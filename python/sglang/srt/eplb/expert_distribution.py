@@ -40,7 +40,8 @@ import torch.distributed
 
 from sglang.kernels.ops.moe.eplb_map_record import record_physical_counts
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_EXPERT_DISPATCH,
     ExpertDispatchCollector,
@@ -170,6 +171,11 @@ class ExpertDistributionRecorder(ABC):
     def get_current_pass_count_buffer(self):
         return None
 
+    def get_current_pass_local_count_buffer(
+        self, *, num_experts: int, ep_rank: int, ep_size: int
+    ) -> Optional[torch.Tensor]:
+        return None
+
     def on_deepep_dispatch_normal(
         self,
         local_physical_count_of_layer: List[int],
@@ -290,6 +296,19 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         if not isinstance(gatherer, _SelectExpertsSinglePassGatherer):
             return None
         return gatherer._data[self._current_layer_idx.value]
+
+    def get_current_pass_local_count_buffer(
+        self, *, num_experts: int, ep_rank: int, ep_size: int
+    ) -> Optional[torch.Tensor]:
+        # Physical experts are rank-major, so this rank's experts are one slice of
+        # the layer's row. None without a current layer or on a width mismatch.
+        if self._current_layer_idx.value is None:
+            return None
+        counts = self.get_current_pass_count_buffer()
+        if counts is None or counts.numel() != num_experts:
+            return None
+        num_local = num_experts // ep_size
+        return counts[ep_rank * num_local : (ep_rank + 1) * num_local]
 
     def on_deepep_dispatch_normal(
         self,

@@ -11,7 +11,6 @@ _is_npu = is_npu()
 _is_hip = is_hip()
 
 # (n, k) -> the largest num_tokens where the tiny GEMM still beats cuBLAS.
-# Doubles as the compile-time max_m: one kernel is built per m up to it.
 _K3_TINY_GEMM_MAX_TOKENS = {
     (144, 7168): 16,
     (896, 7168): 8,
@@ -45,5 +44,5 @@ def kimi_k3_tiny_gemm(
 
             return tgemm.mm(x, w, None, otype=x.dtype)
     if not _is_npu and max_num_tokens is not None and 0 < m <= max_num_tokens:
-        return tiny_gemm_bf16(x, w, max_m=max_num_tokens)
+        return tiny_gemm_bf16(x, w)
     return torch.nn.functional.linear(x, w)

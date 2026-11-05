@@ -39,10 +39,11 @@ from sglang.srt.disaggregation.common.utils import (
     build_dcp_token_transfer_plan,
     group_concurrent_contiguous,
     pack_int_lists,
+    run_on_device,
     unpack_int_lists,
 )
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.utils import (
-    DisaggregationMode,
     build_dsa_tail_transfer_blocks,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
@@ -82,6 +83,7 @@ _PREPARED_STATE_TYPES = frozenset(
     (
         StateType.MAMBA,
         StateType.SWA,
+        StateType.AUXILIARY_SWA,
         StateType.DSA,
         StateType.QSA_PENDING,
         StateType.QSA_COMPRESSED,
@@ -677,9 +679,17 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     if self.enable_staging and self._staging_ctx.buffers
                     else None
                 )
+                # Bind to this rank's device: transfer_worker makes device calls
+                # (the DCP pack's stream switch) that would otherwise use device 0.
                 threading.Thread(
-                    target=self.transfer_worker,
-                    args=(queue, staging_buffer, i),
+                    target=run_on_device,
+                    args=(
+                        self.kv_args.gpu_id,
+                        self.transfer_worker,
+                        queue,
+                        staging_buffer,
+                        i,
+                    ),
                     daemon=True,
                 ).start()
             self._start_bootstrap_thread()
@@ -3191,7 +3201,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     force_flat=True,
                 )
             elif (
-                st == StateType.SWA
+                st in (StateType.SWA, StateType.AUXILIARY_SWA)
                 and not self.is_mla_backend
                 and self.attn_tp_size != decode_tp_size
             ):
@@ -3209,6 +3219,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 )
             elif st in (
                 StateType.SWA,
+                StateType.AUXILIARY_SWA,
                 StateType.BLOCK_SCALE,
                 StateType.BLOCK_SCALE_SWA,
                 StateType.QSA_PENDING,

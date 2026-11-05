@@ -15,7 +15,7 @@ from sglang.srt.layers.attention.linear.gdn_backend import (
 from sglang.srt.layers.attention.linear.kda_backend import KDAAttnBackend
 from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
 from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -220,7 +220,9 @@ class TestTrackMambaStateDtype(CustomTestCase):
                     ssm_states = torch.zeros(16, 1, 2, 2)[::2]
                     cache = SimpleNamespace(conv=[conv_states], temporal=ssm_states)
                     backend.state_layer_cache = lambda _: cache
-                    expected_indices = torch.arange(2) if contiguous else indices
+                    # Staged copies keep the padding sink at row 0, so the
+                    # requests sit at rows 1..n.
+                    expected_indices = torch.arange(1, 3) if contiguous else indices
 
                     def convolve(_layer, _batch, x, states, slots):
                         torch.testing.assert_close(slots, expected_indices)
