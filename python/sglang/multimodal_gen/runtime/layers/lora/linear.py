@@ -40,6 +40,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     write_dense_weight,
 )
 from sglang.multimodal_gen.runtime.utils.precision import get_mixed_precision_state
+from sglang.srt.utils import use_intel_amx_backend
 
 torch._dynamo.config.recompile_limit = 64
 
@@ -217,6 +218,8 @@ class BaseLayerWithLoRA(nn.Module):
     @property
     def can_merge_base_weight(self) -> bool:
         """Whether a LoRA delta may safely replace the stored base weight."""
+        if use_intel_amx_backend(self.base_layer):
+            return False
         weight = self.weight
         if not (weight.dtype.is_floating_point or weight.dtype.is_complex):
             return False
@@ -585,8 +588,9 @@ class BaseLayerWithLoRA(nn.Module):
             )
             for start in range(0, lora_B_2d.shape[0], chunk_rows):
                 end = min(start + chunk_rows, lora_B_2d.shape[0])
-                chunk_delta = lora_B_2d[start:end] @ lora_A_sliced
-                data_2d[start:end].add_(chunk_delta, alpha=scale)
+                data_2d[start:end].addmm_(
+                    lora_B_2d[start:end], lora_A_sliced, alpha=scale
+                )
 
     def _should_merge_in_fp32(
         self,

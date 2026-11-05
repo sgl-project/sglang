@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any
 
-from sglang.srt.mem_cache.unified_radix_cache import UnifiedTreeNode
+from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeNode
 
 if TYPE_CHECKING:
     from sglang.test.scripted_runtime.context.api import ScriptedContext

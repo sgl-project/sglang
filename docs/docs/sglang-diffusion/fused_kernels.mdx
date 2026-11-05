@@ -102,7 +102,7 @@ These fusion families mount under both `quality="lossless"` and
 | Dynamic LoRA delta | An unmerged adapter's scaled update accumulated onto the base output by its second GEMM (`addmm`, one rounding), and a row-parallel layer's bias added in the base GEMM's epilogue, instead of materializing the `[tokens, out]` delta and scaling and adding it in separate passes |
 | FLUX-family VAE fast paths | Channels-last decode, GroupNorm(+SiLU), upsample, and attention replacements for FLUX.2 and AutoencoderKL-based FLUX.1, Z-Image, and SD3 pipelines |
 | Wan VAE RMSNorm + SiLU | Replaces the channel-first RMSNorm/SiLU chain while keeping the decode in `channels_last_3d` |
-| MiniMax-H3 VAE decoder fast path | Per-head fp32 RMSNorm, rounded to the activation dtype, and NeoX RoPE in one launch over the strided Q/K views of the ViT decoder's QKV buffer; cuDNN SDPA for the block's attention |
+| MiniMax-H3 VAE decoder fast path | Per-head fp32 RMSNorm, rounded to the activation dtype, and NeoX RoPE in one launch over the strided Q/K views of the ViT decoder's QKV buffer; cuDNN SDPA for the block's attention; up to `vae_config.decoder_tile_batch` spatial tiles and `vae_config.window_batch` temporal windows per decoder forward. On SM100+ the temporal blend write and output de-normalization run as bit-exact kernels at every quality level |
 
 ## Kernel inventory
 

@@ -261,6 +261,17 @@ Backend selection applies to **blockwise FP8**, **MXFP8** (dense linear), and **
 
 **MXFP8 dense linear:** `auto` uses `flashinfer_cutlass` on SM100 (else `triton`). `flashinfer_cutlass` is fastest on most shapes; `flashinfer_trtllm` is faster only at small M.
 
+**MXFP8 dense linear, HALOps (opt-in):** `--fp8-gemm-backend halops` routes MXFP8 (group-32) dense linear GEMM through [HALOps](https://github.com/PaddlePaddle/HALOps) w8a8 kernels on SM100. The package is published on PaddlePaddle's CUDA 13.2 package page rather than PyPI; the official Docker image installs it, and outside Docker install it explicitly:
+
+```bash Command
+uv pip install halops==0.1.0 \
+  -f https://www.paddlepaddle.org.cn/packages/stable/cu132/halops/
+```
+
+The wheel is cp312 Linux only (x86_64 and aarch64); selecting the backend without it raises an install hint.
+
+Both quantization paths work: `--quantization mxfp8` on a BF16 checkpoint (quantized at load), and a pre-quantized MXFP8 checkpoint, whose uint8 UE8M0 weight scales are used as they are.
+
 ### `--fp4-gemm-backend` (NVFP4 GEMM)
 
 <table>
