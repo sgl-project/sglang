@@ -13,6 +13,11 @@ import triton.language as tl
 
 
 @triton.jit
+def _maximum_with_nan(a, b):
+    return tl.maximum(a, b, propagate_nan=tl.PropagateNan.ALL)
+
+
+@triton.jit
 def _argmax_partial_kernel(
     X, OUTV, OUTI, N, SX, SPLITS: tl.constexpr, BLOCK: tl.constexpr
 ):
@@ -26,12 +31,15 @@ def _argmax_partial_kernel(
         idx = off + tl.arange(0, BLOCK)
         m = idx < tl.minimum(start + per, N)
         v = tl.load(X + row * SX + idx, m, float("-inf"))
-        cur_v = tl.max(v, 0)
-        # lowest index among the maxima of this tile
-        cur_i = tl.min(tl.where(v == cur_v, idx, N), 0)
-        take = (cur_v > best_v) | ((cur_v == best_v) & (cur_i < best_i))
-        best_i = tl.where(take, cur_i, best_i)
+        cur_v = tl.reduce(v, 0, _maximum_with_nan)
+        # Match NaNs explicitly: equality alone cannot select their indices.
+        hit = m & ((v == cur_v) | ((v != v) & (cur_v != cur_v)))
+        cur_i = tl.min(tl.where(hit, idx, N), 0)
+        # Tiles visit increasing indices, so an existing NaN/tie wins.
+        take = (cur_v > best_v) | ((cur_v != cur_v) & (best_v == best_v))
+        take |= cur_i < best_i
         best_v = tl.where(take, cur_v, best_v)
+        best_i = tl.where(take, cur_i, best_i)
     tl.store(OUTV + row * SPLITS + part, best_v)
     tl.store(OUTI + row * SPLITS + part, best_i)
 
@@ -43,8 +51,7 @@ def _argmax_final_kernel(INV, INI, OUT, SPLITS: tl.constexpr, BLOCK: tl.constexp
     m = o < SPLITS
     v = tl.load(INV + row * SPLITS + o, m, float("-inf"))
     i = tl.load(INI + row * SPLITS + o, m, 0x7FFFFFFF)
-    best_v = tl.max(v, 0)
-    best_i = tl.min(tl.where(v == best_v, i, 0x7FFFFFFF), 0)
+    _, best_i = tl.reduce((v, i), 0, _argmax_pair)
     tl.store(OUT + row, best_i.to(tl.int64))
 
 
