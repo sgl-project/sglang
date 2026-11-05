@@ -24,25 +24,20 @@ stores its latent KV plus the DSA lightning-indexer key in
 
 from __future__ import annotations
 
-from typing import Any, Sequence
+from typing import Sequence
 
-import msgspec
 import torch
 
-from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.kernels.ops.quantization.dsa_quant_k_cache import fp8_ds_mla_row_width
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+    DeepSeekV4TokenToKVPool,
+    ExtraHostRegion,
+)
+from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 
 # FlashMLA sparse and the DSA indexer kernels are built for 64-token pages.
 DSA_PAGE_SIZE = 64
-
-
-def mla_latent_bytes(kv_lora_rank: int, rope_dim: int, fp8: bool) -> int:
-    """One token's latent row: bf16, or the FlashMLA FP8 layout (fp8 nope +
-    one fp32 scale per 128 + bf16 rope; 656 B for 512 + 64)."""
-    rope = rope_dim * DSATokenToKVPool.rope_storage_dtype.itemsize
-    if not fp8:
-        return kv_lora_rank * torch.bfloat16.itemsize + rope
-    return kv_lora_rank + kv_lora_rank // DSATokenToKVPool.quant_block_size * 4 + rope
 
 
 def mla_layer_bytes_per_token(
@@ -52,10 +47,13 @@ def mla_layer_bytes_per_token(
 
     Only ``fp8_e4m3`` and ``bfloat16`` get here; the model override rejects the rest.
     """
-    latent = mla_latent_bytes(
-        hf_config.hybrid_mla_kv_lora_rank,
-        hf_config.hybrid_mla_qk_rope_head_dim,
-        kv_cache_dtype_str.startswith("fp8"),
+    kv_lora_rank = hf_config.hybrid_mla_kv_lora_rank
+    rope_dim = hf_config.hybrid_mla_qk_rope_head_dim
+    # A bf16 latent row, or the FlashMLA FP8 one (656 B for 512 + 64).
+    latent = (
+        fp8_ds_mla_row_width(kv_lora_rank, rope_dim)
+        if kv_cache_dtype_str.startswith("fp8")
+        else (kv_lora_rank + rope_dim) * torch.bfloat16.itemsize
     )
     index_head_dim = hf_config.index_head_dim
     index_key = DSATokenToKVPool.index_bytes_per_token_for(
@@ -91,19 +89,6 @@ class _StageLocalLayerCounter:
 
     def wait_until(self, layer_id: int) -> None:
         self._counter.wait_until(layer_id - self._stage_start)
-
-
-class Ernie5_5MlaHostRegion(msgspec.Struct, frozen=True, kw_only=True):
-    """One group of MLA sub-pool buffers HiCache mirrors page by page."""
-
-    # "latent" or "indexer".
-    kind: str
-    device_pool: Any
-    # [main pages, bytes per main page] uint8 views, one per owning layer.
-    device_buffers: list
-    item_bytes: int
-    # Stage-local transfer layer id -> index into device_buffers.
-    layer_mapping: dict
 
 
 class Ernie5_5TokenToKVPool(DeepSeekV4TokenToKVPool):
@@ -147,7 +132,7 @@ class Ernie5_5TokenToKVPool(DeepSeekV4TokenToKVPool):
             use_fp4_indexer=use_fp4_indexer,
             enable_memory_saver=dsv4_kwargs["enable_memory_saver"],
             kv_cache_dim=(
-                mla_latent_bytes(mla_kv_lora_rank, mla_qk_rope_head_dim, fp8)
+                fp8_ds_mla_row_width(mla_kv_lora_rank, mla_qk_rope_head_dim)
                 if fp8
                 else mla_kv_lora_rank + mla_qk_rope_head_dim
             ),
@@ -174,18 +159,18 @@ class Ernie5_5TokenToKVPool(DeepSeekV4TokenToKVPool):
             else _StageLocalLayerCounter(layer_transfer_counter, self._stage_start)
         )
 
-    def _mla_page_regions(self) -> list[tuple[str, int, torch.Tensor, int]]:
-        """``(kind, layer_id, buffer, bytes per main page)``: every latent buffer,
-        then every index-K one, each in layer order.
+    def _mla_page_regions(self) -> list[tuple[PoolName, int, torch.Tensor, int]]:
+        """``(pool name, layer_id, buffer, bytes per main page)``: every latent
+        buffer, then every index-K one, each in layer order.
 
         Both kinds are addressed by the *main* pool's page id, so one item is
         one full main page.
         """
         regions = []
-        for kind, buffers, rows_per_main_page in (
-            ("latent", self.mla_kv_pool.kv_buffer, self.page_size),
+        for pool_name, buffers, rows_per_main_page in (
+            (PoolName.ERNIE5_5_MLA, self.mla_kv_pool.kv_buffer, self.page_size),
             (
-                "indexer",
+                PoolName.ERNIE5_5_MLA_INDEXER,
                 self.mla_kv_pool.index_k_with_scale_buffer,
                 self.page_size // DSA_PAGE_SIZE,
             ),
@@ -202,7 +187,7 @@ class Ernie5_5TokenToKVPool(DeepSeekV4TokenToKVPool):
                 assert buf.nbytes >= item_len, (
                     f"a {buf.nbytes} B buffer cannot hold one {item_len} B page"
                 )
-                regions.append((kind, layer_id, buf, item_len))
+                regions.append((pool_name, layer_id, buf, item_len))
         return regions
 
     def get_contiguous_buf_infos(self):
@@ -215,20 +200,19 @@ class Ernie5_5TokenToKVPool(DeepSeekV4TokenToKVPool):
             item_lens.append(item_len)
         return data_ptrs, data_lens, item_lens
 
-    def mla_host_regions(self) -> tuple[Ernie5_5MlaHostRegion, ...]:
-        """The latent and index-K regions HiCache mirrors next to the compressed-KV
-        ones, as ``[pages, bytes per page]`` views keyed by the main page id."""
-        views: dict[str, list[tuple[int, torch.Tensor]]] = {}
-        for kind, layer_id, buf, item_len in self._mla_page_regions():
+    def extra_host_regions(self) -> tuple[ExtraHostRegion, ...]:
+        """The latent and index-K regions, as ``[pages, bytes per page]`` views."""
+        views: dict[PoolName, list[tuple[int, torch.Tensor]]] = {}
+        for pool_name, layer_id, buf, item_len in self._mla_page_regions():
             # The allocator never hands out a trailing page that does not fit whole.
             num_pages = buf.nbytes // item_len
             flat = buf.view(torch.uint8).reshape(-1)[: num_pages * item_len]
-            views.setdefault(kind, []).append(
+            views.setdefault(pool_name, []).append(
                 (layer_id, flat.view(num_pages, item_len))
             )
         return tuple(
-            Ernie5_5MlaHostRegion(
-                kind=kind,
+            ExtraHostRegion(
+                pool_name=pool_name,
                 device_pool=self.mla_kv_pool,
                 device_buffers=[view for _, view in layer_views],
                 item_bytes=layer_views[0][1].shape[1],
@@ -238,5 +222,5 @@ class Ernie5_5TokenToKVPool(DeepSeekV4TokenToKVPool):
                     for index, (layer_id, _) in enumerate(layer_views)
                 },
             )
-            for kind, layer_views in views.items()
+            for pool_name, layer_views in views.items()
         )

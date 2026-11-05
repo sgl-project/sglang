@@ -28,11 +28,10 @@ from typing import Iterable, Optional, Tuple
 import torch
 from torch import nn
 
-from sglang.kernels.ops.layernorm.mhc_head import fused_hc_head
 from sglang.srt.configs.ernie55 import Ernie5_5_MoeConfig
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
-from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.layernorm import RMSNorm, exact_rms_norm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -45,13 +44,12 @@ from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     DeepseekV2WeightLoaderMixin,
 )
-from sglang.srt.models.deepseek_v4 import make_hc_head_params
 from sglang.srt.models.ernie55 import (
     Ernie5_5DecoderLayer,
+    Ernie5_5HcHead,
     Ernie5_5LogitsProcessor,
     Ernie5_5WeightLoader,
     check_supported_deployment,
-    exact_rms_norm,
     logits_rows,
     scatter_rows,
 )
@@ -95,11 +93,7 @@ class Ernie5_5ModelNextN(nn.Module):
         self.decoder = Ernie5_5DecoderLayer(
             config, 0, quant_config, add_prefix("decoder", prefix)
         )
-        (
-            self.hc_head_fn,
-            self.hc_head_base,
-            self.hc_head_scale,
-        ) = make_hc_head_params(config.hc_mult, hidden_size)
+        self.hc_head = Ernie5_5HcHead(config)
         self.shared_head = nn.Module()
         self.shared_head.norm = RMSNorm(hidden_size, eps=config.rms_norm_eps)
 
@@ -138,22 +132,13 @@ class Ernie5_5ModelNextN(nn.Module):
         # The draft layer is not one of the target's layers the recorder counts.
         with (
             get_global_expert_distribution_recorder().disable_this_region(),
-            get_attn_backend().mla_attn_backend.read_rows(rows, num_tokens),
+            get_attn_backend().read_rows(rows, num_tokens),
         ):
             x = self.decoder(positions, x, forward_batch, zero_allocator, out_rows=rows)
         pre_hc_head = x.flatten(1)
         if num_tokens == 0:
             return x.new_empty((0, hidden_size)), pre_hc_head
-        x = fused_hc_head(
-            x,
-            self.hc_head_fn,
-            self.hc_head_scale,
-            self.hc_head_base,
-            norm_eps=self.config.rms_norm_eps,
-            hc_eps=self.config.hc_eps,
-            eps_outside_sqrt=True,
-        )
-        x = exact_rms_norm(x, self.shared_head.norm)
+        x = exact_rms_norm(self.hc_head(x), self.shared_head.norm)
         if rows is not None:
             # The logits processor picks these rows out of full-batch tensors.
             x = scatter_rows(x, rows, num_tokens)
@@ -240,8 +225,9 @@ class _Ernie5_5NextNWeightLoader(Ernie5_5WeightLoader):
         "h_proj.weight_scale_inv": "model.h_proj.weight_scale_inv",
         "enorm.weight": "model.enorm.weight",
         "hnorm.weight": "model.hnorm.weight",
-        "hc_head_base": "model.hc_head_base",
-        "hc_head_scale": "model.hc_head_scale",
+        "hc_head_fn": "model.hc_head.fn",
+        "hc_head_base": "model.hc_head.base",
+        "hc_head_scale": "model.hc_head.scale",
         "shared_head.norm.weight": "model.shared_head.norm.weight",
     }
     # Shared from the target after loading, so the checkpoint never fills them.
@@ -266,10 +252,6 @@ class _Ernie5_5NextNWeightLoader(Ernie5_5WeightLoader):
         suffix = name[len(self.mtp_prefix) :]
         if suffix in self._OUTER:
             self._load(self._OUTER[suffix], tensor)
-        elif suffix == "hc_head_fn":
-            # Stored [hc_mult * hidden, hc_mult]; the parameter is the transpose.
-            self.params["model.hc_head_fn"].data.copy_(tensor.t())
-            self.loaded.add("model.hc_head_fn")
         else:
             # The mHC parameters sit under an extra transformer_layer. prefix.
             suffix = suffix.removeprefix("transformer_layer.")

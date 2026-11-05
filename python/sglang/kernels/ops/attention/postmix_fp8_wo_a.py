@@ -30,6 +30,10 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.quantization.fp8_group_major_quant_ue8m0 import (
+    sglang_per_token_group_quant_fp8_dsv4_wo_a,
+)
+
 _GROUP = 128
 
 
@@ -84,7 +88,7 @@ def _postmix_quant_kernel(
 
 
 def postmix_quant_supported(x: torch.Tensor, mix: torch.Tensor) -> bool:
-    """Shapes the kernel covers; anything else keeps the two-pass spelling."""
+    """Shapes the kernel covers; anything else takes the two-pass spelling."""
     tokens, groups, hidden = x.shape
     num_heads = mix.shape[0]
     if tokens == 0 or num_heads % groups or (hidden * groups) % num_heads:
@@ -107,10 +111,15 @@ def postmix_fp8_wo_a_quant(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """``sglang_per_token_group_quant_fp8_dsv4_wo_a(postmix(x))``, same output layout.
 
-    ``x`` is the ``[T, G, D]`` wo_a input, ``mix`` the ``[nh, nh]`` postmix matrix,
-    both bf16 and contiguous. Nothing is checked here: callers must first check
-    ``postmix_quant_supported(x, mix)``.
+    ``x`` is the ``[T, G, D]`` wo_a input, ``mix`` the ``[nh, nh]`` postmix matrix.
+    Shapes the kernel does not cover mix with a matmul and quantize separately.
     """
+    if not postmix_quant_supported(x, mix):
+        tokens = x.shape[0]
+        mixed = torch.matmul(mix, x.reshape(tokens, mix.shape[0], -1))
+        return sglang_per_token_group_quant_fp8_dsv4_wo_a(
+            mixed.reshape(x.shape).contiguous()
+        )
     tokens, groups, hidden = x.shape
     num_heads = mix.shape[0]
     head_dim = hidden * groups // num_heads

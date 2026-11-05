@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from contextlib import nullcontext
 from typing import (
+    Any,
     FrozenSet,
     List,
     Literal,
@@ -13,6 +14,7 @@ from typing import (
     Union,
 )
 
+import msgspec
 import torch
 
 from sglang.kernels.ops.attention.dsv4 import (
@@ -1009,6 +1011,19 @@ _DSV4_REGION_NAMES = {
     ),
     128: (PoolName.DEEPSEEK_V4_C128, PoolName.DEEPSEEK_V4_C128_ROPE, None, None),
 }
+
+
+class ExtraHostRegion(msgspec.Struct, frozen=True, kw_only=True):
+    """Device buffers a subclass keeps beside the compressed-KV layout, which
+    HiCache mirrors page by page, keyed by the main pool's page id."""
+
+    pool_name: PoolName
+    device_pool: Any
+    # [main pages, bytes per main page] uint8 views, one per owning layer.
+    device_buffers: list
+    item_bytes: int
+    # Stage-local transfer layer id -> index into device_buffers.
+    layer_mapping: dict
 
 
 class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
@@ -2152,6 +2167,10 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def _swa_local_layer_id(self, layer_id: int) -> int:
         """Convert absolute model layer_id to SWA-pool-local (PP-stage-local) index."""
         return layer_id - self._stage_start
+
+    def extra_host_regions(self) -> tuple[ExtraHostRegion, ...]:
+        """Regions outside the compressed-KV layout that HiCache mirrors too."""
+        return ()
 
     def get_swa_raw_buffer(self, layer_id: int) -> torch.Tensor:
         if self.request_window is not None:

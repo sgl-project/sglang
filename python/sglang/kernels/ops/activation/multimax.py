@@ -22,6 +22,7 @@ NaN and infinities included.
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 
@@ -68,12 +69,27 @@ def _multimax_kernel(
     tl.store(out_ptr + offsets, out.to(out_ptr.dtype.element_ty), mask=mask)
 
 
+def multimax_torch(
+    x: torch.Tensor, ranges: torch.Tensor, ts: torch.Tensor
+) -> torch.Tensor:
+    out = x.clone()
+    out += ts[0] * F.relu(ranges[0] - x)
+    out += ts[1] * F.relu(x - ranges[1])
+    out += ts[2] * F.relu(ranges[2] - x) ** 2
+    out += ts[3] * F.relu(x - ranges[3]) ** 2
+    return out
+
+
 def multimax(x: torch.Tensor, ranges: torch.Tensor, ts: torch.Tensor) -> torch.Tensor:
-    """``x`` contiguous bf16; ``ranges`` / ``ts`` are 4-element bf16 tensors."""
-    assert x.dtype == ranges.dtype == ts.dtype == torch.bfloat16, (
-        f"multimax is bf16-only, got {x.dtype}, {ranges.dtype}, {ts.dtype}"
+    """``ranges`` / ``ts`` are 4-element bf16 tensors; a bf16 ``x`` runs the
+    kernel, any other dtype the eager spelling."""
+    if x.dtype != torch.bfloat16:
+        return multimax_torch(x, ranges, ts)
+    assert ranges.dtype == ts.dtype == torch.bfloat16, (
+        f"multimax is bf16-only, got {ranges.dtype}, {ts.dtype}"
     )
-    assert x.is_contiguous() and ranges.numel() == ts.numel() == 4
+    assert ranges.numel() == ts.numel() == 4
+    x = x.contiguous()
     out = torch.empty_like(x)
     n = x.numel()
     if n == 0:

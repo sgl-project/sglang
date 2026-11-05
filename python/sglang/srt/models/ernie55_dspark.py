@@ -28,23 +28,23 @@ from typing import Iterable, List, Optional, Tuple
 import torch
 from torch import nn
 
-from sglang.kernels.ops.attention.dsv4 import fused_q_norm_rope, fused_rope_inplace
+from sglang.kernels.ops.activation.multimax import multimax
+from sglang.kernels.ops.attention.dsv4 import fused_rope_inplace
 from sglang.kernels.ops.attention.dsv4.rope import precompute_freqs_cis
 from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
-from sglang.kernels.ops.layernorm.mhc_head import fused_hc_head
 from sglang.kernels.ops.speculative.dspark.dspark_draft_model import CommitKvProj
 from sglang.srt.configs.ernie55 import Ernie5_5_MoeConfig
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.attention.dsv4.unified_kv_gate import is_unified_kv_triton
-from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.linear import MergedColumnParallelLinear, ReplicatedLinear
+from sglang.srt.layers.layernorm import RMSNorm, exact_rms_norm
+from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_attn_backend
-from sglang.srt.models.deepseek_v4 import _apply_wo_a_bf16_matmul, make_hc_head_params
+from sglang.srt.models.deepseek_v4 import _apply_wo_a_bf16_matmul
 from sglang.srt.models.deepseek_v4_dspark import (
     _PAD_NUM_HEADS,
     DSparkAttention,
@@ -55,11 +55,11 @@ from sglang.srt.models.deepseek_v4_dspark import (
 from sglang.srt.models.dspark import gather_and_crop_vocab, project_through_lm_head
 from sglang.srt.models.ernie55 import (
     Ernie5_5DecoderLayer,
+    Ernie5_5GatedQMixin,
+    Ernie5_5HcHead,
     Ernie5_5WeightLoader,
     VhaPostMix,
-    apply_multimax,
     check_supported_deployment,
-    exact_rms_norm,
 )
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.speculative.dspark_components.dspark_config import (
@@ -69,7 +69,7 @@ from sglang.srt.speculative.dspark_components.dspark_config import (
 from sglang.srt.utils import add_prefix
 
 
-class Ernie5_5DSparkAttention(DSparkAttention):
+class Ernie5_5DSparkAttention(Ernie5_5GatedQMixin, DSparkAttention):
     """The DSpark draft attention with ERNIE's merged [q_up | gate]
     GEMM, sigmoid output gate and VHA postmix."""
 
@@ -96,32 +96,12 @@ class Ernie5_5DSparkAttention(DSparkAttention):
             original_seq_len=self.rope_scaling["original_max_position_embeddings"],
         )
         self.freqs_cis = precompute_freqs_cis(**self.rope_kwargs)
-        # The same [q_up | gate] split as Ernie5_5HcaAttention.wq_b.
-        self.q_up_local_size = self.n_local_heads * self.head_dim
-        self.wq_b = MergedColumnParallelLinear(
-            self.q_lora_rank,
-            [self.n_heads * self.head_dim, self.n_groups * self.o_lora_rank],
-            bias=False,
-            quant_config=quant_config,
-            prefix=add_prefix("wq_b", prefix),
-            parallel_group="attn_tp",
-        )
+        self._init_gated_wq_b(quant_config, prefix)
         self.postmix = VhaPostMix(self.n_local_heads, self.n_heads)
-        self._gate: Optional[torch.Tensor] = None
 
     def _compute_q(self, x, positions, q_out=None):
         q, _ = self.wq_a(x)
-        qg, _ = self.wq_b(self.q_norm(q))
-        if self._gate is not None:
-            raise RuntimeError("previous output gate never reached wo_b")
-        self._gate = qg[:, self.q_up_local_size :]
-        q = qg[:, : self.q_up_local_size].unflatten(
-            1, (self.n_local_heads, self.head_dim)
-        )
-        if q_out is None:
-            q_out = q.new_empty(q.shape)
-        fused_q_norm_rope(q, q_out, self.eps, self.freqs_cis, positions)
-        return q_out
+        return self._gated_q_norm_rope(self.q_norm(q), positions, q_out)
 
     def forward(
         self, x: torch.Tensor, positions: torch.Tensor, forward_batch: ForwardBatch
@@ -170,8 +150,9 @@ class Ernie5_5DSparkAttention(DSparkAttention):
             is_decode=forward_batch.forward_mode.is_decode(),
             is_target_verify=forward_batch.forward_mode.is_target_verify(),
         )
-        gate, self._gate = self._gate, None
-        o = fused_sigmoid_mul(o.reshape(o.shape[0], -1), gate, round_sigmoid=True)
+        o = fused_sigmoid_mul(
+            o.reshape(o.shape[0], -1), self._take_gate(), round_sigmoid=True
+        )
         out, _ = self.wo_b(o)
         return out
 
@@ -252,11 +233,7 @@ class Ernie5_5_MoeForCausalLMDSpark(nn.Module):
                 for stage_id in range(self.num_stages)
             ]
         )
-        (
-            self.hc_head_fn,
-            self.hc_head_base,
-            self.hc_head_scale,
-        ) = make_hc_head_params(config.hc_mult, config.hidden_size)
+        self.hc_head = Ernie5_5HcHead(config)
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.markov_head = DSparkV4MarkovHead(
             vocab_size=int(config.vocab_size),
@@ -373,30 +350,15 @@ class Ernie5_5_MoeForCausalLMDSpark(nn.Module):
                 x = stage(positions, x, forward_batch, None)
         return LogitsProcessorOutput(next_token_logits=None, hidden_states=x)
 
-    def collapse_hc_head(self, x: torch.Tensor) -> torch.Tensor:
-        if x.shape[0] == 0:
-            return x.new_empty((0, self.config.hidden_size))
-        return fused_hc_head(
-            x,
-            self.hc_head_fn,
-            self.hc_head_scale,
-            self.hc_head_base,
-            norm_eps=self.config.rms_norm_eps,
-            hc_eps=self.config.hc_eps,
-            eps_outside_sqrt=True,
-        )
-
     def compute_base_logits(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        x_post_hc = self.collapse_hc_head(x)
+        x_post_hc = self.hc_head(x)
         x_normed = exact_rms_norm(x_post_hc, self.norm)
         weight = self.lm_head.weight
         if self._use_fp32_lm_head and weight.is_floating_point():
             local_logits = torch.nn.functional.linear(x_normed.float(), weight.float())
         else:
             local_logits = project_through_lm_head(x_normed, self.lm_head)
-        local_logits = apply_multimax(
-            local_logits, self.multimax_ranges, self.multimax_ts
-        )
+        local_logits = multimax(local_logits, self.multimax_ranges, self.multimax_ts)
         if not self._opt_markov_w2_tp_shard:
             local_logits = gather_and_crop_vocab(local_logits, self.lm_head)
         return local_logits, x_post_hc
@@ -433,8 +395,9 @@ class _Ernie5_5DSparkWeightLoader(Ernie5_5WeightLoader):
         "model.mtp.feature_projection.weight": "stages.0.main_proj.weight",
         "model.mtp.feature_norm.weight": "stages.0.main_norm.weight",
         "model.mtp.norm.weight": "norm.weight",
-        "model.mtp.mhc_contract.hc_head_base": "hc_head_base",
-        "model.mtp.mhc_contract.hc_head_scale": "hc_head_scale",
+        "model.mtp.mhc_contract.hc_head_fn": "hc_head.fn",
+        "model.mtp.mhc_contract.hc_head_base": "hc_head.base",
+        "model.mtp.mhc_contract.hc_head_scale": "hc_head.scale",
         "model.mtp.markov_head.markov_w2.weight": "markov_head.markov_w2.weight",
         "model.mtp.confidence_head.projection.weight": "confidence_head.proj.weight",
         "model.lm_head.multimax_ranges": "multimax_ranges",
@@ -442,7 +405,6 @@ class _Ernie5_5DSparkWeightLoader(Ernie5_5WeightLoader):
     }
     # Stored [in, out]; the parameters are [out, in].
     _DRAFT_TRANSPOSED = {
-        "model.mtp.mhc_contract.hc_head_fn": "hc_head_fn",
         "model.mtp.markov_head.markov_w1.weight": "markov_head.markov_w1.weight",
     }
     _DRAFT_PREFIX = "model.mtp."

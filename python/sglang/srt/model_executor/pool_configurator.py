@@ -1458,6 +1458,11 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             page_size = self.page_size // compress_ratio
         return layout.page_bytes(page_size) / page_size
 
+    @property
+    def num_swa_layers(self) -> int:
+        """Stage layers that keep an SWA buffer."""
+        return self.num_layers_total
+
     def _get_bytes_per_swa_token(self) -> float:
         """Bytes one SWA slot costs across the stage. c4_state_pool_size = swa_tokens
         // page_size * ring, so c4 compress state is priced per SWA slot too."""
@@ -1470,7 +1475,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         c4_indexer_state_bytes = 2 * 2 * self.indexer_head_dim * c4_state_dtype_size
 
         c4_state_ratio = self.ring_sizes.get(4, 0) / self.page_size
-        return self._get_paged_kv_bytes_per_token() * self.num_layers_total + (
+        return self._get_paged_kv_bytes_per_token() * self.num_swa_layers + (
             c4_state_ratio
             * (c4_state_bytes + c4_indexer_state_bytes)
             * self.num_layers(4)
@@ -1817,11 +1822,9 @@ class Ernie5_5PoolConfigurator(DSV4PoolConfigurator):
         )
         super().__init__(kvc)
 
-    def _get_bytes_per_swa_token(self) -> float:
-        return (
-            super()._get_bytes_per_swa_token()
-            - self._get_paged_kv_bytes_per_token() * self._num_mla_layers
-        )
+    @property
+    def num_swa_layers(self) -> int:
+        return self.num_layers_total - self._num_mla_layers
 
     def _get_bytes_per_full_token(self) -> float:
         from sglang.srt.mem_cache.ernie55_memory_pool import mla_layer_bytes_per_token

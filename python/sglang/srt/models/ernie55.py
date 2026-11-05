@@ -35,27 +35,19 @@ MLA, DSA, VHA, mHC, SiTU, ``wo_a``/``wo_b``).
 
 from __future__ import annotations
 
-import dataclasses
 from typing import Iterable, Optional, Tuple, Union
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 from sglang.kernels.ops.activation.multimax import multimax
 from sglang.kernels.ops.attention.dsv4 import fused_q_norm_rope, fused_rope_inplace
-from sglang.kernels.ops.attention.postmix_fp8_wo_a import (
-    postmix_fp8_wo_a_quant,
-    postmix_quant_supported,
-)
+from sglang.kernels.ops.attention.postmix_fp8_wo_a import postmix_fp8_wo_a_quant
 from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
 from sglang.kernels.ops.gemm.bf16_fp32 import linear_bf16_fp32
 from sglang.kernels.ops.layernorm.mhc import mhc_post, mhc_pre
 from sglang.kernels.ops.layernorm.mhc_head import fused_hc_head
 from sglang.kernels.ops.moe.multi_router import multi_router_topk
-from sglang.kernels.ops.quantization.fp8_group_major_quant_ue8m0 import (
-    sglang_per_token_group_quant_fp8_dsv4_wo_a,
-)
 from sglang.srt.configs.ernie55 import Ernie5_5_MoeConfig
 from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.environ import envs
@@ -76,7 +68,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.layer_boundary import AttentionInputs, get_attn_tp_context
 from sglang.srt.layers.layer_boundary.layout import moe_cp_gathered_rows
 from sglang.srt.layers.layer_boundary.ops import moe_cp_gather, moe_cp_take_back
-from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.layernorm import RMSNorm, exact_rms_norm
 from sglang.srt.layers.layernorm_sp import runs_sp
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -84,7 +76,10 @@ from sglang.srt.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.logits_processor import (
+    LogitsProcessor,
+    extend_reads_input_logprobs,
+)
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
@@ -97,9 +92,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import (
-    forward_context,
     get_attn_backend,
-    get_forward_context,
 )
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner import get_is_capture_mode
@@ -122,7 +115,7 @@ from sglang.srt.models.deepseek_v4 import (
     make_hc_head_params,
     make_hc_mixing_params,
 )
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     BumpAllocator,
     add_prefix,
@@ -133,7 +126,9 @@ from sglang.srt.utils import (
 
 
 def check_supported_deployment(config: Ernie5_5_MoeConfig) -> None:
-    """Reject the platforms and layouts this model cannot serve."""
+    """Reject the platforms and layouts this model cannot serve. Runs at model
+    construction, where the attention-TP width is final; server-arg features are
+    checked by the ERNIE 5.5 model override."""
     if not is_cuda():
         # The HIP / NPU prepare paths call wq_b directly and skip the gate split.
         raise ValueError("ERNIE 5.5 Flash is supported on CUDA only")
@@ -159,14 +154,6 @@ def check_supported_deployment(config: Ernie5_5_MoeConfig) -> None:
                 f"ERNIE 5.5 Flash splits attention by output group, so attention "
                 f"TP ({attn_tp}) must divide {name} ({value})"
             )
-    overlap = get_exec().overlap
-    if overlap.enable_two_batch_overlap or overlap.enable_single_batch_overlap:
-        # Each attention module carries the output gate between two of the parent's
-        # hooks, which a second micro-batch entering the same module would clobber.
-        raise ValueError(
-            "ERNIE 5.5 Flash does not support batch overlap; drop "
-            "--enable-two-batch-overlap / --enable-single-batch-overlap"
-        )
 
 
 def _heads_are_split() -> bool:
@@ -185,15 +172,7 @@ def logits_rows(forward_batch: ForwardBatch) -> Optional[torch.Tensor]:
         or _heads_are_split()
         or (forward_batch.attn_cp_metadata is not None and is_cp_active(forward_batch))
         or torch.cuda.is_current_stream_capturing()
-    ):
-        return None
-    # Same test as LogitsMetadata for input logprobs.
-    if forward_batch.return_logprob and any(
-        n > start
-        for n, start in zip(
-            forward_batch.extend_seq_lens_cpu,
-            forward_batch.extend_logprob_start_lens_cpu,
-        )
+        or extend_reads_input_logprobs(forward_batch)
     ):
         return None
     return torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
@@ -203,11 +182,6 @@ def scatter_rows(x: torch.Tensor, rows: torch.Tensor, num_rows: int) -> torch.Te
     out = x.new_zeros((num_rows, *x.shape[1:]))
     out[rows] = x
     return out
-
-
-def exact_rms_norm(x: torch.Tensor, norm: RMSNorm) -> torch.Tensor:
-    # torch's rms_norm matches the trainer bit-for-bit; the fused kernel does not.
-    return F.rms_norm(x, (x.shape[-1],), norm.weight, norm.variance_epsilon)
 
 
 def _situ_betas(config: Ernie5_5_MoeConfig) -> Tuple[float, float]:
@@ -267,7 +241,83 @@ class VhaPostMix(nn.Module):
         return mixed.to(heads.dtype).reshape(o.shape)
 
 
-class Ernie5_5HcaAttention(MQALayer):
+def _load_transposed(param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
+    param.data.copy_(loaded_weight.t())
+
+
+class Ernie5_5HcHead(nn.Module):
+    """Collapses the mHC streams into one hidden state (the checkpoint's
+    ``mhc_contract``)."""
+
+    def __init__(self, config: Ernie5_5_MoeConfig):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.norm_eps = config.rms_norm_eps
+        self.hc_eps = config.hc_eps
+        self.fn, self.base, self.scale = make_hc_head_params(
+            config.hc_mult, config.hidden_size
+        )
+        # Stored [hc_mult * hidden, hc_mult]; the parameter is the transpose.
+        set_weight_attrs(self.fn, {"weight_loader": _load_transposed})
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """``[T, hc_mult, hidden]`` -> ``[T, hidden]``."""
+        if x.shape[0] == 0:
+            return x.new_empty((0, self.hidden_size))
+        return fused_hc_head(
+            x,
+            self.fn,
+            self.scale,
+            self.base,
+            norm_eps=self.norm_eps,
+            hc_eps=self.hc_eps,
+            eps_outside_sqrt=True,
+        )
+
+
+class Ernie5_5GatedQMixin:
+    """The [q_up | gate] GEMM over the q-LoRA latent, shared by the HCA and DSpark
+    attentions; the gate waits in ``self._gate`` until wo_b reads it."""
+
+    def _init_gated_wq_b(
+        self, quant_config: Optional[QuantizationConfig], prefix: str
+    ) -> None:
+        # One GEMM, merged so q_up shards by head and gate by output group
+        # (as wo_a / wo_b split).
+        self.q_up_local_size = self.n_local_heads * self.head_dim
+        self.wq_b = MergedColumnParallelLinear(
+            self.q_lora_rank,
+            [self.n_heads * self.head_dim, self.n_groups * self.o_lora_rank],
+            bias=False,
+            quant_config=quant_config,
+            prefix=add_prefix("wq_b", prefix),
+            parallel_group="attn_tp",
+        )
+        self._gate: Optional[torch.Tensor] = None
+
+    def _gated_q_norm_rope(self, q_lora, positions, q_out=None):
+        qg, _ = self.wq_b(q_lora)
+        if self._gate is not None:
+            # Not an assert: `python -O` would turn a stale gate into wrong output.
+            raise RuntimeError("previous output gate never reached wo_b")
+        # Strided views; the norm+rope kernel and the gate-mul read the row stride.
+        self._gate = qg[:, self.q_up_local_size :]
+        q = qg[:, : self.q_up_local_size].unflatten(
+            1, (self.n_local_heads, self.head_dim)
+        )
+        if q_out is None:
+            q_out = q.new_empty(q.shape)
+        fused_q_norm_rope(q, q_out, self.eps, self.freqs_cis, positions)
+        return q_out
+
+    def _take_gate(self) -> torch.Tensor:
+        gate, self._gate = self._gate, None
+        if gate is None:
+            raise RuntimeError("output gate was not produced by the q projection")
+        return gate
+
+
+class Ernie5_5HcaAttention(Ernie5_5GatedQMixin, MQALayer):
     """HCA attention plus ERNIE's postmix and sigmoid output gate."""
 
     def __init__(
@@ -286,18 +336,7 @@ class Ernie5_5HcaAttention(MQALayer):
             alt_streams=alt_streams,
         )
         self.postmix = VhaPostMix(self.n_local_heads, self.n_heads)
-        # One [q_up | gate] GEMM over the shared q-LoRA latent, merged so q_up
-        # shards by head and gate by output group (as wo_a / wo_b split).
-        self.q_up_local_size = self.n_local_heads * self.head_dim
-        self.wq_b = MergedColumnParallelLinear(
-            self.q_lora_rank,
-            [self.n_heads * self.head_dim, self.n_groups * self.o_lora_rank],
-            bias=False,
-            quant_config=quant_config,
-            prefix=add_prefix("wq_b", prefix),
-            parallel_group="attn_tp",
-        )
-        self._gate: Optional[torch.Tensor] = None
+        self._init_gated_wq_b(quant_config, prefix)
         # The mix fuses into the UE8M0 fp8 wo_a quant, but only from the folded
         # [H, H] matrix, which a split head axis has no rank-local form of.
         self._postmix_in_quant = (
@@ -308,19 +347,7 @@ class Ernie5_5HcaAttention(MQALayer):
         )
 
     def _compute_q_b(self, q, positions, q_out=None):
-        qg, _ = self.wq_b(q)
-        if self._gate is not None:
-            # Not an assert: `python -O` would turn a stale gate into wrong output.
-            raise RuntimeError("previous output gate never reached wo_b")
-        # Strided views; the norm+rope kernel and the gate-mul read the row stride.
-        self._gate = qg[:, self.q_up_local_size :]
-        q = qg[:, : self.q_up_local_size].unflatten(
-            1, (self.n_local_heads, self.head_dim)
-        )
-        if q_out is None:
-            q_out = q.new_empty(q.shape)
-        fused_q_norm_rope(q, q_out, self.eps, self.freqs_cis, positions)
-        return q_out
+        return self._gated_q_norm_rope(q, positions, q_out)
 
     def _project_wo_a(self, o, *, positions, **kwargs):
         if not self._postmix_in_quant:
@@ -335,13 +362,7 @@ class Ernie5_5HcaAttention(MQALayer):
             inverse=True,
         )
         x = o.view(o.shape[0], self.n_local_groups, -1)
-        mix = self.postmix.mix
-        if postmix_quant_supported(x, mix):
-            x_fp8, x_scale = postmix_fp8_wo_a_quant(x, mix)
-        else:
-            x_fp8, x_scale = sglang_per_token_group_quant_fp8_dsv4_wo_a(
-                self.postmix(x).contiguous()
-            )
+        x_fp8, x_scale = postmix_fp8_wo_a_quant(x, self.postmix.mix)
         _, groups, hidden = x.shape
         return _fp8_wo_a_einsum(
             x_fp8,
@@ -352,10 +373,7 @@ class Ernie5_5HcaAttention(MQALayer):
         )
 
     def _project_wo_b(self, o, defer_all_reduce: bool = False):
-        gate, self._gate = self._gate, None
-        if gate is None:
-            raise RuntimeError("output gate was not produced by _compute_q_b")
-        o = fused_sigmoid_mul(o.flatten(1), gate, round_sigmoid=True)
+        o = fused_sigmoid_mul(o.flatten(1), self._take_gate(), round_sigmoid=True)
         return super()._project_wo_b(o, defer_all_reduce)
 
 
@@ -441,14 +459,11 @@ class Ernie5_5MlaAttention(DeepseekV2AttentionMLA):
         return fused_sigmoid_mul(self.postmix(attn_out), gate, round_sigmoid=True)
 
     def forward(self, positions, hidden_states, forward_batch, zero_allocator):
-        backend = get_attn_backend().mla_attn_backend
         get_attn_tp_context().set_attn_inputs(
             AttentionInputs(hidden_states, forward_batch, self.prepare_qkv_latent)
         )
         try:
-            with forward_context(
-                dataclasses.replace(get_forward_context(), attn_backend=backend)
-            ):
+            with get_attn_backend().mla_layer_context():
                 out = super().forward(
                     positions, hidden_states, forward_batch, zero_allocator
                 )
@@ -892,11 +907,7 @@ class Ernie5_5Model(nn.Module):
         )
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-            (
-                self.hc_head_fn,
-                self.hc_head_base,
-                self.hc_head_scale,
-            ) = make_hc_head_params(config.hc_mult, config.hidden_size)
+            self.hc_head = Ernie5_5HcHead(config)
         # Layers whose output feeds a DSpark draft; see set_dspark_layers_to_capture.
         self.dspark_layers_to_capture: Optional[list[int]] = None
 
@@ -943,20 +954,10 @@ class Ernie5_5Model(nn.Module):
             return PPProxyTensors({"hidden_states": hidden_states.flatten(1)})
         pre_hc_head = hidden_states.flatten(1)
         # A draft reads every row's streams, the LM head only logits_rows(): collapse and norm just those.
-        rows = None
-        if hidden_states.shape[0] == 0:
-            hidden_states = hidden_states.new_empty((0, self.config.hidden_size))
-        else:
-            rows = logits_rows(forward_batch)
-            hidden_states = fused_hc_head(
-                hidden_states if rows is None else hidden_states[rows],
-                self.hc_head_fn,
-                self.hc_head_scale,
-                self.hc_head_base,
-                norm_eps=self.config.rms_norm_eps,
-                hc_eps=self.config.hc_eps,
-                eps_outside_sqrt=True,
-            )
+        rows = logits_rows(forward_batch) if hidden_states.shape[0] > 0 else None
+        hidden_states = self.hc_head(
+            hidden_states if rows is None else hidden_states[rows]
+        )
         hidden_states = exact_rms_norm(hidden_states, self.norm)
         if rows is not None:
             hidden_states = scatter_rows(hidden_states, rows, pre_hc_head.shape[0])
@@ -975,21 +976,7 @@ class Ernie5_5LogitsProcessor(LogitsProcessor):
         self, hidden_states, lm_head, embedding_bias=None, *, out=None
     ):
         x = super()._compute_lm_head(hidden_states, lm_head, embedding_bias, out=out)
-        return apply_multimax(x, self.multimax_ranges, self.multimax_ts)
-
-
-def apply_multimax(
-    x: torch.Tensor, ranges: torch.Tensor, ts: torch.Tensor
-) -> torch.Tensor:
-    """The piecewise "multimax" activation ERNIE applies to its logits."""
-    if x.dtype == torch.bfloat16:
-        return multimax(x.contiguous(), ranges, ts)
-    out = x.clone()
-    out += ts[0] * F.relu(ranges[0] - x)
-    out += ts[1] * F.relu(x - ranges[1])
-    out += ts[2] * F.relu(ranges[2] - x) ** 2
-    out += ts[3] * F.relu(x - ranges[3]) ** 2
-    return out
+        return multimax(x, self.multimax_ranges, self.multimax_ts)
 
 
 class Ernie5_5_MoeForCausalLM(nn.Module):
@@ -1255,8 +1242,9 @@ class Ernie5_5WeightLoader:
     }
     _ROOT_RENAMES = {
         **_MULTIMAX_RENAMES,
-        "model.mhc_contract.hc_head_base": "model.hc_head_base",
-        "model.mhc_contract.hc_head_scale": "model.hc_head_scale",
+        "model.mhc_contract.hc_head_fn": "model.hc_head.fn",
+        "model.mhc_contract.hc_head_base": "model.hc_head.base",
+        "model.mhc_contract.hc_head_scale": "model.hc_head.scale",
     }
 
     def __init__(self, model: Ernie5_5_MoeForCausalLM):
@@ -1313,12 +1301,7 @@ class Ernie5_5WeightLoader:
 
     def load(self, name: str, tensor: torch.Tensor) -> None:
         if not name.startswith("model.layers."):
-            if name.startswith(self.skipped_roots):
-                return
-            if name == "model.mhc_contract.hc_head_fn":
-                self.params["model.hc_head_fn"].data.copy_(tensor.t())
-                self.loaded.add("model.hc_head_fn")
-            else:
+            if not name.startswith(self.skipped_roots):
                 self._load(self._ROOT_RENAMES.get(name, name), tensor)
             return
         layer_id_text, _, suffix = name[len("model.layers.") :].partition(".")

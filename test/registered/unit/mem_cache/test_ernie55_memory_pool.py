@@ -23,6 +23,7 @@ from sglang.srt.mem_cache.ernie55_memory_pool import (
     Ernie5_5TokenToKVPool,
     mla_layer_bytes_per_token,
 )
+from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -36,7 +37,7 @@ _INDEX_ROW = 4352
 
 
 def _pool(num_layers=3, owned=(1,)):
-    """CPU stub of what get_contiguous_buf_infos and mla_host_regions read;
+    """CPU stub of what get_contiguous_buf_infos and extra_host_regions read;
     the latent buffer is [tokens, 1, kv_cache_dim], as MLATokenToKVPool allocates it."""
     pool = object.__new__(Ernie5_5TokenToKVPool)
     pool.page_size = _PAGE_SIZE
@@ -108,15 +109,18 @@ class TestErnie5_5MlaHostRegions(_StubbedBase):
     """HiCache mirrors the same pages the PD enumeration registers."""
 
     def test_one_region_per_kind_keyed_by_owning_layer(self):
-        regions = _pool(num_layers=4, owned=(1, 3)).mla_host_regions()
-        self.assertEqual([r.kind for r in regions], ["latent", "indexer"])
+        regions = _pool(num_layers=4, owned=(1, 3)).extra_host_regions()
+        self.assertEqual(
+            [r.pool_name for r in regions],
+            [PoolName.ERNIE5_5_MLA, PoolName.ERNIE5_5_MLA_INDEXER],
+        )
         for region in regions:
             self.assertEqual(region.layer_mapping, {1: 0, 3: 1})
             self.assertEqual(len(region.device_buffers), 2)
 
     def test_a_host_page_is_one_main_page_of_the_device_buffer(self):
         pool = _pool(num_layers=2, owned=(1,))
-        latent, indexer = pool.mla_host_regions()
+        latent, indexer = pool.extra_host_regions()
         self.assertEqual(latent.item_bytes, _LATENT_ROW * _PAGE_SIZE)
         self.assertEqual(indexer.item_bytes, _INDEX_ROW * (_PAGE_SIZE // DSA_PAGE_SIZE))
         # Page 1 of the view must alias tokens [256, 512) of the device buffer.
@@ -128,11 +132,11 @@ class TestErnie5_5MlaHostRegions(_StubbedBase):
     def test_items_match_the_pd_enumeration(self):
         pool = _pool(num_layers=4, owned=(1, 3))
         _, _, items = pool.get_contiguous_buf_infos()
-        host_items = [r.item_bytes for r in pool.mla_host_regions() for _ in range(2)]
+        host_items = [r.item_bytes for r in pool.extra_host_regions() for _ in range(2)]
         self.assertEqual(items[1:], host_items)
 
     def test_a_pool_with_no_mla_layer_mirrors_nothing(self):
-        self.assertEqual(_pool(num_layers=2, owned=()).mla_host_regions(), ())
+        self.assertEqual(_pool(num_layers=2, owned=()).extra_host_regions(), ())
 
 
 class TestErnie5_5SwaBuffers(CustomTestCase):

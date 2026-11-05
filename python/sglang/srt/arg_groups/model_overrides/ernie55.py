@@ -76,6 +76,13 @@ def _validate_features(cfg: Any) -> None:
                 f"ERNIE 5.5 Flash's MLA layers run flashmla_sparse only, got "
                 f"{flag} {value}"
             )
+    if cfg.enable_two_batch_overlap or cfg.enable_single_batch_overlap:
+        # Each attention module carries the output gate between two of the parent's
+        # hooks, which a second micro-batch entering the same module would clobber.
+        raise ValueError(
+            "ERNIE 5.5 Flash does not support batch overlap; drop "
+            "--enable-two-batch-overlap / --enable-single-batch-overlap"
+        )
     if cfg.dcp_size > 1:
         # The memory budget does not price the DSA index buffer DCP enlarges.
         raise ValueError("ERNIE 5.5 Flash does not support decode context parallelism")

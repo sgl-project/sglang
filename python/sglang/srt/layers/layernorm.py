@@ -1105,6 +1105,12 @@ class RMSNorm(BaseFusedOp):
         return out, scale, orig_dtype
 
 
+def exact_rms_norm(x: torch.Tensor, norm: RMSNorm) -> torch.Tensor:
+    """``norm`` through torch's rms_norm, which, unlike the fused kernel, matches
+    a trainer that uses it bit for bit."""
+    return F.rms_norm(x, (x.shape[-1],), norm.weight, norm.variance_epsilon)
+
+
 class LayerNorm(BaseFusedOp):
     def __init__(
         self,

@@ -160,6 +160,8 @@ class TestErnie5_5ServerArgOverrides(CustomTestCase):
         swa_full_tokens_ratio=None,
         dsa_prefill_backend=None,
         dsa_decode_backend=None,
+        enable_two_batch_overlap=False,
+        enable_single_batch_overlap=False,
         dcp_size=1,
         disaggregation_mode="null",
         pp_size=1,
@@ -181,6 +183,8 @@ class TestErnie5_5ServerArgOverrides(CustomTestCase):
             ("enable_decoder_swa_bounded_replay", True, "decoder-swa-bounded-replay"),
             ("dsa_prefill_backend", "flashmla_kv", "flashmla_sparse only"),
             ("dsa_decode_backend", "trtllm", "flashmla_sparse only"),
+            ("enable_two_batch_overlap", True, "batch overlap"),
+            ("enable_single_batch_overlap", True, "batch overlap"),
             ("dcp_size", 2, "decode context parallelism"),
         ):
             with self.subTest(field=field):

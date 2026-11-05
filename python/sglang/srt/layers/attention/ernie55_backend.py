@@ -16,9 +16,10 @@
 
 The HCA layers (``compress_ratio == 128``) run the compressed-KV backend this
 class inherits unchanged. The MLA layers run a DSA sub-backend over
-the latent sub-pool of :class:`Ernie5_5TokenToKVPool`; the model publishes it
-as the forward-context backend for the duration of those layers, so the DSA
-attention and its lightning indexer resolve to it like in a plain DSA model.
+the latent sub-pool of :class:`Ernie5_5TokenToKVPool`; inside
+:meth:`Ernie5_5AttnBackend.mla_layer_context` it is the forward-context backend,
+so the DSA attention and its lightning indexer resolve to it like in a plain DSA
+model.
 """
 
 from __future__ import annotations
@@ -42,6 +43,10 @@ from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
 from sglang.srt.mem_cache.ernie55_memory_pool import (
     DSA_PAGE_SIZE,
     Ernie5_5TokenToKVPool,
+)
+from sglang.srt.model_executor.forward_context import (
+    forward_context,
+    get_forward_context,
 )
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 
@@ -298,6 +303,22 @@ class Ernie5_5AttnBackend(DeepseekV4AttnBackend):
         )
         self.mla_attn_backend.prefill_attention_backend_str = "dsa"
         self.mla_attn_backend.decode_attention_backend_str = "dsa"
+
+    @contextlib.contextmanager
+    def mla_layer_context(self):
+        """Run an MLA layer: publish the MLA sub-backend as the forward-context
+        backend, which the DSA attention and indexer read directly."""
+        with forward_context(
+            dataclasses.replace(
+                get_forward_context(), attn_backend=self.mla_attn_backend
+            )
+        ):
+            yield
+
+    def read_rows(self, rows: Optional[torch.Tensor], num_rows: int):
+        """Compute the MLA layers' output for ``rows`` only; see
+        :meth:`Ernie5_5MlaAttnBackend.read_rows`."""
+        return self.mla_attn_backend.read_rows(rows, num_rows)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch) -> None:
         super().init_forward_metadata(forward_batch)

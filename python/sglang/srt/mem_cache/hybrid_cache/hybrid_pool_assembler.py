@@ -689,46 +689,48 @@ def _dsv4_low_ratio_entries(
     return entries
 
 
-def _ernie55_mla_entries(
+def _extra_host_region_entries(
     kvcache: Any,
     page_size: int,
     num_host_pages: int,
     transfer_layer_id_max: int,
     draft_device_pools: tuple[Any, ...],
 ) -> list[PoolEntry]:
-    """FULL-page HiCache entries for the MLA latent and index-key sub-pool,
-    which the compressed-KV layout lacks; NextN draft buffers follow the target's."""
-    from sglang.srt.mem_cache.ernie55_memory_pool import Ernie5_5TokenToKVPool
+    """FULL-page HiCache entries for the regions a pool keeps beside the
+    compressed-KV layout (``extra_host_regions``, e.g. ERNIE 5.5's MLA latent and
+    index keys); packed draft buffers follow the target's."""
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 
-    if not isinstance(kvcache, Ernie5_5TokenToKVPool):
+    if not isinstance(kvcache, DeepSeekV4TokenToKVPool):
         return []
-    draft_buffers: dict[str, list[Any]] = {}
+    draft_buffers: dict[PoolName, list[Any]] = {}
     for pool in draft_device_pools:
-        if isinstance(pool, Ernie5_5TokenToKVPool):
-            for region in pool.mla_host_regions():
-                draft_buffers.setdefault(region.kind, []).extend(region.device_buffers)
-    names = {"latent": PoolName.ERNIE5_5_MLA, "indexer": PoolName.ERNIE5_5_MLA_INDEXER}
-    target_regions = kvcache.mla_host_regions()
-    orphans = set(draft_buffers) - {region.kind for region in target_regions}
+        if isinstance(pool, DeepSeekV4TokenToKVPool):
+            for region in pool.extra_host_regions():
+                draft_buffers.setdefault(region.pool_name, []).extend(
+                    region.device_buffers
+                )
+    target_regions = kvcache.extra_host_regions()
+    orphans = set(draft_buffers) - {region.pool_name for region in target_regions}
     if orphans:
         # Packed drafts ride a target host pool; with none, they would be dropped.
         raise ValueError(
-            f"ERNIE 5.5 draft MLA {sorted(orphans)} pages have no target MLA "
-            "layer on this pipeline stage to share a HiCache host pool with"
+            f"draft {sorted(orphans)} pages have no target layer on this pipeline "
+            "stage to share a HiCache host pool with"
         )
     entries = []
     for region in target_regions:
-        drafts = draft_buffers.get(region.kind, [])
+        drafts = draft_buffers.get(region.pool_name, [])
         if any(buf.shape[1] != region.item_bytes for buf in drafts):
             raise ValueError(
-                f"ERNIE 5.5 draft {region.kind} pages must match the target's "
+                f"draft {region.pool_name} pages must match the target's "
                 f"{region.item_bytes} B pages to share its host pool"
             )
         entries.append(
             build_pool_entry(
-                name=names[region.kind],
+                name=region.pool_name,
                 host_pool=DeepSeekV4PagedHostPool(
-                    pool_name=str(names[region.kind]),
+                    pool_name=str(region.pool_name),
                     device_buffers=[*region.device_buffers, *drafts],
                     item_bytes=region.item_bytes,
                     num_host_pages=num_host_pages,
@@ -813,18 +815,21 @@ def build_deepseek_v4_hicache_stack(
             physical_page_size=swa_info.page_slots,
             consumer="DeepSeek-V4 HiCache",
         )
-        from sglang.srt.mem_cache.ernie55_memory_pool import Ernie5_5TokenToKVPool
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+            DeepSeekV4TokenToKVPool,
+        )
 
         # NextN has one layer per pool, while DSpark keeps all stages in one pool.
         for pool in params.mtp_draft_device_pools:
-            if isinstance(pool, Ernie5_5TokenToKVPool) and not pool._swa_layer_ids():
-                # The NextN draft is one MLA layer: no SWA buffer to pack.
+            if isinstance(pool, DeepSeekV4TokenToKVPool) and not pool._swa_layer_ids():
+                # A draft with no SWA layer (ERNIE 5.5's NextN MLA layer) has no
+                # SWA buffer to pack.
                 continue
             draft_swa = _dsv4_pool_infos(pool).get(PoolName.SWA)
             if draft_swa is None:
                 raise ValueError("Packed DSV4 draft requires paged SWA storage")
             mtp_swa_device_buffers.extend(draft_swa.buffer_info.buffers)
-        # ERNIE 5.5's MLA layers own no SWA buffer, so map the SWA layers alone.
+        # Map the SWA layers alone: ERNIE 5.5's MLA layers own no SWA buffer.
         swa_layer_mapping = with_packed_draft_layer_mapping(
             _dsv4_transfer_layer_mapping(swa.layer_ids, kvcache.start_layer),
             transfer_layer_start=transfer_layer_id_max,
@@ -1063,7 +1068,7 @@ def build_deepseek_v4_hicache_stack(
         )
     )
     entries.extend(
-        _ernie55_mla_entries(
+        _extra_host_region_entries(
             kvcache,
             page_size,
             num_host_pages,

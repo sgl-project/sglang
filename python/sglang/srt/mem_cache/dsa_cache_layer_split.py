@@ -306,32 +306,22 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
 
     # ---- buffer allocation (owned-only + remote scratch) ------------------
 
+    def layer_buffer_rows(self, layer_index: int) -> int:
+        # Non-owned layers allocate a 0-row placeholder so ``kv_buffer`` stays
+        # index-aligned by layer.
+        if not self._is_layer_owned(self.start_layer + layer_index):
+            return 0
+        return super().layer_buffer_rows(layer_index)
+
     def _create_buffers(self):
         self._log_layer_shard_plan()
+        super()._create_buffers()
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
                 torch.cuda.use_mem_pool(self.custom_mem_pool)
                 if self.custom_mem_pool
                 else nullcontext()
             ):
-                # Owned layers get the full buffer; non-owned layers allocate a
-                # 0-row placeholder so ``kv_buffer`` stays index-aligned by layer.
-                self.kv_buffer = [
-                    torch.zeros(
-                        (
-                            (
-                                (self.size + self.page_size)
-                                if self._is_layer_owned(self.start_layer + i)
-                                else 0
-                            ),
-                            1,
-                            self.kv_cache_dim,
-                        ),
-                        dtype=self.store_dtype,
-                        device=self.device,
-                    )
-                    for i in range(self.layer_num)
-                ]
                 self.remote_kv_buffer = torch.empty(
                     (self.size + self.page_size, 1, self.kv_cache_dim),
                     dtype=self.store_dtype,
