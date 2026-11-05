@@ -1366,6 +1366,219 @@ mod tests {
         rt.request_shutdown();
     }
 
+    /// `SGLANG_ENABLE_REQUEST_DECOMPRESSION` answers as Python's middleware
+    /// does. A body tagged `x-body-compressed: zstd` reaches an embedding
+    /// package's layer and every route decompressed, with the header dropped
+    /// and the content length fixed, and without a size cap; multiple frames
+    /// decode as one body, and an empty body stays empty. An unknown method, a corrupt payload or a frame
+    /// needing a window over libzstd's 128 MiB default is a plain-text 400
+    /// that reaches neither the layer nor the scheduler. Turned off, the
+    /// header is ignored.
+    #[test]
+    fn compressed_request_bodies_match_python_decompression() {
+        use std::io::{Read, Write};
+        use std::sync::Mutex;
+        use std::time::Duration;
+
+        fn http_request(
+            addr: std::net::SocketAddr,
+            path: &str,
+            compression: Option<&str>,
+            body: &[u8],
+        ) -> String {
+            let mut conn = std::net::TcpStream::connect(addr).expect("connect");
+            conn.set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let compression = compression
+                .map(|method| format!("x-body-compressed: {method}\r\n"))
+                .unwrap_or_default();
+            write!(
+                conn,
+                "POST {path} HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\n\
+                 {compression}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            conn.write_all(body).unwrap();
+            let mut response = String::new();
+            conn.read_to_string(&mut response).unwrap();
+            response
+        }
+        // The status line and body: the `date` header can differ between two
+        // otherwise identical responses.
+        fn status_and_body(response: &str) -> (&str, &str) {
+            let (head, body) = response.split_once("\r\n\r\n").expect("response head");
+            (head.lines().next().unwrap_or_default(), body)
+        }
+        fn zstd_frames(body: &[u8], frames: usize, window_log: u32) -> Vec<u8> {
+            body.chunks(body.len().div_ceil(frames))
+                .flat_map(|chunk| {
+                    let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 3).unwrap();
+                    encoder
+                        .set_parameter(zstd::zstd_safe::CParameter::WindowLog(window_log))
+                        .unwrap();
+                    encoder.write_all(chunk).unwrap();
+                    encoder.finish().unwrap()
+                })
+                .collect()
+        }
+        let zstd = |body: &[u8]| zstd_frames(body, 1, 20);
+
+        // What the embedding package's layer read: path, whether the
+        // compression header was still set, content length, body.
+        type Seen = (String, bool, Option<String>, Vec<u8>);
+        let seen = Arc::new(Mutex::new(Vec::<Seen>::new()));
+        let recorder = seen.clone();
+        let layer: HttpLayer = Arc::new(move |app: axum::Router| {
+            let recorder = recorder.clone();
+            app.layer(axum::middleware::from_fn(
+                move |request: axum::extract::Request, next: axum::middleware::Next| {
+                    let recorder = recorder.clone();
+                    async move {
+                        let (parts, body) = request.into_parts();
+                        let body = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+                        recorder.lock().unwrap().push((
+                            parts.uri.path().to_owned(),
+                            parts.headers.contains_key("x-body-compressed"),
+                            parts
+                                .headers
+                                .get("content-length")
+                                .map(|value| value.to_str().unwrap().to_owned()),
+                            body.to_vec(),
+                        ));
+                        let request =
+                            axum::extract::Request::from_parts(parts, axum::body::Body::from(body));
+                        next.run(request).await
+                    }
+                },
+            ))
+        });
+        let (addr, _) = free_loopback_addrs();
+        let mut cfg = test_config(addr, None);
+        cfg.server_args = Arc::new(ServerArgs {
+            enable_request_decompression: true,
+            ..test_server_args()
+        });
+        let rt = start(cfg, Some(layer)).expect("start runtime");
+        take_startup_freeze_gc(&rt);
+
+        let generate =
+            br#"{"input_ids":[1,2,3],"stream":false,"sampling_params":{"max_new_tokens":8}}"#;
+        let compressed = zstd(generate);
+        let request =
+            std::thread::spawn(move || http_request(addr, "/generate", Some("zstd"), &compressed));
+        assert!(
+            rt.to_scheduler_rx.wait(Duration::from_secs(5)),
+            "the compressed request did not reach the scheduler ring"
+        );
+        let requests = rt.to_scheduler_rx.drain(1);
+        let input = requests[0]
+            .buffers
+            .iter()
+            .find(|buffer| buffer.name == "input_ids")
+            .expect("input token buffer");
+        assert_eq!(input.shape, vec![3]);
+        let rid = scheduler_rid(&requests[0].header);
+        assert!(
+            rt.from_scheduler_tx
+                .push(terminal_token_frame(rid, &[9, 10]))
+        );
+        let response = request.join().unwrap();
+        let (status, body) = status_and_body(&response);
+        assert_eq!(status, "HTTP/1.1 200 OK", "{response}");
+        assert!(body.contains(r#""output_ids":[9,10]"#), "{response}");
+        assert_eq!(
+            seen.lock().unwrap().pop(),
+            Some((
+                "/generate".to_owned(),
+                false,
+                Some(generate.len().to_string()),
+                generate.to_vec()
+            ))
+        );
+
+        // Each route answers a compressed body as it answers the plain one;
+        // the padded body inflates ~16 MiB from a few KiB.
+        let padded = format!(r#"{{"input_ids":[1],"text":"x"{}}}"#, " ".repeat(16 << 20));
+        for (path, plain) in [
+            ("/generate", br#"{"input_ids":[1],"text":"x"}"#.to_vec()),
+            ("/generate", padded.into_bytes()),
+            ("/v1/completions", b"{}".to_vec()),
+            ("/v1/chat/completions", b"{}".to_vec()),
+        ] {
+            let expected = http_request(addr, path, None, &plain);
+            assert!(
+                status_and_body(&expected).0.starts_with("HTTP/1.1 400"),
+                "{expected}"
+            );
+            for compressed in [zstd(&plain), zstd_frames(&plain, 2, 20)] {
+                let response = http_request(addr, path, Some("zstd"), &compressed);
+                assert_eq!(status_and_body(&response), status_and_body(&expected));
+                let (seen_path, still_compressed, _, seen_body) =
+                    seen.lock().unwrap().pop().unwrap();
+                assert_eq!(seen_path, path);
+                assert!(!still_compressed);
+                assert!(seen_body == plain, "{path}: the layer saw another body");
+            }
+        }
+        let empty = http_request(addr, "/generate", None, b"");
+        assert!(
+            status_and_body(&empty).0.starts_with("HTTP/1.1 400"),
+            "{empty}"
+        );
+        let tagged_empty = http_request(addr, "/generate", Some("zstd"), b"");
+        assert_eq!(status_and_body(&tagged_empty), status_and_body(&empty));
+
+        seen.lock().unwrap().clear();
+        let unsupported =
+            |method: &str| format!("unsupported x-body-compressed '{method}'; supported: ['zstd']");
+        for (method, body, message) in [
+            ("gzip", zstd(generate), unsupported("gzip")),
+            ("ZSTD", zstd(generate), unsupported("ZSTD")),
+            (
+                "zstd",
+                b"not-zstd-data".to_vec(),
+                "decompress failed".to_owned(),
+            ),
+            (
+                "zstd",
+                [zstd(generate), b"garbage".to_vec()].concat(),
+                "decompress failed".to_owned(),
+            ),
+            (
+                "zstd",
+                zstd_frames(generate, 1, 28),
+                "decompress failed".to_owned(),
+            ),
+        ] {
+            let response = http_request(addr, "/generate", Some(method), &body);
+            let (head, body) = response.split_once("\r\n\r\n").unwrap();
+            assert!(head.starts_with("HTTP/1.1 400"), "{response}");
+            assert!(
+                !head.to_ascii_lowercase().contains("content-type"),
+                "{response}"
+            );
+            assert_eq!(body, message);
+        }
+        assert!(seen.lock().unwrap().is_empty());
+        assert!(!rt.to_scheduler_rx.wait(Duration::from_millis(200)));
+        rt.request_shutdown();
+
+        let (addr, _) = free_loopback_addrs();
+        let rt = start(test_config(addr, None), None).expect("start runtime");
+        take_startup_freeze_gc(&rt);
+        let compressed = zstd(generate);
+        let tagged = http_request(addr, "/generate", Some("zstd"), &compressed);
+        let untagged = http_request(addr, "/generate", None, &compressed);
+        assert!(
+            status_and_body(&untagged).0.starts_with("HTTP/1.1 400"),
+            "{untagged}"
+        );
+        assert_eq!(status_and_body(&tagged), status_and_body(&untagged));
+        assert!(!rt.to_scheduler_rx.wait(Duration::from_millis(200)));
+        rt.request_shutdown();
+    }
+
     /// Regression: a port conflict must fail `start` (so the scheduler doesn't
     /// advertise ready), not return an `Ok` runtime whose listener never binds.
     #[test]
