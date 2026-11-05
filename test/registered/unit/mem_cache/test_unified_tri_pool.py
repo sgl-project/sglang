@@ -18,7 +18,9 @@ SWA KV + mamba/conv state in ONE unified byte buffer, chain
 Pure CPU; fakes stand in for the KV pools (data markers verify moves).
 """
 
+import copy
 import inspect
+import random
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -34,7 +36,11 @@ from sglang.srt.mem_cache.kv.alloc.band import (
     FloatBand,
 )
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
-from sglang.srt.mem_cache.kv.alloc.pricing import float_fit
+from sglang.srt.mem_cache.kv.alloc.pricing import (
+    float_fit,
+    float_reclaim_satisfied,
+    float_token_id_capacity,
+)
 from sglang.srt.mem_cache.layout.fused_draft import (
     DenseDraftRegion,
     DraftStateGeometry,
@@ -451,6 +457,77 @@ class TestUnifiedTriPool(_PoolTestCase):
                 self.assertGreaterEqual(mamba_slots.schedulable_available_size(), 1)
                 self.assertIsNotNone(mamba_slots.alloc(1))
                 self.assertEqual(allocator.verify_byte_accounting(), [])
+
+    # -- the reclaim certificate and ensure_capacity --
+
+    @staticmethod
+    def _churn_step(rng, allocator, requests, slots, page_size):
+        """One random event: admit a request, slide its window, finish one, or
+        take or return a state slot."""
+        op = rng.random()
+        if op < 0.4:
+            indices = allocator.alloc(rng.randint(1, 4) * page_size)
+            if indices is not None:
+                requests.append([indices, True])
+        elif op < 0.6 and requests:
+            request = requests[rng.randrange(len(requests))]
+            if request[1]:
+                allocator.free_swa(request[0])
+                request[1] = False
+        elif op < 0.8 and requests:
+            indices, swa_live = requests.pop(rng.randrange(len(requests)))
+            (allocator.free if swa_live else allocator.free_full)(indices)
+        elif op < 0.9:
+            slot = allocator.mamba_allocator.alloc(1)
+            if slot is not None:
+                slots.append(slot)
+        elif slots:
+            allocator.mamba_allocator.free(slots.pop(rng.randrange(len(slots))))
+
+    def test_a_failed_ensure_leaves_no_reclaim_certificate(self):
+        """When ensure_capacity fails, the reclaim certificate must not hold:
+        decode eviction stops on it and frees nothing, so the check would retract
+        a request that a second ensure_capacity could have served."""
+        for lazy_compaction in (True, False):
+            for seed in range(8):
+                rng = random.Random(seed)
+                page_size = rng.choice([1, 2, 4])
+                _, allocator, _, _ = self._build(
+                    n_full=rng.choice([48, 64, 96]) * page_size,
+                    n_swa=rng.choice([12, 16, 24]) * page_size,
+                    n_state=rng.choice([6, 8, 12]),
+                    page_size=page_size,
+                    lazy_compaction=lazy_compaction,
+                )
+                chain = float_chain(allocator)
+                requests, slots = [], []
+                for step in range(120):
+                    self._churn_step(rng, allocator, requests, slots, page_size)
+                    for pages in range(1, 5):
+                        need = pages * page_size
+                        if (
+                            float_token_id_capacity(
+                                allocator.pricing_snapshot(), chain, need
+                            )
+                            and need <= allocator.available_size()
+                        ):
+                            continue
+                        probe = copy.deepcopy(allocator)
+                        # Opened before the outcome, so a served case reports an explicit pass.
+                        with self.subTest(
+                            lazy_compaction=lazy_compaction,
+                            seed=seed,
+                            step=step,
+                            need=need,
+                        ):
+                            if probe.ensure_capacity(need, need):
+                                continue
+                            self.assertFalse(
+                                float_reclaim_satisfied(
+                                    probe.pricing_snapshot(), chain, need
+                                )
+                            )
+                            self.assertEqual(probe.verify_byte_accounting(), [])
 
 
 class TestTriPagedFreeGroup(_PoolTestCase):

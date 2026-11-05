@@ -776,33 +776,42 @@ class _FloatChainPolicy(_WindowPolicy):
             return False
         if need_tokens <= c.available_size():
             return True
+        realized = self._realize_token_certificate(c, chain, need_tokens)
+        if realized is not None:
+            return realized
+        if float_byte_shortfall(_snapshot(c), chain, need_tokens) > 0:
+            return False
+        # Today's last resort, imperative: where the float's holes sit decides it.
+        if relieve_for_alloc(c, need_tokens):
+            return True
+        return bool(self._realize_token_certificate(c, chain, need_tokens))
+
+    def _realize_token_certificate(
+        self, c: ChainAllocator, chain: FloatChain, need_tokens: int
+    ) -> Optional[bool]:
+        """Realize the end or float reclaim certificate; None when neither holds."""
         if float_end_certificate(_snapshot(c), chain, need_tokens):
             # The certificate preserves FLOAT holes in place. Absorbing FLOAT
             # boundaries first would describe a different allocation layout.
             c.full_attn_allocator.flush_for_allocation()
             c.mamba_allocator.flush_for_allocation()
             return need_tokens <= c.available_size()
-        if float_high_target(_snapshot(c), chain, need_tokens) is not None:
-            c.full_attn_allocator.flush_for_allocation()
-            c.mamba_allocator.flush_for_allocation()
-            if not float_token_id_capacity(_snapshot(c), chain, need_tokens):
-                return False
-            if need_tokens <= c.available_size():
-                return True
-            # Recompute from actual frontiers: no credit for another END flush.
-            target = float_high_target(
-                _snapshot(c), chain, need_tokens, flush_ends=False
-            )
-            if target is None:
-                return False
-            c.swa_attn_allocator.make_room(side="high", min_bytes=target)
-            return float_token_id_capacity(_snapshot(c), chain, need_tokens) and (
-                need_tokens <= c.available_size()
-            )
-        if float_byte_shortfall(_snapshot(c), chain, need_tokens) > 0:
+        if float_high_target(_snapshot(c), chain, need_tokens) is None:
+            return None
+        c.full_attn_allocator.flush_for_allocation()
+        c.mamba_allocator.flush_for_allocation()
+        if not float_token_id_capacity(_snapshot(c), chain, need_tokens):
             return False
-        # Today's last resort, imperative: where the float's holes sit decides it.
-        return relieve_for_alloc(c, need_tokens)
+        if need_tokens <= c.available_size():
+            return True
+        # Recompute from actual frontiers: no credit for another END flush.
+        target = float_high_target(_snapshot(c), chain, need_tokens, flush_ends=False)
+        if target is None:
+            return False
+        c.swa_attn_allocator.make_room(side="high", min_bytes=target)
+        return float_token_id_capacity(_snapshot(c), chain, need_tokens) and (
+            need_tokens <= c.available_size()
+        )
 
     def _compute_available_size(self, c: ChainAllocator) -> int:
         """Joint TOKENS for equal FULL/SWA demand, using the same page predicate
