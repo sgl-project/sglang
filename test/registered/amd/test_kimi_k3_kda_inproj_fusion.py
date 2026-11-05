@@ -17,6 +17,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.kernels.ops.gemm import kimi_k3_tiny_gemm
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.models.kimi_k3 import (
     KimiK3DeltaAttention,
     _merge_weights_as_views,
@@ -154,6 +155,40 @@ class TestKimiK3KDAInProjFusion(CustomTestCase):
             fake_attention, x, defer_f_b=False
         )
         torch.testing.assert_close(eager_gate, expected_gate)
+
+    @unittest.skipUnless(torch.version.hip is not None, "ROCm-only fused path")
+    def test_gate_allows_quantized_checkpoint_with_bf16_attention(self):
+        """A quantized checkpoint has do_fuse_qkvbfg False (quant_config is
+        not None) but keeps the attention linears in bf16; the fusion must
+        still apply. Quantized attention weights, attention linears that are
+        quantized after loading, and DP attention must not."""
+
+        def fake_attention(dtype, attn_tp_size=8, quant_method=None):
+            mods = [
+                SimpleNamespace(
+                    weight=torch.empty(rows, HIDDEN, dtype=dtype),
+                    quant_method=quant_method or UnquantizedLinearMethod(),
+                )
+                for rows in (WIDE, HEAD_DIM, HEADS_TP)
+            ]
+            return SimpleNamespace(
+                do_fuse_qkvbfg=False,
+                use_full_rank_gate=True,
+                attn_tp_size=attn_tp_size,
+                tp_size=8,
+                _bfa_uses_block_fp8=False,
+                fused_qkvg_proj=mods[0],
+                f_a_proj=mods[1],
+                b_proj=mods[2],
+            )
+
+        may_fuse = KimiK3DeltaAttention._may_fuse_kda_inproj
+        self.assertTrue(may_fuse(fake_attention(torch.bfloat16)))
+        self.assertFalse(may_fuse(fake_attention(torch.float8_e4m3fn)))
+        self.assertFalse(may_fuse(fake_attention(torch.bfloat16, attn_tp_size=1)))
+        self.assertFalse(
+            may_fuse(fake_attention(torch.bfloat16, quant_method=object()))
+        )
 
 
 if __name__ == "__main__":
