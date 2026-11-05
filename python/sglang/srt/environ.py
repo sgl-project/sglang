@@ -2551,6 +2551,9 @@ class Envs:
     # (bit-identical logits), at this many CTAs per request group.
     SGLANG_ENABLE_QSA_GROUPED4_VERIFY_CHAIN = EnvBool(False)
     SGLANG_QSA_GROUPED4_VERIFY_CHAIN_CTAS = EnvInt(512)
+    # With the chain switch: software-pipeline the chain kernel's key tiles over this many
+    # shared-memory buffers (bit-identical logits); 0 keeps the chain kernel.
+    SGLANG_QSA_GROUPED4_VERIFY_PIPELINE_STAGES = EnvInt(0)
     # Score the MTP draft extend's rows four per request on the grouped4 kernel
     # (TP1, a window of four per request); other shapes keep per-row scoring.
     SGLANG_ENABLE_QSA_GROUPED4_DRAFT_EXTEND = EnvBool(False)

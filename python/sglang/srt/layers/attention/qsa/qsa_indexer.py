@@ -135,6 +135,8 @@ def _qsa_shadow_check(q, cache, table, lengths, max_model_len, k, logits, indice
 _QSA_PREFILL_LOGITS_BUDGET_BYTES = 128 * 1024 * 1024
 _Q38C_SCORE_Q4 = os.environ.get("SGLANG_Q38C_SCORE_Q4", "0") == "1"
 _Q38C_MK_QSA = os.environ.get("SGLANG_Q38C_MK_QSA", "0") == "1"
+# qsa/prefill_select.py: the same prefill selection with fewer, fuller launches.
+_QSA_PREFILL_FAST_SELECT = _qsa_env_flag("SGLANG_ENABLE_QSA_PREFILL_FAST_SELECT", "0")
 
 
 def _qsa_prefill_row_chunk_size(rows: int, keys: int, heads: int) -> int:
@@ -737,6 +739,24 @@ class QSAIndexer(MultiPlatformOp):
         )
         if rows == 0:
             return output
+        if _QSA_PREFILL_FAST_SELECT:
+            from sglang.srt.layers.attention.qsa.prefill_select import (
+                select_prefill_fast,
+            )
+
+            # Bit-identical to the code below; False when its shape is not covered.
+            if select_prefill_fast(
+                self,
+                q,
+                compressed_keys,
+                row_starts,
+                row_ends,
+                query_positions,
+                sequence_lengths_for_rows,
+                max_row_keys,
+                output,
+            ):
+                return output
 
         relative = (
             max_row_keys is not None and max_row_keys > 0 and q.is_cuda and HAS_TILELANG

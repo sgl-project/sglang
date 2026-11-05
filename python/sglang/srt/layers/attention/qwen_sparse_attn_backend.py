@@ -19,6 +19,7 @@ import torch.nn.functional as F
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.qsa import tma_prefill as qsa_tma_prefill
 from sglang.srt.layers.attention.qsa.config import (
     is_qwen_qsa,
     parse_qsa_profile,
@@ -101,6 +102,13 @@ def _last_rows_of_runs(*, extend_lens, pool_ids, num_rows: int) -> list:
 
 # Measured at 4-32 verify rows; larger batches keep fused_kv_prepare + trtllm.
 _QSA_POOL_DECODE_MAX_ROWS = 64
+# Opt-in FP8 pool-read verify attention (qsa/pool_union_decode.py); off by default, read once.
+_QSA_FP8_POOL_VERIFY = os.environ.get("SGLANG_QSA_FP8_POOL_VERIFY", "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 
 
 @lru_cache(maxsize=1)
@@ -1904,6 +1912,24 @@ class QwenSparseAttnBackend(AttentionBackend):
                 ratio=self.compress_ratio,
                 write_new_kv=not kv_prestored,
             )
+        if (
+            _QSA_FP8_POOL_VERIFY
+            and mode.is_target_verify()
+            and get_parallel().tp_size == 1
+            and is_sm100_supported()
+            and int(getattr(forward_batch.spec_info, "topk", 1) or 1) == 1
+            and _qsa_pool_decode_enabled()
+            and self._uses_block_indices(indices)
+            and indexer is not None
+            and indexer.decode_logical_positions is not None
+        ):
+            from sglang.srt.layers.attention.qsa import pool_union_decode as union
+
+            if union.admits(rows, kc.dtype, q.dtype):
+                return self._qsa_fp8_pool_verify(
+                    union, q, k, v, kc, vc, loc, layer, forward_batch, metadata,
+                    indices, width, kv_prestored,
+                )
         return self._forward_trtllm_sparse(
             q.reshape(rows, layer.tp_q_head_num, layer.head_dim),
             kc,
@@ -1918,6 +1944,38 @@ class QwenSparseAttnBackend(AttentionBackend):
             ),
             trtllm_decode,
             new_kv=(k, v, loc, width),
+        )
+
+    def _qsa_fp8_pool_verify(
+        self, union, q, k, v, kc, vc, loc, layer, forward_batch, metadata, indices, width,
+        kv_prestored,
+    ):
+        """SGLANG_QSA_FP8_POOL_VERIFY: a topk-1 verify's sparse attention read from an FP8
+        pool, each request's union of rows once. k/v are already cast to the pool dtype; E4M3
+        widens to BF16 exactly with no k/v scale, as trtllm reads the packed rows
+        (bmm1_scale = layer.scaling, bmm2_scale = 1.0)."""
+        rows = indices.shape[0]
+        row_requests = metadata.row_req_pool_indices
+        if row_requests is None:
+            row_requests = forward_batch.req_pool_indices
+        union.log_engaged(rows, width, kc.shape[1], q.device)
+        return union.qsa_pool_union_decode(
+            q.reshape(rows, layer.tp_q_head_num, layer.head_dim),
+            kc,
+            vc,
+            k,
+            v,
+            loc,
+            self.req_to_token_pool.req_to_token,
+            row_requests,
+            indices.to(torch.int32).contiguous(),
+            metadata.sequence_lengths,
+            metadata.indexer_metadata.decode_logical_positions,
+            width,
+            layer.scaling,
+            ratio=self.compress_ratio,
+            write_new_kv=not kv_prestored,
+            **union.LAUNCH,
         )
 
     def forward_extend(
@@ -2017,6 +2075,20 @@ class QwenSparseAttnBackend(AttentionBackend):
                 sequence_lens, dtype=torch.int32, device=q.device
             )
         cu_seqlens_k = F.pad(sequence_lens_tensor.cumsum(0), (1, 0)).contiguous()
+        if qsa_tma_prefill.ENABLED:
+            output = self._qsa_tma_chunk_prefill(
+                q=q.contiguous(),
+                layer=layer,
+                forward_batch=forward_batch,
+                topk_indices=topk_indices,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                sequence_lens=sequence_lens,
+                sequence_lens_tensor=sequence_lens_tensor,
+                max_q=max_q,
+            )
+            if output is not None:
+                return self._pad_extend_output(output, num_output_rows)
         packed_k, packed_v = pack_qsa_prefill_kv(
             k=pool.layer_router.read(layer.layer_id).key(),
             v=pool.layer_router.read(layer.layer_id).value(),
@@ -2039,6 +2111,57 @@ class QwenSparseAttnBackend(AttentionBackend):
             max_q=max_q,
         )
         return self._pad_extend_output(output, num_output_rows)
+
+    def _qsa_tma_chunk_prefill(
+        self,
+        *,
+        q,
+        layer,
+        forward_batch,
+        topk_indices,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        sequence_lens,
+        sequence_lens_tensor,
+        max_q,
+    ):
+        """SGLANG_ENABLE_QSA_TMA_PREFILL: the stock pack, then the stock kernel's
+        arithmetic with TMA-gathered K/V (qsa/tma_prefill.py; bitwise equal).
+        None keeps the stock code below."""
+        # The grid needs a host max_q; only the prefill host path supplies one.
+        if max_q is None or torch.cuda.is_current_stream_capturing():
+            return None
+        layer_kv = self.token_to_kv_pool.layer_router.read(layer.layer_id)
+        kv_max = max(sequence_lens, default=1)
+        packed_k, packed_v = pack_qsa_prefill_kv(
+            k=layer_kv.key(),
+            v=layer_kv.value(),
+            req_to_token=self.req_to_token_pool.req_to_token,
+            req_indices=forward_batch.req_pool_indices,
+            cu_k=cu_seqlens_k,
+            total_k=sum(sequence_lens),
+            max_k=kv_max,
+            output_dtype=q.dtype,
+        )
+        kernel_args = (
+            q,
+            packed_k,
+            packed_v,
+            topk_indices,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            sequence_lens_tensor,
+            layer.scaling,
+        )
+        if not qsa_tma_prefill.applies(q, packed_k, packed_v, topk_indices):
+            return sparse_gqa_fwd_interface_triton_ck(*kernel_args, max_q=max_q)
+        qsa_tma_prefill.log_once(q, packed_k, topk_indices)
+        return qsa_tma_prefill.checked(
+            lambda: qsa_tma_prefill.chunk_prefill(*kernel_args, max_q=max_q),
+            lambda: sparse_gqa_fwd_interface_triton_ck(*kernel_args, max_q=max_q),
+            q.shape[0],
+            kv_max,
+        )
 
     def prefetch_cp_kv(self, layer, k: torch.Tensor, v: torch.Tensor, forward_batch):
         """Run ``layer``'s prefill-CP K/V gather on a side stream; the layer's
