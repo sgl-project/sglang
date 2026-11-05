@@ -12,6 +12,7 @@ Decode: uses XQA on SM90 and SM120, TRTLLM-GEN on SM100.
 Sliding window and attention sink features are supported.
 """
 
+import contextlib
 import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
@@ -29,11 +30,8 @@ from sglang.kernels.ops.attention.trtllm_mha_page_table import (
 from sglang.kernels.ops.attention.utils import canonicalize_stride
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import (
-    STATIC_SPEC_COMBINATIONS,
     SharedReadEnds,
-    SpecMode,
     resolve_window_kv_pool,
-    spec_combinations,
 )
 from sglang.srt.layers.attention.flashinfer_backend import (
     FlashInferAttnBackend,
@@ -52,7 +50,8 @@ from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.layout.paged_view import paged_kv_view
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import (
     get_buffer,
     get_exec,
@@ -63,11 +62,8 @@ from sglang.srt.runtime_context import (
     max_prefill_buffer_tokens,
     max_speculative_num_draft_tokens,
 )
-from sglang.srt.speculative.ragged_verify import (
-    build_ragged_target_verify_geometry,
-    resolve_ragged_verify_layout,
-)
-from sglang.srt.utils import is_flashinfer_available
+from sglang.srt.speculative.ragged_verify import build_ragged_target_verify_geometry
+from sglang.srt.utils import is_flashinfer_available, print_info_once
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +106,40 @@ def _native_fp4_prefill_output_capacity(
     if chunked_prefill_limit > 0:
         return chunked_prefill_limit
     return max(max_context_len, max_prefill_tokens)
+
+
+# Query rows per CTA (upper bound) whose partial O (FP32) and (max, sum) float2 a
+# trtllm-gen multi-CTA KV split keeps in the workspace.
+_KV_SPLIT_SCRATCH_ROWS_PER_CTA = 128
+
+
+def _full_attn_kv_split_sm_count(
+    *,
+    splits: int,
+    batch_size: int,
+    num_kv_heads: int,
+    device_sm_count: int,
+    max_split_ctas: int,
+) -> Optional[int]:
+    """The SM count that makes trtllm-gen split each (request, KV head) into
+    ``splits`` CTAs, capped at ``max_split_ctas`` CTAs in total; None where
+    FlashInfer's own choice, max(1, sm_count // (batch * kv_heads)), is as high."""
+    base_ctas = batch_size * num_kv_heads
+    splits = min(splits, max_split_ctas // base_ctas)
+    if splits < 2 or device_sm_count // base_ctas >= splits:
+        return None
+    return splits * base_ctas
+
+
+@contextlib.contextmanager
+def _trtllm_decode_sm_count(sm_count: int):
+    # FlashInfer has no per-call KV split yet; it reads get_device_sm_count per call.
+    original = flashinfer.decode.get_device_sm_count
+    flashinfer.decode.get_device_sm_count = lambda device: sm_count
+    try:
+        yield
+    finally:
+        flashinfer.decode.get_device_sm_count = original
 
 
 def _trtllm_native_nvfp4_kv_buffer(token_to_kv_pool, layer_id: int):
@@ -182,18 +212,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
     needs_cpu_seq_lens: bool = False
 
     supports_ragged_verify_graph: bool = True
-
-    # On translated storage: target verify, and a multi-step draft whose steps
-    # take their own window rails and write columns (checked on CPU, not run
-    # on Blackwell hardware). A draft extend is declared there without window
-    # layers only: its window page table is not checked.
-    implemented_spec_combinations = (
-        STATIC_SPEC_COMBINATIONS
-        | spec_combinations(
-            SpecMode.TARGET_VERIFY, SpecMode.DRAFT_DECODE, translated=(True,)
-        )
-        | spec_combinations(SpecMode.DRAFT_EXTEND, window=(False,), translated=(True,))
-    )
 
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         # Prefill metadata init snapshots all scheduler-shared inputs pre-replay.
@@ -352,10 +370,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         # Raw full->swa index mapping tensor for the fused cuda-graph
         # metadata kernel (gather + // page_size happen on device). The unified
         # pool has no token-level mapping, so this is a static-pool mechanism.
-        if (
-            self._swa_kv_pool is not None
-            and not self.kv_index_translator.is_translating
-        ):
+        if self._swa_kv_pool is not None and not self.runner_ids.is_translating:
             self._swa_full_to_swa_mapping = self._swa_kv_pool.full_to_swa_index_mapping
             assert self._swa_full_to_swa_mapping is not None, (
                 "SWA pool must register full_to_swa_index_mapping before "
@@ -432,6 +447,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 "SGLANG_TRTLLM_MHA_DECODE_SEQ_LEN_SPLITS must be at least 1, "
                 f"got {self.decode_seq_len_splits}"
             )
+        # TRTLLM-GEN (SM100) only; the XQA decode kernels pick their own split.
+        self._full_attn_kv_splits = (
+            0 if self.is_xqa_impl else envs.SGLANG_TRTLLM_MHA_FULL_ATTN_KV_SPLITS.get()
+        )
+        if self._full_attn_kv_splits > 1:
+            self._init_full_attn_kv_splits(v_head_dim=config.v_head_dim)
         self._xqa_spec_dec_mask = None
         if self.is_xqa_impl and self.speculative_num_draft_tokens:
             draft_len = self.speculative_num_draft_tokens
@@ -444,6 +465,47 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             self._xqa_spec_dec_mask = (
                 mask.unsqueeze(0).expand(max_bs, -1, -1).contiguous().to(self.device)
             )
+
+    def _init_full_attn_kv_splits(self, *, v_head_dim: int) -> None:
+        self._full_attn_kv_split_min_bs = max(
+            1, envs.SGLANG_TRTLLM_MHA_FULL_ATTN_KV_SPLITS_MIN_BS.get()
+        )
+        self._device_sm_count = flashinfer.utils.get_device_sm_count(
+            torch.device(self.device)
+        )
+        # Every split CTA keeps its partials within half the workspace and takes
+        # one int32 semaphore of the counter buffer (counted in multiples of 8).
+        scratch_bytes_per_cta = _KV_SPLIT_SCRATCH_ROWS_PER_CTA * (8 + 4 * v_head_dim)
+        self._full_attn_kv_split_max_ctas = min(
+            self.workspace_buffer.numel() // 2 // scratch_bytes_per_cta,  # uint8
+            self._multi_ctas_kv_counter_buffer.numel() // 4 // 8 * 8,
+        )
+        print_info_once(
+            f"TRTLLM MHA full-attention decode: {self._full_attn_kv_splits} KV "
+            f"splits per (request, KV head) at batch >= "
+            f"{self._full_attn_kv_split_min_bs}."
+        )
+
+    def _full_attn_kv_split_scope(self, *, window_left: int, batch_size: int, kv_cache):
+        """The SM-count scope of one trtllm-gen decode call under
+        SGLANG_TRTLLM_MHA_FULL_ATTN_KV_SPLITS; a no-op on sliding-window layers."""
+        if (
+            self._full_attn_kv_splits < 2
+            or window_left >= 0
+            or batch_size < self._full_attn_kv_split_min_bs
+        ):
+            return contextlib.nullcontext()
+        k_cache = kv_cache[0] if isinstance(kv_cache, (tuple, list)) else kv_cache
+        sm_count = _full_attn_kv_split_sm_count(
+            splits=self._full_attn_kv_splits,
+            batch_size=batch_size,
+            num_kv_heads=k_cache.shape[-3],  # HND paged cache
+            device_sm_count=self._device_sm_count,
+            max_split_ctas=self._full_attn_kv_split_max_ctas,
+        )
+        if sm_count is None:
+            return contextlib.nullcontext()
+        return _trtllm_decode_sm_count(sm_count)
 
     def _fmha_v2_paged_inputs(
         self,
@@ -712,6 +774,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         max_num_pages = self.max_num_pages
         self.decode_cuda_graph_metadata = {
             "cache_seqlens": torch.zeros(max_bs, dtype=torch.int32, device=self.device),
+            "cu_seqlens_q": torch.arange(
+                max_bs + 1, dtype=torch.int32, device=self.device
+            ),
+            "cu_seqlens_k": torch.zeros(
+                max_bs + 1, dtype=torch.int32, device=self.device
+            ),
             "page_table": torch.zeros(
                 max_bs,
                 max_num_pages,
@@ -733,12 +801,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             self.speculative_num_draft_tokens is not None
             and self.speculative_num_draft_tokens > 0
         ):
-            self.decode_cuda_graph_metadata["cu_seqlens_q"] = torch.arange(
-                0, max_bs + 1, dtype=torch.int32, device=self.device
-            )
-            self.decode_cuda_graph_metadata["cu_seqlens_k"] = torch.zeros(
-                max_bs + 1, dtype=torch.int32, device=self.device
-            )
             self.decode_cuda_graph_metadata["page_table_draft_decode"] = torch.zeros(
                 max_bs,
                 max_num_pages,
@@ -811,8 +873,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
     def _unread_verify_mask(self, max_bs: int) -> Optional[VerifyMask]:
         # Target verify runs the decode kernel, causal within each request's rows; a
-        # topk-1 chain needs no mask (SGLANG_Q35MF_EDGE_CHAIN_TREE), while a tree would.
-        if not envs.SGLANG_Q35MF_EDGE_CHAIN_TREE.get() or self.topk > 1:
+        # topk-1 chain needs no mask (SGLANG_OPT_TRTLLM_MHA_CHAIN_VERIFY), while a tree would.
+        if not envs.SGLANG_OPT_TRTLLM_MHA_CHAIN_VERIFY.get() or self.topk > 1:
             return None
         return maybe_create_verify_mask(
             is_draft_runner=self.is_draft_runner,
@@ -835,6 +897,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         forward_mode: ForwardMode,
         spec_info,
         device: torch.device,
+        ragged_verify_layout: Optional[RaggedVerifyLayout],
     ) -> TRTLLMMHAMetadata:
         """Create TRTLLMMHAMetadata with pre-allocated buffer slice refs, stored in the dict."""
         metadata = TRTLLMMHAMetadata()
@@ -866,12 +929,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 metadata.cache_seqlens_int32 = self.decode_cuda_graph_metadata[
                     "cache_seqlens"
                 ][:bs]
-                metadata.cu_seqlens_q = torch.arange(
-                    0, bs + 1, dtype=torch.int32, device=device
-                )
-                metadata.cu_seqlens_k = torch.zeros(
-                    bs + 1, dtype=torch.int32, device=device
-                )
+                # All variants read/write the backend-owned storage, including
+                # the in-graph refresh recorded before attention.
+                metadata.cu_seqlens_q = self.decode_cuda_graph_metadata["cu_seqlens_q"][
+                    : bs + 1
+                ]
+                metadata.cu_seqlens_k = self.decode_cuda_graph_metadata["cu_seqlens_k"][
+                    : bs + 1
+                ]
                 metadata.page_table = self.decode_cuda_graph_metadata["page_table"][
                     :bs, :
                 ]
@@ -893,9 +958,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             metadata.cu_seqlens_k = self.target_verify_metadata["cu_seqlens_k"][
                 : bs + 1
             ]
-            metadata.is_ragged_verify = (
-                spec_info is not None and spec_info.ragged_verify_layout is not None
-            )
+            metadata.is_ragged_verify = ragged_verify_layout is not None
             metadata.max_seq_len_q = (
                 self.speculative_num_draft_tokens
                 if metadata.is_ragged_verify
@@ -912,10 +975,21 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 verify_rows = bs * metadata.max_seq_len_q
                 # Static per-capture row map (expanded row i -> request i // L);
                 # the recorded refresh in _apply_cuda_graph_metadata uses it.
-                metadata.encoder_row_map = (
-                    torch.arange(verify_rows, device=self.device)
-                    // metadata.max_seq_len_q
-                )
+                row_map_key = ("encoder_row_map", metadata.max_seq_len_q)
+                row_map = self.target_verify_metadata.get(row_map_key)
+                if row_map is None:
+                    # Keep capture-time gather indices alive across variants.
+                    row_map = (
+                        torch.arange(
+                            self.target_verify_metadata[
+                                "encoder_cache_seqlens"
+                            ].numel(),
+                            device=device,
+                        )
+                        // metadata.max_seq_len_q
+                    )
+                    self.target_verify_metadata[row_map_key] = row_map
+                metadata.encoder_row_map = row_map[:verify_rows]
                 metadata.encoder_cache_seqlens = self.target_verify_metadata[
                     "encoder_cache_seqlens"
                 ][:verify_rows]
@@ -965,6 +1039,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         out_cache_loc: Optional[torch.Tensor] = None,
+        ragged_verify_layout: Optional[RaggedVerifyLayout] = None,
     ):
         """Shared capture+replay body for the cuda-graph init path.
 
@@ -1002,7 +1077,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         elif forward_mode.is_target_verify():
             # Here we only support topk = 1 for now.
             metadata = self.target_verify_metadata[bs]
-            if spec_info is not None and spec_info.ragged_verify_layout is not None:
+            if ragged_verify_layout is not None:
                 # Ragged verify: the per-request k-extension is not a
                 # uniform scalar seqlen_offset, so the fused kernel cannot
                 # rebuild this metadata. It is written eagerly on every
@@ -1030,7 +1105,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         # bounds real KV reads by cache_seqlens, so this is a fixed loop
         # bound only — never a host max / seq_lens_cpu D2H sync.
         max_seq_pages = self.max_num_pages
-        unified = self.kv_index_translator.is_translating
+        unified = self.runner_ids.is_translating
         update_trtllm_mha_graph_metadata(
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
@@ -1098,7 +1173,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         )
 
         cache_loc = self._get_layer_cache_loc(layer, forward_batch)
-        k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+        k_cache, v_cache = self.kv_layers.read(layer.layer_id).kv()
         # Layers without checkpoint KV scales fall back to the backend-owned
         # float32 ones tensor; letting the op synthesize one costs a fill
         # kernel per layer per forward, baked into the captured graph.
@@ -1128,21 +1203,26 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         if (
             forward_mode.is_target_verify()
-            and resolve_ragged_verify_layout(forward_batch) is not None
+            and forward_batch.ragged_verify_layout is not None
         ):
             self._assert_ragged_verify_supported()
 
         if in_capture:
             num_tokens = forward_batch.positions.numel()
             self._build_cuda_graph_metadata(
-                bs, num_tokens, forward_mode, spec_info, forward_batch.seq_lens.device
+                bs,
+                num_tokens,
+                forward_mode,
+                spec_info,
+                forward_batch.seq_lens.device,
+                ragged_verify_layout=forward_batch.ragged_verify_layout,
             )
 
         if forward_mode.is_decode_or_idle():
             self.forward_metadata = self.decode_cuda_graph_metadata[bs]
         elif forward_mode.is_target_verify():
             self.forward_metadata = self.target_verify_metadata[bs]
-            ragged_layout = resolve_ragged_verify_layout(forward_batch)
+            ragged_layout = forward_batch.ragged_verify_layout
             if ragged_layout is not None:
                 self._write_ragged_verify_graph_metadata(
                     self.forward_metadata,
@@ -1158,7 +1238,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 f"Invalid forward mode: {forward_mode=} for CUDA Graph replay."
             )
 
-        if self.kv_index_translator.is_translating:
+        if self.runner_ids.is_translating:
             # Unified pool: refill this mode's own page table (this runs
             # out-of-graph on BOTH capture and every replay-prep; the recorded
             # fused kernel skips its page-table writes so the graph reads the
@@ -1167,12 +1247,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             # The kernels bound their page-table reads by `cache_seqlens_int32`
             # (the fused metadata call above wrote it); the plan's table
             # reaches that far, a target verify's draft tail included.
-            self.kv_index_translator.copy_page_table(
-                forward_batch.kv_loc_plan, out=metadata.page_table[:bs]
+            self.runner_ids.copy_page_table(
+                forward_batch.iteration_ids, out=metadata.page_table[:bs]
             )
             if metadata.swa_page_table is not None:
-                self.kv_index_translator.copy_page_table(
-                    forward_batch.kv_loc_plan,
+                self.runner_ids.copy_page_table(
+                    forward_batch.iteration_ids,
                     out=metadata.swa_page_table[:bs],
                     kind=IdSpaceKind.SLIDING_WINDOW,
                 )
@@ -1188,7 +1268,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     self.cuda_graph_swa_out_cache_loc[:n].zero_()
                 else:
                     self.cuda_graph_swa_out_cache_loc[:n].copy_(
-                        self.kv_index_translator.write_ids(
+                        self.runner_ids.write_ids(
                             forward_batch, IdSpaceKind.SLIDING_WINDOW
                         )
                     )
@@ -1239,9 +1319,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 self.cuda_graph_swa_out_cache_loc[:n].zero_()
             else:
                 self.cuda_graph_swa_out_cache_loc[:n].copy_(
-                    self.kv_index_translator.write_ids(
-                        forward_batch, IdSpaceKind.SLIDING_WINDOW
-                    )
+                    self.runner_ids.write_ids(forward_batch, IdSpaceKind.SLIDING_WINDOW)
                 )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
@@ -1252,6 +1330,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             forward_mode=forward_batch.forward_mode,
             spec_info=forward_batch.spec_info,
             out_cache_loc=forward_batch.out_cache_loc,
+            ragged_verify_layout=forward_batch.ragged_verify_layout,
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -1288,7 +1367,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
                 )
         elif forward_batch.forward_mode.is_target_verify():
-            ragged_layout = resolve_ragged_verify_layout(forward_batch)
+            ragged_layout = forward_batch.ragged_verify_layout
             if ragged_layout is not None:
                 self._assert_ragged_verify_supported()
                 geometry = build_ragged_target_verify_geometry(
@@ -1357,20 +1436,19 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             if self.use_fmha_v2 and not forward_batch.forward_mode.is_draft_extend_v2():
                 self._init_fmha_v2_batch_pages(metadata, forward_batch)
 
-        kv_view = self.kv_index_translator.read_table(
-            forward_batch.kv_loc_plan, rows=forward_batch.batch_size
+        kv_view = self.runner_ids.read_table(
+            forward_batch.iteration_ids, rows=forward_batch.batch_size
         )
         if kv_view.is_translated:
             # No fill kernel: the kernels bound their reads by cache_seqlens.
             metadata.page_table = kv_view.ids
             metadata.swa_page_table = (
-                self.kv_index_translator.read_table(
-                    forward_batch.kv_loc_plan,
+                self.runner_ids.read_table(
+                    forward_batch.iteration_ids,
                     kind=IdSpaceKind.SLIDING_WINDOW,
                     rows=forward_batch.batch_size,
                 ).ids
-                if self.kv_index_translator.space(IdSpaceKind.SLIDING_WINDOW)
-                is not None
+                if self.runner_ids.space(IdSpaceKind.SLIDING_WINDOW) is not None
                 else None
             )
             # XQA and fmha_v2 take a page table's row length from its width and
@@ -1410,7 +1488,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         # int64 scatter index (unlike the int32 read page table above).
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
-            metadata.swa_out_cache_loc = self.kv_index_translator.write_ids(
+            metadata.swa_out_cache_loc = self.runner_ids.write_ids(
                 forward_batch, IdSpaceKind.SLIDING_WINDOW
             )
 
@@ -1527,24 +1605,29 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 kwargs["q_len_per_req"] = q_len_per_req
             if mask is not None:
                 kwargs["mask"] = mask[: group_seq_lens.shape[0]]
-            return flashinfer.decode.trtllm_batch_decode_with_kv_cache(
-                query=group_query,
-                kv_cache=kv_cache,
-                workspace_buffer=self.workspace_buffer,
-                block_tables=group_block_tables,
-                seq_lens=group_seq_lens,
-                max_seq_len=self.max_context_len,
-                bmm1_scale=bmm1_scale,
-                bmm2_scale=bmm2_scale,
+            with self._full_attn_kv_split_scope(
                 window_left=window_left,
-                sinks=sinks,
-                skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
-                out=group_out,
-                out_dtype=None if group_out is not None else resolved_out_dtype,
-                kv_cache_sf=kv_cache_sf,
-                multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
-                **kwargs,
-            )
+                batch_size=group_query.shape[0] // q_len_per_req,  # as FlashInfer
+                kv_cache=kv_cache,
+            ):
+                return flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+                    query=group_query,
+                    kv_cache=kv_cache,
+                    workspace_buffer=self.workspace_buffer,
+                    block_tables=group_block_tables,
+                    seq_lens=group_seq_lens,
+                    max_seq_len=self.max_context_len,
+                    bmm1_scale=bmm1_scale,
+                    bmm2_scale=bmm2_scale,
+                    window_left=window_left,
+                    sinks=sinks,
+                    skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
+                    out=group_out,
+                    out_dtype=None if group_out is not None else resolved_out_dtype,
+                    kv_cache_sf=kv_cache_sf,
+                    multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
+                    **kwargs,
+                )
 
         num_requests = seq_lens.shape[0]
         num_splits = min(self.decode_seq_len_splits, num_requests)
@@ -1624,7 +1707,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             save_kv_cache, k, forward_batch
         )
         use_fused_qkv = use_fused_fp8_path and not self.is_xqa_impl
-        pool = self.token_to_kv_pool
 
         if use_fused_fp8_path:
             fused_q = self._fused_fp8_qkv_kv_cache(
@@ -1636,7 +1718,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             v = None
         else:
             if save_kv_cache and k is not None:
-                self.token_to_kv_pool.set_kv_buffer(
+                self.kv_layers.layer(layer.layer_id).store(
                     layer,
                     KVWriteLoc.for_batch(
                         forward_batch,
@@ -1667,7 +1749,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         if self.is_nvfp4_kvcache:
             kv_cache, kv_cache_block_scales = self._get_nvfp4_decode_kv_cache(layer)
         else:
-            k_cache, v_cache = pool.get_kv_buffer(layer.layer_id)
+            k_cache, v_cache = self.kv_layers.read(layer.layer_id).kv()
             kv_cache = self._reshape_paged_kv_cache(
                 k_cache, v_cache, layer, layer.head_dim
             )
@@ -1754,7 +1836,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                         swa_loc=self.forward_metadata.swa_out_cache_loc,
                     )
                 else:
-                    self.token_to_kv_pool.set_kv_buffer(
+                    self.kv_layers.layer(layer.layer_id).store(
                         layer,
                         KVWriteLoc.for_batch(
                             forward_batch,
@@ -1789,9 +1871,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             kv_cache, kv_cache_block_scales = self._get_nvfp4_decode_kv_cache(layer)
             k_cache, v_cache = kv_cache
         else:
-            k_cache_raw, v_cache_raw = self.token_to_kv_pool.get_kv_buffer(
-                layer.layer_id
-            )
+            k_cache_raw, v_cache_raw = self.kv_layers.read(layer.layer_id).kv()
             if not self.use_fmha_v2 or uses_decode_kernel:
                 # Decode and SM100 batch_context kernels require HND layout.
                 k_cache, v_cache = self._reshape_paged_kv_cache(

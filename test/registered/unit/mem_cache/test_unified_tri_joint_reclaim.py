@@ -29,6 +29,7 @@ from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import reset_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.tree_slots import tree_slots_of
 from sglang.test.unified_allocator_fixtures import (
     build_test_unified_pools,
     build_tri_cache,
@@ -49,6 +50,9 @@ class TestTriJointReclaim(CustomTestCase):
         reset_context()
 
     build = staticmethod(build_tri_cache)
+
+    # Pressure budgets below include the arena and three request-table rows:
+    # two requests (eight state slots / three per request), plus the sink row.
 
     def stamp(self, b, a, slots, states, full_layers=1):
         kv = b.token_to_kv_pool
@@ -126,7 +130,10 @@ class TestTriJointReclaim(CustomTestCase):
                     self.assertIsNotNone(outside)
                     self.stamp(b, a, torch.cat((slots, outside)), states)
                     records = self.insert_parts(c, slots, states)
-                    demand = 4 if count == 8 else a.available_size() + 1
+                    # Keep the request fixed when placement becomes tighter;
+                    # available_size()+1 would turn a no-eviction case into a
+                    # genuinely over-capacity request.
+                    demand = 4 if count == 8 else 9
                     if count == 24:
                         demand = min(a.full_available_size(), a.swa_available_size())
                     with patch.object(
@@ -208,7 +215,10 @@ class TestTriJointReclaim(CustomTestCase):
                     c.inc_lock_ref(node, skip_lock_components=(ComponentType.MAMBA,)),
                 )
             )
-        demand = min(a.conserve_full_available_size(), a.conserve_swa_available_size())
+        # Require one token pair beyond free space, so the unlocked state
+        # checkpoints must make room while every token binding stays locked.
+        demand = a.available_size() + 1
+        self.assertFalse(a.can_reserve(demand, demand))
         try:
             self.assertEqual(c.full_evictable_size(), 0)
             self.assertGreater(c.mamba_evictable_size(), 0)
@@ -258,7 +268,9 @@ class TestTriJointReclaim(CustomTestCase):
 
         for occupancy in (0, 2):
             with self.subTest(cached_pages=occupancy):
-                b, a, c = self.build(page_size=4, state_cache=False)
+                b, a, c = self.build(
+                    page_size=4, state_cache=False, total_bytes=25984 + 3 * 4104
+                )
                 states = b.token_to_kv_pool_allocator.state_slots.alloc(8)
                 self.assertIsNotNone(states)
                 slots = a.alloc(occupancy * 4)
@@ -528,7 +540,9 @@ class TestTriJointReclaim(CustomTestCase):
                             token_to_kv_pool_allocator=allocator,
                             page_size=1,
                             sliding_window_size=128,
-                            tree_components=(ComponentType.FULL, ComponentType.SWA),
+                            tree_slots=tree_slots_of(
+                                (ComponentType.FULL, ComponentType.SWA), window=128
+                            ),
                         )
                     )
                     slots = allocator.alloc(4)
@@ -624,11 +638,14 @@ class TestTriJointReclaim(CustomTestCase):
                 self.check_payload(b, a, slots[first:], states, states)
                 self.assertFalse(a.verify_byte_accounting())
 
+    # Temporal-state pressure: eight live entries plus the sink, each padded
+    # by the ABI from 176 to 192 bytes, so the arena is 9 * 16 bytes above
+    # the unpadded 7808; token occupancy and reclaim pressure are unaffected.
     def test_state_quota_accounts_for_token_phase_cascades(self):
         for occupancy, demand in ((96, 10), (97, 1)):
             with self.subTest(occupancy=occupancy, demand=demand):
                 group = 1
-                b, a, c = self.build(temporal=(1, 4, 8))
+                b, a, c = self.build(temporal=(1, 4, 8), total_bytes=7952 + 3 * 1032)
                 states = b.token_to_kv_pool_allocator.state_slots.alloc(8)
                 slots = a.alloc(occupancy)
                 self.stamp(b, a, slots, states)
@@ -699,7 +716,9 @@ class TestTriJointReclaim(CustomTestCase):
     def test_temporal_state_first_stops_after_one_victim(self):
         for lazy in (False, True):
             with self.subTest(lazy=lazy):
-                b, a, c = self.build(lazy=lazy, temporal=(1, 4, 8))
+                b, a, c = self.build(
+                    lazy=lazy, temporal=(1, 4, 8), total_bytes=7952 + 3 * 1032
+                )
                 states = b.token_to_kv_pool_allocator.state_slots.alloc(8)
                 slots = a.alloc(96)
                 self.stamp(b, a, slots, states)
@@ -781,7 +800,9 @@ class TestTriJointReclaim(CustomTestCase):
     def test_float_plan_rechecks_pins_taken_during_preparation(self):
         for owner in ("full", "mamba", "swa"):
             with self.subTest(owner=owner):
-                b, a, c = self.build(lazy=True, temporal=(1, 4, 8))
+                b, a, c = self.build(
+                    lazy=True, temporal=(1, 4, 8), total_bytes=7952 + 3 * 1032
+                )
                 states = b.token_to_kv_pool_allocator.state_slots.alloc(8)
                 slots = a.alloc(96)
                 self.stamp(b, a, slots, states)
@@ -923,6 +944,10 @@ class TestTriJointReclaim(CustomTestCase):
 
 
 class TestTriGeometry(CustomTestCase):
+    def setUp(self):
+        setup_allocator_context()
+        self.addCleanup(reset_context)
+
     def check_saved(self, a, saved):
         for member, buf, ids, values in saved:
             self.assertTrue(

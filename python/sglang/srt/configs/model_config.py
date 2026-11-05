@@ -26,23 +26,26 @@ import torch
 from transformers import PretrainedConfig
 from transformers.utils import cached_file
 
-from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.configs.bailing_hybrid import is_bailing_multi_gate_enabled
 from sglang.srt.configs.embedding_model_spec import resolve_embedding_model_spec
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_config
+from sglang.srt.configs.unlimited_ocr_v2 import (
+    FALLBACK_CONTEXT_LENGTH,
+    UocrDocumentConfig,
+)
 from sglang.srt.environ import envs
-from sglang.srt.layers.quantization import QUANTIZATION_METHODS
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import is_hip, retry
-from sglang.srt.utils.hf_transformers.config import POINTER_ADAPTER_BASES
-from sglang.srt.utils.hf_transformers_utils import (
+from sglang.srt.utils import is_hip, is_npu, retry
+from sglang.srt.utils.hf_transformers import (
     get_config,
     get_context_length,
     get_generation_config,
     get_hf_text_config,
     get_sparse_attention_config,
 )
+from sglang.srt.utils.hf_transformers.config import POINTER_ADAPTER_BASES
 from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 from sglang.utils import is_in_ci
 
@@ -203,13 +206,14 @@ def is_deepseek_dsa(config) -> bool:
             "Glm5NextForConditionalGeneration",
             "LongcatFlashForCausalLM",
             "LongcatFlashForCausalLMNextN",
+            "Xing4_0ForCausalLM",
             "Dots3NoteForCausalLM",
             "Dots3NoteForCausalLMNextN",
             "HYV4ForCausalLM",
             "HYV4ForCausalLMNextN",
         )
         and _hf_attr(config, "index_topk") is not None
-    )
+    ) or is_kimi_k31(config)
 
 
 def dsa_draft_shards_under_dcp(config, dcp_size: int) -> bool:
@@ -219,6 +223,23 @@ def dsa_draft_shards_under_dcp(config, dcp_size: int) -> bool:
     with dcp_size 1.
     """
     return dcp_size > 1 and is_hip() and is_deepseek_dsa(config)
+
+
+def mla_attention_dcp_size(config, *, dcp_size: int, is_nextn: bool) -> int:
+    """The DCP width used by MLA execution, including platform draft policies.
+
+    KV planning must use this same width before the attention module is built.
+    """
+    # Ascend draft backends use allocator-global slots and non-DCP attention.
+    if is_nextn and is_npu():
+        return 1
+    if (
+        is_nextn
+        and is_deepseek_dsa(config)
+        and not dsa_draft_shards_under_dcp(config, dcp_size)
+    ):
+        return 1
+    return dcp_size
 
 
 def is_glm_moe_dsa(config) -> bool:
@@ -232,7 +253,23 @@ def is_glm_moe_dsa(config) -> bool:
 def is_kimi_k3(config) -> bool:
     return _hf_arch(config) in (
         "KimiK3ForConditionalGeneration",
+        "KimiK31ForConditionalGeneration",
         "KimiK3LinearForCausalLM",
+    )
+
+
+_KIMI_K31_ARCHS = (
+    "KimiK31ForConditionalGeneration",
+    "KimiLinearForCausalLM",
+    "KimiK3LinearForCausalLM",
+)
+
+
+def is_kimi_k31(config) -> bool:
+    """Kimi-K3.1: the Kimi linear-attention family with DSA layers."""
+    return (
+        _hf_arch(config) in _KIMI_K31_ARCHS
+        and _hf_attr(config, "index_topk") is not None
     )
 
 
@@ -452,6 +489,33 @@ def uses_minimax_m3_nvfp4_native_stack(quantization: Optional[str]) -> bool:
     return quantization == "minimax_m3_nvfp4" and get_platform().is_blackwell
 
 
+# v2 checkpoints reuse the v1 arch name; the DASH training stage selects this arch.
+UNLIMITED_OCR_V2_ARCH = "UnlimitedOCRV2ForCausalLM"
+
+
+def is_unlimited_ocr_v2(config) -> bool:
+    """Identify v2 checkpoints by ``training_stage == "dash"``.
+
+    Both versions publish ``UnlimitedOCRForCausalLM``, so the arch alone is not enough.
+    """
+    if _hf_arch(config) not in ("UnlimitedOCRForCausalLM", UNLIMITED_OCR_V2_ARCH):
+        return False
+    sparse_cfg = _hf_attr(config, "sparse_attention_config")
+    if not isinstance(sparse_cfg, dict):
+        return False
+    return sparse_cfg.get("training_stage") == "dash"
+
+
+def get_unlimited_ocr_v2_sparse_config(config) -> dict:
+    """Return the checkpoint's ``sparse_attention_config`` dict, or raise."""
+    sparse_cfg = _hf_attr(config, "sparse_attention_config")
+    if not isinstance(sparse_cfg, dict):
+        raise ValueError(
+            "sparse_attention_config missing; is this an Unlimited-OCR v2 checkpoint?"
+        )
+    return sparse_cfg
+
+
 def get_minimax_sparse_attention_config(config: PretrainedConfig) -> dict:
     text_cfg = getattr(config, "text_config", None)
     cfg = (
@@ -597,6 +661,7 @@ class ModelConfig:
         model_config_parser: str = "auto",
         speculative_algorithm: Optional[str] = None,
         is_draft_quantization_explicit: bool = False,
+        uocr_v2_default_context_len: int = FALLBACK_CONTEXT_LENGTH,
     ) -> None:
         # Parse args
         self.model_path = model_path
@@ -605,6 +670,7 @@ class ModelConfig:
         self.is_draft_model = is_draft_model
         self.is_draft_quantization_explicit = is_draft_quantization_explicit
         self.speculative_algorithm = speculative_algorithm
+        self.uocr_v2_default_context_len = uocr_v2_default_context_len
         self.model_impl = model_impl
         self.sampling_defaults = sampling_defaults
         self.quantize_and_serve = quantize_and_serve
@@ -655,6 +721,9 @@ class ModelConfig:
                 ):
                     # Full attention sees the whole prompt, while linear attention stays causal.
                     self.hf_text_config.is_causal = False
+        if is_embedding_nemotron3(self.hf_config):
+            # A bare Ministral3 backbone configured as a mean-pooled embedder.
+            self.hf_config.architectures = ["EmbeddingNemotron3Model"]
         self.joint_head_config = None
         if self.hf_config.architectures == ["Qwen3_5ForConditionalGeneration"]:
             self.joint_head_config = load_joint_head_config(self.model_path, revision)
@@ -727,6 +796,11 @@ class ModelConfig:
 
         # Config draft model
         self._config_draft_model()
+
+        # Remap the v2 arch before DASH tower, sparse backend and two-group KV
+        # pool selection read it.
+        if is_unlimited_ocr_v2(self.hf_config):
+            self.hf_config.architectures[0] = UNLIMITED_OCR_V2_ARCH
 
         # Mixed FP8/MXFP4 ckpts mark mxfp4 routed experts via this key.
         quantization_config = (
@@ -864,10 +938,13 @@ class ModelConfig:
             enable_multimodal
             and not self.is_lm_only
             and (
-                hasattr(self.hf_config, "audio_config")
-                or hasattr(
-                    getattr(self.hf_config, "thinker_config", None), "audio_config"
+                getattr(self.hf_config, "audio_config", None) is not None
+                or getattr(
+                    getattr(self.hf_config, "thinker_config", None),
+                    "audio_config",
+                    None,
                 )
+                is not None
                 or getattr(self.hf_config, "sound_config", None) is not None
                 or is_audio_model(self.hf_config.architectures)
             )
@@ -988,6 +1065,9 @@ class ModelConfig:
             disable_hybrid_swa_memory=cfg.disable_hybrid_swa_memory,
             model_config_parser=cfg.model_config_parser,
             speculative_algorithm=cfg.speculative_algorithm,
+            uocr_v2_default_context_len=UocrDocumentConfig.from_args(
+                cfg
+            ).default_context_length(),
             **kwargs,
         )
 
@@ -1043,6 +1123,12 @@ class ModelConfig:
             "DeepseekV32ForCausalLM",
         ]:
             self.hf_config.architectures[0] = "DeepseekV3ForCausalLMNextN"
+
+        # Xing4_0 bundles a DeepSeek-V3-compatible MTP head (layer index ==
+        # num_hidden_layers); reuse DeepseekV3ForCausalLMNextN as the draft arch.
+        if is_draft_model and self.hf_config.architectures[0] == "Xing4_0ForCausalLM":
+            self.hf_config.architectures[0] = "DeepseekV3ForCausalLMNextN"
+            self.hf_config.num_nextn_predict_layers = 1
 
         if is_draft_model and self.hf_config.architectures[0] == "GlmMoeDsaForCausalLM":
             self.hf_config.architectures[0] = "GlmMoeDsaForCausalLMNextN"
@@ -1221,10 +1307,17 @@ class ModelConfig:
 
     def _derive_hybrid_model(self):
         # Use self.context_len after it has been initialized to prevent using context_len which may be None.
+        layer_types_only = is_layer_types_hybrid_swa_model(
+            self.hf_config.architectures, self.hf_text_config
+        )
+        # Drafts keep the listed rules: speculative workers size draft KV pools
+        # themselves, e.g. FROZEN_KV_MTP passes a single-pool dummy config.
         self.is_hybrid_swa = (
             is_hybrid_swa_model(self.hf_config.architectures, self.hf_text_config)
+            and not (layer_types_only and self.is_draft_model)
             and not self.disable_hybrid_swa_memory
         )
+        self.is_layer_types_hybrid_swa = self.is_hybrid_swa and layer_types_only
         # Whole-model split, read-only; per-runner slices live on ModelLayerInfo.
         self.swa_attention_layer_ids: Optional[List[int]] = None
         self.full_attention_layer_ids: Optional[List[int]] = None
@@ -1300,6 +1393,13 @@ class ModelConfig:
     def _derive_context_length(self, context_length: int):
         is_draft_model = self.is_draft_model
         derived_context_len = get_context_length(self.hf_text_config)
+        if context_length is None and is_unlimited_ocr_v2(self.hf_config):
+            # Page-local RoPE has no position limit; size for the longest window.
+            context_length = derived_context_len = self.uocr_v2_default_context_len
+            logger.info(
+                "Unlimited-OCR v2: context_length defaults to %d (longest window)",
+                context_length,
+            )
 
         if context_length is not None:
             if context_length > derived_context_len:
@@ -1416,6 +1516,7 @@ class ModelConfig:
             or "Eagle3DeepseekV2ForCausalLM" in self.hf_config.architectures
             or "GigaChat35ForCausalLM" in self.hf_config.architectures
             or "GigaChat35ForCausalLMNextN" in self.hf_config.architectures
+            or "Xing4_0ForCausalLM" in self.hf_config.architectures
         ):
             self.head_dim = 256
             self.attention_arch = AttentionArch.MLA
@@ -1491,6 +1592,7 @@ class ModelConfig:
             "KimiLinearForCausalLM" in self.hf_config.architectures
             or "KimiK3LinearForCausalLM" in self.hf_config.architectures
             or "KimiK3ForConditionalGeneration" in self.hf_config.architectures
+            or "KimiK31ForConditionalGeneration" in self.hf_config.architectures
         ):
             tc = self.hf_text_config
             self.head_dim = 72
@@ -1499,6 +1601,9 @@ class ModelConfig:
             self.qk_rope_head_dim = tc.qk_rope_head_dim
             self.v_head_dim = tc.v_head_dim
             self.qk_nope_head_dim = tc.qk_nope_head_dim
+            self.index_head_dim = (
+                get_dsa_index_head_dim(tc) if is_deepseek_dsa(tc) else None
+            )
             self._init_mla_scaling(getattr(tc, "rope_scaling", None))
         elif "BailingMoeV2_5ForCausalLM" in self.hf_config.architectures or (
             # Every Bailing draft is renamed to BailingMoeForCausalLMNextN; only
@@ -1605,6 +1710,16 @@ class ModelConfig:
             self.spec_hidden_size, self.hc_hidden_size = resolve_spec_hidden_size(
                 self.hf_config, self.hidden_size, hc_mult
             )
+            # Models that declare ``hc_contract_for_draft`` (e.g. Xing4_0)
+            # merge the mHC streams back to hidden_size before the Eagle draft
+            # (so spec_hidden_size stays contracted, as resolved above) but
+            # still carry an mHC-internal residual stream (n * hidden_size)
+            # used to size the main model's activation buffers. Restore that
+            # width here; resolve_spec_hidden_size only sizes it for DSV4.
+            if hc_mult > 1 and getattr(
+                self.hf_text_config, "hc_contract_for_draft", False
+            ):
+                self.hc_hidden_size = self.hidden_size * hc_mult
         self.num_hidden_layers = self.hf_text_config.num_hidden_layers
         self.num_attention_layers = self.num_hidden_layers
         if "LongcatFlashForCausalLM" in self.hf_config.architectures:
@@ -2025,6 +2140,9 @@ class ModelConfig:
 
     # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
     def _verify_quantization(self) -> None:
+        # Deferred: the registry imports every quantization method's kernels.
+        from sglang.srt.layers.quantization import QUANTIZATION_METHODS
+
         supported_quantization = [*QUANTIZATION_METHODS]
         rocm_supported_quantization = [
             "awq",
@@ -2384,6 +2502,21 @@ def is_embedding_gemma(config) -> bool:
     )
 
 
+def is_embedding_nemotron3(config) -> bool:
+    """Whether ``config`` is an NVIDIA Nemotron-3-Embed checkpoint.
+
+    Nemotron-3-Embed is serialized as the bare ``Ministral3Model`` backbone,
+    which is also used by generative checkpoints. Its bidirectional attention
+    and mean pooling fields are the defining distinction.
+    """
+    fields = config.to_dict()
+    return (
+        config.architectures == ["Ministral3Model"]
+        and fields.get("is_causal") is False
+        and fields.get("pooling") == "avg"
+    )
+
+
 def is_generation_model(model_architectures: List[str], is_embedding: bool = False):
     # We have two ways to determine whether a model is a generative model.
     # 1. Check the model architecture
@@ -2402,6 +2535,7 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
         or "Qwen3Model" in model_architectures
         or "CLIPModel" in model_architectures
         or "BertModel" in model_architectures
+        or "EmbeddingNemotron3Model" in model_architectures
         or "Contriever" in model_architectures
         or "BertForSequenceClassification" in model_architectures
         or "XLMRobertaModel" in model_architectures
@@ -2422,6 +2556,7 @@ multimodal_model_archs = [
     "DeepseekVL2ForCausalLM",
     "Ernie4_5_VLMoeForConditionalGeneration",
     "MiniMaxM3SparseForConditionalGeneration",
+    "UnlimitedOCRV2ForCausalLM",
     "Gemma3ForConditionalGeneration",
     "Gemma3nForConditionalGeneration",
     "Gemma4ForConditionalGeneration",
@@ -2537,6 +2672,7 @@ multimodal_breakable_cuda_graph_supported_model_archs = [
     "MuseGlimmerForConditionalGeneration",
     "MuseSparkForConditionalGeneration",
     "KimiK3ForConditionalGeneration",
+    "KimiK31ForConditionalGeneration",
     "KimiK25ForConditionalGeneration",
     "MiniMaxM3SparseForCausalLM",
     "MiniMaxM3SparseForConditionalGeneration",
@@ -2675,7 +2811,50 @@ def compute_mla_mscale_scaling(rope_scaling: dict, base_scaling: float) -> float
     return base_scaling * mscale * mscale
 
 
+def mixed_sliding_layer_types(
+    hf_text_config: Optional[PretrainedConfig],
+) -> Optional[List[str]]:
+    """Per-layer kinds of a config that mixes sliding-window and full attention.
+
+    None unless `sliding_window` is set and the first `num_hidden_layers` entries
+    of `layer_types` are all "sliding_attention" or "full_attention", both present.
+    """
+    if hf_text_config is None or not getattr(hf_text_config, "sliding_window", None):
+        return None
+    num_layers = getattr(hf_text_config, "num_hidden_layers", None)
+    layer_types = getattr(hf_text_config, "layer_types", None)
+    if num_layers is None or not layer_types or len(layer_types) < num_layers:
+        return None
+    layer_types = list(layer_types[:num_layers])
+    if set(layer_types) != {"sliding_attention", "full_attention"}:
+        return None
+    return layer_types
+
+
 def is_hybrid_swa_model(
+    model_architectures: List[str],
+    hf_text_config: Optional[PretrainedConfig] = None,
+):
+    return _is_listed_hybrid_swa_model(model_architectures, hf_text_config) or (
+        mixed_sliding_layer_types(hf_text_config) is not None
+    )
+
+
+def is_layer_types_hybrid_swa_model(
+    model_architectures: List[str],
+    hf_text_config: Optional[PretrainedConfig],
+) -> bool:
+    """Hybrid SWA only because `layer_types` mixes sliding and full layers.
+
+    Such a split comes from the HF config alone, so ModelRunner checks it against
+    the attention layers the model builds.
+    """
+    return not _is_listed_hybrid_swa_model(model_architectures, hf_text_config) and (
+        mixed_sliding_layer_types(hf_text_config) is not None
+    )
+
+
+def _is_listed_hybrid_swa_model(
     model_architectures: List[str],
     hf_text_config: Optional[PretrainedConfig] = None,
 ):
@@ -2846,6 +3025,13 @@ def get_hybrid_layer_ids(
         ]
         full_attention_layer_ids = [
             i for i in range(num_hidden_layers) if hybrid_layer_pattern[i] == 0
+        ]
+    elif (layer_types := mixed_sliding_layer_types(hf_text_config)) is not None:
+        swa_attention_layer_ids = [
+            i for i, kind in enumerate(layer_types) if kind == "sliding_attention"
+        ]
+        full_attention_layer_ids = [
+            i for i, kind in enumerate(layer_types) if kind == "full_attention"
         ]
     else:
         swa_attention_layer_ids = None

@@ -10,7 +10,7 @@ from sglang.srt.dllm.algorithm.gemma4_renoise import Gemma4Renoise
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
 )
@@ -56,7 +56,7 @@ class TestGemma4GraphMetadata(unittest.TestCase):
         backend.device = "cpu"
         backend.dllm_block_size = 4
         backend.sliding_window_size = 6
-        backend.kv_index_translator = _ReadStream()
+        backend.runner_ids = _ReadStream()
         backend.token_to_kv_pool = None
         backend.kv_indptr = torch.zeros(4, dtype=torch.int32)
         backend.qo_indptr = torch.zeros(4, dtype=torch.int32)
@@ -160,7 +160,6 @@ class TestGemma4GraphInputEmbeddings(unittest.TestCase):
         runner.bs = 4
         runner.raw_num_token = 12
         runner.captured_req_width = 4
-        runner.enable_pdmux = False
         runner.attention_graph_variants = None
         runner._capture_graph_size = Mock(return_value=4)
         runner._resolve_lora_variant = Mock(return_value=None)

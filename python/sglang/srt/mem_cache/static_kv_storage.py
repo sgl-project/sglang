@@ -17,9 +17,16 @@ import msgspec
 import torch
 
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
-from sglang.srt.mem_cache.kv.plan import WireEntry
+from sglang.srt.mem_cache.kv.advance import TrackingAdvance, advance_tracking
+from sglang.srt.mem_cache.kv.plan import (
+    TREE_STATE,
+    TREE_TOKEN,
+    TREE_WINDOW,
+    TreeSlot,
+    WireEntry,
+)
 from sglang.srt.mem_cache.kv.state_storage import StateSlotsExhausted
-from sglang.srt.mem_cache.kv.storage import Region, SubPoolUsage
+from sglang.srt.mem_cache.kv.storage import Region, ResumeUnits, SubPoolUsage
 from sglang.srt.utils import is_npu
 
 if TYPE_CHECKING:
@@ -41,6 +48,10 @@ class StaticPoolShape(msgspec.Struct, frozen=True, kw_only=True):
     token_capacity: int
     full_tokens_per_layer: Optional[int] = None
     swa_tokens_per_layer: Optional[int] = None
+    # The prefix tree's numbers: the window layers' attention window, and the
+    # token interval a cached recurrent state is valid at.
+    window: Optional[int] = None
+    checkpoint_interval: Optional[int] = None
 
 
 def kv_storage_of(
@@ -125,6 +136,74 @@ class StaticKVStorage:
         self._owner_region: Optional[Region] = None
         self._state_entries: Optional[_StaticStateEntries] = None
 
+    def stated_window_lengths(self) -> Dict[str, Tuple[int, str]]:
+        """No static window states its retention: its length is the
+        model's."""
+        return {}
+
+    def resume_units(
+        self,
+        sub_pool: str,
+        req: Req,
+        *,
+        token_start: int,
+        token_boundary: int,
+        window: Optional[int] = None,
+    ) -> ResumeUnits:
+        if not 0 <= token_start <= token_boundary:
+            raise ValueError("invalid continuation token span")
+        allocator = self._allocator
+        state = allocator.state
+        if state is not None and sub_pool == state.sub_pool:
+            slots = self.requests.req_index_to_mamba_index_mapping[
+                req.kv.req_pool_idx
+            ].reshape(-1)
+            return ResumeUnits(
+                unit_ids=allocator.state_ids(sub_pool).ids(slots),
+                token_start=token_boundary,
+                token_boundary=token_boundary,
+            )
+        if sub_pool not in (self.owner, "swa"):
+            raise KeyError(sub_pool)
+        page_size = allocator.page_size
+        pool = allocator.get_kvcache()
+        request_window = pool.request_window if sub_pool == "swa" else None
+        begin = token_start
+        if sub_pool == "swa":
+            retained = pool.sliding_window if request_window is not None else window
+            if retained is None:
+                raise ValueError("window handoff requires its retention length")
+            begin = max(begin, token_boundary - retained)
+        begin = begin // page_size * page_size
+        if request_window is not None:
+            units = torch.as_tensor(
+                request_window.page_indices(
+                    int(req.kv.req_pool_idx), begin, token_boundary
+                )
+            )
+        else:
+            tokens = self.requests.req_to_token[
+                req.kv.req_pool_idx, begin:token_boundary
+            ]
+            from sglang.srt.layers.cp.base import is_cp_sharded_padded
+
+            if is_cp_sharded_padded():
+                from sglang.srt.layers.cp.utils import (
+                    get_cp_sharded_padded_cache_transfer_indices,
+                )
+
+                # Rank-local storage: the transfer reads this rank's padded rows.
+                tokens = get_cp_sharded_padded_cache_transfer_indices(tokens)
+            physical = (
+                allocator.translate_swa_indices_for_transfer(tokens)
+                if sub_pool == "swa"
+                else allocator.translate_kv_indices_for_transfer(tokens)
+            )
+            units = physical[::page_size] // page_size
+        return ResumeUnits(
+            unit_ids=units, token_start=begin, token_boundary=token_boundary
+        )
+
     def acquire(self, reqs: List[Req]) -> Optional[List[int]]:
         return acquire_rows(self.requests, self._allocator.state, reqs)
 
@@ -146,7 +225,10 @@ class StaticKVStorage:
         num_tokens: int,
         make_room: Callable[[int], Any],
         window_tail: Optional[int] = None,
+        stated_window_tails: Optional[Dict[str, int]] = None,
     ) -> Optional[torch.Tensor]:
+        # Static pools have no window with a stated retention.
+        assert not stated_window_tails
         # Over estimate the number of tokens: assume each request needs a new
         # page (one page per CLASS per request under sharding — the min-class
         # availability floor must cover every request's ceil(K_i/N) rounding,
@@ -260,6 +342,42 @@ class StaticKVStorage:
     def free_tokens(self, ids: torch.Tensor) -> None:
         self._allocator.free(ids)
 
+    def advance(
+        self,
+        req: Req,
+        frontier: Optional[int] = None,
+        *,
+        window: Optional[int] = None,
+        retain_floor: Optional[int] = None,
+        shares_prefixes: bool = False,
+        eviction_interval: int = 1,
+        tracking: Optional[TrackingAdvance] = None,
+        component_type=None,
+    ) -> None:
+        if tracking is not None:
+            advance_tracking(self, req, tracking)
+        if window is None:
+            return
+        if frontier is None:
+            raise ValueError("window retirement needs a token frontier")
+
+        from sglang.srt.mem_cache.common import free_swa_out_of_window_slots
+        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+
+        component_type = ComponentType.SWA if component_type is None else component_type
+        free_swa_out_of_window_slots(
+            req,
+            frontier,
+            sliding_window_size=window,
+            page_size=self._allocator.page_size,
+            req_to_token_pool=self.requests,
+            token_to_kv_pool_allocator=self._allocator,
+            supports_prefix_sharing=shares_prefixes,
+            retain_floor=retain_floor,
+            eviction_interval=eviction_interval,
+            component_type=component_type,
+        )
+
     def release_row(self, req: Req) -> None:
         # The DSV4-NPU table's free() also releases the c4/c128 state pages.
         self.requests.free(req)
@@ -269,6 +387,163 @@ class StaticKVStorage:
 
     def release_rows(self, rows: List[int]) -> None:
         self.requests.free_rows(rows)
+
+    # -- what the prefix tree's effects reach --
+
+    # A second window component (buffer mode's) reaches the same window rows.
+    _TREE_SUB_POOLS = {
+        "FULL": "kv",
+        "SWA": "swa",
+        "AUXILIARY_SWA": "swa",
+        "MAMBA": "mamba",
+    }
+
+    def tree_sub_pool(self, component: str) -> str:
+        return self._TREE_SUB_POOLS[component]
+
+    def _band(self, sub_pool: str):
+        if sub_pool == "swa":
+            return self._allocator.swa_attn_allocator
+        if self._allocator.has_window_pool:
+            return self._allocator.full_attn_allocator
+        return self._allocator
+
+    def available_units(self, sub_pool: str) -> int:
+        return self._band(sub_pool).available_size()
+
+    def take_units(self, sub_pool: str, count: int) -> Optional[torch.Tensor]:
+        return self._band(sub_pool).alloc(count)
+
+    def release_taken(self, sub_pool: str, ids: torch.Tensor) -> None:
+        self._band(sub_pool).free(ids)
+
+    def free_units(self, sub_pool: str, ids: torch.Tensor) -> None:
+        if sub_pool == "swa":
+            self._allocator.free_swa_segment(ids, start_pos=0)
+        else:
+            self._band(sub_pool).free_segment(ids, start_pos=0)
+
+    def free_token_rows(self, ids: torch.Tensor) -> None:
+        self._allocator.free_segment(ids, start_pos=0)
+
+    def free_owner_rows(self, ids: torch.Tensor) -> None:
+        self._allocator.free_full_segment(ids, start_pos=0)
+
+    def window_ids(self, sub_pool: str, owner_ids: torch.Tensor) -> torch.Tensor:
+        return self._allocator.translate_swa_indices_for_transfer(owner_ids).to(
+            torch.int64
+        )
+
+    def bind_window(
+        self, sub_pool: str, owner_ids: torch.Tensor, window_ids: torch.Tensor
+    ) -> None:
+        self._allocator.set_full_to_swa_mapping(owner_ids, window_ids)
+
+    def rehome_window(
+        self, sub_pool: str, kept_ids: torch.Tensor, incoming_ids: torch.Tensor
+    ) -> torch.Tensor:
+        # The static window is reached through a token -> window row mapping:
+        # point the kept ids at the incoming rows and clear the incoming ids.
+        window_ids = self.window_ids(sub_pool, incoming_ids)
+        self._allocator.clear_full_to_swa_mapping(incoming_ids)
+        self._allocator.set_full_to_swa_mapping(kept_ids, window_ids)
+        return window_ids
+
+    def release_rehomed_owner_rows(self, ids: torch.Tensor) -> None:
+        self._allocator.free_full_segment(ids, start_pos=0)
+
+    # -- a running request's state tracking: the scheduler decides when a
+    # request crosses a tracking boundary; the storage hands out and takes back
+    # the slots its ping-pong pair needs, and keeps the table's columns in step.
+
+    def take_tracking_slot(self, req, position: int) -> bool:
+        """Give ``req`` a tracking slot at ``position`` of its ping-pong pair;
+        False when no state slot is free (the boundary then writes no snapshot)."""
+        slot = self._allocator.state_slots.alloc(1)
+        if slot is None:
+            return False
+        self.requests.set_mamba_ping_pong_slot(req, position, slot[0])
+        return True
+
+    def release_tracking_slot(self, req, position: int) -> None:
+        """Give back the tracking slot at ``position`` of ``req``'s pair and
+        empty that position."""
+        self._allocator.state_slots.free(
+            req.kv.mamba_ping_pong_track_buffer[position].unsqueeze(0)
+        )
+        self.requests.set_mamba_ping_pong_slot(req, position, -1)
+
+    def release_state_slot(self, req) -> None:
+        """Give back the state slot ``req`` took before its KV (a request that
+        does not run after all)."""
+        self._allocator.state_slots.free(req.kv.mamba_pool_idx.unsqueeze(-1))
+        req.kv.mamba_pool_idx = None
+
+    # -- the prefix tree's state effects: the tree decides, the storage executes --
+
+    def take_state_slots(self, sub_pool: str, count: int) -> Optional[torch.Tensor]:
+        """``count`` free state slots of ``sub_pool``; None when none are free."""
+        return self._allocator.state_slots.alloc(count)
+
+    def free_state_slots(self, sub_pool: str, slots: torch.Tensor) -> None:
+        self._allocator.state_slots.free(slots)
+
+    def copy_state(self, sub_pool: str, src: torch.Tensor, dst: torch.Tensor) -> None:
+        """Copy the state in slots ``src`` into slots ``dst``."""
+        ids = self._allocator.state_ids(sub_pool)
+        self._allocator.state.pool.copy_from(ids.ids(src), ids.ids(dst))
+
+    def release_state(
+        self, sub_pool: str, req: Req, *, keep: Optional[int] = None
+    ) -> None:
+        """Give back a finished request's state slots, keeping its tracking
+        slot ``keep`` when the tree took that one."""
+        self._allocator.state.release(
+            self.requests, req, mamba_ping_pong_track_buffer_to_keep=keep
+        )
+
+    def donate_tracking_slot(
+        self, sub_pool: str, req: Req, new_slot: torch.Tensor
+    ) -> torch.Tensor:
+        """Hand the tree the request's kept tracking slot, giving the request
+        ``new_slot`` in its place."""
+        return self.requests.donate_mamba_ping_pong_slot(req, new_slot)
+
+    def quantizes_checkpoints(self, sub_pool: str) -> bool:
+        """Whether the tree's state checkpoints live in a quantized pool of
+        their own rather than in state slots."""
+        return self._allocator.state.ckpt_pool is not None
+
+    def take_checkpoint_slot(self, sub_pool: str) -> Optional[torch.Tensor]:
+        return self._allocator.state.ckpt_pool.alloc(1)
+
+    def store_checkpoint(
+        self, sub_pool: str, active: torch.Tensor, checkpoint: torch.Tensor
+    ) -> None:
+        """Quantize the state in slots ``active`` into ``checkpoint``."""
+        state = self._allocator.state
+        state.ckpt_pool.store_from_active(state.pool, active.view(-1), checkpoint)
+
+    def free_checkpoints(self, sub_pool: str, checkpoints: torch.Tensor) -> None:
+        self._allocator.state.ckpt_pool.free(checkpoints)
+
+    def settle_replay(self, sub_pool: str, slot: torch.Tensor) -> int:
+        """At a request's finish: the tokens its slot's state lags behind the
+        request (its replay ring's unflushed depth, 0 without one); the lag
+        restarts at zero."""
+        write_pos = self._allocator.state.pool.replayssm_write_pos
+        if write_pos is None:
+            return 0
+        slot = self._allocator.state_ids(sub_pool).ids(slot)
+        lag = int(write_pos[slot].item())
+        write_pos[slot] = 0
+        return lag
+
+    def restart_replay(self, sub_pool: str, slots: torch.Tensor) -> None:
+        """A loaded state is current: its replay lag restarts at zero."""
+        write_pos = self._allocator.state.pool.replayssm_write_pos
+        if write_pos is not None:
+            write_pos[self._allocator.state_ids(sub_pool).ids(slots)] = 0
 
     def accounting_violations(self) -> List[str]:
         return self._allocator.verify_byte_accounting()
@@ -334,7 +609,7 @@ class StaticKVStorage:
             return states.owner_view
         return states.views[sub_pool]()
 
-    def regions(self, sub_pool: str) -> Region:
+    def regions(self, sub_pool: str, *, part: Optional[str] = None) -> Region:
         if sub_pool == self.owner:
             if self._owner_region is None:
                 self._owner_region = _static_owner_region(self._allocator.get_kvcache())
@@ -346,6 +621,35 @@ class StaticKVStorage:
 
     def sub_pool_names(self) -> Tuple[str, ...]:
         return (self.owner,)
+
+    def tree_slots(
+        self, *, window_reaches: Optional[Dict[str, int]] = None
+    ) -> Tuple[TreeSlot, ...]:
+        shape = self._shape
+        window = (
+            max(shape.window, (window_reaches or {}).get("swa", 0))
+            if shape.window is not None
+            else None
+        )
+        return (
+            (TreeSlot(component="FULL", family=TREE_TOKEN),)
+            + (
+                (TreeSlot(component="SWA", family=TREE_WINDOW, window=window),)
+                if shape.has_window
+                else ()
+            )
+            + (
+                (
+                    TreeSlot(
+                        component="MAMBA",
+                        family=TREE_STATE,
+                        checkpoint_interval=shape.checkpoint_interval,
+                    ),
+                )
+                if shape.has_state
+                else ()
+            )
+        )
 
     def add_pin_source(
         self, sub_pools: Sequence[str], busy: Callable[[], bool]
@@ -700,7 +1004,7 @@ def _static_state_entries(
                 c128_item_lens,
             )
 
-        # On A5 (CYCLE cache_mode), C4 state uses request-local ring rows rather
+        # On Ascend 950 (CYCLE cache_mode), C4 state uses request-local ring rows rather
         # than SWA pages.  Register it separately so P and D can independently
         # map logical positions when their local ring sizes differ.
         from sglang.srt.hardware_backend.npu.utils import is_npu_arch35

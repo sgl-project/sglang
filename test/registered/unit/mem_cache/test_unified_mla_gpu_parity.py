@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""GPU parity of the per-layer-view `UnifiedMLATokenToKVPool` against the stock
+"""GPU parity of the typed `MLAView` against the stock
 `MLATokenToKVPool` on real K3 MLA geometry (L=24, D=512+64).
 
 Both pools receive the same token ids: under the token-major views a token's
@@ -55,12 +55,9 @@ def _marked(loc: torch.Tensor):
 
 
 def _make_pools(ps: int, n_tokens: int = 4096):
-    from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec
+    from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec, MLAView
     from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
     from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
-    from sglang.srt.mem_cache.unified_memory_pool import (
-        UnifiedMLATokenToKVPool,
-    )
 
     full = MLASubPoolSpec(
         name="full",
@@ -87,7 +84,7 @@ def _make_pools(ps: int, n_tokens: int = 4096):
         enable_memory_saver=False,
         page_size=ps,
     )
-    unified = UnifiedMLATokenToKVPool(
+    unified = MLAView(
         arena=pool,
         spec=pool.spec("full"),
         kv_cache_dtype=_DTYPE,
@@ -177,28 +174,13 @@ class TestUnifiedMLAPoolGPUParity(unittest.TestCase):
             torch.testing.assert_close(got_nope, nope, rtol=0, atol=0)
             torch.testing.assert_close(got_rope, rope, rtol=0, atol=0)
 
-    def test_move_kv_cache_page_envelope_gpu(self):
-        for ps in (1, 64):
-            unified, ref, max_tokens = _make_pools(ps)
-            num_pages = max_tokens // ps
-            n_loc = ps  # one full page of tokens
-            src_page, dst_page = num_pages - 2, 2
-            src_t = torch.arange(ps, device=_DEV, dtype=torch.int64) + src_page * ps
-            dst_t = torch.arange(ps, device=_DEV, dtype=torch.int64) + dst_page * ps
-            torch.manual_seed(17)
-            for l in range(_L):
-                layer = types.SimpleNamespace(layer_id=l)
-                k = torch.randn(n_loc, 1, _D, dtype=_DTYPE, device=_DEV)
-                unified.set_kv_buffer(layer, _marked(_kernel_id(src_t, ps)), k, None)
-            before = [
-                unified.get_key_buffer(l)[_kernel_id(src_t, ps)].clone()
-                for l in range(_L)
-            ]
-            unified.move_kv_cache(dst_t, src_t)
-            torch.cuda.synchronize()
-            for l in range(_L):
-                got = unified.get_key_buffer(l)[_kernel_id(dst_t, ps)]
-                torch.testing.assert_close(got, before[l], rtol=0, atol=0)
+    def test_per_slot_move_is_refused_gpu(self):
+        """The arena moves whole page envelopes; a per-slot move on the view
+        would corrupt the entries, so the view refuses it."""
+        unified, _, _ = _make_pools(1)
+        ids = torch.arange(2, device=_DEV, dtype=torch.int64)
+        with self.assertRaises(NotImplementedError):
+            unified.move_kv_cache(ids + 2, ids)
 
 
 if __name__ == "__main__":

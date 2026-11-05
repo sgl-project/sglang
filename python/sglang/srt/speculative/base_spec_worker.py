@@ -163,10 +163,9 @@ class BaseSpecWorker(ABC):
         return self._hicache_draft_plan
 
     @property
-    def draft_swa_window(self) -> int:
-        """Tokens back from the committed length that the draft reads in the
-        target's swa sub-pool; 0 when the target's own window covers them."""
-        return 0
+    def draft_window_reaches(self) -> dict[str, int]:
+        """Reader reaches from committed length, keyed by actual storage band."""
+        return {}
 
     def weight_update_runners(self) -> list[tuple[str, ModelRunner]]:
         """(role, runner) pairs weight ops apply to; [] when the draft owns no weights."""
@@ -194,7 +193,7 @@ class BaseSpecWorker(ABC):
         if not draft_runners:
             return None
         # A fused draft's KV lives in the target's pool: it has none of its own.
-        if draft_runners[0].kv_index_translator.is_fused_draft:
+        if draft_runners[0].runner_ids.is_fused_draft:
             return None
         return draft_runners[0].token_to_kv_pool
 
@@ -281,7 +280,7 @@ class BaseSpecWorker(ABC):
         if not draft_runners:
             return HiCacheDraftPlan()
         draft_pools = tuple(runner.token_to_kv_pool for runner in draft_runners)
-        if any(runner.kv_index_translator.is_fused_draft for runner in draft_runners):
+        if any(runner.runner_ids.is_fused_draft for runner in draft_runners):
             from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
                 validate_fused_hicache_draft,
             )

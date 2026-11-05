@@ -15,15 +15,9 @@ from typing import Any, Dict, Optional, Sequence, Tuple
 import torch
 
 from sglang.srt.mem_cache.kv.memory.arena import KVArena
-from sglang.srt.mem_cache.kv.memory.views import MLAKVView
 from sglang.srt.mem_cache.kv.router import KVLayerRouter
 from sglang.srt.mem_cache.kv.sizing import check_bs1_floor
-from sglang.srt.mem_cache.memory_pool import (
-    KVCache,
-    KVWriteLoc,
-    unwrap_write_loc,
-    write_loc_is_physical,
-)
+from sglang.srt.mem_cache.memory_pool import KVCache
 
 
 class RoutedKVCache(KVCache):
@@ -75,7 +69,9 @@ class RoutedKVCache(KVCache):
         self.device = arena.device
         self.dtype = self._owner_view.dtype
         self.store_dtype = self._owner_view.store_dtype
-        for name, view in views.items():
+        for name, view, indices in self._layer_maps:
+            if not indices:
+                continue
             assert (view.dtype, view.store_dtype) == (self.dtype, self.store_dtype), (
                 f"sub-pool {name!r} stores {view.store_dtype} for {view.dtype}; the "
                 f"owner stores {self.store_dtype} for {self.dtype}"
@@ -86,15 +82,19 @@ class RoutedKVCache(KVCache):
         self.mem_usage = 0.0  # the arena logs the real size
 
     def _build_layer_router(self) -> KVLayerRouter:
-        return KVLayerRouter.from_layer_maps(self, self._layer_maps)
+        return KVLayerRouter.from_layer_maps(self, self._layer_maps, owner=self._owner)
 
     def id_spaces(self):
         raise NotImplementedError(
             "a unified pool's sub-pools name slots through its allocator's "
-            "tables: read them from the allocator or the runner's translator"
+            "tables: read them from the allocator or the runner's `RunnerIds`"
         )
 
     # -- the arena --
+
+    @property
+    def backing_owner(self):
+        return self._arena
 
     @property
     def post_capture_active(self) -> bool:
@@ -132,9 +132,6 @@ class RoutedKVCache(KVCache):
     def get_contiguous_buf_infos(self):
         return self._owner_view.get_contiguous_buf_infos()
 
-    def host_pool_decls(self):
-        return self._owner_view.host_pool_decls()
-
     def get_kv_cache_quant_method(self):
         """The first quantized view's method, else the views' unquantized one."""
         fallback = None
@@ -154,20 +151,13 @@ class RoutedKVCache(KVCache):
     # -- per-layer reads and writes, through the layer's route --
 
     def get_key_buffer(self, layer_id: int, scale: Optional[float] = None):
-        kv = self.layer_router.read(layer_id)
-        if scale is not None:
-            return kv.view.get_key_buffer(kv.view_layer_id, scale)
-        return kv.view.get_key_buffer(kv.view_layer_id)
+        return self.layer_router.read(layer_id).key(scale)
 
     def get_value_buffer(self, layer_id: int, scale: Optional[float] = None):
-        kv = self.layer_router.read(layer_id)
-        if scale is not None:
-            return kv.view.get_value_buffer(kv.view_layer_id, scale)
-        return kv.view.get_value_buffer(kv.view_layer_id)
+        return self.layer_router.read(layer_id).value(scale)
 
     def get_kv_buffer(self, layer_id: int):
-        kv = self.layer_router.read(layer_id)
-        return kv.view.get_kv_buffer(kv.view_layer_id)
+        return self.layer_router.read(layer_id).kv()
 
     def set_kv_buffer(
         self,
@@ -182,31 +172,8 @@ class RoutedKVCache(KVCache):
         """Write ids arrive physical, in the routed sub-pool's id space: the
         owner's in ``full_loc`` (else ``loc``), another token sub-pool's in
         ``swa_loc``, both bound once per forward by the attention backend."""
-        loc, window_loc, owner_loc = unwrap_write_loc(loc_info)
-        kv = self.layer_router.layer(layer.layer_id)
-        if kv.route.sub_pool == self._owner:
-            ids = owner_loc if owner_loc is not None else loc
-        else:
-            assert window_loc is not None, (
-                f"layer {layer.layer_id} writes sub-pool {kv.route.sub_pool!r}, "
-                "but the attention backend bundled no swa_loc for it"
-            )
-            ids = window_loc
-        write_loc = KVWriteLoc(ids, physical=write_loc_is_physical(loc_info))
-        if isinstance(kv.view, MLAKVView):
-            kv.view.set_kv_buffer(
-                layer, write_loc, cache_k, cache_v, layer_id_override=kv.view_layer_id
-            )
-            return
-        kv.view.set_kv_buffer(
-            layer,
-            write_loc,
-            cache_k,
-            cache_v,
-            k_scale,
-            v_scale,
-            layer_id_override=kv.view_layer_id,
-            dcp_kv_mask=dcp_kv_mask,
+        self.layer_router.layer(layer.layer_id).store(
+            layer, loc_info, cache_k, cache_v, k_scale, v_scale, dcp_kv_mask=dcp_kv_mask
         )
 
     def set_mla_kv_buffer(
@@ -216,13 +183,15 @@ class RoutedKVCache(KVCache):
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
     ):
-        kv = self.layer_router.layer(layer.layer_id)
-        kv.view.set_mla_kv_buffer(
-            layer,
-            loc_info,
-            cache_k_nope,
-            cache_k_rope,
-            layer_id_override=kv.view_layer_id,
+        self.layer_router.layer(layer.layer_id).store_mla(
+            layer, loc_info, cache_k_nope, cache_k_rope
+        )
+
+    def set_mla_kv_buffer_prefix_valid(
+        self, layer, loc_info, commit_lens, cache_k_nope, cache_k_rope
+    ):
+        self.layer_router.layer(layer.layer_id).store_mla_prefix(
+            layer, loc_info, commit_lens, cache_k_nope, cache_k_rope
         )
 
     def get_mla_kv_buffer(
@@ -233,10 +202,7 @@ class RoutedKVCache(KVCache):
     ):
         # Read ids arrive translated at their production site; the pool never
         # translates.
-        kv = self.layer_router.read(layer.layer_id)
-        return kv.view.get_mla_kv_buffer(
-            layer, loc, dst_dtype, layer_id_override=kv.view_layer_id
-        )
+        return self.layer_router.read(layer.layer_id).read_mla(layer, loc, dst_dtype)
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         raise NotImplementedError(

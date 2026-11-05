@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import msgspec
 
@@ -10,9 +10,8 @@ from sglang.srt.layers.attention.attention_registry import (
     ATTENTION_BACKENDS,
     attn_backend_wrapper,
 )
-from sglang.srt.layers.attention.base_attn_backend import SpecMode
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_platform
 from sglang.srt.utils import init_cublas
 
 if TYPE_CHECKING:
@@ -21,7 +20,6 @@ if TYPE_CHECKING:
 
 from sglang.srt.runtime_context import (
     attention_backends,
-    get_disagg,
     get_exec,
     get_memory,
     get_spec,
@@ -38,8 +36,6 @@ class ResolvedAttentionBackendStr(msgspec.Struct, frozen=True, kw_only=True):
 
 class AttentionBackends(msgspec.Struct, frozen=True, kw_only=True):
     attn_backend: AttentionBackend
-    decode_attn_backend: Optional[AttentionBackend]
-    decode_attn_backend_group: list[AttentionBackend]
     prefill_attention_backend_str: str
     decode_attention_backend_str: str
 
@@ -98,8 +94,6 @@ def build_attention_backends(*, model_runner: ModelRunner) -> AttentionBackends:
         mamba_backend = Mamba2AttnBackend(model_runner)
         return AttentionBackends(
             attn_backend=mamba_backend,
-            decode_attn_backend=None,
-            decode_attn_backend_group=[],
             prefill_attention_backend_str="mamba2",
             decode_attention_backend_str="mamba2",
         )
@@ -115,22 +109,7 @@ def build_attention_backends(*, model_runner: ModelRunner) -> AttentionBackends:
         ),
     )
 
-    if get_disagg().enable_pdmux:
-        attn_backend = _build_resolved_backend(
-            model_runner=model_runner, resolved=resolved, init_new_workspace=True
-        )
-        decode_attn_backend_group = [
-            _build_resolved_backend(
-                model_runner=model_runner,
-                resolved=resolved,
-                init_new_workspace=False,
-            )
-            for _ in range(get_disagg().sm_group_num)
-        ]
-        decode_attn_backend = decode_attn_backend_group[0]
-    elif (
-        get_exec().overlap.enable_two_batch_overlap and not model_runner.is_draft_worker
-    ):
+    if get_exec().overlap.enable_two_batch_overlap and not model_runner.is_draft_worker:
         attn_backend = TboAttnBackend.init_new(
             lambda: _build_resolved_backend(
                 model_runner=model_runner,
@@ -138,14 +117,10 @@ def build_attention_backends(*, model_runner: ModelRunner) -> AttentionBackends:
                 init_new_workspace=False,
             )
         )
-        decode_attn_backend = None
-        decode_attn_backend_group = []
     else:
         attn_backend = _build_resolved_backend(
             model_runner=model_runner, resolved=resolved, init_new_workspace=False
         )
-        decode_attn_backend = None
-        decode_attn_backend_group = []
 
     if (
         model_runner.device == "npu"
@@ -169,8 +144,6 @@ def build_attention_backends(*, model_runner: ModelRunner) -> AttentionBackends:
 
     return AttentionBackends(
         attn_backend=attn_backend,
-        decode_attn_backend=decode_attn_backend,
-        decode_attn_backend_group=decode_attn_backend_group,
         prefill_attention_backend_str=resolved.prefill,
         decode_attention_backend_str=resolved.decode,
     )
@@ -218,17 +191,23 @@ def _build_resolved_backend(
     init_new_workspace: bool,
 ) -> AttentionBackend:
     if resolved.is_draft_override:
-        full = _build_full_attention_backend_from_str(
-            model_runner=model_runner,
-            backend_str=resolved.prefill,
-            init_new_workspace=init_new_workspace,
+        attn_backend = attn_backend_wrapper(
+            model_runner,
+            _build_full_attention_backend_from_str(
+                model_runner=model_runner,
+                backend_str=resolved.prefill,
+                init_new_workspace=init_new_workspace,
+            ),
         )
-        _require_spec_mode(model_runner, full)
-        attn_backend = attn_backend_wrapper(model_runner, full)
     elif resolved.decode != resolved.prefill:
-        from sglang.srt.layers.attention.hybrid_attn_backend import (
-            HybridAttnBackend,
-        )
+        if get_platform().is_sail:
+            from sglang.srt.hardware_backend.sail.attention.hybrid_attn_backend import (
+                SailHybridAttnBackend as HybridAttnBackend,
+            )
+        else:
+            from sglang.srt.layers.attention.hybrid_attn_backend import (
+                HybridAttnBackend,
+            )
 
         # Compose the two full-attention backends first, then apply model-level
         # wrappers once.  Wrapping each child independently duplicates the
@@ -250,7 +229,6 @@ def _build_resolved_backend(
             ),
         )
         _require_dcp_target_verify(model_runner, hybrid.target_verify_backend())
-        _require_spec_mode(model_runner, hybrid)
         attn_backend = attn_backend_wrapper(model_runner, hybrid)
         logger.info(
             f"Using hybrid attention backend for decode and prefill: "
@@ -268,22 +246,8 @@ def _build_resolved_backend(
             init_new_workspace=init_new_workspace,
         )
         _require_dcp_target_verify(model_runner, full)
-        _require_spec_mode(model_runner, full)
         attn_backend = attn_backend_wrapper(model_runner, full)
     return attn_backend
-
-
-def _require_spec_mode(model_runner: ModelRunner, backend: AttentionBackend) -> None:
-    """Require the speculative forward this runner executes."""
-    if model_runner.spec_algorithm.is_none():
-        return
-    backend.require_spec_mode(
-        model_runner,
-        SpecMode.DRAFT_EXTEND
-        if model_runner.is_draft_worker
-        and not model_runner.spec_algorithm.supports_target_verify_for_draft()
-        else SpecMode.TARGET_VERIFY,
-    )
 
 
 def _require_dcp_target_verify(

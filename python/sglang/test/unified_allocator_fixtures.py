@@ -18,12 +18,15 @@ from sglang.srt.mem_cache.kv.alloc.pricing import (
 )
 from sglang.srt.mem_cache.kv.build import UnifiedBuildContext, build_unified_pools
 from sglang.srt.mem_cache.kv.decl import (
+    FullLifetime,
     MHAGeometry,
     MLAGeometry,
     StateGeometry,
+    StateLifetime,
+    WindowLifetime,
     kv_layer_decls,
 )
-from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
+from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec, MHAView
 from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
 from sglang.srt.mem_cache.kv.memory.arena import ArenaBand, KVArena
@@ -32,10 +35,10 @@ from sglang.srt.mem_cache.layout.fused_draft import FusedDraftPlacement
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
-from sglang.srt.mem_cache.unified_memory_pool import UnifiedMHATokenToKVPool
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.runtime_context import mamba_cache_chunk_size, publish, reset_context
 from sglang.srt.server_args import ServerArgs
+from sglang.test.tree_slots import tree_slots_of
 
 
 def chain_snapshot(allocator) -> ChainSnapshot:
@@ -99,7 +102,9 @@ def build_swa_pool(*, page_size=1, lazy=True, ratio=(1, 1), total_bytes=None):
     return bundle.token_to_kv_pool_allocator
 
 
-def build_tri_pool(*, page_size=1, lazy=True, ratio=(1, 1), temporal=(1, 4, 8)):
+def build_tri_pool(
+    *, page_size=1, lazy=True, ratio=(1, 1), temporal=(1, 4, 8), total_bytes=None
+):
     """Full + SWA + Mamba composite over real CPU pools; returns the pool
     bundle and its allocator."""
     full_layers, swa_layers = ratio
@@ -137,6 +142,7 @@ def build_tri_pool(*, page_size=1, lazy=True, ratio=(1, 1), temporal=(1, 4, 8)):
         enable_mamba_extra_buffer_lazy=False,
         disable_overlap_schedule=True,
         sliding_window_size=32,
+        total_bytes=total_bytes,
     )
     return bundle, bundle.token_to_kv_pool_allocator
 
@@ -254,7 +260,14 @@ def plan_stand_in(arena: SpecArena, fused_draft=None) -> SimpleNamespace:
     """What draft binding reads of a plan, over a test arena's specs."""
     return SimpleNamespace(
         fused_draft=fused_draft,
-        sub_pool=lambda name: SimpleNamespace(spec=arena.spec(name)),
+        sub_pool=lambda name: SimpleNamespace(
+            spec=arena.spec(name),
+            lifetime=FullLifetime()
+            if name == "full"
+            else StateLifetime()
+            if name == "mamba"
+            else WindowLifetime(window=64),
+        ),
     )
 
 
@@ -310,6 +323,10 @@ def build_swa_cache(
     sessions=False,
     window=None,
 ):
+    if total_bytes is None:
+        # These eviction fixtures reserve 100 pages of byte space including
+        # sinks, leaving 99 joint pages for the pressure-sensitive scenarios.
+        total_bytes = 100 * page_size * sum(ratio) * 32
     allocator = build_swa_pool(
         page_size=page_size, lazy=lazy, ratio=ratio, total_bytes=total_bytes
     )
@@ -327,7 +344,10 @@ def build_swa_cache(
             token_to_kv_pool_allocator=allocator,
             page_size=page_size,
             sliding_window_size=128 * page_size if window is None else window,
-            tree_components=(ComponentType.FULL, ComponentType.SWA),
+            tree_slots=tree_slots_of(
+                (ComponentType.FULL, ComponentType.SWA),
+                window=128 * page_size if window is None else window,
+            ),
         )
     )
     slots = allocator.alloc(occupancy * page_size)
@@ -350,9 +370,14 @@ def build_tri_cache(
     ratio=(1, 1),
     sessions=False,
     state_cache=True,
+    total_bytes=None,
 ):
     bundle, a = build_tri_pool(
-        page_size=page_size, lazy=lazy, ratio=ratio, temporal=temporal
+        page_size=page_size,
+        lazy=lazy,
+        ratio=ratio,
+        temporal=temporal,
+        total_bytes=total_bytes,
     )
     c = UnifiedRadixCache(
         CacheInitParams(
@@ -361,10 +386,13 @@ def build_tri_cache(
             token_to_kv_pool_allocator=a,
             page_size=page_size,
             sliding_window_size=128 * page_size,
-            tree_components=(
-                (ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA)
-                if state_cache
-                else (ComponentType.FULL, ComponentType.SWA)
+            tree_slots=tree_slots_of(
+                (
+                    (ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA)
+                    if state_cache
+                    else (ComponentType.FULL, ComponentType.SWA)
+                ),
+                window=128 * page_size,
             ),
             enable_session_radix_cache=sessions,
         )
@@ -377,7 +405,7 @@ class UnifiedGeometry(msgspec.Struct, frozen=True, kw_only=True):
 
     ``chain`` names its kinds: "swa" (full + window), "mamba" (full + state) or
     "tri" (full + window + state); the layer ids given per kind must match.
-    ``byte_budget`` is the token side's byte budget (state slots ride on top);
+    ``byte_budget`` is the complete device-storage budget;
     without it the token capacities size the buffer.
     """
 
@@ -463,7 +491,7 @@ def build_test_unified_pools(
     unified_total_bytes=None,
     model_context_len=None,
     extra_max_context_len=0,
-    max_num_reqs=0,
+    max_num_reqs=1,
     enable_memory_saver=False,
     post_capture_active=False,
     need_sort=False,
@@ -511,11 +539,10 @@ def build_test_unified_pools(
         state_geometry=(
             StateGeometry.of(mamba2_cache_params) if mamba_layer_ids else None
         ),
+        checkpoint_interval=mamba_cache_chunk_size() if mamba_layer_ids else None,
     )
     sizing = KVSizingInputs(
-        token_budget_bytes=total_bytes
-        if total_bytes is not None
-        else unified_total_bytes,
+        budget_bytes=total_bytes if total_bytes is not None else unified_total_bytes,
         full_tokens=(
             full_max_total_num_tokens
             if full_max_total_num_tokens is not None
@@ -524,6 +551,8 @@ def build_test_unified_pools(
         window_tokens=swa_max_total_num_tokens,
         state_slots=max_mamba_cache_size,
         context_len=model_context_len,
+        floor_window=sliding_window_size,
+        alignment=1,
     )
     ctx = UnifiedBuildContext(
         device=device,
@@ -595,14 +624,17 @@ def build_unified_bundle(geometry: UnifiedGeometry):
         state_geometry=(
             StateGeometry.of(cache_params) if cache_params is not None else None
         ),
+        checkpoint_interval=mamba_cache_chunk_size() if g.state_layer_ids else None,
     )
     by_tokens = g.byte_budget is None or bool(g.state_layer_ids)
     sizing = KVSizingInputs(
-        token_budget_bytes=g.byte_budget,
+        budget_bytes=g.byte_budget,
         full_tokens=g.full_tokens if by_tokens else None,
         window_tokens=g.swa_tokens if by_tokens and g.swa_layer_ids else None,
         state_slots=g.state_slots if g.state_layer_ids else 0,
         context_len=g.context_len,
+        floor_window=g.window if g.swa_layer_ids else None,
+        alignment=1,
     )
     ctx = UnifiedBuildContext(
         device=g.device,
@@ -659,7 +691,7 @@ def build_mamba_cache(*, page_size=1, lazy=True, mla=False, ratio=(1, 1)):
             req_to_token_pool=bundle.req_to_token_pool,
             token_to_kv_pool_allocator=allocator,
             page_size=page_size,
-            tree_components=(ComponentType.FULL, ComponentType.MAMBA),
+            tree_slots=tree_slots_of((ComponentType.FULL, ComponentType.MAMBA)),
         )
     )
     return bundle, allocator, cache
@@ -776,7 +808,7 @@ def _pool_summary(pool, raw_base: int) -> dict:
         ),
         "host_capacity": (pool.host_capacity_tokens, pool.host_capacity_bytes),
     }
-    if isinstance(pool, UnifiedMHATokenToKVPool):
+    if isinstance(pool, MHAView):
         out["page_envelope"] = tuple(pool.get_page_envelope_buffer().shape)
     return out
 

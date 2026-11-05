@@ -6,15 +6,14 @@ from __future__ import annotations
 import logging
 from typing import Any, Iterable, Optional
 
-from sglang.srt.arg_groups.overrides import (
+from sglang.srt.arg_groups.model_override_base import (
     attention_backends_of,
-    declare_resolution,
     model_config_of,
-    resolution_result,
     resolved_view,
     resolving_view,
     use_mla_backend,
 )
+from sglang.srt.arg_groups.overrides import declare_resolution, resolution_result
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend
@@ -396,6 +395,49 @@ def handle_cache_compatibility(server_args: Any) -> None:
             "and cannot be used at the same time. Please use only one of them."
         )
 
+    if cfg.enable_prefill_weight_versions:
+        if cfg.enable_unified_memory:
+            raise ValueError(
+                "--enable-prefill-weight-versions is not supported with "
+                "--enable-unified-memory"
+            )
+        if cfg.enable_encoder_swa_bounded_replay:
+            raise ValueError(
+                "--enable-prefill-weight-versions is not supported with "
+                "--enable-encoder-swa-bounded-replay"
+            )
+        if cfg.enable_lmcache or cfg.enable_unified_cache_external_linker:
+            raise ValueError(
+                "--enable-prefill-weight-versions is not supported with "
+                "--enable-lmcache or --enable-unified-cache-external-linker"
+            )
+        if envs.SGLANG_RUST_SERVER.get():
+            raise ValueError(
+                "--enable-prefill-weight-versions is not supported with SGLANG_RUST_SERVER"
+            )
+        if cfg.dllm_algorithm is not None:
+            raise ValueError(
+                "--enable-prefill-weight-versions is not supported with "
+                "--dllm-algorithm"
+            )
+        if cfg.speculative_algorithm not in {None, "EAGLE", "EAGLE3", "DFLASH"}:
+            raise ValueError(
+                "--enable-prefill-weight-versions supports speculative algorithms "
+                f"EAGLE, EAGLE3, and DFLASH, got {cfg.speculative_algorithm!r}"
+            )
+        if cfg.enable_hierarchical_cache:
+            raise ValueError(
+                "The argument enable-prefill-weight-versions cannot be combined with "
+                "enable-hierarchical-cache: KV restored from the host or storage tiers carries "
+                "no weight version, so the reported prompt versions would be wrong."
+            )
+        if cfg.disaggregation_mode != "null":
+            raise ValueError(
+                "The argument enable-prefill-weight-versions is not supported in disaggregation "
+                f"mode {cfg.disaggregation_mode!r}: prefill workers do not report prompt weight "
+                "versions yet."
+            )
+
     if cfg.disaggregation_decode_enable_offload_kvcache:
         if cfg.disaggregation_mode != "decode":
             raise ValueError(
@@ -640,8 +682,7 @@ def _validate_unified_memory_dcp(server_args: Any) -> None:
     assert use_mla_backend(server_args), (
         "--enable-unified-memory with decode context parallelism "
         "(--dcp-size > 1) supports MLA models only (e.g. kimi-linear): the "
-        "MHA unified pool has no DCP-aware masked write path "
-        "(UnifiedMHATokenToKVPool.set_kv_buffer asserts dcp_kv_mask is None)."
+        "MHA unified pool has no DCP-aware masked write path."
     )
     assert not model_config_of(server_args).is_hybrid_swa, (
         "--enable-unified-memory with decode context parallelism "
@@ -734,7 +775,7 @@ def handle_page_major_kv_layout(server_args: Any):
         "--enable-page-major-kv-layout."
     )
     model_config = model_config_of(server_args)
-    # Allow-list. Every backend below reads through the translator, so what
+    # Allow-list. Every backend below reads through the `RunnerIds`, so what
     # gates one is only whether its kernels address the per-layer views by
     # their strides (the slot stride is the whole entry, not one row):
     #   * MLA models: the full paged MLA family, incl. flashmla (ps=64
