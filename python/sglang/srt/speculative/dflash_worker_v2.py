@@ -135,9 +135,9 @@ def _get_fused_kv_materialize_helper():
 
 
 class _DflashDraftSampler:
-    """Capture-safe greedy argmax over the target LM head, run inside the draft
-    cuda graph so the draft sampling is captured and counted in fwd_occupancy.
-    DFLASH's draft has no head of its own; it borrows the target `lm_head`.
+    """Capture-safe greedy argmax over a dense LM head, run inside the draft
+    cuda graph so draft sampling is captured and counted in fwd_occupancy.
+    Drafts borrow the target head unless they declare their own.
 
     tp=1: plain argmax over the local (full) vocab shard.
     tp>1: per-rank shard (max, global id) -> all-gather -> first-max select.
@@ -230,6 +230,25 @@ def _resolve_dflash_embedding_module(draft_model, target_model):
             )
         return embed_module
     return target_model.get_input_embeddings()
+
+
+def _resolve_dflash_sampling_head(
+    draft_model, target_model, *, has_own_lm_head: bool, draft_tp_size: int
+):
+    if not has_own_lm_head:
+        return unwrap_lora_layer(target_model.lm_head)
+
+    lm_head = draft_model.own_lm_head
+    if lm_head is None:
+        raise ValueError("DFLASH drafter declares an lm_head but has no loaded head.")
+    if draft_tp_size != 1:
+        weight = dict(lm_head.named_parameters(recurse=False)).get("weight")
+        if not is_dense_head_weight(weight):
+            raise ValueError(
+                "DFLASH with a quantized draft lm_head is only supported at "
+                f"draft_tp_size=1, got draft_tp_size={draft_tp_size}."
+            )
+    return lm_head
 
 
 def _is_all_greedy(sampling_info) -> bool:
@@ -459,6 +478,12 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._lilicorr_anchor: Optional[torch.Tensor] = None
         draft_config = parse_dflash_draft_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config
+        )
+        self._sampling_lm_head = _resolve_dflash_sampling_head(
+            self.draft_model,
+            target_worker.model_runner.model,
+            has_own_lm_head=draft_config.has_own_lm_head,
+            draft_tp_size=self.draft_parallel_layout.attn_tp_size,
         )
         self._is_domino = draft_config.is_domino
         if get_parallel().attn_dp_enabled and not _is_npu:
@@ -901,9 +926,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         if self.block_size <= 1:
             return _eager("block_size<=1")
         target_model = self._target_worker.model_runner.model
-        lm_head = unwrap_lora_layer(getattr(target_model, "lm_head", None))
+        lm_head = self._sampling_lm_head
         if lm_head is None:
-            return _eager("no target lm_head")
+            return _eager("no sampling lm_head")
 
         # A gate-admitted quantized head is capture-safe: the target's own
         # logits path already runs the same kernel under CUDA graphs.
@@ -1576,7 +1601,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         lm_head,
         chunk_size: int,
     ) -> torch.Tensor:
-        """Greedy argmax over a target LM head that has no dense ``weight``.
+        """Greedy argmax over a sampling LM head that has no dense ``weight``.
 
         A GGUF head stores packed ``qweight`` plus a type tag, so the dense path's
         ``weight[:num_org]`` slicing has nothing to slice. Logits come from the
@@ -1587,7 +1612,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         tp_size = int(get_parallel().tp_group.world_size)
         if tp_size != 1:
             raise RuntimeError(
-                "DFLASH with a quantized target lm_head is only supported at "
+                "DFLASH with a quantized sampling lm_head is only supported at "
                 f"tp=1, got tp_size={tp_size}."
             )
 
@@ -1612,7 +1637,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         lm_head,
         chunk_size: int = 256,
     ) -> torch.Tensor:
-        """Greedy argmax over the target LM head in a TP-safe way.
+        """Greedy argmax over the sampling LM head in a TP-safe way.
 
         We cannot materialize full logits for large vocabularies efficiently, and with
         TP>1 each rank only owns a shard of the LM head weight. This computes the
@@ -2556,13 +2581,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         embed_module = unwrap_lora_layer(
             _resolve_dflash_embedding_module(self.draft_model, target_model)
         )
-        lm_head = unwrap_lora_layer(getattr(target_model, "lm_head", None))
+        lm_head = self._sampling_lm_head
         if lm_head is None or not (
             hasattr(lm_head, "weight")
             or callable(getattr(getattr(lm_head, "quant_method", None), "apply", None))
         ):
             raise RuntimeError(
-                "DFLASH requires the target model to expose `lm_head` with either "
+                "DFLASH requires the selected sampling head to expose either "
                 "`weight` or a `quant_method` that can produce logits."
             )
 

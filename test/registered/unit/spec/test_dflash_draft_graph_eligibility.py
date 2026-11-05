@@ -27,6 +27,7 @@ class TestDFlashDraftGraphEligibility(unittest.TestCase):
         target_model = SimpleNamespace(
             get_input_embeddings=lambda: embedding, lm_head=torch.nn.Linear(4, 16)
         )
+        worker._sampling_lm_head = target_model.lm_head
         iteration_ids = SimpleNamespace(bind=Mock())
         target_translator = SimpleNamespace(plan=Mock(return_value=iteration_ids))
         draft_translator = SimpleNamespace()
