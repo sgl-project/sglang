@@ -31,6 +31,7 @@ from diffusers.models.normalization import (
     AdaLayerNormZero,
     AdaLayerNormZeroSingle,
 )
+
 from sglang.kernels.ops import diffusion as diffusion_ops
 from sglang.kernels.ops.diffusion import (
     FUSED_LINEAR_GELU,
@@ -133,19 +134,16 @@ def _longcat_norm_modulate(
 
 def _longcat_modulation(norm, emb, cache, chunks):
     if (
-        cache is None
-        or type(norm.linear) is not nn.Linear
-        or type(norm.silu) is not nn.SiLU
-        or norm.silu.inplace
-        or getattr(norm, "emb", None) is not None
+        cache is not None
+        and type(norm.linear) is nn.Linear
+        and type(norm.silu) is nn.SiLU
+        and not norm.silu.inplace
+        and getattr(norm, "emb", None) is None
     ):
-        return norm.linear(norm.silu(emb)).chunk(chunks, dim=1)
-    key = id(norm)
-    if key not in cache:
-        if "activation" not in cache:
-            cache["activation"] = norm.silu(emb)
-        cache[key] = norm.linear(cache["activation"]).chunk(chunks, dim=1)
-    return cache[key]
+        values = cache.get(id(norm))
+        if values is not None:
+            return values
+    return norm.linear(norm.silu(emb)).chunk(chunks, dim=1)
 
 
 class _LongCatAdaLayerNormZero(AdaLayerNormZero):
@@ -933,13 +931,21 @@ class LongCatImageTransformer2DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         self.layer_names = ["transformer_blocks", "single_transformer_blocks"]
 
     def _time_conditioning(self, hidden_states):
-        if torch.compiler.is_compiling() or torch.is_grad_enabled() or not hidden_states.is_cuda:
+        if (
+            torch.compiler.is_compiling()
+            or torch.is_grad_enabled()
+            or not hidden_states.is_cuda
+        ):
             return None
         context = get_forward_context_or_none()
         if context is None or context.current_timestep < 0:
             return None
         batch = context.forward_batch
-        if batch is None or not batch.do_classifier_free_guidance or hidden_states.shape[0] != 1:
+        if (
+            batch is None
+            or not batch.do_classifier_free_guidance
+            or hidden_states.shape[0] != 1
+        ):
             return None
         server_args = get_global_server_args()
         if (
@@ -957,17 +963,20 @@ class LongCatImageTransformer2DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             )
         ):
             return None
-        # Use the same one-row projections as the model forward. Computing all
-        # timesteps together lets each layer reuse its weights before attention
-        # and the other layers evict them. Nothing survives the denoising loop.
+        # Keep the native one-row projections and reuse each layer's weights
+        # across timesteps. The denoising stage clears this request-local state.
         state = batch.extra.setdefault(DENOISING_LOOP_STATE, {}).setdefault(
             "longcat_modulations", {}
         )
         key = (hidden_states.dtype, hidden_states.device)
         entry = state.get(id(self))
         if entry is None or entry[0] is not batch.timesteps or entry[1] != key:
-            timesteps = batch.timesteps.to(device=hidden_states.device, dtype=hidden_states.dtype).flatten()
-            embeddings = [self.time_embed(t.reshape(1), hidden_states.dtype) for t in timesteps]
+            timesteps = batch.timesteps.to(
+                device=hidden_states.device, dtype=hidden_states.dtype
+            ).flatten()
+            embeddings = [
+                self.time_embed(t.reshape(1), hidden_states.dtype) for t in timesteps
+            ]
             activations = [torch.nn.functional.silu(value) for value in embeddings]
             by_step = [{} for _ in embeddings]
             norms = [(block.norm1, 6) for block in self.transformer_blocks]

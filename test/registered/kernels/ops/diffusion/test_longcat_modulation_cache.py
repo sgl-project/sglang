@@ -1,4 +1,4 @@
-"""CFG timestep modulation reuse and request/capture fallbacks."""
+"""Request-local time conditioning and capture fallbacks."""
 
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -25,7 +25,7 @@ register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-l
 def test_wrapped_projection_does_not_reuse_cached_modulation():
     norm = longcat._LongCatAdaLayerNormZeroSingle(16)
     emb = torch.randn(1, 16)
-    cache = {}
+    cache = {id(norm): norm.linear(norm.silu(emb)).chunk(3, dim=1)}
     first = longcat._longcat_modulation(norm, emb, cache, 3)
     assert all(
         torch.equal(a, b)
@@ -50,7 +50,7 @@ class _SDPA(nn.Module):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
-def test_model_reuses_only_current_cfg_step_and_falls_back_for_capture():
+def test_model_prepares_time_conditioning_per_request_and_skips_capture():
     torch.manual_seed(42)
     config = LongCatImagePipelineConfig()
     arch = config.dit_config.arch_config
