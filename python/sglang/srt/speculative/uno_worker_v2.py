@@ -8,22 +8,22 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.kernels.ops.sampling import argmax as sampling_argmax
 from sglang.kernels.ops.speculative.uno_tree import build_uno_tree_proposal
 from sglang.srt.managers.utils import GenerationBatchResult
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardBatch,
-    ForwardMode,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     ForwardContext,
     forward_context,
 )
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.runtime_context import get_schedule, get_spec
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.eagle_utils import default_tree_mask_mode
 from sglang.srt.speculative.eagle_worker_common import (
+    STOCK_SPECULATIVE_RUNTIME_HOOKS,
+    bind_eagle_runtime_hooks,
     build_eagle_verify_input,
     run_eagle_verify,
 )
@@ -56,6 +56,8 @@ logger = logging.getLogger(__name__)
 
 class UnoWorkerV2(BaseSpecWorker):
     """Single-model UNO worker with linear and native-EAGLE tree decode."""
+
+    _speculative_runtime_hooks = STOCK_SPECULATIVE_RUNTIME_HOOKS
 
     def __init__(
         self,
@@ -143,6 +145,9 @@ class UnoWorkerV2(BaseSpecWorker):
 
         if self.tree_mode:
             self._uno_draft_attn_backend = self._build_uno_draft_attn_backend()
+        self._speculative_runtime_hooks = bind_eagle_runtime_hooks(
+            self.target_worker, supports_sharded_verify=False
+        )
 
     def init_cuda_graphs(self):
         """Capture only the private F-wide tree-draft graph."""
@@ -346,7 +351,7 @@ class UnoWorkerV2(BaseSpecWorker):
         if not need_top1:
             return result, None
 
-        predictions = torch.argmax(logits, dim=-1).view(
+        predictions = sampling_argmax(logits).view(
             forward_batch.batch_size,
             self.forward_width,
         )
@@ -571,6 +576,7 @@ class UnoWorkerV2(BaseSpecWorker):
             )
         eagle_result = run_eagle_verify(
             verify_batch,
+            speculative_runtime_hooks=self._speculative_runtime_hooks,
             target_worker=self.target_worker,
             req_to_token_pool=self.model_runner.req_to_token_pool,
             token_to_kv_pool_allocator=(self.model_runner.token_to_kv_pool_allocator),

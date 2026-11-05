@@ -58,6 +58,7 @@ _TRITON_KERNELS = [
     ("kv_indices", "get_num_page_per_block_flashmla"),
     ("trtllm_mha_page_table", "build_trtllm_mha_page_table"),
     ("trtllm_mha_graph_metadata", "update_trtllm_mha_graph_metadata"),
+    ("trtllm_mha_graph_metadata", "update_draft_step_seqlens"),
     ("aiter_unified_page_table", "scatter_ragged_to_page_table_kernel"),
     ("aiter_unified_page_table", "scatter_req_to_token_to_page_table_kernel"),
     ("fused_qk_rope_reshape_and_cache", "fused_qk_rope_reshape_and_cache"),
@@ -72,6 +73,15 @@ for _mod, _fn in _TRITON_KERNELS:
         )
     )
 del _mod, _fn
+
+register_kernel(
+    KernelSpec(
+        op="attention.qk_norm_rope",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.qk_norm_rope:qk_norm_rope",
+        capabilities=CUDA_ONLY,
+    )
+)
 
 register_kernel(
     KernelSpec(
@@ -292,6 +302,16 @@ register_kernel(
 # Public entry points inventoried by logical operator group (RFC #29630).
 register_kernel(
     KernelSpec(
+        op="attention.cute_sparse_mla_h16_fwd",
+        backend=KernelBackend.CUTE_DSL,
+        target="sglang.kernels.ops.attention.dsv4.cute_sparse_mla_h16:cute_sparse_mla_h16_fwd",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(9, 0), max_sm=(9, 0))}
+        ),
+    )
+)
+register_kernel(
+    KernelSpec(
         op="attention.get_block_table",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.attention.minicpm_sala.get_block_table:get_block_table",
@@ -335,10 +355,10 @@ register_kernel(
         op="attention.deep_select_topk",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.attention.deep_select:topk",
-        # Exactly SM90, SM100 and SM103, the architectures DeepSelect is tuned for.
+        # Exactly SM90, SM100, SM103 and SM107, the architectures DeepSelect is tuned for.
         capabilities=frozenset(
             CapabilityRequirement.cuda(min_sm=sm, max_sm=sm)
-            for sm in ((9, 0), (10, 0), (10, 3))
+            for sm in ((9, 0), (10, 0), (10, 3), (10, 7))
         ),
     )
 )
@@ -484,6 +504,40 @@ register_kernel(
         backend=KernelBackend.AITER,
         target="sglang.kernels.ops.attention.minimax_sparse.prefill.gluon_prefill:gluon_sparse_prefill",
         capabilities=frozenset({CapabilityRequirement.HIP}),
+    )
+)
+# Unlimited-OCR v2 DASH block-sparse attention: routing, attend, decode metadata.
+for _mod, _fn, _backend in [
+    ("attend", "dash_sparse_attn", KernelBackend.TRITON),
+    ("route", "route_prefill_triton", KernelBackend.TRITON),
+    ("route", "route_decode_triton", KernelBackend.TRITON),
+    ("route", "win_bounds_decode", KernelBackend.TRITON),
+    ("route", "kbar_refresh_tail_triton", KernelBackend.TRITON),
+    ("route", "kbar_all_plan", KernelBackend.TORCH),
+    ("route", "kbar_tail_plan", KernelBackend.TORCH),
+    ("route", "prefill_row2req", KernelBackend.TORCH),
+    ("decode_meta", "dash_decode_meta", KernelBackend.TRITON),
+    ("decode_meta", "dash_decode_allow", KernelBackend.TRITON),
+    ("decode_meta", "page2d_cos_sin", KernelBackend.TRITON),
+    ("decode_meta", "local_union_fused", KernelBackend.TRITON),
+    ("page2d_rope", "apply_page2d_rope", KernelBackend.TRITON),
+    ("page2d_rope", "apply_page2d_rope_pair", KernelBackend.TRITON),
+]:
+    register_kernel(
+        KernelSpec(
+            op=f"attention.{_fn}",
+            backend=_backend,
+            target=f"sglang.kernels.ops.attention.unlimited_ocr_dash.{_mod}:{_fn}",
+        )
+    )
+del _mod, _fn, _backend
+# Its PDL probe reads the device major only, which also enables PDL on ROCm gfx9.
+register_kernel(
+    KernelSpec(
+        op="attention.dash_sparse_attn_decode",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.unlimited_ocr_dash.attend:dash_sparse_attn_decode",
+        capabilities=CUDA_ONLY,
     )
 )
 register_kernel(

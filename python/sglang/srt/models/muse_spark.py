@@ -640,7 +640,7 @@ class MuseSpark1xMoE(nn.Module):
         return (
             self.nvfp4_checkpoint
             and self.pre_expert_norm is not None
-            and not getattr(self.experts, "use_marlin", False)
+            and not self.experts.use_marlin
             and not self.experts.quant_config.use_per_token_activation
             and all_gather_norm_fp4_quant_supported(
                 hidden_states, self.pre_expert_proj.weight.shape[0]

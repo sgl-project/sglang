@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import (
     cache_once,
     is_arch_support_pdl,
@@ -75,11 +76,8 @@ def gemm_ag_supported(
         return False
     m, k = x.shape
     n = weight.shape[0]
-    archs = ((10, 3), (10, 7)) if pooler else ((10, 3),)
-    if pooler and (
-        comm.world_size not in (4, 8)
-        or torch.cuda.get_device_capability(x.device) not in archs
-    ):
+    sm_ok = current_arch().is_sm(10, 3) or (pooler and current_arch().is_sm(10, 7))
+    if pooler and (comm.world_size not in (4, 8) or not sm_ok):
         return False
     max_tokens = (
         POOLER_TP4_MAX_TOKENS if pooler and comm.world_size == 4 else MAX_TOKENS
@@ -88,11 +86,7 @@ def gemm_ag_supported(
         1 <= m <= max_tokens
         and (
             m <= SMALL_PROJECTION_MAX_TOKENS
-            or (
-                comm.world_size in (4, 8)
-                and n in (4096, 8192)
-                and torch.cuda.get_device_capability(x.device) in archs
-            )
+            or (comm.world_size in (4, 8) and n in (4096, 8192) and sm_ok)
         )
         and weight.shape[1] == k
         and n % (comm.world_size * _VEC) == 0
