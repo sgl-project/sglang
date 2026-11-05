@@ -50,7 +50,7 @@ from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.pool_host import common as host_memory
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.unified_cache.components.base import ComponentType
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.tree_core_registry import _TREE_CORE_REGISTRY
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import publish, reset_context
@@ -188,7 +188,10 @@ class _ConfigCase(unittest.TestCase):
     def setUp(self):
         reset_context()
         self.addCleanup(reset_context)
-        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+        args = ServerArgs(model_path="dummy")
+        # Mamba cache setup must not resolve the dummy model through Hugging Face.
+        args._mamba_cache_chunk_size = 64
+        publish(args, role="tokenizer")
 
 
 class TestPhysicalReservation(_ConfigCase):
@@ -290,9 +293,12 @@ class TestFloatSwaReservation(_ConfigCase):
         self.assertEqual((full.allocated_count(), swa.allocated_count()), allocated)
         self.assertEqual(allocator.verify_byte_accounting(), [])
 
-        # Cancelled, so the float makes room again.
+        # Cancellation releases the pin. Trimming the leading hole can make
+        # room without copying live pages; either form of reclaim is valid.
+        previous_low = swa._byte_low_frontier()
         self.assertIsNotNone(states.alloc(1))
-        self.assertIn(("move", "swa"), moves)
+        self.assertGreater(swa._byte_low_frontier(), previous_low)
+        self.assertEqual(allocator.verify_byte_accounting(), [])
 
 
 class TestCallerOwnedLoadDestination(_ConfigCase):
@@ -473,6 +479,10 @@ class TestSwaLoadBackReservation(_UnifiedHiCacheCase):
             )
         self.cache.flush_pending_backups()
         self.cache.writing_check()
+        # Admission stops at its target before this band exhausts its physical
+        # span. Hold that spare span so this test exercises eviction on retry.
+        spare = swa.alloc_physical(swa.available_size())
+        self.assertIsNotNone(spare)
         entry = self.controller.mem_pool_host.entry_map[PoolName.SWA]
         evict = entry.device_evict_fn
         evictions = []
@@ -491,6 +501,7 @@ class TestSwaLoadBackReservation(_UnifiedHiCacheCase):
         self.assertIsNotNone(result)
         self.assertEqual(evictions, [2 * PAGE])
         swa.cancel_physical_reservation(transfer.device_indices)
+        swa.cancel_physical_reservation(spare)
         self.assertEqual(self.allocator.verify_byte_accounting(), [])
         self.cache.sanity_check()
 

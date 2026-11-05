@@ -35,7 +35,7 @@ from sglang.kernels.jit.utils import (
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
-_SUPPORTED_HEADS = {3, 6, 12}
+SUPPORTED_HEADS = {3, 6, 12}
 _CONV_STATE_W = 3  # kernel width 4 -> 3 cached tokens
 
 
@@ -67,7 +67,7 @@ def covered(
     if ssm_states.ndim < 4:
         return False
     H, V, K = ssm_states.shape[-3:]
-    if H not in _SUPPORTED_HEADS:
+    if H not in SUPPORTED_HEADS:
         return False
     seg = H * 128
     conv_dim = 3 * seg

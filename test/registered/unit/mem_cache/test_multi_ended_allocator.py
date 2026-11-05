@@ -22,7 +22,7 @@ from types import SimpleNamespace
 
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang.test.tree_slots import index_slots
+from sglang.test.tree_slots import index_slots, tree_slots_of
 from sglang.test.unified_allocator_fixtures import (
     arena_of,
     chain_snapshot,
@@ -36,11 +36,17 @@ register_cuda_ci(est_time=14, stage="base-b", runner_config="1-gpu-small")
 import contextlib
 import random
 import unittest
-from unittest.mock import MagicMock
+from array import array
+from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+from sglang.srt.mem_cache.base_prefix_cache import (
+    EvictParams,
+    InsertParams,
+    MatchPrefixParams,
+)
+from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import kv_to_page_indices
 from sglang.srt.mem_cache.kv.alloc.band import (
     Band,
@@ -53,6 +59,7 @@ from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
 from sglang.srt.mem_cache.prefill_budget import estimate_swa_kv_tokens
+from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_memory_pool import (
     UnifiedMambaSlotAllocator,
@@ -1205,6 +1212,270 @@ class TestWindowChainAllocator(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
+class TestJointLRUEviction(unittest.TestCase):
+    """joint_lru on the two-ended allocator: one Full/SWA eviction order by access
+    time, per-walk SWA leaf collapse, the eviction dispatch and the SWA times."""
+
+    FULL, SWA = ComponentType.FULL, ComponentType.SWA
+
+    def setUp(self):
+        # The code under test reads its config from the bags.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
+    def _cache(self, eviction_policy="joint_lru", **params):
+        # The allocator fixture reads no instance state.
+        _, allocator, _ = TestWindowChainAllocator._build(
+            self, n_full_slots=48, n_swa_slots=48, full_layer_num=2, swa_layer_num=6
+        )
+        cache = UnifiedRadixCache(
+            CacheInitParams(
+                req_to_token_pool=None,
+                token_to_kv_pool_allocator=allocator,
+                page_size=1,
+                disable=False,
+                sliding_window_size=4,
+                tree_slots=tree_slots_of((self.FULL, self.SWA), window=4),
+                tree_core_backend="python",
+                eviction_policy=eviction_policy,
+                **params,
+            )
+        )
+        return cache, allocator
+
+    @staticmethod
+    def _insert(cache, allocator, tokens):
+        value = allocator.alloc(len(tokens))
+        cache.insert(InsertParams(key=RadixKey(array("q", tokens)), value=value))
+
+    @staticmethod
+    def _match(cache, tokens):
+        cache.match_prefix(MatchPrefixParams(RadixKey(array("q", tokens))))
+
+    @staticmethod
+    def _node(cache, tokens):
+        stack = list(cache.tree_core.root_node.children.values())
+        while stack:
+            node = stack.pop()
+            if list(node.key) == tokens:
+                return node
+            stack.extend(node.children.values())
+        return None
+
+    @staticmethod
+    def _block_compaction(allocator):
+        allocator.lazy_compaction = True
+        for sub_pool in (allocator.full_attn_allocator, allocator.swa_attn_allocator):
+            sub_pool.lazy_compaction = True
+            sub_pool.pin_sources = (lambda: True,)
+
+    @staticmethod
+    def _record_victims(cache):
+        core, victims = cache.tree_core, []
+        select = core.next_joint_eviction_victim
+
+        def recorded():
+            victim = select()
+            if victim is not None:
+                victims.append((victim[0], list(core.node_by_id(victim[1]).key)))
+            return victim
+
+        core.next_joint_eviction_victim = recorded
+        return victims
+
+    def _tree(self, eviction_policy="joint_lru"):
+        """[1..4] -> [5, 6] -> [7..10], and [20, 21]. Matching [1..10] last
+        refreshes [1..4]'s Full but not its SWA, which is outside the window."""
+        cache, allocator = self._cache(eviction_policy)
+        self._insert(cache, allocator, [1, 2, 3, 4])
+        self._insert(cache, allocator, list(range(1, 11)))
+        self._insert(cache, allocator, [20, 21])
+        self._match(cache, list(range(1, 11)))
+        return cache, allocator
+
+    def test_victims_follow_access_time_across_components(self):
+        cache, allocator = self._tree()
+        victims = self._record_victims(cache)
+        cache.evict(EvictParams(num_tokens=12, swa_num_tokens=12))
+        self.assertEqual(
+            victims,
+            [
+                (self.SWA, [1, 2, 3, 4]),
+                # Its cascade frees [20, 21]'s SWA; that heap entry is skipped.
+                (self.FULL, [20, 21]),
+                (self.SWA, [5, 6]),
+                (self.SWA, [7, 8, 9, 10]),
+                (self.FULL, [7, 8, 9, 10]),
+                # Parents join once their last child is gone.
+                (self.FULL, [5, 6]),
+                (self.FULL, [1, 2, 3, 4]),
+            ],
+        )
+        self.assertEqual(allocator.full_attn_allocator.allocated_count(), 0)
+        self.assertEqual(allocator.swa_attn_allocator.allocated_count(), 0)
+
+    def test_joint_walk_strips_leaf_swa_and_the_next_legacy_walk_collapses(self):
+        cache, allocator = self._tree()
+        victims = self._record_victims(cache)
+        # 2 Full + 12 SWA tokens of room ends the walk at [7..10]'s SWA.
+        cache.evict(EvictParams(num_tokens=2, swa_num_tokens=12))
+        self.assertEqual(victims[-1], (self.SWA, [7, 8, 9, 10]))
+        leaf = self._node(cache, [7, 8, 9, 10])
+        self.assertIn(leaf, cache.tree_core.evictable_device_leaves)
+        self.assertIsNotNone(leaf.component_data[self.FULL].value)
+        self.assertIsNone(leaf.component_data[self.SWA].value)
+
+        self._insert(cache, allocator, [30, 31])
+        self._block_compaction(allocator)
+        cache.evict(EvictParams(swa_num_tokens=2))
+        self.assertEqual(len(victims), 4, "no joint walk with compaction blocked")
+        # The legacy SWA walk evicts the whole SWA leaf, Full included.
+        self.assertIsNone(self._node(cache, [30, 31]))
+
+    def test_dispatch_needs_joint_lru_and_unblocked_compaction(self):
+        for policy, blocked, joint in (
+            ("lru", False, False),
+            ("joint_lru", True, False),
+            ("joint_lru", False, True),
+        ):
+            with self.subTest(policy=policy, blocked=blocked):
+                cache, allocator = self._tree(policy)
+                if blocked:
+                    self._block_compaction(allocator)
+                victims = self._record_victims(cache)
+                cache.evict(EvictParams(num_tokens=2))
+                self.assertEqual(victims == [(self.SWA, [1, 2, 3, 4])], joint)
+                # Either way the oldest Full leaf goes: [20, 21] last at 53 vs 58.
+                if not joint:
+                    self.assertIsNone(self._node(cache, [20, 21]))
+
+    def test_window_refresh_stamps_swa_even_with_compaction_blocked(self):
+        cache, allocator = self._cache()
+        self._insert(cache, allocator, [1, 2, 3, 4])
+        self._insert(cache, allocator, list(range(1, 11)))
+        self._insert(cache, allocator, [20, 21])
+        times = cache.tree_core.joint_lru.swa_access_time
+        outside, middle, leaf = (
+            self._node(cache, tokens)
+            for tokens in ([1, 2, 3, 4], [5, 6], [7, 8, 9, 10])
+        )
+        # A refresh stamps its window deepest-newest, as in the SWA LRU order.
+        self.assertLess(times[middle.id], times[leaf.id])
+        outside_swa, outside_full, leaf_swa = (
+            times[outside.id],
+            outside.last_access_time,
+            times[leaf.id],
+        )
+        # The gate selects the eviction walk only; accesses still count.
+        self._block_compaction(allocator)
+        self._match(cache, list(range(1, 11)))
+        self.assertGreater(times[leaf.id], leaf_swa)
+        self.assertLess(times[middle.id], times[leaf.id])
+        # The Full hit refreshes [1..4]'s Full, not its SWA outside the window.
+        self.assertGreater(outside.last_access_time, outside_full)
+        self.assertEqual(times[outside.id], outside_swa)
+
+        # Reopened, the joint walk picks the victims of the same tree whose
+        # match ran with the gate open.
+        for sub_pool in (allocator.full_attn_allocator, allocator.swa_attn_allocator):
+            sub_pool.pin_sources = ()
+        victims = self._record_victims(cache)
+        cache.evict(EvictParams(num_tokens=12, swa_num_tokens=12))
+        open_cache, _ = self._tree()
+        open_victims = self._record_victims(open_cache)
+        open_cache.evict(EvictParams(num_tokens=12, swa_num_tokens=12))
+        self.assertEqual(victims, open_victims)
+
+    def test_swa_access_times_follow_device_swa(self):
+        cache, allocator = self._cache()
+        core = cache.tree_core
+        swa_lru = core.lru_lists[self.SWA]
+
+        def assert_times_match_device_swa():
+            self.assertEqual(set(core.joint_lru.swa_access_time), set(swa_lru.cache))
+
+        self._insert(cache, allocator, list(range(1, 11)))
+        # A 5-token tail fills the window, so the split prefix keeps its time.
+        self._insert(cache, allocator, [1, 2, 3, 4, 5, 6, 7, 8, 50, 51, 52, 53, 54])
+        top = self._node(cache, [1, 2, 3, 4, 5, 6])
+        prefix, suffix = self._node(cache, [7, 8]), self._node(cache, [9, 10])
+        times = core.joint_lru.swa_access_time
+        self.assertEqual(times[prefix.id], times[suffix.id])
+        assert_times_match_device_swa()
+        # Equal times keep the SWA LRU order: the prefix first. Under joint_lru
+        # the suffix's Full keeps its pre-split access, so it is the oldest; the
+        # first window stamped [1..6] just older than [7..10].
+        core.start_joint_eviction()
+        try:
+            order = [core.next_joint_eviction_victim() for _ in range(4)]
+        finally:
+            core.end_joint_eviction()
+        self.assertEqual(
+            order,
+            [
+                (self.FULL, suffix.id),
+                (self.SWA, top.id),
+                (self.SWA, prefix.id),
+                (self.SWA, suffix.id),
+            ],
+        )
+
+        victims = self._record_victims(cache)
+        cache.evict(EvictParams(num_tokens=2, swa_num_tokens=8))
+        self.assertEqual(
+            victims, [(self.FULL, [9, 10]), (self.SWA, [1, 2, 3, 4, 5, 6])]
+        )
+        # A Full cascade and an SWA-only eviction both drop the time; the node
+        # that lost only its SWA stays.
+        self.assertIsNone(self._node(cache, [9, 10]))
+        self.assertIs(self._node(cache, [1, 2, 3, 4, 5, 6]), top)
+        self.assertNotIn(top.id, core.joint_lru.swa_access_time)
+        assert_times_match_device_swa()
+
+        # Restoring the SWA stamps a new access.
+        newest = max(times.values())
+        self._insert(cache, allocator, [1, 2, 3, 4, 5, 6])
+        self.assertIsNotNone(top.component_data[self.SWA].value)
+        self.assertGreater(times[top.id], newest)
+        assert_times_match_device_swa()
+
+        core.reset()
+        self.assertEqual(core.joint_lru.swa_access_time, {})
+
+    def test_prefix_access_keeps_suffix_recency_only_under_joint_lru(self):
+        for policy, keeps in (("joint_lru", True), ("lru", False)):
+            for access in ("insert", "match"):
+                with self.subTest(policy=policy, access=access):
+                    cache, allocator = self._cache(policy)
+                    self._insert(cache, allocator, list(range(1, 11)))
+                    suffix = self._node(cache, [7, 8, 9, 10])
+                    before = suffix.last_access_time
+                    if access == "insert":
+                        self._insert(cache, allocator, [1, 2, 3, 4, 5, 6, 7, 8, 50])
+                    else:
+                        self._match(cache, list(range(1, 9)))
+                    self.assertEqual(list(suffix.key), [9, 10])
+                    if keeps:
+                        self.assertEqual(suffix.last_access_time, before)
+                    else:
+                        self.assertGreater(suffix.last_access_time, before)
+
+    def test_joint_lru_rejects_session_radix_cache_at_initialization(self):
+        with self.assertRaisesRegex(ValueError, "enable-session-radix-cache"):
+            self._cache(enable_session_radix_cache=True)
+        cache, _ = self._cache("lru", enable_session_radix_cache=True)
+        self.assertFalse(cache.evicts_by_joint_lru)
+
+    def test_joint_lru_rejects_a_tree_core_without_the_joint_walk(self):
+        core_cls = type(self._cache("lru")[0].tree_core)
+        with patch.object(core_cls, "supports_joint_eviction", False):
+            with self.assertRaisesRegex(ValueError, "joint Full/SWA eviction walk"):
+                self._cache()
+            cache, _ = self._cache("lru")
+            self.assertFalse(cache.evicts_by_joint_lru)
+
+
 class TestPagedBand(unittest.TestCase):
     """`Band(page_size=8)`: free-list, v2p/p2v and compaction are
     page-granular, while the external API stays in token ids as at page_size 1."""
@@ -1900,7 +2171,6 @@ class TestPagedBand(unittest.TestCase):
     # OOB kernel inputs.
     def test_paged_pool_translate_helper_returns_physical_tokens(self):
         from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
-        from sglang.srt.mem_cache.kv.alloc.interim import _virtual_tokens_to_physical
 
         full_spec = MHASubPoolSpec(
             name="full",
@@ -1948,7 +2218,7 @@ class TestPagedBand(unittest.TestCase):
         v_tokens = allocator.alloc(2 * PS)
         self.assertIsNotNone(v_tokens)
 
-        swa_phys = _virtual_tokens_to_physical(v_tokens, allocator.swa_attn_allocator)
+        swa_phys = allocator.swa_attn_allocator.ids.translate(v_tokens)
 
         self.assertTrue(
             bool((swa_phys >= 0).all().item()),
@@ -2708,16 +2978,23 @@ class TestChainFrontierWalk(unittest.TestCase):
 
     def test_multi_hop_walk_stops_at_first_opaque(self):
         _, fa, ma = self._build_pair()
-        t1 = _ChainStub(low_byte=100, high_byte=100, transparent=True)
-        t2 = _ChainStub(low_byte=200, high_byte=260, transparent=False)
+        low = fa._byte_high_frontier()
+        gap = ma._byte_low_frontier() - low
+        self.assertGreater(gap, 0)
+        t1_pos = low + gap // 4
+        t2_lo, t2_hi = low + gap // 2, low + 3 * gap // 4
+        t1 = _ChainStub(low_byte=t1_pos, high_byte=t1_pos, transparent=True)
+        t2 = _ChainStub(low_byte=t2_lo, high_byte=t2_hi, transparent=False)
         fa.bind_high_peer(t1)
         t1.low_peer = fa
         t1.high_peer = t2
         t2.low_peer = t1
         t2.high_peer = ma
         ma.bind_low_peer(t2)
-        self.assertEqual(fa._current_gap_bytes(), 200 - fa._byte_high_frontier())
+        self.assertEqual(fa._current_gap_bytes(), t2_lo - fa._byte_high_frontier())
         self.assertIs(fa._growth_side_neighbor(), t2)
+        self.assertEqual(ma._current_gap_bytes(), ma._byte_low_frontier() - t2_hi)
+        self.assertIs(ma._growth_side_neighbor(), t2)
         t2.transparent = True
         self.assertIs(fa._growth_side_neighbor(), ma)
         self.assertEqual(
@@ -3004,6 +3281,73 @@ class TestFloatBand(CustomTestCase):
         moved = sum(int(s.numel()) for s, _, _ in fla._inverse_history)
         self.assertEqual(moved, 2)  # min(L_live, G) == L_live
         self._check_float_state(fla, kv)
+
+    def test_joint_relief_translates_donor_bytes_to_float_grid(self):
+        from sglang.srt.mem_cache.kv.alloc.band import _float_open_short_side
+
+        specs = [
+            _make_mha_spec("low", "up", layer_num=1, head_num=1, head_dim=128),
+            _make_mha_spec("middle", "float", layer_num=1, head_num=1, head_dim=96),
+            _make_mha_spec("high", "down", layer_num=1, head_num=1, head_dim=32),
+        ]
+        arena = arena_of(specs, total_bytes=1792, device="cpu")
+        low = Band(arena=arena, sub_pool_name="low", device="cpu", is_id_owner=True)
+        middle = FloatBand(
+            arena=arena, sub_pool_name="middle", device="cpu", is_id_owner=True
+        )
+        high = Band(arena=arena, sub_pool_name="high", device="cpu", is_id_owner=True)
+        low.bind_high_peer(middle)
+        middle.bind_low_peer(low)
+        middle.bind_high_peer(high)
+        high.bind_low_peer(middle)
+        kv = _FakeKVCache(arena, "middle")
+        self.assertIsNotNone(high.alloc(1))
+        v = middle.alloc(1)
+        self._stamp(middle, kv, v)
+        middle._relocate_to_positions([int(middle.ids.virtual_to_physical[v][0])], [2])
+        self.assertEqual(middle._region_bounds_pages(), (2, 4))
+        # Raw frontiers are 512/1664, while the float's own grid is 384.
+        # The requested 512-byte low gap needs only 384 aligned float bytes.
+        _float_open_short_side(middle, {low: 1, middle: 0, high: 1})
+        self.assertEqual(int(middle.ids.virtual_to_physical[v][0]), 3)
+        self._check_float_state(middle, kv)
+        self.assertIsNotNone(high.alloc(1))
+        self.assertIsNotNone(low.alloc(1))
+
+    def test_make_room_leapfrog_preserves_opposite_gap(self):
+        for side in ("low", "high"):
+            with self.subTest(side=side):
+                _, _, fla, _, kv = self._build_tri()
+                v = fla.alloc(1)
+                self._stamp(fla, kv, v)
+                epp = fla.entry_bytes_per_page
+                before = dict(zip(("low", "high"), fla._gap_pages()))
+                ask = (before[side] + 2) * epp
+                self.assertEqual(fla.make_room(side=side, min_bytes=ask), ask)
+                after = dict(zip(("low", "high"), fla._gap_pages()))
+                other = "high" if side == "low" else "low"
+                self.assertEqual(after[other], before[other] - 2)
+                self.assertGreater(after[other], 0)
+                self._check_float_state(fla, kv)
+
+    def test_interior_pack_preserves_payload_with_mixed_move_directions(self):
+        _, _, fla, _, kv = self._build_tri()
+        v = fla.alloc(13)
+        self._stamp(fla, kv, v)
+        physical = fla.ids.virtual_to_physical[v]
+        start = int(physical.min())
+        keep = (physical == start) | (physical >= start + 8)
+        fla.free(v[~keep])
+        live = sorted(int(x) for x in physical[keep].tolist())
+        final = list(range(start + 6, start + 12))
+        self.assertTrue(any(d < src for src, d in zip(live, final)))
+        self.assertTrue(any(d > src for src, d in zip(live, final)))
+        fla._relocate_to_positions(live, final)
+        self._check_float_state(fla, kv)
+        torch.testing.assert_close(
+            fla.ids.virtual_to_physical[v[keep]],
+            torch.tensor(final, dtype=physical.dtype, device=physical.device),
+        )
 
     def test_make_room_impossible_leaves_state_unchanged(self):
         _, _, fla, _, kv = self._build_tri(n_float=8)
@@ -3422,7 +3766,6 @@ class TestDcpWidening(unittest.TestCase):
                 )
                 mamba_slots = UnifiedMambaSlotAllocator(
                     allocator.mamba_allocator,
-                    max_size=allocator.mamba_allocator.max_slots - 1,
                     device=_DEV,
                 )
 
@@ -3481,7 +3824,6 @@ class TestDcpWidening(unittest.TestCase):
             )
             mamba_slots = UnifiedMambaSlotAllocator(
                 allocator.mamba_allocator,
-                max_size=allocator.mamba_allocator.max_slots - 1,
                 device=_DEV,
             )
 

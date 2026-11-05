@@ -46,6 +46,12 @@ _CUDA_SM10X = frozenset({CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 
 # ---------------------------------------------------------------------------
 _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
     (
+        "diffusion.depthwise_conv3x3_bias_glu",
+        KernelBackend.KDA,
+        "sglang.kernels.kda_kernels.sana_depthwise_glu_triton:fused_depthwise_conv3x3_bias_glu",
+        _CUDA,
+    ),
+    (
         "diffusion.fused_packed_swiglu_fp8_rowwise",
         KernelBackend.TRITON,
         "quantization.swiglu_fp8_rowwise_triton:fused_packed_swiglu_fp8_rowwise",
@@ -194,6 +200,12 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
         KernelBackend.TRITON,
         "norm.zimage_qk_rmsnorm_triton:zimage_qk_rmsnorm_native",
         _CUDA,
+    ),
+    (
+        "diffusion.aten_head_rmsnorm",
+        KernelBackend.TRITON,
+        "norm.aten_head_rmsnorm_triton:aten_head_rmsnorm",
+        _HIP,
     ),
     (
         "diffusion.rmsnorm_scale",
@@ -409,6 +421,12 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
         "diffusion.silu_mul",
         KernelBackend.TRITON,
         "activation.silu_mul_bitexact:fused_silu_mul_bitexact",
+        _CUDA,
+    ),
+    (
+        "diffusion.silu_temporal_pad",
+        KernelBackend.KDA,
+        "sglang.kernels.kda_kernels.silu_temporal_pad:fused_silu_temporal_pad",
         _CUDA,
     ),
     (
@@ -730,6 +748,9 @@ _EXPORTS: dict[str, str] = {
     "wan_rmsnorm_silu": "norm.wan_rmsnorm_silu_triton",
     "can_use_qk_rmsnorm_native": "norm.zimage_qk_rmsnorm_triton",
     "zimage_qk_rmsnorm_native": "norm.zimage_qk_rmsnorm_triton",
+    "aten_head_rmsnorm": "norm.aten_head_rmsnorm_triton",
+    "can_use_aten_head_rmsnorm": "norm.aten_head_rmsnorm_triton",
+    "can_use_aten_head_rmsnorm_rope": "norm.aten_head_rmsnorm_triton",
     "can_use_rmsnorm_scale_shift_per_token": "norm.rmsnorm_scale_shift_triton",
     "can_use_rmsnorm_indexed_scale_shift": "norm.rmsnorm_scale_shift_triton",
     "rmsnorm_indexed_scale_shift": "norm.rmsnorm_scale_shift_triton",
@@ -796,8 +817,10 @@ _EXPORTS: dict[str, str] = {
     # Activation-function fusions
     "fused_bias_glu": "activation.sana_conv_post_triton",
     "fused_bias_silu": "activation.sana_conv_post_triton",
+    "fused_depthwise_conv3x3_bias_glu": "sglang.kernels.kda_kernels.sana_depthwise_glu_triton",
     "fused_packed_silu_mul_bitexact": "activation.silu_mul_bitexact",
     "fused_silu_mul_bitexact": "activation.silu_mul_bitexact",
+    "fused_silu_temporal_pad": "sglang.kernels.kda_kernels.silu_temporal_pad",
     "can_use_fused_situ_softcap_mul": "activation.situ_softcap_mul_bitexact",
     "fused_situ_softcap_mul_bitexact": "activation.situ_softcap_mul_bitexact",
     # Diffusion attention kernels

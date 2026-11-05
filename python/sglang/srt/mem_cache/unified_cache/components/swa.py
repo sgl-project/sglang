@@ -29,10 +29,12 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     RecoverSWAWithLockedFull,
     SWARebuild,
 )
-from sglang.srt.mem_cache.unified_cache.components.base import (
+from sglang.srt.mem_cache.unified_cache.component_type import (
     BASE_COMPONENT_TYPE,
-    CacheTransferPhase,
     ComponentType,
+)
+from sglang.srt.mem_cache.unified_cache.components.base import (
+    CacheTransferPhase,
     EvictLayer,
     ExternalLinkerLoadPhase,
     InternalStateBackup,
@@ -51,11 +53,9 @@ if TYPE_CHECKING:
         CacheAction,
         ComponentAction,
     )
-    from sglang.srt.mem_cache.unified_radix_cache import (
-        NodeId,
-        UnifiedRadixCache,
-        UnifiedTreeNode,
-    )
+    from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeNode
+    from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import NodeId
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
 
 class SWAComponent(TreeComponent):
@@ -81,6 +81,14 @@ class SWAComponent(TreeComponent):
             raise ValueError("SWAComponent requires a positive window in its slot")
 
         super().__init__(cache, params, slot)
+        self.pool_name = (
+            PoolName.AUXILIARY_SWA
+            if self.component_type == ComponentType.AUXILIARY_SWA
+            else PoolName.SWA
+        )
+        self._independent = (
+            sum(slot.family == "window" for slot in params.tree_slots) > 1
+        )
         self._session_leaf_covered_len: dict[str, dict[UnifiedTreeNode, int]] = {}
         # The history a prefix keeps, which every reader of the window needs
         # (a fused draft's reads included); not the model's attention window.
@@ -91,6 +99,8 @@ class SWAComponent(TreeComponent):
         ) // params.page_size
         # HiCache state: set to host SWA pool when HiCache enabled
         self._swa_kv_pool_host = None
+        # The running device-eviction walk's leaf-collapse mode.
+        self._evict_device_collapse_leaves = True
 
     component_type = ComponentType.SWA
     pool_name = PoolName.SWA
@@ -98,7 +108,9 @@ class SWAComponent(TreeComponent):
 
     def restore_buffer_mapping(self, full_indices, window_indices):
         self.cache._apply_cache_action(
-            RebuildFullToSWAMapping([full_indices], [window_indices])
+            RebuildFullToSWAMapping(
+                [full_indices], [window_indices], component_type=self.component_type
+            )
         )
 
     def _collect_unbacked_swa_nodes(
@@ -126,7 +138,12 @@ class SWAComponent(TreeComponent):
         while (
             cur is not self.tree_core.root_node and covered < self.sliding_window_size
         ):
-            if cur.write_through_pending_id is not None:
+            # A copy in the same write-back batch already committed this SWA
+            # host value.
+            if (
+                cur.write_through_pending_id is not None
+                and not self.tree_core._is_round_write_pending(cur)
+            ):
                 break
 
             cd = cur.component_data[ct]
@@ -263,6 +280,7 @@ class SWAComponent(TreeComponent):
                 # MATCH_END / INSERT_END instead.
                 return
             case LRURefreshPhase.MATCH_END | LRURefreshPhase.INSERT_END:
+                joint_lru = self.tree_core.joint_lru
                 self.tree_core.lru_lists[
                     self.component_type
                 ].reset_node_and_window_ancestors_mru(
@@ -270,7 +288,14 @@ class SWAComponent(TreeComponent):
                     root_node,
                     self.sliding_window_size + self.tree_core.page_size,
                     self.node_has_component_data,
+                    on_refresh=(
+                        joint_lru.window_stamper()
+                        if joint_lru is not None
+                        and self.component_type == ComponentType.SWA
+                        else None
+                    ),
                 )
+
             case _:
                 raise ValueError(f"Unknown LRURefreshPhase: {phase}")
 
@@ -335,8 +360,10 @@ class SWAComponent(TreeComponent):
                 break
             node = node.parent
 
+        if ct == ComponentType.AUXILIARY_SWA:
+            return result._replace(auxiliary_swa_host_hit_length=swa_host_hit)
         return result._replace(
-            swa_host_hit_length=max(result.swa_host_hit_length, swa_host_hit),
+            swa_host_hit_length=swa_host_hit,
             swa_branching_seqlen=branching_seqlen,
         )
 
@@ -368,7 +395,11 @@ class SWAComponent(TreeComponent):
 
     def _publish_window(self, *, node, cache_actions):
         cache_actions.append(
-            SWARebuild(node.id, node.component_data[BASE_COMPONENT_TYPE].value)
+            SWARebuild(
+                node.id,
+                node.component_data[BASE_COMPONENT_TYPE].value,
+                component_type=self.component_type,
+            )
         )
 
     def _recover_from_incoming(
@@ -376,11 +407,23 @@ class SWAComponent(TreeComponent):
     ):
         full_cd = node.component_data[BASE_COMPONENT_TYPE]
         old_full = full_cd.value
+        if self._independent:
+            cache_actions.append(
+                RecoverEvictedSWA(
+                    component_type=self.component_type,
+                    kept_full=old_full,
+                    incoming_full=incoming_full,
+                )
+            )
+            self._publish_window(node=node, cache_actions=cache_actions)
+            return
         # A locked SWA tombstone also has Full locked, so only an unlocked
         # Full value can be replaced by the incoming ids.
         if full_cd.lock_ref > 0:
             cache_actions.append(
-                RecoverSWAWithLockedFull(node.id, old_full, incoming_full)
+                RecoverSWAWithLockedFull(
+                    node.id, old_full, incoming_full, component_type=self.component_type
+                )
             )
             return
         result.record_adopted_range(BASE_COMPONENT_TYPE, start, end)
@@ -408,6 +451,7 @@ class SWAComponent(TreeComponent):
             params.get_evicted_seqlen(self.component_type), params.prev_prefix_len
         )
         consumed_from = prefix_len
+        duplicate_windows = []
         for fragment, start, end in self._segments(
             node=node, start=total_prefix_len, end=total_prefix_len + prefix_len
         ):
@@ -419,6 +463,13 @@ class SWAComponent(TreeComponent):
                 cache_actions=cache_actions,
             )
             if live_start is None:
+                duplicate_start = max(start, window_start)
+                if self._independent and duplicate_start < end:
+                    duplicate_windows.append(
+                        value_slice[
+                            duplicate_start - total_prefix_len : end - total_prefix_len
+                        ]
+                    )
                 continue
             result.record_adopted_range(self.component_type, live_start, end)
             self._recover_from_incoming(
@@ -433,6 +484,12 @@ class SWAComponent(TreeComponent):
             )
             if not self._independent:
                 consumed_from = min(consumed_from, live_start - total_prefix_len)
+        if duplicate_windows:
+            cache_actions.append(
+                FreeComponentDeviceSlot(
+                    duplicate_windows, component_type=self.component_type
+                )
+            )
         return consumed_from
 
     def _populate_range(
@@ -662,6 +719,17 @@ class SWAComponent(TreeComponent):
     def eviction_priority(self, is_leaf: bool) -> int:
         return 0 if is_leaf else 1
 
+    def evict_device_start(
+        self, request_cnt: int, *, collapse_leaves: bool = True
+    ) -> None:
+        """Begin a device-eviction walk. Without ``collapse_leaves``, evicting an
+        entry on a device leaf strips this component only, leaving Full."""
+        super().evict_device_start(request_cnt)
+        self._evict_device_collapse_leaves = collapse_leaves
+
+    def collapses_leaves(self) -> bool:
+        return self._evict_device_collapse_leaves
+
     def _evict_device_start(self, request_cnt: int) -> None:
         """Begin the device-eviction walk from this component's LRU cursor."""
         self._evict_device_request_cnt = request_cnt
@@ -707,8 +775,10 @@ class SWAComponent(TreeComponent):
 
         x = self._evict_device_cursor
         assert x.component_data[ct].value is not None
-        if x in self.tree_core.evictable_device_leaves and (
-            not enabled or self._can_evict_leaf_atomically(x)
+        if (
+            self._evict_device_collapse_leaves
+            and x in self.tree_core.evictable_device_leaves
+            and (not enabled or self._can_evict_leaf_atomically(x))
         ):
             self._evict_device_cursor = (
                 lru.cursor_next() if enabled else lru.get_prev_no_lock(x)
@@ -768,6 +838,7 @@ class SWAComponent(TreeComponent):
         if self.tree_core.enable_session_radix_cache:
             self.tree_core.lru_lists[self.component_type].cursor_end()
         self._evict_device_cursor = None
+        self._evict_device_collapse_leaves = True
 
     def acquire_component_lock(
         self,
@@ -957,7 +1028,10 @@ class SWAComponent(TreeComponent):
             req,
             pre_len,
             window=self.sliding_window_size,
-            retain_floor=self.cache.swa_retain_floor(req),
+            retain_floor=self.cache.swa_retain_floor(
+                req, window=self.sliding_window_size
+            ),
+            component_type=self.component_type,
             shares_prefixes=True,
         )
 
@@ -1230,10 +1304,6 @@ class SWAComponent(TreeComponent):
             page = self.cache.page_size
             window = ((self.sliding_window_size + page - 1) // page) * page
             boundary = max(0, prefix_len - window)
-            if req.kv is None:
-                from sglang.srt.managers.schedule_batch import ReqKvInfo
-
-                req.kv = ReqKvInfo(kv_allocated_len=prefix_len)
             req.kv.set_evicted_seqlen(
                 self.component_type,
                 max(req.kv.get_evicted_seqlen(self.component_type), boundary),
@@ -1291,7 +1361,11 @@ class SWAComponent(TreeComponent):
             assert offset == len(xfer.host_indices)
             # rebuild the mapping for the loaded SWA chunk, defer to orchestrator level
             if full_chunks:
-                cache_actions.append(RebuildFullToSWAMapping(full_chunks, swa_chunks))
+                cache_actions.append(
+                    RebuildFullToSWAMapping(
+                        full_chunks, swa_chunks, component_type=self.component_type
+                    )
+                )
             return
 
         if phase == CacheTransferPhase.PREFETCH:
@@ -1311,7 +1385,9 @@ class SWAComponent(TreeComponent):
     ) -> None:
         if host_indices is not None and host_indices.numel() > 0:
             cache_actions.append(
-                FreeComponentHostSlot([host_indices], component_type=ComponentType.SWA)
+                FreeComponentHostSlot(
+                    [host_indices], component_type=self.component_type
+                )
             )
 
     def _attach_swa_host_value(
@@ -1509,11 +1585,26 @@ class SWAComponent(TreeComponent):
             )
             return
         if isinstance(action, SWARebuild):
-            # Translate the node's source full value to SWA and store it on the node.
-            swa_value = self._translate_full_to_swa(action.source_value)
-            self.tree_core.set_component_device_value(
-                action.node_id, self.component_type, swa_value
-            )
+            if not self._independent:
+                self.tree_core.set_component_device_value(
+                    action.node_id,
+                    self.component_type,
+                    self._translate_full_to_swa(action.source_value),
+                )
+                return
+            # A later window hook may split this span before actions execute.
+            # Publish every resulting fragment, including the new ancestors.
+            node = self.tree_core.node_by_id(action.node_id)
+            remaining = action.source_value.numel()
+            while remaining:
+                count = len(node.key)
+                assert 0 < count <= remaining
+                source = action.source_value[remaining - count : remaining]
+                self.tree_core.set_component_device_value(
+                    node.id, self.component_type, self._translate_full_to_swa(source)
+                )
+                remaining -= count
+                node = node.parent
             return
         raise AssertionError(
             f"SWAComponent: unhandled ComponentAction {type(action).__name__}"
