@@ -54,7 +54,6 @@ from sglang.srt.batch_overlap.two_batch_overlap import (
 )
 from sglang.srt.configs.model_config import (
     compute_mla_mscale_scaling,
-    dsa_draft_shards_under_dcp,
     dsa_layer_skips_topk,
     get_dsa_index_head_dim,
     get_dsa_index_kpool,
@@ -62,6 +61,7 @@ from sglang.srt.configs.model_config import (
     get_dsa_index_topk,
     is_deepseek_dsa,
     is_glm_moe_dsa,
+    mla_attention_dcp_size,
 )
 from sglang.srt.distributed import divide
 from sglang.srt.environ import envs
@@ -267,6 +267,7 @@ elif _is_npu:
         forward_mha_prepare_npu,
         forward_mla_core_npu,
         forward_mla_prepare_npu,
+        init_modelslim_mla_kv,
     )
 else:
     pass
@@ -587,7 +588,6 @@ class MoEGate(nn.Module):
                 hidden_states,
                 self.weight,
                 out_dtype=torch.float32,
-                max_m=self.tiny_router_gemm_max_tokens,
             )
         elif _use_aiter:
             logits = aiter_dsv3_router_gemm(hidden_states, self.weight)
@@ -1057,10 +1057,10 @@ class DeepseekV2MoE(nn.Module):
             and hidden_states.shape[0] > 0
             and self.shared_experts is not None
             and getattr(self.experts, "use_flashinfer_trtllm_moe", False)
-            and self.topk.topk_config.output_format == TopKOutputFormat.BYPASSED
             and not self._enable_a2a_moe
             and not self._fuse_shared_experts_inside_sbo
-            and not getattr(self, "is_hash", False)
+            and not self.is_hash
+            and self.topk.topk_config.output_format == TopKOutputFormat.BYPASSED
             and not is_expert_remapping_enabled()
             and get_exec().moe.ep_dispatch_algorithm not in ("fake", "lp")
         )
@@ -1112,7 +1112,9 @@ class DeepseekV2MoE(nn.Module):
                 input_ids_global=input_ids_global,
             )
 
-        use_vision_topk = self.gate.e_score_correction_bias_vl is not None
+        use_vision_topk = (
+            self.gate.e_score_correction_bias_vl is not None and not self.is_hash
+        )
         if use_vision_topk and _is_hip:
             use_vision_topk = _hip_moe.batch_has_images(forward_batch)
         if not self._enable_a2a_moe:
@@ -2110,13 +2112,9 @@ class DeepseekV2AttentionMLA(
             and not reduce_results
             and can_defer_cp_decode_attn_tp()
         )
-        self.dcp_size = get_parallel().attn_dcp_size
-        if (
-            is_nextn
-            and self.use_dsa
-            and not dsa_draft_shards_under_dcp(config, self.dcp_size)
-        ):
-            self.dcp_size = 1
+        self.dcp_size = mla_attention_dcp_size(
+            config, dcp_size=get_parallel().attn_dcp_size, is_nextn=is_nextn
+        )
         self.num_heads = num_heads
         assert num_heads % attn_tp_size == 0
         self.num_local_heads = num_heads // attn_tp_size
@@ -2287,6 +2285,8 @@ class DeepseekV2AttentionMLA(
             attn_type=attn_type,
             prefix=add_prefix("attn_mha", prefix),
         )
+        if _is_npu:
+            init_modelslim_mla_kv(self, prefix)
 
         self.alt_stream = alt_stream
         self.attn_mha.kv_b_proj = None

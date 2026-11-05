@@ -8,7 +8,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import build_test_unified_pools
 
-register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 
 class TestUnifiedSWATailAllocation(CustomTestCase):
@@ -121,6 +121,94 @@ class TestUnifiedSWATailAllocation(CustomTestCase):
                     allocator.free(tokens)
                     self.assertEqual(allocator.full_attn_allocator.allocated_count(), 0)
                     self.assertEqual(allocator.swa_attn_allocator.allocated_count(), 0)
+
+    def test_each_window_binds_its_own_tail(self):
+        """A fused draft's window band that keeps a shorter retention than the
+        target window takes and binds only its own tail, not every new page."""
+        from sglang.srt.mem_cache.layout.fused_draft import (
+            DenseDraftRegion,
+            DraftBand,
+            FusedDraftPlacement,
+        )
+        from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
+        from sglang.test.unified_allocator_fixtures import (
+            UnifiedGeometry,
+            build_unified_bundle,
+            setup_allocator_context,
+        )
+
+        page_size, draft_window = 4, 12
+        for seq_len in (8 * page_size, 24 * page_size):
+            with self.subTest(seq_len=seq_len):
+                setup_allocator_context()
+                placement = FusedDraftPlacement.from_counts(
+                    counts={"draft_swa": [1]},
+                    regions={
+                        "draft_swa": DenseDraftRegion(
+                            lane_num=1,
+                            head_num=1,
+                            head_dim=8,
+                            store_dtype=torch.bfloat16,
+                        )
+                    },
+                    new_bands={
+                        "draft_swa": DraftBand(kind="window", window=draft_window)
+                    },
+                )
+                bundle = build_unified_bundle(
+                    UnifiedGeometry(
+                        chain="swa",
+                        full_layer_ids=(0,),
+                        swa_layer_ids=(1,),
+                        page_size=page_size,
+                        window=16,
+                        context_len=128,
+                        full_tokens=192,
+                        swa_tokens=48,
+                        state_slots=8,
+                        lazy=False,
+                        fused_draft=placement,
+                        device="cuda",
+                    )
+                )
+                allocator = bundle.token_to_kv_pool_allocator
+                # The draft band states its retention, so a decode node sizes
+                # its tail and evicted length from it.
+                storage = kv_storage_of(bundle.req_to_token_pool, allocator)
+                self.assertEqual(
+                    storage.stated_window_lengths()["draft_swa"],
+                    (draft_window, "AUXILIARY_SWA"),
+                )
+                windows = {w.sub_pool_name: w for w in allocator._windows}
+                self.assertEqual(set(windows), {"swa", "draft_swa"})
+                zero = torch.tensor([0], dtype=torch.int64)
+                seq = torch.tensor([seq_len], dtype=torch.int64)
+                target_tail, draft_tail = 16, draft_window
+                out = allocator.alloc_extend_swa_tail(
+                    prefix_lens=zero.cuda(),
+                    prefix_lens_cpu=zero,
+                    seq_lens=seq.cuda(),
+                    seq_lens_cpu=seq,
+                    last_loc=torch.tensor([-1], device="cuda"),
+                    extend_num_tokens=seq_len,
+                    swa_tail_len=target_tail,
+                    window_tail_lens={"draft_swa": draft_tail},
+                )
+                self.assertIsNotNone(out)
+                self.assertEqual(windows["swa"].allocated_count(), target_tail)
+                self.assertEqual(
+                    windows["draft_swa"].allocated_count(),
+                    -(-draft_tail // page_size) * page_size,
+                )
+                # Only the draft window's tail pages are bound in its band.
+                draft_v2p = windows["draft_swa"].ids.virtual_to_physical
+                pages = out[::page_size] // page_size
+                bound = draft_v2p[pages] > 0
+                n_tail = -(-draft_tail // page_size)
+                self.assertTrue(bool(bound[-n_tail:].all()))
+                self.assertFalse(bool(bound[:-n_tail].any()))
+                allocator.free(out)
+                self.assertEqual(windows["draft_swa"].allocated_count(), 0)
 
 
 if __name__ == "__main__":

@@ -9,7 +9,7 @@ cover that gate and the digest it decides on.
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 
 register_cpu_ci(est_time=68, suite="base-a-test-cpu")
-register_cuda_ci(est_time=25, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=25, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 import json
 import multiprocessing
@@ -368,11 +368,7 @@ class TestAutotuneCachePhases(CustomTestCase):
         tuner = AutoTuner.get()
         tuner.clear_cache()
         self.addCleanup(tuner.clear_cache)
-        runner = SimpleNamespace(
-            device="cuda",
-            forward_stream=torch.cuda.Stream(),
-            is_draft_worker=False,
-        )
+        runner = SimpleNamespace(device="cuda", forward_stream=torch.cuda.Stream())
         with tempfile.TemporaryDirectory() as directory:
             target, draft = (
                 Path(directory) / name for name in ("target.json", "draft.json")
@@ -411,7 +407,6 @@ class TestAutotuneCachePhases(CustomTestCase):
                     )
                 # No profiling: this models a restart that loads tactics from disk.
                 self.assertFalse(tuner.profiling_cache)
-                runner.is_draft_worker = True
                 with autotune.flashinfer_autotune_context(runner, run_lm_head=False):
                     pass
                 saved = json.loads(draft.read_text())

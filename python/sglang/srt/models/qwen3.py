@@ -5,6 +5,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import torch
 from torch import nn
 
+from sglang.kernels.ops.attention.qk_norm_rope import qk_norm_rope
 from sglang.kernels.ops.attention.table_qk_norm_rope import table_qk_norm_rope_
 from sglang.srt.environ import envs
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
@@ -31,6 +32,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import get_kv_layers
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
@@ -38,9 +40,18 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.qwen2 import Qwen2MLP as Qwen3MLP
 from sglang.srt.models.qwen2 import Qwen2Model
-from sglang.srt.models.utils import apply_qk_norm
+from sglang.srt.models.utils import (
+    apply_qk_norm,
+    maybe_enable_silu_fp4_quant_fusion,
+)
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
+from sglang.srt.runtime_context import (
+    attention_backends,
+    get_exec,
+    get_parallel,
+    get_spec,
+    get_stream,
+)
 from sglang.srt.utils import add_prefix, get_bool_env_var, is_cuda, is_hip, is_npu
 
 Qwen3Config = None
@@ -179,6 +190,7 @@ class Qwen3Attention(nn.Module):
         attention_bias: bool = False,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
+        enable_prefill_qk_norm_rope: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -262,8 +274,36 @@ class Qwen3Attention(nn.Module):
             and not envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
             and get_exec().deterministic.rl_on_policy_target is None
             and get_exec().graph.cuda_graph_config.prefill.tc_compiler != "inductor"
-            and type(self.rotary_emb) is RotaryEmbedding
+            and (
+                type(self.rotary_emb) is RotaryEmbedding
+                or (
+                    # At head_dim 256, triton_mrope_fused's BF16 rounding differs.
+                    type(self.rotary_emb) is MRotaryEmbedding
+                    and self.rotary_emb.mrope_section is not None
+                    and self.head_dim in (64, 128)
+                )
+            )
             and self.head_dim in (64, 128, 256)
+        )
+        self.table_rope_positions_ndim = (
+            2 if type(self.rotary_emb) is MRotaryEmbedding else 1
+        )
+
+        # Only the ordinary dense-Qwen3 caller opts in; inherited callers stay native.
+        self.use_prefill_qk_norm_rope = (
+            enable_prefill_qk_norm_rope
+            and self.use_table_qk_norm_rope
+            and type(self) is Qwen3Attention
+            and type(self.rotary_emb) is RotaryEmbedding
+            and quant_config is None
+            and attn_tp_size == 1
+            and self.head_dim == 128
+            and torch.cuda.get_device_capability()[0] == 9
+            and attention_backends()[0] in ("fa3", "flashinfer")
+            and get_spec().speculative_algorithm is None
+            and self.rotary_emb.is_neox_style
+            and self.rotary_emb.rotary_dim == self.head_dim
+            and self.q_norm.variance_epsilon == self.k_norm.variance_epsilon
         )
 
         self.use_fused_qk_norm_mrope = (
@@ -309,7 +349,12 @@ class Qwen3Attention(nn.Module):
             and qkv.dtype == torch.bfloat16
             and self.q_norm.weight.dtype == torch.bfloat16
             and self.k_norm.weight.dtype == torch.bfloat16
+            and positions.ndim == self.table_rope_positions_ndim
         ):
+            axis_map = None
+            if positions.ndim == 2:
+                axis_map = self.rotary_emb.axis_map
+                self.rotary_emb._match_cos_sin_cache_dtype(qkv)
             table_qk_norm_rope_(
                 qkv,
                 positions,
@@ -321,6 +366,30 @@ class Qwen3Attention(nn.Module):
                 self.head_dim,
                 self.q_norm.variance_epsilon,
                 match_cuda=True,
+                axis_map=axis_map,
+            )
+        elif (
+            self.use_prefill_qk_norm_rope
+            and forward_batch.forward_mode == ForwardMode.EXTEND
+            and not torch.compiler.is_compiling()
+            and qkv.is_cuda
+            and qkv.is_contiguous()
+            and qkv.dtype in (torch.bfloat16, torch.float16)
+            and self.q_norm.weight.dtype == qkv.dtype
+            and self.k_norm.weight.dtype == qkv.dtype
+            and self.rotary_emb.cos_sin_cache.dtype == torch.float32
+            and positions.is_contiguous()
+            and positions.dtype in (torch.int32, torch.int64)
+        ):
+            q = qk_norm_rope(
+                q=q,
+                k=k,
+                q_weight=self.q_norm.weight,
+                k_weight=self.k_norm.weight,
+                cos_sin_cache=self.rotary_emb.cos_sin_cache,
+                positions=positions,
+                head_dim=self.head_dim,
+                eps=self.q_norm.variance_epsilon,
             )
         else:
             q, k = apply_qk_norm(
@@ -467,6 +536,9 @@ class Qwen3DecoderLayer(nn.Module):
             attention_bias=config.attention_bias,
             prefix=add_prefix("self_attn", prefix),
             alt_stream=alt_stream,
+            enable_prefill_qk_norm_rope=(
+                type(self) is Qwen3DecoderLayer and config.model_type == "qwen3"
+            ),
         )
         self.mlp = Qwen3MLP(
             hidden_size=self.hidden_size,
@@ -476,6 +548,7 @@ class Qwen3DecoderLayer(nn.Module):
             prefix=add_prefix("mlp", prefix),
             reduce_results=False,
         )
+        maybe_enable_silu_fp4_quant_fusion(self.mlp)
 
         norm_kwargs = (
             dict(
