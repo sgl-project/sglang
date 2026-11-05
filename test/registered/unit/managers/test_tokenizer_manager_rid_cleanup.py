@@ -522,6 +522,39 @@ class TestAbortOutputPayload(CustomTestCase):
         self.assertEqual(meta["output_token_logprobs"], [])
         self.assertEqual(meta["output_token_logprobs_length"], 0)
 
+    def test_abort_with_routed_experts_returns_no_flat_output_top_logprobs(self):
+        """With flat raw output top logprobs, the blanked echo describes 0 rows."""
+        for b64 in (False, True):
+            with self.subTest(b64=b64):
+                tm = _make_tokenizer_manager(self)
+                rid = f"abort_routed_experts_flat_rid_{b64}"
+                state = _make_req_state(rid)
+                state.obj.return_routed_experts = True
+                state.obj.return_logprob = True
+                state.obj.top_logprobs_num = 2
+                state.obj.token_ids_logprob = None
+                state.obj.return_text_in_logprobs = False
+                state.obj.return_flat_raw_top_logprobs = False
+                state.obj.return_flat_raw_output_top_logprobs = True
+                state.obj.return_flat_raw_top_logprobs_b64 = b64
+                state.output_ids = [5, 6, 7]
+                state.output_token_logprobs_val = [-0.1, -0.2, -0.3]
+                state.output_token_logprobs_idx = [5, 6, 7]
+                state.output_top_logprobs_val = [[-0.1, -2.0]] * 3
+                state.output_top_logprobs_idx = [[5, 9]] * 3
+                tm.rid_to_state[rid] = state
+
+                tm._handle_abort_req(_make_abort_req(rid))
+
+                meta = state.out_list[0]["meta_info"]
+                self.assertEqual(meta["completion_tokens"], 0)
+                self.assertEqual(meta["output_top_logprobs_shape"], [0, 2])
+                self.assertEqual(meta["output_top_logprobs_null_prefix"], 0)
+                suffix = "_flat_b64" if b64 else "_flat"
+                empty = "" if b64 else []
+                self.assertEqual(meta[f"output_top_logprobs_val{suffix}"], empty)
+                self.assertEqual(meta[f"output_top_logprobs_idx{suffix}"], empty)
+
     def test_blanked_abort_echo_reports_weight_versions_of_no_tokens(self):
         """The weight versions of a blanked echo describe the 0 returned tokens."""
         tm = _make_tokenizer_manager(self)

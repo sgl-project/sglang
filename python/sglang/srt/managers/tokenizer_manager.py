@@ -3750,6 +3750,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     meta_info[key] = []
             if "output_token_logprobs_length" in meta_info:
                 meta_info["output_token_logprobs_length"] = 0
+            if "output_top_logprobs_shape" in meta_info:
+                meta_info.update(
+                    _build_flat_top_logprobs_fields(
+                        "output",
+                        [],
+                        [],
+                        state.obj.top_logprobs_num,
+                        return_b64=state.obj.return_flat_raw_top_logprobs_b64,
+                    )
+                )
         meta_info["completion_tokens"] = len(output_ids)
         if is_stream and self.incremental_streaming_output:
             output_ids = [output_ids[-1]] if len(output_ids) > 0 else []
