@@ -183,9 +183,8 @@ class TestGluonMoeGfx950(CustomTestCase):
             del poison
             output = fused_moe(x, *weights)
             torch.cuda.synchronize()
-            self.assertTrue(torch.isfinite(output).all().item())
-            for start in range(0, 32768, 4224):
-                end = min(start + 4224, 32768)
+            self.assertEqual((~torch.isfinite(output)).any(dim=1).sum().item(), 0)
+            for end in (*range(4224, 32768, 4224), 32768):
                 start = end - 4224
                 expected = fused_moe(x[start:end].contiguous(), *weights)
                 torch.testing.assert_close(output[start:end], expected, rtol=0, atol=0)

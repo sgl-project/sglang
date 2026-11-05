@@ -535,10 +535,8 @@ class _Workspace:
 
         def empty(shape, dtype=torch.bfloat16):
             return torch.empty(shape, dtype=dtype, device=x.device)
-        # Split the FP32 routed partials into two halves selected by dense
-        # route id.  Each half is 3 GiB at M=32768, beyond the 2-GiB window
-        # of gfx950 buffer operations, so raw partials use global stores and
-        # loads; only the int16 codes (1.5 GiB per half) use buffer operations.
+        # Each codes half (1.5 GiB at M=32768) fits the 2-GiB Triton buffer-op window;
+        # the FP32 halves (3 GiB) exceed it, so they use global loads and stores.
         self.parts_low = empty((4 * storage_m, h), torch.float32)
         self.parts_high = empty((4 * storage_m, h), torch.float32)
         self.codes_low = empty((4 * storage_m, h + 64), torch.int16)
