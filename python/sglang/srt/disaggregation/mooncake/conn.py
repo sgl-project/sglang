@@ -959,6 +959,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         layouts (e.g. a DSA model whose prefill and decode pick different
         attention backends, or a different ``--kv-cache-dtype``), every page
         lands at the wrong offset and the last pages run past the peer's buffer.
+
+        Checked for MLA pools, pools that publish KV layer ids, and plain MHA
+        pools at the same attn TP size; not for TP-sliced MHA.
         """
         if (
             not self.kv_args.kv_item_lens
@@ -975,14 +978,24 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         ):
             return None
         try:
-            mismatch = self._state_stride_mismatch(
-                src_data_ptrs=self.kv_args.kv_data_ptrs,
-                dst_data_ptrs=info.dst_kv_ptrs,
-                item_lens=self.kv_args.kv_item_lens,
-                dst_item_lens=info.dst_kv_item_lens,
-                src_layer_ids=self.kv_args.kv_layer_ids,
-                dst_layer_ids=info.dst_kv_layer_ids,
-            )
+            if _uses_flat_entry_layout(
+                mla_backend=self.is_mla_backend or self.is_hybrid_mla_backend,
+                force_flat=False,
+                has_layer_ids=bool(self.kv_args.kv_layer_ids or info.dst_kv_layer_ids),
+                state_type=None,
+                num_src_entries=len(self.kv_args.kv_data_ptrs),
+                num_dst_entries=len(info.dst_kv_ptrs),
+            ):
+                mismatch = self._state_stride_mismatch(
+                    src_data_ptrs=self.kv_args.kv_data_ptrs,
+                    dst_data_ptrs=info.dst_kv_ptrs,
+                    item_lens=self.kv_args.kv_item_lens,
+                    dst_item_lens=info.dst_kv_item_lens,
+                    src_layer_ids=self.kv_args.kv_layer_ids,
+                    dst_layer_ids=info.dst_kv_layer_ids,
+                )
+            else:
+                mismatch = self._mha_kv_stride_mismatch(info)
         except Exception as e:
             # Same policy as the state check: never kill the bootstrap thread.
             logger.warning(
@@ -1000,6 +1013,36 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             "(--dsa-prefill-backend / --dsa-decode-backend) or --kv-cache-dtype; "
             "use the same settings on both roles."
         )
+
+    def _mha_kv_stride_mismatch(self, info: KVArgsRegisterInfo) -> Optional[str]:
+        """Plain MHA K/V entries, paired as ``_send_kvcache_generic`` pairs them.
+
+        Item lengths are parallel to pointers, so slicing them with
+        ``get_mha_kv_ptrs_with_pp`` gives each sent entry's decode stride.
+        """
+        src_lens, dst_lens = self.kv_args.kv_item_lens, info.dst_kv_item_lens
+        if len(src_lens) != len(self.kv_args.kv_data_ptrs) or len(dst_lens) != len(
+            info.dst_kv_ptrs
+        ):
+            return None  # Lengths not parallel to the pointers: cannot pair them.
+        if self.pp_size == 1 and len(src_lens) != len(dst_lens):
+            # E.g. a decode-only draft KV: Ascend's PP1 sender pairs entries
+            # positionally here, unlike the generic K/V split. Leave it unchecked.
+            return None
+        src_k, src_v, dst_k, dst_v, num_layers = self.get_mha_kv_ptrs_with_pp(
+            src_lens, dst_lens
+        )
+        if num_layers > min(len(dst_k), len(dst_v)):
+            return None  # The transfer rejects this layer count itself.
+        start_layer = self.kv_args.prefill_start_layer
+        for kind, src, dst in (("K", src_k, dst_k), ("V", src_v, dst_v)):
+            for i in range(num_layers):
+                if src[i] != dst[i]:
+                    return (
+                        f"KV {kind} item length mismatch for layer "
+                        f"{start_layer + i}: prefill={src[i]} decode={dst[i]}"
+                    )
+        return None
 
     def _validate_peer_state_layout(
         self, registration_info: KVArgsRegisterInfo
