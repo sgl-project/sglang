@@ -1101,9 +1101,7 @@ class UnifiedRadixCache(BasePrefixCache):
             self.backup_node_for_write_back(node_id)
             result = self.tree_core.finish_mamba_state_eviction(node_id)
         elif result.swa_backup_node_id is not None:
-            assert (
-                component_type == self.slot_id(TREE_WINDOW) and result.node_id is None
-            )
+            assert component_type in self.window_slots() and result.node_id is None
             assert (
                 not result.device_frees
                 and not result.host_frees
@@ -1115,9 +1113,12 @@ class UnifiedRadixCache(BasePrefixCache):
             # even if host allocation fails.
             node_id = result.swa_backup_node_id
             needed = result.swa_backup_num_tokens
-            swa_host_pool = self.host_pool_group.get_pool(PoolName.SWA)
-            if swa_host_pool is not None and swa_host_pool.available_size() < needed:
-                self.evict_host(needed, self.slot_id(TREE_WINDOW))
+            window_host_pool = self.components[component_type]._swa_kv_pool_host
+            if (
+                window_host_pool is not None
+                and window_host_pool.available_size() < needed
+            ):
+                self.evict_host(needed, component_type)
             self.backup_node_for_write_back(node_id)
             result = self.tree_core.finish_swa_state_eviction(node_id)
         self._apply_eviction_result(result)
@@ -1871,7 +1872,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.supports_swa()
                 and {
                     PoolName.KV,
-                    PoolName.SWA,
+                    *(self.components[ct].pool_name for ct in self.window_slots()),
                 }
                 <= self.host_pool_group.entry_map.keys()
             )

@@ -86,10 +86,12 @@ class StorageSubPool(msgspec.Struct, frozen=True, kw_only=True):
 class SubPoolUsage(msgspec.Struct, frozen=True, kw_only=True):
     """A sub-pool's occupancy as observers report it, in its own units: tokens,
     or slots for a sub-pool that holds state. ``metrics`` is the family its
-    numbers are published under."""
+    numbers are published under (``full``, ``window`` or ``mamba``), and
+    ``label`` the name that tells one window's numbers from another's."""
 
     name: str
     metrics: str
+    label: str
     capacity: int
     available: int
 
@@ -744,6 +746,7 @@ class KVStorage:
             SubPoolUsage(
                 name=s.name,
                 metrics=s.external.metrics,
+                label=s.external.label,
                 capacity=units[s.name][0],
                 available=units[s.name][1],
             )
@@ -760,6 +763,18 @@ class KVStorage:
 
     def wire_entries(self) -> Tuple[WireEntry, ...]:
         return self._plan.wire_entries()
+
+    def entry_sub_pool(self, entry: WireEntry) -> Optional[str]:
+        """The sub-pool a transfer entry carries here."""
+        return entry.sub_pool
+
+    def entry_sub_pools(self) -> Tuple[Optional[str], ...]:
+        """The sub-pool each transfer entry carries, in wire order."""
+        return tuple(self.entry_sub_pool(entry) for entry in self.wire_entries())
+
+    def entry_wire_key(self, entry: WireEntry) -> Optional[str]:
+        """The key PD peers tell entries of one state type apart by."""
+        return entry.key
 
     def host_pool_name(self, sub_pool: str) -> str:
         """The host pool a sub-pool's rows back up to and load from."""
@@ -827,6 +842,22 @@ class KVStorage:
             for name, window in self.retained_window_lengths().items()
         }
 
+    def state_sub_pools(self) -> Tuple[str, ...]:
+        """The sub-pools holding recurrent state, by name."""
+        return tuple(
+            s.name
+            for s in self._plan.sub_pools
+            if isinstance(s.lifetime, StateLifetime)
+        )
+
+    def state_unit_ids(self, sub_pool: str, req: Req) -> torch.Tensor:
+        """The physical slots of state sub-pool ``sub_pool`` holding ``req``'s
+        state: what a transfer sends of it, whatever its length."""
+        ids = self.requests.req_index_to_mamba_index_mapping[
+            req.kv.req_pool_idx
+        ].reshape(-1)
+        return self._allocator.state_id_spaces()[sub_pool].ids(ids)
+
     def resume_units(
         self,
         sub_pool: str,
@@ -847,12 +878,8 @@ class KVStorage:
                 raise ValueError(
                     "state handoff must name an explicit checkpoint boundary"
                 )
-            ids = self.requests.req_index_to_mamba_index_mapping[
-                req.kv.req_pool_idx
-            ].reshape(-1)
-            physical = self._allocator.state_id_spaces()[sub_pool].ids(ids)
             return ResumeUnits(
-                unit_ids=physical,
+                unit_ids=self.state_unit_ids(sub_pool, req),
                 token_start=token_boundary,
                 token_boundary=token_boundary,
             )

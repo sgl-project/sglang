@@ -68,7 +68,7 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
     record_network_transfer,
     setup_state_kv_args,
-    wire_sub_pool,
+    state_indices_per_entry,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import is_cp_sharded_padded
@@ -454,6 +454,7 @@ class PrefillBootstrapQueue:
             storage,
             self.draft_token_to_kv_pool if transfer_draft_cache else None,
             self.scheduler.model_config.num_hidden_layers,
+            window_tails=storage.retained_window_lengths(),
         )
 
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
@@ -1902,14 +1903,6 @@ class SchedulerDisaggregationPrefillMixin:
                 StateType.QSA_PENDING: _qsa_pending_payload,
                 StateType.QSA_COMPRESSED: _full_kv_pages_payload,
                 StateType.SWA: _swa_payload,
-                StateType.AUXILIARY_SWA: lambda: _swa_payload(
-                    wire_sub_pool(
-                        kv_storage_of(
-                            self.req_to_token_pool, self.token_to_kv_pool_allocator
-                        ),
-                        StateType.AUXILIARY_SWA,
-                    )
-                ),
                 StateType.DSA: _dsa_pages_payload,
                 StateType.DSA_TAIL: _dsa_tail_payload,
                 StateType.MINIMAX_INDEX_K: _minimax_payload,
@@ -1937,9 +1930,12 @@ class SchedulerDisaggregationPrefillMixin:
                         prefix_len=req.disagg_decode_prefix_len,
                     )
                 )
-            state_indices = [
-                payloads[st]() if st in payloads else None for st in state_types
-            ]
+            state_indices = state_indices_per_entry(
+                self.disagg_prefill_bootstrap_queue.kv_manager.kv_args,
+                state_types,
+                payloads,
+                _swa_payload,
+            )
             # State rides the last segment's send, whose indices_event is
             # recorded behind these copies on the same stream. The host
             # arrays fill only then, so the page-move ledger takes the device

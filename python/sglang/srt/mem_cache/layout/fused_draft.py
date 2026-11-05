@@ -414,8 +414,8 @@ class WindowHostKind(DenseHostKind):
         return window_sub_pool_name(layers.window)
 
 
-SWA_HOST = register_host_kind(
-    WindowHostKind(name="swa", serves=LAYER_WINDOW, family="dense")
+WINDOW_HOST = register_host_kind(
+    WindowHostKind(name="window", serves=LAYER_WINDOW, family="dense")
 )
 
 

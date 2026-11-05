@@ -128,7 +128,9 @@ def test_customized_info_failure_is_request_local(capacity, customized_info, err
     )
     scheduler.req_to_token_pool = SimpleNamespace(req_to_token=torch.tensor([[0]]))
     scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(
-        kv_manager=SimpleNamespace(kv_args=SimpleNamespace(state_types=[]))
+        kv_manager=SimpleNamespace(
+            kv_args=SimpleNamespace(state_types=[], state_sub_pools=[])
+        )
     )
     with envs.SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES.override(capacity):
         scheduler.disagg_metadata_buffers = MetadataBuffers(
