@@ -21,7 +21,7 @@ class HiCacheVocabParallelEmbedding(VocabParallelEmbedding):
 
     def __init__(self, *args, **kwargs):
         config = get_memory()
-        rows = create_storage(config.enable_hi_engram, config.hi_engram_config)
+        rows = create_storage(config.hi_engram_config)
         with torch.device("cpu"):
             super().__init__(*args, **kwargs)
         if not isinstance(self.quant_method, UnquantizedEmbeddingMethod):

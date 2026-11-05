@@ -640,7 +640,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         )
         ngram_prefix = f"{prefix}.ngram_embedding" if prefix else "ngram_embedding"
         offload_embedding = bool(config.ple_offload_embedding)
-        if get_memory().enable_hi_engram is not None:
+        if get_memory().enable_hi_engram:
             embedding_cls = HiCacheVocabParallelEmbedding
         else:
             embedding_cls = VocabParallelEmbedding
@@ -662,7 +662,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         ngram_embedding.register_buffer(
             "weight_scale", torch.ones(1, dtype=torch.bfloat16), persistent=True
         )
-        if offload_embedding and get_memory().enable_hi_engram is None:
+        if offload_embedding and not get_memory().enable_hi_engram:
             ngram_embedding = Qwen4ExpPinnedHostEmbedding(
                 ngram_embedding,
                 backend=getattr(config, "ple_offload_backend", "pinned"),

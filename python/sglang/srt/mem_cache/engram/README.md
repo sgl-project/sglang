@@ -9,8 +9,10 @@ host KV pool.
 
 The current backend, `MooncakeEngramStorage`, uses Mooncake EngramStore to own
 local host snapshots and read rows on the caller's CUDA stream. Enable it with
-`--enable-hi-engram local`. Omitting this option preserves each model's native
-implementation. `remote` is a reserved mode and fails when the Engram component is constructed:
+`--enable-hi-engram`. This boolean flag defaults to disabled. Select the backend
+through `--hi-engram-config`; `backend` defaults to `local`. Omitting the flag
+preserves each model's native implementation. `backend: "remote"` is reserved
+and fails when the Engram component is constructed:
 Mooncake's remote table API does not yet support CUDA stream/graph lookup.
 
 ## Model integration
@@ -41,16 +43,17 @@ python -m sglang.launch_server \
   --model-path /models/Qwen3.8-Flash-Next-FP8 \
   --tp-size 4 --ep-size 4 \
   --ple-offload-embedding \
-  --enable-hi-engram local \
-  --hi-engram-config '{"local_dir": "/dev/shm/sglang-engram"}'
+  --enable-hi-engram \
+  --hi-engram-config '{"backend": "local", "local_dir": "/dev/shm/sglang-engram"}'
 ```
 
 Local HiCache Engram storage keeps the table on the host even when native PLE
 offloading is disabled. `--ple-offload-embedding` enables Qwen4-Exp's existing
 side-stream prefetch. `--ple-offload-backend` and `--ple-offload-dir` configure the
 native offloader. HiCache accepts storage options as a JSON object through
-`--hi-engram-config`. Currently supported: `local_dir`, which defaults to
-`/dev/shm/sglang-engram` when the configuration or key is omitted. Malformed JSON,
+`--hi-engram-config`. Supported keys are `backend` (default `local`) and
+`local_dir` (default `/dev/shm/sglang-engram`). The config may be omitted when
+using these defaults. Malformed JSON, unsupported backends,
 unknown keys and invalid directory values are rejected when the Engram component
 is constructed, before allocating or loading its embedding weights.
 

@@ -305,15 +305,12 @@ class Memory(msgspec.Struct):
     # Hierarchical engram
     # -------------------------------------------------------------------------
     enable_hi_engram: A[
-        Optional[str],
-        Arg(
-            help="Enable HiCache Engram storage in local or remote mode. Remote is not yet supported.",
-            choices=["local", "remote"],
-        ),
-    ] = None
+        bool,
+        "Enable HiCache Engram storage. Configure the backend through --hi-engram-config.",
+    ] = False
     hi_engram_config: A[
         Optional[str],
-        'A dictionary in JSON string format for hierarchical Engram storage. Example: {"local_dir": "/dev/shm/sglang-engram"}',
+        'A dictionary in JSON string format for hierarchical Engram storage. Example: {"backend": "local", "local_dir": "/dev/shm/sglang-engram"}',
     ] = None
 
     # -------------------------------------------------------------------------

@@ -13,7 +13,7 @@ def _parse_config(config: str | None) -> dict:
         raise ValueError("--hi-engram-config must be a JSON object") from exc
     if not isinstance(options, dict):
         raise ValueError("--hi-engram-config must be a JSON object")
-    unknown = options.keys() - {"local_dir"}
+    unknown = options.keys() - {"backend", "local_dir"}
     if unknown:
         raise ValueError(f"Unknown --hi-engram-config options: {sorted(unknown)}")
     options.setdefault("local_dir", "/dev/shm/sglang-engram")
@@ -22,14 +22,16 @@ def _parse_config(config: str | None) -> dict:
     return options
 
 
-def create_storage(mode: str, config: str | None = None) -> HiCacheEngramStorage:
+def create_storage(config: str | None = None) -> HiCacheEngramStorage:
     """Create row storage without requiring a KV cache or host KV pool."""
-    if mode == "remote":
+    options = _parse_config(config)
+    backend = options.pop("backend", "local")
+    if backend == "remote":
         raise NotImplementedError("Remote HiCache Engram storage is not supported yet")
-    if mode == "local":
+    if backend == "local":
         from sglang.srt.mem_cache.storage.mooncake_engram import (
             MooncakeEngramStorage,
         )
 
-        return MooncakeEngramStorage(**_parse_config(config))
-    raise ValueError(f"Unknown Engram storage mode: {mode!r}")
+        return MooncakeEngramStorage(**options)
+    raise ValueError(f"Unknown Engram storage backend: {backend!r}")
