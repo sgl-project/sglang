@@ -60,6 +60,10 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
     vae_precision: str = "fp32"
     vae_decode_precision: str = "fp16"
     audio_vae_precision: str = "fp32"
+    calibrate_auto_residency_with_explicit_warmup_resolutions: bool = True
+    # The video/audio sigma schedules include both interval endpoints.
+    minimum_inference_steps: int = 2
+
     # Default VSA-H3 sparsity, tile size and reference-video keep rate;
     # --attention-backend-config VSA_sparsity / vsa_tile_size /
     # vsa_ref_keep_rate override them.
