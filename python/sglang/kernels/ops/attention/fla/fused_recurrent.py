@@ -24,8 +24,12 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
     h0,
     ht,
     cu_seqlens,
+    ssm_state_indices,
     scale,
     T,
+    stride_init_state_token: tl.constexpr,
+    stride_final_state_token: tl.constexpr,
+    stride_indices_seq: tl.constexpr,
     B: tl.constexpr,
     H: tl.constexpr,
     HV: tl.constexpr,
@@ -39,10 +43,15 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     IS_KDA: tl.constexpr,
+    USE_SSM_STATE_INDICES: tl.constexpr,  # h0/ht rows are pool slots chosen per sequence
 ):
     i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_n, i_hv = i_nh // HV, i_nh % HV
     i_h = i_hv // (HV // H)
+    if USE_SSM_STATE_INDICES:
+        state_idx = tl.load(ssm_state_indices + i_n * stride_indices_seq).to(tl.int64)
+    else:
+        state_idx = i_n.to(tl.int64)
     if IS_VARLEN:
         bos, eos = (
             tl.load(cu_seqlens + i_n).to(tl.int64),
@@ -73,10 +82,14 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
     mask_k = o_k < K
     mask_v = o_v < V
     mask_h = mask_v[:, None] & mask_k[None, :]
+    if USE_SSM_STATE_INDICES:
+        # A negative slot is padding: start from zero and never write back.
+        mask_h = mask_h & (state_idx >= 0)
 
     b_h = tl.zeros([BV, BK], dtype=tl.float32)
     if USE_INITIAL_STATE:
-        p_h0 = h0 + i_nh * V * K + o_v[:, None] * K + o_k[None, :]
+        p_h0 = h0 + state_idx * stride_init_state_token + i_hv * V * K
+        p_h0 = p_h0 + o_v[:, None] * K + o_k[None, :]
         b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
 
     for _ in range(0, T):
@@ -119,7 +132,8 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
         p_beta += HV * (V if IS_BETA_HEADWISE else 1)
 
     if STORE_FINAL_STATE:
-        p_ht = ht + i_nh * V * K + o_v[:, None] * K + o_k[None, :]
+        p_ht = ht + state_idx * stride_final_state_token + i_hv * V * K
+        p_ht = p_ht + o_v[:, None] * K + o_k[None, :]
         tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
 
 
@@ -161,8 +175,12 @@ def fused_recurrent_gated_delta_rule_fwd(
         h0=initial_state,
         ht=final_state,
         cu_seqlens=cu_seqlens,
+        ssm_state_indices=None,
         scale=scale,
         T=T,
+        stride_init_state_token=0 if initial_state is None else initial_state.stride(0),
+        stride_final_state_token=0 if final_state is None else final_state.stride(0),
+        stride_indices_seq=0,
         B=B,
         H=H,
         HV=HV,
@@ -176,6 +194,7 @@ def fused_recurrent_gated_delta_rule_fwd(
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         IS_VARLEN=cu_seqlens is not None,
         IS_KDA=False,
+        USE_SSM_STATE_INDICES=False,
         num_warps=num_warps,
         num_stages=num_stages,
     )

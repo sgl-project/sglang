@@ -20,9 +20,7 @@ from sglang.kernels.ops.attention.fla.fused_norm_gate import layer_norm_gated_fw
 from sglang.kernels.ops.attention.fla.fused_recurrent import (
     fused_recurrent_gated_delta_rule_fwd_kernel,
 )
-from sglang.kernels.ops.attention.fla.index import (
-    prepare_chunk_indices,
-)
+from sglang.kernels.ops.attention.fla.index import prepare_chunk_indices
 from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
 from sglang.kernels.ops.attention.fla.op import exp, exp2, log
 from sglang.kernels.ops.attention.fla.utils import (
@@ -67,7 +65,7 @@ def fused_recurrent_kda_fwd(
     initial_state: torch.Tensor,
     inplace_final_state: bool = True,
     cu_seqlens: torch.LongTensor | None = None,
-    # ssm_state_indices: torch.Tensor | None = None,
+    ssm_state_indices: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     B, T, H, K, V = *k.shape, v.shape[-1]
@@ -80,20 +78,18 @@ def fused_recurrent_kda_fwd(
     num_warps = 1
 
     o = q.new_empty(NK, *v.shape)
+    if initial_state.stride()[1:] != (V * K, K, 1):
+        raise ValueError("initial_state rows must be dense [HV, V, K]")
+    if ssm_state_indices is not None:
+        # initial_state is the whole state pool; each sequence reads and writes its own slot.
+        if not inplace_final_state:
+            raise ValueError("ssm_state_indices requires inplace_final_state")
+        if ssm_state_indices.shape != (N,):
+            raise ValueError("ssm_state_indices must have one slot per sequence")
     if inplace_final_state:
         final_state = initial_state
     else:
         final_state = q.new_empty(N, HV, V, K, dtype=initial_state.dtype)
-
-    stride_init_state_token = initial_state.stride(0)
-    stride_final_state_token = final_state.stride(0)
-
-    # if ssm_state_indices is None:
-    #     stride_indices_seq, stride_indices_tok = 1, 1
-    # elif ssm_state_indices.ndim == 1:
-    #     stride_indices_seq, stride_indices_tok = ssm_state_indices.stride(0), 1
-    # else:
-    #     stride_indices_seq, stride_indices_tok = ssm_state_indices.stride()
 
     grid = (NK, NV, N * HV)
     fused_recurrent_gated_delta_rule_fwd_kernel[grid](
@@ -106,10 +102,14 @@ def fused_recurrent_kda_fwd(
         h0=initial_state,
         ht=final_state,
         cu_seqlens=cu_seqlens,
-        # ssm_state_indices=ssm_state_indices,
+        ssm_state_indices=ssm_state_indices,
         scale=scale,
-        # N=N,
         T=T,
+        stride_init_state_token=initial_state.stride(0),
+        stride_final_state_token=final_state.stride(0),
+        stride_indices_seq=(
+            0 if ssm_state_indices is None else ssm_state_indices.stride(0)
+        ),
         B=B,
         H=H,
         HV=HV,
@@ -117,17 +117,13 @@ def fused_recurrent_kda_fwd(
         V=V,
         BK=BK,
         BV=BV,
-        # stride_init_state_token=stride_init_state_token,
-        # stride_final_state_token=stride_final_state_token,
-        # stride_indices_seq=stride_indices_seq,
-        # stride_indices_tok=stride_indices_tok,
         USE_INITIAL_STATE=initial_state is not None,
         STORE_FINAL_STATE=final_state is not None,
         IS_BETA_HEADWISE=beta.ndim == v.ndim,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         IS_VARLEN=cu_seqlens is not None,
-        # INPLACE_FINAL_STATE=inplace_final_state,
         IS_KDA=True,
+        USE_SSM_STATE_INDICES=ssm_state_indices is not None,
         num_warps=num_warps,
         num_stages=num_stages,
     )
@@ -147,7 +143,7 @@ def fused_recurrent_kda(
     inplace_final_state: bool = True,
     use_qk_l2norm_in_kernel: bool = True,
     cu_seqlens: torch.LongTensor | None = None,
-    # ssm_state_indices: torch.LongTensor | None = None,
+    ssm_state_indices: torch.Tensor | None = None,
     **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if cu_seqlens is not None and q.shape[0] != 1:
@@ -168,7 +164,7 @@ def fused_recurrent_kda(
         initial_state=initial_state,
         inplace_final_state=inplace_final_state,
         cu_seqlens=cu_seqlens,
-        # ssm_state_indices=ssm_state_indices,
+        ssm_state_indices=ssm_state_indices,
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
     )
     return o, final_state
@@ -989,18 +985,18 @@ def kda_gate_chunk_cumsum(
         supplied, also return its sigmoid in a contiguous float32 [B, T, H] tensor.
     """
     if cu_seqlens is not None:
-        assert g.shape[0] == 1, (
-            "Only batch size 1 is supported when cu_seqlens are provided"
-        )
+        assert (
+            g.shape[0] == 1
+        ), "Only batch size 1 is supported when cu_seqlens are provided"
     assert len(g.shape) == 4
     B, T, H, S = g.shape
     BT = chunk_size
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
-    assert chunk_size == 2 ** (chunk_size.bit_length() - 1), (
-        "chunk_size must be a power of 2"
-    )
+    assert chunk_size == 2 ** (
+        chunk_size.bit_length() - 1
+    ), "chunk_size must be a power of 2"
 
     g_org, g = g, torch.empty_like(g, dtype=output_dtype or g.dtype)
     if beta is not None:
