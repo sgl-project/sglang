@@ -2,7 +2,7 @@ import unittest
 from array import array
 from types import SimpleNamespace
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.io_struct import RequestOutputStats
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler_components.output_streamer import (
@@ -56,6 +56,7 @@ class _FakeReq:
             prefill_finished_time=0.0, enable_metrics=False
         )
         self.weight_version_events = []
+        self.prefill_weight_versions = None
         self.mm_image_tokens = 0
         self.mm_audio_tokens = 0
         self.mm_video_tokens = 0
@@ -170,8 +171,8 @@ class TestOutputStreamerReasoningUsage(unittest.TestCase):
                         self.assertEqual(accumulator.reasoning_tokens, [expected])
                         self.assertEqual(req.reasoning_tokens, original_count)
                         self.assertEqual(
-                            accumulator.output_ids,
-                            [tokens[1 if stream else 0 : retained]],
+                            accumulator.output_ids_flat,
+                            array("q", tokens[1 if stream else 0 : retained]),
                         )
                         if not rust:
                             self.assertEqual(accumulator.completion_tokens, [retained])
