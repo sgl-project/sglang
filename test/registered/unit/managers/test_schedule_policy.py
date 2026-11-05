@@ -202,6 +202,16 @@ class TestShortestPrefillFirst(CustomTestCase):
         self.policy.tree_cache = cache
         return cache
 
+    def test_scheduling_prefix_defaults_to_matched_tokens(self):
+        req = self.make_req("cached", 16, cached=64)
+        self.assertEqual(self.policy.tree_cache.get_scheduling_prefix_len(req), 64)
+
+    def test_unified_scheduling_prefix_without_staging(self):
+        req = self.make_req("cached", 16, cached=64)
+        cache = self.buffer_cache(req, staged_end=64)
+        cache.buffer_pipeline = None
+        self.assertEqual(cache.get_scheduling_prefix_len(req), 64)
+
     def test_buffer_staged_hit_prioritizes_long_input_without_consuming_it(self):
         cached = self.make_req("cached", 16, cached=4096)
         short = self.make_req("short", 128)
