@@ -1158,16 +1158,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         run_compact = self._verify_planner.should_run_compact(layout=layout)
 
-        verify_ids_2d = proposal.verify_ids
-        if verify_ids_2d is None:
-            verify_ids_2d = torch.cat(
-                [draft_block_ids[:, :1], draft_tokens], dim=1
-            ).contiguous()
-        else:
-            self.num_folded_verify_ids_steps += 1
-            if self.num_folded_verify_ids_steps == 1:
-                logger.info("Verify ids read from the draft graph output (first step).")
-
         tree_pre = None
         if self._tree_config is not None and self._tree_config.topk > 1:
             if proposal.folded or proposal.base_logits is None:
@@ -1208,6 +1198,18 @@ class DSparkWorkerV2(BaseSpecWorker):
                     "DSpark tree currently supports greedy verification only; "
                     "sampling acceptance is not implemented."
                 )
+        else:
+            verify_ids_2d = proposal.verify_ids
+            if verify_ids_2d is None:
+                verify_ids_2d = torch.cat(
+                    [draft_block_ids[:, :1], draft_tokens], dim=1
+                ).contiguous()
+            else:
+                self.num_folded_verify_ids_steps += 1
+                if self.num_folded_verify_ids_steps == 1:
+                    logger.info(
+                        "Verify ids read from the draft graph output (first step)."
+                    )
 
         # Must stay ahead of the target verify launch below.
         grammar_tree = (
