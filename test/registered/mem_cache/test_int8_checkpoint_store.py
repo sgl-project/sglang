@@ -9,6 +9,7 @@ bf16-baseline-relative threshold that GSM8K showed is quality-safe.
 """
 
 import unittest
+from types import SimpleNamespace
 
 import torch
 
@@ -17,12 +18,13 @@ from sglang.srt.mem_cache.mamba_checkpoint_pool import (
     MambaCheckpointPool,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 # These are CPU codec / store / pool unit tests (the single CUDA decode-error
 # case self-skips when no GPU is present), so they run on the cheapest CI tier.
 # The int8 GPU decode path is covered end-to-end by
 # test_int8_mamba_checkpoint_e2e (now in the extra stage).
-register_cpu_ci(est_time=6, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 H, V, K = 32, 128, 128
 L = 4
@@ -179,6 +181,137 @@ class TestInt8CheckpointDecodeError(unittest.TestCase):
         o_int8 = decode(S_int8, dec)
         rel = (o_int8 - o_ref).norm() / o_ref.norm()
         self.assertLess(rel.item(), 1.5e-2, f"int8 decode err {rel} too high")
+
+
+class TestInt8CheckpointAdmission(CustomTestCase):
+    """An unavailable checkpoint must not consume a request's tracking state."""
+
+    def setUp(self):
+        from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
+        from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+        from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage
+        from sglang.srt.mem_cache.unified_cache.components.mamba import MambaComponent
+        from sglang.test.unified_allocator_fixtures import setup_allocator_context
+
+        setup_allocator_context()
+
+        self.checkpoints = MambaCheckpointPool(
+            num_layers=2,
+            num_slots=2,
+            num_heads=2,
+            head_v_dim=16,
+            head_k_dim=16,
+            conv_shapes=[(3, 8)],
+            conv_dtype=torch.bfloat16,
+            temporal_dtype=torch.bfloat16,
+            device="cpu",
+        )
+        self.active = SimpleNamespace(
+            mamba_cache=SimpleNamespace(
+                temporal=torch.randn(2, 6, 2, 16, 16).bfloat16(),
+                conv=[torch.randn(2, 6, 3, 8).bfloat16()],
+            )
+        )
+        self.slots = MambaSlotAllocator(5, "cpu")
+        self.slots.alloc(3)
+        self.requests = object.__new__(HybridReqToTokenPool)
+        self.requests.mamba_ping_pong_track_buffer_size = 2
+        self.requests.req_index_to_mamba_ping_pong_track_buffer_mapping = torch.tensor(
+            [[2, 3]]
+        )
+        storage = StaticKVStorage(
+            self.requests,
+            SimpleNamespace(
+                state_slots=self.slots,
+                state=SimpleNamespace(pool=self.active, ckpt_pool=self.checkpoints),
+            ),
+        )
+        self.req = SimpleNamespace(
+            kv=SimpleNamespace(
+                mamba_pool_idx=torch.tensor(1),
+                mamba_ping_pong_track_buffer=torch.tensor([2, 3]),
+                mamba_ping_pong_empty=[False, False],
+                mamba_last_track_idx=0,
+                mamba_last_track_seqlen=64,
+                req_pool_idx=0,
+            )
+        )
+        self.component = object.__new__(MambaComponent)
+        self.component.host_only_checkpoint = False
+        # Tree eviction is the boundary: a no-op means all checkpoints are pinned.
+        self.component.cache = SimpleNamespace(
+            kv_storage=lambda: storage,
+            req_to_token_pool=self.requests,
+            enable_mamba_extra_buffer=True,
+            evict=lambda _: None,
+            evict_for_alloc=lambda _: None,
+        )
+        self.params = SimpleNamespace(mamba_value=None, mamba_keep_idx=None)
+
+    def tearDown(self):
+        from sglang.srt.runtime_context import reset_context
+
+        reset_context()
+
+    def prepare(self, finished=False):
+        return self.component.prepare_for_caching_req(
+            self.req, self.params, 64, finished
+        )
+
+    def assert_tracking_unchanged(self):
+        self.assertEqual(self.req.kv.mamba_ping_pong_track_buffer.tolist(), [2, 3])
+        self.assertEqual(
+            self.requests.req_index_to_mamba_ping_pong_track_buffer_mapping.tolist(),
+            [[2, 3]],
+        )
+
+    def test_pinned_checkpoints_skip_unfinished_without_donation(self):
+        self.checkpoints.alloc(2)
+        self.assertEqual(self.prepare(), 0)
+        self.assertIsNone(self.params.mamba_value)
+        self.assertEqual(self.slots.available_size(), 2)
+        self.assert_tracking_unchanged()
+
+    def test_pinned_checkpoints_skip_finished_without_donation(self):
+        self.checkpoints.alloc(2)
+        self.assertEqual(self.prepare(finished=True), 0)
+        self.assertIsNone(self.params.mamba_value)
+        self.assertEqual(self.slots.available_size(), 2)
+        self.assert_tracking_unchanged()
+
+    def test_active_exhaustion_returns_reserved_checkpoint(self):
+        self.slots.alloc(2)
+        self.assertEqual(self.prepare(), 0)
+        self.assertEqual(self.checkpoints.available_size(), 2)
+        self.assert_tracking_unchanged()
+
+    def test_store_error_returns_reservations_before_donation(self):
+        # A real out-of-range source raises inside the eager codec. The request
+        # and the two allocators must still own exactly their original slots.
+        self.req.kv.mamba_ping_pong_track_buffer[0] = 8
+        with self.assertRaises(IndexError):
+            self.prepare()
+        self.assertEqual(self.checkpoints.available_size(), 2)
+        self.assertEqual(self.slots.available_size(), 2)
+        self.assertEqual(self.req.kv.mamba_ping_pong_track_buffer.tolist(), [8, 3])
+
+    def test_eviction_can_make_checkpoint_admission_succeed(self):
+        held = self.checkpoints.alloc(2)
+        self.component.cache.evict = lambda _: self.checkpoints.free(held[:1])
+        source = self.active.mamba_cache.temporal[:, 2].clone()
+        self.assertEqual(self.prepare(), 64)
+        self.assertEqual(self.params.mamba_value.tolist(), [1])
+        self.assertEqual(self.req.kv.mamba_ping_pong_track_buffer.tolist(), [4, 3])
+        self.assertEqual(self.slots.available_size(), 2)
+        expected_q, expected_scale = Int8CheckpointStore.quantize(source.unsqueeze(1))
+        self.assertTrue(
+            torch.equal(self.checkpoints.temporal.qdata[:, [1]], expected_q)
+        )
+        self.assertTrue(
+            torch.equal(
+                self.checkpoints.temporal.scale[:, [1]], expected_scale.bfloat16()
+            )
+        )
 
 
 if __name__ == "__main__":

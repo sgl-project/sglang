@@ -184,6 +184,47 @@ class Int8CheckpointStore:
         return self.mem_usage_bytes() // max(1, self.num_slots)
 
 
+class MambaCheckpointDevicePool:
+    """HiCache view of checkpoint IDs, never active request-state IDs.
+
+    The host keeps the stored representation: INT8 temporal, native scales and
+    conv. Only a cache-hit CoW decodes it into the separate active state pool.
+    """
+
+    def __init__(self, active_pool, checkpoint_pool):
+        from sglang.srt.mem_cache.device_pool_info import (
+            DevicePoolInfo,
+            MambaStateBufferInfo,
+        )
+        from sglang.srt.mem_cache.hicache_storage import PoolName
+
+        if active_pool._slot_siblings:
+            raise ValueError(
+                "INT8 Mamba HiCache does not support extra model side states."
+            )
+        self.checkpoint_pool = checkpoint_pool
+        self.size = checkpoint_pool.num_slots
+        self.host_capacity_tokens = self.size
+        self.host_capacity_bytes = checkpoint_pool.mem_usage_bytes()
+        self.device = checkpoint_pool.device
+        self._info = DevicePoolInfo(
+            pool_name=PoolName.MAMBA,
+            indices_from_pool=PoolName.MAMBA,
+            layer_ids=tuple(active_pool.mamba_layer_ids),
+            buffer_info=MambaStateBufferInfo(
+                temporal=checkpoint_pool.temporal.qdata,
+                conv=tuple(checkpoint_pool.conv),
+                extra_checkpoint_buffers=tuple(
+                    checkpoint_pool.temporal.scale.unbind(0)
+                ),
+            ),
+        )
+        self._info.buffer_info.validate(layer_ids=self._info.layer_ids)
+
+    def get_device_pool_infos(self):
+        return (self._info,)
+
+
 class MambaCheckpointPool:
     def __init__(
         self,
