@@ -14,7 +14,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 _SRT = pathlib.Path(sglang.__file__).parent / "srt"
-_STEPS = ("release_kv_cache", "release_aborted_request")
+_STEPS = ("release_kv_cache", "detach_aborted")
 # mem_cache defines the steps; the retirer is where they belong.
 _SKIPPED = ("mem_cache/", "managers/scheduler_components/request_retirer.py")
 
@@ -25,7 +25,6 @@ _STEP_CALLERS = {
     "disaggregation/prefill.py:SchedulerDisaggregationPrefillMixin.optimistic_release_and_requeue",
     "managers/schedule_batch.py:release_req",
     "managers/scheduler.py:Scheduler.process_pending_chunked_abort",
-    "managers/scheduler.py:Scheduler.release_aborted_request",
     "managers/scheduler.py:Scheduler.retire_unadmitted_request",
     "managers/scheduler_components/dynamic_chunk_sizer.py:DynamicChunkSizer._profile_prefill_latency",
 }

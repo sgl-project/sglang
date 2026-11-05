@@ -427,7 +427,7 @@ class TestSpanlessAbortPaths(CustomTestCase):
         scheduler.tree_cache = scheduler.beam_coordinator = MagicMock()
         scheduler.hisparse_coordinator = None
         scheduler.init_request_retirer()
-        scheduler.request_retirer.release_aborted_request = MagicMock()
+        scheduler.request_retirer.detach_aborted = MagicMock()
 
         with patch(
             "sglang.srt.managers.utils.get_serving",

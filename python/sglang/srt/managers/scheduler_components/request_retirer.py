@@ -55,7 +55,7 @@ class RequestRetirer:
         # Finished in place, so a later abort in the same intake skips it.
         if req.finished_reason is None:
             req.finish_outside_step(reason or FINISH_ABORT())
-        self.release_aborted_request(req)
+        self.detach_aborted(req)
         self.beam_coordinator.retire_group(req)
         self.send_abort_output(
             make_abort_req(req, finished_reason=finished_reason), req
@@ -75,13 +75,12 @@ class RequestRetirer:
     def release_aborted(self, req: Req) -> None:
         """Release what an aborted request holds, uncached: its cache-side
         state, then its memory. The caller finishes and streams it."""
-        self.release_aborted_request(req)
+        self.detach_aborted(req)
         discard_kv_cache_backup(req, self.tree_cache)
         self.release_finished(req, checkpoint=False)
 
-    # Public while `Scheduler.release_aborted_request` still delegates here.
-    def release_aborted_request(self, req: Req) -> None:
-        """Drop the cache-side state an aborted request left behind."""
+    def detach_aborted(self, req: Req) -> None:
+        """Drop an aborted request from the components tracking it; frees no memory."""
         req.release_mm_inputs_on_abort()
         self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
         if req.session is not None and req.session.streaming:

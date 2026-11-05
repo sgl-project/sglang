@@ -483,7 +483,7 @@ class PrefillBootstrapQueue:
         for req in self.queue:
             if recv_req.matches(req.rid):
                 logger.debug(f"Abort bootstrap queue request. {req.rid=}")
-                self.scheduler.release_aborted_request(req)
+                self.scheduler.request_retirer.detach_aborted(req)
 
                 if hasattr(req.disagg_kv_sender, "abort"):
                     req.disagg_kv_sender.abort()

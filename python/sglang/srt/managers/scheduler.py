@@ -3662,7 +3662,7 @@ class Scheduler(
         # `prefetch_from_storage` arms the paced-retry set for this attempt's
         # cache handle. Only a `finish`/ABORT and a `waiting_queue` sweep clear
         # that, and a retired request reaches neither.
-        self.release_aborted_request(req)
+        self.request_retirer.detach_aborted(req)
         # `update_finish_state` returns early once `finished()`, so an already
         # set `finished_reason` is what the client receives; report the same.
         reason = req.finished_reason or req.to_finish
@@ -3731,10 +3731,6 @@ class Scheduler(
             )
             return False
         return True
-
-    def release_aborted_request(self, req: Req) -> None:
-        """Drop the cache-side state an aborted request left behind."""
-        self.request_retirer.release_aborted_request(req)
 
     def _abort_unavailable(self, req: Req, *, message: str) -> None:
         self.request_retirer.abort_queued(
@@ -4026,7 +4022,7 @@ class Scheduler(
                 req, self.req_to_metadata_buffer_idx_allocator
             )
             req.pending_bootstrap = False
-        self.release_aborted_request(req)
+        self.request_retirer.detach_aborted(req)
         # No member rows exist before the leader's prefill ends.
         self.beam_coordinator.retire_group(req)
         if self.enable_hisparse:

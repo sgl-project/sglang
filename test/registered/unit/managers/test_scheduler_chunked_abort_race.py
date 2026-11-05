@@ -83,7 +83,7 @@ class TestPendingChunkedAbortRace(CustomTestCase):
         req = _FakeReq("failed_load")
         req.discard_output_reason = FINISH_ABORT("External KV cache load failed", 503)
         sched = _make_scheduler(req, chunked_req=req, running_reqs=[])
-        sched.release_aborted_request = Mock()
+        sched.request_retirer = Mock()
         sched.tree_cache = None
         sched.ipc_channels = Mock()
 
@@ -97,7 +97,7 @@ class TestPendingChunkedAbortRace(CustomTestCase):
     def test_aborted_chunked_beam_leader_retires_its_group(self):
         req = _FakeReq("beam_leader")
         sched = _make_scheduler(req, chunked_req=req, running_reqs=[])
-        sched.release_aborted_request = Mock()
+        sched.request_retirer = Mock()
         sched.tree_cache = None
         sched.ipc_channels = Mock()
 
@@ -110,7 +110,7 @@ class TestPendingChunkedAbortRace(CustomTestCase):
         # Each chunk's extend allocates HiSparse spec scratch for the row.
         req = _FakeReq("hisparse_chunked")
         sched = _make_scheduler(req, chunked_req=req, running_reqs=[])
-        sched.release_aborted_request = Mock()
+        sched.request_retirer = Mock()
         sched.tree_cache = None
         sched.ipc_channels = Mock()
         sched.enable_hisparse = True

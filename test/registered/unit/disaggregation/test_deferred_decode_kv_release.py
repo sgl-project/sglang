@@ -1097,7 +1097,7 @@ class TestHiSparseDestinationFollowsTheHold(CustomTestCase):
         release = lambda req, *args, **kwargs: log.append(("kv", req.rid))
         with (
             patch.object(decode_mod, "prepare_abort"),
-            patch.object(q.scheduler.request_retirer, "release_aborted_request"),
+            patch.object(q.scheduler.request_retirer, "detach_aborted"),
             patch.object(retirer_mod, "release_kv_cache", side_effect=release),
         ):
             q.pop_transferred()

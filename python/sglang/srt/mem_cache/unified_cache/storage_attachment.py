@@ -411,7 +411,7 @@ class StorageAttachment:
         and `ongoing_backup` are already empty, so this normally finds nothing. It
         earns its keep on the atexit path, which has no such guard.
 
-        Two deliberate departures from `release_aborted_request`, which does the
+        Two deliberate departures from `_abandon_attempt`, which does the
         same bookkeeping while the storage threads are still running:
 
         * no cross-rank barrier -- at process exit the other ranks may already be

@@ -218,14 +218,14 @@ class TestQueuedAbort(CustomTestCase):
         s.dllm_config = None
         s.grammar_manager = MagicMock()
         s.init_request_retirer()
-        s.request_retirer.release_aborted_request = MagicMock()
+        s.request_retirer.detach_aborted = MagicMock()
 
         s.abort_request(AbortReq(rid="queued"))
         s.abort_request(AbortReq(abort_all=True))
 
         self.assertIsInstance(req.finished_reason, FINISH_ABORT)
         self.assertIsNone(req.to_finish)
-        s.request_retirer.release_aborted_request.assert_called_once_with(req)
+        s.request_retirer.detach_aborted.assert_called_once_with(req)
 
 
 class TestRunningTimeout(CustomTestCase):
