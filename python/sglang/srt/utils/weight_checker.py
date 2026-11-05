@@ -163,7 +163,7 @@ class WeightChecker:
             view.copy_(param.detach())
             snapshot_tensors[name] = view
         assert len(snapshot_tensors) == len(named_params), (
-            f"should not have duplicated tensor name"
+            "should not have duplicated tensor name"
         )
         # publish only after every copy succeeded, so a failed snapshot holds no arena
         self._snapshot_arena = allocator.arena
@@ -339,7 +339,7 @@ def _check_tensors(
     if len(info_messages) > 0:
         logger.info(f"[check_tensors] info: {info_messages}")
     if len(error_messages) > 0:
-        raise Exception(f"check tensor equality failed:\n" + "\n".join(error_messages))
+        raise Exception("check tensor equality failed:\n" + "\n".join(error_messages))
 
 
 def _random_like(t: torch.Tensor):
