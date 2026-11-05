@@ -623,9 +623,7 @@ class MambaMixer2(torch.nn.Module):
                     initial_states = ssm_state.new_zeros(
                         (num_prefills, *ssm_state.shape[1:])
                     )
-                # SSD writes the selected tracking endpoint directly. Returning
-                # no intermediate_states prevents the backend's Triton snapshot
-                # copy from overwriting that checkpoint with a different state.
+                # Native checkpoint writes replace Triton's intermediate-state copy.
                 varlen_state = flashinfer_ssd_prefill(
                     hidden_states_p.view(
                         1, num_prefill_tokens, local_num_heads, self.head_dim

@@ -1,19 +1,14 @@
 """Packed Mamba2 prefill adapter for FlashInfer's checkpoint-capable SSD.
 
-Metadata is built once per forward, not once per layer. FlashInfer 0.7.2 handles
-partial trailing chunks and writes directly into token-major output. Extents
-below one 128-token TMA tile still require padding as a discarded sequence.
-Checkpoint positions are exclusive sequence-relative endpoints supplied by the
-caller's tracking policy.
+FlashInfer 0.7.2 requires at least one 128-token TMA tile; shorter extents use
+a discarded padding sequence. Checkpoint endpoints are sequence-relative.
 """
 
-from dataclasses import dataclass
-
+import msgspec
 import torch
 
 
-@dataclass(frozen=True)
-class SSDPrefillMetadata:
+class SSDPrefillMetadata(msgspec.Struct, frozen=True):
     num_tokens: int
     num_sequences: int
     padding: int
@@ -61,11 +56,7 @@ def prepare_ssd_prefill_metadata(
             else -1
         )
         checkpoint = start + end if end >= 0 else -1
-        # Native capture happens only at logical-segment ends. Split an
-        # interior checkpoint into two segments of the SAME sequence, so
-        # state carries through without resetting or launching a second scan.
-        # An inactive row must have endpoint -1. Physical slot IDs may remain
-        # on device; never synchronize just to inspect a destination.
+        # Split at an interior checkpoint; FlashInfer captures only at segment ends.
         if end == 0:
             initial_rows.append(row)
         cursor = start
@@ -131,8 +122,8 @@ def flashinfer_ssd_prefill(
 
     Inputs follow ``ssd_combined_fwd``: x [1,T,H,64], B/C [1,T,G,128],
     initial states [N,H,64,128]. Caller masks cold initial states to zero. The
-    checkpoint pool must be contiguous, with distinct destination slots. This
-    adapter uses FlashInfer 0.7.2's direct token-major output storage."""
+    checkpoint pool must be contiguous, with distinct destination slots.
+    """
     from flashinfer.mamba import ssd_combined_fwd
 
     if x.shape[0] != 1 or x.shape[1] != metadata.num_tokens:
@@ -168,8 +159,6 @@ def flashinfer_ssd_prefill(
         D=D.to(torch.bfloat16) if D is not None else None,
         dt_bias=dt_bias,
         dt_softplus=True,
-        # Upstream Cake SSD uses exact scan with FP16 processed delta. Keep
-        # normal nonnegative step sizes; no clamp-based dispatch workaround.
         dt_limit=(0.0, float("inf")),
         initial_states=initial_states,
         seq_idx=metadata.seq_idx,

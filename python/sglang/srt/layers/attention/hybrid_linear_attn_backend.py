@@ -1217,9 +1217,6 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
             endpoints = None
             slots = None
             if metadata.has_mamba_track_mask:
-                # Use exactly the Triton tracking policy, including final-state
-                # rows and sequence-relative chunk boundaries. Slot IDs stay
-                # on device after virtual-to-physical translation.
                 if self._has_cpu_prefill_track_metadata(forward_batch):
                     mask = forward_batch.mamba_prefill_track_mask_cpu
                     track_lens = forward_batch.mamba_track_seqlens_cpu
@@ -1228,22 +1225,20 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
                     mask = forward_batch.mamba_track_mask.tolist()
                     track_lens = forward_batch.mamba_track_seqlens.tolist()
                     prefix_lens = forward_batch.extend_prefix_lens.tolist()
-                endpoints = []
-                for active, track, prefix, length in zip(
-                    mask, track_lens, prefix_lens, lengths
-                ):
-                    relative = track - prefix
-                    endpoints.append(
-                        (
-                            length
-                            if relative % self.mamba_chunk_size == 0
-                            else relative
-                            // self.mamba_chunk_size
-                            * self.mamba_chunk_size
-                        )
-                        if active
-                        else -1
-                    )
+                num_prefills = len(lengths)
+                plan = build_prefill_track_plan(
+                    mask[:num_prefills],
+                    track_lens[:num_prefills],
+                    lengths,
+                    prefix_lens[:num_prefills],
+                    self.mamba_chunk_size,
+                    mamba2=True,
+                )
+                endpoints = [-1] * num_prefills
+                for row in plan.final_rows:
+                    endpoints[row] = lengths[row]
+                for row in plan.unaligned_rows:
+                    endpoints[row] = plan.chunk_indices[row] * self.mamba_chunk_size
                 slots = forward_batch.mamba_track_indices[: len(lengths)]
             self.forward_metadata.ssd_prefill = prepare_ssd_prefill_metadata(
                 lengths, forward_batch.input_ids.device, endpoints, slots

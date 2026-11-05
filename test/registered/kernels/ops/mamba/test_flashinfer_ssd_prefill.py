@@ -291,12 +291,7 @@ class TestFlashInferSSDPrefill(CustomTestCase):
 
     @torch.inference_mode()
     def test_short_strong_decay(self):
-        """exp(-sum(A*dt)) can overflow although exp(A*dt) is bounded.
-
-        Older FlashInfer selected an unstable prefix-factorized short-input
-        route with the default lower clamp. Upstream exact scan must remain
-        finite with that normal clamp; the long model-shape test misses this.
-        """
+        """Short inputs with strong decay must remain finite at the default clamp."""
         case = SSDCase([13], [13], heads=128, groups=8, warm=False)
         case.A.fill_(-100)
         case.dt.zero_()
@@ -305,11 +300,7 @@ class TestFlashInferSSDPrefill(CustomTestCase):
 
     @torch.inference_mode()
     def test_transformed_dt_precision(self):
-        """BF16 transformed dt exceeded the state-error bound at seed 187.
-
-        Compare to an independent token-by-token FP32 recurrence, not another
-        chunked implementation with potentially matching rounding errors.
-        """
+        """Processed step sizes must preserve state accuracy against an FP32 recurrence."""
         batch, length, heads, groups = 16, 256, 128, 8
         case = SSDCase([length] * batch, [length] * batch, heads, groups)
         actual = case.run().clone()

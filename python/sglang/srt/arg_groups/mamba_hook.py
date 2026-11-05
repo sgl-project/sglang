@@ -10,6 +10,7 @@ from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.arg_groups.overrides import supports_mamba_cache_extra_buffer
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_platform
+from sglang.srt.utils.common import check_pkg_version_at_least
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +23,10 @@ def handle_mamba_backend(server_args: Any):
         if cfg.enable_unified_memory or cfg.enable_page_major_kv_layout:
             raise ValueError(
                 "FlashInfer Mamba2 SSD prefill requires contiguous static state pools."
+            )
+        if not check_pkg_version_at_least("flashinfer-python", "0.7.2"):
+            raise ValueError(
+                "FlashInfer Mamba2 SSD prefill requires flashinfer-python >= 0.7.2."
             )
         logger.info(
             "Mamba2 prefill uses FlashInfer SSD; decode/verify backend is unchanged"
