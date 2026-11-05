@@ -2002,6 +2002,9 @@ class Envs:
     SGLANG_OPT_DSV41_ENGRAM_HOST_STAGING = EnvBool(False)
     # Deprecated for --engram-config "lookup".
     SGLANG_OPT_DSV41_ENGRAM_PEER_SHARDS = EnvBool(False)
+    # Decode/VERIFY: prepare Engram lookup and wkv on a dedicated stream.
+    # Requires pure DP-attention + MegaMoE (or TP1), and a stream-safe wkv.
+    SGLANG_OPT_DSV41_ENGRAM_PREFETCH = EnvBool(False)
 
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)

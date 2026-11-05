@@ -36,6 +36,7 @@ from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.models.deepseek_common.utils import _device_sm
 from sglang.srt.multimodal.dsv41.vl_routing import vision_topk
+from sglang.srt.runtime_context import get_forward
 from sglang.srt.utils import is_hip, is_sm100_supported
 
 if TYPE_CHECKING:
@@ -550,6 +551,7 @@ def run_mega_routed_experts(
         topk_weights_in = hidden_states.new_empty((0, top_k), dtype=torch.float32)
 
     if _device_sm == 90:
+        _wait_for_moe_prefetch()
         return run_sm90_mega_routed(
             experts,
             hidden_states,
@@ -660,6 +662,11 @@ def run_mega_routed_experts(
         dtype=torch.bfloat16,
         device=hidden_states.device,
     )
+    # Join on the actual MegaMoE stream, which may be the MoE alternate stream.
+    # Routing/topk and pre-dispatch remain independent of Engram preparation.
+    # Leaving NCCL outstanding here can prevent all MegaMoE clusters becoming
+    # resident and deadlock its grid/NVLink software barriers.
+    _wait_for_moe_prefetch()
     with _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
         deep_gemm.fp8_fp4_mega_moe(
             y,
@@ -683,6 +690,12 @@ def _mega_moe_global_tokens_hint(buf) -> Optional[int]:
     if get_is_capture_mode() or is_dsa_enable_prefill_cp():
         return None
     return min(int(sum(counts)), buf.group.size() * buf.num_max_tokens_per_rank)
+
+
+def _wait_for_moe_prefetch() -> None:
+    fence = get_forward().moe_prefetch_fence
+    if fence is not None:
+        fence.wait()
 
 
 def _interleave_mega_moe_gate_up(t: torch.Tensor, gran: int = 8) -> torch.Tensor:

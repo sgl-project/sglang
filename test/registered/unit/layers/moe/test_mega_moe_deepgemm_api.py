@@ -30,6 +30,7 @@ from sglang.srt.runtime_context import (
     get_context,
     get_exec,
     get_flags,
+    get_forward,
     get_model,
     get_parallel,
 )
@@ -310,7 +311,10 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
 
     def test_run_mega_routed_experts_generic_entry(self):
         deep_gemm = ModuleType("deep_gemm")
-        deep_gemm.fp8_fp4_mega_moe = MagicMock()
+        launches = []
+        deep_gemm.fp8_fp4_mega_moe = MagicMock(
+            side_effect=lambda *_args, **_kwargs: launches.append("mega")
+        )
         buffer = SimpleNamespace(
             x=object(),
             x_sf=object(),
@@ -349,7 +353,13 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                     moe_ep_group=SimpleNamespace(device_group=object())
                 ),
             ),
+            get_forward().scoped(
+                moe_prefetch_fence=SimpleNamespace(wait=lambda: launches.append("join"))
+            ),
         ):
+            pre_dispatch.side_effect = lambda *_args, **_kwargs: launches.append(
+                "pre_dispatch"
+            )
             out = mega_moe.run_mega_routed_experts(
                 experts,
                 hidden_states,
@@ -382,6 +392,9 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                 eplb_load_row,
             )
 
+        # Fence placement must retain preparation overlap while preventing
+        # the full-grid MegaMoE kernel from racing outstanding Engram NCCL.
+        self.assertEqual(launches, ["pre_dispatch", "join", "mega"])
         self.assertEqual(out.shape, (3, 4))
         self.assertEqual(out.dtype, torch.bfloat16)
         buf_call = get_buffer.call_args
