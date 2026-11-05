@@ -51,10 +51,10 @@ class GetDisaggStatsReq(msgspec.Struct):
 
 
 class AutoResidencyReq(msgspec.Struct, frozen=True):
-    """Apply or roll back the warmup-calibrated residency promotion.
+    """Plan, apply, or roll back automatic component residency.
 
     Sent by the server warmup orchestrator after the synthetic warmup
     requests finish and before the server reports ready.
     """
 
-    action: str = "apply"  # "apply" | "validate" | "rollback"
+    action: str = "apply"  # "apply" | "apply_static" | "validate" | "rollback"

@@ -2255,7 +2255,7 @@ def collect_residency_targets(
         # A configured manager exposes its measured layerwise frontier. Without
         # managers, the module is still in its ordinary current placement even
         # when the baseline policy requested layerwise offload. Build a virtual
-        # frontier from that real state so an initial resident seed can still
+        # frontier from that real state so a resident component can still
         # be demoted after an OOM.
         frontier_mode = (
             LAYERWISE_OFFLOAD if has_layerwise_managers else COMPONENT_OFFLOAD

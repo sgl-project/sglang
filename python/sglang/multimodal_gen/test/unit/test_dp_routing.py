@@ -95,6 +95,12 @@ def test_auto_residency_fanout_reports_successful_rollback():
     assert _merge_auto_residency_results([skipped, restored]) is restored
 
 
+def test_auto_residency_validation_never_hides_a_replica_rollback():
+    validated = OutputBatch(output={"status": "validated"})
+    restored = OutputBatch(output={"status": "rolled_back"})
+    assert _merge_auto_residency_results([validated, restored]) is restored
+
+
 def test_scheduler_endpoints_one_per_replica():
     args = ServerArgs.__new__(ServerArgs)
     args.host = "localhost"
