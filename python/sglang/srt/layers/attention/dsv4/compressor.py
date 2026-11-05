@@ -19,9 +19,10 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.models.deepseek_common.utils import _is_hip, _use_aiter
 from sglang.srt.runtime_context import get_exec
-from sglang.srt.utils import add_prefix, is_npu, set_weight_attrs
+from sglang.srt.utils import add_prefix, is_gfx1250_supported, is_npu, set_weight_attrs
 
 _is_npu = is_npu()
+_is_gfx1250_supported = is_gfx1250_supported()
 
 if _use_aiter:
     from aiter.tuned_gemm import tgemm
@@ -162,7 +163,9 @@ class Compressor(BaseFusedOp):
         if weight is not None:
             if _use_aiter and weight.dtype == torch.bfloat16:
                 # aiter's tuned GEMM for these shapes; kv_score is bf16-rounded
-                return tgemm.mm(x, weight, otype=x.dtype).float()
+                kv_score = tgemm.mm(x, weight, otype=x.dtype)
+                # the gfx1250 fused compress kernels widen it on load
+                return kv_score if _is_gfx1250_supported else kv_score.float()
             return linear_bf16_fp32(x, weight)
 
         from sglang.srt.layers.quantization.gguf import fused_mul_mat_gguf
@@ -184,6 +187,8 @@ class Compressor(BaseFusedOp):
             return x.new_empty(0, self.head_dim)
 
         kv_score = self.compute_kv_score(x, forward_batch)
+        if _is_gfx1250_supported:
+            kv_score = kv_score.float()
 
         if TYPE_CHECKING:
             assert isinstance(attn_backend, DeepseekV4AttnBackend)

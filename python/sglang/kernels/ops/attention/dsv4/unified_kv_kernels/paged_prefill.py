@@ -51,12 +51,12 @@ import triton.language as tl
 
 from sglang.srt.utils.common import is_gfx95_supported, is_gfx1250_supported
 
-# OPUS gfx950 paged-prefill kernel is preferred when importable; otherwise fall
-# back to the Triton implementation below.
+# OPUS paged-prefill kernel is preferred when importable; otherwise fall back to
+# the Triton implementation below.
 try:
     from aiter.ops.pa_sparse_prefill_opus import pa_sparse_prefill_opus
 
-    _HAS_OPUS = is_gfx95_supported() and not is_gfx1250_supported()
+    _HAS_OPUS = is_gfx95_supported() or is_gfx1250_supported()
 except ImportError:
     pa_sparse_prefill_opus = None
     _HAS_OPUS = False
@@ -316,7 +316,8 @@ def sparse_attn_v4_paged_prefill(
     Returns:
       out: [T, H, D] same dtype as q.
     """
-    if _HAS_OPUS:
+    # gfx1250 OPUS ships only the bf16 code object.
+    if _HAS_OPUS and (q.dtype == torch.bfloat16 or not is_gfx1250_supported()):
         # OPUS contract differs from the Triton kernel in two ways the Triton
         # path tolerates implicitly:
         #  - it requires a FULLY-contiguous q (it only asserts stride(2)==1 but

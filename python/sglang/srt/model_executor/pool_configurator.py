@@ -1124,12 +1124,15 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
             is_unified_kv_fp8,
             is_unified_kv_triton,
+            maybe_enable_gfx1250_v4_unified_kv,
         )
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
             dsv4_unified_row_bytes,
         )
 
         # Resolve the unified-kv gate before any sizing so the two cannot drift.
+        # V4 Pro on gfx1250 (auto) takes the aiter unified pool; V4.1 does not.
+        maybe_enable_gfx1250_v4_unified_kv(getattr(cfg.hf_config, "model_type", None))
         self._unified = is_unified_kv_triton()
         self._unified_fp8 = is_unified_kv_fp8()
         # DSpark draft still allocates a bf16 ring; target fp8 * (T+1)/T would

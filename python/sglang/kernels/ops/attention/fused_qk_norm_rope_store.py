@@ -20,7 +20,7 @@ from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.layout import (
     check_two_pool_pair,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
-from sglang.srt.utils import is_gfx95_supported
+from sglang.srt.utils import is_gfx95_supported, is_gfx1250_supported
 
 _fp8_fnuz = is_fp8_fnuz()
 
@@ -35,7 +35,11 @@ except ImportError:
     fused_qk_norm_rope_group_quant = None
     _HAS_AITER_OP = False
 
-_HAS_GROUP_QUANT = _HAS_AITER_OP and is_gfx95_supported()
+# csrc/kernels/fused_qk_norm_rope_cache_quant.cu has first-class gfx1250 code
+# paths (TDM prefetch ring, DPP-based group-amax, gfx1250-tuned HPW/HPB) next
+# to the gfx942/gfx950 ones -- it is not a gfx95-only kernel at the C++ level,
+# so gate on gfx95 OR gfx1250 here, same fix as env_gate.is_unified_kv_fp8().
+_HAS_GROUP_QUANT = _HAS_AITER_OP and (is_gfx95_supported() or is_gfx1250_supported())
 
 
 # ---------------------------------------------------------------------------
