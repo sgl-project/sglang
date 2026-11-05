@@ -27,6 +27,8 @@ class WeightUpdateRejected(ValueError):
     update_weights_from_tensor then returns success=False with this message on
     every tensor-parallel rank. The served weights stay unchanged only if no
     rank and no earlier runner (the target, before a draft) applied the update.
+    With pipeline parallelism (pp_size > 1) it is not caught, like any other
+    loader exception, because only the first stage reports the result.
     """
 
 

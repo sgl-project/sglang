@@ -379,6 +379,10 @@ class WeightUpdater:
             try:
                 custom_loader(self.get_model(), named_tensors)
             except WeightUpdateRejected as e:
+                # Only the first pipeline stage reports the result, so the other
+                # stages could not learn of a rejection and fail the call too.
+                if get_parallel().pp_size > 1:
+                    raise
                 return False, f"{load_format} rejected the update: {e}"
         elif load_format is None:
             self.get_model().load_weights(named_tensors)
