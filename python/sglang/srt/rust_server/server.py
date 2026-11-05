@@ -263,7 +263,17 @@ class RustServer:
         host = get_serving().host
         if host in ("", "0.0.0.0", "::"):
             # An unspecified bind address is not reachable from another node.
-            host = get_local_ip_auto(fallback="127.0.0.1")
+            detected = get_local_ip_auto(fallback="127.0.0.1")
+            if (
+                host == "0.0.0.0"
+                and NetworkAddress(detected, 0).is_ipv6
+                and _is_loopback(detected)
+            ):
+                # SGLANG_HOST_IP=::1 names this machine, which this IPv4
+                # listener serves at 127.0.0.1. It does not serve any other
+                # IPv6 address; gather_server_endpoints refuses those.
+                detected = "127.0.0.1"
+            host = detected
         return host
 
     @classmethod
