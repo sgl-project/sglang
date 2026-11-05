@@ -1999,6 +1999,9 @@ class Envs:
     # bf16 logits vary with the tile's row count, so picks near the selection
     # floor can differ there.
     SGLANG_OPT_DSV4_INDEXER_TP_SHARD = EnvBool(False)
+    # HIP DSv4.1 prefill: each attention-TP rank attends a share of the tokens with
+    # every head (two all-to-alls) instead of every token with its heads.
+    SGLANG_OPT_DSV4_SHARD_Q = EnvBool(False)
     SGLANG_OPT_DSV4_NONPAGED_INDEXER = EnvBool(True)
     # Per-rank local query rows (after DP-attention sharding when enabled),
     # not request ISL.

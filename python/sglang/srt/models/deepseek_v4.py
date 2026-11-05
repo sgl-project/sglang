@@ -141,7 +141,7 @@ from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_token_to_kv_pool,
 )
-from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.runner import (
     compile_in_capture_mode,
     get_is_capture_mode,
@@ -2784,7 +2784,17 @@ class MQALayer(MqaAttentionBase):
                     q_padded = x.new_empty(x.shape[0], kernel_num_heads, self.head_dim)
                 tp_slice = slice(0, self.n_local_heads)
                 q_out = q_padded[:, tp_slice, :]
-        attn_sink = self._local_attn_sink(kernel_num_heads)
+        # HIP prefill under ShardQ attends a share of the tokens with every head
+        shard_q = (
+            attn_backend.forward_metadata.shard_q
+            if _is_hip and forward_batch.forward_mode == ForwardMode.EXTEND
+            else None
+        )
+        attn_sink = (
+            self.attn_sink
+            if shard_q is not None
+            else self._local_attn_sink(kernel_num_heads)
+        )
 
         if enable_multi_stream:
             # Multi-stream path always fuses cache write into the K kernel,
@@ -2852,6 +2862,11 @@ class MQALayer(MqaAttentionBase):
             )
             return self._project_wo_b(o, defer_all_reduce)
 
+        attn_positions = positions
+        if shard_q is not None:
+            q = shard_q.scatter_q(q)
+            attn_positions = shard_q.positions
+
         # save_kv_cache = kv is not None selects who writes the ring. When kv is
         # None the store was already fused into _forward_prepare* (decode) or
         # done inline, so the backend skips its own store_cache; pass `q` as a
@@ -2865,7 +2880,7 @@ class MQALayer(MqaAttentionBase):
         inv_rope = (
             _hip.attention_inv_rope(
                 self,
-                positions,
+                attn_positions,
                 forward_batch,
                 unified,
                 wo_a_applies_inv_rope=self.wo_a_fp8
@@ -2931,7 +2946,7 @@ class MQALayer(MqaAttentionBase):
                     # HIP only, for the same reason as rope_kwargs above
                     **({} if inv_rope is None else {"inv_rope": inv_rope}),
                 )
-            o = o[:, tp_slice, :]
+            o = o[:, tp_slice, :] if shard_q is None else shard_q.gather_o(o)
         o = self._project_wo_a(
             o,
             positions=positions,
