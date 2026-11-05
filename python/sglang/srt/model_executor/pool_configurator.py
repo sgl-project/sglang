@@ -27,9 +27,9 @@ from sglang.srt.configs.model_config import (
     get_minimax_sparse_layer_ids,
     get_unlimited_ocr_v2_sparse_config,
     is_deepseek_dsa,
-    is_deepseek_v4,
     is_minimax_sparse,
     is_unlimited_ocr_v2,
+    uses_compressed_kv_attention,
     uses_minimax_m3_nvfp4_native_stack,
 )
 from sglang.srt.environ import envs
@@ -609,7 +609,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     ) -> int:
         index_head_dim = get_dsa_index_head_dim(kvc.model_config.hf_config)
         indexer_size_per_token = ceil_div(
-            index_head_dim + index_head_dim // DSATokenToKVPool.quant_block_size * 4,
+            DSATokenToKVPool.index_bytes_per_token_for(
+                index_head_dim, get_exec().kernel.enable_fp4_indexer
+            ),
             get_dsa_index_kpool(kvc.model_config.hf_config),
         )
         element_size = torch._utils._element_size(
@@ -733,8 +735,9 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             if is_deepseek_dsa(model_config.hf_config):
                 index_head_dim = get_dsa_index_head_dim(model_config.hf_config)
                 index_elements = ceil_div(
-                    index_head_dim
-                    + index_head_dim // DSATokenToKVPool.quant_block_size * 4,
+                    DSATokenToKVPool.index_bytes_per_token_for(
+                        index_head_dim, get_exec().kernel.enable_fp4_indexer
+                    ),
                     get_dsa_index_kpool(model_config.hf_config),
                 )
                 self._full_per_token += index_elements * torch._utils._element_size(
@@ -1113,6 +1116,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
     # object.__new__ stubs (SWA floor tests) skip __init__
     _dspark_draft_on_bf16 = False
+    # A subclass that adds the draft's KV to the per-token bytes itself sets this,
+    # replacing the (T+D)/T inflation.
+    _draft_kv_priced_exactly = False
 
     def __init__(self, kvc: KVCacheConfigurator):
         self.kv_cache_dtype_str = kvc.kv_cache_dtype_str
@@ -1325,7 +1331,11 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         )
         self.bytes_per_swa_token = self._get_bytes_per_swa_token()
         self.bytes_per_full_token = self._get_bytes_per_full_token()
-        if self.is_speculative and not self.encoder_replay:
+        if (
+            self.is_speculative
+            and not self.encoder_replay
+            and not self._draft_kv_priced_exactly
+        ):
             # Reserve the draft worker by inflating per-token bytes by
             # (target+draft)/target, as scale_kv_cell_size_per_token_for_dflash does.
             draft_layers = 1
@@ -1790,10 +1800,45 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         return self._to_config(sizes)
 
 
+class Ernie5_5PoolConfigurator(DSV4PoolConfigurator):
+    """ERNIE 5.5 Flash: the MLA layers keep a latent + index key per full token
+    and no SWA buffer (Ernie5_5TokenToKVPool._swa_layer_ids)."""
+
+    def __init__(self, kvc: KVCacheConfigurator):
+        self._hf_config = kvc.model_config.hf_config
+        self.use_fp4_indexer = get_exec().kernel.enable_fp4_indexer
+        stage = range(kvc.layer_info.start_layer, kvc.layer_info.end_layer)
+        self._num_mla_layers = sum(i in stage for i in self._hf_config.mla_layer_ids)
+        # The MTP draft is one MLA layer, priced here instead of by inflation.
+        self._draft_kv_priced_exactly = (
+            get_spec().speculative_algorithm is not None
+            and not kvc.spec_algorithm.is_dspark()
+        )
+        super().__init__(kvc)
+
+    def _get_bytes_per_swa_token(self) -> float:
+        return (
+            super()._get_bytes_per_swa_token()
+            - self._get_paged_kv_bytes_per_token() * self._num_mla_layers
+        )
+
+    def _get_bytes_per_full_token(self) -> float:
+        from sglang.srt.mem_cache.ernie55_memory_pool import mla_layer_bytes_per_token
+
+        mla_layers = self._num_mla_layers + int(self._draft_kv_priced_exactly)
+        return super()._get_bytes_per_full_token() + mla_layers * (
+            mla_layer_bytes_per_token(
+                self._hf_config, self.kv_cache_dtype_str, self.use_fp4_indexer
+            )
+        )
+
+
 def create_memory_pool_configurator(
     kvc: KVCacheConfigurator,
 ) -> MemoryPoolConfigurator:
-    if is_deepseek_v4(kvc.model_config.hf_config) and kvc.is_hybrid_swa:
+    if uses_compressed_kv_attention(kvc.model_config.hf_config) and kvc.is_hybrid_swa:
+        if kvc.model_config.hf_config.architectures[0] == "Ernie5_5_MoeForCausalLM":
+            return Ernie5_5PoolConfigurator(kvc)
         return DSV4PoolConfigurator(kvc)
     if kvc.is_hybrid_swa:
         if SWARequestCapPoolConfigurator.is_applicable(kvc):

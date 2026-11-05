@@ -1091,8 +1091,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             PoolName.DEEPSEEK_V4_C4_STATE,
             PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
             PoolName.DEEPSEEK_V4_C128_STATE,
+            PoolName.ERNIE5_5_MLA,
+            PoolName.ERNIE5_5_MLA_INDEXER,
         ):
-            # DSA indexer and DeepSeek V4 side pools are page-packed
+            # DSA indexer, DeepSeek V4 and ERNIE 5.5 side pools are page-packed
             # single-object pools.
             suffixes = [f"_{self.mla_suffix}_{pool_name}"]
         elif pool_name == PoolName.SWA:

@@ -15,10 +15,14 @@ if _is_cuda or _is_hip:
         weights_raw: torch.Tensor,
         n_heads_inv_sqrt: float,
         softmax_scale: float,
-        q_scale: torch.Tensor,
+        q_scale: torch.Tensor | None,
     ) -> torch.Tensor:
         return torch.empty(
-            (weights_raw.shape[0], weights_raw.shape[1], q_scale.shape[-1]),
+            (
+                weights_raw.shape[0],
+                weights_raw.shape[1],
+                q_scale.shape[-1] if q_scale is not None else 1,
+            ),
             dtype=torch.float32,
             device=weights_raw.device,
         )
@@ -30,20 +34,29 @@ if _is_cuda or _is_hip:
         weights_raw: torch.Tensor,
         n_heads_inv_sqrt: float,
         softmax_scale: float,
-        q_scale: torch.Tensor,
+        q_scale: torch.Tensor | None,
     ) -> torch.Tensor:
         weights = weights_raw * n_heads_inv_sqrt
-        return weights.unsqueeze(-1) * q_scale * softmax_scale
+        weights = weights.unsqueeze(-1)
+        if q_scale is not None:
+            weights = weights * q_scale
+        else:
+            weights = weights.float()
+        return weights * softmax_scale
 
     def _logits_head_gate_graph_fake_impl(
         x: torch.Tensor,
         weight: torch.Tensor,
         n_heads_inv_sqrt: float,
         softmax_scale: float,
-        q_scale: torch.Tensor,
+        q_scale: torch.Tensor | None,
     ) -> torch.Tensor:
         return torch.empty(
-            (x.shape[0], weight.shape[0], q_scale.shape[-1]),
+            (
+                x.shape[0],
+                weight.shape[0],
+                q_scale.shape[-1] if q_scale is not None else 1,
+            ),
             dtype=torch.float32,
             device=x.device,
         )
@@ -55,9 +68,14 @@ if _is_cuda or _is_hip:
         weight: torch.Tensor,
         n_heads_inv_sqrt: float,
         softmax_scale: float,
-        q_scale: torch.Tensor,
+        q_scale: torch.Tensor | None,
     ) -> torch.Tensor:
         out = torch.mm(x, weight.t(), out_dtype=torch.float32)
         weights = out * n_heads_inv_sqrt
-        weights = weights.unsqueeze(-1) * q_scale * softmax_scale
+        weights = weights.unsqueeze(-1)
+        if q_scale is not None:
+            weights = weights * q_scale
+        else:
+            weights = weights.float()
+        weights = weights * softmax_scale
         return weights

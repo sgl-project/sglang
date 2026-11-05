@@ -211,6 +211,8 @@ def is_deepseek_dsa(config) -> bool:
             "Dots3NoteForCausalLMNextN",
             "HYV4ForCausalLM",
             "HYV4ForCausalLMNextN",
+            "Ernie5_5_MoeForCausalLM",
+            "Ernie5_5_MoeForCausalLMNextN",
         )
         and _hf_attr(config, "index_topk") is not None
     ) or is_kimi_k31(config)
@@ -446,6 +448,20 @@ def is_deepseek_v4(config) -> bool:
     )
 
 
+def is_ernie5_5(config) -> bool:
+    return _hf_arch(config) in (
+        "Ernie5_5_MoeForCausalLM",
+        "Ernie5_5_MoeForCausalLMNextN",
+        "Ernie5_5_MoeForCausalLMDSpark",
+    )
+
+
+def uses_compressed_kv_attention(config) -> bool:
+    """Whether the model's attention runs on the compressed sliding-window KV
+    layout (SWA plus C4 / C128 sub-pools) and its backend."""
+    return is_deepseek_v4(config) or is_ernie5_5(config)
+
+
 def is_qwen4_exp(config) -> bool:
     return _hf_arch(config) in (
         "Qwen4ExpForConditionalGeneration",
@@ -456,16 +472,18 @@ def is_qwen4_exp(config) -> bool:
 def resolve_spec_hidden_size(
     hf_config, hidden_size: int, hc_mult: int
 ) -> tuple[int, Optional[int]]:
-    # DSV4 and Qwen4-Exp carry the hc-flattened stream across the target->draft
-    # boundary; other hc models (hy_v4) collapse to hidden_size first.
-    if hc_mult <= 1 or not (is_deepseek_v4(hf_config) or is_qwen4_exp(hf_config)):
+    # DSV4, ERNIE 5.5 and Qwen4-Exp carry the hc-flattened stream across the
+    # target->draft boundary; other hc models (hy_v4) collapse to hidden_size first.
+    if hc_mult <= 1 or not (
+        uses_compressed_kv_attention(hf_config) or is_qwen4_exp(hf_config)
+    ):
         return hidden_size, None
     hc_hidden_size = hidden_size * hc_mult
     return hc_hidden_size, hc_hidden_size
 
 
 def get_dsa_index_head_dim(config: PretrainedConfig) -> int:
-    assert is_deepseek_dsa(config) or is_deepseek_v4(config)
+    assert is_deepseek_dsa(config) or uses_compressed_kv_attention(config)
     return config.index_head_dim
 
 
@@ -1155,6 +1173,21 @@ class ModelConfig:
                 self.hf_config.architectures[0] = "DeepseekV4ForCausalLMNextN"
                 self.hf_config.num_nextn_predict_layers = 1
 
+        if (
+            is_draft_model
+            and self.hf_config.architectures[0] == "Ernie5_5_MoeForCausalLM"
+        ):
+            from sglang.srt.configs.ernie55 import (
+                to_dspark_draft_config,
+                to_nextn_draft_config,
+            )
+
+            # The model override admits DSPARK and EAGLE (MTP) only.
+            if self.speculative_algorithm == "DSPARK":
+                to_dspark_draft_config(self.hf_config)
+            else:
+                to_nextn_draft_config(self.hf_config)
+
         if is_draft_model and self.hf_config.architectures[0] == "Glm4MoeForCausalLM":
             self.hf_config.architectures[0] = "Glm4MoeForCausalLMNextN"
         if (
@@ -1325,15 +1358,8 @@ class ModelConfig:
         if self.is_hybrid_swa:
             logger.debug(f"Hybrid swa model: {self.hf_config.architectures=}")
 
-            self.is_deepseek_v4_arch = any(
-                arch
-                in [
-                    "DeepseekV4ForCausalLM",
-                    "DeepseekV4ForCausalLMNextN",
-                    "DeepseekV4ForCausalLMDSpark",
-                ]
-                for arch in self.hf_config.architectures
-            )
+            # Also True for ERNIE 5.5, whose HCA layers use DeepSeekV4TokenToKVPool.
+            self.is_deepseek_v4_arch = uses_compressed_kv_attention(self.hf_config)
 
             if not self.is_deepseek_v4_arch:
                 self.swa_attention_layer_ids, self.full_attention_layer_ids = (
@@ -1543,11 +1569,7 @@ class ModelConfig:
                 self.hf_text_config, "rope_parameters", None
             ) or getattr(self.hf_text_config, "rope_scaling", None)
             self._init_mla_scaling(rope_scaling)
-        elif (
-            "DeepseekV4ForCausalLM" in self.hf_config.architectures
-            or "DeepseekV4ForCausalLMNextN" in self.hf_config.architectures
-            or "DeepseekV4ForCausalLMDSpark" in self.hf_config.architectures
-        ):
+        elif uses_compressed_kv_attention(self.hf_config):
             self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
             self.qk_nope_head_dim = self.hf_config.head_dim - self.qk_rope_head_dim
             self.window_size = self.hf_config.sliding_window
@@ -2638,6 +2660,9 @@ piecewise_cuda_graph_disabled_model_archs = [
     "DeepseekV4ForCausalLM",
     "DeepseekV4ForCausalLMNextN",
     "DeepseekV4ForCausalLMDSpark",
+    "Ernie5_5_MoeForCausalLM",
+    "Ernie5_5_MoeForCausalLMNextN",
+    "Ernie5_5_MoeForCausalLMDSpark",
     "Qwen3NextForCausalLM",
     "Glm5NextForConditionalGeneration",
     "BailingMoeV2_5ForCausalLM",

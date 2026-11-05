@@ -2009,6 +2009,9 @@ class Envs:
     SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)
     SGLANG_OPT_USE_FLASHINFER_MHC = EnvBool(False)
     SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(True)
+    # ERNIE 5.5 Flash fusions not bit-exact with the eager ops:
+    # the input RMSNorm in mhc_pre, the VHA postmix in the wo_a fp8 quant.
+    SGLANG_OPT_ERNIE5_5_INEXACT_FUSION = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
     # Shard the ratio-1/2 index sources' dense prefill scores across the
     # attention-TP group and all-gather the selections, instead of every rank

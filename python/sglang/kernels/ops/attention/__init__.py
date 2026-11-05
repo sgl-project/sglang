@@ -602,3 +602,20 @@ register_kernel(
         ),
     )
 )
+
+register_kernel(
+    KernelSpec(
+        op="attention.append_window_to_topk",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.dsa.append_window_to_topk:append_window_to_topk",
+        capabilities=CUDA_ONLY,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.postmix_fp8_wo_a_quant",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.postmix_fp8_wo_a:postmix_fp8_wo_a_quant",
+        capabilities=CUDA_ONLY,
+    )
+)

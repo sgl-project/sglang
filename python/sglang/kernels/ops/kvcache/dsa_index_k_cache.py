@@ -111,7 +111,8 @@ class GetKAndS:
             seq_len_sum=seq_len_sum,
             max_seq_len=max_seq_len,
             page_size=pool.index_page_size,
-            index_head_dim=pool.index_head_dim,
+            # Both formats have four scale bytes; FP4 packs two values per byte.
+            index_head_dim=pool.index_head_dim // (2 if pool.use_fp4_indexer else 1),
         )
 
 

@@ -570,6 +570,11 @@ class TestShardedDSAIndexerWrite(unittest.TestCase):
         self.addCleanup(cm.__exit__, None, None, None)
 
     def test_cuda_writers_match_unsharded_bytes(self):
+        for fp4 in (False, True):
+            with self.subTest(fp4=fp4):
+                self._check_cuda_writers_match_unsharded_bytes(fp4)
+
+    def _check_cuda_writers_match_unsharded_bytes(self, use_fp4_indexer):
         from sglang.srt.layers.attention.dsa import dsa_indexer
 
         if not dsa_indexer._is_cuda:
@@ -605,6 +610,9 @@ class TestShardedDSAIndexerWrite(unittest.TestCase):
         indexer = SimpleNamespace(
             block_size=128,
             scale_fmt="ue8m0",
+            use_fp4_indexer=use_fp4_indexer,
+            is_neox_style=False,
+            fused_indexer_hadamard=False,
             k_norm=SimpleNamespace(
                 weight=torch.randn((128,), device=device, generator=generator),
                 bias=torch.randn((128,), device=device, generator=generator),
@@ -626,6 +634,7 @@ class TestShardedDSAIndexerWrite(unittest.TestCase):
             index_head_dim=128,
             enable_memory_saver=False,
             kv_cache_dim=576,
+            use_fp4_indexer=use_fp4_indexer,
         )
         reference = DSATokenToKVPool(num_pages * page_size, **pool_args)
         sharded = PageInterleaveDSATokenToKVPool.__new__(PageInterleaveDSATokenToKVPool)
@@ -649,7 +658,8 @@ class TestShardedDSAIndexerWrite(unittest.TestCase):
         ).roll(7)
         local_buffer = sharded.index_key_cache.get_local_buffer(0)
 
-        for fused_prepare in (False, True):
+        # Indexer disables the FP8-only fused preparation when using FP4.
+        for fused_prepare in (False,) if use_fp4_indexer else (False, True):
             with self.subTest(fused_prepare=fused_prepare):
                 for buffer in (reference_buffer, local_buffer, scratch):
                     buffer.zero_()
@@ -821,6 +831,7 @@ def _real_indexer_topk(check, backends, batch, layer_id, query, weights):
 
     indexer = SimpleNamespace(
         index_topk=2048,
+        use_fp4_indexer=False,
         num_init_tokens=0,
         num_local_tokens=0,
         logits_with_pp_recv=False,
@@ -850,7 +861,7 @@ def _real_indexer_topk(check, backends, batch, layer_id, query, weights):
         ):
             results.append(
                 dsa_indexer.Indexer._get_topk_ragged(
-                    indexer, False, batch, layer_id, query, weights, metadata
+                    indexer, False, batch, layer_id, (query, None), weights, metadata
                 )
             )
         starts, ends = metadata.get_indexer_kvcache_range()

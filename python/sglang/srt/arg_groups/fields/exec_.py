@@ -466,6 +466,10 @@ class ExecKernel(msgspec.Struct):
         bool,
         "Enable the experimental FP4 C4 indexer path for DeepSeek V4. Default keeps the existing indexer implementation.",
     ] = False
+    enable_fp4_indexer: A[
+        bool,
+        "Use FP4 queries and index-K cache for models using DSA Indexer. Default keeps the existing indexer implementation.",
+    ] = False
     enable_dsa_fused_indexer: A[
         Optional[bool],
         Arg(

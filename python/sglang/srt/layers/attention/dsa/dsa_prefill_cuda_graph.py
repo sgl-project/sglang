@@ -108,14 +108,14 @@ def pcg_dsa_indexer_prefill_split(
             False,
             forward_batch,
             layer_id,
-            q_fp8,
+            (q_fp8, None),
             weights,
             metadata,
             topk_result,
         )
         return
 
-    # Fused path stores K (no-Hadamard) and computes q_fp8 + head gate in the
+    # Fused path stores K and computes q_fp8 + head gate in the
     # fused kernels, sliced to the unpadded count. Single stream: the split op is
     # captured, so the dual-stream overlap is disabled.
     if indexer.use_dsa_indexer_fusion:
@@ -133,7 +133,7 @@ def pcg_dsa_indexer_prefill_split(
             False,
             forward_batch,
             layer_id,
-            q_fp8,
+            (q_fp8, None),
             weights,
             metadata,
             topk_result,
@@ -147,7 +147,8 @@ def pcg_dsa_indexer_prefill_split(
         enable_dual_stream=False,
         forward_batch=forward_batch,
     )
-    q_fp8, q_scale = act_quant(query, indexer.block_size, indexer.scale_fmt)
+    q_with_sf, q_scale = indexer._quantize_query(query, act_quant)
+    q, q_sf = q_with_sf
     # Reuse the compiled head-gate util shared with the eager path.
     weights = indexer._get_logits_head_gate(x, q_scale)
     # Store K cache + ragged top-k, sliced to the unpadded count and writing into
@@ -164,7 +165,7 @@ def pcg_dsa_indexer_prefill_split(
         False,
         forward_batch,
         layer_id,
-        q_fp8[:extend_num_tokens],
+        (q[:extend_num_tokens], q_sf[:extend_num_tokens] if q_sf is not None else None),
         weights,
         metadata,
         topk_result,

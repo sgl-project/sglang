@@ -18,8 +18,13 @@ from sglang.kernels.ops.kvcache.dsa_fused_store_index_cache import (
     can_use_dsa_fused_store,
     fused_store_index_k_cache,
 )
+from sglang.kernels.ops.kvcache.dsv4_fp4_index_k_cache import store_fp4_index_k_cache
+from sglang.kernels.ops.quantization.fp4_indexer_quant import (
+    quantize_fp4_indexer_tensor,
+)
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.compilation.compilation_config import register_split_op
+from sglang.srt.configs.model_config import is_ernie5_5
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.dsa_dcp import (
     dcp_all_gather_rows_,
@@ -319,11 +324,16 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         self.is_neox_style = is_neox_style
         self.block_size = block_size
         self.scale_fmt = scale_fmt
+        self.use_fp4_indexer = get_exec().kernel.enable_fp4_indexer
+        # V3.2 fuses adjacent-pair rope without the Hadamard rotation; a NeoX
+        # model keeps the rotation, which the fused kernels then apply too.
+        self.fused_indexer_hadamard = is_neox_style
         self.use_dsa_indexer_fusion = (
             _is_cuda
             and not envs.SGLANG_DISABLE_DSA_INDEXER_FUSION.get()
-            and not is_neox_style
+            and (not is_neox_style or is_ernie5_5(config))
             and not self.skip_rope
+            and not self.use_fp4_indexer
         )
         index_k_uses_rmsnorm = (
             config is not None
@@ -376,7 +386,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 self.hidden_size,
                 self.head_dim,
                 bias=False,
-                quant_config=quant_config,
+                # ERNIE 5.5's fp8 release keeps wk in bf16 with no ignored_layers,
+                # as DeepSeek-V4 does its bf16 indexer weights.
+                quant_config=None if is_ernie5_5(config) else quant_config,
                 prefix=add_prefix("wk", prefix),
             )
             self.weights_proj = ReplicatedLinear(
@@ -604,7 +616,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         return self._project_and_scale_head_gates_fp32(x)
 
     def _get_logits_head_gate(
-        self, x: Union[torch.Tensor, Tuple[torch.Tensor, ...]], q_scale: torch.Tensor
+        self,
+        x: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
+        q_scale: Optional[torch.Tensor],
     ):
         if self.bf16_head_gate:
             return self._apply_q_scale_and_softmax_scale(
@@ -628,23 +642,42 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
     @torch.compile(dynamic=True)
     def _get_logits_head_gate_fp32(
-        self, x: Union[torch.Tensor, Tuple[torch.Tensor, ...]], q_scale: torch.Tensor
+        self,
+        x: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
+        q_scale: Optional[torch.Tensor],
     ):
         weights = self._project_head_gates(x)
         weights = weights * self.n_heads**-0.5
-        weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
+        weights = weights.unsqueeze(-1)
+        if q_scale is not None:
+            weights = weights * q_scale
+        else:
+            weights = weights.float()
+        weights = weights * self.softmax_scale
         return weights
 
     @torch.compile(dynamic=True)
     def _apply_q_scale_and_softmax_scale(
-        self, weights: torch.Tensor, q_scale: torch.Tensor
+        self, weights: torch.Tensor, q_scale: Optional[torch.Tensor]
     ):
-        return weights.unsqueeze(-1) * q_scale * self.softmax_scale
+        weights = weights.unsqueeze(-1)
+        if q_scale is not None:
+            weights = weights * q_scale
+        else:
+            weights = weights.float()
+        return weights * self.softmax_scale
 
     @torch.compile(dynamic=True)
-    def _scale_head_gates(self, weights_raw: torch.Tensor, q_scale: torch.Tensor):
+    def _scale_head_gates(
+        self, weights_raw: torch.Tensor, q_scale: Optional[torch.Tensor]
+    ):
         weights = weights_raw * self.n_heads**-0.5
-        return weights.unsqueeze(-1) * q_scale * self.softmax_scale
+        weights = weights.unsqueeze(-1)
+        if q_scale is not None:
+            weights = weights * q_scale
+        else:
+            weights = weights.float()
+        return weights * self.softmax_scale
 
     def _fused_k_weights(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         kw, _ = self.wk_weights_proj(x)
@@ -740,12 +773,12 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         return q_fp8, weights.unsqueeze(-1)
 
     def _maybe_rotate(self, x: torch.Tensor) -> torch.Tensor:
-        # CUDA and HIP fused writers omit Hadamard; skip it on fallbacks too so
-        # the index-K cache matches the fused path that decode reads back.
+        # Match the fused writers, which decode reads back: the V3.2 fused paths
+        # omit Hadamard, the NeoX one keeps it.
         if (
-            self.use_dsa_indexer_fusion
-            or self.use_aiter_fused_fp8_writer
+            self.use_aiter_fused_fp8_writer
             or not self.apply_hadamard
+            or (self.use_dsa_indexer_fusion and not self.fused_indexer_hadamard)
         ):
             return x
         return rotate_activation(x)
@@ -1097,6 +1130,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     self._indexer_cos_sin_cache,
                     positions if rows is None else positions.index_select(0, rows),
                     page_size,
+                    hadamard=self.fused_indexer_hadamard,
+                    neox_style=self.is_neox_style,
                 )
             return
 
@@ -1108,6 +1143,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             self.k_norm.variance_epsilon,
             self._indexer_cos_sin_cache,
             positions,
+            hadamard=self.fused_indexer_hadamard,
+            neox_style=self.is_neox_style,
         )
         self._store_index_k_cache(
             forward_batch=forward_batch,
@@ -1116,6 +1153,17 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             act_quant=act_quant,
             out_cache_loc=out_cache_loc,
         )
+
+    def _quantize_query(self, query: torch.Tensor, act_quant):
+        """Keep FP4 scales with Q; FP8 scales are folded into the head gates."""
+        if self.use_fp4_indexer:
+            q, sf = quantize_fp4_indexer_tensor(query, rne=True)
+            return (
+                q.view(*query.shape[:-1], self.head_dim // 2),
+                sf.view(*query.shape[:-1]),
+            ), None
+        q, q_scale = act_quant(query, self.block_size, self.scale_fmt)
+        return (q, None), q_scale
 
     def _fused_q_prepare_and_store(
         self,
@@ -1130,7 +1178,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         enable_dual_stream: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # num_tokens (graph split-op contract) slices q/k/positions/out_cache_loc
-        # to the unpadded count; the returned q_fp8/weights are sliced to match.
+        # to the unpadded count; the returned q/weights are sliced to match.
         q_scale_gate = self.softmax_scale * self.n_heads**-0.5
         out_cache_loc = forward_batch.out_cache_loc
         if num_tokens is not None:
@@ -1160,6 +1208,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 q_scale_gate,
                 self._indexer_cos_sin_cache,
                 positions,
+                hadamard=self.fused_indexer_hadamard,
+                neox_style=self.is_neox_style,
             )
 
         # Two overlap stages: wq_b GEMM (alt) || wk_weights_proj GEMM (current),
@@ -1189,6 +1239,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             q_scale_gate,
             self._indexer_cos_sin_cache,
             positions,
+            hadamard=self.fused_indexer_hadamard,
+            neox_style=self.is_neox_style,
         )
         with torch.cuda.stream(self.alt_stream):
             self._fused_k_prepare_and_store(
@@ -1222,16 +1274,18 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         return pool.get_index_k_with_scale_buffer(layer_id=layer_id)
 
     @staticmethod
-    def _pad_heads_for_deep_gemm(q_fp8, weights):
+    def _pad_heads_for_deep_gemm(q, q_sf, weights):
         """Pad q and weights to 32 heads when num_heads < 32,
         so that block_q = 128/num_heads doesn't exceed seq_len_alignment(4)."""
-        num_heads = q_fp8.shape[1]
+        num_heads = q.shape[1]
         if num_heads >= 32:
-            return q_fp8, weights, num_heads
+            return q, q_sf, weights, num_heads
         target_heads = 32
-        q_fp8 = torch.nn.functional.pad(q_fp8, (0, 0, 0, target_heads - num_heads))
+        q = torch.nn.functional.pad(q, (0, 0, 0, target_heads - num_heads))
+        if q_sf is not None:
+            q_sf = torch.nn.functional.pad(q_sf, (0, target_heads - num_heads))
         weights = torch.nn.functional.pad(weights, (0, target_heads - num_heads))
-        return q_fp8, weights, num_heads
+        return q, q_sf, weights, num_heads
 
     def _mask_init_and_local_tokens(
         self,
@@ -1271,10 +1325,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         self,
         forward_batch: ForwardBatch,
         layer_id: int,
-        q_fp8: torch.Tensor,
+        q_with_sf: Tuple[torch.Tensor, Optional[torch.Tensor]],
         weights: torch.Tensor,
         metadata: BaseIndexerMetadata,
     ) -> torch.Tensor:
+        q, q_sf = q_with_sf
         if TYPE_CHECKING:
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
 
@@ -1303,7 +1358,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             block_tables = metadata.get_page_table_64()
 
         max_seq_len = block_tables.shape[1] * page_size
-        kv_cache_fp8 = self._get_index_k_read_buffer(get_token_to_kv_pool(), layer_id)
+        kv_cache = self._get_index_k_read_buffer(get_token_to_kv_pool(), layer_id)
 
         blocksize = page_size
         if (
@@ -1316,7 +1371,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # Reuse pre-computed schedule metadata if available (from init_forward_metadata),
         # otherwise fall back to computing it here.
         schedule_metadata = getattr(metadata, "paged_mqa_schedule_metadata", None)
-        assert len(q_fp8.shape) == 3
+        assert len(q.shape) == 3
         # attn_tp_size > 1 or MAX_LEN padding mode can leave padding in the
         # hidden states; q_offset is the real (unpadded) q length.
         q_offset = sum(metadata.get_dsa_extend_len_cpu())
@@ -1324,7 +1379,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         B = metadata.get_seqlens_int32().shape[0]
         next_n = q_offset // B if B > 0 else 0
         use_cute_dsl = (
-            self.paged_mqa_logits_backend.is_cutedsl()
+            q_sf is None
+            and self.paged_mqa_logits_backend.is_cutedsl()
             and not forward_batch.forward_mode.is_draft_extend_v2()
         )
         dsl_expand_factor, dsl_atom = 1, 1
@@ -1372,18 +1428,18 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     seqlens_32_2d, blocksize, self.sm_count
                 )
 
-        assert len(kv_cache_fp8.shape) == 2
+        assert len(kv_cache.shape) == 2
         block_kv = page_size
         num_heads_kv = 1
-        head_dim_with_sf = 132
-        kv_cache_fp8 = kv_cache_fp8.view(
-            kv_cache_fp8.shape[0], block_kv, num_heads_kv, head_dim_with_sf
+        head_dim_with_sf = 68 if self.use_fp4_indexer else 132
+        kv_cache = kv_cache.view(
+            kv_cache.shape[0], block_kv, num_heads_kv, head_dim_with_sf
         )
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
 
         # SM100 DeepGEMM paged MQA requires batch_size <= num_sms; chunk larger batches.
-        def _chunked_fp8_paged_mqa_logits(
+        def _chunked_paged_mqa_logits(
             q: torch.Tensor,
             kv_cache: torch.Tensor,
             w: torch.Tensor,
@@ -1396,9 +1452,14 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             batch_size, chunk_next_n = q.shape[:2]
             if batch_size == 0:
                 return torch.empty((0, max_len), dtype=torch.float32, device=q.device)
+            if q_sf is not None:
+                logits_fn = deep_gemm.fp8_fp4_paged_mqa_logits
+                scales = q_sf[:q_offset].view(q.shape[:-1])
+            else:
+                logits_fn = resolve_fp8_paged_mqa_logits_fn()
             if batch_size <= self.sm_count:
-                return resolve_fp8_paged_mqa_logits_fn()(
-                    q,
+                return logits_fn(
+                    (q, scales) if q_sf is not None else q,
                     kv_cache,
                     w,
                     context_lens,
@@ -1415,8 +1476,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     chunk_context_lens, blocksize, self.sm_count
                 )
                 logits_chunks.append(
-                    resolve_fp8_paged_mqa_logits_fn()(
-                        q[start:end],
+                    logits_fn(
+                        (q[start:end], scales[start:end])
+                        if q_sf is not None
+                        else q[start:end],
                         kv_cache,
                         w[start * chunk_next_n : end * chunk_next_n],
                         chunk_context_lens,
@@ -1430,8 +1493,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         if self.paged_mqa_logits_backend.is_aiter():
             logits = aiter_paged_mqa_logits(
-                q_fp8,
-                kv_cache_fp8,
+                q,
+                kv_cache,
                 weights,
                 seqlens_32,
                 block_tables,
@@ -1441,8 +1504,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             )
         elif _is_xpu:
             logits = sgl_fp8_paged_mqa_logits(
-                q_fp8[:q_offset],
-                kv_cache_fp8,
+                q[:q_offset],
+                kv_cache,
                 weights[:q_offset],
                 seqlens_32_2d,
                 block_tables,
@@ -1452,8 +1515,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             )
         elif use_cute_dsl:
             logits = cutedsl_paged_mqa_logits(
-                q_fp8,
-                kv_cache_fp8,
+                q,
+                kv_cache,
                 weights,
                 metadata.get_seqlens_int32(),
                 block_tables,
@@ -1471,9 +1534,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             )
         elif use_dg_native:
             logits = deepgemm_paged_mqa_logits_native(
-                _chunked_fp8_paged_mqa_logits,
-                q_fp8,
-                kv_cache_fp8,
+                _chunked_paged_mqa_logits,
+                q,
+                kv_cache,
                 weights,
                 seqlens_32_2d,
                 block_tables,
@@ -1485,9 +1548,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             )
         else:
             logits = deepgemm_paged_mqa_logits_split(
-                _chunked_fp8_paged_mqa_logits,
-                q_fp8,
-                kv_cache_fp8,
+                _chunked_paged_mqa_logits,
+                q,
+                kv_cache,
                 weights,
                 seqlens_32_2d,
                 block_tables,
@@ -1500,8 +1563,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         self._mask_init_and_local_tokens(logits, seqlens_32)
         topk_result = metadata.topk_transform(logits, self.index_topk)
         # Restore possible padding exist in the hidden states.
-        if not _is_hip and q_offset < q_fp8.shape[0]:
-            pad_len = q_fp8.shape[0] - q_offset
+        if not _is_hip and q_offset < q.shape[0]:
+            pad_len = q.shape[0] - q_offset
             padding = torch.full(
                 (pad_len, topk_result.shape[1]),
                 -1,
@@ -1532,11 +1595,12 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         enable_dual_stream: bool,
         forward_batch: ForwardBatch,
         layer_id: int,
-        q_fp8: torch.Tensor,
+        q_with_sf: Tuple[torch.Tensor, Optional[torch.Tensor]],
         weights: torch.Tensor,
         metadata: BaseIndexerMetadata,
         topk_result: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        q, q_sf = q_with_sf
         if TYPE_CHECKING:
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
 
@@ -1579,10 +1643,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         )
 
         batch_size = len(block_tables)
-        token_nums, _, _ = q_fp8.shape
-        device = q_fp8.device
+        token_nums, _, _ = q.shape
+        device = q.device
         device_index = device.index
-        assert device_index is not None, "q_fp8 must be on an indexed CUDA device"
+        assert device_index is not None, "q must be on an indexed CUDA device"
 
         if topk_result is None:
             topk_result = torch.full(
@@ -1596,26 +1660,30 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         indexer_seq_lens_cpu = metadata.get_indexer_seq_len_cpu()
         seq_len_sum = torch.sum(indexer_seq_lens_cpu).item()
         max_seq_len = torch.max(indexer_seq_lens_cpu).item()
-        k_fp8, k_scale = get_token_to_kv_pool().get_index_k_scale_buffer(
+        k, k_scale = get_token_to_kv_pool().get_index_k_scale_buffer(
             layer_id,
             metadata.get_indexer_seq_len(),
             block_tables,
             seq_len_sum,
             max_seq_len,
         )
-        if _is_fp8_fnuz:
-            k_fp8 = k_fp8.view(torch.float8_e4m3fnuz)
+        if self.use_fp4_indexer:
+            k = k.view(torch.int8)
+            k_scale = k_scale.view(torch.int32).squeeze(-1)
+        elif _is_fp8_fnuz:
+            k = k.view(torch.float8_e4m3fnuz)
+            k_scale = k_scale.view(torch.float32).squeeze(-1)
         else:
-            k_fp8 = k_fp8.view(torch.float8_e4m3fn)
+            k = k.view(torch.float8_e4m3fn)
+            k_scale = k_scale.view(torch.float32).squeeze(-1)
 
-        k_scale = k_scale.view(torch.float32).squeeze(-1)
-        kv_fp8 = (k_fp8, k_scale)
+        kv_with_sf = (k, k_scale)
 
         # Check if we need to chunk to avoid OOM
         seq_lens_expanded = metadata.get_seqlens_expanded()
         token_to_batch_idx = metadata.get_token_to_batch_idx()
         q_offset = ks.shape[0]
-        k_offset = k_fp8.shape[0]
+        k_offset = k.shape[0]
         # Every DCP rank holds the whole index K: score 1/W of the rows each, then
         # all-gather the top-k.
         split = _is_hip and getattr(metadata, "dcp_size", 1) > 1
@@ -1640,18 +1708,18 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         )
 
         if not need_chunk and not split:
-            assert q_fp8[:q_offset].shape[0] != 0
+            assert q[:q_offset].shape[0] != 0
             with self._with_real_sm_count():
                 if _is_hip:
                     from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 
-                    kv, scale = kv_fp8
+                    kv, scale = kv_with_sf
                     # Match the CUDA deep_gemm path (clean_logits=False): the topk
                     # transform masks invalid positions via ks/ke/lengths, so the
                     # -inf pre-fill of the [tokens x seq_len_kv] logits buffer is
                     # redundant and grows quadratically with context length.
                     logits = fp8_mqa_logits(
-                        q_fp8[:q_offset],
+                        q[:q_offset],
                         kv,
                         scale,
                         weights[:q_offset],
@@ -1661,25 +1729,37 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     )
                 elif _is_xpu:
                     logits = sgl_fp8_mqa_logits(
-                        q_fp8[:q_offset],
-                        kv_fp8,
+                        q[:q_offset],
+                        kv_with_sf,
                         weights[:q_offset],
                         ks,
                         ke,
                         clean_logits=False,
                     )
                 else:
-                    q_padded, w_padded, _ = self._pad_heads_for_deep_gemm(
-                        q_fp8[:q_offset], weights[:q_offset]
+                    q_padded, q_sf_padded, w_padded, _ = self._pad_heads_for_deep_gemm(
+                        q[:q_offset],
+                        q_sf[:q_offset] if self.use_fp4_indexer else None,
+                        weights[:q_offset],
                     )
-                    logits = resolve_fp8_mqa_logits_fn()(
-                        q_padded,
-                        kv_fp8,
-                        w_padded,
-                        ks,
-                        ke,
-                        clean_logits=False,
-                    )
+                    if q_sf_padded is not None:
+                        logits = deep_gemm.fp8_fp4_mqa_logits(
+                            (q_padded, q_sf_padded),
+                            kv_with_sf,
+                            w_padded,
+                            ks,
+                            ke,
+                            clean_logits=False,
+                        )
+                    else:
+                        logits = resolve_fp8_mqa_logits_fn()(
+                            q_padded,
+                            kv_with_sf,
+                            w_padded,
+                            ks,
+                            ke,
+                            clean_logits=False,
+                        )
             assert logits.shape[0] == len(seq_lens_expanded)
             assert logits.shape[1] == k_offset
 
@@ -1715,10 +1795,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 if _is_hip:
                     from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 
-                    kv, scale = kv_fp8
+                    kv, scale = kv_with_sf
                     # clean_logits=False: topk transform handles masking (see above)
                     logits_chunk = fp8_mqa_logits(
-                        q_fp8[start:end],
+                        q[start:end],
                         kv,
                         scale,
                         weights[start:end],
@@ -1728,25 +1808,37 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     )
                 elif _is_xpu:
                     logits_chunk = sgl_fp8_mqa_logits(
-                        q_fp8[start:end],
-                        kv_fp8,
+                        q[start:end],
+                        kv_with_sf,
                         weights[start:end],
                         ks[start:end],
                         ke[start:end],
                         clean_logits=False,
                     )
                 else:
-                    q_padded, w_padded, _ = self._pad_heads_for_deep_gemm(
-                        q_fp8[start:end], weights[start:end]
+                    q_padded, q_sf_padded, w_padded, _ = self._pad_heads_for_deep_gemm(
+                        q[start:end],
+                        q_sf[start:end] if self.use_fp4_indexer else None,
+                        weights[start:end],
                     )
-                    logits_chunk = resolve_fp8_mqa_logits_fn()(
-                        q_padded,
-                        kv_fp8,
-                        w_padded,
-                        ks[start:end],
-                        ke[start:end],
-                        clean_logits=False,
-                    )
+                    if q_sf_padded is not None:
+                        logits_chunk = deep_gemm.fp8_fp4_mqa_logits(
+                            (q_padded, q_sf_padded),
+                            kv_with_sf,
+                            w_padded,
+                            ks[start:end],
+                            ke[start:end],
+                            clean_logits=False,
+                        )
+                    else:
+                        logits_chunk = resolve_fp8_mqa_logits_fn()(
+                            q_padded,
+                            kv_with_sf,
+                            w_padded,
+                            ks[start:end],
+                            ke[start:end],
+                            clean_logits=False,
+                        )
 
             lengths_chunk = seq_lens_expanded[start:end]
             self._mask_init_and_local_tokens(logits_chunk, lengths_chunk, ks[start:end])
@@ -1901,6 +1993,17 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if hasattr(pool, "invalidate_index_buffer_for_layer"):
             pool.invalidate_index_buffer_for_layer(layer_id)
         if hasattr(pool, "_is_layer_owned") and not pool._is_layer_owned(layer_id):
+            return
+
+        if self.use_fp4_indexer:
+            for buf, loc, rows in _index_k_write_targets(pool, layer_id, out_cache_loc):
+                store_fp4_index_k_cache(
+                    key if rows is None else key.index_select(0, rows),
+                    buf,
+                    loc.contiguous(),
+                    page_size=pool.index_page_size,
+                    rne=True,
+                )
             return
 
         if (
@@ -2076,6 +2179,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 )
                 return maybe_capture_indexer_topk(layer_id, fused_topk)
 
+        # FP4 uses the original BF16 activation for both wk and the head gates.
+        if self.use_fp4_indexer and isinstance(x, tuple) and len(x) >= 3:
+            x = x[2]
+
         # When weights_proj is LoRA-wrapped, use an eager module call so the
         # wrapper owns base+delta and no LoRA kernel runs under torch.compile.
         # Fusion folds weights_proj into wk_weights_proj, so weights_proj is
@@ -2089,17 +2196,19 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             and not in_piecewise_or_breakable_cuda_graph
             and not weights_proj_lora
         ):
-            q_fp8, weights = self._aiter_fused_fp8_prepare_and_store(
+            q, weights = self._aiter_fused_fp8_prepare_and_store(
                 x, q_lora, positions, forward_batch, layer_id
             )
+            q_with_sf = (q, None)
         elif (
             self.use_dsa_indexer_fusion
             and not in_piecewise_or_breakable_cuda_graph
             and forward_batch.attn_cp_metadata is None
         ):
-            q_fp8, weights = self._fused_q_prepare_and_store(
+            q, weights = self._fused_q_prepare_and_store(
                 x, q_lora, positions, forward_batch, layer_id, act_quant
             )
+            q_with_sf = (q, None)
         elif (
             is_graph_dsa_split_op_surface(forward_batch)
             and not self.dsa_enable_prefill_cp
@@ -2153,7 +2262,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             query, key, weights_raw = self._get_q_k_bf16(
                 q_lora, x, positions, enable_dual_stream, forward_batch=forward_batch
             )
-            q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
+            q_with_sf, q_scale = self._quantize_query(query, act_quant)
             with torch.cuda.stream(self.alt_stream):
                 self._store_index_k_cache(
                     forward_batch=forward_batch,
@@ -2179,7 +2288,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
 
-                q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
+                q_with_sf, q_scale = self._quantize_query(query, act_quant)
                 with torch.cuda.stream(self.alt_stream):
                     self._store_index_k_cache(
                         forward_batch=forward_batch,
@@ -2189,7 +2298,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     )
                 current_stream.wait_stream(self.alt_stream)
             elif not in_piecewise_or_breakable_cuda_graph:
-                q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
+                q_with_sf, q_scale = self._quantize_query(query, act_quant)
                 self._store_index_k_cache(
                     forward_batch=forward_batch,
                     layer_id=layer_id,
@@ -2198,10 +2307,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 )
             else:
                 # Graph paths not handled by the full DSA indexer split op
-                # still need q_fp8 for paged topk and q_scale for
+                # still need q for paged topk and q_scale for
                 # logits_head_gate_graph. K-cache storage is handled by the
                 # full graph split path when prefill requires it.
-                q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
+                q_with_sf, q_scale = self._quantize_query(query, act_quant)
 
             # aiter (ROCm gfx95): the 3-tuple (fp8, scale, bf16) from
             # fused_rms_fp8_group_quant is passed directly to _get_logits_head_gate,
@@ -2296,7 +2405,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 or forward_batch.forward_mode.is_draft_extend_v2()
             ):
                 topk_result = self._get_topk_paged(
-                    forward_batch, layer_id, q_fp8, weights, metadata
+                    forward_batch,
+                    layer_id,
+                    q_with_sf,
+                    weights,
+                    metadata,
                 )
             else:
                 # In-graph (PCG/BCG) non-CP prefill is handled earlier by the
@@ -2310,7 +2423,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     enable_dual_stream,
                     forward_batch,
                     layer_id,
-                    q_fp8,
+                    q_with_sf,
                     weights,
                     metadata,
                 )

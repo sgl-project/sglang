@@ -32,10 +32,12 @@ from sglang.srt.configs.model_config import (
     get_unlimited_ocr_v2_sparse_config,
     is_deepseek_dsa,
     is_deepseek_v4,
+    is_ernie5_5,
     is_kimi_k31,
     is_minimax_sparse,
     is_unlimited_ocr_v2,
     mla_attention_dcp_size,
+    uses_compressed_kv_attention,
 )
 from sglang.srt.distributed.utils import get_pp_indices
 from sglang.srt.environ import envs
@@ -661,7 +663,7 @@ class KVCacheConfigurator:
         # dtype attributes initialized so _init_pools can share one code path.
         c4_state_dtype: Optional[torch.dtype] = None
         c128_state_dtype: Optional[torch.dtype] = None
-        if is_deepseek_v4(self.model_config.hf_config):
+        if uses_compressed_kv_attention(self.model_config.hf_config):
             c4_state_dtype, c128_state_dtype = _get_dsv4_compress_state_dtypes()
 
         return _PoolSizes(
@@ -832,7 +834,7 @@ class KVCacheConfigurator:
 
         # Initialize token_to_kv_pool
         is_dsa_model = is_deepseek_dsa(self.model_config.hf_config)
-        is_dsv4_model = is_deepseek_v4(self.model_config.hf_config)
+        is_dsv4_model = uses_compressed_kv_attention(self.model_config.hf_config)
 
         self._validate_prefill_only_disable_kv_cache_pool_family(
             is_dsa_model, is_dsv4_model, current_platform
@@ -926,9 +928,9 @@ class KVCacheConfigurator:
 
     def _unified_window_and_state(self) -> tuple:
         """Whether this model's unified plan holds a window sub-pool and a state
-        sub-pool. DeepSeek-V4 is not served by the unified pool."""
+        sub-pool. Compressed-KV models (DeepSeek-V4, ERNIE 5.5) are not served by it."""
         has_state = self.mambaish_config is not None
-        has_window = self.is_hybrid_swa and not is_deepseek_v4(
+        has_window = self.is_hybrid_swa and not uses_compressed_kv_attention(
             self.model_config.hf_config
         )
         return has_window, has_state
@@ -1956,6 +1958,26 @@ class KVCacheConfigurator:
             kv_layout_kwargs = dict(
                 kv_layout=kv_layout, compressed_kv_layout=compressed_kv_layout
             )
+            hf_config = self.model_config.hf_config
+            # The target, and an MTP draft, keep MLA layers; a DSpark draft has none.
+            if is_ernie5_5(hf_config) and hf_config.mla_layer_ids:
+                from sglang.srt.mem_cache.ernie55_memory_pool import (
+                    Ernie5_5TokenToKVPool,
+                )
+
+                pool_cls = Ernie5_5TokenToKVPool
+                kv_layout_kwargs.update(
+                    # Only this pipeline stage's MLA layers get latent storage.
+                    mla_layer_ids=[
+                        i
+                        for i in hf_config.mla_layer_ids
+                        if self.layer_info.start_layer <= i < self.layer_info.end_layer
+                    ],
+                    mla_kv_lora_rank=hf_config.hybrid_mla_kv_lora_rank,
+                    mla_qk_rope_head_dim=hf_config.hybrid_mla_qk_rope_head_dim,
+                    index_head_dim=hf_config.index_head_dim,
+                    use_fp4_indexer=get_exec().kernel.enable_fp4_indexer,
+                )
 
         unified_fp8 = unified_fp8_for_dsv4_pool(
             is_draft_worker=self.is_draft_worker,
@@ -2225,6 +2247,8 @@ class KVCacheConfigurator:
             pool_kwargs["layer_shard_size"] = dsa_cp_layer_shard_size
         else:
             PoolCls = dsa_pool_class
+        if get_exec().kernel.enable_fp4_indexer:
+            pool_kwargs["use_fp4_indexer"] = True
         if self.loc_space_scale > 1:
             pool_kwargs["dcp_replicated"] = True
         if _should_elide_dsa_index_k(is_draft_worker=self.is_draft_worker):
@@ -2295,6 +2319,8 @@ class KVCacheConfigurator:
                     kv_cache_dtype=self.kv_cache_dtype,
                 ),
             )
+            if get_exec().kernel.enable_fp4_indexer:
+                full_pool_kwargs["use_fp4_indexer"] = True
 
         return SWAKVPool(
             size=full_max_total_num_tokens,
@@ -2518,6 +2544,7 @@ class KVCacheConfigurator:
                 dsa_index_kpool = get_dsa_index_kpool(self.model_config.hf_config)
                 extra_args.update(
                     use_dsa=True,
+                    use_fp4_indexer=get_exec().kernel.enable_fp4_indexer,
                     index_head_dim=get_dsa_index_head_dim(self.model_config.hf_config),
                     kv_cache_dim=calculate_mla_kv_cache_dim(
                         model_config=self.model_config,

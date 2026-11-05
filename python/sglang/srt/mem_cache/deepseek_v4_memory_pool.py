@@ -563,6 +563,8 @@ DSV41_INDEX_PAGE_SIZE = dsv41_index_page_size()
 class DeepSeekV4IndexerPool(KVCache):
     quant_block_size = 128
     index_k_with_scale_buffer_dtype = torch.uint8
+    # GetKAndS reads it; this pool keeps fp8 index keys.
+    use_fp4_indexer = False
 
     def __init__(
         self,
@@ -1188,7 +1190,8 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.qk_rope_head_dim = qk_rope_head_dim
         self.indexer_head_dim = indexer_head_dim
 
-        stage_layer_num = len(stage_ratios)
+        # Layers without SWA (a subclass's full-attention ones) get no buffer.
+        swa_layer_num = len(self._swa_layer_ids())
         kv_pool_cls: type = DeepSeekV4SingleKVPool
 
         self.request_window = None
@@ -1218,7 +1221,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             self.unified_kv_pool = None
             window_spec = RequestWindowSpec.create(
                 num_slots=self.num_req_slots,
-                layers=stage_layer_num,
+                layers=swa_layer_num,
                 page_size=swa_page_size,
                 capacity=self.sliding_window + (online_mtp_max_draft_tokens or 0),
                 workspace_rows=request_window_workspace_rows(
@@ -1246,7 +1249,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 size=self.num_req_slots * self.swa_req_ring_size,
                 page_size=swa_kv_page_size,
                 dtype=dtype,
-                layer_num=stage_layer_num,
+                layer_num=swa_layer_num,
                 device=device,
                 enable_memory_saver=enable_memory_saver,
                 global_page_size=swa_page_size,
@@ -1291,7 +1294,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 size=swa_size,
                 page_size=swa_kv_page_size,
                 dtype=dtype,
-                layer_num=stage_layer_num,
+                layer_num=swa_layer_num,
                 device=device,
                 enable_memory_saver=enable_memory_saver,
                 global_page_size=swa_page_size,
@@ -1494,11 +1497,12 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         if self.swa_kv_pool is None:
             return None
         info = self.swa_kv_pool.paged_buffer_info()
-        if len(info.buffers) != len(self.stage_layer_ids):
+        swa_layer_num = len(self._swa_layer_ids())
+        if len(info.buffers) != swa_layer_num:
             raise ValueError(
                 "DeepSeek V4 SWA KV pool must be PP-stage-local: "
                 f"got {len(info.buffers)} buffers for "
-                f"{len(self.stage_layer_ids)} local layers"
+                f"{swa_layer_num} local SWA layers"
             )
         return info
 
@@ -1516,7 +1520,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 DevicePoolInfo(
                     pool_name=PoolName.SWA,
                     indices_from_pool=PoolName.SWA,
-                    layer_ids=self.stage_layer_ids,
+                    layer_ids=tuple(self._swa_layer_ids()),
                     buffer_info=swa,
                 )
             )
@@ -2140,6 +2144,10 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             "Only c4 layers have indexer states."
         )
         return indexer_compress_state_pool
+
+    def _swa_layer_ids(self) -> list[int]:
+        """Global ids of this stage's layers that own an SWA buffer, in buffer order."""
+        return list(self.stage_layer_ids)
 
     def _swa_local_layer_id(self, layer_id: int) -> int:
         """Convert absolute model layer_id to SWA-pool-local (PP-stage-local) index."""

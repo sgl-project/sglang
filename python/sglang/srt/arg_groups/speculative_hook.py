@@ -677,10 +677,16 @@ def _handle_dspark(server_args: ServerArgs) -> None:
     if cfg.attn_dp_size > 1:
         if not cfg.enable_dp_lm_head:
             raise ValueError("DSpark with dp attention requires --enable-dp-lm-head.")
-        if not _is_npu and cfg.moe_a2a_backend not in ("none", "megamoe", "mori"):
+        allowed_a2a_backends = ("none", "megamoe", "mori")
+        target_arch = model_config_of(server_args).hf_config.architectures[0]
+        if target_arch == "Ernie5_5_MoeForCausalLM":
+            # DeepEP is validated on ERNIE 5.5 Flash only: static ragged verify
+            # gives it EAGLE's per-rank shapes. Its override rejects MegaMoE.
+            allowed_a2a_backends = ("none", "deepep")
+        if not _is_npu and cfg.moe_a2a_backend not in allowed_a2a_backends:
             raise ValueError(
-                "DSpark with dp attention supports moe_a2a_backend 'none' "
-                "(built-in TP MoE), 'megamoe', or 'mori', got "
+                "DSpark with dp attention supports moe_a2a_backend "
+                f"{', '.join(map(repr, allowed_a2a_backends))} for this model, got "
                 f"{cfg.moe_a2a_backend!r}."
             )
         if not _is_npu and (
@@ -1499,5 +1505,8 @@ def _auto_choose_speculative_params(server_args: ServerArgs, model_arch: str) ->
         return (3, 1, 4)
     elif model_arch in ["Grok1ForCausalLM", "Grok1VForCausalLM"]:
         return (5, 4, 8)
+    elif model_arch == "Ernie5_5_MoeForCausalLM":
+        # One ECHO step; the cookbook's low-latency recipes pass 2.
+        return (1, 1, 2)
     else:
         return (3, 1, 4)

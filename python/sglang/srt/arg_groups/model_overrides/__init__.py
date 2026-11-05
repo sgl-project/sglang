@@ -15,6 +15,7 @@ from sglang.srt.arg_groups.model_overrides import deepseek_v2  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import deepseek_v4  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import embedding_gemma2  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import ernie45_vl  # noqa: F401
+from sglang.srt.arg_groups.model_overrides import ernie55  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import exaone  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import falcon_h1  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import flint  # noqa: F401
