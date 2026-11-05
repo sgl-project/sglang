@@ -81,7 +81,7 @@ class Numerics(msgspec.Struct, frozen=True):
 
 
 class BuildContext(msgspec.Struct, frozen=True):
-    widths: tuple[int, ...]  # step rows to build, ascending
+    widths: tuple[int, ...]  # decode step rows to build, ascending
     tokens_per_request: int
     deadline_s: float  # every cross-GPU wait's deadline, below --watchdog-timeout
     # SGLang's runtime state for this model (sglang.srt.kernel_plugins.nvidia.binding)
