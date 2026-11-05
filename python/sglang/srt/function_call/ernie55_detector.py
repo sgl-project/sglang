@@ -36,7 +36,14 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
-from sglang.srt.function_call.utils import get_schema_properties
+from sglang.srt.function_call.utils import (
+    NULL_WORDS,
+    STRING_TYPES,
+    convert_param_value_with_types,
+    extract_types_from_schema,
+    get_schema_properties,
+    resolve_local_refs,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -47,49 +54,14 @@ _INVOKE_OPEN = re.compile(r'<invoke name="([^>]+)">')
 _PARAM_OPEN = re.compile(r'<parameter name="([^>]+)">')
 _PARAM_END = "</parameter>"
 _FUNCTION_END = "</invoke>"
-# A string parameter whose whole value is one of these converts to null.
-_NULL_WORDS = ("null", "none", "nil")
-_MAX_NULL_WORD = max(map(len, _NULL_WORDS))
-_STRING_TYPES = {"string", "str", "text"}
-_NULLABLE_STRING_TYPES = _STRING_TYPES | {"null"}
+_MAX_NULL_WORD = max(map(len, NULL_WORDS))
+_NULLABLE_STRING_TYPES = STRING_TYPES | {"null"}
 
 
 def _json_string_body(text: str) -> str:
     """JSON-escape text without the quotes, as json.dumps(ensure_ascii=False) does;
     the escaping is per character, so escaped pieces concatenate."""
     return encode_basestring(text)[1:-1]
-
-
-def _lookup_pointer(root: Any, ref: str) -> Any:
-    """Resolve a local JSON pointer such as "#/$defs/X" against root."""
-    node = root
-    for part in ref[1:].split("/")[1:]:
-        part = part.replace("~1", "/").replace("~0", "~")
-        if isinstance(node, dict):
-            node = node.get(part)
-        elif isinstance(node, list) and part.isdigit() and int(part) < len(node):
-            node = node[int(part)]
-        else:
-            return None
-    return node
-
-
-def _resolve_refs(schema: Any, root: Any, seen: tuple = ()) -> Any:
-    """Inline local $ref at the levels _extract_types_from_schema reads,
-    the node itself and its anyOf/oneOf/allOf branches; cycles stop at the ref."""
-    if not isinstance(schema, dict):
-        return schema
-    ref = schema.get("$ref")
-    if isinstance(ref, str) and ref.startswith("#") and ref not in seen:
-        target = _lookup_pointer(root, ref)
-        if isinstance(target, dict):
-            siblings = {k: v for k, v in schema.items() if k != "$ref"}
-            return _resolve_refs({**target, **siblings}, root, seen + (ref,))
-    resolved = dict(schema)
-    for keyword in ("anyOf", "oneOf", "allOf"):
-        if isinstance(schema.get(keyword), list):
-            resolved[keyword] = [_resolve_refs(b, root, seen) for b in schema[keyword]]
-    return resolved
 
 
 class Ernie5_5Detector(BaseFormatDetector):
@@ -139,118 +111,6 @@ class Ernie5_5Detector(BaseFormatDetector):
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         normal, calls = self._extract(text, tools)
         return StreamingParseResult(normal_text=normal, calls=calls)
-
-    def _extract_types_from_schema(self, schema: Any) -> list[str]:
-        if schema is None:
-            return ["string"]
-
-        if not isinstance(schema, dict):
-            return ["string"]
-
-        types: set[str] = set()
-
-        if "type" in schema:
-            type_value = schema["type"]
-            if isinstance(type_value, str):
-                types.add(type_value)
-            elif isinstance(type_value, list):
-                for t in type_value:
-                    if isinstance(t, str):
-                        types.add(t)
-
-        if "enum" in schema and isinstance(schema["enum"], list) and schema["enum"]:
-            for value in schema["enum"]:
-                if value is None:
-                    types.add("null")
-                elif isinstance(value, bool):
-                    types.add("boolean")
-                elif isinstance(value, int):
-                    types.add("integer")
-                elif isinstance(value, float):
-                    types.add("number")
-                elif isinstance(value, str):
-                    types.add("string")
-                elif isinstance(value, list):
-                    types.add("array")
-                elif isinstance(value, dict):
-                    types.add("object")
-
-        for choice_field in ("anyOf", "oneOf", "allOf"):
-            if choice_field in schema and isinstance(schema[choice_field], list):
-                for choice in schema[choice_field]:
-                    extracted = self._extract_types_from_schema(choice)
-                    types.update(extracted)
-
-        if not types:
-            return ["string"]
-
-        return list(types)
-
-    def _convert_param_value_with_types(
-        self, value: str, param_types: list[str]
-    ) -> Any:
-        normalized_types = [t.lower() for t in param_types]
-
-        # A non-nullable string keeps its value verbatim: "null"/"none"/"nil"
-        # are ordinary string content, not JSON null. Coercing them would also
-        # diverge this path from the streamed one (cf. minimax_m3).
-        if "null" not in normalized_types and any(
-            t in _STRING_TYPES for t in normalized_types
-        ):
-            return value
-        if value.lower() in _NULL_WORDS:
-            return None
-
-        type_priority = [
-            "integer",
-            "int",
-            "number",
-            "float",
-            "boolean",
-            "bool",
-            "object",
-            "array",
-            "string",
-            "str",
-            "text",
-        ]
-
-        for param_type in type_priority:
-            if param_type not in normalized_types:
-                continue
-
-            if param_type in ["string", "str", "text"]:
-                return value
-            elif param_type in ["integer", "int"]:
-                try:
-                    return int(value)
-                except (ValueError, TypeError):
-                    continue
-            elif param_type in ["number", "float"]:
-                try:
-                    val = float(value)
-                    return val if val != int(val) else int(val)
-                # int() of an infinity ("inf", "1e999") raises OverflowError.
-                except (ValueError, TypeError, OverflowError):
-                    continue
-            elif param_type in ["boolean", "bool"]:
-                lower_val = value.lower().strip()
-                if lower_val in ["true", "1", "yes", "on"]:
-                    return True
-                elif lower_val in ["false", "0", "no", "off"]:
-                    return False
-                continue
-            elif param_type in ["object", "array"]:
-                try:
-                    return json.loads(value)
-                except json.JSONDecodeError:
-                    continue
-
-        # Fallback: try JSON parse, then return as string
-        try:
-            return json.loads(value)
-        except json.JSONDecodeError:
-            return value
 
     def parse_streaming_increment(
         self, new_text: str, tools: List[Tool]
@@ -347,9 +207,9 @@ class Ernie5_5Detector(BaseFormatDetector):
         types = {
             t.lower() for t in self._param_types(self._invoke_name, self._param, tools)
         }
-        # _convert_param_value_with_types returns raw text (or None for a null word)
+        # convert_param_value_with_types returns raw text (or None for a null word)
         # for exactly these types, so the value can be sent as it grows.
-        self._param_is_string = bool(types & _STRING_TYPES) and (
+        self._param_is_string = bool(types & STRING_TYPES) and (
             types <= _NULLABLE_STRING_TYPES
         )
         self._buf = self._buf[param.end() :]
@@ -409,7 +269,7 @@ class Ernie5_5Detector(BaseFormatDetector):
             # The opening quote rules out null,
             # so wait while the value may still be a null word.
             if end <= _MAX_NULL_WORD and any(
-                word.startswith(raw[:end].lower()) for word in _NULL_WORDS
+                word.startswith(raw[:end].lower()) for word in NULL_WORDS
             ):
                 return
             prefix, sent = self._open_key(self._param) + '"', 0
@@ -560,7 +420,7 @@ class Ernie5_5Detector(BaseFormatDetector):
     def _parse_parameter(
         self, fname: str, pname: str, pval: str, tools: List[Tool]
     ) -> Any:
-        return self._convert_param_value_with_types(
+        return convert_param_value_with_types(
             pval, self._param_types(fname, pname, tools)
         )
 
@@ -570,8 +430,8 @@ class Ernie5_5Detector(BaseFormatDetector):
         root = next(
             (t.function.parameters for t in tools if t.function.name == fname), None
         )
-        schema = _resolve_refs(get_schema_properties(root).get(pname), root)
-        return self._extract_types_from_schema(schema)
+        schema = resolve_local_refs(get_schema_properties(root).get(pname), root)
+        return extract_types_from_schema(schema)
 
     def structure_info(self) -> _GetInfoFunc:
         # get_structural_tag builds the constraint natively.

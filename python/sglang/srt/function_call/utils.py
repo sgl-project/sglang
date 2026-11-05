@@ -1,4 +1,5 @@
 import ast
+import json
 import threading
 import warnings
 from json import JSONDecodeError, JSONDecoder
@@ -342,6 +343,157 @@ def get_schema_properties(schema: Any) -> Dict[str, Any]:
                 for key, value in get_schema_properties(branch).items():
                     merged.setdefault(key, value)
     return merged
+
+
+def _lookup_json_pointer(root: Any, ref: str) -> Any:
+    """Resolve a local JSON pointer such as "#/$defs/X" against root."""
+    node = root
+    for part in ref[1:].split("/")[1:]:
+        part = part.replace("~1", "/").replace("~0", "~")
+        if isinstance(node, dict):
+            node = node.get(part)
+        elif isinstance(node, list) and part.isdigit() and int(part) < len(node):
+            node = node[int(part)]
+        else:
+            return None
+    return node
+
+
+def resolve_local_refs(schema: Any, root: Any, seen: tuple = ()) -> Any:
+    """Inline local $ref at the levels extract_types_from_schema reads,
+    the node itself and its anyOf/oneOf/allOf branches; cycles stop at the ref."""
+    if not isinstance(schema, dict):
+        return schema
+    ref = schema.get("$ref")
+    if isinstance(ref, str) and ref.startswith("#") and ref not in seen:
+        target = _lookup_json_pointer(root, ref)
+        if isinstance(target, dict):
+            siblings = {k: v for k, v in schema.items() if k != "$ref"}
+            return resolve_local_refs({**target, **siblings}, root, seen + (ref,))
+    resolved = dict(schema)
+    for keyword in ("anyOf", "oneOf", "allOf"):
+        if isinstance(schema.get(keyword), list):
+            resolved[keyword] = [
+                resolve_local_refs(b, root, seen) for b in schema[keyword]
+            ]
+    return resolved
+
+
+# A string parameter whose whole value is one of these converts to null.
+NULL_WORDS = ("null", "none", "nil")
+STRING_TYPES = {"string", "str", "text"}
+
+
+def extract_types_from_schema(schema: Any) -> list[str]:
+    if schema is None:
+        return ["string"]
+
+    if not isinstance(schema, dict):
+        return ["string"]
+
+    types: set[str] = set()
+
+    if "type" in schema:
+        type_value = schema["type"]
+        if isinstance(type_value, str):
+            types.add(type_value)
+        elif isinstance(type_value, list):
+            for t in type_value:
+                if isinstance(t, str):
+                    types.add(t)
+
+    if "enum" in schema and isinstance(schema["enum"], list) and schema["enum"]:
+        for value in schema["enum"]:
+            if value is None:
+                types.add("null")
+            elif isinstance(value, bool):
+                types.add("boolean")
+            elif isinstance(value, int):
+                types.add("integer")
+            elif isinstance(value, float):
+                types.add("number")
+            elif isinstance(value, str):
+                types.add("string")
+            elif isinstance(value, list):
+                types.add("array")
+            elif isinstance(value, dict):
+                types.add("object")
+
+    for choice_field in ("anyOf", "oneOf", "allOf"):
+        if choice_field in schema and isinstance(schema[choice_field], list):
+            for choice in schema[choice_field]:
+                extracted = extract_types_from_schema(choice)
+                types.update(extracted)
+
+    if not types:
+        return ["string"]
+
+    return list(types)
+
+
+def convert_param_value_with_types(value: str, param_types: list[str]) -> Any:
+    normalized_types = [t.lower() for t in param_types]
+
+    # A non-nullable string keeps its value verbatim: "null"/"none"/"nil"
+    # are ordinary string content, not JSON null. Coercing them would also
+    # diverge this path from the streamed one (cf. minimax_m3).
+    if "null" not in normalized_types and any(
+        t in STRING_TYPES for t in normalized_types
+    ):
+        return value
+    if value.lower() in NULL_WORDS:
+        return None
+
+    type_priority = [
+        "integer",
+        "int",
+        "number",
+        "float",
+        "boolean",
+        "bool",
+        "object",
+        "array",
+        "string",
+        "str",
+        "text",
+    ]
+
+    for param_type in type_priority:
+        if param_type not in normalized_types:
+            continue
+
+        if param_type in ["string", "str", "text"]:
+            return value
+        elif param_type in ["integer", "int"]:
+            try:
+                return int(value)
+            except (ValueError, TypeError):
+                continue
+        elif param_type in ["number", "float"]:
+            try:
+                val = float(value)
+                return val if val != int(val) else int(val)
+            # int() of an infinity ("inf", "1e999") raises OverflowError.
+            except (ValueError, TypeError, OverflowError):
+                continue
+        elif param_type in ["boolean", "bool"]:
+            lower_val = value.lower().strip()
+            if lower_val in ["true", "1", "yes", "on"]:
+                return True
+            elif lower_val in ["false", "0", "no", "off"]:
+                return False
+            continue
+        elif param_type in ["object", "array"]:
+            try:
+                return json.loads(value)
+            except json.JSONDecodeError:
+                continue
+
+    # Fallback: try JSON parse, then return as string
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return value
 
 
 def infer_type_from_json_schema(schema: Dict[str, Any]) -> Optional[str]:
