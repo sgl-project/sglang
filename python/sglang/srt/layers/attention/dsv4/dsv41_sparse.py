@@ -13,6 +13,7 @@ from torch import nn
 
 from sglang.kernels.ops.gemm.bf16_fp32 import linear_bf16_fp32
 from sglang.kernels.ops.gemm.router_gemv_hip import rocm_gemv_split_k_max_tokens
+from sglang.kernels.ops.gemm.tiny_gemm import tiny_gemm_bf16
 from sglang.kernels.ops.layernorm.rmsnorm_fp32 import rmsnorm_fp32
 from sglang.kernels.ops.quantization.fp4_fake_quant import (
     fake_quant_compressed_kv,
@@ -172,13 +173,21 @@ class DeepseekV41Compressor(nn.Module):
         return (kv2 * score2.softmax(dim=1)).sum(dim=1)
 
 
-def _small_weights_proj_max_m(n_heads: int, hidden_size: int) -> int:
-    # -1 means the device or checkpoint shape requires the linear fallback.
-    if not torch.cuda.is_available() or torch.version.hip is not None:
-        return -1
-    from sglang.kernels.ops.gemm.small_gemm_bf16 import MAX_M, can_use_n32k5120_gemm
+# Decode batches up to 32 rows take the tiny GEMM for the two shapes it was measured
+# on: weights_proj (32 heads x 5120) and wk (128 x 512).
+_TINY_GEMM_SHAPES = ((32, 5120), (128, 512))
 
-    return MAX_M if can_use_n32k5120_gemm(n_heads, hidden_size, 1) else -1
+
+def _tiny_gemm_max_m(n: int, k: int) -> int:
+    # -1 means the device or checkpoint shape requires the linear fallback.
+    if (
+        (n, k) not in _TINY_GEMM_SHAPES
+        or not torch.cuda.is_available()
+        or torch.version.hip is not None
+        or torch.cuda.get_device_capability()[0] < 9
+    ):
+        return -1
+    return 32
 
 
 class DeepseekV41Indexer(nn.Module):
@@ -227,7 +236,7 @@ class DeepseekV41Indexer(nn.Module):
             n=self.n_heads, k=config.hidden_size, weight_dtype=torch.bfloat16
         )
         # The decode GEMM matches tiny_gemm's reduction order, not cuBLAS's.
-        self.weights_proj_small_max_m = _small_weights_proj_max_m(
+        self.weights_proj_small_max_m = _tiny_gemm_max_m(
             self.n_heads, config.hidden_size
         )
         if self.owns_k:
@@ -235,18 +244,11 @@ class DeepseekV41Indexer(nn.Module):
                 head_dim, self.index_head_dim, bias=False, dtype=torch.bfloat16
             )
             self.k_norm = RMSNorm(self.index_head_dim, config.rms_norm_eps)
+            self.wk_small_max_m = _tiny_gemm_max_m(self.index_head_dim, head_dim)
 
     def forward_wk(self, latent: torch.Tensor) -> torch.Tensor:
-        from sglang.kernels.ops.gemm.small_gemm_bf16 import (
-            can_use_n128k512_gemm,
-            n128k512_gemm_bf16,
-        )
-
-        # The JIT kernel raises rather than falling back on an unsupported shape.
-        if can_use_n128k512_gemm(
-            self.index_head_dim, latent.shape[-1], latent.shape[0]
-        ):
-            return n128k512_gemm_bf16(latent, self.wk.weight)
+        if 0 < latent.shape[0] <= self.wk_small_max_m:
+            return tiny_gemm_bf16(latent, self.wk.weight)
         return self.wk(latent)
 
     def index_keys(self, latent: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
@@ -269,9 +271,7 @@ class DeepseekV41Indexer(nn.Module):
     def head_weights_raw(self, x: torch.Tensor) -> torch.Tensor:
         """`weights_proj(x)` before the scale, [tokens, n_heads] bf16."""
         if 0 < x.shape[0] <= self.weights_proj_small_max_m and x.is_cuda:
-            from sglang.kernels.ops.gemm.small_gemm_bf16 import n32k5120_gemm_bf16
-
-            return n32k5120_gemm_bf16(x, self.weights_proj.weight)
+            return tiny_gemm_bf16(x, self.weights_proj.weight)
         w, _ = self.weights_proj(x)
         return w
 
