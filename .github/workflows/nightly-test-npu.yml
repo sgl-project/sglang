@@ -266,25 +266,6 @@ jobs:
       device_type_for_deps: 'a3'
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
 
-  # TEMP: single-case validation for the qwen3.6-27B GPQA speculative-accept
-  # pre-check. Remove this job together with the tmp-acc-2-npu-a3 suite entry in
-  # test/run_suite.py once the case is validated.
-  tmp-acc-2-npu-a3:
-    name: tmp-acc-2-npu-a3
-    if: ${{ !cancelled() }}
-    needs: [set-image-config]
-    uses: ./.github/workflows/_npu-single-node-test-stage.yml
-    with:
-      runner: linux-aarch64-a3-2-
-      test_type: 'accuracy'
-      test_suite: tmp-acc-2-npu-a3
-      is_nightly_pipeline_job: true
-      skip_pr_test_health_check: 'true'
-      image: ${{ needs.set-image-config.outputs.image_a3 }}
-      install_sglang_deps: false
-      device_type_for_deps: 'a3'
-      run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
-
   nightly-acc-16-npu-a3:
     name: nightly-acc-16-npu-a3
     if: false # TEMP: was '!cancelled()', restore after glm5.2 2P2D validation
@@ -479,7 +460,6 @@ jobs:
       - nightly-perf-4-npu-a3
       - nightly-perf-16-npu-a3
       - nightly-acc-2-npu-a3
-      - tmp-acc-2-npu-a3
       - nightly-acc-16-npu-a3
       - nightly-acc-4-npu-a5
       - nightly-poc-multi-node-tests
@@ -503,7 +483,6 @@ jobs:
             "${{ needs.nightly-perf-4-npu-a3.result }}" \
             "${{ needs.nightly-perf-16-npu-a3.result }}" \
             "${{ needs.nightly-acc-2-npu-a3.result }}" \
-            "${{ needs.tmp-acc-2-npu-a3.result }}" \
             "${{ needs.nightly-acc-16-npu-a3.result }}"; do
             # TEMP: A5 power maintenance - line below disabled; when restoring, move '; do' back onto the a5 line
             # "${{ needs.nightly-acc-4-npu-a5.result }}"; do
@@ -536,7 +515,6 @@ jobs:
             "nightly-perf-4-npu-a3:${{ needs.nightly-perf-4-npu-a3.result }}" \
             "nightly-perf-16-npu-a3:${{ needs.nightly-perf-16-npu-a3.result }}" \
             "nightly-acc-2-npu-a3:${{ needs.nightly-acc-2-npu-a3.result }}" \
-            "tmp-acc-2-npu-a3:${{ needs.tmp-acc-2-npu-a3.result }}" \
             "nightly-acc-16-npu-a3:${{ needs.nightly-acc-16-npu-a3.result }}"; do
             # TEMP: A5 power maintenance - line below disabled; when restoring, move '; do' back onto the a5 line
             # "nightly-acc-4-npu-a5:${{ needs.nightly-acc-4-npu-a5.result }}"; do
