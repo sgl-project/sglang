@@ -644,26 +644,41 @@ struct RouteRadix4SortKernel {
         .verify(scores);
     TensorMatcher({N_}).with_dtype<bf16_t, fp32_t>(score_dtype).with_device(device_).verify(bias);
     TensorMatcher({M_, K_}).with_dtype<fp32_t>().with_device(device_).verify(out_w);
-    TensorMatcher({M_, K_}).with_dtype<int32_t>().with_device(device_).verify(out_i);
+    // The streamed sort reads ids, and the pad sweep writes the sorted rows, as int4.
+    TensorMatcher({M_, K_})  //
+        .with_dtype<int32_t>()
+        .with_device(device_)
+        .ensure_alignment(16)
+        .verify(out_i);
     // The three sorted rows are padded as one strided sweep, so they have to
     // agree on a length that covers a whole number of BM blocks.
     auto S_ = SymbolicSize{"sorted_len"};
     TensorMatcher({1}).with_dtype<int32_t>().with_device(device_).verify(arrival);
-    TensorMatcher({S_}).with_dtype<int32_t>().with_device(device_).verify(sorted_token_ids);
+    TensorMatcher({S_})  //
+        .with_dtype<int32_t>()
+        .with_device(device_)
+        .ensure_alignment(16)
+        .verify(sorted_token_ids);
     TensorMatcher({-1}).with_dtype<int32_t>().with_device(device_).verify(sorted_expert_ids);
-    TensorMatcher({S_}).with_dtype<fp32_t>().with_device(device_).verify(sorted_weights);
+    TensorMatcher({S_})  //
+        .with_dtype<fp32_t>()
+        .with_device(device_)
+        .ensure_alignment(16)
+        .verify(sorted_weights);
     TensorMatcher({2}).with_dtype<int32_t>().with_device(device_).verify(cumsum_tensor);
     TensorMatcher({-1}).with_dtype<int32_t>().with_device(device_).verify(reverse_sorted);
-    TensorMatcher({S_}).with_dtype<int32_t>().with_device(device_).verify(m_indices);
+    TensorMatcher({S_})  //
+        .with_dtype<int32_t>()
+        .with_device(device_)
+        .ensure_alignment(16)
+        .verify(m_indices);
 
-    RuntimeCheck(
-        N_.unwrap() == kRadix4NumExperts && K_.unwrap() == kRadix4TopK && topk == kRadix4TopK,
-        "route_radix4 is specialized for N=896, K=16");
-    RuntimeCheck(
-        out_w.stride(0) == K_.unwrap() && out_i.stride(0) == K_.unwrap(), "fused sort needs packed [M, K] rows");
-    RuntimeCheck(
-        S_.unwrap() % kRadix4SortBlockM == 0 && S_.unwrap() / kRadix4SortBlockM <= sorted_expert_ids.size(0),
-        "sorted rows must hold whole BM=16 blocks, one expert id each");
+    CHECK_HOST(N_.unwrap() == kRadix4NumExperts && K_.unwrap() == kRadix4TopK && topk == kRadix4TopK)
+        << "route_radix4 is specialized for N=896, K=16";
+    CHECK_HOST(out_w.stride(0) == K_.unwrap() && out_i.stride(0) == K_.unwrap())
+        << "fused sort needs packed [M, K] rows";
+    CHECK_HOST(S_.unwrap() % kRadix4SortBlockM == 0 && S_.unwrap() / kRadix4SortBlockM <= sorted_expert_ids.size(0))
+        << "sorted rows must hold whole BM=16 blocks, one expert id each";
 
     const auto M = static_cast<uint32_t>(M_.unwrap());
     if (M == 0) return;
@@ -672,8 +687,8 @@ struct RouteRadix4SortKernel {
     const int64_t active = routes < kRadix4NumExperts ? routes : kRadix4NumExperts;
     const int64_t capacity =
         (routes + active * (kRadix4SortBlockM - 1) + kRadix4SortBlockM - 1) / kRadix4SortBlockM * kRadix4SortBlockM;
-    RuntimeCheck(S_.unwrap() >= capacity, "sorted rows are shorter than the BM=16 sort capacity for M");
-    RuntimeCheck(reverse_sorted.size(0) >= routes, "reverse_sorted must hold M * topk entries");
+    CHECK_HOST(S_.unwrap() >= capacity) << "sorted rows are shorter than the BM=16 sort capacity for M";
+    CHECK_HOST(reverse_sorted.size(0) >= routes) << "reverse_sorted must hold M * topk entries";
 
     void* moe_ptr = nullptr;
     uint32_t moe_dim = 0;
@@ -682,10 +697,10 @@ struct RouteRadix4SortKernel {
     if (moe_buf.numel() > 0) {
       TensorMatcher({M_, -1}).with_dtype<bf16_t>().with_device(device_).with_strides({-1, 1}).verify(moe_buf);
       // zero_bf16_row clears whole 16-byte vectors of packed rows.
-      RuntimeCheck(
+      CHECK_HOST(
           moe_buf.stride(0) == moe_buf.size(1) && moe_buf.size(1) % 8 == 0 &&
-              reinterpret_cast<uintptr_t>(moe_buf.data_ptr()) % 16 == 0,
-          "moe_buf must be packed, 16-byte aligned rows of a multiple of 8 bf16");
+          reinterpret_cast<uintptr_t>(moe_buf.data_ptr()) % 16 == 0)
+          << "moe_buf must be packed, 16-byte aligned rows of a multiple of 8 bf16";
       moe_ptr = moe_buf.data_ptr();
       moe_dim = static_cast<uint32_t>(moe_buf.size(1));
     }
