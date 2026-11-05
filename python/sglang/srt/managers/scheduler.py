@@ -1214,7 +1214,11 @@ class Scheduler(
                 ),
             )
         device_module = torch.get_device_module(model_runner.device)
-        self.schedule_stream = None if use_mlx() else device_module.Stream(priority=0)
+        self.schedule_stream = (
+            None
+            if use_mlx()
+            else device_module.Stream(priority=envs.SGLANG_PLB_STREAM_PRIORITY.get())
+        )
         # Match run_batch / _pp_launch_batch so warmup allocations stay reusable.
         forward_stream = (
             model_runner.forward_stream
@@ -1785,7 +1789,9 @@ class Scheduler(
         self.forward_stream_ctx: CudaStreamContext = self.device_module.stream(
             self.forward_stream
         )
-        self.copy_stream: CudaStream = self.device_module.Stream()
+        self.copy_stream: CudaStream = self.device_module.Stream(
+            priority=envs.SGLANG_PLB_STREAM_PRIORITY.get()
+        )
         self.copy_stream_ctx: CudaStreamContext = self.device_module.stream(
             self.copy_stream
         )
@@ -5316,7 +5322,13 @@ class Scheduler(
         if self.uocr_runtime is not None:
             # The decode graph reads its relay; a step it did not publish seeds it.
             self.uocr_runtime.relay_result(batch, batch_result, future_indices)
-        self.future_map.stash(future_indices, payload)
+        self.future_map.relay(
+            future_indices,
+            payload,
+            draft_input=batch_result.next_draft_input,
+            accepted_lengths=batch_result.accept_lens,
+            allow_defer=batch.beam_tail is None,
+        )
         self.beam_coordinator.maybe_select_and_relay(
             batch, batch_result, chunked_req=self.chunked_req
         )
