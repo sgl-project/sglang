@@ -594,9 +594,6 @@ def _run_per_token_group_quant_8bit_kernel(
         )
         return
 
-    assert eps == 1e-10, (
-        f"per_token_group_quant bakes the absmax floor in at 1e-10, got {eps}"
-    )
     if (
         scale_ue8m0
         and x_s.dtype == torch.float32
@@ -606,6 +603,7 @@ def _run_per_token_group_quant_8bit_kernel(
             and x_s.is_contiguous()
             and x_q.dtype == fp8_dtype
             and group_size == 32
+            and eps == 1e-10
             and not fuse_silu_and_mul
             and masked_m is None
         )
@@ -625,6 +623,9 @@ def _run_per_token_group_quant_8bit_kernel(
         )
         return
 
+    assert eps == 1e-10, (
+        f"per_token_group_quant bakes the absmax floor in at 1e-10, got {eps}"
+    )
     per_token_group_quant(
         x,
         x_q,

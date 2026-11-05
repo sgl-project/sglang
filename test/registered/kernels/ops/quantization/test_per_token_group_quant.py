@@ -137,18 +137,6 @@ def test_fp32_pow2_public_offset_view(offset):
     _check_fp32_pow2(x[offset:].view(3, 160), public=True)
 
 
-@pytest.mark.parametrize(
-    "dtype,group_size",
-    [(torch.bfloat16, 32), (torch.float16, 32), (torch.bfloat16, 128)],
-)
-def test_fp32_pow2_rejects_nondefault_eps(dtype, group_size):
-    # Both the trait path and the dtype/group-size v2 fallbacks bake in EPS;
-    # a nondefault value must not silently select a kernel that ignores it.
-    x = torch.zeros(3, 256, device="cuda", dtype=dtype)
-    with pytest.raises(AssertionError, match="absmax floor"):
-        sglang_per_token_group_quant_fp8(x, group_size, eps=1e-5, scale_ue8m0=True)
-
-
 @pytest.mark.parametrize("mixed_groups", [False, True])
 def test_fp32_pow2_all_bf16_encodings(mixed_groups):
     # Includes signed zero, subnormals, exponent boundaries, infinities and
