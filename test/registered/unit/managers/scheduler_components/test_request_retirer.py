@@ -23,7 +23,6 @@ _SKIPPED = ("mem_cache/", "managers/scheduler_components/request_retirer.py")
 # themselves. It only shrinks: a new exit goes through `RequestRetirer`.
 _STEP_CALLERS = {
     "disaggregation/prefill.py:SchedulerDisaggregationPrefillMixin.optimistic_release_and_requeue",
-    "managers/schedule_batch.py:release_req",
     "managers/scheduler_components/dynamic_chunk_sizer.py:DynamicChunkSizer._profile_prefill_latency",
 }
 
