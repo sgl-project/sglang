@@ -1807,6 +1807,9 @@ class Envs:
     # Kill-switch for the fused per-slot conv clear/copy kernel (MambaPool);
     # falls back to the per-conv-type Python loop.
     SGLANG_DISABLE_FUSED_MAMBA_SLOT_OPS = EnvBool(False)
+    # Kill-switch for the fused Triton Mamba-1 prefill scan (XPU); falls back to
+    # the per-token PyTorch loop.
+    SGLANG_DISABLE_MAMBA1_TRITON_SCAN = EnvBool(False)
     # Opt-in: on the unified radix tree, leave the matched-prefix mamba evictable
     # during decode (it is already COW'd to the request's own slot) and shrink the
     # mamba pool ratio accordingly. Frees one resident slot per running request,
