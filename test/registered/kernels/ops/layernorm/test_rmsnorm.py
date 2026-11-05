@@ -12,9 +12,9 @@ from sglang.kernels.ops.layernorm.norm import RMSNormMode, precompile_rmsnorm
 from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=600, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=600, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 # Nightly is not redundant here: it sets SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1 to expand get_ci_test_range sweeps.
-register_cuda_ci(est_time=1500, stage="nightly", runner_config="1-gpu-large")
+register_cuda_ci(est_time=1500, stage="nightly", runner_config="1-gpu-small")
 register_amd_ci(est_time=600, suite="jit-kernel-unit-test-amd")
 
 EPS = 1e-6
