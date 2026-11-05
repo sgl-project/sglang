@@ -1878,13 +1878,15 @@ def _byte_level_piece(raw: bytes) -> str:
     return "".join(_PIECE_OF_BYTE[b] for b in raw)
 
 
-# Qwen3 ids: THAI DIGIT ONE (E0 B9 91) is 8158 (E0 B9) + 239 (91), each U+FFFD
-# alone; 40327 is KHO KHWAI. Module-level to outlive the id()-keyed cache.
+# Qwen3 ids: THAI DIGIT ONE (E0 B9 91) is 8158 (E0 B9) + 239 (91), each U+FFFD alone;
+# 240 (92) ends THAI DIGIT TWO, and 40327 is KHO KHWAI.
+# Module-level to outlive the id()-keyed cache.
 _QWEN3_LIKE_TOKENIZER = _FakeTokenizer(
     is_byte_level=True,
     pieces={
         8158: _byte_level_piece(b"\xe0\xb9"),
         239: _byte_level_piece(b"\x91"),
+        240: _byte_level_piece(b"\x92"),
         40327: _byte_level_piece("ค".encode("utf-8")),
     },
 )
@@ -1916,6 +1918,27 @@ class OutputTextLogprobBytesTestCase(CustomTestCase):
         self.assertEqual(out[1].top_logprobs[0].bytes, [145])
         # The display text is unchanged; only ``bytes`` is recovered.
         self.assertEqual([lp.token for lp in out], ["\ufffd", "\ufffd"])
+
+    def test_fragment_candidates_in_one_top_list_are_all_kept(self):
+        """Fragment candidates all display as U+FFFD;
+        each one must keep its own entry, logprob and bytes instead of collapsing."""
+        out = _build_output_text_logprobs(
+            {
+                "output_token_logprobs": [(-0.2, 239, "\ufffd")],
+                "output_top_logprobs": [
+                    [(-0.2, 239, "\ufffd"), (-1.7, 240, "\ufffd"), (-3.0, 40327, "ค")]
+                ],
+            },
+            tokenizer=_QWEN3_LIKE_TOKENIZER,
+        )
+        self.assertEqual(
+            [(top.token, top.logprob, top.bytes) for top in out[0].top_logprobs],
+            [
+                ("\ufffd", -0.2, [145]),
+                ("\ufffd", -1.7, [146]),
+                ("ค", -3.0, [224, 184, 132]),
+            ],
+        )
 
     def test_non_byte_level_tokenizer_keeps_display_text_bytes(self):
         # U+00E9 is also the GPT-2 byte-level piece for byte 233, so decoding

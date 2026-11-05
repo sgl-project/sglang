@@ -100,7 +100,6 @@ from sglang.srt.entrypoints.openai.serving_chat import (
 from sglang.srt.entrypoints.openai.tool_server import MCPToolServer, ToolServer
 from sglang.srt.entrypoints.openai.utils import (
     _is_byte_level_tokenizer,
-    to_openai_style_logprobs,
     token_id_to_bytes,
 )
 from sglang.srt.function_call.core_types import ToolCallItem
@@ -133,55 +132,38 @@ class _MediaInputValidationError(ValueError):
 def _build_output_text_logprobs(
     meta_info: dict, tokenizer: Any = None
 ) -> list[Logprob]:
-    """Reshape decoded ``meta_info`` logprobs into the Responses logprob type,
+    """Build the Responses logprob type from raw ``(logprob, id, text)`` triples,
     covering every generated token."""
-    output_token_logprobs = meta_info.get("output_token_logprobs")
-    output_top_logprobs = meta_info.get("output_top_logprobs")
-    decoded = to_openai_style_logprobs(
-        output_token_logprobs=output_token_logprobs,
-        output_top_logprobs=output_top_logprobs,
-    )
+    output_token_logprobs = meta_info.get("output_token_logprobs") or []
+    output_top_logprobs = meta_info.get("output_top_logprobs") or []
     is_byte_level = tokenizer is not None and _is_byte_level_tokenizer(tokenizer)
 
-    # A byte-level fragment token (part of a multi-byte character) displays as
-    # U+FFFD, so its bytes must come from the id, as in Chat.
+    # A byte-level fragment token displays as U+FFFD;
+    # its bytes must come from the id, as in Chat.
     def token_bytes(token_id, token: str) -> list[int]:
         raw = token_id_to_bytes(tokenizer, token_id) if is_byte_level else None
         return raw if raw is not None else list(token.encode("utf-8"))
 
-    raw_tops = output_top_logprobs or []
-    top_lists = decoded.top_logprobs or []
     logprobs: list[Logprob] = []
-    for index, (token, logprob) in enumerate(
-        zip(decoded.tokens, decoded.token_logprobs)
-    ):
-        top_entry = top_lists[index] if index < len(top_lists) else None
-        raw_top = raw_tops[index] if index < len(raw_tops) else None
-        # Same key and last-wins rule as the text-keyed ``top_entry``, so each
-        # entry gets the id whose logprob it kept.
-        top_ids = (
-            {
-                (top_text if top_text is not None else ""): top_id
-                for _, top_id, top_text in (raw_top or [])
-            }
-            if is_byte_level
-            else {}
+    for index, (logprob, token_id, token_text) in enumerate(output_token_logprobs):
+        raw_top = (
+            output_top_logprobs[index] if index < len(output_top_logprobs) else None
         )
+        # One entry per candidate, as in Chat;
+        # fragment candidates all show U+FFFD, so keying by text keeps only one.
         top_logprobs = [
             LogprobTopLogprob(
-                token=top_token,
+                token=top_text or "",
                 logprob=top_logprob,
-                bytes=token_bytes(token_id=top_ids.get(top_token), token=top_token),
+                bytes=token_bytes(token_id=top_id, token=top_text or ""),
             )
-            for top_token, top_logprob in (top_entry or {}).items()
+            for top_logprob, top_id, top_text in (raw_top or [])
         ]
         logprobs.append(
             Logprob(
-                token=token,
+                token=token_text or "",
                 logprob=logprob,
-                bytes=token_bytes(
-                    token_id=output_token_logprobs[index][1], token=token
-                ),
+                bytes=token_bytes(token_id=token_id, token=token_text or ""),
                 top_logprobs=top_logprobs,
             )
         )
