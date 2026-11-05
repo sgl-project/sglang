@@ -484,8 +484,7 @@ class PrefillBootstrapQueue:
             if recv_req.matches(req.rid):
                 logger.debug(f"Abort bootstrap queue request. {req.rid=}")
                 # Only marks the abort; the exit that releases the request detaches it.
-                if hasattr(req.disagg_kv_sender, "abort"):
-                    req.disagg_kv_sender.abort()
+                req.disagg_kv_sender.abort()
                 if get_parallel().pp_size > 1:
                     prepare_abort(req, "Aborted by AbortReq.")
 

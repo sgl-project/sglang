@@ -101,7 +101,7 @@ class TestRelease(CustomTestCase):
         self._release(_req(FINISH_ABORT(), calls), calls)
         self.assertEqual(
             calls,
-            ["counts", "mm", CacheRequestOutcome.ABORT, "session", "beam", False],
+            ["counts", "mm", "session", CacheRequestOutcome.ABORT, "beam", False],
         )
 
     def test_leaves_the_attempt_of_a_checkpointed_release_to_the_cache(self):

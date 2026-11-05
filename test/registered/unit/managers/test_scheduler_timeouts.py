@@ -226,7 +226,10 @@ class TestQueuedAbort(CustomTestCase):
 
         self.assertIsInstance(req.finished_reason, FINISH_ABORT)
         self.assertIsNone(req.to_finish)
-        s.request_retirer._detach.assert_called_once_with(req, abandon_attempt=True)
+        s.request_retirer._detach.assert_called_once_with(req)
+        s.tree_cache.finish.assert_called_once_with(
+            req.cache_request_handle, CacheRequestOutcome.ABORT
+        )
 
 
 class TestRunningTimeout(CustomTestCase):

@@ -50,6 +50,7 @@ class _FakeReq:
         self.weight_version_events = []
         self.prefill_weight_versions = None
         self.time_stats = Mock()
+        self.cache_request_handle = None
 
     def finished(self):
         return self._finished
@@ -104,7 +105,7 @@ class TestPendingChunkedAbortRace(CustomTestCase):
         req = _FakeReq("beam_leader")
         sched = _make_scheduler(req, chunked_req=req, running_reqs=[])
         sched.request_retirer = release_only_retirer(
-            beam_coordinator=sched.beam_coordinator
+            Mock(), beam_coordinator=sched.beam_coordinator
         )
         sched.ipc_channels = Mock()
 
@@ -126,7 +127,7 @@ class TestPendingChunkedAbortRace(CustomTestCase):
         hisparse_coordinator.request_finished.side_effect = lambda req: calls.append(
             ("hisparse", req)
         )
-        sched.request_retirer = release_only_retirer(None, hisparse_coordinator)
+        sched.request_retirer = release_only_retirer(Mock(), hisparse_coordinator)
 
         with (
             patch.object(sched.request_retirer, "_detach"),

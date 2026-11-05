@@ -447,7 +447,7 @@ class DllmManager:
         self.waiting_queue = IndexedReqList(ListKind.DLLM, abort=self._abort)
         # A subset of the waiting queue.
         self.staging_queue: List[Req] = []
-        self._abort_req = abort
+        self._abort_one = abort
 
     def get_prefill_requests(self) -> List[Req]:
         """Get all prefill requests from waiting queue."""
@@ -499,7 +499,7 @@ class DllmManager:
         aborted = set(aborted_reqs)
         self.staging_queue = [req for req in self.staging_queue if req not in aborted]
         for req in aborted_reqs:
-            self._abort_req(req)
+            self._abort_one(req)
 
     def init_next_round(self) -> None:
         """Initialize staging requests for next round and clear staging queue."""

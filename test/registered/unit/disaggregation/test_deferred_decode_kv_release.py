@@ -882,6 +882,7 @@ def _make_failed_req(mgr, room, idx, abort_notified, notifiable=True):
             bootstrap_room=room,
             rid=f"r{room}",
             return_logprob=False,
+            cache_request_handle=None,
             kv=SimpleNamespace(
                 holds_kv=True, holds_mamba=False, retraction_backup=None
             ),

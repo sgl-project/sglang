@@ -22,8 +22,8 @@ class RequestRetirer:
     """Ends requests and releases what they hold.
 
     abort ends a request no launched step carries, tells the tokenizer once,
-    and releases it; release frees one its caller ended, in a step or out of
-    one, and streams, detaching it first when aborted."""
+    and releases it; release gives back what a request its caller ended holds,
+    detaching it first when aborted; the caller streams it."""
 
     def __init__(
         self,
@@ -60,13 +60,18 @@ class RequestRetirer:
         self.release(req, checkpoint=checkpoint)
 
     def release(self, req: Req, *, checkpoint: bool) -> None:
-        """Give back what an ended request holds:
-        an aborted one is first dropped from the components tracking it, then
+        """Give back what an ended request holds.
+
+        An aborted one is first dropped from the components tracking it, then
         its KV backup and its memory go. The caller finishes and streams it."""
         if isinstance(req.finished_reason, FINISH_ABORT):
+            self._detach(req)
             # A checkpoint hands the KV to the cache, whose store settles the
-            # attempt; an abandon first would end LMCache's session before it.
-            self._detach(req, abandon_attempt=not checkpoint)
+            # attempt.
+            if not checkpoint:
+                self.tree_cache.finish(
+                    req.cache_request_handle, CacheRequestOutcome.ABORT
+                )
             # No-op once the group retired; member rows are not freed here.
             self.beam_coordinator.retire_group(req)
         discard_kv_cache_backup(req, self.tree_cache)
@@ -76,14 +81,13 @@ class RequestRetirer:
         if req.kv.holds_kv or req.kv.holds_mamba:
             release_kv_cache(req, self.tree_cache, checkpoint=checkpoint)
 
-    def _detach(self, req: Req, *, abandon_attempt: bool) -> None:
-        """Drop an aborted request from the components tracking it; frees no
-        memory, so it runs while the request still holds its KV."""
+    def _detach(self, req: Req) -> None:
+        """Drop an aborted request from the components tracking it and free its
+        media; frees no KV or rows, so it runs while the request still holds
+        them."""
         # Counted before the media goes: the output sent after still reports it.
         req.get_mm_token_counts()
         req.release_mm_inputs_on_abort()
-        if abandon_attempt:
-            self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
         if req.session is not None and req.session.streaming:
             req.session.abort_req()
         if self.uocr_runtime is not None:
