@@ -9,6 +9,7 @@ from typing import Any, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
+from sglang.kernels.ops.sampling import argmax as sampling_argmax
 from sglang.kernels.ops.speculative.verify_sampling import (
     tree_speculative_sampling_target_only,
 )
@@ -971,9 +972,8 @@ def apply_dflash_simulated_acceptance(
         # The sampling and selector branches do not materialize the target
         # argmax; only the forced row of each request is read.
         vocab_size = next_token_logits.shape[-1]
-        target_bonus_tokens = torch.argmax(
-            next_token_logits.view(bs, block_size, vocab_size)[:, forced_accept_len],
-            dim=-1,
+        target_bonus_tokens = sampling_argmax(
+            next_token_logits.view(bs, block_size, vocab_size)[:, forced_accept_len]
         )
     elif real_draft_tokens:
         target_bonus_tokens = target_predict[:, forced_accept_len]

@@ -8,6 +8,7 @@ from typing import Optional
 
 import torch
 
+from sglang.kernels.ops.sampling.argmax_jit import can_argmax
 from sglang.srt.speculative.dflash_utils import apply_dflash_simulated_acceptance
 from sglang.srt.speculative.spec_utils import sample_simulated_acc_len
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -33,6 +34,18 @@ DTYPE_SETS = tuple(
 )
 
 
+def _reference_argmax(logits: torch.Tensor) -> torch.Tensor:
+    # sampling_argmax's rule: the JIT kernel never picks a NaN and takes the first
+    # maximum of the rest; its torch.argmax fallback returns the first NaN.
+    if not (logits.is_cuda and can_argmax(logits)):
+        return torch.argmax(logits, dim=-1)
+    values = logits.float()
+    values = torch.where(values.isnan(), float("-inf"), values)
+    # numpy's argmax is documented to return the first maximum.
+    first_max = values.cpu().numpy().argmax(axis=1)
+    return torch.from_numpy(first_max).to(device=logits.device, dtype=torch.int64)
+
+
 def _eager_reference(
     *,
     candidates: torch.Tensor,
@@ -46,16 +59,18 @@ def _eager_reference(
     simulate_acc_token_mode: str,
     next_token_logits: Optional[torch.Tensor] = None,
     fixed_token_id: int = 100,
+    generator: Optional[torch.Generator] = None,
 ) -> None:
-    # Frozen copy of the eager apply_dflash_simulated_acceptance body (main c757c4bb7c).
+    # Frozen copy of the eager apply_dflash_simulated_acceptance body (main b702f0d80e),
+    # with sampling_argmax spelled out as _reference_argmax.
     bs, block_size = candidates.shape
     if simulate_acc_token_mode == "real-draft-token" and target_predict is None:
         # The sampling-verify branch does not materialize the target argmax.
-        target_predict = torch.argmax(next_token_logits, dim=-1).view(bs, block_size)
+        target_predict = _reference_argmax(next_token_logits).view(bs, block_size)
 
     # sample_simulated_acc_len clamps to [1, block_size].
     forced_commit_len = sample_simulated_acc_len(
-        simulate_acc_len, simulate_acc_method, block_size
+        simulate_acc_len, simulate_acc_method, block_size, generator=generator
     )
     forced_accept_len = forced_commit_len - 1
 
@@ -102,7 +117,7 @@ def _int_matrix(*, bs, block_size, dtype, device, layout, gen, low, high):
 
 def _logits_with_ties(*, rows, vocab, dtype, device, seed):
     # Every row's maximum appears at three random columns, and every fifth row
-    # holds two NaNs, so argmax must return the first index.
+    # holds two NaNs, which only torch.argmax's fallback may pick.
     gen = torch.Generator(device=device).manual_seed(seed)
     logits = torch.randn(rows, vocab, generator=gen, device=device).to(dtype)
     tied = torch.randint(0, vocab, (rows, 3), generator=gen, device=device)
@@ -435,7 +450,7 @@ class TestDFlashSimulatedAccept(CustomTestCase):
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_argmax_ties_at_real_vocab(self):
-        """The forced-row argmax keeps torch.argmax's choice (first NaN, else the
+        """The forced-row argmax keeps sampling_argmax's choice (skip NaNs, then the
         first maximum) at real vocabulary sizes and logits dtypes."""
         case_index = 0
         for vocab, bs, dtype in itertools.product(
