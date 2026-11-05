@@ -15,7 +15,10 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 
+# The first HARD_GATED children are EnvRuntimeBool: the master is a hard gate.
+HARD_GATED = 1
 NV_MEGA_RUNTIME_CHILDREN = (
+    "SGLANG_OPT_OVERLAP_EVENT_REUSE",
     "SGLANG_DSPARK_FUSED_ACCEPT_TAIL",
     "SGLANG_DSPARK_DEFER_CONTEXT_KV",
     "SGLANG_OPT_DSV41_DSPARK_DRAFT_PREP_FORK",
@@ -46,6 +49,9 @@ NV_MEGA_RUNTIME_CHILDREN = (
     "SGLANG_OPT_SCHEDULER_SHM_SYNC_LEADER_TCP",
     "SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND",
 )
+
+# Opt-in children (EnvRuntimeBool(False)): off unless set, and the master still gates them.
+NV_MEGA_RUNTIME_OPT_IN_CHILDREN = ()
 
 RENAMED_NV_MEGA_RUNTIME_CHILDREN = {
     "SGLANG_OPT_SMALL_FIELD_COPY_VECTORIZED": "SGLANG_Q35MF_BK_VEC_COPY",
@@ -174,7 +180,7 @@ class TestEnvField(unittest.TestCase):
         master = envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION
         for master_value, child_value in ((True, "0"), (True, "false"), (False, "1")):
             with master.override(master_value):
-                for name in NV_MEGA_RUNTIME_CHILDREN:
+                for name in NV_MEGA_RUNTIME_CHILDREN[HARD_GATED:]:
                     child = self.env_fields[name]
                     with self.subTest(
                         master=master_value, child=name, value=child_value
@@ -184,6 +190,46 @@ class TestEnvField(unittest.TestCase):
                             self.assertTrue(child.is_set())
                             child.clear()
                             self.assertIs(child.get(), master_value)
+
+    def test_mega_runtime_master_is_a_hard_gate(self):
+        master = envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION
+        for master_value in (False, True):
+            for child_value in ("0", "false", "1", "true", None):
+                with master.override(master_value):
+                    for name in NV_MEGA_RUNTIME_CHILDREN[:HARD_GATED]:
+                        child = self.env_fields[name]
+                        with self.subTest(
+                            master=master_value, child=name, value=child_value
+                        ):
+                            with child.override(child_value):
+                                expected = (
+                                    (
+                                        None
+                                        if child_value is None
+                                        else child_value in ("1", "true")
+                                    )
+                                    if master_value
+                                    else False
+                                )
+                                self.assertIs(child.get(), expected)
+                                self.assertTrue(child.is_set())
+                                child.clear()
+                                self.assertIs(child.get(), master_value)
+
+    def test_mega_runtime_opt_in_children_need_the_master_and_a_value(self):
+        master = envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION
+        for master_value in (False, True):
+            with master.override(master_value):
+                for name in NV_MEGA_RUNTIME_OPT_IN_CHILDREN:
+                    child = self.env_fields[name]
+                    with self.subTest(master=master_value, child=name):
+                        self.assertNotIn(name, NV_MEGA_RUNTIME_CHILDREN)
+                        child.clear()
+                        self.assertIs(child.get(), False)
+                        with child.override("1"):
+                            self.assertIs(child.get(), master_value)
+                        with child.override("0"):
+                            self.assertIs(child.get(), False)
 
     def test_mega_runtime_does_not_override_explicit_none(self):
         with envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True):

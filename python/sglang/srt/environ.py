@@ -152,6 +152,13 @@ class EnvBool(EnvField):
         raise ValueError(f'"{value}" is not a valid boolean value')
 
 
+class EnvRuntimeBool(EnvBool):
+    """A runtime child cannot enable an optimization while its master is off."""
+
+    def get(self) -> bool:
+        return envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get() and super().get()
+
+
 class EnvInt(EnvField):
     def parse(self, value: str) -> int:
         try:
@@ -282,8 +289,12 @@ class Envs:
     SGLANG_ROLE_NAMESPACES_OUT = EnvStr(None)
     IS_H200 = EnvBool(False)
     SGLANG_ENABLE_TORCH_INFERENCE_MODE = EnvBool(False)
-    # Explicit child values override this default for megakernel runtime optimizations.
+    # Hard master for megakernel runtime optimizations; children may only disable them.
     SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION = EnvBool(False)
+    # Reuse overlap-loop stream joins and its generation-result completion events.
+    SGLANG_OPT_OVERLAP_EVENT_REUSE = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
 
     # ===================================================================
     # Model configuration, discovery, and weight loading
