@@ -296,7 +296,7 @@ jobs:
 
   nightly-poc-multi-node-tests:
     name: multi-node-poc
-    if: false # TEMP: was '!cancelled()', restore after glm5.2 2P2D validation
+    if: ${{ !cancelled() }}
     needs: [set-image-config, nightly-perf-2-npu-a3, nightly-perf-4-npu-a3, nightly-perf-16-npu-a3, nightly-acc-2-npu-a3, nightly-acc-16-npu-a3]
     strategy:
       fail-fast: false
