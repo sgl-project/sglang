@@ -895,16 +895,14 @@ ReasoningEffortType = Optional[
 ]
 
 
-def _has_message_level_tools(messages: Any) -> bool:
+def _message_tools_indices(messages: Any) -> List[int]:
     if not isinstance(messages, list):
-        return False
-    return any(
-        isinstance(message, dict)
-        and isinstance(message.get("role"), str)
-        and message["role"].lower() in ("root", "system", "developer")
-        and bool(message.get("tools"))
-        for message in messages
-    )
+        return []
+    return [
+        index
+        for index, message in enumerate(messages)
+        if isinstance(message, dict) and message.get("tools")
+    ]
 
 
 class DocSplitOptions(BaseModel):
@@ -1098,28 +1096,21 @@ class ChatCompletionRequest(PDRoutingFields):
         if not isinstance(values, dict):
             return handler(values)
         explicit = values.get("tool_choice") is not None
+        messages = values.get("messages")
+        message_tools_indices = _message_tools_indices(messages)
         if not explicit:
-            if values.get("tools") is None and not _has_message_level_tools(
-                values.get("messages")
-            ):
+            has_message_level_tools = any(
+                isinstance(messages[index].get("role"), str)
+                and messages[index]["role"].lower() in ("root", "system", "developer")
+                for index in message_tools_indices
+            )
+            if values.get("tools") is None and not has_message_level_tools:
                 values["tool_choice"] = "none"
             else:
                 values["tool_choice"] = "auto"
         request = handler(values)
         request._tool_choice_explicit = explicit
-        return request
-
-    @model_validator(mode="wrap")
-    @classmethod
-    def _record_message_tools_indices(cls, values, handler):
-        request = handler(values)
-        messages = values.get("messages") if isinstance(values, dict) else None
-        if isinstance(messages, list):
-            request._message_tools_indices = [
-                index
-                for index, message in enumerate(messages)
-                if isinstance(message, dict) and message.get("tools")
-            ]
+        request._message_tools_indices = message_tools_indices
         return request
 
     @field_validator("reasoning_effort", mode="before")
@@ -1273,23 +1264,6 @@ class ChatCompletionRequest(PDRoutingFields):
             "watermark": self.watermark,
         }
 
-        if self.response_format and self.response_format.type == "json_schema":
-            # strict=false may only go unconstrained when the renderer forwards
-            # response_format to the model; plain chat templates never see it.
-            if (
-                self.response_format.json_schema.strict is not False
-                or not renderer_handles_response_format
-            ):
-                sampling_params["json_schema"] = convert_json_schema_to_str(
-                    self.response_format.json_schema.schema_
-                )
-        elif self.response_format and self.response_format.type == "json_object":
-            sampling_params["json_schema"] = '{"type": "object"}'
-        elif self.response_format and self.response_format.type == "structural_tag":
-            sampling_params["structural_tag"] = convert_json_schema_to_str(
-                self.response_format.model_dump(by_alias=True)
-            )
-
         forces_tool_call = (
             tool_call_constraint is not None
             and tool_call_constraint[0] != "full_assistant_ebnf"
@@ -1298,16 +1272,34 @@ class ChatCompletionRequest(PDRoutingFields):
                 or isinstance(self.tool_choice, ToolChoice)
             )
         )
+        response_format = self.response_format
         # A forced tool call leaves no content for a JSON response_format to
         # shape. When the renderer states response_format in the prompt, the
         # tool-call constraint replaces its grammar instead of conflicting.
         if (
             forces_tool_call
             and renderer_handles_response_format
-            and self.response_format
-            and self.response_format.type in ("json_object", "json_schema")
+            and response_format
+            and response_format.type in ("json_object", "json_schema")
         ):
-            sampling_params.pop("json_schema", None)
+            response_format = None
+
+        if response_format and response_format.type == "json_schema":
+            # strict=false may only go unconstrained when the renderer forwards
+            # response_format to the model; plain chat templates never see it.
+            if (
+                response_format.json_schema.strict is not False
+                or not renderer_handles_response_format
+            ):
+                sampling_params["json_schema"] = convert_json_schema_to_str(
+                    response_format.json_schema.schema_
+                )
+        elif response_format and response_format.type == "json_object":
+            sampling_params["json_schema"] = '{"type": "object"}'
+        elif response_format and response_format.type == "structural_tag":
+            sampling_params["structural_tag"] = convert_json_schema_to_str(
+                response_format.model_dump(by_alias=True)
+            )
 
         # Check if there are already existing output constraints
         has_existing_constraints = (
