@@ -1,5 +1,6 @@
 """ROCm fused QK-norm + RoPE (``apply_qk_norm_rope``) against the unfused
-``apply_qk_norm`` + ``rotary_emb`` path it replaces in Qwen3 prefill.
+``apply_qk_norm`` + ``rotary_emb`` path it replaces in Qwen3 attention: prefill,
+and decode when the aiter decode fusion does not apply.
 
 q/k are strided views of a packed qkv, as ``qkv.split`` gives them. The fused
 kernel reads the fp32 cos/sin cache while the unfused HIP RoPE rounds it to the
@@ -38,7 +39,9 @@ ATOL = 8e-2
 RTOL = 1e-2
 
 
-def _exec_config(tc_compiler="eager", rl_on_policy_target=None):
+def _exec_config(
+    tc_compiler="eager", rl_on_policy_target=None, enable_fused_qk_norm_rope=None
+):
     return SimpleNamespace(
         deterministic=SimpleNamespace(rl_on_policy_target=rl_on_policy_target),
         graph=SimpleNamespace(
@@ -46,6 +49,7 @@ def _exec_config(tc_compiler="eager", rl_on_policy_target=None):
                 prefill=SimpleNamespace(tc_compiler=tc_compiler)
             )
         ),
+        kernel=SimpleNamespace(enable_fused_qk_norm_rope=enable_fused_qk_norm_rope),
     )
 
 
@@ -172,6 +176,7 @@ def test_matches_unfused_path(
         return
     assert len(calls) == 1
     assert torch.equal(fused(positions.to(torch.int32))[0], out)
+    assert len(calls) == 2
 
     q_ref, k_ref = _unfused(qkv, positions, sizes, q_norm, k_norm, rotary_emb, head_dim)
     torch.testing.assert_close(q, q_ref, atol=ATOL, rtol=RTOL)
@@ -215,9 +220,16 @@ def test_kernel_gate_rejects_unvalidated_variants():
     assert can_use(128, 128, False, dtype, round_norm_before_rope=False)
 
 
+_EXEC_OVERRIDES = {
+    "inductor": {"tc_compiler": "inductor"},
+    "rl_on_policy": {"rl_on_policy_target": "fsdp"},
+    "flag_off": {"enable_fused_qk_norm_rope": False},
+}
+
+
 @pytest.mark.parametrize(
     "case",
-    ["yarn", "eps_mismatch", "fp32_norm_weight", "deterministic", "inductor"],
+    ["yarn", "eps_mismatch", "fp32_norm_weight", "deterministic", *_EXEC_OVERRIDES],
 )
 def test_gate_falls_back(monkeypatch, case):
     dtype, head_dim, num_tokens = torch.bfloat16, 128, 257
@@ -236,10 +248,9 @@ def test_gate_falls_back(monkeypatch, case):
     if case == "fp32_norm_weight":
         q_norm.float()
         k_norm.float()
-    elif case == "inductor":
-        monkeypatch.setattr(
-            model_utils, "get_exec", lambda: _exec_config(tc_compiler="inductor")
-        )
+    elif case in _EXEC_OVERRIDES:
+        config = _exec_config(**_EXEC_OVERRIDES[case])
+        monkeypatch.setattr(model_utils, "get_exec", lambda: config)
     with envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.override(case == "deterministic"):
         use_jit = can_use_jit_qk_norm_rope(q_norm, k_norm, rotary_emb, head_dim, dtype)
         assert not use_jit

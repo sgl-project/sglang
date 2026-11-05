@@ -668,6 +668,8 @@ def can_use_jit_qk_norm_rope(
 
     if not (
         _is_hip
+        # None (unset) keeps it on; only --no-enable-fused-qk-norm-rope opts out.
+        and get_exec().kernel.enable_fused_qk_norm_rope is not False
         and not envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
         and get_exec().deterministic.rl_on_policy_target is None
         and get_exec().graph.cuda_graph_config.prefill.tc_compiler != "inductor"
