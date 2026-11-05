@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -159,6 +160,14 @@ def is_retriable_failure(output: str) -> tuple[bool, str]:
     return False, "unknown failure type"
 
 
+def _relay_output(src, dst) -> None:
+    """Copy a child's raw output to `dst` as it arrives."""
+    for chunk in iter(lambda: src.read1(1 << 16), b""):
+        dst.flush()
+        dst.buffer.write(chunk)
+        dst.buffer.flush()
+
+
 def run_with_timeout(
     func: Callable,
     args: tuple = (),
@@ -171,7 +180,9 @@ def run_with_timeout(
     def _target_func():
         ret_value.append(func(*args, **(kwargs or {})))
 
-    t = threading.Thread(target=_target_func)
+    # Daemon: on timeout the thread may stay blocked waiting on a process that
+    # cannot be killed, and must not keep the interpreter from exiting.
+    t = threading.Thread(target=_target_func, daemon=True)
     t.start()
     t.join(timeout=timeout)
     if t.is_alive():
@@ -334,8 +345,25 @@ def run_unittest_files(
                 reader_thread.join(timeout=60)
             else:
                 cmd = ["python3", full_path, "-f"]
-                process = subprocess.Popen(cmd, stdout=None, stderr=None)
+                # Relay output through pipes instead of handing the child our
+                # stdout/stderr: a child stuck in the kernel would otherwise keep
+                # them open, and `docker exec` would not return after we exit.
+                process = subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+                )
+                relays = [
+                    threading.Thread(target=_relay_output, args=(src, dst), daemon=True)
+                    for src, dst in (
+                        (process.stdout, sys.stdout),
+                        (process.stderr, sys.stderr),
+                    )
+                ]
+                for relay in relays:
+                    relay.start()
                 process.wait()
+                # Short bound: a leaked grandchild may still hold the pipes.
+                for relay in relays:
+                    relay.join(timeout=5)
 
             if not use_fork_worker:
                 elapsed = time.perf_counter() - file_tic
@@ -351,6 +379,7 @@ def run_unittest_files(
         attempt = 1
         file_passed = False
         was_retried = False
+        unkillable = False
 
         while attempt <= (max_attempts if enable_retry else 1):
             file_timeout = first_timeout if attempt == 1 else base_timeout
@@ -410,7 +439,13 @@ def run_unittest_files(
                     fork_worker.close(terminate=True)
                     fork_worker = None
                 elif process is not None:
-                    kill_process_tree(process.pid)
+                    try:
+                        kill_process_tree(process.pid)
+                    except RuntimeError as e:
+                        # A process that survives SIGKILL is stuck in the kernel,
+                        # usually in the GPU driver; the device is unusable now.
+                        logger.info(f"\n{e}\n")
+                        unkillable = True
                 time.sleep(5)
                 # TimeoutError aborts run_one_file before its elapsed write;
                 # record the timeout cap as an upper bound so the file still
@@ -418,7 +453,7 @@ def run_unittest_files(
                 file_elapsed[filename] = float(file_timeout)
                 # Retry once on timeout: usually a stuck server / hung device.
                 # A real hang times out again and is reported.
-                if enable_retry and attempt < max_attempts:
+                if enable_retry and attempt < max_attempts and not unkillable:
                     logger.info(
                         f"\n[CI Retry] {filename} timed out after "
                         f"{file_timeout}s; waiting {retry_wait_seconds}s "
@@ -430,7 +465,10 @@ def run_unittest_files(
                 logger.info(f"\n✗ TIMEOUT: {filename} after {file_timeout} seconds\n")
                 if was_retried:
                     retried_tests.append((filename, attempt, "timeout"))
-                failed_tests.append((filename, f"timeout after {file_timeout}s"))
+                reason = f"timeout after {file_timeout}s"
+                if unkillable:
+                    reason += "; process could not be killed"
+                failed_tests.append((filename, reason))
                 break
 
         if not file_passed:
@@ -455,6 +493,12 @@ def run_unittest_files(
             except OSError:
                 pass
 
+        if unkillable:
+            logger.info(
+                "\nStopping the suite: a test process survived SIGKILL, so the "
+                "remaining files would run on a stuck device.\n"
+            )
+            break
         if not file_passed and not continue_on_error:
             break
 
