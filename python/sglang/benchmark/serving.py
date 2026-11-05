@@ -759,7 +759,24 @@ async def async_request_sglang_generate(
                         else:
                             data = orjson.loads(sse_data)
 
+                            if "error" in data:
+                                error = data["error"]
+                                if isinstance(error, dict):
+                                    error = error.get("message") or error
+                                output.error = str(error or "Server returned an error")
+                                break
+
                             _meta_info = data.get("meta_info") or {}
+                            finish_reason = _meta_info.get("finish_reason")
+                            if (
+                                isinstance(finish_reason, dict)
+                                and finish_reason.get("type") == "abort"
+                            ):
+                                output.error = str(
+                                    finish_reason.get("message") or "Request aborted"
+                                )
+                                break
+                            output_len = _meta_info.get("completion_tokens", output_len)
                             if _meta_info.get("spec_accept_length") is not None:
                                 output.spec_accept_length = _meta_info[
                                     "spec_accept_length"
@@ -780,7 +797,6 @@ async def async_request_sglang_generate(
                             if "text" in data and data["text"]:
                                 timestamp = time.perf_counter()
                                 generated_text = data["text"]
-                                output_len = data["meta_info"]["completion_tokens"]
 
                                 # First token
                                 if ttft == 0.0:
@@ -800,9 +816,9 @@ async def async_request_sglang_generate(
                                 last_output_len = output_len
 
                     output.generated_text = generated_text
-                    output.success = True
+                    output.success = not output.error
                     output.latency = latency
-                    output.output_len = output_len
+                    output.output_len = output_len if output.success else 0
                 else:
                     output.error = (
                         (response.reason or "") + ": " + (await response.text())
