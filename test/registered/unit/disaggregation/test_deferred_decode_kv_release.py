@@ -596,7 +596,7 @@ class TestResolveDeferredReleases(CustomTestCase):
             discard.assert_not_called()
             reduce.side_effect = None
             q.resolve_deferred_releases()
-            discard.assert_called_once_with(entries[1].req, q.tree_cache, "host_pool")
+            discard.assert_called_once_with(entries[1].req, q.tree_cache)
             self.assertEqual(q.req_to_metadata_buffer_idx_allocator.freed, [2])
             mgr.note_abort_ack(1, 0, generations[1])
             q.resolve_deferred_releases()

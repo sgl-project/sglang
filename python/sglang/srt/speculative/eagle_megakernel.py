@@ -14,6 +14,7 @@ from sglang.srt.kernel_plugins.nvidia.binding import (
     megakernel_agree,
     megakernel_enabled,
     megakernel_entry,
+    megakernel_graph_variants,
 )
 from sglang.srt.kernel_plugins.nvidia.eagle_binding import (
     EagleDraftExtendIO,
@@ -32,6 +33,69 @@ if TYPE_CHECKING:
 
 # the draft model's entries
 DRAFT_ENTRIES = ("draft_loop", "draft_extend", "begin_draft_round")
+
+
+class EagleDraftRuntime:
+    """Always-present dispatch for draft workers and their graph runners."""
+
+    def bind_draft_graphs(self, runner: Any) -> frozenset[int]:
+        return frozenset()
+
+    def bind_extend_graphs(self, runner: Any) -> frozenset[int]:
+        return frozenset()
+
+    def graph_variants(
+        self,
+        model: torch.nn.Module,
+        runner: str,
+        *,
+        batch_sizes: frozenset[int],
+    ) -> Any:
+        return megakernel_graph_variants(model, runner, batch_sizes=batch_sizes)
+
+    def run_draft_loop(
+        self,
+        *,
+        runner: Any,
+        forward_batch: ForwardBatch,
+        stock: Callable[[], tuple],
+    ) -> tuple:
+        return stock()
+
+    def run_draft_extend(
+        self,
+        *,
+        runner: Any,
+        forward_batch: ForwardBatch,
+        stock: Callable[[], Any],
+    ) -> Any:
+        return stock()
+
+    def note_draft_extend(self) -> None:
+        pass
+
+    def extend_tokens(
+        self,
+        *,
+        runner: Any,
+        batch: ScheduleBatch,
+        stock: Callable[[], tuple],
+        active: bool = True,
+    ) -> tuple:
+        return stock()
+
+    def begin_draft_round(
+        self,
+        *,
+        runner: Any,
+        batch: ScheduleBatch,
+        draft_input: Any,
+        active: bool = True,
+    ) -> None:
+        pass
+
+
+STOCK_EAGLE_DRAFT_RUNTIME = EagleDraftRuntime()
 
 
 def _offers_eagle_entries(*, draft_model: Any) -> bool:
@@ -82,7 +146,13 @@ def init_eagle_megakernel(*, draft_worker: Any) -> Optional[EagleMegakernel]:
     return EagleMegakernel(draft_worker=draft_worker)
 
 
-class EagleMegakernel:
+def init_eagle_draft_runtime(*, draft_worker: Any) -> EagleDraftRuntime:
+    """Resolve draft dispatch once and always return a strategy."""
+    specialized = init_eagle_megakernel(draft_worker=draft_worker)
+    return STOCK_EAGLE_DRAFT_RUNTIME if specialized is None else specialized
+
+
+class EagleMegakernel(EagleDraftRuntime):
     """SGLang's side of the entries, never handed to a plugin: the batch sizes whose
     captured graphs run each entry, their SGLang-owned outputs, and where each draft
     round's input came from."""
@@ -130,11 +200,19 @@ class EagleMegakernel:
             )
         return frozenset(served)
 
-    def run_draft_loop(self, *, runner: Any, forward_batch: ForwardBatch) -> tuple:
+    def run_draft_loop(
+        self,
+        *,
+        runner: Any,
+        forward_batch: ForwardBatch,
+        stock: Callable[[], tuple],
+    ) -> tuple:
         """Inside the draft graph's capture: draft_loop's step in place of
         draft_forward, with the same outputs."""
         bs = int(forward_batch.batch_size)
-        graphs = self._draft_graphs[id(runner)]
+        graphs = self._draft_graphs.get(id(runner))
+        if graphs is None or bs not in graphs.steps:
+            return stock()
         draft_tokens = graphs.draft_tokens[:bs]
         spec_info = forward_batch.spec_info
         graphs.steps[bs](
@@ -198,13 +276,21 @@ class EagleMegakernel:
             self._extend_graphs[id(runner)] = SimpleNamespace(steps=served, out=out)
         return frozenset(served)
 
-    def run_draft_extend(self, *, runner: Any, forward_batch: ForwardBatch) -> Any:
+    def run_draft_extend(
+        self,
+        *,
+        runner: Any,
+        forward_batch: ForwardBatch,
+        stock: Callable[[], Any],
+    ) -> Any:
         """Inside the draft-extend graph's capture: draft_extend's step in place of
         the model's forward; the logits stay inside the megakernel."""
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 
         bs = int(forward_batch.batch_size)
-        graphs = self._extend_graphs[id(runner)]
+        graphs = self._extend_graphs.get(id(runner))
+        if graphs is None or bs not in graphs.steps:
+            return stock()
         out = graphs.out
         spec_info = forward_batch.spec_info
         graphs.steps[bs](
@@ -242,23 +328,33 @@ class EagleMegakernel:
         self._input_seq += 1
 
     def extend_tokens(
-        self, *, runner: Any, batch: ScheduleBatch
-    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
-        """After a draft-extend replay: (topk_p, topk_index) of a graph draft_extend
-        ran, else None for SGLang's top-1."""
+        self,
+        *,
+        runner: Any,
+        batch: ScheduleBatch,
+        stock: Callable[[], tuple],
+        active: bool = True,
+    ) -> tuple:
+        """Return the final draft proposal, falling back to stock when unserved."""
         graphs = self._extend_graphs.get(id(runner))
-        if graphs is None or runner.bs not in graphs.steps:
-            return None
+        if not active or graphs is None or runner.bs not in graphs.steps:
+            return stock()
         self._served_input = (self._input_seq, _rids(batch))
         raw_bs = runner.raw_bs
         # the next replay rewrites the buffers before the next round reads them
         return (
+            None,
             graphs.out.topk_p[:raw_bs].clone(),
             graphs.out.topk_index[:raw_bs].clone(),
         )
 
     def begin_draft_round(
-        self, *, runner: Any, batch: ScheduleBatch, draft_input: Any
+        self,
+        *,
+        runner: Any,
+        batch: ScheduleBatch,
+        draft_input: Any,
+        active: bool = True,
     ) -> None:
         """Before a draft graph replays; tells a served batch size's draft_loop where
         its input came from."""
@@ -267,7 +363,8 @@ class EagleMegakernel:
         graphs = self._draft_graphs.get(id(runner))
         bs = len(batch.seq_lens)
         if (
-            self._begin_draft_round is None
+            not active
+            or self._begin_draft_round is None
             or graphs is None
             or _bucket(bs, runner.capture_bs) not in graphs.steps
         ):

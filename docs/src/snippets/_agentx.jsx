@@ -14,7 +14,39 @@
 //                            to block i of this cell's submitted router).
 //   point.patch[r]           later points: null | {replace: blocks} | per-block
 //                            {args: {flag: [values]|null}, env: {k: v|null}} | {block: full}.
-export const AgentX = ({ data }) => {
+// `data` may also be an array of such files (a generated snapshot plus a hand-maintained
+// platform): they render as one explorer, and each file's source.text labels its own hardware.
+export const AgentX = ({ data: input }) => {
+  // Concatenating shifts the cell indexes of cross-cell `ref` blocks and the `envRef` indexes, in
+  // base blocks and point patches alike.
+  const data = !Array.isArray(input) ? input : input.reduce((acc, d) => {
+    const shift = (b) => ({
+      ...b,
+      ...(b.ref ? { ref: [b.ref[0] + acc.cells.length, ...b.ref.slice(1)] } : {}),
+      ...(b.envRef !== undefined ? { envRef: b.envRef + acc.envs.length } : {}),
+    });
+    const shiftPatch = (p) => (!p ? p : Array.isArray(p)
+      ? p.map((x) => (x && x.block ? { ...x, block: shift(x.block) } : x))
+      : { ...p, replace: p.replace.map(shift) });
+    const cells = d.cells.map((c) => ({
+      ...c,
+      routers: Object.fromEntries(Object.entries(c.routers).map(([r, v]) => [r, { ...v, blocks: v.blocks.map(shift) }])),
+      points: c.points.map((pt) => (!pt.patch ? pt : {
+        ...pt,
+        patch: Object.fromEntries(Object.entries(pt.patch).map(([r, p]) => [r, shiftPatch(p)])),
+      })),
+    }));
+    return {
+      ...acc,
+      hardware: [...acc.hardware, ...d.hardware],
+      checkpoints: [...acc.checkpoints, ...d.checkpoints.filter((k) => !acc.checkpoints.some((a) => a.id === k.id))],
+      cells: [...acc.cells, ...cells],
+      envs: [...acc.envs, ...(d.envs || [])],
+      files: { ...acc.files, ...(d.files || {}) },
+      kvMooncake: acc.kvMooncake || d.kvMooncake,
+      hardwareText: { ...acc.hardwareText, ...Object.fromEntries(d.hardware.map((h) => [h.id, d.source.text || {}])) },
+    };
+  }, { ...input[0], hardware: [], checkpoints: [], cells: [], envs: [], files: {}, kvMooncake: null, hardwareText: {} });
   if (!data || !data.cells) {
     return <div style={{padding: 12, color: "#b91c1c"}}>AgentX: missing <code style={S.code}>data</code> prop</div>;
   }
@@ -470,11 +502,13 @@ export const AgentX = ({ data }) => {
     a: { color: accent, textDecoration: "underline" },
   };
 
+  // Pages whose launches were not measured in InferenceX name their source in data.source.text.
+  const T = (data.hardwareText || {})[hw] || data.source.text || {};
   const statusText = {
-    verified: "✓ Verified in SemiAnalysis InferenceX AgentX",
+    verified: T.verified || "✓ Verified in SemiAnalysis InferenceX AgentX",
     "verified-pr": `✓ Verified in SemiAnalysis InferenceX AgentX (PR #${point.pr}, pending merge)`,
     "in-progress": `◐ In progress in SemiAnalysis InferenceX AgentX (PR #${point.pr})`,
-    derived: "Derived — not run in SemiAnalysis InferenceX AgentX",
+    derived: T.derived || "Derived — not run in SemiAnalysis InferenceX AgentX",
   }[status];
   const routerLabel = { sglang: "SGLang", dynamo: "Dynamo + SGLang" };
   const concLabel = (p) => `c${p.concs.join(" / c")}`;
@@ -541,7 +575,7 @@ export const AgentX = ({ data }) => {
           {Object.keys(cell.routers).sort().map((r) => (
             <button key={r} value={r} style={S.chip(router === r)} onClick={() => pick(setRouter)(r)}>
               {routerLabel[r]}{r === cell.submitted ? " ✓" : ""}
-              <span style={S.sub}>{r === cell.submitted ? "as submitted to SA" : "derived"}</span>
+              <span style={S.sub}>{r === cell.submitted ? T.submitted || "as submitted to SA" : "derived"}</span>
             </button>
           ))}
         </div>
@@ -554,7 +588,7 @@ export const AgentX = ({ data }) => {
             {link(point.runUrl, "SA sweep run")}{point.runUrl && " · "}
             {point.prUrl && <>{link(point.prUrl, `InferenceX PR #${point.pr}`)} · </>}
             {point.jobUrl && <>{link(point.jobUrl, "job log")} · </>}
-            {point.date && <>dashboard date {point.date} · </>}
+            {point.date && <>{T.dateLabel || "dashboard date"} {point.date} · </>}
           </>}
           config <code style={S.code}>{cell.configKey}</code>
           {point.recipeUrl && <> · {link(point.recipeUrl, "recipe")}{point.override ? <> (<code style={S.code}>{point.override}</code>)</> : null}</>}
@@ -568,7 +602,7 @@ export const AgentX = ({ data }) => {
         )}
         {status === "derived" && (
           <ul style={S.list}>
-            <li>Derived from the verified launch ({routerLabel[cell.submitted]}, {KV_LABEL[point.kv].toLowerCase()}); SemiAnalysis did not run this combination.</li>
+            <li>Derived from the verified launch ({routerLabel[cell.submitted]}, {KV_LABEL[point.kv].toLowerCase()}); {T.notRun || "SemiAnalysis did not run this combination"}.</li>
             {router !== cell.submitted && (
               <li>Router: re-rendered with srt-slurm's {router === "dynamo" ? "Dynamo" : "SGLang router"} frontend. Engine flags are unchanged; only the launcher, routing and router-specific flags differ.</li>
             )}
@@ -583,6 +617,7 @@ export const AgentX = ({ data }) => {
         )}
         <ul style={S.list}>
           {cell.disclosures.includes("synthetic-acceptance") && point.goldenAL && (
+            T.acceptance ? <li>{T.acceptance.replace("{al}", point.goldenAL)}</li> :
             <li>{point.status === "in-progress" ? "The pending submission specifies" : "SemiAnalysis measured this point with"} a synthetic speculative-decoding acceptance length of {point.goldenAL} (InferenceX golden AL via <code style={S.code}>SGLANG_SIMULATE_ACC_LEN</code>), which is not part of these commands. Real speed depends on your workload's acceptance.</li>
           )}
           {cell.disclosures.includes("chat-template") && (

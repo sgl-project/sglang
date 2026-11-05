@@ -42,6 +42,8 @@ from sglang.srt.managers.scheduler_components.request_list import (
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
+from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
+from sglang.srt.mem_cache.common import RetractionBackup
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_context, publish, reset_context
@@ -917,6 +919,8 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.mm_receiver = None
         scheduler.grammar_manager = MagicMock()
         scheduler.send_abort_output = MagicMock()
+        scheduler.beam_coordinator = MagicMock()
+        scheduler.init_request_retirer()
         scheduler.enable_continuous_input_polling = False
         scheduler._engine_paused = True
         aborted, kept = self._make_req("aborted"), self._make_req("kept")
@@ -936,6 +940,31 @@ class TestSchedulerPauseGeneration(CustomTestCase):
             ContinueGenerationReqInput(torch_empty_cache=False)
         )
         prealloc_queue.add.assert_called_once_with(kept, is_rebootstrap=True)
+
+    def test_pd_decode_abort_finishes_a_retracted_request(self):
+        """A retracted request aborted while queued must leave finished, with its
+        cache-side state and KV backup released and one abort sent."""
+        scheduler = self._new_scheduler()
+        scheduler.send_abort_output = MagicMock()
+        scheduler.beam_coordinator = MagicMock()
+        scheduler.init_request_retirer()
+        prealloc_queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        prealloc_queue.scheduler = scheduler
+        prealloc_queue.retracted_queue = IndexedReqList(
+            ListKind.PD_RETRACTED, abort=prealloc_queue._abort_retracted
+        )
+        req = self._make_req("aborted")
+        req.kv.retraction_backup = RetractionBackup(cpu_tensors=object())
+        prealloc_queue.retracted_queue.join([req])
+
+        prealloc_queue.retracted_queue.abort(AbortReq(rid="aborted"))
+
+        self.assertIsInstance(req.finished_reason, FINISH_ABORT)
+        scheduler.tree_cache.finish.assert_called_once_with(
+            req.cache_request_handle, CacheRequestOutcome.ABORT
+        )
+        self.assertIsNone(req.kv.retraction_backup)
+        scheduler.send_abort_output.assert_called_once()
 
 
 if __name__ == "__main__":
