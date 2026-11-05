@@ -960,12 +960,37 @@ def _candidate_sets(scores, seq_lens, k, dcp_size, dcp_rank, **kwargs):
     return cand
 
 
-@pytest.mark.skipif(
+_needs_cluster_candidates = pytest.mark.skipif(
     is_hip()
     or not torch.cuda.is_available()
     or torch.cuda.get_device_capability()[0] not in (9, 10),
     reason="CUDA cluster candidate top-k (sm90 / sm100)",
 )
+
+
+@_needs_cluster_candidates
+@pytest.mark.parametrize("cluster_size", [2, 4])
+@torch.inference_mode()
+def test_topk_v2_candidates_cluster_long_row_ties(cluster_size: int) -> None:
+    k, dcp_size, dcp_rank, n = 32, 8, 3, (1 << 20) + 64
+    scores = torch.zeros(1, n, device="cuda")
+    scores[0, :64] = 1
+    scores[0, -64:] = 1
+    seq_lens = torch.tensor([n], dtype=torch.int32, device="cuda")
+    got = _candidate_sets(
+        scores,
+        seq_lens,
+        k,
+        dcp_size,
+        dcp_rank,
+        cluster_size=cluster_size,
+        cluster_floor=0,
+    )
+    want = torch.arange(k, dtype=torch.int32, device="cuda") * dcp_size + dcp_rank
+    assert torch.equal(got[0, :, 1].sort().values, want)
+
+
+@_needs_cluster_candidates
 @pytest.mark.parametrize("cluster_size", [2, 4])
 @pytest.mark.parametrize(
     "dist", ["randn", "ties", "dense_top", "top_bin"] + NARROW_DISTRIBUTIONS

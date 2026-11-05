@@ -760,7 +760,9 @@ topk_candidates_cluster_kernel(const __grid_constant__ TopKCandidatesParams para
   const auto bx = blockIdx.x;
   const auto seq_len = static_cast<uint32_t>(params.seq_lens[bx]);
   const auto topk = params.topk;
-  if (seq_len <= cluster_floor || seq_len <= topk) {
+  // Mode 2's cluster tie keys hold a 20-bit row index, so longer rows take one block.
+  constexpr uint32_t kMaxClusterLen = impl::kDeterministic ? 1u << impl::kDeterministicIdxBits : UINT32_MAX;
+  if (seq_len <= cluster_floor || seq_len <= topk || seq_len > kMaxClusterLen) {
     if (blockIdx.y != bx % kClusterSize) return;
     return candidates_one_block<kPDL>(params, bx, reinterpret_cast<RaggedSmem*>(&smem), s_topk_indices);
   }
