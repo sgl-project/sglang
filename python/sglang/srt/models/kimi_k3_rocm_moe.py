@@ -79,7 +79,7 @@ def build_tuned_front_gemm(*, weight: torch.Tensor) -> Optional[TunedFrontGemm]:
             f"1 <= MIN <= MAX; got {min_tokens}, {max_tokens}."
         )
     # Declines that need no AITER come first, so they warn even on an AITER without tgemm.
-    if unquant._skip_aiter_unquant:
+    if unquant.is_aiter_unquant_skipped():
         print_warning_once(
             "SGLANG_OPT_HIP_K3_TUNED_MOE_FRONT is ignored with deterministic "
             "inference: AITER picks the kernel and split-K by batch size."
