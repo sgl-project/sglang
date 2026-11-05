@@ -254,7 +254,7 @@ struct FastTopKKernel {
     auto L = SymbolicSize{"length"};
     auto S = SymbolicSize{"input_stride"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     TensorMatcher({B, L})  // score
         .with_strides({S, 1})

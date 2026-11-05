@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from dataclasses import fields
 from typing import ClassVar
 
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
@@ -41,6 +42,40 @@ class DisaggServerArgsMixin:
         if role_type == RoleType.DECODER:
             return {**_none, "sp_degree": self.decoder_sp}
         return _none
+
+    def for_disagg_role(self, role_type: RoleType, **overrides):
+        """Derive a worker's arguments without inheriting resolved parent topology."""
+        values = vars(self)
+        kwargs = {
+            f.name: values[f.name]
+            for f in fields(self)
+            if f.init and f.name != "pipeline_config"
+        }
+        explicit = self._explicit_arg_names.copy()
+        # re-run automatic choices for this role's device count, not the parent's
+        for name in (
+            "tp_size",
+            "sp_degree",
+            "ulysses_degree",
+            "ring_degree",
+            "kv_gather_degree",
+            "enable_cfg_parallel",
+            "cfg_parallel_degree",
+            "hsdp_shard_dim",
+        ):
+            if name not in explicit:
+                kwargs.pop(name)
+        kwargs["sp_split_auto"] = False
+        # role-specific flags override explicit generic flags; validation stays shared
+        for name, value in self.get_role_parallelism(role_type).items():
+            if value is not None:
+                kwargs[name] = value
+                explicit.add(name)
+        kwargs.update(overrides)
+        kwargs.update(
+            disagg_role=role_type, disagg_mode=True, _explicit_arg_names=explicit
+        )
+        return type(self).from_kwargs(**kwargs)
 
     def derive_pool_result_endpoint(self) -> str:
         host, base_port = parse_tcp_host_port(
