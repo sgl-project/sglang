@@ -90,16 +90,17 @@ class KPoolCpInfo:
 class KPoolExtendPlan:
     writes: PoolWriteRows
     tails: TailWriteRows
-    pooled_seq_lens_expanded: torch.Tensor
-    seq_lens_expanded: torch.Tensor
-    ragged_concat_page_table: torch.Tensor
-    ragged_q_ks: torch.Tensor
-    ragged_q_ke: torch.Tensor
-    ragged_total_k_rows: int
-    ragged_k_u8: Optional[torch.Tensor]
-    ragged_k_scale: Optional[torch.Tensor]
-    ragged_paged_page_table: Optional[torch.Tensor]
-    ragged_paged_page_table_row_index: Optional[torch.Tensor]
+    # GPU read metadata is absent from write-only NPU plans.
+    pooled_seq_lens_expanded: Optional[torch.Tensor] = None
+    seq_lens_expanded: Optional[torch.Tensor] = None
+    ragged_concat_page_table: Optional[torch.Tensor] = None
+    ragged_q_ks: Optional[torch.Tensor] = None
+    ragged_q_ke: Optional[torch.Tensor] = None
+    ragged_total_k_rows: int = 0
+    ragged_k_u8: Optional[torch.Tensor] = None
+    ragged_k_scale: Optional[torch.Tensor] = None
+    ragged_paged_page_table: Optional[torch.Tensor] = None
+    ragged_paged_page_table_row_index: Optional[torch.Tensor] = None
     cp: Optional[KPoolCpInfo] = None
 
 
@@ -243,6 +244,7 @@ def _kpool_cpu_plan(
     *,
     local_extend_seq_lens_cpu: Optional[List[int]] = None,
     local_seq_lens_cpu: Optional[List[int]] = None,
+    build_ragged_metadata: bool = True,
 ) -> _KPoolCpuPlan:
     plan = _KPoolCpuPlan()
 
@@ -264,17 +266,18 @@ def _kpool_cpu_plan(
         req_pool_indices_cpu,
     )
 
-    if local_extend_seq_lens_cpu is None:
-        local_extend_seq_lens_cpu = extend_seq_lens_cpu
-        local_seq_lens_cpu = seq_lens_cpu
+    if build_ragged_metadata:
+        if local_extend_seq_lens_cpu is None:
+            local_extend_seq_lens_cpu = extend_seq_lens_cpu
+            local_seq_lens_cpu = seq_lens_cpu
 
-    _append_local_rows(
-        plan,
-        kpool,
-        index_page_size,
-        local_extend_seq_lens_cpu,
-        local_seq_lens_cpu,
-    )
+        _append_local_rows(
+            plan,
+            kpool,
+            index_page_size,
+            local_extend_seq_lens_cpu,
+            local_seq_lens_cpu,
+        )
     return plan
 
 
@@ -283,7 +286,7 @@ def _kpool_plan_to_device(
     forward_batch: ForwardBatch,
     full_real_page_table: torch.Tensor,
     local_real_page_table: torch.Tensor,
-    local_seqlens_expanded: torch.Tensor,
+    local_seqlens_expanded: Optional[torch.Tensor],
     local_req_pool_indices: torch.Tensor,
     kpool: int,
     index_page_size: int,
@@ -364,19 +367,10 @@ def _kpool_plan_to_device(
         c += n_tail
         tail_n_write_t = i32_gpu[c : c + n_tail]
         c += n_tail
-        ragged_pool_pages_t = i32_gpu[c : c + n_rag]
-        c += n_rag
-        ragged_q_len_t = i32_gpu[c : c + n_rag]
-        c += n_rag
-        cu_pages_excl_t = i32_gpu[c : c + n_rag]
-        c += n_rag
-        cu_q_len_excl_t = i32_gpu[c : c + n_rag]
     else:
         empty_i32 = torch.empty((0,), dtype=torch.int32, device=device)
         pool_n_from_tail_t = pool_tail_logical_base_t = empty_i32
         tail_dst_logical_start_t = tail_n_write_t = empty_i32
-        ragged_pool_pages_t = ragged_q_len_t = empty_i32
-        cu_pages_excl_t = cu_q_len_excl_t = empty_i32
 
     if n_pool > 0:
         pool_page_group = torch.div(
@@ -393,11 +387,38 @@ def _kpool_plan_to_device(
     else:
         pool_write_locs = torch.empty((0,), dtype=torch.int64, device=device)
 
+    plan = KPoolExtendPlan(
+        writes=PoolWriteRows(
+            req=pool_req_t,
+            pool_id=pool_pool_id_t,
+            n_from_tail=pool_n_from_tail_t,
+            chunk_src=pool_chunk_src_t,
+            tail_logical_base=pool_tail_logical_base_t,
+            write_loc=pool_write_locs,
+        ),
+        tails=TailWriteRows(
+            req=tail_req_t,
+            dst_logical_start=tail_dst_logical_start_t,
+            chunk_src=tail_chunk_src_t,
+            n_write=tail_n_write_t,
+        ),
+    )
+    if not build_ragged_metadata:
+        return plan
+
+    assert local_seqlens_expanded is not None
     pooled_seq_lens_expanded = torch.div(
         local_seqlens_expanded, kpool, rounding_mode="floor"
     ).to(torch.int32)
 
     if n_rag > 0:
+        ragged_pool_pages_t = i32_gpu[c : c + n_rag]
+        c += n_rag
+        ragged_q_len_t = i32_gpu[c : c + n_rag]
+        c += n_rag
+        cu_pages_excl_t = i32_gpu[c : c + n_rag]
+        c += n_rag
+        cu_q_len_excl_t = i32_gpu[c : c + n_rag]
         (
             ragged_concat_page_table,
             ragged_q_ks,
@@ -437,21 +458,8 @@ def _kpool_plan_to_device(
         ragged_k_u8 = None
         ragged_k_scale = None
 
-    return KPoolExtendPlan(
-        writes=PoolWriteRows(
-            req=pool_req_t,
-            pool_id=pool_pool_id_t,
-            n_from_tail=pool_n_from_tail_t,
-            chunk_src=pool_chunk_src_t,
-            tail_logical_base=pool_tail_logical_base_t,
-            write_loc=pool_write_locs,
-        ),
-        tails=TailWriteRows(
-            req=tail_req_t,
-            dst_logical_start=tail_dst_logical_start_t,
-            chunk_src=tail_chunk_src_t,
-            n_write=tail_n_write_t,
-        ),
+    return dataclasses.replace(
+        plan,
         pooled_seq_lens_expanded=pooled_seq_lens_expanded,
         seq_lens_expanded=local_seqlens_expanded,
         ragged_concat_page_table=ragged_concat_page_table,
@@ -462,11 +470,7 @@ def _kpool_plan_to_device(
         ragged_k_scale=ragged_k_scale,
         ragged_paged_page_table=ragged_paged_page_table,
         ragged_paged_page_table_row_index=ragged_paged_page_table_row_index,
-        cp=(
-            _kpool_cp_owner_rank(forward_batch, n_pool, device)
-            if build_ragged_metadata
-            else None
-        ),
+        cp=_kpool_cp_owner_rank(forward_batch, n_pool, device),
     )
 
 
@@ -506,7 +510,7 @@ def init_kpool_extend_metadata(
     index_page_size: int,
     topk_transform_method: Optional[TopkTransformMethod],
     full_real_page_table: torch.Tensor,
-    full_seqlens_expanded: torch.Tensor,
+    full_seqlens_expanded: Optional[torch.Tensor] = None,
     local_real_page_table: Optional[torch.Tensor] = None,
     local_seqlens_expanded: Optional[torch.Tensor] = None,
     local_extend_seq_lens_cpu: Optional[List[int]] = None,
@@ -537,6 +541,7 @@ def init_kpool_extend_metadata(
         index_page_size,
         local_extend_seq_lens_cpu=local_extend_seq_lens_cpu,
         local_seq_lens_cpu=local_seq_lens_cpu,
+        build_ragged_metadata=build_ragged_metadata,
     )
     plan = _kpool_plan_to_device(
         cpu,
@@ -699,19 +704,19 @@ def _alloc_kpool_write_plan_buffers(
     num_draft_tokens: int,
     kpool: int,
     device: torch.device,
-    is_verify: bool,
+    build_per_query_lengths: bool,
     is_v2: bool = False,
 ) -> KPoolWritePlan:
     max_closed_pools = kpool_max_closed_pools(num_draft_tokens, kpool)
-    verify_extras = {}
-    if is_verify:
+    extras = {}
+    if build_per_query_lengths:
         n_rows = max_bs * num_draft_tokens
-        verify_extras = dict(
+        extras = dict(
             pool_seqlens_per_q=torch.zeros(n_rows, dtype=torch.int32, device=device),
             seqlens_per_q=torch.zeros(n_rows, dtype=torch.int32, device=device),
         )
     if is_v2:
-        verify_extras["effective_n_per_batch"] = torch.zeros(
+        extras["effective_n_per_batch"] = torch.zeros(
             max_bs, dtype=torch.int32, device=device
         )
     return KPoolWritePlan(
@@ -722,7 +727,7 @@ def _alloc_kpool_write_plan_buffers(
             max_bs, max_closed_pools, dtype=torch.int64, device=device
         ),
         num_draft_tokens=num_draft_tokens,
-        **verify_extras,
+        **extras,
     )
 
 
@@ -747,7 +752,7 @@ def init_kpool_write_plan_capture(
         num_draft_tokens=num_draft_tokens,
         kpool=kpool,
         device=device,
-        is_verify=is_verify,
+        build_per_query_lengths=is_verify,
         is_v2=is_v2,
     )
     if is_verify and build_schedule_metadata:
@@ -927,10 +932,6 @@ def update_kpool_write_plan_npu(
         f"replay shape={expected_write_loc_shape}."
     )
 
-    has_per_q = plan.pool_seqlens_per_q is not None and plan.seqlens_per_q is not None
-    per_q_out = plan.pool_seqlens_per_q if has_per_q else None
-    seq_per_q_out = plan.seqlens_per_q if has_per_q else None
-
     # Graph replay reuses fixed-size plan buffers. Refresh the accepted-token
     # counts before updating the plan to retain draft-v2 valid-row masking.
     if is_v2 and plan.effective_n_per_batch is not None:
@@ -957,8 +958,8 @@ def update_kpool_write_plan_npu(
         write_start_out=plan.write_start,
         tail_logical_start_out=plan.tail_logical_start,
         write_loc_out=plan.write_loc,
-        pool_seqlens_per_q_out=per_q_out,
-        seqlens_per_q_out=seq_per_q_out,
+        pool_seqlens_per_q_out=None,
+        seqlens_per_q_out=None,
         kpool=pool_size,
         num_draft_tokens=num_draft_tokens,
         index_page_size=slots_per_page,

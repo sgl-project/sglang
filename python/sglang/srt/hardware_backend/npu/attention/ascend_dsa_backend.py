@@ -35,10 +35,6 @@ class AscendDSAForwardMetadata(ForwardMetadata):
     cache_seqlens_int32: Optional[torch.Tensor] = None
     real_page_table: Optional[torch.Tensor] = None
 
-    # ── DSA indexer (consumed by IndexerKPool.forward_npu) ──
-    dsa_seqlens_expanded: Optional[torch.Tensor] = None
-    token_to_batch_idx: Optional[torch.Tensor] = None
-
     # Request-level inputs for the A3/A5 pooled-key indexer.
     pool_query_ends: Optional[torch.Tensor] = None
     pool_key_lens: Optional[torch.Tensor] = None
@@ -65,8 +61,7 @@ class AscendDSAIndexerMetadata(BaseIndexerMetadata):
         return self.attn_metadata.real_page_table
 
     def get_seqlens_expanded(self) -> torch.Tensor:
-        assert self.attn_metadata.dsa_seqlens_expanded is not None
-        return self.attn_metadata.dsa_seqlens_expanded
+        raise NotImplementedError("NPU pooled-key reads use request-level lengths")
 
     def get_page_table_1(self) -> torch.Tensor:
         raise NotImplementedError(
@@ -74,8 +69,7 @@ class AscendDSAIndexerMetadata(BaseIndexerMetadata):
         )
 
     def get_token_to_batch_idx(self) -> torch.Tensor:
-        assert self.attn_metadata.token_to_batch_idx is not None
-        return self.attn_metadata.token_to_batch_idx
+        raise NotImplementedError("NPU pooled-key reads use request-level page tables")
 
     def topk_transform(self, logits: torch.Tensor, topk: int, **_) -> torch.Tensor:
         raise NotImplementedError(
@@ -152,38 +146,6 @@ class AscendDSAAttnBackend(AscendAttnBackend):
             device=forward_batch.seq_lens.device,
         )
 
-    def _query_layout_sizes(self, forward_batch: ForwardBatch) -> tuple[int, int]:
-        """Return packed-token count and maximum query length from host metadata."""
-        mode = forward_batch.forward_mode
-        batch_size = forward_batch.batch_size
-
-        if mode.is_target_verify() or mode.is_draft_extend_v2():
-            query_len = int(self.speculative_num_draft_tokens)
-            return batch_size * query_len, query_len
-
-        if mode.is_extend():
-            query_lens_cpu = forward_batch.extend_seq_lens_cpu
-            if query_lens_cpu is not None:
-                if len(query_lens_cpu) < batch_size:
-                    raise ValueError(
-                        "DSA metadata requires at least one host query length per "
-                        f"request; got {len(query_lens_cpu)} lengths for "
-                        f"batch_size={batch_size}."
-                    )
-                query_lens = [int(value) for value in query_lens_cpu[:batch_size]]
-                return sum(query_lens), max(query_lens, default=0)
-
-            # Normally extend has a CPU mirror. The packed input shape still lets
-            # custom ForwardBatch producers size the output without a device read.
-            if forward_batch.input_ids is None:
-                raise ValueError(
-                    "DSA extend metadata requires extend_seq_lens_cpu or input_ids"
-                )
-            total_q = int(forward_batch.input_ids.shape[0])
-            return total_q, total_q
-
-        return batch_size, 1
-
     def _cache_seqlens(self, forward_batch: ForwardBatch) -> torch.Tensor:
         cache_seqlens = forward_batch.seq_lens[: forward_batch.batch_size].to(
             torch.int32
@@ -223,8 +185,8 @@ class AscendDSAAttnBackend(AscendAttnBackend):
         query_lens = self._query_lens_device(forward_batch)
 
         # The KPool write plan indexes the page table with one row per request.
-        # A3/A5 pooled-key reads also keep request rows. Per-query expansion
-        # remains available for causal positions and the shared write plan.
+        # A3/A5 pooled-key reads also keep request rows. Only the shared MTP
+        # write kernel needs a per-query page-table view.
         max_seq_len_k = self._cache_seqlens_cpu_max(forward_batch)
         page_table_1 = self.req_to_token_pool.req_to_token[
             forward_batch.req_pool_indices[: forward_batch.batch_size],
@@ -250,34 +212,10 @@ class AscendDSAAttnBackend(AscendAttnBackend):
         else:
             real_page_table = real_page_table_computed
 
-        mode = forward_batch.forward_mode
-        needs_causal_expansion = (
-            mode.is_extend() or mode.is_target_verify() or mode.is_draft_extend_v2()
-        )
-        if needs_causal_expansion:
-            from sgl_kernel_npu.operators.indexer import expand_causal_seqlens
-
-            total_q, max_query_len = self._query_layout_sizes(forward_batch)
-            seq_lens_expanded, token_request_ids = expand_causal_seqlens(
-                cache_seqlens,
-                query_lens,
-                device,
-                total_q,
-                max_query_len,
-            )
-        else:
-            seq_lens_expanded = None
-            token_request_ids = torch.arange(
-                forward_batch.batch_size,
-                device=page_table_1.device,
-                dtype=torch.int64,
-            )
         # ── Populate only consumed fields ──
         metadata.page_size = self.page_size
         metadata.cache_seqlens_int32 = cache_seqlens
         metadata.real_page_table = real_page_table
-        metadata.dsa_seqlens_expanded = seq_lens_expanded
-        metadata.token_to_batch_idx = token_request_ids
         self._update_pool_indexer_metadata(metadata, cache_seqlens, query_lens)
 
         # Allocate the plan once during capture; _replay_dsa_metadata refreshes
@@ -289,7 +227,6 @@ class AscendDSAAttnBackend(AscendAttnBackend):
                 metadata,
                 forward_batch,
                 metadata.real_page_table,
-                metadata.dsa_seqlens_expanded,
             )
 
     def _update_pool_indexer_metadata(
@@ -332,7 +269,6 @@ class AscendDSAAttnBackend(AscendAttnBackend):
         metadata: AscendDSAForwardMetadata,
         forward_batch: ForwardBatch,
         real_page_table: torch.Tensor,
-        seq_lens_expanded: torch.Tensor,
     ) -> None:
         """Build shared KPool plans without GPU ragged-logits metadata."""
         from sglang.srt.layers.attention.dsa.kpool_plan import (
@@ -355,7 +291,6 @@ class AscendDSAAttnBackend(AscendAttnBackend):
                 index_page_size=slots_per_page,
                 topk_transform_method=None,
                 full_real_page_table=real_page_table,
-                full_seqlens_expanded=seq_lens_expanded,
                 build_ragged_metadata=False,
             )
             metadata.kpool_extend_plan = planned.kpool_extend_plan
@@ -380,7 +315,7 @@ class AscendDSAAttnBackend(AscendAttnBackend):
             num_draft_tokens=num_draft_tokens,
             kpool=pool_size,
             device=forward_batch.seq_lens.device,
-            is_verify=True,
+            build_per_query_lengths=False,
             is_v2=is_v2,
         )
         metadata.kpool_write_plan = plan
@@ -471,52 +406,7 @@ class AscendDSAAttnBackend(AscendAttnBackend):
             metadata, cache_seqlens, query_lens, replay=True
         )
 
-        # 3. dsa_seqlens_expanded — update causal lengths for each query token
-        needs_causal_expansion = (
-            forward_mode.is_extend()
-            or forward_mode.is_target_verify()
-            or forward_mode.is_draft_extend_v2()
-        )
-        total_q, max_query_len = self._query_layout_sizes(forward_batch)
-        if needs_causal_expansion:
-            from sgl_kernel_npu.operators.indexer import expand_causal_seqlens
-
-            expected_shape = (total_q,)
-            if (
-                metadata.dsa_seqlens_expanded is None
-                or metadata.dsa_seqlens_expanded.shape != expected_shape
-                or metadata.token_to_batch_idx is None
-                or metadata.token_to_batch_idx.shape != expected_shape
-            ):
-                raise RuntimeError(
-                    "DSA graph replay packed-query shape differs from capture: "
-                    "captured_seqlens="
-                    f"{getattr(metadata.dsa_seqlens_expanded, 'shape', None)}, "
-                    "captured_token_map="
-                    f"{getattr(metadata.token_to_batch_idx, 'shape', None)}, "
-                    f"replay={expected_shape}, batch_size={bs}."
-                )
-            expand_causal_seqlens(
-                cache_seqlens,
-                query_lens,
-                cache_seqlens.device,
-                total_q,
-                max_query_len,
-                seqlens_out=metadata.dsa_seqlens_expanded,
-                token_to_batch_out=metadata.token_to_batch_idx,
-            )
-        else:
-            expected_shape = (bs,)
-            if metadata.token_to_batch_idx is None or (
-                metadata.token_to_batch_idx.shape != expected_shape
-            ):
-                raise RuntimeError(
-                    "DSA graph replay token-map shape differs from capture: "
-                    f"captured={getattr(metadata.token_to_batch_idx, 'shape', None)}, "
-                    f"replay={expected_shape}, batch_size={bs}."
-                )
-            torch.arange(bs, out=metadata.token_to_batch_idx)
-        # 4. kpool_write_plan — update for verify/draft-extend-v2.
+        # 3. kpool_write_plan — update for verify/draft-extend-v2.
         # Plain decode has no plan because its index-cache update consumes the
         # ForwardBatch and indexer metadata tensors directly.
         if (

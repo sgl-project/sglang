@@ -181,23 +181,6 @@ def _pack_pool_key_indexer_indices(
     return torch.where(valid_rows.unsqueeze(1), result, -1)
 
 
-def _a5_full_topk_for_short_sequences(topk_result, causal_lens):
-    """Select all causal tokens below the A5 2048-token sparse threshold.
-
-    Use device lengths, not a Python max(seq_lens_cpu) branch: a captured
-    decode graph must keep working as requests cross the threshold.
-    """
-    n_real = min(topk_result.shape[0], causal_lens.shape[0])
-    lengths = causal_lens[:n_real].to(torch.int32).unsqueeze(1)
-    indices = torch.arange(
-        topk_result.shape[1], dtype=torch.int32, device=topk_result.device
-    ).unsqueeze(0)
-    full = torch.where(indices < lengths, indices, -1)
-    result = torch.full_like(topk_result, -1)
-    result[:n_real] = torch.where(lengths < 2048, full, topk_result[:n_real])
-    return result
-
-
 class IndexerKPool(MultiPlatformOp):
     def __init__(
         self,
@@ -344,14 +327,6 @@ class IndexerKPool(MultiPlatformOp):
             and not is_in_breakable_cuda_graph()
             and not dsa_use_prefill_cp(forward_batch)
         )
-
-    @torch.compile(dynamic=True, disable=is_npu())
-    def _get_logits_head_gate_npu(self, x: torch.Tensor):
-        weights, _ = self.weights_proj(x.float())
-        scale = self.n_heads**-0.5 * self.softmax_scale
-        weights = weights * scale
-        weights = weights.unsqueeze(-1)
-        return weights
 
     @staticmethod
     def _get_index_k_read_buffer(pool, layer_id: int) -> torch.Tensor:
@@ -2093,16 +2068,6 @@ class IndexerKPool(MultiPlatformOp):
             valid_mask,
         )
 
-    def _fix_short_sequence_topk_a5(self, topk_result, metadata, mode):
-        if not is_npu_arch35() or self.index_topk < 2048:
-            return topk_result
-        causal_lens = (
-            metadata.get_seqlens_int32()
-            if mode.is_decode_or_idle()
-            else metadata.get_seqlens_expanded()
-        )
-        return _a5_full_topk_for_short_sequences(topk_result, causal_lens)
-
     def _compress_write_mtp_npu(
         self,
         key: torch.Tensor,
@@ -2215,188 +2180,3 @@ class IndexerKPool(MultiPlatformOp):
                 chunk_src_start=tails.chunk_src,
                 n_write=tails.n_write,
             )
-
-    def _prepare_decode_indexer_inputs_npu(self, x, metadata):
-        """Fused decode prep for npu_lightning_indexer inputs (2 Triton kernels).
-
-        Replaces _get_logits_head_gate_npu (weights GEMM + scale + bf16 cast)
-        and the torch-side pool_seqlens / pool_block_tables construction, which
-        torch.compile splits into ~13 small ops.
-        """
-        from sgl_kernel_npu.operators.indexer import (
-            kpool_indexer_prepare_decode_input,
-        )
-
-        seqlens_32 = metadata.get_seqlens_int32()
-        # Decode may run with a padded query batch (graph capture); the kernel
-        # derives N from x.shape and asserts it equals the seqlens row count.
-        x = x[: seqlens_32.shape[0]]
-        block_tables = metadata.get_page_table_64().contiguous()
-
-        return kpool_indexer_prepare_decode_input(
-            x,
-            self.weights_proj.weight,
-            seqlens_32,
-            block_tables,
-            pool_size=self.index_kpool,
-            n_heads_pow=self.n_heads**-0.5,
-            softmax_scale=self.softmax_scale,
-        )
-
-    def _get_topk_paged_npu(
-        self, layer_id, query_bf16, weights, metadata, prepared
-    ) -> torch.Tensor:
-        """NPU paged topk via npu_lightning_indexer fused op on pooled cache.
-
-        Args:
-            prepared: (pool_seqlens, pool_block_tables) from fused decode prep.
-        """
-        import torch_npu
-
-        pool = get_token_to_kv_pool()
-        seqlens_32 = metadata.get_seqlens_int32()
-
-        num_q = query_bf16.shape[0]
-        n_real = seqlens_32.shape[0]
-        if n_real < num_q:
-            query_bf16 = query_bf16[:n_real]
-            weights = weights[:n_real]
-
-        pool_size = self.index_kpool
-        pool_seqlens, pool_block_tables = prepared
-
-        kv_cache = pool.get_index_k_with_scale_buffer(layer_id)
-
-        q_tnd = query_bf16.contiguous().view(n_real, self.n_heads, self.head_dim)
-        w_2d = weights[:n_real]
-        if w_2d.ndim == 3:
-            w_2d = w_2d.squeeze(-1)
-
-        actual_seq_lengths_q = torch.arange(
-            1, n_real + 1, dtype=torch.int32, device=query_bf16.device
-        )
-        n_pool_topk = self.index_topk // pool_size
-        result = torch_npu.npu_lightning_indexer(
-            query=q_tnd,
-            key=kv_cache,
-            weights=w_2d.to(torch.bfloat16),
-            actual_seq_lengths_query=actual_seq_lengths_q,
-            actual_seq_lengths_key=pool_seqlens,
-            block_table=pool_block_tables,
-            layout_query="TND",
-            layout_key="PA_BSND",
-            sparse_count=n_pool_topk,
-            sparse_mode=3,
-        )
-        pool_indices = result[0].squeeze(1)  # may be padded by NPU op
-        pool_indices = pool_indices[:n_real]  # trim padding
-
-        return self._expand_pool_topk_and_append_tail_batched(
-            pool_indices, seqlens_32, n_real, num_q
-        )
-
-    def _get_topk_ragged_npu(
-        self, layer_id, query_bf16, weights, metadata
-    ) -> torch.Tensor:
-        """NPU ragged topk via npu_lightning_indexer fused op on pooled cache.
-
-        Uses per-token causal pool seqlens (like decode per_token mode) so each
-        query token only sees pools up to its causal position.
-        """
-        import torch_npu
-        from sgl_kernel_npu.operators.indexer import (
-            build_pooled_page_table,
-        )
-
-        pool = get_token_to_kv_pool()
-        block_tables = metadata.get_page_table_64()
-        seqlens_expanded = metadata.get_seqlens_expanded()
-
-        num_q = query_bf16.shape[0]
-        n_real_tokens = seqlens_expanded.shape[0]
-
-        pool_size = self.index_kpool
-        # Per-token causal pool seqlens: token i sees pools [0 .. seqlens_expanded[i]//pool_size)
-        pool_seqlens_per_token = torch.div(
-            seqlens_expanded, pool_size, rounding_mode="floor"
-        ).to(torch.int32)
-
-        # Expand block_tables from per-request to per-token
-        token_request_ids = metadata.get_token_to_batch_idx()
-        block_tables_per_token = block_tables[token_request_ids]
-        pool_block_tables = build_pooled_page_table(
-            block_tables_per_token, pool_size
-        ).contiguous()
-
-        kv_cache = pool.get_index_k_with_scale_buffer(layer_id)
-
-        q_tnd = (
-            query_bf16[:n_real_tokens]
-            .contiguous()
-            .view(n_real_tokens, self.n_heads, self.head_dim)
-        )
-        w_2d = weights[:n_real_tokens]
-        if w_2d.ndim == 3:
-            w_2d = w_2d.squeeze(-1)
-
-        # Treat each token as a 1-token request (like decode per_token mode)
-        actual_seq_lengths_q = torch.arange(
-            1, n_real_tokens + 1, dtype=torch.int32, device=query_bf16.device
-        )
-
-        n_pool_topk = self.index_topk // pool_size
-        result = torch_npu.npu_lightning_indexer(
-            query=q_tnd,
-            key=kv_cache,
-            weights=w_2d.to(torch.bfloat16),
-            actual_seq_lengths_query=actual_seq_lengths_q,
-            actual_seq_lengths_key=pool_seqlens_per_token,
-            block_table=pool_block_tables,
-            layout_query="TND",
-            layout_key="PA_BSND",
-            sparse_count=n_pool_topk,
-            sparse_mode=3,
-        )
-        pool_indices = result[0].squeeze(1)  # [n_real_tokens, n_pool_topk]
-        pool_indices = pool_indices[:n_real_tokens]  # truncate padding rows
-
-        return self._expand_pool_topk_and_append_tail_batched(
-            pool_indices, seqlens_expanded, n_real_tokens, num_q
-        )
-
-    def _expand_pool_topk_and_append_tail_batched(
-        self,
-        pool_indices: torch.Tensor,
-        seq_lens_per_token: torch.Tensor,
-        n_real: int,
-        num_q_padded: int,
-    ) -> torch.Tensor:
-        """Expand pool-level topk indices to token-level and append tail tokens.
-
-        All batch rows are processed together without per-request loops.
-
-        Args:
-            pool_indices: [>=n_real, n_pool_topk] — selected pool positions per query
-            seq_lens_per_token: [>=n_real] — total seq_len of the request each query belongs to
-            n_real: number of real query rows
-            num_q_padded: output row count (>= n_real, padded rows filled with -1)
-
-        Returns:
-            [num_q_padded, index_topk + pool_size - 1] int32 token-level indices
-        """
-        from sgl_kernel_npu.operators.indexer import (
-            expand_kpool_group_and_tail_to_topk,
-        )
-
-        pool_size = self.index_kpool
-        n_pool_topk = pool_indices.shape[1]
-        index_topk = n_pool_topk * pool_size
-
-        return expand_kpool_group_and_tail_to_topk(
-            pool_indices.to(torch.int32),
-            seq_lens_per_token.to(torch.int32),
-            n_real,
-            num_q_padded,
-            pool_size,
-            index_topk,
-        )
