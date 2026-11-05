@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import inspect
 import itertools
 from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Tuple, Union
 
@@ -300,6 +301,17 @@ def aiter_has_fp4_rowgroup() -> bool:
     return True
 
 
+@functools.lru_cache(maxsize=1)
+def aiter_has_rowgroup_abs() -> bool:
+    """Whether AITER's row-group kernel takes the |s| epilogue and tile maxima."""
+    try:
+        from aiter.ops.flydsl import flydsl_pa_mqa_logits_fp4_rowgroup
+    except Exception:
+        return False
+    params = inspect.signature(flydsl_pa_mqa_logits_fp4_rowgroup).parameters
+    return "abs_epilogue" in params and "out_tile_max" in params
+
+
 def prepare_fp4_rowgroup_decode_workspace(
     page_table: torch.Tensor,
     rows_per_request: int,
@@ -373,11 +385,13 @@ def rowgroup_prefill_query_start_loc(
     return query_start_loc
 
 
-def _rowgroup_plan(prefill: bool, **shape):
+def _rowgroup_plan(prefill: bool, abs_epilogue: bool, **shape):
     """AITER's plan, but for prefill 8-row tiles 4 rows a wave in 4-wave workgroups (AITER's
     8-wave default there measured 31-41% slower on MI355X at 114K-1M keys)."""
     from aiter.ops.flydsl import make_fp4_mqa_plan
 
+    if abs_epilogue:  # the same, for every tile size: at most 4 rows a wave
+        return make_fp4_mqa_plan(**shape, prefill=True)
     plan = make_fp4_mqa_plan(**shape)
     if prefill and plan.tile_m // plan.heads == 8:
         plan = make_fp4_mqa_plan(**shape, rows_per_wave=4, num_warps=4)
@@ -499,14 +513,20 @@ def rowgroup_paged_mqa_logits(
     pages_per_block: int = 1,
     is_decode: bool = True,
     prefill_plan: bool = False,
+    abs_epilogue: bool = False,
+    tile_max: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """[rows, max_seq_len] fp32 logits from AITER's row-group kernel: sequence b's rows
     query_start_loc[b] .. [b + 1] - 1 score the keys of block_tables[b] up to their own
     row_ends. An entry names a 64-slot page of the pool, or with page8 pages_per_block of
     the pool's 8-slot pages (8: the 64-slot page table as is; 1: an 8-slot page each, the
     candidate table). Past a row's bound the logits are left unwritten; the length-aware
-    top-k never reads them."""
-    from aiter.ops.flydsl import flydsl_pa_mqa_logits_fp4
+    top-k never reads them. abs_epilogue scores with AITER's |s| epilogue, also writing each
+    row's 16-key maxima into tile_max when given."""
+    from aiter.ops.flydsl import (
+        flydsl_pa_mqa_logits_fp4,
+        flydsl_pa_mqa_logits_fp4_rowgroup,
+    )
 
     num_rows, heads = q_fp4.shape[0], q_fp4.shape[-2]
     if page8:
@@ -518,6 +538,7 @@ def rowgroup_paged_mqa_logits(
         page_size = _KV_BLOCK_SIZE
     plan = _rowgroup_plan(
         prefill_plan and not page8,
+        abs_epilogue,
         num_seqs=query_start_loc.shape[0] - 1,
         max_qlen=max_query_len,
         num_rows=num_rows,
@@ -527,6 +548,23 @@ def rowgroup_paged_mqa_logits(
         pages_per_block=pages_per_block,
     )
     logits = _alloc_logits(num_rows, max_seq_len, q_fp4.device, is_decode)
+    if abs_epilogue:  # options the dispatcher below does not pass on
+        flydsl_pa_mqa_logits_fp4_rowgroup(
+            plan,
+            q_fp4.view(torch.uint8).reshape(num_rows, heads, _HEAD_DIM // 2),
+            q_scale.reshape(num_rows, -1),
+            kv,
+            ks,
+            block_tables,
+            weights,
+            query_start_loc,
+            _as_int32_1d(row_ends),
+            weight_scale=weight_scale,
+            out=logits,
+            abs_epilogue=True,
+            out_tile_max=tile_max,
+        )
+        return logits
     flydsl_pa_mqa_logits_fp4(
         q_fp4.view(torch.uint8).reshape(num_rows, 1, heads, _HEAD_DIM // 2),
         q_scale.reshape(num_rows, 1, *_Q_SCALE_SHAPE),

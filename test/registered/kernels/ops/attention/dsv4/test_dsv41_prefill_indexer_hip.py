@@ -1,5 +1,5 @@
 """The V4.1 HIP dense prefill indexer on AITER's row-group kernel scores what the schedule kernel
-scores."""
+scores, and the tile-gated top-k selects what the stock top-k selects."""
 
 from __future__ import annotations
 
@@ -8,14 +8,19 @@ import sys
 import pytest
 import torch
 
+from sglang.kernels.ops.attention.dsv4.candidate_blocks_hip import (
+    topk_transform_paged_hip,
+)
 from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     LOW_RATIO_PAGE_TABLE_BUCKET,
     aiter_fp4_paged_mqa_logits,
     aiter_has_fp4_rowgroup,
+    aiter_has_rowgroup_abs,
     pack_fp4_query_flydsl,
     prepare_fp4_rowgroup_prefill_workspace,
     rowgroup_table_columns,
 )
+from sglang.kernels.ops.attention.dsv4.topk_tilegate_hip import TILE, TileGateTopK
 from sglang.kernels.ops.kvcache.dsv4_fp4_index_k_cache_hip import (
     store_fp4_index_k_cache_split,
 )
@@ -31,9 +36,13 @@ pytestmark = pytest.mark.skipif(
     not (is_hip() and is_gfx95_supported() and aiter_has_fp4_rowgroup()),
     reason="AITER's row-group FP4 MQA logits kernel (gfx95x, ROCm/aiter#6145).",
 )
+needs_abs = pytest.mark.skipif(
+    not aiter_has_rowgroup_abs(), reason="AITER's row-group |s| epilogue"
+)
 
 DEVICE = "cuda"
 PAGE = 64
+K = 512
 
 
 def build_prefill_case(extend_lens, contexts, heads=64, seed=0):
@@ -126,13 +135,96 @@ def assert_rows_close(got, ref, ends, rtol):
             assert err <= rtol * max(1.0, float(e.abs().max())), (r, err)
 
 
-def test_rowgroup_prefill_matches_schedule_kernel():
-    """8-row tiles with short tails, tiny tiles and an empty request: only the fp32
-    summation order differs."""
+@pytest.mark.parametrize("abs_epilogue", [False, pytest.param(True, marks=needs_abs)])
+def test_rowgroup_prefill_matches_schedule_kernel(abs_epilogue):
+    """8-row tiles with short tails, tiny tiles and an empty request. Row-group sums are
+    reordered (2e-6); the |s| epilogue's q' is 8 FP4 pieces (1e-5)."""
     case = build_prefill_case([16, 3, 9, 1, 0, 5], [700, 64, 1000, 33, 50, 6])
+    got = rowgroup_logits(case, abs_epilogue=abs_epilogue)
     assert_rows_close(
-        rowgroup_logits(case), schedule_logits(case), case["row_ends"], 2e-6
+        got, schedule_logits(case), case["row_ends"], 1e-5 if abs_epilogue else 2e-6
     )
+
+
+def run_gate(scores, lens, page_table, tile_max, gate):
+    """(gated, stock) (page, raw) top-k outputs."""
+    outs = []
+    for gated in (True, False):
+        page, raw = (
+            torch.full((scores.shape[0], K), -7, dtype=torch.int32, device=DEVICE)
+            for _ in range(2)
+        )
+        if gated:
+            gate(scores, lens, page_table, page, PAGE, raw, tile_max=tile_max)
+        else:
+            topk_transform_paged_hip(scores, lens, page_table, page, PAGE, raw)
+        outs.append((page, raw))
+    return outs
+
+
+def assert_selects_stock_set(scores, lens, page_table, tile_max, gate):
+    """Stock's value multiset on every row, its index set where the k-th value is not tied,
+    and its page transform."""
+    (g_page, g_raw), (_, s_raw) = run_gate(scores, lens, page_table, tile_max, gate)
+    for r, n in enumerate(lens.tolist()):
+        g, s = g_raw[r][g_raw[r] >= 0], s_raw[r][s_raw[r] >= 0]
+        assert g.numel() == s.numel() == min(n, K) == K - int((g_raw[r] == -1).sum()), r
+        assert torch.equal(
+            scores[r, g.long()].sort().values, scores[r, s.long()].sort().values
+        ), r
+        if s.numel() and int((scores[r, :n] == scores[r, s.long()].min()).sum()) == 1:
+            assert set(g.tolist()) == set(s.tolist()), r
+        pos = g_raw[r].long()
+        ok = pos >= 0
+        want = page_table[r].long()[pos[ok] // PAGE] * PAGE + pos[ok] % PAGE
+        assert torch.equal(g_page[r][ok].long(), want) and torch.equal(
+            g_page[r][~ok], g_raw[r][~ok]
+        ), r
+
+
+def test_tilegate_topk_selects_the_stock_set():
+    """Short, empty and tie-heavy rows (one overflowing the candidate cap), with garbage past
+    each row's bound."""
+    gen = torch.Generator(device=DEVICE).manual_seed(3)
+    width = 64 * 1024
+    lens = [0, 5, 17, 511, 513, 2000, 40000, 65536, 65536, 50001, 33]
+    rows = len(lens)
+    scores = torch.randn(rows, width, generator=gen, device=DEVICE)
+    scores[6] = scores[6].round()  # exact ties at the boundary
+    scores[7] = 1.0  # every tile max ties: past the cap, the stock fallback
+    scores[8, ::97] += 50.0  # survivors over the whole row
+    scores[9] = (scores[9] * 4).round() / 4
+    lens = torch.tensor(lens, dtype=torch.int32, device=DEVICE)
+    col = torch.arange(width, device=DEVICE)
+    scores = torch.where(col < lens[:, None], scores, scores.new_tensor(1e30))
+    page_table = torch.stack(
+        [
+            torch.randperm(4 * width // PAGE, generator=gen, device=DEVICE)[
+                : width // PAGE
+            ]
+            for _ in range(rows)
+        ]
+    ).to(torch.int32)
+    gate = TileGateTopK(topk=K, tile_max_elems=rows * width // TILE, device=DEVICE)
+    tile_max = gate.tile_max(rows, width)
+    tile_max.copy_(scores.view(rows, -1, TILE).amax(dim=2))
+    assert_selects_stock_set(scores, lens, page_table, tile_max, gate)
+
+
+@needs_abs
+def test_tilegate_on_kernel_tile_maxima():
+    """End to end: the |s| kernel's tile maxima (last partial tiles unmasked) feed the gate."""
+    case = build_prefill_case([8, 3, 1], [60000, 33000, 40001], seed=11)
+    rows, width = case["page_table"].shape[0], case["workspace"].max_seq_len
+    gate = TileGateTopK(topk=K, tile_max_elems=rows * width // TILE, device=DEVICE)
+    tile_max = gate.tile_max(rows, width)
+    logits = rowgroup_logits(case, abs_epilogue=True, tile_max=tile_max)
+    lens = case["row_ends"]
+    for r, end in enumerate(lens.tolist()):
+        full = end // TILE
+        want = logits[r, : full * TILE].view(full, TILE).amax(dim=1)
+        assert torch.equal(tile_max[r, :full], want), r
+    assert_selects_stock_set(logits, lens, case["page_table"], tile_max, gate)
 
 
 if __name__ == "__main__":

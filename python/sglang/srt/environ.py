@@ -2052,6 +2052,12 @@ class Envs:
     # V4.1 ratio-2 prefill indexer on a 64-slot index-K pool: score on aiter's row-group FP4
     # kernel (a request's rows share each key load). Not bitwise: fp32 sums are reordered.
     SGLANG_HIP_DSV41_PREFILL_INDEXER_ROWGROUP = EnvBool(False)
+    # V4.1 ratio-1/2 prefill indexer on a 64-slot pool: aiter's row-group kernel with the |s|
+    # epilogue. Approximate: q' is 8 FP4 pieces (within 1e-5 of the row max in tests).
+    SGLANG_HIP_DSV41_PREFILL_INDEXER_ABS_EPILOGUE = EnvBool(False)
+    # With _ABS_EPILOGUE, full-row layers of 32K+ compressed keys take an exact top-k over the
+    # 16-key tiles whose max reaches the k-th best tile max; reserves ~280 MB a rank.
+    SGLANG_HIP_DSV41_PREFILL_INDEXER_TILE_TOPK = EnvBool(False)
     # DeepSeek-V4.1 mHC boundary (HIP): the 32-row Triton tile from _HC_BOUNDARY_WIDE_MIN_M rows (bitwise the same).
     SGLANG_HIP_MHC_BOUNDARY_WIDE_TILE = EnvBool(True)
 

@@ -84,6 +84,7 @@ from sglang.srt.layers.attention.dsv4.low_ratio_backend_hip import (
     low_ratio_identity_skip_enabled,
     low_ratio_index_topk_hip_decode,
     low_ratio_index_topk_hip_extend,
+    make_prefill_tilegate,
     refresh_low_ratio_prefill_workspaces,
 )
 from sglang.srt.layers.attention.dsv4.metadata import (
@@ -967,6 +968,13 @@ class DeepseekV4HipRadixBackend(
         )
         # published by the candidate-source layer, consumed by the later index-source layers
         self.candidate_masks = None
+        # the prefill indexer's tile-gated top-k, its scratch reserved at startup
+        self.prefill_tilegate = make_prefill_tilegate(
+            low_ratios=self.low_ratios,
+            page8_ratios=self.token_to_kv_pool.low_ratio_index_k_page8_ratios(),
+            index_topk=self.index_topk,
+            device=self.device,
+        )
         self.enable_deepseek_v4_fp4_indexer: bool = (
             get_exec().kernel.enable_deepseek_v4_fp4_indexer
         )

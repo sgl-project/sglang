@@ -32,6 +32,7 @@ from sglang.kernels.ops.attention.dsv4.candidate_blocks_hip import (
     with_candidate_page8_table,
 )
 from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
+    _LOGITS_BUDGET_ELEMS,
     LOW_RATIO_PAGE_TABLE_BUCKET,
     FP4DecodeWorkspace,
     FP4PrefillWorkspace,
@@ -39,6 +40,7 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     FP4RowgroupPrefillWorkspace,
     aiter_fp4_paged_mqa_logits,
     aiter_has_fp4_rowgroup,
+    aiter_has_rowgroup_abs,
     index_q_rope_pack_flydsl,
     index_q_rope_pack_weights_flydsl,
     logits_rows_per_chunk,
@@ -54,6 +56,7 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
 from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope_hip import (
     index_k_norm_rope_pack_store_split,
 )
+from sglang.kernels.ops.attention.dsv4.topk_tilegate_hip import TILE, TileGateTopK
 from sglang.kernels.ops.gemm.dsv4_indexer_head_weights_hip import indexer_head_weights
 from sglang.kernels.ops.gemm.router_gemv_hip import rocm_router_gemv_split_k
 from sglang.srt.environ import envs
@@ -109,6 +112,52 @@ def _warn_no_rowgroup() -> None:
     )
 
 
+_PREFILL_ABS_EPILOGUE_RATIOS = frozenset({1, 2})
+# full-row prefills from this many compressed keys take the tile-gated top-k (pays off from
+# 32K on MI355X)
+_TILEGATE_MIN_KEYS = 32768
+
+
+def _prefill_abs_epilogue_ratios(page8_ratios: FrozenSet[int]) -> FrozenSet[int]:
+    """The 64-slot-pool ratios whose dense prefill scores with AITER's |s| epilogue."""
+    if not envs.SGLANG_HIP_DSV41_PREFILL_INDEXER_ABS_EPILOGUE.get():
+        return frozenset()
+    if not (aiter_has_fp4_rowgroup() and aiter_has_rowgroup_abs()):
+        _warn_no_abs_epilogue()
+        return frozenset()
+    return _PREFILL_ABS_EPILOGUE_RATIOS - page8_ratios
+
+
+@functools.lru_cache(maxsize=1)
+def _warn_no_abs_epilogue() -> None:
+    logger.warning(
+        "SGLANG_HIP_DSV41_PREFILL_INDEXER_ABS_EPILOGUE is set but the installed AITER's "
+        "row-group kernel has no |s| epilogue (abs_epilogue / out_tile_max); keeping the stock "
+        "epilogue and top-k."
+    )
+
+
+def make_prefill_tilegate(
+    *,
+    low_ratios: Tuple[int, ...],
+    page8_ratios: FrozenSet[int],
+    index_topk: int,
+    device: torch.device,
+) -> Optional[TileGateTopK]:
+    """The tile-gated top-k of SGLANG_HIP_DSV41_PREFILL_INDEXER_TILE_TOPK, built at startup
+    so its scratch is reserved before serving."""
+    if not envs.SGLANG_HIP_DSV41_PREFILL_INDEXER_TILE_TOPK.get():
+        return None
+    if not _prefill_abs_epilogue_ratios(page8_ratios).intersection(low_ratios):
+        return None
+    return TileGateTopK(
+        topk=index_topk,
+        # a row chunk's logits fit the pooled block, so its tile maxima fit this
+        tile_max_elems=_LOGITS_BUDGET_ELEMS // TILE,
+        device=device,
+    )
+
+
 def _score_requests_rowgroup(
     *,
     page8: bool,
@@ -122,6 +171,8 @@ def _score_requests_rowgroup(
     req_lo: int,
     rows_per_request: List[int],
     row_ends: torch.Tensor,
+    abs_epilogue: bool = False,
+    tile_max: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Full-context logits of a page8 or 64-slot pool for rows, consecutive requests from
     req_lo on with rows_per_request rows each; a request's rows share every key load."""
@@ -146,6 +197,8 @@ def _score_requests_rowgroup(
         pages_per_block=8 if page8 else 1,
         is_decode=False,
         prefill_plan=True,
+        abs_epilogue=abs_epilogue,
+        tile_max=tile_max,
     )
 
 
@@ -265,7 +318,9 @@ def refresh_low_ratio_prefill_workspaces(
     is skipped: rows scored in logits row chunks build their own schedule."""
     previous = previous or {}
     workspaces = {}
-    rowgroup_ratios = _prefill_rowgroup_ratios(page8_ratios)
+    rowgroup_ratios = _prefill_rowgroup_ratios(
+        page8_ratios
+    ) | _prefill_abs_epilogue_ratios(page8_ratios)
     skip_unread = bool(rowgroup_ratios)
     for ratio, meta in metadata_by_ratio.items():
         if skip_unread and ratio not in page8_ratios and ratio not in rowgroup_ratios:
@@ -614,8 +669,10 @@ def low_ratio_index_topk_hip_extend(
     k_scale = pool.get_index_k_fp4_scale_buffer(layer.layer_id)
     prefill_workspace = metadata.fp4_low_ratio_prefill_workspaces.get(ratio)
     page8 = pool.low_ratio_index_k_page8(layer.layer_id)
-    rowgroup64 = not page8 and ratio in _prefill_rowgroup_ratios(
-        pool.low_ratio_index_k_page8_ratios()
+    page8_ratios = pool.low_ratio_index_k_page8_ratios()
+    abs_epilogue = not page8 and ratio in _prefill_abs_epilogue_ratios(page8_ratios)
+    rowgroup64 = abs_epilogue or (
+        not page8 and ratio in _prefill_rowgroup_ratios(page8_ratios)
     )
     if (page8 or rowgroup64) and not (
         isinstance(prefill_workspace, FP4RowgroupPrefillWorkspace)
@@ -629,13 +686,26 @@ def low_ratio_index_topk_hip_extend(
                 backend.max_context_len, ratio, LOW_RATIO_PAGE_TABLE_BUCKET
             ),
         )
+    # the |s| kernel also writes the tile maxima the gated top-k prunes with
+    tilegate = (
+        backend.prefill_tilegate
+        if abs_epilogue
+        and not (indexer.uses_candidates or indexer.is_candidate_source)
+        and max(lc_per_req) >= _TILEGATE_MIN_KEYS
+        else None
+    )
 
     def score_rows(
-        rows: slice, req_lo: int, rows_per_request: List[int]
+        rows: slice,
+        req_lo: int,
+        rows_per_request: List[int],
+        tile_max: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if page8 or rowgroup64:
             return _score_requests_rowgroup(
                 page8=page8,
+                abs_epilogue=abs_epilogue,
+                tile_max=tile_max,
                 q_fp4=q_fp4[rows],
                 q_scale=q_scale[rows],
                 weights=weights[rows],
@@ -708,9 +778,14 @@ def low_ratio_index_topk_hip_extend(
         if page8 and consume_rows is not None:
             select_rows_page8_consumer(rows, req_lo, rows_per_request, consume_rows)
             return
+        tile_max = None
+        if tilegate is not None:
+            tile_max = tilegate.tile_max(
+                rows.stop - rows.start, prefill_workspace.max_seq_len
+            )
         _select_topk_extend_hip(
             indexer=indexer,
-            logits=score_rows(rows, req_lo, rows_per_request),
+            logits=score_rows(rows, req_lo, rows_per_request, tile_max),
             lc_per_req=lc_per_req[req_lo:req_hi],
             extend_lens_cpu=rows_per_request,
             is_identity=group_is_identity,
@@ -721,6 +796,11 @@ def low_ratio_index_topk_hip_extend(
             raw_indices=raw_indices[rows] if raw_indices is not None else None,
             consume=consume_rows,
             publish=publish,
+            topk=(
+                topk_transform_paged_hip
+                if tile_max is None
+                else functools.partial(tilegate, tile_max=tile_max)
+            ),
         )
 
     # group requests to fit the pooled logits block; rows are independent, so grouping is exact
@@ -794,6 +874,7 @@ def _select_topk_extend_hip(
     raw_indices: Optional[torch.Tensor],
     consume: Optional[List[Optional[CandidateBlocks]]],
     publish: Optional[List[Optional[CandidateBlocks]]],
+    topk: Callable[..., None] = topk_transform_paged_hip,
 ) -> None:
     """Row t of logits scores its request's compressed positions in columns 0..lc-1, reachable
     up to compress_lens[t]. A source layer publishes one CandidateBlocks per request (None
@@ -847,7 +928,7 @@ def _select_topk_extend_hip(
             ),
         )
         return
-    topk_transform_paged_hip(
+    topk(
         logits,
         compress_lens.contiguous(),
         page_table,
