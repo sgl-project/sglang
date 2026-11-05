@@ -76,15 +76,14 @@ from sglang.srt.utils import (
     cdiv,
     get_bool_env_var,
     get_device_core_count,
+    next_power_of_2,
 )
 
 logger = logging.getLogger(__name__)
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
-
-
-def _is_pow2(n: int) -> bool:
-    return n > 0 and (n & (n - 1)) == 0
-
+_SGLANG_OPT_HIP_FUSE_MLA_PROJECTION_ROPE_CACHE = (
+    envs.SGLANG_OPT_HIP_FUSE_MLA_PROJECTION_ROPE_CACHE.get()
+)
 
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
@@ -511,7 +510,7 @@ def _can_fuse_bmm_rope_cat_and_cache(
     """
     if not (
         _use_aiter_gfx95
-        and envs.SGLANG_OPT_HIP_FUSE_MLA_PROJECTION_ROPE_CACHE.get()
+        and _SGLANG_OPT_HIP_FUSE_MLA_PROJECTION_ROPE_CACHE
         and attn.dcp_size == 1
         and attn.rotary_emb is not None
         and not attn.use_deep_gemm_bmm
@@ -548,11 +547,11 @@ def _can_fuse_mxfp4_bmm_rope_cat_and_cache(
         # Not asserted kernel-side: a bad shape below reads out of bounds silently.
         # No v_head_dim term (key side only) or q_lora_rank term (upstream of w_kc).
         # BMM K: 32-wide MXFP4 groups; above 256 the packed A-load leaves its one tile.
-        and _is_pow2(attn.qk_nope_head_dim)
+        and next_power_of_2(attn.qk_nope_head_dim) == attn.qk_nope_head_dim
         and 32 <= attn.qk_nope_head_dim <= 256
         # Latent and rope widths are unmasked tl.arange tiles.
-        and _is_pow2(attn.kv_lora_rank)
-        and _is_pow2(attn.qk_rope_head_dim)
+        and next_power_of_2(attn.kv_lora_rank) == attn.kv_lora_rank
+        and next_power_of_2(attn.qk_rope_head_dim) == attn.qk_rope_head_dim
         and attn.qk_rope_head_dim >= 2
     )
 

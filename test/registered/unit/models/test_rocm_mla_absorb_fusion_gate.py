@@ -16,7 +16,6 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.models.deepseek_common.attention_forward_methods import (
     forward_mla_rocm,
@@ -59,6 +58,11 @@ class TestFusedAbsorbGate(CustomTestCase):
         self._saved = forward_mla_rocm._use_aiter_gfx95
         forward_mla_rocm._use_aiter_gfx95 = True
         self.addCleanup(setattr, forward_mla_rocm, "_use_aiter_gfx95", self._saved)
+        kill_switch = mock.patch.object(
+            forward_mla_rocm, "_SGLANG_OPT_HIP_FUSE_MLA_PROJECTION_ROPE_CACHE", True
+        )
+        kill_switch.start()
+        self.addCleanup(kill_switch.stop)
 
     def test_dcp_turns_it_off(self):
         """DCP decode all-gathers q_nope_out, which this path never produces.
@@ -89,7 +93,9 @@ class TestFusedAbsorbGate(CustomTestCase):
         ):
             with self.subTest(term=name):
                 self.assertFalse(_CAN_FUSE(_attn(**{name: broken})))
-        with envs.SGLANG_OPT_HIP_FUSE_MLA_PROJECTION_ROPE_CACHE.override(False):
+        with mock.patch.object(
+            forward_mla_rocm, "_SGLANG_OPT_HIP_FUSE_MLA_PROJECTION_ROPE_CACHE", False
+        ):
             self.assertFalse(_CAN_FUSE(_attn()))
 
 
@@ -155,7 +161,9 @@ class TestMxfp4ProjectionFusionGate(CustomTestCase):
     def _aiter_gfx95_env(self):
         with (
             mock.patch.object(forward_mla_rocm, "_use_aiter_gfx95", True),
-            envs.SGLANG_OPT_HIP_FUSE_MLA_PROJECTION_ROPE_CACHE.override(True),
+            mock.patch.object(
+                forward_mla_rocm, "_SGLANG_OPT_HIP_FUSE_MLA_PROJECTION_ROPE_CACHE", True
+            ),
             get_parallel().override(dcp_enabled=False),
         ):
             yield
@@ -195,7 +203,11 @@ class TestMxfp4ProjectionFusionGate(CustomTestCase):
                     self.assertFalse(self._can_fuse(attn, forward_batch))
             with get_parallel().override(dcp_enabled=True):
                 self.assertFalse(self._can_fuse(self._make_attn(), forward_batch))
-            with envs.SGLANG_OPT_HIP_FUSE_MLA_PROJECTION_ROPE_CACHE.override(False):
+            with mock.patch.object(
+                forward_mla_rocm,
+                "_SGLANG_OPT_HIP_FUSE_MLA_PROJECTION_ROPE_CACHE",
+                False,
+            ):
                 self.assertFalse(self._can_fuse(self._make_attn(), forward_batch))
 
     def test_projection_fusion_gate_targets_aiter_graph_decode(self):
