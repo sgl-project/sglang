@@ -11,6 +11,9 @@ from packaging.version import Version
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
+from sglang.kernels.arch import current_arch
+from sglang.kernels.ops.moe import k31_decode_moe as k31
+from sglang.kernels.ops.moe.moe_finalize_fuse_shared import moe_finalize_fuse_shared
 from sglang.kernels.ops.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
     scaled_fp8_quant,
@@ -38,6 +41,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
 from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.runtime_context import get_forward, get_parallel
 from sglang.srt.utils.device import is_flashinfer_available
+from sglang.srt.utils.log_utils import print_info_once
 from sglang.srt.utils.triton_utils import next_power_of_2
 
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
@@ -1380,6 +1384,94 @@ class FlashInferTrtllmGenMxfp4MoeQuantInfo(MoeQuantInfo):
     hidden_size: int
     flashinfer_mxfp4_moe_precision: str
     routing_bias: Optional[torch.Tensor] = None
+    # Kimi-K3.1 decode MoE kernels usable for this layer (k31_decode_moe_supported)
+    k31_decode_moe: bool = False
+
+
+def _k31_decode_moe_mismatch(
+    layer: torch.nn.Module,
+    intermediate_size: int,
+    hidden_size: int,
+    with_bias: bool,
+    precision: str,
+) -> Optional[str]:
+    """The first requirement of the Kimi-K3.1 decode MoE kernels that the layer
+    misses, or None; the shapes and SiTU constants are compiled into them."""
+    cfg = layer.moe_runner_config
+    if cfg.activation != "situ":
+        return f"activation {cfg.activation}, not situ"
+    situ = (cfg.gemm1_alpha, cfg.gemm1_clamp_limit)
+    if situ != (k31.SITU_BETA, k31.SITU_LINEAR_BETA):
+        return f"SiTU constants {situ}, not (4.0, 25.0)"
+    if with_bias:
+        return "expert bias"
+    if precision != "default":
+        return f"{precision} activations, not MXFP8"
+    if not layer.num_experts == layer.num_local_experts == k31.NUM_EXPERTS:
+        return f"{layer.num_local_experts} of {layer.num_experts} local experts"
+    if (intermediate_size, hidden_size) != (k31.INTER, k31.HIDDEN):
+        return f"intermediate {intermediate_size}, hidden {hidden_size}"
+    arch = current_arch()
+    if not (arch.is_sm(10, 0) or arch.is_sm(10, 3)):
+        return "not SM100 / SM103"
+    return None
+
+
+def k31_decode_moe_supported(
+    layer: torch.nn.Module,
+    intermediate_size: int,
+    hidden_size: int,
+    with_bias: bool,
+    precision: str,
+) -> bool:
+    """Whether this layer runs the Kimi-K3.1 decode MoE kernels
+    (SGLANG_K31_DECODE_MOE); decided once, after the flashinfer_mxfp4 weights
+    are prepared."""
+    if not envs.SGLANG_K31_DECODE_MOE.get():
+        return False
+    mismatch = _k31_decode_moe_mismatch(
+        layer, intermediate_size, hidden_size, with_bias, precision
+    )
+    if mismatch is not None:
+        print_info_once(f"SGLANG_K31_DECODE_MOE: not used ({mismatch})")
+    return mismatch is None
+
+
+def _k31_decode_moe(
+    x_quant: torch.Tensor,
+    x_scale: torch.Tensor,
+    packed_topk: Optional[torch.Tensor],
+    topk_output,
+    quant_info: FlashInferTrtllmGenMxfp4MoeQuantInfo,
+    out: Optional[torch.Tensor],
+) -> Optional[FlashInferTrtllmDeferredFinalizeOutput]:
+    """With `out`, finalizes into it (as flashinfer's do_finalize with
+    routed_scaling_factor None) and returns None; else returns the deferred output."""
+    packed = packed_topk is not None
+    gemm2_out, expanded_idx, packed_weights = k31.k31_moe_mxfp4(
+        x_quant,
+        # the handoff's [T, 28] int32 and per_token_group_quant's packed UE8M0 are both
+        # the linear [T, 112] E8M0 bytes the kernel reads
+        x_scale.view(torch.uint8).view(x_quant.shape[0], -1),
+        packed_topk if packed else topk_output.topk_ids,
+        quant_info.w13_weight,
+        quant_info.w13_weight_scale,
+        quant_info.w2_weight,
+        quant_info.w2_weight_scale,
+        packed=packed,
+    )
+    weights = packed_weights if packed else topk_output.topk_weights
+    if out is not None:
+        moe_finalize_fuse_shared(
+            gemm2_out, expanded_idx, weights, None, k31.TOP_K, enable_pdl=True, out=out
+        )
+        return None
+    return FlashInferTrtllmDeferredFinalizeOutput(
+        gemm2_out=gemm2_out,
+        expert_weights=weights,
+        expanded_idx_to_permuted_idx=expanded_idx,
+        top_k=k31.TOP_K,
+    )
 
 
 def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
@@ -1438,6 +1530,21 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
         top_k = topk_output.topk_config.top_k
         router_logits = topk_output.router_logits
 
+    use_k31 = (
+        quant_info.k31_decode_moe and is_standard and x_quant.shape[0] <= k31.MAX_TOKENS
+    )
+    if quant_info.k31_decode_moe and not use_k31:
+        print_info_once(
+            "SGLANG_K31_DECODE_MOE: calls with a non-standard top-k or more than "
+            "256 tokens fall back to flashinfer"
+        )
+    if use_k31 and _deferred_finalize_enabled.get():
+        return StandardCombineInput(
+            hidden_states=_k31_decode_moe(
+                x_quant, x_scale, prepared_packed_topk, topk_output, quant_info, None
+            )
+        )
+
     num_tokens = x_quant.shape[0]
     from sglang.srt.layers import zero_copy_context
 
@@ -1456,6 +1563,12 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
                 dtype=torch.bfloat16,
                 device=x_quant.device,
             )
+
+    if use_k31:
+        _k31_decode_moe(
+            x_quant, x_scale, prepared_packed_topk, topk_output, quant_info, symm_output
+        )
+        return StandardCombineInput(hidden_states=symm_output)
 
     if runner_config.activation == "situ":
         from flashinfer import trtllm_fp4_block_scale_moe
