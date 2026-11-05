@@ -384,6 +384,7 @@ def _admission_scheduler(chunked_req):
     empty_request_lists(scheduler)
     scheduler.chunked_req = chunked_req
     scheduler.prefill_delayer = None
+    scheduler.scheduler_stage_metrics = None
     scheduler.entries_at_admission = []
 
     def admit(prefill_delayer_single_pass, running_batch):
