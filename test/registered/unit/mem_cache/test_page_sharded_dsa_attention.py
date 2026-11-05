@@ -33,7 +33,7 @@ from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase, publish_build_topology
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
-register_cuda_ci(est_time=120, stage="base-c", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=120, stage="extra-b", runner_config="4-gpu-b200")
 
 
 # =============================================================================
@@ -689,6 +689,7 @@ def _attention_backend(pool, req_to_token, device, prefill_impl="flashmla_sparse
     backend.dsa_index_kpool = 1
     backend.dsa_index_topk = 2048
     backend.dsa_topk_backend = DSATopKBackend.SGL_KERNEL
+    backend.dsa_packed_extend_topk = False
     backend.physical_page_size = 64
     backend.use_mha = False
     backend.use_fused_topk = False
@@ -754,7 +755,7 @@ class _MetadataShardPool(PageInterleaveKVPoolMixin):
 class TestShardedDSAMetadata(unittest.TestCase):
     def test_cp_request_filtering_keeps_both_address_spaces_aligned(self):
         from sglang.srt.layers.attention import dsa_backend
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.model_executor.forward_mode import ForwardMode
 
         lengths = torch.tensor([129, 65, 193])
         req_ids = torch.tensor([2, 0, 4])
@@ -878,7 +879,7 @@ def _real_indexer_topk(check, backends, batch, layer_id, query, weights):
 def _check_attention_batch(check, requests, *, generation, prefill_impl, topk_backend):
     from sglang.srt.layers.attention.dsa import dsa_indexer
     from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
-    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.model_executor.forward_mode import ForwardMode
 
     device = check.device
     lengths = [length for _, _, length in requests]

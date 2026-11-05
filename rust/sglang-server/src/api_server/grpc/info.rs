@@ -20,6 +20,7 @@ pub(super) fn model_info(info: ModelInfo) -> Result<api::GetModelInfoResponse, S
         reasoning_parser,
         tool_call_parser,
         disaggregation_mode: _,
+        launch_fields: _,
     } = info;
     let preferred_sampling_params = preferred_sampling_params
         .map(|params| serde_json::to_string(&params.0))
@@ -55,6 +56,7 @@ pub(super) fn server_info(info: ServerInfo) -> Result<api::GetServerInfoResponse
         incremental_streaming_output,
         disaggregation_mode,
         deployment_info,
+        dp_listeners: _,
     } = info;
     let max_context_length = u32::try_from(max_context_length)
         .map_err(|_| format!("max_context_length {max_context_length} exceeds uint32"))?;
@@ -108,6 +110,16 @@ pub(super) fn server_info(info: ServerInfo) -> Result<api::GetServerInfoResponse
                     endpoint: source.endpoint,
                     topic: source.topic,
                     block_size: source.block_size,
+                })
+                .collect(),
+            node_listeners: deployment_info
+                .node_listeners
+                .into_iter()
+                .map(|listener| api::NodeRustListener {
+                    port_offset: u32::from(listener.port_offset),
+                    dp_rank: listener.dp_rank,
+                    http_port: u32::from(listener.http_port),
+                    grpc_port: listener.grpc_port.map(u32::from),
                 })
                 .collect(),
         }),

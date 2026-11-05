@@ -55,6 +55,7 @@ class HiSparseDSATokenToKVPool(DSATokenToKVPool):
         max_running_requests: Optional[int] = None,
         skip_topk_layers: Optional[list[bool]] = None,
         host_to_device_ratio: int = 2,
+        kv_scale_ue8m0: bool = False,
     ):
         super().__init__(
             size=size,
@@ -75,6 +76,7 @@ class HiSparseDSATokenToKVPool(DSATokenToKVPool):
             tail_extra_slots=tail_extra_slots,
             max_running_requests=max_running_requests,
             skip_topk_layers=skip_topk_layers,
+            kv_scale_ue8m0=kv_scale_ue8m0,
         )
         self.bytes_per_token = self.kv_cache_dim * self.dtype.itemsize
         self.data_strides = torch.full_like(self.data_ptrs, self.bytes_per_token)
@@ -124,19 +126,29 @@ class HiSparseDSATokenToKVPool(DSATokenToKVPool):
         loc_info,
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
+        layer_id_override: Optional[int] = None,
     ):
         loc, _, _ = unwrap_write_loc(loc_info)
         loc = self.translate_loc_to_hisparse_device(loc)
-        super().set_mla_kv_buffer(layer, loc, cache_k_nope, cache_k_rope)
+        super().set_mla_kv_buffer(
+            layer,
+            loc,
+            cache_k_nope,
+            cache_k_rope,
+            layer_id_override=layer_id_override,
+        )
 
     def get_mla_kv_buffer(
         self,
         layer: RadixAttention,
         loc: torch.Tensor,
         dst_dtype: Optional[torch.dtype] = None,
+        layer_id_override: Optional[int] = None,
     ):
         loc = self.translate_loc_to_hisparse_device(loc)
-        return super().get_mla_kv_buffer(layer, loc, dst_dtype)
+        return super().get_mla_kv_buffer(
+            layer, loc, dst_dtype, layer_id_override=layer_id_override
+        )
 
     def transfer_values_on_device(
         self, dst_indices: torch.Tensor, src_indices: torch.Tensor

@@ -13,11 +13,12 @@ from sglang.srt.disaggregation.common.dcp_pack import (
 )
 from sglang.srt.disaggregation.nixl.conn import NixlKVManager, NixlKVSender
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class TestDcpCachedPrefixSend(CustomTestCase):
@@ -90,11 +91,12 @@ class TestDcpCachedPrefixSend(CustomTestCase):
                     token_to_kv_pool_allocator=SimpleNamespace(
                         page_size=page_size,
                         translate_kv_indices_for_transfer=lambda x: x,
+                        state_ids=lambda sub_pool: IdSpace(key=(sub_pool, None)),
                     ),
                     req_to_token_pool=SimpleNamespace(
                         req_to_token=torch.arange(total).reshape(1, -1),
                         req_index_to_mamba_index_mapping=torch.tensor([17]),
-                        translate_mamba_indices=lambda x: x,
+                        state_sub_pool="mamba",
                     ),
                     disagg_metadata_buffers=Mock(),
                     disagg_prefill_bootstrap_queue=SimpleNamespace(kv_manager=mgr),
@@ -104,7 +106,7 @@ class TestDcpCachedPrefixSend(CustomTestCase):
                     scheduler, req, last_chunk=True
                 )
                 calls = mgr.add_transfer_request.call_args_list
-                token_counts = [c.args[7] for c in calls]
+                token_counts = [c.kwargs["num_kv_tokens"] for c in calls]
                 if peer == "dcp":
                     self.assertLessEqual(max(token_counts), limit)
                 else:
@@ -124,8 +126,70 @@ class TestDcpCachedPrefixSend(CustomTestCase):
                 self.assertEqual(
                     [c.args[3] for c in calls], [False] * (len(calls) - 1) + [True]
                 )
-                self.assertTrue(all(c.args[6] is None for c in calls[:-1]))
-                self.assertEqual(int(calls[-1].args[6][0][0]), 17)
+                self.assertTrue(
+                    all(c.kwargs["state_indices"] is None for c in calls[:-1])
+                )
+                self.assertEqual(int(calls[-1].kwargs["state_indices"][0][0]), 17)
+
+
+class TestHostTensorIndicesEvent(CustomTestCase):
+    def test_indices_event_comes_from_the_scheduler_device_module(self):
+        """The D2H indices event is created and recorded on the scheduler's device.
+
+        A sender that takes host-tensor indices gets a pinned host copy plus an
+        event the transfer worker waits on. Building that event with torch.cuda
+        crashes every non-CUDA prefill scheduler on its first KV send.
+        """
+        page_size, total = 64, 128
+        stream = object()
+
+        class _Event:
+            def record(self, recorded_on):
+                self.recorded_on = recorded_on
+
+        sender = SimpleNamespace(
+            supports_host_tensor_indices=True,
+            kv_mgr=SimpleNamespace(enable_all_cp_ranks_for_transfer=False),
+            get_max_transfer_tokens=lambda: None,
+            should_send_kv_chunk=lambda num_pages, is_last: True,
+            send=Mock(),
+        )
+        req = SimpleNamespace(
+            rid="host-indices",
+            kv=SimpleNamespace(req_pool_idx=0),
+            origin_input_ids=[0] * total,
+            extend_end=total,
+            start_send_idx=0,
+            disagg_decode_prefix_len=0,
+            disagg_kv_sender=sender,
+        )
+        scheduler = SimpleNamespace(
+            enable_staging=False,
+            device_module=SimpleNamespace(Event=_Event, current_stream=lambda: stream),
+            token_to_kv_pool_allocator=SimpleNamespace(
+                page_size=page_size,
+                translate_kv_indices_for_transfer=lambda x: x,
+            ),
+            req_to_token_pool=SimpleNamespace(
+                req_to_token=torch.arange(total).reshape(1, -1)
+            ),
+            disagg_prefill_pending_chunk_rids=set(),
+        )
+        real_empty = torch.empty
+
+        def empty_unpinned(*args, pin_memory=False, **kwargs):
+            # Pinned host memory needs an accelerator, which the CPU runner lacks.
+            return real_empty(*args, **kwargs)
+
+        with patch("torch.empty", side_effect=empty_unpinned):
+            SchedulerDisaggregationPrefillMixin._send_kv_chunk(
+                scheduler, req, last_chunk=False
+            )
+
+        event = sender.send.call_args.kwargs["indices_event"]
+        self.assertIsInstance(event, _Event)
+        self.assertIs(event.recorded_on, stream)
+        np.testing.assert_array_equal(sender.send.call_args.args[0], [0, 1])
 
 
 class TestDcpPackBufferBytes(CustomTestCase):

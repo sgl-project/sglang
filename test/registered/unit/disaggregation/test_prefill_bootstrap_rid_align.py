@@ -20,6 +20,14 @@ from sglang.srt.disaggregation.prefill import PrefillBootstrapQueue
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
+class _FakeReqList(list):
+    """Minimal stand-in for IndexedReqList: supports leave() used by pop_bootstrapped."""
+
+    def leave(self, reqs):
+        leaving = set(reqs)
+        self[:] = [req for req in self if req not in leaving]
+
+
 def _make_req(rid: str):
     return SimpleNamespace(
         rid=rid,
@@ -33,7 +41,7 @@ def _make_req(rid: str):
 def _make_queue(rids, *, tp_world_size=1, cp_world_size=1):
     queue = PrefillBootstrapQueue.__new__(PrefillBootstrapQueue)
     queue.pp_size = 1
-    queue.queue = [_make_req(rid) for rid in rids]
+    queue.queue = _FakeReqList(_make_req(rid) for rid in rids)
     tp_group = object() if tp_world_size > 1 else None
     cp_group = object() if cp_world_size > 1 else None
     queue.scheduler = SimpleNamespace(
