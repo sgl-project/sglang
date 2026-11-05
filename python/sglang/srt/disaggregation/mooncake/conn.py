@@ -88,7 +88,7 @@ logger = logging.getLogger(__name__)
 
 FAILED_SESSION_RECOVERIES = Counter(
     "sglang:failed_session_recoveries_total",
-    "Number of mooncake_session_ids un-blacklisted via probe.",
+    "Number of mooncake_session_ids un-blacklisted via probe or repair trial.",
 )
 
 
@@ -293,7 +293,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         self._worker_threads: List[threading.Thread] = []
         # Checked in every role, so a bad value fails startup rather than a
         # later decode -> prefill role switch.
-        self.enable_failed_session_probe = envs.SGLANG_ENABLE_FAILED_SESSION_PROBE.get()
+        self.enable_failed_session_repair = (
+            envs.SGLANG_ENABLE_FAILED_SESSION_REPAIR.get()
+        )
+        self.enable_failed_session_probe = (
+            envs.SGLANG_ENABLE_FAILED_SESSION_PROBE.get()
+            or self.enable_failed_session_repair
+        )
         if self.enable_failed_session_probe:
             self.failed_session_probe_interval = (
                 envs.SGLANG_FAILED_SESSION_PROBE_INTERVAL_S.get()
@@ -318,6 +324,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     "SGLANG_FAILED_SESSION_IDLE_TIMEOUT_S must be positive"
                 )
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            self.session_repair_attempted = set()
+            self.session_repair_rooms: Dict[str, Optional[int]] = {}
             self.session_failures = defaultdict(int)
             self.failed_sessions = set()
             # Only the probe loop fills this; empty when the probe is off.
@@ -403,6 +411,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
     def init_engine(self):
         self.engine = get_mooncake_transfer_engine()
+        if (
+            self.disaggregation_mode == DisaggregationMode.PREFILL
+            and envs.SGLANG_ENABLE_FAILED_SESSION_REPAIR.get()
+            and not hasattr(self.engine.engine, "refresh_session")
+        ):
+            raise RuntimeError(
+                "Failed-session repair requires Mooncake refresh_session support"
+            )
 
     def _registerable_regions(self) -> List[Tuple[int, int]]:
         """(ptr, len) regions to (de)register, exact duplicates removed.
@@ -941,7 +957,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             mooncake_session_id, len(decode_kv_args.dst_aux_ptrs)
         )
         with self.session_lock:
-            self._unblacklist_session(mooncake_session_id)
+            if not self.enable_failed_session_repair:
+                self._unblacklist_session(mooncake_session_id)
             self.state_layout_rejections.pop(mooncake_session_id, None)
             self.state_strides_validated.discard(mooncake_session_id)
             if mismatch is not None:
@@ -2579,6 +2596,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             thread_finish_flag=True,
                         )
                     self._staging_outstanding.pop(kv_chunk.room, None)
+                    self._release_session_repair_room(kv_chunk.room)
                     if self.enable_deferred_decode_kv_release:
                         # Skipped => nothing written for this aborted room; ack.
                         self._maybe_ack_drained_abort(kv_chunk.room)
@@ -2603,30 +2621,25 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 for req in reqs_to_be_processed:
                     start_ts = time.perf_counter()
                     if not req.is_dummy:
-                        # Early exit if the request has failed
                         with self.session_lock:
                             layout_rejection = self.state_layout_rejections.get(
                                 req.mooncake_session_id
                             )
-                            if (
-                                layout_rejection is not None
-                                or req.mooncake_session_id in self.failed_sessions
-                            ):
-                                probe = self.failed_session_probes.get(
-                                    req.mooncake_session_id
-                                )
-                                if probe is not None:
-                                    probe.last_requested = time.monotonic()
-                                self.conclude_failure(
-                                    bootstrap_room=kv_chunk.room,
-                                    failure_reason=layout_rejection
-                                    or (
-                                        "Decode instance could be dead, remote "
-                                        f"mooncake session {req.mooncake_session_id} "
-                                        "is not alive"
-                                    ),
-                                )
-                                break
+                        if (
+                            layout_rejection is not None
+                            or not self._session_transfer_allowed(
+                                req.mooncake_session_id, kv_chunk.room
+                            )
+                        ):
+                            self.conclude_failure(
+                                bootstrap_room=kv_chunk.room,
+                                failure_reason=layout_rejection
+                                or (
+                                    "Decode instance could be dead, remote "
+                                    f"mooncake session {req.mooncake_session_id} is not alive"
+                                ),
+                            )
+                            break
 
                         target_rank_registration_info: KVArgsRegisterInfo = (
                             self.decode_kv_args_table[req.mooncake_session_id]
@@ -2771,14 +2784,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 target_rank_registration_info.dst_kv_layer_ids,
                             )
                         if ret != 0:
-                            with self.session_lock:
-                                self.session_failures[req.mooncake_session_id] += 1
-                                # Failures should never happen if the session is not dead, if the session fails once, mark it as failed
-                                if self.session_failures[req.mooncake_session_id] >= 1:
-                                    self.failed_sessions.add(req.mooncake_session_id)
-                                    logger.error(
-                                        f"Session {req.mooncake_session_id} failed."
-                                    )
+                            self._record_session_failure(req.mooncake_session_id)
                             self._poison_unsettled_send(kv_chunk.room)
                             self.conclude_failure(
                                 bootstrap_room=kv_chunk.room,
@@ -2801,6 +2807,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 # send also marks the room Failed.
                                 if state_rc != 0:
                                     self._poison_unsettled_send(kv_chunk.room)
+                                    if self.enable_failed_session_repair:
+                                        self._record_session_failure(
+                                            req.mooncake_session_id
+                                        )
                                 if (
                                     self.request_status.get(
                                         kv_chunk.room, KVPoll.Failed
@@ -2809,11 +2819,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 ):
                                     break
                                 if state_rc != 0:
-                                    with self.session_lock:
-                                        self.session_failures[
-                                            req.mooncake_session_id
-                                        ] += 1
-                                        self.failed_sessions.add(
+                                    if not self.enable_failed_session_repair:
+                                        self._record_session_failure(
                                             req.mooncake_session_id
                                         )
                                     self.conclude_failure(
@@ -2837,6 +2844,20 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 # The aux write targets decode's metadata
                                 # slot, which the deferred release also frees.
                                 self._poison_unsettled_send(req.room)
+                                if self.enable_failed_session_repair:
+                                    self._record_session_failure(
+                                        req.mooncake_session_id
+                                    )
+                            elif (
+                                len(kv_chunk.prefill_kv_indices) > 0
+                                and self.kv_args.kv_data_ptrs
+                                and not skip_kv
+                                and self.request_status.get(kv_chunk.room)
+                                != KVPoll.Failed
+                            ):
+                                self._finish_session_repair(
+                                    req.mooncake_session_id, kv_chunk.room
+                                )
                             polls.append(True if ret == 0 else False)
                             dst_ranks_infos.append((req.endpoint, req.dst_port))
 
@@ -2877,6 +2898,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     continue
 
                 self._staging_outstanding[kv_chunk.room] -= 1
+                if (
+                    self.request_status.get(kv_chunk.room, KVPoll.Failed)
+                    == KVPoll.Failed
+                ):
+                    self._release_session_repair_room(kv_chunk.room)
                 if self.enable_deferred_decode_kv_release:
                     # In-flight write finished; if aborted and nothing outstanding,
                     # the pages are idle -> release the held ack.
@@ -2907,6 +2933,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     # Publish worker cleanup last: deferred allocation must not
                     # acknowledge Success while this worker can still erase
                     # bookkeeping for a subsequent transfer using the same room.
+                    self._release_session_repair_room(kv_chunk.room)
                     self._staging_outstanding.pop(kv_chunk.room, None)
 
             except Exception as e:
@@ -2932,6 +2959,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self._handle_deferred_abort_notification(notification, room_active)
         else:
             self._handle_legacy_abort_notification(notification, room_active)
+        self._release_session_repair_room(room)
         return True
 
     def _handle_deferred_abort_notification(
@@ -3172,24 +3200,84 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     def get_session_id(self):
         return self.engine.get_session_id()
 
+    def _session_transfer_allowed(self, session_id: str, room: int) -> bool:
+        with self.session_lock:
+            if session_id not in self.failed_sessions:
+                return True
+            probe = self.failed_session_probes.get(session_id)
+            if probe is not None:
+                probe.last_requested = time.monotonic()
+            if (
+                not self.enable_failed_session_repair
+                or session_id not in self.session_repair_rooms
+            ):
+                return False
+            if self.session_repair_rooms[session_id] is None:
+                self.session_repair_rooms[session_id] = room
+            return self.session_repair_rooms[session_id] == room
+
+    def _release_session_repair_room(self, room: int) -> None:
+        if not self.enable_failed_session_repair:
+            return
+        with self.session_lock:
+            # A cancelled room may still have a write in flight. Let the worker
+            # release its grant after all counted chunks have finished.
+            if self._staging_outstanding.get(room, 0) > 0:
+                return
+            for session_id, trial_room in self.session_repair_rooms.items():
+                if trial_room == room:
+                    # Cancellation is not failed-transfer evidence. Keep the already
+                    # refreshed grant but let another room use it; do not refresh again.
+                    self.session_repair_rooms[session_id] = None
+
+    def _record_session_failure(self, session_id: str) -> None:
+        with self.session_lock:
+            self.session_failures[session_id] += 1
+            self.failed_sessions.add(session_id)
+            if self.enable_failed_session_repair:
+                self.session_repair_rooms.pop(session_id, None)
+        logger.error("Session %s failed", session_id)
+
+    def _finish_session_repair(self, session_id: str, room: int) -> None:
+        if not self.enable_failed_session_repair:
+            return
+        with self.session_lock:
+            if (
+                self.session_repair_rooms.get(session_id) != room
+                or self.request_status.get(room, KVPoll.Failed) == KVPoll.Failed
+            ):
+                return
+            self._unblacklist_session(session_id)
+        logger.info(
+            "Session %s recovered after real KV and auxiliary transfer", session_id
+        )
+        FAILED_SESSION_RECOVERIES.inc()
+
     def _unblacklist_session(self, session_id: str) -> None:
         """Caller holds session_lock."""
         self.failed_sessions.discard(session_id)
         self.session_failures.pop(session_id, None)
         self.failed_session_probes.pop(session_id, None)
+        if self.enable_failed_session_repair:
+            self.session_repair_attempted.discard(session_id)
+            self.session_repair_rooms.pop(session_id, None)
 
     def _send_probe(self, session_id: str) -> int:
         try:
+            if self.enable_failed_session_repair:
+                rc = self.engine.refresh_session(session_id)
+                if rc != 0:
+                    return rc
             return self.engine.send_probe(session_id)
         except Exception as e:
             logger.warning("send_probe(%s) raised: %s", session_id, e)
             return -1
 
     def _run_one_probe_pass(self) -> None:
-        """Probe due sessions with per-session exponential backoff, and drop
-        sessions no request has targeted within the idle timeout: a restarted
-        decode comes back under a new session id, so its old one never
-        re-registers."""
+        """Probe with exponential backoff. In repair mode only real transfer
+        success lifts isolation; idle pruning is limited to legacy probe mode.
+        Failed control checks can retry, but a failed trial is not re-granted.
+        """
         now = time.monotonic()
         due = []
         with self.session_lock:
@@ -3205,7 +3293,15 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         interval=self.failed_session_probe_interval,
                     ),
                 )
-                if now - probe.last_requested >= self.failed_session_idle_timeout:
+                if (
+                    self.enable_failed_session_repair
+                    and session_id in self.session_repair_attempted
+                ):
+                    continue
+                if (
+                    not self.enable_failed_session_repair
+                    and now - probe.last_requested >= self.failed_session_idle_timeout
+                ):
                     self._unblacklist_session(session_id)
                     logger.info(
                         "Dropped blacklisted session %s: no request for %.0fs",
@@ -3213,13 +3309,22 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         now - probe.last_requested,
                     )
                 elif now >= probe.next_probe_at:
-                    due.append(session_id)
-        for session_id in due:
+                    due.append((session_id, self.session_failures[session_id]))
+        for session_id, failures in due:
             rc = self._send_probe(session_id)
             with self.session_lock:
                 if rc == 0:
                     was_blacklisted = session_id in self.failed_sessions
-                    self._unblacklist_session(session_id)
+                    if self.enable_failed_session_repair:
+                        if (
+                            was_blacklisted
+                            and self.session_failures[session_id] == failures
+                        ):
+                            self.session_repair_attempted.add(session_id)
+                            self.session_repair_rooms[session_id] = None
+                        was_blacklisted = False
+                    else:
+                        self._unblacklist_session(session_id)
                 else:
                     was_blacklisted = False
                     probe = self.failed_session_probes.get(session_id)
@@ -3352,6 +3457,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
 class MooncakeKVSender(CommonKVSender):
     supports_host_tensor_indices = True
+
+    def clear(self) -> None:
+        super().clear()
+        # CommonKVSender leaves an unowned deferred room untouched.
+        if self.bootstrap_room not in self.kv_mgr.request_status:
+            self.kv_mgr._release_session_repair_room(self.bootstrap_room)
 
     @mooncake_trace_func(MooncakeRequestStage.MOONCAKE_SEND)
     def send(

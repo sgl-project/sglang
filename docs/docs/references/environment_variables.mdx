@@ -1598,8 +1598,13 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_FAILED_SESSION_REPAIR</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Require one room to complete real KV, required state, and auxiliary transfer before clearing a failed Mooncake session. Requires the classic Mooncake backend with <code>refresh_session</code>. Enables the probe loop even when PROBE is false. Refresh/probe failures retry with backoff; a failed trial stays isolated until the manager is reinitialized. Cancellation releases the room grant after in-flight work finishes. Idle expiry and re-registration do not clear isolation in this mode. No GPU/RDMA recovery guarantee is implied.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_FAILED_SESSION_PROBE</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Periodically probe blacklisted Mooncake sessions and un-blacklist the ones that answer. Probes run on their own thread, off the KV transfer path.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Periodically probe blacklisted Mooncake sessions and un-blacklist the ones that answer. Probes run on their own thread, off the KV transfer path. With REPAIR enabled, probe success only grants a real-transfer trial.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
     </tr>
     <tr>
@@ -1614,7 +1619,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_FAILED_SESSION_IDLE_TIMEOUT_S</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Drop a blacklisted Mooncake session that no request has targeted for this many seconds, e.g. the old session id of a restarted decode.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Drop a blacklisted Mooncake session that no request has targeted for this many seconds, e.g. the old session id of a restarted decode. Does not clear isolation when REPAIR is enabled.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>600.0</code></td>
     </tr>
     <tr>
