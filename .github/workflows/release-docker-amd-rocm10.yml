@@ -39,7 +39,7 @@ concurrency:
 
 jobs:
   publish:
-    if: github.repository == 'sgl-project/sglang' && (github.event_name != 'workflow_dispatch' || inputs.job_select == 'all' || inputs.job_select == 'publish')
+    if: false
     runs-on: amd-docker-scale
     environment: 'prod'
     strategy:
@@ -101,7 +101,7 @@ jobs:
               ;;
           esac
 
-          image_tag="v${VERSION}-${rocm_tag}-${DATE}"
+          image_tag="v${VERSION}-${rocm_tag}-${DATE}_triton39_test"
           echo "IMAGE_TAG=${image_tag}" >> "$GITHUB_ENV"
 
           docker build . \
@@ -120,19 +120,6 @@ jobs:
           else
             echo "Build-only run: not pushing rocm/sgl-dev:${image_tag}"
           fi
-
-      - name: Login to Docker Hub (lmsys)
-        if: env.PUSH_IMAGES == 'true'
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Push to lmsysorg/sglang-rocm
-        if: env.PUSH_IMAGES == 'true'
-        run: |
-          docker tag "rocm/sgl-dev:${IMAGE_TAG}" "lmsysorg/sglang-rocm:${IMAGE_TAG}"
-          docker push "lmsysorg/sglang-rocm:${IMAGE_TAG}"
 
   publish-gfx1250-rocm101:
     if: github.repository == 'sgl-project/sglang' && (github.event_name != 'workflow_dispatch' || inputs.job_select == 'all' || inputs.job_select == 'publish-gfx1250-rocm101')
@@ -179,7 +166,7 @@ jobs:
           PRETEND_VERSION: ${{ steps.version.outputs.pretend_version }}
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          image_tag="v${VERSION}-rocm101-mi45x-${DATE}"
+          image_tag="v${VERSION}-rocm101-mi45x-${DATE}_triton39_utlx_test"
           echo "IMAGE_TAG=${image_tag}" >> "$GITHUB_ENV"
 
           docker build . \
@@ -187,6 +174,7 @@ jobs:
             --build-arg "SGL_BRANCH=${GITHUB_SHA}" \
             --build-arg BUILD_TYPE=all \
             --build-arg GPU_ARCH=gfx1250-rocm1010 \
+            --build-arg BUILD_UTLX=1 \
             --build-arg ENABLE_MORI=1 \
             --build-arg ENABLE_NIXL=1 \
             --build-arg "SETUPTOOLS_SCM_PRETEND_VERSION=${PRETEND_VERSION}" \
@@ -198,19 +186,6 @@ jobs:
           else
             echo "Build-only run: not pushing rocm/sgl-dev:${image_tag}"
           fi
-
-      - name: Login to Docker Hub (lmsys)
-        if: env.PUSH_IMAGES == 'true'
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Push to lmsysorg/sglang-rocm
-        if: env.PUSH_IMAGES == 'true'
-        run: |
-          docker tag "rocm/sgl-dev:${IMAGE_TAG}" "lmsysorg/sglang-rocm:${IMAGE_TAG}"
-          docker push "lmsysorg/sglang-rocm:${IMAGE_TAG}"
 
   # gfx1250 (MI45x) runs on the same schedule as the pair above but stays a
   # separate job: no MI450 runner pool consumes the image, so a bring-up build
@@ -260,7 +235,7 @@ jobs:
           PRETEND_VERSION: ${{ steps.version.outputs.pretend_version }}
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          image_tag="v${VERSION}-rocm10-mi45x-${DATE}"
+          image_tag="v${VERSION}-rocm10-mi45x-${DATE}_triton39_utlx_test"
           echo "IMAGE_TAG=${image_tag}" >> "$GITHUB_ENV"
 
           docker build . \
@@ -268,6 +243,7 @@ jobs:
             --build-arg "SGL_BRANCH=${GITHUB_SHA}" \
             --build-arg BUILD_TYPE=all \
             --build-arg GPU_ARCH=gfx1250-rocm1000 \
+            --build-arg BUILD_UTLX=1 \
             --build-arg ENABLE_MORI=1 \
             --build-arg ENABLE_NIXL=1 \
             --build-arg "SETUPTOOLS_SCM_PRETEND_VERSION=${PRETEND_VERSION}" \
@@ -279,16 +255,3 @@ jobs:
           else
             echo "Build-only run: not pushing rocm/sgl-dev:${image_tag}"
           fi
-
-      - name: Login to Docker Hub (lmsys)
-        if: env.PUSH_IMAGES == 'true'
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Push to lmsysorg/sglang-rocm
-        if: env.PUSH_IMAGES == 'true'
-        run: |
-          docker tag "rocm/sgl-dev:${IMAGE_TAG}" "lmsysorg/sglang-rocm:${IMAGE_TAG}"
-          docker push "lmsysorg/sglang-rocm:${IMAGE_TAG}"
