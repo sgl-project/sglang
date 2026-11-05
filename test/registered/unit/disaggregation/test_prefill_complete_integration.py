@@ -1160,6 +1160,38 @@ class TestAllocationIntegration(CustomTestCase):
         self.flush()
         self.assertEqual(receiver.poll(), KVPoll.Failed)
 
+    def test_decode_abort_racing_worker_success_fails_the_request(self):
+        """Decode's ABORT arriving after the worker cached Success but before
+        its commit wins the room. Both ABORT handlers skip a Success room, so
+        prefill must still release the request as failed, not as Success."""
+        sender = self.sender()
+        self.receiver()
+        self.flush()
+        sender.mark_prefill_complete()
+        self.flush()
+        self.prefill.enable_deferred_decode_kv_release = True
+        table = self.prefill.deferred_bootstrap
+        commit = table.conclude
+        abort = [b"ABORT", b"1", b"decode", b"2"]
+
+        def decode_abort_first(room):
+            self.assertEqual(self.prefill.request_status[room], KVPoll.Success)
+            # Prefill's receive path: the room table, then Mooncake's handler.
+            if not self.prefill._handle_bootstrap_message(abort):
+                self.prefill._handle_abort_notification(abort)
+            return commit(room)
+
+        table.conclude = decode_abort_first
+        status = self.prefill.conclude_transfer(
+            bootstrap_room=1, status=KVPoll.Success, targets=[DECODE]
+        )
+        self.assertEqual(status, KVPoll.Failed)
+        self.assertEqual(list(self.wire), [])
+        self.assertEqual(sender.poll(), KVPoll.Failed)
+        with self.assertRaises(KVTransferError):
+            sender.failure_exception()
+        self.assertTrue(table.rooms[1].failed)
+
     def test_recompute_http_error_after_success_before_retirement_is_ignored(self):
         sender, receiver = self.sender(), self.receiver()
         self.flush()

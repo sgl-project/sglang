@@ -938,6 +938,9 @@ class CommonKVManager(BaseKVManager):
             and self.deferred_bootstrap is not None
             and not self.deferred_bootstrap.conclude(bootstrap_room)
         ):
+            # cancel() marks only the room table; fail the request too, before
+            # this worker's cleanup lets the scheduler latch Success.
+            self.update_status(bootstrap_room, KVPoll.Failed)
             return KVPoll.Failed
         self.send_kv_status_message(
             targets=targets,
