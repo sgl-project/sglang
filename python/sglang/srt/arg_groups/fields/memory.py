@@ -118,8 +118,8 @@ class Memory(msgspec.Struct):
     ] = 0
     hicache_mamba_size_gb: A[
         Optional[float],
-        "Gigabytes of --hicache-size for the host Mamba state pool of a hybrid model; the host KV pools split the rest, and any indexer or draft host pools come out of that KV share. "
-        "Needs --enable-hierarchical-cache and an explicit --hicache-size. Unset splits --hicache-size across all host pools by their device pool sizes. Models without a Mamba pool ignore it. Not supported with --enable-unified-memory.",
+        "Gigabytes of --hicache-size for the host Mamba state pool of a hybrid model, which also holds the state of any MTP draft Mamba layers and must fit one state slot; the host KV pools split the rest, and any indexer or draft host pools come out of that KV share. "
+        "Needs --enable-hierarchical-cache and an explicit --hicache-size, and is rejected with --enable-unified-memory for every model. Unset splits --hicache-size across all host pools by their device pool sizes. A model without a Mamba host pool ignores it with a warning.",
     ] = None
     hicache_host_memory_fraction: A[
         Optional[float],
