@@ -89,6 +89,42 @@ def _make_storage_config(tenant_id=DEFAULT_TENANT_ID):
 
 
 class TestMooncakeTenantConfig(unittest.TestCase):
+    def test_local_buffer_size_is_forwarded_to_setup(self):
+        for size in (0, 64 * 1024 * 1024):
+            with self.subTest(size=size):
+                config = _make_storage_config()
+                config.extra_config["local_buffer_size"] = size
+                with patch.dict(
+                    "sys.modules", _fake_mooncake_modules(FakeMooncakeDistributedStore)
+                ):
+                    from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+                        MooncakeStore,
+                    )
+
+                    MooncakeStore(config)
+                self.assertEqual(
+                    FakeMooncakeDistributedStore.instances[-1].setup_calls[0][0][3],
+                    size,
+                )
+
+    def test_invalid_local_buffer_size_is_rejected_before_setup(self):
+        for size in (-1, True, "64mb"):
+            with self.subTest(size=size):
+                config = _make_storage_config()
+                config.extra_config["local_buffer_size"] = size
+                with patch.dict(
+                    "sys.modules", _fake_mooncake_modules(FakeMooncakeDistributedStore)
+                ):
+                    from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+                        MooncakeStore,
+                    )
+
+                    with self.assertRaisesRegex(ValueError, "local_buffer_size"):
+                        MooncakeStore(config)
+                self.assertEqual(
+                    FakeMooncakeDistributedStore.instances[-1].setup_calls, []
+                )
+
     def test_mooncake_store_forwards_non_default_tenant_id(self):
         FakeMooncakeDistributedStore.instances = []
         with patch.dict(
