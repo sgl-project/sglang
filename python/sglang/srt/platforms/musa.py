@@ -22,4 +22,6 @@ class MusaDeviceMixin(CudaDeviceMixin):
 class MusaSRTPlatform(MusaDeviceMixin, SRTPlatform):
     """Default in-tree MUSA SRT platform."""
 
-    capabilities = PlatformCapabilities(supports_triton=True, graph_capture=True)
+    capabilities = PlatformCapabilities(
+        supports_triton=True, graph_capture=True, supports_pynccl=True
+    )

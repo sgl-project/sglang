@@ -185,9 +185,6 @@ class PagedIndexerMetadata:
     use_prefill_cuda_graph: bool = False
     # Indexer source compression ratio: 4 for c4, 1 or 2 for the dsv41 sources.
     compress_ratio: int = 4
-    # Rows per logits chunk for the prefill CUDA graph low-ratio indexer; 0 plans
-    # all rows at once.
-    row_chunk: int = 0
     rows_per_request: int = 1
     # A list when the dynamic-budget forward is row-chunked: one schedule per chunk.
     deep_gemm_metadata: Any = field(init=False, repr=False)
@@ -254,18 +251,7 @@ class PagedIndexerMetadata:
                     self.rows_per_chunk,
                     self.mqa_logits_budget_bytes,
                 )
-            if self.row_chunk > 0:
-                self.deep_gemm_metadata = torch.stack(
-                    [
-                        get_paged_mqa_logits_metadata(
-                            compressed_seq_lens[_s : _s + self.row_chunk],
-                            self.compressed_page_size,
-                            deep_gemm.get_num_sms(),
-                        )
-                        for _s in range(0, compressed_seq_lens.shape[0], self.row_chunk)
-                    ]
-                )
-            elif self.rows_per_chunk is not None:
+            if self.rows_per_chunk is not None:
                 # Chunk metadata is shared by all indexer layers in this forward.
                 self.deep_gemm_metadata = [
                     get_paged_mqa_logits_metadata(
@@ -339,9 +325,7 @@ class PagedIndexerMetadata:
 
     def row_chunks(self):
         num_rows = self.compressed_seq_lens.shape[0]
-        if self.row_chunk > 0:
-            rows_per_chunk = self.row_chunk
-        elif isinstance(self.deep_gemm_metadata, list):
+        if isinstance(self.deep_gemm_metadata, list):
             assert self.rows_per_chunk is not None, (
                 "chunked DeepGEMM metadata requires rows_per_chunk"
             )
@@ -385,7 +369,6 @@ class PagedIndexerMetadata:
                 "page_size",
                 "compressed_page_size",
                 "compress_ratio",
-                "row_chunk",
                 "force_deep_gemm_metadata",
                 "use_prefill_cuda_graph",
                 "use_topk_v2",
@@ -423,6 +406,16 @@ def expand_index_page_table(
     blocks_per_page = slots_per_page // index_page_size
     if blocks_per_page == 1:
         return page_table
+    if (
+        page_table.is_cuda
+        and page_table.stride(1) == 1
+        and blocks_per_page & (blocks_per_page - 1) == 0
+    ):
+        from sglang.kernels.ops.attention.dsv4.attn_glue_hip import (
+            expand_index_page_table as expand_index_page_table_triton,
+        )
+
+        return expand_index_page_table_triton(page_table, blocks_per_page)
     bs, n = page_table.shape
     base = page_table.to(torch.int64) * blocks_per_page
     offsets = torch.arange(blocks_per_page, device=page_table.device, dtype=torch.int64)

@@ -1,0 +1,746 @@
+"""SM90 CuTe sparse-MLA kernel for SGLang DSV4 prefill with 16 local heads.
+
+This kernel is specialized for SGLang's DSV4 sparse-prefill contract:
+
+* Q is padded to 64 heads by the model, while only the first 16 are logical.
+* Q/K/V width is 512 (448 NoPE + 64 RoPE; V uses the same 512-wide row).
+* indices address a per-call, rebased BF16 workspace and are already causal.
+* topk_length is per query and attn_sink is a per-head virtual zero-value key.
+
+The public entry point returns only the 16 logical heads, with shape
+``[TQ, 16, 512]``.  Callers must keep other architectures and DSV4 shapes on
+their existing attention backend.
+"""
+
+from __future__ import annotations
+
+import math
+import threading
+
+import cuda.bindings.driver as cuda
+import cutlass
+import cutlass.cute as cute
+import cutlass.utils as utils
+import torch
+from cutlass.cute.nvgpu import OperandMajorMode, cpasync, warpgroup
+from cutlass.cute.nvgpu.warpgroup import MmaF16BF16Op, OperandSource
+from cutlass.cute.runtime import from_dlpack
+
+from sglang.srt.utils.custom_op import register_custom_op
+
+# SGLang DSV4 sparse-prefill contract.
+H = 16
+TOPK_ALIGNMENT = 128
+MAX_TOPK = 16384
+DQK = 512
+DV = 512
+BN = 64
+NTHR = 128
+NG_QK = 4
+
+# Eight BF16 padding elements rotate each 64-element block by four 32-bit banks,
+# avoiding the bank overlap of a 64-element stride.
+DB_STRIDE = 72
+# Each 8-row group holds 64 d-blocks of 8 channels, all 512 channels of DQK.
+NB_STRIDE = 64 * DB_STRIDE
+KV_ELEMS = 8 * NB_STRIDE
+CHUNK_SB = 8 * DB_STRIDE * 2
+
+Q_CHUNK = H * 64
+Q_ELEMS = (DQK // 64) * Q_CHUNK
+P_ELEMS = BN * H
+OT_STRIDE = DV + 8
+
+LOG2E = 1.4426950408889634
+NO_SINK = -1.0e30
+# Stays below NO_SINK times LOG2E, so invalid rows never raise the running maximum.
+INVALID_SCORE = -3.0e38
+
+
+def _gp(addr):
+    return cute.make_ptr(
+        cutlass.BFloat16,
+        addr,
+        cute.AddressSpace.gmem,
+        assumed_align=16,
+    )
+
+
+def _sp(addr):
+    return cute.make_ptr(
+        cutlass.BFloat16,
+        addr,
+        cute.AddressSpace.smem,
+        assumed_align=16,
+    )
+
+
+def _resolve_rows(
+    kv_ptr,
+    idx_ptr,
+    skv_ptr,
+    smask_ptr,
+    base,
+    g8,
+    k8,
+    topk_length,
+    s_kv,
+):
+    # Indices arrive causal, so validity is slot < topk_length and 0 <= index < s_kv.
+
+    ga = []
+    sa = []
+    predicates = []
+    for c in range(4):
+        n = c * 16 + g8
+        slot = base + n
+        row_raw = idx_ptr[slot]
+
+        prefix_ok = cutlass.max(
+            cutlass.min(topk_length - slot, cutlass.Int32(1)), cutlass.Int32(0)
+        )
+        lower_ok = cutlass.max(
+            cutlass.min(row_raw + 1, cutlass.Int32(1)), cutlass.Int32(0)
+        )
+        upper_ok = cutlass.max(
+            cutlass.min(s_kv - row_raw, cutlass.Int32(1)), cutlass.Int32(0)
+        )
+        ok = prefix_ok * lower_ok * upper_ok
+        row = cutlass.Int64(row_raw * ok)
+        smask_ptr[n] = ok.to(cutlass.Float32)
+
+        # Invalid rows read kv[0], so zero-fill them to keep 0 * NaN out of PV.
+        predicate = cute.make_rmem_tensor((1,), cute.Boolean)
+        predicate.fill(ok != cutlass.Int32(0))
+        predicates.append(predicate)
+
+        ga.append((kv_ptr + row * DQK + k8 * 8).toint())
+        sa.append(
+            (skv_ptr + (n // 8) * NB_STRIDE + (n % 8) * 8 + k8 * DB_STRIDE).toint()
+        )
+    return ga, sa, predicates
+
+
+def _prefetch_chunk(ga, sa, predicates, chunk):
+    g2s = cute.make_copy_atom(
+        cpasync.CopyG2SOp(), cutlass.BFloat16, num_bits_per_copy=128
+    )
+    # A flat (8, 1) layout needs 8 predicates per copy, so nesting gives one per row.
+    l8 = cute.make_layout(((8, 1), 1))
+    for c in range(4):
+        cute.copy(
+            g2s,
+            cute.make_tensor(_gp(ga[c] + chunk * 128), l8),
+            cute.make_tensor(_sp(sa[c] + chunk * CHUNK_SB), l8),
+            pred=predicates[c],
+        )
+
+
+def _prefetch_tile(ga, sa, predicates):
+    for chunk in range(DQK // 64):
+        _prefetch_chunk(ga, sa, predicates, chunk)
+        # One commit group per 128-channel QK stage, as the QK waits count groups.
+        if chunk % 2 == 1:
+            cute.arch.cp_async_commit_group()
+
+
+def _make_qk_fragments(mma_qk, thr_qk, skv_ptr, sq_ptr):
+    kv_frags = []
+    q_frags = []
+    channels = DQK // NG_QK
+    dblocks = channels // 8
+    for group in range(NG_QK):
+        s_k = cute.make_tensor(
+            skv_ptr + group * dblocks * DB_STRIDE,
+            cute.make_layout(
+                ((8, 8), (8, dblocks)),
+                stride=((8, NB_STRIDE), (1, DB_STRIDE)),
+            ),
+        )
+        s_q = cute.make_tensor(
+            sq_ptr + group * 2 * Q_CHUNK,
+            cute.make_layout(
+                ((8, 2), (64, 2)),
+                stride=((64, 512), (1, Q_CHUNK)),
+            ),
+        )
+        kv_frags.append(mma_qk.make_fragment_A(thr_qk.partition_A(s_k)))
+        q_frags.append(mma_qk.make_fragment_B(thr_qk.partition_B(s_q)))
+    return kv_frags, q_frags
+
+
+def _make_pv_fragments(mma_pv, thr_pv, skv_ptr):
+    v_frags = []
+    out_acc = []
+    id_o = cute.make_identity_tensor((64, H))
+    for chunk in range(DV // 64):
+        s_v = cute.make_tensor(
+            skv_ptr + 8 * chunk * DB_STRIDE,
+            cute.make_layout(
+                ((8, 8), (8, 8)),
+                stride=((1, DB_STRIDE), (8, NB_STRIDE)),
+            ),
+        )
+        v_frags.append(mma_pv.make_fragment_A(thr_pv.partition_A(s_v)))
+        acc = cute.make_rmem_tensor(thr_pv.partition_C(id_o).shape, cutlass.Float32)
+        acc.fill(0.0)
+        out_acc.append(acc)
+    return v_frags, out_acc
+
+
+def _issue_qk_staged(mma_qk, score_acc, k_frags, q_frags):
+    cute.nvgpu.warpgroup.fence()
+    mma_qk.set(warpgroup.Field.ACCUMULATE, False)
+    for group in range(NG_QK):
+        cute.arch.cp_async_wait_group(NG_QK - 1 - group)
+        cute.arch.barrier()
+        cute.gemm(mma_qk, score_acc, k_frags[group], q_frags[group], score_acc)
+        cute.nvgpu.warpgroup.commit_group()
+        mma_qk.set(warpgroup.Field.ACCUMULATE, True)
+
+
+def _pv_step(mma_pv, out_acc, v_frags, prob_frag, chunk, fence=False):
+    if fence:
+        cute.nvgpu.warpgroup.fence()
+    cute.gemm(
+        mma_pv,
+        out_acc[chunk],
+        v_frags[chunk],
+        prob_frag,
+        out_acc[chunk],
+    )
+    cute.nvgpu.warpgroup.commit_group()
+
+
+def _queue_pv_final(mma_pv, out_acc, v_frags, prob_frag):
+    """Last tile: enqueue PV and let denominator reduction hide its latency."""
+
+    _pv_step(mma_pv, out_acc, v_frags, prob_frag, 0, fence=True)
+    for chunk in range(1, DV // 64):
+        _pv_step(mma_pv, out_acc, v_frags, prob_frag, chunk)
+
+
+def _run_pv_rolling(
+    mma_pv,
+    out_acc,
+    v_frags,
+    prob_frag,
+    next_ga,
+    next_sa,
+    next_predicates,
+):
+    """Accumulate PV while each retired V chunk is refilled for the next tile."""
+
+    _pv_step(mma_pv, out_acc, v_frags, prob_frag, 0, fence=True)
+    _pv_step(mma_pv, out_acc, v_frags, prob_frag, 1)
+    for chunk in range(6):
+        _pv_step(mma_pv, out_acc, v_frags, prob_frag, chunk + 2)
+        cute.nvgpu.warpgroup.wait_group(2)
+        _prefetch_chunk(next_ga, next_sa, next_predicates, chunk)
+        if chunk % 2 == 1:
+            cute.arch.cp_async_commit_group()
+    cute.nvgpu.warpgroup.wait_group(1)
+    _prefetch_chunk(next_ga, next_sa, next_predicates, 6)
+    cute.nvgpu.warpgroup.wait_group(0)
+    _prefetch_chunk(next_ga, next_sa, next_predicates, 7)
+    cute.arch.cp_async_commit_group()
+
+
+def _reduce_kq_fragment_heads(fragment, op):
+    """Reduce 2 rows per thread, then 16 rows per warp by XOR 4, 8, 16, for 4 heads.
+    Expects the m64n16 TV layout ((4,8,4),(2,2,2)):((128,1,16),(64,8,512))."""
+
+    r0 = op(fragment[0], fragment[2])
+    r1 = op(fragment[1], fragment[3])
+    r2 = op(fragment[4], fragment[6])
+    r3 = op(fragment[5], fragment[7])
+    for offset in (4, 8, 16):
+        r0 = op(r0, cute.arch.shuffle_sync_bfly(r0, offset=offset))
+        r1 = op(r1, cute.arch.shuffle_sync_bfly(r1, offset=offset))
+        r2 = op(r2, cute.arch.shuffle_sync_bfly(r2, offset=offset))
+        r3 = op(r3, cute.arch.shuffle_sync_bfly(r3, offset=offset))
+    return r0, r1, r2, r3
+
+
+def _store_output(thr_pv, sout_ptr, inv_den_ptr, out_acc):
+    den_view = cute.make_tensor(inv_den_ptr, cute.make_layout((64, H), stride=(0, 1)))
+    den_frag = thr_pv.partition_C(den_view)
+    for chunk in range(DV // 64):
+        out_view = cute.make_tensor(
+            sout_ptr + chunk * 64,
+            cute.make_layout((64, H), stride=(1, OT_STRIDE)),
+        )
+        out_frag = thr_pv.partition_C(out_view)
+        for i in range(cute.size(out_acc[chunk])):
+            out_frag[i] = (out_acc[chunk][i] * den_frag[i]).to(cutlass.BFloat16)
+
+
+@cute.kernel
+def _kernel(
+    m_q: cute.Tensor,
+    m_kv: cute.Tensor,
+    m_indices: cute.Tensor,
+    m_topk_length: cute.Tensor,
+    m_attn_sink: cute.Tensor,
+    m_out: cute.Tensor,
+    mma_qk: cute.TiledMma,
+    mma_pv: cute.TiledMma,
+    sm_scale: cutlass.Float32,
+    tq: cutlass.Int32,
+    s_kv: cutlass.Int32,
+    topk: cutlass.Constexpr[int],
+):
+    tidx, _, _ = cute.arch.thread_idx()
+    bidx, _, _ = cute.arch.block_idx()
+    # Widen before multiplying Q, index, and output row strides.
+    qpos = cutlass.Int64(tq - 1) - cutlass.Int64(bidx)
+    g8 = tidx // 8
+    k8 = tidx % 8
+
+    smem = utils.SmemAllocator()
+    skv_ptr = smem.allocate_array(cutlass.BFloat16, KV_ELEMS, byte_alignment=1024)
+    sq_raw = smem.allocate_array(cutlass.BFloat16, Q_ELEMS, byte_alignment=1024)
+    q_atom = warpgroup.make_smem_layout_atom(
+        warpgroup.SmemLayoutAtomKind.K_SW128, cutlass.BFloat16
+    )
+    sq_ptr = cute.recast_ptr(sq_raw, q_atom.inner)
+    sp_ptr = smem.allocate_array(cutlass.BFloat16, P_ELEMS, byte_alignment=1024)
+    # The same allocation is reused for max and denominator.
+    spartial_ptr = smem.allocate_array(cutlass.Float32, 4 * H, byte_alignment=128)
+    smask_ptr = smem.allocate_array(cutlass.Float32, 2 * BN, byte_alignment=128)
+    smax_ptr = smem.allocate_array(cutlass.Float32, H, byte_alignment=128)
+    salpha_ptr = smem.allocate_array(cutlass.Float32, H, byte_alignment=128)
+    ssink_ptr = smem.allocate_array(cutlass.Float32, H, byte_alignment=128)
+    inv_den_ptr = smem.allocate_array(cutlass.Float32, H, byte_alignment=128)
+
+    # The output epilogue aliases the consumed KV staging storage.
+    sout_ptr = skv_ptr
+
+    # Load the first H*DQK elements of each Q row, so H64 input needs no head copy.
+    q_ptr = m_q.iterator + qpos * m_q.stride[0]
+    kv_ptr = m_kv.iterator
+    idx_ptr = m_indices.iterator + qpos * topk
+    out_ptr = m_out.iterator + qpos * (H * DV)
+    # Keep malformed metadata from repeating the final tile.
+    topk_length = cutlass.max(
+        cutlass.min(m_topk_length.iterator[qpos], cutlass.Int32(topk)),
+        cutlass.Int32(0),
+    )
+    # Run one masked tile for length=0 so the launch has a uniform prologue.
+    n_tiles = cutlass.max((topk_length + (BN - 1)) // BN, cutlass.Int32(1))
+    scale_log2 = sm_scale * LOG2E
+
+    # Q is its own cp.async group, in flight while the four tile-0 KV groups issue.
+    g2s = cute.make_copy_atom(
+        cpasync.CopyG2SOp(), cutlass.BFloat16, num_bits_per_copy=128
+    )
+    l8 = cute.make_layout((8, 1))
+    for j in cutlass.range_constexpr(DQK // 64):
+        linear = (j * NTHR + tidx) * 8
+        head = linear // DQK
+        dim = linear - head * DQK
+        qoff = (dim // 64) * Q_CHUNK + (head // 8) * 512 + (head % 8) * 64 + (dim % 64)
+        qdst = cute.make_ptr(
+            cutlass.BFloat16,
+            (sq_raw + qoff).toint(),
+            cute.AddressSpace.smem,
+            assumed_align=16,
+        )
+        qdst = cute.recast_ptr(qdst, q_atom.inner)
+        cute.copy(
+            g2s,
+            cute.make_tensor(_gp((q_ptr + linear).toint()), l8),
+            cute.make_tensor(qdst, l8),
+        )
+    cute.arch.cp_async_commit_group()
+
+    if tidx < H:
+        sink = m_attn_sink.iterator[tidx] * LOG2E
+        ssink_ptr[tidx] = sink
+        # As in FlashMLA, the online maximum covers real K rows only.
+        # The sink joins the denominator in the epilogue, after P is rounded to BF16.
+        smax_ptr[tidx] = cutlass.Float32(NO_SINK)
+        salpha_ptr[tidx] = cutlass.Float32(1.0)
+    cute.arch.barrier()
+
+    # Q plus these four KV groups make five, so the first QK wait also releases Q.
+    ga0, sa0, predicates0 = _resolve_rows(
+        kv_ptr,
+        idx_ptr,
+        skv_ptr,
+        smask_ptr,
+        cutlass.Int32(0),
+        g8,
+        k8,
+        topk_length,
+        s_kv,
+    )
+    _prefetch_tile(ga0, sa0, predicates0)
+
+    thr_qk = mma_qk.get_slice(tidx)
+    thr_pv = mma_pv.get_slice(tidx)
+    k_frags, q_frags = _make_qk_fragments(mma_qk, thr_qk, skv_ptr, sq_ptr)
+    v_frags, out_acc = _make_pv_fragments(mma_pv, thr_pv, skv_ptr)
+
+    id_score = cute.make_identity_tensor((BN, H))
+    score_acc = cute.make_rmem_tensor(
+        thr_qk.partition_C(id_score).shape, cutlass.Float32
+    )
+    prob_acc = cute.make_rmem_tensor(score_acc.shape, cutlass.BFloat16)
+    sum_acc = cute.make_rmem_tensor(score_acc.shape, cutlass.Float32)
+    sum_acc.fill(0.0)
+
+    # QK writes P in its C view, and PV reads the same bytes in a transposed B view.
+    prob_store_view = cute.make_tensor(
+        sp_ptr,
+        cute.make_layout(((8, 8), (8, 2)), stride=((8, 128), (1, 64))),
+    )
+    prob_store_frag = thr_qk.partition_C(prob_store_view)
+    prob_mma_view = cute.make_tensor(
+        sp_ptr,
+        cute.make_layout(((8, 2), (8, 8)), stride=((1, 64), (8, 128))),
+    )
+    prob_mma_frag = mma_pv.make_fragment_B(thr_pv.partition_B(prob_mma_view))
+
+    max_view = cute.make_tensor(smax_ptr, cute.make_layout((BN, H), stride=(0, 1)))
+    max_frag = thr_qk.partition_C(max_view)
+    alpha_qk_view = cute.make_tensor(
+        salpha_ptr, cute.make_layout((BN, H), stride=(0, 1))
+    )
+    alpha_qk_frag = thr_qk.partition_C(alpha_qk_view)
+    alpha_pv_view = cute.make_tensor(
+        salpha_ptr, cute.make_layout((64, H), stride=(0, 1))
+    )
+    alpha_pv_frag = thr_pv.partition_C(alpha_pv_view)
+
+    mma_pv.set(warpgroup.Field.ACCUMULATE, True)
+
+    for tile in cutlass.range(n_tiles, unroll=1):
+        buf = tile % 2
+        next_buf = cutlass.Int32(1) - buf
+        current_mask_ptr = smask_ptr + buf * BN
+
+        _issue_qk_staged(mma_qk, score_acc, k_frags, q_frags)
+
+        # Resolve the next tile's rows here, under the four in-flight QK WGMMA groups.
+        # The alternate mask buffer stays live until the next tile.
+        next_base = cutlass.min((tile + 1) * BN, cutlass.Int32(topk - BN))
+        next_ga, next_sa, next_predicates = _resolve_rows(
+            kv_ptr,
+            idx_ptr,
+            skv_ptr,
+            smask_ptr + next_buf * BN,
+            next_base,
+            g8,
+            k8,
+            topk_length,
+            s_kv,
+        )
+
+        cute.nvgpu.warpgroup.wait_group(0)
+
+        current_mask_view = cute.make_tensor(
+            current_mask_ptr, cute.make_layout((BN, H), stride=(1, 0))
+        )
+        current_mask_frag = thr_qk.partition_C(current_mask_view)
+
+        # QK sets ACCUMULATE=False at the next tile, so scale/mask in place.
+        for i in cutlass.range_constexpr(cute.size(score_acc)):
+            score_acc[i] = (
+                score_acc[i] * scale_log2
+                if current_mask_frag[i] > 0.0
+                else cutlass.Float32(INVALID_SCORE)
+            )
+        warp_max = _reduce_kq_fragment_heads(score_acc, cutlass.max)
+        # Keep inline in @cute.kernel so its SSA values stay in traced control flow.
+        lane_partial = tidx % 32
+        if lane_partial < 4:
+            warp_partial = tidx // 32
+            head_lo = 2 * lane_partial
+            spartial_ptr[warp_partial * H + head_lo] = warp_max[0]
+            spartial_ptr[warp_partial * H + head_lo + 1] = warp_max[1]
+            spartial_ptr[warp_partial * H + head_lo + 8] = warp_max[2]
+            spartial_ptr[warp_partial * H + head_lo + 9] = warp_max[3]
+        cute.arch.barrier()
+
+        if tidx < H:
+            old_max = smax_ptr[tidx]
+            new_max = old_max
+            for warp in cutlass.range_constexpr(4):
+                new_max = cutlass.max(new_max, spartial_ptr[warp * H + tidx])
+            smax_ptr[tidx] = new_max
+            salpha_ptr[tidx] = (
+                cutlass.Float32(1.0)
+                if old_max == new_max
+                else cute.math.exp2(old_max - new_max, fastmath=True)
+            )
+        cute.arch.barrier()
+
+        if tile > 0:
+            for i in cutlass.range_constexpr(cute.size(score_acc)):
+                sum_acc[i] = sum_acc[i] * alpha_qk_frag[i]
+
+        for i in cutlass.range_constexpr(cute.size(score_acc)):
+            p = cute.math.exp2(score_acc[i] - max_frag[i], fastmath=True)
+            prob_acc[i] = p.to(cutlass.BFloat16)
+            sum_acc[i] = sum_acc[i] + p
+
+        # PV's C fragments differ from QK's, so alpha uses its own broadcast view.
+        if tile > 0:
+            for i in cutlass.range_constexpr(cute.size(out_acc[0])):
+                alpha = alpha_pv_frag[i]
+                for chunk in cutlass.range_constexpr(DV // 64):
+                    out_acc[chunk][i] = out_acc[chunk][i] * alpha
+
+        cute.autovec_copy(prob_acc, prob_store_frag)
+        cute.arch.fence_proxy("async.shared", space="cta")
+        cute.arch.barrier()
+
+        if tile + 1 < n_tiles:
+            _run_pv_rolling(
+                mma_pv,
+                out_acc,
+                v_frags,
+                prob_mma_frag,
+                next_ga,
+                next_sa,
+                next_predicates,
+            )
+        else:
+            _queue_pv_final(mma_pv, out_acc, v_frags, prob_mma_frag)
+
+    warp_sum = _reduce_kq_fragment_heads(sum_acc, lambda x, y: x + y)
+    lane_partial = tidx % 32
+    if lane_partial < 4:
+        warp_partial = tidx // 32
+        head_lo = 2 * lane_partial
+        spartial_ptr[warp_partial * H + head_lo] = warp_sum[0]
+        spartial_ptr[warp_partial * H + head_lo + 1] = warp_sum[1]
+        spartial_ptr[warp_partial * H + head_lo + 8] = warp_sum[2]
+        spartial_ptr[warp_partial * H + head_lo + 9] = warp_sum[3]
+    cute.arch.barrier()
+    if tidx < H:
+        denom = cutlass.Float32(0.0)
+        for warp in cutlass.range_constexpr(4):
+            denom = denom + spartial_ptr[warp * H + tidx]
+        sink_mass = (
+            cutlass.Float32(1.0)
+            if ssink_ptr[tidx] == smax_ptr[tidx]
+            else cute.math.exp2(ssink_ptr[tidx] - smax_ptr[tidx], fastmath=True)
+        )
+        denom = denom + sink_mass
+        inv_den_ptr[tidx] = (
+            cutlass.Float32(1.0) / denom if denom > 0.0 else cutlass.Float32(0.0)
+        )
+    cute.arch.barrier()
+
+    # The last tile's PV stayed in flight through the denominator reduction above.
+    cute.nvgpu.warpgroup.wait_group(0)
+    _store_output(thr_pv, sout_ptr, inv_den_ptr, out_acc)
+    cute.arch.barrier()
+
+    for chunk in cutlass.range_constexpr(DV // 64):
+        linear = chunk * NTHR + tidx
+        head = linear // 64
+        dim = linear % 64
+        cute.autovec_copy(
+            cute.make_tensor(_sp((sout_ptr + head * OT_STRIDE + dim * 8).toint()), l8),
+            cute.make_tensor(_gp((out_ptr + head * DV + dim * 8).toint()), l8),
+        )
+
+
+@cute.jit
+def _launch(
+    m_q: cute.Tensor,
+    m_kv: cute.Tensor,
+    m_indices: cute.Tensor,
+    m_topk_length: cute.Tensor,
+    m_attn_sink: cute.Tensor,
+    m_out: cute.Tensor,
+    tq: cutlass.Int32,
+    s_kv: cutlass.Int32,
+    sm_scale: cutlass.Float32,
+    stream,
+):
+    topk = cute.size(m_indices, mode=[1])
+
+    op_qk = MmaF16BF16Op(
+        cutlass.BFloat16,
+        cutlass.Float32,
+        (64, H, 16),
+        OperandSource.SMEM,
+        OperandMajorMode.K,
+        OperandMajorMode.K,
+    )
+    mma_qk = cute.make_tiled_mma(cute.make_mma_atom(op_qk), (1, 1, 1))
+    op_pv = MmaF16BF16Op(
+        cutlass.BFloat16,
+        cutlass.Float32,
+        (64, H, 16),
+        OperandSource.SMEM,
+        OperandMajorMode.MN,
+        OperandMajorMode.MN,
+    )
+    mma_pv = cute.make_tiled_mma(cute.make_mma_atom(op_pv), (1, 1, 1))
+
+    _kernel(
+        m_q,
+        m_kv,
+        m_indices,
+        m_topk_length,
+        m_attn_sink,
+        m_out,
+        mma_qk,
+        mma_pv,
+        sm_scale,
+        tq,
+        s_kv,
+        topk,
+    ).launch(
+        grid=(tq, 1, 1),
+        block=(NTHR, 1, 1),
+        stream=stream,
+        min_blocks_per_mp=2,
+    )
+
+
+_COMPILE_CACHE: dict[tuple, object] = {}
+_COMPILE_LOCK = threading.Lock()
+
+
+def _validate_inputs(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    topk_length: torch.Tensor,
+    attn_sink: torch.Tensor,
+    sm_scale: float,
+) -> None:
+    if q.ndim != 3 or q.shape[1] not in (H, 64) or q.shape[2] != DQK:
+        raise ValueError(f"q must have shape [TQ, 16|64, 512], got {tuple(q.shape)}")
+    if kv.ndim != 2 or kv.shape[1] != DQK:
+        raise ValueError(f"kv must have shape [SKV, 512], got {tuple(kv.shape)}")
+    if indices.ndim != 2 or indices.shape[0] != q.shape[0]:
+        raise ValueError(
+            f"indices must have shape [TQ, TOPK], got {tuple(indices.shape)}"
+        )
+    if topk_length.shape != (q.shape[0],):
+        raise ValueError(
+            f"topk_length must have shape [{q.shape[0]}], "
+            f"got {tuple(topk_length.shape)}"
+        )
+    if attn_sink.ndim != 1 or attn_sink.numel() < H:
+        raise ValueError(
+            f"attn_sink must have shape [>=16], got {tuple(attn_sink.shape)}"
+        )
+
+    topk = indices.shape[1]
+    if topk == 0 or topk % TOPK_ALIGNMENT != 0 or topk > MAX_TOPK:
+        raise ValueError(
+            f"TOPK width must be in [{TOPK_ALIGNMENT}, {MAX_TOPK}] and divisible by "
+            f"{TOPK_ALIGNMENT}; got {topk}"
+        )
+    if kv.shape[0] == 0:
+        raise ValueError("kv workspace must contain at least one row")
+
+    tensors = (q, kv, indices, topk_length, attn_sink)
+    if not all(t.is_cuda for t in tensors):
+        raise ValueError(
+            "q, kv, indices, topk_length, and attn_sink must be CUDA tensors"
+        )
+    if not all(t.device == q.device for t in tensors):
+        raise ValueError("all inputs must be on the same CUDA device")
+    if q.dtype != torch.bfloat16 or kv.dtype != torch.bfloat16:
+        raise TypeError(f"q and kv must be bfloat16, got {q.dtype} and {kv.dtype}")
+    if indices.dtype != torch.int32:
+        raise TypeError(f"indices must be int32, got {indices.dtype}")
+    if topk_length.dtype != torch.int32:
+        raise TypeError(f"topk_length must be int32, got {topk_length.dtype}")
+    if attn_sink.dtype != torch.float32:
+        raise TypeError(f"attn_sink must be float32, got {attn_sink.dtype}")
+    if not all(t.is_contiguous() for t in tensors):
+        raise ValueError("all inputs must be contiguous")
+    if q.data_ptr() % 16 != 0 or kv.data_ptr() % 16 != 0:
+        raise ValueError("q and kv storage must be aligned to 16 bytes")
+
+    capability = torch.cuda.get_device_capability(q.device)
+    if capability != (9, 0):
+        raise ValueError(
+            "cute_sparse_mla_h16_fwd requires a Hopper SM90 GPU, "
+            f"got compute capability {capability[0]}.{capability[1]}"
+        )
+
+    scale = float(sm_scale)
+    if not math.isfinite(scale) or scale <= 0.0:
+        raise ValueError(f"sm_scale must be finite and positive, got {sm_scale}")
+
+
+def _dynamic_tensor(tensor: torch.Tensor, alignment: int):
+    return from_dlpack(tensor, assumed_align=alignment).mark_compact_shape_dynamic(
+        mode=0, stride_order=tuple(range(tensor.ndim)), divisibility=1
+    )
+
+
+@register_custom_op(op_name="cute_sparse_mla_h16", mutates_args=["output"])
+def _cute_sparse_mla_h16_op(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    topk_length: torch.Tensor,
+    attn_sink: torch.Tensor,
+    output: torch.Tensor,
+    sm_scale: float,
+) -> None:
+    with torch.cuda.device(q.device):
+        # Only TQ/SKV vary at runtime; heads and TOPK specialize the executor.
+        args = (
+            _dynamic_tensor(q, 16),
+            _dynamic_tensor(kv, 16),
+            _dynamic_tensor(indices, 4),
+            _dynamic_tensor(topk_length, 4),
+            from_dlpack(attn_sink, assumed_align=4),
+            _dynamic_tensor(output, 16),
+            cutlass.Int32(q.shape[0]),
+            cutlass.Int32(kv.shape[0]),
+            cutlass.Float32(sm_scale),
+            cuda.CUstream(torch.cuda.current_stream(q.device).cuda_stream),
+        )
+        key = (q.device.index, q.shape[1], indices.shape[1])
+        fn = _COMPILE_CACHE.get(key)
+        if fn is None:
+            with _COMPILE_LOCK:
+                fn = _COMPILE_CACHE.get(key)
+                if fn is None:
+                    fn = cute.compile(_launch, *args)
+                    _COMPILE_CACHE[key] = fn
+        fn(*args)
+
+
+def cute_sparse_mla_h16_fwd(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    topk_length: torch.Tensor,
+    attn_sink: torch.Tensor,
+    sm_scale: float,
+) -> torch.Tensor:
+    """Run native-H16 DSV4 sparse prefill and return ``[TQ, 16, 512]``."""
+
+    _validate_inputs(q, kv, indices, topk_length, attn_sink, sm_scale)
+    output = torch.empty((q.shape[0], H, DV), dtype=torch.bfloat16, device=q.device)
+    if q.shape[0] == 0:
+        return output
+
+    _cute_sparse_mla_h16_op(
+        q,
+        kv,
+        indices,
+        topk_length,
+        attn_sink[:H],
+        output,
+        float(sm_scale),
+    )
+    return output
+
+
+__all__ = ["cute_sparse_mla_h16_fwd"]
