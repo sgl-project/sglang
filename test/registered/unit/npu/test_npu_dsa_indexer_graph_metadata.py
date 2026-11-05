@@ -329,6 +329,28 @@ class TestGraphHandle(CustomTestCase):
                 mode=ForwardMode.DECODE, bs=2, live_seq_lens=[6, 9], op=op
             )
 
+    def test_replay_keeps_batch_bucket_storage_independent(self):
+        backend = _backend()
+        op = _FakeMetadataOp()
+        with patch("torch.ops.custom", MagicMock(), create=True) as custom_ops:
+            custom_ops.npu_quant_lightning_indexer_metadata.side_effect = op
+            first = self._capture(backend, mode=ForwardMode.DECODE, bs=1)
+            second = self._capture(backend, mode=ForwardMode.DECODE, bs=2)
+            first_ptr = first.quant_indexer_metadata.data_ptr()
+            second_ptr = second.quant_indexer_metadata.data_ptr()
+            self.assertNotEqual(first_ptr, second_ptr)
+            for lengths in ([5], [7, 9], [11]):
+                batch = _eager_batch(mode=ForwardMode.DECODE, seq_lens=lengths)
+                batch.seq_lens_cpu = None
+                backend.init_forward_metadata_out_graph(batch)
+            self.assertEqual(first.quant_indexer_kv_lens.tolist(), [11])
+            self.assertEqual(second.quant_indexer_kv_lens.tolist(), [7, 9])
+            self.assertEqual(first.quant_indexer_metadata.data_ptr(), first_ptr)
+            self.assertEqual(second.quant_indexer_metadata.data_ptr(), second_ptr)
+            self.assertEqual(len(op.calls), 3)
+            self.assertTrue(torch.all(first.quant_indexer_metadata == 3))
+            self.assertTrue(torch.all(second.quant_indexer_metadata == 2))
+
     def test_draft_extend_capture_builds_no_handle(self):
         backend = _backend()
         with patch("torch.ops.custom", MagicMock(), create=True) as custom_ops:
