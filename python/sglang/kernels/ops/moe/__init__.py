@@ -367,3 +367,35 @@ register_kernel(
         capabilities=CUDA_ONLY,
     )
 )
+
+
+# In-tree Kimi K3 CuTe kernels; metadata imports no GPU implementation.
+for _name, _target in (
+    (
+        "dense_situ",
+        "sglang.kernels.ops.moe.kimi_k3_specialized.dense:DenseSitu.__call__",
+    ),
+    (
+        "route_situ",
+        "sglang.kernels.ops.moe.kimi_k3_specialized.front:RouteSitu.__call__",
+    ),
+    (
+        "cluster_experts_t_p16",
+        "sglang.kernels.ops.moe.kimi_k3_specialized.small_batch_experts:ClusterExpertsTP16.__call__",
+    ),
+    (
+        "cluster_experts_t_p8",
+        "sglang.kernels.ops.moe.kimi_k3_specialized.small_batch_experts:ClusterExpertsTP8.__call__",
+    ),
+):
+    register_kernel(
+        KernelSpec(
+            op=f"moe.kimi_k3_{_name}",
+            backend=KernelBackend.CUTE_DSL,
+            target=_target,
+            capabilities=frozenset(
+                {CapabilityRequirement.cuda(min_sm=(10, 3), max_sm=(10, 3))}
+            ),
+        )
+    )
+del _name, _target

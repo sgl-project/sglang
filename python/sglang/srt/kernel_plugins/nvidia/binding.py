@@ -37,6 +37,7 @@ from sglang.kernels.plugin_kernels.nvidia.spec import (
     PostVerifyStrategy,
     SpeculativeRuntimeHooks,
     Step,
+    builtin_spec_registered,
     find_spec,
     registered_architectures,
     spec_registered,
@@ -1343,7 +1344,7 @@ def handle_nvidia_megakernel(server_args: Any) -> None:
     archs = model_config_of(server_args).hf_config.architectures
     if msa_serves(archs) and not cfg.enable_amd_monokernel:
         return  # handle_monokernel checks the MSA plugin's spec
-    reasons = plugin_reasons()
+    reasons = [] if builtin_spec_registered(archs) else plugin_reasons()
     if not reasons:
         model_config = model_config_of(server_args)
         spec, reasons = megakernel_disable_reasons(

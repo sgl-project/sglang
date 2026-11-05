@@ -1,0 +1,3249 @@
+{
+  "source_repository": "https://github.com/LeslieWylie/sgl-nvidia-mega",
+  "source_pull_request": "https://github.com/sgl-project/sgl-nvidia-mega/pull/38",
+  "upstream_repository": "https://github.com/sgl-project/sgl-nvidia-mega",
+  "upstream_base_commit": "c396f2ab6c7e779af326321ef75fb5b6008e6165",
+  "source_commit": "459640ec1db2b0ffd5ebabc65a51dfd9524f4e44",
+  "source_file_count": 54,
+  "sources": [
+    {
+      "source": "sgl_nvidia_mega/kimi_k3/__init__.py",
+      "sha256": "1c443db5eddce3daf0e6405037ee165ec20108279af460a2d3e3fc792072412a",
+      "targets": [
+        {
+          "module": "sglang.srt.kernel_plugins.nvidia.kimi_k3",
+          "path": "srt/kernel_plugins/nvidia/kimi_k3/__init__.py"
+        }
+      ],
+      "symbols": []
+    },
+    {
+      "source": "sgl_nvidia_mega/kimi_k3/compat.py",
+      "sha256": "9166fe6f607a9c64ba9fbbf55e72b6cb0fde1841f3b9da33ddcadc7fafe8cd99",
+      "targets": [
+        {
+          "module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.compat",
+          "path": "srt/kernel_plugins/nvidia/kimi_k3/compat.py"
+        }
+      ],
+      "symbols": [
+        {
+          "name": "_base_version",
+          "kind": "FunctionDef",
+          "line": 88,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.compat",
+          "ast_sha256_without_imports": "d137e482e0d455329c073276a4197da2d9d4fc18bb59709fff3508f6e8570ead"
+        },
+        {
+          "name": "_require_attributes",
+          "kind": "FunctionDef",
+          "line": 92,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.compat",
+          "ast_sha256_without_imports": "bcde4360b2dbcb75abbd6d55ca51db72349a2c62646e31675118f296a12edf1c"
+        },
+        {
+          "name": "_require_files",
+          "kind": "FunctionDef",
+          "line": 98,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.compat",
+          "ast_sha256_without_imports": "b9c87b05108d333b182089be3e3bc1d04152905dc53286e88001710e72e1e8ca"
+        },
+        {
+          "name": "_tokenspeed_signature",
+          "kind": "FunctionDef",
+          "line": 109,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.compat",
+          "ast_sha256_without_imports": "6cf05c01897739276b11660ed16ae3da9562f9626cd4d4175a09abc25c6cea95"
+        },
+        {
+          "name": "validate_tokenspeed_compatibility",
+          "kind": "FunctionDef",
+          "line": 152,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.compat",
+          "ast_sha256_without_imports": "a1c4aa37577d0878377bb194282cff18d66d797eb425870e720df3eeff3a861e"
+        },
+        {
+          "name": "validate_runtime_compatibility",
+          "kind": "FunctionDef",
+          "line": 257,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.compat",
+          "ast_sha256_without_imports": "0e7671ab75cb8acaa2e4a9176a7bf50b539b0bb4e6d3e01f037efd637d019a8d"
+        }
+      ]
+    },
+    {
+      "source": "sgl_nvidia_mega/kimi_k3/cutedsl/__init__.py",
+      "sha256": "bd3762ee4302c67a96afbd65e9ecc48714081f73e79a8a422c2d52d26f7fd7ed",
+      "targets": [
+        {
+          "module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl",
+          "path": "srt/kernel_plugins/nvidia/kimi_k3/cutedsl/__init__.py"
+        }
+      ],
+      "symbols": []
+    },
+    {
+      "source": "sgl_nvidia_mega/kimi_k3/cutedsl/attn_res/__init__.py",
+      "sha256": "bd3762ee4302c67a96afbd65e9ecc48714081f73e79a8a422c2d52d26f7fd7ed",
+      "targets": [
+        {
+          "module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.attn_res",
+          "path": "srt/kernel_plugins/nvidia/kimi_k3/cutedsl/attn_res/__init__.py"
+        }
+      ],
+      "symbols": []
+    },
+    {
+      "source": "sgl_nvidia_mega/kimi_k3/cutedsl/attn_res/kernel.py",
+      "sha256": "68a7e4b11344330e4d9e926545216b0ae0877ccdabe4b144dde14f0547f3f599",
+      "targets": [
+        {
+          "module": "sglang.kernels.ops.layernorm.kimi_k3_specialized.attn_res",
+          "path": "kernels/ops/layernorm/kimi_k3_specialized/attn_res.py"
+        }
+      ],
+      "symbols": [
+        {
+          "name": "round_pair",
+          "kind": "FunctionDef",
+          "line": 33,
+          "target_module": "sglang.kernels.ops.layernorm.kimi_k3_specialized.attn_res",
+          "ast_sha256_without_imports": "543ccc5f93fd2da73dd44f291ac15f7f708a96c7f864b65d0443be61167b0db7"
+        },
+        {
+          "name": "unpack",
+          "kind": "FunctionDef",
+          "line": 39,
+          "target_module": "sglang.kernels.ops.layernorm.kimi_k3_specialized.attn_res",
+          "ast_sha256_without_imports": "1f6604141daabcc8db2329ef7a5724007f9f7874162297918b6fd55085bac6c4"
+        },
+        {
+          "name": "block_ptr",
+          "kind": "FunctionDef",
+          "line": 45,
+          "target_module": "sglang.kernels.ops.layernorm.kimi_k3_specialized.attn_res",
+          "ast_sha256_without_imports": "9c3275667e21b6ca85803c6fc57ce711dd30efc2306290d4b983dedc10ea2a11"
+        },
+        {
+          "name": "rstd",
+          "kind": "FunctionDef",
+          "line": 50,
+          "target_module": "sglang.kernels.ops.layernorm.kimi_k3_specialized.attn_res",
+          "ast_sha256_without_imports": "3e918e7ceea61c0772e4b2a7248f96f0ff9a6939daf915800d9c2fb96ce46531"
+        },
+        {
+          "name": "dot8",
+          "kind": "FunctionDef",
+          "line": 56,
+          "target_module": "sglang.kernels.ops.layernorm.kimi_k3_specialized.attn_res",
+          "ast_sha256_without_imports": "386227554a54891237a4512d70fa8a2ed36c350cc69c996cdb3d637364ac8d86"
+        },
+        {
+          "name": "arm_exchanges",
+          "kind": "FunctionDef",
+          "line": 61,
+          "target_module": "sglang.kernels.ops.layernorm.kimi_k3_specialized.attn_res",
+          "ast_sha256_without_imports": "40157824a1a403c48a044c93cb7091a0c35a70946d8be7d8980d6c442c54f150"
+        },
+        {
+          "name": "ClusterAttnRes",
+          "kind": "ClassDef",
+          "line": 72,
+          "target_module": "sglang.kernels.ops.layernorm.kimi_k3_specialized.attn_res",
+          "ast_sha256_without_imports": "57efb112cbb98e2092c951069f14bf969129b290a7e982137b6cba1f50560cea",
+          "kernel_class": true
+        }
+      ]
+    },
+    {
+      "source": "sgl_nvidia_mega/kimi_k3/cutedsl/attn_res/prepared.py",
+      "sha256": "6adee57ce70cd2e40c1ccffb6debe24c62a5b6dccd5bda30f2aea954166bc48f",
+      "targets": [
+        {
+          "module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.attn_res.prepared",
+          "path": "srt/kernel_plugins/nvidia/kimi_k3/cutedsl/attn_res/prepared.py"
+        }
+      ],
+      "symbols": [
+        {
+          "name": "compile_consumer",
+          "kind": "FunctionDef",
+          "line": 23,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.attn_res.prepared",
+          "ast_sha256_without_imports": "b5eb22e254481afcfd101f49114235af336fd4fea03f59baeaa605e6a87f9cb4"
+        },
+        {
+          "name": "PreparedAttnRes",
+          "kind": "ClassDef",
+          "line": 40,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.attn_res.prepared",
+          "ast_sha256_without_imports": "6d393fc76d6c3e08f71730fe48aa9750dde7841602caffe581f31725a6bd4fcd"
+        }
+      ]
+    },
+    {
+      "source": "sgl_nvidia_mega/kimi_k3/cutedsl/common/__init__.py",
+      "sha256": "bd3762ee4302c67a96afbd65e9ecc48714081f73e79a8a422c2d52d26f7fd7ed",
+      "targets": [
+        {
+          "module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.common",
+          "path": "srt/kernel_plugins/nvidia/kimi_k3/cutedsl/common/__init__.py"
+        }
+      ],
+      "symbols": []
+    },
+    {
+      "source": "sgl_nvidia_mega/kimi_k3/cutedsl/common/embedding.py",
+      "sha256": "237535356fb0c6a1a3f43818fa3da73c0b21c30cf2b6e50fbcb097401bbcd470",
+      "targets": [
+        {
+          "module": "sglang.kernels.ops.embeddings.kimi_k3_specialized.embedding",
+          "path": "kernels/ops/embeddings/kimi_k3_specialized/embedding.py"
+        },
+        {
+          "module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.common.embedding",
+          "path": "srt/kernel_plugins/nvidia/kimi_k3/cutedsl/common/embedding.py"
+        }
+      ],
+      "symbols": [
+        {
+          "name": "EmbeddingGather",
+          "kind": "ClassDef",
+          "line": 22,
+          "target_module": "sglang.kernels.ops.embeddings.kimi_k3_specialized.embedding",
+          "ast_sha256_without_imports": "ba79083384eb287038fef019ea7d0d906db5bd755602437abb0ee527ea1291e2",
+          "kernel_class": true
+        },
+        {
+          "name": "compile_gather",
+          "kind": "FunctionDef",
+          "line": 43,
+          "target_module": "sglang.kernels.ops.embeddings.kimi_k3_specialized.embedding",
+          "ast_sha256_without_imports": "81f897095ce57ca665ea5cab4828333d0bcd4b9e0066ee6c019175ee341d792f"
+        },
+        {
+          "name": "PreparedEmbedding",
+          "kind": "ClassDef",
+          "line": 53,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.common.embedding",
+          "ast_sha256_without_imports": "ead471bb06fd5e8d62741b04cb12c89cecba7642f552ab10d166ecedd50a2106"
+        }
+      ]
+    },
+    {
+      "source": "sgl_nvidia_mega/kimi_k3/cutedsl/common/host.py",
+      "sha256": "6101863de52475e21d957480afbfa851e67d36cac8723542971af3c50793fcfd",
+      "targets": [
+        {
+          "module": "sglang.kernels.jit.kimi_k3.host",
+          "path": "kernels/jit/kimi_k3/host.py"
+        },
+        {
+          "module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.common.host",
+          "path": "srt/kernel_plugins/nvidia/kimi_k3/cutedsl/common/host.py"
+        }
+      ],
+      "symbols": [
+        {
+          "name": "layout",
+          "kind": "FunctionDef",
+          "line": 20,
+          "target_module": "sglang.kernels.jit.kimi_k3.host",
+          "ast_sha256_without_imports": "7a42bd89bb9babb7c7360db0514a2afd39b2f8a993b21b0e59ae9fce886a2dd0"
+        },
+        {
+          "name": "stream",
+          "kind": "FunctionDef",
+          "line": 24,
+          "target_module": "sglang.kernels.jit.kimi_k3.host",
+          "ast_sha256_without_imports": "86945741cd02f53f78f4d3b80b71ed321402db3ce4673009064b77b0c7254d2f"
+        },
+        {
+          "name": "architecture",
+          "kind": "FunctionDef",
+          "line": 28,
+          "target_module": "sglang.kernels.jit.kimi_k3.host",
+          "ast_sha256_without_imports": "994f32a4d030a1931b09a29ab60fd35145c451894ab99ae6120e1263dca86967"
+        },
+        {
+          "name": "validate_init_barrier_group",
+          "kind": "FunctionDef",
+          "line": 33,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.common.host",
+          "ast_sha256_without_imports": "5430282b194c27e589c452e968068c26dbe05163819f0f835b5f3356c6165503"
+        },
+        {
+          "name": "fake",
+          "kind": "FunctionDef",
+          "line": 60,
+          "target_module": "sglang.kernels.jit.kimi_k3.host",
+          "ast_sha256_without_imports": "9c87ebf5b866a37b134d6e836cbb687ea12cb5ad5f91b3b90d14651c55990336"
+        },
+        {
+          "name": "dynamic_fake",
+          "kind": "FunctionDef",
+          "line": 67,
+          "target_module": "sglang.kernels.jit.kimi_k3.host",
+          "ast_sha256_without_imports": "76027178db7fed02d9269d4da2efdc811a44d71f66fca502b9abf0a46049a8e2"
+        },
+        {
+          "name": "dynamic_view",
+          "kind": "FunctionDef",
+          "line": 72,
+          "target_module": "sglang.kernels.jit.kimi_k3.host",
+          "ast_sha256_without_imports": "d1f6fee84c701929ac939ade85b3d267cf2d0a36c4fdc52cbc6ea0febc2122d2"
+        },
+        {
+          "name": "tensor_maps",
+          "kind": "FunctionDef",
+          "line": 76,
+          "target_module": "sglang.kernels.jit.kimi_k3.host",
+          "ast_sha256_without_imports": "3ee38ba390137c4b1880cfc062ee3f236de6ad6e3f8a91e2386fe4b7154082dd"
+        },
+        {
+          "name": "_checked",
+          "kind": "FunctionDef",
+          "line": 99,
+          "target_module": "sglang.kernels.jit.kimi_k3.host",
+          "ast_sha256_without_imports": "0e968bb7e788ab0f1bd05030054d50f4da7e6665191cec422d090b2911834971"
+        },
+        {
+          "name": "PreparedLaunchAttributes",
+          "kind": "ClassDef",
+          "line": 107,
+          "target_module": "sglang.kernels.jit.kimi_k3.host",
+          "ast_sha256_without_imports": "9aa824e455b9ea2602cc52b527d4057461c125c40df113ea7797a3a9ed9fc098"
+        },
+        {
+          "name": "resolve_kernel",
+          "kind": "FunctionDef",
+          "line": 115,
+          "target_module": "sglang.kernels.jit.kimi_k3.host",
+          "ast_sha256_without_imports": "3ed6df124999b3f8c7441ba41a0e575023efe53aba25b7f17bf8294115d7cb49"
+        },
+        {
+          "name": "check_residency",
+          "kind": "FunctionDef",
+          "line": 128,
+          "target_module": "sglang.kernels.jit.kimi_k3.host",
+          "ast_sha256_without_imports": "27bfe225cabddffb27db531ccf05e83bc0b7ef9b52b622be2fef2cb575677154"
+        },
+        {
+          "name": "prepare_shared_carveout",
+          "kind": "FunctionDef",
+          "line": 146,
+          "target_module": "sglang.kernels.jit.kimi_k3.host",
+          "ast_sha256_without_imports": "925eca9f93d9503e6f6df73f1889c474fe76df7f413f819def334f1e71668f2b"
+        }
+      ]
+    },
+    {
+      "source": "sgl_nvidia_mega/kimi_k3/cutedsl/common/mailbox.py",
+      "sha256": "c31ecdcb5d89133bb42d280945c7dd21c52e5ff9d680294c8b78cd227a04dfb6",
+      "targets": [
+        {
+          "module": "sglang.kernels.ops.communication.kimi_k3_specialized.mailbox",
+          "path": "kernels/ops/communication/kimi_k3_specialized/mailbox.py"
+        }
+      ],
+      "symbols": [
+        {
+          "name": "rearm",
+          "kind": "FunctionDef",
+          "line": 21,
+          "target_module": "sglang.kernels.ops.communication.kimi_k3_specialized.mailbox",
+          "ast_sha256_without_imports": "e189ce96e75c7f6d98f99bfd8da75a883417e35ce598af3922ec4bcd2e7be824"
+        },
+        {
+          "name": "fetch",
+          "kind": "FunctionDef",
+          "line": 25,
+          "target_module": "sglang.kernels.ops.communication.kimi_k3_specialized.mailbox",
+          "ast_sha256_without_imports": "9343a862b054af18a39db1a40349f20e344b8aa6ba99173c70b57c1e438adb6a"
+        },
+        {
+          "name": "poll",
+          "kind": "FunctionDef",
+          "line": 34,
+          "target_module": "sglang.kernels.ops.communication.kimi_k3_specialized.mailbox",
+          "ast_sha256_without_imports": "ae33c405a1e50aecf734f94ca93352f0d6388ebcfdbd7a623e499784e6eac4aa"
+        }
+      ]
+    },
+    {
+      "source": "sgl_nvidia_mega/kimi_k3/cutedsl/common/policy.py",
+      "sha256": "dc6077ecd89b576dfb03f753ce08be1544cba5ced82bd8d23ba3c8f163774720",
+      "targets": [
+        {
+          "module": "sglang.kernels.jit.kimi_k3.policy",
+          "path": "kernels/jit/kimi_k3/policy.py"
+        }
+      ],
+      "symbols": [
+        {
+          "name": "batch_table",
+          "kind": "FunctionDef",
+          "line": 6,
+          "target_module": "sglang.kernels.jit.kimi_k3.policy",
+          "ast_sha256_without_imports": "f8ae55c521bc395c50a83512187f6447ecea75e82149f4e4168d66e5253ef257"
+        }
+      ]
+    },
+    {
+      "source": "sgl_nvidia_mega/kimi_k3/cutedsl/common/prefetch.py",
+      "sha256": "9b97dc7f26b1f2c9f1fce96b1d7bdcfc895135cfc2e27f2e1de68841e8c11f23",
+      "targets": [
+        {
+          "module": "sglang.kernels.ops.memory.kimi_k3_specialized.prefetch",
+          "path": "kernels/ops/memory/kimi_k3_specialized/prefetch.py"
+        }
+      ],
+      "symbols": [
+        {
+          "name": "L2Prefetch",
+          "kind": "ClassDef",
+          "line": 19,
+          "target_module": "sglang.kernels.ops.memory.kimi_k3_specialized.prefetch",
+          "ast_sha256_without_imports": "c9578341bb607f8d6661ce85592b850ff464043adbaffd76970c882160cbcf38",
+          "kernel_class": true
+        },
+        {
+          "name": "compile_kernel",
+          "kind": "FunctionDef",
+          "line": 59,
+          "target_module": "sglang.kernels.ops.memory.kimi_k3_specialized.prefetch",
+          "ast_sha256_without_imports": "df0a83a630e537efb4a4ba0fac4bf123aec676a3b2362f78125dcfabe15681af"
+        }
+      ]
+    },
+    {
+      "source": "sgl_nvidia_mega/kimi_k3/cutedsl/common/primitives.py",
+      "sha256": "af29279fc1bbb3ba035a9f2f4ddc49f272afce993147213fc84c5ec88bfb8df2",
+      "targets": [
+        {
+          "module": "sglang.kernels.jit.kimi_k3.primitives",
+          "path": "kernels/jit/kimi_k3/primitives.py"
+        }
+      ],
+      "symbols": [
+        {
+          "name": "ptx",
+          "kind": "FunctionDef",
+          "line": 16,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "0f6c17ddc0d38b901c90e2f3a0a7221b5e30310db01201e7c31ee8ae7c92a3b3"
+        },
+        {
+          "name": "asm",
+          "kind": "FunctionDef",
+          "line": 48,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "32abd666982dc2e267a285222c2b3aaf755d1c04439e60c36979f9a75578fbd6"
+        },
+        {
+          "name": "_vector",
+          "kind": "FunctionDef",
+          "line": 72,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "e80d475b184b95744a3e0648fba4395585eaba5607fc857c4d4ef1f1dfba65ea"
+        },
+        {
+          "name": "global_timer_ns",
+          "kind": "FunctionDef",
+          "line": 86,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "6692da85622adc8c64e519200a4fd4f2d40936c0ded743937fc54a05bf3e964a"
+        },
+        {
+          "name": "fail_stop",
+          "kind": "FunctionDef",
+          "line": 91,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "23a231cf154fbccd759ef095c36b49ffd0bee369c297a95d45c35af4056bb3bc"
+        },
+        {
+          "name": "wait_deadline_start",
+          "kind": "FunctionDef",
+          "line": 99,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "1d57a3406734cbca18395aabbde3b66ee26ccccb612f9f123be70c867bbe0f1f"
+        },
+        {
+          "name": "wait_deadline_check",
+          "kind": "FunctionDef",
+          "line": 108,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "7d6e3bf97b1a02a52d78492bf8bf19283b16264fe76993f2e7c0acca0dec6e5f"
+        },
+        {
+          "name": "add_rn",
+          "kind": "FunctionDef",
+          "line": 119,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "89dca6b79b1e8b4f62891977957e4d78c6b46bd3cad828280f1e3412f0aa2031"
+        },
+        {
+          "name": "routing_add",
+          "kind": "FunctionDef",
+          "line": 124,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "2f7b0de73bc8467f14a9824286a0c7bc2b30b775e1d0967d5dcd6a79307797b7"
+        },
+        {
+          "name": "fma",
+          "kind": "FunctionDef",
+          "line": 129,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "6e1f9922f3e50068a679dd1f4e787536000502e81e6d84c8ad8231dffc6802a2"
+        },
+        {
+          "name": "dot",
+          "kind": "FunctionDef",
+          "line": 134,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "f1facea6214c6d30a8d9cc3d64fe056565faa080302f57f4333452fed3a31c1a"
+        },
+        {
+          "name": "fma_bf16",
+          "kind": "FunctionDef",
+          "line": 141,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "07b1de6ebe2dc5492cbe2cc7432df3c5fed389b5dfc3f77fa17f814855501177"
+        },
+        {
+          "name": "round_pair_square",
+          "kind": "FunctionDef",
+          "line": 149,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "991d4ff4a3d822688296d5b346a2fa083aad273ab2b9c91e017070ce93c27ca5"
+        },
+        {
+          "name": "inv_rms",
+          "kind": "FunctionDef",
+          "line": 154,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "9fbf2d5b1d7d754c4960f2174a1c6d74d0ce3d5071e79dd41db9d7703535bb6e"
+        },
+        {
+          "name": "query_norm_rsqrt",
+          "kind": "FunctionDef",
+          "line": 167,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "b39776722e47ba09878f8b6d9f68d5bd3cfc839490b1d92e5d375f44f2227211"
+        },
+        {
+          "name": "reciprocal64",
+          "kind": "FunctionDef",
+          "line": 174,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "982736b8dfa97ea08d5f6d72592cb3303ab46e1a7e2a7a3087eb2c7b0f67b5f6"
+        },
+        {
+          "name": "sigmoid_reciprocal",
+          "kind": "FunctionDef",
+          "line": 182,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "b4aa1810bf5368520df1aca8460b5b1fee307856ef6e0a869a235b437d4c9082"
+        },
+        {
+          "name": "sigmoid",
+          "kind": "FunctionDef",
+          "line": 198,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "baa47b5e1b598f1a27da60ecf736a93242c00afb558bf378536f67b706485f27"
+        },
+        {
+          "name": "routing_sigmoid",
+          "kind": "FunctionDef",
+          "line": 209,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "c16948c9af7738ae196191209b939f87094d81c11c6a56a8f0fea20f9320eb9b"
+        },
+        {
+          "name": "routing_weight",
+          "kind": "FunctionDef",
+          "line": 216,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "67a95367738f9dbe06f91ccb4562a3c5914d4fcdc2311dd8c563b6b1d231d27d"
+        },
+        {
+          "name": "situ",
+          "kind": "FunctionDef",
+          "line": 227,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "90695d36a743872ee8f9793102650b3fa36a2989cc8c0d42d1463f3c07194123"
+        },
+        {
+          "name": "shared_situ",
+          "kind": "FunctionDef",
+          "line": 237,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "9b24b0a48701e9e059c01e4a776cf640aed45a24644cb10a4bde2d546d07bdbb"
+        },
+        {
+          "name": "bits_float",
+          "kind": "FunctionDef",
+          "line": 251,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "ecb7003ddd06ededd32717ac1a16c289be2be0fc4df1757811199890e954e984"
+        },
+        {
+          "name": "float_bits",
+          "kind": "FunctionDef",
+          "line": 255,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "b2160a2b41e0629abaf1b9884bbc02a5e7913a623259026c532376f437de11e9"
+        },
+        {
+          "name": "bf16",
+          "kind": "FunctionDef",
+          "line": 259,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "b531be5ab281bd6e3e6c7c94a96187ed24cac9626225d2ae4dd015b98a8adcfe"
+        },
+        {
+          "name": "unpack_bf16",
+          "kind": "FunctionDef",
+          "line": 264,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "bcfa07a42f0ff4d96db10f04c7722bd73f0053f6b696d453d947dcedef70c5b0"
+        },
+        {
+          "name": "fma2",
+          "kind": "FunctionDef",
+          "line": 269,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "e88aab46ade3d0c8abbc2780571935f7392b3d588d899e5037012da45c6bcaf5"
+        },
+        {
+          "name": "mul2",
+          "kind": "FunctionDef",
+          "line": 277,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "748455b462ab86ffd590b9b16af16b53c22a82ede9f19297ff243544b7ae81ad"
+        },
+        {
+          "name": "gate_bf16_bits",
+          "kind": "FunctionDef",
+          "line": 285,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "ade3e58a62d95a1cb58daa88e4ab72273a8134f9cb966af97fc08b5c13bdd11f"
+        },
+        {
+          "name": "pack_pair",
+          "kind": "FunctionDef",
+          "line": 290,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "788de5abaac1a0567e41d563a987ac8439c26dbb0f40e627873852f5534f8f34"
+        },
+        {
+          "name": "no_neg_zero",
+          "kind": "FunctionDef",
+          "line": 317,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "ef39348e32a37be526279204a9473327650ea3e0b75e1212cb639d9c37f19f9a"
+        },
+        {
+          "name": "published",
+          "kind": "FunctionDef",
+          "line": 328,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "a69ae742080bcd4813a5d9bc2fca94b27099097acc27ebeec82d92a8760d44e9"
+        },
+        {
+          "name": "front_dirty",
+          "kind": "FunctionDef",
+          "line": 335,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "3017ae4236b1e338c174b880a1989aa558406e70ec64a157217b405a265d6a2f"
+        },
+        {
+          "name": "fp8_bits",
+          "kind": "FunctionDef",
+          "line": 340,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "9ae83c9cf4d3ed084b2018a273898175b17f21af4b70a7c6e90900c28b8562a4"
+        },
+        {
+          "name": "store_fp8_pair",
+          "kind": "FunctionDef",
+          "line": 348,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "b96e7a7c034497eae17080e2e35dab85befbceaa48aac3ac6ca6078d4d89bf4f"
+        },
+        {
+          "name": "pack_fp8",
+          "kind": "FunctionDef",
+          "line": 356,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "c1a46326af68220d9815149f2200c9fff0a4dbd1818e272567e05fc7903d4078"
+        },
+        {
+          "name": "mx_exponent",
+          "kind": "FunctionDef",
+          "line": 363,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "ae8041e1717fc207f0f261c9bbb219e323c531513b2a815e3d6ab0154ac6e0ba"
+        },
+        {
+          "name": "mx_rescale",
+          "kind": "FunctionDef",
+          "line": 379,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "0505496d067fb6befc54f7383b9ab4255595d4bb8817cc83b3502c5bf4d62184"
+        },
+        {
+          "name": "warp_sum",
+          "kind": "FunctionDef",
+          "line": 385,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "e8b842699068447f89a513bf71bda595c0cffe551c13dd8a584447cb3d6daaa9"
+        },
+        {
+          "name": "redux",
+          "kind": "FunctionDef",
+          "line": 392,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "a458438c4dcbc3abb8a5af4306c0d4643594b2c028bbb1084c333fb1c716abcd"
+        },
+        {
+          "name": "warp_max_abs",
+          "kind": "FunctionDef",
+          "line": 397,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "84be2b72de71f9b910874cc8a03271a571f946261dd4c050b95a9217e4282d79"
+        },
+        {
+          "name": "mma",
+          "kind": "FunctionDef",
+          "line": 401,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "a7c3f1104dde26b5adb7d49ce6a8033d21845d1e94a331a8efefd56cdb858e1a"
+        },
+        {
+          "name": "mma_into",
+          "kind": "FunctionDef",
+          "line": 410,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "4e9aba8c6ff084a637ce18ef98b607c260290c98c83ad8bc713277f2c471fb74"
+        },
+        {
+          "name": "ldmatrix",
+          "kind": "FunctionDef",
+          "line": 417,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "09da6e2ba50dfd3cc01e048bf7913f596641b61396bb0476bc46de81bd43d055"
+        },
+        {
+          "name": "split",
+          "kind": "FunctionDef",
+          "line": 427,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "893cbaaa304000850a3454765ea9cfbec67a59dce1d1fefa92dab762ff7f8cc6"
+        },
+        {
+          "name": "thread",
+          "kind": "FunctionDef",
+          "line": 433,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "25a86ad5e3197e381294a815169c2a57ac57ade9195acc25d0fd73d7a50d5857"
+        },
+        {
+          "name": "shared_address",
+          "kind": "FunctionDef",
+          "line": 440,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "71bbdc831b6ae23aa74fd154a0c9a42eae6fabdf5cf3ad628ebcbffed9c29b45"
+        },
+        {
+          "name": "at",
+          "kind": "FunctionDef",
+          "line": 444,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "2b508246beddf839ea4a0c22d86a7e28efc11748e69de936f7934142f232d388"
+        },
+        {
+          "name": "view",
+          "kind": "FunctionDef",
+          "line": 449,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "ea248580fd44fb6cd086ca4dd5961d10b1435d616aae4d6770dc20801b4f8902"
+        },
+        {
+          "name": "zeros",
+          "kind": "FunctionDef",
+          "line": 455,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "a643b6ece40aeab0aa8c8a0efb27cedc3d7f5b7d0b1cb862eb42d44b1fd60a3d"
+        },
+        {
+          "name": "alloc",
+          "kind": "FunctionDef",
+          "line": 461,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "632e50dbbe31ba0dd72e0affe8af7b29712261809069a178cf47ad2efe61aed9"
+        },
+        {
+          "name": "load_words",
+          "kind": "FunctionDef",
+          "line": 470,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "f9362950ac69ed90a847650e19c425254906f0946cb22d82e195f7cdc70b1fb4"
+        },
+        {
+          "name": "load_bf16x8",
+          "kind": "FunctionDef",
+          "line": 519,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "26b7799e8044f85494aa5a8e0344bba8a64f7c2db5bee2918b82b8b9af60b134"
+        },
+        {
+          "name": "load_vector",
+          "kind": "FunctionDef",
+          "line": 530,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "e04f479d1f285f99453445574f6dd5a7e232a2a5a32582c3d63c907381e05f75"
+        },
+        {
+          "name": "table_load",
+          "kind": "FunctionDef",
+          "line": 546,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "8dd07e52930e69ebe97c53cd9b706992854d3ebd361a1ed8b0ce16b9943adc3f"
+        },
+        {
+          "name": "store_words",
+          "kind": "FunctionDef",
+          "line": 551,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "964741d34d44d39ab37e7e193aaedbbc77b0a8a095e4c01abf2c63eed3feae37"
+        },
+        {
+          "name": "store_f32x4",
+          "kind": "FunctionDef",
+          "line": 575,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "b8ec4d694487eeb3340400c15b3af585292fd9f506373e1680f352e75972a428"
+        },
+        {
+          "name": "store_gate_mailbox",
+          "kind": "FunctionDef",
+          "line": 585,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "5b2ccc6934e1344c3d5243ea0dfb255b1954b12b72d3f32f5dd62d84ca6c25f4"
+        },
+        {
+          "name": "store_bf16_pair",
+          "kind": "FunctionDef",
+          "line": 590,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "dec446bc4598e488d07acab28b23ac7d0111357ba38df558970f6d7c34545ed4"
+        },
+        {
+          "name": "store_pair",
+          "kind": "FunctionDef",
+          "line": 596,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "8ae2298ea3f47416ff3a5664ec886262e513e9ce827171bdb3f5edd9e16a028f"
+        },
+        {
+          "name": "push_float",
+          "kind": "FunctionDef",
+          "line": 606,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "d81c380df8f8c529d55a9c6dd812ec5a7c8ca28e9dd1f214add8f1d297fe2507"
+        },
+        {
+          "name": "multicast_words",
+          "kind": "FunctionDef",
+          "line": 626,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "27f0be3511a4cef7f5d00b156a24dacde6bea6685de4ec501e3c899768b3fbf3"
+        },
+        {
+          "name": "publish_hint",
+          "kind": "FunctionDef",
+          "line": 637,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "f8eeaef3bd8c89c7b069f41be61019867fb04e9508cf53f9ab4096591fab693b"
+        },
+        {
+          "name": "copy_g2s",
+          "kind": "FunctionDef",
+          "line": 642,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "5d0931f44078890ad6f101c9335cf43443b702c6c843083f3b79b7cc8b791ff9"
+        },
+        {
+          "name": "copy_bulk",
+          "kind": "FunctionDef",
+          "line": 669,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "c891da4f645e0945599424f5061b8f0fd210884c394686dca805f5f8930d3d83"
+        },
+        {
+          "name": "copy_s2cluster",
+          "kind": "FunctionDef",
+          "line": 677,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "aa4f9a4863aa85b4dc327bbbf19d6c51f53774ff7cbff29a3e0080970d57e83f"
+        },
+        {
+          "name": "stage_weight",
+          "kind": "FunctionDef",
+          "line": 685,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "380b36164c3ea7f14d8fe6d1ebb517a1d7a849a29f2663c027781bca42a391af"
+        },
+        {
+          "name": "load_tma2",
+          "kind": "FunctionDef",
+          "line": 692,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "3cd2f52ea308d141aabe4837120d9c64b622cbfec5a4d38731c84ff5e8eb154a"
+        },
+        {
+          "name": "load_tma3",
+          "kind": "FunctionDef",
+          "line": 700,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "86cff796a6b1ba99587352cb5195364edd3ab5fa269c9773c509a447bc2aa8a7"
+        },
+        {
+          "name": "prefetch_bytes",
+          "kind": "FunctionDef",
+          "line": 708,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "76e281af5e872bc460ac470adcab1bff3dd6e3c1c08b170373e3997cf22622f7"
+        },
+        {
+          "name": "prefetch_bulk",
+          "kind": "FunctionDef",
+          "line": 713,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "f1778233d7d418f9d9fef44104a76534e66650e33320030c31c27d05780d1b17"
+        },
+        {
+          "name": "prefetch_l2",
+          "kind": "FunctionDef",
+          "line": 720,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "d4f6f1c6b52dd143d8cced7dc32638f097c10b7c7b4c455205df1b64cfef79ca"
+        },
+        {
+          "name": "prefetch_map",
+          "kind": "FunctionDef",
+          "line": 725,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "370d68b6742f8c1412b27b39386b125771b4b2066388247930911c331f1512c9"
+        },
+        {
+          "name": "acquire_tensormap",
+          "kind": "FunctionDef",
+          "line": 731,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "1a3f00accff0969e4a3a165395ec18223c0ba2cfa5da896affc986c63ad09f76"
+        },
+        {
+          "name": "acquire_tensormap_asm",
+          "kind": "FunctionDef",
+          "line": 737,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "b0ca8a991fb074de9a1881aa9abd23a71e6bbd9ba575e97c606636e939a8af6a"
+        },
+        {
+          "name": "try_wait",
+          "kind": "FunctionDef",
+          "line": 744,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "10799f42cf335f875052bd75587ccef7c6ae9d2719a4588e245d197c87ae8f43"
+        },
+        {
+          "name": "wait",
+          "kind": "FunctionDef",
+          "line": 756,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "626521427dc86d78517afb6cb196d33ee374eb88649b6d56d958227fae7c564c"
+        },
+        {
+          "name": "try_wait_phase_zero",
+          "kind": "FunctionDef",
+          "line": 763,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "9e3adf2de3dee7abbff834c49aaa880debac978fbd7ef5d4f09941e94a3619ef"
+        },
+        {
+          "name": "wait_phase_zero_cluster",
+          "kind": "FunctionDef",
+          "line": 770,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "40de5a212c884beb400eeefa5f5b92c39a0cf2eb5c0a664fb1a33cb93cccbfcc"
+        },
+        {
+          "name": "init_barriers",
+          "kind": "FunctionDef",
+          "line": 777,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "11d4edeec3b62e44d24440e00fa9977b971b36702088a4b175e466b9eb368e30"
+        },
+        {
+          "name": "named_barrier",
+          "kind": "FunctionDef",
+          "line": 785,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "73fa5497dbf9fdfb145c5ab6ed41dd68298da8cd954be10f445eb47b7f3c2531"
+        },
+        {
+          "name": "group_barrier",
+          "kind": "FunctionDef",
+          "line": 793,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "47b24f9af8a4efd408e47bfeea755a9be8ff8b29e7b5a343bc55bb750d7c5eb9"
+        },
+        {
+          "name": "sleep_ns",
+          "kind": "FunctionDef",
+          "line": 797,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "88e1ad888a739b1ceab0c5d41f769e1a41b7aad5317e243512a74205394340c3"
+        },
+        {
+          "name": "smem_desc",
+          "kind": "FunctionDef",
+          "line": 805,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "6833ce9a30b65764a3227e2e07b7b5b73622366bced63e2c33ca87934063fc1b"
+        },
+        {
+          "name": "fence_tmem",
+          "kind": "FunctionDef",
+          "line": 816,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "ea79cb4914e8cd953b5ea1514d0772b80226d392e7016475b13defdebb22d8e4"
+        },
+        {
+          "name": "wait_tmem",
+          "kind": "FunctionDef",
+          "line": 820,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "c9d133a465266af17056f9fc4877ae44e43b66e3a5090ddfe72297563051f22a"
+        },
+        {
+          "name": "free_tmem",
+          "kind": "FunctionDef",
+          "line": 826,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "c419f8773bacf92366bb727d3c042c01829b80c94d9cf5c1e88cd07ddf53d6ed"
+        },
+        {
+          "name": "release_tmem",
+          "kind": "FunctionDef",
+          "line": 832,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "a70ee3fbc4fa70fdfd3da8cf5907d91c3617066ddd9eb7eeb5b43f49bb4d6231"
+        },
+        {
+          "name": "require_zero_tmem",
+          "kind": "FunctionDef",
+          "line": 842,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "aff72785b8ad0749458af93a07c7f4a4d0427dd87195f53a506d0b99b29e58c1"
+        },
+        {
+          "name": "load_tmem",
+          "kind": "FunctionDef",
+          "line": 847,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "f5b65cb834c7679c987b5fd106147d2e16cf86190fe8d694ce7be333c16f1b75"
+        },
+        {
+          "name": "copy_scale",
+          "kind": "FunctionDef",
+          "line": 858,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "d3a9f55c28f224a472c52074ef0383f980b467dbe0330a89aa98f341d9cdae91"
+        },
+        {
+          "name": "commit_asm",
+          "kind": "FunctionDef",
+          "line": 867,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "f90b41f7284641b89ac0420f36759a0a36b69ec099a0b8f3b31dda85a1ce3936"
+        },
+        {
+          "name": "mma_bf16_block",
+          "kind": "FunctionDef",
+          "line": 874,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "fc18f47c55c07c6f267c23827bd55b1c2ea907969c89052cf630354936334d14"
+        },
+        {
+          "name": "mma_mx",
+          "kind": "FunctionDef",
+          "line": 894,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "cf123c68458216ef0b1c140446d4a13297cfdd16a792dbbdebe510e8110c8ae8"
+        },
+        {
+          "name": "mma_steps",
+          "kind": "FunctionDef",
+          "line": 903,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "f0cc99b7ad93f5b155ae53b1b73e84164bd35b138c30abef6b04d30c1f04bad8"
+        },
+        {
+          "name": "chunk_mma",
+          "kind": "FunctionDef",
+          "line": 913,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "9f3cafbc702865b25bd01576566cafba603d5b8a82f0fcbd86396ae0ec1f78be"
+        },
+        {
+          "name": "launch",
+          "kind": "FunctionDef",
+          "line": 938,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "d8b7079b16331f4d9b35a2b6f8300a19c9739d539ac28ac70fd8f1f10f62b223"
+        },
+        {
+          "name": "scatter_reduce",
+          "kind": "FunctionDef",
+          "line": 948,
+          "target_module": "sglang.kernels.jit.kimi_k3.primitives",
+          "ast_sha256_without_imports": "a9f6cc75640aa736ba9a6117d5d6c72d3cda6b4503b583870c2342a4736907c3"
+        }
+      ]
+    },
+    {
+      "source": "sgl_nvidia_mega/kimi_k3/cutedsl/common/twoshot.py",
+      "sha256": "ec983e7acc3479718175ab0f01f5dc61999d7c87ce88a9c16621ad15094ba0a1",
+      "targets": [
+        {
+          "module": "sglang.kernels.ops.communication.kimi_k3_specialized.twoshot",
+          "path": "kernels/ops/communication/kimi_k3_specialized/twoshot.py"
+        },
+        {
+          "module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.common.twoshot",
+          "path": "srt/kernel_plugins/nvidia/kimi_k3/cutedsl/common/twoshot.py"
+        }
+      ],
+      "symbols": [
+        {
+          "name": "TwoShot",
+          "kind": "ClassDef",
+          "line": 48,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.common.twoshot",
+          "ast_sha256_without_imports": "241f27aa6128f1057e199421c98d60c4bba0c3d7ed61cfc58f172590b2dfd5ba"
+        },
+        {
+          "name": "push",
+          "kind": "FunctionDef",
+          "line": 90,
+          "target_module": "sglang.kernels.ops.communication.kimi_k3_specialized.twoshot",
+          "ast_sha256_without_imports": "bfcceabda30388fccdf78a42262ce892bc764b8d7324627fdec5b8f6e352ff36"
+        },
+        {
+          "name": "reduce",
+          "kind": "FunctionDef",
+          "line": 100,
+          "target_module": "sglang.kernels.ops.communication.kimi_k3_specialized.twoshot",
+          "ast_sha256_without_imports": "74581a8c374f74d65115b5c03e45963c2ed3d89082bab9b2703896e895555cb4"
+        }
+      ]
+    },
+    {
+      "source": "sgl_nvidia_mega/kimi_k3/cutedsl/gemm/__init__.py",
+      "sha256": "bd3762ee4302c67a96afbd65e9ecc48714081f73e79a8a422c2d52d26f7fd7ed",
+      "targets": [
+        {
+          "module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.gemm",
+          "path": "srt/kernel_plugins/nvidia/kimi_k3/cutedsl/gemm/__init__.py"
+        }
+      ],
+      "symbols": []
+    },
+    {
+      "source": "sgl_nvidia_mega/kimi_k3/cutedsl/gemm/projection.py",
+      "sha256": "42430b737156caebb8366d6a9112dd4acfb010474795e10d09a5e8b2b4d6fd1d",
+      "targets": [
+        {
+          "module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.gemm.projection",
+          "path": "srt/kernel_plugins/nvidia/kimi_k3/cutedsl/gemm/projection.py"
+        }
+      ],
+      "symbols": [
+        {
+          "name": "matrix_view",
+          "kind": "FunctionDef",
+          "line": 21,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.gemm.projection",
+          "ast_sha256_without_imports": "1ca3dfd6ad2a97f5999b965954f3490a65c37e56774ef33b31477ac249b39131"
+        },
+        {
+          "name": "compile_projection",
+          "kind": "FunctionDef",
+          "line": 30,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.gemm.projection",
+          "ast_sha256_without_imports": "8d25c8b08686fce43380b1548d08189dc8705011d67f59a039bfcdc6e8241c08"
+        },
+        {
+          "name": "weight_map",
+          "kind": "FunctionDef",
+          "line": 46,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.gemm.projection",
+          "ast_sha256_without_imports": "52f5c25e9e56e849af1ca8b87a46825f0a846b6cd079d44fb9869b8b6427fb01"
+        },
+        {
+          "name": "PreparedProjection",
+          "kind": "ClassDef",
+          "line": 61,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.gemm.projection",
+          "ast_sha256_without_imports": "4b30f016e3e85c5b4a202442e442a752f8304e6ccd6148d8713a628de9f799f6"
+        }
+      ]
+    },
+    {
+      "source": "sgl_nvidia_mega/kimi_k3/cutedsl/gemm/splitk.py",
+      "sha256": "3e122ca4edc662f94b1b0db01808a70e0c07fee681ba058b2a599aa11f7e0e4e",
+      "targets": [
+        {
+          "module": "sglang.kernels.ops.gemm.kimi_k3_specialized.splitk",
+          "path": "kernels/ops/gemm/kimi_k3_specialized/splitk.py"
+        }
+      ],
+      "symbols": [
+        {
+          "name": "_asm",
+          "kind": "FunctionDef",
+          "line": 39,
+          "target_module": "sglang.kernels.ops.gemm.kimi_k3_specialized.splitk",
+          "ast_sha256_without_imports": "6888c34a28a109d1bf84a6066a22db491fcbf9a2ea5ec432465eb8f91fbe8576"
+        },
+        {
+          "name": "_acquire_tensor_map",
+          "kind": "FunctionDef",
+          "line": 46,
+          "target_module": "sglang.kernels.ops.gemm.kimi_k3_specialized.splitk",
+          "ast_sha256_without_imports": "5a6a68d626948eb60913612ce17cd95f8e164da56f961263219b27b150d41e28"
+        },
+        {
+          "name": "_tma_load_evict_first",
+          "kind": "FunctionDef",
+          "line": 52,
+          "target_module": "sglang.kernels.ops.gemm.kimi_k3_specialized.splitk",
+          "ast_sha256_without_imports": "31e716ecb2dec78a80323a94cd46b8b24a95659a106c74afeead561ec3228784"
+        },
+        {
+          "name": "_wait_cluster",
+          "kind": "FunctionDef",
+          "line": 63,
+          "target_module": "sglang.kernels.ops.gemm.kimi_k3_specialized.splitk",
+          "ast_sha256_without_imports": "21c06ea1a594efcf4db722591b82a6aa31215b334a7e17947c705a00757a2b38"
+        },
+        {
+          "name": "_fence_tcgen05",
+          "kind": "FunctionDef",
+          "line": 72,
+          "target_module": "sglang.kernels.ops.gemm.kimi_k3_specialized.splitk",
+          "ast_sha256_without_imports": "6ccd0e8a8ac8de764c3af7969005a0a33e81bc6e969ce6f152ccec27ae0d71b8"
+        },
+        {
+          "name": "_smem",
+          "kind": "FunctionDef",
+          "line": 78,
+          "target_module": "sglang.kernels.ops.gemm.kimi_k3_specialized.splitk",
+          "ast_sha256_without_imports": "006ecb328c3fea171d3c5dd1ac1472a4dc25474c8198249b1137de265307e740"
+        },
+        {
+          "name": "SplitKGemm",
+          "kind": "ClassDef",
+          "line": 83,
+          "target_module": "sglang.kernels.ops.gemm.kimi_k3_specialized.splitk",
+          "ast_sha256_without_imports": "14cc480d6e38ef8e9315d19bdda1f484814313556c2a70f42d348beefab1c6c8",
+          "kernel_class": true
+        }
+      ]
+    },
+    {
+      "source": "sgl_nvidia_mega/kimi_k3/cutedsl/gemm/ws_gemm.py",
+      "sha256": "cf3af436fee65cf55db5cf8912db46a67cb465f243a3587189aa8a26b67d2835",
+      "targets": [
+        {
+          "module": "sglang.kernels.ops.communication.kimi_k3_specialized.ws_gemm",
+          "path": "kernels/ops/communication/kimi_k3_specialized/ws_gemm.py"
+        }
+      ],
+      "symbols": [
+        {
+          "name": "positive_zero",
+          "kind": "FunctionDef",
+          "line": 43,
+          "target_module": "sglang.kernels.ops.communication.kimi_k3_specialized.ws_gemm",
+          "ast_sha256_without_imports": "d458574b481508cf957b16af60c75a972cd7e795e6722da30ffa3c665778d5a6"
+        },
+        {
+          "name": "peer_load",
+          "kind": "FunctionDef",
+          "line": 52,
+          "target_module": "sglang.kernels.ops.communication.kimi_k3_specialized.ws_gemm",
+          "ast_sha256_without_imports": "5512106063adc0d9bd256cc7c8c302c4916688a7b1ddc85df6c3cb13f23c8f03"
+        },
+        {
+          "name": "positive_zero32",
+          "kind": "FunctionDef",
+          "line": 59,
+          "target_module": "sglang.kernels.ops.communication.kimi_k3_specialized.ws_gemm",
+          "ast_sha256_without_imports": "c724367c6caf7ee9c4b3fd4d1c4ef72c6b59a061409644b302201bca9b685d2b"
+        },
+        {
+          "name": "WsGemm",
+          "kind": "ClassDef",
+          "line": 66,
+          "target_module": "sglang.kernels.ops.communication.kimi_k3_specialized.ws_gemm",
+          "ast_sha256_without_imports": "90aa40363d931b4e378b083db7a4204117a795fd5da8ecfe50a353a991e07976",
+          "kernel_class": true
+        }
+      ]
+    },
+    {
+      "source": "sgl_nvidia_mega/kimi_k3/cutedsl/kda/__init__.py",
+      "sha256": "bd3762ee4302c67a96afbd65e9ecc48714081f73e79a8a422c2d52d26f7fd7ed",
+      "targets": [
+        {
+          "module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.kda",
+          "path": "srt/kernel_plugins/nvidia/kimi_k3/cutedsl/kda/__init__.py"
+        }
+      ],
+      "symbols": []
+    },
+    {
+      "source": "sgl_nvidia_mega/kimi_k3/cutedsl/kda/kernel.py",
+      "sha256": "86912ad48d82ac2775b8b13281fa9f9448885dca6bba4823785d12f1618ff533",
+      "targets": [
+        {
+          "module": "sglang.kernels.ops.attention.kimi_k3_specialized.kda",
+          "path": "kernels/ops/attention/kimi_k3_specialized/kda.py"
+        }
+      ],
+      "symbols": [
+        {
+          "name": "reciprocal_guess",
+          "kind": "FunctionDef",
+          "line": 44,
+          "target_module": "sglang.kernels.ops.attention.kimi_k3_specialized.kda",
+          "ast_sha256_without_imports": "f4581c2b571e6dd1bbbd43876cae038e3c5dd9a232bac1b60938ca44aae751c8"
+        },
+        {
+          "name": "reciprocal_rn",
+          "kind": "FunctionDef",
+          "line": 55,
+          "target_module": "sglang.kernels.ops.attention.kimi_k3_specialized.kda",
+          "ast_sha256_without_imports": "3014c6faf4a6a93a58deaac097b98b84ff954c6b144f75cd37e006ee6b84d527"
+        },
+        {
+          "name": "sigmoids",
+          "kind": "FunctionDef",
+          "line": 60,
+          "target_module": "sglang.kernels.ops.attention.kimi_k3_specialized.kda",
+          "ast_sha256_without_imports": "aced5c329aae1eddf9dcaeda544d8cbdc6783f18662a9e004dc70f18da48f449"
+        },
+        {
+          "name": "advance",
+          "kind": "FunctionDef",
+          "line": 78,
+          "target_module": "sglang.kernels.ops.attention.kimi_k3_specialized.kda",
+          "ast_sha256_without_imports": "3276bd1f8987568266454abae19e3b90d07758d3ffd036a291ba24a4c50a54d5"
+        },
+        {
+          "name": "store_evict_f32x4",
+          "kind": "FunctionDef",
+          "line": 83,
+          "target_module": "sglang.kernels.ops.attention.kimi_k3_specialized.kda",
+          "ast_sha256_without_imports": "a6d4756524fcee6b7286aeeafc0b2b98b3d5f111008d3aeaeeebbec344558272"
+        },
+        {
+          "name": "KdaSplit",
+          "kind": "ClassDef",
+          "line": 90,
+          "target_module": "sglang.kernels.ops.attention.kimi_k3_specialized.kda",
+          "ast_sha256_without_imports": "a3a847ef608a6edcfc588aaa3ace9fbe43b67b18f5494c9c32803acba0c8d289",
+          "kernel_class": true
+        }
+      ]
+    },
+    {
+      "source": "sgl_nvidia_mega/kimi_k3/cutedsl/kda/prepared.py",
+      "sha256": "ace7847cee106fa6472dbe7a249e605f0636ddd03cfa9f84d93e9f1f4e1da5c0",
+      "targets": [
+        {
+          "module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.kda.prepared",
+          "path": "srt/kernel_plugins/nvidia/kimi_k3/cutedsl/kda/prepared.py"
+        }
+      ],
+      "symbols": [
+        {
+          "name": "executable",
+          "kind": "FunctionDef",
+          "line": 31,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.kda.prepared",
+          "ast_sha256_without_imports": "576a9690edb2f23cfc2631686066283e261be14d6c3ab6bb5df2f81100b37459"
+        },
+        {
+          "name": "decode_conv_weight",
+          "kind": "FunctionDef",
+          "line": 49,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.kda.prepared",
+          "ast_sha256_without_imports": "8115625aa7f76b5a24824cdde24d8128c784ad72d20d43ea06744a1f412fa10b"
+        },
+        {
+          "name": "PreparedKda",
+          "kind": "ClassDef",
+          "line": 56,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.kda.prepared",
+          "ast_sha256_without_imports": "9083ecbacf6fce0c1311a4e8a020abf0b9e8c0887d04c7391498452b972daa5a"
+        }
+      ]
+    },
+    {
+      "source": "sgl_nvidia_mega/kimi_k3/cutedsl/mla/__init__.py",
+      "sha256": "bd3762ee4302c67a96afbd65e9ecc48714081f73e79a8a422c2d52d26f7fd7ed",
+      "targets": [
+        {
+          "module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.mla",
+          "path": "srt/kernel_plugins/nvidia/kimi_k3/cutedsl/mla/__init__.py"
+        }
+      ],
+      "symbols": []
+    },
+    {
+      "source": "sgl_nvidia_mega/kimi_k3/cutedsl/mla/dcp.py",
+      "sha256": "6f9bab9db1cf534da2ee8d77cbb88eee3629a826d7dffd2a6e127a7dbd3ca151",
+      "targets": [
+        {
+          "module": "sglang.kernels.ops.communication.kimi_k3_specialized.mla_dcp",
+          "path": "kernels/ops/communication/kimi_k3_specialized/mla_dcp.py"
+        },
+        {
+          "module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.mla.dcp",
+          "path": "srt/kernel_plugins/nvidia/kimi_k3/cutedsl/mla/dcp.py"
+        }
+      ],
+      "symbols": [
+        {
+          "name": "DcpBox",
+          "kind": "ClassDef",
+          "line": 59,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.mla.dcp",
+          "ast_sha256_without_imports": "70a8209962972aef47a0e06fe483997ea3e6273629ab652bb25ca9dccb310e86"
+        },
+        {
+          "name": "DcpValue",
+          "kind": "ClassDef",
+          "line": 129,
+          "target_module": "sglang.kernels.ops.communication.kimi_k3_specialized.mla_dcp",
+          "ast_sha256_without_imports": "368b318b205a382b699262a532eeb57bfb731cf3b769af4d415fe7da654c6f63",
+          "kernel_class": true
+        },
+        {
+          "name": "compile_value",
+          "kind": "FunctionDef",
+          "line": 308,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.mla.dcp",
+          "ast_sha256_without_imports": "d7ca76448480da4e21e1f44668b6fca543016d2f4c09a3ca1e46828aabbc42f3"
+        },
+        {
+          "name": "_decode_metadata",
+          "kind": "FunctionDef",
+          "line": 339,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.mla.dcp",
+          "ast_sha256_without_imports": "f84dde7e105529f0c4f8e2901974ae571d36a5109d566cf2b1d17b4fe79c8a06"
+        },
+        {
+          "name": "_reserve_workspace",
+          "kind": "FunctionDef",
+          "line": 357,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.mla.dcp",
+          "ast_sha256_without_imports": "509bc861e47e12fb7329800ad0f639d3b54a56993c2b71ebf4d145b8128f12c8"
+        },
+        {
+          "name": "prepare_workspace",
+          "kind": "FunctionDef",
+          "line": 369,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.mla.dcp",
+          "ast_sha256_without_imports": "2c198359e20523f9a66796b9e1869aad4fc3ec4f2f05a5672c6bb3a9be6e2185"
+        },
+        {
+          "name": "stock_decode",
+          "kind": "FunctionDef",
+          "line": 402,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.mla.dcp",
+          "ast_sha256_without_imports": "ebaa044184ef4e32863814705d46fa62fa582d3db630fd88b770e45cf77949fc"
+        },
+        {
+          "name": "fill_splits",
+          "kind": "FunctionDef",
+          "line": 474,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.mla.dcp",
+          "ast_sha256_without_imports": "34d3666c5fa7b36ccfbe4fedb7807d5854ab6ec0bfa604a18b2cf904a094717a"
+        },
+        {
+          "name": "local_max",
+          "kind": "FunctionDef",
+          "line": 481,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.mla.dcp",
+          "ast_sha256_without_imports": "eb700d186c31d5d7cff5b2eeb168cda73a964b461e271f3f9c2f29b8d912dbd4"
+        }
+      ]
+    },
+    {
+      "source": "sgl_nvidia_mega/kimi_k3/cutedsl/mla/prepared.py",
+      "sha256": "f1928a08d79a1212eb9e5da767077738efd82e15a6bb45812fb7ceb9d5b22a1b",
+      "targets": [
+        {
+          "module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.mla.prepared",
+          "path": "srt/kernel_plugins/nvidia/kimi_k3/cutedsl/mla/prepared.py"
+        }
+      ],
+      "symbols": [
+        {
+          "name": "_check_dcp_query_residency",
+          "kind": "FunctionDef",
+          "line": 44,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.mla.prepared",
+          "ast_sha256_without_imports": "b5b4d73906236ab57c7d611893b3266cfdaf0dd35b88fa20370f1641ddeffaf8"
+        },
+        {
+          "name": "compile_core",
+          "kind": "FunctionDef",
+          "line": 81,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.mla.prepared",
+          "ast_sha256_without_imports": "835a896439b136728e88f75ebbde283e65033193b59c118e69b11ad7b5ab1941"
+        },
+        {
+          "name": "core_for",
+          "kind": "FunctionDef",
+          "line": 155,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.mla.prepared",
+          "ast_sha256_without_imports": "9e628d76e75958f6b6d699efa9ff06bb8aba6be16dabb8b34dd3187be57eac87"
+        },
+        {
+          "name": "pad_requests",
+          "kind": "FunctionDef",
+          "line": 167,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.mla.prepared",
+          "ast_sha256_without_imports": "84c6016fae047b32c1d516e7d62747b2d074a151935f3f42f2fca12fc8f6b9bc"
+        },
+        {
+          "name": "trtllm_decode",
+          "kind": "FunctionDef",
+          "line": 180,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.mla.prepared",
+          "ast_sha256_without_imports": "5dd0061a4ef89535fcdf18aa49a2c8410f5354080c18077c36ac3fd30aeddb3b"
+        },
+        {
+          "name": "PreparedMla",
+          "kind": "ClassDef",
+          "line": 216,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.mla.prepared",
+          "ast_sha256_without_imports": "f2fd98ac4a59086f6057681c7d33ceb764f52d5c00cf45bb4b670f841452d434"
+        }
+      ]
+    },
+    {
+      "source": "sgl_nvidia_mega/kimi_k3/cutedsl/mla/query.py",
+      "sha256": "02ddbe0f235b46ad2593bd4ad8a8f2e00afb31cca8bcc26afd2406fed58f6578",
+      "targets": [
+        {
+          "module": "sglang.kernels.ops.communication.kimi_k3_specialized.mla_query",
+          "path": "kernels/ops/communication/kimi_k3_specialized/mla_query.py"
+        }
+      ],
+      "symbols": [
+        {
+          "name": "_require_deadline_ns",
+          "kind": "FunctionDef",
+          "line": 51,
+          "target_module": "sglang.kernels.ops.communication.kimi_k3_specialized.mla_query",
+          "ast_sha256_without_imports": "f197d034b025364283763e11666b814d36e0afd6cc3a75f1b0412d6ce7db038d"
+        },
+        {
+          "name": "MlaQuery",
+          "kind": "ClassDef",
+          "line": 62,
+          "target_module": "sglang.kernels.ops.communication.kimi_k3_specialized.mla_query",
+          "ast_sha256_without_imports": "498d5d8230b3a5f1746a23013036e3d0b91dc24db7ea94afe19cc7364b479371",
+          "kernel_class": true
+        }
+      ]
+    },
+    {
+      "source": "sgl_nvidia_mega/kimi_k3/cutedsl/mla/value.py",
+      "sha256": "8992b935d40d7107b4ec7efeb50c67bbc79199c65288c90924eb1c8dcaff6d2a",
+      "targets": [
+        {
+          "module": "sglang.kernels.ops.attention.kimi_k3_specialized.mla_value",
+          "path": "kernels/ops/attention/kimi_k3_specialized/mla_value.py"
+        }
+      ],
+      "symbols": [
+        {
+          "name": "MlaValue",
+          "kind": "ClassDef",
+          "line": 24,
+          "target_module": "sglang.kernels.ops.attention.kimi_k3_specialized.mla_value",
+          "ast_sha256_without_imports": "decda9dafc2ed515835fa5e80d4e4de22da9c15574e5f7fe3a71493968b8fd8a",
+          "kernel_class": true
+        }
+      ]
+    },
+    {
+      "source": "sgl_nvidia_mega/kimi_k3/cutedsl/moe/__init__.py",
+      "sha256": "bd3762ee4302c67a96afbd65e9ecc48714081f73e79a8a422c2d52d26f7fd7ed",
+      "targets": [
+        {
+          "module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.moe",
+          "path": "srt/kernel_plugins/nvidia/kimi_k3/cutedsl/moe/__init__.py"
+        }
+      ],
+      "symbols": []
+    },
+    {
+      "source": "sgl_nvidia_mega/kimi_k3/cutedsl/moe/dense.py",
+      "sha256": "59a97c139d64958f55c6cf157417e6d0bb5fd294d33c129363a88fb7669add15",
+      "targets": [
+        {
+          "module": "sglang.kernels.ops.moe.kimi_k3_specialized.dense",
+          "path": "kernels/ops/moe/kimi_k3_specialized/dense.py"
+        },
+        {
+          "module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.moe.dense",
+          "path": "srt/kernel_plugins/nvidia/kimi_k3/cutedsl/moe/dense.py"
+        }
+      ],
+      "symbols": [
+        {
+          "name": "DenseSitu",
+          "kind": "ClassDef",
+          "line": 18,
+          "target_module": "sglang.kernels.ops.moe.kimi_k3_specialized.dense",
+          "ast_sha256_without_imports": "521582b5e2d09ef38d20f9a151e2a7846cac34dc940e0e620692e93f925a9128",
+          "kernel_class": true
+        },
+        {
+          "name": "_compile_activation",
+          "kind": "FunctionDef",
+          "line": 44,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.moe.dense",
+          "ast_sha256_without_imports": "3b4ba7b6113f2c845995e6aa019d5c8dd95541d852884a1f730018c2d2ea71c6"
+        },
+        {
+          "name": "PreparedDenseMLP",
+          "kind": "ClassDef",
+          "line": 51,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.moe.dense",
+          "ast_sha256_without_imports": "58233c71a7f7d4dc400912d5aa1958a7811ee690a308df4d30b601acd769895d"
+        }
+      ]
+    },
+    {
+      "source": "sgl_nvidia_mega/kimi_k3/cutedsl/moe/experts.py",
+      "sha256": "33e5cd144d4f679306bf5d614a97dd18bed260cb907ff487c06ca554f6b23473",
+      "targets": [
+        {
+          "module": "sglang.kernels.ops.communication.kimi_k3_specialized.experts",
+          "path": "kernels/ops/communication/kimi_k3_specialized/experts.py"
+        }
+      ],
+      "symbols": [
+        {
+          "name": "ExpertsGeometry",
+          "kind": "ClassDef",
+          "line": 55,
+          "target_module": "sglang.kernels.ops.communication.kimi_k3_specialized.experts",
+          "ast_sha256_without_imports": "e48a55aa9063c431f4bb44ecb736ffc0d8b883f0ef465de5fa623476cc214f3f"
+        },
+        {
+          "name": "swizzled",
+          "kind": "FunctionDef",
+          "line": 117,
+          "target_module": "sglang.kernels.ops.communication.kimi_k3_specialized.experts",
+          "ast_sha256_without_imports": "9e8ef60ac559d7b4c5146fd956d2ae74e5a75956e94994d443a7cc2708cd40ce"
+        },
+        {
+          "name": "has_ff_byte",
+          "kind": "FunctionDef",
+          "line": 123,
+          "target_module": "sglang.kernels.ops.communication.kimi_k3_specialized.experts",
+          "ast_sha256_without_imports": "c537ce6ffe2416e057aaca378da049836e53652b92a1e5d3262f984151fd0b78"
+        },
+        {
+          "name": "mx_block",
+          "kind": "FunctionDef",
+          "line": 129,
+          "target_module": "sglang.kernels.ops.communication.kimi_k3_specialized.experts",
+          "ast_sha256_without_imports": "246d5b05a40482c9e9bf49006f9ac2a9381ebe4e7e189f8a76897fc3ebb2fa52"
+        },
+        {
+          "name": "plan_chunk",
+          "kind": "FunctionDef",
+          "line": 158,
+          "target_module": "sglang.kernels.ops.communication.kimi_k3_specialized.experts",
+          "ast_sha256_without_imports": "5133aa909e2bb95b93b61ed9d598a0c69ce6dfd62ed3a19866e879488ed95d4f"
+        },
+        {
+          "name": "ExpertsPlanKernel",
+          "kind": "ClassDef",
+          "line": 187,
+          "target_module": "sglang.kernels.ops.communication.kimi_k3_specialized.experts",
+          "ast_sha256_without_imports": "77e795964608bcb73a6dab1cb4a44485eb67b8a21f5319348f5e34123810a792",
+          "kernel_class": true
+        },
+        {
+          "name": "stage",
+          "kind": "FunctionDef",
+          "line": 212,
+          "target_module": "sglang.kernels.ops.communication.kimi_k3_specialized.experts",
+          "ast_sha256_without_imports": "df39e5412adc1865d1c8c4068155017ae3b2602e32f30b446ba48f4e6a88c0c0"
+        },
+        {
+          "name": "claim",
+          "kind": "FunctionDef",
+          "line": 267,
+          "target_module": "sglang.kernels.ops.communication.kimi_k3_specialized.experts",
+          "ast_sha256_without_imports": "d3b7444c44ecc95c818e5433fb5946b0b075f29b4e057b9c9c641bdacf2954f4"
+        },
+        {
+          "name": "fc2_pairs",
+          "kind": "FunctionDef",
+          "line": 274,
+          "target_module": "sglang.kernels.ops.communication.kimi_k3_specialized.experts",
+          "ast_sha256_without_imports": "b632ac02e3efb59a99d8b0e4b7299d19936da128ffcfad2d9c56a206b22a7f5b"
+        },
+        {
+          "name": "ExpertsKernel",
+          "kind": "ClassDef",
+          "line": 281,
+          "target_module": "sglang.kernels.ops.communication.kimi_k3_specialized.experts",
+          "ast_sha256_without_imports": "22fcaf2845158127283507f9fd9d43984d0bad73f67d1120f763689ba0b868de",
+          "kernel_class": true
+        },
+        {
+          "name": "ExpertsGroupKernel",
+          "kind": "ClassDef",
+          "line": 1545,
+          "target_module": "sglang.kernels.ops.communication.kimi_k3_specialized.experts",
+          "ast_sha256_without_imports": "d87eec7ff87c8652776e6a23e35dc1ff16223484794d8e8d3b7f4762c0c17d61",
+          "kernel_class": true
+        }
+      ]
+    },
+    {
+      "source": "sgl_nvidia_mega/kimi_k3/cutedsl/moe/experts_runtime.py",
+      "sha256": "9caacab90792c01bfdd0024d9a52fa86c0363f37f243922ce4a47e39fbd84b11",
+      "targets": [
+        {
+          "module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.moe.experts_runtime",
+          "path": "srt/kernel_plugins/nvidia/kimi_k3/cutedsl/moe/experts_runtime.py"
+        }
+      ],
+      "symbols": [
+        {
+          "name": "tensor",
+          "kind": "FunctionDef",
+          "line": 28,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.moe.experts_runtime",
+          "ast_sha256_without_imports": "f5707c9be12d99d96bc975a5ec89bd5bcf8f1468f39da9356bb94bdea75359c6"
+        },
+        {
+          "name": "streamed",
+          "kind": "FunctionDef",
+          "line": 32,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.moe.experts_runtime",
+          "ast_sha256_without_imports": "abd3ab7bcdf444773175cd5be1fea5dc894e7a1193357eb21b2b3c8245c38afb"
+        },
+        {
+          "name": "pregrouped",
+          "kind": "FunctionDef",
+          "line": 38,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.moe.experts_runtime",
+          "ast_sha256_without_imports": "6cc3c72134f33356c6e63894de86296e74a95c0909b9b512922e84b65c99e290"
+        },
+        {
+          "name": "early_group",
+          "kind": "FunctionDef",
+          "line": 51,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.moe.experts_runtime",
+          "ast_sha256_without_imports": "77baf45c73f5a7328ebd7904fb010dfa4125c6d1d796a29a84dc9c63fe224877"
+        },
+        {
+          "name": "stealing",
+          "kind": "FunctionDef",
+          "line": 57,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.moe.experts_runtime",
+          "ast_sha256_without_imports": "3e5cee023a58a4bb9fa52468ceb614d237e56468c744c7067521666848793511"
+        },
+        {
+          "name": "compile_experts",
+          "kind": "FunctionDef",
+          "line": 62,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.moe.experts_runtime",
+          "ast_sha256_without_imports": "25866551669bf6a108c1f9f8f7fc34aee21ea00790c0263d16aece36503678ef"
+        },
+        {
+          "name": "compile_group",
+          "kind": "FunctionDef",
+          "line": 97,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.moe.experts_runtime",
+          "ast_sha256_without_imports": "33b5ee8825c77ac2042e0dd3ac18e7a5db358cf14760d85cffa1bcd9ee76f80f"
+        },
+        {
+          "name": "compile_plan",
+          "kind": "FunctionDef",
+          "line": 109,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.moe.experts_runtime",
+          "ast_sha256_without_imports": "fcede9310641bdfd3d5a9cd31cf8d41a981e5920f1c9b5d0442e582bea59e051"
+        },
+        {
+          "name": "scratch",
+          "kind": "FunctionDef",
+          "line": 117,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.moe.experts_runtime",
+          "ast_sha256_without_imports": "690f64b0ad13e49f5f12ce213d2192ce4d9b14f12c1cf640cb44456361be1dd9"
+        },
+        {
+          "name": "PersistentExperts",
+          "kind": "ClassDef",
+          "line": 126,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.moe.experts_runtime",
+          "ast_sha256_without_imports": "dbf72b76fab68cd6fe7ac3ec2f797357cc743ea192da8f395d66044d77636606"
+        }
+      ]
+    },
+    {
+      "source": "sgl_nvidia_mega/kimi_k3/cutedsl/moe/front.py",
+      "sha256": "17663cefade2fe7aa05efcfec9baa96e6c168d7837fa2600728585dfe5d28fd5",
+      "targets": [
+        {
+          "module": "sglang.kernels.ops.moe.kimi_k3_specialized.front",
+          "path": "kernels/ops/moe/kimi_k3_specialized/front.py"
+        },
+        {
+          "module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.moe.front",
+          "path": "srt/kernel_plugins/nvidia/kimi_k3/cutedsl/moe/front.py"
+        }
+      ],
+      "symbols": [
+        {
+          "name": "shared_add",
+          "kind": "FunctionDef",
+          "line": 37,
+          "target_module": "sglang.kernels.ops.moe.kimi_k3_specialized.front",
+          "ast_sha256_without_imports": "986a545dfe968f9b51aad726d64a62d2ed179b2a57108a0565652eae9466a76e"
+        },
+        {
+          "name": "ordered",
+          "kind": "FunctionDef",
+          "line": 43,
+          "target_module": "sglang.kernels.ops.moe.kimi_k3_specialized.front",
+          "ast_sha256_without_imports": "ccf6d2d6c2c751dddecc112ed3be21e537386b3e58cf24a2499278f6c6d77896"
+        },
+        {
+          "name": "RouteSitu",
+          "kind": "ClassDef",
+          "line": 51,
+          "target_module": "sglang.kernels.ops.moe.kimi_k3_specialized.front",
+          "ast_sha256_without_imports": "9da864a96f6f53235ae0a93d6a9ee1594cb9120b96310d7d95550730e9aa180c",
+          "kernel_class": true
+        },
+        {
+          "name": "front_table",
+          "kind": "FunctionDef",
+          "line": 382,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.moe.front",
+          "ast_sha256_without_imports": "51d7e3c52bb4dbaf2956fda74bcfc23c5cf20badb6336c148db0333660daf7f1"
+        },
+        {
+          "name": "front_ks",
+          "kind": "FunctionDef",
+          "line": 387,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.moe.front",
+          "ast_sha256_without_imports": "7e551b02343b03ba4ea78d0802b2ef2af9db96571c522b60d4d76432f6c53845"
+        },
+        {
+          "name": "front_geometry",
+          "kind": "FunctionDef",
+          "line": 391,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.moe.front",
+          "ast_sha256_without_imports": "3d153868f7492c423a03af35e5f96f0820d7e6371ed3a0f1c3b0d80c4ea1dce5"
+        },
+        {
+          "name": "compile_route",
+          "kind": "FunctionDef",
+          "line": 409,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.moe.front",
+          "ast_sha256_without_imports": "b5f6082bac16fb454933b6ff9a51727a9c45276d3e50982eb3acb87d14aa7a35"
+        },
+        {
+          "name": "compile_publish",
+          "kind": "FunctionDef",
+          "line": 440,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.moe.front",
+          "ast_sha256_without_imports": "c4da7c3a4ff60143a2a297d1a72ab0f7405f4b5163b193867ecbb50a2e7c1dc2"
+        },
+        {
+          "name": "SharedFront",
+          "kind": "ClassDef",
+          "line": 451,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.moe.front",
+          "ast_sha256_without_imports": "8287f8c97fd681b57b9870309aa6b31dc98f3ad60082153ff70d4e2fd4367b0a"
+        }
+      ]
+    },
+    {
+      "source": "sgl_nvidia_mega/kimi_k3/cutedsl/moe/prepared.py",
+      "sha256": "ed94c6980bb3e2ddb6443f93a542af1edd1159bd162b54b064c0275ce01fa8e8",
+      "targets": [
+        {
+          "module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.moe.prepared",
+          "path": "srt/kernel_plugins/nvidia/kimi_k3/cutedsl/moe/prepared.py"
+        }
+      ],
+      "symbols": [
+        {
+          "name": "MoEScratch",
+          "kind": "ClassDef",
+          "line": 14,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.moe.prepared",
+          "ast_sha256_without_imports": "98cb7909c472a5f6dc57f8b68e9401d9ead73fe4129b0387a75dc83bec0b2062"
+        },
+        {
+          "name": "PreparedMoE",
+          "kind": "ClassDef",
+          "line": 42,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.moe.prepared",
+          "ast_sha256_without_imports": "f13390fdf459d58ba48945612db647830bb5dceb8838dbb5c8722df596ccfbe4"
+        }
+      ]
+    },
+    {
+      "source": "sgl_nvidia_mega/kimi_k3/cutedsl/moe/routing.py",
+      "sha256": "4054d2dbbf5f88d106f7478850dfcebe4210acce5d9d3bac06c2adabe34e7728",
+      "targets": [
+        {
+          "module": "sglang.kernels.ops.moe.kimi_k3_specialized.routing",
+          "path": "kernels/ops/moe/kimi_k3_specialized/routing.py"
+        }
+      ],
+      "symbols": [
+        {
+          "name": "bf16_word",
+          "kind": "FunctionDef",
+          "line": 28,
+          "target_module": "sglang.kernels.ops.moe.kimi_k3_specialized.routing",
+          "ast_sha256_without_imports": "75b0615b1e3d878379cfcfa09b8861add7f36f48db0ade45f9793e67b3d82b6f"
+        },
+        {
+          "name": "poll_words",
+          "kind": "FunctionDef",
+          "line": 33,
+          "target_module": "sglang.kernels.ops.moe.kimi_k3_specialized.routing",
+          "ast_sha256_without_imports": "ef3a4ce583c1f8be376a1e0414334b003d99b8e9c66b3908f52ce8b1c7c6d289"
+        },
+        {
+          "name": "gather_x",
+          "kind": "FunctionDef",
+          "line": 43,
+          "target_module": "sglang.kernels.ops.moe.kimi_k3_specialized.routing",
+          "ast_sha256_without_imports": "5e5b162e9d383855f2c0bdf06e220cdccf9ab97cd58a60d67bef918ea322bd42"
+        },
+        {
+          "name": "score_record",
+          "kind": "FunctionDef",
+          "line": 77,
+          "target_module": "sglang.kernels.ops.moe.kimi_k3_specialized.routing",
+          "ast_sha256_without_imports": "d8eb8f3be791eb1273e631fd85fb2a1a682b8be84e416c275981d34e0fa4c1b4"
+        },
+        {
+          "name": "stage_rows",
+          "kind": "FunctionDef",
+          "line": 87,
+          "target_module": "sglang.kernels.ops.moe.kimi_k3_specialized.routing",
+          "ast_sha256_without_imports": "47c83688eadda9356d3e07748a44f3dcd1793cab49140fd451f17697da7bc14a"
+        },
+        {
+          "name": "Top16Fast",
+          "kind": "ClassDef",
+          "line": 97,
+          "target_module": "sglang.kernels.ops.moe.kimi_k3_specialized.routing",
+          "ast_sha256_without_imports": "e52c779e9130f489eff306ea1e2222a08ed7b693368a10dd4b0ba057817282be"
+        }
+      ]
+    },
+    {
+      "source": "sgl_nvidia_mega/kimi_k3/cutedsl/moe/shared.py",
+      "sha256": "bf41dec4fe8f34d5ca35be5d812e52c0f3dfcfdd477159a2c45bc702c4f5fb46",
+      "targets": [
+        {
+          "module": "sglang.kernels.ops.communication.kimi_k3_specialized.shared",
+          "path": "kernels/ops/communication/kimi_k3_specialized/shared.py"
+        },
+        {
+          "module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.moe.shared",
+          "path": "srt/kernel_plugins/nvidia/kimi_k3/cutedsl/moe/shared.py"
+        }
+      ],
+      "symbols": [
+        {
+          "name": "situ",
+          "kind": "FunctionDef",
+          "line": 71,
+          "target_module": "sglang.kernels.ops.communication.kimi_k3_specialized.shared",
+          "ast_sha256_without_imports": "abf3387fd45dd091a5d337e64fb93d2cded1da9b309983d04094380e872c3d49"
+        },
+        {
+          "name": "prefetch_tma2",
+          "kind": "FunctionDef",
+          "line": 85,
+          "target_module": "sglang.kernels.ops.communication.kimi_k3_specialized.shared",
+          "ast_sha256_without_imports": "fb51fccff77df99f26875a4f31a9982c09a4352e16986b55cbf9b009a7b2981f"
+        },
+        {
+          "name": "release_count",
+          "kind": "FunctionDef",
+          "line": 92,
+          "target_module": "sglang.kernels.ops.communication.kimi_k3_specialized.shared",
+          "ast_sha256_without_imports": "46bbeaf6ad2fd1caa31c6a8df841aa902e08250993ccc6a8706cf3de461b67b6"
+        },
+        {
+          "name": "acquire_count",
+          "kind": "FunctionDef",
+          "line": 97,
+          "target_module": "sglang.kernels.ops.communication.kimi_k3_specialized.shared",
+          "ast_sha256_without_imports": "20486b0bc6866e7833ddbd83d5833098c16a548f855fa9b349755d4ee3060e65"
+        },
+        {
+          "name": "fetch_count",
+          "kind": "FunctionDef",
+          "line": 102,
+          "target_module": "sglang.kernels.ops.communication.kimi_k3_specialized.shared",
+          "ast_sha256_without_imports": "dfc30fb372285f2fcd3a2424c6d9e8b912d9198a6315fd9f98dd6a998a25f6d3"
+        },
+        {
+          "name": "wait_count",
+          "kind": "FunctionDef",
+          "line": 107,
+          "target_module": "sglang.kernels.ops.communication.kimi_k3_specialized.shared",
+          "ast_sha256_without_imports": "2ed57d90cfa4789bea216c0afb0c22ab633a7ad1cf27e04f36db6f2b8902ec21"
+        },
+        {
+          "name": "weight_maps",
+          "kind": "FunctionDef",
+          "line": 114,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.moe.shared",
+          "ast_sha256_without_imports": "2183c3d549814d37f2e5e3895222d7ad513a6830f5ea5b3c274673901cbd95a0"
+        },
+        {
+          "name": "SharedBase",
+          "kind": "ClassDef",
+          "line": 129,
+          "target_module": "sglang.kernels.ops.communication.kimi_k3_specialized.shared",
+          "ast_sha256_without_imports": "caf2ad36a7bf8dd7e23fb31f0324382374713ce9849b52bda4badea83a9e7532"
+        },
+        {
+          "name": "SharedUmma",
+          "kind": "ClassDef",
+          "line": 210,
+          "target_module": "sglang.kernels.ops.communication.kimi_k3_specialized.shared",
+          "ast_sha256_without_imports": "db1497684a04a466e816e4efb472c625fa2a82954a5bdf6a004bc9fe57023c61",
+          "kernel_class": true
+        },
+        {
+          "name": "SharedDown",
+          "kind": "ClassDef",
+          "line": 552,
+          "target_module": "sglang.kernels.ops.communication.kimi_k3_specialized.shared",
+          "ast_sha256_without_imports": "41527647fdf7d1de8ebefb6621ddb78f95e6dcba5838590bbcbf82d2de9438de",
+          "kernel_class": true
+        },
+        {
+          "name": "compile_shared",
+          "kind": "FunctionDef",
+          "line": 653,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.moe.shared",
+          "ast_sha256_without_imports": "fda913d7cb6438e60cd4ba031538a59b78d727390672ed3fe0d3db2d91bdb1f6"
+        },
+        {
+          "name": "compile_down",
+          "kind": "FunctionDef",
+          "line": 672,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.moe.shared",
+          "ast_sha256_without_imports": "6156eb4f7d8c40599f62da632611326b368caa402aea716cf4e6eb856e90805e"
+        },
+        {
+          "name": "scratch",
+          "kind": "FunctionDef",
+          "line": 682,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.moe.shared",
+          "ast_sha256_without_imports": "a44ed30d9647dd98e210cf6de44bb01b87041417fff0b92d61dec159ef25f4c6"
+        }
+      ]
+    },
+    {
+      "source": "sgl_nvidia_mega/kimi_k3/cutedsl/moe/small_batch/__init__.py",
+      "sha256": "bd3762ee4302c67a96afbd65e9ecc48714081f73e79a8a422c2d52d26f7fd7ed",
+      "targets": [
+        {
+          "module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.moe.small_batch",
+          "path": "srt/kernel_plugins/nvidia/kimi_k3/cutedsl/moe/small_batch/__init__.py"
+        }
+      ],
+      "symbols": []
+    },
+    {
+      "source": "sgl_nvidia_mega/kimi_k3/cutedsl/moe/small_batch/chain.py",
+      "sha256": "b313df04da4011b2200559010ceb0400a5aca2378bac69679fd0e2aff383d261",
+      "targets": [
+        {
+          "module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.moe.small_batch.chain",
+          "path": "srt/kernel_plugins/nvidia/kimi_k3/cutedsl/moe/small_batch/chain.py"
+        }
+      ],
+      "symbols": [
+        {
+          "name": "_compile",
+          "kind": "FunctionDef",
+          "line": 38,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.moe.small_batch.chain",
+          "ast_sha256_without_imports": "aedd1c08877dcd269107650ba7f6f8c7907f7b7864f7096f448075e1de4691fa"
+        },
+        {
+          "name": "_launch",
+          "kind": "FunctionDef",
+          "line": 46,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.moe.small_batch.chain",
+          "ast_sha256_without_imports": "5651f422b62c7af109d9d1bd561e9398e1521865fe8673e93b7aaee9e8ee40f6"
+        },
+        {
+          "name": "u32",
+          "kind": "FunctionDef",
+          "line": 52,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.moe.small_batch.chain",
+          "ast_sha256_without_imports": "c9d10dcd80ab379e897f32fac83a349be1a20453356933de441b0f9d47a16621"
+        },
+        {
+          "name": "SmallBatchBox",
+          "kind": "ClassDef",
+          "line": 56,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.moe.small_batch.chain",
+          "ast_sha256_without_imports": "0e17ff4fb3a3c64b1462184f3756b7f123d950497da7b0f90469c3510b5b2f9a"
+        },
+        {
+          "name": "SmallBatchChain",
+          "kind": "ClassDef",
+          "line": 108,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.moe.small_batch.chain",
+          "ast_sha256_without_imports": "e0c2e439082443e038496da40bc0169196e1ab931d56858cb98419ae352a6e59"
+        }
+      ]
+    },
+    {
+      "source": "sgl_nvidia_mega/kimi_k3/cutedsl/moe/small_batch/experts.py",
+      "sha256": "5c5c6acb35f7c24ca8a107e6a7e3f6a11961c29e445166540584dae3b6f0ecfe",
+      "targets": [
+        {
+          "module": "sglang.kernels.ops.moe.kimi_k3_specialized.small_batch_experts",
+          "path": "kernels/ops/moe/kimi_k3_specialized/small_batch_experts.py"
+        }
+      ],
+      "symbols": [
+        {
+          "name": "quantize_mx8",
+          "kind": "FunctionDef",
+          "line": 54,
+          "target_module": "sglang.kernels.ops.moe.kimi_k3_specialized.small_batch_experts",
+          "ast_sha256_without_imports": "b4d289d54c9376100f513453ba2fed0bf5ab9c3713474b8a8d4504c5d587d6c1"
+        },
+        {
+          "name": "_ClusterExperts",
+          "kind": "ClassDef",
+          "line": 71,
+          "target_module": "sglang.kernels.ops.moe.kimi_k3_specialized.small_batch_experts",
+          "ast_sha256_without_imports": "e371ffce7946efd7812f31eb393d7b77363349f0039a0a0e48636ad68f57d7a7",
+          "kernel_class": true
+        },
+        {
+          "name": "ClusterExpertsTP16",
+          "kind": "ClassDef",
+          "line": 82,
+          "target_module": "sglang.kernels.ops.moe.kimi_k3_specialized.small_batch_experts",
+          "ast_sha256_without_imports": "02ca3c8604852aa2708919bc358422a1939bf7598959259ac20d0218fc078e29"
+        },
+        {
+          "name": "_align_1024",
+          "kind": "FunctionDef",
+          "line": 335,
+          "target_module": "sglang.kernels.ops.moe.kimi_k3_specialized.small_batch_experts",
+          "ast_sha256_without_imports": "68fb5c268191ecd213e0c3b0f4b6cfb3670863bca58739fc8a49fbb74c50850a"
+        },
+        {
+          "name": "ClusterExpertsTP8",
+          "kind": "ClassDef",
+          "line": 339,
+          "target_module": "sglang.kernels.ops.moe.kimi_k3_specialized.small_batch_experts",
+          "ast_sha256_without_imports": "3612e4fcd260975e480d904ba117c52c2406be6166fc4893c2569e15480190d1"
+        }
+      ]
+    },
+    {
+      "source": "sgl_nvidia_mega/kimi_k3/cutedsl/moe/small_batch/front_tp16.py",
+      "sha256": "472e8bd32fb50898a10057d4aeb3c5f1dc1f4a1086f43dc71390612be2a8a62e",
+      "targets": [
+        {
+          "module": "sglang.kernels.ops.communication.kimi_k3_specialized.front_tp16",
+          "path": "kernels/ops/communication/kimi_k3_specialized/front_tp16.py"
+        },
+        {
+          "module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.moe.small_batch.front_tp16",
+          "path": "srt/kernel_plugins/nvidia/kimi_k3/cutedsl/moe/small_batch/front_tp16.py"
+        }
+      ],
+      "symbols": [
+        {
+          "name": "sreg",
+          "kind": "FunctionDef",
+          "line": 49,
+          "target_module": "sglang.kernels.ops.communication.kimi_k3_specialized.front_tp16",
+          "ast_sha256_without_imports": "65fe4ff9b94d0d77fb9d15fe56a61e8a0eda07c7ae0f1ce5c57c0a9d0754f33d"
+        },
+        {
+          "name": "claim_add",
+          "kind": "FunctionDef",
+          "line": 55,
+          "target_module": "sglang.kernels.ops.communication.kimi_k3_specialized.front_tp16",
+          "ast_sha256_without_imports": "956bfa9da3a57cd7faf23cb06fe254db43fa1ca83886dea5534eed5680a6b7c6"
+        },
+        {
+          "name": "counter_reduce",
+          "kind": "FunctionDef",
+          "line": 60,
+          "target_module": "sglang.kernels.ops.communication.kimi_k3_specialized.front_tp16",
+          "ast_sha256_without_imports": "da76ee8f716bce81394a6847586e9c5376c8ec1c9799b27aff885ad3513be454"
+        },
+        {
+          "name": "load_arrivals",
+          "kind": "FunctionDef",
+          "line": 67,
+          "target_module": "sglang.kernels.ops.communication.kimi_k3_specialized.front_tp16",
+          "ast_sha256_without_imports": "cda16e1b955f15af4a8bf746eea620f0c4b3ca3888e3e88da888201c7d838cca"
+        },
+        {
+          "name": "FrontPlacement",
+          "kind": "ClassDef",
+          "line": 72,
+          "target_module": "sglang.kernels.ops.communication.kimi_k3_specialized.front_tp16",
+          "ast_sha256_without_imports": "445f819f3fbfbbee32931f0c1a27eb6c78386c393ffa8304a06cdf1e799ee8fe"
+        },
+        {
+          "name": "FrontPlacementProbe",
+          "kind": "ClassDef",
+          "line": 127,
+          "target_module": "sglang.kernels.ops.communication.kimi_k3_specialized.front_tp16",
+          "ast_sha256_without_imports": "21d3b4c858439bb39b4b56c83f1ce7186d5aa57cffd7dc1addbf79cc8ba6b7e1",
+          "kernel_class": true
+        },
+        {
+          "name": "_compile_probe",
+          "kind": "FunctionDef",
+          "line": 149,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.moe.small_batch.front_tp16",
+          "ast_sha256_without_imports": "17e11d09249fd6a834d93d5e29be6efc00ad547f24d66c65b241aac3de1cff3c"
+        },
+        {
+          "name": "plan_designated",
+          "kind": "FunctionDef",
+          "line": 157,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.moe.small_batch.front_tp16",
+          "ast_sha256_without_imports": "659e50b33380df334c1d13ac45d3a7f02f17fdc94c3d1101fc09784238db7430"
+        },
+        {
+          "name": "initialize_designated",
+          "kind": "FunctionDef",
+          "line": 182,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.moe.small_batch.front_tp16",
+          "ast_sha256_without_imports": "46cf78ec63ce1642281d92e350eab1f74050490071a8bc68f259c4ac05aed7cf"
+        },
+        {
+          "name": "MoeFrontTP16",
+          "kind": "ClassDef",
+          "line": 237,
+          "target_module": "sglang.kernels.ops.communication.kimi_k3_specialized.front_tp16",
+          "ast_sha256_without_imports": "55c0ea8032533d82fad82437d9980a306663a0338ad6655f5308b2c38e3e9fce",
+          "kernel_class": true
+        }
+      ]
+    },
+    {
+      "source": "sgl_nvidia_mega/kimi_k3/cutedsl/moe/small_batch/front_tp8.py",
+      "sha256": "514e9611bb5424e94bf9f5318b080e086204c34d5e1ad64c2a7572944afe07e0",
+      "targets": [
+        {
+          "module": "sglang.kernels.ops.communication.kimi_k3_specialized.front_tp8",
+          "path": "kernels/ops/communication/kimi_k3_specialized/front_tp8.py"
+        }
+      ],
+      "symbols": [
+        {
+          "name": "MoeSharedTP8",
+          "kind": "ClassDef",
+          "line": 49,
+          "target_module": "sglang.kernels.ops.communication.kimi_k3_specialized.front_tp8",
+          "ast_sha256_without_imports": "bd891bc080fc62ab984f9b641cb4c5bc11af0558e8edc09e9ed4685c33947940",
+          "kernel_class": true
+        },
+        {
+          "name": "SharedSituTables",
+          "kind": "ClassDef",
+          "line": 157,
+          "target_module": "sglang.kernels.ops.communication.kimi_k3_specialized.front_tp8",
+          "ast_sha256_without_imports": "2bcd990b5ccb8989f710eca898c3a07eb5cf7d330370f79db0d11bafd1e0bd7a",
+          "kernel_class": true
+        },
+        {
+          "name": "MoeFrontTP8",
+          "kind": "ClassDef",
+          "line": 180,
+          "target_module": "sglang.kernels.ops.communication.kimi_k3_specialized.front_tp8",
+          "ast_sha256_without_imports": "eb247ad796fec043277ffc32eed6b747896b9acfcc65693341994664ff2d6aa7",
+          "kernel_class": true
+        }
+      ]
+    },
+    {
+      "source": "sgl_nvidia_mega/kimi_k3/cutedsl/moe/tail.py",
+      "sha256": "219016e7c130d967339627ebc5613a605c69f4977fc85a0b7fd5b90c3fef194a",
+      "targets": [
+        {
+          "module": "sglang.kernels.ops.communication.kimi_k3_specialized.moe_tail",
+          "path": "kernels/ops/communication/kimi_k3_specialized/moe_tail.py"
+        }
+      ],
+      "symbols": [
+        {
+          "name": "scatter_sums",
+          "kind": "FunctionDef",
+          "line": 64,
+          "target_module": "sglang.kernels.ops.communication.kimi_k3_specialized.moe_tail",
+          "ast_sha256_without_imports": "7678f1bfb09581b3e315cfabc3c21d41670b2990a58941c250cc194243d623ea"
+        },
+        {
+          "name": "gather_sums",
+          "kind": "FunctionDef",
+          "line": 86,
+          "target_module": "sglang.kernels.ops.communication.kimi_k3_specialized.moe_tail",
+          "ast_sha256_without_imports": "4e5e6b2c222a10f24b0bbc9c9965f853c63a45efe392402b0e66310352939b1c"
+        },
+        {
+          "name": "spread",
+          "kind": "FunctionDef",
+          "line": 92,
+          "target_module": "sglang.kernels.ops.communication.kimi_k3_specialized.moe_tail",
+          "ast_sha256_without_imports": "11820a8636fed58bcfe09ccd07e02bfc627aa69edacff1569eb7d5e635f266d8"
+        },
+        {
+          "name": "MoeTail",
+          "kind": "ClassDef",
+          "line": 97,
+          "target_module": "sglang.kernels.ops.communication.kimi_k3_specialized.moe_tail",
+          "ast_sha256_without_imports": "213fcb52806b3694c797eb6111aeb293f6aa81c103ee9f5aeb7e978cfea97c80",
+          "kernel_class": true
+        },
+        {
+          "name": "pow2_spans",
+          "kind": "FunctionDef",
+          "line": 433,
+          "target_module": "sglang.kernels.ops.communication.kimi_k3_specialized.moe_tail",
+          "ast_sha256_without_imports": "ef0be38e0e8c869f86ed3fab931cbf56e696ca8c0f225b7c6d9ee6fcd7c2960f"
+        },
+        {
+          "name": "WaveMoeTail",
+          "kind": "ClassDef",
+          "line": 439,
+          "target_module": "sglang.kernels.ops.communication.kimi_k3_specialized.moe_tail",
+          "ast_sha256_without_imports": "b0b1fb975448ef5f5d477dafd538866d6c68bf9af00082815cf760fa2dac543f"
+        }
+      ]
+    },
+    {
+      "source": "sgl_nvidia_mega/kimi_k3/cutedsl/moe/tail_runtime.py",
+      "sha256": "d10de256b54d03a0040cc6941ea4421fb2fb9e64d6d047cb5bed6f4b0a2a05c5",
+      "targets": [
+        {
+          "module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.moe.tail_runtime",
+          "path": "srt/kernel_plugins/nvidia/kimi_k3/cutedsl/moe/tail_runtime.py"
+        }
+      ],
+      "symbols": [
+        {
+          "name": "flat",
+          "kind": "FunctionDef",
+          "line": 49,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.moe.tail_runtime",
+          "ast_sha256_without_imports": "65d1c02b36d956c72b4ee4dbbfa855c6991453b9c8c697c4a793ae9c95253526"
+        },
+        {
+          "name": "published",
+          "kind": "FunctionDef",
+          "line": 53,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.moe.tail_runtime",
+          "ast_sha256_without_imports": "9ae31d8a130d39bce1693bff799edabb4c1a214e115ec68f8beeb31e98fb31cd"
+        },
+        {
+          "name": "twoshot_batches",
+          "kind": "FunctionDef",
+          "line": 59,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.moe.tail_runtime",
+          "ast_sha256_without_imports": "47b16ced36fcdf5ac072a050ce0402c46c1fa5c596e06c910df42c7a3bfb514f"
+        },
+        {
+          "name": "early_batches",
+          "kind": "FunctionDef",
+          "line": 64,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.moe.tail_runtime",
+          "ast_sha256_without_imports": "27a72fc5f155f8b8175a6368744c50be552a765ee925443a560dfaab740cbe2c"
+        },
+        {
+          "name": "umma_batches",
+          "kind": "FunctionDef",
+          "line": 69,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.moe.tail_runtime",
+          "ast_sha256_without_imports": "c6fa45a945089cb5d06d212cdd1e419e8ccea178e45c62871a8f118421e0c0bb"
+        },
+        {
+          "name": "shares",
+          "kind": "FunctionDef",
+          "line": 74,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.moe.tail_runtime",
+          "ast_sha256_without_imports": "d52e0b737d9f876f3896cc0560dd9ea623837f3197f4a66d7aa50e5ac50d681e"
+        },
+        {
+          "name": "resident_clusters",
+          "kind": "FunctionDef",
+          "line": 80,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.moe.tail_runtime",
+          "ast_sha256_without_imports": "1a0289ffe8743b1d043e94b9a5f4cef69231713771a909f6fbe5d6e22e3fd3a2"
+        },
+        {
+          "name": "MoeTailBox",
+          "kind": "ClassDef",
+          "line": 87,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.moe.tail_runtime",
+          "ast_sha256_without_imports": "6bec82afc4dc8c5e3a125e7b827065d3f955ce06a859075ff16e40350618b3f3"
+        },
+        {
+          "name": "compile_tail",
+          "kind": "FunctionDef",
+          "line": 124,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.moe.tail_runtime",
+          "ast_sha256_without_imports": "35be9c22690944dc64e722673fb0e2aa4adaf520c8b71483b5e40f8377fcad7a"
+        },
+        {
+          "name": "compile_push",
+          "kind": "FunctionDef",
+          "line": 165,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.moe.tail_runtime",
+          "ast_sha256_without_imports": "ddbbc455670cb5cf87ef2a8a55d5454555467b30f5a939f4371009cf5226aee0"
+        },
+        {
+          "name": "MoeTailWeights",
+          "kind": "ClassDef",
+          "line": 174,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.moe.tail_runtime",
+          "ast_sha256_without_imports": "ec3006d64dc6de771f389cfe06e39e85b8fe1aaf0c6c6aa9af57c57306784424"
+        },
+        {
+          "name": "PreparedTail",
+          "kind": "ClassDef",
+          "line": 253,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.moe.tail_runtime",
+          "ast_sha256_without_imports": "042757ba16bc4fac886f648c96580d930b897c197968e0c941db0458611c7fbe"
+        }
+      ]
+    },
+    {
+      "source": "sgl_nvidia_mega/kimi_k3/cutedsl/oproj/__init__.py",
+      "sha256": "bd3762ee4302c67a96afbd65e9ecc48714081f73e79a8a422c2d52d26f7fd7ed",
+      "targets": [
+        {
+          "module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.oproj",
+          "path": "srt/kernel_plugins/nvidia/kimi_k3/cutedsl/oproj/__init__.py"
+        }
+      ],
+      "symbols": []
+    },
+    {
+      "source": "sgl_nvidia_mega/kimi_k3/cutedsl/oproj/consumer.py",
+      "sha256": "500ae720abb97f109b5f4caf141642515f7042fded311e807af43cd38f2e61db",
+      "targets": [
+        {
+          "module": "sglang.kernels.ops.communication.kimi_k3_specialized.oproj_consumer",
+          "path": "kernels/ops/communication/kimi_k3_specialized/oproj_consumer.py"
+        }
+      ],
+      "symbols": [
+        {
+          "name": "pair_op",
+          "kind": "FunctionDef",
+          "line": 47,
+          "target_module": "sglang.kernels.ops.communication.kimi_k3_specialized.oproj_consumer",
+          "ast_sha256_without_imports": "0ad6a1eb04f63e9232f2a307be2510bb21f5a3c0bab438db2eccebb06d7b5fb3"
+        },
+        {
+          "name": "mul_rn",
+          "kind": "FunctionDef",
+          "line": 59,
+          "target_module": "sglang.kernels.ops.communication.kimi_k3_specialized.oproj_consumer",
+          "ast_sha256_without_imports": "77f48af1f8508d318f165949f30670cd32568c84435f295da2d015a4fc6471dd"
+        },
+        {
+          "name": "two",
+          "kind": "FunctionDef",
+          "line": 64,
+          "target_module": "sglang.kernels.ops.communication.kimi_k3_specialized.oproj_consumer",
+          "ast_sha256_without_imports": "6737149c608cfce0850dd934054da092ab80a6ccb38e225029594e1ce8d67f7b"
+        },
+        {
+          "name": "dot8",
+          "kind": "FunctionDef",
+          "line": 68,
+          "target_module": "sglang.kernels.ops.communication.kimi_k3_specialized.oproj_consumer",
+          "ast_sha256_without_imports": "b8c46f42fb46c9899889f1e9ae79ebeaa0bbea09d1796a332675c1533ebcaaa7"
+        },
+        {
+          "name": "reduce_scatter",
+          "kind": "FunctionDef",
+          "line": 78,
+          "target_module": "sglang.kernels.ops.communication.kimi_k3_specialized.oproj_consumer",
+          "ast_sha256_without_imports": "4fded5742a4bdd23e596888b1915799eca67991e55676aead490819e04dd9c66"
+        },
+        {
+          "name": "fetch",
+          "kind": "FunctionDef",
+          "line": 104,
+          "target_module": "sglang.kernels.ops.communication.kimi_k3_specialized.oproj_consumer",
+          "ast_sha256_without_imports": "fcf02be7b1a333da4bdeb72e7a121517180d33227b7ff08f877f73b1fa309e0a"
+        },
+        {
+          "name": "OprojConsumer",
+          "kind": "ClassDef",
+          "line": 111,
+          "target_module": "sglang.kernels.ops.communication.kimi_k3_specialized.oproj_consumer",
+          "ast_sha256_without_imports": "7be9e7809bda406771f1b8628869cb5a17224bfd2ced023f19c10900c1cbae1c",
+          "kernel_class": true
+        },
+        {
+          "name": "OprojFused",
+          "kind": "ClassDef",
+          "line": 424,
+          "target_module": "sglang.kernels.ops.communication.kimi_k3_specialized.oproj_consumer",
+          "ast_sha256_without_imports": "1096ea318d2a5ac3dd18e3d376ec7d8cba0a145e77cee8de965e443d9f2c7cb5",
+          "kernel_class": true
+        }
+      ]
+    },
+    {
+      "source": "sgl_nvidia_mega/kimi_k3/cutedsl/oproj/prepared.py",
+      "sha256": "dd0a3420536d62feabdea33199394b83b441a08fb35040f48cbf726190727ff6",
+      "targets": [
+        {
+          "module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.oproj.prepared",
+          "path": "srt/kernel_plugins/nvidia/kimi_k3/cutedsl/oproj/prepared.py"
+        }
+      ],
+      "symbols": [
+        {
+          "name": "OprojMailbox",
+          "kind": "ClassDef",
+          "line": 33,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.oproj.prepared",
+          "ast_sha256_without_imports": "0f731475e7957562e867222b9119bdf3a96405277e535f47aeb545abf5f3072d"
+        },
+        {
+          "name": "twoshot_batches",
+          "kind": "FunctionDef",
+          "line": 61,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.oproj.prepared",
+          "ast_sha256_without_imports": "6a490442d6299edfe9d2da2ebc901755db13ab5a9cafefc143c981527df740de"
+        },
+        {
+          "name": "engine",
+          "kind": "FunctionDef",
+          "line": 66,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.oproj.prepared",
+          "ast_sha256_without_imports": "0974c927e9a6254ec560d589fa29ddbbfa2ad866ac672cdc7cdec2d989b7c5e9"
+        },
+        {
+          "name": "producer",
+          "kind": "FunctionDef",
+          "line": 73,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.oproj.prepared",
+          "ast_sha256_without_imports": "c3d1260388d25a6005a5800be9d8950b94ef490e043ed07626815f26f40aca01"
+        },
+        {
+          "name": "compile_oproj",
+          "kind": "FunctionDef",
+          "line": 86,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.oproj.prepared",
+          "ast_sha256_without_imports": "d187cf08f4a87db62253f8b0f2666abcd6e659ed76cedb4bf3a95a54f7243cb9"
+        },
+        {
+          "name": "PreparedOproj",
+          "kind": "ClassDef",
+          "line": 131,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.oproj.prepared",
+          "ast_sha256_without_imports": "01923ea538c0f61cf44472308e0ed6b5f288b1395cc75f244d3b6107cbd9d3b3"
+        }
+      ]
+    },
+    {
+      "source": "sgl_nvidia_mega/kimi_k3/cutedsl/oproj/producer.py",
+      "sha256": "09adc7177a8c33188d9558be33b3644beee640b5ef488d30f672bd87845bf9a5",
+      "targets": [
+        {
+          "module": "sglang.kernels.ops.communication.kimi_k3_specialized.oproj_producer",
+          "path": "kernels/ops/communication/kimi_k3_specialized/oproj_producer.py"
+        }
+      ],
+      "symbols": [
+        {
+          "name": "pack8",
+          "kind": "FunctionDef",
+          "line": 47,
+          "target_module": "sglang.kernels.ops.communication.kimi_k3_specialized.oproj_producer",
+          "ast_sha256_without_imports": "d2db9a00ac094b82134a5a62922773fe7b659d307e4e4fc9e0307bc3a7a2de30"
+        },
+        {
+          "name": "tree_reduce",
+          "kind": "FunctionDef",
+          "line": 54,
+          "target_module": "sglang.kernels.ops.communication.kimi_k3_specialized.oproj_producer",
+          "ast_sha256_without_imports": "c2fb537c2805d1e041a88e15113d83cf7325a8ab597e55a10209c8aea72e7ffa"
+        },
+        {
+          "name": "OprojProducer",
+          "kind": "ClassDef",
+          "line": 62,
+          "target_module": "sglang.kernels.ops.communication.kimi_k3_specialized.oproj_producer",
+          "ast_sha256_without_imports": "0e060a0b4defb14897b6398a5c68939645b54207b13fc178b392c68166dc1338",
+          "kernel_class": true
+        },
+        {
+          "name": "OprojUmma",
+          "kind": "ClassDef",
+          "line": 304,
+          "target_module": "sglang.kernels.ops.communication.kimi_k3_specialized.oproj_producer",
+          "ast_sha256_without_imports": "faa251e445e54ed3cd24cd8c3f350bc37f63351cef581b7a9b0beec173fbf3cd",
+          "kernel_class": true
+        }
+      ]
+    },
+    {
+      "source": "sgl_nvidia_mega/kimi_k3/executor.py",
+      "sha256": "c1a8e8ff14fe2d66b02a45dc225a99cf11cd218b5c77ba175010b3a5d1d684bb",
+      "targets": [
+        {
+          "module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.executor",
+          "path": "srt/kernel_plugins/nvidia/kimi_k3/executor.py"
+        }
+      ],
+      "symbols": [
+        {
+          "name": "_require_tensor",
+          "kind": "FunctionDef",
+          "line": 35,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.executor",
+          "ast_sha256_without_imports": "16b8a35121c4df5cd9ba75b6f253aed1684f6c818316a823abe8b921e5e09515"
+        },
+        {
+          "name": "_validate_step_inputs",
+          "kind": "FunctionDef",
+          "line": 66,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.executor",
+          "ast_sha256_without_imports": "29746c9eab1ec562ce37549e0749e85f797546df34ada9c347bb452dfea844bd"
+        },
+        {
+          "name": "KimiK3MegakernelExecutor",
+          "kind": "ClassDef",
+          "line": 140,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.executor",
+          "ast_sha256_without_imports": "143a8d184bb8782be90d53f22b1e20ce68ba564974ad4c2c79d15c36dbd5961e"
+        }
+      ]
+    },
+    {
+      "source": "sgl_nvidia_mega/kimi_k3/prefetch.py",
+      "sha256": "54686d7b15586d2f1d099a9b736e4ab1c3c4a53b4ba14e071d1418e34871ca13",
+      "targets": [
+        {
+          "module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.prefetch",
+          "path": "srt/kernel_plugins/nvidia/kimi_k3/prefetch.py"
+        }
+      ],
+      "symbols": [
+        {
+          "name": "attention_weights",
+          "kind": "FunctionDef",
+          "line": 51,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.prefetch",
+          "ast_sha256_without_imports": "545a0ad97125803285c3c7fd06b8c7360d85b2cd6026545f941b277a987cd005"
+        },
+        {
+          "name": "weight_ranges",
+          "kind": "FunctionDef",
+          "line": 63,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.prefetch",
+          "ast_sha256_without_imports": "74eda7c632cc4b5b6ec493c2f58af10bed55f58d9dd4e5d225494d89e6763d42"
+        },
+        {
+          "name": "_stream_handle",
+          "kind": "FunctionDef",
+          "line": 89,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.prefetch",
+          "ast_sha256_without_imports": "2b22413e7e6f130c01c19b6e7fb1766456e65ae1f6dd654b7db80e48308faa5b"
+        },
+        {
+          "name": "PreparedWeightRanges",
+          "kind": "ClassDef",
+          "line": 95,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.prefetch",
+          "ast_sha256_without_imports": "402a655545cfaa971ceb2a58e072cfc60788125a742dff368cacb7dfb1ff8296"
+        },
+        {
+          "name": "PrefetchController",
+          "kind": "ClassDef",
+          "line": 153,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.prefetch",
+          "ast_sha256_without_imports": "64f4f74c745d0c53b910f8b61a6258f879833cb2ef4d83a59dd8c338a39aed34"
+        }
+      ]
+    },
+    {
+      "source": "sgl_nvidia_mega/kimi_k3/profile.py",
+      "sha256": "e2e6e0862b1cf666a0b551afc00c5c1c1b6cf1faf8c07e0733b2ce9a8074bca1",
+      "targets": [
+        {
+          "module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.profile",
+          "path": "srt/kernel_plugins/nvidia/kimi_k3/profile.py"
+        }
+      ],
+      "symbols": [
+        {
+          "name": "selected_profile",
+          "kind": "FunctionDef",
+          "line": 7,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.profile",
+          "ast_sha256_without_imports": "7112b6f799541af97d33d6cf7cc32f7546b825b606eb2287e8c9827b29631fe9"
+        },
+        {
+          "name": "native_mla_enabled",
+          "kind": "FunctionDef",
+          "line": 18,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.profile",
+          "ast_sha256_without_imports": "737c9abaf0c9a2ad4f19498b1ac0667f14465fb747d29c78b8d36acc117f8b7f"
+        },
+        {
+          "name": "full_decode_enabled",
+          "kind": "FunctionDef",
+          "line": 22,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.profile",
+          "ast_sha256_without_imports": "61144b740e8a82447769201e4e987783cd5906fa953ab350d538b0014a4f069f"
+        },
+        {
+          "name": "native_config_reasons",
+          "kind": "FunctionDef",
+          "line": 26,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.profile",
+          "ast_sha256_without_imports": "285fe09b8eaed8c1b7f9defa780ca682c37fd22c67e69e85a7f5aa2ee8011912"
+        }
+      ]
+    },
+    {
+      "source": "sgl_nvidia_mega/kimi_k3/projection_storage.py",
+      "sha256": "9684af23154ade20d674423a9cc03381a727f146603b4361009e279b5a29a7ee",
+      "targets": [
+        {
+          "module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.projection_storage",
+          "path": "srt/kernel_plugins/nvidia/kimi_k3/projection_storage.py"
+        }
+      ],
+      "symbols": [
+        {
+          "name": "_Part",
+          "kind": "ClassDef",
+          "line": 28,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.projection_storage",
+          "ast_sha256_without_imports": "32163d2bb63c6417008b1beb8456034c414f5a2eca52799ec8c0a6c4142acaa0"
+        },
+        {
+          "name": "_Layout",
+          "kind": "ClassDef",
+          "line": 34,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.projection_storage",
+          "ast_sha256_without_imports": "c960035c70a5b078d5973545a98d07bb5bf08a0c9e27a22865d7cb725b1587aa"
+        },
+        {
+          "name": "_resolve_parameter",
+          "kind": "FunctionDef",
+          "line": 74,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.projection_storage",
+          "ast_sha256_without_imports": "a3651e10e954743e15191e34211b52507b863282cf75683cc28f9eaad2d72d58"
+        },
+        {
+          "name": "_registered",
+          "kind": "FunctionDef",
+          "line": 87,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.projection_storage",
+          "ast_sha256_without_imports": "1b2ace577ba65ae962710c820b55ff48d9b1bcac58aec56fe082a471017daee6"
+        },
+        {
+          "name": "_validate_layout",
+          "kind": "FunctionDef",
+          "line": 94,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.projection_storage",
+          "ast_sha256_without_imports": "d49068d389ab00e817eed63ab2e4dea3df6e446ed7f766860013083f52232226"
+        },
+        {
+          "name": "_validate_tensor",
+          "kind": "FunctionDef",
+          "line": 110,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.projection_storage",
+          "ast_sha256_without_imports": "d7c6e2c948db7444f273058ffe8954f6359241d7271add1ccf272665386e08dd"
+        },
+        {
+          "name": "_parts",
+          "kind": "FunctionDef",
+          "line": 130,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.projection_storage",
+          "ast_sha256_without_imports": "7d5364846ef967219d37cd8c9cc1984513dddbf98e11e4df3e0f851d258f2a41"
+        },
+        {
+          "name": "_same_view",
+          "kind": "FunctionDef",
+          "line": 156,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.projection_storage",
+          "ast_sha256_without_imports": "cfc3824a75189653c8aeb12b1cdbe42cd2b17311d68a47a0564fb7f9582f6c05"
+        },
+        {
+          "name": "_alias_start_row",
+          "kind": "FunctionDef",
+          "line": 173,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.projection_storage",
+          "ast_sha256_without_imports": "0bb3f6c4e3c39800aa1907a752136d138036f3495b3593b961dab96874c4f5fc"
+        },
+        {
+          "name": "_validate_alias",
+          "kind": "FunctionDef",
+          "line": 178,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.projection_storage",
+          "ast_sha256_without_imports": "3dfb52dd9a154275f44c5bf170d6405058540fab974af70ab6df712bdce07773"
+        },
+        {
+          "name": "_validate_installed",
+          "kind": "FunctionDef",
+          "line": 232,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.projection_storage",
+          "ast_sha256_without_imports": "8503b2183ef061632b1db11f71377c917166ec4340264b7583df4dd85f856baa"
+        },
+        {
+          "name": "_coalesce_projection_storage",
+          "kind": "FunctionDef",
+          "line": 272,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.projection_storage",
+          "ast_sha256_without_imports": "453a52931ec40304281e82355373cd71e43cf107b3900cac40e8526a45ba7f09"
+        },
+        {
+          "name": "coalesce_mla_projection_storage",
+          "kind": "FunctionDef",
+          "line": 335,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.projection_storage",
+          "ast_sha256_without_imports": "f40014d6423b2e57428d3b05dbbc541463df701d71333de21118e0f46eefc581"
+        },
+        {
+          "name": "coalesce_kda_projection_storage",
+          "kind": "FunctionDef",
+          "line": 341,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.projection_storage",
+          "ast_sha256_without_imports": "8b32c700801c663c4ac6f001a2147a6593a26fcfdad4fa78d2e0fc5f3af8d07c"
+        }
+      ]
+    },
+    {
+      "source": "sgl_nvidia_mega/kimi_k3/providers.py",
+      "sha256": "3df7e74b7a062a2451f5845e51233de8bc6740af8fd694f98ef46693ec4ae4bf",
+      "targets": [
+        {
+          "module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.providers",
+          "path": "srt/kernel_plugins/nvidia/kimi_k3/providers.py"
+        }
+      ],
+      "symbols": [
+        {
+          "name": "_validate_pool_tensor",
+          "kind": "FunctionDef",
+          "line": 87,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.providers",
+          "ast_sha256_without_imports": "f4a1f3f25320f00eeac88a337064f10e702ddf5ad116e0bed67361c2f65c1756"
+        },
+        {
+          "name": "_digest",
+          "kind": "FunctionDef",
+          "line": 116,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.providers",
+          "ast_sha256_without_imports": "9acc95cf5b5c28f0c41240e2c3e8813e97225380b0a324ee437fa058031c1bc3"
+        },
+        {
+          "name": "_float",
+          "kind": "FunctionDef",
+          "line": 121,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.providers",
+          "ast_sha256_without_imports": "f3cbdc781e0ca0e957f765907014726cfaf9f10afe269659ef377e7530bc7f99"
+        },
+        {
+          "name": "_module",
+          "kind": "FunctionDef",
+          "line": 129,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.providers",
+          "ast_sha256_without_imports": "100fbb4bf62f101ddbe23c793c86dffad14da8c77a8b8646f0288167c5af8a49"
+        },
+        {
+          "name": "_cuda_memory",
+          "kind": "FunctionDef",
+          "line": 136,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.providers",
+          "ast_sha256_without_imports": "d9780e4b69e986d73bfd38ed0fc7ffb68a3af584d4c08d5990ec14d06ff82d67"
+        },
+        {
+          "name": "_tensor_row",
+          "kind": "FunctionDef",
+          "line": 147,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.providers",
+          "ast_sha256_without_imports": "831cff18c503c3fdaa2e1c4325cc8845270228b16110fc9403a3fbbd45085a66"
+        },
+        {
+          "name": "_resource_kind",
+          "kind": "FunctionDef",
+          "line": 162,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.providers",
+          "ast_sha256_without_imports": "bae539684a25f35d9cf1c80111aa2a371be104b2341ed94e4bf5df8cdf9d5694"
+        },
+        {
+          "name": "_handle_row",
+          "kind": "FunctionDef",
+          "line": 174,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.providers",
+          "ast_sha256_without_imports": "022eac98822f31d809ced4d37ba9c4e028b8ade96927c9cc65de78bb3e302685"
+        },
+        {
+          "name": "_owned_resource_inventory",
+          "kind": "FunctionDef",
+          "line": 195,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.providers",
+          "ast_sha256_without_imports": "07a2833cb3e4a040bb91717f83607ce711353c4b1e792271dd8f12537deea3b5"
+        },
+        {
+          "name": "_pointer_free_digest",
+          "kind": "FunctionDef",
+          "line": 308,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.providers",
+          "ast_sha256_without_imports": "1d35090ed4d212ed88aee33411ef9a1901ab2105d4b1828911efcebe7907bd4c"
+        },
+        {
+          "name": "_layer_proxy",
+          "kind": "FunctionDef",
+          "line": 312,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.providers",
+          "ast_sha256_without_imports": "63d1116931fba30a314888d12ed300fbe7e06979c495002b26f41b32eaedd2ac"
+        },
+        {
+          "name": "_final_proxy",
+          "kind": "FunctionDef",
+          "line": 325,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.providers",
+          "ast_sha256_without_imports": "a3035b408ba41916471278ac9ec9df09000055cbe820b5e13edc98a5d57ee701"
+        },
+        {
+          "name": "_validate_mla_query_shard",
+          "kind": "FunctionDef",
+          "line": 337,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.providers",
+          "ast_sha256_without_imports": "028c091f3c3b4260f84235b87bb39ebf00f5962f967b5fb6a0942ce680f37b8b"
+        },
+        {
+          "name": "_mla_proxy",
+          "kind": "FunctionDef",
+          "line": 391,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.providers",
+          "ast_sha256_without_imports": "31b1a009923924457f8d598a09d82a1869334103b8ffc31b11d871061f9ef184"
+        },
+        {
+          "name": "_kda_proxy",
+          "kind": "FunctionDef",
+          "line": 444,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.providers",
+          "ast_sha256_without_imports": "ff5183574ca3deb84c6b495155a36572cd95d7fd2c63684d40e0fcd1e1861c64"
+        },
+        {
+          "name": "_prepare_mla_workspace",
+          "kind": "FunctionDef",
+          "line": 462,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.providers",
+          "ast_sha256_without_imports": "39a0d9a3e3d43c00117caccd089239c5ea3bcd0245ed019150a70a4c22d9bb03"
+        },
+        {
+          "name": "PreparedAttention",
+          "kind": "ClassDef",
+          "line": 480,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.providers",
+          "ast_sha256_without_imports": "95e35dcf884ccc80415593d9fdbee7357e6a264bcb978474249e561f468d5f96"
+        },
+        {
+          "name": "ResourceSet",
+          "kind": "ClassDef",
+          "line": 492,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.providers",
+          "ast_sha256_without_imports": "3d064eb6da4064b60d704ea248cd66d013bff5291a22490face602e3e389d854"
+        },
+        {
+          "name": "build_resources",
+          "kind": "FunctionDef",
+          "line": 740,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.providers",
+          "ast_sha256_without_imports": "a6ee23cfb14bf83179bb0438a623a7aff175ac7c96780e98a8c827ffc6359ef7"
+        }
+      ]
+    },
+    {
+      "source": "sgl_nvidia_mega/kimi_k3/shape_policy.py",
+      "sha256": "c3a8e4506e93bf391919cea0af0d41072cd24ce720ce5eaa1e45b147c39e520b",
+      "targets": [
+        {
+          "module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.shape_policy",
+          "path": "srt/kernel_plugins/nvidia/kimi_k3/shape_policy.py"
+        }
+      ],
+      "symbols": [
+        {
+          "name": "prepared_widths",
+          "kind": "FunctionDef",
+          "line": 8,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.shape_policy",
+          "ast_sha256_without_imports": "f66696edf65a6846947f87b8ae09fdd00c416c8c3b694e7699f34f96780d864e"
+        }
+      ]
+    },
+    {
+      "source": "sgl_nvidia_mega/kimi_k3/skinny_projection.py",
+      "sha256": "751322017ab128c3a9917c37f28a4a61f922fe6ebe16a3ba4e03dcbecc607b67",
+      "targets": [
+        {
+          "module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.skinny_projection",
+          "path": "srt/kernel_plugins/nvidia/kimi_k3/skinny_projection.py"
+        }
+      ],
+      "symbols": [
+        {
+          "name": "_load_backend",
+          "kind": "FunctionDef",
+          "line": 31,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.skinny_projection",
+          "ast_sha256_without_imports": "649c8e98df901b2729e31e19e06be5e4cb20b59a345d20818f7163ee932388a4"
+        },
+        {
+          "name": "SkinnyProjection",
+          "kind": "ClassDef",
+          "line": 40,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.skinny_projection",
+          "ast_sha256_without_imports": "876b733203d465a5dbd0d065df1b94164be8507fcd6c4f9e149ff7f897cf39b3"
+        }
+      ]
+    },
+    {
+      "source": "sgl_nvidia_mega/kimi_k3/spec.py",
+      "sha256": "0eb4e7a489682fdd4a49c269d8b9b12942d2a9d0951885c04e7355acce1addb9",
+      "targets": [
+        {
+          "module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.spec",
+          "path": "srt/kernel_plugins/nvidia/kimi_k3/spec.py"
+        }
+      ],
+      "symbols": [
+        {
+          "name": "_deadline_ns",
+          "kind": "FunctionDef",
+          "line": 132,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.spec",
+          "ast_sha256_without_imports": "8f9b66e83ba1da26f2d3f5ccc5361067f4a27dbe42628136c928bca6a3167422"
+        },
+        {
+          "name": "_config_disable_reasons",
+          "kind": "FunctionDef",
+          "line": 156,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.spec",
+          "ast_sha256_without_imports": "356c2a7a0e42040dc9a2d4af7a2cc02f167ae188141dce91dfbbd691ef5f2da1"
+        },
+        {
+          "name": "_kernel_config_disable_reasons",
+          "kind": "FunctionDef",
+          "line": 186,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.spec",
+          "ast_sha256_without_imports": "79d231ec7a6d8c1edc5da8e1942d69f0bda857471db402101ac77e9aac76bcba"
+        },
+        {
+          "name": "_model_disable_reasons",
+          "kind": "FunctionDef",
+          "line": 241,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.spec",
+          "ast_sha256_without_imports": "40bfd617590c9e3a3a950b026ba36fa30badcf4dde1812447789b7281ac86405"
+        },
+        {
+          "name": "_call_option",
+          "kind": "FunctionDef",
+          "line": 273,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.spec",
+          "ast_sha256_without_imports": "447129804beddaa5bc87d2f19c55d9cc83199dd69fdba4a8db86223fb45d2bf2"
+        },
+        {
+          "name": "_Built",
+          "kind": "ClassDef",
+          "line": 279,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.spec",
+          "ast_sha256_without_imports": "11c2f8e4198fe55eb897e68499bcc47c6746baa5aae151f06963b4ca90915888"
+        },
+        {
+          "name": "_prepare",
+          "kind": "FunctionDef",
+          "line": 362,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.spec",
+          "ast_sha256_without_imports": "673813b049c738236b8c01b1976ee4065826e82386202e2f3316e38c78961ea3"
+        },
+        {
+          "name": "_build",
+          "kind": "FunctionDef",
+          "line": 369,
+          "target_module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.spec",
+          "ast_sha256_without_imports": "0e7790343c24ccca0341048fed64bc5d09174f206a16e84869ec171b06a03b80"
+        }
+      ]
+    },
+    {
+      "source": "sgl_nvidia_mega/kimi_k3/tensor_adapter.py",
+      "sha256": "d248c07c4481e59b0d43570fc92cea1e767eb829152876b86378a95594691761",
+      "targets": [
+        {
+          "module": "sglang.kernels.jit.kimi_k3.tensor_adapter",
+          "path": "kernels/jit/kimi_k3/tensor_adapter.py"
+        }
+      ],
+      "symbols": [
+        {
+          "name": "CUDAGraphCompatibleWrapper",
+          "kind": "ClassDef",
+          "line": 10,
+          "target_module": "sglang.kernels.jit.kimi_k3.tensor_adapter",
+          "ast_sha256_without_imports": "3394f4de4a448745068b1e08e98acdd33d70a54b1258e7d438d3bdc03c51499e"
+        },
+        {
+          "name": "to_cute",
+          "kind": "FunctionDef",
+          "line": 23,
+          "target_module": "sglang.kernels.jit.kimi_k3.tensor_adapter",
+          "ast_sha256_without_imports": "e537a01d8ee91c345f4ac8cae90a5d2a0821f95b49ae885c400a41abdd195cf7"
+        }
+      ]
+    }
+  ],
+  "mechanical_scope": "Original function/class ASTs are preserved except import repaths. Runtime namespace and explicit source inventory wiring are tracked separately.",
+  "wiring_changes": [
+    "providers.PAYLOAD_PACKAGE: use in-tree runtime namespace",
+    "providers._module: explicit canonical host module map",
+    "providers.build_resources: validate and inventory the full mapped source closure before resource creation",
+    "source_manifest: enumerate and hash all SRT/ops/JIT source files and provenance artifacts; reject missing files"
+  ],
+  "generated_modules": [
+    {
+      "module": "sglang.kernels.jit.kimi_k3",
+      "path": "kernels/jit/kimi_k3/__init__.py"
+    },
+    {
+      "module": "sglang.kernels.ops.attention.kimi_k3_specialized",
+      "path": "kernels/ops/attention/kimi_k3_specialized/__init__.py"
+    },
+    {
+      "module": "sglang.kernels.ops.communication.kimi_k3_specialized",
+      "path": "kernels/ops/communication/kimi_k3_specialized/__init__.py"
+    },
+    {
+      "module": "sglang.kernels.ops.embeddings.kimi_k3_specialized",
+      "path": "kernels/ops/embeddings/kimi_k3_specialized/__init__.py"
+    },
+    {
+      "module": "sglang.kernels.ops.gemm.kimi_k3_specialized",
+      "path": "kernels/ops/gemm/kimi_k3_specialized/__init__.py"
+    },
+    {
+      "module": "sglang.kernels.ops.layernorm.kimi_k3_specialized",
+      "path": "kernels/ops/layernorm/kimi_k3_specialized/__init__.py"
+    },
+    {
+      "module": "sglang.kernels.ops.memory.kimi_k3_specialized",
+      "path": "kernels/ops/memory/kimi_k3_specialized/__init__.py"
+    },
+    {
+      "module": "sglang.kernels.ops.moe.kimi_k3_specialized",
+      "path": "kernels/ops/moe/kimi_k3_specialized/__init__.py"
+    },
+    {
+      "module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.source_manifest",
+      "path": "srt/kernel_plugins/nvidia/kimi_k3/source_manifest.py"
+    }
+  ],
+  "kernel_entrypoints": [
+    "sglang.kernels.ops.attention.kimi_k3_specialized.kda:KdaSplit.__call__",
+    "sglang.kernels.ops.attention.kimi_k3_specialized.mla_value:MlaValue.__call__",
+    "sglang.kernels.ops.communication.kimi_k3_specialized.experts:ExpertsGroupKernel.__call__",
+    "sglang.kernels.ops.communication.kimi_k3_specialized.experts:ExpertsKernel.__call__",
+    "sglang.kernels.ops.communication.kimi_k3_specialized.experts:ExpertsPlanKernel.__call__",
+    "sglang.kernels.ops.communication.kimi_k3_specialized.front_tp16:MoeFrontTP16.__call__",
+    "sglang.kernels.ops.communication.kimi_k3_specialized.front_tp8:MoeFrontTP8.__call__",
+    "sglang.kernels.ops.communication.kimi_k3_specialized.front_tp8:MoeSharedTP8.__call__",
+    "sglang.kernels.ops.communication.kimi_k3_specialized.front_tp8:SharedSituTables.__call__",
+    "sglang.kernels.ops.communication.kimi_k3_specialized.mla_dcp:DcpValue.__call__",
+    "sglang.kernels.ops.communication.kimi_k3_specialized.mla_query:MlaQuery.__call__",
+    "sglang.kernels.ops.communication.kimi_k3_specialized.moe_tail:MoeTail.__call__",
+    "sglang.kernels.ops.communication.kimi_k3_specialized.moe_tail:WaveMoeTail.__call__",
+    "sglang.kernels.ops.communication.kimi_k3_specialized.oproj_consumer:OprojConsumer.__call__",
+    "sglang.kernels.ops.communication.kimi_k3_specialized.oproj_consumer:OprojFused.__call__",
+    "sglang.kernels.ops.communication.kimi_k3_specialized.oproj_producer:OprojProducer.__call__",
+    "sglang.kernels.ops.communication.kimi_k3_specialized.oproj_producer:OprojUmma.__call__",
+    "sglang.kernels.ops.communication.kimi_k3_specialized.shared:SharedDown.__call__",
+    "sglang.kernels.ops.communication.kimi_k3_specialized.shared:SharedUmma.__call__",
+    "sglang.kernels.ops.communication.kimi_k3_specialized.ws_gemm:WsGemm.__call__",
+    "sglang.kernels.ops.embeddings.kimi_k3_specialized.embedding:EmbeddingGather.__call__",
+    "sglang.kernels.ops.gemm.kimi_k3_specialized.splitk:SplitKGemm.__call__",
+    "sglang.kernels.ops.layernorm.kimi_k3_specialized.attn_res:ClusterAttnRes.__call__",
+    "sglang.kernels.ops.memory.kimi_k3_specialized.prefetch:L2Prefetch.__call__",
+    "sglang.kernels.ops.moe.kimi_k3_specialized.dense:DenseSitu.__call__",
+    "sglang.kernels.ops.moe.kimi_k3_specialized.front:RouteSitu.__call__",
+    "sglang.kernels.ops.moe.kimi_k3_specialized.small_batch_experts:ClusterExpertsTP16.__call__",
+    "sglang.kernels.ops.moe.kimi_k3_specialized.small_batch_experts:ClusterExpertsTP8.__call__"
+  ],
+  "mixed_sources": [
+    "cutedsl/common/host.py",
+    "cutedsl/common/embedding.py",
+    "cutedsl/common/twoshot.py",
+    "cutedsl/mla/dcp.py",
+    "cutedsl/moe/dense.py",
+    "cutedsl/moe/front.py",
+    "cutedsl/moe/shared.py",
+    "cutedsl/moe/small_batch/front_tp16.py"
+  ]
+}
