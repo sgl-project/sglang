@@ -25,6 +25,7 @@ from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layer_boundary import layer_stack
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.utils import get_num_fused_shared_experts
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -43,7 +44,7 @@ from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models import deepseek_v4_boundary as hc_boundary
 from sglang.srt.models import deepseek_v4_mhc as mhc
-from sglang.srt.models.dbrx import ReplicatedLinear
+from sglang.srt.models.deepseek_common.utils import _is_cuda
 from sglang.srt.models.deepseek_v4 import (
     DEEPSEEK_V4_STACKED_PARAMS_MAPPING,
     DeepseekV4CudaDecoderLayer,
@@ -52,7 +53,6 @@ from sglang.srt.models.deepseek_v4 import (
     MqaAttentionBase,
     _apply_wo_a_bf16_matmul,
     _dequant_fp8_wo_a_streaming,
-    _is_cuda,
     hc_head_torch,
     make_hc_head_params,
 )
@@ -920,9 +920,10 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                 "DeepseekV4ForCausalLMDSpark requires the target embed_tokens "
                 "(call attach_shared_modules first)."
             )
-        x = self.embed_tokens(input_ids)
-        x = x.unsqueeze(1).repeat(1, self.hc_mult, 1)
-        return x
+        return self._expand_hc(self.embed_tokens(input_ids))
+
+    def _expand_hc(self, embeds: torch.Tensor) -> torch.Tensor:
+        return embeds.unsqueeze(1).repeat(1, self.hc_mult, 1)
 
     def forward(
         self,
@@ -948,6 +949,8 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
     def _forward_impl(self, input_ids, positions, forward_batch, input_embeds):
         if input_embeds is None:
             input_embeds = self.forward_embed(input_ids)
+        elif input_embeds.dim() == 2:
+            input_embeds = self._expand_hc(input_embeds)
         x = input_embeds
         pre = None
         if _is_cuda:

@@ -152,6 +152,13 @@ jobs:
         working-directory: sgl-router
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
+      # The opt-in `fips` feature (aws-lc-rs FIPS module) is cfg-gated code
+      # no other job compiles. aws-lc-fips-sys builds with cmake, Go and
+      # clang, which the GitHub-hosted Ubuntu image ships.
+      - name: cargo clippy (fips feature)
+        working-directory: sgl-router
+        run: cargo clippy --locked --all-targets --features fips -- -D warnings
+
       - name: cargo fmt
         working-directory: sgl-router
         run: |
@@ -358,8 +365,8 @@ jobs:
           cargo build --locked --release --workspace
 
       # Install SGLang from the local checkout in editable mode (no PyPI
-      # version pin) — mirrors `pr-test-rust.yml` so the router e2e runs
-      # against whatever SGLang version is on the branch. Replaces the
+      # version pin) so the router e2e runs against whatever SGLang version
+      # is on the branch. Replaces the
       # previous `pip install sglang[srt]==X.Y.Z` pin, which forced the
       # e2e to test against a stale wheel and would silently miss any
       # new ServerArgs field (e.g. `disaggregation_mode` /

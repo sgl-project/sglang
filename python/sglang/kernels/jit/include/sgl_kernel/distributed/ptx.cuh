@@ -1,8 +1,9 @@
 #pragma once
 
 // Inline PTX the distributed collectives need and no CUDA intrinsic covers:
-// system-scope flag traffic, multicast (NVLS) reductions, and the 16B
-// vectorized global accesses the reduce loops are built on.
+// system-scope flag traffic, multicast (NVLS) reductions, the 16B vectorized
+// global accesses the reduce loops are built on, and self-tagged 64-bit
+// payloads.
 //
 // One header rather than a copy per kernel: before this existed the multimem
 // flag increments had three identical definitions, and the 16B helpers were
@@ -234,6 +235,28 @@ SGL_DEVICE void multimem_red_add_release(uint32_t* mc_ptr, uint32_t val) {
 #endif
 }
 
+// ---------------------------------------------------------------------------
+// Self-tagged 64-bit payloads
+//
+// An entry that carries its own epoch tag next to its payload needs no flag: a
+// relaxed 8-byte access is single-copy atomic, so a reader that sees the
+// current tag sees the payload written with it.
+// ---------------------------------------------------------------------------
+
+SGL_DEVICE uint64_t load_relaxed_sys(const uint64_t* ptr) {
+  uint64_t val;
+  asm volatile("ld.relaxed.sys.global.u64 %0, [%1];" : "=l"(val) : "l"(ptr) : "memory");
+  return val;
+}
+
+SGL_DEVICE void store_relaxed_sys(uint64_t* ptr, uint64_t val) {
+  asm volatile("st.relaxed.sys.global.u64 [%0], %1;" : : "l"(ptr), "l"(val) : "memory");
+}
+
+SGL_DEVICE void multimem_store_relaxed(uint64_t* mc_ptr, uint64_t val) {
+  asm volatile("multimem.st.relaxed.sys.global.b64 [%0], %1;" : : "l"(mc_ptr), "l"(val) : "memory");
+}
+
 #else  // USE_ROCM
 
 // The same vocabulary on AMD GPUs. `.sys` maps to the system memory scope (the
@@ -349,6 +372,18 @@ SGL_DEVICE void multimem_red_add_relaxed(uint32_t*, uint32_t) {
 
 SGL_DEVICE void multimem_red_add_release(uint32_t*, uint32_t) {
   assert(false && "multimem red is not supported on ROCm");
+}
+
+SGL_DEVICE uint64_t load_relaxed_sys(const uint64_t* ptr) {
+  return __hip_atomic_load(const_cast<uint64_t*>(ptr), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+}
+
+SGL_DEVICE void store_relaxed_sys(uint64_t* ptr, uint64_t val) {
+  __hip_atomic_store(ptr, val, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+}
+
+SGL_DEVICE void multimem_store_relaxed(uint64_t*, uint64_t) {
+  assert(false && "multimem store is not supported on ROCm");
 }
 
 #endif  // USE_ROCM
