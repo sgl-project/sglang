@@ -290,6 +290,27 @@ class TestHiCacheAutoSize(CustomTestCase):
         self.assertEqual(names[:2], ["free", "barrier"])
         calls.barrier.assert_called_once_with(group="cpu")
 
+    def test_explicit_size_books_the_snapshot_without_an_sglang_world_group(self):
+        """A process can initialize torch.distributed without building the sglang
+        world group; an explicit size must still book its snapshot, not raise."""
+        with (
+            get_context().override_server_args(
+                enable_hierarchical_cache=True, hicache_host_memory_fraction=None
+            ),
+            patch.object(base, "ranks_per_host", return_value=1),
+            patch.object(
+                base,
+                "available_host_memory_bytes",
+                return_value=base.HICACHE_HOST_MEMORY_RESERVE_BYTES + 1000,
+            ),
+            patch.object(torch.distributed, "is_initialized", return_value=True),
+            patch.object(
+                sizing, "get_parallel", side_effect=RuntimeError("no world group")
+            ),
+            sizing.auto_size_hicache(None, None, enabled=True),
+        ):
+            self.assertEqual(base.host_memory_budget_bytes(), 1000)
+
     def test_deepseek_v4_host_pools_book_the_snapshot(self):
         alloc = Mock(return_value=torch.empty(1, dtype=torch.uint8))
         state_infos = [

@@ -94,13 +94,24 @@ def _estimate_hicache_bytes(
     return total + sum(_draft_bytes(pool, draft) for draft in drafts)
 
 
+def _world_cpu_group():
+    """None when this process has no sglang world group to synchronize with."""
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return None
+    try:
+        return get_parallel().world_group.cpu_group
+    except (RuntimeError, ValueError):
+        return None
+
+
 @contextmanager
 def _explicit_size_budget():
     """Book explicitly sized host pools against a snapshot taken before any rank
     allocates; re-sampling per pool charges a late rank for its peers' pools."""
     budget = host_memory_budget_bytes()
-    if torch.distributed.is_initialized():
-        torch.distributed.barrier(group=get_parallel().world_group.cpu_group)
+    group = _world_cpu_group()
+    if group is not None:
+        torch.distributed.barrier(group=group)
     with host_memory_budget_scope(budget):
         yield
 
@@ -128,12 +139,11 @@ def auto_size_hicache(
     ratio = min(requested, budget * (1 - _ALLOCATION_SLACK_FRACTION) / device_bytes)
     # One collective before any pool is built: PP stages own different pool
     # counts, so a per-pool collective could deadlock.
-    if torch.distributed.is_initialized():
+    group = _world_cpu_group()
+    if group is not None:
         value = torch.tensor([ratio], dtype=torch.float64)
         torch.distributed.all_reduce(
-            value,
-            op=torch.distributed.ReduceOp.MIN,
-            group=get_parallel().world_group.cpu_group,
+            value, op=torch.distributed.ReduceOp.MIN, group=group
         )
         ratio = value.item()
     if ratio <= 0:
