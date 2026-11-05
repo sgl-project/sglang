@@ -17,6 +17,7 @@ from sglang.srt.arg_groups.model_overrides import embedding_gemma2  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import ernie45_vl  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import exaone  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import falcon_h1  # noqa: F401
+from sglang.srt.arg_groups.model_overrides import flint  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import gemma2_gemma3  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import gemma4  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import gigachat35  # noqa: F401
@@ -36,9 +37,11 @@ from sglang.srt.arg_groups.model_overrides import minimax_m2  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import minimax_m3  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import moss_vl  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import muse_glimmer  # noqa: F401
+from sglang.srt.arg_groups.model_overrides import nemotron3_embedding  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import nemotron_h  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import olmo2  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import qwen3_5  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import qwen3_moe  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import qwen3_vl  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import qwen4_exp  # noqa: F401
+from sglang.srt.arg_groups.model_overrides import unlimited_ocr_v2  # noqa: F401
