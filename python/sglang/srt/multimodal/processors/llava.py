@@ -44,6 +44,7 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
         LlavaMistralForCausalLM,
     ]
     gpu_image_decode = False  # Llava processes loaded image as PIL image explicitly
+    npu_image_decode = False
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
@@ -64,7 +65,7 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
         image_processor = processor.image_processor
 
         try:
-            image, image_size = load_image(image_input, False)
+            image, image_size = load_image(image_input, False, npu_image_decode=False)
             if image_size is not None:
                 # It is a video with multiple images
                 pixel_values = image_processor(image)["pixel_values"]
