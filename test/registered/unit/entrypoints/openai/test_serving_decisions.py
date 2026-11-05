@@ -410,6 +410,19 @@ class TestDecisions(unittest.IsolatedAsyncioTestCase):
                     self.tokenizer.decode(prompts[0]).endswith(f" {note}\n")
                 )
 
+    async def test_request_chat_template_is_rejected_by_default(self):
+        manager = ScoringManager(self.tokenizer)
+        question = {"q": _question("choice", {"a": None, "b": None})}
+        request = _request(
+            "s", question, chat_template_kwargs={"chat_template": "{{ messages }}"}
+        )
+        response = await _handler(manager).handle_request(request, None)
+        self.assertEqual(response.status_code, 400)
+        self.assertIn(
+            "--trust-request-chat-template", json.loads(response.body)["message"]
+        )
+        self.assertEqual(manager.requests, [])
+
     def test_label_check_skips_the_text_before_the_last_added_token(self):
         encoded = []
         tokenizer = SimpleNamespace(
@@ -885,6 +898,7 @@ class TestDecisions(unittest.IsolatedAsyncioTestCase):
                     manager = ScoringManager(
                         self.tokenizer,
                         allow_auto_truncate=message == "--allow-auto-truncate",
+                        trust_request_chat_template=True,
                     )
                     if message == "--enable-multimodal":
                         manager.model_config.is_multimodal = False
@@ -995,6 +1009,19 @@ class TestSystemOne(unittest.IsolatedAsyncioTestCase):
             serving_class=SystemOneServing,
             **kwargs,
         )
+
+    async def test_request_chat_template_is_rejected_by_default(self):
+        manager = ScoringManager(self.tokenizer)
+        request = _systemone_request(
+            {"urgent": {"type": "noul", "instructions": "Urgent?"}},
+            chat_template_kwargs={"chat_template": "{{ messages }}"},
+        )
+        response = await self._serving(manager).handle_request(request, None)
+        self.assertEqual(response.status_code, 400)
+        self.assertIn(
+            "--trust-request-chat-template", json.loads(response.body)["message"]
+        )
+        self.assertEqual(manager.requests, [])
 
     async def test_decision_checkpoints_answer_with_their_trained_prompt(self):
         """The prompt literal is decision_messages of perplexity-ai/pplx-decider-v1-27b."""
