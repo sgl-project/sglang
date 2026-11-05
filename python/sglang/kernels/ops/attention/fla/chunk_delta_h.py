@@ -35,6 +35,16 @@ def _num_compute_units(device_index: int) -> int:
     return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
+@functools.lru_cache(maxsize=None)
+def _supports_chunk_h_three_stages(device_index: int) -> bool:
+    # MI300 CI (gfx942) OOMs shared memory at num_stages=3 (67584 > 65536).
+    # Keep the longer-sequence staging only on gfx950 (MI355X), where the
+    # measured Qwen3.5 prefill configs fit.
+    props = torch.cuda.get_device_properties(device_index)
+    arch = getattr(props, "gcnArchName", "") or getattr(props, "name", "")
+    return "gfx950" in arch
+
+
 def _select_chunk_h_config(
     N: int, H: int, V: int, NT: int, is_varlen: bool, device_index: int
 ) -> tuple[int, int]:
@@ -52,7 +62,11 @@ def _select_chunk_h_config(
     stages_env = os.getenv("SGLANG_GDN_CHUNK_H_NUM_STAGES")
     if stages_env is None:
         chunks_per_seq = NT // max(N, 1) if is_varlen else NT
-        num_stages = 3 if chunks_per_seq >= 32 else 2
+        num_stages = (
+            3
+            if chunks_per_seq >= 32 and _supports_chunk_h_three_stages(device_index)
+            else 2
+        )
     else:
         num_stages = int(stages_env)
     return BV, num_stages

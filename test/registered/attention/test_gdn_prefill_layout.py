@@ -266,6 +266,9 @@ class TestGdnContracts(CustomTestCase):
         with (
             mock.patch.dict(os.environ, {}, clear=False),
             mock.patch.object(chunk_delta_h, "_num_compute_units", return_value=256),
+            mock.patch.object(
+                chunk_delta_h, "_supports_chunk_h_three_stages", return_value=True
+            ),
         ):
             os.environ.pop("SGLANG_GDN_CHUNK_H_BV", None)
             os.environ.pop("SGLANG_GDN_CHUNK_H_NUM_STAGES", None)
@@ -284,6 +287,13 @@ class TestGdnContracts(CustomTestCase):
                 ],
                 [(16, 3), (16, 3), (16, 2), (32, 3), (64, 2), (64, 3)],
             )
+            # Non-gfx950 targets (e.g. MI300 CI) must stay at 2 stages so the
+            # long-prompt launch fits in 64 KiB LDS.
+            with mock.patch.object(
+                chunk_delta_h, "_supports_chunk_h_three_stages", return_value=False
+            ):
+                self.assertEqual(select(1, 32, 8, 32, False, 0), (16, 2))
+                self.assertEqual(select(4, 32, 128, 128, True, 0), (64, 2))
 
     def _forwarded_norm_switch(self, **kwargs) -> bool:
         from sglang.srt.layers.attention.linear.kernels import gdn_triton
