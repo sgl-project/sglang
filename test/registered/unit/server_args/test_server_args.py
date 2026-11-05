@@ -785,6 +785,7 @@ class TestPrepareServerArgs(CustomTestCase):
                 speculative_num_draft_tokens=6,
                 moe_a2a_backend="megamoe",
                 disaggregation_mode="decode",
+                enable_mxfp4_mega=False,
             )
 
         self.assertEqual(

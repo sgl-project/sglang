@@ -11,6 +11,7 @@ from unittest.mock import ANY, Mock, call, patch
 import numpy as np
 import torch
 import torch.distributed as dist
+import zmq
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager
@@ -1514,6 +1515,7 @@ class TestHeteroTpSwaStateTransfer(CustomTestCase):
             state_dim_per_tensor=[[]],
             state_layer_ids=[[]],
             swa_kv_cache_layout="nhd",
+            state_cp_size=1,
         )
         return prefill
 
@@ -1706,7 +1708,7 @@ class TestStagingWatermark(unittest.TestCase):
 
     def test_new_watermark_subscriber_receives_current_allocator_state(self):
         sock = Mock()
-        bootstrap_info = {"host": "prefill", "port": 7200}
+        bootstrap_info = {"rank_ip": "prefill", "rank_port": 7200}
         receiver = Mock(
             bootstrap_infos=[bootstrap_info],
         )
@@ -1714,13 +1716,16 @@ class TestStagingWatermark(unittest.TestCase):
         handler = object.__new__(DecodeStagingHandler)
         handler.staging_allocator = Mock()
         handler.staging_allocator.get_watermark.return_value = (3, 0)
+        handler._lock = threading.RLock()
         handler._wm_subscribers = {}
+        handler._pending_watermarks = {}
 
         handler.register_wm_subscriber(receiver, "session-new")
 
         sock.send_multipart.assert_called_once_with(
-            [b"WATERMARK", b"3", b"0", b"session-new"]
+            [b"WATERMARK", b"3", b"0", b"session-new"], flags=zmq.NOBLOCK
         )
+        self.assertEqual(handler._pending_watermarks, {})
 
 
 class TestStagingScatterLifecycle(CustomTestCase):
@@ -1994,6 +1999,7 @@ class TestMooncakePPStaging(unittest.TestCase):
         sock = Mock()
         receiver = SimpleNamespace(
             chunk_staging_infos=[],
+            prefill_info=SimpleNamespace(ring_cp_sharded=False),
             _connect_to_bootstrap_server=Mock(return_value=(sock, threading.Lock())),
         )
         allocator = SimpleNamespace(
@@ -2026,13 +2032,16 @@ class TestMooncakePPStaging(unittest.TestCase):
     )
     def test_pp_stage_writes_its_global_layer_slots(self, gather):
         manager = object.__new__(MooncakeKVManager)
-        tensor = SimpleNamespace(shape=(1, 1, 8), element_size=lambda: 2)
+        tensor = torch.empty((6, 4, 8), dtype=torch.bfloat16)
         manager.kv_buffer_tensors = {
             "k_buffers": [tensor],
             "v_buffers": [tensor],
             "page_size": 2,
+            "slot_ids": [("target", "k", 7), ("target", "v", 7)],
         }
         manager.attn_tp_size = 1
+        manager.attn_cp_size, manager.attn_cp_rank = 1, 0
+        manager.ring_cp_sharded = False
         manager.pp_size = 16
         manager.kv_args = SimpleNamespace(
             engine_rank=0,
@@ -2040,6 +2049,7 @@ class TestMooncakePPStaging(unittest.TestCase):
             total_kv_head_num=4,
             kv_head_num=4,
             kv_layer_ids=[7, 7],
+            page_size=2,
         )
         manager._transfer_data = Mock(return_value=0)
         staging = SimpleNamespace(fits=lambda size: True, get_ptr=lambda: 0x9000)
@@ -2051,7 +2061,7 @@ class TestMooncakePPStaging(unittest.TestCase):
             dst_staging_size=1 << 20,
             dst_tp_rank=0,
             dst_attn_tp_size=16,
-            dst_kv_item_len=128,
+            dst_kv_item_len=32,
             dst_layer_ids=[3, 7, 11, 3, 7, 11],
             staging_buffer=staging,
         )
