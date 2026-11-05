@@ -145,21 +145,21 @@ class TestServerArgsPositionalOrder(CustomTestCase):
             (95, "disable_attn_tp_gather"),
             (96, "enable_p2p_check"),
             (97, "device"),
-            (535, "grpc_response_timeout_secs"),
-            (536, "enable_paged_experts"),
-            (537, "paged_experts_num_resident"),
-            (538, "enable_nvidia_megakernel"),
-            (539, "enable_megamoe_for_layernorm_sp"),
+            (532, "grpc_response_timeout_secs"),
+            (533, "enable_paged_experts"),
+            (534, "paged_experts_num_resident"),
+            (535, "enable_nvidia_megakernel"),
+            (536, "enable_megamoe_for_layernorm_sp"),
         ):
             with self.subTest(index=index):
                 self.assertEqual(fields[index].name, name)
         defaults = ServerArgs(model_path="dummy")
         # Surviving legacy inputs retain their slots after an intentional removal.
-        positional = [getattr(defaults, field.name) for field in fields[:536]]
+        positional = [getattr(defaults, field.name) for field in fields[:533]]
         positional[95] = True
         positional[96] = False
         positional[97] = "cpu"
-        positional[535] = 123.0
+        positional[532] = 123.0
 
         args = ServerArgs(*positional)
 
@@ -1375,23 +1375,19 @@ class TestKV4Compatibility(unittest.TestCase):
 class TestLoraForwardDomains(unittest.TestCase):
     def test_rejects_concurrent_forwards(self):
         for runner in ("auto", "lora_cutedsl"):
-            for options in (
-                {"enable_pdmux": True},
-                {"enable_two_batch_overlap": True},
-            ):
-                with self.subTest(runner=runner, options=options):
-                    args = ServerArgs(
-                        model_path="dummy",
-                        tp_size=2,
-                        enable_lora=True,
-                        lora_backend="triton_v2",
-                        moe_runner_backend=runner,
-                        max_lora_rank=8,
-                        lora_target_modules=["down_proj"],
-                        **options,
-                    )
-                    with self.assertRaises(ValueError):
-                        check_lora_server_args(args)
+            with self.subTest(runner=runner):
+                args = ServerArgs(
+                    model_path="dummy",
+                    tp_size=2,
+                    enable_lora=True,
+                    lora_backend="triton_v2",
+                    moe_runner_backend=runner,
+                    max_lora_rank=8,
+                    lora_target_modules=["down_proj"],
+                    enable_two_batch_overlap=True,
+                )
+                with self.assertRaises(ValueError):
+                    check_lora_server_args(args)
 
 
 class TestLoadBalanceMethod(unittest.TestCase):
@@ -2755,6 +2751,32 @@ class TestHiCacheArgs(CustomTestCase):
         self.assertEqual(resolution_result(args, "hicache_io_backend"), "kernel")
         self.assertEqual(resolution_result(args, "hicache_mem_layout"), "page_first")
         self.assertIsNone(resolution_result(args, "decode_attention_backend"))
+
+    def test_prefill_weight_versions_rejects_hierarchical_cache(self):
+        """KV restored from a host or storage tier carries no weight version, so the two cannot combine."""
+        args = self._make_args(
+            enable_prefill_weight_versions=True,
+            enable_hierarchical_cache=True,
+        )
+
+        with self.assertRaisesRegex(ValueError, "enable-hierarchical-cache"):
+            handle_cache_compatibility(args)
+
+    def test_prefill_weight_versions_rejects_disaggregation(self):
+        """PD prefill workers do not stamp prompt tokens yet, so the flag is refused there."""
+        args = self._make_args(
+            enable_prefill_weight_versions=True,
+            disaggregation_mode="prefill",
+        )
+
+        with self.assertRaisesRegex(ValueError, "disaggregation"):
+            handle_cache_compatibility(args)
+
+    def test_prefill_weight_versions_alone_is_accepted(self):
+        """A plain engine may report prompt weight versions."""
+        args = self._make_args(enable_prefill_weight_versions=True)
+
+        handle_cache_compatibility(args)
 
     def test_decode_offload_rejects_host_pool_retraction(self):
         args = self._make_args(
@@ -5159,6 +5181,36 @@ class TestLazyReexports(CustomTestCase):
     def test_an_unknown_attribute_still_raises(self):
         with self.assertRaises(AttributeError):
             server_args_module.NotAThing
+
+
+class TestPrefillWeightVersionCompatibility(CustomTestCase):
+    def test_untracked_kv_paths_rejected(self) -> None:
+        """Reject paths that load or produce KV without preserving provenance."""
+        for overrides in [
+            {"enable_unified_memory": True},
+            {"enable_encoder_swa_bounded_replay": True},
+            {"enable_lmcache": True},
+            {"enable_unified_cache_external_linker": True},
+            {"dllm_algorithm": "LowConfidence"},
+            {"speculative_algorithm": "NGRAM"},
+            {"speculative_algorithm": "UNO"},
+            {"speculative_algorithm": "DSPARK"},
+        ]:
+            with self.subTest(overrides=overrides):
+                args = ServerArgs(
+                    model_path="dummy", enable_prefill_weight_versions=True, **overrides
+                )
+                with self.assertRaisesRegex(
+                    ValueError, "enable-prefill-weight-versions"
+                ):
+                    handle_cache_compatibility(args)
+
+    def test_rust_response_without_provenance_rejected(self) -> None:
+        """Reject the Rust response path that cannot serialize prompt versions."""
+        args = ServerArgs(model_path="dummy", enable_prefill_weight_versions=True)
+        with envs.SGLANG_RUST_SERVER.override(True):
+            with self.assertRaisesRegex(ValueError, "SGLANG_RUST_SERVER"):
+                handle_cache_compatibility(args)
 
 
 if __name__ == "__main__":

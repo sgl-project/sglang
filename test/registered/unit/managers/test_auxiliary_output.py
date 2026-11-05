@@ -503,65 +503,6 @@ def test_scheduler_preserves_pipeline_parallel_output_for_transport():
     scheduler.device_module.Event.assert_not_called()
 
 
-def test_pdmux_split_prefill_schedules_auxiliary_output_copy():
-    device_output = DeviceOutput(torch.tensor([1.0]))
-    result = GenerationBatchResult(
-        logits_output=LogitsProcessorOutput(
-            next_token_logits=None,
-            auxiliary_device_output=device_output,
-        ),
-        next_token_ids=torch.tensor([7]),
-    )
-    copy_done = CopyDone()
-    scheduler = object.__new__(Scheduler)
-    scheduler.scheduler_stage_metrics = None
-    scheduler.metrics_reporter = Mock()
-    scheduler.forward_ct = 0
-    scheduler.processed_tokens_counter = 0
-    scheduler._sched_idled = False
-    scheduler.scripted_scheduler_hook = None
-    scheduler.profiler_manager = SimpleNamespace(_profile_batch_predicate=Mock())
-    scheduler.forward_sleep_time = None
-    scheduler.disaggregation_mode = None
-    scheduler.is_generation = True
-    scheduler.enable_overlap = False
-    scheduler.enable_pdmux = True
-    scheduler.enable_unified_cache_external_linker = False
-    scheduler.tp_worker = SimpleNamespace(
-        forward_batch_split_prefill=Mock(return_value=result)
-    )
-    scheduler.future_map = object()
-    scheduler._relay_forward_payload = Mock()
-    scheduler.device_module = SimpleNamespace(Event=Mock(return_value=copy_done))
-    scheduler.attn_dp_enabled = False
-    batch = SimpleNamespace(
-        forward_mode=SimpleNamespace(
-            is_prebuilt=lambda: False,
-            is_split_prefill=lambda: True,
-        ),
-        split_index=0,
-        reqs=[],
-        req_pool_indices=torch.tensor([3]),
-        input_ids=torch.tensor([5]),
-        extend_num_tokens=1,
-        return_logprob=False,
-        return_hidden_states=False,
-    )
-
-    with (
-        published_topology(),
-        patch(
-            "sglang.srt.managers.scheduler.resolve_forward_inputs"
-        ) as resolve_forward_inputs,
-    ):
-        output_result = Scheduler.run_batch(scheduler, batch)
-
-    resolve_forward_inputs.assert_called_once_with(batch, scheduler.future_map)
-    assert output_result is result
-    assert result.auxiliary_host_output.values.tolist() == [1.0]
-    assert copy_done.record_count == 1
-
-
 def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
     host_output = HostOutput(torch.tensor([1.0]))
     copy_done = SimpleNamespace(synchronize=Mock())

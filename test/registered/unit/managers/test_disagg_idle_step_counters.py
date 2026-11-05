@@ -12,7 +12,6 @@ from unittest.mock import Mock, patch
 from parameterized import parameterized
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.distributed import parallel_state
 from sglang.srt.environ import envs
 from sglang.srt.managers import scheduler as scheduler_module
 from sglang.srt.managers.io_struct import (
@@ -39,7 +38,6 @@ LAUNCH_TIMESTAMPS = (0.0, 0.125, 1.0, 1.125)
 # Prefill busy time is charged launch -> result, so the result clock matters too.
 RESULT_TIMESTAMPS = tuple(ts + 0.1 for ts in LAUNCH_TIMESTAMPS)
 PP_MODULE = "sglang.srt.managers.scheduler_pp_mixin"
-PDMUX_MODULE = "sglang.srt.multiplex.multiplexing_mixin"
 
 
 class _BeforeModelForward(Exception):
@@ -208,43 +206,6 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
                             0 if pending_transfer else 1 + (pattern == "idle_cycle"),
                         )
 
-    def test_pdmux_idle_gap(self):
-        for idle_iterations in (0, 1, 2):
-            with self.subTest(idle_iterations=idle_iterations):
-                batches = self.make_batches(ForwardMode.DECODE)
-                schedule = batches[:2] + [None] * idle_iterations + batches[2:] + [None]
-                scheduler = self.make_scheduler(schedule)
-                scheduler.stream_groups = [(Mock(), Mock())]
-                scheduler.sm_counts = [(80, 52)]
-                scheduler.split_prefill_batch = None
-                scheduler.update_split_prefill_batch = lambda sm_count, running_batch: (
-                    False,
-                    running_batch,
-                )
-                scheduler.update_running_batch = Mock(
-                    side_effect=[batch or ScheduleBatch(reqs=[]) for batch in schedule]
-                )
-                with (
-                    patch(f"{PDMUX_MODULE}.get_current_stream_idx", return_value=0),
-                    patch(f"{PDMUX_MODULE}.torch.cuda.empty_cache"),
-                    patch(
-                        f"{PDMUX_MODULE}.torch.cuda.stream",
-                        side_effect=lambda stream: nullcontext(),
-                    ),
-                    # PD multiplexing requires a separate prefill communicator.
-                    patch.object(
-                        parallel_state,
-                        "_PDMUX_PREFILL_TP_GROUP",
-                        SimpleNamespace(world_size=1, rank_in_group=0),
-                    ),
-                ):
-                    self.run_and_check(
-                        scheduler,
-                        Scheduler.event_loop_pdmux,
-                        ForwardMode.DECODE,
-                        idle_iterations > 0,
-                    )
-
     @parameterized.expand([("fresh", False), ("chained", True)])
     def test_mlx_idle_gap(self, name, chained):
         module = load_mlx_scheduler_module()
@@ -327,26 +288,6 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.result_queue = deque([pending])
 
         self.assertEqual(scheduler.collect_inflight_reqs(), {req})
-
-    def test_split_prefill_is_charged_once_from_its_first_chunk(self):
-        # A split prefill spans several run_batch calls but yields one result,
-        # so only its first chunk may set the burst's start and its idle flag.
-        scheduler = self.make_scheduler([])
-        scheduler._sched_idled = True
-        batch = self.make_batch(ForwardMode.SPLIT_PREFILL)
-        for split_index, launch_ts in enumerate((0.0, 0.2, 0.4)):
-            batch.split_index = split_index
-            self.launch_batch(scheduler, batch, launch_ts)
-
-        self.assertEqual(scheduler.forward_ct, 3)
-        self.assertEqual(batch.forward_iter, 3)
-        self.assertEqual(batch.split_prefill_start, (1, 0.0))
-        self.assertTrue(batch.after_idle_gap)
-
-        self.record_result(scheduler, batch, 0.5)
-        # One charge for the whole burst: first chunk's launch to the result.
-        self.assertEqual(scheduler.total_prefill_busy_us, total_us([0.5 - 0.0]))
-        self.assertEqual(scheduler.total_prefill_uncached_tokens, 1024)
 
     def test_a_prefill_is_not_charged_for_an_overlapping_earlier_one(self):
         # An overlapped launch can precede the previous prefill's result; the

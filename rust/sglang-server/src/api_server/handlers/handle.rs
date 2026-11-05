@@ -64,6 +64,9 @@ pub(crate) struct CoreMetadata {
     pub(super) deployment_info: crate::message::config::DeploymentInfo,
     pub(super) launch_server_info: Arc<serde_json::Map<String, serde_json::Value>>,
     pub(super) launch_model_info: Arc<serde_json::Map<String, serde_json::Value>>,
+    /// Priority for a generation that sets none (see
+    /// `ServerArgs::default_priority_value`).
+    pub(super) default_priority: Option<i64>,
 }
 
 impl From<&ServerArgs> for CoreMetadata {
@@ -87,6 +90,7 @@ impl From<&ServerArgs> for CoreMetadata {
             deployment_info: args.deployment_info.clone(),
             launch_server_info: args.launch_server_info.0.clone(),
             launch_model_info: args.launch_model_info.0.clone(),
+            default_priority: args.default_priority_value,
         }
     }
 }

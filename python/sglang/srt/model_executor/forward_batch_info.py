@@ -216,9 +216,6 @@ class ForwardMode(IntEnum):
     # Represent a batch of requests having their KV cache ready to start decoding
     PREBUILT = auto()
 
-    # Split Prefill for PD multiplexing
-    SPLIT_PREFILL = auto()
-
     # Used in dLLM
     DLLM_EXTEND = auto()
 
@@ -231,7 +228,6 @@ class ForwardMode(IntEnum):
             or self == ForwardMode.MIXED
             or (include_draft_extend_v2 and self == ForwardMode.DRAFT_EXTEND_V2)
             or self == ForwardMode.TARGET_VERIFY
-            or self == ForwardMode.SPLIT_PREFILL
             or self == ForwardMode.DLLM_EXTEND
         )
 
@@ -269,7 +265,6 @@ class ForwardMode(IntEnum):
         return (
             self == ForwardMode.EXTEND
             or self == ForwardMode.MIXED
-            or self == ForwardMode.SPLIT_PREFILL
             or (include_draft_extend_v2 and self == ForwardMode.DRAFT_EXTEND_V2)
         )
 
@@ -286,9 +281,6 @@ class ForwardMode(IntEnum):
 
     def is_dllm_extend(self):
         return self == ForwardMode.DLLM_EXTEND
-
-    def is_split_prefill(self):
-        return self == ForwardMode.SPLIT_PREFILL
 
     def is_extend_without_speculative(self):
         return self.is_extend() and not self.is_target_verify()
@@ -738,14 +730,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     next_token_logits_buffer: torch.Tensor = None
     temperature: torch.Tensor = None
     top_p: torch.Tensor = None
-
-    # For split prefill
-    # intermediate values for split prefill
-    hidden_states: torch.Tensor = None
-    residual: torch.Tensor = None
-    model_specific_states: Dict[str, any] = None
-    # current split index of layer
-    split_index: int = 0
 
     # For multimodal
     mm_input_embeds: Optional[torch.Tensor] = None

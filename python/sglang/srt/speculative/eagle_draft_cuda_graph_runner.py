@@ -143,7 +143,6 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
 
         # Disable parent paths that don't apply to EAGLE.
         self.compile_bs = []  # disables patch_model torch.compile wrapping
-        self.enable_pdmux = False
         self.record_nolora_graph = False
         self.is_dllm = False
 
@@ -329,10 +328,8 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
     def _cache_loc_dtype(self):
         return torch.int64
 
-    def _make_graph_key(
-        self, bs, stream_idx=None, variant_label=None, attention_variant=None
-    ):
-        # EAGLE doesn't use stream_idx; variant_label is _GREEDY_VARIANT or None.
+    def _make_graph_key(self, bs, variant_label=None, attention_variant=None):
+        # variant_label is _GREEDY_VARIANT or None.
         return ShapeKey(
             size=bs, variant_label=variant_label, attention_variant=attention_variant
         )
@@ -400,7 +397,6 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         self,
         size: int,
         forward: Callable,
-        stream_idx: Optional[int] = None,
         variant_label: Optional[str] = None,
         attention_variant: Optional[str] = None,
     ):

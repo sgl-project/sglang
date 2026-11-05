@@ -38,6 +38,7 @@ class _FakeReq:
         self.return_logprob = False
         self.output_ids = []
         self.weight_version_events = []
+        self.prefill_weight_versions = None
         self.time_stats = Mock()
 
     def finished(self):

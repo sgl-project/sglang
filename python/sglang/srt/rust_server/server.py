@@ -516,6 +516,7 @@ class RustServer:
         decode_latencies: Dict[int, float],
         cached_tokens_split: Optional[List[Tuple[int, int, int]]] = None,
         storage_backend: Optional[str] = None,
+        request_stats: Optional[Dict[int, Dict[str, Any]]] = None,
     ) -> None:
         """Egress redirect for generation output (replaces the zmq detokenizer).
 
@@ -537,8 +538,10 @@ class RustServer:
             ``meta_info`` as Python's TokenizerManager does,
             ``cached_tokens_split`` (by row: the request's cached tokens per
             cache tier, ``(device, host, storage)``, when the cache has more
-            tiers than the device) and, for the whole frame, the attached
-            ``storage_backend``.
+            tiers than the device), for the whole frame, the attached
+            ``storage_backend``, and ``request_stats`` (by row: a finished
+            request's ``meta_info`` keys from scheduler state, which the
+            frontend reports as they are).
           - ``data``: the raw little-endian numeric buffer: the token ids
             first, as the 8-byte ``array("q")`` bytes the scheduler already
             holds, then every logprob / hidden column as 4-byte elements
@@ -640,11 +643,16 @@ class RustServer:
                 ),
             )
 
-            # Every column is all-or-nothing per payload — which is also what makes
-            # a family's emptiness a reliable "nobody asked for this" signal.
-            active = []
+            # Each column has one cell per request or none at all. The
+            # accumulator gives a batch with any logprob request a cell per
+            # request in all twelve logprob columns, mostly empty, so `fill`
+            # visits only the rows whose cell carries data. A family with none
+            # stays empty, which the Rust decoder reads as absent (`per_req_ok`
+            # admits an empty column, `lens_i` reads 0 for every request), and
+            # the `header_cols`/`data_cols` loops below still walk all seven,
+            # so column ORDER and arity are unchanged. Visiting every row of
+            # every family added Python work on the scheduler thread with the GIL held.
             for extra in extras:
-                populated = False
                 for name, col in extra.columns():
                     assert len(col) in (
                         0,
@@ -652,27 +660,7 @@ class RustServer:
                     ), (
                         f"extras column {name}: {len(col)} entries for a batch of {batch_size}"
                     )
-                    populated |= len(col) > 0
-                if populated:
-                    active.append(extra)
-
-            # Flatten only the families someone asked for. `has_extra` above is a
-            # per-FRAME guard, so one client enabling logprobs used to drag all
-            # seven families through the per-request loop: at B=4096 that is 28,672
-            # bound-method calls per decode step, materializing 12 columns of 4096
-            # zeros nobody reads. Measured 0.37 ms -> 7.90 ms GIL-held per step,
-            # i.e. 25-75% of a decode step added to the scheduler's critical path.
-            #
-            # Skipping `accept` leaves a family's buffers empty, which is exactly
-            # the wire form the Rust decoder already treats as absent (`per_req_ok`
-            # admits an empty column, `lens_i` reads 0 for every request). The
-            # `header_cols`/`data_cols` loops below still walk all seven, so column
-            # ORDER and arity are unchanged — an inactive family contributes empty
-            # columns in place rather than disappearing.
-            for extra in active:
-                accept = extra.accept  # hoisted: this is the hottest loop here
-                for i in range(batch_size):
-                    accept(i)
+                extra.fill(batch_size)
 
             extras_start = len(header_cols)
             for extra in extras:
@@ -687,14 +675,19 @@ class RustServer:
         # for the others), a multimodal model's media token counts, the
         # finished requests' decode latencies, the customized_info columns and
         # the cached tokens by tier, each empty when nothing in the batch
-        # carries it, then the frame's storage backend. Only the latencies are
-        # built here, for finished rows; the header stops at its last non-empty
-        # column.
+        # carries it, then the frame's storage backend and the finished
+        # requests' stats. Only the latency and stats columns are built here,
+        # for finished rows; the header stops at its last non-empty column.
         latencies = []
         if decode_latencies:
             latencies = [None] * len(rids)
             for row, latency in decode_latencies.items():
                 latencies[row] = latency
+        stats = []
+        if request_stats:
+            stats = [None] * len(rids)
+            for row, row_stats in request_stats.items():
+                stats[row] = row_stats
         media = self._multimodal_enabled
         trailing = [
             payload.weight_versions or [],
@@ -706,6 +699,7 @@ class RustServer:
             self._customized_info_json(payload.customized_info),
             cached_tokens_split or [],
             storage_backend,
+            stats,
         ]
         while trailing and not trailing[-1]:
             trailing.pop()

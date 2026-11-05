@@ -3,16 +3,22 @@ from concurrent.futures import Future
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import torch
+
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.common.conn import KVTransferError
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
+    DecodeRequest,
     DecodeTransferQueue,
     HiCacheRestoreResult,
+    _PendingPublish,
 )
 from sglang.srt.disaggregation.decode_hicache_mixin import (
     HiCacheRestoreGatedKVReceiver,
 )
+from sglang.srt.disaggregation.utils import ReqToMetadataIdxAllocator
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -218,6 +224,183 @@ class TestDecodeHiCacheRestoreGate(CustomTestCase):
         self.assertEqual(queue.queue, [decode_req])
         mock_prepare_abort.assert_not_called()
         mock_release_kv_cache.assert_not_called()
+
+
+class _PollingReceiver:
+    def __init__(self, poll=KVPoll.WaitingForInput):
+        self.clear_called = False
+        self.conclude_state = None
+        self._poll = poll
+        self.send_metadata = MagicMock()
+
+    def poll(self):
+        return self._poll
+
+    def clear(self):
+        self.clear_called = True
+
+    def failure_exception(self):
+        return None
+
+
+def _local_reduce(flags, group, op):
+    return flags
+
+
+class TestDeferredDestinationPublish(CustomTestCase):
+    def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+        for target in ("stream", "current_stream", "Event"):
+            patcher = patch(f"sglang.srt.disaggregation.decode.torch.cuda.{target}")
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _deferring_queue(self, decode_reqs):
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.pp_size = 1
+        queue.gloo_group = object()
+        queue.queue = list(decode_reqs)
+        queue.pending_reqs = []
+        queue.retracted_queue = []
+        queue.num_reserved_decode_tokens = 0
+        queue._num_published_destinations = 0
+        queue._defer_publish = True
+        queue._pending_publish = []
+        queue._publish_stream = MagicMock()
+        queue._resolve_pending_reqs = MagicMock()
+        queue._update_handshake_waiters = MagicMock()
+        queue._uses_swa_tail_prealloc = MagicMock(return_value=False)
+        queue._uses_swa_reservation = MagicMock(return_value=False)
+        queue._allocatable_token_budgets = MagicMock(return_value=1000)
+        queue._prealloc_reservation_fits = MagicMock(return_value=True)
+        queue.req_to_token_pool = MagicMock()
+        queue.req_to_token_pool.available_size.return_value = 4
+        queue.req_to_token_pool.holds_state_slots = False
+        queue.req_to_token_pool.req_to_token = torch.arange(32).reshape(4, 8)
+
+        def pre_alloc(req, *args):
+            req.kv.req_pool_idx = 1
+            return queue.req_to_token_pool.req_to_token[1, : len(req.origin_input_ids)]
+
+        queue._pre_alloc = MagicMock(side_effect=pre_alloc)
+        queue.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(4)
+        queue.token_to_kv_pool_allocator = SimpleNamespace(
+            page_size=1,
+            state=None,
+            translate_kv_indices_for_transfer=lambda indices: indices,
+        )
+        queue.kv_manager = SimpleNamespace(kv_args=SimpleNamespace(state_types=[]))
+        queue.transfer_queue = SimpleNamespace(queue=[], enable_staging=False)
+        queue.tree_cache = MagicMock()
+        queue.scheduler = MagicMock(
+            enable_priority_scheduling=False,
+            enable_hisparse=False,
+            enable_lora=False,
+            enable_decode_hicache=False,
+        )
+        queue.scheduler.running_batch.reqs = []
+        return queue
+
+    @staticmethod
+    def _decode_req(receiver):
+        req = SimpleNamespace(
+            rid="deferred",
+            origin_input_ids=[1] * 5,
+            output_ids=[],
+            kv=ReqKvInfo(),
+            finished_reason=None,
+            sampling_params=SimpleNamespace(max_new_tokens=4),
+            time_stats=MagicMock(),
+        )
+        return DecodeRequest(req=req, kv_receiver=receiver, waiting_for_input=True)
+
+    @staticmethod
+    def _pending(decode_req):
+        decode_req.awaiting_publish = True
+        return _PendingPublish(
+            allocated=MagicMock(),
+            decode_req=decode_req,
+            dst_kv_indices=torch.arange(4),
+            prefix_len=0,
+            total_prefix_len=0,
+            fill_len=4,
+        )
+
+    def test_deferred_destination_keeps_its_metadata_slot_until_published(self):
+        # The transfer queue frees the metadata slot of any request it fails, so
+        # a deferred request must own one before joining the queue, and the
+        # publish must send that slot instead of taking a second one.
+        receiver = _PollingReceiver()
+        decode_req = self._decode_req(receiver)
+        queue = self._deferring_queue([decode_req])
+
+        self.assertEqual(queue.pop_preallocated(), ([decode_req], []))
+
+        receiver.send_metadata.assert_not_called()
+        self.assertTrue(decode_req.awaiting_publish)
+        self.assertEqual(decode_req.metadata_buffer_index, 0)
+        self.assertEqual(queue.req_to_metadata_buffer_idx_allocator.available_size(), 3)
+        entry_time = decode_req.req.time_stats.set_decode_transfer_queue_entry_time
+        entry_time.assert_called_once()
+        # transfer_queue.extend() takes the request over.
+        queue.note_destinations_queued(1)
+
+        allocated = queue._pending_publish[0].allocated
+        with patch(
+            "sglang.srt.disaggregation.decode.all_reduce_flags",
+            side_effect=_local_reduce,
+        ):
+            queue.publish_pending_destinations()
+
+        queue._publish_stream.wait_event.assert_called_once_with(allocated)
+        receiver.send_metadata.assert_called_once()
+        entry_time.assert_called_once()
+        page_indices, metadata_index, state_indices = (
+            receiver.send_metadata.call_args.args
+        )
+        self.assertEqual(page_indices.tolist(), [8, 9, 10, 11, 12])
+        self.assertEqual(metadata_index, 0)
+        self.assertEqual(queue.req_to_metadata_buffer_idx_allocator.available_size(), 3)
+        self.assertFalse(decode_req.awaiting_publish)
+        self.assertEqual(queue._pending_publish, [])
+        self.assertFalse(queue.has_published_destinations)
+
+    def test_deferred_destination_closes_the_move_gate_until_queued(self):
+        """A later allocation in the same pop must not let unified-memory compaction
+        move a deferred request's pages before its publish reads them back."""
+        queue = self._deferring_queue([self._decode_req(_PollingReceiver())])
+
+        queue.pop_preallocated()
+
+        self.assertTrue(queue.has_published_destinations)
+        queue.note_destinations_queued(1)
+        self.assertFalse(queue.has_published_destinations)
+
+    def test_released_receiver_keeps_the_publish_reduction_aligned(self):
+        """A pending request the transfer queue released keeps its slot in the
+        all-reduced polls, polls as failed and is not published."""
+        released = self._decode_req(None)
+        live = self._decode_req(_PollingReceiver())
+        queue = self._deferring_queue([])
+        queue._pending_publish = [self._pending(released), self._pending(live)]
+        queue._publish_destination = MagicMock()
+
+        with patch(
+            "sglang.srt.disaggregation.decode.all_reduce_flags",
+            side_effect=_local_reduce,
+        ) as reduce:
+            queue.publish_pending_destinations()
+
+        self.assertEqual(
+            reduce.call_args.kwargs["flags"],
+            [int(KVPoll.Failed), int(KVPoll.WaitingForInput)],
+        )
+        queue._publish_destination.assert_called_once()
+        self.assertIs(queue._publish_destination.call_args.kwargs["decode_req"], live)
+        self.assertTrue(released.awaiting_publish)
+        self.assertFalse(live.awaiting_publish)
 
 
 if __name__ == "__main__":

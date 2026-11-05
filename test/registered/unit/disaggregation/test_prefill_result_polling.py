@@ -1269,9 +1269,7 @@ class TestCachedPrefixEarlySend(CustomTestCase):
                 reqs=[req],
                 hicache_consumer_index=consumer_index,
                 extend_num_tokens=32,
-                forward_mode=SimpleNamespace(
-                    is_split_prefill=lambda: False, is_prebuilt=lambda: False
-                ),
+                forward_mode=SimpleNamespace(is_prebuilt=lambda: False),
             )
             with self.subTest(consumer_index=consumer_index):
                 with envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.override(True):

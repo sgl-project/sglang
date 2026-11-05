@@ -773,7 +773,7 @@ class TestInitReqStateAtomicity(CustomTestCase):
                     tm._release_lora_once.assert_not_called()
                     tm._tokenize_one_request.assert_not_called()
                     tm._send_one_request.assert_not_called()
-                    tm.send_to_scheduler.send_pyobj.assert_not_called()
+                    self.assertEqual(tm.send_to_scheduler.method_calls, [])
                     self.assertFalse(live_state.abort_sent)
                     self.assertFalse(live_state.lora_released)
 
