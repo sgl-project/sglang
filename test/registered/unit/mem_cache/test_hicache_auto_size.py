@@ -323,6 +323,12 @@ class TestHiCacheAutoSize(CustomTestCase):
         ]
         with (
             patch.dict(ALLOC_MEMORY_FUNCS, {"cpu": alloc}),
+            # Host memory free now caps the snapshot; pin it so it never binds.
+            patch.object(
+                base,
+                "available_host_memory_bytes",
+                return_value=base.HICACHE_HOST_MEMORY_RESERVE_BYTES + 1000,
+            ),
             base.host_memory_budget_scope(1000),
         ):
             # 3 layers x 4 pages x 11 bytes
