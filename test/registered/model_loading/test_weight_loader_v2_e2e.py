@@ -25,6 +25,7 @@ from sglang.test.runners import SRTRunner, check_close_model_outputs
 from sglang.test.test_utils import CustomTestCase
 
 MODEL = "Qwen/Qwen2-0.5B"
+QWEN3_MODEL = "Qwen/Qwen3-0.6B"
 SHORT_PROMPT = "The capital of the United Kingdom is"
 
 
@@ -63,6 +64,28 @@ class TestWeightLoaderV2E2E(CustomTestCase):
             decode_tolerance=1e-6,
             rouge_l_tolerance=1.0,
             debug_text="qwen2 native v1 vs v2 weight loader",
+        )
+
+    def test_qwen3_native_v1_v2_generation_match(self):
+        prompts = [SHORT_PROMPT]
+        max_new_tokens = 32
+        kwargs = self._runner_kwargs()
+
+        with envs.SGLANG_ENABLE_WEIGHT_LOADER_V2.override(False):
+            with SRTRunner(QWEN3_MODEL, **kwargs) as runner_v1:
+                out_v1 = runner_v1.forward(prompts, max_new_tokens=max_new_tokens)
+
+        with envs.SGLANG_ENABLE_WEIGHT_LOADER_V2.override(True):
+            with SRTRunner(QWEN3_MODEL, **kwargs) as runner_v2:
+                out_v2 = runner_v2.forward(prompts, max_new_tokens=max_new_tokens)
+
+        check_close_model_outputs(
+            hf_outputs=out_v1,
+            srt_outputs=out_v2,
+            prefill_tolerance=1e-6,
+            decode_tolerance=1e-6,
+            rouge_l_tolerance=1.0,
+            debug_text="qwen3 native v1 vs v2 weight loader",
         )
 
     def test_transformers_impl_loads_and_generates(self):

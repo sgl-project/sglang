@@ -38,6 +38,7 @@ from torch import nn
 from torch.nn import Parameter
 
 from sglang.srt.layers.utils.common import get_layer_id
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import AutoWeightsLoader, WeightsMapper
 
 __all__ = [
@@ -48,6 +49,7 @@ __all__ = [
     "STANDARD_GATE_UP_MAPPING",
     "STANDARD_STACKED_MAPPING",
     "LLAMA_STACKED_MAPPING",
+    "load_with_stacked_dispatch",
     "filter_pp_weights",
     "register_weight_remap",
     "get_weight_remap",
@@ -146,6 +148,30 @@ LLAMA_STACKED_MAPPING = StackedParamsDispatch(
         (".gate_up_proj", ".up_proj", 1),
     )
 )
+
+
+def load_with_stacked_dispatch(
+    module: nn.Module,
+    weights: Iterable[tuple[str, torch.Tensor]],
+    mapping: StackedParamsDispatch,
+    *,
+    ignore_unexpected_suffixes: tuple[str, ...] = (".bias", ".kv_scale"),
+) -> set[str]:
+    """Load submodule weights via stacked dispatch, then direct param loaders."""
+    loaded: set[str] = set()
+    params_dict = dict(module.named_parameters())
+    for name, tensor in weights:
+        target = mapping.try_load(name, tensor, params_dict)
+        if target is not None:
+            loaded.add(target)
+            continue
+        if name in params_dict:
+            wl = getattr(params_dict[name], "weight_loader", default_weight_loader)
+            wl(params_dict[name], tensor)
+            loaded.add(name)
+        elif not any(name.endswith(suffix) for suffix in ignore_unexpected_suffixes):
+            pass
+    return loaded
 
 
 # ---------------------------------------------------------------------------
