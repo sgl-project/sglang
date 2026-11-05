@@ -74,20 +74,25 @@ def _req(finished_reason, calls):
 
 
 class TestRelease(CustomTestCase):
-    def _release(self, req, calls, checkpoint=False):
+    def _release(self, req, calls, checkpoint=False, verb="release"):
         tree_cache = MagicMock()
         tree_cache.finish.side_effect = lambda handle, outcome: calls.append(outcome)
-        with patch.object(
-            request_retirer,
-            "release_kv_cache",
-            side_effect=lambda req, cache, *, checkpoint: calls.append(checkpoint),
+        retirer = release_only_retirer(
+            tree_cache,
+            beam_coordinator=SimpleNamespace(
+                retire_group=lambda req: calls.append("beam")
+            ),
+        )
+        retirer.send_abort_output = lambda abort_req, req: calls.append("output")
+        with (
+            patch.object(
+                request_retirer,
+                "release_kv_cache",
+                side_effect=lambda req, cache, *, checkpoint: calls.append(checkpoint),
+            ),
+            patch.object(request_retirer, "make_abort_req"),
         ):
-            release_only_retirer(
-                tree_cache,
-                beam_coordinator=SimpleNamespace(
-                    retire_group=lambda req: calls.append("beam")
-                ),
-            ).release(req, checkpoint=checkpoint)
+            getattr(retirer, verb)(req, checkpoint=checkpoint)
 
     def test_drops_cache_side_state_before_an_uncached_release(self):
         # A PD transfer or bootstrap failure, or a checksum mismatch, must also
@@ -105,6 +110,12 @@ class TestRelease(CustomTestCase):
         calls = []
         self._release(_req(FINISH_ABORT(), calls), calls, checkpoint=True)
         self.assertEqual(calls, ["counts", "mm", "session", "beam", True])
+
+    def test_leaves_the_attempt_of_a_checkpointed_abort_to_the_cache(self):
+        # A PD decode request aborted while waiting checkpoints its KV too.
+        calls = []
+        self._release(_req(FINISH_ABORT(), calls), calls, checkpoint=True, verb="abort")
+        self.assertEqual(calls, ["output", "counts", "mm", "session", "beam", True])
 
     def test_leaves_a_request_that_was_not_aborted_attached(self):
         calls = []

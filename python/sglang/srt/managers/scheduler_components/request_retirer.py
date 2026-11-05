@@ -21,9 +21,9 @@ if TYPE_CHECKING:
 class RequestRetirer:
     """Ends requests and releases what they hold.
 
-    abort ends a request no launched step carries and tells the tokenizer
-    once; release frees one its caller ended, in a step or out of one, and
-    streams, detaching it first when aborted."""
+    abort ends a request no launched step carries, tells the tokenizer once,
+    and releases it; release frees one its caller ended, in a step or out of
+    one, and streams, detaching it first when aborted."""
 
     def __init__(
         self,
@@ -57,20 +57,16 @@ class RequestRetirer:
         self.send_abort_output(
             make_abort_req(req, finished_reason=finished_reason), req
         )
-        # It never ran a step, so only the abandon settles its cache attempt.
-        self._release(req, checkpoint=checkpoint, abandon_attempt=True)
+        self.release(req, checkpoint=checkpoint)
 
     def release(self, req: Req, *, checkpoint: bool) -> None:
         """Give back what an ended request holds:
         an aborted one is first dropped from the components tracking it, then
         its KV backup and its memory go. The caller finishes and streams it."""
-        # A checkpoint hands the KV to the cache, whose store settles the
-        # attempt; an abandon first would end LMCache's session before it.
-        self._release(req, checkpoint=checkpoint, abandon_attempt=not checkpoint)
-
-    def _release(self, req: Req, *, checkpoint: bool, abandon_attempt: bool) -> None:
         if isinstance(req.finished_reason, FINISH_ABORT):
-            self._detach(req, abandon_attempt=abandon_attempt)
+            # A checkpoint hands the KV to the cache, whose store settles the
+            # attempt; an abandon first would end LMCache's session before it.
+            self._detach(req, abandon_attempt=not checkpoint)
             # No-op once the group retired; member rows are not freed here.
             self.beam_coordinator.retire_group(req)
         discard_kv_cache_backup(req, self.tree_cache)
