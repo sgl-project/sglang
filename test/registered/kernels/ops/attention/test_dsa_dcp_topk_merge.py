@@ -86,6 +86,12 @@ def _rows(kind: str, seed: int) -> list[torch.Tensor]:
                 base.repeat(n // 8 + 1)[:n] + 4.0 * torch.randperm(n, generator=g) / n
             )
         return rows
+    if kind == "signed_zeros":
+        # ties at the threshold between -0 (even positions) and +0 (odd ones)
+        x = torch.zeros(131072)
+        x[0::2] = -0.0
+        x[torch.randperm(x.numel(), generator=g)[:1000]] = 1.0
+        return [x]
     if kind == "short":
         lengths = [1, 3, 7, 9, 300, 2047, 2048, 2049, 2055, 3000, 5000]
         return [torch.randn(n, generator=g) for n in lengths]
@@ -101,7 +107,8 @@ def _all_ranks_ok(ok: bool) -> bool:
 
 
 def _keys(scores: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
-    b = scores.float().contiguous().view(torch.int32).to(torch.int64) & 0xFFFFFFFF
+    scores = torch.where(scores == 0, 0.0, scores.float())  # -0 ties with +0
+    b = scores.contiguous().view(torch.int32).to(torch.int64) & 0xFFFFFFFF
     ordered = torch.where(b >= 0x80000000, 0xFFFFFFFF - b, b + 0x80000000)
     return ((ordered - 0x80000000) << 32) | (0xFFFFFFFF - pos.to(torch.int64))
 
@@ -183,7 +190,9 @@ class _Case:
         return bad
 
 
-@pytest.mark.parametrize("kind", ["random", "dense_top", "ties", "periodic", "short"])
+@pytest.mark.parametrize(
+    "kind", ["random", "dense_top", "ties", "periodic", "signed_zeros", "short"]
+)
 @torch.inference_mode()
 def test_dcp_topk_merge(kind: str) -> None:
     merge = _init_once()

@@ -55,15 +55,17 @@ struct Smem {
   int sent[kMaxWarps], kept[kMaxWarps];
 };
 
-SGL_DEVICE uint32_t convert_to_uint32(float x) {
-  const uint32_t bits = __float_as_uint(x);
+// Order-preserving fp32 -> uint32 with -0 equal to +0, as top-k mode 2 orders
+// the local candidates, so ties between them go by position here too.
+SGL_DEVICE uint32_t extract_tie_key(float x) {
+  const uint32_t bits = __float_as_uint(x == 0.0f ? 0.0f : x);
   return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
 }
 
 // (score bits, position) -> 64-bit key, larger is better; 0 for an empty slot
 SGL_DEVICE uint64_t make_topk_key(int32_t score_bits, int32_t pos) {
   if (pos < 0) return 0;
-  return (static_cast<uint64_t>(convert_to_uint32(__int_as_float(score_bits))) << 32) | ~static_cast<uint32_t>(pos);
+  return (static_cast<uint64_t>(extract_tie_key(__int_as_float(score_bits))) << 32) | ~static_cast<uint32_t>(pos);
 }
 
 SGL_DEVICE uint64_t pack_entry(int32_t score_bits, int32_t pos, uint64_t tag) {
