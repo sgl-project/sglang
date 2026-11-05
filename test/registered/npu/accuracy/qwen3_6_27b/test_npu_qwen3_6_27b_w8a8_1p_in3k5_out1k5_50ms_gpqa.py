@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 # this 198-question GPQA run cannot finish within the nightly budget, it only
 # ends in a harness timeout after 3.5 hours.
 MIN_SPEC_ACCEPT_LENGTH = 1.5
-MIN_SPEC_ACCEPT_RATE = 0.1
+MIN_SPEC_ACCEPT_RATE = 0.2
 SPEC_PRE_CHECK_ATTEMPTS = 3
 SPEC_PRE_CHECK_MAX_TOKENS = 256
 
