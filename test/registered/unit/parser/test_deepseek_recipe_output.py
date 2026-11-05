@@ -12,8 +12,8 @@ REVISION = "1bae0e1088993b9b82de08f59de5be5a34e42170"
 TEXTS = (
     "Electrons pass through the cytochrome b₆f complex and pump H⁺ ions.",
     "r = 2 × 6.674 × 10⁻¹¹ m³",
-    "Nice work \U0001f642\U0001f680 and 光合作用 done.",
-    "光合作用把二氧化碳和水转化为葡萄糖，并释放氧气。",
+    "Nice work \U0001f642\U0001f680 and a naïve café crème brûlée.",
+    "∫₀¹ x² dx ≈ ⅓, ∑ₖ k ≤ n²/2 → ∞ and ∀ε ∃δ ∴ ⇒ ⊆ ∪ ∩.",
 )
 
 
