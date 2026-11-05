@@ -142,6 +142,7 @@ def _should_use_channels_last_3d(
     ) or not (
         current_platform.is_cuda()
         or current_platform.is_rocm()
+        or current_platform.is_cpu()
         or current_platform.is_xpu()
     ):
         return False
@@ -156,12 +157,9 @@ def _should_use_channels_last_3d(
     if isinstance(pipeline_config, QwenImagePipelineConfig):
         return True
     # Wan's spatial-parallel decode exchanges halos in either layout
-    if isinstance(pipeline_config, WanT2V480PConfig):
+    if isinstance(pipeline_config, (WanT2V480PConfig, Cosmos3Config)):
         return True
-    if (
-        isinstance(pipeline_config, (LTX2PipelineConfig, Cosmos3Config))
-        and server_args.num_gpus == 1
-    ):
+    if isinstance(pipeline_config, LTX2PipelineConfig) and server_args.num_gpus == 1:
         return True
     return False
 
@@ -173,14 +171,14 @@ def _channels_last_3d_overridden() -> bool:
 
 def _channels_last_3d_prefix(server_args: ServerArgs | None) -> str:
     """Module-name prefix of the Conv3d weights to convert to channels_last_3d."""
-    # by default multi-GPU Wan converts only its decoder: channels_last_3d convs
-    # round differently, and the encode output seeds I2V sampling; an explicit
-    # override converts the whole VAE
+    # by default multi-GPU Wan / Cosmos3 convert only their decoder:
+    # channels_last_3d convs round differently, and the encode output seeds I2V
+    # sampling; an explicit override converts the whole VAE
     if (
         not _channels_last_3d_overridden()
         and server_args is not None
         and server_args.num_gpus > 1
-        and isinstance(server_args.pipeline_config, WanT2V480PConfig)
+        and isinstance(server_args.pipeline_config, (WanT2V480PConfig, Cosmos3Config))
     ):
         return "decoder."
     return ""

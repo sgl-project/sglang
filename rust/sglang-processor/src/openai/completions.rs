@@ -6,7 +6,8 @@ use std::sync::Arc;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use sglang_api_types::api::v1::{
-    GenerateRequest, ImagesConfig, Int64List, SamplingParams, SamplingParamsOrList, TokenIds,
+    GenerateMetaInfo, GenerateRequest, GenerateResponse, GenerateStreamError, ImagesConfig,
+    Int64List, LogprobEntry, NullableTopLogprobs, SamplingParams, SamplingParamsOrList, TokenIds,
     TokenIdsList, TokenIdsOrList, WatermarkRequestConfig, sampling_params_or_list,
     token_ids_or_list,
 };
@@ -16,8 +17,8 @@ use super::request::{
     lora_path, one, usage_flags, yes,
 };
 use super::wire::{
-    Payload, Reply, StreamState, http_status_name, malformed_output_reply, meta_u64, now,
-    stream_error_event, unary_reply, without_nulls,
+    Reply, StreamState, abort_event, finish_fields, logprob_slice, logprobs_length, now,
+    unary_reply, without_nulls,
 };
 use super::{OpenAiHeaders, OpenAiSettings, OpenAiTokenizer, Unsupported};
 
@@ -171,7 +172,7 @@ pub fn lower_completion(
     } else {
         Vec::new()
     };
-    let mut lowered = generate_body(&request, headers);
+    let mut lowered = generate_body(&request, headers, settings);
     lowered.custom_labels = labels;
     let (include_usage, continuous_usage_stats) =
         usage_flags(request.stream_options.as_ref(), settings);
@@ -193,7 +194,11 @@ pub fn lower_completion(
     Ok((lowered, responder))
 }
 
-fn generate_body(request: &CompletionRequest, headers: &OpenAiHeaders<'_>) -> GenerateRequest {
+fn generate_body(
+    request: &CompletionRequest,
+    headers: &OpenAiHeaders<'_>,
+    settings: &OpenAiSettings,
+) -> GenerateRequest {
     let sampling = SamplingParams {
         temperature: Some(request.temperature),
         max_new_tokens: Some(request.max_tokens),
@@ -237,7 +242,11 @@ fn generate_body(request: &CompletionRequest, headers: &OpenAiHeaders<'_>) -> Ge
         top_logprobs_num: Some(OneOrList::One(request.logprobs.unwrap_or(0)).into()),
         stream: Some(request.stream),
         return_text_in_logprobs: Some(true),
-        lora_path: lora_path(&request.model, &request.lora_path),
+        lora_path: lora_path(
+            &request.model,
+            &request.lora_path,
+            settings.served_model_name.as_deref(),
+        ),
         bootstrap_host: request.bootstrap_host.clone().map(Into::into),
         bootstrap_port: request.bootstrap_port.clone().map(Into::into),
         bootstrap_room: request.bootstrap_room.clone().map(Into::into),
@@ -325,26 +334,22 @@ pub struct CompletionResponder {
 
 impl CompletionResponder {
     /// `_handle_non_streaming_request` over a `/generate` response.
-    pub fn unary(self, body: &[u8]) -> Option<Reply> {
-        let ret = match serde_json::from_slice(body).ok()? {
-            Value::Array(items) => items,
-            item => vec![item],
-        };
+    pub fn unary(self, ret: Vec<GenerateResponse>) -> Option<Reply> {
         let mut choices = Vec::with_capacity(ret.len());
         for (index, item) in ret.iter().enumerate() {
-            let meta = &item["meta_info"];
-            let Some(text) = item["text"].as_str() else {
-                return Some(malformed_output_reply("text"));
-            };
-            let mut text = text.to_owned();
+            let default_meta = GenerateMetaInfo::default();
+            let meta = item.meta_info.as_ref().unwrap_or(&default_meta);
+            let mut text = item.text.clone();
             if let Some(echo) = self.echo_prompts.get(index / self.n) {
                 text.insert_str(0, echo);
             }
             let logprobs = self.logprobs.then(|| {
                 self.openai_logprobs(
                     self.echo_logprobs.then_some(meta),
-                    &meta["output_token_logprobs"],
-                    &meta["output_top_logprobs"],
+                    meta.output_token_logprobs
+                        .as_ref()
+                        .map_or(&[], |p| &p.entries),
+                    &meta.output_top_logprobs,
                 )
             });
             choices.push(self.choice(index as u64, text, logprobs, meta, item));
@@ -359,13 +364,21 @@ impl CompletionResponder {
         )
     }
 
-    /// One `/generate` SSE `data:` payload, as `_generate_completion_stream`
+    /// One decoded `/generate` stream item, as `_generate_completion_stream`
     /// handles it. `Err` replaces the whole stream, before anything was sent.
-    pub fn stream_data(&mut self, data: &[u8]) -> Result<Vec<String>, Reply> {
-        let mut events = match self.stream.payload(data)? {
-            Payload::Done => return Ok(self.stream_end()),
-            Payload::Frame(content) => self.stream_chunk(&content).into_iter().collect(),
-            Payload::Events(events) => events,
+    pub fn stream_data(
+        &mut self,
+        data: Result<GenerateResponse, GenerateStreamError>,
+    ) -> Result<Vec<String>, Reply> {
+        if self.stream.done {
+            return Ok(Vec::new());
+        }
+        let mut events = match data {
+            Ok(content) => {
+                self.stream.started = true;
+                self.stream_chunk(&content).into_iter().collect()
+            }
+            Err(error) => self.stream.error(error)?,
         };
         if self.stream.ending() {
             events.extend(self.stream_end());
@@ -378,13 +391,14 @@ impl CompletionResponder {
         self.stream.done
     }
 
-    fn stream_chunk(&mut self, content: &Value) -> Option<String> {
+    fn stream_chunk(&mut self, content: &GenerateResponse) -> Option<String> {
         let state = &mut self.stream;
-        let index = content.get("index").and_then(Value::as_u64).unwrap_or(0);
-        let meta = &content["meta_info"];
+        let index = u64::from(content.index.unwrap_or(0));
+        let default_meta = GenerateMetaInfo::default();
+        let meta = content.meta_info.as_ref().unwrap_or(&default_meta);
         state.record(index, meta);
-        let finish_reason = &meta["finish_reason"];
-        let raw_text = content["text"].as_str().unwrap_or_default();
+        let (finish_type, matched_stop) = finish_fields(meta.finish_reason.as_ref());
+        let raw_text = content.text.as_str();
 
         let is_first_chunk = !state.text_offsets.contains_key(&index);
         let offset = state.text_offsets.get(&index).copied().unwrap_or(0);
@@ -403,28 +417,17 @@ impl CompletionResponder {
         if self.logprobs {
             let echo_input = is_first_chunk && self.echo_logprobs;
             let prev = state.logprob_counts.get(&index).copied().unwrap_or(0);
-            let total = meta_u64(meta, "output_token_logprobs_length") as usize;
+            let total = logprobs_length(meta, prev, incremental);
             if prev < total || echo_input {
-                let slice = |key: &str| -> Value {
-                    let items = meta
-                        .get(key)
-                        .and_then(Value::as_array)
-                        .cloned()
-                        .unwrap_or_default();
-                    match incremental {
-                        true => Value::Array(items),
-                        false => Value::Array(
-                            items
-                                .into_iter()
-                                .skip(prev)
-                                .take(total.saturating_sub(prev))
-                                .collect(),
-                        ),
-                    }
-                };
-                let (output, output_top) =
-                    (slice("output_token_logprobs"), slice("output_top_logprobs"));
-                logprobs = self.openai_logprobs(echo_input.then_some(meta), &output, &output_top);
+                let output = meta
+                    .output_token_logprobs
+                    .as_ref()
+                    .map_or(&[][..], |p| p.entries.as_slice());
+                logprobs = self.openai_logprobs(
+                    echo_input.then_some(meta),
+                    logprob_slice(output, prev, total, incremental),
+                    logprob_slice(&meta.output_top_logprobs, prev, total, incremental),
+                );
             }
             self.stream.logprob_counts.insert(index, total);
         }
@@ -432,9 +435,10 @@ impl CompletionResponder {
         let mut token_ids = None;
         let mut prompt_token_ids = None;
         if self.return_token_ids {
-            let ids = content["output_ids"]
-                .as_array()
-                .cloned()
+            let ids = content
+                .output_ids
+                .as_ref()
+                .map(|ids| ids.ids.clone())
                 .unwrap_or_default();
             token_ids = Some(match incremental {
                 true => ids,
@@ -444,47 +448,34 @@ impl CompletionResponder {
                 }
             });
             if is_first_chunk {
-                prompt_token_ids = Some(
-                    content
-                        .get("prompt_token_ids")
-                        .cloned()
-                        .unwrap_or(Value::Null),
-                );
+                prompt_token_ids = content.prompt_token_ids.as_ref();
             }
         }
 
-        // An abort carrying a status is an error; Python checks for an
-        // `HTTPStatus`, which `/generate` serializes as its integer.
-        if finish_reason["type"] == "abort"
-            && let Some(code) = finish_reason.get("status_code").and_then(Value::as_u64)
-            && let Some(name) = http_status_name(code)
-        {
+        if let Some(event) = abort_event(meta.finish_reason.as_ref()) {
             self.stream.stopped = true;
-            let message = finish_reason["message"]
-                .as_str()
-                .unwrap_or("Generation aborted.");
-            return Some(stream_error_event(message, name, code as u16));
+            return Some(event);
         }
 
         let mut choice = json!({
             "index": index,
             "text": delta,
             "logprobs": logprobs,
-            "finish_reason": finish_reason.get("type"),
-            "matched_stop": finish_reason.get("matched"),
+            "finish_reason": finish_type,
+            "matched_stop": matched_stop,
         });
         if let Some(ids) = token_ids {
-            choice["token_ids"] = Value::Array(ids);
+            choice["token_ids"] = json!(ids);
         }
-        if let Some(Value::Array(ids)) = prompt_token_ids {
-            choice["prompt_token_ids"] = Value::Array(ids);
+        if let Some(ids) = prompt_token_ids {
+            choice["prompt_token_ids"] = json!(ids);
         }
         let usage_value = match self.continuous_usage_stats {
             true => self.stream.choice_usage(index, false),
             false => Value::Null,
         };
         let chunk = json!({
-            "id": meta["id"],
+            "id": meta.id,
             "object": "text_completion",
             "created": self.created,
             "model": self.model,
@@ -494,7 +485,10 @@ impl CompletionResponder {
         Some(format!("data: {chunk}\n\n"))
     }
 
-    fn stream_end(&mut self) -> Vec<String> {
+    pub fn stream_end(&mut self) -> Vec<String> {
+        if self.stream.done {
+            return Vec::new();
+        }
         self.stream.done = true;
         let mut events = Vec::new();
         let state = &self.stream;
@@ -518,24 +512,24 @@ impl CompletionResponder {
         index: u64,
         text: String,
         logprobs: Option<Value>,
-        meta: &Value,
-        item: &Value,
+        meta: &GenerateMetaInfo,
+        item: &GenerateResponse,
     ) -> Value {
-        let finish_reason = &meta["finish_reason"];
+        let (finish_type, matched_stop) = finish_fields(meta.finish_reason.as_ref());
         let mut choice = json!({
             "index": index,
             "text": text,
             "logprobs": logprobs,
-            "finish_reason": finish_reason.get("type"),
-            "matched_stop": finish_reason.get("matched"),
+            "finish_reason": finish_type,
+            "matched_stop": matched_stop,
         });
         if self.return_token_ids {
             for (key, ids) in [
-                ("token_ids", item.get("output_ids")),
-                ("prompt_token_ids", item.get("prompt_token_ids")),
+                ("token_ids", item.output_ids.as_ref()),
+                ("prompt_token_ids", item.prompt_token_ids.as_ref()),
             ] {
-                if let Some(ids) = ids.filter(|ids| !ids.is_null()) {
-                    choice[key] = ids.clone();
+                if let Some(ids) = ids {
+                    choice[key] = json!(ids);
                 }
             }
         }
@@ -546,30 +540,32 @@ impl CompletionResponder {
     /// `echo_meta` adds the prompt's logprobs from its `meta_info`.
     fn openai_logprobs(
         &self,
-        echo_meta: Option<&Value>,
-        output: &Value,
-        output_top: &Value,
+        echo_meta: Option<&GenerateMetaInfo>,
+        output: &[LogprobEntry],
+        output_top: &[NullableTopLogprobs],
     ) -> Value {
-        let input = echo_meta.map(|meta| &meta["input_token_logprobs"]);
-        let input_top = echo_meta.map(|meta| &meta["input_top_logprobs"]);
+        let input = echo_meta
+            .and_then(|meta| meta.input_token_logprobs.as_ref())
+            .map(|p| p.entries.as_slice());
+        let input_top = echo_meta.map(|meta| meta.input_top_logprobs.as_slice());
         let mut text_offset = Vec::new();
         let mut token_logprobs = Vec::new();
         let mut tokens = Vec::new();
         let mut top_logprobs = Vec::new();
         for list in [input, Some(output)].into_iter().flatten() {
-            for triple in list.as_array().into_iter().flatten() {
+            for triple in list {
                 tokens.push(json!(self.token_text(triple)));
-                token_logprobs.push(triple[0].clone());
+                token_logprobs.push(triple.logprob);
                 text_offset.push(json!(-1));
             }
         }
         for list in [input_top, Some(output_top)].into_iter().flatten() {
-            for position in list.as_array().into_iter().flatten() {
-                top_logprobs.push(match position.as_array() {
-                    Some(triples) => Value::Object(
-                        triples
+            for position in list {
+                top_logprobs.push(match position.row.as_ref() {
+                    Some(row) => Value::Object(
+                        row.entries
                             .iter()
-                            .map(|t| (self.token_text(t), t[0].clone()))
+                            .map(|t| (self.token_text(t), json!(t.logprob)))
                             .collect(),
                     ),
                     None => Value::Null,
@@ -586,17 +582,17 @@ impl CompletionResponder {
 
     /// `_lossless_token_text`: a fragment of a multi-byte character, shown as
     /// U+FFFD by the engine, is rendered as latin-1 so its bytes round-trip.
-    fn token_text(&self, triple: &Value) -> String {
-        let text = triple[2].as_str();
+    fn token_text(&self, triple: &LogprobEntry) -> String {
+        let text = triple.text.as_deref();
         if let Some(text) = text
             && !text.contains('\u{FFFD}')
         {
             return text.to_owned();
         }
         let fallback = text.unwrap_or_default().to_owned();
-        let bytes = triple[1]
-            .as_u64()
-            .and_then(|id| self.tokenizer.as_ref()?.byte_level_bytes(id as u32));
+        let bytes = u32::try_from(triple.token_id)
+            .ok()
+            .and_then(|id| self.tokenizer.as_ref()?.byte_level_bytes(id));
         match bytes {
             Some(bytes) if std::str::from_utf8(&bytes).is_err() => {
                 bytes.into_iter().map(char::from).collect()

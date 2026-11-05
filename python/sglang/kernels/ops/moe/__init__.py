@@ -61,14 +61,6 @@ register_kernel(
         capabilities=_HIP,
     )
 )
-register_kernel(
-    KernelSpec(
-        op="moe.topk_softmax",
-        backend=KernelBackend.JIT,
-        target="sglang.kernels.ops.moe.moe_topk_softmax:topk_softmax",
-        capabilities=CUDA_ONLY,
-    )
-)
 
 
 register_kernel(
@@ -269,6 +261,22 @@ register_kernel(
     )
 )
 
+# EPLB logical->physical expert id remap fused with the per-expert count.
+register_kernel(
+    KernelSpec(
+        op="moe.eplb_map_and_record",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.moe.eplb_map_record:eplb_map_and_record",
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="moe.record_physical_counts",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.moe.eplb_map_record:record_physical_counts",
+    )
+)
+
 
 # Kernels introduced with Kimi-K3, inventoried by logical operator group.
 register_kernel(
@@ -347,6 +355,15 @@ register_kernel(
         op="moe.muse_spark_post_expert_finalize",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.moe.muse_spark_post_expert_finalize_triton:fused_post_expert_norm_weighted_sum",
+        capabilities=CUDA_ONLY,
+    )
+)
+
+register_kernel(
+    KernelSpec(
+        op="moe.bailing_moe_biased_grouped_topk",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.moe.bailing_moe_topk:bailing_moe_biased_grouped_topk",
         capabilities=CUDA_ONLY,
     )
 )
