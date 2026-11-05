@@ -853,16 +853,21 @@ static inline void check_moe_scales(
   }
 }
 
-#define CHECK_MOE_SCALES_FP8(DIM0, DIM1)                      \
-  auto w1s = w1_scale.value();                                \
-  auto w2s = w2_scale.value();                                \
-  auto block_size_val = block_size.value();                   \
-  int64_t block_size_N = block_size_val[0];                   \
-  int64_t block_size_K = block_size_val[1];                   \
-  TORCH_CHECK(w1s.size(DIM0) == div_up(2 * N, block_size_N)); \
-  TORCH_CHECK(w1s.size(DIM1) == div_up(K, block_size_K));     \
-  TORCH_CHECK(w2s.size(DIM0) == div_up(K, block_size_N));     \
-  TORCH_CHECK(w2s.size(DIM1) == div_up(N, block_size_K))
+// block_size_N == 1 selects the per-channel scale layout: one scale value per
+// output row, constant across the whole reduction dim, so block_size_K is not
+// meaningful (the reduction dim differs between w1 [K] and w2 [N]) and is
+// ignored; w1s/w2s are simply expected to have a trailing dim of 1.
+#define CHECK_MOE_SCALES_FP8(DIM0, DIM1)                                            \
+  auto w1s = w1_scale.value();                                                      \
+  auto w2s = w2_scale.value();                                                      \
+  auto block_size_val = block_size.value();                                         \
+  int64_t block_size_N = block_size_val[0];                                         \
+  int64_t block_size_K = block_size_val[1];                                         \
+  bool per_channel_scale = (block_size_N == 1);                                     \
+  TORCH_CHECK(w1s.size(DIM0) == div_up(2 * N, block_size_N));                       \
+  TORCH_CHECK(w2s.size(DIM0) == div_up(K, block_size_N));                           \
+  TORCH_CHECK(w1s.size(DIM1) == (per_channel_scale ? 1 : div_up(K, block_size_K))); \
+  TORCH_CHECK(w2s.size(DIM1) == (per_channel_scale ? 1 : div_up(N, block_size_K)))
 
 // hidden_states: [M, K]
 // w1: [E, 2N, K] or [E, 2N, K / 2] for uint8

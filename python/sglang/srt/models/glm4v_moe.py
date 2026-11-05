@@ -43,6 +43,7 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
         self.config = config
         self.use_data_parallel = get_mm().mm_enable_dp_encoder
         vision_utils.update_vit_attn_dummy_heads_config(self.config)
+        vision_utils.update_vit_mlp_dummy_neurons_config(self.config)
         self.quant_config = quant_config
         # The weight loader reads this after the build.
         self.num_fused_shared_experts = get_num_fused_shared_experts()

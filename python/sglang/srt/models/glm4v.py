@@ -426,7 +426,7 @@ class Glm4vVisionModel(nn.Module):
             [
                 Glm4vVisionBlock(
                     dim=self.hidden_size,
-                    intermediate_dim=self.out_hidden_size,
+                    intermediate_dim=vision_config.mlp_hidden_size,
                     num_heads=self.num_heads,
                     quant_config=quant_config,
                     prefix=add_prefix(f"blocks.{layer_idx}", prefix),
@@ -603,6 +603,7 @@ class Glm4vForConditionalGeneration(nn.Module):
         self.config = config
         self.use_data_parallel = get_mm().mm_enable_dp_encoder
         vision_utils.update_vit_attn_dummy_heads_config(self.config)
+        vision_utils.update_vit_mlp_dummy_neurons_config(self.config)
         self.visual = Glm4vVisionModel(
             config.vision_config,
             quant_config=quant_config,

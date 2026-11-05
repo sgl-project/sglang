@@ -7,6 +7,7 @@ from typing import Callable, List, Optional
 import torch
 from compressed_tensors.quantization import QuantizationStrategy
 
+from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
 from sglang.srt.layers.parameter import (
     ChannelQuantScaleParameter,
     ModelWeightParameter,
@@ -20,8 +21,11 @@ from sglang.srt.layers.quantization.marlin_utils_fp8 import (
     prepare_fp8_layer_for_marlin,
 )
 from sglang.srt.layers.quantization.utils import convert_to_channelwise
+from sglang.srt.utils import is_cpu, use_intel_amx_backend
 
 __all__ = ["CompressedTensorsW8A16Fp8"]
+
+_is_cpu = is_cpu()
 
 SUPPORTED_STRATEGIES = [QuantizationStrategy.CHANNEL, QuantizationStrategy.TENSOR]
 
@@ -51,14 +55,21 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsLinearScheme):
                 layer.weight_scale.data, requires_grad=False
             )
 
-        # Weights must be transposed for marlin
-        layer.weight = torch.nn.Parameter(layer.weight.t(), requires_grad=False)
-
         if self.is_static_input_scheme:
             # required by torch.compile to be torch.nn.Parameter
             layer.input_scale = torch.nn.Parameter(
                 layer.input_scale.data, requires_grad=False
             )
+
+        if _is_cpu:
+            # No marlin kernel on CPU; apply_weights calls fp8_scaled_mm_cpu
+            # instead. Pack the weight to VNNI layout once here (also converts
+            # bias to float32) so apply_weights doesn't repack on every call.
+            _amx_process_weight_after_loading(layer, ["weight"])
+            return
+
+        # Weights must be transposed for marlin
+        layer.weight = torch.nn.Parameter(layer.weight.t(), requires_grad=False)
         prepare_fp8_layer_for_marlin(layer, size_k_first=True)
 
     def create_weights(
@@ -125,6 +136,20 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsLinearScheme):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if _is_cpu:
+            # block_size_N == 1 selects the per-channel (as opposed to block)
+            # weight-only scale layout in fp8_scaled_mm_cpu: one scale value
+            # per output row (layer.weight_scale is [N, 1]), constant across K.
+            # The kernel requires bias to be float32 regardless of x's dtype.
+            return torch.ops.sgl_kernel.fp8_scaled_mm_cpu(
+                x,
+                layer.weight,
+                layer.weight_scale,
+                [1, layer.weight.shape[1]],
+                bias.float() if bias is not None else None,
+                x.dtype,
+                use_intel_amx_backend(layer),  # is_vnni
+            )
         return apply_fp8_marlin_linear(
             input=x,
             weight=layer.weight,

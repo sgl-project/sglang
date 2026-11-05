@@ -587,6 +587,8 @@ class Glm4MoeSparseMoeBlock(nn.Module):
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        # TODO: CUDA-graph-capture-only path (gated by get_is_capture_mode()); CPU has
+        # no CUDA graph capture so torch.cuda.current_stream() below is never reached.
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
         shared_output = self._forward_shared_experts(hidden_states)
@@ -1013,8 +1015,10 @@ class Glm4MoeForCausalLM(nn.Module):
     def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
         """Why this checkpoint cannot fuse its shared expert, or None. Asked by
         the loader before any layer is built."""
-        if (not _is_cuda or torch.cuda.get_device_capability("cuda") < (8, 0)) and (
-            not _is_hip or torch.cuda.get_device_capability("cuda") < (9, 4)
+        if (
+            (not _is_cuda or torch.cuda.get_device_capability("cuda") < (8, 0))
+            and (not _is_hip or torch.cuda.get_device_capability("cuda") < (9, 4))
+            and not _is_cpu
         ):
             return (
                 "Only GLM-4.5 on NV-platform with capability >= 80 "
@@ -1297,6 +1301,7 @@ class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):
     # ModelConfig rewrites a GLM draft's architecture to this class's own name,
     # so the inherited DeepSeek name would never match what the gate compares.
     fused_shared_experts_architecture = "GlmMoeDsaForCausalLMNextN"
+    # TODO: MTP/NextN (speculative decoding) is not verified to work on CPU.
     # GLM-5.2's MTP layer index differs from DeepSeek's (61), so the inherited
     # substr mapping would wrongly rewrite GLM's real layer-61 weights.
     # exclude_layers remapping for the MTP layer is handled explicitly in
