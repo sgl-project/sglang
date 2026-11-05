@@ -9,9 +9,10 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
-from sglang.srt.managers.scheduler import DisaggregationMode, Scheduler
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.runtime_context import (
     get_device,
     get_disagg,

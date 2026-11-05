@@ -19,12 +19,10 @@ import torch.multiprocessing as mp
 
 from sglang.srt.environ import envs
 from sglang.srt.kv_canary.token_oracle.oracle import HashOracle
-from sglang.srt.managers.schedule_batch import FINISH_LENGTH
+from sglang.srt.managers.req_types import FINISH_LENGTH
 from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.model_executor.forward_batch_info import (
-    ForwardMode,
-    _stable_hash_str_to_i64,
-)
+from sglang.srt.model_executor.forward_batch_info import _stable_hash_str_to_i64
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.utils.network import get_open_port
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.mock_model.utils import MOCK_MODEL_PATH
