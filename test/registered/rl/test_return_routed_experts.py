@@ -493,19 +493,23 @@ class TestRoutedExpertsStartLen(CustomTestCase):
         resp = self._send(self._build_payload(routed_experts_start_len=-2))
         self._assert_aborted(resp, "is lower than -1")
 
-    def test_start_len_minus_one_survives_intake_abort(self):
+    def test_negative_start_len_survives_intake_abort(self):
         """A request rejected by an intake check that runs before the
-        routed-experts check (here an out-of-range logprob_start_len) must be
-        aborted on its own and leave the server serving."""
+        routed-experts check (here an out-of-range logprob_start_len) keeps its
+        negative start; it must be aborted on its own and leave the server
+        serving."""
         aborted = self._send(
             self._build_payload(
-                routed_experts_start_len=-1,
+                routed_experts_start_len=-5,
                 return_logprob=True,
                 logprob_start_len=1_000_000,
             )
         )
         self._assert_aborted(aborted, "is higher than the number of input tokens")
 
+        resp = self._send(self._build_payload())
+        self.assertEqual(resp.status_code, 200, resp.text)
+        # -1 still resolves to the generated rows afterwards.
         resp = self._send(self._build_payload(routed_experts_start_len=-1))
         self.assertEqual(resp.status_code, 200, resp.text)
         self.assertEqual(
