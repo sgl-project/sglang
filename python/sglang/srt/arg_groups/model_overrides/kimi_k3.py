@@ -227,6 +227,11 @@ def _kimi_k31_overrides(server_args: Any, hf_config: Any) -> dict:
                 "(--dsa-topk-backend sgl-kernel, SGLANG_OPT_USE_TOPK_V2 and "
                 "SGLANG_DSA_FUSE_TOPK on)."
             )
+        if cfg.enable_return_indexer_topk:
+            # the sharded indexer returns only this rank's local KV slots
+            raise ValueError(
+                "Kimi-K3.1 DCP does not support --enable-return-indexer-topk."
+            )
         if cfg.dcp_replicate_q_proj is None and cfg.dcp_comm_backend in (
             "a2a",
             "fi_a2a",
