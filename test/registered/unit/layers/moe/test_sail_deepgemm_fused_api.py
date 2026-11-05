@@ -393,7 +393,7 @@ class TestDeepGemmMaskedActivationContract(CustomTestCase):
                     stack.enter_context(patch.object(module, name, value))
             stack.enter_context(
                 patch.object(
-                    runner_module.deep_gemm_wrapper,
+                    sail_entrypoint,
                     "grouped_gemm_nt_bf16_masked",
                     gemm,
                 )
@@ -417,6 +417,80 @@ class TestDeepGemmMaskedActivationContract(CustomTestCase):
 
         torch.testing.assert_close(result, torch.full_like(result, 3))
         self.assertEqual(situ_calls, [(4.0, 6.0, 1, 1)])
+
+    def test_blockwise_masked_fp8_keeps_upstream_dispatch_but_sail_entrypoint(self):
+        """Blockwise FP8 masked runs the shared ``_run_masked_gemm`` yet must land
+        on the SAIL wrapper: that build spells the SBO switch differently."""
+        from sglang.srt.hardware_backend.sail.moe import deepgemm_ep as ep_module
+        from sglang.srt.layers.moe.moe_runner import deep_gemm as runner_module
+        from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+
+        quant = runner_module.DeepGemmMoeQuantInfo(
+            w13_weight=torch.empty((2, 512, 256), dtype=torch.float8_e4m3fn),
+            w2_weight=torch.empty((2, 64, 128), dtype=torch.float8_e4m3fn),
+            w13_scale=torch.ones((2, 512, 2)),
+            w2_scale=torch.ones((2, 64, 1)),
+            use_fp8=True,
+        )
+        runner = object.__new__(ep_module.SailDeepGemmEpRunnerCore)
+        runner.config = MoeRunnerConfig(top_k=1)
+        runner.swiglu_limit = None
+        runner.use_swizzle = False
+        calls = []
+
+        def gemm(lhs, rhs, out, *args, **kw):
+            calls.append(lhs[0].shape)
+            out.fill_(1)
+
+        def act(gateup, masked_m, **kw):
+            return (
+                torch.empty((2, 3, 128), dtype=torch.float8_e4m3fn),
+                torch.ones((2, 3, 1)),
+            )
+
+        def upstream(*args, **kw):
+            raise AssertionError("must not use the shared wrapper")
+
+        with ExitStack() as stack:
+            for module in (runner_module, ep_module):
+                for name, value in (
+                    ("_is_sail", True),
+                    ("dispose_tensor", lambda x: None),
+                    ("get_parallel", lambda: SimpleNamespace(tp_group=None)),
+                    ("use_symmetric_memory", lambda *a, **kw: nullcontext()),
+                    ("is_allocation_symmetric", lambda: False),
+                ):
+                    stack.enter_context(patch.object(module, name, value))
+            stack.enter_context(
+                patch.object(runner_module, "_varlen_deep_gemm_silu_mul_quant", act)
+            )
+            for flag in ("DEEPGEMM_SCALE_UE8M0", "DEEPGEMM_NEED_TMA_ALIGNED_SCALES"):
+                stack.enter_context(
+                    patch.object(runner_module.deep_gemm_wrapper, flag, False)
+                )
+            stack.enter_context(
+                patch.object(
+                    runner_module.deep_gemm_wrapper,
+                    "grouped_gemm_nt_f8f8bf16_masked",
+                    upstream,
+                )
+            )
+            stack.enter_context(
+                patch.object(sail_entrypoint, "grouped_gemm_nt_f8f8bf16_masked", gemm)
+            )
+            payload = runner_module.DeepGemmRunnerInput(
+                torch.empty((2, 3, 256), dtype=torch.float8_e4m3fn),
+                torch.ones((2, 3, 2)),
+                True,
+                masked_m=torch.tensor([1, 2], dtype=torch.int32),
+                expected_m=2,
+            )
+            state = {"hidden_states_device": torch.device("cpu")}
+            result = runner.run(payload, quant, state).hidden_states
+
+        # Two calls: GEMM1 over K=256, GEMM2 over the halved N.
+        self.assertEqual(calls, [(2, 3, 256), (2, 3, 128)])
+        self.assertEqual(result.shape, (2, 3, 64))
 
     def test_launch_scale_capacity_and_non_power_of_two_channel_width(self):
         """The per-token scale write bound must not exceed the capacity; a 1536-wide

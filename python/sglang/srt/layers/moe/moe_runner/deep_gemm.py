@@ -791,6 +791,16 @@ class DeepGemmRunnerCore(MoeRunnerCore):
 
         return down_output
 
+    def _grouped_gemm_nt_f8f8bf16_masked(self, *args, **kwargs):
+        """Masked FP8 grouped GEMM entry point.
+
+        Platform cores override this when their DeepGEMM build exposes the same
+        GEMM under a different API; the shared dispatch then stays vendor-neutral.
+        """
+        from sglang.srt.layers import deep_gemm_wrapper
+
+        return deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(*args, **kwargs)
+
     def _run_masked_gemm(
         self,
         runner_input: DeepGemmRunnerInput,
@@ -867,7 +877,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 n,
             )
             raise
-        deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
+        self._grouped_gemm_nt_f8f8bf16_masked(
             (hidden_states, hidden_states_scale),
             (w13_weight, w13_scale),
             gateup_output,
@@ -969,7 +979,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 "max_block_n": max_block_n,
             }
 
-        deep_gemm_return_value = deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
+        deep_gemm_return_value = self._grouped_gemm_nt_f8f8bf16_masked(
             (down_input, down_input_scale),
             (w2_weight, w2_scale),
             down_output,
