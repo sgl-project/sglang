@@ -433,6 +433,8 @@ class DSAInterleaveCPIndexerOverlap:
         )
 
     def _can_overlap(self):
+        # Function-local: dsa_backend imports sglang.srt.layers.cp, which imports this.
+        from sglang.srt.layers.attention.dsa_backend import uses_raw_fp8_dsa_kv_layout
         from sglang.srt.model_executor.forward_context import get_attn_backend
         from sglang.srt.utils import is_cuda
 
@@ -447,7 +449,7 @@ class DSAInterleaveCPIndexerOverlap:
             return True
         backend = get_attn_backend()
         return (
-            getattr(backend, "dsa_prefill_impl", None) == "trtllm"
+            uses_raw_fp8_dsa_kv_layout(getattr(backend, "dsa_prefill_impl", None))
             and not backend.use_mha
         )
 
