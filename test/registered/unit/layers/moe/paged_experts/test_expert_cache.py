@@ -4,6 +4,7 @@ directories for the cache. The loading helpers are test_paged_experts.py's."""
 import contextlib
 import errno
 import fcntl
+import gc
 import itertools
 import mmap
 import os
@@ -13,6 +14,7 @@ import tempfile
 import threading
 import time
 import unittest
+import weakref
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -620,6 +622,40 @@ class TestExpertCache(_CacheCase):
         self.assertNotEqual(label(long_a), label(long_b))
         self.assertLessEqual(len(label(long_a)), 80)
         self.assertTrue(label(long_a).startswith("org--xxx"))
+
+
+class TestFirstGroupReleased(_CacheCase):
+    """A repacking step's rows are views of the layer's whole K-slot table (on the GPU when
+    serving). The first checked group's rows must be gone when the next run builds another
+    table, unless the build takes them as its first chunk."""
+
+    def _alive_at_second_run(self, folder, width):
+        run, first, alive = PostLoad.run, [], []
+
+        def tracked(step, experts, out=None):
+            if first and not alive:
+                gc.collect()
+                alive.append(any(ref() is not None for ref in first))
+            rows = run(step, experts, out)
+            if not first:
+                first.extend(weakref.ref(t) for t in rows.values())
+            return rows
+
+        with patch.object(PostLoad, "run", tracked):
+            self._start(folder, num_slots=K, width=width)
+        return alive[0]
+
+    def test_released_before_the_next_table(self):
+        with tempfile.TemporaryDirectory() as d:
+            # No entry, groups narrower than K: the build cannot take them as chunk 0.
+            self.assertFalse(self._alive_at_second_run(d, TOP_K))
+            # The entry is read: the check's next group runs.
+            self.assertFalse(self._alive_at_second_run(d, TOP_K))
+
+    def test_kept_when_the_build_takes_them(self):
+        # Control: the tracking sees rows that are still in use.
+        with tempfile.TemporaryDirectory() as d:
+            self.assertTrue(self._alive_at_second_run(d, K))
 
 
 class TestCheckedGroups(CustomTestCase):

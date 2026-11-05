@@ -526,6 +526,9 @@ def fill_store(step, cache: Optional[ExpertCache], width: int) -> HostExpertStor
         store = HostExpertStore(step.rows_like, loads.num_experts)
         if cache.read(store.host):
             ran_check = True
+            # Compared on the host: a repacking step's rows are views of the layer's whole
+            # K-slot table on the GPU, which must not stay alive next to the later groups'.
+            first = {name: rows.to("cpu", copy=True) for name, rows in first.items()}
             stale = check_groups(step, store, groups, first)
             if stale is None:
                 restored = True
@@ -541,7 +544,9 @@ def fill_store(step, cache: Optional[ExpertCache], width: int) -> HostExpertStor
     reuse = not ran_check and groups[0] == list(
         range(min(loads.num_slots, loads.num_experts))
     )
-    store = build_store(step, first if reuse else None, store)
+    if not reuse:
+        first = None  # its K-slot table must not stay alive next to the build's
+    store = build_store(step, first, store)
     cache.save(store.host)
     return store
 
