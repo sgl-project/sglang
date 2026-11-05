@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
+    get_sparse_kv_budget,
     get_sparsity_driven_kv_offload_cell_size,
     get_sparsity_driven_kv_offload_sparse_context_len,
     is_sparsity_driven_kv_offload_enabled,
@@ -27,6 +28,38 @@ def _make_glm51_model_config():
 
 
 class TestSparsityDrivenKVOffloadConfig(unittest.TestCase):
+    def test_graph_alignment_is_reserved_before_buckets_are_resolved(self):
+        from sglang.srt.environ import envs
+
+        prefix = "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config."
+        with (
+            envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.override(True),
+            envs.SGLANG_NPU_SPARSE_KV_CACHE_SIZE.override(0),
+            envs.SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB.override(0),
+            patch(
+                prefix + "get_exec",
+                return_value=SimpleNamespace(
+                    graph=SimpleNamespace(
+                        disable_cuda_graph=False, cuda_graph_config=None
+                    )
+                ),
+            ),
+            patch(prefix + "get_cuda_graph_max_batch_size", return_value=32),
+            patch(prefix + "get_eager_max_batch_size", return_value=24),
+            patch(
+                prefix + "get_spec",
+                return_value=SimpleNamespace(speculative_num_draft_tokens=1),
+            ),
+        ):
+            plan = get_sparse_kv_budget(
+                request_rows=18,
+                context_len=4097,
+                num_layers=2,
+                top_k=2048,
+                kv_bytes_per_token=1152,
+            )
+        self.assertEqual(plan.batch_capacity, 32)
+
     def test_glm_dsa_model_enables_sparse_kv_offload(self):
         with (
             patch.dict(

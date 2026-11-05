@@ -21,12 +21,6 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.block_tables imp
     fill_request_block_table,
     prepare_prefill_gather_rows,
 )
-from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.budget import (
-    sparse_batch_capacity,
-)
-from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
-    get_sparse_kv_budget,
-)
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.copy_sfa_buffers import (
     copy_sfa_host_row_stride,
     view_copy_sfa_output,
@@ -113,9 +107,10 @@ class SparseKVCacheManager:
         # Include the padding row because real request IDs can equal the
         # configured capacity when row 0 is reserved for graph padding.
         self.size = int(req_to_token_pool.req_to_token.shape[0])
-        self.batch_capacity = sparse_batch_capacity(
+        self.batch_capacity = max(
             self.size,
-            max(graph_batch_capacity, get_eager_max_batch_size(self.size - 1)),
+            graph_batch_capacity,
+            get_eager_max_batch_size(self.size - 1),
         )
         self.last_decode_path = "unselected"
         self.logical_max_context_len = int(req_to_token_pool.max_context_len)
@@ -151,16 +146,7 @@ class SparseKVCacheManager:
         )
         self.store_dtype = self.paged_kv_cache.store_dtype
         self.layer_num = self.paged_kv_cache.layer_num
-        self.budget = get_sparse_kv_budget(
-            request_rows=self.size,
-            context_len=self.max_context_len,
-            num_layers=self.layer_num,
-            top_k=self.sparse_context_len,
-            kv_bytes_per_token=self.head_dim * self.store_dtype.itemsize,
-            copy_sfa_query_heads=copy_sfa_padded_query_heads or 128,
-            graph_batch_capacity=self.batch_capacity,
-        )
-        self.device_cache_size = self.budget.cache_tokens
+        self.device_cache_size = self.sparse_context_len
         self.indexer_impl = "legacy"
         self.use_lru = (
             self.device_cache_size > self.sparse_context_len
@@ -172,11 +158,9 @@ class SparseKVCacheManager:
             else (self.max_context_len // 8 + 1) * 8
         )
         logger.info(
-            "Sparse KV per rank: K=%d C=%d, managed HBM=%.2f MiB, host KV=%.2f MiB, LRU=%s",
+            "Sparse KV per rank: K=%d C=%d, LRU=%s",
             self.sparse_context_len,
             self.device_cache_size,
-            self.budget.managed_hbm_bytes / 1024**2,
-            self.budget.host_kv_bytes / 1024**2,
             self.use_lru,
         )
         self.cache_capacity = self.device_cache_size

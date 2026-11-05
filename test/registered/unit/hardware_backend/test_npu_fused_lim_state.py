@@ -74,17 +74,15 @@ class TestLIMState(CustomTestCase):
         for width in (1, 2, 3, 4, 5, 8, 14):
             budget = resolve_sparse_kv_budget(**self.options(max_query_width=width))
             self.assertEqual(budget.cache_tokens, width * 2048)
-            self.assertEqual(budget.selected_kv_bytes, 0)
-            self.assertEqual(budget.policy_bytes, 0)
 
     def test_budget_rejects_insufficient_union_capacity_and_width(self):
         for width in (2, 3, 5, 14):
-            with self.assertRaisesRegex(ValueError, "query width"):
+            with self.assertRaisesRegex(ValueError, "query"):
                 resolve_sparse_kv_budget(
                     **self.options(max_query_width=width, cache_tokens=2048)
                 )
         for width in (0, 15):
-            with self.assertRaisesRegex(ValueError, "query width"):
+            with self.assertRaisesRegex(ValueError, "query"):
                 resolve_sparse_kv_budget(**self.options(max_query_width=width))
 
     def test_graph_padding_grows_scratch_not_request_residency(self):
@@ -104,6 +102,7 @@ class TestLIMState(CustomTestCase):
         prefix = "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload."
         for width in (1, 3, 4, 8, 14):
             manager = SimpleNamespace(
+                budget=resolve_sparse_kv_budget(**self.options(max_query_width=width)),
                 cache_capacity=width * 2048,
                 size=3,
                 batch_capacity=8,
@@ -120,11 +119,24 @@ class TestLIMState(CustomTestCase):
                     )
                 ),
             )
+            pool = manager.paged_kv_cache
+            pool.size, pool.page_size, pool.layer_num, pool.start_layer = (
+                32640,
+                128,
+                2,
+                0,
+            )
+            pool.store_dtype, pool.kv_lora_rank, pool.qk_rope_head_dim = (
+                torch.bfloat16,
+                512,
+                64,
+            )
+            manager.budget.bind_native_pool(pool)
             pre, post = ModuleType("pre"), ModuleType("post")
             pre.fused_prepare_lim_metadata = Mock()
             post.fused_lim_copy_sfa_metadata = Mock()
             with (
-                patch(prefix + "lim.load_fused_lim_operator", return_value=None),
+                patch(prefix + "fused_lim.load_fused_lim_operator", return_value=None),
                 patch.object(
                     torch.ops.npu,
                     "lim_full_visible_max_query_width",
@@ -147,6 +159,149 @@ class TestLIMState(CustomTestCase):
             )
             budget = resolve_sparse_kv_budget(**self.options(max_query_width=width))
             self.assertEqual(budget.adapter_bytes, allocated)
+
+    def test_plan_alignment_and_limits(self):
+        for width in (1, 4):
+            for batch in (3, 8):
+                with self.subTest(width=width, batch=batch):
+                    options = {
+                        **self.options(),
+                        "context_len": 4097,
+                        "graph_batch_capacity": batch,
+                        "max_query_width": width,
+                    }
+                    plan = resolve_sparse_kv_budget(**options)
+                    self.assertEqual(plan.context_len, 4224)
+                    self.assertEqual(plan.batch_capacity, batch)
+
+                    self.assertEqual(
+                        resolve_sparse_kv_budget(
+                            **options, hbm_budget_bytes=plan.managed_hbm_bytes
+                        ).managed_hbm_bytes,
+                        plan.managed_hbm_bytes,
+                    )
+                    with self.assertRaisesRegex(ValueError, "exceeding"):
+                        resolve_sparse_kv_budget(
+                            **options, hbm_budget_bytes=plan.managed_hbm_bytes - 1
+                        )
+        with self.assertRaises(ValueError):
+            resolve_sparse_kv_budget(**self.options(kv_dtype=torch.float32))
+
+    def test_manager_and_adapter_use_same_bound_plan(self):
+        from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool, ReqToTokenPool
+
+        native_package = ModuleType("sgl_kernel_npu")
+        native_package.__path__ = []
+        native_api = ModuleType("sgl_kernel_npu.sparsity_driven_kv_offload")
+        native_api.create_shm_tensor = Mock()
+        native_api.unidex_copy_inplace = Mock()
+        module_name = (
+            "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_manager"
+        )
+        with patch.dict(
+            sys.modules,
+            {
+                "sgl_kernel_npu": native_package,
+                "sgl_kernel_npu.sparsity_driven_kv_offload": native_api,
+            },
+        ):
+            fused_manager = importlib.import_module(module_name)
+
+        prefix = "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload."
+        plan = resolve_sparse_kv_budget(
+            request_rows=4,
+            context_len=4097,
+            num_layers=2,
+            top_k=2048,
+            kv_bytes_per_token=1152,
+            max_query_width=4,
+            cache_tokens=8192,
+            graph_batch_capacity=8,
+        )
+        pool = object.__new__(MLATokenToKVPool)
+        pool.size, pool.page_size, pool.layer_num, pool.start_layer = 4096, 128, 2, 0
+        pool.store_dtype, pool.kv_lora_rank, pool.qk_rope_head_dim = (
+            torch.bfloat16,
+            512,
+            64,
+        )
+        pool.get_index_k_buffer = lambda _: torch.empty(
+            (33, 128, 1, 128), dtype=torch.bfloat16
+        )
+        pool.sparse_kv_budget_plan = plan
+        pool.indexer_layer_ids = (1,)
+        pool.get_index_k_buffer = Mock(return_value=pool.get_index_k_buffer(0))
+        req_pool = ReqToTokenPool(2, 4097, "cpu", False)
+        req_pool.req_to_token[2, 4096] = 73
+        pre, post = ModuleType("pre"), ModuleType("post")
+        pre.fused_prepare_lim_metadata = Mock()
+        post.fused_lim_copy_sfa_metadata = Mock()
+
+        def shm(shape, dtype, device_id, name):
+            tensor = torch.empty(shape, dtype=dtype)
+            return tensor, tensor.data_ptr(), tensor.data_ptr()
+
+        with (
+            patch.object(fused_manager, "load_copy_sfa_operator", return_value=None),
+            patch.object(fused_manager, "create_shm_tensor", side_effect=shm),
+            patch.object(
+                torch, "npu", SimpleNamespace(current_device=lambda: 0), create=True
+            ),
+            patch(prefix + "fused_lim.load_fused_lim_operator", return_value=None),
+            patch.object(
+                torch.ops.npu,
+                "lim_full_visible_max_query_width",
+                SimpleNamespace(default=lambda: 14),
+                create=True,
+            ),
+            patch.dict(
+                sys.modules,
+                {
+                    prefix + "npu_lim_input_metadata": pre,
+                    prefix + "npu_lim_copy_sfa_metadata": post,
+                },
+            ),
+        ):
+            manager = fused_manager.SparseKVCacheManager(
+                req_pool, None, 2048, graph_batch_capacity=8, paged_kv_cache=pool
+            )
+        self.assertIs(manager.budget, plan)
+        self.assertIs(pool.sparse_kv_budget_plan, plan)
+        pool.get_index_k_buffer.assert_called_with(1)
+
+        def actual_bytes(owner, names):
+            tensors = [getattr(owner, name) for name in names]
+            return sum(
+                t.numel() * t.element_size()
+                for value in tensors
+                for t in (value if isinstance(value, list) else [value])
+            )
+
+        self.assertEqual(
+            actual_bytes(manager, plan.manager_buffers)
+            + actual_bytes(manager.lim_adapter, plan.adapter_buffers),
+            plan.managed_hbm_bytes,
+        )
+        self.assertEqual(
+            manager.lim_adapter.key_scale.numel()
+            * manager.lim_adapter.key_scale.element_size(),
+            (4096 + 128) * 4,
+        )
+        self.assertIs(plan.bind_native_pool(pool), plan)
+        self.assertEqual(
+            manager.host_source_indices(
+                torch.tensor([3, 99]), torch.tensor([4096, 9999])
+            ).tolist(),
+            [73, 73],
+        )
+        original = manager.lim_adapter.source_ids
+        manager.lim_adapter.source_ids = original[:1]
+        with self.assertRaises(ValueError):
+            plan.validate_buffers(manager.lim_adapter, plan.adapter_buffers)
+        manager.lim_adapter.source_ids = original
+        pool.size = 3968
+        with self.assertRaises(ValueError):
+            plan.bind_native_pool(pool)
 
     def test_tp_suffix_does_not_extend_actual_query_windows(self):
         for width in (2, 3, 5, 8, 14):

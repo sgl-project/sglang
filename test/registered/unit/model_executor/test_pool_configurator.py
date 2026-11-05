@@ -99,6 +99,8 @@ def _make_model_runner(
 
     mr.use_mla_backend = use_mla_backend
     mr.is_draft_worker = False
+    mr.sparse_kv_budget_plan = None
+    mr._dsa_indexer_layer_ids = None
     mr.num_effective_layers = num_layers
     mr.start_layer = 0
     mr.end_layer = num_layers
@@ -110,6 +112,7 @@ def _make_model_runner(
 
     mc = SimpleNamespace()
     mc.head_dim = head_dim
+    mc.num_attention_heads = 128
     mc.v_head_dim = v_head_dim
     mc.kv_lora_rank = kv_lora_rank
     mc.qk_rope_head_dim = qk_rope_head_dim
@@ -182,6 +185,11 @@ def _make_model_runner(
         swa_attention_layer_ids=list(mc.swa_attention_layer_ids),
         full_attention_layer_ids=list(mc.full_attention_layer_ids),
         is_hybrid_swa_mtp_draft=False,
+    )
+    from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+    mr.get_dsa_indexer_layer_ids = lambda: (
+        KVCacheConfigurator.get_dsa_indexer_layer_ids(mr)
     )
     mr.attn_dp_size = 1
     mr.pp_size = 1
@@ -446,6 +454,9 @@ class TestDefaultConfigurator(CustomTestCase):
 
     def test_sparse_offload_cell_size_uses_compact_target_indexer_and_draft(self):
         from sglang.srt.environ import envs
+        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
+            get_sparse_kv_budget,
+        )
         from sglang.srt.model_executor.pool_configurator import DefaultPoolConfigurator
 
         mr = _make_model_runner(
@@ -482,6 +493,7 @@ class TestDefaultConfigurator(CustomTestCase):
                 speculative_eagle_topk=1,
             ),
             envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.override(True),
+            envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.override(True),
             envs.SGLANG_NPU_SPARSE_KV_CACHE_SIZE.override(12288),
             envs.SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB.override(0),
             mock_cpu_env(kv_size=2),
@@ -490,14 +502,6 @@ class TestDefaultConfigurator(CustomTestCase):
                 return_value=True,
             ),
             patch("sglang.srt.model_executor.pool_configurator._is_npu", True),
-            patch(
-                "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.get_sparsity_driven_kv_offload_cell_size",
-                side_effect=lambda **kwargs: (
-                    kwargs["num_layers"]
-                    * kwargs["model_config"].index_head_dim
-                    * kwargs["element_size"]
-                ),
-            ),
             patch(
                 "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.is_sparsity_driven_kv_offload_enabled",
                 return_value=True,
@@ -508,7 +512,7 @@ class TestDefaultConfigurator(CustomTestCase):
             ),
             patch(
                 "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.get_sparse_kv_budget",
-                return_value=SimpleNamespace(managed_hbm_bytes=123),
+                wraps=get_sparse_kv_budget,
             ) as mock_sparse_budget,
             patch(
                 "sglang.srt.mem_cache.kv_cache_configurator._should_elide_dsa_index_k",
@@ -524,13 +528,45 @@ class TestDefaultConfigurator(CustomTestCase):
             ),
         ):
             cfg = DefaultPoolConfigurator(mr)
+            second_cfg = DefaultPoolConfigurator(mr)
 
         # One compact target indexer, one FP32 scale workspace, and the
         # draft's full native CKV/KPE plus indexer remain in HBM.
         self.assertEqual(len(owner_ids), 21)
         self.assertEqual(cfg._cell_size, (21 + 1) * 128 * 2 + 576 * 2 + 4)
-        self.assertEqual(cfg._fixed_overhead_bytes, 123 + 128 * 4)
+        self.assertEqual(
+            cfg._fixed_overhead_bytes,
+            mr.sparse_kv_budget_plan.managed_hbm_bytes + 128 * 4,
+        )
+        self.assertEqual(second_cfg._fixed_overhead_bytes, cfg._fixed_overhead_bytes)
         self.assertEqual(mock_sparse_budget.call_count, 1)
+
+    def test_legacy_offload_does_not_reserve_fused_buffers(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.model_executor.pool_configurator import DefaultPoolConfigurator
+
+        mr = _make_model_runner(self, num_layers=2, use_mla_backend=True)
+        _configure_dsa_model(mr)
+        mr.model_config.index_head_dim = 128
+        mr.kv_cache_dtype = torch.bfloat16
+        with (
+            envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.override(True),
+            envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.override(False),
+            mock_cpu_env(kv_size=2),
+            patch(
+                "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.is_sparsity_driven_kv_offload_enabled",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.get_sparse_kv_budget",
+                side_effect=AssertionError("Legacy must not resolve a fused budget"),
+            ),
+        ):
+            cfg = DefaultPoolConfigurator(mr)
+
+        self.assertEqual(cfg._cell_size, 2 * 128 * 2)
+        self.assertEqual(cfg._fixed_overhead_bytes, 0)
+        self.assertIsNone(mr.sparse_kv_budget_plan)
 
     def test_fused_draft_entry_overrides_the_layer_ratio(self):
         """A fused draft prices the exact fused entry (host + draft + pad);
@@ -1121,6 +1157,7 @@ class TestEagleConfigurator(CustomTestCase):
                 speculative_eagle_topk=1,
             ),
             envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.override(True),
+            envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.override(True),
             envs.SGLANG_NPU_SPARSE_KV_CACHE_SIZE.override(8192),
             envs.SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB.override(0),
             # Isolate the hardware predicate; all config decisions are real.
@@ -1141,6 +1178,7 @@ class TestEagleConfigurator(CustomTestCase):
                 context_len=8192 + get_req_to_token_extra_context_len(),
                 top_k=2048,
                 kv_bytes_per_token=576 * 2,
+                copy_sfa_query_heads=128,
             )
             unpadded = get_sparse_kv_budget(num_layers=4, **options)
             manager_bytes = unpadded.managed_hbm_bytes
@@ -1161,6 +1199,7 @@ class TestEagleConfigurator(CustomTestCase):
                 envs.SGLANG_NPU_SPARSE_KV_CACHE_SIZE.override(0),
                 envs.SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB.override(128),
             ):
+                mr.sparse_kv_budget_plan = None
                 capped = DefaultPoolConfigurator(mr)
                 actual = get_sparse_kv_budget(num_layers=4, **options)
                 self.assertEqual(
@@ -1183,7 +1222,6 @@ class TestEagleConfigurator(CustomTestCase):
                 padded = get_sparse_kv_budget(
                     num_layers=4, graph_batch_capacity=0, **options
                 )
-                self.assertEqual(padded.selected_kv_bytes, 0)
                 self.assertEqual(padded.device_kv_bytes, 3 * 4 * 8192 * 1152)
                 self.assertGreater(padded.copy_sfa_bytes, unpadded.copy_sfa_bytes)
 
@@ -1219,6 +1257,7 @@ class TestEagleConfigurator(CustomTestCase):
         )
         with (
             envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.override(True),
+            envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.override(True),
             envs.SGLANG_NPU_SPARSE_KV_CACHE_SIZE.override(8192),
             envs.SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB.override(0),
             patch(
@@ -1248,7 +1287,9 @@ class TestEagleConfigurator(CustomTestCase):
             ),
             patch(
                 "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config.get_sparse_kv_budget",
-                return_value=SimpleNamespace(managed_hbm_bytes=123),
+                return_value=SimpleNamespace(
+                    managed_hbm_bytes=123, scale_element_size=torch.float32.itemsize
+                ),
             ) as mock_sparse_budget,
             mock_cpu_env(tp_size=16),
         ):
@@ -1281,6 +1322,7 @@ class TestEagleConfigurator(CustomTestCase):
                     ):
                         mr.dp_size = dp
                         mr.attn_dp_size = attn_dp
+                        mr.sparse_kv_budget_plan = None
                         DefaultPoolConfigurator(mr)
 
                     calls = mock_sparse_budget.call_args_list

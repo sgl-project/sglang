@@ -62,58 +62,25 @@ class LIMDecodeAdapter:
         self._fused_prepare_lim_metadata = fused_prepare_lim_metadata
         self._fused_copy_sfa_metadata = fused_lim_copy_sfa_metadata
         device = manager.device
-        tokens = self.batch_capacity * self.max_query_width
-        self.source_ids = torch.empty(
-            (tokens, 1, self.top_k), dtype=torch.int32, device=device
-        )
-        self.device_slots = torch.empty_like(self.source_ids)
-        self.topk_misses = torch.empty(tokens, dtype=torch.int32, device=device)
-        self.miss_sources = torch.empty(
-            (self.batch_capacity, 32768), dtype=torch.int32, device=device
-        )
-        self.miss_slots = torch.empty_like(self.miss_sources)
-        self.miss_counts = torch.empty(
-            self.batch_capacity, dtype=torch.int32, device=device
-        )
-        self.query_scale = torch.empty((tokens, 64), dtype=torch.float32, device=device)
-        self.query_ends = (
-            torch.arange(1, self.batch_capacity + 1, dtype=torch.int32, device=device)[
-                None
-            ]
-            * torch.arange(
-                1, self.max_query_width + 1, dtype=torch.int32, device=device
-            )[:, None]
-        )
-        self.block_table = torch.empty(
-            (self.batch_capacity, self.source_capacity // 128),
-            dtype=torch.int32,
-            device=device,
-        )
-        self.last_prefix = torch.full(
-            (manager.layer_num, self.rows + 1), -1, dtype=torch.int32, device=device
-        )
-        self._metadata_prefix_scratch = torch.full(
-            (self.rows + 1,), -1, dtype=torch.int32, device=device
-        )
-        self._pre_safe_slots = torch.empty(
-            self.batch_capacity, dtype=torch.int32, device=device
-        )
-        self._pre_lengths = torch.empty_like(self._pre_safe_slots)
-        self._pre_prefixes = torch.empty_like(self._pre_safe_slots)
-        self._pre_states = torch.empty_like(self._pre_safe_slots)
-        self._pre_next_prefix = torch.empty_like(self._pre_safe_slots)
-        self._pre_cache_sizes = torch.empty_like(self._pre_safe_slots)
-        self._pre_sparse = torch.empty(
-            self.batch_capacity, dtype=torch.bool, device=device
-        )
-        self._pre_valid = torch.empty_like(self._pre_sparse)
-        key = manager.paged_kv_cache.get_index_k_buffer(manager.start_layer)
-        if key.dtype != torch.bfloat16 or manager.store_dtype != torch.bfloat16:
-            raise ValueError("Native LIM requires BF16 index and KV caches.")
-        if key.ndim != 4 or key.shape[1:] != (128, 1, 128):
-            raise ValueError("Native LIM requires index keys [pages,128,1,128].")
-        # Charged to the index-cache pool coefficient rather than this adapter.
-        self.key_scale = torch.empty(key.shape[:3], dtype=torch.float32, device=device)
+        for name, spec in manager.budget.adapter_buffers.items():
+            if name == "query_ends":
+                value = (
+                    torch.arange(
+                        1, self.max_query_width + 1, dtype=spec.dtype, device=device
+                    )[:, None]
+                    * torch.arange(
+                        1, self.batch_capacity + 1, dtype=spec.dtype, device=device
+                    )[None, :]
+                )
+            elif name in ("last_prefix", "_metadata_prefix_scratch"):
+                value = spec.allocate(device, fill_value=-1)
+            else:
+                value = spec.allocate(device)
+            setattr(self, name, value)
+        spec = manager.budget.key_scale_spec
+        self.key_scale = spec.allocate(device)
+        spec.validate(self.key_scale, "key_scale")
+        manager.budget.validate_buffers(self, manager.budget.adapter_buffers)
 
     def reset_requests(self, request_slots):
         self.last_prefix[:, request_slots] = -1

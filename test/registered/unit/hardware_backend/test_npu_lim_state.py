@@ -14,10 +14,6 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.block_tables import (
     prepare_prefill_gather_rows,
 )
-from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.budget import (
-    resolve_sparse_kv_budget,
-    sparse_batch_capacity,
-)
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.lim import (
     LIMDecodeAdapter,
     prepare_lim_rows,
@@ -343,85 +339,6 @@ class TestLIMState(CustomTestCase):
             )
         self.assertEqual(plan.request_slots.tolist(), [1, 2] + [rows] * (batch - 2))
         self.assertTrue(torch.all(plan.source_ids[2:] == -1))
-        budget = resolve_sparse_kv_budget(
-            request_rows=rows,
-            graph_batch_capacity=batch,
-            context_len=context,
-            cache_tokens=capacity,
-            num_layers=2,
-            top_k=top_k,
-            kv_bytes_per_token=1152,
-            indexer_impl="lim",
-            copy_sfa=True,
-        )
-        allocated = sum(
-            tensor.numel() * tensor.element_size()
-            for tensor in vars(adapter).values()
-            if isinstance(tensor, torch.Tensor)
-        )
-        # The native key-scale workspace is charged in the index pool coefficient.
-        allocated -= adapter.key_scale.numel() * adapter.key_scale.element_size()
-        self.assertEqual(budget.adapter_bytes, allocated)
-
-    def test_graph_budget_grows_scratch_without_growing_residency(self):
-        options = dict(
-            request_rows=9,
-            context_len=32768,
-            num_layers=4,
-            top_k=2048,
-            kv_bytes_per_token=1152,
-            indexer_impl="lim",
-            copy_sfa=True,
-        )
-        small = resolve_sparse_kv_budget(**options)
-        padded = resolve_sparse_kv_budget(**options, graph_batch_capacity=16)
-        self.assertEqual(sparse_batch_capacity(9, 16), 16)
-        self.assertEqual(small.device_kv_bytes, padded.device_kv_bytes)
-        self.assertEqual(small.slot_map_bytes, padded.slot_map_bytes)
-        self.assertEqual(small.host_kv_bytes, padded.host_kv_bytes)
-        self.assertEqual(padded.selected_kv_bytes, 16 * 2048 * 1152)
-        self.assertGreater(padded.adapter_bytes, small.adapter_bytes)
-        with self.assertRaisesRegex(ValueError, "exceeding"):
-            resolve_sparse_kv_budget(
-                **options,
-                graph_batch_capacity=16,
-                hbm_budget_bytes=small.managed_hbm_bytes,
-            )
-
-    def test_mtp_full_visible_budget_reserves_q4_workspace(self):
-        options = dict(
-            request_rows=4,
-            graph_batch_capacity=8,
-            context_len=32768,
-            cache_tokens=12288,
-            num_layers=2,
-            top_k=2048,
-            kv_bytes_per_token=1152,
-            indexer_impl="lim",
-            copy_sfa=True,
-            copy_sfa_query_heads=32,
-        )
-        baseline = resolve_sparse_kv_budget(**options)
-        mtp = resolve_sparse_kv_budget(**options, mtp_full_visible=True)
-        self.assertEqual(
-            mtp.adapter_bytes - baseline.adapter_bytes,
-            8 * 4 * (2 * 2048 * 4 + 4 + 64 * 4) + 8 * 4,
-        )
-        self.assertEqual(
-            mtp.copy_sfa_bytes - baseline.copy_sfa_bytes, 8 * 4 * 32 * 512 * 2
-        )
-        fused = resolve_sparse_kv_budget(
-            **options, mtp_full_visible=True, fused_copy_sfa_metadata=True
-        )
-        self.assertEqual(fused.adapter_bytes - mtp.adapter_bytes, (4 + 1 + 8) * 4)
-        with self.assertRaisesRegex(ValueError, "capacity"):
-            resolve_sparse_kv_budget(
-                **{**options, "cache_tokens": 4096}, mtp_full_visible=True
-            )
-        with self.assertRaisesRegex(ValueError, "native LIM"):
-            resolve_sparse_kv_budget(
-                **{**options, "copy_sfa": False}, mtp_full_visible=True
-            )
 
     def test_full_visible_q1_transition_padding_and_reuse(self):
         previous = torch.tensor([-1, -1, 2048, 3000, -1], dtype=torch.int32)
@@ -463,96 +380,6 @@ class TestLIMState(CustomTestCase):
             torch.tensor([8193]), torch.tensor([1]), previous, 4096, 4
         )
         self.assertEqual(result[5].tolist(), [-2])
-
-    def test_copy_sfa_budget_includes_planner_and_page_aligned_host_rows(self):
-        budget = resolve_sparse_kv_budget(
-            request_rows=3,
-            context_len=4097,
-            num_layers=4,
-            top_k=2048,
-            kv_bytes_per_token=1152,
-            indexer_impl="lim",
-            copy_sfa=True,
-            copy_sfa_query_heads=8,
-        )
-        self.assertEqual(budget.cache_tokens, 2048)
-        self.assertEqual(budget.host_kv_bytes, 3 * 4 * 4224 * 1152)
-        self.assertGreater(budget.copy_sfa_bytes, 4 * 4 * 2048 * 4)
-        with self.assertRaisesRegex(ValueError, "requires the native LIM indexer"):
-            resolve_sparse_kv_budget(
-                request_rows=3,
-                context_len=4097,
-                num_layers=4,
-                top_k=2048,
-                kv_bytes_per_token=1152,
-                cache_tokens=3072,
-                copy_sfa=True,
-            )
-
-        for capacity in (4096, 8192):
-            with self.subTest(capacity=capacity):
-                larger = resolve_sparse_kv_budget(
-                    request_rows=3,
-                    context_len=4097,
-                    num_layers=4,
-                    top_k=2048,
-                    kv_bytes_per_token=1152,
-                    cache_tokens=capacity,
-                    indexer_impl="lim",
-                    copy_sfa=True,
-                    copy_sfa_query_heads=8,
-                )
-                delta = capacity - 2048
-                # Every extra resident slot has KV and owner storage; misses
-                # grow to C while attention's selected-K workspace stays fixed.
-                expected_extra = (
-                    delta * (3 * 4 * 1152 + 4 * 4 * 4 + 3 * 2 * 4)
-                    + 4 * (delta // 128) * 4
-                )
-                self.assertEqual(
-                    larger.managed_hbm_bytes - budget.managed_hbm_bytes, expected_extra
-                )
-                self.assertEqual(larger.selected_kv_bytes, budget.selected_kv_bytes)
-                with self.assertRaisesRegex(ValueError, "exceeding"):
-                    resolve_sparse_kv_budget(
-                        request_rows=3,
-                        context_len=4097,
-                        num_layers=4,
-                        top_k=2048,
-                        kv_bytes_per_token=1152,
-                        cache_tokens=capacity,
-                        indexer_impl="lim",
-                        copy_sfa=True,
-                        copy_sfa_query_heads=8,
-                        hbm_budget_bytes=larger.managed_hbm_bytes - 1,
-                    )
-
-    def test_native_budget_accounts_actual_persistent_buffers(self):
-        kwargs = dict(
-            request_rows=3,
-            context_len=32896,
-            num_layers=4,
-            top_k=2048,
-            kv_bytes_per_token=1152,
-            indexer_impl="lim",
-        )
-        budget = resolve_sparse_kv_budget(**kwargs, cache_tokens=4096)
-        # C>K is managed by the native pool; no duplicate Python LRU arrays.
-        self.assertEqual(budget.policy_bytes, 2048 * 8)
-        self.assertEqual(budget.slot_map_bytes, 4 * 4 * 32896 * 4)
-        self.assertGreater(budget.adapter_bytes, 3 * (2048 + 128) * 1152)
-        exact = resolve_sparse_kv_budget(
-            **kwargs, hbm_budget_bytes=budget.managed_hbm_bytes
-        )
-        self.assertEqual(exact.cache_tokens, 4096)
-        with self.assertRaisesRegex(ValueError, "multiple of 128"):
-            resolve_sparse_kv_budget(**kwargs, cache_tokens=4097)
-        with self.assertRaisesRegex(ValueError, "exceeding"):
-            resolve_sparse_kv_budget(
-                **kwargs,
-                cache_tokens=4096,
-                hbm_budget_bytes=budget.managed_hbm_bytes - 1,
-            )
 
 
 class TestLIMKernelLoad(CustomTestCase):

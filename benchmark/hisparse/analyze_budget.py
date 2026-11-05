@@ -15,14 +15,13 @@ import importlib.util
 import json
 import sys
 from collections import OrderedDict
-from dataclasses import asdict
 from pathlib import Path
 
 
 def load_budget_module():
     path = (
         Path(__file__).resolve().parents[2]
-        / "python/sglang/srt/hardware_backend/npu/sparsity_driven_kv_offload/budget.py"
+        / "python/sglang/srt/hardware_backend/npu/sparsity_driven_kv_offload/fused_budget.py"
     )
     spec = importlib.util.spec_from_file_location("hisparse_budget_analysis", path)
     module = importlib.util.module_from_spec(spec)
@@ -125,7 +124,17 @@ def scenario_grid(args):
                                 context_len=context_len,
                                 batch_size=batch_size,
                                 assumed_hit_rate=hit_rate,
-                                allocation=asdict(allocation),
+                                allocation={
+                                    name: getattr(allocation, name)
+                                    for name in (
+                                        "cache_tokens",
+                                        "device_kv_bytes",
+                                        "slot_map_bytes",
+                                        "host_kv_bytes",
+                                        "adapter_bytes",
+                                        "copy_sfa_bytes",
+                                    )
+                                },
                                 managed_hbm_bytes=allocation.managed_hbm_bytes,
                                 indexer_hbm_bytes=indexer_bytes,
                                 dense_main_kv_bytes=(batch_size + 1)

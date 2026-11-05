@@ -386,38 +386,27 @@ class AscendAttnBackend(AttentionBackend):
             from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.manager import (
                 register_sparse_kv_manager,
             )
-            from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
-                get_batch_sizes_to_capture,
-            )
 
-            graph_batch_capacity = 0
-            graph = get_exec().graph
-            config = graph.cuda_graph_config
-            if not graph.disable_cuda_graph and config is not None and config.decode.bs:
-                capture_bs, _ = get_batch_sizes_to_capture(model_runner)
-                graph_batch_capacity = max(capture_bs)
+            sparse_options = dict(paged_kv_cache=self.token_to_kv_pool)
+            if self.use_fused_sparse_kv:
+                plan = self.token_to_kv_pool.sparse_kv_budget_plan
+                sparse_options["copy_sfa_padded_query_heads"] = (
+                    plan.copy_sfa_query_heads
+                )
+            else:
+                from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
+                    get_batch_sizes_to_capture,
+                )
 
-            sparse_options = (
-                dict(
-                    copy_sfa_padded_query_heads=next(
-                        (
-                            padding
-                            for padding in (1, 2, 4, 8, 16, 32, 64, 128)
-                            if padding
-                            >= model_runner.model_config.num_attention_heads
-                            // get_parallel().attn_tp_size
-                        ),
-                        None,
-                    ),
-                    graph_batch_capacity=graph_batch_capacity,
-                    paged_kv_cache=self.token_to_kv_pool,
-                )
-                if self.use_fused_sparse_kv
-                else dict(
-                    graph_batch_capacity=graph_batch_capacity,
-                    paged_kv_cache=self.token_to_kv_pool,
-                )
-            )
+                graph = get_exec().graph
+                config = graph.cuda_graph_config
+                if (
+                    not graph.disable_cuda_graph
+                    and config is not None
+                    and config.decode.bs
+                ):
+                    capture_bs, _ = get_batch_sizes_to_capture(model_runner)
+                    sparse_options["graph_batch_capacity"] = max(capture_bs)
             self.sparse_kv_manager = create_sparse_kv_manager(
                 model_runner.req_to_token_pool,
                 model_runner.token_to_kv_pool_allocator,

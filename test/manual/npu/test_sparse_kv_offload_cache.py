@@ -34,7 +34,6 @@ def load_source(name):
     return module
 
 
-budget_module = load_source("budget")
 lru_module = load_source("lru")
 mtp_module = load_source("mtp")
 
@@ -48,89 +47,6 @@ class FakeStream:
 
     def wait_event(self, event):
         self.log.append(("wait", self.name, event))
-
-
-class TestSparseKVBudget(unittest.TestCase):
-    def resolve(self, **kwargs):
-        options = dict(
-            request_rows=5,
-            context_len=32768,
-            num_layers=61,
-            top_k=2048,
-            kv_bytes_per_token=1152,
-        )
-        options.update(kwargs)
-        return budget_module.resolve_sparse_kv_budget(**options)
-
-    def test_allocations_and_default(self):
-        result = self.resolve()
-        self.assertEqual(result.cache_tokens, 2048)
-        self.assertEqual(result.device_kv_bytes, 5 * 61 * 2048 * 1152)
-        self.assertEqual(result.slot_map_bytes, 61 * 6 * 32776 * 4)
-        self.assertEqual(result.selected_kv_bytes, 5 * 2048 * 1152)
-        self.assertEqual(result.policy_bytes, 2048 * 8)
-        self.assertEqual(result.host_kv_bytes, 5 * 61 * 32768 * 1152)
-
-    def test_explicit_capacity_and_cap(self):
-        result = self.resolve(cache_tokens=4096)
-        self.assertEqual(result.policy_bytes, (6 * 61 * 12 + 8) * 4096 + 2048 * 8)
-        self.assertEqual(
-            self.resolve(cache_tokens=4096, hbm_budget_bytes=result.managed_hbm_bytes),
-            result,
-        )
-        with self.assertRaisesRegex(ValueError, "exceeding"):
-            self.resolve(
-                cache_tokens=4096, hbm_budget_bytes=result.managed_hbm_bytes - 1
-            )
-
-    def test_auto_budget_including_exact_minimum(self):
-        minimum = self.resolve()
-        self.assertEqual(
-            self.resolve(hbm_budget_bytes=minimum.managed_hbm_bytes), minimum
-        )
-        for capacity in (2049, 4096, 6144):
-            result = self.resolve(cache_tokens=capacity)
-            self.assertEqual(
-                self.resolve(hbm_budget_bytes=result.managed_hbm_bytes), result
-            )
-        with self.assertRaisesRegex(ValueError, "exceeding"):
-            self.resolve(hbm_budget_bytes=minimum.managed_hbm_bytes - 1)
-
-    def test_copy_sfa_capacity_range(self):
-        for capacity in (2048, 6144, 12288, 16384, 32640):
-            with self.subTest(capacity=capacity):
-                result = self.resolve(
-                    cache_tokens=capacity,
-                    copy_sfa=True,
-                    indexer_impl="lim",
-                    copy_sfa_query_heads=16,
-                )
-                self.assertEqual(result.cache_tokens, capacity)
-        for capacity in (1920, 2049, 32768):
-            with self.subTest(capacity=capacity), self.assertRaises(ValueError):
-                self.resolve(
-                    cache_tokens=capacity,
-                    copy_sfa=True,
-                    indexer_impl="lim",
-                    copy_sfa_query_heads=16,
-                )
-
-    def test_long_output_increases_host_and_metadata_not_hot_kv(self):
-        short, long = self.resolve(context_len=32768), self.resolve(context_len=131072)
-        self.assertEqual(short.device_kv_bytes, long.device_kv_bytes)
-        self.assertEqual(short.host_kv_bytes * 4, long.host_kv_bytes)
-        self.assertGreater(long.slot_map_bytes, short.slot_map_bytes)
-
-    def test_invalid_sizes(self):
-        for options in (
-            dict(cache_tokens=1024),
-            dict(cache_tokens=-1),
-            dict(hbm_budget_bytes=-1),
-            dict(top_k=True),
-            dict(request_rows=0),
-        ):
-            with self.subTest(options=options), self.assertRaises(ValueError):
-                self.resolve(**options)
 
 
 class TestTraceReplay(unittest.TestCase):

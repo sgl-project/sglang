@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import replace
 from typing import TYPE_CHECKING, List, Optional, Union
 
 import torch
@@ -20,13 +19,6 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.block_tables import (
     prepare_prefill_gather_rows,
 )
-from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.budget import (
-    sparse_batch_capacity,
-)
-from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
-    get_sparse_kv_budget,
-    get_sparse_kv_max_query_width,
-)
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.mtp import (
     prepare_mtp_rows,
 )
@@ -36,7 +28,6 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.utils.common import get_eager_max_batch_size
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
@@ -57,30 +48,18 @@ class SparseKVCacheManager:
         copy_sfa_padded_query_heads: Optional[int] = None,
         graph_batch_capacity: int = 0,
         paged_kv_cache: Optional[MLATokenToKVPool] = None,
+        budget_plan=None,
     ) -> None:
         enable_memory_saver = False
         memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
         )
 
-        # Include the padding row because real request IDs can equal the
-        # configured capacity when row 0 is reserved for graph padding.
-        self.size = int(req_to_token_pool.req_to_token.shape[0])
-        self.batch_capacity = sparse_batch_capacity(
-            self.size,
-            max(graph_batch_capacity, get_eager_max_batch_size(self.size - 1)),
-        )
+        self.actual_request_rows = int(req_to_token_pool.req_to_token.shape[0])
         self.last_decode_path = "unselected"
-        self.logical_max_context_len = int(req_to_token_pool.max_context_len)
-        self.max_query_width = get_sparse_kv_max_query_width()
+        self.logical_max_context_len = int(req_to_token_pool.req_to_token.shape[1])
         self.req_to_token_pool = req_to_token_pool
-        self.max_context_len = (self.logical_max_context_len + 127) // 128 * 128
         self.sparse_context_len = int(sparse_context_len)
-        if self.sparse_context_len <= 0:
-            raise ValueError(
-                "SparseKVCacheManager requires a positive sparse_context_len, "
-                f"got {self.sparse_context_len}."
-            )
         self.device = req_to_token_pool.device
         # EAGLE shares the target allocator's token IDs while owning a
         # separate draft KV pool. The allocator's pool is not the draft pool.
@@ -103,30 +82,32 @@ class SparseKVCacheManager:
         )
         self.store_dtype = self.paged_kv_cache.store_dtype
         self.layer_num = self.paged_kv_cache.layer_num
-        self.host_token_capacity = (
-            (int(paged_kv_cache.size) + int(paged_kv_cache.page_size) + 127) // 128
-        ) * 128
-        self.budget = get_sparse_kv_budget(
-            request_rows=self.size,
-            context_len=self.max_context_len,
-            num_layers=self.layer_num,
-            top_k=self.sparse_context_len,
-            kv_bytes_per_token=self.head_dim * self.store_dtype.itemsize,
-            copy_sfa_query_heads=copy_sfa_padded_query_heads or 128,
-            graph_batch_capacity=self.batch_capacity,
+        self.budget = budget_plan or getattr(
+            paged_kv_cache, "sparse_kv_budget_plan", None
         )
+        if self.budget is None:
+            raise ValueError("Native KV pool has no sparse KV budget plan.")
+        self.budget.bind_native_pool(paged_kv_cache)
+        if (
+            self.actual_request_rows > self.budget.request_rows
+            or self.logical_max_context_len > self.budget.context_len
+            or graph_batch_capacity > self.budget.batch_capacity
+            or (
+                copy_sfa_padded_query_heads is not None
+                and copy_sfa_padded_query_heads != self.budget.copy_sfa_query_heads
+            )
+            or self.sparse_context_len != self.budget.top_k
+        ):
+            raise ValueError(
+                "Native manager geometry exceeds or differs from its budget plan."
+            )
+        self.size = self.budget.request_rows
+        self.batch_capacity = self.budget.batch_capacity
+        self.max_context_len = self.budget.context_len
+        self.max_query_width = self.budget.max_query_width
+        self.host_token_capacity = self.budget.host_token_capacity
         self.device_cache_size = self.budget.cache_tokens
-        self.budget = replace(
-            self.budget,
-            host_kv_bytes=(
-                self.host_token_capacity
-                * self.layer_num
-                * self.head_num
-                * self.head_dim
-                * self.store_dtype.itemsize
-            ),
-        )
-        self._slot_map_width = (self.max_context_len + 127) // 128 * 128
+        self._slot_map_width = self.budget.context_len
         logger.info(
             "Sparse KV per rank: K=%d C=%d, managed HBM=%.2f MiB, host KV=%.2f MiB, host_layout=paged",
             self.sparse_context_len,
@@ -135,81 +116,28 @@ class SparseKVCacheManager:
             self.budget.host_kv_bytes / 1024**2,
         )
         self.cache_capacity = self.device_cache_size
-        if (
-            not 2048 <= self.cache_capacity <= 32640
-            or self.cache_capacity % 128
-            or copy_sfa_padded_query_heads is None
-        ):
-            raise ValueError(
-                "Copy-SFA requires C in [2048,32640], aligned to 128, and a padded query head count."
-            )
-        if (self.kv_lora_rank, self.qk_rope_head_dim) != (512, 64):
-            raise ValueError(
-                "Copy-SFA supports only MLA KV dimensions CKV=512 and KPE=64; "
-                f"got CKV={self.kv_lora_rank}, KPE={self.qk_rope_head_dim}."
-            )
-        if self.store_dtype not in (torch.bfloat16, torch.float16):
-            raise ValueError(
-                "Copy-SFA supports only BF16 or FP16 KV storage; "
-                f"got {self.store_dtype}."
-            )
         self._copy_sfa_operator = load_copy_sfa_operator()
 
-        # device KV buffer
+        # Allocate exactly the persistent shapes reserved by the plan.
         try:
             with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-                # [bs, ctx_len, head_num, head_dim] for each layer
-                # The padded slot 0 is used for writing dummy outputs from padded tokens.
-                self.device_kv_buffer: list[torch.Tensor] = [
-                    torch.empty(
-                        (
-                            self.size,
-                            self.device_cache_size,
-                            self.head_num,
-                            self.head_dim,
-                        ),
-                        dtype=self.store_dtype,
-                        device=self.device,
+                for name, spec in self.budget.manager_buffers.items():
+                    fill_value = (
+                        -1
+                        if name in ("device_slot_map", "resident_begin", "resident_end")
+                        else None
                     )
-                    for _ in range(self.layer_num)
-                ]
+                    value = (
+                        [
+                            spec.allocate(self.device, fill_value)
+                            for _ in range(spec.count)
+                        ]
+                        if name in ("device_kv_buffer", "device_slot_map")
+                        else spec.allocate(self.device, fill_value)
+                    )
+                    setattr(self, name, value)
         except Exception as e:
-            self._raise_buffer_allocation_error("device_kv_buffer", e)
-        self.resident_begin = torch.full(
-            (self.layer_num, self.size), -1, dtype=torch.int32, device=self.device
-        )
-        self.resident_end = torch.full_like(self.resident_begin, -1)
-        token_capacity = self.batch_capacity * self.max_query_width
-        self.device_slot_map = [
-            torch.full(
-                (self.size + 1, self._slot_map_width),
-                -1,
-                dtype=torch.int32,
-                device=self.device,
-            )
-            for _ in range(self.layer_num)
-        ]
-        self.planner_actual_seq_lengths_kv = torch.empty(
-            self.batch_capacity, dtype=torch.int32, device=self.device
-        )
-        self.planner_num_cache_tokens = torch.empty_like(
-            self.planner_actual_seq_lengths_kv
-        )
-        self.planner_hbm_block_table = torch.empty(
-            (self.batch_capacity, self.device_cache_size // 128),
-            dtype=torch.int32,
-            device=self.device,
-        )
-        self.planner_dram_block_table = torch.empty(
-            (self.batch_capacity, self.max_context_len // 128),
-            dtype=torch.int32,
-            device=self.device,
-        )
-        self.fused_attn_out = torch.empty(
-            (token_capacity, copy_sfa_padded_query_heads, self.kv_lora_rank),
-            dtype=self.store_dtype,
-            device=self.device,
-        )
+            self._raise_buffer_allocation_error(name, e)
 
         # Host KV buffer
         # [bs, ctx_len, head_num, head_dim] for each layer
@@ -221,12 +149,7 @@ class SparseKVCacheManager:
         # Radix prefixes and accepted-token relocation are expressed in native
         # physical token IDs. Keep host payloads in that same address space;
         # request slots own only the bounded HBM residency maps.
-        host_kv_shape = (
-            1,
-            self.host_token_capacity,
-            self.head_num,
-            self.head_dim,
-        )
+        host_kv_shape = self.budget.host_kv_spec.shape
         logger.info("Sparse KV host buffer shape: %s", host_kv_shape)
         device_id = torch.npu.current_device()
 
@@ -247,6 +170,8 @@ class SparseKVCacheManager:
             LIMDecodeAdapter,
         )
 
+        self.budget.host_kv_spec.validate(self.host_kv_buffer, "host_kv_buffer")
+        self.budget.validate_buffers(self, self.budget.manager_buffers)
         self.lim_adapter = LIMDecodeAdapter(self)
 
         self._install_req_alloc_hook(req_to_token_pool)
@@ -269,7 +194,7 @@ class SparseKVCacheManager:
         """Resolve logical positions through the allocator's shared token map."""
         # Invalid/padded entries are masked by the caller. Clamp only their
         # speculative address calculation, never an active token's mapping.
-        rows = request_ids.long().clamp(0, self.size - 1)
+        rows = request_ids.long().clamp(0, self.actual_request_rows - 1)
         columns = positions.long().clamp(0, self.logical_max_context_len - 1)
         return self.req_to_token_pool.req_to_token[rows, columns].long()
 

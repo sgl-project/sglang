@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Sequence
+
+import torch
 
 from sglang.srt.configs.model_config import (
     get_dsa_index_head_dim,
@@ -10,10 +12,9 @@ from sglang.srt.configs.model_config import (
     is_deepseek_dsa,
 )
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.budget import (
-    SparseKVBudget,
+from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_budget import (
+    BudgetPlan,
     resolve_sparse_kv_budget,
-    sparse_batch_capacity,
 )
 from sglang.srt.runtime_context import (
     attention_backends,
@@ -85,14 +86,10 @@ def is_sparsity_driven_kv_offload_enabled(
         )
     algorithm = (get_spec().speculative_algorithm or "NONE").upper()
     if algorithm != "NONE" and (
-        algorithm not in ("EAGLE", "NEXTN")
-        or get_spec().speculative_eagle_topk != 1
-        or get_parallel().pp_size != 1
-        or get_parallel().dcp_enabled
+        algorithm not in ("EAGLE", "NEXTN") or get_spec().speculative_eagle_topk != 1
     ):
         raise ValueError(
-            "Sparse KV MTP requires EAGLE/NEXTN with "
-            "--speculative-eagle-topk 1, PP=1 and DCP disabled."
+            "Sparse KV MTP requires EAGLE/NEXTN with --speculative-eagle-topk 1."
         )
     return True
 
@@ -138,6 +135,8 @@ def get_sparsity_driven_kv_offload_cell_size(
     num_layers: int,
     element_size: int,
     is_draft_worker: bool = False,
+    indexer_layer_ids: Optional[Sequence[int]] = None,
+    kv_cache_dtype: Optional[torch.dtype] = None,
 ) -> Optional[int]:
     if not is_sparsity_driven_kv_offload_enabled(
         model_config=model_config,
@@ -149,7 +148,14 @@ def get_sparsity_driven_kv_offload_cell_size(
     index_head_dim = get_sparsity_driven_kv_offload_index_head_dim(
         model_config=model_config
     )
-    return index_head_dim * num_layers * element_size
+    num_indexer_layers = (
+        num_layers if indexer_layer_ids is None else len(indexer_layer_ids)
+    )
+    layer_bytes = index_head_dim * element_size
+    if kv_cache_dtype == torch.float8_e4m3fn:
+        # NPU FP8 index keys have one FP32 scale per token and indexer layer.
+        layer_bytes += torch.float32.itemsize
+    return layer_bytes * num_indexer_layers
 
 
 def get_sparse_kv_budget(
@@ -161,38 +167,21 @@ def get_sparse_kv_budget(
     kv_bytes_per_token: int,
     copy_sfa_query_heads: int = 128,
     graph_batch_capacity: Optional[int] = None,
-) -> SparseKVBudget:
+    kv_dtype: torch.dtype = torch.bfloat16,
+) -> BudgetPlan:
+    if not use_fused_sparse_kv_offload():
+        raise ValueError("Sparse KV budgeting requires fused LIM and CopySFA.")
     if graph_batch_capacity is None:
         # Reserve before admission determines the final request-pool size.
         # Capture buckets may round that size up for attention parallelism.
         graph = get_exec().graph
         config = graph.cuda_graph_config
         decode = config.decode if config is not None else None
-        graph_batch_capacity = (
-            min(max(decode.bs), get_cuda_graph_max_batch_size(request_rows))
-            if not graph.disable_cuda_graph and decode is not None and decode.bs
-            else 0
-        )
-    if use_fused_sparse_kv_offload():
-        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_budget import (
-            resolve_sparse_kv_budget as resolve_fused_budget,
-        )
-
-        return resolve_fused_budget(
-            request_rows=request_rows,
-            context_len=context_len,
-            num_layers=num_layers,
-            top_k=top_k,
-            kv_bytes_per_token=kv_bytes_per_token,
-            cache_tokens=envs.SGLANG_NPU_SPARSE_KV_CACHE_SIZE.get(),
-            hbm_budget_bytes=envs.SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB.get() * 1024**2,
-            max_query_width=get_sparse_kv_max_query_width(),
-            copy_sfa_query_heads=copy_sfa_query_heads,
-            graph_batch_capacity=sparse_batch_capacity(
-                request_rows,
-                max(graph_batch_capacity, get_eager_max_batch_size(request_rows - 1)),
-            ),
-        )
+        graph_batch_capacity = 0
+        if not graph.disable_cuda_graph:
+            graph_batch_capacity = get_cuda_graph_max_batch_size(request_rows)
+            if decode is not None and decode.bs:
+                graph_batch_capacity = min(max(decode.bs), graph_batch_capacity)
     return resolve_sparse_kv_budget(
         request_rows=request_rows,
         context_len=context_len,
@@ -201,11 +190,13 @@ def get_sparse_kv_budget(
         kv_bytes_per_token=kv_bytes_per_token,
         cache_tokens=envs.SGLANG_NPU_SPARSE_KV_CACHE_SIZE.get(),
         hbm_budget_bytes=envs.SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB.get() * 1024**2,
-        indexer_impl="legacy",
+        kv_dtype=kv_dtype,
+        max_query_width=get_sparse_kv_max_query_width(),
         copy_sfa_query_heads=copy_sfa_query_heads,
-        graph_batch_capacity=sparse_batch_capacity(
+        graph_batch_capacity=max(
             request_rows,
-            max(graph_batch_capacity, get_eager_max_batch_size(request_rows - 1)),
+            graph_batch_capacity,
+            get_eager_max_batch_size(request_rows - 1),
         ),
     )
 
