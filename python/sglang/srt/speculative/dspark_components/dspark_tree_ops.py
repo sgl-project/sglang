@@ -65,14 +65,6 @@ _TREE_BACKEND_ALIASES = {
 }
 _TREE_OPS_LOADED = False
 _BYTE_BLOCK = 512
-_TREE_ATTN_IMPL_ENV = "SGLANG_DSPARK_TREE_ATTN_IMPL"
-_TREE_ATTN_IMPLS = ("ascendc", "triton")
-_TREE_ATTN_IMPL_ALIASES = {
-    "native": "ascendc",
-    "sgl_native": "ascendc",
-    "ascendc": "ascendc",
-    "triton": "triton",
-}
 
 __all__ = [
     "NodePlan",
@@ -201,16 +193,6 @@ def _tree_backend() -> str:
     return backend
 
 
-def _tree_attn_impl() -> str:
-    raw = os.environ.get(_TREE_ATTN_IMPL_ENV, "ascendc").strip().lower()
-    impl = _TREE_ATTN_IMPL_ALIASES.get(raw, raw)
-    if impl not in _TREE_ATTN_IMPLS:
-        raise ValueError(
-            f"{_TREE_ATTN_IMPL_ENV} must be one of {_TREE_ATTN_IMPLS}, got {raw!r}"
-        )
-    return impl
-
-
 def _ensure_vendor_ops() -> None:
     """Load the vllm-ascend tree bindings from SGLANG_DSPARK_TREE_OPS once."""
     global _TREE_OPS_LOADED
@@ -307,31 +289,15 @@ def _load_attention_op():
                 "the loaded vllm-ascend binding does not expose "
                 "npu_sparse_attn_sharedkv_tree"
             ) from exc
-    if _tree_attn_impl() == "triton":
-        try:
-            from sgl_kernel_npu.tree import sparse_attn_sharedkv_tree
-        except Exception as exc:
-            raise RuntimeError(
-                "DSpark tree attention requires the sgl_kernel_npu.tree attention "
-                "package (sparse_attn_sharedkv_tree); it is unavailable in this "
-                "process."
-            ) from exc
-        return sparse_attn_sharedkv_tree
     try:
-        import sgl_kernel_npu  # noqa: F401  # registers torch.ops.npu
+        from sgl_kernel_npu.tree import sparse_attn_sharedkv_tree
     except Exception as exc:
         raise RuntimeError(
-            "DSpark tree attention requires the sgl_kernel_npu extension; it is "
-            "unavailable in this process."
+            "DSpark tree attention requires the sgl_kernel_npu.tree attention "
+            "package (sparse_attn_sharedkv_tree); it is unavailable in this "
+            "process."
         ) from exc
-    namespace = getattr(torch.ops, "npu", None)
-    op = getattr(namespace, "sparse_attn_sharedkv_tree", None) if namespace else None
-    if op is None:
-        raise RuntimeError(
-            "the sgl_kernel_npu extension does not expose "
-            "torch.ops.npu.sparse_attn_sharedkv_tree"
-        )
-    return op
+    return sparse_attn_sharedkv_tree
 
 
 # ---------------------------------------------------------------------------
@@ -542,55 +508,6 @@ def build_tree_attn_metadata(
                 "torch.ops.custom.npu_sparse_attn_sharedkv_metadata"
             )
         metadata_tensor = op(**kwargs)
-        plan.attn_metadata_cache[cache_key] = metadata_tensor
-        return metadata_tensor, cu_ori, cu_cmp
-    if _tree_attn_impl() == "ascendc":
-        cmp_topk = 0
-        if cmp_sparse_indices is not None and int(ratio) == 4:
-            width = int(cmp_sparse_indices.shape[-1])
-            if width in (512, 1024):
-                cmp_topk = width
-        cache_key = (
-            "ascendc",
-            int(query.shape[1]),
-            int(query.shape[2]),
-            int(ratio),
-            int(window),
-            cmp_topk,
-            compressed is not None,
-            int(plan.n),
-            int(seq.data_ptr()),
-            int(seq.numel()),
-            int(plan.query_cu.data_ptr()),
-        )
-        cached = plan.attn_metadata_cache.get(cache_key)
-        if cached is not None:
-            return cached, cu_ori, cu_cmp
-        try:
-            import sgl_kernel_npu  # noqa: F401  # registers torch.ops.npu
-        except Exception as exc:
-            raise RuntimeError(
-                "DSpark tree attention requires the sgl_kernel_npu extension; "
-                "it is unavailable in this process."
-            ) from exc
-        metadata_tensor = torch.ops.npu.sparse_attn_sharedkv_metadata_host(
-            int(query.shape[1]),
-            1,
-            int(query.shape[2]),
-            "TND",
-            "PA_ND",
-            cu_seqlens_q=plan.query_cu.detach().cpu().to(torch.int32),
-            seqused_kv=seq.detach().cpu().to(torch.int32),
-            batch_size=int(plan.n),
-            cmp_topk=cmp_topk,
-            cmp_ratio=int(ratio),
-            ori_mask_mode=4,
-            cmp_mask_mode=3,
-            ori_win_left=int(window) - 1,
-            ori_win_right=0,
-            has_ori_kv=True,
-            has_cmp_kv=compressed is not None,
-        )
         plan.attn_metadata_cache[cache_key] = metadata_tensor
         return metadata_tensor, cu_ori, cu_cmp
     metadata_tensor = torch.zeros(1024, dtype=torch.int32, device=query.device)
