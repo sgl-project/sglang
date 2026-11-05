@@ -932,14 +932,14 @@ class LongCatImageTransformer2DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
 
         self.layer_names = ["transformer_blocks", "single_transformer_blocks"]
 
-    def _modulation_cache(self, temb):
-        if torch.compiler.is_compiling() or torch.is_grad_enabled() or not temb.is_cuda:
+    def _time_conditioning(self, hidden_states):
+        if torch.compiler.is_compiling() or torch.is_grad_enabled() or not hidden_states.is_cuda:
             return None
         context = get_forward_context_or_none()
         if context is None or context.current_timestep < 0:
             return None
         batch = context.forward_batch
-        if batch is None or not batch.do_classifier_free_guidance or temb.shape[0] != 1:
+        if batch is None or not batch.do_classifier_free_guidance or hidden_states.shape[0] != 1:
             return None
         server_args = get_global_server_args()
         if (
@@ -963,11 +963,11 @@ class LongCatImageTransformer2DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         state = batch.extra.setdefault(DENOISING_LOOP_STATE, {}).setdefault(
             "longcat_modulations", {}
         )
-        key = (tuple(temb.shape), temb.dtype, temb.device)
+        key = (hidden_states.dtype, hidden_states.device)
         entry = state.get(id(self))
         if entry is None or entry[0] is not batch.timesteps or entry[1] != key:
-            timesteps = batch.timesteps.to(device=temb.device, dtype=temb.dtype).flatten()
-            embeddings = [self.time_embed(t.reshape(1), temb.dtype) for t in timesteps]
+            timesteps = batch.timesteps.to(device=hidden_states.device, dtype=hidden_states.dtype).flatten()
+            embeddings = [self.time_embed(t.reshape(1), hidden_states.dtype) for t in timesteps]
             activations = [torch.nn.functional.silu(value) for value in embeddings]
             by_step = [{} for _ in embeddings]
             norms = [(block.norm1, 6) for block in self.transformer_blocks]
@@ -982,9 +982,9 @@ class LongCatImageTransformer2DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                 ):
                     for values, activation in zip(by_step, activations):
                         values[id(norm)] = norm.linear(activation).chunk(chunks, dim=1)
-            entry = (batch.timesteps, key, by_step)
+            entry = (batch.timesteps, key, embeddings, by_step)
             state[id(self)] = entry
-        return entry[2][context.current_timestep]
+        return entry[2][context.current_timestep], entry[3][context.current_timestep]
 
     def forward(
         self,
@@ -1000,7 +1000,12 @@ class LongCatImageTransformer2DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         hidden_states, _ = self.x_embedder(hidden_states)
 
         # Raw scheduler timestep in [0, 1000] — fed directly (see module docstring).
-        temb = self.time_embed(timestep.to(hidden_states.dtype), hidden_states.dtype)
+        conditioning = self._time_conditioning(hidden_states)
+        if conditioning is None:
+            temb = self.time_embed(timestep.to(hidden_states.dtype), hidden_states.dtype)
+            modulation_cache = None
+        else:
+            temb, modulation_cache = conditioning
 
         encoder_hidden_states, _ = self.context_embedder(encoder_hidden_states)
 
@@ -1014,7 +1019,6 @@ class LongCatImageTransformer2DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         cos_sin_cache = torch.cat((cos, sin), dim=-1).contiguous()
         positions = torch.arange(cos.shape[0], device=cos.device, dtype=torch.int64)
 
-        modulation_cache = self._modulation_cache(temb)
         for block in self.transformer_blocks:
             encoder_hidden_states, hidden_states = block(
                 hidden_states=hidden_states,

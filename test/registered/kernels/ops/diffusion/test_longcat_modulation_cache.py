@@ -80,6 +80,7 @@ def test_model_reuses_only_current_cfg_step_and_falls_back_for_capture():
     ]
     calls = []
     activations = []
+    time_embeddings = []
     handles = [
         norm.linear.register_forward_hook(lambda *args: calls.append(1))
         for norm in norms
@@ -88,6 +89,9 @@ def test_model_reuses_only_current_cfg_step_and_falls_back_for_capture():
         norm.silu.register_forward_hook(lambda *args: activations.append(1))
         for norm in norms
     ]
+    handles.append(
+        model.time_embed.register_forward_hook(lambda *args: time_embeddings.append(1))
+    )
     x = torch.randn(1, 8, 64, device="cuda", dtype=torch.bfloat16)
     texts = [
         torch.randn(1, 4, 32, device="cuda", dtype=torch.bfloat16) for _ in range(2)
@@ -125,15 +129,19 @@ def test_model_reuses_only_current_cfg_step_and_falls_back_for_capture():
             expected = [run(text) for text in texts]
             calls.clear()
             activations.clear()
+            time_embeddings.clear()
             with set_forward_context(step, None, batch):
                 actual = [run(text) for text in texts]
             assert len(calls) == (6 if value == 500 else 0 if value == 480 else 3)
             assert len(activations) == 0
+            assert len(time_embeddings) == (
+                2 if value == 500 else 0 if value == 480 else 1
+            )
             assert all(torch.equal(a, b) for a, b in zip(actual, expected))
             state = batch.extra[DENOISING_LOOP_STATE]["longcat_modulations"][id(model)]
             assert state[0] is batch.timesteps
-            assert len(state[2]) == len(batch.timesteps)
-            assert len(state[2][step]) == 3
+            assert len(state[3]) == len(batch.timesteps)
+            assert len(state[3][step]) == 3
 
         for flag in ["enable_breakable_cuda_graph", "enable_cfg_parallel"]:
             setattr(server, flag, True)
@@ -144,7 +152,7 @@ def test_model_reuses_only_current_cfg_step_and_falls_back_for_capture():
             setattr(server, flag, False)
         model.layerwise_offload_managers = [object()]
         with set_forward_context(0, None, batch):
-            assert model._modulation_cache(torch.zeros(1, 256, device="cuda")) is None
+            assert model._time_conditioning(x) is None
         model.layerwise_offload_managers = []
         graph = torch.cuda.CUDAGraph()
         with set_forward_context(0, None, batch), torch.cuda.graph(graph):
