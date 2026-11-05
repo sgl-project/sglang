@@ -1844,6 +1844,12 @@ class KvBufferDesc:
 class KVCache(abc.ABC):
     layer_shard_enabled: bool = False
     post_capture_active: bool = False
+
+    @property
+    def backing_owner(self):
+        """Identity of the allocation whose post-capture bytes this pool reports."""
+        return self
+
     # Prepared before final KV sizing; reused by the host pool after resizing.
     # page_first MHA uses separate K/V buffers; page_unified uses one page buffer.
     hicache_write_back_staging: (
@@ -4128,6 +4134,7 @@ class HybridLinearKVPool(KVCache):
         tail_extra_slots: int = 0,
         max_running_requests: Optional[int] = None,
         skip_topk_layers: Optional[List[bool]] = None,
+        kv_scale_ue8m0: bool = False,
         start_layer: Optional[int] = None,
         full_kv_pool_class: Optional[type] = None,
         quant_method=None,
@@ -4206,6 +4213,7 @@ class HybridLinearKVPool(KVCache):
                 tail_extra_slots=tail_extra_slots,
                 max_running_requests=max_running_requests,
                 skip_topk_layers=skip_topk_layers,
+                kv_scale_ue8m0=kv_scale_ue8m0,
             )
         else:
             MLAPoolClass = (
@@ -4236,6 +4244,10 @@ class HybridLinearKVPool(KVCache):
             self.mem_usage = (k_size + v_size) / GB
 
     @property
+    def backing_owner(self):
+        return self.full_kv_pool.backing_owner
+
+    @property
     def post_capture_active(self) -> bool:
         return self.full_kv_pool.post_capture_active
 
@@ -4251,6 +4263,10 @@ class HybridLinearKVPool(KVCache):
     @property
     def dsa_kv_cache_store_fp8(self) -> bool:
         return getattr(self.full_kv_pool, "dsa_kv_cache_store_fp8", False)
+
+    @property
+    def kv_scale_ue8m0(self) -> bool:
+        return getattr(self.full_kv_pool, "kv_scale_ue8m0", False)
 
     @property
     def kv_cache_dim(self):
@@ -4645,7 +4661,24 @@ class HybridLinearKVPool(KVCache):
         )
 
 
+def _prefix_valid_mla_write_loc(loc_2d, commit_lens, cache_k_nope):
+    if loc_2d.ndim != 2 or commit_lens.shape != (loc_2d.shape[0],):
+        raise ValueError(f"{tuple(loc_2d.shape)=} {tuple(commit_lens.shape)=}")
+    if cache_k_nope.shape[0] != loc_2d.numel():
+        raise ValueError(f"{tuple(cache_k_nope.shape)=} {tuple(loc_2d.shape)=}")
+    # Rows past commit_lens go to the reserved slot 0,
+    # which this pool's MLA writes skip, as they do for CUDA-graph padding.
+    offsets = torch.arange(loc_2d.shape[1], device=loc_2d.device)
+    loc = torch.where(
+        offsets < commit_lens[:, None].to(torch.int64), loc_2d.to(torch.int64), 0
+    ).reshape(-1)
+    return KVWriteLoc(loc, physical=True)
+
+
 class MLATokenToKVPool(KVCache, MLAKVView):
+    # fp8_ds_mla tile scales rounded up to powers of two (Kimi-K3.1)
+    kv_scale_ue8m0 = False
+
     def __init__(
         self,
         size: int,
@@ -4882,7 +4915,12 @@ class MLATokenToKVPool(KVCache, MLAKVView):
             self.write_loc_is_dcp_resolved
             and (self.use_dsa or self.dsa_kv_cache_store_fp8)
         ), "the DSA write paths have no resolved-loc variant"
-        if _is_hip and self.use_dsa and self.dtype == fp8_dtype:
+        if (
+            _is_hip
+            and self.use_dsa
+            and self.dtype == fp8_dtype
+            and not self.dsa_kv_cache_store_fp8
+        ):
             # HIP TileLang FP8 consumes the model's raw MLA layout
             # (NoPE + optional RoPE) without per-block scales.
             # Fuse BF16/FP16 -> FP8 cast with paged KV write.
@@ -4900,7 +4938,7 @@ class MLATokenToKVPool(KVCache, MLAKVView):
             # This also enables reuse of set_mla_kv_buffer_triton two-tensor write path
             # quantize_k_cache_separate returns (nope_part, rope_part) as uint8 bytes
             cache_k_nope_fp8, cache_k_rope_fp8 = quantize_k_cache_separate(
-                cache_k_nope, cache_k_rope
+                cache_k_nope, cache_k_rope, scale_ue8m0=self.kv_scale_ue8m0
             )
 
             # Reuse existing two-tensor write kernel (works with FP8 byte layout)
@@ -4954,18 +4992,11 @@ class MLATokenToKVPool(KVCache, MLAKVView):
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
     ):
-        if loc_2d.ndim != 2 or commit_lens.shape != (loc_2d.shape[0],):
-            raise ValueError(f"{tuple(loc_2d.shape)=} {tuple(commit_lens.shape)=}")
-        if cache_k_nope.shape[0] != loc_2d.numel():
-            raise ValueError(f"{tuple(cache_k_nope.shape)=} {tuple(loc_2d.shape)=}")
-        # Rows past commit_lens go to the reserved slot 0,
-        # which this pool's MLA writes skip, as they do for CUDA-graph padding.
-        offsets = torch.arange(loc_2d.shape[1], device=loc_2d.device)
-        loc = torch.where(
-            offsets < commit_lens[:, None].to(torch.int64), loc_2d.to(torch.int64), 0
-        ).reshape(-1)
         self.set_mla_kv_buffer(
-            layer, KVWriteLoc(loc, physical=True), cache_k_nope, cache_k_rope
+            layer,
+            _prefix_valid_mla_write_loc(loc_2d, commit_lens, cache_k_nope),
+            cache_k_nope,
+            cache_k_rope,
         )
 
     def get_mla_kv_buffer(
@@ -5226,6 +5257,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         max_running_requests: Optional[int] = None,
         skip_topk_layers: Optional[List[bool]] = None,
         dcp_replicated: bool = False,
+        kv_scale_ue8m0: bool = False,
     ):
         override_dim = (
             kv_cache_dim if kv_cache_dim != kv_lora_rank + qk_rope_head_dim else None
@@ -5246,6 +5278,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
             override_kv_cache_dim=override_dim,
             dcp_replicated=dcp_replicated,
         )
+        self.kv_scale_ue8m0 = kv_scale_ue8m0
         # self.index_k_dtype = torch.float8_e4m3fn
         # self.index_k_scale_dtype = torch.float32
         self.index_head_dim = index_head_dim
