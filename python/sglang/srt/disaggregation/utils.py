@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import random
+import time
 from collections import deque
 from contextlib import nullcontext
 from enum import Enum
 from typing import (
     TYPE_CHECKING,
+    Any,
+    Callable,
     Iterable,
     List,
     Literal,
@@ -25,7 +29,7 @@ import torch.distributed as dist
 
 from sglang.srt.configs.model_config import get_dsa_mtp_topk_width, is_deepseek_dsa
 from sglang.srt.disaggregation.base import KVPoll
-from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST, DisaggregationMode
+from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
@@ -47,6 +51,8 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.kv.storage import KVStorage
     from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage
+
+logger = logging.getLogger(__name__)
 
 #########################
 # Constants & Enums
@@ -147,52 +153,140 @@ def get_qsa_pending_state_indices(req: Req) -> np.ndarray:
     return np.array([int(req_pool_idx)], dtype=np.int32)
 
 
-def disagg_transfers_in_flight(scheduler):
-    """A PD node's pin source over the unified memory pool.
+def end_network_transfer(storage, req) -> None:
+    """The request's transfers ended: the rows they addressed may be reused."""
+    storage.end_network_transfer(req)
 
-    Returns a predicate that is True while a transfer may be in flight, so
-    compaction never relocates a page the RDMA engine is reading or writing.
-    Safe to read this state from here: every mover runs on the scheduler thread.
 
-    A page is exposed from the moment its address reaches the peer until the
-    transfer concludes, and for part of that lifetime the request is in NEITHER
-    end's queue -- so queue emptiness alone is not enough:
+def record_network_transfer(
+    storage,
+    req,
+    *,
+    peer,
+    writes: bool,
+    page_indices,
+    page_size: int,
+    state_types: Sequence = (),
+    state_indices: Optional[Sequence] = None,
+) -> None:
+    """Record the device rows one send (or with ``writes`` one receive)
+    addresses by physical id: KV pages of ``page_size`` tokens, and each state
+    entry's rows (``state_indices``, aligned with ``state_types``)."""
+    storage.record_network_transfer(
+        req,
+        pages=page_indices,
+        page_size=page_size,
+        states=_state_rows(storage, state_types, state_indices),
+        writes=writes,
+        peer=peer,
+    )
 
-    - PREFILL: scheduling the final chunk clears `chunked_req` while earlier
-      chunks may still be draining, and the request only reaches the inflight
-      queue later, in the result path.
-    - DECODE: `pop_preallocated` publishes one request's destinations and keeps
-      allocating for the next, whose allocation can urgently flush the peer
-      sub-allocator; the batch reaches the transfer queue only after the loop.
 
-    A decode request receiving into the host pool (`host_staged`) exposes host
-    pages only and holds no device page until `allocate_host_staged`, so it
-    does not close the gate while it waits on the transfer queue.
-    """
+def _state_rows(storage, state_types: Sequence, state_indices: Optional[Sequence]):
+    """Each state entry's ``(sub_pool, slots)`` a transfer addresses. A
+    generator: a storage whose rows never move records nothing and never asks."""
+    from sglang.srt.mem_cache.kv.decl import KV_PART, STATE_PART
 
-    # The scheduler and pool outlive the queues rebuilt by a PD role switch.
-    def busy() -> bool:
-        if scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
-            return bool(
-                scheduler.disagg_prefill_transfer_queue
-                or scheduler.disagg_prefill_pending_chunk_rids
+    if state_indices is None:
+        return
+    # State entries are registered in the storage's wire order, so the i-th
+    # entry carries the i-th wire entry's sub-pool.
+    for entry, state_type, ids in zip(
+        storage.wire_entries(), state_types, state_indices
+    ):
+        if (
+            ids is None
+            or entry.part not in (KV_PART, STATE_PART)
+            or _wire_state_type(entry.state_type) != _wire_state_type(state_type)
+        ):
+            continue
+        for part in ids if isinstance(ids, list) else [ids]:
+            # A one-slot entry (a recurrent state's) arrives 0-d.
+            yield (
+                entry.sub_pool,
+                (part if isinstance(part, torch.Tensor) else np.asarray(part)).reshape(
+                    -1
+                ),
             )
-        if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
-            decode_offload_manager = scheduler.decode_offload_manager
-            return bool(
-                scheduler.disagg_decode_prealloc_queue.has_device_destinations
-                or scheduler.disagg_decode_prealloc_queue.has_published_destinations
-                or (
-                    decode_offload_manager is not None
-                    and decode_offload_manager.has_inflight_device_transfer()
+
+
+def _describe_peer(peer) -> str:
+    """A network transfer's peer as a stuck wait reports it: its room when the
+    peer names a sender."""
+    sender = peer[0] if isinstance(peer, tuple) and peer else peer
+    room = getattr(sender, "bootstrap_room", None)
+    return repr(peer) if room is None else f"room {room}"
+
+
+class NetworkTransferWaiter:
+    """Waits on the host until the engine is done with every network transfer
+    a page move cannot avoid. Each round every rank contributes one done flag
+    and one in-deadline flag, MIN-reduced over ``groups``, so all ranks return
+    or raise in the same round whatever order they list the transfers in.
+    Between rounds it sleeps, releasing the GIL the engine's threads report
+    through. The default ``deadline`` lies past the protocol's own deadlines."""
+
+    def __init__(
+        self,
+        done: Callable[[Any], bool],
+        groups: Sequence[Optional[dist.ProcessGroup]],
+        *,
+        heartbeat: Optional[Callable[[], None]] = None,
+        interval: float = 0.0005,
+        report_after: float = 10.0,
+        deadline: Optional[float] = None,
+    ):
+        self._done = done
+        self._groups = [g for g in groups if g is not None]
+        self._heartbeat = heartbeat
+        self._interval = interval
+        self._report_after = report_after
+        if deadline is None:
+            deadline = envs.SGLANG_DISAGGREGATION_PAGE_MOVE_WAIT_TIMEOUT.get()
+        if deadline is None:
+            deadline = (
+                envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get()
+                + envs.SGLANG_DISAGGREGATION_WAITING_TIMEOUT.get()
+                + envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT.get()
+                + 60.0
+            )
+        self._deadline = deadline
+
+    def __call__(self, transfers) -> None:
+        start = time.monotonic()
+        reported = start
+        while True:
+            local = [bool(self._done(t.peer)) for t in transfers]
+            # Whether this rank's wait is within its deadline: reduced with
+            # the done flag, so every rank decides to give up in one round.
+            in_time = time.monotonic() - start < self._deadline
+            flags = [int(all(local)), int(in_time)]
+            for group in self._groups:
+                flags = all_reduce_flags(flags=flags, group=group, op=dist.ReduceOp.MIN)
+            if flags[0]:
+                return
+            if not flags[1]:
+                stuck = [t.peer for t, ended in zip(transfers, local) if not ended]
+                raise RuntimeError(
+                    f"A KV page move waited {time.monotonic() - start:.1f} s, past "
+                    f"its {self._deadline:.0f} s deadline "
+                    "(SGLANG_DISAGGREGATION_PAGE_MOVE_WAIT_TIMEOUT), for network "
+                    f"transfers that never ended; on this rank {len(stuck)} of "
+                    f"{len(local)} still run: {[_describe_peer(p) for p in stuck]}"
                 )
-            )
-        raise ValueError(
-            "disagg_transfers_in_flight: scheduler is not a PD node "
-            f"(mode={scheduler.disaggregation_mode})"
-        )
-
-    return busy
+            if self._heartbeat is not None:
+                self._heartbeat()
+            now = time.monotonic()
+            if now - reported >= self._report_after:
+                logger.warning(
+                    "A KV page move has waited %.1f s for network transfers to "
+                    "finish; %d of %d are still running on this rank.",
+                    now - start,
+                    len(local) - sum(local),
+                    len(local),
+                )
+                reported = now
+            time.sleep(self._interval)
 
 
 #########################

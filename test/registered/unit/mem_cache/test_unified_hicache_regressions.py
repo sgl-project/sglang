@@ -17,7 +17,8 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import (
     chain_snapshot,
-    pin_every_band,
+    hold_every_band,
+    release_every_band,
     token_ends,
 )
 
@@ -57,7 +58,7 @@ class TestHiCacheIndexDomains(unittest.TestCase):
 
 
 class TestHostGateCapacity(unittest.TestCase):
-    def test_schedulable_memo_tracks_gate_without_allocator_mutation(self):
+    def test_schedulable_memo_tracks_holds(self):
         from test_unified_capacity_memo import _build
 
         from sglang.test.unified_allocator_fixtures import setup_allocator_context
@@ -67,19 +68,15 @@ class TestHostGateCapacity(unittest.TestCase):
         ids = inst._alloc(allocator, kvcache, 8)
         allocator.free_swa(ids[2:6])
         full = allocator.full_attn_allocator
-        state = {"open": True}
-        pin_every_band(allocator, lambda: not state["open"])
-        epoch = full._chain_capacity_epoch()
         before = full.schedulable_available_size()
-        state["open"] = False
-        self.assertEqual(full._chain_capacity_epoch(), epoch)
+        hold_every_band(allocator)
         self.assertEqual(full.schedulable_available_size(), full.available_size())
         self.assertGreater(before, full.schedulable_available_size())
         self.assertFalse(
             ends_compaction_allowed(chain_snapshot(allocator), token_ends(allocator))
         )
         self.assertEqual(allocator.verify_byte_accounting(), [])
-        state["open"] = True
+        release_every_band(allocator)
         self.assertEqual(full.schedulable_available_size(), before)
 
 

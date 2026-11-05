@@ -11,7 +11,7 @@ entries each static pool family registers. All of it goes when those pools do.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 import msgspec
 import torch
@@ -448,11 +448,35 @@ class StaticKVStorage:
         """See `KVStorage.record_forward`: static pools never move a row, so
         nothing races a forward."""
 
+    def move_epoch(self) -> int:
+        """See `KVStorage.move_epoch`: static pools never move a row."""
+        return 0
+
     def retire_forward(self, forward_done) -> None:
         """See `KVStorage.retire_forward`: nothing was recorded."""
 
     def record_host_transfer(self, signal, transfers, *, writes: bool) -> None:
         """See `KVStorage.record_host_transfer`: no row moves under a copy."""
+
+    def record_network_transfer(
+        self, req: Req, *, pages, page_size: int, states=(), writes: bool, peer=None
+    ) -> None:
+        """See `KVStorage.record_network_transfer`: no row moves under a
+        transfer, so nothing ever waits for one."""
+
+    def set_network_waiter(self, waiter) -> None:
+        """See `KVStorage.set_network_waiter`: nothing ever waits."""
+
+    def end_network_transfer(self, req: Req) -> None:
+        """Rows of a static pool are not ordered against network transfers."""
+
+    def hold_receive_rows(
+        self, req: Req, *, token_start: int, token_end: int, signal
+    ) -> None:
+        """See `KVStorage.hold_receive_rows`: static rows never move."""
+
+    def end_receive_hold(self, req: Req) -> None:
+        """See `KVStorage.end_receive_hold`: nothing was held."""
 
     def release_row(self, req: Req) -> None:
         # The DSV4-NPU table's free() also releases the c4/c128 state pages.
@@ -759,11 +783,6 @@ class StaticKVStorage:
                 else ()
             )
         )
-
-    def add_pin_source(
-        self, sub_pools: Sequence[str], busy: Callable[[], bool]
-    ) -> None:
-        """Static pools never move a row, so a transfer has nothing to pin."""
 
     def _states(self) -> _StaticStateEntries:
         if self._state_entries is None:

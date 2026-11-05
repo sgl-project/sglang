@@ -61,6 +61,7 @@ from sglang.srt.mem_cache.kv.alloc.pricing import (
     no_relief_plan,
     snapshot_chain,
 )
+from sglang.srt.mem_cache.kv.alloc.signals import NetworkWaiter
 from sglang.srt.mem_cache.kv.memory.arena import KVArena
 from sglang.srt.mem_cache.utils import get_num_new_pages
 from sglang.srt.runtime_context import get_parallel
@@ -362,20 +363,17 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
     # -- capacity views (the interim policy of the chain's shape) --
 
     def _snapshot_key_now(self) -> int:
-        """The chain's capacity epoch and, per band, its compaction mode and
-        whether a pin source is busy: neither is a capacity field. A band's
-        blocked bit is its load pin, a capacity field, or a busy pin source;
-        sources are callables, so the epoch alone misses a flip."""
+        """The chain's capacity epoch and, per band, its compaction mode, which
+        is not a capacity field."""
         epoch = bits = 0
         for band in self.bands:
             epoch += band._capacity_epoch
-            pinned = band.pinned_by_source()
-            bits = (bits << 2) | (2 if band.lazy_compaction else 0) | pinned
-        return (epoch << (2 * len(self.bands))) | bits
+            bits = (bits << 1) | bool(band.lazy_compaction)
+        return (epoch << len(self.bands)) | bits
 
     def pricing_snapshot(self) -> ChainSnapshot:
         """The bands' snapshot every capacity decision prices on, kept until
-        the epoch moves or a pin source's answer changes."""
+        the epoch moves."""
         key = self._snapshot_key_now()
         if key != self._snapshot_key:
             self._snapshot_memo = snapshot_chain(
@@ -534,6 +532,12 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             rules=self.admission_rules(),
             num_mixed_decode_tokens=num_mixed_decode_tokens,
         )
+
+    def set_network_waiter(self, waiter: Optional[NetworkWaiter]) -> None:
+        """Wait on the host for network transfers a move cannot avoid: every
+        band of the chain asks ``waiter``."""
+        for band in self.bands:
+            band.network_waiter = waiter
 
     def usage(self) -> Dict[str, Tuple[int, int]]:
         """Each sub-pool's (capacity, available units), by sub-pool name."""
@@ -783,16 +787,6 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         )
 
     # -- ordering with transfers and forwards --
-
-    def add_pin_source(
-        self, sub_pools: Sequence[str], busy: Callable[[], bool]
-    ) -> None:
-        """Keep the named sub-pools' pages in place whenever ``busy()`` holds:
-        a DMA initiator whose queues outlive an iteration, registered once. A
-        transfer that reaches every sub-pool names every one: a band it leaves
-        out would relocate its own pages under the same in-flight copy."""
-        for name in sub_pools:
-            self.bands[self._band_positions[name]].add_pin_source(busy)
 
     def fix_pages(self, sub_pool: str, key: Hashable, pages: Sequence[int]) -> None:
         """Keep these physical pages of ``sub_pool`` where they are, under

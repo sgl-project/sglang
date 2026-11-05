@@ -67,12 +67,14 @@ from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.utils import (
     KVClassType,
     MetadataBuffers,
+    NetworkTransferWaiter,
     ReqToMetadataIdxAllocator,
     TransferBackend,
     _is_fake_transfer,
     all_reduce_flags,
     build_kv_layer_ids,
     build_staging_slot_metadata,
+    end_network_transfer,
     get_dsa_tail_state_indices,
     get_kv_class,
     get_kv_transfer_buf_infos,
@@ -86,6 +88,7 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce_with_staging,
     pre_alloc_fill_len,
     prepare_abort,
+    record_network_transfer,
     setup_state_kv_args,
     wire_sub_pool,
 )
@@ -419,6 +422,11 @@ class DecodeRequest:
     # Overlap without the deferred publish: (ready event, send_metadata args,
     # kwargs) until the forward and any pinned metadata readback are done.
     pending_metadata: Optional[Tuple[Any, tuple, dict]] = None
+    # The receive rows of that held send, while no peer has their ids.
+    pending_receive: Optional[_PendingReceive] = None
+    # When a page move first saw this rank's receive fail (`time.monotonic()`);
+    # the release timeout of a later hold starts there.
+    receive_failed_at: Optional[float] = None
 
     # HiCache Status
     prefix_match: Optional[DecodePrefixMatch] = None
@@ -436,6 +444,17 @@ class _PendingPublish(msgspec.Struct, frozen=True):
     prefix_len: int
     total_prefix_len: int
     fill_len: int
+    # The pool's page-move count at allocation (`move_epoch`).
+    move_epoch: int = 0
+
+
+class _PendingReceive(msgspec.Struct, frozen=True):
+    """Receive rows held until their destination is sent; a page move since
+    ``move_epoch`` makes the send re-read their ids (``refresh``)."""
+
+    move_epoch: int
+    page_size: int
+    refresh: Callable[[], Tuple[Any, Optional[List]]]
 
 
 class DecodePreallocQueue(DecodeHiCachePreallocMixin):
@@ -643,6 +662,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if self.scheduler.tp_worker.is_hybrid_swa:
             return self.token_to_kv_pool_allocator.full_available_size()
         return self.token_to_kv_pool_allocator.available_size()
+
+    def _storage(self):
+        return kv_storage_of(self.req_to_token_pool, self.token_to_kv_pool_allocator)
 
     def _swa_tail_len(self, seq_len: int, window_size: Optional[int] = None) -> int:
         """The tokens of a window's tail a decode preallocation keeps: the
@@ -1124,6 +1146,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def release_memory_occupation(self):
         self._cancel_prefill_dp_rank_queries()
         self.queue.clear()
+        if self._pending_publish:
+            storage = self._storage()
+            for entry in self._pending_publish:
+                storage.end_receive_hold(entry.decode_req.req)
         self._pending_publish.clear()
         for req in self.retracted_queue:
             discard_kv_cache_backup(req, self.tree_cache)
@@ -1767,14 +1793,23 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 assert decode_req.metadata_buffer_index is not None
                 decode_req.awaiting_publish = True
                 decode_req.req.time_stats.set_decode_transfer_queue_entry_time()
-                # Counted as published until extend(): a later allocation in this
-                # loop must not compact (move) pages the publish will read back.
+                # Counted as published until extend().
                 self._num_published_destinations += 1
                 # A take of pages a forward may still use (freed while it ran)
                 # queued its wait for that forward on this stream first, so this
                 # event, and the readback the publish gates on it, follow it.
                 allocated = torch.cuda.Event()
                 allocated.record()
+                storage = self._storage()
+                # The publish reads these rows' ids back later, off the
+                # schedule stream; a move since orders it after (`move_epoch`).
+                storage.hold_receive_rows(
+                    decode_req.req,
+                    token_start=total_prefix_len,
+                    token_end=fill_len,
+                    signal=allocated,
+                )
+                move_epoch = storage.move_epoch()
                 self._pending_publish.append(
                     _PendingPublish(
                         allocated=allocated,
@@ -1783,6 +1818,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         prefix_len=prefix_len,
                         total_prefix_len=total_prefix_len,
                         fill_len=fill_len,
+                        move_epoch=move_epoch,
                     )
                 )
             else:
@@ -1812,6 +1848,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         return preallocated_reqs, failed_reqs
 
     def publish_pending_destinations(self) -> None:
+        """Send the destinations allocated by an earlier `pop_preallocated`,
+        one iteration later. A forward still running is kept off the peer's
+        writes by the allocation itself: a take waits for the forwards that
+        may still touch the pages it hands out."""
         if not self._pending_publish:
             return
         pending, self._pending_publish = self._pending_publish, []
@@ -1829,15 +1869,22 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             group=self.gloo_group,
             op=dist.ReduceOp.MIN,
         )
+        storage = self._storage()
         for entry, poll in zip(pending, polls):
             if poll == KVPoll.Failed:
                 # Aborted before its destination was published: nothing to send,
                 # the transfer queue releases it.
+                storage.end_receive_hold(entry.decode_req.req)
                 continue
             entry.decode_req.awaiting_publish = False
-            # Gate the readback on this allocation only, not on the forward the
-            # schedule stream has been fenced behind since.
-            self._publish_stream.wait_event(entry.allocated)
+            if storage.move_epoch() == entry.move_epoch:
+                # Gate the readback on this allocation only, not on the forward
+                # the schedule stream has been fenced behind since.
+                self._publish_stream.wait_event(entry.allocated)
+            else:
+                # A page move since the allocation rebinds these ids on the
+                # schedule stream: read them back after it.
+                self._publish_stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(self._publish_stream):
                 self._publish_destination(
                     decode_req=entry.decode_req,
@@ -1847,6 +1894,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     fill_len=entry.fill_len,
                     metadata_buffer_preassigned=True,
                 )
+            # The publish recorded the rows' transfer: the hold has done its part.
+            storage.end_receive_hold(entry.decode_req.req)
             # The publish counted it again; the transfer queue has held it since.
             self.note_destinations_queued(1)
         # Order the publish stream's writes (e.g. request-state clears) before
@@ -2065,6 +2114,21 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         metadata_kwargs = {"decode_prefix_len": total_prefix_len}
         if device_page_indices is not None:
             metadata_kwargs["device_kv_indices"] = device_page_indices
+
+        def refresh():
+            # The same rows' physical ids and state payloads, read again
+            # after a page move.
+            fresh_kv_indices = (
+                kv_indices
+                if self.scheduler.enable_hisparse
+                else self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
+                    raw_kv_indices
+                )
+            )
+            return fresh_kv_indices, [
+                payloads[st]() if st in payloads else None for st in state_types
+            ]
+
         self._send_kv_metadata(
             decode_req,
             kv_indices,
@@ -2072,8 +2136,44 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             state_indices,
             metadata_buffer_preassigned=metadata_buffer_preassigned,
             non_blocking=non_blocking_metadata,
+            receive_rows=(total_prefix_len, fill_len),
+            refresh=refresh,
             **metadata_kwargs,
         )
+
+    def _record_receive(
+        self, decode_req, page_indices, page_size, state_indices
+    ) -> None:
+        """The peer writes these rows by physical id from now on; a failed
+        transfer is done with them at its deferred release."""
+        record_network_transfer(
+            self._storage(),
+            decode_req.req,
+            peer=decode_req,
+            writes=True,
+            page_indices=page_indices,
+            page_size=page_size,
+            state_types=self.kv_manager.kv_args.state_types,
+            state_indices=state_indices,
+        )
+
+    def held_receive_args(self, decode_req, args: tuple) -> tuple:
+        """A held send's args once it may go: ids re-read after a page move,
+        and the rows recorded as the peer's in place of the hold."""
+        receive = decode_req.pending_receive
+        if receive is None:
+            return args
+        decode_req.pending_receive = None
+        storage = self._storage()
+        page_indices, metadata_index, state_indices = args
+        if storage.move_epoch() != receive.move_epoch:
+            kv_indices, state_indices = receive.refresh()
+            page_indices = self._transfer_page_indices(
+                decode_req, kv_indices, receive.page_size
+            )
+        self._record_receive(decode_req, page_indices, receive.page_size, state_indices)
+        storage.end_receive_hold(decode_req.req)
+        return page_indices, metadata_index, state_indices
 
     def _send_kv_metadata(
         self,
@@ -2083,8 +2183,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         state_indices=None,
         metadata_buffer_preassigned: bool = False,
         non_blocking: bool = False,
+        receive_rows: Optional[Tuple[int, int]] = None,
+        refresh: Optional[Callable[[], Tuple[Any, Optional[List]]]] = None,
         **metadata_kwargs,
     ) -> None:
+        """Send ``decode_req``'s destination, or hold it until the forward in
+        flight is done; a held send's rows (``receive_rows``) are held, not
+        recorded as the peer's, and re-read at the send (``refresh``)."""
         if not metadata_buffer_preassigned:
             decode_req.metadata_buffer_index = (
                 self.req_to_metadata_buffer_idx_allocator.alloc()
@@ -2098,7 +2203,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 host.copy_(indices, non_blocking=True)
                 return host.numpy()
 
-            page_indices = to_host((kv_indices[::page_size] // page_size).int())
+            # The receive is recorded by the device ids: the host copies are
+            # read only once the readback is done.
+            device_pages = (kv_indices[::page_size] // page_size).int()
+            device_state_indices = state_indices
+            page_indices = to_host(device_pages)
             state_indices = [
                 [to_host(indices) for indices in payload] for payload in state_indices
             ]
@@ -2113,6 +2222,35 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             page_indices = self._transfer_page_indices(
                 decode_req, kv_indices, page_size
             )
+            device_pages, device_state_indices = page_indices, state_indices
+        to_device = metadata_kwargs.get("destination") != KVTransferDestination.HOST
+        held = (
+            readback_ready is None
+            and self.scheduler.enable_overlap
+            and not self._defer_publish
+            and to_device
+        )
+        ready = readback_ready
+        if held:
+            # A forward still in flight may write pages this request was just
+            # given, and prefill's RDMA follows no stream: send once it is done.
+            ready = self.scheduler.device_module.Event()
+            ready.record(stream=self.scheduler.forward_stream)
+        if held and receive_rows is not None and refresh is not None:
+            storage = self._storage()
+            storage.hold_receive_rows(
+                decode_req.req,
+                token_start=receive_rows[0],
+                token_end=receive_rows[1],
+                signal=ready,
+            )
+            decode_req.pending_receive = _PendingReceive(
+                move_epoch=storage.move_epoch(), page_size=page_size, refresh=refresh
+            )
+        elif to_device:
+            self._record_receive(
+                decode_req, device_pages, page_size, device_state_indices
+            )
         if (
             metadata_kwargs.get("destination") != KVTransferDestination.HOST
             and self.transfer_queue.enable_staging
@@ -2125,21 +2263,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 decode_req.req.bootstrap_room, decode_req
             )
         args = (page_indices, decode_req.metadata_buffer_index, state_indices)
-        if readback_ready is not None:
-            decode_req.pending_metadata = (readback_ready, args, metadata_kwargs)
-        elif (
-            self.scheduler.enable_overlap
-            and not self._defer_publish
-            and metadata_kwargs.get("destination") != KVTransferDestination.HOST
-        ):
-            # A request that finished last step can still have its forward in
-            # flight, writing pages this request was just given. Prefill's RDMA
-            # into them follows no stream, so send once that forward is done.
-            # The deferred publish already waits on an allocation fenced behind
-            # that forward; this covers the inline publish (staging,
-            # HiSparse, no WAR barrier), where the destination is sent at once.
-            ready = self.scheduler.device_module.Event()
-            ready.record(stream=self.scheduler.forward_stream)
+        if ready is not None:
             decode_req.pending_metadata = (ready, args, metadata_kwargs)
         else:
             decode_req.kv_receiver.send_metadata(*args, **metadata_kwargs)
@@ -2345,14 +2469,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     @property
     def has_published_destinations(self) -> bool:
         return self._num_published_destinations > 0
-
-    @property
-    def has_device_destinations(self) -> bool:
-        """Whether a transfer-queue entry holds a device destination."""
-        stats = self._host_staged_admission_stats
-        if stats is not None and stats.num_device_transfer_reqs is not None:
-            return stats.num_device_transfer_reqs > 0
-        return any(not r.host_staged for r in self.transfer_queue.queue.items())
 
     def note_destinations_queued(self, count: int) -> None:
         """Hand `count` published destinations over to the transfer queue."""
@@ -3027,6 +3143,17 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self._deferred_releases = IndexedReqList(
             ListKind.PD_RELEASING, req_of=lambda x: x[0].req
         )
+        # A page move that cannot avoid a row a receive writes waits, on the
+        # host, until every rank's receive is done writing it.
+        kv_storage_of(
+            tree_cache.req_to_token_pool, tree_cache.token_to_kv_pool_allocator
+        ).set_network_waiter(
+            NetworkTransferWaiter(
+                self._receive_done,
+                (self.gloo_group,),
+                heartbeat=self.scheduler.feed_watchdog,
+            )
+        )
 
     def request_lists(self) -> Dict[ListKind, ReqList]:
         return {
@@ -3310,6 +3437,12 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             if publish:
                 _, args, kwargs = decode_req.pending_metadata
                 decode_req.pending_metadata = None
+                if decode_req.pending_receive is not None:
+                    args = (
+                        self.scheduler.disagg_decode_prealloc_queue.held_receive_args(
+                            decode_req, args
+                        )
+                    )
                 decode_req.kv_receiver.send_metadata(*args, **kwargs)
                 if (
                     decode_req.is_rebootstrap
@@ -3449,6 +3582,14 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                         if not prealloc_queue.allocate_host_staged(decode_req):
                             continue
                 self._commit_transfer_to_req(decode_req)
+                # The peer wrote its last byte.
+                end_network_transfer(
+                    kv_storage_of(
+                        self.tree_cache.req_to_token_pool,
+                        self.tree_cache.token_to_kv_pool_allocator,
+                    ),
+                    decode_req.req,
+                )
                 indices_to_remove.add(i)
                 # Check if request was aborted due to corruption
                 outcomes[decode_req.req.rid] = isinstance(
@@ -3535,19 +3676,15 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         return transferred_reqs, outcomes
 
     def _defer_release(self, decode_req: DecodeRequest) -> None:
-        start_time = time.monotonic()
+        # The timeout runs from the first sight of the failure, so a page move
+        # that saw it before this hold keeps the same deadline.
+        start_time = decode_req.receive_failed_at
+        if start_time is None:
+            start_time = time.monotonic()
         deadline = start_time + self.deferred_kv_release_timeout
         # Host-capable receivers own their drain tracking. Device destinations
         # snapshot the number of prefill acknowledgements required by the manager.
         # A rank that only holds for a peer has no local acknowledgements to await.
-        required_acks = (
-            0
-            if self._is_host_destination(decode_req)
-            or decode_req.awaiting_publish
-            or decode_req.pending_metadata is not None
-            or not decode_req.kv_receiver.abort_notified
-            else len(decode_req.kv_receiver.bootstrap_infos)
-        )
         self._deferred_releases.join(
             [
                 (
@@ -3555,9 +3692,76 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     start_time,
                     deadline,
                     decode_req.metadata_buffer_index,
-                    required_acks,
+                    self._required_abort_acks(decode_req),
                 )
             ]
+        )
+
+    def _required_abort_acks(self, decode_req: DecodeRequest) -> int:
+        """Prefill acks an aborted receive waits for before its rows may be
+        reused: one per prefill rank for a notified device destination."""
+        if (
+            self._is_host_destination(decode_req)
+            or decode_req.awaiting_publish
+            or decode_req.pending_metadata is not None
+            or not decode_req.kv_receiver.abort_notified
+        ):
+            return 0
+        return len(decode_req.kv_receiver.bootstrap_infos)
+
+    def _receive_done(self, decode_req: DecodeRequest) -> bool:
+        """Whether this rank's receive no longer writes ``decode_req``'s rows:
+        it succeeded (staging scatter done), or failed and is quiescent."""
+        receiver = decode_req.kv_receiver
+        if receiver is None:
+            return True
+        staged = self.enable_staging and receiver.require_staging
+        if staged and not self.staging_handler.is_done(decode_req):
+            self.staging_handler.advance_scatter(decode_req)
+        poll = receiver.poll()
+        if staged and self.staging_handler.is_failed(decode_req):
+            poll = KVPoll.Failed
+        if poll == KVPoll.Success:
+            return not staged or self.staging_handler.is_done(decode_req)
+        if poll != KVPoll.Failed:
+            return False
+        return self._failed_receive_quiescent(decode_req)
+
+    def _failed_receive_quiescent(self, decode_req: DecodeRequest) -> bool:
+        """Whether no prefill rank still writes a failed receive's rows, by
+        deferred release's rule: every bootstrap peer's ack, or the deadline
+        from the first sight of the failure, which a later hold keeps."""
+        # TODO(ch-wan): neither the deadline nor a release without deferred
+        # release proves the remote writer stopped, so the network waiter can
+        # let rows be moved or reused while a late write still lands in them.
+        receiver = decode_req.kv_receiver
+        if not (
+            self.enable_deferred_kv_release
+            and receiver.kv_mgr.enable_deferred_decode_kv_release
+        ):
+            return True
+        if self._is_host_destination(decode_req):
+            return receiver.is_abort_release_safe()
+        hold = next(
+            (e for e in self._deferred_releases.items() if e[0] is decode_req), None
+        )
+        if hold is not None:
+            _, _, deadline, _, required_acks = hold
+        elif decode_req.awaiting_publish or decode_req.pending_metadata is not None:
+            return True  # no peer has these rows' addresses
+        else:
+            receiver.ensure_abort_notified(force_arm=True)
+            required_acks = len(getattr(receiver, "bootstrap_infos", None) or ())
+            if decode_req.receive_failed_at is None:
+                decode_req.receive_failed_at = time.monotonic()
+            deadline = decode_req.receive_failed_at + self.deferred_kv_release_timeout
+        # Once the deadline passes the answer stays true, so ranks that saw
+        # the failure at different times still agree in the waiter's reduction.
+        return (
+            receiver.kv_mgr.is_abort_release_safe(
+                decode_req.req.bootstrap_room, required_acks
+            )
+            or time.monotonic() >= deadline
         )
 
     def _unregister_staging_room(self, room: int) -> None:

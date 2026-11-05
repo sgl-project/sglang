@@ -25,7 +25,11 @@ from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.runtime_context import get_parallel, mamba_cache_chunk_size
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang.test.unified_allocator_fixtures import setup_allocator_context
+from sglang.test.unified_allocator_fixtures import (
+    hold_band,
+    release_band,
+    setup_allocator_context,
+)
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
@@ -2600,11 +2604,11 @@ class TestDeclaredParts(CustomTestCase):
             (80, 8, 4),
         )
         budget = a.create_prefill_budget(cache)
-        pinned = [True]
-        a.full_attn_allocator.add_pin_source(lambda: pinned[0])
-        a.swa_attn_allocator.add_pin_source(lambda: pinned[0])
+        hold_band(a.full_attn_allocator)
+        hold_band(a.swa_attn_allocator)
         self.assertFalse(budget._fits(8, 8))
-        pinned[0] = False
+        release_band(a.full_attn_allocator)
+        release_band(a.swa_attn_allocator)
         self.assertTrue(budget._fits(8, 8))
         cache.evict_for_alloc(
             EvictParams(
