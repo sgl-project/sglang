@@ -3536,6 +3536,10 @@ class AiterAttnBackend(AttentionBackend):
         metadatas: list[MlaPrefillPsMetadata] = []
         for i in range(forward_batch.num_prefix_chunks):
             chunk_lens_cpu = forward_batch.prefix_chunk_seq_lens_cpu[i].to(torch.int32)
+            if not chunk_lens_cpu.any():
+                # A chunk without keys has nothing to plan;
+                # leaving the list unset keeps every chunk in bf16 on varlen.
+                return
             if forward_batch.prefix_chunk_has_zero_kv[i]:
                 metadatas.append(
                     self._build_active_prefix_chunk_ps_metadata(
