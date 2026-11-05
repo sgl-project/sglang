@@ -26,6 +26,14 @@ class MockStorageConfig:
     pp_rank: int = 0
     pp_size: int = 1
     is_mla_model: bool = False
+    rank_replicated: Optional[bool] = None
+
+    @property
+    def is_rank_replicated(self):
+        return (
+            self.is_mla_model if self.rank_replicated is None else self.rank_replicated
+        )
+
     is_page_first_layout: bool = True
     model_name: str = "test-model"
     tp_lcm_size: Optional[int] = None
@@ -378,7 +386,7 @@ class TestUMBPStoreDefensiveSemantics(unittest.TestCase):
         store.registered_pools = {}
         store._kv_anchor_is_logical = True
         store.is_mla_backend = True
-        store.mla_suffix = ""
+        store.kv_rank_suffix = ""
         store.mha_suffix = "0"
         store.config_prefix = None
         store.register_mem_host_pool_v2(MockHybridSidePool(), PoolName.DEEPSEEK_V4_C4)

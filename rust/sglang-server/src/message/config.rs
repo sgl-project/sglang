@@ -24,6 +24,9 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+/// Python's `--grpc-response-timeout-secs` default.
+pub const DEFAULT_GRPC_RESPONSE_TIMEOUT_SECS: u64 = 300;
+
 /// Boot knobs specific to the embedded rust server — none of these exist in
 /// the Python-built [`ServerArgs`]; they arrive as explicit
 /// `Server::start` parameters.
@@ -134,6 +137,10 @@ pub struct ServerArgs {
     /// Optional gRPC base port. The same per-rank offset as HTTP is applied at
     /// the Python→Rust startup boundary; `None` keeps gRPC disabled.
     pub grpc_port: Option<u16>,
+    /// `--grpc-response-timeout-secs`: the longest a gRPC call waits for its
+    /// next response event before ending with DEADLINE_EXCEEDED. `0` keeps
+    /// the default, as the legacy gRPC bridge does.
+    pub grpc_response_timeout_secs: u64,
     /// Log levels driving the access log — uvicorn runs at
     /// `log_level_http or log_level` (see [`Self::http_access_log_enabled`]).
     pub log_level: String,
@@ -252,6 +259,7 @@ impl ServerArgs {
         host,
         port,
         grpc_port,
+        grpc_response_timeout_secs,
         log_level,
         log_level_http,
         chat_template,
@@ -307,6 +315,7 @@ impl ServerArgs {
         host: String,
         port: u16,
         grpc_port: Option<u16>,
+        grpc_response_timeout_secs: u64,
         log_level: String,
         log_level_http: Option<String>,
         chat_template: Option<String>,
@@ -360,6 +369,7 @@ impl ServerArgs {
             host,
             port,
             grpc_port,
+            grpc_response_timeout_secs,
             log_level,
             log_level_http,
             chat_template,
@@ -422,6 +432,7 @@ impl Default for ServerArgs {
             host: "127.0.0.1".into(),
             port: 30000,
             grpc_port: None,
+            grpc_response_timeout_secs: DEFAULT_GRPC_RESPONSE_TIMEOUT_SECS,
             log_level: "info".into(),
             log_level_http: None,
             chat_template: None,
@@ -486,6 +497,8 @@ pub struct DeploymentInfo {
     pub hicache_host_total_tokens: Option<u64>,
     pub kv_event_sources: Vec<KvEventSource>,
     pub rust_server_endpoints: Vec<RustServerEndpoint>,
+    /// Every Rust listener of this launch on this node; the same table on each.
+    pub node_listeners: Vec<NodeRustListener>,
 }
 
 /// One DP rank's listener, as a base URL (`http://host:port`).
@@ -501,6 +514,14 @@ pub struct KvEventSource {
     pub endpoint: String,
     pub topic: String,
     pub block_size: u32,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct NodeRustListener {
+    pub port_offset: u16,
+    pub dp_rank: u32,
+    pub http_port: u16,
+    pub grpc_port: Option<u16>,
 }
 
 impl<'py> pyo3::FromPyObject<'_, 'py> for DeploymentInfo {
