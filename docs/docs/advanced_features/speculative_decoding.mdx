@@ -647,7 +647,7 @@ python3 -m sglang.launch_server \
 For DFlash2, use a matching target and selector checkpoint, such as
 `Qwen/Qwen3.8-27B` and `incoai/Qwen3.8-27B-DFlash2`.
 Each attention-DP group runs its draft within the local attention-TP group.
-Draft execution stays eager; eligible target verify batches can use CUDA graphs.
+Draft and target verify batches can use CUDA graphs, including on idle DP ranks.
 The scheduler separates prefill and verify rounds across DP ranks. Keep the
 experimental `SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION` setting disabled.
 
