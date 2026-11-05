@@ -1833,17 +1833,19 @@ class Engine(EngineScoreMixin, EngineBase):
         tensors,
         load_format: Optional[str],
     ) -> List[bytes]:
-        """One serialized payload per TP rank: each rank deserializes only its
-        own copy, so producer-side CUDA-IPC refcounts drop cleanly after every
-        load. flattened_bucket callers pass pre-serialized per-rank payloads."""
+        """One serialized payload per engine rank (tp_size * pp_size, in world
+        rank order): each rank deserializes only its own copy, so producer-side
+        CUDA-IPC refcounts drop cleanly after every load. flattened_bucket
+        callers pass pre-serialized per-rank payloads."""
         if load_format == "flattened_bucket":
             return normalize_serialized_named_tensor_payloads(
                 cast(List[SerializedTensorPayload], tensors)
             )
         else:
+            parallel = get_parallel()
             return [
                 MultiprocessingSerializer.serialize(tensors)
-                for _ in range(get_parallel().tp_size)
+                for _ in range(parallel.tp_size * parallel.pp_size)
             ]
 
     def load_lora_adapter_from_tensors(
