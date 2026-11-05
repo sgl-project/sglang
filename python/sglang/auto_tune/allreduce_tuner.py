@@ -280,7 +280,12 @@ def tune_allreduce(
     import torch.distributed as dist
 
     if not dist.is_initialized():
-        logger.warning("torch.distributed not initialized; skipping allreduce tuning")
+        logger.warning(
+            "torch.distributed is not initialized, so allreduce tuning was skipped. "
+            "Launch one process per GPU with torchrun, for example: "
+            "torchrun --nproc_per_node=8 -m sglang.auto_tune.run_allreduce "
+            "--model-path <model> --tp 8 --qr-quant INT4"
+        )
         return []
 
     if group is None:
@@ -363,6 +368,7 @@ def run_allreduce_tuning(
     output_dir: Optional[str] = None,
     verbose: bool = True,
     qr_quants: Optional[List[str]] = None,
+    num_iters: int = 100,
 ) -> Dict[str, Any]:
     """Entry point for allreduce auto-tuning.
 
@@ -377,7 +383,12 @@ def run_allreduce_tuning(
 
     qr_quants = _normalize_qr_quants(qr_quants)
     results = tune_allreduce(
-        model_config, tp_size, group=group, verbose=verbose, qr_quants=qr_quants,
+        model_config,
+        tp_size,
+        group=group,
+        verbose=verbose,
+        qr_quants=qr_quants,
+        num_iters=num_iters,
     )
 
     if not results:
