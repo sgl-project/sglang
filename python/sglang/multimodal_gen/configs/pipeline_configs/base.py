@@ -45,6 +45,20 @@ from sglang.multimodal_gen.runtime.utils.vision import get_default_height_width
 logger = init_logger(__name__)
 
 
+def normalize_model_id_for_matching(model_id: str) -> str:
+    """Normalize a model id for substring matching.
+
+    Local directory names often swap the separators used by the published
+    repo id (e.g. ``Qwen-Image-2_1`` instead of ``Qwen-Image-2.1``), so unify
+    ``_`` and ``.`` to ``-`` before comparing. Without this, the more specific
+    entry is missed and a shorter, generic entry wins the match (e.g.
+    ``Qwen/Qwen-Image`` matches ``Qwen-Image-2_1`` while
+    ``Qwen/Qwen-Image-2.1`` does not), routing the model to the wrong
+    pipeline config.
+    """
+    return model_id.lower().replace("_", "-").replace(".", "-")
+
+
 class STA_Mode(str, Enum):
     """STA (Sliding Tile Attention) modes."""
 

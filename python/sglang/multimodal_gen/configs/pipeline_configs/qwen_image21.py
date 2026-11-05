@@ -8,7 +8,10 @@ import torch
 from sglang.multimodal_gen.configs.models.dits.qwenimage21 import QwenImage21DitConfig
 from sglang.multimodal_gen.configs.models.encoders.qwen3vl import Qwen3VLConfig
 from sglang.multimodal_gen.configs.models.vaes.qwenimage21 import QwenImage21VAEConfig
-from sglang.multimodal_gen.configs.pipeline_configs.base import ImagePipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.base import (
+    ImagePipelineConfig,
+    normalize_model_id_for_matching,
+)
 from sglang.multimodal_gen.configs.task_type import ModelTaskType
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -112,6 +115,12 @@ class QwenImage21PipelineConfig(ImagePipelineConfig):
         return image
 
 
+def _is_qwen_image_21_model(hf_id: str) -> bool:
+    # Local directory names may use "_" where the published repo id uses "."
+    # (e.g. "Qwen-Image-2_1"), so compare normalized ids.
+    return "qwen-image-2-1" in normalize_model_id_for_matching(hf_id)
+
+
 def register():
     from sglang.multimodal_gen.configs.sample.qwenimage21 import (
         QwenImage21SamplingParams,
@@ -122,5 +131,5 @@ def register():
         sampling_param_cls=QwenImage21SamplingParams,
         pipeline_config_cls=QwenImage21PipelineConfig,
         hf_model_paths=["Qwen/Qwen-Image-2.1", "Qwen/Qwen-Image-2.1-Turbo"],
-        model_detectors=[lambda hf_id: "qwen-image-2.1" in hf_id.lower()],
+        model_detectors=[_is_qwen_image_21_model],
     )
