@@ -317,6 +317,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         short_conv_state_shape: Optional[Tuple[int, int]] = None,
         ngram_context_len: int = 0,
         ngram_eos_token_id: int = 0,
+        replayssm_request_ring: bool = False,
     ):
         DecodeReqToTokenPool.__init__(
             self,
@@ -370,6 +371,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
             enable_linear_replayssm_spec=enable_linear_replayssm_spec,
             short_conv_layer_ids=short_conv_layer_ids,
             short_conv_state_shape=short_conv_state_shape,
+            replayssm_request_ring=replayssm_request_ring,
             ngram_context_len=ngram_context_len,
             ngram_eos_token_id=ngram_eos_token_id,
         )
@@ -2949,13 +2951,38 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 )
             else:
                 committed_output_id = output_id[0].item()
-            decode_req.req.output_ids.append(committed_output_id)
-            # The handoff token is generated on the prefill worker, so it does
-            # not pass through the decode worker's normal batch-result path.
-            # Account for it here using the same request-selected reasoning
-            # terminator matcher as subsequent decode tokens.
-            self.scheduler.batch_result_processor._maybe_update_reasoning_tokens(
-                decode_req.req, committed_output_id
+            req = decode_req.req
+            logprob_token_id = logprob = top_logprobs_val = top_logprobs_idx = None
+            if req.return_logprob:
+                top_logprobs_num = req.logprob.top_logprobs_num
+                logprob_token_id = output_token_logprobs_idx[0].item()
+                logprob = output_token_logprobs_val[0].item()
+                top_logprobs_val = output_top_logprobs_val[:top_logprobs_num].tolist()
+                top_logprobs_idx = output_top_logprobs_idx[:top_logprobs_num].tolist()
+            sampling_mask_idx = sampling_mask_logprobs = None
+            if req.return_sampling_mask:
+                assert output_token_sampling_mask_idx is not None, (
+                    "sampling mask buffer disabled on decode side"
+                )
+                sampling_mask_len = int(output_token_sampling_mask_len[0].item())
+                num_logprobs = (
+                    sampling_mask_len if req.sampling_logprobs_mode == "support" else 1
+                )
+                sampling_mask_idx = (
+                    output_token_sampling_mask_idx[:sampling_mask_len].cpu().numpy()
+                )
+                sampling_mask_logprobs = (
+                    output_token_sampling_logprobs[:num_logprobs].cpu().numpy()
+                )
+            self.scheduler.batch_result_processor.commit_handoff_token(
+                req,
+                committed_output_id,
+                logprob_token_id=logprob_token_id,
+                logprob=logprob,
+                top_logprobs_val=top_logprobs_val,
+                top_logprobs_idx=top_logprobs_idx,
+                sampling_mask_idx=sampling_mask_idx,
+                sampling_mask_logprobs=sampling_mask_logprobs,
             )
         decode_req.req.cached_tokens = cached_tokens[0].item()
         # The prefill node already reported its prefix-cache hit in
@@ -2984,42 +3011,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             ):
                 output_dsa_topk_indices = None
             decode_req.req.output_dsa_topk_indices = output_dsa_topk_indices
-
-        if decode_req.req.return_logprob and not resumes_output:
-            decode_req.req.logprob.output_token_logprobs_val.append(
-                output_token_logprobs_val[0].item()
-            )
-            decode_req.req.logprob.output_token_logprobs_idx.append(
-                output_token_logprobs_idx[0].item()
-            )
-            decode_req.req.logprob.output_top_logprobs_val.append(
-                output_top_logprobs_val[
-                    : decode_req.req.logprob.top_logprobs_num
-                ].tolist()
-            )
-            decode_req.req.logprob.output_top_logprobs_idx.append(
-                output_top_logprobs_idx[
-                    : decode_req.req.logprob.top_logprobs_num
-                ].tolist()
-            )
-            if decode_req.req.logprob.token_ids_logprob is not None:
-                # Prefill omits these scores; reserve a row for the streaming offset.
-                decode_req.req.logprob.output_token_ids_logprobs_val.append([])
-                decode_req.req.logprob.output_token_ids_logprobs_idx.append([])
-        if decode_req.req.return_sampling_mask and not resumes_output:
-            assert output_token_sampling_mask_idx is not None, (
-                "sampling mask buffer disabled on decode side"
-            )
-            sampling_mask_len = int(output_token_sampling_mask_len[0].item())
-            num_logprobs = (
-                sampling_mask_len
-                if decode_req.req.sampling_logprobs_mode == "support"
-                else 1
-            )
-            decode_req.req.sampling_mask_rows.append(
-                output_token_sampling_mask_idx[:sampling_mask_len].cpu().numpy(),
-                output_token_sampling_logprobs[:num_logprobs].cpu().numpy(),
-            )
 
         decode_req.kv_receiver.clear()
         decode_req.kv_receiver = None
@@ -3117,6 +3108,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         deferred_indices = set()
         failed: List[Tuple[int, DecodeRequest, bool]] = []
         outcomes: Dict[str, bool] = {}
+        device_admission_refused = False
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
             if rids_to_check is not None:
                 if decode_req.req.rid not in rids_to_check:
@@ -3200,9 +3192,14 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                         indices_to_remove.add(i)
                         outcomes[decode_req.req.rid] = True
                         continue
+                    # Like the prealloc and retraction loops, admit in queue order: once
+                    # a request does not fit, later ones wait for the next pass.
+                    if device_admission_refused:
+                        continue
                     if not self.scheduler.disagg_decode_prealloc_queue.allocate_host_staged(
                         decode_req
                     ):
+                        device_admission_refused = True
                         continue
                 self._commit_transfer_to_req(decode_req)
                 indices_to_remove.add(i)
@@ -3546,12 +3543,14 @@ class SchedulerDisaggregationDecodeMixin:
             )
             new_prebuilt_batch.filter_batch()
             if not new_prebuilt_batch.is_empty():
+                self.running_reqs.join(new_prebuilt_batch.reqs)
                 if running_batch.is_empty():
                     running_batch = new_prebuilt_batch
                     if self.enable_hisparse:
                         running_batch.hisparse_coordinator = self.hisparse_coordinator
                 else:
                     running_batch.merge_batch(new_prebuilt_batch)
+        self.invariant_checker.maybe_check_running_reqs(running_batch, last_batch=None)
 
         # Schedule decode batch
         if running_batch.is_empty():

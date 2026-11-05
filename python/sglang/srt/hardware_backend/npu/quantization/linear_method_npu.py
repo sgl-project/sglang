@@ -67,7 +67,10 @@ class NPUW8A8Int8LinearMethod(_NPULinearMethodBase):
         layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
         layer.weight.data = npu_format_cast(layer.weight.data)
 
-        layer.weight_scale.data = layer.weight_scale.data.flatten()
+        # Uncompressed W8A8S exports supply deq_scale directly and omit this
+        # unused field; ordinary W8A8 and compressed-tensors may retain it.
+        if hasattr(layer, "weight_scale"):
+            layer.weight_scale.data = layer.weight_scale.data.flatten()
         # Compressed-tensors format doesn't have this field
         if hasattr(layer, "weight_offset"):
             layer.weight_offset.data = layer.weight_offset.data.flatten()

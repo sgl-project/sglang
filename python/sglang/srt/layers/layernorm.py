@@ -457,6 +457,9 @@ def _is_static_per_tensor_fp8_linear(quant_method, linear) -> bool:
 
 
 class RMSNorm(BaseFusedOp):
+    # Explicit opt-in: implementations must honor use_attn_tp_group=False.
+    supports_non_attn_tp_allreduce = True
+
     # The projection that consumes this norm's output; see fuse_input_quant().
     _quant_linear: Optional[nn.Module] = None
 
@@ -1152,6 +1155,8 @@ class LayerNorm(BaseFusedOp):
 
 
 class GemmaRMSNorm(BaseFusedOp):
+    supports_non_attn_tp_allreduce = True
+
     def __init__(
         self,
         hidden_size: int,
@@ -1339,7 +1344,7 @@ class GemmaRMSNorm(BaseFusedOp):
             residual,
             post_residual_addition,
             self.gemma_weight,
-            use_attn_tp_group=True,
+            use_attn_tp_group=use_attn_tp_group,
         )
 
     def forward_with_allreduce_fusion_quant_per_group(

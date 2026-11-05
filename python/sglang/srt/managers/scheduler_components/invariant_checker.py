@@ -41,7 +41,7 @@ from sglang.srt.utils.common import (
 from sglang.srt.utils.watchdog import WatchdogRaw
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.managers.scheduler import Scheduler
 
 
@@ -66,6 +66,12 @@ class SchedulerInvariantChecker:
     # The chunked-prefill request parked between chunks is in neither batch;
     # it still owns its KV row.
     get_chunked_req: Callable = field(default=lambda: None)
+    get_running_reqs: Callable = field(default=lambda: None)
+    # Under PP, the micro-batches' running batches and step batches.
+    get_pp_running_mbs: Callable = field(default=lambda: ())
+    get_pp_mbs: Callable = field(default=lambda: ())
+    # When False, extend step batches hold no running request.
+    prefill_launch_starts_running: Callable = field(default=lambda: True)
     count_req_pool_leak_warnings: int = 0
     count_memory_leak_warnings: int = 0
     recent_busy_msgs: Deque[str] = field(
@@ -475,6 +481,27 @@ class SchedulerInvariantChecker:
             messages.append(mamba_msg)
 
         return has_leak, messages
+
+    def maybe_check_running_reqs(
+        self,
+        running_batch: Optional[ScheduleBatch],
+        last_batch: Optional[ScheduleBatch],
+    ) -> None:
+        """With SGLANG_ENABLE_RUNNING_REQS_CHECK, the running requests are exactly
+        the unfinished ones the batches hold, apart from the chunked request."""
+        if not envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.get():
+            return
+        step_batches = [last_batch, *self.get_pp_mbs()]
+        if not self.prefill_launch_starts_running():
+            step_batches = [
+                b
+                for b in step_batches
+                if b is not None and not b.forward_mode.is_extend()
+            ]
+        self.get_running_reqs().check(
+            [running_batch, *self.get_pp_running_mbs(), *step_batches],
+            chunked_req=self.get_chunked_req(),
+        )
 
     def _check_tree_cache(self):
         if not envs.SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK.get():

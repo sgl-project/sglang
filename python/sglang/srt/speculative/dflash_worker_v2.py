@@ -3166,7 +3166,12 @@ class DFlashWorkerV2(BaseSpecWorker):
             return None
         linear = backend.linear_attn_backend
         req_pool = linear.req_to_token_pool
-        if not req_pool.mamba_pool.replayssm_is_kda:
+        # Host-only checkpoints index the KDA ring by req_pool_idx; this commit
+        # writes it through the mamba slot, so SGLang's commit takes over.
+        if (
+            not req_pool.mamba_pool.replayssm_is_kda
+            or req_pool.mamba_pool.replayssm_request_ring
+        ):
             return None
         spec_state = linear.state_pool.get_speculative_mamba2_params_all_layers()
         if len(spec_state.conv) != 1:

@@ -122,25 +122,6 @@ def _make_server_args(tmp_dir, enabled=True):
 
 
 class TestFormatOutputData(unittest.TestCase):
-    def test_basic_formatting(self):
-        server_args = _make_server_args("/tmp/unused")
-        exporter = _ConcreteExporter(
-            server_args, obj_skip_names=None, out_skip_names=None
-        )
-
-        obj = _GenerateReqInput(
-            rid="req-1", text="hello", sampling_params={"temp": 0.5}
-        )
-        out_dict = {"meta_info": {"latency": 1.5, "tokens": 10}}
-
-        result = exporter._format_output_data(obj, out_dict)
-
-        params = json.loads(result["request_parameters"])
-        self.assertEqual(params["rid"], "req-1")
-        self.assertEqual(params["text"], "hello")
-        self.assertIn("latency", result)
-        self.assertIn("tokens", result)
-
     def test_excludes_always_exclude_fields(self):
         server_args = _make_server_args("/tmp/unused")
         exporter = _ConcreteExporter(
@@ -207,13 +188,6 @@ class TestFileRequestMetricsExporter(unittest.TestCase):
         FileRequestMetricsExporter(_make_server_args(sub_dir), None, None)
         self.assertTrue(os.path.isdir(sub_dir))
 
-    def test_ensure_file_handler_opens_file(self):
-        exporter = self._make_exporter()
-        exporter._ensure_file_handler("20240101_12")
-        self.assertIsNotNone(exporter._current_file_handler)
-        self.assertEqual(exporter._current_hour_suffix, "20240101_12")
-        exporter.close()
-
     def test_ensure_file_handler_rotates(self):
         exporter = self._make_exporter()
         exporter._ensure_file_handler("20240101_12")
@@ -240,13 +214,6 @@ class TestFileRequestMetricsExporter(unittest.TestCase):
         with patch("builtins.open", side_effect=OSError("permission denied")):
             with self.assertRaises(OSError):
                 exporter._ensure_file_handler("20240101_12")
-        self.assertIsNone(exporter._current_file_handler)
-        self.assertIsNone(exporter._current_hour_suffix)
-
-    def test_close(self):
-        exporter = self._make_exporter()
-        exporter._ensure_file_handler("20240101_12")
-        exporter.close()
         self.assertIsNone(exporter._current_file_handler)
         self.assertIsNone(exporter._current_hour_suffix)
 

@@ -2122,6 +2122,7 @@ class DenoisingStage(PipelineStage):
                         if collect_trajectory:
                             self._record_trajectory(ctx, step, batch, server_args)
 
+                        self.check_cancelled(batch)
                         if step_index == num_timesteps - 1 or (
                             (step_index + 1) > ctx.num_warmup_steps
                             and (step_index + 1) % progress_step_interval == 0

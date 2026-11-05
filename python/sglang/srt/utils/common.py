@@ -1905,6 +1905,8 @@ def get_mm_http_session() -> requests.Session:
 
 # Raised by the loaders below when client-supplied media cannot be fetched or
 # decoded. ValueError is in the set because invalid base64 raises binascii.Error.
+# Pillow raises DecompressionBombError from Image.open, before any decode, for an
+# image above twice Image.MAX_IMAGE_PIXELS; it subclasses Exception, not OSError.
 CLIENT_MEDIA_EXCEPTIONS = (
     ValueError,
     UnidentifiedImageError,
@@ -4241,8 +4243,11 @@ def require_mlp_sync():
 
 
 def get_cuda_graph_batch_size_alignment(
-    *, gathered_buffer_required: Optional[bool] = None
+    *,
+    gathered_buffer_required: Optional[bool] = None,
+    include_cp_alignment: bool = True,
 ) -> int:
+    """Decode may waive CP alignment only when no gathered buffer needs it."""
     if gathered_buffer_required is None:
         gathered_buffer_required = require_gathered_buffer()
     alignment = 1
@@ -4251,7 +4256,11 @@ def get_cuda_graph_batch_size_alignment(
     if gathered_buffer_required:
         alignment *= get_parallel().attn_tp_size
     # TODO: unverified on NVIDIA; drop the gate once validated on CUDA.
-    if not is_hip() and alignment % get_parallel().attn_cp_size != 0:
+    if (
+        (include_cp_alignment or gathered_buffer_required)
+        and not is_hip()
+        and alignment % get_parallel().attn_cp_size != 0
+    ):
         alignment *= get_parallel().attn_cp_size
     return alignment
 

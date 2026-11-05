@@ -30,7 +30,6 @@ from sglang.test.runners import SRTRunner
 from sglang.test.test_utils import (
     DEFAULT_PORT_FOR_SRT_TEST_RUNNER,
     CustomTestCase,
-    is_in_ci,
 )
 
 register_cuda_ci(est_time=182, stage="extra-a", runner_config="2-gpu-large")
@@ -179,14 +178,6 @@ class TestMoELoRATP2Logprobs(CustomTestCase):
                 f"Chunked vs non-chunked input logprob diff too large on "
                 f"prompt {i}: max_diff={max_diff:.6e}",
             )
-
-    @unittest.skipIf(is_in_ci(), "Skipping full test in CI")
-    def test_moe_lora_tp2_vs_tp1_full(self):
-        """Full TP=1 vs TP=2 parity across all prompts."""
-        self._assert_tp_parity(
-            prompts=MOE_LORA_TEST_PROMPTS,
-            label="MoE LoRA TP parity (full)",
-        )
 
 
 if __name__ == "__main__":

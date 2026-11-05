@@ -258,6 +258,11 @@ class K31VerifyHostBinding:
             VerifyPoolView,
         )
 
+        if req_pool.mamba_pool.replayssm_request_ring:
+            raise ValueError(
+                "K31 verify indexes the KDA ReplaySSM ring by mamba slot; "
+                "SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT is not supported"
+            )
         full = pool.full_kv_pool
         layers = []
         full_map = pool.full_attention_layer_id_mapping

@@ -39,7 +39,6 @@
     "registered/unit/mem_cache/test_hicache_staged_write_back_dispatch.py",
     "registered/unit/mem_cache/test_mamba_path_state_cap.py",
     "registered/unit/mem_cache/test_pp_prefetch_ticket.py",
-    "registered/unit/mem_cache/test_rust_tree_core.py",
     "registered/unit/mem_cache/test_rust_tree_core_integration.py",
     "registered/unit/mem_cache/test_session_unified_radix_cache.py",
     "registered/unit/mem_cache/test_storage_prefetch_lifecycle.py",

@@ -9,7 +9,7 @@ import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Any, List, Optional, Sequence, Set
+from typing import TYPE_CHECKING, Any, Iterable, List, Optional, Sequence, Set
 
 import torch
 
@@ -168,6 +168,34 @@ class PoolTransfer:
     # BLOCK_GROUPS geometry: FULL pages per block and keys (pages) per group.
     block_pages: int = 0
     group_pages: int = 0
+
+
+def merge_source_transfers(
+    transfers: Iterable[PoolTransfer], pool: PoolName
+) -> Optional[PoolTransfer]:
+    """Every independent transfer of ``pool`` as one span, in transfer order.
+
+    A pool may be staged in several transfers; a sidecar deriving its indices
+    from that pool must cover all of them. A lone transfer is returned as is,
+    so a sidecar keeps aliasing its tensors. Returns None when ``pool`` has no
+    independent transfer.
+    """
+    sources = [t for t in transfers if t.indices_from_pool is None and t.name == pool]
+    if len(sources) <= 1:
+        return sources[0] if sources else None
+
+    def cat(parts):
+        parts = list(parts)
+        return None if any(part is None for part in parts) else torch.cat(parts)
+
+    keys = [t.keys for t in sources]
+    return PoolTransfer(
+        name=pool,
+        host_indices=cat(t.host_indices for t in sources),
+        device_indices=cat(t.device_indices for t in sources),
+        keys=None if any(k is None for k in keys) else [k for ks in keys for k in ks],
+        hit_policy=sources[0].hit_policy,
+    )
 
 
 @dataclass(frozen=True)
