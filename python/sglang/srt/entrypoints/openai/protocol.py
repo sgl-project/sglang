@@ -1046,6 +1046,10 @@ class ChatCompletionRequest(PDRoutingFields):
     tool_choice: Union[ToolChoice, Literal["auto", "required", "none"]] = Field(
         default="auto", examples=["none"]
     )  # noqa
+    # Whether the client sent tool_choice, as opposed to the default filled in
+    # by set_tool_choice_default (the K3 encoder must not render a defaulted
+    # "none" as an explicit tool_choice=none).
+    _tool_choice_explicit: bool = PrivateAttr(default=False)
     parallel_tool_calls: bool = True
     return_hidden_states: Union[bool, Literal["last"]] = False
     return_routed_experts: bool = False
@@ -1174,10 +1178,6 @@ class ChatCompletionRequest(PDRoutingFields):
     # n>1 the engine assigns a separate rid per sampled choice, so deriving it
     # per frame would break the constant-id contract.
     _stream_wire_id: Optional[str] = None
-    # Whether the client sent tool_choice: set_tool_choice_default fills in
-    # "none" for a request without tools, which the K3 encoder must not render
-    # as an explicit tool_choice=none.
-    _tool_choice_explicit: bool = False
 
     @model_validator(mode="before")
     @classmethod

@@ -1100,6 +1100,7 @@ def apply_dflash_simulated_acceptance(
     simulate_acc_token_mode: str,
     next_token_logits: Optional[torch.Tensor] = None,
     fixed_token_id: int = 100,
+    generator: Optional[torch.Generator] = None,
 ) -> None:
     """Forces the DFlash acceptance length (SGLANG_SIMULATE_ACC_LEN benchmark knob).
     ``next_token_logits`` gives the target argmax when ``target_predict`` is None."""
@@ -1110,7 +1111,7 @@ def apply_dflash_simulated_acceptance(
 
     # sample_simulated_acc_len clamps to [1, block_size].
     forced_commit_len = sample_simulated_acc_len(
-        simulate_acc_len, simulate_acc_method, block_size
+        simulate_acc_len, simulate_acc_method, block_size, generator=generator
     )
     forced_accept_len = forced_commit_len - 1
 

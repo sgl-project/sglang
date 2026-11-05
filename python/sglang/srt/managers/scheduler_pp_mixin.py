@@ -631,7 +631,7 @@ class SchedulerPPMixin:
     @scheduler_stage_method(SCHEDULER_STAGE_DISAGG_BOOKKEEPING)
     def process_bootstrapped_queue(self: Scheduler):
         reqs = self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
-        self.waiting_queue.extend(reqs)
+        self.waiting_queue.join(reqs)
 
     @scheduler_stage_method(SCHEDULER_STAGE_PD_CONSENSUS)
     def _pp_pd_get_prefill_transferred_ids(self: Scheduler) -> Dict[str, bool]:
@@ -1878,7 +1878,7 @@ class SchedulerPPMixin:
             resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs(
                 retract_rids
             )
-            self.waiting_queue.extend(resumed_reqs)
+            self.waiting_queue.join(resumed_reqs)
             return [req.rid for req in resumed_reqs]
         return None
 
@@ -1921,6 +1921,6 @@ class SchedulerPPMixin:
             if self.enable_hisparse:
                 for req in released_reqs:
                     self.hisparse_coordinator.admit_request_direct(req)
-            self.waiting_queue.extend(released_reqs)
+            self.waiting_queue.join(released_reqs)
             return outcomes
         return None

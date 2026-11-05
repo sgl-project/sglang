@@ -142,6 +142,7 @@ from sglang.srt.speculative.spec_utils import (
     draft_pp_context,
     draft_tp_context,
     sample_simulated_acc_len,
+    simulated_acc_len_generator,
 )
 from sglang.srt.utils import async_h2d, is_cuda, is_hip, is_npu, is_xpu
 
@@ -541,6 +542,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         # spec broadcasts must stay within the attn-TP group.
         self._tp_sync = SpecTpSync(get_dp_tp_group())
         check_simulate_acc_token_mode()
+        # The forced lengths overwrite accept_len after its broadcast, so every rank
+        # draws them from the same server-seeded stream.
+        self._simulated_acc_len_rng = (
+            simulated_acc_len_generator(target_worker.random_seed)
+            if SIMULATE_ACC_LEN > 0
+            else None
+        )
 
         # DP drafts use per-DP attention TP, independent of idle peers. CP
         # drafts use full TP without CP, including their backend and KV pool.
@@ -3008,7 +3016,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         sim_commit = (
             self._sim_ring.stage(
                 sample_simulated_acc_len(
-                    SIMULATE_ACC_LEN, SIMULATE_ACC_METHOD, block_size
+                    SIMULATE_ACC_LEN,
+                    SIMULATE_ACC_METHOD,
+                    block_size,
+                    generator=self._simulated_acc_len_rng,
                 )
             )
             if SIMULATE_ACC_LEN > 0
@@ -3096,11 +3107,14 @@ class DFlashWorkerV2(BaseSpecWorker):
                 (bs, block_size), dtype=torch.int64, device=self.device
             )
         target_predict = self._accept_target_buf[:bs]
-        # One host draw per round, same RNG as apply_dflash_simulated_acceptance.
+        # One host draw per round, same generator as apply_dflash_simulated_acceptance.
         sim_commit = (
             self._sim_ring.stage(
                 sample_simulated_acc_len(
-                    SIMULATE_ACC_LEN, SIMULATE_ACC_METHOD, block_size
+                    SIMULATE_ACC_LEN,
+                    SIMULATE_ACC_METHOD,
+                    block_size,
+                    generator=self._simulated_acc_len_rng,
                 )
             )
             if SIMULATE_ACC_LEN > 0
@@ -3362,6 +3376,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 simulate_acc_method=SIMULATE_ACC_METHOD,
                 simulate_acc_token_mode=SIMULATE_ACC_TOKEN_MODE,
                 next_token_logits=next_token_logits,
+                generator=self._simulated_acc_len_rng,
             )
             # The Triton path may have written new_seq_lens from the real
             # accept_len; recompute it from the forced commit_lens.

@@ -841,13 +841,16 @@ class OpenAIServingChat(OpenAIServingBase):
                     template_kwargs["thinking_effort"] = effort
 
             effective_tools = self._effective_tools(request)
-            # The encoder renders tool_choice=none as a control message with or
-            # without tools, so a client's explicit "none" reaches it either way
-            # (the server's default "none" for a tool-less request does not).
-            if isinstance(request.tool_choice, str) and (
-                (effective_tools and request.tool_choice in ("required", "none"))
-                or (request.tool_choice == "none" and request._tool_choice_explicit)
-            ):
+            # The encoder renders tool_choice="none" with or without tools, so a
+            # client's explicit "none" reaches it either way; the default "none"
+            # of a request without tools does not.
+            passes_tool_choice = (
+                request.tool_choice == "required" and effective_tools
+            ) or (
+                request.tool_choice == "none"
+                and (effective_tools or request._tool_choice_explicit)
+            )
+            if passes_tool_choice:
                 template_kwargs.setdefault("tool_choice", request.tool_choice)
             if request.response_format is not None:
                 template_kwargs.setdefault(
@@ -2009,9 +2012,9 @@ class OpenAIServingChat(OpenAIServingBase):
             tool_call_constraint = parser.get_structure_constraint(
                 request.tool_choice,
                 parallel_tool_calls=request.parallel_tool_calls,
-                thinking_mode=True
-                if enable_thinking is None
-                else bool(enable_thinking),
+                thinking_mode=(
+                    True if enable_thinking is None else bool(enable_thinking)
+                ),
             )
 
         # Apply chat template and its stop strings
@@ -2199,10 +2202,10 @@ class OpenAIServingChat(OpenAIServingBase):
             else ThinkingMode.CHAT
         )
         messages = [msg.model_dump() for msg in request.messages]
-        # The K3 encoder parses string arguments itself, one level deep, and
-        # keeps nested values' original bytes; a parsed dict would be
-        # re-serialized and change the prompt.
-        if self.chat_encoding_spec != "kimi_k3":
+        # The Kimi-K3 encoder parses history tool-call arguments itself and keeps
+        # the original bytes of nested values; parsing them here would
+        # re-serialize them and change the prompt.
+        if self._encoding_adapter is not None or self.chat_encoding_spec != "kimi_k3":
             strict_tool_call_arguments = (
                 self._encoding_adapter.strict_tool_call_arguments
                 if self._encoding_adapter is not None
