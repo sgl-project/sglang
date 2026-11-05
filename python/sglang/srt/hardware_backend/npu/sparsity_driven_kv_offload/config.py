@@ -89,10 +89,6 @@ def is_sparsity_driven_kv_offload_enabled(
     return True
 
 
-def get_offload_sparse_kv_indexer_impl() -> str:
-    return "lim" if use_fused_sparse_kv_offload() else "legacy"
-
-
 def get_sparsity_driven_kv_offload_sparse_context_len(
     *,
     model_config: ModelConfig,
