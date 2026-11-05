@@ -1,5 +1,9 @@
 # SGLang Simulator
 
+For AFD simulation, see the [AFD guide](AFD.md):
+[preparation and role commands](AFD.md#prepare-and-reproduce),
+[principles](AFD.md#how-it-works), and [demo results](AFD.md#demo-results).
+
 SGLang Simulator reuses SGLang's scheduler and cache implementation while
 replacing model forward execution with a latency predictor. It supports
 timestamped trace replay, synthetic workloads, hierarchical cache simulation,
@@ -28,10 +32,16 @@ runtime compatibility.
 
 ## Installation
 
-From the SGLang repository:
+The package requires Python 3.10 or newer. The AFD CPU suite was verified with
+Python 3.11; activate a matching environment before configuring or running it.
+Runtime and AIC dependencies have their own platform requirements.
+
+From the SGLang repository, in a clean environment:
 
 ```bash
-pip install -e tools/sglang-simulator
+python3.11 -m venv .venv
+. .venv/bin/activate
+python -m pip install -e tools/sglang-simulator
 ```
 
 The simulator does not install or pin a second `sglang` package. Run it from a
@@ -55,6 +65,42 @@ pip install --no-deps "aiconfigurator==0.10.0"
 ```
 
 Upgrade this pin only after rerunning the AIC predictor and compatibility tests.
+
+### AIC source checkout
+
+For editable operator data, install the pinned source instead of the wheel:
+
+```bash
+git clone --branch v0.10.0 https://github.com/ai-dynamo/aiconfigurator.git aiconfigurator
+git -C aiconfigurator lfs pull
+python -m pip install "pyarrow<26" -e ./aiconfigurator
+```
+
+Follow the [pinned release's build prerequisites](https://github.com/ai-dynamo/aiconfigurator/blob/v0.10.0/README.md).
+Record the exact revision for a development fork. Setting `AIC_ROOT` alone does
+not select the imported package. These installation commands are guidance,
+not a record of a clean-environment installation test.
+
+For HTTP simulation, select `predictor.name=aiconfigurator`; an optional
+`predictor.database_path` selects the systems root, otherwise packaged defaults
+apply. For example, this fragment uses an exported `AIC_SYSTEMS_PATH`:
+
+```json
+{
+  "predictor": {
+    "name": "aiconfigurator",
+    "database_path": "${AIC_SYSTEMS_PATH}",
+    "database_mode": "SILICON"
+  }
+}
+```
+
+Add the platform and scheduler sections from [Configuration](#configuration).
+Model/tokenizer files and operator data are separate inputs. `SILICON` selects a
+database mode; inspect individual query provenance for a performance comparison.
+The AFD event runner instead consumes prepared cost records, as described in
+[Supply operator costs](AFD.md#supply-operator-costs). Installing AIC does not
+provide that conversion; a matching cost consumer is not included in this patch.
 
 ## Quick start
 

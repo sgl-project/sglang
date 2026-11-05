@@ -1,19 +1,7 @@
 from typing import Optional
 
 import numpy as np
-from aiconfigurator.sdk import models
-from aiconfigurator.sdk.backends.factory import get_backend
-from aiconfigurator.sdk.common import (
-    CommQuantMode,
-    DatabaseMode,
-    FMHAQuantMode,
-    GEMMQuantMode,
-    KVCacheQuantMode,
-    MoEQuantMode,
-)
-from aiconfigurator.sdk.config import ModelConfig, RuntimeConfig
-from aiconfigurator.sdk.inference_session import InferenceSession
-from aiconfigurator.sdk.perf_database import get_database, get_systems_paths
+from sglang_simulator.aic_compat import AICSDK
 from sglang_simulator.simulation.types import (
     SchedulerConfig,
 )
@@ -26,6 +14,20 @@ from sglang_simulator.time_predictor.base import (
     ScheduleRequest,
 )
 from sglang_simulator.utils import get_logger
+
+_sdk = AICSDK()
+models = _sdk.module("models")
+get_backend = _sdk.module("backends.factory").get_backend
+_config = _sdk.module("config")
+ModelConfig, RuntimeConfig = _config.ModelConfig, _config.RuntimeConfig
+_database = _sdk.module("perf_database")
+get_database, get_systems_paths = _database.get_database, _database.get_systems_paths
+CommQuantMode = _sdk.common.CommQuantMode
+DatabaseMode = _sdk.common.DatabaseMode
+FMHAQuantMode = _sdk.common.FMHAQuantMode
+GEMMQuantMode = _sdk.common.GEMMQuantMode
+KVCacheQuantMode = _sdk.common.KVCacheQuantMode
+MoEQuantMode = _sdk.common.MoEQuantMode
 
 # Map the common data types to AIConfigurator data types.
 MAP_DTYPE_TO_GEMMQuantMode = {
@@ -174,9 +176,11 @@ class AIConfiguratorTimePredictor(InferTimePredictor):
             raise ValueError("Failed to initialize the database.")
 
         database.set_default_database_mode(database_mode)
-        logger.info(f"AIC Database mode: {database_mode}")
+        logger.info(
+            f"AIC API: {_sdk.api}, SDK: {_sdk.version}, data: {database.version}, mode: {database_mode}"
+        )
 
-        self._session = InferenceSession(
+        self._session = _sdk.session(
             model=get_perf_model(config, model, workload_distribution),
             backend=get_backend(self.config.backend_name),
             database=database,

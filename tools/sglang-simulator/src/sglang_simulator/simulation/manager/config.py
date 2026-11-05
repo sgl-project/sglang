@@ -193,7 +193,16 @@ class ConfigManager:
     ) -> InferTimePredictor:
         config = cls._get_raw_config()
         predictor_config = config.get("predictor", {})
-        if predictor_config.get("name") == "aiconfigurator":
+        if predictor_config.get("name") == "afd":
+            from sglang_simulator.afd.serving import AFDRequestPredictor
+
+            return AFDRequestPredictor(
+                model,
+                hw=hw,
+                config=sched_config,
+                afd_config=predictor_config["afd_config"],
+            )
+        elif predictor_config.get("name") == "aiconfigurator":
             database_mode = predictor_config.get("database_mode", "SILICON")
             prefill_scale_factor = predictor_config.get("prefill_scale_factor", 1)
             decode_scale_factor = predictor_config.get("decode_scale_factor", 1)
@@ -248,5 +257,5 @@ class ConfigManager:
         else:
             raise ValueError(
                 f"Unknown predictor name: {predictor_config.get('name')}. "
-                f"Supported: aiconfigurator, ml, replay"
+                f"Supported: aiconfigurator, ml, replay, afd"
             )

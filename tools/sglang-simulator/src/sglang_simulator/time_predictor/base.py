@@ -13,11 +13,13 @@ logger = get_logger("sgl_simulator")
 class ScheduleRequest:
     extend_length: int = 0
     past_kv_length: int = 0
+    request_id: str = ""
 
 
 @dataclass
 class ScheduleBatch:
     reqs: list[ScheduleRequest] = field(default_factory=list)
+    forward_phase: str | None = None
 
     def __repr__(self) -> str:
         return f"batch_size={len(self.reqs)},reqs={[(req.extend_length, req.past_kv_length) for req in self.reqs]}"
