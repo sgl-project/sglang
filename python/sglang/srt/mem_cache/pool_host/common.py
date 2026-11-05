@@ -465,6 +465,13 @@ def alloc_with_pin_memory(
     """
     Allocate tensor using PyTorch's built-in pin_memory flag.
     """
+    host_allocator = envs.SGLANG_NPU_HICACHE_HOST_ALLOCATOR.get()
+    if pin_memory and host_allocator != "torch":
+        if host_allocator != "aclrt":
+            raise ValueError("SGLANG_NPU_HICACHE_HOST_ALLOCATOR must be torch or aclrt")
+        from sglang.srt.mem_cache.pool_host.npu_host_allocator import allocate_acl_host
+
+        return allocate_acl_host(dims, dtype, device)
     buffer = torch.empty(dims, dtype=dtype, device=device, pin_memory=pin_memory)
     return buffer
 
