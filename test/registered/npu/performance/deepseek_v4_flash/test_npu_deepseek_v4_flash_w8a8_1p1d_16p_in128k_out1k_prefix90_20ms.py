@@ -15,7 +15,7 @@ register_npu_ci(
     nightly=True,
 )
 
-# Common environment variables for DSV4-Flash PD-Sep 128k deployment
+# Common environment variables for DSV4-Flash PD-Sep 128k1k deployment
 DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_COMMON_ENVS = {
     "PYTHONUNBUFFERED": "1",
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
@@ -51,7 +51,7 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_COMMON_ENVS = {
     "SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX": "1",
 }
 
-# Prefill node environment variables for DSV4-Flash PD-Sep 128k deployment
+# Prefill node environment variables for DSV4-Flash PD-Sep 128k1k deployment
 DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_PREFILL_ENVS = {
     **DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_COMMON_ENVS,
     # deepep
@@ -67,7 +67,7 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_PREFILL_ENVS = {
     "SGLANG_PROFILE_WITH_STACK": "False",
 }
 
-# Decode node environment variables for DSV4-Flash PD-Sep 128k deployment
+# Decode node environment variables for DSV4-Flash PD-Sep 128k1k deployment
 DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_DECODE_ENVS = {
     **DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_COMMON_ENVS,
     # deepep
@@ -81,7 +81,7 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_DECODE_ENVS = {
     "SGLANG_NPU_SPLIT_SHARED_EXPERT_OVERLAP": "1",
 }
 
-# Prefill node launch arguments for DSV4-Flash PD-Sep 128k
+# Prefill node launch arguments for DSV4-Flash PD-Sep 128k1k
 DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_PREFILL_ARGS = [
     "--page-size",
     128,
@@ -148,7 +148,7 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_PREFILL_ARGS = [
     512,
 ]
 
-# Decode node launch arguments for DSV4-Flash PD-Sep 128k
+# Decode node launch arguments for DSV4-Flash PD-Sep 128k1k
 DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_DECODE_ARGS = [
     "--page-size",
     128,
@@ -215,7 +215,7 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_DECODE_ARGS = [
     5,
 ]
 
-# Model config for DSV4-Flash W8A8 1P+1D PD-Sep 128k deployment
+# Model config for DSV4-Flash W8A8 1P+1D PD-Sep 128k1k deployment
 DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_MODEL_CONFIG = {
     "model_path": DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH,
     "prefill_args": DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_PREFILL_ARGS,
