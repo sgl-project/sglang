@@ -71,6 +71,8 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.qsa.metadata import (
+    build_qsa_capture_token_slot_table,
+    compressed_decode_view,
     localize_compressed_page_table,
 )
 from sglang.srt.managers.schedule_batch import ReqKvInfo
@@ -1889,21 +1891,12 @@ class TestWritePlan(CustomTestCase):
         self.assertEqual(local_rows.numel(), 0)
 
 
-def test_qsa_compressed_page_ownership_mapping():
-    shard = QSACompressedBlockSharding(
-        global_blocks=20,
-        compressed_page_size=4,
-        world_size=3,
-        rank=1,
+def _qsa_compressed_shard(**overrides):
+    args = dict(  # noqa: C408
+        global_blocks=20, compressed_page_size=4, world_size=3, rank=1
     )
-    global_blocks = torch.tensor([4, 7, 16, 19])
-    torch.testing.assert_close(
-        shard.global_to_local_blocks(global_blocks), torch.tensor([0, 3, 4, 7])
-    )
-    torch.testing.assert_close(
-        shard.global_to_local_blocks(torch.tensor([0, 8, 12])),
-        torch.tensor([-1, -1, -1]),
-    )
+    args.update(overrides)
+    return QSACompressedBlockSharding(**args)
 
 
 def test_kv_cache_configurator_selects_page_interleave_allocator_for_sharded_qsa(
@@ -1925,20 +1918,14 @@ def test_kv_cache_configurator_selects_page_interleave_allocator_for_sharded_qsa
         swa_max_total_num_tokens=None,
     )
     monkeypatch.setattr(module.current_platform, "is_out_of_tree", lambda: False)
-    monkeypatch.setattr(module, "get_schedule", lambda: SimpleNamespace(page_size=4))
-    monkeypatch.setattr(
-        module,
-        "get_disagg",
-        lambda: SimpleNamespace(disaggregation_mode="null"),
-    )
-    monkeypatch.setattr(
-        module, "get_memory", lambda: SimpleNamespace(enable_hisparse=False)
-    )
-    monkeypatch.setattr(
-        module,
-        "get_parallel",
-        lambda: SimpleNamespace(dcp_enabled=False, attn_dcp_size=1),
-    )
+    contexts = {
+        "get_schedule": SimpleNamespace(page_size=4),
+        "get_disagg": SimpleNamespace(disaggregation_mode="null"),
+        "get_memory": SimpleNamespace(enable_hisparse=False),
+        "get_parallel": SimpleNamespace(dcp_enabled=False, attn_dcp_size=1),
+    }
+    for name, value in contexts.items():
+        monkeypatch.setattr(module, name, lambda value=value: value)
     allocator = subject._build_token_to_kv_pool_allocator(
         sizes=sizes,
         token_to_kv_pool=pool,
@@ -1981,11 +1968,10 @@ def test_kv_cache_configurator_selects_page_interleave_allocator_for_sharded_qsa
 def test_qsa_page_localization_preserves_nonmonotonic_pages_and_ragged_tail(
     page_table, length, pages, local_length, positions
 ):
-    shard = QSACompressedBlockSharding(
+    shard = _qsa_compressed_shard(
         global_blocks=32 if page_table[0][0] == 5 else 12,
-        compressed_page_size=4,
         world_size=2,
-        rank=1 if page_table[0][0] == 5 else 0,
+        rank=page_table[0][0] == 5,
     )
     actual_pages, actual_length, actual_positions = localize_compressed_page_table(
         global_page_table=torch.tensor(page_table, dtype=torch.int32),
@@ -2001,6 +1987,29 @@ def test_qsa_page_localization_preserves_nonmonotonic_pages_and_ragged_tail(
     )
 
 
+def test_qsa_capture_table_preserves_cyclic_page_ownership():
+    slots = build_qsa_capture_token_slot_table(
+        batch_size=2, max_length=64, device=torch.device("cpu")
+    )
+    pages, lengths = compressed_decode_view(
+        compressed_page_size=4,
+        compress_ratio=4,
+        sequence_lengths=torch.tensor([64, 48], dtype=torch.int32),
+        token_slot_table=slots,
+    )
+    for rank in range(4):
+        shard = _qsa_compressed_shard(global_blocks=16, world_size=4, rank=rank)
+        _, local_lengths, _ = localize_compressed_page_table(
+            global_page_table=pages,
+            compressed_lengths=lengths,
+            sharding=shard,
+        )
+        torch.testing.assert_close(
+            local_lengths,
+            torch.tensor([4, 4 if rank < 3 else 0], dtype=torch.int32),
+        )
+
+
 def test_qsa_raw_slots_preserve_page_offsets_and_reuse():
     shard = QSARawKVSharding(local_capacity=8, world_size=2, rank=1)
     owner, local = shard.local_write_targets(torch.tensor([0, 1, 3, 14, 15, -1]))
@@ -2013,12 +2022,7 @@ def test_qsa_raw_slots_preserve_page_offsets_and_reuse():
 @pytest.mark.parametrize("kind", ["compressed", "raw"])
 def test_qsa_sharding_rejects_out_of_bounds_writes(kind):
     if kind == "compressed":
-        shard = QSACompressedBlockSharding(
-            global_blocks=20,
-            compressed_page_size=4,
-            world_size=3,
-            rank=1,
-        )
+        shard = _qsa_compressed_shard()
         with pytest.raises(IndexError, match="compressed KV write locations"):
             shard.local_write_targets(
                 torch.tensor([20]), valid_mask=torch.tensor([True])

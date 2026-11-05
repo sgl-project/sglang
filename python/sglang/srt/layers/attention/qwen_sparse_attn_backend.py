@@ -34,6 +34,7 @@ from sglang.srt.layers.attention.qsa.metadata import (
     QSAIndexerMetadata,
     build_group_ring_slots,
     build_pending_ring_slots,
+    build_qsa_capture_token_slot_table,
     build_rope_position_matrix,
     compressed_decode_view,
     localize_compressed_page_table,
@@ -62,7 +63,7 @@ from sglang.srt.layers.cp.utils import (
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MHATokenToKVPool
 from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 from sglang.srt.model_executor.forward_mode import ForwardMode
-from sglang.srt.runtime_context import get_parallel, get_spec, get_stream
+from sglang.srt.runtime_context import get_flags, get_parallel, get_spec, get_stream
 from sglang.srt.utils import is_hip, is_sm100_supported, is_sm120
 
 logger = logging.getLogger(__name__)
@@ -303,11 +304,6 @@ class QwenSparseAttnBackend(AttentionBackend):
         self._graph_extend_lens_pin = None
         self._verify_mask = None
         self._qsa_cache_sharding_buffers = None
-        raw_sharding = getattr(self.token_to_kv_pool, "qsa_raw_kv_sharding", None)
-        self.owner_sparse_attn_group = getattr(
-            self.token_to_kv_pool, "qsa_owner_group", None
-        )
-        self.owner_sparse_attn_runtime = getattr(raw_sharding, "runtime", None)
         # (layer_id, k_full, v_full) of the prefill-CP K/V gather prefetch_cp_kv
         # started; that layer's _forward_extend_cp joins it.
         self._cp_kv_pending: Optional[Tuple[int, torch.Tensor, torch.Tensor]] = None
@@ -342,17 +338,13 @@ class QwenSparseAttnBackend(AttentionBackend):
         """Resolve owner communication after the KV pool has finished setup."""
 
         pool = self.token_to_kv_pool
-        raw_sharding = getattr(pool, "qsa_raw_kv_sharding", None)
-        pool_group = getattr(pool, "qsa_owner_group", None)
-        pool_runtime = raw_sharding
-        if pool_group is not None or pool_runtime is not None:
-            if pool_group is None or pool_runtime is None:
-                raise ValueError(
-                    "QSA owner group and raw-KV runtime must be initialized together"
-                )
-            self.owner_sparse_attn_group = pool_group
-            self.owner_sparse_attn_runtime = pool_runtime
-        return self.owner_sparse_attn_group, self.owner_sparse_attn_runtime
+        group = getattr(pool, "qsa_owner_group", None)
+        runtime = getattr(pool, "qsa_raw_kv_sharding", None)
+        if (group is None) != (runtime is None):
+            raise ValueError(
+                "QSA owner group and raw-KV runtime must be initialized together"
+            )
+        return group, runtime
 
     def _dispatch_owner_sparse_attention(
         self,
@@ -381,8 +373,6 @@ class QwenSparseAttnBackend(AttentionBackend):
         static_buffers = self._qsa_cache_sharding_buffers
         if static_buffers is not None and q.shape[0] > static_buffers.max_rows:
             static_buffers = None
-        if static_buffers is not None:
-            static_buffers = static_buffers.for_layer(layer.layer_id)
         output, _ = owner_sparse_attention(
             q,
             k_cache,
@@ -805,6 +795,12 @@ class QwenSparseAttnBackend(AttentionBackend):
                     prefill_sequence_lengths_cpu = tuple(
                         forward_batch.seq_lens_cpu[:batch_size].tolist()
                     )
+        if get_flags().dp.capturing_prefill_graph:
+            token_slot_table = build_qsa_capture_token_slot_table(
+                batch_size=sequence_lengths.numel(),
+                max_length=max_length,
+                device=sequence_lengths.device,
+            )
         decode_page_table = None
         decode_lengths = None
         decode_block_positions = None
@@ -1038,7 +1034,8 @@ class QwenSparseAttnBackend(AttentionBackend):
             is_read=False,
         )
         self._cuda_graph_max_tokens = max_num_tokens
-        if self.owner_sparse_attn_group is not None:
+        owner_group, _ = self._owner_sparse_attn_components()
+        if owner_group is not None:
             from sglang.srt.layers.attention.qsa.cache_sharding import (
                 QSACacheShardingStaticBuffers,
             )
@@ -1048,7 +1045,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             gathered_query_heads = (
                 int(config.num_attention_heads)
                 // int(parallel.attn_tp_size)
-                * int(self.owner_sparse_attn_group.world_size)
+                * int(owner_group.world_size)
             )
             self._qsa_cache_sharding_buffers = QSACacheShardingStaticBuffers(
                 max_rows=max_num_tokens,
@@ -1058,13 +1055,10 @@ class QwenSparseAttnBackend(AttentionBackend):
                 ),
                 num_heads=gathered_query_heads,
                 head_dim=int(config.head_dim),
-                world_size=int(self.owner_sparse_attn_group.world_size),
+                world_size=int(owner_group.world_size),
                 device=self.device,
                 dtype=self.runner.dtype,
-                layer_ids=tuple(
-                    self.token_to_kv_pool.full_attention_layer_id_mapping.keys()
-                ),
-                candidate_group=self.owner_sparse_attn_group,
+                candidate_group=owner_group,
             )
             self.token_to_kv_pool.qsa_cache_sharding_buffers = (
                 self._qsa_cache_sharding_buffers

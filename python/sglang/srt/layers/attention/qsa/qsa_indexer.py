@@ -1005,8 +1005,6 @@ class QSAIndexer(MultiPlatformOp):
             if indexer_metadata.is_cuda_graph
             else None
         )
-        if static_buffers is not None:
-            static_buffers = static_buffers.for_layer(self.layer_id)
         if forward_mode.is_decode() or is_target_verify or is_draft_extend:
             compressed_cache, page_table, compressed_lengths, max_model_len = (
                 indexer_metadata.get_decode_mqa_inputs(self.layer_id)

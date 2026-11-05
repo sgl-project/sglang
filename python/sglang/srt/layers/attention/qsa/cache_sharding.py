@@ -58,18 +58,12 @@ def assert_qsa_cache_sharding_runtime_match(
 ) -> None:
     """Reject partially enabled or differently sharded QSA components."""
 
-    fields = ("size", "rank")
-    mismatches = [
-        name for name in fields if getattr(expected, name) != getattr(actual, name)
-    ]
-    if mismatches:
+    expected_topology = (expected.size, expected.rank)
+    actual_topology = (actual.size, actual.rank)
+    if expected_topology != actual_topology:
         raise ValueError(
             f"{component} QSA cache-sharding runtime mismatch: "
-            + ", ".join(
-                f"{name}={getattr(actual, name)!r} "
-                f"(expected {getattr(expected, name)!r})"
-                for name in mismatches
-            )
+            f"size/rank={actual_topology!r} (expected {expected_topology!r})"
         )
     if expected.enabled and expected.group is not actual.group:
         raise ValueError(
@@ -147,7 +141,6 @@ class QSACacheShardingStaticBuffers:
         world_size: int = 1,
         device: torch.device | str,
         dtype: torch.dtype,
-        layer_ids: tuple[int, ...] | list[int] | None = None,
         candidate_group=None,
     ) -> None:
         owner_topk = topk if owner_topk is None else owner_topk
@@ -163,14 +156,6 @@ class QSACacheShardingStaticBuffers:
         self.head_dim = head_dim
         self._device = torch.device(device)
         self._dtype = dtype
-        self._layer_ids = None
-        if layer_ids is not None:
-            unique_layer_ids = tuple(
-                dict.fromkeys(int(layer_id) for layer_id in layer_ids)
-            )
-            if not unique_layer_ids or len(unique_layer_ids) != len(layer_ids):
-                raise ValueError("QSA layer ids must be non-empty and unique")
-            self._layer_ids = unique_layer_ids
         local_heads = num_heads // world_size
         self.candidate_transport = torch.empty(
             (max_rows, topk, 2), dtype=torch.float32, device=device
@@ -198,17 +183,6 @@ class QSACacheShardingStaticBuffers:
             (max_rows, owner_topk), dtype=torch.int64, device=device
         )
         self.owner_lengths = torch.empty((max_rows,), dtype=torch.int32, device=device)
-        self.owner_pack_max_rows = min(max_rows, 4)
-        owner_pack_tokens = self.owner_pack_max_rows * owner_topk
-        self.owner_packed_k = torch.empty(
-            (owner_pack_tokens, 1, head_dim), dtype=dtype, device=device
-        )
-        self.owner_packed_v = torch.empty_like(self.owner_packed_k)
-        self.owner_packed_slots = torch.empty(
-            (self.owner_pack_max_rows, owner_topk),
-            dtype=torch.int64,
-            device=device,
-        )
         self.owner_a2a_send = torch.empty(
             (world_size, max_rows, local_heads, head_dim + 1),
             dtype=torch.float32,
@@ -263,26 +237,9 @@ class QSACacheShardingStaticBuffers:
         dist.all_reduce(multicast, op=dist.ReduceOp.MIN, group=device_group)
         return state if bool(multicast.item()) else None
 
-    def for_layer(self, layer_id: int) -> QSACacheShardingStaticBuffers:
-        if self._layer_ids is None:
-            return self
-        if int(layer_id) not in self._layer_ids:
-            raise KeyError(f"no static transport slice for QSA layer {layer_id}")
-        return self
-
     def for_batch(self, rows: int) -> QSACacheShardingStaticBuffers:
         if rows < 0 or rows > self.max_rows:
             raise ValueError(
                 f"batch rows {rows} exceed static buffer capacity {self.max_rows}"
             )
         return self
-
-
-__all__ = [
-    "QSACacheShardingRuntime",
-    "QSACacheShardingStaticBuffers",
-    "assert_qsa_cache_sharding_runtime_match",
-    "get_qsa_cache_sharding_runtime",
-    "resolve_qsa_cache_sharding_runtime",
-    "validate_qsa_cache_sharding",
-]
