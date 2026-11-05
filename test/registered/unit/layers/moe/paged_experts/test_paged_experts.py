@@ -1,4 +1,8 @@
 import contextlib
+import mmap
+import os
+import tempfile
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -6,9 +10,15 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.layers.moe.paged_experts import PagedExpertsMoEMethod, formats, sizing
-from sglang.srt.layers.moe.paged_experts.formats import UnquantizedFormat, after_loading
+from sglang.srt.layers.moe.paged_experts import store as store_module
+from sglang.srt.layers.moe.paged_experts.formats import (
+    PostLoad,
+    UnquantizedFormat,
+    build_store,
+)
 from sglang.srt.layers.moe.paged_experts.method import (
     _cap_decode_capture_batch_sizes,
+    _loads_mapped_files,
     check_paged_experts_compat,
     make_for_layer,
 )
@@ -24,7 +34,11 @@ from sglang.srt.layers.moe.paged_experts.runners import (
     TritonContract,
     contract_for,
 )
-from sglang.srt.layers.moe.paged_experts.store import HostExpertStore
+from sglang.srt.layers.moe.paged_experts.store import (
+    ExpertLoads,
+    HostExpertStore,
+    same_bytes,
+)
 from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
@@ -33,7 +47,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
 E, K, H, TOP_K = 16, 4, 8, 2
 
@@ -111,10 +125,10 @@ _METHOD = "sglang.srt.layers.moe.paged_experts.method."
 
 
 def _create(method, layer, contract):
-    """Create the base method's expert tensors and runner as FusedMoE does, on a CPU store,
-    with ``contract`` for the runner."""
+    """Create the base method's expert tensors and runner as FusedMoE does, with
+    ``contract`` for the runner and loads that wait (a mapped safetensors checkpoint)."""
     with (
-        patch(_METHOD + "HostExpertStore", _CpuStore),
+        patch(_METHOD + "_loads_mapped_files", return_value=True),
         patch(_METHOD + "runner_config", side_effect=lambda config, num_slots: config),
         patch(_METHOD + "contract_for", return_value=contract),
     ):
@@ -129,8 +143,14 @@ def _create(method, layer, contract):
 
 
 def _load(method, layer):
+    """The post-load step, with the host store on the CPU."""
     with patch.object(formats, "HostExpertStore", _CpuStore):
         method.process_weights_after_loading(layer)
+
+
+def _copy_row(param, loaded_weight, **kw):
+    """A layer's per-expert loader, reduced to copying the row it is given."""
+    param.data[0].copy_(loaded_weight)
 
 
 def _paged_layer(
@@ -144,9 +164,9 @@ def _paged_layer(
     top_k=None,
     seed=0,
 ):
-    """A paged method over random experts, its layer created through the base method on a CPU
-    store; ``load`` fills the store with the experts and runs the post-load step. ``auto_size``
-    builds it with K = ``num_resident`` slots that sizing then grows, as for
+    """A paged method over random experts, its layer created through the base method;
+    ``load`` loads the experts and runs the post-load step (host store on the CPU).
+    ``auto_size`` builds it with K = ``num_resident`` slots that sizing then grows, as for
     --paged-experts-num-resident auto; ``top_k`` sets the layer's router top-k."""
     torch.manual_seed(seed)
     full = {
@@ -180,8 +200,8 @@ def _paged_layer(
     layer.quant_method = method  # as FusedMoE holds it
     _create(method, layer, contract)
     if load:
-        for name, t in full.items():
-            method.store.host[name].copy_(t)
+        for name_, t in full.items():
+            method.loads.table[name_].copy_(t)
         _load(method, layer)
     return method, layer, SimpleNamespace(**full)
 
@@ -300,8 +320,6 @@ class TestLoading(CustomTestCase):
         layout)."""
         method, layer, _ = _paged_layer(load=False)
         self.assertIs(layer.weight_load_method, method.base_method)
-        self.assertEqual(method.store.host["w2_weight"].shape, (E, H, H))
-        method.store.host["w2_weight"].zero_()
         seen = {}
 
         def impl(self, param, loaded_weight, weight_name, shard_id, expert_id):
@@ -310,27 +328,26 @@ class TestLoading(CustomTestCase):
 
         layer._weight_loader_impl = impl.__get__(layer)
         layer.w2_weight.weight_loader(
-            layer.w2_weight, torch.ones(H, H), "experts.w2_weight", "w2", 9
+            layer.w2_weight, _mapped(torch.ones(H, H)), "experts.w2_weight", "w2", 9
         )
-
+        self.assertEqual(seen, {})  # a view of a mapped file: it waits
+        rows = method.loads.rows([8, 9])["w2_weight"]
         self.assertEqual(seen, {"tag": "block"})
+        self.assertTrue(torch.equal(rows[1], torch.ones(H, H)))
         self.assertTrue(
-            torch.equal(method.store.host["w2_weight"][9], torch.ones(H, H))
-        )
-        self.assertFalse(method.store.host["w2_weight"][8].any())
-
-    def test_host_store_starts_from_the_created_values(self):
-        """What a loader leaves unwritten (e.g. padding a kernel adds) holds the values the
-        base method created, as on the GPU, not uninitialized memory."""
-        method, _, _ = _paged_layer(load=False)
-        for host in method.store.host.values():
-            self.assertTrue((host == 0.5).all())
+            (rows[0] == 0.5).all()
+        )  # not loaded: as the base method created
 
     def test_stacked_checkpoint_goes_to_the_native_loader_as_called(self):
         """A checkpoint tensor holding every expert (e.g. gpt-oss) goes, as called, to the
-        layer's native loader (fused for bf16, padded for MXFP4) on the whole host store; the
-        padding it leaves keeps the value the base method created."""
-        method, layer, _ = _paged_layer(load=False)
+        layer's native loader (fused for bf16, padded for MXFP4) on a table of every expert,
+        after the waiting loads; the padding it leaves keeps the value the base method
+        created."""
+        method, layer, full = _paged_layer(load=False)
+        layer._weight_loader_impl = _copy_row
+        layer.w13_weight.weight_loader(
+            layer.w13_weight, _mapped(full.w13_weight[3]), "w13_weight", "w13", 3
+        )
         calls = []
 
         def native(param, loaded_weight, weight_name, shard_id, *rest, **kwargs):
@@ -347,8 +364,12 @@ class TestLoading(CustomTestCase):
         self.assertEqual(
             calls, [((E, H, H), (), {}), ((E, H, H), (), {"expert_id": None})]
         )
-        self.assertTrue(torch.equal(method.store.host["w2_weight"][..., :-1], stacked))
-        self.assertTrue((method.store.host["w2_weight"][..., -1] == 0.5).all())
+        table = method.loads.table
+        self.assertTrue(torch.equal(table["w2_weight"][..., :-1], stacked))
+        self.assertTrue((table["w2_weight"][..., -1] == 0.5).all())
+        # The load that waited before the stacked one is in the table too.
+        self.assertTrue(torch.equal(table["w13_weight"][3], full.w13_weight[3]))
+        self.assertFalse(method.loads.waiting)
 
     def test_rejects_online_weight_updates(self):
         from sglang.srt.model_executor.model_runner_components.weight_updater import (
@@ -373,51 +394,22 @@ class TestLoading(CustomTestCase):
         self.assertEqual(
             method.checkpoint_params, ("w13_weight", "w2_weight", "w13_weight_scale")
         )
-        self.assertEqual(set(method.store.host), set(method.checkpoint_params))
+        self.assertEqual(set(method.loads.rows_like), set(method.checkpoint_params))
         self.assertIsNone(layer.w13_blockscale_swizzled)
 
-    def _staged(self, layer, num_experts):
-        staged = _CpuStore(
-            layer=layer, names=("w13_weight",), num_experts=num_experts, pin=False
-        )
-        staged.host["w13_weight"].copy_(
-            torch.arange(num_experts * 6.0).reshape(num_experts, 6)
-        )
-        return staged
-
     def test_repack_runs_per_chunk_and_keeps_its_output(self):
-        """A post-load step that repacks each expert into a new tensor runs over every expert
-        of the host store, K at a time, each chunk from the layer's state before the first (a
-        step that skips once it has run still repacks every chunk); the tensors it leaves per
-        expert are paged, and the slots hold experts 0..K-1 repacked."""
-
-        class _Repacking:
-            def process_weights_after_loading(self, layer):
-                if getattr(layer, "converted", False):  # e.g. is_marlin_converted
-                    return
-                layer.converted = True
-                raw = layer.w13_weight.data
-                packed = (raw * 10 + 1).reshape(raw.shape[0], 2, -1)
-                del layer.w13_weight
-                layer.register_parameter(
-                    "w13_qweight", torch.nn.Parameter(packed, requires_grad=False)
-                )
-
-        layer = torch.nn.Module()
-        layer.register_parameter(
-            "w13_weight", torch.nn.Parameter(torch.zeros(K, 6), requires_grad=False)
-        )
-        staged = self._staged(layer, E + 1)  # a partial last chunk
-        with patch.object(formats, "HostExpertStore", _CpuStore):
-            packed = after_loading(
-                layer, _Repacking(), staged, num_slots=K, repacks=True, unpaged=()
-            )
-
-        expected = (staged.host["w13_weight"] * 10 + 1).reshape(E + 1, 2, 3)
+        """A post-load step that repacks each expert into a new tensor runs over every expert,
+        K at a time, each chunk from the layer's state before the first (a step that skips
+        once it has run still repacks every chunk); the tensors it leaves per expert are
+        paged, and the slots hold experts 0..K-1 repacked."""
+        layer = _w13_layer(K)
+        loads, values = _loads(layer, E + 1)  # a partial last chunk
+        store = _post_load(layer, _Repacking(), loads)
+        expected = (values * 10 + 1).reshape(E + 1, 2, 3)
         self.assertEqual(
-            list(packed.host), ["w13_qweight"]
+            list(store.host), ["w13_qweight"]
         )  # not the deleted w13_weight
-        self.assertTrue(torch.equal(packed.host["w13_qweight"], expected))
+        self.assertTrue(torch.equal(store.host["w13_qweight"], expected))
         self.assertTrue(torch.equal(layer.w13_qweight.data, expected[:K]))
 
     def test_a_short_last_chunk_is_padded_with_experts(self):
@@ -442,29 +434,24 @@ class TestLoading(CustomTestCase):
             if param.is_floating_point():
                 param.data.fill_(float("nan"))  # what torch.empty may hold
         names = [name for name, _ in layer.named_parameters()]
-        staged = _CpuStore(layer=layer, names=names, num_experts=E + 1, pin=False)
-        for host in staged.host.values():  # a last chunk of 1 expert
-            if host.is_floating_point():
-                host.copy_(torch.rand(host.shape).add(0.5).to(host.dtype))
+        loads = ExpertLoads(layer, names, E + 1, K)
+        for table in loads.table.values():  # a last chunk of 1 expert
+            if table.is_floating_point():
+                table.copy_(torch.rand(table.shape).add(0.5).to(table.dtype))
             else:
-                host.copy_(torch.randint(0, 256, host.shape, dtype=host.dtype))
-        global_scale = staged.host["w13_weight_global_scale"]
+                table.copy_(torch.randint(0, 256, table.shape, dtype=table.dtype))
+        global_scale = loads.table["w13_weight_global_scale"]
         global_scale[:, 1] = global_scale[:, 0]  # gate and up share it, as exported
-        with (
-            patch.object(formats, "HostExpertStore", _CpuStore),
-            patch(
-                "sglang.srt.layers.quantization.marlin_utils_fp4."
-                "prepare_moe_nvfp4_layer_for_marlin"
-            ),
+        with patch(
+            "sglang.srt.layers.quantization.marlin_utils_fp4."
+            "prepare_moe_nvfp4_layer_for_marlin"
         ):
-            packed = after_loading(
-                layer, scheme, staged, num_slots=K, repacks=True, unpaged=()
-            )
+            store = _post_load(layer, scheme, loads)
         self.assertTrue(
-            torch.equal(packed.host["w13_weight_scale_2"], 1 / global_scale[:, 0])
+            torch.equal(store.host["w13_weight_scale_2"], 1 / global_scale[:, 0])
         )
         self.assertTrue(
-            torch.equal(packed.host["w13_weight"], staged.host["w13_weight_packed"])
+            torch.equal(store.host["w13_weight"], loads.table["w13_weight_packed"])
         )
 
     def test_rejects_a_repack_that_mixes_experts(self):
@@ -476,18 +463,392 @@ class TestLoading(CustomTestCase):
                 raw = layer.w13_weight.data
                 raw.sub_(raw.mean(0))
 
-        layer = torch.nn.Module()
+        layer = _w13_layer(K)
+        loads, _ = _loads(layer, E)
+        with self.assertRaisesRegex(RuntimeError, "each expert on its own"):
+            _post_load(layer, _Mixing(), loads)
+
+    def test_replays_see_the_layer_as_before_the_step(self):
+        """A chunk's loads replay after earlier chunks' steps ran on the layer; a loader that
+        reads the layer's state (as FusedMoE's reads its scheme) still sees it as loaded.
+        Negative control: without restoring that state first, later chunks replay garbage,
+        which the mixing check (experts 1..K again) refuses."""
+        for restores in (True, False):
+            with self.subTest(restores=restores):
+                layer = _w13_layer(K)
+                layer.mode = "loaded"
+                loads, values = _loads(layer, E, wait=True, reads_mode=layer)
+                _Repacking.marks = True
+                step = PostLoad(layer, _Repacking(), loads, True, ())
+                if restores:
+                    store = _fill(step)
+                    expected = (values * 10 + 1).reshape(E, 2, 3)
+                    self.assertTrue(_same(store.host["w13_qweight"], expected))
+                    continue
+                real_reset = step._reset  # restore all but the state the loader reads
+
+                def reset_keeping_mode(real_reset=real_reset):
+                    mode = layer.mode
+                    real_reset()
+                    layer.mode = mode
+
+                step._reset = reset_keeping_mode
+                with self.assertRaisesRegex(RuntimeError, "each expert on its own"):
+                    _fill(step)
+        _Repacking.marks = False
+
+
+class _Repacking:
+    """A post-load step that repacks each expert into a new tensor, once per layer state (as
+    Marlin's ``is_marlin_converted``); ``calls`` counts the chunks it repacked, ``nan_first``
+    makes expert 0 NaN (a valid output ``torch.equal`` never matches), ``validates`` rejects
+    a row that was never loaded (-1, as NVFP4A16 checks rows), ``marks`` changes the layer's
+    ``mode`` (state a loader may read)."""
+
+    calls = 0
+    nan_first = False
+    validates = False
+    marks = False
+
+    def process_weights_after_loading(self, layer):
+        if getattr(layer, "converted", False):
+            return
+        layer.converted = True
+        if type(self).marks:
+            layer.mode = "repacked"
+        type(self).calls += 1
+        raw = layer.w13_weight.data
+        if type(self).validates and (raw == -1).any():
+            raise ValueError("a row that was never loaded")
+        packed = (raw * 10 + 1).reshape(raw.shape[0], 2, -1)
+        if type(self).nan_first:
+            packed[raw[:, 0] == 0] = float("nan")
+        del layer.w13_weight
         layer.register_parameter(
-            "w13_weight", torch.nn.Parameter(torch.zeros(K, 6), requires_grad=False)
+            "w13_qweight", torch.nn.Parameter(packed, requires_grad=False)
         )
-        staged = self._staged(layer, E)
-        with (
-            patch.object(formats, "HostExpertStore", _CpuStore),
-            self.assertRaisesRegex(RuntimeError, "each expert on its own"),
-        ):
-            after_loading(
-                layer, _Mixing(), staged, num_slots=K, repacks=True, unpaged=()
+
+
+class _NoStep:
+    """A post-load step that leaves the loaded rows as they are (FP8, bf16)."""
+
+    def process_weights_after_loading(self, layer):
+        pass
+
+
+_same = same_bytes
+
+
+def _mapped(tensor: torch.Tensor) -> torch.Tensor:
+    """A copy of ``tensor`` as a view of a mapped file, mapped private as safetensors maps a
+    checkpoint: its bytes are in the file, not in memory of its own."""
+    data = tensor.contiguous().reshape(-1).view(torch.uint8).numpy().tobytes()
+    with tempfile.TemporaryFile() as f:
+        f.write(data or b"\0")
+        f.flush()
+        buf = mmap.mmap(
+            f.fileno(),
+            max(1, len(data)),
+            flags=mmap.MAP_PRIVATE,
+            prot=mmap.PROT_READ | mmap.PROT_WRITE,
+        )
+    out = torch.frombuffer(buf, dtype=tensor.dtype, count=tensor.numel())
+    return out.view(tensor.shape)
+
+
+def _anonymous(tensor: torch.Tensor) -> torch.Tensor:
+    """A copy of ``tensor`` in private anonymous memory (as numpy or a loader's own buffer
+    holds a tensor): ``MADV_DONTNEED`` zeroes it."""
+    nbytes = tensor.numel() * tensor.element_size()
+    buf = mmap.mmap(-1, max(1, nbytes), flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
+    out = torch.frombuffer(buf, dtype=tensor.dtype, count=tensor.numel())
+    return out.view(tensor.shape).copy_(tensor)
+
+
+def _w13_layer(num_slots: int, created: float = 0.0) -> torch.nn.Module:
+    layer = torch.nn.Module()
+    layer.register_parameter(
+        "w13_weight",
+        torch.nn.Parameter(torch.full((num_slots, 6), created), requires_grad=False),
+    )
+    return layer
+
+
+def _loads(
+    layer,
+    num_experts,
+    wait=False,
+    skip=(),
+    reads_mode=None,
+    count=None,
+    num_slots=K,
+):
+    """Loads of experts ``0..num_experts-1`` (values ``e * 6 .. e * 6 + 5``) for ``layer``:
+    in a table, or (``wait``) waiting, ``skip`` never written (rows stay as created) and
+    ``count`` called per replayed write; ``reads_mode``: the write reads that layer's
+    ``mode`` and writes garbage unless it says "loaded"."""
+    values = torch.arange(num_experts * 6.0).reshape(num_experts, 6)
+    loads = ExpertLoads(layer, ("w13_weight",), num_experts, num_slots)
+    if not wait:
+        loads.table["w13_weight"].copy_(values)
+        return loads, values
+    for e in range(num_experts):
+
+        def write(dest, e=e):
+            if count is not None:
+                count(e)
+            if e in skip:
+                return
+            ok = reads_mode is None or reads_mode.mode == "loaded"
+            dest.copy_(values[e] if ok else -values[e] - 7)
+
+        assert loads.defer(e, "w13_weight", write, values[e])
+    return loads, values
+
+
+def _fill(step):
+    """``build_store`` with the host store on the CPU."""
+    with patch.object(formats, "HostExpertStore", _CpuStore):
+        return build_store(step)
+
+
+def _post_load(layer, base_method, loads, repacks=True):
+    step = PostLoad(layer, base_method, loads, repacks, ())
+    store = _fill(step)
+    step.finish(store)
+    return store
+
+
+def _page_events(start):
+    """``start()`` (a load that fills a layer): the experts its loads replay and whose
+    checkpoint pages it gives back, as ("read" | "out", expert) in order."""
+    events = []
+    page_out, rows = ExpertLoads.page_out, ExpertLoads.rows
+
+    def spy_page_out(loads, experts):
+        experts = list(experts)
+        events.extend(("out", e) for e in experts)
+        return page_out(loads, experts)
+
+    def spy_rows(loads, experts, out=None):
+        events.extend(("read", e) for e in dict.fromkeys(experts))
+        return rows(loads, experts, out)
+
+    with (
+        patch.object(ExpertLoads, "page_out", spy_page_out),
+        patch.object(ExpertLoads, "rows", spy_rows),
+    ):
+        start()
+    return events
+
+
+def _given_back_early(events, num_experts):
+    """The experts whose pages a start gave back other than once, after their last read."""
+    wrong = []
+    for e in range(num_experts):
+        mine = [kind for kind, x in events if x == e]
+        if mine.count("out") != 1 or mine[-1] != "out":
+            wrong.append((e, mine))
+    return wrong
+
+
+def _rows_ignoring_keep(loads, experts, out=None):
+    """``ExpertLoads.rows`` that gives every replayed expert's pages back, also those the
+    mixing check reads again (the loads before ``keep``)."""
+    keep, loads.keep = loads.keep, set()
+    try:
+        return _rows(loads, experts, out)
+    finally:
+        loads.keep = keep
+
+
+_rows = ExpertLoads.rows
+
+
+class TestLoads(CustomTestCase):
+    def test_loads_wait_until_their_experts_are_replayed(self):
+        """A view of a mapped file waits; ``rows`` replays only the asked experts' loads,
+        onto the created values; repeats are copied, not loaded again."""
+        method, layer, full = _paged_layer(load=False)
+        writes = []
+
+        def impl(param, loaded_weight, **kw):
+            writes.append(1)
+            param.data[0].copy_(loaded_weight)
+
+        layer._weight_loader_impl = impl
+        for e in range(E):
+            layer.w2_weight.weight_loader(
+                layer.w2_weight, _mapped(full.w2_weight[e]), "w2_weight", "w2", e
             )
+        self.assertEqual(writes, [])
+        rows = method.loads.rows([3, 5, 3])["w2_weight"]
+        self.assertEqual(len(writes), 2)
+        self.assertTrue(torch.equal(rows[0], full.w2_weight[3]))
+        self.assertTrue(torch.equal(rows[1], full.w2_weight[5]))
+        self.assertTrue(torch.equal(rows[2], full.w2_weight[3]))
+        self.assertTrue((method.loads.rows([3])["w13_weight"] == 0.5).all())
+
+    def test_only_views_of_mapped_files_wait(self):
+        """A tensor torch allocated (e.g. a ``.bin`` checkpoint's) cannot wait: it would hold
+        its memory. A real safetensors file's tensor can (the control)."""
+        from safetensors import safe_open
+        from safetensors.torch import save_file
+
+        from sglang.srt.layers.moe.paged_experts.method import _can_defer
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "w.safetensors")
+            save_file({"w": torch.randn(64, 64)}, path)
+            with safe_open(path, framework="pt") as f:
+                self.assertTrue(_can_defer(f.get_tensor("w")))
+        self.assertTrue(_can_defer(_mapped(torch.ones(4))))
+        self.assertFalse(_can_defer(torch.ones(4)))
+
+    def test_loads_wait_only_with_the_safetensors_loaders(self):
+        """Only the safetensors loaders with mmap give views of the mapped files; other
+        loaders' tensors may be copies, on the GPU, or buffers reused for the next tensor
+        (the RunAI streamer's), so their loads go to the table at once."""
+        for load_format, disable_mmap, waits in (
+            ("auto", False, True),
+            ("safetensors", False, True),
+            ("mistral", False, True),
+            ("auto", True, False),
+            ("pt", False, False),
+            ("npcache", False, False),
+            ("runai_streamer", False, False),
+            ("fastsafetensors", False, False),
+        ):
+            model = SimpleNamespace(
+                load_format=load_format, weight_loader_disable_mmap=disable_mmap
+            )
+            with (
+                self.subTest(load_format=load_format, disable_mmap=disable_mmap),
+                patch(_METHOD + "get_model", return_value=model),
+            ):
+                self.assertEqual(_loads_mapped_files(), waits)
+
+    def test_a_load_that_cannot_wait_ends_the_waiting(self):
+        """It writes the table, after the created values and the waiting loads; later loads
+        go there too. Negative control: a waiting load not in the table would leave its row
+        as created."""
+        method, layer, full = _paged_layer(load=False)
+        layer._weight_loader_impl = _copy_row
+        loader = layer.w2_weight.weight_loader
+        loader(layer.w2_weight, _mapped(full.w2_weight[5]), "w2_weight", "w2", 5)
+        self.assertTrue(method.loads.waiting)
+        loader(layer.w2_weight, full.w2_weight[6].clone(), "w2_weight", "w2", 6)
+        self.assertFalse(method.loads.waiting)
+        loader(layer.w2_weight, _mapped(full.w2_weight[7]), "w2_weight", "w2", 7)
+        table = method.loads.table["w2_weight"]
+        self.assertTrue(torch.equal(table[5:8], full.w2_weight[5:8]))
+        self.assertTrue((table[8] == 0.5).all())
+        fresh = ExpertLoads(layer, ("w2_weight",), E, K)  # loads never handed over
+        self.assertFalse(torch.equal(fresh.table["w2_weight"][5], full.w2_weight[5]))
+
+    def test_replayed_pages_are_given_back_unchanged(self):
+        """``madvise`` on a replayed view keeps its bytes (the kernel reads them again), and
+        advice the kernel refuses (``MADV_PAGEOUT`` before Linux 5.4) leaves even anonymous
+        memory as it is. Negative control: ``MADV_DONTNEED``, the advice it must not fall
+        back to, zeroes anonymous memory."""
+        view = _mapped(torch.arange(4096.0))
+        before = view.clone()
+        store_module._madvise(view, store_module._MADV_PAGEOUT)
+        store_module._madvise(view, store_module._MADV_WILLNEED)
+        self.assertTrue(torch.equal(view, before))
+
+        values = torch.arange(4096.0) + 1
+        anonymous = _anonymous(values)
+        madvise = store_module._libc().madvise
+
+        def refuses_pageout(start, length, advice):
+            if advice == store_module._MADV_PAGEOUT:
+                return -1
+            return madvise(start, length, advice)
+
+        with patch.object(
+            store_module, "_libc", lambda: SimpleNamespace(madvise=refuses_pageout)
+        ):
+            store_module._madvise(anonymous, store_module._MADV_PAGEOUT)
+        self.assertTrue(torch.equal(anonymous, values))
+        store_module._madvise(anonymous, 4)  # MADV_DONTNEED
+        self.assertFalse(torch.equal(anonymous, values))
+
+    def test_a_build_reads_each_expert_once_and_gives_its_pages_back_after(self):
+        """Every expert's loads replay once, also those of experts 1..K that the mixing check
+        repacks again (their pages stay until it ran), and each expert's checkpoint pages are
+        given back once, after its last read; for a step that repacks and one that does not.
+        Negative control: giving the pages back at every replay, as before, reads experts
+        1..K after they went."""
+        for repacks in (True, False):
+            with self.subTest(repacks=repacks):
+                layer = _w13_layer(K)
+                loads, _ = _loads(layer, E + 1, wait=True)
+                base = _Repacking() if repacks else _NoStep()
+                events = _page_events(lambda: _post_load(layer, base, loads, repacks))
+                self.assertEqual(_given_back_early(events, E + 1), [])
+                reads = [e for kind, e in events if kind == "read"]
+                mixing = list(range(1, K + 1)) if repacks else []
+                self.assertEqual(reads, list(range(E + 1)) + mixing)
+        layer = _w13_layer(K)
+        loads, _ = _loads(layer, E + 1, wait=True)
+        with patch.object(ExpertLoads, "rows", _rows_ignoring_keep):
+            events = _page_events(lambda: _post_load(layer, _Repacking(), loads))
+        early = _given_back_early(events, E + 1)
+        self.assertEqual([e for e, _ in early], list(range(1, K + 1)))
+
+    def test_pages_are_given_back_off_the_loading_thread(self):
+        """``page_out`` hands the replayed views to a thread of its own and returns before the
+        kernel reclaimed them (it does so synchronously); ``drop`` waits for it and ends the
+        thread. Control: ``read_ahead`` advises on the calling thread."""
+        layer = _w13_layer(K)
+        loads, _ = _loads(layer, E, wait=True)
+        loads.rows([0, 1])  # replays experts 0 and 1, then gives their pages back
+        started, release, seen = threading.Event(), threading.Event(), []
+        madvise = store_module._madvise
+
+        def slow(view, advice):
+            seen.append((threading.current_thread(), advice))
+            if advice == store_module._MADV_PAGEOUT:
+                started.set()
+                release.wait(5)
+            return madvise(view, advice)
+
+        with patch.object(store_module, "_madvise", slow):
+            loads.page_out([2, 3])
+            self.assertTrue(started.wait(5))
+            pager = seen[0][0]
+            self.assertTrue(pager.name.startswith("paged-experts-pageout"))
+            loads.read_ahead([4])
+            self.assertIn(
+                (threading.current_thread(), store_module._MADV_WILLNEED), seen
+            )
+            done = threading.Thread(target=loads.drop)
+            done.start()
+            done.join(0.2)
+            self.assertTrue(done.is_alive())  # drop waits for the page-out
+            release.set()
+            done.join(5)
+        self.assertFalse(done.is_alive())
+        self.assertIsNone(loads._pager)
+        pager.join(5)  # the executor's worker exits after shutdown
+        self.assertFalse(pager.is_alive())
+
+    def test_madvise_without_linux_is_skipped(self):
+        """Off Linux there is no libc ``madvise`` to load, and the advice is skipped; on
+        Linux, ``MADV_PAGEOUT`` has its Linux value also where Python's mmap module does not
+        export it."""
+        store_module._libc.cache_clear()
+        self.addCleanup(store_module._libc.cache_clear)
+        view = _mapped(torch.arange(16.0))
+        with patch.object(store_module, "_LINUX", False):
+            self.assertIsNone(store_module._libc())
+            store_module._madvise(view, store_module._MADV_PAGEOUT)  # a no-op
+        store_module._libc.cache_clear()
+        if store_module._LINUX:
+            self.assertIsNotNone(store_module._libc())
+            self.assertEqual(store_module._MADV_PAGEOUT, 21)
+        self.assertTrue(torch.equal(view, torch.arange(16.0)))
 
 
 class TestResidency(CustomTestCase):
@@ -623,7 +984,9 @@ class TestFormats(CustomTestCase):
 
 
 class TestCompat(CustomTestCase):
-    def _check(self, num_resident=K, speculative_algorithm=None, **flags):
+    def _check(
+        self, num_resident=K, speculative_algorithm=None, load_format="auto", **flags
+    ):
         method = "sglang.srt.layers.moe.paged_experts.method."
         moe = SimpleNamespace(
             enable_eplb=False,
@@ -657,7 +1020,8 @@ class TestCompat(CustomTestCase):
                 ),
             ),
             patch(
-                method + "get_model", return_value=SimpleNamespace(load_format="auto")
+                method + "get_model",
+                return_value=SimpleNamespace(load_format=load_format),
             ),
             patch(method + "check_cuda_graph_backend", return_value=True),
         ):
@@ -665,6 +1029,43 @@ class TestCompat(CustomTestCase):
 
     def test_accepts_a_supported_config(self):
         self._check()
+
+    def test_only_loaders_that_fill_through_load_weights_are_accepted(self):
+        """The loaders that fill the experts through model.load_weights and then run the
+        post-load step (e.g. pt) are accepted; the others are refused by name with their
+        reason: dummy has no real weights, gguf GGUF-quantized experts, the rest (e.g.
+        sharded_state, and any new format) load without Paged Experts' loader, and the
+        message names the accepted ones."""
+        from sglang.srt.configs.load_config import LoadFormat
+
+        accepted = {
+            LoadFormat.AUTO,
+            LoadFormat.SAFETENSORS,
+            LoadFormat.PT,
+            LoadFormat.NPCACHE,
+            LoadFormat.MISTRAL,
+            LoadFormat.FASTSAFETENSORS,
+            LoadFormat.INSTANTTENSOR,
+            LoadFormat.RUNAI_STREAMER,
+        }
+        reasons = {
+            LoadFormat.DUMMY: "needs the real weights",
+            LoadFormat.GGUF: "GGUF-quantized experts",
+        }
+        for load_format in LoadFormat:
+            with self.subTest(load_format=load_format.value):
+                if load_format in accepted:
+                    self._check(load_format=load_format)
+                    self._check(load_format=load_format.value)  # as a string
+                    continue
+                reason = reasons.get(
+                    load_format, r"without Paged Experts' loader .*supported: auto, "
+                )
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    f"--load-format {load_format.value} is not supported: .*{reason}",
+                ):
+                    self._check(load_format=load_format)
 
     def test_rejects_speculative_decoding(self):
         with self.assertRaisesRegex(RuntimeError, "speculative decoding"):

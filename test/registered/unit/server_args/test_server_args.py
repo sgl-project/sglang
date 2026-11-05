@@ -2172,6 +2172,23 @@ class TestContextParallelServerArgs(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "DeepSeek V3.2.*interleave"):
             handle_context_parallelism(server_args)
 
+    def test_sharded_padded_cp_kv_layout_refuses_unified_memory(self):
+        for unified in (False, True):
+            with (
+                self.subTest(unified=unified),
+                patch(
+                    "sglang.srt.layers.cp.base.is_cp_sharded_padded", return_value=True
+                ),
+            ):
+                server_args = self._new_cp_args(enable_unified_memory=unified)
+                if unified:
+                    with self.assertRaisesRegex(
+                        ValueError, "--enable-unified-memory does not support"
+                    ):
+                        handle_context_parallelism(server_args)
+                else:
+                    handle_context_parallelism(server_args)
+
     def test_generic_v1_cp_options_are_not_public_cli(self):
         removed_options = (
             ("--enable-prefill-context-parallel", []),
@@ -5352,7 +5369,7 @@ class TestDcpCommBackendDefault(CustomTestCase):
         self.assertEqual(self._resolved(dcp_size=1), "ag_rs")
 
     @override_platform(is_npu=True, is_cuda=False, is_hip=False, is_xpu=False)
-    def test_a5_npu_supports_dcp(self):
+    def test_npu_supports_dcp(self):
         self.assertEqual(self._resolved(dcp_size=2), "ag_rs")
 
     @override_platform(is_cuda=True, is_hip=False)

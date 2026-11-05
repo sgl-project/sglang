@@ -1,7 +1,7 @@
 import random
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.scheduler import Scheduler
@@ -414,12 +414,20 @@ class TestSpanlessAbortPaths(CustomTestCase):
         req.time_stats = SimpleNamespace(
             trace_ctx=SimpleNamespace(abort=lambda abort_info: None)
         )
-        sent = []
-        scheduler = SimpleNamespace(
-            enable_priority_scheduling=False,
-            abort_on_priority_when_disabled=True,
-            send_abort_output=lambda obj, req_arg: sent.append(obj),
+        req.finished_reason = None
+        req.finish_outside_step = lambda reason: None
+        req.kv = SimpleNamespace(
+            holds_kv=False, holds_mamba=False, retraction_backup=None
         )
+        sent = []
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.enable_priority_scheduling = False
+        scheduler.abort_on_priority_when_disabled = True
+        scheduler.send_abort_output = lambda obj, req_arg: sent.append(obj)
+        scheduler.tree_cache = scheduler.beam_coordinator = MagicMock()
+        scheduler.hisparse_coordinator = None
+        scheduler.init_request_retirer()
+        scheduler.request_retirer.release_aborted_request = MagicMock()
 
         with patch(
             "sglang.srt.managers.utils.get_serving",

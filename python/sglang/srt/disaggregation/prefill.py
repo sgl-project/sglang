@@ -73,9 +73,9 @@ from sglang.srt.layers.cp.utils import get_cp_sharded_padded_cache_transfer_indi
 from sglang.srt.managers.req_types import FINISH_ABORT, FINISH_LENGTH
 from sglang.srt.managers.schedule_batch import NextBatchPlan, Req, ScheduleBatch
 from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
     ListKind,
-    RequestList,
-    _RequestList,
+    ReqList,
     move,
 )
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
@@ -113,6 +113,9 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
 
 logger = logging.getLogger(__name__)
+
+# The default window of a window payload: the scheduler's sliding window.
+_SCHEDULER_WINDOW = object()
 
 # TP=1 yield between polls of a pending result. An initial heuristic rather
 # than a tuned value: long enough that the bootstrap, transfer and cache
@@ -208,7 +211,7 @@ class PrefillBootstrapQueue:
         self.pp_size = parallel.pp_size
         self.gpu_id = gpu_id
         self.bootstrap_port = bootstrap_port
-        self.queue = _RequestList(ListKind.PD_BOOTSTRAP, abort=self._abort)
+        self.queue = IndexedReqList(ListKind.PD_BOOTSTRAP, abort=self._abort)
         self.scheduler = scheduler
         self.scheduler_stage_metrics = scheduler_stage_metrics
         # Each rank owns a subset of logical KV pages, so capacity widens by N.
@@ -655,10 +658,7 @@ class SchedulerDisaggregationPrefillMixin:
                 # finalize cannot fail here; if it ever does, the request stays
                 # pending and the post-forward check resolves it.
                 self.disagg_prefill_bootstrap_queue.finalize_bootstrap(req)
-        if failed:
-            self.waiting_queue = [
-                req for req in self.waiting_queue if req not in failed
-            ]
+        self.waiting_queue.leave(failed)
 
     def has_bootstrapped_waiting_req(self: Scheduler) -> bool:
         return any(
@@ -715,7 +715,7 @@ class SchedulerDisaggregationPrefillMixin:
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
-            self.waiting_queue.extend(
+            self.waiting_queue.join(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
 
@@ -844,7 +844,7 @@ class SchedulerDisaggregationPrefillMixin:
                 if should_ingest_requests
                 else []
             )
-            self.waiting_queue.extend(bootstrapped_reqs)
+            self.waiting_queue.join(bootstrapped_reqs)
             # Resume batch creation on completion, new/ready requests, or an idle step.
             if not waiting_for_batch_result or received_inputs or bootstrapped_reqs:
                 skip_batch_creation = False
@@ -1710,42 +1710,24 @@ class SchedulerDisaggregationPrefillMixin:
                     .numpy()
                 ]
 
-            def _swa_payload():
-                allocator = self.token_to_kv_pool_allocator
-                kvcache = allocator.get_kvcache()
-                # A unified pool (one with transfer storage) keeps its window
-                # in a sub-pool, never in per-request window rows.
-                request_window = (
-                    None if allocator.storage is not None else kvcache.request_window
+            def _swa_payload(sub_pool="swa", window=_SCHEDULER_WINDOW):
+                if window is _SCHEDULER_WINDOW:
+                    # Read only when a window entry is sent.
+                    window = self.sliding_window_size
+                storage = kv_storage_of(
+                    self.req_to_token_pool, self.token_to_kv_pool_allocator
                 )
-                # Under encoder replay the scheduler is not hybrid SWA and keeps no
-                # window size; the pool holds it.
-                window_size = (
-                    self.sliding_window_size
-                    if request_window is None
-                    else kvcache.sliding_window
+                resume = storage.resume_units(
+                    sub_pool,
+                    req,
+                    token_start=req.disagg_decode_prefix_len,
+                    token_boundary=seq_len,
+                    window=window,
                 )
-                window_start = max(req.disagg_decode_prefix_len, seq_len - window_size)
-                window_start = (window_start // page_size) * page_size
-                if request_window is not None:
-                    return request_window.page_indices(
-                        int(req.kv.req_pool_idx), window_start, seq_len
-                    )
-                window_kv_indices_full = self.req_to_token_pool.req_to_token[
-                    req.kv.req_pool_idx, window_start:seq_len
-                ]
-                if is_cp_sharded_padded():
-                    window_kv_indices_full = (
-                        get_cp_sharded_padded_cache_transfer_indices(
-                            window_kv_indices_full
-                        )
-                    )
-                window_kv_indices_swa = (
-                    self.token_to_kv_pool_allocator.translate_swa_indices_for_transfer(
-                        window_kv_indices_full
-                    )
-                )
-                return state_page_indices(window_kv_indices_swa)
+                # The window rides the last segment's send, whose indices_event
+                # is recorded behind this copy on the same stream.
+                units = resume.unit_ids
+                return async_d2h(units).numpy() if host_indices else units.cpu().numpy()
 
             def _full_kv_pages_payload():
                 kv_indices_full = self.req_to_token_pool.req_to_token[
@@ -1815,6 +1797,7 @@ class SchedulerDisaggregationPrefillMixin:
                 StateType.QSA_PENDING: _qsa_pending_payload,
                 StateType.QSA_COMPRESSED: _full_kv_pages_payload,
                 StateType.SWA: _swa_payload,
+                StateType.AUXILIARY_SWA: lambda: _swa_payload("draft_swa", None),
                 StateType.DSA: _dsa_pages_payload,
                 StateType.DSA_TAIL: _dsa_tail_payload,
                 StateType.MINIMAX_INDEX_K: _minimax_payload,
@@ -1911,9 +1894,7 @@ class SchedulerDisaggregationPrefillMixin:
         else:
             self.disagg_prefill_pending_chunk_rids.add(req.rid)
 
-    def optimistic_release_and_requeue(
-        self: Scheduler, req: Req, src: RequestList
-    ) -> None:
+    def optimistic_release_and_requeue(self: Scheduler, req: Req, src: ReqList) -> None:
         """Release KV cache and requeue an optimistic prefill request out of `src`."""
         max_attempts = get_disagg().optimistic_prefill_attempts
         uses_write_through_cache = _uses_write_through_cache(self.tree_cache)
@@ -1978,4 +1959,4 @@ class SchedulerDisaggregationPrefillMixin:
             req.time_stats.set_wait_queue_entry_time()
             req.arrival_processed_tokens = self.processed_tokens_counter
             src.leave([req])
-            self.waiting_queue.insert(0, req)
+            self.waiting_queue.prepend([req])
