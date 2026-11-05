@@ -185,6 +185,7 @@ def _qem_first_unique_face_indices(f: np.ndarray, nv: int) -> np.ndarray:
     sorted_f = np.sort(f, axis=1)
     if nv**3 > np.iinfo(np.int64).max:
         return np.unique(sorted_f, axis=0, return_index=True)[1]
+    sorted_f = sorted_f.astype(np.int64, copy=False)
     keys = (sorted_f[:, 0] * nv + sorted_f[:, 1]) * nv + sorted_f[:, 2]
     return np.unique(keys, return_index=True)[1]
 

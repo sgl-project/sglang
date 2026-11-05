@@ -38,7 +38,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.h
 )
 from sglang.multimodal_gen.runtime.utils import mesh3d_utils
 from sglang.multimodal_gen.runtime.utils.mesh3d_utils import mesh_simplify
-from sglang.test.test_utils import CustomTestCase
 
 
 def _reference_qem_vertex_quadrics(v: np.ndarray, f: np.ndarray) -> np.ndarray:
@@ -259,7 +258,7 @@ class TestHunyuan3DPaintTurboSchedule(unittest.TestCase):
         self.assertFalse(stage.scheduler.custom_timesteps)
 
 
-class TestHunyuan3DPaintRemesh(CustomTestCase):
+class TestHunyuan3DPaintRemesh(unittest.TestCase):
     def _unwrap(self, use_remesh: bool) -> trimesh.Trimesh:
         stage = Hunyuan3DPaintPreprocessStage.__new__(Hunyuan3DPaintPreprocessStage)
         stage.config = Hunyuan3D2PipelineConfig(paint_use_remesh=use_remesh)
@@ -299,26 +298,19 @@ class TestHunyuan3DPaintRemesh(CustomTestCase):
 
     def test_qem_first_unique_face_indices_match_numpy_axis_zero(self):
         faces = np.array(
-            [
-                [0, 1, 2],
-                [3, 4, 5],
-                [2, 0, 1],
-                [3, 5, 4],
-                [6, 6, 7],
-                [7, 6, 6],
-                [8, 8, 8],
-                [0, 2, 1],
-            ],
+            [[0, 1, 2], [2, 1, 0], [3, 4, 5], [5, 4, 3]],
             dtype=np.int64,
         )
         expected = np.unique(np.sort(faces, axis=1), axis=0, return_index=True)[1]
-        actual = mesh3d_utils._qem_first_unique_face_indices(faces, nv=9)
+        actual = mesh3d_utils._qem_first_unique_face_indices(faces, nv=6)
         np.testing.assert_array_equal(actual, expected)
 
-        overflow_faces = np.array(
-            [[2, 5, 7], [8, 9, 10], [7, 2, 5], [6, 6, 9], [9, 6, 6]],
-            dtype=np.int64,
-        )
+        int32_faces = np.array([[0, 10, 100], [1, 10, 100]], dtype=np.int32)
+        expected = np.unique(np.sort(int32_faces, axis=1), axis=0, return_index=True)[1]
+        actual = mesh3d_utils._qem_first_unique_face_indices(int32_faces, nv=65536)
+        np.testing.assert_array_equal(actual, expected)
+
+        overflow_faces = np.array([[2, 5, 7], [8, 9, 10], [7, 2, 5]], dtype=np.int64)
         expected = np.unique(
             np.sort(overflow_faces, axis=1), axis=0, return_index=True
         )[1]
