@@ -62,6 +62,7 @@ def _make_scheduler(pending_req, *, chunked_req, running_reqs) -> Scheduler:
     sched.last_batch = None
     sched.beam_coordinator = Mock()
     sched.output_streamer = Mock()
+    sched.enable_hisparse = False
     return sched
 
 
@@ -104,6 +105,28 @@ class TestPendingChunkedAbortRace(CustomTestCase):
             sched.process_pending_chunked_abort()
 
         sched.beam_coordinator.retire_group.assert_called_once_with(req)
+
+    def test_aborted_chunked_req_releases_hisparse_before_kv(self):
+        # Each chunk's extend allocates HiSparse spec scratch for the row.
+        req = _FakeReq("hisparse_chunked")
+        sched = _make_scheduler(req, chunked_req=req, running_reqs=[])
+        sched.release_aborted_request = Mock()
+        sched.tree_cache = None
+        sched.ipc_channels = Mock()
+        sched.enable_hisparse = True
+        calls = []
+        sched.hisparse_coordinator = Mock()
+        sched.hisparse_coordinator.request_finished.side_effect = lambda req: (
+            calls.append(("hisparse", req))
+        )
+
+        with patch(
+            "sglang.srt.managers.scheduler.release_kv_cache",
+            side_effect=lambda req, *a, **kw: calls.append(("kv", req)),
+        ):
+            sched.process_pending_chunked_abort()
+
+        self.assertEqual(calls, [("hisparse", req), ("kv", req)])
 
 
 if __name__ == "__main__":

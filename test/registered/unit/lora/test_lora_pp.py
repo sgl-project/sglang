@@ -34,8 +34,9 @@ from sglang.srt.managers.scheduler_components.metrics_reporter import (
     SchedulerMetricsReporter,
 )
 from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    KeyedReqList,
     ListKind,
-    _RequestList,
 )
 from sglang.srt.runtime_context import get_context, get_parallel
 
@@ -115,6 +116,8 @@ class TestAllPPLoras(CustomTestCase):
 
         short, long = request("short", 5), request("long", 100)
         waiting = request("waiting", 100)
+        waiting_queue = IndexedReqList(ListKind.WAITING)
+        waiting_queue.join([waiting])
         first, second = _batch(short), _batch(long)
         for batch in (first, second):
             batch.batch_is_full = False
@@ -128,19 +131,21 @@ class TestAllPPLoras(CustomTestCase):
         scheduler.__dict__.update(
             running_mbs=[first, second],
             mbs=[first, second],
-            running_reqs=_RequestList(ListKind.DECODING),
-            waiting_queue=[waiting],
+            running_reqs=KeyedReqList(ListKind.DECODING),
+            waiting_queue=waiting_queue,
             lora_drainer=LoRADrainer(max_loras_per_batch=2, max_wait_time_secs=3),
             enable_lora=True,
             enable_lora_overlap_loading=False,
             enable_priority_preemption=False,
             is_hybrid_swa=False,
-            chunked_req=None,
+            chunked_reqs=IndexedReqList(ListKind.CHUNKED),
             min_free_slots_delayer=None,
             is_mixed_chunk=False,
             dllm_config=None,
             grammar_manager=SimpleNamespace(has_waiting_grammars=lambda: False),
-            policy=mock.Mock(),
+            policy=mock.Mock(
+                calc_priority=lambda waiting, *args, **kwargs: list(waiting)
+            ),
             processed_tokens_counter=0,
             disagg_prefill_bootstrap_queue=None,
             get_num_allocatable_reqs=lambda *args, **kwargs: 1,
