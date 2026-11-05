@@ -8,9 +8,10 @@ import torch
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import CYAN, RESET, init_logger
+from sglang.srt.utils import is_npu
 from sglang.srt.utils.torch_npu_patch_utils import apply_torch_npu_patches
 
-if current_platform.is_npu():
+if is_npu():
     import torch_npu
 
     patches = [
