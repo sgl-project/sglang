@@ -58,6 +58,7 @@ _TRITON_KERNELS = [
     ("kv_indices", "get_num_page_per_block_flashmla"),
     ("trtllm_mha_page_table", "build_trtllm_mha_page_table"),
     ("trtllm_mha_graph_metadata", "update_trtllm_mha_graph_metadata"),
+    ("trtllm_mha_graph_metadata", "update_draft_step_seqlens"),
     ("aiter_unified_page_table", "scatter_ragged_to_page_table_kernel"),
     ("aiter_unified_page_table", "scatter_req_to_token_to_page_table_kernel"),
     ("fused_qk_rope_reshape_and_cache", "fused_qk_rope_reshape_and_cache"),
@@ -72,6 +73,15 @@ for _mod, _fn in _TRITON_KERNELS:
         )
     )
 del _mod, _fn
+
+register_kernel(
+    KernelSpec(
+        op="attention.qk_norm_rope",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.qk_norm_rope:qk_norm_rope",
+        capabilities=CUDA_ONLY,
+    )
+)
 
 register_kernel(
     KernelSpec(
@@ -345,10 +355,10 @@ register_kernel(
         op="attention.deep_select_topk",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.attention.deep_select:topk",
-        # Exactly SM90, SM100 and SM103, the architectures DeepSelect is tuned for.
+        # Exactly SM90, SM100, SM103 and SM107, the architectures DeepSelect is tuned for.
         capabilities=frozenset(
             CapabilityRequirement.cuda(min_sm=sm, max_sm=sm)
-            for sm in ((9, 0), (10, 0), (10, 3))
+            for sm in ((9, 0), (10, 0), (10, 3), (10, 7))
         ),
     )
 )

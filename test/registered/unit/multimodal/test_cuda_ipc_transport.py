@@ -28,7 +28,7 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=54, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=54, stage="base-b", runner_config="1-gpu-small")
 
 
 def _produce_pooled_tensor(proxy_queue, consumer_done, result_queue):
@@ -284,6 +284,7 @@ class TestCudaIpcTransport(CustomTestCase):
         processor.use_cuda_ipc = True
         processor.use_ipc_pool_handle_cache = True
         processor.cudaipc_mmfeature_pool = pool
+        processor.processor_fingerprint = "sha256:" + "12" * 32
         features = [
             torch.ones(16, device="cuda"),
             torch.empty(0, device="cuda"),
