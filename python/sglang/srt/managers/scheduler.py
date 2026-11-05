@@ -236,6 +236,9 @@ from sglang.srt.managers.schedule_policy import (
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
+from sglang.srt.managers.scheduler_components.deferred_responses import (
+    DeferredResponses,
+)
 from sglang.srt.managers.scheduler_components.dp_attn import SchedulerDPAttnAdapter
 from sglang.srt.managers.scheduler_components.dynamic_chunk_sizer import (
     DynamicChunkSizer,
@@ -489,8 +492,6 @@ class Scheduler(
     # overrides init_load_publisher (which would otherwise not set it).
     _last_stall_publish_ts: float = float("-inf")
     kv_checksum_computer: Optional[KvChecksumComputer] = None
-    # Allocate per instance only when a consumer first defers a response.
-    _deferred_responses: Optional[Dict[str, Tuple[Req, ResponseCompletion]]] = None
     # Unlimited-OCR collaborators; None for every other model.
     uocr_runtime: Optional[UocrSchedulerRuntime] = None
     resolve_forward_inputs = staticmethod(resolve_forward_inputs)
@@ -777,6 +778,8 @@ class Scheduler(
         self.init_kv_weight_version_tracker()
 
         self.init_output_streamer()
+
+        self.init_deferred_responses()
 
         self.init_batch_result_processor()
 
@@ -1703,7 +1706,7 @@ class Scheduler(
     def init_disaggregation(self):
         self.mm_receiver = None
         self.disagg_prefill_bootstrap_queue = None
-        self.disagg_prefill_inflight_queue = None
+        self.disagg_prefill_transfer_queue = None
         self.disagg_decode_prealloc_queue = None
         self.disagg_decode_transfer_queue = None
 
@@ -1833,9 +1836,8 @@ class Scheduler(
                 scheduler_stage_metrics=self.scheduler_stage_metrics,
                 transfer_backend=self.transfer_backend,
             )
-            # The prefill requests that are in the middle of kv sending
-            self.disagg_prefill_inflight_queue: List[Req] = []
-            # Requests with a sent chunk that are not yet on the inflight queue.
+            self.disagg_prefill_transfer_queue: List[Req] = []
+            # Requests with a sent chunk that are not yet on the transfer queue.
             self.disagg_prefill_pending_chunk_rids: Set[str] = set()
 
             self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
@@ -2648,13 +2650,21 @@ class Scheduler(
             if envs.SGLANG_RUST_SERVER.get()
             else []
         )
+        # Also a collective: attention-DP listeners sharing one CPU mask split it.
+        frontend_cpu_share = (
+            self.get_rust_server_class().gather_frontend_cpu_share(hosts_listener)
+            if envs.SGLANG_RUST_SERVER.get()
+            else (0, 1)
+        )
         if not hosts_listener:
             # Always define the attribute: init_output_streamer and the
             # process_input_requests hook read self.rust_server unconditionally.
             self.rust_server = None
             return
 
-        rust_server = self.get_rust_server_class().launch(self)
+        rust_server = self.get_rust_server_class().launch(
+            self, frontend_cpu_share=frontend_cpu_share
+        )
         rust_server.install_sigterm_drain(
             notify=drain_notify_name(port_args.instance_id)
         )
@@ -2785,6 +2795,7 @@ class Scheduler(
             pool_stats_observer=self.pool_stats_observer,
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
+            get_request_lists=self.request_lists,
             get_chunked_req=lambda: self.chunked_req,
             get_running_reqs=lambda: self.running_reqs,
             get_pp_running_mbs=lambda: (
@@ -2870,8 +2881,8 @@ class Scheduler(
             get_disagg_prefill_bootstrap_queue=lambda: (
                 self.disagg_prefill_bootstrap_queue
             ),
-            get_disagg_prefill_inflight_queue=lambda: (
-                self.disagg_prefill_inflight_queue
+            get_disagg_prefill_transfer_queue=lambda: (
+                self.disagg_prefill_transfer_queue
             ),
             get_disagg_decode_prealloc_queue=lambda: self.disagg_decode_prealloc_queue,
             get_disagg_decode_transfer_queue=lambda: self.disagg_decode_transfer_queue,
@@ -2916,62 +2927,18 @@ class Scheduler(
     def get_output_streamer_class(self) -> type[SchedulerOutputStreamer]:
         return SchedulerOutputStreamer
 
-    def defer_response(self, req: Req, completion: ResponseCompletion) -> None:
-        """Hold a finished response until completion; see deferred_output."""
-        if self.disaggregation_mode != DisaggregationMode.NULL:
-            raise ValueError("deferred responses do not support PD disaggregation")
-        if not req.finished() or req.finished_output:
-            raise ValueError("only finished, unstreamed responses can be deferred")
-        if self._deferred_responses is None:
-            self._deferred_responses = {}
-        if req.rid in self._deferred_responses:
-            raise ValueError(f"response {req.rid!r} is already deferred")
-        self._deferred_responses[req.rid] = (req, completion)
-        req.defer_output = True
-        self.output_streamer.defer_outputs = True
-
-    def stream_released_deferred_outputs(self) -> None:
-        ready = []
-        for rid, (req, completion) in list((self._deferred_responses or {}).items()):
-            if not completion.done():
-                continue
-            del self._deferred_responses[rid]
-            req.defer_output = False
-            try:
-                completion.result()
-            except Exception as exc:
-                logger.exception("Deferred response failed for %s", rid)
-                self._abort_deferred_response(
-                    req, FINISH_ABORT(str(exc), status_code=500).to_json()
-                )
-            else:
-                ready.append(req)
-        if ready:
-            self.output_streamer.stream_output(
-                ready, any(req.return_logprob for req in ready)
-            )
-
-    def has_pending_deferred_outputs(self) -> bool:
-        return bool(self._deferred_responses)
-
-    def _abort_deferred_response(
-        self, req: Req, finished_reason: Optional[FinishReasonDict]
-    ) -> None:
-        req.defer_output = False
-        req.finished_output = True
-        self.send_abort_output(
-            _make_abort_req(req, finished_reason=finished_reason), req
+    def init_deferred_responses(self) -> None:
+        self.deferred_responses = DeferredResponses(
+            disaggregation_mode=self.disaggregation_mode,
+            output_streamer=self.output_streamer,
+            send_abort=lambda req, finished_reason: self.send_abort_output(
+                _make_abort_req(req, finished_reason=finished_reason), req
+            ),
         )
 
-    def _abort_deferred_responses(self, recv_req: AbortReq) -> None:
-        for rid, (req, completion) in list((self._deferred_responses or {}).items()):
-            if recv_req.abort_all or rid.startswith(recv_req.rid):
-                del self._deferred_responses[rid]
-                try:
-                    completion.cancel()
-                except Exception:
-                    logger.exception("Failed to cancel deferred work for %s", rid)
-                self._abort_deferred_response(req, recv_req.finished_reason)
+    def defer_response(self, req: Req, completion: ResponseCompletion) -> None:
+        """Hold a finished response until completion; see deferred_output."""
+        self.deferred_responses.defer(req, completion)
 
     def init_beam_coordinator(self) -> None:
         self.beam_coordinator = BeamCoordinator(
@@ -4861,6 +4828,41 @@ class Scheduler(
             if not req.finished()
         ]
 
+    def request_lists(self) -> Dict[str, List[Req]]:
+        """The lists that hold the live requests, by name. A request is in at
+        most one; one that PD prefill or HiSparse launched is in none until its
+        result is processed."""
+        lists = {
+            "waiting": self.waiting_queue,
+            "grammar": self.grammar_manager.grammar_queue,
+            "chunked": [] if self.chunked_req is None else [self.chunked_req],
+            "running": list(self.running_reqs),
+        }
+        # Read at call time: a PD role switch rebuilds the PD queues.
+        if self.disagg_prefill_bootstrap_queue is not None:
+            lists["prefill_bootstrap"] = self.disagg_prefill_bootstrap_queue.queue
+        if self.disagg_prefill_transfer_queue is not None:
+            lists["prefill_transfer"] = self.disagg_prefill_transfer_queue
+        if self.dllm_config is not None:
+            # Its staging queue is the part of this queue the current round runs.
+            lists["dllm"] = self.dllm_manager.waiting_queue
+        components = (
+            self.disagg_decode_prealloc_queue,
+            self.disagg_decode_transfer_queue,
+            self.hisparse_coordinator,
+            self.uocr_runtime,
+            self.deferred_responses,
+        )
+        for component in components:
+            if component is None:
+                continue
+            component_lists = component.request_lists()
+            assert lists.keys().isdisjoint(component_lists), sorted(
+                lists.keys() & component_lists.keys()
+            )
+            lists.update(component_lists)
+        return lists
+
     def _prefill_launch_starts_running(self) -> bool:
         """Whether launching a request's last prefill chunk starts it running: not
         under PD (KV transfer, or the prebuilt merge), HiSparse (after staging) or
@@ -4897,6 +4899,7 @@ class Scheduler(
         self.profiler_manager._profile_batch_predicate(batch)
         batch.add_inflight_step()
         self._join_launched_reqs(batch)
+        self.invariant_checker.maybe_check_request_lists()
 
     def _on_step_processed(self, batch: ScheduleBatch) -> None:
         """The bookkeeping of every step once its result is processed."""
@@ -5548,8 +5551,7 @@ class Scheduler(
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
-        if self._deferred_responses:
-            self.stream_released_deferred_outputs()
+        self.deferred_responses.stream_released()
         # Flush async trace ops here: in overlap mode this CPU work runs while
         # the next batch's GPU forward is in flight, giving free overlap.
         flush_trace_batch(batch.reqs)
@@ -5713,8 +5715,7 @@ class Scheduler(
     def on_idle(self):
         """Idle housekeeping: guard, check, metrics, reset, sleep."""
         self.dp_attn_adapter.drop_sync_wait_carry()
-        if self._deferred_responses:
-            self.stream_released_deferred_outputs()
+        self.deferred_responses.stream_released()
         # Flush any health-check signal deferred while the engine was busy.
         self.maybe_send_health_check_signal()
 
@@ -5739,7 +5740,7 @@ class Scheduler(
                 self.enable_hicache_storage
                 or self.disaggregation_mode != DisaggregationMode.NULL
                 or self.enable_lmcache
-                or self._deferred_responses
+                or self.deferred_responses.has_pending()
             ):
                 # Storage, transfer, and deferred-output workers need the GIL
                 # between I/O calls. Singleton PD polls no longer yield through
@@ -5801,7 +5802,7 @@ class Scheduler(
             self.load_inquirer.get_loads, force=True, snapshot=snapshot
         )
 
-        if self.has_pending_deferred_outputs():
+        if self.deferred_responses.has_pending():
             # Held responses are released by polling, not by a socket event:
             # keep polling, and yield the GIL to the completion's worker.
             time.sleep(0)
@@ -5811,8 +5812,8 @@ class Scheduler(
         self.metrics_reporter.record_scheduler_idle()
 
     def _record_scheduler_state_for_paused_engine(self) -> None:
-        if self._deferred_responses:
-            self.stream_released_deferred_outputs()
+        if self.deferred_responses.has_pending():
+            self.deferred_responses.stream_released()
             time.sleep(0)
         if self.is_fully_idle():
             self.metrics_reporter.record_scheduler_idle()
@@ -5855,7 +5856,7 @@ class Scheduler(
             idle &= len(self.disagg_decode_prealloc_queue.retracted_queue) == 0
 
         if not for_health_check:
-            # Grammar queue and prefill inflight queue may not produce batch
+            # Grammar queue and prefill transfer queue may not produce batch
             # results instantly, but they still indicate the server is not idle.
             idle &= len(self.grammar_manager.grammar_queue) == 0
             idle &= not self.request_receiver.has_pending()
@@ -5864,7 +5865,7 @@ class Scheduler(
                     ignore_waiting=ignore_waiting
                 )
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                idle &= len(self.disagg_prefill_inflight_queue) == 0
+                idle &= len(self.disagg_prefill_transfer_queue) == 0
                 idle &= len(self.disagg_prefill_bootstrap_queue.queue) == 0
 
             if self.disaggregation_mode == DisaggregationMode.DECODE:
@@ -6148,7 +6149,7 @@ class Scheduler(
             *self.collect_inflight_reqs(),
             *self.waiting_queue,
             *([self.chunked_req] if self.chunked_req is not None else []),
-            *(req for req, _ in (self._deferred_responses or {}).values()),
+            *self.deferred_responses.held_reqs(),
         }
         if self.hisparse_coordinator is not None:
             live_reqs.update(
@@ -6178,8 +6179,7 @@ class Scheduler(
         return inflight_batches
 
     def abort_request(self, recv_req: AbortReq):
-        if self._deferred_responses:
-            self._abort_deferred_responses(recv_req)
+        self.deferred_responses.abort(recv_req)
         if (chunked_req := self.chunked_req) is not None:
             if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
                 self._pending_chunked_abort_req = chunked_req
@@ -6271,9 +6271,9 @@ class Scheduler(
                         prepare_abort(req, "Aborted by AbortReq.")
 
             # Abort in-flight requests
-            for req in self.disagg_prefill_inflight_queue:
+            for req in self.disagg_prefill_transfer_queue:
                 if recv_req.abort_all or req.rid.startswith(recv_req.rid):
-                    logger.debug(f"Abort inflight queue request. {req.rid=}")
+                    logger.debug(f"Abort transfer queue request. {req.rid=}")
                     if hasattr(req.disagg_kv_sender, "abort"):
                         req.disagg_kv_sender.abort()
 
@@ -6375,7 +6375,7 @@ class Scheduler(
             # last_batch itself; its requests are already listed above.
             and self.last_batch is not self.running_batch
             # Skip merge for disagg prefill: completed prefill requests are
-            # already in disagg_prefill_inflight_queue. Merging them into
+            # already in disagg_prefill_transfer_queue. Merging them into
             # running_batch leaks them, since the prefill event loop never
             # calls update_running_batch to clean them up.
             and self.disaggregation_mode != DisaggregationMode.PREFILL
@@ -6645,6 +6645,7 @@ class Scheduler(
             "load_inquirer",
             "output_streamer",
             "batch_result_processor",
+            "deferred_responses",
         ):
             comp = getattr(self, name, None)
             if comp is not None and hasattr(comp, "disaggregation_mode"):

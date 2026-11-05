@@ -3594,8 +3594,8 @@ class OpenAIServingChat(OpenAIServingBase):
     ) -> str:
         """Process for generating a new and unique `tool_call_id`"""
         if self.tool_call_parser != "kimi_k2":
-            # A UUID is sufficient except for Kimi-K2, whose template
-            # requires positional functions.<name>:<index> IDs.
+            # A simple uuid is sufficient for all models except Kimi-K2, whose
+            # chat template requires `functions.{name}:{idx}`.
             tool_call_id = f"call_{uuid.uuid4().hex[:24]}"
             return tool_call_id
         tool_call_id = (

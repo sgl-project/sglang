@@ -4,9 +4,9 @@ from typing import Optional
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import (
     cache_once,
-    get_jit_cuda_arch,
     is_arch_support_pdl,
     is_hip_runtime,
     load_jit,
@@ -277,7 +277,8 @@ def topk_transform_candidates_v2(
 
 
 def candidates_cluster_size(rows: int) -> int:
-    if rows <= 0 or is_hip_runtime() or get_jit_cuda_arch().major not in (9, 10):
+    arch = current_arch()
+    if rows <= 0 or is_hip_runtime() or not (arch.is_sm(9) or arch.is_sm(10)):
         return 0
     from sglang.kernels.jit.utils.occupancy import (
         NoSchedulableClustersError,

@@ -21,6 +21,8 @@ import msgspec
 if TYPE_CHECKING:
     import torch
 
+    from sglang.srt.kernel_plugins.nvidia.binding import PreparationView
+
 # bumped on any breaking change to the contracts in this module
 MEGAKERNEL_API_VERSION = 2
 
@@ -277,6 +279,11 @@ class MegakernelSpec(msgspec.Struct, frozen=True):
     Argument resolution checks the served model's spec in full. A spec found only
     at load, e.g. for a draft model, is checked there against its ISA, tp_sizes,
     decode_graph_backends, hf_config, env and model_disable_reasons.
+
+    Optional prepare(built, view) runs after model preparation, once the attention
+    backends and pools exist, before autotune and graph capture. It receives a
+    typed PreparationView rather than the model runner and must be idempotent:
+    preparation may repeat when the warmup lifecycle resets for recapture.
     """
 
     name: str
@@ -294,7 +301,7 @@ class MegakernelSpec(msgspec.Struct, frozen=True):
     tensor_verify_binding_kind: int = 0
     tensor_verify_build: Optional[Callable[[Any, float], BuiltMegakernel]] = None
     # Pool preparation after allocation and before any forward or graph capture.
-    prepare: Optional[Callable[[BuiltMegakernel, Any], None]] = None
+    prepare: Optional[Callable[[BuiltMegakernel, PreparationView], None]] = None
 
 
 # HF architecture -> the "module:attribute" path of its spec
