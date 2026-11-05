@@ -5124,3 +5124,9 @@ parent完成归档318个文件的压缩及解压SHA核验和全部五轮账本�
 实际服务显式使用prefill/decode graph backend=disabled；旧disable_cuda_graph字段为false，已单独保存有效参数及日志证明。Engine启动PYTHONPATH优先使用缓存Mooncake0.3.14，区别于HTTP驱动环境中的其他安装；组件版本、二进制及扩展SHA单独记录。所有Engine操作/读取/保护及Router兴趣、claim、后端不确定状态排空后，逐个核验PID/创建时间/命令并停止本任务Router、两台Engine、Master和三类采样器；端口关闭，GPU0/1无计算进程，其他GPU未操作。报告及复算命令见benchmark/session_kv_control/results/2026-11-05-lifecycle-v2/REPORT.zh-CN.md；原始proof含final-owned-shutdown与final-gpu-idle。
 
 验收资料收紧：将完整资源细项外置、清理凭证保留摘要，减少约9600行生成数据；新增1份cost proof后最终324个归档文件SHA复核通过。原始请求与正式统计未变，新增proof压缩/解压往返一致。仓库保留可直接回放外部归档的校验入口。
+
+### 持续压力：按准入时长运行并完整收尾
+
+用户要求延长单组连续运行时间。新增默认关闭的duration-s：客户端在同一个截止时刻前独立循环，已准入请求继续完成和排空，期间不重置缓存/模型/进程。passes作为有限安全计划容量，任何客户端提前耗尽均判失败，不空等补时。固定时长允许完成数不同，比较吞吐；不再将墙钟差标为等工作量加速。
+
+离线核对每个客户端执行计划连续前缀、无截止后准入、无提前停止及所有已发任务的完整控制账本；兼容不含duration字段的旧manifest。27项本地HTTP/计划/收尾回归通过，18.302s；额外覆盖精确截止、预算耗尽、伪造晚准入、跳过中间任务、缺失/多余控制及旧数据格式。Ruff选择规则和格式检查通过。仅修改压测及离线工具，Engine/Router生产实现未变。证据：duration-parent-tests-final.log。

@@ -68,3 +68,7 @@ python -W error::ResourceWarning -m unittest -v test_lifecycle_bench
 正式归档应同时保存服务源码/dirty 状态、Router 配置的非秘密副本、模型身份、实际池容量、资源采样、Mooncake segment 状态、全部失败/退回与清理记录。`server_before/after` 保留可用的服务信息；物理 GET/PUT 成本必须使用实现提供的计数或独立观测，不从缓存命中 token 数换算为测得带宽。
 
 成本与资源复算使用 `analyze_lifecycle_costs.py --results CELL --resources resources.jsonl --process-resources process-resources.jsonl --output NEW_DIR`，输出 JSON 和配对 CSV。资源与进程参数可重复提供按时间排序的 `.jsonl/.gz` 分片；按实际 arm 边界筛选采样起点，有捕获时长时同时排除跨界采样；CPU 缺少结束时长时明确保留 capture_duration_unknown 和未知边界误差，不声称完整捕获。报告保留采样覆盖、缺口、进程身份变化和未知计数，CPU 不外推到未观测时间，GET bytes 表示寻址的 KV payload，wire bytes 保持未知。GPU 索引由 `--b-gpu-index` 指定，应与启动时的实际物理设备对应。准备就绪后发生 GPU+host 命中不足计为观测失效，不推断发生无效物理传输。该入口保留所有完成请求的时延和轮次配对，正确性账本仍由 `analyze_lifecycle.py` 核验。
+
+持续压力模式使用 `--duration-s 7200`：每个客户端独立保持请求循环，到统一截止时刻停止发新任务，已经发出的请求及控制操作继续收尾。工作区间不重置缓存、成本模型或进程。`--passes` 在此模式中限定安全计划容量，提前耗尽会失败；时长不靠空等补足。配置示例为 `--cases 96 --concurrency 64 --passes 512 --duration-s 7200 --min-arm-seconds 7200`，仍需用实际 Router 预算文件进行元数据容量预检。
+
+固定时长模式的完成请求数可随策略变化。比较有效吞吐及完整延迟，不将两组墙钟差解释为相同工作量加速。离线核对每个客户端执行了计划的连续前缀、没有截止后准入、所有客户端均持续到截止、所有已准入任务都有收尾记录；旧的固定工作量结果继续按完整计划验证。长时间运行还需观察请求队列、L2占用、GET和CPU/GPU活动，持续时长本身不构成饱和证明。

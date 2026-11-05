@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 import lifecycle_bench as lb
 import test_router_bench as router_fixture
-from analyze_lifecycle import analyze
+from analyze_lifecycle import analyze, duration_plan_errors
 
 
 def args_for(**changes):
@@ -62,6 +62,68 @@ def args_for(**changes):
 
 
 class PlanningTests(unittest.TestCase):
+    def test_duration_admission_has_no_barrier_and_counts_work_before_cutoff(self):
+        clock = [0.0]
+
+        def work(item, admitted):
+            clock[0] += 3
+            return (item, admitted)
+
+        rows, exhausted, stopped = lb.execute_lane(
+            range(5), work, deadline=5, clock=lambda: clock[0]
+        )
+        self.assertEqual(rows, [(0, 0), (1, 3)])
+        self.assertFalse(exhausted)
+        self.assertEqual(stopped, 6)
+        rows, exhausted, _ = lb.execute_lane(
+            [0], work, deadline=6, clock=lambda: clock[0]
+        )
+        self.assertEqual(rows, [])
+        self.assertFalse(exhausted)
+        rows, exhausted, _ = lb.execute_lane(
+            [0], work, deadline=20, clock=lambda: clock[0]
+        )
+        self.assertTrue(exhausted)
+        rows, exhausted, _ = lb.execute_lane(range(3), work, clock=lambda: clock[0])
+        self.assertEqual(len(rows), 3)
+        self.assertFalse(exhausted)
+
+    def test_duration_ledger_rejects_skipped_tasks_late_admission_and_idle_clients(
+        self,
+    ):
+        args = args_for(duration_s=10)
+        lanes = [[{"id": f"{lane}-{i}"} for i in range(3)] for lane in range(2)]
+        rows = [
+            {"id": f"{lane}-{i}", "admitted_monotonic": 100 + i}
+            for lane in range(2)
+            for i in range(2)
+        ]
+        recorded = {
+            "started_monotonic": 100,
+            "duration_s": 10,
+            "admission_deadline_monotonic": 110,
+            "lane_stopped_monotonic": [110, 111],
+            "request_work_s": 11,
+            "duration_budget_exhausted_lanes": [],
+        }
+        self.assertEqual(duration_plan_errors(args, lanes, rows, recorded), [])
+        bad = copy.deepcopy(rows)
+        bad[1]["id"] = "0-2"
+        self.assertTrue(duration_plan_errors(args, lanes, bad, recorded))
+        bad = copy.deepcopy(rows)
+        bad[0]["admitted_monotonic"] = 110
+        self.assertTrue(duration_plan_errors(args, lanes, bad, recorded))
+        for changes in (
+            {"lane_stopped_monotonic": [109, 111]},
+            {"duration_budget_exhausted_lanes": [0]},
+            {"request_work_s": 9},
+            {"lane_stopped_monotonic": [None, 111]},
+        ):
+            with self.subTest(changes=changes):
+                self.assertTrue(
+                    duration_plan_errors(args, lanes, rows, {**recorded, **changes})
+                )
+
     def test_replay_keeps_plan_and_cancellation_policy_independent(self):
         args = args_for(
             wait_jitter_s=0.2,
@@ -113,6 +175,9 @@ class PlanningTests(unittest.TestCase):
             {"control_workers": 4, "control_backlog": 2},
             {"via_router": True, "route_change_fraction": 0.1},
             {"cancel_fraction": 1},
+            {"duration_s": float("nan")},
+            {"duration_s": -1},
+            {"duration_s": 1, "cases": 1, "concurrency": 2},
         ):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 lb.validate(args_for(**changes))
@@ -424,6 +489,82 @@ class LifecycleHTTPTests(unittest.TestCase):
             **changes,
         )
 
+    def test_duration_run_drains_all_issued_tasks_and_replays_lane_prefixes(self):
+        args = self.make_args(
+            duration_s=0.5, passes=40, arms=["on_demand", "lifecycle"]
+        )
+        with (
+            patch.dict(os.environ, {args.router_control_key_env: self.state.bearer}),
+            patch.object(
+                lb, "parity", return_value={"fingerprint_b": {"context_length": 1024}}
+            ),
+            patch.object(
+                lb,
+                "build_tokens",
+                side_effect=lambda model, length, seed: ([seed % 100] * length, []),
+            ),
+            patch("builtins.print"),
+        ):
+            self.assertEqual(lb.run(args), 0)
+        checked = analyze(args.output)
+        self.assertTrue(checked["acceptance_passed"], checked["verification"])
+        self.assertIsNone(checked["paired"][0]["wall_change_percent"])
+        self.assertIsNone(checked["paired"][0]["fixed_work_complete"])
+        self.assertEqual(checked["paired"][0]["comparison_mode"], "duration")
+        for arm in checked["arms"]:
+            self.assertGreater(arm["completed"], 0)
+            self.assertLess(arm["completed"], args.cases * args.passes)
+            self.assertGreaterEqual(arm["request_work_s"], args.duration_s)
+            self.assertEqual(arm["duration_budget_exhausted_lanes"], [])
+        self.assertEqual(
+            checked["verification"]["expected_controls"],
+            sum(a["planned_tasks"] for a in checked["arms"]),
+        )
+        path = Path(args.output, checked["arms"][0]["id"] + ".json")
+        original = path.read_text()
+        altered = json.loads(original)
+        altered["rows"][0]["admitted_monotonic"] = altered[
+            "admission_deadline_monotonic"
+        ]
+        path.write_text(json.dumps(altered))
+        self.assertFalse(analyze(args.output)["verification"]["verified"])
+        path.write_text(original)
+        with Path(args.output, "lifecycle-raw.jsonl").open("a") as journal:
+            journal.write(
+                json.dumps(
+                    {
+                        "kind": "lifecycle_control",
+                        "id": "unissued",
+                        "errors": [],
+                        "quiescent": True,
+                        "completed_monotonic": 0,
+                    }
+                )
+                + "\n"
+            )
+        self.assertFalse(analyze(args.output)["verification"]["verified"])
+
+    def test_duration_plan_exhaustion_fails_without_padding_time(self):
+        args = self.make_args(duration_s=10, passes=1, arms=["on_demand"])
+        with (
+            patch.dict(os.environ, {args.router_control_key_env: self.state.bearer}),
+            patch.object(
+                lb, "parity", return_value={"fingerprint_b": {"context_length": 1024}}
+            ),
+            patch.object(
+                lb,
+                "build_tokens",
+                side_effect=lambda model, length, seed: ([seed % 100] * length, []),
+            ),
+            patch("builtins.print"),
+        ):
+            self.assertEqual(lb.run(args), 2)
+        checked = analyze(args.output)
+        self.assertFalse(checked["acceptance_passed"])
+        arm = checked["arms"][0]
+        self.assertLess(arm["request_work_s"], 10)
+        self.assertTrue(arm["duration_budget_exhausted_lanes"])
+
     def test_full_three_arm_run_keeps_input_plan_and_outputs(self):
         args = self.make_args()
         configuration = {"fingerprint_a": {}, "fingerprint_b": {"context_length": 1024}}
@@ -475,6 +616,11 @@ class LifecycleHTTPTests(unittest.TestCase):
         )
         self.assertTrue(recomputed["acceptance_passed"])
         self.assertEqual(recomputed["paired"], result["paired"])
+        manifest_path = Path(args.output, "lifecycle-manifest.json")
+        legacy = json.loads(manifest_path.read_text())
+        legacy["args"].pop("duration_s")
+        manifest_path.write_text(json.dumps(legacy))
+        self.assertTrue(analyze(args.output)["verification"]["verified"])
         # Replaying a manifest field must be verified independently from the
         # generated summary, so a later edited wait cannot silently pass.
         path = Path(args.output, result["arms"][0]["id"] + ".json")

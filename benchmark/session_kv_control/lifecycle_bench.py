@@ -182,6 +182,19 @@ def replay_plan(args):
     return lanes
 
 
+def execute_lane(lane, work, deadline=None, clock=None):
+    """Keep clients active until the deadline; the finite plan is a safety cap."""
+    clock = clock or time.monotonic
+    rows = []
+    for item in lane:
+        admitted = clock()
+        if deadline is not None and admitted >= deadline:
+            break
+        rows.append(work(item, admitted))
+    stopped = clock()
+    return rows, deadline is not None and stopped < deadline, stopped
+
+
 def cases_for_arm(args, material, spec):
     common = int(args.prefix_tokens * args.shared_prefix_fraction)
     common -= common % args.page_size
@@ -768,7 +781,8 @@ def summarize(arms):
         for name, candidate in members.items():
             if name == "on_demand":
                 continue
-            comparable = (
+            duration = bool(base.get("duration_s") or candidate.get("duration_s"))
+            comparable = not duration and (
                 base["expected_effective_tasks"]
                 == candidate["expected_effective_tasks"]
                 and base["completed"] == base["expected_effective_tasks"]
@@ -778,7 +792,8 @@ def summarize(arms):
                 {
                     "block": block,
                     "candidate": name,
-                    "fixed_work_complete": comparable,
+                    "comparison_mode": "duration" if duration else "fixed_work",
+                    "fixed_work_complete": None if duration else comparable,
                     "effective_throughput_change_percent": 100
                     * (
                         candidate["effective_tasks_per_s"]
@@ -787,8 +802,9 @@ def summarize(arms):
                     )
                     if base["effective_tasks_per_s"]
                     else None,
-                    "wall_change_percent": 100
-                    * (candidate["wall_s"] / base["wall_s"] - 1),
+                    "wall_change_percent": None
+                    if duration
+                    else 100 * (candidate["wall_s"] / base["wall_s"] - 1),
                 }
             )
     return {
@@ -809,7 +825,7 @@ def summarize(arms):
         "measurement": "completed non-cancelled simulated rollout tasks matching source output / work wall including registration, tool waits, control backpressure and final drain",
         "trainer_waiting_time": None,
         "limitations": [
-            "closed-loop fixed-work clients; dispatch lateness is recorded, not an open-loop arrival test",
+            "closed-loop clients; fixed work or bounded duration admission; dispatch lateness is recorded, not an open-loop arrival test",
             "natural cache residency permits GPU hits; all hit tiers and repeated prefill are retained",
             "family branches share input ancestry/salt but have independent logical task incarnations",
             "source publication precedes work; complete-job throughput includes it; lab reset is reported separately",
@@ -896,7 +912,8 @@ def run(args):
             "tool_result": "one fixed synthetic token after the published prefix, equal to its final token",
             "fixed_plan": lanes,
             "schedule": schedule,
-            "acceptance": "minimum duration is checked, never padded by idle sleep; identical fixed-work plan in all arms",
+            "execution_mode": "duration" if args.duration_s else "fixed_work",
+            "acceptance": "duration mode executes a per-lane plan prefix until the admission deadline; plan exhaustion fails; fixed-work mode executes the complete plan; never pad by idle sleep",
             "pressure": "optional sampled host usage; only a recent unambiguous pool gauge above threshold asserts pressure",
         }
         write_json(root / "lifecycle-manifest.json", manifest)
@@ -1028,6 +1045,9 @@ def run(args):
                 engine.http.url: cost_snapshot(engine, spec["id"]) for engine in (a, b)
             }
             work_started = time.monotonic()
+            admission_deadline = (
+                work_started + args.duration_s if args.duration_s else None
+            )
             pressure = (
                 PressureSampler(
                     HTTP(args.engine_b, journal, min(5, args.timeout_s), key),
@@ -1041,8 +1061,8 @@ def run(args):
                 pressure.thread.start()
 
             def lane_work(lane):
-                return [
-                    resume_task(
+                def work(item, admitted):
+                    return resume_task(
                         args,
                         a,
                         b,
@@ -1053,20 +1073,20 @@ def run(args):
                             **item,
                             "arm_id": spec["id"],
                             "trial": spec["id"] + "-" + item["id"],
+                            "admitted_monotonic": admitted,
                         },
                         controls,
                         journal,
                         pressure,
                     )
-                    for item in lane
-                ]
+
+                return execute_lane(lane, work, admission_deadline)
 
             try:
                 with futures.ThreadPoolExecutor(max_workers=args.concurrency) as pool:
+                    completed_lanes = list(pool.map(lane_work, lanes))
                     rows = [
-                        row
-                        for lane_rows in pool.map(lane_work, lanes)
-                        for row in lane_rows
+                        row for lane_rows, _, _ in completed_lanes for row in lane_rows
                     ]
                 inference_finished = time.monotonic()
             finally:
@@ -1083,6 +1103,15 @@ def run(args):
                 completed_monotonic=work_started + wall_s,
                 logical_working_set_tokens=working_set,
                 host_capacity_tokens=args.host_capacity_tokens,
+                duration_s=args.duration_s,
+                admission_deadline_monotonic=admission_deadline,
+                duration_budget_exhausted_lanes=[
+                    i
+                    for i, (_, exhausted, _) in enumerate(completed_lanes)
+                    if exhausted
+                ],
+                lane_stopped_monotonic=[end for _, _, end in completed_lanes],
+                plan_capacity_tasks=sum(map(len, lanes)),
                 **source_phase,
             )
             arm["server_before"] = before
@@ -1107,6 +1136,7 @@ def run(args):
                 and arm["meets_minimum_duration"]
                 and arm["meets_minimum_resumes"]
                 and not arm["drain"]["errors"]
+                and not arm["duration_budget_exhausted_lanes"]
                 for arm in arms
             )
             else 2
@@ -1151,6 +1181,12 @@ def parser():
     cli.add_argument("--concurrency", type=int, default=8)
     cli.add_argument("--cases", type=int, default=64)
     cli.add_argument("--passes", type=int, default=2)
+    cli.add_argument(
+        "--duration-s",
+        type=float,
+        default=0,
+        help="continuously admit work for this many seconds per arm; passes bounds the plan and must not exhaust early",
+    )
     cli.add_argument("--blocks", type=int, default=5)
     cli.add_argument("--prefix-tokens", type=int, default=16384)
     cli.add_argument("--output-tokens", type=int, default=32)
@@ -1218,6 +1254,7 @@ def validate(args):
         "prediction_error_s",
         "fixed_lead_s",
         "min_arm_seconds",
+        "duration_s",
     ):
         if not math.isfinite(getattr(args, name)) or getattr(args, name) < 0:
             raise ValueError(name + " must be finite and nonnegative")
@@ -1244,6 +1281,8 @@ def validate(args):
         raise ValueError("route-change replay requires direct controlled destinations")
     if args.cancel_fraction == 1:
         raise ValueError("at least some effective tasks must be planned")
+    if args.duration_s and args.cases < args.concurrency:
+        raise ValueError("duration mode requires at least one case per client")
 
 
 def main():

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Recompute lifecycle fixed-work results and check the archived task ledger."""
+"""Recompute lifecycle results and check the archived task ledger."""
 
 import argparse
 import gzip
 import json
+import math
 from pathlib import Path
 
 from lifecycle_bench import (
@@ -27,10 +28,55 @@ def load_json(path):
         return json.load(source)
 
 
+def duration_plan_errors(args, lanes, rows, recorded):
+    """Check complete issued prefixes, deadline admission and all-client activity."""
+    positions = {
+        item["id"]: (index, offset)
+        for index, lane in enumerate(lanes)
+        for offset, item in enumerate(lane)
+    }
+    actual = [[] for _ in lanes]
+    errors = []
+    start = recorded["started_monotonic"]
+    deadline = start + args.duration_s
+    for row in rows:
+        position = positions.get(row["id"])
+        if position is None:
+            errors.append("unplanned duration task")
+        else:
+            actual[position[0]].append(position[1])
+        admitted = row.get("admitted_monotonic")
+        if (
+            not isinstance(admitted, (int, float))
+            or not math.isfinite(admitted)
+            or not start <= admitted < deadline
+        ):
+            errors.append("task admitted outside duration window")
+    if any(not lane or lane != list(range(len(lane))) for lane in actual):
+        errors.append("duration lane is not a nonempty plan prefix")
+    stops = recorded.get("lane_stopped_monotonic", [])
+    if (
+        len(stops) != len(lanes)
+        or any(
+            not isinstance(end, (int, float))
+            or not math.isfinite(end)
+            or end < deadline
+            for end in stops
+        )
+        or recorded.get("admission_deadline_monotonic") != deadline
+        or recorded.get("duration_s") != args.duration_s
+        or recorded.get("duration_budget_exhausted_lanes", ["unknown"])
+        or recorded.get("request_work_s", 0) < args.duration_s
+    ):
+        errors.append("duration budget exhausted or clients stopped early")
+    return errors
+
+
 def analyze(directory):
     root = Path(directory)
     manifest = load_json(root / "lifecycle-manifest.json")
     args = argparse.Namespace(**manifest["args"])
+    duration = getattr(args, "duration_s", 0)
     expected = {item["id"]: item for lane in manifest["fixed_plan"] for item in lane}
     controls, references, publications, errors = {}, {}, set(), []
     source_records, source_phases, source_calls = {}, {}, {}
@@ -97,9 +143,9 @@ def analyze(directory):
     }
     if publications != expected_publications:
         errors.append("source publication ledger differs from complete plan")
-    if len(controls) != len(expected) * len(schedule):
+    if not duration and len(controls) != len(expected) * len(schedule):
         errors.append("asynchronous control ledger count differs from complete plan")
-    arms = []
+    arms, issued_controls = [], set()
     for spec in manifest["schedule"]:
         path = root / (spec["id"] + ".json")
         if not path.exists() and not Path(str(path) + ".gz").exists():
@@ -107,7 +153,12 @@ def analyze(directory):
             continue
         recorded = load_json(path)
         rows = recorded["rows"]
-        if len(rows) != len(expected) or {row["id"] for row in rows} != set(expected):
+        issued_controls.update(row["trial"] for row in rows)
+        if duration:
+            errors.extend(
+                duration_plan_errors(args, manifest["fixed_plan"], rows, recorded)
+            )
+        elif len(rows) != len(expected) or {row["id"] for row in rows} != set(expected):
             errors.append("task plan differs: " + spec["id"])
         cases = cases_for_arm(args, manifest["input_material"], spec)
         if getattr(args, "reuse_published_sources", False):
@@ -198,12 +249,16 @@ def analyze(directory):
             if recomputed[key] != recorded[key]:
                 errors.append("recomputed " + key + " differs: " + spec["id"])
         arms.append({**recorded, **recomputed})
+    if duration and set(controls) != issued_controls:
+        errors.append("duration control ledger differs from all issued tasks")
     result = summarize(arms)
     result["verification"] = {
         "errors": errors,
         "verified": not errors,
         "archived_controls": len(controls),
-        "expected_controls": len(expected) * len(schedule),
+        "expected_controls": len(issued_controls)
+        if duration
+        else len(expected) * len(schedule),
         "source_reference_cases": len(references),
     }
     result["acceptance_passed"] = (
@@ -216,6 +271,7 @@ def analyze(directory):
             and arm["meets_minimum_duration"]
             and arm["meets_minimum_resumes"]
             and not arm["drain"]["errors"]
+            and not arm.get("duration_budget_exhausted_lanes", [])
             for arm in arms
         )
     )
