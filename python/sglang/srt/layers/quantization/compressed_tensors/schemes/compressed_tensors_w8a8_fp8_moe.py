@@ -20,13 +20,16 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMoEScheme,
 )
-from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
+from sglang.srt.layers.quantization.fp8_utils import (
+    can_use_xpu_fp8_moe,
+    normalize_e4m3fn_to_e4m3fnuz,
+)
 from sglang.srt.layers.quantization.utils import (
     all_close_1d,
     per_tensor_dequantize,
     swap_w13_to_w31,
 )
-from sglang.srt.utils import get_bool_env_var, is_hip, set_weight_attrs
+from sglang.srt.utils import get_bool_env_var, is_hip, is_xpu, set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
@@ -38,6 +41,7 @@ if TYPE_CHECKING:
 __all__ = ["CompressedTensorsW8A8Fp8MoE"]
 
 _is_hip = is_hip()
+_is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _use_aiter:
@@ -356,6 +360,15 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 moe_runner_backend = MoeRunnerBackend.AITER
             else:
                 moe_runner_backend = MoeRunnerBackend.TRITON
+        elif (
+            _is_xpu
+            and moe_runner_backend.is_intel_xpu()
+            and (
+                self.weight_quant.strategy == QuantizationStrategy.CHANNEL
+                or not can_use_xpu_fp8_moe(moe_runner_config, self.weight_block_size)
+            )
+        ):
+            moe_runner_backend = MoeRunnerBackend.TRITON
 
         if (
             moe_runner_backend.is_aiter()
@@ -378,6 +391,42 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         topk_output = dispatch_output.topk_output
 
         moe_runner_config = self.moe_runner_config
+
+        if (
+            _is_xpu
+            and not get_moe_runner_backend().is_triton()
+            and self.weight_quant.strategy != QuantizationStrategy.CHANNEL
+            and can_use_xpu_fp8_moe(moe_runner_config, self.weight_block_size)
+        ):
+            from sgl_kernel import fused_experts
+
+            from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+            topk_weights, topk_ids, _ = topk_output
+            output = fused_experts(
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                topk_weights,
+                topk_ids,
+                b1=getattr(layer, "w13_weight_bias", None),
+                b2=getattr(layer, "w2_weight_bias", None),
+                use_fp8_w8a8=True,
+                w1_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                block_shape=self.weight_block_size if self.block_quant else None,
+                # XPU "gelu" uses the tanh approximation.
+                activation=(
+                    "gelu"
+                    if moe_runner_config.activation == "gelu_tanh"
+                    else moe_runner_config.activation
+                ),
+                routed_scaling_factor=moe_runner_config.routed_scaling_factor,
+                gemm1_alpha=moe_runner_config.gemm1_alpha,
+                gemm1_limit=moe_runner_config.gemm1_clamp_limit,
+                swiglu_limit=moe_runner_config.swiglu_limit,
+            )
+            return StandardCombineInput(hidden_states=output)
 
         if self.runner.runner_backend.is_aiter():
             from sglang.srt.layers.moe.moe_runner.aiter import (

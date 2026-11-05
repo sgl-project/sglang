@@ -15,6 +15,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     scaled_fp8_quant,
     sglang_per_token_group_quant_fp8,
 )
+from sglang.kernels.ops.quantization.fp8_utils import ue8m0_to_fp32
 from sglang.kernels.ops.quantization.int8_kernel import (
     per_token_group_quant_int8,
     per_token_quant_int8,
@@ -594,6 +595,8 @@ def fused_moe_kernel(
                     a_scale_ptrs + offs_ks * stride_ask, mask=token_mask, other=0.0
                 )
                 b_scale = tl.load(b_scale_ptrs + offs_ks * stride_bsk)
+                if use_fp8_w8a8 and b_scale.dtype == tl.uint8:
+                    b_scale = ue8m0_to_fp32(b_scale)
                 if swap_ab:
                     a, b = tl.trans(b, (1, 0)), tl.trans(a, (1, 0))
                     a_scale, b_scale = b_scale, a_scale

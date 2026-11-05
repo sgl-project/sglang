@@ -60,6 +60,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     block_fp8_scale_to_mxfp8_e8m0,
     can_auto_enable_marlin_fp8,
     can_serve_block_fp8_as_mxfp8,
+    can_use_xpu_fp8_moe,
     cutlass_fp8_supported,
     deepgemm_w8a8_block_fp8_linear_with_fallback,
     deepgemm_w8a8_mxfp8_linear_with_fallback,
@@ -2464,10 +2465,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     def _process_mxfp8_moe_weights(self, layer: Module, quantize: bool = True) -> None:
 
         if not (
-            (_is_cuda and get_platform().is_sm100) or (_is_hip and _is_gfx95_supported)
+            (_is_cuda and get_platform().is_sm100)
+            or (_is_hip and _is_gfx95_supported)
+            or _is_xpu
         ):
             raise RuntimeError(
-                "MXFP8 MoE quantization requires SM100 or ROCm gfx95 "
+                "MXFP8 MoE quantization requires SM100, ROCm gfx95, or Intel XPU "
                 "(gfx942 converts MXFP8 to block-fp8 at load instead)."
             )
 
@@ -2626,7 +2629,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             if get_moe_a2a_backend().is_megamoe():
                 w13_q, w13_s = _quantize_canonical(layer.w13_weight.data)
                 w2_q, w2_s = _quantize_canonical(layer.w2_weight.data)
-            elif _is_hip:
+            elif _is_hip or _is_xpu:
                 w13_q, w13_s_u8 = mxfp8_group_quantize(
                     layer.w13_weight.data.contiguous().view(
                         -1, layer.w13_weight.data.shape[-1]
@@ -2676,7 +2679,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     layer.w2_weight.data
                 )
         else:
-            if _is_hip:
+            if _is_hip or _is_xpu:
                 w13_q = layer.w13_weight.data
                 w2_q = layer.w2_weight.data
                 w13_s = layer.w13_weight_scale_inv.data
@@ -3158,6 +3161,17 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 moe_runner_backend = MoeRunnerBackend.AITER
             else:
                 moe_runner_backend = MoeRunnerBackend.TRITON
+        elif (
+            _is_xpu
+            and moe_runner_backend.is_intel_xpu()
+            and not self.is_fp4_expert
+            and not can_use_xpu_fp8_moe(
+                moe_runner_config,
+                self.weight_block_size,
+                use_mxfp8=self.use_mxfp8,
+            )
+        ):
+            moe_runner_backend = MoeRunnerBackend.TRITON
 
         if (
             moe_runner_backend.is_flashinfer_cutlass()
@@ -3286,7 +3300,18 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             if quant_info is not None:
                 return self.runner.run(dispatch_output, quant_info)
 
-        if _is_xpu and not get_moe_runner_backend().is_triton():
+        if (
+            _is_xpu
+            and not get_moe_runner_backend().is_triton()
+            and (
+                self.is_fp4_expert
+                or can_use_xpu_fp8_moe(
+                    moe_runner_config,
+                    self.weight_block_size,
+                    use_mxfp8=self.use_mxfp8,
+                )
+            )
+        ):
             # sgl-kernel-xpu path
             from sgl_kernel import fused_experts
 
@@ -3315,7 +3340,17 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     if self.block_quant
                     else layer.w2_weight_scale
                 ),
-                activation=moe_runner_config.activation,
+                block_shape=(
+                    self.weight_block_size
+                    if self.block_quant and use_fp8_w8a8 and not self.use_mxfp8
+                    else None
+                ),
+                # XPU "gelu" uses the tanh approximation.
+                activation=(
+                    "gelu"
+                    if use_fp8_w8a8 and moe_runner_config.activation == "gelu_tanh"
+                    else moe_runner_config.activation
+                ),
                 routed_scaling_factor=moe_runner_config.routed_scaling_factor,
                 gemm1_alpha=moe_runner_config.gemm1_alpha,
                 gemm1_limit=moe_runner_config.gemm1_clamp_limit,

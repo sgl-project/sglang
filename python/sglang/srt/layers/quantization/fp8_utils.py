@@ -37,6 +37,7 @@ from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
 from sglang.srt.runtime_context import (
     get_exec,
+    get_parallel,
     get_platform,
 )
 from sglang.srt.utils import (
@@ -62,6 +63,7 @@ from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
     from sglang.srt.layers.linear import LinearBase
+    from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +74,9 @@ _is_fp8_fnuz = is_fp8_fnuz()
 _is_gfx95_supported = is_gfx95_supported()
 _is_gfx1250_supported = is_gfx1250_supported()
 _is_musa = is_musa()
+
+if _is_xpu:
+    import sgl_kernel
 
 # gfx1250 (RDNA4) cannot compile the AITER CK quant/GEMM kernels, and even when
 # CK builds it lacks the MFMA/WMMA instructions those kernels rely on. Force the
@@ -813,6 +818,46 @@ def torch_w8a8_block_fp8_linear(
         output_dtype=torch.bfloat16 if input_scale is not None else input.dtype,
     )
     return output.view(*input.shape[:-1], weight.shape[0])
+
+
+def can_use_xpu_fp8_moe(
+    config: MoeRunnerConfig,
+    weight_block_size: Optional[List[int]],
+    *,
+    use_mxfp8: bool = False,
+) -> bool:
+    """Check FP8 layouts and runner options supported by native XPU MoE."""
+    if not get_platform().is_xpu:
+        return False
+
+    valid_block_size = (
+        weight_block_size in (None, [1, 32])
+        if use_mxfp8
+        else weight_block_size in (None, [128, 128])
+    )
+    if not (
+        valid_block_size
+        and not config.apply_router_weight_on_input
+        and not config.no_combine
+        and (config.activation, config.is_gated)
+        in (("silu", True), ("gelu_tanh", True), ("relu2", False))
+    ):
+        return False
+
+    if (
+        config.num_experts is not None
+        and config.num_local_experts is not None
+        and config.num_experts != config.num_local_experts
+    ):
+        return False
+
+    try:
+        if get_parallel().moe_ep_size > 1:
+            return False
+    except (RuntimeError, ValueError):
+        pass
+
+    return sgl_kernel.is_xe2_arch()
 
 
 def prepare_xpu_block_scale_for_scaled_mm(
@@ -2048,6 +2093,29 @@ def mxfp8_group_quantize(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         )
 
         return mxfp8_e4m3_quantize(x)
+    if _is_xpu:
+        from sgl_kernel import sgl_per_token_group_quant_8bit
+
+        fp8_max = torch.finfo(torch.float8_e4m3fn).max
+        q_input = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+        scale_u8 = torch.empty(
+            (x.shape[0], k // 32), device=x.device, dtype=torch.uint8
+        )
+        if x.shape[0] > 0:
+            sgl_per_token_group_quant_8bit(
+                x,
+                q_input,
+                scale_u8,
+                32,
+                1e-10,
+                -fp8_max,
+                fp8_max,
+                True,
+                False,
+                None,
+                False,
+            )
+        return q_input, scale_u8
     downcast_to_mxfp = _get_triton_mxfp8_downcast()
     q_input, scale_u8 = downcast_to_mxfp(x, torch.float8_e4m3fn, axis=1)
     return q_input.contiguous(), scale_u8.contiguous()
