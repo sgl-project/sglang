@@ -185,19 +185,12 @@ def forward_mla_prepare_npu(
                 m.num_local_heads,
                 m.qk_nope_head_dim,
                 m.qk_rope_head_dim,
-                m.quant_config,
+                m.v_head_dim,
             )
-        (
-            q_pe,
-            k_pe,
-            q_nope_out,
-            k_nope,
-            forward_batch,
-            zero_allocator,
-            positions,
-        ) = m.mla_preprocess.forward(
+        outputs = m.mla_preprocess.forward(
             positions, hidden_states, forward_batch, zero_allocator
         )
+        q_pe, k_pe, q_nope_out, k_nope = outputs[:4]
         topk_indices = None
     else:
         q_lora = None
