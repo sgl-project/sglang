@@ -150,12 +150,10 @@ def send_one_prompt(
     # If need image
     if args.image:
         assert args.batch_size == 1 and not args.random_input_len
-        args.prompt = (
-            "Human: Describe this image in a very short sentence.\n\nAssistant:"
-        )
+        prompt = "Human: Describe this image in a very short sentence.\n\nAssistant:"
         image_data = "https://raw.githubusercontent.com/sgl-project/sglang/main/examples/assets/example_image.png"
     elif args.many_images:
-        args.prompt = (
+        prompt = (
             "Human: I have one reference image and many images."
             "Describe their relationship in a very short sentence.\n\nAssistant:"
         )
