@@ -5967,6 +5967,9 @@ class Scheduler(
     def save_sharded_model(self, **kwargs):
         self.weight_updater.save_sharded_model(kwargs)
 
+    def hot_swap_experts(self, **kwargs):
+        self.weight_updater.hot_swap_experts(**kwargs)
+
     def handle_rpc_request(self, recv_req: RpcReqInput):
         # Handle RPC requests
         logger.info(
@@ -6200,6 +6203,9 @@ class Scheduler(
         self.kv_events_publisher.publish_kv_events()
 
     def continue_generation(self, recv_req: ContinueGenerationReqInput):
+        if self.weight_updater.hot_swap_failed:
+            logger.error("Generation remains paused after an unsafe expert replacement")
+            return
         if recv_req.torch_empty_cache:
             before_mb = torch.cuda.memory_reserved() / (1024 * 1024)
             torch.cuda.empty_cache()

@@ -816,6 +816,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.model_update_expected_workers = self.elastic_worker_count
         self.model_update_tmp: List[UpdateWeightFromDiskReqOutput] = []
         self.is_pause = False
+        self.hot_swap_failed = False
         self.is_pause_cond = asyncio.Condition()
         # Future for awaiting pause/continue broadcast confirmation
         self._pause_continue_future: Optional[asyncio.Future] = None
@@ -2440,11 +2441,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             await asyncio.sleep(1.0)
 
     async def continue_generation(self, obj: ContinueGenerationReqInput):
+        if getattr(self, "hot_swap_failed", False):
+            raise RuntimeError(
+                "HOT_SWAP_UNSAFE: generation cannot resume; restart the Engine"
+            )
         if self.tokenizer_ipc_name is not None:
             await self._pause_continue_through_router(obj)
             return
 
         async with self.is_pause_cond:
+            if getattr(self, "hot_swap_failed", False):
+                raise RuntimeError(
+                    "HOT_SWAP_UNSAFE: generation cannot resume; restart the Engine"
+                )
             self.is_pause = False
             await self._async_dispatch_to_scheduler(obj)
             self.is_pause_cond.notify_all()

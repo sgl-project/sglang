@@ -1911,6 +1911,79 @@ class Engine(EngineScoreMixin, EngineBase):
     def save_sharded_model(self, **kwargs):
         self.collective_rpc("save_sharded_model", **kwargs)
 
+    def hot_swap_expert_set(
+        self, keep, *, max_node_staging_bytes=64 * 2**30, memory_reserve_bytes=8 * 2**30
+    ):
+        return self.loop.run_until_complete(
+            self.async_hot_swap_expert_set(
+                keep,
+                max_node_staging_bytes=max_node_staging_bytes,
+                memory_reserve_bytes=memory_reserve_bytes,
+            )
+        )
+
+    async def async_hot_swap_expert_set(
+        self, keep, *, max_node_staging_bytes=64 * 2**30, memory_reserve_bytes=8 * 2**30
+    ):
+        """Drain generation and replace missing experts in existing BF16 physical slots."""
+        from sglang.srt.eplb.expert_profile import load_expert_profile
+        from sglang.srt.eplb.expert_swap import plan_expert_swap
+
+        if self._attached or not isinstance(self.tokenizer_manager, TokenizerManager):
+            raise ValueError("Hot expert replacement requires one owning native Engine")
+        if getattr(self.tokenizer_manager, "hot_swap_failed", False):
+            raise RuntimeError(
+                "HOT_SWAP_UNSAFE: restart the Engine before another expert update"
+            )
+        source = self.server_args.moe_expert_profile
+        if source is None:
+            raise ValueError(
+                "Start the Engine with a physical expert profile before hot replacement"
+            )
+        profile = load_expert_profile(source)
+        current = getattr(self, "_hot_expert_mapping", profile.keep)
+        plan = plan_expert_swap(current, keep, profile.num_experts)
+        started = time.perf_counter()
+        timing = {}
+
+        async def update():
+            manager = self.tokenizer_manager
+            manager.auto_create_handle_loop()
+            async with manager.is_pause_cond:
+                if manager.is_pause:
+                    raise RuntimeError(
+                        "Resume generation before requesting a drained expert replacement"
+                    )
+                async with manager.model_update_lock.writer_lock:
+                    timing["drain_seconds"] = time.perf_counter() - started
+                    flushed = await manager.flush_cache(timeout_s=30.0)
+                    if not flushed.success:
+                        raise RuntimeError(
+                            "The drained pre-update cache flush timed out"
+                        )
+                    try:
+                        self.collective_rpc(
+                            "hot_swap_experts",
+                            requested=[list(row) for row in plan.physical_to_logical],
+                            expected=[list(row) for row in current],
+                            max_node_staging_bytes=max_node_staging_bytes,
+                            memory_reserve_bytes=memory_reserve_bytes,
+                        )
+                    except Exception as error:
+                        if "HOT_SWAP_UNSAFE" in str(error):
+                            manager.hot_swap_failed = True
+                            manager.is_pause = True
+                        raise
+
+        await update()
+        timing["total_seconds"] = time.perf_counter() - started
+        self._hot_expert_mapping = plan.physical_to_logical
+        return {
+            "physical_to_logical_map": [list(row) for row in plan.physical_to_logical],
+            "changes": [dataclasses.asdict(change) for change in plan.changes],
+            **timing,
+        }
+
     # score() and async_score() are provided by EngineScoreMixin
 
 

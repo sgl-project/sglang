@@ -97,6 +97,7 @@ class SchedulerWeightUpdaterManager:
     stashed_model_static_state: Any = None
     # replicated on every TP rank, so a rejected call returns on all ranks before any barrier
     _session: Optional[_WeightUpdateSession] = None
+    hot_swap_failed: bool = False
     tp_cpu_group: Any = field(init=False)
 
     def __post_init__(self) -> None:
@@ -488,6 +489,12 @@ class SchedulerWeightUpdaterManager:
             pattern=params["pattern"],
             max_size=params["max_size"],
         )
+
+    def hot_swap_experts(self, **kwargs):
+        from sglang.srt.eplb.expert_swap_transaction import hot_swap_experts
+
+        with self._observe_weight_load("expert_set"):
+            hot_swap_experts(self, **kwargs)
 
 
 def _export_static_state(model):
