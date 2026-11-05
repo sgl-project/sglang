@@ -1,5 +1,5 @@
-from sglang_simulator.time_predictor.aiconfigurator import (
-    AIConfiguratorTimePredictor,
+from sglang_simulator.time_predictor.aisimulate import (
+    AISimulateTimePredictor,
 )
 from sglang_simulator.time_predictor.base import (
     InferTimePredictor,
@@ -13,7 +13,7 @@ __all__ = (
     ScheduleRequest,
     ScheduleBatch,
     InferTimePredictor,
-    AIConfiguratorTimePredictor,
+    AISimulateTimePredictor,
     MLTimePredictor,
     ReplayTimePredictor,
 )

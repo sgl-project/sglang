@@ -22,11 +22,13 @@ from sglang.srt.layers.attention.linear.gdn_prefill_graph import (
     GDNPrefillGraphMetadata,
 )
 from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace
+from sglang.srt.mem_cache.kv.router import STATE_PART, KVLayerRouter
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 HEADS, V_HEADS, HEAD_DIM, CONV = 2, 4, 128, 4
 DIM = (2 * HEADS + V_HEADS) * HEAD_DIM
@@ -63,14 +65,23 @@ def _layer():
 def _backend(conv_pool, ssm_pool):
     """The production backend on test pools: slot of request i is i + 1."""
     backend = GDNAttnBackend.__new__(GDNAttnBackend)
+    backend.state_pool = None
     cache = SimpleNamespace(conv=[conv_pool], temporal=ssm_pool)
     backend.req_to_token_pool = SimpleNamespace(
-        mamba2_layer_cache=lambda layer_id: cache,
         get_mamba_indices=lambda req_pool_indices: (req_pool_indices + 1).to(
             torch.int32
         ),
-        translate_mamba_indices=lambda indices: indices,
     )
+    backend._state_ids = IdSpace(key=("state", None))
+    pool = SimpleNamespace(layer_transfer_counter=None, start_layer=0)
+    pool.layer_router = KVLayerRouter.from_layer_maps(pool, (), owner="full")
+    pool.layer_router.bind_part(
+        sub_pool="state",
+        part=STATE_PART,
+        view=SimpleNamespace(mamba2_layer_cache=lambda layer_id: cache),
+        indices={0: 0},
+    )
+    backend.token_to_kv_pool = pool
     backend.device = torch.device("cuda")
     backend._mamba_chunk_size = CHUNK
     backend.conv_states_shape = conv_pool.shape
@@ -158,6 +169,17 @@ class TestGDNPrefillGraph(CustomTestCase):
                 meta=meta,
                 forward_batch=batch,
                 cache_indices=self.backend._prefill_graph_cache_indices(batch),
+            )
+        if batch.mamba_track_indices is None:
+            self.assertIsNone(self.backend.state_tracking_indices)
+        else:
+            torch.testing.assert_close(
+                self.backend.state_tracking_indices,
+                batch.mamba_track_indices.to(meta.track_dst.dtype),
+            )
+            self.assertEqual(
+                self.backend.state_tracking_indices.data_ptr(),
+                meta.track_dst.data_ptr(),
             )
 
     def _capture(self):

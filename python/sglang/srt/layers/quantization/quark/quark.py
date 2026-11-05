@@ -299,6 +299,10 @@ _SHARED_EXPERT_BODY_PROJ_SUFFIXES: tuple[str, ...] = (
     "down_proj",
 )
 
+_NAMED_MOE_LAYER = re.compile(
+    r"((?:.+\.)?layers\.\d+)\.mlp\.(?:experts|shared_experts?)(?:\..+)?"
+)
+
 # Model types the online shared-expert MXFP4 conversion is offered on. Qwen3.5
 # and Qwen3.8 share this architecture and the mlp.shared_expert.* -> fused-slot
 # remap the loader hook depends on; text checkpoints report the "_text"
@@ -1276,14 +1280,17 @@ class QuarkConfig(QuantizationConfig):
             else "shared_expert"
         )
 
-        # Compare routed vs shared specs at layer 0 and the draft block (stub module
-        # needed by _find_matched_config; an unmatched name -> ValueError -> cannot fuse).
+        probe_bases = (
+            *_MOE_SHARED_EXPERT_QUANT_LAYER0_BASES,
+            *_MOE_SHARED_EXPERT_QUANT_DRAFT_BASES,
+            *self._named_moe_layers(layer_quant_config),
+        )
+
+        # Compare routed vs shared specs at each probe base (stub module needed by
+        # _find_matched_config; an unmatched name -> ValueError -> cannot fuse).
         lookup_stub = torch.nn.Module()
         try:
-            for base in (
-                _MOE_SHARED_EXPERT_QUANT_LAYER0_BASES
-                + _MOE_SHARED_EXPERT_QUANT_DRAFT_BASES
-            ):
+            for base in probe_bases:
                 moe_name = f"{base}.mlp.experts"
                 moe_cfg = self._find_matched_config(moe_name, lookup_stub)
                 for suffix in _SHARED_EXPERT_BODY_PROJ_SUFFIXES:
@@ -1295,6 +1302,23 @@ class QuarkConfig(QuantizationConfig):
             return False
 
         return True
+
+    def _named_moe_layers(self, layer_quant_config: dict[str, Any]) -> list[str]:
+        """Target decoder layers whose routed or shared experts are named.
+
+        Layer 0 is a dense MLP in some architectures (DeepSeek-V3, MiniMax-M3),
+        where both of its lookups fall back to the global spec and agree whatever
+        the MoE layers hold. Each named layer can carry its own spec, so all of
+        them are probed. Draft-stack entries say nothing about the target.
+        """
+        return sorted(
+            {
+                match.group(1)
+                for name in layer_quant_config
+                if (match := _NAMED_MOE_LAYER.fullmatch(name))
+                and not self._is_draft_layer(name)
+            }
+        )
 
 
 class QuarkLinearMethod(LinearMethodBase):
