@@ -43,6 +43,7 @@ from sglang.srt.managers.mm_utils import (
     pad_mm_tokens,
 )
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.forward_mode import ForwardMode
@@ -58,7 +59,7 @@ from sglang.srt.models.gemma4_causal import (
 )
 from sglang.srt.models.gemma4_vision import Gemma4VisionEncoder
 from sglang.srt.multimodal.modality import Modality
-from sglang.srt.runtime_context import get_mm, get_parallel
+from sglang.srt.runtime_context import get_exec, get_mm, get_parallel
 from sglang.srt.utils import (
     add_prefix,
     cpu_has_amx_support,
@@ -193,6 +194,10 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         self.enable_multimodal = bool(get_mm().enable_multimodal)
 
         text_config = config.text_config
+
+        if text_config.num_kv_shared_layers > 0:
+            # E2B/E4B reuse KV-cache layer IDs, which prefill graph indexing rejects.
+            get_exec().graph.cuda_graph_config.prefill.backend = Backend.DISABLED
 
         prefix = add_prefix("model", prefix)
 
