@@ -265,8 +265,11 @@ class _VideoSparseAttentionBackendResolver(_CudaAttentionBackendResolver):
 
 
 # The vendored Triton tile-64 kernel is written against Hopper and Blackwell
-# block-sparse geometry; older architectures fail closed.
-VSA_H3_CAPABILITIES = frozenset({(9, 0), (10, 0), (10, 3)})
+# block-sparse geometry. sm80 (A100) is supported too: there the kernel selects
+# a raw-pointer load path, because Triton does not lower TMA descriptor loads
+# natively before Hopper (see vsa_h3_kernels.py). Older architectures still
+# fail closed.
+VSA_H3_CAPABILITIES = frozenset({(8, 0), (9, 0), (10, 0), (10, 3)})
 
 
 class _VideoSparseAttentionH3BackendResolver(_CudaAttentionBackendResolver):
@@ -282,9 +285,9 @@ class _VideoSparseAttentionH3BackendResolver(_CudaAttentionBackendResolver):
         if capability_tuple not in cls.supported_capabilities:
             found = capability.as_version_str() if capability else "unknown"
             raise ValueError(
-                "VSA-H3 (video_sparse_attn_h3) needs compute capability 9.0 "
-                "(Hopper), 10.0 (B200 / GB200) or 10.3 (B300 / GB300); "
-                f"this device reports {found}."
+                "VSA-H3 (video_sparse_attn_h3) needs compute capability 8.0 "
+                "(A100), 9.0 (Hopper), 10.0 (B200 / GB200) or 10.3 "
+                f"(B300 / GB300); this device reports {found}."
             )
         try:
             from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn_h3 import (  # noqa: F401
@@ -596,19 +599,16 @@ class CudaPlatformBase(Platform):
         return torch.device(f"cuda:{envs.LOCAL_RANK}")
 
     @classmethod
-    def get_device_capability(cls, device_id: int = 0) -> DeviceCapability | None:
-        raise NotImplementedError
+    def synchronize(cls) -> None:
+        torch.cuda.synchronize()
 
     @classmethod
-    def is_async_output_supported(cls, enforce_eager: bool | None) -> bool:
-        if enforce_eager:
-            logger.warning(
-                "To see benefits of async output processing, enable CUDA "
-                "graph. Since, enforce-eager is enabled, async output "
-                "processor cannot be used"
-            )
-            return False
-        return True
+    def empty_cache(cls) -> None:
+        torch.cuda.empty_cache()
+
+    @classmethod
+    def get_device_capability(cls, device_id: int = 0) -> DeviceCapability | None:
+        raise NotImplementedError
 
     @classmethod
     @lru_cache(maxsize=1)
@@ -779,7 +779,11 @@ class CudaPlatformBase(Platform):
                 )
 
                 supported_sizes = FlashAttentionBackend.get_supported_head_sizes()
-                if head_size not in supported_sizes:
+                # FA4 on sm100 serves every multiple of 8 up to 128, e.g. Qwen-VL vision heads (72, 80)
+                fa4_head_size = (
+                    cls.is_blackwell() and head_size <= 128 and head_size % 8 == 0
+                )
+                if head_size not in supported_sizes and not fa4_head_size:
                     logger.info(
                         "Cannot use FlashAttention backend for head size %d.",
                         head_size,
@@ -848,11 +852,12 @@ class CudaPlatformBase(Platform):
     @classmethod
     def optimize_vae(cls, vae: torch.nn.Module) -> torch.nn.Module:
         """Install the quality-gated FLUX.2 / AutoencoderKL / Wan / Qwen-Image /
-        MiniMax-H3 VAE decoder fast paths.
+        MiniMax-H3 VAE fast paths.
 
         Requests with quality="lossless" or "high" run the fast paths; the
         "exact" default runs the original module path bit-for-bit. See
-        flux2_vae_cuda_opt and wan_vae_cuda_opt for details.
+        flux2_vae_cuda_opt, wan_vae_cuda_opt and minimax_h3_vae_cuda_opt for
+        details.
         """
         try:
             from sglang.multimodal_gen.runtime.models.vaes.flux2_vae_cuda_opt import (

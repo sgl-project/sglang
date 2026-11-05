@@ -25,9 +25,21 @@ from __future__ import annotations
 
 from typing import Callable, TypeVar
 
+import torch
+
+from sglang.kernels.arch import current_arch
+
 F = TypeVar("F", bound=Callable)
 
-_CUDA_LIKE = frozenset({"cuda", "hip"})
+
+def is_cuda_sm_at_least(
+    min_sm: tuple[int, int], device: torch.device | int | None = None
+) -> bool:
+    """True on NVIDIA CUDA when the GPU's compute capability is >= ``min_sm``.
+
+    ``device`` is ignored: all GPUs of a node are assumed to be the same model.
+    """
+    return current_arch().is_sm_at_least(*min_sm)
 
 
 def platform_key() -> str:
@@ -70,11 +82,6 @@ def is_xpu() -> bool:
     from sglang.multimodal_gen.runtime.platforms import current_platform
 
     return current_platform.is_xpu()
-
-
-def has_triton() -> bool:
-    """True when the live device runs the Triton implementations."""
-    return platform_key() in _CUDA_LIKE
 
 
 def lazy_fallback(kind: str, name: str) -> Callable:

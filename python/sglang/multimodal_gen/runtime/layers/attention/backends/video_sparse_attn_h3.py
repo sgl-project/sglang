@@ -19,6 +19,14 @@ under a FLOP-matched budget ("compete"). The compression branch is gated by
 ``to_gate_compress``: base H3 has no such weights and the gate loads as
 zeros (pure sparse); VSA-distilled students (FastH3) ship trained gates
 that activate the branch.
+
+Ref2VA interleaves reference videos with dense rows. Each reference video is
+its own 3-D tiled region; every video query keeps its own top-k of EACH
+region (references at ``ref_keep_rate``, the generated video at the step
+sparsity), FastVideo's "p2_multi_region" policy. Checkpoints trained on
+128-token (4, 4, 8) tiles select and compress at that logical granularity;
+each logical tile runs as two contiguous 64-token kernel tiles, so the
+selected key set is unchanged.
 """
 
 import functools
@@ -50,83 +58,121 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.vsa_h3_kernels impo
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
-# The FastH3 checkpoints are trained and served at the 64-token (4, 4, 4)
-# tile geometry; the kernel block size matches it exactly.
+# The kernels run 64-token blocks. FastH3 is trained on (4, 4, 4) tiles;
+# FastH3 Omni on 128-token (4, 4, 8) tiles, each served as two kernel blocks.
 VSA_H3_TILE_SHAPE = (4, 4, 4)
 VSA_H3_TILE_ELEMS = math.prod(VSA_H3_TILE_SHAPE)
+VSA_H3_TILE_SHAPES = {64: VSA_H3_TILE_SHAPE, 128: (4, 4, 8)}
 
 _DIT_BLOCK_PREFIX = re.compile(r"^blocks\.(\d+)\.")
 
+PackedSegment = int | tuple[int, int, int]
+
 
 @functools.lru_cache(maxsize=8)
+def _h3_segment_tile_geometry(
+    segments: tuple[PackedSegment, ...],
+    tile_shape: tuple[int, int, int],
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, tuple[tuple[int, int], ...]]:
+    """Tile a packed sequence of interleaved dense segments and video regions.
+
+    ``segments`` lists the packed order: an ``int`` is a dense segment's row
+    count, a ``(t, h, w)`` triple one video region's token grid. Dense
+    segments are chunked into the leading prefix tiles (never straddling a
+    segment boundary); each region follows as a contiguous run of 3-D tiles.
+
+    Returns, at kernel (64-token block) granularity, (variable_block_sizes
+    int32 [n_blocks], pack_index int32 [S_pad]: padded position -> packed row
+    or -1, unpack_index int32 [used]: packed row -> padded position), then
+    num_prefix_tiles and the per-region [start, end) spans in logical tiles.
+    A 128-token logical tile is two consecutive kernel blocks; its upper half
+    is empty when the tile holds at most 64 rows.
+    """
+    tile_elems = math.prod(tile_shape)
+    split = tile_elems // VSA_H3_TILE_ELEMS
+
+    prefix_sizes: list[int] = []
+    prefix_rows: list[torch.Tensor] = []
+    video_entries: list[tuple[int, tuple[int, int, int]]] = []
+    cursor = 0
+    for segment in segments:
+        if isinstance(segment, tuple):
+            video_entries.append((cursor, segment))
+            cursor += math.prod(segment)
+            continue
+        full, remainder = divmod(segment, tile_elems)
+        prefix_sizes.extend([tile_elems] * full)
+        if remainder:
+            prefix_sizes.append(remainder)
+        prefix_rows.append(
+            torch.arange(cursor, cursor + segment, device=device, dtype=torch.long)
+        )
+        cursor += segment
+    num_prefix_tiles = len(prefix_sizes)
+
+    video_rows: list[torch.Tensor] = []
+    size_parts = [torch.tensor(prefix_sizes, dtype=torch.long, device=device)]
+    spans: list[tuple[int, int]] = []
+    tile_cursor = num_prefix_tiles
+    for start, grid in video_entries:
+        num_tiles = tuple(math.ceil(n / t) for n, t in zip(grid, tile_shape))
+        sizes = construct_variable_block_sizes(grid, num_tiles, device, tile_shape)
+        video_rows.append(get_tile_partition_indices(grid, tile_shape, device) + start)
+        size_parts.append(sizes.to(torch.long))
+        spans.append((tile_cursor, tile_cursor + int(sizes.numel())))
+        tile_cursor += int(sizes.numel())
+
+    tile_partition_indices = torch.cat(prefix_rows + video_rows)
+    logical_sizes = torch.cat(size_parts)
+    non_pad_index = get_non_pad_index(logical_sizes, tile_elems)
+    if (
+        int(logical_sizes.sum()) != cursor
+        or non_pad_index.numel() != cursor
+        or tile_partition_indices.numel() != cursor
+    ):
+        raise ValueError(
+            f"VSA-H3 tile geometry mismatch for segments={segments}, "
+            f"tile={tile_shape}: sizes sum {int(logical_sizes.sum())}, non-pad "
+            f"{non_pad_index.numel()}, expected {cursor}."
+        )
+
+    # A logical tile's padded slots are its kernel blocks' slots in order,
+    # so the pack/unpack maps are shared; only the per-block sizes split.
+    seq_pad = logical_sizes.numel() * tile_elems
+    pack_index = torch.full((seq_pad,), -1, dtype=torch.int32, device=device)
+    pack_index[non_pad_index] = tile_partition_indices.to(torch.int32)
+    unpack_index = torch.empty(cursor, dtype=torch.int32, device=device)
+    unpack_index[tile_partition_indices] = non_pad_index.to(torch.int32)
+    offsets = torch.arange(split, device=device) * VSA_H3_TILE_ELEMS
+    block_sizes = (
+        (logical_sizes[:, None] - offsets).clamp(0, VSA_H3_TILE_ELEMS).flatten()
+    )
+    return (
+        block_sizes.to(torch.int32),
+        pack_index,
+        unpack_index,
+        num_prefix_tiles,
+        tuple(spans),
+    )
+
+
 def _h3_tile_geometry(
     prefix_segments: tuple[int, ...],
     dit_seq_shape: tuple[int, int, int],
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
-    """Segment-pure prefix chunks, then video tiles.
+    """Segment-pure prefix chunks, then the generated video's 64-token tiles.
 
-    Returns (variable_block_sizes int32 [n_tiles], pack_index int32 [S_pad]:
-    padded position -> packed row or -1, unpack_index int32 [used]: packed row
-    -> padded position, num_prefix_tiles, num_video_tiles).
+    Returns (variable_block_sizes, pack_index, unpack_index,
+    num_prefix_tiles, num_video_tiles).
     """
-    prefix_len = sum(prefix_segments)
-
-    prefix_sizes: list[int] = []
-    for segment in prefix_segments:
-        full, remainder = divmod(segment, VSA_H3_TILE_ELEMS)
-        prefix_sizes.extend([VSA_H3_TILE_ELEMS] * full)
-        if remainder:
-            prefix_sizes.append(remainder)
-    num_prefix_tiles = len(prefix_sizes)
-
-    num_tiles = (
-        math.ceil(dit_seq_shape[0] / VSA_H3_TILE_SHAPE[0]),
-        math.ceil(dit_seq_shape[1] / VSA_H3_TILE_SHAPE[1]),
-        math.ceil(dit_seq_shape[2] / VSA_H3_TILE_SHAPE[2]),
-    )
-    video_sizes = construct_variable_block_sizes(dit_seq_shape, num_tiles, device)
-    num_video_tiles = int(video_sizes.numel())
-
-    video_indices = (
-        get_tile_partition_indices(dit_seq_shape, VSA_H3_TILE_SHAPE, device)
-        + prefix_len
-    )
-    tile_partition_indices = torch.cat(
-        [
-            torch.arange(prefix_len, device=device, dtype=torch.long),
-            video_indices,
-        ]
-    )
-    variable_block_sizes = torch.cat(
-        [
-            torch.tensor(prefix_sizes, dtype=torch.long, device=device),
-            video_sizes.to(torch.long),
-        ]
-    )
-    non_pad_index = get_non_pad_index(variable_block_sizes, VSA_H3_TILE_ELEMS)
-
-    total = prefix_len + math.prod(dit_seq_shape)
-    sizes_sum = int(variable_block_sizes.sum())
-    if sizes_sum != total or non_pad_index.numel() != total:
-        raise ValueError(
-            f"VSA-H3 tile geometry mismatch for prefix={prefix_segments}, "
-            f"video={dit_seq_shape}: sizes sum {sizes_sum}, non-pad "
-            f"{non_pad_index.numel()}, expected {total}."
+    sizes, pack_index, unpack_index, num_prefix_tiles, spans = (
+        _h3_segment_tile_geometry(
+            (*prefix_segments, tuple(dit_seq_shape)), VSA_H3_TILE_SHAPE, device
         )
-
-    seq_pad = variable_block_sizes.numel() * VSA_H3_TILE_ELEMS
-    pack_index = torch.full((seq_pad,), -1, dtype=torch.int32, device=device)
-    pack_index[non_pad_index] = tile_partition_indices.to(torch.int32)
-    unpack_index = torch.empty(total, dtype=torch.int32, device=device)
-    unpack_index[tile_partition_indices] = non_pad_index.to(torch.int32)
-    return (
-        variable_block_sizes.to(torch.int32),
-        pack_index,
-        unpack_index,
-        num_prefix_tiles,
-        num_video_tiles,
     )
+    return sizes, pack_index, unpack_index, num_prefix_tiles, spans[0][1] - spans[0][0]
 
 
 class VideoSparseAttentionH3Backend(AttentionBackend):
@@ -160,15 +206,31 @@ class VideoSparseAttentionH3Metadata(AttentionMetadata):
     num_prefix_tiles: int
     num_video_tiles: int
     exempt: bool
+    # Kernel (64-token block) granularity; a 128-token logical tile is two
+    # consecutive blocks. Tile counts above are logical.
     variable_block_sizes: torch.Tensor
     pack_index: torch.Tensor
     unpack_index: torch.Tensor
     dense_layers: tuple[int, ...] = ()
     workspace_cache: dict = field(default_factory=dict)
+    tile_elems: int = VSA_H3_TILE_ELEMS
+    # Logical-tile [start, end) per video region, the generated video last,
+    # with each region's sparsity. None: the generated video alone, at
+    # VSA_sparsity.
+    video_tile_spans: tuple[tuple[int, int], ...] | None = None
+    span_sparsities: tuple[float, ...] | None = None
 
     @property
     def num_tiles(self) -> int:
         return self.num_prefix_tiles + self.num_video_tiles
+
+    @property
+    def blocks_per_tile(self) -> int:
+        return self.tile_elems // VSA_H3_TILE_ELEMS
+
+    @property
+    def uses_regions(self) -> bool:
+        return self.video_tile_spans is not None
 
 
 class VideoSparseAttentionH3MetadataBuilder(AttentionMetadataBuilder):
@@ -186,14 +248,50 @@ class VideoSparseAttentionH3MetadataBuilder(AttentionMetadataBuilder):
         exempt: bool = True,
         dense_layers: tuple[int, ...] = (),
         dense_first_n_steps: int = 0,
+        packed_segments: tuple[PackedSegment, ...] | None = None,
+        tile_size: int = VSA_H3_TILE_ELEMS,
+        ref_keep_rate: float | None = None,
         **kwargs: dict[str, Any],
     ) -> VideoSparseAttentionH3Metadata:
+        """``packed_segments`` replaces ``prefix_segments`` for layouts with
+        reference videos: the packed order of dense row counts and video
+        token grids, ending with the generated video's grid. Every earlier
+        grid is a reference region kept at ``ref_keep_rate``."""
         dit_seq_shape = (
             raw_latent_shape[0] // patch_size[0],
             raw_latent_shape[1] // patch_size[1],
             raw_latent_shape[2] // patch_size[2],
         )
-        prefix_segments = tuple(int(s) for s in prefix_segments if s > 0)
+        tile_shape = VSA_H3_TILE_SHAPES.get(int(tile_size))
+        if tile_shape is None:
+            raise ValueError(
+                f"VSA-H3 tile_size must be one of {sorted(VSA_H3_TILE_SHAPES)}, "
+                f"got {tile_size!r}"
+            )
+        if packed_segments is None:
+            packed_segments = (*prefix_segments, dit_seq_shape)
+        segments = tuple(
+            tuple(int(v) for v in s) if isinstance(s, tuple) else int(s)
+            for s in packed_segments
+            if isinstance(s, tuple) or s > 0
+        )
+        if not segments or segments[-1] != dit_seq_shape:
+            raise ValueError(
+                f"VSA-H3 packed segments must end with the generated video "
+                f"{dit_seq_shape}, got {segments}"
+            )
+        num_references = sum(isinstance(s, tuple) for s in segments) - 1
+        if num_references:
+            if ref_keep_rate is None or not 0.0 < float(ref_keep_rate) <= 1.0:
+                raise ValueError(
+                    f"VSA-H3 with {num_references} reference-video region(s) "
+                    f"needs vsa_ref_keep_rate in (0, 1], got {ref_keep_rate!r}"
+                )
+            if not exempt:
+                raise ValueError(
+                    "vsa_mode='compete' supports only the generated-video "
+                    "region; use vsa_mode='exempt' with reference videos"
+                )
         if current_timestep < dense_first_n_steps:
             VSA_sparsity = 0.0
 
@@ -202,27 +300,81 @@ class VideoSparseAttentionH3MetadataBuilder(AttentionMetadataBuilder):
             pack_index,
             unpack_index,
             num_prefix_tiles,
-            num_video_tiles,
-        ) = _h3_tile_geometry(prefix_segments, dit_seq_shape, device)
+            spans,
+        ) = _h3_segment_tile_geometry(segments, tile_shape, device)
 
+        regional = num_references > 0 or tile_shape != VSA_H3_TILE_SHAPE
+        span_sparsities = None
+        if regional:
+            span_sparsities = (1.0 - float(ref_keep_rate or 1.0),) * num_references
+            span_sparsities += (float(VSA_sparsity),)
         return VideoSparseAttentionH3Metadata(
             current_timestep=current_timestep,
             VSA_sparsity=float(VSA_sparsity),
-            total_seq_length=sum(prefix_segments) + math.prod(dit_seq_shape),
+            total_seq_length=sum(
+                math.prod(s) if isinstance(s, tuple) else s for s in segments
+            ),
             num_prefix_tiles=num_prefix_tiles,
-            num_video_tiles=num_video_tiles,
+            num_video_tiles=spans[-1][1] - num_prefix_tiles,
             exempt=exempt,
             variable_block_sizes=variable_block_sizes,
             pack_index=pack_index,
             unpack_index=unpack_index,
             dense_layers=tuple(int(layer) for layer in dense_layers),
             workspace_cache=self._workspace_cache,
+            tile_elems=math.prod(tile_shape),
+            video_tile_spans=spans if regional else None,
+            span_sparsities=span_sparsities,
         )
 
 
 def _compute_topk(sparsity: float, num_video_tiles: int) -> int:
     keep = math.ceil((1.0 - sparsity) * num_video_tiles)
     return max(1, min(keep, num_video_tiles))
+
+
+def _region_tile_lists(
+    scores: torch.Tensor,
+    num_prefix_tiles: int,
+    spans: tuple[tuple[int, int], ...],
+    sparsities: tuple[float, ...],
+) -> torch.Tensor:
+    """scores [H, n_tiles, n_tiles] -> ascending int32 logical kv-tile lists
+    [H, num_video_tiles, width]: every prefix tile, then each region's own
+    top-k (the whole region when its budget covers it)."""
+    prefix = num_prefix_tiles
+    video_rows = scores[:, prefix:, :]
+    parts = [
+        torch.arange(prefix, device=scores.device).expand(
+            *video_rows.shape[:-1], prefix
+        )
+    ]
+    for (start, end), sparsity in zip(spans, sparsities):
+        keep = _compute_topk(sparsity, end - start)
+        if keep == end - start:
+            parts.append(
+                torch.arange(start, end, device=scores.device).expand(
+                    *video_rows.shape[:-1], keep
+                )
+            )
+            continue
+        picked = video_rows[..., start:end].topk(keep, dim=-1).indices
+        parts.append(picked.sort(dim=-1).values + start)
+    return torch.cat(parts, dim=-1).to(torch.int32)
+
+
+def _pool_logical_tiles(
+    pooled: torch.Tensor, meta: VideoSparseAttentionH3Metadata
+) -> torch.Tensor:
+    """Kernel-block means [3, H, n_blocks, D] -> logical-tile means."""
+    split = meta.blocks_per_tile
+    if split == 1:
+        return pooled
+    sizes = meta.variable_block_sizes.view(-1, split).to(torch.float32)
+    blocks = pooled.unflatten(2, (-1, split))
+    # Empty upper halves pool to 0/0; they carry no weight.
+    weighted = torch.where(sizes[..., None] > 0, blocks * sizes[..., None], 0.0)
+    return weighted.sum(3) / sizes.sum(-1)[:, None]
 
 
 def _topk_tile_lists(
@@ -266,6 +418,8 @@ def _workspace_key(
         meta.num_tiles,
         meta.num_prefix_tiles,
         meta.exempt,
+        meta.tile_elems,
+        meta.uses_regions,
         heads,
         head_dim,
         has_gate,
@@ -276,10 +430,11 @@ def _workspace_key(
 
 class _Workspace:
     """Per-geometry scratch: tiled q/k/v(/gate) [3|4, H, S_pad, D], pooled fp32
-    tile means [3, H, n_tiles, D], and the kernel index lists (prefix rows and
-    prefix columns are static; only the top-k video columns change per layer).
-    The native kernel pairs query tiles, so the tile axis is padded to an even
-    count with one empty tile.
+    block means [3, H, n_blocks, D], and the kernel index lists (prefix rows
+    and prefix columns are static; only the top-k video columns change per
+    layer). All of it is at kernel-block granularity. The native kernel pairs
+    query blocks, so the block axis is padded to an even count with one empty
+    block.
     """
 
     def __init__(
@@ -291,7 +446,7 @@ class _Workspace:
         dtype: torch.dtype,
         device: torch.device,
     ) -> None:
-        n_tiles = meta.num_tiles
+        n_tiles = int(meta.variable_block_sizes.numel())
         self.n_tiles = n_tiles
         self.use_sm100_kernel = can_use_vsa_block_sparse_sm100(
             device.index, dtype, head_dim
@@ -321,7 +476,7 @@ class _Workspace:
         self.dense_num[:, :n_tiles] = n_tiles
         self.q2k_index = self.dense_index.clone()
         self.q2k_num = self.dense_num.clone()
-        num_video_tiles = meta.num_video_tiles
+        num_video_tiles = 0 if meta.uses_regions else meta.num_video_tiles
         # Zeroed scratch for the exempt top-k compaction; kept zero between uses.
         self.topk_mask = torch.zeros(
             (heads, num_video_tiles, num_video_tiles), dtype=torch.int8, device=device
@@ -339,7 +494,7 @@ class _Workspace:
 def _gate_tile_index(
     meta: VideoSparseAttentionH3Metadata, row_start: int, num_rows: int
 ) -> torch.Tensor:
-    """Tile of each packed row in the shard, -1 for pad rows."""
+    """Kernel block of each packed row in the shard, -1 for pad rows."""
     key = ("gate_tile_index", row_start, num_rows)
     tile_index = meta.workspace_cache.get(key)
     if tile_index is None:
@@ -390,6 +545,8 @@ def _select_kv_lists(
     sparsity: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Kernel index lists for this layer: dense, or top-k video columns."""
+    if meta.uses_regions:
+        return _select_region_kv_lists(ws, meta, scores, sparsity)
     keep = _compute_topk(sparsity, meta.num_video_tiles)
     if sparsity <= 0.0 or keep >= meta.num_video_tiles:
         return ws.dense_index, ws.dense_num
@@ -412,6 +569,36 @@ def _select_kv_lists(
         ),
         meta.num_prefix_tiles,
     )
+
+
+def _select_region_kv_lists(
+    ws: _Workspace,
+    meta: VideoSparseAttentionH3Metadata,
+    scores: torch.Tensor | None,
+    sparsity: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-region top-k over logical tiles, expanded to kernel blocks."""
+    spans = meta.video_tile_spans
+    sparsities = meta.span_sparsities
+    # Dense steps and layers keep every region dense.
+    if sparsity <= 0.0:
+        return ws.dense_index, ws.dense_num
+    if all(
+        _compute_topk(s, end - start) == end - start
+        for (start, end), s in zip(spans, sparsities)
+    ):
+        return ws.dense_index, ws.dense_num
+    lists = _region_tile_lists(scores, meta.num_prefix_tiles, spans, sparsities)
+    split = meta.blocks_per_tile
+    if split > 1:
+        offsets = torch.arange(split, device=lists.device, dtype=lists.dtype)
+        lists = (lists[..., None] * split + offsets).flatten(-2)
+        lists = lists.repeat_interleave(split, dim=1)
+    prefix_blocks = meta.num_prefix_tiles * split
+    width = lists.shape[-1]
+    ws.q2k_index[:, prefix_blocks : ws.n_tiles, :width] = lists
+    ws.q2k_num[:, prefix_blocks : ws.n_tiles] = width
+    return ws.q2k_index, ws.q2k_num
 
 
 class VideoSparseAttentionH3Impl(AttentionImpl):
@@ -524,7 +711,7 @@ class VideoSparseAttentionH3Impl(AttentionImpl):
             ws.tiled,
             ws.pooled,
         )
-        q_pooled, k_pooled, v_pooled = ws.pooled
+        q_pooled, k_pooled, v_pooled = _pool_logical_tiles(ws.pooled, meta)
 
         scores = None
         if sparsity > 0.0 or needs_compress:
@@ -547,6 +734,12 @@ class VideoSparseAttentionH3Impl(AttentionImpl):
         out_compress = None
         if needs_compress:
             out_compress = torch.matmul(torch.softmax(scores, dim=-1), v_pooled)
+            if meta.blocks_per_tile > 1:
+                # The gate folds per kernel block; both halves of a logical
+                # tile share its compressed row.
+                out_compress = out_compress.repeat_interleave(
+                    meta.blocks_per_tile, dim=1
+                )
 
         result = torch.empty(query.shape, dtype=query.dtype, device=query.device)
         vsa_h3_untile(

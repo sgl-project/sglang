@@ -1,6 +1,5 @@
-// Instantiated from the cookbook-add-model config template. The non-Spark
-// source recipes were exercised on dev @ 2c7511f6f7cf1cdf9ae568ad0fb25f291edb10da.
-// Public HF IDs and the planned Docker image still need verification.
+// Instantiated from the cookbook-add-model config template. Benchmark entries
+// identify the checkpoint and runtime used for each score.
 
 export const config = {
   modelName: "Nemotron 3.5 Super VL",
@@ -185,7 +184,6 @@ export const config = {
         "--context-length 16384",
         "--kv-cache-dtype fp8_e4m3",
         "--mamba-ssm-dtype bfloat16",
-        "--moe-runner-backend triton",
         "--disable-flashinfer-autotune",
         "--chunked-prefill-size 1024",
         "--max-prefill-tokens 8192",
@@ -206,7 +204,6 @@ export const config = {
         "--context-length 16384",
         "--kv-cache-dtype fp8_e4m3",
         "--mamba-ssm-dtype bfloat16",
-        "--moe-runner-backend triton",
         "--disable-flashinfer-autotune",
         "--chunked-prefill-size 1024",
         "--max-prefill-tokens 8192",
@@ -279,7 +276,7 @@ export const config = {
     {
       match: { hw: "dgx-spark", variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" },
       verificationStatus: (sel) => sel.mambaDtype === "float32" ? "unverified" : "verified",
-      env: [],
+      env: ["OMP_NUM_THREADS=4", "MAX_JOBS=1", "CMAKE_BUILD_PARALLEL_LEVEL=1"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -289,7 +286,7 @@ export const config = {
         "--kv-cache-dtype fp8_e4m3",
         "--mamba-ssm-dtype bfloat16",
         "--max-running-requests 2",
-        "--mem-fraction-static 0.88",
+        "--mem-fraction-static 0.75",
         "--chunked-prefill-size 1024",
         "--max-prefill-tokens 8192",
         "--reasoning-parser nemotron_3",
@@ -301,7 +298,7 @@ export const config = {
     {
       match: { hw: "dgx-spark", variant: "default", quant: "nvfp4", strategy: "low-latency", nodes: "single" },
       verificationStatus: (sel) => sel.mambaDtype === "float32" ? "unverified" : "verified",
-      env: [],
+      env: ["OMP_NUM_THREADS=4", "MAX_JOBS=1", "CMAKE_BUILD_PARALLEL_LEVEL=1"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -311,7 +308,7 @@ export const config = {
         "--kv-cache-dtype fp8_e4m3",
         "--mamba-ssm-dtype bfloat16",
         "--max-running-requests 2",
-        "--mem-fraction-static 0.88",
+        "--mem-fraction-static 0.75",
         "--chunked-prefill-size 1024",
         "--max-prefill-tokens 8192",
         "--speculative-algorithm EAGLE",

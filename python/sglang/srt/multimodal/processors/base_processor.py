@@ -25,17 +25,13 @@ from PIL import Image
 from transformers import BaseImageProcessor
 
 from sglang.srt import platforms
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputFormat,
-    MultimodalProcessorOutput,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.multimodal.cache import (
     MultimodalPreprocessCache,
     PreprocessFingerprintProvider,
     build_processor_fingerprint,
 )
+from sglang.srt.multimodal.modality import Modality, MultimodalInputFormat
 from sglang.srt.multimodal.processors.executor import MultimodalProcessorExecutor
 from sglang.srt.multimodal.processors.hash_executor import MultimodalHashExecutor
 from sglang.srt.multimodal.transport.cuda_ipc import (
@@ -213,6 +209,24 @@ def _tokenizer_of(processor):
     return processor.tokenizer if hasattr(processor, "tokenizer") else processor
 
 
+def _placeholder_mismatch_error(
+    *,
+    multimodal_tokens: MultimodalSpecialTokens,
+    text_parts: List[str],
+    modality: Modality,
+    data_by_modality: dict[Modality, Optional[list]],
+) -> ValueError:
+    num_placeholders = sum(
+        multimodal_tokens.get_modality_of_token(part) == modality for part in text_parts
+    )
+    num_items = len(data_by_modality[modality] or [])
+    name = modality.name.lower()
+    return ValueError(
+        f"Prompt has {num_placeholders} {name} placeholders "
+        f"but {num_items} {name} inputs were provided"
+    )
+
+
 def _forget_parent_executor_wakeups():
     # A forked worker inherits the parent's executor wakeups, whose locks a parent
     # thread may hold at fork time; since Python 3.12.8 / 3.13.1 the worker's exit
@@ -225,6 +239,9 @@ class BaseMultimodalProcessor(ABC):
     gpu_image_decode = True  # Enable GPU decoding by default
     smart_rgb_conversion = False
     video_preprocessing_device = None
+    # Redo preprocessing on CPU when the GPU runs out of memory (the tokenizer
+    # process shares its GPU with the scheduler).
+    retry_on_cpu_after_gpu_oom = False
     prefer_tokenized_input = False
     precompute_hash_before_cpu_transfer = False
     # Set by processors that already build input_ids from the request's own
@@ -247,6 +264,9 @@ class BaseMultimodalProcessor(ABC):
     # `process_and_combine_mm_data` -- resolves that clone instead of
     # `self._processor`, so isolation does not depend on the subclass.
     supports_mm_processor_concurrency = True
+    # Placeholder tokens that the loader matches per modality; a processor without
+    # them reads media its own way, so callers cannot tell which media it reads.
+    mm_tokens: Optional[MultimodalSpecialTokens] = None
 
     def __init__(
         self, hf_config, server_args, _processor, transport_mode, *args, **kwargs
@@ -296,8 +316,7 @@ class BaseMultimodalProcessor(ABC):
             max_entries=8192,
         )
         self.trust_mm_content_hashes = bool(get_mm().trust_mm_content_hashes)
-        # The fingerprint is needed only to build artifact keys. Avoid inspecting
-        # processor state when this processor will never retain artifacts.
+        # Compute lazily once for both preprocess and encoder-cache identities.
         self.processor_fingerprint = (
             build_processor_fingerprint(self, hf_config)
             if self.mm_preprocess_cache.enabled
@@ -913,6 +932,23 @@ class BaseMultimodalProcessor(ABC):
             if bos and input_text.startswith(bos):
                 kwargs.setdefault("add_special_tokens", False)
 
+        try:
+            return self._call_processor(processor, input_text, processor_device, kwargs)
+        except torch.cuda.OutOfMemoryError:
+            if not self.retry_on_cpu_after_gpu_oom or kwargs.get("device") in (
+                None,
+                "cpu",
+            ):
+                raise
+            logger.warning(
+                "Multimodal preprocessing ran out of GPU memory on %s; retrying on CPU",
+                kwargs["device"],
+            )
+            torch.cuda.empty_cache()
+            kwargs["device"] = "cpu"
+            return self._call_processor(processor, input_text, "cpu", kwargs)
+
+    def _call_processor(self, processor, input_text, processor_device, kwargs) -> dict:
         with self._temporary_fast_processor_cuda_pool(processor_device):
             result = processor.__call__(
                 text=[input_text],
@@ -1001,7 +1037,7 @@ class BaseMultimodalProcessor(ABC):
                 img.load()
                 return img
             elif modality == Modality.VIDEO:
-                return load_video(data, frame_count_limit)
+                return load_video(data, use_gpu=cls.video_preprocessing_device != "cpu")
             elif modality == Modality.AUDIO:
                 return load_audio(data, audio_sample_rate)
 
@@ -1514,14 +1550,21 @@ class BaseMultimodalProcessor(ABC):
                     # normal text
                     new_text_parts += [text_part]
 
-            except StopIteration as e:
+            except StopIteration:
                 # when precomputed_input is presented with multi-images, StopIteration is expected
                 if has_precomputed_input:
                     new_text_parts += [text_part]
                     continue
-                raise RuntimeError(
-                    f"An exception occurred while loading multimodal data: {e}"
-                )
+                raise _placeholder_mismatch_error(
+                    multimodal_tokens=multimodal_tokens,
+                    text_parts=text_parts,
+                    modality=multimodal_tokens.get_modality_of_token(text_part),
+                    data_by_modality={
+                        Modality.IMAGE: image_data,
+                        Modality.VIDEO: video_data,
+                        Modality.AUDIO: audio_data,
+                    },
+                ) from None
             except ValueError as e:
                 raise ValueError(
                     f"An exception occurred while loading multimodal data: {e}"
@@ -1618,6 +1661,9 @@ class BaseMultimodalProcessor(ABC):
                 "modality",
                 "hash",
                 "pad_value",
+                "pad_values",
+                "identity",
+                "processor_fingerprint",
                 "offsets",
             ):
                 # metadata fields need explicit handling, skip generic item.set
@@ -1922,6 +1968,9 @@ class BaseMultimodalProcessor(ABC):
                         modality=modality,
                         feature=feature,
                         format=MultimodalInputFormat.PRECOMPUTED_EMBEDDING,
+                        offsets=dict_item.pop("offsets", None),
+                        # Legacy hint; actual tensor contents determine cache identity.
+                        hash=dict_item.pop("hash", None),
                         model_specific_data=dict_item,
                     )
                 )
@@ -1993,8 +2042,29 @@ class BaseMultimodalProcessor(ABC):
         *,
         images: Optional[List[Any]],
     ) -> List[MultimodalDataItem]:
-        """Apply model-specific item reshaping while features are still tensors."""
+        """Bind model configuration before optional model-specific reshaping."""
+        self._bind_cache_namespaces(mm_items)
         return mm_items
+
+    def _bind_cache_namespaces(self, mm_items: List[MultimodalDataItem]) -> bool:
+        if self.processor_fingerprint is None:
+            self.processor_fingerprint = build_processor_fingerprint(
+                self, self.hf_config
+            )
+        changed = False
+        for item in mm_items:
+            changed |= item.bind_processor_fingerprint(self.processor_fingerprint)
+        return changed
+
+    def finalize_cache_identities(self, output: MultimodalProcessorOutput) -> None:
+        """Common frontend boundary, including model-specific processor paths."""
+        if (
+            self._bind_cache_namespaces(output.mm_items)
+            and output.padded_input_ids is not None
+        ):
+            output.padded_input_ids = output.build_padded_input_ids(
+                output.input_ids, output.mm_items
+            )
 
     def _prepare_mm_items_for_transport(
         self, mm_items: List[MultimodalDataItem]
@@ -2002,6 +2072,12 @@ class BaseMultimodalProcessor(ABC):
         """Wrap final GPU features, rolling back every lease if one wrap fails."""
         if not self.use_cuda_ipc:
             return mm_items
+
+        for item in mm_items:
+            # Never reconstruct/consume an IPC lease merely to hash its contents.
+            # Leave namespace binding to finalization: fast paths may have
+            # already built padding, which must change together with identity.
+            item.set_pad_value()
 
         # Pool misses fall back to plain CPU tensors. The scheduler copies out
         # and releases each successful pool slice.

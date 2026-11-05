@@ -9,19 +9,16 @@ from sglang.srt.configs.step3p7 import Step3p7Config
 from sglang.srt.layers.linear import ColumnParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    pad_mm_tokens,
 )
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputs,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.step3_vl_10b import PerceptionEncoder
 from sglang.srt.models.step3p5 import Step3p5ForCausalLM
 from sglang.srt.models.utils import WeightsMapper
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.utils import add_prefix
 
 
@@ -130,8 +127,7 @@ class Step3p7ForConditionalGeneration(nn.Module):
         return self._flatten_embeddings(merged_image_features)
 
     def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
-        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
-        return pattern.pad_input_tokens(input_ids, mm_inputs)
+        return pad_mm_tokens(input_ids, mm_inputs)
 
     def forward(
         self,
