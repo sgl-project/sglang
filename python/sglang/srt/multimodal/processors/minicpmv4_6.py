@@ -24,6 +24,8 @@ from typing import Any, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torchvision.transforms.functional as F
+import transformers
+from packaging.version import Version
 from PIL import Image
 
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
@@ -40,6 +42,10 @@ from sglang.srt.multimodal.processors.base_processor import (
 
 IMAGENET_STANDARD_MEAN = (0.5, 0.5, 0.5)
 IMAGENET_STANDARD_STD = (0.5, 0.5, 0.5)
+
+# transformers 5.21 changed the MiniCPM-V 4.6 resize divisor for downsample_mode="4x";
+# 5.20.x and older use one divisor for every mode.
+_TRANSFORMERS_GE_5_21 = Version(transformers.__version__) >= Version("5.21.0")
 
 # Inner per-feature pad sentinel: prevents the next per-image
 # ``replace(image_token, ...)`` from clobbering a previous expansion's inner
@@ -146,9 +152,11 @@ class MiniCPMV4_6ImageProcessor:
 
     Pipeline: pick a slice grid (rows x cols, up to ``max_slice_nums``); resize
     source and (optionally) tiles to multiples of ``patch_size`` times the
-    spatial merge factor (2 for ``downsample_mode="4x"``, 4 for ``"16x"``,
-    the two successive 2x2 merges: mid-ViT merger + DownsampleMLP);
-    rescale, normalize, and NaViT-pack each tile into ``(C, P, H*W/P)``.
+    spatial merge factor, following the installed transformers release:
+    5.21+ uses 2 for ``downsample_mode="4x"`` and 4 for ``"16x"`` (the two
+    successive 2x2 merges: mid-ViT merger + DownsampleMLP), older releases
+    use 4 for both modes; rescale, normalize, and NaViT-pack each tile into
+    ``(C, P, H*W/P)``.
     """
 
     def __init__(
@@ -180,9 +188,12 @@ class MiniCPMV4_6ImageProcessor:
     ) -> Tuple[int, int]:
         height, width = image_size
         scale = self.scale_resolution
-        # "4x" merges one 2x2 block, "16x" merges twice (mid-ViT + DownsampleMLP);
-        # transformers >= 5.21 sizes by the same factor.
-        merge_factor = 2 if self.downsample_mode == "4x" else 4
+        # Must match transformers' image processor: 5.21+ sizes "4x" (one 2x2 merge)
+        # by 2 and "16x" (mid-ViT + DownsampleMLP) by 4; older releases use 4 for both.
+        if _TRANSFORMERS_GE_5_21 and self.downsample_mode == "4x":
+            merge_factor = 2
+        else:
+            merge_factor = 4
         divisor = self.patch_size * merge_factor
         if (height * width > scale * scale) or allow_upscale:
             aspect_ratio = width / height
