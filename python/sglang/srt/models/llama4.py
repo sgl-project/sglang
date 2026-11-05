@@ -48,11 +48,8 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from sglang.srt.model_executor.forward_batch_info import (
-    ForwardBatch,
-    ForwardMode,
-    PPProxyTensors,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.models.llama import LlamaForCausalLM, LlamaMLP
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.runtime_context import get_parallel

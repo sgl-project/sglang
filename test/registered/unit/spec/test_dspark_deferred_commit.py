@@ -25,6 +25,12 @@ register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 
 MAX_BS, STRIDE, KV_WIDTH, VOCAB, HIDDEN = 4, 3, 8, 32, 6
 
+_TRITON_DEVICE = (
+    "cuda"
+    if torch.cuda.is_available()
+    else ("cpu" if os.environ.get("TRITON_INTERPRET") == "1" else None)
+)
+
 
 class _Injector:
     swa_ring_size = None
@@ -54,12 +60,14 @@ class _Injector:
         self.inline.append(kw)
 
 
-def _commit(injector):
+def _commit(injector, device="cpu"):
     commit = DeferredContextCommit(
-        max_bs=MAX_BS, stride=STRIDE, device="cpu", kv_injector=injector
+        max_bs=MAX_BS, stride=STRIDE, device=device, kv_injector=injector
     )
     # What the forked projection leaves: per-stage KV of the verify rows.
-    commit.kvs = [torch.randn(MAX_BS * STRIDE, KV_WIDTH) for _ in range(3)]
+    commit.kvs = [
+        torch.randn(MAX_BS * STRIDE, KV_WIDTH, device=device) for _ in range(3)
+    ]
     return commit
 
 
@@ -120,14 +128,18 @@ class TestDeferredCommit(CustomTestCase):
 
 
 class TestEpilogueStagesOnlyAfterItsProjection(CustomTestCase):
-    def _run(self, projected: bool):
+    def _run(self, projected: bool, *, bs=2, ring=False, device="cpu"):
         injector = _Injector()
-        commit = _commit(injector)
+        if ring:
+            injector.swa_ring_size = 8
+        commit = _commit(injector, device)
         commit.join_projection = lambda: projected
+        if ring:
+            commit._one_launch_stage = True
         epilogue = DsparkVerifyEpilogue(
             max_bs=MAX_BS,
             verify_num_draft_tokens=STRIDE,
-            device="cpu",
+            device=device,
             tp_sync=SimpleNamespace(sync=lambda site, values: values),
             commit_ctx=CommitInjectCtx(
                 draft_model=None,
@@ -138,20 +150,21 @@ class TestEpilogueStagesOnlyAfterItsProjection(CustomTestCase):
             ),
             deferred_commit=commit,
         )
-        bs = 2
         epilogue.begin_static_step(bs, armed=True)
         torch.manual_seed(0)
         out = SimpleNamespace(
-            next_token_logits=torch.randn(bs * STRIDE, VOCAB),
-            hidden_states=torch.randn(bs * STRIDE, HIDDEN),
+            next_token_logits=torch.randn(bs * STRIDE, VOCAB, device=device),
+            hidden_states=torch.randn(bs * STRIDE, HIDDEN, device=device),
         )
+        # A graph's request slots are the head of a max_bs buffer.
+        req_pool_indices = torch.tensor([1, 2, 7, 7], device=device)[:bs]
         fb = SimpleNamespace(
             batch_size=bs,
-            input_ids=torch.randint(0, VOCAB, (bs * STRIDE,)),
-            seq_lens=torch.tensor([5, 9]),
-            out_cache_loc=torch.arange(bs * STRIDE) + 50,
-            positions=torch.arange(bs * STRIDE),
-            req_pool_indices=torch.tensor([1, 2]),
+            input_ids=torch.randint(0, VOCAB, (bs * STRIDE,), device=device),
+            seq_lens=torch.tensor([5, 9], device=device)[:bs],
+            out_cache_loc=torch.arange(bs * STRIDE, device=device) + 50,
+            positions=torch.arange(bs * STRIDE, device=device),
+            req_pool_indices=req_pool_indices,
         )
         epilogue._static_epilogue(out, fb)
         return injector, commit, epilogue, bs
@@ -174,12 +187,18 @@ class TestEpilogueStagesOnlyAfterItsProjection(CustomTestCase):
         self.assertEqual(len(injector.inline), 1)
         self.assertTrue(bool((commit.commit_lens == 0).all()))
 
-
-_TRITON_DEVICE = (
-    "cuda"
-    if torch.cuda.is_available()
-    else ("cpu" if os.environ.get("TRITON_INTERPRET") == "1" else None)
-)
+    @unittest.skipIf(_TRITON_DEVICE is None, "needs CUDA or TRITON_INTERPRET=1")
+    def test_one_launch_stage_writes_each_request_slot_into_its_rows(self):
+        """With a draft SWA ring every staged row carries its own request's slot,
+        also at bs 1."""
+        for bs in (1, 2):
+            with self.subTest(bs=bs):
+                _, commit, _, _ = self._run(
+                    projected=True, bs=bs, ring=True, device=_TRITON_DEVICE
+                )
+                want = torch.tensor([1, 2], device=_TRITON_DEVICE)[:bs]
+                want = want.repeat_interleave(STRIDE)
+                self.assertTrue(torch.equal(commit.state_slot[: bs * STRIDE], want))
 
 
 @unittest.skipIf(_TRITON_DEVICE is None, "needs CUDA or TRITON_INTERPRET=1")

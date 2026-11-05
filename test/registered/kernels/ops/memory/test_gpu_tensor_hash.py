@@ -4,7 +4,7 @@ import torch
 from sglang.kernels.ops.memory.gpu_tensor_hash import gpu_tensor_hash
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 
 def test_small_tensor_hash_is_unchanged():

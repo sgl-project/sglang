@@ -21,12 +21,8 @@ from sglang.srt.managers.incremental_detokenize import (
     DetokenizeState,
     build_detokenize_header,
 )
-from sglang.srt.managers.schedule_batch import (
-    FINISH_ABORT,
-    FINISH_LENGTH,
-    ReqKvInfo,
-    ScheduleBatch,
-)
+from sglang.srt.managers.req_types import FINISH_ABORT, FINISH_LENGTH
+from sglang.srt.managers.schedule_batch import ReqKvInfo, ScheduleBatch
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     SchedulerPoolStatsObserver,
 )
@@ -1583,7 +1579,7 @@ class TestRetainedWindowClaim(CustomTestCase):
     PROMPT = prompt([(0, 200), (1, 200)])
 
     def _finished(self, origin):
-        from sglang.srt.managers.schedule_batch import FINISH_MATCHED_TOKEN
+        from sglang.srt.managers.req_types import FINISH_MATCHED_TOKEN
 
         out = [PAGE] + list(range(30, 60)) + [EOS]
         committed = len(origin) + len(out) - 1
