@@ -62,6 +62,10 @@ def configure_kv_cache_dtype(
         kv_cache_dtype = torch.float8_e4m3fn
     elif server_args_kv_cache_dtype in ("bf16", "bfloat16"):
         kv_cache_dtype = torch.bfloat16
+    elif server_args_kv_cache_dtype == "int8":
+        if not current_platform.is_npu():
+            raise ValueError("--kv-cache-dtype int8 requires the Ascend DSA backend")
+        kv_cache_dtype = torch.int8
     elif server_args_kv_cache_dtype in ("nvfp4", "fp4_mx_block16"):
         if hasattr(torch, "float4_e2m1fn_x2"):
             kv_cache_dtype = torch.float4_e2m1fn_x2
@@ -95,5 +99,29 @@ def configure_kv_cache_dtype(
         kv_cache_dtype = model_dtype
         # "auto" is the tag for an unquantized pool; backends gate descale on it.
         resolved_kv_cache_dtype = "auto"
+
+    # A draft pool defaults to the target's --kv-cache-dtype, but the INT8 KV
+    # recipe covers the target pool only: the draft's sparse attention has not
+    # been validated against packed records.
+    if is_draft_worker and kv_cache_dtype == torch.int8:
+        logger.info(
+            "Speculative draft: overriding KV cache dtype %s -> %s "
+            "(an INT8 KV cache is supported for the target pool only).",
+            kv_cache_dtype,
+            model_dtype,
+        )
+        kv_cache_dtype = model_dtype
+        resolved_kv_cache_dtype = "auto"
+
+    if current_platform.is_npu():
+        from sglang.srt.hardware_backend.npu.kv_capability import (
+            resolve_npu_kv_capability,
+        )
+
+        capability = resolve_npu_kv_capability(
+            kv_cache_dtype, requested=server_args_kv_cache_dtype
+        )
+        if not capability.supported:
+            raise ValueError(capability.unsupported_reason)
 
     return resolved_kv_cache_dtype, kv_cache_dtype

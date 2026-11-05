@@ -338,6 +338,12 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             self.q_b_proj_scale = (
                 self.q_b_proj.weight_scale.float().view(1, -1).contiguous()
             )
+            # INT8 per-token-group KV requires an FP32 [1] clip factor. Keep
+            # alpha=1 to match the pool's unclipped dynamic quantization, and
+            # initialize once so warmup and graph capture reuse the tensor.
+            self.k_nope_clip_alpha = torch.ones(
+                1, dtype=torch.float32, device=qkv_weight.device
+            )
         elif self.weight_quant_mode == 3:
             checkpoint_scales = []
             for layer, (k_dim, n_dim) in zip(projections, expected_shapes):
@@ -581,7 +587,12 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         k_cache, v_cache, slot_mapping = self.get_kv_cache_and_cache_idx(forward_batch)
         pool = get_token_to_kv_pool()
         packed = pool.dsa_kv_cache_store_fp8
-        if packed and self.weight_quant_mode != 3:
+        packed_int8 = packed and k_cache.dtype == torch.int8
+        if packed_int8 and self.weight_quant_mode != 2:
+            raise RuntimeError(
+                "Packed INT8 KV with MLAProlog requires dynamic INT8 QKV-A and Q-B weights"
+            )
+        if packed and not packed_int8 and self.weight_quant_mode != 3:
             raise RuntimeError(
                 "Packed FP8 KV with MLAProlog requires MXFP8 QKV-A and Q-B weights; "
                 "use BF16 draft KV for BF16 draft weights"
@@ -589,11 +600,11 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         token_x = hidden_states
         if self.weight_quant_mode == 2:
             if any(
-                t.dtype != torch.bfloat16
-                for t in (hidden_states, k_cache, v_cache, self.w_kc)
-            ):
+                t.dtype != torch.bfloat16 for t in (hidden_states, v_cache, self.w_kc)
+            ) or k_cache.dtype != (torch.int8 if packed_int8 else torch.bfloat16):
                 raise RuntimeError(
-                    "Dynamic INT8 MLAProlog requires BF16 activations and KV cache"
+                    "Dynamic INT8 MLAProlog requires BF16 activations and "
+                    "BF16 or packed INT8 KV cache"
                 )
             token_x, token_x_scale = torch.ops.npu.npu_dynamic_quant(
                 hidden_states.contiguous()
@@ -637,7 +648,7 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
                 dequant_scale_w_dq=self.qkv_a_proj_scale_q,
                 dequant_scale_w_dkv_kr=self.qkv_a_proj_scale_kv,
                 dequant_scale_w_uq_qr=self.q_b_proj_scale,
-                kv_cache_quant_mode=0,
+                kv_cache_quant_mode=3 if packed else 0,
                 query_quant_mode=0,
             )
         elif self.weight_quant_mode == 3:
@@ -656,6 +667,8 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             mla_prolog_input_args.update(
                 ckvkr_repo_mode=1, quant_scale_repo_mode=1, tile_size=128
             )
+            if packed_int8:
+                mla_prolog_input_args["k_nope_clip_alpha"] = self.k_nope_clip_alpha
         if self.kv_quant_scheme is not None:
             mla_prolog_input_args.update(
                 kv_cache_quant_mode=1,
@@ -676,7 +689,8 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         if self.weight_quant_mode == 2 and q_nope.dtype != torch.bfloat16:
             raise RuntimeError(
                 "This torch_npu/CANN MLAProlog implementation does not return BF16 "
-                "query for weight_quant_mode=2, kv_cache_quant_mode=0"
+                "query for weight_quant_mode=2, "
+                f"kv_cache_quant_mode={mla_prolog_input_args['kv_cache_quant_mode']}"
             )
         return (
             q_pe,
@@ -731,6 +745,10 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         )
         # with the mlaprolog enabled, the kv_b_proj layers are unquantized
         _is_mlaprolog = self.uses_mlaprolog()
+        if get_token_to_kv_pool().dsa_kv_cache_store_fp8 and not _is_mlaprolog:
+            raise RuntimeError(
+                "Packed KV cache requires MLAProlog preprocessing. Disable legacy MLAPO or use BF16 KV cache."
+            )
         q_descale = None
         if _is_w8a8 and not _is_mlaprolog:
             result = self.forward_mlapo(
