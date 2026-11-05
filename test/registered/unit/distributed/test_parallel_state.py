@@ -436,11 +436,8 @@ def test_dcp_disables_quick_allreduce_without_changing_tp_default():
             mock_world.local_rank = 0
             mock_world_group.return_value = mock_world
 
-            parallel_state.initialize_model_parallel(
-                tensor_model_parallel_size=8,
-                pipeline_model_parallel_size=1,
-                decode_context_parallel_size=8,
-            )
+            publish_build_topology(tp_size=8, pp_size=1, dcp_size=8)
+            parallel_state.initialize_model_parallel()
 
             assert created_group_kwargs["dcp"]["use_quick_allreduce"] is False
             assert "use_quick_allreduce" not in created_group_kwargs["tp"]
