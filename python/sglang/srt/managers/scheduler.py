@@ -3855,6 +3855,16 @@ class Scheduler(
 
         return aborts
 
+    def _abort_mm_req_with_released_features(self, req: Req) -> None:
+        """Abort a waiting request that can no longer re-encode MM features."""
+        message = (
+            "Multimodal features for this request were released after prefill "
+            "and its cached KV prefix was evicted after retraction/preemption, "
+            "so it cannot be re-encoded. Please retry the request."
+        )
+        logger.warning("Aborting request %s: %s", req.rid, message)
+        self._abort_unavailable(req, message=message)
+
     def handle_embedding_request(
         self,
         recv_req: TokenizedEmbeddingReqInput,
@@ -4456,6 +4466,7 @@ class Scheduler(
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         buffer_pipeline = self.tree_cache.buffer_pipeline
         # Get requests from the waiting queue to a new prefill batch
+        mm_released_abort_reqs: List[Req] = []
         for req in self.waiting_queue:
             # A spent pass budget admits no one, even before the first
             # candidate: the resumed chunk or mixed decode rows can spend it.
@@ -4524,6 +4535,17 @@ class Scheduler(
                 req.time_stats.observe_storage_staging_ready(staging_ready)
                 if not staging_ready:
                     continue
+
+            if (
+                req.multimodal_inputs is not None
+                and req.multimodal_inputs.has_released_items_beyond_prefix(
+                    req.prefix_len + req.host_hit_length
+                )
+            ):
+                self._abort_mm_req_with_released_features(req)
+                mm_released_abort_reqs.append(req)
+                continue
+
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
@@ -4558,8 +4580,14 @@ class Scheduler(
             mamba_allocator.alloc_group_end()
         self.running_reqs.leave(adder.preempt_list)
 
+        if mm_released_abort_reqs:
+            self.waiting_queue.leave(mm_released_abort_reqs)
+
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
+        # Admission now protects the prefix these requests matched.
+        for req in can_run_list:
+            req.release_mm_prefix_hold(self.tree_cache)
         if len(can_run_list) == 0:
             # Preemption already released these requests; requeue them even
             # though the request they made room for was not admitted.
@@ -5894,6 +5922,9 @@ class Scheduler(
                         "window waited for the previous one.",
                     },
                 )
+            # Paused, retracted requests may still hold nodes of the tree being reset.
+            for req in self.waiting_queue:
+                req.release_mm_prefix_hold(self.tree_cache)
             self.tree_cache.reset()
             self.req_to_token_pool.clear()
             self.token_to_kv_pool_allocator.clear()
