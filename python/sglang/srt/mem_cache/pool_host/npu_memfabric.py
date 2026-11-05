@@ -9,14 +9,13 @@ provider:
   acc_offload_local_dram_entry.cpp) allocates and registers host DRAM
   (offload.empty + offload.host_register).  The HiCache host pool is
   allocated through memfabric_hybrid.offload.empty AND the L2<->L1 IO
-  can use either the AIV kv_exchange kernel or the AICPU offload op.
+  uses the AIV kv_exchange kernel.
 - ``acl``: standard CANN runtime registration (aclrtHostRegister with
   ACL_HOST_REGISTER_MAPPED, see the kernel-side
   sgl_kernel_npu.host_memory).  Plain pageable host tensors are allocated
   with torch.empty and registered so the AIV kv_exchange kernel can
-  resolve their device pointers; the AICPU offload op is NOT usable with
-  this backend (it requires MemFabric-mapped memory), so the kernel-side
-  auto routing sends every transfer to the AIV operator.
+  resolve their device pointers. The kernel-side auto routing sends every
+  transfer to the AIV operator.
 
 ascendc_io_enabled() gates the AIV IO path and is true for both backends.
 """
@@ -210,8 +209,7 @@ def alloc_with_memfabric(
 # into the device VA space by aclrtHostRegister(ACL_HOST_REGISTER_MAPPED)
 # inside the kernel-side host_memory module.  Unlike MemFabric there is no
 # pre-reserved entity and no GB granularity, so capacity tracking is pure
-# Python-side accounting and the AICPU offload op is not available -- the
-# kernel-side auto routing forces the AIV kv_exchange operator.
+# Python-side accounting. Transfers use the AIV kv_exchange operator.
 # ---------------------------------------------------------------------------
 
 
