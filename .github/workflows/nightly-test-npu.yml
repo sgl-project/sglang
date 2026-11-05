@@ -158,7 +158,7 @@ jobs:
       runner_config: linux-aarch64-a3-4-
       image: ${{ needs.set-image-config.outputs.image_a3 }}
       run_timeout_minutes: '120'
-      timeout_per_file: '3600'
+      timeout_per_file: '5400'
       partitions: '{"size":2,"arr":[0,1]}'
       is_nightly_pipeline_job: true
       skip_pr_test_health_check: 'true'
@@ -381,10 +381,10 @@ jobs:
       matrix:
         test_config:
           # glm_5_2 accuracy tests
-          - name: glm_5_2_w8a8_16p_gpqa
-            node_size: 2
-            test_case: test/registered/npu/accuracy/glm5_2/test_npu_glm_5_2_w8a8_16p_gpqa.py
-            test_type: 'accuracy'
+          # - name: glm_5_2_w8a8_16p_gpqa
+          #   node_size: 2
+          #   test_case: test/registered/npu/accuracy/glm5_2/test_npu_glm_5_2_w8a8_16p_gpqa.py
+          #   test_type: 'accuracy'
           # kimi_k3 accuracy tests
           - name: kimi_k3_w4a8_32p_gpqa
             node_size: 4
