@@ -161,7 +161,8 @@ class TestPLEStateCoordinates(unittest.TestCase):
 
     def test_ascend_graph_metadata_checkpoints_static_ple_state(self):
         """Capture and replay save both PLE parts to the recurrent checkpoint rows."""
-        from sglang.srt.mem_cache.kv.router import STATE_PART, KVLayerRouter
+        from sglang.srt.mem_cache.kv.decl import STATE_PART
+        from sglang.srt.mem_cache.kv.router import KVLayerRouter
         from sglang.srt.mem_cache.ple_state_pool import (
             NGRAM_PART,
             SHORT_CONV_PART,

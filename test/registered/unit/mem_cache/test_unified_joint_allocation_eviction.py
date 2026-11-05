@@ -13,6 +13,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.common import evict_from_tree_cache
+from sglang.srt.mem_cache.kv.plan import TREE_WINDOW
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.runtime_context import reset_context
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -451,7 +452,11 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
 
         with patch.object(cache, "_evict_device_next_node", side_effect=step):
             cache.evict_for_alloc(
-                EvictParams(swa_num_tokens=2),
+                EvictParams(
+                    window_num_tokens={
+                        cache.window_sub_pool_of_slot(cache.slot_id(TREE_WINDOW)): 2
+                    }
+                ),
                 allocation_reclaim_satisfied=lambda: (
                     allocator.reclaim_plan(4, 4) == (0, 0)
                 ),

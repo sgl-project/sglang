@@ -17,7 +17,13 @@ import msgspec
 import torch
 
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
-from sglang.srt.mem_cache.kv.advance import TrackingAdvance, advance_tracking
+from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+from sglang.srt.mem_cache.kv.advance import (
+    TrackingAdvance,
+    advance_tracking,
+    retire_window_rows,
+)
+from sglang.srt.mem_cache.kv.decl import Region
 from sglang.srt.mem_cache.kv.plan import (
     TREE_STATE,
     TREE_TOKEN,
@@ -26,7 +32,7 @@ from sglang.srt.mem_cache.kv.plan import (
     WireEntry,
 )
 from sglang.srt.mem_cache.kv.state_storage import StateSlotsExhausted
-from sglang.srt.mem_cache.kv.storage import Region, ResumeUnits, SubPoolUsage
+from sglang.srt.mem_cache.kv.storage import ResumeUnits, SubPoolUsage
 from sglang.srt.utils import is_npu
 
 if TYPE_CHECKING:
@@ -368,7 +374,7 @@ class StaticKVStorage:
         shares_prefixes: bool = False,
         eviction_interval: int = 1,
         tracking: Optional[TrackingAdvance] = None,
-        component_type=None,
+        window_sub_pool: Optional[str] = None,
     ) -> None:
         if tracking is not None:
             advance_tracking(self, req, tracking)
@@ -377,11 +383,7 @@ class StaticKVStorage:
         if frontier is None:
             raise ValueError("window retirement needs a token frontier")
 
-        from sglang.srt.mem_cache.common import free_swa_out_of_window_slots
-        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
-
-        component_type = ComponentType.SWA if component_type is None else component_type
-        free_swa_out_of_window_slots(
+        retire_window_rows(
             req,
             frontier,
             sliding_window_size=window,
@@ -391,7 +393,7 @@ class StaticKVStorage:
             supports_prefix_sharing=shares_prefixes,
             retain_floor=retain_floor,
             eviction_interval=eviction_interval,
-            component_type=component_type,
+            window_sub_pool=window_sub_pool or BaseSWAKVPool.WINDOW_SUB_POOL,
         )
 
     def release_row(self, req: Req) -> None:
@@ -406,16 +408,22 @@ class StaticKVStorage:
 
     # -- what the prefix tree's effects reach --
 
-    # A second window component (buffer mode's) reaches the same window rows.
     _TREE_SUB_POOLS = {
         "FULL": "kv",
         "SWA": "swa",
-        "AUXILIARY_SWA": "swa",
         "MAMBA": "mamba",
     }
 
-    def tree_sub_pool(self, component: str) -> str:
-        return self._TREE_SUB_POOLS[component]
+    def tree_sub_pool(self, slot: str, *, family: Optional[str] = None) -> str:
+        """The sub-pool the tree's slot named ``slot`` holds values of. A window
+        slot under another name (``family`` window) holds the one window's
+        rows."""
+        name = slot
+        if name in self._TREE_SUB_POOLS:
+            return self._TREE_SUB_POOLS[name]
+        if family == "window":
+            return BaseSWAKVPool.WINDOW_SUB_POOL
+        raise KeyError(f"static storage keeps no sub-pool for tree component {name!r}")
 
     def _band(self, sub_pool: str):
         if sub_pool == "swa":
@@ -638,15 +646,43 @@ class StaticKVStorage:
     def sub_pool_names(self) -> Tuple[str, ...]:
         return (self.owner,)
 
-    def tree_slots(
-        self, *, window_reaches: Optional[Dict[str, int]] = None
-    ) -> Tuple[TreeSlot, ...]:
-        shape = self._shape
-        window = (
-            max(shape.window, (window_reaches or {}).get("swa", 0))
-            if shape.window is not None
-            else None
+    def bind_window_retention(
+        self, sliding_window: Optional[int], reaches: Optional[Dict[str, int]]
+    ) -> None:
+        """See `KVStorage.bind_window_retention`; kept on the allocator, which
+        outlives this view."""
+        names = self._allocator.window_pool_names()
+        self._allocator.window_retention = (
+            {}
+            if sliding_window is None
+            else {
+                name: max(sliding_window, (reaches or {}).get(name, 0))
+                for name in names
+            }
         )
+
+    def retained_window_lengths(self) -> Dict[str, int]:
+        """See `KVStorage.retained_window_lengths`. A per-request window ring
+        holds the window alone, and is asked first: under encoder replay the
+        allocator is a plain paged one that keeps no window pool, while the
+        pool's ring still holds the window."""
+        pool = self._allocator.get_kvcache()
+        if isinstance(pool, BaseSWAKVPool) and pool.request_window is not None:
+            return {BaseSWAKVPool.WINDOW_SUB_POOL: pool.sliding_window}
+        if not self._allocator.window_pool_names():
+            return {}
+        retention = self._allocator.window_retention
+        if retention is None:
+            raise ValueError("the window's retention was never bound")
+        return dict(retention)
+
+    def tree_slots(self) -> Tuple[TreeSlot, ...]:
+        shape = self._shape
+        window = None
+        if shape.window is not None:
+            window = (self._allocator.window_retention or {}).get(
+                BaseSWAKVPool.WINDOW_SUB_POOL, shape.window
+            )
         return (
             (TreeSlot(component="FULL", family=TREE_TOKEN),)
             + (

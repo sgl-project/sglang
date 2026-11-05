@@ -16,7 +16,7 @@ limitations under the License.
 from __future__ import annotations
 
 import abc
-from typing import TYPE_CHECKING, Dict, Hashable, Optional, Protocol
+from typing import TYPE_CHECKING, Dict, Hashable, Optional, Protocol, Tuple
 
 import torch
 
@@ -53,6 +53,9 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     storage: Optional[KVStorage] = None
     # The steps a lazily compacting unified pool's freed pages wait for.
     forward_steps: Optional[ForwardSteps] = None
+    # A static pool's window: the tail a running request keeps of it, by the
+    # window pool's name, bound once at startup (`StaticKVStorage`).
+    window_retention: Optional[Dict[str, int]] = None
 
     @property
     def state_slots(self):
@@ -93,6 +96,11 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         """Whether a sliding-window pool sits beside the full-attention one,
         with the window allocation surface (`free_swa`, `swa_available_size`, ...)."""
         return False
+
+    def window_pool_names(self) -> Tuple[str, ...]:
+        """The window pools this allocator keeps, by name; none for a pool
+        without windows."""
+        return ()
 
     def state_id_spaces(self) -> Dict[str, IdSpace]:
         """The id space of each recurrent-state sub-pool whose slots this
@@ -231,6 +239,11 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         """Idle-time diagnostic: recompute byte/slot accounting and return
         violation strings, empty when healthy. Static pools have no byte model."""
         return []
+
+    def window_available_size(self, sub_pool: str) -> int:
+        """What a take from window pool ``sub_pool`` can serve now; a pool
+        keeping one window serves it under any name."""
+        return self.swa_available_size()
 
     def mamba_full_cache_donor(self) -> MambaFullCacheDonor | None:
         """Return the shared-pool donor capability, if this allocator has one."""

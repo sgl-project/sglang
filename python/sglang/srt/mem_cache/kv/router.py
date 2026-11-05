@@ -15,10 +15,7 @@ from typing import Any, Dict, Optional, Sequence, Tuple
 
 import msgspec
 
-# The part every token KV view holds today; derived parts get their own names.
-KV_PART = "kv"
-# A request's recurrent state, one slot per request, in the state sub-pool.
-STATE_PART = "state"
+from sglang.srt.mem_cache.kv.decl import KV_PART
 
 
 class PartRoute(msgspec.Struct, frozen=True, kw_only=True):

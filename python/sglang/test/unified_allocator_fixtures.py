@@ -40,7 +40,7 @@ from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import mamba_cache_chunk_size, publish, reset_context
 from sglang.srt.server_args import ServerArgs
-from sglang.test.tree_slots import tree_slots_of
+from sglang.test.tree_slots import storage_tree_slots, tree_slots_of
 
 
 def chain_snapshot(allocator) -> ChainSnapshot:
@@ -474,8 +474,8 @@ def build_swa_cache(
             token_to_kv_pool_allocator=allocator,
             page_size=page_size,
             sliding_window_size=128 * page_size if window is None else window,
-            tree_slots=tree_slots_of(
-                (ComponentType.FULL, ComponentType.SWA),
+            tree_slots=storage_tree_slots(
+                allocator.storage,
                 window=128 * page_size if window is None else window,
             ),
         )
@@ -516,13 +516,14 @@ def build_tri_cache(
             token_to_kv_pool_allocator=a,
             page_size=page_size,
             sliding_window_size=128 * page_size,
-            tree_slots=tree_slots_of(
-                (
+            tree_slots=storage_tree_slots(
+                a.storage,
+                window=128 * page_size,
+                components=(
                     (ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA)
                     if state_cache
                     else (ComponentType.FULL, ComponentType.SWA)
                 ),
-                window=128 * page_size,
             ),
             enable_session_radix_cache=sessions,
         )
