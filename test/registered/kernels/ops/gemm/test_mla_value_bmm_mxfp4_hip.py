@@ -26,7 +26,7 @@ class TestMlaValueBmmMxfp4Hip(CustomTestCase):
         cls.weight_fp4 = weight_fp4.view(HEADS, N, K // 2)
         cls.weight_scales = weight_scales.view(HEADS, N, K // 32)
 
-    def _split_path(self, x):
+    def _split_path(self, x, w=None, w_scales=None):
         from aiter.ops.triton.batched_gemm_afp4wfp4_pre_quant import (
             batched_gemm_afp4wfp4_pre_quant,
         )
@@ -37,24 +37,28 @@ class TestMlaValueBmmMxfp4Hip(CustomTestCase):
         )
         batched_gemm_afp4wfp4_pre_quant(
             x,
-            self.weight_fp4,
-            self.weight_scales,
+            self.weight_fp4 if w is None else w,
+            self.weight_scales if w_scales is None else w_scales,
             torch.bfloat16,
             bf16_output.transpose(0, 1),
         )
         return fused_flatten_mxfp4_quant(bf16_output)
 
-    def _fused(self, x):
+    def _fused(self, x, w=None, w_scales=None):
         from sglang.kernels.ops.gemm.mla_value_bmm_mxfp4_hip import (
             batched_gemm_a16wfp4_flatten_mxfp4_quant,
         )
 
         return batched_gemm_a16wfp4_flatten_mxfp4_quant(
-            x, self.weight_fp4, self.weight_scales
+            x,
+            self.weight_fp4 if w is None else w,
+            self.weight_scales if w_scales is None else w_scales,
         )
 
-    def _assert_matches_split_path(self, x, actual_fp4, actual_scales):
-        expected_fp4, expected_scales = self._split_path(x)
+    def _assert_matches_split_path(
+        self, x, actual_fp4, actual_scales, w=None, w_scales=None
+    ):
+        expected_fp4, expected_scales = self._split_path(x, w, w_scales)
         torch.testing.assert_close(actual_fp4, expected_fp4, rtol=0, atol=0)
         torch.testing.assert_close(actual_scales, expected_scales, rtol=0, atol=0)
         # o_proj consumes the transposed scale view without materializing it.
@@ -78,6 +82,29 @@ class TestMlaValueBmmMxfp4Hip(CustomTestCase):
                     )
                 )
                 self._assert_matches_split_path(x, *self._fused(x))
+
+    def test_matches_split_path_on_mla_call_site_views(self):
+        """forward_mla_rocm passes strided views, not the contiguous tensors above."""
+        from sglang.kernels.ops.gemm.mla_value_bmm_mxfp4_hip import (
+            can_fuse_mla_value_bmm_mxfp4_quant,
+        )
+
+        # The weight loader stores w_vc / w_scale_v transposed and the call site
+        # transposes them back; x is a head-major view of attn_output (tokens, heads, K).
+        w_vc = self.weight_fp4.contiguous().transpose(1, 2)
+        w_scale_v = self.weight_scales.contiguous().transpose(1, 2)
+        w, w_scales = w_vc.transpose(-2, -1), w_scale_v.transpose(-2, -1)
+        for tokens in (1, 17, 64):
+            with self.subTest(tokens=tokens):
+                attn_output = torch.randn(
+                    (tokens, HEADS, K), dtype=torch.bfloat16, device="cuda"
+                )
+                x = attn_output.transpose(0, 1)
+                self.assertEqual(x.stride(), (K, HEADS * K, 1))
+                self.assertTrue(can_fuse_mla_value_bmm_mxfp4_quant(x, w, w_scales))
+                self._assert_matches_split_path(
+                    x, *self._fused(x, w, w_scales), w=w, w_scales=w_scales
+                )
 
     def test_torch_compile_fullgraph(self):
         from sglang.kernels.ops.gemm.mla_value_bmm_mxfp4_hip import (
