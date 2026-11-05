@@ -246,22 +246,6 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
-        op="gemm.n128k512",
-        backend=KernelBackend.JIT,
-        target="sglang.kernels.ops.gemm.small_gemm_bf16:n128k512_gemm_bf16",
-        capabilities=CUDA_ONLY,
-    )
-)
-register_kernel(
-    KernelSpec(
-        op="gemm.n32k5120",
-        backend=KernelBackend.JIT,
-        target="sglang.kernels.ops.gemm.small_gemm_bf16:n32k5120_gemm_bf16",
-        capabilities=CUDA_ONLY,
-    )
-)
-register_kernel(
-    KernelSpec(
         op="gemm.qwen3x_nvfp4",
         backend=KernelBackend.KDA,
         target=f"{_KDA_PACKAGE}.qwen3x_nvfp4_gemm:try_qwen3x_nvfp4_gemm",
