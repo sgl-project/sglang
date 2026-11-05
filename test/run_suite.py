@@ -86,6 +86,7 @@ PER_COMMIT_SUITES = {
         "base-b-kernel-unit-test-1-gpu-large",
         "base-b-kernel-unit-test-4-gpu-b200",
         "base-b-kernel-unit-test-8-gpu-h200",
+        "base-b-kernel-benchmark-test-1-gpu-small",
         "base-b-kernel-benchmark-test-1-gpu-large",
         # Diffusion keeps case-level pytest partitioning behind registered
         # bridge files while sharing this discovery and dispatch entry point.
@@ -167,6 +168,7 @@ NIGHTLY_SUITES = {
         "nightly-amd-kernel-1-gpu",
         "nightly-amd-1-gpu-mi35x",
         "nightly-amd-1-gpu-zimage-turbo",
+        "nightly-amd-2-gpu",
         "nightly-amd-2-gpu-mi35x-deepseek-r1-mxfp4-tp2",
         "nightly-amd-8-gpu-mi35x-deepseek-r1-mxfp4-tp4",
         "nightly-amd-accuracy-8-gpu-mi35x-kimi-k3",

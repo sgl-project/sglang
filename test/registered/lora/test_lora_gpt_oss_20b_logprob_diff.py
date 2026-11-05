@@ -36,7 +36,7 @@ from sglang.test.lora_utils import assert_lora_matches_trainer_logprobs
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=107, stage="weekly", runner_config="4-gpu-b200")
-register_amd_ci(est_time=180, suite="extra-b-test-4-gpu-amd")
+register_amd_ci(est_time=180, suite="nightly-amd-4-gpu", nightly=True)
 
 BASE_MODEL = "lmsys/gpt-oss-20b-bf16"
 LORA_HF_REPO = "yushengsu/lora-diff-gpt-oss-20b"
