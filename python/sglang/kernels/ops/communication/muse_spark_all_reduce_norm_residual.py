@@ -199,11 +199,10 @@ def all_reduce_norm_residual(
         _uses_multicast(comm),
         prefetch_weights,
     )
-    fn = getattr(
-        module,
-        ("run_scale" if post_norm_is_input_scale else "run_std")
-        + ("_router" if want_router else ""),
-    )
+    if post_norm_is_input_scale:
+        fn = module.run_scale_router if want_router else module.run_scale
+    else:
+        fn = module.run_std_router if want_router else module.run_std
     fn(
         comm.obj,
         partial.contiguous(),
