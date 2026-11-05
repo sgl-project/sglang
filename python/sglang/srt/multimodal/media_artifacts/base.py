@@ -51,8 +51,8 @@ class MediaArtifact(Protocol):
 
     ``content_digest`` identifies the media contents. ``artifact_key`` also
     includes every preprocessing choice that can change the artifact.
-    ``feature_hash`` becomes ``MultimodalDataItem.hash`` and identifies the
-    corresponding encoder embedding.
+    ``feature_hash`` carries a full-width server-computed fingerprint, not a
+    caller-provided hint or a truncated embedding-cache key.
     """
 
     content_digest: str

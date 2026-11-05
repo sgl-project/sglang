@@ -75,6 +75,15 @@ del _mod, _fn
 
 register_kernel(
     KernelSpec(
+        op="attention.qk_norm_rope",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.qk_norm_rope:qk_norm_rope",
+        capabilities=CUDA_ONLY,
+    )
+)
+
+register_kernel(
+    KernelSpec(
         op="attention.kda_qwen38_qsa_sm121",
         backend=KernelBackend.KDA,
         target=("sglang.kernels.kda_kernels.qwen38_qsa_sm121:qwen38_qsa_sm121"),
@@ -345,10 +354,10 @@ register_kernel(
         op="attention.deep_select_topk",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.attention.deep_select:topk",
-        # Exactly SM90, SM100 and SM103, the architectures DeepSelect is tuned for.
+        # Exactly SM90, SM100, SM103 and SM107, the architectures DeepSelect is tuned for.
         capabilities=frozenset(
             CapabilityRequirement.cuda(min_sm=sm, max_sm=sm)
-            for sm in ((9, 0), (10, 0), (10, 3))
+            for sm in ((9, 0), (10, 0), (10, 3), (10, 7))
         ),
     )
 )

@@ -25,6 +25,7 @@ from sglang.srt.mem_cache.hybrid_cache.host_pool_config import (
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
+from sglang.srt.mem_cache.kv import HostPoolOptions
 from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
     DeepSeekV4StateHostPool,
@@ -1277,8 +1278,11 @@ def _evict_for_host_load(
     if component == ComponentType.SWA:
         cache.evict_for_alloc(EvictParams(swa_num_tokens=shortfall))
     else:
-        assert component == ComponentType.MAMBA, component
-        cache.evict_for_alloc(EvictParams(mamba_num=shortfall))
+        if component == ComponentType.AUXILIARY_SWA:
+            cache.evict_for_alloc(EvictParams(auxiliary_swa_num_tokens=shortfall))
+        else:
+            assert component == ComponentType.MAMBA, component
+            cache.evict_for_alloc(EvictParams(mamba_num=shortfall))
 
 
 def build_unified_host_stack(
@@ -1310,6 +1314,11 @@ def build_unified_host_stack(
         for s in sub_pools
     }
     transfer_layer_id_max = max(k for m in layer_maps.values() for k in m) + 1
+    for s in sub_pools:
+        if not layer_maps[s.name]:
+            # A draft-only band still needs a transfer completion event before
+            # the draft runs; its whole entry is copied at the first event.
+            layer_maps[s.name] = {0: 0}
 
     token_drafts, owner_id_drafts = {}, ()
     for s in sub_pools:
@@ -1346,6 +1355,27 @@ def build_unified_host_stack(
             owner_id_drafts,
         )
 
+    parallel = get_parallel()
+
+    def build_host(name, drafts):
+        layout = storage.host_layout(name)
+        options = HostPoolOptions(
+            ratio=memory.hicache_ratio,
+            size=memory.hicache_size if host_sizes[name] is None else host_sizes[name],
+            page_size=page_size,
+            layout=memory.hicache_mem_layout,
+            allocator_type=_get_allocator_type(),
+            pool_label=name,
+            dcp_size=parallel.attn_dcp_size if parallel.dcp_enabled else 1,
+            dcp_rank=parallel.attn_dcp_rank if parallel.dcp_enabled else 0,
+        )
+        return layout.build(
+            options,
+            draft_buffer_infos=tuple(
+                draft.get_device_pool_infos()[0].buffer_info for draft in drafts
+            ),
+        )
+
     host_pools = {}
     if envelope is not None:
         pair = UnifiedPageEnvelopeHostPool.build_hybrid_swa_pool_pair(
@@ -1370,13 +1400,7 @@ def build_unified_host_stack(
         packed_draft_device_pools=token_drafts[owner],
     )
     if owner not in host_pools:
-        host_pools[owner] = build_kv_host_pool(
-            kv_pool=owner_config.root,
-            page_size=page_size,
-            host_size=host_sizes[owner],
-            mtp_draft_device_pools=owner_config.packed_draft_device_pools,
-            pool_label=owner,
-        )
+        host_pools[owner] = build_host(owner, owner_config.packed_draft_device_pools)
     entries = _build_pool_entries(
         config=owner_config,
         root_host_pool=host_pools[owner],
@@ -1390,28 +1414,10 @@ def build_unified_host_stack(
             continue
         view = storage.view(s.name)
         component = ComponentType[s.external.tree_component]
-        if s.holds_state:
-            info = _mamba_info(view)
-            drafts = params.mtp_draft_mamba_pools
-            host_pools[s.name] = build_mamba_host_pool(
-                view,
-                info,
-                host_size=host_sizes[s.name],
-                layout=_state_host_layout(),
-                mtp_draft_device_pools=drafts,
-            )
-            device_layer_num = len(info.layer_ids)
-        else:
-            drafts = token_drafts[s.name]
-            if s.name not in host_pools:
-                host_pools[s.name] = build_kv_host_pool(
-                    kv_pool=view,
-                    page_size=page_size,
-                    host_size=host_sizes[s.name],
-                    mtp_draft_device_pools=drafts,
-                    pool_label=s.name,
-                )
-            device_layer_num = view.layer_num
+        drafts = params.mtp_draft_mamba_pools if s.holds_state else token_drafts[s.name]
+        if s.name not in host_pools:
+            host_pools[s.name] = build_host(s.name, drafts)
+        device_layer_num = storage.host_layout(s.name).device_layer_num
         alloc = storage.host_load_alloc(s.name)
         entries.append(
             build_pool_entry(
@@ -1449,6 +1455,10 @@ def build_unified_host_stack(
                 )
             )
         component_host_pools[component] = host_pools[s.name]
+
+    format_tag = storage.plan.storage_format_tag()
+    if format_tag is not None:
+        host_pools[owner].storage_format_tag = format_tag
 
     host_pool_group = HostPoolGroup(entries)
     cache_controller = _build_cache_controller(
@@ -1779,47 +1789,21 @@ def validate_fused_hicache_draft(
     device pools; registration supplies the pools and the completed cache so
     its page envelopes and shared buffer can be checked.
     """
-    if target_config is not None and not (
-        target_config.spec_algorithm.is_dflash()
-        and target_config.is_hybrid_swa
-        and target_config.mambaish_config is None
-        and get_memory().hicache_storage_backend is None
-    ):
-        raise NotImplementedError(
-            "--enable-hierarchical-cache fused draft KV requires DFLASH, a "
-            "hybrid-SWA target without Mamba, and L2-only storage."
-        )
-
-    if draft_device_pools is not None:
-        from sglang.srt.mem_cache.kv.layout.mha import DraftMHAView
-
-        if not (
-            len(draft_device_pools) == 1
-            and isinstance(draft_device_pools[0], DraftMHAView)
-            and draft_device_pools[0]._sub_pool_name == "full"
-        ):
-            raise NotImplementedError(
-                "HiCache fused draft KV requires a full-attention DFLASH draft."
-            )
-
     if tree_cache is None:
         return
-    assert draft_device_pools is not None
-
+    storage = tree_cache.kv_storage()
+    for pool in draft_device_pools or ():
+        if pool._arena is not storage.allocator.arena:
+            raise ValueError("fused draft views must share the target storage arena")
     entries = tree_cache.cache_controller.mem_pool_host.entry_map
-    if any(
-        name not in entries
-        or not isinstance(entries[name].host_pool, UnifiedPageEnvelopeHostPool)
-        for name in (PoolName.KV, PoolName.SWA)
-    ):
-        raise NotImplementedError(
-            "Fused DFLASH HiCache requires unified hybrid-SWA page-envelope host "
-            "pools; the selected storage backend or host layout does not preserve "
-            "the fused draft bytes."
-        )
-    target = entries[PoolName.KV].device_pool
-    if draft_device_pools[0]._arena is not target._arena:
-        raise ValueError("Fused DFLASH HiCache draft must share the target FULL pool.")
+    for sub_pool in storage.plan.sub_pools:
+        if sub_pool.spec.draft_region is None:
+            continue
+        entry = entries[PoolName(sub_pool.external.host_pool)]
+        if not isinstance(entry.host_pool, UnifiedPageEnvelopeHostPool):
+            raise ValueError(
+                f"host pool {sub_pool.name!r} must preserve the complete declared entry"
+            )
 
 
 def build_hicache_draft_sidecars(
@@ -1848,6 +1832,7 @@ def build_hicache_draft_sidecars(
 _COMPONENT_HOST_ATTR: dict[ComponentType, tuple[str, str]] = {
     ComponentType.FULL: ("full_kv_pool_host", "_full_kv_pool_host"),
     ComponentType.SWA: ("swa_kv_pool_host", "_swa_kv_pool_host"),
+    ComponentType.AUXILIARY_SWA: ("auxiliary_swa_kv_pool_host", "_swa_kv_pool_host"),
     ComponentType.MAMBA: ("mamba_pool_host", "_mamba_pool_host"),
     ComponentType.C128: ("c128_kv_pool_host", "_c128_kv_pool_host"),
 }
@@ -2232,6 +2217,13 @@ class _MiniMaxSparseStrategy(StackStrategy):
 
     def matches(self, kvcache, components):
         return self.owns(kvcache) and components == {ComponentType.FULL}
+
+    def build_direct_linker_pool_group(self, *, kvcache, params, page_size):
+        from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
+            _build_minimax_m3_nvfp4_device_pool_group,
+        )
+
+        return _build_minimax_m3_nvfp4_device_pool_group(kvcache, params, page_size)
 
     def build(
         self,
