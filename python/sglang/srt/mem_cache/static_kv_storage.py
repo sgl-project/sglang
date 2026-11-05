@@ -23,7 +23,7 @@ from sglang.srt.mem_cache.kv.advance import (
     advance_tracking,
     retire_window_rows,
 )
-from sglang.srt.mem_cache.kv.decl import Region
+from sglang.srt.mem_cache.kv.decl import Region, window_sub_pool_name
 from sglang.srt.mem_cache.kv.plan import (
     TREE_STATE,
     TREE_TOKEN,
@@ -676,12 +676,16 @@ class StaticKVStorage:
                 SubPoolUsage(
                     name="full",
                     metrics="full",
+                    label="full",
                     capacity=full_capacity,
                     available=full_available,
                 ),
+                # Published under the name a unified pool's window of this
+                # length goes by.
                 SubPoolUsage(
                     name=_WINDOW,
-                    metrics="swa",
+                    metrics="window",
+                    label=window_sub_pool_name(shape.window),
                     capacity=swa_capacity,
                     available=swa_available,
                 ),
@@ -697,6 +701,7 @@ class StaticKVStorage:
                 SubPoolUsage(
                     name="full",
                     metrics="full",
+                    label="full",
                     capacity=capacity,
                     available=allocator.available_size(),
                 )
@@ -706,6 +711,7 @@ class StaticKVStorage:
                 SubPoolUsage(
                     name="mamba",
                     metrics="mamba",
+                    label="mamba",
                     capacity=allocator.state.pool.size,
                     available=allocator.state_slots.available_size(),
                 )
@@ -734,8 +740,29 @@ class StaticKVStorage:
     def wire_entries(self) -> Tuple[WireEntry, ...]:
         return self._states().wire_entries
 
+    def entry_sub_pool(self, entry: WireEntry) -> Optional[str]:
+        """See `KVStorage.entry_sub_pool`: a static pool's entries are slices
+        of its pools, not sub-pools."""
+        return None
+
+    def entry_sub_pools(self) -> Tuple[Optional[str], ...]:
+        """See `KVStorage.entry_sub_pools`: a static pool's entries are slices
+        of its pools, none of them a sub-pool."""
+        return ()
+
+    def entry_wire_key(self, entry: WireEntry) -> Optional[str]:
+        """See `KVStorage.entry_wire_key`: none for a static pool's entries."""
+        return None
+
     def sub_pool_names(self) -> Tuple[str, ...]:
         return (self.owner,)
+
+    def host_pool_name(self, sub_pool: str) -> str:
+        """See `KVStorage.host_pool_name`: a window entry backs up to the
+        window host pool."""
+        from sglang.srt.mem_cache.hicache_storage import PoolName
+
+        return PoolName.SWA if sub_pool == _WINDOW else PoolName.KV
 
     def bind_window_retention(
         self, sliding_window: Optional[int], reaches: Optional[Dict[str, int]]

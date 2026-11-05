@@ -76,6 +76,11 @@ class TestHiCacheL3Cleaner(CustomTestCase):
             "page-a_model_7_8_indexer_2",
             "page-a_model_7_8_draft_swa",
             "page-a_model_deepseek_v4_c4_indexer_state_2",
+            "page-a_model_7_8_window",
+            "page-a_model_7_8_window_4096",
+            "page-a_model_7_8_window_4096_k",
+            "page-a_model_7_8_window_128_v",
+            "page-a_model_7_8_window_128_3",
         ]
 
         for name in names:
@@ -116,6 +121,40 @@ class TestHiCacheL3Cleaner(CustomTestCase):
             for rank in range(2)
             for suffix in physical_suffixes
         ]
+        old_paths = [self._write_key(key, mtime=100.0) for key in old_keys]
+        new_paths = [self._write_key(key, mtime=200.0) for key in new_keys]
+
+        self._run_single_group_cleanup()
+        self.assertFalse(any(os.path.exists(path) for path in old_paths))
+        self.assertTrue(all(os.path.exists(path) for path in new_paths))
+
+    def test_tick_deletes_named_windows_with_their_page(self):
+        """BUG REGRESSION. Window sub-pools go by their window's length, which
+        the cleaner did not recognise: a page's window objects formed groups
+        of their own, one per TP rank, apart from its KV. They are now one
+        group with the page across every rank."""
+        physical_suffixes = [
+            "",
+            "_k",
+            "_v",
+            "_window_4096_k",
+            "_window_4096_v",
+            "_window_128",
+            "_window_128_0",
+        ]
+        old_keys = [
+            f"page-old_model_{rank}_4{suffix}"
+            for rank in range(4)
+            for suffix in physical_suffixes
+        ]
+        new_keys = [
+            f"page-new_model_{rank}_4{suffix}"
+            for rank in range(4)
+            for suffix in physical_suffixes
+        ]
+        self.assertEqual(
+            {_parse_group_key(key) for key in old_keys}, {"page-old_model"}
+        )
         old_paths = [self._write_key(key, mtime=100.0) for key in old_keys]
         new_paths = [self._write_key(key, mtime=200.0) for key in new_keys]
 

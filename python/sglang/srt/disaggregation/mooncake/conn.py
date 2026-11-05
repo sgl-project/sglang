@@ -52,6 +52,7 @@ from sglang.srt.disaggregation.mooncake.utils import (
     check_mooncake_custom_mem_pool_enabled,
 )
 from sglang.srt.disaggregation.utils import (
+    align_window_tails,
     build_dsa_tail_transfer_blocks,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
@@ -251,9 +252,7 @@ def _uses_flat_entry_layout(
     even on an MHA backend.
     """
     is_single_region_swa = (
-        state_type in (StateType.SWA, StateType.AUXILIARY_SWA)
-        and num_src_entries == 1
-        and num_dst_entries == 1
+        state_type == StateType.SWA and num_src_entries == 1 and num_dst_entries == 1
     )
     return mla_backend or force_flat or has_layer_ids or is_single_region_swa
 
@@ -2045,7 +2044,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         (not the mamba-state path); subclasses extend for hardware components."""
         return st in (
             StateType.SWA,
-            StateType.AUXILIARY_SWA,
             StateType.DSA,
             StateType.QSA_PENDING,
             StateType.QSA_COMPRESSED,
@@ -2090,6 +2088,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     ):
         rc = 0
         state_types = getattr(self.kv_args, "state_types", [])
+        prefill_state_indices = align_window_tails(
+            self.kv_args, prefill_state_indices, req.dst_state_indices
+        )
         for i, st in enumerate(state_types):
             indices = (
                 prefill_state_indices[i] if i < len(prefill_state_indices) else None
@@ -2227,10 +2228,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     and not self.is_hybrid_mla_backend
                     and not is_qwen4_qsa_state
                 )
-                if slice_kv_heads and st not in (
-                    StateType.SWA,
-                    StateType.AUXILIARY_SWA,
-                ):
+                if slice_kv_heads and st != StateType.SWA:
                     raise RuntimeError(
                         f"PD Disaggregation does NOT support PD different TP sizes for non-MLA {st.upper()} hybrid models yet."
                     )

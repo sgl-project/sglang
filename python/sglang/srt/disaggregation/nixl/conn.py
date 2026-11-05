@@ -44,6 +44,7 @@ from sglang.srt.disaggregation.common.utils import (
 )
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.utils import (
+    align_window_tails,
     build_dsa_tail_transfer_blocks,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
@@ -83,7 +84,6 @@ _PREPARED_STATE_TYPES = frozenset(
     (
         StateType.MAMBA,
         StateType.SWA,
-        StateType.AUXILIARY_SWA,
         StateType.DSA,
         StateType.QSA_PENDING,
         StateType.QSA_COMPRESSED,
@@ -3076,6 +3076,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 f"NIXL state layout rejected for {peer_name}: {rejection}"
             )
         state_types = getattr(self.kv_args, "state_types", []) or []
+        prefill_state_indices = align_window_tails(
+            self.kv_args, prefill_state_indices, dst_state_indices
+        )
         src_state_data_ptrs = self.kv_args.state_data_ptrs or []
         src_state_item_lens = self.kv_args.state_item_lens or []
         src_state_dim_per_tensor = (
@@ -3201,7 +3204,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     force_flat=True,
                 )
             elif (
-                st in (StateType.SWA, StateType.AUXILIARY_SWA)
+                st == StateType.SWA
                 and not self.is_mla_backend
                 and self.attn_tp_size != decode_tp_size
             ):
@@ -3219,7 +3222,6 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 )
             elif st in (
                 StateType.SWA,
-                StateType.AUXILIARY_SWA,
                 StateType.BLOCK_SCALE,
                 StateType.BLOCK_SCALE_SWA,
                 StateType.QSA_PENDING,

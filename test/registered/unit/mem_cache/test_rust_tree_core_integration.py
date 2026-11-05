@@ -8,6 +8,7 @@ from itertools import pairwise
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import msgspec
 import pytest
 import torch
 
@@ -26,6 +27,7 @@ from sglang.srt.disaggregation.kv_events import (
     namespaced_block_hash,
 )
 from sglang.srt.environ import envs
+from sglang.srt.managers.cache_controller import PrefetchAck
 from sglang.srt.managers.mm_utils import pad_mm_tokens
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.managers.schedule_batch import Req
@@ -50,6 +52,10 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
+from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+    HybridCacheController,
+)
+from sglang.srt.mem_cache.kv.plan import TREE_WINDOW
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.rust_tree_core.adapter import (
@@ -5136,6 +5142,108 @@ def test_swa_prefetch_commit_end_to_end():
     (release,) = commit([50, 51], loaded_pages=2)
     assert isinstance(release, FreeComponentHostSlot)
     assert release.host_indices[0].tolist() == [50, 51]
+
+
+def _named_window_core(name: str, window: int):
+    """A window tree core whose window keeps its HiCache copies in the host
+    pool ``name`` (a window sub-pool's), which the core calls `swa`."""
+    slots = tuple(
+        (
+            msgspec.structs.replace(slot, host_pool=name)
+            if slot.family == TREE_WINDOW
+            else slot
+        )
+        for slot in tree_slots_of(
+            (ComponentType.FULL, ComponentType.SWA), window=window
+        )
+    )
+    core = _tree_core(tree_slots=slots, sliding_window_size=window)
+    core.set_hicache_enabled()
+    core.has_swa_host_pool = True
+    return core
+
+
+def _reduced_ack(pool_hits, host_pools):
+    """A prefetch ACK reduced as the host-cache controller reduces it, on the
+    one rank of its group, which registers ``host_pools``."""
+    controller = HybridCacheController.__new__(HybridCacheController)
+    controller.mem_pool_host = SimpleNamespace(entry_map=dict.fromkeys(host_pools))
+    controller.prefetch_completion_sync_groups = [None]
+    controller._host_pool_schemas = []
+    controller._all_gather_object = lambda obj, group: [obj]
+    controller._all_reduce = lambda tensor, op, groups: None
+    ack = PrefetchAck(rid="r", operation=None, pool_hits=dict(pool_hits))
+    controller._reduce_prefetch_ack(ack)
+    return ack
+
+
+def _commit_window_prefetch(core, name, host_indices, extra_pool_hit_pages):
+    """Insert a prefetched three-token suffix, then commit its window's host
+    buffer with the storage result the cache updates from the ACK."""
+    from sglang.srt.mem_cache.unified_cache.components import CacheTransferPhase
+
+    anchor = core.match_prefix(MatchPrefixParams(key=_key([99]))).best_match_node
+    insert_result = core.insert_host(
+        anchor,
+        _key([1, 2, 3]),
+        torch.tensor([100, 101, 102], dtype=torch.int64),
+        ["h0", "h1", "h2"],
+    )
+    result = PoolTransferResult(kv_hit_pages=3, extra_pool_hit_pages={})
+    result.update_extra_pool_hit_pages(extra_pool_hit_pages)
+    actions = []
+    core.commit_hicache_transfers(
+        anchor,
+        CacheTransferPhase.PREFETCH,
+        {
+            ComponentType.SWA: [
+                PoolTransfer(
+                    name=name,
+                    host_indices=torch.tensor(host_indices, dtype=torch.int64),
+                )
+            ]
+        },
+        cache_actions=actions,
+        insert_result=insert_result,
+        pool_storage_result=result,
+    )
+    return actions
+
+
+@pytest.mark.parametrize("loaded", [True, False])
+def test_named_window_prefetch_ack_reaches_the_core(loaded):
+    """BUG REGRESSION. The prefetch ACK was reduced over every legacy pool
+    name, so a named window's read gained an unused `swa: 0` entry; the
+    adapter, which gives the named window the core's name `swa`, let that
+    entry overwrite the read, and the core released a fully loaded window's
+    host buffer. The ACK names only host pools some rank registers, and the
+    named window's own count reaches the core."""
+    name = "window_4"
+    core = _named_window_core(name, window=4)
+    ack = _reduced_ack({name: 2} if loaded else {}, (PoolName.KV, name))
+    assert set(ack.pool_hits) <= {str(PoolName.KV), name}
+    actions = _commit_window_prefetch(core, name, [30, 31], ack.pool_hits)
+    if loaded:
+        # The whole window loaded: its tail is attached, nothing is freed.
+        assert actions == []
+    else:
+        # A failed read frees the prefetched host buffer.
+        (free,) = actions
+        assert isinstance(free, FreeComponentHostSlot)
+        assert free.host_indices[0].tolist() == [30, 31]
+
+
+@pytest.mark.parametrize("alias_first", [True, False])
+def test_named_window_pool_wins_over_its_core_alias(alias_first):
+    """A storage result may also carry an entry under the core's own window
+    name; the pool that was read decides, whichever comes first."""
+    name = "window_4"
+    core = _named_window_core(name, window=4)
+    hits = [(name, 2), (str(PoolName.SWA), 0)]
+    actions = _commit_window_prefetch(
+        core, name, [30, 31], dict(hits[::-1] if alias_first else hits)
+    )
+    assert actions == []
 
 
 def test_swa_locked_overlap_defers_through_the_recover_action():

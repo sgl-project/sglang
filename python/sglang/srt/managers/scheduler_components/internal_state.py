@@ -81,6 +81,7 @@ class SchedulerInternalStateController:
             startup_available_gb=scheduler.startup_available_gpu_memory_gb,
             token_capacity=scheduler.max_total_num_tokens,
             token_capacity_swa=scheduler.swa_tokens_per_layer,
+            token_capacity_window=scheduler.window_token_capacities(),
             target_graph_memory_usage=scheduler.tp_worker.graph_memory_usage,
             draft_graph_memory_usage=(
                 None if draft_worker is None else draft_worker.graph_memory_usage

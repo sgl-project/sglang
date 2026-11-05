@@ -55,7 +55,11 @@ from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.tree_slots import storage_tree_slots, window_evictable
+from sglang.test.tree_slots import (
+    only_window,
+    storage_tree_slots,
+    window_evictable,
+)
 from sglang.test.unified_allocator_fixtures import (
     build_test_unified_pools,
     build_tri_pool,
@@ -492,6 +496,9 @@ class _UnifiedHiCacheCase(_ConfigCase):
         controller = cache.cache_controller
         self.cache = cache
         self.controller = controller
+        # The window sub-pool names its host pool; the tree numbers its slot.
+        self.window_pool = only_window(cache)
+        self.window_slot = cache.slot_id(TREE_WINDOW)
         # Compaction and frees wait through this stand-in stream.
         stream = _recorded_stream()
         stream.__enter__()
@@ -535,7 +542,7 @@ class TestSwaLoadBackReservation(_UnifiedHiCacheCase):
         # span. Hold that spare span so this test exercises eviction on retry.
         spare = swa.alloc_physical(swa.available_size())
         self.assertIsNotNone(spare)
-        entry = self.controller.mem_pool_host.entry_map[PoolName.SWA]
+        entry = self.controller.mem_pool_host.entry_map[self.window_pool]
         evict = entry.device_evict_fn
         evictions = []
 
@@ -543,7 +550,9 @@ class TestSwaLoadBackReservation(_UnifiedHiCacheCase):
             evictions.append(need_size)
             return evict(need_size)
 
-        transfer = PoolTransfer(name=PoolName.SWA, host_indices=torch.arange(2 * PAGE))
+        transfer = PoolTransfer(
+            name=self.window_pool, host_indices=torch.arange(2 * PAGE)
+        )
         with mock.patch.object(entry, "device_evict_fn", side_effect=recorded_evict):
             result = self.controller._resolve_device_transfers(
                 [transfer], kv_device_indices=torch.empty(0, dtype=torch.int64)
@@ -615,7 +624,7 @@ class TestLoadBackAdmission(_UnifiedHiCacheCase):
         return (
             core.get_component_device_lock_ref(node, FULL),
             core.get_component_host_lock_ref(node, FULL),
-            core.get_component_host_lock_ref(node, self.cache.slot_id(TREE_WINDOW)),
+            core.get_component_host_lock_ref(node, self.window_slot),
         )
 
     def _host_pressure(self):
@@ -677,15 +686,7 @@ class TestLoadBackAdmission(_UnifiedHiCacheCase):
         _, expected = self._insert(tokens, 100)
         self.cache.flush_pending_backups()
         self.cache.writing_check()
-        self.cache.evict(
-            EvictParams(
-                window_num_tokens={
-                    self.cache.window_sub_pool_of_slot(
-                        self.cache.slot_id(TREE_WINDOW)
-                    ): len(tokens)
-                }
-            )
-        )
+        self.cache.evict(EvictParams(window_num_tokens={self.window_pool: len(tokens)}))
         req = self._request(tokens + list(range(17, 21)))
         # A running request locks its whole path; only its SWA past the window
         # can be reclaimed.
@@ -773,22 +774,14 @@ class TestLoadBackAdmission(_UnifiedHiCacheCase):
         # Submitted after the move: the copy reads where the rows went.
         self.cache.flush_pending_backups()
         self.cache.writing_check()
-        self.cache.evict(
-            EvictParams(
-                window_num_tokens={
-                    self.cache.window_sub_pool_of_slot(
-                        self.cache.slot_id(TREE_WINDOW)
-                    ): len(tokens)
-                }
-            )
-        )
+        self.cache.evict(EvictParams(window_num_tokens={self.window_pool: len(tokens)}))
         req = self._request(tokens + list(range(17, 21)))
         verdict = self._adder().add_one_req(
             req, has_chunked_req=False, truncation_align_size=None
         )
         self.assertIs(verdict, AddReqResult.CONTINUE)
         (op,) = self.controller.load_queue
-        (window,) = [t for t in op.pool_transfers if t.name == PoolName.SWA]
+        (window,) = [t for t in op.pool_transfers if t.name == self.window_pool]
         owner = self.cache.prefix_device_indices(req)[-len(window.device_indices) :]
         # The load-back's bound rows go by the owner's ids until submission.
         self.assertTrue(torch.equal(window.device_indices, owner.to(torch.int64)))
@@ -811,15 +804,7 @@ class TestLoadBackAdmission(_UnifiedHiCacheCase):
         ids, expected = self._insert(tokens, 100)
         self.cache.flush_pending_backups()
         self.cache.writing_check()
-        self.cache.evict(
-            EvictParams(
-                window_num_tokens={
-                    self.cache.window_sub_pool_of_slot(
-                        self.cache.slot_id(TREE_WINDOW)
-                    ): len(tokens)
-                }
-            )
-        )
+        self.cache.evict(EvictParams(window_num_tokens={self.window_pool: len(tokens)}))
         # Window rows that end up below the load's reservation, freed once the
         # load is queued so that compaction moves the reserved rows into them.
         gap = self.allocator.alloc(2 * PAGE)
@@ -829,7 +814,7 @@ class TestLoadBackAdmission(_UnifiedHiCacheCase):
         )
         self.assertIs(verdict, AddReqResult.CONTINUE)
         (op,) = self.controller.load_queue
-        (window,) = [t for t in op.pool_transfers if t.name == PoolName.SWA]
+        (window,) = [t for t in op.pool_transfers if t.name == self.window_pool]
         prefix = self.cache.prefix_device_indices(req)
         owner = prefix[-len(window.device_indices) :].to(torch.int64)
         self.assertTrue(torch.equal(window.device_indices, owner))

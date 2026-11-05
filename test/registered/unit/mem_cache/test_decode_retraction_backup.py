@@ -139,6 +139,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
         radix_cache=False,
         host_receive_threshold=0.5,
         hybrid_swa=False,
+        draft_reach=0,
     ):
         """Bring up a UnifiedRadixCache over fresh pools, optionally with draft KV."""
         server_args = ServerArgs(
@@ -206,7 +207,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
             **({"size_swa": self.pool_size} if hybrid_swa else {}),
         )
         kv_storage_of(req_to_token_pool, allocator).bind_window_retention(
-            8 if hybrid_swa else None, None
+            8 if hybrid_swa else None, {"swa": draft_reach} if draft_reach else None
         )
         params = CacheInitParams(
             disable=not radix_cache,
@@ -220,7 +221,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
                     if hybrid_swa
                     else (ComponentType.FULL,)
                 ),
-                window=8 if hybrid_swa else None,
+                window=max(8, draft_reach) if hybrid_swa else None,
             ),
             sliding_window_size=8 if hybrid_swa else None,
             mtp_draft_device_pools=(
@@ -446,7 +447,9 @@ class TestDecodeRetractionBackup(CustomTestCase):
         queue, _ = self._receive_queue(env)
         group = env.cache.host_pool_group
         full_host = group.get_pool(PoolName.KV)
-        swa_host = group.get_pool(PoolName.SWA)
+        # The window's state entry lands in its own host pool.
+        ((window_pool, swa_host, window_reserved, _),) = queue.host_window_entries
+        self.assertIs(group.get_pool(window_pool), swa_host)
         capacities = (full_host.available_size(), swa_host.available_size())
         req = Req(
             rid="swa-host-receive",
@@ -457,9 +460,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
         )
         receiver = Mock()
         decode_req = DecodeRequest(req=req, kv_receiver=receiver)
-        blocker = swa_host.alloc(
-            swa_host.available_size() - queue.host_swa_reserved_tokens
-        )
+        blocker = swa_host.alloc(swa_host.available_size() - window_reserved)
         self.assertFalse(queue._pre_alloc_host(decode_req))
         self.assertEqual(full_host.available_size(), capacities[0])
         receiver.send_metadata.assert_not_called()
@@ -480,7 +481,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
         expected = []
         for pool_name, host_indices, num_tokens in (
             (PoolName.KV, backup.host_indices, 23),
-            (PoolName.SWA, backup.pool_transfers[0].host_indices, 11),
+            (window_pool, backup.pool_transfers[0].host_indices, 11),
         ):
             entry = group.get_entry(pool_name)
             pool = entry.device_pool
@@ -525,6 +526,69 @@ class TestDecodeRetractionBackup(CustomTestCase):
         self.assertEqual(
             (full_host.available_size(), swa_host.available_size()), capacities
         )
+
+    @patch("torch.distributed.get_world_size", return_value=1)
+    def test_host_receive_restore_with_a_widened_window_slot(self, _world_size):
+        """A reader reaching further back than the attention window (a fused
+        draft's front rows) widens the window tail a request keeps, which
+        retraction backs up and restores. A received request keeps the same
+        tail: the decode receives, binds and restores all of it, each row at
+        its own position."""
+        env = self._build_cache(
+            hicache_ratio=2.0,
+            shared_receive=True,
+            page_size=4,
+            hybrid_swa=True,
+            host_receive_threshold=0,
+            draft_reach=12,
+        )
+        queue, kv_args = self._receive_queue(env)
+        group = env.cache.host_pool_group
+        ((window_pool, _, _, window),) = queue.host_window_entries
+        self.assertEqual(window, 12)
+        req = Req(
+            rid="swa-host-receive-widened",
+            origin_input_text="",
+            bootstrap_host="localhost",
+            origin_input_ids=array("q", [1] * 23),
+            sampling_params=SamplingParams(max_new_tokens=1),
+        )
+        receiver = Mock()
+        decode_req = DecodeRequest(req=req, kv_receiver=receiver)
+        self.assertTrue(queue._pre_alloc_host(decode_req))
+        backup = req.kv.retraction_backup
+        window_host = backup.pool_transfers[0].host_indices
+        # The kept tail starts at the page holding position 23 - 12 = 11.
+        self.assertEqual(len(window_host), 16)
+        self.assertEqual(len(receiver.send_metadata.call_args.args[2][0]), 4)
+        entry = group.get_entry(window_pool)
+        pool = entry.device_pool
+        sent = []
+        for index, (buffer, host_buffer) in enumerate(
+            zip(
+                pool.k_buffer + pool.v_buffer,
+                entry.host_pool.host_kv_data_refs,
+                strict=True,
+            )
+        ):
+            values = torch.arange(len(window_host) * buffer[0].numel()).reshape(
+                len(window_host), *buffer.shape[1:]
+            )
+            values = ((values + index * 37) % 251).to(self.dtype)
+            host_buffer[window_host] = values
+            sent.append((buffer, values[:15]))
+            buffer.fill_(-1)
+
+        self.assertTrue(queue.allocate_host_staged(decode_req))
+        req.output_ids.append(99)
+        env.cache.restore_kv_cache(req, backup)
+        self._finish_restores(env.cache)
+        full_indices = env.req_to_token_pool.req_to_token[
+            req.kv.req_pool_idx, :23
+        ].long()
+        swa_indices = env.allocator.translate_swa_indices_for_transfer(full_indices[8:])
+        for buffer, values in sent:
+            self.assertTrue(torch.equal(buffer[swa_indices].cpu(), values))
 
     @patch("torch.distributed.get_world_size", return_value=1)
     def test_host_receive_threshold_controls_device_allocation(self, _world_size):

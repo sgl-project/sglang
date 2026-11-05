@@ -12,6 +12,7 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Callable,
+    Dict,
     Iterable,
     List,
     Literal,
@@ -335,10 +336,11 @@ def kv_layout_signature(kv_args: KVArgs) -> int:
     Two sides can compare digests only if they cover the same bytes. A prefill
     with another TP width has other per-page item lengths; a PP or
     layer-sharded prefill owns fewer buffers; the same byte sizes under another
-    dtype or page layout (fp16 vs bf16, two V4 layouts) hold other bytes.
-    Shipped beside the digest, so those become one logged skip instead of a
-    mismatch on every request. Positive int64 and never 0, which marks "no
-    digest" in the metadata row.
+    dtype or page layout (fp16 vs bf16, two V4 layouts) hold other bytes; a
+    prefill keeping a longer window tail than its decode digests more of that
+    window's pages. Shipped beside the digest, so those become one logged skip
+    instead of a mismatch on every request. Positive int64 and never 0, which
+    marks "no digest" in the metadata row.
     """
     layout = (
         kv_args.page_size,
@@ -348,9 +350,120 @@ def kv_layout_signature(kv_args: KVArgs) -> int:
         [state_type.value for state_type in kv_args.state_types],
         list(kv_args.kv_item_lens),
         [list(lens) for lens in kv_args.state_item_lens],
+        list(getattr(kv_args, "state_window_tails", None) or ()),
     )
     raw = hashlib.blake2b(repr(layout).encode(), digest_size=8).digest()
     return int.from_bytes(raw, "big") >> 1 | 1
+
+
+def state_wire(kv_args: KVArgs) -> Optional[List[List[Optional[str]]]]:
+    """The state entries a PD peer registers, in order, as (state type,
+    sub-pool) pairs, with the tail a window entry carries when the peer
+    states it: two peers transfer state entry by entry, page by page, so
+    theirs must be equal. None when the peer registered no state entries
+    yet."""
+    state_types = getattr(kv_args, "state_types", None)
+    if state_types is None:
+        return None
+    keys = getattr(kv_args, "state_wire_keys", None) or [None] * len(state_types)
+    tails = getattr(kv_args, "state_window_tails", None) or [None] * len(state_types)
+    return [
+        [_wire_state_type(state_type).value, key] + ([] if tail is None else [tail])
+        for state_type, key, tail in zip(state_types, keys, tails)
+    ]
+
+
+def check_state_wire(
+    prefill_wire: Optional[List[List[Optional[str]]]],
+    decode_wire: Optional[List[List[Optional[str]]]],
+) -> None:
+    """Refuse peers whose state entries cannot pair: entries pair by position,
+    each of the same state type and sub-pool. A window entry may come from a
+    prefill keeping a longer tail than the decode (it sends the decode's
+    tail), never a shorter one."""
+    if prefill_wire is None or decode_wire is None or prefill_wire == decode_wire:
+        return
+    if len(prefill_wire) == len(decode_wire):
+        prefill_kinds = {entry[1] is None for entry in prefill_wire}
+        decode_kinds = {entry[1] is None for entry in decode_wire}
+        if prefill_wire and prefill_kinds != decode_kinds:
+            raise RuntimeError(
+                f"PD state entry mismatch: prefill server registers {prefill_wire}, "
+                f"but decode server registers {decode_wire}. A server with unified "
+                "memory cannot pair with one without it: mixed pool kinds are not "
+                "supported."
+            )
+        shorter = [
+            (p[1], p[2], d[2])
+            for p, d in zip(prefill_wire, decode_wire)
+            if p[:2] == d[:2] and len(p) > 2 and len(d) > 2 and p[2] < d[2]
+        ]
+        if all(
+            p[:2] == d[:2] and (len(p) > 2) == (len(d) > 2)
+            for p, d in zip(prefill_wire, decode_wire)
+        ):
+            if not shorter:
+                return
+            raise RuntimeError(
+                "PD state entry mismatch: the prefill server keeps a shorter "
+                "window tail than the decode server needs, as (sub-pool, prefill "
+                f"tail, decode tail): {shorter}. Both servers need the same "
+                "draft model and front rows, or a prefill keeping more."
+            )
+    raise RuntimeError(
+        f"PD state entry mismatch: prefill server registers {prefill_wire}, but "
+        f"decode server registers {decode_wire} (state type, sub-pool, window "
+        "tail). Both servers must hold the same attention and state sub-pools "
+        "(model, window lengths, draft model and its front rows, unified memory "
+        "settings)."
+    )
+
+
+def align_window_tails(kv_args: KVArgs, prefill_state_indices, dst_state_indices):
+    """The prefill's state pages, each window entry carried by its sub-pool
+    cut to its decode's newest pages. Both lists end at the request's last
+    token, so a prefill keeping a longer tail than its decode (a reader of
+    its own reaching further back) sends the extra pages in front; the decode
+    receives only the tail it keeps."""
+    from sglang.srt.disaggregation.base.conn import StateType
+
+    sub_pools = getattr(kv_args, "state_sub_pools", None) or []
+    state_types = getattr(kv_args, "state_types", None) or []
+    aligned = list(prefill_state_indices)
+    for i, (state_type, sub_pool) in enumerate(zip(state_types, sub_pools)):
+        if sub_pool is None or state_type != StateType.SWA:
+            continue
+        if i >= len(aligned) or i >= len(dst_state_indices):
+            continue
+        src, dst = aligned[i], dst_state_indices[i]
+        if src is None or dst is None or len(src) <= len(dst):
+            continue
+        aligned[i] = src[len(src) - len(dst) :]
+    return aligned
+
+
+def state_indices_per_entry(
+    kv_args: KVArgs,
+    state_types: Sequence,
+    payloads: Dict,
+    window_payload: Callable[[str], Any],
+) -> List:
+    """One payload per registered state entry: a window entry carries the
+    pages of its own sub-pool; any other entry, and an entry without a
+    sub-pool (a static pool's), its state type's payload (None when the type
+    has none)."""
+    from sglang.srt.disaggregation.base.conn import StateType
+
+    return [
+        (
+            window_payload(sub_pool)
+            if sub_pool is not None and st == StateType.SWA
+            else payloads[st]()
+            if st in payloads
+            else None
+        )
+        for st, sub_pool in zip(state_types, kv_args.state_sub_pools)
+    ]
 
 
 def all_reduce_flags(
@@ -1417,10 +1530,14 @@ def append_state_component(
     conv_shard_groups: Optional[List[Optional[List[int]]]] = None,
     slice_outer_counts: Optional[List[int]] = None,
     layer_ids: Optional[List[int]] = None,
+    sub_pool: Optional[str] = None,
+    wire_key: Optional[str] = None,
 ) -> None:
     """Append one state component. Caller orders state_types consistently
     on prefill and decode sides."""
     kv_args.state_types.append(state_type)
+    kv_args.state_sub_pools.append(sub_pool)
+    kv_args.state_wire_keys.append(wire_key)
     kv_args.state_data_ptrs.append(data_ptrs)
     kv_args.state_data_lens.append(data_lens)
     kv_args.state_item_lens.append(item_lens)
@@ -1629,28 +1746,23 @@ def _wire_state_type(state_type) -> Enum:
     return state_type if isinstance(state_type, Enum) else StateType(state_type)
 
 
-def wire_sub_pool(storage, state_type) -> str:
-    """The sub-pool a storage transfers as ``state_type``."""
-    return next(
-        entry.sub_pool
-        for entry in storage.wire_entries()
-        if _wire_state_type(entry.state_type) == state_type
-    )
-
-
 def setup_state_kv_args(
     kv_args: KVArgs,
     storage: KVStorage | StaticKVStorage,
     draft_token_to_kv_pool=None,
     total_kv_layers: Optional[int] = None,
+    window_tails: Optional[Dict[str, int]] = None,
 ) -> None:
     """Register the storage's state entries in its wire order, and the flags
-    peers read from its token KV layout."""
+    peers read from its token KV layout. ``window_tails`` gives the tail each
+    window sub-pool carries (`KVStorage.retained_window_lengths`); peers agree on it."""
     from sglang.srt.disaggregation.base.conn import StateType
     from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 
     kv_args.state_types = []
+    kv_args.state_sub_pools = []
+    kv_args.state_wire_keys = []
     kv_args.state_data_ptrs = []
     kv_args.state_data_lens = []
     kv_args.state_item_lens = []
@@ -1679,9 +1791,15 @@ def setup_state_kv_args(
             list(region.conv_shard_groups),
             list(region.slice_outer_counts),
             list(region.layer_ids),
+            sub_pool=storage.entry_sub_pool(entry),
+            wire_key=storage.entry_wire_key(entry),
         )
         if state_type == StateType.SWA:
             kv_args.swa_kv_cache_layout = region.kv_layout
+    kv_args.state_window_tails = [
+        (window_tails or {}).get(sub_pool) if sub_pool is not None else None
+        for sub_pool in kv_args.state_sub_pools
+    ]
     # MLA token KV beside recurrent state.
     kv_args.is_hybrid_mla_backend = (
         is_mla_backend(owner_view) and StateType.MAMBA in kv_args.state_types

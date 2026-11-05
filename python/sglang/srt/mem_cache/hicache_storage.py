@@ -109,7 +109,6 @@ class PoolName(str, Enum):
     KV = "kv"
     MAMBA = "mamba"
     SWA = "swa"
-    AUXILIARY_SWA = "auxiliary_swa"
     INDEXER = "indexer"
     # TODO(hzh0425): Current DeepSeek V4 pool naming is verbose; will be normalized to
     # 'COMPRESSED_KV / COMPRESSED_INDEXER / COMPRESSED_STATE' in the next PR.
@@ -145,6 +144,19 @@ class PoolName(str, Enum):
         return self.value
 
 
+# A host pool's name, always a plain string: a well-known `PoolName` value, or,
+# for a window sub-pool of a unified pool, the sub-pool's own name (one host
+# pool per window, so their number is the model's). Transfers and pool entries
+# store the plain string; a `PoolName` member compares and hashes equal to it.
+HostPoolName = str
+
+
+def host_pool_name(name: str) -> HostPoolName:
+    """``name`` as a host pool name: the plain string of a `PoolName` member,
+    or the name itself."""
+    return str(name)
+
+
 class PoolHitPolicy(str, Enum):
     """Hit policy for batch_exists_v2 per-pool prefix matching.
 
@@ -170,16 +182,21 @@ class PoolTransfer:
     nodes_to_load      : evicted nodes this transfer covers
     """
 
-    name: PoolName
+    name: HostPoolName
     host_indices: Optional[torch.Tensor] = None
     device_indices: Optional[torch.Tensor] = None
     keys: Optional[List[str]] = None
     hit_policy: PoolHitPolicy = PoolHitPolicy.ALL_PAGES
     nodes_to_load: Optional[List[Any]] = None
-    indices_from_pool: Optional[PoolName] = None
+    indices_from_pool: Optional[HostPoolName] = None
     # BLOCK_GROUPS geometry: FULL pages per block and keys (pages) per group.
     block_pages: int = 0
     group_pages: int = 0
+
+    def __post_init__(self):
+        self.name = host_pool_name(self.name)
+        if self.indices_from_pool is not None:
+            self.indices_from_pool = host_pool_name(self.indices_from_pool)
 
 
 def merge_source_transfers(
@@ -214,9 +231,15 @@ def merge_source_transfers(
 class SidecarPoolSpec:
     """Pool whose transfer indices are reused from one real source pool."""
 
-    pool_name: PoolName
-    indices_from_pool: PoolName
+    pool_name: HostPoolName
+    indices_from_pool: HostPoolName
     hit_policy: PoolHitPolicy = PoolHitPolicy.ALL_PAGES
+
+    def __post_init__(self):
+        object.__setattr__(self, "pool_name", host_pool_name(self.pool_name))
+        object.__setattr__(
+            self, "indices_from_pool", host_pool_name(self.indices_from_pool)
+        )
 
 
 @dataclass
