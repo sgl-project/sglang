@@ -96,7 +96,7 @@ from sglang.srt.model_executor.forward_context import (
 )
 from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.runtime_context import get_forward, get_memory, get_parallel
+from sglang.srt.runtime_context import get_exec, get_forward, get_memory, get_parallel
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 from sglang.srt.utils import add_prefix, is_cpu, use_intel_amx_backend
 from sglang.srt.utils.common import get_device_capability, is_cuda
@@ -781,6 +781,8 @@ class MuseSpark1xMoE(nn.Module):
             and not self.experts.use_marlin
             # Graph capture sees a fixed set of token counts; eager shapes would each cache routing metadata.
             and get_is_capture_mode()
+            # The split runs FlashInfer's default tactic; with autotune on, the ordinary call keeps its tuned one.
+            and get_exec().kernel.disable_flashinfer_autotune
         ):
             return None
         # Imports FlashInfer internals; only the NVFP4 FlashInfer path reaches here.
