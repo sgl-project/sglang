@@ -221,6 +221,9 @@ def match_kv_cache(
         match_result.mamba_host_hit_length,
     )
     req.matched_window_host_hit_lengths = dict(match_result.window_host_hit_lengths)
+    req.host_hit_write_back = match_result.host_hit_write_back
+    req.host_hit_prefetch = match_result.host_hit_prefetch
+    req.host_hit_source_ranges = match_result.host_hit_source_ranges
     max_len = req._compute_max_prefix_len(len(token_ids))
     req.num_matched_prefix_tokens = min(req.prefix_len + req.host_hit_length, max_len)
     req.swa_branching_seqlen = match_result.swa_branching_seqlen
