@@ -1,3 +1,4 @@
+import gc
 import unittest
 import weakref
 from types import SimpleNamespace
@@ -146,6 +147,7 @@ class TestGDNMISMetadata(CustomTestCase):
             previous_maps = weakref.ref(metadata.batch_tensors.item_ssm_indices)
             observations.clear()
             del metadata, query, item, tensors
+            gc.collect()
             self.assertIsNone(previous_maps())
             batch = self._batch()
             batch.multi_item_delimiter_indices = [
