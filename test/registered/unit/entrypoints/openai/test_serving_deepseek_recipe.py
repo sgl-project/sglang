@@ -14,6 +14,7 @@ DSML_CALL = (
     '<｜DSML｜ parameter name="x" string="true">1</｜DSML｜ parameter>\n'
     "</｜DSML｜ invoke>\n</｜DSML｜ calls>"
 )
+TOOL = {"type": "function", "function": {"name": "f", "parameters": {}}}
 
 
 def _tokenizer_file():
@@ -354,24 +355,26 @@ class TestHandlerRequestSemantics(CustomTestCase):
             self._parse(chat, "A title", task="title", **thinking)[:2],
             (None, "A title"),
         )
-        continued = [
-            {"role": "user", "content": "hi"},
-            {"role": "assistant", "content": "Hello"},
-        ]
-        self.assertEqual(
-            self._parse(
-                chat,
-                " world",
-                messages=continued,
-                continue_final_message=True,
-                **thinking,
-            )[:2],
-            (None, " world"),
-        )
+        for content in ("Hello", [{"type": "text", "text": "Hello"}]):
+            continued = [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": content},
+            ]
+            with self.subTest(content=content):
+                self.assertEqual(
+                    self._parse(
+                        chat,
+                        " world",
+                        messages=continued,
+                        continue_final_message=True,
+                        **thinking,
+                    )[:2],
+                    (None, " world"),
+                )
 
     def test_natural_stop_inside_reasoning_fails(self):
         """A thinking output that stops on its own inside its reasoning fails, also
-        when the request sets other stops or parses no calls."""
+        when the request sets other stops or no call is parsed."""
         from sglang.srt.parser.deepseek_recipe_output import UnclosedReasoningError
 
         chat = _serving(self, self.tokenizer)
@@ -386,6 +389,11 @@ class TestHandlerRequestSemantics(CustomTestCase):
             ("Still thinking.", other_stops),
             # Without tools, a calls block is reasoning text.
             ("Still thinking." + DSML_CALL, {}),
+            # A calls block ends the reasoning only through a call in it.
+            (
+                "Still thinking.\n\n<｜DSML｜ calls>\n</｜DSML｜ calls>",
+                {"tools": [TOOL]},
+            ),
         ):
             with (
                 self.subTest(text=text, fields=fields),
@@ -418,21 +426,28 @@ class TestHandlerRequestSemantics(CustomTestCase):
                 self.assertTrue(reasoning.startswith("Still thinking"))
                 self.assertEqual(content, "")
 
-    def test_calls_and_task_outputs_end_without_think_end(self):
-        """A calls block ends reasoning as recipe parses it, and a task output such
-        as an action label has no reasoning to close."""
+    def test_outputs_that_may_skip_think_end_are_returned(self):
+        """A parsed call ends the reasoning, and a task output, a constrained output
+        or reasoning sent as content is returned without </think>."""
         chat = _serving(self, self.tokenizer)
         thinking = {"chat_template_kwargs": {"thinking": True}}
-        tool = {"type": "function", "function": {"name": "f", "parameters": {}}}
         _, _, calls = self._parse(
-            chat, "Still thinking." + DSML_CALL, tools=[tool], **thinking
+            chat, "Still thinking." + DSML_CALL, tools=[TOOL], **thinking
         )
         self.assertEqual([call.function.name for call in calls], ["f"])
-        reasoning, content, _ = self._parse(chat, "search", task="action", **thinking)
-        self.assertEqual((reasoning or "") + content, "search")
+        for text, fields in (
+            ("search", {"task": "action"}),
+            ('{"a": 1}', {"response_format": {"type": "json_object"}}),
+            ("Still thinking.", {"regex": r"Still thinking\."}),
+            ("Still thinking.", {"separate_reasoning": False}),
+        ):
+            with self.subTest(fields=fields):
+                reasoning, content, _ = self._parse(chat, text, **thinking, **fields)
+                self.assertEqual((reasoning or "") + content, text)
 
     def test_other_paths_fail_at_a_natural_stop_inside_reasoning(self):
-        """Streamed chat and both Responses paths fail at such a finish too."""
+        """Streamed chat and both Responses paths fail at such a finish too, but
+        not after </think> has streamed in."""
         from sglang.srt.entrypoints.openai.protocol import (
             ChatCompletionRequest,
             ResponsesRequest,
@@ -469,23 +484,23 @@ class TestHandlerRequestSemantics(CustomTestCase):
                 usage=None,
             )
 
-        for end in range(1, len(output_ids) + 1):
-            last = end == len(output_ids)
-            chunk = {
-                "output_ids": output_ids[:end],
+        def chunk(ids, last):
+            return {
+                "output_ids": ids,
                 "meta_info": {
                     "id": "chat",
-                    "completion_tokens": end,
+                    "completion_tokens": len(ids),
                     "finish_reason": finish if last else None,
                 },
             }
-            if not last:
-                stream_chat(chunk, None)
-                responses_stream.step(chunk, None)
+
+        for end in range(1, len(output_ids)):
+            stream_chat(chunk(output_ids[:end], False), None)
+            responses_stream.step(chunk(output_ids[:end], False), None)
         with self.assertRaises(UnclosedReasoningError):
-            stream_chat(chunk, "stop")
+            stream_chat(chunk(output_ids, True), "stop")
         with self.assertRaises(UnclosedReasoningError):
-            responses_stream.step(chunk, finish)
+            responses_stream.step(chunk(output_ids, True), finish)
         with self.assertRaises(UnclosedReasoningError):
             adapter.parse_responses_output(
                 request=ResponsesRequest(input="hi"),
@@ -495,6 +510,13 @@ class TestHandlerRequestSemantics(CustomTestCase):
                 separate_reasoning=True,
                 parse_tool_calls=False,
             )
+
+        parsers.clear()
+        closed = self.tokenizer.encode("Done.</think>", add_special_tokens=False)
+        closed.append(eos)
+        for end in range(1, len(closed)):
+            stream_chat(chunk(closed[:end], False), None)
+        stream_chat(chunk(closed, True), "stop")
 
     def test_streamed_tool_call(self):
         from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest

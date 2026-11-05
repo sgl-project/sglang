@@ -21,7 +21,6 @@ IMAGE_TOKEN = "<｜deepseek_image｜>"
 ASSISTANT_TOKEN = "<｜Assistant｜>"
 THINK_START_TOKEN = "<think>"
 THINK_END_TOKEN = "</think>"
-DSML_TOKEN = "｜DSML｜"
 TASK_TOKENS = {
     "action": "<｜action｜>",
     "query": "<｜query｜>",

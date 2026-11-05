@@ -11,7 +11,6 @@ from typing import Any, Optional
 import msgspec
 
 from sglang.srt.parser.deepseek_recipe_renderer import (
-    DSML_TOKEN,
     THINK_END_TOKEN,
     THINK_START_TOKEN,
     DeepSeekRecipe,
@@ -50,7 +49,7 @@ class RecipeToolCall(msgspec.Struct, frozen=True):
 
 
 class UnclosedReasoningError(ValueError):
-    """A thinking output that stopped inside its reasoning."""
+    """A ValueError, so chat answers it with a 400 or a stream error."""
 
 
 def whole_tool_calls(delta: RecipeOutputDelta) -> list[RecipeToolCall]:
@@ -81,6 +80,7 @@ class DeepSeekRecipeOutputParser:
         parse_json_output: bool = False,
         separate_reasoning: bool = True,
         stream_reasoning: bool = True,
+        reasoning_must_close: bool = True,
         stop: Sequence[str] = (),
         stop_regex: Sequence[str] = (),
         stop_token_ids: Sequence[int] = (),
@@ -114,11 +114,14 @@ class DeepSeekRecipeOutputParser:
         self.num_consumed_tokens = 0
         # A finish reports a client stop by its string, regex or id, and EOS by its id.
         self._client_stops = (*stop, *stop_regex, *stop_token_ids)
-        # Reasoning ends at </think> or, as recipe parses calls, at a DSML block.
-        ends = (THINK_END_TOKEN, DSML_TOKEN) if parse_tool_calls else (THINK_END_TOKEN,)
-        self._reasoning_end_ids = {self._hf_tokenizer.token_to_id(t) for t in ends}
+        self._think_end_id = self._hf_tokenizer.token_to_id(THINK_END_TOKEN)
+        # Reasoning ends at </think> or at the first call recipe parses. Reasoning
+        # sent as content cannot leave the answer empty, so it is not tracked.
         self._reasoning_open = (
-            thinking_stage is not None and thinking_stage.starts_in_reasoning()
+            reasoning_must_close
+            and separate_reasoning
+            and thinking_stage is not None
+            and thinking_stage.starts_in_reasoning()
         )
 
     def feed(self, token_ids: Sequence[int]) -> RecipeOutputDelta:
@@ -132,7 +135,7 @@ class DeepSeekRecipeOutputParser:
         return self._deltas(self._push(ready))
 
     def _push(self, token_ids: list[int]) -> list[Any]:
-        if not self._reasoning_end_ids.isdisjoint(token_ids):
+        if self._think_end_id in token_ids:
             self._reasoning_open = False
         return self._processor.push(self._recipe.InferenceChunk.tokens(token_ids))
 
@@ -186,20 +189,6 @@ class DeepSeekRecipeOutputParser:
                 )
         return self._deltas(chunks)
 
-    def check_reasoning_closed(self, finish_reason: dict[str, Any]) -> None:
-        """After `finish`: raise if a thinking output stopped in its reasoning,
-        on a stop the client did not ask for such as EOS."""
-        # Length and abort finishes and a matched client stop cut it on purpose.
-        if (
-            self._reasoning_open
-            and finish_reason["type"] == "stop"
-            and finish_reason.get("matched") not in self._client_stops
-        ):
-            raise UnclosedReasoningError(
-                "The model stopped inside its reasoning, "
-                "before any answer or tool call."
-            )
-
     def _cut_at_stop_string(
         self, token_ids: list[int], stop: str, *, keep_stop: bool
     ) -> list[int]:
@@ -230,6 +219,19 @@ class DeepSeekRecipeOutputParser:
             + self._hf_tokenizer.encode(text[:cut], add_special_tokens=False).ids
         )
 
+    def check_reasoning_closed(self, finish_reason: dict[str, Any]) -> None:
+        """After `finish`: raise if the output stopped on its own inside its
+        reasoning. Length, abort and client stops cut it on purpose."""
+        if (
+            self._reasoning_open
+            and finish_reason["type"] == "stop"
+            and finish_reason.get("matched") not in self._client_stops
+        ):
+            raise UnclosedReasoningError(
+                "The model stopped inside its reasoning, "
+                "before any answer or tool call."
+            )
+
     def _deltas(self, chunks: list[Any]) -> RecipeOutputDelta:
         delta = RecipeOutputDelta()
         for chunk in chunks:
@@ -247,6 +249,8 @@ class DeepSeekRecipeOutputParser:
                 )
                 for call in piece.get("tool_calls") or ()
             )
+            if tool_calls:
+                self._reasoning_open = False
             if self._reasoning_as_content:
                 content, reasoning = reasoning + content, ""
             if self._hold_reasoning:

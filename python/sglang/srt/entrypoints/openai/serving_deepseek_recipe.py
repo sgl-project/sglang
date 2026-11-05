@@ -187,9 +187,7 @@ class DeepSeekRecipeChatEncodingAdapter:
         delta = parser.finish(
             output_ids, finish_reason, keep_matched_stop=request.no_stop_trim
         )
-        # A task output, such as an action label, has no reasoning to close.
-        if request.task is None:
-            parser.check_reasoning_closed(finish_reason)
+        parser.check_reasoning_closed(finish_reason)
         calls = whole_tool_calls(delta)
         if not calls:
             return delta.reasoning or None, delta.content, None, finish_reason
@@ -236,8 +234,7 @@ class DeepSeekRecipeChatEncodingAdapter:
             delta = parser.finish(
                 new_output_ids, finish_reason, keep_matched_stop=request.no_stop_trim
             )
-            if request.task is None:
-                parser.check_reasoning_closed(finish_reason)
+            parser.check_reasoning_closed(finish_reason)
 
         history_tool_calls_cnt = self._hooks.history_tool_calls_count(request)
         if delta.tool_calls:
@@ -332,7 +329,7 @@ class DeepSeekRecipeChatEncodingAdapter:
     ) -> DeepSeekRecipeOutputParser:
         response_format = request.response_format
         continued = (
-            _trailing_assistant_turn(
+            _final_assistant_turn(
                 _null_content_as_empty(
                     [
                         message.model_dump(
@@ -358,6 +355,12 @@ class DeepSeekRecipeChatEncodingAdapter:
             and response_format.type in JSON_RESPONSE_FORMATS,
             separate_reasoning=self._separate_reasoning and request.separate_reasoning,
             stream_reasoning=request.stream_reasoning,
+            # A task output, such as an action label, has no reasoning to close,
+            # and a grammar may not let a constrained output close it.
+            reasoning_must_close=request.task is None
+            and request.regex is None
+            and request.ebnf is None
+            and (response_format is None or response_format.type == "text"),
             stop=_stop_strings(request.stop),
             stop_regex=_stop_strings(request.stop_regex),
             stop_token_ids=request.stop_token_ids or (),
@@ -416,15 +419,24 @@ def _null_content_as_empty(messages: list[dict[str, Any]]) -> list[dict[str, Any
     ]
 
 
+def _final_assistant_turn(
+    messages: list[dict[str, Any]],
+) -> Optional[dict[str, Any]]:
+    """The final assistant turn, without the tool calls SGLang discards."""
+    last = messages[-1] if messages else None
+    if last and last["role"] == "assistant":
+        return {key: value for key, value in last.items() if key != "tool_calls"}
+    return None
+
+
 def _trailing_assistant_turn(
     messages: list[dict[str, Any]],
 ) -> Optional[dict[str, Any]]:
     """The trailing text turn SGLang continues or, without continue_final_message,
-    re-sends as a user turn (as `_handle_last_assistant_message`), without the
-    tool calls SGLang discards."""
-    last = messages[-1] if messages else None
-    if last and last["role"] == "assistant" and isinstance(last.get("content"), str):
-        return {key: value for key, value in last.items() if key != "tool_calls"}
+    re-sends as a user turn (as `_handle_last_assistant_message`)."""
+    last = _final_assistant_turn(messages)
+    if last is not None and isinstance(last.get("content"), str):
+        return last
     return None
 
 
