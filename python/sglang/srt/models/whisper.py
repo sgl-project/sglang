@@ -158,8 +158,12 @@ class WhisperEncoderLayer(torch.nn.Module):
             config.activation_function, quant_config=quant_config
         )
 
-        self.fc1 = ColumnParallelLinear(self.embed_dim, config.encoder_ffn_dim)
-        self.fc2 = RowParallelLinear(config.encoder_ffn_dim, self.embed_dim)
+        self.fc1 = ColumnParallelLinear(
+            self.embed_dim, config.encoder_ffn_dim, quant_config=quant_config
+        )
+        self.fc2 = RowParallelLinear(
+            config.encoder_ffn_dim, self.embed_dim, quant_config=quant_config
+        )
         self.final_layer_norm = torch.nn.LayerNorm(self.embed_dim)
 
     def forward(
@@ -227,8 +231,12 @@ class WhisperDecoderLayer(torch.nn.Module):
             is_cross_attention=True,
         )
         self.encoder_attn_layer_norm = torch.nn.LayerNorm(self.embed_dim)
-        self.fc1 = ColumnParallelLinear(self.embed_dim, config.decoder_ffn_dim)
-        self.fc2 = RowParallelLinear(config.decoder_ffn_dim, self.embed_dim)
+        self.fc1 = ColumnParallelLinear(
+            self.embed_dim, config.decoder_ffn_dim, quant_config=quant_config
+        )
+        self.fc2 = RowParallelLinear(
+            config.decoder_ffn_dim, self.embed_dim, quant_config=quant_config
+        )
         self.final_layer_norm = torch.nn.LayerNorm(self.embed_dim)
 
     def forward(
