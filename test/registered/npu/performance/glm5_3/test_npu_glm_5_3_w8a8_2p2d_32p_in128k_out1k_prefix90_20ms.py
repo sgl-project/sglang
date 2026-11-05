@@ -2,8 +2,8 @@ import unittest
 
 from sglang.test.ascend.e2e.test_npu_multi_node_utils import NIC_NAME
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
-    AISBENCHMARK_DATASET_DEFAULT,
-    BENCHMARK_TOOL_DEFAULT,
+    AISBENCHMARK,
+    AISBENCHMARK_DATASET_GSM8K,
     GLM_5_3_W8A8_MODEL_PATH,
     TestNpuPerfMultiNodePdSepTestCaseBase,
 )
@@ -175,19 +175,17 @@ class TestNPUGLM5_3_W8A8_2P2D_32P_In128k_Out1k_Prefix90_20ms(
     """Test NPU performance for GLM-5.3-w8a8 PD separation 2p2d in128k out1k prefix90"""
 
     model_config = GLM_5_3_PD_SEP_MODEL_CONFIG
-    benchmark_tool = BENCHMARK_TOOL_DEFAULT
-    dataset_type = AISBENCHMARK_DATASET_DEFAULT
-    dataset_name = "generated-shared-prefix"
+    benchmark_tool = AISBENCHMARK
+    dataset_type = AISBENCHMARK_DATASET_GSM8K
+    dataset_path = None
     max_concurrency = 64
     num_prompts = 256
     input_len = 131072
     output_len = 1024
-    random_range_ratio = 1
     repeat_rate = 0.9
-    seed = 1
+    dp = 32
     tpot = 20
     output_token_throughput = 620
-    pop_sglang_is_in_ci_for_gsp = True
 
     def test_npu_glm_5_3_w8a8_2p2d_32p_in128k_out1k_prefix90_20ms(self):
         """Run NPU performance test for GLM-5.3-w8a8 PD separation"""
