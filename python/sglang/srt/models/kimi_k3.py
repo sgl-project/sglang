@@ -864,16 +864,6 @@ class KimiK3MoE(nn.Module):
             topk_weights_in = routed_input.new_empty(
                 (0, self._mega_top_k), dtype=torch.float32
             )
-        valid_rows = None
-        if valid_token_count is not None:
-            # The graph bucket is static; its live CP prefix changes on replay.
-            # Mask NaNs as well as routes before quantization/dispatch.
-            valid_rows = (
-                torch.arange(num_tokens, device=routed_input.device) < valid_token_count
-            )
-            routed_input = routed_input.masked_fill(~valid_rows[:, None], 0)
-            topk_ids_in = topk_ids_in.masked_fill(~valid_rows[:, None], -1)
-            topk_weights_in = topk_weights_in.masked_fill(~valid_rows[:, None], 0)
 
         mega_moe_pre_dispatch(
             routed_input,
@@ -884,6 +874,7 @@ class KimiK3MoE(nn.Module):
             buf.topk_idx,
             buf.topk_weights,
             quant_group_size=32,
+            num_token_non_padded=valid_token_count,
         )
         # At least one row so the tvm-ffi binding sees a non-null data_ptr.
         y = torch.empty(
@@ -902,7 +893,8 @@ class KimiK3MoE(nn.Module):
                 fast_math=True,
             )
         y = y[:num_tokens]
-        if valid_rows is not None:
+        if valid_token_count is not None:
+            valid_rows = torch.arange(num_tokens, device=y.device) < valid_token_count
             y.masked_fill_(~valid_rows[:, None], 0)
         if not self.experts.should_fuse_routed_scaling_factor_in_topk:
             if (
