@@ -293,7 +293,9 @@ def test_executor_observes_weight_mutation_and_replacement_through_its_views():
 @pytest.mark.parametrize("architecture", ["qwen3", "llama"])
 def test_same_mlx_executor_runs_real_sglang_mlp_architectures(architecture):
     from sglang.srt.models.llama import LlamaMLP
-    from sglang.srt.models.qwen3 import Qwen3MLP
+
+    # Qwen3 reuses Qwen2's MLP; import it from where it is defined.
+    from sglang.srt.models.qwen2 import Qwen2MLP as Qwen3MLP
     from sglang.srt.runtime_context import _CONTEXT, get_parallel
 
     torch.manual_seed(0)
@@ -402,7 +404,8 @@ def test_export_functionalizes_kv_mutation_into_explicit_graph_output():
 
 
 def test_real_qwen3_mlp_exports_without_an_architecture_registry():
-    from sglang.srt.models.qwen3 import Qwen3MLP
+    # Qwen3 reuses Qwen2's MLP; import it from where it is defined.
+    from sglang.srt.models.qwen2 import Qwen2MLP as Qwen3MLP
     from sglang.srt.runtime_context import _CONTEXT, get_parallel
 
     old_server_args = _CONTEXT._server_args
