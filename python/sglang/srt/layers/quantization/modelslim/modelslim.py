@@ -168,7 +168,9 @@ class ModelSlimConfig(QuantizationConfig):
             }
 
         # Add an mlp.* alias for each block_sparse_moe.* key but KEEP the original,
-        # so both module namings resolve
+        # so both module namings resolve. Work on a copy so the caller's dict (e.g.
+        # the HF config's quantization_config) is not modified in place.
+        quant_config = dict(quant_config)
         for k in list(quant_config.keys()):
             if not isinstance(k, str):
                 continue
