@@ -246,6 +246,7 @@ def handle_model_specific_adjustments(server_args: Any):
     if model_arch in (
         "KimiLinearForCausalLM",
         "KimiK3ForConditionalGeneration",
+        "KimiK31ForConditionalGeneration",
     ):
         from sglang.srt.arg_groups.kimi_k3_hook import (
             apply_kimi_k3_linear_attn_defaults,
@@ -283,6 +284,8 @@ def handle_model_specific_adjustments(server_args: Any):
         "HYV4ForCausalLMNextN",
         "LongcatFlashForCausalLM",
         "Dots3NoteForCausalLM",
+        "Xing4_0ForCausalLM",
+        "KimiK31ForConditionalGeneration",
     ]:
         # Set attention backend for DeepSeek
         if is_deepseek_dsa(hf_config):  # DeepSeek 3.2/GLM 5
@@ -516,6 +519,18 @@ def handle_model_specific_adjustments(server_args: Any):
                 envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.set(False)
             if not envs.SGLANG_EAGER_INPUT_NO_COPY.is_set():
                 envs.SGLANG_EAGER_INPUT_NO_COPY.set(True)
+
+    elif model_arch in ["Xing4_0ForCausalLM"]:
+        # Xing4_0 uses the TileLang mhc_pre/mhc_post kernels
+        # (sglang.kernels.ops.layernorm.mhc) for its mHC module. The
+        # DeepGEMM tf32_hc_prenorm_gemm path is a raw C extension that
+        # torch.compile (fullgraph=True, used by tc_piecewise prefill
+        # backend) cannot trace, raising:
+        #   torch._dynamo.exc.Unsupported: Dynamo does not know how to trace
+        #   method `__call__` of class `Function`
+        # Disable it so mhc_pre falls through to the TileLang splitk path
+        # which already supports xing4_0's hc_hidden_size=14336 (4 * 3584).
+        envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
 
     elif model_arch in ["GptOssForCausalLM"]:
         # Attention backend selection + XPU dtype validation moved to the
