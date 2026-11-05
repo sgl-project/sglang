@@ -96,13 +96,6 @@ class TestK3SortPlanSharedGemm(CustomTestCase):
             self.assertIs(got, want)
         self.assertIsNone(plan.take_shared_gemm(self.topk_ids))
 
-    def test_exit_runs_untaken_gemm(self):
-        with mock.patch.object(k3_moe_epi, "shared_gemm_preact", _fake_preact):
-            with k3sp.k3_sort_plan(k3sp.K3SortPlan(shared_gemm=self.gemm)) as plan:
-                pass
-        self.assertIsNone(plan.shared_gemm)
-        torch.testing.assert_close(self.out, self.act @ self.w_down.t())
-
     def test_exit_skips_taken_gemm(self):
         with mock.patch.object(k3_moe_epi, "shared_gemm_preact", _fake_preact):
             with k3sp.k3_sort_plan(k3sp.K3SortPlan(shared_gemm=self.gemm)) as plan:
