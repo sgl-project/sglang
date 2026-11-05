@@ -93,6 +93,7 @@ class TestNPUSparseDispatch(unittest.TestCase):
                 distributed=SimpleNamespace(is_initialized=lambda: False)
             ),
             memfabric_host_memory_enabled=lambda: False,
+            acl_host_memory_enabled=lambda: False,
         )
         exec(compile(methods, str(path), "exec"), self.namespace)
         host_class = type("Host", (), {name: self.namespace[name] for name in names})
@@ -370,6 +371,66 @@ class TestNPUSparseDispatch(unittest.TestCase):
                     self.assertEqual(allocate.call_count, 3 if v_width == 0 else 4)
                     self.assertEqual(empty.call_count, 1 if v_width == 0 else 0)
 
+    def test_acl_allocation_mirrors_component_budget(self):
+        """The acl backend allocates the same blocks as memfabric.
+
+        The only wiring difference is the allocator/declaration pair:
+        ensure_acl_capacity + alloc_with_acl replace their memfabric
+        counterparts, while the per-component byte list passed to the
+        declaration stays identical (aclrt has no GB rounding to mirror).
+        """
+        h = self.host
+        h.page_num, h.layer_num, h.page_size = 8, 3, 128
+        h._transfer_device = SimpleNamespace(type="npu")
+        h.device, h.pin_memory, h.allocator = "cpu", True, None
+        h.kv_lora_rank, h.qk_rope_head_dim = 512, 64
+        allocate = Mock(side_effect=lambda shape, **_: Buffer(shape))
+        reserve = Mock()
+        empty = Mock(side_effect=lambda shape, **_: Buffer(shape))
+        self.namespace.update(
+            ALLOC_MEMORY_FUNCS={"npu": allocate},
+            alloc_with_acl=allocate,
+            ensure_acl_capacity=reserve,
+            acl_host_memory_enabled=lambda: True,
+            torch=SimpleNamespace(
+                float32="fp32",
+                empty=empty,
+                npu=SimpleNamespace(current_device=lambda: 0),
+            ),
+        )
+        for layout, kv_dims, index_dims in (
+            ("page_first_kv_split", (8, 3, 128, 1), (8, 2, 128, 1)),
+            ("layer_first_kv_split", (3, 8, 128, 1), (2, 8, 128, 1)),
+        ):
+            for packed in (False, True):
+                with self.subTest(layout=layout, packed=packed):
+                    allocate.reset_mock()
+                    reserve.reset_mock()
+                    empty.reset_mock()
+                    h.layout = layout
+                    h.dsa_kv_cache_store_fp8 = packed
+                    h.dtype = SimpleNamespace(itemsize=1 if packed else 2)
+                    self.native.k_width = 656 if packed else 512
+                    v_width = 0 if packed else 64
+                    self.assertIs(h.init_kv_buffer(), h.k_buffer)
+                    self.assertEqual(h.k_buffer.shape, (*kv_dims, self.native.k_width))
+                    self.assertEqual(h.v_buffer.shape, (*kv_dims, v_width))
+                    self.assertEqual(h.index_k_buffer.shape, (*index_dims, 128))
+                    self.assertEqual(h.index_k_scale_buffer.shape, (*index_dims, 1))
+                    expected_blocks = [
+                        8 * 128 * 3 * self.native.k_width * h.dtype.itemsize
+                    ]
+                    if v_width:
+                        expected_blocks.append(
+                            8 * 128 * 3 * v_width * h.dtype.itemsize
+                        )
+                    expected_blocks.extend(
+                        [8 * 128 * 2 * 128 * h.dtype.itemsize, 8 * 128 * 2 * 4]
+                    )
+                    reserve.assert_called_once_with(expected_blocks, 0)
+                    self.assertEqual(allocate.call_count, 3 if v_width == 0 else 4)
+                    self.assertEqual(empty.call_count, 1 if v_width == 0 else 0)
+
     def test_lf_allocation_requires_memfabric_before_allocating(self):
         h = self.host
         h.layout, h.page_num = "layer_first_kv_split", 8
@@ -377,7 +438,9 @@ class TestNPUSparseDispatch(unittest.TestCase):
         h.kv_lora_rank, h.dsa_kv_cache_store_fp8 = 512, False
         allocate = Mock()
         self.namespace["ALLOC_MEMORY_FUNCS"] = {"npu": allocate}
-        with self.assertRaisesRegex(ValueError, "SGLANG_HICACHE_HOST_MEM_BACKEND"):
+        with self.assertRaisesRegex(
+            ValueError, "SGLANG_HICACHE_HOST_MEM_BACKEND=memfabric or acl"
+        ):
             h.init_kv_buffer()
         allocate.assert_not_called()
 
