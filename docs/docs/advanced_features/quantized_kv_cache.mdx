@@ -40,7 +40,11 @@ FP4 quantization is currently experimental.
 `int8` supports DSA (sparse MLA) models such as GLM-5.2 on Ascend A2/A3 NPUs.
 Each token stores a packed record containing an INT8 latent, BF16 rope and
 per-128-element FP32 scales. The NPU sparse attention kernel reads this record
-directly. The independent DSA indexer K cache uses BF16.
+directly. The independent DSA indexer K cache uses BF16 by default. To quantize it on
+A2/A3, pass `--dsa-indexer-kv-dtype int8`. This uses INT8 keys and FP16 per-token
+scales and requires the vendor `custom_ops` quantized indexer and metadata
+operators. Decode graph replay refreshes the metadata in persistent buffers
+before each execution. Draft workers retain the automatic indexer dtype.
 
 This path requires attention CP and DCP sizes of one. Configure the same target
 KV dtype on both PD roles. Speculative draft workers use their model dtype for
