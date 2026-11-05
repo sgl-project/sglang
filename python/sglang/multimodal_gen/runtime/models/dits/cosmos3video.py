@@ -79,6 +79,7 @@ def _can_enable_t1_fused_qk_norm_rope(
     *,
     is_blackwell: bool,
     is_hopper: bool,
+    is_sm120: bool,
     hidden_act: str,
     tp_size: int,
     sp_size: int,
@@ -89,6 +90,11 @@ def _can_enable_t1_fused_qk_norm_rope(
         return False
     if is_blackwell:
         return True
+    if is_sm120:
+        shape = (hidden_act, hidden_size)
+        return (
+            tp_size == 1 and sp_size == 1 and shape in (("relu2", 2048), ("silu", 4096))
+        )
     if not is_hopper or sp_size != 1:
         return False
     if tp_size == 1:
@@ -1777,6 +1783,7 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         enable_t1_fused_qk_norm_rope = T == 1 and _can_enable_t1_fused_qk_norm_rope(
             is_blackwell=current_platform.is_blackwell(),
             is_hopper=current_platform.is_hopper(),
+            is_sm120=current_platform.is_sm120(),
             hidden_act=self.hidden_act,
             hidden_size=self.hidden_size,
             tp_size=get_tp_world_size(),
