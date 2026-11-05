@@ -180,6 +180,15 @@ def _qem_collapse_targets(
     return x, np.maximum(np.einsum("ni,nij,nj->n", xh, q, xh), 0)
 
 
+def _qem_first_unique_face_indices(f: np.ndarray, nv: int) -> np.ndarray:
+    """Return the first index for each face, ignoring vertex order."""
+    sorted_f = np.sort(f, axis=1)
+    if nv**3 > np.iinfo(np.int64).max:
+        return np.unique(sorted_f, axis=0, return_index=True)[1]
+    keys = (sorted_f[:, 0] * nv + sorted_f[:, 1]) * nv + sorted_f[:, 2]
+    return np.unique(keys, return_index=True)[1]
+
+
 def _qem_decimate(
     vertices: np.ndarray, faces: np.ndarray, target_faces: int, max_rounds: int = 100
 ) -> Tuple[np.ndarray, np.ndarray]:
@@ -253,7 +262,7 @@ def _qem_decimate(
         if len(idx) == 0 or len(bad):
             break
         # collapses can leave two faces on the same vertices; keep one
-        _, first = np.unique(np.sort(new_f, axis=1), axis=0, return_index=True)
+        first = _qem_first_unique_face_indices(new_f, nv)
         v, f = new_v, new_f[np.sort(first)]
     used = np.unique(f)
     remap = np.full(len(v), -1)
