@@ -5,11 +5,12 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
-import sglang.multimodal_gen.runtime.layers.linear as linear
-import sglang.multimodal_gen.runtime.models.dits.longcat_image as longcat
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+import sglang.multimodal_gen.runtime.layers.linear as linear
+import sglang.multimodal_gen.runtime.models.dits.longcat_image as longcat
 from sglang.multimodal_gen.configs.pipeline_configs.longcat_image import (
     LongCatImagePipelineConfig,
 )

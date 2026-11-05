@@ -158,8 +158,8 @@ class _LongCatAdaLayerNormZero(AdaLayerNormZero):
     ):
         if self.emb is not None:
             emb = self.emb(timestep, class_labels, hidden_dtype=hidden_dtype)
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = _longcat_modulation(
-            self, emb, modulation_cache, 6
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+            _longcat_modulation(self, emb, modulation_cache, 6)
         )
         x = _longcat_norm_modulate(self.norm, x, scale_msa, shift_msa)
         return x, gate_msa, shift_mlp, scale_mlp, gate_mlp
@@ -169,7 +169,9 @@ class _LongCatAdaLayerNormZeroSingle(AdaLayerNormZeroSingle):
     def forward(
         self, x: torch.Tensor, emb: Optional[torch.Tensor] = None, modulation_cache=None
     ):
-        shift_msa, scale_msa, gate_msa = _longcat_modulation(self, emb, modulation_cache, 3)
+        shift_msa, scale_msa, gate_msa = _longcat_modulation(
+            self, emb, modulation_cache, 3
+        )
         return _longcat_norm_modulate(self.norm, x, scale_msa, shift_msa), gate_msa
 
 
@@ -1011,7 +1013,9 @@ class LongCatImageTransformer2DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         # Raw scheduler timestep in [0, 1000] — fed directly (see module docstring).
         conditioning = self._time_conditioning(hidden_states)
         if conditioning is None:
-            temb = self.time_embed(timestep.to(hidden_states.dtype), hidden_states.dtype)
+            temb = self.time_embed(
+                timestep.to(hidden_states.dtype), hidden_states.dtype
+            )
             modulation_cache = None
         else:
             temb, modulation_cache = conditioning
