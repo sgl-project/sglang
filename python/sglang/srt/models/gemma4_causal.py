@@ -35,6 +35,7 @@ from sglang.kernels.ops.moe.gemma4_routing import (
 )
 from sglang.srt.distributed.utils import get_group_rank_size
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
+from sglang.srt.layers.communication import gemma4_ar_fusion
 from sglang.srt.layers.layer_boundary import (
     SumGroup,
     append_stages,
@@ -65,7 +66,11 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    ForwardMode,
+    PPProxyTensors,
+)
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
@@ -74,7 +79,12 @@ from sglang.srt.models.gemma3_causal import Gemma3MLP, Gemma3TextScaledWordEmbed
 from sglang.srt.models.utils import (
     create_fused_set_kv_buffer_arg,
 )
-from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_forward,
+    get_parallel,
+    get_server_args,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -946,7 +956,113 @@ class Gemma4TextModel(PreTrainedModel):
         else:
             self.norm = PPMissingLayer()
         self.layers_to_capture = []
+        self._ar_fusion = self._maybe_init_ar_fusion(config)
         self.post_init()
+
+    def _maybe_init_ar_fusion(
+        self, config
+    ) -> Optional["gemma4_ar_fusion.Gemma4ArFusion"]:
+        """The fused all-reduce sites (layers/communication/gemma4_ar_fusion.py)
+        when requested and this model fits them."""
+        if not gemma4_ar_fusion.requested():
+            return None
+        layer = self.layers[self.start_layer]
+        linear = getattr(
+            getattr(layer.self_attn.qkv_proj, "scheme", None),
+            "w8a8_block_fp8_linear",
+            None,
+        )
+        linear_name = getattr(getattr(linear, "func", linear), "__name__", "")
+        reasons = [
+            why
+            for bad, why in (
+                (self.pp_group.world_size != 1, "pipeline parallel"),
+                (self.hidden_size_per_layer_input > 0, "per-layer embeddings"),
+                (Gemma4DecoderLayer._enable_moe_block(config), "MoE block"),
+                (
+                    linear_name
+                    not in (
+                        "deepgemm_w8a8_block_fp8_linear_with_fallback",
+                        "triton_w8a8_block_fp8_linear",
+                    ),
+                    f"block-FP8 linear {linear_name or 'missing'} takes no "
+                    "pre-quantized input",
+                ),
+            )
+            if bad
+        ]
+        if reasons:
+            logger.warning("SGLANG_GEMMA4_AR_FUSION=1 ignored: %s", ", ".join(reasons))
+            return None
+        return gemma4_ar_fusion.Gemma4ArFusion.create(
+            config.hidden_size, config.rms_norm_eps
+        )
+
+    def _ar_fusion_applies(
+        self, forward_batch, num_tokens, per_layer_inputs, pp_proxy_tensors
+    ) -> bool:
+        mode = forward_batch.forward_mode
+        return (
+            (mode == ForwardMode.EXTEND or mode.is_mixed())
+            and self._ar_fusion.applies(num_tokens)
+            and per_layer_inputs is None
+            and pp_proxy_tensors is None
+            and not self.layers_to_capture
+            and not get_forward().sp_active
+        )
+
+    def _forward_ar_fusion(
+        self, positions, forward_batch, input_embeds
+    ) -> torch.Tensor:
+        """The layer stack with every TP all-reduce + epilogue as one fused site.
+
+        This rank keeps only its own rows of the residual stream; each site
+        returns the next GEMM's FP8 input for all rows. Same math as
+        Gemma4DecoderLayer.forward: the attention site rounds the
+        post-attention norm to bf16 before the add, the MLP site adds in fp32
+        and scales.
+        """
+        fusion = self._ar_fusion
+        if not fusion.used:
+            fusion.used = True
+            logger.info(
+                "gemma4 all-reduce fusion: first fused forward (%d tokens)",
+                input_embeds.shape[0],
+            )
+        row0, rows = fusion.rows(input_embeds.shape[0])
+        residual = input_embeds[row0 : row0 + rows].clone()
+        x = self.layers[self.start_layer].input_layernorm(input_embeds)
+        for idx in range(self.start_layer, self.end_layer):
+            layer = self.layers[idx]
+            h = layer.self_attn(
+                positions=positions, hidden_states=x, forward_batch=forward_batch
+            )
+            x = fusion.site(
+                h,
+                residual,
+                layer.post_attention_layernorm.weight,
+                layer.pre_feedforward_layernorm.weight,
+                None,
+                round_a=True,
+            )
+            h = layer.mlp(x)
+            if idx + 1 < self.end_layer:
+                x = fusion.site(
+                    h,
+                    residual,
+                    layer.post_feedforward_layernorm.weight,
+                    self.layers[idx + 1].input_layernorm.weight,
+                    layer.layer_scalar,
+                    round_a=False,
+                )
+            else:
+                x = fusion.final(
+                    h,
+                    residual,
+                    layer.post_feedforward_layernorm.weight,
+                    layer.layer_scalar,
+                )
+        return self.norm(x)
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
@@ -1044,6 +1160,10 @@ class Gemma4TextModel(PreTrainedModel):
             per_layer_inputs = self.project_per_layer_inputs(
                 input_embeds, per_layer_inputs
             )
+            if self._ar_fusion is not None and self._ar_fusion_applies(
+                forward_batch, input_embeds.shape[0], per_layer_inputs, pp_proxy_tensors
+            ):
+                return self._forward_ar_fusion(positions, forward_batch, input_embeds)
             hidden_states = input_embeds
             residual_batch.start(forward_batch)
         else:
