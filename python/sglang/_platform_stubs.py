@@ -286,17 +286,15 @@ def get_device_properties(device: Any = 0) -> _MPSDeviceProperties:  # noqa: ARG
     """
     global _cached_props
     if _cached_props is None:
-        import torch
-
-        total_memory = int(torch.mps.recommended_max_memory())
-        if total_memory <= 0:
-            raise RuntimeError(
-                "torch.mps.recommended_max_memory() returned a non-positive "
-                "Metal working-set limit"
-            )
+        # Metal cannot use all of system RAM: allocations are only safe up
+        # to recommendedMaxWorkingSetSize (~65-75% of RAM). Advertising the
+        # full RAM size lets callers overcommit the GPU working set (#21443).
+        # The helper asks the active Apple Silicon runtime (MLX or torch-MPS)
+        # and falls back to total system RAM when the limit is unknown.
+        from sglang._apple_silicon_memory import apple_gpu_total_memory
 
         _cached_props = _MPSDeviceProperties(
-            total_memory=total_memory,
+            total_memory=apple_gpu_total_memory(),
         )
     return _cached_props
 
