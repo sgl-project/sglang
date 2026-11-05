@@ -49,7 +49,7 @@ HICACHE_STORAGE_EXTRA_CONFIG = json.dumps(
         "meta_service_url": METASERVICE_CONFIG["meta_service_url"],
         "config_store_url": METASERVICE_CONFIG["config_store_url"],
         "log_level": "info",
-        "world_size": 8,
+        "world_size": 16,
         "protocol": "device_sdma",
         "dram_size": "20GB",
     }
