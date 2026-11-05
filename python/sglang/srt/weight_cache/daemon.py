@@ -268,7 +268,7 @@ class WeightCacheDaemon:
         # expandable_segments makes torch's caching allocator hand out memory
         # that cannot be exported via _share_cuda_, so the IPC export below would
         # die mid-way with an opaque CUDA error. Fail fast with an actionable
-        # message before touching the device. Only CUDA's allocator is affected.
+        # message before touching the device.
         self._assert_ipc_compatible_allocator()
         current_platform.set_device(current_platform.get_device(self.gpu_id))
 
