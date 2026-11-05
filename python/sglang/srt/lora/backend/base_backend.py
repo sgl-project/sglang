@@ -1,3 +1,4 @@
+import logging
 from typing import Optional, Tuple, Union
 
 import torch
@@ -11,8 +12,13 @@ from sglang.srt.lora.utils import (
     get_batch_token_counts,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.runner_utils.cuda_graph_liveness import (
+    have_live_cuda_graphs,
+)
 from sglang.srt.runtime_context import LoRABatchLayout
 from sglang.srt.utils.common import empty_device_cache
+
+logger = logging.getLogger(__name__)
 
 
 class BaseLoRABackend(LoRABackendLmHeadMixing):
@@ -354,6 +360,14 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
     def resize_cuda_graph_moe_buffers(self, max_bs: int) -> bool:
         """Shrink the provisional pre-profile buffers to the captured token cap."""
         if self._moe_cg_buffer_max_bs is None or max_bs >= self._moe_cg_buffer_max_bs:
+            return False
+
+        if have_live_cuda_graphs():
+            logger.info(
+                "Skipping MoE LoRA buffer resize: CUDA graphs are captured; "
+                "clearing buffers the captured graphs reference would "
+                "corrupt replays."
+            )
             return False
 
         assert self._moe_cg_buffer_init_args is not None

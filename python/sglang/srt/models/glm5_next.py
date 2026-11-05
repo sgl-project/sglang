@@ -1329,6 +1329,52 @@ class Glm5NextForConditionalGeneration(nn.Module):
             self.config.rope_scaling or {}
         )
 
+    def precompile_kernels_after_loading(self) -> None:
+        """Warm the b12x W4A16 route-pack Triton modules before pools commit."""
+        if self.encoder_only or self.model is None:
+            return
+        from sglang.srt.layers.moe.utils import get_moe_runner_backend
+
+        quant_config = getattr(self, "quant_config", None)
+        if not (
+            get_moe_runner_backend().is_flashinfer_cutlass()
+            and getattr(quant_config, "is_w4a16", False)
+            and getattr(quant_config, "group_size", None) == 32
+        ):
+            return
+        n_routed_experts = getattr(self.config, "n_routed_experts", None)
+        top_k = getattr(self.config, "num_experts_per_tok", None)
+        if not n_routed_experts or not top_k:
+            return
+
+        from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
+            precompile_w4a16_prefill_routes,
+        )
+
+        param = next(self.model.parameters(), None)
+        if param is None:
+            return
+        logger.info(
+            "Precompiling b12x W4A16 prefill route-pack: %d experts, top_k %d, "
+            "7 token-capacity shapes on %s",
+            n_routed_experts,
+            top_k,
+            param.device,
+        )
+        # Route packing specializes on both token capacity and the selected
+        # routed block size. Cover the shape regimes used by tool/vision
+        # prefills and 4K chunked long-context work while memory is still
+        # available; otherwise Triton loads those modules on the first
+        # request after pools and CUDA graphs have consumed nearly all
+        # device memory.
+        for prefill_tokens in (256, 320, 512, 1024, 2048, 4096, 8192):
+            precompile_w4a16_prefill_routes(
+                device=param.device,
+                num_experts=n_routed_experts,
+                top_k=top_k,
+                prefill_tokens=prefill_tokens,
+            )
+
     def get_input_embeddings(self) -> nn.Embedding:
         if self.model is None:
             raise AttributeError(
