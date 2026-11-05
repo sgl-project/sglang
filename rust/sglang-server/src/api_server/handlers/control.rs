@@ -5,8 +5,11 @@
 use std::time::Duration;
 
 use crate::message::ids::Rid;
+use tokio::sync::oneshot;
+
 use crate::message::io_struct::{
-    AbortReq, CheckWeightsReqInput, ControlRequest, FlushCacheReqInput, ProfileOptions, ProfileReq,
+    AbortReq, CheckWeightsReqInput, ControlRequest, FlushCacheReqInput, FreezeGCReq,
+    ProfileOptions, ProfileReq,
 };
 use crate::message::request::RequestKind;
 use crate::message::response::ResponseItem;
@@ -16,6 +19,7 @@ use super::generate::AbortEnding;
 use super::handle::{CoreHandle, translate_runtime_error};
 use crate::api_server::core::CoreError;
 use crate::api_server::core::fanout::{self, RankReply, RequestBuilder};
+use crate::tokenizer_manager::wiring::TmEvent;
 use crate::utils::environ;
 
 /// One relayed abort, connect to reply: the client was answered already,
@@ -26,6 +30,26 @@ const PEER_ABORT_TIMEOUT: Duration = Duration::from_secs(5);
 pub(super) const PEER_ABORT_MAX_IN_FLIGHT: usize = 64;
 
 impl CoreHandle {
+    /// Ask this listener's scheduler ranks to apply `gc_threshold` and freeze
+    /// their garbage collector (Python's `TokenizerManager.freeze_gc`). Not fanned
+    /// out: every DP listener sends its own after its own warmup. The scheduler
+    /// sends no reply, so this returns once the message is on the scheduler's queue.
+    pub(crate) async fn freeze_gc(&self, gc_threshold: Option<Vec<i64>>) -> Result<(), CoreError> {
+        let control =
+            ControlRequest::FreezeGCReq(FreezeGCReq::new(Rid::new().to_string(), gc_threshold));
+        let (queued, queued_rx) = oneshot::channel();
+        self.inner
+            .intake_tx
+            .send_async(TmEvent::OneWay { control, queued })
+            .await
+            .map_err(|_| CoreError::Unavailable)?;
+        match queued_rx.await {
+            Ok(result) => result.map_err(translate_runtime_error),
+            // Intake shut down before handling it.
+            Err(_) => Err(CoreError::Unavailable),
+        }
+    }
+
     /// Flush every DP rank's caches; succeeds only if all ranks flushed (Python checks rank 0 only).
     pub(crate) async fn flush_cache(&self, timeout_s: f64) -> Result<FlushCacheOutcome, CoreError> {
         let outcomes = self

@@ -65,6 +65,7 @@ def _server_args(ext, port: int):
         detokenizer_worker_num=1,
         skip_tokenizer_init=True,
         skip_server_warmup=True,
+        gc_threshold=None,
         default_priority_value=None,
         enable_request_header_overrides=False,
         health_generate_headers={},
@@ -110,6 +111,11 @@ class TestRustServerCrashDumpBoundary(CustomTestCase):
         port = _free_port()
         server = ext.Server(_server_args(ext, port))
         try:
+            # With the warmup skipped, the first scheduler message is the
+            # post-startup FreezeGCReq; take it so the test sees its request.
+            self.assertTrue(server.wait_request(timeout_ms=15000))
+            (freeze_gc,) = server.recv_requests(1)
+            self.assertEqual(msgspec.msgpack.decode(freeze_gc.header)[0], "FreezeGCReq")
             bridge = RustServer(server, http_port=port)
             bridge.server_args = SimpleNamespace(
                 watermark_config=None, resolved_dict=dict
