@@ -382,7 +382,6 @@ POSITIONAL_FIELD_ORDER = (
     "media_url_max_file_size_mb",
     "mm_preprocess_cache_size_mb",
     "trust_mm_content_hashes",
-    "token_space_preprocess_cache_trust_url",
     "limit_mm_data_per_request",
     "enable_mm_global_cache",
     "image_processor_backend",
@@ -566,5 +565,6 @@ POSITIONAL_FIELD_ORDER = (
     "output_store_backend_extra_config",
     "remote_instance_weight_loader_start_seed_via_nixl",
     "enable_token_space_processor",
+    "token_space_preprocess_cache_trust_url",
 )
 # fmt: on
