@@ -547,11 +547,13 @@ class TpModelWorker(BaseTpWorker):
         self.model_runner.hisparse_coordinator = coordinator
 
     def get_worker_info(self):
-        # The runner already reports logical DCP capacity.
+        # The runner already reports logical DCP capacity; HiSparse admits up to
+        # its host-backed logical pool instead of the device-only pool.
         kv_capacity = (
-            self.model_runner.effective_logical_max_total_num_tokens
-            * page_interleave_shard_size(self.model_runner.token_to_kv_pool_allocator)
-        )
+            self.model_runner.max_token_pool_size
+            if getattr(self.model_runner, "enable_hisparse", False)
+            else self.model_runner.effective_logical_max_total_num_tokens
+        ) * page_interleave_shard_size(self.model_runner.token_to_kv_pool_allocator)
         if is_cp_sharded_padded():
             kv_capacity = from_cp_sharded(kv_capacity)
         # Not an error: a deployment that never sends max-length requests may
