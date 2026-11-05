@@ -40,7 +40,10 @@ class ThreadGroup:
             out.copy_(torch.cat([self.blocks[r] for r in range(self.world)]))
             self.barrier.wait()
 
-        return SimpleNamespace(all_gather_into_tensor=all_gather_into_tensor)
+        return SimpleNamespace(
+            all_gather_into_tensor=all_gather_into_tensor,
+            unique_name=f"threads-tp{self.world}",  # no sdma exchange set up
+        )
 
 
 def run_ranks(world, fn):

@@ -138,6 +138,38 @@ def compute_q_b(
     return q, q_for_wqb, fuse_q_rope
 
 
+def low_ratio_sources_first(
+    attn, forward_batch, attn_backend, *, unified: bool, use_cp: bool
+) -> bool:
+    """Whether a ratio-1/2 layer's compressor and indexer run before its q_b and KV store,
+    so the indexer's sdma exchange overlaps them (the model finishes it before attention).
+    Legal: neither side reads what the other writes, and neither issues an attention-TP
+    collective. Eager prefill only, and only with the sdma exchange ready."""
+    if not (
+        envs.SGLANG_OPT_DSV4_INDEXER_TP_SHARD.get()
+        and attn.compress_ratio in (1, 2)
+        and (attn.compressor is not None or attn.indexer is not None)
+        and attn.attn_tp_size > 1
+        and not unified
+        and not use_cp
+        and forward_batch.forward_mode.is_extend_without_speculative()
+        and not is_in_breakable_cuda_graph()
+    ):
+        return False
+    from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
+        DeepseekV4HipRadixBackend,
+    )
+    from sglang.srt.layers.attention.dsv4 import (
+        indexer_shard_gather_hip as shard_gather,
+    )
+
+    if not isinstance(attn_backend, DeepseekV4HipRadixBackend):
+        return False
+    from sglang.srt.runtime_context import get_parallel
+
+    return shard_gather.sdma_ready(get_parallel().attn_tp_group)
+
+
 def skip_head_pad(attn) -> bool:
     # only tilelang is built for padded head widths; aiter and Triton take the real head count
     return attn.attn_tp_size > 1 and not hip_attention_needs_head_pad()

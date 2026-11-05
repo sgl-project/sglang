@@ -60,6 +60,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.deepseek_v4_backend import (
     _as_int_list,
 )
+from sglang.srt.layers.attention.dsv4 import indexer_shard_gather_hip as shard_gather
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
@@ -795,7 +796,8 @@ def low_ratio_index_topk_hip_extend(
                     )
         backend.candidate_masks = publish
     if exchange is not None:
-        exchange.finish()
+        # sdma: may finish after the layer's q_b / KV store (deferred_indexer_gather)
+        backend.defer_or_finish_indexer_gather(exchange)
 
 
 def _clip_requests(
@@ -872,9 +874,14 @@ class _ShardExchange:
             assert self.dst[p].dtype == torch.int32, self.dst[p].dtype
         self.topk = page_indices.shape[1]
         n, cols = self.world * self.per, self.topk * len(parts)
-        # indexed by batch row; my block is sent from here, so send and receive never alias
-        self.rows = page_indices.new_empty((n, cols))
-        self.region = page_indices.new_empty((n, cols))
+        self.sdma = shard_gather.sdma_for(self.group, nbytes=4 * n * cols)
+        if self.sdma is not None:
+            # gathered in place: my rows are written straight into my block of the window
+            self.rows = self.region = self.sdma.prepare(self.per, cols)
+        else:
+            # indexed by batch row; my block is sent from here, so send and receive never alias
+            self.rows = page_indices.new_empty((n, cols))
+            self.region = page_indices.new_empty((n, cols))
         # identity rows write only their reachable columns
         self.rows[self.lo : self.hi].fill_(-1)
 
@@ -893,10 +900,15 @@ class _ShardExchange:
                 self.rows[self.lo : self.hi, i * self.topk : (i + 1) * self.topk].copy_(
                     self.dst[p][self.lo : self.hi]
                 )
+        if self.sdma is not None:
+            self.sdma.start()
+            return
         block = self.rows[self.rank * self.per : (self.rank + 1) * self.per]
         self.group.all_gather_into_tensor(self.region, block)
 
     def finish(self) -> None:
+        if self.sdma is not None:
+            self.sdma.wait()
         n = self.num_rows
         for i, p in enumerate(self.parts):
             self.dst[p][:n].copy_(self.region[:n, i * self.topk : (i + 1) * self.topk])

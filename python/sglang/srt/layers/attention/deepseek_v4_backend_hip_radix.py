@@ -4,6 +4,7 @@ import enum
 import functools
 import logging
 import os
+from contextlib import contextmanager
 from dataclasses import dataclass, field, fields
 from typing import (
     TYPE_CHECKING,
@@ -979,6 +980,9 @@ class DeepseekV4HipRadixBackend(
         # _opus_prefill_applies. Per ratio, not per layer: every layer of the ratio reads
         # what its index source exchanged, and q's shape / dtype are model constants.
         self._opus_prefill_q_ok: Dict[int, bool] = {}
+        # a row-sharded prefill indexer's sdma exchange left to finish_indexer_gather()
+        self._defer_indexer_gather = False
+        self._pending_indexer_gather = None
         self.enable_deepseek_v4_fp4_indexer: bool = (
             get_exec().kernel.enable_deepseek_v4_fp4_indexer
         )
@@ -1007,6 +1011,7 @@ class DeepseekV4HipRadixBackend(
         self.speculative_num_steps = speculative_num_steps
         self.speculative_num_draft_tokens: int = get_spec().speculative_num_draft_tokens
         self.is_draft_worker = getattr(model_runner, "is_draft_worker", False)
+        self._init_indexer_shard_gather()
         self._verify_mask: Optional[VerifyMask] = None
         self.is_dspark = model_runner.spec_algorithm.is_dspark()
         # the DSpark draft reads the target's checkpoint, so its config names V4.1 too
@@ -3179,6 +3184,45 @@ class DeepseekV4HipRadixBackend(
         )
 
     # ---- row-sharded prefill indexer exchange ----
+
+    def _init_indexer_shard_gather(self) -> None:
+        """Collective over attention TP: builds the sdma exchange at startup."""
+        if (
+            self.is_draft_worker
+            or not envs.SGLANG_OPT_DSV4_INDEXER_TP_SHARD.get()
+            or get_parallel().attn_tp_size == 1
+            or get_parallel().attn_cp_size != 1
+        ):
+            return
+        from sglang.srt.layers.attention.dsv4 import (
+            indexer_shard_gather_hip as shard_gather,
+        )
+
+        if shard_gather.gather_mode() == "sdma":
+            shard_gather.init_shard_gather(get_parallel().attn_tp_group)
+
+    @contextmanager
+    def deferred_indexer_gather(self):
+        """Within: an sdma exchange started by the indexer stays pending until
+        finish_indexer_gather(). One left by a forward that raised before attention is
+        dropped; the next exchange's prepare drains it."""
+        self._pending_indexer_gather = None
+        self._defer_indexer_gather = True
+        try:
+            yield
+        finally:
+            self._defer_indexer_gather = False
+
+    def defer_or_finish_indexer_gather(self, exchange) -> None:
+        if self._defer_indexer_gather and exchange.sdma is not None:
+            self._pending_indexer_gather = exchange
+        else:
+            exchange.finish()
+
+    def finish_indexer_gather(self) -> None:
+        pending, self._pending_indexer_gather = self._pending_indexer_gather, None
+        if pending is not None:
+            pending.finish()
 
     def indexer_gather_parts(
         self, compress_ratio: int, forward_batch: ForwardBatch, num_rows: int
