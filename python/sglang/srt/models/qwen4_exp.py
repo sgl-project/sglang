@@ -4,7 +4,7 @@ import math
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Dict, Iterable, Optional, Set, Tuple, Union
+from typing import Any, Iterable, Optional, Set, Tuple, Union
 
 import msgspec
 import sympy
@@ -891,18 +891,14 @@ class Qwen4ExpNGramEmbedding(nn.Module):
 
 # Triton only knows the fp8e4nv pointer dtype from SM89 up (its NVIDIA backend adds
 # it at capability >= 89); older parts gather the e4m3 bytes and decode them here.
-_FP8_E4M3_PTR: Dict[int, bool] = {}
-
-
+# On ROCm torch.cuda is HIP and a gfx arch also reports >= (9, 4), so keep HIP on
+# the byte decode: the fp8e4nv pointer is an NVIDIA-backend capability.
 def _fp8_e4m3_ptr_supported() -> bool:
-    if not torch.cuda.is_available():
-        return False
-    device = torch.cuda.current_device()
-    supported = _FP8_E4M3_PTR.get(device)
-    if supported is None:
-        supported = torch.cuda.get_device_capability(device) >= (8, 9)
-        _FP8_E4M3_PTR[device] = supported
-    return supported
+    return (
+        torch.version.hip is None
+        and torch.cuda.is_available()
+        and torch.cuda.get_device_capability() >= (8, 9)
+    )
 
 
 @triton.jit
@@ -1040,6 +1036,8 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         self.register_buffer("weight_scale", embedding.weight_scale, persistent=True)
         del embedding.weight
         self._block_d = triton.next_power_of_2(self.embedding_dim)
+        # Fixed for the life of the model; keeps the gather free of a device query.
+        self._fp8_native = _fp8_e4m3_ptr_supported()
 
     def allocate_output(
         self, shape: Tuple[int, ...], device: torch.device
@@ -1087,7 +1085,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                 tp_vocab_start=self.shard_indices.org_vocab_start_index,
                 tp_vocab_end=self.shard_indices.org_vocab_end_index,
                 is_fp8=self.weight.dtype == torch.float8_e4m3fn,
-                fp8_native=_fp8_e4m3_ptr_supported(),
+                fp8_native=self._fp8_native,
                 BLOCK_D=self._block_d,
             )
         return output
