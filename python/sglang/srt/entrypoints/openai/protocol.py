@@ -1045,8 +1045,7 @@ class ChatCompletionRequest(PDRoutingFields):
         default="auto", examples=["none"]
     )  # noqa
     # Whether the client sent tool_choice, as opposed to the default filled in
-    # by set_tool_choice_default (the K3 encoder must not render a defaulted
-    # "none" as an explicit tool_choice=none).
+    # by set_tool_choice_default.
     _tool_choice_explicit: bool = PrivateAttr(default=False)
     # Indices of the messages the client sent a non-empty `tools` on, including
     # user messages, whose model drops the field.

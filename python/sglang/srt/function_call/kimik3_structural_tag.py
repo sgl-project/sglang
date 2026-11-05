@@ -213,9 +213,8 @@ def _with_root_definitions(
 
 
 def _is_root_structure_ref(ref: Any) -> bool:
-    # Refs into the definition pools resolve in every argument schema, which
-    # carries the root's pools; any other local ref points into the root's own
-    # structure, which an argument schema no longer has.
+    # Every argument schema carries the root's definition pools; other local
+    # refs point into the root's own structure, which an argument schema lacks.
     return (
         isinstance(ref, str)
         and (ref == "#" or ref.startswith("#/"))
@@ -226,14 +225,8 @@ def _is_root_structure_ref(ref: Any) -> bool:
 def _localize_root_refs(
     schema: Union[bool, Dict[str, Any]], root_schema: Dict[str, Any]
 ) -> Union[bool, Dict[str, Any]]:
-    """Make the root-structure refs of an argument schema resolvable inside it.
-
-    Each argument value compiles as its own JSON schema, so a ref such as
-    ``#/properties/value/properties/a`` would be looked up in the argument
-    schema and fail. Every such target (and, transitively, the root-structure
-    refs inside it) is copied under ``$defs`` and the ref is rewritten to it.
-    Unresolvable refs are left for the compiler to report.
-    """
+    # Each argument value compiles as its own schema, so every root-structure ref
+    # target is copied under its $defs and the ref rewritten to point there.
     if not isinstance(schema, dict):
         return schema
     pools = [schema.get(key) for key in ("$defs", "definitions")]

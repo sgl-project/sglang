@@ -3871,7 +3871,7 @@ class KimiK3LinearForCausalLM(nn.Module):
         return loaded_params
 
     def _check_dsa_indexer_loaded(self, loaded_params: set[str]) -> None:
-        if getattr(self.config, "dsa_config", None) is None:
+        if self.config.dsa_config is None:
             return
         expected = {
             name for name, _ in self.named_parameters() if ".self_attn.indexer." in name
