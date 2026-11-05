@@ -279,7 +279,15 @@ def _init_cpu_threads_env(
         mem_bind_env = os.environ.get("SGLANG_CPU_MEM_BIND", None)
         node_mem_bind = -1
 
-        if mem_bind_env:
+        if mem_bind_env and (
+            parallel.dp_size > 1 or parallel.pp_size > 1 or parallel.nnodes > 1
+        ):
+            raise ValueError(
+                "SGLANG_CPU_MEM_BIND only supports TP on a single machine "
+                "(dp_size=1, pp_size=1, nnodes=1)."
+            )
+
+        elif mem_bind_env:
             nodes = [n.strip() for n in mem_bind_env.split(",") if n.strip()]
             if len(nodes) == 1:
                 # Single node given (e.g. "8"): all ranks bind to node 8

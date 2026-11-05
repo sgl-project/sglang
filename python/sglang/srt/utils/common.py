@@ -522,26 +522,27 @@ def get_available_gpu_memory(
 
     elif device == "cpu":
         # TODO: rename the variables in the current function to be not GPU specific
+        parallel = get_parallel()
         mem_bind_env = os.environ.get("SGLANG_CPU_MEM_BIND", None)
-        # This file contain numa nodes with compute cores
+        # This file contains the NUMA nodes with compute cores
         has_cpu_path = "/sys/devices/system/node/has_cpu"
-        if mem_bind_env:
-            nodes = parse_node_list(mem_bind_env)
-        elif os.path.exists(has_cpu_path):
-            with open(has_cpu_path) as f:
-                nodes = parse_node_list(f.read())
-        else:
-            nodes = None
 
-        # Each worker's share of the free memory, including any container limit
-        n_numa_node = len(nodes) if nodes else len(get_cpu_ids_by_node())
-        free_gpu_memory = get_free_cpu_memory() / n_numa_node
+        nodes = None
+        if parallel.dp_size == 1 and parallel.pp_size == 1 and parallel.nnodes == 1:
+            if mem_bind_env:
+                nodes = parse_node_list(mem_bind_env)
+            elif os.path.exists(has_cpu_path):
+                with open(has_cpu_path) as f:
+                    nodes = parse_node_list(f.read())
 
-        # Nodes can differ in capacity, so also fit within the smallest one
-        if nodes:
+        if nodes and parallel.tp_size <= len(nodes):
             free_gpu_memory = min(
-                free_gpu_memory,
+                get_free_cpu_memory() / len(nodes),
                 min(get_numa_node_available_bytes(n) for n in nodes),
+            )
+        else:
+            free_gpu_memory = round(
+                get_free_cpu_memory() / len(get_cpu_ids_by_node()), 3
             )
     elif device == "npu":
         num_gpus = torch.npu.device_count()
