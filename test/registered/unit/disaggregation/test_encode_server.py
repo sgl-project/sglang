@@ -12,7 +12,10 @@ import torch
 import sglang.srt.disaggregation.encoder.server as encoder_server
 from sglang.srt.disaggregation.encoder import http_server
 from sglang.srt.disaggregation.encoder import runtime as encoder_runtime
-from sglang.srt.disaggregation.encoder.preprocessor import EncoderPreprocessor
+from sglang.srt.disaggregation.encoder.preprocessor import (
+    EncoderPreprocessor,
+    EncoderPreprocessResult,
+)
 from sglang.srt.disaggregation.encoder.receiver import EmbeddingData
 from sglang.srt.disaggregation.encoder.runtime import (
     _DP_RELEASE_AFTER_ENCODE,
@@ -110,6 +113,38 @@ class TestEncoderDPErrorHandling(CustomTestCase):
             self.assertEqual(future.result(), valid)
 
         asyncio.run(run())
+
+
+class TestEncoderCacheIdentity(CustomTestCase):
+    def test_grid_content_and_namespace_identify_each_embedding(self):
+        encoder = MMEncoder.__new__(MMEncoder)
+        encoder.model_type = "qwen3_vl"
+        encoder.cache_namespace = "sha256:" + "12" * 32
+        encoder.preprocessor = EncoderPreprocessor.__new__(EncoderPreprocessor)
+        encoder.preprocessor.model_type = encoder.model_type
+        features = torch.zeros(16, 2)
+        grids = torch.tensor([[1, 2, 4], [1, 4, 2]])
+        result = EncoderPreprocessResult(
+            mm_inputs={"pixel_values": features, "image_grid_thw": grids},
+            grid_thw=grids,
+            token_counts=[2, 2],
+        )
+
+        def keys():
+            return encoder._calculate_hashes_from_features(
+                features, result, Modality.IMAGE
+            )
+
+        original = keys()
+        self.assertEqual([len(key) for key in original], [32, 32])
+        self.assertNotEqual(original[0], original[1])
+        self.assertEqual(original, keys())
+        features[-1] = 1
+        changed = keys()
+        self.assertEqual(original[0], changed[0])
+        self.assertNotEqual(original[1], changed[1])
+        encoder.cache_namespace = "sha256:" + "34" * 32
+        self.assertTrue(all(a != b for a, b in zip(changed, keys())))
 
 
 class TestEncoderMetaRegistry(CustomTestCase):
