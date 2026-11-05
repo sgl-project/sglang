@@ -11,7 +11,6 @@ for a caller that hands it to AITER's fused_moe in place of moe_sorting.
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
@@ -62,9 +61,6 @@ def build() -> Module:
         # No fast-math: expert-id selection must stay comparable to aiter under
         # ties and NaN.
         extra_cuda_cflags=["-O3"],
-        extra_include_paths=[
-            str(Path(__file__).resolve().parents[2] / "jit" / "csrc" / "moe")
-        ],
     )
 
 
