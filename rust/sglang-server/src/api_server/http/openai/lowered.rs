@@ -22,7 +22,7 @@ use sglang_processor::{DynamoTokenizer, TemplateArgs, TemplateError};
 use super::super::request_headers::apply_header_overrides;
 use super::chat::ChatBody;
 use super::template::RenderedChat;
-use super::{AppState, ChatFormatter};
+use super::{AppState, ChatFormatter, error_payload};
 use crate::api_server::core::CoreError;
 use crate::api_server::http::native_api::{
     GenerateItem, RequestState, RequestTiming, drain_unary_frame, generate_requests,
@@ -173,8 +173,8 @@ pub(super) async fn chat(
     if state.server_args.enable_request_header_overrides
         && let Err(error) = apply_header_overrides(&mut generate, headers)
     {
-        // `apply_header_overrides` raises `HTTPException(400)`, typed by its status.
-        return Some(typed_error_response(StatusCode::BAD_REQUEST, "400", &error));
+        // `apply_header_overrides` raises `HTTPException(400)`.
+        return Some(error_response(StatusCode::BAD_REQUEST, &error));
     }
     // Failures before the first frame answer unary even for a stream: Python
     // awaits the first chunk before it starts the stream.
@@ -406,42 +406,24 @@ fn python_error_frame(error: &CoreError, index: Option<u32>) -> String {
     .to_string()
 }
 
-/// `OpenAIServingBase.create_error_response`: a 400 is a `BadRequestError`;
-/// any other status is an `HTTPException`, typed by its status code.
+/// `OpenAIServingBase.create_error_response`: OpenAI's error envelope, typed
+/// by the status.
 fn error_response(status: StatusCode, message: &str) -> Response {
-    let err_type = match status {
-        StatusCode::BAD_REQUEST => "BadRequestError".to_owned(),
-        _ => status.as_u16().to_string(),
-    };
-    typed_error_response(status, &err_type, message)
+    (status, axum::Json(error_payload(status, message))).into_response()
 }
 
 /// `handle_request`'s answer to a call that failed before its first frame: a
 /// scheduler abort is the `HTTPException` the tokenizer manager raises, while a
-/// failure of this server's own is Python's generic exception.
+/// failure of this server's own is Python's generic 500, without its text.
 fn call_error_response(error: &CoreError) -> Response {
     let status = error.http_status();
     match error {
         CoreError::RuntimeRejected { .. } => error_response(status, &error.to_string()),
-        _ if status == StatusCode::INTERNAL_SERVER_ERROR => typed_error_response(
-            status,
-            "InternalServerError",
-            &format!("Internal server error: {error}"),
-        ),
+        _ if status == StatusCode::INTERNAL_SERVER_ERROR => {
+            error_response(status, "Internal server error")
+        }
         _ => error_response(status, &error.to_string()),
     }
-}
-
-fn typed_error_response(status: StatusCode, err_type: &str, message: &str) -> Response {
-    let code = status.as_u16();
-    let error = serde_json::json!({
-        "object": "error",
-        "message": message,
-        "type": err_type,
-        "param": null,
-        "code": code,
-    });
-    (status, axum::Json(error)).into_response()
 }
 
 fn reply_response(reply: Reply) -> Response {
@@ -522,8 +504,8 @@ mod tests {
         // Unary, as Python answers a failure before the first chunk.
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let value = body_json(response).await;
-        assert_eq!(value["type"], "BadRequestError");
-        let message = value["message"].as_str().unwrap();
+        assert_eq!(value["error"]["type"], "invalid_request_error");
+        let message = value["error"]["message"].as_str().unwrap();
         assert!(message.contains("exceeds the maximum"), "{message}");
     }
 
@@ -560,18 +542,18 @@ mod tests {
         let response = post_json(app, "/v1/chat/completions", body).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let value = body_json(response).await;
-        let message = value["message"].as_str().unwrap();
+        let message = value["error"]["message"].as_str().unwrap();
         assert!(message.contains("byte limit"), "{message}");
     }
 
     /// A scheduler abort in a stream, whatever its status, is Python's error
-    /// event under that status, then the stream's end, not a unary 400.
+    /// event typed by that status, then the stream's end, not a unary 400.
     #[tokio::test]
     async fn streamed_abort_keeps_its_status() {
-        for (status, name) in [
-            (503, "SERVICE_UNAVAILABLE"),
-            (400, "BAD_REQUEST"),
-            (412, "PRECONDITION_FAILED"),
+        for (status, error_type) in [
+            (503, "service_unavailable_error"),
+            (400, "invalid_request_error"),
+            (412, "invalid_request_error"),
         ] {
             let app = lowered_state(move |rid| {
                 let mut item = chunk(rid, "", true);
@@ -605,8 +587,8 @@ mod tests {
                 })
                 .unwrap_or_else(|| panic!("no error event: {text}"));
             assert_eq!(
-                (error["type"].as_str(), error["code"].as_u64()),
-                (Some(name), Some(status))
+                error,
+                json!({"message": "aborted", "type": error_type, "param": null, "code": null})
             );
             assert!(text.trim_end().ends_with("data: [DONE]"), "{text}");
         }
@@ -635,7 +617,10 @@ mod tests {
         let response = post("x-override-priority", "high").await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         // `HTTPException(400)`, typed by its status.
-        assert_eq!(body_json(response).await["type"], "400");
+        assert_eq!(
+            body_json(response).await["error"]["type"],
+            "invalid_request_error"
+        );
     }
 
     /// A failed choice answers at once, without waiting on an unfinished sibling.
@@ -657,7 +642,8 @@ mod tests {
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
-    /// This server's own failure answers as Python's generic exception does.
+    /// This server's own failure answers as Python's generic exception does,
+    /// without its text.
     #[tokio::test]
     async fn failed_choice_keeps_its_status() {
         let body = json!({"model": "model", "messages": [{"role": "user", "content": "hi"}]});
@@ -666,13 +652,13 @@ mod tests {
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let value = body_json(response).await;
         assert_eq!(
-            (value["type"].as_str(), value["code"].as_u64()),
-            (Some("InternalServerError"), Some(500))
-        );
-        let message = value["message"].as_str().unwrap();
-        assert!(
-            message.starts_with("Internal server error: ") && message.contains("boom"),
-            "{value}"
+            value,
+            json!({"error": {
+                "message": "Internal server error",
+                "type": "server_error",
+                "param": null,
+                "code": null,
+            }})
         );
     }
 
@@ -690,11 +676,14 @@ mod tests {
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let value = body_json(response).await;
         assert_eq!(
-            (value["type"].as_str(), value["code"].as_u64()),
-            (Some("InternalServerError"), Some(500))
+            value,
+            json!({"error": {
+                "message": "Internal server error",
+                "type": "server_error",
+                "param": null,
+                "code": null,
+            }})
         );
-        let message = value["message"].as_str().unwrap();
-        assert!(message.starts_with("Internal server error: "), "{value}");
     }
 
     /// A template's detected toggle decides reasoning before the parser's

@@ -162,6 +162,11 @@ def add_api_key_middleware(
     from fastapi.responses import ORJSONResponse
     from starlette.requests import Request
 
+    from sglang.srt.entrypoints.openai.protocol import (
+        is_openai_api_route,
+        openai_error_body,
+    )
+
     class _ApiKeyASGIMiddleware:
         """ASGI-native middleware to preserve client disconnect events."""
 
@@ -190,14 +195,16 @@ def add_api_key_middleware(
             )
 
             if not decision.allowed:
+                message = (
+                    "Unauthorized" if decision.error_status_code == 401 else "Forbidden"
+                )
+                route_path = path.removeprefix(scope.get("root_path", ""))
                 response = ORJSONResponse(
-                    content={
-                        "error": (
-                            "Unauthorized"
-                            if decision.error_status_code == 401
-                            else "Forbidden"
-                        )
-                    },
+                    content=(
+                        openai_error_body(message, decision.error_status_code)
+                        if is_openai_api_route(route_path)
+                        else {"error": message}
+                    ),
                     status_code=decision.error_status_code,
                 )
                 await response(scope, receive, send)
