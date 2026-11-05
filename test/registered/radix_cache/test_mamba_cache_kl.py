@@ -55,29 +55,8 @@ class MambaCacheKLMixin:
 
 
 class TestMambaLazyFullPoolKL(MambaCacheKLMixin, DefaultServerBase):
-    """Guard lazy Mamba checkpoint reuse when the optional track slot is exhausted.
-
-    Keep overlap scheduling and decode CUDA graphs enabled. A four-slot pool holds
-    two cached prefixes, the request's live state, and its keep checkpoint. The
-    first decode boundary finds no free track slot, evicts a cached state to get
-    one, and never writes the keep buffer; delayed prefill processing must not
-    publish that buffer under a wrong length.
-
-    Compare full-vocabulary next-token distributions at the SAME 255-token prompt,
-    all resumed from a 192-token checkpoint; comparing later free-running tokens
-    would confound cache corruption with different generated histories. The reuse
-    resumes from the checkpoint a prefill followed by a 32-token decode left
-    behind, and is checked against two references:
-    - the same prefill without the decode: the same kernels on the same shapes, so
-      a correct state matches bit for bit and any difference is a reuse bug;
-    - a prefill of the first 192 tokens alone: a different prefill split, whose
-      numerical noise must stay below the KL bound.
-
-    The prompt is random token ids. A repeated-token prompt saturates the linear
-    attention state, so a checkpoint 32 tokens off stays within the split noise.
-    RTX 5090 with random prompts: split noise 3.1e-4 to 8.2e-4 over 9 seeds; a
-    checkpoint 16 or more tokens off gives 6.0e-3 or more (seed 0).
-    """
+    """A four-slot pool leaves the first decode boundary no free track slot; the
+    checkpoint the request leaves at 192 tokens must match its prefill's."""
 
     ignore_eos = True
     model = "Qwen/Qwen3.5-0.8B"
@@ -116,7 +95,6 @@ class TestMambaLazyFullPoolKL(MambaCacheKLMixin, DefaultServerBase):
     ]
 
     def _resume_at_192(self, prompt, other_prefix, seed_len, seed_new_tokens):
-        """Cache two prefixes, seed a request, then score `prompt` from its 192 hit."""
         self._flush_cache()
         self._generate(other_prefix, 1)
         self._generate(prompt[:128], 1)
@@ -143,12 +121,12 @@ class TestMambaLazyFullPoolKL(MambaCacheKLMixin, DefaultServerBase):
         config = AutoConfig.from_pretrained(self.model)
         self.vocab_ids = list(range(config.get_text_config().vocab_size))
         rng = random.Random(0)
+        # Not a repeated token: it saturates the state, hiding a checkpoint 32 tokens off.
         prompt = [rng.randrange(1000, 100000) for _ in range(255)]
         other_prefix = [rng.randrange(1000, 100000) for _ in range(128)]
 
         reused = self._resume_at_192(prompt, other_prefix, 255, 32)
-        # A single output token does not launch the boundary-crossing decode, so
-        # these 192-token checkpoints come from a prefill alone.
+        # One output token launches no boundary decode; the prefill writes 192.
         same_split = self._resume_at_192(prompt, other_prefix, 255, 1)
         split = self._resume_at_192(prompt, other_prefix, 192, 1)
 
