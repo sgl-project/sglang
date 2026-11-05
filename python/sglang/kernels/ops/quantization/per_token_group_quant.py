@@ -208,9 +208,6 @@ def _per_token_group_quant_custom_op(
                 output_q,
                 output_s,
                 group_size,
-                1e-10,
-                -448.0,
-                448.0,
                 scale_ue8m0=True,
             )
             return

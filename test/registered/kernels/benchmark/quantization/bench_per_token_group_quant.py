@@ -6,8 +6,6 @@ from sglang.kernels.ops.activation.activation import silu_and_mul
 from sglang.kernels.ops.quantization.fp8_kernel import (
     create_per_token_group_quant_fp8_output_scale,
     fp8_dtype,
-    fp8_max,
-    fp8_min,
 )
 
 # per_token_group_quant_8bit_v2 is the perf baseline; production only routes
@@ -38,9 +36,6 @@ def _jit_v2(G, x, x_q, x_s, scale_ue8m0):
         x_q,
         x_s,
         G,
-        1e-10,
-        float(fp8_min),
-        float(fp8_max),
         scale_ue8m0=scale_ue8m0,
     )
 
