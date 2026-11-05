@@ -438,9 +438,9 @@ class ServerArgs:
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
     def get_tokenizer_worker_class(self):
-        from sglang.srt.managers.tokenizer_worker import TokenizerWorker
+        from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
-        return TokenizerWorker
+        return TokenizerManager
 
     def url(self, port: int | None = None):
         scheme = "https" if self.ssl_certfile else "http"
@@ -561,7 +561,11 @@ def resolve_encoder_transfer_backend(
 ) -> str:
     if backend != "auto":
         return backend
-    if model_arch == "KimiK3ForConditionalGeneration" and tp_size > 1:
+    if (
+        model_arch
+        in ("KimiK3ForConditionalGeneration", "KimiK31ForConditionalGeneration")
+        and tp_size > 1
+    ):
         return "zmq_to_tokenizer"
     return "zmq_to_scheduler"
 
@@ -735,7 +739,7 @@ class PortArgs:
     # The ipc filename for Scheduler to send metrics
     metrics_ipc_name: str
 
-    # The ipc filename for MultiTokenizerRouter to receive inputs from TokenizerWorker processes (zmq)
+    # The ipc filename for MultiTokenizerRouter to receive inputs from tokenizer worker processes (zmq)
     tokenizer_worker_ipc_name: str | None
 
     # The ipc endpoints between verifier scheduler and drafter scheduler

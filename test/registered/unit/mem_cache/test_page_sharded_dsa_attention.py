@@ -689,6 +689,7 @@ def _attention_backend(pool, req_to_token, device, prefill_impl="flashmla_sparse
     backend.dsa_index_kpool = 1
     backend.dsa_index_topk = 2048
     backend.dsa_topk_backend = DSATopKBackend.SGL_KERNEL
+    backend.dsa_packed_extend_topk = False
     backend.physical_page_size = 64
     backend.use_mha = False
     backend.use_fused_topk = False
