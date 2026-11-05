@@ -243,17 +243,37 @@ def _vendor_namespace():
     return namespace
 
 
+def _vendor_compressor_is_fused(project) -> bool:
+    """Return whether the vendor binding exposes the fused aggregation inputs."""
+    try:
+        schema = str(project.default._schema)
+    except AttributeError:
+        try:
+            schema = str(project._schema)
+        except AttributeError:
+            return False
+    return all(name in schema for name in ("state", "ancestors", "norm_weight"))
+
+
 def _load_compressor_ops():
     if _tree_backend() != "sgl_kernel_npu":
         _ensure_vendor_ops()
         namespace = _vendor_namespace()
         try:
-            return namespace.compressor_tree_project, namespace.compressor_tree
+            project = namespace.compressor_tree_project
         except AttributeError as exc:
             raise RuntimeError(
                 "the loaded vllm-ascend binding does not expose "
-                "compressor_tree_project / compressor_tree"
+                "compressor_tree_project"
             ) from exc
+        fused = _vendor_compressor_is_fused(project)
+        tree = getattr(namespace, "compressor_tree", None)
+        if tree is None and not fused:
+            raise RuntimeError(
+                "the loaded vllm-ascend binding exposes neither a fused "
+                "compressor_tree_project nor compressor_tree"
+            )
+        return project, tree, fused
     try:
         from sgl_kernel_npu.tree import compressor_tree
         from sgl_kernel_npu.tree import compressor_tree_project
@@ -263,7 +283,7 @@ def _load_compressor_ops():
             "package (compressor_tree / compressor_tree_project); it is "
             "unavailable in this process."
         ) from exc
-    return compressor_tree_project, compressor_tree
+    return compressor_tree_project, compressor_tree, False
 
 
 def _load_sgl_kernel_indexer_op():
@@ -370,31 +390,51 @@ def compress_nodes(
         plan.residue_cache[ratio] = residue
     # build_node_plan keeps hidden_ids as arange(n); avoid a redundant gather.
     hidden_nodes = hidden[: plan.n]
-    compressor_tree_project, compressor_tree = _load_compressor_ops()
-    compressor_tree_project(
-        hidden_nodes,
-        module._fused_wkv_w,
-        module._fused_wgate_w,
-        nodes,
-        module.ape,
-        residue,
-        plan.query_cu,
-    )
-    node_kv = compressor_tree(
-        state,
-        nodes,
-        module._fused_norm_weight_fp32,
-        cos,
-        sin,
-        table,
-        plan.start,
-        plan.ancestors,
-        plan.depths,
-        plan.req_ids,
-        int(module.ratio),
-        int(module.rope_head_dim),
-        float(module.norm.variance_epsilon),
-    )
+    compressor_tree_project, compressor_tree, fused = _load_compressor_ops()
+    if fused:
+        node_kv = compressor_tree_project(
+            hidden_nodes,
+            module._fused_wkv_w,
+            module._fused_wgate_w,
+            nodes,
+            module.ape,
+            residue,
+            plan.query_cu,
+            state=state,
+            prefix=plan.start,
+            ancestors=plan.ancestors,
+            depths=plan.depths,
+            requests=plan.req_ids,
+            norm_weight=module._fused_norm_weight_fp32,
+            cos=cos,
+            sin=sin,
+            table=table,
+        )
+    else:
+        compressor_tree_project(
+            hidden_nodes,
+            module._fused_wkv_w,
+            module._fused_wgate_w,
+            nodes,
+            module.ape,
+            residue,
+            plan.query_cu,
+        )
+        node_kv = compressor_tree(
+            state,
+            nodes,
+            module._fused_norm_weight_fp32,
+            cos,
+            sin,
+            table,
+            plan.start,
+            plan.ancestors,
+            plan.depths,
+            plan.req_ids,
+            int(module.ratio),
+            int(module.rope_head_dim),
+            float(module.norm.variance_epsilon),
+        )
     if record_sink is not None:
         # ratio=1 records the projected state row (one per node); the commit
         # kernel treats ratio=1 as state and writes it back to the state cache.

@@ -159,10 +159,120 @@ class PublicSurfaceTest(CustomTestCase):
         ), mock.patch.dict(
             os.environ, {"SGLANG_DSPARK_TREE_BACKEND": "sgl_kernel_npu"}
         ):
-            project, tree = tree_ops._load_compressor_ops()
+            project, tree, fused = tree_ops._load_compressor_ops()
 
         self.assertIs(project, fake_tree.compressor_tree_project)
         self.assertIs(tree, fake_tree.compressor_tree)
+        self.assertFalse(fused)
+
+    def test_vendor_compressor_detects_fused_schema(self) -> None:
+        old = SimpleNamespace(
+            default=SimpleNamespace(
+                _schema="compressor_tree_project(Tensor x, Tensor wkv) -> ()"
+            )
+        )
+        new = SimpleNamespace(
+            default=SimpleNamespace(
+                _schema=(
+                    "compressor_tree_project(Tensor x, Tensor state=None, "
+                    "Tensor ancestors=None, Tensor norm_weight=None) -> Tensor"
+                )
+            )
+        )
+        self.assertFalse(tree_ops._vendor_compressor_is_fused(old))
+        self.assertTrue(tree_ops._vendor_compressor_is_fused(new))
+
+    def test_vendor_compressor_loader_allows_fused_without_tree(self) -> None:
+        project = SimpleNamespace(
+            default=SimpleNamespace(
+                _schema=(
+                    "compressor_tree_project(Tensor state=None, "
+                    "Tensor ancestors=None, Tensor norm_weight=None) -> Tensor"
+                )
+            )
+        )
+        namespace = SimpleNamespace(compressor_tree_project=project)
+        with mock.patch.dict(
+            os.environ, {"SGLANG_DSPARK_TREE_BACKEND": "vendor"}
+        ), mock.patch.object(tree_ops, "_ensure_vendor_ops"), mock.patch.object(
+            tree_ops, "_vendor_namespace", return_value=namespace
+        ):
+            loaded, tree, fused = tree_ops._load_compressor_ops()
+
+        self.assertIs(loaded, project)
+        self.assertIsNone(tree)
+        self.assertTrue(fused)
+
+
+class CompressorTest(CustomTestCase):
+    def _module(self):
+        return SimpleNamespace(
+            _fused_wkv_w=torch.ones(1),
+            _fused_wgate_w=torch.ones(1),
+            _fused_norm_weight_fp32=torch.ones(8),
+            ratio=4,
+            overlap=0,
+            head_dim=8,
+            ape=torch.ones(4, 8),
+            rope_head_dim=64,
+            norm=SimpleNamespace(variance_epsilon=1e-6),
+        )
+
+    def test_compress_nodes_uses_fused_vendor_call(self):
+        project = mock.Mock(return_value=torch.zeros(6, 8, dtype=torch.bfloat16))
+        tree = mock.Mock(side_effect=AssertionError("compressor_tree must not run"))
+        state = torch.zeros(4, 4, 16)
+        table = torch.ones(2, 2, dtype=torch.int32)
+        cos = torch.ones(16, 64)
+        sin = torch.ones(16, 64)
+        plan = _make_plan()
+
+        with mock.patch.object(
+            tree_ops, "_load_compressor_ops", return_value=(project, tree, True)
+        ):
+            node_kv, _ = tree_ops.compress_nodes(
+                self._module(),
+                hidden=torch.zeros(6, 8),
+                state=state,
+                table=table,
+                cos=cos,
+                sin=sin,
+                plan=plan,
+            )
+
+        self.assertIs(node_kv, project.return_value)
+        tree.assert_not_called()
+        kwargs = project.call_args.kwargs
+        self.assertIs(kwargs["state"], state)
+        self.assertIs(kwargs["prefix"], plan.start)
+        self.assertIs(kwargs["ancestors"], plan.ancestors)
+        self.assertIs(kwargs["depths"], plan.depths)
+        self.assertIs(kwargs["requests"], plan.req_ids)
+        self.assertIs(kwargs["cos"], cos)
+        self.assertIs(kwargs["sin"], sin)
+        self.assertIs(kwargs["table"], table)
+
+    def test_compress_nodes_keeps_two_op_fallback(self):
+        project = mock.Mock(return_value=None)
+        tree = mock.Mock(return_value=torch.zeros(6, 8, dtype=torch.bfloat16))
+        plan = _make_plan()
+
+        with mock.patch.object(
+            tree_ops, "_load_compressor_ops", return_value=(project, tree, False)
+        ):
+            node_kv, _ = tree_ops.compress_nodes(
+                self._module(),
+                hidden=torch.zeros(6, 8),
+                state=torch.zeros(4, 4, 16),
+                table=torch.ones(2, 2, dtype=torch.int32),
+                cos=torch.ones(16, 64),
+                sin=torch.ones(16, 64),
+                plan=plan,
+            )
+
+        self.assertIs(node_kv, tree.return_value)
+        project.assert_called_once()
+        tree.assert_called_once()
 
 
 class NodePlanTest(CustomTestCase):
