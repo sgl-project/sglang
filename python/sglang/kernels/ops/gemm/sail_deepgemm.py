@@ -4,7 +4,7 @@ from typing import Tuple
 
 import torch
 
-from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.hardware_backend.sail.deep_gemm import entrypoint as sail_entrypoint
 from sglang.srt.utils.custom_op import register_custom_op
 
 
@@ -40,11 +40,11 @@ def grouped_gemm_nt_f8f8bf16_fused(
     is_perchannel: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     config, rows, experts, tokens, blocks, inv_perm, expert_ids = (
-        deep_gemm_wrapper.moe_align_block_size(
+        sail_entrypoint.moe_align_block_size(
             A, B, topk_ids, perchannel_quant=is_perchannel
         )
     )
-    deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_fused(
+    sail_entrypoint.grouped_gemm_nt_f8f8bf16_fused(
         (A, As),
         (B, Bs),
         C,
@@ -79,9 +79,9 @@ def grouped_gemm_nt_i8i8bf16_fused(
     topk_ids: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     config, rows, experts, tokens, blocks, inv_perm, expert_ids = (
-        deep_gemm_wrapper.moe_align_block_size(A, B, topk_ids, perchannel_quant=True)
+        sail_entrypoint.moe_align_block_size(A, B, topk_ids, perchannel_quant=True)
     )
-    deep_gemm_wrapper.grouped_gemm_nt_i8i8bf16_fused(
+    sail_entrypoint.grouped_gemm_nt_i8i8bf16_fused(
         (A, As), (B, Bs), C, rows, experts, tokens, blocks, config
     )
     return rows, inv_perm, expert_ids
@@ -108,9 +108,9 @@ def grouped_gemm_nt_f4f4bf16_fused(
     topk_ids: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     config, rows, experts, tokens, blocks, inv_perm, expert_ids = (
-        deep_gemm_wrapper.moe_align_block_size(A, B, topk_ids, perchannel_quant=False)
+        sail_entrypoint.moe_align_block_size(A, B, topk_ids, perchannel_quant=False)
     )
-    deep_gemm_wrapper.grouped_gemm_nt_f4f4bf16_fused(
+    sail_entrypoint.grouped_gemm_nt_f4f4bf16_fused(
         (A, As), (B, Bs), C, rows, experts, tokens, blocks, config
     )
     return rows, inv_perm, expert_ids
@@ -135,9 +135,9 @@ def grouped_gemm_nt_bf16i4bf16_fused(
     topk_ids: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     config, rows, experts, tokens, blocks, inv_perm, expert_ids = (
-        deep_gemm_wrapper.moe_align_block_size(A, B, topk_ids, perchannel_quant=False)
+        sail_entrypoint.moe_align_block_size(A, B, topk_ids, perchannel_quant=False)
     )
-    deep_gemm_wrapper.grouped_gemm_nt_bf16i4bf16_fused(
+    sail_entrypoint.grouped_gemm_nt_bf16i4bf16_fused(
         A, (B, Bs), C, rows, experts, tokens, blocks, config
     )
     return rows, inv_perm, expert_ids
@@ -162,9 +162,9 @@ def grouped_gemm_nt_bf16bf16bf16_fused(
     topk_ids: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     config, rows, experts, tokens, blocks, inv_perm, expert_ids = (
-        deep_gemm_wrapper.moe_align_block_size(A, B, topk_ids)
+        sail_entrypoint.moe_align_block_size(A, B, topk_ids)
     )
-    deep_gemm_wrapper.grouped_gemm_nt_bf16bf16bf16_fused(
+    sail_entrypoint.grouped_gemm_nt_bf16bf16bf16_fused(
         A, B, C, rows, experts, tokens, blocks, config
     )
     return rows, inv_perm, expert_ids

@@ -25,6 +25,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.sail.deep_gemm import entrypoint as sail_entrypoint
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe.moe_runner.deep_gemm import (
@@ -177,7 +178,7 @@ class SailDeepGemmEpRunnerCore(DeepGemmRunnerCore):
         if deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
             hidden_states_scale = tma_align_input_scale(hidden_states_scale)
 
-        deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_nopad(
+        sail_entrypoint.grouped_gemm_nt_f8f8bf16_nopad(
             (hidden_states, hidden_states_scale),
             w13_weight_fp8,
             gateup_output,
@@ -355,7 +356,7 @@ class SailDeepGemmEpRunnerCore(DeepGemmRunnerCore):
             down_input_scale = tma_align_input_scale(down_input_scale)
 
         # The down activation is quantized here, independently of dispatch.
-        deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_nopad(
+        sail_entrypoint.grouped_gemm_nt_f8f8bf16_nopad(
             (down_input_fp8, down_input_scale),
             w2_weight_fp8,
             down_output,
@@ -402,7 +403,7 @@ class SailDeepGemmEpRunnerCore(DeepGemmRunnerCore):
             dtype=torch.bfloat16,
         )
 
-        deep_gemm_wrapper.grouped_gemm_nt_bf16_nopad(
+        sail_entrypoint.grouped_gemm_nt_bf16_nopad(
             hidden_states,
             w13_weight,
             gateup_output,
@@ -452,7 +453,7 @@ class SailDeepGemmEpRunnerCore(DeepGemmRunnerCore):
                 device=hidden_states_device,
                 dtype=torch.bfloat16,
             )
-        deep_gemm_wrapper.grouped_gemm_nt_bf16_nopad(
+        sail_entrypoint.grouped_gemm_nt_bf16_nopad(
             down_input,
             w2_weight,
             down_output,
@@ -500,7 +501,7 @@ class SailDeepGemmEpRunnerCore(DeepGemmRunnerCore):
         # The "i8i8" entry point also takes fp8-e4m3 activations and weights with
         # channel-wise (per-token) scales, which is exactly what this fp8 path feeds
         # it, so the name is deliberate rather than a leftover of the int8 path.
-        deep_gemm_wrapper.grouped_gemm_nt_i8i8bf16_nopad(
+        sail_entrypoint.grouped_gemm_nt_i8i8bf16_nopad(
             (hidden_states, hidden_states_scale),
             w13_weight_quant,
             gateup_output,
@@ -569,7 +570,7 @@ class SailDeepGemmEpRunnerCore(DeepGemmRunnerCore):
 
         # Same entry point as the gate-up GEMM above: it serves fp8 channel-wise
         # operands as well.
-        deep_gemm_wrapper.grouped_gemm_nt_i8i8bf16_nopad(
+        sail_entrypoint.grouped_gemm_nt_i8i8bf16_nopad(
             (down_input_int8, down_input_scale),
             w2_weight_quant,
             down_output,
@@ -612,7 +613,7 @@ class SailDeepGemmEpRunnerCore(DeepGemmRunnerCore):
             device=hidden_states_device,
             dtype=torch.bfloat16,
         )
-        deep_gemm_wrapper.grouped_gemm_nt_i8i8bf16_nopad(
+        sail_entrypoint.grouped_gemm_nt_i8i8bf16_nopad(
             (hidden_states, hidden_states_scale),
             w13_weight_quant,
             gateup_output,
@@ -662,7 +663,7 @@ class SailDeepGemmEpRunnerCore(DeepGemmRunnerCore):
             dtype=torch.bfloat16,
         )
 
-        deep_gemm_wrapper.grouped_gemm_nt_i8i8bf16_nopad(
+        sail_entrypoint.grouped_gemm_nt_i8i8bf16_nopad(
             (down_input_int8, down_input_scale),
             w2_weight_quant,
             down_output,
@@ -719,7 +720,7 @@ class SailDeepGemmEpRunnerCore(DeepGemmRunnerCore):
         )
         # [WA] before deepep normal mode support uint16_t column major scale
         hidden_states_scale = preprocess_mxfp4_scales(hidden_states_scale)
-        deep_gemm_wrapper.grouped_gemm_nt_f4f4bf16_nopad(
+        sail_entrypoint.grouped_gemm_nt_f4f4bf16_nopad(
             (hidden_states, hidden_states_scale),
             w13_weight_quant,
             b13,
@@ -764,7 +765,7 @@ class SailDeepGemmEpRunnerCore(DeepGemmRunnerCore):
             device=hidden_states_device,
             dtype=torch.bfloat16,
         )
-        deep_gemm_wrapper.grouped_gemm_nt_f4f4bf16_nopad(
+        sail_entrypoint.grouped_gemm_nt_f4f4bf16_nopad(
             (down_input_fp4, down_input_scale),
             w2_weight_quant,
             b2,
@@ -857,7 +858,7 @@ class SailDeepGemmEpRunnerCore(DeepGemmRunnerCore):
             device=hidden_states_device,
             dtype=torch.bfloat16,
         )
-        deep_gemm_wrapper.grouped_gemm_nt_bf16i4bf16_nopad(
+        sail_entrypoint.grouped_gemm_nt_bf16i4bf16_nopad(
             hidden_states,
             w13_weight_quant,
             gateup_output,
@@ -895,7 +896,7 @@ class SailDeepGemmEpRunnerCore(DeepGemmRunnerCore):
             device=hidden_states_device,
             dtype=torch.bfloat16,
         )
-        deep_gemm_wrapper.grouped_gemm_nt_bf16i4bf16_nopad(
+        sail_entrypoint.grouped_gemm_nt_bf16i4bf16_nopad(
             down_input,
             w2_weight_quant,
             down_output,
@@ -1106,7 +1107,7 @@ class SailDeepGemmEpRunnerCore(DeepGemmRunnerCore):
             (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
         )
 
-        deep_gemm_wrapper.grouped_gemm_nt_i8i8bf16_masked(
+        sail_entrypoint.grouped_gemm_nt_i8i8bf16_masked(
             (hidden_states, hidden_states_scale),
             (w13_weight, w13_scale),
             gateup_output,
@@ -1182,7 +1183,7 @@ class SailDeepGemmEpRunnerCore(DeepGemmRunnerCore):
                 "max_block_n": max_block_n,
             }
 
-        deep_gemm_return_value = deep_gemm_wrapper.grouped_gemm_nt_i8i8bf16_masked(
+        deep_gemm_return_value = sail_entrypoint.grouped_gemm_nt_i8i8bf16_masked(
             (down_input, down_input_scale),
             (w2_weight, w2_scale),
             down_output,
@@ -1236,7 +1237,7 @@ class SailDeepGemmEpRunnerCore(DeepGemmRunnerCore):
             (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
         )
 
-        deep_gemm_wrapper.grouped_gemm_nt_f4f4bf16_masked(
+        sail_entrypoint.grouped_gemm_nt_f4f4bf16_masked(
             (hidden_states, hidden_states_scale),
             (w13_weight, w13_scale),
             b13,
@@ -1299,7 +1300,7 @@ class SailDeepGemmEpRunnerCore(DeepGemmRunnerCore):
 
         # DeepGemm kernel expects [E, T, S//2] for mxfp4 scale
         down_input_scale = down_input_scale.permute(0, 2, 1)
-        deep_gemm_return_value = deep_gemm_wrapper.grouped_gemm_nt_f4f4bf16_masked(
+        deep_gemm_return_value = sail_entrypoint.grouped_gemm_nt_f4f4bf16_masked(
             (down_input, down_input_scale),
             (w2_weight, w2_scale),
             b2,
@@ -1357,7 +1358,7 @@ class SailDeepGemmEpRunnerCore(DeepGemmRunnerCore):
             (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
         )
 
-        deep_gemm_wrapper.grouped_gemm_nt_bf16i4bf16_masked(
+        sail_entrypoint.grouped_gemm_nt_bf16i4bf16_masked(
             hidden_states,
             (w13_weight, w13_scale),
             gateup_output,
@@ -1395,7 +1396,7 @@ class SailDeepGemmEpRunnerCore(DeepGemmRunnerCore):
             (num_groups, m, k), device=down_input.device, dtype=torch.bfloat16
         )
 
-        deep_gemm_wrapper.grouped_gemm_nt_bf16i4bf16_masked(
+        sail_entrypoint.grouped_gemm_nt_bf16i4bf16_masked(
             down_input,
             (w2_weight, w2_scale),
             down_output,
