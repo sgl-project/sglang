@@ -6,7 +6,7 @@ lifetime and allocation unit share one sub-pool.
 """
 
 import math
-from typing import ClassVar, Iterable, Optional, Sequence, Tuple, Union
+from typing import Any, ClassVar, Iterable, Optional, Sequence, Tuple, Union
 
 import msgspec
 import torch
@@ -403,3 +403,25 @@ def with_state_ple(
         extra_parts=(*geometry.extra_parts, *parts),
         scratch_parts=(*geometry.scratch_parts, *scratch),
     )
+
+
+# The part every token KV view holds today; derived parts get their own names.
+KV_PART = "kv"
+# A request's recurrent state, one slot per request, in the state sub-pool.
+STATE_PART = "state"
+
+
+class Region(msgspec.Struct, frozen=True, kw_only=True):
+    """A sub-pool's device memory as a PD peer registers it: one entry per
+    buffer, and per entry the slices a peer of another TP size reads. A whole
+    page envelope has no slices: both peers must lay it out identically."""
+
+    ptrs: Tuple[int, ...]
+    lens: Tuple[int, ...]
+    item_lens: Tuple[int, ...]
+    dim_per_tensor: Tuple[int, ...] = ()
+    conv_shard_groups: Tuple[Any, ...] = ()
+    slice_outer_counts: Tuple[int, ...] = ()
+    layer_ids: Tuple[int, ...] = ()
+    # The token KV byte layout both peers must share, for views that have one.
+    kv_layout: Optional[str] = None

@@ -74,8 +74,7 @@ def _cache():
     return SimpleNamespace(
         sliding_window_size=16,
         full_evictable_size=lambda: 0,
-        swa_evictable_size=lambda: 0,
-        auxiliary_swa_evictable_size=lambda: 0,
+        window_evictable_size=lambda component: 0,
         mamba_evictable_size=lambda: 0,
         supports_mamba=lambda: True,
         supports_prefix_sharing=lambda: True,
@@ -100,7 +99,6 @@ class TestStateAdmissionLimits(unittest.TestCase):
                         total_tokens=3,
                         max_new_tokens=1,
                         input_tokens=1,
-                        swa_host_hit_length=0,
                         chunk_limit=None,
                         state_slots=1,
                     )
@@ -211,7 +209,6 @@ class TestStateAdmissionLimits(unittest.TestCase):
                 total_tokens=12,
                 max_new_tokens=0,
                 input_tokens=11,
-                swa_host_hit_length=0,
                 chunk_limit=None,
                 state_slots=12,
             )[0]
@@ -231,7 +228,6 @@ class TestStateAdmissionLimits(unittest.TestCase):
                         total_tokens=3,
                         max_new_tokens=1,
                         input_tokens=1,
-                        swa_host_hit_length=0,
                         chunk_limit=None,
                         state_slots=slots,
                     )[0]

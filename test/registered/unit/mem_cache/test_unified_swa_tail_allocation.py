@@ -177,7 +177,7 @@ class TestUnifiedSWATailAllocation(CustomTestCase):
                 storage = kv_storage_of(bundle.req_to_token_pool, allocator)
                 self.assertEqual(
                     storage.stated_window_lengths()["draft_swa"],
-                    (draft_window, "AUXILIARY_SWA"),
+                    (draft_window, "DRAFT_SWA"),
                 )
                 windows = {w.sub_pool_name: w for w in allocator._windows}
                 self.assertEqual(set(windows), {"window_16", "draft_swa"})

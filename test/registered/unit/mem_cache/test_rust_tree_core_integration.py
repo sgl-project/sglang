@@ -12,6 +12,7 @@ import pytest
 import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
+from sglang.test.tree_slots import core_window_evictable, core_window_protected
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-small")
@@ -82,7 +83,13 @@ from sglang.srt.mem_cache.utils import (
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.test.tree_slots import FAMILY_OF, index_slots, slot_of, tree_slots_of
+from sglang.test.tree_slots import (
+    CUSTOM_WINDOW_COMPONENT,
+    FAMILY_OF,
+    index_slots,
+    slot_of,
+    tree_slots_of,
+)
 
 
 def _slots(*components):
@@ -1840,7 +1847,7 @@ def test_host_lock_refs_round_trip(swa, missing_receipt):
         return  # A Rust ownership violation poisons the core.
     core.dec_host_lock_ref(leaf, params)
     if swa:
-        assert core.swa_protected_size() == 1
+        assert core_window_protected(core) == 1
     core.dec_lock_ref(leaf, device_lock.to_dec_params())
     core.sanity_check([], [])
 
@@ -3094,7 +3101,11 @@ def test_internal_swa_write_back_preserves_window_until_ack(
     _mock_swa_write_back_io(case, backup)
     cache, core = case.cache, case.core
     parent, leaf = case.nodes
-    params = EvictParams(num_tokens=0, swa_num_tokens=case.segment)
+    params = EvictParams(
+        window_num_tokens={
+            cache.window_sub_pool_of_slot(ComponentType.SWA): case.segment
+        }
+    )
     if backup in ("raised", "ack_raised"):
         with pytest.raises(RuntimeError, match="DMA .* failed"):
             cache.evict(params)
@@ -3111,14 +3122,24 @@ def test_internal_swa_write_back_preserves_window_until_ack(
         # The driver's finally block must discard the paused walk even when
         # submission or completion fails, so a new eviction can make progress.
         _mock_swa_write_back_io(case)
-        assert cache.evict(params).swa_num_tokens_evicted == case.segment
+        assert (
+            cache.evict(params).window_num_tokens_evicted.get(
+                cache.window_sub_pool_of_slot(ComponentType.SWA), 0
+            )
+            == case.segment
+        )
         assert core.get_component_device_value(parent, ComponentType.SWA) is None
         cache.dec_lock_ref(leaf, case.leaf_lock)
         core.sanity_check([], [])
         return
 
     result = cache.evict(params)
-    assert result.swa_num_tokens_evicted == case.segment
+    assert (
+        result.window_num_tokens_evicted.get(
+            cache.window_sub_pool_of_slot(ComponentType.SWA), 0
+        )
+        == case.segment
+    )
     assert result.num_tokens_evicted == 0
     assert result.mamba_num_evicted == int(with_mamba)
     if with_mamba:
@@ -3146,7 +3167,12 @@ def test_internal_swa_write_back_preserves_window_until_ack(
         assert matched.best_match_node == parent
         assert matched.device_prefix_len == 0
         assert matched.full_kv_hit_length == case.segment
-        assert matched.swa_host_hit_length == case.segment
+        assert (
+            matched.window_host_hit_lengths.get(
+                cache.window_sub_pool_of_slot(ComponentType.SWA), 0
+            )
+            == case.segment
+        )
         assert matched.mamba_host_hit_length == int(with_mamba)
         (transfer,) = core.build_hicache_transfers(
             ComponentType.SWA, parent, CacheTransferPhase.LOAD_BACK
@@ -3166,8 +3192,19 @@ def test_internal_swa_write_back_reserves_entire_unbacked_window(backend):
     # SWA LRU, and its backup window includes both unbacked prefix segments.
     cache.match_prefix(MatchPrefixParams(key=_key(list(range(case.segment)))))
     _mock_swa_write_back_io(case, "host_pressure")
-    result = cache.evict(EvictParams(num_tokens=0, swa_num_tokens=case.segment))
-    assert result.swa_num_tokens_evicted == case.segment
+    result = cache.evict(
+        EvictParams(
+            window_num_tokens={
+                cache.window_sub_pool_of_slot(ComponentType.SWA): case.segment
+            }
+        )
+    )
+    assert (
+        result.window_num_tokens_evicted.get(
+            cache.window_sub_pool_of_slot(ComponentType.SWA), 0
+        )
+        == case.segment
+    )
     assert case.events[:2] == [("host_evict", 2 * case.segment), ("write", victim)]
     (submission,) = case.submissions
     (transfer,) = submission[2][ComponentType.SWA]
@@ -3221,8 +3258,14 @@ def test_internal_swa_write_back_respects_active_window_locks(backend, guard):
         cache._finish_write_through_ack(parent)
     assert (
         cache.evict(
-            EvictParams(num_tokens=0, swa_num_tokens=case.segment)
-        ).swa_num_tokens_evicted
+            EvictParams(
+                window_num_tokens={
+                    cache.window_sub_pool_of_slot(ComponentType.SWA): case.segment
+                }
+            )
+        ).window_num_tokens_evicted.get(
+            cache.window_sub_pool_of_slot(ComponentType.SWA), 0
+        )
         == case.segment
     )
     assert core.component_has_host_value_only(parent, ComponentType.SWA)
@@ -3249,8 +3292,14 @@ def test_internal_swa_write_back_follows_runtime_policy_update(backend):
     assert cache._tree_core_backend == backend
     assert (
         cache.evict(
-            EvictParams(num_tokens=0, swa_num_tokens=case.segment)
-        ).swa_num_tokens_evicted
+            EvictParams(
+                window_num_tokens={
+                    cache.window_sub_pool_of_slot(ComponentType.SWA): case.segment
+                }
+            )
+        ).window_num_tokens_evicted.get(
+            cache.window_sub_pool_of_slot(ComponentType.SWA), 0
+        )
         == case.segment
     )
     assert core.component_has_host_value_only(case.nodes[0], ComponentType.SWA)
@@ -3670,7 +3719,7 @@ def test_custom_swa_component_keeps_its_inline_backup_contract():
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
     class AuxiliarySWAComponent(SWAComponent):
-        component_type = ComponentType.AUXILIARY_SWA
+        component_type = CUSTOM_WINDOW_COMPONENT
 
         def _publish_window(self, node, cache_actions):
             cache_actions.append(
@@ -3690,10 +3739,10 @@ def test_custom_swa_component_keeps_its_inline_backup_contract():
             page_size=1,
             sliding_window_size=4,
             tree_slots=tree_slots_of(
-                (ComponentType.FULL, ComponentType.AUXILIARY_SWA), window=4
+                (ComponentType.FULL, CUSTOM_WINDOW_COMPONENT), window=4
             ),
             component_registry_override={
-                FAMILY_OF[ComponentType.AUXILIARY_SWA]: AuxiliarySWAComponent
+                FAMILY_OF[CUSTOM_WINDOW_COMPONENT]: AuxiliarySWAComponent
             },
             tree_core_backend="python",
         )
@@ -3707,7 +3756,7 @@ def test_custom_swa_component_keeps_its_inline_backup_contract():
         InsertParams(key=_key(list(range(6))), value=values, prev_prefix_len=2)
     ).last_device_node
     lock = cache.inc_lock_ref(leaf).to_dec_params()
-    component = ComponentType.AUXILIARY_SWA
+    component = CUSTOM_WINDOW_COMPONENT
     original = core.get_component_device_value(parent, component).clone()
     core.set_hicache_enabled()
     core.has_swa_host_pool = True
@@ -4206,7 +4255,7 @@ def test_swa_window_repair_with_page_rounded_window(backend, is_bigram):
         (0, 8)
     ]
     assert core.full_evictable_size() == 16
-    assert core.swa_evictable_size() == 8
+    assert core_window_evictable(core) == 8
     core.sanity_check([], [])
 
 
@@ -4271,7 +4320,7 @@ def test_swa_window_repair_preserves_full_slots_and_key_namespace(page_size, is_
             == []
         )
     assert core.full_evictable_size() == 8
-    assert core.swa_evictable_size() == 4
+    assert core_window_evictable(core) == 4
     core.sanity_check([], [])
 
 
@@ -4300,12 +4349,12 @@ def test_swa_window_repair_returns_split_actions_and_balances_existing_locks():
         assert action.old_node_id == leaf
         assert action.new_child_node_id == leaf
     assert actions[0].new_node_id != actions[1].new_node_id
-    assert core.swa_protected_size() == 4
-    assert core.swa_evictable_size() == 0
+    assert core_window_protected(core) == 4
+    assert core_window_evictable(core) == 0
     core.finish_write_through([action.new_node_id for action in actions] + [leaf], leaf)
     core.dec_lock_ref(leaf, receipt.to_dec_params())
-    assert core.swa_protected_size() == 0
-    assert core.swa_evictable_size() == 4
+    assert core_window_protected(core) == 0
+    assert core_window_evictable(core) == 4
     core.sanity_check([], [])
 
 
@@ -4339,7 +4388,7 @@ def test_swa_window_repair_rejects_invalid_publication_without_partial_changes()
         (0, 2),
         (6, 8),
     ]
-    assert core.swa_evictable_size() == 4
+    assert core_window_evictable(core) == 4
     core.sanity_check([], [])
 
 
@@ -4486,7 +4535,7 @@ def test_skipped_mamba_lock_survives_swa_only_release_through_the_adapter():
     assert core.mamba_protected_size() == 1
     core.dec_lock_ref(node, owner.to_dec_params())
     assert core.protected_size() == 0
-    assert core.swa_protected_size() == 0
+    assert core_window_protected(core) == 0
     assert core.mamba_protected_size() == 0
 
 
@@ -5145,15 +5194,15 @@ def test_lock_uuid_round_trips_through_dec_lock_ref():
     assert result.component_lock_uuids[ComponentType.SWA] is not None
     assert not result.component_host_lock_uuids
     # The locked window is protected SWA accounting, visible through the binding.
-    assert core.swa_protected_size() == 2
-    assert core.swa_evictable_size() == 1
+    assert core_window_protected(core) == 2
+    assert core_window_evictable(core) == 1
     core.dec_lock_ref(
         node,
         result.to_dec_params(),
     )
     # The uuid-bounded release returned the window to evictable.
-    assert core.swa_protected_size() == 0
-    assert core.swa_evictable_size() == 3
+    assert core_window_protected(core) == 0
+    assert core_window_evictable(core) == 3
     # A repeat acquire reuses the stamped uuid.
     again = core.inc_lock_ref(node)
     assert (
@@ -5163,7 +5212,7 @@ def test_lock_uuid_round_trips_through_dec_lock_ref():
     skipped = core.inc_lock_ref(node, skip_lock_components=(ComponentType.SWA,))
     assert ComponentType.SWA not in skipped.component_lock_uuids
     core.dec_lock_ref(node, skipped.to_dec_params())
-    assert core.swa_protected_size() == 2
+    assert core_window_protected(core) == 2
     core.dec_lock_ref(node, again.to_dec_params())
     core.sanity_check([], [])
 
@@ -5184,7 +5233,7 @@ def test_swa_tombstones_cross_the_binding_and_release_balanced(
     )
     result = core.inc_lock_ref(leaf)
     assert result.component_lock_uuids[ComponentType.SWA] is None
-    assert core.swa_protected_size() == 2
+    assert core_window_protected(core) == 2
     release = core.dec_swa_lock_only if swa_only else core.dec_lock_ref
     if missing_receipt:
         missing = DecLockRefParams(node_id=leaf)
@@ -5196,7 +5245,7 @@ def test_swa_tombstones_cross_the_binding_and_release_balanced(
         assert error.value.__cause__ is None
         return  # A Rust ownership violation poisons the core.
     release(leaf, result.to_dec_params())
-    assert core.swa_protected_size() == 0
+    assert core_window_protected(core) == 0
     if swa_only:
         core.dec_lock_ref(leaf, DecLockRefParams(node_id=leaf), skip_swa=True)
     core.sanity_check([], [])

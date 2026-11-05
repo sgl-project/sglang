@@ -47,9 +47,14 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
 from sglang.srt.mem_cache.unified_cache.component_type import (
     BASE_COMPONENT_TYPE,
     ComponentType,
+    tree_slot_ids,
 )
 from sglang.srt.mem_cache.unified_cache.components import CacheTransferPhase
-from sglang.srt.mem_cache.unified_cache.tree_core_registry import NATIVE_SLOTS
+from sglang.srt.mem_cache.unified_cache.tree_core_registry import (
+    NATIVE_FAMILY_IDS,
+    non_native_slots,
+    several_window_slots,
+)
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import StorageBackupSpec
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     JOINT_LRU_EVICTION_POLICY,
@@ -159,7 +164,33 @@ def _kv_event_from_tagged(
     raise ValueError(f"unknown kv event tag: {tag}")
 
 
-def _cache_action_from_tagged(action: tuple) -> CacheAction:
+class _CoreIds:
+    """The tree's slot ids and the ids the native core stores them by: the core
+    keeps one slot per family, by that family's own id, whatever id the tree
+    gives the slot."""
+
+    def __init__(self, tree_slots):
+        slot_ids = tree_slot_ids(tree_slots)
+        self._to_core = {
+            slot_ids[slot.component]: int(NATIVE_FAMILY_IDS[slot.family])
+            for slot in tree_slots
+        }
+        self._to_tree = {core: tree for tree, core in self._to_core.items()}
+        self.window: Optional[ComponentType] = self._to_tree.get(
+            int(NATIVE_FAMILY_IDS[TREE_WINDOW])
+        )
+
+    def core(self, component_type: ComponentType) -> int:
+        """The core's id for a tree slot. A component the tree does not keep
+        passes through as is, for the core to refuse in its own terms."""
+        return self._to_core.get(component_type, int(component_type))
+
+    def tree(self, core_id: int) -> ComponentType:
+        tree_id = self._to_tree.get(int(core_id))
+        return ComponentType(core_id) if tree_id is None else tree_id
+
+
+def _cache_action_from_tagged(action: tuple, ids: _CoreIds) -> CacheAction:
     """Build the Python CacheAction for one of the binding's tagged tuples."""
     tag = action[0]
     if tag == "free_device_kv":
@@ -179,57 +210,67 @@ def _cache_action_from_tagged(action: tuple) -> CacheAction:
         )
     if tag == "free_component_device_slot":
         return FreeComponentDeviceSlot(
-            component_type=ComponentType(action[1]), indices=list(action[2])
+            component_type=ids.tree(action[1]), indices=list(action[2])
         )
     if tag == "free_component_host_slot":
         return FreeComponentHostSlot(
-            component_type=ComponentType(action[1]), host_indices=list(action[2])
+            component_type=ids.tree(action[1]), host_indices=list(action[2])
         )
     if tag == "rebuild_full_to_swa_mapping":
         return RebuildFullToSWAMapping(
-            full_indices=list(action[1]), swa_indices=list(action[2])
+            full_indices=list(action[1]),
+            swa_indices=list(action[2]),
+            component_type=ids.window,
         )
     if tag == "recover_swa_with_locked_full":
         return RecoverSWAWithLockedFull(
-            node_id=action[1], kept_full=action[2], incoming_full=action[3]
+            node_id=action[1],
+            kept_full=action[2],
+            incoming_full=action[3],
+            component_type=ids.window,
         )
     if tag == "swa_rebuild":
-        return SWARebuild(node_id=action[1], source_value=action[2])
+        return SWARebuild(
+            node_id=action[1], source_value=action[2], component_type=ids.window
+        )
     raise ValueError(f"unknown cache action tag: {tag}")
 
 
-def _cache_actions_from_tagged(actions: Sequence[tuple]) -> list[CacheAction]:
+def _cache_actions_from_tagged(
+    actions: Sequence[tuple], ids: _CoreIds
+) -> list[CacheAction]:
     """Build the Python CacheActions for the binding's tagged tuples, in order."""
-    return [_cache_action_from_tagged(action) for action in actions]
+    return [_cache_action_from_tagged(action, ids) for action in actions]
 
 
-def _inc_lock_ref_result_from_binding(result) -> IncLockRefResult:
+def _inc_lock_ref_result_from_binding(result, ids: _CoreIds) -> IncLockRefResult:
     return IncLockRefResult(
         delta=result.delta,
         node_id=result.node_id,
         skipped_lock_components=tuple(
-            ComponentType(ct) for ct in result.skipped_lock_components
+            ids.tree(ct) for ct in result.skipped_lock_components
         ),
         component_lock_uuids={
-            ComponentType(ct): uuid for ct, uuid in result.component_lock_uuids.items()
+            ids.tree(ct): uuid for ct, uuid in result.component_lock_uuids.items()
         },
         component_host_lock_uuids={
-            ComponentType(ct): uuid
-            for ct, uuid in result.component_host_lock_uuids.items()
+            ids.tree(ct): uuid for ct, uuid in result.component_host_lock_uuids.items()
         },
     )
 
 
-def _dec_lock_ref_params_to_binding(bindings_module, params: DecLockRefParams):
+def _dec_lock_ref_params_to_binding(
+    bindings_module, params: DecLockRefParams, ids: _CoreIds
+):
     """Use the owning module's type for both production and inspection bindings."""
     return bindings_module.DecLockRefParamsBinding(
         node_id=params.node_id,
-        skipped_lock_components=[int(ct) for ct in params.skipped_lock_components],
+        skipped_lock_components=[ids.core(ct) for ct in params.skipped_lock_components],
         component_lock_uuids={
-            int(ct): uuid for ct, uuid in params.component_lock_uuids.items()
+            ids.core(ct): uuid for ct, uuid in params.component_lock_uuids.items()
         },
         component_host_lock_uuids={
-            int(ct): uuid for ct, uuid in params.component_host_lock_uuids.items()
+            ids.core(ct): uuid for ct, uuid in params.component_host_lock_uuids.items()
         },
     )
 
@@ -262,27 +303,30 @@ def _transfer_from_binding(transfer: tuple) -> PoolTransfer:
 
 def _comp_xfers_to_binding(
     comp_xfers: dict[ComponentType, list[PoolTransfer]],
+    ids: _CoreIds,
 ) -> dict[int, list[tuple]]:
-    """Rekey per-component transfers by the binding's component values."""
+    """Rekey per-component transfers by the core's ids."""
     return {
-        int(ct): [_transfer_to_binding(x) for x in xfers]
+        ids.core(ct): [_transfer_to_binding(x) for x in xfers]
         for ct, xfers in comp_xfers.items()
     }
 
 
 def _comp_xfers_from_binding(
-    comp_xfers: dict[int, list[tuple]],
+    comp_xfers: dict[int, list[tuple]], ids: _CoreIds
 ) -> dict[ComponentType, list[PoolTransfer]]:
-    """Rekey the binding's per-component transfer tuples by ComponentType."""
+    """Rekey the binding's per-component transfer tuples by the tree's ids."""
     return {
-        ComponentType(ct): [_transfer_from_binding(x) for x in xfers]
+        ids.tree(ct): [_transfer_from_binding(x) for x in xfers]
         for ct, xfers in comp_xfers.items()
     }
 
 
-def _tracker_to_binding(tracker: dict[ComponentType, int]) -> dict[int, int]:
-    """Rekey a ComponentType tracker by the binding's component values."""
-    return {int(component): freed for component, freed in tracker.items()}
+def _tracker_to_binding(
+    tracker: dict[ComponentType, int], ids: _CoreIds
+) -> dict[int, int]:
+    """Rekey a tree-id tracker by the core's ids."""
+    return {ids.core(component): freed for component, freed in tracker.items()}
 
 
 class _RustKVCacheEventRecorder:
@@ -318,7 +362,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     supports_rotation_base = True
 
     def _cache_action_from_tagged(self, action: tuple) -> CacheAction | ComponentAction:
-        return _cache_action_from_tagged(action)
+        return _cache_action_from_tagged(action, self._ids)
 
     def _cache_actions_from_tagged(
         self, actions: Sequence[tuple]
@@ -340,7 +384,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 rotation_tail_declined=step.result.rotation_tail_declined,
                 adopted_ranges=(
                     {
-                        ComponentType(component_type): list(ranges)
+                        self._ids.tree(component_type): list(ranges)
                         for component_type, ranges in step.result.adopted_ranges.items()
                     }
                     if step.result.adopted_ranges is not None
@@ -361,7 +405,11 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             last_visited_node_id=result.last_visited_node_id,
             full_device_match_len=result.full_device_match_len,
             host_hit_length=result.host_hit_length,
-            swa_host_hit_length=result.swa_host_hit_length,
+            window_host_hit_lengths=(
+                {}
+                if self._ids.window is None
+                else {self._ids.window: result.swa_host_hit_length}
+            ),
             swa_branching_seqlen=result.swa_branching_seqlen,
             mamba_host_hit_length=result.mamba_host_hit_length,
             mamba_branching_seqlen=result.mamba_branching_seqlen,
@@ -373,11 +421,11 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         """Map a binding eviction step into an interface step result; both carry
         this step's deltas, frees, and actions."""
         for component, delta in binding_result.tracker.items():
-            result.tracker[ComponentType(component)] = delta
+            result.tracker[self._ids.tree(component)] = delta
         for component, tensors in binding_result.new_device_frees.items():
-            result.device_frees[ComponentType(component)].extend(tensors)
+            result.device_frees[self._ids.tree(component)].extend(tensors)
         for component, tensors in binding_result.new_host_frees.items():
-            result.host_frees[ComponentType(component)].extend(tensors)
+            result.host_frees[self._ids.tree(component)].extend(tensors)
         result.cache_actions.extend(
             self._cache_actions_from_tagged(binding_result.cache_actions)
         )
@@ -390,8 +438,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         # Each family's slot id: the adapter names a slot by its family, never
         # by a kind.
         self._family_slot_ids: dict[str, ComponentType] = {}
+        slot_ids = tree_slot_ids(params.tree_slots)
         for slot in params.tree_slots:
-            self._family_slot_ids.setdefault(slot.family, ComponentType[slot.component])
+            self._family_slot_ids.setdefault(slot.family, slot_ids[slot.component])
 
         # TODO(Jialin): Port session-reference-aware TreeCore support from #29173.
         if params.enable_session_radix_cache:
@@ -401,11 +450,12 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
 
         # TODO(Jialin): Port custom component registration from #25754 and
         # C128 support from #33676.
-        unsupported_components = [
-            slot
-            for slot in params.tree_slots
-            if NATIVE_SLOTS.get(slot.component) != slot.family
-        ]
+        if several_window_slots(params.tree_slots):
+            raise ValueError(
+                "Rust TreeCore keeps one window slot; this tree has "
+                f"{[s.component for s in params.tree_slots if s.family == TREE_WINDOW]}"
+            )
+        unsupported_components = non_native_slots(params.tree_slots)
         if unsupported_components:
             names = ", ".join(
                 sorted(
@@ -418,6 +468,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             raise ValueError(
                 "Rust TreeCore does not support component_registry_override"
             )
+        # The core keeps each family's slot by its own id; translate at the
+        # binding, so the tree's ids never reach it.
+        self._ids = _CoreIds(params.tree_slots)
         # Validate the same constructor options as Python before passing the
         # configured eviction parameters to the native strategy.
         eviction_strategy = get_eviction_strategy(
@@ -516,7 +569,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             # Each slot's id and family: the native core picks a slot's driver
             # by its family.
             [
-                (int(ComponentType[slot.component]), slot.family)
+                (self._ids.core(slot_ids[slot.component]), slot.family)
                 for slot in params.tree_slots
             ],
         )
@@ -607,9 +660,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         skip_lock_components: Sequence[ComponentType] = (),
     ) -> IncLockRefResult:
         result = self._binding.inc_lock_ref(
-            node_id, [int(ct) for ct in skip_lock_components]
+            node_id, [self._ids.core(ct) for ct in skip_lock_components]
         )
-        return _inc_lock_ref_result_from_binding(result)
+        return _inc_lock_ref_result_from_binding(result, self._ids)
 
     def dec_lock_ref(
         self,
@@ -618,7 +671,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         skip_swa: bool = False,
     ) -> DecLockRefResult:
         self._binding.dec_lock_ref(
-            node_id, _dec_lock_ref_params_to_binding(self._bindings, params), skip_swa
+            node_id,
+            _dec_lock_ref_params_to_binding(self._bindings, params, self._ids),
+            skip_swa,
         )
         return DecLockRefResult()
 
@@ -631,13 +686,13 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         result = DecSwaLockOnlyResult()
         new_device_frees, new_host_frees, actions = self._binding.dec_window_lock_only(
             node_id,
-            int(component_type),
-            _dec_lock_ref_params_to_binding(self._bindings, params),
+            self._ids.core(component_type),
+            _dec_lock_ref_params_to_binding(self._bindings, params, self._ids),
         )
         for component, tensors in new_device_frees.items():
-            result.device_frees[ComponentType(component)].extend(tensors)
+            result.device_frees[self._ids.tree(component)].extend(tensors)
         for component, tensors in new_host_frees.items():
-            result.host_frees[ComponentType(component)].extend(tensors)
+            result.host_frees[self._ids.tree(component)].extend(tensors)
         result.cache_actions.extend(self._cache_actions_from_tagged(actions))
         return result
 
@@ -648,12 +703,12 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     ) -> DecSwaLockOnlyResult:
         result = DecSwaLockOnlyResult()
         new_device_frees, new_host_frees, actions = self._binding.dec_swa_lock_only(
-            node_id, _dec_lock_ref_params_to_binding(self._bindings, params)
+            node_id, _dec_lock_ref_params_to_binding(self._bindings, params, self._ids)
         )
         for component, tensors in new_device_frees.items():
-            result.device_frees[ComponentType(component)].extend(tensors)
+            result.device_frees[self._ids.tree(component)].extend(tensors)
         for component, tensors in new_host_frees.items():
-            result.host_frees[ComponentType(component)].extend(tensors)
+            result.host_frees[self._ids.tree(component)].extend(tensors)
         result.cache_actions.extend(self._cache_actions_from_tagged(actions))
         return result
 
@@ -662,13 +717,13 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     def evict_device_start(
         self, component_type: ComponentType, request_cnt: int
     ) -> None:
-        self._binding.evict_device_start(int(component_type), request_cnt)
+        self._binding.evict_device_start(self._ids.core(component_type), request_cnt)
 
     def evict_device_next_node(
         self, component_type: ComponentType, tracker: dict[ComponentType, int]
     ) -> EvictDeviceNextNodeResult:
         binding_result = self._binding.evict_device_next_node(
-            int(component_type), _tracker_to_binding(tracker)
+            self._ids.core(component_type), _tracker_to_binding(tracker, self._ids)
         )
         result = EvictDeviceNextNodeResult(
             node_id=binding_result.node_id,
@@ -725,17 +780,17 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         return self._fill_evict_result(binding_result, DemoteResult())
 
     def evict_device_end(self, component_type: ComponentType) -> None:
-        self._binding.evict_device_end(int(component_type))
+        self._binding.evict_device_end(self._ids.core(component_type))
 
     def inc_host_lock_ref(self, node_id: NodeId) -> IncLockRefResult:
         result = self._binding.inc_host_lock_ref(node_id)
-        return _inc_lock_ref_result_from_binding(result)
+        return _inc_lock_ref_result_from_binding(result, self._ids)
 
     def dec_host_lock_ref(
         self, node_id: NodeId, params: DecLockRefParams
     ) -> DecLockRefResult:
         self._binding.dec_host_lock_ref(
-            node_id, _dec_lock_ref_params_to_binding(self._bindings, params)
+            node_id, _dec_lock_ref_params_to_binding(self._bindings, params, self._ids)
         )
         return DecLockRefResult()
 
@@ -746,10 +801,10 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         return self._binding.protected_size()
 
     def component_evictable_size(self, component_type: ComponentType) -> int:
-        return self._binding.component_evictable_size(int(component_type))
+        return self._binding.component_evictable_size(self._ids.core(component_type))
 
     def component_protected_size(self, component_type: ComponentType) -> int:
-        return self._binding.component_protected_size(int(component_type))
+        return self._binding.component_protected_size(self._ids.core(component_type))
 
     def full_evictable_size(self) -> int:
         return self._binding.full_evictable_size()
@@ -760,16 +815,10 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     def _slot_size(self, size_of: Callable[[int], int], family: str) -> int:
         """``size_of`` the tree's slot of ``family``; 0 when it has none."""
         slot_id = self.slot_id(family)
-        return 0 if slot_id is None else size_of(int(slot_id))
-
-    def swa_evictable_size(self) -> int:
-        return self._slot_size(self._binding.component_evictable_size, TREE_WINDOW)
+        return 0 if slot_id is None else size_of(self._ids.core(slot_id))
 
     def mamba_evictable_size(self) -> int:
         return self._slot_size(self._binding.component_evictable_size, TREE_STATE)
-
-    def swa_protected_size(self) -> int:
-        return self._slot_size(self._binding.component_protected_size, TREE_WINDOW)
 
     def mamba_protected_size(self) -> int:
         return self._slot_size(self._binding.component_protected_size, TREE_STATE)
@@ -879,7 +928,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         self, component_type: ComponentType, num_tokens: int
     ) -> DriveHostEvictionResult:
         binding_result = self._binding.drive_host_eviction(
-            int(component_type),
+            self._ids.core(component_type),
             num_tokens,
             envs.SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM.get(),
         )
@@ -894,9 +943,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     ) -> None:
         binding_result = self._binding.evict_excess_path_states(tail_node_id)
         for component, tensors in binding_result.new_device_frees.items():
-            device_frees[ComponentType(component)].extend(tensors)
+            device_frees[self._ids.tree(component)].extend(tensors)
         for component, tensors in binding_result.new_host_frees.items():
-            host_frees[ComponentType(component)].extend(tensors)
+            host_frees[self._ids.tree(component)].extend(tensors)
         cache_actions.extend(
             self._cache_actions_from_tagged(binding_result.cache_actions)
         )
@@ -1004,7 +1053,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         self, node_id: NodeId
     ) -> tuple[torch.Tensor, dict[ComponentType, list[PoolTransfer]]]:
         device_value, comp_xfers = self._binding.build_backup_spec(node_id)
-        comp_xfers = _comp_xfers_from_binding(comp_xfers)
+        comp_xfers = _comp_xfers_from_binding(comp_xfers, self._ids)
         self._refresh_swa_backup_indices(comp_xfers.get(self.slot_id(TREE_WINDOW), ()))
         return device_value, comp_xfers
 
@@ -1040,7 +1089,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             token_ids=token_ids,
             hash_value=spec.hash_value,
             prefix_keys=spec.prefix_keys,
-            comp_xfers=_comp_xfers_from_binding(spec.comp_xfers),
+            comp_xfers=_comp_xfers_from_binding(spec.comp_xfers, self._ids),
         )
 
     def build_hicache_transfers(
@@ -1056,7 +1105,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         last_hash: Optional[str] = None,
     ) -> Optional[list[PoolTransfer]]:
         transfers = self._binding.build_hicache_transfers(
-            int(component_type),
+            self._ids.core(component_type),
             node_id,
             phase.value,
             host_indices,
@@ -1082,7 +1131,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             node_id, mamba_pool_idx
         )
         kv_xfer = _transfer_from_binding(kv_xfer)
-        comp_xfers = _comp_xfers_from_binding(comp_xfers)
+        comp_xfers = _comp_xfers_from_binding(comp_xfers, self._ids)
         return kv_xfer, comp_xfers
 
     def prefetch_anchor_info(
@@ -1168,7 +1217,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         actions, mamba_exist = self._binding.commit_hicache_transfers(
             node_id,
             phase.value,
-            _comp_xfers_to_binding(comp_xfers),
+            _comp_xfers_to_binding(comp_xfers, self._ids),
             (
                 None
                 if insert_result is None
@@ -1198,7 +1247,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         comp_xfers: dict[ComponentType, list[PoolTransfer]],
     ) -> None:
         self._binding.commit_backup(
-            node_id, host_indices, _comp_xfers_to_binding(comp_xfers)
+            node_id,
+            host_indices,
+            _comp_xfers_to_binding(comp_xfers, self._ids),
         )
 
     def commit_load_back(
@@ -1212,7 +1263,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             node_id,
             device_indices,
             _transfer_to_binding(kv_xfer),
-            _comp_xfers_to_binding(comp_xfers),
+            _comp_xfers_to_binding(comp_xfers, self._ids),
         )
         return self._cache_actions_from_tagged(actions)
 
@@ -1260,7 +1311,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     def adjust_component_size(
         self, node_id: NodeId, component_type: ComponentType, delta: int
     ) -> None:
-        self._binding.adjust_component_size(node_id, int(component_type), delta)
+        self._binding.adjust_component_size(
+            node_id, self._ids.core(component_type), delta
+        )
 
     def collect_path_info(
         self, end_node_ids: Sequence[NodeId]
@@ -1272,18 +1325,22 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         self, node_id: NodeId, component_type: ComponentType, value: torch.Tensor
     ) -> None:
         self._binding.set_component_device_value(
-            node_id, int(component_type), value.to(torch.int64)
+            node_id, self._ids.core(component_type), value.to(torch.int64)
         )
 
     def get_component_device_value(
         self, node_id: NodeId, component_type: ComponentType
     ) -> Optional[torch.Tensor]:
-        return self._binding.get_component_device_value(node_id, int(component_type))
+        return self._binding.get_component_device_value(
+            node_id, self._ids.core(component_type)
+        )
 
     def component_has_host_value_only(
         self, node_id: NodeId, component_type: ComponentType
     ) -> bool:
-        return self._binding.component_has_host_value_only(node_id, int(component_type))
+        return self._binding.component_has_host_value_only(
+            node_id, self._ids.core(component_type)
+        )
 
     # ==== Others ====
 

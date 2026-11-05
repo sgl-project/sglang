@@ -364,7 +364,6 @@ class TestIndependentWindowFree(unittest.TestCase):
             DraftBand,
             FusedDraftPlacement,
         )
-        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
         from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
         self.addCleanup(reset_context)
@@ -397,16 +396,13 @@ class TestIndependentWindowFree(unittest.TestCase):
                         )
                     )
                     ids = a.alloc(32)
-                    kv = ReqKvInfo(req_pool_idx=0, swa_evict_floor=8)
+                    kv = ReqKvInfo(req_pool_idx=0, window_evict_floor=8)
                     storage.requests.req_to_token[0, :32] = ids
-                    for name, ct, end in zip(
-                        ("window_16", "draft_swa"),
-                        (ComponentType.SWA, ComponentType.AUXILIARY_SWA),
-                        cursors,
-                    ):
-                        start = 8 if ct == ComponentType.SWA and end else 0
+                    for name, end in zip(("window_16", "draft_swa"), cursors):
+                        # Every window frees from the request's shield up.
+                        start = 8 if end else 0
                         a.free_window_segment(name, ids[start:end], start_pos=start)
-                        kv.set_evicted_seqlen(ct, end)
+                        kv.set_evicted_seqlen(name, end)
                     recorder = _ShapeSyncRecorder()
                     with (
                         envs.SGLANG_INVARIANT_CHECK.override(
@@ -496,8 +492,8 @@ class TestIndependentWindowFree(unittest.TestCase):
                         key=RadixKey(array("q", range(64))),
                         value=ids,
                         component_evicted_seqlens={
-                            ComponentType.SWA: primary,
-                            ComponentType.AUXILIARY_SWA: auxiliary,
+                            ComponentType.of("WINDOW_16"): primary,
+                            ComponentType.of("DRAFT_SWA"): auxiliary,
                         },
                     )
                 )
@@ -508,7 +504,8 @@ class TestIndependentWindowFree(unittest.TestCase):
             )
             cache.evict(
                 EvictParams(
-                    num_tokens=64, swa_num_tokens=64, auxiliary_swa_num_tokens=64
+                    num_tokens=64,
+                    window_num_tokens={"window_16": 64, "draft_swa": 64},
                 )
             )
         self.assertEqual(recorder.hits, [])
@@ -541,7 +538,7 @@ class TestUnifiedSwaFullSideGroup(unittest.TestCase):
         cache = mock.Mock()
         cache.supports_prefix_sharing.return_value = True
         cache.full_evictable_size.return_value = 0
-        cache.swa_evictable_size.return_value = 0
+        cache.window_evictable_size.return_value = 0
         cache.evict_for_alloc.side_effect = AssertionError("no tree eviction needed")
 
         self.assertTrue(alloc.evict_to_free_tokens(cache, before + 4, swa_num_tokens=0))

@@ -37,6 +37,15 @@ from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
+
+def _window_hit(req):
+    """The one window's ``Req.window_host_hit_lengths`` entry, read off a
+    stand-in request."""
+    from sglang.srt.managers.schedule_batch import Req
+
+    return max(Req.window_host_hit_lengths.fget(req).values(), default=0)
+
+
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 MEMORY_POOL_HOST_MODULE = "sglang.srt.mem_cache.memory_pool_host"
@@ -372,7 +381,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
             component_type=ComponentType.SWA,
             full_window_pages=1,
         )
-        pipeline._auxiliary_swa_component = None
+        pipeline._further_window_components = ()
         pipeline._cache.cache_controller.mem_pool_host.entry_map = {
             PoolName.SWA: SimpleNamespace(
                 host_pool=SimpleNamespace(page_size=swa_page_size)
@@ -424,7 +433,8 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
                     self.assertTrue(pipeline.prepare_staged_prefetch(req))
                     self.assertEqual(req.host_hit_length, 2)
                     self.assertEqual(
-                        req.swa_host_hit_length, 2 if resident_prefix else 4
+                        _window_hit(req),
+                        2 if resident_prefix else 4,
                     )
                     window = req.staged_prefetch_plan.windows[ComponentType.SWA]
                     self.assertEqual((window.start, window.end), (4, 8))

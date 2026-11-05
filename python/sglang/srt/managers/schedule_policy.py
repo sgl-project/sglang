@@ -44,7 +44,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import lru_cache
-from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Set, Union
+from typing import TYPE_CHECKING, Dict, Iterable, List, Mapping, Optional, Set, Union
 
 import torch
 
@@ -806,7 +806,7 @@ class PrefillAdder:
         extend_input_len: int,
         total_tokens: int,
         state_slots: int,
-        swa_host_hit_length: int,
+        window_host_hit_lengths: Mapping[str, int],
         chunk_limit: Optional[int],
     ) -> tuple[bool, Optional[int]]:
         return self.memory_budget.check_prefill(
@@ -815,9 +815,8 @@ class PrefillAdder:
             state_slots=state_slots,
             max_new_tokens=self._swa_new_tokens(req),
             input_tokens=len(req.full_untruncated_fill_ids),
-            swa_host_hit_length=swa_host_hit_length,
             chunk_limit=chunk_limit,
-            auxiliary_swa_host_hit_length=req.auxiliary_swa_host_hit_length,
+            window_host_hit_lengths=window_host_hit_lengths,
         )
 
     def _state_slots_for_req(self, req: Req, *, include_host_hit: bool = False) -> int:
@@ -1454,7 +1453,7 @@ class PrefillAdder:
                 total_tokens=total_tokens,
                 state_slots=state_slots,
                 host_hit_length=req.host_hit_length,
-                swa_host_hit_length=req.swa_host_hit_length,
+                window_host_hit_lengths=req.window_host_hit_lengths,
                 truncation_align_size=truncation_align_size,
                 has_chunked_req=has_chunked_req,
             )
@@ -1527,8 +1526,7 @@ class PrefillAdder:
                         ),
                         extend_input_len=admission.extend_len,
                         max_new_tokens=load_max_new,
-                        swa_host_hit_length=req.swa_host_hit_length,
-                        auxiliary_swa_host_hit_length=req.auxiliary_swa_host_hit_length,
+                        window_host_hit_lengths=req.window_host_hit_lengths,
                         chunk_limit=self.rem_chunk_tokens,
                     )
                     if not self.memory_budget.prepare_load_back(**load_budget):
@@ -1586,7 +1584,7 @@ class PrefillAdder:
                         total_tokens=total_tokens,
                         state_slots=state_slots,
                         host_hit_length=0,
-                        swa_host_hit_length=0,
+                        window_host_hit_lengths={},
                         truncation_align_size=truncation_align_size,
                         has_chunked_req=has_chunked_req,
                     )
@@ -1621,7 +1619,7 @@ class PrefillAdder:
         *,
         total_tokens: int,
         host_hit_length: int,
-        swa_host_hit_length: int,
+        window_host_hit_lengths: Mapping[str, int],
         truncation_align_size: Optional[int],
         has_chunked_req: bool = False,
         state_slots: int = 0,
@@ -1646,7 +1644,7 @@ class PrefillAdder:
             extend_input_len=extend_len,
             total_tokens=total_tokens,
             state_slots=state_slots,
-            swa_host_hit_length=swa_host_hit_length,
+            window_host_hit_lengths=window_host_hit_lengths,
             chunk_limit=chunk_limit,
         )
         if not can_admit:
@@ -1718,8 +1716,7 @@ class PrefillAdder:
                 max_new_tokens=0 if is_chunked else self._swa_new_tokens(req),
                 chunk_limit=chunk_limit,
                 state_slots=state_slots,
-                swa_host_hit_length=swa_host_hit_length,
-                auxiliary_swa_host_hit_length=req.auxiliary_swa_host_hit_length,
+                window_host_hit_lengths=window_host_hit_lengths,
             )
         ):
             return AddReqResult.NO_TOKEN
