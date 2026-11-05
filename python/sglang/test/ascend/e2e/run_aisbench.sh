@@ -523,11 +523,7 @@ if [ "$MODE" == "perf" ];then
         gen_dataset_gsm8k_config_file "${dataset_dir}"
         gen_model_config_file_vllm_api_stream_chat
 
-        # REPEAT_RATE is a float (e.g. 0.9) and bash arithmetic is integer-only.
-        # The test image has no bc, so strip zeros/dots and test for a non-zero
-        # digit: 0.9 -> "9" (prefix mode), 0/0.0 -> "" (standard mode).
-        REPEAT_RATE_NONZERO=${REPEAT_RATE//[0.]/}
-        if [ -n "${REPEAT_RATE_NONZERO}" ]; then
+        if awk "BEGIN{exit !(${REPEAT_RATE:-0} > 0)}"; then
             echo "===== [Step 2/4] Prefix Mode Detected: Updating temporary config file ====="
             ls -la "${DEST_COPY_DIR}" | head -30
             # The toolkit loads its settings via "from config import *", so the
