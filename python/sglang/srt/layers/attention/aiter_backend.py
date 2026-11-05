@@ -3027,7 +3027,7 @@ class AiterAttnBackend(AttentionBackend):
                         and self.dcp_world_size > 1
                         and not forward_mode.is_idle()
                     ):
-                        kv_lens = seq_lens[:bs].to(torch.int32).clone()
+                        kv_lens = seq_lens[:bs].to(torch.int32, copy=True)
                         self._plan_dcp_decode_metadata(
                             kv_indptr,
                             kv_indices,
@@ -3203,6 +3203,8 @@ class AiterAttnBackend(AttentionBackend):
                 self._plan_dcp_decode_metadata(
                     kv_indptr,
                     kv_indices,
+                    # A copy even at int32: the planner localizes it in place, and on
+                    # the Gluon route kv_lens is the batch's seq_lens itself.
                     kv_lens[:bs].to(torch.int32, copy=True),
                     None,
                     bs,
