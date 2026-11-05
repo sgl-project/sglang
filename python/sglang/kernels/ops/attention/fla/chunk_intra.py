@@ -872,18 +872,15 @@ def chunk_kda_fwd_kernel_intra_sub_chunk(
     b_g = tl.load(p_g, mask=m_ck, other=0.0)
     b_beta = tl.load(p_beta, mask=m_c, other=0.0)
 
+    # Match the subchunk-start anchor used by the fused diagonal path.
     if USE_GATHER:
-        b_gn = gather(
-            b_g, tl.full([1, BK], min(BC // 2, T - i_ti - 1), dtype=tl.int16), axis=0
-        )
+        b_gn = gather(b_g, tl.full([1, BK], 0, dtype=tl.int16), axis=0)
     else:
         # calculate offset
-        p_gn = g + (i_ti + min(BC // 2, T - i_ti - 1)) * H * K + tl.arange(0, BK)
+        p_gn = g + i_ti * H * K + tl.arange(0, BK)
         b_gn = tl.load(p_gn, mask=tl.arange(0, BK) < K, other=0.0)
         b_gn = b_gn[None, :]
 
-    # current block, keep numerical stability by subtracting the left boundary
-    # less than 85 to avoid overflow in exp2
     b_gm = (b_g - b_gn).to(tl.float32)
 
     b_gq = tl.where(m_c[:, None], exp2(b_gm), 0.0)
