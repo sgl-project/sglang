@@ -322,9 +322,11 @@ _AITER_PARTITION_SIZE_ROCM = 256
 _PREFILL_TILE_Q = 256
 
 
-def _zero_pad_heads(x: torch.Tensor, num_heads: int) -> torch.Tensor:
-    """Append zero heads to x [tokens, heads, dim] up to num_heads."""
-    out = x.new_empty((x.shape[0], num_heads, *x.shape[2:]))
+def _zero_pad_heads(
+    x: torch.Tensor, num_heads: int, dtype: torch.dtype
+) -> torch.Tensor:
+    """Append zero heads to x [tokens, heads, dim] up to num_heads, cast to dtype."""
+    out = x.new_empty((x.shape[0], num_heads, *x.shape[2:]), dtype=dtype)
     out[:, : x.shape[1]].copy_(x)
     out[:, x.shape[1] :].zero_()
     return out
@@ -1971,10 +1973,10 @@ class AiterAttnBackend(AttentionBackend):
         # instantiation for runs on the next one up, with zero heads sliced back off.
         head_pad = self.fp8_prefill_num_head - nhead
         if head_pad:
-            q = _zero_pad_heads(q, num_heads=self.fp8_prefill_num_head)
-            k = _zero_pad_heads(k, num_heads=self.fp8_prefill_num_head)
-            v = _zero_pad_heads(v, num_heads=self.fp8_prefill_num_head)
             nhead = self.fp8_prefill_num_head
+            q = _zero_pad_heads(q, num_heads=nhead, dtype=fp8_dtype)
+            k = _zero_pad_heads(k, num_heads=nhead, dtype=fp8_dtype)
+            v = _zero_pad_heads(v, num_heads=nhead, dtype=fp8_dtype)
 
         if q.dtype != fp8_dtype:
             q = q.to(fp8_dtype)
