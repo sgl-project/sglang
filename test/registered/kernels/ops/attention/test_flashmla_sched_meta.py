@@ -418,7 +418,7 @@ def test_native_heads_schedule_and_output(heads, batch, mode):
 @pytest.mark.skipif(not get_platform().is_sm100, reason="native heads require SM100")
 class TestFlashMLAGraphMetadata(CustomTestCase):
     def test_partition_changes_between_graph_batch_sizes(self):
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.model_executor.forward_mode import ForwardMode
         from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
         from sglang.test.kits.dsa_metadata_kit import inputs, make_backend
 

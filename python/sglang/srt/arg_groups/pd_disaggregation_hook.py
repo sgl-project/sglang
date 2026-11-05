@@ -5,12 +5,12 @@ import os
 from typing import TYPE_CHECKING, Any
 
 from sglang.srt.arg_groups.arg_utils import record_fields
-from sglang.srt.arg_groups.overrides import (
-    declare_resolution,
+from sglang.srt.arg_groups.model_override_base import (
     model_config_of,
     resolved_view,
     resolving_view,
 )
+from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import attn_dp_enabled_of, num_dp_ranks_of
 

@@ -122,7 +122,8 @@ from sglang.srt.layers.dcp.layout import (
     get_dcp_lens,
 )
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.utils import (
     is_cuda,
     is_gfx95_supported,

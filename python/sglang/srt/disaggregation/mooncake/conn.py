@@ -46,12 +46,12 @@ from sglang.srt.disaggregation.common.utils import (
     run_on_device,
     unpack_int_lists,
 )
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.mooncake.utils import (
     _validate_efa_allocator_compatibility,
     check_mooncake_custom_mem_pool_enabled,
 )
 from sglang.srt.disaggregation.utils import (
-    DisaggregationMode,
     build_dsa_tail_transfer_blocks,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,

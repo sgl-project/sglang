@@ -33,7 +33,6 @@ if TYPE_CHECKING:
         DeviceAuxiliaryOutput,
         HostAuxiliaryOutput,
     )
-    from sglang.srt.managers.scheduler import GenerationBatchResult
     from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
     from sglang.srt.observability.forward_pass_metrics import (
         FpmTiming,

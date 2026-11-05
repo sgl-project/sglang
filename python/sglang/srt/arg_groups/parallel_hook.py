@@ -10,15 +10,17 @@ from typing import Any
 from sglang.srt.arg_groups.cp_tp_group_sharing_hook import (
     resolve_cp_tp_group_sharing,
 )
+from sglang.srt.arg_groups.model_override_base import (
+    model_config_of,
+    resolved_view,
+    resolving_view,
+)
 from sglang.srt.arg_groups.overrides import (
     _data_parallelism_defaults,
     _dcp_comm_backend_default,
     _dp_lm_head_validation,
     _tp_lm_head_all_to_all_default,
     declare_resolution,
-    model_config_of,
-    resolved_view,
-    resolving_view,
     run_post_process_pass,
     should_report_expert_balancedness,
 )

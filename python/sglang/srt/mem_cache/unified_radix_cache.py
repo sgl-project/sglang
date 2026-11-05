@@ -85,9 +85,6 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeDeviceKVFullOnly,
     UpdatePendingBackupOnNodeSplit,
 )
-
-# UnifiedTreeNode / UnifiedLRUList live on the tree core; re-exported here
-# because other modules and tests import them from this module.
 from sglang.srt.mem_cache.unified_cache.components import (
     BASE_COMPONENT_TYPE,
     CacheTransferPhase,
@@ -110,13 +107,8 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     UnifiedCacheLinker,
     UnifiedCacheLinkerWrapper,
 )
-from sglang.srt.mem_cache.unified_cache.unified_tree_core import (  # noqa: F401
-    NodeId,
-    UnifiedLRUList,
-    UnifiedTreeCore,
-    UnifiedTreeNode,
-)
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
+    NodeId,
     uses_joint_lru,
 )
 from sglang.srt.observability.metrics_collector import (

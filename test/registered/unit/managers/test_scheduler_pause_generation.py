@@ -13,16 +13,18 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.disaggregation.decode import DecodePreallocQueue
 from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
     DecodeKVCacheOffloadManager,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.cache_controller import HiCacheAck
 from sglang.srt.managers.io_struct import (
+    AbortReq,
     ContinueGenerationReqInput,
     PauseGenerationReqInput,
 )
-from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.deferred_responses import (
     DeferredResponses,
@@ -31,12 +33,12 @@ from sglang.srt.managers.scheduler_components.kv_events_publisher import (
     SchedulerKvEventsPublisher,
 )
 from sglang.srt.managers.scheduler_components.pool_stats_observer import PoolStats
+from sglang.srt.managers.scheduler_components.request_list import RequestList
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
-from sglang.srt.managers.scheduler_components.running_reqs import RunningReqs
 from sglang.srt.mem_cache.radix_cache import RadixCache
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -96,7 +98,8 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.last_batch = None
         scheduler.cur_batch_for_debug = None
         scheduler.chunked_req = None
-        scheduler.running_reqs = RunningReqs()
+        scheduler.running_reqs = RequestList()
+        scheduler.prefill_launched_reqs = RequestList()
         scheduler.running_batch = MagicMock()
         scheduler.running_batch.reqs = []
         scheduler.running_batch.is_empty.return_value = True
@@ -124,6 +127,12 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.disaggregation_mode = DisaggregationMode.NULL
         scheduler.hisparse_coordinator = None
         scheduler.decode_offload_manager = None
+        scheduler.disagg_prefill_bootstrap_queue = None
+        scheduler.disagg_prefill_transfer_queue = None
+        scheduler.disagg_decode_prealloc_queue = None
+        scheduler.disagg_decode_transfer_queue = None
+        scheduler.dllm_config = None
+        scheduler.uocr_runtime = None
         scheduler.server_args = MagicMock()
         scheduler.waiting_queue = []
         # pause_generation zeros gen_throughput and flushes KV events.
@@ -882,6 +891,40 @@ class TestSchedulerPauseGeneration(CustomTestCase):
 
         scheduler.disagg_decode_prealloc_queue.enqueue_held_rebootstrap.assert_called_once_with()
         self.assertFalse(scheduler._engine_paused)
+
+    def test_pd_decode_abort_finishes_a_held_rebootstrap(self):
+        scheduler = self._new_scheduler()
+        scheduler.disaggregation_mode = DisaggregationMode.DECODE
+        prealloc_queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        prealloc_queue.queue = []
+        prealloc_queue.retracted_queue = []
+        prealloc_queue.held_rebootstrap_reqs = []
+        prealloc_queue.add = MagicMock()
+        scheduler.disagg_decode_prealloc_queue = prealloc_queue
+        scheduler.disagg_decode_transfer_queue = SimpleNamespace(queue=[])
+        scheduler.deferred_responses = MagicMock()
+        scheduler.mm_receiver = None
+        scheduler.grammar_manager = MagicMock()
+        scheduler.send_abort_output = MagicMock()
+        scheduler.enable_continuous_input_polling = False
+        scheduler._engine_paused = True
+        aborted, kept = self._make_req("aborted"), self._make_req("kept")
+        prealloc_queue.hold_rebootstrap(aborted)
+        prealloc_queue.hold_rebootstrap(kept)
+
+        scheduler.abort_request(AbortReq(rid="aborted"))
+
+        self.assertIsInstance(aborted.finished_reason, FINISH_ABORT)
+        self.assertIsNone(kept.finished_reason)
+        self.assertEqual(prealloc_queue.held_rebootstrap_reqs, [kept])
+        scheduler.tree_cache.finish.assert_called_once()
+        ((abort, sent_req), _) = scheduler.send_abort_output.call_args
+        self.assertEqual((abort.rid, sent_req), ("aborted", aborted))
+
+        scheduler.continue_generation(
+            ContinueGenerationReqInput(torch_empty_cache=False)
+        )
+        prealloc_queue.add.assert_called_once_with(kept, is_rebootstrap=True)
 
 
 if __name__ == "__main__":

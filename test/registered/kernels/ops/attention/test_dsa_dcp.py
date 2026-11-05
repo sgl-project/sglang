@@ -38,8 +38,8 @@ from sglang.srt.layers.attention.dsa_backend import (
 from sglang.srt.layers.dcp import layout as dcp_layout
 from sglang.srt.layers.dcp.layout import get_dcp_lens
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla import (
     is_mla_dcp_lse_base_on_e,
 )

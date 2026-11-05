@@ -372,7 +372,6 @@ class TestAutotuneCachePhases(CustomTestCase):
             device="cuda",
             forward_stream=torch.cuda.Stream(),
             model_config=SimpleNamespace(hf_config=SimpleNamespace(architectures=None)),
-            is_draft_worker=False,
         )
         with tempfile.TemporaryDirectory() as directory:
             target, draft = (
@@ -412,7 +411,6 @@ class TestAutotuneCachePhases(CustomTestCase):
                     )
                 # No profiling: this models a restart that loads tactics from disk.
                 self.assertFalse(tuner.profiling_cache)
-                runner.is_draft_worker = True
                 with autotune.flashinfer_autotune_context(runner, run_lm_head=False):
                     pass
                 saved = json.loads(draft.read_text())
