@@ -190,14 +190,12 @@ def tiny_router_gemm_max_tokens(
     *, num_experts: int, hidden_size: int, weight_dtype: torch.dtype
 ) -> int:
     """Rows up to which the tiny GEMM beats cuBLAS for the router, -1 when the
-    shape or the device rules it out. Doubles as the kernel's compile-time
-    max_m, so keep it as tight as the measurements allow.
-    """
+    shape or the device rules it out."""
     if not _is_cuda or _device_sm < 90 or weight_dtype != torch.bfloat16:
         return -1
 
     from sglang.kernels.ops.gemm.tiny_gemm import can_use_tiny_gemm
 
-    if not can_use_tiny_gemm(num_experts, hidden_size, max_m=16):
+    if not can_use_tiny_gemm(num_experts, hidden_size):
         return -1
     return 16
