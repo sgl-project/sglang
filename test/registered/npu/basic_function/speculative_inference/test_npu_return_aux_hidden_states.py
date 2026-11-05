@@ -14,10 +14,12 @@ from sglang.test.test_utils import (
 
 register_npu_ci(est_time=200, suite="base-b-test-1-npu-a3")
 
-# Qwen3-8B hidden size; the three EAGLE3 aux layers are each this wide, packed
-# along the last dim by `pack_aux_hidden_states`.
+# Qwen3-8B hidden size; the aux layers are each this wide, packed along the
+# last dim by `pack_aux_hidden_states`. Use a non-default layer count (2) so the
+# assertion also proves `--return-aux-hidden-state-layer-ids` is honored
+# (EAGLE3 defaults to 3 layers).
 QWEN3_8B_HIDDEN_SIZE = 4096
-NUM_AUX_LAYERS = 3
+NUM_AUX_LAYERS = 2
 EXPECTED_PACKED_DIM = QWEN3_8B_HIDDEN_SIZE * NUM_AUX_LAYERS
 
 
@@ -50,7 +52,6 @@ class TestNpuReturnAuxHiddenStates(CustomTestCase):
                 "--return-aux-hidden-state-layer-ids",
                 "1",
                 "2",
-                "3",
                 "--disable-cuda-graph",
                 "--mem-fraction-static",
                 "0.7",
