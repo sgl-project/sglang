@@ -68,6 +68,7 @@ from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import (
+    RoutingMethodType,
     get_moe_a2a_backend,
     get_moe_runner_backend,
     get_num_fused_shared_experts,
@@ -439,6 +440,13 @@ class MiniMaxM3MoE(nn.Module):
             gemm1_clamp_limit=config.swiglu_limit,
             prefix=add_prefix("experts", prefix),
             gate_up_interleaved=False,
+            # M3 routes sigmoid+bias -> topk -> scaled-sum-normalize =
+            # RoutingMethodType.MiniMax2. Without this declaration the
+            # FlashInfer TRT-LLM MoE path falls back to DeepSeekV3 in-kernel
+            # routing (get_moe_routing_method_type), which is wrong for M3 and
+            # rejected by FlashInfer >= 0.7.1 at n_group=0, so
+            # --moe-runner-backend flashinfer_trtllm cannot start this model.
+            routing_method_type=RoutingMethodType.MiniMax2,
         )
         self.experts._minimax_activation = (
             "swigluoai" if config.hidden_act == "swigluoai" else "swiglu"
