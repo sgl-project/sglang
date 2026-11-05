@@ -1,18 +1,27 @@
 """Unit tests for srt/distributed/device_communicators/quick_all_reduce.py"""
 
+import logging
+import sys
+import types
 import unittest
+from unittest.mock import patch
 
 import torch
 
+import sglang.srt.distributed.device_communicators.custom_all_reduce_ops as ops
 from sglang.srt.distributed.device_communicators.quick_all_reduce import (
     MB,
     QuickAllReduce,
     QuickReduceRegime,
 )
+from sglang.srt.environ import envs
+from sglang.srt.utils import print_warning_once, temp_set_env
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+_QR_MODULE = "sglang.srt.distributed.device_communicators.quick_all_reduce"
 
 
 class _FakeFlyDSLInt4:
@@ -39,6 +48,19 @@ def _make_flydsl_quick_reduce(fake: _FakeFlyDSLInt4) -> QuickAllReduce:
     return quick_reduce
 
 
+def _make_uninitialized_quick_reduce() -> QuickAllReduce:
+    quick_reduce = QuickAllReduce.__new__(QuickAllReduce)
+    quick_reduce.disabled = True
+    quick_reduce._flydsl_int4 = None
+    quick_reduce.group = None
+    quick_reduce.device = torch.device("cpu")
+    quick_reduce.rank = 0
+    quick_reduce.world_size = 4
+    quick_reduce.qr_quant_level = QuickReduceRegime.INT4
+    quick_reduce.use_fp16_kernels = 1
+    return quick_reduce
+
+
 class TestQuickAllReduceFlyDSLInt4(CustomTestCase):
     def test_flydsl_int4_takes_only_contiguous_aligned_bf16(self):
         """Input the FlyDSL INT4 kernel cannot take must not reach it."""
@@ -62,6 +84,38 @@ class TestQuickAllReduceFlyDSLInt4(CustomTestCase):
         for name, tensor in rejected.items():
             with self.subTest(name):
                 self.assertFalse(quick_reduce.should_quick_allreduce(tensor))
+
+    def test_missing_flydsl_class_falls_back_to_hip_visibly(self):
+        """Without QuickAllReduceInt4, QuickReduce stays on the HIP kernel, warns once and says so."""
+        fake_module = types.ModuleType("aiter.ops.flydsl")
+        print_warning_once.cache_clear()
+        with (
+            patch.dict(sys.modules, {"aiter.ops.flydsl": fake_module}),
+            envs.SGLANG_USE_AITER_FLYDSL_QUICK_REDUCE.override(True),
+            temp_set_env(ROCM_QUICK_REDUCE_QUANTIZATION="INT4"),
+            patch(f"{_QR_MODULE}.is_gfx95_supported", return_value=True),
+            patch.object(ops, "init_custom_qr", create=True, return_value=1),
+            patch.object(ops, "qr_max_size", create=True, return_value=2048 * MB),
+            patch.object(ops, "qr_destroy", create=True),
+            patch.object(QuickAllReduce, "create_shared_buffer"),
+            self.assertLogs(level="INFO") as logs,
+        ):
+            for _ in range(2):
+                quick_reduce = _make_uninitialized_quick_reduce()
+                quick_reduce.init_quick_all_reduce()
+                self.assertIsNone(quick_reduce._flydsl_int4)
+                self.assertFalse(quick_reduce.disabled)
+                quick_reduce.close()
+
+        warnings = [r for r in logs.records if r.levelno == logging.WARNING]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("uses the HIP kernel", warnings[0].getMessage())
+        activation = [
+            r
+            for r in logs.records
+            if r.getMessage().startswith("QuickReduce INT4 uses the HIP kernel")
+        ]
+        self.assertEqual(len(activation), 2)
 
     def test_close_releases_flydsl_int4(self):
         fake = _FakeFlyDSLInt4()
