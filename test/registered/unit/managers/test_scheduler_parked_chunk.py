@@ -16,6 +16,10 @@ maybe_stub_sgl_kernel()
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    ListKind,
+)
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -65,11 +69,14 @@ class TestParkedChunkSkipsPrefillStep(CustomTestCase):
         s.grammar_manager = SimpleNamespace(has_waiting_grammars=lambda: False)
         s.enable_priority_preemption = False
         s.is_hybrid_swa = False
-        s.waiting_queue = waiting
+        s.waiting_queue = IndexedReqList(ListKind.WAITING)
+        s.waiting_queue.join(waiting)
+        s.disagg_prefill_bootstrap_queue = None
         s.chunked_req = chunk
         s.min_free_slots_delayer = None
         s.get_num_allocatable_reqs = Mock(return_value=8)
         s.policy = Mock()
+        s.policy.calc_priority = lambda waiting, *args, **kwargs: list(waiting)
         s.policy.shortest_prefill_chunk_limit.return_value = None
         s.processed_tokens_counter = 0
         s.chunked_prefill_size = 8192
@@ -82,7 +89,7 @@ class TestParkedChunkSkipsPrefillStep(CustomTestCase):
         s.tree_cache = SimpleNamespace(
             buffer_pipeline=None, storage_prefetch_retries=None
         )
-        s.token_to_kv_pool_allocator = None
+        s.token_to_kv_pool_allocator = SimpleNamespace(state_slots=None)
         s.new_token_ratio_tracker = SimpleNamespace(current=0.0)
         s.max_prefill_tokens = 1 << 20
         s.is_mixed_chunk = False
@@ -116,7 +123,7 @@ class TestParkedChunkSkipsPrefillStep(CustomTestCase):
 
         self.assertIsNone(batch)
         self.assertIs(s.chunked_req, chunk)
-        self.assertEqual(s.waiting_queue, [waiting])
+        self.assertEqual(list(s.waiting_queue), [waiting])
         self.assertEqual(chunk.inflight_middle_chunks, 0)
 
 
