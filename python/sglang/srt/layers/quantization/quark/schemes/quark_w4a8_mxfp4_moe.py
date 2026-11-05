@@ -289,6 +289,21 @@ class QuarkW4A8MXFp4MoE(QuarkMoEScheme):
         # triton path.
         self.flydsl_weights = None
         if FLYDSL_ENABLED and self.ep_expert_map is None:
+            from sglang.srt.runtime_context import get_context, get_exec
+
+            # Weight-prep tests run before server config is published.
+            # A published server with CPU offload is refused: flydsl_weights
+            # keeps the GPU buffers the offloader tries to free.
+            if (
+                get_context().is_config_namespace_published("exec")
+                and get_exec().offload.cpu_offload_gb > 0
+            ):
+                raise ValueError(
+                    "SGLANG_GFX1250_W4A8_FLYDSL=1 does not support "
+                    "--cpu-offload-gb > 0: cached FlyDSL/Gluon weight views "
+                    "retain GPU storage and defeat CPU offload. Set "
+                    "SGLANG_GFX1250_W4A8_FLYDSL=0 or disable CPU offload."
+                )
             fw = prepare_w4a8_gfx1250_flydsl_weights(
                 layer.w13_weight.data,
                 layer.w13_weight_scale.data,
