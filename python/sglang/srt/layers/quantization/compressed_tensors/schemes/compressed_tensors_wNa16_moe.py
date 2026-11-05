@@ -590,7 +590,7 @@ class CompressedTensorsWNA16DeepGemmMoE(CompressedTensorsWNA16MoE):
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
-        import sglang.srt.layers.moe.moe_runner.sail_deepgemm_moe  # noqa: F401
+        import sglang.srt.hardware_backend.sail.moe.deepgemm_moe  # noqa: F401
 
         self.moe_runner_config = moe_runner_config
         self.runner = MoeRunner(MoeRunnerBackend.DEEP_GEMM, moe_runner_config)

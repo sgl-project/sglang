@@ -26,8 +26,8 @@ class TestDeepGemmMaskedActivationContract(CustomTestCase):
         """Invalid activation combinations must raise instead of degrading to plain
         SiLU or writing a wrong FP4 layout."""
         from sglang.kernels.ops.moe import ep_moe_kernels as kernels
+        from sglang.srt.hardware_backend.sail.moe import deepgemm_ep as ep_module
         from sglang.srt.layers.moe.moe_runner import deep_gemm as runner_module
-        from sglang.srt.layers.moe.moe_runner import sail_deepgemm_ep as ep_module
         from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 
         for limit, swiglu, swizzle, message in (
@@ -96,8 +96,8 @@ class TestDeepGemmMaskedActivationContract(CustomTestCase):
         """All six GEMM2 kinds must receive the oai output for their weight layout,
         and clamp must not modify the GEMM1 buffer."""
         from sglang.kernels.ops.quantization import fp8_kernel, int8_kernel, sail_mxfp4
+        from sglang.srt.hardware_backend.sail.moe import deepgemm_ep as ep_module
         from sglang.srt.layers.moe.moe_runner import deep_gemm as runner_module
-        from sglang.srt.layers.moe.moe_runner import sail_deepgemm_ep as ep_module
         from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 
         gate = torch.tensor([-10, -1, 0.5, 10], dtype=torch.bfloat16).repeat(64)
@@ -245,8 +245,8 @@ class TestDeepGemmMaskedActivationContract(CustomTestCase):
         """BF16, channel FP8/INT8 and W4A16 must propagate the activation protocol
         down to the actual launch."""
         from sglang.kernels.ops.moe import ep_moe_kernels as kernels
+        from sglang.srt.hardware_backend.sail.moe import deepgemm_ep as ep_module
         from sglang.srt.layers.moe.moe_runner import deep_gemm as runner_module
-        from sglang.srt.layers.moe.moe_runner import sail_deepgemm_ep as ep_module
         from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 
         for variant, dtype, gemm_name in (
@@ -352,8 +352,8 @@ class TestDeepGemmMaskedActivationContract(CustomTestCase):
         ``silu_and_mul_masked_fwd``."""
         from sglang.kernels.ops import activation as activation_ops
         from sglang.kernels.ops.moe import ep_moe_kernels as kernels
+        from sglang.srt.hardware_backend.sail.moe import deepgemm_ep as ep_module
         from sglang.srt.layers.moe.moe_runner import deep_gemm as runner_module
-        from sglang.srt.layers.moe.moe_runner import sail_deepgemm_ep as ep_module
         from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 
         situ_calls = []
@@ -903,8 +903,8 @@ class TestSailDeepGemmFusedApi(CustomTestCase):
         """Run the real contiguous/masked flow, replacing the GPU GEMM/activation with
         CPU numerics only at the boundary."""
         from sglang.kernels.ops import activation
+        from sglang.srt.hardware_backend.sail.moe import deepgemm_ep as ep_module
         from sglang.srt.layers.moe.moe_runner import deep_gemm as runner_module
-        from sglang.srt.layers.moe.moe_runner import sail_deepgemm_ep as ep_module
         from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 
         for variant in ("mma", "valu", "int4"):
@@ -1021,7 +1021,7 @@ class TestSailDeepGemmFusedApi(CustomTestCase):
         """Both weight layouts of the same gate/up must give identical output after
         the upper-level forwarding, inverse routing and weighting."""
         from sglang.srt.environ import envs
-        from sglang.srt.layers.moe.moe_runner import sail_deepgemm_moe as tp
+        from sglang.srt.hardware_backend.sail.moe import deepgemm_moe as tp
         from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 
         source = torch.ones((2, 4), dtype=torch.bfloat16)
@@ -1131,7 +1131,7 @@ class TestSailDeepGemmFusedApi(CustomTestCase):
         """GEMM2 of the real TP runner must stay nopad and reuse the inverse routing
         of GEMM1."""
         from sglang.srt.environ import envs
-        from sglang.srt.layers.moe.moe_runner import sail_deepgemm_moe as tp
+        from sglang.srt.hardware_backend.sail.moe import deepgemm_moe as tp
 
         source = torch.full((2, 64), 0.01, dtype=torch.bfloat16)
         source[1].fill_(0.02)
@@ -1302,8 +1302,8 @@ class TestSailDeepGemmFusedApi(CustomTestCase):
         """The physical scale of the SiTU producer must still be an MN-major view for
         GEMM2 after t/permute."""
         from sglang.kernels.ops import activation
+        from sglang.srt.hardware_backend.sail.moe import deepgemm_ep as ep_module
         from sglang.srt.layers.moe.moe_runner import deep_gemm as runner_module
-        from sglang.srt.layers.moe.moe_runner import sail_deepgemm_ep as ep_module
         from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 
         quant = runner_module.DeepGemmMoeQuantInfo(
