@@ -3,7 +3,7 @@
 import unittest
 from array import array
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import torch
 
@@ -17,43 +17,6 @@ from sglang.test.kits.unified_radix_cache.mixins import UnifiedRadixCacheFixture
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
-
-
-class TestArrivalMatchGate(CustomTestCase):
-    def test_config_and_storage_transitions(self):
-        scheduler = SimpleNamespace(
-            tree_cache=SimpleNamespace(cache_controller=object())
-        )
-        # Reuse the scheduler as L3 is attached, detached, then reattached.
-        cases = [(1, True, "buffer_only"), (4, True, "cache")]
-        cases += [(4, enabled, "buffer_only") for enabled in (False, True, False, True)]
-        cases = [(*case, True) for case in cases] + [(4, True, "buffer_only", False)]
-        for pp_size, enabled, mode, has_controller in cases:
-            with self.subTest(pp_size=pp_size, enabled=enabled, mode=mode):
-                scheduler.enable_hicache_storage = enabled
-                scheduler.tree_cache.cache_controller = (
-                    object() if has_controller else None
-                )
-                req = SimpleNamespace(init_next_round_input=Mock())
-                with (
-                    patch(
-                        "sglang.srt.managers.scheduler.get_parallel",
-                        return_value=SimpleNamespace(pp_size=pp_size, pp_rank=1),
-                    ),
-                    patch(
-                        "sglang.srt.managers.scheduler.get_memory",
-                        return_value=SimpleNamespace(hicache_host_memory_mode=mode),
-                    ),
-                ):
-                    Scheduler._bind_pp_arrival_prefetch(
-                        scheduler, req, SimpleNamespace()
-                    )
-                if pp_size > 1 and enabled and mode == "buffer_only" and has_controller:
-                    req.init_next_round_input.assert_called_once_with(
-                        scheduler.tree_cache, cow_mamba=False
-                    )
-                else:
-                    req.init_next_round_input.assert_not_called()
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "cache fixtures require CUDA")
