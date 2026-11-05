@@ -16,10 +16,14 @@ import torch
 
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.srt.utils import is_xpu
+from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-small")
+register_xpu_ci(est_time=15, suite="stage-b-test-1-gpu-xpu")
+
+_DEVICE = "xpu" if is_xpu() else "cuda"
 
 _L, _H, _D, _ROWS = 2, 2, 64, 64
 # One slot holds every layer's K and V plus a gap, as a unified-pool entry.
@@ -34,10 +38,10 @@ def _strided_device_pool():
         head_num=_H,
         head_dim=_D,
         layer_num=_L,
-        device="cuda",
+        device=_DEVICE,
         enable_memory_saver=False,
     )
-    backing = torch.randn(_ROWS * _E, dtype=torch.bfloat16, device="cuda")
+    backing = torch.randn(_ROWS * _E, dtype=torch.bfloat16, device=_DEVICE)
     pool.k_buffer = [
         backing.as_strided((_ROWS, _H, _D), (_E, _D, 1), 2 * l * _H * _D)
         for l in range(_L)
@@ -50,7 +54,16 @@ def _strided_device_pool():
     return pool
 
 
-@unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+def _xpu_kernels_take_row_stride() -> bool:
+    import sgl_kernel  # noqa: F401  registers torch.ops.sgl_kernel
+
+    schema = str(torch.ops.sgl_kernel.transfer_kv_per_layer.default._schema)
+    return "src_row_stride" in schema
+
+
+@unittest.skipUnless(
+    torch.cuda.is_available() or is_xpu(), "requires a CUDA or XPU device"
+)
 class TestHiCacheStridedDeviceRows(CustomTestCase):
     def test_backup_and_load_keep_every_slot(self):
         for layout in ("layer_first", "page_first"):
@@ -73,23 +86,27 @@ class TestHiCacheStridedDeviceRows(CustomTestCase):
                     write_back_staging=device.hicache_write_back_staging,
                 )
                 self.addCleanup(host.destroy)
-                if not host.can_use_jit:
+                # XPU has no JIT path; its AOT kernels step rows by src/dst_row_stride.
+                if is_xpu():
+                    if not _xpu_kernels_take_row_stride():
+                        self.skipTest("sgl-kernel-xpu predates the row-stride kwargs")
+                elif not host.can_use_jit:
                     self.skipTest("strided device rows need the JIT HiCache kernels")
 
-                src = torch.tensor([3, 7, 20, 41], device="cuda")
-                dst = torch.tensor([5, 9, 30, 50], device="cuda")
+                src = torch.tensor([3, 7, 20, 41], device=_DEVICE)
+                dst = torch.tensor([5, 9, 30, 50], device=_DEVICE)
                 want = [
                     (k[src].clone(), v[src].clone())
                     for k, v in zip(device.k_buffer, device.v_buffer)
                 ]
-                host_slots = host.alloc(len(src)).to("cuda")
+                host_slots = host.alloc(len(src)).to(_DEVICE)
 
                 host.backup_from_device_all_layer(device, host_slots, src, "kernel")
                 for layer in range(_L):
                     host.load_to_device_per_layer(
                         device, host_slots, dst, layer, "kernel"
                     )
-                torch.cuda.synchronize()
+                torch.get_device_module(_DEVICE).synchronize()
 
                 for layer, (k, v) in enumerate(want):
                     self.assertTrue(torch.equal(device.k_buffer[layer][dst], k))
