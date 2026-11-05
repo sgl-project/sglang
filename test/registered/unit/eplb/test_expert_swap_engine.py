@@ -33,7 +33,9 @@ class TestExpertSwapEngine(CustomTestCase):
                 requested[0][:] = [0, 1, 2, 3]
             await update
             owner.collective_rpc.assert_called_once()
-            self.assertEqual(owner.collective_rpc.call_args.kwargs["requested"], [[7, 6, 5, 0]])
+            self.assertEqual(
+                owner.collective_rpc.call_args.kwargs["requested"], [[7, 6, 5, 0]]
+            )
 
         try:
             owner.loop.run_until_complete(scenario())

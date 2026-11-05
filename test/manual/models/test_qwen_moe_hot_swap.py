@@ -1,6 +1,7 @@
 """Native BF16 Qwen4 same-slot A/B/A replacement and optional GPU fault injection."""
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -12,9 +13,46 @@ import psutil
 import torch
 from safetensors.torch import load_file
 from test_qwen_moe_expert_profile import PROMPTS, compare
-from test_qwen_moe_saliency import inspect_fixture
 
 import sglang as sgl
+
+
+def inspect_fixture(model_path):
+    model_path = model_path.resolve()
+    files = sorted(path for path in model_path.rglob("*") if path.is_file())
+    total_bytes = sum(path.stat().st_size for path in files)
+    if not files or total_bytes >= 128 * 2**20:
+        raise ValueError(
+            "This manual test requires a local fixture smaller than 128 MiB"
+        )
+    manifest = {}
+    for path in files:
+        digest = hashlib.sha256()
+        with path.open("rb") as source:
+            for block in iter(lambda: source.read(2**20), b""):
+                digest.update(block)
+        manifest[str(path.relative_to(model_path))] = {
+            "bytes": path.stat().st_size,
+            "sha256": digest.hexdigest(),
+        }
+    config = json.loads((model_path / "config.json").read_text())
+    text = config.get("text_config", config)
+    num_layers = int(text["num_hidden_layers"])
+    top_k = int(text["num_experts_per_tok"])
+    num_experts = int(text.get("num_experts", text.get("num_local_experts", 0)))
+    if min(num_layers, top_k, num_experts) <= 0 or top_k > num_experts:
+        raise ValueError("Fixture must have valid routed-expert dimensions")
+    return {
+        "path": str(model_path),
+        "bytes": total_bytes,
+        "files": manifest,
+        "sha256": hashlib.sha256(
+            json.dumps(manifest, sort_keys=True).encode()
+        ).hexdigest(),
+        "num_layers": num_layers,
+        "top_k": top_k,
+        "num_experts": num_experts,
+    }
 
 
 def scheduler_pids():
