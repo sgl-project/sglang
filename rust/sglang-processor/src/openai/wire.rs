@@ -16,98 +16,68 @@ pub struct Reply {
     pub body: String,
 }
 
-/// `ErrorResponse(...).model_dump()`.
-pub(super) fn error_body(message: &str, err_type: &str, code: u16) -> Value {
-    json!({"object": "error", "message": message, "type": err_type, "param": null, "code": code})
+/// `protocol.openai_error_type`: OpenAI's `error.type` for an HTTP status.
+fn openai_error_type(code: u16) -> &'static str {
+    match code {
+        401 => "authentication_error",
+        403 => "permission_error",
+        429 => "rate_limit_error",
+        503 => "service_unavailable_error",
+        500.. => "server_error",
+        _ => "invalid_request_error",
+    }
+}
+
+/// `protocol.openai_error_body`.
+pub(super) fn error_body(message: &str, code: u16) -> Value {
+    json!({"error": {"message": message, "type": openai_error_type(code), "param": null, "code": null}})
 }
 
 /// `OpenAIServingBase.create_error_response`.
-pub(super) fn error_reply(message: &str, err_type: &str, code: u16) -> Reply {
+pub(super) fn error_reply(message: &str, code: u16) -> Reply {
     Reply {
         status: code,
-        body: error_body(message, err_type, code).to_string(),
+        body: error_body(message, code).to_string(),
     }
 }
 
 /// `OpenAIServingBase.create_streaming_error_response`, as an SSE event.
-pub(super) fn stream_error_event(message: &str, err_type: &str, code: u16) -> String {
-    let error = json!({"error": error_body(message, err_type, code)});
-    format!("data: {}\n\n", python_json(&error, true))
+pub(super) fn stream_error_event(message: &str, code: u16) -> String {
+    format!(
+        "data: {}\n\n",
+        python_json(&error_body(message, code), true)
+    )
 }
 
-/// A native `/generate` error's message, OpenAI type and status. Python's
-/// `/generate` sends no code (a ValueError, so a 400); an engine that sends one
-/// keeps its status, typed as `create_error_response` types it.
-fn engine_error_parts(error: GenerateStreamError) -> (String, String, u16) {
+/// A native `/generate` error's message and status. Python's `/generate`
+/// sends no code (a ValueError, so a 400); an engine that sends one keeps its
+/// status.
+fn engine_error_parts(error: GenerateStreamError) -> (String, u16) {
     let error = error.error.unwrap_or_default();
     let code = u16::try_from(error.code)
         .ok()
         .filter(|code| (400..600).contains(code))
         .unwrap_or(400);
-    let err_type = match code {
-        400 => "BadRequestError".to_owned(),
-        _ => code.to_string(),
-    };
-    (error.message, err_type, code)
+    (error.message, code)
 }
 
 /// The OpenAI reply for a native `/generate` error.
 pub(super) fn engine_error_reply(error: GenerateStreamError) -> Reply {
-    let (message, err_type, code) = engine_error_parts(error);
-    error_reply(&message, &err_type, code)
+    let (message, code) = engine_error_parts(error);
+    error_reply(&message, code)
 }
 
-/// Python's answer when the engine output lacks what the OpenAI layer reads.
-pub(super) fn malformed_output_reply(missing: &str) -> Reply {
-    let message = format!("Internal server error: '{missing}'");
-    error_reply(&message, "InternalServerError", 500)
+/// Python's catch-all 500, when the engine output lacks what the OpenAI layer reads.
+pub(super) fn malformed_output_reply() -> Reply {
+    error_reply("Internal server error", 500)
 }
 
-/// `HTTPStatus(code).name` for an error status, as Python 3.12 names it.
-pub(super) fn http_status_name(code: u64) -> Option<&'static str> {
-    Some(match code {
-        400 => "BAD_REQUEST",
-        401 => "UNAUTHORIZED",
-        402 => "PAYMENT_REQUIRED",
-        403 => "FORBIDDEN",
-        404 => "NOT_FOUND",
-        405 => "METHOD_NOT_ALLOWED",
-        406 => "NOT_ACCEPTABLE",
-        407 => "PROXY_AUTHENTICATION_REQUIRED",
-        408 => "REQUEST_TIMEOUT",
-        409 => "CONFLICT",
-        410 => "GONE",
-        411 => "LENGTH_REQUIRED",
-        412 => "PRECONDITION_FAILED",
-        413 => "REQUEST_ENTITY_TOO_LARGE",
-        414 => "REQUEST_URI_TOO_LONG",
-        415 => "UNSUPPORTED_MEDIA_TYPE",
-        416 => "REQUESTED_RANGE_NOT_SATISFIABLE",
-        417 => "EXPECTATION_FAILED",
-        418 => "IM_A_TEAPOT",
-        421 => "MISDIRECTED_REQUEST",
-        422 => "UNPROCESSABLE_ENTITY",
-        423 => "LOCKED",
-        424 => "FAILED_DEPENDENCY",
-        425 => "TOO_EARLY",
-        426 => "UPGRADE_REQUIRED",
-        428 => "PRECONDITION_REQUIRED",
-        429 => "TOO_MANY_REQUESTS",
-        431 => "REQUEST_HEADER_FIELDS_TOO_LARGE",
-        451 => "UNAVAILABLE_FOR_LEGAL_REASONS",
-        500 => "INTERNAL_SERVER_ERROR",
-        501 => "NOT_IMPLEMENTED",
-        502 => "BAD_GATEWAY",
-        503 => "SERVICE_UNAVAILABLE",
-        504 => "GATEWAY_TIMEOUT",
-        505 => "HTTP_VERSION_NOT_SUPPORTED",
-        506 => "VARIANT_ALSO_NEGOTIATES",
-        507 => "INSUFFICIENT_STORAGE",
-        508 => "LOOP_DETECTED",
-        510 => "NOT_EXTENDED",
-        511 => "NETWORK_AUTHENTICATION_REQUIRED",
-        _ => return None,
-    })
+/// Whether `code` is an `HTTPStatus` error code, as Python 3.12 defines them.
+pub(super) fn is_http_error_status(code: u64) -> bool {
+    matches!(
+        code,
+        400..=418 | 421..=426 | 428 | 429 | 431 | 451 | 500..=508 | 510 | 511
+    )
 }
 
 /// `UsageProcessor.calculate_token_usage`, dumped as `UsageInfo`.
@@ -188,28 +158,18 @@ pub(super) struct StreamState {
 impl StreamState {
     /// An engine error replaces the reply until the first chunk has been sent.
     pub(super) fn error(&mut self, error: GenerateStreamError) -> Result<Vec<String>, Reply> {
-        let (message, err_type, code) = engine_error_parts(error);
+        let (message, code) = engine_error_parts(error);
         if !self.started {
             // Python's `/generate` streams a scheduler abort as a frame and
             // sends only 400 error frames, so a 500 is a host's own failure:
-            // `handle_request`'s generic `InternalServerError`.
+            // `handle_request`'s generic 500, which sends no exception text.
             if code == 500 {
-                let message = format!("Internal server error: {message}");
-                return Err(error_reply(&message, "InternalServerError", code));
+                return Err(error_reply("Internal server error", code));
             }
-            return Err(error_reply(&message, &err_type, code));
+            return Err(error_reply(&message, code));
         }
         self.failed = true;
-        // Mid-stream, Python's abort event is typed by the status's name.
-        let event_type = match code {
-            400 => None,
-            _ => http_status_name(code.into()),
-        };
-        Ok(vec![stream_error_event(
-            &message,
-            event_type.unwrap_or(&err_type),
-            code,
-        )])
+        Ok(vec![stream_error_event(&message, code)])
     }
 
     /// An abort or error just ended the stream; Python stops there, without
@@ -294,11 +254,12 @@ pub(super) fn abort_event(reason: Option<&FinishReason>) -> Option<String> {
         return None;
     };
     let code = u64::from(abort.status_code?);
-    Some(stream_error_event(
-        abort.message.as_deref().unwrap_or("Generation aborted."),
-        http_status_name(code)?,
-        code as u16,
-    ))
+    is_http_error_status(code).then(|| {
+        stream_error_event(
+            abort.message.as_deref().unwrap_or("Generation aborted."),
+            code as u16,
+        )
+    })
 }
 
 pub(super) fn logprob_slice<T>(items: &[T], prev: usize, total: usize, incremental: bool) -> &[T] {
@@ -326,6 +287,62 @@ pub(super) fn logprobs_length(meta: &GenerateMetaInfo, prev: usize, incremental:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn engine_errors_become_the_envelope_with_their_status() {
+        let error = |message: &str, code: u32| GenerateStreamError {
+            error: Some(sglang_api_types::api::v1::ErrorBody {
+                message: message.into(),
+                code,
+            }),
+            index: None,
+        };
+        let envelope = |message: &str, error_type: &str| json!({"error": {"message": message, "type": error_type, "param": null, "code": null}});
+        let body = |reply: &Reply| serde_json::from_str::<Value>(&reply.body).unwrap();
+        // A ValueError from `/generate` carries no code: a 400.
+        let value_error = engine_error_reply(error("bad n", 0));
+        assert_eq!(value_error.status, 400);
+        assert_eq!(
+            body(&value_error),
+            envelope("bad n", "invalid_request_error")
+        );
+        // An engine status is kept, and typed by it.
+        let unavailable = engine_error_reply(error("The request queue is full.", 503));
+        assert_eq!(unavailable.status, 503);
+        assert_eq!(
+            body(&unavailable),
+            envelope("The request queue is full.", "service_unavailable_error")
+        );
+
+        // Before the first chunk, a 500 is the generic one, without its text.
+        let mut stream = StreamState::default();
+        let failed = stream.error(error("boom", 500)).unwrap_err();
+        assert_eq!(failed.status, 500);
+        assert_eq!(
+            body(&failed),
+            envelope("Internal server error", "server_error")
+        );
+        // Mid-stream, the error is an envelope frame typed by its status.
+        stream.started = true;
+        let events = stream.error(error("Out of memory.", 503)).unwrap();
+        assert_eq!(
+            events,
+            [format!(
+                "data: {}\n\n",
+                python_json(
+                    &envelope("Out of memory.", "service_unavailable_error"),
+                    true
+                )
+            )]
+        );
+
+        let malformed = malformed_output_reply();
+        assert_eq!(malformed.status, 500);
+        assert_eq!(
+            body(&malformed),
+            envelope("Internal server error", "server_error")
+        );
+    }
 
     #[test]
     fn cache_report_keeps_zero_cached_tokens() {

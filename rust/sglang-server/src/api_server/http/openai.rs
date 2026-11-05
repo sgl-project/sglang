@@ -87,23 +87,26 @@ fn unix_seconds_u32() -> u32 {
     u32::try_from(unix_seconds()).unwrap_or(u32::MAX)
 }
 
-/// The OpenAI error payload.
+/// OpenAI's `error.type` for an HTTP status (`protocol.openai_error_type`).
+fn openai_error_type(code: StatusCode) -> &'static str {
+    match code {
+        StatusCode::UNAUTHORIZED => "authentication_error",
+        StatusCode::FORBIDDEN => "permission_error",
+        StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",
+        StatusCode::SERVICE_UNAVAILABLE => "service_unavailable_error",
+        code if code.is_server_error() => "server_error",
+        _ => "invalid_request_error",
+    }
+}
+
+/// The OpenAI error payload (`protocol.openai_error_body`).
 pub(super) fn error_payload(code: StatusCode, message: impl Into<String>) -> serde_json::Value {
-    let message = message.into();
-    let error_type = if code == StatusCode::UNAUTHORIZED {
-        "AuthenticationError"
-    } else if code.is_server_error() {
-        "InternalServerError"
-    } else {
-        "BadRequestError"
-    };
     serde_json::json!({
         "error": {
-            "object": "error",
-            "message": message,
-            "type": error_type,
+            "message": message.into(),
+            "type": openai_error_type(code),
             "param": null,
-            "code": code.as_u16(),
+            "code": null,
         }
     })
 }

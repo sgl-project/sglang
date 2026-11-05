@@ -49,6 +49,8 @@ logger = logging.getLogger(__name__)
 class OpenAIServingCompletion(OpenAIServingBase):
     """Handler for /v1/completion requests"""
 
+    openai_error_envelope = True
+
     def __init__(
         self,
         tokenizer_manager: TokenizerManager,

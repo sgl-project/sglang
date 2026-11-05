@@ -180,6 +180,9 @@ _RESPONSE_OUTPUT = TypeAdapter(ResponsesResponse.model_fields["output"].annotati
 class OpenAIServingResponses(OpenAIServingChat):
     """Handler for /v1/responses requests"""
 
+    # /v1/responses keeps its own error shape (create_error_response below).
+    openai_error_envelope = False
+
     def __init__(
         self,
         tokenizer_manager: TokenizerManager,
