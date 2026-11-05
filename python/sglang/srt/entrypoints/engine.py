@@ -137,7 +137,7 @@ from sglang.srt.runtime_context import (
     snapshot_context,
 )
 from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
-from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.server_args import PortArgs, ServerArgs, redact_server_args_secrets
 from sglang.srt.utils import (
     MultiprocessingSerializer,
     SerializedTensorPayload,
@@ -180,7 +180,7 @@ _is_cuda = is_cuda()
 
 
 def _server_args_for_logging(server_args: ServerArgs) -> Dict[str, Any]:
-    return redact_watermark_secrets(server_args.resolved_dict())
+    return redact_server_args_secrets(server_args.resolved_dict())
 
 
 @dataclasses.dataclass
@@ -318,7 +318,7 @@ class Engine(EngineScoreMixin, EngineBase):
                 "_launch_command",
                 "Engine("
                 + ", ".join(
-                    f"{k}={v!r}" for k, v in redact_watermark_secrets(kwargs).items()
+                    f"{k}={v!r}" for k, v in redact_server_args_secrets(kwargs).items()
                 )
                 + ")",
             )
@@ -1649,7 +1649,9 @@ class Engine(EngineScoreMixin, EngineBase):
         return msgspec_to_builtins(
             redact_watermark_secrets(
                 {
-                    **self.tokenizer_manager.server_args.resolved_dict(),
+                    **redact_server_args_secrets(
+                        self.tokenizer_manager.server_args.resolved_dict()
+                    ),
                     "launch_command": self.tokenizer_manager.server_args.launch_command,
                     **self._scheduler_init_result.scheduler_infos[0],
                     "startup_time": self.tokenizer_manager.startup_time,

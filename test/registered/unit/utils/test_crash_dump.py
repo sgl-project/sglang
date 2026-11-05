@@ -79,6 +79,40 @@ def _load_only_dump(folder: str) -> tuple:
         return path, pickle.load(f)
 
 
+# Every secret a dump must not carry. The watermark keys have no flag; the
+# command line spells the others as argparse accepts them.
+_SECRETS = {
+    "api_key": "api-secret",
+    "admin_api_key": "admin-secret",
+    "ssl_keyfile_password": "ssl-secret",
+    "watermark_key": "abcdef0123456789",
+    "watermark_key_b": "0123456789abcdef",
+}
+_SECRET_ARGV = (
+    "launch_server",
+    "--api-key",
+    "api-secret",
+    "--admin-api-ke=admin-secret",
+    "--ssl-keyfile-password",
+    "ssl-secret",
+)
+
+
+def _assert_secrets_redacted(test: CustomTestCase, path: str, dump: dict):
+    with open(path, "rb") as f:
+        dumped = f.read()
+    for secret in _SECRETS.values():
+        test.assertNotIn(secret.encode(), dumped)
+    for name in _SECRETS:
+        test.assertEqual(dump["server_args"][name], "<redacted>")
+        test.assertEqual(dump["resolved_config"][name], "<redacted>")
+    test.assertEqual(
+        dump["launch_command"],
+        "launch_server --api-key <redacted> --admin-api-ke=<redacted> "
+        "--ssl-keyfile-password <redacted>",
+    )
+
+
 class TestTokenizerManagerCrashDump(CustomTestCase):
     def test_file_name_and_contents(self):
         """The TokenizerManager's dump: one file per crash under the host's
@@ -152,18 +186,46 @@ class TestTokenizerManagerCrashDump(CustomTestCase):
                 running[1:], ({"text": " par", "output_ids": [7]}, 1001.0, 1002.0)
             )
 
-    def test_server_args_key_redacted_with_watermarking_off(self):
-        # The Python API accepts a server key without --enable-watermark, and
-        # validation then skips it.
-        secret = "abcdef0123456789"
-        server_args = ServerArgs(model_path="dummy", watermark_key=secret)
+    def test_server_args_snapshot_redacted_with_watermarking_off(self):
+        # The request dump pickles this snapshot as is. The Python API accepts
+        # a server key without --enable-watermark, and validation then skips it.
+        server_args = ServerArgs(model_path="dummy", **_SECRETS)
         context = create_context(server_args, role="test")
         self.assertFalse(context.config_bag("exec").features.enable_watermark)
         tm = SimpleNamespace(server_args=server_args)
         with use_context(context):
             dumped = pickle.dumps(TokenizerManager._server_args_for_dump(tm))
-        self.assertNotIn(secret.encode(), dumped)
+        for secret in _SECRETS.values():
+            self.assertNotIn(secret.encode(), dumped)
         self.assertIn(b"<redacted>", dumped)
+
+    def test_secrets_redacted_whatever_the_writer_passes(self):
+        """`write_crash_dump` redacts on its own, so the dump carries no
+        secret even when the writer passes the server args unredacted, as a
+        dict or as the record."""
+        server_args = ServerArgs(model_path="dummy", **_SECRETS)
+        finished = (_request("done"), _out("done"), 100.0, 101.5)
+        for passed in (server_args.resolved_dict(), server_args):
+            tm = SimpleNamespace(
+                crash_dump_folder=None,
+                crash_dump_performed=False,
+                crash_dump_request_list=deque([(finished[3], pickle.dumps(finished))]),
+                rid_to_state={},
+                server_args=server_args,
+                _server_args_for_dump=lambda: passed,
+                _dump_config_snapshot=server_args.resolved_dict,
+            )
+            with (
+                self.subTest(type(passed).__name__),
+                tempfile.TemporaryDirectory() as folder,
+                use_context(create_context(server_args, role="test")),
+                patch.object(sys, "argv", list(_SECRET_ARGV)),
+                envs.SGLANG_PYSPY_DUMP_BEFORE_CRASH.override(False),
+                envs.SGLANG_CUDA_COREDUMP_BEFORE_CRASH.override(False),
+            ):
+                tm.crash_dump_folder = folder
+                TokenizerManager.dump_requests_before_crash(tm, hostname="host")
+                _assert_secrets_redacted(self, *_load_only_dump(folder))
 
     def test_server_args_snapshot_failure_keeps_the_dump(self):
         # Before the redaction, a watermarking-off dump pickled ServerArgs
@@ -280,7 +342,7 @@ def _normalized(body: dict, index=None) -> GenerateReqInput:
 
 
 class TestRustServerCrashDump(CustomTestCase):
-    def _dump(self, server: RustServer, folder: str):
+    def _dump(self, server: RustServer, folder: str, argv=("launch_server",)):
         with (
             patch.object(
                 server_module,
@@ -294,7 +356,7 @@ class TestRustServerCrashDump(CustomTestCase):
                     resolved_server_args_dict=lambda base: {**base, "resolved": True}
                 ),
             ),
-            patch.object(sys, "argv", ["launch_server"]),
+            patch.object(sys, "argv", list(argv)),
         ):
             server.dump_requests_before_crash()
             # Once per process: the watchdog may follow the exception path.
@@ -337,27 +399,17 @@ class TestRustServerCrashDump(CustomTestCase):
         self.assertEqual(unfinished[0], expected_unfinished)
         self.assertEqual(unfinished[1:], ({"output_ids": [9]}, 16.0, 17.0))
 
-    def test_server_args_keys_redacted_with_watermarking_off(self):
-        """Rust mode refuses `--enable-watermark`, but the Python API takes a
-        server key without it and validation then skips the key, so the
-        dump redacts it as Python's does."""
-        key, key_b = "abcdef0123456789", "0123456789abcdef"
-        server_args = ServerArgs(
-            model_path="dummy", watermark_key=key, watermark_key_b=key_b
-        )
+    def test_secrets_redacted(self):
+        """The dump carries no secret, as Python's does. Rust mode refuses
+        `--enable-watermark`, but the Python API takes a server key without
+        it and validation then skips the key."""
+        server_args = ServerArgs(model_path="dummy", **_SECRETS)
         server = _rust_server(_SNAPSHOT)
         server.server_args = server_args
         with tempfile.TemporaryDirectory() as folder:
             with use_context(create_context(server_args, role="test")):
-                self._dump(server, folder)
-            path, dump = _load_only_dump(folder)
-            with open(path, "rb") as f:
-                dumped = f.read()
-        for secret in (key, key_b):
-            self.assertNotIn(secret.encode(), dumped)
-        for name in ("watermark_key", "watermark_key_b"):
-            self.assertEqual(dump["server_args"][name], "<redacted>")
-            self.assertEqual(dump["resolved_config"][name], "<redacted>")
+                self._dump(server, folder, argv=_SECRET_ARGV)
+            _assert_secrets_redacted(self, *_load_only_dump(folder))
 
     def test_dump_loads_with_the_readers(self):
         """`safe_pickle_load`, the replay script and the incident triage tool

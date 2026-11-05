@@ -49,6 +49,7 @@ from sglang.version import __version__
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
     from sglang.srt.rust_extensions._server import ServerArgs
+    from sglang.srt.server_args import ServerArgs as PyServerArgs
 
 logger = logging.getLogger(__name__)
 
@@ -375,8 +376,8 @@ def _launch_server_info(scheduler: Scheduler) -> str:
     at launch, as a JSON object: the resolved `server_args`,
     `launch_command`, `kv_events`, and the scheduler's init info less what is
     only known once initialization finishes (`startup_time`, which the Rust
-    server reports per request, and the gRPC `kv_event_sources`). Watermark
-    secrets are redacted as Python's HTTP and gRPC frontends redact them."""
+    server reports per request, and the gRPC `kv_event_sources`). Secrets are
+    redacted as Python's HTTP and gRPC frontends redact them."""
     scheduler_info = {
         "status": "ready",
         "max_total_num_tokens": scheduler.max_total_num_tokens,
@@ -390,21 +391,20 @@ def _launch_server_info(scheduler: Scheduler) -> str:
     # The Rust listener speaks HTTP/1 only, whatever `--enable-http2` says; a
     # router reads this key to pick its protocol.
     info["enable_http2"] = False
-    _redact_api_keys(info)
+    _redact_api_keys(info, scheduler.server_args)
     return json.dumps(info, default=str)
 
 
 _API_KEY_FIELDS = ("api_key", "admin_api_key")
 
 
-def _redact_api_keys(info: Dict[str, Any]) -> None:
-    """Keep the listener's keys out of `/server_info`, which only the API key
-    (or nothing) guards: reporting them would hand the admin key to every
-    API-key holder."""
-    keys = [info[name] for name in _API_KEY_FIELDS if info.get(name)]
-    for name in _API_KEY_FIELDS:
-        if info.get(name) is not None:
-            info[name] = "<redacted>"
+def _redact_api_keys(info: Dict[str, Any], server_args: PyServerArgs) -> None:
+    """Keep the listener's keys out of `/server_info`'s `launch_command`,
+    which only the API key (or nothing) guards: reporting them would hand the
+    admin key to every API-key holder. `build_server_info` has replaced the
+    key fields in `info` already, so the values come from `server_args`."""
+    keys = [getattr(server_args, name) for name in _API_KEY_FIELDS]
+    keys = [key for key in keys if key]
     command = info.get("launch_command")
     if not command:
         return

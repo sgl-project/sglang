@@ -3630,7 +3630,10 @@ def build_server_info(server_args, scheduler_info: Dict[str, Any]) -> Dict[str, 
 
     Callers add transport-specific fields and serialize the result.
     """
-    result = server_args.resolved_dict()
+    # lazy: server_args imports from this module.
+    from sglang.srt.server_args import redact_server_args_secrets
+
+    result = redact_server_args_secrets(server_args.resolved_dict())
     result["launch_command"] = server_args.launch_command
     result.update(scheduler_info)
     result["kv_events"] = describe_kv_events_publisher(server_args)

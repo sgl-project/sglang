@@ -22,6 +22,7 @@ from sglang.srt.sampling.watermarking.core import (
     redact_watermark_command_line,
     redact_watermark_secrets,
 )
+from sglang.srt.server_args import redact_secret_cli_args, redact_server_args_secrets
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +38,20 @@ def crash_dump_hostname() -> str:
     return os.getenv("HOSTNAME", socket.gethostname())
 
 
+def _redacted_config(config: Any) -> Optional[dict]:
+    """``config`` -- a ``ServerArgs`` or a dict of its fields -- as a dict
+    without the secrets, or None when it cannot be serialized."""
+    if config is None:
+        return None
+    try:
+        if not isinstance(config, dict):
+            config = config.resolved_dict()
+        return redact_server_args_secrets(config)
+    except Exception as e:
+        logger.error(f"Failed to snapshot the config for the dump: {e!r}")
+        return None
+
+
 def write_crash_dump(
     folder: str,
     hostname: str,
@@ -50,7 +65,11 @@ def write_crash_dump(
     finished time)`` tuples — with the launch state to
     ``<folder>/<hostname>/crash_dump_<time><filename_suffix>.pkl`` and return
     the path. The file appears whole or not at all: a process killed while
-    writing leaves no partial dump behind."""
+    writing leaves no partial dump behind.
+
+    Secrets are redacted here, for every writer: ``server_args`` (a
+    ``ServerArgs`` or a dict of its fields) and ``resolved_config`` are stored
+    as dicts without them, and the launch command without their values."""
     filename = os.path.join(
         folder,
         hostname,
@@ -60,11 +79,13 @@ def write_crash_dump(
     os.makedirs(os.path.dirname(filename), exist_ok=True)
 
     data = {
-        "server_args": server_args,
+        "server_args": _redacted_config(server_args),
         "config_updates": redact_watermark_secrets(get_context().overrides_log()),
-        "resolved_config": resolved_config,
+        "resolved_config": _redacted_config(resolved_config),
         "requests": redact_watermark_secrets(requests),
-        "launch_command": redact_watermark_command_line(sys.argv, watermark_config),
+        "launch_command": redact_watermark_command_line(
+            redact_secret_cli_args(sys.argv), watermark_config
+        ),
     }
     temp_path = os.path.join(
         os.path.dirname(filename), f".crash_dump_{secrets.token_hex(8)}.tmp"
