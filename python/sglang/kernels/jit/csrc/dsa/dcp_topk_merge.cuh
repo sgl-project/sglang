@@ -14,9 +14,6 @@
 //      which is exact because a rank holds at most k global top-k keys;
 //   5. writes this rank's keys >= t* as widened KV slots, -1 after them.
 //
-// Split mode (kSplit, KV replicated): rank q scored the 64-token pages p with
-// p % kNumRanks == q, and every rank writes ALL keys >= t* as KV slots.
-//
 // Exchange: every 64-bit entry carries an 8-bit epoch tag next to its payload
 // (score bits << 32 | position << 8 | tag), written with one 64-bit multimem
 // store and read with one 64-bit relaxed load, so a reader that sees the tag of
@@ -275,22 +272,15 @@ SGL_DEVICE uint64_t fallback_kth(
   return select_kth(visit, min(n, kTopK), s);
 }
 
-// Keys of rank q among the first L positions: token interleave, or (kSplit) its
-// 64-token pages q, q + kNumRanks, ... below L.
-template <int kNumRanks, bool kSplit>
+// Keys of rank q among the first L positions under the token interleave.
+template <int kNumRanks>
 SGL_DEVICE int local_len(int L, int q) {
-  if constexpr (kSplit) {
-    const int pages = L / 64;
-    const int full = pages - q - 1 >= 0 ? (pages - q - 1) / kNumRanks + 1 : 0;
-    return full * 64 + (full * kNumRanks + q == pages ? L % 64 : 0);
-  } else {
-    return max((L - q + kNumRanks - 1) / kNumRanks, 0);
-  }
+  return max((L - q + kNumRanks - 1) / kNumRanks, 0);
 }
 
 // Buffer layout (uint64_t entries): [2 parities][max_rows][kNumRanks * kCandK + kTopK],
 // the candidate block of every rank, then this rank's full local top-k.
-template <int kNumRanks, int kTopK, int kCandK, bool kSplit>
+template <int kNumRanks, int kTopK, int kCandK>
 __global__ void __launch_bounds__(32 * kNumRanks) merge_kernel(const __grid_constant__ Params p) {
   static_assert(kNumRanks == 8 || kNumRanks == 16, "one warp per rank: 8 or 16 ranks");
   constexpr int kThreads = 32 * kNumRanks;
@@ -367,58 +357,25 @@ __global__ void __launch_bounds__(32 * kNumRanks) merge_kernel(const __grid_cons
   unsigned fail = 0;
 #pragma unroll
   for (int q = 0; q < kNumRanks; ++q) {
-    if (want > 0 && s.kept[q] == s.sent[q] && local_len<kNumRanks, kSplit>(L, q) > s.sent[q]) fail |= 1u << q;
+    if (want > 0 && s.kept[q] == s.sent[q] && local_len<kNumRanks>(L, q) > s.sent[q]) fail |= 1u << q;
   }
   if (tid == 0) p.fallback[row] = fail != 0;
   if (fail) t = fallback_kth<kNumRanks, kTopK, kCandK>(p, row, fail, full_off, tag, cand, s);
 
   int32_t* const out = p.out + static_cast<int64_t>(row) * kTopK;
   const auto pad = [&](int e) { out[e] = -1; };
-  if constexpr (kSplit) {
-    // ---- every key >= t*: in the candidates (each rank sent all its keys >= t*
-    // unless it failed), else in the union the fallback gathered ----
-    const auto to_slot = [&](uint64_t k) {
-      const int pos = static_cast<int>(0xFFFFFFFFu - static_cast<uint32_t>(k));
-      return p.page_table[row * p.page_table_stride + pos / p.span] * p.span + pos % p.span;
-    };
-    if (!fail) {
-      bool csel[kPerLane];
-#pragma unroll
-      for (int i = 0; i < kPerLane; ++i)
-        csel[i] = cand[i] != 0 && cand[i] >= t;
-      compact<kTopK, kThreads>(csel, [&](int e, int i) { out[e] = to_slot(cand[i]); }, pad, s);
-    } else {
-      // at most 64 union keys per thread: the selection fits one 64-bit mask
-      constexpr int kUnion = kNumRanks * kTopK / kThreads;
-      static_assert(kUnion <= 64);
-      const uint64_t* const keys = p.union_scratch + static_cast<int64_t>(row) * kNumRanks * kTopK;
-      uint64_t mask = 0;
-#pragma unroll 8
-      for (int j = 0; j < kUnion; ++j) {
-        const uint64_t k = keys[tid + j * kThreads];
-        mask |= static_cast<uint64_t>(k != 0 && k >= t) << j;
-      }
-      int n;
-      int at = block_exclusive_sum<kNumRanks>(__popcll(mask), n, s);
-      for (; mask; mask &= mask - 1)
-        out[at++] = to_slot(keys[tid + (__ffsll(mask) - 1) * kThreads]);
-      for (int e = n + tid; e < kTopK; e += kThreads)
-        pad(e);
-    }
-  } else {
-    // ---- this rank's keys >= t*, compacted ----
-    select_at_least(own, t, sel);
-    compact<kTopK, kThreads>(sel, [&](int e, int i) { out[e] = slot[i]; }, pad, s);
-  }
+  // ---- this rank's keys >= t*, compacted ----
+  select_at_least(own, t, sel);
+  compact<kTopK, kThreads>(sel, [&](int e, int i) { out[e] = slot[i]; }, pad, s);
   __syncthreads();
   if (tid == 0) p.counters[row] = c + 1;
 }
 
 }  // namespace dcp_topk_merge
 
-template <int64_t kNumRanks, int64_t kTopK, int64_t kCandK, int64_t kSplit>
+template <int64_t kNumRanks, int64_t kTopK, int64_t kCandK>
 struct DcpTopKMergeKernel {
-  static constexpr auto kernel = dcp_topk_merge::merge_kernel < kNumRanks, kTopK, kCandK, kSplit != 0 > ;
+  static constexpr auto kernel = dcp_topk_merge::merge_kernel<kNumRanks, kTopK, kCandK>;
 
   /**
    * \brief Merges one batch of decode rows; every rank of the group calls it
