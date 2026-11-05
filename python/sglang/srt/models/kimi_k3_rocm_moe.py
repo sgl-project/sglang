@@ -71,6 +71,13 @@ def build_tuned_front_gemm(*, weight: torch.Tensor) -> Optional[TunedFrontGemm]:
         envs.SGLANG_USE_AITER.get() and envs.SGLANG_OPT_HIP_K3_TUNED_MOE_FRONT.get()
     ):
         return None
+    min_tokens = envs.SGLANG_OPT_HIP_K3_TUNED_MOE_FRONT_MIN_TOKENS.get()
+    max_tokens = envs.SGLANG_OPT_HIP_K3_TUNED_MOE_FRONT_MAX_TOKENS.get()
+    if not 1 <= min_tokens <= max_tokens:
+        raise ValueError(
+            "SGLANG_OPT_HIP_K3_TUNED_MOE_FRONT_{MIN,MAX}_TOKENS must satisfy "
+            f"1 <= MIN <= MAX; got {min_tokens}, {max_tokens}."
+        )
     # Declines that need no AITER come first, so they warn even on an AITER without tgemm.
     if unquant._skip_aiter_unquant:
         print_warning_once(
@@ -86,12 +93,14 @@ def build_tuned_front_gemm(*, weight: torch.Tensor) -> Optional[TunedFrontGemm]:
             "keeping the default GEMM."
         )
         return None
+    from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+    from aiter.tuned_gemm import tgemm
+
     try:
-        from aiter.jit.utils.chip_info import get_cu_num, get_gfx
-        from aiter.tuned_gemm import get_GEMM_A16W16_tuned_config, tgemm
+        from aiter.tuned_gemm import get_GEMM_A16W16_tuned_config
     except ImportError as e:
         raise ImportError(
-            "SGLANG_OPT_HIP_K3_TUNED_MOE_FRONT=1 needs aiter.tuned_gemm.tgemm and "
+            "SGLANG_OPT_HIP_K3_TUNED_MOE_FRONT=1 needs aiter.tuned_gemm."
             "get_GEMM_A16W16_tuned_config, which this AITER build lacks."
         ) from e
 
@@ -102,13 +111,6 @@ def build_tuned_front_gemm(*, weight: torch.Tensor) -> Optional[TunedFrontGemm]:
             f"front on {_TUNED_FRONT_TARGET}; got {target}, keeping the default GEMM."
         )
         return None
-    min_tokens = envs.SGLANG_OPT_HIP_K3_TUNED_MOE_FRONT_MIN_TOKENS.get()
-    max_tokens = envs.SGLANG_OPT_HIP_K3_TUNED_MOE_FRONT_MAX_TOKENS.get()
-    if not 1 <= min_tokens <= max_tokens:
-        raise ValueError(
-            "SGLANG_OPT_HIP_K3_TUNED_MOE_FRONT_{MIN,MAX}_TOKENS must satisfy "
-            f"1 <= MIN <= MAX; got {min_tokens}, {max_tokens}."
-        )
     # Without its tuned rows tgemm silently falls back to a default kernel.
     untuned = _first_untuned_tokens(
         get_tuned_config=get_GEMM_A16W16_tuned_config,

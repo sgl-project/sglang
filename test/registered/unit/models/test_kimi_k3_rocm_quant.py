@@ -198,9 +198,18 @@ class TestTunedFrontGemm(CustomTestCase):
         with self.assertRaisesRegex(RuntimeError, "M=65"):
             self._build(aiter=_fake_aiter(rows_up_to=64), window=(1, 192))
 
-    def test_rejects_an_empty_window(self):
-        with self.assertRaises(ValueError):
-            self._build(window=(64, 32))
+    def test_rejects_an_invalid_window_on_every_target(self):
+        """A bad MIN/MAX fails the load even where the target then declines the tuned front."""
+        no_aiter = {"aiter": None, "aiter.tuned_gemm": None}
+        for name, kwargs in (
+            ("tuned target", {}),
+            ("TP4 front shape", dict(weight=_shaped(7552, 7168), aiter=no_aiter)),
+            ("gfx942", dict(aiter=_fake_aiter(gfx="gfx942"))),
+            ("deterministic inference", dict(deterministic=True, aiter=no_aiter)),
+        ):
+            for window in ((64, 32), (0, 128)):
+                with self.subTest(name, window=window), self.assertRaises(ValueError):
+                    self._build(window=window, **kwargs)
 
 
 if __name__ == "__main__":
