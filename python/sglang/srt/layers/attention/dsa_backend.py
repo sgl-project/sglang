@@ -132,7 +132,7 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 _IS_GFX95 = is_gfx95_supported()
 
 if TYPE_CHECKING:
-    from sgl_kernel.flash_mla import FlashMLASchedMeta
+    from sglang.kernels.ops.attention.flash_mla_interface import FlashMLASchedMeta
 
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -249,15 +249,6 @@ def _restore_trtllm_decode_dp_padding(
 
 
 def _flashmla_kv_padded_heads(num_heads: int) -> int:
-    """Use native head counts when the installed SM100 kernel supports them."""
-    if _is_cuda and get_platform().is_sm100 and 1 <= num_heads <= 128:
-        # Importing the wrapper loads the extension and registers its ops.
-        from sgl_kernel import flash_mla
-
-        if flash_mla._flashmla_import_error is None and hasattr(
-            torch.ops.sgl_kernel, "sparse_decode_num_sm_parts"
-        ):
-            return num_heads
     if num_heads <= 64:
         return 64
     if num_heads <= 128:
@@ -3549,8 +3540,6 @@ class DeepseekSparseAttnBackend(
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         # dcp_partial: DCP decode, q gathered from the group attends over this
         # rank's KV shard; returns (o, lse) for the merge instead of o.
-        from sgl_kernel.flash_mla import flash_mla_with_kvcache
-
         cache_seqlens = metadata.dsa_cache_seqlens_int32
         assert metadata.flashmla_metadata is not None
 
@@ -3595,7 +3584,7 @@ class DeepseekSparseAttnBackend(
                 q_input, indices, topk_length
             )
 
-        o, lse = flash_mla_with_kvcache(
+        o, lse = self._call_flash_mla_with_kvcache(
             q=q_input,
             k_cache=kv_cache,
             cache_seqlens=cache_seqlens,
@@ -3632,8 +3621,7 @@ class DeepseekSparseAttnBackend(
         # The schedule depends on topk_length, so it is built per call, by the
         # DeepSeek-V4 scheduler kernel's windowed schedule (FlashMLA's own walk
         # over the partitions sits on the critical path for tens of us).
-        from sgl_kernel.flash_mla import get_mla_metadata
-
+        from sglang.kernels.ops.attention.flash_mla_interface import get_mla_metadata
         from sglang.srt.layers.attention.deepseek_v4_backend import (
             _maybe_precompute_flashmla_sched_meta,
         )
@@ -3646,7 +3634,7 @@ class DeepseekSparseAttnBackend(
             topk_length=topk_length,
             extra_indices=None,
             extra_topk_length=None,
-            windowed=True,
+            schedule="windowed",
         )
         return sched_meta
 
@@ -4548,8 +4536,6 @@ class DeepseekSparseAttnBackend(
         seq_len_q: int,
         num_heads_q: Optional[int] = None,
     ):
-        from sgl_kernel.flash_mla import get_mla_metadata
-
         if num_heads_q is None:
             num_heads_q = self.flashmla_kv_num_q_heads
 

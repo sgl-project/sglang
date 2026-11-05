@@ -42,7 +42,6 @@ from sglang.kernels.ops.attention.dsa.dcp_topk_merge import (
     dcp_topk_merge_buffer_numel,
 )
 from sglang.kernels.ops.attention.dsv4.topk import (
-    candidates_cluster_size,
     topk_transform_candidates_v2,
     topk_transform_packed_v2,
     topk_transform_paged_v2,
@@ -175,8 +174,6 @@ def init_dcp_candidate_all_gather(max_rows: int, topk: int) -> None:
     )
 
 
-_CANDIDATE_CLUSTER_FLOOR = 16384
-
 # Candidates per rank in the merge. Over 109824 decode rows of six real
 # workloads (32K and 100K contexts, all 24 DSA layers), a rank held at most 339
 # of a row's global top-2048 keys under DCP8, so 384 needs no fallback there.
@@ -274,22 +271,20 @@ class DcpTopKMerge:
 
 
 _TOPK_MERGE: Optional[DcpTopKMerge] = None
+_TOPK_MERGE_CREATED = False
 
 
 def init_dcp_topk_merge(max_rows: int, topk: int) -> None:
     """Collective over the DCP group; call on every rank before CUDA graph
     capture."""
-    global _TOPK_MERGE
-    if _TOPK_MERGE is not None:  # one buffer per process
+    global _TOPK_MERGE, _TOPK_MERGE_CREATED
+    if _TOPK_MERGE_CREATED:  # one buffer per process, also when create declined
         return
+    _TOPK_MERGE_CREATED = True
     parallel = get_parallel()
-    group = parallel.dcp_group
-    # the kernel's rank must be the one the local candidates encode positions with
-    assert (group.world_size, group.rank_in_group) == (
-        parallel.attn_dcp_size,
-        parallel.attn_dcp_rank,
+    _TOPK_MERGE = DcpTopKMerge.create(
+        parallel.dcp_group, max_rows, topk, parallel.attn_dcp_rank
     )
-    _TOPK_MERGE = DcpTopKMerge(group, max_rows, topk)
 
 
 def _zeros_i32(n: int, device: torch.device) -> torch.Tensor:
@@ -421,11 +416,9 @@ def _local_candidates(
         logits,
         local_lens,
         out_candidates=out,
-        world=parallel.attn_dcp_size,
-        rank=parallel.attn_dcp_rank,
-        stable_ties=True,
-        cluster_size=candidates_cluster_size(rows),
-        cluster_floor=_CANDIDATE_CLUSTER_FLOOR,
+        dcp_size=parallel.attn_dcp_size,
+        dcp_rank=parallel.attn_dcp_rank,
+        deterministic=True,
     )
     return out
 
@@ -514,7 +507,7 @@ def dcp_global_topk(
         BLOCK=block,
     )
     topk_transform_paged_v2(
-        dense, global_lens, page_table, out, span, plan, stable_ties=True
+        dense, global_lens, page_table, out, span, plan, deterministic=True
     )
     return out
 
@@ -540,7 +533,7 @@ def dcp_all_visible(
         out,
         span,
         row_starts=_zeros_i32(rows, global_lens.device),
-        stable_ties=True,
+        deterministic=True,
     )
     return out
 
