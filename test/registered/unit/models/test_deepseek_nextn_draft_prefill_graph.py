@@ -73,9 +73,7 @@ class TestNextNLayersView(CustomTestCase):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner._qwen_bcg_hc_sidechannel = False
         runner._qwen_bcg_mtp_draft = False
-        runner._layer_model_text_only = (
-            deepseek_nextn.DeepseekModelNextN.prefill_cuda_graph_text_only
-        )
+        runner._layer_model_text_only = True
         self.assertFalse(
             runner.can_replay_locally(
                 batch_size=1,

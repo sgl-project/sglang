@@ -733,10 +733,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 ),
                 None,
             )
-            # Opt-in, like input_embeds_hidden_size: a body that embeds its
-            # input_ids itself captured the text-only embedding path.
-            self._layer_model_text_only = getattr(
-                self.layer_model, "prefill_cuda_graph_text_only", False
+            from sglang.srt.models.deepseek_nextn import DeepseekModelNextN
+
+            # NextN embeds its input_ids itself, so its graph holds the text-only
+            # embedding path.
+            self._layer_model_text_only = isinstance(
+                self.layer_model, DeepseekModelNextN
             )
 
         # DCP extend attention reads KV through a gather buffer in attn_dcp_metadata;

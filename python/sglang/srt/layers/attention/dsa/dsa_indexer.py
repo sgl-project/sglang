@@ -861,7 +861,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             and envs.SGLANG_ENABLE_DSA_PREFILL_INDEXER_PREP_IN_CUDA_GRAPH.get()
             and not self._aiter_fused_fp8_active(forward_batch)
             and not self.dsa_enable_prefill_cp
-            and not hasattr(get_token_to_kv_pool(), "_is_layer_owned")
         ):
             return False
         backend = get_attn_backend()
@@ -1834,22 +1833,33 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if not return_indices:
             return None
 
-        # MLA: use dummy logits with topk kernel's fast path to generate indices
-        # When length <= 2048, naive_topk_cuda directly generates [0,1,...,length-1,-1,...]
+        return self._fill_all_selected_topk(metadata, x_meta.device, topk_result)
+
+    def _fill_all_selected_topk(
+        self,
+        metadata: BaseIndexerMetadata,
+        device: torch.device,
+        topk_result: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
+        """Top-k indices when every key is selected (kv_len <= top-k).
+
+        Zero logits take the top-k kernel's fast path, which gives
+        [0, 1, ..., length - 1, -1, ...]. With a static ``topk_result`` (PCG/BCG)
+        fill its valid prefix, leave padded rows at the -1 sentinel and return
+        None; otherwise return the indices.
+        """
         seq_lens_expanded = metadata.get_seqlens_expanded()
         dummy_logits = torch.zeros(
             seq_lens_expanded.shape[0],
             self.index_topk,
             dtype=torch.float32,
-            device=x_meta.device,
+            device=device,
         )
         raw_topk_result = metadata.topk_transform(dummy_logits, self.index_topk)
-        if topk_result is not None:
-            # PCG/BCG: fill the valid prefix of the padded static buffer and
-            # leave padded rows at the -1 sentinel.
-            topk_result[: raw_topk_result.shape[0]] = raw_topk_result
-            return None
-        return raw_topk_result
+        if topk_result is None:
+            return raw_topk_result
+        topk_result[: raw_topk_result.shape[0]] = raw_topk_result
+        return None
 
     def _store_index_k_cache(
         self,

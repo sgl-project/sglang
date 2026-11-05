@@ -13,6 +13,7 @@ from sglang.srt.layers.attention import dsa_backend
 from sglang.srt.layers.attention.dsa_backend import (
     DeepseekSparseAttnBackend,
     _layerwise_kv_load_configured,
+    _max_eager_attn_prefill_rows,
     _min_bitwise_prefill_graph_bucket,
 )
 from sglang.srt.model_executor.forward_mode import ForwardMode
@@ -35,12 +36,15 @@ class _FakeLoadCounter:
         self.waited.append(layer_id)
 
 
-def _backend(*, min_rows=96, seq_lens_rows=4096, use_mha=False, counter=None):
+def _backend(
+    *, min_rows=96, max_eager_rows=80, seq_lens_rows=4096, use_mha=False, counter=None
+):
     backend = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)
     backend._prefill_graph_seq_lens = (
         None if seq_lens_rows is None else torch.zeros(seq_lens_rows, dtype=torch.int32)
     )
     backend._prefill_graph_min_rows = min_rows
+    backend._max_eager_attn_prefill_rows = max_eager_rows
     backend.use_mha = use_mha
     backend.token_to_kv_pool = SimpleNamespace(layer_transfer_counter=counter)
     return backend
@@ -97,6 +101,33 @@ class TestPrefillGraphSeqLens(CustomTestCase):
         self.assertEqual(idle.waited, [])
 
         _backend(counter=None)._wait_for_layerwise_kv_load()
+
+    def test_only_captured_attention_waits_up_front(self):
+        # Extends that replay a bucket below the floor keep the eager attention
+        # break, which waits per layer; keep their load/compute overlap.
+        for rows, waits in ((50, False), (80, False), (81, True), (512, True)):
+            with self.subTest(rows=rows):
+                counter = _FakeLoadCounter(num_layers=2, consumer_index=0)
+                _backend(counter=counter)._refresh_prefill_graph_seq_lens(
+                    torch.ones(rows, dtype=torch.int32)
+                )
+                self.assertEqual(counter.waited, [0, 1] if waits else [])
+
+
+class TestMaxEagerAttnPrefillRows(CustomTestCase):
+    def test_matches_the_bucket_each_extend_replays(self):
+        # An extend of n rows replays the smallest bucket >= n; its attention is
+        # captured iff that bucket is >= the floor, i.e. iff n > the threshold.
+        buckets = generate_prefill_cuda_graph_batch_sizes(8192)
+        for min_rows in (0, 96, buckets[-1], buckets[-1] + 1):
+            threshold = _max_eager_attn_prefill_rows(buckets=buckets, min_rows=min_rows)
+            for rows in range(1, buckets[-1] + 1):
+                bucket = min(b for b in buckets if b >= rows)
+                self.assertEqual(rows > threshold, bucket >= min_rows, (min_rows, rows))
+
+    def test_gb300_default(self):
+        buckets = generate_prefill_cuda_graph_batch_sizes(8192)
+        self.assertEqual(_max_eager_attn_prefill_rows(buckets=buckets, min_rows=96), 80)
 
 
 class TestCanRunPrefillAttentionInGraph(CustomTestCase):

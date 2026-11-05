@@ -503,10 +503,8 @@ def _validate_flashmla_sparse_q8_backend(
 
 
 def _layerwise_kv_load_configured() -> bool:
-    # Each of these registers a layer-transfer counter on the KV pool after graph
-    # capture; a layer's attention must then wait on its load event per replay.
-    # HiCache is not listed: start_loading() issues every layer's copy and records
-    # its event before the batch's forward, so _wait_for_layerwise_kv_load covers it.
+    # Loaders that need a per-layer wait inside the replay. HiCache records every
+    # layer's event before the forward, so _wait_for_layerwise_kv_load covers it.
     memory = get_memory()
     return bool(
         memory.enable_flexkv
@@ -516,11 +514,8 @@ def _layerwise_kv_load_configured() -> bool:
     )
 
 
-# Prefill graph buckets below this many rows keep the eager attention break of the
-# captured DSA prefill attention. -1: the smallest bucket whose real rows all exceed
-# SMs / 2 (96 on 152 SMs), below which the sparse MLA kernel may split the KV over
-# CTAs differently for the padded bucket than for the real rows (same math, other
-# FP8 rounding), so every batch stays bitwise equal to the eager break. 0: every bucket.
+# Smallest prefill graph bucket whose DSA attention is captured; smaller ones keep
+# the eager break. -1: _min_bitwise_prefill_graph_bucket. 0: every bucket.
 _PREFILL_GRAPH_MIN_ROWS = -1
 
 
@@ -550,6 +545,12 @@ def _min_bitwise_prefill_graph_bucket(*, buckets: list[int], num_sms: int) -> in
             return bucket
         smaller_bucket = bucket
     return smaller_bucket + 1
+
+
+def _max_eager_attn_prefill_rows(*, buckets: list[int], min_rows: int) -> int:
+    """Most rows an extend can have and still replay a bucket below ``min_rows``
+    (eager attention break): the largest such bucket, else 0."""
+    return max((bucket for bucket in buckets if bucket < min_rows), default=0)
 
 
 class DeepseekSparseAttnBackend(
@@ -875,6 +876,14 @@ class DeepseekSparseAttnBackend(
 
         self._prefill_graph_seq_lens = self._make_prefill_graph_seq_lens()
         self._prefill_graph_min_rows = self._resolve_prefill_graph_min_rows()
+        self._max_eager_attn_prefill_rows = (
+            _max_eager_attn_prefill_rows(
+                buckets=_aligned_prefill_graph_buckets(),
+                min_rows=self._prefill_graph_min_rows,
+            )
+            if self._prefill_graph_seq_lens is not None
+            else 0
+        )
         if self._prefill_graph_seq_lens is not None:
             logger.info(
                 "DSA prefill attention runs inside the breakable prefill CUDA graph "
@@ -4285,14 +4294,14 @@ class DeepseekSparseAttnBackend(
         # bucket's padded rows attend to one dummy KV slot (forward_prefill_in_graph).
         torch.clamp(dsa_cache_seqlens, min=1, out=buf[:num_rows])
         buf[num_rows:].fill_(1)
-        self._wait_for_layerwise_kv_load()
+        if num_rows > self._max_eager_attn_prefill_rows:
+            # Smaller extends replay an eager-attention bucket, which waits per layer.
+            self._wait_for_layerwise_kv_load()
 
     def _wait_for_layerwise_kv_load(self) -> None:
-        # Captured attention cannot wait per layer in its KV read, so a batch
-        # with a HiCache load-back in flight waits for every transfer layer's event
-        # before the forward: correct, without the per-layer load/compute overlap.
-        # Draft pools have no counter; their loads finish before the target's last
-        # event, and the draft forward is stream-ordered after the target's.
+        # Captured attention cannot wait per layer, so wait for every layer's
+        # HiCache load-back up front. Draft pools have no counter and run after
+        # the target's forward on the same stream.
         counter = self.token_to_kv_pool.layer_transfer_counter
         if counter is None or counter.consumer_index < 0:
             return
@@ -4331,19 +4340,8 @@ class DeepseekSparseAttnBackend(
         is_neox: bool,
         out: torch.Tensor,
     ) -> None:
-        """TRT-LLM sparse MLA prefill over every row of a prefill graph bucket.
-
-        The FP8 + fused-top-k path of ``_forward_trtllm`` with nothing read
-        from the host: per-row lengths come from ``_prefill_graph_seq_lens``
-        (refreshed by ``init_forward_metadata``), and the context length only
-        through them and the top-k slots. Padded rows read positions 0, write
-        their KV to the dummy slot 0 (``out_cache_loc`` is zero-padded), and
-        attend to that slot alone; their outputs are never consumed. Real rows
-        run the same kernels on the same inputs as the eager split op; only
-        at <= SMs / 2 real rows may the kernel split the KV over CTAs
-        differently for the bucket than for the real rows, which the default
-        _PREFILL_GRAPH_MIN_ROWS excludes.
-        """
+        """The FP8 fused-top-k TRT-LLM sparse MLA prefill over every bucket row,
+        with per-row lengths from ``_prefill_graph_seq_lens``."""
         import flashinfer.decode
 
         num_rows = q_nope.shape[0]
@@ -4362,8 +4360,9 @@ class DeepseekSparseAttnBackend(
             layer, out_cache_loc, k, k_rope_fp8
         )
 
-        # The indexer fills padded top-k rows with -1; give them the dummy slot
-        # so their length-1 attention reads valid KV. The gated top-k backends
+        # Padded rows store their KV to the dummy slot 0 (out_cache_loc is
+        # zero-padded) and the indexer fills their top-k with -1; give them that
+        # slot so their length-1 attention reads valid KV. The gated top-k backends
         # put a valid slot first in every real row, so it is a no-op there.
         topk_indices[:, 0].clamp_(min=0)
         page_table, sparse_mla_top_k = self._pad_trtllm_sparse_page_table(

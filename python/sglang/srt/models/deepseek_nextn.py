@@ -72,9 +72,6 @@ def _publish_index_topk_share_at_replay(topk_indices: Optional[torch.Tensor]) ->
 
 
 class DeepseekModelNextN(nn.Module):
-    # forward embeds input_ids itself (the multimodal rows use mm_input_embeds),
-    # so a captured prefill graph holds the text-only embedding.
-    prefill_cuda_graph_text_only = True
     # Set per instance in __init__; see the `layers` property.
     exposes_decoder_as_layers = False
 
