@@ -13,8 +13,8 @@ from sglang.srt.runtime_context import get_platform
 @_register_for("RicursiveForCausalLM")
 def _ricursive_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
-    # Ripple's prefill logprobs on flashinfer match HF with no window at all, so
-    # a prompt longer than sliding_window reads keys its sliding layers must not.
+    # On a tiny random Ricursive checkpoint, flashinfer's prefill logprobs match HF
+    # with no window at all. Drop this once its prefill applies per-layer windows.
     if "flashinfer" in (
         cfg.attention_backend,
         cfg.prefill_attention_backend,
@@ -28,7 +28,8 @@ def _ricursive_overrides(server_args: Any, hf_config: Any) -> dict:
     if not get_platform().is_cuda:
         return overrides
     if get_platform().is_sm100:
-        default_backend = "trtllm_mha"
+        # trtllm_mha doesn't support deterministic inference.
+        default_backend = "fa4" if cfg.enable_deterministic_inference else "trtllm_mha"
     elif get_platform().is_sm90:
         default_backend = "fa3"
     else:
