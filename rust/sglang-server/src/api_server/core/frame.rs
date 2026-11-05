@@ -381,6 +381,8 @@ fn cached_tokens_details(details: CachedTokensDetails) -> api::CachedTokensDetai
         host: details.host,
         storage: details.storage,
         storage_backend: details.storage_backend.as_deref().map(str::to_owned),
+        host_write_back: details.host_write_back,
+        host_prefetch: details.host_prefetch,
     }
 }
 
@@ -588,6 +590,8 @@ mod tests {
             host: 2,
             storage: Some(3),
             storage_backend: Some(Arc::from("HiCacheFile")),
+            host_write_back: None,
+            host_prefetch: None,
         };
         let streamed = CoreOutput {
             cached_tokens: 6,
@@ -615,6 +619,24 @@ mod tests {
         assert_eq!(
             json(&output.meta_info("rid", None))["cached_tokens_details"],
             serde_json::json!({"device": 1, "host": 2, "storage": 3, "storage_backend": "HiCacheFile"})
+        );
+    }
+
+    #[test]
+    fn cached_tokens_host_origin_reaches_json() {
+        let details = cached_tokens_details(CachedTokensDetails {
+            device: 2,
+            host: 8,
+            storage: None,
+            storage_backend: None,
+            host_write_back: Some(3),
+            host_prefetch: Some(5),
+        });
+        assert_eq!(
+            json(&details),
+            serde_json::json!({
+                "device": 2, "host": 8, "host_write_back": 3, "host_prefetch": 5
+            })
         );
     }
 

@@ -169,6 +169,16 @@ class SchedulerOutputStreamer:
                 details["storage"] = req.cached_tokens_storage
             if self.enable_hicache_storage():
                 details["storage_backend"] = self._get_storage_backend_type()
+            # Split the host portion by write source (only meaningful for HiCache;
+            # both stay 0 otherwise, and are omitted when there is no host hit).
+            if (
+                req.cached_tokens_host > 0
+                and getattr(req, "cached_tokens_host_write_back", 0)
+                + getattr(req, "cached_tokens_host_prefetch", 0)
+                == req.cached_tokens_host
+            ):
+                details["host_write_back"] = req.cached_tokens_host_write_back
+                details["host_prefetch"] = req.cached_tokens_host_prefetch
             return details
 
         if req.cached_tokens > 0:
@@ -661,13 +671,22 @@ class _GenerationStreamAccumulator:
             self.audio_tokens.append(audio_t)
             self.video_tokens.append(video_t)
             if self.cached_tokens_split is not None:
-                self.cached_tokens_split.append(
-                    (
-                        req.cached_tokens_device,
-                        req.cached_tokens_host,
-                        req.cached_tokens_storage,
-                    )
+                split = (
+                    req.cached_tokens_device,
+                    req.cached_tokens_host,
+                    req.cached_tokens_storage,
                 )
+                if (
+                    req.cached_tokens_host > 0
+                    and getattr(req, "cached_tokens_host_write_back", 0)
+                    + getattr(req, "cached_tokens_host_prefetch", 0)
+                    == req.cached_tokens_host
+                ):
+                    split += (
+                        req.cached_tokens_host_write_back,
+                        req.cached_tokens_host_prefetch,
+                    )
+                self.cached_tokens_split.append(split)
         else:
             # Read by the DetokenizerManager (continuity check) and TokenizerManager
             # (meta_info, per-request metrics), never by `push_generation`.

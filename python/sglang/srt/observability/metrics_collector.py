@@ -1945,6 +1945,20 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
             labelnames=list(labels.keys()) + ["cache_source"],
         )
 
+        # Host (L2) hit source breakdown. Reported on a dedicated counter (not
+        # as extra cache_source values of cached_tokens_total) so that
+        # sum(cached_tokens_total{...}) keeps its mutually-exclusive partition
+        # invariant: host_write_back + host_prefetch == host, i.e. they are
+        # sub-categories of host and must not be counted a second time.
+        self.cached_tokens_host_source_total = Counter(
+            name="sglang:cached_tokens_host_source_total",
+            documentation=(
+                "Number of cached prompt tokens on host by write source "
+                "(write_back/prefetch)."
+            ),
+            labelnames=list(labels.keys()) + ["host_source"],
+        )
+
         self.num_requests_total = Counter(
             name="sglang:num_requests_total",
             documentation="Number of requests processed.",
@@ -2130,6 +2144,24 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
 
                 report_cache_source("device", cached_tokens_details.get("device", 0))
                 report_cache_source("host", cached_tokens_details.get("host", 0))
+
+                # Host source breakdown (only present when HiCache is enabled).
+                # Kept off cached_tokens_total{cache_source=...} on purpose:
+                # write_back + prefetch == host, so reporting them there would
+                # double-count host tokens in any sum over cache_source.
+                def report_host_source(source: str, value: int):
+                    if value > 0:
+                        host_source_labels = {**labels, "host_source": source}
+                        self.cached_tokens_host_source_total.labels(
+                            **host_source_labels
+                        ).inc(value)
+
+                report_host_source(
+                    "write_back", cached_tokens_details.get("host_write_back", 0)
+                )
+                report_host_source(
+                    "prefetch", cached_tokens_details.get("host_prefetch", 0)
+                )
 
                 # Storage fields are only present when L3 storage backend is enabled
                 if "storage" in cached_tokens_details:

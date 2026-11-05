@@ -18,6 +18,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
+from sglang.srt.mem_cache.radix_cache import HostSource
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeComponentDeviceSlot,
     UpdatePendingBackupOnNodeSplit,
@@ -126,19 +127,37 @@ class FullComponent(TreeComponent):
         best_value_len: int,
     ) -> MatchResult:
         # Compute Full KV host hit length: walk from last_host_node up to
-        # last_device_node, summing host_value lengths of evicted nodes.
+        # last_device_node, summing host_value lengths of evicted nodes, and
+        # attribute the same interval to write-back vs L3-prefetch sources.
         ct = self.component_type
+        host_segments = []
         kv_host_hit = 0
+        kv_host_write_back = 0
+        kv_host_prefetch = 0
         node = result.best_match_node
         root_node = self.tree_core.root_node
         while node is not result.last_device_node and node is not root_node:
             full_host = node.component_data[ct].host_value
             if full_host is not None:
-                kv_host_hit += len(full_host)
+                n = len(full_host)
+                kv_host_hit += n
+                host_segments.append((n, node.host_source))
+                if node.host_source == HostSource.L3_PREFETCH:
+                    kv_host_prefetch += n
+                elif node.host_source == HostSource.DEVICE_BACKUP:
+                    kv_host_write_back += n
             node = node.parent
         if kv_host_hit > 0:
+            offset = result.device_prefix_len
+            host_ranges = []
+            for length, source in reversed(host_segments):
+                host_ranges.append((offset, offset + length, source))
+                offset += length
             return result._replace(
-                host_hit_length=max(result.host_hit_length, kv_host_hit)
+                host_hit_length=max(result.host_hit_length, kv_host_hit),
+                host_hit_write_back=kv_host_write_back,
+                host_hit_prefetch=kv_host_prefetch,
+                host_hit_source_ranges=tuple(host_ranges),
             )
         return result
 
@@ -166,6 +185,9 @@ class FullComponent(TreeComponent):
                 :split_len
             ].clone()
             child_cd.host_value = child_cd.host_value[split_len:].clone()
+            # The new parent inherits the Full host source; the child's was
+            # only sliced, so it keeps its own source.
+            new_parent.host_source = child.host_source
 
     def evict_component(
         self,
@@ -195,6 +217,7 @@ class FullComponent(TreeComponent):
             host_freed = len(cd.host_value)
             host_frees[self.component_type].append(cd.host_value)
             cd.host_value = None
+            node.host_source = None
         return freed, host_freed
 
     def eviction_priority(self, is_leaf: bool) -> int:

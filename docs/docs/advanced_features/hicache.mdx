@@ -6,3 +6,25 @@ metatags:
 - [Hicache Best Practices](./hicache_best_practices)
 - [Hicache Design](./hicache_design)
 - [Hicache Storage Runtime Attach Detach](./hicache_storage_runtime_attach_detach)
+
+
+## L2 hit origins
+
+`cached_tokens_details` can include `host_write_back` and `host_prefetch` when
+SGLang knows the origin of the complete L2 hit interval. They divide `host`
+into tokens retained after a device-to-host backup and tokens already resident
+in L2 after an earlier L3 prefetch. A storage read performed for the current
+request counts under `storage` and is excluded from these L2 subcategories.
+
+The counts follow the prefix actually admitted after H2D restoration, including
+prefix clipping. Unknown or incomplete provenance omits both optional origin
+fields. P/D metadata carries the origin counts to the decode node. Python and
+Rust frontends expose the same fields. Origin collection currently uses the
+Python UnifiedTreeCore, selected with
+`SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python`. Other tree cores report unknown
+origin through the optional-field behavior above.
+
+With metrics enabled, `sglang:cached_tokens_host_source_total` reports the same
+subcategories under `host_source="write_back"` and `host_source="prefetch"`.
+These values divide the host tier, so sum `sglang:cached_tokens_total` across
+its cache-source labels to obtain total cache hits.

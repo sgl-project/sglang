@@ -785,6 +785,7 @@ class TestOutputStreamerCachedTokensSplit(unittest.TestCase):
         hierarchical_cache,
         storage_backend=None,
         disaggregation_mode=DisaggregationMode.NULL,
+        host_origin=None,
     ):
         """The cached-token split and storage backend one Rust egress frame
         carries for a request with cached tokens on every tier."""
@@ -810,6 +811,10 @@ class TestOutputStreamerCachedTokensSplit(unittest.TestCase):
         req.cached_tokens_device = 1
         req.cached_tokens_host = 2
         req.cached_tokens_storage = 3
+        if host_origin is not None:
+            req.cached_tokens_host_write_back, req.cached_tokens_host_prefetch = (
+                host_origin
+            )
         streamer._stream_output_generation([req], False)
         return rust_server.push_generation.call_args.args[2:4]
 
@@ -834,6 +839,19 @@ class TestOutputStreamerCachedTokensSplit(unittest.TestCase):
             ([(1, 2, 3)], None),
         )
         self.assertEqual(self._split_sent(hierarchical_cache=False), (None, None))
+
+    def test_rust_frames_include_only_complete_host_origin(self):
+        for source, expected in (
+            ((1, 1), (1, 2, 3, 1, 1)),
+            ((2, 0), (1, 2, 3, 2, 0)),
+            ((0, 0), (1, 2, 3)),
+            ((1, 0), (1, 2, 3)),
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(
+                    self._split_sent(hierarchical_cache=True, host_origin=source),
+                    ([expected], None),
+                )
 
 
 class TestOutputStreamerRustRequestStats(unittest.TestCase):

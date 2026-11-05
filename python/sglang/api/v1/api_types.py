@@ -413,6 +413,8 @@ class CachedTokensDetails(msgspec.Struct, kw_only=True, frozen=True):
     host: int = 0
     storage: Optional[int] = None
     storage_backend: Optional[str] = None
+    host_write_back: Optional[int] = None
+    host_prefetch: Optional[int] = None
 
     @classmethod
     def from_json_value(cls, value: Any) -> "CachedTokensDetails":
@@ -1901,6 +1903,10 @@ def decode_CachedTokensDetails(value: Any) -> CachedTokensDetails:
             kw["storage"] = None if x is None else _expect_uint(x, expected="u32")
         elif key == "storage_backend":
             kw["storage_backend"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "host_write_back":
+            kw["host_write_back"] = None if x is None else _expect_uint(x, expected="u32")
+        elif key == "host_prefetch":
+            kw["host_prefetch"] = None if x is None else _expect_uint(x, expected="u32")
     return CachedTokensDetails(**kw)
 
 
@@ -1912,6 +1918,10 @@ def encode_CachedTokensDetails(v: CachedTokensDetails) -> Dict[str, Any]:
         d["storage"] = v.storage
     if v.storage_backend is not None:
         d["storage_backend"] = v.storage_backend
+    if v.host_write_back is not None:
+        d["host_write_back"] = v.host_write_back
+    if v.host_prefetch is not None:
+        d["host_prefetch"] = v.host_prefetch
     return d
 
 
