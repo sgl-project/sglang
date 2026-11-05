@@ -2439,6 +2439,7 @@ class DenoisingStage(PipelineStage):
                     "device": get_local_torch_device(),
                 }
             )
+            attn_metadata = self.attn_metadata_builder.build(**moba_params)
         elif self.attn_backend.get_enum() == AttentionBackendEnum.FA:
             attn_metadata = self.attn_metadata_builder.build(
                 raw_latent_shape=batch.raw_latent_shape

@@ -1,16 +1,29 @@
 # SPDX-License-Identifier: Apache-2.0
-"""CUDA parity checks for VMoBA chunk selection."""
+"""Accelerator parity checks for VMoBA chunk selection."""
 
 import importlib.util
 import pathlib
 
 import pytest
 import torch
+from sglang.srt.utils import get_device, is_xpu
 
 _VMOBA_PATH = pathlib.Path(__file__).resolve().parents[1] / "vmoba" / "vmoba.py"
 _spec = importlib.util.spec_from_file_location("vmoba_under_test", _VMOBA_PATH)
 vmoba = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(vmoba)
+
+# vmoba falls back to an _unsupported stub when neither flash-attn nor the XPU
+# shim imports, so gate on the resolved function rather than on one package.
+_NO_ATTENTION = vmoba.flash_attn_varlen_func.__name__ == "_unsupported"
+
+requires_attention = pytest.mark.skipif(
+    _NO_ATTENTION, reason="no varlen attention backend available"
+)
+
+# The XPU varlen kernel rejects head_dim 32 ("Unsupported head size for
+# non-paged prefill attention: 32"); flash-attn accepts it, so CUDA keeps it.
+HEAD_DIMS = (64,) if is_xpu() else (32, 64)
 
 
 def _layout(seqlens, chunk_size):
@@ -68,16 +81,17 @@ def _reference_topk_attention(q, k, v, seqlens, chunk_size, topk):
     return out
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA GPU")
-def test_gpu_mixed_sparse_selection_matches_torch_reference():
-    pytest.importorskip("flash_attn")
+@requires_attention
+@pytest.mark.parametrize("head_dim", HEAD_DIMS)
+def test_gpu_mixed_sparse_selection_matches_torch_reference(head_dim):
+    device = get_device()
     torch.manual_seed(0)
-    seqlens, chunk_size, heads, head_dim = [128, 128], 32, 2, 32
+    seqlens, chunk_size, heads = [128, 128], 32, 2
     q, k, v = (
-        torch.randn(256, heads, head_dim, device="cuda", dtype=torch.float16)
+        torch.randn(256, heads, head_dim, device=device, dtype=torch.float16)
         for _ in range(3)
     )
-    cu_seqlens = torch.tensor([0, 128, 256], dtype=torch.int32, device="cuda")
+    cu_seqlens = torch.tensor([0, 128, 256], dtype=torch.int32, device=device)
 
     actual = vmoba.moba_attn_varlen(
         q,
@@ -95,18 +109,19 @@ def test_gpu_mixed_sparse_selection_matches_torch_reference():
     assert torch.allclose(actual.float(), expected, atol=5e-3, rtol=5e-3)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA GPU")
-def test_gpu_self_chunk_only_fallback_matches_flash_attention():
-    pytest.importorskip("flash_attn")
+@requires_attention
+@pytest.mark.parametrize("head_dim", HEAD_DIMS)
+def test_gpu_self_chunk_only_fallback_matches_flash_attention(head_dim):
+    device = get_device()
     torch.manual_seed(1)
-    seqlens, chunk_size, heads, head_dim = [128, 128], 32, 2, 32
+    seqlens, chunk_size, heads = [128, 128], 32, 2
     q, k, v = (
-        torch.randn(256, heads, head_dim, device="cuda", dtype=torch.float16)
+        torch.randn(256, heads, head_dim, device=device, dtype=torch.float16)
         for _ in range(3)
     )
-    cu_seqlens = torch.tensor([0, 128, 256], dtype=torch.int32, device="cuda")
+    cu_seqlens = torch.tensor([0, 128, 256], dtype=torch.int32, device=device)
     _, cu_chunks, _, _ = _layout(seqlens, chunk_size)
-    cu_chunks = cu_chunks.to(device="cuda")
+    cu_chunks = cu_chunks.to(device=device)
 
     actual = vmoba.moba_attn_varlen(
         q,
