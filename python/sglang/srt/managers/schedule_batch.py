@@ -1101,6 +1101,13 @@ class Req(ReqDllmMixin):
         # The index of the extend / decode batch
         self.extend_batch_idx = 0
         self.decode_batch_idx = 0
+        # None until the last prompt token has been seeded; afterwards the
+        # number of output tokens already fed to the penalizers.
+        self.penalty_cumulated_output_len: Optional[int] = None
+        # Spec verify feeds accepted tokens on the forward stream, before
+        # overlap scheduling updates output_ids. Once seeded, skip the stale
+        # output-id path for this request.
+        self.penalty_external_cumulation = False
 
         # For multi-http worker
         self.http_worker_ipc = http_worker_ipc
@@ -3542,23 +3549,47 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def cumulate_penalty_output_tokens(self):
         # Under overlap batch.input_ids is just a placeholder here -- the
         # real token is relayed via future_map and resolved at forward
-        # entry. So take the last output token from Req directly
-        # (origin_input_ids[-1] on the first decode, before any output).
-        last_tokens = [
-            req.output_ids[-1] if len(req.output_ids) else req.origin_input_ids[-1]
-            for req in self.reqs
-        ]
-        # Non-blocking H2D so this per-step copy doesn't sync behind the forward.
-        # pin_memory (matching the prefill-path tensors) keeps the copy async;
-        # is_pin_memory_available falls back to pageable on unsupported devices.
-        latest_output_ids = torch.tensor(
-            last_tokens,
-            dtype=torch.int64,
-            pin_memory=is_pin_memory_available(self.device),
-        ).to(self.device, non_blocking=True)
-        self.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
-            latest_output_ids
-        )
+        # entry. Use Req output ids directly. A spec verify step can commit
+        # several tokens at once, so feed every token not yet seen.
+        new_tokens_per_req = []
+        for req in self.reqs:
+            output_len = len(req.output_ids)
+            if req.penalty_cumulated_output_len is None:
+                if output_len:
+                    new_tokens = list(req.output_ids)
+                    req.penalty_cumulated_output_len = output_len
+                else:
+                    new_tokens = [req.origin_input_ids[-1]]
+                    req.penalty_cumulated_output_len = 0
+            elif getattr(req, "penalty_external_cumulation", False):
+                new_tokens = []
+            elif req.penalty_cumulated_output_len < output_len:
+                start = req.penalty_cumulated_output_len
+                new_tokens = list(req.output_ids[start:output_len])
+                req.penalty_cumulated_output_len = output_len
+            else:
+                new_tokens = []
+            new_tokens_per_req.append(new_tokens)
+
+        max_new_tokens = max(map(len, new_tokens_per_req), default=0)
+        pin_memory = is_pin_memory_available(self.device)
+        for token_offset in range(max_new_tokens):
+            rows = [
+                row
+                for row, tokens in enumerate(new_tokens_per_req)
+                if len(tokens) > token_offset
+            ]
+            tokens = torch.tensor(
+                [new_tokens_per_req[row][token_offset] for row in rows],
+                dtype=torch.int64,
+                pin_memory=pin_memory,
+            ).to(self.device, non_blocking=True)
+            row_indices = torch.tensor(
+                rows, dtype=torch.int64, pin_memory=pin_memory
+            ).to(self.device, non_blocking=True)
+            self.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
+                tokens, row_indices=row_indices
+            )
 
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
