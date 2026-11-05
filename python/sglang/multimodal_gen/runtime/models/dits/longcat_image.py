@@ -953,6 +953,7 @@ class LongCatImageTransformer2DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         if (
             server_args.enable_breakable_cuda_graph
             or server_args.enable_cfg_parallel
+            or server_args.sp_degree != 1
             or self.layerwise_offload_managers
             or torch.cuda.is_current_stream_capturing()
             or not all(

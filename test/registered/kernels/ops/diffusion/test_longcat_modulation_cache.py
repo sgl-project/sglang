@@ -102,7 +102,7 @@ def test_model_prepares_time_conditioning_per_request_and_skips_capture():
     txt_ids = torch.zeros(4, 3, device="cuda")
     timestep = torch.tensor([500], device="cuda", dtype=torch.bfloat16)
     server = SimpleNamespace(
-        enable_breakable_cuda_graph=False, enable_cfg_parallel=False
+        enable_breakable_cuda_graph=False, enable_cfg_parallel=False, sp_degree=1
     )
     batch = SimpleNamespace(
         do_classifier_free_guidance=True,
@@ -152,6 +152,10 @@ def test_model_prepares_time_conditioning_per_request_and_skips_capture():
                 assert torch.equal(run(texts[0]), expected[0])
             assert len(calls) == 3
             setattr(server, flag, False)
+        server.sp_degree = 2
+        with set_forward_context(0, None, batch):
+            assert model._time_conditioning(x) is None
+        server.sp_degree = 1
         model.layerwise_offload_managers = [object()]
         with set_forward_context(0, None, batch):
             assert model._time_conditioning(x) is None
