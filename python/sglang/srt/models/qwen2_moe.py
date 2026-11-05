@@ -38,6 +38,7 @@ from sglang.srt.distributed import (
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.eplb.expert_profile import get_num_physical_experts
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
@@ -300,13 +301,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 if not self.enable_shared_expert_fusion
                 else config.num_experts_per_tok + self.num_fused_shared_experts
             ),
-            num_experts=(
-                config.num_experts + get_exec().moe.ep_num_redundant_experts
-                if not self.enable_shared_expert_fusion
-                else config.num_experts
-                + get_exec().moe.ep_num_redundant_experts
-                + self.num_fused_shared_experts
-            ),
+            num_experts=get_num_physical_experts(config.num_experts)
+            + self.num_fused_shared_experts,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             quant_config=quant_config,

@@ -945,6 +945,14 @@ class ExecMoe(msgspec.Struct):
         "The algorithm to choose ranks for redundant experts in expert parallel.",
     ] = None
     init_expert_location: A[str, "Initial location of EP experts."] = "trivial"
+    moe_expert_profile: A[
+        Optional[str],
+        Arg(
+            help="JSON file or object of logical expert IDs to retain at startup. "
+            "Requires BF16 Qwen3-MoE or Qwen4Exp, Triton MoE and no expert parallelism.",
+            resolvable=True,
+        ),
+    ] = None
     enable_eplb: A[bool, "Enable EPLB algorithm"] = False
     eplb_algorithm: A[str, "Chosen EPLB algorithm"] = "auto"
     eplb_rebalance_num_iterations: A[

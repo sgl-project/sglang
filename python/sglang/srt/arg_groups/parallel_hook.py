@@ -759,6 +759,72 @@ def handle_elastic_ep(server_args: Any):
 
 def handle_eplb_and_dispatch(server_args: Any):
     cfg = resolving_view(server_args)
+    if cfg.moe_expert_profile is not None:
+        from sglang.srt.eplb.expert_profile import load_expert_profile
+
+        view = resolved_view(server_args)
+        model_config = model_config_of(server_args)
+        text_config = model_config.hf_text_config
+        if model_config.hf_config.architectures[0] not in (
+            "Qwen3MoeForCausalLM",
+            "Qwen4ExpForConditionalGeneration",
+        ):
+            raise ValueError("--moe-expert-profile supports Qwen3-MoE and Qwen4Exp")
+        if (
+            model_config.quantization is not None
+            or str(model_config.dtype) != "torch.bfloat16"
+        ):
+            raise ValueError("--moe-expert-profile requires an unquantized BF16 model")
+        if (
+            view.moe_runner_backend != "triton"
+            or view.moe_a2a_backend != "none"
+            or view.ep_size != 1
+        ):
+            raise ValueError(
+                "--moe-expert-profile requires Triton MoE and no expert parallelism"
+            )
+        if (
+            cfg.enable_eplb
+            or cfg.ep_num_redundant_experts
+            or cfg.init_expert_location != "trivial"
+            or cfg.ep_dispatch_algorithm not in (None, "dynamic")
+            or cfg.ep_join_mode is not None
+            or cfg.enable_paged_experts
+            or cfg.enable_lora
+            or cfg.speculative_algorithm is not None
+            or cfg.expert_distribution_recorder_mode is not None
+            or cfg.expert_balancedness_report_mode != "off"
+            or cfg.enforce_shared_experts_fusion
+        ):
+            raise ValueError(
+                "--moe-expert-profile cannot be combined with EPLB, custom placement, offload, LoRA, speculation or expert recording"
+            )
+        if (
+            envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
+            or envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
+        ):
+            raise ValueError(
+                "--moe-expert-profile cannot be combined with simulated routing"
+            )
+        if getattr(text_config, "decoder_sparse_step", 1) != 1 or getattr(
+            text_config, "mlp_only_layers", []
+        ):
+            raise ValueError(
+                "--moe-expert-profile requires routed experts in every decoder layer"
+            )
+        profile = load_expert_profile(cfg.moe_expert_profile)
+        profile.validate_model(
+            text_config.num_hidden_layers,
+            text_config.num_experts,
+            text_config.num_experts_per_tok,
+        )
+        declare_resolution(
+            server_args,
+            "_handle_eplb_and_dispatch",
+            moe_expert_profile=profile.to_json(),
+            ep_dispatch_algorithm="dynamic",
+            disable_shared_experts_fusion=True,
+        )
     if cfg.enable_eplb and (cfg.expert_distribution_recorder_mode is None):
         declare_resolution(
             server_args,

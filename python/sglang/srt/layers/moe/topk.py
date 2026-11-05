@@ -1965,6 +1965,7 @@ def is_expert_remapping_enabled() -> bool:
         return False
     return (
         get_exec().moe.enable_eplb
+        or get_exec().moe.moe_expert_profile is not None
         or get_exec().moe.init_expert_location != "trivial"
         or get_exec().moe.ep_num_redundant_experts > 0
     )

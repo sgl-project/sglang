@@ -91,6 +91,10 @@ def transform_select_experts_inputs(
     correction_bias: Optional[torch.Tensor],
     info: Optional[ExpertLocationDispatchInfo],
 ):
+    if info is not None and get_exec().moe.moe_expert_profile is not None:
+        router_logits = router_logits.masked_fill(
+            info.partial_logical_to_all_physical_map_num_valid == 0, float("-inf")
+        )
     if (info is not None) and (info.ep_dispatch_algorithm == "fake"):
         router_logits.uniform_(5, 10)
         if correction_bias is not None:

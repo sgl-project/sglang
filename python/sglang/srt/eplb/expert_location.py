@@ -25,6 +25,7 @@ import torch
 import torch.distributed
 import torch.nn.functional as F
 
+from sglang.srt.eplb.expert_profile import get_num_physical_experts, load_expert_profile
 from sglang.srt.runtime_context import (
     get_device,
     get_exec,
@@ -233,9 +234,8 @@ class ExpertLocationMetadata:
         if model_config_for_expert_location is None:
             return None
 
-        base_num_physical_experts = (
+        base_num_physical_experts = get_num_physical_experts(
             model_config_for_expert_location.num_logical_experts
-            + get_exec().moe.ep_num_redundant_experts
         )
         # elastic-EP scale-up rewrites ep_size on the published config
         ep_size = get_parallel().ep_size
@@ -803,6 +803,14 @@ def compute_initial_expert_location_metadata(
     model_config: ModelConfig,
     moe_ep_rank: int,
 ) -> Optional[ExpertLocationMetadata]:
+    source = get_exec().moe.moe_expert_profile
+    if source is not None:
+        profile = load_expert_profile(source)
+        return ExpertLocationMetadata.init_by_mapping(
+            model_config,
+            physical_to_logical_map=profile.keep,
+            moe_ep_rank=moe_ep_rank,
+        )
     data = get_exec().moe.init_expert_location
     if data == "trivial":
         return ExpertLocationMetadata.init_trivial(model_config, moe_ep_rank)

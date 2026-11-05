@@ -28,6 +28,7 @@ from transformers import PretrainedConfig
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.eplb.expert_profile import get_num_physical_experts
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateAccumulator
 from sglang.srt.layers.layer_boundary import (
     append_stages,
@@ -255,7 +256,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             norm_topk_prob = False
 
         self.experts = get_moe_impl_class(quant_config)(
-            num_experts=config.num_experts + get_exec().moe.ep_num_redundant_experts,
+            num_experts=get_num_physical_experts(config.num_experts),
             top_k=config.num_experts_per_tok,
             layer_id=layer_id,
             hidden_size=config.hidden_size,
