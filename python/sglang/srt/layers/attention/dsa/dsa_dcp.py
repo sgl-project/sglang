@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import msgspec
 import torch
 
+from sglang.kernels.ops.attention.dcp_kernels import _lse_pack_dim
 from sglang.kernels.ops.attention.dsa.transform_index import (
     transform_index_page_table_dcp,
 )
@@ -117,6 +118,72 @@ def dcp_trtllm_sparse_attention(
         outputs.append(output)
     output = outputs[0] if len(outputs) == 1 else torch.cat(outputs)
     return output.view(rows, 1, heads, -1), lse
+
+
+def dcp_gathered_prefill_crossover(
+    *,
+    v_head_dim: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    partial_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    project_before_merge: bool,
+    q_all_gather: bool,
+) -> float:
+    """Prefix tokens per extend token and gathered head at which the two DCP
+    prefill routes put the same number of bytes on the wire.
+
+    Owned sends every extend token's partial for every head through the a2a,
+    with the LSE packed next to it, and all-gathers its query first unless
+    --dcp-replicate-q-proj built it locally. Gathered all-gathers each cached
+    prefix token's latent once. Both collectives move the same (W-1)/W of their
+    volume over the same fabric, so the group width and the bandwidth cancel:
+    what is left is the layer geometry and the two dtypes. A bf16 cache with a
+    kv_lora_rank-wide a2a and a bf16 query gather lands near 3.8; the fp8 cache
+    with a v_head_dim-wide a2a and a locally built query lands near 0.9.
+    """
+    latent = kv_lora_rank + qk_rope_head_dim
+    partial_width = v_head_dim if project_before_merge else kv_lora_rank
+    owned = (partial_width + _lse_pack_dim(partial_dtype)) * partial_dtype.itemsize
+    if q_all_gather:
+        # The query crosses in the KV dtype (see "Gather the DSA DCP Q in the
+        # FP8 KV dtype"), one latent-wide row per head per extend token.
+        owned += latent * kv_dtype.itemsize
+    return owned / (latent * kv_dtype.itemsize)
+
+
+def dcp_use_gathered_prefill(
+    extend_prefix_lens_cpu: List[int],
+    extend_num_tokens: int,
+    gathered_heads: int,
+    crossover: float,
+) -> bool:
+    """Whether a DCP prefill all-gathers the cached prefix KV and attends with
+    this rank's heads, instead of all-gathering Q and LSE-merging owned slots.
+
+    The gathered path moves one latent per prefix token; the owned path moves
+    every extend token's Q for all heads plus the head partials back. The
+    prefix all-gather reads position p from rank p % W, so every prefix must
+    be a whole number of widened pages.
+    """
+    w = get_parallel().dcp_group.world_size
+    if any(p % w for p in extend_prefix_lens_cpu):
+        return False
+    prefix = sum(extend_prefix_lens_cpu)
+    return prefix < crossover * gathered_heads * extend_num_tokens
+
+
+def dcp_gathered_page_table(
+    dcp_kv_indptr: torch.Tensor,
+    dcp_kv_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    width: int,
+) -> torch.Tensor:
+    """[bs, width] sequence position -> row of the all-gathered ``dcp_kv_buffer``."""
+    cols = torch.arange(width, device=seq_lens.device)
+    valid = cols < seq_lens[:, None]
+    flat = torch.where(valid, dcp_kv_indptr[:-1, None].long() + cols, 0)
+    return torch.where(valid, dcp_kv_indices[flat], 0).to(torch.int32)
 
 
 def dcp_split_rows(rows: int) -> Tuple[int, int, int, int]:
