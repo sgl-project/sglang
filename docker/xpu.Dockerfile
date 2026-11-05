@@ -24,9 +24,7 @@ USER root
 # Keep in lockstep with the host xe KMD; override via --build-arg.
 ARG COMPUTE_RUNTIME_VERSION=26.27.39122.11
 ARG IGC_VERSION=2.38.2+22051
-# The iHD media driver needs gmmlib >= 22.10.1; compute-runtime releases ship 22.10.2 from 26.40 on.
-ARG GMM_VERSION=22.10.2
-ARG GMM_COMPUTE_RUNTIME_VERSION=26.40.40196.8
+ARG GMM_VERSION=22.10.0
 
 RUN apt-get update && apt-get install -y software-properties-common curl && \
     add-apt-repository -y ppa:kobuk-team/intel-graphics && \
@@ -40,14 +38,13 @@ RUN apt-get update && apt-get install -y software-properties-common curl && \
     cd /tmp && \
     igc_url="https://github.com/intel/intel-graphics-compiler/releases/download/v${IGC_VERSION%%+*}" && \
     cr_url="https://github.com/intel/compute-runtime/releases/download/${COMPUTE_RUNTIME_VERSION}" && \
-    gmm_url="https://github.com/intel/compute-runtime/releases/download/${GMM_COMPUTE_RUNTIME_VERSION}" && \
     # IGC first: libze-intel-gpu1 / intel-opencl-icd depend on its exact version.
     curl -fsSL -O "${igc_url}/intel-igc-core-2_${IGC_VERSION}_amd64.deb" && \
     curl -fsSL -O "${igc_url}/intel-igc-opencl-2_${IGC_VERSION}_amd64.deb" && \
     curl -fsSL -O "${cr_url}/libze-intel-gpu1_${COMPUTE_RUNTIME_VERSION}-0_amd64.deb" && \
     curl -fsSL -O "${cr_url}/intel-opencl-icd_${COMPUTE_RUNTIME_VERSION}-0_amd64.deb" && \
     curl -fsSL -O "${cr_url}/intel-ocloc_${COMPUTE_RUNTIME_VERSION}-0_amd64.deb" && \
-    curl -fsSL -O "${gmm_url}/libigdgmm12_${GMM_VERSION}_amd64.deb" && \
+    curl -fsSL -O "${cr_url}/libigdgmm12_${GMM_VERSION}_amd64.deb" && \
     apt-get install -y --allow-downgrades \
         ./intel-igc-core-2_${IGC_VERSION}_amd64.deb \
         ./intel-igc-opencl-2_${IGC_VERSION}_amd64.deb \
