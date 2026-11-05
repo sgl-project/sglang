@@ -35,7 +35,16 @@ from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator  # noqa:
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams  # noqa: E402
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool  # noqa: E402
 from sglang.srt.mem_cache.radix_cache import RadixCache  # noqa: E402
-from sglang.srt.runtime_context import get_parallel  # noqa: E402
+from sglang.srt.mem_cache.registry import (  # noqa: E402
+    TreeCacheBuildContext,
+    default_radix_cache_factory,
+)
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache  # noqa: E402
+from sglang.srt.runtime_context import (  # noqa: E402
+    get_memory,
+    get_parallel,
+    get_server_args,
+)
 from sglang.srt.sampling.sampling_params import SamplingParams  # noqa: E402
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm  # noqa: E402
 from sglang.test.scheduler_test_utils import empty_request_lists  # noqa: E402
@@ -43,21 +52,38 @@ from sglang.test.scheduler_test_utils import empty_request_lists  # noqa: E402
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
-def make_cpu_scheduler(send_output, *, cache_enabled=False):
+def make_cpu_scheduler(send_output, *, cache_enabled=False, legacy_cache=False):
     scheduler = Scheduler.__new__(Scheduler)
     empty_request_lists(scheduler)
     scheduler.req_to_token_pool = ReqToTokenPool(8, 32, "cpu", False)
     scheduler.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
         size=32, dtype=torch.int64, device="cpu", kvcache=None, need_sort=False
     )
-    scheduler.tree_cache = RadixCache(
-        CacheInitParams(
-            disable=not cache_enabled,
-            req_to_token_pool=scheduler.req_to_token_pool,
-            token_to_kv_pool_allocator=scheduler.token_to_kv_pool_allocator,
-            page_size=1,
-        )
+    params = CacheInitParams(
+        disable=not cache_enabled,
+        req_to_token_pool=scheduler.req_to_token_pool,
+        token_to_kv_pool_allocator=scheduler.token_to_kv_pool_allocator,
+        page_size=1,
     )
+    scheduler.model_config = SimpleNamespace(is_multimodal=False)
+    if legacy_cache:
+        scheduler.tree_cache = RadixCache(params)
+    else:
+        scheduler.tree_cache = default_radix_cache_factory(
+            TreeCacheBuildContext(
+                server_args=get_server_args(),
+                params=params,
+                is_hybrid_swa=False,
+                is_hybrid_ssm=False,
+                enable_hierarchical_cache=False,
+                disable_radix_cache=not cache_enabled,
+                tp_worker=None,
+                model_config=scheduler.model_config,
+                tp_size=1,
+                tp_rank=0,
+                tp_group=None,
+            )
+        )
     scheduler.disaggregation_mode = DisaggregationMode.NULL
     for attr in (
         "enable_hierarchical_cache",
@@ -73,7 +99,6 @@ def make_cpu_scheduler(send_output, *, cache_enabled=False):
     scheduler.decode_offload_manager = None
     scheduler.rust_server = None
     scheduler.mm_receiver = None
-    scheduler.model_config = SimpleNamespace(is_multimodal=False)
     scheduler.spec_algorithm = SpeculativeAlgorithm.NONE
     scheduler.running_batch = ScheduleBatch(reqs=[])
     scheduler.last_batch = None
@@ -141,6 +166,9 @@ class TestSchedulerCancellationRetirement(CustomTestCase):
 
     def test_queued_output_precedes_release_but_receipt_follows_real_release(self):
         scheduler = self._scheduler()
+        # UnifiedRadixCache is the default even with static, non-unified pools.
+        self.assertIs(type(scheduler.tree_cache), UnifiedRadixCache)
+        self.assertFalse(get_memory().enable_unified_memory)
         target = self._req(scheduler)
         neighbor = self._req(scheduler, "target-neighbor", "instance-b")
         scheduler.waiting_queue.join([target, neighbor])
@@ -187,7 +215,7 @@ class TestSchedulerCancellationRetirement(CustomTestCase):
         scheduler.request_retirer.release_finished(req, checkpoint=True)
         self.assertFalse(req.kv.holds_kv)
         self.assertEqual(scheduler.req_to_token_pool.available_size(), 8)
-        self.assertEqual(scheduler.tree_cache.total_size(), 3)
+        self.assertEqual(scheduler.tree_cache.evictable_size(), 3)
         self.assertEqual(scheduler.token_to_kv_pool_allocator.available_size(), 29)
         scheduler._on_step_processed(first)
         self.assertEqual(req.inflight_steps, 1)
@@ -251,6 +279,42 @@ class TestSchedulerCancellationRetirement(CustomTestCase):
         self.assertEqual(self.outputs[-1][0].reason, "feature_disabled")
         self.assertFalse(req.finished())
         self.assertTrue(req.kv.holds_kv)
+
+    def test_unified_receipts_reject_other_cache_owners_and_custom_cores(self):
+        scheduler = self._scheduler()
+        req = self._req(scheduler)
+        scheduler.waiting_queue.join([req])
+        cache = scheduler.tree_cache
+        allocator = scheduler.token_to_kv_pool_allocator
+        unsupported = (
+            (cache, "cache_controller", object()),
+            (cache, "linker", object()),
+            (cache, "enable_session_radix_cache", True),
+            (cache, "components", {}),
+            (cache, "_tree_core_backend", "custom"),
+            (cache, "tree_core", object()),
+            (allocator, "storage", object()),
+            (allocator, "state", object()),
+            (scheduler, "tree_cache", object()),
+        )
+        for index, (owner, attr, value) in enumerate(unsupported):
+            with self.subTest(owner=type(owner).__name__, attr=attr):
+                with patch.object(owner, attr, value):
+                    self._cancel(scheduler, req, f"unsupported-{index}")
+                self.assertEqual(self.outputs[-1][0].status, "unsupported")
+                self.assertFalse(req.finished())
+                self.assertTrue(req.kv.holds_kv)
+        self.assertEqual(scheduler.req_to_token_pool.available_size(), 7)
+        self.assertEqual(allocator.available_size(), 29)
+
+    def test_legacy_static_radix_cache_still_returns_resources(self):
+        scheduler = make_cpu_scheduler(self._send_output, legacy_cache=True)
+        req = self._req(scheduler)
+        scheduler.waiting_queue.join([req])
+        self._cancel(scheduler, req)
+        self.assertEqual(self.outputs[-1][0].status, "retired")
+        self.assertEqual(scheduler.req_to_token_pool.available_size(), 8)
+        self.assertEqual(scheduler.token_to_kv_pool_allocator.available_size(), 32)
 
     def test_pending_duplicates_expiry_and_capacity_never_fabricate_release(self):
         scheduler = self._scheduler()

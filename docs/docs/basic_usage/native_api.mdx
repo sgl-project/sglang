@@ -57,7 +57,7 @@ print_highlight(response.json())
 
 By default, `/abort_request` sends a cancellation and returns an empty HTTP 200 response. It does not confirm that the scheduler has released the request's resources.
 
-Experimental retirement receipts require `SGLANG_ENABLE_CANCEL_RETIREMENT_RECEIPTS=1` before server startup. The initial scope is one Python tokenizer, unified serving, one scheduler rank, and single text generation with the normal RadixCache. Distributed serving, multimodal requests, parallel sampling, beam search, sessions, LoRA, speculative decoding, hybrid caches, HiCache and offload are unsupported.
+Experimental retirement receipts require `SGLANG_ENABLE_CANCEL_RETIREMENT_RECEIPTS=1` before server startup. The initial scope is one Python tokenizer, unified serving, one scheduler rank, and single text generation with built-in full-attention caches and static pools. This includes the default `UnifiedRadixCache` and the legacy `RadixCache`. Distributed serving, multimodal requests, parallel sampling, beam search, sessions, LoRA, speculative decoding, hybrid caches, HiCache, external storage and offload are unsupported.
 
 While a `/generate` request with a caller-supplied `rid` is active, send:
 

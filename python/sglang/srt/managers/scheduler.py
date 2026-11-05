@@ -6064,6 +6064,56 @@ class Scheduler(
             inflight_batches.extend(batch for batch, _ in self.result_queue)
         return inflight_batches
 
+    def _cancellation_retirement_cache_supported(self) -> bool:
+        from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
+        from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
+        from sglang.srt.mem_cache.kv.plan import TREE_TOKEN
+        from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+        from sglang.srt.mem_cache.unified_cache.components.full import FullComponent
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        cache = self.tree_cache
+        if type(cache) not in (RadixCache, UnifiedRadixCache):
+            return False
+        allocator = cache.token_to_kv_pool_allocator
+        # UnifiedRadixCache is also the default tree over ordinary static pools.
+        # Limit receipts to the same request-row/token owners as the old tree;
+        # unified arenas, recurrent state and custom allocators need other fences.
+        if (
+            type(cache.req_to_token_pool) is not ReqToTokenPool
+            or type(allocator)
+            not in (TokenToKVPoolAllocator, PagedTokenToKVPoolAllocator)
+            or allocator.storage is not None
+            or allocator.state is not None
+        ):
+            return False
+        if type(cache) is RadixCache:
+            return True
+        if (
+            type(cache) is not UnifiedRadixCache
+            or set(cache.components) != {ComponentType.FULL}
+            or type(cache.components[ComponentType.FULL]) is not FullComponent
+            or cache.components[ComponentType.FULL].slot.family != TREE_TOKEN
+            or cache.enable_session_radix_cache
+            or cache.cache_controller is not None
+            or cache.linker is not None
+        ):
+            return False
+        # Custom cores may introduce owners beyond the built-in release path.
+        if cache._tree_core_backend == "python":
+            from sglang.srt.mem_cache.unified_cache.unified_tree_core import (
+                UnifiedTreeCore,
+            )
+
+            return type(cache.tree_core) is UnifiedTreeCore
+        if cache._tree_core_backend == "rust":
+            # A live Rust core has already loaded its extension at construction.
+            from sglang.srt.mem_cache.rust_tree_core.adapter import RustUnifiedTreeCore
+
+            return type(cache.tree_core) is RustUnifiedTreeCore
+        return False
+
     def _cancellation_retirement_scope_error(self, req: Optional[Req] = None) -> str:
         if not envs.SGLANG_ENABLE_CANCEL_RETIREMENT_RECEIPTS.get():
             return "feature_disabled"
@@ -6084,7 +6134,7 @@ class Scheduler(
         if self.disaggregation_mode != DisaggregationMode.NULL:
             return "disaggregated_scheduler"
         if (
-            type(self.tree_cache) is not RadixCache
+            not self._cancellation_retirement_cache_supported()
             or self.enable_hierarchical_cache
             or self.enable_hicache_storage
             or self.enable_lmcache
@@ -6092,6 +6142,8 @@ class Scheduler(
             or self.is_hybrid_swa
             or self.is_hybrid_ssm
             or self.enable_hisparse
+            or get_memory().enable_unified_cache_external_linker
+            or get_memory().radix_cache_backend is not None
             or self.tree_cache.req_to_token_pool.holds_state_slots
             or self.decode_offload_manager is not None
         ):
