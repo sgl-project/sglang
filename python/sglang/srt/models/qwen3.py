@@ -5,6 +5,9 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import torch
 from torch import nn
 
+from sglang.kernels.ops.attention.qk_norm_rope import qk_norm_rope
+from sglang.kernels.ops.attention.table_qk_norm_rope import table_qk_norm_rope_
+from sglang.srt.environ import envs
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.layer_boundary import (
     append_stages,
@@ -29,6 +32,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import get_kv_layers
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
@@ -36,9 +40,18 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.qwen2 import Qwen2MLP as Qwen3MLP
 from sglang.srt.models.qwen2 import Qwen2Model
-from sglang.srt.models.utils import apply_qk_norm
+from sglang.srt.models.utils import (
+    apply_qk_norm,
+    maybe_enable_silu_fp4_quant_fusion,
+)
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
+from sglang.srt.runtime_context import (
+    attention_backends,
+    get_exec,
+    get_parallel,
+    get_spec,
+    get_stream,
+)
 from sglang.srt.utils import add_prefix, get_bool_env_var, is_cuda, is_hip, is_npu
 
 Qwen3Config = None
@@ -52,6 +65,8 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _has_fused_qk_norm_mrope = False
 _has_fused_qk_norm_rope = False
 if _use_aiter:
+    from aiter import dtypes as aiter_dtypes
+
     try:
         from aiter import fused_qk_norm_mrope_3d_cache_pts_quant_shuffle
 
@@ -93,8 +108,10 @@ def aiter_fused_qk_norm_rope_set_kv(
 
     ``qkv`` is the (num_tokens, (num_heads + 2 * num_kv_heads) * head_dim) QKV
     projection; ``k_cache`` / ``v_cache`` are the NHD (slots, num_kv_heads,
-    head_dim) pool buffers. ``k_scale`` / ``v_scale`` must be CPU tensors: the
-    kernel reads them on the host. Returns q as (num_tokens, num_heads * head_dim).
+    head_dim) pool buffers, in ``qkv``'s dtype or ``aiter.dtypes.fp8``. An fp8
+    cache stores k / k_scale and v / v_scale; other caches ignore the scales.
+    ``k_scale`` / ``v_scale`` must be CPU tensors: the kernel reads them on the
+    host. Returns q as (num_tokens, num_heads * head_dim).
     """
     num_tokens = qkv.shape[0]
     q_out = torch.empty(
@@ -139,6 +156,23 @@ def aiter_fused_qk_norm_rope_set_kv(
     return q_out.view(num_tokens, -1)
 
 
+def _host_kv_scale(scale, scale_float) -> float:
+    """Host value of a RadixAttention per-tensor KV scale. ``BaseKVCacheMethod``
+    pairs its device scale with a float, ``load_kv_cache_scales`` sets a plain
+    float, and without a scale the pool writes unscaled."""
+    if scale is None:
+        return 1.0
+    if scale_float is not None:
+        return float(scale_float)
+    if isinstance(scale, (int, float)):
+        return float(scale)
+    # Reading it here would be a device-to-host sync, which graph capture forbids.
+    raise ValueError(
+        f"the fused KV write needs a host copy of the KV scale, got a "
+        f"{type(scale).__name__} without one"
+    )
+
+
 class Qwen3Attention(nn.Module):
     def __init__(
         self,
@@ -156,6 +190,7 @@ class Qwen3Attention(nn.Module):
         attention_bias: bool = False,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
+        enable_prefill_qk_norm_rope: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -230,6 +265,47 @@ class Qwen3Attention(nn.Module):
         )
         self.alt_stream = alt_stream
 
+        # Qwen3 guarantees matching norm eps and full-head NeoX RoPE; these
+        # CUDA head sizes also select the non-fallback RoPE implementation.
+        self.use_table_qk_norm_rope = (
+            _is_cuda
+            and get_exec().kernel.enable_fused_qk_norm_rope
+            and not get_exec().deterministic.enable_deterministic_inference
+            and not envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
+            and get_exec().deterministic.rl_on_policy_target is None
+            and get_exec().graph.cuda_graph_config.prefill.tc_compiler != "inductor"
+            and (
+                type(self.rotary_emb) is RotaryEmbedding
+                or (
+                    # At head_dim 256, triton_mrope_fused's BF16 rounding differs.
+                    type(self.rotary_emb) is MRotaryEmbedding
+                    and self.rotary_emb.mrope_section is not None
+                    and self.head_dim in (64, 128)
+                )
+            )
+            and self.head_dim in (64, 128, 256)
+        )
+        self.table_rope_positions_ndim = (
+            2 if type(self.rotary_emb) is MRotaryEmbedding else 1
+        )
+
+        # Only the ordinary dense-Qwen3 caller opts in; inherited callers stay native.
+        self.use_prefill_qk_norm_rope = (
+            enable_prefill_qk_norm_rope
+            and self.use_table_qk_norm_rope
+            and type(self) is Qwen3Attention
+            and type(self.rotary_emb) is RotaryEmbedding
+            and quant_config is None
+            and attn_tp_size == 1
+            and self.head_dim == 128
+            and torch.cuda.get_device_capability()[0] == 9
+            and attention_backends()[0] in ("fa3", "flashinfer")
+            and get_spec().speculative_algorithm is None
+            and self.rotary_emb.is_neox_style
+            and self.rotary_emb.rotary_dim == self.head_dim
+            and self.q_norm.variance_epsilon == self.k_norm.variance_epsilon
+        )
+
         self.use_fused_qk_norm_mrope = (
             _has_fused_qk_norm_mrope
             and isinstance(self.rotary_emb, MRotaryEmbedding)
@@ -245,26 +321,86 @@ class Qwen3Attention(nn.Module):
             and self.head_dim in (64, 128, 256, 512)
             and self.q_norm.variance_epsilon == self.k_norm.variance_epsilon
         )
-        if self.use_fused_qk_norm_mrope or self.use_fused_qk_norm_rope:
-            # Scale tensors MUST stay on CPU: the C++ kernel uses .item<float>()
-            # which triggers hipMemcpy D2H + sync on CUDA tensors, breaking graph capture.
-            # Explicit device='cpu' is required because SGLang constructs models inside
-            # a `with torch.device('cuda'):` context that changes the default device.
-            self._fused_k_scale = torch.tensor(1.0, dtype=torch.float32, device="cpu")
-            self._fused_v_scale = torch.tensor(1.0, dtype=torch.float32, device="cpu")
+        # Built on first use: the KV scales are set after __init__, by
+        # process_weights_after_loading or load_kv_cache_scales.
+        self._fused_kv_scales: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
 
-    def forward_prepare_native(self, positions, hidden_states):
+    def _aiter_fused_kv_scales(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """(k_scale, v_scale) for the fused KV write as CPU float32 tensors. The
+        kernel reads them on the host at launch, so a device tensor would sync
+        and break graph capture, and a captured graph keeps the values it was
+        captured with."""
+        if self._fused_kv_scales is None:
+            k_scale = _host_kv_scale(self.attn.k_scale, self.attn.k_scale_float)
+            v_scale = _host_kv_scale(self.attn.v_scale, self.attn.v_scale_float)
+            self._fused_kv_scales = (
+                torch.tensor(k_scale, dtype=torch.float32, device="cpu"),
+                torch.tensor(v_scale, dtype=torch.float32, device="cpu"),
+            )
+        return self._fused_kv_scales
+
+    def forward_prepare_native(self, positions, hidden_states, forward_batch):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = apply_qk_norm(
-            q=q,
-            k=k,
-            q_norm=self.q_norm,
-            k_norm=self.k_norm,
-            head_dim=self.head_dim,
-            alt_stream=self.alt_stream,
-        )
-        q, k = self.rotary_emb(positions, q, k)
+
+        if (
+            self.use_table_qk_norm_rope
+            and forward_batch.forward_mode.is_decode()
+            and qkv.dtype == torch.bfloat16
+            and self.q_norm.weight.dtype == torch.bfloat16
+            and self.k_norm.weight.dtype == torch.bfloat16
+            and positions.ndim == self.table_rope_positions_ndim
+        ):
+            axis_map = None
+            if positions.ndim == 2:
+                axis_map = self.rotary_emb.axis_map
+                self.rotary_emb._match_cos_sin_cache_dtype(qkv)
+            table_qk_norm_rope_(
+                qkv,
+                positions,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                self.rotary_emb.cos_sin_cache,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                self.q_norm.variance_epsilon,
+                match_cuda=True,
+                axis_map=axis_map,
+            )
+        elif (
+            self.use_prefill_qk_norm_rope
+            and forward_batch.forward_mode == ForwardMode.EXTEND
+            and not torch.compiler.is_compiling()
+            and qkv.is_cuda
+            and qkv.is_contiguous()
+            and qkv.dtype in (torch.bfloat16, torch.float16)
+            and self.q_norm.weight.dtype == qkv.dtype
+            and self.k_norm.weight.dtype == qkv.dtype
+            and self.rotary_emb.cos_sin_cache.dtype == torch.float32
+            and positions.is_contiguous()
+            and positions.dtype in (torch.int32, torch.int64)
+        ):
+            q = qk_norm_rope(
+                q=q,
+                k=k,
+                q_weight=self.q_norm.weight,
+                k_weight=self.k_norm.weight,
+                cos_sin_cache=self.rotary_emb.cos_sin_cache,
+                positions=positions,
+                head_dim=self.head_dim,
+                eps=self.q_norm.variance_epsilon,
+            )
+        else:
+            q, k = apply_qk_norm(
+                q=q,
+                k=k,
+                q_norm=self.q_norm,
+                k_norm=self.k_norm,
+                head_dim=self.head_dim,
+                alt_stream=self.alt_stream,
+            )
+            q, k = self.rotary_emb(positions, q, k)
         return q, k, v
 
     def forward_prepare_npu(self, positions, hidden_states, forward_batch):
@@ -305,8 +441,7 @@ class Qwen3Attention(nn.Module):
             self.num_heads,
             self.num_kv_heads,
             self.head_dim,
-            self._fused_k_scale,
-            self._fused_v_scale,
+            *self._aiter_fused_kv_scales(),
         )
         return q, None, None
 
@@ -328,10 +463,10 @@ class Qwen3Attention(nn.Module):
         )
         if can_try_aiter_fused:
             k_cache, v_cache = get_kv_layers().read(self.attn.layer_id).kv()
-            # The fused write targets the NHD layout in the activation dtype and
-            # does not apply per-layer KV scales.
-            use_aiter_fused = (
-                k_cache.dim() == 3 and k_cache.dtype == hidden_states.dtype
+            # The fused write targets the NHD layout, in the activation dtype or
+            # the one fp8 dtype the kernel quantizes to.
+            use_aiter_fused = k_cache.dim() == 3 and (
+                k_cache.dtype in (hidden_states.dtype, aiter_dtypes.fp8)
             )
 
         if use_aiter_fused:
@@ -343,6 +478,8 @@ class Qwen3Attention(nn.Module):
             q, k, v = self.forward_prepare_native(
                 positions=positions,
                 hidden_states=hidden_states,
+                # use fused kernel for decode
+                forward_batch=forward_batch,
             )
         else:
             q, k, v = self.forward_prepare_npu(
@@ -399,6 +536,9 @@ class Qwen3DecoderLayer(nn.Module):
             attention_bias=config.attention_bias,
             prefix=add_prefix("self_attn", prefix),
             alt_stream=alt_stream,
+            enable_prefill_qk_norm_rope=(
+                type(self) is Qwen3DecoderLayer and config.model_type == "qwen3"
+            ),
         )
         self.mlp = Qwen3MLP(
             hidden_size=self.hidden_size,
@@ -408,6 +548,7 @@ class Qwen3DecoderLayer(nn.Module):
             prefix=add_prefix("mlp", prefix),
             reduce_results=False,
         )
+        maybe_enable_silu_fp4_quant_fusion(self.mlp)
 
         norm_kwargs = (
             dict(
@@ -634,45 +775,6 @@ class Qwen3ForCausalLM(nn.Module):
                 return self.pooler(hidden_states, forward_batch)
         else:
             return hidden_states
-
-    @torch.no_grad()
-    def forward_split_prefill(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        split_interval: Tuple[int, int],  # [start, end) 0-based
-        input_embeds: torch.Tensor = None,
-    ):
-        start, end = split_interval
-        # embed
-        if start == 0:
-            residual_batch.start(forward_batch)
-            if input_embeds is None:
-                forward_batch.hidden_states = self.model.embed_tokens(input_ids)
-            else:
-                forward_batch.hidden_states = input_embeds
-        # decoder layer
-        for i in range(start, end):
-            layer = self.model.layers[i]
-            forward_batch.hidden_states = layer(
-                positions,
-                forward_batch.hidden_states,
-                forward_batch,
-            )
-
-        if end == self.model.config.num_hidden_layers:
-            forward_batch.hidden_states = residual_batch.final_norm(
-                forward_batch.hidden_states, forward_batch, self.model.norm
-            )
-            # logits process
-            result = self.logits_processor(
-                input_ids, forward_batch.hidden_states, self.lm_head, forward_batch
-            )
-        else:
-            result = None
-
-        return result
 
     @property
     def start_layer(self):

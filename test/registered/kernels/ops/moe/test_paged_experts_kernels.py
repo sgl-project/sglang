@@ -1,3 +1,4 @@
+import threading
 import unittest
 
 import torch
@@ -10,7 +11,7 @@ from sglang.kernels.ops.moe.paged_experts import (
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 E, K = 64, 16
 
@@ -147,6 +148,62 @@ class TestPagedExpertsKernels(CustomTestCase):
                 self.assertTrue(torch.equal(gpu[s].cpu(), host[e]))
             self.assertFalse(gpu[1].any())  # untouched
 
+    def test_store_pins_its_exact_size_and_the_gather_reads_it(self):
+        """The host store pins exactly its size (torch's pinned allocator rounds up to a power
+        of two), and the gather kernel reads it through the GPU."""
+        from sglang.srt.layers.moe.paged_experts.store import HostExpertStore
+
+        gpu = torch.zeros(K, 3, 1000, dtype=torch.bfloat16, device="cuda")
+        host = HostExpertStore({"w": ((3, 1000), torch.bfloat16)}, E).host["w"]
+        host.copy_(torch.randn(E, 3, 1000, dtype=torch.bfloat16))
+        self.assertTrue(host.is_pinned())
+        self.assertEqual(host.untyped_storage().nbytes(), E * 3 * 1000 * 2)
+        src = torch.tensor([5, 63] + [0] * (K - 2), dtype=torch.int32).cuda()
+        dst = torch.tensor([2, 0] + [0] * (K - 2), dtype=torch.int32).cuda()
+        count = torch.tensor([2], dtype=torch.int32, device="cuda")
+
+        paged_experts_gather(*_gather_args([host], [gpu]), src, dst, count)
+
+        self.assertTrue(torch.equal(gpu[2].cpu(), host[5]))
+        self.assertTrue(torch.equal(gpu[0].cpu(), host[63]))
+
+    def test_store_is_on_the_host_under_a_default_cuda_device(self):
+        """Models are constructed under ``torch.device("cuda")``; a store created there (by
+        a format that pages its loaded rows as they are) is still pinned host memory."""
+        from sglang.srt.layers.moe.paged_experts.store import HostExpertStore
+
+        with torch.device("cuda"):
+            host = HostExpertStore({"w": ((3, 1000), torch.bfloat16)}, E).host["w"]
+        self.assertEqual(host.device.type, "cpu")
+        self.assertTrue(host.is_pinned())
+
+    def test_store_unregisters_its_pages_once_the_last_tensor_is_freed(self):
+        """The pinned pages stay registered while any tensor on them lives (here a slice that
+        outlives the store and its tensor), and are unregistered once the last one is freed."""
+        import gc
+
+        from sglang.srt.layers.moe.paged_experts.store import HostExpertStore
+
+        gpu = torch.zeros(K, 3, 1000, dtype=torch.bfloat16, device="cuda")
+        store = HostExpertStore({"w": ((3, 1000), torch.bfloat16)}, E)
+        ptr = store.host["w"].data_ptr()
+        expert = store.host["w"][5]
+        gpu[0].copy_(expert, non_blocking=True)  # a read still queued when it is freed
+        del store
+        gc.collect()
+        self.assertTrue(expert.is_pinned())
+
+        del expert
+        gc.collect()
+        # Unregistering again must fail: the pages are no longer registered. In a thread of its
+        # own, as CUDA keeps the error as the thread's last error for a later call to report.
+        rc = []
+        unregister = lambda: rc.append(int(torch.cuda.cudart().cudaHostUnregister(ptr)))
+        thread = threading.Thread(target=unregister)
+        thread.start()
+        thread.join()
+        self.assertNotEqual(rc[0], 0)
+
     def test_graph_replays_decide_on_new_routing(self):
         """A captured decide + gather plans and pages each replay's routing, not the routing
         seen at capture."""
@@ -179,6 +236,62 @@ class TestPagedExpertsKernels(CustomTestCase):
             self.assert_state(state, ref, plan)
             for s, e in enumerate(ref.slot_expert):
                 self.assertTrue(torch.equal(gpu[s].cpu(), host[e]))
+
+
+class TestPooledSlotTables(CustomTestCase):
+    def test_a_pooled_table_returns_its_memory_once_dropped(self):
+        """``auto`` keeps the K = top_k slot tables in a pool of their own so that freeing them
+        returns their segments. Negative control: while the pool lives, they stay reserved."""
+        from sglang.srt.layers.moe.paged_experts.method import pooled_empty
+
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        before = torch.cuda.memory_reserved()
+        table, pool = pooled_empty(64 << 20, torch.device("cuda"))
+        self.assertGreaterEqual(torch.cuda.memory_reserved() - before, 64 << 20)
+        del table
+        torch.cuda.empty_cache()
+        self.assertGreaterEqual(torch.cuda.memory_reserved() - before, 64 << 20)
+        del pool
+        torch.cuda.empty_cache()
+        self.assertLess(torch.cuda.memory_reserved() - before, 64 << 20)
+
+    def test_released_slot_tables_return_their_memory(self):
+        """A layer that auto has sized drops its K = top_k tables (``release_slots``) and their
+        memory goes back. Negative control: a view of a table kept elsewhere holds it."""
+        from types import SimpleNamespace
+
+        from sglang.srt.layers.moe.paged_experts.method import (
+            PagedExpertsMoEMethod,
+            _slot_table_bytes,
+            pooled_empty,
+        )
+
+        host = torch.randn(E, 2, 1 << 17)  # 1 MiB per expert
+        nbytes = K * host[0].numel() * host.element_size()
+        for keep_a_view in (False, True):
+            with self.subTest(keep_a_view=keep_a_view):
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                before = torch.cuda.memory_reserved()
+                method = PagedExpertsMoEMethod(None, None, E, K, auto_size=True)
+                method.store = SimpleNamespace(host={"w13_weight": host})
+                layer = torch.nn.Module()
+                layer.w13_weight = torch.nn.Parameter(
+                    torch.empty(0, *host.shape[1:], device="cuda"), requires_grad=False
+                )
+                slab, method._slot_pool = pooled_empty(
+                    _slot_table_bytes(method, K), torch.device("cuda")
+                )
+                method._place(layer, K, slab, 0)
+                self.assertTrue(torch.equal(layer.w13_weight.cpu(), host[:K]))
+                del slab
+                kept = layer.w13_weight.data[0] if keep_a_view else None
+                method.release_slots(layer)
+                torch.cuda.empty_cache()
+                held = torch.cuda.memory_reserved() - before
+                self.assertEqual(held >= nbytes, keep_a_view)
+                del kept
 
 
 def _gather_args(hosts, gpus):

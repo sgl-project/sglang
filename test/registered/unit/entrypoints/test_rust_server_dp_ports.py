@@ -1,11 +1,13 @@
 import json
+import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from sglang.api.v1 import api_types
 from sglang.srt import rust_extensions
-from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.arg_groups.pd_disaggregation_hook import handle_pd_disaggregation
 from sglang.srt.disaggregation.base.conn import BaseKVBootstrapServer
 from sglang.srt.disaggregation.common.conn import CommonKVBootstrapServer
@@ -13,7 +15,12 @@ from sglang.srt.entrypoints import engine
 from sglang.srt.entrypoints.engine import node_hosts_rust_server
 from sglang.srt.environ import envs
 from sglang.srt.managers import disagg_service
-from sglang.srt.runtime_context import get_context, get_parallel
+from sglang.srt.managers.load_snapshot import create_load_snapshot_writer, shm_path_for
+from sglang.srt.runtime_context import (
+    derive_attention_ranks,
+    get_context,
+    get_parallel,
+)
 from sglang.srt.rust_server import config as rust_config
 from sglang.srt.rust_server import server as rust_server
 from sglang.srt.server_args import ServerArgs
@@ -22,13 +29,15 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
-def _scheduler_for_typed_config():
+def _scheduler_for_typed_config(load_snapshot_writer=None):
     return SimpleNamespace(
         server_args=SimpleNamespace(enable_return_hidden_states=False),
         model_config=SimpleNamespace(
             context_len=2048,
             vocab_size=1000,
             is_multimodal=False,
+            is_image_understandable_model=False,
+            is_audio_understandable_model=False,
             hf_config=SimpleNamespace(model_type=None),
             get_default_sampling_params=lambda: {},
         ),
@@ -44,8 +53,24 @@ def _scheduler_for_typed_config():
         rust_server_tokenizer_path=lambda: "tokenizer",
         tokenizer=None,
         max_total_num_tokens=1024,
-        load_snapshot_writer=None,
+        load_snapshot_writer=load_snapshot_writer,
         rust_server_endpoints=[{"dp_rank": 0, "endpoint": "http://127.0.0.1:30000"}],
+    )
+
+
+def _reported_deployment_info() -> api_types.DeploymentInfo:
+    """The DeploymentInfo this rank's listener reports, decoded by the api.v1
+    contract."""
+    extension = MagicMock()
+    with (
+        patch.object(rust_config, "compute_num_reserved_tokens", return_value=0),
+        patch.object(rust_config, "_launch_server_info", return_value="{}"),
+    ):
+        rust_config._build_server_args(
+            _scheduler_for_typed_config(), extension=extension
+        )
+    return api_types.DeploymentInfo.from_json_value(
+        json.loads(extension.ServerArgs.call_args.kwargs["deployment_info"])
     )
 
 
@@ -67,6 +92,11 @@ def _scheduler_for_typed_config():
         ({"hicache_write_policy": "write_back"}, "hicache_write_policy", "write_back"),
         ({"smg_grpc_mode": True}, "grpc_port", None),
         ({"grpc_mode": True}, "grpc_port", None),
+        (
+            {"grpc_response_timeout_secs": 900},
+            "grpc_response_timeout_secs",
+            900,
+        ),
         ({"default_priority_value": 5}, "default_priority_value", None),
         (
             {"enable_priority_scheduling": True, "default_priority_value": 5},
@@ -92,6 +122,7 @@ def _scheduler_for_typed_config():
         "hicache_write_policy",
         "legacy-smg",
         "deprecated-legacy-smg",
+        "grpc-response-timeout",
         "priority-off",
         "priority-on",
         "mm-limits-unset",
@@ -133,6 +164,9 @@ def test_typed_config_forwards_resolved_launch_fields(overrides, kwarg, expected
     assert deployment_info["rust_server_endpoints"] == [
         {"dp_rank": 0, "endpoint": "http://127.0.0.1:30000"}
     ]
+    # Rust reads absent keys as defaults, so every contract field must be sent
+    # under its contract name.
+    assert set(api_types.DeploymentInfo.__struct_fields__) <= set(deployment_info)
 
 
 @pytest.mark.parametrize(
@@ -303,6 +337,113 @@ def test_dp_leaders_reuse_node_local_ports(
         assert ports == [30000 + offset for offset in expected]
 
 
+def test_plain_dp_replicas_bind_their_own_ports():
+    # Each replica is its own TP group led by TP rank 0, so the replica index
+    # must separate the ports.
+    with (
+        get_context().override_server_args(
+            tp_size=2, dp_size=2, host="0.0.0.0", port=30000
+        ),
+        patch.object(rust_extensions, "load_rust_extension") as extension,
+        patch.object(rust_server, "_partition_cores", return_value=(None, None)),
+        patch.object(rust_server, "_build_server_args"),
+    ):
+        scheduler = SimpleNamespace(
+            server_args=SimpleNamespace(),
+            model_config=SimpleNamespace(is_multimodal=False),
+        )
+        ports = []
+        for dp_rank in range(2):
+            with get_parallel().override(
+                tp_rank=0,
+                attn_tp_rank=0,
+                attn_cp_rank=0,
+                attn_dp_rank=0,
+                dp_rank=dp_rank,
+            ):
+                ports.append(rust_server.RustServer.launch(scheduler).http_port)
+
+        calls = extension.return_value.Server.call_args_list
+        assert [c.kwargs["port_offset"] for c in calls] == [0, 1]
+        assert ports == [30000, 30001]
+
+
+@pytest.mark.parametrize(
+    "server_args,leaders",
+    [
+        (
+            {"nnodes": 2, "node_rank": 1, "tp_size": 4, "attn_dp_size": 4},
+            [(2, 2), (3, 3)],
+        ),
+        (
+            {
+                "nnodes": 4,
+                "node_rank": 1,
+                "tp_size": 4,
+                "pp_size": 2,
+                "attn_dp_size": 2,
+                "attn_cp_size": 2,
+            },
+            [(2, 1)],
+        ),
+        ({"tp_size": 2, "dp_size": 2}, [(0, 0), (0, 1)]),
+        ({}, [(0, 3)]),
+    ],
+    ids=[
+        "attention-dp-second-node",
+        "pp-cp-first-stage",
+        "plain-dp",
+        "external-dp-rank",
+    ],
+)
+def test_node_listeners_name_every_listener_on_the_node(server_args, leaders):
+    """Given every (tp_rank, dp_rank) DP leader on one node, each of their
+    listeners reports the same node table, whose entry for each listener is
+    the port offset it binds and the DP rank it reports itself."""
+    with (
+        get_context().override_server_args(
+            host="0.0.0.0", port=30000, grpc_port=40000, **server_args
+        ),
+        patch.object(rust_extensions, "load_rust_extension") as extension,
+        patch.object(rust_server, "_partition_cores", return_value=(None, None)),
+        patch.object(rust_server, "_build_server_args"),
+    ):
+        parallel = get_parallel()
+        reported = []
+        for tp_rank, dp_rank in leaders:
+            attn_tp_rank, attn_dp_rank = derive_attention_ranks(
+                tp_rank=tp_rank,
+                attn_tp_size=parallel.attn_tp_size,
+                attn_cp_size=parallel.attn_cp_size,
+            )
+            with parallel.override(
+                tp_rank=tp_rank,
+                dp_rank=dp_rank,
+                attn_dp_rank=attn_dp_rank,
+                attn_tp_rank=attn_tp_rank,
+                attn_cp_rank=0,
+            ):
+                rust_server.RustServer.launch(
+                    SimpleNamespace(
+                        server_args=SimpleNamespace(),
+                        model_config=SimpleNamespace(is_multimodal=False),
+                    )
+                )
+                reported.append(_reported_deployment_info())
+        calls = extension.return_value.Server.call_args_list
+
+    table = [
+        api_types.NodeRustListener(
+            port_offset=c.kwargs["port_offset"],
+            dp_rank=info.dp_rank,
+            http_port=30000 + c.kwargs["port_offset"],
+            grpc_port=40000 + c.kwargs["port_offset"],
+        )
+        for c, info in zip(calls, reported)
+    ]
+    assert [info.node_listeners for info in reported] == [table] * len(leaders)
+
+
 @pytest.mark.parametrize(
     "pp_size,expected",
     [(1, [True, False, True, False]), (2, [True, True, False, False])],
@@ -328,6 +469,59 @@ def test_scale_joiner_hosts_listener():
         ep_join_mode="scale",
     ):
         assert node_hosts_rust_server()
+
+
+@pytest.mark.parametrize(
+    "nnodes,ranks,force_zmq",
+    [(1, (0, 1), False), (2, (2, 3), False), (2, (2, 3), True)],
+    ids=["single-node", "multi-node", "forced-zmq"],
+)
+def test_each_listener_reads_its_own_slot_of_a_node_local_file(
+    nnodes, ranks, force_zmq
+):
+    # The two DP leaders on the last node. Under multi-node DP they create the
+    # node's snapshot file themselves; no node-0 collector gathers them.
+    dp_size = 2 * nnodes
+    port_args = SimpleNamespace(instance_id=f"test_rust_loads_{nnodes}")
+    path = shm_path_for(port_args.instance_id)
+    extension = MagicMock()
+    writers, listeners = [], []
+    with (
+        get_context().override_server_args(
+            nnodes=nnodes, node_rank=nnodes - 1, tp_size=dp_size, attn_dp_size=dp_size
+        ),
+        envs.SGLANG_RUST_SERVER.override(True),
+        envs.SGLANG_LOAD_SNAPSHOT_USE_ZMQ.override(force_zmq),
+        patch.object(rust_extensions, "load_rust_extension", return_value=extension),
+        patch.object(rust_config, "compute_num_reserved_tokens", return_value=0),
+        patch.object(rust_config, "_launch_server_info", return_value="{}"),
+    ):
+        try:
+            for dp_rank in ranks:
+                writers.append(create_load_snapshot_writer(port_args, dp_size, dp_rank))
+                with get_parallel().override(attn_dp_rank=dp_rank, dp_rank=None):
+                    rust_config._build_server_args(
+                        _scheduler_for_typed_config(writers[-1]),
+                        default_max_new_tokens=None,
+                    )
+                kwargs = extension.ServerArgs.call_args.kwargs
+                listeners.append(
+                    tuple(
+                        kwargs[f"load_snapshot_{key}"]
+                        for key in ("path", "dp_size", "dp_rank")
+                    )
+                )
+        finally:
+            for writer in writers:
+                writer.close()
+            if os.path.exists(path):
+                os.unlink(path)
+
+    if force_zmq:
+        # Snapshots leave the process, so `/v1/loads` has no file to read.
+        assert listeners == [(None, 0, 0)] * len(ranks)
+    else:
+        assert listeners == [(path, dp_size, dp_rank) for dp_rank in ranks]
 
 
 class _HttpRegistry(CommonKVBootstrapServer):
@@ -403,6 +597,47 @@ def test_rust_mode_starts_only_a_bootstrap_server_rust_cannot_serve(
         assert server.address == ("127.0.0.1", 33000)
     else:
         assert server is None
+
+
+@pytest.mark.parametrize("hosts", [True, False], ids=["host", "non-host"])
+def test_listener_rank_installs_the_sigterm_drain(hosts):
+    # Every rank joins the endpoint and frontend-CPU gathers; only a listener
+    # rank launches the server, with its CPU share, and it drains on SIGTERM,
+    # reporting to the launcher's socket.
+    from sglang.test.test_utils import maybe_stub_sgl_kernel
+
+    maybe_stub_sgl_kernel()
+    from sglang.srt.managers import scheduler as scheduler_module
+
+    server = MagicMock()
+    server_class = MagicMock()
+    server_class.launch.return_value = server
+    server_class.gather_server_endpoints.return_value = []
+    server_class.gather_frontend_cpu_share.return_value = (1, 2)
+    scheduler = SimpleNamespace(
+        _hosts_rust_server=lambda: hosts,
+        get_rust_server_class=lambda: server_class,
+        _engine_paused=False,
+    )
+    with (
+        envs.SGLANG_RUST_SERVER.override(True),
+        patch.object(scheduler_module, "RustServerIdleSleeper"),
+    ):
+        scheduler_module.Scheduler.maybe_init_rust_server(
+            scheduler, SimpleNamespace(instance_id="dp-ports-test")
+        )
+
+    server_class.gather_server_endpoints.assert_called_once_with(hosts)
+    server_class.gather_frontend_cpu_share.assert_called_once_with(hosts)
+    assert server_class.launch.called == hosts
+    if hosts:
+        server_class.launch.assert_called_once_with(
+            scheduler, frontend_cpu_share=(1, 2)
+        )
+        server.install_sigterm_drain.assert_called_once_with(
+            notify=rust_server.drain_notify_name("dp-ports-test")
+        )
+    assert scheduler.rust_server is (server if hosts else None)
 
 
 if __name__ == "__main__":
