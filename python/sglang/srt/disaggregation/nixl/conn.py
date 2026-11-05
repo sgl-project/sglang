@@ -52,7 +52,7 @@ from sglang.srt.disaggregation.utils import (
     slice_dsa_tail_dst_ptrs_for_pp,
 )
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_device, get_schedule
+from sglang.srt.runtime_context import get_device, get_parallel, get_schedule
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import run_with_deadline
 
@@ -640,6 +640,10 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         self._prepared_state_plans: Dict[str, _PreparedStatePlan] = {}
         self._state_layout_rejections: Dict[str, str] = {}
         self.kv_buffer_tensors = None
+        # CP-TP sharing keeps complete KV heads on each CP rank, while decode
+        # owns a head shard. Pack that shard locally before direct-to-KV writes;
+        # no decode staging protocol or advertised topology changes are needed.
+        self._cp_slice_pack_buffers = []
         self.prep_handles: Dict[str, Any] = {}
         self.prep_handle_slice_src: Optional[Tuple[Any, int, int, int]] = (
             None  # (handle, num_groups, num_ptr_pairs, num_slots)
@@ -673,6 +677,29 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             if self.enable_staging:
                 self._init_staging_prefill_ctx()
                 self._init_staging_buffers(len(self.transfer_queues))
+            if (
+                get_parallel().enable_cp_tp_group_sharing
+                and get_device().device == "cuda"
+                and self.src_mem_kind == "VRAM"
+                and not self.is_mla_backend
+                and not self.is_hybrid_mla_backend
+                and self.pp_size == 1
+                and self.dcp_size == 1
+            ):
+                from sglang.srt.disaggregation.common.staging_buffer import (
+                    StagingBuffer,
+                )
+
+                # Bound scratch space independently of prompt length. A worker
+                # splits long cached prefixes and drains each write before reuse.
+                for _ in self.transfer_queues:
+                    buf = StagingBuffer(64 << 20, "cuda", self.kv_args.gpu_id)
+                    self._register_staging_memory(buf.get_ptr(), buf.get_size())
+                    self._cp_slice_pack_buffers.append(buf)
+                logger.info(
+                    "NIXL CP head-slice packing enabled: %d x 64 MiB",
+                    len(self._cp_slice_pack_buffers),
+                )
             for i, queue in enumerate(self.transfer_queues):
                 staging_buffer = (
                     self._staging_ctx.buffers[i]
@@ -1845,6 +1872,22 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                                             chunked_dst_kv_indice,
                                         )
                                     )
+                            elif (
+                                self._cp_slice_pack_buffers
+                                and decode_tp_size == self.state_tp_size
+                                and not getattr(
+                                    self._cp_slice_pack_buffers[worker_index],
+                                    "nixl_poisoned",
+                                    False,
+                                )
+                            ):
+                                self.send_kvcache_slice_packed(
+                                    req.agent_name,
+                                    src_prefill_kv_indices,
+                                    chunked_dst_kv_indice,
+                                    self._cp_slice_pack_buffers[worker_index],
+                                    handles,
+                                )
                             else:
                                 kv_xfer_handle = self.send_kvcache_slice(
                                     req.agent_name,
@@ -2494,6 +2537,84 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             )
             handles.append(xfer_handle)
         return handles
+
+    def send_kvcache_slice_packed(
+        self, peer_name, prefill_kv_indices, dst_kv_indices, pack_buffer, handles
+    ):
+        """Gather a CP rank's head slice, then coalesce direct-to-KV writes.
+
+        Unlike receiver staging this keeps bootstrap rank pairing unchanged.
+        Every posted handle belongs to the caller's failure barrier. Scratch
+        remains quarantined after an uncertain post or completion failure.
+        """
+        from sglang.srt.disaggregation.common.dcp_pack import try_pack_dcp_src
+
+        info = self.decode_kv_args_table[peer_name]
+        _, groups, num_regions, _ = self.prep_handle_slice_src
+        _, _, head_group = self.prep_handles_slice_dst[peer_name]
+        page_size = self.kv_args.page_size
+        sk, sv, dk, dv, layers = self.get_mha_kv_ptrs_with_pp(
+            self.kv_args.kv_data_ptrs, info.dst_kv_ptrs
+        )
+        src_ptrs = list(sk[:layers]) + list(sv[:layers])
+        dst_ptrs = list(dk[:layers]) + list(dv[:layers])
+        # The prepared slice path already requires uniform NHD slot geometry.
+        src_page_bytes = self.kv_args.kv_item_lens[0]
+        dst_page_bytes = info.dst_kv_item_len
+        if (
+            len(src_ptrs) != num_regions
+            or src_page_bytes != groups * dst_page_bytes
+            or dst_page_bytes % page_size
+            or len(prefill_kv_indices) != len(dst_kv_indices)
+        ):
+            raise ValueError("Invalid CP head-slice packing geometry")
+        token_bytes = dst_page_bytes // page_size
+        src_stride = src_page_bytes // page_size
+        max_pages = pack_buffer.get_size() // (num_regions * dst_page_bytes)
+        if max_pages < 1:
+            raise ValueError("CP head-slice pack buffer cannot hold one page")
+        adjusted_ptrs = [ptr + head_group * token_bytes for ptr in src_ptrs]
+        src_pages = np.asarray(prefill_kv_indices, dtype=np.int64)
+        dst_pages = np.asarray(dst_kv_indices, dtype=np.int64)
+        for start in range(0, len(src_pages), max_pages):
+            pages = src_pages[start : start + max_pages]
+            tokens = (
+                pages[:, None] * page_size + np.arange(page_size, dtype=np.int64)
+            ).reshape(-1)
+            packed = try_pack_dcp_src(
+                pack_buffer=pack_buffer,
+                kv_data_ptrs=adjusted_ptrs,
+                src_token_indices=tokens,
+                token_item_lens=[token_bytes] * num_regions,
+                src_token_item_lens=[src_stride] * num_regions,
+            )
+            if packed is None:
+                raise RuntimeError(
+                    "CP head-slice packing unexpectedly exceeded capacity"
+                )
+            packed_ptrs, _ = packed
+            # Set before posting: even a rejected post can leave a NIC read in
+            # flight. Retain the allocation and fall back to unpacked sends if
+            # completion cannot be proven, rather than overwrite its contents.
+            pack_buffer.nixl_poisoned = True
+            handle = self._send_kvcache_generic(
+                peer_name=peer_name,
+                src_data_ptrs=packed_ptrs,
+                dst_data_ptrs=dst_ptrs,
+                item_lens=[dst_page_bytes] * num_regions,
+                prefill_data_indices=np.arange(len(pages), dtype=np.int64),
+                dst_data_indices=dst_pages[start : start + len(pages)],
+                dst_gpu_id=info.gpu_id,
+                force_flat=True,
+                bypass_prepped=True,
+            )
+            handles.append(handle)
+            settled, failed = self._await_handles([handle], failure_seen=False)
+            if not settled or failed:
+                raise RuntimeError(
+                    "NIXL CP packed KV transfer did not complete successfully"
+                )
+            pack_buffer.nixl_poisoned = False
 
     def send_kvcache_slice(
         self,

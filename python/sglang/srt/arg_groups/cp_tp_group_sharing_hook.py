@@ -69,9 +69,12 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
     }
     if model.hf_config.architectures[0] == "Qwen4ExpForConditionalGeneration":
         unsupported |= {
-            # The MoE runs TP experts on rows gathered over the TP group.
-            # Waterfill turns on DeepEP and EP after this hook.
-            "ep-size > 1": view.ep_size > 1,
+            # The boundary gathers the same CP rows on every rank before MoE,
+            # then sums expert contributions before taking back the CP shard.
+            # With EP == TP, each rank owns whole experts (MoE TP == 1),
+            # preserving FP8 block scales even for narrow expert dimensions.
+            # Mixed EP/TP subgroups and token-dispatch a2a are not covered.
+            "ep-size not in (1, tp-size)": view.ep_size not in (1, cfg.tp_size),
             "moe-a2a-backend": view.moe_a2a_backend != "none",
             "enable-waterfill": cfg.enable_waterfill,
             "pp-size > 1": cfg.pp_size > 1,
