@@ -11,14 +11,16 @@ from sglang.srt.layers.logits_processor import (
     SamplingMaskOutput,
     SamplingMaskStatus,
 )
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
+from sglang.srt.managers.req_types import FINISH_ABORT
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
 from sglang.srt.managers.utils import GenerationBatchResult
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import release_only_retirer
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -56,6 +58,7 @@ def _make_processor(case, server_mode: str = "full") -> SchedulerBatchResultProc
         logprob_result_processor=None,
         output_streamer=Mock(),
         beam_coordinator=Mock(),
+        request_retirer=release_only_retirer(),
         abort_request=lambda *args, **kwargs: None,
     )
 
@@ -67,7 +70,6 @@ class TestPrefillEmbeddingResults(CustomTestCase):
             SimpleNamespace(
                 encoding_format=encoding_format,
                 discard_output_reason=discard_reason,
-                inflight_middle_chunks=0,
                 is_retracted=False,
                 embedding=None,
                 pooled_hidden_state=None,
@@ -76,6 +78,7 @@ class TestPrefillEmbeddingResults(CustomTestCase):
                 time_stats=Mock(),
                 update_finish_state=Mock(),
                 finished=lambda: True,
+                kv=SimpleNamespace(holds_kv=True, holds_mamba=False),
             )
             for encoding_format, discard_reason in (
                 ("tensor", reason),
@@ -87,6 +90,7 @@ class TestPrefillEmbeddingResults(CustomTestCase):
             req.request_finish = MethodType(Req.request_finish, req)
         batch = SimpleNamespace(
             reqs=reqs,
+            chunked_req=None,
             return_logprob=False,
             prefill_stats=None,
         )
@@ -99,8 +103,7 @@ class TestPrefillEmbeddingResults(CustomTestCase):
         processor = replace(_make_processor(self), is_generation=False)
 
         with patch(
-            "sglang.srt.managers.scheduler_components."
-            "batch_result_processor.release_kv_cache"
+            "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache"
         ) as release:
             processor.process_batch_result_prefill(batch, result)
 
@@ -221,9 +224,8 @@ class TestSamplingMaskMaterialization(CustomTestCase):
 
 
 class _PrefillReq:
-    def __init__(self, *, rid: str, inflight_middle_chunks: int, return_hidden_states):
+    def __init__(self, *, rid: str, return_hidden_states):
         self.rid = rid
-        self.inflight_middle_chunks = inflight_middle_chunks
         self.return_hidden_states = return_hidden_states
         self.hidden_states = []
         self.is_retracted = False
@@ -258,6 +260,7 @@ class _DecodeReq:
         self.grammar = None
         self.beam_group = None
         self.time_stats = Mock()
+        self.kv = SimpleNamespace(holds_kv=True, holds_mamba=False)
 
     def finished(self):
         return self.finished_len is not None
@@ -284,18 +287,11 @@ class TestPrefillHiddenStateOffsets(CustomTestCase):
 
         for server_mode, capture_mode, hidden_states in cases:
             with self.subTest(server_mode=server_mode):
-                middle = _PrefillReq(
-                    rid="middle",
-                    inflight_middle_chunks=1,
-                    return_hidden_states=False,
-                )
-                last = _PrefillReq(
-                    rid="last",
-                    inflight_middle_chunks=0,
-                    return_hidden_states="last",
-                )
+                middle = _PrefillReq(rid="middle", return_hidden_states=False)
+                last = _PrefillReq(rid="last", return_hidden_states="last")
                 batch = SimpleNamespace(
                     reqs=[middle, last],
+                    chunked_req=middle,
                     decoding_reqs=[],
                     return_logprob=False,
                     return_hidden_states=True,
@@ -344,14 +340,11 @@ class TestPrefillHiddenStateOffsets(CustomTestCase):
 class TestPrefillSkippedOutput(CustomTestCase):
     def test_sampling_mask_middle_chunk_does_not_require_logits_output(self):
         """A non-token-producing PP chunk may omit its logits output."""
-        req = _PrefillReq(
-            rid="middle",
-            inflight_middle_chunks=1,
-            return_hidden_states=False,
-        )
+        req = _PrefillReq(rid="middle", return_hidden_states=False)
         req.return_sampling_mask = True
         batch = SimpleNamespace(
             reqs=[req],
+            chunked_req=req,
             return_logprob=False,
             return_hidden_states=False,
             return_hidden_states_mode=CaptureHiddenMode.NULL,
@@ -382,7 +375,6 @@ class TestPrefillSkippedOutput(CustomTestCase):
         ):
             processor.process_batch_result_prefill(batch, result)
 
-        self.assertEqual(req.inflight_middle_chunks, 0)
         self.assertEqual(req.output_ids, [])
         processor.output_streamer.stream_output.assert_called_once_with(
             [req], False, req
@@ -394,17 +386,16 @@ class TestMixedBatchKvRelease(CustomTestCase):
         """A decode req that finishes inside a mixed batch goes through the
         worker's pre-release hook, as it would in a decode batch; a prefill
         req finishing on its first token does not."""
-        prefill_req = _PrefillReq(
-            rid="prefill", inflight_middle_chunks=0, return_hidden_states=False
-        )
-        decode_req = _PrefillReq(
-            rid="decode", inflight_middle_chunks=0, return_hidden_states=False
-        )
+        prefill_req = _PrefillReq(rid="prefill", return_hidden_states=False)
+        decode_req = _PrefillReq(rid="decode", return_hidden_states=False)
         for req in (prefill_req, decode_req):
             req.finished = lambda req=req: bool(req.output_ids)
-            req.kv = SimpleNamespace(kv_committed_len=0)
+            req.kv = SimpleNamespace(
+                kv_committed_len=0, holds_kv=True, holds_mamba=False
+            )
         batch = SimpleNamespace(
             reqs=[prefill_req, decode_req],
+            chunked_req=None,
             decoding_reqs=[decode_req],
             return_logprob=False,
             return_hidden_states=False,
@@ -435,7 +426,7 @@ class TestMixedBatchKvRelease(CustomTestCase):
         with (
             patch(
                 "sglang.srt.managers.scheduler_components."
-                "batch_result_processor.release_kv_cache"
+                "request_retirer.release_kv_cache"
             ) as release,
             patch.object(
                 SchedulerBatchResultProcessor, "_maybe_collect_routed_experts"
@@ -503,7 +494,7 @@ class TestSamplingMaskStatusErrors(CustomTestCase):
             next_token_ids=torch.tensor([8]),
         )
         with patch(
-            "sglang.srt.managers.scheduler_components.batch_result_processor.release_kv_cache"
+            "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache"
         ) as release:
             processor.process_batch_result_decode(batch, result)
 

@@ -220,11 +220,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_observer import SamplingObserver
 from sglang.srt.sampling.watermarking.core import WatermarkState
-from sglang.srt.server_args import (  # noqa: F401  (re-export)
-    CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS,
-    ServerArgs,
-    add_chunked_prefix_cache_attention_backend,
-)
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.adaptive_spec_params import (
     resolve_candidate_steps_from_config,
 )
@@ -1022,9 +1018,21 @@ class ModelRunner:
             self.memory_pool_config = memory_pool_config
 
         self.init_kv_cache_configurator(draft_parallel_layout)
+        expert_slots = None
+        if get_exec().moe.enable_paged_experts and (
+            get_exec().moe.paged_experts_num_resident in (None, "auto")
+        ):
+            # --paged-experts-num-resident auto: the KV cache first, then the expert slots.
+            from sglang.srt.layers.moe.paged_experts.sizing import ExpertSlotSizing
+
+            expert_slots = ExpertSlotSizing.for_model(
+                self.model, self.kv_cache_configurator, self.pre_model_load_memory
+            )
         result = self.kv_cache_configurator.configure(
             pre_model_load_memory=self.pre_model_load_memory
         )
+        if expert_slots is not None:
+            expert_slots.size(result.max_total_num_tokens)
         self.max_total_num_tokens = result.max_total_num_tokens
         self.max_running_requests = result.max_running_requests
         self.req_to_token_pool = result.req_to_token_pool
@@ -1176,22 +1184,48 @@ class ModelRunner:
         dcp_group = get_parallel().dcp_group
         if dcp_group.world_size <= 1:
             return
+        fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+
+        def absorb_weight_16bit(w: torch.Tensor, w_scale) -> Optional[torch.Tensor]:
+            # Per-tensor fp8 absorb weights (GLM kv_b_proj on gfx95) carry a
+            # rank-local scale, so they are dequantized before the gather.
+            if w.dtype in (torch.bfloat16, torch.float16):
+                return w.contiguous()
+            if w.dtype in fp8_dtypes and (
+                isinstance(w_scale, (int, float)) or w_scale.numel() == 1
+            ):
+                return (w.to(torch.bfloat16) * w_scale).contiguous()
+            return None
+
         n_prepared = 0
         for m in self.model.modules():
             if not isinstance(m, DeepseekV2AttentionMLA) or m.w_kc is None:
                 continue
             qp = m.q_b_proj if m.has_q_b_proj else m.q_proj
-            if m.w_kc.dtype not in (torch.bfloat16, torch.float16):
-                logger.warning("dcp_replicate_q_proj: skipping non-16-bit w_kc")
+            # q-replicate needs a 16-bit or per-tensor fp8 absorb weight;
+            # anything else keeps the per-layer Q all-gather.
+            w_kc = absorb_weight_16bit(m.w_kc, m.w_scale)
+            if w_kc is None:
+                logger.warning("dcp_replicate_q_proj: skipping unsupported w_kc")
                 continue
             if isinstance(qp.quant_method, UnquantizedLinearMethod):
-                m.q_b_proj_qrep_weight = dcp_group.all_gather(qp.weight.data, dim=0)
+                local = qp.weight.data
+                m.q_b_proj_qrep_weight = dcp_group.all_gather(local.contiguous(), dim=0)
+                # The local q_b_proj rows are this rank's slice of the replica;
+                # alias them so the replica does not double the q_b_proj
+                # footprint.
+                rows = local.shape[0]
+                r = dcp_group.rank_in_group
+                qp.weight.data = m.q_b_proj_qrep_weight[r * rows : (r + 1) * rows]
             elif _is_block_fp8(qp):
                 m.q_b_proj_qrep = _gather_block_fp8_linear(qp, dcp_group)
             else:
                 logger.warning("dcp_replicate_q_proj: skipping unsupported q-proj")
                 continue
-            m.w_kc_qrep = dcp_group.all_gather(m.w_kc.contiguous(), dim=0)
+            m.w_kc_qrep = dcp_group.all_gather(w_kc, dim=0)
+            w_vc = absorb_weight_16bit(m.w_vc, m.w_scale)
+            if w_vc is not None:
+                m.w_vc_qrep = dcp_group.all_gather(w_vc, dim=0)
             n_prepared += 1
         logger.info(
             "dcp_replicate_q_proj: prepared full-head Q weights for %d MLA layers",
@@ -1471,6 +1505,13 @@ class ModelRunner:
 
     def maybe_precompile_model_kernels_after_loading(self) -> None:
         maybe_precompile_model_kernels_after_loading(self.model, self.device)
+
+    def _uses_cpu_graph_attention_backend(self) -> bool:
+        return (
+            self.device == "cpu"
+            and self.prefill_attention_backend_str == "intel_amx"
+            and self.decode_attention_backend_str == "intel_amx"
+        )
 
     def maybe_init_dwdp(self):
         if self.is_draft_worker:
