@@ -21,6 +21,7 @@ from sglang.srt.layers.cp.interleave import (
     is_interleave_extend,
 )
 from sglang.srt.layers.dcp import (
+    all_gather_kv_cache_for_extend_dsa,
     all_gather_kv_cache_for_mla_extend,
     all_gather_q_for_mla_decode,
     cp_lse_ag_out_rs_mla,
@@ -33,6 +34,7 @@ from sglang.srt.lora.utils import kv_b_lora_correction
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
+    get_kv_layers,
     get_token_to_kv_pool,
 )
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
@@ -126,6 +128,25 @@ def bcg_dcp_extend_kv_gather(
         kv_lora_rank,
         k_nope,
         k_pe,
+    )
+
+
+@eager_on_graph(True)
+def bcg_dcp_extend_kv_gather_dsa(
+    token_to_kv_pool,
+    attn_mqa,
+    forward_batch: ForwardBatch,
+    k_nope: torch.Tensor,
+    k_pe: torch.Tensor,
+) -> None:
+    if is_in_prefill_graph_scope():
+        forward_batch = get_forward_batch()
+    all_gather_kv_cache_for_extend_dsa(
+        kv_cache=get_kv_layers().read(attn_mqa.layer_id).key(),
+        metadata=forward_batch.attn_dcp_metadata,
+        k_nope=k_nope,
+        k_pe=k_pe,
+        kv_scale_ue8m0=token_to_kv_pool.kv_scale_ue8m0,
     )
 
 
@@ -763,7 +784,15 @@ class DeepseekMLAForwardMixin:
                     )
             elif forward_batch.forward_mode.is_extend():
                 # for extend, gather kv
-                if not self.use_dsa:
+                if self.use_dsa:
+                    bcg_dcp_extend_kv_gather_dsa(
+                        get_token_to_kv_pool(),
+                        self.attn_mqa,
+                        forward_batch,
+                        k_nope,
+                        k_pe,
+                    )
+                else:
                     bcg_dcp_extend_kv_gather(
                         get_token_to_kv_pool(),
                         self.attn_mqa,

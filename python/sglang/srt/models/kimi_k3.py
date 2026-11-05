@@ -40,8 +40,11 @@ from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStatePacker,
 )
 from sglang.srt.layers.communication import k3_ar_fusion, k3_sp_collective
-from sglang.srt.layers.dcp.layout import set_dsa_shards_index_k
-from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
+from sglang.srt.layers.dcp.layout import dsa_shards_index_k, set_dsa_shards_index_k
+from sglang.srt.layers.dcp.planner import (
+    prepare_decode_context_parallel_metadata,
+    prepare_decode_context_parallel_metadata_dsa,
+)
 from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
     is_dp_attention_enabled,
@@ -3225,7 +3228,12 @@ class KimiK3LinearForCausalLM(nn.Module):
     ):
         if _is_npu:
             return None
-        return prepare_decode_context_parallel_metadata(
+        prepare = (
+            prepare_decode_context_parallel_metadata_dsa
+            if dsa_shards_index_k()
+            else prepare_decode_context_parallel_metadata
+        )
+        return prepare(
             seq_lens=seq_lens,
             extend_prefix_lens=extend_prefix_lens,
             extend_prefix_lens_cpu=extend_prefix_lens_cpu,
