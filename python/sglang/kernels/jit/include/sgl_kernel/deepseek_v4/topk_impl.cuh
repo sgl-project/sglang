@@ -39,7 +39,8 @@
 
 #if SUPPORT_CLUSTER
 #include <sgl_kernel/math.cuh>
-#include <sgl_kernel/mbarrier.cuh>
+
+#include <sgl_kernel/ptx/barrier.cuh>
 #endif
 
 // The exactness contract, chosen once per process (SGLANG_TOPK_V2_MODE -> -DSGL_TOPK_MODE).
