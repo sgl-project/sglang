@@ -49,10 +49,3 @@ PYTHONPATH=python:test/registered/unit/multimodal python -m unittest \
 ```
 
 The tests cover cross-process single flight, forced key collisions, global byte/LRU limits, copy-on-write isolation, clear during snapshot/lock wait/computation, process termination, truncated files, empty/scalar/bfloat16 tensors, partial hits and caller-hash verification. GPU end-to-end measurements should use an actual vision model and distinguish warm preprocessing reuse from GPU prefix-cache and kernel warmup effects.
-
-Run the synthetic HTTP benchmark against the running server with and without the shared cache, after kernel warmup:
-
-```bash
-python benchmark/multimodal/bench_shared_preprocess_cache.py \
-  --model Qwen/Qwen3-VL-2B-Instruct --base-url http://127.0.0.1:30000 --label shared --large-batch
-```
