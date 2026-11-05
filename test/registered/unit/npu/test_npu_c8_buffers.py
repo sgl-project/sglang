@@ -197,6 +197,15 @@ class TestC8BufferContracts(CustomTestCase):
                         host.get_size_per_token() * host.page_num * host.page_size,
                     )
                     device_ids, host_ids = torch.arange(4), torch.arange(8, 12)
+                    pointers, lengths = host.get_page_buffer_meta(host_ids)
+                    components = [host.k_buffer, host.v_buffer, host.index_k_buffer]
+                    components = [tensor for tensor in components if tensor.numel()]
+                    self.assertEqual(
+                        lengths, [tensor[2].nbytes for tensor in components]
+                    )
+                    self.assertEqual(
+                        pointers, [tensor[2].data_ptr() for tensor in components]
+                    )
                     host.backup_from_device_all_layer(
                         pool, host_ids, device_ids, "kernel_ascend"
                     )
