@@ -23,10 +23,14 @@ import torch
 
 from sglang.srt.state_capturer.base import BaseTopkCapturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
+from sglang.srt.utils import get_device_module
+
+device_module = get_device_module()
 
 
 class TopkRowCopy(msgspec.Struct):
-    event: torch.cuda.Event
+    # A device_module.Event recorded after the index copy.
+    event: Any
     device_indices_cpu: torch.Tensor
     host_indices_cpu: torch.Tensor
     # Keeps the device index tensor alive until the copy has run.
@@ -67,10 +71,10 @@ class HostTopkRows:
         device_indices_cpu = torch.empty(
             device_indices.shape, dtype=device_indices.dtype, pin_memory=True
         )
-        stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(stream):
+        stream.wait_stream(device_module.current_stream())
+        with device_module.stream(stream):
             device_indices_cpu.copy_(device_indices, non_blocking=True)
-            event = torch.cuda.Event()
+            event = device_module.Event()
             event.record(stream)
         return TopkRowCopy(
             event=event,
