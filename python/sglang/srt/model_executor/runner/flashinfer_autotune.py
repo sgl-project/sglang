@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import datetime
 import functools
 import hashlib
@@ -48,6 +49,22 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 FLASHINFER_AUTOTUNE_WORKAROUND_SKIPS = frozenset()
+
+# The TP group of the PP stage, recorded by a draft's TP scope before it narrows
+# get_parallel().tp_group to one attention-DP group: the drafts of every group
+# run the same dummy forwards and must agree on the tactics, like the target.
+_draft_stage_tp_group: contextvars.ContextVar[Optional[GroupCoordinator]] = (
+    contextvars.ContextVar("draft_stage_tp_group", default=None)
+)
+
+
+@contextlib.contextmanager
+def draft_autotune_sync_scope(stage_tp_group: GroupCoordinator):
+    token = _draft_stage_tp_group.set(stage_tp_group)
+    try:
+        yield
+    finally:
+        _draft_stage_tp_group.reset(token)
 
 
 def get_flashinfer_autotune_skip_ops(model_runner: ModelRunner) -> set[str]:
@@ -287,7 +304,12 @@ def _drop_diverged_autotune_cache(
 
 
 @contextlib.contextmanager
-def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool):
+def flashinfer_autotune_context(
+    model_runner: ModelRunner,
+    *,
+    run_lm_head: bool,
+    tp_group: Optional[GroupCoordinator] = None,
+):
     from flashinfer import autotune_v2
 
     # The gate below decides on the same inputs load_configs does.
@@ -295,7 +317,9 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
 
     mr = model_runner
     cache_path = flashinfer_autotune_cache_path(mr)
-    sync_group = _autotune_tactic_sync_group(get_parallel().tp_group)
+    if tp_group is None:  # the ranks that must agree on the tactics
+        tp_group = get_parallel().tp_group
+    sync_group = _autotune_tactic_sync_group(tp_group)
     reuse_cache = envs.SGLANG_FLASHINFER_AUTOTUNE_CACHE.get()
     if reuse_cache:
         autotune_cache = cache_path
@@ -400,12 +424,12 @@ def maybe_flashinfer_autotune_speculative_draft(
     ):
         return
 
-    def run_and_reset():
+    with flashinfer_autotune_context(
+        mr, run_lm_head=run_lm_head, tp_group=_draft_stage_tp_group.get()
+    ):
         forward_fn()
         if post_warmup_hook is not None:
             post_warmup_hook()
-
-    run_flashinfer_autotune_forward(mr, run_and_reset, run_lm_head=run_lm_head)
     tuned_phases.add(phase_key)
 
 
