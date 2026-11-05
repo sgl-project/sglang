@@ -639,8 +639,8 @@ class C_SchedulerHook(BaseHook):
 
                     logger.info(f"Simulation results saved to {output_dir}.")
 
-                except Exception as e:
-                    logger.exception(f"Failed to dump results. Error: {e}")
+                except Exception:
+                    logger.exception("Failed to dump results")
             else:
                 logger.warning("No request statistics available.")
 
