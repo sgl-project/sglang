@@ -113,6 +113,7 @@ def build_tuned_front_gemm(*, weight: torch.Tensor) -> Optional[TunedFrontGemm]:
         raise RuntimeError(
             "SGLANG_OPT_HIP_K3_TUNED_MOE_FRONT=1 but this AITER has no tuned bf16 GEMM "
             f"row for M={untuned}, N={shape[0]}, K={shape[1]} on {target}; it needs "
-            "ROCm/aiter#6411, whose rows cover 1-192 tokens."
+            "ROCm/aiter#6411 (rows for 1-128 tokens) and ROCm/aiter#6820 (rows for "
+            "129-192 tokens)."
         )
     return TunedFrontGemm(mm=tgemm.mm, min_tokens=min_tokens, max_tokens=max_tokens)
