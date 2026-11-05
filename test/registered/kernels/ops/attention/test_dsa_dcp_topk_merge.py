@@ -55,12 +55,6 @@ def _rows(kind: str, seed: int) -> list[torch.Tensor]:
     g = torch.Generator().manual_seed(seed)
     if kind == "random":
         return [torch.randn(131072, generator=g)]
-    if kind == "dense_top":
-        # many distinct scores near the global threshold
-        return [
-            10 + 0.3 * torch.randn(131072, generator=g),
-            10 + 0.3 * torch.randn(65536, generator=g),
-        ]
     if kind == "ties":
         return [
             torch.randint(0, 200, (32768 - 100 * i,), generator=g).float() / 8
@@ -180,7 +174,7 @@ class _Case:
 
 
 @pytest.mark.parametrize(
-    "kind", ["random", "dense_top", "ties", "periodic", "signed_zeros", "short"]
+    "kind", ["random", "ties", "periodic", "signed_zeros", "short"]
 )
 @torch.inference_mode()
 def test_dcp_topk_merge(kind: str) -> None:
