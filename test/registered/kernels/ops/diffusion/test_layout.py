@@ -37,6 +37,7 @@ from sglang.kernels.ops.diffusion import (
     fused_scatter_to_padded,
     nearest_upsample_nhwc,
     pack_qkv_destination_major,
+    replicate_reflect_pad3d,
     usp_merge_heads,
 )
 from sglang.multimodal_gen.runtime.layers.attention.backends import (
@@ -758,6 +759,31 @@ def test_wan_cached_conv_chunk_loop_bitwise(pads_temporal_only):
         assert got_payload is not None and got_payload.shape[2] == CACHE_T
         # Reference cache holds the last CACHE_T unpadded frames.
         assert torch.equal(got_payload, ref_cache[:, :, -CACHE_T:])
+
+
+@pytest.mark.skipif(bool(torch.version.hip), reason="CUDA-only kernel")
+@pytest.mark.parametrize(
+    "dtype,left,right",
+    [(torch.float16, 2, 0), (torch.bfloat16, 1, 1), (torch.float32, 0, 0)],
+)
+def test_replicate_reflect_pad3d_preserves_borders(dtype, left, right):
+    """Time repeats the edge; space reflects without repeating it, even for one frame."""
+    current_device = torch.cuda.current_device()
+    device = torch.device("cuda", (current_device + 1) % torch.cuda.device_count())
+    x = torch.randn((2, 7, 1, 5, 12), device=device, dtype=dtype)[..., ::2]
+    temporal = torch.cat(
+        [
+            x[:, :, :1].expand(-1, -1, left, -1, -1),
+            x,
+            x[:, :, -1:].expand(-1, -1, right, -1, -1),
+        ],
+        dim=2,
+    )
+    expected = torch.nn.functional.pad(temporal, (2, 2, 1, 1, 0, 0), mode="reflect")
+    actual = replicate_reflect_pad3d(x, left, right, 1, 2)
+    assert torch.cuda.current_device() == current_device
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    assert actual.is_contiguous(memory_format=torch.channels_last_3d)
 
 
 if __name__ == "__main__":

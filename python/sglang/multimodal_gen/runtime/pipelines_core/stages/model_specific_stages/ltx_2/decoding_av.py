@@ -3,6 +3,7 @@ from collections.abc import Callable
 import torch
 from diffusers.video_processor import VideoProcessor
 
+from sglang.multimodal_gen.configs.sample.sampling_params import quality_allows
 from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
     get_replica_group,
@@ -12,6 +13,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
     ComponentUse,
 )
 from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
+from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import use_vae_fast_path
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     StageParallelismType,
@@ -256,9 +258,15 @@ class LTX2AVDecodingStage(DecodingStage):
                     should_cast_vae = not vae_autocast_enabled
                     if not vae_autocast_enabled:
                         latents = latents.to(vae_dtype)
-                    with temporary_module_dtype(
-                        self.vae, vae_dtype, enabled=should_cast_vae
-                    ) as vae:
+                    with (
+                        use_vae_fast_path(
+                            self.vae,
+                            quality_allows(batch.sampling_params.quality, "lossless"),
+                        ),
+                        temporary_module_dtype(
+                            self.vae, vae_dtype, enabled=should_cast_vae
+                        ) as vae,
+                    ):
                         decode_kwargs = (
                             {} if on_frames is None else {"on_frames": on_frames}
                         )

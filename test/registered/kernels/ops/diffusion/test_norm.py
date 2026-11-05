@@ -42,6 +42,7 @@ from sglang.kernels.ops.diffusion import (
     channel_rmsnorm_finish_silu,
     channel_rmsnorm_silu_nhwc,
     group_norm_silu_4d,
+    pixel_norm_silu,
     rmsnorm_scale,
     rmsnorm_tanh_residual,
     triton_group_norm_silu,
@@ -1029,6 +1030,42 @@ def test_aten_head_rmsnorm_guards():
         (x.cpu(), weight.cpu()),
     ]:
         assert not can_use_aten_head_rmsnorm(inputs, gamma)
+
+
+@pytest.mark.skipif(bool(torch.version.hip), reason="CUDA-only kernel")
+@pytest.mark.parametrize(
+    "dtype,layout",
+    [(torch.float16, "cf"), (torch.bfloat16, "sliced"), (torch.float32, "cl")],
+)
+def test_pixel_norm_silu_preserves_dtype_rounding_and_strides(dtype, layout):
+    """FP32-only squaring or treating channel-first input as rows changes the norm."""
+    from sglang.multimodal_gen.test.quality_tier_admission import (
+        assert_error_no_worse_than_reference,
+    )
+
+    current_device = torch.cuda.current_device()
+    device = torch.device("cuda", (current_device + 1) % torch.cuda.device_count())
+    x = torch.randn((2, 130, 3, 5, 7), device=device, dtype=dtype)
+    if layout == "cl":
+        x = x.contiguous(memory_format=torch.channels_last_3d)
+    elif layout == "sliced":
+        x = x[:, ::2, :, :, ::2]
+    x[0, :, 0, 0, 0] = 0
+    x[1, 0, 0, 0, 0] = float("nan")
+    x[1, 0, 1, 0, 0] = float("inf")
+    baseline = F.silu(x / (x.square().mean(1, keepdim=True) + 1e-8).sqrt())
+    actual = pixel_norm_silu(x)
+    assert torch.cuda.current_device() == current_device
+    precise = x.double()
+    precise = F.silu(precise / (precise.square().mean(1, keepdim=True) + 1e-8).sqrt())
+    assert torch.equal(torch.isnan(actual), torch.isnan(baseline))
+    finite = torch.isfinite(baseline)
+    assert_error_no_worse_than_reference(
+        reference_fp64=precise[finite],
+        baseline=baseline[finite],
+        candidate=actual[finite],
+    )
+    assert actual.is_contiguous(memory_format=torch.channels_last_3d)
 
 
 if __name__ == "__main__":
