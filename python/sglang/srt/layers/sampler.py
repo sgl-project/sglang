@@ -674,8 +674,6 @@ class Sampler(nn.Module):
                 ).view(-1)
             else:
                 batch_next_token_ids = torch.multinomial(probs, num_samples=1).view(-1)
-            if return_sampling_mask:
-                filtered_probs = probs
         else:
             assert self.use_ascend_backend, (
                 "Only ascend backend supports sampling from logits"
