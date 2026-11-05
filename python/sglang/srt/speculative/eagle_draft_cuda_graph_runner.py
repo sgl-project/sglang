@@ -14,6 +14,7 @@ from sglang.srt.layers.dp_attention import (
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
+from sglang.srt.managers.overlap_utils import spec_relay_bypass_enabled
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
@@ -79,6 +80,24 @@ class EagleDraftInputBuffers(ForwardInputBuffers):
     global_num_tokens_gpu: Optional[torch.Tensor]
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
     dsa_seed_topk: Optional[torch.Tensor] = None
+
+
+def _same_storage(src: Optional[torch.Tensor], buf: torch.Tensor) -> bool:
+    """Whether ``src`` is already the leading rows of ``buf``."""
+    return src is not None and src.data_ptr() == buf.data_ptr()
+
+
+def _topk_in_place(spec_info, buffers) -> bool:
+    """Whether both top-1 inputs are the runner's buffers already (they are copied together)."""
+    return _same_storage(spec_info.topk_index, buffers.topk_index) and _same_storage(
+        spec_info.topk_p, buffers.topk_p
+    )
+
+
+def _relay_private_inputs() -> frozenset[str]:
+    if spec_relay_bypass_enabled() and get_parallel().moe_ep_size == 1:
+        return frozenset({"topk_p", "topk_index", "hidden_states"})
+    return frozenset()
 
 
 class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
@@ -282,7 +301,8 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
             dsa_seed_topk=dsa_seed_topk,
         )
-        self.buffers.share_buffers()
+        # Relay outputs survive other runners until the next draft consumes them.
+        self.buffers.share_buffers(exclude=_relay_private_inputs())
         # Resolve the always-present graph dispatch before capture. Specialized
         # batch sizes are used only to select compatible graph variants.
         self.draft_runtime = eagle_worker.draft_runtime
@@ -616,12 +636,22 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 buffers.rids_int.zero_()
             if buffers.bootstrap_room_ids_int is not None:
                 buffers.bootstrap_room_ids_int.fill_(-1)
-            buffers.topk_p.zero_()
-            buffers.topk_index.zero_()
+            # draft_extend may have written this round's rows in place; clear only
+            # the padding rows of such a buffer.
+            spec_info = forward_batch.spec_info
+            for buf, src in (
+                (buffers.topk_p, spec_info.topk_p),
+                (buffers.topk_index, spec_info.topk_index),
+                (buffers.hidden_states, spec_info.hidden_states),
+            ):
+                if buf is None:
+                    continue
+                if _same_storage(src, buf):
+                    buf[raw_bs:].zero_()
+                else:
+                    buf.zero_()
             if buffers.draft_probs is not None:
                 buffers.draft_probs.zero_()
-            if buffers.hidden_states is not None:
-                buffers.hidden_states.zero_()
             if buffers.dsa_seed_topk is not None:
                 buffers.dsa_seed_topk.zero_()
             buffers.req_pool_indices.zero_()
@@ -648,18 +678,20 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             buffers.seq_lens[:raw_bs],
             buffers.out_cache_loc[: raw_num_token * self.speculative_num_steps],
             buffers.positions[:raw_num_token],
-            buffers.topk_p[:raw_bs],
-            buffers.topk_index[:raw_bs],
             buffers.req_pool_indices[:raw_bs],
         ]
         copy_srcs = [
             forward_batch.seq_lens,
             forward_batch.out_cache_loc,
             forward_batch.positions,
-            forward_batch.spec_info.topk_p,
-            forward_batch.spec_info.topk_index,
             forward_batch.req_pool_indices,
         ]
+        if not _topk_in_place(forward_batch.spec_info, buffers):
+            copy_dsts += [buffers.topk_p[:raw_bs], buffers.topk_index[:raw_bs]]
+            copy_srcs += [
+                forward_batch.spec_info.topk_p,
+                forward_batch.spec_info.topk_index,
+            ]
         if self.model_runner.model_config.model_is_mrope:
             if bs != raw_bs or forward_batch.mrope_positions is None:
                 buffers.mrope_positions.zero_()
@@ -687,6 +719,9 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         if (
             buffers.hidden_states is not None
             and forward_batch.spec_info.hidden_states is not None
+            and not _same_storage(
+                forward_batch.spec_info.hidden_states, buffers.hidden_states
+            )
         ):
             buffers.hidden_states[:raw_bs].copy_(forward_batch.spec_info.hidden_states)
         if buffers.dsa_seed_topk is not None:
