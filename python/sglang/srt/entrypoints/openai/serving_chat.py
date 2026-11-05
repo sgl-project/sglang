@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import re
 import time
 import uuid
 from collections import OrderedDict
@@ -264,6 +265,35 @@ def neutralize_kimi_k3_image_placeholder_value(value: Any) -> Any:
             for key, item in value.items()
         }
     return value
+
+
+_KIMI_K3_TOOL_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_-]{0,255}")
+
+
+def _validate_kimi_k3_message_tools(request: ChatCompletionRequest) -> str | None:
+    """Message-level tool rules of the Kimi-K3 encoding, which renders such
+    tools only from a system message without content."""
+    for index in request._message_tools_indices:
+        message = request.messages[index]
+        if message.role not in ("system", "developer"):
+            return (
+                f"messages[{index}]: only a system or developer message can "
+                f"declare tools, got role {message.role!r}."
+            )
+        if message.content:
+            return f"messages[{index}]: a message that declares tools must have no content."
+        for tool in message.tools:
+            # `type` defaults to "function", so a missing one must be caught here.
+            if tool.type != "function" or "type" not in tool.model_fields_set:
+                return f"messages[{index}]: tool 'type' must be 'function'."
+            name = tool.function.name
+            if not _KIMI_K3_TOOL_NAME_RE.fullmatch(name):
+                return (
+                    f"messages[{index}]: invalid tool name {name!r}: it must start "
+                    "with a letter or '_', contain only letters, digits, '_' or "
+                    "'-', and be at most 256 characters."
+                )
+    return None
 
 
 _M3_THINKING_TYPES = ("adaptive", "enabled", "disabled")
@@ -1146,6 +1176,10 @@ class OpenAIServingChat(OpenAIServingBase):
             m3_error = _validate_minimax_m3_request(request)
             if m3_error:
                 return m3_error
+        if self.chat_encoding_spec == "kimi_k3":
+            k3_error = _validate_kimi_k3_message_tools(request)
+            if k3_error:
+                return k3_error
         if request.return_flat_raw_output_top_logprobs and not request.return_meta_info:
             return "return_flat_raw_output_top_logprobs requires return_meta_info=true."
 
