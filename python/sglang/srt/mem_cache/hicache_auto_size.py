@@ -59,19 +59,30 @@ def _leaf_bytes(pool) -> int:
     return sum(sizes) if isinstance(sizes, tuple) else sizes
 
 
-def _draft_bytes(target, draft) -> int:
-    if draft.layer_router.sub_pool(
-        IdSpaceKind.SLIDING_WINDOW
-    ) is not None or isinstance(draft, DeepSeekV4TokenToKVPool):
-        # Match sidecar construction: only SWA drafts follow target SWA slots.
-        target = (
-            target.layer_router.view(IdSpaceKind.SLIDING_WINDOW)
-            if target.layer_router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None
-            else target.swa_kv_pool
-        )
-        draft = draft.swa_kv_pool
+def _sidecar_bytes(target, draft) -> int:
     # A sidecar has one host slot per target slot, however few slots the draft has.
     return _pool_bytes(draft) * target.size // draft.size
+
+
+def _draft_bytes(target, draft) -> int:
+    router = draft.layer_router
+    if router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is None and not isinstance(
+        draft, DeepSeekV4TokenToKVPool
+    ):
+        return _sidecar_bytes(target, draft)
+    # Match sidecar construction: SWA layers follow target SWA slots, and a
+    # hybrid draft's full-attention layers follow target full slots.
+    target_swa = (
+        target.layer_router.view(IdSpaceKind.SLIDING_WINDOW)
+        if target.layer_router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None
+        else target.swa_kv_pool
+    )
+    total = _sidecar_bytes(target_swa, draft.swa_kv_pool)
+    if not isinstance(draft, DeepSeekV4TokenToKVPool) and router.routes_to(
+        IdSpaceKind.FULL
+    ):
+        total += _sidecar_bytes(target, router.view(IdSpaceKind.FULL))
+    return total
 
 
 def _estimate_hicache_bytes(
