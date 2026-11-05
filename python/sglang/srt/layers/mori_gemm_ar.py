@@ -62,14 +62,17 @@ QUANT_BLOCK_M = 64
 
 
 def mxfp8_shape(layer) -> tuple[int, int]:
-    """The layer's logical ``(N, K)``, read off the ue8m0 scale.
+    """The layer's logical ``(N, K)``, read off the weight in its route's layout.
 
-    **Not** ``layer.weight.shape``: the native route rebinds the weight to its
-    shuffled ``[N/16, K/128, 2048]``, and reading that first axis as N
-    disqualifies every layer without a word.
+    The native route rebinds the weight to its shuffled ``[N/16, K/128, 2048]``,
+    so ``weight.shape[0]`` is N only on the aiter route. The ue8m0 scale is no
+    substitute: it has ``ceil(N/32)`` rows, which overstates any N that is not a
+    multiple of 32.
     """
-    sn, sk = layer.weight_scale_mx_e8m0.shape
-    return sn * 32, sk * 32
+    shape = layer.weight.shape
+    if mxfp8_route(layer) == "native":
+        return shape[0] * 16, shape[1] * 128
+    return shape[0], shape[1]
 
 
 def mxfp8_route(layer) -> str | None:
@@ -118,7 +121,9 @@ _UPDATE_UNSUPPORTED = (
 def release_mori_weight(layer) -> None:
     """Drop this layer's re-laid-out copy, and the constraint that came with it."""
     layer._mori_b = None
-    layer._derived_weight_cache_error = None
+    # The attribute is an optional protocol (weight_updater reads it with getattr).
+    layer._derived_weight_cache_error = getattr(layer, "_mori_prior_cache_error", None)
+    layer._mori_prior_cache_error = None
 
 
 def release_all_prepared() -> None:
@@ -179,6 +184,8 @@ def mori_weight(layer):
         .reshape(-1)
     )
     layer._mori_b = (b, b_scale)
+    # Another owner of the layer may already have set it; release restores it.
+    layer._mori_prior_cache_error = getattr(layer, "_derived_weight_cache_error", None)
     layer._derived_weight_cache_error = _UPDATE_UNSUPPORTED
     return layer._mori_b
 
@@ -342,7 +349,9 @@ def _can_ever_fuse(layer) -> bool:
     large ceiling -- so an instance that never prefills may still pay for the
     window. Narrowing that needs a signal this layer does not have.
     """
-    if not fused_wo_b_available() or not _reduces_over_tp_group(layer):
+    if not fused_wo_b_available():
+        return False
+    if not (_is_plain_row_parallel(layer) and _reduces_over_tp_group(layer)):
         return False
     if not mxfp8_ready(layer):
         return False
@@ -379,6 +388,9 @@ def prepare_fused_wo_b(layers) -> None:
     world_size = get_parallel().tp_size
     n, k = mxfp8_shape(candidates[0])
     m_max = _window_m_max(_padded_m(_prefill_ceiling() or 1, world_size), world_size)
+    # The window serves one (N, K) and `fused_wo_b` declines every other shape,
+    # so a copy of a mismatched layer would never be read.
+    candidates = [layer for layer in candidates if mxfp8_shape(layer) == (n, k)]
 
     # Called once per model, and a worker can load more than one: with MTP the
     # NextN draft is a DeepseekV4ForCausalLM subclass that does not override
@@ -970,6 +982,18 @@ def _eligible(m: int, m_pad: int, n: int, k: int, world_size: int) -> bool:
     return m_pad >= floor and m >= _MIN_PAD_FILL * m_pad
 
 
+def _is_plain_row_parallel(layer) -> bool:
+    """A ``RowParallelLinear`` itself, without a bias.
+
+    A LoRA adapter wraps ``wo_b`` in ``RowParallelLinearWithLoRA``, which moves
+    the attributes read below under ``base_layer`` and adds its own delta; and
+    the fused GEMM has no bias term. ``wo_b`` is built with ``bias=False``.
+    """
+    from sglang.srt.layers.linear import RowParallelLinear
+
+    return isinstance(layer, RowParallelLinear) and layer.bias is None
+
+
 def _reduces_over_tp_group(layer) -> bool:
     """Whether this layer's own all-reduce is the one the op would perform.
 
@@ -1010,11 +1034,17 @@ def _reduces_over_tp_group(layer) -> bool:
 def _substitutes_layer_all_reduce(layer) -> bool:
     """``_reduces_over_tp_group`` plus the flags that vary per forward."""
     from sglang.srt.layers.moe.utils import should_skip_mlp_all_reduce
+    from sglang.srt.runtime_context import get_forward
 
     # The mHC post folds the reduce in; the split path skips it here.
     if should_skip_mlp_all_reduce():
         return False
-    return _reduces_over_tp_group(layer)
+    # Under Megatron SP, RowParallelLinear reduce-scatters along the token dim
+    # instead (row_parallel_gbar_matmul); an all-reduced [M, N] is the wrong
+    # result and the wrong shape. sp_active is the same on every rank.
+    if get_forward().sp_active:
+        return False
+    return _is_plain_row_parallel(layer) and _reduces_over_tp_group(layer)
 
 
 def _mori_has_gemm_ar() -> bool:
@@ -1054,7 +1084,11 @@ def fused_wo_b_available() -> bool:
     if _disabled:
         return False
     if _switch_on is None:
-        _switch_on = envs.SGLANG_OPT_FUSED_WO_B_AR.get()
+        from sglang.srt.utils.common import is_gfx95_supported
+
+        # Stated rather than left to the mxfp8 markers, which only the gfx950
+        # routes set today: mori's kernel and its tuning are gfx950's.
+        _switch_on = envs.SGLANG_OPT_FUSED_WO_B_AR.get() and is_gfx95_supported()
     return _switch_on and _mori_has_gemm_ar()
 
 
@@ -1062,10 +1096,17 @@ def fused_wo_b(layer, x: torch.Tensor) -> torch.Tensor | None:
     """wo_b's `GEMM + all-reduce`, fused. ``None`` means "use the normal path".
 
     ``x`` is the bf16 activation this rank holds, ``[M, K]``. The result is the
-    all-reduced ``[M, N]``, as a **view of the symmetric window** -- the next
-    layer's wo_b overwrites it, which is safe because the caller consumes it in
-    the residual add of the same layer. ``SGLANG_DEBUG_FUSED_WO_B_AR`` forces a copy
-    and cross-checks against the unfused path.
+    all-reduced ``[M, N]``, as a **view of the symmetric window**, and the next
+    ``wo_b`` call overwrites it. The caller must consume it before then.
+    DeepSeek-V4 does, but through an op schedule this module does not own:
+    ``attn_boundary.finish()`` hands it to ``ResidualStream.record()``, and the
+    residual is applied at ``ffn_boundary.prepare()`` in
+    ``op_mhc_post_attn_pre_mlp``, still in the same layer. Under prefill TBO the
+    two microbatches share the window, so a ``YieldOperation`` between
+    ``op_attn`` and ``op_mhc_post_attn_pre_mlp`` would let one overwrite the
+    other's result without an error. Clone the result if that schedule changes.
+    ``SGLANG_DEBUG_FUSED_WO_B_AR`` forces a copy and cross-checks against the
+    unfused path.
     """
     global _state, _disabled
 

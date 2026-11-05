@@ -16,7 +16,7 @@ from unittest.mock import mock_open, patch
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_forward, get_parallel
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -115,6 +115,29 @@ class TestReducesOverTpGroup(CustomTestCase):
         # Equal size would pass a size comparison; the ranks are what is compared.
         with tp_group(ranks=range(4)):
             self.assertFalse(mg._reduces_over_tp_group(_Layer(ranks=range(4, 8))))
+
+
+class TestPerForwardSubstitution(CustomTestCase):
+    def test_sequence_parallel_reduce_scatters_instead(self):
+        """Under Megatron SP the layer reduce-scatters along tokens, so an
+        all-reduced ``[M, N]`` would be the wrong result and the wrong shape."""
+        with (
+            tp_group(),
+            patch.object(mg, "_is_plain_row_parallel", return_value=True),
+            patch(
+                "sglang.srt.layers.moe.utils.should_skip_mlp_all_reduce",
+                return_value=False,
+            ),
+        ):
+            self.assertTrue(mg._substitutes_layer_all_reduce(_Layer()))
+            with get_forward().scoped(sp_active=True):
+                self.assertFalse(mg._substitutes_layer_all_reduce(_Layer()))
+
+    def test_a_wrapped_layer_is_declined_rather_than_raising(self):
+        """A LoRA adapter wraps wo_b and moves its attributes under
+        ``base_layer``; startup must decline it, not raise AttributeError."""
+        with tp_group(), patch.object(mg, "fused_wo_b_available", return_value=True):
+            self.assertFalse(mg._can_ever_fuse(torch.nn.Module()))
 
 
 class TestEligible(CustomTestCase):
@@ -366,7 +389,8 @@ class _WoB(torch.nn.Module):
 
     def __init__(self, n=N, k=K):
         super().__init__()
-        w = torch.randint(0, 255, (n * k,), dtype=torch.uint8)
+        # The native route's shuffled layout, [N/16, K/128, 2048].
+        w = torch.randint(0, 255, (n // 16, k // 128, 2048), dtype=torch.uint8)
         self.weight = torch.nn.Parameter(
             w.view(torch.float8_e4m3fn), requires_grad=False
         )
@@ -444,6 +468,66 @@ class TestWeightUpdateRefusal(CustomTestCase):
             before,
             (w._version, w.data._version, w.data_ptr(), w.untyped_storage().data_ptr()),
         )
+
+
+class TestShapeAndPreparation(CustomTestCase):
+    def tearDown(self):
+        mg._prepared.clear()
+
+    def test_n_comes_from_the_weight_not_the_scale(self):
+        """The ue8m0 scale has ceil(N/32) rows; an N off the 32 grid was
+        overstated, and the weight reshape then failed at startup."""
+        n = 5120 + 16
+        layer = torch.nn.Module()
+        layer.weight = torch.nn.Parameter(
+            torch.zeros(n, K, dtype=torch.uint8).view(torch.float8_e4m3fn),
+            requires_grad=False,
+        )
+        layer.weight_scale_mx_e8m0 = torch.nn.Parameter(
+            torch.zeros(-(-n // 32), K // 32, dtype=torch.uint8), requires_grad=False
+        )
+        layer.mxfp8_native_ready = False
+        layer.mxfp8_aiter_ready = True
+        self.assertEqual(mg.mxfp8_shape(layer), (n, K))
+        self.assertEqual(mg.mxfp8_shape(_WoB()), (N, K))
+
+    def test_layers_the_window_cannot_serve_get_no_copy(self):
+        """The window serves the first candidate's (N, K); copying a layer of
+        another shape allocates a full weight nothing ever reads."""
+        same, other = _WoB(), _WoB(n=N // 2)
+        with (
+            tp_group(),
+            patch.object(mg, "_can_ever_fuse", return_value=True),
+            patch.object(mg, "_construct_collectively", return_value=True),
+            patch.object(mg, "_prefill_ceiling", return_value=0),
+            patch.object(mg, "_padded_m", lambda m, world_size: m),
+            patch.object(mg, "_state", None),
+        ):
+            mg.prepare_fused_wo_b([same, other])
+        self.assertIsNotNone(same._mori_b)
+        self.assertIsNone(getattr(other, "_mori_b", None))
+        self.assertEqual(mg._prepared, [same])
+
+    def test_release_restores_another_owners_constraint(self):
+        layer = _WoB()
+        layer._derived_weight_cache_error = "set by another cache"
+        mg.mori_weight(layer)
+        self.assertEqual(layer._derived_weight_cache_error, mg._UPDATE_UNSUPPORTED)
+        mg.release_mori_weight(layer)
+        self.assertEqual(layer._derived_weight_cache_error, "set by another cache")
+
+
+class TestPlatformGate(CustomTestCase):
+    def test_off_on_anything_but_gfx95(self):
+        """The mxfp8 markers only gate by accident of which routes set them."""
+        with (
+            patch.object(mg, "_switch_on", None),
+            patch.object(mg, "_disabled", False),
+            patch.object(mg, "_mori_has_gemm_ar", return_value=True),
+            envs.SGLANG_OPT_FUSED_WO_B_AR.override(True),
+            patch("sglang.srt.utils.common.is_gfx95_supported", return_value=False),
+        ):
+            self.assertFalse(mg.fused_wo_b_available())
 
 
 if __name__ == "__main__":

@@ -54,6 +54,7 @@ jobs:
               - "python/sglang/srt/layers/mori_gemm_ar.py"
               - "test/registered/amd/test_mori_gemm_ar*.py"
               - "docker/rocm.Dockerfile"
+              - "scripts/ci/amd/amd_ci_install_dependency.sh"
               - ".github/workflows/pr-test-amd-mori.yml"
 
   mori-gemm-ar:
