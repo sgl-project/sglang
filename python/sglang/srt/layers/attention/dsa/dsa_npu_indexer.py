@@ -95,17 +95,6 @@ class DSANPUIndexerMixin:
             return_value=False,
         )
 
-        # The operator does not initialize all padded TND rows (including
-        # multi-token verify requests with zero KV length). Mask them on-device
-        # so eager DP padding and graph replay share the same [T, K] contract.
-        rows = torch.arange(query.shape[0], device=query.device)
-        requests = torch.searchsorted(q_ends, rows, right=True).clamp_max(
-            q_ends.numel() - 1
-        )
-        valid = (rows < q_ends[-1]) & (
-            kv_lengths[requests] > q_ends[requests] - rows - 1
-        )
-        indices.masked_fill_(~valid[:, None, None], -1)
         # Share logical token indices with the next attention, like ordinary DSA.
         return indices.squeeze(1)
 
