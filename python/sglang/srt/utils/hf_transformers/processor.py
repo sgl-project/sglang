@@ -355,7 +355,16 @@ def _get_processor(
         trust_remote_code = False
 
     try:
-        if config.model_type == "minimax_m3_vl":
+        if "FireRedASR2ForConditionalGeneration" in (config.architectures or []):
+            from sglang.srt.configs.fireredasr2 import FireRedASR2Processor
+
+            processor = FireRedASR2Processor.from_pretrained(
+                tokenizer_name,
+                trust_remote_code=trust_remote_code,
+                revision=revision,
+                **kwargs,
+            )
+        elif config.model_type == "minimax_m3_vl":
             processor = _get_minimax_m31_processor(tokenizer_name, config, revision)
         elif "InternVL3_5" in tokenizer_name:
             processor = AutoTokenizer.from_pretrained(

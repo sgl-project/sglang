@@ -2555,6 +2555,7 @@ multimodal_model_archs = [
     "Cosmos3EdgeForConditionalGeneration",
     "DeepseekVL2ForCausalLM",
     "Ernie4_5_VLMoeForConditionalGeneration",
+    "FireRedASR2ForConditionalGeneration",
     "MiniMaxM3SparseForConditionalGeneration",
     "UnlimitedOCRV2ForCausalLM",
     "Gemma3ForConditionalGeneration",
@@ -2694,6 +2695,7 @@ def is_multimodal_model(model_architectures: List[str]):
 
 def is_audio_model(model_architectures: List[str]):
     models = [
+        "FireRedASR2ForConditionalGeneration",
         "WhisperForConditionalGeneration",
         "Qwen3ASRForConditionalGeneration",
     ]
