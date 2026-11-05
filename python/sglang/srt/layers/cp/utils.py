@@ -654,9 +654,9 @@ class ShardedContextParallelMetadata(BaseContextParallelMetadata):
         needs_kv_descale=True,
         attention_indices=None,
     ):
-        from sglang.srt.distributed import (
-            get_attn_cp_group,
-            get_moe_tensor_parallel_world_size,
+        from sglang.srt.distributed import get_attn_cp_group
+        from sglang.srt.layers.moe import (
+            is_moe_input_scattered_across_dp_ranks,
         )
 
         metadata = cls()
@@ -668,7 +668,9 @@ class ShardedContextParallelMetadata(BaseContextParallelMetadata):
         cp_group = get_attn_cp_group()
         metadata.group = cp_group.device_group
         metadata.rank, metadata.world = cp_group.rank_in_group, cp_group.world_size
-        metadata.moe_tp = get_moe_tensor_parallel_world_size() > 1
+        # Ordinary experts need the gathered rows and a sum across TP, even
+        # when EP owns every expert shard and the MoE-TP group is one rank wide.
+        metadata.moe_tp = not is_moe_input_scattered_across_dp_ranks()
         metadata.device = device
         metadata.lengths = tuple(map(int, lengths))
         metadata.prefixes = tuple(map(int, prefixes))
@@ -935,7 +937,7 @@ def is_gdn_cp_enabled(server_args=None):
         args = resolved_view(server_args)
         return (
             args.attn_cp_size > 1
-            and args.linear_attn_prefill_backend == "flashqla_cp"
+            and args.linear_attn_prefill_backend == "flashqla"
             and args.disaggregation_mode == "prefill"
             and not args.encoder_only
         )
@@ -943,7 +945,7 @@ def is_gdn_cp_enabled(server_args=None):
 
     return (
         get_parallel().attn_cp_size > 1
-        and get_exec().mamba.linear_attn_prefill_backend == "flashqla_cp"
+        and get_exec().mamba.linear_attn_prefill_backend == "flashqla"
         and get_disagg().disaggregation_mode == "prefill"
         and not get_disagg().encoder_only
     )

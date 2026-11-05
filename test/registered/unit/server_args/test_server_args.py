@@ -5473,13 +5473,17 @@ class TestPagedExpertsNumResident(unittest.TestCase):
                 _paged_experts_num_resident(bad)
 
 
-class TestRingCPEPD(unittest.TestCase):
+class TestRingCPEPD(CustomTestCase):
     def setUp(self):
+        from sglang.srt.configs.qwen3_5 import Qwen3_5MoeConfig
+
         self.config = SimpleNamespace(
-            hf_config=SimpleNamespace(
+            hf_config=Qwen3_5MoeConfig(
                 architectures=["Qwen3_5MoeForConditionalGeneration"]
             ),
             is_multimodal=False,
+            is_draft_model=False,
+            linear_attn_registry_result=None,
             dtype=torch.bfloat16,
         )
 
@@ -5499,7 +5503,7 @@ class TestRingCPEPD(unittest.TestCase):
             "--attention-backend",
             "fa3",
             "--linear-attn-prefill-backend",
-            "flashqla_cp",
+            "flashqla",
             "--disaggregation-mode",
             "prefill",
             "--tp-size",
@@ -5531,11 +5535,15 @@ class TestRingCPEPD(unittest.TestCase):
 
     @staticmethod
     def _validate(args):
+        from sglang.srt.arg_groups.cp_tp_group_sharing_hook import (
+            resolve_cp_tp_group_sharing,
+        )
         from sglang.srt.arg_groups.parallel_hook import _resolve_sharded_hybrid_cp
         from sglang.srt.arg_groups.pd_disaggregation_hook import (
             handle_encoder_disaggregation,
         )
 
+        resolve_cp_tp_group_sharing(args, args._model_config)
         _resolve_sharded_hybrid_cp(args)
         handle_encoder_disaggregation(args)
 
@@ -5577,7 +5585,7 @@ class TestRingCPEPD(unittest.TestCase):
                 "--attn-cp-size",
                 str(cp_size),
                 "--linear-attn-prefill-backend",
-                "flashqla_cp",
+                "flashqla",
             )
             with (
                 self.assertLogs(
@@ -5785,8 +5793,6 @@ class TestRingCPEPD(unittest.TestCase):
             ("dp_size", 2),
             ("pp_size", 2),
             ("moe_dp_size", 2),
-            ("ep_size", 2),
-            ("moe_a2a_backend", "megamoe"),
         )
         for name, value in invalid:
             with self.subTest(name=name, value=value):
@@ -5795,11 +5801,161 @@ class TestRingCPEPD(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "CP=TP"):
                     self._validate(args)
 
-    def test_ring_cp_requires_qwen35_moe(self):
-        args = self._epd_args()
-        self.config.hf_config.architectures = ["Qwen3_5ForConditionalGeneration"]
-        with self.assertRaisesRegex(ValueError, "Qwen3.5 MoE"):
+    def test_gdn_cp_is_independent_of_architecture_name_and_expert_partition(self):
+        from sglang.srt.configs.qwen3_5 import Qwen3_5Config, Qwen3_5MoeConfig
+
+        for config_type in (Qwen3_5Config, Qwen3_5MoeConfig):
+            for ep in (1, 2, 4):
+                with self.subTest(config=config_type, ep=ep):
+                    self.config.hf_config = config_type(architectures=["CustomGDN"])
+                    args = self._ring_args("--ep-size", str(ep), world=4)
+                    self._validate(args)
+                    handle_a2a_moe(args)
+                    self.assertEqual(resolution_result(args, "ep_size"), ep)
+
+    def test_flashqla_with_cp_rejects_non_gdn_and_unsupported_head_dimensions(self):
+        from transformers import PretrainedConfig
+
+        args = self._ring_args()
+        self.config.hf_config.text_config.linear_key_head_dim = 64
+        with self.assertRaisesRegex(ValueError, "head dimensions of 128"):
             self._validate(args)
+        self.config.hf_config = PretrainedConfig(architectures=["CustomAttention"])
+        with self.assertRaisesRegex(ValueError, "requires GDN layers"):
+            self._validate(args)
+
+    def _qwen4_args(self, *options, gdn=True, heads=16):
+        from sglang.srt.configs.qwen4_exp import Qwen4ExpConfig
+
+        self.config.hf_config = Qwen4ExpConfig(
+            architectures=["Qwen4ExpForConditionalGeneration"],
+            text_config=dict(
+                indexer_n_heads=8,
+                indexer_kv_heads=1,
+                indexer_head_dim=128,
+                indexer_budget=2048,
+                indexer_compress_ratio=4,
+                linear_num_key_heads=heads,
+                linear_num_value_heads=heads * 2,
+            ),
+        )
+        return self._ring_args(
+            "--enable-prefill-cp",
+            "--cp-strategy",
+            "interleave",
+            "--attention-backend",
+            "qsa",
+            "--linear-attn-prefill-backend",
+            "flashqla" if gdn else "triton",
+            *options,
+        )
+
+    def test_qwen4_group_sharing_does_not_depend_on_qsa_profile_or_ep(self):
+        for gdn in (False, True):
+            for ep in (1, 2):
+                for strategy in ("zigzag", "interleave"):
+                    for indexer_heads in (None, 8):
+                        with self.subTest(
+                            gdn=gdn, ep=ep, strategy=strategy, heads=indexer_heads
+                        ):
+                            args = self._qwen4_args(
+                                "--ep-size", str(ep), "--cp-strategy", strategy, gdn=gdn
+                            )
+                            self.config.hf_config.text_config.indexer_n_heads = (
+                                indexer_heads
+                            )
+                            self._validate(args)
+                            handle_a2a_moe(args)
+                            self.assertTrue(
+                                resolution_result(args, "enable_cp_tp_group_sharing")
+                            )
+                            self.assertEqual(resolution_result(args, "ep_size"), ep)
+
+    def test_qsa_gdn_cp_keeps_full_heads_but_tp_requires_divisibility(self):
+        from sglang.srt.arg_groups.cp_tp_group_sharing_hook import (
+            resolve_cp_tp_group_sharing,
+        )
+
+        args = self._qwen4_args(heads=3)
+        self._validate(args)
+        resolve_cp_tp_group_sharing(args, self.config)
+        self.assertTrue(resolution_result(args, "enable_cp_tp_group_sharing"))
+        args = self._qwen4_args(gdn=False, heads=3)
+        with self.assertRaisesRegex(ValueError, "must be divisible"):
+            resolve_cp_tp_group_sharing(args, self.config)
+
+    def test_cp_validation_does_not_parse_sparse_attention_kernel_config(self):
+        args = self._qwen4_args("--attention-backend", "fa3")
+        self.config.hf_config.text_config.indexer_compress_ratio = 3
+        self._validate(args)
+        self.assertTrue(resolution_result(args, "enable_cp_tp_group_sharing"))
+
+    def test_qsa_profile_does_not_enable_an_unintegrated_architecture(self):
+        from sglang.srt.arg_groups.cp_tp_group_sharing_hook import (
+            resolve_cp_tp_group_sharing,
+        )
+
+        args = self._qwen4_args(gdn=False)
+        self.config.hf_config.architectures = ["CustomCompressedAttention"]
+        resolve_cp_tp_group_sharing(args, self.config)
+        self.assertFalse(resolution_result(args, "enable_cp_tp_group_sharing"))
+
+    def test_mega_constraints_run_after_ep_normalization(self):
+        for qsa in (False, True):
+            with self.subTest(qsa=qsa):
+                make_args = self._qwen4_args if qsa else self._ring_args
+                args = make_args("--enable-mxfp4-mega", "--moe-a2a-backend", "megamoe")
+                self.assertEqual(args.ep_size, 1)
+                self._validate(args)
+                handle_a2a_moe(args)
+                self.assertEqual(resolution_result(args, "ep_size"), args.tp_size)
+        args = self._qwen4_args("--enable-mxfp4-mega")
+        self._validate(args)
+        with self.assertRaisesRegex(ValueError, "requires --moe-a2a-backend megamoe"):
+            handle_a2a_moe(args)
+        args = self._qwen4_args(
+            "--enable-mxfp4-mega",
+            "--moe-a2a-backend",
+            "megamoe",
+            "--tp-size",
+            "4",
+            gdn=False,
+        )
+        with self.assertRaisesRegex(
+            ValueError, "mapped combine requires a shared CP/EP group"
+        ):
+            handle_a2a_moe(args)
+
+    def test_mega_layout_contract_does_not_select_attention_or_model(self):
+        """An unchanged MoE row topology must not require GDN or a QSA model."""
+        from transformers import PretrainedConfig
+
+        self.config.hf_config = PretrainedConfig(architectures=["UnrelatedMoE"])
+        for attention, linear in (
+            ("fa3", "triton"),
+            ("triton", "flashinfer"),
+            ("qsa", "flashqla"),
+        ):
+            with self.subTest(attention=attention, linear=linear):
+                args = self._ring_args(
+                    "--enable-mxfp4-mega",
+                    "--attention-backend",
+                    attention,
+                    "--linear-attn-prefill-backend",
+                    linear,
+                    "--ep-size",
+                    "1",
+                    backend="megamoe",
+                    world=4,
+                )
+                handle_a2a_moe(args)
+                self.assertEqual(resolution_result(args, "ep_size"), 4)
+                self.assertEqual(
+                    resolution_result(args, "attention_backend"), attention
+                )
+                self.assertEqual(
+                    resolution_result(args, "linear_attn_prefill_backend"), linear
+                )
 
     def test_page_size_and_capacity_restrictions_remain(self):
         invalid = (

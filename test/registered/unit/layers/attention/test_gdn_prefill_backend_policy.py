@@ -397,7 +397,9 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
         backend.kernel_dispatcher = SimpleNamespace(extend_uses_state_checkpoints=True)
         metadata = SimpleNamespace(has_mamba_track_mask=True, track_ssm_h_src=None)
         forward_batch = SimpleNamespace(
-            forward_mode=SimpleNamespace(is_target_verify=lambda: False),
+            forward_mode=ForwardMode.DECODE,
+            gdn_cp_metadata=None,
+            prefill_cp_metadata=None,
             multi_item_delimiter_indices=None,
             mamba_track_mask=torch.tensor([True]),
             mamba_track_indices=torch.tensor([7]),
@@ -497,6 +499,106 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
             ):
                 with self.assertRaisesRegex(ValueError, "supports KDA only"):
                     GDNKernelDispatcher(decode_backend, prefill_backend)
+
+
+class TestFlashQLAGDNPrefillPolicy(CustomTestCase):
+    def test_flashqla_uses_the_cp_group_without_borrowing_tp(self):
+        from sglang.srt.runtime_context import get_parallel
+
+        for world in (1, 2, 4):
+            with self.subTest(cp_size=world):
+                cp_group = SimpleNamespace(world_size=world, device_group=object())
+                with (
+                    get_context().override_server_args(
+                        tp_size=8,
+                        attn_cp_size=world,
+                        linear_attn_prefill_backend="flashqla",
+                        disaggregation_mode="prefill",
+                    ),
+                    get_parallel().override(attn_cp_group=cp_group),
+                    patch(
+                        "sglang.srt.layers.attention.linear.kernels.gdn_flashqla."
+                        "FlashQLAGDNKernel",
+                        side_effect=lambda **kwargs: SimpleNamespace(**kwargs),
+                    ),
+                ):
+                    dispatcher = GDNKernelDispatcher(
+                        LinearAttnKernelBackend.TRITON, LinearAttnKernelBackend.FLASHQLA
+                    )
+                    self.assertEqual(dispatcher.use_context_parallel, world > 1)
+                    self.assertIs(
+                        dispatcher.extend_kernel.cp_group,
+                        cp_group.device_group if world > 1 else None,
+                    )
+                    self.assertIsInstance(dispatcher.decode_kernel, TritonGDNKernel)
+                    self.assertIsInstance(dispatcher.verify_kernel, TritonGDNKernel)
+
+    def test_gdn_plan_matches_the_selected_attention_shards(self):
+        """A zigzag attention shard must not be routed as round-robin GDN input."""
+        from sglang.srt.layers.cp.interleave import InterleaveCPStrategy
+        from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
+        from sglang.srt.runtime_context import get_parallel
+
+        for strategy, strategy_type in (
+            ("interleave", InterleaveCPStrategy),
+            ("zigzag", ZigzagCPStrategy),
+        ):
+            for world in (2, 4):
+                for lengths in ((512,), (513, 259), (8, 3)):
+                    for rank in range(world):
+                        with self.subTest(
+                            strategy=strategy, world=world, lengths=lengths, rank=rank
+                        ):
+                            prefixes = tuple(5 + 16 * i for i in range(len(lengths)))
+                            group = SimpleNamespace(
+                                world_size=world,
+                                rank_in_group=rank,
+                                device_group=object(),
+                            )
+                            backend = object.__new__(GDNAttnBackend)
+                            backend.device = "cpu"
+                            backend._gdn_cp_plan = None
+                            backend._cp_residual_exchange = None
+                            batch = SimpleNamespace(
+                                forward_mode=ForwardMode.EXTEND,
+                                gdn_cp_metadata=None,
+                                extend_lens=lengths,
+                                prefix_lens=prefixes,
+                            )
+                            with (
+                                get_context().override_server_args(
+                                    device="cpu",
+                                    tp_size=world,
+                                    attn_cp_size=world,
+                                    enable_prefill_cp=True,
+                                    cp_strategy=strategy,
+                                    linear_attn_prefill_backend="flashqla",
+                                    disaggregation_mode="prefill",
+                                    enable_cp_tp_group_sharing=True,
+                                ),
+                                get_parallel().override(
+                                    attn_cp_group=group, attn_cp_rank=rank
+                                ),
+                                patch(
+                                    "torch.distributed.get_world_size",
+                                    return_value=world,
+                                ),
+                                patch("torch.distributed.get_rank", return_value=rank),
+                            ):
+                                backend.prepare_cp_metadata(batch)
+                                attention = strategy_type(cp_size=world)
+                                batch.attn_cp_metadata = attention.build_metadata(
+                                    sum(lengths),
+                                    [p + n for p, n in zip(prefixes, lengths)],
+                                    list(lengths),
+                                )
+                                local = attention.shard_hidden_states(
+                                    torch.arange(sum(lengths)), batch
+                                )
+                                indices = batch.gdn_cp_metadata.attention[rank]
+                                torch.testing.assert_close(
+                                    local[: len(indices)], torch.tensor(indices)
+                                )
 
 
 if __name__ == "__main__":

@@ -556,6 +556,17 @@ def _reject_unsupported(stage):
     cannot bind, naming the combination. The rejections that depend on the
     rows of one edge are made where that edge binds (``_bind_stage``)."""
     parallel = get_parallel()
+    from sglang.srt.layers.cp.utils import is_gdn_cp_enabled
+
+    if (
+        stage.cp_layout is None
+        and is_gdn_cp_enabled()
+        and not parallel.enable_cp_tp_group_sharing
+    ):
+        raise NotImplementedError(
+            "Sharded GDN CP requires each attention/FFN stage to declare its CP "
+            "token layout; this stage has no CP row-transport integration"
+        )
     if stage.update.applied_at_exit:
         # CP-TP group sharing is the MoE-CP gather MHC has been run with.
         if (

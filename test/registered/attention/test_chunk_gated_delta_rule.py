@@ -1435,7 +1435,7 @@ class TestFlashQLACP(CustomTestCase):
                 dtype=torch.int32,
                 device="cuda",
             )
-            for name, kernel in (("flashqla", self.tp), ("flashqla_cp", self.cp)):
+            for name, kernel in (("flashqla-tp", self.tp), ("flashqla-cp", self.cp)):
                 pool.copy_(before)
                 output = torch.empty_like(expected)
                 out, final, _ = kernel.extend(

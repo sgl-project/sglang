@@ -56,6 +56,7 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import (
     get_exec,
     get_memory,
+    get_parallel,
     get_schedule,
     mamba_cache_chunk_size,
 )
@@ -482,22 +483,15 @@ class GDNKernelDispatcher:
             self.extend_kernel = triton_kernel
 
         elif prefill_backend.is_flashqla():
-            from sglang.srt.distributed import get_attn_cp_group, get_attn_tp_group
             from sglang.srt.layers.attention.linear.kernels.gdn_flashqla import (
                 FlashQLAGDNKernel,
             )
-            from sglang.srt.layers.cp.utils import is_gdn_cp_enabled
 
-            group = None
-            if prefill_backend == LinearAttnKernelBackend.FLASHQLA_CP:
-                self.use_context_parallel = is_gdn_cp_enabled()
-                group = (
-                    get_attn_cp_group()
-                    if self.use_context_parallel
-                    else get_attn_tp_group()
-                ).device_group
+            cp_group = get_parallel().attn_cp_group
+            self.use_context_parallel = cp_group.world_size > 1
             self.extend_kernel = FlashQLAGDNKernel(
-                fallback=triton_kernel, cp_group=group
+                fallback=triton_kernel,
+                cp_group=cp_group.device_group if self.use_context_parallel else None,
             )
         elif prefill_backend.is_cutedsl():
             if not is_cuda():
@@ -921,14 +915,22 @@ class GDNAttnBackend(MambaAttnBackendBase):
         lengths = batch.extend_lens if lengths is None else lengths
         prefixes = batch.prefix_lens if prefixes is None else prefixes
         world = get_attn_cp_group().world_size
-        attention_indices = tuple(
-            tuple(range(rank, sum(lengths), world)) for rank in range(world)
-        )
+        strategy = get_parallel().cp_strategy
+        if strategy == "interleave":
+            attention_indices = tuple(
+                tuple(range(rank, sum(lengths), world)) for rank in range(world)
+            )
+            cp_mode = "round-robin-split"
+        elif strategy == "zigzag":
+            attention_indices = None
+            cp_mode = "in-seq-split"
+        else:
+            raise ValueError(f"Unsupported prefill CP strategy: {strategy}")
         metadata = ShardedContextParallelMetadata.plan_prefill(
             lengths,
             prefixes,
             self.device,
-            cp_mode="round-robin-split",
+            cp_mode=cp_mode,
             attention_indices=attention_indices,
             previous=self._gdn_cp_plan,
             residual_exchange=self._cp_residual_exchange,
@@ -978,7 +980,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if cp_prefill and cp_metadata is not None:
             if not self.kernel_dispatcher.use_context_parallel:
                 raise ValueError(
-                    "GDN CP metadata requires the flashqla_cp prefill backend and sharded CP"
+                    "GDN CP metadata requires FlashQLA prefill with a multi-rank CP group"
                 )
             # Previous batches may have written the source on another owner.
             # Finish those stores before COW, then publish COW/clear before reads.

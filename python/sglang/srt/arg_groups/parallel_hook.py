@@ -99,63 +99,43 @@ def _resolve_sharded_hybrid_cp(server_args):
     import torch
 
     from sglang.srt.arg_groups.overrides import attention_backends_of
+    from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
 
     cfg = resolving_view(server_args)
     active = (
         cfg.attn_cp_size > 1
-        and cfg.linear_attn_prefill_backend == "flashqla_cp"
+        and cfg.linear_attn_prefill_backend == "flashqla"
         and not cfg.encoder_only
     )
-    qsa_cp_mega = (
-        (
-            cfg.enable_prefill_cp
-            and cfg.attn_cp_size > 1
-            and cfg.attn_cp_size == cfg.tp_size == cfg.ep_size
-            and cfg.attn_dp_size == cfg.moe_dp_size == cfg.pp_size == cfg.dp_size == 1
-            and cfg.disaggregation_mode == "prefill"
-            and cfg.max_running_requests is not None
-            and cfg.chunked_prefill_size is not None
-            and cfg.chunked_prefill_size > 0
-            and model_config_of(server_args).hf_config.architectures[0]
-            == "Qwen4ExpForConditionalGeneration"
-        )
-        if cfg.enable_mxfp4_mega
-        else False
-    )
-    if cfg.enable_mxfp4_mega and (
-        not (active or qsa_cp_mega) or cfg.moe_a2a_backend != "megamoe"
-    ):
-        raise ValueError(
-            "--enable-mxfp4-mega requires supported hybrid/QSA CP prefill and --moe-a2a-backend megamoe"
-        )
     if not active:
         return
     config = model_config_of(server_args)
-    ep = cfg.tp_size if cfg.moe_a2a_backend == "deepep" else cfg.ep_size
-    qsa_gdn_cp = (
-        config.hf_config.architectures[0] == "Qwen4ExpForConditionalGeneration"
-        and cfg.enable_prefill_cp
-        and cfg.cp_strategy == "interleave"
-    )
-    if (
-        not (
-            config.hf_config.architectures[0] == "Qwen3_5MoeForConditionalGeneration"
-            or qsa_gdn_cp
+    gdn = hybrid_gdn_config(config)
+    if gdn is None:
+        raise ValueError(
+            "--linear-attn-prefill-backend flashqla with CP requires GDN layers"
         )
-        or cfg.attn_cp_size != cfg.tp_size
+    if gdn.linear_key_head_dim != 128 or gdn.linear_value_head_dim != 128:
+        raise ValueError("FlashQLA GDN CP requires key/value head dimensions of 128")
+    if (
+        config.hf_config.architectures[0] == "Qwen4ExpForConditionalGeneration"
+        and not cfg.enable_prefill_cp
+    ):
+        raise ValueError("Qwen4Exp CP requires --enable-prefill-cp")
+    # These row plans span the whole TP group; they do not yet compose with
+    # a head-sharded attention group or a pipeline-stage boundary.
+    if (
+        cfg.attn_cp_size != cfg.tp_size
         or cfg.dp_size != 1
         or cfg.attn_dp_size != 1
         or cfg.pp_size != 1
         or cfg.moe_dp_size != 1
         or cfg.dcp_size != 1
         or cfg.disaggregation_mode != "prefill"
-        or not (
-            (ep == 1 and cfg.moe_a2a_backend == "none")
-            or (ep == cfg.tp_size and cfg.moe_a2a_backend in ("deepep", "megamoe"))
-        )
     ):
         raise ValueError(
-            "GDN CP requires Qwen3.5 MoE or interleave QSA PD prefill, CP=TP>=2, DP=PP=MoE-DP=1, and TP experts or pure EP with DeepEP/MegaMoE"
+            "GDN CP row transport currently requires PD prefill, CP=TP>=2, "
+            "DP=attention-DP=PP=MoE-DP=DCP=1"
         )
     if cfg.disaggregation_transfer_backend not in ("mooncake", "mooncake_tcp"):
         raise ValueError("Sharded CP KV transfer requires Mooncake")
@@ -181,7 +161,7 @@ def _resolve_sharded_hybrid_cp(server_args):
             "Sharded CP requires BF16, a page size divisible by CP, explicit max-running-requests, and ordinary KV/Mamba pools without speculation, LoRA, HiCache, PD-mux or state compression"
         )
     prefill = attention_backends_of(cfg)[0]
-    if not qsa_gdn_cp and prefill not in ("fa3", "trtllm_mha"):
+    if not cfg.enable_cp_tp_group_sharing and prefill not in ("fa3", "trtllm_mha"):
         raise ValueError("Sharded CP uses fa3 on Hopper or trtllm_mha on Blackwell")
     if prefill == "fa3" and cfg.kv_cache_dtype == "fp8_e5m2":
         raise ValueError("FlashAttention3 does not support fp8_e5m2")
@@ -207,7 +187,6 @@ def handle_context_parallelism(server_args: Any):
     # own qualified NPU/MUSA build would still hit the original rejection
     # at this later, nested call.
     run_hook(validate_prefill_cp_platform, server_args)
-    _resolve_sharded_hybrid_cp(server_args)
 
     cfg = resolving_view(server_args)
     if parse_connector_type(cfg.model_path) != ConnectorType.INSTANCE:
@@ -257,6 +236,8 @@ def handle_context_parallelism(server_args: Any):
                     "--language-only."
                 )
         resolve_cp_tp_group_sharing(server_args, model_config)
+
+    _resolve_sharded_hybrid_cp(server_args)
 
     if cfg.enable_prefill_cp and cfg.cp_strategy is None:
         raise ValueError(

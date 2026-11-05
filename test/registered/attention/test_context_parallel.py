@@ -956,7 +956,7 @@ def _worker(rank, result_dir, world_size):
             model_path="dummy",
             tp_size=world_size,
             attn_cp_size=world_size,
-            linear_attn_prefill_backend="flashqla_cp",
+            linear_attn_prefill_backend="flashqla",
             disaggregation_mode="prefill",
         )
     )
@@ -1086,11 +1086,19 @@ def _run_case(
         extend_prefix_lens_cpu=tuple(64 * i for i in range(len(lengths))),
         num_token_non_padded=original_count,
     )
-    with mock_parallel_groups(
-        attn_cp_size=world,
-        attn_cp_rank=rank,
-        moe_tp_size=world if moe_tp else 1,
-        attn_cp_group=SimpleNamespace(device_group=dist.group.WORLD),
+    from sglang.srt.layers.moe import MoeA2ABackend
+    from sglang.srt.runtime_context import get_flags
+
+    with (
+        get_flags().moe.override(
+            a2a_backend=MoeA2ABackend.NONE if moe_tp else MoeA2ABackend.DEEPEP
+        ),
+        mock_parallel_groups(
+            attn_cp_size=world,
+            attn_cp_rank=rank,
+            moe_tp_size=world if moe_tp else 1,
+            attn_cp_group=SimpleNamespace(device_group=dist.group.WORLD),
+        ),
     ):
         batch.prefill_cp_metadata = ContextParallelMetadata.from_prefill(
             batch, device, residual_exchange=residual_exchange, previous=previous
@@ -1249,6 +1257,11 @@ class TestRingCPMoETP(CustomTestCase):
 
 class TestContextParallelMetadata(unittest.TestCase):
     def setUp(self):
+        from sglang.srt.runtime_context import get_context
+
+        config = get_context().override_server_args(tp_size=2, attn_cp_size=2)
+        config.install()
+        self.addCleanup(config.restore)
         self.exchange = object()
         self.parallel = SimpleNamespace(
             attn_cp_group=SimpleNamespace(
@@ -1262,10 +1275,6 @@ class TestContextParallelMetadata(unittest.TestCase):
             patch(
                 "sglang.srt.distributed.get_attn_cp_group",
                 side_effect=lambda: self.parallel.attn_cp_group,
-            ),
-            patch(
-                "sglang.srt.distributed.get_moe_tensor_parallel_world_size",
-                side_effect=lambda: self.parallel.moe_tp_size,
             ),
             patch("torch.distributed.get_world_size", return_value=2),
             patch("torch.distributed.get_rank", return_value=0),
@@ -1285,13 +1294,23 @@ class TestContextParallelMetadata(unittest.TestCase):
             extend_prefix_lens_cpu=prefixes,
             num_token_non_padded=torch.tensor(sum(lengths)),
         )
-        return ContextParallelMetadata.from_prefill(
-            batch,
-            torch.device("cpu"),
-            residual_exchange=self.exchange,
-            previous=previous,
-            cp_mode=cp_mode,
-        )
+        from sglang.srt.layers.moe import MoeA2ABackend
+        from sglang.srt.runtime_context import get_flags
+
+        with get_flags().moe.override(
+            a2a_backend=(
+                MoeA2ABackend.NONE
+                if self.parallel.moe_tp_size > 1
+                else MoeA2ABackend.DEEPEP
+            )
+        ):
+            return ContextParallelMetadata.from_prefill(
+                batch,
+                torch.device("cpu"),
+                residual_exchange=self.exchange,
+                previous=previous,
+                cp_mode=cp_mode,
+            )
 
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
     def test_gdn_metadata_does_not_read_device_state_on_host(self):
@@ -1446,7 +1465,7 @@ class TestContextParallelMetadata(unittest.TestCase):
         runner = SimpleNamespace(
             server_args=SimpleNamespace(
                 attn_cp_size=2,
-                linear_attn_prefill_backend="flashqla_cp",
+                linear_attn_prefill_backend="flashqla",
                 disaggregation_mode="prefill",
                 encoder_only=False,
             ),
@@ -2235,7 +2254,7 @@ class TestCPWarmup(unittest.TestCase):
         ):
             args = SimpleNamespace(
                 attn_cp_size=cp_size,
-                linear_attn_prefill_backend="flashqla_cp",
+                linear_attn_prefill_backend="flashqla",
                 disaggregation_mode=role,
                 encoder_only=encoder,
             )

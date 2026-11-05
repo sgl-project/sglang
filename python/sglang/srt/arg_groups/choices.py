@@ -197,7 +197,6 @@ RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
 
 LINEAR_ATTN_KERNEL_BACKEND_CHOICES = [
     "flashqla",
-    "flashqla_cp",
     "triton",
     "cutedsl",
     "flashinfer",
