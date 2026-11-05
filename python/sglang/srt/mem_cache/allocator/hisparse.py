@@ -13,6 +13,7 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
 )
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import get_disagg
 from sglang.srt.utils.common import get_num_new_pages
 
 if TYPE_CHECKING:
@@ -114,6 +115,28 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return min(
             self.logical_attn_allocator.available_size(),
             self.hisparse_attn_allocator.available_size(),
+        )
+
+    def max_new_tokens_for_memory(
+        self,
+        input_tokens: int,
+        max_new_tokens: int,
+        *,
+        token_capacity: int,
+        sliding_window_size: int | None,
+        chunk_size: int | None,
+    ) -> int | None:
+        # PD receives prompt KV into host memory. Keep the scheduler's physical
+        # capacity for metrics, but do not silently reduce generation to zero
+        # when a valid prompt exceeds the sparse device working set.
+        if get_disagg().disaggregation_mode == "decode":
+            token_capacity = self.size_full
+        return super().max_new_tokens_for_memory(
+            input_tokens,
+            max_new_tokens,
+            token_capacity=token_capacity,
+            sliding_window_size=sliding_window_size,
+            chunk_size=chunk_size,
         )
 
     def get_kvcache(self):

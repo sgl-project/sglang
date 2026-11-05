@@ -6214,6 +6214,51 @@ class ServingChatTestCase(CustomTestCase):
         result = self.chat._encode_messages([], Mock(), False, image_data=[])
         self.assertIsNone(result)
 
+    def test_streaming_retraction_503_after_partial_text(self):
+        for include_usage in (False, True):
+            with self.subTest(include_usage=include_usage):
+
+                async def generate():
+                    item = _spec_result(0)
+                    item["text"] = "Partial answer"
+                    item["meta_info"]["finish_reason"] = None
+                    yield copy.deepcopy(item)
+                    item["meta_info"]["finish_reason"] = {
+                        "type": "abort",
+                        "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                        "message": "Retracted under decode memory pressure. Retry later.",
+                    }
+                    yield item
+
+                self.tm.generate_request.return_value = generate()
+                request = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "Hi"}],
+                    stream=True,
+                    stream_options={"include_usage": include_usage},
+                )
+                chunks = self._run_chat_stream(Mock(), request)
+                parsed = self._parse_chunks(chunks)
+                errors = [c["error"] for c in parsed if "error" in c]
+                self.assertEqual(len(errors), 1)
+                self.assertEqual(errors[0]["code"], 503)
+                self.assertEqual(errors[0]["type"], "SERVICE_UNAVAILABLE")
+                self.assertTrue(
+                    any(
+                        choice.get("delta", {}).get("content") == "Partial answer"
+                        for c in parsed
+                        for choice in c.get("choices", [])
+                    )
+                )
+                self.assertFalse(
+                    any(
+                        choice.get("finish_reason")
+                        for c in parsed
+                        for choice in c.get("choices", [])
+                    )
+                )
+                self.assertEqual(chunks[-1], "data: [DONE]\n\n")
+
 
 class TestProcessToolCallsWithRequiredToolChoice(unittest.TestCase):
     """Test _process_tool_calls with tool_choice='required' uses model-specific parser."""

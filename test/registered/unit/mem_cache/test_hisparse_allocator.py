@@ -21,6 +21,30 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestHiSparseDecodeRemap(CustomTestCase):
+    def test_pd_generation_budget_uses_host_capacity_and_keeps_page_slack(self):
+        allocator = object.__new__(HiSparseTokenToKVPoolAllocator)
+        allocator.page_size = 64
+        allocator._size_full = 384000
+        kwargs = dict(token_capacity=48000, sliding_window_size=None, chunk_size=256)
+        for mode, expected in (("decode", 64), ("prefill", 0), ("null", 0)):
+            with (
+                self.subTest(mode=mode),
+                patch(
+                    "sglang.srt.mem_cache.allocator.hisparse.get_disagg",
+                    return_value=SimpleNamespace(disaggregation_mode=mode),
+                ),
+            ):
+                self.assertEqual(
+                    allocator.max_new_tokens_for_memory(65536, 64, **kwargs), expected
+                )
+        with patch(
+            "sglang.srt.mem_cache.allocator.hisparse.get_disagg",
+            return_value=SimpleNamespace(disaggregation_mode="decode"),
+        ):
+            self.assertEqual(
+                allocator.max_new_tokens_for_memory(383872, 128, **kwargs), 63
+            )
+
     def test_spec_scratch_is_charged_only_before_request_slot_allocation(self):
         allocator = object.__new__(HiSparseTokenToKVPoolAllocator)
         allocator.page_size = 64

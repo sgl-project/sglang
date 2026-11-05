@@ -29,6 +29,36 @@ def _alignment_8_capture_bs(runner, width, *, gathered_buffer_required):
 
 
 class TestModelRunnerDecodeRows(unittest.TestCase):
+    def test_hisparse_pd_prompt_limit_uses_host_capacity(self):
+        runner = object.__new__(ModelRunner)
+        runner.is_hybrid_swa = False
+        runner.enable_hisparse = True
+        runner.max_total_num_tokens = 48000
+        runner.token_to_kv_pool_allocator = SimpleNamespace(size_full=384000)
+        runner.req_to_token_pool = SimpleNamespace(
+            schedulable_token_capacity=lambda capacity: capacity
+        )
+        runner.kv_cache_configurator = SimpleNamespace(
+            logical_token_capacity=lambda *, max_total_num_tokens: max_total_num_tokens
+        )
+        for mode, expected in (("decode", 384000), ("prefill", 48000), ("null", 48000)):
+            with (
+                self.subTest(mode=mode),
+                patch(
+                    "sglang.srt.model_executor.model_runner.get_disagg",
+                    return_value=SimpleNamespace(disaggregation_mode=mode),
+                ),
+            ):
+                self.assertEqual(
+                    runner.effective_logical_max_total_num_tokens, expected
+                )
+                self.assertEqual(runner.logical_max_total_num_tokens, 48000)
+
+        runner.enable_hisparse = False
+        with patch("sglang.srt.model_executor.model_runner.get_disagg") as disagg:
+            self.assertEqual(runner.effective_logical_max_total_num_tokens, 48000)
+            disagg.assert_not_called()
+
     def test_adaptive_sizing_covers_a_wider_candidate_width(self):
         """The shared logits buffer is sized for the widest adaptive candidate
         width: bs 12 at width 6 needs 72 rows."""

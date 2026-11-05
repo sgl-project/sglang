@@ -122,6 +122,7 @@ from sglang.srt.mem_cache.allocation import (
 )
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.hisparse import HiSparseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     CacheRequestHandle,
@@ -1816,12 +1817,18 @@ def release_req(
     if get_disagg().disaggregation_mode != "decode":
         resumable = req.resumable_by_reprefill
     elif offload_kv:
+        backend = get_disagg().disaggregation_decode_retraction_backup
+        if isinstance(token_to_kv_pool_allocator, HiSparseTokenToKVPoolAllocator):
+            # HiSparse cannot restore host KV, indexer keys and draft state
+            # after retract_req releases its workspace. Abort through the
+            # existing no-backup path instead of calling get_cpu_copy.
+            backend = "none"
         resumable = backup_kv_cache(
             req,
             tree_cache,
             req_to_token_pool,
             token_to_kv_pool_allocator,
-            get_disagg().disaggregation_decode_retraction_backup,
+            backend,
         )
     else:
         resumable = req.resumable_by_rebootstrap
@@ -2953,6 +2960,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     status_code = HTTPStatus.SERVICE_UNAVAILABLE
                 elif (
                     get_disagg().disaggregation_decode_retraction_backup == "host_pool"
+                    and not isinstance(
+                        self.token_to_kv_pool_allocator, HiSparseTokenToKVPoolAllocator
+                    )
                 ):
                     message = "Retraction host KV pool exhausted. Aborting the request."
                     status_code = HTTPStatus.INTERNAL_SERVER_ERROR
@@ -2979,7 +2989,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 FINISH_ABORT(
                     "Out of memory even after retracting all other requests "
                     "in the decode batch. Aborting the last request.",
-                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    status_code=(
+                        HTTPStatus.SERVICE_UNAVAILABLE
+                        if isinstance(
+                            self.token_to_kv_pool_allocator,
+                            HiSparseTokenToKVPoolAllocator,
+                        )
+                        else HTTPStatus.INTERNAL_SERVER_ERROR
+                    ),
                 )
             )
             reqs_to_abort.append(last_req)
