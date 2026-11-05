@@ -48,7 +48,6 @@ on:
           - jit-kernel-unit-test-amd
           - jit-kernel-benchmark-test-amd
           - stage-b-test-1-gpu-small-amd
-          - stage-b-test-1-gpu-small-amd-nondeterministic
           - stage-b-test-1-gpu-small-amd-mi35x
           - stage-b-test-1-gpu-large-amd
           - stage-b-test-2-gpu-large-amd
@@ -600,46 +599,6 @@ jobs:
         timeout-minutes: ${{ (inputs.runner_arch || 'mi300') == 'mi300' && 90 || 75 }}
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite base-b-test-1-gpu-small-mi30x --auto-partition-id ${{ matrix.part }} --auto-partition-size 8 --timeout-per-file 2400 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
-
-  stage-b-test-1-gpu-small-amd-nondeterministic:
-    name: ${{ format('stage-b-test-1-gpu-small-amd-nondeterministic ({0}, {1})', matrix.rocm_version, fromJson(needs.check-changes.outputs.runs_on_map)['1-gpu-small-mi30x']) }}
-    strategy:
-      fail-fast: false
-      matrix:
-        rocm_version: ${{ fromJson(needs.check-changes.outputs.rocm_versions) }}
-    needs: [check-changes, wait-for-stage-a-amd]
-    if: |
-      always() &&
-      (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-1-gpu-small-amd-nondeterministic,')) ||
-        (
-          !(inputs.target_stage || inputs.target_stage_select) &&
-          ((github.event_name == 'schedule') || (!failure() && !cancelled())) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
-      )
-    runs-on: ${{ fromJson(needs.check-changes.outputs.runs_on_map)['1-gpu-small-mi30x'] }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
-
-      - name: Ensure VRAM is clear
-        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
-
-      - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "${{ matrix.rocm_version }}"
-        env:
-          GITHUB_WORKSPACE: ${{ github.workspace }}
-
-      - name: Install dependencies
-        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
-
-      - name: Run test
-        timeout-minutes: 75
-        run: |
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite base-b-nondeterministic-test-1-gpu-small-mi30x --timeout-per-file 3600 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   # Waits for the MI300 stage-b jobs, like stage-c: the MI35x 1-GPU pool is the
   # scarcest AMD runner pool, so a PR run only asks it for a runner once its
@@ -1401,7 +1360,6 @@ jobs:
         jit-kernel-benchmark-test-amd,
         wait-for-stage-b-amd,
         stage-b-test-1-gpu-small-amd,
-        stage-b-test-1-gpu-small-amd-nondeterministic,
         stage-b-test-1-gpu-small-amd-mi35x,
         stage-b-test-1-gpu-large-amd,
         stage-b-test-2-gpu-large-amd,

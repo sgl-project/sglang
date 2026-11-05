@@ -25,9 +25,7 @@ from sglang.test.test_utils import CustomTestCase
 
 
 register_cuda_ci(est_time=160, stage="extra-a", runner_config="1-gpu-small")
-register_amd_ci(
-    est_time=132, stage="base-b-nondeterministic", runner_config="1-gpu-small-mi30x"
-)
+register_amd_ci(est_time=330, stage="extra-a", runner_config="1-gpu-small-mi30x")
 
 MODELS = [
     ("LxzGordon/URM-LLaMa-3.1-8B", 1, 4e-2),
