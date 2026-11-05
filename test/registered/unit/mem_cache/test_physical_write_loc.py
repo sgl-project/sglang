@@ -36,9 +36,11 @@ from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec, MHAView
 from sglang.srt.mem_cache.memory_pool import (
     KVWriteLoc,
     MHATokenToKVPool,
+    unwrap_write_loc,
     write_loc_is_physical,
 )
 from sglang.srt.runtime_context import reset_context
+from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.unified_allocator_fixtures import (
     arena_of,
@@ -165,6 +167,29 @@ class TestKVWriteLocCarriesTheMark(unittest.TestCase):
         self.assertTrue(
             write_loc_is_physical(KVWriteLoc(torch.tensor([1]), physical=True))
         )
+
+
+class TestWriteLocIsDense(unittest.TestCase):
+    def test_strided_loc_is_refused(self):
+        strided = torch.arange(6).view(2, 3)[:, 0]
+        with self.assertRaises(ValueError):
+            KVWriteLoc(strided)
+        with self.assertRaises(ValueError):
+            KVWriteLoc(torch.tensor([1, 2]), swa_loc=strided)
+        with self.assertRaises(ValueError):
+            unwrap_write_loc(strided)
+
+    def test_each_draft_step_row_is_dense(self):
+        bs, topk, num_steps = 2, 2, 3
+        loc = torch.arange(bs * topk * num_steps)
+        per_step = per_step_draft_out_cache_loc(loc, bs, topk, num_steps)
+        for step in range(num_steps):
+            self.assertTrue(per_step[step].is_contiguous())
+            self.assertEqual(
+                per_step[step].tolist(),
+                loc.view(bs, topk, num_steps)[:, :, step].reshape(-1).tolist(),
+            )
+            KVWriteLoc(per_step[step])
 
 
 class TestUnifiedDoorsRefuseUnmarkedLocs(unittest.TestCase):
