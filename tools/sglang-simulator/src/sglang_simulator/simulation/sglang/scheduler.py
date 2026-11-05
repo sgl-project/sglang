@@ -31,10 +31,12 @@ from sglang_simulator.simulation.utils import (
 from sglang_simulator.time_predictor.base import (
     InferTimePredictor,
     PredictorError,
-    ScheduleRequest,
 )
 from sglang_simulator.time_predictor.base import (
     ScheduleBatch as SimulationScheduleBatch,
+)
+from sglang_simulator.time_predictor.base import (
+    ScheduleRequest,
 )
 from sglang_simulator.utils import get_logger
 from sglang_simulator.utils.json import CustomJsonEncoder

@@ -2,7 +2,6 @@ import json
 from contextvars import ContextVar
 
 import torch
-
 from sglang_simulator.hook import BaseHook
 from sglang_simulator.simulation.manager import ConfigManager
 from sglang_simulator.simulation.sglang.utils import (
@@ -304,12 +303,12 @@ class C_KVCacheConfiguratorHook(BaseHook):
 
             budget_config = ConfigManager.get_memory_budget_config()
             if budget_config is not None:
-                from sglang.srt.model_executor.pool_configurator import (
-                    create_memory_pool_configurator,
-                )
-
                 from sglang_simulator.simulation.resource_budget import (
                     estimate_infercast_budget,
+                )
+
+                from sglang.srt.model_executor.pool_configurator import (
+                    create_memory_pool_configurator,
                 )
 
                 _validate_resource_pool(self)
