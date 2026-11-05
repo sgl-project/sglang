@@ -6073,55 +6073,31 @@ class MiniMaxSparseKVPool(KVCache):
     ) -> bool:
         """Precondition for writing main K/V with ``reshape_and_cache_flash``.
 
-        Mirrors ``AiterAttnBackend._use_fused_fp8_kv_write`` (which already runs
-        this kernel on the dense layers) plus the pool-layout facts that
-        backend cannot see from here.
+        Disabled: this path is only reached for sparse layers (dense layers
+        already go through ``AiterAttnBackend._use_fused_fp8_kv_write``, which
+        is unaffected by this flag), and routing sparse-layer main-KV writes
+        through the fused store here produced silent, permanent GSM8K
+        corruption on MiniMax-M3-MXFP4 -- coherent output for the first
+        ~150-200 decode requests of a run, then an irrecoverable collapse into
+        incoherent multi-language output for every request after. Verified via
+        a clean A/B (this predicate forced to ``False`` vs. unmodified) on the
+        same image/config at TP2 (GSM8K 0.019 -> 0.969) and TP4 (0.013 ->
+        ~0.96 corrected for an unrelated empty-response artifact); TP8 is
+        unaffected either way by an independent aiter MoE issue.
+        Every individual check below (layout, shape, stride, scale pairing)
+        was re-verified against the actual sparse-layer call site and each
+        holds for the QKV-interleaved-view tensors sparse layers pass in, so
+        the defect is not one of these documented preconditions being wrong
+        in isolation -- the leading candidate is a synchronization gap between
+        this kernel launch and a concurrent read of the same aliased
+        QKV-view buffer that is specific to how sparse layers source
+        cache_k/cache_v, which neither this predicate nor the GPU
+        equivalence tests (single isolated call, no concurrent aliasing) can
+        observe. Left disabled pending that root cause; the original
+        precondition logic is preserved in this PR's git history (prior to
+        this commit) for whoever picks the root cause back up.
         """
-        main = self.main_pool
-        # Only worth routing here when there is a cast to fuse: an fp8 pool fed
-        # model-dtype activations. A model-dtype pool has no cast, so
-        # set_kv_buffer's scatter is already the whole operation.
-        if main.dtype not in _FP8_KV_CACHE_DTYPES or cache_k.dtype == main.dtype:
-            return False
-        # The kernel addresses the cache as [num_pages, page_size, heads, dim];
-        # only the NHD buffer reshapes to that. hnd / vectorized_5d / the FP4
-        # quantized pool each have their own writer inside set_kv_buffer.
-        if main.use_hnd or main.kv_cache_layout != "nhd" or main.is_quantized_kv_cache:
-            return False
-        # Buffer is [size + page_size, heads, dim]; the 4-D view needs the row
-        # count to divide by page_size. PoolConfigurator page-aligns
-        # max_total_num_tokens, so this holds in practice -- fall back rather
-        # than raise if some caller ever sizes a pool by hand.
-        if main.size % main.page_size != 0:
-            return False
-        # One (num_heads, head_size) pair covers both K and V in the kernel.
-        if main.head_dim != main.v_head_dim:
-            return False
-        if cache_k.shape[1:] != (main.head_num, main.head_dim):
-            return False
-        if cache_v.shape[1:] != (main.head_num, main.v_head_dim):
-            return False
-        # The kernel takes stride(0) as the token stride and assumes each token's
-        # heads/dims are contiguous behind it. Checking is cheap and the failure
-        # mode otherwise is silently mis-scattered KV, not an exception.
-        if not _is_token_major_contiguous(cache_k, main.head_dim):
-            return False
-        if not _is_token_major_contiguous(cache_v, main.v_head_dim):
-            return False
-        # USE_SCALE is one constexpr covering both K and V, and the launcher
-        # substitutes the *key* tensor for a missing scale pointer -- so a
-        # one-sided scale would make the kernel read garbage as v_scale.
-        if (k_scale is None) != (v_scale is None):
-            return False
-        # Non-unit scales are divided out inside the kernel, which loads them
-        # from a device tensor, while the backend hands us the float mirrors.
-        # Those agree by construction: BaseKVCacheMethod.process_weights_after_loading
-        # (layers/quantization/kv_cache.py) copies the same resolved value into
-        # layer.k_scale/.v_scale and into the *_float attributes. A float scale with no tensor behind it means that method
-        # never ran, so there is nothing safe to tl.load -- fall back.
-        if k_scale is not None and (layer.k_scale is None or layer.v_scale is None):
-            return False
-        return True
+        return False
 
     def _store_main_kv_fused_fp8(
         self,
