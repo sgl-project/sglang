@@ -17,6 +17,9 @@ from unittest.mock import Mock, patch
 
 import torch
 from PIL import Image
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def _jpeg(size=(64, 48), **options):
@@ -337,8 +340,8 @@ class TestNpuJpegInput(unittest.TestCase):
         for device, target in (("npu", 3), ("npu:1", 1)):
             with self.subTest(device=device), self._npu() as (state, backend):
 
-                def fail(value):
-                    self.assertEqual(state.current, target)
+                def fail(value, expected_device=target):
+                    self.assertEqual(state.current, expected_device)
                     raise RuntimeError("decoder failure")
 
                 failing = types.SimpleNamespace(decode=fail)
@@ -383,9 +386,8 @@ class TestNpuJpegInput(unittest.TestCase):
             for data in cases:
                 with self.subTest(
                     dtype=data.dtype, shape=data.shape, device=data.device
-                ):
-                    with self.assertRaises((TypeError, ValueError)):
-                        self.jpeg.decode_jpeg(data)
+                ), self.assertRaises((TypeError, ValueError)):
+                    self.jpeg.decode_jpeg(data)
 
     def test_public_unsupported_chip_and_invalid_target(self):
         data = _encoded_tensor(_jpeg())
