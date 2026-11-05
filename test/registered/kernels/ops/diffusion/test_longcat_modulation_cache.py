@@ -1,5 +1,6 @@
 """Request-local time conditioning and capture fallbacks."""
 
+import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -162,3 +163,7 @@ def test_model_prepares_time_conditioning_per_request_and_skips_capture():
         assert torch.equal(captured, run(texts[0]))
     for handle in handles:
         handle.remove()
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
