@@ -1847,7 +1847,6 @@ macro_rules! tree_core_methods {
                     .map_err(node_access_error)
             }
 
-            /// The node's accumulated match count.
             fn node_hit_count(&self, py: Python<'_>, node_id: NodeId) -> PyResult<i64> {
                 py.detach(|| self.core().node_hit_count(node_id))
                     .map_err(node_access_error)
@@ -3284,7 +3283,6 @@ macro_rules! tree_core_binding {
                 catch_native_panic(|| self.inner.node_backuped(py, node_id))
             }
 
-            /// The node's accumulated match count.
             fn node_hit_count(&self, py: Python<'_>, node_id: NodeId) -> PyResult<i64> {
                 catch_native_panic(|| self.inner.node_hit_count(py, node_id))
             }

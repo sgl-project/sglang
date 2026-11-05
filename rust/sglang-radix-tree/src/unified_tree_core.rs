@@ -4454,7 +4454,6 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         Ok(self.arena.node(node_id).backuped())
     }
 
-    /// The node's accumulated match count, which write-through compares with its threshold.
     pub fn node_hit_count(&self, node_id: NodeId) -> Result<i64, NodeAccessError> {
         let node_id = self.arena.resolve(node_id)?;
         Ok(self.arena.node(node_id).hit_count)

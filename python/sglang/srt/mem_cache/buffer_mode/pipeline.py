@@ -880,8 +880,7 @@ class BufferModePipeline:
                     intent.pool == PoolName.MAMBA
                     and self._cache._mamba_request_end_only
                 ):
-                    # A split must not turn one admitted endpoint checkpoint
-                    # into additional intermediate-state writes.
+                    # Keep only the original endpoint's state after a split.
                     if any(key not in intent.keys for key in keys):
                         continue
                 repaired = _UnifiedBackupIntent(

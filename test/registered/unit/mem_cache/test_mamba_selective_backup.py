@@ -205,8 +205,6 @@ class TestMambaSelectiveBackup(unittest.TestCase):
                 self.assertIsNone(cache._insert_params)
 
     def test_endpoint_retry_reads_hit_count_from_each_tree_core_backend(self):
-        # The retry runs on the tree core the server selected; the Rust core has
-        # no Python node objects, so the hit count must come through the interface.
         for backend in ("python", "rust"):
             for threshold, expected in ((2, [7]), (3, [])):
                 with self.subTest(backend=backend, threshold=threshold):
@@ -315,8 +313,6 @@ class TestCacheModeMambaSelectiveBackup(CustomTestCase):
     tree_backend = "python"
 
     def make_cache(self, selective=True, storage=True):
-        # Both backends use real Mamba insertion, transfer construction and
-        # commit; only host/storage I/O below is simulated with CPU tensors.
         core = real_tree_core(self.tree_backend, mamba=True)
         nodes = [
             pump_insert(

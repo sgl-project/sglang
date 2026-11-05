@@ -2042,16 +2042,14 @@ class UnifiedRadixCache(BasePrefixCache):
         if not self._mamba_request_end_only or params is None:
             return True
         if params.is_request_end is None:
-            return True  # Preserve direct/manual backups without request context.
+            return True
         if not params.is_request_end:
             return False
         (path,) = self.tree_core.collect_path_info([node_id])
         return bool(path) and path[-1].path_end == len(params.key)
 
     def _retry_request_end_mamba_backup(self, result: InsertResult) -> None:
-        # Full KV may already be backed up from an intermediate checkpoint.
-        # Both modes must retry the newly eligible Mamba endpoint under the
-        # same write policy, without counting another hit.
+        # An earlier KV backup may have skipped this endpoint's Mamba state.
         params = self._insert_params
         if (
             not self._mamba_request_end_only
@@ -2090,8 +2088,7 @@ class UnifiedRadixCache(BasePrefixCache):
             # backed up. Skip only when no transfer remains.
             if device_value.numel() == 0 and not comp_xfers:
                 continue
-            # Component-only retries must preserve the earlier Full-KV ack's
-            # lock ownership. No-op retries above need no synchronization.
+            # Finish the previous ack before replacing its lock ownership.
             if node_id in self.ongoing_write_through:
                 self.writing_check(write_back=True)
             sidecar_xfers = self._build_backup_sidecar(device_value, comp_xfers)

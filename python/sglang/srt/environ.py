@@ -893,8 +893,7 @@ class Envs:
     # Buffer mode: store only the SWA window ending at each node (what a
     # prefetch ending there restores) instead of every SWA page.
     SGLANG_ENABLE_HICACHE_SWA_TAIL_ONLY_BACKUP = EnvBool(False)
-    # Cache and buffer modes: omit intermediate Mamba host/storage checkpoints.
-    # Keep complete request endpoints; unknown/manual backup sources stay eligible.
+    # Cache/buffer mode: back up Mamba only at request endpoints.
     SGLANG_HICACHE_MAMBA_REQUEST_END_ONLY = EnvBool(False)
     SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR = EnvStr(None)
     # Enable O_DIRECT when opening NIXL POSIX backend files (bypasses OS page cache).

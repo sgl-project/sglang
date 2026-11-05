@@ -245,8 +245,7 @@ class UnifiedTreeCoreInterface(ABC):
 
     @abstractmethod
     def node_hit_count(self, node_id: NodeId) -> int:
-        """The node's accumulated match count, which write-through compares with
-        ``write_through_threshold``."""
+        """Hit count used by the write-through threshold."""
         ...
 
     @abstractmethod
