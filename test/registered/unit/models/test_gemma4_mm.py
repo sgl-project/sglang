@@ -30,7 +30,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.mm_utils import embed_mm_inputs  # noqa: E402
-from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
+from sglang.srt.model_executor.forward_mode import ForwardMode  # noqa: E402
 from sglang.srt.models import gemma4_mm  # noqa: E402
 from sglang.srt.models.gemma4_causal import Gemma4TextModel  # noqa: E402
 from sglang.srt.models.gemma4_mm import Gemma4ForConditionalGeneration  # noqa: E402
