@@ -374,6 +374,7 @@ def test_cross_request_image_batching_by_backend(monkeypatch, backend):
             [TOTAL_LEN, TOTAL_LEN],
             [[item.offsets[0]] for item in items],
             torch.zeros(2 * TOTAL_LEN, dtype=torch.long),
+            rids=None,
         )
         return embedding
 
@@ -563,7 +564,7 @@ VIDEO_LEN = 24
 VIDEO_CHUNKS = [(0, 9), (9, 9), (18, 6)]
 VIDEO_TOKENS = sum(end - start + 1 for start, end in VIDEO_RUNS)
 # The embedding paths: full (a multi-run video), batched (a single-run item),
-# and per-request on HIP, NPU and XPU (a multi-run audio item).
+# and per-request on HIP and XPU (a multi-run audio item).
 PATHS = ["full", "batched", "per_request"]
 
 
@@ -626,7 +627,6 @@ def _pruned_video():
     item = MultimodalDataItem(
         modality=Modality.VIDEO,
         hash=5,
-        pad_value=0,
         feature=torch.zeros(1),
         offsets=[(1, 2), (5, 7), (10, 11)],
         model_specific_data={"pre_chunked_input_ids": PRUNED_PROMPT},
@@ -704,10 +704,11 @@ def test_pruned_video_is_encoded_once_per_request():
     encoder.assert_called_once()
     assert [chunk.shape[0] for chunk, _ in outs] == [1, 4, 2]
     assert torch.equal(torch.cat([chunk for chunk, _ in outs]), rows)
-    # Pruning moved the placeholders: [1, 0, 4, 5, 0, 0, 0, 0, 9, 10, 0, 0, 12, 13].
-    assert outs[0][1].tolist() == [1, 0, 4, 5]
-    assert outs[1][1].tolist() == [0, 0, 0, 0, 9]
-    assert outs[2][1].tolist() == [10, 0, 0, 12, 13]
+    # Pruning moved the placeholders: [1, p, 4, 5, p, p, p, p, 9, 10, p, p, 12, 13].
+    pad = item.pad_value
+    assert outs[0][1].tolist() == [1, pad, 4, 5]
+    assert outs[1][1].tolist() == [pad, pad, pad, pad, 9]
+    assert outs[2][1].tolist() == [10, pad, pad, 12, 13]
     assert not mm_schedule._prefill_rows
 
 
@@ -940,7 +941,9 @@ def test_keeping_rows_leaves_the_cache_order_alone():
         rids=["req"],
     )
 
-    assert list(mm_schedule.embedding_cache.mm_cache) == [11, 12]
+    assert list(mm_schedule.embedding_cache.mm_cache) == [
+        item.cache_key for item in items
+    ]
     assert len(mm_schedule._prefill_rows) == 1
 
 

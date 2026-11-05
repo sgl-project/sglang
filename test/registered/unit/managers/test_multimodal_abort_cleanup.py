@@ -36,6 +36,7 @@ from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.transport.cuda_ipc import CudaIpcTensorTransportProxy
 from sglang.srt.runtime_context import get_context, get_parallel, publish, reset_context
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.session.session_controller import Session
 from sglang.srt.utils import cuda_vmm_transport_utils as vmm
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -380,6 +381,7 @@ def kept_rows():
 def _admission_scheduler(chunked_req):
     """A scheduler whose admission records how many kept entries it found."""
     scheduler = Scheduler.__new__(Scheduler)
+    empty_request_lists(scheduler)
     scheduler.chunked_req = chunked_req
     scheduler.prefill_delayer = None
     scheduler.entries_at_admission = []
@@ -420,7 +422,6 @@ def test_last_chunk_still_reads_its_kept_rows(kept_rows):
 
 def test_bootstrap_failure_releases_kept_rows_before_admission(kept_rows):
     scheduler = _admission_scheduler(chunked_req=object())
-    scheduler.scheduler_stage_metrics = None
     scheduler.process_pending_chunked_abort = Mock()
     scheduler._process_hicache_events = Mock()
     scheduler.resolve_waiting_queue_bootstrap = Mock()
@@ -442,7 +443,9 @@ def test_bootstrap_failure_releases_kept_rows_before_admission(kept_rows):
 
 def _pause_scheduler(disaggregation_mode):
     scheduler = Scheduler.__new__(Scheduler)
+    empty_request_lists(scheduler)
     scheduler._engine_paused = False
+    scheduler._pause_started_at = None
     scheduler.enable_overlap = False
     scheduler.enable_overlap_mlx = False
     scheduler.last_batch = None
@@ -455,7 +458,6 @@ def _pause_scheduler(disaggregation_mode):
     scheduler.tree_cache = MagicMock()
     scheduler.req_to_token_pool = MagicMock()
     scheduler.token_to_kv_pool_allocator = MagicMock()
-    scheduler.waiting_queue = []
     scheduler._add_request_to_queue = MagicMock()
     scheduler.metrics_reporter = MagicMock()
     scheduler.metrics_reporter.current_scheduler_metrics_enabled = False
@@ -467,8 +469,6 @@ def _pause_scheduler(disaggregation_mode):
 
 @pytest.fixture
 def published_server_args():
-    from sglang.srt.server_args import ServerArgs
-
     publish(ServerArgs(model_path="dummy"), role="test")
     yield
     reset_context()
@@ -518,9 +518,13 @@ def test_weights_only_memory_release_drops_kept_rows(kept_rows):
 
 @pytest.mark.parametrize("prefix_len, in_progress", [(4, True), (0, False)])
 def test_dllm_context_is_in_progress_once_part_is_prefilled(prefix_len, in_progress):
-    manager = DllmManager(dllm_config=None)
-    manager.waiting_queue.append(
-        SimpleNamespace(dllm_phase=DllmReqPhase.STAGING_PREFILL, prefix_len=prefix_len)
+    manager = DllmManager(dllm_config=None, release_aborted=Mock())
+    manager.waiting_queue.join(
+        [
+            SimpleNamespace(
+                dllm_phase=DllmReqPhase.STAGING_PREFILL, prefix_len=prefix_len
+            )
+        ]
     )
 
     assert manager.any_context_in_progress() is in_progress
@@ -531,9 +535,12 @@ def test_dllm_abort_drops_only_the_aborted_rows(published_server_args, kept_rows
     req = Req("dllm-video", "", [1], SamplingParams())
     survivor = Req("dllm-other", "", [1], SamplingParams())
     scheduler = _queued_scheduler(req)
-    scheduler.waiting_queue = []
+    scheduler.waiting_queue.clear()
     scheduler.dllm_config = object()
-    scheduler.dllm_manager = DllmManager(dllm_config=None)
+    scheduler.dllm_manager = DllmManager(
+        dllm_config=None, release_aborted=scheduler._release_aborted_dllm_req
+    )
+    scheduler.dllm_manager.waiting_queue.join([req, survivor])
     scheduler.dllm_manager.staging_queue.extend([req, survivor])
     kept_rows.clear()
     kept_rows[(req.rid, "item")] = object()
@@ -541,6 +548,7 @@ def test_dllm_abort_drops_only_the_aborted_rows(published_server_args, kept_rows
 
     scheduler.abort_request(AbortReq(rid=req.rid))
 
+    assert list(scheduler.dllm_manager.waiting_queue) == [survivor]
     assert scheduler.dllm_manager.staging_queue == [survivor]
     assert list(kept_rows) == [(survivor.rid, "item")]
 

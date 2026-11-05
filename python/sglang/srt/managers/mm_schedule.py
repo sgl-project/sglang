@@ -2,7 +2,7 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, replace
-from typing import Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Callable, Dict, Hashable, Iterable, List, Optional, Tuple
 
 import msgspec
 import torch
@@ -350,14 +350,13 @@ def _rows_key(
     items: List[MultimodalDataItem],
     offsets,
 ) -> Optional[tuple]:
-    mm_hashes = tuple(item.hash for item in items)
-    if owner is None or None in mm_hashes:
-        return None  # unrelated items without a hash would share the key
+    if owner is None:
+        return None
     return (
         owner,
         kind,
         items[0].modality,
-        mm_hashes,
+        tuple(item.cache_key for item in items),
         tuple(tuple(run) for run in offsets),
     )
 
@@ -377,7 +376,7 @@ def _keep_prefill_rows(
     end_row: int,
     chunk_end: int,
     last_token: int,
-    cache_hash: Optional[int],
+    cache_hash: Hashable,
 ) -> None:
     if key is None:
         return
@@ -442,7 +441,7 @@ def _item_prefill_chunk(
         end_row=end_row,
         chunk_end=chunk_end,
         last_token=last_token,
-        cache_hash=item.hash,
+        cache_hash=item.cache_key,
     )
     return chunk
 
