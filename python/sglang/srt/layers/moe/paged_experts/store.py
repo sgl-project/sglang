@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import ctypes
+import errno
 import functools
 import logging
 import math
@@ -20,6 +21,25 @@ import torch
 logger = logging.getLogger(__name__)
 
 
+def _memfd_create(name: str) -> int:
+    # Some CPython builds omit both the binding and Linux's MFD_CLOEXEC constant.
+    flags = getattr(os, "MFD_CLOEXEC", 1)
+    native = getattr(os, "memfd_create", None)
+    if native is not None:
+        return native(name, flags)
+    libc = _libc()
+    if libc is None or not hasattr(libc, "memfd_create"):
+        raise OSError(errno.ENOSYS, "Paged experts require Linux memfd_create support")
+    create = libc.memfd_create
+    create.argtypes = (ctypes.c_char_p, ctypes.c_uint)
+    create.restype = ctypes.c_int
+    fd = create(name.encode(), flags)
+    if fd < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    return fd
+
+
 def _pin_until_freed(shape, dtype: torch.dtype) -> torch.Tensor:
     """Page-locked host memory of exactly the tensor's size (torch's pinned allocator rounds
     every allocation up to a power of two): shared memory of that size, registered with CUDA
@@ -31,7 +51,7 @@ def _pin_until_freed(shape, dtype: torch.dtype) -> torch.Tensor:
     as their model, so that sync happens only at exit or in tests.
     """
     nbytes = math.prod(shape) * dtype.itemsize
-    fd = os.memfd_create("sglang-paged-experts", os.MFD_CLOEXEC)
+    fd = _memfd_create("sglang-paged-experts")
     try:
         os.ftruncate(fd, nbytes)
         storage = torch.UntypedStorage.from_file(
