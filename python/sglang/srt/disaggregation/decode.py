@@ -124,7 +124,6 @@ from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
     match_kv_cache,
     page_align_floor,
-    release_kv_cache,
     restore_kv_cache,
     start_restore_kv_cache,
     suffix_page_indices,
@@ -407,7 +406,7 @@ class DecodeRequest:
     # Queued for transfer but its destination not yet sent to any prefill rank.
     awaiting_publish: bool = False
     # Overlap without the deferred publish: (ready event, send_metadata args,
-    # kwargs) until the forward in flight at allocation time is done.
+    # kwargs) until the forward and any pinned metadata readback are done.
     pending_metadata: Optional[Tuple[Any, tuple, dict]] = None
 
     # HiCache Status
@@ -1084,14 +1083,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def _abort_retracted(self, recv_req: AbortReq) -> None:
         # Retracted requests hold a KV backup.
         for req in self.retracted_queue.take(lambda req: recv_req.matches(req.rid)):
-            self.scheduler.request_retirer.abort_queued(req)
+            self.scheduler.request_retirer.abort(req)
 
     def _abort_held(self, recv_req: AbortReq) -> None:
         # Held requests hold no KV.
         for req in self.held_rebootstrap_reqs.take(
             lambda req: recv_req.matches(req.rid)
         ):
-            self.scheduler.request_retirer.abort_queued(
+            self.scheduler.request_retirer.abort(
                 req, finished_reason=recv_req.finished_reason
             )
 
@@ -1788,8 +1787,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 r for r in self.pending_reqs if id(r) not in failed_ids
             ]
             for decode_req in failed_reqs:
-                if decode_req.req.kv.holds_mamba and not decode_req.req.kv.holds_kv:
-                    release_kv_cache(decode_req.req, self.tree_cache, checkpoint=False)
+                self.scheduler.request_retirer.release(decode_req.req, checkpoint=False)
 
         self.queue.leave([queue[i].req for i in indices_to_remove])
 
@@ -1873,19 +1871,26 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         seq_len = fill_len
 
+        state_types = self.kv_manager.kv_args.state_types
+        non_blocking_metadata = (
+            self.transfer_queue.enable_staging
+            and envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
+            and not self.scheduler.enable_hisparse
+            and torch.cuda.is_available()
+            and set(state_types) <= {StateType.MAMBA}
+            and not _is_fake_transfer(decode_req.req)
+        )
+
         def _mamba_payload():
             state_ids = self.token_to_kv_pool_allocator.state_ids(
                 self.req_to_token_pool.state_sub_pool
             )
-            return [
-                state_ids.ids(
-                    self.req_to_token_pool.req_index_to_mamba_index_mapping[
-                        decode_req.req.kv.req_pool_idx
-                    ]
-                )
-                .cpu()
-                .numpy()
-            ]
+            indices = state_ids.ids(
+                self.req_to_token_pool.req_index_to_mamba_index_mapping[
+                    decode_req.req.kv.req_pool_idx
+                ]
+            )
+            return [indices if non_blocking_metadata else indices.cpu().numpy()]
 
         def _swa_payload(sub_pool="swa", window=_SCHEDULER_WINDOW):
             if window is _SCHEDULER_WINDOW:
@@ -1963,7 +1968,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         def _request_row_payload():
             return np.array([decode_req.req.kv.req_pool_idx], dtype=np.int32)
 
-        state_types = self.kv_manager.kv_args.state_types
         if StateType.DSV4_REQUEST_STATE in state_types and isinstance(
             self.token_to_kv_pool, DeepSeekV4TokenToKVPool
         ):
@@ -2039,6 +2043,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             kv_transfer_page_size,
             state_indices,
             metadata_buffer_preassigned=metadata_buffer_preassigned,
+            non_blocking=non_blocking_metadata,
             **metadata_kwargs,
         )
 
@@ -2049,6 +2054,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         page_size,
         state_indices=None,
         metadata_buffer_preassigned: bool = False,
+        non_blocking: bool = False,
         **metadata_kwargs,
     ) -> None:
         if not metadata_buffer_preassigned:
@@ -2056,7 +2062,29 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self.req_to_metadata_buffer_idx_allocator.alloc()
             )
         assert decode_req.metadata_buffer_index is not None
-        page_indices = self._transfer_page_indices(decode_req, kv_indices, page_size)
+        readback_ready = None
+        if non_blocking:
+
+            def to_host(indices):
+                host = torch.empty(indices.shape, dtype=indices.dtype, pin_memory=True)
+                host.copy_(indices, non_blocking=True)
+                return host.numpy()
+
+            page_indices = to_host((kv_indices[::page_size] // page_size).int())
+            state_indices = [
+                [to_host(indices) for indices in payload] for payload in state_indices
+            ]
+            # Fence both the D2H and the prior forward before exposing reused pages.
+            if self.scheduler.enable_overlap:
+                forward_done = self.scheduler.device_module.Event()
+                forward_done.record(stream=self.scheduler.forward_stream)
+                torch.cuda.current_stream().wait_event(forward_done)
+            readback_ready = torch.cuda.Event()
+            readback_ready.record()
+        else:
+            page_indices = self._transfer_page_indices(
+                decode_req, kv_indices, page_size
+            )
         if (
             metadata_kwargs.get("destination") != KVTransferDestination.HOST
             and self.transfer_queue.enable_staging
@@ -2069,7 +2097,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 decode_req.req.bootstrap_room, decode_req
             )
         args = (page_indices, decode_req.metadata_buffer_index, state_indices)
-        if (
+        if readback_ready is not None:
+            decode_req.pending_metadata = (readback_ready, args, metadata_kwargs)
+        elif (
             self.scheduler.enable_overlap
             and not self._defer_publish
             and metadata_kwargs.get("destination") != KVTransferDestination.HOST
@@ -3151,16 +3181,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         )
         kv_manager._staging_handler = self.staging_handler
 
-    def _release_request(self, decode_req: DecodeRequest) -> None:
-        # HiSparse host pages are the transfer destination; free them with the KV.
-        if self.scheduler.enable_hisparse:
-            self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
-        if self.enable_host_receive:
-            discard_kv_cache_backup(decode_req.req, self.tree_cache)
-            if decode_req.host_staged:
-                return
-        release_kv_cache(decode_req.req, self.tree_cache, checkpoint=False)
-
     def _is_host_destination(self, decode_req: DecodeRequest) -> bool:
         return self.enable_host_receive and decode_req.host_staged
 
@@ -3319,7 +3339,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                         self.scheduler.output_streamer.stream_output(
                             [decode_req.req], decode_req.req.return_logprob
                         )
-                        self._release_request(decode_req)
+                        self.scheduler.request_retirer.release(
+                            decode_req.req, checkpoint=False
+                        )
                         decode_req.kv_receiver.clear()
                         decode_req.kv_receiver = None
                         indices_to_remove.add(i)
@@ -3346,7 +3368,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                         decode_req.req.return_logprob,
                     )
                     self._clean_hicache_prefetch_resources(decode_req)
-                    self._release_request(decode_req)
+                    self.scheduler.request_retirer.release(
+                        decode_req.req, checkpoint=False
+                    )
                     self._record_transfer_failure(
                         decode_req.req.finished_reason.message
                     )
@@ -3373,7 +3397,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 self._defer_release(decode_req)
                 deferred_indices.add(i)
             else:
-                self._release_request(decode_req)
+                self.scheduler.request_retirer.release(decode_req.req, checkpoint=False)
                 receiver = decode_req.kv_receiver
                 receiver.clear()
                 decode_req.kv_receiver = None
@@ -3446,7 +3470,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         if self.enable_staging and self.staging_handler.is_staging_room(room):
             self.staging_handler.unregister_decode_req(room)
         # release pre-allocated kv cache, but don't insert into the tree since it's failed
-        self._release_request(decode_req)
+        self.scheduler.request_retirer.release(decode_req.req, checkpoint=False)
         self.metadata_buffers.clear_slot(idx)
         self.req_to_metadata_buffer_idx_allocator.free(idx)
         if not self._is_host_destination(decode_req):
@@ -3573,6 +3597,7 @@ class SchedulerDisaggregationDecodeMixin:
                 batch, chunked_req=self.chunked_req
             )
             self.cur_batch_for_debug = batch
+            self._flush_staging_scatters()
 
             # Launch the current batch
             if batch:
@@ -3590,6 +3615,10 @@ class SchedulerDisaggregationDecodeMixin:
     def event_loop_overlap_disagg_decode(self: Scheduler):
         self.result_queue = deque()
         self.last_batch: Optional[ScheduleBatch] = None
+        defer_prealloc = (
+            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
+            and envs.SGLANG_ENABLE_NV_MEGA_PDDEC_RUNTIME_OPTIMIZATION.get()
+        )
 
         def pop_and_process():
             tmp_batch, tmp_result = self.result_queue.popleft()
@@ -3609,7 +3638,7 @@ class SchedulerDisaggregationDecodeMixin:
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
-            self.process_decode_queue()
+            prealloc_deferred = self.process_decode_queue(defer_prealloc=defer_prealloc)
 
             # overlap + spec + grammar is unsupported (would desync DP ranks).
             process_last_batch_early = self.should_process_last_batch_early(
@@ -3628,13 +3657,20 @@ class SchedulerDisaggregationDecodeMixin:
                 batch, chunked_req=self.chunked_req
             )
             self.cur_batch_for_debug = batch
+            self._flush_staging_scatters()
 
             # Launch the current batch
             if batch:
                 batch_result = self.run_batch(batch)
+                # Allocation may read page indices back to the host. Submit it
+                # before the scheduler's WAR wait, after launching this forward.
+                if prealloc_deferred:
+                    self._preallocate_new_requests()
                 self._apply_war_barrier()
                 self.result_queue.append((batch.copy(), batch_result))
             else:
+                if prealloc_deferred:
+                    self._preallocate_new_requests()
                 batch_result = None
                 self._sched_idled = True
 
@@ -3651,6 +3687,16 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Update last_batch
             self.last_batch = batch
+
+    def _flush_staging_scatters(self: Scheduler) -> None:
+        handler = self.disagg_decode_transfer_queue.staging_handler
+        if handler is not None and handler._defer_scatter:
+            stream = (
+                self.forward_stream
+                if self.enable_overlap or get_parallel().pp_size > 1
+                else self.schedule_stream
+            )
+            handler.flush_pending_scatters(stream)
 
     def _run_batch_prebuilt(
         self: Scheduler, batch: ScheduleBatch
@@ -3703,6 +3749,11 @@ class SchedulerDisaggregationDecodeMixin:
         batch = self._get_new_prebuilt_batch(running_batch)
         if batch is None:
             return None
+        nonblocking = self._nonblocking_admit_in_scope(batch)
+        if self.enable_overlap and not nonblocking:
+            # A finished request can still have a redundant forward writing a
+            # row the admitted request will seed.
+            self.schedule_stream.wait_stream(self.forward_stream)
         # Verify after host restore and before process_prebuilt caches any KV.
         self._verify_kv_checksums(batch)
         if batch.is_empty():
@@ -3710,8 +3761,39 @@ class SchedulerDisaggregationDecodeMixin:
         self.ngram_embedding_manager.prepare_for_forward(
             batch, chunked_req=self.chunked_req
         )
-        batch.process_prebuilt(self.future_map)
+        if nonblocking:
+            # Reused FutureMap rows are seeded after the previous forward and
+            # before the next one, without parking the host behind that forward.
+            self.forward_stream.wait_stream(self.schedule_stream)
+            with self.forward_stream_ctx:
+                batch.process_prebuilt(self.future_map)
+            batch.req_pool_indices.record_stream(self.forward_stream)
+            batch.seq_lens.record_stream(self.forward_stream)
+        else:
+            batch.process_prebuilt(self.future_map)
         return batch
+
+    def _nonblocking_admit_in_scope(self: Scheduler, batch: ScheduleBatch) -> bool:
+        # EAGLE's seed uses pinned async_h2d_stack already. Other seed paths,
+        # host restores and grammar may read device results back to the host.
+        return (
+            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
+            and envs.SGLANG_ENABLE_NV_MEGA_PDDEC_RUNTIME_OPTIMIZATION.get()
+            and self.enable_overlap
+            and self.spec_algorithm.is_eagle()
+            and not self.enable_hisparse
+            # Cache checkpointing may free/rebind allocator pages on this stream;
+            # keep that work ordered with the scheduler's subsequent allocations.
+            and not get_disagg().disaggregation_decode_enable_radix_cache
+            and get_disagg().disaggregation_decode_host_receive_threshold == 1
+            and all(
+                req.grammar is None
+                and req.output_dsa_topk_indices is None
+                and req.kv.retraction_backup is None
+                and req.hidden_states_tensor is not None
+                for req in batch.reqs
+            )
+        )
 
     def _verify_kv_checksums(self, batch: ScheduleBatch) -> None:
         computer: Optional[KvChecksumComputer] = self.kv_checksum_computer
@@ -3795,9 +3877,7 @@ class SchedulerDisaggregationDecodeMixin:
             status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
         )
         self.output_streamer.stream_output([req], req.return_logprob)
-        if self.enable_hisparse:
-            self.hisparse_coordinator.request_finished(req)
-        release_kv_cache(req, self.tree_cache, checkpoint=False)
+        self.request_retirer.release(req, checkpoint=False)
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_transfer_failed_reqs()
 
@@ -3878,10 +3958,6 @@ class SchedulerDisaggregationDecodeMixin:
 
         # construct fake completed prefill
         new_batch.prepare_for_prebuilt()
-        if self.enable_overlap:
-            # A finished request can still have one redundant forward in flight.
-            # Drain it before a prebuilt request seeds a potentially reused row.
-            self.schedule_stream.wait_stream(self.forward_stream)
         return new_batch
 
     def _start_host_restores(self: Scheduler) -> None:
@@ -3955,8 +4031,13 @@ class SchedulerDisaggregationDecodeMixin:
                 )
         return {id(req) for req, done in zip(pending, ready.tolist()) if done}
 
+    def _preallocate_new_requests(self: Scheduler) -> None:
+        req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()
+        self.disagg_decode_transfer_queue.extend(req_conns)
+
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
-    def process_decode_queue(self: Scheduler):
+    def process_decode_queue(self: Scheduler, defer_prealloc: bool = False) -> bool:
+        """Return whether the overlap loop must preallocate after its launch."""
         if self.enable_decode_hicache:
             self.tree_cache.check_hicache_events()
         elif (
@@ -3980,7 +4061,7 @@ class SchedulerDisaggregationDecodeMixin:
         self.waiting_queue.join(resumed_reqs)
         if len(self.disagg_decode_prealloc_queue.retracted_queue) > 0:
             # if there are still retracted requests, we do not allocate new requests
-            return
+            return False
 
         if not hasattr(self, "polling_count"):
             self.polling_count = 0
@@ -3988,10 +4069,13 @@ class SchedulerDisaggregationDecodeMixin:
 
         self.polling_count = (self.polling_count + 1) % self.polling_interval
 
+        prealloc_deferred = False
         if self.polling_count % self.polling_interval == 0:
             if get_disagg().disaggregation_decode_host_receive_threshold == 1:
-                req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()
-                self.disagg_decode_transfer_queue.extend(req_conns)
+                if defer_prealloc:
+                    prealloc_deferred = True
+                else:
+                    self._preallocate_new_requests()
             transferred_reqs = (
                 self.disagg_decode_transfer_queue.pop_transferred()
             )  # the requests which kv has arrived
@@ -4004,3 +4088,4 @@ class SchedulerDisaggregationDecodeMixin:
                 # Give completed host transfers device space before new arrivals.
                 req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()
                 self.disagg_decode_transfer_queue.extend(req_conns)
+        return prealloc_deferred
