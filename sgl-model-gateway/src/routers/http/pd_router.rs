@@ -752,6 +752,15 @@ impl PDRouter {
                     })));
                 let mut response = Response::new(Body::from_stream(stream));
                 response.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+                let source = if first_sent.load(std::sync::atomic::Ordering::Acquire) == 1 {
+                    "prefill"
+                } else {
+                    "decode"
+                };
+                response.headers_mut().insert(
+                    "x-sglang-pd-first-token-source", HeaderValue::from_static(source),
+                );
+                tracing::info!(first_token_source = source, "PD prefill-first stream started");
                 response.extensions_mut().insert(BreakerOutcomesRecorded);
                 response
             }
@@ -2197,6 +2206,7 @@ mod tests {
             router.execute_dual_dispatch_internal(Some(&headers), json!({"text":"prompt", "stream":true}),
                 context, prefill, Some(decode), Instant::now())).await
             .expect("first token must not wait for decode headers");
+        assert_eq!(response.headers()["x-sglang-pd-first-token-source"], "prefill");
         let mut body = response.into_body().into_data_stream();
         assert_eq!(body.next().await.unwrap().unwrap(), first.as_bytes());
         release_decode.notify_one();

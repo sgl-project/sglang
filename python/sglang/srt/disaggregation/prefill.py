@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional
 import numpy as np
 import torch
 
+from sglang.srt.observability.pd_timing import log_pd_timing
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.checksum import (
@@ -410,6 +411,7 @@ class PrefillBootstrapQueue:
         if self._check_if_req_exceed_kv_capacity(req):
             return False
 
+        log_pd_timing(req, "p_sender_create")
         backend = (
             TransferBackend.FAKE
             if req.bootstrap_host == FAKE_BOOTSTRAP_HOST
@@ -445,6 +447,7 @@ class PrefillBootstrapQueue:
             return False
 
         req.time_stats.set_bootstrap_done_time()
+        log_pd_timing(req, "p_bootstrap_done")
         decode_prefix_len = req.disagg_kv_sender.pop_decode_prefix_len()
         req.start_send_idx = decode_prefix_len
         # Base of the staging chunk grid (suffix-relative send coordinates).
@@ -696,6 +699,8 @@ class SchedulerDisaggregationPrefillMixin:
 
         if batch:
             set_schedule_time_batch(batch)
+            for req in batch.reqs:
+                log_pd_timing(req, "p_batch_scheduled", batch_requests=len(batch.reqs))
 
         return NextBatchPlan(batch_to_run=batch, running_batch=running_batch)
 
@@ -1033,6 +1038,7 @@ class SchedulerDisaggregationPrefillMixin:
         ):
             if req is not batch.chunked_req:
                 req.time_stats.set_prefill_finished_time()
+                log_pd_timing(req, "p_prefill_result_ready")
 
                 # Its KV never landed: abort instead of sending it to decode.
                 if req.discard_output_reason is not None:
@@ -1321,6 +1327,7 @@ class SchedulerDisaggregationPrefillMixin:
                 req.disagg_kv_sender.clear()
                 done_reqs.append(req)
                 req.time_stats.set_prefill_kv_transfer_finish_time()
+                log_pd_timing(req, "p_transfer_success_observed")
             elif poll == KVPoll.Failed:
                 self.handle_inflight_transfer_failure(req)
                 done_reqs.append(req)
@@ -1616,6 +1623,8 @@ class SchedulerDisaggregationPrefillMixin:
                 digest = computer.compute(page_indices_gpu, state_indices)
                 signature = self.disagg_prefill_bootstrap_queue.kv_checksum_signature
             self.disagg_metadata_buffers.set_kv_checksum(req, digest, signature)
+        if last_chunk:
+            log_pd_timing(req, "p_last_chunk_submit")
         self._send_kv_chunk(req, last_chunk=last_chunk, end_idx=end_idx)
 
     def _send_kv_chunk(
