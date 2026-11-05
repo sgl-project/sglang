@@ -19,9 +19,9 @@ for name in (
     "torch_npu.contrib",
     "sgl_kernel_npu",
     "sgl_kernel_npu.attention",
-    "sgl_kernel_npu.attention.flash_mla",
-    "sgl_kernel_npu.attention.paged_mtp_attention",
     "sgl_kernel_npu.attention.sinks_attention",
+    "sgl_kernel_npu.operators",
+    "sgl_kernel_npu.operators.attention",
     "sglang.srt.speculative",
     "sglang.srt.speculative.decoupled_spec_io",
     "sglang.srt.speculative.spec_info",
@@ -381,17 +381,19 @@ def test_cpu_length_gate_respects_backend_capability_and_explicit_override(
             kwargs["device"] = "cpu"
         return original_tensor(*args, **kwargs)
 
-    kernel_module = SimpleNamespace(flash_mla=Mock(), flash_mla_metadata=Mock())
-    paged_mtp_module = SimpleNamespace(paged_mtp_attention_decode=Mock())
+    # Expose only the selected kernel's exports to check each conditional import.
+    kernel_module = SimpleNamespace()
+    if uses_flash_mla:
+        kernel_module.flash_mla = Mock()
+        kernel_module.flash_mla_metadata = Mock()
+    if uses_paged_mtp:
+        kernel_module.paged_mtp_attention_decode = Mock()
     with (
         patch.dict(
             sys.modules,
             {
-                "sgl_kernel_npu.attention.flash_mla": (
-                    kernel_module if uses_flash_mla else None
-                ),
-                "sgl_kernel_npu.attention.paged_mtp_attention": (
-                    paged_mtp_module if uses_paged_mtp else None
+                "sgl_kernel_npu.operators.attention": (
+                    kernel_module if uses_flash_mla or uses_paged_mtp else None
                 ),
             },
         ),
@@ -455,8 +457,7 @@ def test_cpu_length_gate_respects_backend_capability_and_explicit_override(
         assert obj.flash_mla_metadata is kernel_module.flash_mla_metadata
     if uses_paged_mtp:
         assert (
-            obj.paged_mtp_attention_decode
-            is paged_mtp_module.paged_mtp_attention_decode
+            obj.paged_mtp_attention_decode is kernel_module.paged_mtp_attention_decode
         )
 
 

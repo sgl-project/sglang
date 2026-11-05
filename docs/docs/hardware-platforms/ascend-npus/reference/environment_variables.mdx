@@ -58,9 +58,10 @@ This document provides a list of commonly used environment variables and aims to
 ### Kimi-K3 speculative attention
 
 Use these switches to optimize DSPARK target verification and draft attention on Ascend NPUs.
-Install a version of `sgl-kernel-npu` that provides `sgl_kernel_npu.attention.flash_mla` and
-`sgl_kernel_npu.attention.paged_mtp_attention` for your NPU. Set the variables in the server
-environment on every rank before launching with `--speculative-algorithm DSPARK`:
+Install a version of `sgl-kernel-npu` that exports `flash_mla`, `flash_mla_metadata`, and
+`paged_mtp_attention_decode` from `sgl_kernel_npu.operators.attention` for your NPU.
+Set the variables in the server environment on every rank before launching with
+`--speculative-algorithm DSPARK`:
 
 ```bash
 export SGLANG_NPU_USE_FLASH_MLA=1

@@ -430,12 +430,12 @@ class AscendAttnBackend(AttentionBackend):
             and get_bool_env_var("SGLANG_NPU_USE_FLASH_MLA", "False")
         )
         if self.use_flash_mla:
-            from sgl_kernel_npu.attention.flash_mla import flash_mla, flash_mla_metadata
+            from sgl_kernel_npu.operators.attention import flash_mla, flash_mla_metadata
 
             self.flash_mla = flash_mla
             self.flash_mla_metadata = flash_mla_metadata
         if self.use_paged_mtp:
-            from sgl_kernel_npu.attention.paged_mtp_attention import (
+            from sgl_kernel_npu.operators.attention import (
                 paged_mtp_attention_decode,
             )
 
