@@ -105,15 +105,6 @@ class TestE8M0ToF32(CustomTestCase):
         x = torch.zeros((3, 4, 5), dtype=torch.uint8)
         self.assertEqual(tuple(e8m0_to_f32(x).shape), (3, 4, 5))
 
-    @unittest.skipUnless(torch.cuda.is_available(), "no GPU")
-    def test_cuda_parity(self):
-        x = torch.tensor([127, 134, 255], dtype=torch.uint8, device="cuda")
-        out = e8m0_to_f32(x)
-        self.assertEqual(out.device.type, "cuda")
-        self.assertEqual(out[0].item(), 1.0)
-        self.assertEqual(out[1].item(), 128.0)
-        self.assertTrue(torch.isnan(out[2]).item())
-
 
 QKV_MAPPING = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
 

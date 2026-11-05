@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import gc
 import threading
+import time
 from collections import deque
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import contextmanager
@@ -14,6 +16,7 @@ import torch
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.utils import _sample_to_uint8_frames
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
+from sglang.multimodal_gen.runtime.managers.request_gc import request_gc
 from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler, _DeferredOutput
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 
@@ -200,6 +203,58 @@ def test_generation_with_one_pending_finalize_still_overlaps():
             pending.set_result(None)
 
 
+def test_continuous_finalize_overlap_leaves_a_gc_window(monkeypatch):
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler._async_output_save = True
+    scheduler._inflight_finalizes = deque()
+    scheduler.server_args = SimpleNamespace(
+        pipeline_config=SimpleNamespace(
+            supports_sequential_multi_output_inference=lambda: False
+        )
+    )
+    entered, release, waiting = (threading.Event() for _ in range(3))
+
+    class ObservedFuture(Future):
+        def result(self, timeout=None):
+            waiting.set()
+            return super().result(timeout)
+
+    pending = ObservedFuture()
+    scheduler._inflight_finalizes.append(pending)
+
+    def save():
+        try:
+            with request_gc.defer():
+                entered.set()
+                assert release.wait(10)
+                assert not gc.isenabled()
+        finally:
+            pending.set_result(None)
+
+    def forward(*args, **kwargs):
+        assert pending.done()
+        assert gc.isenabled()
+        return OutputBatch()
+
+    scheduler.worker = SimpleNamespace(
+        is_sleeping=lambda: False,
+        execute_forward=forward,
+        take_deferred_finalize=lambda: None,
+    )
+    monkeypatch.setattr(request_gc, "MAX_DEFER_SECONDS", 0)
+    with ThreadPoolExecutor(2) as executor:
+        saving = executor.submit(save)
+        try:
+            assert entered.wait(10)
+            dispatch = executor.submit(scheduler._handle_generation, [_req()])
+            assert waiting.wait(10)
+            assert not dispatch.done()
+        finally:
+            release.set()
+            saving.result(timeout=10)
+        assert isinstance(dispatch.result(timeout=10), OutputBatch)
+
+
 def _finalize_scheduler(replies):
     scheduler = Scheduler.__new__(Scheduler)
     scheduler._async_output_save = True
@@ -258,3 +313,43 @@ def test_reply_send_holds_the_socket_lock():
 
     assert held == [True]
     assert not scheduler._socket_lock.locked()
+
+
+def test_idle_wait_leaves_the_socket_lock_to_a_pending_reply():
+    # The finalize thread replies under _socket_lock; a loop that waited holding
+    # it and re-took it right after starved that reply for up to a second.
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler._socket_lock = threading.Lock()
+    scheduler.receiver = object()
+    scheduler._poller = SimpleNamespace(poll=lambda timeout: time.sleep(timeout / 1e3))
+    got_lock = []
+
+    def reply():
+        time.sleep(0.05)  # land inside the loop's waits
+        got_lock.append(scheduler._socket_lock.acquire(blocking=False))
+        if got_lock[0]:
+            scheduler._socket_lock.release()
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        scheduler._inflight_finalizes = deque([executor.submit(reply)])
+        deadline = time.monotonic() + 10
+        while not scheduler._inflight_finalizes[0].done():
+            assert time.monotonic() < deadline
+            scheduler._wait_idle(1.0)
+
+    assert got_lock == [True]
+
+
+def test_idle_wait_without_pending_finalize_polls_the_socket():
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler._socket_lock = threading.Lock()
+    scheduler._inflight_finalizes = deque()
+    scheduler.receiver = object()
+    polls = []
+    scheduler._poller = SimpleNamespace(
+        poll=lambda timeout: polls.append((timeout, scheduler._socket_lock.locked()))
+    )
+
+    scheduler._wait_idle(0.25)
+
+    assert polls == [(250.0, True)]
