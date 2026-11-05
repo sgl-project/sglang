@@ -434,6 +434,15 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self.kv_args.state_data_ptrs, self.kv_args.state_data_lens
         ):
             add(ptrs, lens)
+        if (
+            envs.ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE.get()
+            and envs.SGLANG_MOONCAKE_ASCEND_REGISTER_ALLOCATION.get()
+        ):
+            from sglang.srt.disaggregation.mooncake.npu_registration import (
+                registration_regions,
+            )
+
+            regions = registration_regions(regions)
         return regions
 
     def register_buffer_to_engine(self):
