@@ -351,6 +351,23 @@ class CommitTest(CustomTestCase):
         self.assertEqual(float(buf[0, 10, 0]), 2.0)
         self.assertEqual(float(buf[1, 11, 0]), 15.0)
 
+    def test_move_swa_kv_gathers_before_overlapping_writes(self):
+        buf = torch.arange(6, dtype=torch.float32).reshape(1, 6, 1)
+        pool = SimpleNamespace(
+            layer_num=1,
+            translate_loc_from_full_to_swa=lambda loc: loc,
+            get_swa_buffer=lambda layer_id: buf[layer_id],
+        )
+        plan = SimpleNamespace(
+            source_rows=torch.tensor([[1], [2]]),
+            dest_positions=torch.tensor([[2], [3]]),
+            dest_slots=torch.tensor([[2], [3]]),
+            commit_lens=torch.tensor([2]),
+            new_seq_lens=torch.tensor([7]),
+        )
+        tree_ops.move_swa_kv(pool, plan)
+        self.assertEqual(buf[0, :4, 0].tolist(), [0.0, 1.0, 1.0, 2.0])
+
 
 class NoFallbackTest(CustomTestCase):
     def test_compress_nodes_raises_runtime_error_without_sgl_kernel_npu(self):

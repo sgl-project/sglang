@@ -91,6 +91,15 @@ __all__ = [
 
 
 @dataclass
+class SwaMovePlan:
+    """Cached SWA row mapping and per-layer gather scratch."""
+
+    source: torch.Tensor
+    destination: torch.Tensor
+    scratch: dict[int, torch.Tensor] = field(default_factory=dict)
+
+
+@dataclass
 class NodePlan:
     """Per-verify-step tree geometry shared by compressor, indexer and attention.
 
@@ -119,6 +128,7 @@ class NodePlan:
     indexed_table_cache: dict[
         tuple, tuple[torch.Tensor | None, torch.Tensor | None]
     ] = field(default_factory=dict)
+    swa_move_plan: SwaMovePlan | None = None
     indexer_lengths_cache: tuple[torch.Tensor, torch.Tensor] | None = None
     max_kv_cache: int | None = None
     indexer_metadata_cache: dict[
@@ -1215,6 +1225,21 @@ def commit_nodes(prepared) -> None:
 
 
 
+def _build_swa_move_plan(plan: NodePlan, pool) -> SwaMovePlan:
+    cached = getattr(plan, "swa_move_plan", None)
+    if cached is not None:
+        return cached
+    mask = plan.source_rows >= 0
+    source = plan.source_rows[mask].to(torch.int64)
+    dest = plan.dest_slots[mask].to(torch.int64)
+    src_swa = pool.translate_loc_from_full_to_swa(source)
+    dst_swa = pool.translate_loc_from_full_to_swa(dest)
+    valid = (src_swa >= 0) & (dst_swa >= 0)
+    cached = SwaMovePlan(src_swa[valid], dst_swa[valid])
+    plan.swa_move_plan = cached
+    return cached
+
+
 def move_swa_kv(pool, plan) -> None:
     """Move accepted full/SWA KV rows to contiguous history slots.
 
@@ -1222,15 +1247,24 @@ def move_swa_kv(pool, plan) -> None:
     whose recent window lives in the same SWA buffer). Compressed KV is committed
     separately by the node page kernels.
     """
-    mask = plan.source_rows >= 0
-    source = plan.source_rows[mask].to(torch.int64)
-    dest = plan.dest_slots[mask].to(torch.int64)
-    src_swa = pool.translate_loc_from_full_to_swa(source)
-    dst_swa = pool.translate_loc_from_full_to_swa(dest)
-    valid = (src_swa >= 0) & (dst_swa >= 0)
-    src_swa = src_swa[valid]
-    dst_swa = dst_swa[valid]
+    move = _build_swa_move_plan(plan, pool)
+    if move.source.numel() == 0:
+        return
     for layer_id in range(int(pool.layer_num)):
         buffer = pool.get_swa_buffer(layer_id)
         flat = buffer.flatten(0, 1)
-        flat[dst_swa] = flat[src_swa]
+        scratch = move.scratch.get(layer_id)
+        scratch_shape = (move.source.numel(), *flat.shape[1:])
+        if (
+            scratch is None
+            or scratch.shape != scratch_shape
+            or scratch.dtype != flat.dtype
+            or scratch.device != flat.device
+        ):
+            scratch = torch.empty(
+                scratch_shape, dtype=flat.dtype, device=flat.device
+            )
+            move.scratch[layer_id] = scratch
+        # Gather before writing so src/dst overlap cannot corrupt a source row.
+        torch.index_select(flat, 0, move.source, out=scratch)
+        flat.index_copy_(0, move.destination, scratch)
