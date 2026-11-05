@@ -443,9 +443,21 @@ def discard_kv_cache_backup(req: Req, tree_cache: BasePrefixCache) -> None:
     req.kv.retraction_backup = None
 
 
-def release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool):
+def release_kv_cache(
+    req: Req,
+    tree_cache: BasePrefixCache,
+    *,
+    checkpoint: bool,
+    keep_req_pool_row: bool = False,
+):
     """Give the request's kv row back; with ``checkpoint`` the tree first keeps
-    what it can key."""
+    what it can key.
+
+    ``keep_req_pool_row`` serves HiSparse state-preserving retraction: the
+    logical KV slots are released normally, but the req_to_token row stays
+    allocated to the request (its retained host-pool row is keyed by it), so
+    the row must not return to the free list.
+    """
     assert (not req.kv.holds_kv) == req.kv.is_kv_released
     # A mamba-capable cache may alloc mamba state before alloc KV cache
     if not req.kv.holds_kv:
@@ -483,6 +495,12 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool)
     )
     tree_cache.on_release(req, checkpointed=checkpoint)
 
+    if keep_req_pool_row:
+        # Row stays owned by the request; only the logical slots were freed
+        # above. kv_allocated_len was reset by the free path's accounting, so
+        # mark_kv_released's invariant still holds for the row itself.
+        req.kv.mark_kv_released()
+        return
     kv_storage_of(
         tree_cache.req_to_token_pool,
         tree_cache.token_to_kv_pool_allocator,

@@ -413,10 +413,14 @@ class ReqKvInfo:
         """Prefill-aware SWA: the window never evicts [0, extend_end)."""
         self.swa_evict_floor = extend_end
 
-    def reset_for_retract(self) -> None:
+    def reset_for_retract(self, *, allow_held_row: bool = False) -> None:
         """A retracted request, its row already released, starts over: the tree
-        prefix, the committed length and the mamba state are reset."""
-        assert not self.holds_kv, "expect it is already released"
+        prefix, the committed length and the mamba state are reset.
+
+        ``allow_held_row`` covers HiSparse state-preserving retraction, which
+        intentionally keeps the req_to_token row (the retained host-pool row
+        is keyed by it) while only the logical slots were released."""
+        assert allow_held_row or not self.holds_kv, "expect it is already released"
         self.clear_tree_prefix()
         self.mamba_pool_idx = None
         self.mamba_ping_pong_track_buffer = None
@@ -857,6 +861,17 @@ class Req(ReqDllmMixin):
 
         # For hisparse
         self.hisparse_staging = False
+        # HiSparse state-preserving retraction: the request was retracted with
+        # its host-pool row kept; resume must re-admit without a prefill
+        # retransfer. See HiSparseCoordinator.retract_req_state_preserving.
+        self.hisparse_retraction_pending = False
+        # Indexer-K CPU sidecar captured at state-preserving retraction time
+        # (DSV4: the indexer K lives in device logical-slot space, not in the
+        # HiSparse host pool). None unless a backup exists.
+        self.hisparse_indexer_backup = None
+        # SWA-window CPU sidecar (same reason; only the live window is kept).
+        self.hisparse_swa_backup = None
+        self.hisparse_swa_backup_full_len = 0
 
         # Snapshot of the scheduler prefill-token counter taken at waiting_queue entry; used by HRRN aging.
         self.arrival_processed_tokens: int = 0
@@ -1519,7 +1534,13 @@ class Req(ReqDllmMixin):
         self.temp_input_token_ids_logprobs_idx = None
         self.mamba_branching_seqlen = None
         self.already_computed = 0
-        self.kv.reset_for_retract()
+        # HiSparse state-preserving retraction keeps the req_to_token row
+        # (the retained host-pool row is keyed by it); only the logical
+        # slots were released, so holds_kv stays true and the assert inside
+        # reset_for_retract must not fire.
+        self.kv.reset_for_retract(
+            allow_held_row=getattr(self, "hisparse_retraction_pending", False)
+        )
         self.prefill_weight_versions = None
         self.extend_batch_idx = 0
         self.decode_batch_idx = 0
@@ -1806,7 +1827,18 @@ def release_req(
 ) -> bool:
     """Returns whether the request can be resumed."""
     if hisparse_coordinator is not None and not req.finished():
-        hisparse_coordinator.retract_req(req)
+        if (
+            get_disagg().disaggregation_mode == "decode"
+            and offload_kv
+            and not getattr(req, "hisparse_retraction_pending", False)
+        ):
+            # HiSparse state-preserving retraction: the host pool already
+            # holds every committed token, so keep the req_to_host_pool row,
+            # free only the device side, and skip the cpu_tensor backup
+            # (which would raise NotImplementedError on HiSparse pools).
+            hisparse_coordinator.retract_req_state_preserving(req)
+        else:
+            hisparse_coordinator.retract_req(req)
 
     # In decode disaggregation the retracted KV is offloaded to host so it can be
     # restored later without recompute (see resume_retracted_reqs/load_kv_cache).
@@ -1815,7 +1847,7 @@ def release_req(
     # The config bag reflects role flips; server_args keeps the launch role.
     if get_disagg().disaggregation_mode != "decode":
         resumable = req.resumable_by_reprefill
-    elif offload_kv:
+    elif offload_kv and not getattr(req, "hisparse_retraction_pending", False):
         resumable = backup_kv_cache(
             req,
             tree_cache,
@@ -1823,10 +1855,19 @@ def release_req(
             token_to_kv_pool_allocator,
             get_disagg().disaggregation_decode_retraction_backup,
         )
+    elif offload_kv:
+        # HiSparse state-preserving retraction: the retained host-pool row
+        # IS the backup, so there is nothing to copy out.
+        resumable = True
     else:
         resumable = req.resumable_by_rebootstrap
     # TODO (csy): for preempted requests, we may want to insert into the tree
-    release_kv_cache(req, tree_cache, checkpoint=False)
+    release_kv_cache(
+        req,
+        tree_cache,
+        checkpoint=False,
+        keep_req_pool_row=getattr(req, "hisparse_retraction_pending", False),
+    )
     # NOTE(lsyin): we should use the newly evictable memory instantly.
     num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
     evict_from_tree_cache(tree_cache, num_tokens)
