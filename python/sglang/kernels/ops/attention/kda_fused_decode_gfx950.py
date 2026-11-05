@@ -14,6 +14,7 @@ import os
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.selector import get_kernel
 from sglang.kernels.spec import KernelBackend
 from sglang.srt.utils import is_hip
@@ -31,8 +32,8 @@ def enabled() -> bool:
 def available(device: torch.device | None = None) -> bool:
     if not is_hip() or not enabled() or not torch.cuda.is_available():
         return False
-    arch = torch.cuda.get_device_properties(device).gcnArchName
-    return arch.split(":", 1)[0] == "gfx950"
+    hip = current_arch().hip
+    return hip is not None and hip.gcn_arch == "gfx950"
 
 
 def warmup(**_: object) -> None:

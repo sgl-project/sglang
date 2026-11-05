@@ -8,10 +8,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sglang.kernels.ops.lora.moe.activation import ActivationFn
 from sglang.srt.lora.moe.base_gemm_provider import select_provider_cls
 from sglang.srt.lora.moe.plan import (
     ActFamily,
-    ActivationFn,
     ActSpec,
     AFamily,
     ASpec,

@@ -13,6 +13,7 @@ import tempfile
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils.hipcc import (
     HipKernel,
     check_hip,
@@ -55,8 +56,8 @@ def smallm_fp8_gemm_enabled() -> bool:
         return False
     if _mod is None:
         _mod = False
-        arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
-        if arch == "gfx950" and hip_version() >= (7, 2, 0):
+        hip = current_arch().hip
+        if hip is not None and hip.gcn_arch == "gfx950" and hip_version() >= (7, 2, 0):
             co = os.path.join(tempfile.mkdtemp(prefix="sglang_smallm_fp8_"), "k.co")
             cmd = [
                 hipcc_path(),

@@ -32,7 +32,7 @@ from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2MLP, Qwen2Model
 from sglang.srt.utils import add_prefix
-from sglang.srt.utils.hf_transformers_utils import get_rope_config
+from sglang.srt.utils.hf_transformers import get_rope_config
 
 
 class DynamicShortConvolutionKernelGenerator(nn.Module):

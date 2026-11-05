@@ -9,12 +9,12 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from sglang.kernels.ops.lora.moe.activation import ActivationFn
 from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.lora.moe.base_gemm_provider import select_provider_cls
 from sglang.srt.lora.moe.plan import (
     ActFamily,
-    ActivationFn,
     FinalizeFamily,
     MoePlan,
     SelectedPlan,

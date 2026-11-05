@@ -23,6 +23,7 @@ from .scoring import (
     get_deep_gemm_prefill_data,
     prefill_requests,
     select_decode,
+    sharded_dense_prefill_topk,
     write_prefill,
 )
 from .types import (
@@ -71,7 +72,11 @@ class FullTopKIndexer:
         kv = self.token_to_kv_pool.get_low_ratio_index_k_fp4(
             inputs.layer_id, data.k_slots
         )
-        dense_prefill_topk(data, kv, out=inputs.out_raw_indices[: data.num_rows])
+        out = inputs.out_raw_indices[: data.num_rows]
+        if inputs.row_shard is None:
+            dense_prefill_topk(data, kv, out=out)
+        else:
+            sharded_dense_prefill_topk(data, kv, out=out, shard=inputs.row_shard)
         data.write_page_indices(inputs)
 
     def _torch_prefill(self, inputs: PrefillInputs) -> None:

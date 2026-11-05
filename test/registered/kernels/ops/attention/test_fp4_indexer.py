@@ -627,6 +627,31 @@ def test_hopper_indexer_backends_replay(ratio):
                 assert (out.raw_indices[batch] == -1).all().item()
 
 
+@pytest.mark.parametrize(
+    "bs,n,bpp",
+    [(1024, 2049, 4), (1024, 2049, 2), (3, 17, 2), (0, 10, 4), (5, 9, 3)],
+)
+def test_expand_index_page_table_matches_cpu(bs, n, bpp):
+    """The GPU expansion is bitwise the torch expression the CPU path runs; bpp 3
+    stays on torch."""
+    from sglang.srt.layers.attention.dsv4.metadata import expand_index_page_table
+
+    def expand(t):
+        return expand_index_page_table(
+            t, full_page_size=64 * bpp, compress_ratio=1, index_page_size=64
+        )
+
+    torch.manual_seed(bs + n + bpp)
+    t = torch.randint(0, 1 << 20, (2 * bs, n), device=get_device(), dtype=torch.int32)
+    if bs and n >= 8:
+        t[:, -3:] = -1
+        t[0, :4] = t.new_tensor([2**31 - 1, 2**30, 2**29 + 7, -(2**31)])
+    for table in (t[:bs], t[::2]):
+        out = expand(table)
+        assert out.dtype == torch.int32
+        assert torch.equal(out.cpu(), expand(table.cpu()))
+
+
 @pytest.mark.parametrize("rows", [0, 1, 32, 129])
 @pytest.mark.parametrize("topk", [0, 1, 65, 512])
 @pytest.mark.parametrize("write_raw", [False, True])

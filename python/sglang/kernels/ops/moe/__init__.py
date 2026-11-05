@@ -61,14 +61,6 @@ register_kernel(
         capabilities=_HIP,
     )
 )
-register_kernel(
-    KernelSpec(
-        op="moe.topk_softmax",
-        backend=KernelBackend.JIT,
-        target="sglang.kernels.ops.moe.moe_topk_softmax:topk_softmax",
-        capabilities=CUDA_ONLY,
-    )
-)
 
 
 register_kernel(
@@ -363,6 +355,15 @@ register_kernel(
         op="moe.muse_spark_post_expert_finalize",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.moe.muse_spark_post_expert_finalize_triton:fused_post_expert_norm_weighted_sum",
+        capabilities=CUDA_ONLY,
+    )
+)
+
+register_kernel(
+    KernelSpec(
+        op="moe.bailing_moe_biased_grouped_topk",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.moe.bailing_moe_topk:bailing_moe_biased_grouped_topk",
         capabilities=CUDA_ONLY,
     )
 )
