@@ -40,6 +40,8 @@ def _install_comfy_stubs() -> None:
     comfy_api.input = comfy_api_input
     sys.modules.setdefault("comfy_api", comfy_api)
     sys.modules.setdefault("comfy_api.input", comfy_api_input)
+    # Fake mp4s cannot be probed: force the SGLDVideoInput fallback.
+    sys.modules["comfy_api.input_impl"] = None
 
     comfy = types.ModuleType("comfy")
     comfy.model_detection = types.ModuleType("comfy.model_detection")
@@ -54,6 +56,12 @@ def _install_comfy_stubs() -> None:
     ):
         setattr(comfy_utils, name, lambda *a, **k: None)
     comfy.utils = comfy_utils
+
+    comfy_utils.ProgressBar = mock.Mock
+    comfy.model_management.throw_exception_if_processing_interrupted = lambda: None
+    comfy.model_management.InterruptProcessingException = type(
+        "InterruptProcessingException", (Exception,), {}
+    )
 
     comfy_model_patcher = types.ModuleType("comfy.model_patcher")
 
@@ -117,14 +125,38 @@ RESOLVED_SIZE = "1344x768"
 
 
 class _Response:
-    def __init__(self, payload):
+    def __init__(self, payload, status_code=200):
         self._payload = payload
+        self.status_code = status_code
 
     def raise_for_status(self):
-        pass
+        if self.status_code >= 400:
+            raise SERVER_API.requests.exceptions.HTTPError(f"{self.status_code}")
 
     def json(self):
         return self._payload
+
+    def iter_content(self, chunk_size=None):
+        yield b"fake-mp4-bytes"
+
+
+_TMP_FILES = []
+
+
+def _tmp_file(suffix):
+    """A temp file path that the autouse fixture below deletes afterwards."""
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as fh:
+        _TMP_FILES.append(fh.name)
+        return fh.name
+
+
+@pytest.fixture(autouse=True)
+def _remove_tmp_files():
+    yield
+    while _TMP_FILES:
+        path = _TMP_FILES.pop()
+        if os.path.exists(path):
+            os.remove(path)
 
 
 _TMP_FILES = []
@@ -338,3 +370,223 @@ def test_payload_validates_against_the_server_request_model(task):
     assert request.task == task
     assert request.target["short_edge"] == payload["target"]["short_edge"]
     assert len(request.conditions) == len(payload["conditions"])
+
+
+# --- server mode against a remote server ------------------------------------
+
+
+def _client():
+    return SGLDiffusionServerAPI(base_url="http://127.0.0.1:1234")
+
+
+def test_image_timeout_and_lora_strength_reach_the_server():
+    client = SGLDiffusionServerAPI(base_url="http://127.0.0.1:1234", image_timeout=900)
+    posts = []
+
+    def fake_post(url, json=None, timeout=None, **kwargs):
+        posts.append((json, timeout))
+        return _Response({"data": [{"b64_json": "x"}]})
+
+    with mock.patch(f"{PKG}.core.server_api.requests.post", side_effect=fake_post):
+        client.generate_image(prompt="a cat")
+        NODES.SGLDiffusionServerSetLora().set_lora(
+            sgld_client=client, lora_name="style.safetensors", strength=0.5
+        )
+    assert posts[0][1] == 900
+    assert posts[1][0]["strength"] == 0.5
+
+
+def test_video_input_fallback_fails_loudly():
+    video = NODES.convert_video_to_comfy_video("/tmp/out.mp4", height=720, width=1280)
+    assert isinstance(video, sys.modules[f"{PKG}.utils"].SGLDVideoInput)
+    with pytest.raises(NotImplementedError):
+        video.get_components()
+    with pytest.raises(NotImplementedError):
+        video.save_to("/tmp/converted.webm", format="webm")
+
+
+def test_video_node_uses_resolved_size_and_comfy_progress_and_cancel():
+    client = _client()
+    captured = {}
+
+    def fake_generate_video(**kwargs):
+        captured.update(kwargs)
+        return {"file_path": "/tmp/x.mp4", "size": "1280x704"}
+
+    with (
+        mock.patch.object(client, "generate_video", fake_generate_video),
+        mock.patch.object(NODES.comfy.utils, "ProgressBar") as pbar,
+    ):
+        video, _ = NODES.SGLDiffusionGenerateVideo().generate_video(
+            sgld_client=client, positive_prompt="a cat", width=1280, height=720
+        )
+    assert video.get_dimensions() == (1280, 704)
+    mm = NODES.comfy.model_management
+    assert captured["check_interrupt"] is mm.throw_exception_if_processing_interrupted
+    assert captured["progress_callback"] is pbar.return_value.update_absolute
+
+
+def _capture_video_request(**kwargs):
+    seen = {}
+
+    def fake_post(url, json=None, files=None, data=None, **kw):
+        seen["files"] = files and {
+            key: (name, fh.read(), content_type)
+            for key, (name, fh, content_type) in files.items()
+        }
+        seen["data"], seen["json"] = data, json
+        return _Response({"id": "job-1"})
+
+    out_path = _tmp_file(".mp4")
+    status = {"id": "job-1", "status": "completed", "file_path": out_path}
+    with (
+        mock.patch(f"{PKG}.core.server_api.requests.post", side_effect=fake_post),
+        mock.patch(
+            f"{PKG}.core.server_api.requests.get", return_value=_Response(status)
+        ),
+    ):
+        _client().generate_video(prompt="a cat", **kwargs)
+    return seen
+
+
+def test_generate_video_uploads_local_files_with_json_encoded_fields(tmp_path):
+    clip, image = tmp_path / "clip.mp4", tmp_path / "ref.png"
+    clip.write_bytes(b"fake-mp4")
+    image.write_bytes(b"fake-png")
+    seen = _capture_video_request(
+        video_path=str(clip),
+        input_reference=str(image),
+        extra_fields={"target": {"type": "image"}, "flag": False},
+    )
+    assert seen["json"] is None
+    assert seen["files"]["video_reference"] == ("clip.mp4", b"fake-mp4", "video/mp4")
+    assert seen["files"]["input_reference"][1] == b"fake-png"
+    assert "video_path" not in seen["data"] and "input_reference" not in seen["data"]
+    # the server json-decodes form values, so Python repr would break them
+    assert seen["data"]["target"] == '{"type": "image"}'
+    assert seen["data"]["flag"] == "false"
+
+
+@pytest.mark.parametrize(
+    "source", ["https://example.com/clip.mp4", "/srv/sglang/inputs/clip.mp4"]
+)
+def test_generate_video_sends_remote_source_video_as_a_string(source):
+    seen = _capture_video_request(video_path=source)
+    assert seen["files"] is None
+    assert seen["json"]["video_path"] == source
+
+
+def _run_completed_job(job, tmp_path, content=None):
+    """Poll a completed job once; /content answers with ``content``."""
+    gets = []
+
+    def fake_get(url, **kwargs):
+        gets.append(url)
+        if url.endswith("/content"):
+            return content or _Response({})
+        assert len(gets) == 1, "kept polling a completed job"
+        return _Response(job)
+
+    with (
+        mock.patch.object(SERVER_API.requests, "get", fake_get),
+        mock.patch.object(
+            SERVER_API.requests, "post", return_value=_Response({"id": "job-1"})
+        ),
+    ):
+        result = _client().generate_video(prompt="a cat", output_path=str(tmp_path))
+    return result, gets
+
+
+def test_generate_video_downloads_a_result_the_server_kept_elsewhere(tmp_path):
+    job = {"id": "job-1", "status": "completed", "file_path": "/srv/out/job-1.sh"}
+    result, gets = _run_completed_job(job, tmp_path)
+    # the extension is whitelisted and the file lands in output_path
+    assert result["file_path"] == os.path.join(os.path.realpath(tmp_path), "job-1.mp4")
+    assert open(result["file_path"], "rb").read() == b"fake-mp4-bytes"
+    assert gets[-1].endswith("/videos/job-1/content")
+
+
+def test_generate_video_returns_a_cloud_url_without_downloading(tmp_path):
+    url = "https://bucket.example/job-1.mp4"
+    job = {"id": "job-1", "status": "completed", "url": url, "file_path": None}
+    result, gets = _run_completed_job(job, tmp_path)
+    assert result["url"] == url and len(gets) == 1
+
+
+def test_failed_result_download_fails_fast_and_leaves_no_file(tmp_path):
+    class _Broken(_Response):
+        def iter_content(self, chunk_size=None):
+            yield b"partial"
+            raise SERVER_API.requests.exceptions.ConnectionError("dropped")
+
+    job = {"id": "job-1", "status": "completed", "file_path": "/srv/out/job-1.mp4"}
+    with pytest.raises(RuntimeError, match="dropped"):
+        _run_completed_job(job, tmp_path, content=_Broken({}))
+    assert os.listdir(tmp_path) == []
+
+
+@pytest.mark.parametrize("video_id", ["../escape", "job.1"])
+def test_localize_video_result_rejects_unsafe_video_id(tmp_path, video_id):
+    status = {"status": "completed", "file_path": "/srv/out/x.mp4"}
+    with mock.patch(f"{PKG}.core.server_api.requests.get") as get:
+        with pytest.raises(RuntimeError, match="unsafe id"):
+            _client()._localize_video_result(status, video_id, str(tmp_path))
+    get.assert_not_called()
+
+
+def test_generate_video_reports_progress_and_stops_when_interrupted():
+    polls = iter(
+        [{"status": "queued", "progress": 0}, {"status": "in_progress", "progress": 40}]
+        + [{"status": "in_progress", "progress": 40}] * 50
+    )
+    seen, checks = [], []
+
+    def check_interrupt():
+        checks.append(1)
+        if len(seen) == 2:
+            raise KeyboardInterrupt
+
+    with (
+        mock.patch.object(
+            SERVER_API.requests, "get", lambda url, **kw: _Response(next(polls))
+        ),
+        mock.patch.object(
+            SERVER_API.requests, "post", return_value=_Response({"id": "vid1"})
+        ),
+        mock.patch.object(SERVER_API.time, "sleep"),
+    ):
+        with pytest.raises(KeyboardInterrupt):
+            _client().generate_video(
+                prompt="a cat",
+                progress_callback=seen.append,
+                check_interrupt=check_interrupt,
+            )
+    assert seen == [0, 40]
+
+
+@pytest.mark.parametrize(
+    "value, base_url, expected",
+    [
+        ("/data/clip.mp4", "http://127.0.0.1:3000/v1", "file:///data/clip.mp4"),
+        ("/data/clip.mp4", "http://remote-host.example:3000/v1", ValueError),
+        ("file:///srv/clip.mp4", "http://remote-host.example:3000/v1", None),
+    ],
+)
+def test_h3_local_reference_media_needs_a_local_server(value, base_url, expected):
+    resolve = SGLDiffusionGenerateH3._remote_material_uri
+    if expected is ValueError:
+        with pytest.raises(ValueError, match="no way to read or upload"):
+            resolve(value, "reference_video", base_url)
+    else:
+        assert resolve(value, "reference_video", base_url) == (expected or value)
+
+
+def test_is_local_server_accepts_own_hostname_and_loopback():
+    is_local = SGLDiffusionGenerateH3._is_local_server
+    assert is_local(f"http://{NODES.socket.gethostname()}:3000/v1")
+    assert is_local("http://0.0.0.0:3000/v1")
+    assert is_local("http://[::1]:3000/v1")
+    with mock.patch.object(
+        NODES.socket, "getaddrinfo", return_value=[(0, 0, 0, "", ("10.1.2.3", 0))]
+    ):
+        assert not is_local("http://gpu-box:3000/v1")

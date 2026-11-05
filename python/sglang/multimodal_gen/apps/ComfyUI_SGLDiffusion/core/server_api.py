@@ -35,9 +35,6 @@ class SGLDiffusionServerAPI:
             base_url: Base URL of the SGLang Diffusion server (e.g., "http://localhost:30010/v1")
             api_key: API key for authentication (default: "sk-proj-1234567890")
             image_timeout: Seconds to wait for an image generate/edit request
-                before timing out. A large job (big size, or a first request
-                that triggers torch.compile/warmup) can need more than the
-                previous hardcoded 300s.
         """
         self.image_timeout = image_timeout
         # Ensure base_url doesn't end with /v1 if it's already there
@@ -289,12 +286,8 @@ class SGLDiffusionServerAPI:
             else:
                 size = "720x1280"
 
-        # Prepare request fields shared by the JSON and multipart paths.
-        # `output_path` is deliberately never sent: it used to be the
-        # ComfyUI node's own temp directory, which only exists on this
-        # machine and breaks as soon as the server runs elsewhere. Letting
-        # the server pick its own output location and fetching the result
-        # (see below) works for both the local and remote case.
+        # output_path is not sent: it is a local dir a remote server cannot use;
+        # the result is fetched back instead (_localize_video_result).
         fields: Dict[str, Any] = {
             "prompt": prompt,
             "size": size,
@@ -322,10 +315,7 @@ class SGLDiffusionServerAPI:
         if extra_fields:
             fields.update(extra_fields)
 
-        # Upload local files instead of sending their paths: a server on
-        # another machine cannot read this machine's filesystem (the images
-        # endpoint already does this for image_path). The server takes an
-        # uploaded source clip as `video_reference`.
+        # Upload local files: a remote server cannot read this machine's paths.
         string_fields: Dict[str, Any] = {}
         uploads: Dict[str, str] = {}
         for form_key, json_key, path in (
@@ -341,8 +331,7 @@ class SGLDiffusionServerAPI:
 
         try:
             if uploads:
-                # JSON, not repr: the server json-decodes form values, so a
-                # nested dict or False must not arrive as Python's repr
+                # the server json-decodes form values
                 data = {
                     key: (
                         value if isinstance(value, (str, bytes)) else json.dumps(value)
@@ -402,8 +391,7 @@ class SGLDiffusionServerAPI:
                         progress_callback(int(status["progress"]))
 
                     if status.get("status") == "completed":
-                        # Localize outside this try, so a failed download
-                        # fails fast instead of being retried as a poll error.
+                        # download outside this try so a failure is not retried
                         break
                     elif status.get("status") == "failed":
                         error = status.get("error", {})
@@ -445,14 +433,9 @@ class SGLDiffusionServerAPI:
     def _localize_video_result(
         self, status: Dict[str, Any], video_id: str, output_path: Optional[str]
     ) -> Dict[str, Any]:
-        """Make sure ``file_path`` in a completed job points at a local file.
+        """Download the result via /videos/{id}/content when file_path is not local.
 
-        The server's own ``file_path`` is only readable when the server runs
-        on this machine. When it isn't (no such local file), download the
-        result through ``GET /videos/{id}/content`` instead of trusting a
-        path that belongs to a different filesystem. A job uploaded to cloud
-        storage has no file_path and a ``url`` instead; ``/content`` refuses
-        those, so it is returned as is and the node fetches the url.
+        Cloud jobs (url, no file_path) are returned as is; the node fetches the url.
         """
         file_path = status.get("file_path")
         if file_path and os.path.exists(file_path):
@@ -594,8 +577,7 @@ class SGLDiffusionServerAPI:
                 - "transformer": Apply only to the primary transformer (high noise for Wan2.2)
                 - "transformer_2": Apply only to transformer_2 (low noise for Wan2.2)
                 - "critic": Apply only to the critic model
-            strength: LoRA merge strength. The server defaults to 1.0 when
-                not given; values < 1.0 reduce the effect.
+            strength: LoRA merge strength (server default 1.0)
 
         Returns:
             Dictionary containing the API response with status and message
