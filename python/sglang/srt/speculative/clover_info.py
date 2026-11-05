@@ -2,36 +2,30 @@
 """Draft state and preview/verify metadata for Clover."""
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
 
 import torch
 
 from sglang.srt.mem_cache.kv_loc_plan import IdSpaceKind
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sglang.srt.speculative.clover_penalty import CloverPenaltyState
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 
-if TYPE_CHECKING:
-    from sglang.srt.speculative.clover_penalty import CloverPenaltyState
-
 
 @dataclass
 class CloverDraftInput(DFlashDraftInputV2):
-    penalty_state: "CloverPenaltyState | None" = field(
-        default=None, init=False, repr=False
+    penalty_state: CloverPenaltyState = field(
+        default_factory=CloverPenaltyState, repr=False
     )
 
     def prepare_for_decode(self, batch):
-        from sglang.srt.speculative.clover_penalty import (
-            get_clover_penalty_state,
-        )
-
-        self.penalty_state = None
         super().prepare_for_decode(batch)
-        orchestrator = batch.sampling_info.penalizer_orchestrator
-        self.penalty_state = get_clover_penalty_state(orchestrator)
-        self.penalty_state.sync_native(orchestrator)
+        self.penalty_state.sync_native(batch.sampling_info.penalizer_orchestrator)
+
+    def merge_batch(self, other):
+        super().merge_batch(other)
+        self.penalty_state.merge(other.penalty_state)
 
     def __post_init__(self):
         super().__post_init__()

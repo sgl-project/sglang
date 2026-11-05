@@ -14,9 +14,6 @@ from sglang.srt.speculative.clover_penalty import (
 from sglang.srt.speculative.clover_penalty import (
     apply_clover_penalties as _apply_clover_penalties,
 )
-from sglang.srt.speculative.clover_penalty import (
-    get_clover_penalty_state,
-)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -137,66 +134,72 @@ class TestCloverPenalties(CustomTestCase):
         self.assertIn("valid vocabulary ID", validate_clover_request(out_of_vocab))
 
     def test_native_history_increment_filter_merge_and_rebuild(self):
-        a = request(
-            [1, 1], frequency_penalty=0.7, presence_penalty=0.9, repetition_penalty=1.05
-        )
-        b = request(
-            [2], frequency_penalty=-0.3, presence_penalty=-0.2, repetition_penalty=0.8
-        )
-        batch = NativeBatch([a, b])
-        state = CloverPenaltyState()
+        from sglang.srt.speculative.clover_info import CloverDraftInput
+
+        class SuffixOnly(list):
+            consumed = 0
+
+            def __getitem__(self, key):
+                if isinstance(key, slice) and (key.start or 0) < self.consumed:
+                    raise AssertionError("replayed committed history")
+                return super().__getitem__(key)
+
+        def draft(req):
+            req.output_ids = SuffixOnly(req.output_ids)
+            batch = NativeBatch([req])
+            pending = torch.tensor([req.output_ids[-1]])
+            state = CloverDraftInput.from_tokens(
+                pending, torch.tensor([len(req.output_ids)])
+            )
+            state.penalty_state.sync_native(batch.orchestrator)
+            req.output_ids.consumed = len(req.output_ids)
+            return batch, state
+
+        a = request([1, 1], presence_penalty=0.5, repetition_penalty=1.25)
+        b = request([2, 2], frequency_penalty=0.25)
+        batch, current = draft(a)
+        other, incoming = draft(b)
+        batch.orchestrator.merge(other.orchestrator)
+        batch.reqs += other.reqs
+        current.merge_batch(incoming)
 
         def check():
-            buffers = state.sync_native(batch.orchestrator)
+            buffers = current.penalty_state.sync_native(batch.orchestrator)
             for row, req in enumerate(batch.reqs):
-                counts = torch.tensor(
-                    [req.output_ids.count(t) for t in range(8)], dtype=torch.float32
+                counts = torch.bincount(
+                    torch.tensor(req.output_ids, dtype=torch.long), minlength=8
                 )
                 sp = req.sampling_params
-                from sglang.srt.sampling import penaltylib
-
-                reference = NativeBatch([req])
-                native_frequency = reference.orchestrator.penalizers[
-                    penaltylib.BatchedFrequencyPenalizer
-                ]
-                for token in req.output_ids:
-                    native_frequency.cumulate_output_tokens(torch.tensor([token]))
                 expected = (
-                    native_frequency.cumulated_frequency_penalties[0],
+                    counts * sp.frequency_penalty,
                     (counts > 0).float() * sp.presence_penalty,
                     torch.where(counts > 0, sp.repetition_penalty, 1.0),
                 )
                 for buf, ref in zip(buffers, expected):
-                    torch.testing.assert_close(buf[row], ref, atol=0, rtol=0)
+                    if buf is not None:
+                        torch.testing.assert_close(buf[row], ref, atol=0, rtol=0)
             return buffers
 
-        original = check()
-        a.output_ids.extend([1, 3, 3])
-        updated = check()
-        self.assertTrue(all(x is y for x, y in zip(original, updated)))
-        check()  # Preview/verify must not count the same tokens twice.
-        batch.reqs = [b, a]
-        batch.orchestrator.filter(torch.tensor([1, 0]))
+        for req in (a, b):
+            req.output_ids.append(3)
+        self.assertTrue(all(buf is not None for buf in check()))
+        check()  # A second sync must not double-count.
+        batch.reqs = [b]
+        keep = torch.tensor([1])
+        batch.orchestrator.filter(keep)
+        current.filter_batch(keep)
+        b.output_ids.consumed = len(b.output_ids)
+        b.output_ids.append(2)
+        freq, presence, repetition = check()
+        self.assertIsNotNone(freq)
+        self.assertIsNone(presence)
+        self.assertIsNone(repetition)
+
+        b.output_ids = [5, 5]
         check()
-        other = NativeBatch(
-            [
-                request(
-                    [4, 4],
-                    frequency_penalty=0.2,
-                    presence_penalty=0.4,
-                    repetition_penalty=2,
-                )
-            ]
-        )
-        batch.orchestrator.merge(other.orchestrator)
-        batch.reqs += other.reqs
+        del b.output_ids[1:]
         check()
-        a.output_ids = [5]  # Retraction/replacement on unchanged storage.
-        check()
-        del b.output_ids[:]
-        check()
-        # Same requests, newly allocated native storage.
-        batch = NativeBatch(batch.reqs)
+        batch = NativeBatch(batch.reqs)  # Fresh storage needs the full history.
         check()
 
     def test_block_frequency_matches_native_token_updates(self):
@@ -260,7 +263,7 @@ class TestCloverPenalties(CustomTestCase):
                 batch = NativeBatch([req])
                 visible = torch.tensor([[1, 2]])
 
-                state = get_clover_penalty_state(batch.orchestrator)
+                state = CloverPenaltyState()
 
                 def apply(buffers):
                     logits = torch.zeros(1, 2, 8)

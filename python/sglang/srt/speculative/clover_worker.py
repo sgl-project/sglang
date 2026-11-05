@@ -260,7 +260,6 @@ class CloverWorker(BaseSpecWorker):
         if not isinstance(state, CloverDraftInput):
             raise RuntimeError("CLOVER decode requires pending tokens from prefill")
         penalty_state = state.penalty_state
-        state.penalty_state = None
         penalties = (
             batch.sampling_info.acc_additive_penalties,
             batch.sampling_info.acc_scaling_penalties,
@@ -299,8 +298,6 @@ class CloverWorker(BaseSpecWorker):
         )
         block[:, 0].copy_(state.bonus_tokens)
         draft_fb = self._preview_batch(batch, block, positions, cache_loc, plan)
-        if penalty_state is None:
-            raise RuntimeError("CLOVER decode requires prepared penalty state")
         candidates = self._draft(
             draft_fb,
             batch.reqs,
@@ -384,12 +381,14 @@ class CloverWorker(BaseSpecWorker):
         if on_publish is not None:
             on_publish(new_seq_lens)
         batch.forward_mode = ForwardMode.DECODE
+        next_draft_input = CloverDraftInput.from_tokens(bonus_tokens, new_seq_lens)
+        next_draft_input.penalty_state = penalty_state
         return GenerationBatchResult(
             logits_output=result.logits_output,
             next_token_ids=accept_tokens.reshape(-1),
             accept_lens=accept_lens,
             new_seq_lens=new_seq_lens,
-            next_draft_input=CloverDraftInput.from_tokens(bonus_tokens, new_seq_lens),
+            next_draft_input=next_draft_input,
             speculative_num_draft_tokens=width,
             can_run_cuda_graph=result.can_run_cuda_graph,
         )

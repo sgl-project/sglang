@@ -691,6 +691,8 @@ Select the rule with `--speculative-clover-accept-rule`:
 Neither rule is distribution-preserving stochastic speculative sampling. Draft generation uses argmax, while temperature, top-k, and top-p apply only to bonus-token sampling. Exact greedy AR equivalence additionally requires identical target-logit processing.
 </Warning>
 
+Clover requires `min_new_tokens=0` because its block sampler does not apply position-dependent EOS masking.
+
 Clover sets preferred sampling defaults of `presence_penalty=0.9` and `repetition_penalty=1.05`. It also enables `dllm_length_penalty=10` and `dllm_think_end_bias=10` through request `custom_params`. To disable all four, set `presence_penalty=0`, `repetition_penalty=1.0`, and request `custom_params` of `{"dllm_length_penalty": 0, "dllm_think_end_bias": 0}`. Explicit server or request preferences take precedence over these defaults.
 
 ### Requirements and limitations

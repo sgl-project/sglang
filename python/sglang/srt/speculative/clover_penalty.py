@@ -21,8 +21,12 @@ class CloverPenaltyState:
 
     def __init__(self):
         self._histories = {}
-        self._buffers = None
+        self._owner = None
         self._synced = {}
+
+    def merge(self, other):
+        self._synced.update(other._synced)
+        self._histories.update(other._histories)
 
     def retain(self, reqs):
         active = {id(req) for req in reqs}
@@ -50,7 +54,7 @@ class CloverPenaltyState:
         return seen
 
     def sync_native(self, orchestrator):
-        """Sync committed outputs; rebuild when native storage or row ownership changes."""
+        """Sync committed suffixes into the rows carried by native filter and merge."""
         from sglang.srt.sampling import penaltylib
 
         reqs = orchestrator.reqs()
@@ -69,25 +73,9 @@ class CloverPenaltyState:
             getattr(p, name) if p is not None and p.is_prepared() else None
             for p, (_, name, _) in zip(penalizers, specs)
         )
-        # Detect replaced buffers without keeping their storage alive.
-        layout = tuple(id(req) for req in reqs)
-        rebuild = (
-            self._buffers is None
-            or self._buffers[1] != layout
-            or any(
-                (old() if old is not None else None) is not new
-                for old, new in zip(self._buffers[0], buffers)
-            )
-        )
-        if rebuild:
+        if self._owner is not None and self._owner() is not orchestrator:
             self._synced.clear()
-            for buf, (_, _, default) in zip(buffers, specs):
-                if buf is not None:
-                    buf.fill_(default)
-        self._buffers = (
-            tuple(weakref.ref(buf) if buf is not None else None for buf in buffers),
-            layout,
-        )
+        self._owner = weakref.ref(orchestrator)
         if not any(buf is not None for buf in buffers):
             return buffers
         device = torch.device(orchestrator.device)
@@ -101,7 +89,7 @@ class CloverPenaltyState:
                 or previous[1] > len(output)
             )
             old_len = 0 if reset else previous[1]
-            if reset and not rebuild:
+            if reset:
                 for buf, (_, _, default) in zip(buffers, specs):
                     if buf is not None:
                         buf[row].fill_(default)
@@ -133,14 +121,6 @@ class CloverPenaltyState:
                     )
             self._synced[id(req)] = (output, len(output))
         return buffers
-
-
-def get_clover_penalty_state(orchestrator):
-    """Return the committed-history state owned by this native batch."""
-    state = getattr(orchestrator, "_clover_penalty_state", None)
-    if state is None:
-        state = orchestrator._clover_penalty_state = CloverPenaltyState()
-    return state
 
 
 def _apply_native_penalties(scores, additive, scaling):
