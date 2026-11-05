@@ -134,17 +134,24 @@ def cp_sequence_to_interleave_order(hidden_states, forward_batch, gathered_rows)
     if not is_interleave_extend(forward_batch):
         return hidden_states
     metadata = forward_batch.attn_cp_metadata
-    padded = hidden_states.new_zeros((gathered_rows, *hidden_states.shape[1:]))
     if metadata.gather_index is not None:
+        padded = hidden_states.new_zeros((gathered_rows, *hidden_states.shape[1:]))
         return padded.index_copy_(0, metadata.gather_index, hidden_states)
-    padded[: hidden_states.shape[0]] = hidden_states
+    # One strided copy: token i lands in rank i % size's block at row i // size;
+    # only the padding rows of the last token group are zeroed.
     size = get_parallel().attn_cp_size
-    return (
-        padded.reshape(-1, size, *hidden_states.shape[1:])
-        .transpose(0, 1)
-        .flatten(0, 1)
-        .contiguous()
+    tokens, row_shape = hidden_states.shape[0], hidden_states.shape[1:]
+    out = hidden_states.new_empty((gathered_rows, *row_shape))
+    blocks = out.view(size, gathered_rows // size, *row_shape)
+    groups = tokens // size
+    blocks[:, :groups].copy_(
+        hidden_states[: groups * size].view(groups, size, *row_shape).transpose(0, 1)
     )
+    if groups < blocks.shape[1]:
+        blocks[:, groups:].zero_()
+        tail = tokens - groups * size
+        blocks[:tail, groups].copy_(hidden_states[groups * size :])
+    return out
 
 
 class InterleaveCPStrategy(ContextParallelStrategy):
