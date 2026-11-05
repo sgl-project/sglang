@@ -26,7 +26,11 @@ from torch import nn
 
 from sglang.kernels.ops.attention import mla_q_cache_aiter_hip
 from sglang.srt.runtime_context import get_buffer
-from sglang.srt.utils.common import is_device_stream_capturing, print_warning_once
+from sglang.srt.utils.common import (
+    is_device_stream_capturing,
+    is_gfx1250_supported,
+    print_warning_once,
+)
 
 # With save_kv_cache=False, these backends read only the BF16 Q and the KV cache;
 # Triton target-verify runs its extend kernel, which also reads k.
@@ -37,7 +41,7 @@ _TARGET_VERIFY_BACKENDS = frozenset({"aiter"})
 @functools.cache
 def _triton_q_cache_op() -> Optional[Callable]:
     """AITER's no-RoPE Triton Q/cache kernel, or None where it cannot run."""
-    if torch.cuda.get_device_properties().gcnArchName.startswith("gfx1250"):
+    if is_gfx1250_supported():
         return None
     try:
         from aiter.ops.triton.fusions.fused_kv_cache import fused_qk_cat_and_cache_mla

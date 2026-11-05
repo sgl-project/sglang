@@ -6,6 +6,8 @@ import functools
 
 import torch
 
+from sglang.kernels.arch import current_arch
+
 # Kimi-K3 MLA widths (kv_lora_rank, qk_rope_head_dim); other widths are not covered.
 _KV_LORA_RANK = 512
 _PE_DIM = 64
@@ -25,23 +27,11 @@ def _op():
 
 
 @functools.cache
-def _is_gfx950() -> bool:
-    try:
-        from aiter.jit.utils.chip_info import get_gfx_runtime
-
-        return get_gfx_runtime() == "gfx950"
-    except (AssertionError, ImportError, KeyError, RuntimeError):
-        return False
-
-
-@functools.cache
 def available() -> bool:
-    return (
-        torch.version.hip is not None
-        and torch.cuda.is_available()
-        and _is_gfx950()
-        and _op() is not None
-    )
+    if torch.version.hip is None or not torch.cuda.is_available():
+        return False
+    hip = current_arch().hip
+    return hip is not None and hip.gcn_arch == "gfx950" and _op() is not None
 
 
 def covered(
