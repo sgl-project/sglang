@@ -2350,8 +2350,22 @@ def configure_hf_hub_logger():
 
 
 def suppress_noisy_warnings():
-    """Suppress known noisy warnings from third-party libraries."""
+    """Suppress known noisy third-party output: warnings, and the HF Hub and httpx loggers."""
     configure_hf_hub_logger()
+    filter_noisy_warnings()
+
+    # Suppress noisy third-party HTTP loggers.
+    # huggingface_hub uses httpx which logs every HTTP request at INFO level.
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
+def filter_noisy_warnings():
+    """Drop known noisy warnings from third-party libraries; logging is untouched.
+
+    pytest re-enables DeprecationWarning per test, so test/pytest.ini repeats
+    the DeprecationWarning entries below; keep the two in sync.
+    """
     warnings.filterwarnings(
         "ignore", category=UserWarning, message="The given NumPy array is not writable"
     )
@@ -2366,41 +2380,52 @@ def suppress_noisy_warnings():
         category=FutureWarning,
     )
 
-    # cutlass-dsl emits these inside `catch_warnings()+simplefilter("always")`,
-    # which bypasses filterwarnings; override showwarning to drop them too.
-    cutlass_dsl_noisy = {
+    # flashinfer and quack still import pre-4.8 cutlass-dsl paths. Matching only
+    # those packages keeps sglang's own uses of the old paths visible.
+    third_party = "flashinfer|quack"
+    # (category, message regex, emitting packages, or None for any)
+    noisy_warnings = [
         (
             DeprecationWarning,
-            "Using `struct.scalar` as pointer is deprecated.",
+            re.escape("Using `struct.scalar` as pointer is deprecated."),
+            None,
         ),
         (
             UserWarning,
-            "NamedBarrier wait also arrives on the barrier. "
-            "Routing call to NamedBarrier.arrive_and_wait().",
+            re.escape(
+                "NamedBarrier wait also arrives on the barrier. "
+                "Routing call to NamedBarrier.arrive_and_wait()."
+            ),
+            None,
         ),
-        (
-            DeprecationWarning,
-            "builtin type swigvarlink has no __module__ attribute",
-        ),
-    }
-    for cat, msg in cutlass_dsl_noisy:
-        warnings.filterwarnings("ignore", message=re.escape(msg), category=cat)
+        (DeprecationWarning, r"builtin type \w+ has no __module__ attribute", None),
+        (DeprecationWarning, r"cutlass\.\S+ is deprecated; use cutlass\.", third_party),
+        (DeprecationWarning, r"Arch from arch\.py is deprecated", third_party),
+    ]
+    for cat, message, packages in noisy_warnings:
+        module = rf"({packages})(\.|$)" if packages else ""
+        warnings.filterwarnings("ignore", message=message, category=cat, module=module)
 
-    if not getattr(warnings.showwarning, "_sglang_patched_cutlass_dsl", False):
+    # cutlass-dsl emits some of these inside `catch_warnings()+simplefilter("always")`,
+    # which bypasses filterwarnings; override showwarning to drop them too.
+    if not getattr(warnings.showwarning, "_sglang_noisy_warning_filter", False):
         prev_showwarning = warnings.showwarning
 
-        def _filtered_showwarning(message, category, *args, **kwargs):
-            if (category, str(message)) in cutlass_dsl_noisy:
-                return
-            prev_showwarning(message, category, *args, **kwargs)
+        def _filtered_showwarning(message, category, filename, *args, **kwargs):
+            for cat, pattern, packages in noisy_warnings:
+                if (
+                    issubclass(category, cat)
+                    and re.match(pattern, str(message))
+                    and (
+                        packages is None
+                        or re.search(rf"[/\\]({packages})[/\\]", filename)
+                    )
+                ):
+                    return
+            prev_showwarning(message, category, filename, *args, **kwargs)
 
-        _filtered_showwarning._sglang_patched_cutlass_dsl = True
+        _filtered_showwarning._sglang_noisy_warning_filter = True
         warnings.showwarning = _filtered_showwarning
-
-    # Suppress noisy third-party HTTP loggers.
-    # huggingface_hub uses httpx which logs every HTTP request at INFO level.
-    for name in ("httpx", "httpcore"):
-        logging.getLogger(name).setLevel(logging.WARNING)
 
 
 def suppress_other_loggers():
