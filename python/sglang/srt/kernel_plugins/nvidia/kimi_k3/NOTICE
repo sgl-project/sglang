@@ -1,0 +1,26 @@
+Kimi K3 specialized decode for SGLang
+Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES and SGLang contributors.
+Licensed under the Apache License 2.0.
+
+The Kimi K3 executor and CuTe DSL implementation are relocated from the official
+sgl-project/sgl-nvidia-mega implementation introduced in pull request #17, with
+the TP8 integration and stability updates proposed in pull request #38:
+https://github.com/sgl-project/sgl-nvidia-mega/pull/38
+The source snapshot is commit 459640ec1db2b0ffd5ebabc65a51dfd9524f4e44 in
+LeslieWylie/sgl-nvidia-mega, not a claim that those updates were merged upstream.
+Original file-level notices are retained.
+SOURCE_MAPPING.json identifies every original source and its in-tree locations.
+
+The split-K GEMM now in kernels/ops/gemm/kimi_k3_specialized/splitk.py is adapted from
+FlashInfer's flashinfer/gemm/kernels/dense_bf16_gemm_sm100_splitk.py at
+v0.7.0.post1 (Apache License 2.0). FlashInfer's NOTICE reads:
+
+FlashInfer
+Copyright 2025-2026 NVIDIA
+Copyright 2023-2026 FlashInfer community (https://flashinfer.ai/)
+
+Kimi K3's L2 weight-prefetch orchestration in prefetch.py is adapted from vLLM
+(Apache License 2.0, Copyright contributors to the vLLM project), originally at
+30044971a864d132e9a47f135e9ed11ece5c34d3 and compared with the final head
+063c0c6d25658ed0702670b2fd07f02f21cadf10 of pull request #61867:
+https://github.com/vllm-project/vllm/pull/61867

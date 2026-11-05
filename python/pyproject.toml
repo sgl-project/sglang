@@ -162,6 +162,11 @@ fastokens = [
   "fastokens>=0.3.2",
 ]
 
+k3-full-decode = [
+  # CuTe, CUDA Python and apache-tvm-ffi are already pinned above.
+  "tokenspeed-mla==2.0.3",
+]
+
 test = [
   "accelerate",
   "addict",

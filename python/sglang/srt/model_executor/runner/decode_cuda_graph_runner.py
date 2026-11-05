@@ -2055,6 +2055,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self.attn_backend, forward_batch.forward_mode
             )
         with self.model_context(), timer_ctx, self.backend.replay_session():
+            from sglang.srt.kernel_plugins.nvidia.binding import (
+                prepare_megakernel_replay,
+            )
+
+            prepare_megakernel_replay(self.model_runner.model)
             if not self.backend.prepare_replay(forward_batch):
                 self.load_batch(forward_batch, pp_proxy_tensors)
             if envs.SGLANG_LOG_DECODE_GRAPH_KEY.get():

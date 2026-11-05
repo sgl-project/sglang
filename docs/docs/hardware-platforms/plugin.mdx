@@ -47,6 +47,118 @@ The framework provides two plugin types, both discovered via Python's standard `
 
 The platform plugin system targets **out-of-tree (OOT) hardware platforms**. Diffusion support is experimental and covers the seams documented below, not every device-specific branch.
 
+## Built-in Kimi K3 specialized decode
+
+Kimi K3's NVIDIA decode implementation ships in SGLang. It uses the existing
+`--enable-nvidia-megakernel` interface and does not require an external
+`sgl-nvidia-mega` installation or entry-point registration. `SGLANG_PLUGINS`
+filters external plugins, not this built-in implementation. Other NVIDIA models
+continue to use their existing external plugins.
+
+The complete 93-layer language-model path includes embedding, MLA/KDA,
+projections, routed and shared experts, and AttnRes. SGLang continues to own
+scheduling, KV pages, recurrent state, HiCache restoration, sampling and APIs.
+The implementation reuses the community K3 executor from
+[sgl-nvidia-mega #17](https://github.com/sgl-project/sgl-nvidia-mega/pull/17), with
+file-level attribution and notices retained in the source package.
+
+Shipping the binding and runtime together keeps their internal contracts
+versioned with SGLang. The native-MLA profile provides an attention control while
+retaining the same specialized executor and SGLang-owned cache state.
+
+### Configuration
+
+The DCP/HiCache profiles support this configuration:
+
+| Setting | Requirement |
+| --- | --- |
+| Platform | Linux, NVIDIA CUDA 13, B300/GB300 SM103 with at least 148 SMs |
+| Model | Kimi K3 packed-MXFP4 experts and BF16 activations |
+| Parallelism | Single node, TP8, DCP1 or DCP8, no speculative decoding |
+| Cache | FP8 E4M3 KV, page size 64; HiCache is supported |
+| Execution | Full decode CUDA graphs, request buckets up to 64 |
+
+From the repository root, install the optional full-attention dependency and
+select a profile before starting your server:
+
+```bash
+python -m pip install -e './python[k3-full-decode]'
+export SGLANG_NVIDIA_MEGAKERNEL_SLOTS=k3_full_decode
+```
+
+Add `--enable-nvidia-megakernel` to a server launch configured as above, with
+`--model-path` pointing to your K3 checkpoint. `k3_full_decode` uses fused MLA/DCP,
+prepared TP embedding, B1/B2 tiny GEMM and B1–8 L2 weight prefetch.
+`k3_native_mla` selects the same executor with SGLang's native MLA/DCP attention
+and does not need TokenSpeed. Select exactly one profile. The full-decode extra
+pins `tokenspeed-mla==2.0.3`; CuTe and `apache-tvm-ffi==0.1.11` are already SGLang
+dependencies. Preparation checks dependency ABI and model geometry before
+allocating specialized resources and sizing the KV cache.
+
+Providers and workspaces are prepared before KV sizing for the default widths
+1–8/16/32/48/64 plus configured request buckets up to 64. Prefill, eager profiling,
+warmup and unprepared buckets use the original model. A later pool-clamped bucket
+does not allocate new providers. Startup still rejects an enabled runner when
+none of its captured buckets uses the specialized path.
+
+TP16, SM100, multi-node execution and DSpark are outside these profiles. A
+configured context up to 1,048,576 tokens is an admission limit, not a full
+1M-input quality result or a capacity guarantee.
+
+Auxiliary hidden-state capture (`--enable-return-aux-hidden-states`) is not
+supported by these profiles. Use the native model path for layer-tap outputs.
+
+### Resource lifetime
+
+Retaining a Torch `Parameter` does not preserve its previous storage when a
+backend replaces its `.data`. Replicated-Q setup can keep the parameter's shape
+and identity while moving the local Q shard into a gathered buffer.
+
+Providers, workspaces and prefetch tables are allocated before KV sizing.
+After backend setup, `ResourceSet.bind()` prepares the attention caches and
+binds CuTe views and prefetch ranges to the final weight storage before graph
+capture. Prefetch ranges update the existing table in place, preserving its
+CuTe and driver pointers. Layout changes are rejected; replay does not rebind
+addresses or allocate replacement tables.
+
+### Correctness and measurement scope
+
+The implementation uses a direct residual-vector norm in both AttnRes consumers
+to avoid cancellation-induced NaNs and a monotonic incremental detokenization
+cursor to avoid duplicate Unicode streaming text. CPU regressions cover these
+counterexamples, late weight-address binding and auxiliary-capture admission.
+Earlier isolated SM103 consumer tests covered B1/B64, eager/graph, empty-bank
+and final branches; the relocated implementation still needs its own CUDA and
+full-model validation.
+
+![Historical pre-fix integrated-build throughput and p95 time to first token](/images/kimi-k3-specialized-decode/integrated-comparison.png)
+
+This historical comparison predates the AttnRes and Unicode fixes. One integrated
+build run per arm used 128 formal requests after three warmups, 32,768 input
+tokens, 27,648 reused prefix tokens, 300 output tokens including reasoning, and
+concurrency 64. Source/image and memory/inference profiles changed together; all
+requests reached the output cap. The original 120-second after-peer metadata
+deadline failed. Later metadata-only closure sent no generation requests and did
+not change the original strict-comparator failure. These measurements do not
+qualify the current code's task quality, capacity or performance.
+
+### Qualifying an in-tree build
+
+The remaining GPU qualification must use the exact in-tree revision under
+review. Pin the model, dependencies, launch settings and memory budget, then:
+
+- Compare stock, `k3_native_mla` and `k3_full_decode` at TP8/DCP8; include a
+  focused DCP1 check for the other advertised mode.
+- Check numerical differences and representative task outputs, including
+  naturally terminated answers and HiCache host/store restoration. Compare
+  numerical drift with stock-run variability.
+- Measure TTFT, decode latency/throughput, peak GPU memory and available KV
+  capacity with the same workload. Repeat representative points to report
+  variability, and separate decode timing from prefill and cache-restore time.
+
+These are pending checks. Earlier integration results and configured context
+limits do not replace qualification of this build.
+
 ## Architecture
 
 ### Runtime-specific platform interfaces

@@ -37,6 +37,7 @@ from sglang.kernels.plugin_kernels.nvidia.spec import (
     PostVerifyStrategy,
     SpeculativeRuntimeHooks,
     Step,
+    builtin_spec_registered,
     find_spec,
     registered_architectures,
     spec_registered,
@@ -108,6 +109,10 @@ TOLERATED_CALLABLES = (
     "ForwardView.low_ratio_sources",  # compressor / indexer inputs
     "ForwardView.core_compressor",
     "KdaStepView.track_decode_state",  # SGLang's KDA prefix-state tracking
+    "HybridStepView.prepare_layer",  # live per-layer cache restore barrier
+    "MlaStepView.native_decode",  # SGLang's MLA kernel and DCP merge
+    "megakernel_agree",  # startup topology agreement before resource build
+    "MegakernelBinding.native_mla_supports_backend",  # startup capability query
     "KvPoolView.set_swa_key_buffer_radix_fused_norm_rope",  # the fused SWA key write
     "KvPoolView.pool",  # passed back to SGLang's own draft KV store only
     "sglang.kernels.ops",  # SGLang's kernel ops
@@ -195,6 +200,8 @@ class MlaPoolView:
         storage_dtype: torch.dtype,
         layer_mapping: Mapping[int, int],
         caches: Mapping[int, torch.Tensor],
+        write_shard_size: int = 1,
+        write_shard_rank: int = 0,
     ):
         self.reserved_capacity = int(reserved_capacity)
         self._serving_capacity = serving_capacity
@@ -204,6 +211,8 @@ class MlaPoolView:
         self.storage_dtype = storage_dtype
         self.layer_mapping = MappingProxyType(dict(layer_mapping))
         self._caches = MappingProxyType(dict(caches))
+        self.write_shard_size = int(write_shard_size)
+        self.write_shard_rank = int(write_shard_rank)
 
     @property
     def serving_capacity(self) -> int:
@@ -248,6 +257,8 @@ class MlaStepView(msgspec.Struct, frozen=True):
     sequence_lengths: torch.Tensor
     write_slots: torch.Tensor
     tokens_per_request: int = 1
+    native_decode: Optional[Callable[[int, torch.Tensor, torch.Tensor], None]] = None
+    global_sequence_lengths: Optional[torch.Tensor] = None
 
 
 class KdaStepView:
@@ -273,6 +284,7 @@ class HybridStepView(msgspec.Struct, frozen=True):
     mla: MlaStepView
     kda: KdaStepView
     aux_hidden_states: Optional[torch.Tensor] = None
+    prepare_layer: Optional[Callable[[int], None]] = None
 
 
 class ForwardView:
@@ -332,7 +344,11 @@ class _SealedSource(msgspec.Struct, frozen=True):
 class _HybridSources(msgspec.Struct, frozen=True):
     model_runner: ModelRunner
     backend: HybridLinearAttnBackend
-    full_backend: TRTLLMMLABackend
+    # Keep the full-attention owner, even when it routes prefill and decode to
+    # different children. Only the selected MLA child supplies decode buffers.
+    full_backend: AttentionBackend
+    mla_backend: TRTLLMMLABackend
+    prefill_backend: Optional[AttentionBackend]
     linear_backend: KDAAttnBackend
     token_pool: HybridLinearKVPool
     full_pool: KVCache
@@ -344,6 +360,22 @@ class MegakernelBinding:
     """Built at install, before the KV pools exist; read at build or forward. Each
     source is sealed at the first read that finds it; ``assert_live`` (after the
     decode graphs are captured) raises once one was reallocated."""
+
+    native_mla_api_version = 1
+
+    @classmethod
+    def native_mla_supports_backend(cls, name: str) -> bool:
+        """Require both the binding and native adapter for an optional backend.
+
+        API-v1 TRT consumers remain compatible with helpers predating Cute DSL.
+        The optional capability is read only during enabled-plugin admission.
+        """
+        from sglang.srt.kernel_plugins.nvidia import kimi_mla
+
+        adapter_backends = getattr(
+            kimi_mla, "NATIVE_MLA_DECODE_BACKENDS", ("trtllm_mla",)
+        )
+        return name in {"trtllm_mla", "cutedsl_mla"} and name in adapter_backends
 
     def __init__(self, *, model: torch.nn.Module):
         self._model = model
@@ -395,7 +427,7 @@ class MegakernelBinding:
         key = f"{mode}:{int(forward_batch.batch_size)}"
         mla, kda = view.hybrid.mla, view.hybrid.kda
         sources = self._current_hybrid_sources()
-        mla_metadata = self._mla_metadata(sources)
+        mla_metadata = self._mla_metadata(sources, forward_batch)
         kda_metadata = sources.linear_backend.forward_metadata
         # Keep each graph's metadata owners when the backend selects another
         # batch-size bucket, while still detecting replacement of their fields.
@@ -417,6 +449,14 @@ class MegakernelBinding:
                 lambda: kda_metadata.mamba_cache_indices,
             ),
         ]
+        if mla.global_sequence_lengths is not None:
+            tensors.append(
+                (
+                    "mla.global_sequence_lengths",
+                    mla.global_sequence_lengths,
+                    lambda: mla_metadata.global_seq_lens_k,
+                )
+            )
         if kda.verify_scratch_indices is not None:
             num_requests = int(forward_batch.batch_size)
             tensors.append(
@@ -525,7 +565,6 @@ class MegakernelBinding:
             return None
 
         from sglang.srt.layers.attention.linear.kda_backend import KDAAttnBackend
-        from sglang.srt.layers.attention.trtllm_mla_backend import TRTLLMMLABackend
         from sglang.srt.mem_cache.memory_pool import (
             HybridLinearKVPool,
             HybridReqToTokenPool,
@@ -533,12 +572,18 @@ class MegakernelBinding:
         )
 
         full_backend = backend.full_attn_backend
+        mla_backend = _mla_backend(full_backend)
+        prefill_backend = (
+            full_backend.prefill_backend
+            if mla_backend is not None and mla_backend is not full_backend
+            else None
+        )
         linear_backend = backend.linear_attn_backend
         token_pool = backend.token_to_kv_pool
         request_pool = backend.req_to_token_pool
         # This view describes the MLA/KDA layout, not arbitrary hybrid backends.
         if (
-            not isinstance(full_backend, TRTLLMMLABackend)
+            mla_backend is None
             or not isinstance(linear_backend, KDAAttnBackend)
             or not isinstance(token_pool, HybridLinearKVPool)
             or not isinstance(request_pool, HybridReqToTokenPool)
@@ -549,10 +594,13 @@ class MegakernelBinding:
         mamba_pool = request_pool.mamba_pool
         full_mapping = token_pool.full_attention_layer_id_mapping
         mamba_mapping = request_pool.mamba_map
-        for role, child in (("full", full_backend), ("linear", linear_backend)):
-            if child.token_to_kv_pool is not token_pool:
+        children = [("full", full_backend), ("linear", linear_backend)]
+        if mla_backend is not full_backend:
+            children.extend((("decode", mla_backend), ("prefill", prefill_backend)))
+        for role, child in children:
+            if getattr(child, "token_to_kv_pool", None) is not token_pool:
                 raise ValueError(f"megakernel binding: {role} backend KV pool differs")
-            if child.req_to_token_pool is not request_pool:
+            if getattr(child, "req_to_token_pool", None) is not request_pool:
                 raise ValueError(
                     f"megakernel binding: {role} backend request pool differs"
                 )
@@ -563,6 +611,8 @@ class MegakernelBinding:
             model_runner=model_runner,
             backend=backend,
             full_backend=full_backend,
+            mla_backend=mla_backend,
+            prefill_backend=prefill_backend,
             linear_backend=linear_backend,
             token_pool=token_pool,
             full_pool=full_pool,
@@ -683,6 +733,17 @@ class MegakernelBinding:
                 storage_dtype=full_pool.store_dtype,
                 layer_mapping=full_map,
                 caches=caches,
+                write_shard_size=(
+                    1
+                    if getattr(full_pool, "write_loc_is_dcp_resolved", False)
+                    or getattr(full_pool, "dcp_replicated", False)
+                    else getattr(full_pool, "_write_loc_dcp_span", 1)
+                ),
+                write_shard_rank=(
+                    get_parallel().attn_dcp_rank
+                    if getattr(full_pool, "_write_loc_dcp_span", 1) > 1
+                    else 0
+                ),
             ),
             kda=KdaPoolView(
                 capacity=int(mamba_pool.size),
@@ -736,6 +797,7 @@ class MegakernelBinding:
             # named invariant before a deeper path could raise AttributeError.
             "hybrid_backend": lambda: runner.attn_backend,
             "full_backend": lambda: runner.attn_backend.full_attn_backend,
+            "mla_backend": lambda: _mla_backend(runner.attn_backend.full_attn_backend),
             "linear_backend": lambda: runner.attn_backend.linear_attn_backend,
             "hybrid_kv_pool": lambda: runner.attn_backend.token_to_kv_pool,
             "full_kv_pool": lambda: runner.attn_backend.token_to_kv_pool.full_kv_pool,
@@ -761,6 +823,41 @@ class MegakernelBinding:
                 runner.attn_backend.req_to_token_pool.mamba_map
             ),
         }
+        if sources.mla_backend is not sources.full_backend:
+            getters.update(
+                full_prefill_backend=lambda: (
+                    runner.attn_backend.full_attn_backend.prefill_backend
+                ),
+                full_spec_attn_is_decode=lambda: (
+                    runner.attn_backend.full_attn_backend.spec_attn_is_decode
+                ),
+                full_spec_attn_is_prefill=lambda: (
+                    runner.attn_backend.full_attn_backend.spec_attn_is_prefill
+                ),
+                mla_backend_kv_pool=lambda: (
+                    _mla_backend(runner.attn_backend.full_attn_backend).token_to_kv_pool
+                ),
+                mla_backend_request_pool=lambda: (
+                    _mla_backend(
+                        runner.attn_backend.full_attn_backend
+                    ).req_to_token_pool
+                ),
+                full_prefill_kv_pool=lambda: (
+                    runner.attn_backend.full_attn_backend.prefill_backend.token_to_kv_pool
+                ),
+                full_prefill_request_pool=lambda: (
+                    runner.attn_backend.full_attn_backend.prefill_backend.req_to_token_pool
+                ),
+            )
+        # Native MLA captures the selected child's workspace and zero-KV row
+        # fixup table. Seal them alongside the cache roots before graph replay.
+        for attribute in ("workspace_buffer", "q_indptr_decode"):
+            if hasattr(sources.mla_backend, attribute):
+                getters[f"mla_backend_{attribute}"] = lambda attribute=attribute: (
+                    getattr(
+                        _mla_backend(runner.attn_backend.full_attn_backend), attribute
+                    )
+                )
         for name, getter in getters.items():
             self._seal(name, getter(), getter)
 
@@ -769,11 +866,37 @@ class MegakernelBinding:
         if sources is None:
             raise RuntimeError("megakernel binding: hybrid resources were not prepared")
         backend = sources.model_runner.attn_backend
-        # Read through the live root objects so assert_live sees replacements.
+        if backend is not sources.backend:
+            raise RuntimeError(
+                "megakernel binding: hybrid_backend was reallocated "
+                "after its first read"
+            )
+        full_backend = backend.full_attn_backend
+        mla_backend = _mla_backend(full_backend)
+        prefill_backend = (
+            full_backend.prefill_backend
+            if mla_backend is not None and mla_backend is not full_backend
+            else None
+        )
+        # Eager views must not pair fresh child metadata with resources prepared
+        # for a different owner. Graph replay checks the same roots above.
+        for name, value, original in (
+            ("full_backend", full_backend, sources.full_backend),
+            ("mla_backend", mla_backend, sources.mla_backend),
+            ("full_prefill_backend", prefill_backend, sources.prefill_backend),
+        ):
+            if value is not original:
+                raise RuntimeError(
+                    f"megakernel binding: {name} was reallocated after its first read"
+                )
+        # Read pools through the live root objects so storage checks retain
+        # their existing authoritative restore getters.
         return _HybridSources(
             model_runner=sources.model_runner,
             backend=backend,
-            full_backend=backend.full_attn_backend,
+            full_backend=full_backend,
+            mla_backend=mla_backend,
+            prefill_backend=prefill_backend,
             linear_backend=backend.linear_attn_backend,
             token_pool=backend.token_to_kv_pool,
             full_pool=backend.token_to_kv_pool.full_kv_pool,
@@ -781,13 +904,24 @@ class MegakernelBinding:
             mamba_pool=backend.req_to_token_pool.mamba_pool,
         )
 
+    def prepare_replay(self) -> None:
+        """Validate graph storage and join the current layer restore transactions.
+
+        Layer getters run while capturing, but HiCache can rotate the consumer
+        event before any replay. Re-read the sealed MLA and routed KDA views on
+        the replay stream so this invocation waits for the live restore events.
+        Keep upstream's authoritative state router and storage checks.
+        """
+        if self._hybrid_sources is not None:
+            self.assert_live()
+
     def _hybrid_step(
         self, backend: AttentionBackend, forward_batch: ForwardBatch
     ) -> HybridStepView:
         sources = self._current_hybrid_sources()
         if backend is not sources.backend:
             raise RuntimeError("megakernel binding: running hybrid backend changed")
-        mla_metadata = self._mla_metadata(sources)
+        mla_metadata = self._mla_metadata(sources, forward_batch)
         kda_metadata: Optional[KdaForwardMetadata] = (
             sources.linear_backend.forward_metadata
         )
@@ -795,6 +929,12 @@ class MegakernelBinding:
             raise RuntimeError("megakernel binding: KDA decode metadata is unavailable")
         block_table = mla_metadata.block_kv_indices
         sequence_lengths = mla_metadata.seq_lens_k
+        global_sequence_lengths = getattr(mla_metadata, "global_seq_lens_k", None)
+        if (
+            self._preparation.hybrid.mla.write_shard_size > 1
+            and global_sequence_lengths is None
+        ):
+            raise RuntimeError("megakernel binding: DCP global lengths are unavailable")
         write_slots = forward_batch.out_cache_loc
         state_indices = kda_metadata.mamba_cache_indices
         if any(
@@ -838,12 +978,36 @@ class MegakernelBinding:
                 layer_id,
             )
 
+        def prepare_layer(layer_id: int) -> None:
+            # Reusing a bound storage pointer must not bypass HiCache's per-layer
+            # restore barrier. These are the same getters used by native MLA/KDA.
+            if layer_id in pool_view.mla.layer_mapping:
+                sources.token_pool.get_key_buffer(layer_id)
+            else:
+                sources.linear_backend.state_layer_cache(layer_id)
+
+        def native_decode(layer_id: int, query: torch.Tensor, output: torch.Tensor):
+            from sglang.srt.kernel_plugins.nvidia.kimi_mla import native_mla_decode
+
+            attention = self._model.language_model.model.layers[layer_id].self_attn
+            native_mla_decode(
+                query,
+                output,
+                backend=sources.mla_backend,
+                cache=pool_view.mla.cache(layer_id),
+                attention=attention,
+                metadata=mla_metadata,
+                forward_batch=forward_batch,
+            )
+
         return HybridStepView(
             mla=MlaStepView(
                 block_table=block_table,
                 sequence_lengths=sequence_lengths,
                 write_slots=write_slots,
                 tokens_per_request=tokens_per_request,
+                native_decode=native_decode,
+                global_sequence_lengths=global_sequence_lengths,
             ),
             kda=KdaStepView(
                 state_indices=state_indices,
@@ -851,6 +1015,7 @@ class MegakernelBinding:
                 verify_scratch_indices=scratch_indices,
             ),
             aux_hidden_states=aux_hidden_states,
+            prepare_layer=prepare_layer,
         )
 
     def _verify_step(
@@ -926,8 +1091,25 @@ class MegakernelBinding:
             )
         return tokens_per_request, scratch_indices, aux
 
-    def _mla_metadata(self, sources: _HybridSources) -> TRTLLMMLADecodeMetadata:
-        metadata = sources.full_backend.forward_decode_metadata
+    def _mla_metadata(
+        self, sources: _HybridSources, forward_batch: Optional[ForwardBatch] = None
+    ) -> TRTLLMMLADecodeMetadata:
+        backend = sources.mla_backend
+        if forward_batch is not None and backend is not sources.full_backend:
+            backend = _mla_backend(sources.full_backend, forward_batch.forward_mode)
+        if backend is None:
+            raise RuntimeError(
+                "megakernel binding: selected MLA backend is unsupported"
+            )
+        # Match native MLA's per-forward override before its active backend
+        # metadata; the split owner may have just initialized another mode.
+        metadata = (
+            getattr(forward_batch, "decode_trtllm_mla_metadata", None)
+            if forward_batch is not None
+            else None
+        )
+        if metadata is None:
+            metadata = backend.forward_decode_metadata
         if metadata is None:
             raise RuntimeError("megakernel binding: MLA decode metadata is unavailable")
         return metadata
@@ -941,6 +1123,24 @@ class MegakernelBinding:
         # only models with Engram layers have a hasher
         hasher = getattr(self._model, "engram_hasher", None)
         return None if hasher is None else hasher.history
+
+
+def _mla_backend(full_backend: Any, forward_mode: Any = None) -> Any:
+    """Select MLA through SGLang's native split-backend routing authority."""
+    from sglang.srt.layers.attention.trtllm_mla_backend import TRTLLMMLABackend
+
+    if isinstance(full_backend, TRTLLMMLABackend):
+        return full_backend
+    from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
+
+    if not isinstance(full_backend, HybridAttnBackend):
+        return None
+    child = (
+        full_backend.decode_backend
+        if forward_mode is None
+        else full_backend._select_backend(forward_mode)
+    )
+    return child if isinstance(child, TRTLLMMLABackend) else None
 
 
 def _identity(value: Any) -> tuple:
@@ -1144,7 +1344,7 @@ def handle_nvidia_megakernel(server_args: Any) -> None:
     archs = model_config_of(server_args).hf_config.architectures
     if msa_serves(archs) and not cfg.enable_amd_monokernel:
         return  # handle_monokernel checks the MSA plugin's spec
-    reasons = plugin_reasons()
+    reasons = [] if builtin_spec_registered(archs) else plugin_reasons()
     if not reasons:
         model_config = model_config_of(server_args)
         spec, reasons = megakernel_disable_reasons(
@@ -1197,11 +1397,15 @@ def install_megakernel(
 
     tokens = _tokens_per_request()
     binding = _binding_class(hf_config.architectures)(model=model)
+    graph = get_exec().graph.cuda_graph_config
     context = BuildContext(
         widths=tuple(range(tokens, spec.max_rows + 1, tokens)),
         tokens_per_request=tokens,
         deadline_s=deadline_s(get_device().watchdog_timeout),
         binding=binding,
+        capture_widths=(
+            None if graph is None or graph.decode.bs is None else tuple(graph.decode.bs)
+        ),
     )
     start, free_before = time.perf_counter(), torch.cuda.mem_get_info()[0]
     built = spec.build(model, hf_config, context)
@@ -1277,6 +1481,12 @@ def prepare_megakernel(model_runner: ModelRunner) -> None:
         installed.prepare(
             installed.built, installed.binding.preparation_view(model_runner)
         )
+
+
+def prepare_megakernel_replay(model: torch.nn.Module) -> None:
+    installed = model.__dict__.get("_megakernel")
+    if installed is not None and isinstance(installed.binding, MegakernelBinding):
+        installed.binding.prepare_replay()
 
 
 def bind_speculative_runtime_hooks(

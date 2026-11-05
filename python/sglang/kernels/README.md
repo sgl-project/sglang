@@ -135,13 +135,15 @@ agent_kernels = [
 
 ## Plugin kernel backend: `plugin_kernels/`
 
-This directory holds the contracts of external kernel libraries that load as
-SGLang plugins (the `sglang.srt.plugins` entry point) and replace a model's step
+This directory holds the contracts of model-step implementations. External kernel
+libraries load as SGLang plugins (the `sglang.srt.plugins` entry point) and replace a model's step
 with kernels specialized for one model, configuration and platform: today the
 small-batch decode and verify steps, possibly prefill or high-throughput steps
 later. `KernelBackend.PLUGIN` records them. These are kernel plugins, not the
 platform plugins that add a device. The kernels stay in the libraries, and the
-code is split at the kernel/runtime boundary:
+code is split at the kernel/runtime boundary. Built-in Kimi K3 uses the same
+contract, with its runtime in `srt/kernel_plugins/nvidia/kimi_k3/`, callable kernels
+in their logical `ops/` groups, and compilation helpers in `jit/kimi_k3/`:
 
 - `kernels/plugin_kernels/<hardware>/` holds what a plugin implements and
   registers: its spec (registration, API version, requirements, capability and
@@ -154,9 +156,9 @@ code is split at the kernel/runtime boundary:
   model-forward dispatch with its fallback, and hands a plugin the runtime
   state it may use.
 
-| Hardware | Server flag | Library |
+| Hardware | Server flag | Implementation |
 | --- | --- | --- |
-| `nvidia/` | `--enable-nvidia-megakernel` | [sgl-nvidia-mega](https://github.com/sgl-project/sgl-nvidia-mega) |
+| `nvidia/` | `--enable-nvidia-megakernel` | Built-in Kimi K3; other models use [sgl-nvidia-mega](https://github.com/sgl-project/sgl-nvidia-mega) |
 | `amd/` | `--enable-amd-monokernel` | [sgl-amd-mono](https://github.com/sgl-project/sgl-amd-mono) |
 
 An operator exposed from here registers into its logical group with

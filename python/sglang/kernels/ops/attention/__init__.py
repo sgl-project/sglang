@@ -612,3 +612,27 @@ register_kernel(
         ),
     )
 )
+
+
+# In-tree Kimi K3 CuTe kernels; metadata imports no GPU implementation.
+for _name, _target in (
+    (
+        "kda_split",
+        "sglang.kernels.ops.attention.kimi_k3_specialized.kda:KdaSplit.__call__",
+    ),
+    (
+        "mla_value",
+        "sglang.kernels.ops.attention.kimi_k3_specialized.mla_value:MlaValue.__call__",
+    ),
+):
+    register_kernel(
+        KernelSpec(
+            op=f"attention.kimi_k3_{_name}",
+            backend=KernelBackend.CUTE_DSL,
+            target=_target,
+            capabilities=frozenset(
+                {CapabilityRequirement.cuda(min_sm=(10, 3), max_sm=(10, 3))}
+            ),
+        )
+    )
+del _name, _target

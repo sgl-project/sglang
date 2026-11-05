@@ -280,7 +280,7 @@ def dual_gemm_swiglu_fp8(
     x_scale: torch.Tensor,
     gate_up_weight_scale: torch.Tensor,
     output_scale: Optional[torch.Tensor] = None,
-    quant_mode: Optional["DualGemmQuantMode"] = None,
+    quant_mode: Optional[DualGemmQuantMode] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fuse FP8 gate/up projections, SwiGLU, and activation quantization."""
     if quant_mode is None:
@@ -597,3 +597,23 @@ register_kernel(
         capabilities=_SM90,
     )
 )
+
+
+# In-tree Kimi K3 CuTe kernels; metadata imports no GPU implementation.
+for _name, _target in (
+    (
+        "split_k_gemm",
+        "sglang.kernels.ops.gemm.kimi_k3_specialized.splitk:SplitKGemm.__call__",
+    ),
+):
+    register_kernel(
+        KernelSpec(
+            op=f"gemm.kimi_k3_{_name}",
+            backend=KernelBackend.CUTE_DSL,
+            target=_target,
+            capabilities=frozenset(
+                {CapabilityRequirement.cuda(min_sm=(10, 3), max_sm=(10, 3))}
+            ),
+        )
+    )
+del _name, _target

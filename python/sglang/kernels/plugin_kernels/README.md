@@ -1,6 +1,6 @@
 # `plugin_kernels` — plugin kernel backend
 
-The contracts of external kernel libraries that load as SGLang plugins and
+The contracts of model-step implementations. External kernel libraries load as SGLang plugins and
 replace a model's step with kernels specialized for one model, configuration
 and platform. Today they serve small-batch decode and verify steps; prefill or
 high-throughput specializations fit here too. `KernelBackend.PLUGIN` records
@@ -23,9 +23,9 @@ srt/kernel_plugins/          # SGLang's integration
                              #   and the runtime state handed to the plugin
 ```
 
-| Hardware | Server flag | Library |
+| Hardware | Server flag | Implementation |
 | --- | --- | --- |
-| `nvidia/` | `--enable-nvidia-megakernel` | [sgl-nvidia-mega](https://github.com/sgl-project/sgl-nvidia-mega) |
+| `nvidia/` | `--enable-nvidia-megakernel` | Built-in Kimi K3; other models use [sgl-nvidia-mega](https://github.com/sgl-project/sgl-nvidia-mega) |
 | `amd/` | `--enable-amd-monokernel` | [sgl-amd-mono](https://github.com/sgl-project/sgl-amd-mono) |
 
 ## How a plugin runs
@@ -39,7 +39,14 @@ With its server flag set, `srt/kernel_plugins/<hardware>/binding.py`:
 - replaces that model's forward for the steps the spec covers; every other step
   runs the model's own forward.
 
-The kernels stay in their libraries, which import the contract from
+For built-in Kimi K3, no external entry point is required. SGLang owns its spec,
+preparation and dispatch under `srt/kernel_plugins/nvidia/kimi_k3/`; its kernels
+live in the logical `kernels/ops/` groups and share `kernels/jit/kimi_k3/` helpers.
+An installed external plugin cannot replace this built-in architecture's spec;
+its other model registrations keep their existing behavior. The server flag is
+still required, and all platform, shape, state-ownership and fallback checks run.
+
+External kernels stay in their libraries, which import the contract from
 `sglang.kernels.plugin_kernels.<hardware>` and, in their tests, the integration
 from `sglang.srt.kernel_plugins.<hardware>`. Unit tests are in
 `test/registered/unit/kernel_plugins/<hardware>/`.

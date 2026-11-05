@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "measurement_date": "2026-11-04",
+  "scope": "Historical pre-fix integrated image plus memory/inference profile; not a benchmark of the patched public PR heads.",
+  "source_receipt_sha256": "529d853fbd4fdfc139f56b857a9b9d6b4346cc941671c2fe8da97da7f9e3eeca",
+  "conditions": {
+    "hardware": "B300 SM103",
+    "tensor_parallel_size": 8,
+    "decode_context_parallel_size": 8,
+    "speculation": false,
+    "input_tokens_per_request": 32768,
+    "output_tokens_per_request": 300,
+    "output_includes_reasoning": true,
+    "concurrency": 64,
+    "warmup_requests_per_arm": 3,
+    "formal_requests_per_arm": 128,
+    "physical_reused_prefix_tokens_per_request": 27648,
+    "independent_runs_per_arm": 1
+  },
+  "arms": {
+    "off": {
+      "formal_wall_seconds": 64.4721013889648,
+      "output_tokens_per_second": 595.6064588050272,
+      "p95_ttft_seconds": 24.99310013698414,
+      "formal_output_tokens": 38400,
+      "formal_input_tokens": 4194304
+    },
+    "on": {
+      "formal_wall_seconds": 58.09607272199355,
+      "output_tokens_per_second": 660.9741106555526,
+      "p95_ttft_seconds": 22.730465461034328,
+      "formal_output_tokens": 38400,
+      "formal_input_tokens": 4194304
+    }
+  },
+  "notes": [
+    "Measurements predate the AttnRes normalization and Unicode streaming fixes; they establish neither post-fix performance nor the earlier build task quality.",
+    "OFF and ON differ in source/image and memory/inference profile. This is not a same-image switch or isolated-kernel comparison.",
+    "Output throughput is total formal output tokens divided by the complete formal wall, including drain.",
+    "p95 TTFT is the original run-summary value, not a recomputed linearly interpolated quantile.",
+    "Every formal request reached its 300-token length cap. These are not naturally completed answer or task-quality results.",
+    "The original 120-second after-peer metadata deadline was missed. A later metadata-only continuation closed checks with zero generation POSTs; the original strict comparator remains failed.",
+    "Configured capture buckets, warmup routing and expert launch policy changed during public extraction. Current public source, capacity and performance need fresh GPU qualification.",
+    "A single paired run provides no confidence interval or run-to-run variance estimate."
+  ]
+}

@@ -102,3 +102,91 @@ for _fn in ("all_gather_matmul", "matmul_reduce_scatter"):
         )
     )
 del _fn
+
+
+# In-tree Kimi K3 CuTe kernels; metadata imports no GPU implementation.
+for _name, _target in (
+    (
+        "experts_group_kernel",
+        "sglang.kernels.ops.communication.kimi_k3_specialized.experts:ExpertsGroupKernel.__call__",
+    ),
+    (
+        "experts_kernel",
+        "sglang.kernels.ops.communication.kimi_k3_specialized.experts:ExpertsKernel.__call__",
+    ),
+    (
+        "experts_plan_kernel",
+        "sglang.kernels.ops.communication.kimi_k3_specialized.experts:ExpertsPlanKernel.__call__",
+    ),
+    (
+        "moe_front_t_p16",
+        "sglang.kernels.ops.communication.kimi_k3_specialized.front_tp16:MoeFrontTP16.__call__",
+    ),
+    (
+        "moe_front_t_p8",
+        "sglang.kernels.ops.communication.kimi_k3_specialized.front_tp8:MoeFrontTP8.__call__",
+    ),
+    (
+        "moe_shared_t_p8",
+        "sglang.kernels.ops.communication.kimi_k3_specialized.front_tp8:MoeSharedTP8.__call__",
+    ),
+    (
+        "shared_situ_tables",
+        "sglang.kernels.ops.communication.kimi_k3_specialized.front_tp8:SharedSituTables.__call__",
+    ),
+    (
+        "dcp_value",
+        "sglang.kernels.ops.communication.kimi_k3_specialized.mla_dcp:DcpValue.__call__",
+    ),
+    (
+        "mla_query",
+        "sglang.kernels.ops.communication.kimi_k3_specialized.mla_query:MlaQuery.__call__",
+    ),
+    (
+        "moe_tail",
+        "sglang.kernels.ops.communication.kimi_k3_specialized.moe_tail:MoeTail.__call__",
+    ),
+    (
+        "wave_moe_tail",
+        "sglang.kernels.ops.communication.kimi_k3_specialized.moe_tail:WaveMoeTail.__call__",
+    ),
+    (
+        "oproj_consumer",
+        "sglang.kernels.ops.communication.kimi_k3_specialized.oproj_consumer:OprojConsumer.__call__",
+    ),
+    (
+        "oproj_fused",
+        "sglang.kernels.ops.communication.kimi_k3_specialized.oproj_consumer:OprojFused.__call__",
+    ),
+    (
+        "oproj_producer",
+        "sglang.kernels.ops.communication.kimi_k3_specialized.oproj_producer:OprojProducer.__call__",
+    ),
+    (
+        "oproj_umma",
+        "sglang.kernels.ops.communication.kimi_k3_specialized.oproj_producer:OprojUmma.__call__",
+    ),
+    (
+        "shared_down",
+        "sglang.kernels.ops.communication.kimi_k3_specialized.shared:SharedDown.__call__",
+    ),
+    (
+        "shared_umma",
+        "sglang.kernels.ops.communication.kimi_k3_specialized.shared:SharedUmma.__call__",
+    ),
+    (
+        "ws_gemm",
+        "sglang.kernels.ops.communication.kimi_k3_specialized.ws_gemm:WsGemm.__call__",
+    ),
+):
+    register_kernel(
+        KernelSpec(
+            op=f"communication.kimi_k3_{_name}",
+            backend=KernelBackend.CUTE_DSL,
+            target=_target,
+            capabilities=frozenset(
+                {CapabilityRequirement.cuda(min_sm=(10, 3), max_sm=(10, 3))}
+            ),
+        )
+    )
+del _name, _target

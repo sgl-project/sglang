@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import enum
 import importlib
+import logging
 from typing import TYPE_CHECKING, Any, Callable, Mapping, Optional, Protocol, Sequence
 
 import msgspec
@@ -12,6 +13,8 @@ import torch
 
 if TYPE_CHECKING:
     from sglang.srt.kernel_plugins.nvidia.binding import PreparationView
+
+logger = logging.getLogger(__name__)
 
 # bumped on any breaking change to the contracts in this module
 MEGAKERNEL_API_VERSION = 2
@@ -86,6 +89,10 @@ class BuildContext(msgspec.Struct, frozen=True):
     deadline_s: float  # every cross-GPU wait's deadline, below --watchdog-timeout
     # SGLang's runtime state for this model (sglang.srt.kernel_plugins.nvidia.binding)
     binding: Any = None
+    # Configured request buckets before KV sizing, unlike ``widths`` token rows.
+    # Providers convert requests to token rows once. Later pool-clamped buckets
+    # may be absent here and must not trigger new resource allocation at replay.
+    capture_widths: Optional[tuple[int, ...]] = None
 
 
 class Step(msgspec.Struct, frozen=True):
@@ -463,12 +470,28 @@ class MegakernelSpec(msgspec.Struct, frozen=True):
     prepare: Optional[Callable[[BuiltMegakernel, PreparationView], None]] = None
 
 
-# HF architecture -> the "module:attribute" path of its spec
+# Built-in ownership is separate from external registrations. Keep these paths
+# lazy so importing the contract or registering other models loads no kernels.
+_BUILTIN_SPECS: dict[str, str] = {
+    "KimiK3ForConditionalGeneration": (
+        "sglang.srt.kernel_plugins.nvidia.kimi_k3.spec:SPEC"
+    ),
+}
+
+# External HF architecture -> the "module:attribute" path of its spec.
 _REGISTRY: dict[str, str] = {}
 
 
 def register(*, architecture: str, path: str) -> None:
     """Register a module:attribute spec path from the plugin entry point."""
+    if architecture in _BUILTIN_SPECS:
+        if path != _BUILTIN_SPECS[architecture]:
+            logger.info(
+                "%s uses SGLang's built-in megakernel; ignoring external spec %s",
+                architecture,
+                path,
+            )
+        return
     if _REGISTRY.get(architecture, path) != path:
         raise ValueError(
             f"a megakernel spec for {architecture} is already registered: "
@@ -478,13 +501,20 @@ def register(*, architecture: str, path: str) -> None:
 
 
 def registered_architectures() -> list[str]:
-    """The architectures with a registered spec; empty when no plugin registered any."""
-    return sorted(_REGISTRY)
+    """The architectures with a built-in or externally registered spec."""
+    return sorted(_BUILTIN_SPECS.keys() | _REGISTRY.keys())
+
+
+def builtin_spec_registered(architectures: Optional[Sequence[str]]) -> bool:
+    """Whether any architecture has a built-in spec, without importing it."""
+    return any(arch in _BUILTIN_SPECS for arch in architectures or ())
 
 
 def spec_registered(architectures: Optional[Sequence[str]]) -> bool:
     """Whether any of the architectures has a registered spec, usable or not."""
-    return any(arch in _REGISTRY for arch in architectures or ())
+    return builtin_spec_registered(architectures) or any(
+        arch in _REGISTRY for arch in architectures or ()
+    )
 
 
 def find_spec(
@@ -492,8 +522,13 @@ def find_spec(
 ) -> tuple[Optional[MegakernelSpec], str]:
     """The compatible spec and an empty reason, or None and a rejection reason."""
     why = []
-    for arch in architectures or ():
-        path = _REGISTRY.get(arch)
+    # A built-in owns the model even when another HF architecture is listed
+    # first. An incompatible built-in must not fall back to an external spec.
+    builtin_architectures = [
+        arch for arch in architectures or () if arch in _BUILTIN_SPECS
+    ]
+    for arch in builtin_architectures or architectures or ():
+        path = _BUILTIN_SPECS.get(arch) or _REGISTRY.get(arch)
         if path is None:
             continue
         module, _, attr = path.partition(":")

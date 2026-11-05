@@ -189,7 +189,12 @@ class DetokenizeState(msgspec.Struct):
                 # commit (token offsets stay so the next iteration retries
                 # with more tokens).
                 printable = find_printable_text(new_text)
-                self.sent_offset = self.decoded_text_len + len(printable)
+                # The printable prefix can shrink while a later UTF-8
+                # character is incomplete. Already emitted text cannot be
+                # retracted, so never move the sent cursor backwards.
+                self.sent_offset = max(
+                    self.sent_offset, self.decoded_text_len + len(printable)
+                )
                 return printable[pending:] if pending else printable
 
         # Finished: materialize once, trim the matched stop, emit the tail.
