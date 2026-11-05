@@ -18,7 +18,7 @@ from sglang.srt.model_executor.runner_utils.pool import (
     graph_pool_borrow_largest_run,
 )
 from sglang.srt.runtime_context import get_exec
-from sglang.srt.utils.common import async_d2h, is_pin_memory_available
+from sglang.srt.utils.common import async_d2h, async_h2d, is_pin_memory_available
 
 if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessorOutput
@@ -359,7 +359,11 @@ def get_token_ids_logprobs_chunk(
         val = []
         idx = []
         if token_ids is not None and available_len > 0:
-            rows = logprobs[pt : pt + available_len, token_ids]
+            # A Python-list index would be a pageable, synchronizing H2D copy.
+            token_ids_tensor = async_h2d(
+                token_ids, dtype=torch.long, device=logprobs.device
+            )
+            rows = logprobs[pt : pt + available_len, token_ids_tensor]
             if log_normalizer is not None:
                 rows = (
                     rows.float() - row_max[pt : pt + available_len, None]
@@ -616,6 +620,14 @@ class InputLogprobProcessor:
             token_ids_logprobs_val = None
             token_ids_logprobs_idx = None
 
+        # On CUDA, top-k / token-ids rows leave as async pinned copies so the host
+        # never blocks; finalize_input_logprobs() reads them after the D2H wait.
+        copy_to_pinned_cpu = pruned_states.is_cuda
+        has_pinned_spans = copy_to_pinned_cpu and (
+            logits_metadata.extend_return_top_logprob
+            or logits_metadata.extend_token_ids_logprob
+        )
+
         # If a single sequence is split into multiple chunks, we need to keep track
         # of the pruned length of the sequences in the previous chunks.
         split_len_topk = 0
@@ -750,7 +762,7 @@ class InputLogprobProcessor:
                         split_len_topk,
                         log_normalizer=chunk_log_normalizer,
                         precomputed_topk=chunk_precomputed_topk,
-                        copy_to_pinned_cpu=borrow_logprob_memory,
+                        copy_to_pinned_cpu=copy_to_pinned_cpu,
                     )
 
                 # Get the logprob of given token id
@@ -767,7 +779,7 @@ class InputLogprobProcessor:
                         token_ids_logprobs_idx,
                         split_len_token_ids,
                         log_normalizer=chunk_log_normalizer,
-                        copy_to_pinned_cpu=borrow_logprob_memory,
+                        copy_to_pinned_cpu=copy_to_pinned_cpu,
                     )
 
                 # Get the logprob of the requested token ids
@@ -797,11 +809,11 @@ class InputLogprobProcessor:
             lm_head.reset_lm_head_pass()
 
         input_copy_done = None
-        if borrow_logprob_memory:
+        if borrow_logprob_memory or has_pinned_spans:
             # The copies and the next replay share the forward stream.
             input_copy_done = torch.cuda.Event()
             input_copy_done.record(torch.cuda.current_stream(pruned_states.device))
-        else:
+        if not borrow_logprob_memory:
             # Concatenate the results
             token_logprobs = torch.cat(token_logprobs, dim=0)
 
