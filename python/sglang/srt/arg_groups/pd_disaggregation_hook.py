@@ -20,9 +20,36 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _validate_decode_input_only_cache(cfg: Any) -> bool:
+    """Keep the experimental retention policy on its device-only PD path."""
+    if (
+        not envs.SGLANG_PD_DECODE_CACHE_INPUT_ONLY.get()
+        or cfg.disaggregation_mode != "decode"
+    ):
+        return False
+    if not (
+        cfg.disaggregation_decode_enable_radix_cache
+        and cfg.speculative_algorithm in ("EAGLE", "NEXTN")
+        and cfg.disaggregation_transfer_backend == "mooncake"
+        and not cfg.enable_hierarchical_cache
+        and not cfg.disaggregation_decode_enable_offload_kvcache
+        and not cfg.enable_session_radix_cache
+        and not cfg.enable_hisparse
+        and not cfg.enable_pd_role_switch
+        and cfg.pp_size == cfg.attn_cp_size == cfg.dcp_size == 1
+    ):
+        raise ValueError(
+            "SGLANG_PD_DECODE_CACHE_INPUT_ONLY requires decode radix caching, "
+            "EAGLE/NEXTN, Mooncake and PP/CP/DCP=1; HiCache, decode offload, "
+            "session radix caching, HiSparse and role switching are unsupported"
+        )
+    return True
+
+
 def handle_pd_disaggregation(server_args: ServerArgs) -> None:
     """Validate and normalize PD-disaggregation server args."""
     cfg = resolving_view(server_args)
+    _validate_decode_input_only_cache(cfg)
 
     # "mooncake_tcp" is mooncake with the TCP transport forced: set MC_FORCE_TCP
     # so mooncake installs TcpTransport instead of RDMA, rewrite the backend to
