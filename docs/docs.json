@@ -10,6 +10,10 @@
   },
   "redirects": [
     {
+      "source": "/cookbook/autoregressive/Ernie/:slug*",
+      "destination": "/cookbook/autoregressive/Baidu/:slug*"
+    },
+    {
       "source": "/cookbook/autoregressive/Reflection/Beam-1.0",
       "destination": "/cookbook/autoregressive/Reflection/Beam-1_0"
     },
@@ -1256,6 +1260,7 @@
                   {
                     "group": "Kimi (Moonshot AI)",
                     "pages": [
+                      "cookbook/autoregressive/Moonshotai/Kimi-K3.1-Pro",
                       "cookbook/autoregressive/Moonshotai/Kimi-K3",
                       "cookbook/autoregressive/Moonshotai/Kimi-K2.7-Code",
                       "cookbook/autoregressive/Moonshotai/Kimi-K2.6",
@@ -1407,11 +1412,12 @@
                   {
                     "group": "Baidu",
                     "pages": [
+                      "cookbook/autoregressive/Baidu/ERNIE-5.5-Flash",
+                      "cookbook/autoregressive/Baidu/Ernie4.5",
+                      "cookbook/autoregressive/Baidu/Ernie4.5-VL",
                       "cookbook/autoregressive/Baidu/Unlimited-OCR-2",
                       "cookbook/autoregressive/Baidu/PaddleOCR-VL",
-                      "cookbook/autoregressive/Baidu/Unlimited-OCR",
-                      "cookbook/autoregressive/Ernie/Ernie4.5",
-                      "cookbook/autoregressive/Ernie/Ernie4.5-VL"
+                      "cookbook/autoregressive/Baidu/Unlimited-OCR"
                     ]
                   },
                   {
