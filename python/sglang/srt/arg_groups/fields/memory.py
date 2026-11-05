@@ -302,6 +302,18 @@ class Memory(msgspec.Struct):
     ] = None
 
     # -------------------------------------------------------------------------
+    # Hierarchical engram
+    # -------------------------------------------------------------------------
+    enable_hi_engram: A[
+        bool,
+        "Enable HiCache Engram storage. Configure the backend through --hi-engram-config.",
+    ] = False
+    hi_engram_config: A[
+        Optional[str],
+        'A dictionary in JSON string format for hierarchical Engram storage. Example: {"backend": "local", "local_dir": "/dev/shm/sglang-engram"}',
+    ] = None
+
+    # -------------------------------------------------------------------------
     # LMCache
     # -------------------------------------------------------------------------
     enable_lmcache: A[
