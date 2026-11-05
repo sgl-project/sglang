@@ -164,6 +164,9 @@ srt_hpu = ["sglang[runtime_common]"]
 
 # https://docs.sglang.io/hardware-platforms/sail
 srt_sail = [
+  "flash-attention-for-sail",
+  "flashinfer-for-sail",
+  "flashmla-for-sail",
   "sailify==1.0.0",
   "sglang[runtime_common]",
   "torch-for-sail",

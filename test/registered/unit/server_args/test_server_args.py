@@ -229,15 +229,19 @@ class TestPrepareServerArgs(CustomTestCase):
         self.assertTrue(joined._radix_eviction_policy_explicitly_set)
         self.assertTrue(configured._radix_eviction_policy_explicitly_set)
 
-    def test_amd_monokernel_flag_spellings_in_config_and_cli(self):
-        """The deprecated --monokernel-backend amd and --enable-amd-monokernel share a
-        dest; a config file must accept either key, true or false, not reject both."""
+    def test_monokernel_flag_spellings_in_config_and_cli(self):
+        """The deprecated --monokernel-backend amd|msa sets --enable-amd-monokernel or
+        --enable-nvidia-megakernel; a config file accepts every spelling."""
         cases = (
-            ("monokernel-backend: amd\n", [], True),
-            ("enable-amd-monokernel: true\n", [], True),
-            ("enable-amd-monokernel: false\n", [], False),
-            (None, ["--enable-amd-monokernel"], True),
-            (None, ["--monokernel-backend", "amd"], True),
+            ("monokernel-backend: amd\n", [], (True, False)),
+            ("monokernel-backend: msa\n", [], (False, True)),
+            ("enable-amd-monokernel: true\n", [], (True, False)),
+            ("enable-amd-monokernel: false\n", [], (False, False)),
+            ("enable-nvidia-megakernel: true\n", [], (False, True)),
+            (None, ["--enable-amd-monokernel"], (True, False)),
+            (None, ["--enable-nvidia-megakernel"], (False, True)),
+            (None, ["--monokernel-backend", "amd"], (True, False)),
+            (None, ["--monokernel-backend", "msa"], (False, True)),
         )
         for config, cli, expected in cases:
             with self.subTest(config=config, cli=cli):
@@ -249,7 +253,11 @@ class TestPrepareServerArgs(CustomTestCase):
                         f.write(config)
                     self.addCleanup(os.unlink, f.name)
                     argv += ["--config", f.name]
-                self.assertIs(prepare_server_args(argv).enable_amd_monokernel, expected)
+                args = prepare_server_args(argv)
+                self.assertEqual(
+                    (args.enable_amd_monokernel, args.enable_nvidia_megakernel),
+                    expected,
+                )
 
     def test_ple_embedding_offload_rejects_generic_weight_offload(self):
         for generic_offload in (

@@ -229,7 +229,7 @@ class ExecKernel(msgspec.Struct):
     ] = None
     enable_nvidia_megakernel: A[
         bool,
-        "Enable the NVIDIA megakernel from the sgl-nvidia-mega package. Supported decode and verify steps use its fused kernels; other steps use the standard forward. An unsupported startup configuration raises an error listing the reasons. Experimental feature.",
+        "Enable the NVIDIA megakernel from the sgl-nvidia-mega package, or for MiniMax-M3.1 from the SGLang plugin of the MSA package. Supported decode and verify steps use its fused kernels; other steps use the standard forward. An unsupported startup configuration raises an error listing the reasons. Experimental feature.",
     ] = False
     enable_amd_monokernel: A[
         bool,

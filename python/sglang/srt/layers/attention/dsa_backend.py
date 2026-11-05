@@ -629,6 +629,25 @@ class DeepseekSparseAttnBackend(
     # branch of __init__ allocates one.
     _multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None
 
+    def _call_flash_mla_sparse_fwd(self, **kwargs):
+        from sglang.kernels.ops.attention.flash_mla_interface import (
+            flash_mla_sparse_fwd,
+        )
+
+        return flash_mla_sparse_fwd(**kwargs)
+
+    # flashmla_kv decode and its metadata use sgl_kernel's FlashMLA, which also
+    # takes the native (unpadded) prefill head count.
+    def _call_flash_mla_with_kvcache(self, **kwargs):
+        from sgl_kernel.flash_mla import flash_mla_with_kvcache
+
+        return flash_mla_with_kvcache(**kwargs)
+
+    def _call_get_mla_metadata(self, **kwargs):
+        from sgl_kernel.flash_mla import get_mla_metadata
+
+        return get_mla_metadata(**kwargs)
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -3151,10 +3170,6 @@ class DeepseekSparseAttnBackend(
         topk_length: Optional[torch.Tensor] = None,
         attn_sink: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        from sglang.kernels.ops.attention.flash_mla_interface import (
-            flash_mla_sparse_fwd,
-        )
-
         # FlashMLA sparse kernel requires num_heads to be a multiple of 64 (Hopper) or 128 (Blackwell)
         # When using TP, num_heads might be smaller (e.g., 256//8=32)
         num_tokens, num_heads, head_dim = q_all.shape
@@ -3201,7 +3216,7 @@ class DeepseekSparseAttnBackend(
             # they ever diverge.
             topk_length = None
 
-        o, _, _ = flash_mla_sparse_fwd(
+        o, _, _ = self._call_flash_mla_sparse_fwd(
             q=q_input,
             kv=kv_cache,
             indices=indices_input,
@@ -3693,8 +3708,6 @@ class DeepseekSparseAttnBackend(
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         # dcp_partial: DCP decode, q gathered from the group attends over this
         # rank's KV shard; returns (o, lse) for the merge instead of o.
-        from sgl_kernel.flash_mla import flash_mla_with_kvcache
-
         cache_seqlens = metadata.dsa_cache_seqlens_int32
         assert metadata.flashmla_metadata is not None
 
@@ -3759,7 +3772,7 @@ class DeepseekSparseAttnBackend(
                 [indices, indices.new_full((pad_rows, *indices.shape[1:]), -1)]
             )
 
-        o, lse = flash_mla_with_kvcache(
+        o, lse = self._call_flash_mla_with_kvcache(
             q=q_input,
             k_cache=kv_cache,
             cache_seqlens=cache_seqlens,
@@ -4819,12 +4832,10 @@ class DeepseekSparseAttnBackend(
         seq_len_q: int,
         num_heads_q: Optional[int] = None,
     ):
-        from sgl_kernel.flash_mla import get_mla_metadata
-
         if num_heads_q is None:
             num_heads_q = self.flashmla_kv_num_q_heads
 
-        flashmla_metadata, num_splits = get_mla_metadata(
+        flashmla_metadata, num_splits = self._call_get_mla_metadata(
             cache_seqlens=cache_seqlens,
             # TODO doc says `num_q_tokens_per_q_seq * num_heads_q // num_heads_k`
             #      but the name looks like need seq_len_q?

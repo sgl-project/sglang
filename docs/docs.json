@@ -1472,6 +1472,7 @@
                   {
                     "group": "Mistral",
                     "pages": [
+                      "cookbook/autoregressive/Mistral/Mistral-Large-4",
                       "cookbook/autoregressive/Mistral/Ministral-3",
                       "cookbook/autoregressive/Mistral/Mistral-Small-4",
                       "cookbook/autoregressive/Mistral/Mistral-Medium-3.5",
