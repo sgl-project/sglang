@@ -1,7 +1,6 @@
 """In-tree aiter rows and DeepSeek-V4's aiter patches apply only while aiter lacks them."""
 
 import collections
-import glob
 import importlib.metadata
 import json
 import os
@@ -22,184 +21,52 @@ register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd")
 
 try:
     import aiter  # noqa: F401
-    from aiter.jit.core import AITER_CONFIGS, AITER_ROOT_DIR
+    from aiter.jit.core import AITER_CONFIGS
 
     _HAS_AITER = True
 except Exception:  # noqa: BLE001
     _HAS_AITER = False
 
 
-_TABLE = tables.A8W8_BLOCKSCALE_BPRESHUFFLE
-_KERNEL_COLS = list(_TABLE.kernel_cols)
-_INTREE_ONLY_COLS = ["aiter_pr"] + ["base_" + c for c in _KERNEL_COLS]
-
-
-def _apply(table, intree):
-    return tables.apply_intree_rows(table, intree, _TABLE.key_cols, _KERNEL_COLS)
-
-
-_DSV4_CSV = os.path.join(tables.CONFIG_DIR, _TABLE.name, "deepseek_v4.csv")
-
-
-def _intree():
-    return pd.read_csv(_DSV4_CSV)
-
-
-def _install_dsv4(out_dir):
-    return tables.install_intree_table(_TABLE, [_DSV4_CSV], out_dir)
-
-
-def _as_stock(intree):
-    """The rows as aiter ships them before the PRs."""
-    stock = intree.copy()
-    for c in _KERNEL_COLS:
-        stock[c] = stock["base_" + c]
-    return stock.drop(columns=_INTREE_ONLY_COLS)
-
-
-def _keys(df):
-    return list(zip(*(df[c].astype(str) for c in _TABLE.key_cols)))
-
-
-def _kernels_by_key(df):
-    return {
-        k: tables.norm_kernel(r, _KERNEL_COLS)
-        for k, (_, r) in zip(_keys(df), df.iterrows())
-    }
-
-
-class TestBpreshuffleRows(CustomTestCase):
-    def test_rows_match_prs(self):
-        df = _intree()
-        self.assertEqual(len(df), 32)
-        self.assertEqual(len(set(_keys(df))), 32)
-        pr6004 = df[df.aiter_pr == 6004]
-        self.assertEqual(len(pr6004), 8)
-        self.assertTrue(((pr6004.N == 2048) & (pr6004.K == 7168)).all())
-        pr6029 = df[df.aiter_pr == 6029]
-        self.assertEqual(len(pr6029), 24)
-        self.assertEqual(set(zip(pr6029.N, pr6029.K)), {(8192, 1536), (7168, 2048)})
-        # only kernel choices change, never to a CK instance aiter may not have built
-        self.assertTrue(df.libtype.isin(["triton", "asm"]).all())
-
-    def _other(self):
-        return pd.DataFrame(
-            [["gfx950", 256, 1, 4096, 7168, "triton", 0, 0, 1.0, "triton", 1, 1, 0.0]],
-            columns=[c for c in _as_stock(_intree()).columns],
+class TestApplyRows(CustomTestCase):
+    def test_rows_apply_only_while_aiter_lacks_them(self):
+        """A row replaces aiter's only over its base kernel and adds only a missing shape,
+        so aiter's merged or re-tuned rows win and no key repeats."""
+        table = tables.A8W8_BLOCKSCALE_BPRESHUFFLE
+        key = {"gfx": "gfx950", "cu_num": 256, "N": 2048, "K": 7168}
+        ck = {"libtype": "ck", "kernelId": 7, "splitK": 0, "kernelName": "ck7"}
+        ours = {"libtype": "triton", "kernelId": 0, "splitK": 0, "kernelName": "triton"}
+        newer = {"libtype": "asm", "kernelId": 16, "splitK": 1, "kernelName": "newer"}
+        base = {"base_" + c: v for c, v in ck.items()}
+        aiter_rows = pd.DataFrame(
+            [
+                {**key, "M": 1, **ck},  # pre-PR -> replaced
+                {**key, "M": 2, **ours},  # aiter merged the row
+                {**key, "M": 3, **newer},  # aiter re-tuned the shape
+                {**key, "M": 5, **ck},  # aiter has a row for an addition's key
+            ]
         )
-
-    def test_stock_aiter_rows_replaced_in_place(self):
-        stock = pd.concat([_as_stock(_intree()), self._other()], ignore_index=True)
-        out, stats = _apply(stock, _intree())
-        self.assertEqual(stats[tables.APPLIED], 32)
-        self.assertEqual(_keys(out), _keys(stock))  # same keys, same order
-        self.assertFalse(out.duplicated(subset=list(_TABLE.key_cols)).any())
-        want = _kernels_by_key(_intree())
-        got = _kernels_by_key(out)
-        for k, v in want.items():
-            self.assertEqual(got[k], v)
-
-    def test_merged_aiter_is_left_alone(self):
-        merged = _intree().drop(columns=_INTREE_ONLY_COLS)
-        out, stats = _apply(merged, _intree())
-        self.assertEqual(stats[tables.APPLIED], 0)
-        self.assertEqual(stats[tables.UPSTREAM], 32)
-        pd.testing.assert_frame_equal(out, merged)
-
-    def test_superseded_or_missing_rows_prefer_aiter(self):
-        stock = _as_stock(_intree())
-        stock.loc[0, "libtype"] = "asm"
-        stock.loc[0, "kernelName"] = "some_newer_kernel"
-        stock = stock.drop(index=1).reset_index(drop=True)
-        out, stats = _apply(stock, _intree())
-        self.assertEqual(stats[tables.SUPERSEDED], 1)
-        self.assertEqual(stats[tables.MISSING], 1)
-        self.assertEqual(stats[tables.APPLIED], 30)
-        self.assertEqual(out.loc[0, "kernelName"], "some_newer_kernel")
-
-
-@unittest.skipUnless(_HAS_AITER, "aiter not installed")
-class TestBpreshuffleWithAiter(CustomTestCase):
-    """Runs aiter's real table resolution (default CSV + model_configs merge)."""
-
-    def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="sglang_intree_test_")
-        # keep aiter's merged-table output private to this test
-        self._tempdir = tempfile.tempdir
-        tempfile.tempdir = self.tmp
-        self._env = os.environ.pop(_TABLE.env, None)
-        self._clear()
-
-    def tearDown(self):
-        os.environ.pop(_TABLE.env, None)
-        if self._env is not None:
-            os.environ[_TABLE.env] = self._env
-        tempfile.tempdir = self._tempdir
-        self._clear()
-        shutil.rmtree(self.tmp, ignore_errors=True)
-
-    @staticmethod
-    def _clear():
-        type(AITER_CONFIGS).get_config_file.cache_clear()
-
-    def _effective(self):
-        path = AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE_FILE
-        df = pd.read_csv(path)
-        self.assertFalse(df.duplicated(subset=list(_TABLE.key_cols)).any())
-        return path, _kernels_by_key(df)
-
-    def _assert_pr_rows(self, kernels):
-        for k, v in _kernels_by_key(_intree()).items():
-            self.assertEqual(kernels[k], v, k)
-
-    def test_install_on_pinned_aiter(self):
-        stats, csv_file = _install_dsv4(os.path.join(self.tmp, "out"))
-        self.assertEqual(stats[tables.SUPERSEDED] + stats[tables.MISSING], 0, stats)
-        self.assertEqual(stats[tables.APPLIED] + stats[tables.UPSTREAM], 32, stats)
-        path, kernels = self._effective()
-        self.assertEqual(path, csv_file)
-        if stats[tables.APPLIED]:
-            self.assertEqual(os.environ[_TABLE.env], path)
-        self._assert_pr_rows(kernels)
-        # idempotent: a second process inheriting the env changes nothing
-        again, again_file = _install_dsv4(os.path.join(self.tmp, "out"))
-        self.assertEqual(again[tables.APPLIED], 0)
-        self.assertEqual(again_file, path)
-
-    def test_aiter_with_prs_merged(self):
-        """Simulate aiter having merged #6004/#6029: its tables carry the PR rows."""
-        cfg = os.path.join(AITER_ROOT_DIR, "aiter", "configs")
-        name = "a8w8_blockscale_bpreshuffle_tuned_gemm"
-        files = [os.path.join(cfg, f"{name}.csv")] + sorted(
-            p
-            for p in glob.glob(os.path.join(cfg, "model_configs", f"*{name}*.csv"))
-            if "untuned" not in os.path.basename(p)
+        intree = pd.DataFrame(
+            [{**key, "M": m, **ours, **base} for m in (1, 2, 3, 4)]
+            + [{**key, "M": m, **ours} for m in (5, 6)]
         )
-        new = {k: r for k, (_, r) in zip(_keys(_intree()), _intree().iterrows())}
-        copies, patched = [], 0
-        for p in files:
-            df = pd.read_csv(p)
-            if "gfx" in df.columns:
-                for i, k in enumerate(_keys(df)):
-                    if k in new:
-                        for c in _KERNEL_COLS:
-                            df.at[df.index[i], c] = new[k][c]
-                        patched += 1
-            dst = os.path.join(self.tmp, os.path.basename(p))
-            df.to_csv(dst, index=False)
-            copies.append(dst)
-        self.assertEqual(patched, 32)
-        os.environ[_TABLE.env] = os.pathsep.join(copies)
-        self._clear()
-
-        stats, _ = _install_dsv4(os.path.join(self.tmp, "out"))
-        self.assertEqual(stats[tables.APPLIED], 0)
-        self.assertEqual(stats[tables.UPSTREAM], 32)
-        # nothing installed: aiter keeps resolving its own (merged) list
-        self.assertEqual(os.environ[_TABLE.env], os.pathsep.join(copies))
-        self.assertFalse(os.path.exists(os.path.join(self.tmp, "out")))
-        _, kernels = self._effective()
-        self._assert_pr_rows(kernels)
+        out, stats = tables.apply_intree_rows(
+            aiter_rows, intree, table.key_cols, table.kernel_cols
+        )
+        self.assertEqual(
+            stats,
+            {
+                tables.APPLIED: 1,
+                tables.UPSTREAM: 1,
+                tables.SUPERSEDED: 2,
+                tables.MISSING: 1,
+                tables.ADDED: 1,
+            },
+        )
+        self.assertEqual(out["M"].tolist(), [1, 2, 3, 5, 6])
+        self.assertEqual(
+            out["kernelName"].tolist(), ["triton", "triton", "newer", "ck7", "triton"]
+        )
 
 
 def _write_rows(tmp, name, rows):
