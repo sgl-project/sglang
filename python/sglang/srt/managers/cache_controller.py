@@ -319,6 +319,7 @@ class HiCacheController:
         storage_backend_extra_config: Optional[dict] = None,
         enable_storage_metrics: bool = False,
         host_memory_mode: str = "cache",
+        mirror_topk_rows: bool = True,
     ):
         self.tp_group = tp_group
         self.host_memory_mode = host_memory_mode
@@ -386,11 +387,14 @@ class HiCacheController:
 
         self.l2_transfer_engine = L2TransferEngine(io_backend)
         # Routed-experts rows follow their KV through the host tier; None
-        # without a routed-experts capturer.
+        # without a routed-experts capturer, or for a controller that never
+        # loads host slots back (mirror_topk_rows=False).
         from sglang.srt.mem_cache.hicache_topk_rows import HostTopkRows
 
-        self.topk_rows = HostTopkRows.create(
-            host_pool=self.mem_pool_host, device=str(self.device)
+        self.topk_rows = (
+            HostTopkRows.create(host_pool=self.mem_pool_host, device=str(self.device))
+            if mirror_topk_rows
+            else None
         )
 
         # If a storage backend is provided at startup, treat it as an implicit attach,

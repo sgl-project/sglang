@@ -273,6 +273,7 @@ def _build_cache_controller(
     model_name: Optional[str],
     storage_backend_extra_config: Optional[dict],
     enable_storage_metrics: bool,
+    mirror_topk_rows: bool = True,
 ) -> HybridCacheController:
     memory = get_memory()
     return HybridCacheController(
@@ -293,6 +294,7 @@ def _build_cache_controller(
         transfer_layer_id_max=transfer_layer_id_max,
         enable_storage_metrics=enable_storage_metrics,
         host_memory_mode=memory.hicache_host_memory_mode,
+        mirror_topk_rows=mirror_topk_rows,
     )
 
 
@@ -1471,6 +1473,8 @@ def build_unified_host_stack(
         model_name=model_name,
         storage_backend_extra_config=storage_backend_extra_config,
         enable_storage_metrics=enable_storage_metrics,
+        # A decode offload stack (no cache) never loads host slots back.
+        mirror_topk_rows=cache is not None,
     )
     return StackBuildResult(
         host_pool_group=host_pool_group,

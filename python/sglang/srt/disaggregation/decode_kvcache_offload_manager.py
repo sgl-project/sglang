@@ -123,6 +123,8 @@ class DecodeKVCacheOffloadManager:
                 storage_backend=get_memory().hicache_storage_backend,
                 model_name=get_serving().served_model_name,
                 storage_backend_extra_config=hicache_storage_backend_extra_config,
+                # Decode offload only writes to host and storage, never loads back.
+                mirror_topk_rows=False,
             )
 
         self.ongoing_offload = {}
