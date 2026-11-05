@@ -76,6 +76,7 @@ from sglang.srt.runtime_context import (
     get_device,
     get_exec,
     get_parallel,
+    get_platform,
 )
 from sglang.srt.state_capturer.indexer_topk import (
     maybe_capture_indexer_topk,
@@ -1433,9 +1434,14 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 num_heads=self.n_heads,
             )
         ctx_2d = getattr(metadata, "paged_mqa_ctx_lens_2d", None)
+        # DCP verify rows carry their own local lengths ([B, next_n]). DG-native
+        # bounds a request's keys by its last row's length and masks no row, and
+        # the DCP top-k bounds each row by its own length, so the request's
+        # draft rows share one index-K read (SM100 only: SM90 caps next_n at 2).
         use_dg_native = (
             not use_cute_dsl
             and _is_cuda
+            and (dcp_size == 1 or get_platform().is_sm100)
             and forward_batch.forward_mode.is_target_verify()
             and next_n >= 2
             and ctx_2d is not None

@@ -1013,13 +1013,21 @@ class DeepseekSparseAttnBackend(
         # TODO: SM90 supports DG-native next_n in {1,2} too — enable once
         # validated; for now DG-native is SM100+ only.
         next_n = self.speculative_num_draft_tokens
-        if (
+        dg_native_verify = (
             forward_mode.is_target_verify()
             and next_n
             and next_n >= 2
             and get_platform().is_sm100
             and not envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
-        ):
+        )
+        if forward_mode.is_target_verify() and self.attn_dcp_size > 1:
+            # DCP: each verify row scores this rank's share of its causal length,
+            # laid out [B, next_n] for DG-native (one index-K read per request).
+            lens = _to_2d_context_lens(seqlens_expanded, batch_size)
+            if dg_native_verify and lens.numel() == batch_size * next_n:
+                lens = lens.view(batch_size, next_n)
+            return self._dcp_local_ctx_lens(lens)
+        if dg_native_verify:
             return cache_seqlens_int32.view(-1, 1).expand(-1, next_n).contiguous()
         if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
             return _to_2d_context_lens(seqlens_expanded, batch_size)
@@ -2010,6 +2018,7 @@ class DeepseekSparseAttnBackend(
                 if (
                     self.speculative_num_draft_tokens >= 2
                     and get_platform().is_sm100
+                    and self.attn_dcp_size == 1
                     and metadata.paged_mqa_ctx_lens_2d is not None
                     and metadata.paged_mqa_ctx_lens_2d.dim() == 2
                     and metadata.paged_mqa_ctx_lens_2d.size(0) == bs
@@ -2633,6 +2642,8 @@ class DeepseekSparseAttnBackend(
                 layer=layer,
                 metadata=metadata,
                 page_table_1=page_table_1,
+                dcp_partial=self.attn_dcp_size > 1
+                and forward_batch.forward_mode.is_target_verify(),
             )
         elif dsa_impl == "fa3":
             return self._forward_fa3(
