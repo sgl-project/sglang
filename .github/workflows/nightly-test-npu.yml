@@ -2,11 +2,6 @@ name: Nightly Test (NPU)
 on:
   schedule:
     - cron: '0 16 * * *'  # Execute at 0:00 a.m. Beijing Time every day
-  pull_request:
-    branches:
-      - main
-    paths:
-      - ".github/workflows/nightly-test-npu.yml"
   workflow_dispatch:
     inputs:
       ref:
@@ -301,7 +296,7 @@ jobs:
 
   nightly-poc-multi-node-tests:
     name: multi-node-poc
-    if: false # TEMP: single-case validation for qwen3.6-27B GPQA, restore afterwards
+    if: false # TEMP: was '!cancelled()', restore after glm5.2 2P2D validation
     needs: [set-image-config, nightly-perf-2-npu-a3, nightly-perf-4-npu-a3, nightly-perf-16-npu-a3, nightly-acc-2-npu-a3, nightly-acc-16-npu-a3]
     strategy:
       fail-fast: false
