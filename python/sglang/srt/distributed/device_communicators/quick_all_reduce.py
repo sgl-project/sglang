@@ -17,7 +17,7 @@ from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import 
 )
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
 from sglang.srt.environ import envs
-from sglang.srt.utils import is_cuda, is_gfx95_supported, is_hip
+from sglang.srt.utils import is_cuda, is_gfx95_supported, is_hip, print_warning_once
 
 logger = logging.getLogger(__name__)
 
@@ -209,18 +209,30 @@ class QuickAllReduce:
             envs.SGLANG_USE_AITER_FLYDSL_QUICK_REDUCE.get()
             and self.qr_quant_level == QuickReduceRegime.INT4
             and is_gfx95_supported()
+            and self._init_flydsl_int4(qr_max_size)
         ):
-            self._init_flydsl_int4(qr_max_size)
             return
         # If qr_max_size is None, then 2GB is used by default.
         self._ptr = ops.init_custom_qr(self.rank, self.world_size, qr_max_size)
         self.qr_max_size = qr_max_size if qr_max_size > 0 else ops.qr_max_size()
         self.create_shared_buffer()
         self.disabled = False
+        logger.info(
+            "QuickReduce %s uses the HIP kernel (max %d MiB)",
+            self.qr_quant_level.name,
+            self.qr_max_size // MB,
+        )
 
-    def _init_flydsl_int4(self, qr_max_size: int):
+    def _init_flydsl_int4(self, qr_max_size: int) -> bool:
         # FlyDSL owns its IPC buffers, so the HIP QuickReduce is not created.
-        from aiter.ops.flydsl import QuickAllReduceInt4
+        try:
+            from aiter.ops.flydsl import QuickAllReduceInt4
+        except ImportError as e:
+            print_warning_once(
+                "SGLANG_USE_AITER_FLYDSL_QUICK_REDUCE is set, but aiter has no FlyDSL "
+                f"QuickAllReduceInt4 ({e}); QuickReduce INT4 uses the HIP kernel."
+            )
+            return False
 
         self._flydsl_int4 = QuickAllReduceInt4(
             group=self.group,
@@ -237,6 +249,7 @@ class QuickAllReduce:
             "QuickReduce INT4 uses aiter FlyDSL QuickAllReduceInt4 (max %d MiB)",
             self.qr_max_size // MB,
         )
+        return True
 
     def create_shared_buffer(self):
         """
