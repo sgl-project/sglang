@@ -19,6 +19,7 @@ from __future__ import annotations
 import atexit
 import logging
 import os
+from typing import Optional
 
 import pytest
 import torch
@@ -42,7 +43,7 @@ GRAPH_CHECKS, REPLAYS_PER_CHECK = 5, 20  # 3 * 100 calls per row slot > 255 tags
 
 
 @cache_once
-def _init_once() -> DcpTopKMerge:
+def _init_once() -> Optional[DcpTopKMerge]:
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(local_rank)
@@ -54,7 +55,7 @@ def _init_once() -> DcpTopKMerge:
     get_parallel().override_permanently(world_group=ps._WORLD)
     atexit.register(dist.destroy_process_group)
     logging.disable(logging.INFO)
-    return DcpTopKMerge(ps._WORLD, MAX_ROWS, TOPK)
+    return DcpTopKMerge.create(ps._WORLD, MAX_ROWS, TOPK)
 
 
 def _rows(kind: str, seed: int) -> list[torch.Tensor]:
@@ -199,7 +200,7 @@ def test_dcp_topk_merge(kind: str) -> None:
     world, rank = ps._WORLD.world_size, ps._WORLD.rank_in_group
     if world != 8:
         pytest.skip("the merge needs 8 ranks")
-    if merge.buffer is None:
+    if merge is None:
         pytest.skip("multimem multicast unavailable")
     span = PAGE_SIZE * world
     cases = [_Case(kind, seed, rank, world, span) for seed in SEEDS]

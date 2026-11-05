@@ -21,6 +21,8 @@ top-k ranks within the top-k of its own shard, so the merge is exact. With 8
 or 16 ranks and multicast, decode rows merge in one kernel (``DcpTopKMerge``).
 """
 
+from __future__ import annotations
+
 from typing import Optional
 
 import torch
@@ -44,21 +46,29 @@ _DCP_MERGE_CAND_K = 384
 
 class DcpTopKMerge:
     """Exact global top-k merge of decode rows in one kernel; see
-    jit/csrc/dsa/dcp_topk_merge.cuh. Needs 8 or 16 ranks (one warp each), top-k
-    2048 and multicast; ``usable`` is False otherwise."""
+    jit/csrc/dsa/dcp_topk_merge.cuh. Built by ``create``."""
 
-    def __init__(self, group, max_rows: int, topk: int):
-        import torch.distributed._symmetric_memory as symm_mem
-
+    def __init__(self, group, max_rows: int, topk: int, buffer: torch.Tensor, handle):
+        device = group.device
         self.dcp_rank = group.rank_in_group
         self.max_rows = max_rows
-        self.buffer: Optional[torch.Tensor] = None
-        self.multicast_ptr = 0
-        self.peer_ptrs: Optional[torch.Tensor] = None
-        self.counters: Optional[torch.Tensor] = None
+        self.buffer = buffer
+        self.multicast_ptr = handle.multicast_ptr
+        self.peer_ptrs = torch.tensor(
+            handle.buffer_ptrs, dtype=torch.int64, device=device
+        )
+        self.counters = torch.zeros(max_rows, dtype=torch.int64, device=device)
         # 1 where a row's candidates could not certify the result (for tests)
-        self.fallback: Optional[torch.Tensor] = None
-        self.union_scratch: Optional[torch.Tensor] = None
+        self.fallback = torch.zeros(max_rows, dtype=torch.int32, device=device)
+        self.union_scratch = torch.empty(
+            (max_rows, group.world_size * topk), dtype=torch.int64, device=device
+        )
+
+    @classmethod
+    def create(cls, group, max_rows: int, topk: int) -> Optional[DcpTopKMerge]:
+        """Collective over ``group``. None unless it has 8 ranks (16 with the
+        megakernel), top-k is 2048, and its GPUs share NVLink multicast."""
+        import torch.distributed._symmetric_memory as symm_mem
 
         world = group.world_size
         # 16 ranks only on megakernel paths
@@ -69,11 +79,12 @@ class DcpTopKMerge:
                 if 16 in worlds
                 else "DSA DCP top-k merge off: it needs 8 ranks and top-k 2048"
             )
-            return
+            return None
         if not all(in_the_same_node_as(group.cpu_group)) and not is_one_nvlink_clique(
             group.cpu_group, group.device
         ):
-            return
+            print_info_once("DSA DCP top-k merge off: ranks span NVLink domains")
+            return None
         buffer = symm_mem.empty(
             dcp_topk_merge_buffer_numel(world, max_rows, topk, _DCP_MERGE_CAND_K),
             dtype=torch.int64,
@@ -86,20 +97,11 @@ class DcpTopKMerge:
         handle = symm_mem.rendezvous(buffer, group.device_group.group_name)
         if handle.multicast_ptr == 0:
             print_info_once("DSA DCP top-k merge off: no multicast")
-            return
-        self.buffer = buffer
-        self.multicast_ptr = handle.multicast_ptr
-        self.peer_ptrs = torch.tensor(
-            handle.buffer_ptrs, dtype=torch.int64, device=group.device
-        )
-        self.counters = torch.zeros(max_rows, dtype=torch.int64, device=group.device)
-        self.fallback = torch.zeros(max_rows, dtype=torch.int32, device=group.device)
-        self.union_scratch = torch.empty(
-            (max_rows, world * topk), dtype=torch.int64, device=group.device
-        )
+            return None
+        return cls(group, max_rows, topk, buffer, handle)
 
     def usable(self, rows: int) -> bool:
-        return self.buffer is not None and rows <= self.max_rows
+        return rows <= self.max_rows
 
     def __call__(
         self,
