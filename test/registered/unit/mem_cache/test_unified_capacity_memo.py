@@ -38,6 +38,9 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def _build(lazy: bool):
+    from sglang.test.unified_allocator_fixtures import setup_allocator_context
+
+    setup_allocator_context()
     # Function-scope import: the fixture is a TestCase subclass, and a
     # module-scope binding would make pytest collect its tests AGAIN here.
     from test_multi_ended_allocator import TestWindowChainAllocator as _SwaFixture
@@ -194,6 +197,9 @@ class TestTriCapacityMemoCoherence(CustomTestCase):
     mamba-end state draw and a float span move behind the composite."""
 
     def _build_tri(self, lazy=False):
+        from sglang.test.unified_allocator_fixtures import setup_allocator_context
+
+        setup_allocator_context()
         from test_unified_tri_pool import TestUnifiedTriPool
 
         inst = TestUnifiedTriPool(
