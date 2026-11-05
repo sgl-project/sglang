@@ -94,6 +94,18 @@ def test_real_manager_mtp_owner_share_lifecycle(
     pool.req_to_token[2, :CONTEXT] = torch.arange(CONTEXT, 2 * CONTEXT, device=device)
     index_pool = _IndexPool(keys)
     budget = resolve_sparse_kv_budget(
+        model_config=SimpleNamespace(
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            index_head_dim=128,
+            hf_config=SimpleNamespace(
+                architectures=["GlmMoeDsaForCausalLM"],
+                index_head_dim=128,
+                index_n_heads=32,
+                index_topk=2048,
+            ),
+        ),
+        page_size=128,
         request_rows=3,
         graph_batch_capacity=3,
         context_len=CONTEXT,
@@ -104,6 +116,7 @@ def test_real_manager_mtp_owner_share_lifecycle(
         copy_sfa_query_heads=heads,
         max_query_width=Q,
     )
+    index_pool.sparse_kv_budget_plan = budget
     inputs = SimpleNamespace(
         batch_size=batch,
         forward_mode=ForwardMode.TARGET_VERIFY,
@@ -149,24 +162,6 @@ def test_real_manager_mtp_owner_share_lifecycle(
             stack.enter_context(envs.SGLANG_ENABLE_ASYNC_ASSERT.override(async_checks))
             stack.enter_context(
                 patch("sglang.srt.runtime_context.get_spec", return_value=spec)
-            )
-            stack.enter_context(
-                patch(
-                    "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_manager.get_sparse_kv_budget",
-                    return_value=budget,
-                )
-            )
-            stack.enter_context(
-                patch(
-                    "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_manager.get_sparse_kv_max_query_width",
-                    return_value=Q,
-                )
-            )
-            stack.enter_context(
-                patch(
-                    "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_manager.get_eager_max_batch_size",
-                    return_value=3,
-                )
             )
             manager = SparseKVCacheManager(
                 pool,

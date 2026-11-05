@@ -46,6 +46,19 @@ class TestLIMState(CustomTestCase):
 
     def options(self, **kwargs):
         return dict(
+            model_config=SimpleNamespace(
+                kv_lora_rank=512,
+                qk_rope_head_dim=64,
+                index_head_dim=128,
+                hf_config=SimpleNamespace(
+                    architectures=["GlmMoeDsaForCausalLM"],
+                    index_head_dim=128,
+                    index_n_heads=64,
+                    index_topk=2048,
+                ),
+            ),
+            page_size=128,
+            copy_sfa_query_heads=128,
             request_rows=3,
             graph_batch_capacity=8,
             context_len=32768,
@@ -54,6 +67,30 @@ class TestLIMState(CustomTestCase):
             kv_bytes_per_token=1152,
             **kwargs,
         )
+
+    def test_model_index_heads_control_query_scale_budget(self):
+        options = self.options()
+        options["model_config"].hf_config.index_n_heads = 32
+        small = resolve_sparse_kv_budget(**options)
+        options["model_config"].hf_config.index_n_heads = 64
+        large = resolve_sparse_kv_budget(**options)
+        self.assertEqual(small.adapter_buffers["query_scale"].shape[-1], 32)
+        self.assertEqual(large.adapter_buffers["query_scale"].shape[-1], 64)
+        self.assertEqual(
+            large.managed_hbm_bytes - small.managed_hbm_bytes,
+            small.batch_capacity * small.max_query_width * (64 - 32) * 4,
+        )
+
+    def test_unsupported_model_geometry_is_rejected(self):
+        for field, value in (
+            ("kv_lora_rank", 256),
+            ("qk_rope_head_dim", 32),
+            ("index_head_dim", 96),
+        ):
+            options = self.options()
+            setattr(options["model_config"], field, value)
+            with self.assertRaises(ValueError):
+                resolve_sparse_kv_budget(**options)
 
     def test_query_geometry_uses_actual_verify_width(self):
         for width in (1, 2, 3, 4, 5, 8, 14):
@@ -100,9 +137,19 @@ class TestLIMState(CustomTestCase):
 
     def test_adapter_budget_matches_actual_dynamic_query_allocations(self):
         prefix = "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload."
-        for width in (1, 3, 4, 8, 14):
+        for width, indexer_heads in (
+            (1, 32),
+            (4, 32),
+            (1, 64),
+            (3, 64),
+            (4, 64),
+            (8, 64),
+            (14, 64),
+        ):
+            options = self.options(max_query_width=width)
+            options["model_config"].hf_config.index_n_heads = indexer_heads
             manager = SimpleNamespace(
-                budget=resolve_sparse_kv_budget(**self.options(max_query_width=width)),
+                budget=resolve_sparse_kv_budget(**options),
                 cache_capacity=width * 2048,
                 size=3,
                 batch_capacity=8,
@@ -157,8 +204,8 @@ class TestLIMState(CustomTestCase):
                 for t in vars(adapter).values()
                 if isinstance(t, torch.Tensor) and t is not adapter.key_scale
             )
-            budget = resolve_sparse_kv_budget(**self.options(max_query_width=width))
-            self.assertEqual(budget.adapter_bytes, allocated)
+            self.assertEqual(manager.budget.adapter_bytes, allocated)
+            self.assertEqual(adapter.query_scale.shape[-1], indexer_heads)
 
     def test_plan_alignment_and_limits(self):
         for width in (1, 4):
@@ -209,6 +256,9 @@ class TestLIMState(CustomTestCase):
 
         prefix = "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload."
         plan = resolve_sparse_kv_budget(
+            model_config=self.options()["model_config"],
+            page_size=128,
+            copy_sfa_query_heads=128,
             request_rows=4,
             context_len=4097,
             num_layers=2,
@@ -299,6 +349,10 @@ class TestLIMState(CustomTestCase):
         with self.assertRaises(ValueError):
             plan.validate_buffers(manager.lim_adapter, plan.adapter_buffers)
         manager.lim_adapter.source_ids = original
+        pool.kv_lora_rank = 256
+        with self.assertRaises(ValueError):
+            plan.bind_native_pool(pool)
+        pool.kv_lora_rank = 512
         pool.size = 3968
         with self.assertRaises(ValueError):
             plan.bind_native_pool(pool)

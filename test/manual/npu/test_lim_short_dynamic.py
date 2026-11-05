@@ -1,8 +1,6 @@
 """Real-manager dense/sparse mixed attention, replay and residency lifecycle."""
 
-from contextlib import ExitStack
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import pytest
 import torch
@@ -64,6 +62,18 @@ def test_prefill_attention_and_short_residency():
     mapping = (pages[..., None] * 128 + torch.arange(128)).view(2, context)
     pool.req_to_token[1:3] = mapping.to("npu")
     budget = resolve_sparse_kv_budget(
+        model_config=SimpleNamespace(
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            index_head_dim=128,
+            hf_config=SimpleNamespace(
+                architectures=["GlmMoeDsaForCausalLM"],
+                index_head_dim=128,
+                index_n_heads=32,
+                index_topk=2048,
+            ),
+        ),
+        page_size=128,
         request_rows=3,
         graph_batch_capacity=3,
         context_len=context,
@@ -73,15 +83,9 @@ def test_prefill_attention_and_short_residency():
         cache_tokens=capacity,
         copy_sfa_query_heads=heads,
     )
-    prefix = "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_manager."
+    index_pool.sparse_kv_budget_plan = budget
     manager = None
-    with ExitStack() as stack:
-        stack.enter_context(get_parallel().override(attn_cp_size=1))
-        stack.enter_context(patch(prefix + "get_sparse_kv_budget", return_value=budget))
-        stack.enter_context(
-            patch(prefix + "get_sparse_kv_max_query_width", return_value=1)
-        )
-        stack.enter_context(patch(prefix + "get_eager_max_batch_size", return_value=3))
+    with get_parallel().override(attn_cp_size=1):
         try:
             manager = SparseKVCacheManager(
                 pool,
@@ -196,6 +200,18 @@ def test_short_sparse_graph_lifecycle(
     pool.req_to_token[2, :context] = mapping[1].to("npu")
     index_pool = _IndexPool(key)
     budget = resolve_sparse_kv_budget(
+        model_config=SimpleNamespace(
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            index_head_dim=128,
+            hf_config=SimpleNamespace(
+                architectures=["GlmMoeDsaForCausalLM"],
+                index_head_dim=128,
+                index_n_heads=32,
+                index_topk=2048,
+            ),
+        ),
+        page_size=128,
         request_rows=3,
         graph_batch_capacity=3,
         context_len=context,
@@ -206,14 +222,9 @@ def test_short_sparse_graph_lifecycle(
         copy_sfa_query_heads=heads,
         max_query_width=width,
     )
-    prefix = "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_manager."
+    index_pool.sparse_kv_budget_plan = budget
     manager = None
-    with ExitStack() as stack:
-        stack.enter_context(patch(prefix + "get_sparse_kv_budget", return_value=budget))
-        stack.enter_context(
-            patch(prefix + "get_sparse_kv_max_query_width", return_value=width)
-        )
-        stack.enter_context(patch(prefix + "get_eager_max_batch_size", return_value=3))
+    with get_parallel().override(attn_cp_size=1):
         try:
             manager = SparseKVCacheManager(
                 pool,

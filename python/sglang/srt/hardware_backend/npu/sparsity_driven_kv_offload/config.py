@@ -37,11 +37,6 @@ def use_fused_sparse_kv_offload() -> bool:
     return envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.get()
 
 
-def is_copy_sfa_decode_graph_eligible(seq_lens_cpu) -> bool:
-    """Dense and sparse rows share the fused graph, regardless of length."""
-    return True
-
-
 def is_sparsity_driven_kv_offload_enabled(
     *,
     model_config: ModelConfig,
@@ -160,17 +155,23 @@ def get_sparsity_driven_kv_offload_cell_size(
 
 def get_sparse_kv_budget(
     *,
+    model_config: ModelConfig,
     request_rows: int,
     context_len: int,
     num_layers: int,
     top_k: int,
     kv_bytes_per_token: int,
-    copy_sfa_query_heads: int = 128,
+    copy_sfa_query_heads: Optional[int] = None,
     graph_batch_capacity: Optional[int] = None,
     kv_dtype: torch.dtype = torch.bfloat16,
 ) -> BudgetPlan:
     if not use_fused_sparse_kv_offload():
         raise ValueError("Sparse KV budgeting requires fused LIM and CopySFA.")
+    if copy_sfa_query_heads is None:
+        query_heads = model_config.num_attention_heads // get_parallel().attn_tp_size
+        if query_heads <= 0:
+            raise ValueError("CopySFA requires a positive per-rank query head count.")
+        copy_sfa_query_heads = 1 << (query_heads - 1).bit_length()
     if graph_batch_capacity is None:
         # Reserve before admission determines the final request-pool size.
         # Capture buckets may round that size up for attention parallelism.
@@ -183,6 +184,8 @@ def get_sparse_kv_budget(
             if decode is not None and decode.bs:
                 graph_batch_capacity = min(max(decode.bs), graph_batch_capacity)
     return resolve_sparse_kv_budget(
+        model_config=model_config,
+        page_size=get_schedule().page_size,
         request_rows=request_rows,
         context_len=context_len,
         num_layers=num_layers,

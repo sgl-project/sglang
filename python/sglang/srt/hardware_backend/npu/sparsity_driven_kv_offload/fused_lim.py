@@ -48,6 +48,8 @@ class LIMDecodeAdapter:
         self.max_query_width = manager.max_query_width
         self.top_k = manager.sparse_context_len
         self.source_capacity = manager.max_context_len
+        self.index_head_dim = manager.budget.index_head_dim
+        self.index_n_heads = manager.budget.index_n_heads
         self.operator = load_fused_lim_operator()
         try:
             supported = torch.ops.npu.lim_full_visible_max_query_width.default()
@@ -93,6 +95,8 @@ class LIMDecodeAdapter:
         rows = batch * width
         if (
             not 1 <= width <= self.max_query_width
+            or query.ndim != 3
+            or query.shape[1:] != (self.index_n_heads, self.index_head_dim)
             or query.shape[0] < rows
             or batch > self.batch_capacity
         ):

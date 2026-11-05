@@ -284,6 +284,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         1, get_schedule().max_running_requests // kvc.attn_dp_size
                     )
                     budget_options = dict(
+                        model_config=kvc.model_config,
                         request_rows=max_running_requests_per_worker + extra_rows + 1,
                         context_len=kvc.model_config.context_len
                         + get_req_to_token_extra_context_len(),
@@ -296,14 +297,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         )
                         * torch._utils._element_size(kvc.kv_cache_dtype),
                     )
-                    query_heads = (
-                        kvc.model_config.num_attention_heads
-                        // get_parallel().attn_tp_size
-                    )
                     kvc.sparse_kv_budget_plan = get_sparse_kv_budget(
                         num_layers=num_layers,
                         kv_dtype=kvc.kv_cache_dtype,
-                        copy_sfa_query_heads=1 << (query_heads - 1).bit_length(),
                         **budget_options,
                     )
                 budget = kvc.sparse_kv_budget_plan

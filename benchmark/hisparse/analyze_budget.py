@@ -16,6 +16,7 @@ import json
 import sys
 from collections import OrderedDict
 from pathlib import Path
+from types import SimpleNamespace
 
 
 def load_budget_module():
@@ -97,6 +98,19 @@ def scenario_grid(args):
             for batch_size in args.batch_sizes:
                 for capacity in args.cache_sizes:
                     allocation = budget.resolve_sparse_kv_budget(
+                        model_config=SimpleNamespace(
+                            kv_lora_rank=512,
+                            qk_rope_head_dim=64,
+                            index_head_dim=128,
+                            hf_config=SimpleNamespace(
+                                architectures=["GlmMoeDsaForCausalLM"],
+                                index_head_dim=128,
+                                index_n_heads=64,
+                                index_topk=2048,
+                            ),
+                        ),
+                        page_size=128,
+                        copy_sfa_query_heads=128,
                         request_rows=batch_size + 1,
                         context_len=context_len,
                         num_layers=args.layers,

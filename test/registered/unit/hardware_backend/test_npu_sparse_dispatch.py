@@ -1,12 +1,28 @@
 """CPU contracts for selecting the NPU sparse-KV implementations."""
 
 import sys
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload import config, dispatch
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=1, stage="base-a")
+
+MODEL_CONFIG = SimpleNamespace(
+    num_attention_heads=128,
+    kv_lora_rank=512,
+    qk_rope_head_dim=64,
+    index_head_dim=128,
+    hf_config=SimpleNamespace(
+        architectures=["GlmMoeDsaForCausalLM"],
+        index_head_dim=128,
+        index_n_heads=64,
+        index_topk=512,
+    ),
+)
 
 
 @pytest.mark.parametrize("fused", [False, True])
@@ -48,29 +64,13 @@ def test_manager_and_attention_follow_one_switch(monkeypatch, fused):
     assert dispatch.get_sparse_kv_attention(fused=fused) is expected[fused]
 
 
-def test_legacy_budget_preserves_topk_capacity(monkeypatch):
+def test_legacy_budget_requires_fused_mode(monkeypatch):
+    monkeypatch.setattr(config, "get_schedule", lambda: SimpleNamespace(page_size=128))
     monkeypatch.setattr(config, "get_eager_max_batch_size", lambda _: 4)
     with envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.override(False):
-        budget = config.get_sparse_kv_budget(
-            request_rows=3,
-            context_len=1024,
-            num_layers=2,
-            top_k=512,
-            kv_bytes_per_token=1152,
-            graph_batch_capacity=4,
-        )
-    assert budget.cache_tokens == 512
-    assert budget.device_kv_bytes == 3 * 2 * 512 * 1152
-    assert budget.slot_map_bytes == 2 * 4 * ((1024 // 8 + 1) * 8) * 4
-    assert budget.managed_hbm_bytes >= budget.device_kv_bytes + budget.slot_map_bytes
-
-
-def test_fused_budget_keeps_its_constraints(monkeypatch):
-    monkeypatch.setattr(config, "get_eager_max_batch_size", lambda _: 4)
-    monkeypatch.setattr(config, "get_sparse_kv_max_query_width", lambda: 4)
-    with envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.override(True):
-        with pytest.raises(ValueError, match="K=2048"):
+        with pytest.raises(ValueError):
             config.get_sparse_kv_budget(
+                model_config=MODEL_CONFIG,
                 request_rows=3,
                 context_len=1024,
                 num_layers=2,
@@ -78,3 +78,25 @@ def test_fused_budget_keeps_its_constraints(monkeypatch):
                 kv_bytes_per_token=1152,
                 graph_batch_capacity=4,
             )
+
+
+def test_fused_budget_keeps_its_constraints(monkeypatch):
+    monkeypatch.setattr(config, "get_parallel", lambda: SimpleNamespace(attn_tp_size=1))
+    monkeypatch.setattr(config, "get_schedule", lambda: SimpleNamespace(page_size=128))
+    monkeypatch.setattr(config, "get_eager_max_batch_size", lambda _: 4)
+    monkeypatch.setattr(config, "get_sparse_kv_max_query_width", lambda: 4)
+    with envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.override(True):
+        with pytest.raises(ValueError, match="K=2048"):
+            config.get_sparse_kv_budget(
+                model_config=MODEL_CONFIG,
+                request_rows=3,
+                context_len=1024,
+                num_layers=2,
+                top_k=512,
+                kv_bytes_per_token=1152,
+                graph_batch_capacity=4,
+            )
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__]))

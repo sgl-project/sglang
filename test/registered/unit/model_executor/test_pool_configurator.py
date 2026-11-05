@@ -211,6 +211,8 @@ def _configure_dsa_model(model_runner):
     hf_config.architectures = ["GlmMoeDsaForCausalLM"]
     hf_config.index_topk = 2048
     hf_config.index_head_dim = 128
+    hf_config.index_n_heads = 64
+    model_runner.model_config.index_head_dim = 128
 
 
 KV_SIZE = 2  # bf16
@@ -1174,6 +1176,7 @@ class TestEagleConfigurator(CustomTestCase):
         ):
             cfg = DefaultPoolConfigurator(mr)
             options = dict(
+                model_config=mr.model_config,
                 request_rows=3,
                 context_len=8192 + get_req_to_token_extra_context_len(),
                 top_k=2048,
