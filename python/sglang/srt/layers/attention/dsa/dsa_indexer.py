@@ -2209,10 +2209,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 x, q_lora, positions, forward_batch, layer_id, act_quant
             )
             q_with_sf = (q, None)
-        elif (
-            is_graph_dsa_split_op_surface(forward_batch)
-            and not self.dsa_enable_prefill_cp
-        ):
+        elif is_graph_dsa_split_op_surface(forward_batch):
             # Default path for non-CP prefill under PCG/BCG: run the whole indexer
             # (q/k proj, head gate, k-cache store, topk) as a single eager split op
             # instead of capturing it piecemeal in the graph. The split op is
