@@ -64,6 +64,7 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
 from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.dllm.metrics import make_dllm_metrics
 from sglang.srt.elastic_ep.topology import (
     attn_replica_size,
     physical_ep_size_to_dp_size,
@@ -382,6 +383,10 @@ class ReqState:
     # Accumulated keys written to meta_info. Cumulative streams re-report only
     # these, so a subclass can accumulate values it keeps out of responses.
     customized_info_reported_keys: Set[str] = dataclasses.field(default_factory=set)
+
+    # Last cumulative dLLM work snapshot received, independent of token slicing.
+    dllm_forward_count: int = 0
+    dllm_completion_tokens: int = 0
 
     # For return_prompt_token_ids: stores prompt token IDs captured after tokenization
     prompt_token_ids: Optional[List[int]] = None
@@ -2023,6 +2028,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     meta_info[key] = [
                         item for m in meta_info_list for item in m.get(key, [])
                     ]
+            if "dllm_metrics" in meta_info:
+                metrics = [m["dllm_metrics"] for m in meta_info_list]
+                meta_info["dllm_metrics"] = make_dllm_metrics(
+                    sum(m["forward_count"] for m in metrics),
+                    sum(m["completion_tokens"] for m in metrics),
+                )
             out["meta_info"] = meta_info
         return out
 
@@ -2765,6 +2776,22 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         "cached_tokens": request_stats.cached_tokens,
                     }
                 )
+                if (
+                    recv_obj.dllm_forward_counts is not None
+                    and (forward_count := recv_obj.dllm_forward_counts[i]) is not None
+                ):
+                    completion_tokens = recv_obj.completion_tokens[i]
+                    if state.obj.stream and self.incremental_streaming_output:
+                        meta_info["dllm_metrics"] = make_dllm_metrics(
+                            forward_count - state.dllm_forward_count,
+                            completion_tokens - state.dllm_completion_tokens,
+                        )
+                    else:
+                        meta_info["dllm_metrics"] = make_dllm_metrics(
+                            forward_count, completion_tokens
+                        )
+                    state.dllm_forward_count = forward_count
+                    state.dllm_completion_tokens = completion_tokens
                 if (
                     recv_obj.weight_versions is not None
                     and (spans := recv_obj.weight_versions[i]) is not None

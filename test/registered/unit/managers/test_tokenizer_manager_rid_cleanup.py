@@ -24,6 +24,7 @@ from unittest.mock import AsyncMock, MagicMock, Mock, patch
 import msgspec
 from fastapi import HTTPException
 
+from sglang.srt.dllm.metrics import make_dllm_metrics
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
@@ -34,6 +35,7 @@ from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry  # noqa: E402
 from sglang.srt.managers.io_struct import (  # noqa: E402
     AbortReq,
     BatchStrOutput,
+    BatchTokenIDOutput,
     EmbeddingReqInput,
     GenerateReqInput,
     RequestOutputStats,
@@ -1704,6 +1706,92 @@ class TestPriorityRange(CustomTestCase):
                         with self.assertRaisesRegex(ValueError, "signed 64-bit"):
                             asyncio.run(tm.generate_request(obj).__anext__())
                         tm._init_req_state.assert_not_called()
+
+
+def _dllm_output(kind, rid, count, completion_tokens, ids, finished):
+    out = _make_batch_str_output(rid)
+    out.finished_reasons = [{"type": "length"} if finished else None]
+    out.output_ids_flat = array("q", ids)
+    out.output_ids_offsets = [0, len(ids)]
+    out.completion_tokens = [completion_tokens]
+    out.dllm_forward_counts = None if count is None else [count]
+    if kind is BatchStrOutput:
+        return out
+    values = {}
+    for field in msgspec.structs.fields(BatchTokenIDOutput):
+        if hasattr(out, field.name):
+            values[field.name] = getattr(out, field.name)
+        elif (
+            field.default is msgspec.NODEFAULT
+            and field.default_factory is msgspec.NODEFAULT
+        ):
+            values[field.name] = [[]]
+    return BatchTokenIDOutput(**values)
+
+
+class TestForwardMetricsStreaming(unittest.TestCase):
+    def test_native_output_handlers_all_stream_modes(self):
+        for kind in (BatchStrOutput, BatchTokenIDOutput):
+            for stream, incremental in ((False, False), (True, False), (True, True)):
+                with self.subTest(
+                    kind=kind.__name__, stream=stream, incremental=incremental
+                ):
+                    tm = _make_tokenizer_manager(self)
+                    tm.incremental_streaming_output = incremental
+                    state = _make_req_state("metrics")
+                    state.obj.stream = stream
+                    state.obj.return_sampling_mask = False
+                    tm.rid_to_state["metrics"] = state
+                    for count, tokens, ids, finished in (
+                        (2, 0, [], False),
+                        (5, 6, list(range(6)), False),
+                        (6, 8, [6, 7], True),
+                    ):
+                        asyncio.run(
+                            tm._handle_batch_output(
+                                _dllm_output(
+                                    kind, "metrics", count, tokens, ids, finished
+                                )
+                            )
+                        )
+                    metrics = [o["meta_info"]["dllm_metrics"] for o in state.out_list]
+                    if incremental:
+                        self.assertEqual(
+                            [m["forward_count"] for m in metrics], [2, 3, 1]
+                        )
+                        self.assertEqual(
+                            [m["completion_tokens"] for m in metrics], [0, 6, 2]
+                        )
+                        merged = tm._coalesce_streaming_chunks(
+                            state.out_list, "metrics"
+                        )
+                        self.assertEqual(
+                            merged["meta_info"]["dllm_metrics"], make_dllm_metrics(6, 8)
+                        )
+                    else:
+                        self.assertEqual(metrics[-1], make_dllm_metrics(6, 8))
+                        if stream:
+                            self.assertEqual(metrics[0], make_dllm_metrics(2, 0))
+                    self.assertEqual(
+                        state.out_list[-1]["meta_info"]["completion_tokens"], 8
+                    )
+
+    def test_ar_metadata_absent_and_zero_work_defined(self):
+        tm = _make_tokenizer_manager(self)
+        for count in (None, 0):
+            state = _make_req_state("zero")
+            state.obj.return_sampling_mask = False
+            tm.rid_to_state["zero"] = state
+            asyncio.run(
+                tm._handle_batch_output(
+                    _dllm_output(BatchStrOutput, "zero", count, 0, [], True)
+                )
+            )
+            meta = state.out_list[-1]["meta_info"]
+            if count is None:
+                self.assertNotIn("dllm_metrics", meta)
+            else:
+                self.assertEqual(meta["dllm_metrics"], make_dllm_metrics(0, 0))
 
 
 if __name__ == "__main__":

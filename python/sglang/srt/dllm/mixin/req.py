@@ -22,6 +22,8 @@ class ReqDllmMixin:
         self.dllm_phase: Optional[DllmReqPhase] = None
         self.dllm_incomplete_ids = array("q")
         self.dllm_algo_state = None
+        # Lifetime total, including prefill and recomputation after retraction.
+        self.dllm_forward_count = 0
         self.dllm_block_offset = 0
         self.dllm_config = dllm_config
         self.dllm_has_literal_mask = False

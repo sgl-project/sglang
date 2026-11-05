@@ -1768,6 +1768,8 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
 
     # Verify count: number of verification forward passes
     spec_verify_ct: Optional[List[int]] = None
+    # Cumulative dLLM forwards per request; None entries denote non-dLLM requests.
+    dllm_forward_counts: Optional[List[Optional[int]]] = None
     # Accepted drafts
     spec_num_correct_drafts: Optional[List[int]] = None
     spec_num_block_accept_tokens: Optional[List[int]] = None
@@ -1856,6 +1858,7 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
 
     # Verify count: number of verification forward passes
     spec_verify_ct: Optional[List[int]] = None
+    dllm_forward_counts: Optional[List[Optional[int]]] = None
     # Accepted drafts
     spec_num_correct_drafts: Optional[List[int]] = None
     spec_num_block_accept_tokens: Optional[List[int]] = None

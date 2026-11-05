@@ -23,6 +23,7 @@ DllmRunOutput = Tuple[
     Optional[List[int]],
     Optional[List[Any]],
     bool,
+    int,
 ]
 
 
@@ -117,10 +118,11 @@ class DllmAlgorithm:
         self.prepare_inputs(model_runner, forward_batch, states)
 
         out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
+        forward_count = 1
         # No mask to denoise: return empty so process_batch_result_dllm skips the
         # stream branch (matches the pre-refactor behavior).
         if all(start == self.block_size for start in start_list):
-            return out.logits_output, [], None, None, out.can_run_graph
+            return out.logits_output, [], None, None, out.can_run_graph, forward_count
 
         # The first forward has planned the fixed canvas's attention metadata.
         if _is_npu or (self.reuse_forward_metadata and out.can_run_graph):
@@ -131,12 +133,20 @@ class DllmAlgorithm:
                 break
             self.prepare_inputs(model_runner, forward_batch, states)
             out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
+            forward_count += 1
 
         next_token_ids = forward_batch.input_ids.view(batch_size, self.block_size)
         next_token_ids_list = [
             next_token_ids[i, start_list[i] :] for i in range(batch_size)
         ]
-        return out.logits_output, next_token_ids_list, None, None, out.can_run_graph
+        return (
+            out.logits_output,
+            next_token_ids_list,
+            None,
+            None,
+            out.can_run_graph,
+            forward_count,
+        )
 
     def _run_fdfo(
         self,
@@ -174,4 +184,5 @@ class DllmAlgorithm:
             accept_length_per_req_cpu,
             states_out,
             out.can_run_graph,
+            1,
         )

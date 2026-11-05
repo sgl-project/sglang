@@ -1274,5 +1274,33 @@ class TestOutputStreamerPrefillWeightVersions(unittest.TestCase):
         self.assertIsNotNone(payload.weight_versions)
 
 
+class TestForwardCountTransport(unittest.TestCase):
+    # Use the same runtime context fixture as the existing streamer tests.
+    setUp = TestOutputStreamerCustomizedInfo.setUp
+
+    def test_stop_trimmed_completion_and_mixed_ar_payload(self):
+        accumulator = _accumulator()
+        req = _FakeReq("diffusion", [10, 11, 12, 13], finished=True)
+        req.output_ids_through_stop = [10, 11]
+        req.dllm_config = object()
+        req.dllm_forward_count = 5
+        accumulator.accept(req=req)
+        accumulator.accept(req=_FakeReq("autoregressive", [20], finished=True))
+        payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
+        self.assertEqual(payload.dllm_forward_counts, [5, None])
+        self.assertEqual(payload.completion_tokens, [2, 1])
+        self.assertEqual(
+            [list(row_output_ids(payload, i)) for i in range(2)], [[10, 11], [20]]
+        )
+        req.dllm_forward_count = 9
+        self.assertEqual(payload.dllm_forward_counts, [5, None])
+
+    def test_ar_payload_has_no_dllm_counts(self):
+        accumulator = _accumulator()
+        accumulator.accept(req=_FakeReq("autoregressive", [20], finished=True))
+        payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
+        self.assertIsNone(payload.dllm_forward_counts)
+
+
 if __name__ == "__main__":
     unittest.main()

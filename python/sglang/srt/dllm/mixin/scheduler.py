@@ -92,6 +92,10 @@ class SchedulerDllmMixin:
         if result.copy_done is not None:
             result.copy_done.synchronize()
 
+        # Count work even when a round emits no tokens (prefill or denoising).
+        for req in batch.reqs:
+            req.dllm_forward_count += result.dllm_forward_count
+
         if (
             self.dllm_config.requires_separate_context_encoding
             and not batch.forward_mode.is_dllm_extend()

@@ -882,6 +882,10 @@ class _GenerationStreamAccumulator:
                 customized_info, self.uocr_forced_tokens
             )
         dp_ranks = [dp_rank] * len(self.rids) if self.rids else None
+        dllm_forward_counts = [
+            req.dllm_forward_count if getattr(req, "dllm_config", None) else None
+            for req in self.output_reqs
+        ]
         return BatchTokenIDOutput(
             rids=self.rids,
             # The tokenizer-side router reads the list on every TOKENIZER batch,
@@ -892,6 +896,11 @@ class _GenerationStreamAccumulator:
                 else None
             ),
             spec_verify_ct=self.spec_verify_ct,
+            dllm_forward_counts=(
+                dllm_forward_counts
+                if any(count is not None for count in dllm_forward_counts)
+                else None
+            ),
             spec_num_correct_drafts=self.spec_num_correct_drafts,
             spec_num_block_accept_tokens=self.spec_num_block_accept_tokens,
             spec_num_cap_tokens=self.spec_num_cap_tokens,

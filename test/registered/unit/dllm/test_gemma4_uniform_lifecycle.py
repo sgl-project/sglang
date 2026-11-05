@@ -32,6 +32,7 @@ class _Req:
         self.dllm_block_offset = context_len
         self.dllm_incomplete_ids = array("q")
         self.dllm_algo_state = None
+        self.dllm_forward_count = 0
         self.dllm_phase_prefill = prefill
         self.extend_end = context_len + block_size
         self.kv = ReqKvInfo(
@@ -107,6 +108,7 @@ class _Scheduler(SchedulerDllmMixin):
 def _result(next_token_ids, *, accept_lengths=None, algo_states=None):
     return SimpleNamespace(
         copy_done=None,
+        dllm_forward_count=1,
         next_token_ids=next_token_ids,
         accept_length_per_req_cpu=accept_lengths,
         dllm_algo_state=algo_states,
@@ -154,6 +156,28 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
         scheduler.token_to_kv_pool_allocator.free_group_begin.assert_not_called()
         scheduler.output_streamer.stream_output.assert_not_called()
         scheduler.metrics_reporter.report_prefill_stats.assert_called_once()
+
+    def test_scheduler_counts_context_and_unresolved_rounds(self):
+        scheduler = _Scheduler(fdfo=True)
+        req = _Req(prefill=True)
+        scheduler.process_batch_result_dllm(_Batch([req]), _result(None))
+        self.assertEqual(req.dllm_forward_count, 1)
+        self.assertEqual(list(req.output_ids), [])
+        req.dllm_phase_prefill = False
+        for expected in (2, 3):
+            scheduler.process_batch_result_dllm(
+                _Batch([req]),
+                _result([[1, 2, 3, 4]], accept_lengths=[0], algo_states=[{}]),
+            )
+            self.assertEqual(req.dllm_forward_count, expected)
+            self.assertEqual(list(req.output_ids), [])
+
+    def test_scheduler_counts_sync_empty_output(self):
+        scheduler = _Scheduler(fdfo=False)
+        scheduler.dllm_config.requires_separate_context_encoding = False
+        req = _Req(prefill=True)
+        scheduler.process_batch_result_dllm(_Batch([req]), _result([]))
+        self.assertEqual(req.dllm_forward_count, 1)
 
     def test_context_admission_obeys_live_swa_budget(self):
         allocator = SimpleNamespace(

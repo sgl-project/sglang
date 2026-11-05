@@ -1,0 +1,105 @@
+"""Actual dLLM work accounting, including stream transport and batched idle work."""
+
+import unittest
+from array import array
+from types import SimpleNamespace
+
+import torch
+
+from sglang.srt.dllm.algorithm.low_confidence import LowConfidence
+from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+
+
+def _config(fdfo=False):
+    return DllmConfig("LowConfidence", {"threshold": 0.95}, 4, -1, 8, fdfo)
+
+
+class _ForwardOracle:
+    """Fast row unmasks all at once; slow row unmasks one token each step."""
+
+    def __init__(self):
+        self.calls = []
+
+    def forward(self, batch, pp_proxy_tensors=None):
+        self.calls.append((list(batch.rids), batch.input_ids.clone()))
+        logits = torch.zeros(batch.batch_size, 4, 3)
+        for i, rid in enumerate(batch.rids):
+            logits[i, :, 0] = 12 if rid == "fast" else 0
+        return SimpleNamespace(
+            logits_output=SimpleNamespace(full_logits=logits.flatten(0, 1)),
+            can_run_graph=False,
+        )
+
+
+def _batch(rids, ids=None):
+    return SimpleNamespace(
+        rids=rids,
+        batch_size=len(rids),
+        dllm_prompt_mask=None,
+        input_ids=(
+            torch.full((len(rids) * 4,), -1, dtype=torch.long)
+            if ids is None
+            else torch.tensor(ids, dtype=torch.long)
+        ),
+    )
+
+
+class TestActualForwardCount(unittest.TestCase):
+    def test_sync_charges_finished_row_for_actual_batched_work(self):
+        runner = _ForwardOracle()
+        batch = _batch(["fast", "slow"])
+        result = LowConfidence(_config()).run(runner, batch)
+        self.assertEqual(len(result), 6, "Algorithm result must expose actual work")
+        self.assertEqual(result[5], len(runner.calls))
+        self.assertEqual(result[5], 5)  # Four unmask rounds plus final KV.
+        self.assertFalse((runner.calls[1][1][:4] == -1).any())
+        self.assertTrue((runner.calls[1][1][4:] == -1).any())
+        self.assertTrue(all(rids == ["fast", "slow"] for rids, _ in runner.calls))
+
+    def test_fdfo_stops_charging_row_after_it_leaves(self):
+        runner = _ForwardOracle()
+        algorithm = LowConfidence(_config(fdfo=True))
+        batch = _batch(["fast", "slow"])
+        counts = {"fast": 0, "slow": 0}
+        states = None
+        while batch.rids:
+            result = algorithm.run(runner, batch, states)
+            self.assertEqual(len(result), 6, "FDFO must report unresolved work")
+            self.assertEqual(result[5], 1)
+            for rid in batch.rids:
+                counts[rid] += result[5]
+            keep = [i for i, accepted in enumerate(result[2]) if not accepted]
+            rows = batch.input_ids.view(-1, 4)[keep].flatten().tolist()
+            states = [result[3][i] for i in keep]
+            batch = _batch([batch.rids[i] for i in keep], rows)
+        self.assertEqual(counts, {"fast": 2, "slow": 5})
+        self.assertEqual(
+            counts,
+            {rid: sum(rid in rids for rids, _ in runner.calls) for rid in counts},
+        )
+
+    def test_pure_prefill_counts_even_without_output(self):
+        runner = _ForwardOracle()
+        result = LowConfidence(_config()).run(runner, _batch(["fast"], [1] * 4))
+        self.assertEqual(result[1], [])
+        self.assertEqual(len(result), 6, "Pure prefill must expose its forward")
+        self.assertEqual(result[5], 1)
+        self.assertEqual(len(runner.calls), 1)
+
+    def test_retraction_retains_lifetime_count_new_request_starts_zero(self):
+        req = Req("same-id", "", array("q", [1, 2]), SamplingParams())
+        req.dllm_forward_count = 7
+        req.reset_for_retract()
+        self.assertEqual(req.dllm_forward_count, 7)
+        fresh = Req("same-id", "", array("q", [1, 2]), SamplingParams())
+        self.assertTrue(hasattr(fresh, "dllm_forward_count"))
+        self.assertEqual(fresh.dllm_forward_count, 0)
+
+
+if __name__ == "__main__":
+    unittest.main()

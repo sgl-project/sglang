@@ -228,9 +228,9 @@ class Gemma4Renoise(DllmAlgorithm):
     ) -> DllmRunOutput:
         if not forward_batch.forward_mode.is_dllm_extend():
             if forward_batch.input_ids.numel() == 0:
-                return None, [], None, None, False
+                return None, [], None, None, False, 0
             out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
-            return out.logits_output, [], None, None, out.can_run_graph
+            return out.logits_output, [], None, None, out.can_run_graph, 1
 
         self.vocab_size = model_runner.model_config.hf_config.text_config.vocab_size
         self.embed_tokens = model_runner.model.get_input_embeddings()

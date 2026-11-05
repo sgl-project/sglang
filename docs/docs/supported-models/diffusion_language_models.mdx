@@ -114,6 +114,42 @@ curl -X POST "http://127.0.0.1:30000/generate" \
     }'
 ```
 
+## Forward-count metrics
+
+The Python `/generate` API and `Engine.generate` return request-level work in
+`meta_info.dllm_metrics`:
+
+```json
+{
+  "forward_count": 40,
+  "completion_tokens": 128,
+  "tokens_per_forward": 3.2
+}
+```
+
+`forward_count` counts model forwards that the request actually participates in,
+including uncached prefill, denoising, final KV updates, and recomputation after
+retraction. It excludes initialization and CUDA graph capture. In synchronous
+batches, a completed row still counts forwards while it waits for other rows.
+FDFO counts only rounds that contain the request. These are per-request counts;
+summing them across requests does not give the number of GPU batch forwards.
+
+`completion_tokens` uses the existing completion-token count after stop/length
+truncation. `tokens_per_forward` is that count divided by `forward_count`, or
+`0.0` when no forward has run. It measures output tokens per forward, not latency,
+throughput, or output quality. Token-level denoising step maps describe a
+different quantity: when individual positions become resolved.
+
+Non-streaming and normal streaming responses contain cumulative metrics. With
+`--incremental-streaming-output`, each streaming response contains the forward
+and completion-token increments since the preceding response, and their ratio.
+Chunks can contain forwards without new tokens. To aggregate incremental
+responses, sum both counters and divide the totals; do not average the ratios.
+The outer `meta_info.completion_tokens` retains its existing cumulative meaning.
+
+These fields describe generation outputs from the Python serving path. Abort
+notifications and the Rust frontend do not expose these metrics.
+
 ## Supported Models
 
 Below the supported models are summarized in a table.
