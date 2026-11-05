@@ -43,6 +43,9 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     get_embedding_tp_kwargs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.models.deepseek_common.attention_forward_methods import (
+    DeepseekMLAForwardMixin,
+)
 from sglang.srt.models.deepseek_common.utils import enable_nextn_moe_bf16_cast_to_fp8
 from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer, DeepseekV3ForCausalLM
 from sglang.srt.models.utils import WeightsMapper
@@ -367,7 +370,14 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                 get_exec().kernel.dsa_prefill_backend,
             )
         )
-        return attn.use_dsa and not trtllm_fuses_rope
+        # forward_kv_only runs the indexer and RoPE itself, so an override of these
+        # hooks would see only the last-token pass.
+        default_hooks = all(
+            getattr(getattr(attn, hook), "__func__", None)
+            is getattr(DeepseekMLAForwardMixin, hook)
+            for hook in ("run_mla_indexer", "prepare_mla_qkv")
+        )
+        return attn.use_dsa and not trtllm_fuses_rope and default_hooks
 
     @torch.no_grad()
     def forward_kv_only(

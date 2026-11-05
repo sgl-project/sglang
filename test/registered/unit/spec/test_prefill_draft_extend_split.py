@@ -9,6 +9,9 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.models.deepseek_common.attention_forward_methods import (
+    DeepseekMLAForwardMixin,
+)
 from sglang.srt.models.deepseek_nextn import DeepseekV3ForCausalLMNextN
 from sglang.srt.speculative.eagle_utils import (
     _MAX_UNSPLIT_PREFILL_DRAFT_EXTEND_TOKENS,
@@ -198,8 +201,11 @@ class TestSplitPrefillDraftExtend(CustomTestCase):
         self.assertTrue(_should_split(batch, mm_input_embeds=torch.zeros(_LONG, 2)))
 
 
-def _supports_forward_kv_only(*, rope, kv_cache_dtype, prefill, decode):
-    attn = SimpleNamespace(use_dsa=True, rotary_emb=object() if rope else None)
+def _supports_forward_kv_only(
+    *, rope, kv_cache_dtype, prefill, decode, attn_cls=DeepseekMLAForwardMixin
+):
+    attn = attn_cls()
+    attn.use_dsa, attn.rotary_emb = True, object() if rope else None
     draft = SimpleNamespace(
         model=SimpleNamespace(decoder=SimpleNamespace(self_attn=attn))
     )
@@ -233,6 +239,16 @@ class TestDraftSupportsForwardKVOnly(CustomTestCase):
         ):
             self.assertTrue(
                 _supports_forward_kv_only(**unfused, prefill="trtllm", decode="trtllm")
+            )
+
+    def test_overridden_mla_hook_keeps_the_single_draft_extend(self):
+        """The KV-only pass runs the indexer and RoPE itself, bypassing the hooks."""
+        bf16 = dict(rope=True, kv_cache_dtype=torch.bfloat16, prefill="tilelang")
+        self.assertTrue(_supports_forward_kv_only(**bf16, decode="tilelang"))
+        for hook in ("run_mla_indexer", "prepare_mla_qkv"):
+            attn_cls = type("Attn", (DeepseekMLAForwardMixin,), {hook: lambda self: 0})
+            self.assertFalse(
+                _supports_forward_kv_only(**bf16, decode="tilelang", attn_cls=attn_cls)
             )
 
 
