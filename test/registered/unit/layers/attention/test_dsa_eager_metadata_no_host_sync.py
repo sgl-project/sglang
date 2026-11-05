@@ -46,6 +46,7 @@ class TestDsaEagerMetadataNoHostSync(unittest.TestCase):
             _cal_indexer_k_start_end=lambda *args: (None, None),
             _transform_table_1_to_real=lambda table: table,
             _build_topk_v2_plan=lambda _: None,
+            init_kernel_metadata=lambda _: None,
             _init_kpool_metadata=lambda metadata, *args, **kwargs: metadata,
         )
 
