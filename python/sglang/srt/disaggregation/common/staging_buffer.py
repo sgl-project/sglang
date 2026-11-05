@@ -159,6 +159,7 @@ class StagingBuffer:
         device: str,
         gpu_id: int,
         custom_mem_pool=None,
+        gather_stream_priority: int = 0,
     ):
         self.size_bytes = size_bytes
         if isinstance(device, str):
@@ -213,6 +214,7 @@ class StagingBuffer:
         # Created on first gather; the decode-side allocator's buffer never
         # gathers, so eager creation would leak one device stream per rank.
         self._gather_stream: Optional[torch.Stream] = None
+        self._gather_stream_priority = gather_stream_priority
 
         ptr_type_str = _device_ptr_type_str(self.data_ptr, device.type)
         logger.info(
@@ -246,7 +248,12 @@ class StagingBuffer:
 
     def get_gather_stream(self) -> torch.Stream:
         if self._gather_stream is None:
-            self._gather_stream = self.create_stream()
+            if self._gather_stream_priority and self.device.type == "cuda":
+                self._gather_stream = self.device_module.Stream(
+                    device=self.device, priority=self._gather_stream_priority
+                )
+            else:
+                self._gather_stream = self.create_stream()
         return self._gather_stream
 
 

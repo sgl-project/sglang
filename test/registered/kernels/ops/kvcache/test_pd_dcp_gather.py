@@ -5,16 +5,45 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
-from sglang.kernels.ops.kvcache.pd_dcp_gather import copy_mla_rows_into_pack
+from sglang.kernels.ops.kvcache.pd_dcp_gather import (
+    MlaPackMetadataCache,
+    copy_mla_rows_into_pack,
+)
 from sglang.srt.disaggregation.common.staging_buffer import StagingBuffer
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(est_time=10, stage="jit-kernel-unit", runner_config="amd")
 
 
 class TestPdDcpGather(CustomTestCase):
+    def test_cached_layout_with_varying_rows_and_source_strides(self):
+        cache = MlaPackMetadataCache()
+        sources = [
+            torch.arange(16384 * stride, device="cuda")
+            .remainder(251)
+            .to(torch.uint8)
+            .reshape(16384, stride)
+            for stride in (16, 32)
+        ]
+        for rows in (1, 777, 8192):
+            indices = torch.arange(rows, dtype=torch.int64, device="cuda") * 2
+            pack = torch.empty(rows * 12, dtype=torch.uint8, device="cuda")
+            copy_mla_rows_into_pack(
+                [x.data_ptr() for x in sources],
+                indices,
+                pack,
+                [4, 8],
+                [16, 32],
+                metadata_cache=cache,
+            )
+            expected = torch.cat(
+                [sources[0][indices, :4].flatten(), sources[1][indices, :8].flatten()]
+            )
+            torch.testing.assert_close(pack, expected, rtol=0, atol=0)
+
     def test_gathers_strided_rows_layer_major(self):
         dim = 8
         kv0 = torch.arange(32 * dim, dtype=torch.float32, device="cuda").view(
