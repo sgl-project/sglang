@@ -158,7 +158,9 @@ class TestGemma4GraphInputEmbeddings(unittest.TestCase):
         runner.ragged_verify_mode = False
         runner.deepep_adapter = Mock()
         runner.bs = 4
+        runner.raw_bs = 4
         runner.raw_num_token = 12
+        runner.require_mlp_tp_gather = False
         runner.captured_req_width = 4
         runner.attention_graph_variants = None
         runner._capture_graph_size = Mock(return_value=4)

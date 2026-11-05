@@ -249,6 +249,7 @@ def _plain_kv_pool():
 class _FakeScheduler(SchedulerDisaggregationDecodeMixin):
     def __init__(self, computer, req_to_token):
         self.kv_checksum_computer = computer
+        self.enable_overlap = False
         self.waiting_queue = []
         self.token_to_kv_pool_allocator = SimpleNamespace(
             page_size=1, get_kvcache=_plain_kv_pool
