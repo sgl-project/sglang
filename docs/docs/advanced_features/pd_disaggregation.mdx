@@ -123,7 +123,7 @@ Each published CUDA 13 image has an EFA variant for EFA-enabled AWS EC2 instance
 
 Each EFA image matches its base and adds:
 
-- The AWS EFA userspace stack: libfabric with the EFA provider, rdma-core, and the aws-ofi-nccl plugin. The host does not need its own EFA userspace install.
+- The AWS EFA userspace stack: libfabric with the EFA provider, the aws-ofi-nccl plugin, and hwloc. The host does not need its own EFA userspace install.
 - On x86_64, the EFA build of Mooncake with `MOONCAKE_PROTOCOL=efa`. On arm64 the standard Mooncake package is kept and `MOONCAKE_PROTOCOL=tcp` is set, because the EFA build is x86_64-only.
 - `SGLANG_DISAGGREGATION_NIXL_BACKEND=LIBFABRIC`, so NIXL transfers use EFA on both architectures.
 - `NCCL_NET_PLUGIN=ofi` and `NCCL_TUNER_PLUGIN=ofi`, so NCCL uses aws-ofi-nccl.

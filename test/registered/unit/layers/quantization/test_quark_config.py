@@ -633,6 +633,100 @@ _BLOCK_FP8_MOE_SPEC = {
     "bias": None,
 }
 
+_MXFP8_LINEAR_SPEC = {
+    "weight": {
+        "dtype": "fp8_e4m3",
+        "qscheme": "per_block",
+        "block_size": [1, 32],
+        "is_dynamic": False,
+        "scale_type": "float8_e8m0fnu",
+    },
+    "input_tensors": {
+        "dtype": "fp8_e4m3",
+        "qscheme": "per_group",
+        "group_size": 32,
+        "is_dynamic": True,
+    },
+    "output_tensors": None,
+    "bias": None,
+}
+
+
+class TestSharedExpertFusionGateDenseLeadingLayers(CustomTestCase):
+    """amd/MiniMax-M3.1-Flash-Quark-MXFP4 layout: the leading layers are dense
+    MLPs, the routed experts take the MXFP4 global spec, and every MoE layer
+    names its shared expert MXFP8 in layer_quant_config.
+
+    Layer 0 has neither routed nor shared experts, so both of its lookups fall
+    back to the global spec and agree. Fusing on that answer copies the MXFP8
+    shared expert into the packed MXFP4 slot, which fails at load.
+    """
+
+    _PREFIX = "language_model.model.layers"
+
+    def _config(
+        self,
+        shared_spec_by_layer,
+        prefix=_PREFIX,
+        num_hidden_layers=None,
+        num_nextn_predict_layers=0,
+    ) -> QuarkConfig:
+        config = _bare_config()
+        config.quant_config = {
+            "global_quant_config": deepcopy(_MXFP4_MOE_SPEC),
+            "layer_quant_config": {
+                f"{prefix}.0.self_attn.q_proj": deepcopy(_MXFP8_LINEAR_SPEC),
+                **{
+                    f"{prefix}.{layer}.mlp.shared_experts.{proj}": deepcopy(spec)
+                    for layer, spec in shared_spec_by_layer.items()
+                    for proj in ("gate_proj", "up_proj", "down_proj")
+                },
+            },
+            "layer_type_quant_config": {},
+        }
+        config.exclude_layers = []
+        config.packed_modules_mapping = {"gate_up_proj": ["gate_proj", "up_proj"]}
+        config.num_hidden_layers = num_hidden_layers
+        config.num_nextn_predict_layers = num_nextn_predict_layers
+        return config
+
+    def test_shared_expert_in_another_format_blocks_fusion(self):
+        shared = {3: _MXFP8_LINEAR_SPEC, 4: _MXFP8_LINEAR_SPEC}
+        for prefix in (self._PREFIX, "model.layers"):
+            with self.subTest(prefix=prefix):
+                config = self._config(shared, prefix=prefix)
+                self.assertFalse(config.can_fuse_shared_expert())
+
+    def test_shared_expert_in_the_routed_format_still_fuses(self):
+        config = self._config({3: _MXFP4_MOE_SPEC, 4: _MXFP4_MOE_SPEC})
+        self.assertTrue(config.can_fuse_shared_expert())
+
+    def test_one_mismatched_moe_layer_blocks_fusion_in_any_entry_order(self):
+        for shared in (
+            {3: _MXFP4_MOE_SPEC, 4: _MXFP8_LINEAR_SPEC},
+            {4: _MXFP8_LINEAR_SPEC, 3: _MXFP4_MOE_SPEC},
+        ):
+            with self.subTest(order=list(shared)):
+                self.assertFalse(self._config(shared).can_fuse_shared_expert())
+
+    def test_named_routed_experts_in_another_format_block_fusion(self):
+        config = self._config({})
+        config.quant_config["layer_quant_config"][f"{self._PREFIX}.3.mlp.experts"] = (
+            deepcopy(_FP8_MOE_SPEC)
+        )
+        self.assertFalse(config.can_fuse_shared_expert())
+
+    def test_a_draft_layer_does_not_answer_for_the_target(self):
+        # The NextN layer appended after the decoder keeps its shared expert
+        # MXFP8; the target's own MoE layer matches its routed experts.
+        config = self._config(
+            {4: _MXFP8_LINEAR_SPEC, 3: _MXFP4_MOE_SPEC},
+            prefix="model.layers",
+            num_hidden_layers=4,
+            num_nextn_predict_layers=1,
+        )
+        self.assertTrue(config.can_fuse_shared_expert())
+
 
 class TestSharedExpertOnlineMxfp4Gate(CustomTestCase):
     """Load-time MXFP4 quantization of a BF16 shared expert into the fused slot.

@@ -9,9 +9,9 @@ import torch
 from sglang.srt.hardware_backend.npu.graph_runner import npu_cudagraph_backend as mod
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.runtime_context import get_parallel
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_npu_ci
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_npu_ci(est_time=10, suite="base-a-test-npu")
 
 
 def _make_backend():

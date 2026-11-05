@@ -217,6 +217,7 @@ const SCHEMA_META_INFO_KEYS: &[&str] = &[
     "image_tokens",
     "audio_tokens",
     "video_tokens",
+    "cached_tokens_details",
 ];
 
 /// A repeated key has been logged once.
@@ -866,10 +867,9 @@ fn e2e_latency(timing: &RequestTiming) -> f64 {
 }
 
 /// One incremental streaming frame's output: this step's delta with the
-/// cumulative token count in `meta_info` (matching Python).
-fn delta_output(mut delta: CoreOutput, accumulated: &CoreOutput) -> CoreOutput {
-    delta.completion_tokens = accumulated.completion_tokens;
-    delta
+/// cumulative counts in `meta_info` (see [`CoreOutput::with_cumulative_counts`]).
+fn delta_output(delta: CoreOutput, accumulated: &CoreOutput) -> CoreOutput {
+    delta.with_cumulative_counts(accumulated)
 }
 
 /// The SSE `data` text of one `api.v1` item (a frame or an error).
@@ -1755,6 +1755,7 @@ mod tests {
             image_tokens: Some(1),
             audio_tokens: Some(1),
             video_tokens: Some(1),
+            cached_tokens_details: Some(Default::default()),
         };
         let keys: Vec<String> = serde_json::to_value(&every)
             .unwrap()
@@ -2139,18 +2140,43 @@ mod tests {
     }
 
     /// `incremental=true`: each frame carries this step's **delta** text/output_ids,
-    /// but `meta_info.completion_tokens` stays cumulative (matching Python).
+    /// but `meta_info.completion_tokens` stays cumulative (matching Python), and
+    /// so does the cached-token split, which a scheduler abort does not carry.
     #[tokio::test]
     async fn incremental_emits_deltas_with_cumulative_count() {
+        use crate::message::response::{CachedTokensDetails, ChunkExtras};
+
         let (tx, rx) = mpsc::channel(8);
         let calls = vec![timed_call(10, rx)];
         let stream = generation_event_stream(calls, true, true);
         futures::pin_mut!(stream);
+        let with_extras = |item: ResponseItem, extras: ChunkExtras| {
+            let (ResponseItem::Frame(mut chunk) | ResponseItem::Done(mut chunk)) = item else {
+                unreachable!()
+            };
+            chunk.cached_tokens = 3;
+            chunk.extras = Some(Box::new(extras));
+            chunk
+        };
+        let split = serde_json::json!({"device": 1, "host": 2});
 
-        tx.send(frame(10, "Hello")).await.unwrap();
+        let hello = with_extras(
+            frame(10, "Hello"),
+            ChunkExtras {
+                cached_tokens_details: Some(CachedTokensDetails {
+                    device: 1,
+                    host: 2,
+                    storage: None,
+                    storage_backend: None,
+                }),
+                ..Default::default()
+            },
+        );
+        tx.send(ResponseItem::Frame(hello)).await.unwrap();
         let v = parse(&stream.next().await.unwrap());
         assert_eq!(v["text"], "Hello");
         assert_eq!(v["meta_info"]["completion_tokens"], 1);
+        assert_eq!(v["meta_info"]["cached_tokens_details"], split);
         assert!(v["meta_info"].get("e2e_latency").is_none());
 
         tx.send(frame(10, " world")).await.unwrap();
@@ -2162,11 +2188,19 @@ mod tests {
         );
         assert!(v["meta_info"].get("e2e_latency").is_none());
 
-        tx.send(done(10, "!")).await.unwrap();
+        let aborted = with_extras(
+            done(10, "!"),
+            ChunkExtras {
+                abort_output: true,
+                ..Default::default()
+            },
+        );
+        tx.send(ResponseItem::Done(aborted)).await.unwrap();
         let v = parse(&stream.next().await.unwrap());
         assert_eq!(v["text"], "!");
         assert_eq!(v["meta_info"]["completion_tokens"], 3);
         assert_eq!(v["meta_info"]["finish_reason"]["type"], "length");
+        assert_eq!(v["meta_info"]["cached_tokens_details"], split);
         assert!(v["meta_info"]["e2e_latency"].as_f64().unwrap() >= 0.010);
 
         assert_eq!(stream.next().await.unwrap(), "[DONE]");

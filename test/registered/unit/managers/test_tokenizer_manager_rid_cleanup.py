@@ -17,6 +17,7 @@ Covers:
 import asyncio
 import time
 import unittest
+from array import array
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
@@ -80,7 +81,6 @@ _PER_REQUEST_FLOAT_FIELDS = frozenset(
 
 _PER_REQUEST_NESTED_LIST_FIELDS = frozenset(
     {
-        "output_ids",
         # Logprob fields
         "input_token_logprobs_val",
         "input_token_logprobs_idx",
@@ -213,6 +213,10 @@ def _make_batch_str_output(rid: str, finished_reason=None) -> BatchStrOutput:
             kwargs[f.name] = [fr]
         elif f.name == "output_strs":
             kwargs[f.name] = ["hello"]
+        elif f.name == "output_ids_flat":
+            kwargs[f.name] = array("q")
+        elif f.name == "output_ids_offsets":
+            kwargs[f.name] = [0, 0]
         elif f.name == "request_stats":
             kwargs[f.name] = [_request_stats()]
         elif f.name in _PER_REQUEST_INT_FIELDS:
