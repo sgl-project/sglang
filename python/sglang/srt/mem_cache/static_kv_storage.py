@@ -17,6 +17,7 @@ import msgspec
 import torch
 
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
+from sglang.srt.mem_cache.kv.advance import TrackingAdvance, advance_tracking
 from sglang.srt.mem_cache.kv.plan import (
     TREE_STATE,
     TREE_TOKEN,
@@ -25,7 +26,7 @@ from sglang.srt.mem_cache.kv.plan import (
     WireEntry,
 )
 from sglang.srt.mem_cache.kv.state_storage import StateSlotsExhausted
-from sglang.srt.mem_cache.kv.storage import Region, SubPoolUsage
+from sglang.srt.mem_cache.kv.storage import Region, ResumeUnits, SubPoolUsage
 from sglang.srt.utils import is_npu
 
 if TYPE_CHECKING:
@@ -135,6 +136,74 @@ class StaticKVStorage:
         self._owner_region: Optional[Region] = None
         self._state_entries: Optional[_StaticStateEntries] = None
 
+    def stated_window_lengths(self) -> Dict[str, Tuple[int, str]]:
+        """No static window states its retention: its length is the
+        model's."""
+        return {}
+
+    def resume_units(
+        self,
+        sub_pool: str,
+        req: Req,
+        *,
+        token_start: int,
+        token_boundary: int,
+        window: Optional[int] = None,
+    ) -> ResumeUnits:
+        if not 0 <= token_start <= token_boundary:
+            raise ValueError("invalid continuation token span")
+        allocator = self._allocator
+        state = allocator.state
+        if state is not None and sub_pool == state.sub_pool:
+            slots = self.requests.req_index_to_mamba_index_mapping[
+                req.kv.req_pool_idx
+            ].reshape(-1)
+            return ResumeUnits(
+                unit_ids=allocator.state_ids(sub_pool).ids(slots),
+                token_start=token_boundary,
+                token_boundary=token_boundary,
+            )
+        if sub_pool not in (self.owner, "swa"):
+            raise KeyError(sub_pool)
+        page_size = allocator.page_size
+        pool = allocator.get_kvcache()
+        request_window = pool.request_window if sub_pool == "swa" else None
+        begin = token_start
+        if sub_pool == "swa":
+            retained = pool.sliding_window if request_window is not None else window
+            if retained is None:
+                raise ValueError("window handoff requires its retention length")
+            begin = max(begin, token_boundary - retained)
+        begin = begin // page_size * page_size
+        if request_window is not None:
+            units = torch.as_tensor(
+                request_window.page_indices(
+                    int(req.kv.req_pool_idx), begin, token_boundary
+                )
+            )
+        else:
+            tokens = self.requests.req_to_token[
+                req.kv.req_pool_idx, begin:token_boundary
+            ]
+            from sglang.srt.layers.cp.base import is_cp_sharded_padded
+
+            if is_cp_sharded_padded():
+                from sglang.srt.layers.cp.utils import (
+                    get_cp_sharded_padded_cache_transfer_indices,
+                )
+
+                # Rank-local storage: the transfer reads this rank's padded rows.
+                tokens = get_cp_sharded_padded_cache_transfer_indices(tokens)
+            physical = (
+                allocator.translate_swa_indices_for_transfer(tokens)
+                if sub_pool == "swa"
+                else allocator.translate_kv_indices_for_transfer(tokens)
+            )
+            units = physical[::page_size] // page_size
+        return ResumeUnits(
+            unit_ids=units, token_start=begin, token_boundary=token_boundary
+        )
+
     def acquire(self, reqs: List[Req]) -> Optional[List[int]]:
         return acquire_rows(self.requests, self._allocator.state, reqs)
 
@@ -156,7 +225,10 @@ class StaticKVStorage:
         num_tokens: int,
         make_room: Callable[[int], Any],
         window_tail: Optional[int] = None,
+        stated_window_tails: Optional[Dict[str, int]] = None,
     ) -> Optional[torch.Tensor]:
+        # Static pools have no window with a stated retention.
+        assert not stated_window_tails
         # Over estimate the number of tokens: assume each request needs a new
         # page (one page per CLASS per request under sharding — the min-class
         # availability floor must cover every request's ceil(K_i/N) rounding,
@@ -273,15 +345,26 @@ class StaticKVStorage:
     def advance(
         self,
         req: Req,
-        frontier: int,
+        frontier: Optional[int] = None,
         *,
-        window: int,
-        retain_floor: Optional[int],
-        shares_prefixes: bool,
+        window: Optional[int] = None,
+        retain_floor: Optional[int] = None,
+        shares_prefixes: bool = False,
         eviction_interval: int = 1,
+        tracking: Optional[TrackingAdvance] = None,
+        component_type=None,
     ) -> None:
-        from sglang.srt.mem_cache.common import free_swa_out_of_window_slots
+        if tracking is not None:
+            advance_tracking(self, req, tracking)
+        if window is None:
+            return
+        if frontier is None:
+            raise ValueError("window retirement needs a token frontier")
 
+        from sglang.srt.mem_cache.common import free_swa_out_of_window_slots
+        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+
+        component_type = ComponentType.SWA if component_type is None else component_type
         free_swa_out_of_window_slots(
             req,
             frontier,
@@ -292,6 +375,7 @@ class StaticKVStorage:
             supports_prefix_sharing=shares_prefixes,
             retain_floor=retain_floor,
             eviction_interval=eviction_interval,
+            component_type=component_type,
         )
 
     def release_row(self, req: Req) -> None:
@@ -374,7 +458,7 @@ class StaticKVStorage:
 
     def take_tracking_slot(self, req, position: int) -> bool:
         """Give ``req`` a tracking slot at ``position`` of its ping-pong pair;
-        False when no state slot is free (tracking then stays in place)."""
+        False when no state slot is free (the boundary then writes no snapshot)."""
         slot = self._allocator.state_slots.alloc(1)
         if slot is None:
             return False
@@ -525,7 +609,7 @@ class StaticKVStorage:
             return states.owner_view
         return states.views[sub_pool]()
 
-    def regions(self, sub_pool: str) -> Region:
+    def regions(self, sub_pool: str, *, part: Optional[str] = None) -> Region:
         if sub_pool == self.owner:
             if self._owner_region is None:
                 self._owner_region = _static_owner_region(self._allocator.get_kvcache())
@@ -538,9 +622,15 @@ class StaticKVStorage:
     def sub_pool_names(self) -> Tuple[str, ...]:
         return (self.owner,)
 
-    def tree_slots(self, *, window_reach: int = 0) -> Tuple[TreeSlot, ...]:
+    def tree_slots(
+        self, *, window_reaches: Optional[Dict[str, int]] = None
+    ) -> Tuple[TreeSlot, ...]:
         shape = self._shape
-        window = max(shape.window, window_reach) if shape.window is not None else None
+        window = (
+            max(shape.window, (window_reaches or {}).get("swa", 0))
+            if shape.window is not None
+            else None
+        )
         return (
             (TreeSlot(component="FULL", family=TREE_TOKEN),)
             + (
@@ -914,7 +1004,7 @@ def _static_state_entries(
                 c128_item_lens,
             )
 
-        # On A5 (CYCLE cache_mode), C4 state uses request-local ring rows rather
+        # On Ascend 950 (CYCLE cache_mode), C4 state uses request-local ring rows rather
         # than SWA pages.  Register it separately so P and D can independently
         # map logical positions when their local ring sizes differ.
         from sglang.srt.hardware_backend.npu.utils import is_npu_arch35

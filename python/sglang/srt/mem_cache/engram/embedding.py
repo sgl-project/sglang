@@ -2,15 +2,16 @@
 
 import torch
 
-from sglang.srt.layers.vocab_parallel_embedding import (
-    UnquantizedEmbeddingMethod,
-    VocabParallelEmbedding,
-    attn_tp_all_reduce,
-    get_attn_tp_context,
-    get_masked_input_and_mask,
-    is_allocation_symmetric,
-    tensor_model_parallel_all_reduce,
+from sglang.srt.distributed import tensor_model_parallel_all_reduce
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
+)
+from sglang.srt.layers.dp_attention import attn_tp_all_reduce, is_allocation_symmetric
+from sglang.srt.layers.layer_boundary import get_attn_tp_context
+from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
+from sglang.srt.layers.vocab_parallel_embedding import (
+    VocabParallelEmbedding,
+    get_masked_input_and_mask,
 )
 from sglang.srt.mem_cache.engram import create_storage
 from sglang.srt.runtime_context import get_memory, get_parallel
