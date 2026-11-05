@@ -23,6 +23,9 @@ This module carries SGLang's own path for those checkpoints:
 
 * ``GGUF_NATIVE_CONFIG_BUILDERS`` maps a GGUF ``general.architecture`` to a
   builder returning a fully populated config.
+* Architecture probing caches only names and compact DFlash metadata.
+* Plain DFlash exports with F32/F16/BF16 weights are identified separately
+  by metadata and tensor types, leaving other DFlash layouts to their own builders.
 * ``build_gguf_tokenizer`` reuses transformers' own converters, which work fine
   once they are reached directly instead of through the gated loader.
 
@@ -30,38 +33,73 @@ Reaching for these is a last resort: a config.json next to the .gguf still wins,
 because the checkpoint author's own config outranks anything reconstructed.
 """
 
+import os
+from functools import lru_cache
 from typing import Any, Callable, Dict, Optional
 
 from transformers import PretrainedConfig
 
 from sglang.srt.configs.muse_glimmer import MuseGlimmerConfig
+from sglang.srt.utils.hf_transformers.dflash_gguf import (
+    _extract_dflash_gguf_metadata,
+    build_plain_dflash_gguf_config,
+    is_plain_dflash_gguf,
+)
 
 GGUF_NATIVE_CONFIG_BUILDERS: Dict[str, Callable[[str], PretrainedConfig]] = {
     "muse-glimmer": MuseGlimmerConfig.from_gguf,
 }
 
 
+def _read_gguf_metadata(gguf_path):
+    path = os.path.abspath(os.fspath(gguf_path))
+    stat = os.stat(path)
+    identity = (
+        stat.st_dev,
+        stat.st_ino,
+        stat.st_size,
+        stat.st_mtime_ns,
+        stat.st_ctime_ns,
+    )
+    return _cached_gguf_metadata(path, identity)
+
+
+@lru_cache(maxsize=4)
+def _cached_gguf_metadata(path, identity):
+    from gguf import GGUFReader
+
+    reader = GGUFReader(path)
+    field = reader.fields.get("general.architecture")
+    arch = None if field is None else field.contents()
+    if not isinstance(arch, str):
+        return None, None
+    # Other architectures only need their name; leave their config loaders alone.
+    if arch != "dflash":
+        return arch, None
+    if any(key.startswith("lilicorr.") for key in reader.fields):
+        return arch, None
+    return arch, _extract_dflash_gguf_metadata(reader)
+
+
 def read_gguf_architecture(gguf_path: str) -> Optional[str]:
     """The ``general.architecture`` string, or None if it cannot be read."""
     try:
-        from gguf import GGUFReader
-
-        reader = GGUFReader(gguf_path)
-        field = reader.fields.get("general.architecture")
-        if field is None:
-            return None
-        value = field.contents()
-        return value if isinstance(value, str) else None
+        return _read_gguf_metadata(gguf_path)[0]
     except Exception:
         return None
 
 
 def has_native_gguf_support(gguf_path: str) -> bool:
-    return read_gguf_architecture(gguf_path) in GGUF_NATIVE_CONFIG_BUILDERS
+    arch = read_gguf_architecture(gguf_path)
+    if arch in GGUF_NATIVE_CONFIG_BUILDERS:
+        return True
+    return arch == "dflash" and is_plain_dflash_gguf(gguf_path)
 
 
 def build_gguf_config(gguf_path: str) -> PretrainedConfig:
     arch = read_gguf_architecture(gguf_path)
+    if arch == "dflash" and is_plain_dflash_gguf(gguf_path):
+        return build_plain_dflash_gguf_config(gguf_path)
     return GGUF_NATIVE_CONFIG_BUILDERS[arch](gguf_path)
 
 
