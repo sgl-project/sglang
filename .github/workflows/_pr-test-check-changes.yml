@@ -95,7 +95,7 @@ jobs:
               - "python/setup.py"
               - "python/sglang/!(multimodal_gen|kernels)/**/!(*.md)"
               # Diffusion-only kernels and tests are left to multimodal_gen and
-              # jit_kernel; ops/diffusion/common stays since srt imports it via kda_kernels.
+              # jit_kernel; ops/diffusion/common stays since kda_kernels (an srt path) imports it.
               - "python/sglang/kernels/{,ops/,jit/,jit/csrc/}!(*.md)"
               - "python/sglang/kernels/!(aot|ops|jit)/**/!(*.md)"
               - "python/sglang/kernels/jit/!(csrc)/**/!(*.md)"
@@ -130,6 +130,7 @@ jobs:
             simulator:
               - ".github/workflows/pr-test-extra.yml"
               - ".github/workflows/_pr-test-simulator-cpu.yml"
+              - ".github/workflows/_pr-test-simulator-gpu.yml"
               - "benchmark/simulator/**/!(*.md)"
               - "tools/sglang-simulator/**/!(*.md)"
             multimodal_gen:

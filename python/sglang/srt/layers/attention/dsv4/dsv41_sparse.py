@@ -11,13 +11,13 @@ from typing import Optional, Tuple
 import torch
 from torch import nn
 
-from sglang.kernels.ops.attention.dsv4.torch_quant import (
-    fake_quant_compressed_kv,
-    fake_quant_fp4,
-)
 from sglang.kernels.ops.gemm.bf16_fp32 import linear_bf16_fp32
 from sglang.kernels.ops.gemm.router_gemv_hip import rocm_gemv_split_k_max_tokens
 from sglang.kernels.ops.layernorm.rmsnorm_fp32 import rmsnorm_fp32
+from sglang.kernels.ops.quantization.fp4_fake_quant import (
+    fake_quant_compressed_kv,
+    fake_quant_fp4,
+)
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.utils import add_prefix, is_gfx95_supported
@@ -99,14 +99,14 @@ def rope_tail(
 
 
 def fused_low_ratio_compress_supported() -> bool:
-    """The fused c1 / c2 / index-K decode kernels need sm100+ on CUDA (they pack fp4
-    with `cvt.rn.satfinite.e2m1x2`) or gfx950 on ROCm; the answer also fixes the
-    ratio-2 weight layout (`wkv_gate`, or `wkv` plus `wgate`)."""
+    """The fused c1 / c2 / index-K decode kernels need sm90+ on CUDA or gfx950 on
+    ROCm; the answer also fixes the ratio-2 weight layout (`wkv_gate`, or `wkv`
+    plus `wgate`)."""
     if not torch.cuda.is_available():
         return False
     if torch.version.hip is not None:
         return is_gfx95_supported()
-    return torch.cuda.get_device_capability()[0] >= 10
+    return torch.cuda.get_device_capability()[0] >= 9
 
 
 class DeepseekV41Compressor(nn.Module):

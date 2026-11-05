@@ -26,12 +26,9 @@ except ImportError:
     _flash_attn_varlen_backward = _unsupported
     flash_attn_varlen_func = _unsupported
 
-from functools import lru_cache
-
 from einops import rearrange
 
 
-@lru_cache(maxsize=16)
 def calc_chunks(cu_seqlen, moba_chunk_size):
     """
     Calculate chunk boundaries.
@@ -40,6 +37,8 @@ def calc_chunks(cu_seqlen, moba_chunk_size):
     so that every chunk can be selected.
     """
     batch_sizes = cu_seqlen[1:] - cu_seqlen[:-1]
+    if (batch_sizes <= 0).any():
+        raise ValueError("calc_chunks requires every sequence to be non-empty.")
     batch_num_chunk = (batch_sizes + (moba_chunk_size - 1)) // moba_chunk_size
     cu_num_chunk = torch.ones(
         batch_num_chunk.numel() + 1,
@@ -130,8 +129,10 @@ def _select_threshold_query_head(
     cutoff = torch.where(
         any_cond,
         cond.float().argmax(dim=0),
-        torch.full_like(any_cond, fill_value=C - 1),
+        torch.full(any_cond.shape, C - 1, dtype=torch.long, device=gate.device),
     )  # (H, S)
+    # Self chunk already meets the threshold: select no extra chunk.
+    cutoff = torch.where(remain_ratio > 0, cutoff, -1)
 
     # 7) build a mask in sorted order up to that cutoff
     idx_range = torch.arange(C, device=gate.device).view(-1, 1, 1)  # (C, 1, 1)
@@ -210,8 +211,10 @@ def _select_threshold_block(
     cutoff_flat = torch.where(
         any_cond,
         cond_flat.float().argmax(dim=1),
-        torch.full_like(any_cond, fill_value=HS - 1),
+        torch.full(any_cond.shape, HS - 1, dtype=torch.long, device=gate.device),
     )  # (C,)
+    # Self entries already meet the threshold: select no extra entry.
+    cutoff_flat = torch.where(remain_ratio > 0, cutoff_flat, -1)
 
     # 7) build a mask in sorted order up to that cutoff per block
     idx_range_flat = torch.arange(HS, device=gate.device).unsqueeze(0)  # (1, H*S)
@@ -282,6 +285,9 @@ def _select_threshold_overall(
     # Only sort the valid 'other' entries
     valid_others_indices = torch.where(valid_others_mask_flat)[0]
     valid_others_values = others_flat[valid_others_indices]
+    if valid_others_values.numel() == 0:
+        # Every sequence fits in one chunk, so only self chunks exist.
+        return valid_gate_mask & gate_self_chunk_mask
 
     sorted_others_values, sort_perm = torch.sort(
         valid_others_values, descending=True
@@ -307,6 +313,13 @@ def _select_threshold_overall(
         torch.tensor(
             len(sorted_others_values) - 1, device=gate.device, dtype=torch.long
         ),
+    )
+
+    # Self entries already meet the threshold: select no extra entry.
+    cutoff_idx_in_sorted = torch.where(
+        remain_ratio > 0,
+        cutoff_idx_in_sorted,
+        torch.full_like(cutoff_idx_in_sorted, -1),
     )
 
     # 7) build a mask selecting the top-k others based on the cutoff
@@ -383,6 +396,8 @@ def _select_threshold_head_global(
     has_cutoff = cond.any(dim=1)  # (H,)
     default = torch.full((H,), CS - 1, device=gate.device, dtype=torch.long)
     cutoff = torch.where(has_cutoff, cond.float().argmax(dim=1), default)  # (H,)
+    # Self entries already meet the threshold: select no extra entry.
+    cutoff = torch.where(remain_ratio > 0, cutoff, -1)
 
     idx_range = torch.arange(CS, device=gate.device).unsqueeze(0)  # (1, C*S)
     sorted_mask = idx_range <= cutoff.unsqueeze(1)  # (H, C*S)
@@ -625,6 +640,9 @@ def moba_attn_varlen(
     kv = torch.stack((k, v), dim=1)
     seqlen, num_head, head_dim = q.shape
 
+    # Empty sequences have no chunks; drop them so chunk layout stays aligned.
+    cu_seqlens = torch.unique_consecutive(cu_seqlens)
+
     # Compute chunk boundaries.
     cu_chunk, filtered_chunk_indices, num_filtered_chunk, chunk_to_batch = calc_chunks(
         cu_seqlens, moba_chunk_size
@@ -739,11 +757,13 @@ def moba_attn_varlen(
             )
             gate_idx_flat = torch.zeros_like(flat_valid, dtype=torch.bool)
             gate_idx_flat.scatter_(1, topk_idx, True)
-            gate_mask = gate_idx_flat.reshape(H, C, S).permute(1, 0, 2)
+            gate_mask = valid_gate_mask & gate_idx_flat.reshape(H, C, S).permute(
+                1, 0, 2
+            )
         else:
             raise ValueError(
                 f"Invalid threshold_type for topk: {threshold_type}. "
-                "Choose 'query_head', 'block', or 'overall'."
+                "Choose 'query_head', 'overall', or 'head_global'."
             )
     elif select_mode == "threshold":
         # Delegate to the specific thresholding function
@@ -766,7 +786,7 @@ def moba_attn_varlen(
             )
         else:
             raise ValueError(
-                f"Invalid threshold_type: {threshold_type}. Choose 'query_head', 'block', or 'overall'."
+                f"Invalid threshold_type: {threshold_type}. Choose 'query_head', 'block', 'overall', or 'head_global'."
             )
     else:
         raise ValueError(
@@ -775,10 +795,17 @@ def moba_attn_varlen(
 
     # eliminate self_chunk in MoBA branch
     gate_mask = gate_mask & ~gate_self_chunk_mask
-    # if gate_mask is all false, perform flash_attn instead
+    # if gate_mask is all false, only the self chunks are attended
     if gate_mask.sum() == 0:
         return flash_attn_varlen_func(
-            q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen, causal=False
+            q,
+            k,
+            v,
+            self_attn_cu_seqlen,
+            self_attn_cu_seqlen,
+            moba_chunk_size,
+            moba_chunk_size,
+            causal=False,
         )
 
     # Determine which query positions are selected.
@@ -834,9 +861,9 @@ def moba_attn_varlen(
         dim=0,
     ).to(torch.int32)
 
-    assert (
-        moba_cu_seqlen_kv.shape == moba_cu_seqlen_q.shape
-    ), f"Mismatch between moba_cu_seqlen_kv.shape and moba_cu_seqlen_q.shape: {moba_cu_seqlen_kv.shape} vs {moba_cu_seqlen_q.shape}"
+    assert moba_cu_seqlen_kv.shape == moba_cu_seqlen_q.shape, (
+        f"Mismatch between moba_cu_seqlen_kv.shape and moba_cu_seqlen_q.shape: {moba_cu_seqlen_kv.shape} vs {moba_cu_seqlen_q.shape}"
+    )
 
     return MixedAttention.apply(
         q,
@@ -872,14 +899,16 @@ def process_moba_input(
     if isinstance(chunk_size, float) or isinstance(chunk_size, int):
         moba_chunk_size = int(chunk_size * patch_resolution[1] * patch_resolution[2])
     else:
-        assert isinstance(
-            chunk_size, (Tuple, list)
-        ), f"chunk_size should be a tuple, list, or int, now it is: {type(chunk_size)}"
+        assert isinstance(chunk_size, (Tuple, list)), (
+            f"chunk_size should be a tuple, list, or int, now it is: {type(chunk_size)}"
+        )
         if len(chunk_size) == 2:
             assert (
                 patch_resolution[1] % chunk_size[0] == 0
                 and patch_resolution[2] % chunk_size[1] == 0
-            ), f"spatial patch_resolution {patch_resolution[1:]} should be divisible by 2d chunk_size {chunk_size}"
+            ), (
+                f"spatial patch_resolution {patch_resolution[1:]} should be divisible by 2d chunk_size {chunk_size}"
+            )
             nch, ncw = (
                 patch_resolution[1] // chunk_size[0],
                 patch_resolution[2] // chunk_size[1],
@@ -899,7 +928,9 @@ def process_moba_input(
                 patch_resolution[0] % chunk_size[0] == 0
                 and patch_resolution[1] % chunk_size[1] == 0
                 and patch_resolution[2] % chunk_size[2] == 0
-            ), f"patch_resolution {patch_resolution} should be divisible by 3d chunk_size {chunk_size}"
+            ), (
+                f"patch_resolution {patch_resolution} should be divisible by 3d chunk_size {chunk_size}"
+            )
             nct, nch, ncw = (
                 patch_resolution[0] // chunk_size[0],
                 patch_resolution[1] // chunk_size[1],

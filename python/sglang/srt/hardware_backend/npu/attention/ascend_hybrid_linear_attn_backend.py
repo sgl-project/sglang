@@ -15,7 +15,7 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
 from sglang.srt.layers.attention.mamba.mamba2_metadata import (
     ForwardMetadata,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
@@ -36,7 +36,7 @@ class ReplaySSMDecodeMixin:
     """ReplaySSM decode ring (--enable-linear-replayssm) for an Ascend backend.
 
     The ring kernel is the gate-generic Triton implementation shared with CUDA
-    (``sglang.kernels...fla.fused_recurrent_linear_replayssm``); it runs on
+    (``sglang.kernels...linear.fused_recurrent_linear_replayssm``); it runs on
     Ascend through triton-ascend, so this only has to detect that the ring is
     live for the pool + layer and hand the *packed* post-conv qkv to that kernel
     instead of splitting q/k/v for the per-step decode. Cursor advance and
@@ -111,7 +111,7 @@ class ReplaySSMDecodeMixin:
             "--enable-linear-replayssm: ReplaySSM ring decode engaged on NPU "
             f"(triton-ascend ring kernel, is_kda={is_kda}, L={d_cache.shape[2]}).",
         )
-        from sglang.kernels.ops.attention.fla.fused_recurrent_linear_replayssm import (
+        from sglang.kernels.ops.attention.linear.fused_recurrent_linear_replayssm import (
             fused_recurrent_linear_replayssm_decode,
         )
 
@@ -276,9 +276,14 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
         num_padding: Optional[int] = None,
         in_capture: bool = False,
         mamba_track_indices: Optional[torch.Tensor] = None,
+        ragged_verify_layout=None,
         *args,
         **kwargs,
     ):
+        if ragged_verify_layout is not None:
+            raise NotImplementedError(
+                "Ascend hybrid linear attention does not support ragged verify"
+            )
         # out_graph passes seq_lens_cpu=None at capture; mirror the base guard.
         if seq_lens_cpu is None:
             num_padding = 0
@@ -407,7 +412,7 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
             ]
         )
 
-        mamba_caches = self.linear_attn_backend.req_to_token_pool.get_speculative_mamba2_params_all_layers()
+        mamba_caches = self.linear_attn_backend.state_pool.get_speculative_mamba2_params_all_layers()
 
         conv_states = mamba_caches.conv[0]
         ssm_states = mamba_caches.temporal

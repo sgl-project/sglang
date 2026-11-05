@@ -16,7 +16,7 @@ These are investigation hints, not a list of changes to apply.
 | `No platform detected. Using base SRTPlatform with defaults.` | Platform detection | Decide whether fallback is expected on this machine or indicates a missing plugin. |
 | `Unexpected error during package walk` in CUTE_DSL | Installed cutlass package, its handler, root propagation, and `CUTE_DSL_LOG_LEVEL` | Inspect the actual exception and duplicate-handler path; do not assume the current log level or hide all warnings. |
 | Repeated dtype, hybrid-model, or tokenizer fallback messages | Model-config and tokenizer construction in launcher, scheduler, and detokenizer | Multiple constructors may explain repetition. Retain meaningful per-process information and distinguish these from handler duplication. |
-| Repeated template detection messages | `managers/template_detection.py` and `managers/template_manager.py` | Check whether a summary already contains the same information. |
+| Repeated template detection messages | `parser/template_detection.py` and `parser/template_manager.py` | Check whether a summary already contains the same information. |
 | KV cache dtype logged separately from allocation | Model runner and memory pool | Check whether the allocation summary already carries dtype; retain useful allocation and SWA details. |
 | CUTLASS backend disabled during graph capture | Attention backend selection | Expected fallback may be useful information; retain the reason and selected behavior. |
 | `Ignore import error when loading ...` | Model, multimodal, or algorithm registries | Distinguish an unused optional model dependency from failure to load the requested model. |

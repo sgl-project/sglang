@@ -22,6 +22,11 @@ from sglang.srt.models.deepseek_common.amd import deepseek_v4_gfx95_dense as gfx
 from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (  # noqa: F401  deepseek_v4 reaches apply_attention_mhc through this module
     apply_attention_mhc,
 )
+from sglang.srt.models.deepseek_common.amd.deepseek_v4_wo_a_fp8 import (
+    WO_A_MXFP8_GROUP_SIZE,
+    is_wo_a_fp8_block32_supported,
+    wo_a_fp8_block,
+)
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import is_gfx95_supported
 
@@ -45,6 +50,11 @@ def init_mqa_layer(attn, quant_config) -> None:
     attn._wq_b_native_consumer_checked = False
     attn._wq_b_native_consumer = False
     attn._wo_b_fp8_grid_operand = None
+    # the fp8 unified_kv decode can quantize wo_a's input itself, per 128 only
+    attn.wo_a_fp8_block128 = attn.wo_a_fp8 and (
+        wo_a_fp8_block(attn.wo_a.weight, attn.wo_a.weight_scale_inv)
+        == WO_A_MXFP8_GROUP_SIZE
+    )
 
 
 def wo_a_emits_fp8_grid(attn) -> bool:
@@ -59,6 +69,17 @@ def wo_a_split_k_allowed() -> bool:
     return not (
         is_batch_invariant_mode_enabled()
         or get_exec().deterministic.enable_deterministic_inference
+    )
+
+
+def wo_a_fp8_block32_enabled() -> bool:
+    """Whether V4.1's 32x32-block wo_a stays fp8 for aiter's preshuffled BMM. A monokernel
+    reads the row-major wo_a and quantizes the bf16 one itself; deterministic and
+    batch-invariant inference keep the bf16 GEMM's one reduction order."""
+    return (
+        is_wo_a_fp8_block32_supported()
+        and not get_exec().kernel.enable_amd_monokernel
+        and wo_a_split_k_allowed()
     )
 
 
@@ -180,6 +201,26 @@ def hc_post(cfg, x, residual, post, comb) -> Optional[torch.Tensor]:
     return mhc_post_split_h(x, residual, post, comb, block_size=2048)
 
 
+def _x_quant_e8m0(layer) -> bool:
+    """Whether input_layernorm's fp8 operand goes out with ue8m0 scales: only when
+    every dense projection reading it (wqkv_a, or wq_a + wkv) runs the e8m0 mxscale
+    GEMM (SGLANG_DSV4_DENSE_MXSCALE). Resolved on first use, after weight load."""
+    cached = layer.__dict__.get("_x_quant_e8m0")
+    if cached is None:
+        from sglang.srt.layers.quantization.fp8_utils import dense_mxscale_ready
+
+        attn = layer.self_attn
+        if getattr(attn, "fuse_wqa_wkv", False):
+            consumers = (getattr(attn, "wqkv_a", None),)
+        else:
+            consumers = (getattr(attn, "wq_a", None), getattr(attn, "wkv", None))
+        cached = all(c is not None for c in consumers) and dense_mxscale_ready(
+            *consumers
+        )
+        layer.__dict__["_x_quant_e8m0"] = cached
+    return cached
+
+
 def input_norm(
     layer,
     hidden_states: torch.Tensor,
@@ -194,7 +235,10 @@ def input_norm(
         if coefficients is not None:
             coefficients.materialize()
         x_quant, hidden_states = fused_rmsnorm_fp8_quant(
-            hidden_states, layer.input_layernorm.weight, layer.rms_norm_eps
+            hidden_states,
+            layer.input_layernorm.weight,
+            layer.rms_norm_eps,
+            e8m0=_x_quant_e8m0(layer),
         )
         return hidden_states, x_quant
     if layer.fused_rmsnorm_fake_quant:

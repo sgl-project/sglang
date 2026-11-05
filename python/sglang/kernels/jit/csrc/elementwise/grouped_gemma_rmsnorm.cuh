@@ -141,7 +141,7 @@ struct GroupedGemmaRMSNormKernel {
     auto M = SymbolicSize{"num_tokens"};
     auto H = SymbolicSize{"hidden_size"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     TensorMatcher({M, H})  // input
         .with_dtype<DType>()
