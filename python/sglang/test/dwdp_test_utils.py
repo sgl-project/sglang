@@ -6,7 +6,6 @@ from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
 from sglang.benchmark.serving import run_benchmark
-from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.common import get_device_count, get_device_module
 from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
@@ -14,6 +13,7 @@ from sglang.test.test_utils import (
     auto_config_device,
     get_benchmark_args,
     popen_launch_server,
+    terminate_and_kill_process_tree,
     write_github_step_summary,
 )
 
@@ -27,15 +27,13 @@ XPU_SERVER_ARGS = [
     "bfloat16",
     "--trust-remote-code",
 ]
-# Shared by the DWDP arm and its TP control: TP mean 0.960 - 3 SE at n=400 on 2x B60
-# (sgl-eval 0.1.3, greedy; DWDP scored 0.965).
+# TP mean 0.960 - 3 SE at n=400 on 2x B60 (sgl-eval 0.1.3, greedy); P/D with DWDP prefill scored 0.96.
 GPT_OSS_20B_GSM8K_FLOOR = 0.93
 GSM8K_NUM_EXAMPLES = 400
 # The XPU default is single-stream because intel_xpu attention wedged the driver on
 # concurrent prefill; 8 threads run clean at TP=2.
 GSM8K_NUM_THREADS = 8
-# DWDP's buffer slots cost two to three layers of expert bytes on top of the owned
-# shard, so every DWDP test and its TP control get the same fraction.
+# DWDP's buffer slots cost two to three layers of expert bytes on top of the owned shard.
 MEM_FRACTION_STATIC = "0.85"
 
 
@@ -71,8 +69,7 @@ def assert_gsm8k_accuracy(
 ) -> dict:
     """Score a launched server on GSM8K with sgl-eval and assert the floor.
 
-    Greedy sampling, as in test_disaggregation_dwdp_gpt_oss.py, so the DWDP arm
-    and its TP control differ only by the parallelism under test.
+    Greedy sampling, as in test_disaggregation_dwdp_gpt_oss.py.
     """
     metrics = run_sgl_eval(
         SimpleNamespace(
@@ -136,9 +133,8 @@ PERF_INPUT_LEN = 4096
 # The load scales with the GPU count so every rank sees the same work.
 PERF_NUM_PROMPTS_PER_GPU = 32
 PERF_MAX_CONCURRENCY_PER_GPU = 4
-# DWDP/TP is at least 1.03 on every measured platform and GPU count; the floor
-# leaves a margin under that.
-MIN_DWDP_TO_TP_INPUT_THROUGHPUT = 0.9
+# DWDP/TP at 4k-token prompts on B60: 1.29-1.33 on 2 cards, 1.14-1.25 on 4; a lost DWDP gain falls below this
+MIN_DWDP_TO_TP_INPUT_THROUGHPUT = 1.05
 
 # Every flag whose default depends on the platform, so the arms differ only in
 # --dwdp-size and the platforms only in the device flags launch_dwdp_server adds.
@@ -201,7 +197,8 @@ def run_prefill_perf_vs_tp(*, num_gpus: int) -> float:
                 max_concurrency=PERF_MAX_CONCURRENCY_PER_GPU * num_gpus,
             )
         finally:
-            kill_process_tree(process.pid)
+            # the next arm starts on the same cards, so this server must be gone first
+            terminate_and_kill_process_tree(process)
 
     ratio = results["dwdp"]["input_throughput"] / results["tp"]["input_throughput"]
     device = f"{num_gpus}x {get_device_module().get_device_name(0)}"

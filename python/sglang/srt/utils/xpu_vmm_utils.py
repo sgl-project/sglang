@@ -35,7 +35,7 @@ from sglang.srt.utils.vmm_common import Reservation, all_ranks_ok
 
 logger = logging.getLogger(__name__)
 
-# Constants and struct layouts are copied from ze_api.h and zes_api.h at ZE_API_VERSION 1.15, each named for its enum or #define.
+# Constants and struct layouts are copied from ze_api.h at ZE_API_VERSION 1.15, each named for its enum or #define.
 
 _LOADER_SONAME = "libze_loader.so.1"
 # fixed so a user PATH cannot substitute the tool
@@ -49,16 +49,6 @@ _REQUIRED_SYMBOLS = (
     "zePhysicalMemGetProperties",
     "zeVirtualMemMap",
     "zeVirtualMemQueryPageSize",
-)
-
-# Probed apart from the VMM symbols so missing telemetry degrades a memory query
-# instead of failing a launch.
-_SYSMAN_SYMBOLS = (
-    "zesInit",
-    "zesDriverGet",
-    "zesDeviceGet",
-    "zesDeviceGetProperties",
-    "zesDeviceProcessesGetState",
 )
 
 # ze_result_t
@@ -78,31 +68,13 @@ _ZE_MEMORY_ACCESS_ATTRIBUTE_READWRITE = 1
 
 _ZE_MAX_DEVICE_NAME = 256  # #define; sizes a _DeviceProperties array
 
-# zes_structure_type_t
-_ZES_STRUCTURE_TYPE_DEVICE_PROPERTIES = 0x1
-_ZES_STRUCTURE_TYPE_PROCESS_STATE = 0x16
-
-_ZES_STRING_PROPERTY_SIZE = 64  # #define; sizes _ZesDeviceProperties arrays
-
-# Chosen here, not read from the spec:
-
-# zesDeviceProcessesGetState counts then fills, and a rank starting up in between
-# turns the second call into INVALID_SIZE; ask for room the count did not ask for.
-_SYSMAN_PROCESS_SLACK = 8
-
 # zeVirtualMemQueryPageSize grows with the request: measured 64 KiB below 2 MiB,
 # 2 MiB from there to 64 GiB on Arc B60. Expert shards always sit past that step.
 _PAGE_SIZE_QUERY_BYTES = 2 << 20
 
-# Level Zero physical memory torch's allocator cannot see: bytes this process created
-# on each device, by handle, and whether it ever created or imported any
+# Level Zero physical memory this process created, by handle: (device_id, bytes);
+# torch's allocator cannot see it
 local_physical_memory: Dict[int, Tuple[int, int]] = {}
-_physical_memory_created = False
-
-
-def has_physical_memory() -> bool:
-    """Whether this process holds Level Zero physical memory outside torch's allocator."""
-    return _physical_memory_created
 
 
 def local_physical_memory_bytes(device_id: int) -> int:
@@ -426,8 +398,6 @@ def create_physical_mem(size: int, prop: XpuAllocationProp) -> int:
         ),
         "zePhysicalMemCreate",
     )
-    global _physical_memory_created
-    _physical_memory_created = True
     local_physical_memory[int(handle.value)] = (device_id, int(size))
     return int(handle.value)
 
@@ -587,114 +557,6 @@ class VmmReservation:
             logger.warning(f"zeVirtualMemFree(local) -> 0x{result & 0xFFFFFFFF:x}")
 
 
-class _ZesProcessState(ctypes.Structure):
-    _fields_ = [
-        ("stype", ctypes.c_uint32),
-        ("pNext", ctypes.c_void_p),
-        ("processId", ctypes.c_uint32),
-        ("memSize", ctypes.c_uint64),
-        ("sharedSize", ctypes.c_uint64),
-        ("engines", ctypes.c_uint32),
-    ]
-
-
-class _ZesDeviceProperties(ctypes.Structure):
-    """core is a whole ze_device_properties_t by value, so the trailing fields
-    only land where the driver writes them if that nested layout is exact too."""
-
-    _fields_ = [
-        ("stype", ctypes.c_uint32),
-        ("pNext", ctypes.c_void_p),
-        ("core", _DeviceProperties),
-        ("numSubdevices", ctypes.c_uint32),
-        ("serialNumber", ctypes.c_char * _ZES_STRING_PROPERTY_SIZE),
-        ("boardNumber", ctypes.c_char * _ZES_STRING_PROPERTY_SIZE),
-        ("brandName", ctypes.c_char * _ZES_STRING_PROPERTY_SIZE),
-        ("modelName", ctypes.c_char * _ZES_STRING_PROPERTY_SIZE),
-        ("vendorName", ctypes.c_char * _ZES_STRING_PROPERTY_SIZE),
-        ("driverVersion", ctypes.c_char * _ZES_STRING_PROPERTY_SIZE),
-    ]
-
-
-@cache
-def _sysman_device_handle(device_id: int) -> int:
-    """Sysman handle for a torch XPU ordinal, matched by UUID: sysman enumerates
-    independently of the core API, so index order is no contract here either."""
-    lib = _load_level_zero_exporting(_SYSMAN_SYMBOLS)
-    check_ze(lib.zesInit(0), "zesInit")
-    torch_uuid = _torch_uuid(device_id)
-
-    driver_count = ctypes.c_uint32(0)
-    check_ze(lib.zesDriverGet(ctypes.byref(driver_count), None), "zesDriverGet(count)")
-    drivers = (ctypes.c_void_p * driver_count.value)()
-    check_ze(lib.zesDriverGet(ctypes.byref(driver_count), drivers), "zesDriverGet")
-
-    for driver in drivers[: driver_count.value]:
-        device_count = ctypes.c_uint32(0)
-        check_ze(
-            lib.zesDeviceGet(ctypes.c_void_p(driver), ctypes.byref(device_count), None),
-            "zesDeviceGet(count)",
-        )
-        devices = (ctypes.c_void_p * device_count.value)()
-        check_ze(
-            lib.zesDeviceGet(
-                ctypes.c_void_p(driver), ctypes.byref(device_count), devices
-            ),
-            "zesDeviceGet",
-        )
-        for device in devices[: device_count.value]:
-            props = _ZesDeviceProperties()
-            props.stype = _ZES_STRUCTURE_TYPE_DEVICE_PROPERTIES
-            props.core.stype = _ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES
-            check_ze(
-                lib.zesDeviceGetProperties(
-                    ctypes.c_void_p(device), ctypes.byref(props)
-                ),
-                "zesDeviceGetProperties",
-            )
-            if bytes(props.core.uuid) == torch_uuid:
-                return int(device)
-
-    raise RuntimeError(
-        f"torch XPU device {device_id} (uuid={torch_uuid.hex()}) has no matching "
-        f"Level Zero sysman device"
-    )
-
-
-def get_device_memory_in_use(device_id: int) -> int:
-    """Device memory held by every process on device_id, in bytes.
-
-    The only query on this driver that sees L0 physical memory: on Arc B60
-    zesMemoryGetState reports free == total, currUsableMemSize reports 0, and
-    torch.xpu.mem_get_info forwards the former. ~35 ms (the driver walks /proc),
-    so use it on startup and sizing paths, never per step.
-    """
-    lib = _load_level_zero_exporting(_SYSMAN_SYMBOLS)
-    device = _sysman_device_handle(int(device_id))
-
-    count = ctypes.c_uint32(0)
-    check_ze(
-        lib.zesDeviceProcessesGetState(
-            ctypes.c_void_p(device), ctypes.byref(count), None
-        ),
-        "zesDeviceProcessesGetState(count)",
-    )
-    if count.value == 0:
-        return 0
-
-    capacity = ctypes.c_uint32(count.value + _SYSMAN_PROCESS_SLACK)
-    states = (_ZesProcessState * capacity.value)()
-    for state in states:
-        state.stype = _ZES_STRUCTURE_TYPE_PROCESS_STATE
-    check_ze(
-        lib.zesDeviceProcessesGetState(
-            ctypes.c_void_p(device), ctypes.byref(capacity), states
-        ),
-        "zesDeviceProcessesGetState",
-    )
-    return sum(int(state.memSize) for state in states[: capacity.value])
-
-
 class XpuVmmBackend(VmmBackend):
     @property
     def torch_device(self) -> torch.device:
@@ -811,8 +673,6 @@ class XpuVmmBackend(VmmBackend):
             )
         finally:
             os.close(dup_fd)
-        global _physical_memory_created
-        _physical_memory_created = True
         return int(handle.value)
 
     def owns_exported_fds(self) -> bool:

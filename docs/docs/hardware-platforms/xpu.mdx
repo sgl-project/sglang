@@ -500,6 +500,6 @@ python -m sglang.launch_server --model-path openai/gpt-oss-20b --device xpu \
     --mem-fraction-static 0.85
 ```
 
-Tested with gpt-oss-20b on 2 and 4 Arc Pro B60 cards and Qwen3-30B-A3B on 4, and in P/D with DWDP prefill on 2 cards and TP decode on 2 over NIXL. NIXL needs a UCX built with Level Zero support (`--with-ze`), as in `docker/xpu.Dockerfile`; the PyPI wheel is CUDA-only.
+Tested with gpt-oss-20b on 2 and 4 Arc Pro B60 cards, and in P/D with DWDP prefill on 2 cards and TP decode on 2 over NIXL. NIXL needs a UCX built with Level Zero support (`--with-ze`), as in `docker/xpu.Dockerfile`; the PyPI wheel is CUDA-only.
 
 Level Zero cannot map one physical page into two virtual ranges, so DWDP on XPU remaps its buffer pages per layer and keeps three prefetch slots instead of two. DWDP refuses EPLB, speculative decoding, pipeline parallelism, two-batch overlap and `--enforce-shared-experts-fusion` at startup; a model that fuses shared experts by default fails at DWDP setup.
