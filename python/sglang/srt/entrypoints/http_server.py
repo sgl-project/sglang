@@ -2238,8 +2238,6 @@ async def vertex_generate(
         return ORJSONResponse({"predictions": orjson.loads(ret.body)})
     return ret
 
-    return ORJSONResponse({"predictions": ret})
-
 
 def _create_error_response(e):
     return ORJSONResponse(
