@@ -79,6 +79,7 @@ from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     get_allocator_from_storage,
     make_kernel_ptr_table,
+    resolve_host_pin_memory,
 )
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
 
@@ -274,7 +275,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         self.slot_page_size = slot_page_size
         self.dtype = torch.uint8
         self.device = device
-        self.pin_memory = pin_memory
+        self.pin_memory = resolve_host_pin_memory(pin_memory)
         self.allocator = get_allocator_from_storage(allocator_type)
         self.page_size = slot_page_size
         self.size = num_host_pages * slot_page_size
@@ -794,7 +795,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
         self.swa_page_size = swa_page_size
         self.dtype = torch.uint8
         self.device = device
-        self.pin_memory = pin_memory
+        self.pin_memory = resolve_host_pin_memory(pin_memory)
         self.allocator = get_allocator_from_storage(allocator_type)
         self.page_size = swa_page_size
         self.size = num_host_pages * swa_page_size

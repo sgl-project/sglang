@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.pool_host.common import (
     _cuda_host_unregister,
     get_allocator_from_storage,
     make_kernel_ptr_table,
+    resolve_host_pin_memory,
 )
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
@@ -105,7 +106,7 @@ class DSAIndexerPoolHost(HostKVCache):
         self._is_dummy = is_dummy
         self._destroyed = False
         self.device_pool = None
-        self.pin_memory = pin_memory
+        self.pin_memory = resolve_host_pin_memory(pin_memory)
         self.device = device
         self.allocator = get_allocator_from_storage(allocator_type)
         self._layer_sharded = layer_sharded

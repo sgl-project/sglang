@@ -898,6 +898,13 @@ class Envs:
     # Disable with SGLANG_HICACHE_NIXL_USE_DIRECT_IO=0 or via the
     # "use_direct_io": false key in --hicache-storage-backend-extra-config.
     SGLANG_HICACHE_NIXL_USE_DIRECT_IO = EnvBool(True)
+    # On NPU, allocate HiCache host pools as pageable rather than pinned host
+    # memory. torch_npu pins through aclrtMallocHost, and the CANN driver maps
+    # that memory into the device window as a VM_PFNMAP|VM_IO VMA, which the
+    # kernel refuses to pin again: ibv_reg_mr() fails with EINVAL and a storage
+    # backend (e.g. Mooncake) cannot register the host pool. Opt in to trade the
+    # H2D copy speedup for a registrable pool. No effect off NPU.
+    SGLANG_HICACHE_DISABLE_NPU_HOST_PIN_MEMORY = EnvBool(False)
     SGLANG_HUGEPAGE_SIZE = EnvStr("")
     # >0: prefault host pools with a private THP mapping using this many threads; 0 disables.
     SGLANG_HICACHE_HOST_PARALLEL_ALLOC_THREADS = EnvInt(0)

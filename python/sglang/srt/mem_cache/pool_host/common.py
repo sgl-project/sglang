@@ -17,11 +17,56 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.storage.mmap import alloc_mmap_ex
 from sglang.srt.runtime_context import get_memory
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hip, is_npu
 
 logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
+
+
+@lru_cache(maxsize=1)
+def _log_host_pin_memory_policy() -> None:
+    disabled = envs.SGLANG_HICACHE_DISABLE_NPU_HOST_PIN_MEMORY.get()
+    npu = is_npu()
+    if disabled and npu:
+        logger.info(
+            "HiCache host pool: pinned memory disabled "
+            "(SGLANG_HICACHE_DISABLE_NPU_HOST_PIN_MEMORY=%d, is_npu=%s); "
+            "allocating pageable host memory so storage backends can register it.",
+            disabled,
+            npu,
+        )
+    else:
+        logger.info(
+            "HiCache host pool: pinned memory enabled "
+            "(SGLANG_HICACHE_DISABLE_NPU_HOST_PIN_MEMORY=%d, is_npu=%s).",
+            disabled,
+            npu,
+        )
+
+
+def resolve_host_pin_memory(pin_memory: bool) -> bool:
+    """Optionally pageable instead of pinned host memory for HiCache pools.
+
+    Gated by SGLANG_HICACHE_DISABLE_NPU_HOST_PIN_MEMORY=1, off by default.
+
+    torch_npu backs ``pin_memory=True`` with aclrtMallocHost, and the CANN
+    driver maps that memory into /dev/davinci_manager as a VM_PFNMAP|VM_IO
+    VMA. The kernel refuses to pin such a VMA, so ibv_reg_mr() fails with
+    EINVAL when a storage backend registers the host pool for RDMA — Mooncake
+    surfaces it as "Failed to register buffer to Mooncake Store, error code:
+    -600" and HiCache never comes up. Pageable host memory registers fine, so
+    give up the H2D copy speedup to keep the storage backend working.
+    """
+    _log_host_pin_memory_policy()
+    if (
+        not pin_memory
+        or not envs.SGLANG_HICACHE_DISABLE_NPU_HOST_PIN_MEMORY.get()
+        or not is_npu()
+    ):
+        return pin_memory
+    return False
+
 
 _CUDA_HOST_REGISTERED_RANGES_ATTR = "_sglang_cuda_host_registered_ranges"
 _HOST_LOCKED_RANGE_ATTR = "_sglang_host_locked_range"
