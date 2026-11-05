@@ -356,6 +356,37 @@ class TreeBuilder:
 
         keep_count = min(self.budget, state.num_nodes)
         priority = state.path_scores[:, 1 : state.num_nodes + 1]
+        self.num_selected_nodes = keep_count
+        if out is None:
+            out = _empty_layout(r, keep_count, device)
+        if priority.device.type == "npu":
+            try:
+                from .dspark_tree_triton import (
+                    finalize_tree_layout_triton,
+                    prune_tree_layout_triton,
+                )
+            except ImportError:
+                pass
+            else:
+                prune_tree_layout_triton(
+                    priority,
+                    state.tokens,
+                    state.depths,
+                    state.parents,
+                    out.tokens,
+                    out.depths,
+                    out.parents,
+                    keep_count,
+                )
+                out.num_nodes[:] = keep_count
+                finalize_tree_layout_triton(
+                    out.parents,
+                    out.first_child,
+                    out.next_sibling,
+                    out.visibility,
+                    keep_count,
+                )
+                return out
         kept = priority.argsort(dim=-1, descending=True, stable=True)[
             :, :keep_count
         ]
@@ -374,9 +405,6 @@ class TreeBuilder:
         new_tokens = state.tokens.gather(1, kept_ids - 1)
         new_depths = state.depths.gather(1, kept_ids - 1)
 
-        self.num_selected_nodes = keep_count
-        if out is None:
-            out = _empty_layout(r, keep_count, device)
         return finalize_tree_layout_torch(
             out, new_tokens, new_depths, new_parents, keep_count
         )
@@ -633,6 +661,7 @@ def build_tree_metadata(
     *,
     prefix_lens: torch.Tensor,
     anchor_tokens: torch.Tensor,
+    num_nodes: int | None = None,
 ) -> TreeMetadata:
     """Build per-node verify geometry for a finalized TreeLayout."""
     batch, budget = layout.tokens.shape
@@ -640,7 +669,8 @@ def build_tree_metadata(
         raise ValueError("prefix_lens/anchor_tokens batch mismatch")
     device = layout.tokens.device
     query_width = budget + 1
-    num_nodes = int(layout.num_nodes.max().item()) if batch else 0  # HOST-SYNC: max readback
+    if num_nodes is None:
+        num_nodes = int(layout.num_nodes.max().item()) if batch else 0  # HOST-SYNC: max readback
     max_depth = int(layout.depths.max().item()) if budget else 0  # HOST-SYNC: max readback
 
     depths = torch.cat(
@@ -1112,7 +1142,10 @@ def plan_tree_pre(
     )
     layout = builder.build(base_logits, root_token_ids)
     metadata = build_tree_metadata(
-        layout, prefix_lens=prefix_lens, anchor_tokens=root_token_ids
+        layout,
+        prefix_lens=prefix_lens,
+        anchor_tokens=root_token_ids,
+        num_nodes=builder.num_selected_nodes,
     )
     if metadata.query_width != config.verify_width:
         raise ValueError(

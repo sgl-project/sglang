@@ -124,6 +124,9 @@ class NodePlan:
     )
     max_seqlen_cache: dict[tuple[int, int, int], int] = field(default_factory=dict)
     attn_metadata_cache: dict[tuple, torch.Tensor] = field(default_factory=dict)
+    indexed_table_cache: dict[
+        tuple, tuple[torch.Tensor | None, torch.Tensor | None]
+    ] = field(default_factory=dict)
     indexer_lengths_cache: tuple[torch.Tensor, torch.Tensor] | None = None
     max_kv_cache: int | None = None
     indexer_metadata_cache: dict[
@@ -669,6 +672,41 @@ def _tree_attention(**kwargs) -> torch.Tensor:
     return op(q, **op_kwargs)[0]
 
 
+def _table_cache_token(table: torch.Tensor | None):
+    if table is None:
+        return (0, (), ())
+    return (int(table.data_ptr()), tuple(table.shape), tuple(table.stride()))
+
+
+def _cached_indexed_tables(
+    plan: NodePlan,
+    ori_block_table: torch.Tensor | None,
+    cmp_block_table: torch.Tensor | None,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    key = (
+        _table_cache_token(ori_block_table),
+        _table_cache_token(cmp_block_table),
+        int(plan.req_ids.data_ptr()),
+        tuple(plan.req_ids.shape),
+    )
+    cached = plan.indexed_table_cache.get(key)
+    if cached is not None:
+        return cached
+    ori = (
+        ori_block_table.index_select(0, plan.req_ids)
+        if ori_block_table is not None
+        else None
+    )
+    cmp = (
+        cmp_block_table.index_select(0, plan.req_ids)
+        if cmp_block_table is not None
+        else None
+    )
+    cached = (ori, cmp)
+    plan.indexed_table_cache[key] = cached
+    return cached
+
+
 def attend_nodes(
     *,
     query: torch.Tensor,
@@ -696,15 +734,8 @@ def attend_nodes(
         cmp_sparse_indices=cmp_sparse_indices,
         compressed=compressed,
     )
-    ori_table = (
-        ori_block_table.index_select(0, plan.req_ids)
-        if ori_block_table is not None
-        else None
-    )
-    cmp_table = (
-        cmp_block_table.index_select(0, plan.req_ids)
-        if cmp_block_table is not None
-        else None
+    ori_table, cmp_table = _cached_indexed_tables(
+        plan, ori_block_table, cmp_block_table
     )
     return _tree_attention(
         q=query,

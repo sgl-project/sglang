@@ -426,6 +426,18 @@ class TreeAttentionContractTest(CustomTestCase):
         self.assertIsNotNone(out["tree_ancestors"])
         self.assertIsNotNone(out["tree_prefix"])
 
+    def test_indexed_block_tables_are_cached_per_plan(self):
+        plan = _make_plan()
+        ori = torch.arange(12, dtype=torch.int32).reshape(3, 4)
+        cmp = torch.arange(100, 112, dtype=torch.int32).reshape(3, 4)
+
+        first = tree_ops._cached_indexed_tables(plan, ori, cmp)
+        second = tree_ops._cached_indexed_tables(plan, ori, cmp)
+
+        self.assertIs(first, second)
+        self.assertTrue(torch.equal(first[0], ori.index_select(0, plan.req_ids)))
+        self.assertTrue(torch.equal(first[1], cmp.index_select(0, plan.req_ids)))
+
 
 class NodeCommitLaunchTest(CustomTestCase):
     def _plan(self):

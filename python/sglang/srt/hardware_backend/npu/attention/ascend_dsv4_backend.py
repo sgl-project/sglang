@@ -1069,6 +1069,7 @@ class C4IndexerAscendBackendMixin:
         tree_plan,
     ) -> torch.Tensor:
         from sglang.srt.speculative.dspark_components.dspark_tree_ops import (
+            _cached_max_kv,
             get_node_plan,
             tree_indexer,
             tree_indexer_select_all,
@@ -1090,7 +1091,7 @@ class C4IndexerAscendBackendMixin:
             q_quant = q_quant[:n]
             q_scale = q_scale[:n]
             weights = weights[:n]
-        max_kv = int(plan.start.max().item() + plan.depths.max().item() + 1)
+        max_kv = _cached_max_kv(plan)
         if max(1, max_kv // 4) <= topk:
             return tree_indexer_select_all(plan, topk, q_quant.device).view(-1, topk)
         nodes = tree_plan.tree_node_kv.get(c4_indexer.layer_id)
