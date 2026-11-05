@@ -105,7 +105,11 @@ def flat_index_logits_tiles(
         rows, width, heads=q[0].shape[1], budget_bytes=budget_bytes
     )
     weights = weights.to(index_weights_dtype())
-    logits_dtype = index_logits_dtype()
+    if weights.dtype == torch.bfloat16:
+        logits_args, logits_kwargs = (width,), {}
+    else:
+        logits_args = (False, width)
+        logits_kwargs = {"logits_dtype": index_logits_dtype()}
     for offset in range(0, rows, rows_per_chunk):
         tile = slice(offset, min(offset + rows_per_chunk, rows))
         tile_starts = starts[tile]
@@ -117,9 +121,8 @@ def flat_index_logits_tiles(
                 weights[tile],
                 tile_starts,
                 tile_starts + lengths[tile],
-                False,
-                width,
-                logits_dtype=logits_dtype,
+                *logits_args,
+                **logits_kwargs,
             ),
         )
 
