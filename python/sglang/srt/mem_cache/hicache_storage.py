@@ -133,8 +133,8 @@ class PoolName(str, Enum):
     DEEPSEEK_V4_C4_INDEXER_STATE = "deepseek_v4_c4_indexer_state"
     DEEPSEEK_V4_C128_STATE = "deepseek_v4_c128_state"
     # ERNIE 5.5 Flash's full-context MLA layers: latent KV and DSA index keys.
-    ERNIE5_5_MLA = "ernie5_5_mla"
-    ERNIE5_5_MLA_INDEXER = "ernie5_5_mla_indexer"
+    ERNIE5_5_MLA = "ernie55_mla"
+    ERNIE5_5_MLA_INDEXER = "ernie55_mla_indexer"
 
     # Draft KV pool
     DRAFT = "draft"
