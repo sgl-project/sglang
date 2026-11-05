@@ -1272,7 +1272,17 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Storage directory for the HiCache NIXL backend.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Not set</td>
     </tr>
-  </tbody>
+      <tr>
+      <td><code>SGLANG_HICACHE_PREFETCH_TIMING_TRACE</code></td>
+      <td>Emit <code>HICACHE_PREFETCH_TIMING</code> JSON records for each prefetch boundary, host/buffer handoff and forward entry. Records carry host, PID, request ID, attempt ID and operation ID, with local monotonic nanosecond timestamps. Consume records include queue, lookup, read and ACK wait durations. H2D completion uses the existing transfer metrics.</td>
+      <td><code>false</code></td>
+    </tr>
+    <tr>
+      <td><code>SGLANG_HICACHE_TRACE_RUN_ID</code></td>
+      <td>Run identifier attached to opt-in HiCache prefetch timing records. Correlate durations within one host/process. Prompt contents, token IDs and cache keys are excluded.</td>
+      <td><code>""</code></td>
+    </tr>
+</tbody>
 </table>
 
 

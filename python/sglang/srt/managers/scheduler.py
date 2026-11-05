@@ -332,6 +332,7 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
 )
 from sglang.srt.mem_cache.events import KvEventLoraNames
+from sglang.srt.mem_cache.hicache_storage import log_hicache_prefetch_forward_entries
 from sglang.srt.mem_cache.kv_weight_version_tracker import KvWeightVersionTracker
 from sglang.srt.mem_cache.static_kv_storage import StaticPoolShape, kv_storage_of
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
@@ -4577,6 +4578,7 @@ class Scheduler(
             self.chunked_req = adder.new_chunked_req
 
         set_time_batch(can_run_list, "set_forward_entry_time")
+        log_hicache_prefetch_forward_entries(can_run_list)
 
         # Create a new batch
         new_batch = ScheduleBatch.init_new(

@@ -64,6 +64,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
     SidecarPoolSpec,
+    log_hicache_prefetch_consume,
     merge_source_transfers,
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
@@ -2789,6 +2790,9 @@ class UnifiedRadixCache(BasePrefixCache):
             request, operation, hash_value, host_indices
         ):
             # Hybrid all-or-nothing check failed; result already discarded.
+            log_hicache_prefetch_consume(
+                operation, path="hybrid_discard", loaded_tokens=0
+            )
             return
 
         allocated_tokens = len(host_indices)
@@ -2808,9 +2812,13 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.buffer_pipeline is not None:
             # No graft: release the rank-local tail beyond the synced usable
             # length, then park the bounce for admission-time consumption.
-            return self.buffer_pipeline.stage_completed_prefetch(
+            result = self.buffer_pipeline.stage_completed_prefetch(
                 request, completed_tokens, hash_value
             )
+            log_hicache_prefetch_consume(
+                operation, path="buffer_staging", completed_tokens=completed_tokens
+            )
+            return result
 
         fetched_key = prefetch_key[:completed_tokens]
         insert_result = self.tree_core.insert_host(
@@ -2859,6 +2867,13 @@ class UnifiedRadixCache(BasePrefixCache):
         self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
 
         self.prefetch_loaded_tokens_by_reqid[request] = loaded_from_storage
+        log_hicache_prefetch_consume(
+            operation,
+            path="cache_insert",
+            requested_tokens=len(prefetch_key),
+            completed_tokens=completed_tokens,
+            loaded_tokens=loaded_from_storage,
+        )
         if loaded_from_storage > 0:
             self.prefetch_loaded_storage_start_by_reqid[request] = (
                 operation.storage_start + insert_result.prefix_len
@@ -3157,6 +3172,7 @@ class UnifiedRadixCache(BasePrefixCache):
     ) -> None:
         """Drop an in-flight prefetch, releasing ``host_indices`` and ``extra_pools``."""
         info = self.ongoing_prefetch.pop(request)
+        log_hicache_prefetch_consume(info.operation, path="retire", loaded_tokens=0)
         if info.anchor_lock_params is not None:
             self.dec_host_lock_ref(info.anchor_node_id, info.anchor_lock_params)
         if self.buffer_pipeline is not None:
