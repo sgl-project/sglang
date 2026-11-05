@@ -23,9 +23,9 @@ from sglang.srt.managers.mm_schedule import (
     _move_items_to_device,
 )
 from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
     ListKind,
-    RequestList,
-    _RequestList,
+    ReqList,
     move,
 )
 from sglang.srt.models.unlimited_ocr_v2_support.document_reuse import (
@@ -82,14 +82,14 @@ def _token_count(item) -> int:
 class EarlyEmbeddings(PrefetchedEmbeddingFunc):
     """The image encoder, plus parked windows' pages it encoded ahead of prefill.
 
-    Embeddings are keyed by item hash and kept until their window finishes:
+    Embeddings are keyed by the full item identity and kept until their window finishes:
     chunked prefill embeds an image once per chunk it overlaps.
     """
 
     def __init__(self, *, encode: Callable[[List[MultimodalDataItem]], torch.Tensor]):
         self._encode = encode
-        self._by_hash: Dict[int, torch.Tensor] = {}
-        self._owned: Dict[str, List[int]] = {}
+        self._by_key: Dict[bytes, torch.Tensor] = {}
+        self._owned: Dict[str, List[bytes]] = {}
         self._bytes = 0
         self._stream: Optional[torch.cuda.Stream] = None
 
@@ -97,12 +97,12 @@ class EarlyEmbeddings(PrefetchedEmbeddingFunc):
         return self._encode(items)
 
     def has_prefetched(self) -> bool:
-        return bool(self._by_hash)
+        return bool(self._by_key)
 
     def prefetched(
-        self, item_hash: Optional[int], token_count: int
+        self, item_key: Optional[bytes], token_count: int
     ) -> Optional[torch.Tensor]:
-        emb = self._by_hash.get(item_hash) if item_hash is not None else None
+        emb = self._by_key.get(item_key) if item_key is not None else None
         if emb is None or emb.shape[0] != token_count:
             return None
         return emb
@@ -122,7 +122,9 @@ class EarlyEmbeddings(PrefetchedEmbeddingFunc):
         them, and a miss here costs only time.
         """
         items = [
-            it for it in items if it.hash is not None and it.hash not in self._by_hash
+            it
+            for it in items
+            if it.hash is not None and it.cache_key not in self._by_key
         ]
         if not items or any(it.feature is None or not it.offsets for it in items):
             return
@@ -157,21 +159,21 @@ class EarlyEmbeddings(PrefetchedEmbeddingFunc):
             if emb.shape[0] != _token_count(it):
                 continue
             emb.record_stream(forward_stream)
-            self._by_hash[it.hash] = emb
+            self._by_key[it.cache_key] = emb
             self._bytes += emb.numel() * emb.element_size()
-            owned.append(it.hash)
+            owned.append(it.cache_key)
         self._owned[rid] = owned
 
     def release(self, rid: str) -> None:
         """Free a window's early embeddings once it no longer needs them."""
         for h in self._owned.pop(rid, ()):
-            emb = self._by_hash.pop(h, None)
+            emb = self._by_key.pop(h, None)
             if emb is not None:
                 self._bytes -= emb.numel() * emb.element_size()
 
     def clear(self) -> None:
         """Drop every early embedding."""
-        self._by_hash.clear()
+        self._by_key.clear()
         self._owned.clear()
         self._bytes = 0
 
@@ -196,13 +198,13 @@ class DocPrefetch:
         # Vision runs on every TP rank in lockstep; it is not encoded out of step.
         self._encode_ahead = early is not None and tp_size == 1
         # Follow-ups waiting for their predecessor.
-        self._parked = _RequestList(
+        self._parked = IndexedReqList(
             ListKind.UOCR_PARKED, abort=lambda r: self._abort(self._parked, r)
         )
         # Completion tokens of finished predecessors whose follow-up has not arrived.
         self._finished: Dict[str, int] = {}
         # Follow-ups whose predecessor finished, for the scheduler to queue.
-        self._released = _RequestList(
+        self._released = IndexedReqList(
             ListKind.UOCR_RELEASED, abort=lambda r: self._abort(self._released, r)
         )
 
@@ -259,13 +261,13 @@ class DocPrefetch:
         """Follow-ups released since the last call, in release order."""
         return self._released.take()
 
-    def request_lists(self) -> Dict[ListKind, RequestList]:
+    def request_lists(self) -> Dict[ListKind, ReqList]:
         return {
             ListKind.UOCR_PARKED: self._parked,
             ListKind.UOCR_RELEASED: self._released,
         }
 
-    def _abort(self, windows: RequestList, recv_req: AbortReq) -> None:
+    def _abort(self, windows: ReqList, recv_req: AbortReq) -> None:
         aborted = windows.take(lambda r: recv_req.matches(r.rid))
         for r in aborted:
             self.release_early(r.rid)
