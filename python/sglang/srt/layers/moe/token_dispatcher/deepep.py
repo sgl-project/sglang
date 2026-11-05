@@ -555,6 +555,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 
         if is_npu_arch35() or self.deepep_output_dtype not in (
+            DispatcherOutputDtype.BF16,
             DispatcherOutputDtype.INT8,
             DispatcherOutputDtype.FP8,
         ):
@@ -566,6 +567,8 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
                 "SGLANG_NPU_DEEPEP_NORMAL_BF16 requires "
                 "DEEP_NORMAL_MODE_USE_INT8_QUANT=0."
             )
+        if self.deepep_output_dtype == DispatcherOutputDtype.BF16:
+            return
         self.deepep_output_dtype = DispatcherOutputDtype.BF16
         logger.info_once(
             "DeepEP Normal dispatch uses BF16 under SGLANG_NPU_DEEPEP_NORMAL_BF16."
