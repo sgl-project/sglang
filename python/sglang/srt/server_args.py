@@ -563,10 +563,7 @@ def resolve_encoder_transfer_backend(
         return backend
     if (
         model_arch
-        in (
-            "KimiK3ForConditionalGeneration",
-            "KimiK31ForConditionalGeneration",
-        )
+        in ("KimiK3ForConditionalGeneration", "KimiK31ForConditionalGeneration")
         and tp_size > 1
     ):
         return "zmq_to_tokenizer"

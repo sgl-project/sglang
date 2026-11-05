@@ -37,7 +37,7 @@ from sglang.srt.configs.unlimited_ocr_v2 import (
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import is_hip, retry
+from sglang.srt.utils import is_hip, is_npu, retry
 from sglang.srt.utils.hf_transformers import (
     get_config,
     get_context_length,
@@ -210,12 +210,9 @@ def is_deepseek_dsa(config) -> bool:
             "Dots3NoteForCausalLMNextN",
             "HYV4ForCausalLM",
             "HYV4ForCausalLMNextN",
-            "KimiK31ForConditionalGeneration",
-            "KimiK31LinearForCausalLM",
-            "KimiLinearForCausalLM",
         )
         and _hf_attr(config, "index_topk") is not None
-    )
+    ) or is_kimi_k31(config)
 
 
 def dsa_draft_shards_under_dcp(config, dcp_size: int) -> bool:
@@ -225,6 +222,23 @@ def dsa_draft_shards_under_dcp(config, dcp_size: int) -> bool:
     with dcp_size 1.
     """
     return dcp_size > 1 and is_hip() and is_deepseek_dsa(config)
+
+
+def mla_attention_dcp_size(config, *, dcp_size: int, is_nextn: bool) -> int:
+    """The DCP width used by MLA execution, including platform draft policies.
+
+    KV planning must use this same width before the attention module is built.
+    """
+    # Ascend draft backends use allocator-global slots and non-DCP attention.
+    if is_nextn and is_npu():
+        return 1
+    if (
+        is_nextn
+        and is_deepseek_dsa(config)
+        and not dsa_draft_shards_under_dcp(config, dcp_size)
+    ):
+        return 1
+    return dcp_size
 
 
 def is_glm_moe_dsa(config) -> bool:
@@ -238,9 +252,23 @@ def is_glm_moe_dsa(config) -> bool:
 def is_kimi_k3(config) -> bool:
     return _hf_arch(config) in (
         "KimiK3ForConditionalGeneration",
-        "KimiK3LinearForCausalLM",
         "KimiK31ForConditionalGeneration",
-        "KimiK31LinearForCausalLM",
+        "KimiK3LinearForCausalLM",
+    )
+
+
+_KIMI_K31_ARCHS = (
+    "KimiK31ForConditionalGeneration",
+    "KimiLinearForCausalLM",
+    "KimiK3LinearForCausalLM",
+)
+
+
+def is_kimi_k31(config) -> bool:
+    """Kimi-K3.1: the Kimi linear-attention family with DSA layers."""
+    return (
+        _hf_arch(config) in _KIMI_K31_ARCHS
+        and _hf_attr(config, "index_topk") is not None
     )
 
 
@@ -672,10 +700,6 @@ class ModelConfig:
                 **kwargs,
             )
         )
-        # Remote Kimi K3.1 configs define their own KimiLinearConfig class.
-        # Normalize it before deriving hf_text_config and model shapes so all
-        # downstream config consumers see SGLang's complete implementation.
-        self._normalize_remote_kimi_linear_config()
         self.pointer_head = None
         base = POINTER_ADAPTER_BASES.get((self.model_path, revision))
         if base is not None:
@@ -696,6 +720,9 @@ class ModelConfig:
                 ):
                     # Full attention sees the whole prompt, while linear attention stays causal.
                     self.hf_text_config.is_causal = False
+        if is_embedding_nemotron3(self.hf_config):
+            # A bare Ministral3 backbone configured as a mean-pooled embedder.
+            self.hf_config.architectures = ["EmbeddingNemotron3Model"]
         self.joint_head_config = None
         if self.hf_config.architectures == ["Qwen3_5ForConditionalGeneration"]:
             self.joint_head_config = load_joint_head_config(self.model_path, revision)
@@ -1271,61 +1298,6 @@ class ModelConfig:
             self.hf_config.architectures[0] = "HYV4ForCausalLMNextN"
             self.hf_config.num_nextn_predict_layers = 1
 
-    def _normalize_remote_kimi_linear_config(self):
-        """Replace a remote-code KimiLinearConfig text_config with SGLang's version.
-
-        K3.1 ships ``configuration_kimi_k3.py`` via ``auto_map`` whose
-        ``KimiLinearConfig`` lacks SGLang-specific properties
-        (``mamba2_cache_params``, ``full_attention_layer_ids``,
-        ``n_routed_experts`` …).  Re-create from its dict so every subsystem
-        (attention backend selection, KV-cache configurator, MoE gate) sees the
-        SGLang class.
-        """
-        from sglang.srt.configs.kimi_linear import KimiLinearConfig
-
-        text_config = getattr(self.hf_config, "text_config", None)
-        if text_config is not None:
-            if isinstance(text_config, KimiLinearConfig):
-                return
-            if getattr(text_config, "model_type", None) != "kimi_linear":
-                return
-            config_dict = (
-                text_config.to_dict()
-                if hasattr(text_config, "to_dict")
-                else dict(text_config)
-            )
-            self.hf_config.text_config = KimiLinearConfig(**config_dict)
-            # Mirror native KimiK3Config: DSA fields must also live on the
-            # top-level config, which is what the KV-cache configurator and
-            # memory sizing read (is_deepseek_dsa on hf_config, not text_config).
-            if getattr(self.hf_config.text_config, "dsa_config", None) is not None:
-                self.hf_config.text_config.architectures = ["KimiK31LinearForCausalLM"]
-                self.hf_config.index_topk = self.hf_config.text_config.index_topk
-                self.hf_config.index_head_dim = (
-                    self.hf_config.text_config.index_head_dim
-                )
-                self.hf_config.index_n_heads = self.hf_config.text_config.index_n_heads
-                self.hf_config.index_topk_freq = (
-                    self.hf_config.text_config.index_topk_freq
-                )
-                self.hf_config.index_skip_topk_offset = (
-                    self.hf_config.text_config.index_skip_topk_offset
-                )
-            return
-
-        # Text-only Kimi K3.1 checkpoints expose KimiLinearConfig as the
-        # top-level config rather than under ``text_config``.
-        if isinstance(self.hf_config, KimiLinearConfig):
-            return
-        if getattr(self.hf_config, "model_type", None) != "kimi_linear":
-            return
-        config_dict = (
-            self.hf_config.to_dict()
-            if hasattr(self.hf_config, "to_dict")
-            else dict(self.hf_config)
-        )
-        self.hf_config = KimiLinearConfig(**config_dict)
-
     def _derive_hybrid_model(self):
         # Use self.context_len after it has been initialized to prevent using context_len which may be None.
         layer_types_only = is_layer_types_hybrid_swa_model(
@@ -1612,7 +1584,6 @@ class ModelConfig:
             "KimiLinearForCausalLM" in self.hf_config.architectures
             or "KimiK3LinearForCausalLM" in self.hf_config.architectures
             or "KimiK3ForConditionalGeneration" in self.hf_config.architectures
-            or "KimiK31LinearForCausalLM" in self.hf_config.architectures
             or "KimiK31ForConditionalGeneration" in self.hf_config.architectures
         ):
             tc = self.hf_text_config
@@ -1622,6 +1593,9 @@ class ModelConfig:
             self.qk_rope_head_dim = tc.qk_rope_head_dim
             self.v_head_dim = tc.v_head_dim
             self.qk_nope_head_dim = tc.qk_nope_head_dim
+            self.index_head_dim = (
+                get_dsa_index_head_dim(tc) if is_deepseek_dsa(tc) else None
+            )
             self._init_mla_scaling(getattr(tc, "rope_scaling", None))
         elif "BailingMoeV2_5ForCausalLM" in self.hf_config.architectures or (
             # Every Bailing draft is renamed to BailingMoeForCausalLMNextN; only
@@ -2510,6 +2484,21 @@ def is_embedding_gemma(config) -> bool:
     )
 
 
+def is_embedding_nemotron3(config) -> bool:
+    """Whether ``config`` is an NVIDIA Nemotron-3-Embed checkpoint.
+
+    Nemotron-3-Embed is serialized as the bare ``Ministral3Model`` backbone,
+    which is also used by generative checkpoints. Its bidirectional attention
+    and mean pooling fields are the defining distinction.
+    """
+    fields = config.to_dict()
+    return (
+        config.architectures == ["Ministral3Model"]
+        and fields.get("is_causal") is False
+        and fields.get("pooling") == "avg"
+    )
+
+
 def is_generation_model(model_architectures: List[str], is_embedding: bool = False):
     # We have two ways to determine whether a model is a generative model.
     # 1. Check the model architecture
@@ -2528,6 +2517,7 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
         or "Qwen3Model" in model_architectures
         or "CLIPModel" in model_architectures
         or "BertModel" in model_architectures
+        or "EmbeddingNemotron3Model" in model_architectures
         or "Contriever" in model_architectures
         or "BertForSequenceClassification" in model_architectures
         or "XLMRobertaModel" in model_architectures

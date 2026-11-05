@@ -2722,16 +2722,12 @@ class KimiK3DecoderLayer(nn.Module):
             forward_batch=forward_batch,
             zero_allocator=zero_allocator,
         )
+        if isinstance(result, tuple):
+            result = result[0]
 
         if qkv_latent_func is not None:
             get_attn_tp_context().clear_attn_inputs()
 
-        # A DSA attention's forward core returns (output, topk_indices)
-        # (deepseek_v2's forward_absorb contract); keep only the output so
-        # the stage boundary records a plain tensor. K3.1's index_topk_freq
-        # is 1, so no layer reuses another layer's indices.
-        if isinstance(result, tuple):
-            result = result[0]
         return result
 
     def forward(
@@ -2760,20 +2756,6 @@ class KimiK3DecoderLayer(nn.Module):
         return self.ffn_boundary.finish(hidden_states, forward_batch)
 
 
-def _ensure_sglang_kimi_linear_config(config) -> KimiLinearConfig:
-    """Convert a remote-code KimiLinearConfig to SGLang's version.
-
-    K3.1 ships ``configuration_kimi_k3.py`` via ``auto_map`` which defines its
-    own ``KimiLinearConfig``.  That remote class lacks attributes SGLang relies
-    on (e.g. ``n_routed_experts``).  Re-create the config from its dict form so
-    SGLang's ``KimiLinearConfig.__init__`` runs and sets every alias.
-    """
-    if isinstance(config, KimiLinearConfig):
-        return config
-    config_dict = config.to_dict() if hasattr(config, "to_dict") else dict(config)
-    return KimiLinearConfig(**config_dict)
-
-
 class KimiK3LinearModel(nn.Module):
     """K3 language-model backbone."""
 
@@ -2784,7 +2766,6 @@ class KimiK3LinearModel(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        config = _ensure_sglang_kimi_linear_config(config)
         self.config = config
         self.pp_group = get_parallel().pp_group
         self.dspark_layers_to_capture: Optional[list[int]] = None
@@ -3068,7 +3049,6 @@ class KimiK3LinearForCausalLM(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        config = _ensure_sglang_kimi_linear_config(config)
         self.config = config
         self.quant_config = quant_config
         if quant_config is not None:
@@ -3391,8 +3371,21 @@ class KimiK3LinearForCausalLM(nn.Module):
                         weight_loader(param, loaded_weight, **kwargs)
             loaded_params.add(name)
 
+        self._check_dsa_indexer_loaded(loaded_params)
         self.post_load_weights()
         return loaded_params
+
+    def _check_dsa_indexer_loaded(self, loaded_params: set[str]) -> None:
+        if self.config.dsa_config is None:
+            return
+        expected = {
+            name for name, _ in self.named_parameters() if ".self_attn.indexer." in name
+        }
+        missing = sorted(expected - loaded_params)
+        assert not missing, (
+            f"Kimi-K3.1: {len(missing)} DSA indexer params were not loaded, "
+            f"e.g. {missing[:4]}"
+        )
 
     def post_load_weights(self):
         # Also invoked by loader post-load hooks (DummyModelLoader,
@@ -3951,21 +3944,12 @@ class KimiK3ForConditionalGeneration(nn.Module):
                 pass
 
 
-class KimiK31LinearForCausalLM(KimiK3LinearForCausalLM):
-    """K3.1 text-only entry point — same architecture, DSA-enabled full-attention layers."""
-
-    pass
-
-
 class KimiK31ForConditionalGeneration(KimiK3ForConditionalGeneration):
-    """K3.1 multimodal entry point — MoonViT3d tower + DSA-enabled KimiLinear backbone."""
-
     pass
 
 
 EntryClass = [
     KimiK3ForConditionalGeneration,
-    KimiK3LinearForCausalLM,
     KimiK31ForConditionalGeneration,
-    KimiK31LinearForCausalLM,
+    KimiK3LinearForCausalLM,
 ]

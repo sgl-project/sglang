@@ -48,7 +48,7 @@ def _require_kimi_k3_aiter_gluon_dcp_support() -> None:
         )
 
 
-@_register_for("KimiK3ForConditionalGeneration", "KimiK31ForConditionalGeneration")
+@_register_for("KimiK3ForConditionalGeneration")
 def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
     if cfg.dcp_size > 1:
@@ -174,6 +174,18 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
             "backend knobs unset for the sync-free default."
         )
     return overrides
+
+
+@_register_for("KimiK31ForConditionalGeneration")
+def _kimi_k31_overrides(server_args: Any, hf_config: Any) -> dict:
+    cfg = resolving_view(server_args)
+    if cfg.dcp_size > 1:
+        raise ValueError(
+            f"Kimi-K3.1 does not support --dcp-size > 1 yet (got {cfg.dcp_size})."
+        )
+    if cfg.enable_unified_memory:
+        raise ValueError("Kimi-K3.1 does not support --enable-unified-memory yet.")
+    return {}
 
 
 @_register_for("KimiK3ForConditionalGeneration", "KimiK31ForConditionalGeneration")

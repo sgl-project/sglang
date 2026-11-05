@@ -254,8 +254,6 @@ def validate_flashinfer_megamoe_model(server_args: Any) -> None:
         "Qwen3MoeForCausalLM",
         "KimiK3ForConditionalGeneration",
         "KimiK3LinearForCausalLM",
-        "KimiK31ForConditionalGeneration",
-        "KimiK31LinearForCausalLM",
     )
     if not any(
         architecture in validated_architectures for architecture in architectures

@@ -115,12 +115,6 @@ def kimi_linear_config(model_config: ModelConfig):
     text_config = getattr(config, "text_config", None)
     if isinstance(text_config, KimiLinearConfig):
         return text_config
-    if (
-        text_config is not None
-        and getattr(text_config, "model_type", None) == "kimi_linear"
-        and hasattr(text_config, "linear_attn_config")
-    ):
-        return text_config
     return None
 
 

@@ -13,9 +13,8 @@ _RSV_ARCHITECTURES = {
 }
 _AR_ARCHITECTURES = {
     "KimiK3ForConditionalGeneration",
-    "KimiK3LinearForCausalLM",
     "KimiK31ForConditionalGeneration",
-    "KimiK31LinearForCausalLM",
+    "KimiK3LinearForCausalLM",
     "Qwen3ForCausalLM",
     "Qwen3ForSequenceClassification",
     "Qwen3Model",

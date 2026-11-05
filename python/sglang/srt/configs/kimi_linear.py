@@ -54,7 +54,6 @@ class KimiLinearConfig(PretrainedConfig):
         mla_use_nope: bool | None = False,
         num_nextn_predict_layers: int = 0,
         linear_attn_config: dict | None = None,
-        dsa_config: dict | None = None,
         attn_res_block_size: int | None = None,
         routed_expert_hidden_size: int | None = None,
         latent_moe_use_norm: bool = False,
@@ -62,6 +61,7 @@ class KimiLinearConfig(PretrainedConfig):
         activation_situ_linear_beta: float | None = None,
         mla_use_output_gate: bool = False,
         max_position_embeddings: int = 4096,
+        dsa_config: dict | None = None,
         **kwargs,
     ):
         self.model_type = model_type
@@ -124,15 +124,7 @@ class KimiLinearConfig(PretrainedConfig):
 
         self.dsa_config = dsa_config
         if dsa_config is not None:
-            self.index_topk = dsa_config.get("index_topk")
-            self.index_head_dim = dsa_config.get("index_head_dim")
-            self.index_n_heads = dsa_config.get("index_num_heads")
-            self.index_rope_dim = dsa_config.get("index_rope_dim", 0)
-            self.index_k_norm_type = dsa_config.get("index_k_norm_type")
-            self.indexer_use_fp8 = dsa_config.get("indexer_use_fp8", False)
-            self.index_topk_freq = dsa_config.get("index_topk_freq", 1)
-            self.index_skip_topk_offset = dsa_config.get("index_skip_topk_offset")
-            self.dsa_layers = dsa_config.get("dsa_layers", [])
+            self._init_dsa(dsa_config)
 
         super().__init__(
             pad_token_id=pad_token_id,
@@ -141,6 +133,44 @@ class KimiLinearConfig(PretrainedConfig):
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
+
+    def _init_dsa(self, dsa_config: dict) -> None:
+        index_topk_freq = dsa_config.get("index_topk_freq", 1)
+        if index_topk_freq != 1:
+            raise ValueError(
+                "Kimi-K3.1 DSA only supports index_topk_freq == 1 (every DSA "
+                f"layer runs its own indexer), got {index_topk_freq}."
+            )
+        index_rope_dim = dsa_config.get("index_rope_dim", 0)
+        if index_rope_dim != 0:
+            raise ValueError(
+                "Kimi-K3.1 DSA only supports index_rope_dim == 0 (NoPE "
+                f"indexer), got {index_rope_dim}."
+            )
+        index_k_norm_type = dsa_config.get("index_k_norm_type", "layernorm")
+        if index_k_norm_type != "layernorm":
+            raise ValueError(
+                "Kimi-K3.1 DSA only supports index_k_norm_type == 'layernorm', "
+                f"got {index_k_norm_type!r}."
+            )
+        dsa_layers = dsa_config.get("dsa_layers")
+        full_attn_layers = (self.linear_attn_config or {}).get("full_attn_layers")
+        if dsa_layers is None or sorted(dsa_layers) != sorted(full_attn_layers or []):
+            raise ValueError(
+                "Kimi-K3.1 DSA requires dsa_layers == full_attn_layers, got "
+                f"dsa_layers={dsa_layers}, full_attn_layers={full_attn_layers}."
+            )
+        self.index_topk = dsa_config["index_topk"]
+        self.index_n_heads = dsa_config["index_num_heads"]
+        self.index_head_dim = dsa_config["index_head_dim"]
+        self.index_topk_freq = index_topk_freq
+        self.index_skip_topk_offset = dsa_config.get("index_skip_topk_offset")
+        self.index_rope_dim = index_rope_dim
+        self.index_k_norm_type = index_k_norm_type
+        self.index_k_norm_eps = self.rms_norm_eps
+        self.index_k_norm_fp32 = True
+        self.index_apply_hadamard = False
+        self.index_bf16_head_gate = True
 
     @property
     def is_mla(self):
