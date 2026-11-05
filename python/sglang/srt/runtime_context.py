@@ -644,6 +644,9 @@ class Resources(_FlagGroupBase):
     expert_location_metadata: Any = None
     # Model expert counts published by ModelRunner before EvenMoE construction.
     mlb_model_info: dict[str, int | None] | None = None
+    # The target's EvenMoE MoELoadBalancer, published by ModelRunner before it
+    # builds the model so every target (Hash)TopK binds it at construction.
+    moe_load_balancer: Any = None
     # Coupled EvenMoE placement: EPLBManager.refresh_layer, run by the routing glue
     # ahead of each layer's dispatch. None unless placement refreshes per layer.
     mlb_placement_refresh: Any = None

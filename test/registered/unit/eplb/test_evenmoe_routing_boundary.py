@@ -57,11 +57,13 @@ class TestRoutingBoundary(CustomTestCase):
         shared = SharedExpertsConfig(
             num_fused_shared_experts=1, routed_by_load_balancer=True
         )
+        mlb = object()
         for router_type in (TopK, HashTopK):
             with (
                 self.subTest(router=router_type.__name__),
                 get_context().override_server_args(),
                 get_parallel().override(tp_group=SimpleNamespace(world_size=1)),
+                get_context().resources.override(moe_load_balancer=mlb),
                 patch(
                     "sglang.srt.eplb.moe_load_balancer_glue.get_configured_moe_load_balancer_pipeline",
                     return_value=pipeline,
@@ -85,9 +87,9 @@ class TestRoutingBoundary(CustomTestCase):
                         draft = make_router()
                 self.assertFalse(draft_config.routed_by_load_balancer)
                 self.assertEqual(draft_config.num_shared_topk_slots, 1)
-                self.assertFalse(draft.mlb_requires_post_topk_routing)
+                self.assertIs(target.moe_load_balancer, mlb)
+                self.assertIsNone(draft.moe_load_balancer)
 
-                target.moe_load_balancer = object()
                 result = StandardTopKOutput(
                     torch.empty((0, 3)), torch.empty((0, 3), dtype=torch.int32), None
                 )
@@ -104,6 +106,23 @@ class TestRoutingBoundary(CustomTestCase):
                 self.assertEqual(
                     route.call_args.kwargs["topk_output"].topk_ids.shape, (0, 2)
                 )
+
+    def test_routing_router_requires_published_balancer(self):
+        pipeline = SimpleNamespace(
+            capabilities=SimpleNamespace(requires_post_topk_routing=True)
+        )
+        with (
+            get_context().override_server_args(moe_load_balancer_algorithm="lplb"),
+            patch(
+                "sglang.srt.eplb.moe_load_balancer_glue.get_moe_load_balancer_pipeline",
+                return_value=pipeline,
+            ),
+        ):
+            with (
+                get_context().resources.override(moe_load_balancer=None),
+                self.assertRaisesRegex(RuntimeError, "no MoELoadBalancer"),
+            ):
+                TopK(top_k=2, layer_id=0)
 
     @unittest.skipUnless(
         importlib.util.find_spec("evenmoe"), "evenmoe is not installed"
@@ -376,6 +395,8 @@ class TestLoadBalancerBeforeSharedLayout(CustomTestCase):
         pipeline = SimpleNamespace(
             capabilities=SimpleNamespace(requires_post_topk_routing=True)
         )
+        mlb = Mock()
+        mlb.transform_topk_inputs.side_effect = lambda logits, bias: (logits, bias)
         for router_type in (TopK, HashTopK):
             with (
                 self.subTest(router=router_type.__name__),
@@ -383,6 +404,7 @@ class TestLoadBalancerBeforeSharedLayout(CustomTestCase):
                 get_model().override(
                     shared_experts=SharedExpertsConfig(num_fused_shared_experts=1)
                 ),
+                get_context().resources.override(moe_load_balancer=mlb),
                 patch(
                     "sglang.srt.eplb.moe_load_balancer_glue.get_configured_moe_load_balancer_pipeline",
                     return_value=pipeline,
@@ -398,10 +420,6 @@ class TestLoadBalancerBeforeSharedLayout(CustomTestCase):
                         layer_id=7,
                         routed_scaling_factor=2.5,
                     )
-                )
-                router.moe_load_balancer = Mock()
-                router.moe_load_balancer.transform_topk_inputs.side_effect = (
-                    lambda logits, bias: (logits, bias)
                 )
 
                 def route(**kwargs):
@@ -493,6 +511,7 @@ class TestLoadBalancerBeforeSharedLayout(CustomTestCase):
                     get_model().override(
                         shared_experts=SharedExpertsConfig(num_fused_shared_experts=1)
                     ),
+                    get_context().resources.override(moe_load_balancer=object()),
                     patch(
                         "sglang.srt.eplb.moe_load_balancer_glue.get_configured_moe_load_balancer_pipeline",
                         return_value=pipeline,
@@ -503,7 +522,6 @@ class TestLoadBalancerBeforeSharedLayout(CustomTestCase):
                         if router_type is TopK
                         else HashTopK(topk=2, num_experts=4, vocab_size=4, layer_id=7)
                     )
-                    router.moe_load_balancer = object()
                     with patch(
                         "sglang.srt.eplb.moe_load_balancer_glue.route_topk_with_mlb",
                         side_effect=lambda **kwargs: kwargs["topk_output"],

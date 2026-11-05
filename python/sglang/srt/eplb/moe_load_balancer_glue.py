@@ -112,6 +112,26 @@ def get_configured_moe_load_balancer_pipeline():
     return get_moe_load_balancer_pipeline(get_exec().moe.moe_load_balancer_algorithm)
 
 
+def resolve_moe_load_balancer():
+    """The MoELoadBalancer a target (Hash)TopK under construction routes through.
+
+    None unless the pipeline routes after TopK. ModelRunner publishes the
+    target's balancer before it builds the model, so it is bound once here
+    instead of being attached to every router after loading.
+    """
+    pipeline = get_configured_moe_load_balancer_pipeline()
+    if pipeline is None or not pipeline.capabilities.requires_post_topk_routing:
+        return None
+    moe_load_balancer = get_context().resources.moe_load_balancer
+    if moe_load_balancer is None:
+        raise RuntimeError(
+            "--moe-load-balancer-algorithm routes after TopK, but no "
+            "MoELoadBalancer is published; ModelRunner must create it before "
+            "building the model."
+        )
+    return moe_load_balancer
+
+
 def get_moe_load_balancer_pipeline(algorithm):
     """Parse ``--moe-load-balancer-algorithm`` into an EvenMoE RoutingPipeline."""
     if algorithm is None:

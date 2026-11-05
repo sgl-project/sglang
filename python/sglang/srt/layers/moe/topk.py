@@ -783,20 +783,11 @@ class TopK(BaseFusedOp):
             get_flags().moe.in_speculative_scope if is_draft is None else is_draft
         )
         # The MoE load balancer (see sglang.srt.eplb.moe_load_balancer_glue)
-        # routes after TopK when its pipeline asks for it; ModelRunner attaches
-        # the shared MoELoadBalancer to every target TopK before the first
-        # forward. Draft layers keep the native path.
-        from sglang.srt.eplb.moe_load_balancer_glue import (
-            get_configured_moe_load_balancer_pipeline,
-        )
+        # routes after TopK when its pipeline asks for it; None otherwise.
+        # Draft layers keep the native path.
+        from sglang.srt.eplb.moe_load_balancer_glue import resolve_moe_load_balancer
 
-        pipeline = get_configured_moe_load_balancer_pipeline()
-        self.mlb_requires_post_topk_routing = (
-            pipeline is not None
-            and pipeline.capabilities.requires_post_topk_routing
-            and not self.is_draft
-        )
-        self.moe_load_balancer = None
+        self.moe_load_balancer = None if self.is_draft else resolve_moe_load_balancer()
         self._runner_backend_bound = False
 
         shared_experts = get_model().shared_experts
@@ -821,7 +812,7 @@ class TopK(BaseFusedOp):
             # The MoE load balancer expands a standard top-k output.
             output_format=(
                 TopKOutputFormat.STANDARD
-                if self.mlb_requires_post_topk_routing
+                if self.moe_load_balancer is not None
                 else output_format
             ),
             scoring_func=scoring_func,
@@ -837,11 +828,6 @@ class TopK(BaseFusedOp):
     def _resolve_routing_inputs(
         self, num_token_non_padded, expert_location_dispatch_info
     ):
-        if self.mlb_requires_post_topk_routing and self.moe_load_balancer is None:
-            raise RuntimeError(
-                "MoE load balancer routing is enabled but ModelRunner did not "
-                "attach MoELoadBalancer to this TopK."
-            )
         return resolve_routing_inputs(
             layer_id=self.layer_id,
             is_draft=self.is_draft,
@@ -897,11 +883,6 @@ class TopK(BaseFusedOp):
         num_token_non_padded: Optional[torch.Tensor] = None,
     ) -> TopKOutput:
         if self.moe_load_balancer is None:
-            if self.mlb_requires_post_topk_routing:
-                raise RuntimeError(
-                    "MoE load balancer routing is enabled but ModelRunner did not "
-                    "attach MoELoadBalancer to this TopK."
-                )
             return topk_output
         if not TopKOutputChecker.format_is_standard(topk_output):
             raise RuntimeError("MoE load balancer routing requires StandardTopKOutput.")

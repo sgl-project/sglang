@@ -34,7 +34,7 @@ def mega_gate_supported(moe) -> bool:
     if (
         _device_sm // 10 != 10
         or moe.config.model_type != "deepseek_v41"
-        or moe.topk.mlb_requires_post_topk_routing
+        or moe.topk.moe_load_balancer is not None
         or moe.num_fused_shared_experts
         or get_exec().deterministic.enable_deterministic_inference
     ):

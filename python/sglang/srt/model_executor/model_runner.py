@@ -69,7 +69,6 @@ from sglang.srt.eplb.expert_distribution import (
 )
 from sglang.srt.eplb.expert_location import (
     ExpertLocationMetadata,
-    ModelConfigForExpertLocation,
     append_trivial_expert_slots,
     broadcast_global_expert_location_metadata,
     compute_initial_expert_location_metadata,
@@ -94,9 +93,7 @@ from sglang.srt.layers.cp.utils import (
 )
 from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.moe.hash_topk import HashTopK
 from sglang.srt.layers.moe.mega_moe import allocate_mega_moe_buffers
-from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.lora.lora_manager import LoRAManager, init_lora_cuda_graph_moe_buffers
 from sglang.srt.lora.lora_registry import LoRARef
@@ -176,6 +173,8 @@ from sglang.srt.model_executor.model_runner_components.load_model_utils import (
 )
 from sglang.srt.model_executor.model_runner_components.moe_ep_setup import (
     check_quantized_moe_compatibility,
+    commit_initial_moe_placement,
+    create_moe_load_balancer,
     prebuild_deepep_v2_buffer,
 )
 from sglang.srt.model_executor.model_runner_components.ngram_embedding_manager import (
@@ -744,7 +743,7 @@ class ModelRunner:
     def initialize(self):
         self.init_memory_saver_adapter()
         self.maybe_init_remote_instance_transfer_engine()
-        self.moe_load_balancer = self._create_moe_load_balancer()
+        self.maybe_init_moe_load_balancer()
         self.maybe_init_expert_location_metadata()
         self.maybe_init_eplb_manager()
         self.expert_location_updater = ExpertLocationUpdater()
@@ -756,7 +755,7 @@ class ModelRunner:
             check_layer_types_hybrid_swa_split(
                 model=self.model, model_config=self.model_config
             )
-        self._prepare_moe_topk()
+        self.maybe_commit_initial_moe_placement()
 
         self.maybe_init_dwdp()
 
@@ -794,50 +793,20 @@ class ModelRunner:
         if remote_instance_transfer_engine_enabled(load_format=self.draft_load_format):
             self.remote_instance_weight_transporter.init_engine()
 
-    def _create_moe_load_balancer(self):
-        if self.is_draft_worker:
-            return None
-        server_args = get_exec().moe
-        if server_args.moe_load_balancer_algorithm is None:
-            return None
+    def maybe_init_moe_load_balancer(self):
+        """Create the target's EvenMoE balancer before the model is built."""
+        self.moe_load_balancer = (
+            None
+            if self.is_draft_worker
+            else create_moe_load_balancer(model_config=self.model_config)
+        )
 
-        model_info = ModelConfigForExpertLocation.from_model_config(self.model_config)
-        if model_info is None:
-            raise ValueError(
-                "--moe-load-balancer-algorithm requires a model with routed "
-                f"experts; {self.model_config.hf_config.architectures} has none."
+    def maybe_commit_initial_moe_placement(self):
+        """Hand the loaded placement to the balancer before the first forward."""
+        if self.moe_load_balancer is not None:
+            commit_initial_moe_placement(
+                model=self.model, moe_load_balancer=self.moe_load_balancer
             )
-
-        from evenmoe import MoELoadBalancer
-        from evenmoe.adapters.sglang import to_load_balancer_kwargs
-
-        context = get_context()
-        context.resources.mlb_model_info = {
-            "num_logical_experts": model_info.num_logical_experts,
-            "num_groups": model_info.num_groups,
-        }
-        kwargs = to_load_balancer_kwargs(context)
-        return MoELoadBalancer.from_algorithm(**kwargs)
-
-    def _prepare_moe_topk(self):
-        if (
-            self.moe_load_balancer is None
-            or not self.moe_load_balancer.routing_capabilities.requires_post_topk_routing
-        ):
-            return
-        layer_ids = []
-        for module in self.model.modules():
-            if not isinstance(module, (TopK, HashTopK)):
-                continue
-            if module.layer_id is None:
-                raise RuntimeError(
-                    "EvenMoE routing requires every MoE TopK to have layer_id."
-                )
-            module.moe_load_balancer = self.moe_load_balancer
-            layer_ids.append(module.layer_id)
-        from evenmoe.adapters.sglang import commit_placement
-
-        commit_placement(self.moe_load_balancer, get_context(), layer_ids)
 
     def maybe_init_expert_location_metadata(self):
         if self.is_draft_worker:

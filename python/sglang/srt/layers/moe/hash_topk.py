@@ -54,17 +54,9 @@ class HashTopK(nn.Module):
             get_flags().moe.in_speculative_scope if is_draft is None else is_draft
         )
         # See TopK: the MoE load balancer routes after TopK on target layers.
-        from sglang.srt.eplb.moe_load_balancer_glue import (
-            get_configured_moe_load_balancer_pipeline,
-        )
+        from sglang.srt.eplb.moe_load_balancer_glue import resolve_moe_load_balancer
 
-        pipeline = get_configured_moe_load_balancer_pipeline()
-        self.mlb_requires_post_topk_routing = (
-            pipeline is not None
-            and pipeline.capabilities.requires_post_topk_routing
-            and not self.is_draft
-        )
-        self.moe_load_balancer = None
+        self.moe_load_balancer = None if self.is_draft else resolve_moe_load_balancer()
 
         self.shared_experts = get_model().shared_experts
         self.num_experts = num_experts
@@ -142,11 +134,6 @@ class HashTopK(nn.Module):
         num_token_non_padded: Optional[torch.Tensor] = None,
     ) -> StandardTopKOutput:
         if self.moe_load_balancer is None:
-            if self.mlb_requires_post_topk_routing:
-                raise RuntimeError(
-                    "MoE load balancer routing is enabled but ModelRunner did not "
-                    "attach MoELoadBalancer to this HashTopK."
-                )
             return topk_output
 
         topk_ids, topk_weights, _ = _post_process_topk_ids(

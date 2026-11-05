@@ -909,7 +909,7 @@ class KimiK3MoE(nn.Module):
             return False
         if (cfg.num_expert_group or 1) > 1 or (cfg.topk_group or 1) > 1:
             return False
-        if self.topk.mlb_requires_post_topk_routing:
+        if self.topk.moe_load_balancer is not None:
             return False
         if self.gate.e_score_correction_bias is None:
             return False

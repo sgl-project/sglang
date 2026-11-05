@@ -28,7 +28,9 @@ class TestEvenMoERuntimeContext(unittest.TestCase):
         from evenmoe import MoELoadBalancer
         from evenmoe.adapters.sglang import to_load_balancer_kwargs
 
-        from sglang.srt.model_executor.model_runner import ModelRunner
+        from sglang.srt.model_executor.model_runner_components.moe_ep_setup import (
+            create_moe_load_balancer,
+        )
 
         context = get_context()
         model_config = object()
@@ -40,7 +42,7 @@ class TestEvenMoERuntimeContext(unittest.TestCase):
                 ep_num_redundant_experts=2,
             ),
             context.parallel.override(moe_ep_rank=1),
-            context.resources.override(mlb_model_info=None),
+            context.resources.override(mlb_model_info=None, moe_load_balancer=None),
             patch.object(
                 ModelConfigForExpertLocation,
                 "from_model_config",
@@ -55,9 +57,8 @@ class TestEvenMoERuntimeContext(unittest.TestCase):
             ),
         ):
             self.assertIsNone(context.resources.expert_location_metadata)
-            mlb = ModelRunner._create_moe_load_balancer(
-                SimpleNamespace(is_draft_worker=False, model_config=model_config)
-            )
+            mlb = create_moe_load_balancer(model_config=model_config)
+            self.assertIs(context.resources.moe_load_balancer, mlb)
             self.assertEqual(
                 context.resources.mlb_model_info,
                 {"num_logical_experts": 2, "num_groups": 1},
@@ -112,8 +113,10 @@ class TestEvenMoERuntimeContext(unittest.TestCase):
                     self.assertEqual(actual[field], expected[field])
                 self.assertIsNone(actual["num_groups"])
 
-    def test_model_runner_rejects_models_without_routed_experts(self):
-        from sglang.srt.model_executor.model_runner import ModelRunner
+    def test_rejects_models_without_routed_experts(self):
+        from sglang.srt.model_executor.model_runner_components.moe_ep_setup import (
+            create_moe_load_balancer,
+        )
 
         model_config = SimpleNamespace(
             hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"])
@@ -123,25 +126,27 @@ class TestEvenMoERuntimeContext(unittest.TestCase):
                 ModelConfigForExpertLocation, "from_model_config", return_value=None
             ),
             patch(
-                "sglang.srt.model_executor.model_runner.get_exec",
+                "sglang.srt.model_executor.model_runner_components.moe_ep_setup.get_exec",
                 return_value=SimpleNamespace(
                     moe=SimpleNamespace(moe_load_balancer_algorithm="static")
                 ),
             ),
             self.assertRaisesRegex(ValueError, "routed experts"),
         ):
-            ModelRunner._create_moe_load_balancer(
-                SimpleNamespace(is_draft_worker=False, model_config=model_config)
-            )
+            create_moe_load_balancer(model_config=model_config)
 
     @unittest.skipUnless(
         importlib.util.find_spec("evenmoe"),
         "evenmoe is not installed",
     )
-    def test_model_runner_creates_core_through_context_adapter(self):
-        from sglang.srt.model_executor.model_runner import ModelRunner
+    def test_creates_core_through_context_adapter_and_publishes_it(self):
+        from sglang.srt.model_executor.model_runner_components.moe_ep_setup import (
+            create_moe_load_balancer,
+        )
 
-        context = SimpleNamespace(resources=SimpleNamespace(mlb_model_info=None))
+        context = SimpleNamespace(
+            resources=SimpleNamespace(mlb_model_info=None, moe_load_balancer=None)
+        )
         model_config, mlb = object(), object()
         kwargs = dict(algorithm="static", ep_size=2, source_rank=1, experts_per_rank=2)
         with (
@@ -151,11 +156,11 @@ class TestEvenMoERuntimeContext(unittest.TestCase):
                 return_value=ModelConfigForExpertLocation(1, 2, 1),
             ) as extract,
             patch(
-                "sglang.srt.model_executor.model_runner.get_context",
+                "sglang.srt.model_executor.model_runner_components.moe_ep_setup.get_context",
                 return_value=context,
             ),
             patch(
-                "sglang.srt.model_executor.model_runner.get_exec",
+                "sglang.srt.model_executor.model_runner_components.moe_ep_setup.get_exec",
                 return_value=SimpleNamespace(
                     moe=SimpleNamespace(moe_load_balancer_algorithm="static")
                 ),
@@ -169,10 +174,9 @@ class TestEvenMoERuntimeContext(unittest.TestCase):
                 return_value=mlb,
             ) as create,
         ):
-            result = ModelRunner._create_moe_load_balancer(
-                SimpleNamespace(is_draft_worker=False, model_config=model_config)
-            )
+            result = create_moe_load_balancer(model_config=model_config)
         self.assertIs(result, mlb)
+        self.assertIs(context.resources.moe_load_balancer, mlb)
         extract.assert_called_once_with(model_config)
         adapt.assert_called_once_with(context)
         create.assert_called_once_with(**kwargs)
@@ -239,29 +243,42 @@ class TestEvenMoERuntimeContext(unittest.TestCase):
         importlib.util.find_spec("evenmoe"),
         "evenmoe is not installed",
     )
-    def test_topk_modules_share_the_load_balancer_and_commit_their_layers(self):
+    def test_initial_commit_covers_only_routing_layers(self):
         from sglang.srt.layers.moe.hash_topk import HashTopK
         from sglang.srt.layers.moe.topk import TopK
-        from sglang.srt.model_executor.model_runner import ModelRunner
-
-        topk = Mock(spec=TopK, layer_id=2)
-        hash_topk = Mock(spec=HashTopK, layer_id=3)
-        mlb = Mock()
-        runner = SimpleNamespace(
-            moe_load_balancer=mlb,
-            model=SimpleNamespace(modules=lambda: [object(), topk, hash_topk]),
+        from sglang.srt.model_executor.model_runner_components.moe_ep_setup import (
+            commit_initial_moe_placement,
         )
+
+        mlb = Mock()
+        routers = [
+            Mock(spec=TopK, layer_id=2, moe_load_balancer=mlb),
+            Mock(spec=HashTopK, layer_id=3, moe_load_balancer=mlb),
+            Mock(spec=TopK, layer_id=4, moe_load_balancer=None),
+        ]
+        model = SimpleNamespace(modules=lambda: [object(), *routers])
         context = object()
         with (
             patch(
-                "sglang.srt.model_executor.model_runner.get_context",
+                "sglang.srt.model_executor.model_runner_components.moe_ep_setup.get_context",
                 return_value=context,
             ),
             patch("evenmoe.adapters.sglang.commit_placement") as commit,
         ):
-            ModelRunner._prepare_moe_topk(runner)
-        self.assertIs(topk.moe_load_balancer, mlb)
-        self.assertIs(hash_topk.moe_load_balancer, mlb)
+            commit_initial_moe_placement(model=model, moe_load_balancer=mlb)
+            commit_initial_moe_placement(
+                model=SimpleNamespace(modules=lambda: routers[2:]),
+                moe_load_balancer=mlb,
+            )
+            with self.assertRaisesRegex(RuntimeError, "layer_id"):
+                commit_initial_moe_placement(
+                    model=SimpleNamespace(
+                        modules=lambda: [
+                            Mock(spec=HashTopK, layer_id=None, moe_load_balancer=mlb)
+                        ]
+                    ),
+                    moe_load_balancer=mlb,
+                )
         commit.assert_called_once_with(mlb, context, [2, 3])
 
     @unittest.skipUnless(
