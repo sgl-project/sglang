@@ -31,15 +31,16 @@ DEEPSEEK_V4_FLASH_W8A8_8P_ENVS = {
     "DEEPEP_HCCL_BUFFSIZE": "2500",
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "96",
     "DEEPEP_HYBRID_DEPLOYMENT": "1",
-    "SGLANG_RAGGED_VERIFY_MODE": "static",
-    "SGLANG_DSPARK_FAST_KERNEL": "0",
+    # "SGLANG_RAGGED_VERIFY_MODE": "static",
+    # "SGLANG_DSPARK_FAST_KERNEL": "0",
     # war barrier
     "SGLANG_ENABLE_WAR_BARRIER": "1",
     "SGLANG_FORCE_COARSE_WAR_BARRIER": "1",
     # skip gpu branch
     "SGLANG_OPT_FP8_WO_A_GEMM": "0",
     "SGLANG_OPT_USE_OVERLAP_STORE_CACHE": "False",
-    "FORCE_DRAFT_MODEL_NON_QUANT": "1",
+    # Speculative decoding disabled for the overlap-schedule variant.
+    # "FORCE_DRAFT_MODEL_NON_QUANT": "1",
     "SGLANG_DSV4_FP4_EXPERTS": "False",
     "SGLANG_OPT_FUSE_WQA_WKV": "0",
     "SGLANG_OPT_BF16_FP32_GEMM_ALGO": "torch",
