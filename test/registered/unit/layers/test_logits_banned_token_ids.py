@@ -95,5 +95,39 @@ class TestGetLogitsMasksBannedTokens(CustomTestCase):
         self.assertTrue((logits[:, [0, 2, 3, 5]] == 0).all())
 
 
+class TestModelRunnerSetsBannedTokenIds(CustomTestCase):
+    """A target model without a LogitsProcessor on the last pipeline stage
+    refuses to start instead of ignoring the flag."""
+
+    def _set_banned_token_ids(self, model, is_last_rank):
+        from sglang.srt.model_executor.model_runner import ModelRunner
+
+        runner = ModelRunner.__new__(ModelRunner)
+        runner.model = model
+        runner.is_draft_worker = False
+        runner.device = "cpu"
+        runner.pp_group = SimpleNamespace(is_last_rank=is_last_rank)
+        exec_config = SimpleNamespace(
+            features=SimpleNamespace(sampling_banned_token_ids=[1])
+        )
+        with patch(
+            "sglang.srt.model_executor.model_runner.get_exec",
+            return_value=exec_config,
+        ):
+            runner.maybe_set_banned_token_ids()
+
+    def test_logits_processor_is_masked(self):
+        model = torch.nn.Sequential(_processor(vocab_size=4))
+        self._set_banned_token_ids(model=model, is_last_rank=True)
+        self.assertEqual(model[0].banned_token_cols.tolist(), [1])
+
+    def test_model_without_logits_processor_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "no LogitsProcessor"):
+            self._set_banned_token_ids(model=torch.nn.Linear(2, 2), is_last_rank=True)
+
+    def test_earlier_pipeline_stage_without_logits_processor_starts(self):
+        self._set_banned_token_ids(model=torch.nn.Linear(2, 2), is_last_rank=False)
+
+
 if __name__ == "__main__":
     unittest.main()

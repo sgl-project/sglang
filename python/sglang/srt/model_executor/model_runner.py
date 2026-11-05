@@ -877,9 +877,17 @@ class ModelRunner:
         # masks the draft after setting up the head.
         if not token_ids or self.is_draft_worker:
             return
+        num_masked = 0
         for module in self.model.modules():
             if isinstance(module, LogitsProcessor):
                 module.set_banned_token_ids(token_ids=token_ids, device=self.device)
+                num_masked += 1
+        # Some models build their LogitsProcessor on the last pipeline stage only.
+        if num_masked == 0 and self.pp_group.is_last_rank:
+            raise ValueError(
+                "--sampling-banned-token-ids is not supported for "
+                f"{type(self.model).__name__}: it has no LogitsProcessor to mask."
+            )
 
     def maybe_init_lora_manager(self):
         if self.spec_algorithm.is_uno():
