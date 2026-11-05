@@ -1,4 +1,17 @@
-"""Native BF16 Qwen4 same-slot A/B/A replacement and optional GPU fault injection."""
+"""Native BF16 Qwen4 same-slot A/B/A replacement and optional GPU fault injection.
+
+From the repository root, create the bounded random checkpoint on CPU:
+    PYTHONPATH=python python test/manual/models/create_tiny_qwen4_fixture.py \
+        --out scratch/tiny-qwen4
+
+With four visible CUDA GPUs, run the actual replacement and rollback checks:
+    PYTHONPATH=python python test/manual/models/test_qwen_moe_hot_swap.py \
+        --model-path scratch/tiny-qwen4 --work-dir scratch/hot-swap-tp4 \
+        --tp-size 4 --decode-graph --fault-prepare --fault-write
+
+The fixture needs a Qwen4-capable Transformers installation and downloads no
+weights or tokenizer assets. It is smaller than 128 MiB and has no quality value.
+"""
 
 import argparse
 import hashlib
