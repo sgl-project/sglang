@@ -188,7 +188,10 @@ def _megakernel(**entries):
             cuda_graph_runner=None,
             draft_runner=SimpleNamespace(
                 model=_model(**entries),
-                model_config=SimpleNamespace(hidden_size=4, dtype=torch.float32),
+                model_config=SimpleNamespace(
+                    hidden_size=4, spec_hidden_size=4, dtype=torch.float32
+                ),
+                spec_algorithm=SimpleNamespace(is_standalone=lambda: False),
             ),
         ),
     )
@@ -1168,6 +1171,95 @@ class TestSpecRelayBypass(CustomTestCase):
 
         future_map._stash.assert_called_once_with(indices, payload)
         self.assertIsNone(future_map._deferred_relay)
+
+
+class TestDraftOutputWidth(CustomTestCase):
+    def test_recurrent_output_uses_the_declared_hidden_stream(self):
+        supplied = {}
+
+        def extend(**buffers):
+            supplied.update(buffers)
+            return lambda bs: (lambda io: None) if bs == 1 else None
+
+        mk = _megakernel(draft_extend=extend)
+        mk._draft_config.spec_hidden_size = 16
+        runner = SimpleNamespace(
+            max_bs=1, device="cpu", captured_req_width=4, capture_bs=(1,)
+        )
+        with patch.object(eagle_megakernel, "megakernel_agree"):
+            self.assertEqual(mk.bind_extend_graphs(runner), {1})
+        self.assertEqual(supplied["hidden"].shape, (1, 16))
+        self.assertEqual(supplied["hidden"].dtype, torch.float32)
+
+    def test_no_recurrent_hidden_stream_keeps_stock(self):
+        factory = MagicMock()
+        mk = _megakernel(draft_extend=factory)
+        mk._draft_runner.spec_algorithm = SimpleNamespace(is_standalone=lambda: True)
+        self.assertEqual(mk.bind_extend_graphs(SimpleNamespace()), frozenset())
+        factory.assert_not_called()
+
+    def _check_author_alias(self, cases):
+        for declared_width, buffer_dtype, reuse in cases:
+            with self.subTest(width=declared_width, dtype=buffer_dtype):
+                supplied = {}
+
+                def extend(**buffers):
+                    supplied.update(buffers)
+                    return lambda bs: (lambda io: None) if bs == 1 else None
+
+                mk = _megakernel(draft_extend=extend)
+                mk._draft_config.spec_hidden_size = declared_width
+                buffers = SimpleNamespace(
+                    topk_index=torch.zeros((2, 1), dtype=torch.int64),
+                    topk_p=torch.ones((2, 1), dtype=torch.float32),
+                    hidden_states=torch.zeros((2, 4), dtype=buffer_dtype),
+                )
+                mk._draft_worker.cuda_graph_runner = SimpleNamespace(buffers=buffers)
+                runner = SimpleNamespace(
+                    max_bs=1, device="cpu", captured_req_width=4, capture_bs=(1,)
+                )
+                with (
+                    patch.object(
+                        overlap_utils, "spec_relay_bypass_enabled", return_value=True
+                    ),
+                    patch.object(
+                        eagle_megakernel,
+                        "get_parallel",
+                        return_value=SimpleNamespace(moe_ep_size=1),
+                    ),
+                    patch.object(eagle_megakernel, "megakernel_agree"),
+                ):
+                    self.assertEqual(mk.bind_extend_graphs(runner), {1})
+                self.assertEqual(supplied["hidden"].shape, (1, declared_width))
+                self.assertEqual(supplied["hidden"].dtype, torch.float32)
+                for name, original in (
+                    ("topk_index", buffers.topk_index),
+                    ("topk_p", buffers.topk_p),
+                    ("hidden", buffers.hidden_states),
+                ):
+                    self.assertEqual(
+                        supplied[name].data_ptr() == original.data_ptr(), reuse
+                    )
+                self.assertIs(
+                    mk._extend_graphs[id(runner)].out.hidden, supplied["hidden"]
+                )
+
+    def test_compatible_author_alias_preserves_buffer_identity(self):
+        self._check_author_alias(((4, torch.float32, True),))
+
+    def test_incompatible_author_alias_uses_owned_stream_buffers(self):
+        self._check_author_alias(
+            ((16, torch.float32, False), (4, torch.float64, False))
+        )
+
+    def test_missing_hidden_stream_returns_stock_before_alias_access(self):
+        factory = MagicMock()
+        mk = _megakernel(draft_extend=factory)
+        mk._draft_runner.spec_algorithm = SimpleNamespace(is_standalone=lambda: True)
+        with patch.object(mk, "_draft_inputs_as_extend_outputs") as alias:
+            self.assertEqual(mk.bind_extend_graphs(SimpleNamespace()), frozenset())
+        alias.assert_not_called()
+        factory.assert_not_called()
 
 
 if __name__ == "__main__":
