@@ -74,13 +74,20 @@ class EngineBase(ABC):
         pass
 
     @abstractmethod
-    def release_memory_occupation(self):
-        """Release GPU memory occupation temporarily."""
+    def release_memory_occupation(self, tags: Optional[List[str]] = None):
+        """Release GPU memory occupation temporarily.
+
+        ``tags`` selects what to release (e.g. ``["kv_cache"]``, ``["weights"]``);
+        ``None`` releases everything.
+        """
         pass
 
     @abstractmethod
-    def resume_memory_occupation(self):
-        """Resume GPU memory occupation which is previously released."""
+    def resume_memory_occupation(self, tags: Optional[List[str]] = None):
+        """Resume GPU memory occupation which is previously released.
+
+        ``tags`` selects what to resume; ``None`` resumes everything.
+        """
         pass
 
     @abstractmethod
