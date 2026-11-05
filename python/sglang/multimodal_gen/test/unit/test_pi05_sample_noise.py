@@ -11,7 +11,9 @@ from sglang.test.test_utils import CustomTestCase
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
 class TestPi05SampleNoise(CustomTestCase):
     def test_request_generators(self):
-        from sglang.multimodal_gen.runtime.models.vlas.pi05_policy import Pi05PolicyModel
+        from sglang.multimodal_gen.runtime.models.vlas.pi05_policy import (
+            Pi05PolicyModel,
+        )
 
         # sample_noise only uses config and device; no checkpoint is needed.
         policy = Pi05PolicyModel.__new__(Pi05PolicyModel)
