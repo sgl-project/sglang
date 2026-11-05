@@ -613,6 +613,8 @@ register_kernel(
         capabilities=_SM90,
     )
 )
+# Needs gfx950 FP4 dot_scaled and AITER; capabilities cannot bound a HIP arch,
+# so the caller gates on gfx95.
 register_kernel(
     KernelSpec(
         op="gemm.batched_gemm_a16wfp4_flatten_mxfp4_quant",

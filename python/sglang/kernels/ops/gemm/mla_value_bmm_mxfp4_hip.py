@@ -19,15 +19,12 @@ from aiter.ops.triton.batched_gemm_afp4wfp4_pre_quant import (
 from aiter.ops.triton.fused_mxfp4_quant import fused_flatten_mxfp4_quant
 
 try:
-    from aiter.ops.triton._triton_kernels.common.pid_preprocessing import (
-        pid_grid,
-        remap_xcd,
-    )
+    from aiter.ops.triton._triton_kernels.common.pid_preprocessing import pid_grid
 except ImportError:
     # AITER before ROCm/aiter#6505; drop once the minimum AITER includes it.
-    from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid, remap_xcd
+    from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid
 
-from sglang.srt.utils.common import direct_register_custom_op
+from sglang.srt.utils.custom_op import register_custom_op
 
 _MXFP4_QUANT_BLOCK_SIZE = 32
 # @triton.jit kernels can only read module globals instantiated as tl.constexpr,
@@ -85,8 +82,7 @@ def _batched_gemm_a16wfp4_flatten_mxfp4_quant_kernel(
     tl.static_assert(NUM_KSPLIT == 1)
     tl.static_assert(BLOCK_SIZE_N % _MXFP4_QUANT_BLOCK_SIZE_TL == 0)
 
-    # Runtime grid size, as in AITER: a constexpr would compile one binary per batch size.
-    remap_xcd(pid, num_pid_m * num_pid_n)
+    # TODO(perf): try pid = remap_xcd(...); AITER's kernel also discards that result.
     pid_m, pid_n = pid_grid(pid, num_pid_m, num_pid_n, GROUP_SIZE_M=GROUP_SIZE_M)
 
     stride_ab = tl.cast(stride_ab, tl.int64)
@@ -217,6 +213,10 @@ def _get_fused_config(x: torch.Tensor, w: torch.Tensor) -> dict | None:
     return config
 
 
+@register_custom_op(
+    op_name="batched_gemm_a16wfp4_flatten_mxfp4_quant",
+    mutates_args=["out", "out_scales"],
+)
 def _batched_gemm_a16wfp4_flatten_mxfp4_quant(
     x: torch.Tensor,
     w: torch.Tensor,
@@ -268,24 +268,6 @@ def _batched_gemm_a16wfp4_flatten_mxfp4_quant(
     )
 
 
-def _batched_gemm_a16wfp4_flatten_mxfp4_quant_fake(
-    x: torch.Tensor,
-    w: torch.Tensor,
-    w_scales: torch.Tensor,
-    out: torch.Tensor,
-    out_scales: torch.Tensor,
-) -> None:
-    return None
-
-
-direct_register_custom_op(
-    op_name="batched_gemm_a16wfp4_flatten_mxfp4_quant",
-    op_func=_batched_gemm_a16wfp4_flatten_mxfp4_quant,
-    mutates_args=["out", "out_scales"],
-    fake_impl=_batched_gemm_a16wfp4_flatten_mxfp4_quant_fake,
-)
-
-
 def can_fuse_mla_value_bmm_mxfp4_quant(
     x: torch.Tensor, w: torch.Tensor, w_scales: torch.Tensor
 ) -> bool:
@@ -331,9 +313,7 @@ def batched_gemm_a16wfp4_flatten_mxfp4_quant(
         dtype=torch.uint8,
         device=x.device,
     ).T
-    torch.ops.sglang.batched_gemm_a16wfp4_flatten_mxfp4_quant(
-        x, w, w_scales, out, out_scales
-    )
+    _batched_gemm_a16wfp4_flatten_mxfp4_quant(x, w, w_scales, out, out_scales)
     return out, out_scales
 
 
