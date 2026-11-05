@@ -939,7 +939,7 @@ class LongCatImageTransformer2DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         if context is None or context.current_timestep < 0:
             return None
         batch = context.forward_batch
-        if batch is None or not batch.do_classifier_free_guidance:
+        if batch is None or not batch.do_classifier_free_guidance or temb.shape[0] != 1:
             return None
         server_args = get_global_server_args()
         if (
@@ -957,17 +957,34 @@ class LongCatImageTransformer2DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             )
         ):
             return None
-        # Both CFG branches use the same timestep. Retain only this step's
-        # projections; the denoising stage drops the request state before decode.
+        # Use the same one-row projections as the model forward. Computing all
+        # timesteps together lets each layer reuse its weights before attention
+        # and the other layers evict them. Nothing survives the denoising loop.
         state = batch.extra.setdefault(DENOISING_LOOP_STATE, {}).setdefault(
             "longcat_modulations", {}
         )
-        key = (context.current_timestep, tuple(temb.shape), temb.dtype, temb.device)
+        key = (tuple(temb.shape), temb.dtype, temb.device)
         entry = state.get(id(self))
-        if entry is None or entry[0] != key:
-            entry = (key, {})
+        if entry is None or entry[0] is not batch.timesteps or entry[1] != key:
+            timesteps = batch.timesteps.to(device=temb.device, dtype=temb.dtype).flatten()
+            embeddings = [self.time_embed(t.reshape(1), temb.dtype) for t in timesteps]
+            activations = [torch.nn.functional.silu(value) for value in embeddings]
+            by_step = [{} for _ in embeddings]
+            norms = [(block.norm1, 6) for block in self.transformer_blocks]
+            norms += [(block.norm1_context, 6) for block in self.transformer_blocks]
+            norms += [(block.norm, 3) for block in self.single_transformer_blocks]
+            for norm, chunks in norms:
+                if (
+                    type(norm.linear) is nn.Linear
+                    and type(norm.silu) is nn.SiLU
+                    and not norm.silu.inplace
+                    and getattr(norm, "emb", None) is None
+                ):
+                    for values, activation in zip(by_step, activations):
+                        values[id(norm)] = norm.linear(activation).chunk(chunks, dim=1)
+            entry = (batch.timesteps, key, by_step)
             state[id(self)] = entry
-        return entry[1]
+        return entry[2][context.current_timestep]
 
     def forward(
         self,

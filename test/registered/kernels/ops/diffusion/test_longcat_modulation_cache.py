@@ -98,7 +98,11 @@ def test_model_reuses_only_current_cfg_step_and_falls_back_for_capture():
     server = SimpleNamespace(
         enable_breakable_cuda_graph=False, enable_cfg_parallel=False
     )
-    batch = SimpleNamespace(do_classifier_free_guidance=True, extra={})
+    batch = SimpleNamespace(
+        do_classifier_free_guidance=True,
+        extra={},
+        timesteps=torch.tensor([500, 480], device="cuda"),
+    )
 
     def run(text):
         return model(
@@ -112,17 +116,24 @@ def test_model_reuses_only_current_cfg_step_and_falls_back_for_capture():
     with patch.object(longcat, "get_global_server_args", return_value=server):
         for step, value in [(0, 500), (1, 480), (0, 600)]:
             if value == 600:
-                batch = SimpleNamespace(do_classifier_free_guidance=True, extra={})
+                batch = SimpleNamespace(
+                    do_classifier_free_guidance=True,
+                    extra={},
+                    timesteps=torch.tensor([600], device="cuda"),
+                )
             timestep.fill_(value)
             expected = [run(text) for text in texts]
             calls.clear()
             activations.clear()
             with set_forward_context(step, None, batch):
                 actual = [run(text) for text in texts]
-            assert len(calls) == 3 and len(activations) == 1
+            assert len(calls) == (6 if value == 500 else 0 if value == 480 else 3)
+            assert len(activations) == 0
             assert all(torch.equal(a, b) for a, b in zip(actual, expected))
             state = batch.extra[DENOISING_LOOP_STATE]["longcat_modulations"][id(model)]
-            assert state[0][0] == step and len(state[1]) == 4
+            assert state[0] is batch.timesteps
+            assert len(state[2]) == len(batch.timesteps)
+            assert len(state[2][step]) == 3
 
         for flag in ["enable_breakable_cuda_graph", "enable_cfg_parallel"]:
             setattr(server, flag, True)
