@@ -41,6 +41,11 @@ export AMD_CI_CACHE_HOST="$CI_NODE_SCRATCH/sglang-data"
 bash scripts/ci/amd/ensure_vram_clear.sh rocm
 bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$CI_ROCM_VERSION"
 bash scripts/ci/amd/amd_ci_install_dependency.sh
+# --env pairs from the launcher, one KEY=VAL per line.
+EXEC_ENV_ARGS=()
+while IFS= read -r kv; do
+    [[ -n "$kv" ]] && EXEC_ENV_ARGS+=(-e "$kv")
+done <<< "${CI_EXEC_ENV:-}"
 # shellcheck disable=SC2086  # CI_SUITE_ARGS is a list of run_suite.py flags
-bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test ${EXEC_ENV_ARGS[@]+"${EXEC_ENV_ARGS[@]}"} \
     python3 run_suite.py --hw amd --suite "$CI_SUITE" $CI_SUITE_ARGS
