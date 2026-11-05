@@ -1195,6 +1195,32 @@ async def hicache_storage_backend_status():
     }
 
 
+@app.put("/unified-cache/external-linker")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def attach_cache_linker():
+    """Re-attach the launch-time external linker while all schedulers are idle."""
+    if not get_serving().admin_api_key:
+        return _admin_api_key_missing_response()
+    ret = await _global_state.tokenizer_manager.attach_cache_linker()
+    return ORJSONResponse(
+        msgspec_to_builtins(ret),
+        status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
+    )
+
+
+@app.delete("/unified-cache/external-linker")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def detach_cache_linker():
+    """Detach the external linker while all schedulers are idle."""
+    if not get_serving().admin_api_key:
+        return _admin_api_key_missing_response()
+    ret = await _global_state.tokenizer_manager.detach_cache_linker()
+    return ORJSONResponse(
+        msgspec_to_builtins(ret),
+        status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
+    )
+
+
 # example usage:
 # curl -s http://127.0.0.1:30000/get_hicache_l3_cache_layout
 @app.get("/get_hicache_l3_cache_layout")

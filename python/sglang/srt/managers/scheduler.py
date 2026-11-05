@@ -140,6 +140,8 @@ from sglang.srt.managers.io_struct import (
     ActiveRanksOutput,
     AddExternalCorpusReqInput,
     AddExternalCorpusReqOutput,
+    AttachCacheLinkerReqInput,
+    AttachCacheLinkerReqOutput,
     AttachHiCacheStorageReqInput,
     AttachHiCacheStorageReqOutput,
     BatchTokenizedEmbeddingReqInput,
@@ -152,6 +154,8 @@ from sglang.srt.managers.io_struct import (
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
     DestroyWeightsUpdateGroupReqInput,
+    DetachCacheLinkerReqInput,
+    DetachCacheLinkerReqOutput,
     DetachHiCacheStorageReqInput,
     DetachHiCacheStorageReqOutput,
     DumperControlReqInput,
@@ -1906,6 +1910,8 @@ class Scheduler(
                 (BatchTokenizedEmbeddingReqInput, self.handle_batch_embedding_request),
                 (FlushCacheReqInput, self.flush_wrapper.handle),
                 (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
+                (AttachCacheLinkerReqInput, self.attach_cache_linker_wrapped),
+                (DetachCacheLinkerReqInput, self.detach_cache_linker_wrapped),
                 (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
                 (DetachHiCacheStorageReqInput, self.detach_hicache_storage_wrapped),
                 (AbortReq, self.abort_request),
@@ -5865,6 +5871,41 @@ class Scheduler(
             )
 
         return DetachHiCacheStorageReqOutput(success=False, message=msg)
+
+    def _cache_linker_admin_rejection(self, operation: str) -> Optional[str]:
+        if not self.enable_unified_cache_external_linker:
+            return "Launch with --enable-unified-cache-external-linker to manage an external linker."
+        if not self.is_fully_idle():
+            return (
+                f"Reject {operation}: scheduler is not idle. "
+                f"#queue-req={len(self.waiting_queue)} "
+                f"#running-req={len(self.running_batch.reqs)}"
+            )
+        return None
+
+    def attach_cache_linker_wrapped(
+        self, recv_req: AttachCacheLinkerReqInput
+    ) -> AttachCacheLinkerReqOutput:
+        rejection = self._cache_linker_admin_rejection("attach")
+        if rejection is not None:
+            return AttachCacheLinkerReqOutput(success=False, message=rejection)
+        try:
+            ok, message = self.tree_cache.attach_cache_linker()
+        except Exception as e:
+            logger.exception("Attach external linker failed with exception.")
+            return AttachCacheLinkerReqOutput(success=False, message=str(e))
+        return AttachCacheLinkerReqOutput(success=ok, message=message)
+
+    def detach_cache_linker_wrapped(
+        self, recv_req: DetachCacheLinkerReqInput
+    ) -> DetachCacheLinkerReqOutput:
+        rejection = self._cache_linker_admin_rejection("detach")
+        if rejection is not None:
+            return DetachCacheLinkerReqOutput(success=False, message=rejection)
+        # Detach failures are fatal: ranks may now have different linker states.
+        # Let run_scheduler_process notify the parent and terminate the workers.
+        ok, message = self.tree_cache.detach_cache_linker()
+        return DetachCacheLinkerReqOutput(success=ok, message=message)
 
     def flush_cache(self, empty_cache: bool = True):
         """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache."""

@@ -260,13 +260,17 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
         )
         cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
         cache.tree_core = SimpleNamespace(
-            enable_external_cache_linker=False, write_through_threshold=256
+            enable_external_cache_linker=False,
+            write_through_threshold=256,
+            backfill_missing_hash_values=lambda: 0,
         )
         cache.tree_components = (ComponentType.FULL,) + (
             (ComponentType.MAMBA,) if has_state else ()
         )
         cache.components = {component: object() for component in cache.tree_components}
         cache._components_tuple = tuple(cache.components.values())
+        cache._all_reduce_attn_groups = lambda tensor, op: None
+        cache.linker = None
         counter = MagicMock(name="layer_done_counter")
         linker = SimpleNamespace(pools=linker_pools, layer_done_counter=counter)
         kvcache = ctx.params.token_to_kv_pool_allocator.get_kvcache.return_value

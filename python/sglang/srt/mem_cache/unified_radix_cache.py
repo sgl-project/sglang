@@ -95,6 +95,10 @@ from sglang.srt.mem_cache.unified_cache.components import (
     SWAComponent,
     TreeComponent,
 )
+from sglang.srt.mem_cache.unified_cache.linker_attachment import (
+    CacheLinkerAttachment,
+    runtime_change_rejection,
+)
 from sglang.srt.mem_cache.unified_cache.session_ref_tracker import (
     UnifiedSessionRefTracker,
 )
@@ -359,6 +363,7 @@ class UnifiedRadixCache(BasePrefixCache):
         # Owns the storage backend lifecycle; built by init_hicache.
         self._storage_attachment: Optional[StorageAttachment] = None
         self.linker: Optional[UnifiedCacheLinkerWrapper] = None
+        self._linker_attachment: Optional[CacheLinkerAttachment] = None
         self.prefetch_stop_policy = "best_effort"
         self.prefetch_threshold = 256
         self.prefetch_timeout_base = 1.0
@@ -455,6 +460,17 @@ class UnifiedRadixCache(BasePrefixCache):
                 tag=P2PTag.HICACHE_PP_SYNC,
             )
             self.work_list.append(send_work)
+
+    def init_linker_attachment(
+        self,
+        *,
+        build_linker: Callable[[], UnifiedCacheLinker],
+        publish_linker: Callable[[Optional[UnifiedCacheLinker]], None],
+    ) -> None:
+        self._linker_attachment = CacheLinkerAttachment(
+            self, build_linker=build_linker, publish_linker=publish_linker
+        )
+        self._linker_attachment.attach()
 
     def init_cache_linker(self, cache_linker: UnifiedCacheLinker) -> None:
         """Attach an external KV store directly to the device pools."""
@@ -650,8 +666,8 @@ class UnifiedRadixCache(BasePrefixCache):
         self.sidecar_pool_specs.append(spec)
 
     def release_host_resources(self) -> None:
-        if self.linker is not None:
-            self.linker.close()
+        if self._linker_attachment is not None:
+            self._linker_attachment.detach(synchronize=False)
         if self.host_pool_group is not None:
             self.host_pool_group.destroy()
 
@@ -3730,6 +3746,18 @@ class UnifiedRadixCache(BasePrefixCache):
             return False, "HiCache storage backend is not initialized."
         return self._storage_attachment.detach()
 
+    def attach_cache_linker(self) -> tuple[bool, str]:
+        rejection = runtime_change_rejection()
+        if rejection is not None:
+            return False, rejection
+        return True, self._linker_attachment.attach()
+
+    def detach_cache_linker(self) -> tuple[bool, str]:
+        rejection = runtime_change_rejection()
+        if rejection is not None:
+            return False, rejection
+        return True, self._linker_attachment.detach()
+
     def shutdown(self) -> None:
         """Best-effort auto-detach of the storage backend on process shutdown."""
         if self._storage_attachment is not None:
@@ -4069,6 +4097,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.linker.commit_completed_offloads(
                     [bool(success) for success in successes.tolist()]
                 )
+            return
+        if self._linker_attachment is not None:
+            # A detached linker leaves no host tier to poll.
             return
 
         # Reap the previous round's PP-sync sends before issuing new ones.
