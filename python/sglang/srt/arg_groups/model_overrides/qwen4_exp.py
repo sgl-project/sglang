@@ -43,7 +43,8 @@ def _qwen4_exp_overrides(server_args: Any, hf_config: Any) -> dict:
         import torch
 
         overrides["ple_offload_embedding"] = (
-            get_platform().is_cuda
+            not cfg.nixl_use_cpu_buffer
+            and get_platform().is_cuda
             and model_config_of(server_args).dtype == torch.bfloat16
         )
 

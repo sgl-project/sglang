@@ -4109,6 +4109,7 @@ class HybridLinearKVPool(KVCache):
     """KV cache with separate pools for full and linear attention layers."""
 
     cpu_copy_carries_mamba = True
+    cpu_copy_draft_pool: Optional[KVCache] = None
 
     def __init__(
         self,
@@ -4492,12 +4493,24 @@ class HybridLinearKVPool(KVCache):
             if mamba_indices is not None
             else None
         )
+        if self.cpu_copy_draft_pool is not None:
+            draft_cpu = self.cpu_copy_draft_pool.get_cpu_copy(
+                indices, mamba_indices=mamba_indices, req_pool_index=req_pool_index
+            )
+            return kv_cpu, mamba_cpu, draft_cpu
         return kv_cpu, mamba_cpu
 
     def load_cpu_copy(
         self, cache_cpu, indices, mamba_indices=None, req_pool_index=None
     ):
-        kv_cpu, mamba_cpu = cache_cpu
+        kv_cpu, mamba_cpu = cache_cpu[:2]
+        if self.cpu_copy_draft_pool is not None:
+            self.cpu_copy_draft_pool.load_cpu_copy(
+                cache_cpu[2],
+                indices,
+                mamba_indices=mamba_indices,
+                req_pool_index=req_pool_index,
+            )
         self.full_kv_pool.load_cpu_copy(kv_cpu, indices, req_pool_index=req_pool_index)
         if mamba_cpu is not None and mamba_indices is not None:
             self.mamba_pool.load_cpu_copy(

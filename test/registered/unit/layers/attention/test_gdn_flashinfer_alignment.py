@@ -188,6 +188,37 @@ class TestFlashInferGDNAlignment(unittest.TestCase):
         torch.testing.assert_close(captured["a"], a)
         torch.testing.assert_close(captured["b"], b)
 
+    def test_sm90_decode_padding_preserves_last_live_state(self):
+        kernel = _make_kernel_without_flashinfer()
+        kernel.use_state_pool = False
+        kernel._decode_fn = lambda **kwargs: (
+            torch.zeros_like(kwargs["v"]),
+            kwargs["state"] + 1,
+        )
+        state = torch.arange(4 * 2 * 4 * 4, dtype=torch.float32).reshape(4, 2, 4, 4)
+        before = state.clone()
+        q = torch.ones(1, 3, 1, 4)
+        v = torch.ones(1, 3, 2, 4)
+        gates = torch.ones(1, 3, 2)
+        indices = torch.tensor([1, -1, -1], dtype=torch.int32)
+        kernel.decode(
+            q,
+            q,
+            v,
+            gates,
+            gates,
+            A_log=torch.zeros(2),
+            dt_bias=torch.zeros(2),
+            ssm_states=state,
+            cache_indices=indices,
+            query_start_loc=torch.arange(4, dtype=torch.int32),
+        )
+        torch.testing.assert_close(state[1], before[1] + 1)
+        torch.testing.assert_close(state[2:], before[2:])
+        torch.testing.assert_close(
+            indices, torch.tensor([1, -1, -1], dtype=torch.int32)
+        )
+
     def test_gate_parameter_cache_preserves_backend_dtype_contract(self):
         kernel = _make_kernel_without_flashinfer()
         A_log = torch.empty(8, dtype=torch.bfloat16)
