@@ -21,15 +21,25 @@ from sglang.kernels.ops.moe.clover_coreset_triton import (
     supports_clover_block_coreset_triton,
 )
 from sglang.srt.configs.clover_moe import CloverMoeConfig
-from sglang.srt.layers.layer_boundary import declare_attn, declare_ffn
+from sglang.srt.layers.layer_boundary import append_stages, declare_attn, declare_ffn
 from sglang.srt.layers.layer_boundary.residual.add_norm import (
     NORM_QUANT_READOUT,
 )
+from sglang.srt.layers.layernorm import GemmaRMSNorm
+from sglang.srt.layers.linear import (
+    QKVParallelLinear,
+    ReplicatedLinear,
+    ReplicatedParallelGroup,
+    RowParallelLinear,
+    resolve_linear_parallel_group,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.moe.utils import is_shared_experts_fusion_disabled
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
+from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import (
@@ -42,15 +52,28 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.qwen2_moe import Qwen2MoeSparseMoeBlock
 from sglang.srt.models.qwen3_5 import (
-    Qwen3_5AttentionDecoderLayer,
     Qwen3_5GatedDeltaNet,
-    Qwen3_5LinearDecoderLayer,
     Qwen3_5MoeForCausalLM,
     Qwen3_5MoeForConditionalGeneration,
     _fp8_tuple_input,
 )
 from sglang.srt.runtime_context import get_parallel, linear_attn_parallel_group
-from sglang.srt.utils import add_prefix, set_weight_attrs
+from sglang.srt.utils import (
+    add_prefix,
+    get_bool_env_var,
+    is_cuda,
+    is_hip,
+    set_weight_attrs,
+)
+from sglang.srt.utils.hf_transformers_utils import get_rope_config
+
+_is_cuda = is_cuda()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
+
+if _is_cuda:
+    from sglang.kernels.ops.attention.fused_qk_rmsnorm_rope_gate import (
+        fused_qk_gemma_rmsnorm_rope_gate,
+    )
 
 
 def block_coreset(logits, block_size, top_k, top_p):
@@ -86,35 +109,75 @@ def _clover_stage_facts(config, layer_id, *, attn_read=NORM_QUANT_READOUT):
     )
 
 
+class CloverRouterGate(ReplicatedLinear):
+    """Router gate that applies the block coreset while a preview forward runs."""
+
+    def __init__(self, *args, top_k, top_p, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.top_k = top_k
+        self.top_p = top_p
+        # Set by CloverSparseMoeBlock.forward for the duration of one preview call.
+        self.preview_block_size = None
+
+    def forward(self, x):
+        logits, bias = super().forward(x)
+        if self.preview_block_size is not None:
+            logits = block_coreset(
+                logits, self.preview_block_size, self.top_k, self.top_p
+            )
+        return logits, bias
+
+
 class CloverSparseMoeBlock(Qwen2MoeSparseMoeBlock):
-    def __init__(self, *, config, **kwargs):
-        super().__init__(config=config, **kwargs)
-        self.clover_coreset = config.moe_block_coreset_enabled
-        self.clover_top_k = config.num_experts_per_tok
-        self.clover_top_p = config.moe_block_coreset_top_p
+    """Qwen2-MoE block with the coreset applied through the router gate, so every
+    routing path that reads self.gate (normal, dual stream, DeepEP, MegaMoE) sees it."""
+
+    def __init__(self, *, layer_id, config, quant_config=None, prefix="", **kwargs):
+        coreset = config.moe_block_coreset_enabled
+        super().__init__(
+            layer_id=layer_id,
+            config=config,
+            quant_config=quant_config,
+            prefix=prefix,
+            # The AITER fused router computes top-k without self.gate and would
+            # skip the coreset.
+            support_shared_expert_fusion=(
+                not is_shared_experts_fusion_disabled() and not (_use_aiter and coreset)
+            ),
+            **kwargs,
+        )
+        self.clover_coreset = coreset
+        if coreset:
+            self.gate = CloverRouterGate(
+                config.hidden_size,
+                config.num_experts,
+                bias=False,
+                quant_config=None,
+                prefix=add_prefix("gate", prefix),
+                top_k=config.num_experts_per_tok,
+                top_p=config.moe_block_coreset_top_p,
+            )
 
     @property
     def supports_deferred_finalize(self) -> bool:
         # Clover's layer boundaries do not install a deferred-finalize consumer.
         return False
 
-    # The coreset restricts routed experts only, before top-k, and only in preview.
-    def _router_logits(self, hidden_states, *, forward_batch):
-        router_logits = super()._router_logits(
-            hidden_states, forward_batch=forward_batch
-        )
-        if (
+    def forward(self, hidden_states, forward_batch=None, defer_finalize=False):
+        # The coreset restricts routed experts only, before top-k, and only in preview.
+        if not (
             self.clover_coreset
             and forward_batch is not None
             and forward_batch.forward_mode.is_dllm_extend()
         ):
-            router_logits = block_coreset(
-                router_logits,
-                hidden_states.shape[0] // forward_batch.batch_size,
-                self.clover_top_k,
-                self.clover_top_p,
-            )
-        return router_logits
+            return super().forward(hidden_states, forward_batch, defer_finalize)
+        self.gate.preview_block_size = (
+            hidden_states.shape[0] // forward_batch.batch_size
+        )
+        try:
+            return super().forward(hidden_states, forward_batch, defer_finalize)
+        finally:
+            self.gate.preview_block_size = None
 
 
 class CloverRadixLinearAttention(RadixLinearAttention):
@@ -232,17 +295,34 @@ class CloverGatedDeltaNet(Qwen3_5GatedDeltaNet):
         object.__setattr__(self.attn, "conv_right_weight", self.conv_right_weight)
 
 
-class CloverLinearDecoderLayer(Qwen3_5LinearDecoderLayer):
-    stage_facts = staticmethod(_clover_stage_facts)
-    is_moe = staticmethod(lambda config: True)
-    linear_attn_cls = CloverGatedDeltaNet
-    moe_block_cls = CloverSparseMoeBlock
+def _build_moe(config, layer_id, quant_config, prefix, alt_stream):
+    return CloverSparseMoeBlock(
+        layer_id=layer_id,
+        config=config,
+        quant_config=quant_config,
+        # Follow Qwen3.5: HIP overlaps the shared expert only without fusion.
+        alt_stream=(
+            alt_stream if (_is_cuda or is_shared_experts_fusion_disabled()) else None
+        ),
+        prefix=add_prefix("mlp", prefix),
+        # The stage boundary completes this stage's sum.
+        reduce_results=False,
+    )
 
 
-class CloverAttentionDecoderLayer(Qwen3_5AttentionDecoderLayer):
+def _build_stages(config, layer_id, input_layernorm, post_attention_layernorm):
+    attn, ffn = _clover_stage_facts(config, layer_id)
+    # Qwen's optional CuTe DSL boundary fusion is not supported for Clover.
+    return append_stages(
+        (attn, input_layernorm, {"fusions": None}),
+        (ffn, post_attention_layernorm, {"fusions": None}),
+    )
+
+
+class CloverLinearDecoderLayer(nn.Module):
+    """GatedDeltaNet mixer plus sparse MoE, built from shared Qwen3.5 components."""
+
     stage_facts = staticmethod(_clover_stage_facts)
-    is_moe = staticmethod(lambda config: True)
-    moe_block_cls = CloverSparseMoeBlock
 
     def __init__(
         self,
@@ -252,40 +332,200 @@ class CloverAttentionDecoderLayer(Qwen3_5AttentionDecoderLayer):
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
         is_nextn: bool = False,
-        build_stages: bool = True,
     ) -> None:
-        super().__init__(
+        super().__init__()
+        self.config = config
+        self.layer_id = layer_id
+        self.linear_attn = CloverGatedDeltaNet(
+            config, layer_id, quant_config, alt_stream, prefix
+        )
+        self.mlp = _build_moe(
             config,
             layer_id,
-            quant_config=quant_config,
-            prefix=prefix,
-            alt_stream=alt_stream,
-            is_nextn=is_nextn,
-            build_stages=build_stages,
+            quant_config,
+            prefix.replace(".linear_attn", ""),
+            alt_stream,
         )
-        # Causal encoding and noncausal preview share projections.
+        self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = GemmaRMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.attn_boundary, self.ffn_boundary = _build_stages(
+            config, layer_id, self.input_layernorm, self.post_attention_layernorm
+        )
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        captured_last_layer_outputs=None,
+    ) -> torch.Tensor:
+        hidden_states = self.attn_boundary.prepare(
+            hidden_states, forward_batch, capture_gathered=captured_last_layer_outputs
+        )
+        if not forward_batch.forward_mode.is_idle() and hidden_states.shape[0] > 0:
+            hidden_states = self.linear_attn(hidden_states, forward_batch)
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
+        hidden_states = self.mlp(hidden_states, forward_batch)
+        return self.ffn_boundary.finish(hidden_states, forward_batch)
+
+
+class CloverAttentionDecoderLayer(nn.Module):
+    """Gated full attention plus sparse MoE. Causal encoding and the noncausal
+    preview share projections; the layout matches Qwen3.5 checkpoints."""
+
+    stage_facts = staticmethod(_clover_stage_facts)
+
+    def __init__(
+        self,
+        config: CloverMoeConfig,
+        layer_id: int,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+        alt_stream: Optional[torch.cuda.Stream] = None,
+        is_nextn: bool = False,
+    ) -> None:
+        super().__init__()
+        self.config = config
+        self.layer_id = layer_id
+        attn_tp_size = get_parallel().attn_tp_size
+        kv_parallel_group = ReplicatedParallelGroup(
+            "attn_tp", get_parallel().attn_dcp_size
+        )
+        _, kv_tp_size = resolve_linear_parallel_group(kv_parallel_group)
+        total_num_heads = config.num_attention_heads
+        total_num_kv_heads = config.num_key_value_heads
+        assert total_num_heads % attn_tp_size == 0
+        self.num_heads = total_num_heads // attn_tp_size
+        self.num_kv_heads = max(1, total_num_kv_heads // kv_tp_size)
+        self.head_dim = config.head_dim or (config.hidden_size // self.num_heads)
+        self.q_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_kv_heads * self.head_dim
+        self.scaling = self.head_dim**-0.5
+        self.attn_output_gate = config.attn_output_gate
+
+        rope_theta, rope_scaling = get_rope_config(config)
+        if rope_scaling and not ("rope_type" in rope_scaling or "type" in rope_scaling):
+            rope_scaling = None
+        self.rotary_emb = get_rope(
+            head_size=self.head_dim,
+            rotary_dim=self.head_dim,
+            max_position=config.max_position_embeddings,
+            rope_scaling=rope_scaling,
+            base=rope_theta,
+            partial_rotary_factor=config.partial_rotary_factor,
+            is_neox_style=True,
+            dtype=torch.get_default_dtype(),
+        )
+        self.qkv_proj = QKVParallelLinear(
+            config.hidden_size,
+            self.head_dim,
+            total_num_heads * (1 + self.attn_output_gate),
+            total_num_kv_heads,
+            bias=False,
+            quant_config=quant_config,
+            parallel_group="attn_tp",
+            kv_parallel_group=kv_parallel_group,
+            prefix=add_prefix("qkv_proj", prefix),
+        )
+        self.o_proj = RowParallelLinear(
+            total_num_heads * self.head_dim,
+            config.hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            reduce_results=False,
+            parallel_group="attn_tp",
+            prefix=add_prefix("o_proj", prefix),
+        )
+        self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        attn_kwargs = dict(
+            num_kv_heads=self.num_kv_heads,
+            layer_id=layer_id,
+            prefix=f"{prefix}.attn",
+            quant_config=quant_config,
+        )
+        self.attn = RadixAttention(
+            self.num_heads,
+            self.head_dim,
+            self.scaling,
+            attn_type=AttentionType.DECODER,
+            **attn_kwargs,
+        )
         self.attn_preview = RadixAttention(
             self.num_heads,
             self.head_dim,
             self.scaling,
-            num_kv_heads=self.num_kv_heads,
-            layer_id=layer_id,
             attn_type=AttentionType.ENCODER_ONLY,
-            prefix=f"{prefix}.attn",
-            quant_config=quant_config,
+            **attn_kwargs,
         )
 
-    # Adapted from Qwen3_5AttentionDecoderLayer.self_attention in qwen3_5.py.
+        self.mlp = _build_moe(
+            config,
+            layer_id,
+            quant_config,
+            prefix.replace(".self_attn", ""),
+            alt_stream,
+        )
+        self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = GemmaRMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.attn_boundary, self.ffn_boundary = _build_stages(
+            config, layer_id, self.input_layernorm, self.post_attention_layernorm
+        )
+
+    def _prepare_qkv_gate(self, *, positions, hidden_states):
+        qkv, _ = self.qkv_proj(hidden_states)
+        q_width = self.q_size * (1 + self.attn_output_gate)
+        q_gate, k, v = qkv.split([q_width, self.kv_size, self.kv_size], dim=-1)
+        if _is_cuda:
+            q, k, gate = fused_qk_gemma_rmsnorm_rope_gate(
+                q_gate,
+                k,
+                self.q_norm.weight.data,
+                self.k_norm.weight.data,
+                self.rotary_emb.cos_sin_cache,
+                positions,
+                self.q_norm.variance_epsilon,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                self.rotary_emb.rotary_dim,
+                has_gate=self.attn_output_gate,
+                mrope_axis_map=(
+                    self.rotary_emb.axis_map if positions.dim() == 2 else None
+                ),
+            )
+            seq_len = hidden_states.shape[0]
+            q, k = q.view(seq_len, -1), k.view(seq_len, -1)
+            gate = gate.view(seq_len, -1) if gate is not None else None
+            return q, k, v, gate
+
+        gate = None
+        if self.attn_output_gate:
+            q_gate = q_gate.view(*q_gate.shape[:-1], self.num_heads, -1)
+            q, gate = torch.chunk(q_gate, 2, dim=-1)
+            q = q.reshape(*q.shape[:-2], -1)
+        else:
+            q = q_gate
+        q = self.q_norm(q.reshape(-1, self.head_dim)).view(q.shape)
+        k = self.k_norm(k.reshape(-1, self.head_dim)).view(k.shape)
+        q, k = self.rotary_emb(positions, q, k)
+        return q, k, v, gate
+
     def self_attention(self, positions, hidden_states, forward_batch):
-        if not forward_batch.forward_mode.is_dllm_extend():
-            return super().self_attention(positions, hidden_states, forward_batch)
-
         q, k, v, gate = self._prepare_qkv_gate(
-            positions=positions,
-            hidden_states=hidden_states,
-            forward_batch=forward_batch,
+            positions=positions, hidden_states=hidden_states
         )
-        attn_output = self.attn_preview(q, k, v, forward_batch)
+        attn = (
+            self.attn_preview
+            if forward_batch.forward_mode.is_dllm_extend()
+            else self.attn
+        )
+        attn_output = attn(q, k, v, forward_batch)
         if self.attn_output_gate:
             if _fp8_tuple_input(self.o_proj, attn_output.shape[0]):
                 attn_output = fused_sigmoid_mul(attn_output, gate, quant=True)
@@ -293,6 +533,23 @@ class CloverAttentionDecoderLayer(Qwen3_5AttentionDecoderLayer):
                 attn_output = fused_sigmoid_mul(attn_output, gate, inplace=True)
         output, _ = self.o_proj(attn_output)
         return output
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        captured_last_layer_outputs=None,
+    ) -> torch.Tensor:
+        hidden_states = self.attn_boundary.prepare(
+            hidden_states, forward_batch, capture_gathered=captured_last_layer_outputs
+        )
+        if not forward_batch.forward_mode.is_idle() and hidden_states.shape[0] > 0:
+            hidden_states = self.self_attention(positions, hidden_states, forward_batch)
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
+        hidden_states = self.mlp(hidden_states, forward_batch)
+        return self.ffn_boundary.finish(hidden_states, forward_batch)
 
 
 class CloverMoeModel(Qwen3_5MoeForCausalLM):

@@ -1117,10 +1117,6 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
     """Qwen3.5 Decoder Layer with Linear Attention (GatedDeltaNet)."""
 
     stage_facts = staticmethod(_qwen3_5_stage_facts)
-    # Construction hooks for checkpoints that reuse this layer with their own modules.
-    is_moe = staticmethod(_qwen3_5_is_moe)
-    linear_attn_cls = Qwen3_5GatedDeltaNet
-    moe_block_cls = Qwen2MoeSparseMoeBlock
 
     def __init__(
         self,
@@ -1136,14 +1132,14 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         self.config = config
         self.layer_id = layer_id
 
-        self.linear_attn = self.linear_attn_cls(
+        self.linear_attn = Qwen3_5GatedDeltaNet(
             config, layer_id, quant_config, alt_stream, prefix
         )
 
         # NOTE: Determine the MLP type based on the model type
         # Qwen3.5 use all layers for MLP / Qwen3.5-MoE use sparse MoE blocks
-        if self.is_moe(config):
-            self.mlp = self.moe_block_cls(
+        if _qwen3_5_is_moe(config):
+            self.mlp = Qwen2MoeSparseMoeBlock(
                 layer_id=layer_id,
                 config=config,
                 quant_config=quant_config,
@@ -1261,9 +1257,6 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
     """Qwen3.5 Decoder Layer with Full Attention."""
 
     stage_facts = staticmethod(_qwen3_5_stage_facts)
-    # Construction hooks for checkpoints that reuse this layer with their own modules.
-    is_moe = staticmethod(_qwen3_5_is_moe)
-    moe_block_cls = Qwen2MoeSparseMoeBlock
 
     def __init__(
         self,
@@ -1379,8 +1372,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 # The stage boundary completes this stage's sum.
                 reduce_results=False,
             )
-        elif self.is_moe(config):
-            self.mlp = self.moe_block_cls(
+        elif _qwen3_5_is_moe(config):
+            self.mlp = Qwen2MoeSparseMoeBlock(
                 layer_id=layer_id,
                 config=config,
                 quant_config=quant_config,

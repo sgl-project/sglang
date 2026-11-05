@@ -703,21 +703,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             self.experts.supports_deferred_finalize and self.shared_expert is not None
         )
 
-    def _router_logits(
-        self,
-        hidden_states: torch.Tensor,
-        *,
-        forward_batch: Optional[ForwardBatch],
-    ) -> torch.Tensor:
-        """Return (num_tokens, n_experts) logits; subclasses may restrict experts."""
-        router_logits, _ = self.gate(hidden_states)
-        return router_logits
-
     def _forward_router_experts(
         self,
         hidden_states: torch.Tensor,
         *,
-        forward_batch: Optional[ForwardBatch] = None,
         defer_finalize: bool = False,
     ):
         if _use_aiter and self.enable_shared_expert_fusion and not defer_finalize:
@@ -725,7 +714,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
             if (topk_output := qwen_moe_topk_output(self, hidden_states)) is not None:
                 return self.experts(hidden_states, topk_output)
-        router_logits = self._router_logits(hidden_states, forward_batch=forward_batch)
+        # router_logits: (num_tokens, n_experts)
+        router_logits, _ = self.gate(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
         if defer_finalize:
             if not self.supports_deferred_finalize:
@@ -762,7 +752,6 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         hidden_states: torch.Tensor,
         use_fused_gate: bool = False,
         defer_finalize: bool = False,
-        forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
         current_stream = torch.cuda.current_stream()
 
@@ -771,7 +760,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             # the shared branch reads the same input and writes a separate output.
             self.alt_stream.wait_stream(current_stream)
             router_output = self._forward_router_experts(
-                hidden_states, forward_batch=forward_batch, defer_finalize=True
+                hidden_states, defer_finalize=True
             )
             with torch.cuda.stream(self.alt_stream):
                 shared_output = self._forward_shared_experts(
@@ -810,9 +799,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         # ===== END TO BE REFACTORED ====
 
         with torch.cuda.stream(self.alt_stream):
-            router_output = self._forward_router_experts(
-                hidden_states, forward_batch=forward_batch
-            )
+            router_output = self._forward_router_experts(hidden_states)
 
         current_stream.wait_stream(self.alt_stream)
 
@@ -865,7 +852,6 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 hidden_states,
                 use_fused_gate=use_fused_gate,
                 defer_finalize=defer_finalize,
-                forward_batch=forward_batch,
             )
         else:
             shared_output = self._forward_shared_experts(
@@ -876,9 +862,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                     hidden_states, shared_output
                 )
             final_hidden_states = self._forward_router_experts(
-                hidden_states,
-                forward_batch=forward_batch,
-                defer_finalize=defer_finalize,
+                hidden_states, defer_finalize=defer_finalize
             )
 
         if defer_finalize:
