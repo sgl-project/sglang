@@ -310,7 +310,8 @@ class RowBucketGraphRunner:
                     cuda_graph=graph,
                     pool=pool,
                     stream=ctx.stream,
-                    barrier_fn=tp_group.barrier,
+                    # Captured while serving: other threads may use CUDA meanwhile.
+                    capture_error_mode="thread_local",
                 ),
             ):
                 outputs = body()

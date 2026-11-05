@@ -170,16 +170,23 @@ pub(super) fn format_json_schema(
     })
 }
 
-/// `model:adapter` selects a LoRA adapter over `lora_path`.
+/// `_resolve_lora_path`: a `model:adapter` adapter wins over `lora_path`; the
+/// exact served name, colons and all, has none.
 pub(super) fn lora_path(
     model: &str,
     lora_path: &Option<OneOrList<Option<String>>>,
+    served_model_name: Option<&str>,
 ) -> Option<OptionalStringOrList> {
-    match model.split_once(':') {
-        Some((_, adapter)) if !py_strip(adapter).is_empty() => {
-            Some(OneOrList::One(py_strip(adapter).to_owned()).into())
+    let adapter = match served_model_name {
+        Some(served) if model == served => None,
+        Some(served) if model.starts_with(&format!("{served}:")) => {
+            Some(&model[served.len() + 1..])
         }
-        _ => lora_path.clone().map(Into::into),
+        _ => model.split_once(':').map(|(_, adapter)| adapter),
+    };
+    match adapter.map(py_strip).filter(|adapter| !adapter.is_empty()) {
+        Some(adapter) => Some(OneOrList::One(adapter.to_owned()).into()),
+        None => lora_path.clone().map(Into::into),
     }
 }
 
@@ -210,4 +217,20 @@ pub(super) fn custom_labels(
             _ => Err(Unsupported("invalid_request")),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use serde_json::json;
+
+    #[test]
+    fn lora_path_keeps_the_served_name_whole() {
+        let served = Some("s3://b:m");
+        let path = |model| serde_json::to_value(lora_path(model, &None, served)).unwrap();
+        assert_eq!(path("s3://b:m"), json!(null));
+        assert_eq!(path("s3://b:m:ad"), json!("ad"));
+        assert_eq!(path("base:ad"), json!("ad"));
+    }
 }

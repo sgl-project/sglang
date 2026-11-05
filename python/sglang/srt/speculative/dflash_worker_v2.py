@@ -28,23 +28,25 @@ from sglang.srt.layers.logits_processor import (
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.mem_cache.kv_loc_plan import KVLocPlan
+from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.mem_cache.allocation import assign_req_to_token_pool_func
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
+from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
     ForwardBatch,
-    ForwardMode,
     compute_position,
     enable_num_token_non_padded,
 )
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.model_runner import SamplingPrewarmResult
 from sglang.srt.model_executor.runner_utils.pool import (
     disable_graph_pool_borrow,
     graph_pool_borrow_enabled,
 )
+from sglang.srt.models.dflash import DFlashMLAAttention
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_exec,
@@ -102,11 +104,11 @@ from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_METHOD,
     SIMULATE_ACC_TOKEN_MODE,
     GrammarTree,
-    assign_req_to_token_pool_func,
     build_grammar_vocab_mask,
     check_simulate_acc_token_mode,
     draft_pp_context,
     draft_tp_context,
+    simulated_acc_len_generator,
 )
 from sglang.srt.utils import async_h2d, is_cuda, is_hip, is_npu, is_xpu
 
@@ -415,6 +417,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         # spec broadcasts must stay within the attn-TP group.
         self._tp_sync = SpecTpSync(get_dp_tp_group())
         check_simulate_acc_token_mode()
+        # The forced lengths overwrite accept_len after its broadcast, so every rank
+        # draws them from the same server-seeded stream.
+        self._simulated_acc_len_rng = (
+            simulated_acc_len_generator(target_worker.random_seed)
+            if SIMULATE_ACC_LEN > 0
+            else None
+        )
 
         # DP drafts use per-DP attention TP, independent of idle peers. CP
         # drafts use full TP without CP, including their backend and KV pool.
@@ -1322,7 +1331,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         slot; overwrite it with the learned vector. VocabParallelEmbedding-aware:
         each rank only updates the row if the token falls within its shard.
         """
-        from sglang.srt.arg_groups.overrides import resolving_view
+        from sglang.srt.arg_groups.model_override_base import resolving_view
 
         draft_model_path = resolving_view(self.server_args).speculative_draft_model_path
         if draft_model_path is None:
@@ -1813,10 +1822,12 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         return out_tokens
 
-    def _draft_write_ids(self, plan: KVLocPlan) -> torch.Tensor:
+    def _draft_write_ids(
+        self, plan: IterationIds, kind=IdSpaceKind.FULL
+    ) -> Optional[torch.Tensor]:
         """The plan's write ids as the draft pool indexes them: the target's
         physical ids for a fused draft, the virtual ids for a private one."""
-        return plan.write_ids(self.draft_model_runner.kv_index_translator)
+        return plan.write_ids(self.draft_model_runner.runner_ids, kind=kind)
 
     def _append_target_hidden_to_draft_kv_by_loc(
         self,
@@ -1827,6 +1838,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         cache_loc_2d: Optional[torch.Tensor] = None,
         commit_lens: Optional[torch.Tensor] = None,
         extend_lens: Optional[torch.Tensor] = None,
+        swa_cache_loc: Optional[torch.Tensor] = None,
     ) -> None:
         """Materialize target context features into the draft KV cache at explicit slots.
 
@@ -1896,9 +1908,18 @@ class DFlashWorkerV2(BaseSpecWorker):
                     "DFLASH cache_loc_2d requires commit_lens for prefix-valid writes."
                 )
 
+        if swa_cache_loc is not None and swa_cache_loc.shape != cache_loc.shape:
+            raise ValueError(
+                "DFLASH full and window cache locations must have matching shapes."
+            )
+
         device = self.model_runner.device
         if cache_loc.device != device:
             cache_loc = cache_loc.to(device, non_blocking=True)
+        if swa_cache_loc is not None:
+            swa_cache_loc = swa_cache_loc.to(
+                device=device, dtype=torch.int64, non_blocking=True
+            )
         if positions.device != device:
             positions = positions.to(device, non_blocking=True)
         if target_hidden.device != device:
@@ -1950,6 +1971,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                             ctx_hidden=ctx_hidden,
                             ctx_positions=positions,
                             ctx_cache_loc=cache_loc,
+                            ctx_swa_cache_loc=swa_cache_loc,
                             ctx_cache_loc_2d=cache_loc_2d,
                             commit_lens=commit_lens,
                         )
@@ -1967,15 +1989,34 @@ class DFlashWorkerV2(BaseSpecWorker):
                     layer_ctx_hidden = self.draft_model.prepare_context_hidden_for_kv(
                         layer, ctx_hidden
                     )
+                    if isinstance(attn, DFlashMLAAttention):
+                        attn.write_context_kv(
+                            pool=self.draft_model_runner.token_to_kv_pool,
+                            positions=positions,
+                            hidden_states=layer_ctx_hidden,
+                            cache_loc=cache_loc,
+                            swa_cache_loc=swa_cache_loc,
+                            cache_loc_2d=cache_loc_2d,
+                            commit_lens=commit_lens,
+                        )
+                        continue
                     k, v = attn.kv_proj_only(layer_ctx_hidden)
                     k = attn.apply_k_norm(k)
                     k = attn.apply_k_rope(positions, k)
                     k = k.view(-1, attn.num_kv_heads, attn.head_dim)
                     v = v.view(-1, attn.num_kv_heads, attn.head_dim)
 
-                    self.draft_model_runner.token_to_kv_pool.set_kv_buffer_prefix_valid(
+                    self.draft_model_runner.token_to_kv_pool.layer_router.layer(
+                        attn.attn.layer_id
+                    ).store_prefix(
                         attn.attn,
-                        cache_loc_2d,
+                        KVWriteLoc(
+                            cache_loc_2d,
+                            swa_loc=swa_cache_loc.view_as(cache_loc_2d)
+                            if swa_cache_loc is not None
+                            else None,
+                            physical=True,
+                        ),
                         commit_lens,
                         k,
                         v,
@@ -1990,6 +2031,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                         ctx_hidden=ctx_hidden,
                         ctx_positions=positions,
                         ctx_cache_loc=cache_loc,
+                        ctx_swa_cache_loc=swa_cache_loc,
                     )
                     return
                 except Exception as e:
@@ -2004,6 +2046,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 ctx_hidden=ctx_hidden,
                 ctx_positions=positions,
                 ctx_cache_loc=cache_loc,
+                ctx_swa_cache_loc=swa_cache_loc,
             )
 
     def _append_target_hidden_sequential(
@@ -2011,12 +2054,22 @@ class DFlashWorkerV2(BaseSpecWorker):
         ctx_hidden: torch.Tensor,
         ctx_positions: torch.Tensor,
         ctx_cache_loc: torch.Tensor,
+        ctx_swa_cache_loc: Optional[torch.Tensor] = None,
     ) -> None:
         for layer in self.draft_model.layers:
             attn = layer.self_attn
             layer_ctx_hidden = self.draft_model.prepare_context_hidden_for_kv(
                 layer, ctx_hidden
             )
+            if isinstance(attn, DFlashMLAAttention):
+                attn.write_context_kv(
+                    pool=self.draft_model_runner.token_to_kv_pool,
+                    positions=ctx_positions,
+                    hidden_states=layer_ctx_hidden,
+                    cache_loc=ctx_cache_loc,
+                    swa_cache_loc=ctx_swa_cache_loc,
+                )
+                continue
             if _is_npu:
                 _, k, v = attn.forward_prepare_npu(ctx_positions, layer_ctx_hidden)
                 # Keep V scaling consistent with forward().
@@ -2028,9 +2081,11 @@ class DFlashWorkerV2(BaseSpecWorker):
                 k = attn.apply_k_rope(ctx_positions, k)
             k = k.view(-1, attn.num_kv_heads, attn.head_dim)
             v = v.view(-1, attn.num_kv_heads, attn.head_dim)
-            self.draft_model_runner.token_to_kv_pool.set_kv_buffer(
+            self.draft_model_runner.token_to_kv_pool.layer_router.layer(
+                attn.attn.layer_id
+            ).store(
                 attn.attn,
-                KVWriteLoc(ctx_cache_loc, physical=True),
+                KVWriteLoc(ctx_cache_loc, swa_loc=ctx_swa_cache_loc, physical=True),
                 k,
                 v,
                 attn.attn.k_scale,
@@ -2044,6 +2099,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         ctx_cache_loc: torch.Tensor,
         ctx_cache_loc_2d: Optional[torch.Tensor] = None,
         commit_lens: Optional[torch.Tensor] = None,
+        ctx_swa_cache_loc: Optional[torch.Tensor] = None,
     ) -> None:
         """Fused KV materialization using batched projection + Triton kernel."""
         token_to_kv_pool = self.draft_model_runner.token_to_kv_pool
@@ -2057,9 +2113,15 @@ class DFlashWorkerV2(BaseSpecWorker):
         ) -> None:
             attn = self.draft_model.layers[layer_idx].self_attn.attn
             if ctx_cache_loc_2d is not None and commit_lens is not None:
-                token_to_kv_pool.set_kv_buffer_prefix_valid(
+                token_to_kv_pool.layer_router.layer(attn.layer_id).store_prefix(
                     attn,
-                    ctx_cache_loc_2d,
+                    KVWriteLoc(
+                        ctx_cache_loc_2d,
+                        swa_loc=ctx_swa_cache_loc.view_as(ctx_cache_loc_2d)
+                        if ctx_swa_cache_loc is not None
+                        else None,
+                        physical=True,
+                    ),
                     commit_lens,
                     cache_k,
                     cache_v,
@@ -2067,9 +2129,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                     attn.v_scale,
                 )
             else:
-                token_to_kv_pool.set_kv_buffer(
+                token_to_kv_pool.layer_router.layer(attn.layer_id).store(
                     attn,
-                    KVWriteLoc(ctx_cache_loc, physical=True),
+                    KVWriteLoc(ctx_cache_loc, swa_loc=ctx_swa_cache_loc, physical=True),
                     cache_k,
                     cache_v,
                     attn.k_scale,
@@ -2277,6 +2339,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 simulate_acc_method=SIMULATE_ACC_METHOD,
                 simulate_acc_token_mode=SIMULATE_ACC_TOKEN_MODE,
                 next_token_logits=next_token_logits,
+                generator=self._simulated_acc_len_rng,
             )
             # The Triton path may have written new_seq_lens from the real
             # accept_len; recompute it from the forced commit_lens.
@@ -2349,9 +2412,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                 batch,
                 pp_proxy_tensors=pp_proxy_tensors,
                 capture_hidden_mode=CaptureHiddenMode.FULL,
-                return_kv_loc_plan=True,
+                return_iteration_ids=True,
             )
-            kv_loc_plan, batch_output.kv_loc_plan = batch_output.kv_loc_plan, None
+            iteration_ids, batch_output.iteration_ids = batch_output.iteration_ids, None
 
             logits_output, next_token_ids = (
                 batch_output.logits_output,
@@ -2407,7 +2470,10 @@ class DFlashWorkerV2(BaseSpecWorker):
             # The draft KV goes to the slots the target prefill just wrote.
             self._append_target_hidden_to_draft_kv_by_loc(
                 target_hidden=logits_output.hidden_states,
-                cache_loc=self._draft_write_ids(kv_loc_plan),
+                cache_loc=self._draft_write_ids(iteration_ids),
+                swa_cache_loc=self._draft_write_ids(
+                    iteration_ids, IdSpaceKind.SLIDING_WINDOW
+                ),
                 positions=positions,
                 extend_lens=ctx_lens,
             )
@@ -2585,7 +2651,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         verify_out_cache_loc = verify_out_cache_loc_2d.reshape(-1)
         # The iteration's window -- the draft block, the verify and the
         # target-hidden KV writes all write it -- planned once.
-        kv_loc_plan = self.target_worker.model_runner.kv_index_translator.plan(
+        iteration_ids = self.target_worker.model_runner.runner_ids.plan(
             req_pool_indices=batch.req_pool_indices,
             seq_lens=prefix_lens,
             seq_lens_cpu=(
@@ -2660,16 +2726,16 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         # The draft block writes the whole window. A compact draft reads its
         # own `req_to_token` rows over its own lengths.
-        draft_translator = self.draft_model_runner.kv_index_translator
+        draft_translator = self.draft_model_runner.runner_ids
         draft_plan = (
-            kv_loc_plan.reads_from(
+            iteration_ids.reads_from(
                 draft_translator,
                 seq_lens=draft_seq_lens,
                 seq_lens_cpu=seq_lens_cpu,
                 read_extent=block_size,
             )
             if self.use_compact_draft_cache
-            else kv_loc_plan
+            else iteration_ids
         )
         draft_plan.bind(forward_batch, draft_translator)
 
@@ -2827,7 +2893,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_token_num=int(self.block_size),
             custom_mask=custom_mask,
             capture_hidden_mode=CaptureHiddenMode.FULL,
-            kv_loc_plan=kv_loc_plan,
+            iteration_ids=iteration_ids,
         )
 
         batch.out_cache_loc = verify_out_cache_loc
@@ -2982,11 +3048,14 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         # Consume in this step: every decode graph size shares one aux output,
         # which the next target forward overwrites (resolve_aux_hidden_states_width).
-        cache_loc = self._draft_write_ids(kv_loc_plan)
+        cache_loc = self._draft_write_ids(iteration_ids)
         self._append_target_hidden_to_draft_kv_by_loc(
             target_hidden=hidden.reshape(-1, hidden.shape[-1]),
             cache_loc=cache_loc,
             cache_loc_2d=cache_loc.view(verify_out_cache_loc_2d.shape),
+            swa_cache_loc=self._draft_write_ids(
+                iteration_ids, IdSpaceKind.SLIDING_WINDOW
+            ),
             positions=positions,
             commit_lens=commit_lens,
         )
@@ -3011,4 +3080,5 @@ class DFlashWorkerV2(BaseSpecWorker):
             new_seq_lens=new_seq_lens,
             routed_experts_output=target_out.routed_experts_output,
             indexer_topk_output=target_out.indexer_topk_output,
+            kv_weight_version_record=target_out.kv_weight_version_record,
         )
