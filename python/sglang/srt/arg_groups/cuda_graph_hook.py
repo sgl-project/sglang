@@ -256,9 +256,22 @@ def disable_breakable_cudagraph_if_incompatible(server_args: Any):
 
 
 def disable_full_prefill_cudagraph_if_incompatible(server_args: Any):
-    """Full prefill CG: empty rule list today; see the experimental warning."""
+    """Full prefill CG: disable for incompatible architectures."""
     cfg = resolving_view(server_args)
-    rules = []
+    from sglang.srt.configs.hybrid_arch import mambaish_config
+
+    def _is_hybrid_linear_model():
+        model_cfg = model_config_of(server_args)
+        if model_cfg is None:
+            return False
+        return mambaish_config(model_cfg) is not None
+
+    rules = [
+        (
+            "hybrid linear attention models (GDN/KDA/Mamba)",
+            _is_hybrid_linear_model,
+        ),
+    ]
     for name, predicate in rules:
         if predicate():
             logger.warning(
@@ -452,6 +465,15 @@ def validate_cuda_graph_config(server_args: Any):
                 f"--cuda-graph-config[{phase}].backend={backend!r} not allowed; "
                 f"allowed: {ALLOWED_BACKENDS_PER_PHASE[phase]}"
             )
+    if cfg.cuda_graph_config.prefill.backend == Backend.FULL:
+        model_cfg = model_config_of(server_args)
+        if model_cfg is not None:
+            from sglang.srt.configs.hybrid_arch import mambaish_config
+
+            if mambaish_config(model_cfg) is not None:
+                raise ValueError(
+                    "Full prefill CUDA graph is incompatible with hybrid linear attention models (GDN/KDA/Mamba)."
+                )
 
 
 def _resolve_max_context_size(

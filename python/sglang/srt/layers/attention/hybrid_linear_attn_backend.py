@@ -843,6 +843,11 @@ class MambaAttnBackendBase(AttentionBackend):
                     seq_lens_cpu == self._graph_seq_len_fill_value
                 )
         num_padding = int(num_padding)
+        if not self.state_indices_list or bs > len(self.state_indices_list):
+            raise RuntimeError(
+                f"HybridLinearAttnBackend state_indices_list is uninitialized for bs={bs}. "
+                "Ensure init_cuda_graph_state() was called prior to replay or graph capture."
+            )
         if self._fused_state_indices_ok and self.replayssm_write_pos_list is None:
             # Single-launch fast path: mapping gather + padding sentinel + store
             # into the static buffer, plus zeroing padded req_pool_indices rows —
