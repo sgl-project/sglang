@@ -1472,10 +1472,9 @@ class DeepseekV2MoE(nn.Module):
                 pre_quant_input=pre_quant_input,
             )
         else:
-            final_hidden_states = self.experts(
-                hidden_states,
-                topk_output,
-            )
+            from sglang.srt.layers.moe.prefill_moe_tile import run_prefill_experts
+
+            final_hidden_states = run_prefill_experts(self, hidden_states, topk_output)
         if (
             not _is_cuda
             and not _is_musa
