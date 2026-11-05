@@ -39,10 +39,11 @@ from sglang.srt.disaggregation.common.utils import (
     build_dcp_token_transfer_plan,
     group_concurrent_contiguous,
     pack_int_lists,
+    run_on_device,
     unpack_int_lists,
 )
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.utils import (
-    DisaggregationMode,
     build_dsa_tail_transfer_blocks,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
@@ -82,6 +83,7 @@ _PREPARED_STATE_TYPES = frozenset(
     (
         StateType.MAMBA,
         StateType.SWA,
+        StateType.AUXILIARY_SWA,
         StateType.DSA,
         StateType.QSA_PENDING,
         StateType.QSA_COMPRESSED,
@@ -377,14 +379,14 @@ class KVArgsRegisterInfo:
     def from_zmq(cls, msg: List[bytes]):
         dst_kv_ptrs = list(struct.unpack(f"{len(msg[5]) // 8}Q", msg[5]))
         dst_kv_mem_kinds = (
-            _unpack_kv_mem_kinds(msg[17], len(dst_kv_ptrs))
-            if len(msg) > 17
+            _unpack_kv_mem_kinds(msg[18], len(dst_kv_ptrs))
+            if len(msg) > 18
             else ["VRAM"] * len(dst_kv_ptrs)
         )
-        dst_kv_item_len = int(msg[11].decode("ascii"))
+        dst_kv_item_len = int(msg[12].decode("ascii"))
         dst_kv_item_lens = (
-            list(struct.unpack(f"{len(msg[18]) // 8}Q", msg[18]))
-            if len(msg) > 18 and msg[18] != b""
+            list(struct.unpack(f"{len(msg[19]) // 8}Q", msg[19]))
+            if len(msg) > 19 and msg[19] != b""
             else [dst_kv_item_len] * len(dst_kv_ptrs)
         )
         if len(dst_kv_item_lens) != len(dst_kv_ptrs):
@@ -393,23 +395,23 @@ class KVArgsRegisterInfo:
                 f"got {len(dst_kv_item_lens)}, expected {len(dst_kv_ptrs)}"
             )
         dst_state_data_ptrs = (
-            unpack_int_lists(msg[7], "Q") if len(msg) > 7 and msg[7] != b"" else []
+            unpack_int_lists(msg[8], "Q") if len(msg) > 8 and msg[8] != b"" else []
         )
         dst_state_item_lens = (
-            unpack_int_lists(msg[12], "I") if len(msg) > 12 and len(msg[12]) > 0 else []
-        )
-        dst_state_dim_per_tensor = (
             unpack_int_lists(msg[13], "I") if len(msg) > 13 and len(msg[13]) > 0 else []
         )
+        dst_state_dim_per_tensor = (
+            unpack_int_lists(msg[14], "I") if len(msg) > 14 and len(msg[14]) > 0 else []
+        )
         dst_num_slots = (
-            int(msg[16].decode("ascii")) if len(msg) > 16 and msg[16] != b"" else None
+            int(msg[17].decode("ascii")) if len(msg) > 17 and msg[17] != b"" else None
         )
         dst_state_layer_ids = (
-            unpack_int_lists(msg[19], "I") if len(msg) > 19 and len(msg[19]) > 0 else []
+            unpack_int_lists(msg[20], "I") if len(msg) > 20 and len(msg[20]) > 0 else []
         )
         dst_kv_layer_ids = (
-            list(struct.unpack(f"{len(msg[20]) // 4}I", msg[20]))
-            if len(msg) > 20 and msg[20] != b""
+            list(struct.unpack(f"{len(msg[21]) // 4}I", msg[21]))
+            if len(msg) > 21 and msg[21] != b""
             else []
         )
 
@@ -423,40 +425,38 @@ class KVArgsRegisterInfo:
             dst_kv_mem_kinds=dst_kv_mem_kinds,
             dst_aux_ptrs=list(struct.unpack(f"{len(msg[6]) // 8}Q", msg[6])),
             dst_aux_item_lens=(
-                list(struct.unpack(f"{len(msg[24]) // 8}Q", msg[24]))
-                if len(msg) > 24
-                else None
+                list(struct.unpack(f"{len(msg[7]) // 8}Q", msg[7])) if msg[7] else None
             ),
             dst_state_data_ptrs=dst_state_data_ptrs,
-            gpu_id=int(msg[8].decode("ascii")),
-            decode_tp_size=int(msg[9].decode("ascii")),
-            decode_tp_rank=int(msg[10].decode("ascii")),
+            gpu_id=int(msg[9].decode("ascii")),
+            decode_tp_size=int(msg[10].decode("ascii")),
+            decode_tp_rank=int(msg[11].decode("ascii")),
             dst_kv_item_len=dst_kv_item_len,
             dst_kv_item_lens=dst_kv_item_lens,
             dst_kv_layer_ids=dst_kv_layer_ids,
-            # msg[19:21] are the layer-id frames above; DCP trails them.
+            # msg[20:22] are the layer-id frames above; DCP trails them.
             dst_dcp_size=(
-                int(msg[21].decode("ascii")) if len(msg) > 21 and msg[21] != b"" else 1
+                int(msg[22].decode("ascii")) if len(msg) > 22 and msg[22] != b"" else 1
             ),
             dst_dcp_rank=(
-                int(msg[22].decode("ascii")) if len(msg) > 22 and msg[22] != b"" else 0
+                int(msg[23].decode("ascii")) if len(msg) > 23 and msg[23] != b"" else 0
             ),
             dst_num_slots=dst_num_slots,
             dst_state_item_lens=dst_state_item_lens,
             dst_state_dim_per_tensor=dst_state_dim_per_tensor,
             dst_state_layer_ids=dst_state_layer_ids,
             staging_base_ptr=(
-                struct.unpack("Q", msg[14])[0]
-                if len(msg) > 14 and len(msg[14]) == 8
+                struct.unpack("Q", msg[15])[0]
+                if len(msg) > 15 and len(msg[15]) == 8
                 else 0
             ),
             staging_total_size=(
-                int(msg[15].decode("ascii")) if len(msg) > 15 and msg[15] != b"" else 0
+                int(msg[16].decode("ascii")) if len(msg) > 16 and msg[16] != b"" else 0
             ),
-            # Frame 23 is absent on decodes that predate prepared state transfers.
+            # Frame 24 is absent on decodes that predate prepared state transfers.
             dst_state_data_lens=(
-                unpack_int_lists(msg[23], "Q")
-                if len(msg) > 23 and len(msg[23]) > 0
+                unpack_int_lists(msg[24], "Q")
+                if len(msg) > 24 and len(msg[24]) > 0
                 else []
             ),
         )
@@ -679,9 +679,17 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     if self.enable_staging and self._staging_ctx.buffers
                     else None
                 )
+                # Bind to this rank's device: transfer_worker makes device calls
+                # (the DCP pack's stream switch) that would otherwise use device 0.
                 threading.Thread(
-                    target=self.transfer_worker,
-                    args=(queue, staging_buffer, i),
+                    target=run_on_device,
+                    args=(
+                        self.kv_args.gpu_id,
+                        self.transfer_worker,
+                        queue,
+                        staging_buffer,
+                        i,
+                    ),
                     daemon=True,
                 ).start()
             self._start_bootstrap_thread()
@@ -3193,7 +3201,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     force_flat=True,
                 )
             elif (
-                st == StateType.SWA
+                st in (StateType.SWA, StateType.AUXILIARY_SWA)
                 and not self.is_mla_backend
                 and self.attn_tp_size != decode_tp_size
             ):
@@ -3211,6 +3219,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 )
             elif st in (
                 StateType.SWA,
+                StateType.AUXILIARY_SWA,
                 StateType.BLOCK_SCALE,
                 StateType.BLOCK_SCALE_SWA,
                 StateType.QSA_PENDING,
@@ -3494,7 +3503,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             dst_kv_item_len = 0
             dst_num_slots = 0
 
-        message = [
+        return [
             GUARD,
             "None".encode("ascii"),
             self.local_ip.encode("ascii"),
@@ -3503,6 +3512,14 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             self.agent.get_agent_metadata(),
             packed_kv_data_ptrs,
             packed_aux_data_ptrs,
+            # Always sent, empty unless customized-info transfer is enabled.
+            (
+                struct.pack(
+                    f"{len(self.kv_args.aux_item_lens)}Q", *self.kv_args.aux_item_lens
+                )
+                if self.customized_info_enabled
+                else b""
+            ),
             packed_state_data_ptrs,
             str(self.kv_args.gpu_id).encode("ascii"),
             str(self.attn_tp_size).encode("ascii"),
@@ -3521,13 +3538,6 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             str(self.dcp_rank).encode("ascii"),
             packed_state_data_lens,
         ]
-        if self.customized_info_enabled:
-            message.append(
-                struct.pack(
-                    f"{len(self.kv_args.aux_item_lens)}Q", *self.kv_args.aux_item_lens
-                )
-            )
-        return message
 
     def build_receiver_metadata_message(
         self,
