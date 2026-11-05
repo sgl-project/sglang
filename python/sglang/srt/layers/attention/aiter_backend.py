@@ -456,6 +456,7 @@ class AiterAttnBackend(AttentionBackend):
     # declare here to avoid CI failure in test_aiter_fp8_q_unified_attention.py
     use_mla_auto_kv_splits: bool = False
     use_mla_fp8_q_asm: bool = False
+    use_mla_dcp_asm: bool = False
 
     # Set in __init__; declared here for tests that build the backend without it
     # (test_aiter_fp8_kv_scales_paths.py).
@@ -1781,6 +1782,8 @@ class AiterAttnBackend(AttentionBackend):
         reduce_final_map = self.forward_metadata.reduce_final_map
         reduce_partial_map = self.forward_metadata.reduce_partial_map
         num_kv_splits = self._kernel_num_kv_splits()
+        # The kernel takes the intra_batch_mode its metadata was planned with.
+        _, planned_intra_batch_mode = self._mla_decode_metadata_modes()
 
         return self._mla_decode_fwd_with_head_pad(
             q,
@@ -1801,7 +1804,7 @@ class AiterAttnBackend(AttentionBackend):
             reduce_partial_map=reduce_partial_map,
             q_scale=k_descale,
             kv_scale=k_descale,
-            intra_batch_mode=intra_batch_mode,
+            intra_batch_mode=planned_intra_batch_mode,
             num_kv_splits=num_kv_splits,
         )
 
@@ -4253,7 +4256,9 @@ class AiterAttnBackend(AttentionBackend):
                 reduce_final_map = self.forward_metadata.reduce_final_map
                 reduce_partial_map = self.forward_metadata.reduce_partial_map
 
-                num_kv_splits = self.forward_metadata.num_kv_splits
+                num_kv_splits = self._kernel_num_kv_splits()
+                # DCP verify returned above, so the decode modes planned this metadata.
+                _, planned_intra_batch_mode = self._mla_decode_metadata_modes()
 
                 o = self._mla_decode_fwd_with_head_pad(
                     q,
@@ -4274,7 +4279,7 @@ class AiterAttnBackend(AttentionBackend):
                     reduce_partial_map=reduce_partial_map,
                     q_scale=k_descale,
                     kv_scale=k_descale,
-                    intra_batch_mode=intra_batch_mode,
+                    intra_batch_mode=planned_intra_batch_mode,
                     num_kv_splits=num_kv_splits,
                 )
                 return o

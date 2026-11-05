@@ -638,6 +638,82 @@ class TestFp8QAsmPersistScope(CustomTestCase):
             self.assertEqual(eligible._mla_decode_metadata_modes(), (True, False))
 
 
+class TestFp8QAsmLaunchMatchesPlan(CustomTestCase):
+    """Decode and verify launch with the schedule their metadata was planned with."""
+
+    def _launch_kwargs(self, *, verify, auto_kv_splits):
+        from sglang.srt.layers.attention import aiter_backend
+        from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
+
+        qlen = 8 if verify else 1
+        be = AiterAttnBackend.__new__(AiterAttnBackend)
+        be.use_mla = True
+        be.num_head = 12
+        be.head_pad_mode = "zero"
+        be.kv_cache_dtype = fp8_dtype
+        be.mla_kernel_num_head_padded = 16
+        be.dcp_world_size = 1
+        be.use_mla_dcp_asm = False
+        be.use_mla_fp8_q_asm = True
+        be.use_mla_auto_kv_splits = auto_kv_splits
+        be.mla_decode_backend = "asm"
+        be.mla_verify_backend = "asm"
+        be.k_scale = be.v_scale = torch.tensor([1.0])
+        layer_kv = mock.Mock()
+        layer_kv.key.return_value = torch.zeros(8, 1, 576, dtype=fp8_dtype)
+        layer_kv.value.return_value = torch.zeros(8, 1, 512, dtype=fp8_dtype)
+        be.token_to_kv_pool = mock.Mock()
+        be.token_to_kv_pool.layer_router.read.return_value = layer_kv
+        # make_mla_meta_data takes -1 as the auto split cap.
+        be.forward_metadata = mock.Mock(
+            max_q_len=qlen, num_kv_splits=-1 if auto_kv_splits else 32
+        )
+        be._mla_decode_fwd_with_head_pad = mock.Mock(
+            return_value=torch.zeros(qlen, 12, 512)
+        )
+        q = torch.zeros(qlen, 12, 576, dtype=torch.bfloat16)
+        with (
+            mock.patch.object(aiter_backend, "_use_mla_ps_kernel", False),
+            mock.patch.object(aiter_backend, "fast_mode", False),
+            mock.patch.object(aiter_backend, "intra_batch_mode", False),
+            mock.patch.object(
+                aiter_backend, "prefer_mla_gluon_decode", return_value=True
+            ),
+            mock.patch.object(aiter_backend, "is_gfx95_supported", return_value=True),
+        ):
+            if verify:
+                forward_batch = mock.Mock(attn_attend_prefix_cache=False)
+                forward_batch.forward_mode.is_target_verify.return_value = True
+                forward_batch.forward_mode.is_draft_extend_v2.return_value = False
+                be.forward_extend(
+                    q,
+                    torch.zeros(qlen, 1, 576, dtype=torch.bfloat16),
+                    torch.zeros(qlen, 1, 512, dtype=torch.bfloat16),
+                    _layer(),
+                    forward_batch,
+                    save_kv_cache=False,
+                )
+            else:
+                be._forward_mla_decode(q, _layer(), mock.Mock(), k_descale=1.0)
+        return be._mla_decode_fwd_with_head_pad.call_args.kwargs
+
+    def test_launch_takes_the_planned_intra_batch_mode(self):
+        """Under PERSIST=0 the module intra_batch_mode is off, but the opt-in plans
+        with the PERSIST=1 schedule (intra_batch_mode on); the launch must match."""
+        for verify in (False, True):
+            with self.subTest(verify=verify):
+                kwargs = self._launch_kwargs(verify=verify, auto_kv_splits=False)
+                self.assertTrue(kwargs["intra_batch_mode"])
+
+    def test_auto_kv_splits_reach_the_kernel_as_none(self):
+        """mla_decode_fwd reads -1 as a real split count; None lets aiter pick."""
+        for verify in (False, True):
+            with self.subTest(verify=verify):
+                kwargs = self._launch_kwargs(verify=verify, auto_kv_splits=True)
+                self.assertIsNone(kwargs["num_kv_splits"])
+                self.assertFalse(kwargs["intra_batch_mode"])
+
+
 class TestFp8QAsmQueryCast(CustomTestCase):
     def _run_decode(
         self, *, enabled, qlen, query_dtype=torch.bfloat16, persistent=True, q_max=1.0
