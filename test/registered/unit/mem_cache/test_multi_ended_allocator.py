@@ -2171,7 +2171,6 @@ class TestPagedBand(unittest.TestCase):
     # OOB kernel inputs.
     def test_paged_pool_translate_helper_returns_physical_tokens(self):
         from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
-        from sglang.srt.mem_cache.kv.alloc.interim import _virtual_tokens_to_physical
 
         full_spec = MHASubPoolSpec(
             name="full",
@@ -2219,7 +2218,7 @@ class TestPagedBand(unittest.TestCase):
         v_tokens = allocator.alloc(2 * PS)
         self.assertIsNotNone(v_tokens)
 
-        swa_phys = _virtual_tokens_to_physical(v_tokens, allocator.swa_attn_allocator)
+        swa_phys = allocator.swa_attn_allocator.ids.translate(v_tokens)
 
         self.assertTrue(
             bool((swa_phys >= 0).all().item()),
@@ -2979,16 +2978,23 @@ class TestChainFrontierWalk(unittest.TestCase):
 
     def test_multi_hop_walk_stops_at_first_opaque(self):
         _, fa, ma = self._build_pair()
-        t1 = _ChainStub(low_byte=100, high_byte=100, transparent=True)
-        t2 = _ChainStub(low_byte=200, high_byte=260, transparent=False)
+        low = fa._byte_high_frontier()
+        gap = ma._byte_low_frontier() - low
+        self.assertGreater(gap, 0)
+        t1_pos = low + gap // 4
+        t2_lo, t2_hi = low + gap // 2, low + 3 * gap // 4
+        t1 = _ChainStub(low_byte=t1_pos, high_byte=t1_pos, transparent=True)
+        t2 = _ChainStub(low_byte=t2_lo, high_byte=t2_hi, transparent=False)
         fa.bind_high_peer(t1)
         t1.low_peer = fa
         t1.high_peer = t2
         t2.low_peer = t1
         t2.high_peer = ma
         ma.bind_low_peer(t2)
-        self.assertEqual(fa._current_gap_bytes(), 200 - fa._byte_high_frontier())
+        self.assertEqual(fa._current_gap_bytes(), t2_lo - fa._byte_high_frontier())
         self.assertIs(fa._growth_side_neighbor(), t2)
+        self.assertEqual(ma._current_gap_bytes(), ma._byte_low_frontier() - t2_hi)
+        self.assertIs(ma._growth_side_neighbor(), t2)
         t2.transparent = True
         self.assertIs(fa._growth_side_neighbor(), ma)
         self.assertEqual(
@@ -3275,6 +3281,73 @@ class TestFloatBand(CustomTestCase):
         moved = sum(int(s.numel()) for s, _, _ in fla._inverse_history)
         self.assertEqual(moved, 2)  # min(L_live, G) == L_live
         self._check_float_state(fla, kv)
+
+    def test_joint_relief_translates_donor_bytes_to_float_grid(self):
+        from sglang.srt.mem_cache.kv.alloc.band import _float_open_short_side
+
+        specs = [
+            _make_mha_spec("low", "up", layer_num=1, head_num=1, head_dim=128),
+            _make_mha_spec("middle", "float", layer_num=1, head_num=1, head_dim=96),
+            _make_mha_spec("high", "down", layer_num=1, head_num=1, head_dim=32),
+        ]
+        arena = arena_of(specs, total_bytes=1792, device="cpu")
+        low = Band(arena=arena, sub_pool_name="low", device="cpu", is_id_owner=True)
+        middle = FloatBand(
+            arena=arena, sub_pool_name="middle", device="cpu", is_id_owner=True
+        )
+        high = Band(arena=arena, sub_pool_name="high", device="cpu", is_id_owner=True)
+        low.bind_high_peer(middle)
+        middle.bind_low_peer(low)
+        middle.bind_high_peer(high)
+        high.bind_low_peer(middle)
+        kv = _FakeKVCache(arena, "middle")
+        self.assertIsNotNone(high.alloc(1))
+        v = middle.alloc(1)
+        self._stamp(middle, kv, v)
+        middle._relocate_to_positions([int(middle.ids.virtual_to_physical[v][0])], [2])
+        self.assertEqual(middle._region_bounds_pages(), (2, 4))
+        # Raw frontiers are 512/1664, while the float's own grid is 384.
+        # The requested 512-byte low gap needs only 384 aligned float bytes.
+        _float_open_short_side(middle, {low: 1, middle: 0, high: 1})
+        self.assertEqual(int(middle.ids.virtual_to_physical[v][0]), 3)
+        self._check_float_state(middle, kv)
+        self.assertIsNotNone(high.alloc(1))
+        self.assertIsNotNone(low.alloc(1))
+
+    def test_make_room_leapfrog_preserves_opposite_gap(self):
+        for side in ("low", "high"):
+            with self.subTest(side=side):
+                _, _, fla, _, kv = self._build_tri()
+                v = fla.alloc(1)
+                self._stamp(fla, kv, v)
+                epp = fla.entry_bytes_per_page
+                before = dict(zip(("low", "high"), fla._gap_pages()))
+                ask = (before[side] + 2) * epp
+                self.assertEqual(fla.make_room(side=side, min_bytes=ask), ask)
+                after = dict(zip(("low", "high"), fla._gap_pages()))
+                other = "high" if side == "low" else "low"
+                self.assertEqual(after[other], before[other] - 2)
+                self.assertGreater(after[other], 0)
+                self._check_float_state(fla, kv)
+
+    def test_interior_pack_preserves_payload_with_mixed_move_directions(self):
+        _, _, fla, _, kv = self._build_tri()
+        v = fla.alloc(13)
+        self._stamp(fla, kv, v)
+        physical = fla.ids.virtual_to_physical[v]
+        start = int(physical.min())
+        keep = (physical == start) | (physical >= start + 8)
+        fla.free(v[~keep])
+        live = sorted(int(x) for x in physical[keep].tolist())
+        final = list(range(start + 6, start + 12))
+        self.assertTrue(any(d < src for src, d in zip(live, final)))
+        self.assertTrue(any(d > src for src, d in zip(live, final)))
+        fla._relocate_to_positions(live, final)
+        self._check_float_state(fla, kv)
+        torch.testing.assert_close(
+            fla.ids.virtual_to_physical[v[keep]],
+            torch.tensor(final, dtype=physical.dtype, device=physical.device),
+        )
 
     def test_make_room_impossible_leaves_state_unchanged(self):
         _, _, fla, _, kv = self._build_tri(n_float=8)
@@ -3693,7 +3766,6 @@ class TestDcpWidening(unittest.TestCase):
                 )
                 mamba_slots = UnifiedMambaSlotAllocator(
                     allocator.mamba_allocator,
-                    max_size=allocator.mamba_allocator.max_slots - 1,
                     device=_DEV,
                 )
 
@@ -3752,7 +3824,6 @@ class TestDcpWidening(unittest.TestCase):
             )
             mamba_slots = UnifiedMambaSlotAllocator(
                 allocator.mamba_allocator,
-                max_size=allocator.mamba_allocator.max_slots - 1,
                 device=_DEV,
             )
 
