@@ -6030,18 +6030,15 @@ class Scheduler(
         is_decode = self.disaggregation_mode == DisaggregationMode.DECODE
         is_prefill = self.disaggregation_mode == DisaggregationMode.PREFILL
         for req in self.waiting_queue.take(lambda req: recv_req.matches(req.rid)):
+            if is_prefill:
+                # A PD prefill request may hold KV its sender still reads; abort
+                # the sender before that KV is freed.
+                self.release_prefill_sender(req, abort_sender=True)
             # Without the initiator's reason the tokenizer falls back to a
             # generic abort message.
             self.request_retirer.abort_queued(
-                req,
-                finished_reason=recv_req.finished_reason,
-                checkpoint=is_decode,
-                # A PD prefill request may hold KV its sender still reads; the
-                # prefill tail aborts the sender before it frees that KV.
-                release_memory=not is_prefill,
+                req, finished_reason=recv_req.finished_reason, checkpoint=is_decode
             )
-            if is_prefill:
-                self.release_aborted_prefill_waiting_req(req)
             logger.debug(f"Abort queued request. {req.rid=}")
 
     def _abort_chunked(self, recv_req: AbortReq) -> None:

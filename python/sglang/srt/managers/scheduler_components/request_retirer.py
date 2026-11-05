@@ -23,7 +23,8 @@ class RequestRetirer:
 
     abort_queued ends a request no launched step carries and tells the
     tokenizer once; release_finished releases one a step already finished,
-    whose output goes out with the step."""
+    whose output goes out with the step; release_aborted releases one its
+    caller already aborted and streams."""
 
     def __init__(
         self,
@@ -47,7 +48,6 @@ class RequestRetirer:
         reason: Optional[FINISH_ABORT] = None,
         finished_reason: Optional[FinishReasonDict] = None,
         checkpoint: bool = False,
-        release_memory: bool = True,
     ) -> None:
         """Abort a request no launched step carries: one aborted in a queue, or
         refused at the waiting-queue door. ``reason`` is the request's own finish
@@ -60,8 +60,6 @@ class RequestRetirer:
         self.send_abort_output(
             make_abort_req(req, finished_reason=finished_reason), req
         )
-        if not release_memory:
-            return
         discard_kv_cache_backup(req, self.tree_cache)
         self.release_finished(req, checkpoint=checkpoint)
 
@@ -73,6 +71,13 @@ class RequestRetirer:
             self.hisparse_coordinator.request_finished(req)
         if req.kv.holds_kv or req.kv.holds_mamba:
             release_kv_cache(req, self.tree_cache, checkpoint=checkpoint)
+
+    def release_aborted(self, req: Req) -> None:
+        """Release what an aborted request holds, uncached: its cache-side
+        state, then its memory. The caller finishes and streams it."""
+        self.release_aborted_request(req)
+        discard_kv_cache_backup(req, self.tree_cache)
+        self.release_finished(req, checkpoint=False)
 
     # Public while `Scheduler.release_aborted_request` still delegates here.
     def release_aborted_request(self, req: Req) -> None:

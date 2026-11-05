@@ -23,6 +23,7 @@ from sglang.srt.environ import envs
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.router import PlainPoolRouter
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.scheduler_test_utils import release_only_retirer
 
 register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
@@ -255,6 +256,7 @@ class _FakeScheduler(SchedulerDisaggregationDecodeMixin):
         )
         self.req_to_token_pool = SimpleNamespace(req_to_token=req_to_token)
         self.tree_cache = None
+        self.request_retirer = Mock()
         self.enable_hisparse = False
         self.output_streamer = SimpleNamespace(stream_output=self.stream_output)
         self.metrics_reporter = SimpleNamespace(enable_metrics=True)
@@ -446,7 +448,6 @@ class TestGetNewPrebuiltBatchChecksum(unittest.TestCase):
         with (
             envs.SGLANG_IS_IN_CI.override(False),
             patch("sglang.srt.disaggregation.decode.prepare_abort") as mock_abort,
-            patch("sglang.srt.disaggregation.decode.release_kv_cache") as mock_release,
         ):
             batch = self._run_once(sched)
             self.assertIsNone(self._run_once(sched))
@@ -455,7 +456,7 @@ class TestGetNewPrebuiltBatchChecksum(unittest.TestCase):
         self.assertEqual(sched.waiting_queue, [])
         self.assertEqual(sched.streamed_aborts, [req])
         mock_abort.assert_called_once()
-        mock_release.assert_called_once()
+        sched.request_retirer.release_aborted.assert_called_once_with(req)
         sched.metrics_collector.increment_transfer_failed_reqs.assert_called_once_with()
 
     def test_mismatch_raises_in_ci(self):
@@ -474,15 +475,12 @@ class TestGetNewPrebuiltBatchChecksum(unittest.TestCase):
         sched = self._make_sched(_SENTINEL)
         req = _make_req(0xDEADBEEF, self.num_pages, rid="HEALTH_CHECK_1")
         sched.waiting_queue = [req]
-        with (
-            patch("sglang.srt.disaggregation.decode.prepare_abort") as mock_abort,
-            patch("sglang.srt.disaggregation.decode.release_kv_cache") as mock_release,
-        ):
+        with patch("sglang.srt.disaggregation.decode.prepare_abort") as mock_abort:
             batch = self._run_once(sched)
         self.assertEqual(batch.reqs, [req])
         self.assertEqual(sched.streamed_aborts, [])
         mock_abort.assert_not_called()
-        mock_release.assert_not_called()
+        sched.request_retirer.release_aborted.assert_not_called()
 
     def test_injected_mismatch_aborts_without_raising_in_ci(self):
         """The injector must not trip the in-CI raise it exists to exercise."""
@@ -493,7 +491,6 @@ class TestGetNewPrebuiltBatchChecksum(unittest.TestCase):
             envs.SGLANG_IS_IN_CI.override(True),
             envs.SGLANG_TEST_DISAGG_KV_CHECKSUM_MISMATCH_PROB.override(1.0),
             patch("sglang.srt.disaggregation.decode.prepare_abort") as mock_abort,
-            patch("sglang.srt.disaggregation.decode.release_kv_cache"),
         ):
             self.assertIsNone(self._run_once(sched))
         self.assertEqual(sched.streamed_aborts, [req])
@@ -507,7 +504,6 @@ class TestGetNewPrebuiltBatchChecksum(unittest.TestCase):
         with (
             envs.SGLANG_IS_IN_CI.override(False),
             patch("sglang.srt.disaggregation.decode.prepare_abort"),
-            patch("sglang.srt.disaggregation.decode.release_kv_cache"),
         ):
             batch = self._run_once(
                 sched, reduce=lambda flags, group, op: [1] * len(flags)
@@ -572,7 +568,6 @@ class TestGetNewPrebuiltBatchChecksum(unittest.TestCase):
         with (
             envs.SGLANG_IS_IN_CI.override(False),
             patch("sglang.srt.disaggregation.decode.prepare_abort") as mock_abort,
-            patch("sglang.srt.disaggregation.decode.release_kv_cache"),
         ):
             batch = self._run_once(sched)
         self.assertEqual(batch.reqs, [skipped])
@@ -585,18 +580,24 @@ class TestKvChecksumMismatchHiSparse(unittest.TestCase):
         # Transfer already admitted the request into HiSparse; the abort must
         # free its host pages before the KV itself.
         sched = _FakeScheduler(None, None)
-        sched.enable_hisparse = True
         calls = []
-        sched.hisparse_coordinator = Mock()
-        sched.hisparse_coordinator.request_finished.side_effect = lambda req: (
-            calls.append(("hisparse", req))
+        hisparse_coordinator = Mock()
+        hisparse_coordinator.request_finished.side_effect = lambda req: calls.append(
+            ("hisparse", req)
         )
+        sched.request_retirer = release_only_retirer(Mock(), hisparse_coordinator)
         req = _make_req(0xDEADBEEF, 4)
+        req.kv = SimpleNamespace(
+            holds_kv=True, holds_mamba=False, retraction_backup=None
+        )
+        req.cache_request_handle = None
+        req.session = None
+        req.release_mm_inputs_on_abort = Mock()
         with (
             envs.SGLANG_IS_IN_CI.override(False),
             patch("sglang.srt.disaggregation.decode.prepare_abort"),
             patch(
-                "sglang.srt.disaggregation.decode.release_kv_cache",
+                "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache",
                 side_effect=lambda req, *a, **kw: calls.append(("kv", req)),
             ),
         ):

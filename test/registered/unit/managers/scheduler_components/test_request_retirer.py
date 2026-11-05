@@ -1,9 +1,14 @@
 import ast
 import pathlib
 import unittest
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import sglang
+from sglang.srt.managers.scheduler_components import request_retirer
+from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import release_only_retirer
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
@@ -16,16 +21,8 @@ _SKIPPED = ("mem_cache/", "managers/scheduler_components/request_retirer.py")
 # The functions outside `RequestRetirer` that still run a release step
 # themselves. It only shrinks: a new exit goes through `RequestRetirer`.
 _STEP_CALLERS = {
-    "disaggregation/decode.py:DecodePreallocQueue.pop_preallocated",
-    "disaggregation/decode.py:DecodeTransferQueue._release_request",
-    "disaggregation/decode.py:SchedulerDisaggregationDecodeMixin._handle_kv_checksum_mismatch",
     "disaggregation/prefill.py:PrefillBootstrapQueue._abort",
-    "disaggregation/prefill.py:SchedulerDisaggregationPrefillMixin._retire_aborted_prefill_result",
-    "disaggregation/prefill.py:SchedulerDisaggregationPrefillMixin.handle_bootstrap_failure",
-    "disaggregation/prefill.py:SchedulerDisaggregationPrefillMixin.handle_inflight_transfer_failure",
     "disaggregation/prefill.py:SchedulerDisaggregationPrefillMixin.optimistic_release_and_requeue",
-    "disaggregation/prefill.py:SchedulerDisaggregationPrefillMixin.process_disagg_prefill_transfer_queue",
-    "disaggregation/prefill.py:SchedulerDisaggregationPrefillMixin.release_aborted_prefill_waiting_req",
     "managers/schedule_batch.py:release_req",
     "managers/scheduler.py:Scheduler.process_pending_chunked_abort",
     "managers/scheduler.py:Scheduler.release_aborted_request",
@@ -64,6 +61,34 @@ def _step_callers() -> set:
 class TestReleaseStepsLiveInRequestRetirer(CustomTestCase):
     def test_only_allowlisted_functions_run_a_release_step(self):
         self.assertEqual(_step_callers(), _STEP_CALLERS)
+
+
+class TestReleaseAborted(CustomTestCase):
+    def test_drops_cache_side_state_before_an_uncached_release(self):
+        # A PD transfer or bootstrap failure, or a checksum mismatch, must also
+        # cancel the attempt's cache work and free its streaming session.
+        calls = []
+        tree_cache = MagicMock()
+        tree_cache.finish.side_effect = lambda handle, outcome: calls.append(outcome)
+        req = SimpleNamespace(
+            cache_request_handle=object(),
+            session=SimpleNamespace(
+                streaming=True, abort_req=lambda: calls.append("session")
+            ),
+            release_mm_inputs_on_abort=lambda: calls.append("mm"),
+            kv=SimpleNamespace(
+                holds_kv=True, holds_mamba=False, retraction_backup=None
+            ),
+        )
+
+        with patch.object(
+            request_retirer,
+            "release_kv_cache",
+            side_effect=lambda req, cache, *, checkpoint: calls.append(checkpoint),
+        ):
+            release_only_retirer(tree_cache).release_aborted(req)
+
+        self.assertEqual(calls, ["mm", CacheRequestOutcome.ABORT, "session", False])
 
 
 if __name__ == "__main__":
