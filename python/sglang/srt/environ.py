@@ -337,6 +337,9 @@ class Envs:
     SGLANG_ENABLE_REQUEST_DECOMPRESSION = EnvBool(False)
     # Override parsed request fields from headers.
     SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES = EnvBool(False)
+    # Encode cumulative /generate logprob stream chunks from each list's cached
+    # JSON; the bytes are the same either way, so this only turns the cache off.
+    SGLANG_ENABLE_CACHED_STREAM_ENCODING = EnvBool(True)
     DISABLE_OPENAPI_DOC = EnvBool(False)
     SGLANG_TIMEOUT_KEEP_ALIVE = EnvInt(5)
     # Uvicorn multiprocess supervisor pings each worker on this interval; default 5s is

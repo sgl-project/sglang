@@ -52,6 +52,8 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.logprob_processor import (
     InputLogprobProcessor,
     LogprobStage,
+    PackedTokenIdsLogprobs,
+    PackedTopLogprobs,
     get_token_ids_logprobs_raw,
     get_top_logprobs_raw,
 )
@@ -292,6 +294,10 @@ class LogitsProcessorOutput:
         List[Union[List[float], torch.Tensor]]
     ] = None
     next_token_token_ids_logprobs_idx: Optional[List] = None
+    # Batch-packed device forms of the four lists above, as the samplers emit them;
+    # finalize_next_token_logprobs rebuilds the lists once they are on the host.
+    next_token_top_logprobs_packed: Optional[PackedTopLogprobs] = None
+    next_token_token_ids_logprobs_packed: Optional[PackedTokenIdsLogprobs] = None
     # Post-filter support IDs and requested behavior logprobs, bounded by server
     # capacity. Logprobs are normalized over the full realized support.
     sampling_mask_output: Optional[SamplingMaskOutput] = None
@@ -373,6 +379,33 @@ class LogitsProcessorOutput:
             if sequences is not None:
                 for i, spans in enumerate(sequences):
                     sequences[i] = [row for span in spans for row in span.tolist()]
+
+    def finalize_next_token_logprobs(self) -> None:
+        """Turn next-token top-k / token-ids logprobs into per-row host lists."""
+        if self.next_token_top_logprobs_packed is not None:
+            (
+                self.next_token_top_logprobs_val,
+                self.next_token_top_logprobs_idx,
+            ) = self.next_token_top_logprobs_packed.to_rows()
+            self.next_token_top_logprobs_packed = None
+        elif self.next_token_top_logprobs_val:
+            # One tensor per row: MLX host rows and rows relayed by PP.
+            self.next_token_top_logprobs_val = [
+                v.tolist() for v in self.next_token_top_logprobs_val
+            ]
+            self.next_token_top_logprobs_idx = [
+                x.tolist() for x in self.next_token_top_logprobs_idx
+            ]
+        if self.next_token_token_ids_logprobs_packed is not None:
+            (
+                self.next_token_token_ids_logprobs_val,
+                self.next_token_token_ids_logprobs_idx,
+            ) = self.next_token_token_ids_logprobs_packed.to_rows()
+            self.next_token_token_ids_logprobs_packed = None
+        elif self.next_token_token_ids_logprobs_val:
+            self.next_token_token_ids_logprobs_val = [
+                v.tolist() for v in self.next_token_token_ids_logprobs_val
+            ]
 
 
 @dataclasses.dataclass

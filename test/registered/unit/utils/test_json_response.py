@@ -16,12 +16,15 @@ from sglang.srt.entrypoints.openai.protocol import (
     UsageInfo,
 )
 from sglang.srt.utils.json_response import (
+    CUMULATIVE_STREAM_ENCODER_AVAILABLE,
+    CumulativeStreamEncoder,
     SGLangORJSONResponse,
     dumps_json,
     model_json_response,
     orjson_response,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 register_cpu_ci(est_time=5, suite="stage-b-test-cpu-intel")
@@ -139,6 +142,72 @@ class TestModelJSONResponse(unittest.TestCase):
         error = orjson_response({"error": "bad"}, status_code=400)
 
         self.assertIs(model_json_response(error), error)
+
+
+@unittest.skipUnless(CUMULATIVE_STREAM_ENCODER_AVAILABLE, "requires orjson.Fragment")
+class TestCumulativeStreamEncoder(CustomTestCase):
+    def test_non_append_changes_are_encoded_in_full(self):
+        """Cached JSON of a list is reused only while the chunk carries the same
+        list grown by appends; after any other change the chunk must still
+        encode exactly like dumps_json."""
+        encoder = CumulativeStreamEncoder()
+        output_ids = [5, 6, 7]
+        logprobs = [(-0.5, 5, None), (float("-inf"), 6, ' "q"\n'), (-1.5, 7, None)]
+        meta_info = {"finish_reason": None, 3: "non-str key"}
+        meta_info["output_token_logprobs"] = logprobs
+        chunk = {"text": "a", "output_ids": output_ids, "meta_info": meta_info}
+
+        def check(change):
+            self.assertEqual(encoder.encode(chunk), dumps_json(chunk), change)
+
+        check("first chunk")
+        output_ids.append(8)
+        logprobs.extend([(-2.0, 8, "\u00e9"), (-2.25, 9, None)])
+        check("appended")
+        output_ids.pop()
+        check("shorter")
+        output_ids.clear()
+        check("emptied")
+        # Small ints are shared objects: in the next two lists the entry at the
+        # old last position is the same object though the entries before differ.
+        output_ids.extend([1, 2, 7, 9])
+        check("refilled after empty")
+        output_ids = chunk["output_ids"] = [4, 4, 4, 9, 13]
+        check("another list object")
+        logprobs[-1] = (-2.5, 9, "y")
+        check("last encoded entry replaced")
+        logprobs[:] = [(-3.0 - i, i, None) for i in range(6)]
+        check("refilled with more entries")
+        del meta_info["output_token_logprobs"]
+        check("list dropped")
+        meta_info["output_token_logprobs"] = None
+        check("list replaced by null")
+        meta_info["output_token_logprobs"] = logprobs
+        logprobs.append((-9.0, 1, None))
+        check("list back, appended")
+
+    def test_last_chunk_releases_its_request(self):
+        """A batch stream keeps encoded lists only for requests that have not
+        sent their last chunk yet."""
+        encoder = CumulativeStreamEncoder()
+        output_ids = {0: [1, 2], 1: [3]}
+        for index in (0, 1):
+            encoder.encode(
+                {
+                    "index": index,
+                    "output_ids": output_ids[index],
+                    "meta_info": {"finish_reason": None},
+                }
+            )
+        output_ids[0].append(4)
+        last = {
+            "index": 0,
+            "output_ids": output_ids[0].copy(),
+            "meta_info": {"finish_reason": {"type": "length", "length": 3}},
+        }
+
+        self.assertEqual(encoder.encode(last), dumps_json(last))
+        self.assertEqual(list(encoder._requests), [1])
 
 
 if __name__ == "__main__":

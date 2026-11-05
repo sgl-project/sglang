@@ -336,6 +336,8 @@ class ReqState:
         return out
 
     # For incremental state update.
+    # Output IDs, sampling lists and detokenized logprobs are append-only within
+    # a request: utils/json_response.CumulativeStreamEncoder caches their JSON.
     # TODO(lianmin): do not initialize some lists if not needed.
     output_ids: List[int] = dataclasses.field(default_factory=list)
     canary_info: Optional[ReqStateCanaryInfo] = None

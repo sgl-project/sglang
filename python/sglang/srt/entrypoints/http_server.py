@@ -204,6 +204,8 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.auth import AuthLevel, app_has_admin_force_endpoints, auth_level
 from sglang.srt.utils.json_response import (
+    CUMULATIVE_STREAM_ENCODER_AVAILABLE,
+    CumulativeStreamEncoder,
     SGLangORJSONResponse,
     dumps_json,
     model_json_response,
@@ -936,6 +938,22 @@ async def generate_request(obj: GenerateReqInput, request: Request):
     return await serve_generate_request(obj, request)
 
 
+def _stream_chunk_encoder(
+    return_logprob: Optional[Union[List[bool], bool]],
+) -> Callable[[Any], bytes]:
+    if isinstance(return_logprob, list):
+        return_logprob = any(return_logprob)
+    if (
+        return_logprob
+        and CUMULATIVE_STREAM_ENCODER_AVAILABLE
+        and envs.SGLANG_ENABLE_CACHED_STREAM_ENCODING.get()
+        and not _global_state.tokenizer_manager.incremental_streaming_output
+    ):
+        # Cumulative chunks repeat each request's whole logprob history.
+        return CumulativeStreamEncoder().encode
+    return dumps_json
+
+
 async def serve_generate_request(obj: GenerateReqInput, request: Request):
     """Serve an admitted generate request: `generate_request` after its
     contract check. A route that admits requests with its own parser calls
@@ -945,11 +963,13 @@ async def serve_generate_request(obj: GenerateReqInput, request: Request):
     if obj.stream:
 
         async def stream_results() -> AsyncIterator[bytes]:
+            encode_chunk = _stream_chunk_encoder(return_logprob=obj.return_logprob)
             try:
                 async for out in _global_state.tokenizer_manager.generate_request(
                     obj, request
                 ):
-                    yield b"data: " + dumps_json(out) + b"\n\n"
+                    # One copy of a payload that can be megabytes; "+" copies it twice.
+                    yield b"".join((b"data: ", encode_chunk(out), b"\n\n"))
             except ValueError as e:
                 # A client disconnect also surfaces here. It's a client-side
                 # cancellation, not a server error or bad input -- log it and
