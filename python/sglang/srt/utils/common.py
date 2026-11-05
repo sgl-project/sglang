@@ -2350,8 +2350,18 @@ def configure_hf_hub_logger():
 
 
 def suppress_noisy_warnings():
-    """Suppress known noisy warnings from third-party libraries."""
+    """Suppress known noisy warnings and loggers from third-party libraries."""
     configure_hf_hub_logger()
+    filter_noisy_warnings()
+
+    # Suppress noisy third-party HTTP loggers.
+    # huggingface_hub uses httpx which logs every HTTP request at INFO level.
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
+def filter_noisy_warnings():
+    """Drop known noisy warnings from third-party libraries; logging is untouched."""
     warnings.filterwarnings(
         "ignore", category=UserWarning, message="The given NumPy array is not writable"
     )
@@ -2401,11 +2411,6 @@ def suppress_noisy_warnings():
 
         _filtered_showwarning._sglang_patched_cutlass_dsl = True
         warnings.showwarning = _filtered_showwarning
-
-    # Suppress noisy third-party HTTP loggers.
-    # huggingface_hub uses httpx which logs every HTTP request at INFO level.
-    for name in ("httpx", "httpcore"):
-        logging.getLogger(name).setLevel(logging.WARNING)
 
 
 def suppress_other_loggers():
