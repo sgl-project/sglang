@@ -233,10 +233,11 @@ class Schedule(msgspec.Struct):
         bool, "Enable prefill delayer for DP attention to reduce idle time."
     ] = False
     prefill_delayer_max_delay_passes: A[
-        int,
-        "Maximum forward passes to delay prefill. Queue-triggered delays are "
-        "bounded by --prefill-delayer-max-delay-ms instead.",
-    ] = 30
+        Optional[int],
+        "Maximum forward passes to delay prefill; defaults to 30 if unset. "
+        "Queue-triggered delays are bounded by --prefill-delayer-max-delay-ms, "
+        "and by this only when it is set.",
+    ] = None
     prefill_delayer_token_usage_low_watermark: A[
         Optional[float], "Token usage low watermark for prefill delayer."
     ] = None

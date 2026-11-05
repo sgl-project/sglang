@@ -20,6 +20,8 @@ if TYPE_CHECKING:
 
 _DEBUG_LOG = get_bool_env_var("SGLANG_PREFILL_DELAYER_DEBUG_LOG")
 
+DEFAULT_MAX_DELAY_PASSES = 30
+
 logger = logging.getLogger(__name__)
 
 
@@ -76,12 +78,19 @@ class _NegotiateOutput(NamedTuple):
 class PrefillDelayer:
     def __init__(
         self,
-        max_delay_passes: int,
+        max_delay_passes: Optional[int],
         token_usage_low_watermark: Optional[float],
         metrics_collector: Optional["SchedulerMetricsCollector"] = None,
         debug_log_enabled: bool = True,
     ):
-        self._max_delay_passes = max_delay_passes
+        # Only an explicit max_delay_passes bounds queue-triggered delays;
+        # otherwise they are bounded by max_delay_ms alone.
+        self._queue_max_delay_passes = max_delay_passes
+        self._max_delay_passes = (
+            max_delay_passes
+            if max_delay_passes is not None
+            else DEFAULT_MAX_DELAY_PASSES
+        )
         self._token_usage_low_watermark = token_usage_low_watermark
         self._debug_log_enabled = _DEBUG_LOG and debug_log_enabled
         # Queue-based trigger is opt-in: activates only when queue_min_ratio
@@ -283,23 +292,19 @@ class PrefillDelayer:
                 if self.skip_first_delayer and slot_condition:
                     self.skip_first_delayer = False
                     pass
-                elif queue_condition:
-                    # Bounded by max_delay_ms (checked above), not by
-                    # max_delay_passes.
-                    next_state = prev_state or _State()
-                    next_state = next_state.bump_delayed_count()
-                    return _NegotiateOutput(
-                        next_state=next_state,
-                        output_allow=False,
-                        output_reason="delay",
-                        **debug_info,
-                    )
                 else:
                     # Bound the wait like the "mixed" branch: on a saturated
                     # engine slot_condition may never turn false, so cap the
-                    # delay by max_delay_passes.
+                    # delay by max_delay_passes. A queue-triggered delay is
+                    # bounded by max_delay_ms (checked above), and by
+                    # max_delay_passes only when that is set explicitly.
+                    max_passes = (
+                        self._queue_max_delay_passes
+                        if queue_condition
+                        else self._max_delay_passes
+                    )
                     prev_delayed_count = prev_state.delayed_count if prev_state else 0
-                    if prev_delayed_count < self._max_delay_passes - 1:
+                    if max_passes is None or prev_delayed_count < max_passes - 1:
                         next_state = prev_state or _State()
                         next_state = next_state.bump_delayed_count()
                         return _NegotiateOutput(
