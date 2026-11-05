@@ -149,8 +149,7 @@ class Ernie5_5_MoeConfig(PretrainedConfig):
             {
                 **rs,
                 "rope_theta": rope_theta,
-                # HF renamed the key "type" -> "rope_type"; keep whichever the
-                # config carries so a new-format rope_scaling is not reset to default.
+                # Accept both "type" and "rope_type".
                 "rope_type": rs.get("rope_type", rs.get("type", "default")),
             },
         )

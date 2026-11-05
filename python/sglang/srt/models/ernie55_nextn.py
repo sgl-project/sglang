@@ -121,7 +121,8 @@ class Ernie5_5ModelNextN(nn.Module):
         zero_allocator = BumpAllocator(
             buffer_size=2, dtype=torch.float32, device=x.device
         )
-        # Only the LM head's rows (one per request) go past the indexer; KV and index-K still get every row.
+        # Only the LM head's rows (one per request) go past the indexer; KV and
+        # index-K still get every row.
         rows = None
         if (
             num_tokens > 0

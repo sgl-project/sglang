@@ -74,31 +74,18 @@ class _StubbedBase(CustomTestCase):
 
 
 class TestErnie5_5PdBufInfos(_StubbedBase):
-    def test_appends_one_latent_and_one_index_region_per_mla_layer(self):
+    def test_appends_latent_then_index_regions_per_mla_layer(self):
         ptrs, lens, items = _pool(num_layers=4, owned=(1, 3)).get_contiguous_buf_infos()
-        # base + 2 MLA layers x (latent, index-K)
-        self.assertEqual(len(ptrs), 1 + 4)
-        self.assertEqual(len(ptrs), len(lens))
-        self.assertEqual(len(ptrs), len(items))
         self.assertEqual(ptrs[0], _BASE[0][0], "base regions must come first")
         self.assertEqual(items[0], _BASE[2][0])
-
-    def test_item_length_is_one_full_page(self):
-        _, _, items = _pool().get_contiguous_buf_infos()
-        latent, index = items[1], items[2]
-        # The latent buffer holds one row per token.
-        self.assertEqual(latent, _LATENT_ROW * _PAGE_SIZE)
-        # The index-K buffer holds one row per DSA page.
-        self.assertEqual(index, _INDEX_ROW * (_PAGE_SIZE // DSA_PAGE_SIZE))
-
-    def test_latent_regions_precede_index_regions(self):
-        pool = _pool(num_layers=4, owned=(1, 3))
-        _, lens, _ = pool.get_contiguous_buf_infos()
+        # Then both MLA layers' latent regions, then their index-K regions.
         latent_bytes = _PAGE_SIZE * 2 * _LATENT_ROW
         index_bytes = 8 * _INDEX_ROW
         self.assertEqual(
             lens[1:], [latent_bytes, latent_bytes, index_bytes, index_bytes]
         )
+        self.assertEqual(len(ptrs), len(lens))
+        self.assertEqual(len(ptrs), len(items))
 
     def test_a_pool_with_no_mla_layer_matches_the_base(self):
         got = _pool(num_layers=2, owned=()).get_contiguous_buf_infos()

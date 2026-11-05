@@ -102,7 +102,8 @@ class Ernie5_5MlaAttnBackend(DeepseekSparseAttnBackend):
 
     @contextlib.contextmanager
     def read_rows(self, rows: Optional[torch.Tensor], num_rows: int):
-        """Compute only ``rows``; the other rows output zero. KV and index-K are still written for all."""
+        """Compute only ``rows``; the other rows output zero. KV and index-K are
+        still written for all."""
         # A captured top-k must stay complete.
         if rows is not None and get_global_indexer_capturer() is None:
             mask = torch.zeros(num_rows, dtype=torch.bool, device=rows.device)
@@ -131,7 +132,7 @@ class Ernie5_5MlaAttnBackend(DeepseekSparseAttnBackend):
         k_range = attn_metadata.indexer_k_start_end
         keep = self._read_rows
         if keep is not None:
-            # Unread rows get no candidates and an empty key range: top-k is all -1, DeepGEMM skips them.
+            # Unread rows get no candidates and an empty key range, so top-k is all -1.
             ks, ke = k_range
             lengths = lengths.masked_fill(~keep, 0)
             k_range = (ks, torch.where(keep, ke, ks))
@@ -191,7 +192,8 @@ class Ernie5_5MlaAttnBackend(DeepseekSparseAttnBackend):
             # Unread rows attend to nothing: no work, zero output.
             topk_length = topk_length.masked_fill(~keep, 0)
         if kv_cache.dtype == torch.bfloat16 and q_all.shape[1] == 64:
-            # The parent pads q to 128 heads on Blackwell; the 64-head build skips that copy and half the work.
+            # The parent pads q to 128 heads on Blackwell; the 64-head build skips
+            # that copy and half the work.
             o, _, _ = self._call_flash_mla_sparse_fwd(
                 q=q_all,
                 kv=kv_cache,
@@ -239,8 +241,8 @@ class Ernie5_5MlaAttnBackend(DeepseekSparseAttnBackend):
             is_fp8_kvcache=True,
             indices=page_table_1.unsqueeze(1),
             attn_sink=sink,
-            # sm90 decode kernel (splitkv_mla.cuh) asserts "V3.2 does not support dynamic topk length";
-            # rows are -1 padded, so None is equivalent there. Drop once the kernel accepts topk_length.
+            # The sm90 decode kernel rejects a dynamic topk length; the rows are
+            # -1 padded, so None is equivalent there.
             topk_length=None if self.device_sm_major < 10 else topk_length,
         )
         return o[:, 0, :num_heads]

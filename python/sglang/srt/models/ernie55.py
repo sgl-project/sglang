@@ -127,8 +127,7 @@ from sglang.srt.utils import (
 
 def check_supported_deployment(config: Ernie5_5_MoeConfig) -> None:
     """Reject the platforms and layouts this model cannot serve. Runs at model
-    construction, where the attention-TP width is final; server-arg features are
-    checked by the ERNIE 5.5 model override."""
+    construction, where the attention-TP width is final."""
     if not is_cuda():
         # The HIP / NPU prepare paths call wq_b directly and skip the gate split.
         raise ValueError("ERNIE 5.5 Flash is supported on CUDA only")
@@ -162,8 +161,9 @@ def _heads_are_split() -> bool:
 
 
 def logits_rows(forward_batch: ForwardBatch) -> Optional[torch.Tensor]:
-    """Each extend segment's last token, the rows the LM head reads in a plain prefill. None where
-    other rows may be read or the rows are sharded, or while a graph is captured."""
+    """Each extend segment's last token, the rows the LM head reads in a plain
+    prefill. None where other rows may be read or the rows are sharded, or while a
+    graph is captured."""
     if (
         forward_batch.forward_mode != ForwardMode.EXTEND
         or forward_batch._original_forward_mode == ForwardMode.IDLE
@@ -232,8 +232,8 @@ class VhaPostMix(nn.Module):
         heads = o.reshape(o.shape[0], self.num_heads, -1)
         if not self.sharded:
             return torch.matmul(self.mix, heads).reshape(o.shape)
-        # fp32 end to end: a bf16 latent and residual add measured ~1.5 GSM8K
-        # points below the folded path at attention TP 4.
+        # fp32 end to end: a bf16 latent and residual add lose accuracy against
+        # the folded path.
         heads32 = heads.float()
         latent = torch.matmul(self.vha_postmix_U.t().float(), heads32)
         latent = attn_tp_all_reduce(latent)
@@ -655,8 +655,9 @@ class Ernie5_5Moe(nn.Module):
         return routed + shared
 
     def _shared_experts_in_dispatch(self, hidden_states: torch.Tensor) -> list:
-        """Compute the shared expert in the eager DeepEP dispatch hook, after the input is quantized and
-        before the all-to-all, while the SMs idle. The returned list holds the output once the hook ran."""
+        """Compute the shared expert in the eager DeepEP dispatch hook, after the
+        input is quantized and before the all-to-all, while the SMs idle. The
+        returned list holds the output once the hook ran."""
         result = []
 
         def hook(dispatcher):
@@ -682,7 +683,8 @@ class Ernie5_5DecoderLayer(nn.Module):
         self.self_attn = self._build_self_attn(
             config, layer_id, quant_config, add_prefix("self_attn", prefix), alt_streams
         )
-        # Attention DP with whole heads per rank: replicate the dense MLP, no DP gather, all-reduce or scatter.
+        # Attention DP with whole heads per rank: replicate the dense MLP, with no
+        # DP gather, all-reduce or scatter.
         self._dense_replicated = False
         if layer_id >= config.first_k_dense_replace:
             self.mlp = Ernie5_5Moe(
@@ -763,7 +765,8 @@ class Ernie5_5DecoderLayer(nn.Module):
         return mhc_post(x, residual, post, comb)
 
     def ffn_reads_own_rows(self) -> bool:
-        """True if each row's FFN output depends on that row alone (no DP gather), so rows can be skipped."""
+        """True if each row's FFN output depends on that row alone (no DP gather),
+        so rows can be skipped."""
         return (
             self._dense_replicated
             or get_parallel().attn_dp_size == 1
@@ -778,7 +781,7 @@ class Ernie5_5DecoderLayer(nn.Module):
         all-to-all MoE, which routes each rank's own."""
         if isinstance(self.mlp, Ernie5_5Moe) and not get_moe_a2a_backend().is_none():
             if not _heads_are_split():
-                # The all-to-all routes each rank's own tokens and the rest is per token.
+                # The all-to-all routes each rank's own tokens; the rest is per token.
                 return self.mlp(x)
             if forward_batch.attn_tp_sequence_sharded:
                 return self._forward_moe_attn_tp_shard(x)
@@ -843,7 +846,8 @@ class Ernie5_5DecoderLayer(nn.Module):
         zero_allocator: BumpAllocator,
         out_rows: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Only ``out_rows`` continue past attention (KV is still written for all); needs ffn_reads_own_rows()."""
+        """Only ``out_rows`` continue past attention (KV is still written for all);
+        needs ffn_reads_own_rows()."""
         x, post, comb = self._hc_pre(
             hidden_states,
             self.hc_attn_fn,
@@ -953,7 +957,8 @@ class Ernie5_5Model(nn.Module):
         if not self.pp_group.is_last_rank:
             return PPProxyTensors({"hidden_states": hidden_states.flatten(1)})
         pre_hc_head = hidden_states.flatten(1)
-        # A draft reads every row's streams, the LM head only logits_rows(): collapse and norm just those.
+        # A draft reads every row's streams, the LM head only logits_rows():
+        # collapse and norm just those.
         rows = logits_rows(forward_batch) if hidden_states.shape[0] > 0 else None
         hidden_states = self.hc_head(
             hidden_states if rows is None else hidden_states[rows]
