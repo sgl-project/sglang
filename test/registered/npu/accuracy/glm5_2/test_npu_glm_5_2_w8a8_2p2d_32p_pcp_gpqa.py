@@ -143,7 +143,7 @@ GLM_5_2_PCP_PD_SEP_DECODE_ARGS = [
     "--mem-fraction-static",
     0.88,
     "--max-running-requests",
-    32,
+    48,
     "--attention-backend",
     "ascend",
     "--device",
