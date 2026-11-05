@@ -168,14 +168,25 @@ class TestLatentMXFP4Runtime(CustomTestCase):
         with self.assertRaisesRegex(RuntimeError, "has not been prepared"):
             projections.up(x=torch.ones(1, 3584))
 
-    def test_builder_honors_the_aiter_opt_out(self):
+    def test_builder_honors_the_aiter_and_determinism_opt_outs(self):
         """SGLANG_USE_AITER=0 must keep the BF16 latent projections even though
-        AITER is importable on the device."""
+        AITER is importable on the device. So must deterministic inference: the
+        token-count switch to lossy MXFP4 would make outputs batch dependent."""
         with mock.patch.object(latent_mxfp4_aiter_hip, "supported", return_value=True):
-            with envs.SGLANG_USE_AITER.override(False):
-                self.assertIsNone(build_latent_mxfp4_projections())
-            with envs.SGLANG_USE_AITER.override(True):
-                self.assertIsNotNone(build_latent_mxfp4_projections())
+            for use_aiter, deterministic in (
+                (False, False),
+                (True, True),
+                (True, False),
+            ):
+                with (
+                    self.subTest(use_aiter=use_aiter, deterministic=deterministic),
+                    envs.SGLANG_USE_AITER.override(use_aiter),
+                    get_context().override_server_args(
+                        enable_deterministic_inference=deterministic
+                    ),
+                ):
+                    built = build_latent_mxfp4_projections()
+                    self.assertEqual(built is not None, use_aiter and not deterministic)
 
     def test_rejects_nonpositive_token_floor(self):
         for min_tokens in (0, -1):

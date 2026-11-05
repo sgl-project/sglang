@@ -8,6 +8,7 @@ from torch import nn
 
 from sglang.kernels.ops.gemm import latent_mxfp4_aiter_hip
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils.common import print_warning_once
 
 logger = logging.getLogger(__name__)
@@ -15,6 +16,13 @@ logger = logging.getLogger(__name__)
 
 def build_latent_mxfp4_projections() -> Optional["LatentMXFP4Projections"]:
     """Per-layer holder when the device can run the MXFP4 GEMMs, else None."""
+    # MXFP4 is picked by the batch token count, which breaks batch invariance.
+    if get_exec().deterministic.enable_deterministic_inference:
+        print_warning_once(
+            "SGLANG_OPT_HIP_K3_MOE_LATENT_MXFP4 is ignored with "
+            "--enable-deterministic-inference; keeping the BF16 latent projections."
+        )
+        return None
     if not (envs.SGLANG_USE_AITER.get() and latent_mxfp4_aiter_hip.supported()):
         print_warning_once(
             "SGLANG_OPT_HIP_K3_MOE_LATENT_MXFP4 needs SGLANG_USE_AITER=1 and AITER "
