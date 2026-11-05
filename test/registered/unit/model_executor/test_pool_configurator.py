@@ -99,6 +99,7 @@ def _make_model_runner(
     mr.modelslim_cache_layout = None
     mr.is_draft_worker = False
     mr.dflash_draft_cell_size_per_token = None
+    mr.dflash_draft_loc_space_scale = 1
     mr.num_effective_layers = num_layers
     mr.start_layer = 0
     mr.end_layer = num_layers
@@ -1450,21 +1451,21 @@ class TestDflashDraftKvBudget(CustomTestCase):
                 self.assertEqual(config.dflash_draft_cell_size_per_token, expected)
                 self.assertIs(config.draft_parallel_layout, layout)
 
-    def test_dcp_replication_scales_draft_budget(self):
-        """The replicated draft pool spans every DCP virtual location."""
+    def test_dcp_draft_budget_follows_draft_loc_space_scale(self):
+        """A replicated draft pool is charged per widened location, a draft that
+        executes DCP once per target row."""
         draft_kv_per_token = 10_240
-        mr = _make_model_runner(self)
-        mr.spec_algorithm.is_dflash_family.return_value = True
-        mr.spec_aux_config = SimpleNamespace(
-            eagle_draft_num_layers=None,
-            dflash_draft_num_layers=5,
-        )
-
-        mr.dflash_draft_cell_size_per_token = draft_kv_per_token
-
         target_kv_per_token = 4 * (64 + 64) * 32 * KV_SIZE
-        for dcp_size in (1, 8):
-            with self.subTest(dcp_size=dcp_size):
+        for dcp_size, loc_space_scale in ((1, 1), (8, 8), (8, 1)):
+            mr = _make_model_runner(self)
+            mr.spec_algorithm.is_dflash_family.return_value = True
+            mr.spec_aux_config = SimpleNamespace(
+                eagle_draft_num_layers=None,
+                dflash_draft_num_layers=5,
+            )
+            mr.dflash_draft_cell_size_per_token = draft_kv_per_token
+            mr.dflash_draft_loc_space_scale = loc_space_scale
+            with self.subTest(dcp_size=dcp_size, loc_space_scale=loc_space_scale):
                 # TP=8 makes both topologies valid. The mock deliberately keeps
                 # target geometry fixed so this assertion isolates the draft term.
                 with (
@@ -1479,8 +1480,27 @@ class TestDflashDraftKvBudget(CustomTestCase):
 
                 self.assertEqual(
                     cfg._cell_size,
-                    target_kv_per_token + draft_kv_per_token * dcp_size,
+                    target_kv_per_token + draft_kv_per_token * loc_space_scale,
                 )
+
+    def test_draft_loc_space_scale(self):
+        """An MLA draft that executes DCP keeps per-rank rows; an MHA draft spans
+        the widened locs."""
+        from sglang.srt.mem_cache.kv_cache_configurator import draft_loc_space_scale
+
+        hf_config = SimpleNamespace(architectures=["DFlashDraftModel"])
+        self.assertEqual(
+            draft_loc_space_scale(
+                hf_config=hf_config, use_mla_backend=True, dcp_size=8
+            ),
+            1,
+        )
+        self.assertEqual(
+            draft_loc_space_scale(
+                hf_config=hf_config, use_mla_backend=False, dcp_size=8
+            ),
+            8,
+        )
 
     def test_hybrid_swa_budget_shrinks_by_draft_pool(self):
         """The HybridSWA budget must charge the DFLASH draft pool."""

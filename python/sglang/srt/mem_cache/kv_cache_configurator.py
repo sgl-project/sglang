@@ -21,6 +21,7 @@ from sglang.srt.configs.hybrid_arch import (
     mambaish_config,
 )
 from sglang.srt.configs.model_config import (
+    AttentionArch,
     ModelConfig,
     dsa_layer_skips_topk,
     get_dsa_index_head_dim,
@@ -67,10 +68,7 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DeepSeekV4TokenToKVPool,
     select_dsv4_kv_layout,
 )
-from sglang.srt.mem_cache.draft_kv_budget import (
-    resolve_dflash_draft_cell_size,
-    resolve_dflash_draft_rows_dcp_collapsed,
-)
+from sglang.srt.mem_cache.draft_kv_budget import resolve_dflash_draft_cell_size
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
@@ -375,28 +373,17 @@ def host_only_mamba_checkpoint() -> bool:
             "with --enable-int8-mamba-checkpoint."
         )
     return True
-def mla_draft_rows_are_dcp_collapsed(
-    *,
-    model_config: ModelConfig,
-    use_mla_backend: bool,
-    has_mambaish_state: bool,
-    is_hybrid_swa: bool,
-    kv_cache_dtype: torch.dtype,
-) -> bool:
-    """Whether a draft with this geometry keeps DCP-collapsed (physical) MLA rows;
-    see KVCacheConfigurator.draft_mla_rows_are_physical. Shared with the target's
-    pool budget, which must not charge such a draft per widened location."""
-    return (
-        get_parallel().attn_dcp_size > 1
-        and use_mla_backend
-        and not has_mambaish_state
-        and not is_hybrid_swa
-        and not is_deepseek_dsa(model_config.hf_config)
-        and not is_deepseek_v4(model_config.hf_config)
-        and not is_float4_e2m1fn_x2(kv_cache_dtype)
-        and not current_platform.is_out_of_tree()
-        and get_exec().kernel.attention_backend != "ascend"
+
+
+def draft_loc_space_scale(*, hf_config, use_mla_backend: bool, dcp_size: int) -> int:
+    """Pool rows a draft keeps per target row: dcp_size for a draft that spans the
+    widened locs untranslated, 1 for an MLA draft that executes DCP like the target."""
+    execution_width = (
+        mla_attention_dcp_size(hf_config, dcp_size=dcp_size, is_nextn=True)
+        if use_mla_backend
+        else 1
     )
+    return dcp_size // execution_width
 
 
 @dataclass(slots=True, kw_only=True)
@@ -428,9 +415,8 @@ class KVCacheConfigurator:
     memory_pool_config: Optional[MemoryPoolConfig]
     draft_parallel_layout: DraftParallelLayout | None = None
     dflash_draft_cell_size_per_token: int | None = field(init=False, default=None)
-    # The DFLASH draft pool keeps DCP-collapsed MLA rows (one per target row),
-    # so the target's budget charges it per row, not per widened location.
-    dflash_draft_rows_dcp_collapsed: bool = field(init=False, default=False)
+    # DFLASH draft pool rows per target row (the draft's loc_space_scale)
+    dflash_draft_loc_space_scale: int = field(init=False, default=1)
     draft_model_idx: Optional[int] = None
     kv_cache_dtype_str: Optional[str] = None
     extra_mamba_cache_bytes_per_req: int = 0
@@ -466,10 +452,12 @@ class KVCacheConfigurator:
                 draft_num_layers=aux.dflash_draft_num_layers,
                 attn_tp_size=self.draft_attn_tp_size,
             )
-            self.dflash_draft_rows_dcp_collapsed = (
-                resolve_dflash_draft_rows_dcp_collapsed(
-                    draft_model_config=aux.draft_model_config
-                )
+            self.dflash_draft_loc_space_scale = draft_loc_space_scale(
+                hf_config=aux.draft_model_config.hf_config,
+                use_mla_backend=(
+                    aux.draft_model_config.attention_arch == AttentionArch.MLA
+                ),
+                dcp_size=get_parallel().attn_dcp_size,
             )
         self.mambaish_config = mambaish_config(self.model_config)
         self.hybrid_gdn_config = hybrid_gdn_config(self.model_config)
@@ -643,17 +631,13 @@ class KVCacheConfigurator:
     # 2. A pool must page as its allocator does, or its last page falls short.
     @property
     def loc_space_scale(self) -> int:
-        dcp_size = get_parallel().attn_dcp_size
         if not self.is_draft_worker:
             return 1
-        execution_width = (
-            mla_attention_dcp_size(
-                self.model_config.hf_config, dcp_size=dcp_size, is_nextn=True
-            )
-            if self.use_mla_backend
-            else 1
+        return draft_loc_space_scale(
+            hf_config=self.model_config.hf_config,
+            use_mla_backend=self.use_mla_backend,
+            dcp_size=get_parallel().attn_dcp_size,
         )
-        return dcp_size // execution_width
 
     @property
     def pool_page_size(self) -> int:
