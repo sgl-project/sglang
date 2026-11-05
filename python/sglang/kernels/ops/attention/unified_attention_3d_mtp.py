@@ -47,6 +47,9 @@ try:  # gfx950 assembly MTP-verify attention (in-tree .s, assembled at first use
         AsmKernelUnavailable as _AsmKernelUnavailable,
     )
     from sglang.kernels.ops.attention.vattn_asm_gfx950 import (
+        alloc_seg_plan as _alloc_seg_plan,
+    )
+    from sglang.kernels.ops.attention.vattn_asm_gfx950 import (
         asm_kernel_available as _asm_kernel_available,
     )
     from sglang.kernels.ops.attention.vattn_asm_gfx950 import (
@@ -61,6 +64,7 @@ except ImportError:
     _reset_seg_plan_cache = None
 
 import os as _os
+from typing import Optional
 
 from sglang.srt.utils import get_hip_version, is_gfx95_supported
 
@@ -930,11 +934,15 @@ def unified_attention_3d_mtp_decode_func(
     block_table: torch.Tensor,
     k_descale: torch.Tensor,
     v_descale: torch.Tensor,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    seg_plan: Optional[tuple] = None,
 ) -> bool:
     """ASM verify-attn for decode batches (uniform q_len 1, e.g. EAGLE draft
     decode steps and plain decode).
 
-    cu_seqlens_q is a static arange (q_len 1 per sequence); the kernel
+    cu_seqlens_q is a static arange (q_len 1 per sequence; built here unless
+    the caller passes one of length num_seqs + 1); seg_plan is the alloc_seg_plan tuple, already filled
+    by the fused KV-write kernel (skips the plan launch); the kernel
     tail-aligns in-kernel, so the single real token sits on row 3 at its
     original position and rows 0-2 are store-masked. All shapes are static,
     so the path is safe under cuda-graph capture.
@@ -950,7 +958,13 @@ def unified_attention_3d_mtp_decode_func(
         return False
     num_kv_heads = k.shape[2]
     num_queries_per_kv = num_query_heads // num_kv_heads
-    cu_dec = torch.arange(0, num_seqs + 1, device=q.device, dtype=torch.int32)
+    cu_dec = cu_seqlens_q
+    if cu_dec is None or cu_dec.shape[0] != num_seqs + 1:
+        cu_dec = torch.arange(0, num_seqs + 1, device=q.device, dtype=torch.int32)
+    plan_kwargs = {}
+    if seg_plan is not None:
+        _, plan, tok_nseg, seg_max, _ = seg_plan
+        plan_kwargs = dict(plan=plan, tok_nseg=tok_nseg, num_segments=seg_max)
     if not asm_verify_attn_supported(
         q,
         k,
@@ -976,7 +990,17 @@ def unified_attention_3d_mtp_decode_func(
             v_descale,
             softmax_scale,
             out=out,
+            **plan_kwargs,
         )
     except _AsmKernelUnavailable:
         return False
     return True
+
+
+def alloc_decode_seg_plan(seq_lens: torch.Tensor, num_kv_heads: int):
+    """Plan buffers for launch_reshape_and_cache_flash(seg_plan=...) to fill, or
+    None when the asm kernel is unavailable. Feed the result to
+    unified_attention_3d_mtp_decode_func."""
+    if not asm_verify_attn_enabled():
+        return None
+    return _alloc_seg_plan(seq_lens, num_kv_heads)
