@@ -1518,6 +1518,7 @@ class KimiK3MoE(nn.Module):
             # fused-norm AR (its GEMV chains on it via PDL)
             if (
                 fused_norm
+                and not use_mxfp4
                 and self._gemm_ag_up_eligible
                 and k3_ar_fusion.gemm_ag_up_fits(num_tokens)
             ):
