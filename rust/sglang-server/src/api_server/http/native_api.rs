@@ -293,6 +293,7 @@ const SCHEMA_META_INFO_KEYS: &[&str] = &[
     "audio_tokens",
     "video_tokens",
     "cached_tokens_details",
+    "dp_rank",
 ];
 
 /// A repeated key has been logged once.
@@ -1631,7 +1632,9 @@ mod tests {
     /// sampling params the client sent for it (without the launch-time
     /// preferred ones), and sees each terminal frame once. An HTTP layer's
     /// earlier [`crate::RequestStart`] lengthens every terminal `e2e_latency`
-    /// but neither decode latency.
+    /// but neither decode latency. Every frame carries the listener's DP rank
+    /// (null without data parallelism), a status abort's terminal stream frame
+    /// included.
     #[tokio::test]
     async fn generate_hook_keys_reach_every_frame() {
         for (stream, incremental, hook, batch, metrics) in [
@@ -1642,6 +1645,29 @@ mod tests {
             (true, true, true, true, true),
             (true, true, false, false, true),
         ] {
+            // A hooked case also runs as DP rank 1; the rest as the only rank.
+            let dp_rank: u32 = if hook { 1 } else { 0 };
+            let server_args = crate::message::config::ServerArgs {
+                incremental_streaming_output: incremental,
+                metrics: metrics.then(|| crate::message::config::MetricsConfig {
+                    multiproc_dir: String::new(),
+                    labels: Default::default(),
+                    priority_label: false,
+                    bucket_time_to_first_token: None,
+                    bucket_inter_token_latency: None,
+                    bucket_e2e_request_latency: None,
+                    bucket_prompt_tokens: None,
+                    bucket_generation_tokens: None,
+                }),
+                preferred_sampling_params: Some(crate::message::config::PreferredSamplingParams(
+                    serde_json::json!({"top_k": 7}),
+                )),
+                deployment_info: crate::message::config::DeploymentInfo {
+                    dp_rank: Some(dp_rank),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
             let (intake_tx, intake_rx) = flume::unbounded();
             let core = crate::api_server::handlers::CoreHandle::new(
                 intake_tx,
@@ -1654,7 +1680,7 @@ mod tests {
                     mm_limits: Default::default(),
                     multimodal: false,
                     peer_endpoints: Vec::new(),
-                    metadata: crate::api_server::handlers::CoreMetadata::default(),
+                    metadata: crate::api_server::handlers::CoreMetadata::from(&server_args),
                     metrics: None,
                     request_log: None,
                 },
@@ -1662,25 +1688,7 @@ mod tests {
             let top_p_hook = TopPHook::default();
             let state = Arc::new(AppState {
                 core,
-                server_args: Arc::new(crate::message::config::ServerArgs {
-                    incremental_streaming_output: incremental,
-                    metrics: metrics.then(|| crate::message::config::MetricsConfig {
-                        multiproc_dir: String::new(),
-                        labels: Default::default(),
-                        priority_label: false,
-                        bucket_time_to_first_token: None,
-                        bucket_inter_token_latency: None,
-                        bucket_e2e_request_latency: None,
-                        bucket_prompt_tokens: None,
-                        bucket_generation_tokens: None,
-                    }),
-                    preferred_sampling_params: Some(
-                        crate::message::config::PreferredSamplingParams(
-                            serde_json::json!({"top_k": 7}),
-                        ),
-                    ),
-                    ..Default::default()
-                }),
+                server_args: Arc::new(server_args),
                 generation_policy: GenerationPolicy::default(),
                 chat_formatter: None,
                 generate_hook: hook
@@ -1724,6 +1732,17 @@ mod tests {
                         unreachable!()
                     };
                     chunk.rid = rid.clone();
+                    // A streamed batch's second item ends on a status abort,
+                    // still a frame.
+                    if stream && item == 1 {
+                        chunk.finish_reason = serde_json::from_value(serde_json::json!({
+                            "type": "abort",
+                            "message": "Aborted",
+                            "status_code": 500,
+                            "err_type": null
+                        }))
+                        .unwrap();
+                    }
                     let mut stats = serde_json::Map::new();
                     stats.insert("num_retractions".into(), serde_json::json!(1));
                     stats.insert("queue_time".into(), serde_json::json!(0.5));
@@ -1787,7 +1806,7 @@ mod tests {
             };
 
             let case = format!(
-                "stream={stream} incremental={incremental} hook={hook} batch={batch} metrics={metrics}"
+                "stream={stream} incremental={incremental} hook={hook} batch={batch} metrics={metrics} dp_rank={dp_rank}"
             );
             // A stream takes each delta before its terminal output arrives.
             assert_eq!(frames.len(), items * if stream { 2 } else { 1 }, "{case}");
@@ -1800,6 +1819,11 @@ mod tests {
                     .map_or(if batch { position } else { 0 }, |i| i as usize);
                 let meta = frame["meta_info"].as_object().unwrap();
                 let terminal = !meta["finish_reason"].is_null();
+                assert_eq!(
+                    meta.get("dp_rank"),
+                    Some(&serde_json::json!(dp_rank)),
+                    "{case}"
+                );
                 let keys: Vec<&str> = meta.keys().map(String::as_str).collect();
                 let e2e_latency = meta.get("e2e_latency").and_then(serde_json::Value::as_f64);
                 assert_eq!(e2e_latency.is_some(), terminal, "{case}");
@@ -2158,6 +2182,7 @@ mod tests {
             audio_tokens: Some(1),
             video_tokens: Some(1),
             cached_tokens_details: Some(Default::default()),
+            dp_rank: Some(0),
         };
         let keys: Vec<String> = serde_json::to_value(&every)
             .unwrap()
