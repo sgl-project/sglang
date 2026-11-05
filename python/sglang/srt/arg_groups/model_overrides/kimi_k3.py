@@ -194,8 +194,7 @@ def _kimi_k31_lossless_defaults(cfg: Any) -> dict:
 
 def _kimi_k31_dcp_overrides(cfg: Any) -> dict:
     """DCP shards the MLA KV and the index-K cache by token; the indexer merges
-    a global top-k and the DSA attention (flashmla_kv or trtllm) merges partials
-    by LSE."""
+    a global top-k and the DSA attention merges partials by LSE."""
     dcp = cfg.dcp_size
     if dcp & (dcp - 1) or cfg.tp_size % dcp:
         raise ValueError(

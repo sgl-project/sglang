@@ -90,9 +90,7 @@ def kda_chain_verify_gfx950(
         dt_bias=layer.dt_bias,
         ssm_states=ssm_states,
         cache_indices=conv_state_indices,
-        intermediate_states_buffer=(
-            None if replayssm_rawv is not None else intermediate_state_cache
-        ),
+        intermediate_states_buffer=intermediate_state_cache,
         scale=layer.head_k_dim**-0.5,
         T=draft_token_num,
         num_q_heads=layer.num_q_heads,
