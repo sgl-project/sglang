@@ -1,5 +1,3 @@
-"""Owner-side sparse attention without materializing global K/V."""
-
 from __future__ import annotations
 
 import torch
@@ -99,8 +97,6 @@ def select_kv_heads_for_query_shard(
     tp_size: int,
     tp_rank: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Select the global KV-head group covered by one contiguous Q-head shard."""
-
     if k.ndim != 3 or v.shape != k.shape:
         raise ValueError("K/V must have matching [tokens, heads, dim] shapes")
     if (
@@ -133,117 +129,6 @@ def select_kv_heads_for_query_shard(
     )
 
 
-def _validate_attention_inputs(
-    q: torch.Tensor,
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    local_token_slots: torch.Tensor,
-) -> None:
-    if q.ndim != 3 or k_cache.ndim != 3 or v_cache.ndim != 3:
-        raise ValueError("q, k_cache and v_cache must be rank-3 tensors")
-    if k_cache.shape != v_cache.shape:
-        raise ValueError("k_cache and v_cache must have matching shapes")
-    if local_token_slots.ndim != 2 or local_token_slots.shape[0] != q.shape[0]:
-        raise ValueError("local_token_slots must have shape [query_tokens, tokens]")
-    if q.shape[-1] != k_cache.shape[-1]:
-        raise ValueError("Q/K/V head dimensions must match")
-    if k_cache.shape[1] == 0 or q.shape[1] % k_cache.shape[1] != 0:
-        raise ValueError("query heads must be divisible by KV heads")
-    if q.device != k_cache.device or q.device != v_cache.device:
-        raise ValueError("q, k_cache and v_cache must share a device")
-    if local_token_slots.device != q.device:
-        raise ValueError("local_token_slots must be on the Q/K/V device")
-    assert_qsa_indices_in_bounds(
-        local_token_slots,
-        k_cache.shape[0],
-        valid_mask=local_token_slots >= 0,
-        label="owner local KV read locations",
-    )
-
-
-def owner_sparse_attention_partial(
-    q: torch.Tensor,
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    local_token_slots: torch.Tensor,
-    softmax_scale: float | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run the production GPU owner-local kernel without gathering K/V."""
-
-    _validate_attention_inputs(q, k_cache, v_cache, local_token_slots)
-    if not q.is_cuda:
-        raise ValueError("production owner sparse attention requires CUDA tensors")
-    from sglang.srt.layers.attention.qsa.sparse_attn import (
-        sparse_gqa_packed_decode_with_lse_triton,
-    )
-
-    scale = q.shape[-1] ** -0.5 if softmax_scale is None else softmax_scale
-    return sparse_gqa_packed_decode_with_lse_triton(
-        q.contiguous(),
-        k_cache,
-        v_cache,
-        local_token_slots,
-        scale,
-    )
-
-
-def merge_owner_sparse_attention(
-    partial_output: torch.Tensor,
-    partial_lse: torch.Tensor,
-    *,
-    group,
-    static_buffers=None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Exchange FP32 output/LSE once and stably merge this rank's head shard."""
-
-    if partial_output.ndim != 3 or partial_lse.shape != partial_output.shape[:2]:
-        raise ValueError("partial output/LSE must be [rows, heads, dim]/[rows, heads]")
-    if partial_lse.dtype != torch.float32:
-        raise TypeError("partial LSE must be float32")
-    world_size = int(group.world_size)
-    rows, num_heads, head_dim = partial_output.shape
-    if num_heads % world_size:
-        raise ValueError("owner partial heads must be divisible by group size")
-    local_heads = num_heads // world_size
-    if static_buffers is None:
-        packed = torch.empty(
-            (world_size, rows, local_heads, head_dim + 1),
-            dtype=torch.float32,
-            device=partial_output.device,
-        )
-        recv = torch.empty_like(packed)
-    else:
-        static_buffers = static_buffers.for_batch(rows)
-        packed = static_buffers.owner_a2a_send
-        recv = static_buffers.owner_a2a_recv
-        packed[..., :-1].zero_()
-        packed[..., -1].fill_(float("-inf"))
-    packed[:, :rows, ..., :-1].copy_(
-        partial_output.float()
-        .view(rows, world_size, local_heads, head_dim)
-        .permute(1, 0, 2, 3)
-    )
-    packed[:, :rows, ..., -1].copy_(
-        partial_lse.view(rows, world_size, local_heads).permute(1, 0, 2)
-    )
-    group.all_to_all_single(recv.view(-1), packed.view(-1))
-    gathered = recv[:, :rows]
-    if gathered.shape[0] != world_size:
-        raise ValueError("owner collective returned an unexpected owner dimension")
-    if not gathered.is_cuda:
-        raise ValueError("production owner sparse attention requires CUDA tensors")
-    from sglang.kernels.ops.attention.dcp_kernels import dcp_lse_combine_triton
-
-    output, lse = dcp_lse_combine_triton(
-        gathered[..., :-1],
-        gathered[..., -1],
-        is_lse_base_on_e=True,
-        return_lse=True,
-    )
-    assert lse is not None
-    return output.to(partial_output.dtype), lse
-
-
 def owner_sparse_attention(
     q: torch.Tensor,
     local_k_cache: torch.Tensor,
@@ -255,17 +140,10 @@ def owner_sparse_attention(
     softmax_scale: float | None = None,
     static_buffers=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run owner filtering, local attention, and optional cross-owner merge."""
-
-    local_query_heads = q.shape[1]
     if static_buffers is not None:
         static_buffers = static_buffers.for_batch(q.shape[0])
-        expected_local_heads = static_buffers.num_heads // static_buffers.world_size
-        if local_query_heads != expected_local_heads:
-            raise ValueError(
-                "static Q transport head geometry does not match the query: "
-                f"got {local_query_heads}, expected {expected_local_heads}"
-            )
+        if q.shape[1] != static_buffers.num_heads // static_buffers.world_size:
+            raise ValueError("static Q transport head geometry mismatch")
     gathered_q = q
     if group is not None:
         with torch.profiler.record_function("qsa.owner.q_gather"):
@@ -292,10 +170,7 @@ def owner_sparse_attention(
         owner_width = global_token_slots.shape[1]
         if static_buffers is not None and global_token_slots.is_cuda:
             if owner_width > static_buffers.owner_topk:
-                raise ValueError(
-                    "selected owner width exceeds static buffer capacity: "
-                    f"{owner_width} > {static_buffers.owner_topk}"
-                )
+                raise ValueError("selected owner width exceeds static buffer capacity")
             local_slots, _ = _owner_localize_token_slots_triton(
                 global_token_slots,
                 sharding,
@@ -315,20 +190,62 @@ def owner_sparse_attention(
         )
         gathered_q = static_buffers.q_gathered[: q.shape[0]]
     with torch.profiler.record_function("qsa.owner.kernel"):
-        output, lse = owner_sparse_attention_partial(
-            gathered_q,
+        assert_qsa_indices_in_bounds(
+            local_slots,
+            local_k_cache.shape[0],
+            valid_mask=local_slots >= 0,
+            label="owner local KV read locations",
+        )
+        from sglang.srt.layers.attention.qsa.sparse_attn import (
+            sparse_gqa_packed_decode_with_lse_triton,
+        )
+
+        scale = gathered_q.shape[-1] ** -0.5 if softmax_scale is None else softmax_scale
+        output, lse = sparse_gqa_packed_decode_with_lse_triton(
+            gathered_q.contiguous(),
             local_k_cache,
             local_v_cache,
             local_slots,
-            softmax_scale,
+            scale,
         )
     if group is None:
         return output, lse
     with torch.profiler.record_function("qsa.owner.output_lse_merge"):
-        output, lse = merge_owner_sparse_attention(
-            output,
-            lse,
-            group=group,
-            static_buffers=static_buffers,
+        output_dtype = output.dtype
+        world_size = int(group.world_size)
+        rows, num_heads, head_dim = output.shape
+        if num_heads % world_size:
+            raise ValueError("owner partial heads must be divisible by group size")
+        local_heads = num_heads // world_size
+        if static_buffers is None:
+            packed = torch.empty(
+                (world_size, rows, local_heads, head_dim + 1),
+                dtype=torch.float32,
+                device=output.device,
+            )
+            recv = torch.empty_like(packed)
+        else:
+            packed = static_buffers.owner_a2a_send
+            recv = static_buffers.owner_a2a_recv
+            packed[..., :-1].zero_()
+            packed[..., -1].fill_(float("-inf"))
+        packed[:, :rows, ..., :-1].copy_(
+            output.float()
+            .view(rows, world_size, local_heads, head_dim)
+            .permute(1, 0, 2, 3)
         )
+        packed[:, :rows, ..., -1].copy_(
+            lse.view(rows, world_size, local_heads).permute(1, 0, 2)
+        )
+        group.all_to_all_single(recv.view(-1), packed.view(-1))
+        gathered = recv[:, :rows]
+        from sglang.kernels.ops.attention.dcp_kernels import dcp_lse_combine_triton
+
+        output, lse = dcp_lse_combine_triton(
+            gathered[..., :-1],
+            gathered[..., -1],
+            is_lse_base_on_e=True,
+            return_lse=True,
+        )
+        output = output.to(output_dtype)
     return output, lse
