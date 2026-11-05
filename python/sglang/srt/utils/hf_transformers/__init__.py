@@ -18,9 +18,7 @@ This package provides HF Transformers helpers, split into submodules
 monkey-patches live in the sibling ``sglang.srt.utils.hf_transformers_patches``
 module and are applied when this package is imported, before anything here
 loads a config, tokenizer, or processor.
-All public symbols are re-exported here for convenience.  The old import
-path ``sglang.srt.utils.hf_transformers_utils`` is preserved by a
-separate shim module.
+All public symbols are re-exported here for convenience.
 """
 
 from ..hf_transformers_patches import (

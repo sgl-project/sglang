@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from sglang.srt.runtime_context import get_parallel, get_schedule, get_spec
+from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule, get_spec
 
 """
 end to end attention solution with aiter kernels
@@ -26,6 +26,7 @@ from sglang.kernels.ops.attention.kv_indices import (
     spec_kv_index_token_blocks,
 )
 from sglang.kernels.ops.attention.utils import assert_buffer_fits
+from sglang.kernels.ops.speculative.cache_locs import generate_draft_decode_kv_indices
 from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
     resolve_window_id_space,
@@ -43,7 +44,6 @@ from sglang.srt.model_executor.runner_utils.capture_mode import (
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
     draft_kv_indices_used_len,
-    generate_draft_decode_kv_indices,
 )
 from sglang.srt.utils import is_gfx95_supported
 
@@ -387,6 +387,24 @@ def _asm_context_prefill_gather_indices(
     return tok_idx, cu_k
 
 
+def _unified_extend_q(q: torch.Tensor, num_heads: int, head_dim: int) -> torch.Tensor:
+    """q as unified_attention's (tokens, heads, head_dim) input, without a copy when possible.
+
+    unified_attention reads q through its token stride (query_stride_0) and needs the heads x
+    head_dim of a token dense (unit dim stride, head stride = head_dim). A q that is a column
+    slice of the fused QKV output (RoPE writes it in place) is such a view and is returned as
+    is; q.contiguous() copied the whole q of every prefill/extend batch. Any other layout,
+    or one view() rejects, is made contiguous as before.
+    """
+    try:
+        q_v = q.view(-1, num_heads, head_dim)
+        if q_v.stride(2) == 1 and q_v.stride(1) == head_dim:
+            return q_v
+    except RuntimeError:
+        pass
+    return q.contiguous().view(-1, num_heads, head_dim)
+
+
 class AiterAttnBackend(AttentionBackend):
     # kv_indptr/qo_indptr are preallocated at (req pool + 1); an extend batch
     # can never carry more seqs than the pool.
@@ -576,6 +594,16 @@ class AiterAttnBackend(AttentionBackend):
         else:
             self.use_triton_unified_attention = get_bool_env_var(
                 "SGLANG_USE_AITER_UNIFIED_ATTN"
+            )
+        # Deterministic mode allows aiter decode only for the paged_attention_ragged
+        # path; the unified-attention and 5D-pool kernels are not verified batch-invariant.
+        if get_exec().deterministic.enable_deterministic_inference and (
+            self.use_triton_unified_attention or self.kv_cache_is_vectorized_5d
+        ):
+            raise ValueError(
+                "Deterministic inference supports aiter decode attention only with the "
+                "default paged KV cache: not with sliding-window models, "
+                "SGLANG_USE_AITER_UNIFIED_ATTN or a vectorized 5D KV cache layout."
             )
 
         # Decode metadata format. unified_attention and pa_decode_gluon (the
@@ -1282,7 +1310,7 @@ class AiterAttnBackend(AttentionBackend):
                 pt = swa_page_table
 
         k_cache, v_cache = self.kv_layers.read(layer.layer_id).kv()
-        q_u = q.contiguous().view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        q_u = _unified_extend_q(q, layer.tp_q_head_num, layer.qk_head_dim)
         o = q_u.new_empty(
             (q_u.shape[0], layer.tp_q_head_num, layer.v_head_dim),
             dtype=self.input_dtype,
