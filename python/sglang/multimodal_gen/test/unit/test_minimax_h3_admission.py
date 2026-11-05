@@ -794,6 +794,7 @@ def test_validate_server_args_accepts_sla_attn():
         component_attention_backends={"transformer": "sla_attn"},
         attention_backend="fa",
         ring_degree=1,
+        performance_mode="speed",
         resolve_component_attention_backend=lambda *_names: (
             AttentionBackendEnum.SLA_ATTN,
             "transformer",
