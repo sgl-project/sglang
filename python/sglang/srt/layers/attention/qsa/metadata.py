@@ -388,6 +388,24 @@ def build_rope_position_matrix(
     return rope_positions[:, :num_tokens].long().transpose(0, 1).contiguous()
 
 
+def build_qsa_capture_token_slot_table(
+    *,
+    batch_size: int,
+    max_length: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Build cyclic physical pages for synthetic prefill graph requests."""
+    if batch_size < 0:
+        raise ValueError("batch_size must be non-negative")
+    if max_length < 0:
+        raise ValueError("max_length must be non-negative")
+    return (
+        torch.arange(max_length, dtype=torch.int32, device=device)
+        .unsqueeze(0)
+        .expand(batch_size, -1)
+    )
+
+
 def compressed_decode_view(
     *,
     compressed_page_size: int,
@@ -582,6 +600,7 @@ def localize_compressed_page_table(
 
 __all__ = [
     "QSAIndexerMetadata",
+    "build_qsa_capture_token_slot_table",
     "build_qsa_row_ranges",
     "build_pending_ring_slots",
     "build_group_ring_slots",
