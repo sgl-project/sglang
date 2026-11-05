@@ -46,6 +46,8 @@ from .hunyuan_image3_utils import (
     HunYuanRotary2DEmbedder,
     ImageKVCacheManager,
     create_hunyuan_image_attention_meta,
+    pad_prefix_rows,
+    split_suffix_inputs,
     timestep_embedding,
 )
 
@@ -520,16 +522,22 @@ class HunYuanSparseMoeBlock(nn.Module):
         hidden_dim = hidden_states.shape[-1]
         hidden_states = hidden_states.view(-1, hidden_dim)
 
+        # Must run before the experts: the CUDA FusedMoE kernel runs in place
+        # and overwrites hidden_states with the expert output.
+        shared_out = None
+        if self.shared_mlp is not None:
+            shared_out = self.shared_mlp(hidden_states)
+
         router_logits, _ = self.gate(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
         final_hidden_states = self.experts(hidden_states, topk_output)
 
-        if self.shared_mlp is not None:
-            _shared_out = self.shared_mlp(hidden_states)
-            final_hidden_states = final_hidden_states + _shared_out
+        if shared_out is not None:
+            final_hidden_states = final_hidden_states + shared_out
 
-        # NPU: AscendTPDispatcher all-gathers the FusedMoE output internally;
-        # the shared MLP's down_proj all-reduces its own output.
+        # NPU: the Ascend MoE finalize all-gathers the FusedMoE output
+        # internally (moe_runner/ascend.py); the shared MLP's down_proj
+        # all-reduces its own output.
 
         return final_hidden_states.view(orig_shape)
 
@@ -844,9 +852,17 @@ class HunyuanImage3Model(nn.Module):
             ]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # CLA followers reuse the master layer's K/V instead of their own, which
+        # the per-layer prefix cache does not track; those configs run in full.
+        self.prefix_cache_supported = _get_cla_factor(config) == 1
 
     def get_input_embeddings(self, input_ids):
         return self.embed_tokens(input_ids)
+
+    def clear_prefix_kv_cache(self):
+        """Release per-layer prefix K/V tensors held for the active generation."""
+        for layer in self.layers:
+            layer.self_attn.image_attn.clear()
 
     @torch.no_grad()
     def forward(self, input_ids, positions, forward_batch, input_embeds=None):
@@ -882,12 +898,63 @@ class HunyuanImage3Model(nn.Module):
         attn_meta=None,
         num_image_tokens=None,
         first_step=False,
+        prefix_len=None,
+        cache_slot=0,
+        attn_segments=None,
     ):
+        if prefix_len is not None and self.prefix_cache_supported:
+            return self._forward_block_prefix_cached(
+                hidden_states,
+                attention_mask,
+                custom_pos_emb,
+                num_image_tokens=num_image_tokens,
+                first_step=first_step,
+                prefix_len=prefix_len,
+                cache_slot=cache_slot,
+                attn_segments=attn_segments,
+            )
         if attn_meta is None:
             attn_meta = create_hunyuan_image_attention_meta(
                 attention_mask, num_image_tokens, first_step
             )
+            attn_meta.attn_segments = attn_segments
+        return self._run_layers(
+            hidden_states, attention_mask, custom_pos_emb, attn_meta
+        )
 
+    def _forward_block_prefix_cached(
+        self,
+        hidden_states,
+        attention_mask,
+        custom_pos_emb,
+        num_image_tokens,
+        first_step,
+        prefix_len,
+        cache_slot,
+        attn_segments,
+    ):
+        """Step 0 runs the full sequence and caches each layer's prefix K/V.
+        Later steps run only the suffix (the noisy image and timestep rows).
+        """
+        bs = attention_mask.shape[0]
+        attn_meta = create_hunyuan_image_attention_meta(
+            attention_mask, num_image_tokens, first_step
+        )
+        attn_meta.prefix_len = prefix_len
+        attn_meta.cache_slot = cache_slot
+        attn_meta.attn_segments = attn_segments
+        if first_step:
+            return self._run_layers(
+                hidden_states, attention_mask, custom_pos_emb, attn_meta
+            )
+        suffix_hidden, suffix_mask, suffix_pos = split_suffix_inputs(
+            hidden_states, attention_mask, custom_pos_emb, prefix_len
+        )
+        attn_meta.query_lens = [suffix_mask.shape[2]] * bs
+        suffix_out = self._run_layers(suffix_hidden, suffix_mask, suffix_pos, attn_meta)
+        return pad_prefix_rows(suffix_out, bs, prefix_len)
+
+    def _run_layers(self, hidden_states, attention_mask, custom_pos_emb, attn_meta):
         residual = None
         cla_factor = _get_cla_factor(self.config)
         prev_kv_states = None
@@ -1008,6 +1075,9 @@ class HunyuanImage3ForCausalMM(CachableDiT):
         num_image_tokens=None,
         first_step=False,
         timestep=None,
+        prefix_len=None,
+        cache_slot=0,
+        attn_segments=None,
     ):
         # TeaCache gate: skip similar steps and reuse the cached residual;
         # one decision covers the packed CFG batch.
@@ -1022,6 +1092,9 @@ class HunyuanImage3ForCausalMM(CachableDiT):
             custom_pos_emb,
             num_image_tokens=num_image_tokens,
             first_step=first_step,
+            prefix_len=prefix_len,
+            cache_slot=cache_slot,
+            attn_segments=attn_segments,
         )
 
         if timestep is not None:

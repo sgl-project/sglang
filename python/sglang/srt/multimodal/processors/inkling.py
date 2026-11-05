@@ -30,17 +30,14 @@ from typing import Any, Dict, List, Optional, Tuple, Type, Union
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalProcessorOutput,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.models.inkling import InklingForConditionalGeneration
 from sglang.srt.multimodal.inkling import (
     InklingAudioFeatureExtractor,
     InklingImageProcessor,
     InklingProcessor,
 )
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
