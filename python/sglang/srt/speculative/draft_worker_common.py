@@ -31,7 +31,7 @@ class DraftWorkerBundle(msgspec.Struct, frozen=True):
 
 
 # Draft backends that serve only MLA layers; DFLASH takes them for MLA drafts.
-DFLASH_MLA_ONLY_DRAFT_BACKENDS = ("cutedsl_mla", "trtllm_mla")
+DFLASH_MLA_ONLY_DRAFT_BACKENDS = ("cutedsl_mla",)
 
 
 def resolve_draft_worker_attention_backend(*, algo_label: Optional[str] = None) -> str:

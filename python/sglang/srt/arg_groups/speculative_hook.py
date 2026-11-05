@@ -928,7 +928,6 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
     Consumed by ModelRunner's `is_draft_worker` override (one backend for all
     draft modes).
     """
-    from sglang.srt.speculative.dflash_utils import is_dflash_mla_draft_config
     from sglang.srt.speculative.draft_worker_common import (
         DFLASH_MLA_ONLY_DRAFT_BACKENDS,
     )
@@ -945,7 +944,16 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
         if backend in DFLASH_MLA_ONLY_DRAFT_BACKENDS:
             # These serve only MLA layers: a draft verify window through the
             # target's MLA decode kernels (DCP owner rows under DCP).
-            return is_dflash_mla_draft_config(_load_draft_hf_config(cfg))
+            from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
+            from sglang.srt.utils.hf_transformers import get_config
+
+            draft_hf_config = get_config(
+                cfg.speculative_draft_model_path,
+                trust_remote_code=cfg.trust_remote_code,
+                revision=cfg.speculative_draft_model_revision,
+                model_override_args=json.loads(cfg.json_model_override_args),
+            )
+            return parse_dflash_draft_config(draft_hf_config=draft_hf_config).is_mla
         return backend in supported_draft_backends
 
     def get_fallback_backend() -> str:
