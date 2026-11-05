@@ -2027,9 +2027,6 @@ class Envs:
     SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)
     SGLANG_OPT_USE_FLASHINFER_MHC = EnvBool(False)
     SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(True)
-    # ERNIE 5.5 Flash fusions not bit-exact with the eager ops:
-    # the input RMSNorm in mhc_pre, the VHA postmix in the wo_a fp8 quant.
-    SGLANG_OPT_ERNIE5_5_INEXACT_FUSION = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
     # Shard the ratio-1/2 index sources' dense prefill scores across the
     # attention-TP group and all-gather the selections, instead of every rank
@@ -2353,6 +2350,13 @@ class Envs:
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MIN_HITS = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MAX_SEQLEN = EnvInt(6144)
+
+    # ===================================================================
+    # ERNIE 5.5
+    # ===================================================================
+    # Fusions not bit-exact with the eager ops: the input RMSNorm into mhc_pre,
+    # and the VHA postmix into the wo_a fp8 quant.
+    SGLANG_OPT_ERNIE5_5_FUSE_INEXACT = EnvBool(True)
 
     # ===================================================================
     # Symmetric memory

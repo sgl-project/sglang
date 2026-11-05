@@ -16,6 +16,9 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.arg_groups.model_override_base import resolving_view
+from sglang.srt.arg_groups.model_overrides.deepseek_v4 import (
+    DSV4_DEFAULT_SWA_FULL_TOKENS_RATIO,
+)
 from sglang.srt.configs.ernie55 import ERNIE5_5_MOE_ARCH
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.configs.model_config import (
@@ -1087,10 +1090,6 @@ class SWARequestCapPoolConfigurator(HybridSWAPoolConfigurator):
         return self._make_pool_config(
             full_tokens, min(swa_tokens, max_total_num_tokens)
         )
-
-
-# Used when --swa-full-tokens-ratio is at its default and cap mode is unusable.
-DSV4_DEFAULT_SWA_FULL_TOKENS_RATIO = 0.1
 
 
 def _operator_swa_full_tokens_ratio() -> Optional[float]:

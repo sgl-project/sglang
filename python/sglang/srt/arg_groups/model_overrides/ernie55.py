@@ -18,6 +18,10 @@ import logging
 from typing import Any, Dict
 
 from sglang.srt.arg_groups.model_override_base import _register_for, resolving_view
+from sglang.srt.arg_groups.model_overrides.deepseek_v4 import (
+    DSV4_DEFAULT_SWA_FULL_TOKENS_RATIO,
+    DSV4_PAGE_SIZE,
+)
 from sglang.srt.configs.ernie55 import ERNIE5_5_MOE_ARCH
 from sglang.srt.environ import envs
 
@@ -137,8 +141,7 @@ def _ernie55_overrides(server_args: Any, hf_config: Any) -> dict:
     _validate_speculative(cfg)
     overrides: Dict[str, Any] = {
         "attention_backend": "ernie55",
-        # The C128 sub-pool hardcodes 256-token pages.
-        "page_size": 256,
+        "page_size": DSV4_PAGE_SIZE,
     }
     if cfg.kv_cache_dtype == "auto":
         # An accuracy-relevant default: say so rather than switching silently.
@@ -148,9 +151,8 @@ def _ernie55_overrides(server_args: Any, hf_config: Any) -> dict:
         )
         overrides["kv_cache_dtype"] = "fp8_e4m3"
     if cfg.swa_full_tokens_ratio is None:
-        # DSV4_DEFAULT_SWA_FULL_TOKENS_RATIO (pool_configurator);
-        # the 128-token HCA window needs only a small SWA share.
-        overrides["swa_full_tokens_ratio"] = 0.1
+        # The 128-token HCA window needs only a small SWA share.
+        overrides["swa_full_tokens_ratio"] = DSV4_DEFAULT_SWA_FULL_TOKENS_RATIO
     logger.info(
         "Use ernie55 attention backend for ERNIE 5.5 Flash, with %s.",
         ", ".join(f"{k}={v}" for k, v in overrides.items() if k != "attention_backend"),

@@ -834,16 +834,18 @@ class KVCacheConfigurator:
 
         # Initialize token_to_kv_pool
         is_dsa_model = is_deepseek_dsa(self.model_config.hf_config)
-        is_dsv4_model = uses_compressed_kv_attention(self.model_config.hf_config)
+        is_compressed_kv_model = uses_compressed_kv_attention(
+            self.model_config.hf_config
+        )
 
         self._validate_prefill_only_disable_kv_cache_pool_family(
-            is_dsa_model, is_dsv4_model, current_platform
+            is_dsa_model, is_compressed_kv_model, current_platform
         )
 
         token_to_kv_pool = self._build_token_to_kv_pool(
             sizes=sizes,
             is_dsa_model=is_dsa_model,
-            is_dsv4_model=is_dsv4_model,
+            is_compressed_kv_model=is_compressed_kv_model,
             req_to_token_pool=req_to_token_pool,
             state=state,
         )
@@ -868,7 +870,7 @@ class KVCacheConfigurator:
         token_to_kv_pool_allocator = self._build_token_to_kv_pool_allocator(
             sizes=sizes,
             token_to_kv_pool=token_to_kv_pool,
-            is_dsv4_model=is_dsv4_model,
+            is_compressed_kv_model=is_compressed_kv_model,
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
@@ -1384,14 +1386,14 @@ class KVCacheConfigurator:
     def _validate_prefill_only_disable_kv_cache_pool_family(
         self,
         is_dsa_model: bool,
-        is_dsv4_model: bool,
+        is_compressed_kv_model: bool,
         current_platform,
     ):
         if not get_schedule().prefill_only_disable_kv_cache or self.is_draft_worker:
             return
 
         unsupported_pool_family = None
-        if is_dsv4_model:
+        if is_compressed_kv_model:
             unsupported_pool_family = "DeepSeekV4TokenToKVPool"
         elif current_platform.is_out_of_tree() and not self.mambaish_config:
             unsupported_pool_family = "out-of-tree platform KV pool"
@@ -1635,7 +1637,7 @@ class KVCacheConfigurator:
         *,
         sizes: _PoolSizes,
         is_dsa_model: bool,
-        is_dsv4_model: bool,
+        is_compressed_kv_model: bool,
         req_to_token_pool: ReqToTokenPool,
         state: Optional[StateStorage] = None,
     ) -> KVCache:
@@ -1643,7 +1645,9 @@ class KVCacheConfigurator:
         # layout with separate KV storage. Handle them before the normal pool
         # dispatch; targets and drafts without that allocator fall through.
         mtp_pool = self._build_mtp_kv_shard_pool(
-            sizes=sizes, is_dsa_model=is_dsa_model, is_dsv4_model=is_dsv4_model
+            sizes=sizes,
+            is_dsa_model=is_dsa_model,
+            is_compressed_kv_model=is_compressed_kv_model,
         )
         if mtp_pool is not None:
             return mtp_pool
@@ -1673,7 +1677,7 @@ class KVCacheConfigurator:
                 current_platform, subsystem="the block-scaled (fp4 / mxfp8) KV pool"
             )
 
-        if is_dsv4_model:
+        if is_compressed_kv_model:
             reject_out_of_tree_path(
                 current_platform, subsystem="the DeepSeek-V4 KV pool"
             )
@@ -1780,7 +1784,7 @@ class KVCacheConfigurator:
         return token_to_kv_pool
 
     def _build_mtp_kv_shard_pool(
-        self, *, sizes: _PoolSizes, is_dsa_model: bool, is_dsv4_model: bool
+        self, *, sizes: _PoolSizes, is_dsa_model: bool, is_compressed_kv_model: bool
     ) -> Optional[KVCache]:
         """Build a draft pool in its target's logical space, with its own KV.
 
@@ -1805,7 +1809,7 @@ class KVCacheConfigurator:
         if get_parallel().attn_dcp_size > 1:
             raise ValueError("MTP KV sharding is incompatible with DCP.")
         if (
-            is_dsv4_model
+            is_compressed_kv_model
             or self.is_hybrid_swa
             or self.mambaish_config is not None
             or self.sliding_window_size is not None
@@ -2718,7 +2722,7 @@ class KVCacheConfigurator:
         *,
         sizes: _PoolSizes,
         token_to_kv_pool: KVCache,
-        is_dsv4_model: bool,
+        is_compressed_kv_model: bool,
         req_to_token_pool: ReqToTokenPool,
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator],
     ) -> BaseTokenToKVPoolAllocator:
@@ -2727,13 +2731,13 @@ class KVCacheConfigurator:
         if token_to_kv_pool_allocator is None:
             if _is_npu and (
                 get_exec().kernel.attention_backend == "ascend"
-                or is_dsv4_model
+                or is_compressed_kv_model
                 or self.hybrid_gdn_config is not None
             ):
                 if self.is_hybrid_swa:
                     # DSV4 on NPU: SWA allocator subclass that also drives the
                     # c4/c128 allocators, producing a DSV4OutCacheLoc per alloc.
-                    if is_dsv4_model:
+                    if is_compressed_kv_model:
                         from sglang.srt.hardware_backend.npu.dsv4.dsv4_allocator import (
                             DSV4NPUTokenToKVPoolAllocator,
                         )
@@ -2857,7 +2861,7 @@ class KVCacheConfigurator:
                             need_sort=need_sort,
                         )
 
-            if get_memory().enable_hisparse and is_dsv4_model:
+            if get_memory().enable_hisparse and is_compressed_kv_model:
                 assert self.is_hybrid_swa, "DeepSeek V4 HiSparse requires SWA mode."
                 token_to_kv_pool_allocator = DeepSeekV4HiSparseTokenToKVPoolAllocator(
                     token_to_kv_pool_allocator

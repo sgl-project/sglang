@@ -179,7 +179,7 @@ def _resolve_eagle_aux_hidden_state(
 
     if (
         draft_model_config.is_hybrid_swa
-        and not draft_model_config.uses_compressed_kv_attention
+        and not draft_model_config.is_compressed_kv_arch
     ):
         config.eagle_draft_swa_num_layers = len(
             draft_model_config.swa_attention_layer_ids

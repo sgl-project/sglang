@@ -626,6 +626,7 @@ register_kernel(
         op="attention.postmix_fp8_wo_a_quant",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.attention.postmix_fp8_wo_a:postmix_fp8_wo_a_quant",
-        capabilities=CUDA_ONLY,
+        # The UE8M0 packed scales are an SM100 layout.
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(10, 0))}),
     )
 )

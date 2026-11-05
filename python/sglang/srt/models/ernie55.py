@@ -340,7 +340,7 @@ class Ernie5_5HcaAttention(Ernie5_5GatedQMixin, MQALayer):
         # The mix fuses into the UE8M0 fp8 wo_a quant, but only from the folded
         # [H, H] matrix, which a split head axis has no rank-local form of.
         self._postmix_in_quant = (
-            envs.SGLANG_OPT_ERNIE5_5_INEXACT_FUSION.get()
+            envs.SGLANG_OPT_ERNIE5_5_FUSE_INEXACT.get()
             and self.wo_a_fp8
             and DEEPGEMM_SCALE_UE8M0
             and not self.postmix.sharded
@@ -711,7 +711,7 @@ class Ernie5_5DecoderLayer(nn.Module):
         )
 
         # Fuse the input RMSNorm into mhc_pre; not bit-exact with the eager norm.
-        self.fuse_input_norm = envs.SGLANG_OPT_ERNIE5_5_INEXACT_FUSION.get()
+        self.fuse_input_norm = envs.SGLANG_OPT_ERNIE5_5_FUSE_INEXACT.get()
         self.hc_mult = config.hc_mult
         (
             self.hc_attn_fn,

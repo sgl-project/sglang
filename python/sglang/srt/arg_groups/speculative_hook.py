@@ -18,6 +18,7 @@ from sglang.srt.arg_groups.overrides import (
     record_foreign_defaults,
     run_post_process_pass,
 )
+from sglang.srt.configs.ernie55 import ERNIE5_5_MOE_ARCH
 from sglang.srt.environ import envs
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
@@ -677,8 +678,6 @@ def _handle_dspark(server_args: ServerArgs) -> None:
     if cfg.attn_dp_size > 1:
         if not cfg.enable_dp_lm_head:
             raise ValueError("DSpark with dp attention requires --enable-dp-lm-head.")
-        from sglang.srt.configs.ernie55 import ERNIE5_5_MOE_ARCH
-
         allowed_a2a_backends = ("none", "megamoe", "mori")
         target_arch = model_config_of(server_args).hf_config.architectures[0]
         if target_arch == ERNIE5_5_MOE_ARCH:
@@ -1507,7 +1506,7 @@ def _auto_choose_speculative_params(server_args: ServerArgs, model_arch: str) ->
         return (3, 1, 4)
     elif model_arch in ["Grok1ForCausalLM", "Grok1VForCausalLM"]:
         return (5, 4, 8)
-    elif model_arch == "Ernie5_5_MoeForCausalLM":
+    elif model_arch == ERNIE5_5_MOE_ARCH:
         # One ECHO step; the cookbook's low-latency recipes pass 2.
         return (1, 1, 2)
     else:

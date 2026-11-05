@@ -1352,11 +1352,9 @@ class ModelConfig:
         if self.is_hybrid_swa:
             logger.debug(f"Hybrid swa model: {self.hf_config.architectures=}")
 
-            self.uses_compressed_kv_attention = uses_compressed_kv_attention(
-                self.hf_config
-            )
+            self.is_compressed_kv_arch = uses_compressed_kv_attention(self.hf_config)
 
-            if not self.uses_compressed_kv_attention:
+            if not self.is_compressed_kv_arch:
                 self.swa_attention_layer_ids, self.full_attention_layer_ids = (
                     get_hybrid_layer_ids(
                         self.hf_config.architectures,
