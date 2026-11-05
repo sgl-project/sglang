@@ -132,8 +132,6 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 _IS_GFX95 = is_gfx95_supported()
 
 if TYPE_CHECKING:
-    from flash_mla.flash_mla_interface import FlashMLASchedMeta
-
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInput
@@ -3560,9 +3558,7 @@ class DeepseekSparseAttnBackend(
             indices.shape[-1] == self.dsa_index_topk
         )  # requirement of FlashMLA decode kernel
         if dcp_partial:
-            tile_scheduler_metadata = self._dcp_flashmla_sched_meta(
-                q_input, indices, topk_length
-            )
+            tile_scheduler_metadata = self._call_get_mla_metadata()[0]
 
         o, lse = self._call_flash_mla_with_kvcache(
             q=q_input,
@@ -3593,30 +3589,6 @@ class DeepseekSparseAttnBackend(
         o = o.view(-1, num_q_heads, v_head_dim)
         lse = lse.view(-1, lse.shape[1])[:, :num_q_heads]
         return o, lse
-
-    @staticmethod
-    def _dcp_flashmla_sched_meta(
-        q: torch.Tensor, indices: torch.Tensor, topk_length: Optional[torch.Tensor]
-    ) -> FlashMLASchedMeta:
-        # The schedule depends on topk_length, so it is built per call, by the
-        # DeepSeek-V4 scheduler kernel's windowed schedule (FlashMLA's own walk
-        # over the partitions sits on the critical path for tens of us).
-        from sglang.kernels.ops.attention.flash_mla_interface import get_mla_metadata
-        from sglang.srt.layers.attention.deepseek_v4_backend import (
-            _maybe_precompute_flashmla_sched_meta,
-        )
-
-        sched_meta = get_mla_metadata()[0]
-        _maybe_precompute_flashmla_sched_meta(
-            sched_meta,
-            q=q,
-            indices=indices,
-            topk_length=topk_length,
-            extra_indices=None,
-            extra_topk_length=None,
-            schedule="windowed",
-        )
-        return sched_meta
 
     def _forward_standard_mha(
         self,

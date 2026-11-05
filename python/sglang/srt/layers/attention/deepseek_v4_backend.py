@@ -260,8 +260,8 @@ def _create_flashmla_metadata():
     return get_mla_metadata()[0]
 
 
-# FlashMLA's sm100 head64 (and head64x2: h128/d576) decode schedule constants;
-# not exported, so they go stale silently if FlashMLA retunes them.
+# FlashMLA's head64 sm100 decode scheduling constants; not exported, so they hold
+# only for that shape and go stale silently if FlashMLA retunes it.
 _FLASHMLA_SCHED_BLOCK_SIZE_N = 64
 _FLASHMLA_SCHED_FIXED_OVERHEAD = 5
 
@@ -272,14 +272,7 @@ def _num_sms(device_index: int) -> int:
 
 
 def _fast_flashmla_sched_shape(q: torch.Tensor) -> bool:
-    # These layouts use the head64 kernel's schedule constants; V4's
-    # specialized head128 kernel stays excluded.
-    num_heads, head_dim = q.shape[-2], q.shape[-1]
-    return (
-        q.is_cuda
-        and get_platform().is_blackwell
-        and (num_heads == 64 or (num_heads == 128 and head_dim == 576))
-    )
+    return q.is_cuda and get_platform().is_blackwell and q.shape[-2] == 64
 
 
 def _maybe_precompute_flashmla_sched_meta(
@@ -290,12 +283,10 @@ def _maybe_precompute_flashmla_sched_meta(
     topk_length: Optional[torch.Tensor],
     extra_indices: Optional[torch.Tensor],
     extra_topk_length: Optional[torch.Tensor],
-    schedule: Literal["serial", "parallel", "windowed"] = "serial",
 ) -> None:
     """Fill the split-KV schedule buffers so `sparse_decode_fwd` skips its own
     `<<<1, 32>>>` scheduling kernel on the decode critical path;
-    `flashmla_sched_meta` produces the same schedule bit for bit, or with
-    `schedule="windowed"` an equally balanced one in a fraction of the time."""
+    `flashmla_sched_meta` produces the same schedule bit for bit."""
     if flashmla_metadata is None:
         return
     if getattr(flashmla_metadata, "tile_scheduler_metadata", None) is not None:
@@ -322,7 +313,6 @@ def _maybe_precompute_flashmla_sched_meta(
         fixed_overhead_num_blocks=_FLASHMLA_SCHED_FIXED_OVERHEAD,
         topk=indices.shape[-1],
         extra_topk=0 if extra_indices is None else extra_indices.shape[-1],
-        schedule=schedule,
     )
     flashmla_metadata.tile_scheduler_metadata = meta
     flashmla_metadata.num_splits = num_splits
