@@ -311,6 +311,77 @@ async fn count_tokens() {
 }
 
 #[tokio::test]
+async fn minimax_m31_count_tokens_matches_generation_effort() {
+    let mock = MockWorker::start(vec![]).await;
+    let dir = tempfile::tempdir().unwrap();
+    let tokenizer = dir.path().join("tokenizer.json");
+    std::fs::copy("tests/fixtures/tiny_tokenizer.json", &tokenizer).unwrap();
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../../../rust/sglang-processor/tests/fixtures/parity/minimax-m3.1-flash.json"
+    ))
+    .unwrap();
+    std::fs::write(
+        dir.path().join("tokenizer_config.json"),
+        json!({"chat_template": fixture["chat_template"]}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("config.json"),
+        r#"{"model_type":"minimax_m3_vl"}"#,
+    )
+    .unwrap();
+    let mut cfg = config();
+    cfg.model.tokenizer_path = Some(tokenizer.to_str().unwrap().into());
+    cfg.model.aliases = vec!["s3://bucket/minimax".into()];
+    let ctx = build_ctx_with(mock.url.clone(), cfg);
+    for model in [MODEL, "s3://bucket/minimax"] {
+        let mut counts = Vec::new();
+        for effort in ["low", "minimal"] {
+            let request = json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "hello world"}],
+                "output_config": {"effort": effort},
+            });
+            let (status, _, body) =
+                post(ctx.clone(), "/v1/messages/count_tokens", request.clone()).await;
+            assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+            let count = serde_json::from_slice::<Value>(&body).unwrap()["input_tokens"]
+                .as_u64()
+                .unwrap();
+            counts.push(count);
+
+            let mut request = request;
+            request["max_tokens"] = 16.into();
+            let (status, _, body) = post(ctx.clone(), "/v1/messages", request).await;
+            assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+            let sent = captured(&mock).unwrap();
+            assert_eq!(sent["model"], MODEL);
+            assert_eq!(sent["reasoning_effort"], "low");
+            assert_eq!(sent["input_ids"].as_array().unwrap().len() as u64, count);
+        }
+        assert_eq!(
+            counts[0], counts[1],
+            "minimal and low must count identically"
+        );
+
+        for kwargs in [
+            json!({"reasoning_effort": "none"}),
+            json!({"thinking_mode": "disabled"}),
+        ] {
+            let (status, _, body) = post(
+                ctx.clone(),
+                "/v1/messages/count_tokens",
+                json!({"model": model, "messages": [{"role": "user", "content": "hi"}],
+                       "chat_template_kwargs": kwargs}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_anthropic_error(&body, "invalid_request_error");
+        }
+    }
+}
+
+#[tokio::test]
 async fn oversized_body_uses_the_anthropic_envelope() {
     let mock = MockWorker::start(vec![]).await;
     let big = "x".repeat(sgl_router::server::routes::chat::MAX_CHAT_BODY_BYTES);

@@ -1,4 +1,4 @@
-// Speed: `python3 -m sglang.bench_serving --flush-cache` against the exact cell
+// Speed: `python3 -m sglang.benchmark.serving --flush-cache` against the exact cell
 // command on one GPU, PR #41993 head on top of nightly main, so sglang_version
 // names the PR rather than a release. Base rows use random 8192/1024; DSPARK
 // rows use sharegpt, because random tokens collapse draft acceptance.
