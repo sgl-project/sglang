@@ -25,6 +25,11 @@ from sglang.srt.layers.attention.dsa.dsa_dcp import (
     dcp_all_gather_rows_,
     dcp_split_rows,
 )
+from sglang.srt.layers.attention.dsa.dsa_dcp_sharded import (
+    dcp_all_visible,
+    dcp_gather_request_rows,
+    dcp_global_topk,
+)
 from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import BaseIndexerMetadata
 from sglang.srt.layers.attention.dsa.dsa_npu_indexer import DSANPUIndexerMixin
 from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
@@ -159,6 +164,7 @@ from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.kv_shard_hooks import get_kv_shard_pool
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.cp.utils import is_cp_active
+from sglang.srt.layers.dcp.layout import dsa_shards_index_k, get_dcp_lens
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
@@ -252,6 +258,15 @@ def _index_k_write_targets(pool, layer_id: int, loc: torch.Tensor):
     if shard_pool is None:
         return ((pool.get_index_k_with_scale_buffer(layer_id=layer_id), loc, None),)
     return shard_pool.index_key_cache.write_targets(layer_id, loc)
+
+
+def _index_k_dcp() -> Tuple[int, int]:
+    """(size, rank) of the DCP group Kimi-K3.1 shards index-K over by token, or
+    (1, 0): other models keep index-K replicated under DCP."""
+    if not dsa_shards_index_k():
+        return 1, 0
+    parallel = get_parallel()
+    return parallel.attn_dcp_size, parallel.attn_dcp_rank
 
 
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
@@ -437,6 +452,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if config is not None:
             self.num_init_tokens = getattr(config, "index_init_tokens", 0)
             self.num_local_tokens = getattr(config, "index_local_tokens", 0)
+        if dsa_shards_index_k() and (self.num_init_tokens or self.num_local_tokens):
+            raise ValueError(
+                "DSA with --dcp-size > 1 does not support index_init_tokens / "
+                "index_local_tokens."
+            )
 
         self.paged_mqa_logits_backend = DSAPagedMQALogitsBackend.resolve(
             get_exec().kernel.dsa_paged_mqa_logits_backend
@@ -1084,6 +1104,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if (
             not _is_fp8_fnuz
             and out_cache_loc is not None
+            # under DCP the store goes through _store_index_k_cache's owner rule
+            and not dsa_shards_index_k()
             and can_use_dsa_fused_store(torch.bfloat16, out_cache_loc.dtype, page_size)
         ):
             for buf, loc, rows in _index_k_write_targets(pool, layer_id, out_cache_loc):
@@ -1323,9 +1345,16 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         B = metadata.get_seqlens_int32().shape[0]
         next_n = q_offset // B if B > 0 else 0
+        dcp_size, _ = _index_k_dcp()
+        assert (
+            dcp_size == 1
+            or forward_batch.forward_mode.is_decode_or_idle()
+            or forward_batch.forward_mode.is_target_verify()
+        ), "DSA DCP runs the paged top-k in decode and target verify only"
         use_cute_dsl = (
             self.paged_mqa_logits_backend.is_cutedsl()
             and not forward_batch.forward_mode.is_draft_extend_v2()
+            and dcp_size == 1
         )
         dsl_expand_factor, dsl_atom = 1, 1
         if (
@@ -1496,9 +1525,22 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 q_offset=q_offset,
             )
 
-        # NOTE(dark): logits should be cleaned in topk_transform
-        self._mask_init_and_local_tokens(logits, seqlens_32)
-        topk_result = metadata.topk_transform(logits, self.index_topk)
+        if dcp_size > 1:
+            # block_tables and seqlens_32_2d are this rank's: the page ids of
+            # its index-K shard and its share of each sequence.
+            topk_result = dcp_global_topk(
+                logits[:q_offset],
+                seqlens_32_2d.view(-1)[:q_offset],
+                seqlens_32.view(-1)[:q_offset],
+                block_tables,
+                self.index_topk,
+                page_size,
+                metadata.attn_metadata.topk_v2_plan,
+            )
+        else:
+            # NOTE(dark): logits should be cleaned in topk_transform
+            self._mask_init_and_local_tokens(logits, seqlens_32)
+            topk_result = metadata.topk_transform(logits, self.index_topk)
         # Restore possible padding exist in the hidden states.
         if not _is_hip and q_offset < q_fp8.shape[0]:
             pad_len = q_fp8.shape[0] - q_offset
@@ -1596,13 +1638,18 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         indexer_seq_lens_cpu = metadata.get_indexer_seq_len_cpu()
         seq_len_sum = torch.sum(indexer_seq_lens_cpu).item()
         max_seq_len = torch.max(indexer_seq_lens_cpu).item()
-        k_fp8, k_scale = get_token_to_kv_pool().get_index_k_scale_buffer(
-            layer_id,
-            metadata.get_indexer_seq_len(),
-            block_tables,
-            seq_len_sum,
-            max_seq_len,
-        )
+        if dsa_shards_index_k():
+            k_fp8, k_scale = self._dcp_gather_index_k(
+                layer_id, metadata, block_tables, indexer_seq_lens_cpu
+            )
+        else:
+            k_fp8, k_scale = get_token_to_kv_pool().get_index_k_scale_buffer(
+                layer_id,
+                metadata.get_indexer_seq_len(),
+                block_tables,
+                seq_len_sum,
+                max_seq_len,
+            )
         if _is_fp8_fnuz:
             k_fp8 = k_fp8.view(torch.float8_e4m3fnuz)
         else:
@@ -1781,6 +1828,35 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 topk_result[:q_offset] = topk_dst[:q_offset]
         return topk_result
 
+    @staticmethod
+    def _dcp_gather_index_k(
+        layer_id: int,
+        metadata: BaseIndexerMetadata,
+        block_tables: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Prefill under DCP: every request's index-K from all ranks, in DCP1's
+        # get_index_k_scale_buffer layout, so the ragged indexer runs unchanged.
+        parallel = get_parallel()
+        dcp_size, dcp_rank = parallel.attn_dcp_size, parallel.attn_dcp_rank
+        local_lens_cpu = get_dcp_lens(seq_lens_cpu, dcp_size, dcp_rank)
+        # block_tables holds this rank's page ids of each request
+        k_fp8, k_scale = get_token_to_kv_pool().get_index_k_scale_buffer(
+            layer_id,
+            get_dcp_lens(metadata.get_indexer_seq_len(), dcp_size, dcp_rank),
+            block_tables,
+            int(local_lens_cpu.sum()),
+            max(int(local_lens_cpu.max()), 1),
+        )
+        rows = k_fp8.shape[0]
+        k_bytes = k_fp8.view(torch.uint8).view(rows, -1)
+        s_bytes = k_scale.view(torch.uint8).view(rows, -1)
+        gathered = dcp_gather_request_rows(
+            torch.cat([k_bytes, s_bytes], dim=-1), seq_lens_cpu
+        )
+        k_fp8, k_scale = gathered.split([k_bytes.shape[1], s_bytes.shape[1]], dim=-1)
+        return k_fp8.contiguous(), k_scale.contiguous()
+
     def _forward_cuda_k_only(
         self,
         x: torch.Tensor,
@@ -1862,13 +1938,26 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # MLA: use dummy logits with topk kernel's fast path to generate indices
         # When length <= 2048, naive_topk_cuda directly generates [0,1,...,length-1,-1,...]
         seq_lens_expanded = metadata.get_seqlens_expanded()
-        dummy_logits = torch.zeros(
-            seq_lens_expanded.shape[0],
-            self.index_topk,
-            dtype=torch.float32,
-            device=x_meta.device,
-        )
-        raw_topk_result = metadata.topk_transform(dummy_logits, self.index_topk)
+        if dsa_shards_index_k() and (
+            forward_batch.forward_mode.is_decode_or_idle()
+            or forward_batch.forward_mode.is_target_verify()
+        ):
+            # Widened slots of every visible position; verify rows pass their
+            # per-row (causal) global lengths.
+            raw_topk_result = dcp_all_visible(
+                seq_lens_expanded,
+                metadata.get_page_table_64(),
+                self.index_topk,
+                get_token_to_kv_pool().page_size,
+            )
+        else:
+            dummy_logits = torch.zeros(
+                seq_lens_expanded.shape[0],
+                self.index_topk,
+                dtype=torch.float32,
+                device=x_meta.device,
+            )
+            raw_topk_result = metadata.topk_transform(dummy_logits, self.index_topk)
         if topk_result is not None:
             # PCG/BCG: fill the valid prefix of the padded static buffer and
             # leave padded rows at the -1 sentinel.
@@ -1903,6 +1992,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if hasattr(pool, "_is_layer_owned") and not pool._is_layer_owned(layer_id):
             return
 
+        dcp_size, dcp_rank = _index_k_dcp()
         if (
             _is_cuda
             and (not _is_fp8_fnuz)
@@ -1913,14 +2003,33 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             )
         ):
             # NOTE: wrapper already normalizes shape/contiguity and asserts dtypes.
-            for buf, loc, rows in _index_k_write_targets(pool, layer_id, out_cache_loc):
+            if dcp_size > 1:
+                # K3.1 shards index-K by token: the kernel keeps this rank's rows
+                buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
                 fused_store_index_k_cache(
-                    key if rows is None else key.index_select(0, rows),
+                    key,
                     buf,
-                    loc,
+                    out_cache_loc,
                     pool.index_page_size,
+                    dcp_size=dcp_size,
+                    dcp_rank=dcp_rank,
                 )
+            else:
+                for buf, loc, rows in _index_k_write_targets(
+                    pool, layer_id, out_cache_loc
+                ):
+                    fused_store_index_k_cache(
+                        key if rows is None else key.index_select(0, rows),
+                        buf,
+                        loc,
+                        pool.index_page_size,
+                    )
             return
+
+        # K3.1 shards index-K like the MLA KV under DCP; only the fused store
+        # maps the widened write loc to this rank's row (slot // N) and skips
+        # the tokens of other ranks.
+        assert dcp_size == 1, "DSA index-K writes under DCP need the CUDA fused store"
 
         # Fast path: AITER fused quant + cache store
         # When _use_aiter_preshuffle is True we use the new MFMA 16x16 preshuffle
