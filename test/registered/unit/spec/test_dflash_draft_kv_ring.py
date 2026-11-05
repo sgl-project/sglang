@@ -154,9 +154,10 @@ class TestResolveMHADraftKVRing(CustomTestCase):
         with _switch(None):
             self.assertFalse(self._resolve(_mha_args(), draft_cfg=None))
 
-    def test_on_for_a_sliding_mha_draft_on_trtllm_mha_and_fa4(self):
+    def test_on_for_a_sliding_mha_draft(self):
         cases = {
             "trtllm_mha": _mha_args(),
+            "fa3": _mha_args(speculative_draft_attention_backend="fa3"),
             "fa4": _mha_args(speculative_draft_attention_backend="fa4"),
             "pd prefill over mooncake": _mha_args(
                 disaggregation_mode="prefill",
@@ -177,7 +178,6 @@ class TestResolveMHADraftKVRing(CustomTestCase):
             "attn cp": _mha_args(attn_cp_size=2),
             "dp attention": _mha_args(attn_dp_size=2),
             "draft window": _mha_args(speculative_draft_window_size=512),
-            "fa3": _mha_args(speculative_draft_attention_backend="fa3"),
         }
         for name, args in cases.items():
             with self.subTest(name), _switch():

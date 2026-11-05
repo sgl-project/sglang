@@ -43,7 +43,7 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 
-DFLASH_MHA_RING_DRAFT_BACKENDS = ("trtllm_mha", "fa4")
+DFLASH_MHA_RING_DRAFT_BACKENDS = ("trtllm_mha", "fa3", "fa4")
 
 
 def dflash_dcp_mla_draft_backend() -> str:
