@@ -25,6 +25,7 @@ runtime_base = [
   "anthropic>=0.20.0",
   "apache-tvm-ffi",
   "av",
+  "blake3>=1.0.0",
   "blobfile==3.0.0",
   "build",
   "datasets",
@@ -110,7 +111,7 @@ tracing = [
 
 # Monokernels for gfx950 (--enable-amd-monokernel); the ROCm image checks out this pin too.
 monokernels_hip = [
-  "sgl-amd-mono @ git+https://github.com/sgl-project/sgl-amd-mono.git@b10f3b71c45a70f504c5cad2d622c3e423196e90",
+  "sgl-amd-mono @ git+https://github.com/sgl-project/sgl-amd-mono.git@e52803f9d2b7dabff4bfd2f53ec25c03d56af947",
 ]
 
 # HIP (Heterogeneous-computing Interface for Portability) for AMD

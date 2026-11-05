@@ -18,8 +18,8 @@ from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     SchedulerPoolStatsObserver,
 )
 from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
     ListKind,
-    _RequestList,
 )
 from sglang.srt.managers.utils import allocate_distinct_stream
 from sglang.srt.mem_cache.allocator import (
@@ -378,7 +378,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
             ),
             queue=decode_queue(ListKind.PD_PREALLOC),
             pending_reqs=[],
-            retracted_queue=_RequestList(ListKind.PD_RETRACTED),
+            retracted_queue=IndexedReqList(ListKind.PD_RETRACTED),
             _prefill_dp_rank_queries={},
             _num_published_destinations=0,
             num_reserved_decode_tokens=0,
@@ -776,7 +776,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
                     (resumed.kv.req_pool_idx, slice(0, self.num_tokens)), reused
                 )
 
-            queue.retracted_queue = _RequestList(ListKind.PD_RETRACTED)
+            queue.retracted_queue = IndexedReqList(ListKind.PD_RETRACTED)
             queue.retracted_queue.join([req])
             with (
                 patch.object(queue, "_uses_swa_reservation", return_value=False),

@@ -26,15 +26,9 @@ from sglang.srt.layers.logits_processor import (
 )
 from sglang.srt.managers.auxiliary_output import CommittedTokens
 from sglang.srt.managers.req_types import FINISH_ABORT, FINISH_MATCHED_TOKEN
-from sglang.srt.managers.schedule_batch import (
-    Req,
-    ScheduleBatch,
-    mamba_lazy_spec_in_window,
-)
-from sglang.srt.mem_cache.common import (
-    checkpoint_kv_cache,
-    release_kv_cache,
-)
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.mem_cache.common import checkpoint_kv_cache
+from sglang.srt.mem_cache.kv.advance import TrackingAdvance
 from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.model_executor.forward_batch_info import (
     get_required_capture_hidden_mode,
@@ -47,7 +41,6 @@ from sglang.srt.runtime_context import (
     get_memory,
     get_observability,
     mamba_track_grid,
-    max_speculative_num_draft_tokens,
 )
 from sglang.srt.sampling.sampling_params import (
     get_request_reasoning_end_token_ids,
@@ -72,6 +65,9 @@ if TYPE_CHECKING:
     )
     from sglang.srt.managers.scheduler_components.output_streamer import (
         SchedulerOutputStreamer,
+    )
+    from sglang.srt.managers.scheduler_components.request_retirer import (
+        RequestRetirer,
     )
     from sglang.srt.managers.tp_worker import BaseTpWorker
     from sglang.srt.managers.utils import (
@@ -152,6 +148,7 @@ class SchedulerBatchResultProcessor:
     logprob_result_processor: SchedulerLogprobResultProcessor
     output_streamer: SchedulerOutputStreamer
     beam_coordinator: BeamCoordinator
+    request_retirer: RequestRetirer
     abort_request: Callable
     uocr_runtime: Optional[UocrSchedulerRuntime] = None
     # Hands requests out of the scheduler's prefill_launched_reqs.
@@ -167,9 +164,7 @@ class SchedulerBatchResultProcessor:
             req.update_finish_state()
             if req.finished():
                 req.time_stats.set_quick_finish_time()
-                if get_memory().enable_hisparse:
-                    self.hisparse_coordinator.request_finished(req)
-                release_kv_cache(req, self.tree_cache, checkpoint=True)
+                self.request_retirer.release_finished(req, checkpoint=True)
 
         # Note: Logprobs should be handled on the prefill engine.
         self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
@@ -192,7 +187,8 @@ class SchedulerBatchResultProcessor:
         if not req.return_routed_experts:
             return
         capturer = get_global_experts_capturer()
-        if capturer is None:
+        # Only the rank that sends outputs keeps routed experts on the host.
+        if capturer is None or not capturer.has_host_cache:
             return
         start_len = req.routed_experts_start_len
         seqlen = len(req.origin_input_ids) + len(req.output_ids_through_stop)
@@ -448,14 +444,10 @@ class SchedulerBatchResultProcessor:
                         if discard_finish_reason is None:
                             self._maybe_collect_routed_experts(req)
                             self._maybe_collect_indexer_topk(req)
-                        if get_memory().enable_hisparse:
-                            self.hisparse_coordinator.request_finished(req)
                         if batch.decoding_reqs and req in batch.decoding_reqs:
                             self._prepare_kv_cache_release(req)
-                        release_kv_cache(
-                            req,
-                            self.tree_cache,
-                            checkpoint=discard_finish_reason is None,
+                        self.request_retirer.release_finished(
+                            req, checkpoint=discard_finish_reason is None
                         )
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
@@ -541,7 +533,7 @@ class SchedulerBatchResultProcessor:
                 if req.discard_output_reason is not None and not is_middle_chunk:
                     req.request_finish(req.discard_output_reason)
                     req.update_finish_state(0)
-                    release_kv_cache(req, self.tree_cache, checkpoint=False)
+                    self.request_retirer.release_finished(req, checkpoint=False)
                     req.time_stats.set_completion_time()
                     continue
 
@@ -559,7 +551,7 @@ class SchedulerBatchResultProcessor:
                     req.update_finish_state()
 
                     if req.finished():
-                        release_kv_cache(req, self.tree_cache, checkpoint=True)
+                        self.request_retirer.release_finished(req, checkpoint=True)
                         req.time_stats.set_completion_time()
                     else:
                         checkpoint_kv_cache(req, self.tree_cache)
@@ -1459,10 +1451,8 @@ class SchedulerBatchResultProcessor:
         if get_disagg().disaggregation_decode_enable_offload_kvcache:
             self.decode_offload_manager.finalize_release_on_finish(req)
         else:
-            if get_memory().enable_hisparse:
-                self.hisparse_coordinator.request_finished(req)
             self._prepare_kv_cache_release(req)
-            release_kv_cache(req, self.tree_cache, checkpoint=False)
+            self.request_retirer.release_finished(req, checkpoint=False)
         req.time_stats.set_completion_time()
 
     def _handle_finish_state_updated_req(
@@ -1491,20 +1481,16 @@ class SchedulerBatchResultProcessor:
                 known_mamba_boundary = bool(batch.mamba_track_mask_next_cpu[i])
 
             if completed_mamba_boundary and not lazy:
-                req.kv.mamba_last_track_idx = batch.mamba_track_buffer_indices[i]
-                # The slot that stops being the latest still holds its
-                # checkpoint; name it so a short key can fall back to it.
-                req.kv.mamba_prev_track_seqlen = req.kv.mamba_last_track_seqlen
-                req.kv.mamba_last_track_seqlen = req.kv.kv_committed_len - lookahead
-            elif (
-                req.finished()
-                and lazy
-                and lookahead == 1
-                and known_mamba_boundary
-                and req.kv.mamba_next_track_idx == req.kv.mamba_last_track_idx
-                and req.kv.mamba_untracked_decode_batch_idx != req.decode_batch_idx
-            ):
-                req.mamba_lazy_checkpoint = False
+                kv_storage_of(
+                    batch.req_to_token_pool, batch.token_to_kv_pool_allocator
+                ).advance(
+                    req,
+                    tracking=TrackingAdvance(
+                        boundary=req.kv.kv_committed_len - lookahead,
+                        last_position=batch.mamba_track_buffer_indices[i],
+                        preserve_previous=True,
+                    ),
+                )
 
         # Called here (after update_finish_state) so req.finished() is valid
         # for mamba_lazy_post_decode_at_boundary inside.
@@ -1547,15 +1533,13 @@ class SchedulerBatchResultProcessor:
                 if not self.decode_offload_manager.offload_kv_cache(req):
                     self.decode_offload_manager.finalize_release_on_finish(req)
             else:
-                if get_memory().enable_hisparse:
-                    self.hisparse_coordinator.request_finished(req)
                 self._prepare_kv_cache_release(req)
                 checkpoint = (
                     req.mamba_lazy_checkpoint
                     if get_exec().mamba.enable_mamba_extra_buffer_lazy
                     else True
                 )
-                release_kv_cache(req, self.tree_cache, checkpoint=checkpoint)
+                self.request_retirer.release_finished(req, checkpoint=checkpoint)
 
             req.time_stats.set_completion_time()
 
@@ -1682,19 +1666,30 @@ class SchedulerBatchResultProcessor:
         track_idx = req.kv.mamba_next_track_idx
         if not known_boundary and batch.mamba_track_buffer_indices is not None:
             track_idx = batch.mamba_track_buffer_indices[i]
-        previous_track_seqlen = req.kv.mamba_last_track_seqlen
-        if not known_boundary:
-            req.kv.mamba_last_track_seqlen = track_seqlen
+        storage = kv_storage_of(
+            batch.req_to_token_pool, batch.token_to_kv_pool_allocator
+        )
         if lazy:
-            # Lazy frees the slot it stops tracking, so nothing names the
-            # previous checkpoint there; mamba_prev_track_seqlen stays None.
+            if not known_boundary:
+                storage.advance(req, tracking=TrackingAdvance(boundary=track_seqlen))
             self.mamba_lazy_post_decode_at_boundary(req, batch, track_idx)
         else:
             if not known_boundary:
-                req.kv.mamba_last_track_idx = track_idx
-                req.kv.mamba_prev_track_seqlen = previous_track_seqlen
-            req.kv.mamba_next_track_idx = (
-                batch.req_to_token_pool.get_mamba_ping_pong_other_idx(track_idx)
+                storage.advance(
+                    req,
+                    tracking=TrackingAdvance(
+                        boundary=track_seqlen,
+                        last_position=track_idx,
+                        preserve_previous=True,
+                    ),
+                )
+            storage.advance(
+                req,
+                tracking=TrackingAdvance(
+                    next_position=batch.req_to_token_pool.get_mamba_ping_pong_other_idx(
+                        track_idx
+                    )
+                ),
             )
 
     def _mamba_lazy_spec_update(
@@ -1704,10 +1699,11 @@ class SchedulerBatchResultProcessor:
 
         Running req with a confirmed crossing: the commit scattered the
         crossing state into the planned position; promote it to keep unless
-        the plan already pointed at the keep slot (in-place fallback, or
-        promoted by an earlier overlapped confirmation).
-        Finishing req: donate the keep slot only if no scatter wrote it
-        (this step) or may still write it (the in-flight next step).
+        the plan already pointed at the keep slot (promoted by an earlier
+        overlapped confirmation). A -1 plan had no slot: the keep slot and
+        mamba_last_track_seqlen stay.
+        Finishing req: donate the keep slot only if this step's scatter did
+        not write it.
         """
         positions = batch.mamba_lazy_spec_track_positions_cpu
         planned_pos = (
@@ -1717,40 +1713,30 @@ class SchedulerBatchResultProcessor:
         )
 
         if req.finished():
-            # Skip the donation if a scatter wrote or may still write the keep slot.
+            # Skip the donation if this step's scatter wrote the keep slot.
             keep_written_by_this_step = (
                 crossed and planned_pos == req.kv.mamba_next_track_idx
             )
-            other_idx = 1 - req.kv.mamba_next_track_idx
-            # Recompute the in-flight verify's plan (kv_committed_len is
-            # frozen since its prepare, so the recompute is exact).
-            keep_may_be_written_in_flight = req.kv.mamba_ping_pong_empty[
-                other_idx
-            ] and mamba_lazy_spec_in_window(
-                req,
-                mamba_track_grid(self.tree_cache.page_size),
-                max_speculative_num_draft_tokens(),
-            )
-            if (
-                planned_pos is None
-                or keep_written_by_this_step
-                or keep_may_be_written_in_flight
-            ):
+            if planned_pos is None or keep_written_by_this_step:
                 req.mamba_lazy_checkpoint = False
             return
 
-        if not crossed or planned_pos is None:
+        if not crossed or planned_pos is None or planned_pos < 0:
             return
-        if planned_pos != req.kv.mamba_next_track_idx:
-            # Promote pending -> keep: free the old checkpoint, repoint.
-            kv_storage_of(
-                batch.req_to_token_pool, batch.token_to_kv_pool_allocator
-            ).release_tracking_slot(req, req.kv.mamba_next_track_idx)
-            req.kv.mamba_next_track_idx = planned_pos
-        # else: in-place fallback, or promoted by an earlier confirmation —
-        # keep holds the track_seqlen state either way.
-        req.kv.mamba_last_track_idx = planned_pos
-        req.kv.mamba_last_track_seqlen = track_seqlen
+        old_position = req.kv.mamba_next_track_idx
+        kv_storage_of(
+            batch.req_to_token_pool, batch.token_to_kv_pool_allocator
+        ).advance(
+            req,
+            tracking=TrackingAdvance(
+                boundary=track_seqlen,
+                last_position=planned_pos,
+                next_position=planned_pos,
+                release_positions=(old_position,)
+                if planned_pos != old_position
+                else (),
+            ),
+        )
 
     @staticmethod
     def _mamba_assert_committed_len_lookahead(req: Req) -> None:
@@ -1806,10 +1792,13 @@ class SchedulerBatchResultProcessor:
         self, req: Req, batch: ScheduleBatch, track_idx: int
     ):
         """Commit a completed lazy-mode boundary and free its old slot."""
-        req.kv.mamba_last_track_idx = track_idx
-        req.kv.mamba_next_track_idx = track_idx
-        other_idx = 1 - track_idx
-        if not req.kv.mamba_ping_pong_empty[other_idx]:
-            kv_storage_of(
-                batch.req_to_token_pool, batch.token_to_kv_pool_allocator
-            ).release_tracking_slot(req, other_idx)
+        kv_storage_of(
+            batch.req_to_token_pool, batch.token_to_kv_pool_allocator
+        ).advance(
+            req,
+            tracking=TrackingAdvance(
+                last_position=track_idx,
+                next_position=track_idx,
+                release_positions=(1 - track_idx,),
+            ),
+        )

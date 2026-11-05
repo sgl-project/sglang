@@ -11,7 +11,6 @@ from typing import (
     Iterator,
     List,
     Optional,
-    Set,
 )
 
 if TYPE_CHECKING:
@@ -42,7 +41,7 @@ class ListKind(enum.Enum):
     DEFERRED = enum.auto()
 
 
-class RequestList(ABC):
+class ReqList(ABC):
     """A list of live requests. Every live request is in exactly one list."""
 
     kind: ListKind
@@ -74,10 +73,44 @@ class RequestList(ABC):
         return sum(1 for _ in self)
 
 
-class _RequestList(RequestList):
-    """Requests in join order, held by identity. Each change rebinds a new dict,
-    so leaving while iterating is safe. An owner that wraps each request joins
-    the wrappers and passes `req_of` to unwrap them."""
+class KeyedReqList(ReqList):
+    """Requests in join order, held in a dict by identity: for a list asked `in`
+    often. Changed in place, so a loop that changes the list iterates a copy."""
+
+    def __init__(self, kind: ListKind) -> None:
+        self.kind = kind
+        self._reqs: Dict[Req, None] = {}
+
+    def join(self, reqs: Iterable[Req]) -> None:
+        """Add the given requests; ones already in keep their place."""
+        for req in reqs:
+            self._reqs.setdefault(req, None)
+
+    def leave(self, reqs: Iterable[Req]) -> None:
+        """Drop the given requests; ones not in are ignored."""
+        for req in reqs:
+            self._reqs.pop(req, None)
+
+    def leave_finished(self) -> None:
+        self.leave([req for req in self._reqs if req.finished()])
+
+    def clear(self) -> None:
+        self._reqs.clear()
+
+    def __iter__(self) -> Iterator[Req]:
+        return iter(self._reqs)
+
+    def __len__(self) -> int:
+        return len(self._reqs)
+
+    def __contains__(self, req: Req) -> bool:
+        return req in self._reqs
+
+
+class IndexedReqList(ReqList):
+    """The default list: items in an order the owner sets, held in a list, for a
+    queue scanned in order and dropped from in batches. An owner that wraps each
+    request stores the wrappers and passes `req_of` to unwrap them."""
 
     def __init__(
         self,
@@ -89,53 +122,51 @@ class _RequestList(RequestList):
         self.kind = kind
         self._abort = abort
         self._req_of = req_of
-        self._items: Dict[Req, Any] = {}
+        self._items: List[Any] = []
 
     def join(self, items: Iterable) -> None:
-        """Add the given items; ones whose request is already in keep their place."""
-        joining = {}
-        for item in items:
-            req = self._req_of(item)
-            if req not in self._items:
-                joining.setdefault(req, item)
-        if joining:
-            self._items = {**self._items, **joining}
+        """Add the given items at the back, in order."""
+        self._items.extend(items)
+
+    def prepend(self, items: Iterable) -> None:
+        """Add the given items at the front, in order."""
+        self._items[:0] = items
+
+    def replace(self, items: Iterable) -> None:
+        self._items = list(items)
 
     def leave(self, reqs: Iterable[Req]) -> None:
-        """Drop the given requests; ones not in are ignored."""
-        self._drop({req for req in reqs if req in self._items})
-
-    def leave_finished(self) -> None:
-        self._drop({req for req in self._items if req.finished()})
+        """Drop the items of the given requests; ones not in are ignored."""
+        leaving = set(reqs)
+        if leaving:
+            self._items = [
+                item for item in self._items if self._req_of(item) not in leaving
+            ]
 
     def clear(self) -> None:
-        self._items = {}
+        self._items = []
 
     def abort(self, recv_req: AbortReq) -> None:
         if self._abort is not None:
             self._abort(recv_req)
 
     def items(self) -> Iterator:
-        """The joined items, in list order."""
-        return iter(self._items.values())
+        return iter(self._items)
 
     def __iter__(self) -> Iterator[Req]:
-        return iter(self._items)
+        return map(self._req_of, self._items)
 
     def __len__(self) -> int:
         return len(self._items)
 
     def __contains__(self, req: Req) -> bool:
-        return req in self._items
+        return any(self._req_of(item) is req for item in self._items)
 
-    def _drop(self, leaving: Set[Req]) -> None:
-        if leaving:
-            self._items = {
-                req: item for req, item in self._items.items() if req not in leaving
-            }
+    def __getitem__(self, index):
+        return self._items[index]
 
 
-def move(reqs: Iterable[Req], src: RequestList, dst: RequestList) -> None:
+def move(reqs: Iterable[Req], src: ReqList, dst: ReqList) -> None:
     """Move requests from `src` to `dst`; each must be in `src`."""
     reqs = list(reqs)
     missing = [req.rid for req in reqs if req not in src]
