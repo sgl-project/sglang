@@ -211,6 +211,8 @@ class TestPostFoldRelay(unittest.TestCase):
         self.assertIs(overlap_utils._offered_relay, relay)
 
         fm = overlap_utils.FutureMap.__new__(overlap_utils.FutureMap)
+        # Deferred relays arrive in R7; production initializes this in __init__.
+        fm._deferred_relay = None
         fm.needs_confidence_relay = False
         fm.spec_algo = SimpleNamespace(is_some=lambda: False, is_ngram=lambda: False)
         fm._adopt_relay(relay)
