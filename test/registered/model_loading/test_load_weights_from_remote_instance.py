@@ -356,16 +356,11 @@ class TestLoadWeightsFromRemoteInstance(CustomTestCase):
         # test_suits : tp, dp, model_name, backend, dst_instance_id
         if is_in_ci():
             # FIXME: refactor this test to have less random behavior
-            mode = random.choice(["Engine", "Server"])
-            remote_instance_loader_backend = random.choice(["nccl", "transfer_engine"])
+            # VALIDATION ONLY (michael/amd-mooncake-hip-ipc-validate): pin the
+            # transfer_engine backend and run both modes.
             test_suits = [
-                (
-                    1,
-                    1,
-                    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-                    [mode],
-                    remote_instance_loader_backend,
-                ),
+                (1, 1, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, ["Engine"], "transfer_engine"),
+                (1, 1, DEFAULT_SMALL_MODEL_NAME_FOR_TEST, ["Server"], "transfer_engine"),
             ]
         else:
             test_suits = [

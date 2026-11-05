@@ -135,7 +135,7 @@ jobs:
   extra-a-test-1-gpu-small-amd:
     name: ${{ format('extra-a-test-1-gpu-small-amd ({0}, linux-{1}-1gpu-sglang, {2})', inputs.rocm_version || 'rocm10', inputs.runner_arch || 'mi300', matrix.part) }}
     needs: [call-gate]
-    if: ${{ !cancelled() && needs.call-gate.result == 'success' }}
+    if: false  # VALIDATION ONLY
     strategy:
       fail-fast: false
       matrix:
@@ -172,7 +172,7 @@ jobs:
   extra-a-test-1-gpu-large-amd:
     name: ${{ format('extra-a-test-1-gpu-large-amd ({0}, linux-{1}-1gpu-sglang, {2})', inputs.rocm_version || 'rocm10', inputs.runner_arch || 'mi300', matrix.part) }}
     needs: [call-gate]
-    if: ${{ !cancelled() && needs.call-gate.result == 'success' }}
+    if: false  # VALIDATION ONLY
     strategy:
       fail-fast: false
       matrix:
@@ -205,13 +205,16 @@ jobs:
   # throughput. Mirrors CUDA's extra-a 2-gpu-large stage; runs on the 2-GPU
   # AMD pool.
   extra-a-test-2-gpu-large-amd:
-    name: ${{ format('extra-a-test-2-gpu-large-amd ({0}, linux-{1}-2gpu-sglang, {2})', inputs.rocm_version || 'rocm10', inputs.runner_arch || 'mi300', matrix.part) }}
+    # VALIDATION ONLY (michael/amd-mooncake-hip-ipc-validate): run
+    # test_load_weights_from_remote_instance.py with transfer_engine, once on
+    # the image's Mooncake and once with Mooncake rebuilt at the PR's pin.
+    name: ${{ format('remote-instance transfer_engine ({0}, linux-{1}-2gpu-sglang, mooncake={2})', inputs.rocm_version || 'rocm10', inputs.runner_arch || 'mi300', matrix.mooncake) }}
     needs: [call-gate]
     if: ${{ !cancelled() && needs.call-gate.result == 'success' }}
     strategy:
       fail-fast: false
       matrix:
-        part: [0, 1]
+        mooncake: [image, pr-pin]
     runs-on: ${{ format('linux-{0}-2gpu-sglang', inputs.runner_arch || 'mi300') }}
     steps:
       - name: Checkout code
@@ -230,18 +233,41 @@ jobs:
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
 
-      - name: Run test
-        timeout-minutes: 60
+      - name: Rebuild Mooncake at the Dockerfile pin
+        if: matrix.mooncake == 'pr-pin'
+        timeout-minutes: 45
         run: |
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite extra-a-test-2-gpu-large-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 1800 ${{ inputs.continue_on_error == true && '--continue-on-error' || '' }}
+          MOONCAKE_COMMIT=$(grep '^ARG MOONCAKE_COMMIT=' docker/rocm.Dockerfile | cut -d'"' -f2)
+          echo "Rebuilding Mooncake at ${MOONCAKE_COMMIT}"
+          docker exec ci_sglang bash -c "
+            set -ex
+            rm -rf /tmp/Mooncake
+            git clone https://github.com/kvcache-ai/Mooncake.git /tmp/Mooncake
+            cd /tmp/Mooncake
+            git checkout ${MOONCAKE_COMMIT}
+            git submodule update --init --recursive
+            bash dependencies.sh -y
+            export PATH=\$PATH:/usr/local/go/bin
+            mkdir -p build && cd build
+            cmake .. -DUSE_HIP=ON -DUSE_ETCD=ON -DENABLE_MULTI_PROTOCOL=ON -DWITH_STORE=ON -DBUILD_UNIT_TESTS=OFF
+            make -j \$(nproc)
+            make install
+            git -C /tmp/Mooncake log -1 --oneline
+          "
 
-  # =============================================== extra-b (4-gpu) ===============================================
-  # 4-GPU tests that CUDA runs in extra-b. Same container env as the
-  # stage-c-test-4-gpu-amd job in pr-test-amd.yml.
+      - name: Show Mooncake build in use
+        run: |
+          docker exec ci_sglang bash -c "python3 -c 'import mooncake, os; d=os.path.dirname(mooncake.__file__); print(d)' && ls -la --time-style=full-iso \$(python3 -c 'import mooncake, os; print(os.path.dirname(mooncake.__file__))') | grep -E '\.so'"
+
+      - name: Run test
+        timeout-minutes: 30
+        run: |
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 registered/model_loading/test_load_weights_from_remote_instance.py
+
   extra-b-test-4-gpu-amd:
     name: ${{ format('extra-b-test-4-gpu-amd ({0}, linux-{1}-4gpu-sglang)', inputs.rocm_version || 'rocm10', inputs.runner_arch || 'mi300') }}
     needs: [call-gate]
-    if: ${{ !cancelled() && needs.call-gate.result == 'success' }}
+    if: false  # VALIDATION ONLY
     runs-on: ${{ format('linux-{0}-4gpu-sglang', inputs.runner_arch || 'mi300') }}
     steps:
       - name: Checkout code
