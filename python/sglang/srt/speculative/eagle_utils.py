@@ -31,7 +31,6 @@ from sglang.srt.mem_cache.allocation_sizing import (
 )
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.utils import (
-    get_bool_env_var,
     is_cpu,
     is_cuda,
     is_hip,
@@ -52,7 +51,7 @@ if TYPE_CHECKING:
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 _is_xpu = is_xpu()
 _is_cpu = is_cpu()
 _COMPACT_VERIFY_SAMPLING = envs.SGLANG_OPT_SPEC_COMPACT_VERIFY_SAMPLING.get()
@@ -570,37 +569,32 @@ def _sparse_rejection_target_probs(
     from sglang.srt.speculative.dflash_utils import _adjust_top_p_for_top_k
 
     rows, vocab_size = next_token_logits.shape
+
+    def per_row(x):
+        return x.repeat_interleave(rows_per_request, dim=0).view(rows, 1)
+
     # ties with the k-th logit stay in, as in top_k_renorm_prob
     width = min(vocab_size, max_top_k + 32)
-    logits, token_ids = torch.topk(next_token_logits, width, dim=-1, sorted=True)
-    temperatures = sampling_info.temperatures.repeat_interleave(
-        rows_per_request, dim=0
-    ).view(rows, 1)
+    logits, token_ids = torch.topk(next_token_logits, width, dim=-1)
+    temperatures = per_row(sampling_info.temperatures)
     logits = logits.float() / temperatures
-    top_ks = sampling_info.top_ks.repeat_interleave(rows_per_request, dim=0)
-    pivots = logits.gather(1, (top_ks.long() - 1).clamp_(0, width - 1).view(rows, 1))
+    top_ks = per_row(sampling_info.top_ks).long()
+    pivots = logits.gather(1, (top_ks - 1).clamp_(0, width - 1))
     logits.masked_fill_(logits < pivots, float("-inf"))
     probs = torch.softmax(logits, dim=-1)
     if sampling_info.need_top_p_sampling:
         # The nucleus is cut on the full distribution, so the top-k mass it must
         # reach is top_p scaled by the top-k share of the vocabulary's mass.
         top_ps = _adjust_top_p_for_top_k(
-            logits,
-            next_token_logits,
-            sampling_info.top_ps.repeat_interleave(rows_per_request, dim=0).view(
-                rows, 1
-            ),
-            temperatures,
+            logits, next_token_logits, per_row(sampling_info.top_ps), temperatures
         )
         ascending = probs.flip(-1)
-        cutoff = torch.searchsorted(
-            ascending.cumsum(-1), 1.0 - top_ps.float(), right=False
-        ).clamp_(max=width - 1)
+        cutoff = torch.searchsorted(ascending.cumsum(-1), 1.0 - top_ps).clamp_(
+            max=width - 1
+        )
         probs = probs.masked_fill(probs < ascending.gather(1, cutoff), 0.0)
         probs.div_(probs.sum(-1, keepdim=True))
-    target_probs = torch.zeros(
-        rows, vocab_size, dtype=torch.float32, device=next_token_logits.device
-    )
+    target_probs = torch.zeros_like(next_token_logits, dtype=torch.float32)
     return target_probs.scatter_(1, token_ids, probs)
 
 
@@ -628,11 +622,9 @@ def _apply_joint_top_k_top_p(
 
 
 def compact_verify_max_top_k(batch: ScheduleBatch) -> Optional[int]:
-    """The support for eagle_sample's top-k branches, or None for the dense branch:
-    every request must sample with a finite top-k within the compact limit.
-    SGLANG_OPT_SPEC_COMPACT_VERIFY_SAMPLING turns it on; when it is unset,
-    rejection sampling on the AITER (ROCm) path does too, since its top-k target
-    probs equal the dense ones."""
+    """The top-k support for eagle_sample's top-k branches, or None for dense. On when
+    SGLANG_OPT_SPEC_COMPACT_VERIFY_SAMPLING is set, or unset with rejection sampling
+    on the AITER path. Every request needs a finite top-k within the compact limit."""
     enabled = _COMPACT_VERIFY_SAMPLING or (
         _use_aiter
         and not _COMPACT_VERIFY_SAMPLING_SET

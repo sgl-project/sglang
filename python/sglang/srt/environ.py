@@ -1680,7 +1680,6 @@ class Envs:
     )
     # A verify whose requests all sample with a finite top-k within the compact limit
     # samples on that support (eagle_sample's compact branch), graphed or eager.
-    # Unset, rejection sampling also builds its target probs on that support.
     SGLANG_OPT_SPEC_COMPACT_VERIFY_SAMPLING = EnvBoolWithAlias(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get,
         deprecated_name="SGLANG_Q35MF_EDGE_SPARSE_VERIFY_SAMPLING",
