@@ -58,6 +58,7 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+from sglang.srt.layers.ple_short_conv import chunked_packed_short_conv
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptMixedPrecisionConfig,
@@ -1227,13 +1228,41 @@ class Qwen4ExpPLELayer(nn.Module):
         )
         padded_seq[batch.req_indices, batch.token_offsets] = x
         conv_input = torch.cat([state, padded_seq.transpose(1, 2)], dim=-1)
-        conv_output = F.conv1d(
-            conv_input,
-            self.conv1d.weight.to(dtype=x.dtype),
-            bias=None,
-            dilation=self.short_conv_dilation,
-            groups=self.conv_channels,
-        ).transpose(1, 2)
+        conv_chunk_size = envs.SGLANG_PLE_PREFILL_CONV_CHUNK_SIZE.get()
+        conv_lengths = (
+            forward_batch.extend_seq_lens_cpu if conv_chunk_size > 0 else None
+        )
+        chunked = (
+            conv_chunk_size > 0
+            and batch.row_width > conv_chunk_size
+            and x.dtype == torch.bfloat16
+            and batch.mode.is_extend_without_speculative()
+            # BCG runs this body eagerly with the live layout at each break.
+            # A fully captured graph must not bake in host request boundaries.
+            and (not get_is_capture_mode() or is_in_breakable_cuda_graph())
+            and conv_lengths is not None
+            and len(conv_lengths) == batch.lengths.shape[0]
+            and all(0 <= length <= batch.row_width for length in conv_lengths)
+            and sum(conv_lengths) == x.shape[0]
+        )
+        if chunked:
+            # conv_input owns the history and padding needed by state commits.
+            del padded_seq
+            conv_output = chunked_packed_short_conv(
+                conv_input,
+                self.conv1d.weight.to(dtype=x.dtype),
+                conv_lengths,
+                dilation=self.short_conv_dilation,
+                chunk_size=conv_chunk_size,
+            )
+        else:
+            conv_output = F.conv1d(
+                conv_input,
+                self.conv1d.weight.to(dtype=x.dtype),
+                bias=None,
+                dilation=self.short_conv_dilation,
+                groups=self.conv_channels,
+            ).transpose(1, 2)
 
         if batch.mode.is_target_verify():
             intermediate_cache = short_conv.view.layer_intermediate_cache(
@@ -1306,6 +1335,8 @@ class Qwen4ExpPLELayer(nn.Module):
                     dtype=conv_state.dtype
                 )
 
+        if chunked:
+            return F.silu(conv_output)
         return F.silu(conv_output[batch.req_indices, batch.token_offsets])
 
     def forward_idle(self, forward_batch: ForwardBatch) -> None:

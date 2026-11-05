@@ -334,6 +334,8 @@ class Envs:
     # that the gate rows above use, with the same arithmetic. 0 keeps the default path there.
     SGLANG_HC_FUSED_COMBINE_MAX_ROWS = EnvInt(0)
     SGLANG_ENABLE_PLE_STATE_INDEX_MASK = EnvBool(False)
+    # Prefill depthwise-convolution output tokens per call; zero keeps stock.
+    SGLANG_PLE_PREFILL_CONV_CHUNK_SIZE = EnvInt(0)
     # Keep the frozen cluster path by default; opt in to native rows except M4.
     SGLANG_Q38C_HC_CLUSTER_M4ONLY = EnvBool(False)
     # Experimental FN target router + input NVFP4 quantization, SM103 TP1/EP1.
