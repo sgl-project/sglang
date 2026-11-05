@@ -47,6 +47,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
+    maybe_remap_kv_scale_name,
     sharded_weight_loader,
 )
 from sglang.srt.runtime_context import get_parallel
@@ -177,6 +178,7 @@ class Lfm2Attention(nn.Module):
             scaling=self.scaling,
             num_kv_heads=self.num_local_kv_heads,
             layer_id=layer_id,
+            quant_config=quant_config,
             attn_type=attn_type,
             prefix=add_prefix("attn", prefix),
         )
@@ -650,6 +652,12 @@ class Lfm2BidirectionalModel(Lfm2Model):
             if ".conv.conv.bias" in name:
                 name = name.replace(".conv.conv.bias", ".conv.conv_bias")
 
+            # Handle FP8 kv-scale remapping
+            if "scale" in name:
+                name = maybe_remap_kv_scale_name(name, params_dict)
+                if name is None:
+                    continue
+
             # Handle QKV stacking
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
@@ -774,6 +782,12 @@ class Lfm2ForCausalLM(nn.Module):
                 loaded_weight = loaded_weight.squeeze(1)  # (D, 1, K) -> (D, K)
             if ".conv.conv.bias" in name:
                 name = name.replace(".conv.conv.bias", ".conv.conv_bias")
+
+            # Handle FP8 kv-scale remapping
+            if "scale" in name:
+                name = maybe_remap_kv_scale_name(name, params_dict)
+                if name is None:
+                    continue
 
             # Handle QKV stacking
             for param_name, weight_name, shard_id in stacked_params_mapping:

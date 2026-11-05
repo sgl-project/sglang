@@ -30,7 +30,10 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    maybe_remap_kv_scale_name,
+)
 from sglang.srt.models.hunyuan_v3 import HYV3DecoderLayer
 from sglang.srt.runtime_context import get_stream
 from sglang.srt.utils import is_cuda
@@ -206,6 +209,12 @@ class HYV3ForCausalLMNextN(nn.Module):
 
             if "router.gate." in name:
                 name = name.replace("router.", "")
+
+            # Handle FP8 kv-scale remapping
+            if "scale" in name:
+                name = maybe_remap_kv_scale_name(name, params_dict)
+                if name is None:
+                    continue
 
             is_found = False
             for param_name, weight_name, shard_id in stacked_params_mapping:

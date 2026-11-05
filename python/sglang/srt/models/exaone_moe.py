@@ -59,7 +59,10 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.runner import get_is_capture_mode
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    maybe_remap_kv_scale_name,
+)
 from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
 from sglang.srt.utils import LazyValue, add_prefix, is_cuda, make_pp_layers
 
@@ -386,6 +389,7 @@ class ExaoneMoEAttention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
             sliding_window_size=(
                 config.sliding_window if self.sliding_window else None
@@ -758,6 +762,11 @@ class ExaoneMoEForCausalLM(nn.Module):
                 continue
             if name.startswith("model.vision_tower") and name not in params_dict:
                 continue
+            # Handle FP8 kv-scale remapping
+            if "scale" in name:
+                name = maybe_remap_kv_scale_name(name, params_dict)
+                if name is None:
+                    continue
 
             is_expert_weight = False
             for param_name, weight_name, shard_id in stacked_params_mapping:

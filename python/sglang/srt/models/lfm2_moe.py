@@ -49,6 +49,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
+    maybe_remap_kv_scale_name,
     sharded_weight_loader,
 )
 from sglang.srt.models.lfm2 import (
@@ -241,6 +242,7 @@ class Lfm2MoeAttention(nn.Module):
             scaling=self.scaling,
             num_kv_heads=self.num_local_kv_heads,
             layer_id=layer_id,
+            quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
         )
 
@@ -781,6 +783,12 @@ class Lfm2MoeForCausalLM(nn.Module):
                             expert_id=expert_id,
                         )
                     loaded_params.add(fused_name)
+                    continue
+
+            # Handle FP8 kv-scale remapping
+            if "scale" in name:
+                name = maybe_remap_kv_scale_name(name, params_dict)
+                if name is None:
                     continue
 
             # Handle stacked params (QKV, dense MLP gate_up)

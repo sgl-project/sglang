@@ -40,7 +40,10 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    maybe_remap_kv_scale_name,
+)
 from sglang.srt.runtime_context import get_parallel, get_stream
 from sglang.srt.utils import is_cuda
 from sglang.srt.utils.hf_transformers import get_rope_config
@@ -283,6 +286,7 @@ class HYV3Attention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            quant_config=quant_config,
             prefix=f"{prefix}.attn",
         )
         if self.use_qk_norm:
@@ -572,6 +576,12 @@ class HYV3ForCausalLM(nn.Module):
             if num_nextn_layers > 0 and name.startswith("model.layers."):
                 parts = name.split(".")
                 if len(parts) >= 3 and int(parts[2]) >= self.config.num_hidden_layers:
+                    continue
+
+            # Handle FP8 kv-scale remapping
+            if "scale" in name:
+                name = maybe_remap_kv_scale_name(name, params_dict)
+                if name is None:
                     continue
 
             is_found = False

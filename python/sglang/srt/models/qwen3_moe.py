@@ -593,6 +593,7 @@ class Qwen3MoeAttention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
             sliding_window_size=sliding_window_size,
+            quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
         )
 
