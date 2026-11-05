@@ -1906,7 +1906,7 @@ class DeepseekV4HipRadixBackend(
             # scored on the row-group kernel, its workspace built with the metadata
             return
         if (
-            get_parallel().attn_cp_size != 1
+            is_cp_active(forward_batch)
             or getattr(forward_batch, "tbo_children", None)
             or getattr(forward_batch, "tbo_parent_token_range", None) is not None
         ):
