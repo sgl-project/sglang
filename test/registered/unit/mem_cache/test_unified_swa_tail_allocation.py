@@ -166,7 +166,7 @@ class TestUnifiedSWATailAllocation(CustomTestCase):
                         full_tokens=192,
                         swa_tokens=48,
                         state_slots=8,
-                        lazy=False,
+                        lazy=True,
                         fused_draft=placement,
                         device="cuda",
                     )

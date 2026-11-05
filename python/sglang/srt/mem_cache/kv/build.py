@@ -53,7 +53,7 @@ class UnifiedBuildContext(msgspec.Struct, frozen=True, kw_only=True):
     end_layer: int
     enable_memory_saver: bool
     need_sort: bool
-    lazy_compaction: bool = False
+    lazy_compaction: bool = True
     forward_stream: Optional[Any] = None  # torch.cuda.Stream
     post_capture_active: bool = False
     is_draft_worker: bool = False

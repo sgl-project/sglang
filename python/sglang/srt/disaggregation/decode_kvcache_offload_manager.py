@@ -169,13 +169,14 @@ class DecodeKVCacheOffloadManager:
             virtual_indices
         )
         # Page-aligned chunks have whole-page bindings; zero denotes the sink page.
-        live_swa_indices = swa_indices[swa_indices > 0].to(torch.int64)
-        if live_swa_indices.numel() == 0:
+        # Window rows go by the owner's ids; the copy translates them.
+        live_indices = virtual_indices[swa_indices > 0].to(torch.int64)
+        if live_indices.numel() == 0:
             return full_indices, []
         return full_indices, [
             PoolTransfer(
                 name=PoolName.SWA,
-                device_indices=live_swa_indices,
+                device_indices=live_indices,
                 hit_policy=PoolHitPolicy.TRAILING_PAGES,
             )
         ]
@@ -346,9 +347,7 @@ class DecodeKVCacheOffloadManager:
         self.tree_cache.unlock(req.lock)
         req.lock = None
         kv_storage_of(
-            self.req_to_token_pool,
-            self.token_to_kv_pool_allocator,
-            tree_cache=self.tree_cache,
+            self.req_to_token_pool, self.token_to_kv_pool_allocator
         ).release_row(req)
         req.kv.mark_kv_released()
         self.offloaded_state.pop(req, None)

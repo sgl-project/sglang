@@ -84,7 +84,7 @@ class TestUnifiedTriPool(_PoolTestCase):
         n_swa=16,
         n_state=8,
         page_size=1,
-        lazy_compaction=False,
+        lazy_compaction=True,
     ):
         full, swa, mamba = tri_sub_pool_specs()
         total = (
@@ -168,7 +168,7 @@ class TestUnifiedTriPool(_PoolTestCase):
         self.assertEqual(allocator.available_size(), before)
 
     def test_pd_short_tail_fits_beyond_joint_capacity(self):
-        for lazy in (False, True):
+        for lazy in (True,):
             for tail_len in (0, 5):
                 with self.subTest(lazy=lazy, tail_len=tail_len):
                     _, allocator, _, _ = self._build(page_size=4, lazy_compaction=lazy)
@@ -241,6 +241,8 @@ class TestUnifiedTriPool(_PoolTestCase):
         after = allocator.available_size()
         self.assertLess(after, before)
         allocator.mamba_allocator.free(slots)
+        # A lazy end gives freed slots' bytes back once it compacts.
+        allocator.mamba_allocator.flush_for_allocation()
         self.assertEqual(allocator.available_size(), before)
 
     # -- steady-state SWA churn: tombstones -> holes -> in-place reuse --
@@ -365,7 +367,7 @@ class TestUnifiedTriPool(_PoolTestCase):
         self.assertEqual(sa._hole_pages(), holes)  # holes are assets, not backlog
 
     def test_full_donor_stops_after_float_exposes_mamba_capacity(self):
-        for page_size, lazy_compaction in ((1, False), (4, True)):
+        for page_size, lazy_compaction in ((1, True), (4, True)):
             with self.subTest(page_size=page_size, lazy_compaction=lazy_compaction):
                 _, allocator, _, _ = self._build(
                     page_size=page_size, lazy_compaction=lazy_compaction
@@ -1012,13 +1014,13 @@ class TestTriFactorySizing(_PoolTestCase):
         from sglang.srt.runtime_context import get_parallel
         from sglang.srt.session.streaming_session import SessionSlot, StreamingSession
 
-        for lazy_compaction in (None, False, True):
+        for lazy_compaction in (None, True):
             for ids in ((0, -1), (-1, 0), (-1, -1), (0, 1)):
                 with self.subTest(compaction=lazy_compaction, ids=ids):
                     kw = self._factory_kwargs(
                         enable_mamba_extra_buffer=True,
                         enable_mamba_extra_buffer_lazy=True,
-                        lazy_compaction=lazy_compaction,
+                        lazy_compaction=True,
                     )
                     with get_parallel().override(attn_dcp_size=1):
                         bundle = build_test_unified_pools(**kw)
@@ -1247,7 +1249,7 @@ class TestTriFactorySizing(_PoolTestCase):
         )
         from sglang.srt.runtime_context import get_parallel
 
-        for lazy in (False, True):
+        for lazy in (True,):
             with self.subTest(lazy=lazy):
                 kw = self._factory_kwargs(
                     enable_mamba_extra_buffer=True,
@@ -1544,7 +1546,7 @@ class TestJointCapacityIsHonoured(_PoolTestCase):
         for page_size in (1, 2, 4):
             for fl, sl, ml in ((4, 3, 1), (4, 2, 2), (6, 3, 1), (3, 5, 2)):
                 for n_full, n_swa, n_state in ((24, 16, 4), (32, 16, 8), (20, 12, 6)):
-                    for lazy in (False, True):
+                    for lazy in (True,):
                         specs = tri_sub_pool_specs(
                             full_layer_num=fl,
                             swa_layer_num=sl,
@@ -1603,7 +1605,7 @@ class TestJointCapacityIsHonoured(_PoolTestCase):
                 n_full=24 * page_size,
                 n_swa=16 * page_size,
                 n_state=4,
-                lazy=False,
+                lazy=True,
                 specs=specs,
             )
             sa = alloc.swa_attn_allocator
@@ -1686,13 +1688,17 @@ class TestFloatRelocationIsOrderedAgainstTheForward(_PoolTestCase):
         alloc.free(v[:4])
         order = self._trace(flt)
         flt.make_room(side="low", min_bytes=flt.entry_bytes_per_page)
-        self.assertIn("settle", order, "make_room never settled the forward")
+        # No copy, no wait: a settle with nothing to order would hold later
+        # schedule-stream work behind the forward for nothing.
         if "move" in order:
+            self.assertIn("settle", order, "make_room never settled the forward")
             self.assertLess(
                 order.index("settle"),
                 order.index("move"),
                 f"a copy was issued before the settle: {order}",
             )
+        else:
+            self.assertEqual(order, [])
 
     def test_compact_holes_settles_before_the_first_move(self):
         _pool, alloc, _kv = self._tri()

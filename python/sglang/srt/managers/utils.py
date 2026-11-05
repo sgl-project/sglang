@@ -101,6 +101,9 @@ class GenerationBatchResult:
 
     # For overlap scheduling
     copy_done: Optional[Union[torch.cuda.Event, HostCopyDone]] = None
+    # The unified pool's record of this forward; processing the result retires
+    # it, so page moves stop treating its pages as in flight.
+    unified_forward_done: Optional[torch.cuda.Event] = None
     delay_sample_func: Optional[callable] = None
     # The step's launch record, for the unified pool's processing.
     forward_launch: Optional[ForwardLaunch] = None
@@ -421,11 +424,14 @@ class EmbeddingBatchResult:
             only when the batch contained ``return_pooled_hidden_states=True``
             requests.  Tensor (uniform shapes) or list of tensors (MIS).
         copy_done: CUDA event recorded after the async CPU copy completes.
+        unified_forward_done: The unified pool's record of an overlapped
+            forward; processing the result retires it.
     """
 
     embeddings: torch.Tensor
     pooled_hidden_states: Optional[torch.Tensor] = None
     copy_done: Optional[Union[torch.cuda.Event, HostCopyDone]] = None
+    unified_forward_done: Optional[torch.cuda.Event] = None
     can_run_cuda_graph: bool = False
     fpm_timing: Optional[FpmTiming] = None
     # The step's launch record, for the unified pool's processing.

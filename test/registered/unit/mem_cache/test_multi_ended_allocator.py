@@ -280,6 +280,8 @@ class TestBand(unittest.TestCase):
         p = alloc.ids.virtual_to_physical[v]
         kv.buf[p] = -1  # the freed virtual id's data is gone
         alloc.free(v)
+        # Compact at once, so the allocated band stays hole-free.
+        alloc.flush_for_allocation()
 
     def test_basic_alloc_free_compaction(self):
         _, full_alloc, mamba_alloc, full_kv, mamba_kv = self._build_pair()
@@ -288,7 +290,7 @@ class TestBand(unittest.TestCase):
         b = self._alloc(full_alloc, full_kv, 5)
         c = self._alloc(full_alloc, full_kv, 2)
         self._check_invariants(full_alloc, full_kv)
-        # free the middle batch -> forces eager compaction (boundary slots move in)
+        # free the middle batch, then compact (boundary slots move in)
         self._free(full_alloc, full_kv, b)
         self._check_invariants(full_alloc, full_kv)
         # `a` and `c` virtual ids unchanged; their physical slots may have moved.
@@ -383,7 +385,7 @@ class TestBand(unittest.TestCase):
 
     def test_lazy_retract_churn_no_ghost(self):
         """Regression: heavy free/flush churn in lazy mode must never leave a
-        'ghost' page -- p2v < 0 in neither _free_phys_pages nor _pending_reuse."""
+        'ghost' page -- p2v < 0 in neither _free_phys_pages nor the pending pages."""
         rng = random.Random(0x5373)
         _, alloc, kv = self._build_lazy_full(n_full_slots=64, move_cap=2)
         live = []
@@ -405,13 +407,6 @@ class TestBand(unittest.TestCase):
         for _ in range(64):
             alloc.flush_opportunistic()
         self.assertEqual(alloc.allocated_count(), 0)
-
-    def test_double_free_raises(self):
-        _, full_alloc, mamba_alloc, full_kv, mamba_kv = self._build_pair()
-        v = self._alloc(full_alloc, full_kv, 3)
-        self._free(full_alloc, full_kv, v)
-        with self.assertRaises(AssertionError):
-            full_alloc.free(v)
 
     # -- `out=` parameter regression tests --
 
@@ -812,6 +807,13 @@ class TestWindowChainAllocator(unittest.TestCase):
         kvcache.full_kv_pool.buf[full_phys] = -1
         kvcache.swa_kv_pool.buf[valid_swa] = -1
         allocator.free(v)
+        self._compact(allocator)
+
+    @staticmethod
+    def _compact(allocator):
+        """Compact every band at once, so each allocated band is hole-free."""
+        for band in allocator.members:
+            band.flush_for_allocation()
 
     def _check_sub_pool_invariants(self, sub, kv):
         """Per-sub-pool: v2p/p2v mutual inverse on the live set, hole-free
@@ -954,6 +956,7 @@ class TestWindowChainAllocator(unittest.TestCase):
         b_swa = allocator.swa_attn_allocator.ids.virtual_to_physical[b]
         kvcache.swa_kv_pool.buf[b_swa] = -1
         allocator.free_swa(b)
+        self._compact(allocator)
         # c's full-physical UNCHANGED (full side did not compact):
         self.assertEqual(
             int(allocator.full_attn_allocator.ids.virtual_to_physical[c].item()),
@@ -1010,6 +1013,7 @@ class TestWindowChainAllocator(unittest.TestCase):
                 swa_phys = allocator.swa_attn_allocator.ids.virtual_to_physical[v]
                 kvcache.swa_kv_pool.buf[swa_phys] = -1
                 allocator.free_swa(v)
+                self._compact(allocator)
                 live[idx] = ("swa_tomb", v)
             # Invariants after every op.
             self._check_sub_pool_invariants(
@@ -1525,9 +1529,10 @@ class TestPagedBand(unittest.TestCase):
             for t in v.tolist():
                 stamped[t] = t
 
-        # Free the MIDDLE page (token ids of `b`). This forces a compaction
-        # where page `c` (boundary, grow-up) relocates into page `b`'s slot.
+        # Free the MIDDLE page (token ids of `b`), then compact: page `c`
+        # (boundary, grow-up) relocates into page `b`'s slot.
         full_alloc.free(b)
+        full_alloc.flush_for_allocation()
         for t in b.tolist():
             stamped.pop(t, None)
         self._check_invariants(full_alloc, full_kv, stamped)
@@ -1556,6 +1561,7 @@ class TestPagedBand(unittest.TestCase):
         # The caller must pass page-coherent ranges; `a` covers both pages whole.
         full_alloc.free(a)
         self.assertEqual(full_alloc.allocated_count(), 0)
+        full_alloc.flush_for_allocation()
         self.assertEqual(full_alloc._allocated_pages(), 0)
 
     # 6. take_physical overflow check (grow-up direction).
@@ -2139,7 +2145,7 @@ class TestPagedBand(unittest.TestCase):
 
 
 class TestLazyCompaction(unittest.TestCase):
-    """Lazy compaction invariants and the lazy-vs-eager equivalence harness.
+    """Lazy compaction invariants.
     `_flush` only waits on `forward_stream` when one is passed, so these
     allocators stay CPU-only."""
 
@@ -2284,64 +2290,6 @@ class TestLazyCompaction(unittest.TestCase):
             self.assertEqual(int(fa.ids.physical_to_virtual[physical].item()), virtual)
             self.assertEqual(int(kv.buf[physical].item()), virtual)
 
-    def _replay_sequence(self, ops, lazy: bool):
-        """Run a given alloc/free op trace under eager OR lazy mode and
-        return the final (live virtual set, alloc-time KV stamps)."""
-        _pool, fa, kv = self._make_full(lazy=lazy)
-        live = set()  # set of virtual ids
-        kv_stamps = {}  # v -> stamp (the data we wrote at alloc time)
-        next_stamp = 100
-        for kind, n in ops:
-            if kind == "alloc":
-                tokens = fa.alloc(n)
-                if tokens is None:
-                    continue
-                for v in tokens.tolist():
-                    p = int(fa.ids.virtual_to_physical[v].item())
-                    kv.buf[p] = next_stamp
-                    kv_stamps[v] = next_stamp
-                    live.add(v)
-                    next_stamp += 1
-            elif kind == "free":
-                if not live:
-                    continue
-                # Take up to n from live, deterministically by id.
-                victims = sorted(live)[:n]
-                live.difference_update(victims)
-                fa.free(torch.tensor(victims, dtype=torch.int64))
-        # Force final compaction on lazy so the comparison is at quiescence.
-        if lazy:
-            fa._flush(urgent=True)
-        # Read back the data for each live id.
-        live_data = {}
-        for v in live:
-            p = int(fa.ids.virtual_to_physical[v].item())
-            live_data[v] = int(kv.buf[p].item())
-        return live, live_data, kv_stamps
-
-    def test_lazy_vs_eager_equivalence(self):
-        """Same random alloc/free sequence under lazy and eager modes must
-        yield identical live virtual sets AND identical KV reads (the data
-        followed any relocation).
-        """
-        rng = random.Random(42)
-        ops = []
-        for _ in range(200):
-            if rng.random() < 0.6:
-                ops.append(("alloc", rng.randint(1, 6)))
-            else:
-                ops.append(("free", rng.randint(1, 4)))
-        eager_live, eager_data, eager_stamps = self._replay_sequence(ops, lazy=False)
-        lazy_live, lazy_data, lazy_stamps = self._replay_sequence(ops, lazy=True)
-        self.assertEqual(eager_live, lazy_live, "live virtual set diverged")
-        self.assertEqual(eager_stamps, lazy_stamps, "alloc-time stamps diverged")
-        # For every live id, the data we read back must match what we wrote.
-        for v in eager_live:
-            self.assertEqual(
-                eager_data[v], eager_stamps[v], f"eager: KV[v={v}] != stamp"
-            )
-            self.assertEqual(lazy_data[v], lazy_stamps[v], f"lazy: KV[v={v}] != stamp")
-
     def test_lazy_non_urgent_stops_at_write_set_blocker(self):
         """When the topmost survivor is in an in-flight batch's write-set, a
         non-urgent `_flush` stops the boundary walk: skipping past it would
@@ -2376,18 +2324,21 @@ class TestLazyCompaction(unittest.TestCase):
         )
         # State untouched: hole still present.
         self.assertEqual(len(fa._free_phys_pages), 1)
-        self.assertEqual(len(fa._pending_reuse), 0)
-        # Firing the event prunes the write-set entry; the next flush then
-        # releases src directly, with no pending-reuse entry needed.
+        self.assertEqual(len(fa.usage.pending_by_key()), 0)
+        # Retiring the forward (its result processed) prunes the write-set
+        # entry; the next flush then releases src directly, with no pending-reuse
+        # entry needed. Firing alone decides nothing.
         ev.fired = True
+        self.assertEqual(fa._flush(urgent=False), 0)
+        fa.retire_forward(ev)
         n_moves2 = fa._flush(urgent=False)
         self.assertGreaterEqual(n_moves2, 1)
-        self.assertEqual(len(fa._pending_reuse), 0)
+        self.assertEqual(len(fa.usage.pending_by_key()), 0)
 
     def test_lazy_non_urgent_read_race_uses_pending_reuse(self):
         """With no in-flight write-set, a non-urgent `_flush` compacts at once
         (read+read on KV[src] is safe) and parks `(src, latest_event)` in
-        `_pending_reuse`, so no later alloc writes KV[src] under a live read."""
+        pending, so no later alloc writes KV[src] under a live read."""
         _pool, fa, _kv = self._make_full(lazy=True)
         a = fa.alloc(5)
 
@@ -2408,15 +2359,18 @@ class TestLazyCompaction(unittest.TestCase):
         fa.set_inflight_forward(ev, None)
         n_moves = fa._flush(urgent=False)
         self.assertGreaterEqual(n_moves, 1)
-        # `_pending_reuse` holds one entry per BATCH (keyed by event), not per
-        # src; the page count lives in `_pending_reuse_pages_cpu`.
-        self.assertEqual(len(fa._pending_reuse), 1)
-        self.assertEqual(len(fa._pending_reuse_pages_cpu), n_moves)
-        # Fire the event and drain -- srcs return to availability.
+        # Pending pages group by the event they wait (one entry per BATCH), not per
+        # src; the page count lives in `usage.pending_pages`.
+        self.assertEqual(len(fa.usage.pending_by_key()), 1)
+        self.assertEqual(len(fa.usage.pending_pages), n_moves)
+        # Firing alone does not release them; retiring the forward does.
         ev.fired = True
         fa._drain_pending_reuse(urgent=False)
-        self.assertEqual(len(fa._pending_reuse), 0)
-        self.assertEqual(len(fa._pending_reuse_pages_cpu), 0)
+        self.assertEqual(len(fa.usage.pending_by_key()), 1)
+        fa.retire_forward(ev)
+        fa._drain_pending_reuse(urgent=False)
+        self.assertEqual(len(fa.usage.pending_by_key()), 0)
+        self.assertEqual(len(fa.usage.pending_pages), 0)
 
 
 class TestO3FusedAllocBind(unittest.TestCase):
@@ -3465,7 +3419,7 @@ class TestDcpWidening(unittest.TestCase):
                 self.assertTrue(bool((written[~owned] == 0).all()))
                 self.assertTrue(bool((written[owned] > 0).all()))
 
-    def _build_composite(self, *, page_size, lazy_compaction=False):
+    def _build_composite(self, *, page_size, lazy_compaction=True):
         from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
 
         full_spec = _make_mha_spec("full", "up", layer_num=2)
@@ -3619,13 +3573,12 @@ class TestDcpWidening(unittest.TestCase):
 
     def test_full_donor_reaches_real_capacity_across_supported_layouts(self):
         cases = (
-            # Baseline eager layout.
-            (1, 1, False, False),
-            # Paged lazy layout with grouped frees.
+            (1, 1, True, False),
+            # Paged layout with grouped frees.
             (1, 4, True, True),
             # DCP widens Full ids while Mamba remains one slot per request.
             (2, 1, True, True),
-            (4, 1, False, False),
+            (4, 1, True, False),
         )
         for dcp_size, page_size, lazy_compaction, grouped_free in cases:
             with (

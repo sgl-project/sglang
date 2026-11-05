@@ -69,6 +69,22 @@ def pin_every_band(allocator, busy) -> None:
     allocator.add_pin_source(tuple(m.sub_pool_name for m in allocator.members), busy)
 
 
+HOLD = "test-hold"
+
+
+def hold_band(band, key=HOLD) -> None:
+    """Keep a band's live pages where they are: none of them moves, and the
+    band's extent keeps covering them, though it still reuses holes and
+    extends."""
+    first, end = band._span_range()
+    p2v = band.ids.physical_to_virtual[first:end].tolist()
+    band.fix_pages(key, [first + i for i, v in enumerate(p2v) if v >= 0])
+
+
+def release_band(band, key=HOLD) -> None:
+    band.unfix_pages(key)
+
+
 def setup_allocator_context():
     reset_context()
     args = ServerArgs(model_path="dummy", device="cpu")
@@ -446,7 +462,7 @@ def tri_sub_pool_specs(
 def build_swa_cache(
     *,
     occupancy=96,
-    lazy=False,
+    lazy=True,
     page_size=1,
     ratio=(1, 1),
     total_bytes=None,
@@ -627,7 +643,7 @@ def build_test_unified_pools(
     post_capture_active=False,
     need_sort=False,
     forward_stream=None,
-    lazy_compaction=False,
+    lazy_compaction=True,
     is_draft_worker=False,
     enable_mamba_extra_buffer=False,
     enable_mamba_extra_buffer_lazy=False,

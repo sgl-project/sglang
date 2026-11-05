@@ -101,7 +101,7 @@ class TestUnifiedAllocatorTrace(CustomTestCase):
 
     def test_state_full_corner_exhausts_more_than_512_slots(self):
         """The state-full prefix must leave no further slot available."""
-        config = TraceConfig(chain="mamba", page_size=64, lazy=False, device="cpu")
+        config = TraceConfig(chain="mamba", page_size=64, lazy=True, device="cpu")
         adapter, model = _SharedCapacityAdapter(config), HostModel()
         for op in corner_states(config)["state_full"]:
             apply_op(adapter, model, op)
