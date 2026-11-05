@@ -97,11 +97,18 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.kv_hints import KvHintsEnvelope
 from sglang.srt.managers.req_types import (
+    FINISH_ABORT,
+    FINISH_LENGTH,
+    FINISH_MATCHED_STR,
+    FINISH_MATCHED_TOKEN,
+    FINISHED_MATCHED_REGEX,
     MM_PAD_SHIFT_VALUE,
+    BaseFinishReason,
     MultimodalDataItem,
-    MultimodalProcessorOutput,
+    MultimodalInputs,
     ReturnHiddenStatesMode,
     SamplingLogprobsMode,
+    get_request_return_hidden_states_mode,
     get_return_hidden_states_mode,
 )
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
@@ -126,11 +133,13 @@ from sglang.srt.mem_cache.common import (
     match_kv_cache,
     release_kv_cache,
 )
+from sglang.srt.mem_cache.kv.advance import TrackingAdvance
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.model_executor.encoder_swa_replay import resets_swa_window
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
+from sglang.srt.multimodal.cache.digest import structured_digest
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.observability.metrics_collector import (
     DPBalanceStats,
@@ -164,17 +173,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
-
-
-def get_request_return_hidden_states_mode(
-    return_hidden_states: Union[List[ReturnHiddenStatesMode], ReturnHiddenStatesMode],
-) -> CaptureHiddenMode:
-    if isinstance(return_hidden_states, list):
-        return max(
-            (get_return_hidden_states_mode(mode) for mode in return_hidden_states),
-            default=CaptureHiddenMode.NULL,
-        )
-    return get_return_hidden_states_mode(return_hidden_states)
 
 
 def get_batch_return_hidden_states_mode(reqs: List[Req]) -> CaptureHiddenMode:
@@ -235,287 +233,6 @@ def split_cached_prefix_by_tier(
         host = 0 if host_hit_is_storage else host_hit_len - storage_in_host
     device = prefix_len - host - storage
     return device, host, storage
-
-
-class BaseFinishReason:
-    def to_json(self):
-        raise NotImplementedError()
-
-
-class FINISH_MATCHED_TOKEN(BaseFinishReason):
-    def __init__(self, matched: Union[int, List[int]]):
-        super().__init__()
-        self.matched = matched
-
-    def to_json(self):
-        return {
-            "type": "stop",  # to match OpenAI API's return value
-            "matched": self.matched,
-        }
-
-
-class FINISH_MATCHED_STR(BaseFinishReason):
-    def __init__(self, matched: str):
-        super().__init__()
-        self.matched = matched
-
-    def to_json(self):
-        return {
-            "type": "stop",  # to match OpenAI API's return value
-            "matched": self.matched,
-        }
-
-
-class FINISHED_MATCHED_REGEX(BaseFinishReason):
-    def __init__(self, matched: str):
-        super().__init__()
-        self.matched = matched
-
-    def to_json(self):
-        return {
-            "type": "stop",  # to match OpenAI API's return value
-            "matched": self.matched,
-        }
-
-
-class FINISH_LENGTH(BaseFinishReason):
-    def __init__(self, length: int):
-        super().__init__()
-        self.length = length
-
-    def to_json(self):
-        return {
-            "type": "length",  # to match OpenAI API's return value
-            "length": self.length,
-        }
-
-
-class FINISH_ABORT(BaseFinishReason):
-    def __init__(self, message=None, status_code=None, err_type=None):
-        super().__init__()
-        self.message = message or "Aborted"
-        self.status_code = status_code
-        self.err_type = err_type
-
-    def to_json(self):
-        return {
-            "type": "abort",
-            "message": self.message,
-            "status_code": self.status_code,
-            "err_type": self.err_type,
-        }
-
-
-@dataclasses.dataclass
-class MultimodalInputs:
-    """The multimodal data related inputs."""
-
-    # items of data
-    mm_items: List[MultimodalDataItem]
-    padded_input_ids: Optional[List[int]] = None
-    image_pad_len: Optional[list] = None
-    num_image_tokens: Optional[int] = None
-    token_modalities: Optional[List[int]] = None
-
-    # image
-    im_token_id: Optional[int] = None
-    im_start_id: Optional[int] = None
-    im_end_id: Optional[int] = None
-    slice_start_id: Optional[int] = None
-    slice_end_id: Optional[int] = None
-
-    # video
-    video_token_id: Optional[int] = None
-
-    # audio
-    audio_token_id: Optional[int] = None
-    audio_start_id: Optional[int] = None
-    audio_end_id: Optional[int] = None
-
-    # QWen2-VL related
-    mrope_positions: Optional[torch.Tensor] = None
-    mrope_position_delta: Optional[torch.Tensor] = None
-    mrope_position_delta_repeated_cache: Optional[torch.Tensor] = None
-
-    # Moss-VL related
-    vision_position_ids: Optional[torch.Tensor] = None
-    media_nums_per_sample: Optional[List[int]] = None
-    visible_frame_counts: Optional[torch.Tensor] = None
-
-    def release_features(self):
-        """Release feature tensors to free GPU memory."""
-        for item in self.mm_items:
-            try:
-                # Release both deferred features that were never used and
-                # borrowed features retained for possible re-prefill.
-                item.release_transport_proxies()
-            except Exception:
-                logger.warning(
-                    "Failed to release an unused multimodal feature transport",
-                    exc_info=True,
-                )
-            finally:
-                item.feature = None
-
-    @staticmethod
-    def from_processor_output(
-        obj: MultimodalProcessorOutput, *, requires_mm_token_modalities: bool = False
-    ):
-        mm_items = obj.mm_items
-        assert isinstance(mm_items, list)
-        mm_items = [item for item in mm_items if item.is_valid()]
-
-        # try reconstructing from cuda-ipc
-        reconstruct_device = None
-        try:
-            for mm_item in mm_items:
-                if (
-                    mm_item.has_cuda_ipc_proxy()
-                    and not mm_item.can_defer_cuda_ipc_feature_reconstruction()
-                ):
-                    if reconstruct_device is None:
-                        reconstruct_device = torch.cuda.current_device()
-                    mm_item.reconstruct(reconstruct_device)
-        except BaseException:
-            for mm_item in mm_items:
-                mm_item.release_transport_proxies()
-            raise
-
-        if envs.SGLANG_MM_BUFFER_SIZE_MB.get() > 0:
-            # Multi-modal feature hashing optimization:
-            # When SGLANG_MM_BUFFER_SIZE_MB > 0, we temporarily move feature tensors to GPU
-            # for faster hash computation, while avoiding OOM issues.
-            from sglang.srt.managers.mm_utils import (
-                init_feature_buffer,
-                is_feature_buffer_initialized,
-                reset_buffer_offset,
-                try_add_to_buffer,
-            )
-
-            device = torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
-            if not is_feature_buffer_initialized():
-                init_feature_buffer(device)
-            reset_buffer_offset()
-            for item in mm_items:
-                if item.feature is not None:
-                    if isinstance(item.feature, torch.Tensor):
-                        item.feature = try_add_to_buffer(item.feature)
-
-        token_modalities = (
-            MultimodalProcessorOutput.build_token_modalities(obj.input_ids, mm_items)
-            if requires_mm_token_modalities
-            else None
-        )
-
-        for item in mm_items:
-            item.set_pad_value()
-
-        if envs.SGLANG_MM_BUFFER_SIZE_MB.get() > 0:
-            for item in mm_items:
-                if item.feature is not None:
-                    item.feature = item.feature.to("cpu", non_blocking=True)
-
-        mm_inputs = MultimodalInputs(
-            mm_items=mm_items,
-            padded_input_ids=obj.padded_input_ids,
-            token_modalities=token_modalities,
-        )
-        optional_args = [
-            "mrope_positions",
-            "mrope_position_delta",
-            "im_token_id",
-            "im_start_id",
-            "im_end_id",
-            "video_token_id",
-            "slice_start_id",
-            "slice_end_id",
-            "audio_start_id",
-            "audio_end_id",
-            "audio_token_id",
-            "vision_position_ids",
-            "media_nums_per_sample",
-            "visible_frame_counts",
-        ]
-        for arg in optional_args:
-            val = getattr(obj, arg, None)
-            if val is not None:
-                setattr(mm_inputs, arg, val)
-
-        return mm_inputs
-
-    def contains_image_inputs(self) -> bool:
-        return any(item.is_image() for item in self.mm_items)
-
-    def contains_video_inputs(self) -> bool:
-        return any(item.is_video() for item in self.mm_items)
-
-    def contains_audio_inputs(self) -> bool:
-        return any(item.is_audio() for item in self.mm_items)
-
-    def contains_mm_input(self) -> bool:
-        return any(True for item in self.mm_items if item.is_valid())
-
-    def compute_mm_token_counts(self) -> Tuple[int, int, int]:
-        """Count prompt tokens consumed by each modality (image, audio, video).
-
-        A modality's token count is the total span covered by its items'
-        offsets. Returns a (image_tokens, audio_tokens, video_tokens) tuple.
-        """
-        image_tokens = audio_tokens = video_tokens = 0
-        for item in self.mm_items:
-            if not item.offsets:
-                continue
-            num_tokens = sum(end - start + 1 for start, end in item.offsets)
-            if item.is_image():
-                image_tokens += num_tokens
-            elif item.is_audio():
-                audio_tokens += num_tokens
-            elif item.is_video():
-                video_tokens += num_tokens
-        return image_tokens, audio_tokens, video_tokens
-
-    def merge(self, other: MultimodalInputs):
-
-        # args needed to be merged
-        optional_args = [
-            "mm_items",
-            "image_pad_len",
-        ]
-        for arg in optional_args:
-            self_arg = getattr(self, arg, None)
-            if self_arg is not None:
-                setattr(self, arg, self_arg + getattr(other, arg))
-
-        if other.token_modalities is not None:
-            if self.token_modalities is None:
-                self.token_modalities = list(other.token_modalities)
-            else:
-                self.token_modalities += other.token_modalities
-
-        mrope_positions = self.mrope_positions
-        if mrope_positions is not None:
-            if other.mrope_positions is None:
-                self.mrope_positions = mrope_positions
-            else:
-                self.mrope_positions = torch.cat(
-                    [self.mrope_positions, other.mrope_positions], dim=1
-                )
-
-        mrope_position_delta = self.mrope_position_delta
-        if mrope_position_delta is not None:
-            if other.mrope_position_delta is None:
-                self.mrope_position_delta = mrope_position_delta
-            else:
-                self.mrope_position_delta = torch.cat(
-                    [self.mrope_position_delta, other.mrope_position_delta], dim=0
-                )
-
-        for key, val in other.__dict__.items():
-            if "_id" in key:
-                # set token_ids
-                if getattr(self, key, None) is None:
-                    setattr(self, key, getattr(other, key, None))
-        # other args would be kept intact
 
 
 @dataclasses.dataclass(slots=True, kw_only=True)
@@ -860,6 +577,7 @@ class Req(ReqDllmMixin):
 
         self.extra_key = extra_key
         self.cache_salt = cache_salt or None
+        self._user_cache_salt = self.cache_salt
         self.lora_id = lora_id
         self.routing_key = routing_key
 
@@ -905,6 +623,7 @@ class Req(ReqDllmMixin):
         # Per-component host hit lengths split off from host_hit_length:
         self.host_hit_length = 0
         self.swa_host_hit_length = 0
+        self.matched_auxiliary_swa_host_hit_length = 0
         self.mamba_host_hit_length = 0
         # The branching point seqlen to track mamba state. If set, given by prefix
         # match, it will be the tracked seqlen in the ping pong buffer for the
@@ -942,11 +661,6 @@ class Req(ReqDllmMixin):
         # radix-disabled fallback, which keeps no nodes past the root and has
         # no rebind.
         self.kv_rotation_base: Optional[int] = None
-
-        # Whether or not if it is chunked. It increments whenever
-        # it is chunked, and decrement whenever chunked request is
-        # processed.
-        self.inflight_middle_chunks = 0
 
         # The launched steps carrying this request whose results are not
         # processed yet.
@@ -1220,7 +934,9 @@ class Req(ReqDllmMixin):
     def auxiliary_swa_host_hit_length(self) -> int:
         plan = self.staged_prefetch_plan
         return (
-            plan.window_tokens(ComponentType.AUXILIARY_SWA) if plan is not None else 0
+            plan.window_tokens(ComponentType.AUXILIARY_SWA)
+            if plan is not None
+            else self.matched_auxiliary_swa_host_hit_length
         )
 
     def needs_host_load_back(self) -> bool:
@@ -1297,6 +1013,24 @@ class Req(ReqDllmMixin):
             self.multimodal_inputs = image_inputs
         else:
             self.multimodal_inputs.merge(image_inputs)
+        self.bind_multimodal_cache_namespace()
+
+    def bind_multimodal_cache_namespace(self) -> None:
+        """Protect KV lookup with full identities, not partial pad-token matches.
+
+        A media span can contain only one token, so even wide pad sentinels
+        cannot carry its entire digest. Scope both the radix tree and storage
+        to the ordered media identities. This deliberately gives up text-prefix
+        sharing across different media while preserving same-media reuse.
+        """
+        if self.multimodal_inputs is not None and self.multimodal_inputs.mm_items:
+            identities = tuple(
+                item.cache_key for item in self.multimodal_inputs.mm_items
+            )
+            self.cache_salt = (
+                "sglang-mm-v1:"
+                + structured_digest((self._user_cache_salt, identities)).hex()
+            )
 
     def _extend_session_image_inputs(self, image_inputs):
         """Append media while preserving the saved session and its position history."""
@@ -1785,7 +1519,6 @@ class Req(ReqDllmMixin):
         self.temp_input_top_logprobs_idx = None
         self.temp_input_token_ids_logprobs_val = None
         self.temp_input_token_ids_logprobs_idx = None
-        self.inflight_middle_chunks = 0
         self.mamba_branching_seqlen = None
         self.already_computed = 0
         self.kv.reset_for_retract()
@@ -2932,16 +2665,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # so we need to add 1 to the seqlen to retrieve the correct mamba state from h.
                 mamba_track_seqlen = _force_track_h(mamba_track_seqlen_aligned)
 
-            # In lazy mode, skip the swap — the second ping-pong slot is not
-            # allocated yet; it will be allocated on demand at the track boundary
-            # in mamba_lazy_prealloc_at_boundary during prepare_for_decode.
-            req.kv.mamba_last_track_idx = req.kv.mamba_next_track_idx
-            if not get_exec().mamba.enable_mamba_extra_buffer_lazy:
-                req.kv.mamba_next_track_idx = (
-                    self.req_to_token_pool.get_mamba_ping_pong_other_idx(
-                        req.kv.mamba_next_track_idx
-                    )
-                )
             if req.mamba_branching_seqlen is not None:
                 # track branching point in this forward if the branching point
                 # is within the current extend batch.
@@ -2958,7 +2681,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     # See _force_track_h() for more details.
                     mamba_track_seqlen = _force_track_h(req.mamba_branching_seqlen)
                     mamba_track_seqlen_aligned = req.mamba_branching_seqlen
-            req.kv.mamba_last_track_seqlen = mamba_track_seqlen_aligned
+            kv_storage_of(
+                self.req_to_token_pool, self.token_to_kv_pool_allocator
+            ).advance(
+                req,
+                tracking=TrackingAdvance(
+                    boundary=mamba_track_seqlen_aligned,
+                    last_position=track_position,
+                    next_position=track_position
+                    if get_exec().mamba.enable_mamba_extra_buffer_lazy
+                    else self.req_to_token_pool.get_mamba_ping_pong_other_idx(
+                        track_position
+                    ),
+                ),
+            )
 
         return _MambaRadixCacheV2TrackEntry(
             track_mask=mask,
@@ -3376,10 +3112,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 storage.take_tracking_slot(req, other_idx)
             )
             if took:
-                req.kv.mamba_next_track_idx = other_idx
+                storage.advance(req, tracking=TrackingAdvance(next_position=other_idx))
             else:
                 # The in-flight write invalidates the keep slot's old checkpoint.
-                req.kv.mamba_last_track_seqlen = None
+                storage.advance(req, tracking=TrackingAdvance(boundary=None))
 
     def mamba_lazy_undo_prealloc_at_boundary(self):
         """Give back the slots mamba_lazy_prealloc_at_boundary handed this decode
@@ -3397,8 +3133,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if buf[1 - next_idx].item() == -1:
                 # The prealloc failed, so tracking would have been in place.
                 continue
-            storage.release_tracking_slot(req, next_idx)
-            req.kv.mamba_next_track_idx = 1 - next_idx
+            storage.advance(
+                req,
+                tracking=TrackingAdvance(
+                    next_position=1 - next_idx, release_positions=(next_idx,)
+                ),
+            )
 
     def mamba_lazy_spec_prepare(self, mamba_track_interval: int, max_draft_tokens: int):
         """Lazy-mode spec counterpart of mamba_lazy_prealloc_at_boundary.
@@ -3432,7 +3172,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     storage.take_tracking_slot(req, other_idx)
                 )
                 if not has_pending:
-                    req.kv.mamba_last_track_seqlen = None
+                    storage.advance(req, tracking=TrackingAdvance(boundary=None))
             # On failure the verify scatters in place into the keep slot.
             track_positions.append(
                 other_idx if has_pending else req.kv.mamba_next_track_idx
@@ -3725,6 +3465,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         return ScheduleBatch(
             reqs=self.reqs[:],
             launched_reqs=self.launched_reqs,
+            chunked_req=self.chunked_req,
             extend_lens=self.extend_lens,
             prefix_lens=self.prefix_lens,
             req_to_token_pool=self.req_to_token_pool,
@@ -3828,7 +3569,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
                     # Past the retain window the request no longer reads its prefill's
                     # SWA; release that part of the tree lock so SWA LRU can reclaim it.
-                    if release_leaf_lock and req.decode_batch_idx >= retain_window:
+                    if release_leaf_lock and (
+                        has_auxiliary_swa or req.decode_batch_idx >= retain_window
+                    ):
                         self.tree_cache.release_swa_prefix_lock(req)
                 elif (
                     self.forward_mode.is_extend()

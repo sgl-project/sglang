@@ -67,7 +67,6 @@ class TestInklingCheckpointIndices(CustomTestCase):
         pool = StateView(
             arena=shared,
             spec=shared.spec("mamba"),
-            spec_state_size=0,
             mamba_layer_ids=[0, 1],
         )
         allocator = Band(

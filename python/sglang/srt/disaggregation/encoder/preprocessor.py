@@ -54,7 +54,7 @@ from sglang.srt.utils import (
     load_image,
     load_video,
 )
-from sglang.srt.utils.hf_transformers_utils import resolve_image_processor_backend
+from sglang.srt.utils.hf_transformers import resolve_image_processor_backend
 
 logger = logging.getLogger(__name__)
 
