@@ -398,8 +398,7 @@ void biased_grouped_topk_kernel_impl(
     int64_t topk_group,
     int64_t topk,
     int64_t num_fused_shared_experts,
-    bool has_shared_scaling_factor,
-    float shared_scaling_factor_value,
+    float shared_expert_weight,
     bool renormalize) {
   using Vec = at::vec::Vectorized<float>;
 
@@ -480,18 +479,6 @@ void biased_grouped_topk_kernel_impl(
         topk_weights[i * topk + j] = scores[index];
       }
 
-      if (num_fused_shared_experts > 0) {
-        int64_t shared_pos = topk - 1;
-        topk_ids[i * topk + shared_pos] = static_cast<int32_t>(NUM_EXPERTS);
-        if (has_shared_scaling_factor) {
-          float sum = 0.f;
-          for (int64_t j = 0; j < shared_pos; ++j) {
-            sum += topk_weights[i * topk + j];
-          }
-          topk_weights[i * topk + shared_pos] = sum / shared_scaling_factor_value;
-        }
-      }
-
 #if defined(CPU_CAPABILITY_AVX512)
       if (renormalize || apply_scaling_factor) {
         __mmask16 mask_sum = (1ULL << routed_count) - 1;
@@ -527,6 +514,11 @@ void biased_grouped_topk_kernel_impl(
         }
       }
 #endif
+      if (num_fused_shared_experts > 0) {
+        const int64_t shared_pos = i * topk + topk - 1;
+        topk_ids[shared_pos] = static_cast<int32_t>(NUM_EXPERTS);
+        topk_weights[shared_pos] = shared_expert_weight;
+      }
     }
   });
 }
@@ -587,8 +579,7 @@ void biased_grouped_topk_kernel_impl(
       topk_group,                                         \
       topk,                                               \
       num_fused_shared_experts,                           \
-      has_shared_scaling_factor,                          \
-      shared_scaling_factor_value,                        \
+      shared_expert_weight,                               \
       renormalize);
 
 }  // anonymous namespace
@@ -854,7 +845,7 @@ std::tuple<at::Tensor, at::Tensor> biased_grouped_topk_cpu(
     int64_t num_fused_shared_experts,
     std::optional<double> routed_scaling_factor,
     std::optional<at::Tensor> num_token_non_padded,
-    std::optional<double> shared_expert_routed_scaling_factor) {
+    double shared_expert_weight) {
   // TODO: Will support num_token_non_padded.
   TORCH_CHECK(
       num_fused_shared_experts == 0 || num_fused_shared_experts == 1,
@@ -876,8 +867,6 @@ std::tuple<at::Tensor, at::Tensor> biased_grouped_topk_cpu(
   at::Tensor topk_weights = at::empty({num_tokens, topk}, hidden_states.options().dtype(at::kFloat));
   at::Tensor topk_ids = at::empty({num_tokens, topk}, hidden_states.options().dtype(at::kInt));
   float scaling_factor_value = routed_scaling_factor.has_value() ? routed_scaling_factor.value() : 1.0f;
-  bool has_shared_scaling_factor = shared_expert_routed_scaling_factor.has_value();
-  float shared_scaling_factor_value = has_shared_scaling_factor ? shared_expert_routed_scaling_factor.value() : 1.0f;
 
   CPU_DISPATCH_FLOATING_TYPES_EXT(st, correction_bias.scalar_type(), "biased_grouped_topk_kernel", [&] {
     switch (num_experts) {

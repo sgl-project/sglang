@@ -2499,8 +2499,9 @@ def biased_grouped_topk_cpu(
         routed_scaling_factor if apply_routed_scaling_factor_on_output else None,
         # num_token_non_padded must be None since it is not supported in kernel
         num_token_non_padded=None,
-        shared_expert_routed_scaling_factor=(
-            routed_scaling_factor if num_fused_shared_experts > 0 else None
+        shared_expert_weight=fused_shared_expert_weight(
+            routed_scaling_factor=routed_scaling_factor,
+            fused_in_topk=bool(apply_routed_scaling_factor_on_output),
         ),
     )
 

@@ -6,6 +6,9 @@ import torch
 
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.moe.topk import (
+    biased_grouped_topk_cpu,
+)
+from sglang.srt.layers.moe.topk import (
     biased_grouped_topk_impl as native_biased_grouped_topk,
 )
 from sglang.srt.layers.moe.topk import biased_topk_impl as native_biased_topk
@@ -149,7 +152,16 @@ class TestBiasedGroupedTopK(CustomTestCase):
 # extra slot (id == num_routed_experts); the kernel must match
 # biased_grouped_topk_impl's num_fused_shared_experts semantics exactly.
 class TestBiasedGroupedTopKFusedSharedExpert(CustomTestCase):
-    def _run_single_test(self, M, E, G, topk_group, renormalize, routed_scaling_factor):
+    def _run_single_test(
+        self,
+        M,
+        E,
+        G,
+        topk_group,
+        renormalize,
+        routed_scaling_factor,
+        apply_routed_scaling_factor_on_output,
+    ):
         torch.manual_seed(7)
         topk_routed = 8
         topk = topk_routed + 1
@@ -168,8 +180,9 @@ class TestBiasedGroupedTopKFusedSharedExpert(CustomTestCase):
             topk_group,
             num_fused_shared_experts=1,
             routed_scaling_factor=routed_scaling_factor,
+            apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
         )
-        topk_weights, topk_ids = torch.ops.sgl_kernel.biased_grouped_topk_cpu(
+        topk_weights, topk_ids = biased_grouped_topk_cpu(
             hidden_states,
             gating_output,
             correction_bias,
@@ -177,10 +190,9 @@ class TestBiasedGroupedTopKFusedSharedExpert(CustomTestCase):
             renormalize,
             G,
             topk_group,
-            1,
-            None,
-            None,
-            shared_expert_routed_scaling_factor=routed_scaling_factor,
+            num_fused_shared_experts=1,
+            routed_scaling_factor=routed_scaling_factor,
+            apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
         )
 
         self.assertTrue(torch.equal(topk_ids.long(), ref_topk_ids))
@@ -189,11 +201,29 @@ class TestBiasedGroupedTopKFusedSharedExpert(CustomTestCase):
 
     def test_fused_shared_expert(self):
         for renormalize in [True, False]:
-            for routed_scaling_factor in [None, 2.5]:
-                for E_num in [128, 160, 192, 256, 384]:
-                    self._run_single_test(
-                        12, E_num, 8, 2, renormalize, routed_scaling_factor
-                    )
+            for routed_scaling_factor in [None, 0.0, 1.0, 2.5]:
+                for apply_routed_scaling_factor_on_output in [False, True]:
+                    if (
+                        apply_routed_scaling_factor_on_output
+                        and routed_scaling_factor is None
+                    ):
+                        continue
+                    for E_num in [128, 160, 192, 256, 384]:
+                        with self.subTest(
+                            num_experts=E_num,
+                            renormalize=renormalize,
+                            routed_scaling_factor=routed_scaling_factor,
+                            apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+                        ):
+                            self._run_single_test(
+                                12,
+                                E_num,
+                                8,
+                                2,
+                                renormalize,
+                                routed_scaling_factor,
+                                apply_routed_scaling_factor_on_output,
+                            )
 
 
 class TestBiasedTopK(CustomTestCase):
