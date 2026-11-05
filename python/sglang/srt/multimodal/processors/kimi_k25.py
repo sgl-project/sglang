@@ -148,8 +148,14 @@ def _ensure_chw_rgb(image: torch.Tensor) -> torch.Tensor:
     return image[:3]
 
 
+_MAX_GPU_RESIZE_PIXELS = 4096 * 4096
+
+
 def _resize_bicubic_if_needed(
-    image: torch.Tensor, target_height: int, target_width: int
+    image: torch.Tensor,
+    target_height: int,
+    target_width: int,
+    max_gpu_pixels: Optional[int] = None,
 ) -> torch.Tensor:
     """Track the checkpoint processor's ``PIL.Image.resize(..., BICUBIC)``.
 
@@ -162,12 +168,20 @@ def _resize_bicubic_if_needed(
     8-bit levels of residual remain -- against PIL's float path we agree to 5e-3,
     i.e. the kernel matches and only the arithmetic differs.
     """
-    image = image.float()
     if image.shape[-2:] == (target_height, target_width):
-        return image
+        return image.float()
+    # ``max_gpu_pixels`` (per source image): the fp32 copy of a very large
+    # source can exhaust a GPU that also holds the weights and KV cache, so
+    # callers sharing that GPU resize those on the CPU.
+    device = image.device
+    if (
+        max_gpu_pixels is not None
+        and image.shape[-2] * image.shape[-1] > max_gpu_pixels
+    ):
+        image = image.cpu()
     return (
         F.interpolate(
-            image,
+            image.float(),
             size=(target_height, target_width),
             mode="bicubic",
             align_corners=False,
@@ -175,6 +189,7 @@ def _resize_bicubic_if_needed(
         )
         .round_()
         .clamp_(0.0, 255.0)
+        .to(device)
     )
 
 
@@ -198,6 +213,7 @@ def _process_single_image(
     patch_size: int,
     to_chw: Callable[[Union[torch.Tensor, Image.Image]], torch.Tensor] = _to_cuda_chw,
     post_resize: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+    max_gpu_resize_pixels: Optional[int] = None,
 ) -> torch.Tensor:
     """Process a single image on GPU: resize -> pad -> normalize -> patchify.
 
@@ -211,7 +227,9 @@ def _process_single_image(
     padded_h = new_h + config["pad_height"]
     padded_w = new_w + config["pad_width"]
 
-    x = _resize_bicubic_if_needed(image.unsqueeze(0), new_h, new_w)
+    x = _resize_bicubic_if_needed(
+        image.unsqueeze(0), new_h, new_w, max_gpu_resize_pixels
+    )
     if post_resize is not None:
         x = post_resize(x)
 
@@ -224,6 +242,7 @@ def _resize_images_by_source_shape(
     indexed_images: list[tuple[int, torch.Tensor]],
     target_height: int,
     target_width: int,
+    max_gpu_resize_pixels: Optional[int] = None,
 ) -> list[torch.Tensor]:
     """Resize images while batching only inputs with an identical source layout.
 
@@ -241,18 +260,49 @@ def _resize_images_by_source_shape(
         if len(images) == 1:
             index, image = images[0]
             resized_by_index[index] = _resize_bicubic_if_needed(
-                image.unsqueeze(0), target_height, target_width
+                image.unsqueeze(0), target_height, target_width, max_gpu_resize_pixels
             )
             continue
 
         source_batch = torch.cat([image.unsqueeze(0) for _, image in images], dim=0)
         resized_batch = _resize_bicubic_if_needed(
-            source_batch, target_height, target_width
+            source_batch, target_height, target_width, max_gpu_resize_pixels
         )
         for local_index, (index, _) in enumerate(images):
             resized_by_index[index] = resized_batch[local_index : local_index + 1]
 
     return [resized_by_index[index] for index, _ in indexed_images]
+
+
+_GPU_PREPROCESS_CHUNK_BYTES = 512 * 1024 * 1024
+
+
+def _gpu_preprocess_bytes(
+    image: Union[torch.Tensor, Image.Image], padded_pixels: int
+) -> int:
+    """Transient GPU bytes for one image in a batched chunk: the uint8 source,
+    its copy in the joined source batch and its fp32 resize input, plus the
+    fp32 RGBA output."""
+    if isinstance(image, Image.Image):
+        source = 3 * image.width * image.height
+    else:
+        source = image.numel()
+    return source * (1 + 1 + 4) + 4 * 4 * padded_pixels
+
+
+def _byte_bounded_chunks(group: list, padded_pixels: int) -> list[list]:
+    """Split a size group of ``(idx, image, config)`` so each chunk fits the budget."""
+    chunks, chunk, used = [], [], 0
+    for item in group:
+        size = _gpu_preprocess_bytes(item[1], padded_pixels)
+        if chunk and used + size > _GPU_PREPROCESS_CHUNK_BYTES:
+            chunks.append(chunk)
+            chunk, used = [], 0
+        chunk.append(item)
+        used += size
+    if chunk:
+        chunks.append(chunk)
+    return chunks
 
 
 def _gpu_preprocess_images(
@@ -263,10 +313,12 @@ def _gpu_preprocess_images(
     patch_size: int,
     to_chw: Callable[[Union[torch.Tensor, Image.Image]], torch.Tensor] = _to_cuda_chw,
     post_resize: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+    max_gpu_resize_pixels: Optional[int] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """GPU preprocessing pipeline for a batch of images.
 
     Groups images with the same target padded size for batch processing.
+    Sources larger than ``max_gpu_resize_pixels`` are resized on the CPU.
     """
     n = len(images)
     if n == 0:
@@ -298,39 +350,45 @@ def _gpu_preprocess_images(
                 patch_size,
                 to_chw=to_chw,
                 post_resize=post_resize,
+                max_gpu_resize_pixels=max_gpu_resize_pixels,
             )
             all_patches[idx] = patches
             all_grids[idx] = _grid_thw_from_resize_config(config, patch_size)
         else:
-            indexed_images = [(idx, to_chw(image)) for idx, image, _ in group]
+            # Bound the transient fp32 working set so a many-image request
+            # cannot exhaust the GPU that also holds weights and KV cache.
+            for sub_group in _byte_bounded_chunks(group, padded_h * padded_w):
+                indexed_images = [(idx, to_chw(image)) for idx, image, _ in sub_group]
 
-            # One NaViT target group can include several original resolutions.
-            # Batch only source-compatible images, which removes redundant
-            # bicubic launches for common multi-image requests without padding
-            # random-size inputs to a larger source resolution.
-            resized = _resize_images_by_source_shape(indexed_images, target_h, target_w)
-            if post_resize is not None:
-                # Before the concat: a hook may change the channel count (K3
-                # composites RGBA onto a background and returns RGB), and mixed
-                # 3/4-channel sources cannot be concatenated first.
-                resized = [post_resize(part) for part in resized]
-            batch = torch.cat(resized, dim=0)
+                # One NaViT target group can include several original resolutions.
+                # Batch only source-compatible images, which removes redundant
+                # bicubic launches for common multi-image requests without padding
+                # random-size inputs to a larger source resolution.
+                resized = _resize_images_by_source_shape(
+                    indexed_images, target_h, target_w, max_gpu_resize_pixels
+                )
+                if post_resize is not None:
+                    # Before the concat: a hook may change the channel count (K3
+                    # composites RGBA onto a background and returns RGB), and mixed
+                    # 3/4-channel sources cannot be concatenated first.
+                    resized = [post_resize(part) for part in resized]
+                batch = torch.cat(resized, dim=0)
 
-            T = 1
-            gh, gw = padded_h // patch_size, padded_w // patch_size
-            batch = normalize_and_patchify(
-                batch,
-                image_scale,
-                image_bias,
-                patch_size,
-                padded_h,
-                padded_w,
-            )
+                T = 1
+                gh, gw = padded_h // patch_size, padded_w // patch_size
+                batch = normalize_and_patchify(
+                    batch,
+                    image_scale,
+                    image_bias,
+                    patch_size,
+                    padded_h,
+                    padded_w,
+                )
 
-            grid = (T, gh, gw)
-            for i, (idx, _, _) in enumerate(group):
-                all_patches[idx] = batch[i]
-                all_grids[idx] = grid
+                grid = (T, gh, gw)
+                for i, (idx, _, _) in enumerate(sub_group):
+                    all_patches[idx] = batch[i]
+                    all_grids[idx] = grid
 
     pixel_values = torch.cat(all_patches, dim=0)
     grid_thws = torch.tensor(all_grids, dtype=torch.int64)
@@ -455,7 +513,12 @@ class KimiGPUProcessorWrapper:
         # 3. GPU image preprocessing
         image_scale, image_bias = self._get_gpu_norm_tensors()
         pixel_values, grid_thws = _gpu_preprocess_images(
-            images, resize_configs, image_scale, image_bias, self._patch_size
+            images,
+            resize_configs,
+            image_scale,
+            image_bias,
+            self._patch_size,
+            max_gpu_resize_pixels=_MAX_GPU_RESIZE_PIXELS,
         )
 
         return {

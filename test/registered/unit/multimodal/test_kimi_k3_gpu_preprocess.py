@@ -1,6 +1,7 @@
 """K3 GPU preprocess: shared batched pipeline hook contract (CPU parts)."""
 
 import sys
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -10,6 +11,7 @@ from PIL import Image
 from sglang.srt.multimodal.kimi_k3_image_processing import (
     fill_transparent_bg as _fill_transparent_bg,
 )
+from sglang.srt.multimodal.processors import kimi_k3, kimi_k25
 from sglang.srt.multimodal.processors.kimi_k25 import _resize_bicubic_if_needed
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -56,6 +58,42 @@ def test_resize_matches_pil_bicubic_golden():
         # Integer pixel domain: everything within 1 level, most pixels exact.
         assert diff.max() <= 1.0, f"max |diff|={diff.max()} at {target_w}x{target_h}"
         assert (diff == 0).mean() > 0.7, f"bitwise ratio={(diff == 0).mean():.3f}"
+
+
+def _spy_cpu_moves(monkeypatch):
+    moved = []
+    real_cpu = torch.Tensor.cpu
+    monkeypatch.setattr(
+        torch.Tensor, "cpu", lambda t: moved.append(t.shape) or real_cpu(t)
+    )
+    return moved
+
+
+def test_large_resize_runs_on_cpu_and_matches(monkeypatch):
+    """Sources above the GPU pixel cap resize on the CPU with the same kernel
+    and come back on the caller's device."""
+    x = torch.from_numpy(_natural_image(600, 800)).permute(2, 0, 1).unsqueeze(0)
+    expected = _resize_bicubic_if_needed(x, 300, 400)
+
+    moved = _spy_cpu_moves(monkeypatch)
+    ours = _resize_bicubic_if_needed(x, 300, 400, max_gpu_pixels=0)
+
+    assert moved == [x.shape]
+    assert ours.device == x.device
+    torch.testing.assert_close(ours, expected)
+
+
+def test_resize_cap_is_per_image_and_opt_in(monkeypatch):
+    """The cap compares one source image, not the batch, and callers that do
+    not pass it (model-side deferred preprocessing) never move to the CPU."""
+    x = torch.from_numpy(_natural_image(600, 800)).permute(2, 0, 1).unsqueeze(0)
+    batch = torch.cat([x, x])
+    moved = _spy_cpu_moves(monkeypatch)
+
+    _resize_bicubic_if_needed(batch, 300, 400, max_gpu_pixels=600 * 800)
+    _resize_bicubic_if_needed(batch, 300, 400)
+
+    assert moved == []
 
 
 def test_fill_transparent_bg_matches_checkpoint_composite():
@@ -110,6 +148,88 @@ def test_fill_transparent_bg_no_config_drops_alpha():
     out = _fill_transparent_bg(batch, None)
     assert out.shape == (2, 3, 4, 4)
     assert torch.equal(out, batch[:, :3])
+
+
+def _cpu_chw(image) -> torch.Tensor:
+    return torch.from_numpy(np.asarray(image)).permute(2, 0, 1).contiguous()
+
+
+def _norm_tensors():
+    return torch.full((1, 3, 1, 1), 1 / 127.5), torch.full((1, 3, 1, 1), -1.0)
+
+
+def test_gpu_preprocess_chunks_match_single_batch(monkeypatch):
+    """Byte-bounded sub-batches produce the same patches as one batch."""
+    images = [
+        Image.fromarray(np.roll(_natural_image(112, 168), 5 * i, axis=1))
+        for i in range(5)
+    ]
+    configs = [dict(new_height=56, new_width=84, pad_height=0, pad_width=0)] * 5
+    scale, bias = _norm_tensors()
+    args = (images, configs, scale, bias, 14)
+    whole, whole_grids = kimi_k25._gpu_preprocess_images(*args, to_chw=_cpu_chw)
+
+    monkeypatch.setattr(kimi_k25, "_GPU_PREPROCESS_CHUNK_BYTES", 1)
+    group = [(i, image, config) for i, (image, config) in enumerate(zip(*args[:2]))]
+    assert len(kimi_k25._byte_bounded_chunks(group, 56 * 84)) == 5
+    chunked, chunked_grids = kimi_k25._gpu_preprocess_images(*args, to_chw=_cpu_chw)
+
+    torch.testing.assert_close(chunked, whole)
+    assert torch.equal(chunked_grids, whole_grids)
+
+
+def test_gpu_preprocess_chunks_count_source_bytes(monkeypatch):
+    """Large sources with a small target are split by their own size, since
+    each source is moved to the GPU and joined before it is resized."""
+    image = Image.new("RGB", (2000, 1500))
+    group = [(i, image, None) for i in range(4)]
+    per_image = kimi_k25._gpu_preprocess_bytes(image, 56 * 84)
+    assert per_image > 6 * 2000 * 1500
+    monkeypatch.setattr(kimi_k25, "_GPU_PREPROCESS_CHUNK_BYTES", 2 * per_image)
+    chunks = kimi_k25._byte_bounded_chunks(group, 56 * 84)
+    assert [len(chunk) for chunk in chunks] == [2, 2]
+
+
+def test_prepare_image_features_falls_back_to_cpu_on_gpu_oom(monkeypatch):
+    """A tokenizer-side GPU OOM is served by the CPU path, not surfaced."""
+    images = [Image.fromarray(_natural_image(56, 84))] * 2
+    scale, bias = _norm_tensors()
+    cpu_calls = []
+
+    def cpu_call(text, imgs):
+        cpu_calls.append(len(imgs))
+        configs = [kimi_k25.navit_resize_config(84, 56, 14, 2, 16384, 512, None)] * len(
+            imgs
+        )
+        pixel_values, grids = kimi_k25._gpu_preprocess_images(
+            imgs, configs, scale, bias, 14, to_chw=_cpu_chw
+        )
+        return {"pixel_values": pixel_values, "image_grid_thw": grids}
+
+    def gpu_oom(*args, **kwargs):
+        raise torch.OutOfMemoryError("CUDA out of memory")
+
+    fake = SimpleNamespace(
+        _patch_size=14,
+        _merge_kernel_size=2,
+        _in_patch_limit=16384,
+        _patch_limit_on_one_side=512,
+        _fixed_output_tokens=None,
+        _transparent_bg_config=None,
+        _image_token="<image>",
+        _get_gpu_norm_tensors=lambda: (scale, bias),
+        _cpu_call=cpu_call,
+    )
+    monkeypatch.setattr(kimi_k3, "_gpu_preprocess_images", gpu_oom)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+
+    features, _, _, grids = kimi_k3.KimiK3GPUProcessorWrapper.prepare_image_features(
+        fake, images
+    )
+
+    assert cpu_calls == [2]
+    assert len(features) == len(grids) == 2
 
 
 if __name__ == "__main__":
