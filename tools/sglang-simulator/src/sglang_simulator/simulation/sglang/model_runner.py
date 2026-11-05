@@ -1,7 +1,6 @@
 from contextvars import ContextVar
 
 import torch
-
 from sglang_simulator.hook import BaseHook
 from sglang_simulator.simulation.manager import ConfigManager
 from sglang_simulator.simulation.sglang.utils import (

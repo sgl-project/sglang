@@ -5,7 +5,6 @@ import math
 
 import zmq
 import zmq.asyncio
-
 from sglang_simulator.compat import validate_coordinator_endpoint
 from sglang_simulator.simulation.coordinator import (
     PROTOCOL_VERSION,
