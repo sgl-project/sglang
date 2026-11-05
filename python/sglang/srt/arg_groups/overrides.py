@@ -761,7 +761,7 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
 # Matches the reference fp8_ds_mla cache; trtllm's 576 B layout does not.
 _KIMI_K31_DSA_BACKEND = "flashmla_kv"
 # Opt-in: raw FP8 KV (scale 1.0) and FP8 q, so numerics differ from the reference.
-_KIMI_K31_DSA_BACKENDS = ("flashmla_kv", "trtllm", "prims_ts")
+_KIMI_K31_DSA_BACKENDS = ("flashmla_kv", "prims_ts")
 
 
 def _kimi_k31_kv_cache_dtype(view: Any) -> dict:
@@ -794,7 +794,7 @@ def _kimi_k31_dsa_backends(view: Any) -> dict:
     if len(chosen) > 1:
         raise ValueError(
             "Kimi-K3.1 needs the same --dsa-prefill-backend and "
-            "--dsa-decode-backend (flashmla_kv and trtllm / prims_ts use "
+            "--dsa-decode-backend (flashmla_kv and prims_ts use "
             f"different KV layouts); got {view.dsa_prefill_backend!r} and "
             f"{view.dsa_decode_backend!r}."
         )
@@ -806,11 +806,11 @@ def _kimi_k31_dsa_backends(view: Any) -> dict:
             f"Kimi-K3.1 HiSparse requires DSA backend {_KIMI_K31_DSA_BACKEND!r}; "
             f"got {backend!r}."
         )
-    if backend in ("trtllm", "prims_ts"):
+    if backend == "prims_ts":
         logger.warning(
             f"Kimi-K3.1 {backend} DSA uses FP8 q and an unscaled FP8 KV cache, not "
             "the reference fp8_ds_mla numerics. PD prefill and decode servers must "
-            "both use a raw-FP8-KV backend (trtllm or prims_ts)."
+            "both use prims_ts."
         )
     declared = {f: backend for f in fields if getattr(view, f) is None}
     logger.warning(

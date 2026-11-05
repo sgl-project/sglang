@@ -4213,31 +4213,29 @@ class TestKimiK31DsaBackends(CustomTestCase):
             {"dsa_prefill_backend": "flashmla_kv", "dsa_decode_backend": "flashmla_kv"},
         )
 
-    def test_trtllm_on_one_phase_selects_both(self):
+    def test_prims_ts_on_one_phase_selects_both(self):
         self.assertEqual(
-            self._resolve(dsa_decode_backend="trtllm"),
-            {"dsa_prefill_backend": "trtllm"},
+            self._resolve(dsa_decode_backend="prims_ts"),
+            {"dsa_prefill_backend": "prims_ts"},
         )
         self.assertEqual(
-            self._resolve(dsa_prefill_backend="trtllm", dsa_decode_backend="trtllm"),
+            self._resolve(
+                dsa_prefill_backend="prims_ts", dsa_decode_backend="prims_ts"
+            ),
             {},
         )
 
     def test_rejects_mixed_backends(self):
         with self.assertRaisesRegex(ValueError, "same --dsa-prefill-backend"):
             self._resolve(
-                dsa_prefill_backend="flashmla_kv", dsa_decode_backend="trtllm"
+                dsa_prefill_backend="flashmla_kv", dsa_decode_backend="prims_ts"
             )
 
     def test_rejects_unsupported_backend(self):
         with self.assertRaisesRegex(ValueError, "--dsa-decode-backend"):
             self._resolve(dsa_decode_backend="flashmla_sparse")
-
-    def test_trtllm_with_dcp(self):
-        self.assertEqual(
-            self._resolve(dsa_decode_backend="trtllm", dcp_size=8),
-            {"dsa_prefill_backend": "trtllm"},
-        )
+        with self.assertRaisesRegex(ValueError, "--dsa-decode-backend"):
+            self._resolve(dsa_decode_backend="trtllm")
 
     def test_hisparse_defaults_to_flashmla_kv(self):
         self.assertEqual(
@@ -4245,9 +4243,9 @@ class TestKimiK31DsaBackends(CustomTestCase):
             {"dsa_prefill_backend": "flashmla_kv", "dsa_decode_backend": "flashmla_kv"},
         )
 
-    def test_hisparse_rejects_trtllm(self):
+    def test_hisparse_rejects_prims_ts(self):
         with self.assertRaisesRegex(ValueError, "HiSparse requires DSA backend"):
-            self._resolve(enable_hisparse=True, dsa_decode_backend="trtllm")
+            self._resolve(enable_hisparse=True, dsa_decode_backend="prims_ts")
 
 
 class TestKimiK31LosslessDefaults(CustomTestCase):
