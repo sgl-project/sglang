@@ -1948,12 +1948,12 @@ class MoriKVManager(CommonKVManager):
             state_type == StateType.DSA
             and self.pp_size is not None
             and self.pp_size > 1
-            # A hybrid linear+DSA pool lists only its full-attention layers, so a
-            # model-layer slice would mispair them; it still needs layer ids.
-            and not self.is_hybrid_mla_backend
             and not src_layer_ids
             and not dst_layer_ids
             and n_src != n_dst
+            # A hybrid linear+DSA pool lists only its full-attention layers, so a
+            # model-layer slice would mispair them; it still needs layer ids.
+            and not self.is_hybrid_mla_backend
         ):
             # DSA state is registered without layer ids; slice the decode entries for
             # this PP stage the same way Mooncake's no-layer-id path does.
