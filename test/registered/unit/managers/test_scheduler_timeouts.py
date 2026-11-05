@@ -45,6 +45,7 @@ class _FakeReq:
     release_mm_inputs_on_abort = Req.release_mm_inputs_on_abort
     request_finish = Req.request_finish
     finish_outside_step = Req.finish_outside_step
+    get_mm_token_counts = MagicMock()
 
     def __init__(self, rid, wait_entry=0.0, forward_entry=0.0, is_finished=False):
         self.rid = rid
@@ -218,14 +219,17 @@ class TestQueuedAbort(CustomTestCase):
         s.dllm_config = None
         s.grammar_manager = MagicMock()
         s.init_request_retirer()
-        s.request_retirer.release_aborted_request = MagicMock()
+        s.request_retirer._detach = MagicMock()
 
         s.abort_request(AbortReq(rid="queued"))
         s.abort_request(AbortReq(abort_all=True))
 
         self.assertIsInstance(req.finished_reason, FINISH_ABORT)
         self.assertIsNone(req.to_finish)
-        s.request_retirer.release_aborted_request.assert_called_once_with(req)
+        s.request_retirer._detach.assert_called_once_with(req)
+        s.tree_cache.finish.assert_called_once_with(
+            req.cache_request_handle, CacheRequestOutcome.ABORT
+        )
 
 
 class TestRunningTimeout(CustomTestCase):

@@ -23,7 +23,6 @@ from sglang.srt.disaggregation.mooncake.conn import (
 )
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     KeyedReqList,
@@ -439,9 +438,6 @@ class TestAllocationIntegration(CustomTestCase):
             disagg_prefill_bootstrap_queue=SimpleNamespace(queue=[]),
             metrics_reporter=SimpleNamespace(enable_metrics=False),
             processed_tokens_counter=0,
-        )
-        scheduler.release_aborted_request = MethodType(
-            Scheduler.release_aborted_request, scheduler
         )
         with (
             patch("sglang.srt.disaggregation.prefill.checkpoint_kv_cache"),
