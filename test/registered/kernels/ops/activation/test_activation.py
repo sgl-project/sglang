@@ -10,11 +10,16 @@ from sglang.kernels.ops.activation.activation import (
     relu2,
     run_activation,
 )
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_ppu_ci,
+)
 
 register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 # Nightly is not redundant here: it sets SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1 to expand get_ci_test_range sweeps.
 register_cuda_ci(est_time=20, stage="nightly", runner_config="1-gpu-large")
+register_ppu_ci(est_time=18, suite="nightly-1-ppu", nightly=True)
 register_amd_ci(est_time=20, stage="jit-kernel-unit", runner_config="amd")
 
 

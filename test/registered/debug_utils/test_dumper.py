@@ -41,7 +41,11 @@ from sglang.srt.debug_utils.dumper import (
 )
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.common import temp_set_env
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_ppu_ci,
+)
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -51,6 +55,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=30, stage="nightly", runner_config="2-gpu-large")
+register_ppu_ci(est_time=372, suite="nightly-2-ppu", nightly=True)
 register_amd_ci(est_time=60, suite="nightly-amd", nightly=True)
 
 

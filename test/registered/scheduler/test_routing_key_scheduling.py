@@ -10,6 +10,7 @@ from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cpu_ci,
     register_cuda_ci,
+    register_ppu_ci,
 )
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -21,6 +22,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=50, stage="nightly", runner_config="1-gpu-large")
+register_ppu_ci(est_time=54, suite="nightly-1-ppu", nightly=True)
 register_amd_ci(est_time=120, suite="nightly-amd-1-gpu", nightly=True)
 register_cpu_ci(est_time=184, suite="base-c-test-cpu")
 

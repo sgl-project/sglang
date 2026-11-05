@@ -9,11 +9,12 @@ from sglang.kernels.jit.utils import get_ci_test_range
 from sglang.kernels.ops.quantization.per_tensor_quant_fp8 import (
     per_tensor_quant_fp8,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
 
 register_cuda_ci(est_time=16, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 # Nightly is not redundant here: it sets SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1 to expand get_ci_test_range sweeps.
 register_cuda_ci(est_time=20, stage="nightly", runner_config="1-gpu-large")
+register_ppu_ci(est_time=17, suite="nightly-1-ppu", nightly=True)
 
 try:
     from sglang.srt.utils import is_hip
