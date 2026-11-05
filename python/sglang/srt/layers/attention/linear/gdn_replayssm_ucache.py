@@ -16,12 +16,15 @@ records, any other row extends it. A fresh slot only needs ``hist_len = 0``.
 
 from __future__ import annotations
 
+import logging
 from typing import Callable, Optional
 
 import msgspec
 import torch
 import triton
 import triton.language as tl
+
+logger = logging.getLogger(__name__)
 
 # FlashInfer u-cache ring geometry (gdn_replay_mtp_umma.RING_SLOTS / W_RING).
 RING_SLOTS = 32
@@ -261,21 +264,34 @@ def commit_gdn_ucache_cursors(
 
 def _load_flush_kernel(device: torch.device) -> Callable:
     capability = torch.cuda.get_device_capability(device)
-    if capability == (10, 7):
-        from flashinfer.gdn_kernels.gdn_replay_mtp_umma_rubin import (
-            gated_delta_rule_mtp_ucache_flush_umma_rubin,
+    if capability not in ((10, 0), (10, 7)):
+        raise RuntimeError(
+            f"GDN u-cache verify needs SM100 or SM107, got SM{capability[0]}{capability[1]}"
         )
+    if capability == (10, 7):
+        try:
+            from flashinfer.gdn_kernels.gdn_replay_mtp_umma_rubin import (
+                gated_delta_rule_mtp_ucache_flush_umma_rubin,
+            )
 
-        return gated_delta_rule_mtp_ucache_flush_umma_rubin
-    if capability == (10, 0):
+            return gated_delta_rule_mtp_ucache_flush_umma_rubin
+        except ImportError:
+            # FlashInfer 0.7.3 ships only the SM100 build, which also runs on SM107
+            # (slower); the SM107 build arrives with flashinfer-ai/flashinfer#6791.
+            logger.warning(
+                "GDN u-cache verify: FlashInfer has no SM107 u-cache build; "
+                "using the SM100 build. Upgrade FlashInfer for the tuned kernel."
+            )
+    try:
         from flashinfer.gdn_kernels.gdn_replay_mtp_umma import (
             gated_delta_rule_mtp_ucache_flush_umma,
         )
-
-        return gated_delta_rule_mtp_ucache_flush_umma
-    raise RuntimeError(
-        f"GDN u-cache verify needs SM100 or SM107, got SM{capability[0]}{capability[1]}"
-    )
+    except ImportError as e:
+        raise RuntimeError(
+            "--enable-gdn-replayssm-ucache needs FlashInfer >= 0.7.3 "
+            "(flashinfer.gdn_kernels.gdn_replay_mtp_umma)."
+        ) from e
+    return gated_delta_rule_mtp_ucache_flush_umma
 
 
 class GdnUcacheVerifier:
