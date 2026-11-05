@@ -1976,6 +1976,49 @@ class PreshardedModelLoader(DefaultModelLoader):
         return xxhash.xxh3_128()
 
     @staticmethod
+    def _is_npu_packed_nz(tensor: torch.Tensor) -> bool:
+        if tensor.device.type != "npu" or tensor.dtype != torch.int32:
+            return False
+
+        import torch_npu
+
+        from sglang.srt.hardware_backend.npu.utils import NPUACLFormat
+
+        return torch_npu.get_npu_format(tensor) == NPUACLFormat.ACL_FORMAT_FRACTAL_NZ
+
+    @staticmethod
+    def _packed_byte_view(tensor: torch.Tensor) -> torch.Tensor:
+        if tensor.ndim and tensor.stride(-1) == 1:
+            return tensor.view(torch.int8)
+        # A scalar or strided final dimension needs a unit-stride word lane.
+        return tensor.unsqueeze(-1).view(torch.int8)
+
+    @staticmethod
+    def _to_cpu_bits(tensor: torch.Tensor, *, copy: bool) -> torch.Tensor:
+        value = tensor.detach()
+        if PreshardedModelLoader._is_npu_packed_nz(value):
+            # Direct int32 NZ transfers can select an unsupported TransData.
+            return (
+                PreshardedModelLoader._packed_byte_view(value)
+                .to(device="cpu", copy=copy)
+                .contiguous()
+                .view(torch.int32)
+                .reshape(value.shape)
+            )
+        if copy:
+            value = value.contiguous()
+        return value.to(device="cpu", copy=copy).contiguous()
+
+    @staticmethod
+    def _copy_packed_nz(target: torch.Tensor, source: torch.Tensor) -> None:
+        if source.dtype != target.dtype or source.shape != target.shape:
+            raise ValueError("Packed-NZ restore requires identical shape and dtype")
+        with torch.no_grad():
+            dest = PreshardedModelLoader._packed_byte_view(target)
+            src = PreshardedModelLoader._packed_byte_view(source)
+            dest.copy_(src.reshape(dest.shape))
+
+    @staticmethod
     def _hash_tensor(tensor: torch.Tensor) -> str:
         # CPU copy so concurrent dump workers cannot race CUDA D2H hashing.
         t = tensor.detach()
@@ -1986,7 +2029,7 @@ class PreshardedModelLoader(DefaultModelLoader):
         if t.numel() == 0:
             return h.hexdigest()
 
-        cpu = t.contiguous().to(device="cpu", copy=True).contiguous()
+        cpu = PreshardedModelLoader._to_cpu_bits(t, copy=True)
         flat_u8 = cpu.reshape(-1).view(torch.uint8)
         h.update(memoryview(flat_u8.numpy()))
         return h.hexdigest()
@@ -2389,12 +2432,7 @@ class PreshardedModelLoader(DefaultModelLoader):
                         f"for file {f['filename']}; plan is inconsistent."
                     )
                 name_for_this_rank = names_for_this_rank[0]
-                tensor = (
-                    state_dict[name_for_this_rank]
-                    .detach()
-                    .to(device="cpu", copy=False)
-                    .contiguous()
-                )
+                tensor = self._to_cpu_bits(state_dict[name_for_this_rank], copy=False)
                 tensors_to_save[t["stored_key"]] = tensor
             save_file(tensors_to_save, os.path.join(presharded_dir, f["filename"]))
 
@@ -2441,6 +2479,12 @@ class PreshardedModelLoader(DefaultModelLoader):
             if r.get("is_extra"):
                 module_path, _, attr_name = r["name"].rpartition(".")
                 module = model.get_submodule(module_path) if module_path else model
+                current = getattr(module, attr_name, None)
+                if isinstance(current, torch.Tensor) and self._is_npu_packed_nz(
+                    current
+                ):
+                    self._copy_packed_nz(current, tensor)
+                    continue
                 if hasattr(module, attr_name):
                     try:
                         delattr(module, attr_name)
@@ -2463,7 +2507,10 @@ class PreshardedModelLoader(DefaultModelLoader):
                     "Re-dump with matching quant/parallel config, or set "
                     "verify_on_load and check process_weights_after_loading."
                 )
-            param_data.copy_(tensor)
+            if self._is_npu_packed_nz(param_data):
+                self._copy_packed_nz(param_data, tensor)
+            else:
+                param_data.copy_(tensor)
             loaded_param_keys.add(r["name"])
 
         cached.clear()
