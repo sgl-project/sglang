@@ -317,10 +317,17 @@ class TestPrefetchCheckpoints(CustomTestCase):
                     extra_config={"max_inflight_bytes": bad},
                     load_format=LoadFormat.SAFETENSORS,
                 )
-        _validate_default_loader_extra_config(
-            extra_config={"max_inflight_bytes": 1 << 30},
-            load_format=LoadFormat.SAFETENSORS,
-        )
+        # Formats that reach the buffered safetensors iterator accept it.
+        for load_format in (
+            LoadFormat.AUTO,
+            LoadFormat.SAFETENSORS,
+            LoadFormat.MISTRAL,
+            LoadFormat.FLASH_RL,
+        ):
+            _validate_default_loader_extra_config(
+                extra_config={"max_inflight_bytes": 1 << 30},
+                load_format=load_format,
+            )
         # Formats whose loaders ignore the cap reject it.
         for load_format in (LoadFormat.FASTSAFETENSORS, LoadFormat.PT):
             with self.assertRaisesRegex(ValueError, "Unexpected extra config keys"):

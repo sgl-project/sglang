@@ -369,7 +369,12 @@ def _validate_default_loader_extra_config(
         return
 
     allowed_keys = {"enable_multithread_load", "num_threads"}
-    if load_format in (LoadFormat.AUTO, LoadFormat.SAFETENSORS):
+    if load_format in (
+        LoadFormat.AUTO,
+        LoadFormat.SAFETENSORS,
+        LoadFormat.MISTRAL,
+        LoadFormat.FLASH_RL,
+    ):
         # Only the buffered multithreaded safetensors iterator honors it.
         allowed_keys.add("max_inflight_bytes")
     if load_format == LoadFormat.FASTSAFETENSORS:
