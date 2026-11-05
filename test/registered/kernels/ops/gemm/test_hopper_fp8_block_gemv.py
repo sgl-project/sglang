@@ -92,8 +92,8 @@ class TestHopperFp8BlockGemv(CustomTestCase):
         for m, n, k in [
             (1, 1536, 6144),
             (2, 1544, 6144),
-            (4, 2560, 6144),
-            (8, 768, 6144),
+            (3, 2560, 6144),
+            (5, 768, 6144),
             (8, 8184, 6144),
         ]:
             gen = torch.Generator(device="cuda").manual_seed(m + n)
@@ -103,6 +103,17 @@ class TestHopperFp8BlockGemv(CustomTestCase):
             out = hopper_fp8_block_gemv(xq, xs, wq, ws)
             ref = _fp64_reference(xq, xs, wq, ws)
             self.assertLess(_max_rel_err(out, ref), MAX_REL_ERR, (m, n, k))
+
+    def test_batch_invariant_up_to_m8(self):
+        # M <= 8 all run one kernel config, so a row's output can't depend on M.
+        n, k = 1536, 6144
+        wq, ws = _block_fp8_weight(n, k, seed=5)
+        x = torch.randn(8, k, device="cuda").to(torch.bfloat16)
+        xq, xs = sglang_per_token_group_quant_fp8(x, BLOCK)
+        full = hopper_fp8_block_gemv(xq, xs, wq, ws)
+        for m in (1, 3, 7):
+            out = hopper_fp8_block_gemv(xq[:m], xs[:m], wq, ws)
+            self.assertTrue(torch.equal(out, full[:m]), m)
 
     def test_linear_dispatch_at_wide_k(self):
         # With the flag on, the linear entry point has to reach the GEMV at K=6144.
