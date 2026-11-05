@@ -3520,12 +3520,8 @@ class Scheduler(
     def _bind_pp_arrival_prefetch(self, req: Req, recv_req) -> None:
         """PP0 decides the request's L3 ticket on arrival; every stage takes the
         prefix match behind that decision at the same step."""
-        if (
-            get_parallel().pp_size <= 1
-            or not self.enable_hicache_storage
-            or get_memory().hicache_host_memory_mode != "buffer_only"
-            or self.tree_cache.cache_controller is None
-        ):
+        controller = self.tree_cache.cache_controller
+        if controller is None or controller.pp_prefetch_command_group is None:
             return
         if get_parallel().pp_rank == 0:
             recv_req.pp_prefetch_ticketed = bool(self._prefetch_kvcache(req))

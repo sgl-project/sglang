@@ -30,7 +30,7 @@ class TestArrivalMatchEviction(UnifiedRadixCacheFixtures, CustomTestCase):
         max_context_len=1024,
     )
 
-    def _stage(self, rank, *, match_on_arrival=True):
+    def _stage(self, rank, *, match_on_arrival=True, ticket_enabled=True):
         cache, allocator, pool = build_fixture(self.cfg)
         shared = self._make_seq(1, 2)
         self._insert(cache, allocator, pool, shared)
@@ -39,10 +39,11 @@ class TestArrivalMatchEviction(UnifiedRadixCacheFixtures, CustomTestCase):
         self._insert(cache, allocator, pool, self._make_seq(1000, 2))
         req = self._make_req(pool)
         req.origin_input_ids = array("q", shared + self._make_seq(5000, 1))
-        cache.cache_controller = SimpleNamespace()
+        cache.cache_controller = SimpleNamespace(
+            pp_prefetch_command_group=object() if ticket_enabled else None
+        )
         scheduler = SimpleNamespace(
             tree_cache=cache,
-            enable_hicache_storage=True,
             _prefetch_kvcache=lambda r: r.init_next_round_input(cache, cow_mamba=False),
         )
         # The request stays out of the enqueue path while its grammar is pending.
@@ -51,12 +52,6 @@ class TestArrivalMatchEviction(UnifiedRadixCacheFixtures, CustomTestCase):
                 patch(
                     "sglang.srt.managers.scheduler.get_parallel",
                     return_value=SimpleNamespace(pp_rank=rank, pp_size=4),
-                ),
-                patch(
-                    "sglang.srt.managers.scheduler.get_memory",
-                    return_value=SimpleNamespace(
-                        hicache_host_memory_mode="buffer_only"
-                    ),
                 ),
                 patch.object(cache, "bind_prefetch_ticket"),
             ):
@@ -69,6 +64,7 @@ class TestArrivalMatchEviction(UnifiedRadixCacheFixtures, CustomTestCase):
     def test_missing_arrival_match_changes_eviction(self):
         self.assertEqual(self._stage(0), (128, 128))
         self.assertEqual(self._stage(1, match_on_arrival=False), (0, 128))
+        self.assertEqual(self._stage(1, ticket_enabled=False), (0, 128))
 
     def test_every_stage_preserves_the_same_checkpoint(self):
         self.assertEqual([self._stage(rank) for rank in range(4)], [(128, 128)] * 4)
