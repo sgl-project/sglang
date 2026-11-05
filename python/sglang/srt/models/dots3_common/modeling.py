@@ -97,8 +97,7 @@ from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
     pad_mm_token_pairs,
 )
-from sglang.srt.managers.req_types import MultimodalDataItem
-from sglang.srt.managers.schedule_batch import MultimodalInputs
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
@@ -254,9 +253,7 @@ class Dots3MoEGate(nn.Module):
     def forward(self, hidden_states):
         # Use the fused router only for its tuned shapes.
         if hidden_states.shape[0] <= self.tiny_router_gemm_max_tokens:
-            logits = tiny_gemm_bf16(
-                hidden_states, self.weight, max_m=self.tiny_router_gemm_max_tokens
-            )
+            logits = tiny_gemm_bf16(hidden_states, self.weight)
         else:
             logits = F.linear(hidden_states, self.weight, None)
 

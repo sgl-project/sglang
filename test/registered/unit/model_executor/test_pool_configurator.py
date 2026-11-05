@@ -96,6 +96,7 @@ def _make_model_runner(
     mr = MagicMock()
 
     mr.use_mla_backend = use_mla_backend
+    mr.modelslim_cache_layout = None
     mr.is_draft_worker = False
     mr.dflash_draft_cell_size_per_token = None
     mr.num_effective_layers = num_layers
@@ -451,6 +452,7 @@ class TestHybridSWAConfigurator(CustomTestCase):
         configurator = object.__new__(KVCacheConfigurator)
         configurator.model_config = mr.model_config
         configurator.is_hybrid_swa = True
+        configurator.use_mla_backend = False
         configurator.is_draft_worker = False
         target = configurator._derive_pool_sizes(config=config)
         configurator.is_draft_worker = True
@@ -955,6 +957,64 @@ class TestEagleConfigurator(CustomTestCase):
         total_layers = num_layers + eagle_draft_num_layers
         used = config.max_total_num_tokens * full_pt * total_layers
         self.assertLessEqual(used, available)
+
+    @patch(
+        "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
+        return_value=576,
+    )
+    def test_eagle_dcp_replicated_draft_does_not_exceed_budget(
+        self,
+        _mock_calculate_mla_kv_cache_dim,
+    ):
+        """The EAGLE draft pool spans every DCP virtual location with its own KV
+        heads: GQA heads replicate over DCP on the target only, an MLA latent has none.
+        """
+        available = 10_000_000
+        num_layers = 32
+        eagle_draft_num_layers = 1
+        tp_size = 8
+        total_kv_heads = 8
+
+        def num_kv_heads(tensor_parallel_size, dcp_size=1):
+            return total_kv_heads // (tensor_parallel_size // dcp_size)
+
+        for use_mla_backend in (True, False):
+            for dcp_size in (1, 4):
+                with self.subTest(use_mla_backend=use_mla_backend, dcp_size=dcp_size):
+                    mr = _make_model_runner(
+                        self, num_layers=num_layers, use_mla_backend=use_mla_backend
+                    )
+                    mr.model_config.get_num_kv_heads = num_kv_heads
+                    mr.spec_algorithm.is_eagle.return_value = True
+                    mr.spec_algorithm.is_standalone.return_value = False
+                    mr.spec_algorithm.is_none.return_value = False
+                    mr.spec_aux_config.eagle_draft_num_layers = eagle_draft_num_layers
+
+                    with (
+                        mock_cpu_env(tp_size=tp_size),
+                        get_parallel().override(attn_dcp_size=dcp_size),
+                    ):
+                        from sglang.srt.model_executor.pool_configurator import (
+                            create_memory_pool_configurator,
+                        )
+
+                        cfg = create_memory_pool_configurator(mr)
+                        config = cfg.calculate_pool_sizes(available, 1)
+
+                    if use_mla_backend:
+                        target_per_layer = draft_per_layer = 576 * KV_SIZE
+                    else:
+                        mc = mr.model_config
+                        head_bytes = (mc.head_dim + mc.v_head_dim) * KV_SIZE
+                        target_per_layer = num_kv_heads(tp_size, dcp_size) * head_bytes
+                        draft_per_layer = num_kv_heads(tp_size) * head_bytes
+                    per_token = (
+                        target_per_layer * num_layers
+                        + draft_per_layer * eagle_draft_num_layers * dcp_size
+                    )
+                    used = config.max_total_num_tokens * per_token
+                    self.assertLessEqual(used, available)
+                    self.assertGreater(used, available * 0.99)
 
     @patch(
         "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
