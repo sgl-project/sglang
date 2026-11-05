@@ -1577,6 +1577,11 @@ class Envs:
     # and benchmarks at parity, so this is a consolidation escape hatch, not a perf flip.
     SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK = EnvBool(False)
     SGLANG_OPT_USE_TOPK_V2 = EnvBool(True)
+    # Exactness of the top-k v2 kernel, compiled in once per process: 0 fast (an
+    # overflowing threshold bin keeps an arbitrary subset; opt-in), 1 exact (values
+    # equal torch.topk's; the default on every platform), 2 exact with the same
+    # selected set on every run.
+    SGLANG_TOPK_V2_MODE = EnvInt(1)
 
     # ===================================================================
     # Kernel selection and fused backends
