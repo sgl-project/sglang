@@ -57,6 +57,103 @@ def _set_architectures(config, arch_name):
     config.update({"architectures": [arch_name]})
 
 
+_ROPE_OVERRIDE_KEYS = ("rope_scaling", "rope_parameters")
+
+# Sub-config attributes that may hold the language-model config of a
+# composite (VLM / omni) model. Mirrors the attribute priority of
+# `get_hf_text_config` in common.py.
+_TEXT_SUB_CONFIG_ATTRS = (
+    "thinker_config",
+    "llm_config",
+    "language_config",
+    "text_config",
+)
+
+
+# Unlike get_hf_text_config, selects the sub-config without normalizing its RoPE.
+def _resolve_text_sub_config(config) -> Optional[PretrainedConfig]:
+    for attr in _TEXT_SUB_CONFIG_ATTRS:
+        sub = getattr(config, attr, None)
+        if isinstance(sub, dict):
+            sub = PretrainedConfig(**sub)
+            setattr(config, attr, sub)
+        if isinstance(sub, PretrainedConfig):
+            if attr == "thinker_config":
+                inner = getattr(sub, "text_config", None)
+                if isinstance(inner, dict):
+                    inner = PretrainedConfig(**inner)
+                    sub.text_config = inner
+                if isinstance(inner, PretrainedConfig):
+                    return inner
+            return sub
+    return None
+
+
+def _merged_rope_override(config, key: str, value):
+    existing = getattr(config, key, None)
+    if not isinstance(value, dict):
+        return value
+    if not isinstance(existing, dict):
+        return dict(value)
+    merged = {**existing, **value}
+    # "type" is the legacy alias of "rope_type": an override naming one sets
+    # the other, so the checkpoint's old type does not win.
+    for alias, other in (("rope_type", "type"), ("type", "rope_type")):
+        if alias in value and other in merged and other not in value:
+            merged[other] = value[alias]
+    return merged
+
+
+def _sub_config_for_override(config, key: str, value):
+    existing = getattr(config, key, None)
+    if (
+        key in _TEXT_SUB_CONFIG_ATTRS
+        and isinstance(value, dict)
+        and isinstance(existing, dict)
+    ):
+        existing = PretrainedConfig(**existing)
+        setattr(config, key, existing)
+    if isinstance(value, dict) and isinstance(existing, PretrainedConfig):
+        return existing
+    return None
+
+
+def _mirror_rope_overrides(config, rope_overrides: dict) -> None:
+    text_config = _resolve_text_sub_config(config)
+    if text_config is None:
+        return
+    for key, value in rope_overrides.items():
+        text_config.update(
+            {key: _merged_rope_override(config=text_config, key=key, value=value)}
+        )
+
+
+def apply_model_override_args(config, model_override_args: dict) -> None:
+    """Preserve sub-configs and checkpoint RoPE keys when applying CLI overrides."""
+    flat_overrides = {}
+    rope_overrides = {}
+    for key, value in model_override_args.items():
+        sub_config = _sub_config_for_override(config=config, key=key, value=value)
+        if sub_config is not None:
+            apply_model_override_args(config=sub_config, model_override_args=value)
+        elif key in _ROPE_OVERRIDE_KEYS:
+            # One key at a time: under transformers v5 both keys share one
+            # dict, so each merge has to see the previous one.
+            config.update(
+                {key: _merged_rope_override(config=config, key=key, value=value)}
+            )
+            # Mirror only dicts: a null would replace the language sub-config's
+            # whole RoPE dict, rope_theta included.
+            if isinstance(value, dict):
+                rope_overrides[key] = value
+        else:
+            flat_overrides[key] = value
+    if flat_overrides:
+        config.update(flat_overrides)
+    if rope_overrides:
+        _mirror_rope_overrides(config=config, rope_overrides=rope_overrides)
+
+
 def _apply_deepseek_ocr_overrides(config, model):
     _override_v_head_dim_if_zero(config)
     _set_architectures(config, "DeepseekOCRForCausalLM")
@@ -405,23 +502,9 @@ def get_config(
     if model_override_args:
         if isinstance(config, DeepseekV41Config):
             model_override_args = normalize_deepseek_v41_config(model_override_args)
-        # A plain update() setattrs a dict-valued override straight onto the
-        # config, so '{"text_config": {...}}' on a VLM would replace the whole
-        # sub-config with a dict and break attribute access downstream.
-        for key, value in model_override_args.items():
-            current = getattr(config, key, None)
-            if isinstance(value, dict) and isinstance(current, PretrainedConfig):
-                current.update(value)
-            elif (
-                key in ("rope_scaling", "rope_parameters")
-                and isinstance(value, dict)
-                and isinstance(current, dict)
-            ):
-                # v5's rope_scaling setter replaces rope_parameters wholesale;
-                # merge so partial overrides keep rope_theta (#41227).
-                setattr(config, key, {**current, **value})
-            else:
-                setattr(config, key, value)
+        apply_model_override_args(
+            config=config, model_override_args=model_override_args
+        )
 
     if is_gguf and not gguf_has_sidecar_config:
         if config.model_type not in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES:
