@@ -25,6 +25,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
 )
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
+from sglang.srt.mem_cache.kv.plan import TREE_WINDOW
 from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
@@ -1891,9 +1892,17 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
         cache.req_to_token_pool.req_to_token = torch.tensor(
             [[1, 2, 3, 4, 5, 0]], dtype=torch.int64
         )
-        cache.token_to_kv_pool_allocator = mock.Mock()
-        cache.token_to_kv_pool_allocator.translate_swa_indices_for_transfer.side_effect = (
-            lambda indices: indices + 100
+        cache.token_to_kv_pool_allocator = mock.Mock(hands_out_virtual_ids=False)
+        # Each window component reads its rows through the storage it lives in.
+        storage = mock.Mock()
+        storage.window_ids.side_effect = lambda sub_pool, indices: indices + 100
+        cache._components_tuple = (
+            SimpleNamespace(
+                slot=SimpleNamespace(family=TREE_WINDOW, window=3),
+                component_type=ComponentType.SWA,
+                pool_name=PoolName.SWA,
+                storage_and_sub_pool=lambda: (storage, "swa"),
+            ),
         )
         req = mock.Mock(rid="req", seqlen=6)
         req.kv.req_pool_idx = 0
@@ -1909,7 +1918,7 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
                 torch.tensor([103, 104, 105, 106]),
             )
         )
-        cache.token_to_kv_pool_allocator.translate_swa_indices_for_transfer.assert_called_once()
+        storage.window_ids.assert_called_once()
         cache.token_to_kv_pool_allocator.translate_kv_indices_for_transfer.assert_not_called()
         cache.token_to_kv_pool_allocator.translate_loc_from_full_to_swa.assert_not_called()
 
