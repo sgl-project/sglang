@@ -133,86 +133,6 @@ def select_kv_heads_for_query_shard(
     )
 
 
-@triton.jit
-def _pack_owner_kv_contiguous_kernel(
-    k_ptr,
-    v_ptr,
-    slots_ptr,
-    lengths_ptr,
-    out_k_ptr,
-    out_v_ptr,
-    out_slots_ptr,
-    width: tl.constexpr,
-    num_kv_heads: tl.constexpr,
-    head_dim: tl.constexpr,
-    block_dim: tl.constexpr,
-):
-    row = tl.program_id(0)
-    column = tl.program_id(1)
-    head = tl.program_id(2)
-    dimensions = tl.arange(0, block_dim)
-    slot = tl.load(slots_ptr + row * width + column)
-    length = tl.load(lengths_ptr + row)
-    valid = (column < length) & (slot >= 0)
-    source = slot.to(tl.int64) * num_kv_heads * head_dim + head * head_dim + dimensions
-    packed_index = row * width + column
-    destination = (
-        packed_index.to(tl.int64) * num_kv_heads * head_dim
-        + head * head_dim
-        + dimensions
-    )
-    dimension_mask = dimensions < head_dim
-    tl.store(
-        out_k_ptr + destination,
-        tl.load(k_ptr + source, mask=valid & dimension_mask, other=0.0),
-        mask=dimension_mask,
-    )
-    tl.store(
-        out_v_ptr + destination,
-        tl.load(v_ptr + source, mask=valid & dimension_mask, other=0.0),
-        mask=dimension_mask,
-    )
-    if head == 0:
-        tl.store(
-            out_slots_ptr + packed_index,
-            tl.where(valid, packed_index, -1),
-        )
-
-
-def pack_owner_kv_contiguous(
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    local_token_slots: torch.Tensor,
-    owner_lengths: torch.Tensor,
-    out_k: torch.Tensor,
-    out_v: torch.Tensor,
-    out_slots: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Gather owner-selected K/V into fixed-address row-contiguous storage."""
-
-    rows, width = local_token_slots.shape
-    expected = (rows * width, k_cache.shape[1], k_cache.shape[2])
-    if out_k.shape != expected or out_v.shape != expected:
-        raise ValueError(f"owner packed K/V shape must be {expected}")
-    if out_slots.shape != local_token_slots.shape:
-        raise ValueError("owner packed slots must match local slot shape")
-    _pack_owner_kv_contiguous_kernel[(rows, width, k_cache.shape[1])](
-        k_cache,
-        v_cache,
-        local_token_slots,
-        owner_lengths,
-        out_k,
-        out_v,
-        out_slots,
-        width=width,
-        num_kv_heads=k_cache.shape[1],
-        head_dim=k_cache.shape[2],
-        block_dim=triton.next_power_of_2(k_cache.shape[2]),
-        num_warps=4,
-    )
-    return out_k, out_v, out_slots
-
-
 def _validate_attention_inputs(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -376,7 +296,7 @@ def owner_sparse_attention(
                     "selected owner width exceeds static buffer capacity: "
                     f"{owner_width} > {static_buffers.owner_topk}"
                 )
-            local_slots, owner_lengths = _owner_localize_token_slots_triton(
+            local_slots, _ = _owner_localize_token_slots_triton(
                 global_token_slots,
                 sharding,
                 fixed_width=owner_width,
@@ -386,7 +306,7 @@ def owner_sparse_attention(
                 lengths=static_buffers.owner_lengths[: global_token_slots.shape[0]],
             )
         else:
-            local_slots, owner_lengths = _owner_localize_token_slots_triton(
+            local_slots, _ = _owner_localize_token_slots_triton(
                 global_token_slots, sharding, fixed_width=owner_width
             )
     if static_buffers is not None and group is not None:
@@ -395,30 +315,11 @@ def owner_sparse_attention(
         )
         gathered_q = static_buffers.q_gathered[: q.shape[0]]
     with torch.profiler.record_function("qsa.owner.kernel"):
-        attention_k = local_k_cache
-        attention_v = local_v_cache
-        attention_slots = local_slots
-        if (
-            static_buffers is not None
-            and q.shape[0] <= static_buffers.owner_pack_max_rows
-            and local_k_cache.shape[1] == 1
-            and local_k_cache.shape[2] == 128
-        ):
-            packed_tokens = q.shape[0] * owner_width
-            attention_k, attention_v, attention_slots = pack_owner_kv_contiguous(
-                local_k_cache,
-                local_v_cache,
-                local_slots,
-                owner_lengths,
-                static_buffers.owner_packed_k[:packed_tokens],
-                static_buffers.owner_packed_v[:packed_tokens],
-                static_buffers.owner_packed_slots[: q.shape[0], :owner_width],
-            )
         output, lse = owner_sparse_attention_partial(
             gathered_q,
-            attention_k,
-            attention_v,
-            attention_slots,
+            local_k_cache,
+            local_v_cache,
+            local_slots,
             softmax_scale,
         )
     if group is None:
@@ -431,12 +332,3 @@ def owner_sparse_attention(
             static_buffers=static_buffers,
         )
     return output, lse
-
-
-__all__ = [
-    "merge_owner_sparse_attention",
-    "owner_sparse_attention",
-    "owner_sparse_attention_partial",
-    "pack_owner_kv_contiguous",
-    "select_kv_heads_for_query_shard",
-]
