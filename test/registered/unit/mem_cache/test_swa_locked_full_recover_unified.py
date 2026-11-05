@@ -32,7 +32,6 @@ import unittest
 import torch
 
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator
-from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.storage import _page_pairs
 from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.mem_cache.unified_cache.cache_action import (
@@ -180,7 +179,7 @@ class TestOwnershipTransfer(_RecoverTestBase):
         kept, incoming = self._two_ranges(allocator)
         donated = swa.ids.virtual_to_physical[incoming.to(torch.int64)].clone()
 
-        allocator.storage.rehome_window("swa", kept, incoming)
+        allocator.storage.rehome_window("window_32", kept, incoming)
 
         self.assertEqual(
             swa.ids.virtual_to_physical[kept.to(torch.int64)].tolist(),
@@ -203,7 +202,7 @@ class TestOwnershipTransfer(_RecoverTestBase):
         kept, incoming = self._two_ranges(allocator)
         allocator.free_swa(incoming)  # donor no longer owns anything
         with self.assertRaises(AssertionError):
-            allocator.storage.rehome_window("swa", kept, incoming)
+            allocator.storage.rehome_window("window_32", kept, incoming)
 
 
 class TestRecoverActionHandler(_RecoverTestBase):
@@ -216,9 +215,7 @@ class TestRecoverActionHandler(_RecoverTestBase):
         kept, incoming = self._two_ranges(allocator)
         allocator.free_swa(kept)  # what eviction does when it tombstones
         self.assertTrue(
-            bool(
-                (allocator.id_spaces()[IdSpaceKind.SLIDING_WINDOW].ids(kept) == 0).all()
-            ),
+            bool((allocator.id_spaces()[allocator.roles.window].ids(kept) == 0).all()),
             "precondition: a tombstoned range translates to the sink",
         )
         # Snapshot AFTER the setup traffic: the invariant under test is that
@@ -248,9 +245,7 @@ class TestRecoverActionHandler(_RecoverTestBase):
             "the incoming ids' FULL side must come back",
         )
         self.assertTrue(
-            bool(
-                (allocator.id_spaces()[IdSpaceKind.SLIDING_WINDOW].ids(kept) > 0).all()
-            ),
+            bool((allocator.id_spaces()[allocator.roles.window].ids(kept) > 0).all()),
             "after recovery the node's ids must address live swa pages",
         )
 
@@ -309,9 +304,7 @@ class TestRecoverEvictedSWAHandler(_RecoverTestBase):
         )
 
         self.assertTrue(
-            bool(
-                (allocator.id_spaces()[IdSpaceKind.SLIDING_WINDOW].ids(kept) > 0).all()
-            ),
+            bool((allocator.id_spaces()[allocator.roles.window].ids(kept) > 0).all()),
             "the node's ids must address live swa pages after recovery",
         )
         self.assertTrue(

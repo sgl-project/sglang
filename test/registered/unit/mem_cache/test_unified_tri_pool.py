@@ -1293,7 +1293,8 @@ class TestTriFactorySizing(_PoolTestCase):
         plan = allocator.storage.plan
         self.assertIsInstance(allocator, ChainAllocator)
         self.assertEqual(
-            [m.sub_pool_name for m in allocator.members], ["full", "swa", "mamba"]
+            [m.sub_pool_name for m in allocator.members],
+            ["full", plan.primary_window().name, "mamba"],
         )
         sized = allocator.storage.sized
         self.assertEqual(pool.total_bytes + sized.fixed_bytes, budget)
@@ -1301,7 +1302,7 @@ class TestTriFactorySizing(_PoolTestCase):
         self.assertEqual(len(pool.bands), 3)
         self.assertEqual(
             [(b.name, b.grow_direction) for b in pool.bands],
-            [("mamba", "up"), ("swa", "float"), ("full", "down")],
+            [("mamba", "up"), (plan.primary_window().name, "float"), ("full", "down")],
         )
 
     def test_fallback_is_the_token_count_resum(self):
@@ -1310,7 +1311,7 @@ class TestTriFactorySizing(_PoolTestCase):
         plan = bundle.token_to_kv_pool_allocator.storage.plan
         want = (
             64 * plan.sub_pool("full").spec.entry_bytes()
-            + 32 * plan.sub_pool("swa").spec.entry_bytes()
+            + 32 * plan.primary_window().spec.entry_bytes()
             + self._factory_kwargs()["max_mamba_cache_size"]
             * plan.sub_pool("mamba").spec.entry_bytes()
             + plan.sink_bytes()
@@ -1331,7 +1332,7 @@ class TestTriFactorySizing(_PoolTestCase):
         plan = bundle.token_to_kv_pool_allocator.storage.plan
         self.assertIs(plan.fused_draft, placement)
         self.assertIs(plan.sub_pool("full").spec.draft_region, region)
-        for other in ("swa", "mamba"):
+        for other in (plan.primary_window().name, "mamba"):
             self.assertIsNone(plan.sub_pool(other).spec.draft_region, other)
 
     def _state_placement(self):

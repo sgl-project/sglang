@@ -164,9 +164,10 @@ class DecodeKVCacheOffloadManager:
         if not self._unified_window:
             return full_indices, []
 
-        swa_indices = self.token_to_kv_pool_allocator.id_spaces()[
-            IdSpaceKind.SLIDING_WINDOW
-        ].ids(virtual_indices)
+        window = self.kv_cache.layer_router.sub_pool(IdSpaceKind.SLIDING_WINDOW).name
+        swa_indices = self.token_to_kv_pool_allocator.id_spaces()[window].ids(
+            virtual_indices
+        )
         # Page-aligned chunks have whole-page bindings; zero denotes the sink page.
         live_swa_indices = swa_indices[swa_indices > 0].to(torch.int64)
         if live_swa_indices.numel() == 0:
