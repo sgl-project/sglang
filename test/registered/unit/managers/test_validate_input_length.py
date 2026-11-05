@@ -30,7 +30,7 @@ class TestValidateInputLength(CustomTestCase):
             req, max_req_input_len=1018, allow_auto_truncate=False
         )
         self.assertIn(
-            "Input length (1500 tokens) exceeds the maximum allowed length (1018 tokens).",
+            "Input length (1500 tokens) exceeds the maximum allowed length (1017 tokens).",
             msg,
         )
         self.assertIn("This model's maximum context length is 1017 tokens", msg)

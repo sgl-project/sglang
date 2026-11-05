@@ -305,10 +305,12 @@ def validate_input_length(
             # OpenAI-compatible clients (e.g. LiteLLM) recognize a context
             # overflow by OpenAI's "This model's maximum context length is"
             # sentence; without it this is a generic 400 to them.
+            # Both sentences quote the largest accepted prompt.
+            max_prompt_len = max_req_input_len - 1
             error_msg = (
                 f"Input length ({len(req.origin_input_ids)} tokens) exceeds "
-                f"the maximum allowed length ({max_req_input_len} tokens). "
-                f"This model's maximum context length is {max_req_input_len - 1} "
+                f"the maximum allowed length ({max_prompt_len} tokens). "
+                f"This model's maximum context length is {max_prompt_len} "
                 f"tokens on this server. "
                 f"Use a shorter input or enable --allow-auto-truncate."
             )
