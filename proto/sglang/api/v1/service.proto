@@ -166,6 +166,22 @@ message DeploymentInfo {
 
   // KV-cache event streams published by this deployment.
   repeated KvEventSource kv_event_sources = 19;
+
+  // Every Rust listener this launch runs on this node, in port-offset order.
+  // Each of them reports the same list, so one connection finds the rest.
+  repeated NodeRustListener node_listeners = 20;
+}
+
+// One Rust listener: the HTTP (and native gRPC) server embedded by a DP-group
+// leader scheduler.
+message NodeRustListener {
+  // The listener binds --port + port_offset and --grpc-port + port_offset.
+  uint32 port_offset = 1;
+  // The DP rank it serves; equals that listener's DeploymentInfo.dp_rank.
+  uint32 dp_rank = 2;
+  uint32 http_port = 3;
+  // Unset without native gRPC.
+  optional uint32 grpc_port = 4;
 }
 
 message KvEventSource {
