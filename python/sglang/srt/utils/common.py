@@ -496,6 +496,15 @@ def get_available_gpu_memory(
         total_free_memory = get_free_cpu_memory()
         n_node = len(get_cpu_ids_by_node()) or 1
         free_gpu_memory = round(total_free_memory / n_node, 3)
+        # The symmetric split above assumes every node carries the same free
+        # memory. On an imbalanced host it overshoots the smaller node and the
+        # scheduler sizes the KV pool past what that node can hold (#48411:
+        # socket0 server tests OOM-killed during KV allocation). Bound the
+        # estimate by the smallest node's available memory when sysfs exposes
+        # the per-node view; on a balanced host the minimum matches the mean.
+        per_node_free = get_per_numa_node_available_memory()
+        if per_node_free:
+            free_gpu_memory = min(free_gpu_memory, min(per_node_free))
     elif device == "npu":
         num_gpus = torch.npu.device_count()
         assert gpu_id < num_gpus
@@ -912,6 +921,73 @@ def get_free_cpu_memory() -> int:
     return free_cpu_memory
 
 
+def _read_numa_node_meminfos(
+    node_root: str = "/sys/devices/system/node",
+) -> List[Dict[str, int]]:
+    """Parse every node's meminfo under ``node_root`` into {field: bytes}.
+
+    Nodes with an unreadable or unparsable meminfo are skipped; the result is
+    in node order.
+    """
+    if not os.path.isdir(node_root):
+        return []
+    infos = []
+    for entry in sorted(os.listdir(node_root)):
+        if not entry.startswith("node"):
+            continue
+        fields: Dict[str, int] = {}
+        try:
+            with open(os.path.join(node_root, entry, "meminfo"), "r") as f:
+                for line in f:
+                    # "Node 0 MemFree:         3118176 kB"
+                    parts = line.split(":", 1)
+                    if len(parts) != 2:
+                        continue
+                    name = parts[0].split()[-1]
+                    value = parts[1].strip().split()
+                    if len(value) == 2 and value[1] == "kB":
+                        fields[name] = int(value[0]) * 1024
+        except (OSError, ValueError):
+            continue
+        if fields:
+            infos.append(fields)
+    return infos
+
+
+def get_per_numa_node_available_memory(
+    node_root: str = "/sys/devices/system/node",
+) -> Optional[List[int]]:
+    """Estimate the available memory of every NUMA node, in bytes.
+
+    Per-node meminfo carries no MemAvailable, so this mirrors its semantics
+    with the standard approximation: free plus reclaimable file pages plus
+    reclaimable slab. On a balanced host the estimate tracks the global
+    ``MemAvailable`` closely enough that the smaller of the two bounds wins,
+    so callers only see a tighter number when a node is actually starved
+    (#48411: one socket ~60 GB below the other). Returns None when no node
+    exposes a readable meminfo (containers that hide sysfs); callers then
+    keep their symmetric estimate.
+    """
+    infos = _read_numa_node_meminfos(node_root)
+    values = [
+        info.get("MemFree", 0)
+        + info.get("Active(file)", 0)
+        + info.get("Inactive(file)", 0)
+        + info.get("SReclaimable", 0)
+        for info in infos
+    ]
+    return values or None
+
+
+def get_per_numa_node_total_memory(
+    node_root: str = "/sys/devices/system/node",
+) -> Optional[List[int]]:
+    """The MemTotal of every NUMA node from sysfs, in bytes, or None."""
+    infos = _read_numa_node_meminfos(node_root)
+    values = [info["MemTotal"] for info in infos if "MemTotal" in info]
+    return values or None
+
+
 def get_cpu_memory_capacity():
     # Per-rank memory capacity cannot be determined for customized core settings
     if os.environ.get("SGLANG_CPU_OMP_THREADS_BIND", ""):
@@ -927,6 +1003,12 @@ def get_cpu_memory_capacity():
     if instance_max_cpu_memory is not None:
         total_cpu_memory = min(total_cpu_memory, instance_max_cpu_memory)
     per_node_mem = total_cpu_memory / n_node
+    # Same asymmetric-NUMA bound as get_available_gpu_memory: a rank bound to
+    # one node cannot use more than that node's total, so the symmetric split
+    # overshoots the smaller node on an imbalanced host (#48411).
+    per_node_total = get_per_numa_node_total_memory()
+    if per_node_total:
+        per_node_mem = min(per_node_mem, min(per_node_total))
     # Retrieved value in Byte, need MB
     return float(per_node_mem // (1 << 20))
 
