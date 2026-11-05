@@ -6,6 +6,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.sail.moe import deepep as sail_deepep
 from sglang.srt.layers.moe import utils as moe_utils
 from sglang.srt.layers.moe.token_dispatcher import deepep
 from sglang.srt.layers.moe.utils import DeepEPMode, DispatcherOutputDtype
@@ -60,7 +61,6 @@ class TestDeepEPFabric(CustomTestCase):
                     patch.dict(get_resources().buffers, {}, clear=True),
                     patch.object(deepep, "Buffer", buffer_type, create=True),
                     patch.object(deepep, "DEEPEP_SUPPORT_USE_FABRIC", supports_fabric),
-                    patch.object(deepep, "DEEPEP_SUPPORT_TIMEOUT_CONTROL", False),
                     patch.object(deepep, "_is_npu", False),
                     patch.object(deepep, "_set_nvshmem_qp_depth"),
                     patch.object(
@@ -108,26 +108,23 @@ class TestDeepEPFabric(CustomTestCase):
                 self.assertFalse(deepep._buffer_supports_use_fabric(object))
 
     def test_sail_override_without_flashinfer(self):
-        with (
-            patch.object(deepep, "_is_sail", True),
-            patch.object(
-                deepep,
-                "is_flashinfer_available",
-                side_effect=AssertionError("SAIL must not probe NVIDIA FABRIC"),
-            ),
+        """SAIL reads its own fabric flag instead of probing NVIDIA FABRIC."""
+        with patch.object(
+            deepep,
+            "is_flashinfer_available",
+            side_effect=AssertionError("SAIL must not probe NVIDIA FABRIC"),
         ):
             with envs.SGLANG_SAIL_MNNVL_FABRIC_SUPPORTED.override(False):
-                self.assertFalse(deepep._is_mnnvl_fabric_supported())
+                self.assertFalse(sail_deepep.SailDeepEPBuffer.mnnvl_fabric_supported())
             with envs.SGLANG_SAIL_MNNVL_FABRIC_SUPPORTED.override(True):
-                self.assertTrue(deepep._is_mnnvl_fabric_supported())
+                self.assertTrue(sail_deepep.SailDeepEPBuffer.mnnvl_fabric_supported())
 
-    def test_sail_override_does_not_enable_other_platforms(self):
+    def test_sail_fabric_flag_does_not_leak_into_the_shared_buffer(self):
         with (
-            patch.object(deepep, "_is_sail", False),
             patch.object(deepep, "is_flashinfer_available", return_value=False),
             envs.SGLANG_SAIL_MNNVL_FABRIC_SUPPORTED.override(True),
         ):
-            self.assertFalse(deepep._is_mnnvl_fabric_supported())
+            self.assertFalse(deepep.DeepEPBuffer.mnnvl_fabric_supported())
 
 
 class TestDeepEPDispatcherDtype(CustomTestCase):
@@ -141,9 +138,13 @@ class TestDeepEPDispatcherDtype(CustomTestCase):
         )
         self.enterContext(patch.object(moe_utils, "_is_npu", npu))
         self.enterContext(patch.object(deepep, "use_deepep", True))
-        self.enterContext(patch.object(deepep, "_is_sail", sail))
         self.enterContext(patch.object(deepep, "_is_npu", npu))
-        return deepep._DeepEPDispatcherImplBase(
+        impl_cls = (
+            sail_deepep.SailDeepEPDispatcherImplBase
+            if sail
+            else deepep._DeepEPDispatcherImplBase
+        )
+        return impl_cls(
             group=None,
             router_topk=2,
             permute_fusion=False,
@@ -195,6 +196,47 @@ class TestDeepEPDispatcherDtype(CustomTestCase):
         dispatcher.set_quant_config({"dispatcher_output_dtype": "bf16"})
         self.assertFalse(dispatcher.use_fp8)
         self.assertFalse(dispatcher.use_int8)
+
+    def test_dispatcher_installs_sail_impls_only_on_sail(self):
+        for sail, expected in (
+            (
+                True,
+                (
+                    sail_deepep.SailDeepEPDispatcherImplNormal,
+                    sail_deepep.SailDeepEPDispatcherImplLowLatency,
+                ),
+            ),
+            (
+                False,
+                (
+                    deepep._DeepEPDispatcherImplNormal,
+                    deepep._DeepEPDispatcherImplLowLatency,
+                ),
+            ),
+        ):
+            with (
+                self.subTest(sail=sail),
+                get_context().override_server_args(
+                    deepep_dispatcher_output_dtype="auto"
+                ),
+                envs.SGLANG_DEEPEP_BF16_DISPATCH.override(False),
+                envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.override(64),
+                patch.object(deepep, "use_deepep", True),
+                patch.object(deepep, "_is_npu", False),
+                patch.object(deepep, "is_sail", return_value=sail),
+            ):
+                dispatcher = deepep.DeepEPDispatcher(
+                    group=None,
+                    router_topk=2,
+                    num_experts=4,
+                    num_local_experts=4,
+                    hidden_size=128,
+                    params_dtype=torch.bfloat16,
+                    deepep_mode=DeepEPMode.AUTO,
+                )
+
+            self.assertIsInstance(dispatcher._normal_dispatcher, expected[0])
+            self.assertIsInstance(dispatcher._low_latency_dispatcher, expected[1])
 
 
 if __name__ == "__main__":
