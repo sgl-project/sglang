@@ -151,6 +151,7 @@ class TokenSpaceSGLangProcessor:
             # nvJPEG and GPU video decode use bare "cuda", cuda:0 on a pool thread.
             worker_thread_device=server_args.base_gpu_id if is_cuda_alike() else None,
             item_feature_cache=item_feature_cache,
+            item_feature_cache_check_rate=mm.token_space_preprocess_cache_check_rate,
         )
         # The tokenizer manager sets pad values through it.
         self.hash_executor = MultimodalHashExecutor()

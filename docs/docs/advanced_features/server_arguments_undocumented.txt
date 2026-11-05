@@ -62,6 +62,7 @@
 --mm-io-worker-num
 --mm-preprocess-cache-size-mb
 --token-space-preprocess-cache-dir
+--token-space-preprocess-cache-check-rate
 --mm-processor-worker-num
 --otlp-service-name
 --prefill-kv-cache-dequant-dtype

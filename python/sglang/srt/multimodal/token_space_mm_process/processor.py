@@ -58,7 +58,6 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
     """
 
     strategy_class = None
-    HIT_CHECK_RATE = 1 / 100
 
     @classmethod
     @functools.cache
@@ -80,11 +79,14 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
         processor_config=None,
         worker_thread_device=None,
         item_feature_cache=None,
+        item_feature_cache_check_rate=None,
     ):
         strategy_class = self.strategy_class
         self._worker_thread_device = worker_thread_device
         # Any map with get and __setitem__, e.g. a dict, an LRU or a disk cache.
         self._item_feature_cache = item_feature_cache
+        # The share of hits computed again and compared with the cache; 0 or None is off.
+        self._item_feature_cache_check_rate = item_feature_cache_check_rate
         if processor_config is None:
             processor_config = MultimodalProcessorConfig()
         self._initialize_processor(
@@ -262,11 +264,13 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
                         if isinstance(features.get(name), torch.Tensor):
                             features[name] = features[name].to(device)
             # A key that leaves out something the features depend on fails here, not in training.
-            checked = {
-                index: features
-                for index, features in enumerate(item_features)
-                if features is not None and random.random() < self.HIT_CHECK_RATE
-            }
+            if self._item_feature_cache_check_rate:
+                checked = {
+                    index: features
+                    for index, features in enumerate(item_features)
+                    if features is not None
+                    and random.random() < self._item_feature_cache_check_rate
+                }
             for index in checked:
                 item_features[index] = None
         missed = [
