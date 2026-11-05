@@ -124,7 +124,6 @@ from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
     match_kv_cache,
     page_align_floor,
-    release_kv_cache,
     restore_kv_cache,
     start_restore_kv_cache,
     suffix_page_indices,
@@ -1084,14 +1083,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def _abort_retracted(self, recv_req: AbortReq) -> None:
         # Retracted requests hold a KV backup.
         for req in self.retracted_queue.take(lambda req: recv_req.matches(req.rid)):
-            self.scheduler.request_retirer.abort_queued(req)
+            self.scheduler.request_retirer.abort(req)
 
     def _abort_held(self, recv_req: AbortReq) -> None:
         # Held requests hold no KV.
         for req in self.held_rebootstrap_reqs.take(
             lambda req: recv_req.matches(req.rid)
         ):
-            self.scheduler.request_retirer.abort_queued(
+            self.scheduler.request_retirer.abort(
                 req, finished_reason=recv_req.finished_reason
             )
 
@@ -1788,8 +1787,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 r for r in self.pending_reqs if id(r) not in failed_ids
             ]
             for decode_req in failed_reqs:
-                if decode_req.req.kv.holds_mamba and not decode_req.req.kv.holds_kv:
-                    release_kv_cache(decode_req.req, self.tree_cache, checkpoint=False)
+                self.scheduler.request_retirer.release(decode_req.req, checkpoint=False)
 
         self.queue.leave([queue[i].req for i in indices_to_remove])
 
@@ -3183,16 +3181,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         )
         kv_manager._staging_handler = self.staging_handler
 
-    def _release_request(self, decode_req: DecodeRequest) -> None:
-        # HiSparse host pages are the transfer destination; free them with the KV.
-        if self.scheduler.enable_hisparse:
-            self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
-        if self.enable_host_receive:
-            discard_kv_cache_backup(decode_req.req, self.tree_cache)
-            if decode_req.host_staged:
-                return
-        release_kv_cache(decode_req.req, self.tree_cache, checkpoint=False)
-
     def _is_host_destination(self, decode_req: DecodeRequest) -> bool:
         return self.enable_host_receive and decode_req.host_staged
 
@@ -3351,7 +3339,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                         self.scheduler.output_streamer.stream_output(
                             [decode_req.req], decode_req.req.return_logprob
                         )
-                        self._release_request(decode_req)
+                        self.scheduler.request_retirer.release(
+                            decode_req.req, checkpoint=False
+                        )
                         decode_req.kv_receiver.clear()
                         decode_req.kv_receiver = None
                         indices_to_remove.add(i)
@@ -3378,7 +3368,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                         decode_req.req.return_logprob,
                     )
                     self._clean_hicache_prefetch_resources(decode_req)
-                    self._release_request(decode_req)
+                    self.scheduler.request_retirer.release(
+                        decode_req.req, checkpoint=False
+                    )
                     self._record_transfer_failure(
                         decode_req.req.finished_reason.message
                     )
@@ -3405,7 +3397,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 self._defer_release(decode_req)
                 deferred_indices.add(i)
             else:
-                self._release_request(decode_req)
+                self.scheduler.request_retirer.release(decode_req.req, checkpoint=False)
                 receiver = decode_req.kv_receiver
                 receiver.clear()
                 decode_req.kv_receiver = None
@@ -3478,7 +3470,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         if self.enable_staging and self.staging_handler.is_staging_room(room):
             self.staging_handler.unregister_decode_req(room)
         # release pre-allocated kv cache, but don't insert into the tree since it's failed
-        self._release_request(decode_req)
+        self.scheduler.request_retirer.release(decode_req.req, checkpoint=False)
         self.metadata_buffers.clear_slot(idx)
         self.req_to_metadata_buffer_idx_allocator.free(idx)
         if not self._is_host_destination(decode_req):
@@ -3885,9 +3877,7 @@ class SchedulerDisaggregationDecodeMixin:
             status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
         )
         self.output_streamer.stream_output([req], req.return_logprob)
-        if self.enable_hisparse:
-            self.hisparse_coordinator.request_finished(req)
-        release_kv_cache(req, self.tree_cache, checkpoint=False)
+        self.request_retirer.release(req, checkpoint=False)
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_transfer_failed_reqs()
 

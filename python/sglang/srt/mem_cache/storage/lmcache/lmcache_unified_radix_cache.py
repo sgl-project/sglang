@@ -262,7 +262,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
     def on_release(self, req: Req, *, checkpointed: bool) -> None:
         super().on_release(req, checkpointed=checkpointed)
         if not checkpointed:
-            self.release_aborted_request(req.cache_request_handle)
+            self._abandon_attempt(req.cache_request_handle)
 
     def checkpoint(self, req: Req, *, up_to: int, **kwargs) -> None:
         self._publish_external_loaded_prefix(req, token_ids_len=up_to)
@@ -320,7 +320,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
     def has_pending_cache_operations(self) -> bool:
         return bool(self._external_flows or self._pending_stores)
 
-    def release_aborted_request(self, handle: CacheRequestHandle) -> None:
+    def _abandon_attempt(self, handle: CacheRequestHandle) -> None:
         rid = handle.rid
         self.prefetch_loaded_tokens_by_reqid.pop(handle, None)
         self.prefetch_loaded_storage_start_by_reqid.pop(handle, None)

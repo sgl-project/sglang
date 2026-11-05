@@ -243,11 +243,8 @@ class TestDecodeHiCacheRestoreGate(CustomTestCase):
                 gated = HiCacheRestoreGatedKVReceiver(_gated_decode_req(poll, status))
                 self.assertEqual(gated.poll(), expected)
 
-    @patch("sglang.srt.disaggregation.decode.release_kv_cache")
     @patch("sglang.srt.disaggregation.decode.prepare_abort")
-    def test_pop_transferred_branches_on_reduced_poll_only(
-        self, mock_prepare_abort, mock_release_kv_cache
-    ):
+    def test_pop_transferred_branches_on_reduced_poll_only(self, mock_prepare_abort):
         def make_queue(decode_req, peer_poll):
             queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
             queue.queue = decode_queue(ListKind.PD_RECEIVING, [decode_req])
@@ -303,13 +300,12 @@ class TestDecodeHiCacheRestoreGate(CustomTestCase):
         mock_prepare_abort.assert_called_once()
 
         mock_prepare_abort.reset_mock()
-        mock_release_kv_cache.reset_mock()
         decode_req = _gated_decode_req(KVPoll.Transferring, HiCacheRestoreResult.FAILED)
         queue = make_queue(decode_req, peer_poll=KVPoll.Success)
         self.assertEqual(queue.pop_transferred(), [])
         self.assertEqual(list(queue.queue.items()), [decode_req])
         mock_prepare_abort.assert_not_called()
-        mock_release_kv_cache.assert_not_called()
+        queue.scheduler.request_retirer.release.assert_not_called()
 
 
 class _PollingReceiver:
