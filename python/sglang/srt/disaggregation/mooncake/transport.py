@@ -54,6 +54,9 @@ class MooncakeTransport(Transport):
         # (ptr, length) each key is registered with. Keys sharing a region share
         # one engine registration: double registration fails in the engine.
         self._registrations: Dict[BufferKey, Tuple[int, int]] = {}
+        # Offsets in Copy are relative to the original view, even when multiple
+        # views share a larger physical registration.
+        self._view_ptrs: Dict[BufferKey, int] = {}
 
     @property
     def session_id(self) -> str:
@@ -64,38 +67,54 @@ class MooncakeTransport(Transport):
             [Registration(key=key, ptr=ptr, length=length, device=device)]
         )
 
-    def register_all(self, registrations: Sequence[Registration]) -> None:
+    def register_all(
+        self,
+        registrations: Sequence[Registration],
+        *,
+        register_allocation_spans: bool = False,
+    ) -> None:
         """Register in one batch_register call: Ascend's MemFabric merges
         overlapping 2 MiB aligned ranges only within one batch."""
+        views = [(r.ptr, r.length) for r in registrations if r.length]
+        if register_allocation_spans:
+            from sglang.srt.disaggregation.mooncake.npu_registration import (
+                registration_spans,
+            )
+
+            regions = registration_spans(views)
+        else:
+            regions = {view: view for view in views}
         self.deregister(
             [
                 r.key
                 for r in registrations
-                if self._registrations.get(r.key, (r.ptr, r.length))
-                != (r.ptr, r.length)
+                if r.key in self._registrations
+                and self._registrations[r.key] != regions.get((r.ptr, r.length))
             ]
         )
-        registered_regions = set(self._registrations.values())
-        new_regions = []
-        for r in registrations:
-            if r.length == 0:
-                # Elided DSA index-K layers keep a 0-row buffer for alignment;
-                # the engine rejects zero-length regions and nothing writes them.
-                continue
-            region = (r.ptr, r.length)
-            if region not in registered_regions:
-                registered_regions.add(region)
-                new_regions.append(region)
-            self._registrations[r.key] = region
+        # Identical registrations share one engine entry. A zero-row layer
+        # keeps its key in the wire layout and has no engine registration.
+        existing = set(self._registrations.values())
+        new_regions = [
+            region
+            for region in dict.fromkeys(regions.values())
+            if region not in existing
+        ]
         if new_regions:
             ptrs, lens = zip(*new_regions)
             self._engine.batch_register(list(ptrs), list(lens))
+        for r in registrations:
+            if r.length:
+                self._registrations[r.key] = regions[(r.ptr, r.length)]
+                self._view_ptrs[r.key] = r.ptr
 
     def deregister(self, keys: Sequence[BufferKey]) -> None:
         """Unregister `keys`, preserving regions still held by other keys."""
-        released_regions = {
-            self._registrations.pop(key) for key in keys if key in self._registrations
-        }
+        released_regions = set()
+        for key in keys:
+            if key in self._registrations:
+                released_regions.add(self._registrations.pop(key))
+                del self._view_ptrs[key]
         unused_regions = released_regions - set(self._registrations.values())
         if unused_regions:
             self._engine.batch_deregister([ptr for ptr, _ in unused_regions])
@@ -124,9 +143,7 @@ class MooncakeTransport(Transport):
         if not copies:
             return []
         # uint64: XPU pointers can set bit 63.
-        src_addrs = [
-            np.uint64(self._registrations[c.src][0]) + c.ranges[:, 0] for c in copies
-        ]
+        src_addrs = [np.uint64(self._view_ptrs[c.src]) + c.ranges[:, 0] for c in copies]
         dst_addrs = [np.uint64(remote.bases[c.dst]) + c.ranges[:, 1] for c in copies]
         lengths = [c.ranges[:, 2] for c in copies]
         ret = self._engine.batch_transfer_sync(
