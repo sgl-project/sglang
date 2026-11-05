@@ -804,6 +804,73 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
         cache.unlock(req.lock)
 
     @requires_full_mamba_ps1
+    def test_decode_load_back_preserves_transferred_mamba_state(self):
+        """A late prefix restore must not replace the full-prompt PD state."""
+        from types import SimpleNamespace
+
+        from sglang.srt.disaggregation.decode_hicache_mixin import (
+            DecodeHiCacheTransferMixin,
+            DecodePrefixMatch,
+            HiCacheRestoreResult,
+        )
+
+        cache, allocator, pool = self._build_hicache_fixture()
+        chain = self._build_chain_pages(cache, allocator, pool, 3)
+        leaf = chain[-1]
+        tokens = self._match_tokens_for_chain(cache, chain)
+        node_slot = node_device_value(cache, leaf, ComponentType.MAMBA).clone()
+        self._fill_mamba_state(pool, node_slot, marker=11)
+        checkpoint = self._snapshot_mamba_state(pool, node_slot)
+        self._backup_node(cache, leaf)
+        cache.evict(EvictParams(num_tokens=node_key_length(cache, leaf)))
+
+        req = self._make_req(pool)
+        req.origin_input_ids = array("q", tokens + [900, 901])
+        match = cache.match_prefix(
+            MatchPrefixParams(
+                key=RadixKey(array("q", tokens)), req=req, cow_mamba=False
+            )
+        )
+        self._apply_match_to_req(req, match)
+        req.lock = cache.lock(match.last_device_node)
+        slot = req.kv.mamba_pool_idx.unsqueeze(0).clone()
+        # Model the completed P->D write before the local H->D is queued.
+        self._fill_mamba_state(pool, slot, marker=37)
+        transferred = self._snapshot_mamba_state(pool, slot)
+        dr = SimpleNamespace(
+            req=req,
+            prefix_match=DecodePrefixMatch(
+                prefix_indices=cache.prefix_device_indices(req),
+                l2_host_hit_length=match.host_hit_length,
+                l3_storage_hit_length=0,
+                last_device_node=match.last_device_node,
+            ),
+            hicache_restore_status=HiCacheRestoreResult.PENDING,
+            hicache_restore_lock=None,
+        )
+        try:
+            self.assertTrue(
+                DecodeHiCacheTransferMixin._try_hicache_queue_load_back(
+                    SimpleNamespace(tree_cache=cache), dr
+                )
+            )
+            self._finish_pending_loads(cache)
+            actual = self._snapshot_mamba_state(pool, slot)
+            self.assertTrue(torch.equal(actual[0], transferred[0]))
+            for got, wanted in zip(actual[1], transferred[1]):
+                self.assertTrue(torch.equal(got, wanted))
+            restored = self._snapshot_mamba_state(
+                pool, node_device_value(cache, leaf, ComponentType.MAMBA)
+            )
+            self.assertTrue(torch.equal(restored[0], checkpoint[0]))
+            for got, wanted in zip(restored[1], checkpoint[1]):
+                self.assertTrue(torch.equal(got, wanted))
+            self.assertEqual(len(dr.hicache_restored_kv_indices), match.host_hit_length)
+        finally:
+            cache.unlock(dr.hicache_restore_lock)
+            cache.unlock(req.lock)
+
+    @requires_full_mamba_ps1
     def test_load_back_success_copies_mamba_state_into_request_slot(self):
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()
         chain = self._build_chain_pages(cache, allocator, req_to_token_pool, 3)

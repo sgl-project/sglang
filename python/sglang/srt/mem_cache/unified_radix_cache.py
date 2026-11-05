@@ -4049,7 +4049,10 @@ class UnifiedRadixCache(BasePrefixCache):
                 and best_match_node_id in self.ongoing_load_back
             ):
                 return None
-            if self.load_back(best_match_node_id, mem_quota, req=req):
+            # Restore cache-owned checkpoints without replacing state supplied
+            # by the PD transfer in the request slot.
+            load_req = req if params.restore_request_state else None
+            if self.load_back(best_match_node_id, mem_quota, req=load_req):
                 new_indices = self.tree_core.collect_full_device_indices(
                     best_match_node_id, last_best_match_device_node_id
                 )
