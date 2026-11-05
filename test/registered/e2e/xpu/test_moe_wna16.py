@@ -92,6 +92,8 @@ class TestXpuMoeWna16(CustomTestCase):
         activation_fn = {
             "silu": F.silu,
             "gelu": F.gelu,
+            "gelu_tanh": lambda x: F.gelu(x, approximate="tanh"),
+            "relu2": lambda x: torch.square(F.relu(x)),
             "situ": lambda x: 4.0 * torch.tanh(x / 4.0) * torch.sigmoid(x),
         }[config.activation]
         x = dispatch_output.hidden_states.float().cpu()
@@ -147,10 +149,17 @@ class TestXpuMoeWna16(CustomTestCase):
                 gate_up = reference_gemm(
                     expert_input, w13_weight, w13_scale, expert_id, b1_cpu
                 )
-                intermediate = (
-                    activation_fn(gate_up[: self.intermediate])
-                    * gate_up[self.intermediate :]
-                )
+                if config.is_gated:
+                    gate = gate_up[: self.intermediate]
+                    up = gate_up[self.intermediate :]
+                    if config.swiglu_limit is not None:
+                        gate = activation_fn(gate).clamp(max=config.swiglu_limit)
+                        up = up.clamp(min=-config.swiglu_limit, max=config.swiglu_limit)
+                        intermediate = gate * up
+                    else:
+                        intermediate = activation_fn(gate) * up
+                else:
+                    intermediate = activation_fn(gate_up)
                 expert_output = reference_gemm(
                     intermediate, w2_weight, w2_scale, expert_id, b2_cpu
                 )
@@ -219,10 +228,13 @@ class TestXpuMoeWna16(CustomTestCase):
         method.create_weights(**create_kwargs)
         method.create_moe_runner(layer, runner_config)
 
+        w13_intermediate = (
+            2 * self.intermediate if runner_config.is_gated else self.intermediate
+        )
         w13_bf16 = (
             torch.randn(
                 self.num_experts,
-                2 * self.intermediate,
+                w13_intermediate,
                 self.hidden,
                 dtype=torch.bfloat16,
             )
@@ -316,6 +328,30 @@ class TestXpuMoeWna16(CustomTestCase):
             routed_scaling_factor=1.5,
         )
         output = method.apply(layer, dispatch_output)
+        self._assert_output_matches_reference(output, reference)
+
+    def test_fp8_moe_swiglu_limit_native(self):
+        from sgl_kernel import fused_experts
+
+        dispatch_output = self._create_dispatch_output()
+        config = MoeRunnerConfig(swiglu_limit=10.0)
+        method = Fp8MoEMethod(Fp8Config(is_checkpoint_fp8_serialized=True))
+        layer, _, _ = self._build_moe_layer(method, runner_config=config)
+        layer.to(self.device)
+        method.process_weights_after_loading(layer)
+
+        reference = self._reference_moe(
+            dispatch_output,
+            layer.w13_weight,
+            layer.w2_weight,
+            layer.w13_weight_scale,
+            layer.w2_weight_scale,
+            runner_config=config,
+        )
+        with patch("sgl_kernel.fused_experts", wraps=fused_experts) as native:
+            output = method.apply(layer, dispatch_output)
+            native.assert_called_once()
+            self.assertEqual(native.call_args.kwargs["swiglu_limit"], 10.0)
         self._assert_output_matches_reference(output, reference)
 
     def test_mxfp8_moe_method_serialized(self):
@@ -515,6 +551,27 @@ class TestXpuMoeWna16(CustomTestCase):
             with self.subTest(activation=activation, is_gated=is_gated):
                 config = MoeRunnerConfig(activation=activation, is_gated=is_gated)
                 self.assertEqual(can_use_xpu_fp8_moe(config, None), expected)
+
+        default_config = MoeRunnerConfig(activation="silu", is_gated=True)
+        # Block size checks
+        self.assertTrue(can_use_xpu_fp8_moe(default_config, [1, 32], use_mxfp8=True))
+        self.assertFalse(can_use_xpu_fp8_moe(default_config, [32, 32], use_mxfp8=True))
+        self.assertTrue(
+            can_use_xpu_fp8_moe(default_config, [128, 128], use_mxfp8=False)
+        )
+        self.assertFalse(can_use_xpu_fp8_moe(default_config, [32, 32], use_mxfp8=False))
+
+        # EP checks
+        with get_parallel().override(tp_size=2, moe_ep_size=2, attn_tp_size=2):
+            self.assertFalse(can_use_xpu_fp8_moe(default_config, None))
+        non_local_config = MoeRunnerConfig(
+            activation="silu", is_gated=True, num_experts=8, num_local_experts=4
+        )
+        self.assertFalse(can_use_xpu_fp8_moe(non_local_config, None))
+
+        # Architecture checks
+        with patch("sgl_kernel.is_xe2_arch", return_value=False):
+            self.assertFalse(can_use_xpu_fp8_moe(default_config, None))
 
     def test_compressed_tensors_runner_config_fallback(self):
         from sgl_kernel import fused_experts
@@ -725,13 +782,22 @@ class TestXpuMoeWna16(CustomTestCase):
                 )
                 for method in methods:
                     with self.subTest(backend=backend, method=type(method).__name__):
+                        config = MoeRunnerConfig(activation="gelu_tanh")
                         layer, _, _ = self._build_moe_layer(
                             method,
-                            runner_config=MoeRunnerConfig(activation="gelu_tanh"),
+                            runner_config=config,
                         )
                         layer.to(self.device)
                         method.process_weights_after_loading(layer)
                         dispatch = self._create_dispatch_output()
+                        reference = self._reference_moe(
+                            dispatch,
+                            layer.w13_weight,
+                            layer.w2_weight,
+                            layer.w13_weight_scale,
+                            layer.w2_weight_scale,
+                            runner_config=config,
+                        )
                         with patch(
                             "sgl_kernel.fused_experts", wraps=fused_experts
                         ) as native:
@@ -744,9 +810,31 @@ class TestXpuMoeWna16(CustomTestCase):
                             self.assertEqual(
                                 native.call_args.kwargs["activation"], "gelu"
                             )
-                        self.assertEqual(
-                            output.hidden_states.shape, dispatch.hidden_states.shape
-                        )
+                        self._assert_output_matches_reference(output, reference)
+
+    def test_fp8_moe_relu2_native(self):
+        from sgl_kernel import fused_experts
+
+        dispatch_output = self._create_dispatch_output()
+        config = MoeRunnerConfig(activation="relu2", is_gated=False)
+        method = Fp8MoEMethod(Fp8Config(is_checkpoint_fp8_serialized=True))
+        layer, _, _ = self._build_moe_layer(method, runner_config=config)
+        layer.to(self.device)
+        method.process_weights_after_loading(layer)
+
+        reference = self._reference_moe(
+            dispatch_output,
+            layer.w13_weight,
+            layer.w2_weight,
+            layer.w13_weight_scale,
+            layer.w2_weight_scale,
+            runner_config=config,
+        )
+        with patch("sgl_kernel.fused_experts", wraps=fused_experts) as native:
+            output = method.apply(layer, dispatch_output)
+            native.assert_called_once()
+            self.assertEqual(native.call_args.kwargs["activation"], "relu2")
+        self._assert_output_matches_reference(output, reference)
 
 
 if __name__ == "__main__":

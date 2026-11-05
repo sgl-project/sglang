@@ -156,9 +156,11 @@ sglang serve                        \
 
 On Xe2 / BMG, FP8 MoE experts use the `sgl-kernel-xpu` W8A16 grouped GEMM
 when you select the default `auto` runner or `--moe-runner-backend intel_xpu`.
-Expert weights stay FP8 and activations stay BF16; this is not native W8A8
-activation computation. The `fp8` and `compressed-tensors` methods call this
-native path directly; the Triton runner handles FP8 and MXFP8 fallbacks.
+Because Xe2 XMX does not have native FP8 DPAS instructions, expert weights
+are dequantized to BF16 in registers and computed via BF16 DPAS, while
+activations stay in BF16 without activation-side FP8 quantization.
+The `fp8` and `compressed-tensors` methods call this native path directly;
+the Triton runner handles FP8 and MXFP8 fallbacks.
 
 | Weight format | Native Xe2 path |
 |---|---|
@@ -182,9 +184,10 @@ fallback. An explicit `--moe-runner-backend triton` also bypasses the native
 FP8 path.
 
 MXFP8 also uses Triton for an explicit Triton runner, input-side router
-weighting, uncombined outputs, or exact GELU. This fallback decodes UE8M0
-scales inside the GEMM without materializing BF16 expert weights.
-Expert-parallel execution has not been validated on the native path.
+weighting, uncombined outputs, exact GELU, expert parallelism (EP), or non-Xe2
+architectures. In this fallback, activations undergo dynamic per-token-group FP8
+quantization, and the Triton GEMM kernel decodes UE8M0 scale bytes into FP32
+multipliers on the fly without materializing BF16 expert weights.
 
 ## Benchmarking with Requests
 

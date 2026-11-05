@@ -37,6 +37,7 @@ from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
 from sglang.srt.runtime_context import (
     get_exec,
+    get_parallel,
     get_platform,
 )
 from sglang.srt.utils import (
@@ -73,6 +74,9 @@ _is_fp8_fnuz = is_fp8_fnuz()
 _is_gfx95_supported = is_gfx95_supported()
 _is_gfx1250_supported = is_gfx1250_supported()
 _is_musa = is_musa()
+
+if _is_xpu:
+    import sgl_kernel
 
 # gfx1250 (RDNA4) cannot compile the AITER CK quant/GEMM kernels, and even when
 # CK builds it lacks the MFMA/WMMA instructions those kernels rely on. Force the
@@ -823,13 +827,37 @@ def can_use_xpu_fp8_moe(
     use_mxfp8: bool = False,
 ) -> bool:
     """Check FP8 layouts and runner options supported by native XPU MoE."""
-    return (
-        (use_mxfp8 or weight_block_size in (None, [128, 128]))
+    if not get_platform().is_xpu:
+        return False
+
+    valid_block_size = (
+        weight_block_size in (None, [1, 32])
+        if use_mxfp8
+        else weight_block_size in (None, [128, 128])
+    )
+    if not (
+        valid_block_size
         and not config.apply_router_weight_on_input
         and not config.no_combine
         and (config.activation, config.is_gated)
         in (("silu", True), ("gelu_tanh", True), ("relu2", False))
-    )
+    ):
+        return False
+
+    if (
+        config.num_experts is not None
+        and config.num_local_experts is not None
+        and config.num_experts != config.num_local_experts
+    ):
+        return False
+
+    try:
+        if get_parallel().moe_ep_size > 1:
+            return False
+    except (RuntimeError, ValueError):
+        pass
+
+    return sgl_kernel.is_xe2_arch()
 
 
 def prepare_xpu_block_scale_for_scaled_mm(
