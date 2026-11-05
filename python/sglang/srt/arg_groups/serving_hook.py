@@ -10,11 +10,8 @@ import random
 import socket
 from typing import Any
 
-from sglang.srt.arg_groups.overrides import (
-    declare_resolution,
-    model_config_of,
-    resolving_view,
-)
+from sglang.srt.arg_groups.model_override_base import model_config_of, resolving_view
+from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import get_platform
@@ -84,6 +81,13 @@ def handle_ssl_validation(server_args: Any):
         raise ValueError(
             "--enable-ssl-refresh requires --ssl-certfile and --ssl-keyfile "
             "to be specified."
+        )
+    if cfg.enable_http_worker_reuseport and (
+        cfg.tokenizer_worker_num == 1 or cfg.enable_http2
+    ):
+        raise ValueError(
+            "--enable-http-worker-reuseport requires --tokenizer-worker-num > 1 "
+            "and has no effect with --enable-http2."
         )
 
     if cfg.enable_http2:
@@ -402,11 +406,6 @@ def handle_deprecated_args(server_args: Any):
             )
         if cfg.grpc_port is None:
             raise ValueError("--sidecar requires --grpc-port or SGLANG_GRPC_PORT.")
-        if envs.SGLANG_RUST_SERVER.get():
-            raise ValueError(
-                "--sidecar is not yet supported with SGLANG_RUST_SERVER: "
-                "Rust-server mode does not run the Python sidecar lifecycle."
-            )
     if native_grpc:
         if cfg.use_ray:
             raise ValueError(
@@ -714,7 +713,7 @@ def handle_return_hidden_states_mode(server_args: Any):
             "return_hidden_states_mode must be one of: None, 'last', or 'full'."
         )
     if cfg.return_hidden_states_mode is None:
-        if cfg.enable_return_hidden_states:
+        if cfg.enable_return_hidden_states or cfg.enable_return_aux_hidden_states:
             declare_resolution(
                 server_args,
                 "_handle_return_hidden_states_mode",

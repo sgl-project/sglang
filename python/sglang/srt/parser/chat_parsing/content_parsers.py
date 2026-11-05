@@ -79,7 +79,7 @@ def _json(text: str, args: dict) -> Any:
 
     try:
         return json.loads(working)
-    except json.JSONDecodeError as e:
+    except (json.JSONDecodeError, RecursionError) as e:
         if args.get("allow_non_json"):
             return _text(text, args)
         if working == text:
@@ -96,7 +96,87 @@ def _sub_parse(raw: str, value_parser: dict | None) -> Any:
     return parse_content(raw, value_parser.get("name", "text"), value_parser.get("args", {}))
 
 
-def _xml_inline(text: str, args: dict) -> dict:
+# A whole JSON string, and the rest of one after its opening quote.
+_JSON_STRING = re.compile(r'"(?:[^"\\]++|\\.)*+"', re.DOTALL)
+_JSON_STRING_REST = re.compile(r'(?:[^"\\]++|\\.)*+', re.DOTALL)
+
+
+_JSON_MARKER = re.compile(r'["{}\[\]]')
+_JSON_LITERAL = re.compile(r'-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?|true|false|null')
+
+
+def _json_advance(text: str, scan: dict, end: int) -> bool:
+    """Advance the current JSON value, holding an escape cut off at `end`."""
+    pos = scan["pos"]
+    if scan.get("json_done"):
+        return True
+    if "json_start" not in scan:
+        while pos < end and text[pos] in " \t\n\r":
+            pos += 1
+        if pos == end:
+            scan["pos"] = pos
+            return False
+        scan.update(json_start=pos, depth=0)
+    while pos < end:
+        if scan["string"]:
+            pos = _JSON_STRING_REST.match(text, pos, end).end()
+            if pos == end or text[pos] != '"':
+                break
+            scan["string"] = False
+            if scan["depth"] == 0:
+                scan["json_done"] = True
+        else:
+            marker = _JSON_MARKER.search(text, pos, end)
+            if marker is None:
+                pos = end
+                break
+            pos = marker.start()
+            if text[pos] == '"':
+                scan["string"] = True
+            elif text[pos] in "{[":
+                scan["depth"] += 1
+            else:
+                scan["depth"] -= 1
+                if scan["depth"] == 0:
+                    scan["json_done"] = True
+        pos += 1
+        if scan.get("json_done"):
+            break
+    scan["pos"] = pos
+    return scan.get("json_done", False) or (
+        not scan["string"] and scan["depth"] == 0
+        and _JSON_LITERAL.fullmatch(text[scan["json_start"]:end].strip()) is not None
+    )
+
+
+def _json_tag(tag: re.Pattern, text: str, head: int, value: int, end: int):
+    """Match the tag at `head` whose JSON value, from `value`, ends no earlier than that JSON."""
+    m = tag.match(text, head, end)
+    scan = {"pos": value, "string": False}
+    if m is None or _json_advance(text, scan, m.end("value")):
+        return m
+    # Only a string or container can hold a tag end. Mask no further than its end: a quote in the tag end
+    # could pair with a later one.
+    if not _json_advance(text, scan, end) or text[scan["json_start"]] not in '"[{':
+        return m
+    masked = _JSON_STRING.sub(lambda s: '"' + "\0" * (len(s.group()) - 2) + '"', text[value : scan["pos"]])
+    return tag.match(text[:value] + masked + text[scan["pos"] : end], head)
+
+
+def _xml_tags(text: str, tag_pattern: str, json_keys: frozenset = frozenset()):
+    """Find parameter tags while shielding JSON strings for `json_keys`."""
+    tag = re.compile(tag_pattern, re.DOTALL)
+    pos = 0
+    while (m := tag.search(text, pos)) is not None:
+        if m.groupdict().get("key") in json_keys:
+            m = _json_tag(tag, text, m.start(), m.start("value"), len(text)) or m
+            yield m.group("key"), text[m.start("value") : m.end("value")]
+        else:
+            yield m.groupdict().get("key"), m.groupdict().get("value", "")
+        pos = m.end()
+
+
+def _xml_inline(text: str, args: dict, json_keys: frozenset = frozenset()) -> dict:
     """Parse shallow XML-ish tags into a dict. `tag_pattern` regex must have named
     groups `key` and `value`. Optional `value_parser` recurses; `merge_duplicates`
     collects duplicate keys into a list."""
@@ -107,12 +187,10 @@ def _xml_inline(text: str, args: dict) -> dict:
     merge = args.get("merge_duplicates", False)
 
     out: dict[str, Any] = {}
-    for m in re.finditer(tag_pattern, text, flags=re.DOTALL):
-        groups = m.groupdict()
-        key = groups.get("key")
+    for key, raw in _xml_tags(text, tag_pattern, json_keys):
         if key is None:
             raise ValueError(f"xml-inline: tag_pattern must have a named group 'key'. Pattern: {tag_pattern}")
-        value = _sub_parse(groups.get("value", ""), value_parser)
+        value = _sub_parse(raw, value_parser)
         if key in out and merge:
             if not isinstance(out[key], list):
                 out[key] = [out[key]]
@@ -149,15 +227,17 @@ CONTENT_PARSERS = {
     "kv-lines": _kv_lines,
 }
 
-# Parsers whose output is the verbatim body text (modulo whitespace) — chunks
-# from these fields stream with `dirty=False` because each chunk is part of
-# the final value. Structured parsers (`json`, `xml-inline`, `kv-lines`) only
-# produce a meaningful value on close, so their chunks stream raw bytes
-# flagged `dirty=True` while the parsed value is delivered in `region_close`.
-STREAMABLE_PARSERS = frozenset({"text", "int", "float", "bool"})
+# Parsers whose output is the verbatim body text, apart from outer whitespace that
+# `strip` trims at close. Their chunks stream with `dirty=False` unless a `transform`
+# reshapes the value. Every other parser only produces its value on close, so its
+# chunks stream raw bytes flagged `dirty=True` while the parsed value is delivered
+# in `region_close`.
+STREAMABLE_PARSERS = frozenset({"text"})
 
 
-def parse_content(text: str, name: str, args: dict) -> Any:
+def parse_content(text: str, name: str, args: dict, json_keys: frozenset = frozenset()) -> Any:
+    if json_keys:
+        return _xml_inline(text, args, json_keys)
     return CONTENT_PARSERS[name](text, args)
 
 
@@ -214,14 +294,14 @@ def validate_transform_strings(scope: str, transform: Any) -> None:
         )
 
 
-def process_field(body: str, field, captures: dict) -> Any:
+def process_field(body: str, field, captures: dict, json_keys: frozenset = frozenset()) -> Any:
     """Run `body` through the field's content parser, then optionally apply the
     transform template. When `transform_each` is set, the parsed content must
     be a list and the template is applied to each element (with the element's
     keys unpacked into the template scope, alongside any regex captures).
 
     `field` is a `spec.Field`; typed via duck-typing to avoid a cyclic import."""
-    value = parse_content(body, field.content, field.content_args)
+    value = parse_content(body, field.content, field.content_args, json_keys)
     if field.transform is None:
         return value
     if field.transform_each:
