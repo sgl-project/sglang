@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.arg_groups.model_override_base import resolving_view
+from sglang.srt.configs.ernie55 import ERNIE5_5_MOE_ARCH
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.configs.model_config import (
     AttentionArch,
@@ -1837,7 +1838,7 @@ def create_memory_pool_configurator(
     kvc: KVCacheConfigurator,
 ) -> MemoryPoolConfigurator:
     if uses_compressed_kv_attention(kvc.model_config.hf_config) and kvc.is_hybrid_swa:
-        if kvc.model_config.hf_config.architectures[0] == "Ernie5_5_MoeForCausalLM":
+        if kvc.model_config.hf_config.architectures[0] == ERNIE5_5_MOE_ARCH:
             return Ernie5_5PoolConfigurator(kvc)
         return DSV4PoolConfigurator(kvc)
     if kvc.is_hybrid_swa:

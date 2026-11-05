@@ -29,6 +29,12 @@ from transformers.utils import cached_file
 from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.configs.bailing_hybrid import is_bailing_multi_gate_enabled
 from sglang.srt.configs.embedding_model_spec import resolve_embedding_model_spec
+from sglang.srt.configs.ernie55 import (
+    ERNIE5_5_ARCHS,
+    ERNIE5_5_MOE_ARCH,
+    to_dspark_draft_config,
+    to_nextn_draft_config,
+)
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_config
 from sglang.srt.configs.unlimited_ocr_v2 import (
     FALLBACK_CONTEXT_LENGTH,
@@ -449,11 +455,7 @@ def is_deepseek_v4(config) -> bool:
 
 
 def is_ernie5_5(config) -> bool:
-    return _hf_arch(config) in (
-        "Ernie5_5_MoeForCausalLM",
-        "Ernie5_5_MoeForCausalLMNextN",
-        "Ernie5_5_MoeForCausalLMDSpark",
-    )
+    return _hf_arch(config) in ERNIE5_5_ARCHS
 
 
 def uses_compressed_kv_attention(config) -> bool:
@@ -1173,15 +1175,7 @@ class ModelConfig:
                 self.hf_config.architectures[0] = "DeepseekV4ForCausalLMNextN"
                 self.hf_config.num_nextn_predict_layers = 1
 
-        if (
-            is_draft_model
-            and self.hf_config.architectures[0] == "Ernie5_5_MoeForCausalLM"
-        ):
-            from sglang.srt.configs.ernie55 import (
-                to_dspark_draft_config,
-                to_nextn_draft_config,
-            )
-
+        if is_draft_model and self.hf_config.architectures[0] == ERNIE5_5_MOE_ARCH:
             # The model override admits DSPARK and EAGLE (MTP) only.
             if self.speculative_algorithm == "DSPARK":
                 to_dspark_draft_config(self.hf_config)
@@ -1358,10 +1352,11 @@ class ModelConfig:
         if self.is_hybrid_swa:
             logger.debug(f"Hybrid swa model: {self.hf_config.architectures=}")
 
-            # Also True for ERNIE 5.5, whose HCA layers use DeepSeekV4TokenToKVPool.
-            self.is_deepseek_v4_arch = uses_compressed_kv_attention(self.hf_config)
+            self.uses_compressed_kv_attention = uses_compressed_kv_attention(
+                self.hf_config
+            )
 
-            if not self.is_deepseek_v4_arch:
+            if not self.uses_compressed_kv_attention:
                 self.swa_attention_layer_ids, self.full_attention_layer_ids = (
                     get_hybrid_layer_ids(
                         self.hf_config.architectures,

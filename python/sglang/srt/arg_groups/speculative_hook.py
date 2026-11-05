@@ -677,9 +677,11 @@ def _handle_dspark(server_args: ServerArgs) -> None:
     if cfg.attn_dp_size > 1:
         if not cfg.enable_dp_lm_head:
             raise ValueError("DSpark with dp attention requires --enable-dp-lm-head.")
+        from sglang.srt.configs.ernie55 import ERNIE5_5_MOE_ARCH
+
         allowed_a2a_backends = ("none", "megamoe", "mori")
         target_arch = model_config_of(server_args).hf_config.architectures[0]
-        if target_arch == "Ernie5_5_MoeForCausalLM":
+        if target_arch == ERNIE5_5_MOE_ARCH:
             # DeepEP is validated on ERNIE 5.5 Flash only: static ragged verify
             # gives it EAGLE's per-rank shapes. Its override rejects MegaMoE.
             allowed_a2a_backends = ("none", "deepep")
