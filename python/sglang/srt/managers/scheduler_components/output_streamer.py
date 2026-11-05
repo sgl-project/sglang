@@ -475,6 +475,7 @@ class _GenerationStreamAccumulator:
     has_detokenize_header: bool = False
     reasoning_tokens: list = field(default_factory=list)
     completion_tokens: list = field(default_factory=list)
+    cache_write_tokens: list = field(default_factory=list)
     request_stats: list = field(default_factory=list)
     has_request_stats: bool = False
     # OutputSink.RUST only; see BatchTokenIDOutput.prompt_tokens.
@@ -624,6 +625,7 @@ class _GenerationStreamAccumulator:
         # A verified token block can extend past the stop position. Report
         # reasoning usage only within the same prefix as completion usage.
         self.reasoning_tokens.append(min(req.reasoning_tokens, len(output_ids_)))
+        self.cache_write_tokens.append(getattr(req, "cache_write_tokens", None))
         # Index-aligned with the batch items so mixed batches resolve per-item
         # on the tokenizer side; None for non-beam items and aborted groups.
         beam_output = (
@@ -906,6 +908,7 @@ class _GenerationStreamAccumulator:
             reasoning_tokens=self.reasoning_tokens,
             completion_tokens=self.completion_tokens,
             request_stats=self.request_stats if self.has_request_stats else None,
+            cache_write_tokens=self.cache_write_tokens,
             prompt_tokens=self.prompt_tokens,
             cached_tokens=self.cached_tokens,
             image_tokens=self.image_tokens,

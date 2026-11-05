@@ -98,6 +98,7 @@ from sglang.srt.entrypoints.openai.serving_chat import (
     _incomplete_tool_call_indices,
 )
 from sglang.srt.entrypoints.openai.tool_server import MCPToolServer, ToolServer
+from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import to_openai_style_logprobs
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
@@ -602,6 +603,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                         background=request.background and not request.stream,
                         require_reasoning=require_reasoning,
                     )
+                    self._set_cache_reporting_window(adapted_request)
 
                     generator = self._generate_with_builtin_tools(
                         request.request_id,
@@ -862,6 +864,7 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         status = "completed"
         finish_reason = None
+        num_cache_write_tokens = None
         if self.use_harmony:
             assert isinstance(context, HarmonyContext)
             output = (
@@ -918,6 +921,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                 num_prompt_tokens = meta_info.get("prompt_tokens", 0)
                 num_generated_tokens = meta_info.get("completion_tokens", 0)
                 num_cached_tokens = meta_info.get("cached_tokens", 0)
+                if get_serving().enable_cache_report:
+                    num_cache_write_tokens = meta_info.get("cache_write_tokens")
                 num_reasoning_tokens = meta_info.get("reasoning_tokens", 0)
                 finish_reason = meta_info.get("finish_reason")
                 status = self._status_from_finish_reason(finish_reason)
@@ -950,15 +955,25 @@ class OpenAIServingResponses(OpenAIServingChat):
                 num_cached_tokens = 0
                 num_reasoning_tokens = 0
 
+            num_prompt_tokens = self._reported_prompt_tokens(
+                {"prompt_tokens": num_prompt_tokens}
+            )
+            if self.chat_encoding_spec == "kimi_k3":
+                num_cached_tokens = min(num_cached_tokens, num_prompt_tokens)
+
         usage = UsageInfo(
             prompt_tokens=num_prompt_tokens,
             completion_tokens=num_generated_tokens,
             total_tokens=num_prompt_tokens + num_generated_tokens,
             reasoning_tokens=num_reasoning_tokens,
         )
-        if self.enable_prompt_tokens_details and num_cached_tokens:
+        usage._cache_write_reporting_enabled = get_serving().enable_cache_report
+        if self.enable_prompt_tokens_details:
             usage.prompt_tokens_details = PromptTokenUsageInfo(
-                cached_tokens=num_cached_tokens
+                cached_tokens=num_cached_tokens,
+                cache_write_tokens=UsageProcessor.cache_write_tokens(
+                    num_cache_write_tokens, num_prompt_tokens, num_cached_tokens
+                ),
             )
         request_metadata.final_usage_info = usage
 
@@ -2374,6 +2389,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         prompt_tokens = 0
         completion_tokens = 0
         cached_tokens = 0
+        cache_write_tokens = None
         total_tokens_meta = 0
         reasoning_tokens_meta = 0
         finish_reason: Optional[dict[str, Any]] = None
@@ -2641,9 +2657,12 @@ class OpenAIServingResponses(OpenAIServingChat):
                 if not isinstance(chunk, dict):
                     continue
                 meta = chunk.get("meta_info") or {}
-                prompt_tokens = meta.get("prompt_tokens", prompt_tokens)
+                if "prompt_tokens" in meta:
+                    prompt_tokens = self._reported_prompt_tokens(meta)
                 completion_tokens = meta.get("completion_tokens", completion_tokens)
                 cached_tokens = meta.get("cached_tokens", cached_tokens)
+                if get_serving().enable_cache_report:
+                    cache_write_tokens = meta.get("cache_write_tokens")
                 total_tokens_meta = meta.get("total_tokens", total_tokens_meta)
                 reasoning_tokens_meta = meta.get(
                     "reasoning_tokens", reasoning_tokens_meta
@@ -3012,16 +3031,26 @@ class OpenAIServingResponses(OpenAIServingChat):
                 yield ev
 
         final_output_items = list(emitted_items)
+        if self.chat_encoding_spec == "kimi_k3":
+            cached_tokens = min(cached_tokens, prompt_tokens)
 
         usage = UsageInfo(
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
-            total_tokens=total_tokens_meta or (prompt_tokens + completion_tokens),
+            total_tokens=(
+                prompt_tokens + completion_tokens
+                if self.chat_encoding_spec == "kimi_k3"
+                else total_tokens_meta or (prompt_tokens + completion_tokens)
+            ),
             reasoning_tokens=reasoning_tokens_meta,
         )
-        if self.enable_prompt_tokens_details and cached_tokens:
+        usage._cache_write_reporting_enabled = get_serving().enable_cache_report
+        if self.enable_prompt_tokens_details:
             usage.prompt_tokens_details = PromptTokenUsageInfo(
-                cached_tokens=cached_tokens
+                cached_tokens=cached_tokens,
+                cache_write_tokens=UsageProcessor.cache_write_tokens(
+                    cache_write_tokens, prompt_tokens, cached_tokens
+                ),
             )
         request_metadata.final_usage_info = usage
 
@@ -3116,6 +3145,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 background=adapted_request.background,
                 require_reasoning=adapted_request.require_reasoning,
             )
+            self._set_cache_reporting_window(adapted_request)
 
             # Update sampling params with reduced max_tokens
             if hasattr(sampling_params, "max_new_tokens") or isinstance(
