@@ -337,6 +337,21 @@ def fast_prefill_plan(
 _global_workspace_users: weakref.WeakSet = weakref.WeakSet()
 
 
+def get_workspace_buffer(init_new_workspace: bool, device) -> torch.Tensor:
+    """A private workspace, or the process-wide shared one.
+
+    A backend with its own workspace never creates the shared one, so a shared
+    workspace dropped by release_unused_global_workspace stays dropped.
+    """
+    # different from flashinfer zero_init_global_workspace_buffer
+    allocate = lambda: torch.empty(
+        envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(), dtype=torch.uint8, device=device
+    )
+    if init_new_workspace:
+        return allocate()
+    return get_buffer("flashinfer_workspace", allocate)
+
+
 def release_unused_global_workspace() -> int:
     """Drop the shared FlashInfer workspace once no backend uses it.
 
@@ -496,23 +511,10 @@ class FlashInferAttnBackend(AttentionBackend):
         self.use_paged = envs.SGLANG_FLASHINFER_USE_PAGED.get()
 
         # Allocate buffers
-        # different from flashinfer zero_init_global_workspace_buffer
-        global_workspace_buffer = get_buffer(
-            "flashinfer_workspace",
-            lambda: torch.empty(
-                envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
-                dtype=torch.uint8,
-                device=model_runner.device,
-            ),
+        self.workspace_buffer = get_workspace_buffer(
+            init_new_workspace=init_new_workspace, device=model_runner.device
         )
-        if init_new_workspace:
-            self.workspace_buffer = torch.empty(
-                envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
-                dtype=torch.uint8,
-                device=model_runner.device,
-            )
-        else:
-            self.workspace_buffer = global_workspace_buffer
+        if not init_new_workspace:
             _global_workspace_users.add(self)
         max_bs = get_cuda_graph_max_batch_size(model_runner.req_to_token_pool.size)
         if kv_indptr_buf is None:

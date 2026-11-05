@@ -121,7 +121,8 @@ def build_attention_backends(*, model_runner: ModelRunner) -> AttentionBackends:
         attn_backend = _build_resolved_backend(
             model_runner=model_runner, resolved=resolved, init_new_workspace=False
         )
-    if "flashinfer" in (resolved.prefill, resolved.decode):
+    # TRTLLMHAAttnBackend subclasses FlashInferAttnBackend and shares its workspace.
+    if {"flashinfer", "trtllm_mha"} & {resolved.prefill, resolved.decode}:
         from sglang.srt.layers.attention.flashinfer_backend import (
             release_unused_global_workspace,
         )

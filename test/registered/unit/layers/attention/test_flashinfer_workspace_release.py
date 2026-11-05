@@ -8,6 +8,7 @@ import unittest
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention import flashinfer_backend
 from sglang.srt.runtime_context import get_buffer, pop_buffer
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -54,6 +55,20 @@ class TestFlashInferWorkspaceRelease(CustomTestCase):
 
     def test_nothing_to_release(self):
         self.assertEqual(flashinfer_backend.release_unused_global_workspace(), 0)
+
+    def test_private_workspace_does_not_create_the_shared_one(self):
+        # A backend built with init_new_workspace=True after a release (e.g. an
+        # adaptive speculative runtime) must not re-create the shared workspace.
+        with envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.override(WORKSPACE_BYTES):
+            private = flashinfer_backend.get_workspace_buffer(
+                init_new_workspace=True, device="cpu"
+            )
+            self.assertEqual(private.numel(), WORKSPACE_BYTES)
+            self.assertIsNone(pop_buffer("flashinfer_workspace"))
+            shared = flashinfer_backend.get_workspace_buffer(
+                init_new_workspace=False, device="cpu"
+            )
+            self.assertIs(get_buffer("flashinfer_workspace", lambda: None), shared)
 
 
 if __name__ == "__main__":
