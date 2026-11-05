@@ -24,6 +24,7 @@ from sglang.srt.managers.req_types import (
     MultimodalDataItem,
     MultimodalInputs,
 )
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -228,6 +229,48 @@ def _case_split_path_mixed_precomputed():
     )
 
 
+def _case_later_pipeline_stage():
+    # Later PP stages skip the encoder; input_ids must still get the placeholder ids.
+    mm_a, ids_a, pos_a = _request(
+        8,
+        IMAGE_TOKEN_ID,
+        modalities=(Modality.IMAGE, Modality.VIDEO),
+        video_token_id=VIDEO_TOKEN_ID,
+    )
+    mm_b, ids_b, pos_b = _request(9, IMAGE_TOKEN_ID)
+    gen = torch.Generator().manual_seed(10)
+    text_ids = torch.randint(0, VOCAB, (SEQ_LEN,), generator=gen)
+    no_mm = torch.zeros(SEQ_LEN, dtype=torch.bool)
+    host_ids = torch.cat([ids_a, text_ids, ids_b])
+    image_positions = torch.cat([pos_a[Modality.IMAGE], no_mm, pos_b[Modality.IMAGE]])
+    video_positions = torch.cat([pos_a[Modality.VIDEO], no_mm, no_mm])
+    input_ids = host_ids.clone()
+    forward_batch = SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND,
+        contains_mm_inputs=lambda: True,
+        mm_inputs=[mm_a, None, mm_b],
+    )
+    language_model = SimpleNamespace(
+        get_input_embeddings=_embedding,
+        pp_group=SimpleNamespace(is_first_rank=False),
+    )
+
+    input_embeds = mm_utils.prepare_mm_inputs(
+        input_ids=input_ids,
+        forward_batch=forward_batch,
+        language_model=language_model,
+        kwargs={},
+        multimodal_model=_FakeVLM(),
+    )
+
+    assert input_embeds is None
+    assert bool((input_ids[image_positions] == IMAGE_TOKEN_ID).all())
+    assert bool((input_ids[video_positions] == VIDEO_TOKEN_ID).all())
+    mm_positions = image_positions | video_positions
+    assert torch.equal(input_ids[~mm_positions], host_ids[~mm_positions])
+    assert bool((host_ids[mm_positions] >= MM_PAD_SHIFT_VALUE).all())
+
+
 class TestMMPlaceholderTokenIds(CustomTestCase):
     def setUp(self):
         # The embedding path reads the config namespaces and the attention-TP rank.
@@ -262,6 +305,9 @@ class TestMMPlaceholderTokenIds(CustomTestCase):
 
     def test_split_path_mixed_precomputed(self):
         _case_split_path_mixed_precomputed()
+
+    def test_later_pipeline_stage(self):
+        _case_later_pipeline_stage()
 
 
 if __name__ == "__main__":

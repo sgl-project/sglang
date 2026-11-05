@@ -32,7 +32,11 @@ from sglang.srt.managers.mm_schedule import (
     DataEmbeddingFunc,
     get_embedding_and_mask,
 )
-from sglang.srt.managers.req_types import MultimodalInputs, MultimodalProcessorOutput
+from sglang.srt.managers.req_types import (
+    MultimodalDataItem,
+    MultimodalInputs,
+    MultimodalProcessorOutput,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.transport import (
@@ -463,6 +467,47 @@ def _fill_mm_placeholder_token_ids(
             input_ids.masked_fill_(mask.view(input_ids.shape), token_id)
 
 
+def _sorted_pad_values_tensor(
+    items: List[MultimodalDataItem], device: torch.device
+) -> torch.Tensor:
+    # Sorted for the searchsorted lookup in _get_multimodal_mask.
+    pad_values = sorted(value for item in items for value in item.padding_values())
+    if device.type == "cuda":
+        # Pinned staging keeps the placeholder copy asynchronous on CUDA.
+        pad_values_cpu = torch.tensor(
+            pad_values, dtype=torch.int64, device="cpu", pin_memory=True
+        )
+        return pad_values_cpu.to(device, non_blocking=True)
+    return torch.as_tensor(pad_values, device=device)
+
+
+def _fill_mm_placeholder_token_ids_from_pad_values(
+    input_ids: torch.Tensor, mm_inputs_list: List[MultimodalInputs]
+) -> None:
+    """Placeholder fill for ranks that skip embed_mm_inputs (later PP stages)."""
+    items = [
+        item
+        for mm_inputs in mm_inputs_list
+        for item in mm_inputs.mm_items
+        if item is not None
+    ]
+    modalities, masks = [], []
+    for modality in Modality.all():
+        modality_items = [item for item in items if item.is_modality(modality=modality)]
+        if modality_items:
+            pad_values = _sorted_pad_values_tensor(
+                items=modality_items, device=input_ids.device
+            )
+            modalities.append(modality)
+            masks.append(mm_schedule._get_multimodal_mask(input_ids, pad_values))
+    _fill_mm_placeholder_token_ids(
+        input_ids=input_ids,
+        mm_inputs_list=mm_inputs_list,
+        modalities=modalities,
+        masks=masks,
+    )
+
+
 def embed_mm_inputs(
     mm_inputs_list: List[MultimodalInputs],
     extend_prefix_lens: List[int],
@@ -518,22 +563,9 @@ def embed_mm_inputs(
             embedder = getattr(multimodal_model, f"get_{modality_id}_feature", None)
         if len(items) != 0:
             assert embedder is not None, f"no embedding method found for {modality}"
-            # Sorted for the searchsorted lookup in _get_multimodal_mask.
-            pad_values = sorted(
-                value for item in items for value in item.padding_values()
+            placeholder_tensor = _sorted_pad_values_tensor(
+                items=items, device=input_ids.device
             )
-            if input_ids.device.type == "cuda":
-                # Pinned staging keeps the placeholder copy asynchronous on CUDA.
-                placeholder_cpu = torch.tensor(
-                    pad_values, dtype=torch.int64, device="cpu", pin_memory=True
-                )
-                placeholder_tensor = placeholder_cpu.to(
-                    input_ids.device, non_blocking=True
-                )
-            else:
-                placeholder_tensor = torch.as_tensor(
-                    pad_values, device=input_ids.device
-                )
             # calculate per request items length offset
             items_size = [0]
             items_offsets = []
@@ -741,16 +773,18 @@ def prepare_mm_inputs(
 
     Preserve multimodal cache/offload bookkeeping and the MTP embedding copy.
     Additional language-model inputs, such as DeepStack features, update kwargs.
-    Non-first pipeline ranks consume proxy tensors and return no embeddings.
+    Non-first pipeline ranks consume proxy tensors and return no embeddings;
+    they still write the placeholder token ids into input_ids.
     """
     assert hasattr(language_model, "get_input_embeddings")
     embed_tokens = language_model.get_input_embeddings()
+    is_mm_extend = (
+        not forward_batch.forward_mode.is_decode()
+        and not forward_batch.forward_mode.is_target_verify()
+        and forward_batch.contains_mm_inputs()
+    )
     if not hasattr(language_model, "pp_group") or language_model.pp_group.is_first_rank:
-        if (
-            not forward_batch.forward_mode.is_decode()
-            and not forward_batch.forward_mode.is_target_verify()
-            and forward_batch.contains_mm_inputs()
-        ):
+        if is_mm_extend:
             mm_inputs_list = [
                 mm_input for mm_input in forward_batch.mm_inputs if mm_input is not None
             ]
@@ -869,6 +903,15 @@ def prepare_mm_inputs(
             forward_batch.input_embeds.copy_(input_embeds)
             input_embeds = forward_batch.input_embeds
     else:
+        if is_mm_extend:
+            _fill_mm_placeholder_token_ids_from_pad_values(
+                input_ids=input_ids,
+                mm_inputs_list=[
+                    mm_input
+                    for mm_input in forward_batch.mm_inputs
+                    if mm_input is not None
+                ],
+            )
         input_embeds = None
     return input_embeds
 
