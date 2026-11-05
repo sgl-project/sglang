@@ -288,6 +288,74 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
             # stash on that instead.
             algo.handle_server_args(server_args)
 
+    _validate_standalone_pd_scope(server_args)
+
+
+def _validate_standalone_pd_scope(server_args: ServerArgs) -> None:
+    """Keep the initial no-hidden PD handoff within its supported scope.
+
+    The seed check after transfer completion is request-local, not a consensus
+    operation. In particular, TP ranks must not independently admit/abort the
+    same request. Overlap and host/staging cache recovery need separate serving
+    coverage before they can use this handoff.
+    """
+    cfg = resolved_view(server_args)
+    if cfg.speculative_algorithm != "STANDALONE" or cfg.disaggregation_mode not in (
+        "prefill",
+        "decode",
+    ):
+        return
+
+    unsupported = []
+    if not cfg.disable_overlap_schedule:
+        unsupported.append("overlap scheduling (set --disable-overlap-schedule)")
+    for field in (
+        "tp_size",
+        "pp_size",
+        "dp_size",
+        "attn_dp_size",
+        "attn_cp_size",
+        "dcp_size",
+    ):
+        if getattr(cfg, field) != 1:
+            unsupported.append(f"--{field.replace('_', '-')} must be 1")
+    if cfg.enable_prefill_cp:
+        unsupported.append("--enable-prefill-cp")
+    if cfg.speculative_eagle_topk != 1:
+        unsupported.append("--speculative-eagle-topk must be 1")
+    if cfg.disaggregation_decode_allocation_policy != "early":
+        unsupported.append("--disaggregation-decode-allocation-policy must be early")
+
+    for field in (
+        "enable_hierarchical_cache",
+        "enable_unified_cache_external_linker",
+        "enable_lmcache",
+        "enable_flexkv",
+        "enable_hisparse",
+    ):
+        if getattr(cfg, field):
+            unsupported.append(f"--{field.replace('_', '-')}")
+    if cfg.hicache_storage_backend is not None:
+        unsupported.append("--hicache-storage-backend")
+    if cfg.radix_cache_backend == "flexkv":
+        unsupported.append("--radix-cache-backend flexkv")
+    if cfg.disaggregation_mode == "decode":
+        if cfg.disaggregation_decode_enable_offload_kvcache:
+            unsupported.append("--disaggregation-decode-enable-offload-kvcache")
+        if cfg.disaggregation_decode_host_receive_threshold < 1:
+            unsupported.append("--disaggregation-decode-host-receive-threshold < 1")
+        if cfg.disaggregation_decode_retraction_backup in ("cpu_tensor", "host_pool"):
+            unsupported.append("explicit host retraction backup")
+    if envs.SGLANG_DISAGG_STAGING_BUFFER.get():
+        unsupported.append("SGLANG_DISAGG_STAGING_BUFFER")
+
+    if unsupported:
+        raise ValueError(
+            "STANDALONE PD currently supports synchronous, single-rank, top-k1 "
+            "serving with early allocation and without host/staging cache "
+            "features. Unsupported configuration: " + "; ".join(unsupported)
+        )
+
 
 def _handle_dflash(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)

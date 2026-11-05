@@ -154,6 +154,12 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_memory,
     get_parallel,
+    get_spec,
+)
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.standalone_disaggregation import (
+    StandaloneDraftSeedError,
+    validate_standalone_disagg_draft_seed,
 )
 from sglang.srt.utils import (
     ceil_align,
@@ -3028,6 +3034,28 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             decode_req.kv_receiver.clear()
             decode_req.kv_receiver = None
             return
+
+        if self.spec_algorithm == SpeculativeAlgorithm.STANDALONE:
+            try:
+                validate_standalone_disagg_draft_seed(
+                    output_topk_p,
+                    output_topk_index,
+                    topk=get_spec().speculative_eagle_topk,
+                    vocab_size=self.scheduler.model_config.vocab_size,
+                    rid=decode_req.req.rid,
+                )
+            except StandaloneDraftSeedError as exc:
+                # The completed transport's resources are released by the same
+                # request-local abort path as a bootstrap-room mismatch. Do not
+                # commit its handoff token or publish a seed to a later batch.
+                prepare_abort(
+                    decode_req.req,
+                    str(exc),
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+                decode_req.kv_receiver.clear()
+                decode_req.kv_receiver = None
+                return
 
         self._commit_hicache_local_restore_to_req(decode_req)
 

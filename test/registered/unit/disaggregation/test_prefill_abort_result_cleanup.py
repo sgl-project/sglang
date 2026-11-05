@@ -19,6 +19,7 @@ from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -69,7 +70,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
             consume_auxiliary_output=Mock(),
             _maybe_collect_customized_info=Mock(),
         )
-        self.spec_algorithm = SimpleNamespace(is_eagle=lambda: False)
+        self.spec_algorithm = SpeculativeAlgorithm.NONE
         self.tree_cache = Mock()
         self.disagg_prefill_transfer_queue = IndexedReqList(ListKind.PD_SENDING)
         self.disagg_prefill_pending_chunk_rids = {"aborted-prefill"}
@@ -187,7 +188,7 @@ class TestPrefillCompleteResult(CustomTestCase):
     @patch("sglang.srt.disaggregation.prefill.checkpoint_kv_cache")
     def test_ready_observes_accepted_token_and_speculative_sidecars(self, cache):
         scheduler = _Scheduler()
-        scheduler.spec_algorithm = SimpleNamespace(is_eagle=lambda: True)
+        scheduler.spec_algorithm = SpeculativeAlgorithm.EAGLE
         req = _Req()
         req.to_finish = None
         req.time_stats.set_prefill_transfer_queue_entry_time = Mock()
@@ -208,6 +209,8 @@ class TestPrefillCompleteResult(CustomTestCase):
             observed.append(
                 (
                     list(req.output_ids),
+                    req.output_topk_p.tolist(),
+                    req.output_topk_index.tolist(),
                     req.hidden_states_tensor.tolist(),
                     req.output_dsa_topk_indices.tolist(),
                     req in scheduler.disagg_prefill_transfer_queue,
@@ -217,8 +220,67 @@ class TestPrefillCompleteResult(CustomTestCase):
         req.disagg_kv_sender.mark_prefill_complete.side_effect = ready
         scheduler.prefill_launched_reqs.join([req])
         scheduler.process_batch_result_disagg_prefill(batch, result)
-        self.assertEqual(observed, [([11], [1.0, 2.0], [5, 6], True)])
+        self.assertEqual(
+            observed, [([11], [0.75, 0.25], [3, 4], [1.0, 2.0], [5, 6], True)]
+        )
         self.assertTrue(req.pending_bootstrap)
+        scheduler.send_kv_chunk.assert_not_called()
+
+    @patch("sglang.srt.disaggregation.prefill.checkpoint_kv_cache")
+    def test_standalone_ready_observes_each_seed_without_hidden_states(self, cache):
+        """Exercise result publication only, without model or KV transfer work."""
+        scheduler = _Scheduler()
+        scheduler.spec_algorithm = SpeculativeAlgorithm.STANDALONE
+        reqs = [_Req() for _ in range(2)]
+        observed = []
+        for i, req in enumerate(reqs):
+            req.rid = f"standalone-{i}"
+            req.to_finish = None
+            req.time_stats.set_prefill_transfer_queue_entry_time = Mock()
+            # A reused request must not carry a previous hidden-state sidecar.
+            req.hidden_states_tensor = torch.tensor([99.0])
+            req.output_dsa_topk_indices = torch.tensor([99])
+
+            def ready(req=req):
+                observed.append(
+                    (
+                        req.rid,
+                        list(req.output_ids),
+                        req.output_topk_p.tolist(),
+                        req.output_topk_index.tolist(),
+                        req.hidden_states_tensor,
+                        req.output_dsa_topk_indices,
+                        len(scheduler.disagg_prefill_transfer_queue),
+                    )
+                )
+
+            req.disagg_kv_sender.mark_prefill_complete.side_effect = ready
+
+        # No hidden_states attribute: this producer path must not read it.
+        draft = SimpleNamespace(
+            topk_p=torch.tensor([[0.75], [0.25]]),
+            topk_index=torch.tensor([[3], [7]]),
+        )
+        batch = _batch(reqs[0])
+        batch.reqs = reqs
+        batch.spec_info = draft
+        result = GenerationBatchResult(
+            next_token_ids=torch.tensor([11, 12]), next_draft_input=draft
+        )
+
+        scheduler.prefill_launched_reqs.join(reqs)
+        scheduler.process_batch_result_disagg_prefill(batch, result)
+
+        self.assertEqual(
+            observed,
+            [
+                ("standalone-0", [11], [0.75], [3], None, None, 1),
+                ("standalone-1", [12], [0.25], [7], None, None, 2),
+            ],
+        )
+        self.assertEqual(list(scheduler.disagg_prefill_transfer_queue), reqs)
+        for req in reqs:
+            req.disagg_kv_sender.mark_prefill_complete.assert_called_once_with()
         scheduler.send_kv_chunk.assert_not_called()
 
     @patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)

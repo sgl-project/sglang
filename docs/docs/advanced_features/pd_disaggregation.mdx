@@ -74,6 +74,12 @@ destination registration. Older decode workers do not enforce this check. Keep
 `early` on both sides until every worker has been upgraded, then enable the new
 policy on both sides.
 
+## STANDALONE speculative decoding
+
+For the initial synchronous, single-rank STANDALONE handoff and its configuration
+limits, see [STANDALONE PD](/docs/advanced_features/speculative_decoding#prefill-and-decode-disaggregation).
+Both workers must use the same revision and target/draft configuration.
+
 ## Profiling in PD Disaggregation Mode
 
 When you need to profile prefill or decode workers in PD disaggregation mode, please refer to the [Profile In PD Disaggregation Mode](../developer_guide/benchmark_and_profiling#profile-in-pd-disaggregation-mode) section in the Benchmark and Profiling guide. Due to torch profiler limitations, prefill and decode workers must be profiled separately using dedicated command-line options.

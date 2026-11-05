@@ -47,6 +47,7 @@ from sglang.srt.disaggregation.minimax import minimax_index_transfer_pages
 from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.disaggregation.utils import (
     CustomizedInfoError,
+    DraftSeedMetadataError,
     KVClassType,
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
@@ -1003,7 +1004,10 @@ class SchedulerDisaggregationPrefillMixin:
         draft_input = result.next_draft_input
         draft_hidden_states_cpu = None
         draft_dsa_topk_indices_cpu = None
-        if self.spec_algorithm.is_eagle() and draft_input is not None:
+        if (
+            self.spec_algorithm.carries_draft_hidden_states()
+            and draft_input is not None
+        ):
             draft_hidden_states_cpu = draft_input.hidden_states.to(
                 "cpu", non_blocking=False
             )
@@ -1102,9 +1106,13 @@ class SchedulerDisaggregationPrefillMixin:
                     self.prefill_launched_reqs,
                     self.disagg_prefill_transfer_queue,
                 )
-                if self.spec_algorithm.is_eagle() and draft_input is not None:
+                if self.spec_algorithm.need_topk() and draft_input is not None:
                     req.output_topk_p = draft_input.topk_p[i]
                     req.output_topk_index = draft_input.topk_index[i]
+                else:
+                    req.output_topk_p = None
+                    req.output_topk_index = None
+                if draft_hidden_states_cpu is not None:
                     req.hidden_states_tensor = draft_hidden_states_cpu[i].clone()
                     if draft_dsa_topk_indices_cpu is not None:
                         req.output_dsa_topk_indices = draft_dsa_topk_indices_cpu[
@@ -1679,8 +1687,9 @@ class SchedulerDisaggregationPrefillMixin:
         if last_chunk:
             try:
                 self.disagg_metadata_buffers.set_buf(req)
-            except CustomizedInfoError as exc:
-                # customized_info may be unserializable or exceed the transfer buffer.
+            except (CustomizedInfoError, DraftSeedMetadataError) as exc:
+                # Invalid request metadata must not terminate the scheduler or
+                # send a partial final chunk. Other application errors propagate.
                 req.customized_info = None
                 prepare_abort(
                     req, str(exc), status_code=HTTPStatus.INTERNAL_SERVER_ERROR
