@@ -271,14 +271,14 @@ def _record_server_prompt_len(data, output):
     summing ``prompt_len`` across outputs counts one number once per round
     rather than adding up each request's own prompt.
 
-    Two consumers divide by that sum: the ``--cache-report`` hit rate, and
-    ``input_lens`` in the JSON output.
+    Single-turn input throughput, the ``--cache-report`` hit rate, and
+    ``input_lens`` in the JSON output use the recorded lengths.
 
     The server reports the real figure as ``usage.prompt_tokens`` on the
     OpenAI-compatible routes and ``meta_info.prompt_tokens`` on the native one.
-    It is the same quantity for a single-turn row, so preferring it needs no
-    per-dataset branch, and leaving the seeded value in place when the server
-    reports nothing keeps behaviour unchanged for any backend that does not.
+    It may differ from the dataset estimate after preprocessing or truncation.
+    Leaving the seeded value in place when usage is absent preserves the
+    fallback for backends that do not report prompt counts.
     """
     reported = data.get("usage") or data.get("meta_info") or {}
     prompt_tokens = reported.get("prompt_tokens")
@@ -1165,8 +1165,14 @@ def calculate_metrics(
             )
             retokenized_output_lens.append(retokenized_output_len)
             if input_requests is not None:
-                total_input += input_requests[i].prompt_len
-                total_input_text += input_requests[i].text_prompt_len
+                total_input += outputs[i].prompt_len
+                # Aggregate usage cannot split a multimodal prompt; keep the
+                # dataset's modality estimates when vision tokens are present.
+                total_input_text += (
+                    input_requests[i].text_prompt_len
+                    if input_requests[i].vision_prompt_len
+                    else outputs[i].prompt_len
+                )
                 total_input_vision += input_requests[i].vision_prompt_len
             if output_len > 1:
                 tpots.append((outputs[i].latency - outputs[i].ttft) / (output_len - 1))

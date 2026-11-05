@@ -5,11 +5,15 @@ import json
 import threading
 import unittest
 from argparse import Namespace
+from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from types import SimpleNamespace
 
+from sglang.benchmark.datasets.common import DatasetRow
 from sglang.benchmark.serving import (
     RequestFuncInput,
     async_request_openai_chat_completions,
+    calculate_metrics,
     set_global_args,
     wrap_multi_turn_request_func,
 )
@@ -88,25 +92,62 @@ class TestBenchServingPromptLen(CustomTestCase):
         outputs = out if isinstance(out, list) else [out]
         for o in outputs:
             self.assertTrue(o.success, o.error)
-        return [o.prompt_len for o in outputs]
+        return outputs
 
     def test_single_request(self):
         usage_on = {"stream_options": {"include_usage": True}}
         cases = [
-            ("streaming with usage", True, usage_on, 123),
-            ("non-streaming", False, None, 123),
-            ("no usage keeps row value", True, None, ROW_PROMPT_LEN),
+            ("streaming with usage", True, usage_on, 123, 1),
+            ("non-streaming", False, None, 123, 1),
+            ("no usage keeps row value", True, None, ROW_PROMPT_LEN, 8),
         ]
-        for name, stream, extra, expected in cases:
+        for name, stream, extra, expected, output_tokens in cases:
             with self.subTest(name):
-                lens = self._run(
+                outputs = self._run(
                     async_request_openai_chat_completions,
                     "hello",
                     [123],
                     stream=stream,
                     extra=extra,
                 )
-                self.assertEqual(lens, [expected])
+                self.assertEqual([o.prompt_len for o in outputs], [expected])
+                # The response may report a truncated or differently tokenized
+                # prompt. Summary throughput must agree with the recorded length.
+                for vision_tokens in (0, 100):
+                    with self.subTest(vision_tokens=vision_tokens):
+                        row = DatasetRow(
+                            prompt="hello",
+                            prompt_len=ROW_PROMPT_LEN,
+                            output_len=8,
+                            text_prompt_len=ROW_PROMPT_LEN - vision_tokens,
+                            vision_prompt_len=vision_tokens,
+                        )
+                        metrics, output_lens = calculate_metrics(
+                            input_requests=[row, row],
+                            outputs=[outputs[0], replace(outputs[0], success=False)],
+                            dur_s=2.0,
+                            tokenizer=SimpleNamespace(
+                                encode=lambda text, **kwargs: list(text)
+                            ),
+                            backend="sglang-oai-chat",
+                        )
+                        self.assertEqual(metrics.completed, 1)
+                        self.assertEqual(metrics.total_input, expected)
+                        self.assertEqual(
+                            metrics.total_input_text,
+                            ROW_PROMPT_LEN - vision_tokens
+                            if vision_tokens
+                            else expected,
+                        )
+                        self.assertEqual(metrics.total_input_vision, vision_tokens)
+                        self.assertEqual(output_lens, [output_tokens, 0])
+                        self.assertEqual(metrics.input_throughput, expected / 2.0)
+                        self.assertEqual(
+                            metrics.total_throughput, (expected + output_tokens) / 2.0
+                        )
+                        self.assertEqual(
+                            metrics.total_throughput_retokenized, (expected + 2) / 2.0
+                        )
 
     def test_multi_turn_requests_usage_per_round(self):
         per_round = [100, 250, 400]
@@ -126,10 +167,10 @@ class TestBenchServingPromptLen(CustomTestCase):
         ]
         for extra, sent, expected in cases:
             with self.subTest(extra=extra):
-                lens = self._run(
+                outputs = self._run(
                     multi_turn, ["one", "two", "three"], per_round, extra=extra
                 )
-                self.assertEqual(lens, expected)
+                self.assertEqual([o.prompt_len for o in outputs], expected)
                 self.assertEqual(
                     [b["stream_options"] for b in self.server.bodies], [sent] * 3
                 )
