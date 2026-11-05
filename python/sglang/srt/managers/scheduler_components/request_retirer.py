@@ -60,14 +60,10 @@ class RequestRetirer:
         self.release(req, checkpoint=checkpoint)
 
     def release(self, req: Req, *, checkpoint: bool) -> None:
-        """Give back what an ended request holds.
-
-        An aborted one is first dropped from the components tracking it, then
-        its KV backup and its memory go. The caller finishes and streams it."""
+        """Give back what an ended request holds; the caller finishes and streams it."""
         if isinstance(req.finished_reason, FINISH_ABORT):
             self._detach(req)
-            # A checkpoint hands the KV to the cache, whose store settles the
-            # attempt.
+            # A checkpoint hands the KV to the cache, whose store settles the attempt.
             if not checkpoint:
                 self.tree_cache.finish(
                     req.cache_request_handle, CacheRequestOutcome.ABORT

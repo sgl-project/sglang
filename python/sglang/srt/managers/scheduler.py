@@ -3648,15 +3648,9 @@ class Scheduler(
         reason = req.finished_reason or req.to_finish
         req.time_stats.trace_ctx.abort(abort_info={"reason": reason.message})
         req.update_finish_state()
-        # The request holds no memory, so the release only detaches it, which
-        # still matters: `create_req` marks a streaming session in-flight, and
-        # the pre-abort detach lives in `StreamingSession.find_active_slot`, which
-        # only runs while scheduling; a session left in-flight rejects every
-        # later request. And PREFILL runs `_prefetch_kvcache` before its door, so
-        # even the one-token stub is registered with the cache by now:
-        # `prefetch_from_storage` arms the paced-retry set for this attempt's
-        # cache handle. Only a `finish`/ABORT and a `waiting_queue` sweep clear
-        # that, and a retired request reaches neither.
+        # Holds no memory, but the detach still matters: `create_req` marked its
+        # streaming session in flight, and PREFILL's `_prefetch_kvcache` armed
+        # the cache's paced retry for its handle; nothing else clears either.
         self.request_retirer.release(req, checkpoint=False)
         # Like `find_active_slot`, the detached request also leaves its session.
         if req.session is not None and req.session.streaming:
