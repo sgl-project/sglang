@@ -5,8 +5,8 @@ set -euo pipefail
 HOSTNAME_VALUE=$(hostname)
 GPU_FAMILY=""
 
-# Host names look like: linux-mi35x-gpu-1-xxxxx-runner-zzzzz; runners that are
-# not ARC pods set AMD_CI_GPU_ARCH instead (see amd_ci_start_container.sh).
+# Host names look like: linux-mi35x-gpu-1-xxxxx-runner-zzzzz
+# Non-ARC runners have no such hostname and set AMD_CI_GPU_ARCH instead.
 if [[ -n "${AMD_CI_GPU_ARCH:-}" ]]; then
   GPU_FAMILY="${AMD_CI_GPU_ARCH}"
   echo "Using GPU family from AMD_CI_GPU_ARCH: ${GPU_FAMILY}"

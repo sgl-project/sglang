@@ -37,9 +37,8 @@ if [ -n "$OPTIONAL_DEPS" ]; then
     EXTRAS="dev_hip,tracing,${OPTIONAL_DEPS}"
 fi
 
-# Host names look like: linux-mi35x-gpu-1-xxxxx-runner-zzzzz. A runner that is
-# not an ARC pod (e.g. a long-lived runner on a bare GPU host) has no such name
-# and sets AMD_CI_GPU_ARCH (mi35x, mi30x, ...) in its environment instead.
+# Host names look like: linux-mi35x-gpu-1-xxxxx-runner-zzzzz
+# Non-ARC runners have no such hostname and set AMD_CI_GPU_ARCH instead.
 if [[ -n "${AMD_CI_GPU_ARCH:-}" ]]; then
   GPU_ARCH="${AMD_CI_GPU_ARCH}"
   echo "Using GPU architecture from AMD_CI_GPU_ARCH: ${GPU_ARCH}"

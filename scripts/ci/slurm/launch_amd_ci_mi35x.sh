@@ -1,10 +1,8 @@
 #!/usr/bin/env bash
 # Run one AMD CI suite on a single MI35x node scheduled through Spur.
 #
-# The GitHub runner lives on the cluster's login node. This script submits a
-# one-node, whole-node batch job running amd_ci_job_mi35x.sh -- the same
-# container steps a linux-mi35x-gpu-* ARC job runs in pr-test-amd.yml -- streams
-# the job's log into the step output, and exits with the suite's exit code.
+# Runs on the login node: submits a whole-node job running amd_ci_job_mi35x.sh,
+# streams its log into the step output, and exits with the suite's exit code.
 #
 # Spur behaviours handled here (see launch_mi355x.sh, #40113 and #41025):
 #   * batch output is not streamed back, so the job logs to shared storage and

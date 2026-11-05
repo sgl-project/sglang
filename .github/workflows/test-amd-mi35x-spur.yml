@@ -3,11 +3,8 @@ name: Test AMD MI35x (Spur)
 # Smoke test for MI35x nodes scheduled through Spur. The runner sits on the
 # cluster's login node and submits one single-node job per leg through
 # scripts/ci/slurm/launch_amd_ci_mi35x.sh, which runs the same container steps
-# as the linux-mi35x-gpu-* jobs in pr-test-amd.yml.
-#
-# Per-cluster settings (SLURM_PARTITION / SLURM_ACCOUNT / SLURM_QOS and the
-# node-local CI_NODE_SCRATCH) come from the runner's environment, as they do
-# for nightly-amd-mi355x-disagg.yml.
+# as the linux-mi35x-gpu-* jobs in pr-test-amd.yml. Cluster settings come from
+# the runner's environment (see the launcher's header).
 on:
   workflow_dispatch:
     inputs:

@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # Body of one launch_amd_ci_mi35x.sh job; runs on the allocated MI35x node.
 #
-# Runs the same steps as a linux-mi35x-gpu-* job in pr-test-amd.yml. The node
-# is held whole (--exclusive), which ensure_vram_clear.sh relies on: it stops
-# every container on the host that holds a GPU.
+# The node is held whole (--exclusive), which ensure_vram_clear.sh relies on:
+# it stops every container on the host that holds a GPU.
 #
 # The checkout is copied to node-local scratch first. The CI container runs as
 # root and writes into its /sglang-checkout bind mount, which a root-squashed
