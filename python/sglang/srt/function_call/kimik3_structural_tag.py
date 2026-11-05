@@ -538,10 +538,8 @@ def _tool_calls_tag(call_tags: List[TagFormat], parallel_tool_calls: bool) -> Ta
     return TagFormat(begin=TOOLS_OPEN, content=content, end=TOOLS_CLOSE)
 
 
-# Text outside a tools section is limited to the response channel, whose body
-# admits no control token. The model also emits near-miss markers
-# (<|close|>Message, <|close|>_message, a stray TOOLS_CLOSE), so excluding known
-# markers cannot keep markup out of the content.
+# Response text admits no control token: an exclude list of known markers would
+# miss the near-misses the model emits (<|close|>Message, a stray TOOLS_CLOSE).
 _RESPONSE_TEXT = AnyTextFormat(excludes=["<|open|>", _CLOSE_TOKEN])
 
 
@@ -565,9 +563,8 @@ _NONEMPTY_RESPONSE = _response(
     )
 )
 
-# A grammar that ends at the tools close must still admit the turn's
-# MESSAGE_CLOSE: K3 emits it before EOS, which is masked until the grammar
-# completes, so without it the model can never finish the turn.
+# K3 emits MESSAGE_CLOSE before EOS, and EOS is masked until the grammar
+# completes, so a grammar ending at the tools close must still admit it.
 _OPTIONAL_MESSAGE_CLOSE = OptionalFormat(content=ConstStringFormat(value=MESSAGE_CLOSE))
 
 
