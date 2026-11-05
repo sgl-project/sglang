@@ -10,7 +10,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
 from sglang.srt.speculative import standalone_disaggregation
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm

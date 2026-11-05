@@ -17,7 +17,8 @@ from sglang.srt.disaggregation.decode import DecodeRequest, DecodeTransferQueue
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sglang.srt.disaggregation.utils import MetadataBuffers
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ReqKvInfo
+from sglang.srt.managers.req_types import FINISH_ABORT
+from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )

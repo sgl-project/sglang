@@ -54,7 +54,7 @@ def build_standalone_disagg_draft_input(
     initializes the next draft step after decode admits the transferred request.
     """
     from sglang.srt.managers.overlap_utils import RelayPayload
-    from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+    from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
     from sglang.srt.speculative.eagle_info import EagleDraftInput
     from sglang.srt.utils.common import async_h2d_stack
 
