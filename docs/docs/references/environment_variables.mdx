@@ -2026,6 +2026,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Bootstrap URL for the ZBAL path (NPU only).</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>""</code></td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_NPU_HICACHE_HOST_ALLOCATOR</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Allocator for pinned HiCache buffers. Use aclrt for exact-size aclrtMallocHost allocations on Ascend 910B (A2), with CANN libascendcl.so available. Tensor views retain ownership of the allocation. The default torch value uses the PyTorch allocator.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>torch</code></td>
+    </tr>
   </tbody>
 </table>
 
