@@ -26,13 +26,16 @@ def test_wrapped_projection_does_not_reuse_cached_modulation():
     norm = longcat._LongCatAdaLayerNormZeroSingle(16)
     emb = torch.randn(1, 16)
     cache = {}
-    first = longcat._longcat_modulation(norm, emb, cache)
-    assert torch.equal(first, norm.linear(norm.silu(emb)))
+    first = longcat._longcat_modulation(norm, emb, cache, 3)
+    assert all(
+        torch.equal(a, b)
+        for a, b in zip(first, norm.linear(norm.silu(emb)).chunk(3, dim=1))
+    )
     norm.linear = nn.Sequential(norm.linear, nn.Identity())
     emb.add_(1)
-    assert torch.equal(
-        longcat._longcat_modulation(norm, emb, cache), norm.linear(norm.silu(emb))
-    )
+    actual = longcat._longcat_modulation(norm, emb, cache, 3)
+    expected = norm.linear(norm.silu(emb)).chunk(3, dim=1)
+    assert all(torch.equal(a, b) for a, b in zip(actual, expected))
 
 
 class _SDPA(nn.Module):
@@ -76,8 +79,13 @@ def test_model_reuses_only_current_cfg_step_and_falls_back_for_capture():
         model.single_transformer_blocks[0].norm,
     ]
     calls = []
+    activations = []
     handles = [
         norm.linear.register_forward_hook(lambda *args: calls.append(1))
+        for norm in norms
+    ]
+    handles += [
+        norm.silu.register_forward_hook(lambda *args: activations.append(1))
         for norm in norms
     ]
     x = torch.randn(1, 8, 64, device="cuda", dtype=torch.bfloat16)
@@ -108,12 +116,13 @@ def test_model_reuses_only_current_cfg_step_and_falls_back_for_capture():
             timestep.fill_(value)
             expected = [run(text) for text in texts]
             calls.clear()
+            activations.clear()
             with set_forward_context(step, None, batch):
                 actual = [run(text) for text in texts]
-            assert len(calls) == 3
+            assert len(calls) == 3 and len(activations) == 1
             assert all(torch.equal(a, b) for a, b in zip(actual, expected))
             state = batch.extra[DENOISING_LOOP_STATE]["longcat_modulations"][id(model)]
-            assert state[0][0] == step and len(state[1]) == 3
+            assert state[0][0] == step and len(state[1]) == 4
 
         for flag in ["enable_breakable_cuda_graph", "enable_cfg_parallel"]:
             setattr(server, flag, True)

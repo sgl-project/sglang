@@ -131,17 +131,20 @@ def _longcat_norm_modulate(
     )
 
 
-def _longcat_modulation(norm, emb, cache):
+def _longcat_modulation(norm, emb, cache, chunks):
     if (
         cache is None
         or type(norm.linear) is not nn.Linear
         or type(norm.silu) is not nn.SiLU
+        or norm.silu.inplace
         or getattr(norm, "emb", None) is not None
     ):
-        return norm.linear(norm.silu(emb))
+        return norm.linear(norm.silu(emb)).chunk(chunks, dim=1)
     key = id(norm)
     if key not in cache:
-        cache[key] = norm.linear(norm.silu(emb))
+        if "activation" not in cache:
+            cache["activation"] = norm.silu(emb)
+        cache[key] = norm.linear(cache["activation"]).chunk(chunks, dim=1)
     return cache[key]
 
 
@@ -157,9 +160,8 @@ class _LongCatAdaLayerNormZero(AdaLayerNormZero):
     ):
         if self.emb is not None:
             emb = self.emb(timestep, class_labels, hidden_dtype=hidden_dtype)
-        emb = _longcat_modulation(self, emb, modulation_cache)
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = emb.chunk(
-            6, dim=1
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = _longcat_modulation(
+            self, emb, modulation_cache, 6
         )
         x = _longcat_norm_modulate(self.norm, x, scale_msa, shift_msa)
         return x, gate_msa, shift_mlp, scale_mlp, gate_mlp
@@ -169,8 +171,7 @@ class _LongCatAdaLayerNormZeroSingle(AdaLayerNormZeroSingle):
     def forward(
         self, x: torch.Tensor, emb: Optional[torch.Tensor] = None, modulation_cache=None
     ):
-        emb = _longcat_modulation(self, emb, modulation_cache)
-        shift_msa, scale_msa, gate_msa = emb.chunk(3, dim=1)
+        shift_msa, scale_msa, gate_msa = _longcat_modulation(self, emb, modulation_cache, 3)
         return _longcat_norm_modulate(self.norm, x, scale_msa, shift_msa), gate_msa
 
 
