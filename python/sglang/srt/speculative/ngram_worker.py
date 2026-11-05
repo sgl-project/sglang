@@ -45,6 +45,25 @@ logger = logging.getLogger(__name__)
 USE_FULL_MASK = True
 
 
+def _attn_backend_supports_qlen_mask(attn_backend) -> bool:
+    backend = attn_backend
+    for _ in range(4):
+        if backend is None:
+            return False
+        full_backend = getattr(backend, "full_attn_backend", None)
+        if full_backend is not None:
+            backend = full_backend
+            continue
+        prefill_backend = getattr(backend, "prefill_backend", None)
+        decode_backend = getattr(backend, "decode_backend", None)
+        if prefill_backend is not None and decode_backend is not None:
+            spec_is_decode = getattr(backend, "spec_attn_is_decode", False)
+            backend = decode_backend if spec_is_decode else prefill_backend
+            continue
+        break
+    return type(backend).__name__ == "FlashAttentionBackend"
+
+
 def _derive_tree_links(
     mask: np.ndarray, bs: int, draft_token_num: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -94,6 +113,9 @@ class NGRAMWorker(BaseSpecWorker):
         self.server_args = server_args
         self._target_worker = target_worker
         self.model_runner = target_worker.model_runner
+        self.use_full_mask = USE_FULL_MASK and not _attn_backend_supports_qlen_mask(
+            getattr(self.model_runner, "attn_backend", None)
+        )
         self.page_size = get_schedule().page_size
         self.draft_token_num: int = get_spec().speculative_num_draft_tokens
         self.max_trie_depth: int = get_spec().speculative_ngram_max_trie_depth
@@ -197,7 +219,7 @@ class NGRAMWorker(BaseSpecWorker):
         self.positions = torch.empty(
             (max_total_drafts,), dtype=torch.int64, device=self.device
         )
-        self.tree_mask = torch.empty(
+        self.tree_mask = torch.ones(
             (max_total_mask_size,), dtype=torch.bool, device=self.device
         )
 
@@ -319,7 +341,7 @@ class NGRAMWorker(BaseSpecWorker):
         # Pre-sync: only needs seq_lens_cpu, so build before the blocking
         # accept sync inside _prepare_draft_tokens.
         ones_masks = None
-        if USE_FULL_MASK and not _is_cpu:
+        if self.use_full_mask and not _is_cpu:
             ones_masks = [
                 torch.ones(
                     (self.draft_token_num, batch.seq_lens_cpu[i]), device=self.device
@@ -348,7 +370,7 @@ class NGRAMWorker(BaseSpecWorker):
 
         # NOTE: QLEN_MASK is faster than FULL_MASK, but requires corresponding changes in flashinfer.
         # Testing shows about 8% performance improvement (the effect is roughly proportional to batch size).
-        if USE_FULL_MASK and not _is_cpu:
+        if self.use_full_mask and not _is_cpu:
             tree_mask = []
             mask = mask.reshape(bs, self.draft_token_num, self.draft_token_num)
             # TODO(siyuan): the for loop here leads to significant overhead in large batch size. Can be written into a kernel.
