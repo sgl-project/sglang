@@ -7,14 +7,15 @@ it is bit-identical to the legacy in-place formula that
 
     floor((len - rank - 1) / N) + 1   ==   len // N + (rank < len % N)   (len >= 0)
 
-Also pins the request-ordered prefix/extend interleave of
-``all_gather_kv_cache_for_mha_extend``.
+Also pins the request-ordered prefix/extend rows that
+``all_gather_kv_cache_for_mha_extend`` returns after a simulated DCP all-gather.
 
 Usage:
     python -m pytest test_dcp_layout_unit.py -v
     python test_dcp_layout_unit.py
 """
 
+import itertools
 import math
 import unittest
 from types import SimpleNamespace
@@ -153,16 +154,41 @@ def _expected_interleave(prefix_rows, extend_rows, prefix_lens, extend_lens):
     return torch.cat(out)
 
 
+class _GatherOnLastRankGroup:
+    """DCP group for ranks run in order 0..N-1; only the last rank's gather is complete."""
+
+    def __init__(self, world_size):
+        self.world_size = world_size
+        self.sent = []
+
+    def all_gather_into_tensor(self, out, inp):
+        self.sent.append(inp.clone())
+        if len(self.sent) == self.world_size:
+            out.copy_(torch.cat(self.sent))
+
+
+def _dcp_local_rows(prefix_lens, dcp_size, rank):
+    """Global prefix rows that `rank` stores: request positions p with p % dcp_size == rank."""
+    starts = itertools.accumulate(prefix_lens, initial=0)
+    rows = [
+        s + p for s, n in zip(starts, prefix_lens) for p in range(rank, n, dcp_size)
+    ]
+    return torch.tensor(rows, dtype=torch.int64)
+
+
 class TestAllGatherKvCacheForMhaExtend(CustomTestCase):
     KV_LORA, ROPE = 4, 2
 
     def test_rows_are_request_ordered_prefix_then_extend(self):
-        """Request-ordered [prefix_i, extend_i] rows; trailing padded extend rows are dropped."""
+        """After the DCP prefix all-gather, rows are request-ordered [prefix_i, extend_i];
+        trailing padded extend rows are dropped."""
         cases = [
             ([4, 0, 9], [2, 5, 1], 3),
             ([0, 6, 0, 3], [1, 1, 4, 2], 0),
         ]
-        for prefix_lens, extend_lens, pad in cases:
+        for (prefix_lens, extend_lens, pad), dcp_size in itertools.product(
+            cases, (2, 4)
+        ):
             num_prefix, num_extend = sum(prefix_lens), sum(extend_lens) + pad
             # Distinct row values so any misplaced row shows up as a mismatch.
             kv_buf = torch.arange(num_prefix * self.KV_LORA, dtype=torch.float32)
@@ -179,16 +205,26 @@ class TestAllGatherKvCacheForMhaExtend(CustomTestCase):
             pool = SimpleNamespace(
                 layer_router=SimpleNamespace(read=lambda _layer_id: layer_kv)
             )
-            with rc.get_parallel().override(dcp_enabled=False, dcp_size=1, dcp_rank=0):
-                got_kv_a, got_k_pe = all_gather_kv_cache_for_mha_extend(
-                    token_to_kv_pool=pool,
-                    attn_mqa=SimpleNamespace(layer_id=0),
-                    dcp_local_prefix_kv_indices=torch.arange(num_prefix),
-                    extend_prefix_lens_cpu=prefix_lens,
-                    extend_seq_lens_cpu=extend_lens,
-                    kv_a=kv_a,
-                    k_pe=k_pe,
-                )
+            group = _GatherOnLastRankGroup(dcp_size)
+            for rank in range(dcp_size):
+                with rc.get_parallel().override(
+                    dcp_enabled=True,
+                    dcp_size=dcp_size,
+                    dcp_rank=rank,
+                    dcp_group=group,
+                ):
+                    got_kv_a, got_k_pe = all_gather_kv_cache_for_mha_extend(
+                        token_to_kv_pool=pool,
+                        attn_mqa=SimpleNamespace(layer_id=0),
+                        dcp_local_prefix_kv_indices=_dcp_local_rows(
+                            prefix_lens=prefix_lens, dcp_size=dcp_size, rank=rank
+                        ),
+                        extend_prefix_lens_cpu=prefix_lens,
+                        extend_seq_lens_cpu=extend_lens,
+                        kv_a=kv_a,
+                        k_pe=k_pe,
+                    )
+            # got_* now holds the last rank's output, the one built from the full gather.
             want_kv_a = _expected_interleave(
                 prefix_rows=kv_buf.squeeze(1),
                 extend_rows=kv_a,
@@ -201,7 +237,7 @@ class TestAllGatherKvCacheForMhaExtend(CustomTestCase):
                 prefix_lens=prefix_lens,
                 extend_lens=extend_lens,
             )
-            msg = f"prefix_lens={prefix_lens} extend_lens={extend_lens} pad={pad}"
+            msg = f"{prefix_lens=} {extend_lens=} {pad=} {dcp_size=}"
             self.assertTrue(torch.equal(got_kv_a, want_kv_a), msg)
             self.assertTrue(torch.equal(got_k_pe, want_k_pe), msg)
 
