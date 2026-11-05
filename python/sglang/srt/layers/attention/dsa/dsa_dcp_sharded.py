@@ -65,10 +65,15 @@ class DcpTopKMerge:
         )
 
     @classmethod
-    def create(cls, group, max_rows: int, topk: int) -> Optional[DcpTopKMerge]:
+    def create(
+        cls, group, max_rows: int, topk: int, dcp_rank: int
+    ) -> Optional[DcpTopKMerge]:
         """Collective over ``group``. None unless it has 8 ranks (16 with the
         megakernel), top-k is 2048, and its GPUs share NVLink multicast."""
         import torch.distributed._symmetric_memory as symm_mem
+
+        # the certificate counts rank q's keys as positions p % world == q
+        assert group.rank_in_group == dcp_rank, (group.rank_in_group, dcp_rank)
 
         world = group.world_size
         # 16 ranks only on megakernel paths

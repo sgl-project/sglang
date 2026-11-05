@@ -55,7 +55,7 @@ def _init_once() -> Optional[DcpTopKMerge]:
     get_parallel().override_permanently(world_group=ps._WORLD)
     atexit.register(dist.destroy_process_group)
     logging.disable(logging.INFO)
-    return DcpTopKMerge.create(ps._WORLD, MAX_ROWS, TOPK)
+    return DcpTopKMerge.create(ps._WORLD, MAX_ROWS, TOPK, ps._WORLD.rank_in_group)
 
 
 def _rows(kind: str, seed: int) -> list[torch.Tensor]:
