@@ -169,14 +169,15 @@ class TestAfp4wfp4EvenKConfig(CustomTestCase):
         self.assertEqual(config, {**aiter_config, "BLOCK_SIZE_K": 256})
 
     def test_failed_lookup_keeps_the_default_path(self):
-        for error in (KeyError("no M bucket"), AssertionError("no DEFAULT.json")):
+        for error in (
+            KeyError("no M bucket"),
+            AssertionError("no DEFAULT.json"),
+            # The private AITER getter changed its signature.
+            TypeError("changed signature"),
+        ):
             with self.subTest(error=type(error).__name__):
                 self.assertIsNone(self._config(mock.Mock(side_effect=error)))
         self.assertIsNone(self._config(None))
-
-    def test_other_lookup_errors_propagate(self):
-        with self.assertRaises(TypeError):
-            self._config(mock.Mock(side_effect=TypeError("changed signature")))
 
     def test_split_k_config_is_left_to_aiter(self):
         split_k = {"BLOCK_SIZE_K": 512, "NUM_KSPLIT": 4}

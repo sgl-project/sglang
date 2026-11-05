@@ -73,6 +73,15 @@ def _warn_no_even_k_block(k: int) -> None:
     )
 
 
+@functools.cache
+def _warn_aiter_get_config_failed() -> None:
+    logger.warning(
+        "MXFP4 gemm_afp4wfp4: AITER's _get_config failed; "
+        "the triton-lang/triton#11256 K-tail workaround is off.",
+        exc_info=True,
+    )
+
+
 @functools.lru_cache(maxsize=1024)
 def _afp4wfp4_even_k_config(m: int, n: int, k_packed: int) -> Optional[dict]:
     # None keeps AITER's own config selection.
@@ -82,6 +91,10 @@ def _afp4wfp4_even_k_config(m: int, n: int, k_packed: int) -> Optional[dict]:
         config, _ = _aiter_afp4wfp4_get_config(m, n, k_packed)
     except (KeyError, AssertionError):
         # No config file or M bucket for this shape.
+        return None
+    except Exception:
+        # _get_config is private AITER API; a changed one keeps AITER's own config selection.
+        _warn_aiter_get_config_failed()
         return None
     if config["NUM_KSPLIT"] != 1:
         # Split-K configs are left to AITER's get_splitk;
