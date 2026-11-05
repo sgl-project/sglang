@@ -23,6 +23,9 @@ class GPTQIntelAMXLinearKernel:
         self.quant_config = quant_config
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        layer.gptq_cpu_padding.fill_weight_padding(
+            qweight=layer.qweight.data, qzeros=layer.qzeros.data
+        )
         _amx_process_weight_after_loading(
             layer, ["qweight", "qzeros", "scales"], None, "gptq"
         )
@@ -36,6 +39,7 @@ class GPTQIntelAMXLinearKernel:
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        x = layer.gptq_cpu_padding.pad_activation(x)
         return torch.ops.sgl_kernel.int4_scaled_mm_cpu(
             x,
             layer.qweight,
@@ -70,8 +74,9 @@ class GPTQIntelAMXMoEKernel:
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
-        assert self.moe_runner_config.activation == "silu", (
-            "Only SiLU activation is supported."
+        activation = self.moe_runner_config.activation
+        assert activation in ("silu", "gelu"), (
+            f"Only SiLU and GELU activations are supported, got {activation}."
         )
 
         x = dispatch_output.hidden_states
@@ -95,5 +100,6 @@ class GPTQIntelAMXMoEKernel:
             None,  # alpha
             None,  # limit
             True,  # is_vnni
+            activation,
         )
         return StandardCombineInput(hidden_states=output)
