@@ -25,7 +25,7 @@ from sglang.srt.layers.attention.dsa.dsa_npu_indexer import (
     _get_indexer_query_shard,
     plan_indexer_query_shard,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
