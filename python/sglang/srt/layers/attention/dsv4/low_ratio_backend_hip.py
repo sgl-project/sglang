@@ -501,7 +501,9 @@ def low_ratio_index_topk_hip_extend(
     """Ragged prefill: the FlyDSL prefill kernel scores every token's visible compressed positions,
     candidate masks are published or applied per request, one paged top-k selects every row.
     Identity requests are written without scores; an all-identity batch skips the kernel.
-    With row_shard, this rank selects its share of the rows and the selections are all-gathered."""
+    With row_shard, this rank selects its share of the rows and only the selection part this
+    forward's attention reads is all-gathered (backend.indexer_gather_parts); a candidate
+    source's blocks stay on the rank that scored them."""
     pool = backend.token_to_kv_pool
     metadata = backend.forward_metadata
     core = metadata.core_metadata
@@ -512,6 +514,8 @@ def low_ratio_index_topk_hip_extend(
     page_indices.fill_(-1)
     if raw_indices is not None:
         raw_indices.fill_(-1)
+    # every row holds both parts unless a row-sharded exchange below says otherwise
+    backend.set_indexer_gathered_parts(ratio, None)
 
     seq_lens_cpu = _as_int_list(forward_batch.seq_lens_cpu)
     # bounded replay counts cover only each request's tail
@@ -689,11 +693,20 @@ def low_ratio_index_topk_hip_extend(
         indexer_metadata.page_table, LOW_RATIO_PAGE_TABLE_BUCKET
     )
     req_lo0, req_hi0, tok_lo0 = 0, len(extend_lens_cpu), 0
+    exchange = None
     if row_shard is not None:
         shard_rows = row_shard.local_rows(num_tokens)
         lens, req_lo0, req_hi0, offsets = _clip_requests(extend_lens_cpu, shard_rows)
         tok_lo0 = shard_rows.start
-        if consume is not None:
+        shard_key = (num_tokens, shard_rows.start, shard_rows.stop)
+        if isinstance(consume, _LocalCandidates):
+            # the source scored the same rows on this rank and kept only them
+            if consume.shard_key != shard_key:
+                raise RuntimeError(
+                    "a row-sharded candidate consumer needs its source sharded over the "
+                    f"same rows: source {consume.shard_key}, consumer {shard_key}"
+                )
+        elif consume is not None:
             consume = [
                 c
                 if c is None or lens[b] == extend_lens_cpu[b]
@@ -702,6 +715,20 @@ def low_ratio_index_topk_hip_extend(
             ]
         if publish is not None:
             publish = []
+        exchange = _ShardExchange(
+            row_shard,
+            num_tokens,
+            parts=backend.indexer_gather_parts(ratio, forward_batch, num_tokens),
+            page_indices=page_indices,
+            raw_indices=raw_indices,
+        )
+        # the local top-k writes the exchanged part of its rows straight into the send block
+        page_indices, raw_indices = exchange.selection_outputs()
+    elif isinstance(consume, _LocalCandidates):
+        raise RuntimeError(
+            "an unsharded candidate consumer cannot read a row-sharded source's local "
+            f"candidates (shard key {consume.shard_key}, {num_tokens} rows)"
+        )
     groups = [
         (lo + req_lo0, hi + req_lo0, tok_lo + tok_lo0, tok_hi + tok_lo0)
         for lo, hi, tok_lo, tok_hi in _request_groups(
@@ -743,30 +770,22 @@ def low_ratio_index_topk_hip_extend(
                 pieces.append(piece[0])
         if publish is not None:
             publish.append(cat_candidate_blocks(pieces))
-    if row_shard is not None:
-        publish = _gather_shard(
-            row_shard,
-            shard_rows,
-            req_lo0,
-            page_indices,
-            raw_indices,
-            publish,
-            num_rows=num_tokens,
-            published=[
-                t > 0 and lc > 0 and not ident
-                for t, lc, ident in zip(extend_lens_cpu, lc_per_req, is_identity)
-            ],
-            extend_lens=extend_lens_cpu,
-            topk_blocks=indexer.candidate_topk_blocks,
-            block_size=indexer.candidate_block_size,
-        )
+    local_rows = None
+    if exchange is not None:
+        exchange.start()
+        if publish is not None:
+            # Candidates stay on the rank that scored them: every consumer is sharded
+            # over the same rows (shard_key) and reads only its own.
+            publish = _LocalCandidates.of(
+                publish, req_lo0, req_hi0, len(extend_lens_cpu), shard_key=shard_key
+            )
+            local_rows = (lens, offsets)
     if publish is not None:
         if page8:
             assert len(publish) == len(extend_lens_cpu), (len(publish), extend_lens_cpu)
-            tok = 0
-            for b, candidates in enumerate(publish):
-                r = slice(tok, tok + extend_lens_cpu[b])
-                tok = r.stop
+            for b, (candidates, r) in enumerate(
+                zip(publish, _publication_rows(extend_lens_cpu, local_rows))
+            ):
                 if candidates is not None:
                     publish[b] = with_candidate_page8_table(
                         candidates,
@@ -775,6 +794,8 @@ def low_ratio_index_topk_hip_extend(
                         page_size=indexer_metadata.compressed_page_size,
                     )
         backend.candidate_masks = publish
+    if exchange is not None:
+        exchange.finish()
 
 
 def _clip_requests(
@@ -794,65 +815,91 @@ def _clip_requests(
     return lens, req_lo, max(req_lo, req_hi), offsets
 
 
-def _gather_shard(
-    row_shard: RowShard,
-    rows: slice,
-    req_lo: int,
-    page_indices: torch.Tensor,
-    raw_indices: Optional[torch.Tensor],
-    local_publish: Optional[List[Optional[CandidateBlocks]]],
-    *,
-    num_rows: int,
-    published: List[bool],
-    extend_lens: List[int],
-    topk_blocks: int,
-    block_size: int,
-) -> Optional[List[Optional[CandidateBlocks]]]:
-    """All-gathers every rank's rows of the selections and, on a source layer, of the candidate
-    blocks (ids, then the compact length); returns the publication of every request.
-    num_rows is the count rows was cut from, padding rows included."""
-    topk = page_indices.shape[1]
-    parts = [page_indices[rows]]
-    if raw_indices is not None:
-        parts.append(raw_indices[rows])
-    if local_publish is not None:
-        cand = page_indices.new_full((rows.stop - rows.start, topk_blocks + 1), -1)
-        starts = list(itertools.accumulate([0, *extend_lens]))
-        for b, c in enumerate(local_publish, start=req_lo):
-            if c is None:
-                continue
-            lo = max(starts[b], rows.start) - rows.start
-            cand[lo : lo + c.ids.shape[0], :topk_blocks] = c.ids
-            cand[lo : lo + c.ids.shape[0], topk_blocks] = c.compact_lens
-        parts.append(cand)
-    local = torch.cat(parts, dim=1)
-    local = torch.nn.functional.pad(
-        local, (0, 0, 0, row_shard.rows_per_rank(num_rows) - local.shape[0]), value=-1
-    )
-    full = row_shard.gather(local, num_rows)
-    page_indices[:num_rows].copy_(full[:, :topk])
-    if raw_indices is not None:
-        raw_indices[:num_rows].copy_(full[:, topk : 2 * topk])
-    if local_publish is None:
-        return None
-    ids = full[:, -topk_blocks - 1 : -1].contiguous()
-    compact_lens = full[:, -1].contiguous()
-    publish, tok = [], 0
-    for t_len, has in zip(extend_lens, published):
-        r = slice(tok, tok + t_len)
-        tok += t_len
-        publish.append(
-            CandidateBlocks(
-                ids=ids[r],
-                compact_lens=compact_lens[r],
-                compact_page_table=torch.zeros_like(compact_lens[r]).unsqueeze(1),
-                compact_page_size=triton.next_power_of_2(topk_blocks * block_size),
-                block_size=block_size,
-            )
-            if has
-            else None
+class _LocalCandidates(list):
+    """A row-sharded candidate source's per-request blocks of only this rank's rows (None
+    for requests without rows here), keyed by the rows they were scored over."""
+
+    def __init__(self, items, *, shard_key: tuple):
+        super().__init__(items)
+        self.shard_key = shard_key
+
+    @classmethod
+    def of(cls, local: list, req_lo: int, req_hi: int, num_reqs: int, *, shard_key):
+        """From the publication of requests req_lo..req_hi (my rows of each)."""
+        assert len(local) == req_hi - req_lo, (len(local), req_lo, req_hi)
+        return cls(
+            [None] * req_lo + list(local) + [None] * (num_reqs - req_hi),
+            shard_key=shard_key,
         )
-    return publish
+
+
+def _publication_rows(
+    extend_lens: List[int], local: Optional[Tuple[List[int], List[int]]]
+):
+    """Each request's batch rows its publication entry covers: all of them, or with
+    local=(lens, offsets) from _clip_requests only this rank's."""
+    tok = 0
+    for b, t_len in enumerate(extend_lens):
+        if local is None:
+            yield slice(tok, tok + t_len)
+        else:
+            lens, offsets = local
+            yield slice(tok + offsets[b], tok + offsets[b] + lens[b])
+        tok += t_len
+
+
+class _ShardExchange:
+    """All-gathers every rank's rows of the selection parts attention reads (``parts``)
+    through one ``[world * rows_per_rank, len(parts) * topk]`` int32 region; rank r's block
+    is rows ``[r * rows_per_rank, (r + 1) * rows_per_rank)``, so with the equal shares of
+    RowShard a block row is the batch row. With one part (the recipes) the local top-k
+    writes it straight into the send block; ``finish`` copies every rank's rows into the
+    core metadata's index buffers. Rows past num_rows (the last share's padding) are
+    dropped."""
+
+    def __init__(self, row_shard, num_rows: int, *, parts, page_indices, raw_indices):
+        self.group = row_shard.group
+        self.world, self.rank = row_shard.world, row_shard.rank
+        self.num_rows = num_rows
+        self.per = row_shard.rows_per_rank(num_rows)
+        rows = row_shard.local_rows(num_rows)
+        self.lo, self.hi = rows.start, rows.stop
+        assert self.lo == self.hi or self.lo == self.rank * self.per, (rows, self.per)
+        self.parts = parts
+        self.dst = {"page": page_indices, "raw": raw_indices}
+        for p in parts:
+            assert self.dst[p] is not None, (p, parts)
+            assert self.dst[p].dtype == torch.int32, self.dst[p].dtype
+        self.topk = page_indices.shape[1]
+        n, cols = self.world * self.per, self.topk * len(parts)
+        # indexed by batch row; my block is sent from here, so send and receive never alias
+        self.rows = page_indices.new_empty((n, cols))
+        self.region = page_indices.new_empty((n, cols))
+        # identity rows write only their reachable columns
+        self.rows[self.lo : self.hi].fill_(-1)
+
+    def selection_outputs(self):
+        """(page_indices, raw_indices) for the local selection to write its rows into."""
+        out = dict(self.dst)
+        if len(self.parts) == 1:
+            out[self.parts[0]] = self.rows
+        return out["page"], out["raw"]
+
+    def start(self) -> None:
+        if len(self.parts) > 1:
+            # uniform_fp8 / unified pools, or a forward whose attention path is not
+            # known yet: both parts side by side in the block
+            for i, p in enumerate(self.parts):
+                self.rows[self.lo : self.hi, i * self.topk : (i + 1) * self.topk].copy_(
+                    self.dst[p][self.lo : self.hi]
+                )
+        block = self.rows[self.rank * self.per : (self.rank + 1) * self.per]
+        self.group.all_gather_into_tensor(self.region, block)
+
+    def finish(self) -> None:
+        n = self.num_rows
+        for i, p in enumerate(self.parts):
+            self.dst[p][:n].copy_(self.region[:n, i * self.topk : (i + 1) * self.topk])
 
 
 def _select_topk_extend_hip(
