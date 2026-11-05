@@ -4010,15 +4010,13 @@ class Scheduler(
         req.clear_requested_finish()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.release_prefill_sender(req, abort_sender=True)
-        self.request_retirer.release(req, checkpoint=False)
+        # A client abort leaves the message to the tokenizer.
+        self.request_retirer.abort(
+            req, finished_reason=req.discard_output_reason and reason.to_json()
+        )
 
         self.chunked_req = None
         self._pending_chunked_abort_req = None
-        # A client abort leaves the message to the tokenizer.
-        finished_reason = req.discard_output_reason and reason.to_json()
-        self.send_abort_output(
-            make_abort_req(req, finished_reason=finished_reason), req
-        )
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
 
     def _build_hisparse_decode_batch(self, reqs):
@@ -4387,6 +4385,7 @@ class Scheduler(
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
             prefill_tile_block_m=prefill_tile_block_m,
+            request_retirer=self.request_retirer,
         )
 
         if self.chunked_req is not None:
@@ -4799,7 +4798,9 @@ class Scheduler(
                 if mamba_allocator is not None
                 else None
             )
-            retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode()
+            retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
+                self.request_retirer
+            )
             self.running_reqs.leave([*retracted_reqs, *reqs_to_abort])
             new_available_tokens = self.token_to_kv_pool_allocator.available_size()
             new_token_gained = new_available_tokens - old_available_tokens
@@ -4822,15 +4823,8 @@ class Scheduler(
                 )
             self.new_token_ratio_tracker.current = new_token_ratio
             for req in reqs_to_abort:
-                abort_reason: FINISH_ABORT = req.to_finish
-                self.send_abort_output(
-                    make_abort_req(req, finished_reason=abort_reason.to_json()),
-                    req,
-                )
-            for req in reqs_to_abort:
-                # Member rows were freed inside retract_decode; the group only
-                # has to leave the live set.
-                self.beam_coordinator.retire_group(req)
+                # retract_decode recorded the reason and freed any member rows.
+                self.request_retirer.abort_retracted(req, reason=req.to_finish)
 
             msg_prefix = (
                 "KV cache pool is full. Retract requests. "
@@ -6133,10 +6127,8 @@ class Scheduler(
             # be discarded; non-decode modes never offload.
             unresumable = retract_all(
                 reqs=retract_reqs,
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                 tree_cache=self.tree_cache,
-                hisparse_coordinator=self.hisparse_coordinator,
+                request_retirer=self.request_retirer,
                 offload_kv=False,
             )
         self.running_batch.reqs = []
@@ -6145,12 +6137,12 @@ class Scheduler(
         self.prefill_launched_reqs.leave(retract_reqs)
         for req in retract_reqs:
             if req in unresumable:
-                abort_reason = FINISH_ABORT(
-                    unresumable_abort_message(),
-                    status_code=HTTPStatus.SERVICE_UNAVAILABLE,
-                )
-                self.send_abort_output(
-                    make_abort_req(req, finished_reason=abort_reason.to_json()), req
+                self.request_retirer.abort_retracted(
+                    req,
+                    reason=FINISH_ABORT(
+                        unresumable_abort_message(),
+                        status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                    ),
                 )
             elif self.disaggregation_mode == DisaggregationMode.DECODE:
                 req.time_stats.set_retract_time()
