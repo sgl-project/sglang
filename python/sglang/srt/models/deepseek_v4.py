@@ -3561,6 +3561,24 @@ def _scatter_tail_rows(
     return full
 
 
+def _finalize_dspark_aux(
+    aux: AuxHiddenStatePacker,
+    tail: Optional[LateLayerTail],
+    num_tokens: int,
+    cuda_cp_tail: bool,
+) -> torch.Tensor:
+    """Finalize the packed DSpark captures, then move them with the tail rows.
+
+    The packer is not iterable: every capture lands in one
+    ``[tokens, K * hidden]`` buffer, so the CP scatter has to run on the
+    finalized payload instead of a per-capture list.
+    """
+    packed = aux.finalize()
+    if not cuda_cp_tail:
+        return packed
+    return _scatter_tail_rows(tail=tail, rows=packed, num_tokens=num_tokens, zero=True)
+
+
 class DeepseekV4CudaDecoderLayer(DeepseekV4DecoderLayerBase):
     """CUDA execution with declared residual reads and writes."""
 
@@ -4614,9 +4632,9 @@ class DeepseekV4Model(nn.Module):
         # included, by this rank's full shard layout, so the tail rows go back
         # into that layout before the gather.
         cuda_cp_tail = _needs_cp_tail_scatter(tail, forward_batch)
+        num_tokens = input_ids.shape[0]
         if tail is not None and (not capture_dspark or cuda_cp_tail):
             # The logits processor indexes rows by the full extend layout.
-            num_tokens = input_ids.shape[0]
             hidden_states = _scatter_tail_rows(
                 tail=tail,
                 rows=hidden_states,
@@ -4629,19 +4647,10 @@ class DeepseekV4Model(nn.Module):
                 num_tokens=num_tokens,
                 zero=cuda_cp_tail,
             )
-            if cuda_cp_tail and capture_dspark:
-                dspark_aux_hidden_states = [
-                    _scatter_tail_rows(
-                        tail=tail,
-                        rows=aux,
-                        num_tokens=num_tokens,
-                        zero=True,
-                    )
-                    for aux in dspark_aux_hidden_states
-                ]
-
         if capture_dspark:
-            return (hidden_states, pre_hc_head), dspark_aux_hidden_states.finalize()
+            return (hidden_states, pre_hc_head), _finalize_dspark_aux(
+                dspark_aux_hidden_states, tail, num_tokens, cuda_cp_tail
+            )
 
         return hidden_states, pre_hc_head
 

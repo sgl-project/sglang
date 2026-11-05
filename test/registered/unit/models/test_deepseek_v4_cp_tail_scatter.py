@@ -4,8 +4,13 @@ from unittest import mock
 import torch
 
 from sglang.srt.layers.attention.deepseek_v4_backend import LateLayerTail
+from sglang.srt.layers.aux_hidden_states import AuxHiddenStatePacker
 from sglang.srt.models import deepseek_v4
-from sglang.srt.models.deepseek_v4 import _needs_cp_tail_scatter, _scatter_tail_rows
+from sglang.srt.models.deepseek_v4 import (
+    _finalize_dspark_aux,
+    _needs_cp_tail_scatter,
+    _scatter_tail_rows,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
@@ -44,6 +49,27 @@ class TestScatterTailRows(unittest.TestCase):
         out = _scatter_tail_rows(_tail(), torch.tensor([[10.0], [20.0]]), num_tokens=4)
         self.assertEqual(out[1, 0].item(), 10.0)
         self.assertEqual(out[3, 0].item(), 20.0)
+
+
+class TestFinalizeDsparkAux(unittest.TestCase):
+    def _packer(self):
+        packer = AuxHiddenStatePacker(2)
+        packer.append(torch.tensor([[10.0], [20.0]]))
+        packer.append(torch.tensor([[11.0], [21.0]]))
+        return packer
+
+    def test_finalized_payload_is_returned_unchanged_without_cp(self):
+        packed = _finalize_dspark_aux(self._packer(), _tail(), 4, cuda_cp_tail=False)
+        self.assertEqual(tuple(packed.shape), (2, 2))
+        self.assertTrue(torch.equal(packed[:, 0], torch.tensor([10.0, 20.0])))
+        self.assertTrue(torch.equal(packed[:, 1], torch.tensor([11.0, 21.0])))
+
+    def test_packed_payload_is_scattered_with_the_tail_rows(self):
+        out = _finalize_dspark_aux(self._packer(), _tail(), 4, cuda_cp_tail=True)
+        self.assertEqual(tuple(out.shape), (4, 2))
+        self.assertTrue(torch.equal(out[1], torch.tensor([10.0, 11.0])))
+        self.assertTrue(torch.equal(out[3], torch.tensor([20.0, 21.0])))
+        self.assertEqual(out[[0, 2]].abs().sum().item(), 0.0)
 
 
 class TestNeedsCpTailScatter(unittest.TestCase):
