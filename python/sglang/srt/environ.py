@@ -427,9 +427,9 @@ class Envs:
     SGLANG_TEST_RETRACT = EnvBool(False)
     SGLANG_TEST_RETRACT_INTERVAL = EnvInt(3)
     SGLANG_TEST_RETRACT_NO_PREFILL_BS = EnvInt(2**31)
-    # Scheduler: force lazy extra_buffer prealloc to fail at decode boundaries
-    SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL = EnvBool(False)
-    # KL tests: skip the cache-hit count assertion (e.g. when alloc failure reduces hits)
+    # Scheduler: report the mamba state pool full to lazy tracking-slot alloc, so each boundary evicts first
+    SGLANG_TEST_MAMBA_LAZY_POOL_FULL = EnvBool(False)
+    # KL tests: skip the cache-hit count assertion (e.g. when eviction reduces hits)
     SGLANG_TEST_SKIP_CACHE_HIT_ASSERT = EnvBool(False)
     # HiCache: GPU sleep cycles before each layer's host-to-device load, so a forward
     # that skips the per-layer load wait reads unloaded layers
@@ -2337,6 +2337,9 @@ class Envs:
     # ===================================================================
     SGLANG_PLATFORM = EnvStr("")
     SGLANG_PLUGINS = EnvStr("")
+    # Read by the NVIDIA megakernel plugin, not by SGLang: a comma-separated
+    # slot list that replaces the plugin's default. Empty runs the stock paths.
+    SGLANG_NVIDIA_MEGAKERNEL_SLOTS = EnvTuple(())
 
     # ===================================================================
     # KV-Canary and Token-Oracle (testing only)

@@ -2411,5 +2411,10 @@ MPS and does not read them.
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Comma-separated list of plugins to load.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>""</code></td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_NVIDIA_MEGAKERNEL_SLOTS</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Read by the NVIDIA megakernel plugin, not by SGLang. A comma-separated slot list that replaces the plugin's default slot policy; an empty value runs the stock paths. Unset keeps the plugin default.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Unset (plugin default)</td>
+    </tr>
   </tbody>
 </table>
