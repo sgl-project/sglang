@@ -15,6 +15,7 @@ from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.unified_cache.cache_action import BackupKV
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -32,6 +33,11 @@ from sglang.test.hicache_write_back_fixtures import (
     write_back_cache,
 )
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.unified_allocator_fixtures import (
+    UnifiedGeometry,
+    build_unified_bundle,
+    setup_allocator_context,
+)
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -229,6 +235,45 @@ class _WriteBackBatchingSuite:
         cc.assert_copies_behind_the_fence(self)
         cache.sanity_check()
 
+    def test_allocation_reclaim_on_a_token_chain_batches_its_copies(self):
+        """BUG REGRESSION. A unified chain without window bands reclaimed an
+        allocation with a stop asked after every victim, which only a demote
+        can answer, so each dirty leaf took a copy submission and a wait of
+        its own. Its shortfall is a token count: its victims share one."""
+        setup_allocator_context()
+        bundle = build_unified_bundle(
+            UnifiedGeometry(
+                chain="full",
+                full_layer_ids=(0,),
+                page_size=PAGE,
+                full_tokens=2 * BATCH_TOKENS,
+                context_len=2 * BATCH_TOKENS,
+            )
+        )
+        cache, allocator, host_pool = write_back_cache(
+            self.tree_core_backend,
+            device_tokens=2 * BATCH_TOKENS,
+            host_tokens=BATCH_TOKENS,
+            allocator=bundle.token_to_kv_pool_allocator,
+        )
+        for seq in batch_seqs(1):
+            insert_seq(cache, allocator, seq)
+        # Rows outside the tree hold the rest of the device.
+        while allocator.alloc(PAGE) is not None:
+            pass
+        cc = _FencedController(cache.cache_controller, {id(host_pool): "kv"})
+        cache.cache_controller = cc
+
+        result = cache.evict_for_alloc(KVDemand(full_tokens=BATCH_TOKENS))
+
+        self.assertEqual(result.num_tokens_evicted, BATCH_TOKENS)
+        self.assertIsNotNone(allocator.alloc(BATCH_TOKENS))
+        self.assertEqual(len(cc.submitted), 1)
+        self.assertEqual(sum(event[0] == "sync" for event in cc.log), 1)
+        for seq in batch_seqs(1):
+            self.assertEqual(match_seq(cache, seq).host_hit_length, SEQ_TOKENS)
+        cache.sanity_check()
+
     def test_swa_window_copies_go_behind_the_write_fence(self):
         """A chain's SWA window copy also reads its parent's SWA slots: the
         batch, parents included, goes behind the fence in one submission, and
@@ -329,7 +374,7 @@ class _WriteBackBatchingSuite:
         cache.sanity_check()
 
     def _evict_until_reclaimed(self, *, batched):
-        """evict_for_alloc with an allocator's reclaim predicate, met three
+        """evict_until with an allocator's reclaim predicate, met three
         victims into a quota of a whole batch; returns the tokens evicted and
         which sequences stay on device."""
         cache, allocator, _ = self._fill_host_with_one_batch()
@@ -338,9 +383,9 @@ class _WriteBackBatchingSuite:
         if not batched:
             cache._write_back_batch_tokens = lambda *args: 0
         target = allocator.available_size() + 3 * SEQ_TOKENS
-        result = cache.evict_for_alloc(
+        result = cache.evict_until(
             EvictParams(num_tokens=BATCH_TOKENS),
-            allocation_reclaim_satisfied=lambda: allocator.available_size() >= target,
+            satisfied=lambda: allocator.available_size() >= target,
         )
         cache.sanity_check()
         on_device = [

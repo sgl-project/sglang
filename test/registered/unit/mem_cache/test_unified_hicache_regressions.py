@@ -10,7 +10,6 @@ from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
 from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo, MambaStateBufferInfo
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import _split_hicache_size
-from sglang.srt.mem_cache.kv.alloc.pricing import ends_compaction_allowed
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -19,7 +18,6 @@ from sglang.test.unified_allocator_fixtures import (
     chain_snapshot,
     hold_every_band,
     release_every_band,
-    token_ends,
 )
 
 register_cuda_ci(est_time=13, stage="extra-a", runner_config="1-gpu-small")
@@ -58,7 +56,7 @@ class TestHiCacheIndexDomains(unittest.TestCase):
 
 
 class TestHostGateCapacity(unittest.TestCase):
-    def test_schedulable_memo_tracks_holds(self):
+    def test_capacity_read_tracks_holds(self):
         from test_unified_capacity_memo import _build
 
         from sglang.test.unified_allocator_fixtures import setup_allocator_context
@@ -67,17 +65,14 @@ class TestHostGateCapacity(unittest.TestCase):
         inst, allocator, kvcache = _build(lazy=True)
         ids = inst._alloc(allocator, kvcache, 8)
         allocator.free_swa(ids[2:6])
-        full = allocator.full_attn_allocator
-        before = full.schedulable_available_size()
+        before = allocator.full_available_size()
         hold_every_band(allocator)
-        self.assertEqual(full.schedulable_available_size(), full.available_size())
-        self.assertGreater(before, full.schedulable_available_size())
-        self.assertFalse(
-            ends_compaction_allowed(chain_snapshot(allocator), token_ends(allocator))
-        )
+        # A held band's holes cannot be compacted away: the read drops.
+        self.assertGreater(before, allocator.full_available_size())
+        self.assertTrue(any(band.blocked for band in chain_snapshot(allocator).bands))
         self.assertEqual(allocator.verify_byte_accounting(), [])
         release_every_band(allocator)
-        self.assertEqual(full.schedulable_available_size(), before)
+        self.assertEqual(allocator.full_available_size(), before)
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
@@ -231,78 +226,62 @@ class TestDirectBackendTranslation(unittest.TestCase):
 
 class TestTriPoolAssembly(CustomTestCase):
     def test_swa_allocation_and_rollback_match_pool_id_ownership(self):
+        """A static SWA stack loads and rolls back through the same allocator.
+        A unified pool's window loads go through its storage instead
+        (`KVStorage.host_load_alloc`, physical reservations bound before the
+        copy), which the load-back tests cover."""
         from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler as assembler
-        from sglang.srt.mem_cache.kv.alloc.band import (
-            Band,
-        )
 
-        for unified in (False, True):
-            with self.subTest(unified=unified):
-                # Unified memory always builds a Band SWA end.
-                swa_allocator = (
-                    object.__new__(Band)
-                    if unified
-                    else SimpleNamespace(alloc=Mock(), free=Mock())
-                )
-                composite = SimpleNamespace(
-                    swa_attn_allocator=swa_allocator,
-                    state_slots=SimpleNamespace(alloc=Mock(), free=Mock()),
-                )
-                params = SimpleNamespace(
-                    page_size=1,
-                    mtp_draft_device_pools=(),
-                    mtp_draft_mamba_pools=(),
-                    token_to_kv_pool_allocator=composite,
-                    tp_cache_group=None,
-                    attn_cp_cache_group=None,
-                    attn_tp_cache_group=None,
-                    pp_cache_group=None,
-                )
-                memory = MagicMock(enable_unified_memory=unified, hicache_size=0)
-                host = MagicMock()
-                with (
-                    patch.object(assembler, "get_memory", return_value=memory),
-                    patch.object(
-                        assembler, "_get_allocator_type", return_value="default"
-                    ),
-                    patch.object(assembler, "build_kv_host_pool", return_value=host),
-                    patch.object(assembler, "build_mamba_host_pool", return_value=host),
-                    patch.object(assembler, "HybridCacheController"),
-                ):
-                    group, _ = assembler.build_hybrid_mamba_swa_stack(
-                        params=params,
-                        full_kv_pool=object(),
-                        swa_kv_pool=object(),
-                        mamba_pool=SimpleNamespace(
-                            get_device_pool_infos=lambda: (
-                                DevicePoolInfo(
-                                    pool_name=PoolName.MAMBA,
-                                    indices_from_pool=PoolName.MAMBA,
-                                    layer_ids=(2,),
-                                    buffer_info=MambaStateBufferInfo(
-                                        temporal=torch.zeros(1, 2, 1),
-                                        conv=(torch.zeros(1, 2, 1),),
-                                    ),
-                                ),
-                            )
+        swa_allocator = SimpleNamespace(alloc=Mock(), free=Mock())
+        composite = SimpleNamespace(
+            swa_attn_allocator=swa_allocator,
+            state_slots=SimpleNamespace(alloc=Mock(), free=Mock()),
+        )
+        params = SimpleNamespace(
+            page_size=1,
+            mtp_draft_device_pools=(),
+            mtp_draft_mamba_pools=(),
+            token_to_kv_pool_allocator=composite,
+            tp_cache_group=None,
+            attn_cp_cache_group=None,
+            attn_tp_cache_group=None,
+            pp_cache_group=None,
+        )
+        memory = MagicMock(enable_unified_memory=False, hicache_size=0)
+        host = MagicMock()
+        with (
+            patch.object(assembler, "get_memory", return_value=memory),
+            patch.object(assembler, "_get_allocator_type", return_value="default"),
+            patch.object(assembler, "build_kv_host_pool", return_value=host),
+            patch.object(assembler, "build_mamba_host_pool", return_value=host),
+            patch.object(assembler, "HybridCacheController"),
+        ):
+            group, _ = assembler.build_hybrid_mamba_swa_stack(
+                params=params,
+                full_kv_pool=object(),
+                swa_kv_pool=object(),
+                mamba_pool=SimpleNamespace(
+                    get_device_pool_infos=lambda: (
+                        DevicePoolInfo(
+                            pool_name=PoolName.MAMBA,
+                            indices_from_pool=PoolName.MAMBA,
+                            layer_ids=(2,),
+                            buffer_info=MambaStateBufferInfo(
+                                temporal=torch.zeros(1, 2, 1),
+                                conv=(torch.zeros(1, 2, 1),),
+                            ),
                         ),
-                        full_layer_mapping={0: 0},
-                        swa_layer_mapping={1: 0},
-                        start_layer=0,
-                        load_cache_event=None,
-                        storage_backend=None,
                     )
-                entry = group.entry_map[PoolName.SWA]
-                if unified:
-                    self.assertEqual(
-                        entry.device_alloc_fn, swa_allocator.alloc_physical
-                    )
-                    self.assertEqual(
-                        entry.device_free_fn, swa_allocator.cancel_physical_reservation
-                    )
-                else:
-                    self.assertIs(entry.device_alloc_fn, swa_allocator.alloc)
-                    self.assertIs(entry.device_free_fn, swa_allocator.free)
+                ),
+                full_layer_mapping={0: 0},
+                swa_layer_mapping={1: 0},
+                start_layer=0,
+                load_cache_event=None,
+                storage_backend=None,
+            )
+        entry = group.entry_map[PoolName.SWA]
+        self.assertIs(entry.device_alloc_fn, swa_allocator.alloc)
+        self.assertIs(entry.device_free_fn, swa_allocator.free)
 
 
 if __name__ == "__main__":

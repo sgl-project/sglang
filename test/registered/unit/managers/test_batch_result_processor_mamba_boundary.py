@@ -15,7 +15,14 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
 from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.mem_cache.allocation import alloc_tracking_slots
 from sglang.srt.mem_cache.kv.advance import advance_tracking
+from sglang.srt.mem_cache.kv.plan import TREE_STATE, TREE_TOKEN
+from sglang.srt.mem_cache.unified_cache.components import (
+    BASE_COMPONENT_TYPE,
+    ComponentType,
+)
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -346,9 +353,9 @@ class TestMambaLazyBoundaryWithoutSlot(unittest.TestCase):
                 batch.tree_cache = SimpleNamespace(
                     page_size=TRACK_INTERVAL,
                     supports_mamba=lambda: True,
-                    evict_for_alloc=lambda params: (
-                        evicted.append(params.mamba_num),
-                        free_slots.extend([True] * params.mamba_num),
+                    evict_for_alloc=lambda demand: (
+                        evicted.append(demand.state_slots),
+                        free_slots.extend([True] * demand.state_slots),
                     ),
                 )
                 if spec:
@@ -359,6 +366,65 @@ class TestMambaLazyBoundaryWithoutSlot(unittest.TestCase):
                     self.assertEqual(batch.mamba_track_mask_cpu, [True])
                     self.assertEqual(req.kv.mamba_next_track_idx, 1)
                 self.assertEqual(evicted, [1])
+
+
+class _StatePoolCache:
+    """A cache whose state pool is a pool of its own: `evict_for_alloc` takes
+    what an allocation needs in all and evicts its shortfall, by the real
+    conversion (`UnifiedRadixCache.evict_pool_shortfalls`)."""
+
+    evict_pool_shortfalls = UnifiedRadixCache.evict_pool_shortfalls
+    _demand_by_type = UnifiedRadixCache._demand_by_type
+
+    def __init__(self, free_slots, cached):
+        self.free_slots = free_slots
+        self.cached = cached
+        self.evicted = []
+        self.tree_components = (BASE_COMPONENT_TYPE, ComponentType.MAMBA)
+
+    def supports_mamba(self):
+        return True
+
+    def slot_id(self, kind):
+        if kind is TREE_TOKEN:
+            return BASE_COMPONENT_TYPE
+        return ComponentType.MAMBA if kind is TREE_STATE else None
+
+    def _window_sub_pools_by_slot(self):
+        return {}
+
+    def _pool_available(self, component_type):
+        if component_type == ComponentType.MAMBA:
+            return len(self.free_slots)
+        return 1 << 20
+
+    def _evict(self, params, *, demand):
+        n = min(params.mamba_num, self.cached)
+        self.cached -= n
+        self.evicted.append(n)
+        self.free_slots.extend([True] * n)
+
+    def evict_for_alloc(self, demand):
+        return self.evict_pool_shortfalls(demand)
+
+
+class TestTrackingSlotsAskTheWholeDemand(unittest.TestCase):
+    def test_some_slots_free_evicts_only_the_shortfall_and_takes_all(self):
+        """Four candidates, two slots free, cached states to evict: the
+        reclaim is asked for all four, evicts the two missing, and every
+        candidate gets a slot."""
+        free_slots = [True, True]
+        cache = _StatePoolCache(free_slots, cached=8)
+        storage = SimpleNamespace(
+            take_tracking_slot=lambda req, pos: bool(free_slots and free_slots.pop())
+        )
+        state = SimpleNamespace(
+            slots=SimpleNamespace(schedulable_available_size=lambda: len(free_slots))
+        )
+        candidates = [(object(), i) for i in range(4)]
+        taken = alloc_tracking_slots(storage, state, candidates, cache)
+        self.assertEqual(cache.evicted, [2])
+        self.assertEqual(taken, [True, True, True, True])
 
 
 if __name__ == "__main__":

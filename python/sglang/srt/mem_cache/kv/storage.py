@@ -9,7 +9,17 @@ code outside the KV package loops over them instead of naming a combination.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 import msgspec
 import torch
@@ -20,6 +30,7 @@ from sglang.srt.mem_cache.kv.advance import (
     coalesce_ranges,
     retire_window_rows,
 )
+from sglang.srt.mem_cache.kv.alloc.page_usage import Consumer
 from sglang.srt.mem_cache.kv.alloc.signals import (
     NetworkTransfer,
     NetworkWaiter,
@@ -41,6 +52,26 @@ from sglang.srt.mem_cache.kv.router import KVLayerRouter
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
+
+
+def window_tail_len(
+    seq_len: int, window: Optional[int], page_size: int, *, keep_insert_boundary: bool
+) -> int:
+    """The tokens of ``seq_len`` a window keeping ``window`` tokens holds live,
+    from a page boundary: what a decode preallocation binds of it and what a
+    peer sends of it. With ``keep_insert_boundary`` (a decode radix cache),
+    enough stays before the page-aligned insert boundary for the cached key
+    to contain a complete window; ``seq_len - 1`` is the last committed
+    position."""
+    if seq_len <= 0:
+        return max(seq_len, 0)
+    if window is None or window <= 0:
+        return seq_len
+    if keep_insert_boundary:
+        window_start = max(0, seq_len - 1 - max(window, page_size))
+    else:
+        window_start = max(0, seq_len - window)
+    return seq_len - window_start // page_size * page_size
 
 
 class StorageSubPool(msgspec.Struct, frozen=True, kw_only=True):
@@ -73,6 +104,16 @@ class ResumeUnits(msgspec.Struct, frozen=True, kw_only=True):
     unit_ids: torch.Tensor
     token_start: int
     token_boundary: int
+
+
+# Rows whose holder gives them back when its work ends: what a request under
+# memory pressure may wait for.
+_COUNTED = (RowState.ACTIVE, RowState.HELD)
+
+
+def _consumer(receive: bool) -> Consumer:
+    """Who writes taken pages first: a network receive, or the next forward."""
+    return Consumer.NETWORK_RECEIVE if receive else Consumer.FORWARD
 
 
 class KVStorage:
@@ -120,6 +161,9 @@ class KVStorage:
         self._window_reaches: Dict[str, int] = {}
         self._unstated_window: Optional[int] = None
         state = allocator.state
+        if state is not None and requests is not None:
+            # The memory clip prices a fresh request's state as acquire does.
+            allocator.fresh_request_state_slots = state.fresh_request_slots(requests)
         self._views: Dict[str, Any] = {}
         sub_pools = []
         for s in plan.owner_first():
@@ -142,6 +186,14 @@ class KVStorage:
                 )
             )
         self._sub_pools = tuple(sub_pools)
+        # The allocator prices each window by the tail a request keeps of it;
+        # a window the model does not state has none until it is bound.
+        if all(
+            s.lifetime.window is not None
+            for s in plan.sub_pools
+            if isinstance(s.lifetime, WindowLifetime)
+        ):
+            allocator.retained_windows = self.retained_window_lengths()
 
     def host_layout(self, name: str):
         """The sub-pool's host layout and persistent device buffers."""
@@ -212,13 +264,17 @@ class KVStorage:
         )
 
     def take_tokens(
-        self, num_tokens: int, *, make_room: Callable[[int], Any]
+        self,
+        num_tokens: int,
+        *,
+        make_room: Callable[[int], Any],
+        receive: bool = False,
     ) -> Optional[torch.Tensor]:
         """Owner token ids, one per token (page size 1); None when they do not
-        fit."""
+        fit. ``receive``: a network receive writes them first."""
 
         make_room(num_tokens)
-        return self._allocator.alloc(num_tokens)
+        return self._allocator.alloc(num_tokens, _consumer(receive))
 
     def take_extend(
         self,
@@ -231,19 +287,19 @@ class KVStorage:
         last_loc: torch.Tensor,
         num_tokens: int,
         make_room: Callable[[int], Any],
-        window_tail: Optional[int] = None,
-        stated_window_tails: Optional[Dict[str, int]] = None,
+        window_tails: Optional[Mapping[str, int]] = None,
         tree_cache=None,
         batch=None,
+        receive: bool = False,
     ) -> Optional[torch.Tensor]:
         """Owner token ids for ``[prefix_len, seq_len)`` of each request's
         ``rows`` entry, by page, continuing each request's last page from
-        ``last_loc``; None when they do not fit. With ``window_tail`` (one
-        request whose KV a peer sends), the target window binds pages for its
-        last ``window_tail`` tokens only, and each window of
-        `stated_window_lengths` for its own tail in ``stated_window_tails``.
-        ``tree_cache`` and ``batch`` are for pools that need the step's context
-        (static ones); a unified pool needs neither."""
+        ``last_loc``; None when they do not fit. With ``window_tails`` (one
+        request whose KV a peer sends; every window, by sub-pool), each
+        window binds pages for its own last tokens only. ``tree_cache`` and
+        ``batch`` are for pools that need the step's context (static ones);
+        a unified pool needs neither. ``receive``: a network receive writes
+        the pages first."""
         demand = self._allocator.get_extend_allocation_demand(
             prefix_lens_cpu,
             seq_lens_cpu,
@@ -253,7 +309,7 @@ class KVStorage:
         )
 
         make_room(demand)
-        if window_tail is not None:
+        if window_tails is not None:
             return self._allocator.alloc_extend_swa_tail(
                 prefix_lens=prefix_lens,
                 prefix_lens_cpu=prefix_lens_cpu,
@@ -261,8 +317,8 @@ class KVStorage:
                 seq_lens_cpu=seq_lens_cpu,
                 last_loc=last_loc,
                 extend_num_tokens=num_tokens,
-                swa_tail_len=window_tail,
-                window_tail_lens=stated_window_tails,
+                window_tail_lens=window_tails,
+                consumer=_consumer(receive),
             )
         return self._allocator.alloc_extend(
             prefix_lens,
@@ -271,6 +327,7 @@ class KVStorage:
             seq_lens_cpu,
             last_loc,
             num_tokens,
+            consumer=_consumer(receive),
         )
 
     def take_decode(
@@ -367,6 +424,28 @@ class KVStorage:
         retained document window) until `release_row`."""
         self.requests.hold(holder.kv.req_pool_idx)
 
+    def others_hold_rows(self, req: Optional[Req]) -> bool:
+        """Whether work other than ``req`` (None: no request) holds a row of
+        the request table: a running or waiting request, a sent request whose
+        transfer is in flight, a request of another pipeline microbatch, a PD
+        decode node's preallocated receive row, beam members, a retained
+        document window. Each gives its row and ids back when it ends, so
+        waiting for it can free memory; a parked row does not."""
+        table = self.requests
+        held = sum(table.count(state) for state in _COUNTED)
+        own = (
+            req is not None
+            and req.kv.req_pool_idx is not None
+            and table.state_of(req.kv.req_pool_idx) in _COUNTED
+        )
+        return held > int(own)
+
+    def only_parked_rows_held(self) -> bool:
+        """Whether parked rows are the only rows held: their memory comes back
+        only when their sessions close, so waiting for it makes no progress."""
+        parked = self.requests.count(RowState.PARKED)
+        return parked > 0 and not self.others_hold_rows(None)
+
     def take_rows(self, num_rows: int) -> Optional[List[int]]:
         """Rows bound to no request (beam search members); None when too few
         are free."""
@@ -402,8 +481,9 @@ class KVStorage:
         return self._allocator
 
     def available_units(self, sub_pool: str) -> int:
-        """Rows ``take_units`` can hand out without eviction."""
-        return self._band(sub_pool).available_size()
+        """Units ``take_units`` can hand out without eviction: the planner's
+        answer, which counts the room a relayout makes, as a take does."""
+        return self._allocator.units_available(sub_pool)
 
     def take_units(self, sub_pool: str, count: int) -> Optional[torch.Tensor]:
         """``count`` rows of ``sub_pool`` alone (a load the tree stages); None
@@ -710,11 +790,13 @@ class KVStorage:
         the model does not state (``sliding_window``)."""
         self._window_reaches = dict(reaches or {})
         self._unstated_window = sliding_window
+        self._allocator.retained_windows = self.retained_window_lengths()
 
     def retained_window_lengths(self) -> Dict[str, int]:
         """The tail a running request keeps of each window sub-pool, by name:
         the window its layers declare, widened by a reader reaching further
-        back. The prefix tree retains, backs up and restores this much."""
+        back. The prefix tree retains, backs up and restores this much, a PD
+        peer sends it, and a decode node binds and receives it."""
         lengths = self._retained_lengths()
         for s in self._plan.sub_pools:
             if isinstance(s.lifetime, WindowLifetime) and s.name not in lengths:
@@ -735,13 +817,17 @@ class KVStorage:
                     lengths[s.name] = max(window, self._window_reaches.get(s.name, 0))
         return lengths
 
-    def stated_window_lengths(self) -> Dict[str, Tuple[int, str]]:
-        """Window sub-pools whose lifetime states the tokens they retain, by
-        name: (retained tokens, tree component)."""
+    def window_tails(
+        self, seq_len: int, *, keep_insert_boundary: bool
+    ) -> Dict[str, int]:
+        """The tail of ``seq_len`` tokens each window sub-pool keeps live, by
+        name (`window_tail_len` over its retained length)."""
+        page_size = self._allocator.page_size
         return {
-            s.name: (s.lifetime.window, s.external.tree_component)
-            for s in self._plan.sub_pools
-            if isinstance(s.lifetime, WindowLifetime) and s.lifetime.window is not None
+            name: window_tail_len(
+                seq_len, window, page_size, keep_insert_boundary=keep_insert_boundary
+            )
+            for name, window in self.retained_window_lengths().items()
         }
 
     def resume_units(
@@ -751,8 +837,10 @@ class KVStorage:
         *,
         token_start: int,
         token_boundary: int,
-        window: Optional[int] = None,
     ) -> ResumeUnits:
+        """The units of ``sub_pool`` a peer continues ``req`` from. A window
+        sends the tail a running request keeps of it
+        (`retained_window_lengths`)."""
         if not 0 <= token_start <= token_boundary:
             raise ValueError("invalid continuation token span")
         planned = self._plan.sub_pool(sub_pool)
@@ -773,11 +861,7 @@ class KVStorage:
             )
         begin = token_start
         if isinstance(planned.lifetime, WindowLifetime):
-            retained = planned.lifetime.window
-            if retained is None:
-                retained = window
-            if retained is None:
-                raise ValueError("window handoff requires its retention length")
+            retained = self.retained_window_lengths()[sub_pool]
             begin = max(begin, token_boundary - retained)
         begin = begin // planned.unit * planned.unit
         tokens = self.requests.req_to_token[req.kv.req_pool_idx, begin:token_boundary]
@@ -832,15 +916,6 @@ class KVStorage:
                 view.kv_cache_layout if isinstance(spec, MHASubPoolSpec) else None
             ),
         )
-
-    def device_room(self, sub_pool: str) -> int:
-        """Free units a host load can take in the sub-pool now."""
-        if sub_pool in self._allocator.window_allocators:
-            return self._allocator.window_allocators[
-                sub_pool
-            ].schedulable_available_size()
-        assert sub_pool == self._allocator.roles.state, sub_pool
-        return self._allocator.state_slots.schedulable_available_size()
 
     def host_ids(
         self, sub_pool: str
@@ -918,10 +993,11 @@ class KVStorage:
         """Record one send (or with ``writes`` one receive) a network engine
         runs for ``req`` outside every stream: it reads (writes) the owner's
         physical ``pages`` of ``page_size`` tokens and each ``(sub_pool,
-        slots)`` of ``states`` until it ends. The rows may still move: a copy of
-        a row the engine writes, or a reuse of the bytes a moved row it reads
-        leaves, waits on the host for the transfer (`set_network_waiter`, which
-        judges it by ``peer``). Every one of the request's transfers ends with
+        slots)`` of ``states`` until it ends. The rows may still move. A relief
+        keeps them in place when it can; when it cannot, a copy of a row the
+        engine writes, or a reuse of the bytes a moved row it reads leaves,
+        waits on the host for the transfer (`set_network_waiter`, which judges
+        it by ``peer``). Every one of the request's transfers ends with
         `end_network_transfer`. ``pages`` and ``slots`` may be device tensors
         the schedule stream produced."""
         transfer = NetworkTransfer(peer)
@@ -953,13 +1029,15 @@ class KVStorage:
         """A decode node took ``req``'s receive rows (its tokens
         ``[token_start, token_end)``, every window's rows among them, and its
         state slots) and will publish their physical ids to the peer later,
-        reading them back off the schedule stream. Until `end_receive_hold` an
-        opportunistic compaction leaves their bands alone. A move an
-        allocation needs may still move them, waiting for nothing, since no
-        peer has their ids yet: it bumps `move_epoch`, and the publish orders
-        its readback after the schedule stream. ``signal`` is the allocation's
-        event. The rows are recorded by id, so nothing pays a device read for
-        them."""
+        reading them back off the schedule stream. Until `end_receive_hold`
+        the rows count as rows a network transfer writes: a relief keeps them
+        in place whenever a layout serves its demand that way, and an
+        opportunistic compaction stops at them. If a relief must move them
+        anyway, the move bumps `move_epoch` and the publish orders its
+        readback after the schedule stream. ``signal`` is the allocation's
+        event. The rows are recorded by id and resolved only when a relief
+        reads them, before its first wait, so nothing else pays a device
+        read for them."""
         release = ReceiveHold()
         self._receive_holds[_lifetime(req)] = (req, release)
         tokens = self.requests.req_to_token[req.kv.req_pool_idx, token_start:token_end]
@@ -1053,10 +1131,10 @@ class KVStorage:
 
     def move_epoch(self) -> int:
         """How many page-move batches may have moved a held receive row (see
-        `hold_receive_rows`): ones issued while a hold was open. A held row's
-        ids, resolved on another stream, stay valid while it is unchanged;
-        after such a move the reader must order itself after the schedule
-        stream."""
+        `hold_receive_rows`): ones issued while a hold was open and not fixed
+        in place. A held row's ids, resolved on another stream, stay valid
+        while it is unchanged; after such a move the reader must order itself
+        after the schedule stream."""
         return sum(band.held_row_moves for band in self._allocator.bands)
 
     def retire_forward(self, forward_done: torch.cuda.Event) -> None:
@@ -1064,6 +1142,13 @@ class KVStorage:
         ``forward_done``: it and every forward recorded before it retire. Page
         moves decide from retirement, the same point on every rank."""
         self._allocator.retire_forward(forward_done)
+
+    def owner_load_alloc(self) -> Tuple[Callable[[int], Any], Callable[[Any], Any]]:
+        """How a host load takes the owner's token ids it loads into, and gives
+        back the ones it did not use: from the owner's band, where the tree
+        made room for the load before it."""
+        owner = self._allocator.full_attn_allocator
+        return owner.alloc, owner.free
 
     def host_load_alloc(
         self, sub_pool: str

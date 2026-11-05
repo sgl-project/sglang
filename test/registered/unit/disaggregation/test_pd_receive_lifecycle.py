@@ -3,25 +3,38 @@
 Both PD queues install a network-transfer waiter on the pool's storage at
 construction, static pools included; and the decode queue's judgement of a
 failed receive, which the waiter MIN-reduces across ranks every round, stays
-done once its release timeout has passed. Unified memory refuses staging
-buffers at startup.
+done once its release timeout has passed. A receive preallocation takes its
+pages for the network receive that writes them first. Unified memory refuses
+staging buffers at startup.
 """
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from sglang.srt.disaggregation.base import KVPoll
-from sglang.srt.disaggregation.decode import DecodeRequest, DecodeTransferQueue
+from sglang.srt.disaggregation.decode import (
+    DecodeRequest,
+    DecodeTransferQueue,
+    alloc_for_decode_prealloc,
+)
 from sglang.srt.disaggregation.utils import NetworkTransferWaiter
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     ListKind,
 )
+from sglang.srt.mem_cache.kv.alloc.band import Band
+from sglang.srt.mem_cache.kv.alloc.page_usage import Consumer
 from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage, kv_storage_of
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.scheduler_test_utils import FakeReq
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.unified_allocator_fixtures import (
+    UnifiedGeometry,
+    build_unified_bundle,
+    setup_allocator_context,
+)
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -103,6 +116,55 @@ class TestReceiveTimeoutStaysDone(CustomTestCase):
                     # Done stays done until the release.
                     self.assertEqual(flags, [True, True], now[0])
         self.assertEqual(agreed_at, 11.0)
+
+
+class TestReceivePreallocationConsumer(CustomTestCase):
+    def test_a_receive_preallocation_takes_its_pages_for_the_receive(self):
+        """BUG REGRESSION. A decode preallocated a peer's KV rows as pages a
+        forward writes first, though the network receive does, ordered by no
+        stream: on a band that does not zero its pages, a forward still
+        touching them would not have been waited. Every band takes them for
+        the receive (`page_usage.CLEARANCE`)."""
+        setup_allocator_context()
+        allocator = build_unified_bundle(
+            UnifiedGeometry(
+                chain="swa", full_layer_ids=(0,), swa_layer_ids=(1,), device="cpu"
+            )
+        ).token_to_kv_pool_allocator
+        taken = []
+        acquire = Band.acquire
+
+        def recording_acquire(band, num_pages, consumer, **kwargs):
+            taken.append((band.sub_pool_name, consumer))
+            return acquire(band, num_pages, consumer, **kwargs)
+
+        fill_len = 8
+        with patch.object(Band, "acquire", recording_acquire):
+            kv_loc = alloc_for_decode_prealloc(
+                allocator.storage,
+                allocator,
+                req=MagicMock(kv=ReqKvInfo()),
+                fill_len=fill_len,
+                delta_len=fill_len,
+                prefix_len=0,
+                total_prefix_len=0,
+                prefix_indices=None,
+                uses_swa_tail=False,
+                window_tails=dict.fromkeys(allocator.window_pool_names(), fill_len),
+            )
+        self.assertEqual(kv_loc.numel(), fill_len)
+        self.assertEqual(
+            {name for name, _ in taken},
+            {band.sub_pool_name for band in allocator.bands},
+        )
+        self.assertEqual(
+            [
+                name
+                for name, consumer in taken
+                if consumer is not Consumer.NETWORK_RECEIVE
+            ],
+            [],
+        )
 
 
 class TestUnifiedMemoryRefusesStagingBuffers(CustomTestCase):

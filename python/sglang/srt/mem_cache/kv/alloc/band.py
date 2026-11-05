@@ -74,6 +74,7 @@ from sglang.srt.mem_cache.kv.alloc.signals import (
     TransferRelease,
     keys_of,
     signal_fired,
+    unreleased_transfers,
     wait_signals,
 )
 from sglang.srt.mem_cache.kv.memory.arena import KVArena
@@ -188,116 +189,6 @@ class _CapacityField(Generic[_T]):
     def __set__(self, obj, value: _T) -> None:
         obj.__dict__[self._name] = value
         obj._capacity_epoch += 1
-
-
-def _float_open_short_side(flt, demand) -> None:
-    """Float relocation policy, driven by a demand vector: pages per band, zero
-    for bands the operation does not touch. A grow-down end faces the float's
-    HIGH side, a grow-up end its LOW side; `make_room`'s `min_bytes` is a TARGET
-    for the whole band, so the ask is a total, never a delta.
-    """
-    if flt is not None:
-        # Recovery settled every band before deciding (`relieve_for_alloc`).
-        flt._assert_ready_for_geometry("a float's two-sided deficit")
-    if flt is None or flt._is_frontier_transparent():
-        return  # no float involved / empty float never blocks
-    if not any(pages > 0 for pages in demand.values()):
-        return  # nothing demanded -- nothing to open (also keeps slack's max() total)
-    for band_alloc, pages in demand.items():
-        if pages <= 0:
-            continue
-        index_room = (
-            band_alloc.num_pages
-            - band_alloc.min_page_index
-            - band_alloc._allocated_pages()
-        )
-        if pages > index_room:
-            return  # index space binds; bytes cannot fix this
-    sides = {"low": 0, "high": 0}
-    for band_alloc, pages in demand.items():
-        if band_alloc is flt or pages <= 0:
-            continue
-        # Holes, and pages pending until their step is processed: a take
-        # reaches those after a stream wait, without the float moving.
-        holes = band_alloc._reusable_pages() if band_alloc.lazy_compaction else 0
-        ext = max(0, pages - holes)
-        above = flt.high_peer
-        while above is not None and above is not band_alloc:
-            above = above.high_peer
-        side = "high" if above is band_alloc else "low"
-        sides[side] += ext * band_alloc.entry_bytes_per_page
-    band = {
-        "low": max(
-            0, flt._byte_low_frontier() - flt._chain_high_frontier_below_bytes()
-        ),
-        "high": max(
-            0, flt._chain_low_frontier_above_bytes() - flt._byte_high_frontier()
-        ),
-    }
-    surplus = {side: band[side] - sides[side] for side in ("low", "high")}
-    f_pages = demand.get(flt, 0)
-    f_bytes = max(0, f_pages - flt._reusable_pages()) * flt.entry_bytes_per_page
-
-    def open_side(side, raw_gap):
-        # The donor demand is measured from its raw frontier; make_room takes
-        # a gap measured from the float's aligned region boundary.
-        epp = flt.entry_bytes_per_page
-        lo, hi = flt._region_bounds_pages()
-        if side == "low":
-            frontier = flt._chain_high_frontier_below_bytes()
-            target = -(-(frontier + raw_gap) // epp)
-            gap = (target - lo) * epp
-        else:
-            frontier = flt._chain_low_frontier_above_bytes()
-            target = (frontier - raw_gap) // epp
-            gap = (hi - target) * epp
-        flt.make_room(side=side, min_bytes=max(0, gap))
-
-    if surplus["low"] < 0 and surplus["high"] < 0:
-        # One-sided relief does not jointly compact/reposition interior holes
-        # when both peer gaps are deficient. This is not an impossibility proof.
-        return
-    if surplus["low"] < 0 or surplus["high"] < 0:
-        short, far = ("low", "high") if surplus["low"] < 0 else ("high", "low")
-        target = sides[short] + max(0, f_bytes - max(0, surplus[far]))
-        if target > band[short]:
-            open_side(short, target)
-        return
-    if f_bytes > max(surplus.values()):
-        short = "low" if surplus["low"] >= surplus["high"] else "high"
-        open_side(short, sides[short] + f_bytes)
-
-
-def relieve_for_alloc(short_pool, need_tokens: int) -> bool:
-    """THE shortfall ladder: every allocation shortfall in the unified pool runs
-    exactly this, whether a single band's own alloc or the chain allocator's coupled
-    multi-band alloc. The urgent flush is called unconditionally -- an END compacts
-    and a FLOAT always has boundary absorption to do -- so the ladder never
-    branches on member kind or layout.
-    """
-    with settle_pending_for_recovery(_chain_members(short_pool)):
-        for m in short_pool._flush_targets():
-            m.flush_for_allocation()
-        if need_tokens <= short_pool.available_size():
-            return True
-        short_pool._ask_float_for_room(need_tokens)
-        return need_tokens <= short_pool.available_size()
-
-
-def _chain_members(pool) -> Tuple:
-    """The bands of ``pool``'s chain, low to high: a chain allocator's members,
-    or a band and every band chained to it."""
-    members = getattr(pool, "members", None)
-    if members is not None:
-        return tuple(members)
-    low = pool
-    while low.low_peer is not None:
-        low = low.low_peer
-    members = []
-    while low is not None:
-        members.append(low)
-        low = low.high_peer
-    return tuple(members)
 
 
 class _AllocatorOperation:
@@ -428,16 +319,6 @@ def _settled_for_recovery(bands, op):
             b._recovery_depth -= 1
 
 
-def _drains_on_urgent_flush(neighbor) -> bool:
-    """Whether an urgent flush of ``neighbor`` would release its holes; a blocked
-    neighbor cannot, so its holes earn no credit."""
-    return (
-        neighbor is not None
-        and neighbor.lazy_compaction
-        and not neighbor.moves_blocked()
-    )
-
-
 def flush_deferred_free_group(
     allocator,
     pending_groups: Sequence[Optional[Sequence[torch.Tensor]]],
@@ -447,27 +328,6 @@ def flush_deferred_free_group(
         return
     allocator.free_group_end()
     allocator.free_group_begin()
-
-
-def full_tokens_before_mamba_recheck(
-    full_allocator: Band,
-    mamba_allocator: Band,
-    target_size: int,
-) -> int:
-    """Conservative Full-token lower bound for the next Mamba capacity check.
-
-    The current Mamba slot count can hide at most one slot minus one byte of
-    residual room. Subtract that possible residue so this estimate only skips
-    checks that cannot succeed from Full bytes alone. Allocator capacity remains
-    the stop condition after the bound is crossed.
-    """
-    missing_slots = max(0, target_size - mamba_allocator.schedulable_available_size())
-    if missing_slots == 0:
-        return 0
-    mamba_page_bytes = mamba_allocator.entry_bytes_per_page
-    minimum_missing_bytes = (missing_slots - 1) * mamba_page_bytes + 1
-    dcp_size = get_parallel().attn_dcp_size if full_allocator.shards_under_dcp else 1
-    return -(-minimum_missing_bytes * dcp_size // full_allocator.entry_bytes)
 
 
 def _span_growth(before: Tuple[int, int], after: Tuple[int, int]) -> List[int]:
@@ -595,7 +455,7 @@ class Band:
 
         # --- Lazy compaction state ---
         # An end compacts lazily, behind the forwards that may still read the
-        # pages it moves; a float moves only on demand (`FloatBand.make_room`).
+        # pages it moves; a float moves only when a planned layout relocates it.
         assert lazy_compaction or band.grow_direction == "float", (
             f"Band({sub_pool_name!r}): an end band compacts lazily"
         )
@@ -620,8 +480,10 @@ class Band:
         # them (`PageUsage`).
         self.usage = PageUsage()
         # Move batches that may have moved a held receive row (one issued
-        # while a hold is open).
+        # while a hold is open and not fixed in place), and whether a relief
+        # has the held rows fixed now.
         self.held_row_moves = 0
+        self.holds_fixed = False
         # Cumulative observability counters (NOT reset at clear()).
         self._stats_n_free_lazy: int = 0
         self._stats_n_release_batch: int = 0
@@ -658,13 +520,10 @@ class Band:
         )
         self._move_max_pages = min(max_pages_per_move, self.num_pages)
 
-        # Epoch-keyed memos for the capacity views: pure between mutations, but
-        # schedulers read them O(queue) times per step.
+        # Epoch-keyed memo for the capacity view: pure between mutations, but
+        # schedulers read it O(queue) times per step.
         self._avail_memo_epoch: Optional[int] = None
         self._avail_memo_tokens: int = 0
-        self._sched_avail_memo_key: Optional[tuple] = None
-        self._sched_avail_memo_tokens: int = 0
-        self._credit_neighbors_memo: Optional[tuple] = None
 
         self.clear()
 
@@ -803,9 +662,9 @@ class Band:
 
     def _assert_ready_for_geometry(self, where: str) -> None:
         """Layout-changing geometry decides on holes and live pages only: the
-        band holds no pending page and its free list's host copy matches it (an
-        urgent recovery's entry made both true). Checked at invariant level
-        WARN and up."""
+        band holds no pending page and, inside an urgent recovery, its free
+        list's host copy matches it (the recovery's entry made both true).
+        Checked at invariant level WARN and up."""
         if resolve_level() < InvariantCheckLevel.WARN:
             return
         if self._pending_until_retire:
@@ -814,7 +673,7 @@ class Band:
                 f"{self._pending_until_retire_pages} pages pending until their "
                 "step is processed"
             )
-        if not self._free_pages_host_known():
+        if self._recovery_depth and not self._free_pages_host_known():
             raise AssertionError(
                 f"{self.sub_pool_name}: {where} with no host copy of its free list"
             )
@@ -917,8 +776,9 @@ class Band:
 
     def _read_ahead(self) -> None:
         """Read on the host, now, everything a flush, a relocation or a take of
-        this band reads from the device: the free list, and the pages
-        unfinished forwards write and live transfers touch. The copies stay
+        this band reads from the device: the free list, the pages pending until
+        their step is processed, and the pages unfinished forwards write and
+        live transfers (held receive rows included) touch. The copies stay
         valid until what they copy changes: a move updates them on the host
         (`_note_moved`), a free without host ids drops the free list's, and a
         use recorded later is read when it is first needed. A use whose ids
@@ -926,6 +786,10 @@ class Band:
         self.usage.prune()
         self._inflight_write_sets()
         self._transfer_page_sets()
+        # Held receive rows, which a relief reads (`network_rows`).
+        for use in self.usage.transfers():
+            if isinstance(use.release, ReceiveHold) and not use.release.released:
+                self._use_physical_pages(use)
         self._free_pages_snapshot()
         self._pending_host_snapshot()
 
@@ -1056,16 +920,6 @@ class Band:
                     f"[{self.sub_pool_name}] stale available_size memo: "
                     f"cached={self._avail_memo_tokens}, actual={actual}"
                 )
-        if self._sched_avail_memo_key == self._schedulable_capacity_key():
-            actual = self._available_tokens(
-                extra_gap_bytes=self._peer_drainable_hole_bytes()
-            )
-            if self._sched_avail_memo_tokens != actual:
-                out.append(
-                    f"[{self.sub_pool_name}] stale schedulable_available_size "
-                    f"memo: cached={self._sched_avail_memo_tokens}, "
-                    f"actual={actual}"
-                )
         return out
 
     def _byte_low_frontier(self) -> int:
@@ -1117,14 +971,6 @@ class Band:
             p = p.high_peer
         return total
 
-    def _growth_side_neighbor(self) -> Optional[Band]:
-        """Nearest NON-transparent chain member on this pool's GROWTH side -- the
-        one whose compaction releases bytes reachable at this pool's frontier."""
-        p = self.high_peer if self.grow_direction == "up" else self.low_peer
-        while p is not None and p._is_frontier_transparent():
-            p = p.high_peer if self.grow_direction == "up" else p.low_peer
-        return p
-
     def _current_gap_bytes(self) -> int:
         """Free byte band between this side's frontier and the nearest
         non-transparent chain frontier (2-pool: the peer's, byte-identical)."""
@@ -1136,13 +982,9 @@ class Band:
             0, self._byte_low_frontier() - self._chain_high_frontier_below_bytes()
         )
 
-    def _available_tokens(self, extra_gap_bytes: int = 0) -> int:
-        """Tokens allocatable given `extra_gap_bytes` of ADDED gap room
-        (0 == current realizable; >0 == post-peer-compaction). Own index headroom
-        is unaffected by `extra_gap_bytes`: peer bytes add no page indices here.
-        """
-        gap_bytes = self._current_gap_bytes() + extra_gap_bytes
-        pages_by_bytes = gap_bytes // self.entry_bytes_per_page
+    def _available_tokens(self) -> int:
+        """Tokens this band alone can take in place, its neighbours unmoved."""
+        pages_by_bytes = self._current_gap_bytes() // self.entry_bytes_per_page
         pages_by_index_space = (
             self.num_pages - self.min_page_index - self._allocated_pages()
         )
@@ -1152,29 +994,15 @@ class Band:
         return (pages_extend + pages_drain) * self.page_size
 
     def available_size(self) -> int:
-        """Tokens allocatable RIGHT NOW (no peer compaction).
-
-        Alloc shortfall gates consult this, so it MUST NOT fold in peer holes; use
-        `schedulable_available_size()` for that. Memoized on the chain epoch.
-        """
+        """Tokens this band alone can take in place now, nothing in the chain
+        moved. What a take can serve with the chain laid out for it is the
+        chain allocator's read (`units_available`). Memoized on the chain
+        epoch."""
         epoch = self._chain_capacity_epoch()
         if self._avail_memo_epoch != epoch:
             self._avail_memo_tokens = self._available_tokens()
             self._avail_memo_epoch = epoch
         return self.cap_available(self._avail_memo_tokens)
-
-    def _peer_drainable_hole_bytes(self) -> int:
-        """Gap bytes an urgent flush of the growth-side chain neighbor would
-        release. `_free_phys_pages` counts, and the pages pending until their
-        step is processed, which an urgent flush settles after a stream wait; NOT the
-        vacated sources, which await their readers -- so the credit is
-        realizable.
-        """
-        neighbor = self._growth_side_neighbor()
-        if not _drains_on_urgent_flush(neighbor):
-            return 0
-        # Pages pending until their step is processed drain too, after a stream wait.
-        return neighbor._reusable_pages() * neighbor.entry_bytes_per_page
 
     def moves_blocked(self) -> bool:
         """Whether a fixed page forbids relocating pages, for the paths that
@@ -1205,53 +1033,21 @@ class Band:
         pages = self.fixed_pages()
         return (min(pages), max(pages) + 1) if pages else None
 
-    def _credit_neighbors(self) -> tuple:
-        """Chain members whose holes `schedulable_available_size` credits. Which
-        members these are depends only on epoch-tracked state."""
-        return (self._growth_side_neighbor(),)
+    # The chain allocator this band is a member of, set when it joins one.
+    chain_allocator = None
 
-    def _schedulable_capacity_key(self) -> tuple:
-        """Chain epoch plus each credited neighbor's drain state: gates flip with
-        no allocator write, so the epoch alone misses them."""
-        epoch = self._chain_capacity_epoch()
-        m = self._credit_neighbors_memo
-        if m is None or m[0] != epoch:
-            m = self._credit_neighbors_memo = (epoch, self._credit_neighbors())
-        (neighbor,) = m[1]
-        return epoch, _drains_on_urgent_flush(neighbor)
-
-    def _schedulable_physical_tokens(self) -> int:
-        """Physical room after neighbor flush, before the owner token quota."""
-        key = self._schedulable_capacity_key()
-        if self._sched_avail_memo_key != key:
-            self._sched_avail_memo_tokens = self._available_tokens(
-                extra_gap_bytes=self._peer_drainable_hole_bytes()
-            )
-            self._sched_avail_memo_key = key
-        return self._sched_avail_memo_tokens
-
-    def schedulable_available_size(self) -> int:
-        """Tokens allocatable after flushing a neighbor, including reclaimable holes.
-
-        Allocation checks use available_size(). Cache by capacity and gate state.
-        """
-        return self.cap_available(self._schedulable_physical_tokens())
-
-    def _flush_targets(self):
-        """A band short on its OWN alloc asks only its growth-side neighbour to
-        flush. Never itself: own compaction trades one hole for one gap byte (net
-        zero); only a NEIGHBOUR's compaction releases into the shared gap.
-        """
-        neighbor = self._growth_side_neighbor()
-        return () if neighbor is None else (neighbor,)
-
-    def _ask_float_for_room(self, need_tokens: int) -> None:
-        """A band short on its OWN pages asks the growth-side member, if it is a
-        float, to open the side facing it; the policy is `_float_open_short_side`."""
-        blocker = self._growth_side_neighbor()
-        if not isinstance(blocker, FloatBand):
-            return
-        _float_open_short_side(blocker, {self: -(-need_tokens // self.page_size)})
+    @_band_operation
+    def relieve(self, need_tokens: int) -> bool:
+        """A take of ``need_tokens`` of this band alone is short where the band
+        stands: have the chain lay itself out for it, by the planner's least
+        rearrangement, and say whether it then fits in place."""
+        chain = self.chain_allocator
+        if chain is None:
+            return False
+        pages = -(-need_tokens // self.page_size)
+        if not chain.lay_out_for({self.sub_pool_name: pages}):
+            return False
+        return need_tokens <= self.available_size()
 
     # -- the one path that hands out writable pages --
 
@@ -1596,37 +1392,30 @@ class Band:
                 return None
             return self.acquire(num_pages, consumer)
 
+    def takes_at_frontier(self, take) -> bool:
+        """Whether a plan's ``take`` only extends this end's frontier, with no
+        hole to fill: `place_pages` then takes and binds the pages in one
+        kernel."""
+        return (
+            self.grow_direction != "float"
+            and not take.reuse
+            and self._free_phys_pages.numel() == 0
+        )
+
     @_band_operation
-    def take_planned_physical_pages(
+    def take_planned_pages(
         self, take, consumer: Consumer = Consumer.FORWARD
     ) -> Optional[torch.Tensor]:
-        """Apply a no-relief take only while its source geometry still holds:
-        ``take.pages`` pages for ``consumer`` (`acquire`)."""
-        from sglang.srt.mem_cache.kv.alloc.pricing import snapshot_band
-
-        current = snapshot_band(self)
-        if (
-            current.low_byte != take.low_byte
-            or current.high_byte != take.high_byte
-            or current.holes != take.holes
-            or current.live != take.live
-        ):
-            return None
-        if take.fresh is not None:
-            start, end = take.fresh
-            if (
-                start * self.entry_bytes_per_page
-                < self._chain_high_frontier_below_bytes()
-                or end * self.entry_bytes_per_page
-                > self._chain_low_frontier_above_bytes()
-            ):
-                return None
+        """Take a plan's pages for this band (a `PlanTake` of the current
+        snapshot): holes first, then pages pending until their step is
+        processed (the plan priced them with the holes), then the planned
+        extension; with none planned, a float never grows."""
         if self.grow_direction == "float":
             # Planned: with no fresh range the float never grows.
             return self.take_physical_pages(
-                take.pages, consumer, placement=take.fresh, planned=True
+                take.count(), consumer, placement=take.pages, planned=True
             )
-        return self.take_physical_pages(take.pages, consumer)
+        return self.take_physical_pages(take.count(), consumer)
 
     def _sorted_free_phys_pages(self) -> torch.Tensor:
         """`_free_phys_pages` in ascending order. Sorts on the device, and only
@@ -1711,9 +1500,9 @@ class Band:
     def alloc(
         self, need_size: int, consumer: Consumer = Consumer.FORWARD
     ) -> Optional[torch.Tensor]:
-        """Allocate `need_size` virtual TOKEN ids (id-owner only) for
-        ``consumer`` to write first (`acquire`). Returns token-granular,
-        page-structured ids, or None on shortfall.
+        """Allocate `need_size` virtual TOKEN ids (id-owner only), whose pages
+        ``consumer`` writes first (`acquire`). Returns
+        token-granular, page-structured ids, or None on shortfall.
 
         All allocator GPU ops run on `schedule_stream`; `alloc` needs no
         `wait_stream` barrier because its v2p/p2v writes are picked up by the
@@ -1730,10 +1519,8 @@ class Band:
                 f"Band({self.sub_pool_name!r}).alloc: need_size="
                 f"{need_size} must be a multiple of page_size={self.page_size}"
             )
-            if need_size > self.available_size():
-                # Shortfall: flush the PEER, not own -- see `_flush_targets`.
-                if not relieve_for_alloc(self, need_size):
-                    return None
+            if need_size > self.available_size() and not self.relieve(need_size):
+                return None
             num_pages = need_size // self.page_size
             if num_pages > len(self.free_virtual_ids):
                 return None
@@ -2044,7 +1831,7 @@ class Band:
     def _count_move_batch(self) -> None:
         """Count a page-move batch that may have moved a held receive row,
         on every path that rebinds moved pages."""
-        if self.usage.holds_receive_rows():
+        if not self.holds_fixed and self.usage.holds_receive_rows():
             # A held receive row may be among the pages moved.
             self.held_row_moves += 1
 
@@ -2217,7 +2004,7 @@ class Band:
         first. Pays a D2H sync per transfer; call it before any stream wait."""
         self.usage.prune()
         # Held receive rows: nothing touches them yet, so no copy or free
-        # waits on them.
+        # waits on them; only a relief resolves them (`network_rows`).
         transfers = [
             use
             for use in self.usage.transfers()
@@ -2240,6 +2027,7 @@ class Band:
         """The physical PAGE ids physical ``units`` of ``unit_tokens`` tokens
         cover. Reads a device tensor on the host (a stream sync)."""
         if isinstance(units, torch.Tensor):
+            self._check_host_read("pages of units")
             units = units.tolist()
         rows = self.pool_page_size
         return {
@@ -2323,11 +2111,78 @@ class Band:
             self._range_clearance(first, end, (Consumer.SCHEDULE_COPY,))
         )
 
+    def _wait_network_fences(self, first: int, end: int) -> None:
+        """Wait on the host for every unreleased network transfer whose fence
+        meets this band's pages ``[first, end)``: the bytes then hold nothing
+        for a layout to keep out of."""
+        lo, hi = first * self.entry_bytes_per_page, end * self.entry_bytes_per_page
+        transfers = {
+            id(transfer): transfer
+            for band in self._chain_bands()
+            for use in band.usage.network_fences(lo, hi)
+            for transfer in unreleased_transfers(use.signal)
+        }
+        if transfers:
+            self._wait_on_stream(tuple(transfers.values()))
+
     def _fenced(self, page: int) -> bool:
         """Whether an unfinished fence of the chain meets ``page``."""
         lo = page * self.entry_bytes_per_page
         hi = lo + self.entry_bytes_per_page
         return any(band.usage.fence_meets(lo, hi) for band in self._chain_bands())
+
+    # -- one relief: every host read before the first stream wait --
+
+    def held_pending_count(self) -> int:
+        """Pending pages that are fixed: they stay where they are and return
+        to the free list only later, so they count as occupied."""
+        pending = self.usage.pending_pages
+        if not pending or not self.usage.fixed:
+            return 0
+        return len(pending & self.fixed_pages())
+
+    def occupied_pages(self) -> int:
+        """Pages an urgent pass keeps: live pages, and pending pages that are
+        fixed."""
+        return self.live_page_count + self.held_pending_count()
+
+    def network_rows(self, transfer_sets=None) -> Set[int]:
+        """Pages of this band a network transfer reads or writes until its
+        logical release, and pages pending on such a release: the pages inside
+        the span that are not holes. Moving one, or reusing the bytes a move of
+        one leaves, waits on the host until the engine is done with it.
+        Decided from logical releases only, the same on every rank."""
+        if transfer_sets is None:
+            transfer_sets = self._transfer_page_sets()
+        rows: Set[int] = set()
+        for _, pages, _, release in transfer_sets:
+            if release is not None and not release.released:
+                rows.update(pages)
+        rows.update(self.usage.network_held_pending())
+        # Receive rows held for a publish still to come: by id until now, read
+        # once and kept current on the host as pages move.
+        for use in self.usage.transfers():
+            if isinstance(use.release, ReceiveHold) and not use.release.released:
+                rows.update(self._use_physical_pages(use))
+        # A send's page that an earlier last-resort move took beyond the
+        # frontier is no page of this band any more: its bytes stay fenced on
+        # the send, and the chain keeps layouts out of them while it reads
+        # (`network_held_bytes`). Rows recorded by controller id that this
+        # band does not bind (a window's rows outside its tail) translate to
+        # the reserved pages below the band, outside the span too.
+        first, end = self._span_range()
+        holes = set(self._free_pages_snapshot())
+        return {page for page in rows if first <= page < end and page not in holes}
+
+    def has_network_rows(self) -> bool:
+        """Whether a network transfer is unreleased on this band, or a page
+        pending on one: no device read."""
+        if self.usage.network_held_pending():
+            return True
+        return any(
+            use.release is not None and not use.release.released
+            for use in self.usage.transfers()
+        )
 
     def _maybe_emit_stats(self) -> None:
         """Env-gated periodic stats emit (at most once per interval) at `_flush` end.
@@ -3040,15 +2895,13 @@ class Band:
             return self._alloc_reserved(need_size)
 
     def _alloc_reserved(self, need_size: int) -> Optional[torch.Tensor]:
-        if need_size > self.available_size():
-            if not relieve_for_alloc(self, need_size):
-                return None
+        num_pages = need_size // self.page_size
+        if need_size > self.available_size() and not self.relieve(need_size):
+            return None
         # The host copy, kept since the read-ahead: no device read here.
         free_before = self._free_pages_snapshot(after_wait=True)
         span_before = self._span_range()
-        physical_pages = self.take_physical_pages(
-            need_size // self.page_size, Consumer.HOST_LOAD
-        )
+        physical_pages = self.take_physical_pages(num_pages, Consumer.HOST_LOAD)
         if physical_pages is None:
             return None
         # The pages taken: those the span grew by, and the holes that left the
@@ -3132,7 +2985,8 @@ class FloatBand(Band):
     the boundary on the side with the LARGER free gap, and from empty it positions
     the span at the MIDPOINT of the inter-frontier region so free gap exists on
     both sides and neighbor growth does not immediately force a data move. Data
-    moves happen only ON DEMAND, via ``make_room`` / ``compact_holes``. An EMPTY
+    moves happen only ON DEMAND, when the chain's planned layout relocates the
+    float (`relocate_into`). An EMPTY
     float (no live page and none fixed) resets its span and is
     frontier-transparent: it occupies no bytes and must never wall off free
     space. A fixed page keeps the span over it, free or not.
@@ -3246,52 +3100,8 @@ class FloatBand(Band):
 
     # -- availability --
 
-    def _side_neighbor(self, side: str) -> Optional[Band]:
-        """Nearest non-transparent member on ``side``."""
-        p = self.low_peer if side == "low" else self.high_peer
-        while p is not None and p._is_frontier_transparent():
-            p = p.low_peer if side == "low" else p.high_peer
-        return p
-
-    def _side_drainable_hole_bytes(self, side: str) -> int:
-        """Realizable gap bytes an urgent flush of the neighbour on ``side``
-        would release, walking past transparent members like the frontier walk.
-        """
-        p = self._side_neighbor(side)
-        if not _drains_on_urgent_flush(p):
-            return 0
-        return p._reusable_pages() * p.entry_bytes_per_page
-
-    def _peer_drainable_hole_bytes(self) -> int:
-        """The better of the two sides. `_growth_side_neighbor()` is undefined
-        for a float -- its `grow_direction` is "float", so the base answers
-        `low_peer` and never sees the high neighbour.
-        """
-        return max(
-            self._side_drainable_hole_bytes("low"),
-            self._side_drainable_hole_bytes("high"),
-        )
-
-    def _credit_neighbors(self) -> tuple:
-        return (self._side_neighbor("low"), self._side_neighbor("high"))
-
-    def _schedulable_capacity_key(self) -> tuple:
-        # One drain bit per side: `_available_tokens` credits each side on its own.
-        epoch = self._chain_capacity_epoch()
-        m = self._credit_neighbors_memo
-        if m is None or m[0] != epoch:
-            m = self._credit_neighbors_memo = (epoch, self._credit_neighbors())
-        low, high = m[1]
-        return epoch, _drains_on_urgent_flush(low), _drains_on_urgent_flush(high)
-
-    def _available_tokens(self, extra_gap_bytes: int = 0) -> int:
+    def _available_tokens(self) -> int:
         gap_low, gap_high = self._gap_pages()
-        if extra_gap_bytes > 0:
-            # Per side: the base hands down one undirected scalar because an
-            # END pool grows one way, but a float grows both.
-            epp = self.entry_bytes_per_page
-            gap_low += self._side_drainable_hole_bytes("low") // epp
-            gap_high += self._side_drainable_hole_bytes("high") // epp
         gap_pages = max(gap_low, gap_high)  # a single alloc extends ONE side
         pages_by_index_space = (
             self.num_pages - self.min_page_index - self._occupied_pages()
@@ -3511,8 +3321,8 @@ class FloatBand(Band):
         DEFERRED, not per-free: deciding how far to walk needs the hole set on the
         HOST, so this is the float's one D2H, and doing it per free put a host sync
         on the per-decode-step path. Callers place it where a sync is already free
-        (the per-step opportunistic flush) or already warranted (the head of the
-        shortfall ladder). Skipping it is only ever CONSERVATIVE: the span reads
+        (the per-step opportunistic flush) or already warranted (an urgent
+        flush). Skipping it is only ever CONSERVATIVE: the span reads
         wider than its live content, while `_live_pages()`, hence transparency and
         the byte-conservation identity, stay exact.
         """
@@ -3545,191 +3355,56 @@ class FloatBand(Band):
 
     # -- on-demand data movement --
 
-    def make_room(self, *, side: str, min_bytes: int) -> int:
-        """Open >= ``min_bytes`` of CONTIGUOUS free space between this pool's
-        ``side`` boundary and the region bound on that side, relocating the
-        minimum set of live boundary pages (holes-first destinations, then the far
-        gap). Returns the bytes now open on ``side``; a result < ``min_bytes``
-        means the ask is impossible now or movement is gated, and state is then
-        unchanged.
-        Scheduler-phase only; stream safety is owned HERE, not by the caller:
-        the copy waits only a forward that writes a moved page, and what may
-        still touch its destinations, after the plan and the write sets are
-        read on the host; the vacated pages are fenced. Moves
-        at most min(L_live, G) pages: every live page when the ask exceeds them.
-        """
-        assert side in ("low", "high"), f"side must be 'low'|'high'; got {side!r}"
-        epp = self.entry_bytes_per_page
-        gap_low, gap_high = self._gap_pages()
-        gap_side_bytes = (gap_low if side == "low" else gap_high) * epp
-        if self.moves_blocked() or gap_side_bytes >= min_bytes:
-            return gap_side_bytes
-        with settle_pending_for_recovery((self,)):
-            return self._make_room(side, min_bytes)
-
-    def _make_room(self, side: str, min_bytes: int) -> int:
-        # The recovery entry settled the float: the geometry sees holes and
-        # live pages only.
-        self._assert_ready_for_geometry("make_room")
-        epp = self.entry_bytes_per_page
-        gap_low, gap_high = self._gap_pages()
-        gap_side_bytes = (gap_low if side == "low" else gap_high) * epp
-        lo, hi = self._region_bounds_pages()
-        if gap_side_bytes >= min_bytes or self._is_frontier_transparent():
-            return gap_side_bytes
-
-        # Capacity: even packing every live page flush against the far side
-        # cannot open more than (region - live) bytes.
-        live = self._live_pages()
-        if (hi - lo - live) * epp < min_bytes:
-            return gap_side_bytes  # impossible now; untouched
-
-        need_pages = (min_bytes - gap_side_bytes + epp - 1) // epp
-
-        holes = set(self._free_pages_snapshot(after_wait=True))
-        span = range(self.low_wm_page, self.high_wm_page)
-        live_pages_sorted = [p for p in span if p not in holes]
-
-        if need_pages >= live:
-            # Pack only far enough to satisfy this side. Packing against the
-            # opposite edge would erase room reserved for that neighbour.
-            gap_pages = -(-min_bytes // epp)
-            if side == "high":
-                end = hi - gap_pages
-                final = list(range(end - live, end))
-            else:
-                start = lo + gap_pages
-                final = list(range(start, start + live))
-            self._relocate_to_positions(live_pages_sorted, final)
-            gap_low2, gap_high2 = self._gap_pages()
-            return (gap_low2 if side == "low" else gap_high2) * epp
-
-        # Boundary relocation (G < L_live):
-        # Sources: live pages nearest the demanded side, retreating inward.
-        if side == "high":
-            srcs = list(reversed(live_pages_sorted))[: min(need_pages, live)]
-        else:
-            srcs = live_pages_sorted[: min(need_pages, live)]
-        src_set = set(srcs)
-
-        # Strictly on the far side of EVERY source: keeps the batched move
-        # src/dst-disjoint and actually retreats the edge.
-        if side == "high":
-            usable_holes = sorted(h for h in holes if h < min(srcs))
-        else:
-            usable_holes = sorted((h for h in holes if h > max(srcs)), reverse=True)
-        dsts: List[int] = list(usable_holes[: len(srcs)])
-        n_fresh = len(srcs) - len(dsts)
-        if n_fresh > 0:
-            # Far-gap feasibility for the fresh destinations.
-            if side == "high":
-                if n_fresh > gap_low:
-                    return gap_side_bytes
-                dsts += list(
-                    range(self.low_wm_page - 1, self.low_wm_page - 1 - n_fresh, -1)
-                )
-            else:
-                if n_fresh > gap_high:
-                    return gap_side_bytes
-                dsts += list(range(self.high_wm_page, self.high_wm_page + n_fresh))
-
+    def relocate_into(self, first: int, end: int) -> int:
+        """Move this float into the page block ``[first, end)``: live pages
+        already inside stay, the others are copied to free pages of the block,
+        and the block's remaining pages become holes. The caller guarantees the
+        block holds every live page, contains every fixed page and meets no
+        other band. Returns pages moved."""
+        # The relief's recovery entry settled the float and read its free
+        # list (`ChainAllocator._relief`).
+        self._assert_ready_for_geometry("relocate_into")
+        holes = set(self._free_pages_snapshot(after_wait=bool(self._recovery_depth)))
+        live = [p for p in range(self.low_wm_page, self.high_wm_page) if p not in holes]
+        assert len(live) <= end - first, "the block cannot hold the live pages"
+        inside = {p for p in live if first <= p < end}
+        srcs = [p for p in live if p not in inside]
+        assert not set(srcs) & self.fixed_pages(), (
+            f"[{self.sub_pool_name}] the block [{first}, {end}) leaves a fixed "
+            "page behind"
+        )
+        # Not live, so never a source: one batched, disjoint move.
+        vacant = [p for p in range(first, end) if p not in inside]
+        dsts = vacant[: len(srcs)]
+        # Host reads before the first stream wait.
         if srcs:
-            # Host reads before the first stream wait.
             write_sets = self._inflight_write_sets()
             transfer_sets = self._transfer_page_sets()
-            # The copy writes ``dsts``: bytes a neighbour vacated may still be
-            # read there.
+        # Bytes of the block a network send still reads (a last-resort plan
+        # placed it there): wait for the send now, on the host, so that no
+        # hole of a span waits for one. A plan that can avoid them does.
+        self._wait_network_fences(first, end)
+        # The copy writes ``dsts``: bytes a neighbour vacated may still be read
+        # there. The block's other pages become holes; their fences stay for
+        # `acquire`, which clears them for whoever takes each one.
+        if srcs:
             self._clear_destinations(dsts)
             src_t, dst_t = self._to_device(srcs), self._to_device(dsts)
             self._wait_writers(srcs, write_sets, transfer_sets)
             self._move_pages_and_rebind(src_t, dst_t)
             self._note_moved(list(zip(srcs, dsts)))
             self.ids.physical_to_virtual.index_fill_(0, src_t, -1)
-            # The sources end outside the new span: the edge retreats past them.
+            # Every source lies outside the block, so outside the new span.
             for readers, group in self._reader_groups(srcs, transfer_sets):
                 self._fence_vacated(group, readers)
-
-        # Reconstruct the span from final live positions: everything between
-        # the extremes is span; non-live pages inside are holes.
-        final_live = sorted((set(live_pages_sorted) - src_set) | set(dsts))
-        self.low_wm_page = final_live[0]
-        self.high_wm_page = final_live[-1] + 1
-        final_live_set = set(final_live)
-        new_holes = [
-            p
-            for p in range(self.low_wm_page, self.high_wm_page)
-            if p not in final_live_set
-        ]
-        self._set_free_pages(self._to_device(new_holes), host=new_holes)
-        self._holes_dirty = True  # the span moved; re-check its boundaries
-        self._absorb_span_boundary_holes()
-
-        gap_low2, gap_high2 = self._gap_pages()
-        return (gap_low2 if side == "low" else gap_high2) * epp
-
-    def _relocate_to_positions(self, live_sorted: List[int], final: List[int]) -> int:
-        """Order-preserving relocation of the live pages onto the ``final``
-        positions (an ascending hole-free block). Batched disjoint move when
-        possible, else ORDERED singleton moves: by induction each destination is a
-        hole or an already-vacated source. Every destination not already live is
-        cleared first (`_clear_destinations`). Returns pages moved.
-        """
-        assert len(live_sorted) == len(final)
-        pairs = [(s, d) for s, d in zip(live_sorted, final) if s != d]
-        if pairs:
-            src_set = {s for s, _ in pairs}
-            dst_set = {d for _, d in pairs}
-            live_set = set(live_sorted)
-            vacant = sorted(d for d in dst_set if d not in live_set)
-            transfer_sets = self._transfer_page_sets()
-            if src_set.isdisjoint(dst_set):
-                # Host reads before the first stream wait.
-                write_sets = self._inflight_write_sets()
-                srcs = [s for s, _ in pairs]
-                src_t = self._to_device(srcs)
-                dst_t = self._to_device([d for _, d in pairs])
-                self._clear_destinations(vacant)
-                self._wait_writers(srcs, write_sets, transfer_sets)
-                self._move_pages_and_rebind(src_t, dst_t)
-                self._note_moved(pairs)
-                self.ids.physical_to_virtual.index_fill_(0, src_t, -1)
-                # Disjoint: every source lies outside the final block.
-                for readers, group in self._reader_groups(sorted(srcs), transfer_sets):
-                    self._fence_vacated(group, readers)
-            else:
-                # Interior packing can move pages in both directions. For an
-                # order-preserving mapping, leftward moves are safe in ascending
-                # source order and rightward moves in descending source order;
-                # the two groups cannot overwrite each other's unread sources.
-                ordered = [pair for pair in pairs if pair[1] < pair[0]] + [
-                    pair for pair in reversed(pairs) if pair[1] > pair[0]
-                ]
-                # Built ONCE: a copy per page in the loop is an H2D per page, and
-                # a shift can span the whole pool.
-                src_all = self._to_device([s for s, _ in ordered])
-                dst_all = self._to_device([d for _, d in ordered])
-                # Some destinations are sources vacated earlier in this pass, which
-                # a forward or a transfer may still read: wait every recorded
-                # forward, and every transfer touching a source.
-                self._clear_destinations(vacant)
-                self._settle_inflight_forward()
-                for signal, pages, _, _ in transfer_sets:
-                    if not src_set.isdisjoint(pages):
-                        self._wait_on_stream(signal)
-                for i in range(len(ordered)):
-                    s_t, d_t = src_all[i : i + 1], dst_all[i : i + 1]
-                    self._move_pages_and_rebind(s_t, d_t)
-                    self.ids.physical_to_virtual.index_fill_(0, s_t, -1)
-                self._note_moved(ordered)
-        if final:
-            self.low_wm_page = final[0]
-            self.high_wm_page = final[-1] + 1
-        else:
-            self._reset_watermarks()
+        kept = inside | set(dsts)
+        self.low_wm_page, self.high_wm_page = first, end
+        new_holes = [p for p in range(first, end) if p not in kept]
         self._set_free_pages(
             torch.empty(0, dtype=torch.int64, device=self.device), host=[]
         )
-        return len(pairs)
+        self.release(self._to_device(new_holes), Release.VACATED, host=new_holes)
+        return len(srcs)
 
     def _byte_accounting_violations(self) -> List[str]:
         out: List[str] = []
@@ -3764,8 +3439,9 @@ class FloatBand(Band):
     def _flush(self, *, urgent: bool) -> int:
         """Boundary absorption only -- never data movement. For a float the
         `_free_phys_pages` entries are INTERIOR HOLES, reusable assets by design,
-        not a compaction backlog; relocation happens on demand via `make_room` /
-        `compact_holes`. What a flush point buys is handing back unneeded span."""
+        not a compaction backlog; relocation happens on demand, when a planned
+        layout moves the float. What a flush point buys is handing back unneeded
+        span."""
         if urgent:
             self._assert_ready_for_geometry("an urgent span retreat")
         return self._absorb_span_boundary_holes()
@@ -3779,33 +3455,6 @@ class FloatBand(Band):
                 return 0
             with allocator_operation(self._chain_bands(), moves=True):
                 return self._flush(urgent=False)
-
-    def compact_holes(self, *, retreat_side: str) -> int:
-        """Close ALL interior holes by packing live pages toward the side
-        OPPOSITE ``retreat_side`` (order-preserving), shrinking the span on
-        ``retreat_side`` by the hole count. Returns pages moved."""
-        assert retreat_side in ("low", "high")
-        if self.moves_blocked() or (
-            self._hole_pages() == 0 and not self._pending_until_retire_pages
-        ):
-            return 0
-        with settle_pending_for_recovery((self,)):
-            self._assert_ready_for_geometry("compact_holes")
-            if self._is_frontier_transparent():
-                return 0  # settled and parked: nothing left to pack
-            # `_relocate_to_positions` orders its copies before their first write.
-            holes = set(self._free_pages_snapshot(after_wait=True))
-            return self._pack_live(holes, retreat_side)
-
-    def _pack_live(self, holes: Set[int], retreat_side: str) -> int:
-        live_sorted = [
-            p for p in range(self.low_wm_page, self.high_wm_page) if p not in holes
-        ]
-        if retreat_side == "high":
-            final = list(range(self.low_wm_page, self.low_wm_page + len(live_sorted)))
-        else:
-            final = list(range(self.high_wm_page - len(live_sorted), self.high_wm_page))
-        return self._relocate_to_positions(live_sorted, final)
 
     # -- band-incompatible base APIs --
 

@@ -68,7 +68,25 @@ def _draft_placement(decls, *, target_window, draft_window):
     ).placement
 
 
-def _storage(plan):
+def _storage(windows, *, device="cpu", lazy=True):
+    """A storage of the target's window ``windows[0]`` and, when given, a fused
+    draft's window ``windows[1]`` of another length."""
+    target, *drafts = windows
+    assert len(drafts) <= 1, "a draft adds at most one window"
+    decls = _decls(target)
+    placement = (
+        _draft_placement(decls, target_window=target, draft_window=drafts[0])
+        if drafts
+        else None
+    )
+    return _build(
+        plan_kv_storage(decls, page_size=4, fused_draft=placement),
+        device=device,
+        lazy=lazy,
+    )
+
+
+def _build(plan, *, device="cpu", lazy=True):
     setup_allocator_context()
     sized = size_plan(
         plan,
@@ -82,14 +100,14 @@ def _storage(plan):
         ),
     )
     ctx = UnifiedBuildContext(
-        device="cpu",
+        device=device,
         start_layer=0,
         end_layer=2,
         enable_memory_saver=False,
         need_sort=False,
         max_num_reqs=3,
         model_context_len=64,
-        lazy_compaction=True,
+        lazy_compaction=lazy,
     )
     return build_kv_storage(plan, sized, ctx)
 
@@ -207,7 +225,7 @@ class TestDraftWindowNames(CustomTestCase):
 
 class TestWindowRole(CustomTestCase):
     def test_the_sliding_window_role_finds_the_target_window(self):
-        storage = _storage(plan_kv_storage(_decls(16), page_size=4))
+        storage = _storage((16,))
         router = storage.allocator.get_kvcache().layer_router
         self.assertEqual(router.sub_pool(IdSpaceKind.SLIDING_WINDOW).name, "window_16")
         self.assertIs(router.view(IdSpaceKind.SLIDING_WINDOW), router.view("window_16"))
@@ -220,7 +238,7 @@ class TestWindowRole(CustomTestCase):
     def test_runner_ids_resolve_the_role_to_the_target_window(self):
         from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
 
-        storage = _storage(plan_kv_storage(_decls(16), page_size=4))
+        storage = _storage((16,))
         alloc = storage.allocator
         runner = RunnerIds(
             req_to_token=storage.requests.req_to_token,
@@ -255,7 +273,7 @@ class TestWindowRole(CustomTestCase):
                     decls, target_window=16, draft_window=draft_window
                 )
                 plan = plan_kv_storage(decls, page_size=4, fused_draft=placement)
-                storage = _storage(plan)
+                storage = _build(plan)
                 alloc = storage.allocator
                 pool = routed_draft_pool(
                     arena=alloc.arena,
