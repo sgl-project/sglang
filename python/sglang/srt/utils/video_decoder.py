@@ -84,11 +84,12 @@ class VideoDecoderWrapper:
             try:
                 with self._xpu_slot():
                     self._decoder = VideoDecoder(source, **kwargs)
-            except RuntimeError:
+            except RuntimeError as error:
                 if "device" in kwargs:
                     logger.warning(
-                        "%s video decoding failed, falling back to CPU.",
+                        "%s video decoding failed, falling back to CPU: %s",
                         kwargs["device"].upper(),
+                        error,
                     )
                     kwargs.pop("device")
                     self._tc_kwargs = kwargs
