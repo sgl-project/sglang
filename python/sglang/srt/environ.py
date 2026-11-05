@@ -427,9 +427,9 @@ class Envs:
     SGLANG_TEST_RETRACT = EnvBool(False)
     SGLANG_TEST_RETRACT_INTERVAL = EnvInt(3)
     SGLANG_TEST_RETRACT_NO_PREFILL_BS = EnvInt(2**31)
-    # Scheduler: force lazy extra_buffer prealloc to fail at decode boundaries
-    SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL = EnvBool(False)
-    # KL tests: skip the cache-hit count assertion (e.g. when alloc failure reduces hits)
+    # Scheduler: report the mamba state pool full to lazy tracking-slot alloc, so each boundary evicts first
+    SGLANG_TEST_MAMBA_LAZY_POOL_FULL = EnvBool(False)
+    # KL tests: skip the cache-hit count assertion (e.g. when eviction reduces hits)
     SGLANG_TEST_SKIP_CACHE_HIT_ASSERT = EnvBool(False)
     # HiCache: GPU sleep cycles before each layer's host-to-device load, so a forward
     # that skips the per-layer load wait reads unloaded layers
@@ -914,6 +914,12 @@ class Envs:
     # Staging buffer for heterogeneous TP KV transfer
     SGLANG_DISAGG_STAGING_BUFFER = EnvBool(False)
     SGLANG_DISAGG_STAGING_POOL_SIZE_MB = EnvInt(4096)
+    # Queue incoming KV scatters between forwards; disabled by default.
+    SGLANG_PLB_SCATTER_DEFER = EnvBool(False)
+    # Decode stream priority relative to background KV scatters.
+    SGLANG_PLB_STREAM_PRIORITY = EnvInt(0)
+    # 0: original kernel; >0: persistent CTAs; -1: one CTA per page.
+    SGLANG_PLB_SCATTER_CTAS = EnvInt(0)
     # TODO(yangminl): remove SGLANG_STAGING_USE_TORCH and the torch fallback in
     # staging_buffer.py once Triton kernels are fully validated in production.
     SGLANG_STAGING_USE_TORCH = EnvBool(False)
@@ -1262,6 +1268,8 @@ class Envs:
     SGLANG_MOE_NVFP4_DISPATCH = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE = EnvBool(False)
+    # Kill switch for fusing dense-MLP SiLU*mul with the NVFP4 down_proj input quant.
+    SGLANG_DISABLE_SILU_FP4_QUANT_FUSION = EnvBool(False)
     # GLM NextN (MTP): cast the draft layer's bf16 fused MoE to per-channel FP8
     # on load. Unrelated to the NVFP4 block-FP8 NextN path above.
     SGLANG_GLM_NEXTN_MOE_PTPC = EnvBool(False)
@@ -1413,6 +1421,9 @@ class Envs:
     # the batch fits the chunk budget.
     SGLANG_TRITON_DENSE_PREFILL_ATTN = EnvBool(True)
     SGLANG_ENABLE_TORCH_COMPILE = EnvBool(False)
+    SGLANG_TORCH_DYNAMIC_SHAPE = EnvBool(False)
+    # torch.compile backend for CPU graphs (defaults to "inductor"; "eager" or "aot_eager" for debugging)
+    SGLANG_CPU_GRAPH_COMPILE_BACKEND = EnvStr("inductor")
     SGLANG_TRITON_DECODE_SPLIT_TILE_SIZE = EnvInt(256)
 
     # ===================================================================
@@ -1546,6 +1557,11 @@ class Envs:
     # The [M*top_k, hidden] HBM round trip pays only at small M; 0 disables.
     # GLM-5.2 (H=6144): neutral at 192 on B300 TP8, crossover 192-223 on GB300 TP4.
     SGLANG_MOE_DEFERRED_FINALIZE_MAX_TOKENS = EnvInt(192)
+    # Let the CuTe DSL fused MoE finalize consume expert-parallel handoffs.
+    # Unset follows the NVIDIA runtime master; an explicit value wins.
+    SGLANG_OPT_CUTEDSL_EP_DEFERRED_FINALIZE = EnvBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
     # DeepSeek/GLM MoE (deepseek_v2.py): quantize the (dp-gathered) MoE input
     # to per-token-group-128 fp8 ONCE and feed both the fused shared-expert
     # GEMM (cutlass w8a8 linear) and the routed experts' triton fused runner,
@@ -1576,6 +1592,11 @@ class Envs:
     # and benchmarks at parity, so this is a consolidation escape hatch, not a perf flip.
     SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK = EnvBool(False)
     SGLANG_OPT_USE_TOPK_V2 = EnvBool(True)
+    # Exactness of the top-k v2 kernel, compiled in once per process: 0 fast (an
+    # overflowing threshold bin keeps an arbitrary subset; opt-in), 1 exact (values
+    # equal torch.topk's; the default on every platform), 2 exact with the same
+    # selected set on every run.
+    SGLANG_TOPK_V2_MODE = EnvInt(1)
 
     # ===================================================================
     # Kernel selection and fused backends
@@ -1657,6 +1678,11 @@ class Envs:
     SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # Let an unchanged top-k-1 EAGLE round read the previous round's top-1 and hidden
+    # rows where the draft-extend graph left them instead of relaying copies.
+    SGLANG_OPT_SPEC_RELAY_IN_PLACE = EnvBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
     # Runtime optimizations that follow SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION. Each
     # still accepts its former name (deprecated_name) until the alias is removed.
     # The fused small-field copy gives each field its own blocks and moves aligned fields in 16 B units.
@@ -1712,6 +1738,8 @@ class Envs:
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get,
         deprecated_name="SGLANG_Q35MF_EDGE_MULTIHOST_TCP",
     )
+    # PD decode optimizations follow the shared switch unless explicitly disabled.
+    SGLANG_ENABLE_NV_MEGA_PDDEC_RUNTIME_OPTIMIZATION = EnvBool(True)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_OPT_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
@@ -2341,6 +2369,9 @@ class Envs:
     # ===================================================================
     SGLANG_PLATFORM = EnvStr("")
     SGLANG_PLUGINS = EnvStr("")
+    # Read by the NVIDIA megakernel plugin, not by SGLang: a comma-separated
+    # slot list that replaces the plugin's default. Empty runs the stock paths.
+    SGLANG_NVIDIA_MEGAKERNEL_SLOTS = EnvTuple(())
 
     # ===================================================================
     # KV-Canary and Token-Oracle (testing only)
