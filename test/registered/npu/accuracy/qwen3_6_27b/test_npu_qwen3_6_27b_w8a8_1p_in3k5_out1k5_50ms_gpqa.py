@@ -1,8 +1,6 @@
 import logging
 import unittest
 
-import requests
-
 from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
     TestNpuAccuracyTestCaseBase,
 )
@@ -20,11 +18,10 @@ register_npu_ci(
 
 logger = logging.getLogger(__name__)
 
-# Fail fast when the NEXTN draft model stops being accepted. With an acceptance
-# length of 1.0 (no draft token accepted) decoding is several times slower and
-# this 198-question GPQA run cannot finish within the nightly budget, it only
-# ends in a harness timeout after 3.5 hours.
-MIN_SPEC_ACCEPT_LENGTH = 1.5
+# Fail fast when the NEXTN draft model stops being accepted. When acceptance
+# collapses (accept length ~1.0, accept rate ~0.0) decoding is several times
+# slower and this 198-question GPQA run cannot finish within the nightly
+# budget, it only ends in a harness timeout after 3.5 hours.
 MIN_SPEC_ACCEPT_RATE = 0.2
 SPEC_PRE_CHECK_ATTEMPTS = 3
 SPEC_PRE_CHECK_MAX_TOKENS = 256
@@ -113,11 +110,6 @@ class TestNPUQwen3_6_27B_1P_In3k5_Out1k5_gpqa(TestNpuAccuracyTestCaseBase):
         },
     }
 
-    def _get_num_draft_tokens(self):
-        other_args = list(self.other_args)
-        idx = other_args.index("--speculative-num-draft-tokens")
-        return int(other_args[idx + 1])
-
     def _check_spec_acceptance(self):
         """Abort early when speculative decoding acceptance has collapsed.
 
@@ -128,14 +120,13 @@ class TestNPUQwen3_6_27B_1P_In3k5_Out1k5_gpqa(TestNpuAccuracyTestCaseBase):
         once a decode step has run) and reports ``acc_length``, from which the
         per-draft accept rate is derived.
         """
-        num_draft_tokens = self._get_num_draft_tokens()
+        other_args = list(self.other_args)
+        idx = other_args.index("--speculative-num-draft-tokens")
+        num_draft_tokens = int(other_args[idx + 1])
         args = BenchArgs(
             base_url=self.base_url, max_new_tokens=SPEC_PRE_CHECK_MAX_TOKENS
         )
-        acc_length = 0.0
-        accept_rate = 0.0
         for attempt in range(1, SPEC_PRE_CHECK_ATTEMPTS + 1):
-            requests.post(self.base_url + "/flush_cache", timeout=60).raise_for_status()
             acc_length, speed = send_one_prompt(
                 args, label=f"spec pre-check attempt {attempt}", print_output=False
             )
@@ -151,27 +142,18 @@ class TestNPUQwen3_6_27B_1P_In3k5_Out1k5_gpqa(TestNpuAccuracyTestCaseBase):
                 accept_rate,
                 speed,
             )
-            if (
-                acc_length >= MIN_SPEC_ACCEPT_LENGTH
-                and accept_rate >= MIN_SPEC_ACCEPT_RATE
-            ):
+            if accept_rate >= MIN_SPEC_ACCEPT_RATE:
                 break
 
-        self.assertGreaterEqual(
-            acc_length,
-            MIN_SPEC_ACCEPT_LENGTH,
-            f"Speculative decoding accept length too low: acc_length="
-            f"{acc_length:.3f} < {MIN_SPEC_ACCEPT_LENGTH} after "
-            f"{SPEC_PRE_CHECK_ATTEMPTS} attempts. Draft tokens are mostly "
-            "rejected, decoding is several times slower and this GPQA "
-            "evaluation cannot finish within the time budget.",
-        )
         self.assertGreaterEqual(
             accept_rate,
             MIN_SPEC_ACCEPT_RATE,
             f"Speculative decoding accept rate too low: accept_rate="
-            f"{accept_rate:.3f} < {MIN_SPEC_ACCEPT_RATE} after "
-            f"{SPEC_PRE_CHECK_ATTEMPTS} attempts.",
+            f"{accept_rate:.3f} (acc_length={acc_length:.3f}, speed={speed:.2f} "
+            f"token/s) < {MIN_SPEC_ACCEPT_RATE} after {SPEC_PRE_CHECK_ATTEMPTS} "
+            "attempts. Draft tokens are mostly rejected, decoding is several "
+            "times slower and this GPQA evaluation cannot finish within the "
+            "time budget.",
         )
 
     def test_accuracy(self):
