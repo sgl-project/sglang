@@ -18,10 +18,16 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 class _Budget:
     """No memory pressure; exercise the scheduler's compute-budget path."""
 
+    has_state_slots = False
+    requires_final_shape_check = False
+
     def available_chunk_tokens(self, chunk_limit):
         return chunk_limit
 
-    def fit_chunk(self, *, extend_input_len, max_new_tokens, chunk_limit):
+    def fit_chunk(
+        self, *, extend_input_len, max_new_tokens, chunk_limit, state_slots=0
+    ):
+        assert state_slots == 0
         return chunk_limit
 
     def reserve(self, *args, **kwargs):
