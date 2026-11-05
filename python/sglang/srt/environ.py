@@ -872,6 +872,9 @@ class Envs:
     # HiCache host<->device transfers use the TMA staging kernel when the GPU
     # (sm_90+), row size and page size allow; set to 0 to force the register kernel.
     SGLANG_HICACHE_TMA_TRANSFER = EnvBool(True)
+    # Zero keeps LPM ordering. Positive values price recomputation relative to
+    # one outstanding host-hit token on a PD prefill worker.
+    SGLANG_HICACHE_LPM_COMPUTE_WEIGHT = EnvInt(0)
     # Base token count for each MLA/DSA dedup broadcast chunk.
     SGLANG_MLA_DEDUP_CHUNK_TOKENS = EnvInt(2048)
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
