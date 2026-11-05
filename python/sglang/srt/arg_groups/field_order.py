@@ -381,6 +381,7 @@ POSITIONAL_FIELD_ORDER = (
     "allowed_media_domains",
     "media_url_max_file_size_mb",
     "mm_preprocess_cache_size_mb",
+    "mm_preprocess_cache_dir",
     "trust_mm_content_hashes",
     "limit_mm_data_per_request",
     "enable_mm_global_cache",

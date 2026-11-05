@@ -4,7 +4,6 @@ import re
 import time
 from copy import deepcopy
 from dataclasses import dataclass, replace
-from functools import lru_cache
 from typing import Any, List, Optional, Union
 
 import numpy as np
@@ -390,13 +389,11 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
             self.hf_config.vision_config, "tokens_per_second", None
         )
 
-        # Also match the legacy sglang <image> sentinel used by /generate,
-        # so the artifact fast path can normalize it before build_input_ids.
         self.mm_tokens = MultimodalSpecialTokens(
             image_token="<|vision_start|><|image_pad|><|vision_end|>",
             image_token_id=hf_config.image_token_id,
             image_token_regex=re.compile(
-                r"<\|vision_start\|>(?:<\|image_pad\|>)+<\|vision_end\|>|<image>"
+                r"<\|vision_start\|>(?:<\|image_pad\|>)+<\|vision_end\|>"
             ),
             video_token_id=self.VIDEO_TOKEN_ID,
             audio_token_id=self.audio_token_id,
@@ -885,20 +882,14 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
         if normalized_text is None:
             return None
         try:
-            if isinstance(normalized_text, str):
-                (
-                    input_ids_tuple,
-                    offsets,
-                    mrope_positions,
-                    mrope_position_delta,
-                ) = self._cached_image_prompt_template(normalized_text, grid_key)
-            else:
-                (
-                    input_ids_tuple,
-                    offsets,
-                    mrope_positions,
-                    mrope_position_delta,
-                ) = self._build_image_prompt_template(normalized_text, grid_key)
+            # Prompt history changes across turns. Keep its token IDs and
+            # M-RoPE tensors request-local; only image artifacts are cached.
+            (
+                input_ids_tuple,
+                offsets,
+                mrope_positions,
+                mrope_position_delta,
+            ) = self._build_image_prompt_template(normalized_text, grid_key)
         except ValueError as exc:
             if "prompt placeholders" not in str(exc):
                 raise
@@ -955,11 +946,6 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
             )
             return None
         return normalized
-
-    @lru_cache(maxsize=256)
-    def _cached_image_prompt_template(self, input_text: str, grid_key: tuple):
-        """Cache prompt expansion and M-RoPE by prompt and image-grid shape."""
-        return self._build_image_prompt_template(input_text, grid_key)
 
     def _build_image_prompt_template(self, input_text, grid_key: tuple):
         image_grid_thw = torch.tensor(grid_key, dtype=torch.long)
