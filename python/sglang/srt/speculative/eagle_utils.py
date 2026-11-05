@@ -592,6 +592,29 @@ def compact_verify_max_top_k(batch: ScheduleBatch) -> Optional[int]:
     return max(top_ks)
 
 
+def validate_spec_opt_out_request(req, spec_algorithm):
+    """Reject algorithms that do not implement target-root one-token acceptance."""
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    if not req.sampling_params.disable_speculative_decoding or spec_algorithm.is_none():
+        return None
+    if spec_algorithm not in (
+        SpeculativeAlgorithm.EAGLE,
+        SpeculativeAlgorithm.EAGLE3,
+        SpeculativeAlgorithm.STANDALONE,
+    ):
+        return (
+            "disable_speculative_decoding is supported only with EAGLE, EAGLE3, "
+            "and STANDALONE. It limits acceptance to one target-sampled token; "
+            "draft-model work still runs."
+        )
+    if req.custom_logit_processor is not None:
+        return (
+            "disable_speculative_decoding does not yet support custom logit processors."
+        )
+    return None
+
+
 def eagle_sample(
     verify_input: EagleVerifyInput,
     batch: ScheduleBatch,
@@ -604,6 +627,7 @@ def eagle_sample(
     simulated_acc_len: Optional[torch.Tensor] = None,
     simulated_acc_len_rng: Optional[torch.Generator] = None,
     sparse_bonus_argmax: bool = False,
+    target_sampler=None,
 ):
     """
     Verify and find accepted tokens based on logits output and batch
@@ -709,6 +733,15 @@ def eagle_sample(
                     draft_token_num=verify_input.draft_token_num,
                 )
             )
+
+    # Sample the root target policy independently of proposal acceptance. In
+    # rejection sampling predict[root] may otherwise contain a draft proposal;
+    # shortening accept_lens alone does not reproduce ordinary target sampling.
+    opt_out_predictions = None
+    if getattr(sampling_info, "has_spec_opt_out", False):
+        opt_out_predictions = _sample_spec_opt_out_roots(
+            next_token_logits, verify_input, batch, target_sampler
+        )
 
     candidates = verify_input.draft_token.reshape(bs, verify_input.draft_token_num)
     predict_shape = list(next_token_logits.shape)[:-1]
@@ -936,6 +969,25 @@ def eagle_sample(
     # tensor includes the trailing/bonus token via out-of-place +1 so the
     # name no longer flips semantics mid-function (naming doc C2).
     accept_lens = num_correct_drafts + 1
+
+    if opt_out_predictions is not None:
+        mask = sampling_info.spec_opt_out_mask
+        roots = verify_input.retrieve_index[:, 0].long()
+        predict[roots] = torch.where(mask, opt_out_predictions, predict[roots]).to(
+            predict.dtype
+        )
+        accept_lens = torch.where(mask, torch.ones_like(accept_lens), accept_lens)
+        accept_index[:, 0] = torch.where(mask, roots, accept_index[:, 0]).to(
+            accept_index.dtype
+        )
+        # Some commit consumers (notably HiSparse) derive valid positions from
+        # the index sentinel rather than accept_lens. Truncate both views of
+        # acceptance before any state is committed.
+        steps = torch.arange(accept_index.shape[1], device=accept_index.device)
+        accept_index = accept_index.masked_fill(
+            steps.unsqueeze(0) >= accept_lens.unsqueeze(1), -1
+        )
+
     if watermark_state is not None and sampling_info.has_watermark_candidates:
         watermark_state.record_speculative(
             batch.req_pool_indices,
@@ -945,6 +997,38 @@ def eagle_sample(
             accept_lens,
         )
     return predict, accept_lens, accept_index
+
+
+def _sample_spec_opt_out_roots(next_token_logits, verify_input, batch, target_sampler):
+    """Sample root rows with the normal target sampler and decode positions.
+
+    Keep the full request-row layout so custom processors, seeds and grammar
+    metadata retain their indices. Only opted-out rows are committed. The copy
+    protects verify logits/logprobs from the sampler's in-place softmax.
+    """
+    from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+    from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+    from sglang.srt.runtime_context import get_parallel
+
+    roots = verify_input.retrieve_index[:, 0].long()
+    root_logits = next_token_logits.index_select(0, roots)
+    if target_sampler is None:
+        raise ValueError("Per-request speculative opt-out requires the target sampler")
+    tokens = target_sampler(
+        LogitsProcessorOutput(next_token_logits=root_logits),
+        batch.sampling_info,
+        False,
+        [],
+        [],
+        batch.seq_lens,
+    )
+    # Match verify's unconditional stochastic TP synchronization: the normal
+    # sampler only synchronizes under its own optional policy/grammar settings.
+    parallel = get_parallel()
+    group = parallel.attn_tp_group if is_dp_attention_enabled() else parallel.tp_group
+    if group.world_size > 1:
+        group.broadcast(tokens, src=0)
+    return tokens
 
 
 def _verify_outputs(

@@ -1,0 +1,103 @@
+Same-prefix GPU diagnosis, 2026-11-02
+====================================
+
+Conclusion
+The two repeated first-divergence sites behind the previous 14 comparisons are
+precision-sensitive target-logit tie flips. Both paths selected the correct
+lowest-ID argmax of their own logits, and emitted IDs matched logprob IDs.
+BF16 speculative warm decode tied its two leading candidates; FP16 removed both
+ties and both paths selected the same tokens. No production sampling fix is
+justified by these observations. This is bounded evidence, not a proof that
+all attention/KV values or every configuration are correct. Keep the PR draft.
+The historical exact-token E2E failure is not relabelled as a pass.
+
+Environment and method
+H100 SXM, pinned image from per_request_spec_opt_out_e2e_resume.txt. The Rust
+preflight passed. Qwen2.5-1.5B-Instruct target, Qwen2.5-0.5B-Instruct draft,
+STANDALONE, width 4, 3 steps, Triton attention, page 16, overlap enabled,
+seed 0, greedy. Prefill/decode CUDA graphs disabled for this diagnosis.
+Source: 9dbdeaaf plus the PREFIX_DTYPE/TF32-off diagnostic controls committed in
+ce7b2dba. No production runtime patch was applied. Raw executed script and patch
+are archived. Analysis and new unit regressions are from ce7b2dba.
+
+For each dtype, target and speculative servers ran sequentially:
+- warm_plain: three concurrent prompts (two opted out, one enabled on spec),
+  max-new-tokens [8, 68, 68], with no logits capture.
+- warm_probe: same inputs, synchronizing and saving full pre-sampling logits.
+- fresh: exact saved token prefix, one next token from prefill.
+- one-decode: prefix minus its last token, then two generated tokens. The first
+  generated token matched the saved final prefix token in all four cases/dtype.
+Cache was flushed before every case. The analyzer checks the ENTIRE prefix,
+not just position and last input ID, before accepting a score comparison.
+All 12 captured sites per dtype had identical prefixes, correct argmax, and
+matching emitted IDs. All 12 HTTP responses per dtype passed emitted/logprob-ID
+alignment. Unprobed and probed warm outputs agreed within each server/dtype.
+
+Results at the original first-divergence sites
+                            BF16 target      BF16 spec      FP16 target/spec
+prompt 0, output index 4     22, margin .125   21, margin 0   21, margin .015625
+prompt 1, output index 63    7952, margin .125 374, margin 0  7952, margin .0625
+
+Prompt 0 is position 24, input ID 220. BF16 target logits for IDs 22/21 were
+22.875/22.75; speculative warm logits were 22.875/22.875.
+Prompt 1 is position 76, input ID 7015. BF16 target logits for IDs 7952/374 were
+24.75/24.625; speculative warm logits were 24.625/24.625.
+The sampler correctly resolves each exact tie to the smaller token ID.
+Fresh-prefill and one-decode BF16 controls selected the target-only winner at
+both sites. Therefore the BF16 warm-history computation matters.
+
+Full-vocabulary speculative warm logits versus target fresh-prefill reference:
+                     BF16 max abs / RMS         FP16 max abs / RMS
+position 24          .25 / .060927               .020996 / .005221
+position 76          .25 / .059429               .035156 / .009470
+The precision control substantially reduces score perturbations. It does not
+identify one particular attention, GEMM or normalization kernel as the source.
+FP32/TF32-off was attempted but the image's RMSNorm CUDA kernel rejected Float
+at startup; no FP32 output or FP32 correctness claim exists.
+
+Regression and diagnostic changes
+- Real ordinary/root greedy sampler test covers exact ties (lowest-ID choice)
+  and a strict positive margin that must not be rounded into a tie.
+- Offline analyzer rejects wrong/short prefixes and non-finite logits, verifies
+  actual emissions, and reports full-vocabulary deltas without pass tolerances.
+- Existing strict cross-server token equality in the model smoke stays intact.
+  These diagnostic results do not silently waive it or force a different token.
+
+Reproduction after environment preparation
+Use the pinned image and preparation script documented in the resume checklist.
+Run from repository root with PYTHONPATH=python:test/manual/spec and the prepared
+SGLANG_CACHE_DIR/HF_HOME, SGLANG_RUST_BUILD_MODE=never:
+
+  PREFIX_RESULTS=/workspace/prefix-bf16 \
+    timeout 900 python -u test/manual/spec/diagnose_spec_opt_out_prefix.py
+  PREFIX_RESULTS=/workspace/prefix-fp16 PREFIX_DTYPE=float16 \
+    timeout 900 python -u test/manual/spec/diagnose_spec_opt_out_prefix.py
+  python test/manual/spec/analyze_spec_opt_out_prefix.py /workspace/prefix-bf16
+  python test/manual/spec/analyze_spec_opt_out_prefix.py /workspace/prefix-fp16
+
+Download inputs.json, full HTTP responses, captures.jsonl, all .npy vectors,
+validated-analysis.json, model logs, executed source/hash and unit logs before
+stopping the Pod. The driver cleans server process groups, not the billable Pod.
+
+Remaining limits
+This run diagnoses the two first-divergence sites in dense STANDALONE. Previous
+bounded KV page/pool/length checks passed, but complete KV tensor equality,
+EAGLE3, HiSparse, distributed serving, cancellation/EOS streaming transport and
+performance remain separate validation. FP16 results do not promise BF16
+bitwise equality between servers with different execution/batch shapes.
+
+Validation and shutdown
+Local: 26 passed, 2 skipped, 22 subtests passed (9.75s) across diagnostic,
+opt-out and API-contract suites. Skips need CUDA/native seeded kernels.
+H100: 30 passed, 181 subtests passed, 20 dependency warnings (30.48s), no skips,
+across opt-out, diagnostic and post-verify-graph suites. Zero empty-graph warnings.
+GPU unit source hashes matched the committed local files. Ruff lint/format and
+git diff --check passed. All three FP16 warm output vectors matched across the
+target/spec servers; this is not the full historical lifecycle E2E rerun.
+
+The raw archive was downloaded and SHA-256 verified before stopping the Pod:
+8dcf8534d14e11206f4dc031105ab08ec59846a087b864e3eb06aa6777d66c75
+Started conservatively 23:28:50 UTC; stopped confirmed by 23:42:43 UTC.
+Compute and container storage showed Not running, total $0.00/hr. Estimated
+current-run upper cost $0.93, cumulative including earlier runs $2.99, below
+$10. These are elapsed-time estimates, not a final billing statement.

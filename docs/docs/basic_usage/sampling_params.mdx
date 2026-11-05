@@ -125,6 +125,12 @@ The object is defined at `sampling_params.py::SamplingParams`. You can also read
 
 By default, SGLang initializes several sampling parameters from the model's `generation_config.json` (when the server is launched with `--sampling-defaults model`, which is the default). To use SGLang/OpenAI constant defaults instead, start the server with `--sampling-defaults openai`. You can always override any parameter per request via `sampling_params`.
 
+`disable_speculative_decoding` (`bool`, default `false`) requests one-token target
+acceptance on EAGLE, EAGLE3, or STANDALONE servers. Draft-model work continues,
+including in all-opt-out batches. See [per-request one-token acceptance](/docs/advanced_features/speculative_decoding#per-request-one-token-acceptance)
+for the execution contract and current limitations.
+
+
 ```bash Command
 # Use model-provided defaults from generation_config.json (default behavior)
 python -m sglang.launch_server --model-path <MODEL> --sampling-defaults model

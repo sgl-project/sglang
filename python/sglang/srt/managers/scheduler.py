@@ -376,6 +376,7 @@ from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_utils import validate_dflash_request
 from sglang.srt.speculative.eagle_utils import (
     get_draft_recurrent_hidden_state_spec_from_config,
+    validate_spec_opt_out_request,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_sampling_mask import (
@@ -3317,6 +3318,12 @@ class Scheduler(
             )
             req.time_stats.trace_ctx.abort(abort_info=abort_req.finished_reason)
             self.send_abort_output(abort_req, req)
+            return
+
+        if error_msg := validate_spec_opt_out_request(req, self.spec_algorithm):
+            req.set_finish_with_abort(error_msg)
+            self.init_req_max_new_tokens(req)
+            self._add_request_to_queue(req)
             return
 
         if self.spec_algorithm.is_dflash_family():

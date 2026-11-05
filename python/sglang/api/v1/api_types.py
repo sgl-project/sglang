@@ -205,6 +205,7 @@ class SamplingParams(msgspec.Struct, kw_only=True, frozen=True):
     beam_width: Optional[int] = None
     watermark: Optional[WatermarkRequestConfig] = None
     choice: List[str] = []
+    disable_speculative_decoding: Optional[bool] = None
 
     @classmethod
     def from_json_value(cls, value: Any) -> "SamplingParams":
@@ -1272,7 +1273,7 @@ def encode_FinishReason(v: FinishReason) -> Any:
     raise TypeError(f"FinishReason: unsupported value {type(v).__name__}")
 
 
-_FIELDS_SamplingParams = ("max_new_tokens", "stop", "stop_token_ids", "stop_regex", "temperature", "top_p", "top_k", "min_p", "frequency_penalty", "presence_penalty", "repetition_penalty", "min_new_tokens", "n", "json_schema", "regex", "ebnf", "structural_tag", "ignore_eos", "skip_special_tokens", "spaces_between_special_tokens", "no_stop_trim", "stream_interval", "logit_bias", "sampling_seed", "custom_params", "beam_width", "watermark", "choice",)
+_FIELDS_SamplingParams = ("max_new_tokens", "stop", "stop_token_ids", "stop_regex", "temperature", "top_p", "top_k", "min_p", "frequency_penalty", "presence_penalty", "repetition_penalty", "min_new_tokens", "n", "json_schema", "regex", "ebnf", "structural_tag", "ignore_eos", "skip_special_tokens", "spaces_between_special_tokens", "no_stop_trim", "stream_interval", "logit_bias", "sampling_seed", "custom_params", "beam_width", "watermark", "choice", "disable_speculative_decoding",)
 
 
 def decode_SamplingParams(value: Any) -> SamplingParams:
@@ -1335,6 +1336,8 @@ def decode_SamplingParams(value: Any) -> SamplingParams:
             kw["watermark"] = None if x is None else decode_WatermarkRequestConfig(x)
         elif key == "choice":
             kw["choice"] = [] if x is None else [_expect_str(e, expected="a string") for e in _expect_seq(x, expected="a sequence")]
+        elif key == "disable_speculative_decoding":
+            kw["disable_speculative_decoding"] = None if x is None else _expect_bool(x, expected="a boolean")
         else:
             raise _unknown_field(key, fields=_FIELDS_SamplingParams)
     return SamplingParams(**kw)
@@ -1397,6 +1400,8 @@ def encode_SamplingParams(v: SamplingParams) -> Dict[str, Any]:
         d["watermark"] = encode_WatermarkRequestConfig(v.watermark)
     if v.choice:
         d["choice"] = list(v.choice)
+    if v.disable_speculative_decoding is not None:
+        d["disable_speculative_decoding"] = v.disable_speculative_decoding
     return d
 
 

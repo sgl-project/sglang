@@ -1525,8 +1525,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 # stages already ran, so do not re-draft here.
                 verify_input = batch.spec_info
             elif self.speculative_num_steps == 0:
-                # Drafting disabled (high batch size). _draft_extend below still
-                # runs, keeping draft KV warm for when the batch shrinks.
+                # Only the configured zero-step runtime has width-one attention,
+                # commit, and draft-extend state. Per-request opt-out retains the
+                # active layout and draft work, even when every row opts out.
                 verify_input = self._build_trivial_verify_input(batch)
             else:
                 with (

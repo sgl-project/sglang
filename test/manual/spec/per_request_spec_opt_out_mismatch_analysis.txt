@@ -1,0 +1,81 @@
+Follow-up: see per_request_spec_opt_out_prefix_results.txt for the subsequent
+GPU same-prefix BF16/FP16 diagnosis. The text below is the earlier offline
+checkpoint and its then-unresolved evidence limits.
+
+Offline analysis of the 2026-11-02 H100 run
+=========================================
+
+Verdict: the 14 comparisons are genuine failures of the harness's exact token
+comparison, but the preserved evidence cannot establish whether the underlying
+cause is arithmetic variation, an attention/KV semantic bug, or output reporting.
+They must remain unresolved. No numerical tolerance is used to turn them into
+passes, and no production decoding change is justified by this evidence alone.
+GPU remained off during this analysis. Keep the PR draft.
+
+Evidence examined
+- retry3/summary.json, target/eager/graph.log and their JSONL probes.
+- tested-hashes.txt and tested.patch from the downloaded run archive.
+- Runtime and harness code at 21ff4328628105c7b6aa7d5b827aa75123943a0d.
+  The run was ebca2e69 plus the executed schema/harness patches later committed
+  in 21ff4328; hashes of the five executed changed files matched.
+
+The harness makes 10 opted-out comparisons per mode. Seven per mode failed:
+  mode       prompt row   first difference (0-based)   target ID   spec ID   repeats
+  eager      0            4                            22          21        3
+  graph      0            4                            22          21        3
+  eager      1            63                           7952        374       4
+  graph      1            63                           7952        374       4
+Thus 14 failures are two prompt/prefix divergence sites repeated across request
+waves and modes, not 14 independent divergence sites. Each pair has an identical
+prefix before its first difference. All recorded mismatching eager/graph output
+vectors agree with each other, including after flush_cache. This does not prove
+that the target-only baseline is correct or that the spec output is correct.
+
+What the evidence supports
+- Every recorded opted-out verify row retained length 1. All 444 verify length
+  vectors match their subsequent draft-extend vectors, separately in both modes.
+- Mixed batches and all-opt-out batches both occurred. Page/pool assertions
+  completed without failure. These prove bounded ownership/accounting checks,
+  not the correctness of every stored K/V value or attention result.
+- CUDA graph replay is not a sufficient explanation: the same divergence occurs
+  with graphs disabled. A shared eager/graph defect is still possible.
+- Server args have different random_seed values, but these requests are greedy.
+  Sampler.forward selects argmax before stochastic sampling, so a seed difference
+  does not directly explain these decisions. A CPU regression now checks the
+  ordinary logprob-returning and opt-out root sampler on identical logits with
+  different RNG states. This does not check GPU attention-produced logits.
+- _sample_spec_opt_out_roots gathers retrieve_index[:, 0] and samples a copy.
+  Acceptance truncation replaces that root and its index sentinel. The retained
+  IDs feed both output_ids and _apply_decode_logprobs; no statically evident
+  one-token shift was found in this path. This is code review, not an observation
+  of the discarded HTTP bodies.
+
+Confirmed diagnostic defects and fixes
+- The old harness compared IDs extracted only from output_token_logprobs, without
+  checking actual output_ids. It now compares emitted IDs and independently
+  asserts that the logprob IDs agree, including expected output length.
+- The old harness discarded full responses, selected logprob values, top scores,
+  wave identity and successful comparisons. It now saves every HTTP response and
+  request before validation, asks for top-5 logprobs, records wave/first-difference
+  indices, and writes a partial summary after each completed mode.
+- Server random_seed is fixed for reproducibility; this is not claimed as a fix
+  for the observed greedy mismatch. Final token comparisons remain strict.
+- CPU regressions cover mismatched emitted/metadata IDs, missing/short outputs,
+  length-only divergence, wave/first-index preservation, and preservation of an
+  invalid response before the assertion and server cleanup.
+
+What remains necessary to classify the runtime cause
+The old archive has neither full HTTP responses nor root logits/top-score
+margins. No post-hoc calculation can recover those values from token IDs.
+On a separately authorized GPU run, first inspect output_ids versus logprob IDs
+and both top-5 rows at the FIRST divergence, where the prefixes still agree.
+Do not compare later logits after the histories have diverged. A non-argmax
+emission or ID misalignment would be a concrete sampling/reporting defect.
+Different score winners with correct argmax choices localize the difference
+upstream of sampling, but do not by themselves prove harmless rounding.
+To distinguish attention/KV semantics from numerical sensitivity, replay the
+same explicit input-token prefix in both paths, capture full target-root logits
+and position/KV metadata, and compare with an independent fresh-prefill result.
+Only attribute a near-tie flip to numerics with measured score perturbations and
+controlled prefix/configuration; do not invent an epsilon from these token logs.
+The newly added GPU diagnostics have not been run; no model E2E pass is claimed.

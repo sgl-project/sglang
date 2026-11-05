@@ -154,6 +154,35 @@ For further details please see the [EAGLE3 paper](https://arxiv.org/pdf/2503.018
 
 ---
 
+## Per-request one-token acceptance
+
+On servers using `EAGLE`, `EAGLE3`, or `STANDALONE`, you can set
+`sampling_params.disable_speculative_decoding` to `true` on a `/generate` request.
+The default is `false`. The flag limits that request to one newly sampled target
+root token per decode iteration, including when it shares a batch with requests
+that accept several tokens. The root uses the ordinary target sampler, including
+its temperature, top-k/top-p/min-p, and per-request seed policy.
+
+Despite the parameter name, **draft-model work still runs**. Draft prefill,
+proposal generation, and draft extend keep their configured widths and KV state,
+even when every request in the batch opts out. The flag does not provide a
+no-draft-work latency or throughput baseline. Post-verify graph replay falls back
+to eager execution for batches containing opted-out requests; the other eligible
+model-forward graphs remain available.
+
+Other speculative algorithms reject this flag rather than silently ignoring it.
+Opted-out speculative requests currently reject custom logit processors, and
+EAGLE-family requests still do not support `return_sampling_mask`. Ordinary token
+streaming and logprobs use the single committed token. When speculation is disabled
+server-wide, the flag has no effect.
+
+Matching the ordinary sampling policy does not guarantee bitwise-identical output
+between a speculative server and a separate non-speculative server: attention
+kernels, batching, and floating-point logits can differ. Unseeded sampling also
+consumes a different random stream. Use identical root logits and per-request
+seeds when testing sampler equivalence; validate model-level equivalence separately
+on the deployment hardware.
+
 ## EAGLE Decoding
 
 To enable EAGLE speculative decoding the following parameters are relevant:

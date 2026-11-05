@@ -111,6 +111,12 @@ class SamplingBatchInfo:
     watermark_candidates_host: Optional[List[bool]] = None
     has_watermark_candidates: bool = False
 
+    # Per-request speculative decoding opt-out
+    spec_opt_out_mask: Optional[torch.Tensor] = None
+    spec_opt_outs_host: Optional[List[bool]] = None
+    has_spec_opt_out: bool = False
+    is_all_spec_opt_out: bool = False
+
     # Device
     device: str = "cuda"
 
@@ -292,6 +298,18 @@ class SamplingBatchInfo:
             },
         )
 
+        spec_opt_outs = [
+            getattr(r.sampling_params, "disable_speculative_decoding", False)
+            for r in reqs
+        ]
+        has_spec_opt_out = any(spec_opt_outs)
+        is_all_spec_opt_out = all(spec_opt_outs) if reqs else False
+        spec_opt_out_mask = (
+            torch.tensor(spec_opt_outs, dtype=torch.bool, device=device)
+            if has_spec_opt_out
+            else None
+        )
+
         ret = cls(
             temperatures=temperatures,
             top_ps=top_ps,
@@ -326,6 +344,10 @@ class SamplingBatchInfo:
             watermark_enabled=watermark_enabled,
             watermark_candidates_host=watermark_candidates_host,
             has_watermark_candidates=has_watermark_candidates,
+            spec_opt_out_mask=spec_opt_out_mask,
+            spec_opt_outs_host=spec_opt_outs,
+            has_spec_opt_out=has_spec_opt_out,
+            is_all_spec_opt_out=is_all_spec_opt_out,
             sampling_support_logprobs_capture_indices=(
                 sampling_support_logprobs_capture_indices
             ),
@@ -471,6 +493,13 @@ class SamplingBatchInfo:
 
         return observer_state
 
+    def _refresh_spec_opt_out_flags(self):
+        # Scheduler edits already have host row indices; never synchronize the
+        # device just to decide whether a batch contains opted-out requests.
+        flags = self.spec_opt_outs_host or []
+        self.has_spec_opt_out = any(flags)
+        self.is_all_spec_opt_out = bool(flags) and all(flags)
+
     def filter_batch(self, keep_indices: List[int], keep_indices_device: torch.Tensor):
         self.penalizer_orchestrator.filter(keep_indices_device)
 
@@ -486,10 +515,15 @@ class SamplingBatchInfo:
             "watermark_keys",
             "watermark_context_windows",
             "watermark_enabled",
+            "spec_opt_out_mask",
         ]:
             value = getattr(self, item, None)
             if value is not None:
                 setattr(self, item, value[keep_indices_device])
+
+        if self.spec_opt_outs_host is not None:
+            self.spec_opt_outs_host = [self.spec_opt_outs_host[i] for i in keep_indices]
+        self._refresh_spec_opt_out_flags()
 
         if self.watermark_candidates_host is not None:
             self.watermark_candidates_host = [
@@ -612,6 +646,23 @@ class SamplingBatchInfo:
             self.sampling_mask_top_ks = (
                 self.sampling_mask_top_ks or [1] * self_len
             ) + (other.sampling_mask_top_ks or [1] * other_len)
+
+        if self.spec_opt_out_mask is not None or other.spec_opt_out_mask is not None:
+            self_mask = (
+                self.spec_opt_out_mask
+                if self.spec_opt_out_mask is not None
+                else torch.zeros(self_len, dtype=torch.bool, device=self.device)
+            )
+            other_mask = (
+                other.spec_opt_out_mask
+                if other.spec_opt_out_mask is not None
+                else torch.zeros(other_len, dtype=torch.bool, device=self.device)
+            )
+            self.spec_opt_out_mask = torch.cat([self_mask, other_mask])
+        self.spec_opt_outs_host = (self.spec_opt_outs_host or [False] * self_len) + (
+            other.spec_opt_outs_host or [False] * other_len
+        )
+        self._refresh_spec_opt_out_flags()
 
         # Note: because the __len()__ operator is defined on the temperatures tensor,
         # please make sure any merge operation with len(self) or len(other) is done before

@@ -336,6 +336,41 @@ class TestReasoningTokenAccounting(CustomTestCase):
         self.assertFalse(req._is_reasoning_over)
 
 
+class TestSpecOptOutOutput(CustomTestCase):
+    def test_opt_out_eos_commits_one_token_and_does_not_train_adaptation(self):
+        processor = _make_processor()
+        processor.model_worker.on_verify_complete_cpu = MagicMock()
+        opted_out, enabled = _make_req(99), _make_req(99)
+        opted_out.grammar = enabled.grammar = None
+        opted_out.sampling_params.disable_speculative_decoding = True
+        opted_out.eos_token_ids = {2}
+        batch = _FakeBatch([opted_out, enabled])
+        result = _make_result(4, [1, 3], [2, 99, 99, 99, 4, 5, 6, 99])
+        emitted = processor._resolve_spec_v2_tokens(result, batch)
+        self.assertEqual(emitted, [[2], [4, 5, 6]])
+        self.assertEqual(opted_out.kv.kv_committed_len, 1)
+        self.assertEqual(enabled.kv.kv_committed_len, 3)
+        processor.model_worker.on_verify_complete_cpu.assert_called_once_with(
+            [2], batch_size=2
+        )
+        opted_out.output_ids.extend(emitted[0])
+        opted_out.update_finish_state(len(emitted[0]))
+        self.assertTrue(opted_out.finished())
+        self.assertEqual(opted_out.finished_len, 1)
+
+    def test_all_opt_out_does_not_update_adaptation_or_commit_cancelled_request(self):
+        processor = _make_processor()
+        processor.model_worker.on_verify_complete_cpu = MagicMock()
+        req = _make_req(99)
+        req.grammar = None
+        req.sampling_params.disable_speculative_decoding = True
+        req.is_retracted = True
+        result = _make_result(4, [1], [2, 99, 99, 99])
+        processor._resolve_spec_v2_tokens(result, _FakeBatch([req]))
+        self.assertEqual(req.kv.kv_committed_len, 0)
+        processor.model_worker.on_verify_complete_cpu.assert_not_called()
+
+
 class TestFinishedMambaSpecCheckpoint(CustomTestCase):
     def test_finished_checkpoint_boundaries(self):
         processor = replace(

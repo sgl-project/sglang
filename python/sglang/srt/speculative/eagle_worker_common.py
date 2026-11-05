@@ -730,6 +730,7 @@ def run_eagle_verify(
         grammar_mask,
         uno_target_max_top_k=uno_target_max_top_k,
         watermark_state=target_worker.model_runner.watermark_state,
+        target_sampler=getattr(target_worker.model_runner, "sampler", None),
         watermark_full_mask=(
             target_worker.model_runner.attn_backend.verify_mask is None
             or target_worker.model_runner.attn_backend.verify_mask.mode

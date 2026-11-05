@@ -1119,6 +1119,13 @@ impl ::serde::Serialize for SamplingParams {
         if !self.choice.is_empty() {
             ::serde::ser::SerializeMap::serialize_entry(&mut map, "choice", &self.choice)?;
         }
+        if let Some(v) = &self.disable_speculative_decoding {
+            ::serde::ser::SerializeMap::serialize_entry(
+                &mut map,
+                "disable_speculative_decoding",
+                v,
+            )?;
+        }
         ::serde::ser::SerializeMap::end(map)
     }
 }
@@ -1154,6 +1161,7 @@ impl<'de> ::serde::Deserialize<'de> for SamplingParams {
             "beam_width",
             "watermark",
             "choice",
+            "disable_speculative_decoding",
         ];
         struct V;
         impl<'de> ::serde::de::Visitor<'de> for V {
@@ -1193,6 +1201,7 @@ impl<'de> ::serde::Deserialize<'de> for SamplingParams {
                 let mut f_beam_width = None;
                 let mut f_watermark = None;
                 let mut f_choice = None;
+                let mut f_disable_speculative_decoding = None;
                 while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
                     match key.as_ref() {
                         "max_new_tokens" => {
@@ -1414,6 +1423,15 @@ impl<'de> ::serde::Deserialize<'de> for SamplingParams {
                                     .unwrap_or_default(),
                             );
                         }
+                        "disable_speculative_decoding" => {
+                            if f_disable_speculative_decoding.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "disable_speculative_decoding",
+                                ));
+                            }
+                            f_disable_speculative_decoding =
+                                Some(map.next_value::<Option<bool>>()?);
+                        }
                         other => {
                             return Err(::serde::de::Error::unknown_field(other, FIELDS));
                         }
@@ -1449,6 +1467,7 @@ impl<'de> ::serde::Deserialize<'de> for SamplingParams {
                     beam_width: f_beam_width.flatten(),
                     watermark: f_watermark.flatten(),
                     choice: f_choice.unwrap_or_default(),
+                    disable_speculative_decoding: f_disable_speculative_decoding.flatten(),
                 })
             }
         }

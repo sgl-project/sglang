@@ -300,7 +300,14 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
         # Llama 3.2 1B Instruct set tie_word_embeddings to True
         # Llama 3.1 8B Instruct set tie_word_embeddings to False
         self.load_lm_head_from_target = False
-        if self.config.tie_word_embeddings:
+        # Reduced-vocabulary checkpoints can inherit tie_word_embeddings from
+        # the target config, but their trained head has a different row count.
+        # Tying would skip lm_head.weight loading and overwrite the draft head
+        # when set_embed() shares the target embedding.
+        if self.config.tie_word_embeddings and config.draft_vocab_size in (
+            None,
+            config.vocab_size,
+        ):
             self.lm_head = self.model.embed_tokens
         else:
             if config.draft_vocab_size is None:
