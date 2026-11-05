@@ -1,6 +1,8 @@
 """``fused_recurrent_kda`` with ``ssm_state_indices`` must update the state pool in place
 and match the same kernel run on a gathered copy of the state."""
 
+import sys
+
 import pytest
 import torch
 
@@ -54,4 +56,4 @@ def test_fused_recurrent_kda_in_place_matches_packed_path(d: int):
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    sys.exit(pytest.main([__file__]))
