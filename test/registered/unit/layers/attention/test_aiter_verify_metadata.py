@@ -7,6 +7,8 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.layers.attention import aiter_backend
+from sglang.srt.layers.dcp import layout as dcp_layout
+from sglang.srt.layers.dcp import planner as dcp_planner
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -129,105 +131,114 @@ class TestAiterUnifiedVerifyWithoutHostSeqLens(CustomTestCase):
 
 _DCP_SIZE = 8
 _DRAFT_TOKENS = 8
+_DCP_MAX_CONTEXT_LEN = 128
+# The second request fills the context, so its asm shard meets the static graph bound.
+_DCP_SEQ_LENS = torch.tensor([32, _DCP_MAX_CONTEXT_LEN], dtype=torch.int32)
+
+
+def _rank0_shard_lens(kv_lens):
+    # Tokens are dealt round-robin from rank 0, so rank 0 holds ceil(len / DCP).
+    return ((kv_lens + _DCP_SIZE - 1) // _DCP_SIZE).tolist()
 
 
 def _dcp_verify_backend(asm_cprr):
-    """An MLA backend at DCP8 whose graph replay records the KV lengths it localizes."""
+    """An MLA backend at DCP8 rank 0, with the cuda graph buffers it allocates."""
     backend = aiter_backend.AiterAttnBackend.__new__(aiter_backend.AiterAttnBackend)
-    n_rows = _BATCH_SIZE * _DRAFT_TOKENS
     backend.device = torch.device("cpu")
     backend.use_mla = True
+    backend.use_mla_dcp_asm = False
     backend._use_unified_verify = False
+    backend.use_sliding_window_kv_pool = False
+    backend.decode_uses_page_table = False
+    backend.skip_prefill = True
+    backend.page_size = 1
     backend.dcp_world_size = _DCP_SIZE
     backend.num_draft_tokens = _DRAFT_TOKENS
     backend.cprr_kernel_heads = 96 if asm_cprr else 0
-    backend.max_context_len = 128
-    backend.qo_indptr = torch.zeros(_BATCH_SIZE + 1, dtype=torch.int32)
-    backend.kv_indptr = torch.zeros(_BATCH_SIZE + 1, dtype=torch.int32)
-    backend.req_to_token = torch.zeros((_BATCH_SIZE, 128), dtype=torch.int32)
-    backend.cuda_graph_kv_indices = torch.zeros(256, dtype=torch.int32)
-    backend.cuda_graph_kv_last_page_len = torch.ones(_BATCH_SIZE, dtype=torch.int32)
-    backend.cuda_graph_global_kv_indptr = torch.zeros(
-        _BATCH_SIZE + 1, dtype=torch.int32
-    )
-    backend.cuda_graph_dcp_static_local_kv_lens = torch.full(
-        (_BATCH_SIZE,), 32, dtype=torch.int32
-    )
-    backend.cuda_graph_verify_token_table = torch.zeros((n_rows, 32), dtype=torch.int32)
-    backend.cuda_graph_verify_local_kv_lens = torch.zeros(n_rows, dtype=torch.int32)
-    backend.cuda_graph_cprr_kv_indices = torch.zeros(256, dtype=torch.int32)
-    backend.cuda_graph_cprr_kv_indptr = torch.zeros(_BATCH_SIZE + 1, dtype=torch.int32)
-    backend.cuda_graph_cprr_empty_rows = torch.zeros(n_rows, dtype=torch.bool)
+    backend.max_context_len = _DCP_MAX_CONTEXT_LEN
     backend.max_split_per_batch = 32
     backend.cprr_fast_mode = True
     backend.cprr_intra_batch_mode = False
-    backend.work_metadata = backend.work_info_set = backend.work_indptr = None
-    backend.reduce_indptr = backend.reduce_final_map = None
-    backend.reduce_partial_map = None
-    backend.make_mla_meta_data = lambda *_args, **_kwargs: None
+    backend.qo_indptr = torch.zeros(_BATCH_SIZE + 1, dtype=torch.int32)
+    backend.kv_indptr = torch.zeros(_BATCH_SIZE + 1, dtype=torch.int32)
+    backend.req_to_token = torch.zeros(
+        (_BATCH_SIZE, _DCP_MAX_CONTEXT_LEN + _DRAFT_TOKENS), dtype=torch.int32
+    )
+    backend.runner_ids = SimpleNamespace(
+        full_v2p_table=None, needs_read_translate=False
+    )
     backend._asm_cprr_supports_verify_shape = lambda _q_len: asm_cprr
-    backend._kv_index_blocks = lambda _bs: 1
-    backend.localized = None
-
-    def plan_dcp_decode_metadata(kv_indptr, _indices, kv_lens, _cpu, bs, **_kwargs):
-        # The planner localizes kv_indptr in place, so its lengths must be the
-        # ones kv_indptr spans.
-        spans = kv_indptr[1 : bs + 1] - kv_indptr[:bs]
-        backend.localized = (kv_lens.tolist(), spans.tolist())
-
-    backend._plan_dcp_decode_metadata = plan_dcp_decode_metadata
-    backend._build_dcp_verify_token_table = lambda *_a, out, out_lens: (out, out_lens)
-    backend._build_dcp_verify_ragged_indices = (
-        lambda *_a, out_indices, out_indptr, out_empty: (
-            out_indices,
-            out_indptr,
-            out_empty,
-        )
+    # The persistent-kernel work plan is aiter's; these tests check the KV shard.
+    backend.make_mla_decode_meta_data_buffer = lambda *_a, **_k: (torch.zeros(1),) * 6
+    backend.make_mla_meta_data = lambda *_args, **_kwargs: None
+    backend.init_cuda_graph_state(
+        max_bs=_BATCH_SIZE, max_num_tokens=_BATCH_SIZE * _DRAFT_TOKENS
     )
     return backend
 
 
 class TestAiterDcpVerifyGraphReplay(CustomTestCase):
-    """At DCP, the verify localizes each request's KV to this rank's shard, from
-    the KV lengths it is given. The asm cp kernel reads the verify window (the
-    draft tokens) from the cache, so its shard must span them. Graph replay gave
-    the prefix lengths, so every rank dropped its draft tokens from the verify."""
+    """Graph replay must plan each rank's DCP verify shard from the lengths eager
+    plans: the asm cp verify reads the draft tokens from the cache, so its shard
+    spans them, and that shard must still fit the static graph buffers."""
 
     def setUp(self):
-        for target, replacement in (
-            ("create_flashinfer_kv_indices_triton", _NoopKernel()),
+        parallel = SimpleNamespace(
+            dcp_enabled=True, dcp_size=_DCP_SIZE, dcp_rank=0, attn_dcp_rank=0
+        )
+        for module, target, replacement in (
+            (aiter_backend, "create_flashinfer_kv_indices_triton", _NoopKernel()),
+            (aiter_backend, "create_mla_kv_page_table_for_dcp", _NoopKernel()),
+            (aiter_backend, "compact_dcp_verify_token_table_to_ragged", _NoopKernel()),
+            (dcp_planner, "update_kv_lens_and_indices", _NoopKernel()),
             # The asm cp route runs only with the persistent MLA kernels.
-            ("_use_mla_ps_kernel", True),
+            (aiter_backend, "_use_mla_ps_kernel", True),
+            (aiter_backend, "get_parallel", lambda: parallel),
+            (dcp_planner, "get_parallel", lambda: parallel),
+            (dcp_layout, "get_parallel", lambda: parallel),
         ):
-            patcher = patch.object(aiter_backend, target, replacement)
+            patcher = patch.object(module, target, replacement)
             patcher.start()
             self.addCleanup(patcher.stop)
 
-    def _localized_kv_lens(self, asm_cprr):
+    def _replay_shard_lens(self, asm_cprr):
         backend = _dcp_verify_backend(asm_cprr)
+        seq_lens = _DCP_SEQ_LENS.clone()
         backend._apply_cuda_graph_metadata(
-            _BATCH_SIZE,
-            torch.arange(_BATCH_SIZE, dtype=torch.int32),
-            _SEQ_LENS.clone(),
-            int(_SEQ_LENS.sum()),
-            ForwardMode.TARGET_VERIFY,
-            None,
-            None,
-            _DRAFT_TOKENS,
+            bs=_BATCH_SIZE,
+            req_pool_indices=torch.arange(_BATCH_SIZE, dtype=torch.int32),
+            seq_lens=seq_lens,
+            seq_lens_sum=int(_DCP_SEQ_LENS.sum()),
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            spec_info=None,
+            seq_lens_cpu=None,
+            verify_tokens_per_req=_DRAFT_TOKENS,
         )
-        kv_lens, spans = backend.localized
-        self.assertEqual(kv_lens, spans)
-        return kv_lens
+        # The planner localizes its KV lengths in place; the batch's must survive.
+        self.assertEqual(seq_lens.tolist(), _DCP_SEQ_LENS.tolist())
+
+        metadata = backend.forward_metadata
+        shard_lens = metadata.local_kv_lens.view(_BATCH_SIZE, _DRAFT_TOKENS)[:, 0]
+        self.assertLessEqual(
+            int(shard_lens.max()), metadata.verify_token_table.shape[1]
+        )
+        if asm_cprr:
+            self.assertLessEqual(
+                int(metadata.cprr_kv_indptr[-1]), metadata.cprr_kv_indices.numel()
+            )
+        return shard_lens.tolist()
 
     def test_asm_cp_verify_shard_spans_the_draft_tokens(self):
         self.assertEqual(
-            self._localized_kv_lens(asm_cprr=True),
-            (_SEQ_LENS + _DRAFT_TOKENS).tolist(),
+            self._replay_shard_lens(asm_cprr=True),
+            _rank0_shard_lens(_DCP_SEQ_LENS + _DRAFT_TOKENS),
         )
 
     def test_gluon_verify_shard_stays_the_prefix(self):
         # Gluon attends the draft tokens from k_window, on one rank only.
-        self.assertEqual(self._localized_kv_lens(asm_cprr=False), _SEQ_LENS.tolist())
+        self.assertEqual(
+            self._replay_shard_lens(asm_cprr=False), _rank0_shard_lens(_DCP_SEQ_LENS)
+        )
 
 
 if __name__ == "__main__":
