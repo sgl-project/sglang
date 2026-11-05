@@ -187,7 +187,10 @@ def _megakernel(**entries):
             cuda_graph_runner=None,
             draft_runner=SimpleNamespace(
                 model=_model(**entries),
-                model_config=SimpleNamespace(hidden_size=4, dtype=torch.float32),
+                model_config=SimpleNamespace(
+                    hidden_size=4, spec_hidden_size=4, dtype=torch.float32
+                ),
+                spec_algorithm=SimpleNamespace(is_standalone=lambda: False),
             ),
         ),
     )
@@ -1069,6 +1072,57 @@ class TestSpecRelayBypass(CustomTestCase):
 
         future_map._stash.assert_called_once_with(indices, payload)
         self.assertIsNone(future_map._deferred_relay)
+
+
+class TestDraftOutputWidth(CustomTestCase):
+    def test_extend_outputs_follow_the_draft_hidden_stream(self):
+        for width, dtype, reuse in (
+            (4, torch.float32, True),
+            (16, torch.float32, False),
+        ):
+            with self.subTest(width=width, dtype=dtype):
+                supplied = {}
+
+                def extend(**buffers):
+                    supplied.update(buffers)
+                    return lambda bs: (lambda io: None) if bs == 1 else None
+
+                mk = _megakernel(draft_extend=extend)
+                mk._draft_config.spec_hidden_size = width
+                hidden = torch.zeros((2, 4), dtype=dtype)
+                mk._draft_worker.cuda_graph_runner = SimpleNamespace(
+                    buffers=SimpleNamespace(
+                        topk_index=torch.zeros((2, 1), dtype=torch.int64),
+                        topk_p=torch.ones((2, 1)),
+                        hidden_states=hidden,
+                    )
+                )
+                runner = SimpleNamespace(
+                    max_bs=1, device="cpu", captured_req_width=4, capture_bs=(1,)
+                )
+                with (
+                    patch.object(
+                        overlap_utils, "spec_relay_bypass_enabled", return_value=True
+                    ),
+                    patch.object(
+                        eagle_megakernel,
+                        "get_parallel",
+                        return_value=SimpleNamespace(moe_ep_size=1),
+                    ),
+                    patch.object(eagle_megakernel, "megakernel_agree"),
+                ):
+                    self.assertEqual(mk.bind_extend_graphs(runner), {1})
+                self.assertEqual(supplied["hidden"].shape, (1, width))
+                self.assertEqual(
+                    supplied["hidden"].data_ptr() == hidden.data_ptr(), reuse
+                )
+
+    def test_no_recurrent_hidden_stream_keeps_stock(self):
+        factory = MagicMock()
+        mk = _megakernel(draft_extend=factory)
+        mk._draft_runner.spec_algorithm = SimpleNamespace(is_standalone=lambda: True)
+        self.assertEqual(mk.bind_extend_graphs(SimpleNamespace()), frozenset())
+        factory.assert_not_called()
 
 
 if __name__ == "__main__":
