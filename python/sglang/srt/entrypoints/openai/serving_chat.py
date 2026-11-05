@@ -1790,6 +1790,38 @@ class OpenAIServingChat(OpenAIServingBase):
             and issubclass(tool_detector, ResponseTemplateToolDetector)
         )
 
+    # The only reasoning-effort levels an always-on GLM template understands
+    # (`effective_reasoning_effort` in the GLM-5.3 chat template); every other
+    # value falls through to the template default, "max".
+    _GLM_REASONING_EFFORTS = ("low", "high", "max")
+
+    def _normalize_glm_reasoning_effort(self, request: ChatCompletionRequest) -> None:
+        """Fold a GLM request's effort onto the levels its template understands.
+
+        The GLM-5.3 template reads neither ``thinking`` nor ``enable_thinking``
+        (see ``_is_glm53``): it renders ``low``/``high`` into its "Reasoning
+        Effort:" line and falls back to ``max`` for any other value, so a
+        request effort such as ``"none"`` means "the template default", not
+        "reasoning off". Drop the thinking keys that
+        ``normalize_reasoning_inputs`` derives from ``effort != "none"``, and map
+        unsupported levels to ``max``, so the prompt and the grammar built from
+        these kwargs cannot disagree about whether this turn has a thinking
+        section.
+        """
+        config = self.template_manager.reasoning_config
+        if self.reasoning_parser != "glm45" or config is None or not config.always_on:
+            return
+        if (
+            request.reasoning_effort is not None
+            and request.reasoning_effort not in self._GLM_REASONING_EFFORTS
+        ):
+            request.reasoning_effort = "max"
+        if request.chat_template_kwargs:
+            kwargs = dict(request.chat_template_kwargs)
+            kwargs.pop("thinking", None)
+            kwargs.pop("enable_thinking", None)
+            request.chat_template_kwargs = kwargs or None
+
     def _process_messages(
         self,
         request: ChatCompletionRequest,
@@ -1813,6 +1845,9 @@ class OpenAIServingChat(OpenAIServingBase):
 
         if self.is_minimax_m3:
             _normalize_minimax_m3_request(request)
+
+        # GLM has no thinking toggle, so its effort must not imply one.
+        self._normalize_glm_reasoning_effort(request)
 
         normalize_hunyuan_reasoning_effort(
             request, self.reasoning_parser, self.template_manager.reasoning_config
@@ -1842,16 +1877,15 @@ class OpenAIServingChat(OpenAIServingBase):
             and not any(tool.function.strict for tool in effective_tools)
         )
         if glm_constraint:
-            enable_thinking = (request.chat_template_kwargs or {}).get(
-                "enable_thinking"
-            )
             parser = FunctionCallParser(effective_tools, self.tool_call_parser)
+            # Take the reasoning prefix from the template, not from a request
+            # kwarg: a GLM template always opens ` thinking` and never reads
+            # `enable_thinking`, so a grammar without the prefix would ban the
+            # only token that can close thinking and run to max_new_tokens.
             tool_call_constraint = parser.get_structure_constraint(
                 request.tool_choice,
                 parallel_tool_calls=request.parallel_tool_calls,
-                thinking_mode=True
-                if enable_thinking is None
-                else bool(enable_thinking),
+                thinking_mode=thinking_mode,
             )
 
         # Apply chat template and its stop strings
