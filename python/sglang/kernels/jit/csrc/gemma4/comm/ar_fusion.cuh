@@ -29,15 +29,17 @@
 // that divides kHidden / 8.
 #pragma once
 
-#include <cuda_bf16.h>
-#include <cuda_fp8.h>
-
-#include <sgl_kernel/distributed/communicator.cuh>
-#include <sgl_kernel/distributed/ptx.cuh>
 #include <sgl_kernel/tensor.h>
+
 #include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/vec.cuh>
 #include <sgl_kernel/warp.cuh>
+
+#include <sgl_kernel/distributed/communicator.cuh>
+#include <sgl_kernel/distributed/ptx.cuh>
+
+#include <cuda_bf16.h>
+#include <cuda_fp8.h>
 
 namespace sglang {
 
@@ -83,7 +85,8 @@ SGL_DEVICE uint4 pack(const float* f) {
   uint4 v;
   auto* p = reinterpret_cast<__nv_bfloat162*>(&v);
 #pragma unroll
-  for (int i = 0; i < 4; ++i) p[i] = __floats2bfloat162_rn(f[2 * i], f[2 * i + 1]);
+  for (int i = 0; i < 4; ++i)
+    p[i] = __floats2bfloat162_rn(f[2 * i], f[2 * i + 1]);
   return v;
 }
 
@@ -91,8 +94,9 @@ SGL_DEVICE float bf16_round(float x) {
   return __bfloat162float(__float2bfloat16_rn(x));
 }
 
-template <uint32_t kHidden, uint32_t kThreads, bool kUsePDL>
-struct Gemma4ArFusionKernel {
+// Shape constants and the per-row device code, for one hidden size and block width.
+template <uint32_t kHidden, uint32_t kThreads>
+struct RowEpilogue {
   static constexpr uint32_t kVec = 8;  // bf16 per 16-byte vector
   static constexpr uint32_t kNumVecs = kHidden / kVec;
   static constexpr uint32_t kPerThread = kNumVecs / kThreads;
@@ -116,7 +120,8 @@ struct Gemma4ArFusionKernel {
     __syncthreads();
     float t = 0.f;
 #pragma unroll
-    for (uint32_t i = 0; i < kNumWarps; ++i) t += smem[i];
+    for (uint32_t i = 0; i < kNumWarps; ++i)
+      t += smem[i];
     return t;
   }
 
@@ -144,7 +149,8 @@ struct Gemma4ArFusionKernel {
     for (uint32_t i = 0; i < kPerThread; ++i) {
       unpack(raw[i], x[i]);
 #pragma unroll
-      for (uint32_t j = 0; j < kVec; ++j) ss += x[i][j] * x[i][j];
+      for (uint32_t j = 0; j < kVec; ++j)
+        ss += x[i][j] * x[i][j];
     }
     const float r1 = rsqrtf(block_sum(ss, smem) / kHidden + p.eps);
     const float s = p.scalar_bf16 ? __bfloat162float(*static_cast<const __nv_bfloat16*>(p.scalar))
@@ -187,7 +193,8 @@ struct Gemma4ArFusionKernel {
       uint2 q;
       auto* qp = reinterpret_cast<__nv_fp8_e4m3*>(&q);
 #pragma unroll
-      for (uint32_t j = 0; j < kVec; ++j) qp[j] = __nv_fp8_e4m3(fminf(fmaxf(x[i][j] / scale, -kFp8Max), kFp8Max));
+      for (uint32_t j = 0; j < kVec; ++j)
+        qp[j] = __nv_fp8_e4m3(fminf(fmaxf(x[i][j] / scale, -kFp8Max), kFp8Max));
       // adjacent lanes hold adjacent vectors: the even lane issues both as one 16-byte multicast store
       const uint32_t px = __shfl_xor_sync(0xffffffff, q.x, 1), py = __shfl_xor_sync(0xffffffff, q.y, 1);
       if ((t & 1) == 0) store_mc(p.out_mc, (row * kHidden + c * kVec) / 16, make_uint4(q.x, q.y, px, py));
@@ -197,24 +204,30 @@ struct Gemma4ArFusionKernel {
       }
     }
   }
+};
 
-  template <bool kFinal>
-  __global__ static void __launch_bounds__(kThreads) kernel(const __grid_constant__ Params p) {
-    __shared__ float smem[kNumWarps];
-    // Reserve the window before the PDL wait, signal after it (see McBarrier).
-    const auto barrier = McBarrier(p.sem_local, p.sem_mc, p.world_size, /*num_arrives=*/2);
-    device::PDLWaitPrimary<kUsePDL>();
-    barrier.arrive_relaxed(/*n=*/0);  // every rank's partials are written
-    __syncthreads();
-    uint4 raw[kPerThread];
-    for (uint32_t lr = blockIdx.x; lr < p.rows; lr += gridDim.x) {
-      load_row(p, lr, raw);
-      epilogue<kFinal>(p, lr, raw, smem);
-    }
-    device::PDLTriggerSecondary<kUsePDL>();
-    __syncthreads();
-    barrier.arrive_rel_acq(/*n=*/1);  // every rank's multicast stores have landed
+template <uint32_t kHidden, uint32_t kThreads, bool kUsePDL, bool kFinal>
+__global__ void __launch_bounds__(kThreads) gemma4_ar_fusion_kernel(const __grid_constant__ Params p) {
+  using E = RowEpilogue<kHidden, kThreads>;
+  __shared__ float smem[E::kNumWarps];
+  // Reserve the window before the PDL wait, signal after it (see McBarrier).
+  const auto barrier = McBarrier(p.sem_local, p.sem_mc, p.world_size, /*num_arrives=*/2);
+  device::PDLWaitPrimary<kUsePDL>();
+  barrier.arrive_relaxed(/*n=*/0);  // every rank's partials are written
+  __syncthreads();
+  uint4 raw[E::kPerThread];
+  for (uint32_t lr = blockIdx.x; lr < p.rows; lr += gridDim.x) {
+    E::load_row(p, lr, raw);
+    E::template epilogue<kFinal>(p, lr, raw, smem);
   }
+  device::PDLTriggerSecondary<kUsePDL>();
+  __syncthreads();
+  barrier.arrive_rel_acq(/*n=*/1);  // every rank's multicast stores have landed
+}
+
+template <uint32_t kHidden, uint32_t kThreads, bool kUsePDL>
+struct Gemma4ArFusionKernel {
+  static constexpr uint32_t kNumGroups = RowEpilogue<kHidden, kThreads>::kNumGroups;
 
   // ---- host -----------------------------------------------------------------
 
@@ -260,10 +273,12 @@ struct Gemma4ArFusionKernel {
   }
 
   template <bool kFinal>
-  static void launch(const Params& p, int64_t num_blocks, const host::distributed::CommunicatorObj& comm, DLDevice device) {
+  static void
+  launch(const Params& p, int64_t num_blocks, const host::distributed::CommunicatorObj& comm, DLDevice device) {
     CHECK_HOST(num_blocks >= 1) << "invalid num_blocks: " << num_blocks;
     num_blocks = std::min<int64_t>(num_blocks, comm.get_pull_blocks());
-    host::LaunchKernel(static_cast<uint32_t>(num_blocks), kThreads, device).enable_pdl(kUsePDL)(kernel<kFinal>, p);
+    host::LaunchKernel(static_cast<uint32_t>(num_blocks), kThreads, device)
+        .enable_pdl(kUsePDL)(gemma4_ar_fusion_kernel<kHidden, kThreads, kUsePDL, kFinal>, p);
   }
 
   /// One fused site. `partial` is this rank's [T, H] bf16 view of a symmetric
