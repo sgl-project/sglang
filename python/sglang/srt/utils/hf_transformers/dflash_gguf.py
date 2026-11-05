@@ -18,11 +18,8 @@ The public nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-4GB-DFlash export uses this layou
 LiLiCorr and packed draft weights use different runtimes and are not accepted.
 Target layer indices include the embedding output in GGUF, so they are shifted
 by one for SGLang's decoder-layer captures.
-Only small config values are cached; readers retain large tokenizer views.
+Detection and config loading share compact metadata; readers are not cached.
 """
-
-from copy import deepcopy
-from functools import lru_cache
 
 from transformers import Qwen3Config
 
@@ -53,74 +50,89 @@ def dflash_gguf_name_map(num_layers):
     return names
 
 
-@lru_cache(maxsize=4)
-def is_plain_dflash_gguf(path):
-    from gguf import GGMLQuantizationType, GGUFReader
+def _extract_dflash_gguf_metadata(reader):
+    tokens = reader.fields.get("tokenizer.ggml.tokens")
+    return {
+        "fields": {
+            key: field.contents()
+            for key, field in reader.fields.items()
+            if key.startswith(("dflash.", "lilicorr."))
+            or key in ("general.architecture", "tokenizer.ggml.mask_token_id")
+        },
+        "tensors": {
+            tensor.name: (tuple(int(size) for size in tensor.shape), tensor.tensor_type)
+            for tensor in reader.tensors
+        },
+        "vocab_size": None if tokens is None else len(tokens.data),
+        "token_types": None if tokens is None else tuple(tokens.types),
+    }
 
-    reader = GGUFReader(path, mode="r")
-    arch = reader.fields.get("general.architecture")
+
+def is_plain_dflash_gguf(path):
+    from gguf import GGMLQuantizationType
+
+    from sglang.srt.utils.hf_transformers.gguf_native import _read_gguf_metadata
+
+    _, metadata = _read_gguf_metadata(path)
     return (
-        arch is not None
-        and arch.contents() == "dflash"
-        and "dflash.target_layers" in reader.fields
-        and not any(key.startswith("lilicorr.") for key in reader.fields)
-        and bool(reader.tensors)
+        metadata is not None
+        and "dflash.target_layers" in metadata["fields"]
+        and not any(key.startswith("lilicorr.") for key in metadata["fields"])
+        and bool(metadata["tensors"])
         and all(
-            tensor.tensor_type
+            tensor_type
             in (
                 GGMLQuantizationType.F32,
                 GGMLQuantizationType.F16,
                 GGMLQuantizationType.BF16,
             )
-            for tensor in reader.tensors
+            for _, tensor_type in metadata["tensors"].values()
         )
     )
 
 
-def _read_plain_dflash_gguf(path):
-    from gguf import GGMLQuantizationType, GGUFReader
+def _validate_plain_dflash_gguf(metadata):
+    from gguf import GGMLQuantizationType
 
-    reader = GGUFReader(path, mode="r")
-    meta = {
-        key: field.contents()
-        for key, field in reader.fields.items()
-        if key.startswith(("dflash.", "lilicorr."))
-        or key in ("general.architecture", "tokenizer.ggml.mask_token_id")
-    }
-    if meta.get("general.architecture") != "dflash" or any(
-        key.startswith("lilicorr.") for key in meta
+    if metadata is None or any(
+        key.startswith("lilicorr.") for key in metadata["fields"]
     ):
         raise ValueError("Expected a plain DFlash GGUF without LiLiCorr metadata")
+    meta = metadata["fields"]
+    if meta.get("general.architecture") != "dflash":
+        raise ValueError("Expected a plain DFlash GGUF without LiLiCorr metadata")
     names = dflash_gguf_name_map(int(meta["dflash.block_count"]))
-    actual = {tensor.name for tensor in reader.tensors}
+    actual = metadata["tensors"].keys()
     if actual != names.keys():
         raise ValueError(
             f"Unsupported DFlash GGUF tensors: missing={sorted(names.keys() - actual)}, "
             f"unexpected={sorted(actual - names.keys())}"
         )
-    for tensor in reader.tensors:
-        if tensor.tensor_type not in (
+    for name, (_, tensor_type) in metadata["tensors"].items():
+        if tensor_type not in (
             GGMLQuantizationType.F32,
             GGMLQuantizationType.F16,
             GGMLQuantizationType.BF16,
         ):
-            raise ValueError(
-                f"DFlash GGUF requires F32, F16, or BF16 weights: {tensor.name}"
-            )
-    return reader, meta, names
+            raise ValueError(f"DFlash GGUF requires F32, F16, or BF16 weights: {name}")
+    return names
 
 
 def build_plain_dflash_gguf_config(path):
-    return Qwen3Config(**deepcopy(_read_plain_dflash_gguf_config(path)))
+    return Qwen3Config(**_read_plain_dflash_gguf_config(path))
 
 
-@lru_cache(maxsize=4)
 def _read_plain_dflash_gguf_config(path) -> dict:
     from gguf import GGUFValueType
 
-    reader, meta, _ = _read_plain_dflash_gguf(path)
-    tokens = reader.fields["tokenizer.ggml.tokens"]
-    if tokens.types != [GGUFValueType.ARRAY, GGUFValueType.STRING]:
+    from sglang.srt.utils.hf_transformers.gguf_native import _read_gguf_metadata
+
+    _, metadata = _read_gguf_metadata(path)
+    _validate_plain_dflash_gguf(metadata)
+    meta = metadata["fields"]
+    if metadata["token_types"] is None:
+        raise KeyError("tokenizer.ggml.tokens")
+    if metadata["token_types"] != (GGUFValueType.ARRAY, GGUFValueType.STRING):
         raise ValueError(
             "DFlash GGUF tokenizer.ggml.tokens must be an array of strings"
         )
@@ -143,8 +155,8 @@ def _read_plain_dflash_gguf_config(path) -> dict:
     if int(field("attention.value_length")) != head_dim:
         raise ValueError("DFlash GGUF requires equal key and value dimensions")
     hidden = int(field("embedding_length"))
-    fc = next(t for t in reader.tensors if t.name == "fc.weight")
-    if tuple(fc.shape) != (hidden * len(targets), hidden):
+    fc_shape, _ = metadata["tensors"]["fc.weight"]
+    if fc_shape != (hidden * len(targets), hidden):
         raise ValueError("DFlash GGUF fc shape does not match its target layers")
     return dict(
         architectures=["DFlashDraftModel"],
@@ -157,7 +169,7 @@ def _read_plain_dflash_gguf_config(path) -> dict:
         rms_norm_eps=float(field("attention.layer_norm_rms_epsilon")),
         max_position_embeddings=int(field("context_length")),
         rope_theta=float(field("rope.freq_base")),
-        vocab_size=len(tokens.data),
+        vocab_size=metadata["vocab_size"],
         is_causal=bool(field("attention.causal")),
         use_sliding_window=any(pattern),
         sliding_window=int(field("attention.sliding_window")),
@@ -174,9 +186,10 @@ def _read_plain_dflash_gguf_config(path) -> dict:
 def plain_dflash_gguf_weights(path):
     import numpy as np
     import torch
-    from gguf import GGMLQuantizationType
+    from gguf import GGMLQuantizationType, GGUFReader
 
-    reader, _, names = _read_plain_dflash_gguf(path)
+    reader = GGUFReader(path, mode="r")
+    names = _validate_plain_dflash_gguf(_extract_dflash_gguf_metadata(reader))
     for tensor in reader.tensors:
         data = np.array(tensor.data, copy=True)
         if tensor.tensor_type == GGMLQuantizationType.BF16:

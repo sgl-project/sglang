@@ -136,7 +136,9 @@ class TestDFlashGGUF(CustomTestCase):
             path = Path(temp) / "draft.gguf"
             write_draft(path)
             with track_readers() as (readers, token_parts):
-                config = build_plain_dflash_gguf_config(str(path))
+                self.assertEqual(read_gguf_architecture(str(path)), "dflash")
+                self.assertTrue(has_native_gguf_support(str(path)))
+                config = get_config(str(path), trust_remote_code=False)
                 config.dflash_config["target_layer_ids"].clear()
                 again = build_plain_dflash_gguf_config(str(path))
                 self.assertEqual(again.dflash_config["target_layer_ids"], [1, 5])
@@ -149,23 +151,40 @@ class TestDFlashGGUF(CustomTestCase):
             gc.collect()
             self.assertTrue(all(ref() is None for ref in readers + token_parts))
 
-    def test_architecture_probe_does_not_retain_non_dflash_readers(self):
-        """Probing an ordinary target must not retain its full tokenizer metadata."""
+    def test_architecture_probe_releases_metadata_and_refreshes_replaced_files(self):
+        """Ordinary GGUF probes must release arrays and observe file replacements."""
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "target.gguf"
-            writer = gguf.GGUFWriter(path, "llama")
-            writer.add_array("tokenizer.ggml.tokens", ["a", "b"])
-            writer.add_tensor("token_embd.weight", np.ones((2, 32), dtype=np.float32))
-            writer.write_header_to_file()
-            writer.write_kv_data_to_file()
-            writer.write_tensors_to_file()
-            writer.close()
-            with track_readers() as (readers, token_parts):
-                self.assertEqual(read_gguf_architecture(str(path)), "llama")
-            gc.collect()
-            self.assertEqual(len(readers), 1)
-            self.assertTrue(token_parts)
-            self.assertTrue(all(ref() is None for ref in readers + token_parts))
+            self.assertIsNone(read_gguf_architecture(str(path)))
+            with (
+                track_readers() as (readers, token_parts),
+                patch(
+                    "sglang.srt.utils.hf_transformers.gguf_native._extract_dflash_gguf_metadata",
+                    side_effect=AssertionError(
+                        "DFlash extraction reached another model"
+                    ),
+                ),
+            ):
+                for index, arch in enumerate(("llama", "qwen2"), 1):
+                    replacement = Path(temp) / "replacement.gguf"
+                    writer = gguf.GGUFWriter(replacement, arch)
+                    writer.add_array("tokenizer.ggml.tokens", ["a", "b"])
+                    writer.add_tensor(
+                        "token_embd.weight", np.ones((2, 32), dtype=np.float32)
+                    )
+                    writer.write_header_to_file()
+                    writer.write_kv_data_to_file()
+                    writer.write_tensors_to_file()
+                    writer.close()
+                    replacement.replace(path)
+                    self.assertEqual(read_gguf_architecture(str(path)), arch)
+                    self.assertFalse(has_native_gguf_support(str(path)))
+                    self.assertEqual(len(readers), index)
+                    gc.collect()
+                    self.assertTrue(token_parts)
+                    self.assertTrue(all(ref() is None for ref in readers + token_parts))
+            path.unlink()
+            self.assertIsNone(read_gguf_architecture(str(path)))
 
     def test_config_preserves_vocabulary_capture_indices_and_attention(self):
         tokens = ("", "é", "long token", "mask", "z")
@@ -195,6 +214,7 @@ class TestDFlashGGUF(CustomTestCase):
                 with self.subTest(tokens=tokens):
                     path = Path(temp) / f"draft-{index}.gguf"
                     write_draft(path, tokens=tokens)
+                    self.assertTrue(has_native_gguf_support(str(path)))
                     with self.assertRaisesRegex(
                         ValueError, "tokenizer.ggml.tokens must be an array of strings"
                     ):
@@ -258,6 +278,7 @@ class TestDFlashGGUF(CustomTestCase):
                 with self.subTest(kwargs=kwargs):
                     path = Path(temp) / f"draft{index}.gguf"
                     write_draft(path, **kwargs)
+                    self.assertTrue(has_native_gguf_support(str(path)))
                     with self.assertRaisesRegex(
                         ValueError, "Unsupported DFlash GGUF tensors"
                     ):
@@ -271,9 +292,14 @@ class TestDFlashGGUF(CustomTestCase):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "draft.gguf"
             write_draft(path, lilicorr=True)
-            self.assertFalse(has_native_gguf_support(str(path)))
-            with self.assertRaisesRegex(ValueError, "without LiLiCorr"):
-                build_plain_dflash_gguf_config(str(path))
+            with patch(
+                "sglang.srt.utils.hf_transformers.gguf_native._extract_dflash_gguf_metadata",
+                side_effect=AssertionError("Plain DFlash extraction reached LiLiCorr"),
+            ):
+                self.assertEqual(read_gguf_architecture(str(path)), "dflash")
+                self.assertFalse(has_native_gguf_support(str(path)))
+                with self.assertRaisesRegex(ValueError, "without LiLiCorr"):
+                    build_plain_dflash_gguf_config(str(path))
 
     def test_packed_dflash_does_not_enter_the_dense_loader(self):
         with tempfile.TemporaryDirectory() as temp:
