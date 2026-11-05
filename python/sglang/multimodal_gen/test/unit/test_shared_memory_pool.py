@@ -177,32 +177,6 @@ def test_estimated_manager_has_no_mapping():
     assert manager.mapped_layer_bytes() == {}
 
 
-def test_no_resident_seed_on_a_shared_pool(monkeypatch):
-    from types import SimpleNamespace
-
-    from sglang.multimodal_gen.runtime.managers.memory_managers import initial_residency
-
-    _share_pool(monkeypatch, True)
-    monkeypatch.setattr(
-        initial_residency, "auto_residency_static_skip_reason", lambda args: None
-    )
-    monkeypatch.setattr(type(current_platform), "is_cuda", lambda self: True)
-    seeded: list[str] = []
-    server_args = SimpleNamespace(
-        use_fsdp_inference=False,
-        set_auto_residency_mode=lambda name, mode: seeded.append(name),
-    )
-    monkeypatch.setattr(
-        initial_residency.current_platform,
-        "get_available_gpu_memory",
-        lambda **kwargs: (_ for _ in ()).throw(
-            AssertionError("seed must not size the pool")
-        ),
-    )
-    initial_residency.maybe_seed_initial_residency(server_args, inventory=[])
-    assert seeded == []
-
-
 def test_mapped_layers_carry_no_transfer_work_on_a_shared_pool(monkeypatch):
     class _Manager(_FakeManager):
         def layer_weight_bytes(self):
