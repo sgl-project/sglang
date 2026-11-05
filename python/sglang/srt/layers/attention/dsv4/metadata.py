@@ -195,8 +195,8 @@ class PagedIndexerMetadata:
     deep_gemm_varlen: bool = False
     # A list when the dynamic-budget forward is row-chunked: one schedule per chunk.
     deep_gemm_metadata: Any = field(init=False, repr=False)
-    # The request of each query row when the schedule is varlen, else None; a list
-    # alongside a chunked ``deep_gemm_metadata``.
+    # The request of each query row of a chunk (all rows if unchunked) when the
+    # schedule is varlen, else None; a shorter last chunk takes its prefix.
     deep_gemm_indices: Any = field(init=False, repr=False, default=None)
     topk_metadata: torch.Tensor = field(init=False, repr=False)
     nonpaged_plan: Optional[NonPagedIndexerPlan] = field(
@@ -269,43 +269,39 @@ class PagedIndexerMetadata:
             )
             if varlen:
                 assert compressed_seq_lens.shape[1] == 1, compressed_seq_lens.shape
+                self.deep_gemm_indices = (
+                    torch.arange(
+                        self.rows_per_chunk or num_rows,
+                        dtype=torch.int32,
+                        device=compressed_seq_lens.device,
+                    )
+                    // group
+                )
 
             def schedule(lens: torch.Tensor):
-                if not varlen:
-                    plan = get_paged_mqa_logits_metadata(
-                        lens.view(-1, group),
+                if varlen:
+                    return get_paged_mqa_logits_metadata(
+                        lens.view(-1, 1),
                         self.compressed_page_size,
                         deep_gemm.get_num_sms(),
+                        self.deep_gemm_indices[: lens.shape[0]],
                     )
-                    return plan, None
-                indices = torch.arange(
-                    lens.shape[0], dtype=torch.int32, device=lens.device
-                )
-                if group > 1:
-                    indices = indices // group
-                plan = get_paged_mqa_logits_metadata(
-                    lens.view(-1, 1),
+                return get_paged_mqa_logits_metadata(
+                    lens.view(-1, group),
                     self.compressed_page_size,
                     deep_gemm.get_num_sms(),
-                    indices,
                 )
-                return plan, indices
 
             if self.rows_per_chunk is not None:
                 # Chunk metadata is shared by all indexer layers in this forward.
-                plans = [
+                self.deep_gemm_metadata = [
                     schedule(compressed_seq_lens[rows])
                     for rows in iter_row_chunks(
                         num_rows=num_rows, rows_per_chunk=self.rows_per_chunk
                     )
                 ]
-                self.deep_gemm_metadata = [plan for plan, _ in plans]
-                if varlen:
-                    self.deep_gemm_indices = [indices for _, indices in plans]
             else:
-                self.deep_gemm_metadata, self.deep_gemm_indices = schedule(
-                    compressed_seq_lens
-                )
+                self.deep_gemm_metadata = schedule(compressed_seq_lens)
 
             assert isinstance(self.deep_gemm_metadata, (torch.Tensor, list))
 
@@ -381,12 +377,6 @@ class PagedIndexerMetadata:
             f"{len(chunks)=}"
         )
         return chunks
-
-    def deep_gemm_indices_for(self, rows: slice) -> Optional[torch.Tensor]:
-        """The ``indices`` of the schedule covering ``rows`` (a ``row_chunks`` slice)."""
-        if isinstance(self.deep_gemm_indices, list):
-            return self.deep_gemm_indices[rows.start // self.rows_per_chunk]
-        return self.deep_gemm_indices
 
     def copy_(self, other: PagedIndexerMetadata):
         # A chunked schedule list has no in-place copy; rebind it instead.

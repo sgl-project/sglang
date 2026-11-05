@@ -50,9 +50,9 @@ class DeepGEMMDecodeData(msgspec.Struct, frozen=True):
         q_fp4, q_sf = self.q_fp4[rows], self.q_sf[rows]
         lens = metadata.compressed_seq_lens[rows]
         table = metadata.page_table[rows]
-        indices = metadata.deep_gemm_indices_for(rows)
+        indices = metadata.deep_gemm_indices
         if indices is not None:
-            return (q_fp4, q_sf), lens, table, indices
+            return (q_fp4, q_sf), lens, table, indices[: lens.shape[0]]
         if n > 1:
             heads = q_fp4.shape[2]
             q_fp4 = q_fp4.view(-1, n, heads, 64)

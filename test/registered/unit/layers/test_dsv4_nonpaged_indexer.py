@@ -869,7 +869,7 @@ class TestPagedIndexerMetadataChunking(CustomTestCase):
         )
         chunks = [rows for rows, _ in metadata.row_chunks()]
         self.assertGreater(len(chunks), 1)
-        self.assertEqual(len(metadata.deep_gemm_indices), len(chunks))
+        self.assertEqual(metadata.deep_gemm_indices.shape[0], metadata.rows_per_chunk)
         calls = deep_gemm.get_paged_mqa_logits_metadata.call_args_list
         for rows, call in zip(chunks, calls):
             lens, _block_kv, _num_sms, indices = call.args
@@ -880,26 +880,19 @@ class TestPagedIndexerMetadataChunking(CustomTestCase):
             torch.testing.assert_close(
                 indices, torch.arange(n, dtype=torch.int32) // group
             )
-            self.assertIs(metadata.deep_gemm_indices_for(rows), indices)
+            torch.testing.assert_close(metadata.deep_gemm_indices[:n], indices)
 
-    def test_varlen_needs_enough_rows(self):
-        metadata, deep_gemm, _ = self._build(
-            num_rows=64,
-            budget=None,
-            use_topk_v2=False,
-            rows_per_request=4,
-            deep_gemm_varlen=True,
-        )
-        self.assertIsNone(metadata.deep_gemm_indices)
-        self.assertEqual(len(deep_gemm.get_paged_mqa_logits_metadata.call_args.args), 3)
-
-    def test_varlen_caps_rows_at_the_scheduler_smem_limit(self):
-        for num_rows, varlen in ((29032, True), (29040, False)):
+    def test_varlen_row_bounds(self):
+        for num_rows, group, varlen in (
+            (64, 4, False),
+            (29032, 8, True),
+            (29040, 8, False),
+        ):
             metadata, deep_gemm, _ = self._build(
                 num_rows=num_rows,
                 budget=None,
                 use_topk_v2=False,
-                rows_per_request=8,
+                rows_per_request=group,
                 deep_gemm_varlen=True,
             )
             self.assertEqual(metadata.deep_gemm_indices is not None, varlen)
@@ -1037,7 +1030,7 @@ class TestChunkedPagedDecode(CustomTestCase):
             use_topk_v2=True,
             rows_per_request=1,
             row_chunks=lambda: list(zip(self.chunks, self.plans)),
-            deep_gemm_indices_for=lambda rows: None,
+            deep_gemm_indices=None,
         )
         inputs = DecodeInputs(
             indexer=None,
@@ -1164,7 +1157,7 @@ class TestGroupedVerifyRows(CustomTestCase):
             compressed_seq_lens=lens,
             page_table=table.repeat_interleave(block, dim=0),
             rows_per_request=rows_per_request,
-            deep_gemm_indices_for=lambda rows: indices,
+            deep_gemm_indices=indices,
         )
         data = DeepGEMMDecodeData(
             q_fp4=torch.arange(num_rows * heads * 64, dtype=torch.int8).view(
@@ -1203,7 +1196,7 @@ class TestGroupedVerifyRows(CustomTestCase):
         data, metadata, _table, ((q, sf), lens, table, indices) = self._args(
             6, slice(6, 18), request_ids
         )
-        self.assertIs(indices, request_ids)
+        self.assertTrue(torch.equal(indices, request_ids))
         self.assertTrue(torch.equal(q, data.q_fp4[6:18]))
         self.assertTrue(torch.equal(sf, data.q_sf[6:18]))
         self.assertTrue(torch.equal(lens, metadata.compressed_seq_lens[6:18]))

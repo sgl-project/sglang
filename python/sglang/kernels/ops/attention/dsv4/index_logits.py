@@ -154,18 +154,7 @@ def deep_gemm_fp4_paged_mqa_logits(
     sl = seq_lens.to(torch.int32)
     if sl.dim() == 1:
         sl = sl.unsqueeze(-1)
-    if indices is not None:
-        return fp8_fp4_paged_mqa_logits(
-            q_fp4,
-            k_cache,
-            weights.to(torch.bfloat16),
-            sl,
-            page_table,
-            deep_gemm_metadata,
-            max_seq_len,
-            indices=indices,
-        )
-    return fp8_fp4_paged_mqa_logits(
+    args = (
         q_fp4,
         k_cache,
         weights.to(index_weights_dtype()),
@@ -173,9 +162,10 @@ def deep_gemm_fp4_paged_mqa_logits(
         page_table,
         deep_gemm_metadata,
         max_seq_len,
-        False,
-        logits_dtype=index_logits_dtype(),
     )
+    if indices is not None:
+        return fp8_fp4_paged_mqa_logits(*args, indices=indices)
+    return fp8_fp4_paged_mqa_logits(*args, False, logits_dtype=index_logits_dtype())
 
 
 def sparse_logits(
