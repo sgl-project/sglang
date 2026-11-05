@@ -1,5 +1,6 @@
 import unittest
 import weakref
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -21,7 +22,6 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
-    SimpleNamespace,
     popen_launch_server,
 )
 

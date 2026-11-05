@@ -15,10 +15,8 @@ import time
 from contextlib import ExitStack
 from typing import Any, List, Optional, Union
 
-from sglang.multimodal_gen.configs.sample.sampling_params import (
-    DataType,
-    SamplingParams,
-)
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
     ListLorasReq,
     MergeLoraWeightsReq,
@@ -28,13 +26,15 @@ from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     GenerationResult,
-    expand_request_outputs,
     format_lora_message,
     map_request_outputs,
     prepare_request,
     save_outputs,
 )
 from sglang.multimodal_gen.runtime.pipelines_core import Req
+from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
+    expand_request_outputs,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.platforms.plugins import apply_plugin_hooks
 from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (

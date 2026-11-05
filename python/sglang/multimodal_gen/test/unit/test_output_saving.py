@@ -6,7 +6,7 @@ import torch
 from PIL import Image
 
 import sglang.multimodal_gen.runtime.entrypoints.utils as output_utils
-from sglang.multimodal_gen.configs.sample.sampling_params import DataType
+from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     MaterializedOutput,
     post_process_sample,

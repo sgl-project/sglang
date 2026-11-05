@@ -6,7 +6,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from sglang.multimodal_gen.configs.sample.sampling_params import DataType
+from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.runtime.entrypoints import diffusion_generator as dg
 from sglang.multimodal_gen.runtime.scheduler_client import SchedulerClient
 from sglang.multimodal_gen.runtime.utils.device_errors import (

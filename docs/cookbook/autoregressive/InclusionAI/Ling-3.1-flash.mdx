@@ -111,7 +111,7 @@ The image includes KDA normalization/quantization fusion, FP8 block GEMV, router
 Launch the H200 **Low-Latency** recipe, then run:
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --host localhost --port 30000 \
   --model inclusionAI/Ling-3.1-flash \
@@ -125,7 +125,7 @@ python3 -m sglang.bench_serving \
 For the saturation row in the benchmark widget, launch the H200 **High-Throughput** recipe instead and run:
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --host localhost --port 30000 \
   --model inclusionAI/Ling-3.1-flash \

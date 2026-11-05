@@ -9,7 +9,7 @@ import torch
 from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.utils.common import is_npu
 
 if TYPE_CHECKING:
@@ -157,6 +157,11 @@ class AttentionBackend(ABC):
         """
         self.init_forward_metadata_out_graph(forward_batch)
         self.init_forward_metadata_in_graph(forward_batch)
+
+    @property
+    def requires_eager_metadata(self) -> bool:
+        """Whether metadata preparation has host work required on every replay."""
+        return False
 
     def glue_target_verify_metadata(self) -> str:
         """Empty if the target verify prep may be captured into the metadata glue graph

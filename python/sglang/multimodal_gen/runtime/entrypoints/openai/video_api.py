@@ -21,10 +21,10 @@ from fastapi import (
 from fastapi.responses import FileResponse
 
 from sglang.multimodal_gen.configs.sample.sampling_params import (
-    DataType,
     SamplingParams,
     generate_request_id,
 )
+from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.runtime.entrypoints.openai.prompt_enhancement import (
     maybe_enhance_prompt,
 )

@@ -357,9 +357,7 @@ class TestMiniMaxM31Rocm(CustomTestCase):
             device="cuda",
         )
         args._model_config = SimpleNamespace(hf_config=config)
-        with patch(
-            "sglang.srt.utils.hf_transformers_utils.get_config", return_value=config
-        ):
+        with patch("sglang.srt.utils.hf_transformers.get_config", return_value=config):
             _handle_dspark(args)
         self.assertEqual(
             resolution_result(args, "speculative_draft_model_path"), "dummy-draft"
@@ -623,7 +621,7 @@ class TestMiniMaxM31Nvfp4Backend(CustomTestCase):
 
     def test_verify_replans_after_prefix_growth_without_mutating_input_lengths(self):
         from sglang.srt.layers.attention import minimax_sparse_nvfp4_backend as backend
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.model_executor.forward_mode import ForwardMode
 
         class Plan:
             def __init__(self, **kwargs):

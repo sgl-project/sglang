@@ -100,6 +100,12 @@ REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)
 # creation so runtime collectives do not silently fall back to backend defaults.
 _MODEL_PARALLEL_GROUP_TIMEOUT: Optional[timedelta] = None
 
+# AITER fused AR+RMSNorm 1-stage kernel: one block per token up to kMaxBlocks,
+# and every rank reads every peer, so its read volume is payload * world_size
+# (128 KiB of payload at world_size 8).
+_FUSED_AR_RMS_1STAGE_MAX_TOKENS = 80
+_FUSED_AR_RMS_1STAGE_MAX_READ_BYTES = 8 * 128 * 1024
+
 
 def get_torch_distributed_pg_options(group_name=None):
     if not _is_npu:
@@ -309,6 +315,7 @@ class GroupCoordinator:
         recovered_rank: bool = False,
         rank_offset: int = 0,
         max_world_size: Optional[int] = None,
+        use_quick_allreduce: Optional[bool] = None,
     ):
         # Set group info
         group_name = group_name or "anonymous"
@@ -424,6 +431,9 @@ class GroupCoordinator:
         self.use_pynccl = use_pynccl
         self.use_mscclpp = use_mscclpp
         self.use_custom_allreduce = use_custom_allreduce
+        self.use_quick_allreduce = (
+            use_custom_allreduce if use_quick_allreduce is None else use_quick_allreduce
+        )
         self.use_torch_symm_mem_all_reduce = use_torch_symm_mem_all_reduce
         self.use_hpu_communicator = use_hpu_communicator
         self.use_xpu_communicator = use_xpu_communicator
@@ -516,7 +526,7 @@ class GroupCoordinator:
                     "warning, specify --disable-custom-all-reduce explicitly."
                 )
 
-            if is_hip():
+            if self.use_quick_allreduce and is_hip():
                 try:
                     # Initialize a custom quick all-reduce implementation for AMD
                     # when rocm >= gfx942. Quick reduce is designed as a
@@ -850,17 +860,16 @@ class GroupCoordinator:
         if not hasattr(ca_comm, "custom_fused_ar_rms"):
             return None
 
-        # 1-stage vs 2-stage selection for fused AR+RMSNorm:
-        # The 1-stage kernel launches one block per token and is capped at
-        # 80 tokens (kMaxBlocks).  Guard with a byte threshold so large
-        # prefill batches fall through to the 2-stage kernel instead of
-        # hitting a runtime error.  AITER's C++ dispatch already gates
-        # which hidden_dims have valid 1-stage support.
+        # AITER's C++ dispatch further limits 1-stage to the hidden_dims it supports.
         if envs.SGLANG_USE_1STAGE_ALLREDUCE.is_set():
             use_1stage_ar = envs.SGLANG_USE_1STAGE_ALLREDUCE.get()
         else:
             total_bytes = input_.numel() * input_.element_size()
-            use_1stage_ar = total_bytes <= 128 * 1024
+            token_num = input_.numel() // input_.shape[-1]
+            use_1stage_ar = (
+                token_num <= _FUSED_AR_RMS_1STAGE_MAX_TOKENS
+                and total_bytes * self.world_size <= _FUSED_AR_RMS_1STAGE_MAX_READ_BYTES
+            )
 
         if (
             getattr(ca_comm, "_IS_CAPTURING", False)
@@ -2177,6 +2186,7 @@ def init_model_parallel_group(
     backend: str,
     use_pynccl: Optional[bool] = None,
     use_custom_allreduce: Optional[bool] = None,
+    use_quick_allreduce: Optional[bool] = None,
     use_message_queue_broadcaster: bool = False,
     group_name: Optional[str] = None,
     use_mscclpp: Optional[bool] = None,
@@ -2204,6 +2214,7 @@ def init_model_parallel_group(
         use_pynccl=use_pynccl,
         use_mscclpp=use_mscclpp,
         use_custom_allreduce=use_custom_allreduce,
+        use_quick_allreduce=use_quick_allreduce,
         use_torch_symm_mem_all_reduce=use_torch_symm_mem_allreduce,
         use_hpu_communicator=True,
         use_xpu_communicator=True,
@@ -2704,6 +2715,10 @@ def initialize_model_parallel(
             dcp_group_ranks,
             get_world_group().local_rank,
             backend,
+            # Current DCP paths use all-gather/reduce-scatter, all-to-all, or
+            # FP32 all-reduce. QuickAllReduce does not serve these collectives,
+            # but its communicator reserves a large workspace on every rank.
+            use_quick_allreduce=False,
             use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
             group_name="dcp",
             recovered_rank=recovered_rank,
