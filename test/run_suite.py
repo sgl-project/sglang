@@ -198,6 +198,9 @@ NIGHTLY_SUITES = {
         "nightly-16-npu-a3",
         "nightly-acc-2-npu-a3",
         "nightly-acc-8-npu-a3",
+        # TEMP: single-case validation suite, remove after the qwen3.6-27B GPQA
+        # spec-accept pre-check lands.
+        "tmp-acc-2-npu-a3",
         "nightly-acc-16-npu-a3",
         "nightly-acc-4-npu-a5",
         "nightly-perf-2-npu-a3",

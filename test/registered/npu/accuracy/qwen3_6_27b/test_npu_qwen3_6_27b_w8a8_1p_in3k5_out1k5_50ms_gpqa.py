@@ -1,4 +1,7 @@
+import logging
 import unittest
+
+import requests
 
 from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
     TestNpuAccuracyTestCaseBase,
@@ -7,12 +10,23 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
     QWEN3_6_27B_W8A8_MODEL_PATH,
 )
 from sglang.test.ci.ci_register import register_npu_ci
+from sglang.test.send_one import BenchArgs, send_one_prompt
 
 register_npu_ci(
     est_time=8400,
-    suite="nightly-acc-2-npu-a3",
+    suite="tmp-acc-2-npu-a3",
     nightly=True,
 )
+
+logger = logging.getLogger(__name__)
+
+# Fail fast when the NEXTN draft model stops being accepted. With an acceptance
+# length of 1.0 (no draft token accepted) decoding is several times slower and
+# this 198-question GPQA run cannot finish within the nightly budget, it only
+# ends in a harness timeout after 3.5 hours.
+MIN_SPEC_ACCEPT_LENGTH = 1.5
+SPEC_PRE_CHECK_ATTEMPTS = 3
+SPEC_PRE_CHECK_MAX_TOKENS = 256
 
 QWEN3_6_27B_3K5_1K5_ENVS = {
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
@@ -98,7 +112,46 @@ class TestNPUQwen3_6_27B_1P_In3k5_Out1k5_gpqa(TestNpuAccuracyTestCaseBase):
         },
     }
 
+    def _check_spec_accept_length(self):
+        """Abort early when speculative decoding acceptance has collapsed.
+
+        A draft model whose tokens are almost always rejected slows decoding
+        down several times, so the GPQA evaluation would spend the whole job
+        budget without ever reaching the accuracy assertion. ``send_one_prompt``
+        warms the server up as a side effect (``avg_spec_accept_length`` only
+        exists once a decode step has run) and reports
+        ``completion_tokens / spec_verify_ct`` for the same request.
+        """
+        args = BenchArgs(
+            base_url=self.base_url, max_new_tokens=SPEC_PRE_CHECK_MAX_TOKENS
+        )
+        acc_length = 0.0
+        for attempt in range(1, SPEC_PRE_CHECK_ATTEMPTS + 1):
+            requests.post(self.base_url + "/flush_cache", timeout=60).raise_for_status()
+            acc_length, speed = send_one_prompt(
+                args, label=f"spec pre-check attempt {attempt}", print_output=False
+            )
+            logger.info(
+                "spec pre-check attempt %d: acc_length=%.3f, speed=%.2f token/s",
+                attempt,
+                acc_length,
+                speed,
+            )
+            if acc_length >= MIN_SPEC_ACCEPT_LENGTH:
+                break
+
+        self.assertGreaterEqual(
+            acc_length,
+            MIN_SPEC_ACCEPT_LENGTH,
+            f"Speculative decoding acceptance too low: acc_length="
+            f"{acc_length:.3f} < {MIN_SPEC_ACCEPT_LENGTH} after "
+            f"{SPEC_PRE_CHECK_ATTEMPTS} attempts. Draft tokens are mostly "
+            "rejected, decoding is several times slower and this GPQA "
+            "evaluation cannot finish within the time budget.",
+        )
+
     def test_accuracy(self):
+        self._check_spec_accept_length()
         self.run_accuracy()
 
 
