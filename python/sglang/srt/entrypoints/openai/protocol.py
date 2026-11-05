@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from typing import (
     Annotated,
     Any,
+    Callable,
     Dict,
     List,
     Literal,
@@ -36,6 +37,7 @@ from typing import (
     runtime_checkable,
 )
 
+import msgspec
 from openai.types.responses import (
     ResponseFunctionToolCall,
     ResponseInputItemParam,
@@ -228,7 +230,7 @@ class UsageInfo(BaseModel):
 
 
 class StreamOptions(BaseModel):
-    include_usage: Optional[bool] = False
+    include_usage: Optional[bool] = None
     continuous_usage_stats: Optional[bool] = False
 
 
@@ -419,8 +421,9 @@ class CompletionRequest(PDRoutingFields):
     )
 
     images_config: Optional[Dict] = None
-    # Per-request processor overrides; only MiniCPM-V 4.7 reads them (downsample_mode,
+    # Per-request processor overrides; MiniCPM-V 4.7 reads them (downsample_mode,
     # max_slice_nums), flattening images_/videos_kwargs into one request-wide profile.
+    # Unlimited-OCR v2 reads them as defaults under images_config.
     mm_processor_kwargs: Optional[Dict] = None
 
     # Deprecated: use routed_dp_rank instead
@@ -892,22 +895,34 @@ ReasoningEffortType = Optional[
 ]
 
 
-def _has_message_level_tools(messages: Any) -> bool:
+def _message_tools_indices(messages: Any) -> List[int]:
     if not isinstance(messages, list):
-        return False
-    return any(
-        isinstance(message, dict)
-        and isinstance(message.get("role"), str)
-        and message["role"].lower() in ("root", "system", "developer")
-        and bool(message.get("tools"))
-        for message in messages
-    )
+        return []
+    return [
+        index
+        for index, message in enumerate(messages)
+        if isinstance(message, dict) and message.get("tools")
+    ]
+
+
+class DocSplitOptions(BaseModel):
+    """Options for splitting oversized document requests into page batches."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    max_batch_pages: Optional[int] = Field(default=None, ge=1)
+    overlap_pages: Optional[int] = Field(default=None, ge=0)
+    lookahead_pages: Optional[int] = Field(default=None, ge=0)
+    max_page_tokens: Optional[int] = Field(default=None, ge=1)
 
 
 class ChatCompletionRequest(PDRoutingFields):
     _response_parser_prefix: str = PrivateAttr(default="")
     _response_parser_grammar_start: Optional[str] = PrivateAttr(default=None)
     _response_parser_json_response_format: bool = PrivateAttr(default=False)
+    _response_parser_tool_grammar: bool = PrivateAttr(default=False)
+    _format_add_generation_prompt: Optional[bool] = PrivateAttr(default=None)
+    _format_add_special_tokens: bool = PrivateAttr(default=False)
 
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
@@ -948,6 +963,12 @@ class ChatCompletionRequest(PDRoutingFields):
     tool_choice: Union[ToolChoice, Literal["auto", "required", "none"]] = Field(
         default="auto", examples=["none"]
     )  # noqa
+    # Whether the client sent tool_choice, as opposed to the default filled in
+    # by set_tool_choice_default.
+    _tool_choice_explicit: bool = PrivateAttr(default=False)
+    # Indices of the messages the client sent a non-empty `tools` on, including
+    # user messages, whose model drops the field.
+    _message_tools_indices: List[int] = PrivateAttr(default_factory=list)
     parallel_tool_calls: bool = True
     return_hidden_states: Union[bool, Literal["last"]] = False
     return_routed_experts: bool = False
@@ -1021,9 +1042,11 @@ class ChatCompletionRequest(PDRoutingFields):
 
     images_config: Optional[Dict] = None
     video_config: Optional[Dict] = None
-    # Per-request processor overrides; only MiniCPM-V 4.7 reads them (downsample_mode,
+    # Per-request processor overrides; MiniCPM-V 4.7 reads them (downsample_mode,
     # max_slice_nums), flattening images_/videos_kwargs into one request-wide profile.
+    # Unlimited-OCR v2 reads them as defaults under images_config.
     mm_processor_kwargs: Optional[Dict] = None
+    doc_split_options: Optional[DocSplitOptions] = None
 
     # Custom logit processor for advanced sampling control
     custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
@@ -1067,17 +1090,28 @@ class ChatCompletionRequest(PDRoutingFields):
     def _handle_deprecated_dp_rank(cls, values):
         return _migrate_deprecated_dp_rank(values)
 
-    @model_validator(mode="before")
+    @model_validator(mode="wrap")
     @classmethod
-    def set_tool_choice_default(cls, values):
-        if values.get("tool_choice") is None:
-            if values.get("tools") is None and not _has_message_level_tools(
-                values.get("messages")
-            ):
+    def set_tool_choice_default(cls, values, handler):
+        if not isinstance(values, dict):
+            return handler(values)
+        explicit = values.get("tool_choice") is not None
+        messages = values.get("messages")
+        message_tools_indices = _message_tools_indices(messages)
+        if not explicit:
+            has_message_level_tools = any(
+                isinstance(messages[index].get("role"), str)
+                and messages[index]["role"].lower() in ("root", "system", "developer")
+                for index in message_tools_indices
+            )
+            if values.get("tools") is None and not has_message_level_tools:
                 values["tool_choice"] = "none"
             else:
                 values["tool_choice"] = "auto"
-        return values
+        request = handler(values)
+        request._tool_choice_explicit = explicit
+        request._message_tools_indices = message_tools_indices
+        return request
 
     @field_validator("reasoning_effort", mode="before")
     @classmethod
@@ -1230,21 +1264,41 @@ class ChatCompletionRequest(PDRoutingFields):
             "watermark": self.watermark,
         }
 
-        if self.response_format and self.response_format.type == "json_schema":
+        forces_tool_call = (
+            tool_call_constraint is not None
+            and tool_call_constraint[0] != "full_assistant_ebnf"
+            and (
+                self.tool_choice == "required"
+                or isinstance(self.tool_choice, ToolChoice)
+            )
+        )
+        response_format = self.response_format
+        # A forced tool call leaves no content for a JSON response_format to
+        # shape. When the renderer states response_format in the prompt, the
+        # tool-call constraint replaces its grammar instead of conflicting.
+        if (
+            forces_tool_call
+            and renderer_handles_response_format
+            and response_format
+            and response_format.type in ("json_object", "json_schema")
+        ):
+            response_format = None
+
+        if response_format and response_format.type == "json_schema":
             # strict=false may only go unconstrained when the renderer forwards
             # response_format to the model; plain chat templates never see it.
             if (
-                self.response_format.json_schema.strict is not False
+                response_format.json_schema.strict is not False
                 or not renderer_handles_response_format
             ):
                 sampling_params["json_schema"] = convert_json_schema_to_str(
-                    self.response_format.json_schema.schema_
+                    response_format.json_schema.schema_
                 )
-        elif self.response_format and self.response_format.type == "json_object":
+        elif response_format and response_format.type == "json_object":
             sampling_params["json_schema"] = '{"type": "object"}'
-        elif self.response_format and self.response_format.type == "structural_tag":
+        elif response_format and response_format.type == "structural_tag":
             sampling_params["structural_tag"] = convert_json_schema_to_str(
-                self.response_format.model_dump(by_alias=True)
+                response_format.model_dump(by_alias=True)
             )
 
         # Check if there are already existing output constraints
@@ -1256,10 +1310,7 @@ class ChatCompletionRequest(PDRoutingFields):
         )
 
         if tool_call_constraint and has_existing_constraints:
-            if tool_call_constraint[0] != "full_assistant_ebnf" and (
-                self.tool_choice == "required"
-                or isinstance(self.tool_choice, ToolChoice)
-            ):
+            if forces_tool_call:
                 raise ValueError(
                     "tool_choice 'required' or a named tool cannot be combined with "
                     "response_format, regex, or ebnf: the tool-call constraint and the "
@@ -1755,6 +1806,14 @@ class TokenizeRequest(BaseModel):
         default=True,
         description="whether to add model-specific special tokens (e.g. BOS/EOS) during encoding.",
     )
+    add_generation_prompt: Optional[bool] = Field(
+        default=None,
+        description=(
+            "With messages: render them as given, passing this to the chat template, "
+            "and encode with add_special_tokens (default false). Omitted, messages are "
+            "rendered as for a chat completion."
+        ),
+    )
 
     @model_validator(mode="after")
     def validate_tokenize_input(self) -> TokenizeRequest:
@@ -1770,7 +1829,14 @@ class TokenizeRequest(BaseModel):
         extra = getattr(self, "__pydantic_extra__", None)
         if extra:
             data.update(extra)
-        return ChatCompletionRequest.model_validate(data)
+        request = ChatCompletionRequest.model_validate(data)
+        if self.add_generation_prompt is not None:
+            request._format_add_generation_prompt = self.add_generation_prompt
+            request._format_add_special_tokens = (
+                "add_special_tokens" in self.model_fields_set
+                and self.add_special_tokens
+            )
+        return request
 
 
 class TokenizeResponse(BaseModel):
@@ -1838,6 +1904,7 @@ RESPONSE_TOOL_TYPES = Literal[
     "image_generation",
     "computer_use_preview",
     "local_shell",
+    "shell",
     "mcp",
     "custom",
     "namespace",
@@ -1847,6 +1914,8 @@ RESPONSE_TOOL_TYPES = Literal[
 
 class ResponseTool(BaseModel):
     """Tool definition for responses."""
+
+    model_config = ConfigDict(extra="allow")
 
     type: RESPONSE_TOOL_TYPES = Field(description="Type of tool to enable")
     name: Optional[str] = None
@@ -1865,6 +1934,14 @@ class ResponseTool(BaseModel):
         if self.type == "function" and not self.name:
             raise ValueError("Function tools must include a name.")
         return self
+
+
+class ResponseToolState(msgspec.Struct, frozen=True):
+    """Public tool metadata and name mappings for one translated request."""
+
+    public_tools: list[ResponseTool] | None = None
+    public_choice: str | dict[str, Any] | None = None
+    names: dict[str, dict[str, str]] = {}
 
 
 class ResponseInputMessageParam(EasyInputMessageParam, total=False):
@@ -1893,9 +1970,11 @@ ResponseInputOutputItem: TypeAlias = Union[
 class ResponsesRequest(PDRoutingFields):
     """Request body for v1/responses endpoint."""
 
+    _tool_state: ResponseToolState = PrivateAttr(default_factory=ResponseToolState)
     _response_parser_prefix: str = PrivateAttr(default="")
     _response_parser_grammar_start: Optional[str] = PrivateAttr(default=None)
     _response_parser_json_response_format: bool = PrivateAttr(default=False)
+    _response_parser_tool_grammar: bool = PrivateAttr(default=False)
 
     # Core OpenAI API fields (ordered by official documentation)
     background: Optional[bool] = False
@@ -1911,9 +1990,10 @@ class ResponsesRequest(PDRoutingFields):
             ]
         ]
     ] = None
-    # Accept dict-shaped items as the loose arm; downstream normalization
-    # handles replayed shapes that don't satisfy every openai TypedDict.
-    input: Union[str, List[ResponseInputOutputItem], List[Dict[str, Any]]]
+    # Preserve JSON input for downstream validation; SDK TypedDicts discard extra fields.
+    input: Union[str, List[Dict[str, Any]], List[ResponseInputOutputItem]] = Field(
+        union_mode="left_to_right"
+    )
     instructions: Optional[str] = None
     max_output_tokens: Optional[int] = None
     max_tool_calls: Optional[int] = None
@@ -2089,7 +2169,10 @@ class ResponsesRequest(PDRoutingFields):
             "name"
         )
         if tool_choice.get("type") in ("function", "custom") and name:
-            return {"type": "function", "name": name}
+            choice = {"type": tool_choice["type"], "name": name}
+            if "namespace" in tool_choice:
+                choice["namespace"] = tool_choice["namespace"]
+            return choice
         return "auto"
 
     def to_sampling_params(
@@ -2325,6 +2408,7 @@ class ResponsesResponse(BaseModel):
                 {"format": {"type": "text"}} if _is_text_only(output) else None
             )
 
+        tool_state = request._tool_state
         return cls(
             id=request.request_id,
             created_at=created_time,
@@ -2337,8 +2421,16 @@ class ResponsesResponse(BaseModel):
                 if request.parallel_tool_calls is not None
                 else True
             ),
-            tool_choice=request.effective_tool_choice(),
-            tools=request.tools,
+            tool_choice=(
+                tool_state.public_choice
+                if tool_state.public_choice is not None
+                else request.effective_tool_choice()
+            ),
+            tools=(
+                tool_state.public_tools
+                if tool_state.public_tools is not None
+                else request.tools
+            ),
             # fields for parity with v1/responses
             error=None,
             incomplete_details=(
@@ -2366,6 +2458,20 @@ class ResponsesResponse(BaseModel):
         )
 
 
+class ResponsesLifecycleEvent(BaseModel):
+    """Response lifecycle event using SGLang's public response schema."""
+
+    type: Literal[
+        "response.created",
+        "response.in_progress",
+        "response.completed",
+        "response.incomplete",
+        "response.failed",
+    ]
+    response: ResponsesResponse
+    sequence_number: int = -1
+
+
 class RequestResponseMetadata(BaseModel):
     """Metadata for request/response tracking."""
 
@@ -2386,6 +2492,13 @@ class MessageProcessingResult:
     skip_special_tokens: bool = True
     require_reasoning: bool = False
     reasoning_end_token_ids: Optional[List[int]] = None
+    # The tool-call constraint is the response template's own grammar.
+    template_tool_call_grammar: bool = False
+    # Derives the tool-call constraint for output that starts the assistant
+    # message, so that only a prompt ending at the message start pays for it.
+    message_start_tool_call_constraint: Optional[
+        Callable[[], Optional[ToolCallConstraint]]
+    ] = None
     uses_response_template: bool = False
 
 
