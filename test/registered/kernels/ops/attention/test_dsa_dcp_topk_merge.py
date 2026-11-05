@@ -163,8 +163,9 @@ class _Case:
             self.logits.clone(),
             self.local_lens,
             out_candidates=self.candidates,
-            world=world,
-            rank=rank,
+            dcp_size=world,
+            dcp_rank=rank,
+            deterministic=True,
         )
         merge(self.candidates, self.global_lens, self.page_table, self.out, span)
 
