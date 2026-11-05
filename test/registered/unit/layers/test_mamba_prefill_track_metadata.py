@@ -558,7 +558,7 @@ class TestVerifyTrackIndexReuse(unittest.TestCase):
         batch, reuse = make_verify_batch(), spec_utils.VerifyTrackIndices()
         self._prepare(batch, reuse)
         self.assertEqual(
-            self._prepare(batch, reuse, lazy=True), ([31, -1, 20], [1, 0, 0])
+            self._prepare(batch, reuse, lazy=True), ([31, 0, 20], [1, 0, 0])
         )
 
 

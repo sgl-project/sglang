@@ -458,7 +458,7 @@ class StaticKVStorage:
 
     def take_tracking_slot(self, req, position: int) -> bool:
         """Give ``req`` a tracking slot at ``position`` of its ping-pong pair;
-        False when no state slot is free (tracking then stays in place)."""
+        False when no state slot is free (the boundary then writes no snapshot)."""
         slot = self._allocator.state_slots.alloc(1)
         if slot is None:
             return False
