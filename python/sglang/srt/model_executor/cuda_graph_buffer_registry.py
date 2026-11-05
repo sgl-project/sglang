@@ -1091,14 +1091,17 @@ def build_eager_registry(
     The decode slot set is a superset of eager prefill's needs (eager prefill
     carries ``input_embeds`` from the batch and reads the bs-axis fields live),
     so we reuse it, sized at ``(max_bs, max_num_token)`` where ``max_num_token``
-    is the prefill token ceiling. ``seq_len_fill_value=0`` because eager never
-    pads, so the sentinel tail is never read.
+    is the startup prefill token ceiling, or a larger size when
+    ``EagerRunner.load_batch`` regrows the registry for a bigger batch.
+    ``seq_len_fill_value=0`` because eager never pads, so the sentinel tail is
+    never read.
 
     ``share_pool=True`` so same-named / same-size slots coalesce through the
     process-wide pool. A registry built later at runtime can opt out
-    (``share_pool=False``) so its buffers are freed with it. The ``EagerRunner`` is built before the cuda-graph runners
-    (see ``ModelRunner.init_backends``), so its (largest) allocations are
-    canonical and the cg runners' matching slots (prefill's token-axis at
+    (``share_pool=False``) so its buffers are freed with it. The
+    ``EagerRunner`` is built before the cuda-graph runners (see
+    ``ModelRunner.init_backends``), so its (largest) allocations are canonical
+    and the cg runners' matching slots (prefill's token-axis at
     ``max_num_token``, decode's bs-axis at ``max_bs``) adopt them.
     """
     return build_decode_registry(
