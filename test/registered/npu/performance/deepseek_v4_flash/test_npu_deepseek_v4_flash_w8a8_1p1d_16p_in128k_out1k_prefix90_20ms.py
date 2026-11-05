@@ -228,17 +228,16 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_MODEL_CONFIG = {
 class TestNPUDeepSeekV4FlashW8A81P1D16PIn128kOut1k20ms(
     TestNpuPerfMultiNodePdSepTestCaseBase
 ):
-    """Test NPU performance for DeepSeek-V4-Flash W8A8 PD-Sep 1P+1D 16p in128k out1k."""
+    """Test NPU performance for DeepSeek-V4-Flash W8A8 PD-Sep 1P+1D 16p in128k out1k prefix90."""
 
-    benchmark_tool = BENCHMARK_TOOL_DEFAULT
     model_config = DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_MODEL_CONFIG
-    dataset_name = "generated-shared-prefix"
-    max_concurrency = 55
-    num_prompts = 90
+    benchmark_tool = AISBENCHMARK
+    dataset_type = AISBENCHMARK_DATASET_GSM8K
+    dataset_path = None
     input_len = 131072
     output_len = 1024
-    random_range_ratio = 1
-    seed = 1
+    num_prompts = 90
+    max_concurrency = 54
     repeat_rate = 0.9
     request_rate = 3
     warmup_requests = 16
