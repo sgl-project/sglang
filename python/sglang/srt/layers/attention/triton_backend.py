@@ -198,6 +198,7 @@ class TritonAttnBackend(AttentionBackend):
         kv_indptr_buf: Optional[torch.Tensor] = None,
         *,
         dllm_fa4: bool = False,
+        use_unified_prefill: bool = False,
     ):
         # Lazy import to avoid the initialization of cuda context
         from sglang.kernels.ops.attention.decode_attention import (
@@ -387,6 +388,7 @@ class TritonAttnBackend(AttentionBackend):
         self.enable_deterministic = (
             get_exec().deterministic.enable_deterministic_inference
         )
+        self.use_unified_prefill = self.enable_deterministic or use_unified_prefill
 
         if self.enable_deterministic:
             # Fixed split tile size for batch invariance
@@ -1933,8 +1935,8 @@ class TritonAttnBackend(AttentionBackend):
                 q, k, v, layer, forward_batch, causal, logits_soft_cap, sinks
             )
 
-        # Deterministic mode: use unified 1-stage kernel
-        if self.enable_deterministic:
+        # Unified prefill reads the cached prefix and new suffix from the same KV pool.
+        if self.use_unified_prefill:
             return self._forward_extend_unified(
                 q,
                 o,

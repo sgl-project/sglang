@@ -77,7 +77,7 @@ class TestGemma4GraphMetadata(unittest.TestCase):
         backend._can_run_dense_fp8_chunked_mha = Mock(return_value=False)
         backend.allow_bidirectional_attention_in_extend = False
         backend.dcp_size = 1
-        backend.enable_deterministic = True
+        backend.use_unified_prefill = True
         backend._forward_extend_unified = Mock()
         layer = SimpleNamespace(
             qk_head_dim=4,

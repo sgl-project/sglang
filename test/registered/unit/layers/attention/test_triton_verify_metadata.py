@@ -169,7 +169,7 @@ def test_unified_target_verify_uses_resolved_metadata(with_spec_info):
     backend = _RecordingTritonBackend.__new__(_RecordingTritonBackend)
     backend.device = torch.device("cpu")
     backend.dcp_size = 1
-    backend.enable_deterministic = True
+    backend.use_unified_prefill = True
     backend.use_dense_fp8_chunked_prefill = False
     backend.allow_bidirectional_attention_in_extend = False
     backend.page_size = 1

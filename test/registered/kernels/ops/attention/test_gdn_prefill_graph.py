@@ -27,7 +27,7 @@ from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace
 from sglang.srt.mem_cache.kv.decl import STATE_PART
 from sglang.srt.mem_cache.kv.router import KVLayerRouter
 from sglang.srt.model_executor.forward_mode import ForwardMode
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, get_exec
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -145,7 +145,13 @@ def _batch(extend_lens, prefix_lens, track=None):
 
 @unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")
 class TestGDNPrefillGraph(CustomTestCase):
-    def _setup(self, ssm_dtype):
+    def _setup(self, ssm_dtype, *, fp32_snapshots=False):
+        override = get_context().override_server_args(
+            _mamba_cache_chunk_size=CHUNK,
+            enable_gdn_fp32_snapshots=fp32_snapshots,
+        )
+        override.install()
+        self.addCleanup(override.restore)
         self.layer = _layer()
         g = torch.Generator(device="cuda").manual_seed(11)
         self.conv_pool = (
@@ -190,6 +196,10 @@ class TestGDNPrefillGraph(CustomTestCase):
             num_tokens=BUCKET,
             max_seqs_cap=MAX_SEQS,
             track=True,
+            fp32_snapshots=(
+                get_exec().mamba.enable_gdn_fp32_snapshots
+                and self.ssm_pool.dtype == torch.float32
+            ),
             cache_index_dtype=torch.int32,
             device=torch.device("cuda"),
         )
@@ -251,6 +261,57 @@ class TestGDNPrefillGraph(CustomTestCase):
         self.assertTrue(torch.equal(self.conv_pool, ref_conv), "conv pool differs")
         self.assertTrue(torch.equal(self.ssm_pool, ref_ssm), "ssm pool differs")
 
+    def test_fp32_boundary_snapshot(self) -> None:
+        """BF16 prefill activations must not round an FP32 prefix checkpoint."""
+        self._setup(torch.float32, fp32_snapshots=True)
+        torch.manual_seed(23)
+        self.conv_pool[1].zero_()
+        self.ssm_pool[1].zero_()
+        self.mixed.normal_()
+        self.a.normal_()
+        self.b.normal_()
+
+        reference_conv = self.conv_pool.clone()
+        reference_ssm = self.ssm_pool.clone()
+        reference_backend = _backend(reference_conv, reference_ssm)
+        reference_batch = _batch([CHUNK], [0])
+        reference_backend.init_forward_metadata(reference_batch)
+        reference_backend.forward_extend(
+            self.layer,
+            reference_batch,
+            self.mixed[:CHUNK],
+            self.a[:CHUNK],
+            self.b[:CHUNK],
+        )
+        expected_snapshot = reference_ssm[1]
+        self.assertFalse(
+            torch.equal(expected_snapshot, expected_snapshot.bfloat16().float())
+        )
+
+        tracked_batch = _batch([CHUNK + 1], [0], track={0: CHUNK + 1})
+        eager_conv = self.conv_pool.clone()
+        eager_ssm = self.ssm_pool.clone()
+        eager_backend = _backend(eager_conv, eager_ssm)
+        eager_backend.init_forward_metadata(tracked_batch)
+        eager_backend.forward_extend(
+            self.layer,
+            tracked_batch,
+            self.mixed[: CHUNK + 1],
+            self.a[: CHUNK + 1],
+            self.b[: CHUNK + 1],
+        )
+        torch.testing.assert_close(
+            eager_ssm[NUM_SLOTS // 2], expected_snapshot, rtol=0, atol=0
+        )
+
+        metadata, graph, _ = self._capture()
+        self._fill(metadata, tracked_batch)
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            self.ssm_pool[NUM_SLOTS // 2], expected_snapshot, rtol=0, atol=0
+        )
+
     def test_replays_match_eager(self):
         cases = [
             # (extend lens, prefix lens, track {row: tracked length from prefix}).
@@ -285,9 +346,6 @@ class TestGDNPrefillGraph(CustomTestCase):
         """Prefill metadata is built while the previous forward still runs; a host
         sync there holds the scheduler until that forward ends."""
         self._setup(torch.float32)
-        override = get_context().override_server_args(_mamba_cache_chunk_size=CHUNK)
-        override.install()
-        self.addCleanup(override.restore)
         extend_kernel = self.backend.kernel_dispatcher.extend_kernel
         # Row 0 snapshots mid-chunk, row 1 on a chunk boundary, row 2 untracked.
         lens, prefixes, track = [200, 70, 33], [0, 64, 0], {0: 130, 1: 64}
