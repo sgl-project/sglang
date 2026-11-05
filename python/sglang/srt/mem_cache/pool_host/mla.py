@@ -1293,8 +1293,8 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         v_buffer_data_ptr
                         + indices[index]
                         * self.layer_num
-                        * self.qk_rope_head_dim
-                        * self.dtype.itemsize
+                        * self.v_buffer.shape[-1]
+                        * self.v_buffer.element_size()
                     )
                     ptr_list.append(v_ptr)
                 if index_k_buffer_data_ptr is not None:
@@ -1317,9 +1317,9 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             k_element_size = self.layer_num * k_item_size * self.page_size * k_width
             v_element_size = (
                 self.layer_num
-                * self.dtype.itemsize
+                * self.v_buffer.element_size()
                 * self.page_size
-                * self.qk_rope_head_dim
+                * self.v_buffer.shape[-1]
             )
             index_k_element_size = (
                 num_indexer_layers * index_k_item_size * self.page_size * index_k_width
