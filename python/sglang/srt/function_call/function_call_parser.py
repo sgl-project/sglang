@@ -53,6 +53,7 @@ from sglang.srt.function_call.poolside_v1_detector import PoolsideV1Detector
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
 from sglang.srt.function_call.qwen25_detector import Qwen25Detector
+from sglang.srt.function_call.ripple_detector import RippleDetector
 from sglang.srt.function_call.spark25_detector import Spark25Detector
 from sglang.srt.function_call.step3_detector import Step3Detector
 from sglang.srt.function_call.trinity_detector import TrinityDetector
@@ -89,6 +90,7 @@ class FunctionCallParser:
         "glm45": Glm4MoeDetector,
         "glm47": Glm47MoeDetector,
         "flint": Glm47MoeDetector,
+        "ripple": RippleDetector,
         "gpt-oss": GptOssDetector,
         "k2_horizon": K2V3Detector,
         "kimi_k2": KimiK2Detector,
