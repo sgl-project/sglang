@@ -182,7 +182,7 @@ def disagg_transfers_in_flight(scheduler):
             return bool(
                 any(
                     not decode_req.host_staged
-                    for decode_req in scheduler.disagg_decode_transfer_queue.queue
+                    for decode_req in scheduler.disagg_decode_transfer_queue.queue.items()
                 )
                 or scheduler.disagg_decode_prealloc_queue.has_published_destinations
                 or (
@@ -1582,7 +1582,7 @@ def setup_state_kv_args(
         else None
     )
     for entry in storage.wire_entries():
-        region = storage.regions(entry.sub_pool)
+        region = storage.regions(entry.sub_pool, part=entry.part)
         state_type = _wire_state_type(entry.state_type)
         append_state_component(
             kv_args,
