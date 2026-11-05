@@ -219,6 +219,8 @@ class _OngoingPrefetch(NamedTuple):
 
 
 class UnifiedRadixCache(BasePrefixCache):
+    _decode_input_only_cache = False
+
     # Unlimited-OCR v2 split-document KV reuse; None for every other model.
     uocr_doc_reuse: Optional[DocReuse] = None
     # Whether eviction walks every component in one joint LRU order; set from the
@@ -341,6 +343,22 @@ class UnifiedRadixCache(BasePrefixCache):
                 "joint Full/SWA eviction walk; "
                 f"SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND={self._tree_core_backend!r} "
                 "has none."
+            )
+
+        self._decode_input_only_cache = (
+            envs.SGLANG_PD_DECODE_CACHE_INPUT_ONLY.get()
+            and get_disagg().disaggregation_mode == "decode"
+        )
+        if self._decode_input_only_cache and (
+            self.disable
+            or not self.tree_core.is_eagle
+            or self.tree_components != (ComponentType.FULL,)
+            or self.enable_session_radix_cache
+            or self._tree_core_backend != "python"
+        ):
+            raise ValueError(
+                "SGLANG_PD_DECODE_CACHE_INPUT_ONLY requires an enabled "
+                "Python EAGLE FULL-only radix cache without session tracking"
             )
 
         # Session ref tracking (--enable-session-radix-cache).
@@ -476,6 +494,10 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def init_cache_linker(self, cache_linker: UnifiedCacheLinker) -> None:
         """Attach an external KV store directly to the device pools."""
+        if self._decode_input_only_cache:
+            raise ValueError(
+                "Input-only decode caching does not support external KV stores"
+            )
         if cache_linker.load_mode == "prefetch":
             memory = get_memory()
             self.prefetch_stop_policy = cache_linker.prefetch_policy
@@ -545,6 +567,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def init_hicache(self, server_args: ServerArgs, params: CacheInitParams) -> None:
         """Initialize HiCache infrastructure."""
+        if self._decode_input_only_cache:
+            raise ValueError("Input-only decode caching does not support HiCache")
         self.host_memory_mode = get_memory().hicache_host_memory_mode
         if self.host_memory_mode == "buffer_only":
             supported = {ComponentType.FULL, ComponentType.MAMBA, *self.window_slots()}
@@ -1543,6 +1567,14 @@ class UnifiedRadixCache(BasePrefixCache):
     def maybe_hand_to_session(self, req: Req) -> None:
         self.session.take(req)
 
+    def _cacheable_token_count(self, req: Req, token_count: int) -> int:
+        # EAGLE's bigram key and the normal page alignment still apply below.
+        # Generated and speculative tail slots remain request-owned; the existing
+        # release path frees them after the request no longer needs them.
+        if self._decode_input_only_cache:
+            return min(token_count, len(req.origin_input_ids))
+        return token_count
+
     def free_kv_row(self, kv: ReqKvInfo, ranges: list[tuple[int, int]]) -> None:
         # A restore's host-to-device copy may still be writing this row's
         # pages; they must not return to the allocator before it finishes.
@@ -1633,7 +1665,7 @@ class UnifiedRadixCache(BasePrefixCache):
             session_id=req.session_id,
             rotation_base=req.kv_rotation_base,
         )
-        effective_cache_len = len(token_ids)
+        effective_cache_len = self._cacheable_token_count(req, len(token_ids))
         for comp in self._components_tuple:
             cl = comp.prepare_for_caching_req(
                 req=req,
@@ -1824,7 +1856,7 @@ class UnifiedRadixCache(BasePrefixCache):
             priority=req.priority or 0,
             rotation_base=req.kv_rotation_base,
         )
-        effective_cache_len = len(token_ids)
+        effective_cache_len = self._cacheable_token_count(req, len(token_ids))
         for comp in self._components_tuple:
             cache_len = comp.prepare_for_caching_req(
                 req=req,
