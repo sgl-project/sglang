@@ -164,10 +164,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     check_cuda_graph_backend,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_executor.forward_context import (
-    get_attn_backend,
-    get_token_to_kv_pool,
-)
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
@@ -2834,11 +2831,6 @@ class DeepseekV2DecoderLayer(nn.Module):
             forward_batch, next_full_attention_layer_id
         )
 
-        _kv_pool = get_token_to_kv_pool()
-        _counter = getattr(_kv_pool, "layer_transfer_counter", None)
-        if _counter is not None:
-            _counter.wait_for_prefetch(self.layer_id - _kv_pool.start_layer + 1)
-
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
 
@@ -2892,11 +2884,6 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
 
     def op_comm_prepare_mlp(self, state):
-        _kv_pool = get_token_to_kv_pool()
-        _counter = getattr(_kv_pool, "layer_transfer_counter", None)
-        if _counter is not None:
-            _counter.wait_for_prefetch(self.layer_id - _kv_pool.start_layer + 1)
-
         hidden_states = self.attn_boundary.finish(
             state.pop("hidden_states_after_attn"), state.forward_batch
         )

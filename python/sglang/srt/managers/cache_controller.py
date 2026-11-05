@@ -44,7 +44,7 @@ from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import get_bool_env_var, get_device_module
+from sglang.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
 
@@ -88,10 +88,6 @@ class LayerDoneCounter:
         self.events = [LayerLoadingEvent(num_layers) for _ in range(self.num_counters)]
         self.producer_index = -1
         self.consumer_index = -1
-        # Callback invoked after a layer's wait resolves, to trigger
-        # on-demand prefetch of the next layer on the load stream.
-        self.on_layer_consumed: Optional[Callable] = None
-        self._last_consumed_layer: int = -1
 
     def update_producer(self):
         self.producer_index = (self.producer_index + 1) % self.num_counters
@@ -102,31 +98,15 @@ class LayerDoneCounter:
 
     def set_consumer(self, index: int):
         self.consumer_index = index
-        self._last_consumed_layer = -1
 
     def wait_until(self, threshold: int):
         if self.consumer_index < 0:
             return
         self.events[self.consumer_index].wait(threshold)
 
-    def consume_layer(self, threshold: int):
-        if self.consumer_index < 0:
-            return
-        if self.on_layer_consumed is not None and threshold > self._last_consumed_layer:
-            self._last_consumed_layer = threshold
-            self.on_layer_consumed(threshold + 1)
-
-    def wait_for_prefetch(self, layer_id: int):
-        if self.consumer_index < 0:
-            return
-        if layer_id >= self.num_layers:
-            return
-        self.events[self.consumer_index].wait(layer_id)
-
     def reset(self):
         self.producer_index = -1
         self.consumer_index = -1
-        self._last_consumed_layer = -1
 
 
 class CacheOperation:
@@ -377,7 +357,6 @@ class HiCacheController:
         self.device = self.mem_pool_device.device
         self.transfer_layer_id_max = self.mem_pool_device.layer_num
         self.layer_done_counter = LayerDoneCounter(self.transfer_layer_id_max)
-        self.layer_done_counter.on_layer_consumed = self.trigger_layer_load
         self.mem_pool_device.register_layer_transfer_counter(self.layer_done_counter)
 
         if write_policy not in [
@@ -1054,8 +1033,6 @@ class HiCacheController:
         if len(self.load_queue) == 0:
             return -1
 
-        self._drain_pending_prefetch()
-
         producer_id = self.layer_done_counter.update_producer()
         op = CacheOperation.merge_ops(self.load_queue)
         host_indices, device_indices, pool_transfers = self._move_op_indices(op)
@@ -1076,11 +1053,6 @@ class HiCacheController:
             start_event=producer_event.start_event,
             on_layer_done=producer_event.complete,
             transfer_layer_id_max=self.transfer_layer_id_max,
-            # On-demand H2D loads only layer 0 up front and pulls the rest
-            # layer-by-layer from forward (get_kv_buffer's consume_layer), so
-            # the per-layer loads overlap attention compute. The bulk path is
-            # still available as a fallback switch.
-            on_demand=get_bool_env_var("SGLANG_HICACHE_ON_DEMAND_H2D", "True"),
         )
 
         self.mem_pool_device_allocator.set_hicache_transfer_done_event(
@@ -1099,18 +1071,6 @@ class HiCacheController:
             )
         )
         return producer_id
-
-    def trigger_layer_load(self, layer_id: int) -> None:
-        handle = self.l2_transfer_engine.prefetch_handle
-        if handle is None:
-            return
-        handle.trigger_layer(layer_id)
-
-    def _drain_pending_prefetch(self) -> None:
-        handle = self.l2_transfer_engine.prefetch_handle
-        if handle is None:
-            return
-        handle.drain()
 
     def evict_host(self, host_indices: torch.Tensor, backup_only: bool = True) -> int:
         if not backup_only:

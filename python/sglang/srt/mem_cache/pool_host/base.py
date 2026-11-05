@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import abc
 import logging
-import os
 import threading
 from collections.abc import Iterable
 from contextlib import contextmanager
@@ -249,13 +248,7 @@ class HostKVCache(abc.ABC):
         # Verify there is enough available host memory.
         requested_bytes = self.size * self.size_per_token
         available_bytes = host_memory_budget_bytes(requested_bytes)
-        # The memfabric backend reserves host DRAM through the offload entity
-        # (see npu_memfabric.ensure_memfabric_capacity), which does not need
-        # the psutil-based budget check.
-        mf_backend = os.environ.get("SGLANG_HICACHE_HOST_MEM_BACKEND", "").lower() == (
-            "memfabric"
-        )
-        if requested_bytes > available_bytes and not mf_backend:
+        if requested_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory available. Requesting "
                 f"{requested_bytes / 1e9:.2f} GB but only have "
