@@ -1536,8 +1536,7 @@ class SchedulerPPMixin:
                 # waits on copy_done. Extend and speculative results keep the
                 # old path; they were not measured.
                 if (
-                    target.forward_mode.is_decode()
-                    and target.spec_algorithm.is_none()
+                    target.forward_mode.is_decode() and target.spec_algorithm.is_none()
                 ) or (
                     batch_result.logits_output is not None
                     and batch_result.logits_output.sampling_mask_output is not None
