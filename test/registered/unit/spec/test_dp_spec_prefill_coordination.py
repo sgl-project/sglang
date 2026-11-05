@@ -142,6 +142,7 @@ class TestDPSpecPrefillCoordinationPlan(CustomTestCase):
                     can_run_draft_cuda_graph=True,
                     can_run_prefill_cuda_graph=False,
                     prefill_cuda_graph_max_prefix_len=0,
+                    global_decode_graph_max_seq_len=None,
                 )
                 with envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.override(True):
                     _update_gather_batch(batch, info, not local_only)

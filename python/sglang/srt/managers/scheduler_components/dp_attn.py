@@ -508,7 +508,9 @@ def _local_attention_pairs(local_batch: Optional[ScheduleBatch]) -> int:
     return _prefill_attention_pairs(local_batch)
 
 
-def _local_decode_graph_max_seq_len(local_batch: Optional[ScheduleBatch]) -> int:
+def _local_decode_graph_max_seq_len(
+    local_batch: Optional[ScheduleBatch], spec_algorithm: SpeculativeAlgorithm
+) -> int:
     """Upper bound of the longest sequence this rank's decode step attends, read on the
     host. Without a host seq_lens mirror (speculative acceptance in flight, or a merge
     that dropped it) the committed lengths lag the device by up to one unprocessed step
@@ -521,7 +523,11 @@ def _local_decode_graph_max_seq_len(local_batch: Optional[ScheduleBatch]) -> int
         return 0
     if local_batch.seq_lens_cpu is not None and local_batch.seq_lens_cpu.numel() > 0:
         return int(local_batch.seq_lens_cpu.max())
-    step_width = max(max_speculative_num_draft_tokens() or 0, 1)
+    step_width = (
+        1
+        if spec_algorithm.is_none()
+        else max(max_speculative_num_draft_tokens() or 0, 1)
+    )
     return max(req.seqlen for req in local_batch.reqs) + 2 * step_width
 
 
@@ -669,7 +675,9 @@ def prepare_mlp_sync_batch_raw(
         # Gathered unconditionally like the other columns, so a per-process
         # metrics flag cannot make ranks disagree on what the tensor holds.
         attention_pairs=_local_attention_pairs(local_batch),
-        decode_graph_max_seq_len=_local_decode_graph_max_seq_len(local_batch),
+        decode_graph_max_seq_len=_local_decode_graph_max_seq_len(
+            local_batch, model_runner.spec_algorithm
+        ),
     )
 
     if num_dp_ranks == 1:

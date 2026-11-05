@@ -15,6 +15,7 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler_components import dp_attn
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -200,37 +201,45 @@ class TestMLPSyncDecodeBound(CustomTestCase):
 
     def test_local_bound(self):
         local = dp_attn._local_decode_graph_max_seq_len
+        none, eagle = SpeculativeAlgorithm.NONE, SpeculativeAlgorithm.EAGLE
         decode = SimpleNamespace(
             forward_mode=ForwardMode.DECODE,
             batch_size=lambda: 2,
             seq_lens_cpu=torch.tensor([9, 4000]),
             reqs=[],
         )
-        self.assertEqual(local(decode), 4000)
+        self.assertEqual(local(decode, eagle), 4000)
         # Without the host mirror: committed lengths plus two steps' width.
         decode.seq_lens_cpu = None
         decode.reqs = [SimpleNamespace(seqlen=100), SimpleNamespace(seqlen=3990)]
         with patch.object(dp_attn, "max_speculative_num_draft_tokens", return_value=4):
-            self.assertEqual(local(decode), 3998)
+            self.assertEqual(local(decode, eagle), 3998)
         with patch.object(
             dp_attn, "max_speculative_num_draft_tokens", return_value=None
         ):
-            self.assertEqual(local(decode), 3992)
+            self.assertEqual(local(decode, eagle), 3992)
+        # Plain decode advances one token a step and never reads the spec config.
+        with patch.object(
+            dp_attn,
+            "max_speculative_num_draft_tokens",
+            side_effect=AssertionError("spec config read without speculation"),
+        ):
+            self.assertEqual(local(decode, none), 3992)
         idle = SimpleNamespace(
             forward_mode=ForwardMode.IDLE,
             batch_size=lambda: 0,
             seq_lens_cpu=None,
             reqs=[],
         )
-        self.assertEqual(local(idle), 0)
-        self.assertEqual(local(None), 0)
+        self.assertEqual(local(idle, eagle), 0)
+        self.assertEqual(local(None, eagle), 0)
         extend = SimpleNamespace(
             forward_mode=ForwardMode.EXTEND,
             batch_size=lambda: 2,
             seq_lens_cpu=torch.tensor([9]),
             reqs=[],
         )
-        self.assertEqual(local(extend), 0)
+        self.assertEqual(local(extend, eagle), 0)
 
     def test_update_gather_batch_puts_the_bound_on_the_batch(self):
         info = self._info(1234)

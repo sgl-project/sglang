@@ -35,9 +35,10 @@ def dp_decode_max_seq_len(forward_batch: ForwardBatch) -> Optional[int]:
     none). The scheduler's MLP sync gathers an upper bound per rank and stores the
     maximum on the batch; None without the sync (no DP attention) or outside decode.
     """
-    if not forward_batch.forward_mode.is_decode_or_idle():
+    max_seq_len = getattr(forward_batch, "dp_decode_graph_max_seq_len", None)
+    if max_seq_len is None or not forward_batch.forward_mode.is_decode_or_idle():
         return None
-    return getattr(forward_batch, "dp_decode_graph_max_seq_len", None)
+    return max_seq_len
 
 
 @dataclass(frozen=True)
