@@ -1124,21 +1124,16 @@ def _node_commit_kernels():
                 match = on_page & (row_of == r)
                 best = tl.max(tl.where(match, priority, -1), 0)
                 chosen = tl.max(tl.where(match & (priority == best), node, -1), 0)
+                if chosen >= 0:
+                    src = node_data + chosen * row_bytes
+                else:
+                    src = original + r * row_stride
                 for begin in tl.range(0, row_bytes, CBLOCK):
                     offset = begin + lanes
-                    old = tl.load(
-                        original + r * row_stride + offset,
-                        offset < row_bytes,
-                        other=0,
-                    )
-                    value = tl.load(
-                        node_data + tl.maximum(chosen, 0) * row_bytes + offset,
-                        (offset < row_bytes) & (chosen >= 0),
-                        other=0,
-                    )
+                    value = tl.load(src + offset, offset < row_bytes, other=0)
                     tl.store(
                         Staging + stage_offset + r * row_bytes + offset,
-                        tl.where(chosen >= 0, value, old),
+                        value,
                         offset < row_bytes,
                     )
 
