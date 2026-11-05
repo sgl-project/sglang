@@ -1168,6 +1168,14 @@ class DSparkWorkerV2(BaseSpecWorker):
             page_table = self.model_runner.req_to_token_pool.req_to_token[
                 batch.req_pool_indices
             ]
+            prefix_lens_cpu = batch.seq_lens_cpu
+            max_prefix = (
+                int(prefix_lens_cpu.max())
+                if prefix_lens_cpu is not None
+                and prefix_lens_cpu.device.type == "cpu"
+                and prefix_lens_cpu.numel() > 0
+                else None
+            )
             tree_pre = plan_tree_pre(
                 base_logits=proposal.base_logits,
                 root_token_ids=draft_block_ids[:, 0],
@@ -1183,6 +1191,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     self.model_runner.token_to_kv_pool.full_to_swa_index_mapping
                 ),
                 draft_slots=verify_window.verify_cache_loc_2d,
+                max_prefix=max_prefix,
             )
             verify_ids_2d = tree_pre.metadata.verify_ids.reshape(bs, -1)
             if batch.has_grammar:

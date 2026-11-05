@@ -1100,6 +1100,7 @@ class TreePrePlan:
     layout: TreeLayout
     metadata: TreeMetadata
     ori_sparse_indices: torch.Tensor
+    max_prefix: int | None = None
     node_records: list = field(default_factory=list)
     tree_node_kv: dict = field(default_factory=dict)
     tree_node_scale: dict = field(default_factory=dict)
@@ -1126,6 +1127,7 @@ def plan_tree_pre(
     scorer=None,
     full_to_swa_mapping: torch.Tensor | None = None,
     draft_slots: torch.Tensor | None = None,
+    max_prefix: int | None = None,
 ) -> TreePrePlan:
     """Build topology, per-node verify geometry and sparse ori slots.
 
@@ -1165,7 +1167,12 @@ def plan_tree_pre(
             layout.tokens.shape[0], metadata.query_width, -1
         ),
     )
-    return TreePrePlan(layout=layout, metadata=metadata, ori_sparse_indices=sparse)
+    return TreePrePlan(
+        layout=layout,
+        metadata=metadata,
+        ori_sparse_indices=sparse,
+        max_prefix=max_prefix,
+    )
 
 
 def plan_tree_post(

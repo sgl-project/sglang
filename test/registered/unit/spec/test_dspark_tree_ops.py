@@ -111,7 +111,7 @@ def _make_pre(device: str = "cpu"):
         positions=prefix_flat + depths,
         node_cu_seqlens_q=torch.arange(7, dtype=torch.int32, device=device),
     )
-    return SimpleNamespace(metadata=metadata)
+    return SimpleNamespace(metadata=metadata, max_prefix=8)
 
 
 class PublicSurfaceTest(CustomTestCase):
@@ -184,12 +184,25 @@ class NodePlanTest(CustomTestCase):
         # node id != KV slot: each node consumes its own hidden row.
         self.assertTrue(torch.equal(plan.hidden_ids, torch.arange(6)))
         self.assertTrue(torch.equal(plan.token_index, torch.arange(6)))
+        self.assertEqual(plan.max_prefix, 8)
 
     def test_get_node_plan_caches_per_step(self):
         pre = _make_pre()
         first = tree_ops.get_node_plan(pre)
         second = tree_ops.get_node_plan(pre)
         self.assertIs(first, second)
+
+    def test_cached_max_kv_uses_host_prefix_without_device_readback(self):
+        plan = _make_plan()
+        plan.max_prefix = 8
+        with mock.patch.object(
+            torch.Tensor, "item", side_effect=AssertionError("device readback")
+        ):
+            self.assertEqual(tree_ops._cached_max_kv(plan), 11)
+
+    def test_cached_max_kv_falls_back_to_device_max(self):
+        plan = _make_plan()
+        self.assertEqual(tree_ops._cached_max_kv(plan), 11)
 
 
 class IndexerTest(CustomTestCase):

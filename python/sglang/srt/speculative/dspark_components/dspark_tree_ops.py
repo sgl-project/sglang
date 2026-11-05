@@ -117,6 +117,7 @@ class NodePlan:
     query_cu: torch.Tensor  # [n + 1] int32
     hidden_ids: torch.Tensor  # [n] int64
     token_index: torch.Tensor  # [n] int64
+    max_prefix: int | None = None
     window_pages_cache: dict[tuple[int, int, int, int], tuple[int, ...]] = field(
         default_factory=dict
     )
@@ -170,6 +171,7 @@ def build_node_plan(pre) -> NodePlan:
         query_cu=meta.node_cu_seqlens_q.to(torch.int32),
         hidden_ids=torch.arange(n, dtype=torch.int64, device=device),
         token_index=torch.arange(n, dtype=torch.int64, device=device),
+        max_prefix=pre.max_prefix,
     )
 
 
@@ -740,7 +742,12 @@ def _cached_indexer_lengths(plan: NodePlan) -> tuple[torch.Tensor, torch.Tensor]
 def _cached_max_kv(plan: NodePlan) -> int:
     cached = plan.max_kv_cache
     if cached is None:
-        cached = int(plan.start.max().item() + plan.depths.max().item() + 1)
+        if plan.max_prefix is not None:
+            # ancestors width is max_depth + 1, so max_prefix + width is
+            # max(start) + max(depth) + 1 without a device readback.
+            cached = plan.max_prefix + int(plan.ancestors.shape[1])
+        else:
+            cached = int(plan.start.max().item() + plan.depths.max().item() + 1)
         plan.max_kv_cache = cached
     return cached
 
