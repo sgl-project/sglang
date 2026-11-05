@@ -28,9 +28,7 @@ class RequestRetirer:
 
     abort ends a request no launched step reports, tells the tokenizer once,
     and releases it; release gives back what a request its caller ended holds,
-    detaching it first when aborted; the caller streams it. retract releases
-    what a retracted request holds and reports whether it can resume;
-    abort_retracted ends one that will not be requeued."""
+    detaching it first when aborted; the caller streams it."""
 
     def __init__(
         self,
@@ -86,18 +84,12 @@ class RequestRetirer:
             release_kv_cache(req, self.tree_cache, checkpoint=checkpoint)
 
     def retract(self, req: Req, *, offload_kv: bool) -> bool:
-        """Release the memory a request being retracted holds, without
-        checkpointing it: HiSparse rows, KV and mamba state, backing the KV up
-        first where it is restored rather than recomputed. Returns whether the
-        request can be resumed."""
+        """Release a retracted request's memory uncheckpointed; return whether it can resume."""
         if req.kv.holds_kv and self.hisparse_coordinator is not None:
             self.hisparse_coordinator.retract_req(req)
 
-        # In decode disaggregation the retracted KV is offloaded to host so it can be
-        # restored later without recompute (see resume_retracted_reqs/load_kv_cache).
-        # Callers that will recompute the KV instead (PD true-retraction rebootstrap)
-        # pass offload_kv=False to skip the wasteful device->host copy.
-        # The config bag reflects role flips; server_args keeps the launch role.
+        # PD decode backs the KV up to host to restore it without recompute; a caller
+        # that will rebootstrap passes offload_kv=False to skip the copy.
         if get_disagg().disaggregation_mode != "decode":
             resumable = req.resumable_by_reprefill
         elif offload_kv:
@@ -116,10 +108,8 @@ class RequestRetirer:
         return resumable
 
     def abort_retracted(self, req: Req, *, reason: FINISH_ABORT) -> None:
-        """Abort a retracted request that will not be requeued, and tell the
-        tokenizer once. It is not finished in place: a step launched before the
-        retraction may still carry it, and that step's output would report it
-        again."""
+        """Abort a retracted request that will not be requeued. Not finished in place:
+        a step launched before the retraction may still carry it and report it again."""
         self._detach(req)
         # retract released the KV without a checkpoint.
         self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
