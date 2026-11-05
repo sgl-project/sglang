@@ -71,6 +71,9 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionRequirements,
 )
+from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import (
+    DynamicCudnnSDPAImpl,
+)
 from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn_h3 import (
     vsa_h3_fold_gate,
 )
@@ -804,17 +807,56 @@ def _minimax_h3_pipelined_dense_attention(
         ulysses_pipelined_attention,
     )
 
-    def attend(q_group, k_group, v_group):
-        return impl.forward_varlen(
-            q_group,
-            k_group,
-            v_group,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
-            cu_seqlens_host=cu_seqlens_host,
-        )
-
+    attend = _minimax_h3_group_attend(
+        impl,
+        cu_seqlens=cu_seqlens,
+        cu_seqlens_host=cu_seqlens_host,
+        max_seqlen=max_seqlen,
+    )
     return ulysses_pipelined_attention(q, k, v, attend, groups, fill=fill)
+
+
+def _minimax_h3_group_attend(
+    impl,
+    *,
+    cu_seqlens: torch.Tensor,
+    cu_seqlens_host: tuple[int, ...] | None,
+    max_seqlen: int,
+):
+    """One head group's attention over the gathered packed sequence.
+
+    Trailing alignment rows (cu_seqlens ``[0, used, total]``) only reach their
+    own rows, so they stay zero; the real rows run cuDNN SDPA varlen's own
+    per-segment call, written straight into the output when the backend can.
+    """
+    used = max_seqlen
+    pad_only_tail = (
+        isinstance(impl, DynamicCudnnSDPAImpl)
+        and cu_seqlens_host is not None
+        and len(cu_seqlens_host) == 3
+        and cu_seqlens_host[:2] == (0, used)
+        and cu_seqlens_host[2] > used
+    )
+
+    def attend(q_group, k_group, v_group):
+        if not pad_only_tail:
+            return impl.forward_varlen(
+                q_group,
+                k_group,
+                v_group,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                cu_seqlens_host=cu_seqlens_host,
+            )
+        out = torch.empty_like(q_group)
+        real = [t[:used].unsqueeze(0) for t in (q_group, k_group, v_group)]
+        dst = out[:used].unsqueeze(0)
+        if not impl.forward_into(*real, dst, None):
+            dst.copy_(impl.forward(*real, None))
+        out[used:].zero_()
+        return out
+
+    return attend
 
 
 # aiter's varlen kernel gives a head group the same bytes as those heads inside

@@ -6,11 +6,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from sglang.srt.arg_groups.overrides import (
-    declare_resolution,
-    resolving_view,
-    use_mla_backend,
-)
+from sglang.srt.arg_groups.model_override_base import resolving_view, use_mla_backend
+from sglang.srt.arg_groups.overrides import declare_resolution
 
 logger = logging.getLogger(__name__)
 

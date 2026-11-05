@@ -16,10 +16,7 @@ from sglang.multimodal_gen.configs.models.fsdp import (
     is_module_list_entry_in,
     is_zimage_layer,
 )
-from sglang.multimodal_gen.configs.pipeline_configs.base import (
-    ModelTaskType,
-    PipelineConfig,
-)
+from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import Cosmos3Config
 from sglang.multimodal_gen.configs.pipeline_configs.flux import (
     Flux2PipelineConfig,
@@ -66,6 +63,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan import (
 )
 from sglang.multimodal_gen.configs.pipeline_configs.zimage import ZImagePipelineConfig
 from sglang.multimodal_gen.configs.sample.flux import FluxSamplingParams
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 from sglang.multimodal_gen.registry import (
     _get_config_info,
     get_non_diffusers_pipeline_name,
@@ -3440,6 +3438,8 @@ class TestBreakableCudaGraphDefault(_CudaPlatformTestCase):
             model_path="Lightricks/LTX-2.5-Diffusers", enable_cfg_parallel=False
         )
         self.assertTrue(args.enable_breakable_cuda_graph)
+        # the two-stage request takes the output size, not LTX-2.5's 960x544 stage 1
+        self.assertEqual(args.warmup_resolutions, ["1920x1088"])
 
     def test_gates_keep_unset_bcg_off(self):
         cases = {

@@ -9,7 +9,7 @@ from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config impor
     get_config_file_name,
 )
 from sglang.srt.utils import is_gfx95_supported, is_hip
-from sglang.srt.utils.hf_transformers_utils import get_config
+from sglang.srt.utils.hf_transformers import get_config
 
 
 class BenchmarkConfig(TypedDict):

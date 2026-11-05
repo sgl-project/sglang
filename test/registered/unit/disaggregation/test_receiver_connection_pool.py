@@ -20,7 +20,11 @@ import numpy as np
 import zmq
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
+from sglang.srt.disaggregation.common.conn import (
+    CommonKVBootstrapServer,
+    CommonKVManager,
+    CommonKVReceiver,
+)
 from sglang.srt.disaggregation.common.staging_handler import DecodeStagingHandler
 from sglang.srt.disaggregation.mooncake.conn import (
     KVArgsRegisterInfo as MooncakeKVArgsRegisterInfo,
@@ -509,9 +513,17 @@ class TestCommonReceiverLifecycle(CustomTestCase):
         receiver, _ = self._make_receiver()
         handler = object.__new__(DecodeStagingHandler)
         handler.staging_allocator = SimpleNamespace(_scatter_stream=None)
+        handler._defer_scatter = False
         decode_req = SimpleNamespace(_chunk_events=[])
         handler.release_room(17, decode_req, receiver)
         self.assertEqual(receiver.chunk_staging_infos, [])
+
+
+class TestBootstrapServerClose(CustomTestCase):
+    def test_close_before_server_thread_runs(self):
+        with patch.object(threading.Thread, "start"):
+            server = CommonKVBootstrapServer("127.0.0.1", 0)
+        server.close()
 
 
 if __name__ == "__main__":

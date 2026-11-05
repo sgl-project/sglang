@@ -677,6 +677,7 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
                 weight_scale=layer.weight_scale,
                 input_scale=layer.input_scale,
                 bias=bias,
+                pre_quant_output_dtype=layer.orig_dtype,
             )
         return apply_fp8_linear(
             input=x,
@@ -685,6 +686,7 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
             input_scale=layer.input_scale,
             bias=bias,
             cutlass_fp8_supported=self.cutlass_fp8_supported,
+            pre_quant_output_dtype=layer.orig_dtype,
         )
 
 
@@ -3207,6 +3209,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             and (
                 moe_runner_backend.is_flashinfer_trtllm()
                 or moe_runner_backend.is_flashinfer_megamoe()
+                or self._is_cutedsl_v2_standard
             )
         ), f"{activation=} is unsupported by {moe_runner_backend}"
 

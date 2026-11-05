@@ -19,8 +19,12 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
+from sglang.srt.mem_cache.kv.build import UnifiedBuildContext, build_kv_storage
+from sglang.srt.mem_cache.kv.decl import MHAGeometry, kv_layer_decls
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec, MHAView
+from sglang.srt.mem_cache.kv.plan import plan_kv_storage
 from sglang.srt.mem_cache.kv.routed_cache import RoutedKVCache
+from sglang.srt.mem_cache.kv.sizing import KVSizingInputs, size_plan
 from sglang.srt.mem_cache.layout.fused_draft import (
     LAYER_FULL,
     LAYER_WINDOW,
@@ -64,67 +68,61 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
             ),
             num_runners=1,
             ctx=PlacementContext(
-                host_names=("full", "swa") if target_window else ("full", "mamba"),
+                host_names=("full", "swa") if target_window else ("full",),
                 target_window=target_window,
             ),
             store_dtype=torch.bfloat16,
         )
         self.assertIsNotNone(decision.placement, decision.declined)
         placement = decision.placement
-        host = "swa" if target_window and window <= target_window else "full"
+        # A draft window rides in the target window of its length; any other
+        # draft window gets a band of its own.
+        fused = window == target_window
+        host = "swa" if fused or not target_window else "draft_swa"
         self.assertEqual(placement.hosts(), (host,))
-        specs = [
-            MHASubPoolSpec(
-                name=name,
-                layer_num=1,
-                head_num=1,
-                head_dim=8,
-                store_dtype=torch.bfloat16,
-                grow_direction=direction,
-                draft_region=placement.region(name),
-            )
-            for name, direction in (("full", "up"), ("swa", "down"))
-        ]
-        buffer = arena_of(
-            total_bytes=1024 * sum(spec.entry_bytes() for spec in specs),
-            sub_pool_specs=specs,
-            device="cuda",
-            enable_memory_saver=False,
-            page_size=1,
-            fused_draft=placement,
+        self.assertEqual(host in placement.new_bands, not fused, placement.new_bands)
+        # The target: a full layer and, when it has one, a window layer.
+        geometry = MHAGeometry(
+            head_num=1, head_dim=8, v_head_dim=8, kv_cache_dtype=torch.bfloat16
         )
-        views = {
-            name: MHAView(
-                arena=buffer,
-                spec=buffer.spec(name),
-                page_size=1,
-                model_layer_ids=(layer_id,),
-            )
-            for name, layer_id in (("full", 0), ("swa", 1))
-        }
-        target_pool = RoutedKVCache(
-            arena=buffer,
-            owner="full",
-            layer_maps=[("full", views["full"], {0: 0}), ("swa", views["swa"], {1: 0})],
-            page_size=1,
-            start_layer=0,
-            end_layer=None,
-            size=buffer.num_entries("full") - 1,
-            head_num=views["full"].head_num,
-            head_dim=views["full"].head_dim,
+        decls = kv_layer_decls(
+            full_layer_ids=(0,),
+            full_geometry=geometry,
+            window_layer_ids=(1,) if target_window else (),
+            window_geometry=geometry if target_window else None,
+            window=target_window,
         )
-        allocator = ChainAllocator(
-            roles=ChainRoles(owner="full", window="swa"),
-            arena=buffer,
-            kvcache=target_pool,
-            views=views,
-            device="cuda",
-            full_max_total_num_tokens=1024,
-            swa_max_total_num_tokens=1024,
+        storage_plan = plan_kv_storage(decls, page_size=1, fused_draft=placement)
+        sized = size_plan(
+            storage_plan,
+            KVSizingInputs(
+                full_tokens=1024,
+                window_tokens=1024,
+                state_slots=0,
+                max_running_requests=2,
+                context_len=1024,
+                alignment=1,
+            ),
         )
-        # Different FULL/SWA addresses make a wrong storage route observable.
+        storage = build_kv_storage(
+            storage_plan,
+            sized,
+            UnifiedBuildContext(
+                device="cuda",
+                start_layer=0,
+                end_layer=2 if target_window else 1,
+                enable_memory_saver=False,
+                need_sort=False,
+                max_num_reqs=2,
+                model_context_len=1024,
+                lazy_compaction=False,
+            ),
+        )
+        allocator = storage.allocator
+        # Different full and window addresses make a wrong storage route
+        # observable.
         old = allocator.alloc(7)
-        allocator.free_swa_segment(old, start_pos=0)
+        allocator.free_window_segment(host, old, start_pos=0)
         virtual = allocator.alloc(512)
         req = SimpleNamespace(size=1, req_to_token=virtual.reshape(1, -1))
         layer = RadixAttention(
@@ -138,9 +136,9 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
         bound = bind_fused_draft(
             placement=placement,
             runner=0,
-            arena=buffer,
-            plan=plan_stand_in(buffer, placement),
-            owner="full",
+            arena=allocator.arena,
+            plan=storage_plan,
+            owner=storage_plan.owner().name,
             target_state=None,
             model=SimpleNamespace(modules=lambda: [layer]),
             model_config=SimpleNamespace(),
@@ -172,10 +170,10 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
             with patch.object(tb, "TritonAttnBackend", return_value=inner):
                 backend = tb.TritonMultiStepDraftBackend(runner, 1, 3)
         else:
-            # Whether the step backend writes a window sub-pool, as
+            # The step backend writes a window sub-pool, as
             # FlashInferAttnBackend resolves it for this runner.
             inner = SimpleNamespace(
-                max_context_len=512, use_sliding_window_kv_pool=host == "swa"
+                max_context_len=512, use_sliding_window_kv_pool=True
             )
             with patch.object(fb, "FlashInferAttnBackend", return_value=inner):
                 if backend_kind == "flashinfer":
@@ -191,6 +189,7 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
         self.bound_pool = bound.token_to_kv_pool
         self.runner, self.layer = runner, layer
         self.allocator, self.virtual, self.reader = allocator, virtual, reader
+        self.host = host
         rows = torch.zeros(1, dtype=torch.int64, device="cuda")
         seq_lens = torch.tensor([300], dtype=torch.int32, device="cuda")
         plan = reader.plan(
@@ -215,12 +214,17 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
             ),
         )
         full = allocator.translate_kv_loc(virtual)
-        swa = allocator.id_spaces()[IdSpaceKind.SLIDING_WINDOW].ids(virtual)
-        self.assertFalse(torch.equal(full, swa))
-        return backend, batch, full if host == "full" else swa, host
+        draft_window = allocator.id_spaces()[host].ids(virtual)
+        self.assertFalse(torch.equal(full, draft_window))
+        if target_window and not fused:
+            # A draft band of its own: reading the target's window would be a
+            # wrong route, and observable.
+            target = allocator.id_spaces()["swa"].ids(virtual)
+            self.assertFalse(torch.equal(target, draft_window))
+        return backend, batch, draft_window, host
 
     def test_window_reads_follow_placement_in_eager_and_graph(self):
-        for window, target_window in ((256, 128), (64, None), (64, 128)):
+        for window, target_window in ((256, 128), (64, None), (64, 128), (128, 128)):
             with self.subTest(window=window, target_window=target_window):
                 backend, batch, physical, _ = self._fixture(window, target_window)
                 full_ids = torch.empty((3, 512), dtype=torch.int64, device="cuda")
@@ -352,10 +356,8 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
         window, seq_len, accept = 64, 300, 2
         self._fixture(window, target_window=128)
         # The window side no longer holds the prefix before the window.
-        self.allocator.free_swa_segment(self.virtual[:200], start_pos=0)
-        swa = self.allocator.id_spaces()[IdSpaceKind.SLIDING_WINDOW].ids(
-            self.virtual[:seq_len]
-        )
+        self.allocator.free_window_segment(self.host, self.virtual[:200], start_pos=0)
+        swa = self.allocator.id_spaces()[self.host].ids(self.virtual[:seq_len])
         span = window + accept
         live = swa[seq_len - span :]
         self.assertFalse(torch.equal(live, swa[:span]))
@@ -383,7 +385,7 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
         when reads are translated. Each step now reads a rail of the last
         window + 1 tokens (the decode window wrapper's span) in the ids of
         the storage its window layers live in."""
-        for window, target_window in ((256, 128), (64, None), (64, 128)):
+        for window, target_window in ((256, 128), (64, None), (64, 128), (128, 128)):
             with self.subTest(window=window, target_window=target_window):
                 backend, batch, physical, _ = self._fixture(
                     window, target_window, backend_kind="flashinfer"
@@ -457,7 +459,7 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
         layer's window. Checked on the replay prep: the window table's live
         window holds the window sub-pool's ids of the request's tokens, not the
         owner's."""
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.model_executor.forward_mode import ForwardMode
 
         window, seq_len = 64, 300
         self._fixture(window, 128)

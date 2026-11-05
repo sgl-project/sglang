@@ -96,7 +96,7 @@ def _tokenizer_load_snapshot_owner_caller() -> str:
     """The caller that plays the tokenizer-side zmq owner role.
 
     In multi-tokenizer mode (``tokenizer_worker_num > 1``) there are N
-    independent ``TokenizerWorker`` processes that would all try to bind the
+    independent tokenizer worker processes that would all try to bind the
     same zmq PULL endpoint.  Instead, the single ``MultiTokenizerRouter``
     process owns the socket (polls zmq -> SHM) and every worker reads SHM.
     """

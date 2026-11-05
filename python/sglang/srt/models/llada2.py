@@ -91,7 +91,7 @@ from sglang.srt.utils import (
     is_npu,
     make_pp_layers,
 )
-from sglang.srt.utils.hf_transformers_utils import get_rope_config
+from sglang.srt.utils.hf_transformers import get_rope_config
 
 LoraConfig = None
 logger = logging.getLogger(__name__)

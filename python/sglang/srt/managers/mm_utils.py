@@ -18,7 +18,6 @@ import numpy as np
 import torch
 from torch import nn
 
-from sglang.kernels.ops.memory.gpu_tensor_hash import gpu_tensor_hash
 from sglang.srt.environ import envs
 from sglang.srt.managers import mm_schedule
 from sglang.srt.managers.io_struct import (
@@ -32,20 +31,15 @@ from sglang.srt.managers.mm_schedule import (
     DataEmbeddingFunc,
     get_embedding_and_mask,
 )
-from sglang.srt.managers.mm_schedule import (
-    init_mm_embedding_cache as init_mm_embedding_cache,
-)
-from sglang.srt.managers.schedule_batch import (
-    CudaIpcTensorTransportProxy,
-    Modality,
-    MultimodalInputs,
-    MultimodalProcessorOutput,
-)
+from sglang.srt.managers.req_types import MultimodalInputs, MultimodalProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.multimodal.cache.digest import structured_digest
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.transport import (
     TensorTransportMode,
     determine_tensor_transport_mode,
 )
+from sglang.srt.multimodal.transport.cuda_ipc import CudaIpcTensorTransportProxy
 from sglang.srt.runtime_context import (
     get_disagg,
     get_server_args,
@@ -897,64 +891,33 @@ def data_hash(data) -> int:
 
 
 def tensor_hash(tensor_list) -> int:
-    """
-    hash a tensor or a tensor list
-    """
-    tensor = tensor_list
-    if isinstance(tensor_list, list):
-        tensor_list = flatten_nested_list(tensor_list)
-        tensors = [
-            x.flatten() if isinstance(x, torch.Tensor) else x for x in tensor_list
-        ]
-        # GPU path: concat + triton hash (unchanged)
-        if any(isinstance(t, torch.Tensor) and t.is_cuda for t in tensors):
-            tensor = torch.concat(tensors)
-            return gpu_tensor_hash(tensor.cuda())
-        # CPU path: hash each tensor incrementally without concat
-        hasher = hashlib.sha256()
-        for t in tensors:
-            t = t.detach().cpu().contiguous()
-            hasher.update(memoryview(t.reshape(-1).view(torch.uint8).numpy()))
-        hash_bytes = hasher.digest()[:8]
-        return int.from_bytes(hash_bytes, byteorder="big", signed=False)
-
-    # Single tensor
-    if tensor.is_cuda:
-        return gpu_tensor_hash(tensor.cuda())
-    tensor = tensor.detach().cpu().contiguous()
-    hasher = hashlib.sha256()
-    hasher.update(memoryview(tensor.reshape(-1).view(torch.uint8).numpy()))
-    hash_bytes = hasher.digest()[:8]
-    return int.from_bytes(hash_bytes, byteorder="big", signed=False)
+    """Compatibility scalar; cache identities must use hash_feature_digest."""
+    return int.from_bytes(structured_digest(tensor_list)[:8], "big")
 
 
-def hash_feature(f):
-    if isinstance(f, list):
-        # A list may mix ShmPointerMMData and plain tensors, since wrapping
-        # falls back to inline transport per element when shm allocation fails.
-        if len(f) > 0 and any(isinstance(x, ShmPointerMMData) for x in f):
-            return tensor_hash(
-                [x.tensor if isinstance(x, ShmPointerMMData) else x for x in f]
-            )
-        if len(f) > 0 and isinstance(f[0], torch.Tensor):
-            return tensor_hash(f)
-        return data_hash(tuple(flatten_nested_list(f)))
-    elif isinstance(f, np.ndarray):
-        arr = np.ascontiguousarray(f)
-        hasher = hashlib.sha256()
-        hasher.update(memoryview(arr))
-        hash_bytes = hasher.digest()[:8]
-        return int.from_bytes(hash_bytes, byteorder="big", signed=False)
-    elif isinstance(f, torch.Tensor):
-        return tensor_hash([f])
-    elif isinstance(f, CudaIpcTensorTransportProxy):
-        reconstruct_t = f.reconstruct_on_target_device(torch.cuda.current_device())
-        return tensor_hash([reconstruct_t])
-    elif isinstance(f, ShmPointerMMData):
-        if f.precomputed_hash is not None:
-            return f.precomputed_hash
-        return tensor_hash([f.tensor])
-    return data_hash(f)
+def _identity_data(value):
+    if isinstance(value, ShmPointerMMData):
+        # Reading must not consume the handle needed by the encoder later.
+        return value.tensor
+    if isinstance(value, CudaIpcTensorTransportProxy):
+        raise RuntimeError("Multimodal identity must be computed before CUDA transport")
+    if isinstance(value, list):
+        return [_identity_data(part) for part in value]
+    if isinstance(value, tuple):
+        return tuple(_identity_data(part) for part in value)
+    if isinstance(value, dict):
+        return {key: _identity_data(part) for key, part in value.items()}
+    return value
+
+
+def hash_feature_digest(value) -> bytes:
+    """Hash actual transport contents, never its address or a scalar hint."""
+    return structured_digest(_identity_data(value))
+
+
+def hash_feature(value) -> int:
+    """Legacy scalar hash. Embedding and prefix caches use the full digest."""
+    return int.from_bytes(hash_feature_digest(value)[:8], "big")
 
 
 def extend_mrope_positions_for_retracted_request(
@@ -1177,7 +1140,7 @@ def _try_simple_split(item, num_items, expanded_mm_items):
         new_item.model_specific_data = _split_model_data_for_item(
             item.model_specific_data, i, num_items, patch_slices, total_num_patches
         )
-        new_item.hash = None
+        new_item.clear_identity()
         expanded_mm_items.append(new_item)
     return True
 
@@ -1259,7 +1222,7 @@ def get_new_expanded_mm_items(original_mm_items):
                         num_items=num_items,
                         total_feature_len=total_feature_len,
                     )
-                    new_item.hash = None
+                    new_item.clear_identity()
                     expanded_mm_items.append(new_item)
 
             elif item.is_video():
@@ -1345,7 +1308,7 @@ def get_new_expanded_mm_items(original_mm_items):
                         num_items=num_videos,
                         total_feature_len=total_feature_len,
                     )
-                    new_item.hash = None
+                    new_item.clear_identity()
                     expanded_mm_items.append(new_item)
             else:
                 if not _try_simple_split(item, num_items, expanded_mm_items):
@@ -1507,6 +1470,16 @@ def _get_is_default_transport():
     return _is_default_tensor_transport
 
 
+def _model_specific_shm_values(item):
+    """Yield the ``model_specific_data`` entries that are SHM pointers."""
+    data = item.model_specific_data
+    if not data:
+        return
+    for key, value in data.items():
+        if isinstance(value, ShmPointerMMData):
+            yield key, value
+
+
 def _wrap_shm_or_inline(tensor: torch.Tensor, precomputed_hash: Optional[int] = None):
     """Wrap a tensor in ShmPointerMMData, falling back to inline (pickled)
     transport when shared memory cannot be allocated, e.g. /dev/shm is full
@@ -1540,6 +1513,62 @@ def _wrap_tensor_or_list(value, precomputed_hash: Optional[int] = None):
     return value
 
 
+def _is_placeholder_crop(item) -> bool:
+    """Whether ``images_crop`` is an all-zero placeholder the model discards.
+
+    A crop-free mode emits a zero tensor and marks the page ``has_local_crops``
+    False; the vision path then rebuilds its own zeros from the shape alone, so
+    the payload is never read.
+    """
+    crops = item.model_specific_data.get("has_local_crops")
+    if not crops:
+        return False
+    if isinstance(crops, torch.Tensor):
+        crops = crops.tolist()
+    return not any(bool(c) for c in crops)
+
+
+def _placeholder_crop(tensor: torch.Tensor) -> torch.Tensor:
+    """A zero-stride view carrying ``tensor``'s shape at one element of storage.
+
+    Sending the real zeros would publish a segment per page (12.6 MB in a
+    crop-free mode) for data nothing reads; the view keeps the shape every
+    consumer indexes and pickles to a few hundred bytes.
+    """
+    return torch.zeros(1, dtype=tensor.dtype, device=tensor.device).expand(tensor.shape)
+
+
+# Arbitrary floor; smaller ``model_specific_data`` tensors are pickled inline.
+_SHM_MODEL_DATA_MIN_BYTES = 1 << 20
+
+
+def _wrap_model_specific_data(item) -> None:
+    """Wrap large ``model_specific_data`` tensors, in a fresh dict.
+
+    The dict is replaced rather than mutated: ``copy.copy`` on an item shares
+    it, so writing in place would alias two requests onto one segment and the
+    first unlink would pull it out from under the second.
+    """
+    data = item.model_specific_data
+    if not data:
+        return
+    placeholder = _is_placeholder_crop(item)
+    wrapped = None
+    for key, value in data.items():
+        if not isinstance(value, torch.Tensor) or not value.is_cpu:
+            continue
+        if value.numel() * value.element_size() < _SHM_MODEL_DATA_MIN_BYTES:
+            continue
+        if wrapped is None:
+            wrapped = dict(data)
+        if placeholder and key == "images_crop":
+            wrapped[key] = _placeholder_crop(value)
+        else:
+            wrapped[key] = _wrap_shm_or_inline(value)
+    if wrapped is not None:
+        item.model_specific_data = wrapped
+
+
 def wrap_shm_features(obj):
     """
     Scan the object for multimodal tensors and wrap them in SHM pointers.
@@ -1548,6 +1577,10 @@ def wrap_shm_features(obj):
         return obj
 
     if obj.mm_inputs:
+        wrap_model_data = (
+            obj.mm_inputs.shm_model_specific_data
+            and envs.SGLANG_ENABLE_UOCR_SHM_WRAP_MODEL_DATA.get()
+        )
         for item in obj.mm_inputs.mm_items:
             item_hash = item.hash
             if item.feature is not None:
@@ -1558,6 +1591,8 @@ def wrap_shm_features(obj):
                 item.precomputed_embeddings = _wrap_tensor_or_list(
                     item.precomputed_embeddings, precomputed_hash=item_hash
                 )
+            if wrap_model_data:
+                _wrap_model_specific_data(item)
     return obj
 
 
@@ -1584,6 +1619,10 @@ def has_shm_features(recv_reqs):
                     return True
                 if _feature_has_shm(item.precomputed_embeddings):
                     return True
+                # Without this the scheduler skips the materialization barrier
+                # and hands the model a pointer where it expects a tensor.
+                if next(_model_specific_shm_values(item), None) is not None:
+                    return True
     return False
 
 
@@ -1609,6 +1648,10 @@ def discard_shm_features(obj) -> None:
     for item in obj.mm_inputs.mm_items:
         _discard_tensor_or_list(item.feature)
         _discard_tensor_or_list(item.precomputed_embeddings)
+        # Rejecting a request must release its crop segments too, or each one
+        # leaks a multi-megabyte /dev/shm allocation.
+        for _key, value in _model_specific_shm_values(item):
+            value.close_and_unlink()
 
 
 def _unwrap_tensor_or_list(value):
@@ -1646,4 +1689,12 @@ def unwrap_shm_features(obj):
                 item.precomputed_embeddings = _unwrap_tensor_or_list(
                     item.precomputed_embeddings
                 )
+            # Fresh dict, for the same copy.copy aliasing reason as the wrap.
+            unwrapped = None
+            for key, value in _model_specific_shm_values(item):
+                if unwrapped is None:
+                    unwrapped = dict(item.model_specific_data)
+                unwrapped[key] = value.materialize()
+            if unwrapped is not None:
+                item.model_specific_data = unwrapped
     return obj

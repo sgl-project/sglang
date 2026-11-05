@@ -50,6 +50,7 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS: str | None = None
     SGLANG_DIFFUSION_FLUX3_NATTEN_BACKEND: str | None = None
     SGLANG_DIFFUSION_CFG_GATE_STEP: float = 1.0
+    SGLANG_DIFFUSION_WAN_TEXT_PADDING: str = "max"
     # cache-dit env vars (primary transformer)
     # on by default; engages only on 2 ranks with peer-to-peer access and falls
     # back to NCCL when unavailable. Set 0 to force NCCL. Keep this in step with
@@ -226,6 +227,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_COSMOS3_LIDAR_USE_NATTEN": _lazy_bool(
         "SGLANG_DIFFUSION_COSMOS3_LIDAR_USE_NATTEN"
     ),
+    # Store the Wan-Animate-2 reference-video K/V cache in FP8 e4m3 with per-(token, head)
+    # scales, dequantized one block at a time into the attention buffer.
+    "SGLANG_DIFFUSION_WAN_ANIMATE_2_FP8_REFERENCE_KV": _lazy_bool(
+        "SGLANG_DIFFUSION_WAN_ANIMATE_2_FP8_REFERENCE_KV", "false"
+    ),
     # MXFP8 Attention quantization
     # Applies to both online ``MXFP8Config`` and offline ``ModelSlimConfig`` (W8A8_MXFP8)
     # Q/K/V are getting offline rotating in case of rotation matrices in quant_config
@@ -323,6 +329,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # last conditional-minus-unconditional residual. Keep 1.0 to disable.
     "SGLANG_DIFFUSION_CFG_GATE_STEP": _lazy_float(
         "SGLANG_DIFFUSION_CFG_GATE_STEP", 1.0
+    ),
+    # Wan UMT5 text padding. "max" (default) pads every prompt to 512 tokens.
+    # "longest" encodes only the real tokens; "bucket" rounds up to a multiple of
+    # 64. Both are faster but change the bf16 rounding, so outputs are not
+    # bit-identical to "max".
+    "SGLANG_DIFFUSION_WAN_TEXT_PADDING": _lazy_str(
+        "SGLANG_DIFFUSION_WAN_TEXT_PADDING", "max"
     ),
     # Kernel backend for convrot_int8 (online or serialized ConvRot INT8):
     # "auto" prefers SGLang's JIT-compiled convrot_int8 ops where they build

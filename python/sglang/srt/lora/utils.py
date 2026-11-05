@@ -6,7 +6,7 @@ from typing import Iterable, List, Optional, Set, Tuple, Union
 import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.utils.hf_transformers_utils import AutoConfig
+from sglang.srt.utils.hf_transformers import AutoConfig
 
 logger = logging.getLogger(__name__)
 
