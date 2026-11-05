@@ -6,8 +6,9 @@ import torch
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     sample_simulated_bonus,
 )
-from sglang.test.ci.ci_register import register_amd_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
+register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
 
 
@@ -33,6 +34,7 @@ class TestSimulatedBonus(unittest.TestCase):
             sampling_info=_info([1e-6] * bs),
             bs=bs,
             verify_num_draft_tokens=rows,
+            seed=0,
         )
         ref = logits.view(bs, rows, vocab).argmax(-1)[
             torch.arange(bs), correct_len.long()
@@ -52,6 +54,7 @@ class TestSimulatedBonus(unittest.TestCase):
             sampling_info=_info([1e-6] * bs),
             bs=bs,
             verify_num_draft_tokens=rows,
+            seed=0,
         )
         picked_rows = logits.float().view(bs, rows, vocab)[
             torch.arange(bs), correct_len
@@ -73,6 +76,7 @@ class TestSimulatedBonus(unittest.TestCase):
             sampling_info=_info([0.7] * n),
             bs=n,
             verify_num_draft_tokens=1,
+            seed=1,
         )
         freq = torch.bincount(out, minlength=vocab).float() / n
         want = torch.softmax(base / 0.7, dim=-1)

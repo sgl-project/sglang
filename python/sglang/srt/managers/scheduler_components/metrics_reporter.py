@@ -11,10 +11,11 @@ from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import msgspec
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import EPLB_BALANCEDNESS_WINDOW_SIZES
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.scheduler_components.request_list import ListKind
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -855,10 +856,7 @@ class SchedulerMetricsReporter:
                 )
             else:
                 self.stats.num_running_reqs = prefill_stats.num_running_reqs
-            self.stats.num_queue_reqs = QueueCount.from_reqs(
-                self.scheduler.waiting_queue, priority_enabled
-            )
-            self.stats.num_grammar_queue_reqs = len(self.scheduler.grammar_manager)
+            self._update_queue_stats(priority_enabled)
             self.stats.cache_hit_rate = cache_hit_rate
             # Refresh here too: prefill-heavy stretches can run long between
             # decode-stats ticks, and the gauge must decay rather than hold.
@@ -874,13 +872,6 @@ class SchedulerMetricsReporter:
 
             # PD disaggregation
             if self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
-                self.stats.num_prefill_bootstrap_queue_reqs = QueueCount.from_reqs(
-                    self.scheduler.disagg_prefill_bootstrap_queue.queue,
-                    priority_enabled,
-                )
-                self.stats.num_prefill_inflight_queue_reqs = QueueCount.from_reqs(
-                    self.scheduler.disagg_prefill_transfer_queue, priority_enabled
-                )
                 self.stats.kv_transfer_speed_gb_s = self.kv_transfer_speed_gb_s
                 self.stats.kv_transfer_latency_ms = self.kv_transfer_latency_ms
             elif self.scheduler.disaggregation_mode == DisaggregationMode.DECODE:
@@ -1073,10 +1064,7 @@ class SchedulerMetricsReporter:
             self.stats.num_running_reqs = QueueCount.from_reqs(
                 batch.reqs, priority_enabled
             )
-            self.stats.num_queue_reqs = QueueCount.from_reqs(
-                self.scheduler.waiting_queue, priority_enabled
-            )
-            self.stats.num_grammar_queue_reqs = len(self.scheduler.grammar_manager)
+            self._update_queue_stats(priority_enabled)
             self.stats.gen_throughput = self.last_gen_throughput
             # cache_hit_rate is prefill-owned (per-report semantics); decode
             # ticks must not reset it, or the exported gauge reads 0 whenever
@@ -1098,16 +1086,6 @@ class SchedulerMetricsReporter:
             self.stats.num_retracted_reqs = self.num_retracted_reqs
             self.stats.num_paused_reqs = self.num_paused_reqs
             self.num_retracted_reqs = self.num_paused_reqs = 0
-
-            # PD disaggregation
-            if self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
-                self.stats.num_prefill_bootstrap_queue_reqs = QueueCount.from_reqs(
-                    self.scheduler.disagg_prefill_bootstrap_queue.queue,
-                    priority_enabled,
-                )
-                self.stats.num_prefill_inflight_queue_reqs = QueueCount.from_reqs(
-                    self.scheduler.disagg_prefill_transfer_queue, priority_enabled
-                )
 
             # Streaming session metrics
             self.stats.num_streaming_sessions = (
@@ -1437,6 +1415,20 @@ class SchedulerMetricsReporter:
             self.fwd_occupancy = float("nan")
             self.stats.fwd_occupancy = float("nan")
 
+    def _update_queue_stats(self, priority_enabled: bool) -> None:
+        lists = self.scheduler.request_lists()
+        self.stats.num_queue_reqs = QueueCount.from_reqs(
+            lists[ListKind.WAITING], priority_enabled
+        )
+        self.stats.num_grammar_queue_reqs = len(lists[ListKind.GRAMMAR])
+        if self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
+            self.stats.num_prefill_bootstrap_queue_reqs = QueueCount.from_reqs(
+                lists[ListKind.PD_BOOTSTRAP], priority_enabled
+            )
+            self.stats.num_prefill_inflight_queue_reqs = QueueCount.from_reqs(
+                lists[ListKind.PD_SENDING], priority_enabled
+            )
+
     def _update_decode_queue_stats(self, priority_enabled: bool) -> None:
         transfer_queue = self.scheduler.disagg_decode_transfer_queue.queue
         self.stats.num_decode_prealloc_queue_reqs = QueueCount.from_reqs(
@@ -1449,7 +1441,7 @@ class SchedulerMetricsReporter:
             self.scheduler.disagg_decode_transfer_queue.num_pending_deferred_releases()
         )
         host_reqs = (
-            [req for req in transfer_queue if req.host_staged]
+            [d.req for d in transfer_queue.items() if d.host_staged]
             if get_disagg().disaggregation_decode_host_receive_threshold < 1
             else []
         )
@@ -1509,20 +1501,11 @@ class SchedulerMetricsReporter:
             self.scheduler.running_batch.reqs, priority_enabled
         )
         self.stats.gen_throughput = 0
-        self.stats.num_queue_reqs = QueueCount.from_reqs(
-            self.scheduler.waiting_queue, priority_enabled
-        )
-        self.stats.num_grammar_queue_reqs = len(self.scheduler.grammar_manager)
-        if self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
-            self.stats.num_prefill_bootstrap_queue_reqs = QueueCount.from_reqs(
-                self.scheduler.disagg_prefill_bootstrap_queue.queue, priority_enabled
-            )
-            self.stats.num_prefill_inflight_queue_reqs = QueueCount.from_reqs(
-                self.scheduler.disagg_prefill_transfer_queue, priority_enabled
-            )
+        self._update_queue_stats(priority_enabled)
         if self.scheduler.disaggregation_mode == DisaggregationMode.DECODE:
             self._update_decode_queue_stats(priority_enabled)
         # Host pools change without a batch (e.g. /flush_cache); refresh before
         # publishing so the gauges do not hold the last batch's values.
         self._log_hicache_stats()
         self.metrics_collector.log_stats(self.stats)
+        self.scheduler.kv_events_publisher.emit_kv_metrics()

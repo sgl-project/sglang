@@ -29,8 +29,8 @@ from sglang.srt.layers.moe.utils import (
     speculative_moe_backend_context,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.router import STATE_PART
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -38,10 +38,8 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardBatch,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
 from sglang.srt.runtime_context import (
     get_device,
     get_schedule,
@@ -1116,21 +1114,20 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         )
 
     @property
-    def draft_swa_window(self) -> int:
-        # The widened extend starts front rows below the committed length, and
-        # each depth reads its own window back from there.
+    def draft_window_reaches(self) -> dict[str, int]:
+        # Widened extend reads front rows before the committed length. The
+        # attention role "swa" may route to a different storage band per runner.
         draft = self._draft_worker
-        windows = [
-            runner.sliding_window_size
-            for runner in draft.draft_runner_list
-            if runner.runner_ids.is_fused_draft
-            and runner.token_to_kv_pool.layer_router.routes_to(
-                IdSpaceKind.SLIDING_WINDOW
-            )
-        ]
-        if not windows:
-            return 0
-        return max(windows) + draft.draft_extend_num_front_tokens
+        reaches = {}
+        for runner in draft.draft_runner_list:
+            if not runner.runner_ids.is_fused_draft:
+                continue
+            router = runner.token_to_kv_pool.layer_router
+            if router.routes_to(IdSpaceKind.SLIDING_WINDOW):
+                name = router.storage_name(IdSpaceKind.SLIDING_WINDOW)
+                reach = runner.sliding_window_size + draft.draft_extend_num_front_tokens
+                reaches[name] = max(reaches.get(name, 0), reach)
+        return reaches
 
     def forward_batch_generation(
         self,
