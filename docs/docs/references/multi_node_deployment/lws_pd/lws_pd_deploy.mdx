@@ -18,7 +18,7 @@ metatags:
 
 ### Prefill
 
-Prefill manifest file [prefill.yaml](https://github.com/sgl-project/sglang/blob/main/docs/references/multi_node_deployment/lws_pd/lws-examples/p.yaml)
+Prefill manifest file `p.yaml`
 
 *Note: The NodeSelector section, model location section, and taint toleration section can be adjusted according to your actual deployment environment*
 
@@ -337,7 +337,7 @@ spec:
 
 ### Decode
 
-Decode node deployment manifest file [decode.yaml](https://github.com/sgl-project/sglang/blob/main/docs/references/multi_node_deployment/lws_pd/lws-examples/d.yaml)
+Decode node deployment manifest file `d.yaml`
 
 *Note: The NodeSelector section, model location section, and taint toleration section can be adjusted according to your actual deployment environment*
 
@@ -646,7 +646,7 @@ Currently, we use a static K8S service + minilb approach to implement model API 
 ### Creating Service for Prefill and Decode
 
 #### Create prefill k8s service
-[p-svc.yaml](https://github.com/sgl-project/sglang/blob/main/docs/references/multi_node_deployment/lws_pd/lws-examples/p-svc.yaml)
+`p-svc.yaml`:
 ```yaml Config
 apiVersion: v1
 kind: Service
@@ -664,7 +664,7 @@ spec:
 Execute `kubectl apply -f p-svc.yaml`
 
 #### Create decode k8s service
-[d-svc.yaml](https://github.com/sgl-project/sglang/blob/main/docs/references/multi_node_deployment/lws_pd/lws-examples/d-svc.yaml)
+`d-svc.yaml`:
 ```yaml Config
 apiVersion: v1
 kind: Service
@@ -682,7 +682,7 @@ spec:
 Execute `kubectl apply -f d-svc.yaml`
 
 #### Deploy minilb and lb service
-[lb.yaml](https://github.com/sgl-project/sglang/blob/main/docs/references/multi_node_deployment/lws_pd/lws-examples/lb.yaml)
+`lb.yaml`:
 ```yaml Config
 apiVersion: apps/v1
 kind: Deployment
