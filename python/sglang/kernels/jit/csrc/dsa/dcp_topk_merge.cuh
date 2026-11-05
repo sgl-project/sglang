@@ -416,6 +416,7 @@ struct DcpTopKMergeKernel {
     const auto rows = static_cast<int32_t>(R.unwrap());
     const auto max_rows = static_cast<int32_t>(M.unwrap());
     RuntimeCheck(rows <= max_rows, "dcp_topk_merge: rows ", rows, " > max_rows ", max_rows);
+    RuntimeCheck(0 <= dcp_rank && dcp_rank < kNumRanks, "dcp_topk_merge: dcp_rank ", dcp_rank, " out of range");
     RuntimeCheck(
         page_table.size(0) >= rows, "dcp_topk_merge: page_table has ", page_table.size(0), " rows < rows ", rows);
     const int64_t need = 2LL * max_rows * (kNumRanks * kCandK + kTopK);
