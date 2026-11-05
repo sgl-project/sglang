@@ -32,6 +32,7 @@ from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, window_sub_pool_of
+from sglang.srt.mem_cache.kv.requests import RequestTable, RowState
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_SANITY_CHECK_CACHE,
@@ -525,28 +526,63 @@ class SchedulerInvariantChecker:
             self._report_leak("pool-bytes", "\n".join(byte_violations))
 
     def _check_req_pool(self):
-        # Account for pre-alloc headroom whenever the pool has it. The decode
-        # pool always does; with runtime P<->D role switching a prefill instance
-        # may also hold a decode-flavored (pre-alloc) pool, so key off the pool
-        # itself rather than the current role.
-        req_total_size = (
-            self.req_to_token_pool.size + self.req_to_token_pool.pre_alloc_size
-        )
-
+        pool = self.req_to_token_pool
         session_req_count = self.pool_stats_observer.session_held_req_count()
-        if len(self.req_to_token_pool.free_slots) + session_req_count != req_total_size:
-            msg = (
-                "req_to_token_pool memory leak detected!"
-                f"available_size={len(self.req_to_token_pool.free_slots)}, "
-                f"session_held={session_req_count}, "
-                f"total_size={self.req_to_token_pool.size}\n"
-            )
+        if isinstance(pool, RequestTable):
+            msg = self._row_state_violation(pool, session_req_count)
+        else:
+            msg = self._row_count_violation(pool, session_req_count)
+        if msg is not None:
             raise_error_or_warn(
                 self,
                 envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE.get(),
                 "count_req_pool_leak_warnings",
                 msg,
             )
+
+    @staticmethod
+    def _row_state_violation(
+        table: RequestTable, session_req_count: int
+    ) -> Optional[str]:
+        """Idle, no request holds a row: every row is free, parked by a
+        streaming session or held by a retained window, and those two are
+        what the sessions and the windows own."""
+        counts = {state.name: table.count(state) for state in RowState}
+        problems = []
+        if table.count(RowState.FREE) != len(table.free_slots):
+            problems.append("FREE differs from the free list")
+        if table.count(RowState.ACTIVE) != 0:
+            problems.append("ACTIVE rows while idle")
+        if (
+            table.count(RowState.PARKED) + table.count(RowState.HELD)
+            != session_req_count
+        ):
+            problems.append("PARKED + HELD differs from session_held")
+        if not problems:
+            return None
+        return (
+            "req_to_token_pool memory leak detected! "
+            f"{'; '.join(problems)}: rows={counts}, "
+            f"free_list={len(table.free_slots)}, session_held={session_req_count}\n"
+        )
+
+    @staticmethod
+    def _row_count_violation(
+        pool: ReqToTokenPool, session_req_count: int
+    ) -> Optional[str]:
+        # Account for pre-alloc headroom whenever the pool has it. The decode
+        # pool always does; with runtime P<->D role switching a prefill instance
+        # may also hold a decode-flavored (pre-alloc) pool, so key off the pool
+        # itself rather than the current role.
+        req_total_size = pool.size + pool.pre_alloc_size
+        if len(pool.free_slots) + session_req_count == req_total_size:
+            return None
+        return (
+            "req_to_token_pool memory leak detected!"
+            f"available_size={len(pool.free_slots)}, "
+            f"session_held={session_req_count}, "
+            f"total_size={pool.size}\n"
+        )
 
     def _report_leak(self, pool_name: str, token_msg: str):
         msg = f"{pool_name} memory leak detected! {token_msg}"
