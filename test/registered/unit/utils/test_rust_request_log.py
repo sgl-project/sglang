@@ -234,6 +234,7 @@ _CASES = [
                 "reasoning_tokens": 0,
                 "weight_version": "default",
                 "cached_tokens_details": {"device": 1, "host": 0},
+                "dp_rank": None,
             },
         },
     },
