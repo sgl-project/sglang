@@ -30,7 +30,6 @@ class TestK3MoeSortPlanE2E(CustomTestCase):
         from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
         from aiter.ops.triton.quant import dynamic_mxfp4_quant
 
-        from sglang.kernels.ops.moe.k3_moe_cfg import apply_k3_moe_decode_cfg
         from sglang.srt.layers.moe.moe_runner.aiter import (
             AiterMoeQuantInfo,
             AiterQuantType,
@@ -38,8 +37,6 @@ class TestK3MoeSortPlanE2E(CustomTestCase):
         )
         from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 
-        # the kernels the K3 model selects at import
-        apply_k3_moe_decode_cfg()
         torch.manual_seed(0)
         dev = torch.device("cuda", 0)
 

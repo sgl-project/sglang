@@ -547,12 +547,6 @@ class KimiK3MoE(nn.Module):
             ),
             prefix=add_prefix("experts", prefix),
         )
-        if _is_hip:
-            # Tuned AITER decode MoE configs for this model's expert shape.
-            from sglang.kernels.ops.moe.k3_moe_cfg import apply_k3_moe_decode_cfg
-
-            apply_k3_moe_decode_cfg()
-
         self.topk = TopK(
             top_k=config.num_experts_per_token,
             layer_id=self.layer_idx,
