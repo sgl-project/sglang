@@ -27,6 +27,18 @@ if ENABLE_JIT_DEEPGEMM:
     import deep_gemm
 
 
+def _preprocess_mxfp4_scales(scales):
+    """Pack E8M0 scales into the layout the FP4 GEMMs read.
+
+    A host without the DeepGEMM build imports this module only to price a kernel
+    type (see test_warmup_memory), so leave the raw scales in place there; the
+    vendor module is exactly what such a host cannot import.
+    """
+    if not ENABLE_JIT_DEEPGEMM:
+        return scales
+    return deep_gemm.preprocess_mxfp4_scales(scales)
+
+
 def _empty_token_int8(size):
     *dims, k = size
     return (
@@ -326,8 +338,8 @@ class _GroupedMaskedWarmupExecutor_fp4(_BaseWarmupExecutor):
     def setup_tensors(self, max_m: int, n: int, k: int, num_groups: int):
         self.lhs_q, self.lhs_s = _empty_token_uint8((num_groups, max_m, k))
         self.rhs_q, self.rhs_s = _empty_block_uint8((num_groups, n, k))
-        self.lhs_s = deep_gemm.preprocess_mxfp4_scales(self.lhs_s)
-        self.rhs_s = deep_gemm.preprocess_mxfp4_scales(self.rhs_s)
+        self.lhs_s = _preprocess_mxfp4_scales(self.lhs_s)
+        self.rhs_s = _preprocess_mxfp4_scales(self.rhs_s)
         self.bias = None
         self.masked_m = torch.zeros((num_groups,), device="cuda", dtype=torch.int32)
         self.out = torch.empty(
@@ -353,8 +365,8 @@ class _GroupedNopadWarmupExecutor_fp4(_BaseWarmupExecutor):
     def setup_tensors(self, max_m: int, n: int, k: int, num_groups: int):
         self.lhs_q, self.lhs_s = _empty_token_uint8((max_m, k))
         self.rhs_q, self.rhs_s = _empty_block_uint8((num_groups, n, k))
-        self.lhs_s = deep_gemm.preprocess_mxfp4_scales(self.lhs_s)
-        self.rhs_s = deep_gemm.preprocess_mxfp4_scales(self.rhs_s)
+        self.lhs_s = _preprocess_mxfp4_scales(self.lhs_s)
+        self.rhs_s = _preprocess_mxfp4_scales(self.rhs_s)
         self.bias = None
         self.m_indices = torch.zeros((max_m,), device="cuda", dtype=torch.int32)
         self.out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)
@@ -376,8 +388,8 @@ class _NormalWarmupExecutor_fp4(_BaseWarmupExecutor):
     def setup_tensors(self, max_m: int, n: int, k: int, num_groups: int):
         self.lhs_q, self.lhs_s = _empty_token_uint8((max_m, k))
         self.rhs_q, self.rhs_s = _empty_block_uint8((n, k))
-        self.lhs_s = deep_gemm.preprocess_mxfp4_scales(self.lhs_s)
-        self.rhs_s = deep_gemm.preprocess_mxfp4_scales(self.rhs_s)
+        self.lhs_s = _preprocess_mxfp4_scales(self.lhs_s)
+        self.rhs_s = _preprocess_mxfp4_scales(self.rhs_s)
         self.bias = None
         self.out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)
 
@@ -555,7 +567,7 @@ class _GroupedFusedWarmupExecutor_fp4(_GroupedFusedWarmupExecutor):
         # gather-read consumes K-major scales directly; only the RHS goes through
         # the vendor preprocessing.
         self.lhs_s = self.lhs_s.view(torch.uint16)
-        self.rhs_s = deep_gemm.preprocess_mxfp4_scales(self.rhs_s)
+        self.rhs_s = _preprocess_mxfp4_scales(self.rhs_s)
         self.out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)
         self.topk_ids = torch.randint(
             0, num_groups, (max_m, 1), device="cuda", dtype=torch.int32
