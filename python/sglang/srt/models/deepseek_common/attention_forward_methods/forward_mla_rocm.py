@@ -1133,8 +1133,9 @@ class DeepseekMLARocmForwardMixin:
                 # KV row already written; as on the cat-cache path below.
                 k = q[:, :1, :]
                 save_kv_cache = False
-            elif self._skip_rope_for_aiter_fused_mla() or self._fuse_rope_for_gfx1250_mla(
-                forward_batch
+            elif (
+                self._skip_rope_for_aiter_fused_mla()
+                or self._fuse_rope_for_gfx1250_mla(forward_batch)
             ):
                 q, _, _, k = _fused_rope_cat_and_cache(
                     self,
