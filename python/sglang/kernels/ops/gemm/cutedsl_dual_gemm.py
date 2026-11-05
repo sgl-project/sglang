@@ -511,7 +511,9 @@ class BlackwellDualGemmKernel:
         empty,
         ready,
         tmem_ready,
+        tmem_dealloc,
         tmem_slot,
+        cta_rank: cutlass.Int32,
         accumulator_layout: cutlass.Constexpr,
         tiled_mma: cute.TiledMma,
         shared_gate: cute.Tensor,
@@ -567,8 +569,19 @@ class BlackwellDualGemmKernel:
         # Phase 1: the MMA warp and four epilogue warps contribute 32 + 128
         # arrivals.  Do not free cluster-coherent TMEM until every async load
         # has been fenced by the epilogue warps.
+        # The release arrival must land in phase 1. Made while phase 0 is still
+        # open (a store warp has not arrived yet), it counts toward phase 0 and
+        # the parity-1 wait passes before the store warps' tcgen05.ld.
+        cute.arch.mbarrier_wait(tmem_ready, 0)
         cute.arch.mbarrier_arrive(tmem_ready)
         cute.arch.mbarrier_wait(tmem_ready, 1)
+        if cutlass.const_expr(self.use_2cta):
+            # tcgen05.dealloc.cta_group::2 is collective: the PTX ISA requires the
+            # issuing warp and the peer CTA's warp to synchronize their TMEM
+            # accesses first. Rendezvous with the peer MMA warp, as
+            # cutlass.utils.TmemAllocator.free does.
+            cute.arch.mbarrier_arrive(tmem_dealloc, cta_rank ^ 1)
+            cute.arch.mbarrier_wait(tmem_dealloc, 0)
         cute.arch.dealloc_tmem(tmem_ptr, 256, is_two_cta=self.use_2cta)
 
     @cute.experimental.jit
@@ -1064,6 +1077,9 @@ class BlackwellDualGemmKernel:
         tmem_ready = cute_ext.allocate(
             cutlass.Int64, cute.AddressSpace.smem, cute.make_layout(1), alignment=8
         )
+        tmem_dealloc = cute_ext.allocate(
+            cutlass.Int64, cute.AddressSpace.smem, cute.make_layout(1), alignment=8
+        )
         full, empty = full_storage.iterator, empty_storage.iterator
         ready = ready_storage.iterator
 
@@ -1075,6 +1091,9 @@ class BlackwellDualGemmKernel:
                 cute.arch.mbarrier_init(empty + stage, 1)
             cute.arch.mbarrier_init(ready, 1)
             cute.arch.mbarrier_init(tmem_ready.iterator, 32 + 128)
+            if cutlass.const_expr(self.use_2cta):
+                # Peer MMA warps rendezvous here before the collective dealloc.
+                cute.arch.mbarrier_init(tmem_dealloc.iterator, 32)
 
         cute.arch.mbarrier_init_fence()
 
@@ -1133,7 +1152,9 @@ class BlackwellDualGemmKernel:
                 empty,
                 ready,
                 tmem_ready.iterator,
+                tmem_dealloc.iterator,
                 tmem_slot.iterator,
+                cta_rank,
                 accumulator_layout,
                 tiled_mma,
                 shared_gate,
