@@ -369,12 +369,21 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 and int(draft_num_layers) > 0
                 and int(num_layers) > 0
             ):
+                draft_loc_space_scale = 1
+                if get_memory().enable_hisparse:
+                    from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+                    # The draft pool is direct-indexed by the target
+                    # allocator's host-expanded logical ids, like the EAGLE
+                    # draft pool above; its bytes scale with the expansion.
+                    draft_loc_space_scale = parse_hisparse_config().host_to_device_ratio
                 self._cell_size = scale_kv_cell_size_per_token_for_dflash(
                     target_cell_size_per_token=self._cell_size,
                     target_num_layers=int(num_layers),
                     draft_num_layers=int(draft_num_layers)
                     * get_parallel().attn_dcp_size,
                     draft_cell_size_per_token=_dflash_draft_cell_size(kvc) or None,
+                    draft_loc_space_scale=draft_loc_space_scale,
                 )
 
     def _compute_cell_size(
