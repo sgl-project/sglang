@@ -896,8 +896,8 @@ def test_topk_v2_ties_by_index(path: str, seq: int, num_ties: int) -> None:
 @torch.inference_mode()
 def test_topk_v2_candidates_match_ragged(seq: int, with_row_starts: bool) -> None:
     """The candidate epilogue selects what the ragged kernel selects and emits
-    (score bits, position * world + rank), (0, -1) padded."""
-    k, batch, world, rank = 2048, 3, 8, 5
+    (score bits, position * dcp_size + dcp_rank), (0, -1) padded."""
+    k, batch, dcp_size, dcp_rank = 2048, 3, 8, 5
     g = torch.Generator(device="cuda").manual_seed(seq)
     width = seq + 16
     scores = torch.randn(batch, width, generator=g, device="cuda")
@@ -924,8 +924,8 @@ def test_topk_v2_candidates_match_ragged(seq: int, with_row_starts: bool) -> Non
         scores.clone(),
         seq_lens,
         out_candidates=cand,
-        world=world,
-        rank=rank,
+        dcp_size=dcp_size,
+        dcp_rank=dcp_rank,
         row_starts=starts,
         deterministic=True,
     )
@@ -936,14 +936,14 @@ def test_topk_v2_candidates_match_ragged(seq: int, with_row_starts: bool) -> Non
         idx = idx[idx >= 0].sort().values
         pos = cand[row, :, 1].long()
         valid = pos >= 0
-        assert torch.equal(pos[valid].sort().values, idx * world + rank)
-        local = (pos[valid] - rank) // world
+        assert torch.equal(pos[valid].sort().values, idx * dcp_size + dcp_rank)
+        local = (pos[valid] - dcp_rank) // dcp_size
         want_bits = scores[row, start + local].view(torch.int32)
         assert torch.equal(cand[row, valid, 0], want_bits)
         assert bool((cand[row, ~valid, 0] == 0).all())
 
 
-def _candidate_sets(scores, seq_lens, k, world, rank, **kwargs):
+def _candidate_sets(scores, seq_lens, k, dcp_size, dcp_rank, **kwargs):
     cand = torch.full(
         (scores.shape[0], k, 2), -7, dtype=torch.int32, device=scores.device
     )
@@ -951,8 +951,8 @@ def _candidate_sets(scores, seq_lens, k, world, rank, **kwargs):
         scores.clone(),
         seq_lens,
         out_candidates=cand,
-        world=world,
-        rank=rank,
+        dcp_size=dcp_size,
+        dcp_rank=dcp_rank,
         deterministic=True,
         **kwargs,
     )
@@ -972,7 +972,7 @@ def _candidate_sets(scores, seq_lens, k, world, rank, **kwargs):
 def test_topk_v2_candidates_cluster_matches_one_block(
     dist: str, cluster_size: int
 ) -> None:
-    k, world, rank = 2048, 8, 3
+    k, dcp_size, dcp_rank = 2048, 8, 3
     lens = [65536, 40000, 16385, 12000, 8193, 4097, 2049, 2048, 100, 0]
     width = max(lens) + 64
     torch.manual_seed(len(dist) * 31 + cluster_size)
@@ -985,14 +985,14 @@ def test_topk_v2_candidates_cluster_matches_one_block(
     else:
         scores = _single_bin_scores(dist, len(lens), width, "cuda")
     seq_lens = torch.tensor(lens, dtype=torch.int32, device="cuda")
-    ref = _candidate_sets(scores, seq_lens, k, world, rank, cluster_size=0)
+    ref = _candidate_sets(scores, seq_lens, k, dcp_size, dcp_rank, cluster_size=0)
     for floor in (0, 16384):
         got = _candidate_sets(
             scores,
             seq_lens,
             k,
-            world,
-            rank,
+            dcp_size,
+            dcp_rank,
             cluster_size=cluster_size,
             cluster_floor=floor,
         )
@@ -1001,7 +1001,7 @@ def test_topk_v2_candidates_cluster_matches_one_block(
             got_pos, got_order = got[row, :, 1].sort()
             valid = got_pos >= 0
             assert int(valid.sum()) == min(n, k), msg
-            local = (got_pos[valid] - rank) // world
+            local = (got_pos[valid] - dcp_rank) // dcp_size
             assert bool((local >= 0).all() and (local < n).all()), msg
             assert local.unique().numel() == local.numel(), msg
             assert torch.equal(

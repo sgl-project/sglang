@@ -411,7 +411,6 @@ SGL_DEVICE void ragged_select_transform(
     const PageTransform& transform,
     int32_t* s_topk_indices,
     RaggedSmem* smem) {
-  constexpr uint32_t kVecSize = impl::TopKStreaming::kVecSize;
   auto problem = TopKProblem{
       .in = score + row_start,
       .out = out,
@@ -422,33 +421,10 @@ SGL_DEVICE void ragged_select_transform(
     return trivial_transform<kPDL, kMode>(problem, transform);
   }
 
-  const auto rem = row_start % kVecSize;
-  if (rem != 0) {
-    // The mask has to land after the indexer has retired
-    // Otherwise it may be accidentally overwritten by DG upstream
-    device::PDLWaitPrimary<kPDL>();
-    static_assert(kVecSize <= kBlockSize, "not enough threads ");
-    if (const auto tx = threadIdx.x; tx < rem) {
-      score[row_start - rem + tx] = impl::padding_value();
-    }
-  }
-  using device::topk::broadcast;
-  problem.in -= rem;
-  problem.out = s_topk_indices;  // write into stage buffer in smem first
-  problem.seq_len = seq_len + rem;
-  problem.bias = broadcast(-static_cast<int32_t>(rem));
-  problem.input_start = broadcast(rem);
-
-  if (problem.seq_len <= Register2::kMaxSeqLen) {
-    Register2::forward<kPDL>(problem, smem);
-  } else if (problem.seq_len <= Register4::kMaxSeqLen) {
-    Register4::forward<kPDL>(problem, smem);
-  } else {
-    Streaming::forward<kPDL>(problem, smem);
-  }
+  ragged_window_topk<kPDL>(score, row_start, seq_len, topk, s_topk_indices, 0, smem);
   device::PDLTriggerSecondary<kPDL>();
   __syncthreads();
-  problem.seq_len = seq_len;
+  problem.out = s_topk_indices;  // staged in smem first
   paged_transform<kMode>(problem, out, transform);
 }
 
@@ -471,7 +447,7 @@ TOPK_KERNEL void topk_ragged_kpool_kernel(const __grid_constant__ TopKRaggedKpoo
 
 /// Candidates for a distributed top-k merge (DSA decode context parallel): the
 /// row's top-k as (fp32 score bits, global position) int32 pairs, where local
-/// position l on rank `cand_rank` is global position `l * cand_world + cand_rank`.
+/// position l on rank `dcp_rank` is global position `l * dcp_size + dcp_rank`.
 struct TopKCandidatesParams {
   float* __restrict__ scores;  // NOTE: may write, as for the ragged layout
   const int32_t* __restrict__ seq_lens;
@@ -479,9 +455,14 @@ struct TopKCandidatesParams {
   int32_t* __restrict__ candidates;        // [rows, topk, 2]
   int64_t score_stride;
   uint32_t topk;
-  int32_t cand_world;
-  int32_t cand_rank;
+  int32_t dcp_size;
+  int32_t dcp_rank;
 };
+
+/// One candidate of TopKCandidatesParams; a negative local index pads with (0, -1).
+SGL_DEVICE int2 make_candidate(float score, int32_t idx, int32_t dcp_size, int32_t dcp_rank) {
+  return idx >= 0 ? make_int2(__float_as_int(score), idx * dcp_size + dcp_rank) : make_int2(0, -1);
+}
 
 /**
  * \brief Ragged top-k emitting merge candidates (see TopKCandidatesParams).
@@ -500,8 +481,7 @@ candidates_one_block(const TopKCandidatesParams& params, const uint32_t bx, Ragg
   const auto out = reinterpret_cast<int2*>(params.candidates) + bx * static_cast<int64_t>(topk);
   const auto score = params.scores + bx * params.score_stride;
   const auto emit = [&](uint32_t tx, int32_t idx) {
-    out[tx] = idx >= 0 ? make_int2(__float_as_int(score[row_start + idx]), idx * params.cand_world + params.cand_rank)
-                       : make_int2(0, -1);
+    out[tx] = make_candidate(idx >= 0 ? score[row_start + idx] : 0.0f, idx, params.dcp_size, params.dcp_rank);
   };
 
   if (seq_len <= topk) {
@@ -909,21 +889,21 @@ __global__ __launch_bounds__(kBlockSize, 1) __cluster_dims__(1, kClusterSize, 1)
 
   const auto out = reinterpret_cast<int2*>(params.candidates) + bx * static_cast<int64_t>(topk);
   const auto score = params.scores + bx * params.score_stride;
-  const auto world = params.cand_world;
-  const auto rank = params.cand_rank;
+  const auto dcp_size = params.dcp_size;
+  const auto dcp_rank = params.dcp_rank;
   const auto problem = TopKProblem{.in = score, .out = s_topk_indices, .topk = topk, .seq_len = seq_len};
   Cluster::template forward<kPDL>(
       problem,
       reinterpret_cast<typename Cluster::Smem*>(&smem),
       [&](uint32_t slot, float val, uint32_t idx) {
-        out[slot] = make_int2(__float_as_int(val), static_cast<int32_t>(idx) * world + rank);
+        out[slot] = make_candidate(val, static_cast<int32_t>(idx), dcp_size, dcp_rank);
       },
       &s_first_staged);
   if (blockIdx.y != 0) return;
   __syncthreads();
   for (uint32_t slot = s_first_staged + threadIdx.x; slot < topk; slot += kBlockSize) {
     const auto idx = s_topk_indices[slot];
-    out[slot] = idx >= 0 ? make_int2(__float_as_int(score[idx]), idx * world + rank) : make_int2(0, -1);
+    out[slot] = make_candidate(idx >= 0 ? score[idx] : 0.0f, idx, dcp_size, dcp_rank);
   }
 }
 
@@ -1897,7 +1877,7 @@ struct TopKKernel {
 
   /**
    * \brief Ragged top-k emitting distributed-merge candidates: `candidates`
-   * [rows, topk, 2] int32 gets (fp32 score bits, `local * world + rank`) for
+   * [rows, topk, 2] int32 gets (fp32 score bits, `local * dcp_size + dcp_rank`) for
    * every selected local position, `(0, -1)` padded. `scores` is written in
    * place as for `transform_ragged`.
    */
@@ -1906,8 +1886,8 @@ struct TopKKernel {
       const tvm::ffi::TensorView seq_lens,
       const tvm::ffi::Optional<tvm::ffi::TensorView> row_starts,
       const tvm::ffi::TensorView candidates,
-      const int64_t world,
-      const int64_t rank,
+      const int64_t dcp_size,
+      const int64_t dcp_rank,
       const int64_t cluster_size,
       const int64_t cluster_floor) {
     using namespace host;
@@ -1943,7 +1923,8 @@ struct TopKKernel {
     RuntimeCheck(S.unwrap() % 4 == 0, "score_stride must be a multiple of 4 (16-byte vectorized load)");
     const auto topk = static_cast<uint32_t>(K.unwrap());
     RuntimeCheck(topk > 0 && topk <= kMaxTopK, "topk must be in (0, 2048]");
-    RuntimeCheck(world >= 1 && rank >= 0 && rank < world, "invalid world/rank");
+    RuntimeCheck(
+        dcp_size >= 1 && dcp_rank >= 0 && dcp_rank < dcp_size, "invalid dcp_size/dcp_rank: ", dcp_size, ", ", dcp_rank);
 
     const auto params = TopKCandidatesParams{
         .scores = static_cast<float*>(scores.data_ptr()),
@@ -1952,8 +1933,8 @@ struct TopKKernel {
         .candidates = static_cast<int32_t*>(candidates.data_ptr()),
         .score_stride = S.unwrap(),
         .topk = topk,
-        .cand_world = static_cast<int32_t>(world),
-        .cand_rank = static_cast<int32_t>(rank),
+        .dcp_size = static_cast<int32_t>(dcp_size),
+        .dcp_rank = static_cast<int32_t>(dcp_rank),
     };
     const auto rows = static_cast<uint32_t>(B.unwrap());
 #if SUPPORT_CLUSTER

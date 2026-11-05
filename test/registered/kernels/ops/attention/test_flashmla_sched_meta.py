@@ -250,7 +250,7 @@ def test_parallel_walk_matches_serial(b, num_sm_parts, topk, extra_topk, mode):
             fixed_overhead_num_blocks=FIXED_OVERHEAD,
             topk=topk,
             extra_topk=extra_topk,
-            parallel=parallel,
+            schedule="parallel" if parallel else "serial",
         )
         out.append((meta, splits))
     assert torch.equal(out[0][0], out[1][0])
@@ -281,7 +281,7 @@ def test_parallel_walk_replay_switches_with_lengths():
             block_size_n=BLOCK_SIZE_N,
             fixed_overhead_num_blocks=FIXED_OVERHEAD,
             topk=topk,
-            parallel=parallel,
+            schedule="parallel" if parallel else "serial",
         )
 
     for parallel in (False, True):
@@ -372,7 +372,7 @@ def test_windowed_schedule_is_valid(b, num_sm_parts, mode):
         block_size_n=BLOCK_SIZE_N,
         fixed_overhead_num_blocks=FIXED_OVERHEAD,
         topk=topk,
-        windowed=True,
+        schedule="windowed",
     )
     num_blocks = (topk_length.clamp(min=1) + BLOCK_SIZE_N - 1) // BLOCK_SIZE_N
     max_cost = _replay_schedule(meta.cpu(), splits.cpu(), num_blocks.cpu())
@@ -414,7 +414,7 @@ def test_windowed_schedule_output(b):
         block_size_n=BLOCK_SIZE_N,
         fixed_overhead_num_blocks=FIXED_OVERHEAD,
         topk=topk,
-        windowed=True,
+        schedule="windowed",
     )
     out, lse, _ = _call(kv, b, 1, topk, topk_length, meta=(meta, splits))
     assert torch.isfinite(ref_out).all()

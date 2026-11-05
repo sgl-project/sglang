@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Literal, Optional
 
 import torch
 
@@ -13,6 +13,9 @@ if TYPE_CHECKING:
 
 # sizeof(DecodingSchedMeta) / 4, fixed by FlashMLA's params.h.
 META_INTS = 8
+
+# flashmla::Schedule in flashmla_sched_meta.cuh.
+_SCHEDULES = {"serial": 0, "parallel": 1, "windowed": 2}
 
 
 @cache_once
@@ -35,8 +38,7 @@ def flashmla_sched_meta(
     fixed_overhead_num_blocks: int,
     topk: int,
     extra_topk: int = 0,
-    parallel: bool = False,
-    windowed: bool = False,
+    schedule: Literal["serial", "parallel", "windowed"] = "serial",
 ) -> None:
     """Fill FlashMLA's split-KV tile-scheduler metadata in place.
 
@@ -57,13 +59,13 @@ def flashmla_sched_meta(
         fixed_overhead_num_blocks: the implementation's per-request overhead.
         topk: the sparse top-k, or -1 for a dense model.
         extra_topk: the extra cache's top-k, 0 when there is none.
-        parallel: compute the partition walk in parallel when the sparse
-            schedule's tables fit in shared memory (otherwise, and for a dense
-            schedule, the serial walk runs). Both give the same schedule.
-        windowed: for a sparse schedule, cut the requests' costs into equal
-            windows instead of walking the partitions: not FlashMLA's schedule,
-            but a valid one with the same bound on the costliest partition,
-            computed in a few microseconds instead of tens.
+        schedule: how the partitions are found. "serial": FlashMLA's own walk.
+            "parallel": the same schedule, walked by the whole block when a
+            sparse schedule's tables fit in shared memory. "windowed" (sparse
+            only): the requests' costs cut into equal windows; not FlashMLA's
+            schedule, but a valid one with the same bound on the costliest
+            partition, computed in a few microseconds instead of tens. Either
+            falls back to "serial" when it does not apply.
     """
     _jit_flashmla_sched_meta_module().flashmla_sched_meta(
         tile_scheduler_metadata,
@@ -75,6 +77,5 @@ def flashmla_sched_meta(
         fixed_overhead_num_blocks,
         topk,
         extra_topk,
-        parallel,
-        windowed,
+        _SCHEDULES[schedule],
     )

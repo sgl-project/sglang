@@ -31,7 +31,7 @@ def _jit_topk_v1_module():
 
 
 @cache_once
-def _jit_topk_v2_module(deterministic: bool):
+def _jit_topk_v2_module(deterministic: bool = False):
     from sglang.kernels.jit.utils.occupancy import (
         NoSchedulableClustersError,
         get_max_active_clusters,
@@ -156,7 +156,7 @@ def plan_topk_v2(
                              prefer the cluster implementation.
                              Negative number means internal heuristic.
     """
-    module = _jit_topk_v2_module(False)
+    module = _jit_topk_v2_module()
     bs = seq_lens.shape[0]
     metadata = (
         seq_lens.new_empty(bs + 1, _PLAN_METADATA_INTS_PER_BATCH)
@@ -176,7 +176,7 @@ def topk_v2_plan_is_written(seq_lens: torch.Tensor) -> bool:
         dtype=torch.int32,
         device=seq_lens.device,
     )
-    _jit_topk_v2_module(False).topk_plan(seq_lens, probe, -1)
+    _jit_topk_v2_module().topk_plan(seq_lens, probe, -1)
     return probe[0, 1].item() != -1
 
 
@@ -224,7 +224,7 @@ _CANDIDATES_CLUSTER_FLOOR = 16384
 
 def _candidates_cluster_size(rows: int) -> int:
     arch = current_arch()
-    if rows <= 0 or not (arch.is_sm(9) or arch.is_sm(10)):
+    if rows <= 0 or arch.cuda is None or not arch.cuda.supports_cluster:
         return 0
     from sglang.kernels.jit.utils.occupancy import (
         NoSchedulableClustersError,
@@ -245,8 +245,8 @@ def topk_transform_candidates_v2(
     seq_lens: torch.Tensor,
     *,
     out_candidates: torch.Tensor,
-    world: int,
-    rank: int,
+    dcp_size: int,
+    dcp_rank: int,
     row_starts: Optional[torch.Tensor] = None,
     deterministic: bool = False,
     cluster_size: Optional[int] = None,
@@ -257,9 +257,9 @@ def topk_transform_candidates_v2(
     Row ``i`` selects the top-k of ``scores[i, ks : ks + seq_lens[i]]`` (``ks
     = row_starts[i]``, 0 when omitted) exactly as :func:`topk_transform_ragged_v2`
     does, and writes ``out_candidates[i]`` (``[topk, 2]`` int32) = (fp32 score
-    bits, ``position * world + rank``) per selected position, ``(0, -1)``
-    padded. Local position ``l`` of rank ``rank`` is global position
-    ``l * world + rank`` under decode context parallelism.
+    bits, ``position * dcp_size + dcp_rank``) per selected position, ``(0, -1)``
+    padded: local position ``l`` of rank ``dcp_rank`` is global position
+    ``l * dcp_size + dcp_rank`` under decode context parallelism.
 
     ``cluster_size`` None picks one from the row count (rows starting at
     column 0 only); 0 keeps one block per row.
@@ -274,8 +274,8 @@ def topk_transform_candidates_v2(
         seq_lens,
         row_starts,
         out_candidates,
-        world,
-        rank,
+        dcp_size,
+        dcp_rank,
         cluster_size,
         cluster_floor,
     )
@@ -369,7 +369,7 @@ def topk_transform_kpool_v2(
     ``metadata`` is :func:`plan_topk_v2` over ``pool_lens``. The kernel reads it
     before its PDL wait, so plan before launching the kernel that writes ``scores``.
     """
-    _jit_topk_v2_module(False).topk_transform_kpool(
+    _jit_topk_v2_module().topk_transform_kpool(
         scores,
         pool_lens,
         token_seq_lens,
@@ -401,7 +401,7 @@ def topk_transform_kpool_ragged_v2(
 
     NOTE: ``scores`` is written in place, as in :func:`topk_transform_ragged_v2`.
     """
-    _jit_topk_v2_module(False).topk_transform_kpool_ragged(
+    _jit_topk_v2_module().topk_transform_kpool_ragged(
         scores,
         pool_lens,
         row_starts,
