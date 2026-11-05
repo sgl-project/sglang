@@ -878,7 +878,7 @@ def plan_tree_commit(
     device = path_node_ids.device
     valid = path_node_ids >= 0
     num_accepted = valid.sum(dim=1).to(torch.int64)
-    max_rows = int(num_accepted.max().item()) + 1 if batch else 1  # HOST-SYNC: max readback
+    max_rows = path_node_ids.shape[1] + 1
 
     source_rows = torch.full((batch, max_rows), -1, dtype=torch.long, device=device)
     dest_positions = torch.full((batch, max_rows), -1, dtype=torch.long, device=device)

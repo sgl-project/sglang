@@ -462,9 +462,9 @@ class TestCommitPlan:
             block_table=torch.tensor([[0, 1, 2, 3, 4]]),
             block_size=4,
         )
-        assert plan.source_rows.tolist() == [[100, 101, 103]]
-        assert plan.dest_positions.tolist() == [[10, 11, 12]]
-        assert plan.dest_slots.tolist() == [[100, 101, 102]]
+        assert plan.source_rows.tolist() == [[100, 101, 103, -1, -1]]
+        assert plan.dest_positions.tolist() == [[10, 11, 12, -1, -1]]
+        assert plan.dest_slots.tolist() == [[100, 101, 102, -1, -1]]
         assert plan.commit_lens.tolist() == [3]
         assert plan.new_seq_lens.tolist() == [13]
 
@@ -476,8 +476,8 @@ class TestCommitPlan:
             block_table=torch.tensor([[0, 1, 2]]),
             block_size=4,
         )
-        assert plan.source_rows.tolist() == [[100]]
-        assert plan.dest_positions.tolist() == [[7]]
+        assert plan.source_rows.tolist() == [[100, -1, -1]]
+        assert plan.dest_positions.tolist() == [[7, -1, -1]]
         assert plan.commit_lens.tolist() == [1]
 
 
