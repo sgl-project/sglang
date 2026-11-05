@@ -363,6 +363,28 @@ unset fields inherit the CLI flags. See
   threshold flags were removed; see
   [upgrading](REFERENCE.md#upgrading-from-cache_aware_zmq).
 
+### FIPS builds
+
+For deployments that require FIPS 140-validated cryptography, build with the
+opt-in `fips` cargo feature. The router then uses the aws-lc-rs FIPS module as
+its TLS provider (outbound connections to workers and the Kubernetes API) and
+exits at startup unless FIPS mode is active. Default builds are unchanged.
+
+```bash
+cargo build --release --features fips
+# or the container image
+docker build -f docker/sgl-router.Dockerfile --build-arg CARGO_FEATURES=fips .
+```
+
+- The FIPS module builds from source and needs cmake, Go and clang, on a glibc
+  (not musl) target. The Dockerfile installs them when `fips` is requested;
+  `RUNTIME_BASE_IMAGE` selects the runtime base, e.g. a FIPS-mode OS image.
+- FIPS builds do not download tokenizers from Hugging Face Hub (its HTTP
+  client cannot use the FIPS module): pass a local `--tokenizer-path`, or
+  `--no-tokenizer` for load-only policies.
+- On macOS, the FIPS module links as a shared library; set
+  `DYLD_LIBRARY_PATH` to its build output directory to run a native build.
+
 ## License
 
 Apache-2.0.
