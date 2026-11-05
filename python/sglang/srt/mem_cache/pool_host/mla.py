@@ -35,7 +35,10 @@ from sglang.srt.mem_cache.pool_host.common import (
 )
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
 from sglang.srt.mem_cache.pool_host.npu_memfabric import (
+    acl_host_memory_enabled,
+    alloc_with_acl,
     alloc_with_memfabric,
+    ensure_acl_capacity,
     ensure_memfabric_capacity,
     memfabric_host_memory_enabled,
 )
@@ -422,22 +425,23 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             native.k_width if self.dsa_kv_cache_store_fp8 else self.kv_lora_rank
         )
         v_width = 0 if self.dsa_kv_cache_store_fp8 else native.v_width
-        if not memfabric_host_memory_enabled():
-            # page/layer_first_kv_split on NPU goes through the Memfabric AscendC
-            # zero-copy path, whose AIV kernel de-references host pointers via
-            # get_dva. Reject a non-memfabric host pool here rather than
-            # failing later inside get_dva.
+        if not (memfabric_host_memory_enabled() or acl_host_memory_enabled()):
+            # page/layer_first_kv_split on NPU goes through the registered-host
+            # AscendC zero-copy path, whose AIV kernel de-references host
+            # pointers via their mapped device addresses. Reject a
+            # non-registered host pool here rather than failing later inside
+            # resolve_host_dva.
             raise ValueError(
                 "page/layer_first_kv_split layout requires "
-                "SGLANG_HICACHE_HOST_MEM_BACKEND=memfabric on NPU "
+                "SGLANG_HICACHE_HOST_MEM_BACKEND=memfabric or acl on NPU "
                 "(generic MHA/MLA host pool AscendC path)"
             )
-        if memfabric_host_memory_enabled():
-            # Memfabric-mapped host DRAM: required by the AIV sparse-copy IO
+        if memfabric_host_memory_enabled() or acl_host_memory_enabled():
+            # Registered host DRAM: required by the AIV sparse-copy IO
             # path and usable by the legacy memcpy2d path unchanged.  Each
-            # buffer allocated below becomes its own offload.empty block
-            # GB-rounded by the host-memory entry, so size the reserve with
-            # the per-buffer bytes (a list) instead of a raw combined sum.
+            # buffer allocated below becomes its own registered block, so
+            # size the reserve with the per-buffer bytes (a list) instead
+            # of a raw combined sum.
             total_bytes = [
                 self.page_num
                 * self.page_size
@@ -466,8 +470,15 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 total_bytes.append(
                     self.page_num * self.page_size * num_indexer_layers * 4
                 )
-            ensure_memfabric_capacity(total_bytes, torch.npu.current_device())
-            alloc_func = alloc_with_memfabric
+            if memfabric_host_memory_enabled():
+                # MemFabric host-memory entry: GB-rounds every block on A3,
+                # so the reserve budget and accounting must round the same way.
+                ensure_memfabric_capacity(total_bytes, torch.npu.current_device())
+                alloc_func = alloc_with_memfabric
+            else:
+                # aclrt registration: no fixed reserve, per-block accounting.
+                ensure_acl_capacity(total_bytes, torch.npu.current_device())
+                alloc_func = alloc_with_acl
         self.k_buffer = alloc_func(
             (*base_dims, k_width),
             dtype=self.dtype,
