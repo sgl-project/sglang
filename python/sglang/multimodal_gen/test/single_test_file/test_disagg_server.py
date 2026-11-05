@@ -291,7 +291,12 @@ def _generate_image(api_port: int, model: str, **overrides) -> bytes:
 
 
 def _require_gpus(n: int) -> None:
-    available = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    if torch.cuda.is_available():
+        available = torch.cuda.device_count()
+    elif torch.xpu.is_available():
+        available = torch.xpu.device_count()
+    else:
+        available = 0
     if available < n:
         raise unittest.SkipTest(f"need {n} GPUs, have {available}")
 
