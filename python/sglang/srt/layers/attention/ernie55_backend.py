@@ -319,6 +319,14 @@ class Ernie5_5AttnBackend(DeepseekV4AttnBackend):
         super().init_forward_metadata_in_graph(forward_batch)
         self.mla_attn_backend.init_forward_metadata_in_graph(forward_batch)
 
+    def init_forward_metadata_for_breakable_cuda_graph_capture(
+        self, forward_batch: ForwardBatch
+    ):
+        # The MLA layers' metadata would not be refreshed on replay.
+        raise NotImplementedError(
+            "ERNIE 5.5 Flash does not support breakable prefill CUDA graphs"
+        )
+
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         return SharedReadEnds.max_of(
             (super().shared_read_ends(fm), self.mla_attn_backend.shared_read_ends(fm))
