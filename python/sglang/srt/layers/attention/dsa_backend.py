@@ -446,9 +446,8 @@ def _validate_dcp_backend(
     prefill_impl: str,
     decode_impl: str,
 ) -> None:
-    # The DCP indexer emits global KV slots that only the flashmla_kv and
-    # trtllm paths localize, and its decode merge runs the v2 top-k with the
-    # per-forward plan.
+    # The DCP indexer emits global KV slots that only the flashmla_kv path
+    # localizes, and its decode merge runs the v2 top-k with the per-forward plan.
     if not kimi_k31:
         raise ValueError("DSA with --dcp-size > 1 is implemented for Kimi-K3.1 only.")
     if not use_fused_topk:
@@ -457,15 +456,10 @@ def _validate_dcp_backend(
         raise ValueError(
             "DSA with --dcp-size > 1 needs the v2 top-k (SGLANG_OPT_USE_TOPK_V2)."
         )
-    if prefill_impl != decode_impl or decode_impl not in (
-        "flashmla_kv",
-        "trtllm",
-        "prims_ts",
-    ):
+    if prefill_impl != "flashmla_kv" or decode_impl != "flashmla_kv":
         raise ValueError(
             "DSA with --dcp-size > 1 needs --dsa-prefill-backend and "
-            "--dsa-decode-backend both flashmla_kv, both trtllm or both "
-            f"prims_ts; got {prefill_impl} and {decode_impl}."
+            f"--dsa-decode-backend flashmla_kv; got {prefill_impl} and {decode_impl}."
         )
 
 

@@ -184,8 +184,7 @@ def _kimi_k31_overrides(server_args: Any, hf_config: Any) -> dict:
 
 def _kimi_k31_dcp_overrides(cfg: Any) -> dict:
     """DCP shards the MLA KV and the index-K cache by token; the indexer merges
-    a global top-k and the DSA attention (flashmla_kv or trtllm) merges partials
-    by LSE."""
+    a global top-k and the DSA attention (flashmla_kv) merges partials by LSE."""
     dcp = cfg.dcp_size
     if dcp & (dcp - 1) or cfg.tp_size % dcp:
         raise ValueError(
@@ -193,20 +192,9 @@ def _kimi_k31_dcp_overrides(cfg: Any) -> dict:
             f"got dcp_size={dcp}, tp_size={cfg.tp_size}."
         )
     unsupported = {
-        "speculative decoding other than DSPARK and DFLASH": cfg.speculative_algorithm
-        not in (None, "DSPARK", "DFLASH"),
-        # A DFLASH MLA draft attends over DCP owner rows on the draft-verify
-        # path, which only cute-dsl MLA serves with a global causal bound.
-        "a DFLASH draft attention backend other than cutedsl_mla": (
-            cfg.speculative_algorithm == "DFLASH"
-            and cfg.speculative_draft_attention_backend not in (None, "cutedsl_mla")
-        ),
-        # Mooncake moves a DCP-1 prefill's KV row by row and a same-DCP
-        # prefill's page by page, and raises on any other DCP pair.
-        "PD over a transfer backend other than Mooncake": (
-            cfg.disaggregation_mode in ("prefill", "decode")
-            and cfg.disaggregation_transfer_backend != "mooncake"
-        ),
+        "speculative decoding": cfg.speculative_algorithm is not None,
+        "PD disaggregation": cfg.disaggregation_mode in ("prefill", "decode"),
+        "HiCache": cfg.enable_hierarchical_cache,
         "HiSparse": cfg.enable_hisparse,
         "prefill context parallel": cfg.enable_prefill_cp
         or (cfg.attn_cp_size or 1) > 1,
@@ -214,28 +202,7 @@ def _kimi_k31_dcp_overrides(cfg: Any) -> dict:
     rejected = [name for name, on in unsupported.items() if on]
     if rejected:
         raise ValueError(f"Kimi-K3.1 DCP does not support {', '.join(rejected)} yet.")
-    overrides = _dcp_replicate_q_proj_default(cfg, "Kimi-K3.1")
-    if cfg.speculative_algorithm == "DFLASH":
-        overrides["speculative_draft_attention_backend"] = "cutedsl_mla"
-        # Target verify runs on the DSA decode impl, which merges the per-rank
-        # partials by LSE.
-        overrides["speculative_attention_mode"] = "decode"
-    if cfg.speculative_algorithm == "DSPARK":
-        from sglang.srt.speculative.ragged_verify import (
-            RaggedVerifyMode,
-            read_ragged_verify_mode,
-        )
-
-        ragged_mode = read_ragged_verify_mode()
-        if ragged_mode is not RaggedVerifyMode.STATIC:
-            raise ValueError(
-                "Kimi-K3.1 DCP + DSPARK requires SGLANG_RAGGED_VERIFY_MODE=static; "
-                f"compact/cap-accept are not validated under DCP (got {ragged_mode.value!r})."
-            )
-        # Target verify runs on the DSA decode impl, which merges
-        # the per-rank partials by LSE, as for Kimi-K3 DCP + DSPARK.
-        overrides["speculative_attention_mode"] = "decode"
-    return overrides
+    return _dcp_replicate_q_proj_default(cfg, "Kimi-K3.1")
 
 
 def _dcp_replicate_q_proj_default(cfg: Any, model: str) -> dict:

@@ -93,9 +93,8 @@ def _select_local_dcp_heads_for_autotune(
 
 def is_mla_dcp_lse_base_on_e(attention_backend: Optional[str]) -> bool:
     if attention_backend == "dsa":
-        # Kimi-K3.1's sharded DSA DCP merges FlashMLA partials (natural log);
-        # trtllm-gen partials are base 2.
-        return dsa_shards_index_k() and get_exec().kernel.dsa_decode_backend != "trtllm"
+        # Kimi-K3.1's sharded DSA DCP merges FlashMLA partials (natural log)
+        return dsa_shards_index_k()
     return attention_backend in {"flashmla", "cutedsl_mla", "aiter"}
 
 
