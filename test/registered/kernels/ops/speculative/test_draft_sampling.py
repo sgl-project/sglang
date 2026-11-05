@@ -1,6 +1,7 @@
 """The one-pass Gumbel-max draft sample picks the same token as the three-op path."""
 
 import unittest
+from unittest import mock
 
 import torch
 
@@ -8,6 +9,7 @@ from sglang.kernels.ops.sampling import argmax as sampling_argmax
 from sglang.kernels.ops.sampling import softmax as sampling_softmax
 from sglang.kernels.ops.sampling.argmax_jit import can_argmax
 from sglang.kernels.ops.speculative.row_argmax import div_argmax
+from sglang.srt.speculative import spec_utils
 from sglang.srt.speculative.spec_utils import fast_sample, sample_draft_proposal
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -101,6 +103,27 @@ class TestGumbelArgmax(CustomTestCase):
             ref_p, ref_index = _reference_fast_sample(probs)
             torch.cuda.manual_seed(1000 + rows)
             p, index = fast_sample(probs)
+            self.assertTrue(torch.equal(index, ref_index))
+            self.assertTrue(torch.equal(_bits(p), _bits(ref_p)))
+
+    def test_fast_sample_matches_reference_on_a_step_view(self):
+        # The multi-layer EAGLE single-graph draft samples from
+        # draft_probs[:bs, step] of a [max_bs, num_steps, vocab] buffer.
+        gen = torch.Generator(device="cuda").manual_seed(3)
+        rows, steps, vocab = 64, 3, 151936
+        logits = torch.randn((rows, steps, vocab), generator=gen, device="cuda") * 3
+        buffer = torch.softmax(logits, dim=-1)
+        for step in range(steps):
+            probs = buffer[:, step]
+            self.assertFalse(probs.is_contiguous())
+            torch.cuda.manual_seed(2000 + step)
+            ref_p, ref_index = _reference_fast_sample(probs)
+            torch.cuda.manual_seed(2000 + step)
+            with mock.patch.object(
+                spec_utils, "div_argmax", wraps=spec_utils.div_argmax
+            ) as fused:
+                p, index = fast_sample(probs)
+            self.assertEqual(fused.call_count, 1)  # the fused path ran
             self.assertTrue(torch.equal(index, ref_index))
             self.assertTrue(torch.equal(_bits(p), _bits(ref_p)))
 

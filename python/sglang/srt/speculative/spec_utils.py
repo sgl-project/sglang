@@ -189,7 +189,9 @@ def fast_sample(
             num_samples == 1
             and _is_cuda
             and probs.dtype == torch.float32
-            and probs.is_contiguous()
+            # Unit column stride is enough: the multi-layer EAGLE single-graph
+            # draft passes a [bs, step] view of a [max_bs, steps, vocab] buffer.
+            and probs.stride(-1) == 1
             and probs.numel() >= 1 << 23
             and can_argmax(q)
         ):
