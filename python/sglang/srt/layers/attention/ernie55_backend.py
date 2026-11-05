@@ -46,7 +46,8 @@ from sglang.srt.mem_cache.ernie55_memory_pool import (
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 
 if TYPE_CHECKING:
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.model_executor.forward_mode import ForwardMode
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 
@@ -343,10 +344,8 @@ class Ernie5_5MultiStepBackend(DeepseekV4MultiStepBackend):
     ) -> None:
         if not in_capture and self.speculative_num_steps == 1:
             return
-        from sglang.srt.model_executor.forward_batch_info import (
-            ForwardMode,
-            build_inner_fb_view,
-        )
+        from sglang.srt.model_executor.forward_batch_info import build_inner_fb_view
+        from sglang.srt.model_executor.forward_mode import ForwardMode
 
         inner_fb = build_inner_fb_view(
             forward_batch, bs=forward_batch.batch_size, forward_mode=ForwardMode.DECODE
