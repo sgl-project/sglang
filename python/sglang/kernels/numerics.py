@@ -4,7 +4,18 @@
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
 
+from sglang.srt.utils import is_hip
+
 _FLT_MIN = tl.constexpr(1.1754943508222875e-38)
+_is_hip = is_hip()
+
+_MUL_RN_ASM = tl.constexpr("mul.rn.f32 $0, $1, $2;")
+_MUL_RN_CONSTRAINTS = tl.constexpr("=f,f,f")
+if _is_hip:
+    # AMDGPU asm indexes a VGPR ("v"); the PTX "f" constraint fails register
+    # allocation there. v_mul_f32 is RNE and uncontracted, like mul.rn.f32.
+    _MUL_RN_ASM = tl.constexpr("v_mul_f32 $0, $1, $2")
+    _MUL_RN_CONSTRAINTS = tl.constexpr("=v,v,v")
 
 
 @triton.jit
@@ -20,8 +31,8 @@ def round_bf16_to_fp32(value):
 def mul_rn_f32(x, y):
     """Opaque correctly-rounded fp32 multiply that blocks FMA contraction."""
     return tl.inline_asm_elementwise(
-        asm="mul.rn.f32 $0, $1, $2;",
-        constraints="=f,f,f",
+        asm=_MUL_RN_ASM,
+        constraints=_MUL_RN_CONSTRAINTS,
         args=[x, y],
         dtype=tl.float32,
         is_pure=True,
