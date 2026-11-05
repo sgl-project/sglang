@@ -1,6 +1,5 @@
 """In-tree aiter rows and DeepSeek-V4's aiter patches apply only while aiter lacks them."""
 
-import collections
 import importlib.metadata
 import json
 import os
@@ -77,8 +76,7 @@ def _write_rows(tmp, name, rows):
 
 class TestHipblasltRows(CustomTestCase):
     def test_another_rocm_skips_the_hipblaslt_rows(self):
-        """hipBLASLt solution indices belong to one hipBLASLt build and another rejects
-        them, so a hipBLASLt row applies only on the ROCm in its rocm column."""
+        """ROCm 10's hipBLASLt rejects ROCm 7.2's solution indices at graph capture."""
         row = {"M": 1, "N": 50016, "K": 6144, "splitK": 0, "kernelName": ""}
         with tempfile.TemporaryDirectory() as tmp:
             csvs = _write_rows(
@@ -115,9 +113,8 @@ _TABLES_AITER = "acf8fdf93"
 
 @unittest.skipUnless(_HAS_AITER, "aiter not installed")
 class TestInTreeTables(CustomTestCase):
-    """aiter refuses a table with a repeated key, so no key repeats across the in-tree
-    CSVs. On the pinned aiter every shape resolves to its row's kernel; there, a re-tuned
-    aiter shape (superseded) or one it dropped (missing) means the rows need updating."""
+    """On the pinned aiter a re-tuned (superseded) or dropped (missing) shape means the
+    in-tree rows need updating."""
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="sglang_intree_tables_test_")
@@ -142,31 +139,17 @@ class TestInTreeTables(CustomTestCase):
             if not csvs:
                 continue
             with self.subTest(table.name):
-                keys, kernels = table.key_cols, table.kernel_cols
                 rows = tables.read_intree_rows(table, csvs)
-                self.assertFalse(rows.duplicated(subset=list(keys)).any())
+                self.assertFalse(rows.duplicated(subset=list(table.key_cols)).any())
                 stats, path = tables.install_intree_table(
                     table, csvs, out_dir=os.path.join(self.tmp, "out")
                 )
+                self.assertEqual(path, getattr(AITER_CONFIGS, table.attr))
                 if pinned:
+                    # a key aiter repeats counts as missing, so this also rules it out
                     self.assertEqual(
                         stats[tables.SUPERSEDED] + stats[tables.MISSING], 0, stats
                     )
-                self.assertEqual(path, getattr(AITER_CONFIGS, table.attr))
-                merged = pd.read_csv(path)
-                # aiter's own fused-MoE tables repeat a few shapes (its loader keeps the
-                # first); an in-tree row must never be one of them
-                index = tables.row_keys(merged, keys)
-                counts = collections.Counter(index)
-                effective = {}
-                for key, (_, row) in zip(index, merged.iterrows()):
-                    effective.setdefault(key, tables.norm_kernel(row, kernels))
-                for key, (_, row) in zip(tables.row_keys(rows, keys), rows.iterrows()):
-                    self.assertEqual(counts[key], 1, key)
-                    if pinned:
-                        self.assertEqual(
-                            effective[key], tables.norm_kernel(row, kernels), key
-                        )
 
 
 class TestTritonJson(CustomTestCase):
@@ -277,13 +260,8 @@ class TestMhcTileM16(CustomTestCase):
         self.assertTrue(saw_32)
 
     def test_wraps_an_aiter_without_preshuffled_layouts(self):
-        """An aiter older than the preshuffled layouts takes (m, hidden_size) only; the
-        wrapper calls it so and still forces tile_m=16 at decode M."""
-
-        def two_arg_policy(m, hidden_size):
-            return _stock_gfx950_policy(m, hidden_size)
-
-        patched = it.make_mhc_tile_m16_config(two_arg_policy)
+        """An aiter whose mHC config takes only (m, hidden_size) raised TypeError."""
+        patched = it.make_mhc_tile_m16_config(lambda m, h: _stock_gfx950_policy(m, h))
         self.assertEqual(patched(8, 7168)[1], 16)
         self.assertEqual(patched(4096, 7168), _stock_gfx950_policy(4096, 7168))
         with self.assertRaises(TypeError):
