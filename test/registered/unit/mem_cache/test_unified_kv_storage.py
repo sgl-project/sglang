@@ -12,7 +12,10 @@ from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler as hpa
 from sglang.srt.mem_cache.kv.layout.mha import MHAHostLayout
 from sglang.srt.mem_cache.kv.layout.mla import MLAHostLayout
 from sglang.srt.mem_cache.kv.layout.state import StateHostLayout
-from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.mem_cache.unified_cache.component_type import (
+    ComponentType,
+    tree_slot_ids,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import (
@@ -41,11 +44,6 @@ CHAINS = {
         state_layer_ids=(0, 2),
         **_P16,
     ),
-}
-_COMPONENTS = {
-    "swa": {ComponentType.FULL, ComponentType.SWA},
-    "mamba": {ComponentType.FULL, ComponentType.MAMBA},
-    "tri": {ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA},
 }
 
 
@@ -84,11 +82,11 @@ class TestPlanNames(CustomTestCase):
 
     def test_sub_pools_and_wire_entries_per_chain(self):
         expected = {
-            "swa": (("full", "kv", "FULL"), ("window_32", "swa", "SWA")),
+            "swa": (("full", "kv", "FULL"), ("window_32", "swa", "WINDOW_32")),
             "mamba": (("full", "kv", "FULL"), ("mamba", "mamba", "MAMBA")),
             "tri": (
                 ("full", "kv", "FULL"),
-                ("window_32", "swa", "SWA"),
+                ("window_32", "swa", "WINDOW_32"),
                 ("mamba", "mamba", "MAMBA"),
             ),
         }
@@ -123,9 +121,9 @@ class TestPlanNames(CustomTestCase):
         # each with its sub-pool's family, in the order it drives their eviction
         # (owner, window, state).
         expected = {
-            "swa": (("FULL", "token"), ("SWA", "window")),
+            "swa": (("FULL", "token"), ("WINDOW_32", "window")),
             "mamba": (("FULL", "token"), ("MAMBA", "state")),
-            "tri": (("FULL", "token"), ("SWA", "window"), ("MAMBA", "state")),
+            "tri": (("FULL", "token"), ("WINDOW_32", "window"), ("MAMBA", "state")),
         }
         for name, slots in expected.items():
             with self.subTest(chain=name):
@@ -160,6 +158,28 @@ class TestPlanNames(CustomTestCase):
                     tuple((s.component, s.family) for s in storage.tree_slots()),
                     slots,
                 )
+
+    def test_static_tree_components_map_to_their_sub_pools(self):
+        from sglang.srt.mem_cache.static_kv_storage import (
+            StaticKVStorage,
+            StaticPoolShape,
+        )
+
+        storage = StaticKVStorage(
+            None,
+            None,
+            shape=StaticPoolShape(has_window=True, has_state=True, token_capacity=1),
+        )
+        self.assertEqual(storage.tree_sub_pool("FULL"), "kv")
+        self.assertEqual(storage.tree_sub_pool("SWA"), "swa")
+        self.assertEqual(storage.tree_sub_pool("MAMBA"), "mamba")
+        # A window slot under another name holds the one window's rows; a
+        # slot of no family the storage keeps has no sub-pool.
+        self.assertEqual(storage.tree_sub_pool("CUSTOM_WINDOW", family="window"), "swa")
+        with self.assertRaises(KeyError):
+            storage.tree_sub_pool("CUSTOM_WINDOW")
+        with self.assertRaises(KeyError):
+            storage.tree_sub_pool("C128", family="block")
 
     def test_layer_indices_follow_the_pool_routes(self):
         for name in CHAINS:
@@ -253,8 +273,10 @@ class TestHostStack(CustomTestCase):
     def _build(self, name, *, backend):
         bundle = _bundle(name)
         allocator = bundle.token_to_kv_pool_allocator
-        chain = CHAINS[name].chain
-        cache = _RecordingCache(bundle, _COMPONENTS[chain])
+        # The tree's components, numbered as the storage's slots number them.
+        cache = _RecordingCache(
+            bundle, tree_slot_ids(allocator.storage.tree_slots()).values()
+        )
         params = SimpleNamespace(
             token_to_kv_pool_allocator=allocator,
             req_to_token_pool=getattr(bundle, "req_to_token_pool", None),
@@ -314,7 +336,8 @@ class TestHostStack(CustomTestCase):
             self.assertEqual(entry.host_pool.name, sub_pool)
             self.assertIs(entry.host_pool.device_pool, storage.view(sub_pool))
         # Each side's host pressure evicts its own tree component.
-        for entry, component in ((kv, ComponentType.FULL), (swa, ComponentType.SWA)):
+        window = tree_slot_ids(storage.tree_slots())["WINDOW_32"]
+        for entry, component in ((kv, ComponentType.FULL), (swa, window)):
             cache.calls.clear()
             entry.host_evict_fn(3)
             self.assertEqual(cache.calls, [("host", 3, component)])
@@ -323,7 +346,7 @@ class TestHostStack(CustomTestCase):
         swa.device_evict_fn(1 << 30)
         ((kind, params),) = cache.calls
         self.assertEqual(kind, "device")
-        self.assertGreater(params.swa_num_tokens, 0)
+        self.assertGreater(sum(params.window_num_tokens.values()), 0)
         self.assertEqual(controller["transfer_layer_id_max"], 4)
 
     def test_host_transfers_translate_through_the_storage(self):

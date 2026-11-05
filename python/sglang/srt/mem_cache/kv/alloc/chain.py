@@ -28,13 +28,12 @@ import msgspec
 import torch
 from torch.profiler import record_function
 
-from sglang.kernels.ops.memory.allocator import alloc_decode_kernel, alloc_extend_kernel
+from sglang.kernels.ops.memory.allocator import (
+    alloc_decode_kernel,
+    alloc_extend_kernel,
+)
 from sglang.srt.environ import InvariantCheckLevel
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.allocator.swa import (
-    UNIFIED_SWA_SEGMENT_BOUND,
-    UNIFIED_SWA_SEGMENT_RELEASED,
-)
 from sglang.srt.mem_cache.kv.alloc.band import (
     Band,
     FloatBand,
@@ -47,6 +46,10 @@ from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace
 from sglang.srt.mem_cache.kv.alloc.interim import (
     ChainAdmissionRules,
     interim_policy_for,
+)
+from sglang.srt.mem_cache.kv.alloc.invariants import (
+    WINDOW_SEGMENT_BOUND,
+    WINDOW_SEGMENT_RELEASED,
 )
 from sglang.srt.mem_cache.kv.alloc.pricing import (
     ChainSnapshot,
@@ -381,6 +384,19 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
 
     def swa_available_size(self) -> int:
         return self._policy.swa_available_size(self)
+
+    def window_pool_names(self) -> Tuple[str, ...]:
+        return tuple(window.sub_pool_name for window in self._windows)
+
+    def window_available_size(self, sub_pool: str) -> int:
+        """What a take from window sub-pool ``sub_pool`` can serve now: the
+        target window's as the chain's policy answers it, another window's
+        from its own band."""
+        if sub_pool not in self.window_pool_names():
+            raise KeyError(f"no window sub-pool {sub_pool!r}")
+        if sub_pool == self.roles.window:
+            return self.swa_available_size()
+        return self.window_allocators[sub_pool].schedulable_available_size()
 
     def conserve_full_available_size(self) -> int:
         return self._policy.conserve_full_available_size(self)
@@ -1272,7 +1288,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         # when detection is disabled. This invariant has no recovery action.
         if resolve_level() >= InvariantCheckLevel.WARN:
             expect(
-                UNIFIED_SWA_SEGMENT_BOUND,
+                WINDOW_SEGMENT_BOUND,
                 window.ids.virtual_to_physical[v_pages] > 0,
                 msg="caller wants free_full_segment",
             )
@@ -1314,7 +1330,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         if resolve_level() >= InvariantCheckLevel.WARN:
             for window in self._windows:
                 expect(
-                    UNIFIED_SWA_SEGMENT_RELEASED,
+                    WINDOW_SEGMENT_RELEASED,
                     window.ids.virtual_to_physical[reps // self.page_size] <= 0,
                     msg="caller wants free_segment",
                 )

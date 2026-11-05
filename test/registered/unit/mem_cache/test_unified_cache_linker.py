@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
 )
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
+from sglang.srt.mem_cache.kv.plan import TREE_WINDOW
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
     MooncakeDirectLinker,
@@ -61,7 +62,7 @@ from sglang.test.kits.unified_radix_cache.fixtures import (
 )
 from sglang.test.kits.unified_radix_cache.mixins import UnifiedRadixCacheFixtures
 from sglang.test.test_utils import CustomTestCase
-from sglang.test.tree_slots import index_slots
+from sglang.test.tree_slots import FAMILY_OF, index_slots
 
 register_cpu_ci(est_time=18, suite="base-a-test-cpu")
 register_cuda_ci(est_time=18, stage="base-b", runner_config="1-gpu-small")
@@ -167,6 +168,15 @@ def _cache_for_wrapper(**kwargs):
         "pp_group": None,
     }
     defaults.update(kwargs)
+    # The stand-in's window slots, as a tree with these slots reports them.
+    windows = tuple(
+        dict.fromkeys(
+            ct
+            for ct in (*defaults["tree_components"], *defaults["components"])
+            if FAMILY_OF.get(ct) == TREE_WINDOW
+        )
+    )
+    defaults.setdefault("window_slots", lambda: windows)
     return SimpleNamespace(**defaults)
 
 
@@ -696,7 +706,12 @@ class TestUnifiedCacheLinkerPythonBackend(
         )
         self.assertEqual(match.device_prefix_len, 2)
         self.assertEqual(match.host_hit_length, 2)
-        self.assertEqual(match.swa_host_hit_length, 2)
+        self.assertEqual(
+            match.window_host_hit_lengths.get(
+                consumer.window_sub_pool_of_slot(ComponentType.SWA), 0
+            ),
+            2,
+        )
         self._apply_match_to_req(req, match)
 
         self._insert(consumer, consumer_allocator, consumer_req_pool, tokens[:3])
@@ -1438,7 +1453,7 @@ def test_swa_reuse_policy_tracks_layout_without_a_tier_condition(
     component.cache = cache
     component.tree_core = cache.tree_core
     # #32759: request-relative SWA needs tail re-prefill even without HiCache.
-    assert cache.swa_reprefill_tail_tokens() == (128 if unified_kv else 0)
+    assert cache.window_reprefill_tail_tokens() == (128 if unified_kv else 0)
     node = SimpleNamespace(
         component_data={
             ComponentType.SWA: SimpleNamespace(value=None, host_value=None)
@@ -1453,7 +1468,7 @@ def test_cache_without_swa_needs_no_reprefill():
     cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
     cache.components = {}
     index_slots(cache, cache.components)
-    assert cache.swa_reprefill_tail_tokens() == 0
+    assert cache.window_reprefill_tail_tokens() == 0
 
 
 @pytest.mark.parametrize("swa_stored", [True, False])
@@ -1462,15 +1477,36 @@ def test_skip_swa_when_linker_store_lacks_swa(swa_stored):
     linker = _FakeLinker()
     if swa_stored:
         linker.pools[PoolName.SWA] = object()
-    swa = object()
+    swa = SimpleNamespace(pool_name=PoolName.SWA)
     cache = _cache_for_wrapper(
         components={ComponentType.SWA: swa},
         _components_tuple=(swa,),
         tree_components=(ComponentType.FULL, ComponentType.SWA),
     )
     wrapper = UnifiedCacheLinkerWrapper(cache, linker)
-    assert wrapper._skip_swa is (not swa_stored)
+    assert (swa in wrapper._skipped_windows) is (not swa_stored)
     assert (swa in wrapper._components) is swa_stored
+
+
+def test_linker_keeps_every_window_slot():
+    """A tree with several window slots (a draft window of its own length
+    beside the target's) gets a linker; each window is stored, or tombstoned
+    when the store lacks its pool, on its own."""
+    linker = _FakeLinker()
+    linker.pools["window_127"] = object()
+    target = SimpleNamespace(pool_name="window_127", window_sub_pool="window_127")
+    draft = SimpleNamespace(pool_name="window_128", window_sub_pool="window_128")
+    target_slot, draft_slot = ComponentType.SWA, object()
+    cache = _cache_for_wrapper(
+        components={target_slot: target, draft_slot: draft},
+        _components_tuple=(target, draft),
+        tree_components=(ComponentType.FULL, target_slot),
+        window_slots=lambda: (target_slot, draft_slot),
+    )
+    wrapper = UnifiedCacheLinkerWrapper(cache, linker)
+    assert wrapper._windows == (target, draft)
+    assert wrapper._skipped_windows == (draft,)
+    assert target in wrapper._components and draft not in wrapper._components
 
 
 @pytest.fixture
@@ -1499,6 +1535,7 @@ def full_linker_component():
 def test_linker_filters_unstored_swa_from_lookup(full_linker_component):
     full = full_linker_component
     swa = SWAComponent.__new__(SWAComponent)
+    swa.__dict__["_window_sub_pool"] = "swa"
     swa.build_external_linker_transfer = MagicMock(
         side_effect=AssertionError("excluded SWA reached linker")
     )
@@ -1611,11 +1648,12 @@ def test_linker_load_preserves_swa_boundaries(
 ):
     full = full_linker_component
     swa = SWAComponent.__new__(SWAComponent)
+    swa.__dict__["_window_sub_pool"] = "swa"
     participates = swa_stored
 
     def prepare(phase, req, full_transfer, transfer, prefix_len, **kwargs):
         if phase == ExternalLinkerLoadPhase.PREPARE:
-            req.kv.set_evicted_seqlen(ComponentType.SWA, prefix_len - 2)
+            req.kv.set_evicted_seqlen("swa", prefix_len - 2)
         return transfer
 
     swa.build_external_linker_transfer = MagicMock(
@@ -1644,7 +1682,7 @@ def test_linker_load_preserves_swa_boundaries(
         if previous_boundary is None
         else ReqKvInfo(
             kv_allocated_len=previous_boundary,
-            component_evicted_seqlens={ComponentType.SWA: previous_boundary},
+            window_evicted_seqlens={"swa": previous_boundary},
         )
     )
     req = SimpleNamespace(
@@ -1672,7 +1710,7 @@ def test_linker_load_preserves_swa_boundaries(
     assert wrapper.inflight_load_rids == ["rid"]
     assert torch.equal(wrapper.private_load_indices["rid"], restored)
     assert req.swa_branching_seqlen is None
-    assert req.kv.get_evicted_seqlen(ComponentType.SWA) == expected_boundary
+    assert req.kv.get_evicted_seqlen("swa") == expected_boundary
     assert req.kv.kv_allocated_len == (previous_boundary or 0)
     assert [c.args[0] for c in full.build_external_linker_transfer.call_args_list] == [
         LinkerTransferPhase.LOAD

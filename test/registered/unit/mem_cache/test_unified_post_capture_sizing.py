@@ -687,7 +687,6 @@ class TestUnifiedPostCaptureSizing(CustomTestCase):
 
         from sglang.srt.mem_cache.cache_init_params import CacheInitParams
         from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler as host
-        from sglang.srt.mem_cache.unified_cache.components import ComponentType
         from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
         from sglang.srt.runtime_context import get_memory
 
@@ -728,18 +727,17 @@ class TestUnifiedPostCaptureSizing(CustomTestCase):
             host.attach_hybrid_pool_to_unified_cache(
                 cache, params, None, load_cache_event=None
             )
+        target, draft = cache.window_slots()
         pools = (
             cache.full_kv_pool_host,
-            cache.swa_kv_pool_host,
-            cache.auxiliary_swa_kv_pool_host,
+            cache.components[target]._swa_kv_pool_host,
+            cache.components[draft]._swa_kv_pool_host,
         )
         for pool in pools:
             self.addCleanup(pool.destroy)
         self.assertIsNot(pools[1], pools[2])
-        self.assertIs(cache.components[ComponentType.SWA]._swa_kv_pool_host, pools[1])
-        self.assertIs(
-            cache.components[ComponentType.AUXILIARY_SWA]._swa_kv_pool_host, pools[2]
-        )
+        self.assertIsNotNone(pools[1])
+        self.assertIsNotNone(pools[2])
         ids = pools[2].alloc(4)
         self.assertIsNotNone(ids)
         pools[2].free(ids)

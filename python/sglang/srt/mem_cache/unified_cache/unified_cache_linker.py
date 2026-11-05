@@ -58,10 +58,11 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 device_module = get_device_module()
 
+# The token and state components the linker stores, besides the tree's window
+# slots (which it finds by family, whatever ids the tree gives them).
 _EXTERNAL_LINKER_SUPPORTED_COMPONENTS = frozenset(
     {
         ComponentType.FULL,
-        ComponentType.SWA,
         ComponentType.MAMBA,
     }
 )
@@ -261,25 +262,32 @@ class UnifiedCacheLinkerWrapper:
         cache: UnifiedRadixCache,
         cache_linker: UnifiedCacheLinker,
     ):
-        unsupported = set(cache.tree_components) - _EXTERNAL_LINKER_SUPPORTED_COMPONENTS
+        # The linker keeps every window slot of the tree, each as its own pool.
+        windows = cache.window_slots()
+        supported = _EXTERNAL_LINKER_SUPPORTED_COMPONENTS | set(windows)
+        unsupported = set(cache.tree_components) - supported
         if unsupported:
             names = ", ".join(
                 component.name for component in sorted(unsupported, key=int)
             )
             raise ValueError(
-                "External cache linker supports only Full, SWA and Mamba tree "
+                "External cache linker supports only Full, window and Mamba tree "
                 f"components; unsupported: {names}"
             )
 
         self.cache = cache
         self.cache_linker = cache_linker
-        swa = cache.components.get(ComponentType.SWA)
-        # A store without SWA pages tombstones restored tails instead.
-        self._skip_swa = swa is not None and PoolName.SWA not in cache_linker.pools
+        self._windows = tuple(cache.components[slot] for slot in windows)
+        # A window whose pages the store lacks tombstones restored tails instead.
+        self._skipped_windows = tuple(
+            window
+            for window in self._windows
+            if window.pool_name not in cache_linker.pools
+        )
         self._components = tuple(
             component
             for component in cache._components_tuple
-            if not (self._skip_swa and component is swa)
+            if not any(component is window for window in self._skipped_windows)
         )
         # rid -> what match found, consumed by the next init_load_back.
         self.hit_markers: dict[str, ExternalCacheHitMarker] = {}
@@ -338,12 +346,6 @@ class UnifiedCacheLinkerWrapper:
             return result
         hit_tokens = hit_pages * page
 
-        swa_transfer = by_pool.get(PoolName.SWA)
-        swa_host_hit_length = (
-            min(len(swa_transfer.keys), hit_pages) * page
-            if swa_transfer is not None
-            else 0
-        )
         # Mamba keeps a single state slot per node, so a hit is worth one slot.
         mamba_host_hit_length = 1 if PoolName.MAMBA in by_pool else 0
 
@@ -351,10 +353,16 @@ class UnifiedCacheLinkerWrapper:
             tail_hashes=list(tail_hashes[:hit_pages]),
             device_hit_len=device_hit_len,
         )
+        window_hits = dict(result.window_host_hit_lengths)
+        for window in self._windows:
+            transfer = by_pool.get(window.pool_name)
+            hit = min(len(transfer.keys), hit_pages) * page if transfer else 0
+            name = window.window_sub_pool
+            window_hits[name] = max(window_hits.get(name, 0), hit)
         return result._replace(
             last_host_node=result.best_match_node,
             host_hit_length=hit_tokens,
-            swa_host_hit_length=max(result.swa_host_hit_length, swa_host_hit_length),
+            window_host_hit_lengths=window_hits,
             mamba_host_hit_length=max(
                 result.mamba_host_hit_length, mamba_host_hit_length
             ),
@@ -463,12 +471,12 @@ class UnifiedCacheLinkerWrapper:
         )
 
         # Components omitted from the linker do not run their PREPARE hook.
-        # Keep a non-restorable SWA range as tombstones instead of rebuilding
-        # it from an uninitialized FULL-to-SWA mapping when the tail is inserted.
-        if self._skip_swa:
+        # Keep a non-restorable window range as tombstones instead of rebuilding
+        # it from an uninitialized FULL-to-window mapping when the tail is inserted.
+        for window in self._skipped_windows:
+            name = window.window_sub_pool
             req.kv.set_evicted_seqlen(
-                ComponentType.SWA,
-                max(req.kv.get_evicted_seqlen(ComponentType.SWA), prefix_len),
+                name, max(req.kv.get_evicted_seqlen(name), prefix_len)
             )
 
         # match placed the SWA branch point before this tail was known; a point
@@ -516,8 +524,9 @@ class UnifiedCacheLinkerWrapper:
             )
             if transfers is None:
                 continue
-            if self._skip_swa:
-                transfers = [t for t in transfers if t.name != PoolName.SWA]
+            if self._skipped_windows:
+                skipped = {window.pool_name for window in self._skipped_windows}
+                transfers = [t for t in transfers if t.name not in skipped]
             if self.offload_skip_prefix_len:
                 transfers = self._drop_offload_skip_prefix(node_id, transfers)
                 if transfers is None:

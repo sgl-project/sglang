@@ -23,13 +23,14 @@ from sglang.srt.mem_cache.kv.alloc.pricing import (
     float_high_target,
     float_reclaim_satisfied,
 )
+from sglang.srt.mem_cache.kv.plan import TREE_WINDOW
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import reset_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang.test.tree_slots import tree_slots_of
+from sglang.test.tree_slots import storage_tree_slots
 from sglang.test.unified_allocator_fixtures import (
     build_test_unified_pools,
     build_tri_cache,
@@ -289,7 +290,9 @@ class TestTriJointReclaim(CustomTestCase):
                         float_chain(a),
                         400,
                         full_reclaim=c.full_evictable_size(),
-                        swa_reclaim=c.swa_evictable_size(),
+                        swa_reclaim=c.window_evictable_size(
+                            c.window_sub_pool_of_slot(c.slot_id(TREE_WINDOW))
+                        ),
                         state_reclaim=c.mamba_evictable_size(),
                     ),
                     0,
@@ -540,8 +543,10 @@ class TestTriJointReclaim(CustomTestCase):
                             token_to_kv_pool_allocator=allocator,
                             page_size=1,
                             sliding_window_size=128,
-                            tree_slots=tree_slots_of(
-                                (ComponentType.FULL, ComponentType.SWA), window=128
+                            tree_slots=storage_tree_slots(
+                                allocator.storage,
+                                window=128,
+                                components=(ComponentType.FULL, ComponentType.SWA),
                             ),
                         )
                     )
@@ -741,7 +746,9 @@ class TestTriJointReclaim(CustomTestCase):
                     results.append(
                         (
                             result.num_tokens_evicted,
-                            result.swa_num_tokens_evicted,
+                            result.window_num_tokens_evicted.get(
+                                c.window_sub_pool_of_slot(c.slot_id(TREE_WINDOW)), 0
+                            ),
                             result.mamba_num_evicted,
                         )
                     )

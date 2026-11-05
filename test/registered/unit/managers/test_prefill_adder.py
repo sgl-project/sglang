@@ -74,7 +74,7 @@ class TestPrefillAdder(CustomTestCase):
     ) -> MagicMock:
         tree_cache = MagicMock()
         tree_cache.full_evictable_size.return_value = full_evictable_size
-        tree_cache.swa_evictable_size.return_value = swa_evictable_size
+        tree_cache.window_evictable_size.return_value = swa_evictable_size
         tree_cache.evictable_size.return_value = evictable_size
         tree_cache.disable = False
         tree_cache.inc_lock_ref.return_value = IncLockRefResult()
@@ -144,8 +144,7 @@ class TestPrefillAdder(CustomTestCase):
         req.time_stats = SimpleNamespace(wait_queue_entry_time=wait_time)
         req.retracted_stain = False
         req.host_hit_length = 0
-        req.swa_host_hit_length = 0
-        req.auxiliary_swa_host_hit_length = 0
+        req.window_host_hit_lengths = {}
         req.mamba_host_hit_length = 0
         req.storage_hit_length = 0
         req.storage_hit_start = None
@@ -207,7 +206,7 @@ class TestPrefillAdder(CustomTestCase):
     def create_shared_req(self, rid, max_new_tokens=4):
         req = self.create_mock_req(rid, priority=0, max_new_tokens=max_new_tokens)
         req.sampling_params.ignore_eos = False
-        req.swa_host_hit_length = 0
+        req.window_host_hit_lengths = {}
         req.last_node = MagicMock()
         req.full_untruncated_fill_ids = list(range(12))
         return req
@@ -439,11 +438,11 @@ class TestPrefillAdder(CustomTestCase):
         adder = self.create_shared_adder()
         self.assertIsNotNone(adder.token_to_kv_pool_allocator.alloc(24))
         self.mock_tree_cache.full_evictable_size.return_value = 24
-        self.mock_tree_cache.swa_evictable_size.return_value = 24
+        self.mock_tree_cache.window_evictable_size.return_value = 24
 
         def lock_prefix(_):
             self.mock_tree_cache.full_evictable_size.return_value = 0
-            self.mock_tree_cache.swa_evictable_size.return_value = 0
+            self.mock_tree_cache.window_evictable_size.return_value = 0
             return IncLockRefResult()
 
         self.mock_tree_cache.inc_lock_ref.side_effect = lock_prefix
@@ -1321,7 +1320,7 @@ class TestPrefillAdder(CustomTestCase):
         req.prefix_len = PREFIX
         req.full_untruncated_fill_ids = list(range(PREFIX + EXTEND))
         req.host_hit_length = 0
-        req.swa_host_hit_length = 0
+        req.window_host_hit_lengths = {}
         req.last_node = MagicMock()
         req.sampling_params = SimpleNamespace(max_new_tokens=40, ignore_eos=False)
 
@@ -1366,7 +1365,7 @@ class TestPrefillAdder(CustomTestCase):
             req.prefix_len = 0
             req.full_untruncated_fill_ids = list(range(SPAN))
             req.host_hit_length = HOST_HIT
-            req.swa_host_hit_length = WINDOW
+            req.window_host_hit_lengths = {"swa": WINDOW}
             req.needs_host_load_back.return_value = True
             req.last_node = MagicMock()
             req.best_match_node = MagicMock()
@@ -1443,7 +1442,7 @@ class TestPrefillAdder(CustomTestCase):
         )
         req = self._create_host_hit_req(host_hit=6144, tail=2048)
         req.sampling_params.max_new_tokens = 1024
-        req.swa_host_hit_length = 1024
+        req.window_host_hit_lengths = {"swa": 1024}
         req.best_match_node = MagicMock()
         req.needs_host_load_back.return_value = True
 
@@ -1472,7 +1471,7 @@ class TestPrefillAdder(CustomTestCase):
                     first = self._create_delayer_req(
                         512, rid="first", max_new_tokens=16
                     )
-                    first.swa_host_hit_length = 0
+                    first.window_host_hit_lengths = {}
                     adder.add_one_req(
                         first, has_chunked_req=False, truncation_align_size=None
                     )
@@ -1749,7 +1748,7 @@ class TestPrefillAdder(CustomTestCase):
                     req.host_hit_length -= 4
                 old_node, restored_node = req.last_node, object()
                 if name == "aux_only":
-                    req.swa_host_hit_length = 8
+                    req.window_host_hit_lengths = {"swa": 8}
 
                 def load_back(params):
                     self.assertIs(params.req, req)
@@ -2047,14 +2046,20 @@ class TestPrefillAdder(CustomTestCase):
         adder = self.create_swa_adder(size_swa=1024, sliding_window=128)
         self.assertTrue(
             adder.memory_budget.swa_never_fits(
-                extend_input_len=256, max_new_tokens=64, swa_host_hit_length=4096
+                extend_input_len=256,
+                max_new_tokens=64,
+                window_host_hit_lengths={"swa": 4096},
             )
         )
 
     def test_swa_never_fits_is_gated_by_pool_capacity(self):
         # Same request; only the pool size changes. Proves the check compares
         # the budget against size_swa (guards against a wrong-accessor bug).
-        req = dict(extend_input_len=256, max_new_tokens=64, swa_host_hit_length=600)
+        req = dict(
+            extend_input_len=256,
+            max_new_tokens=64,
+            window_host_hit_lengths={"swa": 600},
+        )
         self.assertTrue(
             self.create_swa_adder(
                 size_swa=512, sliding_window=128

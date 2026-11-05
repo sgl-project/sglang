@@ -22,7 +22,7 @@ from sglang.srt.managers.scheduler_components.invariant_checker import (
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     PoolStats,
     SchedulerPoolStatsObserver,
-    kv_private_swa_tokens,
+    kv_private_window_tokens,
 )
 from sglang.srt.managers.scheduler_components.request_list import ListKind
 from sglang.srt.mem_cache.allocator.page_interleave import PageInterleavePoolAllocator
@@ -129,13 +129,13 @@ class TestPrivateSwaTokens(CustomTestCase):
         kv = ReqKvInfo(
             req_pool_idx=0,
             kv_allocated_len=280,
-            swa_evict_floor=278,
-            component_evicted_seqlens={ComponentType.SWA: 278},
+            window_evict_floor=278,
+            window_evicted_seqlens={"swa": 278},
         )
-        self.assertEqual(kv_private_swa_tokens(kv, page_size=1), 280)
+        self.assertEqual(kv_private_window_tokens(kv, 1, "swa"), 280)
         kv.kv_allocated_len = 450
-        kv.set_evicted_seqlen(ComponentType.SWA, 300)
-        self.assertEqual(kv_private_swa_tokens(kv, page_size=1), 428)
+        kv.set_evicted_seqlen("swa", 300)
+        self.assertEqual(kv_private_window_tokens(kv, 1, "swa"), 428)
 
 
 class TestShardedFullPoolInvariant(CustomTestCase):

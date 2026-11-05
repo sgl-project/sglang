@@ -31,13 +31,6 @@ if _is_npu:
 _SWA_PEER_MAPPED = Invariant("swa.peer_mapped", Bucket.FATAL_UNCONTAINABLE, IsTrue())
 # free_full leaves the mapping alone, so a live entry would strand its SWA peer.
 _SWA_PEER_RELEASED = Invariant("swa.peer_released", Bucket.GUARD, IsTrue())
-# The unified allocator's segment frees trust the caller's bound/released split.
-UNIFIED_SWA_SEGMENT_BOUND = Invariant(
-    "unified_swa.segment_bound", Bucket.FATAL_UNCONTAINABLE, IsTrue()
-)
-UNIFIED_SWA_SEGMENT_RELEASED = Invariant(
-    "unified_swa.segment_released", Bucket.FATAL_UNCONTAINABLE, IsTrue()
-)
 
 
 class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
@@ -183,6 +176,11 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self, tree_cache, num_mixed_decode_tokens=num_mixed_decode_tokens
         )
 
+    def window_pool_names(self):
+        from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+
+        return (BaseSWAKVPool.WINDOW_SUB_POOL,)
+
     def reclaim_for_prealloc(
         self, tree_cache, full_tokens: int, swa_tokens: int
     ) -> str | None:
@@ -197,8 +195,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         available = self.swa_available_size()
         if available < swa_tokens:
+            (window,) = self.window_pool_names()
             tree_cache.evict_for_alloc(
-                EvictParams(swa_num_tokens=swa_tokens - available)
+                EvictParams(window_num_tokens={window: swa_tokens - available})
             )
             available = self.swa_available_size()
         if available < swa_tokens:
@@ -221,8 +220,12 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         full_shortfall = max(0, num_tokens - self.full_available_size())
         swa_shortfall = max(0, num_tokens - self.swa_available_size())
         if full_shortfall or swa_shortfall:
+            (window,) = self.window_pool_names()
             tree_cache.evict_for_alloc(
-                EvictParams(num_tokens=full_shortfall, swa_num_tokens=swa_shortfall)
+                EvictParams(
+                    num_tokens=full_shortfall,
+                    window_num_tokens={window: swa_shortfall} if swa_shortfall else {},
+                )
             )
 
     def full_available_size(self):
