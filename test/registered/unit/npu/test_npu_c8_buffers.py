@@ -84,10 +84,14 @@ class TestC8BufferContracts(CustomTestCase):
         self.addCleanup(scope.restore)
         self.enterContext(get_parallel().override(attn_dcp_rank=0))
 
-    def pool(self, *, packed=True, mixed=False):
+    def pool(self, *, packed=True, mixed=False, indexer="auto"):
         dtype = torch.int8 if packed else torch.bfloat16
         capability = resolve_kv_capability(
-            kv_cache_dtype=dtype, is_arch35=False, soc_name="Ascend910B4"
+            kv_cache_dtype=dtype,
+            is_arch35=False,
+            soc_name="Ascend910B4",
+            requested_indexer_kv_dtype=indexer,
+            int8_indexer_op_available=True,
         )
         return NPUMLATokenToKVPool(
             size=8,
@@ -135,14 +139,27 @@ class TestC8BufferContracts(CustomTestCase):
                     kwargs["device_indices"][::4], kwargs["host_indices"][::4]
                 ):
                     if kwargs["direction"] == Direction.D2H:
-                        host[int(cpu) // 4].copy_(device[:, int(dev) // 4])
+                        host[int(cpu) // 4].view_as(device[:, int(dev) // 4]).copy_(
+                            device[:, int(dev) // 4]
+                        )
                     else:
-                        device[:, int(dev) // 4].copy_(host[int(cpu) // 4])
+                        device[:, int(dev) // 4].copy_(
+                            host[int(cpu) // 4].view_as(device[:, int(dev) // 4])
+                        )
 
-        for packed, mixed in ((True, False), (False, False), (False, True)):
-            with self.subTest(packed=packed, mixed=mixed):
-                pool = self.pool(packed=packed, mixed=mixed)
-                for tensor in (pool.k_buffer, pool.v_buffer, pool.index_k_buffer):
+        for packed, mixed, indexer in (
+            (True, False, "auto"),
+            (False, False, "auto"),
+            (False, True, "auto"),
+            (True, False, "int8"),
+            (False, False, "int8"),
+        ):
+            with self.subTest(packed=packed, mixed=mixed, indexer=indexer):
+                pool = self.pool(packed=packed, mixed=mixed, indexer=indexer)
+                device_components = [pool.k_buffer, pool.v_buffer, pool.index_k_buffer]
+                if pool.index_k_scale_buffer is not None:
+                    device_components.append(pool.index_k_scale_buffer)
+                for tensor in device_components:
                     tensor.fill_(7)
                 with (
                     patch.object(mla, "_is_npu", True),
@@ -184,21 +201,21 @@ class TestC8BufferContracts(CustomTestCase):
                         end_layer=2,
                         target_layer_num=2,
                     )
-                    allocated = sum(
-                        tensor.nbytes
-                        for tensor in (
-                            host.k_buffer,
-                            host.v_buffer,
-                            host.index_k_buffer,
-                        )
-                    )
+                    host_components = [
+                        host.k_buffer,
+                        host.v_buffer,
+                        host.index_k_buffer,
+                    ]
+                    if host.index_k_scale_buffer is not None:
+                        host_components.append(host.index_k_scale_buffer)
+                    allocated = sum(tensor.nbytes for tensor in host_components)
                     self.assertEqual(
                         allocated,
                         host.get_size_per_token() * host.page_num * host.page_size,
                     )
                     device_ids, host_ids = torch.arange(4), torch.arange(8, 12)
                     pointers, lengths = host.get_page_buffer_meta(host_ids)
-                    components = [host.k_buffer, host.v_buffer, host.index_k_buffer]
+                    components = host_components
                     components = [tensor for tensor in components if tensor.numel()]
                     self.assertEqual(
                         lengths, [tensor[2].nbytes for tensor in components]
@@ -209,12 +226,12 @@ class TestC8BufferContracts(CustomTestCase):
                     host.backup_from_device_all_layer(
                         pool, host_ids, device_ids, "kernel_ascend"
                     )
-                    for tensor in (pool.k_buffer, pool.v_buffer, pool.index_k_buffer):
+                    for tensor in device_components:
                         tensor[:, 0].zero_()
                     host.load_to_device_per_layer(
                         pool, host_ids, device_ids, 0, "kernel_ascend"
                     )
-                    for tensor in (pool.k_buffer, pool.v_buffer, pool.index_k_buffer):
+                    for tensor in device_components:
                         self.assertTrue(torch.all(tensor == 7))
 
     def test_sparse_attention_receives_packed_int8_and_bf16_queries(self):

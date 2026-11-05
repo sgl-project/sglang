@@ -699,7 +699,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             for i in self.indexer_layer_ids
         )
         if kv_capability is None:
-            kv_capability = resolve_npu_kv_capability(dtype)
+            kv_capability = resolve_npu_kv_capability(
+                dtype, is_draft_worker=is_draft_worker
+            )
         if not kv_capability.supported:
             raise ValueError(kv_capability.unsupported_reason)
         if kv_capability.kv_cache_dtype != dtype:

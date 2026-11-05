@@ -232,6 +232,21 @@ class Model(msgspec.Struct):
             choices=["auto", "bfloat16", "fp8_e4m3"],
         ),
     ] = "auto"
+    dsa_indexer_kv_dtype: A[
+        str,
+        Arg(
+            help=(
+                "Data type for the DSA indexer K cache storage, on Ascend NPUs "
+                'only. This is an axis of its own: "auto" follows '
+                "--kv-cache-dtype on arch35 NPUs and resolves to BF16 on A2/A3 "
+                'NPUs, so an INT8 indexer must be asked for explicitly. "int8" '
+                "quantizes the indexer K cache with one FP16 scale per token "
+                'and needs the vendor quantized-indexer operator. "fp8_e4m3" '
+                "requires an arch35 NPU."
+            ),
+            choices=["auto", "bf16", "int8", "fp8_e4m3"],
+        ),
+    ] = "auto"
     modelopt_quant: A[
         Optional[Union[str, Dict]],
         (

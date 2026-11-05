@@ -117,11 +117,37 @@ def configure_kv_cache_dtype(
         from sglang.srt.hardware_backend.npu.kv_capability import (
             resolve_npu_kv_capability,
         )
+        from sglang.srt.runtime_context import get_model
 
+        if is_draft_worker and get_model().dsa_indexer_kv_dtype == "int8":
+            logger.info(
+                "Speculative draft: overriding DSA indexer KV dtype int8 -> auto "
+                "(the INT8 indexer is hardware-validated for the target model only)."
+            )
         capability = resolve_npu_kv_capability(
-            kv_cache_dtype, requested=server_args_kv_cache_dtype
+            kv_cache_dtype,
+            requested=server_args_kv_cache_dtype,
+            is_draft_worker=is_draft_worker,
         )
         if not capability.supported:
             raise ValueError(capability.unsupported_reason)
+    else:
+        _reject_quantized_indexer_off_npu()
 
     return resolved_kv_cache_dtype, kv_cache_dtype
+
+
+# --dsa-indexer-kv-dtype is read on Ascend NPUs only, so a quantized request
+# elsewhere is a startup error rather than a silent no-op.
+_QUANTIZED_INDEXER_KV_DTYPES = ("int8", "fp8_e4m3")
+
+
+def _reject_quantized_indexer_off_npu() -> None:
+    from sglang.srt.runtime_context import get_model
+
+    requested = get_model().dsa_indexer_kv_dtype
+    if requested in _QUANTIZED_INDEXER_KV_DTYPES:
+        raise ValueError(
+            f"--dsa-indexer-kv-dtype {requested} is an Ascend NPU switch and "
+            "has no effect on this platform; leave it at auto."
+        )

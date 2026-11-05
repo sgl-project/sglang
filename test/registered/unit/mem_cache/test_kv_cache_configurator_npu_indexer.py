@@ -33,7 +33,10 @@ class TestNPUIndexerLayerLayout(CustomTestCase):
         )
         pool = object()
 
+        from sglang.srt.runtime_context import get_context
+
         with (
+            get_context().override_server_args(),
             patch.object(
                 kcc,
                 "get_parallel",

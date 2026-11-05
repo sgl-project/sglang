@@ -323,6 +323,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     draft_indexer_size = self._compute_dsa_indexer_cell_size(
                         kvc=kvc,
                         num_layers=draft_num_layers,
+                        is_draft_worker=True,
                         allocate_all_layers=True,
                     )
                     draft_kv_size *= dcp_size
@@ -620,8 +621,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         *,
         kvc: KVCacheConfigurator,
         num_layers: int,
+        is_draft_worker: Optional[bool] = None,
         allocate_all_layers: bool = False,
     ) -> int:
+        if is_draft_worker is None:
+            is_draft_worker = kvc.is_draft_worker
         index_head_dim = get_dsa_index_head_dim(kvc.model_config.hf_config)
         indexer_size_per_token = ceil_div(
             index_head_dim + index_head_dim // DSATokenToKVPool.quant_block_size * 4,
@@ -635,7 +639,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 resolve_npu_kv_capability,
             )
 
-            capability = resolve_npu_kv_capability(kvc.kv_cache_dtype)
+            capability = resolve_npu_kv_capability(
+                kvc.kv_cache_dtype, is_draft_worker=is_draft_worker
+            )
             indexer_size_per_token = index_head_dim * torch._utils._element_size(
                 capability.indexer_kv_dtype
             )

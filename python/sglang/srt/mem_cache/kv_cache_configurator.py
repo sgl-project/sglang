@@ -2129,7 +2129,9 @@ class KVCacheConfigurator:
                 )
                 if not dsa_layer_skips_topk(self.model_config.hf_config, layer_id)
             )
-        kv_capability = resolve_npu_kv_capability(self.kv_cache_dtype)
+        kv_capability = resolve_npu_kv_capability(
+            self.kv_cache_dtype, is_draft_worker=self.is_draft_worker
+        )
         token_to_kv_pool = NPUMLATokenToKVPool(
             max_total_num_tokens,
             page_size=get_schedule().page_size,

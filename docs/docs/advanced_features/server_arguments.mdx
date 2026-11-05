@@ -369,6 +369,12 @@ Please consult the documentation below and [server_args.py](https://github.com/s
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>auto</code>, <code>fp8_e5m2</code>, <code>fp8_e4m3</code>, <code>bf16</code>, <code>bfloat16</code>, <code>int8</code>, <code>nvfp4</code>, <code>fp4_mx_block16</code></td>
     </tr>
         <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--dsa-indexer-kv-dtype`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Data type for the DSA indexer K cache storage, on Ascend NPUs only. This is an axis of its own: "auto" follows `--kv-cache-dtype` on arch35 NPUs and resolves to BF16 on A2/A3 NPUs, so an INT8 indexer must be asked for explicitly. "int8" quantizes the indexer K cache with one FP16 scale per token and needs the vendor quantized-indexer operator; it runs under the NPU decode CUDA graph. "fp8_e4m3" requires an arch35 NPU.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`auto`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>auto</code>, <code>bf16</code>, <code>int8</code>, <code>fp8_e4m3</code></td>
+    </tr>
+        <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-fp32-lm-head`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>If set, the LM head outputs (logits) are in FP32.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
