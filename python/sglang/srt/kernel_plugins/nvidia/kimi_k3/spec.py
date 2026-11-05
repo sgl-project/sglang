@@ -164,6 +164,13 @@ def _config_disable_reasons(cfg: Any, hf_config: Any) -> list[str]:
     graph_config = cfg.cuda_graph_config
     if graph_config is None or graph_config.decode.backend != "full":
         reasons.append("needs the FULL decode CUDA-graph backend")
+    # Capture-only resolution clears speculative_algorithm, but still needs
+    # intermediate layer taps that the specialized executor does not produce.
+    if getattr(cfg, "aux_hidden_state_capture", None) is not None:
+        reasons.append(
+            "Kimi K3 specialized decode does not support "
+            "--enable-return-aux-hidden-states"
+        )
     if EXTENDED_PROFILE:
         reasons.extend(native_config_reasons(cfg))
         try:

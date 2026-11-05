@@ -101,14 +101,19 @@ TP16, SM100, multi-node execution and DSpark are outside these profiles. A
 configured context up to 1,048,576 tokens is an admission limit, not a full
 1M-input quality result or a capacity guarantee.
 
+Auxiliary hidden-state capture (`--enable-return-aux-hidden-states`) is not
+supported by these profiles. Use the native model path for layer-tap outputs.
+
 ### Correctness and measurement scope
 
-The implementation includes two correctness fixes: a direct residual-vector norm
-in both AttnRes consumers, avoiding cancellation-induced NaNs, and a monotonic
-incremental detokenization cursor, avoiding duplicate Unicode streaming text.
-CPU regressions preserve the counterexamples. Earlier isolated SM103 consumer
-tests covered B1/B64, eager/graph, empty-bank and final branches; the relocated
-implementation still needs its own CUDA and full-model validation.
+The implementation uses a direct residual-vector norm in both AttnRes consumers
+to avoid cancellation-induced NaNs and a monotonic incremental detokenization
+cursor to avoid duplicate Unicode streaming text. MLA weight views and prefetch
+address tables bind to the final weight storage after replicated-Q setup, before
+graph capture. CPU regressions cover these host-side boundaries and numerical
+counterexamples. Earlier isolated SM103 consumer tests covered B1/B64,
+eager/graph, empty-bank and final branches; the relocated implementation still
+needs its own CUDA and full-model validation.
 
 ![Historical pre-fix integrated-build throughput and p95 time to first token](/images/kimi-k3-specialized-decode/integrated-comparison.png)
 

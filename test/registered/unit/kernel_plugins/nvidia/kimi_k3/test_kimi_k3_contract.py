@@ -210,6 +210,7 @@ class TestKimiK3Contract(CustomTestCase):
                 )
 
     def test_configuration_and_loaded_model_refusals_are_named(self):
+        from sglang.srt.arg_groups.model_override_base import resolving_view
         from sglang.srt.kernel_plugins.nvidia.kimi_k3.spec import (
             _config_disable_reasons,
             _model_disable_reasons,
@@ -218,8 +219,50 @@ class TestKimiK3Contract(CustomTestCase):
         cfg = SimpleNamespace(
             cuda_graph_config=SimpleNamespace(decode=SimpleNamespace(backend="full")),
             context_length=8192,
+            speculative_algorithm=None,
+            enable_return_aux_hidden_states=False,
+            aux_hidden_state_capture=None,
+            dcp_size=1,
+            nnodes=1,
+            attn_cp_size=1,
+            enable_prefill_cp=False,
         )
-        self.assertEqual(_config_disable_reasons(cfg, SimpleNamespace()), [])
+        for extended in (False, True):
+            with (
+                self.subTest(extended=extended),
+                patch(
+                    "sglang.srt.kernel_plugins.nvidia.kimi_k3.spec.EXTENDED_PROFILE",
+                    extended,
+                ),
+            ):
+                self.assertEqual(_config_disable_reasons(cfg, SimpleNamespace()), [])
+                for method in ("dflash", "dspark"):
+                    with self.subTest(capture=method):
+                        inputs = SimpleNamespace(**vars(cfg))
+                        inputs.enable_return_aux_hidden_states = True
+                        inputs.speculative_algorithm = method.upper()
+                        # Match handle_aux_hidden_state_capture: this is capture
+                        # without a draft, so a NoSpec check alone cannot reject it.
+                        inputs._resolved_overrides = [
+                            (
+                                "_handle_aux_hidden_state_capture",
+                                {
+                                    "speculative_algorithm": None,
+                                    "aux_hidden_state_capture": method,
+                                },
+                            )
+                        ]
+                        resolved = resolving_view(inputs)
+                        self.assertIsNone(resolved.speculative_algorithm)
+                        self.assertEqual(resolved.aux_hidden_state_capture, method)
+                        reasons = _config_disable_reasons(resolved, SimpleNamespace())
+                        self.assertTrue(
+                            any(
+                                "--enable-return-aux-hidden-states" in reason
+                                for reason in reasons
+                            ),
+                            reasons,
+                        )
         cfg.context_length = 4096
         cfg.cuda_graph_config.decode.backend = "disabled"
         reasons = _config_disable_reasons(cfg, SimpleNamespace())

@@ -2,7 +2,8 @@
 """CPU checks for host ordering; these do not compile or execute CUDA kernels."""
 
 import importlib
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
@@ -77,6 +78,88 @@ def test_weight_ranges_follow_strides_alignment_and_byte_cap():
         prefetch.weight_ranges((backing.flatten()[1:],))
     with pytest.raises(ValueError, match="at least 16"):
         prefetch.weight_ranges(weights, 1)
+
+
+def test_resource_binding_refreshes_prefetch_addresses_in_place(monkeypatch):
+    """Native Q replication can change storage without changing its Parameter."""
+    from sglang.srt.kernel_plugins.nvidia.kimi_k3 import providers
+
+    # Execute the real table constructor while isolating only GPU import/compile.
+    cuda, bindings, driver = (
+        ModuleType(name) for name in ("cuda", "cuda.bindings", "cuda.bindings.driver")
+    )
+    cuda.bindings, bindings.driver = bindings, driver
+    for name, module in (
+        ("cuda", cuda),
+        ("cuda.bindings", bindings),
+        ("cuda.bindings.driver", driver),
+    ):
+        monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.kernels.jit.kimi_k3.host",
+        SimpleNamespace(_checked=Mock(), resolve_kernel=Mock()),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.kernels.jit.kimi_k3.tensor_adapter",
+        SimpleNamespace(to_cute=lambda table, align: table),
+    )
+    compile_kernel = Mock(return_value=object())
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.kernels.ops.memory.kimi_k3_specialized.prefetch",
+        SimpleNamespace(compile_kernel=compile_kernel),
+    )
+    weight = torch.nn.Parameter(torch.empty(16, 16), requires_grad=False)
+    original = weight.detach()  # Keep old and new allocations distinct.
+    identity, shape, stride = id(weight), tuple(weight.shape), tuple(weight.stride())
+    ranges = prefetch.PreparedWeightRanges((weight,), byte_cap=128)
+    table_pointer, table_bytes = (
+        ranges.table.data_ptr(),
+        ranges.table.numel() * ranges.table.element_size(),
+    )
+    controller = prefetch.PrefetchController.__new__(prefetch.PrefetchController)
+    controller.tables = {("next_attention", 0, batch): ranges for batch in (1, 2)}
+    replica = torch.empty(8 * shape[0], shape[1])
+    local = replica.narrow(0, 3 * shape[0], shape[0])
+    weight.data = local
+    assert (id(weight), tuple(weight.shape), tuple(weight.stride())) == (
+        identity,
+        shape,
+        stride,
+    )
+    assert local.storage_offset() == 3 * shape[0] * shape[1]
+    assert local.data_ptr() != original.data_ptr()
+    assert ranges.table.tolist() == [[original.data_ptr(), 128]]
+    prepared = Mock()
+    resources = SimpleNamespace(
+        _binding_candidate=Mock(return_value={"pool": "stable"}),
+        binding_fingerprint=None,
+        binding=None,
+        attention={
+            0: SimpleNamespace(kind="mla", core=SimpleNamespace(prepare_cache=prepared))
+        },
+        compilation_inventory=[],
+        prefetch=controller,
+    )
+    cache = object()
+    with (
+        patch.object(providers, "_cuda_memory", return_value={}),
+        patch.object(torch.cuda, "synchronize"),
+    ):
+        providers.ResourceSet.bind(
+            resources, SimpleNamespace(mla=SimpleNamespace(cache=lambda layer: cache))
+        )
+    prepared.assert_called_once_with(cache)
+    assert ranges.table.tolist() == [[local.data_ptr(), 128]]
+    assert ranges.table.data_ptr() == table_pointer
+    assert ranges.views is ranges.table
+    assert ranges.table.numel() * ranges.table.element_size() == table_bytes
+    compile_kernel.assert_called_once()
+    weight.data = local[:, :8].contiguous()
+    with pytest.raises(ValueError, match="weight layout changed"):
+        ranges.bind()
 
 
 def test_resource_inventory_does_not_traverse_borrowed_collective_owners():

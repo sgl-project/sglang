@@ -750,6 +750,8 @@ class ResourceSet:
             self.compilation_inventory.append(
                 {"kind": "attention_core", "layer_id": layer_id, "name": provider.kind}
             )
+        if self.prefetch is not None:
+            self.prefetch.bind()
         torch.cuda.synchronize()
         after = self._binding_candidate(hybrid)
         if after != candidate:

@@ -49,7 +49,7 @@ NEXT_ATTENTION = {8: "1:96.100,2-3:96,4-7:64,8:32", 16: "1-8:1024"}
 
 
 def attention_weights(provider, module):
-    """The prepared provider's immutable tensors, in consumption order.
+    """The prepared provider's tensors, in consumption order.
 
     Use the coalesced SGLang projection and the core's normalized weight views,
     including owned MLA W_UK layout copies, rather than stale module aliases.
@@ -93,7 +93,7 @@ def _stream_handle(stream):
 
 
 class PreparedWeightRanges:
-    """One owner retains weights, immutable range table, executable and launch ABI."""
+    """One owner retains weights, fixed-size range table, executable and launch ABI."""
 
     def __init__(self, weights, *, byte_cap=0, grid=32, carveout=None, priority=False):
         import cuda.bindings.driver as cuda
@@ -105,6 +105,11 @@ class PreparedWeightRanges:
         )
 
         self.weights = weights = tuple(weights)
+        self.byte_cap = byte_cap
+        self.weight_layouts = tuple(
+            (tuple(weight.shape), tuple(weight.stride()), weight.dtype)
+            for weight in weights
+        )
         if not weights or any(weight.device != weights[0].device for weight in weights):
             raise ValueError(
                 "L2 prefetch needs nonempty, same-device immutable weights"
@@ -113,6 +118,7 @@ class PreparedWeightRanges:
         ranges = weight_ranges(weights, byte_cap)
         if not ranges:
             raise ValueError("L2 prefetch has no aligned weight range")
+        self.range_sizes = tuple(size for _, size in ranges)
         self.table = torch.tensor(ranges, dtype=torch.int64, device=device)
         self.compiled = compile_kernel(len(ranges), grid, carveout, device.index)
         self.config = None
@@ -140,6 +146,30 @@ class PreparedWeightRanges:
         self.pointer = ctypes.c_void_p(self.table.data_ptr())
         self.arguments = (ctypes.c_void_p * 1)(ctypes.addressof(self.pointer))
         self.address = ctypes.addressof(self.arguments)
+
+    def bind(self):
+        """Refresh final weight addresses without reallocating captured table storage."""
+        if self.table.is_cuda and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("L2 prefetch addresses must be bound before capture")
+        if any(weight.device != self.table.device for weight in self.weights):
+            raise ValueError("L2 prefetch weight device changed before binding")
+        if (
+            tuple(
+                (tuple(weight.shape), tuple(weight.stride()), weight.dtype)
+                for weight in self.weights
+            )
+            != self.weight_layouts
+        ):
+            raise ValueError("L2 prefetch weight layout changed before binding")
+        ranges = weight_ranges(self.weights, self.byte_cap)
+        if (
+            tuple(self.table.shape) != (len(ranges), 2)
+            or tuple(size for _, size in ranges) != self.range_sizes
+        ):
+            raise ValueError("L2 prefetch range geometry changed before binding")
+        # Keep both the CuTe view and driver argument pointing at the allocated
+        # device table. Only this temporary CPU tensor is created after KV sizing.
+        self.table.copy_(torch.tensor(ranges, dtype=torch.int64, device="cpu"))
 
     def launch(self, stream):
         if self.config is None:
@@ -202,6 +232,11 @@ class PrefetchController:
             self.events[key] = event
         for batch in batches:
             self.tables[point, layer, batch] = ranges
+
+    def bind(self):
+        """Finalize each shared range table once, after native weight preparation."""
+        for ranges in dict.fromkeys(self.tables.values()):
+            ranges.bind()
 
     def fork(self, point, layer, batch):
         ranges = self.tables.get((point, layer, batch))
