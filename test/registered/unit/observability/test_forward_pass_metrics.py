@@ -1549,8 +1549,8 @@ class TestEstimatedPerfConstants(CustomTestCase):
             )
         )
         qk_head_dim = 96.0 + 32.0
-        compressed_q_proj_flops = (
-            2.0 * hidden * q_lora_rank + 2.0 * q_lora_rank * (heads * qk_head_dim)
+        compressed_q_proj_flops = 2.0 * hidden * q_lora_rank + 2.0 * q_lora_rank * (
+            heads * qk_head_dim
         )
         uncompressed_q_proj_flops = 2.0 * hidden * heads * qk_head_dim
         # Low-rank Q compression must actually reduce projection FLOPs for a
@@ -1652,6 +1652,11 @@ class TestEstimatedPerfConstants(CustomTestCase):
         # per-token KV cache -- kv_cache_bytes_per_token must scale by the
         # attention-layer count parsed from layers_block_type, never the
         # unrelated num_attention_layers field (999, deliberately wrong here).
+        #
+        # layers_block_type is a real Python list on every HF config that
+        # defines it (NemotronH, Jamba, Zamba, Bamba, FalconH1, ...), never a
+        # comma-joined string -- use a list here so this test exercises the
+        # same type the production code actually sees.
         head_dim, kv_heads = 128.0, 8.0
         self._init(
             _fake_model_config(
@@ -1659,7 +1664,15 @@ class TestEstimatedPerfConstants(CustomTestCase):
                 num_kv_heads=kv_heads,
                 num_attention_layers=999,
                 hf_text_config_overrides={
-                    "layers_block_type": "attention,mamba,mlp,attention,mamba,mlp,mamba",
+                    "layers_block_type": [
+                        "attention",
+                        "mamba",
+                        "mlp",
+                        "attention",
+                        "mamba",
+                        "mlp",
+                        "mamba",
+                    ],
                     "intermediate_size": 4096,
                 },
             )
@@ -1668,6 +1681,142 @@ class TestEstimatedPerfConstants(CustomTestCase):
         expected_kv_cache_bytes = 2.0 * kv_heads * head_dim * num_attn_layers * 2.0
         self.assertEqual(
             self.reporter._kv_cache_bytes_per_token, expected_kv_cache_bytes
+        )
+
+    def test_falcon_h1_style_uniform_hybrid_label_counts_every_layer(self):
+        # FalconH1Config.layers_block_type is a property that returns
+        # ["hybrid"] * num_hidden_layers -- every layer, never "attention",
+        # "mlp", or "moe". Each FalconH1DecoderLayer actually contains its own
+        # self.self_attn, self.mamba, AND self.feed_forward all at once, so
+        # every layer genuinely pays both the attention and the MLP cost.
+        # The regression this guards: naively counting literal "attention"/
+        # "mlp"/"moe" labels gives num_attn_layers=0 AND num_mlp_layers=0 for
+        # this convention, zeroing every FLOPs/bandwidth estimate.
+        hidden, head_dim, heads, kv_heads, layers = 4096, 128, 32, 8, 6
+        self._init(
+            _fake_model_config(
+                hidden_size=hidden,
+                head_dim=head_dim,
+                num_attn_heads=heads,
+                num_kv_heads=kv_heads,
+                num_attention_layers=layers,
+                hf_text_config_overrides={
+                    "layers_block_type": ["hybrid"] * layers,
+                    "intermediate_size": 14336,
+                },
+            )
+        )
+        attn_linear_flops = (
+            2.0 * hidden * head_dim * (heads + 2.0 * kv_heads)
+            + 2.0 * hidden * head_dim * heads
+        )
+        mlp_flops = 6.0 * hidden * 14336
+        # Must match the plain dense/GQA formula over every layer -- not zero.
+        self.assertEqual(
+            self.reporter._linear_flops_per_token,
+            attn_linear_flops * layers + mlp_flops * layers,
+        )
+        self.assertGreater(self.reporter._linear_flops_per_token, 0.0)
+        self.assertEqual(
+            self.reporter._attn_dot_flops_coeff, 4.0 * heads * head_dim * layers
+        )
+        self.assertGreater(self.reporter._kv_cache_bytes_per_token, 0.0)
+
+    def test_jamba_style_attention_mamba_only_labels_still_charge_mlp_everywhere(self):
+        # Jamba/Bamba's layers_block_type only ever contains "attention" or
+        # "mamba" -- there is no separate "mlp"/"moe" label, because every
+        # layer (whichever mixer it uses) has its own attached MLP. Only the
+        # attention *mixer* count should shrink to the real "attention"
+        # entries; the MLP count must still cover every layer.
+        hidden, head_dim, heads, kv_heads = 4096, 128, 32, 8
+        layers_block_type = [
+            "attention",
+            "mamba",
+            "mamba",
+            "attention",
+            "mamba",
+            "mamba",
+            "mamba",
+            "attention",
+        ]
+        total_layers = float(len(layers_block_type))
+        num_attn_layers = 3.0  # "attention" appears 3 times
+        self._init(
+            _fake_model_config(
+                hidden_size=hidden,
+                head_dim=head_dim,
+                num_attn_heads=heads,
+                num_kv_heads=kv_heads,
+                num_attention_layers=int(total_layers),
+                hf_text_config_overrides={
+                    "layers_block_type": layers_block_type,
+                    "intermediate_size": 14336,
+                },
+            )
+        )
+        attn_linear_flops = (
+            2.0 * hidden * head_dim * (heads + 2.0 * kv_heads)
+            + 2.0 * hidden * head_dim * heads
+        )
+        mlp_flops = 6.0 * hidden * 14336
+        # The regression this guards against: num_mlp_layers silently forced
+        # to 0 because the vocabulary has no literal "mlp"/"moe" label.
+        wrong_zeroed_mlp = attn_linear_flops * num_attn_layers + mlp_flops * 0.0
+        expected = attn_linear_flops * num_attn_layers + mlp_flops * total_layers
+        self.assertNotEqual(self.reporter._linear_flops_per_token, wrong_zeroed_mlp)
+        self.assertEqual(self.reporter._linear_flops_per_token, expected)
+        # KV cache bandwidth only applies to the real attention-mixer layers.
+        self.assertEqual(
+            self.reporter._kv_cache_bytes_per_token,
+            2.0 * kv_heads * head_dim * num_attn_layers * 2.0,
+        )
+
+    def test_full_attention_layer_ids_read_from_model_config_when_present(self):
+        # sglang computes swa/full_attention_layer_ids in ModelConfig.__init__
+        # (via get_hybrid_layer_ids()) and stores them on model_config itself
+        # -- this is the real path for Gemma2/Gemma3/Llama4-style SWA hybrid
+        # models. No layers_block_type is involved for these.
+        head_dim, kv_heads = 128.0, 8.0
+        full_attention_layer_ids = [2, 5, 9, 12]
+        self._init(
+            _fake_model_config(
+                head_dim=head_dim,
+                num_kv_heads=kv_heads,
+                num_attention_layers=16,
+                full_attention_layer_ids=full_attention_layer_ids,
+            )
+        )
+        num_attn_layers = float(len(full_attention_layer_ids))
+        self.assertEqual(
+            self.reporter._kv_cache_bytes_per_token,
+            2.0 * kv_heads * head_dim * num_attn_layers * 2.0,
+        )
+
+    def test_full_attention_layer_ids_falls_back_to_hf_text_config(self):
+        # KimiLinear/KimiK3's own HF config class defines full_attention_layer_ids
+        # as a native field (read directly as self.config.full_attention_layer_ids
+        # in kimi_linear.py/kimi_k3.py) -- sglang's ModelConfig never computes or
+        # mirrors it for these architectures, so it only ever lives on
+        # hf_text_config. The regression this guards against: looking ONLY at
+        # hf_text_config (pre-fix) silently breaks SWA models that have it on
+        # model_config instead, or looking ONLY at model_config (an earlier
+        # draft of this fix) would silently break KimiLinear/KimiK3.
+        head_dim, kv_heads = 128.0, 8.0
+        full_attention_layer_ids = [0, 3, 6]
+        self._init(
+            _fake_model_config(
+                head_dim=head_dim,
+                num_kv_heads=kv_heads,
+                num_attention_layers=16,
+                hf_text_config_overrides={
+                    "full_attention_layer_ids": full_attention_layer_ids,
+                },
+            )
+        )
+        num_attn_layers = float(len(full_attention_layer_ids))
+        self.assertEqual(
+            self.reporter._kv_cache_bytes_per_token,
+            2.0 * kv_heads * head_dim * num_attn_layers * 2.0,
         )
 
 

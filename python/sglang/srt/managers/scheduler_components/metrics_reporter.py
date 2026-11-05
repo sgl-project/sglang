@@ -557,17 +557,45 @@ class SchedulerMetricsReporter:
 
         hidden_size = float(model_config.hidden_size)
         num_layers = float(getattr(model_config, "num_attention_layers", 0))
-        # Per-layer attention/MLP/Mamba split for hybrid architectures (NemotronH, etc).
+        # Per-layer attention/MLP/Mamba split for hybrid architectures. Two
+        # distinct conventions exist across real HF configs:
+        #   - Dedicated-layer (NemotronH): each layer is *exclusively* one of
+        #     "attention"/"mamba"/"mlp"/"moe" -- a "mamba" layer has no MLP of
+        #     its own, since the FFN lives in its own separately-indexed
+        #     layer. Only count the dedicated labels.
+        #   - Bundled-layer (FalconH1's uniform "hybrid" label; Jamba/Bamba's
+        #     "attention"/"mamba" with no separate FFN label at all): every
+        #     layer carries its own attention-or-mamba mixer *and* its own
+        #     MLP together. These vocabularies never contain "mlp"/"moe" at
+        #     all, so detect the convention by that and fall back to
+        #     "every layer pays the FFN cost" instead of silently zeroing it.
         layers_block_type = getattr(hf_text_config, "layers_block_type", None)
         if layers_block_type:
-            num_attn_layers = float(layers_block_type.count("attention"))
-            num_mlp_layers = float(
-                layers_block_type.count("mlp") + layers_block_type.count("moe")
+            num_attn_layers = float(
+                sum(1 for t in layers_block_type if t not in ("mamba", "mlp", "moe"))
+            )
+            has_dedicated_ffn_layers = any(
+                t in ("mlp", "moe") for t in layers_block_type
+            )
+            num_mlp_layers = (
+                float(layers_block_type.count("mlp") + layers_block_type.count("moe"))
+                if has_dedicated_ffn_layers
+                else num_layers
             )
         else:
+            # full_attention_layer_ids is usually computed by sglang itself
+            # (ModelConfig.__init__, via get_hybrid_layer_ids()) and stored on
+            # model_config -- NOT on hf_text_config, which only ever has it
+            # when a model's own HF config class defines the field natively
+            # (e.g. KimiLinear/KimiK3). Check both so neither source is
+            # silently ignored.
             full_attention_layer_ids = getattr(
-                hf_text_config, "full_attention_layer_ids", None
+                model_config, "full_attention_layer_ids", None
             )
+            if full_attention_layer_ids is None:
+                full_attention_layer_ids = getattr(
+                    hf_text_config, "full_attention_layer_ids", None
+                )
             num_attn_layers = (
                 float(len(full_attention_layer_ids))
                 if full_attention_layer_ids is not None
@@ -597,9 +625,7 @@ class SchedulerMetricsReporter:
         is_mla = getattr(model_config, "attention_arch", None) == AttentionArch.MLA
         if is_mla and num_attn_heads > 0:
             kv_lora_rank = float(getattr(model_config, "kv_lora_rank", 0) or 0)
-            qk_rope_head_dim = float(
-                getattr(model_config, "qk_rope_head_dim", 0) or 0
-            )
+            qk_rope_head_dim = float(getattr(model_config, "qk_rope_head_dim", 0) or 0)
             qk_nope_head_dim = getattr(model_config, "qk_nope_head_dim", None)
             qk_nope_head_dim = (
                 float(qk_nope_head_dim)
@@ -644,9 +670,7 @@ class SchedulerMetricsReporter:
                 + kv_b_proj_weight_elems
                 + o_proj_weight_elems
             )
-            attn_dot_flops_per_layer = 2.0 * num_attn_heads * (
-                qk_head_dim + v_head_dim
-            )
+            attn_dot_flops_per_layer = 2.0 * num_attn_heads * (qk_head_dim + v_head_dim)
             kv_cache_elems_per_token_per_layer = kv_a_dim
         else:
             attn_linear_flops = (
