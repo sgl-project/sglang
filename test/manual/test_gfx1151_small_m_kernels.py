@@ -232,3 +232,39 @@ def test_gluon_small_m_falls_back_without_triton_3_7(monkeypatch):
         assert qs._gfx115_w4a16_gemm(x, w, s) is None  # 8 rows: skinny GEMM
     finally:
         qs._gluon_small_m_available.cache_clear()
+
+
+@gfx115
+def test_verify_attention_register_spills():
+    """The split kernel streams q in chunks to stay near the register file; 12 spills with
+    Triton 3.7 / ROCm 7.2.4 (139 when q was held as a whole operand). A compiler change that
+    brings the spills back shows up here before it shows up as a slower verify step."""
+    from sglang.kernels.ops.attention import verify_attention_gfx1151 as va
+
+    hq, hkv, d, t = 24, 4, 256, 8
+    kc = torch.randn(4096, hkv, d, device="cuda", dtype=torch.bfloat16)
+    q = torch.randn(t, hq, d, device="cuda", dtype=torch.bfloat16)
+    r2t = torch.arange(4096, device="cuda", dtype=torch.int32)[None]
+    compiled = {}
+    run = va._verify_split_kernel.run
+
+    def capture(*args, **kwargs):
+        compiled["kernel"] = run(*args, **kwargs)
+        return compiled["kernel"]
+
+    va._verify_split_kernel.run = capture
+    try:
+        va.verify_attention_gfx1151(
+            q,
+            torch.empty_like(q),
+            kc,
+            torch.randn_like(kc),
+            r2t,
+            torch.zeros(1, dtype=torch.int64, device="cuda"),
+            torch.tensor([2000], device="cuda"),
+            t,
+            d**-0.5,
+        )
+    finally:
+        va._verify_split_kernel.run = run
+    assert compiled["kernel"].n_spills <= 32, compiled["kernel"].n_spills

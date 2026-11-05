@@ -10,8 +10,8 @@ request and runs QK and PV on the matrix cores; a second kernel merges the split
 ``0..t``, whose K/V the backend has already written to the cache.
 
 Numerics follow the extend kernel: fp32 online softmax, ``p`` rounded to bf16 for PV. On
-gfx1151 with Qwen3.8 shapes (24 q heads, 4 kv heads, head dim 256) this takes 0.35 / 0.8 /
-2.6 ms per layer at 1k / 8k / 39k prefixes against 1.3 / 6.6 / 30.7 ms for
+gfx1151 with Qwen3.8 shapes (24 q heads, 4 kv heads, head dim 256) this takes 0.10 / 0.24 /
+1.0 ms per layer at 1k / 8k / 39k prefixes against 0.43 / 3.5 / 16 ms for
 ``extend_attention_fwd``.
 """
 
@@ -45,6 +45,7 @@ def _verify_split_kernel(
     NSPLIT: tl.constexpr,
     BT: tl.constexpr,
     HG: tl.constexpr,
+    QC: tl.constexpr,
 ):
     """One program per (request, kv head, group of ``HG`` of its q heads, split); rows are
     (block token, q head of the group), 8 x next_pow2(HG). The groups of a kv head are
@@ -70,8 +71,10 @@ def _verify_split_kernel(
     valid = (r % HP < HG) & (h < GQ) & (m < T)
     seq_r = prefix + m + 1
     d = tl.arange(0, D)
+    dq = tl.arange(0, QC)
     qrow = (b * T + m) * HQ + j * GQ + h
-    q = tl.load(q_ptr + qrow[:, None] * D + d[None, :], mask=valid[:, None], other=0.0)
+    # padding rows read a real q row (finite scores) and are never stored
+    q_rows = q_ptr + tl.where(valid, qrow, b * T * HQ + j * GQ)[:, None] * D
     bt = tl.arange(0, BT)
     m_i = tl.full((R,), float("-inf"), tl.float32)
     l_i = tl.zeros((R,), tl.float32)
@@ -80,9 +83,22 @@ def _verify_split_kernel(
         tt = t + bt
         tok = tl.load(req_to_token + rp * r2t_stride + tl.minimum(tt, t1 - 1))
         # int32 offsets (the caller checks the pool size); 16-byte hints, unmasked loads
-        off = tl.multiple_of(tok * (HKV * D) + j * D, 16)[:, None] + d[None, :]
-        k = tl.load(tl.max_contiguous(tl.multiple_of(k_ptr + off, [1, 16]), [1, 8]))
-        sc = tl.dot(q, tl.trans(k)) * scale
+        base = tl.multiple_of(tok * (HKV * D) + j * D, 16)
+        # q is re-read (from cache) in QC-wide chunks every tile: kept in registers as a
+        # WMMA operand it takes 128 VGPRs next to the accumulator's 128 and spills, and
+        # the spill reloads queue behind the K/V gathers. volatile keeps it in the loop.
+        sc = tl.zeros((R, BT), tl.float32)
+        for c in tl.static_range(0, D, QC):
+            qc = tl.load(q_rows + c + dq[None, :], volatile=True)
+            kc = tl.load(
+                tl.max_contiguous(
+                    tl.multiple_of(k_ptr + base[:, None] + c + dq[None, :], [1, 16]),
+                    [1, 8],
+                )
+            )
+            sc = tl.dot(qc, tl.trans(kc), sc)
+        sc = sc * scale
+        off = base[:, None] + d[None, :]
         sc = tl.where(
             (tt[None, :] < seq_r[:, None]) & (tt[None, :] < t1), sc, float("-inf")
         )
@@ -202,7 +218,10 @@ def verify_attention_gfx1151(
         NSPLIT=nsplit,
         BT=bt,
         HG=hg,
+        QC=32,
         num_warps=num_warps,
+        # the default software pipelining doubles the LDS and adds spills
+        num_stages=1,
     )
     _verify_combine_kernel[(rows * hq,)](part, ml, o, D=d, NSPLIT=nsplit, num_warps=4)
     return o
