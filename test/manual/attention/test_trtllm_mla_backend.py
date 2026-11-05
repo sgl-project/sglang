@@ -19,11 +19,12 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     ForwardContext,
     set_forward_context,
 )
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.server_args import (
     ServerArgs,
     set_global_server_args_for_scheduler,
