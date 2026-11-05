@@ -3049,9 +3049,6 @@ class ServingChatTestCase(CustomTestCase):
                 )
 
     def test_kimi_k3_rejects_message_tools_the_encoding_cannot_render(self):
-        """Kimi-K3 renders message-level tools only from a system message
-        without content; other encodings keep accepting every case."""
-
         def tool(name="lookup", **fields):
             return {"type": "function", "function": {"name": name}, **fields}
 
@@ -3090,9 +3087,6 @@ class ServingChatTestCase(CustomTestCase):
                     )
 
     def test_kimi_k3_forced_tool_call_overrides_json_response_format(self):
-        """Kimi-K3 states response_format in the prompt, so a forced tool call
-        keeps its constraint and the JSON grammar is dropped; other encodings
-        reject the conflict, and regex keeps conflicting under Kimi-K3."""
         self.template_manager.chat_template_name = None
         self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
         tool = {"type": "function", "function": {"name": "get_weather"}}
