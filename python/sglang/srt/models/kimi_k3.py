@@ -141,6 +141,7 @@ from sglang.srt.models.kimi_k3_amd.moe import (
     KimiK3MoEHipMixin,
     ffn_row_shards_hip,
     link_column_tails_hip,
+    link_row_sharded_stream_hip,
 )
 from sglang.srt.models.kimi_k3_amd.row_shard_o_proj import (
     gather_full_o_proj,
@@ -497,6 +498,15 @@ def _add3(
 
 # One-shot log guard: proves the merged front is live (see _ep_front).
 _EP_FRONT_LOGGED = False
+
+
+def _row_sharded_switch_on() -> bool:
+    """Any of the opt-in gfx950 row-sharded front / o_proj / stream switches."""
+    return (
+        envs.SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_FRONT.get()
+        or envs.SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_O_PROJ.get()
+        or envs.SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM.get()
+    )
 
 
 def _is_row_shard_o_proj(o_proj: RowParallelLinear) -> bool:
@@ -3062,7 +3072,11 @@ class KimiK3DecoderLayer(nn.Module):
         if self._row_shards is not None and _is_row_shard_o_proj(o_proj):
             o_proj.row_shards = self._row_shards
             self._o_proj_row_sharded = True
-        elif self._row_shards is not None and _o_proj_takes_output(o_proj):
+        elif (
+            self._row_shards is not None
+            and _row_sharded_switch_on()
+            and _o_proj_takes_output(o_proj)
+        ):
             pad_o_proj_rows(
                 o_proj, tp_size=get_parallel().attn_tp_size, row_shards=self._row_shards
             )
@@ -3315,6 +3329,7 @@ class KimiK3LinearModel(nn.Module):
         )
         if _is_hip:
             link_column_tails_hip(self)
+            link_row_sharded_stream_hip(self)
 
     def forward(
         self,

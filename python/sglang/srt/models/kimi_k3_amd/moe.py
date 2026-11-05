@@ -97,6 +97,9 @@ class KimiK3MoEHipMixin:
     # post-load), and what shard_front gathered for the forward after it.
     _row_front_shared: Optional[tuple[torch.Tensor, torch.Tensor]] = None
     _row_front_out: Optional[tuple] = None
+    # Set by link_row_sharded_stream_hip when every later layer reads a stream
+    # left on row shards (SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM, PP1).
+    _row_stream = False
 
     def _prepare_hip_paths(self) -> None:
         """Post-load, after _merge_front_weights: the ROCm paths this layer takes."""
@@ -345,7 +348,7 @@ class KimiK3MoEHipMixin:
             )
         out, _ = self.routed_expert_up_proj(self._latent_norm(latent))
         stream_rows = _add3(out, shared, prefix)
-        if envs.SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM.get():
+        if self._row_stream:
             # the next read takes this rank's rows (attn_bank._bank_rows)
             return stream_rows[: row_shard(num_tokens, self.tp_size, tp_rank)[1]]
         stream = stream_rows.new_empty(padded_rows, hidden_size)
@@ -396,6 +399,8 @@ class KimiK3MoEHipMixin:
         min_tokens = self._a8w4_moe_min_tokens
         if (
             self._row_front_shared is None
+            # the A8W4 kernels and the latent reduce write bf16
+            or normed.dtype != torch.bfloat16
             or min_tokens is None
             or not min_tokens <= num_tokens <= self._a8w4_moe_max_tokens
         ):
@@ -636,6 +641,23 @@ def ffn_row_shards_hip(layer) -> Optional[Callable[[int], bool]]:
     if get_parallel().attn_tp_size != get_parallel().tp_size:
         return None
     return layer.mlp.takes_row_sharded_tail
+
+
+def link_row_sharded_stream_hip(model) -> None:
+    """Let a layer's row-sharded tail leave the stream on this rank's rows only
+    when every later layer reads it there (its FFN takes the row-sharded read)
+    and no pipeline stage boundary follows: a dense layer or a PP send would
+    read every row of the stream and of the bank, which the shard left stale."""
+    if not envs.SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM.get():
+        return
+    if get_parallel().pp_size > 1:
+        return
+    later_on_shards = True
+    for i in reversed(range(model.start_layer, model.end_layer)):
+        layer = model.layers[i]
+        if isinstance(layer.mlp, KimiK3MoEHipMixin):
+            layer.mlp._row_stream = later_on_shards
+        later_on_shards = later_on_shards and layer._row_shards is not None
 
 
 def link_column_tails_hip(model) -> None:
