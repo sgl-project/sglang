@@ -29,7 +29,7 @@ register_npu_ci(
     est_time=400,
     suite="base-b-test-4-npu-a3",
 )
-register_npu_ci(est_time=2400, suite="nightly-4-npu-a3", nightly=True)
+register_npu_ci(est_time=2700, suite="nightly-4-npu-a3", nightly=True)
 
 
 class TestDPAttentionDP2TP2(
@@ -79,6 +79,9 @@ class TestDPAttentionMixedChunk(
     # with (4-shot chat, temperature 1.0).
     gsm8k_accuracy_thres = 0.83
     gsm8k_backend = "evalscope"
+    # One full-dataset evalscope pass takes ~32 min, so cap at one re-run
+    # (2 passes ~= 55 min) to stay inside the per-file CI timeout.
+    gsm8k_max_attempts = 2
 
     @classmethod
     def setUpClass(cls):

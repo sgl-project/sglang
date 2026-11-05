@@ -12,6 +12,9 @@ runner_ids calls; the PD transfer plane's `translate_kv_indices_for_transfer`,
 which stages for RDMA outside the forward path; and the STATIC SWA pool's
 legacy full->swa slot map, a different mapping kind with no virtual/physical
 ambiguity.
+
+The wrapper fixtures here also check that wrappers forward
+`get_decode_graph_variants` to the child that runs decode attention.
 """
 
 import ast
@@ -34,6 +37,7 @@ from sglang.srt.layers.attention.minimax_sparse_backend import (
     MiniMaxHybridAttnBackend,
 )
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -180,6 +184,58 @@ class TestWrapperBackendsForwardTranslator(CustomTestCase):
         for name, wrapper in _build_wrappers(runner_ids).items():
             with self.subTest(wrapper=name):
                 self.assertIs(wrapper.runner_ids, runner_ids)
+
+
+class _VariantsInner(_Inner):
+    def __init__(self, variants):
+        super().__init__()
+        self.variants = variants
+
+    def get_decode_graph_variants(self, capture_forward_mode, captured_req_width):
+        return self.variants
+
+
+def _variant_wrappers(owner, other):
+    """Each wrapper with `owner` as the child that runs decode attention."""
+    with get_context().override_server_args(speculative_attention_mode="decode"):
+        hybrid = HybridAttnBackend(_Runner(None), other, owner)
+    return {
+        "HybridAttnBackend": hybrid,
+        "HybridLinearAttnBackend": HybridLinearAttnBackend(owner, other, [0]),
+        "ShortConvHybridAttnBackend": ShortConvHybridAttnBackend(owner, other, [0]),
+        "MiniMaxHybridAttnBackend": MiniMaxHybridAttnBackend(owner, other, [0]),
+        "TboAttnBackend": TboAttnBackend(owner, [other, other]),
+        "DotsSWAMLAAttnBackend": DotsSWAMLAAttnBackend(other),
+        "DotsHybridAttnBackend": DotsHybridAttnBackend(other, other),
+    }
+
+
+# Dots wraps MLA / FlashAttention / DSA backends only, which capture one decode
+# graph; MiniMax's dense side is unverified with partition buckets on ROCm.
+_NOT_FORWARDED = {
+    "DotsSWAMLAAttnBackend",
+    "DotsHybridAttnBackend",
+    "MiniMaxHybridAttnBackend",
+}
+
+
+class TestWrapperBackendsForwardDecodeGraphVariants(CustomTestCase):
+    """Bug regression: the base hook returns None, so a wrapper that does not
+    forward it captures one decode graph and aiter partition buckets turn off."""
+
+    def test_wrappers_report_their_decode_childs_variants(self):
+        owner_variants, other_variants = object(), object()
+        for owner in (owner_variants, None):
+            wrappers = _variant_wrappers(
+                _VariantsInner(owner), _VariantsInner(other_variants)
+            )
+            self.assertEqual(set(wrappers), _derive_wrapper_names())
+            for name, wrapper in wrappers.items():
+                with self.subTest(wrapper=name, owner=owner):
+                    self.assertIs(
+                        wrapper.get_decode_graph_variants(ForwardMode.DECODE, 1),
+                        None if name in _NOT_FORWARDED else owner,
+                    )
 
 
 if __name__ == "__main__":
