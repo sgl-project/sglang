@@ -84,7 +84,10 @@ from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     ModelOptFp8LinearMethod,
     _prepare_nvfp4_weight_bytes,
 )
-from sglang.multimodal_gen.runtime.layers.quantization.mxfp8 import MXFP8Config
+from sglang.multimodal_gen.runtime.layers.quantization.mxfp8 import (
+    ComfyMXFP8LinearMethod,
+    MXFP8Config,
+)
 from sglang.multimodal_gen.runtime.loader.component_loaders import transformer_loader
 from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader import (
     TransformerLoader,
@@ -1195,6 +1198,68 @@ class TestTransformerQuantHelpers(unittest.TestCase):
 
         self.assertIsInstance(method, NPUMXFP8LinearMethod)
 
+    def test_comfy_mxfp8_scales_are_not_interleaved_twice(self):
+        config = MXFP8Config(
+            is_checkpoint_fp8_serialized=True,
+            layer_markers={"blocks.0.attn.out_proj": {"format": "mxfp8"}},
+        )
+        method = config.get_quant_method(
+            LinearBase(input_size=64, output_size=32), "blocks.0.attn.out_proj"
+        )
+        self.assertIsInstance(method, ComfyMXFP8LinearMethod)
+        self.assertIsInstance(method, SRTFp8LinearMethod)
+        # Renaming the SRT hook would silently restore the double interleave.
+        self.assertTrue(
+            hasattr(SRTFp8LinearMethod, "_process_mxfp8_linear_weight_scale")
+        )
+
+        checkpoint_scale = torch.arange(64, dtype=torch.uint8).reshape(32, 2)
+        layer = torch.nn.Module()
+        layer.weight_scale_inv = torch.nn.Parameter(
+            checkpoint_scale.clone(), requires_grad=False
+        )
+        method.mxfp8_dense_backend = SimpleNamespace(
+            is_flashinfer_cutlass=lambda: True,
+            is_flashinfer_cutedsl=lambda: False,
+        )
+
+        method._process_mxfp8_linear_weight_scale(layer)
+
+        self.assertEqual(layer.weight_scale_inv_swizzled.shape, torch.Size([64]))
+        torch.testing.assert_close(
+            layer.weight_scale_inv_swizzled.data, checkpoint_scale.flatten()
+        )
+
+        # scales converted from block-FP8 are row-major, so SRT still interleaves them
+        converted = torch.zeros(32, 2, dtype=torch.uint8)
+        with patch.object(
+            SRTFp8LinearMethod, "_process_mxfp8_linear_weight_scale"
+        ) as srt_hook:
+            method._process_mxfp8_linear_weight_scale(layer, scale_u8=converted)
+        srt_hook.assert_called_once_with(layer, scale_u8=converted)
+
+    def test_config_driven_mxfp8_keeps_srt_scale_processing(self):
+        config = MXFP8Config(is_checkpoint_fp8_serialized=True)
+        method = config.get_quant_method(
+            LinearBase(input_size=64, output_size=32), "blocks.0.attn.out_proj"
+        )
+        self.assertIsNone(config.layer_markers)
+        self.assertIsInstance(method, ComfyMXFP8LinearMethod)
+
+        layer = torch.nn.Module()
+        layer.weight_scale_inv = torch.nn.Parameter(
+            torch.arange(64, dtype=torch.uint8).reshape(32, 2), requires_grad=False
+        )
+        method.mxfp8_dense_backend = SimpleNamespace(
+            is_flashinfer_cutlass=lambda: True,
+            is_flashinfer_cutedsl=lambda: False,
+        )
+        with patch.object(
+            SRTFp8LinearMethod, "_process_mxfp8_linear_weight_scale"
+        ) as srt_hook:
+            method._process_mxfp8_linear_weight_scale(layer)
+        srt_hook.assert_called_once_with(layer, scale_u8=None)
+
     def test_comfy_full_precision_fp8_dequantizes_before_linear(self):
         layer = torch.nn.Module()
         layer.weight = torch.nn.Parameter(
@@ -1422,6 +1487,43 @@ class TestTransformerQuantHelpers(unittest.TestCase):
 
         self.assertIsInstance(quant_config, Fp8Config)
         self.assertEqual(quant_config.ignored_layers, ignored_layers)
+
+    def _resolve_online_quant_config(self, method, ignored_layers):
+        return _resolve_quant_config(
+            hf_config={},
+            server_args=self._make_server_args(
+                quantization=method,
+                quantization_ignored_layers=ignored_layers,
+            ),
+            safetensors_list=[],
+            component_model_path="/unused/component/path",
+        )
+
+    def test_online_quant_configs_accepting_ignored_layers_receive_them(self):
+        # The online methods that honour `ignored_layers` in their
+        # `get_quant_method` must be handed the CLI patterns.
+        ignored_layers = ["blocks.0.attn.out_proj", "condition_proj"]
+        for method in ("fp8", "mxfp4", "convrot_int8"):
+            with self.subTest(method=method):
+                quant_config = self._resolve_online_quant_config(method, ignored_layers)
+                self.assertEqual(quant_config.ignored_layers, ignored_layers)
+
+    def test_online_quant_config_without_ignored_layers_param_does_not_raise(self):
+        # Methods outside the online-quant set must be built without the
+        # kwarg rather than raising TypeError when the CLI flag is set.
+        quant_config = self._resolve_online_quant_config(
+            "mxfp4_npu", ["blocks.0.attn.out_proj"]
+        )
+        self.assertIsNotNone(quant_config)
+        self.assertFalse(hasattr(quant_config, "ignored_layers"))
+
+    def test_unset_ignored_layers_leaves_config_default(self):
+        # Omitting the kwarg when the flag is unset must match the previous
+        # behaviour of passing ignored_layers=None explicitly.
+        for ignored_layers in (None, []):
+            with self.subTest(ignored_layers=ignored_layers):
+                quant_config = self._resolve_online_quant_config("fp8", ignored_layers)
+                self.assertEqual(quant_config.ignored_layers, [])
 
     @patch(
         "sglang.multimodal_gen.runtime.loader.transformer_load_utils.build_nvfp4_config_from_safetensors_list",

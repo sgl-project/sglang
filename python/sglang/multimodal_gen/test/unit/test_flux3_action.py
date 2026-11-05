@@ -37,6 +37,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.f
     targets_to_actions,
     text_ids,
 )
+from sglang.multimodal_gen.test.unit.host_sync_guard import SyncOnRead
 
 DROID_CONFIG = {
     "action_dim": 8,
@@ -228,6 +229,38 @@ def test_action_request_builds_flux3_sampling_params():
     assert extra["options"]["guidance_scale"] == 2.0
 
 
+def test_json_pixel_lists_become_arrays_before_ipc():
+    """Nested pixel lists must reach the server processes as one numpy array."""
+    from sglang.multimodal_gen.runtime.entrypoints.action.protocol import (
+        _pixel_list_to_array,
+    )
+
+    image = np.arange(4 * 5 * 3, dtype=np.uint8).reshape(4, 5, 3)
+    payload = {
+        "input": {
+            "task": "pour the cup",
+            "observation": {
+                "images": {"wrist": image.tolist(), "left": image.tolist()},
+                "observation.images.right": image.tolist(),
+                "state": [0.0] * 8,
+            },
+        },
+    }
+    params = build_action_sampling_params(payload, _server_args(_droid_config()))
+    observation = params.build_request_extra()["vla"]["observation"]
+    for value in (
+        *observation["images"].values(),
+        observation["observation.images.right"],
+    ):
+        assert value.dtype == np.uint8 and np.array_equal(value, image)
+    floats = _pixel_list_to_array((image / 255.0).tolist())
+    assert floats.dtype == np.float64 and np.allclose(floats * 255.0, image)
+    wide = _pixel_list_to_array((image.astype(np.int64) + 256).tolist())
+    assert wide.dtype == np.int64
+    for unchanged in (["a.png", "b.png"], [[1, 2], [3]], [[[1, 2], [3]]]):
+        assert _pixel_list_to_array(unchanged) is unchanged
+
+
 def test_action_metadata_reports_policy_recipe():
     metadata = action_metadata(_server_args(_droid_config()))
     assert metadata["policy_family"] == "flux3_action"
@@ -285,6 +318,9 @@ def test_reference_dit_config_fields_are_translated():
     arch = config.dit_config.arch_config
     assert arch.num_attention_heads == 24
     assert "image" not in arch.in_channels
+    # Every stream keeps an output head and the latent is the video stream.
+    assert arch.out_modes is None
+    assert arch.num_channels_latents == 96
     with pytest.raises(NotImplementedError):
         config.load_policy_config(
             {**DROID_CONFIG, "dit_config": {"depth_late_blocks": 2}}
@@ -377,14 +413,17 @@ def test_json_decoded_pixel_lists_are_accepted():
     from_json = parse_observation({"images": as_json, "state": [0.0] * 8}, config)
     from_uint8 = parse_observation({"images": views, "state": np.zeros(8)}, config)
     assert torch.equal(from_json.canvas, from_uint8.canvas)
-    with pytest.raises(ValueError, match="0, 255"):
-        parse_observation(
-            {
-                "images": {**as_json, "wrist": as_json["wrist"] + 256},
-                "state": [0.0] * 8,
-            },
-            config,
-        )
+    as_lists = {k: v.tolist() for k, v in views.items()}
+    from_lists = parse_observation({"images": as_lists, "state": [0.0] * 8}, config)
+    assert torch.equal(from_lists.canvas, from_uint8.canvas)
+    as_floats = {k: (v / 255.0).tolist() for k, v in views.items()}
+    from_floats = parse_observation({"images": as_floats, "state": [0.0] * 8}, config)
+    assert torch.allclose(from_floats.canvas, from_uint8.canvas)
+    for bad in (as_json["wrist"] + 256, (as_json["wrist"] + 256).tolist()):
+        with pytest.raises(ValueError, match="0, 255"):
+            parse_observation(
+                {"images": {**as_json, "wrist": bad}, "state": [0.0] * 8}, config
+            )
 
 
 def test_missing_camera_is_reported():
@@ -455,6 +494,35 @@ def test_cosmos_unipc_feeds_reference_ticks_and_reuses_the_scheduler():
         assert seen == [999, 937, 833, 624]
 
 
+class _DeviceTickScheduler(FlowUniPCMultistepScheduler):
+    def set_timesteps(self, *args, **kwargs):
+        super().set_timesteps(*args, **kwargs)
+        self.timesteps = self.timesteps.as_subclass(SyncOnRead)
+
+
+def test_cosmos_unipc_reads_ticks_on_the_host_once():
+    generator = torch.Generator().manual_seed(0)
+    start = {"a": torch.randn(1, 3, 2, generator=generator)}
+    velocity = {"a": torch.randn(1, 3, 2, generator=generator)}
+    results = []
+    for scheduler in (
+        _unipc_scheduler(),
+        _DeviceTickScheduler(**_unipc_scheduler().config),
+    ):
+        seen = []
+        result = cosmos_unipc(
+            dict(start),
+            lambda samples, t: (seen.append(t), velocity)[1],
+            scheduler=scheduler,
+            n_steps=4,
+            shift=5.0,
+        )
+        results.append((seen, result["a"].as_subclass(torch.Tensor)))
+    (seen, expected), (device_seen, actual) = results
+    assert device_seen == seen
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
 def test_cosmos_unipc_recovers_x0_on_a_straight_flow():
     """Exact velocities on a straight flow must land on x0 (solver bookkeeping is consistent)."""
     generator = torch.Generator().manual_seed(0)
@@ -478,20 +546,6 @@ def test_cosmos_unipc_recovers_x0_on_a_straight_flow():
 
 
 # ---------------------------------------------------------------- DiT
-def _init_single_process_parallel() -> None:
-    from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-        maybe_init_distributed_environment_and_model_parallel,
-        model_parallel_is_initialized,
-    )
-    from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
-        ensure_distributed_env_defaults,
-    )
-
-    if not model_parallel_is_initialized():
-        ensure_distributed_env_defaults()
-        maybe_init_distributed_environment_and_model_parallel(tp_size=1, sp_size=1)
-
-
 def _tiny_arch() -> Flux3ArchConfig:
     return Flux3ArchConfig(
         hidden_size=64,
@@ -507,12 +561,12 @@ def _tiny_arch() -> Flux3ArchConfig:
 @pytest.mark.skipif(
     not torch.cuda.is_available(), reason="needs the CUDA parallel runtime"
 )
-def test_dit_loads_released_checkpoint_names():
+def test_dit_loads_released_checkpoint_names(request):
     """Released checkpoints load by name; a renamed module or mapping breaks them."""
     from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
     from sglang.multimodal_gen.runtime.models.dits.flux3 import Flux3Transformer
 
-    _init_single_process_parallel()
+    request.getfixturevalue("single_process_model_parallel")
     with torch.device("meta"):
         model = Flux3Transformer(Flux3DiTConfig(arch_config=_tiny_arch()))
     params = set(model.state_dict())
@@ -559,14 +613,14 @@ def test_dit_loads_released_checkpoint_names():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA attention")
-def test_dit_cached_streams_match_full_forward():
+def test_dit_cached_streams_match_full_forward(request):
     """The pipeline's per-caption / per-request caching must not change predictions."""
     from sglang.multimodal_gen.runtime.managers.forward_context import (
         set_forward_context,
     )
     from sglang.multimodal_gen.runtime.models.dits.flux3 import Flux3Transformer
 
-    _init_single_process_parallel()
+    request.getfixturevalue("single_process_model_parallel")
     torch.manual_seed(0)
     model = Flux3Transformer(Flux3DiTConfig(arch_config=_tiny_arch())).cuda().bfloat16()
     for p in model.parameters():
@@ -610,6 +664,43 @@ def test_dit_cached_streams_match_full_forward():
     assert torch.equal(cached["video"], full["x_video"])
     assert torch.equal(cached["act"], full["x_act"])
     assert full["x_act_cond"].shape == (1, 1, 3)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA graphs")
+def test_cuda_graph_replays_match_eager_denoise_steps(request):
+    """Replays with fresh inputs must match eager steps bit for bit."""
+    from sglang.multimodal_gen.runtime.managers.forward_context import (
+        set_forward_context,
+    )
+    from sglang.multimodal_gen.runtime.models.dits.flux3 import Flux3Transformer
+    from sglang.multimodal_gen.runtime.vla.cuda_graph import VLATensorGraphRunner
+
+    request.getfixturevalue("single_process_model_parallel")
+    torch.manual_seed(0)
+    model = Flux3Transformer(Flux3DiTConfig(arch_config=_tiny_arch())).cuda().bfloat16()
+    for p in model.parameters():
+        torch.nn.init.normal_(p, std=0.05)
+    _, ids = pack_video(torch.zeros(1, 96, 2, 2, 3), first_frame=1, fps=15.0)
+    rope = model.rope(ids.cuda())
+
+    def step(x, t, rope):
+        state = model.encode_stream(name="video", x=x, ids=None, timesteps=t, rope=rope)
+        return (state.hidden,)
+
+    runner = VLATensorGraphRunner("test", enabled=True, max_entries=2)
+    with torch.no_grad(), set_forward_context(current_timestep=0, attn_metadata=None):
+        for seed, t in ((1, 0.7), (2, 0.3)):
+            torch.manual_seed(seed)
+            inputs = (
+                torch.randn(1, 12, 96, device="cuda", dtype=torch.bfloat16),
+                torch.full((1,), t, device="cuda"),
+                rope,
+            )
+            (eager,) = step(*inputs)
+            (graph,) = runner.run(step, inputs)
+            assert torch.equal(graph, eager)
+    info = runner.cache_info()
+    assert (info.captures, info.hits, info.failures) == (1, 1, 0)
 
 
 @pytest.mark.parametrize("fnuz", [False, True])
@@ -662,7 +753,7 @@ def test_fp8r_native_format_preserves_values(monkeypatch, fnuz, tuple_output):
     not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 9),
     reason="needs FP8 scaled_mm",
 )
-def test_fp8r_checkpoint_loads_fused_rowwise_linears():
+def test_fp8r_checkpoint_loads_fused_rowwise_linears(request):
     """Native FP8r payloads (E4M3 + per-row scales) must fuse and dequantize consistently."""
     from sglang.multimodal_gen.runtime.models.dits.flux3 import (
         Flux3Fp8RowwiseLinear,
@@ -671,7 +762,7 @@ def test_fp8r_checkpoint_loads_fused_rowwise_linears():
         quantize_fp8_rowwise,
     )
 
-    _init_single_process_parallel()
+    request.getfixturevalue("single_process_model_parallel")
     with torch.device("meta"):
         model = Flux3Transformer(Flux3DiTConfig(arch_config=_tiny_arch()))
     reference = {}

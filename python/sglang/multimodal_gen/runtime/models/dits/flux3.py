@@ -36,7 +36,6 @@ request.
 from __future__ import annotations
 
 import math
-import os
 from typing import Any
 
 import msgspec
@@ -46,15 +45,16 @@ import torch.nn.functional as F
 
 from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
+    can_use_fp8_rowwise,
     can_use_fused_inplace_qknorm_rope,
-    can_use_fused_layernorm_modulate,
+    fp8_rowwise,
     fused_inplace_qknorm_rope,
-    fused_layernorm_modulate_raw,
     fused_packed_silu_mul_bitexact,
-    is_plain_layer_norm,
+    fused_packed_swiglu_fp8_rowwise,
     residual_gate_add,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.dits.flux3 import (
     Flux3ArchConfig,
     Flux3DiTConfig,
@@ -86,6 +86,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
+from sglang.multimodal_gen.runtime.models.dits.common import (
+    layernorm_modulate_bitexact,
+)
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -133,71 +136,50 @@ _LN_MODULATE = BitExactFusionGate("FLUX 3 fused LN+modulate", per_signature=True
 _SWIGLU = BitExactFusionGate("FLUX 3 fused SwiGLU", per_signature=True)
 
 
-def _eager_fast_path_allowed(x: torch.Tensor) -> bool:
-    return (
-        x.is_cuda
-        and x.dtype is torch.bfloat16
-        and not torch.compiler.is_compiling()
-        and not torch.cuda.is_current_stream_capturing()
-    )
+def _fast_path_allowed(x: torch.Tensor) -> bool:
+    return x.is_cuda and x.dtype is torch.bfloat16 and not torch.compiler.is_compiling()
 
 
 def _norm_modulate(
     norm: nn.LayerNorm, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
 ) -> torch.Tensor:
     """``(1 + scale) * LN(x) + shift`` with ``(B, 1, D)`` modulation."""
-    scale_row, shift_row = scale[:, 0], shift[:, 0]
-    if (
-        _LN_MODULATE.disabled
-        or not _eager_fast_path_allowed(x)
-        or not is_plain_layer_norm(norm, x.shape[-1])
-        or not can_use_fused_layernorm_modulate(x, scale_row, shift_row)
-    ):
+
+    def reference():
         return (1 + scale) * norm(x) + shift
-    sig = (x.device, x.shape[0], x.shape[-1], norm.eps)
-    try:
-        out = fused_layernorm_modulate_raw(x, scale_row, shift_row, norm.eps)
-    except Exception as exc:
-        _LN_MODULATE.on_exception(exc, logger=logger)
-        return (1 + scale) * norm(x) + shift
-    if _LN_MODULATE.is_verified(sig):
-        return out
-    return _LN_MODULATE.accept_or_fallback(
-        out,
-        (1 + scale) * norm(x) + shift,
-        sig=sig,
-        logger=logger,
-        mismatch_msg="FLUX 3 fused LN+modulate is not bit-exact here; using eager",
+
+    if not _fast_path_allowed(x):
+        return reference()
+    return layernorm_modulate_bitexact(
+        _LN_MODULATE,
+        norm,
+        x,
+        scale[:, 0],
+        shift[:, 0],
+        reference,
+        sig=(x.device, x.shape[0], x.shape[-1], norm.eps),
     )
 
 
 def _swiglu(packed: torch.Tensor) -> torch.Tensor:
     """``silu(gate) * value`` of a packed ``[gate | value]`` projection."""
     gate, value = packed.chunk(2, dim=-1)
-    if _SWIGLU.disabled or not _eager_fast_path_allowed(packed):
+    if not _fast_path_allowed(packed):
         return F.silu(gate) * value
-    sig = (packed.device, packed.shape[-1], packed.stride(-2))
-    try:
-        out = fused_packed_silu_mul_bitexact(packed)
-    except Exception as exc:
-        _SWIGLU.on_exception(exc, logger=logger)
-        return F.silu(gate) * value
-    if _SWIGLU.is_verified(sig):
-        return out
-    return _SWIGLU.accept_or_fallback(
-        out,
-        F.silu(gate) * value,
-        sig=sig,
+    return _SWIGLU.run(
+        lambda: fused_packed_silu_mul_bitexact(packed),
+        lambda: F.silu(gate) * value,
+        sig=(packed.device, packed.shape[-1], packed.stride(-2)),
         logger=logger,
-        mismatch_msg="FLUX 3 fused SwiGLU is not bit-exact here; using eager",
     )
 
 
+# Not apply_qk_norm_rope: Flux3RMSNorm has neither RMSNorm's weight nor its eps,
+# and the eager fallback is Flux3's own fp32 pair rotation.
 def _fused_qknorm_rope_enabled(q: torch.Tensor, head_dim: int) -> bool:
     return (
-        _eager_fast_path_allowed(q)
-        and os.getenv("SGLANG_ENABLE_FUSED_QKNORM_ROPE", "1").lower()
-        not in ("0", "false", "off", "no")
+        _fast_path_allowed(q)
+        and envs.SGLANG_ENABLE_FUSED_QKNORM_ROPE
         and can_use_fused_inplace_qknorm_rope(
             head_dim=head_dim,
             rope_dim=head_dim,
@@ -292,7 +274,7 @@ class Flux3Fp8RowwiseLinear(nn.Module):
     parallel linears so the module can replace either kind.
     """
 
-    # _scaled_mm needs M padded to a multiple of 16.
+    # Preserve the checkpoint inference path's row padding convention.
     ROW_ALIGNMENT = 16
 
     def __init__(
@@ -328,17 +310,51 @@ class Flux3Fp8RowwiseLinear(nn.Module):
         flat = x.reshape(-1, self.in_features).contiguous()
         rows = flat.shape[0]
         pad = -rows % self.ROW_ALIGNMENT
-        if pad:
-            flat = F.pad(flat, (0, 0, 0, pad))
-        activation, activation_scale = quantize_fp8_rowwise(flat)
-        if self.weight.dtype == torch.float8_e4m3fnuz:
-            from sglang.srt.layers.quantization.fp8_utils import (
-                normalize_e4m3fn_to_e4m3fnuz,
-            )
+        if can_use_fp8_rowwise(flat):
+            activation, activation_scale = fp8_rowwise(flat, self.ROW_ALIGNMENT)
+        else:
+            if pad:
+                flat = F.pad(flat, (0, 0, 0, pad))
+            activation, activation_scale = quantize_fp8_rowwise(flat)
+            # ROCm-only: can_use_fp8_rowwise() requires torch.version.hip is None,
+            # so the fnuz weights only ever reach this branch.
+            if self.weight.dtype == torch.float8_e4m3fnuz:
+                from sglang.srt.layers.quantization.fp8_utils import (
+                    normalize_e4m3fn_to_e4m3fnuz,
+                )
 
-            activation, activation_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
-                activation, activation_scale
+                activation, activation_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                    activation, activation_scale
+                )
+        return self._forward_quantized(activation, activation_scale, leading)
+
+    def forward_swiglu(self, packed: torch.Tensor):
+        """Fuse packed BF16 SwiGLU with this layer's activation quantization."""
+        if not (
+            packed.is_cuda
+            and torch.version.hip is None
+            and packed.dtype == torch.bfloat16
+            and packed.ndim == 3
+            and packed.shape[-1] == 2 * self.in_features
+            and 0 < self.in_features <= 16384
+            and packed.stride(-1) == 1
+            and packed.stride(1) >= packed.shape[-1]
+            and (
+                packed.shape[0] <= 1
+                or packed.stride(0) == packed.shape[1] * packed.stride(1)
             )
+            and self.weight.dtype == torch.float8_e4m3fn
+            and torch.cuda.get_device_capability(packed.device) >= (8, 9)
+            and not torch.compiler.is_compiling()
+        ):
+            return self(_swiglu(packed))
+        activation, activation_scale = fused_packed_swiglu_fp8_rowwise(
+            packed, self.ROW_ALIGNMENT
+        )
+        return self._forward_quantized(activation, activation_scale, packed.shape[:-1])
+
+    def _forward_quantized(self, activation, activation_scale, leading):
+        rows = math.prod(leading)
         out = torch._scaled_mm(
             activation,
             self.weight.T,
@@ -542,7 +558,11 @@ class Flux3Block(nn.Module):
             q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
             attended = self.attn(q, k, v, attn_mask_meta=sp.attn_mask_meta)
         attended = attended.reshape(batch, length, self.local_hidden)
-        out = self.attn_out(attended)[0] + self.mlp_out(_swiglu(mlp))[0]
+        if isinstance(self.mlp_out, Flux3Fp8RowwiseLinear):
+            mlp_out = self.mlp_out.forward_swiglu(mlp)[0]
+        else:
+            mlp_out = self.mlp_out(_swiglu(mlp))[0]
+        out = self.attn_out(attended)[0] + mlp_out
         if self.tp_size > 1:
             # One reduce of the summed partials, not one per branch (the order
             # the FLUX 3 reference TP uses).
@@ -647,40 +667,43 @@ class Flux3Transformer(BaseDiT, LayerwiseOffloadableModuleMixin):
             if arch.vec_in_dim is not None
             else None
         )
+        self.quant_config = quant_config
         streams = sorted(self.in_channels)
         self.early_stream_modulations = nn.ModuleDict(
-            {m: Flux3Modulation(hidden) for m in (*streams, TEXT_STREAM)}
+            {
+                m: self._make_modulation(f"early_stream_modulations.{m}")
+                for m in (*streams, TEXT_STREAM)
+            }
         )
         self.single_stream_modulations = nn.ModuleDict(
-            {m: Flux3Modulation(hidden) for m in (*streams, TEXT_STREAM)}
+            {
+                m: self._make_modulation(f"single_stream_modulations.{m}")
+                for m in (*streams, TEXT_STREAM)
+            }
         )
-
-        def block(prefix: str) -> Flux3Block:
-            return Flux3Block(
-                hidden,
-                arch.num_attention_heads,
-                arch.mlp_ratio,
-                quant_config=quant_config,
-                supported_attention_backends=self._supported_attention_backends,
-                prefix=prefix,
-            )
-
         self.content_mode_blocks = nn.ModuleDict(
             {
                 m: nn.ModuleList(
-                    block(f"content_mode_blocks.{m}.{i}") for i in range(arch.depth)
+                    self._make_block(f"content_mode_blocks.{m}.{i}")
+                    for i in range(arch.depth)
                 )
                 for m in streams
             }
         )
         self.txt_mode_blocks = nn.ModuleList(
-            block(f"txt_mode_blocks.{i}") for i in range(arch.depth)
+            self._make_block(f"txt_mode_blocks.{i}") for i in range(arch.depth)
         )
         self.single_blocks = nn.ModuleList(
-            block(f"single_blocks.{i}") for i in range(arch.depth_single_blocks)
+            self._make_block(f"single_blocks.{i}")
+            for i in range(arch.depth_single_blocks)
         )
+        out_modes = self.in_channels if arch.out_modes is None else arch.out_modes
         self.final_layer = nn.ModuleDict(
-            {m: Flux3LastLayer(hidden, c) for m, c in self.in_channels.items()}
+            {
+                m: Flux3LastLayer(hidden, c)
+                for m, c in self.in_channels.items()
+                if m in out_modes
+            }
         )
         self.layer_names = [
             "txt_mode_blocks",
@@ -688,6 +711,23 @@ class Flux3Transformer(BaseDiT, LayerwiseOffloadableModuleMixin):
             "single_blocks",
         ]
         self.__post_init__()
+
+    # ------------------------------------------------------------------ factories
+    # Subclasses swap the block / modulation implementation; the module tree
+    # (and therefore the checkpoint layout) stays the same.
+    def _make_modulation(self, prefix: str) -> nn.Module:
+        del prefix
+        return Flux3Modulation(self.hidden_size)
+
+    def _make_block(self, prefix: str) -> nn.Module:
+        return Flux3Block(
+            self.hidden_size,
+            self.num_attention_heads,
+            self.arch.mlp_ratio,
+            quant_config=self.quant_config,
+            supported_attention_backends=self._supported_attention_backends,
+            prefix=prefix,
+        )
 
     # ------------------------------------------------------------------ pieces
     @property
@@ -845,10 +885,11 @@ class Flux3Transformer(BaseDiT, LayerwiseOffloadableModuleMixin):
                 )
             )
             names.append(key)
-        outputs = self.denoise(
-            context=context, streams=streams, targets=[s.name for s in streams]
-        )
-        return {key: outputs[s.name] for key, s in zip(names, streams)}
+        targets = [s.name for s in streams if s.name in self.final_layer]
+        outputs = self.denoise(context=context, streams=streams, targets=targets)
+        return {
+            key: outputs[s.name] for key, s in zip(names, streams) if s.name in outputs
+        }
 
 
 def _compute_dtype(linear: nn.Module) -> torch.dtype:

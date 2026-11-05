@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 from transformers import PretrainedConfig
 
+from sglang.srt.layers.layer_boundary import layer_stack
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -79,12 +80,12 @@ class Step3p5AMultiTokenPredictor(nn.Module):
         self.hnorm = GemmaRMSNorm(config.hidden_size, config.rms_norm_eps)
         self.eh_proj = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
         self.shared_head = SharedHead(config=config, quant_config=quant_config)
-        self.mtp_block = Step3p5DecoderLayer(
-            config=config,
-            layer_id=layer_id,
-            prefix=f"{prefix}.mtp_block",
-            is_nextn=True,
-        )
+        with layer_stack():
+            self.mtp_block = Step3p5DecoderLayer(
+                config=config,
+                layer_id=layer_id,
+                prefix=f"{prefix}.mtp_block",
+            )
         self.lm_head = self.shared_head.head
 
     def forward(

@@ -20,6 +20,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.convrot_int8_conf
 )
 from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
     QwenImageCrossAttention,
+    _gather_modulation_shards,
     _joint_qkv_head_views,
     _project_qkv_into_joint_buffers,
     _sync_into_buffer,
@@ -38,6 +39,7 @@ SEQ_IMG = 13
 QWEN_IMAGE = "sglang.multimodal_gen.runtime.models.dits.qwen_image"
 SP_WORLD_SIZE = f"{QWEN_IMAGE}.get_sp_world_size"
 PROJECT_INTO_JOINT_BUFFERS = f"{QWEN_IMAGE}._project_qkv_into_joint_buffers"
+TP_ALL_GATHER = f"{QWEN_IMAGE}.tensor_model_parallel_all_gather"
 FUSED_INPLACE_QKNORM = (
     "sglang.multimodal_gen.runtime.layers.layernorm.can_use_fused_inplace_qknorm"
 )
@@ -474,6 +476,33 @@ class TestQwenImageJointQkvBuffersConvRot(_JointQkvCase):
         self.assertTrue(eligible(hidden, encoder))
         self.assertFalse(eligible(hidden.half(), encoder.half()))
         self.assertFalse(eligible(hidden, encoder.half()))
+
+
+class TestModulationGather(CustomTestCase):
+    def test_gather_matches_full_projection(self):
+        tp_size, dim = 2, 8
+        for num_img, num_txt in ((1, 1), (2, 1)):  # 2:1 is zero_cond_t
+            with self.subTest(num_img=num_img, num_txt=num_txt):
+                torch.manual_seed(0)
+                w_img, w_txt = torch.randn(6 * dim, dim), torch.randn(6 * dim, dim)
+                x_img, x_txt = torch.randn(num_img, dim), torch.randn(num_txt, dim)
+
+                def local(rank):
+                    rows = slice(
+                        rank * 6 * dim // tp_size, (rank + 1) * 6 * dim // tp_size
+                    )
+                    return x_img @ w_img[rows].T, x_txt @ w_txt[rows].T
+
+                shards = [torch.cat(local(rank), dim=0) for rank in range(tp_size)]
+
+                def fake_all_gather(tensor, dim=-1):
+                    self.assertTrue(torch.equal(tensor, shards[0]))
+                    return torch.cat(shards, dim=dim)
+
+                with patch(TP_ALL_GATHER, fake_all_gather):
+                    img, txt = _gather_modulation_shards(*local(0))
+                torch.testing.assert_close(img, x_img @ w_img.T)
+                torch.testing.assert_close(txt, x_txt @ w_txt.T)
 
 
 if __name__ == "__main__":

@@ -81,6 +81,13 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
             # lacks that DCP path (TypeError: unexpected kwarg 'causal_seqs').
             overrides["speculative_attention_mode"] = "decode"
 
+        if get_platform().is_npu:
+            overrides.update(
+                dcp_comm_backend="a2a",
+                dcp_replicate_q_proj=False,
+            )
+            return overrides
+
         prefill_backend, decode_backend = attention_backends_of(cfg)
         if decode_backend == "cutedsl_mla" or decode_backend is None:
             _require_kimi_k3_cutedsl_dcp_support()
@@ -91,21 +98,6 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
             overrides.update(
                 prefill_attention_backend="trtllm_mla",
                 decode_attention_backend="cutedsl_mla",
-            )
-        elif decode_backend == "tokenspeed_mla":
-            logger.info(
-                "Kimi-K3 DCP overrides attention backends: "
-                f"prefill={prefill_backend!r}, decode={decode_backend!r} -> "
-                "'tokenspeed_mla'."
-            )
-            logger.info(
-                "Kimi-K3 DCP with tokenspeed mla backend overrides KV cache dtype: "
-                f"{cfg.kv_cache_dtype!r} -> 'fp8_e4m3'."
-            )
-            overrides.update(
-                prefill_attention_backend="tokenspeed_mla",
-                decode_attention_backend="tokenspeed_mla",
-                kv_cache_dtype="fp8_e4m3",
             )
         elif decode_backend == "aiter":
             _require_kimi_k3_aiter_gluon_dcp_support()
@@ -123,7 +115,7 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
             )
         else:
             raise AssertionError(
-                f"Decode attention backend for Kimi-K3 DCP must be 'cutedsl_mla', 'tokenspeed_mla' or 'aiter', got {decode_backend!r}."
+                f"Decode attention backend for Kimi-K3 DCP must be 'cutedsl_mla' or 'aiter', got {decode_backend!r}."
             )
 
         if cfg.dcp_replicate_q_proj is None and cfg.dcp_comm_backend in (
@@ -167,7 +159,7 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
         # that still needs declaring -- else verify stays on the prefill backend,
         # whose host-side plan (flashinfer by default) forces a per-step D2H.
         _, backend = attention_backends_of(cfg)
-    if _dspark_verify_on_decode_backend(backend, q_len, cfg.kv_cache_dtype):
+    if _dspark_verify_on_decode_backend(backend, q_len):
         overrides["speculative_attention_mode"] = "decode"
         logger.info(
             "Kimi-K3 DSPARK on SM100/SM103: decode/verify attention backend "
@@ -184,7 +176,19 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
     return overrides
 
 
-@_register_for("KimiK3ForConditionalGeneration")
+@_register_for("KimiK31ForConditionalGeneration")
+def _kimi_k31_overrides(server_args: Any, hf_config: Any) -> dict:
+    cfg = resolving_view(server_args)
+    if cfg.dcp_size > 1:
+        raise ValueError(
+            f"Kimi-K3.1 does not support --dcp-size > 1 yet (got {cfg.dcp_size})."
+        )
+    if cfg.enable_unified_memory:
+        raise ValueError("Kimi-K3.1 does not support --enable-unified-memory yet.")
+    return {}
+
+
+@_register_for("KimiK3ForConditionalGeneration", "KimiK31ForConditionalGeneration")
 def _kimi_k3_moe_runner_overrides(server_args: Any, hf_config: Any) -> dict:
     # MoE runner default, independent of the attention-backend gate above.
     # trtllm-gen fused MoE (flashinfer_mxfp4) beats marlin on both the decode
