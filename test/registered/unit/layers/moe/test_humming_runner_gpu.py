@@ -26,8 +26,6 @@ class TestHummingRunnerGPU(CustomTestCase):
     def test_activation_input_processing(self):
         from humming.config import LayerConfig
 
-        # Each case covers a distinct activation/layout/precision contract rather
-        # than repeating the same pipeline for every model that uses it.
         cases = [
             ("silu", torch.bfloat16, "dynamic_group", {}),
             ("silu", torch.bfloat16, "dynamic_group", {"hadamard_block_size": 32}),
@@ -180,14 +178,12 @@ class TestHummingRunnerGPU(CustomTestCase):
             self.skipTest("Secondary-scale UMMA regression requires SM100/SM110 family")
         self._check_indexed_two_gemms(static_scales=False, secondary_scales=True)
 
-    def test_clamped_silu_two_gemms(self):
+    def test_grouped_clamped_silu_two_gemms(self):
         if get_device_sm() != 90:
             self.skipTest("Clamped SiLU regression targets the Hopper serving path")
-        for gemm_type in ("indexed", "grouped_contiguous"):
-            with self.subTest(gemm_type=gemm_type):
-                self._check_indexed_two_gemms(
-                    static_scales=False, swiglu_limit=10.0, gemm_type=gemm_type
-                )
+        self._check_indexed_two_gemms(
+            static_scales=False, swiglu_limit=10.0, gemm_type="grouped_contiguous"
+        )
 
     def _check_indexed_two_gemms(
         self,

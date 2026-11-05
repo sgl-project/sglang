@@ -10,13 +10,7 @@ from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 def get_humming_activation(
     config: MoeRunnerConfig, dtype: torch.dtype
 ) -> dict[str, str]:
-    """Preserve the activation dtype boundary before Hadamard/quantization.
-
-    Custom expressions compute a gated activation from float arguments a and b.
-    Their result is rounded to the GEMM output dtype, just like a materialized
-    activation. Layout is explicit because gate_up_interleaved historically
-    applies only to specific SwiGLU paths, not every FusedMoE weight layout.
-    """
+    """Build a gated CUDA expression with materialized FP16/BF16 rounding."""
     if not config.is_gated:
         raise ValueError("Humming MoE input processing requires a gated activation")
     if dtype == torch.bfloat16:

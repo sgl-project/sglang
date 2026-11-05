@@ -3336,24 +3336,14 @@ class KimiK3LinearForCausalLM(nn.Module):
                 )
                 if expert_entry is not None:
                     param_name, weight_name, expert_id, shard_id = expert_entry
-                    # Preserve the checkpoint-native packed name for Humming.
-                    # Native Mxfp4MoEMethod registers the same fused parameter
-                    # without the `_packed` suffix, so resolve that alias only
-                    # when the exact parameter is absent.
+                    # Prefer Humming's packed name, then the native MXFP4 alias.
                     mapped_name = name.replace(weight_name, param_name)
-                    candidate_names = [mapped_name]
-                    if mapped_name.endswith("_weight_packed"):
-                        candidate_names.append(mapped_name.removesuffix("_packed"))
-                    resolved_name = next(
-                        (
-                            candidate_name
-                            for candidate_name in candidate_names
-                            if candidate_name in params_dict
-                        ),
-                        None,
-                    )
-                    if resolved_name is not None:
-                        name = resolved_name
+                    if mapped_name not in params_dict and mapped_name.endswith(
+                        "_weight_packed"
+                    ):
+                        mapped_name = mapped_name.removesuffix("_packed")
+                    if mapped_name in params_dict:
+                        name = mapped_name
                         param = params_dict[name]
                         weight_loader = param.weight_loader
                         weight_loader(
@@ -3366,7 +3356,7 @@ class KimiK3LinearForCausalLM(nn.Module):
                     elif name.endswith((".weight_packed", ".weight_scale")):
                         raise RuntimeError(
                             "Unable to map required Kimi-K3 expert tensor "
-                            f"{name!r}; expected one of {candidate_names!r}"
+                            f"{name!r}; expected {mapped_name!r}"
                         )
                 else:
                     if (

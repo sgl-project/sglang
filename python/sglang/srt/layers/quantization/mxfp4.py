@@ -389,7 +389,6 @@ class Mxfp4Config(QuantizationConfig):
 
 
 class Mxfp4MoEMethod(FusedMoEMethodBase):
-    # Set in __init__; methods built with __new__ stay on the non-Humming paths.
     use_humming = False
 
     def __init__(
@@ -485,14 +484,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 intermediate_size_per_partition_after_pad
                 - layer.intermediate_size_per_partition
             )
-        elif self.use_deep_gemm or self.use_mega_moe:
-            # DeepGEMM fp8_fp4 grouped GEMM consumes the checkpoint layout
-            # directly (packed e2m1 K-major + ue8m0 g32 scales); no padding.
-            pass
-        elif self.use_humming:
-            # Humming's MXFP4 schema consumes the checkpoint layout directly.
-            # Do not inherit generic Triton padding merely because
-            # triton-kernels is installed in the runtime image.
+        elif self.use_deep_gemm or self.use_mega_moe or self.use_humming:
+            # These backends consume the unpadded MXFP4 checkpoint layout.
             pass
         elif get_platform().is_sm100:
             if self.use_flashinfer:
@@ -676,9 +669,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 prepare_humming_moe_layer,
             )
 
-            # Preserve the checkpoint's packed E2M1 weights and E8M0 group-32
-            # scales. Humming's native MXFP4 schema only changes tensor views
-            # and kernel layout; it must run before the generic BF16 fallback.
+            # Prepare native MXFP4 before the generic BF16 fallback.
             prepare_humming_moe_layer(layer, {"quant_method": "mxfp4"})
             layer._mxfp4_backend = "humming"
             return
@@ -1645,8 +1636,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         from sglang.srt.layers.moe.topk import TopKOutputChecker
 
         if self.use_humming:
-            # Keep this before reading `.topk_output`: non-standard dispatchers
-            # do not expose that field, while MoeRunner owns the conversion.
+            # Non-standard dispatchers need MoeRunner's conversion first.
             from sglang.srt.layers.moe.moe_runner.humming import (
                 HummingMoeQuantInfo,
             )
