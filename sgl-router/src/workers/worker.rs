@@ -3,7 +3,7 @@
 
 use crate::discovery::{ModelId, WorkerId, WorkerMode};
 use crate::health::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
-use sglang_api_types::runtime::v1::sglang_service_client::SglangServiceClient;
+use sglang_api_types::api::v1::sglang_service_client::SglangServiceClient;
 use sglang_processor::openai::OpenAiSettings;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
@@ -65,7 +65,7 @@ impl From<WireProtocol> for EngineProfile {
 }
 
 /// The engine's own default message cap (`DEFAULT_GRPC_MAX_MESSAGE_SIZE` in
-/// rust/sglang-grpc), so the router never rejects what the engine accepts.
+/// rust/sglang-server/src/api_server/grpc/app.rs).
 pub const GRPC_MAX_MESSAGE_BYTES: usize = 64 << 20;
 
 /// A client that dials on first use; only an unparsable address yields `None`.
