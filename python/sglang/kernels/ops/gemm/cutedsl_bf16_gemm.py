@@ -776,27 +776,18 @@ class TgvGemmCuteExtKernel:
                 tcgen05.commit(bar_mma_epilog, commit_mask, self.cta_group)
 
         # ---- TMEM dealloc: wait for own EPILOG's tcgen05.ld to retire, free.
-        # The release arrival below must land in phase 1 of bar_tmem_alloc. This
-        # warp has not waited for phase 0 (the allocation hand-off): if two or
-        # more EPILOG warps have not yet made their phase-0 arrival at :796 when
-        # we get here, our arrival counts toward phase 0, phase 0 stays open and
-        # mbarrier_wait(bar_tmem_alloc, 1) returns at once (parity 1 then names
-        # the complete preceding phase), so the dealloc would run before the
-        # EPILOG's tcgen05.ld. In the 2-CTA non-leader CTA there is no K-loop
-        # between the two arrivals, so this is a sub-microsecond race. Observe
-        # phase 0 first (same fix as flashinfer PR 7443 for the split-K kernel).
+        # The release arrival must land in phase 1. Made while phase 0 is still
+        # open (an EPILOG warp has not arrived yet), it counts toward phase 0 and
+        # the parity-1 wait passes before the EPILOG's tcgen05.ld. Same fix as
+        # flashinfer PR 7443 for the split-K kernel.
         cute.arch.mbarrier_wait(bar_tmem_alloc, 0)
         cute.arch.mbarrier_arrive(bar_tmem_alloc)  # phase 1: 32 of 160
         cute.arch.mbarrier_wait(bar_tmem_alloc, 1)
         if cutlass.const_expr(self.use_2cta):
-            # tcgen05.dealloc.cta_group::2 is one collective operation of the CTA
-            # pair. The PTX ISA (Tensor Memory Allocation and Management
-            # Instructions: tcgen05.alloc, tcgen05.dealloc,
-            # tcgen05.relinquish_alloc_permit) says the issuing warp and the peer
-            # CTA's warp "must synchronize Tensor Memory accesses before
-            # attempting to collectively deallocate". Rendezvous with the peer MMA warp so
-            # neither CTA's EPILOG can still be loading when the pair's columns
-            # are freed, as cutlass's TmemAllocator.free does.
+            # tcgen05.dealloc.cta_group::2 is collective: the PTX ISA requires the
+            # issuing warp and the peer CTA's warp to synchronize their TMEM
+            # accesses first. Rendezvous with the peer MMA warp, as
+            # cutlass.utils.TmemAllocator.free does.
             cute.arch.mbarrier_arrive(bar_tmem_dealloc, cta_rank_in_cluster ^ 1)
             cute.arch.mbarrier_wait(bar_tmem_dealloc, 0)
         cute.arch.dealloc_tmem(tmem_ptr, num_tmem_cols, is_two_cta=self.use_2cta)
