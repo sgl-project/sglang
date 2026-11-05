@@ -1396,11 +1396,15 @@ def install_megakernel(
 
     tokens = _tokens_per_request()
     binding = _binding_class(hf_config.architectures)(model=model)
+    graph = get_exec().graph.cuda_graph_config
     context = BuildContext(
         widths=tuple(range(tokens, spec.max_rows + 1, tokens)),
         tokens_per_request=tokens,
         deadline_s=deadline_s(get_device().watchdog_timeout),
         binding=binding,
+        capture_widths=(
+            None if graph is None or graph.decode.bs is None else tuple(graph.decode.bs)
+        ),
     )
     start, free_before = time.perf_counter(), torch.cuda.mem_get_info()[0]
     built = spec.build(model, hf_config, context)

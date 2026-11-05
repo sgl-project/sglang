@@ -208,3 +208,7 @@ class TestKimiNativeMla(unittest.TestCase):
             metadata.global_seq_lens_k = None
             with self.assertRaisesRegex(RuntimeError, "global lengths"):
                 binding._hybrid_step(backend, batch)
+
+
+if __name__ == "__main__":
+    unittest.main()

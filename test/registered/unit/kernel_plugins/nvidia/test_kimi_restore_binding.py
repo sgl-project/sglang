@@ -233,3 +233,67 @@ def test_replay_hook_keeps_absent_and_other_bindings_unchanged():
     model.__dict__["_megakernel"] = SimpleNamespace(binding=other)
     mb.prepare_megakernel_replay(model)
     other.prepare_replay.assert_not_called()
+
+
+@pytest.mark.parametrize("q", [1, 6])
+@pytest.mark.parametrize("configured", [None, [24, 37, 96]])
+def test_install_keeps_request_capture_buckets_distinct_from_token_rows(
+    monkeypatch, q, configured
+):
+    configured = None if configured is None else list(configured)
+    contexts = []
+
+    def build(model, hf_config, context):
+        contexts.append(context)
+        return SimpleNamespace(
+            widths=context.widths,
+            draft_sampler=None,
+            draft_loop=None,
+            draft_extend=None,
+            begin_draft_round=None,
+            graph_variants=None,
+            speculative_runtime_hooks=None,
+            summary=lambda: "CPU capture-width contract",
+            plan=lambda *args, **kwargs: None,
+        )
+
+    spec = SimpleNamespace(
+        name="CPU capture-width contract",
+        max_rows=64,
+        build=build,
+        prepare=None,
+        numerics=SimpleNamespace(kind=SimpleNamespace(value="test")),
+    )
+    graph = SimpleNamespace(decode=SimpleNamespace(bs=configured))
+    monkeypatch.setattr(mb, "megakernel_enabled", lambda: True)
+    monkeypatch.setattr(mb, "_find_spec_on_every_rank", lambda **kwargs: spec)
+    monkeypatch.setattr(mb, "_requirement_reasons", lambda **kwargs: [])
+    monkeypatch.setattr(mb, "_model_disable_reasons", lambda **kwargs: [])
+    monkeypatch.setattr(mb, "_gather_reasons", lambda reasons: reasons)
+    monkeypatch.setattr(mb, "_tokens_per_request", lambda: q)
+    monkeypatch.setattr(mb, "get_device", lambda: SimpleNamespace(watchdog_timeout=30))
+    monkeypatch.setattr(
+        mb,
+        "get_exec",
+        lambda: SimpleNamespace(graph=SimpleNamespace(cuda_graph_config=graph)),
+    )
+    monkeypatch.setattr(mb, "megakernel_agree", lambda *args, **kwargs: None)
+    monkeypatch.setattr(mb, "_decode_graphs_enabled", lambda: False)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: (0, 0))
+    mb.install_megakernel(
+        model=torch.nn.Module(),
+        hf_config=SimpleNamespace(architectures=["KimiK3ForConditionalGeneration"]),
+        capture_tail_hooks=[],
+        is_draft=False,
+    )
+    context = contexts[0]
+    assert context.tokens_per_request == q
+    assert context.widths == tuple(range(q, 65, q))
+    assert context.capture_widths == (None if configured is None else (24, 37, 96))
+    if configured is not None:
+        configured.append(48)
+        assert context.capture_widths == (24, 37, 96)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__]))

@@ -192,3 +192,7 @@ def test_cute_never_invents_a_missing_global_causal_bound():
     ):
         native_mla_decode(query, output, **args)
     kernel.assert_not_called()
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__]))

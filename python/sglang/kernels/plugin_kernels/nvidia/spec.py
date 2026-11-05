@@ -86,6 +86,10 @@ class BuildContext(msgspec.Struct, frozen=True):
     deadline_s: float  # every cross-GPU wait's deadline, below --watchdog-timeout
     # SGLang's runtime state for this model (sglang.srt.kernel_plugins.nvidia.binding)
     binding: Any = None
+    # Configured request buckets before KV sizing, unlike ``widths`` token rows.
+    # Providers convert requests to token rows once. Later pool-clamped buckets
+    # may be absent here and must not trigger new resource allocation at replay.
+    capture_widths: Optional[tuple[int, ...]] = None
 
 
 class Step(msgspec.Struct, frozen=True):
