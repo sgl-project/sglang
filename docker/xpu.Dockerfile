@@ -20,42 +20,21 @@ ARG SG_LANG_KERNEL_SOURCE=wheel
 
 USER root
 
-# Pin Level-Zero UMD + IGC (rolling PPA once faulted libze on B580; see sgl-kernel-xpu#296).
-# Keep in lockstep with the host xe KMD; override via --build-arg.
-ARG COMPUTE_RUNTIME_VERSION=26.27.39122.11
-ARG IGC_VERSION=2.38.2+22051
-ARG GMM_VERSION=22.10.0
+# Versioned Intel GPU stack instead of the base image's rolling PPA (see sgl-kernel-xpu#296).
+ARG INTEL_OMIX_VERSION=0.4.1
 
-RUN apt-get update && apt-get install -y software-properties-common curl && \
-    add-apt-repository -y ppa:kobuk-team/intel-graphics && \
-    apt-get update && \
-    # Loader + media/metrics from the PPA; the GPU driver is pinned below.
+RUN rm -f /etc/apt/sources.list.d/kobuk-team-ubuntu-intel-graphics-*.sources && \
+    apt-get update && apt-get install -y curl gpg && \
+    curl -fsSL https://repositories.intel.com/gpu/intel-graphics.key | \
+        gpg --yes --dearmor --output /usr/share/keyrings/intel-graphics.gpg && \
+    echo "deb [arch=amd64 signed-by=/usr/share/keyrings/intel-graphics.gpg] https://repositories.intel.com/gpu/ubuntu noble/intel-omix/${INTEL_OMIX_VERSION} unified" \
+        > /etc/apt/sources.list.d/intel-gpu-noble.list && \
+    # Fail here if the omix channel can't be fetched.
+    apt-get update -o APT::Update::Error-Mode=any && \
     apt-get install -y \
-        libze1 intel-metrics-discovery clinfo intel-gsc \
+        intel-gpu-compute intel-metrics-discovery clinfo \
         intel-media-va-driver-non-free libmfx-gen1 libvpl2 libvpl-tools libva-glx2 va-driver-all vainfo \
-        libze-dev \
         ffmpeg && \
-    cd /tmp && \
-    igc_url="https://github.com/intel/intel-graphics-compiler/releases/download/v${IGC_VERSION%%+*}" && \
-    cr_url="https://github.com/intel/compute-runtime/releases/download/${COMPUTE_RUNTIME_VERSION}" && \
-    # IGC first: libze-intel-gpu1 / intel-opencl-icd depend on its exact version.
-    curl -fsSL -O "${igc_url}/intel-igc-core-2_${IGC_VERSION}_amd64.deb" && \
-    curl -fsSL -O "${igc_url}/intel-igc-opencl-2_${IGC_VERSION}_amd64.deb" && \
-    curl -fsSL -O "${cr_url}/libze-intel-gpu1_${COMPUTE_RUNTIME_VERSION}-0_amd64.deb" && \
-    curl -fsSL -O "${cr_url}/intel-opencl-icd_${COMPUTE_RUNTIME_VERSION}-0_amd64.deb" && \
-    curl -fsSL -O "${cr_url}/intel-ocloc_${COMPUTE_RUNTIME_VERSION}-0_amd64.deb" && \
-    curl -fsSL -O "${cr_url}/libigdgmm12_${GMM_VERSION}_amd64.deb" && \
-    apt-get install -y --allow-downgrades \
-        ./intel-igc-core-2_${IGC_VERSION}_amd64.deb \
-        ./intel-igc-opencl-2_${IGC_VERSION}_amd64.deb \
-        ./libigdgmm12_${GMM_VERSION}_amd64.deb \
-        ./libze-intel-gpu1_${COMPUTE_RUNTIME_VERSION}-0_amd64.deb \
-        ./intel-opencl-icd_${COMPUTE_RUNTIME_VERSION}-0_amd64.deb \
-        ./intel-ocloc_${COMPUTE_RUNTIME_VERSION}-0_amd64.deb && \
-    rm -f /tmp/*.deb && \
-    # Hold so later apt upgrades can't pull the rolling PPA version back.
-    apt-mark hold libze-intel-gpu1 intel-opencl-icd intel-ocloc libigdgmm12 \
-        intel-igc-core-2 intel-igc-opencl-2 && \
     rm -rf /var/lib/apt/lists/*
 
 
