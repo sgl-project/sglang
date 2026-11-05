@@ -34,7 +34,12 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_fused_func,
 )
 from sglang.srt.layers.utils import copy_or_rebind_param
-from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
+from sglang.srt.runtime_context import (
+    get_context,
+    get_exec,
+    get_forward,
+    get_parallel,
+)
 from sglang.srt.utils.common import (
     is_flashinfer_available,
     next_power_of_2,
@@ -1589,6 +1594,8 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         and not defer_finalize
         and hidden_pad == 0
         and symm_output.dtype == torch.bfloat16
+        # Kernel tests call this runner without a published server config.
+        and get_context().is_config_namespace_published("exec")
         and get_exec().deterministic.enable_deterministic_inference
     )
     flashinfer_finalize = not (defer_finalize or finalize_in_order)
