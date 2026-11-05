@@ -17,6 +17,7 @@ from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
     track_mamba_states_all_layers,
     track_mamba_states_if_needed,
 )
+from sglang.srt.configs.hybrid_arch import hybrid_kda_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
@@ -160,6 +161,12 @@ class MambaAttnBackendBase(AttentionBackend):
                 self._model_runner.model_config.hf_text_config, "mamba_chunk_size", 64
             )
         return self._mamba_chunk_size
+
+    @property
+    def state_chunk_size(self) -> int:
+        if hybrid_kda_config(self._model_runner.model_config) is not None:
+            return KDA_CHUNK_SIZE
+        return self.mamba_chunk_size
 
     def _translate_mamba_indices(self, mamba_indices: torch.Tensor) -> torch.Tensor:
         """The request table's slot ids as the state pool indexes them (the
@@ -476,11 +483,7 @@ class MambaAttnBackendBase(AttentionBackend):
             return self._init_track_ssm_indices_from_cpu(
                 mamba_cache_indices, forward_batch
             )
-        state_chunk_size = (
-            KDA_CHUNK_SIZE
-            if getattr(self.req_to_token_pool.mamba_pool, "is_kda", False)
-            else self.mamba_chunk_size
-        )
+        state_chunk_size = self.state_chunk_size
         # CPU to avoid kernel launches for the masking ops
         mamba_track_mask = forward_batch.mamba_track_mask.cpu()
         extend_seq_lens = forward_batch.extend_seq_lens.cpu()
@@ -562,11 +565,7 @@ class MambaAttnBackendBase(AttentionBackend):
 
     def _init_track_ssm_indices_from_cpu(self, mamba_cache_indices, forward_batch):
         is_mamba2 = isinstance(self, Mamba2AttnBackend)
-        state_chunk_size = (
-            KDA_CHUNK_SIZE
-            if getattr(self.req_to_token_pool.mamba_pool, "is_kda", False)
-            else self.mamba_chunk_size
-        )
+        state_chunk_size = self.state_chunk_size
         plan = build_prefill_track_plan(
             forward_batch.mamba_prefill_track_mask_cpu,
             forward_batch.mamba_track_seqlens_cpu,

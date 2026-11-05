@@ -11,10 +11,6 @@ from functools import wraps
 import torch
 from sgl_kernel_npu.operators.multimodal import flatten_patches
 
-from sglang.srt.hardware_backend.npu.modules.glm_vl_utils import (
-    _patch_processor_method,
-)
-
 
 def npu_wrapper_glm5_next_image_patchify(func):
     @wraps(func)
@@ -79,6 +75,15 @@ def npu_apply_glm5_next_preprocess_patch(processor) -> bool:
         inner_type = type(inner)
         if not callable(getattr(inner_type, "patchify", None)):
             return False
-        patches.append((inner, "patchify", wrapper, _NPU_PATCH_MARKER))
+        patches.append((inner_type, wrapper))
 
-    return bool(patches) and all(_patch_processor_method(*args) for args in patches)
+    for processor_type, wrapper in patches:
+        original = getattr(processor_type, "patchify", None)
+        if not callable(original):
+            return False
+        if getattr(original, _NPU_PATCH_MARKER, False):
+            continue
+        patched = wrapper(original)
+        setattr(patched, _NPU_PATCH_MARKER, True)
+        setattr(processor_type, "patchify", patched)
+    return bool(patches)
