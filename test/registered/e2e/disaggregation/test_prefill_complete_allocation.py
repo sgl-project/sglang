@@ -14,26 +14,30 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
 
-register_cuda_ci(est_time=168, stage="extra-a", runner_config="2-gpu-large")
+register_cuda_ci(est_time=230, stage="extra-a", runner_config="2-gpu-large")
 
 
 class _PrefillCompleteServer(PDDisaggregationServerBase):
     model = "Qwen/Qwen3-0.6B"
 
-    model_revision = "c1899de289a04d12100db370d81485cdf75e47ca"
+    model_args = [
+        "--revision",
+        "c1899de289a04d12100db370d81485cdf75e47ca",
+        "--attention-backend",
+        "flashinfer",
+    ]
+
+    # Parallelism flags beyond --tp, on prefill only.
+    prefill_parallel_args = []
 
     policy = "prefill_complete"
 
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        common = [
-            "--revision",
-            cls.model_revision,
+        common = cls.model_args + [
             "--disaggregation-decode-allocation-policy",
             cls.policy,
-            "--attention-backend",
-            "flashinfer",
             "--mem-fraction-static",
             "0.65",
             "--max-total-tokens",
@@ -46,7 +50,9 @@ class _PrefillCompleteServer(PDDisaggregationServerBase):
             "16",
             "--enable-metrics",
         ]
-        cls.extra_prefill_args = common + ["--chunked-prefill-size", "512"]
+        cls.extra_prefill_args = (
+            common + ["--chunked-prefill-size", "512"] + cls.prefill_parallel_args
+        )
         cls.extra_decode_args = list(common)
         cls.launch_all()
 
@@ -384,6 +390,58 @@ class TestPrefillCompleteTimeout(_PrefillCompleteServer):
         # the source as well as the destination before cache flush can succeed.
         self._flush_when_idle()
         self.generate("The capital of France is")
+
+
+class TestJustInTimeAllocation(_PrefillCompleteServer):
+    policy = "just_in_time"
+
+    def test_destination_lands_mid_prefill_and_output_matches(self):
+        """With no handshake measured yet, the first request signals readiness
+        at its first chunk, so decode holds its destination for most of the
+        slowed prefill; under completion-only readiness it would hold it for
+        the KV transfer alone."""
+        self._flush_when_idle()
+        prompt = "The capital of France is Paris. " * 400
+        forward_sleep = 0.3
+        requests.post(
+            self.prefill_url + "/slow_down",
+            json={"forward_sleep_time": forward_sleep},
+            timeout=10,
+        ).raise_for_status()
+        try:
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(self.generate, prompt)
+                held_since = held_until = None
+                deadline = time.monotonic() + 30
+                while not future.done() and time.monotonic() < deadline:
+                    now = time.monotonic()
+                    load = self._decode_load()
+                    if load["disaggregation"]["decode_transfer_queue_reqs"] > 0:
+                        if held_since is None:
+                            held_since = now
+                        held_until = now
+                    elif held_since is not None:
+                        break
+                    time.sleep(0.02)
+                slow = future.result(timeout=60)
+        finally:
+            requests.post(
+                self.prefill_url + "/slow_down",
+                json={"forward_sleep_time": 0.0},
+                timeout=10,
+            ).raise_for_status()
+        held = 0.0 if held_since is None else held_until - held_since
+        # Several slowed prefill forwards, not one KV transfer.
+        self.assertGreater(held, 3 * forward_sleep, "decode never held mid-prefill")
+        self.assertGreater(slow["meta_info"]["prompt_tokens"], 512 * 4)
+        self._flush_when_idle()
+        fast = self.generate(prompt)
+        self.assertEqual(slow["text"], fast["text"])
+        self.assertEqual(
+            [x[1] for x in slow["meta_info"]["output_token_logprobs"]],
+            [x[1] for x in fast["meta_info"]["output_token_logprobs"]],
+        )
+        self._run_concurrent_requests()
 
 
 if __name__ == "__main__":

@@ -10,7 +10,10 @@ import torch
 import torch.distributed
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
+from sglang.srt.disaggregation.utils import (
+    defers_decode_allocation,
+    poll_and_all_reduce_attn_cp_tp_group,
+)
 from sglang.srt.distributed.communication_op import attn_cp_tp_broadcast_pyobj
 from sglang.srt.distributed.parallel_state import P2PWork
 from sglang.srt.environ import envs
@@ -289,6 +292,7 @@ class SchedulerPPMixin:
                 prefill_plan = self.get_new_batch_prefill(self.running_batch)
                 batch = prefill_plan.batch_to_run
                 self.running_batch = prefill_plan.running_batch
+                self.pace_decode_readiness(batch)
                 batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
                 self.mbs[mb_id] = batch
                 self.running_mbs[mb_id] = self.running_batch
@@ -614,7 +618,12 @@ class SchedulerPPMixin:
         ] = defaultdict(deque)
 
     def process_bootstrapped_queue(self: Scheduler):
-        reqs = self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
+        # Under PP, only deferred decode allocation keeps optimistic prefill,
+        # which parks requests.
+        if defers_decode_allocation():
+            reqs = self.pop_bootstrapped_and_resolve_parked_pp()
+        else:
+            reqs = self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
         self.waiting_queue.join(reqs)
 
     def _pp_pd_get_prefill_transferred_ids(self: Scheduler) -> Dict[str, bool]:

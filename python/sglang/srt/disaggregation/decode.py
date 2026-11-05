@@ -73,6 +73,7 @@ from sglang.srt.disaggregation.utils import (
     all_reduce_flags,
     build_kv_layer_ids,
     build_staging_slot_metadata,
+    defers_decode_allocation,
     get_dsa_tail_state_indices,
     get_kv_class,
     get_kv_transfer_buf_infos,
@@ -1204,7 +1205,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def _init_receiver(self, decode_req: DecodeRequest, prefill_dp_rank: int) -> None:
         decode_req.kv_receiver.init(prefill_dp_rank)
         if (
-            get_disagg().disaggregation_decode_allocation_policy == "prefill_complete"
+            defers_decode_allocation()
             and decode_req.kv_receiver.conclude_state != KVPoll.Failed
         ):
             decode_req.req.disagg_prefill_dp_rank = prefill_dp_rank

@@ -129,6 +129,9 @@ DISAGG_TRANSFER_BACKEND_CHOICES = [
     "mooncake_tcp",
 ]
 
+# Decode reserves a request's KV only once prefill signals readiness.
+DEFERRED_DECODE_ALLOCATION_POLICIES = frozenset({"prefill_complete", "just_in_time"})
+
 GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 
 BUILT_IN_SAMPLING_BACKENDS = frozenset({"flashinfer", "pytorch", "ascend", "intel_xpu"})

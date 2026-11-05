@@ -23,6 +23,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
+from sglang.srt.arg_groups.choices import DEFERRED_DECODE_ALLOCATION_POLICIES
 from sglang.srt.configs.model_config import get_dsa_mtp_topk_width, is_deepseek_dsa
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST, DisaggregationMode
@@ -54,12 +55,12 @@ if TYPE_CHECKING:
 
 
 def pp_sync_polls(
-    polls: Optional[List[int]],
+    polls: Optional[list],
     pp_group: GroupCoordinator,
     pp_rank: int,
     pp_size: int,
     sync_work_list: List,
-) -> List[int]:
+) -> list:
     """Synchronize poll states from PP0 through the PP pipeline.
 
     PP0 provides the data. Each later PP rank receives it from the previous
@@ -120,12 +121,56 @@ def poll_and_all_reduce_prefill_pp(
 ) -> List[int]:
     polls: List[int] = []
     if pp_rank == 0:
-        polls = _poll_with_failure_injection_pp(pollers)
-        polls = _all_reduce_polls(polls, attn_tp_cpu_group)
-        polls = _all_reduce_polls(polls, attn_cp_cpu_group)
+        polls = _poll_prefill_pp0(pollers, attn_cp_cpu_group, attn_tp_cpu_group)
     # Propagate PP0's data to other ranks
     polls = pp_sync_polls(polls, pp_group, pp_rank, pp_size, pp_poll_sync_work_list)
     return polls
+
+
+def poll_and_all_reduce_prefill_pp_sections(
+    sections: List[List[CommonKVSender]],
+    attn_cp_cpu_group: dist.ProcessGroup,
+    attn_tp_cpu_group: dist.ProcessGroup,
+    pp_group: GroupCoordinator,
+    pp_rank: int,
+    pp_size: int,
+    pp_poll_sync_work_list: List[torch.distributed.Work],
+) -> List[List[int]]:
+    """PP0's consensus polls, one list per section, in a single PP sync.
+
+    Carrying each section's bootstrap rooms lets a stage whose sections differ
+    from PP0's, in membership or order, fail instead of applying a poll to
+    another request.
+    """
+    rooms = [[poller.bootstrap_room for poller in section] for section in sections]
+    payload = None
+    if pp_rank == 0:
+        flat = iter(
+            _poll_prefill_pp0(
+                [poller for section in sections for poller in section],
+                attn_cp_cpu_group,
+                attn_tp_cpu_group,
+            )
+        )
+        payload = [rooms, [[next(flat) for _ in section] for section in sections]]
+    pp0_rooms, polls = pp_sync_polls(
+        payload, pp_group, pp_rank, pp_size, pp_poll_sync_work_list
+    )
+    assert pp0_rooms == rooms, (
+        f"PP stages disagree on polled requests: PP0 polled rooms {pp0_rooms}, "
+        f"PP{pp_rank} holds {rooms}"
+    )
+    return polls
+
+
+def _poll_prefill_pp0(
+    pollers: List[CommonKVSender],
+    attn_cp_cpu_group: dist.ProcessGroup,
+    attn_tp_cpu_group: dist.ProcessGroup,
+) -> List[int]:
+    polls = _poll_with_failure_injection_pp(pollers)
+    polls = _all_reduce_polls(polls, attn_tp_cpu_group)
+    return _all_reduce_polls(polls, attn_cp_cpu_group)
 
 
 def get_dsa_seed_metadata_dim(hf_config) -> int:
@@ -1691,6 +1736,13 @@ def is_unadmitted_reject(req: Req) -> bool:
         or req.kv.holds_mamba
         or req.metadata_buffer_index >= 0
         or req.kv.retraction_backup is not None
+    )
+
+
+def defers_decode_allocation() -> bool:
+    return (
+        get_disagg().disaggregation_decode_allocation_policy
+        in DEFERRED_DECODE_ALLOCATION_POLICIES
     )
 
 
