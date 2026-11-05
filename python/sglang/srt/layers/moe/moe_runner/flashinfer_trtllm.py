@@ -270,10 +270,9 @@ def _trtllm_mxfp4_moe_runner(
         num_experts=num_experts,
         num_fused_shared_experts=0,
     )
-    enable_pdl = trtllm_moe_enable_pdl(num_tokens)
-    device_support_moe_pdl = getattr(fi_moe_core, "_device_support_moe_pdl", None)
-    if device_support_moe_pdl is not None and not device_support_moe_pdl(device):
-        enable_pdl = False
+    enable_pdl = trtllm_moe_enable_pdl(
+        num_tokens
+    ) and fi_moe_core._device_support_moe_pdl(device)
     runner_kwargs = {
         "routing_input_mode": routing_input_mode,
         "num_experts": num_experts,
