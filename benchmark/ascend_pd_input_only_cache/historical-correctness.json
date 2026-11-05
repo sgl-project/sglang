@@ -1,0 +1,135 @@
+{
+  "kind": "historical_deployment_evidence_not_current_port_validation",
+  "date_sgt": "2026-10-28",
+  "model": "GLM-5.2 W4A8C8",
+  "hardware": "4 nodes, 32 Ascend 910B4 NPUs; two P nodes and two D nodes",
+  "runtime": "CANN 9.1.0; TDP main-0923-derived deployment",
+  "sampling": {
+    "temperature": 0,
+    "top_p": 1,
+    "max_tokens": 96,
+    "enable_thinking": false
+  },
+  "legacy_gate": {
+    "name": "SGLANG_GLM52_D_INPUT_CACHE",
+    "value": "1",
+    "D_NEXTN": "steps=5, topk=1, draft_tokens=6",
+    "cache": "device-only FULL, page size 128"
+  },
+  "source_sha256": {
+    "d-prefix-baseline/rows.json": "f9558b65c6f6f517eef80a86d6f11bfc8f280918e24111a49a7c2a18a6a23294",
+    "d-prefix-router-v3/rows.json": "072f3988aa9f33401af81c7de4eb41827ae73ccef51110a041050711f8a29ca4",
+    "d-prefix-router-v3/result.json": "1af35adcdc7e450c292ed92874cd14ea9e3ff85b24e84a82c7e41acf3aa2953b"
+  },
+  "request_count": 12,
+  "matched_output_count": 12,
+  "observed_nonzero_D_prefix_lengths": [
+    2048,
+    8448,
+    16896
+  ],
+  "rows": [
+    {
+      "fixture": 0,
+      "mode": "cold",
+      "prompt_tokens": 2135,
+      "baseline_output": "{\"code\":\"AMBER731\",\"value\":323}",
+      "candidate_output": "{\"code\":\"AMBER731\",\"value\":323}",
+      "equal": true
+    },
+    {
+      "fixture": 0,
+      "mode": "hit",
+      "prompt_tokens": 2135,
+      "baseline_output": "{\"code\":\"AMBER731\",\"value\":323}",
+      "candidate_output": "{\"code\":\"AMBER731\",\"value\":323}",
+      "equal": true
+    },
+    {
+      "fixture": 0,
+      "mode": "post_flush",
+      "prompt_tokens": 2135,
+      "baseline_output": "{\"code\":\"AMBER731\",\"value\":323}",
+      "candidate_output": "{\"code\":\"AMBER731\",\"value\":323}",
+      "equal": true
+    },
+    {
+      "fixture": 0,
+      "mode": "followup",
+      "prompt_tokens": 2173,
+      "baseline_output": "{\"code\":\"AMBER731\",\"value\":330}",
+      "candidate_output": "{\"code\":\"AMBER731\",\"value\":330}",
+      "equal": true
+    },
+    {
+      "fixture": 1,
+      "mode": "cold",
+      "prompt_tokens": 8460,
+      "baseline_output": "{\"code\":\"BLUE482\",\"value\":324}",
+      "candidate_output": "{\"code\":\"BLUE482\",\"value\":324}",
+      "equal": true
+    },
+    {
+      "fixture": 1,
+      "mode": "hit",
+      "prompt_tokens": 8460,
+      "baseline_output": "{\"code\":\"BLUE482\",\"value\":324}",
+      "candidate_output": "{\"code\":\"BLUE482\",\"value\":324}",
+      "equal": true
+    },
+    {
+      "fixture": 1,
+      "mode": "post_flush",
+      "prompt_tokens": 8460,
+      "baseline_output": "{\"code\":\"BLUE482\",\"value\":324}",
+      "candidate_output": "{\"code\":\"BLUE482\",\"value\":324}",
+      "equal": true
+    },
+    {
+      "fixture": 1,
+      "mode": "followup",
+      "prompt_tokens": 8497,
+      "baseline_output": "{\"code\":\"BLUE482\",\"value\":331}",
+      "candidate_output": "{\"code\":\"BLUE482\",\"value\":331}",
+      "equal": true
+    },
+    {
+      "fixture": 2,
+      "mode": "cold",
+      "prompt_tokens": 16908,
+      "baseline_output": "{\"code\":\"GREEN936\",\"value\":325}",
+      "candidate_output": "{\"code\":\"GREEN936\",\"value\":325}",
+      "equal": true
+    },
+    {
+      "fixture": 2,
+      "mode": "hit",
+      "prompt_tokens": 16908,
+      "baseline_output": "{\"code\":\"GREEN936\",\"value\":325}",
+      "candidate_output": "{\"code\":\"GREEN936\",\"value\":325}",
+      "equal": true
+    },
+    {
+      "fixture": 2,
+      "mode": "post_flush",
+      "prompt_tokens": 16908,
+      "baseline_output": "{\"code\":\"GREEN936\",\"value\":325}",
+      "candidate_output": "{\"code\":\"GREEN936\",\"value\":325}",
+      "equal": true
+    },
+    {
+      "fixture": 2,
+      "mode": "followup",
+      "prompt_tokens": 16945,
+      "baseline_output": "{\"code\":\"GREEN936\",\"value\":332}",
+      "candidate_output": "{\"code\":\"GREEN936\",\"value\":332}",
+      "equal": true
+    }
+  ],
+  "limitations": [
+    "Synthetic sequential greedy fixtures only, about 2k/8k/16k input tokens.",
+    "This is not evidence that the latest-main port or TDP backport passes on hardware.",
+    "No isolated end-to-end TTFT, Decode or OutputTPS improvement is claimed.",
+    "Concurrent pressure, abort, retract, stochastic decoding and paired target/draft KV byte checks on real NPUs remain pending."
+  ]
+}

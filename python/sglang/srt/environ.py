@@ -809,6 +809,8 @@ class Envs:
     SGLANG_DISAGGREGATION_ZMQ_SEND_TIMEOUT = EnvInt(1)
     SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL = EnvFloat(5.0)
     SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE = EnvInt(2)
+    # Experimental device-only input-prefix retention for PD decode.
+    SGLANG_PD_DECODE_CACHE_INPUT_ONLY = EnvBool(False)
     SGLANG_DISAGGREGATION_WAITING_TIMEOUT = EnvInt(300)
     # A wedged RDMA stack fails startup here instead of at the scheduler watchdog.
     SGLANG_DISAGGREGATION_ENGINE_INIT_TIMEOUT = EnvInt(60)
