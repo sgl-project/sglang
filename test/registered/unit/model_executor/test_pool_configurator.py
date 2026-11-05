@@ -1104,6 +1104,41 @@ class TestEagleConfigurator(CustomTestCase):
             available,
         )
 
+    def test_npu_int8_target_reserves_unpacked_draft_kv(self):
+        import torch
+
+        from sglang.srt.hardware_backend.npu.kv_capability import resolve_kv_capability
+        from sglang.srt.model_executor.pool_configurator import (
+            create_memory_pool_configurator,
+        )
+
+        mr = _make_model_runner(self, num_layers=2, use_mla_backend=True)
+        _configure_dsa_model(mr)
+        mr.kv_cache_dtype = torch.int8
+        mr.model_dtype = torch.bfloat16
+        mr.spec_algorithm.is_eagle.return_value = True
+        mr.spec_algorithm.is_none.return_value = False
+        mr.spec_aux_config.eagle_draft_num_layers = 1
+        capability = resolve_kv_capability(
+            kv_cache_dtype=torch.int8, is_arch35=False, soc_name="Ascend910B4"
+        )
+        with (
+            patch("sglang.srt.model_executor.pool_configurator._is_npu", True),
+            patch(
+                "sglang.srt.hardware_backend.npu.kv_capability.resolve_npu_kv_capability",
+                return_value=capability,
+            ),
+            patch(
+                "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
+                return_value=656,
+            ),
+        ):
+            cfg = create_memory_pool_configurator(mr)
+            actual_bytes = 2 * (656 + 256) + 1152 + 256
+            self.assertEqual(cfg._cell_size, actual_bytes)
+            config = cfg.calculate_pool_sizes(10_000_000, page_size=1)
+            self.assertLessEqual(config.max_total_num_tokens * actual_bytes, 10_000_000)
+
     def test_hybrid_swa_draft_uses_swa_geometry_and_capacity(self):
         """SWA draft layers use SWA KV geometry and capacity."""
         available = 10_000_000

@@ -209,12 +209,21 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 self._native_infos = infos
                 native = self._native_buffers
                 index_layers = len(native.index_layer_indices)
-                if layout == "page_first_kv_split" and native.index_k is not None:
-                    self._size_per_token += (
-                        native.index_width * self.dtype.itemsize * index_layers
+                if layout == "page_first_kv_split":
+                    self._size_per_token = self.layer_num * (
+                        native.k_width * native.k.element_size()
+                        + native.v_width * native.v.element_size()
                     )
+                    if native.index_k is not None:
+                        self._size_per_token += (
+                            native.index_width
+                            * native.index_k.element_size()
+                            * index_layers
+                        )
                     if native.index_scales is not None:
-                        self._size_per_token += 4 * index_layers
+                        self._size_per_token += (
+                            native.index_scales.element_size() * index_layers
+                        )
                 self.device_kv_buffers = ()
                 self.device_data_ptrs = None
             else:
@@ -377,49 +386,22 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             num_indexer_layers = len(native.index_layer_indices)
             indexer_dims = (self.page_num, num_indexer_layers, self.page_size, 1)
             alloc_func = ALLOC_MEMORY_FUNCS[self._transfer_device.type]
-            if self.dsa_kv_cache_store_fp8:
-                # FP8 DSA packs latent+RoPE+scale into the device k_buffer;
-                # mirror the packed width so the 2D memcpy row width matches.
-                k_width = native.k_width
-            else:
-                k_width = self.kv_lora_rank
+            k_width = native.k_width
             if _is_npu and memfabric_host_memory_enabled():
-                # Memfabric-mapped host DRAM (single switch): required by the
-                # AIV sparse-copy IO path and usable by the legacy memcpy2d
-                # path unchanged.  Size the GB-aligned reserve with the
-                # combined bytes of all buffers allocated below.
-                total_bytes = (
-                    self.page_num
-                    * self.page_size
-                    * self.layer_num
-                    * (k_width + self.qk_rope_head_dim)
-                    * self.dtype.itemsize
-                )
-                if native.index_k is not None:
-                    total_bytes += (
-                        self.page_num
-                        * self.page_size
-                        * num_indexer_layers
-                        * native.index_width
-                        * self.dtype.itemsize
-                    )
-                if native.index_scales is not None:
-                    # FP32 scale mirror
-                    total_bytes += (
-                        self.page_num * self.page_size * num_indexer_layers * 4
-                    )
+                # Reserve exactly the typed components this host pool allocates.
+                total_bytes = self.page_num * self.page_size * self._size_per_token
                 ensure_memfabric_capacity(total_bytes, torch.npu.current_device())
                 alloc_func = alloc_with_memfabric
             self.k_buffer = alloc_func(
                 (*base_dims, k_width),
-                dtype=self.dtype,
+                dtype=native.k.dtype,
                 device=self.device,
                 pin_memory=self.pin_memory,
                 allocator=self.allocator,
             )
             self.v_buffer = alloc_func(
-                (*base_dims, self.qk_rope_head_dim),
-                dtype=self.dtype,
+                (*base_dims, native.v_width),
+                dtype=native.v.dtype,
                 device=self.device,
                 pin_memory=self.pin_memory,
                 allocator=self.allocator,
@@ -428,7 +410,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             if native.index_k is not None:
                 self.index_k_buffer = alloc_func(
                     (*indexer_dims, native.index_width),
-                    dtype=self.dtype,
+                    dtype=native.index_k.dtype,
                     device=self.device,
                     pin_memory=self.pin_memory,
                     allocator=self.allocator,
@@ -440,7 +422,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             if native.index_scales is not None:
                 self.index_k_scale_buffer = alloc_func(
                     (*indexer_dims, 1),
-                    dtype=torch.float32,
+                    dtype=native.index_scales.dtype,
                     device=self.device,
                     pin_memory=self.pin_memory,
                     allocator=self.allocator,
@@ -1311,8 +1293,8 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         v_buffer_data_ptr
                         + indices[index]
                         * self.layer_num
-                        * self.qk_rope_head_dim
-                        * self.dtype.itemsize
+                        * self.v_buffer.shape[-1]
+                        * self.v_buffer.element_size()
                     )
                     ptr_list.append(v_ptr)
                 if index_k_buffer_data_ptr is not None:
@@ -1335,9 +1317,9 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             k_element_size = self.layer_num * k_item_size * self.page_size * k_width
             v_element_size = (
                 self.layer_num
-                * self.dtype.itemsize
+                * self.v_buffer.element_size()
                 * self.page_size
-                * self.qk_rope_head_dim
+                * self.v_buffer.shape[-1]
             )
             index_k_element_size = (
                 num_indexer_layers * index_k_item_size * self.page_size * index_k_width

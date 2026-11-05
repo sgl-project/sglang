@@ -108,6 +108,39 @@ def handle_mxfp8_kv_cache_compatibility(server_args: Any) -> None:
         )
 
 
+def handle_int8_kv_cache_compatibility(server_args: Any) -> None:
+    """An INT8 KV cache exists for the DSA MLA path on Ascend A2/A3 only.
+
+    It stores one packed record per token (quantized latent | BF16 rope |
+    per-tile scales), which only the NPU sparse attention op reads back. Any
+    other pool would take INT8 as a plain storage dtype and silently cast
+    BF16 K/V into it.
+    """
+    cfg = resolving_view(server_args)
+    if cfg.kv_cache_dtype != "int8":
+        return
+    if not get_platform().is_npu:
+        raise ValueError(
+            "--kv-cache-dtype int8 is supported on Ascend NPUs only; no other "
+            "platform has kernels that read an INT8 KV cache."
+        )
+    if cfg.dcp_size > 1 or cfg.attn_cp_size > 1:
+        raise ValueError(
+            "--kv-cache-dtype int8 currently requires attention CP and DCP size one; "
+            "the context-parallel sparse attention path consumes unquantized KV."
+        )
+    from sglang.srt.configs.model_config import is_deepseek_dsa
+
+    hf_config = model_config_of(server_args).hf_config
+    if not is_deepseek_dsa(hf_config):
+        raise ValueError(
+            "--kv-cache-dtype int8 stores the packed DSA MLA record, which "
+            "only the DSA sparse attention path reads back; "
+            f"{hf_config.architectures[0]} does not use it. Use "
+            "--kv-cache-dtype bf16 or auto."
+        )
+
+
 def handle_kv4_compatibility(server_args: Any) -> None:
     """Check FP4 KV cache compatibility with the attention backend"""
 

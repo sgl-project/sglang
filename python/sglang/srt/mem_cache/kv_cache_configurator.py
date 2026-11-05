@@ -2101,10 +2101,12 @@ class KVCacheConfigurator:
     def _build_ascend_mla_kv_pool(
         self, *, max_total_num_tokens: int, is_dsa_model: bool
     ) -> KVCache:
+        from sglang.srt.hardware_backend.npu.kv_capability import (
+            resolve_npu_kv_capability,
+        )
         from sglang.srt.hardware_backend.npu.memory_pool_npu import (
             NPUMLATokenToKVPool,
         )
-        from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 
         # Indexer uses the allocator-global slot space on DCP target workers.
         dcp_size = get_parallel().attn_dcp_size
@@ -2112,7 +2114,6 @@ class KVCacheConfigurator:
             index_size = max_total_num_tokens
         else:
             index_size = max_total_num_tokens * dcp_size
-        is_arch35 = is_npu_arch35()
         # Shared layers never access the indexer; pool sizing uses the same gate
         # so the saved indexer memory can be used for additional KV tokens.
         use_compact_indexer_layout = is_dsa_model and _should_elide_dsa_index_k(
@@ -2128,9 +2129,7 @@ class KVCacheConfigurator:
                 )
                 if not dsa_layer_skips_topk(self.model_config.hf_config, layer_id)
             )
-        use_dsa_fp8_kv_cache_storage = (
-            self.kv_cache_dtype == torch.float8_e4m3fn and is_arch35
-        )
+        kv_capability = resolve_npu_kv_capability(self.kv_cache_dtype)
         token_to_kv_pool = NPUMLATokenToKVPool(
             max_total_num_tokens,
             page_size=get_schedule().page_size,
@@ -2145,9 +2144,10 @@ class KVCacheConfigurator:
                 calculate_mla_kv_cache_dim(
                     model_config=self.model_config, kv_cache_dtype=self.kv_cache_dtype
                 )
-                if use_dsa_fp8_kv_cache_storage
+                if kv_capability.main_kv_packed
                 else None
             ),
+            kv_capability=kv_capability,
             is_draft_worker=self.is_draft_worker,
             layer_num=self.layer_info.num_effective_layers,
             device=self.device,
@@ -2245,6 +2245,7 @@ class KVCacheConfigurator:
             kv_cache_dim=calculate_mla_kv_cache_dim(
                 model_config=self.model_config,
                 kv_cache_dtype=self.kv_cache_dtype,
+                packed=is_packed_mla_kv_cache(self.kv_cache_dtype),
             ),
             enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
@@ -2293,6 +2294,7 @@ class KVCacheConfigurator:
                 kv_cache_dim=calculate_mla_kv_cache_dim(
                     model_config=self.model_config,
                     kv_cache_dtype=self.kv_cache_dtype,
+                    packed=is_packed_mla_kv_cache(self.kv_cache_dtype),
                 ),
             )
 
@@ -2522,6 +2524,7 @@ class KVCacheConfigurator:
                     kv_cache_dim=calculate_mla_kv_cache_dim(
                         model_config=self.model_config,
                         kv_cache_dtype=self.kv_cache_dtype,
+                        packed=is_packed_mla_kv_cache(self.kv_cache_dtype),
                     ),
                     index_kpool=dsa_index_kpool,
                     index_kpool_compress=get_dsa_index_kpool_compress(
@@ -3462,8 +3465,22 @@ class KVCacheConfigurator:
         return total_rest_memory - mamba_state_memory
 
 
+def is_packed_mla_kv_cache(kv_cache_dtype: torch.dtype) -> bool:
+    """Whether DSA MLA KV uses the packed quantized record (latent | rope | scales)."""
+    if _is_npu:
+        from sglang.srt.hardware_backend.npu.kv_capability import (
+            resolve_npu_kv_capability,
+        )
+
+        return resolve_npu_kv_capability(kv_cache_dtype).main_kv_packed
+    return kv_cache_dtype == torch.float8_e4m3fn
+
+
 def calculate_mla_kv_cache_dim(
-    *, model_config: ModelConfig, kv_cache_dtype: torch.dtype
+    *,
+    model_config: ModelConfig,
+    kv_cache_dtype: torch.dtype,
+    packed: Optional[bool] = None,
 ) -> int:
     is_dsa_model = is_deepseek_dsa(model_config.hf_config)
     kv_cache_dtype = kv_cache_dtype
@@ -3516,7 +3533,10 @@ def calculate_mla_kv_cache_dim(
     quant_block_size = DSATokenToKVPool.quant_block_size
     # Calculate override_kv_cache_dim for FP8 storage in backends that use scaled KV layout
     # (excluding TRTLLM and HIP raw-layout kernels).
-    if kv_cache_dtype == torch.float8_e4m3fn:
+    if packed is None:
+        packed = is_packed_mla_kv_cache(kv_cache_dtype)
+    if packed:
+        assert kv_cache_dtype.itemsize == 1
         assert kv_lora_rank % quant_block_size == 0, (
             f"kv_lora_rank {kv_lora_rank} must be multiple of quant_block_size {quant_block_size}"
         )

@@ -44,6 +44,7 @@ from sglang.srt.arg_groups.hisparse_hook import (
 )
 from sglang.srt.arg_groups.kv_cache_hook import (
     handle_cache_compatibility,
+    handle_int8_kv_cache_compatibility,
     handle_kv4_compatibility,
     handle_nvfp4_prefill_kv_dequant_dtype,
     validate_prefill_only_disable_kv_cache_args,
@@ -1441,6 +1442,37 @@ class TestInt8MambaCheckpointCompatibility(unittest.TestCase):
         )
 
 
+class TestNpuInt8KvCompatibility(CustomTestCase):
+    @override_platform(is_npu=True)
+    def test_dsa_int8_uses_normal_argument_view(self):
+        args = ServerArgs(model_path="dummy", kv_cache_dtype="int8")
+        args._model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(
+                architectures=["GlmMoeDsaForCausalLM"], index_topk=2048
+            )
+        )
+        handle_int8_kv_cache_compatibility(args)
+
+    @override_platform(is_npu=True)
+    def test_context_parallel_int8_is_rejected(self):
+        for option in ("dcp_size", "attn_cp_size"):
+            with self.subTest(option=option):
+                args = ServerArgs(
+                    model_path="dummy", kv_cache_dtype="int8", **{option: 2}
+                )
+                with self.assertRaisesRegex(ValueError, "CP and DCP"):
+                    handle_int8_kv_cache_compatibility(args)
+
+    @override_platform(is_npu=True)
+    def test_non_dsa_int8_is_rejected(self):
+        args = ServerArgs(model_path="dummy", kv_cache_dtype="int8")
+        args._model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"])
+        )
+        with self.assertRaisesRegex(ValueError, "DSA"):
+            handle_int8_kv_cache_compatibility(args)
+
+
 class TestKV4Compatibility(unittest.TestCase):
     def setUp(self):
         self._use_mla_backend_patcher = patch(
@@ -2057,7 +2089,9 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
             speculative_adaptive=True,
         )
         model_config = SimpleNamespace(
-            hf_config=SimpleNamespace(architectures=["GlmMoeDsaForCausalLM"])
+            hf_config=SimpleNamespace(
+                architectures=["GlmMoeDsaForCausalLM"], index_topk=2048
+            )
         )
 
         with (
