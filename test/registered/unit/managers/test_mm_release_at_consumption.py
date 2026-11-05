@@ -23,17 +23,15 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import AbortReq
-    from sglang.srt.managers.schedule_batch import MultimodalDataItem, Req
+    from sglang.srt.managers.req_types import MultimodalDataItem
+    from sglang.srt.managers.schedule_batch import Req
 
 
 def _types():
     from sglang.srt.managers.mm_utils import release_consumed_mm_features
-    from sglang.srt.managers.schedule_batch import (
-        Modality,
-        MultimodalDataItem,
-        MultimodalInputs,
-        Req,
-    )
+    from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
+    from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.multimodal.modality import Modality
 
     return (
         release_consumed_mm_features,
@@ -109,15 +107,10 @@ def _abort_scheduler():
     retired: list[object] = []
     scheduler.beam_coordinator = SimpleNamespace(retire_group=retired.append)
     sent: list[tuple[object, object]] = []
-    object.__setattr__(
-        scheduler,
-        "ipc_channels",
-        SimpleNamespace(
-            send_to_tokenizer=SimpleNamespace(
-                send_output=lambda out, req=None: sent.append((out, req))
-            )
-        ),
-    )
+    scheduler.send_abort_output = lambda out, req: sent.append((out, req))
+    scheduler.hisparse_coordinator = None
+    scheduler.uocr_runtime = None
+    scheduler.init_request_retirer()
     return scheduler, sent, retired, finished
 
 
