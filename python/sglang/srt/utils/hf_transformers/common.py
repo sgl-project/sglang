@@ -95,6 +95,7 @@ from sglang.srt.configs.all_configs import (
     Step3p5Config,
     Step3p7Config,
     Step3VLConfig,
+    Xing4_0Config,
     XllmConfig,
 )
 from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
@@ -189,6 +190,7 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         InklingVisionConfig,
         InklingMMConfig,
         MiniMaxM3VLConfig,
+        Xing4_0Config,
         XllmConfig,
     ]
 }
