@@ -1369,6 +1369,15 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             buffers.append(self.index_k_scale_buffer)
         if sum(chunk[0].shape[1] for chunk in saved_chunks) != pages.numel():
             raise ValueError("KPool restore logical-page count differs from snapshot")
+        for group, saved_group in zip(
+            (self._compress_tail_k, self._compress_tail_score), saved_tails, strict=True
+        ):
+            for buf, saved in zip(group, saved_group, strict=True):
+                if saved is not None and saved.dtype != buf.dtype:
+                    raise ValueError(
+                        "KPool tail snapshot dtype differs from the live pool; "
+                        "BF16 and FP32 tail states cannot be mixed"
+                    )
         start = 0
         for chunk in saved_chunks:
             count = chunk[0].shape[1]
