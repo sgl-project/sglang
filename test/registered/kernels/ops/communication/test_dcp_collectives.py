@@ -286,7 +286,7 @@ def test_token_packing_after_dcp_gather():
                         device=f"cuda:{rank}",
                         dtype=torch.bfloat16,
                     ),
-                    pow2_scale=True,
+                    scale_ue8m0=True,
                 )
                 .view(torch.uint8)
                 .view(-1, 656)

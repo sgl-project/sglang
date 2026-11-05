@@ -37,7 +37,7 @@ from sglang.srt.configs.unlimited_ocr_v2 import (
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import is_hip, retry
+from sglang.srt.utils import is_hip, is_npu, retry
 from sglang.srt.utils.hf_transformers import (
     get_config,
     get_context_length,
@@ -215,7 +215,7 @@ def is_deepseek_dsa(config) -> bool:
             "KimiK3LinearForCausalLM",
         )
         and _hf_attr(config, "index_topk") is not None
-    )
+    ) or is_kimi_k31(config)
 
 
 def dsa_draft_shards_under_dcp(config, dcp_size: int) -> bool:
@@ -225,6 +225,23 @@ def dsa_draft_shards_under_dcp(config, dcp_size: int) -> bool:
     with dcp_size 1.
     """
     return dcp_size > 1 and is_hip() and is_deepseek_dsa(config)
+
+
+def mla_attention_dcp_size(config, *, dcp_size: int, is_nextn: bool) -> int:
+    """The DCP width used by MLA execution, including platform draft policies.
+
+    KV planning must use this same width before the attention module is built.
+    """
+    # Ascend draft backends use allocator-global slots and non-DCP attention.
+    if is_nextn and is_npu():
+        return 1
+    if (
+        is_nextn
+        and is_deepseek_dsa(config)
+        and not dsa_draft_shards_under_dcp(config, dcp_size)
+    ):
+        return 1
+    return dcp_size
 
 
 def is_glm_moe_dsa(config) -> bool:
@@ -240,6 +257,21 @@ def is_kimi_k3(config) -> bool:
         "KimiK3ForConditionalGeneration",
         "KimiK31ForConditionalGeneration",
         "KimiK3LinearForCausalLM",
+    )
+
+
+_KIMI_K31_ARCHS = (
+    "KimiK31ForConditionalGeneration",
+    "KimiLinearForCausalLM",
+    "KimiK3LinearForCausalLM",
+)
+
+
+def is_kimi_k31(config) -> bool:
+    """Kimi-K3.1: the Kimi linear-attention family with DSA layers."""
+    return (
+        _hf_arch(config) in _KIMI_K31_ARCHS
+        and _hf_attr(config, "index_topk") is not None
     )
 
 
@@ -432,19 +464,6 @@ def resolve_spec_hidden_size(
         return hidden_size, None
     hc_hidden_size = hidden_size * hc_mult
     return hc_hidden_size, hc_hidden_size
-
-
-def is_kimi_k31(config) -> bool:
-    """Kimi-K3.1: the Kimi linear-attention family with DSA layers."""
-    return (
-        _hf_arch(config)
-        in (
-            "KimiK31ForConditionalGeneration",
-            "KimiLinearForCausalLM",
-            "KimiK3LinearForCausalLM",
-        )
-        and _hf_attr(config, "index_topk") is not None
-    )
 
 
 def get_dsa_index_head_dim(config: PretrainedConfig) -> int:
@@ -704,6 +723,9 @@ class ModelConfig:
                 ):
                     # Full attention sees the whole prompt, while linear attention stays causal.
                     self.hf_text_config.is_causal = False
+        if is_embedding_nemotron3(self.hf_config):
+            # A bare Ministral3 backbone configured as a mean-pooled embedder.
+            self.hf_config.architectures = ["EmbeddingNemotron3Model"]
         self.joint_head_config = None
         if self.hf_config.architectures == ["Qwen3_5ForConditionalGeneration"]:
             self.joint_head_config = load_joint_head_config(self.model_path, revision)
@@ -2465,6 +2487,21 @@ def is_embedding_gemma(config) -> bool:
     )
 
 
+def is_embedding_nemotron3(config) -> bool:
+    """Whether ``config`` is an NVIDIA Nemotron-3-Embed checkpoint.
+
+    Nemotron-3-Embed is serialized as the bare ``Ministral3Model`` backbone,
+    which is also used by generative checkpoints. Its bidirectional attention
+    and mean pooling fields are the defining distinction.
+    """
+    fields = config.to_dict()
+    return (
+        config.architectures == ["Ministral3Model"]
+        and fields.get("is_causal") is False
+        and fields.get("pooling") == "avg"
+    )
+
+
 def is_generation_model(model_architectures: List[str], is_embedding: bool = False):
     # We have two ways to determine whether a model is a generative model.
     # 1. Check the model architecture
@@ -2483,6 +2520,7 @@ def is_generation_model(model_architectures: List[str], is_embedding: bool = Fal
         or "Qwen3Model" in model_architectures
         or "CLIPModel" in model_architectures
         or "BertModel" in model_architectures
+        or "EmbeddingNemotron3Model" in model_architectures
         or "Contriever" in model_architectures
         or "BertForSequenceClassification" in model_architectures
         or "XLMRobertaModel" in model_architectures

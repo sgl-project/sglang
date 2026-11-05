@@ -333,7 +333,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             rope_head_dim = index_rope_dim
         self.skip_rope = rope_head_dim == 0
         self.apply_hadamard = getattr(config, "index_apply_hadamard", True)
-        self.bf16_head_gate = not self.apply_hadamard
+        self.bf16_head_gate = getattr(config, "index_bf16_head_gate", False)
         k_norm_eps = getattr(config, "index_k_norm_eps", None)
         self.hidden_size = hidden_size
         self.n_heads = index_n_heads
@@ -421,6 +421,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 dtype=(
                     torch.float32
                     if self.use_aiter_fused_fp8_writer
+                    or getattr(config, "index_k_norm_fp32", False)
                     else (torch.bfloat16 if _use_aiter else torch.float32)
                 ),
                 **k_norm_eps_kwargs,
@@ -634,7 +635,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         self.weights_proj.weight.data = merged[self.head_dim :]
         self._wk_gate_weight = merged
 
-    def _weights_proj_bf16_in_fp32_out(
+    def _project_head_gates(
         self, x: Union[torch.Tensor, Tuple[torch.Tensor, ...]]
     ) -> torch.Tensor:
         # aiter (ROCm gfx95): extract the passthrough bf16 tensor from the
@@ -664,12 +665,14 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         self, x: Union[torch.Tensor, Tuple[torch.Tensor, ...]], q_scale: torch.Tensor
     ):
         if self.bf16_head_gate:
-            return self._bf16_head_gate(x).unsqueeze(-1) * q_scale * self.softmax_scale
+            return self._apply_q_scale_and_softmax_scale(
+                self._bf16_head_gate(x), q_scale
+            )
         return self._get_logits_head_gate_fp32(x, q_scale)
 
     def _bf16_head_gate(self, x: torch.Tensor) -> torch.Tensor:
         # Eager: torch.compile may drop the intermediate bf16 rounding.
-        weights = self._weights_proj_bf16_in_fp32_out(x)
+        weights = self._project_head_gates(x)
         assert weights.dtype == torch.bfloat16
         return (weights * self.n_heads**-0.5).float()
 
@@ -677,7 +680,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
     def _project_and_scale_head_gates_fp32(
         self, x: Union[torch.Tensor, Tuple[torch.Tensor, ...]]
     ):
-        weights = self._weights_proj_bf16_in_fp32_out(x)
+        weights = self._project_head_gates(x)
         weights = weights * self.n_heads**-0.5
         return weights
 
@@ -685,7 +688,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
     def _get_logits_head_gate_fp32(
         self, x: Union[torch.Tensor, Tuple[torch.Tensor, ...]], q_scale: torch.Tensor
     ):
-        weights = self._weights_proj_bf16_in_fp32_out(x)
+        weights = self._project_head_gates(x)
         weights = weights * self.n_heads**-0.5
         weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
         return weights
@@ -754,7 +757,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         query, _ = self.wq_b(q_lora)
         query = query.view(-1, self.n_heads, self.head_dim)
         key, _ = self.wk(x)
-        weights_raw = self._weights_proj_bf16_in_fp32_out(x)
+        weights_raw = self._project_head_gates(x)
 
         out_cache_loc = forward_batch.out_cache_loc
         if num_tokens is not None:
@@ -1098,7 +1101,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         x: torch.Tensor,
         positions: torch.Tensor,
         *,
-        apply_hadamard: bool = True,
+        rotate: bool = True,
     ):
         # fused_rms_fp8_group_quant with output_unquantized_inp1=True produces a
         # (fp8, scale, bf16) 3-tuple; extract the bf16 for the unquantized wk layer.
@@ -1126,7 +1129,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 dummy_q_rope = k_rope
             _, k_rope = self.rotary_emb(positions, dummy_q_rope, k_rope)
             self._update_rope_guarded(key[..., : self.rope_head_dim], k_rope)
-        if apply_hadamard and self.apply_hadamard:
+        if rotate and self.apply_hadamard:
             key = rotate_activation(key)
 
         return key
@@ -2049,7 +2052,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         # Keep K in the same no-Hadamard space as the fused Q/K writer.
         if self._aiter_fused_fp8_active(forward_batch):
-            key = self._get_k_bf16(x, positions, apply_hadamard=False)
+            key = self._get_k_bf16(x, positions, rotate=False)
             if num_tokens is not None:
                 key = key[:num_tokens]
             self._store_index_k_cache(
@@ -2480,7 +2483,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
             # aiter (ROCm gfx95): the 3-tuple (fp8, scale, bf16) from
             # fused_rms_fp8_group_quant is passed directly to _get_logits_head_gate,
-            # which extracts the bf16 tensor via _weights_proj_bf16_in_fp32_out,
+            # which extracts the bf16 tensor via _project_head_gates,
             # completely skipping the FP8 dequantization path below.
             if (
                 _use_aiter

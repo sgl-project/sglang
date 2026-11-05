@@ -643,6 +643,9 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
     import torch
 
     major, _ = torch.cuda.get_device_capability()
+    if kimi_k31:
+        return _kimi_k31_dsa_backends(view)
+
     kv_cache_dtype = view.kv_cache_dtype
     user_set_prefill = view.dsa_prefill_backend is not None
     user_set_decode = view.dsa_decode_backend is not None
@@ -655,23 +658,16 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
         and not get_platform().is_hip
     )
 
-    if kimi_k31:
-        return _kimi_k31_dsa_backends(view)
-
     if getattr(hf_config, "learnable_sink", False):
         backend = "flashmla_sparse"
-        for field in ("dsa_prefill_backend", "dsa_decode_backend"):
-            value = getattr(view, field)
-            if value is not None and value != backend:
-                option = "--" + field.replace("_", "-")
-                raise ValueError(
-                    f"{model_arch} uses learnable attention sinks and requires "
-                    f"{option} {backend!r}; got {value!r}"
-                )
-        if not user_set_prefill:
-            declared["dsa_prefill_backend"] = backend
-        if not user_set_decode:
-            declared["dsa_decode_backend"] = backend
+        declared = _pin_dsa_backends(
+            view,
+            backend,
+            lambda option, value: (
+                f"{model_arch} uses learnable attention sinks and requires "
+                f"{option} {backend!r}; got {value!r}"
+            ),
+        )
         logger.warning(
             "Set DSA backends for learnable attention sinks: "
             f"prefill={declared.get('dsa_prefill_backend', view.dsa_prefill_backend)}, "
@@ -758,15 +754,29 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
     return declared
 
 
+def _pin_dsa_backends(
+    view: Any, backend: str, mismatch_error: Callable[[str, str], str]
+) -> Dict[str, Any]:
+    declared: Dict[str, Any] = {}
+    for field in ("dsa_prefill_backend", "dsa_decode_backend"):
+        value = getattr(view, field)
+        if value is None:
+            declared[field] = backend
+        elif value != backend:
+            option = "--" + field.replace("_", "-")
+            raise ValueError(mismatch_error(option, value))
+    return declared
+
+
 # Matches the reference fp8_ds_mla cache; trtllm's 576 B layout does not.
 _KIMI_K31_DSA_BACKEND = "flashmla_kv"
+# ROCm: the Triton kernels dequantize the same fp8_ds_mla rows and run BF16 dots.
+_KIMI_K31_DSA_BACKEND_HIP = "triton"
 # Opt-in: raw FP8 KV (scale 1.0) and FP8 q, so numerics differ from the reference.
 _KIMI_K31_DSA_BACKENDS = ("flashmla_kv", "trtllm", "prims_ts")
 
 
 def _kimi_k31_kv_cache_dtype(view: Any) -> dict:
-    if get_platform().is_hip:
-        raise ValueError("Kimi-K3.1 DSA requires CUDA (FlashMLA / DeepGEMM).")
     if view.kv_cache_dtype not in ("auto", "fp8_e4m3"):
         raise ValueError(
             "Kimi-K3.1 requires --kv-cache-dtype fp8_e4m3 (the reference "
@@ -779,40 +789,55 @@ def _kimi_k31_kv_cache_dtype(view: Any) -> dict:
 
 
 def _kimi_k31_dsa_backends(view: Any) -> dict:
-    fields = ("dsa_prefill_backend", "dsa_decode_backend")
-    for field in fields:
-        value = getattr(view, field)
-        if value is not None and value not in _KIMI_K31_DSA_BACKENDS:
-            option = "--" + field.replace("_", "-")
+    if get_platform().is_hip:
+        if view.enable_hisparse:
             raise ValueError(
-                f"Kimi-K3.1 supports {option} {' / '.join(_KIMI_K31_DSA_BACKENDS)}; "
-                f"got {value!r}."
+                "Kimi-K3.1 does not support --enable-hisparse on ROCm yet."
             )
-    # Both phases read one KV pool (and PD peers exchange it), so an unset
-    # phase follows the set one.
-    chosen = {getattr(view, f) for f in fields} - {None}
-    if len(chosen) > 1:
-        raise ValueError(
-            "Kimi-K3.1 needs the same --dsa-prefill-backend and "
-            "--dsa-decode-backend (flashmla_kv and trtllm / prims_ts use "
-            f"different KV layouts); got {view.dsa_prefill_backend!r} and "
-            f"{view.dsa_decode_backend!r}."
+        backend = _KIMI_K31_DSA_BACKEND_HIP
+        declared = _pin_dsa_backends(
+            view,
+            backend,
+            lambda option, value: (
+                f"Kimi-K3.1 requires {option} {backend!r} to match "
+                f"the reference fp8_ds_mla numerics; got {value!r}."
+            ),
         )
-    backend = chosen.pop() if chosen else _KIMI_K31_DSA_BACKEND
-    if view.enable_hisparse and backend != _KIMI_K31_DSA_BACKEND:
-        # The HiSparse FP8 backend allow-list (hisparse_hook) admits only
-        # flashmla_kv among the K3.1 backends.
-        raise ValueError(
-            f"Kimi-K3.1 HiSparse requires DSA backend {_KIMI_K31_DSA_BACKEND!r}; "
-            f"got {backend!r}."
-        )
-    if backend in ("trtllm", "prims_ts"):
-        logger.warning(
-            f"Kimi-K3.1 {backend} DSA uses FP8 q and an unscaled FP8 KV cache, not "
-            "the reference fp8_ds_mla numerics. PD prefill and decode servers must "
-            "both use a raw-FP8-KV backend (trtllm or prims_ts)."
-        )
-    declared = {f: backend for f in fields if getattr(view, f) is None}
+    else:
+        fields = ("dsa_prefill_backend", "dsa_decode_backend")
+        for field in fields:
+            value = getattr(view, field)
+            if value is not None and value not in _KIMI_K31_DSA_BACKENDS:
+                option = "--" + field.replace("_", "-")
+                raise ValueError(
+                    f"Kimi-K3.1 supports {option} "
+                    f"{' / '.join(_KIMI_K31_DSA_BACKENDS)}; got {value!r}."
+                )
+        # Both phases read one KV pool (and PD peers exchange it), so an unset
+        # phase follows the set one.
+        chosen = {getattr(view, f) for f in fields} - {None}
+        if len(chosen) > 1:
+            raise ValueError(
+                "Kimi-K3.1 needs the same --dsa-prefill-backend and "
+                "--dsa-decode-backend (flashmla_kv and trtllm / prims_ts use "
+                f"different KV layouts); got {view.dsa_prefill_backend!r} and "
+                f"{view.dsa_decode_backend!r}."
+            )
+        backend = chosen.pop() if chosen else _KIMI_K31_DSA_BACKEND
+        if backend in ("trtllm", "prims_ts"):
+            logger.warning(
+                f"Kimi-K3.1 {backend} DSA uses FP8 q and an unscaled FP8 KV cache, not "
+                "the reference fp8_ds_mla numerics. PD prefill and decode servers must "
+                "both use a raw-FP8-KV backend (trtllm or prims_ts)."
+            )
+        if view.enable_hisparse and backend != _KIMI_K31_DSA_BACKEND:
+            # The HiSparse FP8 backend allow-list (hisparse_hook) admits only
+            # flashmla_kv among the K3.1 backends.
+            raise ValueError(
+                f"Kimi-K3.1 HiSparse requires DSA backend {_KIMI_K31_DSA_BACKEND!r}; "
+                f"got {backend!r}."
+            )
+        declared = {f: backend for f in fields if getattr(view, f) is None}
     logger.warning(
         "Set DSA backends for Kimi-K3.1: prefill=%s, decode=%s.", backend, backend
     )
@@ -1962,9 +1987,9 @@ def post_capture_kv_sizing_planned(server_args: Any) -> bool:
         return False
     if cfg.device != "cuda":
         return False
-    if cfg.dcp_size != 1:
+    if cfg.dcp_size != 1 and not cfg.enable_unified_memory:
         return False
-    if mla_enabled:
+    if mla_enabled and not cfg.enable_unified_memory:
         return False
     if cfg.prefill_only_disable_kv_cache:
         return False
@@ -1980,19 +2005,7 @@ def post_capture_kv_sizing_planned(server_args: Any) -> bool:
     ):
         return False
 
-    # Only the hybrid-SWA byte pool has a matching post-capture resize path.
     model_config = model_config_of(server_args)
-    if cfg.enable_unified_memory:
-        from sglang.srt.mem_cache.kv.decl import declared_lifetime_types
-        from sglang.srt.mem_cache.kv.plan import resized_after_capture
-        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-
-        if not resized_after_capture(declared_lifetime_types(model_config)):
-            return False
-        # The solver budgets these independent draft pools again after capture.
-        spec = SpeculativeAlgorithm.from_string(cfg.speculative_algorithm)
-        if spec.is_eagle() or spec.is_standalone() or spec.is_dflash_family():
-            return False
 
     if (
         cfg.disaggregation_mode != "prefill"

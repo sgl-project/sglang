@@ -182,7 +182,7 @@ def pcg_dsa_indexer_prefill_split(
     ):
         from sglang.kernels.ops.attention.dsa.head_gate import indexer_q_quant_head_gate
 
-        gate = indexer._weights_proj_bf16_in_fp32_out(x)
+        gate = indexer._project_head_gates(x)
         q_fp8, weights = indexer_q_quant_head_gate(
             query, gate, indexer.softmax_scale, indexer.scale_fmt
         )

@@ -1,9 +1,8 @@
 """The mm-item hash contract of the native Qwen path.
 
-The two paths hash different things, deliberately. Native hashes are `content_hash`
-over the raw encoded source bytes, computed on an MM worker; the Python path hashes
-the decoded feature tensor. Both feed `set_pad_value`, so the native drain can skip
-`hash_feature` on the scheduler loop — the point of precomputing them.
+The native driver's scalar source hash is legacy metadata, not a cache identity.
+Workers additionally produce a full digest of the model-facing tensor and metadata.
+Python items bind those inputs and processor configuration before transport.
 
 Field-by-field parity of everything else is `test_e2e_parity.py`.
 """
@@ -21,7 +20,9 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.mm_utils import hash_feature  # noqa: E402
+from sglang.srt.multimodal.cache.identity import (  # noqa: E402
+    resolve_multimodal_item_identity,
+)
 from sglang.srt.rust_server.multimodal import RustMmProcessor  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -85,9 +86,7 @@ class TestQwenRustMmHashes(CustomTestCase):
                         [CORE.common.content_hash(raw_bytes(s)) for s in sources],
                     )
 
-    def test_python_hashes_the_feature(self):
-        """The contrast: `set_pad_value` on the Python path derives its hash from
-        the feature tensor, which is why the native path must precompute one."""
+    def test_python_hashes_feature_and_processor_metadata(self):
         output = asyncio.run(
             self.processor.process_mm_data_async(
                 image_data=[image_bytes(96, 80)],
@@ -98,9 +97,16 @@ class TestQwenRustMmHashes(CustomTestCase):
             )
         )
         for item in output.mm_items:
-            expected = hash_feature(item.feature)
+            expected = resolve_multimodal_item_identity(
+                feature=item.feature,
+                modality=item.modality.name,
+                input_format=item.format.name,
+                namespace=item.processor_fingerprint,
+                metadata=item.model_specific_data,
+            )
             item.set_pad_value()
-            self.assertEqual(item.hash, expected)
+            self.assertEqual(item.cache_key, expected)
+            self.assertEqual(len(item.cache_key), 32)
 
 
 if __name__ == "__main__":
