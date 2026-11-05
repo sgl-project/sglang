@@ -31,13 +31,15 @@ def _jit_topk_v1_module():
 
 
 @cache_once
-def _jit_topk_v2_module():
+def _jit_topk_v2_module(deterministic: bool):
     from sglang.kernels.jit.utils.occupancy import (
         NoSchedulableClustersError,
         get_max_active_clusters,
     )
 
-    mode = envs.SGLANG_TOPK_V2_MODE.get()
+    # The DSA decode context-parallel merge needs index-ordered ties on its own
+    # calls, whatever the process-wide mode.
+    mode = 2 if deterministic else envs.SGLANG_TOPK_V2_MODE.get()
     assert mode in (0, 1, 2), f"SGLANG_TOPK_V2_MODE must be 0, 1 or 2, got {mode}"
     extra_cuda_cflags = [f"-DSGL_TOPK_MODE={mode}"]
     arch = current_arch()
@@ -63,6 +65,7 @@ def _jit_topk_v2_module():
         ("topk_transform_paged", f"{kernel}::transform_paged"),
         ("topk_transform_ragged", f"{kernel}::transform_ragged"),
         ("topk_transform_packed", f"{kernel}::transform_packed"),
+        ("topk_transform_candidates", f"{kernel}::transform_candidates"),
         ("topk_plan", f"{kernel}::plan"),
         ("topk_transform_kpool", f"{kernel}::transform_kpool"),
         ("topk_transform_kpool_ragged", f"{kernel}::transform_kpool_ragged"),
@@ -70,6 +73,7 @@ def _jit_topk_v2_module():
     return load_jit(
         make_name("topk_v2"),
         *args,
+        f"mode{mode}",
         extra_cuda_cflags=extra_cuda_cflags,
         cuda_files=["deepseek_v4/topk_v2.cuh"],
         cuda_wrappers=wrappers,
@@ -152,7 +156,7 @@ def plan_topk_v2(
                              prefer the cluster implementation.
                              Negative number means internal heuristic.
     """
-    module = _jit_topk_v2_module()
+    module = _jit_topk_v2_module(False)
     bs = seq_lens.shape[0]
     metadata = (
         seq_lens.new_empty(bs + 1, _PLAN_METADATA_INTS_PER_BATCH)
@@ -172,7 +176,7 @@ def topk_v2_plan_is_written(seq_lens: torch.Tensor) -> bool:
         dtype=torch.int32,
         device=seq_lens.device,
     )
-    _jit_topk_v2_module().topk_plan(seq_lens, probe, -1)
+    _jit_topk_v2_module(False).topk_plan(seq_lens, probe, -1)
     return probe[0, 1].item() != -1
 
 
@@ -183,6 +187,7 @@ def topk_transform_ragged_v2(
     out_offsets: torch.Tensor,
     out_indices: torch.Tensor,
     row_starts: Optional[torch.Tensor] = None,
+    deterministic: bool = False,
 ) -> None:
     """Ragged (prefill) fused top-k for a contiguous-KV score matrix.
 
@@ -209,8 +214,71 @@ def topk_transform_ragged_v2(
             row_starts,
         )
         return
-    module = _jit_topk_v2_module()
+    module = _jit_topk_v2_module(deterministic)
     module.topk_transform_ragged(scores, seq_lens, row_starts, out_offsets, out_indices)
+
+
+# Candidate rows longer than this split over a cluster of blocks.
+_CANDIDATES_CLUSTER_FLOOR = 16384
+
+
+def _candidates_cluster_size(rows: int) -> int:
+    arch = current_arch()
+    if rows <= 0 or not (arch.is_sm(9) or arch.is_sm(10)):
+        return 0
+    from sglang.kernels.jit.utils.occupancy import (
+        NoSchedulableClustersError,
+        get_max_active_clusters,
+    )
+
+    for size in (4, 2):
+        try:
+            if rows <= get_max_active_clusters(size, occupancy=1):
+                return size
+        except NoSchedulableClustersError:
+            continue
+    return 0
+
+
+def topk_transform_candidates_v2(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    *,
+    out_candidates: torch.Tensor,
+    world: int,
+    rank: int,
+    row_starts: Optional[torch.Tensor] = None,
+    deterministic: bool = False,
+    cluster_size: Optional[int] = None,
+    cluster_floor: int = _CANDIDATES_CLUSTER_FLOOR,
+) -> None:
+    """Ragged top-k emitting candidates for a distributed top-k merge.
+
+    Row ``i`` selects the top-k of ``scores[i, ks : ks + seq_lens[i]]`` (``ks
+    = row_starts[i]``, 0 when omitted) exactly as :func:`topk_transform_ragged_v2`
+    does, and writes ``out_candidates[i]`` (``[topk, 2]`` int32) = (fp32 score
+    bits, ``position * world + rank``) per selected position, ``(0, -1)``
+    padded. Local position ``l`` of rank ``rank`` is global position
+    ``l * world + rank`` under decode context parallelism.
+
+    ``cluster_size`` None picks one from the row count (rows starting at
+    column 0 only); 0 keeps one block per row.
+
+    NOTE: ``scores`` is written in place as for the ragged entry point.
+    """
+    if cluster_size is None:
+        rows = seq_lens.shape[0]
+        cluster_size = 0 if row_starts is not None else _candidates_cluster_size(rows)
+    _jit_topk_v2_module(deterministic).topk_transform_candidates(
+        scores,
+        seq_lens,
+        row_starts,
+        out_candidates,
+        world,
+        rank,
+        cluster_size,
+        cluster_floor,
+    )
 
 
 def topk_transform_paged_v2(
@@ -221,6 +289,8 @@ def topk_transform_paged_v2(
     page_size: int,
     metadata: torch.Tensor,
     out_raw_indices: Optional[torch.Tensor] = None,
+    *,
+    deterministic: bool = False,
 ) -> None:
     """Fused top-k + optional page-table transform (DeepSeek-V4 top-k v2 kernel).
 
@@ -242,6 +312,12 @@ def topk_transform_paged_v2(
     come from :func:`plan_topk_v2` over the same `seq_lens` values.
     A length of 0 is the valid way to express "no tokens": the row takes the
     trivial path and the output is guaranteed to be all -1.
+
+    Among scores equal to the k-th largest, which fill the last slots is
+    arbitrary, unless ``deterministic`` builds this call in top-k mode 2
+    (``SGLANG_TOPK_V2_MODE``): then the smallest indices do (the merge of the
+    DSA decode context-parallel top-k relies on it). The same holds for
+    the candidates and packed entry points.
     """
     if is_xpu():
         if out_raw_indices is not None:
@@ -263,7 +339,7 @@ def topk_transform_paged_v2(
             metadata,
         )
         return
-    module = _jit_topk_v2_module()
+    module = _jit_topk_v2_module(deterministic)
     module.topk_transform_paged(
         scores,
         seq_lens,
@@ -293,7 +369,7 @@ def topk_transform_kpool_v2(
     ``metadata`` is :func:`plan_topk_v2` over ``pool_lens``. The kernel reads it
     before its PDL wait, so plan before launching the kernel that writes ``scores``.
     """
-    _jit_topk_v2_module().topk_transform_kpool(
+    _jit_topk_v2_module(False).topk_transform_kpool(
         scores,
         pool_lens,
         token_seq_lens,
@@ -325,7 +401,7 @@ def topk_transform_kpool_ragged_v2(
 
     NOTE: ``scores`` is written in place, as in :func:`topk_transform_ragged_v2`.
     """
-    _jit_topk_v2_module().topk_transform_kpool_ragged(
+    _jit_topk_v2_module(False).topk_transform_kpool_ragged(
         scores,
         pool_lens,
         row_starts,
@@ -348,6 +424,7 @@ def topk_transform_packed_v2(
     *,
     row_starts: torch.Tensor,
     row_to_batch: Optional[torch.Tensor] = None,
+    deterministic: bool = False,
 ) -> None:
     """Packed (DSA extend prefill) fused top-k + page-table transform.
 
@@ -369,7 +446,7 @@ def topk_transform_packed_v2(
     pass a view with overlapping rows.
     ``seq_lens`` entries must be NON-NEGATIVE, as for the paged entry point.
     """
-    module = _jit_topk_v2_module()
+    module = _jit_topk_v2_module(deterministic)
     module.topk_transform_packed(
         scores,
         seq_lens,
