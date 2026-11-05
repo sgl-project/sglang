@@ -146,6 +146,21 @@ def reference_pages(
     return REFERENCE[layout](full, page_bytes=page_bytes)
 
 
+class TestV41ScaleFloor(CustomTestCase):
+    def test_scale_floor_follows_act_quant(self):
+        """DeepSeek's act_quant floors amax at 1e-4 and then divides by 448, so the
+        smallest V41 scale is 2^-22. Flooring the quotient instead gives 2^-13 and
+        coarsens every tile whose amax is at most 448 * 2^-14."""
+
+        maxima = [0.0, 2**-20, 2**-14, 2**-12, 1e-3, 0.02, 448 * 2**-14, 0.03, 1.0]
+        amax = torch.tensor(maxima, dtype=torch.bfloat16).float()
+        want = torch.tensor(
+            [2.0 ** math.ceil(math.log2(max(a, 1e-4) / 448)) for a in amax.tolist()]
+        )
+        self.assertTrue(torch.equal(tq.ceil_pow2_scale(amax), want))
+        self.assertEqual(float(tq.ceil_pow2_scale(torch.zeros(1))), 2.0**-22)
+
+
 def _v41_store_kernels_available() -> bool:
     if not torch.cuda.is_available():
         return False
@@ -269,7 +284,9 @@ class TestV41KVStore(CustomTestCase):
 
         maxima = [
             0,
+            2**-20,
             2**-12,
+            0.02,
             6 * 2**-9,
             6 * 1.0625,
             6 * 1.1875,

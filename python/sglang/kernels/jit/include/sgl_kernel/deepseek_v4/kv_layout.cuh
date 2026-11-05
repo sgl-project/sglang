@@ -169,7 +169,7 @@ SGL_DEVICE float vec_amax(const float (&v)[kVecSize]) {
 }
 
 /// V4.1 fp8 row: one ue8m0 scale per 32-element tile. `data_row` is the token's 512 B,
-/// `scale_row` its 16 scale bytes. Scale `2^ceil(log2(max(amax / 448, 1e-4)))` stored as the
+/// `scale_row` its 16 scale bytes. Scale `2^ceil(log2(max(amax, 1e-4) / 448))` stored as the
 /// ue8m0 byte, payload `e4m3(x / scale)` rounded to nearest even (|x / scale| <= 448, so it
 /// never saturates).
 template <uint32_t kVecSize>
@@ -179,11 +179,12 @@ SGL_DEVICE void store_row_fp8(uint8_t* data_row, uint8_t* scale_row, uint32_t tx
   static_assert(kVecSize % 2 == 0 && kTileLanes >= 1 && (kTileLanes & (kTileLanes - 1)) == 0);
 
   const float amax = warp::reduce_max<kTileLanes>(vec_amax(v));
-  // ceil(log2(max(amax / 448, 1e-4))) exactly, from the bits of amax: 448 = 1.75 * 2^8, so the
-  // quotient's exponent is amax's minus 8, plus one when the mantissa exceeds 1.75, floored at 2^-13.
+  // ceil(log2(max(amax, 1e-4) / 448)) exactly, from the bits of amax: 448 = 1.75 * 2^8, so the
+  // quotient's exponent is amax's minus 8, plus one when the mantissa exceeds 1.75, floored at 2^-22
+  // (amax is floored before the division, as in DeepSeek's act_quant).
   const uint32_t bits = __float_as_uint(amax);
   const int32_t exponent =
-      max(static_cast<int32_t>(bits >> 23) - 8 + static_cast<int32_t>((bits & 0x7FFFFFu) > 0x600000u), 114);
+      max(static_cast<int32_t>(bits >> 23) - 8 + static_cast<int32_t>((bits & 0x7FFFFFu) > 0x600000u), 105);
   // The scale is a power of two, so the multiply by its reciprocal is the exact quotient.
   const float inv_scale = fp8::inv_scale_ue8m0(exponent);
   AlignedVector<fp8x2_e4m3_t, kVecSize / 2> out;
