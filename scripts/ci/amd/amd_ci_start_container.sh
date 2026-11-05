@@ -55,7 +55,11 @@ while [[ $# -gt 0 ]]; do
       echo ""
       echo "Environment:"
       echo "  ENABLE_CACHE_HOST=1|0"
-      echo "      Mount /home/runner/sglang-data to /sgl-data. Defaults to 1 when RUNNER_NAME contains 300 or 35x, otherwise 0. Missing host cache falls back to container-local /sgl-data."
+      echo "      Mount the host cache (AMD_CI_CACHE_HOST) to /sgl-data. Defaults to 1 when AMD_CI_CACHE_HOST is set or RUNNER_NAME contains 300 or 35x, otherwise 0. Missing host cache falls back to container-local /sgl-data."
+      echo "  AMD_CI_CACHE_HOST=PATH"
+      echo "      Host directory for the persistent cache. Default: /home/runner/sglang-data."
+      echo "  AMD_CI_GPU_ARCH=mi35x|mi30x"
+      echo "      GPU architecture for runners whose hostname is not linux-<arch>-gpu-N (non-ARC hosts)."
       exit 0
       ;;
     *) echo "Unknown option $1"; exit 1;;
@@ -69,7 +73,11 @@ HOSTNAME_VALUE=$(hostname)
 GPU_ARCH="mi30x"   # default
 
 # Host names look like: linux-mi35x-gpu-1-xxxxx-runner-zzzzz
-if [[ "${HOSTNAME_VALUE}" =~ ^linux-(mi[0-9]+[a-z]*)-gpu-[0-9]+ ]]; then
+# Non-ARC runners have no such hostname and set AMD_CI_GPU_ARCH instead.
+if [[ -n "${AMD_CI_GPU_ARCH:-}" ]]; then
+  GPU_ARCH="${AMD_CI_GPU_ARCH}"
+  echo "Using GPU architecture from AMD_CI_GPU_ARCH: ${GPU_ARCH}"
+elif [[ "${HOSTNAME_VALUE}" =~ ^linux-(mi[0-9]+[a-z]*)-gpu-[0-9]+ ]]; then
   GPU_ARCH="${BASH_REMATCH[1]}"
   echo "Detected GPU architecture from hostname: ${GPU_ARCH}"
 else
@@ -145,7 +153,7 @@ find_latest_image() {
       *)     echo "Error: unsupported GPU architecture '${gpu_arch}'" >&2; return 1 ;;
   esac
 
-  # First, check local cache on the runner.
+  # Prefer the newest date, checking both local and remote before falling back.
   for days_back in {0..6}; do
     image_tag="${base_tag}-$(date -d "${days_back} days ago" +%Y%m%d)"
     image_id=$(docker images -q "rocm/sgl-dev:${image_tag}")
@@ -154,17 +162,13 @@ find_latest_image() {
       echo "rocm/sgl-dev:${image_tag}"
       return 0
     fi
-  done
-
-  # If not found locally, resolve the latest tag from the public registry.
-  for days_back in {0..6}; do
-    image_tag="${base_tag}-$(date -d "${days_back} days ago" +%Y%m%d)"
     echo "Checking for image: rocm/sgl-dev:${image_tag}" >&2
     if docker manifest inspect "rocm/sgl-dev:${image_tag}" >/dev/null 2>&1; then
       echo "Found available image: rocm/sgl-dev:${image_tag}" >&2
       echo "rocm/sgl-dev:${image_tag}"
       return 0
     fi
+    echo "Image unavailable: rocm/sgl-dev:${image_tag}; checking older dates" >&2
   done
 
   # Docker Hub's `name=` filter is fuzzy; only accept official version tags.
@@ -260,7 +264,11 @@ else
   retry_with_backoff 6 docker pull "${IMAGE}"
 fi
 
-CACHE_HOST=/home/runner/sglang-data
+# Non-ARC hosts have no /home/runner; setting AMD_CI_CACHE_HOST also turns the mount on.
+CACHE_HOST="${AMD_CI_CACHE_HOST:-/home/runner/sglang-data}"
+if [[ -z "${ENABLE_CACHE_HOST:-}" && -n "${AMD_CI_CACHE_HOST:-}" ]]; then
+  ENABLE_CACHE_HOST="1"
+fi
 if [[ -z "${ENABLE_CACHE_HOST:-}" ]]; then
   RUNNER_NAME_LOWER="${RUNNER_NAME:-}"
   RUNNER_NAME_LOWER="${RUNNER_NAME_LOWER,,}"

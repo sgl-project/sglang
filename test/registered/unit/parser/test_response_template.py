@@ -4,6 +4,10 @@ import copy
 import json
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
+
+from xgrammar import Grammar
+from xgrammar.testing import _is_grammar_accept_string
 
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
@@ -12,14 +16,17 @@ from sglang.srt.entrypoints.openai.protocol import (
     Tool,
     ToolChoice,
 )
+from sglang.srt.function_call.beam_detector import BeamDetector
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.gemma4_detector import (
     Gemma4Detector as Gemma4ToolDetector,
 )
+from sglang.srt.parser.beam import BeamReasoningDetector
 from sglang.srt.parser.reasoning_parser import Gemma4Detector as Gemma4ReasoningDetector
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.parser.response_template import (
     GRAMMAR_AFTER_REASONING,
+    GRAMMAR_AT_ANSWER,
     GRAMMAR_FROM_START,
     ResponseTemplateReasoningDetector,
     ResponseTemplateToolDetector,
@@ -241,6 +248,9 @@ class TestResponseTemplateLoading(CustomTestCase):
             GEMMA4_RESPONSE_TEMPLATE,
         )
         self.assertIs(FallbackDetector().response_template, XML_TOOL_TEMPLATE)
+        # Present metadata is validated even when empty; only absent metadata falls back.
+        with self.assertRaisesRegex(ValueError, "non-empty dict"):
+            FallbackDetector(tokenizer=SimpleNamespace(response_template={}))
 
     def test_tool_detector_requires_tool_calls_field(self):
         template = copy.deepcopy(GEMMA4_RESPONSE_TEMPLATE)
@@ -562,6 +572,11 @@ class TestResponseTemplateAdapters(CustomTestCase):
                 "<think>Plan</think>" + delimited,
                 ("Plan", delimited),
             ),
+            (
+                GRAMMAR_AT_ANSWER,
+                "<think>Plan</think><answer>" + delimited,
+                ("Plan", delimited),
+            ),
             (GRAMMAR_FROM_START, delimited, ("", delimited)),
         )
         for grammar_start, output, expected in cases:
@@ -704,15 +719,76 @@ class TestResponseTemplateAdapters(CustomTestCase):
         self.assertTrue(detector.thinks_internally)
         self.assertEqual(detector.reasoning_default, "always")
 
+    def test_json_after_reasoning_is_framed_as_the_answer(self):
+        """JSON started at the reasoning end must not skip the answer opener, unless a
+        call starts."""
+        detector = BeamReasoningDetector(response_template=DELIMITED_TEMPLATE)
+        call = '<call:get_weather>{"days": 3}</call>'
+        tag = detector.json_answer_structural_tag(
+            {"type": "object"}, tools=[_tool().model_dump()]
+        )
+        grammar = Grammar.from_structural_tag(json.dumps(tag))
+
+        self.assertEqual(detector.think_end_token, "</think>")
+        self.assertFalse(_is_grammar_accept_string(grammar, call + '<answer>{"a": 1}'))
+
+    def test_message_start_call_opens_as_the_parser_opens_it(self):
+        """A message-start call must not continue the anchor in a form the parser does
+        not open."""
+        template = copy.deepcopy(DELIMITED_TEMPLATE)
+        template["fields"]["tool_calls"]["open_pattern"] = (
+            r"<assistant><call:(?P<name>\w+)>"
+        )
+        detector = BeamDetector(response_template=template, prefix="<assistant>")
+        call = '<call:get_weather>{"days": 3}</call>'
+
+        tag = detector.get_structural_tag(
+            tools=[_tool()], tool_choice="required", message_start=True
+        )
+        grammar = Grammar.from_structural_tag(tag.model_dump_json())
+        parsed = detector.detect_and_parse("<assistant>" + call, [_tool()])
+
+        self.assertFalse(_is_grammar_accept_string(grammar, call))
+        self.assertTrue(_is_grammar_accept_string(grammar, "<assistant>" + call))
+        self.assertEqual(
+            [(call.name, json.loads(call.parameters)) for call in parsed.calls],
+            [("get_weather", {"days": 3})],
+        )
+
+    def test_message_start_call_opener_may_nest_its_name(self):
+        template = copy.deepcopy(DELIMITED_TEMPLATE)
+        template["fields"]["tool_calls"]["open_pattern"] = r"(?:<call:(?P<name>\w+)>)"
+        detector = BeamDetector(response_template=template, prefix="<assistant>")
+        call = '<call:get_weather>{"days": 3}</call>'
+
+        tag = detector.get_structural_tag(
+            tools=[_tool()], tool_choice="required", message_start=True
+        )
+        grammar = Grammar.from_structural_tag(tag.model_dump_json())
+
+        self.assertTrue(_is_grammar_accept_string(grammar, call))
+
     def test_transform_each_tool_region_emits_all_calls(self):
         """Each member is transformed with the opener's captures, and its
-        arguments are cast to the tool schema."""
+        arguments are cast to the tool schema. A JSON string stays a string
+        where the schema allows one."""
         template = TRANSFORM_EACH_RESPONSE_TEMPLATE
-        tools = [_tool(), _tool("get_forecast")]
+        lookup = Tool(
+            type="function",
+            function=Function(
+                name="lookup",
+                parameters={
+                    "type": "object",
+                    "properties": {"code": {"type": ["string", "integer"]}},
+                },
+            ),
+        )
+        tools = [_tool(), _tool("get_forecast"), lookup]
         opener = "<calls id=1>"
         text = (
             opener + '[{"name":"get_weather","arguments":{"location":"Paris"}},'
-            '{"name":"get_forecast","arguments":{"days":"3"}}]</calls>'
+            '{"name":"get_forecast","arguments":{"days":"3"}},'
+            '{"name":"lookup","arguments":{"code":"123"}}]</calls>'
         )
         detector = ResponseTemplateToolDetector(
             response_template=template,
@@ -727,6 +803,7 @@ class TestResponseTemplateAdapters(CustomTestCase):
             [
                 ("get_weather", {"location": "Paris"}),
                 ("get_forecast", {"days": 3}),
+                ("lookup", {"code": "123"}),
             ],
         )
 
@@ -745,6 +822,7 @@ class TestResponseTemplateAdapters(CustomTestCase):
             [
                 ("get_weather", {"location": "Paris"}),
                 ("get_forecast", {"days": 3}),
+                ("lookup", {"code": "123"}),
             ],
         )
 
@@ -872,6 +950,23 @@ class TestResponseTemplateAdapters(CustomTestCase):
         self.assertTrue(detector.has_tool_call(opener))
         result = detector.detect_and_parse(opener, [_tool()])
         self.assertEqual(result.normal_text, "")
+        self.assertEqual(result.calls, [])
+
+    def test_cut_off_call_too_deep_to_decode_is_dropped(self):
+        """A cut-off call whose arguments nest too deeply to decode is dropped,
+        keeping the text before it, instead of failing the response."""
+        detector = ResponseTemplateToolDetector(
+            response_template=GEMMA4_RESPONSE_TEMPLATE,
+        )
+        text = "hello" + TOOL_CALL.split("{", 1)[0] + "{hours:[[1"
+
+        # How deeply JSON must nest to exhaust the decoder depends on the Python version.
+        with patch("json.loads", side_effect=RecursionError) as decode:
+            self.assertTrue(detector.has_tool_call(text))
+            result = detector.detect_and_parse(text, [_tool()])
+
+        decode.assert_called_with('{"hours":[[1')
+        self.assertEqual(result.normal_text, "hello")
         self.assertEqual(result.calls, [])
 
     def test_streaming_malformed_call_is_dropped_before_emission(self):
@@ -1181,18 +1276,37 @@ class TestResponseTemplateAdapters(CustomTestCase):
         self.assertEqual(closed.normal_text, "")
         self.assertEqual(closed.calls, [])
 
-    def test_strict_tools_require_native_constraint_support(self):
-        tokenizer = SimpleNamespace(response_template=GEMMA4_RESPONSE_TEMPLATE)
-        tool = _tool()
-        tool.function.strict = True
-        parser = FunctionCallParser(
-            tools=[tool],
-            tool_call_parser="response_template",
-            tokenizer=tokenizer,
-        )
+    def test_automatic_tool_guarantees_are_enforced_or_rejected(self):
+        """Strict or single automatic calls must not go unenforced: they get the grammar
+        or fail."""
+        strict_tool = _tool()
+        strict_tool.function.strict = True
+        call = '<call:get_weather>{"days": 3}</call>'
+        for requested, tools, parallel in (
+            ("strict tools", [strict_tool], True),
+            ("parallel_tool_calls=False", [_tool()], False),
+        ):
+            with self.subTest(requested):
+                kind, tag = FunctionCallParser(
+                    tools=tools,
+                    tool_call_parser="beam",
+                    tokenizer=SimpleNamespace(response_template=DELIMITED_TEMPLATE),
+                ).get_structure_constraint("auto", parallel_tool_calls=parallel)
+                grammar = Grammar.from_structural_tag(tag.model_dump_json())
+                self.assertEqual(kind, "structural_tag")
+                self.assertIs(_is_grammar_accept_string(grammar, call + call), parallel)
 
-        with self.assertRaisesRegex(ValueError, "does not support strict"):
-            parser.get_structure_constraint("auto")
+                parser = FunctionCallParser(
+                    tools=tools,
+                    tool_call_parser="beam",
+                    tokenizer=SimpleNamespace(
+                        response_template=GEMMA4_RESPONSE_TEMPLATE
+                    ),
+                )
+                with self.assertRaisesRegex(ValueError, requested):
+                    parser.get_structure_constraint(
+                        "auto", parallel_tool_calls=parallel
+                    )
 
     def test_required_and_named_tools_use_generic_json_schema(self):
         tokenizer = SimpleNamespace(response_template=GEMMA4_RESPONSE_TEMPLATE)
@@ -1222,16 +1336,25 @@ class TestResponseTemplateAdapters(CustomTestCase):
             "json_schema",
         )
 
-    def test_parallel_false_auto_is_rejected_without_native_constraint(self):
-        tokenizer = SimpleNamespace(response_template=GEMMA4_RESPONSE_TEMPLATE)
-        parser = FunctionCallParser(
-            tools=[_tool()],
-            tool_call_parser="response_template",
-            tokenizer=tokenizer,
-        )
-
-        with self.assertRaisesRegex(ValueError, "parallel_tool_calls=False"):
-            parser.get_structure_constraint("auto", parallel_tool_calls=False)
+        # A strict tool the native format cannot hold to its schema keeps forced
+        # calls on the JSON array, and the parser must then expect it too.
+        untyped = _tool()
+        untyped.function.parameters["properties"]["days"] = {
+            "$ref": "https://example.com/days.json"
+        }
+        for strict, native in ((False, True), (True, False)):
+            with self.subTest(strict=strict):
+                untyped.function.strict = strict
+                parser = FunctionCallParser(
+                    tools=[untyped],
+                    tool_call_parser="beam",
+                    tokenizer=SimpleNamespace(response_template=XML_TOOL_TEMPLATE),
+                )
+                self.assertEqual(
+                    parser.get_structure_constraint("required")[0],
+                    "structural_tag" if native else "json_schema",
+                )
+                self.assertIs(parser.detector.supports_structural_tag(), native)
 
 
 if __name__ == "__main__":

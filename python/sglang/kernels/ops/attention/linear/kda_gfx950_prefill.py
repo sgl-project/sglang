@@ -16,6 +16,7 @@ from functools import lru_cache
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.selector import get_kernel
 from sglang.kernels.spec import KernelBackend
 
@@ -27,7 +28,8 @@ def available() -> bool:
         return False
     if not torch.version.hip or not torch.cuda.is_available():
         return False
-    return torch.cuda.get_device_properties(0).gcnArchName.split(":")[0] == "gfx950"
+    hip = current_arch().hip
+    return hip is not None and hip.gcn_arch == "gfx950"
 
 
 def extend(

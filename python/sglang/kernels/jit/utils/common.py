@@ -62,14 +62,16 @@ def empty_sentinel(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     return torch.empty(0, dtype=dtype, device=device)
 
 
-@cache_once
 def is_hip_runtime() -> bool:
-    return bool(torch.version.hip)
+    from sglang.kernels.spec import PlatformInfo
+
+    return PlatformInfo.detect().is_hip
 
 
-@cache_once
 def is_musa_runtime() -> bool:
-    return getattr(torch.version, "musa", None) is not None
+    from sglang.kernels.spec import PlatformInfo
+
+    return PlatformInfo.detect().is_musa
 
 
 @cache_once

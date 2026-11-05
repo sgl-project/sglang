@@ -10,22 +10,33 @@ use dynamo_renderer::{OAIChatLikeRequest, OAIPromptFormatter, PromptFormatter, R
 use serde_json::Value;
 use thiserror::Error;
 
+mod content_format;
 mod legacy;
 mod loader;
 mod models;
 mod reasoning;
 mod selection;
+mod template;
 mod thinking;
 
 use self::legacy::LegacyFormatter;
 pub use self::loader::load_chat_formatter;
-pub use self::models::DeepSeekTokenizer;
+pub(crate) use self::models::deepseek_v4_thinking;
+pub use self::models::{DeepSeekTokenizer, continues_final_message};
 use self::models::{
-    deep_sort, deepseek_v4_thinking, encode_tools_to_typescript, is_glm53, is_qwen38,
-    render_deepseek_v4, render_glm53, render_kimi_k3, render_qwen38, takes_content_parts,
+    deep_sort, encode_tools_to_typescript, is_glm53, is_minimax_m3, is_qwen38,
+    prints_arguments_as_xml, render_deepseek_v4, render_glm53, render_kimi_k3, render_minimax_m3,
+    render_qwen38, takes_content_parts,
+};
+#[cfg(feature = "openai")]
+pub(crate) use self::models::{
+    deepseek_v4_continued_message, deepseek_v4_parse_start, deepseek_v4_special_tokens,
+    deepseek_v4_task, pydantic_bool,
 };
 pub use self::reasoning::{requested_effort, requested_thinking};
 pub use self::selection::{ChatFormatterOptions, select_chat_formatter};
+pub use self::template::TemplateArgs;
+use self::thinking::ThinkingPolicy;
 pub use self::thinking::ThinkingTemplates;
 
 /// Legacy stop strings: a single separator-style stop or a list of stops.
@@ -56,6 +67,16 @@ pub enum ChatFormatter {
     /// Dynamo's K3 formatter: [`Self::render_prompt`] keeps Dynamo's request
     /// semantics, while [`Self::render_request`] follows SGLang's.
     KimiK3,
+    /// MiniMax-M3's and M3.1's Jinja template, which `render_request` renders as SGLang does.
+    MiniMaxM3 {
+        formatter: PromptFormatter,
+        /// The template prints tool-call argument scalars through M3's `to_xml`.
+        xml_arguments: bool,
+        /// Python's content format; unknown formats decline parts-list requests.
+        content_parts: Option<bool>,
+        /// Private context key, chosen not to collide with template variables.
+        message_context: String,
+    },
     /// Qwen3.8's Jinja template, which `render_request` renders as SGLang does.
     Qwen38 {
         formatter: PromptFormatter,
@@ -82,6 +103,7 @@ impl ChatFormatter {
         match self {
             ChatFormatter::HuggingFace { formatter, .. }
             | ChatFormatter::Glm53(formatter)
+            | ChatFormatter::MiniMaxM3 { formatter, .. }
             | ChatFormatter::Qwen38 { formatter, .. } => render_oai(formatter, request),
             ChatFormatter::KimiK25 { formatter, .. } => {
                 let mut args = request.chat_template_args().cloned().unwrap_or_default();
@@ -98,7 +120,15 @@ impl ChatFormatter {
                     }
                     args.insert("tools".into(), tools);
                 }
-                render_oai(formatter, &TemplateArgsRequest { request, args })
+                render_oai(
+                    formatter,
+                    &TemplateArgsRequest {
+                        request,
+                        args,
+                        messages: None,
+                        tools: None,
+                    },
+                )
             }
             ChatFormatter::KimiK3 => {
                 KimiK3Formatter::new(true)
@@ -134,8 +164,8 @@ impl ChatFormatter {
     /// `chat_template_kwargs`, returning the prompt and the
     /// `continue_final_message` prefix SGLang tokenizes separately.
     /// The body must be one SGLang's `ChatCompletionRequest` accepts; it is not
-    /// re-validated. Only DeepSeek-V4, V4.1, GLM-5.3, Kimi K3 and Qwen3.8 render
-    /// this way; others use [`Self::render_prompt`].
+    /// re-validated. Only DeepSeek-V4, V4.1, GLM-5.3, Kimi K3, MiniMax-M3 and Qwen3.8
+    /// render this way; others use [`Self::render_prompt`].
     pub fn render_request(
         &self,
         request: Value,
@@ -145,21 +175,40 @@ impl ChatFormatter {
         match self {
             // recipe renders a continued final message itself, so no prefix follows.
             ChatFormatter::DeepSeekV4(_) => render_deepseek_v4(false, request, default_kwargs)
-                .map(|prompt| (prompt, String::new())),
+                .map(|prompt| (prompt, String::new()))
+                .map_err(RenderError::Failed),
             ChatFormatter::DeepSeekV41(_) => render_deepseek_v4(true, request, default_kwargs)
-                .map(|prompt| (prompt, String::new())),
+                .map(|prompt| (prompt, String::new()))
+                .map_err(RenderError::Failed),
             ChatFormatter::Glm53(formatter) => {
                 render_glm53(formatter, request, default_kwargs).map(text)
             }
             ChatFormatter::KimiK3 => render_kimi_k3(request, default_kwargs),
+            ChatFormatter::MiniMaxM3 {
+                formatter,
+                xml_arguments,
+                content_parts,
+                message_context,
+            } => render_minimax_m3(
+                formatter,
+                *xml_arguments,
+                *content_parts,
+                message_context,
+                request,
+                default_kwargs,
+            )
+            .map(text),
             ChatFormatter::Qwen38 {
                 formatter,
                 content_parts,
                 ..
             } => render_qwen38(formatter, *content_parts, request, default_kwargs).map(text),
-            _ => Err("this formatter renders through render_prompt".into()),
+            _ => Err(RenderError::Declined("this formatter's requests".into())),
         }
-        .map_err(|message| TemplateError::Renderer { message })
+        .map_err(|error| match error {
+            RenderError::Declined(message) => TemplateError::NeedsRenderFallback { message },
+            RenderError::Failed(message) => TemplateError::Renderer { message },
+        })
     }
 
     /// DeepSeek-V4 or V4.1 through deepseek-recipe; `tokenizer_json`, the
@@ -212,21 +261,41 @@ impl ChatFormatter {
             | ChatFormatter::DeepSeekV41(_)
             | ChatFormatter::Glm53(_)
             | ChatFormatter::KimiK3
+            | ChatFormatter::MiniMaxM3 { .. }
             | ChatFormatter::Qwen38 { .. } => None,
             ChatFormatter::Legacy(formatter) => formatter.spec.stop_str.clone(),
         }
     }
 
     /// Whether the template always reasons, as `template_detection` resolves
-    /// GLM-5.3's (`glm53_always_think`).
+    /// GLM-5.3's (`glm53_always_think`) and the Jinja templates it detects.
     pub fn always_thinks(&self) -> bool {
-        matches!(self, ChatFormatter::Glm53(_))
+        match self {
+            ChatFormatter::Glm53(_) => true,
+            ChatFormatter::HuggingFace { thinking, .. }
+            | ChatFormatter::KimiK25 { thinking, .. } => {
+                thinking.default_policy() == ThinkingPolicy::Always
+            }
+            _ => false,
+        }
     }
 
     /// The template's reasoning toggle kwarg and its default, as
-    /// `template_detection` resolves Qwen3.8's (`enable_thinking_default_true`).
+    /// `template_detection` resolves Qwen3.8's (`enable_thinking_default_true`)
+    /// and the Jinja templates it detects.
     pub fn reasoning_toggle(&self) -> Option<(&'static str, bool)> {
-        matches!(self, ChatFormatter::Qwen38 { .. }).then_some(("enable_thinking", true))
+        match self {
+            ChatFormatter::Qwen38 { .. } => Some(("enable_thinking", true)),
+            ChatFormatter::HuggingFace { thinking, .. }
+            | ChatFormatter::KimiK25 { thinking, .. } => match thinking.default_policy() {
+                ThinkingPolicy::TemplateToggle {
+                    key,
+                    default_enabled,
+                } => Some((key, default_enabled)),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     /// Resolve the template's effective thinking mode and materialize its
@@ -257,7 +326,8 @@ impl ChatFormatter {
             }
             // `template_detection`'s `glm53_always_think`.
             ChatFormatter::Glm53(_) => Some(true),
-            ChatFormatter::Legacy(_) => None,
+            // M3 reads `thinking_mode`, which its reasoning parser resolves.
+            ChatFormatter::MiniMaxM3 { .. } | ChatFormatter::Legacy(_) => None,
         }
     }
 }
@@ -276,10 +346,12 @@ fn render_oai(
 
 /// Formatter-facing request view over adapted template arguments.
 /// Native effort access and template arguments share the adapted value without
-/// changing the original request.
+/// changing the original request; `messages` and `tools` replace its own when set.
 struct TemplateArgsRequest<'a> {
     request: &'a dyn OAIChatLikeRequest,
     args: HashMap<String, Value>,
+    messages: Option<minijinja::Value>,
+    tools: Option<Option<Value>>,
 }
 
 impl OAIChatLikeRequest for TemplateArgsRequest<'_> {
@@ -288,15 +360,24 @@ impl OAIChatLikeRequest for TemplateArgsRequest<'_> {
     }
 
     fn messages(&self) -> minijinja::Value {
-        self.request.messages()
+        match &self.messages {
+            Some(messages) => messages.clone(),
+            None => self.request.messages(),
+        }
     }
 
     fn typed_messages(&self) -> Option<&[ChatCompletionRequestMessage]> {
-        self.request.typed_messages()
+        match self.messages {
+            Some(_) => None,
+            None => self.request.typed_messages(),
+        }
     }
 
     fn tools(&self) -> Option<minijinja::Value> {
-        self.request.tools()
+        match &self.tools {
+            Some(tools) => tools.as_ref().map(minijinja::Value::from_serialize),
+            None => self.request.tools(),
+        }
     }
 
     fn tool_choice(&self) -> Option<minijinja::Value> {
@@ -321,6 +402,29 @@ impl OAIChatLikeRequest for TemplateArgsRequest<'_> {
 
     fn chat_template_args(&self) -> Option<&HashMap<String, Value>> {
         Some(&self.args)
+    }
+}
+
+/// Why a parity renderer did not render a request.
+#[derive(Debug)]
+pub(crate) enum RenderError {
+    /// A valid request it cannot render exactly as SGLang does, named by what
+    /// it declines; [`ChatFormatter::render_request`] maps it to
+    /// [`TemplateError::NeedsRenderFallback`].
+    Declined(String),
+    /// An invalid request, or one the template rejects.
+    Failed(String),
+}
+
+impl From<String> for RenderError {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+
+impl From<&str> for RenderError {
+    fn from(message: &str) -> Self {
+        Self::Failed(message.to_owned())
     }
 }
 
@@ -365,6 +469,11 @@ pub enum TemplateError {
 
     #[error("invalid chat template: {message}")]
     Renderer { message: String },
+
+    /// A valid request [`ChatFormatter::render_request`] cannot render exactly as
+    /// SGLang does; the host should render it another way, not reject it.
+    #[error("the parity renderer declines {message}")]
+    NeedsRenderFallback { message: String },
 
     #[error("legacy chat template `{path}` must be a JSON object")]
     LegacyNotObject { path: PathBuf },

@@ -10,13 +10,23 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Lifecycle management for an optional local native gRPC sidecar."""
+"""Lifecycle management for an optional local native gRPC sidecar.
+
+The Python server runs the sidecar against its native gRPC server. In
+Rust-server mode the launcher on every node that hosts a Rust listener runs
+one sidecar against the node's first listener, which serves gRPC on
+--grpc-port.
+"""
 
 import argparse
+import contextlib
 import importlib
 import logging
 import multiprocessing as mp
 import os
+import signal
+import threading
+from typing import Callable, Iterator
 
 from sglang.srt.runtime_context import (
     get_serving,
@@ -131,3 +141,69 @@ def start_sidecar() -> Sidecar:
     )
     sidecar.start()
     return sidecar
+
+
+@contextlib.contextmanager
+def rust_server_sidecar(node_hosts_listener: bool) -> Iterator[None]:
+    """Run the --sidecar module for the duration of the block, against this
+    node's first Rust listener. A no-op without --sidecar or on a node that
+    hosts no listener."""
+    if get_serving().sidecar is None or not node_hosts_listener:
+        yield
+        return
+
+    # The node's first listener binds the base ports, so start_sidecar's
+    # --grpc-port endpoint is the one it serves.
+    sidecar = start_sidecar()
+    stopped = False
+
+    def stop() -> None:
+        nonlocal stopped
+        # Marked first, so a SIGTERM arriving during this stop is forwarded at
+        # once instead of stopping the same process again.
+        if stopped:
+            return
+        stopped = True
+        try:
+            sidecar.stop()
+        except Exception:
+            logger.exception("Failed to stop sidecar")
+
+    try:
+        with _stop_on_sigterm(stop):
+            yield
+    finally:
+        stop()
+
+
+@contextlib.contextmanager
+def _stop_on_sigterm(stop: Callable[[], None]) -> Iterator[None]:
+    """For the duration of the block, SIGTERM runs ``stop`` and then reaches
+    the handler it replaced, or the default action."""
+    if threading.current_thread() is not threading.main_thread():
+        logger.warning(
+            "The sidecar will not drain on SIGTERM: signal handlers can only be "
+            "installed from the main thread."
+        )
+        yield
+        return
+
+    previous = signal.getsignal(signal.SIGTERM)
+
+    def stop_then_forward(signum, frame):
+        stop()
+        # Pass the signal on to the handler this replaced, or to the default action.
+        if callable(previous):
+            previous(signum, frame)
+        elif previous == signal.SIG_DFL:
+            signal.signal(signum, signal.SIG_DFL)
+            os.kill(os.getpid(), signum)
+            # Still running: the kernel drops a default-action signal sent to
+            # PID 1 of a PID namespace (a container without an init).
+            raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGTERM, stop_then_forward)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous)

@@ -181,7 +181,7 @@ class Spec(msgspec.Struct):
     speculative_moe_a2a_backend: A[
         Optional[str],
         Arg(
-            help="Choose the backend for MoE A2A in speculative decoding. Defaults to --moe-a2a-backend, except flashinfer_megamoe defaults the draft to none (draft layers are typically unquantized, which flashinfer_megamoe's global-expert-id dispatch doesn't support).",
+            help="Choose the backend for MoE A2A in speculative decoding. Defaults to --moe-a2a-backend, except flashinfer_megamoe defaults the draft to none (draft layers are typically unquantized, which flashinfer_megamoe's global-expert-id dispatch doesn't support). ascend_ops is supported on NPU and uses --moe-ascend-ops-config.",
             choices=[
                 "none",
                 "deepep",
@@ -193,7 +193,7 @@ class Spec(msgspec.Struct):
                 "megamoe",
                 "deepep_v2",
                 "pplx",
-                "ascend_tp",
+                "ascend_ops",
             ],
             resolvable=True,
         ),
@@ -205,11 +205,7 @@ class Spec(msgspec.Struct):
             "mxf4xmxf4 MMA type (see --enable-w4a4-mxfp4-megamoe). Pass "
             "--no-speculative-enable-w4a4-mxfp4-megamoe to keep the draft on "
             "fp8xfp4 (W4A8) while the target runs W4A4. Same as "
-            "--enable-w4a4-mxfp4-megamoe if unset. A draft that runs MXFP4 "
-            "MegaMoE with a different MMA type from the target may allocate an "
-            "additional MegaMoE symmetric buffer after the KV pool is sized; "
-            "lower --mem-fraction-static if CUDA-graph capture runs out of "
-            "memory.",
+            "--enable-w4a4-mxfp4-megamoe if unset.",
             action=argparse.BooleanOptionalAction,
         ),
     ] = None
@@ -218,6 +214,7 @@ class Spec(msgspec.Struct):
         Arg(
             help="The quantization method for speculative model.",
             choices=QUANTIZATION_CHOICES,
+            resolvable=True,
         ),
     ] = None
     # Internal provenance used after the public draft quantization inherits the

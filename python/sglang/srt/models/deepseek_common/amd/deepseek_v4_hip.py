@@ -22,6 +22,11 @@ from sglang.srt.models.deepseek_common.amd import deepseek_v4_gfx95_dense as gfx
 from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (  # noqa: F401  deepseek_v4 reaches apply_attention_mhc through this module
     apply_attention_mhc,
 )
+from sglang.srt.models.deepseek_common.amd.deepseek_v4_wo_a_fp8 import (
+    WO_A_MXFP8_GROUP_SIZE,
+    is_wo_a_fp8_block32_supported,
+    wo_a_fp8_block,
+)
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import is_gfx95_supported
 
@@ -45,6 +50,11 @@ def init_mqa_layer(attn, quant_config) -> None:
     attn._wq_b_native_consumer_checked = False
     attn._wq_b_native_consumer = False
     attn._wo_b_fp8_grid_operand = None
+    # the fp8 unified_kv decode can quantize wo_a's input itself, per 128 only
+    attn.wo_a_fp8_block128 = attn.wo_a_fp8 and (
+        wo_a_fp8_block(attn.wo_a.weight, attn.wo_a.weight_scale_inv)
+        == WO_A_MXFP8_GROUP_SIZE
+    )
 
 
 def wo_a_emits_fp8_grid(attn) -> bool:
@@ -59,6 +69,17 @@ def wo_a_split_k_allowed() -> bool:
     return not (
         is_batch_invariant_mode_enabled()
         or get_exec().deterministic.enable_deterministic_inference
+    )
+
+
+def wo_a_fp8_block32_enabled() -> bool:
+    """Whether V4.1's 32x32-block wo_a stays fp8 for aiter's preshuffled BMM. A monokernel
+    reads the row-major wo_a and quantizes the bf16 one itself; deterministic and
+    batch-invariant inference keep the bf16 GEMM's one reduction order."""
+    return (
+        is_wo_a_fp8_block32_supported()
+        and not get_exec().kernel.enable_amd_monokernel
+        and wo_a_split_k_allowed()
     )
 
 

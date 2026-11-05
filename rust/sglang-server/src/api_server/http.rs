@@ -6,4 +6,5 @@ mod loads;
 mod metrics;
 mod native_api;
 mod openai;
+pub(crate) mod pre_generate;
 mod request_headers;

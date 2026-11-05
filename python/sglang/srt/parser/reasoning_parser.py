@@ -32,6 +32,7 @@ from sglang.srt.function_call.muse_glimmer_format import (
     partial_marker_len,
 )
 from sglang.srt.parser.answer_frame import AnswerFrame, InklingAnswerFrame
+from sglang.srt.parser.beam import BeamReasoningDetector
 from sglang.srt.parser.harmony_parser import HarmonyParser
 from sglang.srt.parser.inkling_tokenizer import (
     CONTENT_INVOKE_TOOL_JSON,
@@ -44,7 +45,10 @@ from sglang.srt.parser.inkling_tokenizer import (
     INKLING_SPECIAL_TOKEN_IDS,
     MESSAGE_MODEL,
 )
-from sglang.srt.parser.response_template import ResponseTemplateReasoningDetector
+from sglang.srt.parser.response_template import (
+    ResponseTemplateReasoningDetector,
+    grammar_holds_calls,
+)
 
 
 class StreamingParseResult:
@@ -1530,6 +1534,12 @@ class _DeepSeekV3Detector(Qwen3Detector):
         self.reasoning_default = "explicit_thinking"
 
 
+class _FlintDetector(Qwen3Detector):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.reasoning_default = None
+
+
 DSV4_EOS_TOKEN = "<｜end▁of▁sentence｜>"
 DSV4_THINK_START_TOKEN = "<think>"
 DSV4_THINK_END_TOKEN = "</think>"
@@ -1574,6 +1584,42 @@ class _PoolsideV1Detector(Qwen3Detector):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.reasoning_default = "explicit_enable_thinking"
+
+
+class Xing4_0Detector(Qwen3Detector):
+    """Detector for Xing4_0 models.
+
+    Xing4_0 reuses Qwen3's reasoning markers, injected into the prompt via
+    the template's ``enable_thinking`` parameter, and emits Qwen3-compatible
+    tool-call tokens, so Qwen3Detector's parsing rules apply unchanged.
+
+    When ``enable_thinking=True``:
+      The model generates reasoning content followed by the close marker and
+      then the answer.
+
+    When ``enable_thinking=False``:
+      The model generates the answer directly without any markers.
+
+    ``force_nonempty_content=True`` acts as a safety net: if the model omits
+    the close tag, the accumulated reasoning is reclassified as normal text
+    so the answer is never lost in the text field.
+    """
+
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = False,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+        force_nonempty_content: bool = True,
+    ):
+        super().__init__(
+            stream_reasoning=stream_reasoning,
+            force_reasoning=force_reasoning,
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
+            force_nonempty_content=force_nonempty_content,
+        )
 
 
 class Apertus2509Detector(BaseReasoningFormatDetector):
@@ -2267,6 +2313,7 @@ class ReasoningParser:
 
     DetectorMap: Dict[str, Type[BaseReasoningFormatDetector]] = {
         "apertus2509": Apertus2509Detector,
+        "beam": BeamReasoningDetector,
         "deepseek-r1": DeepSeekR1Detector,
         "deepseek-v3": _DeepSeekV3Detector,
         "deepseek-v4": DeepSeekV4Detector,
@@ -2299,8 +2346,10 @@ class ReasoningParser:
         "gigachat35": DeepSeekR1Detector,
         "inkling": InklingDetector,
         "iquest_q1": IQuestQ1ReasoningDetector,
+        "flint": _FlintDetector,
         "cohere_command4": CohereCommand4Detector,
         "response_template": ResponseTemplateReasoningDetector,
+        "xing4_0": Xing4_0Detector,
     }
 
     def __init__(
@@ -2396,6 +2445,11 @@ class ReasoningParser:
                 kwargs["prefix"] = prefix
             if isinstance(request, (ChatCompletionRequest, ResponsesRequest)):
                 kwargs["grammar_start"] = request._response_parser_grammar_start
+                kwargs["tools"] = request.tools
+                kwargs["constrained"] = grammar_holds_calls(
+                    request._response_parser_tool_grammar,
+                    request._response_parser_grammar_start,
+                )
 
         self.detector = detector_class(**kwargs)
 

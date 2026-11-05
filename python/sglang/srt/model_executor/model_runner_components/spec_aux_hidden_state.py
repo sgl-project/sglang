@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any, Optional
 import msgspec
 
 from sglang.srt.configs.model_config import ModelConfig, is_deepseek_v4
-from sglang.srt.runtime_context import get_spec
+from sglang.srt.runtime_context import get_exec, get_spec
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -46,6 +46,8 @@ class SpecAuxHiddenStateConfig(msgspec.Struct, kw_only=True):
     # EAGLE draft pool is sized by `eagle_draft_num_layers` instead.
     draft_model_config: Optional[ModelConfig] = None
     draft_kv_num_layers: Optional[int] = None
+    # Route the DFLASH-family capture to the model's DSPARK hook when it has one.
+    is_dspark: bool = False
 
 
 def resolve_spec_aux_hidden_state_config(
@@ -55,7 +57,13 @@ def resolve_spec_aux_hidden_state_config(
     spec_algorithm: SpeculativeAlgorithm,
     is_draft_worker: bool,
 ) -> SpecAuxHiddenStateConfig:
-    config = SpecAuxHiddenStateConfig()
+    config = SpecAuxHiddenStateConfig(is_dspark=spec_algorithm.is_dspark())
+    _resolve_capture_only_aux_hidden_state(
+        config=config,
+        model_config=model_config,
+        spec_algorithm=spec_algorithm,
+        is_draft_worker=is_draft_worker,
+    )
     _resolve_eagle_aux_hidden_state(
         config=config,
         server_args=server_args,
@@ -71,6 +79,54 @@ def resolve_spec_aux_hidden_state_config(
         is_draft_worker=is_draft_worker,
     )
     return config
+
+
+def _resolve_capture_only_aux_hidden_state(
+    *,
+    config: SpecAuxHiddenStateConfig,
+    model_config: ModelConfig,
+    spec_algorithm: SpeculativeAlgorithm,
+    is_draft_worker: bool,
+) -> None:
+    """--enable-return-aux-hidden-states: aux capture on a target without a draft.
+
+    No draft layer counts are set, so the KV pool reserves nothing for a draft.
+    """
+    features = get_exec().features
+    method = features.aux_hidden_state_capture
+    if method is None or is_draft_worker or not spec_algorithm.is_none():
+        return
+    layer_ids = features.return_aux_hidden_state_layer_ids
+    if layer_ids is not None:
+        _check_capture_layer_ids_in_range(layer_ids, model_config)
+    if method == "eagle3":
+        config.eagle_use_aux_hidden_state = True
+        config.eagle_aux_hidden_state_layer_ids = (
+            list(layer_ids) if layer_ids is not None else None
+        )
+    else:
+        config.dflash_use_aux_hidden_state = True
+        config.dflash_target_layer_ids = list(layer_ids)
+        config.is_dspark = method == "dspark"
+
+
+def _check_capture_layer_ids_in_range(layer_ids, model_config: ModelConfig) -> None:
+    num_layers = getattr(model_config.hf_text_config, "num_hidden_layers", None)
+    if num_layers is None:
+        raise ValueError(
+            "--return-aux-hidden-state-layer-ids requires target num_hidden_layers "
+            "in config."
+        )
+    # Loop models: target layer ids span num_hidden_layers * num_loops.
+    num_layers = int(num_layers) * int(
+        getattr(model_config.hf_text_config, "num_loops", 1)
+    )
+    out_of_range = [layer_id for layer_id in layer_ids if layer_id >= num_layers]
+    if out_of_range:
+        raise ValueError(
+            f"--return-aux-hidden-state-layer-ids {out_of_range} out of range for a "
+            f"target with {num_layers} layers."
+        )
 
 
 def _resolve_eagle_aux_hidden_state(

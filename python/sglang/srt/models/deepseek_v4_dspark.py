@@ -17,6 +17,7 @@ from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecutio
 from sglang.srt.distributed.device_communicators.vocab_gather import make_vocab_gather
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
     is_unified_kv_triton,
 )
@@ -24,9 +25,13 @@ from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layer_boundary import layer_stack
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.utils import get_num_fused_shared_experts
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.modelslim.modelslim import (
+    remap_dspark_weight_name_npu,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -39,7 +44,7 @@ from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models import deepseek_v4_boundary as hc_boundary
 from sglang.srt.models import deepseek_v4_mhc as mhc
-from sglang.srt.models.dbrx import ReplicatedLinear
+from sglang.srt.models.deepseek_common.utils import _is_cuda
 from sglang.srt.models.deepseek_v4 import (
     DEEPSEEK_V4_STACKED_PARAMS_MAPPING,
     DeepseekV4CudaDecoderLayer,
@@ -48,7 +53,6 @@ from sglang.srt.models.deepseek_v4 import (
     MqaAttentionBase,
     _apply_wo_a_bf16_matmul,
     _dequant_fp8_wo_a_streaming,
-    _is_cuda,
     hc_head_torch,
     make_hc_head_params,
 )
@@ -490,7 +494,9 @@ class DSparkV4MarkovHead(BaseDSparkMarkovHead):
             cls_name = type(vocab_gather).__name__
             logger.info("DSpark markov_w2 vocab gather: %s", cls_name)
         self.vocab_shard = VocabShard(
-            start=self._tp_shard.org_vocab_start, gather=vocab_gather
+            start=self._tp_shard.org_vocab_start,
+            width=self._tp_shard.org_vocab_end - self._tp_shard.org_vocab_start,
+            gather=vocab_gather,
         )
 
     def get_prev_embeddings(self, token_ids: torch.Tensor) -> torch.Tensor:
@@ -688,7 +694,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
     # ModelSlim NPU checkpoints carry QuaRot-aligned, MTP-local
     # embedding/head weights. The native CUDA path keeps the original DSpark
     # behavior and shares the target model's vocabulary modules.
-    uses_own_vocab_modules = _is_npu
+    uses_own_vocab_modules = _is_npu and not is_npu_arch35()
     precompile_kernels_after_loading = (
         DeepseekV4ForCausalLM.precompile_kernels_after_loading
     )
@@ -699,7 +705,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         hf_config,
         quant_config,
     ):
-        if _is_npu:
+        if cls.uses_own_vocab_modules:
             return (
                 "NPU DSpark ModelSlim weight loading does not support mapping "
                 "shared experts into fused expert slots."
@@ -914,9 +920,10 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                 "DeepseekV4ForCausalLMDSpark requires the target embed_tokens "
                 "(call attach_shared_modules first)."
             )
-        x = self.embed_tokens(input_ids)
-        x = x.unsqueeze(1).repeat(1, self.hc_mult, 1)
-        return x
+        return self._expand_hc(self.embed_tokens(input_ids))
+
+    def _expand_hc(self, embeds: torch.Tensor) -> torch.Tensor:
+        return embeds.unsqueeze(1).repeat(1, self.hc_mult, 1)
 
     def forward(
         self,
@@ -942,6 +949,8 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
     def _forward_impl(self, input_ids, positions, forward_batch, input_embeds):
         if input_embeds is None:
             input_embeds = self.forward_embed(input_ids)
+        elif input_embeds.dim() == 2:
+            input_embeds = self._expand_hc(input_embeds)
         x = input_embeds
         pre = None
         if _is_cuda:
@@ -1034,11 +1043,22 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
 
         for name, loaded_weight in weights:
             mapped = (
-                self._remap_dspark_weight_name_npu(name)
-                if _is_npu
+                remap_dspark_weight_name_npu(name)
+                if (_is_npu and not is_npu_arch35())
                 else self._remap_dspark_weight_name(name)
             )
             if mapped is None:
+                continue
+            if _is_npu and mapped in ("embed_tokens.weight", "lm_head.weight"):
+                if not self.uses_own_vocab_modules:
+                    continue
+                stage_idx = int(name.split(".", 2)[1])
+                vocab_stage = (
+                    0 if mapped == "embed_tokens.weight" else self.num_stages - 1
+                )
+                if stage_idx != vocab_stage:
+                    continue
+            if mapped.startswith("confidence_head.") and self.confidence_head is None:
                 continue
             if self.num_fused_shared_experts > 0 and ".mlp.shared_experts." in mapped:
                 mapped = mapped.replace(
@@ -1153,64 +1173,6 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             return None
         mapped_rest = mapped_rest.replace(".gate.bias", ".gate.e_score_correction_bias")
         mapped_rest = mapped_rest.replace(".scale", ".weight_scale_inv")
-        return f"stages.{stage_id}.{mapped_rest}"
-
-    def _remap_dspark_weight_name_npu(self, name: str) -> Optional[str]:
-        if name.startswith(("embed.", "embed_tokens.", "head.", "lm_head.")):
-            return None
-        if "rotary_emb.inv_freq" in name:
-            return None
-
-        if not name.startswith("mtp."):
-            return None
-        parts = name.split(".", 2)
-        if len(parts) < 3:
-            return None
-        stage_id, rest = parts[1], parts[2]
-        if not stage_id.isdigit():
-            return None
-        stage_idx = int(stage_id)
-        if rest in ("embed.weight", "embed_tokens.weight"):
-            return (
-                "embed_tokens.weight"
-                if self.uses_own_vocab_modules and stage_idx == 0
-                else None
-            )
-        if rest in ("head.weight", "lm_head.weight"):
-            return (
-                "lm_head.weight"
-                if self.uses_own_vocab_modules and stage_idx == self.num_stages - 1
-                else None
-            )
-        if rest.startswith(("embed.", "embed_tokens.", "head.", "lm_head.")):
-            return None
-
-        if rest.startswith("markov_head."):
-            return f"markov_head.{rest[len('markov_head.') :]}"
-
-        if rest.startswith("confidence_head."):
-            if self.confidence_head is None:
-                return None
-            return f"confidence_head.{rest[len('confidence_head.') :]}"
-
-        mapped_rest = rest
-        if mapped_rest.startswith("attn."):
-            mapped_rest = "self_attn." + mapped_rest.removeprefix("attn.")
-        elif mapped_rest.startswith("ffn."):
-            mapped_rest = "mlp." + mapped_rest.removeprefix("ffn.")
-        elif mapped_rest.startswith("attn_norm."):
-            mapped_rest = "input_layernorm." + mapped_rest.removeprefix("attn_norm.")
-        elif mapped_rest.startswith("ffn_norm."):
-            mapped_rest = "post_attention_layernorm." + mapped_rest.removeprefix(
-                "ffn_norm."
-            )
-        mapped_rest = mapped_rest.replace(".w1.", ".gate_proj.")
-        mapped_rest = mapped_rest.replace(".w2.", ".down_proj.")
-        mapped_rest = mapped_rest.replace(".w3.", ".up_proj.")
-        mapped_rest = mapped_rest.replace(".gate.tid2eid", ".topk.tid2eid")
-        mapped_rest = mapped_rest.replace(".gate.bias", ".gate.e_score_correction_bias")
-        if mapped_rest.endswith(".scale"):
-            mapped_rest = mapped_rest.removesuffix(".scale") + ".weight_scale_inv"
         return f"stages.{stage_id}.{mapped_rest}"
 
 

@@ -1,11 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import errno
 import io
+import os
+import threading
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, wait
+from contextlib import contextmanager
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import httpx
 import pytest
@@ -36,6 +42,7 @@ from sglang.multimodal_gen.runtime.postprocess.bounded_cache import (
     cache_get,
     cache_put,
 )
+from sglang.multimodal_gen.runtime.utils import image_io
 from sglang.multimodal_gen.runtime.utils.image_io import ensure_path_within_root
 
 
@@ -163,6 +170,50 @@ def test_save_image_sources_within_uploads_root(tmp_path, image_source):
     )
     assert Path(saved) == root / f"input{suffix}"
     assert Path(saved).read_bytes() == b"image"
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_failed_image_write_preserves_destination(
+    monkeypatch, tmp_path, image_source, existing
+):
+    """A failed input write must not publish partial bytes or truncate an old file."""
+    source, suffix = image_source
+    target = tmp_path / f"input{suffix}"
+    if existing:
+        target.write_bytes(b"previous image")
+
+    @contextmanager
+    def failing_write(opener, *args, **kwargs):
+        with opener(*args, **kwargs) as stream:
+            write = stream.write
+
+            def write_partial(data):
+                write(data[:1])
+                raise OSError(errno.ENOSPC, "No space left on device")
+
+            with patch.object(stream, "write", side_effect=write_partial):
+                yield stream
+
+    with monkeypatch.context() as fault:
+        fault.setattr(utils, "open", partial(failing_write, open), raising=False)
+        fault.setattr(image_io, "open", partial(failing_write, open), raising=False)
+        fault.setattr(os, "fdopen", partial(failing_write, os.fdopen))
+        with pytest.raises(Exception, match="No space left on device"):
+            asyncio.run(
+                utils.save_image_to_path(
+                    source, str(tmp_path / "input"), uploads_root=str(tmp_path)
+                )
+            )
+    assert set(tmp_path.iterdir()) == ({target} if existing else set())
+    if existing:
+        assert target.read_bytes() == b"previous image"
+    # a later request must replace the file with a complete input
+    saved = asyncio.run(
+        utils.save_image_to_path(
+            b"complete image", str(target), uploads_root=str(tmp_path)
+        )
+    )
+    assert Path(saved).read_bytes() == b"complete image"
 
 
 def test_save_image_sources_reject_escape_before_writing(tmp_path, image_source):
@@ -506,6 +557,7 @@ def test_image_download_over_size_limit_is_rejected(monkeypatch, tmp_path, handl
         asyncio.run(utils._save_url_image_to_path("https://x.test/a.png", str(target)))
     assert not target.exists()
     assert not any(part_dir.iterdir())
+    assert not list(target.parent.iterdir())
 
 
 def test_image_download_within_limit_is_saved(monkeypatch, tmp_path):
@@ -523,6 +575,109 @@ def test_image_download_within_limit_is_saved(monkeypatch, tmp_path):
     )
     assert Path(saved).read_bytes() == b"x" * 512
     assert not any(part_dir.iterdir())
+    assert list(target.parent.iterdir()) == [target]
+
+
+def test_cancelled_image_download_leaves_no_partial_file(monkeypatch, tmp_path):
+    """Executor congestion must not orphan a fully downloaded temporary file."""
+    target = tmp_path / "in" / "image.png"
+    finish = threading.Event()
+    payload = b"image bytes"
+
+    async def run_test():
+        loop = asyncio.get_running_loop()
+        loop.set_default_executor(ThreadPoolExecutor(max_workers=1))
+        occupied = asyncio.Event()
+        worker = None
+
+        def occupy_executor():
+            loop.call_soon_threadsafe(occupied.set)
+            assert finish.wait(5)
+
+        class Stream(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                yield payload
+
+            async def aclose(self):
+                nonlocal worker
+                worker = loop.run_in_executor(None, occupy_executor)
+                await occupied.wait()
+
+        part_dir = _patch_download(
+            monkeypatch,
+            tmp_path,
+            lambda _: httpx.Response(200, stream=Stream()),
+        )
+        task = asyncio.create_task(
+            utils._save_url_image_to_path("https://x.test/image.png", str(target))
+        )
+        try:
+            await asyncio.wait_for(occupied.wait(), 5)
+            await asyncio.sleep(0)
+            if not task.done():
+                task.cancel()
+            try:
+                saved = await task
+            except asyncio.CancelledError:
+                assert not target.exists()
+            else:
+                assert Path(saved).read_bytes() == payload
+        finally:
+            finish.set()
+            if worker is not None:
+                await worker
+        assert not list(part_dir.iterdir())
+        assert list(target.parent.iterdir()) == ([target] if target.exists() else [])
+
+    asyncio.run(run_test())
+
+
+def test_image_download_rejects_destination_directory(monkeypatch, tmp_path):
+    """A path collision must not return a directory or hide an upload inside it."""
+    part_dir = _patch_download(
+        monkeypatch, tmp_path, lambda _: httpx.Response(200, content=b"image")
+    )
+    target = tmp_path / "image.png"
+    target.mkdir()
+    with pytest.raises(Exception, match="directory"):
+        asyncio.run(utils._save_url_image_to_path("https://x.test/a.png", str(target)))
+    assert not list(target.iterdir())
+    assert not list(part_dir.iterdir())
+    assert set(tmp_path.iterdir()) == {target, part_dir}
+
+
+@pytest.mark.parametrize("recover", [False, True])
+def test_image_download_retry_keeps_only_complete_output(
+    monkeypatch, tmp_path, recover
+):
+    """Failed attempts must leave neither partial files nor a truncated destination."""
+    attempts = 0
+
+    async def broken_body():
+        yield b"partial image"
+        raise httpx.ReadError("incomplete response")
+
+    def handler(request):
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(
+            200,
+            content=b"complete image" if recover and attempts == 3 else broken_body(),
+        )
+
+    part_dir = _patch_download(monkeypatch, tmp_path, handler)
+    target = tmp_path / "image.png"
+    target.write_bytes(b"existing image")
+    request = utils._save_url_image_to_path("https://x.test/a.png", str(target))
+    if recover:
+        assert asyncio.run(request) == str(target)
+    else:
+        with pytest.raises(Exception, match="incomplete response"):
+            asyncio.run(request)
+    assert attempts == 3
+    assert target.read_bytes() == (b"complete image" if recover else b"existing image")
+    assert not list(part_dir.iterdir())
+    assert set(tmp_path.iterdir()) == {target, part_dir}
 
 
 _CPU = SimpleNamespace(get_local_torch_device=lambda: torch.device("cpu"))

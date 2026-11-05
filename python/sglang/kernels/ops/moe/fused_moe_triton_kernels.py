@@ -5,6 +5,7 @@ from collections import OrderedDict
 from typing import Any, Dict, List, Optional
 
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 
@@ -598,6 +599,10 @@ def fused_moe_kernel(
                     a_scale, b_scale = b_scale, a_scale
                 if BLOCK_SIZE_N > group_n:
                     accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
+                elif swap_ab:
+                    # After the swap, a_scale is the scalar weight block scale
+                    # and b_scale contains per-token scales along the last axis.
+                    accumulator += tl.dot(a, b) * (a_scale * b_scale[None, :])
                 else:
                     accumulator += tl.dot(a, b) * (a_scale[:, None] * b_scale)
             else:
@@ -894,7 +899,7 @@ def invoke_fused_moe_kernel(
         assert B_scale is not None
         if block_shape is None:
             # activation tensor-wise fp8 quantization, dynamic or static
-            padded_size = padding_size
+            padded_size = 0 if _use_aiter else padding_size
             # activations apply per-token quantization when weights apply per-channel quantization by default
             A, A_scale = scaled_fp8_quant(
                 A, A_scale, use_per_token_if_dynamic=per_channel_quant
@@ -909,10 +914,16 @@ def invoke_fused_moe_kernel(
                 # the matching scales (row- or column-major, strides are
                 # passed to the kernel below).
                 assert A_scale is not None
-            elif _is_cuda:
-                A, A_scale = sglang_per_token_group_quant_fp8(A, block_k)
             else:
-                A, A_scale = per_token_group_quant_fp8(A, block_k)
+                # A TP shard can end K in a partial scale group (e.g. 160 with group 128);
+                # quantize a zero-padded copy, the GEMM masks to B.shape[2] as the logical K.
+                pad_k = (-A.shape[-1]) % block_k
+                if pad_k:
+                    A = F.pad(A, (0, pad_k))
+                if _is_cuda:
+                    A, A_scale = sglang_per_token_group_quant_fp8(A, block_k)
+                else:
+                    A, A_scale = per_token_group_quant_fp8(A, block_k)
             assert triton.cdiv(A.shape[-1], block_k) == A_scale.shape[-1]
             assert triton.cdiv(B.shape[-2], block_n) == B_scale.shape[-2]
             assert triton.cdiv(B.shape[-1], block_k) == B_scale.shape[-1]

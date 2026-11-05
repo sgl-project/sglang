@@ -93,6 +93,11 @@ def expand_prefill_causally(
     device = req_pool_indices.device
     cuda_int32_kwargs = {"dtype": torch.int32, "device": device}
 
+    if extend_start_loc is None and (
+        seq_lens_cpu is None or extend_seq_lens_cpu is None
+    ):
+        # Without host lists, start from the device lengths like the Triton kernel.
+        extend_start_loc = torch.cumsum(extend_seq_lens, dim=0) - extend_seq_lens
     if extend_start_loc is not None:
         repeats = extend_seq_lens.to(torch.int64)
         req_pool_indices_repeated = torch.repeat_interleave(

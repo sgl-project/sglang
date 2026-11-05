@@ -1,6 +1,7 @@
 import torch
 import triton
 import triton.language as tl
+from torch.fx.experimental.symbolic_shapes import guard_or_false, guard_or_true
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
@@ -88,7 +89,7 @@ def fused_sigmoid_mul(
         gate_stride_head = hidden_dim
 
     out = attn_output if inplace else torch.empty_like(attn_output)
-    block_h = 1024 if num_tokens < 1024 else 2048
+    block_h = 1024 if guard_or_true(num_tokens < 1024) else 2048
     kwargs = {}
     if quant:  # one block per row; returns per-token FP8 (q, scale [T, 1])
         block_h = triton.next_power_of_2(hidden_dim)
@@ -232,7 +233,7 @@ def _launch_fused_gate_sigmoid_mul(
         ),
     }
 
-    if num_tokens >= 1024 or is_batch_invariant_mode_enabled():
+    if guard_or_false(num_tokens >= 1024) or is_batch_invariant_mode_enabled():
         config["num_warps"] = min(config["num_warps"], 8)
 
     use_pdl = is_arch_support_pdl()

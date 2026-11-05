@@ -47,9 +47,11 @@ from .mistral_utils import (
 )
 from .tokenizer import (
     _TOKENIZERS_BACKEND,
+    _fastokens_patch_lifted,
     _fix_added_tokens_encoding,
     _fix_special_tokens_pattern,
     _install_tokenizer_warnings_filter,
+    _shim_fastokens_backend,
     get_tokenizer,
 )
 
@@ -243,6 +245,42 @@ def _get_minimax_m31_processor(model_path, config, revision):
 
 
 def get_processor(
+    tokenizer_name: str,
+    *args,
+    tokenizer_backend: str = "huggingface",
+    **kwargs,
+):
+    try:
+        return _get_processor(
+            tokenizer_name, *args, tokenizer_backend=tokenizer_backend, **kwargs
+        )
+    except Exception:
+        if tokenizer_backend != "fastokens":
+            raise
+        processor = _load_fastokens_processor_over_repaired_backend(
+            tokenizer_name, *args, **kwargs
+        )
+        if processor is None:
+            raise
+        return processor
+
+
+def _load_fastokens_processor_over_repaired_backend(tokenizer_name, *args, **kwargs):
+    """Processor counterpart of ``tokenizer._load_fastokens_over_repaired_backend``."""
+    try:
+        with _fastokens_patch_lifted():
+            processor = _get_processor(
+                tokenizer_name, *args, tokenizer_backend="huggingface", **kwargs
+            )
+    except Exception:
+        logger.warning("huggingface load for the fastokens retry failed", exc_info=True)
+        return None
+    if _shim_fastokens_backend(get_tokenizer_from_processor(processor)) is None:
+        return None
+    return processor
+
+
+def _get_processor(
     tokenizer_name: str,
     *args,
     tokenizer_mode: str = "auto",

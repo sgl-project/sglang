@@ -243,7 +243,11 @@ class PrefixPad:
         return self.value
 
 
-@eager_on_graph
+@eager_on_graph(
+    output_factory=lambda attn, q, k, v, prefix_pad: q.new_empty(
+        (*q.shape[:-1], v.shape[-1])
+    )
+)
 def attend_past_prefix_pad(attn, q, k, v, prefix_pad):
     # a graph break: the pad varies per request, and skipping it hands the
     # kernel exactly the eager K/V, so padded replays stay bit-exact. Calls the
