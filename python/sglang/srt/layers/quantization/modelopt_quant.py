@@ -3125,10 +3125,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         repack = layer._fp4_moe_repack
         if repack is None or getattr(layer, "inference_moe_w13_interleaved", False):
             logger.warning_once(
-                "This NVFP4 MoE layout cannot be restored before a weight update: "
-                "experts the update does not rewrite are post-processed twice. "
-                "Update every expert tensor, or serve with --moe-runner-backend "
-                "flashinfer_trtllm or flashinfer_cutlass."
+                "This NVFP4 MoE layout cannot be restored before a weight update "
+                "(a padded or interleaved layout, rescaled w13 scales, or a MoE "
+                "backend that repacks without a restore): experts the update does "
+                "not rewrite are post-processed twice. Update every expert tensor."
             )
             return
         if repack == "trtllm":
