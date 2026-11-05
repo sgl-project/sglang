@@ -4464,12 +4464,13 @@ class Scheduler(
             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
                 continue
 
-            # A forward batch runs one pooling mode, so setwise readout requests
-            # (token_indices_to_pool) cannot share a batch with last-token ones.
-            # Admit only the first request's mode; the other stays queued.
+            # A forward batch has one pooling mode and uses either token
+            # embeddings or supplied input_embeds. Leave incompatible requests queued.
             if adder.can_run_list and (
                 (req.token_indices_to_pool is not None)
                 != (adder.can_run_list[0].token_indices_to_pool is not None)
+                or (req.input_embeds is None)
+                != (adder.can_run_list[0].input_embeds is None)
             ):
                 continue
 
