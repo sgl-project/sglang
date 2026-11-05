@@ -14,13 +14,11 @@ from sglang.multimodal_gen.configs.models.vaes.minimax_h3_audio import (
 from sglang.multimodal_gen.configs.models.vaes.minimax_h3_video import (
     MiniMaxH3VideoVAEConfig,
 )
-from sglang.multimodal_gen.configs.pipeline_configs.base import (
-    ModelTaskType,
-    PipelineConfig,
-)
+from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
     ModelDeploymentConfig,
 )
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
     LAYERWISE_OFFLOAD,
 )
@@ -431,10 +429,31 @@ class FastH3OmniPipelineConfig(FastH3PipelineConfig):
         MiniMaxH3PipelineConfig.validate_server_args(self, server_args)
 
 
+@dataclass
+class PikaH3FlexPipelineConfig(MiniMaxH3PipelineConfig):
+    """Pika H3 Flex: base MiniMax-H3 with Pika's six-step LoRA adapters."""
+
+    def validate_server_args(self, server_args) -> None:
+        # A BF16 merge rounds away about a third of the adapters' update (by
+        # norm, under auto's 50% cutoff), so keep them unmerged like the
+        # reference unless a merge mode is chosen explicitly.
+        if not server_args.is_arg_explicitly_set("lora_merge_mode"):
+            server_args.lora_merge_mode = "dynamic"
+        super().validate_server_args(server_args)
+
+    def validate_quality_deployment(self, server_args) -> None:
+        raise ValueError(
+            'quality="high" is audited only for the base MiniMax-H3 50-step '
+            "4xH200 deployment; Pika H3 Flex has no audited high-quality "
+            'deployment. Use quality="exact", or the default "lossless".'
+        )
+
+
 __all__ = [
     "FastH3OmniPipelineConfig",
     "FastH3PipelineConfig",
     "MiniMaxH3PipelineConfig",
+    "PikaH3FlexPipelineConfig",
 ]
 
 
@@ -443,6 +462,7 @@ def register():
         FastH3OmniSamplingParams,
         FastH3SamplingParams,
         MiniMaxH3SamplingParams,
+        PikaH3FlexSamplingParams,
     )
     from sglang.multimodal_gen.registry import register_configs
 
@@ -482,6 +502,18 @@ def register():
         model_detectors=[
             lambda model_id: (
                 "fasth3omni" in model_id.lower().replace("-", "").replace("_", "")
+            )
+        ],
+    )
+    register_configs(
+        sampling_param_cls=PikaH3FlexSamplingParams,
+        pipeline_config_cls=PikaH3FlexPipelineConfig,
+        hf_model_paths=[
+            "Pika-Labs/Pika-H3-Flex",
+        ],
+        model_detectors=[
+            lambda model_id: (
+                "pikah3flex" in model_id.lower().replace("-", "").replace("_", "")
             )
         ],
     )

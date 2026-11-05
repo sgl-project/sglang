@@ -1,6 +1,9 @@
 ARG CUDA_VERSION=13.0.3
 ARG UV_VERSION=latest
 ARG PYTHON_VERSION=3.12
+# AWS EFA userspace (libfabric, aws-ofi-nccl), see docker/install_efa.sh.
+ARG EFA_INSTALLER_VERSION=1.51.0
+ARG EFA_INSTALLER_SHA256=83993044fa4df3dc2f8b5c2f7051d61b9689441be023a2c92ea51d3f53f2465c
 
 FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv
 
@@ -19,7 +22,7 @@ ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
 ARG INSTALL_FLASHINFER_JIT_CACHE=0
 ARG FLASHINFER_VERSION=0.7.2
-ARG MOONCAKE_VERSION=0.3.13.post1
+ARG MOONCAKE_VERSION=0.3.14
 ARG MSCCLPP_VERSION=sglang-v0.10.1
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -165,6 +168,7 @@ ENV LANG=en_US.UTF-8 \
 #     |
 #     +-- torch_deps ------> flashinfer_cache (needs flashinfer)
 #     |                  \-> hpc_ops_builder (cmake-only build)
+#     |                  \-> halops_wheel (prebuilt wheel download)
 #     |
 #     +-- devtools_builder (independent)
 #     +-- gateway_builder  (independent, only needs gateway source)
@@ -270,6 +274,26 @@ RUN mkdir -p /wheels && \
         git checkout ${HPC_OPS_COMMIT} && \
         python3 setup.py bdist_wheel -d /wheels; \
     fi
+
+########################################################
+# PARALLEL STAGE 2b: HALOps Wheel (needs torch_deps)
+########################################################
+FROM torch_deps AS halops_wheel
+
+# HALOps (https://github.com/PaddlePaddle/HALOps): MXFP8 w8a8 dense GEMM kernels
+# for the opt-in --fp8-gemm-backend=halops. Only prebuilt wheels are published,
+# so fetch the one matching this image's Python and platform. A missing or
+# mismatched wheel leaves /wheels empty and the install step skips it.
+ARG HALOPS_VERSION=0.1.0
+ARG HALOPS_INDEX_URL=https://www.paddlepaddle.org.cn/packages/stable/cu132/halops/
+
+WORKDIR /build
+
+RUN mkdir -p /wheels && \
+    (python3 -m pip download "halops==${HALOPS_VERSION}" \
+        --no-deps --only-binary=:all: --no-index \
+        -f "${HALOPS_INDEX_URL}" -d /wheels \
+    || echo "WARNING: no halops ${HALOPS_VERSION} wheel for this platform; skipping")
 
 ########################################################
 # PARALLEL STAGE 3: FlashInfer Cache (needs torch_deps)
@@ -409,6 +433,17 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         uv pip install --no-deps /tmp/wheels/hpc-ops/*.whl; \
     fi && rm -rf /tmp/wheels/hpc-ops
 
+# Copy HALOps wheel and install if it was staged; a platform-mismatched or
+# otherwise unusable wheel must not fail the image build.
+COPY --from=halops_wheel /wheels /tmp/wheels/halops
+RUN --mount=type=cache,target=/root/.cache/uv \
+    if ls /tmp/wheels/halops/*.whl >/dev/null 2>&1; then \
+        uv pip install --no-deps /tmp/wheels/halops/*.whl \
+        || (uv pip uninstall halops >/dev/null 2>&1 || true; \
+            echo "WARNING: halops wheel install failed; building without it"); \
+    fi; \
+    rm -rf /tmp/wheels/halops
+
 # Copy flashinfer cubin (always) and jit-cache (if installed) packages
 COPY --from=flashinfer_cache /flashinfer_jit_output/ /opt/sglang/lib/python3.12/site-packages/
 
@@ -522,6 +557,17 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --prerelease=allow --index-strategy unsafe-best-match \
         --extra-index-url https://pypi.nvidia.com/ ai-dynamo
+
+# Install the AWS EFA userspace for NIXL's LIBFABRIC backend, Mooncake's EFA
+# transport and NCCL over aws-ofi-nccl.
+ARG EFA_INSTALLER_VERSION
+ARG EFA_INSTALLER_SHA256
+RUN --mount=type=bind,source=docker/install_efa.sh,target=/tmp/install_efa.sh \
+    bash /tmp/install_efa.sh
+# LD_LIBRARY_PATH is required: under `--gpus` the NVIDIA toolkit reruns
+# ldconfig, which puts the distro libfabric first in the cache.
+ENV LD_LIBRARY_PATH="/opt/amazon/efa/lib:${LD_LIBRARY_PATH}" \
+    PATH="/opt/amazon/efa/bin:${PATH}"
 
 # Add yank script
 COPY --chown=root:root --chmod=755 docker/configs/yank /usr/local/bin/yank
@@ -805,6 +851,17 @@ COPY --from=framework_final /root/.cache/sglang /root/.cache/sglang
 COPY --from=framework_final /usr/lib/*-linux-gnu/libgdrapi.so* /usr/lib/
 COPY --from=framework_final /usr/bin/gdrcopy_* /usr/bin/
 COPY --from=framework_final /usr/src/gdrdrv-2.5.1 /usr/src/gdrdrv-2.5.1
+
+# Install the AWS EFA userspace for NIXL's LIBFABRIC backend, Mooncake's EFA
+# transport and NCCL over aws-ofi-nccl.
+ARG EFA_INSTALLER_VERSION
+ARG EFA_INSTALLER_SHA256
+RUN --mount=type=bind,source=docker/install_efa.sh,target=/tmp/install_efa.sh \
+    bash /tmp/install_efa.sh
+# LD_LIBRARY_PATH is required: under `--gpus` the NVIDIA toolkit reruns
+# ldconfig, which puts the distro libfabric first in the cache.
+ENV LD_LIBRARY_PATH="/opt/amazon/efa/lib:${LD_LIBRARY_PATH}" \
+    PATH="/opt/amazon/efa/bin:${PATH}"
 
 # Fix DeepEP IBGDA symlink in runtime
 RUN ln -sf /usr/lib/$(uname -m)-linux-gnu/libmlx5.so.1 /usr/lib/$(uname -m)-linux-gnu/libmlx5.so \

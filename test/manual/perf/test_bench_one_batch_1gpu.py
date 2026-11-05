@@ -5,12 +5,12 @@ import unittest
 
 import numpy as np
 
+from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     CustomTestCase,
     is_in_ci,
-    kill_process_tree,
     run_bench_one_batch,
     write_github_step_summary,
 )
