@@ -77,7 +77,7 @@ from sglang.srt.utils import (
     is_npu,
     is_xpu,
 )
-from sglang.srt.utils.hf_transformers_utils import get_rope_config
+from sglang.srt.utils.hf_transformers import get_rope_config
 
 _is_cuda = is_cuda()
 _is_cpu = is_cpu()

@@ -7,9 +7,9 @@ from typing import TYPE_CHECKING, NamedTuple, Optional, Tuple
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import (
     cache_once,
-    get_jit_cuda_arch,
     is_arch_support_pdl,
     is_hip_runtime,
     is_musa_runtime,
@@ -97,7 +97,7 @@ def _schedule_rmsnorm(
     def _rmsnorm_vec_bytes() -> int:
         if is_hip_runtime() or is_musa_runtime():
             return 16
-        return 32 if get_jit_cuda_arch().major >= 10 else 16
+        return 32 if current_arch().is_sm_at_least(10) else 16
 
     def _threads_per_row(num_vecs: int, vecs_per_thread: int, max_threads: int) -> int:
         if num_vecs < 32:

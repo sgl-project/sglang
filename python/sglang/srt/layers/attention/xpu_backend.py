@@ -5,14 +5,16 @@ from typing import TYPE_CHECKING, Optional, Tuple
 import msgspec
 import torch
 
+from sglang.kernels.ops.attention.metadata import (
+    normal_decode_set_metadata,
+    prepare_swa_spec_page_table_triton,
+)
 from sglang.kernels.ops.attention.utils import assert_buffer_fits
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.flashattention_backend import (
     FlashAttentionMetadata,
     merge_state_v2_wrapper,
-    normal_decode_set_metadata,
-    prepare_swa_spec_page_table_triton,
 )
 from sglang.srt.layers.attention.local_attention import (
     LocalAttentionMetadata,
@@ -22,7 +24,8 @@ from sglang.srt.layers.dcp import cp_lse_ag_out_rs_mha, get_dcp_lens
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -117,11 +120,16 @@ def _bidirectional_image_attn_args(
     block_ids: Optional[torch.Tensor],
     window_size: tuple[int, int],
     max_seqlen_k: int,
+    sliding_layers_only: bool = False,
 ) -> tuple[Optional[torch.Tensor], tuple[int, int]]:
+    # sliding_layers_only: full-attention layers (no window) keep causal image
+    # attention, as HF Gemma 4 does.
+    if block_ids is None or (sliding_layers_only and window_size[0] < 0):
+        return None, window_size
     # The kernel's bidirectional-block mask has no sliding-window variant. Drop the
     # window only when it cannot clip a key (kv length <= left window + 1);
     # otherwise keep local attention and leave this layer without the mask.
-    if block_ids is None or (window_size[0] >= 0 and max_seqlen_k > window_size[0] + 1):
+    if window_size[0] >= 0 and max_seqlen_k > window_size[0] + 1:
         return None, window_size
     return block_ids, (-1, -1)
 
@@ -264,6 +272,8 @@ class XPUAttentionBackend(AttentionBackend):
         # Gemma-3 multimodal: per-token image-block id over whole sequences, set by
         # prepare_attn_masks each image EXTEND forward, consumed by forward_extend.
         self.bidirectional_block_ids = None
+        # Set with the ids by models whose full-attention layers stay causal.
+        self.bidirectional_sliding_layers_only = False
 
     def _assert_dcp_supported(self):
         if self.has_swa:
@@ -375,6 +385,7 @@ class XPUAttentionBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
         self.bidirectional_block_ids = None
+        self.bidirectional_sliding_layers_only = False
         if self.dcp_size > 1:
             self._init_forward_metadata_dcp(forward_batch)
             return
@@ -913,6 +924,7 @@ class XPUAttentionBackend(AttentionBackend):
                     block_ids=self.bidirectional_block_ids,
                     window_size=window_size,
                     max_seqlen_k=metadata.max_seq_len_k,
+                    sliding_layers_only=self.bidirectional_sliding_layers_only,
                 )
                 if bidirectional_block_ids is not None:
                     causal_arg = False

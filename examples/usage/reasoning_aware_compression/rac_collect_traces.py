@@ -51,7 +51,7 @@ from typing import Iterator, List, Optional
 import msgspec
 
 import sglang as sgl
-from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+from sglang.srt.utils.hf_transformers import get_tokenizer
 
 # The system prompt used by open-r1's GRPO recipes, which is what the RAC
 # reference implementation generated its published traces with. Keeping it

@@ -29,7 +29,8 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
-from sglang.srt.mem_cache.unified_radix_cache import NodeId, UnifiedRadixCache
+from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import NodeId
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig

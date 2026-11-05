@@ -9,7 +9,7 @@ import socket
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
-from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.disaggregation.kv_events import select_kv_publisher_dp_rank
 from sglang.srt.entrypoints.v1_loads import (
     _accelerator_name,
@@ -109,6 +109,7 @@ def _build_server_args(
         ),
         # Every Rust listener of the deployment (`RustServer.gather_server_endpoints`).
         "rust_server_endpoints": scheduler.rust_server_endpoints,
+        "node_listeners": _node_listeners(grpc_port=grpc_port),
     }
     # `/v1/loads` reads this rank's slot of the scheduler's shared-memory
     # snapshots directly, from the file on this node even under multi-node DP;
@@ -133,6 +134,7 @@ def _build_server_args(
         # The shared field is also populated for legacy SMG mode; only forward
         # it when it selects SGLang's native gRPC transport.
         grpc_port=grpc_port,
+        grpc_response_timeout_secs=get_serving().grpc_response_timeout_secs,
         log_level=get_observability().log_level,
         log_level_http=get_observability().log_level_http,
         chat_template=get_serving().chat_template,
@@ -239,6 +241,42 @@ def _build_metrics_config(ext: ModuleType):
         bucket_prompt_tokens=token_buckets(obs.prompt_tokens_buckets),
         bucket_generation_tokens=token_buckets(obs.generation_tokens_buckets),
     )
+
+
+def _node_listeners(*, grpc_port: Optional[int]) -> List[Dict[str, Any]]:
+    """`DeploymentInfo.node_listeners`: every Rust listener on this listener's
+    node, in port-offset order, so each of them reports the same table."""
+    parallel = get_parallel()
+    nnodes_per_tp_group = max(parallel.nnodes // parallel.pp_size, 1)
+    tp_size_per_node = parallel.tp_size // nnodes_per_tp_group
+    first_tp_rank = tp_size_per_node * (parallel.node_rank % nnodes_per_tp_group)
+    node_tp_ranks = range(first_tp_rank, first_tp_rank + tp_size_per_node)
+    # Each attention DP group hosts a listener on its first rank (CP=TP=0).
+    dp_group_width = parallel.attn_tp_size * parallel.attn_cp_size
+    leader_tp_ranks = [tp for tp in node_tp_ranks if tp % dp_group_width == 0]
+    # Plain DP launches every replica on these leaders; otherwise only this one.
+    if not parallel.attn_dp_enabled and parallel.dp_size > 1:
+        replicas = range(parallel.dp_size)
+    else:
+        replicas = [parallel.dp_rank]
+    # Each listener reports this as its own `dp_rank`.
+    listener_dp_ranks = [
+        select_kv_publisher_dp_rank(
+            parallel.attn_dp_size, tp_rank // dp_group_width, dp_rank
+        )
+        for dp_rank in replicas
+        for tp_rank in leader_tp_ranks
+    ]
+    # RustServer.launch offsets a listener by the node's listeners before it.
+    return [
+        {
+            "port_offset": offset,
+            "dp_rank": dp_rank,
+            "http_port": get_serving().port + offset,
+            "grpc_port": None if grpc_port is None else grpc_port + offset,
+        }
+        for offset, dp_rank in enumerate(listener_dp_ranks)
+    ]
 
 
 def _launch_server_info(scheduler: Scheduler) -> str:

@@ -12,14 +12,16 @@ from unittest.mock import patch
 import numpy as np
 import torch
 
-from sglang.srt.configs import LocateAnythingConfig, MoonViTConfig
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.configs.kimi_vl_moonvit import MoonViTConfig
+from sglang.srt.configs.locate_anything import LocateAnythingConfig
+from sglang.srt.managers.req_types import MultimodalDataItem
 from sglang.srt.models.kimi_vl_moonvit import MoonVitPretrainedModel
 from sglang.srt.models.locate_anything import (
     LocateAnythingBoxGrammarLogitProcessor,
     LocateAnythingForConditionalGeneration,
     LocateAnythingMultiModalProjector,
 )
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.utils.common import is_cpu
 from sglang.test.ci.ci_register import register_cpu_ci

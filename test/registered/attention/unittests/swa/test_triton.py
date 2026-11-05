@@ -4,7 +4,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods import dense_attention
@@ -28,7 +28,7 @@ from sglang.test.kits.attention_unittest.runner_modes.split_op_runner import (
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=13, stage="base-b", runner_config="4-gpu-b200")
-register_cuda_ci(est_time=21, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=21, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=20, suite="stage-b-test-1-gpu-large-amd")
 # backend-specific: the gfx950 window-only DSpark draft verify (triton_backend_hip).
 register_amd_ci(est_time=20, suite="stage-b-test-1-gpu-small-amd-mi35x")

@@ -28,6 +28,7 @@ from sglang.kernels.ops.attention.kv_indices import spec_kv_index_token_blocks
 from sglang.kernels.ops.attention.utils import (
     assert_buffer_fits,
 )
+from sglang.kernels.ops.speculative.cache_locs import generate_draft_decode_kv_indices
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import (
@@ -51,7 +52,8 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
@@ -61,7 +63,6 @@ from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
     draft_kv_indices_used_len,
     fill_draft_window_rail,
-    generate_draft_decode_kv_indices,
     resolve_draft_decode_window,
 )
 from sglang.srt.utils import (
