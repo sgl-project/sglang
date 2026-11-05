@@ -99,6 +99,7 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
     def _scheduler(store=None, *, hierarchical=True):
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.enable_hierarchical_cache = hierarchical
+        scheduler.enable_unified_cache_external_linker = False
         scheduler.page_size = 64
         scheduler.max_total_num_tokens = 8192
         scheduler.max_req_input_len = 4096
@@ -251,6 +252,38 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
         self.assertEqual(
             scheduler.get_init_info()["hicache_object_layout"], reply.layout
         )
+
+    def test_direct_linker_describes_its_own_store(self):
+        """The direct external linker has no HiCache controller or host KV buffer:
+        its own MooncakeStore is described, with KV among the registered pools."""
+        store = self._store(registered=(PoolName.KV, PoolName.SWA))
+        scheduler = self._scheduler(hierarchical=False)
+        scheduler.enable_unified_cache_external_linker = True
+        scheduler.tree_cache.cache_controller = None
+        scheduler.tree_cache.linker = SimpleNamespace(
+            cache_linker=SimpleNamespace(storage=store)
+        )
+        scheduler.tree_cache.components[ComponentType.SWA] = SimpleNamespace(
+            full_window_pages=2, pool_name=PoolName.SWA
+        )
+        scheduler.tree_cache._window_slots = (ComponentType.SWA,)
+
+        reply = scheduler.get_hicache_l3_cache_layout(GetHiCacheL3LayoutReq())
+        self.assertTrue(reply.layout["enabled"])
+        pools = reply.layout["hicache_object_layout"]["pools"]
+        self.assertEqual([p["pool"] for p in pools], ["kv", "swa"])
+        self.assertEqual(
+            [p["hit_policy"] for p in pools], ["all_pages", "trailing_pages"]
+        )
+        self.assertEqual(pools[1]["trailing_pages"], 2)
+        self.assertEqual(
+            scheduler.get_init_info()["hicache_object_layout"], reply.layout
+        )
+
+        scheduler.tree_cache.linker = None
+        reply = scheduler.get_hicache_l3_cache_layout(GetHiCacheL3LayoutReq())
+        self.assertFalse(reply.layout["enabled"])
+        self.assertIn("linker", reply.layout["reason"])
 
     def test_sidecar_window_uses_its_source_and_preserves_its_policy(self):
         store = self._store(
