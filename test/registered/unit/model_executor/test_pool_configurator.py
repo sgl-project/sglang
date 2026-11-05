@@ -96,6 +96,7 @@ def _make_model_runner(
     mr = MagicMock()
 
     mr.use_mla_backend = use_mla_backend
+    mr.modelslim_cache_layout = None
     mr.is_draft_worker = False
     mr.dflash_draft_cell_size_per_token = None
     mr.num_effective_layers = num_layers

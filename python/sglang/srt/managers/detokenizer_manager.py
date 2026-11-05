@@ -97,7 +97,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         self.recv_from_scheduler = get_zmq_socket(
             context, zmq.PULL, port_args.detokenizer_ipc_name, True
         )
-        # In multi-tokenizer mode, results are pushed back to each TokenizerWorker
+        # In multi-tokenizer mode, results are pushed back to each tokenizer worker
         # directly via SocketMapping inside multi_http_worker_event_loop, so the
         # single send_to_tokenizer socket is unused.
         if get_serving().tokenizer_worker_num == 1:

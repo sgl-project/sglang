@@ -1360,19 +1360,20 @@ def fused_topk(
                 )
         # ===== TO BE REFACTORED ====
         elif packed_out is not None:
-            # Fused gating + routed pack (SGLANG_OPT_LORA_FUSED_TOPK_PACK): one JIT kernel
-            # writes topk_weights/topk_ids AND the FlashInfer packed topk in one launch.
-            from sglang.kernels.ops.lora.moe.trtllm_lora_temp.topk_softmax_pack import (
-                topk_softmax_pack,
+            # Fused gating + routed pack (SGLANG_OPT_LORA_FUSED_TOPK_PACK): the router
+            # also writes the FlashInfer packed topk in the same launch.
+            from sglang.kernels.ops.moe.moe_fused_gate import (
+                moe_fused_gate as _jit_moe_fused_gate,
             )
 
-            topk_softmax_pack(
-                topk_weights,
-                topk_ids,
-                packed_out,
+            topk_weights, topk_ids = _jit_moe_fused_gate(
                 gating_output,
-                renormalize,
+                None,
+                topk,
+                scoring_func="softmax",
+                renormalize=renormalize,
                 num_token_non_padded=num_token_non_padded,
+                packed_out=packed_out,
             )
         # ===== END TO BE REFACTORED ====
         elif _is_cuda or use_rocm_triton:
@@ -2101,6 +2102,36 @@ def biased_grouped_topk_gpu(
             num_expert_group=num_expert_group,
             topk_group=topk_group,
         )
+    if _is_cuda and not dynamic_bias and num_expert_group and num_expert_group > 1:
+        # One-warp-per-token CUDA router (same selection as flashinfer's
+        # fused_topk_deepseek, ties to the lowest id); shared columns carry
+        # fused_shared_expert_weight like the branch below.
+        from sglang.kernels.ops.moe import moe_route_warp
+
+        if moe_route_warp.covered(
+            gating_output.dtype,
+            gating_output.shape[1],
+            topk,
+            "sigmoid",
+            num_fused_shared_experts,
+            num_expert_group,
+            topk_group,
+            gating_output.device.index,
+        ) and moe_route_warp.bias_layout_ok(correction_bias):
+            return moe_route_warp.moe_route_warp(
+                gating_output,
+                correction_bias,
+                topk,
+                scoring_func="sigmoid",
+                num_fused_shared_experts=num_fused_shared_experts,
+                renormalize=renormalize,
+                routed_scaling_factor=routed_scaling_factor,
+                apply_routed_scaling_factor_on_output=bool(
+                    apply_routed_scaling_factor_on_output
+                ),
+                num_expert_group=num_expert_group,
+                topk_group=topk_group,
+            )
     if (
         _is_cuda
         and fused_topk_deepseek is not None
@@ -2265,30 +2296,6 @@ def biased_grouped_topk_gpu(
             )
         )
         if _jit_gate_ok:
-            # ===== TO BE REFACTORED ====
-            _use_jit_bf16_gate = False
-            if _SGLANG_EXPERIMENTAL_LORA_OPTI:
-                from sglang.srt.lora.trtllm_lora_temp.environ import lora_envs
-
-                _use_jit_bf16_gate = (
-                    lora_envs.SGLANG_OPT_USE_JIT_KERNEL_KIMI_GATE.get()
-                    and lora_envs.SGLANG_OPT_KIMI_GATE_BF16_INPUT.get()
-                )
-            if _use_jit_bf16_gate:
-                from sglang.kernels.ops.lora.moe.trtllm_lora_temp.kimi_k2_moe_fused_gate import (
-                    kimi_k2_moe_fused_gate as _kimi_k2_moe_fused_gate,
-                )
-
-                # bf16 pass-through: skip the two host-side fp32 upcast kernels.
-                return _kimi_k2_moe_fused_gate(
-                    gating_output,
-                    correction_bias,
-                    topk=topk,
-                    renormalize=renormalize,
-                    routed_scaling_factor=routed_scaling_factor,
-                    apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
-                )
-            # ===== END TO BE REFACTORED ====
             from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate as jit_gate
 
             # Pass BF16 logits through untouched for the automatic radix-select

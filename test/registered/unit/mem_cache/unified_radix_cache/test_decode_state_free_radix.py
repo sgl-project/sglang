@@ -10,7 +10,8 @@ from dataclasses import replace
 from types import MethodType, SimpleNamespace
 from unittest import mock
 
-from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req
+from sglang.srt.managers.req_types import FINISH_LENGTH
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocation import ensure_mamba_capacity
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.kv.plan import TREE_STATE
