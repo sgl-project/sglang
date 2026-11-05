@@ -381,9 +381,10 @@ ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
 ENV AITER_COMMIT_DEFAULT="26f4f1fb2de14d122c71f5fed7afb97a5c97cade"
 ENV BUILD_RCCL="1"
-# Head of ROCm/rocm-systems#14254: develop plus a fix for a hang in the first
-# all-reduce on gfx1250. Not merged yet; move to develop once it is.
-ENV RCCL_COMMIT_DEFAULT="1c0ab425abda9d1fd80fa977c253556b14eb140b"
+# rocm-systems develop. The fix for the hang in the first all-reduce on gfx1250
+# (ROCm/rocm-systems#14254) has landed on the mainline, so pin develop instead
+# of the PR branch.
+ENV RCCL_COMMIT_DEFAULT="d2e0de357464cd34cabaea859b71c10da88e7ae9"
 # hipBLASLt 10.1 looks for TensileLibrary_lazy_gfx1250.dat directly under
 # library/, not library/<arch>/, and every GEMM fails without this.
 ENV HIPBLASLT_TENSILE_LIBPATH="/opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries/lib/hipblaslt/library/gfx1250"
@@ -463,7 +464,7 @@ ARG LLVM_BRANCH="MainOpSelV2"
 ARG LLVM_COMMIT="6520ace8227ffe2728148d5f3b9872a870b0a560"
 
 ARG MOONCAKE_REPO="https://github.com/kvcache-ai/Mooncake.git"
-ARG MOONCAKE_COMMIT="78566d459c140956fd15606e102132b1acc83eec"
+ARG MOONCAKE_COMMIT="748af1a53dba2d57c110de0e7feb5613ddb8835b"
 
 ARG TILELANG_REPO="https://github.com/tile-ai/tilelang.git"
 ARG TILELANG_COMMIT="a55a82302bf7f3c5af635b5c9146f728185cc900"

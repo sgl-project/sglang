@@ -43,7 +43,7 @@ from sglang.srt.configs.janus_pro import MultiModalityConfig
 from sglang.srt.configs.jet_nemotron import JetNemotronConfig
 from sglang.srt.configs.jet_vlm import JetVLMConfig
 from sglang.srt.configs.k2_horizon import K2HorizonConfig, XllmConfig
-from sglang.srt.configs.kimi_k3 import KimiK3Config
+from sglang.srt.configs.kimi_k3 import KimiK3Config, KimiK31Config
 from sglang.srt.configs.kimi_k25 import KimiK25Config
 from sglang.srt.configs.kimi_linear import KimiLinearConfig
 from sglang.srt.configs.kimi_vl import KimiVLConfig
@@ -94,6 +94,7 @@ from sglang.srt.configs.step3_vl import (
 from sglang.srt.configs.step3p5 import Step3p5Config
 from sglang.srt.configs.step3p7 import Step3p7Config
 from sglang.srt.configs.unlimited_ocr import UnlimitedVLConfig
+from sglang.srt.configs.xing4_0 import Xing4_0Config
 from sglang.srt.configs.zaya import ZayaConfig
 
 __all__ = [
@@ -130,6 +131,7 @@ __all__ = [
     "Glm5NextTextConfig",
     "KimiLinearConfig",
     "KimiK3Config",
+    "KimiK31Config",
     "KimiK25Config",
     "LagunaConfig",
     "Qwen3NextConfig",
@@ -182,5 +184,6 @@ __all__ = [
     "InklingModelConfig",
     "InklingVisionConfig",
     "UnlimitedVLConfig",
+    "Xing4_0Config",
     "ZayaConfig",
 ]
