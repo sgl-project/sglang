@@ -2049,6 +2049,9 @@ class Envs:
     # V4.1 ratio-1 index-K pool in aiter's row-group page-8 layout (8 consecutive 8-slot pages per
     # 64-slot page), so a candidate consumer layer scores only its published blocks.
     SGLANG_HIP_DSV41_INDEX_K_PAGE8 = EnvBool(False)
+    # V4.1 ratio-2 prefill indexer on a 64-slot index-K pool: score on aiter's row-group FP4
+    # kernel (a request's rows share each key load). Not bitwise: fp32 sums are reordered.
+    SGLANG_HIP_DSV41_PREFILL_INDEXER_ROWGROUP = EnvBool(False)
     # DeepSeek-V4.1 mHC boundary (HIP): the 32-row Triton tile from _HC_BOUNDARY_WIDE_MIN_M rows (bitwise the same).
     SGLANG_HIP_MHC_BOUNDARY_WIDE_TILE = EnvBool(True)
 

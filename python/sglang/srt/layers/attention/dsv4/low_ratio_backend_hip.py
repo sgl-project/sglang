@@ -87,8 +87,31 @@ def _fp4_rowgroup_enabled() -> bool:
     return True
 
 
-def _score_requests_page8(
+# the full-row index layers: the schedule kernel re-reads the whole context once a row
+_PREFILL_ROWGROUP_RATIOS = frozenset({2})
+
+
+def _prefill_rowgroup_ratios(page8_ratios: FrozenSet[int]) -> FrozenSet[int]:
+    """The 64-slot-pool ratios whose dense prefill scores on AITER's row-group kernel."""
+    if not envs.SGLANG_HIP_DSV41_PREFILL_INDEXER_ROWGROUP.get():
+        return frozenset()
+    if not aiter_has_fp4_rowgroup():
+        _warn_no_rowgroup()
+        return frozenset()
+    return _PREFILL_ROWGROUP_RATIOS - page8_ratios
+
+
+@functools.lru_cache(maxsize=1)
+def _warn_no_rowgroup() -> None:
+    logger.warning(
+        "SGLANG_HIP_DSV41_PREFILL_INDEXER_ROWGROUP is set but the installed AITER has no "
+        "row-group FP4 MQA logits kernel (#6145); keeping the schedule kernel."
+    )
+
+
+def _score_requests_rowgroup(
     *,
+    page8: bool,
     q_fp4: torch.Tensor,
     q_scale: torch.Tensor,
     weights: torch.Tensor,
@@ -100,8 +123,8 @@ def _score_requests_page8(
     rows_per_request: List[int],
     row_ends: torch.Tensor,
 ) -> torch.Tensor:
-    """Full-context logits of a page8 pool for rows, consecutive requests from req_lo on with
-    rows_per_request rows each; a request's rows share every key load."""
+    """Full-context logits of a page8 or 64-slot pool for rows, consecutive requests from
+    req_lo on with rows_per_request rows each; a request's rows share every key load."""
     assert sum(rows_per_request) == q_fp4.shape[0], (rows_per_request, q_fp4.shape)
     return rowgroup_paged_mqa_logits(
         q_fp4=q_fp4,
@@ -119,9 +142,10 @@ def _score_requests_page8(
         row_ends=row_ends,
         max_query_len=max(rows_per_request),
         max_seq_len=workspace.max_seq_len,
-        page8=True,
-        pages_per_block=8,
+        page8=page8,
+        pages_per_block=8 if page8 else 1,
         is_decode=False,
+        prefill_plan=True,
     )
 
 
@@ -235,13 +259,26 @@ def refresh_low_ratio_prefill_workspaces(
     page8_ratios: FrozenSet[int] = frozenset(),
 ) -> Dict[int, Union[FP4PrefillWorkspace, FP4RowgroupPrefillWorkspace]]:
     """Must run outside CUDA-graph capture; see prepare_fp4_prefill_workspace. A page8 pool
-    scores on the row-group kernel, which takes no schedule, on a table as wide as
-    ``max_context_len`` needs (without extend_lens, the indexer builds its workspace
-    itself)."""
+    and the row-group prefill ratios score on the row-group kernel, which takes no schedule,
+    on a table as wide as ``max_context_len`` needs (without extend_lens, the indexer builds
+    its workspace itself). With the row-group prefill on, a schedule workspace no call reads
+    is skipped: rows scored in logits row chunks build their own schedule."""
     previous = previous or {}
     workspaces = {}
+    rowgroup_ratios = _prefill_rowgroup_ratios(page8_ratios)
+    skip_unread = bool(rowgroup_ratios)
     for ratio, meta in metadata_by_ratio.items():
-        if ratio in page8_ratios:
+        if skip_unread and ratio not in page8_ratios and ratio not in rowgroup_ratios:
+            num_rows = (
+                sum(extend_lens)
+                if extend_lens is not None
+                else meta.page_table.shape[0]
+            )
+            if num_rows > logits_rows_per_chunk(
+                meta.page_table, LOW_RATIO_PAGE_TABLE_BUCKET
+            ):
+                continue
+        if ratio in page8_ratios or ratio in rowgroup_ratios:
             if extend_lens is not None:
                 workspaces[ratio] = prepare_fp4_rowgroup_prefill_workspace(
                     meta.page_table,
@@ -577,7 +614,10 @@ def low_ratio_index_topk_hip_extend(
     k_scale = pool.get_index_k_fp4_scale_buffer(layer.layer_id)
     prefill_workspace = metadata.fp4_low_ratio_prefill_workspaces.get(ratio)
     page8 = pool.low_ratio_index_k_page8(layer.layer_id)
-    if page8 and not (
+    rowgroup64 = not page8 and ratio in _prefill_rowgroup_ratios(
+        pool.low_ratio_index_k_page8_ratios()
+    )
+    if (page8 or rowgroup64) and not (
         isinstance(prefill_workspace, FP4RowgroupPrefillWorkspace)
         and prefill_workspace.request_page_table.shape[0] == len(extend_lens_cpu)
     ):
@@ -593,8 +633,9 @@ def low_ratio_index_topk_hip_extend(
     def score_rows(
         rows: slice, req_lo: int, rows_per_request: List[int]
     ) -> torch.Tensor:
-        if page8:
-            return _score_requests_page8(
+        if page8 or rowgroup64:
+            return _score_requests_rowgroup(
+                page8=page8,
                 q_fp4=q_fp4[rows],
                 q_scale=q_scale[rows],
                 weights=weights[rows],

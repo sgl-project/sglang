@@ -373,6 +373,17 @@ def rowgroup_prefill_query_start_loc(
     return query_start_loc
 
 
+def _rowgroup_plan(prefill: bool, **shape):
+    """AITER's plan, but for prefill 8-row tiles 4 rows a wave in 4-wave workgroups (AITER's
+    8-wave default there measured 31-41% slower on MI355X at 114K-1M keys)."""
+    from aiter.ops.flydsl import make_fp4_mqa_plan
+
+    plan = make_fp4_mqa_plan(**shape)
+    if prefill and plan.tile_m // plan.heads == 8:
+        plan = make_fp4_mqa_plan(**shape, rows_per_wave=4, num_warps=4)
+    return plan
+
+
 def prepare_fp4_prefill_workspace(
     page_table: torch.Tensor,
     c4_seq_lens: torch.Tensor,
@@ -487,6 +498,7 @@ def rowgroup_paged_mqa_logits(
     page8: bool,
     pages_per_block: int = 1,
     is_decode: bool = True,
+    prefill_plan: bool = False,
 ) -> torch.Tensor:
     """[rows, max_seq_len] fp32 logits from AITER's row-group kernel: sequence b's rows
     query_start_loc[b] .. [b + 1] - 1 score the keys of block_tables[b] up to their own
@@ -494,7 +506,7 @@ def rowgroup_paged_mqa_logits(
     the pool's 8-slot pages (8: the 64-slot page table as is; 1: an 8-slot page each, the
     candidate table). Past a row's bound the logits are left unwritten; the length-aware
     top-k never reads them."""
-    from aiter.ops.flydsl import flydsl_pa_mqa_logits_fp4, make_fp4_mqa_plan
+    from aiter.ops.flydsl import flydsl_pa_mqa_logits_fp4
 
     num_rows, heads = q_fp4.shape[0], q_fp4.shape[-2]
     if page8:
@@ -504,7 +516,8 @@ def rowgroup_paged_mqa_logits(
         assert pages_per_block == 1, "a 64-slot page entry names one page"
         kv, ks = k_payload.view(torch.uint8), k_scale
         page_size = _KV_BLOCK_SIZE
-    plan = make_fp4_mqa_plan(
+    plan = _rowgroup_plan(
+        prefill_plan and not page8,
         num_seqs=query_start_loc.shape[0] - 1,
         max_qlen=max_query_len,
         num_rows=num_rows,
