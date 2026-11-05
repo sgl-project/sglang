@@ -523,6 +523,96 @@ def _rank_consensus_worker(rank, rendezvous):
         dist.destroy_process_group()
 
 
+def _coordinated_transfer_wait_worker(rank, rendezvous):
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{rendezvous}",
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=15),
+    )
+    try:
+        # Rank 0 has no local batch; rank 1's copy completes on its third
+        # query. Both must execute exactly the same readiness collectives.
+        queries = [0]
+        polls = [0]
+
+        def query():
+            queries[0] += 1
+            return queries[0] >= 3
+
+        def retire():
+            polls[0] += 1
+
+        scheduler = SimpleNamespace(
+            last_batch=None if rank == 0 else object(),
+            result_queue=(
+                deque()
+                if rank == 0
+                else deque(
+                    [
+                        (
+                            None,
+                            SimpleNamespace(
+                                copy_done=SimpleNamespace(query=query),
+                                delay_sample_func=None,
+                            ),
+                        )
+                    ]
+                )
+            ),
+            tp_size=2,
+            tp_cpu_group=dist.group.WORLD,
+            process_disagg_prefill_transfer_queue=retire,
+        )
+        status = torch.empty(1, dtype=torch.int32)
+        SchedulerDisaggregationPrefillMixin.poll_transfers_during_coordinated_result_wait(
+            scheduler,
+            status,
+        )
+        assert polls[0] == 3, (rank, polls[0])
+        assert queries[0] == (0 if rank == 0 else 3)
+        dist.barrier()
+
+        # Missing sampling/copy must cause a collective fallback on every
+        # rank, even though the idle rank reports READY.
+        polls[0] = 0
+        if rank == 1:
+            scheduler.result_queue[0][1].delay_sample_func = object()
+        SchedulerDisaggregationPrefillMixin.poll_transfers_during_coordinated_result_wait(
+            scheduler,
+            status,
+        )
+        assert polls[0] == 0
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+class TestCoordinatedTransferWait(CustomTestCase):
+    def test_idle_dp_rank_participates_until_busy_peer_completes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ctx = multiprocessing.get_context("spawn")
+            rendezvous = str(Path(directory) / "gloo")
+            processes = [
+                ctx.Process(
+                    target=_coordinated_transfer_wait_worker, args=(rank, rendezvous)
+                )
+                for rank in range(2)
+            ]
+            try:
+                for process in processes:
+                    process.start()
+                for process in processes:
+                    process.join(timeout=25)
+                self.assertEqual([p.exitcode for p in processes], [0, 0])
+            finally:
+                for process in processes:
+                    if process.is_alive():
+                        process.terminate()
+                    process.join(timeout=5)
+
+
 class TestPrefillResultPolling(CustomTestCase):
     @unittest.skipUnless(dist.is_gloo_available(), "requires Gloo")
     def test_empty_polls_and_arrival_bursts_preserve_storage_retry_pacing(self):

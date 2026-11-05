@@ -787,6 +787,65 @@ class SchedulerDisaggregationPrefillMixin:
             )
         return enabled
 
+    def _is_dp_transfer_wait_polling_enabled(self: Scheduler) -> bool:
+        if not envs.SGLANG_DISAGG_PREFILL_DP_POLL_TRANSFERS_WHILE_WAITING.get():
+            return False
+        supported = (
+            self.pp_size == 1
+            and self.spec_algorithm.is_none()
+            and self.is_generation
+            and self.dllm_config is None
+        )
+        if not supported:
+            logger.warning(
+                "Coordinated prefill transfer polling requires PP=1 and "
+                "non-speculative autoregressive generation; using blocking waits."
+            )
+        if supported:
+            logger.info(
+                "Coordinated prefill transfer polling enabled "
+                "(PP=1, fixed-site readiness consensus)"
+            )
+        return supported
+
+    def poll_transfers_during_coordinated_result_wait(
+        self: Scheduler, completion_status: torch.Tensor
+    ) -> None:
+        """All TP/DP/CP ranks enter here once per overlap-loop iteration.
+
+        No intake, batch construction or new forward is allowed inside this
+        loop. Idle ranks contribute READY rather than skipping the collective.
+        Transfer retirement still runs on the scheduler thread, with its normal
+        attention-TP/CP status consensus and KV ownership checks.
+        """
+        result = self.result_queue[0][1] if self.last_batch is not None else None
+        while True:
+            # 0 means sampling has not yet submitted the copy: collectively
+            # fall back to the existing blocking path instead of spinning.
+            state = 2 if result is None else 0
+            if (
+                result is not None
+                and result.copy_done is not None
+                and result.delay_sample_func is None
+            ):
+                state = 2 if result.copy_done.query() else 1
+            completion_status.fill_(state)
+            if self.tp_size > 1:
+                torch.distributed.all_reduce(
+                    completion_status,
+                    op=torch.distributed.ReduceOp.MIN,
+                    group=self.tp_cpu_group,
+                )
+            state = completion_status.item()
+            if state == 0:
+                return
+            self.process_disagg_prefill_transfer_queue()
+            if state == 2:
+                return
+            # Also yield on TP>1: bootstrap/transfer worker threads need CPU
+            # while all ranks wait for the same device completion frontier.
+            time.sleep(PREFILL_INPUT_POLL_INTERVAL_S)
+
     def _war_barrier_is_coarse(self: Scheduler) -> bool:
         # Same condition as Scheduler._apply_war_barrier's whole-forward fallback.
         if not self._war_barrier_enabled:
@@ -813,6 +872,10 @@ class SchedulerDisaggregationPrefillMixin:
             self._is_continuous_input_polling_enabled()
         )
         poll_transfers_while_waiting = self._is_transfer_wait_polling_enabled()
+        coordinated_transfer_wait = self._is_dp_transfer_wait_polling_enabled()
+        if coordinated_transfer_wait:
+            self.enable_continuous_input_polling = False
+            poll_transfers_while_waiting = False
         self.result_queue = deque()
         batch_result_completion_status = torch.empty(1, dtype=torch.int32, device="cpu")
         # True when intake repeats while the oldest batch result is unfinished.
@@ -891,11 +954,19 @@ class SchedulerDisaggregationPrefillMixin:
                 else:
                     batch_result = None
 
+            # This is deliberately outside `if self.last_batch`: an idle DP
+            # rank must execute the same readiness collectives as a busy peer.
+            if coordinated_transfer_wait:
+                self.poll_transfers_during_coordinated_result_wait(
+                    batch_result_completion_status
+                )
+
             if self.last_batch:
                 # Poll until the oldest result is ready on all TP ranks while there
                 # is input to take or a transfer to retire; otherwise block.
-                if self.enable_continuous_input_polling or (
-                    poll_transfers_while_waiting and self.disagg_prefill_transfer_queue
+                if not coordinated_transfer_wait and (
+                    self.enable_continuous_input_polling
+                    or (poll_transfers_while_waiting and self.disagg_prefill_transfer_queue)
                 ):
                     oldest_batch_result = self.result_queue[0][1]
                     if (

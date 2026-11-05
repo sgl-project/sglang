@@ -376,6 +376,45 @@ class TestPDTimingLog(CustomTestCase):
         ):
             pd_timing.log_pd_timing(SimpleNamespace(bootstrap_room=42), "p_sender_create")
 
+    def test_pd_engine_timing_propagates_to_workers_and_resets_on_failure(self):
+        import concurrent.futures
+        import contextvars
+        import json
+
+        from sglang.srt.observability import pd_timing
+
+        def native(session, src, dst, lengths):
+            if session == "fail":
+                raise RuntimeError("transport failed")
+            return -7
+
+        def transfer(session):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                return executor.submit(
+                    contextvars.copy_context().run,
+                    pd_timing.run_pd_engine_transfer,
+                    native,
+                    session,
+                    [100],
+                    [200],
+                    [64],
+                ).result()
+
+        with pd_timing.envs.SGLANG_ENABLE_PD_TIMING_LOG.override(True):
+            with self.assertLogs(pd_timing.logger, level="INFO") as logs:
+                self.assertEqual(pd_timing.run_pd_transfer(42, transfer, "peer"), -7)
+                with self.assertRaisesRegex(RuntimeError, "transport failed"):
+                    pd_timing.run_pd_transfer(43, transfer, "fail")
+            self.assertIsNone(pd_timing._transfer_room.get())
+        rows = [json.loads(line.split("PD_TIMING ", 1)[1]) for line in logs.output]
+        engine = [r for r in rows if r["stage"].startswith("engine_call_")]
+        self.assertEqual([r["bootstrap_room"] for r in engine], [42, 42, 43, 43])
+        self.assertEqual(engine[0]["call_id"], engine[1]["call_id"])
+        self.assertEqual(engine[1]["status"], -7)
+        self.assertIsNone(engine[3]["status"])
+        self.assertEqual(engine[1]["bytes"], 64)
+        self.assertNotIn("buffers", engine[0])
+
     def test_pd_timing_correlates_by_room_without_logging_payload(self):
         import json
         from types import SimpleNamespace

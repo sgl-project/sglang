@@ -1,4 +1,5 @@
 import concurrent.futures
+import contextvars
 import enum
 import logging
 from typing import List, Optional, Tuple
@@ -414,6 +415,7 @@ class AscendKVManager(MooncakeKVManager):
         if self.enable_custom_mem_pool:
             futures = [
                 executor.submit(
+                    contextvars.copy_context().run,
                     process_layer,
                     src_ptr,
                     dst_ptr,

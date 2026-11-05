@@ -6,6 +6,7 @@ import os
 from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 from sglang.srt.environ import envs
+from sglang.srt.observability.pd_timing import run_pd_engine_transfer
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
@@ -252,8 +253,12 @@ class MooncakeTransferEngine:
     ) -> int:
         """Synchronously transfer data to the specified addresses in batches."""
         try:
-            ret = self.engine.batch_transfer_sync_write(
-                session_id, buffers, peer_buffer_addresses, lengths
+            ret = run_pd_engine_transfer(
+                self.engine.batch_transfer_sync_write,
+                session_id,
+                buffers,
+                peer_buffer_addresses,
+                lengths,
             )
         except Exception:
             ret = -1
