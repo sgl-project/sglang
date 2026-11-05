@@ -136,6 +136,32 @@ ModelRegistry.models.update(import_new_model_classes())
 launch_server(server_args)
 ```
 
+### Opt into MLA caching
+
+If your external model implements Multi-head Latent Attention (MLA), set
+`use_mla` to `true` in its Hugging Face text configuration to select the compressed
+latent KV cache. For a multimodal checkpoint, put these fields in the nested text
+configuration used by your model.
+
+```json Config
+{
+  "use_mla": true,
+  "kv_lora_rank": 512,
+  "qk_nope_head_dim": 128,
+  "qk_rope_head_dim": 64,
+  "v_head_dim": 96
+}
+```
+
+All four dimensions must be integers. `kv_lora_rank` and `v_head_dim` must be
+positive. The two Q/K dimensions may be zero individually, but their sum must be
+positive. Use dimensions that match your model implementation. This opt-in selects
+the MLA configuration; your model must implement MLA and use a compatible attention
+backend. It does not convert an MHA model to MLA or enable sparse attention.
+
+Providing the dimensions without `use_mla: true` keeps the existing attention
+selection. Built-in architectures retain their specialized configuration rules.
+
 ## Example: Implementing and Serving a Llama Wrapper Model
 
 Below is an introductory, step-by-step walkthrough on how to implement a new model end-to-end in SGLang and then run it via the [Offline Engine](../basic_usage/offline_engine_api).
