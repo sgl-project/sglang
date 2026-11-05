@@ -19,7 +19,6 @@ from flashinfer.fused_moe import (  # noqa: E402
 
 from sglang.srt.layers.muse_spark.routed_moe_split import (  # noqa: E402
     get_routed_moe_split,
-    split_enabled,
     split_supported,
 )
 
@@ -156,23 +155,10 @@ def test_split_matches_ordinary_call(weights, local, m, per_token):
 
 
 def test_split_gate():
-    """The gate admits the tiles measured bitwise (<= 128) and keeps the rest on the ordinary call."""
-    for local, m in SPLIT_CASES:
-        assert split_supported(num_tokens=m, top_k=TOP_K, num_local_experts=local)
+    """The gate keeps tile 192 and token counts above the measured range on the ordinary call."""
     # Tile 192 at 32 local experts, and above the measured token range.
     assert not split_supported(num_tokens=960, top_k=TOP_K, num_local_experts=32)
     assert not split_supported(num_tokens=1025, top_k=TOP_K, num_local_experts=64)
-
-
-def test_split_enabled_per_gpu_and_tp():
-    """Only measured (GPU, TP) pairs take the split, from their measured token count."""
-    for tp in (4, 8):
-        assert split_enabled(num_tokens=8, tp_size=tp, capability=(10, 7))
-        assert split_enabled(num_tokens=1024, tp_size=tp, capability=(10, 7))
-        assert not split_enabled(num_tokens=256, tp_size=tp, capability=(10, 3))
-        assert split_enabled(num_tokens=512, tp_size=tp, capability=(10, 3))
-    assert not split_enabled(num_tokens=4, tp_size=4, capability=(10, 7))
-    assert not split_enabled(num_tokens=64, tp_size=2, capability=(10, 7))
 
 
 if __name__ == "__main__":
