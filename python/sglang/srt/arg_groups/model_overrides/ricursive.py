@@ -13,8 +13,8 @@ from sglang.srt.runtime_context import get_platform
 @_register_for("RicursiveForCausalLM")
 def _ricursive_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
-    # forward_extend's no-prefix branch runs without window_left, and Ripple's
-    # sliding layers need the window as soon as a prompt outgrows it.
+    # Ripple's prefill logprobs on flashinfer match HF with no window at all, so
+    # a prompt longer than sliding_window reads keys its sliding layers must not.
     if "flashinfer" in (
         cfg.attention_backend,
         cfg.prefill_attention_backend,
