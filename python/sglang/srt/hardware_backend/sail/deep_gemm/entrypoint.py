@@ -6,6 +6,11 @@ gather-read fused MoE API. None of them exist in the CUDA build that
 ``layers/deep_gemm_wrapper`` targets, so they live here instead of growing the
 shared wrapper.
 
+The module also hosts the masked FP8/BF16 grouped GEMMs whose *signature* the
+vendor build diverges on (per-channel kernel types, ``enable_sbo_overlap`` and
+the optional overlap arguments), so the shared wrappers stay upstream-faithful
+and SAIL callers import the variant from here.
+
 Both the registry-side custom-op wrapper
 ``sglang.kernels.ops.gemm.sail_deepgemm`` and the SAIL MoE runners import from
 this module directly. Routing them through ``deep_gemm_wrapper`` instead would
@@ -23,6 +28,7 @@ from sglang.srt.layers.deep_gemm_wrapper.configurer import (  # noqa: F401
     ENABLE_JIT_DEEPGEMM,
 )
 from sglang.srt.layers.deep_gemm_wrapper.entrypoint import (
+    _ensure_cuda,
     _sanity_check_input,
     configure_deep_gemm_num_sms,
 )
@@ -56,6 +62,109 @@ def grouped_gemm_nt_f8f8bf16_nopad(
 
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
         deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_nopad(lhs, rhs, out, m_indices, m_rows)
+
+
+def grouped_gemm_nt_f8f8bf16_masked(
+    lhs: Tuple[torch.Tensor, torch.Tensor],
+    rhs: Tuple[torch.Tensor, torch.Tensor],
+    out: torch.Tensor,
+    masked_m: torch.Tensor,
+    expected_m: int,
+    overlap_args: Optional[Any] = None,
+    max_block_n: int = 256,
+    recipe_a: Optional[Tuple[int, int]] = None,
+    recipe_b: Optional[Tuple[int, int]] = None,
+):
+    """Masked FP8 grouped GEMM, per-channel aware.
+
+    Differs from the shared wrapper in two ways: a per-channel scale selects the
+    ``_CHANNEL`` kernel type, and SBO is requested as ``enable_sbo_overlap``
+    (the CUDA build names the same switch ``enable_overlap``).
+    """
+    assert _is_sail, (
+        "grouped_gemm_nt_f8f8bf16_masked is only supported by SAIL DeepGEMM"
+    )
+
+    num_groups, _, k = lhs[0].shape
+    _, n, _ = rhs[0].shape
+    kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED
+    if lhs[1].shape[-1] == 1 and rhs[1].shape[-1] == 1:
+        kernel_type = (
+            compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED_CHANNEL
+        )
+
+    _sanity_check_input(lhs)
+    _sanity_check_input(rhs)
+
+    lhs = _ensure_cuda(lhs)
+    rhs = _ensure_cuda(rhs)
+
+    with compile_utils.deep_gemm_execution_hook(
+        expected_m, n, k, num_groups, kernel_type
+    ):
+        with configure_deep_gemm_num_sms(
+            overlap_args.num_sms if overlap_args is not None else None
+        ):
+            fp4_kwargs = {}
+            if recipe_a is not None:
+                fp4_kwargs["recipe_a"] = recipe_a
+            if recipe_b is not None:
+                fp4_kwargs["recipe_b"] = recipe_b
+
+            return deep_gemm.fp8_m_grouped_gemm_nt_masked(
+                lhs,
+                rhs,
+                out,
+                masked_m,
+                expected_m,
+                **fp4_kwargs,
+                **(
+                    dict(
+                        enable_sbo_overlap=True,
+                        max_block_n=max_block_n,
+                        signal=overlap_args.signal,
+                    )
+                    if overlap_args is not None
+                    else {}
+                ),
+            )
+
+
+def grouped_gemm_nt_bf16_masked(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    d: torch.Tensor,
+    masked_m: torch.Tensor,
+    expected_m: int,
+    overlap_args: Optional[Any] = None,
+    max_block_n: int = 256,
+):
+    """BF16 masked grouped GEMM with the SBO switch this build expects."""
+    assert _is_sail, "grouped_gemm_nt_bf16_masked is only supported by SAIL DeepGEMM"
+
+    num_groups, _, k = a.shape
+    _, n, _ = b.shape
+    kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_BF16_MASKED
+
+    with compile_utils.deep_gemm_execution_hook(
+        expected_m, n, k, num_groups, kernel_type
+    ):
+        return deep_gemm.m_grouped_bf16_gemm_nt_masked(
+            a,
+            b,
+            d,
+            masked_m,
+            expected_m,
+            **(
+                dict(
+                    enable_sbo_overlap=True,
+                    max_block_n=max_block_n,
+                    signal=overlap_args.signal,
+                )
+                if overlap_args is not None
+                else {}
+            ),
+        )
 
 
 # int8 implementation
