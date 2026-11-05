@@ -426,6 +426,27 @@ def test_moe_post_reduces_before_adding_replicated_shared(
     torch.testing.assert_close(actual, torch.full((2, 3), expected))
 
 
+@pytest.mark.parametrize("num_tokens", [32, 576, 1024, 4095])
+def test_deepgemm_compensated_mhc_slices(num_tokens):
+    from sglang.srt.runtime_context import get_platform
+    from sglang.test.kernels.mhc import hc_split_sinkhorn_torch
+
+    if not get_platform().is_sm100:
+        pytest.skip("Blackwell DeepGEMM prenorm")
+    torch.manual_seed(7 + num_tokens)
+    x = torch.randn(num_tokens, 4 * 7168, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(24, 4 * 7168, device="cuda") * 0.01
+    scale = torch.tensor([0.5, 0.25, 0.25], device="cuda")
+    base = torch.randn(24, device="cuda")
+    parts = mhc.split_tf32_hc_weight(w)
+    actual = mhc.hc_mix_stats_sinkhorn_deepgemm(x, parts, scale, base, 20, 1e-6, 1e-6)
+    xd = x.double()
+    z = (xd @ w.double().T) * torch.rsqrt(xd.square().mean(-1, keepdim=True) + 1e-6)
+    expected = hc_split_sinkhorn_torch(z[None], scale, base, 4, 20, 1e-6)
+    for result, ref in zip(actual, expected):
+        torch.testing.assert_close(result, ref[0].float(), rtol=1e-5, atol=2e-6)
+
+
 if __name__ == "__main__":
     import sys
 
