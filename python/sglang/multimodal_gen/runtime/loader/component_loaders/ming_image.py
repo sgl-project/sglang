@@ -12,6 +12,7 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.text_encoder_loader 
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
     checkpoint_weights_iterator,
 )
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     get_diffusers_component_config,
 )
@@ -19,6 +20,20 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
 
 class MingImageEncoderLoader(TextEncoderLoader):
     component_names = []
+
+    def resolve_component_weight_override(
+        self, server_args: ServerArgs, component_name: str
+    ) -> str | None:
+        return ComponentLoader.resolve_component_weight_override(
+            self, server_args, component_name
+        )
+
+    def resolve_component_quantization_override(
+        self, server_args: ServerArgs, component_name: str
+    ) -> str | None:
+        return ComponentLoader.resolve_component_quantization_override(
+            self, server_args, component_name
+        )
 
     def load_customized(self, component_model_path, server_args, component_name):
         root = Path(component_model_path)
@@ -37,7 +52,7 @@ class MingImageEncoderLoader(TextEncoderLoader):
             component_model_path,
             config,
             server_args,
-            dtype=server_args.pipeline_config.text_encoder_precisions[0],
+            dtype=self.component_load_precision(server_args, component_name),
             component_name=component_name,
         )
 

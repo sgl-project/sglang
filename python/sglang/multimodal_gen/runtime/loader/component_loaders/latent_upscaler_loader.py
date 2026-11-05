@@ -43,14 +43,15 @@ class LatentUpscalerLoader(ComponentLoader):
         if class_name is None:
             raise ValueError(f"{component_model_path}/config.json has no _class_name")
         bank_cls, _ = ModelRegistry.resolve_model_cls(class_name)
-        bank = self._build_bank(bank_cls, config, component_model_path)
+        with torch.device("meta"):
+            bank = self._build_bank(bank_cls, config, component_model_path)
 
         state_dict: dict[str, torch.Tensor] = {}
         for path in _list_safetensors_files(component_model_path):
             state_dict.update(safetensors_load_file(path))
         if not state_dict:
             raise FileNotFoundError(f"no safetensors files in {component_model_path}")
-        bank.load_state_dict(state_dict, strict=True)
+        bank.load_state_dict(state_dict, strict=True, assign=True)
 
         target_device = self.target_device(
             server_args.should_start_component_on_cpu(component_name)
