@@ -264,6 +264,55 @@ class TestCakeSoftmaxCapability(CustomTestCase):
         self.assertFalse(spec.is_available(_HIP))
 
 
+class TestCakeMlaValueGateCapability(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        from sglang.kernels.cake_kernels import mla_value_gate as cake_mla
+
+        self.cake_mla = cake_mla
+        self.cake_mla._device_supported.cache_clear()
+
+    def tearDown(self):
+        self.cake_mla._device_supported.cache_clear()
+        super().tearDown()
+
+    def test_registry_and_device_check_match_supported_architectures(self):
+        from sglang.kernels.ops import attention as attention_ops
+
+        spec = K.select_kernel("attention.mla_value_gate", backend=KernelBackend.CAKE)
+        for arch, ok in (
+            ((10, 0), True),
+            ((10, 3), True),
+            ((9, 0), False),
+            ((10, 1), False),
+            ((10, 2), False),
+            ((12, 0), False),
+        ):
+            platform = PlatformInfo(
+                device_type="cuda", cuda_arch_major=arch[0], cuda_arch_minor=arch[1]
+            )
+            self.assertEqual(spec.is_available(platform), ok, arch)
+        self.assertFalse(spec.is_available(_CPU))
+        self.assertFalse(spec.is_available(_HIP))
+
+        w_uv = SimpleNamespace(is_cuda=True, device=SimpleNamespace(index=0))
+        for arch, module, ok in (
+            ((10, 3), object(), True),
+            ((10, 0), object(), True),
+            ((10, 2), object(), False),
+            ((10, 3), None, False),
+        ):
+            with self.subTest(arch=arch, module=module is not None):
+                self.cake_mla._device_supported.cache_clear()
+                with (
+                    patch("torch.cuda.get_device_capability", return_value=arch),
+                    patch.object(self.cake_mla, "find_spec", return_value=module),
+                ):
+                    self.assertEqual(
+                        attention_ops.can_use_cake_mla_value_gate(w_uv), ok
+                    )
+
+
 @pytest.mark.parametrize(
     "relative_path",
     (

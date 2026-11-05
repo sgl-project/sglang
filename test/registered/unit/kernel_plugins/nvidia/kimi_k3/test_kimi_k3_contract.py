@@ -339,7 +339,7 @@ class TestKimiK3Contract(CustomTestCase):
         self.assertEqual(
             sum("/cutedsl/" in item["source"] for item in mapping["sources"]), 43
         )
-        self.assertEqual(len(source_paths()), 71)
+        self.assertEqual(len(source_paths()), 72)
         manifest = payload_manifest()
         self.assertTrue(all(record["nbytes"] >= 0 for record in manifest.values()))
 

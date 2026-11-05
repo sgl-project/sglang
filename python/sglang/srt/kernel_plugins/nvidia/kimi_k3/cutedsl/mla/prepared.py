@@ -38,6 +38,9 @@ from sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.mla.dcp import (
     local_max,
     stock_decode,
 )
+from sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.mla.flashinfer_value import (
+    prepare_value_gate,
+)
 
 # tokenspeed (SM-filling splits) streams long contexts fast; trtllm-gen wins from B16.
 TRTLLM_CORE_BATCH, CORES = 16, ("tokenspeed", "trtllm")
@@ -294,6 +297,7 @@ class PreparedMla:
             to_cute(w, 4 if w.dtype == torch.float32 else 16) for w in self.weights
         )
         specs = tuple(layout(w) for w in (*self.weights, kv.view(torch.uint8)))
+        self.value_gates = {}
         for batch, q in self.cores:
             device = self.device.index
             dcp = self.dcp.size if self.dcp is not None else 0
@@ -317,6 +321,10 @@ class PreparedMla:
             self.kernels[batch, q] = (*compile_core(*args), query, latent)
             if self.dcp is not None:
                 self.prepare_dcp(batch)
+            else:  # weights[4] is W_UV in its final storage; None keeps MlaValue
+                self.value_gates[batch, q] = prepare_value_gate(
+                    self.weights[4], rows=batch, q=q
+                )
             if kv.is_cuda and not self.native_mla:  # compile before graph capture
                 table = torch.zeros(batch, 1, dtype=torch.int32, device=kv.device)
                 ones = torch.full((batch,), q, dtype=torch.int32, device=kv.device)
@@ -396,10 +404,16 @@ class PreparedMla:
         q_args = (x, qnorm, kvnorm, qb, uk, kv, q_slots, qinv, kinv, self.eps, query)
         out_view, gate = to_cute(out), to_cute(projected[:, 2112:])
         lens = to_cute(lengths[:reqs], 4)
+        # FlashInfer runner reading MlaValue's tensors, or None for MlaValue (v).
+        value_gate = self.value_gates.get((batch, q))
+        value_args = self.latent[:batch], projected[:, 2112:], lengths[:reqs], out
         if self.native_mla:
             mq(*q_args, s)
             native_decode(self.query_scratch[:batch], self.latent[:batch])
-            v(latent, uv, gate, lens, out_view, s)
+            if value_gate is None:
+                v(latent, uv, gate, lens, out_view, s)
+            else:
+                value_gate.launch(*value_args)
             return out
         elif self.dcp is not None:  # DcpValue zeroes padded requests (global lengths)
             publish, ((rows, rows_lse), boxes, peers), ids = self.dcp_args[batch]
@@ -410,5 +424,8 @@ class PreparedMla:
             return out
         mq(*q_args, s)
         self.stock_core(cache, block_table, lengths, batch, q)
-        v(latent, uv, gate, lens, out_view, s)
+        if value_gate is None:
+            v(latent, uv, gate, lens, out_view, s)
+        else:
+            value_gate.launch(*value_args)
         return out

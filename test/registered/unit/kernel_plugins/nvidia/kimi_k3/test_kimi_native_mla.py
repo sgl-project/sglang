@@ -188,6 +188,7 @@ def test_prepared_mla_binds_replicated_q_storage_after_backend_initialization():
             tensor.dtype,
         ),
         compile_core=lambda *args: (object(), object()),
+        prepare_value_gate=lambda *args, **kwargs: None,
     )
     definition = ast.ClassDef(
         name="PreparedMla",
@@ -322,6 +323,7 @@ def test_native_prepared_core_does_not_fall_through_or_insert_twice():
         latent=torch.zeros(1, 12, 512, dtype=torch.bfloat16),
         stock_core=record("unexpected-stock-core"),
         dcp=None,
+        value_gates={},
     )
     args = dict(
         cache=torch.zeros(1, 64, 576, dtype=torch.uint8),

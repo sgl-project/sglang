@@ -95,6 +95,18 @@ pins `tokenspeed-mla==2.0.3`; CuTe and `apache-tvm-ffi==0.1.11` are already SGLa
 dependencies. Preparation checks dependency ABI and model geometry before
 allocating specialized resources and sizing the KV cache.
 
+Adding `k3_flashinfer_mla_value` to the slot list (for example
+`k3_native_mla,k3_flashinfer_mla_value`) runs the MLA value projection and sigmoid
+gate with the Cake kernel that FlashInfer ships as `flashinfer.cake_mla_value_gate`
+wherever the decode uses `MlaValue`: the default executor with no profile token
+(`community`), `k3_native_mla` (DCP1 and DCP8) and `k3_full_decode` without DCP.
+Fused DCP (`k3_full_decode` with DCP8) keeps `DcpValue`. The FlashInfer pinned by
+SGLang (`flashinfer_python==0.7.2`) does not ship that module, so with it the slot
+logs one warning and keeps `MlaValue`; the kernel needs a FlashInfer build that
+ships it, with matching `flashinfer-python`, `flashinfer-cubin` and
+`flashinfer-jit-cache` versions. A bucket FlashInfer cannot prepare, for example on
+another GPU architecture, also keeps `MlaValue`.
+
 Providers and workspaces are prepared before KV sizing for the default widths
 1–8/16/32/48/64 plus configured request buckets up to 64. Prefill, eager profiling,
 warmup and unprepared buckets use the original model. A later pool-clamped bucket

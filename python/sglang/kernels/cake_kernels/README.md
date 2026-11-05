@@ -20,3 +20,15 @@ before being added here.
 The fast path also requires FlashInfer's `cake_blackwell_softmax` module. Older
 FlashInfer installations retain Torch softmax; this adapter does not change
 SGLang's dependency pins.
+
+The MLA value gate (`attention.mla_value_gate`) is the Cake form of Kimi K3's
+`MlaValue`: the W_UV projection of the BF16 attention latent, rounded to BF16 and
+multiplied by the FP32 sigmoid of the gate, with every row whose request length is
+zero or negative written as zero. Measured on B200 and GB300, its output is
+bit-exact to MlaValue.
+`prepare_cake_mla_value_gate` binds W_UV outside CUDA Graph capture and returns a
+runner whose launches can be captured and replayed with new input contents; a
+replaced W_UV storage needs a new runner. Kimi K3 selects it per prepared bucket
+with the `k3_flashinfer_mla_value` slot and keeps MlaValue otherwise. It needs
+FlashInfer's `cake_mla_value_gate` module, which SGLang's pinned FlashInfer does not
+ship yet.

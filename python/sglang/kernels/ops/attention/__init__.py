@@ -135,7 +135,43 @@ def qwen38_qsa_sm121_varlen(
     )
 
 
-__all__ = ["can_use_kda_qwen38_qsa_sm121", "qwen38_qsa_sm121_varlen"]
+register_kernel(
+    KernelSpec(
+        op="attention.mla_value_gate",
+        backend=KernelBackend.CAKE,
+        target="sglang.kernels.cake_kernels.mla_value_gate:prepare_mla_value_gate",
+        capabilities=frozenset(
+            {
+                CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 0)),
+                CapabilityRequirement.cuda(min_sm=(10, 3), max_sm=(10, 3)),
+            }
+        ),
+    )
+)
+
+
+def can_use_cake_mla_value_gate(w_uv: torch.Tensor) -> bool:
+    """Check the device and FlashInfer build of the Cake MLA value gate."""
+    from sglang.kernels.cake_kernels.mla_value_gate import supports_mla_value_gate
+
+    return supports_mla_value_gate(w_uv)
+
+
+def prepare_cake_mla_value_gate(
+    w_uv: torch.Tensor, *, max_rows: int, rows_per_request: int = 1
+):
+    """Explicit Cake MLA value gate entry point: a runner bound to ``w_uv``."""
+    return get_kernel("attention.mla_value_gate", KernelBackend.CAKE)(
+        w_uv, max_rows=max_rows, rows_per_request=rows_per_request
+    )
+
+
+__all__ = [
+    "can_use_cake_mla_value_gate",
+    "can_use_kda_qwen38_qsa_sm121",
+    "prepare_cake_mla_value_gate",
+    "qwen38_qsa_sm121_varlen",
+]
 
 
 # Vendored linear-attention (flash-linear-attention port) kernels relocated

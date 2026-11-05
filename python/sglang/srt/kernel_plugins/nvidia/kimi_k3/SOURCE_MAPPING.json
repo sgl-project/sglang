@@ -3166,7 +3166,8 @@
     "providers.PAYLOAD_PACKAGE: use in-tree runtime namespace",
     "providers._module: explicit canonical host module map",
     "providers.build_resources: validate and inventory the full mapped source closure before resource creation",
-    "source_manifest: enumerate and hash all SRT/ops/JIT source files and provenance artifacts; reject missing files"
+    "source_manifest: enumerate and hash all SRT/ops/JIT source files and provenance artifacts; reject missing files",
+    "mla.prepared.PreparedMla.prepare_cache, PreparedMla.run: opt-in Cake MLA value gate via sglang.kernels.ops.attention (slot k3_flashinfer_mla_value) at the MlaValue launch sites; MlaValue fallback, fused DCP keeps DcpValue"
   ],
   "generated_modules": [
     {
@@ -3200,6 +3201,10 @@
     {
       "module": "sglang.kernels.ops.moe.kimi_k3_specialized",
       "path": "kernels/ops/moe/kimi_k3_specialized/__init__.py"
+    },
+    {
+      "module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.cutedsl.mla.flashinfer_value",
+      "path": "srt/kernel_plugins/nvidia/kimi_k3/cutedsl/mla/flashinfer_value.py"
     },
     {
       "module": "sglang.srt.kernel_plugins.nvidia.kimi_k3.source_manifest",
