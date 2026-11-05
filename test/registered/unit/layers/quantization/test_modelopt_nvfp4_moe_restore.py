@@ -29,6 +29,7 @@ from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4FusedMoEM
 
 # isort: on
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.moe.moe_runner import flashinfer_trtllm
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.utils import MoeA2ABackend, MoeRunnerBackend
 from sglang.srt.runtime_context import get_flags
@@ -139,6 +140,21 @@ class TestNvFp4MoeRestore(CustomTestCase):
                         name,
                     )
                     self.assertEqual(getattr(layer, name).data_ptr(), storage[name])
+
+    def test_layers_share_one_scale_interleave_map(self):
+        # One copy per scale shape for all MoE layers, none in a layer's cache.
+        flashinfer_trtllm._FP4_SCALE_INTERLEAVE_SOURCES.clear()
+        raw = _raw_tensors(seed=3)
+        with self._backend(MoeRunnerBackend.FLASHINFER_TRTLLM):
+            layers = [_layer(raw), _layer(raw)]
+            for layer in layers:
+                self._process(layer)
+                layer.quant_method.restore_weights_before_loading(layer)
+        self.assertEqual(len(flashinfer_trtllm._FP4_SCALE_INTERLEAVE_SOURCES), 2)
+        for layer in layers:
+            cache = layer.quant_method._cache_permute_indices
+            names = {key[0] for key in cache if isinstance(key, tuple)}
+            self.assertNotIn("fp4_block_scale_interleave", names)
 
     def test_partial_update_keeps_untouched_experts(self):
         raw = _raw_tensors(seed=1)

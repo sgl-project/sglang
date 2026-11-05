@@ -750,6 +750,22 @@ def _fp4_block_scale_interleave_sources(
     return sources
 
 
+# Every MoE layer has the same scale shapes, so one copy per shape and device is
+# shared by all of them (the per-layer permute-index caches would keep one each).
+_FP4_SCALE_INTERLEAVE_SOURCES: dict = {}
+
+
+def _get_fp4_block_scale_interleave_sources(
+    shape: torch.Size, device: torch.device
+) -> torch.Tensor:
+    key = (tuple(shape), torch.device(device))
+    sources = _FP4_SCALE_INTERLEAVE_SOURCES.get(key)
+    if sources is None:
+        sources = _fp4_block_scale_interleave_sources(shape, device)
+        _FP4_SCALE_INTERLEAVE_SOURCES[key] = sources
+    return sources
+
+
 def _inverse_permutation(indices: torch.Tensor) -> torch.Tensor:
     if not torch.equal(
         indices.sort().values,
@@ -808,11 +824,7 @@ def restore_fp4_moe_weights_from_flashinfer_trtllm(
                 cache_permute_indices, scale[0], epilogue_tile_m, num_elts_per_sf=16
             )
 
-        sources_key = ("fp4_block_scale_interleave", tuple(scale.shape[1:]))
-        sources = cache_permute_indices.get(sources_key)
-        if sources is None:
-            sources = _fp4_block_scale_interleave_sources(scale[0].shape, scale.device)
-            cache_permute_indices[sources_key] = sources
+        sources = _get_fp4_block_scale_interleave_sources(scale[0].shape, scale.device)
         plans.append(
             (
                 weight,
