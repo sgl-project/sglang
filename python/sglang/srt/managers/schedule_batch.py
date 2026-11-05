@@ -1825,8 +1825,14 @@ def release_req(
         )
     else:
         resumable = req.resumable_by_rebootstrap
-    # TODO (csy): for preempted requests, we may want to insert into the tree
-    release_kv_cache(req, tree_cache, checkpoint=False)
+    # A request that will resume keeps its KV as a cached prefix when asked to;
+    # a Mamba tree forks an unfinished request's state on insert, so never there.
+    keep_kv = (
+        offload_kv
+        and get_schedule().preempt_keep_kv
+        and not tree_cache.supports_mamba()
+    )
+    release_kv_cache(req, tree_cache, checkpoint=keep_kv)
     # NOTE(lsyin): we should use the newly evictable memory instantly.
     num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
     evict_from_tree_cache(tree_cache, num_tokens)
@@ -2943,7 +2949,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # Aborting, so a host backup to resume from would be wasted.
                 self.release_req(idx, len(sorted_indices), offload_kv=False)
                 continue
-            # release memory and don't insert into the tree because we need the space instantly
+            # Release the row now; the tree keeps its KV only with --preempt-keep-kv.
             if self.release_req(idx, len(sorted_indices)):
                 retracted_reqs.append(req)
             else:

@@ -136,6 +136,14 @@ class Schedule(msgspec.Struct):
             choices=["length", "priority"],
         ),
     ] = "length"
+    preempt_keep_kv: A[
+        bool,
+        "Keep a retracted or preempted request's KV, decoded tokens included, in the "
+        "prefix cache instead of freeing it, so the request resumes from the cache "
+        "rather than recomputing its decoded tokens. Best effort: the kept KV is "
+        "unlocked and can be evicted before the request resumes. No effect without "
+        "the radix cache or with Mamba models.",
+    ] = False
     schedule_conservativeness: A[
         float,
         "How conservative the schedule policy is. A larger value means more conservative scheduling. Use a larger value if you see requests being retracted frequently.",
