@@ -3298,7 +3298,7 @@ class AiterAttnBackend(AttentionBackend):
                 kv_lens = seq_lens
             # Unified verify reads the page table, not these flat indices.
             kv_indptr = kv_indices = None
-            if self.use_mla or not self._use_unified_verify:
+            if not self._use_unified_verify:
                 kv_indptr = self.kv_indptr[: bs + 1]
                 kv_indptr[1 : bs + 1] = torch.cumsum(kv_lens, dim=0)
                 kv_indices = self.cuda_graph_kv_indices
