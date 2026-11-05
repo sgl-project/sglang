@@ -719,7 +719,7 @@ class TestMqaLogitsBudgetArithmetic(CustomTestCase):
 
     def test_static_budget_never_queries_free_memory(self):
         total = 80 << 30
-        props = SimpleNamespace(total_memory=total)
+        props = SimpleNamespace(total_memory=total, is_integrated=0)
         device_module = SimpleNamespace(
             get_device_properties=MagicMock(return_value=props)
         )
