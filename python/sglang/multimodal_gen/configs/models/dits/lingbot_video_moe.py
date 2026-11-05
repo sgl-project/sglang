@@ -51,3 +51,4 @@ class LingBotVideoMoEArchConfig(DiTArchConfig):
 class LingBotVideoMoEConfig(DiTConfig):
     arch_config: DiTArchConfig = field(default_factory=LingBotVideoMoEArchConfig)
     prefix: str = "LingBotVideo"
+    ep_size: int = 1

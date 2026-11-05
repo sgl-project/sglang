@@ -22,7 +22,13 @@ from sglang.kernels.ops.diffusion import (
 from sglang.multimodal_gen.configs.models.dits.lingbot_video_moe import (
     LingBotVideoMoEConfig,
 )
-from sglang.multimodal_gen.runtime.distributed import divide, get_tp_world_size
+from sglang.multimodal_gen.runtime.distributed import (
+    divide,
+    get_sp_group,
+    get_sp_world_size,
+    get_tp_world_size,
+    sequence_model_parallel_all_gather,
+)
 from sglang.multimodal_gen.runtime.layers.attention import (
     USPAttention,
     build_varlen_mask_meta,
@@ -34,6 +40,8 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 from sglang.multimodal_gen.runtime.layers.moe import (
     LingBotVideoMLP,
     LingBotVideoSparseMoeBlock,
+    MoeExpertParallelInfo,
+    resolve_moe_expert_parallel,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
@@ -42,6 +50,7 @@ from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
     _apply_rotary_emb,
 )
+from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
@@ -70,10 +79,50 @@ LINGBOT_VIDEO_FP32_MODULES = (
 
 
 logger = logging.getLogger(__name__)
+EXPERT_PARAM_SUFFIXES = (".ffn.experts.w13_weight", ".ffn.experts.w2")
 
 
 def is_lingbot_block(name: str, _module: object) -> bool:
     return "blocks" in name and name.split(".")[-1].isdigit()
+
+
+def is_expert_parallel_param(name: str) -> bool:
+    return name.endswith(EXPERT_PARAM_SUFFIXES)
+
+
+def pack_expert_weights(
+    weight_iterator: Iterable[tuple[str, torch.Tensor]],
+    *,
+    ep_info: MoeExpertParallelInfo,
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Pack gate/up weights and retain this rank's expert shard."""
+
+    def shard(name: str, tensor: torch.Tensor) -> torch.Tensor:
+        if not ep_info.enabled or not is_expert_parallel_param(name):
+            return tensor
+        start = ep_info.local_expert_start
+        return tensor[start : start + ep_info.num_local_experts]
+
+    seen: dict[str, list[torch.Tensor | None]] = {}
+    for name, tensor in weight_iterator:
+        suffix = next(
+            (s for s in (".ffn.experts.w1", ".ffn.experts.w3") if name.endswith(s)),
+            None,
+        )
+        if suffix is None:
+            sharded = shard(name, tensor)
+            if ep_info.enabled and is_expert_parallel_param(name):
+                sharded = sharded.clone()
+            yield name, sharded
+            continue
+        prefix = name[: -len(suffix)]
+        packed_name = f"{prefix}.ffn.experts.w13_weight"
+        tensor = shard(packed_name, tensor)
+        pair = seen.setdefault(prefix, [None, None])
+        pair[0 if suffix.endswith(".w1") else 1] = tensor
+        if pair[0] is not None and pair[1] is not None:
+            yield packed_name, torch.cat(pair, dim=1)
+            del seen[prefix]
 
 
 def should_keep_in_fp32(name: str) -> bool:
@@ -280,6 +329,8 @@ class LingBotVideoAttention(nn.Module):
         freqs_cis: tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor] = None,
         attn_mask_meta: Optional[dict] = None,
+        num_replicated_suffix: int = 0,
+        skip_sequence_parallel_override: bool = False,
     ) -> torch.Tensor:
         cos, sin = freqs_cis
         q, _ = self.to_q(x)
@@ -303,6 +354,8 @@ class LingBotVideoAttention(nn.Module):
             v,
             attn_mask=attention_mask,
             attn_mask_meta=attn_mask_meta,
+            num_replicated_suffix=num_replicated_suffix,
+            skip_sequence_parallel_override=skip_sequence_parallel_override,
         )
         out = out.flatten(2)
         out, _ = self.to_out(out)
@@ -330,6 +383,7 @@ class LingBotVideoBlock(nn.Module):
         topk_group,
         routed_scaling_factor,
         layer_idx: int,
+        ep_info: MoeExpertParallelInfo,
         prefix: str = "",
         supported_attention_backends: Optional[set[AttentionBackendEnum]] = None,
         quant_config: Optional[QuantizationConfig] = None,
@@ -366,6 +420,7 @@ class LingBotVideoBlock(nn.Module):
                 topk_group=topk_group,
                 routed_scaling_factor=routed_scaling_factor,
                 n_shared_experts=n_shared_experts,
+                ep_info=ep_info,
             )
         else:
             self.ffn = LingBotVideoMLP(h, intermediate_size)
@@ -378,6 +433,8 @@ class LingBotVideoBlock(nn.Module):
         freqs_cis: tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor] = None,
         attn_mask_meta: Optional[dict] = None,
+        num_replicated_suffix: int = 0,
+        skip_sequence_parallel_override: bool = False,
     ) -> torch.Tensor:
         expected_tokens = x.shape[0] * x.shape[1]
         if temb6.ndim != 2 or temb6.shape[0] != expected_tokens:
@@ -402,6 +459,8 @@ class LingBotVideoBlock(nn.Module):
             freqs_cis,
             attention_mask=attention_mask,
             attn_mask_meta=attn_mask_meta,
+            num_replicated_suffix=num_replicated_suffix,
+            skip_sequence_parallel_override=skip_sequence_parallel_override,
         )
         x = _lingbot_gated_residual(self, x, self.norm_post_attn(attn_out), gate_msa)
 
@@ -458,22 +517,14 @@ class LingBotVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
     def preprocess_loaded_state_dict(
         self, weight_iterator: Iterable[tuple[str, torch.Tensor]]
     ) -> Iterator[tuple[str, torch.Tensor]]:
-        # Pack experts.w1+w3 into experts.w13_weight, gate then up on dim 1; w2 passes through.
-        seen: dict[str, list[torch.Tensor | None]] = {}
-        for name, tensor in weight_iterator:
-            suffix = next(
-                (s for s in (".ffn.experts.w1", ".ffn.experts.w3") if name.endswith(s)),
-                None,
+        return pack_expert_weights(weight_iterator, ep_info=self.ep_info)
+
+    def validate_weight_update_source(self, *, weights_path: str | None) -> None:
+        if self.ep_info.enabled:
+            raise ValueError(
+                "runtime weight updates are not supported under expert parallelism; "
+                "restart the server to load new weights"
             )
-            if suffix is None:
-                yield name, tensor
-                continue
-            prefix = name[: -len(suffix)]
-            pair = seen.setdefault(prefix, [None, None])
-            pair[0 if suffix.endswith(".w1") else 1] = tensor
-            if pair[0] is not None and pair[1] is not None:
-                yield f"{prefix}.ffn.experts.w13_weight", torch.cat(pair, dim=1)
-                del seen[prefix]
 
     def __init__(
         self,
@@ -493,6 +544,10 @@ class LingBotVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
 
         self.hidden_size = hidden_size
         self.num_attention_heads = num_attention_heads
+        self.ep_info = resolve_moe_expert_parallel(
+            config.num_experts,
+            ep_size=config.ep_size,
+        )
         self.in_channels = config.in_channels
         self.out_channels = config.out_channels
         self.num_channels_latents = config.out_channels
@@ -546,6 +601,7 @@ class LingBotVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
                     topk_group=config.topk_group,
                     routed_scaling_factor=config.routed_scaling_factor,
                     layer_idx=i,
+                    ep_info=self.ep_info,
                     prefix=f"blocks.{i}",
                     supported_attention_backends=self._supported_attention_backends,
                     quant_config=quant_config,
@@ -593,12 +649,38 @@ class LingBotVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
         )
         x = self.patch_embedder(patch_tokens)
 
+        forward_batch = get_forward_context().forward_batch
+        sp_size = get_sp_world_size()
+        sequence_shard_enabled = (
+            forward_batch is not None
+            and forward_batch.enable_sequence_shard
+            and sp_size > 1
+        )
+
+        positions = _joint_position_ids(text_lens, gt, gh, gw, L, device).view(
+            B, n_video + L, 3
+        )
+        if sequence_shard_enabled:
+            if n_video % sp_size != 0:
+                raise ValueError(
+                    f"LingBot video token count ({n_video}) must be divisible by "
+                    f"sp_degree ({sp_size})"
+                )
+            local_n_video = n_video // sp_size
+            start = get_sp_group().rank_in_group * local_n_video
+            stop = start + local_n_video
+            x = x[:, start:stop].contiguous()
+            positions = torch.cat(
+                [positions[:, start:stop], positions[:, n_video:]], dim=1
+            )
+        else:
+            local_n_video = n_video
+
         text = self.text_embedder(encoder_hidden_states)
         joint = torch.cat([x, text], dim=1)  # [video; text]
         joint_seq_len = joint.shape[1]
 
-        positions = _joint_position_ids(text_lens, gt, gh, gw, L, device)
-        cos, sin = self.rotary_emb.forward_uncached(positions)
+        cos, sin = self.rotary_emb.forward_uncached(positions.reshape(-1, 3))
         freqs_cis = (cos.float(), sin.float())
 
         attention_mask = attn_mask_meta = None
@@ -606,7 +688,7 @@ class LingBotVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
         if B > 1 and encoder_attention_mask is not None:
             attention_mask = torch.cat(
                 [
-                    torch.ones(B, n_video, dtype=torch.bool, device=device),
+                    torch.ones(B, local_n_video, dtype=torch.bool, device=device),
                     encoder_attention_mask.bool(),
                 ],
                 dim=1,
@@ -628,6 +710,9 @@ class LingBotVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
                 freqs_cis,
                 attention_mask,
                 attn_mask_meta,
+                num_replicated_suffix=L if sequence_shard_enabled else 0,
+                skip_sequence_parallel_override=sp_size > 1
+                and not sequence_shard_enabled,
             )
 
         final_mod = self.norm_out_modulation(
@@ -638,7 +723,9 @@ class LingBotVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixi
         )
         final_hidden = self.norm_out(joint) * (1.0 + scale) + shift
         projected = self.proj_out(final_hidden.to(self.proj_out.weight.dtype))
-        x = projected[:, :n_video]
+        x = projected[:, :local_n_video]
+        if sequence_shard_enabled:
+            x = sequence_model_parallel_all_gather(x.contiguous(), dim=1)
 
         Cout = self.out_channels
         x = x.reshape(B, gt, gh, gw, pF, pH, pW, Cout)
