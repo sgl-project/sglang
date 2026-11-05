@@ -522,16 +522,16 @@ __global__ __launch_bounds__(BLOCK) void route_radix4_kernel(__grid_constant__ c
       } else {
         __threadfence();
         if (lane == 0) {
-          const int old = atomicAdd(params.arrival, 1);
-          s_leader = (old == static_cast<int>(gridDim.x) - 1) ? 1 : 0;
+          const bool last = atomicAdd(params.arrival, 1) == static_cast<int>(gridDim.x) - 1;
+          // Pairs with every other CTA's release (on a multi-XCD part this L2 may hold
+          // stale lines of their rows); taken before the barrier, which extends it to all waves.
+          if (last) __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+          s_leader = last ? 1 : 0;
         }
       }
     }
     __syncthreads();
     if (s_leader) {
-      // The acquire that pairs with every other CTA's release: on a multi-XCD
-      // part the leader's L2 may still hold stale lines of their out_i/out_w rows.
-      if (!alone) __threadfence();
       // moe_buf is zeroed after the sort: nothing here reads it, and zeroing
       // first would stall sort_subkernel's first __syncthreads.
       radix4_sort::sort_subkernel<EXPERTS, TOPK, static_cast<int>(kRadix4SortBlockM), BLOCK>(
