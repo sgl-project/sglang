@@ -206,6 +206,11 @@ def _to_2d_context_lens(seqlens_32: torch.Tensor, batch_size: int) -> torch.Tens
     return seqlens_32.contiguous().view(-1, 1)
 
 
+def _trtllm_padded_heads(num_heads: int) -> int:
+    """Pad the unsupported 65–127 MLA query-head range for trtllm-gen."""
+    return 128 if 64 < num_heads < 128 else num_heads
+
+
 def _trim_trtllm_decode_dp_padding(
     q_all: torch.Tensor,
     topk_indices: Optional[torch.Tensor],
@@ -4257,7 +4262,12 @@ class DeepseekSparseAttnBackend(
 
         multi_ctas_kv_counter_buffer = self._multi_ctas_kv_counter_for(batch_size)
 
-        q = q_all.view(batch_size, 1, num_heads, head_dim)
+        kernel_heads = _trtllm_padded_heads(num_heads)
+        if kernel_heads != num_heads:
+            padded_q = q_all.new_zeros((batch_size, kernel_heads, head_dim))
+            padded_q[:, :num_heads].copy_(q_all)
+            q_all = padded_q
+        q = q_all.view(batch_size, 1, kernel_heads, head_dim)
         kv = kv_cache.view(-1, 1, self.physical_page_size, self.kv_cache_dim)
         block_tables = page_table_1.unsqueeze(1)
         seq_lens = metadata.cache_seqlens_int32 if seq_lens is None else seq_lens
@@ -4289,11 +4299,19 @@ class DeepseekSparseAttnBackend(
                 cu_seqlens_q=self.get_device_int32_arange(batch_size + 1),
                 **attention_kwargs,
             )
+            # Q may already contain head padding from the fused FP8 builder.
+            # Restore the layer's logical head count for both Q preparation paths.
+            output_heads = layer.tp_q_head_num
+            if kernel_heads != output_heads:
+                out = out[..., :output_heads, :].contiguous()
+                lse = lse[:, :output_heads].contiguous()
             if num_decode_padding_rows:
                 lse = torch.cat(
                     [
                         lse,
-                        lse.new_full((num_decode_padding_rows, num_heads), -torch.inf),
+                        lse.new_full(
+                            (num_decode_padding_rows, output_heads), -torch.inf
+                        ),
                     ]
                 )
             return _restore_trtllm_decode_dp_padding(out, num_decode_padding_rows), lse
@@ -4304,7 +4322,8 @@ class DeepseekSparseAttnBackend(
             seq_lens=seq_lens,
             **attention_kwargs,
         )
-
+        if kernel_heads != layer.tp_q_head_num:
+            out = out[..., : layer.tp_q_head_num, :].contiguous()
         return _restore_trtllm_decode_dp_padding(out, num_decode_padding_rows)
 
     def _pad_topk_indices(

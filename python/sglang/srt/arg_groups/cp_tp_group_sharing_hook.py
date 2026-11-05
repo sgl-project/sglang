@@ -53,18 +53,13 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
     # This hook runs before speculative defaults and NEXTN alias resolution.
     # Native MTP keeps the target's CP/TP placement. DFLASH consumes the
     # target's gathered hidden states and runs its draft with ordinary TP.
-    # Only GLM-5.3-Flash has these speculative paths ported. A Kimi-K3.1 PD
-    # prefill runs DFLASH only to write the prompt's draft KV from the
-    # gathered aux hidden states.
+    # Both integrated and PD prefill consume the CP-gathered target states.
     if cfg.speculative_algorithm is not None:
         if arch == "KimiK31ForConditionalGeneration":
-            if (
-                cfg.speculative_algorithm.upper() != "DFLASH"
-                or cfg.disaggregation_mode != "prefill"
-            ):
+            if cfg.speculative_algorithm.upper() != "DFLASH":
                 raise ValueError(
                     "Kimi-K3.1 CP-TP group sharing only supports "
-                    "--speculative-algorithm DFLASH on a PD prefill node."
+                    "--speculative-algorithm DFLASH."
                 )
         elif arch != "Glm5NextForConditionalGeneration":
             raise ValueError(
