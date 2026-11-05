@@ -2396,9 +2396,6 @@ class ModelConfig:
         Pull the model config files to a temporary
         directory in case of remote.
 
-        Args:
-            model: The model name or path.
-
         """
         from sglang.srt.connector import create_remote_connector
         from sglang.srt.utils import is_remote_url
