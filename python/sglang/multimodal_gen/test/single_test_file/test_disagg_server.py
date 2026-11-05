@@ -300,21 +300,32 @@ def _require_gated_model(repo_id: str) -> None:
     """Skip when a gated checkpoint can be neither downloaded nor read from cache.
 
     Fork PRs get no ``HF_TOKEN``, so the download fails with a 401 unless the
-    runner already has the model cached.
+    runner already has the whole model cached. A partial cache (for example,
+    only ``model_index.json``) would still need a download, so it counts as
+    missing. The completeness checks are the loader's own.
     """
     from huggingface_hub import get_token, snapshot_download
     from huggingface_hub.errors import LocalEntryNotFoundError
 
+    from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
+        _check_index_files_for_missing_shards,
+        _verify_diffusers_model_complete,
+    )
+
     if get_token():
         return
     try:
-        snapshot_download(
-            repo_id, allow_patterns=["config.json"], local_files_only=True
-        )
+        path = snapshot_download(repo_id, local_files_only=True)
     except LocalEntryNotFoundError:
+        path = None
+    if (
+        path is None
+        or not _verify_diffusers_model_complete(path)
+        or not _check_index_files_for_missing_shards(path)[0]
+    ):
         raise unittest.SkipTest(
-            f"{repo_id} is gated: needs HF_TOKEN or a cached copy"
-        ) from None
+            f"{repo_id} is gated: needs HF_TOKEN or a fully cached copy"
+        )
 
 
 class _DisaggTestBase(CustomTestCase):
