@@ -354,6 +354,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     @staticmethod
     def _qsa_kv_offload_budget(kvc: KVCacheConfigurator, num_layers: int):
         """GPU and host cost model of the QSA K/V offload of this worker."""
+        from sglang.srt.layers.attention.qsa.config import parse_qsa_profile
         from sglang.srt.mem_cache.qsa_kv_offload import (
             QSAKVOffloadBudget,
             offload_layout_from_config,
@@ -371,9 +372,15 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         offloaded_layers = num_layers
         if get_memory().qsa_kv_offload_draft:
             # The MTP draft pool has the same layout and per-layer K/V size (as
-            # the cell's draft share assumes), so its layers just add up.
+            # the cell's draft share assumes), so its layers just add up. A draft
+            # without QSA layers would get a pool that keeps its K/V on the GPU.
             draft_layers = int(kvc.spec_aux_config.eagle_draft_num_layers or 0)
-            if draft_layers <= 0:
+            draft_config = kvc.spec_aux_config.draft_model_config
+            if (
+                draft_layers <= 0
+                or draft_config is None
+                or parse_qsa_profile(draft_config.hf_config) is None
+            ):
                 raise ValueError(
                     "--qsa-kv-offload-draft needs an MTP draft model with QSA layers"
                 )

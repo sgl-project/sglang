@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.qsa_kv_offload import (
     offload_table_bytes_per_slot,
 )
 from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.model_executor.pool_configurator import DefaultPoolConfigurator
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -319,6 +320,59 @@ class TestOffloadArgs(CustomTestCase):
         for message, (overrides, hf_config) in cases.items():
             with self.subTest(message), self.assertRaisesRegex(ValueError, message):
                 check_qsa_kv_offload_args(_offload_args(**overrides), hf_config)
+
+
+class TestDraftOffloadBudget(CustomTestCase):
+    @staticmethod
+    def _budget(draft_hf_config):
+        kvc = SimpleNamespace(
+            model_config=SimpleNamespace(
+                hf_config=_QSA_HF_CONFIG,
+                head_dim=256,
+                v_head_dim=256,
+                context_len=8192,
+                get_num_kv_heads=lambda tp_size, dcp_size: 2,
+            ),
+            spec_aux_config=SimpleNamespace(
+                eagle_draft_num_layers=1,
+                draft_model_config=SimpleNamespace(hf_config=draft_hf_config),
+            ),
+            kv_cache_dtype=torch.bfloat16,
+        )
+        layout = compute_offload_layout(
+            compress_ratio=CR,
+            token_topk=2048,
+            hot_blocks=1024,
+            num_request_slots=1,
+            rows_per_request=1,
+            max_extend_tokens=1024,
+            page_size=64,
+        )
+        memory = SimpleNamespace(qsa_kv_offload_draft=True, qsa_kv_offload_host_size=40)
+        parallel = SimpleNamespace(attn_tp_size=1, attn_dcp_size=1)
+        schedule = SimpleNamespace(page_size=64)
+        with patch.multiple(
+            "sglang.srt.model_executor.pool_configurator",
+            get_memory=lambda: memory,
+            get_parallel=lambda: parallel,
+            get_schedule=lambda: schedule,
+        ):
+            with patch(
+                "sglang.srt.mem_cache.qsa_kv_offload.offload_layout_from_config",
+                return_value=layout,
+            ):
+                return DefaultPoolConfigurator._qsa_kv_offload_budget(
+                    kvc, num_layers=12
+                )
+
+    def test_draft_layers_must_be_qsa_layers(self):
+        # 2 KV heads x (256 + 256) x 2 B, over 12 target + 1 draft layers.
+        budget = self._budget(_QSA_HF_CONFIG)
+        self.assertEqual(budget.offloaded_bytes_per_token, 2 * 512 * 2 * 13)
+        # A draft without the QSA indexer (e.g. a standalone EAGLE head) keeps
+        # its K/V on the GPU, so the budget must not move it to the host.
+        with self.assertRaisesRegex(ValueError, "with QSA layers"):
+            self._budget(SimpleNamespace())
 
 
 class _OffloadSim:
