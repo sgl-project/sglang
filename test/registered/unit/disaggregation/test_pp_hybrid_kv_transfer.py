@@ -126,6 +126,53 @@ class TestHybridSendUsesLayerIdPairing(CustomTestCase):
         self._run_case(model_full_ids=ids, stage_full_ids=ids[7:], start_offset=7)
 
 
+class TestCompactNPUIndexerTransfer(CustomTestCase):
+    def test_both_transports_use_the_published_compact_entry_order(self):
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+        self.addCleanup(reset_context)
+        source_ids = [0, 1, 2, 0, 1, 2, 0, 2]
+        destination_ids = [0, 2, 1, 0, 2, 1, 0, 2, 3, 3, 3]
+        source_ptrs = [1000 + i * 100 for i in range(len(source_ids))]
+        destination_ptrs = [10000 + i * 100 for i in range(len(destination_ids))]
+        lengths = [10] * 6 + [4] * 2
+        for transport in (MooncakeKVManager, AscendKVManager):
+            with self.subTest(transport=transport.__name__):
+                manager = _RecordingKVManager(prefill_start_layer=0, pp_size=1)
+                manager.is_mla_backend = True
+                manager.kv_args.kv_data_ptrs = source_ptrs
+                manager.kv_args.kv_item_lens = lengths
+                manager.kv_args.kv_layer_ids = source_ids
+                manager._validate_envelope_kv_layout = (
+                    MooncakeKVManager._validate_envelope_kv_layout.__get__(manager)
+                )
+                manager._send_kvcache_generic = (
+                    MooncakeKVManager._send_kvcache_generic.__get__(manager)
+                )
+                with get_memory().override(enable_unified_memory=False):
+                    result = transport.send_kvcache(
+                        manager,
+                        "peer",
+                        np.array([1], dtype=np.int32),
+                        destination_ptrs,
+                        np.array([2], dtype=np.int32),
+                        None,
+                        dst_layer_ids=destination_ids,
+                    )
+                self.assertEqual(result, 0)
+                order = [0, 2, 1, 3, 5, 4, 6, 7]
+                self.assertEqual(
+                    manager.blocks,
+                    [
+                        (
+                            source_ptrs[i] + lengths[i],
+                            destination_ptrs[j] + 2 * lengths[i],
+                            lengths[i],
+                        )
+                        for i, j in enumerate(order)
+                    ],
+                )
+
+
 class TestSingleRegionSWATransfer(CustomTestCase):
     def test_one_region_full_generates_transfer_block(self):
         publish(ServerArgs(model_path="dummy"), role="tokenizer")
