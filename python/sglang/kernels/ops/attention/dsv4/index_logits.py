@@ -47,6 +47,11 @@ def index_weights_dtype() -> torch.dtype:
 FLAT_LOGITS_WIDTH_ALIGN = 64
 
 
+def flat_index_logits_row_alignment(heads: int) -> int:
+    """Query rows per 128-head-row MMA tile of the flat score kernel."""
+    return 128 // heads
+
+
 def flat_index_logits_rows_per_tile(
     rows: int,
     width: int,
@@ -58,7 +63,7 @@ def flat_index_logits_rows_per_tile(
     Tiles are sized as fp32 logits whatever the logits dtype: bf16 tiles then fill
     half the budget, which leaves room for the per-row selection scratch that
     grows with the tile."""
-    row_alignment = 128 // heads
+    row_alignment = flat_index_logits_row_alignment(heads)
     rows_per_chunk = mqa_logits_rows_per_chunk(
         num_rows=ceil_align(rows, row_alignment),
         row_bytes=mqa_logits_row_bytes(width),
@@ -100,7 +105,11 @@ def flat_index_logits_tiles(
         rows, width, heads=q[0].shape[1], budget_bytes=budget_bytes
     )
     weights = weights.to(index_weights_dtype())
-    logits_dtype = index_logits_dtype()
+    if weights.dtype == torch.bfloat16:
+        logits_args, logits_kwargs = (width,), {}
+    else:
+        logits_args = (False, width)
+        logits_kwargs = {"logits_dtype": index_logits_dtype()}
     for offset in range(0, rows, rows_per_chunk):
         tile = slice(offset, min(offset + rows_per_chunk, rows))
         tile_starts = starts[tile]
@@ -112,9 +121,8 @@ def flat_index_logits_tiles(
                 weights[tile],
                 tile_starts,
                 tile_starts + lengths[tile],
-                False,
-                width,
-                logits_dtype=logits_dtype,
+                *logits_args,
+                **logits_kwargs,
             ),
         )
 
