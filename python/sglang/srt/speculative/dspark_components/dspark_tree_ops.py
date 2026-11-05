@@ -1131,17 +1131,25 @@ def _node_commit_kernels():
                 match = on_page & (row_of == r)
                 best = tl.max(tl.where(match, priority, -1), 0)
                 chosen = tl.max(tl.where(match & (priority == best), node, -1), 0)
-                if chosen >= 0:
-                    src = node_data + chosen * row_bytes
-                else:
-                    src = original + r * row_stride
+                # Select the row by value; a pointer phi across different
+                # buffers is rejected by the Ascend Triton backend.
+                chosen_safe = tl.maximum(chosen, 0)
+                node_src = node_data + chosen_safe * row_bytes
+                orig_src = original + r * row_stride
                 for begin in tl.range(0, row_bytes, CBLOCK):
                     offset = begin + lanes
-                    value = tl.load(src + offset, offset < row_bytes, other=0)
+                    in_range = offset < row_bytes
+                    node_value = tl.load(
+                        node_src + offset, in_range & (chosen >= 0), other=0
+                    )
+                    orig_value = tl.load(
+                        orig_src + offset, in_range & (chosen < 0), other=0
+                    )
+                    value = tl.where(chosen >= 0, node_value, orig_value)
                     tl.store(
                         Staging + stage_offset + r * row_bytes + offset,
                         value,
-                        offset < row_bytes,
+                        in_range,
                     )
 
     @triton.jit
