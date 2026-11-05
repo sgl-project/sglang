@@ -118,7 +118,12 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
                 f"Decode attention backend for Kimi-K3 DCP must be 'cutedsl_mla' or 'aiter', got {decode_backend!r}."
             )
 
-        overrides.update(_dcp_replicate_q_proj_default(cfg, "Kimi-K3"))
+        if cfg.dcp_replicate_q_proj is None and cfg.dcp_comm_backend in (
+            "a2a",
+            "fi_a2a",
+        ):
+            logger.info("Kimi-K3 DCP enables replicated Q projection by default.")
+            overrides["dcp_replicate_q_proj"] = True
         return overrides
 
     if not (get_platform().is_sm100 and get_platform().device_sm in (100, 103)):
@@ -174,40 +179,26 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
 @_register_for("KimiK31ForConditionalGeneration")
 def _kimi_k31_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
-    overrides = {}
-    if cfg.dcp_size > 1:
-        overrides.update(_kimi_k31_dcp_overrides(cfg))
     if cfg.enable_unified_memory:
         raise ValueError("Kimi-K3.1 does not support --enable-unified-memory yet.")
+    overrides = {}
+    if cfg.dcp_size > 1:
+        if (
+            cfg.speculative_algorithm is not None
+            or cfg.disaggregation_mode != "null"
+            or cfg.enable_hierarchical_cache
+        ):
+            raise ValueError(
+                "Kimi-K3.1 DCP does not support speculative decoding, PD "
+                "disaggregation or HiCache yet."
+            )
+        if cfg.dcp_replicate_q_proj is None and cfg.dcp_comm_backend in (
+            "a2a",
+            "fi_a2a",
+        ):
+            logger.info("Kimi-K3.1 DCP enables replicated Q projection by default.")
+            overrides["dcp_replicate_q_proj"] = True
     return overrides
-
-
-def _kimi_k31_dcp_overrides(cfg: Any) -> dict:
-    dcp = cfg.dcp_size
-    if dcp & (dcp - 1) or cfg.tp_size % dcp:
-        raise ValueError(
-            f"Kimi-K3.1 DCP needs a power-of-two --dcp-size dividing --tp-size, "
-            f"got dcp_size={dcp}, tp_size={cfg.tp_size}."
-        )
-    unsupported = {
-        "speculative decoding": cfg.speculative_algorithm is not None,
-        "PD disaggregation": cfg.disaggregation_mode in ("prefill", "decode"),
-        "HiCache": cfg.enable_hierarchical_cache,
-        "HiSparse": cfg.enable_hisparse,
-        "prefill context parallel": cfg.enable_prefill_cp
-        or (cfg.attn_cp_size or 1) > 1,
-    }
-    rejected = [name for name, on in unsupported.items() if on]
-    if rejected:
-        raise ValueError(f"Kimi-K3.1 DCP does not support {', '.join(rejected)} yet.")
-    return _dcp_replicate_q_proj_default(cfg, "Kimi-K3.1")
-
-
-def _dcp_replicate_q_proj_default(cfg: Any, model: str) -> dict:
-    if cfg.dcp_replicate_q_proj is None and cfg.dcp_comm_backend in ("a2a", "fi_a2a"):
-        logger.info(f"{model} DCP enables replicated Q projection by default.")
-        return {"dcp_replicate_q_proj": True}
-    return {}
 
 
 @_register_for("KimiK3ForConditionalGeneration", "KimiK31ForConditionalGeneration")
