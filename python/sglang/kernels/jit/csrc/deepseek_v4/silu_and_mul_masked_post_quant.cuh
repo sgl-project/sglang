@@ -423,9 +423,19 @@ struct SiluMulQuantContigParams {
   int64_t hidden_dim;
   uint32_t num_tokens;
   uint32_t scale_row_stride_int32;  // only used when kTransposed=true
+  uint32_t scale_stride_m;
+  uint32_t scale_stride_g;
 };
 
-template <uint32_t kGroupSize, bool kScaleUE8M0, bool kTransposed, bool kSwizzle, bool kUsePDL, bool kApplySwigluLimit>
+template <
+    uint32_t kGroupSize,
+    bool kScaleUE8M0,
+    bool kTransposed,
+    bool kSwizzle,
+    bool kUsePDL,
+    bool kApplySwigluLimit,
+    bool kRoundToBF16,
+    uint32_t kRowsPerCTA>
 __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
     silu_mul_quant_contig_kernel(const SiluMulQuantContigParams __grid_constant__ params) {
   using namespace device;
@@ -436,8 +446,16 @@ __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
   static_assert(kGroupSize == 32 || kGroupSize == 128, "unsupported group_size");
   static_assert(!(kTransposed && !kScaleUE8M0), "transposed layout only supports ue8m0");
 
-  const auto token_id = blockIdx.x;
-  const auto work_id = threadIdx.x / kWorkThreads;
+  uint32_t token_id = blockIdx.x;
+  uint32_t lane_in_row = threadIdx.x;
+  uint32_t threads_per_row = blockDim.x;
+  if constexpr (kRowsPerCTA > 1) {
+    threads_per_row = blockDim.x / kRowsPerCTA;
+    token_id = blockIdx.x * kRowsPerCTA + threadIdx.x / threads_per_row;
+    lane_in_row = threadIdx.x % threads_per_row;
+    if (token_id >= params.num_tokens) return;
+  }
+  const auto work_id = lane_in_row / kWorkThreads;
 
   const auto input = params.input + token_id * params.hidden_dim * 2;
   const auto output = params.output + token_id * params.hidden_dim;
@@ -451,7 +469,7 @@ __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
       const auto base = reinterpret_cast<uint8_t*>(params.output_scale);
       return base + (work_id / 4u) * (params.scale_row_stride_int32 * 4u) + token_id * 4u + (work_id % 4u);
     } else {
-      return params.output_scale + token_id * num_groups + work_id;
+      return params.output_scale + token_id * params.scale_stride_m + work_id * params.scale_stride_g;
     }
   }();
 
@@ -459,11 +477,11 @@ __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
 
   InputVec gate_vec, up_vec;
   if constexpr (kSwizzle) {
-    gate_vec.load(input, threadIdx.x * 2);
-    up_vec.load(input, threadIdx.x * 2 + 1);
+    gate_vec.load(input, lane_in_row * 2);
+    up_vec.load(input, lane_in_row * 2 + 1);
   } else {
-    gate_vec.load(input, threadIdx.x);
-    up_vec.load(input, threadIdx.x + blockDim.x);
+    gate_vec.load(input, lane_in_row);
+    up_vec.load(input, lane_in_row + threads_per_row);
   }
 
   float local_max = 0.0f;
@@ -471,7 +489,7 @@ __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
 
 #pragma unroll
   for (uint32_t i = 0; i < 4; ++i) {
-    const auto [x, y] = silu_and_mul<kApplySwigluLimit>(gate_vec[i], up_vec[i], params.swiglu_limit);
+    const auto [x, y] = silu_and_mul<kApplySwigluLimit, !kRoundToBF16>(gate_vec[i], up_vec[i], params.swiglu_limit);
     results[2 * i + 0] = x;
     results[2 * i + 1] = y;
     local_max = fmaxf(local_max, fmaxf(fabsf(x), fabsf(y)));
@@ -490,19 +508,25 @@ __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
   } else {
     scale = absmax / math::FP8_E4M3_MAX;
   }
-  const auto inv_scale = 1.0f / scale;
+  // Match BF16 activation storage and the separate quantizer's 448/absmax.
+  const auto inv_scale = kRoundToBF16 && !kScaleUE8M0 ? math::FP8_E4M3_MAX / absmax : 1.0f / scale;
 
   OutputVec out_vec;
 #pragma unroll
   for (uint32_t i = 0; i < 4; ++i) {
-    const float scaled_val0 = results[2 * i + 0] * inv_scale;
-    const float scaled_val1 = results[2 * i + 1] * inv_scale;
+    float scaled_val0 = results[2 * i + 0] * inv_scale;
+    float scaled_val1 = results[2 * i + 1] * inv_scale;
+    if constexpr (kRoundToBF16) {
+      // Padded expert slots can be uninitialized during graph capture.
+      scaled_val0 = fminf(scaled_val0, math::FP8_E4M3_MAX);
+      scaled_val1 = fminf(scaled_val1, math::FP8_E4M3_MAX);
+    }
     out_vec[i] = pack_fp8(scaled_val0, scaled_val1);
   }
 
   PDLTriggerSecondary<kUsePDL>();
 
-  out_vec.store(output, threadIdx.x);
+  out_vec.store(output, lane_in_row);
   if constexpr (kTransposed) {
     *output_scale = ue8m0_exp;
   } else {
@@ -510,13 +534,35 @@ __global__ __launch_bounds__(1024, 2) void  // maximize occupancy
   }
 }
 
-template <int64_t kGroupSize, bool kScaleUE8M0, bool kSwizzle, bool kUsePDL, bool kApplySwigluLimit>
+template <
+    int64_t kGroupSize,
+    bool kScaleUE8M0,
+    bool kSwizzle,
+    bool kUsePDL,
+    bool kApplySwigluLimit,
+    bool kRoundToBF16 = false,
+    uint32_t kRowsPerCTA = 1>
 struct SiluAndMulContigPostQuantKernel {
   static_assert(kGroupSize == 32 || kGroupSize == 128);
-  static constexpr auto kernel_normal =
-      silu_mul_quant_contig_kernel<kGroupSize, kScaleUE8M0, false, kSwizzle, kUsePDL, kApplySwigluLimit>;
-  static constexpr auto kernel_transposed =
-      silu_mul_quant_contig_kernel<kGroupSize, true, true, kSwizzle, kUsePDL, kApplySwigluLimit>;
+  static_assert(kRowsPerCTA == 1 || kRowsPerCTA == 2 || kRowsPerCTA == 4 || kRowsPerCTA == 8);
+  static constexpr auto kernel_normal = silu_mul_quant_contig_kernel<
+      kGroupSize,
+      kScaleUE8M0,
+      false,
+      kSwizzle,
+      kUsePDL,
+      kApplySwigluLimit,
+      kRoundToBF16,
+      kRowsPerCTA>;
+  static constexpr auto kernel_transposed = silu_mul_quant_contig_kernel<
+      kGroupSize,
+      true,
+      true,
+      kSwizzle,
+      kUsePDL,
+      kApplySwigluLimit,
+      kRoundToBF16,
+      kRowsPerCTA>;
 
   static void
   run(const tvm::ffi::TensorView input,
@@ -546,14 +592,25 @@ struct SiluAndMulContigPostQuantKernel {
     RuntimeCheck(D.unwrap() == 2 * hidden_dim, "invalid dimension");
     RuntimeCheck(hidden_dim % kGroupSize == 0);
     const auto num_groups = static_cast<uint32_t>(hidden_dim / kGroupSize);
+    RuntimeCheck(hidden_dim > 0, "hidden_dim must be positive");
 
     uint32_t scale_row_stride_int32 = 0;
+    uint32_t scale_stride_m = num_groups;
+    uint32_t scale_stride_g = 1;
     if (!transposed) {
       G.set_value(num_groups);
-      TensorMatcher({M, G})  // (M, G) fp32 natural row-major
+      auto SM = SymbolicSize{"scale stride M"};
+      auto SG = SymbolicSize{"scale stride G"};
+      TensorMatcher({M, G})  // FP32 row-major or TMA-aligned column-major
+          .with_strides({SM, SG})
           .with_dtype<fp32_t>()
           .with_device(device)
           .verify(output_scale);
+      RuntimeCheck(
+          (SM.unwrap() == num_groups && SG.unwrap() == 1) || (SM.unwrap() == 1 && SG.unwrap() >= M.unwrap()),
+          "invalid FP32 scale strides");
+      scale_stride_m = static_cast<uint32_t>(SM.unwrap());
+      scale_stride_g = static_cast<uint32_t>(SG.unwrap());
     } else {
       RuntimeCheck(kScaleUE8M0, "transposed layout only supports scale_ue8m0=true");
       RuntimeCheck(num_groups % 4 == 0, "transposed layout requires num_groups % 4 == 0");
@@ -578,12 +635,17 @@ struct SiluAndMulContigPostQuantKernel {
         .hidden_dim = hidden_dim,
         .num_tokens = num_tokens,
         .scale_row_stride_int32 = scale_row_stride_int32,
+        .scale_stride_m = scale_stride_m,
+        .scale_stride_g = scale_stride_g,
     };
 
-    const auto num_threads = hidden_dim / 8;
-    RuntimeCheck(num_threads % device::kWarpThreads == 0);
+    const auto threads_per_row = hidden_dim / 8;
+    RuntimeCheck(threads_per_row % device::kWarpThreads == 0);
+    const auto num_threads = threads_per_row * kRowsPerCTA;
+    RuntimeCheck(num_threads <= 1024);
+    if (num_tokens == 0) return;
     const auto kernel = transposed ? kernel_transposed : kernel_normal;
-    LaunchKernel(num_tokens, num_threads, device.unwrap())  //
+    LaunchKernel(host::div_ceil(num_tokens, kRowsPerCTA), num_threads, device.unwrap())  //
         .enable_pdl(kUsePDL)(kernel, params);
   }
 };
