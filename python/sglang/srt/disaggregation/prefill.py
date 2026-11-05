@@ -673,6 +673,11 @@ class SchedulerDisaggregationPrefillMixin:
         last_batch: Optional[ScheduleBatch],
         should_retry_storage_prefetch: bool = True,
     ) -> NextBatchPlan:
+        if (
+            envs.SGLANG_DISAGG_PREFILL_POLL_TRANSFERS_BEFORE_FORWARD.get()
+            and get_parallel().pp_size == 1
+        ):
+            self.process_disagg_prefill_transfer_queue()
         self.process_pending_chunked_abort()
         self._process_hicache_events(
             should_retry_storage_prefetch=should_retry_storage_prefetch
