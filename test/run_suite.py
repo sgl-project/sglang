@@ -86,6 +86,7 @@ PER_COMMIT_SUITES = {
         "base-b-kernel-unit-test-1-gpu-large",
         "base-b-kernel-unit-test-4-gpu-b200",
         "base-b-kernel-unit-test-8-gpu-h200",
+        "base-b-kernel-benchmark-test-1-gpu-small",
         "base-b-kernel-benchmark-test-1-gpu-large",
         # Diffusion keeps case-level pytest partitioning behind registered
         # bridge files while sharing this discovery and dispatch entry point.

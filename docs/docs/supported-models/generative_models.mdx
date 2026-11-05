@@ -174,6 +174,11 @@ in the GitHub search bar.
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Baidu's ERNIE-4.5 series which consists of MoE with 47B and 3B active parameters, with the largest model having 424B total parameters, as well as a 0.3B dense model.</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**ERNIE 5.5 Flash**</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`baidu/ERNIE-5.5-Flash-Base`, `baidu/ERNIE-5.5-Flash-Base-BF16`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Baidu's ERNIE 5.5 Flash (`Ernie5_5_MoeForCausalLM`), a 280B-total / 14B-active MoE: 37 heavily compressed attention (HCA) layers and 6 full-context MLA layers with DSA sparse attention, low-rank gated attention with a cross-head post-mix (VHA), manifold-constrained hyper-connections, and Multi-Router latent MoE layers with 512 experts (top-10) plus a shared expert. The Base checkpoints (FP8 and BF16) are served through the completions endpoint; ERNIE-5.5-Flash (FP8 / FP4 / BF16), with the `ernie55` reasoning and tool-call parsers and a DSpark draft, is coming soon, and attention TP must divide the 8 output groups. See the ERNIE-5.5-Flash cookbook page for recipes.</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**Arcee AFM-4.5B**</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`arcee-ai/AFM-4.5B-Base`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Arcee's foundational model series for real world reliability and edge deployments.</td>
