@@ -127,7 +127,7 @@ from sglang.srt.utils import (
     log_info_on_rank0,
     make_pp_layers,
 )
-from sglang.srt.utils.hf_transformers_utils import get_rope_config
+from sglang.srt.utils.hf_transformers import get_rope_config
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
