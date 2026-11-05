@@ -1300,6 +1300,41 @@ class ServingChatTestCase(CustomTestCase):
 
         self.assertIsNone(processed.tool_call_constraint)
 
+    def test_glm47_ebnf_keeps_reasoning_prefix_for_unsupported_effort(self):
+        """GLM's template never reads `enable_thinking`, so the EBNF must follow
+        the template's always-on reasoning instead of the kwarg that
+        ``reasoning_effort="none"`` synthesizes. With the "no thinking section"
+        grammar, `</think>` is unselectable and the model can never close
+        thinking, so it runs to max_new_tokens."""
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.template_manager.reasoning_config = ReasoningToggleConfig(
+            special_case="always"
+        )
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        self.chat.reasoning_parser = "glm45"
+        self.chat.tool_call_parser = "glm47"
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "What is 2+2?"}],
+            reasoning_effort="none",
+            tools=[{"type": "function", "function": {"name": "add"}}],
+        )
+
+        processed = self.chat._process_messages(req, is_multimodal=False)
+
+        self.assertIsNotNone(processed.tool_call_constraint)
+        constraint_type, grammar = processed.tool_call_constraint
+        self.assertEqual(constraint_type, "full_assistant_ebnf")
+        self.assertIn('thinking_block ::= thinking_block_content "</think>"', grammar)
+        self.assertNotIn('thinking_block ::= ""', grammar)
+        # The unsupported level folded onto the template default, and no thinking
+        # key survived for the grammar to misread.
+        self.assertEqual(req.reasoning_effort, "max")
+        self.assertNotIn("enable_thinking", req.chat_template_kwargs or {})
+        self.assertNotIn("thinking", req.chat_template_kwargs or {})
+
     def test_jinja_tool_schema_fallback_to_flat_function(self):
         """Fallback to function-only schema when template rejects OpenAI wrapper."""
         self.template_manager.chat_template_name = None
