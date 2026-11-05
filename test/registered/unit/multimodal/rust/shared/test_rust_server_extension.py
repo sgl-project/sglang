@@ -1101,6 +1101,28 @@ class TestRustServerExtension(CustomTestCase):
         )
         scheduler.output_streamer.release_detokenize_state.assert_called_once_with(req)
 
+    def test_freeze_gc_skips_the_detokenizer_socket_in_rust_mode(self):
+        """The scheduler freezes its own GC either way; only without the Rust
+        server, whose detokenizer shares the process, does it forward the
+        request to a detokenizer process."""
+        from sglang.srt.managers.io_struct import FreezeGCReq
+        from sglang.srt.managers.scheduler import Scheduler
+
+        req = FreezeGCReq(rid="r#1", gc_threshold=[700, 10, 1000])
+        scheduler = SimpleNamespace(
+            rust_server=RustServer(Mock(), http_port=30000), ipc_channels=Mock()
+        )
+        with patch("sglang.srt.managers.scheduler.freeze_gc") as freeze_gc:
+            Scheduler.handle_freeze_gc(scheduler, req)
+            freeze_gc.assert_called_once_with("Scheduler", [700, 10, 1000])
+            scheduler.ipc_channels.send_to_detokenizer.send_output.assert_not_called()
+
+            scheduler.rust_server = None
+            Scheduler.handle_freeze_gc(scheduler, req)
+        scheduler.ipc_channels.send_to_detokenizer.send_output.assert_called_once_with(
+            req, req
+        )
+
     def test_mixed_logprob_batch_frame(self):
         """In a batch where only some rows carry each logprob family, every row
         reads back its own cells from the frame (`for_each_chunk`'s column
