@@ -167,13 +167,13 @@ else
   # GPU arch, yet rebuilding them took ~30 s in every job. Cache the wheel on the
   # persistent /sgl-data volume, keyed by the source tree hash and the image ID.
   # A dirty tree (local runs) or a missing key always builds without caching.
+  CI_IMAGE_ID=$(docker inspect --format '{{.Image}}' ci_sglang 2>/dev/null || true)
+  CI_IMAGE_ID="${CI_IMAGE_ID#sha256:}"
   AOT_KEY=""
   if git diff --quiet HEAD -- python/sglang/kernels/aot 2>/dev/null; then
     AOT_TREE=$(git rev-parse --short=16 HEAD:python/sglang/kernels/aot 2>/dev/null || true)
-    AOT_IMAGE=$(docker inspect --format '{{.Image}}' ci_sglang 2>/dev/null || true)
-    AOT_IMAGE="${AOT_IMAGE#sha256:}"
-    if [[ -n "${AOT_TREE}" && -n "${AOT_IMAGE}" ]]; then
-      AOT_KEY="${AOT_TREE}-${AOT_IMAGE:0:16}-${IMAGE_GFX}"
+    if [[ -n "${AOT_TREE}" && -n "${CI_IMAGE_ID}" ]]; then
+      AOT_KEY="${AOT_TREE}-${CI_IMAGE_ID:0:16}-${IMAGE_GFX}"
     fi
   fi
   AOT_CACHE_ROOT=/sgl-data/sgl-kernel-wheels
@@ -205,9 +205,62 @@ else
   # from its cache, so the _multimodal this would compile went unused.
   install_with_retry docker exec -e SGLANG_BUILD_RUST_EXTS=none ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e "python[${EXTRAS}]"
 
-  # Seed that cache with what stage-a built, when the workflow downloaded it.
-  if [[ -d rust-ext-amd ]]; then
-    bash "$(dirname "${BASH_SOURCE[0]}")/amd_ci_rust_ext_cache.sh" import rust-ext-amd
+  # The loader builds mem_cache, mem_cache_inspection and _multimodal at runtime,
+  # ~2 min per job. Cache them on /sgl-data like the AOT wheel, one entry per
+  # Cargo package keyed by its sources, the loader, the image and the installed
+  # torch and Python ABI. The loader still checks its own fingerprint, so a
+  # module it does not expect is ignored, never loaded, and sync replaces an
+  # entry that did not supply every module. Without the mount (the container
+  # then has a local /sgl-data) or with a dirty tree nothing is built here: the
+  # tests build at runtime, as before.
+  RUST_CACHE_ROOT=/sgl-data/sgl-rust-extensions
+  RUST_ABI=""
+  if [[ -z "${CI_IMAGE_ID}" ]]; then
+    RUST_SKIP="no image ID for ci_sglang"
+  elif [[ -z "$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/sgl-data"}}1{{end}}{{end}}' ci_sglang 2>/dev/null)" ]]; then
+    RUST_SKIP="no /sgl-data mount"
+  else
+    RUST_ABI=$(docker exec ci_sglang python3 -c "import importlib.metadata as m, sysconfig; print(m.version('torch'), sysconfig.get_config_var('SOABI'))" 2>/dev/null || true)
+    RUST_SKIP="could not read the torch version"
+  fi
+  # rust_cache_entry PACKAGE PATH...: the entry name, or nothing (and the reason
+  # on stderr) if any PATH is dirty (the loader also hashes untracked files) or
+  # has no tree hash.
+  rust_cache_entry() {
+    local package=$1 dirty path tree trees=""
+    shift
+    if ! dirty=$(git status --porcelain --untracked-files=all -- "$@" 2>/dev/null); then
+      echo "[RUST] Not caching ${package}: not a git checkout" >&2
+      return 0
+    fi
+    if [[ -n "${dirty}" ]]; then
+      dirty=${dirty%%$'\n'*}
+      echo "[RUST] Not caching ${package}: uncommitted changes (${dirty:3}, ...)" >&2
+      return 0
+    fi
+    for path in "$@"; do
+      if ! tree=$(git rev-parse "HEAD:${path}" 2>/dev/null); then
+        echo "[RUST] Not caching ${package}: no ${path} at HEAD" >&2
+        return 0
+      fi
+      trees+="${tree}"$'\n'
+    done
+    echo "${package}-$(printf '%s%s\n' "${trees}" "${RUST_ABI}" | sha256sum | cut -c1-16)-${CI_IMAGE_ID:0:16}-${IMAGE_GFX}"
+  }
+  RUST_LOADER=python/sglang/srt/rust_extensions
+  RUST_ENTRIES=()
+  if [[ -z "${RUST_ABI}" ]]; then
+    echo "[RUST] Not caching Rust extensions (${RUST_SKIP}); they build at runtime"
+  else
+    RUST_ENTRY=$(rust_cache_entry sglang-radix-tree rust/sglang-radix-tree rust/rust-toolchain.toml rust/.cargo "${RUST_LOADER}" python/sglang/srt/mem_cache/rust_tree_core)
+    [[ -n "${RUST_ENTRY}" ]] && RUST_ENTRIES+=("sglang-radix-tree=${RUST_ENTRY}")
+    RUST_ENTRY=$(rust_cache_entry sglang-mm rust "${RUST_LOADER}")
+    [[ -n "${RUST_ENTRY}" ]] && RUST_ENTRIES+=("sglang-mm=${RUST_ENTRY}")
+  fi
+  if [[ ${#RUST_ENTRIES[@]} -gt 0 ]]; then
+    bash "$(dirname "${BASH_SOURCE[0]}")/amd_ci_exec.sh" -w /sglang-checkout \
+      python3 /sglang-checkout/scripts/ci/amd/amd_ci_rust_ext_cache.py sync --root "${RUST_CACHE_ROOT}" "${RUST_ENTRIES[@]}" \
+      || echo "[RUST] Warning: could not sync the Rust extension cache in ${RUST_CACHE_ROOT}" >&2
   fi
 fi
 
