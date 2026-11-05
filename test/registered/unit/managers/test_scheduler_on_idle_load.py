@@ -3,8 +3,9 @@
 A non-storage no-batch stall spins on_idle without sleeping, so the gate must
 cap the O(queue) get_loads for both the DP-balancing writer and the load
 socket. Work held outside the admitted request queues (async SHM
-materialization) must keep the scheduler non-idle. CPU-only: builds a bare
-Scheduler with mocked collaborators, like test_scheduler_flush_cache.
+materialization) must keep the scheduler non-idle. A Rust-server rank parks
+on its request ring only when it is safe. CPU-only: builds a bare Scheduler
+with mocked collaborators, like test_scheduler_flush_cache.
 """
 
 import unittest
@@ -185,6 +186,60 @@ class TestAsyncShmIdleAccounting(CustomTestCase):
         scheduler.on_idle()
         scheduler.idle_sleeper.maybe_sleep.assert_called_once_with()
         self.assertEqual(progress_wait.call_count, 2)
+
+
+class _RecordingRequestRing:
+    def __init__(self):
+        self.park_timeouts_ms = []
+
+    def wait_request(self, timeout_ms: int) -> None:
+        self.park_timeouts_ms.append(timeout_ms)
+
+    def install_sigterm_drain(self, notify: str) -> None:
+        pass
+
+
+class TestRustServerIdlePark(CustomTestCase):
+    def test_attention_dp_rank_parks_only_with_sleep_on_idle(self):
+        """An idle attention-DP rank must not park on its ring by default: a request
+        on a peer's listener never wakes it, yet the peer's next step gathers every
+        DP rank. --sleep-on-idle and non-attention-DP ranks still park."""
+        for attn_dp_enabled, sleep_on_idle, parks in (
+            (True, False, False),
+            (True, True, True),
+            (False, False, True),
+        ):
+            with self.subTest(
+                attn_dp_enabled=attn_dp_enabled, sleep_on_idle=sleep_on_idle
+            ):
+                ring = _RecordingRequestRing()
+                s = Scheduler.__new__(Scheduler)
+                s._engine_paused = False
+                s.get_rust_server_class = lambda: SimpleNamespace(
+                    launch=lambda _scheduler, frontend_cpu_share: ring,
+                    gather_server_endpoints=lambda _hosts_listener: [],
+                    gather_frontend_cpu_share=lambda _hosts_listener: (0, 1),
+                )
+                parallel = SimpleNamespace(
+                    pp_rank=0,
+                    attn_tp_rank=0,
+                    attn_cp_rank=0,
+                    attn_dp_enabled=attn_dp_enabled,
+                )
+                with (
+                    envs.SGLANG_RUST_SERVER.override(True),
+                    patch(
+                        "sglang.srt.managers.scheduler.get_parallel",
+                        return_value=parallel,
+                    ),
+                    patch(
+                        "sglang.srt.managers.scheduler.get_device",
+                        return_value=SimpleNamespace(sleep_on_idle=sleep_on_idle),
+                    ),
+                ):
+                    s.maybe_init_rust_server(SimpleNamespace(instance_id="idle-park"))
+                    s.maybe_sleep_on_idle()
+                self.assertEqual(bool(ring.park_timeouts_ms), parks)
 
 
 if __name__ == "__main__":

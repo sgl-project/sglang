@@ -621,7 +621,9 @@ def test_listener_rank_installs_the_sigterm_drain(hosts):
     )
     with (
         envs.SGLANG_RUST_SERVER.override(True),
-        patch.object(scheduler_module, "RustServerIdleSleeper"),
+        patch.object(scheduler_module, "create_rust_server_idle_sleeper"),
+        patch.object(scheduler_module, "get_parallel"),
+        patch.object(scheduler_module, "get_device"),
     ):
         scheduler_module.Scheduler.maybe_init_rust_server(
             scheduler, SimpleNamespace(instance_id="dp-ports-test")
