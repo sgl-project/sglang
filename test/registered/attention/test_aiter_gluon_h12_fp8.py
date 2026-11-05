@@ -460,6 +460,7 @@ class TestFp8QAsmSelection(CustomTestCase):
             decode_backend="asm",
             verify_backend="asm",
             dcp_world_size=1,
+            is_draft_worker=False,
             verify_qlen=1,
             gfx95=True,
         )
@@ -528,7 +529,7 @@ class TestFp8QAsmPersistScope(CustomTestCase):
     """SGLANG_OPT_HIP_MLA_FP8_Q_ASM must not turn persistence on for the process.
     Under SGLANG_AITER_MLA_PERSIST=0, other backends and the module defaults stay off."""
 
-    def _build(self, *, num_draft_tokens):
+    def _build(self, *, num_draft_tokens, is_draft_worker=False):
         from types import SimpleNamespace
 
         from sglang.srt.configs.model_config import AttentionArch
@@ -558,7 +559,7 @@ class TestFp8QAsmPersistScope(CustomTestCase):
             ),
             token_to_kv_pool=kv_pool,
             token_to_kv_pool_allocator=SimpleNamespace(get_kvcache=lambda: kv_pool),
-            is_draft_worker=False,
+            is_draft_worker=is_draft_worker,
             spec_algorithm=SpeculativeAlgorithm.DSPARK,
             runner_ids=None,
             decode_attention_backend_str="aiter",
@@ -596,6 +597,8 @@ class TestFp8QAsmPersistScope(CustomTestCase):
             eligible = self._build(num_draft_tokens=8)
             # DSpark block 3: a four-token window keeps PERSIST=0 routing.
             other = self._build(num_draft_tokens=4)
+            # A draft model's backend keeps PERSIST=0 routing at any window.
+            draft = self._build(num_draft_tokens=8, is_draft_worker=True)
 
             self.assertFalse(aiter_backend._use_mla_ps_kernel)
             self.assertFalse(aiter_backend.fast_mode)
@@ -608,6 +611,8 @@ class TestFp8QAsmPersistScope(CustomTestCase):
             self.assertFalse(other.use_mla_fp8_q_asm)
             self.assertFalse(other._use_mla_decode_persist_metadata())
             self.assertIsNone(other.max_split_per_batch)
+            self.assertFalse(draft.use_mla_fp8_q_asm)
+            self.assertFalse(draft._use_mla_decode_persist_metadata())
 
     def test_persist_auto_splits_still_set_the_module_modes(self):
         """Under PERSIST=1 with auto KV splits, draft extend reads the module modes with a

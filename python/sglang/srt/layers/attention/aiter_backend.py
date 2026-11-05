@@ -131,6 +131,7 @@ def _fp8_q_asm_mla_selected(
     decode_backend: str,
     verify_backend: str,
     dcp_world_size: int,
+    is_draft_worker: bool,
     verify_qlen: int,
     gfx95: bool,
     max_verify_qlen: int = _MLA_ASM_PS_MAX_QLEN,
@@ -151,6 +152,8 @@ def _fp8_q_asm_mla_selected(
         and decode_backend == "asm"
         and verify_backend == "asm"
         and dcp_world_size <= 1
+        # A draft backend also runs draft extend, which plans with the module modes.
+        and not is_draft_worker
         and gfx95
         and 1 <= verify_qlen <= max_verify_qlen
         and verify_qlen not in _MLA_FP8_Q_ASM_BROKEN_QLENS
@@ -812,6 +815,7 @@ class AiterAttnBackend(AttentionBackend):
                 decode_backend=self.mla_decode_backend,
                 verify_backend=self.mla_verify_backend,
                 dcp_world_size=self.dcp_world_size,
+                is_draft_worker=model_runner.is_draft_worker,
                 verify_qlen=self.num_draft_tokens or 1,
                 gfx95=is_gfx95_supported(),
                 max_verify_qlen=envs.SGLANG_OPT_HIP_MLA_FP8_Q_ASM_MAX_QLEN.get(),
