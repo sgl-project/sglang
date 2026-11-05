@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from functools import partial
 from typing import Any, Literal
 
+import msgspec
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
@@ -15,6 +16,7 @@ from transformers.modeling_outputs import BaseModelOutputWithPooling
 from transformers.models.auto import CONFIG_MAPPING
 from transformers.models.gemma.configuration_gemma import GemmaConfig
 
+from sglang.kernels.ops.diffusion.sites.bitexact_gate import BitExactFusionGate
 from sglang.multimodal_gen.configs.pipeline_configs.pi05 import Pi05PipelineConfig
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_parallel_world_size,
@@ -36,12 +38,15 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.vla.prefix_cache import VLADensePrefixCache
 from sglang.srt.layers.activation import GeluAndMul
 from sglang.srt.layers.rotary_embedding import (
     apply_rotary_pos_emb as native_apply_rotary_pos_emb,
 )
 from sglang.srt.models.siglip import SiglipVisionModel
+
+logger = init_logger(__name__)
 
 
 def config_compute_dtype(config: GemmaConfig) -> torch.dtype | None:
@@ -60,10 +65,15 @@ def config_compute_dtype(config: GemmaConfig) -> torch.dtype | None:
 
 @dataclass
 class PiGemmaModelOutput:
-    last_hidden_state: torch.Tensor
+    last_hidden_state: torch.Tensor | None
     past_key_values: object | None = None
     hidden_states: tuple[torch.Tensor, ...] | None = None
     attentions: tuple[torch.Tensor, ...] | None = None
+
+
+class Pi05DenoiseCondition(msgspec.Struct, frozen=True):
+    time_embedding: torch.Tensor
+    modulations: tuple[torch.Tensor, ...]
 
 
 def gated_residual(
@@ -125,6 +135,8 @@ class PiGemmaRMSNorm(nn.Module):
         super().__init__()
         self.eps = eps
         self.dim = dim
+        self.enable_fusion = False
+        self.fusion_gate = BitExactFusionGate("Pi05 RMSNorm", per_signature=True)
         if cond_dim is None:
             self.weight = nn.Parameter(torch.zeros(dim))
             self.dense = None
@@ -136,11 +148,47 @@ class PiGemmaRMSNorm(nn.Module):
         self,
         x: torch.Tensor,
         cond: torch.Tensor | None = None,
+        modulation: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if (
+            self.enable_fusion
+            and not torch.is_grad_enabled()
+            and x.device.type == "cuda"
+            and torch.version.cuda is not None
+            and x.ndim == 3
+            and x.is_contiguous()
+            and x.dtype in (torch.bfloat16, torch.float16)
+        ):
+            from sglang.kernels.ops.diffusion import rmsnorm_modulate_preserve_reduction
+
+            if self.dense is not None and modulation is None and cond is not None:
+                modulation = self.dense(cond.to(dtype=self.dense.weight.dtype))
+            weight = self.weight if self.dense is None else None
+            affine = weight if weight is not None else modulation
+            return self.fusion_gate.run(
+                lambda: rmsnorm_modulate_preserve_reduction(
+                    x, weight, modulation if weight is None else None, self.eps
+                ),
+                lambda: self.forward_native(x, cond, modulation),
+                sig=(
+                    x.device,
+                    x.dtype,
+                    x.shape,
+                    None if affine is None else affine.dtype,
+                ),
+                equal=lambda a, b: all(
+                    x is y if x is None or y is None else torch.equal(x, y)
+                    for x, y in zip(a, b, strict=True)
+                ),
+                logger=logger,
+            )
+        return self.forward_native(x, cond, modulation)
+
+    def forward_native(self, x, cond=None, modulation=None):
         dtype = x.dtype
         variance = torch.mean(torch.square(x.float()), dim=-1, keepdim=True)
         normed = x * torch.rsqrt(variance + self.eps)
-        if cond is None:
+        if cond is None and modulation is None:
             if self.dense is not None:
                 return normed.type_as(x), None
             normed = normed * (1.0 + self.weight.float())
@@ -149,7 +197,8 @@ class PiGemmaRMSNorm(nn.Module):
             normed = normed * (1.0 + self.weight.float())
             return normed.type_as(x), None
 
-        modulation = self.dense(cond.to(dtype=self.dense.weight.dtype))
+        if modulation is None:
+            modulation = self.dense(cond.to(dtype=self.dense.weight.dtype))
         if x.ndim == 3:
             modulation = modulation.unsqueeze(1)
         scale, shift, gate = modulation.chunk(3, dim=-1)
@@ -403,6 +452,35 @@ class PiGemmaAttention(nn.Module):
 
         if past_key_values is not None:
             if (
+                getattr(self, "use_split_kv", False)
+                and self.sp_attn is None
+                and past_key_values.read_only
+                and query_states.device.type == "cuda"
+                and query_states.dtype in (torch.float16, torch.bfloat16)
+                and self.head_dim in (64, 128, 256)
+                and (attention_mask is None or attention_mask.shape[1:3] == (1, 1))
+            ):
+                from sglang.kernels.ops.attention.pi05_split_kv import (
+                    split_kv_attention,
+                )
+
+                prefix_keys, prefix_values = past_key_values.get_prefix(self.layer_idx)
+                attn_output = (
+                    split_kv_attention(
+                        query_states,
+                        prefix_keys,
+                        prefix_values,
+                        key_states,
+                        value_states,
+                        attention_mask,
+                        self.scaling,
+                    )
+                    .transpose(1, 2)
+                    .reshape(*input_shape, -1)
+                    .contiguous()
+                )
+                return linear_forward(self.o_proj, attn_output), None
+            if (
                 self.sp_attn is not None
                 and past_key_values.read_only
                 and attention_mask is None
@@ -475,10 +553,15 @@ class PiGemmaDecoderLayer(nn.Module):
         past_key_values=None,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         adarms_cond: torch.Tensor | None = None,
+        adarms_modulations: tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs,
     ) -> torch.Tensor:
         residual = hidden_states
-        hidden_states, gate = self.input_layernorm(hidden_states, cond=adarms_cond)
+        hidden_states, gate = self.input_layernorm(
+            hidden_states,
+            cond=adarms_cond,
+            modulation=None if adarms_modulations is None else adarms_modulations[0],
+        )
         hidden_states, _ = self.self_attn(
             hidden_states,
             attention_mask=attention_mask,
@@ -490,7 +573,9 @@ class PiGemmaDecoderLayer(nn.Module):
 
         residual = hidden_states
         hidden_states, gate = self.post_attention_layernorm(
-            hidden_states, cond=adarms_cond
+            hidden_states,
+            cond=adarms_cond,
+            modulation=None if adarms_modulations is None else adarms_modulations[1],
         )
         hidden_states = self.mlp(hidden_states)
         hidden_states = gated_residual(residual, hidden_states, gate)
@@ -615,6 +700,8 @@ class PiGemmaModel(nn.Module):
         output_hidden_states: bool | None = None,
         cache_position: torch.LongTensor | None = None,
         adarms_cond: torch.Tensor | None = None,
+        adarms_modulations: tuple[torch.Tensor, ...] | None = None,
+        prefix_kv_only: bool = False,
         **kwargs,
     ) -> PiGemmaModelOutput:
         output_attentions = (
@@ -628,6 +715,10 @@ class PiGemmaModel(nn.Module):
             else self.config.output_hidden_states
         )
         use_cache = use_cache if use_cache is not None else self.config.use_cache
+        if prefix_kv_only and (
+            not use_cache or output_attentions or output_hidden_states
+        ):
+            raise ValueError("prefix_kv_only requires KV output without hidden states")
 
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("Specify exactly one of input_ids or inputs_embeds")
@@ -677,10 +768,30 @@ class PiGemmaModel(nn.Module):
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
 
-        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+        for layer_index, decoder_layer in enumerate(
+            self.layers[: self.config.num_hidden_layers]
+        ):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
             self._layer_to_compute_device(decoder_layer)
+            if prefix_kv_only and layer_index == self.config.num_hidden_layers - 1:
+                # Only final-layer K/V is consumed; preserve QKV/RoPE and skip attention/MLP.
+                normalized, _ = decoder_layer.input_layernorm(
+                    hidden_states,
+                    adarms_cond,
+                    modulation=(
+                        None
+                        if adarms_modulations is None
+                        else adarms_modulations[2 * layer_index]
+                    ),
+                )
+                query, key, value = decoder_layer.self_attn.project_qkv(normalized)
+                _, key = native_apply_rotary_pos_emb(
+                    query, key, *position_embeddings, unsqueeze_dim=1
+                )
+                past_key_values.update(key, value, layer_index)
+                self._layer_to_cpu_after_compute(decoder_layer)
+                return PiGemmaModelOutput(None, past_key_values=past_key_values)
             layer_outputs = decoder_layer(
                 hidden_states,
                 attention_mask=causal_mask,
@@ -688,6 +799,11 @@ class PiGemmaModel(nn.Module):
                 output_attentions=output_attentions,
                 position_embeddings=position_embeddings,
                 adarms_cond=adarms_cond,
+                adarms_modulations=(
+                    None
+                    if adarms_modulations is None
+                    else adarms_modulations[2 * layer_index : 2 * layer_index + 2]
+                ),
                 **kwargs,
             )
             hidden_states = layer_outputs
@@ -695,7 +811,11 @@ class PiGemmaModel(nn.Module):
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
 
-        hidden_states, _ = self.norm(hidden_states, adarms_cond)
+        hidden_states, _ = self.norm(
+            hidden_states,
+            adarms_cond,
+            modulation=None if adarms_modulations is None else adarms_modulations[-1],
+        )
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
@@ -1122,6 +1242,8 @@ class PaliGemmaWithExpertModel(nn.Module):
         inputs_embeds: list[torch.FloatTensor | None],
         use_cache: bool | None,
         adarms_cond: list[torch.Tensor | None] | None = None,
+        expert_adarms_modulations: tuple[torch.Tensor, ...] | None = None,
+        prefix_kv_only: bool = False,
     ):
         if adarms_cond is None:
             adarms_cond = [None, None]
@@ -1133,6 +1255,7 @@ class PaliGemmaWithExpertModel(nn.Module):
                 past_key_values=past_key_values,
                 use_cache=use_cache,
                 adarms_cond=adarms_cond[0],
+                prefix_kv_only=prefix_kv_only,
             )
             return [
                 prefix_output.last_hidden_state,
@@ -1147,6 +1270,7 @@ class PaliGemmaWithExpertModel(nn.Module):
                 past_key_values=past_key_values,
                 use_cache=use_cache,
                 adarms_cond=adarms_cond[1],
+                adarms_modulations=expert_adarms_modulations,
             )
             return [None, suffix_output.last_hidden_state], None
 
@@ -1225,6 +1349,14 @@ class Pi05CoreModel(nn.Module):
             torch.empty(0, dtype=torch.float64),
             persistent=False,
         )
+        if self.paligemma_with_expert.gemma_expert is not None:
+            for layer in self.paligemma_with_expert.gemma_expert.model.layers:
+                layer.self_attn.use_split_kv = (
+                    config.action_attention_backend == "triton_split_kv"
+                )
+        for module in self.modules():
+            if isinstance(module, PiGemmaRMSNorm):
+                module.enable_fusion = config.enable_fused_norm
 
     def prepare_attention_masks_4d(
         self,
@@ -1267,7 +1399,17 @@ class Pi05CoreModel(nn.Module):
         self,
         noisy_actions: torch.Tensor,
         timestep: torch.Tensor,
+        condition: Pi05DenoiseCondition | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        action_emb = self.action_in_proj(
+            noisy_actions.to(dtype=linear_compute_dtype(self.action_in_proj))
+        )
+        adarms_cond = (
+            self.embed_time(timestep) if condition is None else condition.time_embedding
+        )
+        return action_emb, adarms_cond
+
+    def embed_time(self, timestep: torch.Tensor) -> torch.Tensor:
         if (
             self._time_embedding_scaling.numel()
             != self.action_in_proj.out_features // 2
@@ -1296,16 +1438,26 @@ class Pi05CoreModel(nn.Module):
             max_period=self.config.time_embedding_max_period,
             scaling=self._time_embedding_scaling,
         )
-        action_emb = self.action_in_proj(
-            noisy_actions.to(dtype=linear_compute_dtype(self.action_in_proj))
-        )
         time_emb = time_emb.to(dtype=self.time_mlp_in.weight.dtype)
         time_emb = self.time_mlp_in(time_emb)
         time_emb = F.silu(time_emb)
         time_emb = self.time_mlp_out(time_emb)
-        adarms_cond = F.silu(time_emb)
+        return F.silu(time_emb)
 
-        return action_emb, adarms_cond
+    def prepare_denoise_condition(self, timestep: torch.Tensor) -> Pi05DenoiseCondition:
+        cond = self.embed_time(timestep)
+        expert = self.paligemma_with_expert.gemma_expert.model
+        norms = [
+            norm
+            for layer in expert.layers[: expert.config.num_hidden_layers]
+            for norm in (layer.input_layernorm, layer.post_attention_layernorm)
+        ] + [expert.norm]
+        return Pi05DenoiseCondition(
+            time_embedding=cond,
+            modulations=tuple(
+                norm.dense(cond.to(dtype=norm.dense.weight.dtype)) for norm in norms
+            ),
+        )
 
     def prepare_denoise_layout(
         self,
@@ -1341,6 +1493,12 @@ class Pi05CoreModel(nn.Module):
                 [prefix_pad_2d_masks, suffix_att_2d_masks],
                 dim=2,
             )
+            if self.config.action_attention_backend == "triton_split_kv" and not (
+                model_parallel_is_initialized()
+                and get_sequence_parallel_world_size() > 1
+            ):
+                # Pi0.5 action queries share one noncausal key-padding mask.
+                full_att_2d_masks = full_att_2d_masks[:, :1, :]
             # A masked prefix guarantees that the concatenated layout is not
             # full attention. Avoid a device-to-host ``.item()`` here so this
             # path remains CUDA-graph capturable.
@@ -1448,6 +1606,7 @@ class Pi05CoreModel(nn.Module):
                 past_key_values=None,
                 inputs_embeds=[prefix_embs, None],
                 use_cache=True,
+                prefix_kv_only=True,
             )
         self._offload_prefix_language_layers_after_prefix()
         return (
@@ -1467,8 +1626,9 @@ class Pi05CoreModel(nn.Module):
         *,
         action_position_offset: int = 0,
         denoise_layout: tuple[torch.Tensor | None, torch.Tensor] | None = None,
+        condition: Pi05DenoiseCondition | None = None,
     ) -> torch.Tensor:
-        suffix_embs, adarms_cond = self.embed_suffix(x_t, timestep)
+        suffix_embs, adarms_cond = self.embed_suffix(x_t, timestep, condition)
         if denoise_layout is None:
             denoise_layout = self.prepare_denoise_layout(
                 prefix_pad_masks,
@@ -1488,6 +1648,9 @@ class Pi05CoreModel(nn.Module):
                 inputs_embeds=[None, suffix_embs],
                 use_cache=False,
                 adarms_cond=[None, adarms_cond],
+                expert_adarms_modulations=None
+                if condition is None
+                else condition.modulations,
             )
         suffix_out = outputs_embeds[1][:, -x_t.shape[1] :]
         return self.action_out_proj(

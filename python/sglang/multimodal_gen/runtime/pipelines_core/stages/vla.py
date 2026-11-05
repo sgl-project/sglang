@@ -189,6 +189,14 @@ class VLAPrefixEncodingStage(PipelineStage):
             if len(group_batches) == 1 or fingerprint[0] == "single":
                 for index, batch in group:
                     results[index] = self(batch, server_args)
+                    context = vla_state(batch).get("prefix_context")
+                    if (
+                        len(batches) > 1
+                        and context is not None
+                        and context.layout.get("mutable_graph_output", False)
+                    ):
+                        # Preserve this prefix before another request replays the graph.
+                        vla_state(batch)["prefix_context"] = context.clone()
                 continue
 
             prefix_start = time.perf_counter()
@@ -200,6 +208,10 @@ class VLAPrefixEncodingStage(PipelineStage):
                 grouped_observation,
                 use_cuda_graph=_cuda_graph_enabled(group_batches[0]),
             )
+            if len(group_batches) < len(batches) and prefix_context.layout.get(
+                "mutable_graph_output", False
+            ):
+                prefix_context = prefix_context.clone()
             prefix_ms = (time.perf_counter() - prefix_start) * 1000
 
             for offset, (index, batch) in enumerate(group):
@@ -328,11 +340,12 @@ class VLAPrefixEncodingStage(PipelineStage):
         cuda_graph_enabled = _cuda_graph_enabled(batch)
         prefix_context = self.policy_model.encode_prefix(
             observation,
-            use_cuda_graph=cuda_graph_enabled and not cache_enabled,
+            use_cuda_graph=cuda_graph_enabled,
             bucket_prompt=cuda_graph_enabled,
         )
         if cache_key is not None:
             prefix_context.cache_key_digest = cache_key
+            prefix_context = self.prefix_cache.put(cache_key, prefix_context)
 
         vla_timings(batch)["prefix_ms"] = (time.perf_counter() - prefix_start) * 1000
         state["prefix_context"] = prefix_context
@@ -344,9 +357,6 @@ class VLAPrefixEncodingStage(PipelineStage):
             "prompt_token_bucket": prefix_context.layout.get("prompt_token_bucket"),
         }
 
-        # 4. update prefix kv cache
-        if cache_key is not None:
-            self.prefix_cache.put(cache_key, prefix_context)
         if split is not None:
             self._send_prefix_result(batch, split, prefix_context)
         if (

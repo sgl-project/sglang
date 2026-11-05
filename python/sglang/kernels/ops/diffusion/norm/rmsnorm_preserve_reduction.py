@@ -1,16 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Fuse RMSNorm pointwise work while retaining the native FP32 mean reduction.
-
-Matches ``weight * (x.float() * rsqrt(mean(x.float()**2) + eps)).to(x.dtype)``
-for FP16/BF16 inputs; packed projection views are materialized before the launch. The FP32 square buffer has the original shape,
-so aten selects the same reduction as the eager chain. Verified at head width
-128, including 131072 rows; callers verify their first dispatch before reuse.
-"""
+"""RMSNorm pointwise fusion preserving Torch's FP32 mean and cast boundaries."""
 
 import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.numerics import cuda_rsqrtf
 from sglang.srt.utils.custom_op import register_custom_op
 
 
@@ -19,6 +14,14 @@ def _square_fp32_kernel(x_ptr, square_ptr, N: tl.constexpr, BLOCK: tl.constexpr)
     index = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     value = tl.load(x_ptr + index, index < N, 0).to(tl.float32)
     tl.store(square_ptr + index, value * value, index < N)
+
+
+def _mean_square(x: torch.Tensor, block_size: int) -> torch.Tensor:
+    squares = torch.empty_like(x, dtype=torch.float32)
+    _square_fp32_kernel[(triton.cdiv(x.numel(), block_size),)](
+        x, squares, x.numel(), block_size, enable_fp_fusion=False
+    )
+    return squares.mean(dim=-1, keepdim=True)
 
 
 @triton.jit
@@ -68,13 +71,9 @@ def rmsnorm_preserve_reduction(
     ):
         raise RuntimeError("invalid input for rmsnorm_preserve_reduction")
     x = x.contiguous()
-    squares = torch.empty_like(x, dtype=torch.float32)
     out = torch.empty_like(x)
     with torch.cuda.device(x.device):
-        _square_fp32_kernel[(triton.cdiv(x.numel(), 1024),)](
-            x, squares, x.numel(), 1024
-        )
-        variance = squares.mean(dim=-1, keepdim=True)
+        variance = _mean_square(x, 1024)
         _rmsnorm_finish_kernel[(triton.cdiv(x.numel(), 512),)](
             x,
             variance,
@@ -87,3 +86,102 @@ def rmsnorm_preserve_reduction(
             enable_fp_fusion=False,
         )
     return out
+
+
+@triton.jit
+def _rmsnorm_modulate_finish_kernel(
+    X,
+    Mean,
+    Weight,
+    Modulation,
+    Out,
+    Gate,
+    N: tl.constexpr,
+    WIDTH: tl.constexpr,
+    TOKENS: tl.constexpr,
+    EPS: tl.constexpr,
+    ADAPTIVE: tl.constexpr,
+    WEIGHTED: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    valid = offsets < N
+    row, column = offsets // WIDTH, offsets % WIDTH
+    x = tl.load(X + offsets, valid, other=0).to(tl.float32)
+    mean = tl.load(Mean + row, valid, other=0)
+    normalized = x * cuda_rsqrtf(mean + EPS)
+    if ADAPTIVE:
+        batch = row // TOKENS
+        base = batch * (3 * WIDTH) + column
+        scale = tl.load(Modulation + base, valid, other=0).to(tl.float32)
+        shift = tl.load(Modulation + base + WIDTH, valid, other=0).to(tl.float32)
+        normalized = normalized * (1.0 + scale) + shift
+        gate = tl.load(Modulation + base + 2 * WIDTH, valid, other=0)
+        tl.store(Gate + batch * WIDTH + column, gate, valid & (row % TOKENS == 0))
+    elif WEIGHTED:
+        weight = tl.load(Weight + column, valid, other=0).to(tl.float32)
+        normalized = normalized * (1.0 + weight)
+    tl.store(Out + offsets, normalized, valid)
+
+
+def rmsnorm_modulate_preserve_reduction(
+    x: torch.Tensor,
+    weight: torch.Tensor | None,
+    modulation: torch.Tensor | None,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Inference RMSNorm with ``1 + weight`` or packed scale/shift/gate modulation.
+    Keep Torch's FP32 mean and affine rounding; return owned outputs in x.dtype.
+    """
+    if (
+        x.device.type != "cuda"
+        or torch.version.hip is not None
+        or x.ndim != 3
+        or not x.is_contiguous()
+        or x.dtype not in (torch.bfloat16, torch.float16)
+        or x.numel() == 0
+    ):
+        raise ValueError(
+            "rmsnorm_modulate_preserve_reduction requires contiguous CUDA FP16/BF16 [B,T,D]"
+        )
+    batch, tokens, width = x.shape
+    if weight is not None and modulation is not None:
+        raise ValueError("Choose weight or adaptive modulation")
+    for affine, shape in ((weight, (width,)), (modulation, (batch, 3 * width))):
+        if affine is not None and (
+            affine.device != x.device
+            or affine.shape != shape
+            or not affine.is_contiguous()
+            or affine.dtype not in (torch.float32, torch.bfloat16, torch.float16)
+        ):
+            raise ValueError("Invalid normalization affine shape, layout or dtype")
+    if torch.is_grad_enabled() and any(
+        tensor is not None and tensor.requires_grad
+        for tensor in (x, weight, modulation)
+    ):
+        raise RuntimeError("rmsnorm_modulate_preserve_reduction is inference-only")
+    with torch.cuda.device(x.device):
+        mean = _mean_square(x, 256)
+        output = torch.empty_like(x)
+        gate = (
+            None
+            if modulation is None
+            else torch.empty((batch, 1, width), device=x.device, dtype=x.dtype)
+        )
+        _rmsnorm_modulate_finish_kernel[(triton.cdiv(x.numel(), 256),)](
+            x,
+            mean,
+            weight,
+            modulation,
+            output,
+            gate,
+            x.numel(),
+            width,
+            tokens,
+            eps,
+            modulation is not None,
+            weight is not None,
+            256,
+            enable_fp_fusion=False,
+        )
+    return output, gate

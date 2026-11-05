@@ -25,6 +25,23 @@ class PrefixContext:
     prefix_len: int
     layout: dict[str, Any] = field(default_factory=dict)
     cache_key_digest: str | None = None
+    # Prefix replay increments this counter; zero means untracked.
+    revision: int = 0
+
+    def clone(self) -> PrefixContext:
+        """Own the tensors so later prefix graph replays cannot overwrite them."""
+        layout = dict(self.layout)
+        layout.pop("mutable_graph_output", None)
+        return PrefixContext(
+            past_key_values=VLADensePrefixCache(
+                (keys.detach().clone(), values.detach().clone(), window)
+                for keys, values, window in self.past_key_values
+            ),
+            prefix_pad_masks=self.prefix_pad_masks.detach().clone(),
+            prefix_len=self.prefix_len,
+            layout=layout,
+            cache_key_digest=self.cache_key_digest,
+        )
 
 
 class VLADensePrefixCache:
@@ -161,11 +178,15 @@ class VLAPrefixCacheManager:
             self._cache.move_to_end(key)
         return context
 
-    def put(self, key: str, context: PrefixContext) -> None:
+    def put(self, key: str, context: PrefixContext) -> PrefixContext:
+        # Return an owned snapshot so later prefix replays cannot overwrite it.
+        if context.layout.get("mutable_graph_output", False):
+            context = context.clone()
         if self.max_entries == 0:
-            return
+            return context
         if len(self._cache) >= self.max_entries and key not in self._cache:
             self._cache.popitem(last=False)
         context.cache_key_digest = key
         self._cache[key] = context
         self._cache.move_to_end(key)
+        return context
