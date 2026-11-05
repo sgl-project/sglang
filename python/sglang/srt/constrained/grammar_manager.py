@@ -15,8 +15,8 @@ from sglang.srt.constrained.reasoner_grammar_backend import ReasonerGrammarObjec
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
     ListKind,
-    _RequestList,
 )
 from sglang.srt.runtime_context import get_parallel, get_serving
 from sglang.srt.sampling.sampling_params import (
@@ -36,7 +36,7 @@ class GrammarManager:
     def __init__(self, scheduler: Scheduler):
         self.scheduler = scheduler
         self.server_args = scheduler.server_args
-        self.grammar_queue = _RequestList(ListKind.GRAMMAR, abort=self._abort)
+        self.grammar_queue = IndexedReqList(ListKind.GRAMMAR, abort=self._abort)
         if not get_serving().skip_tokenizer_init:
             self.grammar_backend = create_grammar_backend(
                 self.server_args,

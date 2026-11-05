@@ -176,230 +176,6 @@ def _extract_pooled_hidden_states_by_index(output: BatchEmbeddingOutput, i: int)
     return [states[i]]
 
 
-def _handle_output_by_index(output, i):
-    """NOTE: A maintainable method is better here."""
-    if isinstance(output, BatchTokenIDOutput):
-        new_output = BatchTokenIDOutput(
-            rids=[output.rids[i]],
-            spec_verify_ct=_extract_field_by_index(output, "spec_verify_ct", i),
-            spec_num_correct_drafts=_extract_field_by_index(
-                output, "spec_num_correct_drafts", i
-            ),
-            spec_correct_drafts_histogram=_extract_field_by_index(
-                output, "spec_correct_drafts_histogram", i
-            ),
-            spec_num_block_accept_tokens=_extract_field_by_index(
-                output, "spec_num_block_accept_tokens", i
-            ),
-            spec_num_cap_tokens=_extract_field_by_index(
-                output, "spec_num_cap_tokens", i
-            ),
-            spec_cap_lens_histogram=_extract_field_by_index(
-                output, "spec_cap_lens_histogram", i
-            ),
-            finished_reasons=_extract_field_by_index(output, "finished_reasons", i),
-            **_extract_output_ids_by_indices(output, [i]),
-            detokenize_headers=_extract_field_by_index(output, "detokenize_headers", i),
-            completion_tokens=_extract_field_by_index(output, "completion_tokens", i),
-            reasoning_tokens=_extract_field_by_index(output, "reasoning_tokens", i),
-            request_stats=_extract_field_by_index(output, "request_stats", i),
-            input_token_logprobs_val=_extract_field_by_index(
-                output, "input_token_logprobs_val", i, check_length=False
-            ),
-            input_token_logprobs_idx=_extract_field_by_index(
-                output, "input_token_logprobs_idx", i, check_length=False
-            ),
-            output_token_logprobs_val=_extract_field_by_index(
-                output, "output_token_logprobs_val", i, check_length=False
-            ),
-            output_token_logprobs_idx=_extract_field_by_index(
-                output, "output_token_logprobs_idx", i, check_length=False
-            ),
-            input_top_logprobs_val=_extract_field_by_index(
-                output, "input_top_logprobs_val", i, check_length=False
-            ),
-            input_top_logprobs_idx=_extract_field_by_index(
-                output, "input_top_logprobs_idx", i, check_length=False
-            ),
-            input_top_logprobs_val_flat=_extract_field_by_index(
-                output, "input_top_logprobs_val_flat", i, check_length=False
-            ),
-            input_top_logprobs_idx_flat=_extract_field_by_index(
-                output, "input_top_logprobs_idx_flat", i, check_length=False
-            ),
-            input_top_logprobs_flat_null_prefix=_extract_field_by_index(
-                output, "input_top_logprobs_flat_null_prefix", i, check_length=False
-            ),
-            output_top_logprobs_val=_extract_field_by_index(
-                output, "output_top_logprobs_val", i, check_length=False
-            ),
-            output_top_logprobs_idx=_extract_field_by_index(
-                output, "output_top_logprobs_idx", i, check_length=False
-            ),
-            input_token_ids_logprobs_val=_extract_field_by_index(
-                output, "input_token_ids_logprobs_val", i, check_length=False
-            ),
-            input_token_ids_logprobs_idx=_extract_field_by_index(
-                output, "input_token_ids_logprobs_idx", i, check_length=False
-            ),
-            output_token_ids_logprobs_val=_extract_field_by_index(
-                output, "output_token_ids_logprobs_val", i, check_length=False
-            ),
-            output_token_ids_logprobs_idx=_extract_field_by_index(
-                output, "output_token_ids_logprobs_idx", i, check_length=False
-            ),
-            output_token_entropy_val=_extract_field_by_index(
-                output, "output_token_entropy_val", i, check_length=False
-            ),
-            output_token_sampling_mask=_extract_field_by_index(
-                output, "output_token_sampling_mask", i, check_length=False
-            ),
-            output_hidden_states=_extract_field_by_index(
-                output, "output_hidden_states", i, check_length=False
-            ),
-            routed_experts=_extract_field_by_index(
-                output, "routed_experts", i, check_length=False
-            ),
-            indexer_topk=_extract_field_by_index(
-                output, "indexer_topk", i, check_length=False
-            ),
-            weight_versions=_extract_field_by_index(output, "weight_versions", i),
-            prefill_weight_versions=_extract_field_by_index(
-                output, "prefill_weight_versions", i
-            ),
-            placeholder_tokens_idx=None,
-            placeholder_tokens_val=None,
-            beam_search_output=_extract_field_by_index(
-                output, "beam_search_output", i, check_length=True
-            ),
-            token_steps=_extract_field_by_index(
-                output, "token_steps", i, check_length=False
-            ),
-            customized_info=_extract_field_by_index(
-                output, "customized_info", i, check_length=False
-            ),
-            dp_ranks=_extract_field_by_index(output, "dp_ranks", i, check_length=False),
-        )
-    elif isinstance(output, BatchEmbeddingOutput):
-        new_output = BatchEmbeddingOutput(
-            rids=[output.rids[i]],
-            finished_reasons=_extract_field_by_index(output, "finished_reasons", i),
-            embeddings=_extract_field_by_index(output, "embeddings", i),
-            tensor_embeddings=_extract_field_by_index(
-                output, "tensor_embeddings", i, check_length=False
-            ),
-            request_stats=_extract_field_by_index(output, "request_stats", i),
-            placeholder_tokens_idx=None,
-            placeholder_tokens_val=None,
-            pooled_hidden_states=_extract_pooled_hidden_states_by_index(output, i),
-        )
-    elif isinstance(output, BatchStrOutput):
-        new_output = BatchStrOutput(
-            rids=[output.rids[i]],
-            spec_verify_ct=_extract_field_by_index(output, "spec_verify_ct", i),
-            spec_num_correct_drafts=_extract_field_by_index(
-                output, "spec_num_correct_drafts", i
-            ),
-            spec_correct_drafts_histogram=_extract_field_by_index(
-                output, "spec_correct_drafts_histogram", i
-            ),
-            spec_num_block_accept_tokens=_extract_field_by_index(
-                output, "spec_num_block_accept_tokens", i
-            ),
-            spec_num_cap_tokens=_extract_field_by_index(
-                output, "spec_num_cap_tokens", i
-            ),
-            spec_cap_lens_histogram=_extract_field_by_index(
-                output, "spec_cap_lens_histogram", i
-            ),
-            finished_reasons=_extract_field_by_index(output, "finished_reasons", i),
-            output_strs=_extract_field_by_index(output, "output_strs", i),
-            **_extract_output_ids_by_indices(output, [i]),
-            completion_tokens=_extract_field_by_index(output, "completion_tokens", i),
-            reasoning_tokens=_extract_field_by_index(output, "reasoning_tokens", i),
-            request_stats=_extract_field_by_index(output, "request_stats", i),
-            input_token_logprobs_val=_extract_field_by_index(
-                output, "input_token_logprobs_val", i, check_length=False
-            ),
-            input_token_logprobs_idx=_extract_field_by_index(
-                output, "input_token_logprobs_idx", i, check_length=False
-            ),
-            output_token_logprobs_val=_extract_field_by_index(
-                output, "output_token_logprobs_val", i, check_length=False
-            ),
-            output_token_logprobs_idx=_extract_field_by_index(
-                output, "output_token_logprobs_idx", i, check_length=False
-            ),
-            input_top_logprobs_val=_extract_field_by_index(
-                output, "input_top_logprobs_val", i, check_length=False
-            ),
-            input_top_logprobs_idx=_extract_field_by_index(
-                output, "input_top_logprobs_idx", i, check_length=False
-            ),
-            input_top_logprobs_val_flat=_extract_field_by_index(
-                output, "input_top_logprobs_val_flat", i, check_length=False
-            ),
-            input_top_logprobs_idx_flat=_extract_field_by_index(
-                output, "input_top_logprobs_idx_flat", i, check_length=False
-            ),
-            input_top_logprobs_flat_null_prefix=_extract_field_by_index(
-                output, "input_top_logprobs_flat_null_prefix", i, check_length=False
-            ),
-            output_top_logprobs_val=_extract_field_by_index(
-                output, "output_top_logprobs_val", i, check_length=False
-            ),
-            output_top_logprobs_idx=_extract_field_by_index(
-                output, "output_top_logprobs_idx", i, check_length=False
-            ),
-            input_token_ids_logprobs_val=_extract_field_by_index(
-                output, "input_token_ids_logprobs_val", i, check_length=False
-            ),
-            input_token_ids_logprobs_idx=_extract_field_by_index(
-                output, "input_token_ids_logprobs_idx", i, check_length=False
-            ),
-            output_token_ids_logprobs_val=_extract_field_by_index(
-                output, "output_token_ids_logprobs_val", i, check_length=False
-            ),
-            output_token_ids_logprobs_idx=_extract_field_by_index(
-                output, "output_token_ids_logprobs_idx", i, check_length=False
-            ),
-            output_token_entropy_val=_extract_field_by_index(
-                output, "output_token_entropy_val", i, check_length=False
-            ),
-            output_token_sampling_mask=_extract_field_by_index(
-                output, "output_token_sampling_mask", i, check_length=False
-            ),
-            output_hidden_states=_extract_field_by_index(
-                output, "output_hidden_states", i, check_length=False
-            ),
-            routed_experts=_extract_field_by_index(
-                output, "routed_experts", i, check_length=False
-            ),
-            indexer_topk=_extract_field_by_index(
-                output, "indexer_topk", i, check_length=False
-            ),
-            customized_info=_extract_field_by_index(
-                output, "customized_info", i, check_length=False
-            ),
-            dp_ranks=_extract_field_by_index(output, "dp_ranks", i, check_length=False),
-            placeholder_tokens_idx=None,
-            placeholder_tokens_val=None,
-            beam_search_output=_extract_field_by_index(
-                output, "beam_search_output", i, check_length=True
-            ),
-            weight_versions=_extract_field_by_index(output, "weight_versions", i),
-            prefill_weight_versions=_extract_field_by_index(
-                output, "prefill_weight_versions", i
-            ),
-            token_steps=_extract_field_by_index(
-                output, "token_steps", i, check_length=False
-            ),
-        )
-    else:
-        new_output = output
-    return new_output
-
-
 class _CannotSplitBatch(Exception):
     pass
 
@@ -469,6 +245,7 @@ _UNCHECKED_LENGTH_FIELDS = frozenset(
         "token_steps",
         "customized_info",
         "dp_ranks",
+        "tensor_embeddings",
     }
 )
 _NOT_SPLIT_FIELDS = frozenset(
@@ -479,8 +256,39 @@ _NOT_SPLIT_FIELDS = frozenset(
         "placeholder_tokens_val",
         "output_ids_flat",
         "output_ids_offsets",
+        "pooled_hidden_states",
     }
 )
+
+
+def _handle_output_by_index(output, i):
+    if not isinstance(
+        output, (BatchTokenIDOutput, BatchStrOutput, BatchEmbeddingOutput)
+    ):
+        return output
+
+    split_fields = {
+        field.name: _extract_field_by_index(
+            output,
+            field.name,
+            i,
+            check_length=field.name not in _UNCHECKED_LENGTH_FIELDS,
+        )
+        for field in _cached_output_fields(type(output))
+        if field.name not in _NOT_SPLIT_FIELDS
+    }
+    if isinstance(output, BatchEmbeddingOutput):
+        split_fields["pooled_hidden_states"] = _extract_pooled_hidden_states_by_index(
+            output, i
+        )
+    else:
+        split_fields.update(_extract_output_ids_by_indices(output, [i]))
+    return type(output)(
+        rids=[output.rids[i]],
+        placeholder_tokens_idx=None,
+        placeholder_tokens_val=None,
+        **split_fields,
+    )
 
 
 def _handle_output_by_indices(output: Any, indices: List[int]) -> Any:
@@ -627,7 +435,7 @@ class MultiTokenizerRouter:
             print_exception_wrapper(self.handle_loop), self._loop
         )
 
-        # In multi-tokenizer mode the N TokenizerWorker processes cannot each
+        # In multi-tokenizer mode the N tokenizer worker processes cannot each
         # bind the zmq PULL socket used for load snapshots, so the single
         # MultiTokenizerRouter process owns it (zmq -> SHM) and the workers
         # read SHM only. Drain it event-driven via the socket's fd instead of
@@ -656,7 +464,7 @@ class MultiTokenizerRouter:
         """Drain zmq load snapshots into SHM whenever the PULL socket is readable.
 
         zmq exposes an edge-triggered fd; ``poll()`` drains it until empty, which
-        also re-arms the fd, so TokenizerWorkers reading SHM stay up to date
+        also re-arms the fd, so tokenizer workers reading SHM stay up to date
         without any timer.
         """
         assert self.load_snapshot_reader is not None

@@ -387,6 +387,24 @@ def _asm_context_prefill_gather_indices(
     return tok_idx, cu_k
 
 
+def _unified_extend_q(q: torch.Tensor, num_heads: int, head_dim: int) -> torch.Tensor:
+    """q as unified_attention's (tokens, heads, head_dim) input, without a copy when possible.
+
+    unified_attention reads q through its token stride (query_stride_0) and needs the heads x
+    head_dim of a token dense (unit dim stride, head stride = head_dim). A q that is a column
+    slice of the fused QKV output (RoPE writes it in place) is such a view and is returned as
+    is; q.contiguous() copied the whole q of every prefill/extend batch. Any other layout,
+    or one view() rejects, is made contiguous as before.
+    """
+    try:
+        q_v = q.view(-1, num_heads, head_dim)
+        if q_v.stride(2) == 1 and q_v.stride(1) == head_dim:
+            return q_v
+    except RuntimeError:
+        pass
+    return q.contiguous().view(-1, num_heads, head_dim)
+
+
 class AiterAttnBackend(AttentionBackend):
     # kv_indptr/qo_indptr are preallocated at (req pool + 1); an extend batch
     # can never carry more seqs than the pool.
@@ -394,6 +412,10 @@ class AiterAttnBackend(AttentionBackend):
 
     # declare here to avoid CI failure in test_aiter_fp8_q_unified_attention.py
     use_mla_auto_kv_splits: bool = False
+
+    # Set in __init__; declared here for tests that build the backend without it
+    # (test_aiter_fp8_kv_scales_paths.py).
+    deterministic_prefill_max_q: Optional[int] = None
 
     def __init__(
         self,
@@ -578,14 +600,29 @@ class AiterAttnBackend(AttentionBackend):
                 "SGLANG_USE_AITER_UNIFIED_ATTN"
             )
         # Deterministic mode allows aiter decode only for the paged_attention_ragged
-        # path; the unified-attention and 5D-pool kernels are not verified batch-invariant.
+        # path and aiter prefill only for the batch prefill path; the unified-attention
+        # and 5D-pool kernels are not verified batch-invariant.
         if get_exec().deterministic.enable_deterministic_inference and (
             self.use_triton_unified_attention or self.kv_cache_is_vectorized_5d
         ):
             raise ValueError(
-                "Deterministic inference supports aiter decode attention only with the "
+                "Deterministic inference supports aiter attention only with the "
                 "default paged KV cache: not with sliding-window models, "
                 "SGLANG_USE_AITER_UNIFIED_ATTN or a vectorized 5D KV cache layout."
+            )
+
+        # Deterministic mode: AITER batch prefill's output depends on max_seqlen_q (it
+        # sizes the launch, and 1 selects a non-causal mask), so every call gets the
+        # same value, one that covers any extend: at most one chunk.
+        self.deterministic_prefill_max_q = None
+        if get_exec().deterministic.enable_deterministic_inference:
+            self._reject_deterministic_fp8_kv_prefill(
+                getattr(model_runner, "prefill_attention_backend_str", None),
+                self.kv_cache_dtype,
+            )
+            chunk = get_schedule().chunked_prefill_size
+            self.deterministic_prefill_max_q = (
+                chunk if chunk is not None and chunk > 0 else self.max_context_len
             )
 
         # Decode metadata format. unified_attention and pa_decode_gluon (the
@@ -1292,7 +1329,7 @@ class AiterAttnBackend(AttentionBackend):
                 pt = swa_page_table
 
         k_cache, v_cache = self.kv_layers.read(layer.layer_id).kv()
-        q_u = q.contiguous().view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        q_u = _unified_extend_q(q, layer.tp_q_head_num, layer.qk_head_dim)
         o = q_u.new_empty(
             (q_u.shape[0], layer.tp_q_head_num, layer.v_head_dim),
             dtype=self.input_dtype,
@@ -3753,6 +3790,28 @@ class AiterAttnBackend(AttentionBackend):
         return output, lse.transpose(0, 1).contiguous()
 
     @staticmethod
+    def _reject_deterministic_fp8_kv_prefill(prefill_backend, kv_cache_dtype):
+        """Reject aiter prefill on an fp8 KV cache in deterministic mode.
+
+        The argument check accepts aiter prefill with ``--kv-cache-dtype auto``,
+        but ``auto`` becomes an fp8 KV cache at load time when the checkpoint
+        quantizes its KV cache to FP8, and the fp8 KV prefill kernel is not
+        batch-invariant. Check the resolved dtype here.
+        """
+        if prefill_backend == "aiter" and kv_cache_dtype in (
+            torch.float8_e4m3fn,
+            torch.float8_e4m3fnuz,
+            torch.float8_e5m2,
+        ):
+            raise ValueError(
+                "Deterministic inference supports aiter prefill attention only with "
+                f"a bf16 KV cache, but the KV cache is {kv_cache_dtype} (with "
+                "--kv-cache-dtype auto, the checkpoint's FP8 KV cache quantization "
+                "selects fp8). Use --kv-cache-dtype bfloat16 or another "
+                "--prefill-attention-backend."
+            )
+
+    @staticmethod
     def _reject_target_verify_cross_layer_kv(k, v):
         """Reject cross-layer KV sharing on the legacy ragged target-verify path.
 
@@ -4734,6 +4793,9 @@ class AiterAttnBackend(AttentionBackend):
                 v_cache = v_cache.view(-1, self.page_size, *v_cache.shape[-2:])
                 extra_kwargs["kv_last_page_lens"] = last_page_len[: bs0 - 1]
 
+            max_q_len = self.forward_metadata.max_q_len
+            if self.deterministic_prefill_max_q is not None:
+                max_q_len = max(max_q_len, self.deterministic_prefill_max_q)
             o = mha_batch_prefill_func(
                 q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                 k_cache,
@@ -4741,7 +4803,7 @@ class AiterAttnBackend(AttentionBackend):
                 self.forward_metadata.qo_indptr[:bs0],
                 kv_indptr_arg,
                 page_table,
-                self.forward_metadata.max_q_len,
+                max_q_len,
                 self.forward_metadata.max_kv_len,
                 softmax_scale=layer.scaling,
                 causal=True,
