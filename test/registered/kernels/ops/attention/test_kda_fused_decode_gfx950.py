@@ -144,10 +144,14 @@ class TestGfx950KDAFusedDecode(CustomTestCase):
         with envs.SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND.override("gfx950"):
             device = torch.device("cuda")
             self.assertTrue(
-                kda_fused_decode_gfx950.available(device, state_dtype=torch.float32)
+                kda_fused_decode_gfx950.available(
+                    device=device, state_dtype=torch.float32
+                )
             )
             self.assertFalse(
-                kda_fused_decode_gfx950.available(device, state_dtype=torch.bfloat16)
+                kda_fused_decode_gfx950.available(
+                    device=device, state_dtype=torch.bfloat16
+                )
             )
 
     @torch.inference_mode()

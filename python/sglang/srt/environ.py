@@ -1108,13 +1108,13 @@ class Envs:
     SGLANG_ROCM_SMALLM_ROUTER = EnvBool(True)
     SGLANG_ROCM_SMALLM_MOE = EnvBool(True)
     SGLANG_ROCM_SMALLM_FP8_PROJ = EnvBool(True)
-    # Fused Kimi-K3 KDA decode kernel: "gfx950" (SGLang HIP kernel) or "aiter"
-    # (AITER FlyDSL boundary); any other value keeps the unfused KDA decode.
+    # Fused Kimi-K3 KDA decode kernel: "gfx950" (SGLang HIP) or "aiter" (FlyDSL);
+    # any other value keeps the unfused KDA decode.
     SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND = EnvStrWithAlias(
         "gfx950", deprecated_name="SGLANG_ROCM_K3_KDA_FUSED_BACKEND"
     )
-    # FlyDSL module behind the "aiter" fused KDA decode: "auto" prefers SGLang's
-    # vendored copy and falls back to AITER, "sglang" or "aiter" pin one.
+    # FlyDSL kernel behind the "aiter" fused KDA decode: "sglang" or "aiter" pins one;
+    # "auto" prefers the vendored copy, and AITER's for a state dtype only it takes.
     SGLANG_USE_HIP_K3_FLYDSL_SOURCE = EnvStrWithAlias(
         "auto", deprecated_name="SGLANG_K3_FLYDSL_SOURCE"
     )

@@ -10,10 +10,12 @@ from unittest import mock
 
 import torch
 
+from sglang.kernels.ops.attention import kda_fused_decode_aiter_hip
+from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.quark.quark import QuarkLinearMethod
 from sglang.srt.layers.quantization.quark.schemes import QuarkW8A8Fp8
-from sglang.srt.models import kimi_k3_rocm_quant
-from sglang.srt.models.kimi_k3 import _is_unquantized_mergeable
+from sglang.srt.models import kimi_k3, kimi_k3_rocm_quant
+from sglang.srt.models.kimi_k3 import KimiK3DeltaAttention, _is_unquantized_mergeable
 from sglang.srt.models.kimi_k3_rocm_quant import (
     _k3_channel_fp8_to_bf16,
     k3_fused_decode_f_b_weight,
@@ -151,6 +153,65 @@ class TestFusedDecodeFbWeight(CustomTestCase):
 
         with mock.patch.object(kimi_k3_rocm_quant, "print_warning_once") as warn:
             self.assertIsNone(k3_fused_decode_f_b_weight(f_b))
+        warn.assert_called_once()
+
+
+class TestHipFusedDecodeArming(CustomTestCase):
+    """_prepare_fused_decode on ROCm, on a stand-in attention module."""
+
+    def test_failed_rearm_drops_the_previous_arming(self):
+        """A re-run that cannot arm (here the backend reports unavailable) must not
+        leave the previous f_b serving the fused decode."""
+        layer = SimpleNamespace(
+            conv_weights=None,
+            _k3_hip_fused_decode_args=("stale f_b", None, 1e-5, None),
+            _k3_hip_fused_decode_backend="aiter",
+            _k3_hip_fused_decode_ops=kda_fused_decode_aiter_hip,
+        )
+        attention = SimpleNamespace(
+            attn=layer,
+            _kda_hip_fused_decode_ready=True,
+            f_b_proj=SimpleNamespace(weight=torch.empty(12 * 128, 128)),
+            config=SimpleNamespace(
+                mamba2_cache_params=SimpleNamespace(
+                    dtype=SimpleNamespace(temporal=torch.bfloat16)
+                )
+            ),
+        )
+
+        with (
+            mock.patch.object(kimi_k3, "_is_hip", True),
+            envs.SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND.override("aiter"),
+            mock.patch.object(
+                kda_fused_decode_aiter_hip, "available", return_value=False
+            ),
+        ):
+            KimiK3DeltaAttention._prepare_fused_decode(attention)
+
+        self.assertFalse(attention._kda_hip_fused_decode_ready)
+        self.assertIsNone(layer._k3_hip_fused_decode_args)
+        self.assertIsNone(layer._k3_hip_fused_decode_ops)
+
+    def test_block_fp8_f_b_arms_from_the_merged_bf16_copy(self):
+        """A block-FP8 f_b_proj holds FP8 with no Quark scheme; the fused decode must
+        take the BF16 copy _merge_bfa_weights() dequantized, and warn when none exists."""
+        merged = torch.randn(12 * 128, 128, dtype=torch.bfloat16)
+        attention = SimpleNamespace(
+            use_full_rank_gate=True,
+            _bfa_f_b_w=merged,
+            f_b_proj=SimpleNamespace(
+                weight=torch.nn.Parameter(
+                    torch.zeros(12 * 128, 128, dtype=torch.float8_e4m3fn),
+                    requires_grad=False,
+                ),
+                quant_method=mock.Mock(),
+            ),
+        )
+        self.assertIs(KimiK3DeltaAttention._fused_decode_f_b_weight(attention), merged)
+
+        attention._bfa_f_b_w = None
+        with mock.patch.object(kimi_k3, "print_warning_once") as warn:
+            self.assertIsNone(KimiK3DeltaAttention._fused_decode_f_b_weight(attention))
         warn.assert_called_once()
 
 

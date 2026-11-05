@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import functools
 import logging
+from collections.abc import Callable
+from typing import NamedTuple
 
 import torch
 
@@ -25,65 +28,106 @@ _STATE_SLOT_STRIDES = ((_DIM * _DIM, _DIM, 1),)
 _WARMED: set[tuple[int, float, float, torch.dtype]] = set()
 
 
+class _Kernel(NamedTuple):
+    run: Callable[..., torch.Tensor]
+    supported: Callable[..., bool]
+    state_dtypes: tuple[torch.dtype, ...]
+
+
 def enabled() -> bool:
     return envs.SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND.get().lower() == "aiter"
 
 
-def _ops():
-    """(run, supported, recurrent-state dtypes) of the selected kernel."""
-    try:
-        from sglang.kernels.ops.attention.kda_flydsl.source import load_module
-
-        module = load_module(_SGLANG_MODULE, _AITER_MODULE)
-    except (ImportError, ModuleNotFoundError) as error:
-        print_warning_once(
-            f"Kimi-K3 fused KDA decode unavailable ({error}); "
-            "decode runs the unfused chain"
+def _flydsl_source() -> str:
+    source = envs.SGLANG_USE_HIP_K3_FLYDSL_SOURCE.get().lower()
+    if source not in ("auto", "sglang", "aiter"):
+        raise ValueError(
+            "SGLANG_USE_HIP_K3_FLYDSL_SOURCE must be one of auto, sglang, or aiter"
         )
-        return None, None, ()
-    if module.__name__ == _SGLANG_MODULE:
-        return (
+    return source
+
+
+def _load_kernel(source: str) -> _Kernel:
+    """The ``source`` kernel; ImportError when that source does not ship it."""
+    from sglang.kernels.ops.attention.kda_flydsl.source import load_module
+
+    module = load_module(_SGLANG_MODULE, _AITER_MODULE, source=source)
+    if source == "sglang":
+        return _Kernel(
             module.flydsl_kimi_k3_kda_decode_with_f_b,
             module.is_flydsl_kimi_k3_kda_decode_supported,
             (torch.float32,),
         )
     try:
         op = module.flydsl_kda_decode_with_f_b
-        return op, module.is_flydsl_kda_decode_supported, tuple(op.state_dtypes)
+        supported = module.is_flydsl_kda_decode_supported
     except AttributeError:
+        raise ImportError(
+            f"{module.__name__} lacks flydsl_kda_decode_with_f_b "
+            "(needs ROCm/aiter#6026)"
+        ) from None
+    try:
+        state_dtypes = tuple(op.state_dtypes)
+    except AttributeError:
+        raise ImportError(
+            f"{module.__name__}.flydsl_kda_decode_with_f_b lacks the state_dtypes "
+            "tag (an older ROCm/aiter#6026 revision; update AITER)"
+        ) from None
+    return _Kernel(op, supported, state_dtypes)
+
+
+@functools.cache
+def _bind(source: str, state_dtype: torch.dtype) -> _Kernel | None:
+    """The kernel ``source`` selects for a ``state_dtype`` pool; None if none loads.
+
+    "auto" prefers the vendored kernel, and binds AITER's when only AITER's takes
+    ``state_dtype``; a kernel that does not take it is still returned for the
+    caller to reject.
+    """
+    loaded, errors = [], []
+    for candidate in ("sglang", "aiter") if source == "auto" else (source,):
+        try:
+            kernel = _load_kernel(candidate)
+        except ImportError as error:
+            errors.append(f"{candidate}: {error}")
+            continue
+        if state_dtype in kernel.state_dtypes:
+            return kernel
+        loaded.append(kernel)
+    if not loaded:
         print_warning_once(
-            f"Kimi-K3 fused KDA decode unavailable: {module.__name__} lacks "
-            "flydsl_kda_decode_with_f_b (ROCm/aiter#6026); "
+            f"Kimi-K3 fused KDA decode unavailable ({'; '.join(errors)}); "
             "decode runs the unfused chain"
         )
-        return None, None, ()
+        return None
+    if errors:
+        print_warning_once(
+            f"Kimi-K3 fused KDA decode has no {state_dtype} kernel from "
+            f"{'; '.join(errors)}"
+        )
+    return loaded[0]
 
 
-def _state_dtypes(device: torch.device | None) -> tuple[torch.dtype, ...]:
-    """State dtypes the selected kernel takes on ``device``; empty if unavailable."""
-    if not is_hip() or not enabled() or not torch.cuda.is_available():
-        return ()
-    _, supported, state_dtypes = _ops()
-    if supported is None or not supported(device):
-        return ()
-    return state_dtypes
-
-
-def _op_name() -> str:
-    op, _, _ = _ops()
+def _op_name(state_dtype: torch.dtype) -> str:
+    op = _bind(_flydsl_source(), state_dtype).run
     return f"{op.__module__}.{op.__name__}"
 
 
-def available(device: torch.device | None, state_dtype: torch.dtype) -> bool:
+def available(*, device: torch.device | None, state_dtype: torch.dtype) -> bool:
     """Whether the selected kernel runs on ``device`` over a ``state_dtype`` pool."""
-    state_dtypes = _state_dtypes(device)
-    if state_dtypes and state_dtype not in state_dtypes:
+    if not is_hip() or not enabled() or not torch.cuda.is_available():
+        return False
+    kernel = _bind(_flydsl_source(), state_dtype)
+    if kernel is None or not kernel.supported(device):
+        return False
+    if state_dtype not in kernel.state_dtypes:
         print_warning_once(
-            f"Kimi-K3 fused KDA decode not armed: {_op_name()} takes a "
-            f"{', '.join(map(str, state_dtypes))} recurrent state, the pool holds "
+            f"Kimi-K3 fused KDA decode not armed: {_op_name(state_dtype)} takes a "
+            f"{', '.join(map(str, kernel.state_dtypes))} recurrent state, the pool holds "
             f"{state_dtype}; decode runs the unfused chain"
         )
-    return state_dtype in state_dtypes
+        return False
+    return True
 
 
 def _dense_slots(tensor: torch.Tensor, layouts: tuple[tuple[int, ...], ...]) -> bool:
@@ -103,8 +147,8 @@ def covered(
     output_gate: torch.Tensor,
     norm_weight: torch.Tensor,
 ) -> bool:
-    state_dtypes = _state_dtypes(f_a.device)
-    if not state_dtypes or f_a.ndim != 2:
+    kernel = _bind(_flydsl_source(), state.dtype)
+    if kernel is None or state.dtype not in kernel.state_dtypes or f_a.ndim != 2:
         return False
     batch = f_a.shape[0]
     return (
@@ -127,7 +171,6 @@ def covered(
         and _dense_slots(conv_state, _CONV_SLOT_STRIDES)
         and state.ndim == 4
         and state.shape[1:] == (_HEADS, _DIM, _DIM)
-        and state.dtype in state_dtypes
         and _dense_slots(state, _STATE_SLOT_STRIDES)
         and state_indices.shape == (batch,)
         and state_indices.dtype == torch.int32
@@ -159,10 +202,10 @@ def run(
     norm_eps: float,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    op, _, _ = _ops()
-    if op is None:
+    kernel = _bind(_flydsl_source(), state.dtype)
+    if kernel is None:
         raise RuntimeError("AITER Kimi-K3 fused KDA decode is unavailable")
-    return op(
+    return kernel.run(
         f_a=f_a,
         f_b_weight=f_b_weight,
         x=mixed_qkv,
@@ -193,7 +236,7 @@ def warmup(
     norm_eps: float,
     state_dtype: torch.dtype,
 ) -> None:
-    if state_dtype not in _state_dtypes(f_b_weight.device):
+    if not available(device=f_b_weight.device, state_dtype=state_dtype):
         return
     device_index = -1 if f_b_weight.device.index is None else f_b_weight.device.index
     key = (device_index, float(norm_eps), float(lower_bound), state_dtype)
@@ -223,6 +266,6 @@ def warmup(
     _WARMED.add(key)
     logger.info(
         "Kimi-K3 fused KDA decode armed: %s, %s recurrent state",
-        _op_name(),
+        _op_name(state_dtype),
         state_dtype,
     )

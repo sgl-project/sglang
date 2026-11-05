@@ -34,8 +34,12 @@ def _runs_here() -> bool:
     return hip is not None and hip.gcn_arch == "gfx950"
 
 
-def available(device: torch.device | None, state_dtype: torch.dtype) -> bool:
-    """Whether the kernel runs on ``device`` over a ``state_dtype`` pool."""
+def available(*, device: torch.device | None, state_dtype: torch.dtype) -> bool:
+    """Whether the kernel runs over a ``state_dtype`` pool on the local GPU arch.
+
+    ``device`` is unused (``current_arch()`` answers for the host);
+    it keeps the interface of ``kda_fused_decode_aiter_hip.available``.
+    """
     if not _runs_here():
         return False
     if state_dtype != torch.float32:

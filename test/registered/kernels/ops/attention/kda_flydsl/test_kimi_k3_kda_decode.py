@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import importlib.util
-import os
 from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
@@ -25,6 +24,7 @@ from sglang.kernels.ops.attention.kda_flydsl.kimi_k3_kda_decode import (
     is_flydsl_kimi_k3_kda_decode_supported,
 )
 from sglang.srt.environ import envs
+from sglang.srt.utils.common import temp_set_env
 from sglang.test.ci.ci_register import register_amd_ci
 
 register_amd_ci(est_time=120, suite="stage-b-test-1-gpu-small-amd-mi35x")
@@ -482,9 +482,13 @@ def test_f_b_api_rejects_invalid_projection_inputs() -> None:
 def test_fused_kda_backend_is_opt_in():
     from sglang.kernels.ops.attention import kda_fused_decode_aiter_hip
 
-    with mock.patch.dict(os.environ):
-        envs.SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND.clear()
-        os.environ.pop("SGLANG_ROCM_K3_KDA_FUSED_BACKEND", None)
+    field = envs.SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND
+    # The deprecated name has no descriptor to override.
+    with (
+        field.override(None),
+        temp_set_env(allow_sglang=True, SGLANG_ROCM_K3_KDA_FUSED_BACKEND=None),
+    ):
+        field.clear()
         assert not kda_fused_decode_aiter_hip.enabled()
     with envs.SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND.override("gfx950"):
         assert not kda_fused_decode_aiter_hip.enabled()
@@ -513,14 +517,16 @@ def test_pre_rename_names_still_select(new_name, old_name, old_value, new_value)
     """Launch scripts and the cookbook's pinned image still set the old names;
     each must reach its descriptor, and the new name must win over it."""
     field = getattr(envs, new_name)
-    # patch.dict also drops the copy the alias fallback writes to the new name.
-    with mock.patch.dict(os.environ):
+    # The old name has no descriptor to override; override() on the new one also
+    # drops the copy the alias fallback writes to it.
+    with field.override(None), temp_set_env(allow_sglang=True, **{old_name: old_value}):
         field.clear()
-        os.environ[old_name] = old_value
         with pytest.warns(DeprecationWarning, match=old_name):
             assert field.get() == old_value
-    with mock.patch.dict(os.environ), field.override(new_value):
-        os.environ[old_name] = old_value
+    with (
+        field.override(new_value),
+        temp_set_env(allow_sglang=True, **{old_name: old_value}),
+    ):
         assert field.get() == new_value
 
 
@@ -579,58 +585,89 @@ def _bf16_state(inputs: Inputs) -> None:
     inputs.state = inputs.state.to(torch.bfloat16).contiguous()
 
 
+@pytest.fixture
+def fresh_binding():
+    """Drop cached kernel bindings, so a faked module neither sees nor leaks one."""
+    from sglang.kernels.ops.attention import kda_fused_decode_aiter_hip
+
+    kda_fused_decode_aiter_hip._bind.cache_clear()
+    yield
+    kda_fused_decode_aiter_hip._bind.cache_clear()
+
+
+@_requires_aiter_kda
+def test_aiter_source_binds_the_aiter_kda_decode(select_fused_backend) -> None:
+    """SGLANG_USE_HIP_K3_FLYDSL_SOURCE=aiter must call the kernel ROCm/aiter#6026 publishes."""
+    from aiter.ops.flydsl import linear_attention_kernels as aiter_kernels
+
+    adapter = select_fused_backend("aiter")
+    kernel = adapter._bind("aiter", torch.float32)
+    assert (kernel.run, kernel.supported) == (
+        aiter_kernels.flydsl_kda_decode_with_f_b,
+        aiter_kernels.is_flydsl_kda_decode_supported,
+    )
+
+
+@_requires_aiter_bf16_state
+def test_auto_source_arms_a_bf16_pool_on_the_aiter_kernel(
+    select_fused_backend,
+) -> None:
+    """auto must not stop at the FP32-only vendored kernel when AITER's takes BF16,
+    and must keep the vendored kernel for an FP32 pool."""
+    from aiter.ops.flydsl.linear_attention_kernels import flydsl_kda_decode_with_f_b
+
+    adapter = select_fused_backend("auto")
+    assert adapter.available(device=_DEVICE, state_dtype=torch.bfloat16)
+    assert adapter._bind("auto", torch.bfloat16).run is flydsl_kda_decode_with_f_b
+    assert (
+        adapter._bind("auto", torch.float32).run is flydsl_kimi_k3_kda_decode_with_f_b
+    )
+
+
 @pytest.mark.parametrize(
-    "source,names",
+    "aiter_module, reason",
     [
-        pytest.param(
-            "aiter",
-            ("flydsl_kda_decode_with_f_b", "is_flydsl_kda_decode_supported"),
-            marks=_requires_aiter_kda,
-        ),
+        # AITER builds before ROCm/aiter#6026 ship the module with only GDR ops.
+        (lambda name: SimpleNamespace(__name__=name), "ROCm/aiter#6026"),
+        # Earlier ROCm/aiter#6026 revisions do not tag the state dtypes they take.
         (
-            "sglang",
-            (
-                "flydsl_kimi_k3_kda_decode_with_f_b",
-                "is_flydsl_kimi_k3_kda_decode_supported",
+            lambda name: SimpleNamespace(
+                __name__=name,
+                flydsl_kda_decode_with_f_b=lambda **_: None,
+                is_flydsl_kda_decode_supported=lambda device=None: True,
             ),
+            "state_dtypes",
         ),
     ],
+    ids=["no-kda-decode", "no-state-dtypes"],
 )
-def test_source_binds_its_kda_decode(select_fused_backend, source, names) -> None:
-    """SGLANG_USE_HIP_K3_FLYDSL_SOURCE=aiter must call the kernel ROCm/aiter#6026 publishes."""
-    import importlib
-
-    adapter = select_fused_backend(source)
-    module = importlib.import_module(
-        adapter._AITER_MODULE if source == "aiter" else adapter._SGLANG_MODULE
-    )
-    run, supported, _ = adapter._ops()
-    assert (run, supported) == tuple(getattr(module, name) for name in names)
-
-
 def test_aiter_module_without_kda_decode_fails_closed(
-    monkeypatch, select_fused_backend
+    monkeypatch, select_fused_backend, fresh_binding, aiter_module, reason
 ) -> None:
-    """AITER builds before ROCm/aiter#6026 ship the module with only GDR ops."""
+    """An AITER without the current ROCm/aiter#6026 decode must leave decode
+    unfused and say which part is missing."""
     from sglang.kernels.ops.attention.kda_flydsl import source
 
     adapter = select_fused_backend("aiter")
     monkeypatch.setattr(
         source,
         "load_module",
-        lambda local, aiter: SimpleNamespace(__name__=aiter),
+        lambda local, aiter, *, source: aiter_module(aiter),
     )
     warn = mock.Mock()
     monkeypatch.setattr(adapter, "print_warning_once", warn)
-    assert adapter._ops() == (None, None, ())
-    assert "ROCm/aiter#6026" in warn.call_args.args[0]
-    assert not adapter.available(_DEVICE, state_dtype=torch.float32)
+    assert adapter._bind("aiter", torch.float32) is None
+    assert reason in warn.call_args.args[0]
+    assert not adapter.available(device=_DEVICE, state_dtype=torch.float32)
 
 
 @_requires_aiter_bf16_state
+@pytest.mark.parametrize("source", ["aiter", "auto"])
 @pytest.mark.parametrize("batch", [1, 2, 8])
-def test_aiter_bf16_state_matches_reference(select_fused_backend, batch: int) -> None:
-    adapter = select_fused_backend("aiter")
+def test_aiter_bf16_state_matches_reference(
+    select_fused_backend, source: str, batch: int
+) -> None:
+    adapter = select_fused_backend(source)
     f_a, f_b_weight, seed = _make_fb_inputs(batch)
     _bf16_state(seed)
     reference_inputs = _copy_inputs(seed)
@@ -693,9 +730,9 @@ def test_sglang_source_is_not_armed_for_a_bf16_pool(
     warn = mock.Mock()
     monkeypatch.setattr(adapter, "print_warning_once", warn)
 
-    assert adapter.available(_DEVICE, state_dtype=torch.float32)
+    assert adapter.available(device=_DEVICE, state_dtype=torch.float32)
     warn.assert_not_called()
-    assert not adapter.available(_DEVICE, state_dtype=torch.bfloat16)
+    assert not adapter.available(device=_DEVICE, state_dtype=torch.bfloat16)
     assert "torch.bfloat16" in warn.call_args.args[0]
 
 
@@ -749,4 +786,4 @@ def test_vendored_and_aiter_kda_decode_agree(select_fused_backend, batch: int) -
 if __name__ == "__main__":
     import sys
 
-    sys.exit(pytest.main([__file__]))
+    sys.exit(pytest.main([__file__, "-v"]))
