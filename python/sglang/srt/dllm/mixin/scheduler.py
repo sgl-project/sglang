@@ -6,15 +6,13 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Set, Union
 
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.req import DllmReqPhase
-from sglang.srt.managers.req_types import FINISH_ABORT, FINISH_LENGTH
+from sglang.srt.managers.req_types import FINISH_LENGTH
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
     ListKind,
-    _RequestList,
 )
-from sglang.srt.managers.utils import make_abort_req
-from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.runtime_context import get_exec, get_schedule
@@ -36,17 +34,11 @@ class SchedulerDllmMixin:
         )
         self.dllm_manager = DllmManager(
             dllm_config=self.dllm_config,
-            release_aborted=self._release_aborted_dllm_req,
+            abort=self._abort_dllm_req,
         )
 
-    def _release_aborted_dllm_req(self: Scheduler, req: Req) -> None:
-        # Finished in place, so a later abort in the same intake skips it.
-        if req.finished_reason is None:
-            req.finish_outside_step(FINISH_ABORT())
-        self.release_aborted_request(req)
-        self.send_abort_output(make_abort_req(req), req)
-        if req.kv.holds_kv or req.kv.holds_mamba:
-            release_kv_cache(req, self.tree_cache, checkpoint=False)
+    def _abort_dllm_req(self: Scheduler, req: Req) -> None:
+        self.request_retirer.abort(req)
         logger.debug(f"Abort dLLM queued request. {req.rid=}")
 
     def validate_dllm_request(self: Scheduler, req: Req) -> Optional[str]:
@@ -66,7 +58,7 @@ class SchedulerDllmMixin:
             return None
 
         running_bs = len(running_batch.reqs)
-        self.policy.calc_priority(self.waiting_queue)
+        self.waiting_queue.replace(self.policy.calc_priority(self.waiting_queue))
 
         # Create prefill adder with resource constraints
         adder = self._create_dllm_prefill_adder(running_bs, running_batch=running_batch)
@@ -197,9 +189,8 @@ class SchedulerDllmMixin:
             req.finish_outside_step(FINISH_LENGTH(length=len(req.output_ids)))
 
         if req.finished():
-            release_kv_cache(
+            self.request_retirer.release(
                 req,
-                self.tree_cache,
                 checkpoint=not self.dllm_config.requires_separate_context_encoding,
             )
             req.time_stats.set_completion_time()
@@ -249,7 +240,7 @@ class SchedulerDllmMixin:
         if num_requests_to_add > 0:
             requests_to_add = self.waiting_queue[:num_requests_to_add]
             self.dllm_manager.add_waiting_reqs(requests_to_add)
-            self.waiting_queue = self.waiting_queue[num_requests_to_add:]
+            self.waiting_queue.replace(self.waiting_queue[num_requests_to_add:])
 
     def _should_skip_prefill(self: Scheduler, running_batch: ScheduleBatch) -> bool:
         """Check if DLLM prefill should be skipped."""
@@ -447,16 +438,16 @@ class DllmManager:
     def __init__(
         self,
         dllm_config: Optional[DllmConfig],
-        release_aborted: Callable[[Req], None],
+        abort: Callable[[Req], None],
     ):
         self.dllm_config = dllm_config
         self.max_running_reqs = (
             dllm_config.max_running_requests if dllm_config is not None else 1
         )
-        self.waiting_queue = _RequestList(ListKind.DLLM, abort=self._abort)
+        self.waiting_queue = IndexedReqList(ListKind.DLLM, abort=self._abort)
         # A subset of the waiting queue.
         self.staging_queue: List[Req] = []
-        self._release_aborted = release_aborted
+        self._abort_one = abort
 
     def get_prefill_requests(self) -> List[Req]:
         """Get all prefill requests from waiting queue."""
@@ -500,7 +491,7 @@ class DllmManager:
 
     def filter_finished_reqs(self) -> None:
         """Remove finished requests from both queues."""
-        self.waiting_queue.leave_finished()
+        self.waiting_queue.take(lambda req: req.finished())
         self.staging_queue = [req for req in self.staging_queue if not req.finished()]
 
     def _abort(self, recv_req: AbortReq) -> None:
@@ -508,7 +499,7 @@ class DllmManager:
         aborted = set(aborted_reqs)
         self.staging_queue = [req for req in self.staging_queue if req not in aborted]
         for req in aborted_reqs:
-            self._release_aborted(req)
+            self._abort_one(req)
 
     def init_next_round(self) -> None:
         """Initialize staging requests for next round and clear staging queue."""

@@ -33,13 +33,15 @@ from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
     ListKind,
-    _RequestList,
 )
+from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import release_only_retirer
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
@@ -69,10 +71,13 @@ def _make_scheduler():
     the retirement are only ever tested apart, and a step missing from the
     retirement passes every door test.
     """
+    beam_coordinator = MagicMock()
     sched = SimpleNamespace(
         output_streamer=MagicMock(),
-        beam_coordinator=MagicMock(),
-        release_aborted_request=MagicMock(),
+        beam_coordinator=beam_coordinator,
+        request_retirer=release_only_retirer(
+            MagicMock(), beam_coordinator=beam_coordinator
+        ),
     )
     sched.retire_unadmitted_request = MagicMock(
         side_effect=lambda req: Scheduler.retire_unadmitted_request(sched, req)
@@ -83,7 +88,7 @@ def _make_scheduler():
 def _prefill_queue(sched):
     q = SimpleNamespace(
         scheduler=sched,
-        queue=_RequestList(ListKind.PD_BOOTSTRAP),
+        queue=IndexedReqList(ListKind.PD_BOOTSTRAP),
         create_sender=MagicMock(return_value=True),
     )
     return q
@@ -93,7 +98,7 @@ def _decode_queue(sched):
     q = SimpleNamespace(
         scheduler=sched,
         token_to_kv_pool_allocator=MagicMock(),
-        retracted_queue=_RequestList(ListKind.PD_RETRACTED),
+        retracted_queue=IndexedReqList(ListKind.PD_RETRACTED),
         pending_reqs=[],
         _check_if_req_exceed_kv_capacity=MagicMock(return_value=False),
         _create_receiver_and_enqueue=MagicMock(
@@ -289,14 +294,14 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
         sched = SimpleNamespace(
             uocr_runtime=None,
             disaggregation_mode=DisaggregationMode.NULL,
-            waiting_queue=[],
+            waiting_queue=IndexedReqList(ListKind.WAITING),
             processed_tokens_counter=0,
             _set_or_validate_priority=MagicMock(return_value=True),
             _abort_on_queued_limit=MagicMock(return_value=False),
             _prefetch_kvcache=MagicMock(),
         )
         Scheduler._add_request_to_queue(sched, req)
-        self.assertEqual(sched.waiting_queue, [req])
+        self.assertEqual(list(sched.waiting_queue), [req])
         self.assertIsInstance(req.to_finish, FINISH_ABORT)
 
     def test_retire_detaches_a_streaming_session(self):
@@ -316,7 +321,9 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
 
         # PREFILL arms the cache's paced-retry set via `_prefetch_kvcache`
         # before the door, and only this call clears it again.
-        sched.release_aborted_request.assert_called_once_with(req)
+        sched.request_retirer.tree_cache.finish.assert_called_once_with(
+            req.cache_request_handle, CacheRequestOutcome.ABORT
+        )
         session.abort_req.assert_called_once()
         self.assertIsNone(req.session)
         sched.beam_coordinator.retire_group.assert_called_once_with(req)

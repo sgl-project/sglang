@@ -1994,6 +1994,17 @@ def _fused_gate_emits_packed_ids(
     )
 
 
+def _padded_row_mask(
+    x: torch.Tensor, num_token_non_padded: torch.Tensor
+) -> torch.Tensor:
+    rows = torch.arange(
+        x.shape[0],
+        dtype=num_token_non_padded.dtype,
+        device=x.device,
+    )
+    return rows >= num_token_non_padded
+
+
 def _mask_topk_ids_padded_region(
     topk_ids: torch.Tensor,
     num_token_non_padded: Optional[torch.Tensor] = None,
@@ -2004,8 +2015,9 @@ def _mask_topk_ids_padded_region(
     if not topk_ids.is_cuda:
         if _is_npu:
             return
-        rows = torch.arange(topk_ids.shape[0], device=topk_ids.device)
-        topk_ids.masked_fill_((rows >= num_token_non_padded)[:, None], fill_value)
+        topk_ids.masked_fill_(
+            _padded_row_mask(topk_ids, num_token_non_padded)[:, None], fill_value
+        )
         return
     # TODO: let the kernel support other dtypes
     if _is_cuda and topk_ids.dtype == torch.int32 and fill_value == -1:
@@ -2015,8 +2027,7 @@ def _mask_topk_ids_padded_region(
     elif _can_fuse_padded_region(topk_ids):
         _fill_padded_rows(topk_ids, num_token_non_padded, fill_value)
     else:
-        indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)
-        topk_ids[indices >= num_token_non_padded, :] = fill_value
+        topk_ids[_padded_row_mask(topk_ids, num_token_non_padded), :] = fill_value
 
 
 def _zero_topk_weights_padded_region(
@@ -2026,14 +2037,14 @@ def _zero_topk_weights_padded_region(
     if num_token_non_padded is None:
         return
     if not topk_weights.is_cuda:
-        rows = torch.arange(topk_weights.shape[0], device=topk_weights.device)
-        topk_weights.masked_fill_((rows >= num_token_non_padded)[:, None], 0.0)
+        topk_weights.masked_fill_(
+            _padded_row_mask(topk_weights, num_token_non_padded)[:, None], 0.0
+        )
         return
     if _can_fuse_padded_region(topk_weights):
         _fill_padded_rows(topk_weights, num_token_non_padded, 0.0)
         return
-    indices = torch.arange(0, topk_weights.shape[0], device=topk_weights.device)
-    topk_weights[indices >= num_token_non_padded, :] = 0.0
+    topk_weights[_padded_row_mask(topk_weights, num_token_non_padded), :] = 0.0
 
 
 @torch.compile(dynamic=True, backend=get_compiler_backend())
@@ -2192,6 +2203,31 @@ def biased_grouped_topk_gpu(
             )
 
         return topk_weights, topk_ids
+
+    elif (
+        _is_cuda
+        and not dynamic_bias
+        and num_experts == 512
+        and num_expert_group == 8
+        and topk_group == 4
+        and 1 <= topk_routed <= 8
+        and 0 <= num_fused_shared_experts <= 1
+    ):
+        from sglang.kernels.ops.moe.bailing_moe_topk import (
+            bailing_moe_biased_grouped_topk,
+        )
+
+        return bailing_moe_biased_grouped_topk(
+            gating_output.to(dtype=torch.float32),
+            correction_bias.to(dtype=torch.float32),
+            num_expert_group,
+            topk_group,
+            topk,
+            renormalize,
+            num_fused_shared_experts,
+            routed_scaling_factor if routed_scaling_factor is not None else 1.0,
+            bool(apply_routed_scaling_factor_on_output),
+        )
 
     elif _is_cuda and num_expert_group > 1 and not dynamic_bias:
         # CUDA grouped fallback (flashinfer unavailable / constraints unmet): the
@@ -2908,9 +2944,8 @@ def _post_process_topk_ids(
     if _is_npu:
         _zero_topk_weights_padded_region(topk_weights, num_token_non_padded)
         if recorder_topk_ids is not None and num_token_non_padded is not None:
-            rows = torch.arange(topk_ids.shape[0], device=topk_ids.device)
             recorder_topk_ids = recorder_topk_ids.masked_fill(
-                (rows >= num_token_non_padded)[:, None], -1
+                _padded_row_mask(topk_ids, num_token_non_padded)[:, None], -1
             )
 
     if _is_hip and not _skip_hip_pad_mask and not _fold_pad_weights_into_append:
