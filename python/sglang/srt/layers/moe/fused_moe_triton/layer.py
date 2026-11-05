@@ -411,6 +411,7 @@ class FusedMoE(torch.nn.Module):
         enable_qwen35_fp8_deferred_finalize: bool = False,
         quant_method: Optional[FusedMoEMethodBase] = None,
         uses_expert_location: bool = True,
+        allow_fp8_blockwise_tail: bool = False,
         activation_type: Optional[str] = None,
         activation_impl: Optional[str] = None,
     ):
@@ -432,6 +433,7 @@ class FusedMoE(torch.nn.Module):
         self.num_experts = num_experts
         self.with_bias = with_bias
         self.num_fused_shared_experts = num_fused_shared_experts
+        self.allow_fp8_blockwise_tail = allow_fp8_blockwise_tail
 
         self.enable_flashinfer_cutlass_moe = (
             get_moe_runner_backend().is_flashinfer_cutlass()

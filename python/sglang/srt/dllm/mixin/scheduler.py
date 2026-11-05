@@ -13,7 +13,6 @@ from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     ListKind,
 )
-from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.runtime_context import get_exec, get_schedule
@@ -190,9 +189,8 @@ class SchedulerDllmMixin:
             req.finish_outside_step(FINISH_LENGTH(length=len(req.output_ids)))
 
         if req.finished():
-            release_kv_cache(
+            self.request_retirer.release_finished(
                 req,
-                self.tree_cache,
                 checkpoint=not self.dllm_config.requires_separate_context_encoding,
             )
             req.time_stats.set_completion_time()

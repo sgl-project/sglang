@@ -427,9 +427,9 @@ class Envs:
     SGLANG_TEST_RETRACT = EnvBool(False)
     SGLANG_TEST_RETRACT_INTERVAL = EnvInt(3)
     SGLANG_TEST_RETRACT_NO_PREFILL_BS = EnvInt(2**31)
-    # Scheduler: force lazy extra_buffer prealloc to fail at decode boundaries
-    SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL = EnvBool(False)
-    # KL tests: skip the cache-hit count assertion (e.g. when alloc failure reduces hits)
+    # Scheduler: report the mamba state pool full to lazy tracking-slot alloc, so each boundary evicts first
+    SGLANG_TEST_MAMBA_LAZY_POOL_FULL = EnvBool(False)
+    # KL tests: skip the cache-hit count assertion (e.g. when eviction reduces hits)
     SGLANG_TEST_SKIP_CACHE_HIT_ASSERT = EnvBool(False)
     # HiCache: GPU sleep cycles before each layer's host-to-device load, so a forward
     # that skips the per-layer load wait reads unloaded layers
@@ -1192,7 +1192,7 @@ class Envs:
     # ===================================================================
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     # Requantize plain block-FP8 (fp32-scale) checkpoints to MXFP8 at load
-    # time for arch35 (Atlas A5) Linear and MoE MXFP8 GEMMs. Disabled keeps
+    # time for arch35 (Ascend 950) Linear and MoE MXFP8 GEMMs. Disabled keeps
     # supported 128x128 FP32-scale checkpoints on native block-FP8 GEMMs.
     # Requantization is lossy (128x128 FP32 scales -> 1x32 UE8M0): enable
     # explicitly for performance after validating workload accuracy.
@@ -1258,6 +1258,8 @@ class Envs:
     SGLANG_MOE_NVFP4_DISPATCH = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE = EnvBool(False)
+    # Kill switch for fusing dense-MLP SiLU*mul with the NVFP4 down_proj input quant.
+    SGLANG_DISABLE_SILU_FP4_QUANT_FUSION = EnvBool(False)
     # GLM NextN (MTP): cast the draft layer's bf16 fused MoE to per-channel FP8
     # on load. Unrelated to the NVFP4 block-FP8 NextN path above.
     SGLANG_GLM_NEXTN_MOE_PTPC = EnvBool(False)
@@ -1460,6 +1462,8 @@ class Envs:
     SGLANG_USE_DEEPGEMM_BMM = EnvBool(False)
     SGLANG_DEEPGEMM_SANITY_CHECK = EnvBool(False)
     SGLANG_DEEPGEMM_PDL = EnvBool(True)
+    SGLANG_ENABLE_FP8_BLOCK_GEMV = EnvBool(False)
+    SGLANG_ENABLE_FUSED_KDA_OUTPUT_QUANT = EnvBool(False)
     SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP = EnvBool(False)
 
     # ===================================================================
@@ -2055,9 +2059,9 @@ class Envs:
 
     # cache, GEMM, and distributed
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
-    # ROCm gfx950: fuse inverse-RoPE into the wo_a mxfp8 quant (aiter
-    # inverse_rope_group_quant) instead of a separate fused_rope_inplace + Triton
-    # quant. Off by default; requires SGLANG_OPT_FP8_WO_A_GEMM and the aiter op.
+    # Fuse inverse RoPE into wo_a activation quantization: CUDA UE8M0 JIT
+    # or ROCm gfx950 aiter inverse_rope_group_quant. Off by default;
+    # requires the corresponding FP8 wo_a path.
     SGLANG_OPT_FP8_WO_A_FUSED_INVROPE = EnvBool(False)
     # SM100/SM103: collapse the bf16 wo_a verify chain (fused_rope_inplace,
     # _wo_a_partial, _wo_a_reduce_quant) into one cluster-launched megakernel.
@@ -2335,6 +2339,9 @@ class Envs:
     # ===================================================================
     SGLANG_PLATFORM = EnvStr("")
     SGLANG_PLUGINS = EnvStr("")
+    # Read by the NVIDIA megakernel plugin, not by SGLang: a comma-separated
+    # slot list that replaces the plugin's default. Empty runs the stock paths.
+    SGLANG_NVIDIA_MEGAKERNEL_SLOTS = EnvTuple(())
 
     # ===================================================================
     # KV-Canary and Token-Oracle (testing only)

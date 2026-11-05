@@ -48,6 +48,7 @@ class TestKimiK3Humming(CustomTestCase):
         torch.nn.Module.__init__(model)
         model.config = SimpleNamespace(
             linear_attn_config={},
+            dsa_config=None,
             is_moe=True,
             num_experts=1,
             num_hidden_layers=1,
