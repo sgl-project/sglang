@@ -410,6 +410,7 @@ class TestMambaAllocatorCpuCopyIsPhysical(unittest.TestCase):
         return allocator, owner
 
     def test_pool_is_handed_physical_token_ids(self):
+        self.enterContext(get_parallel().override(attn_dcp_size=1, attn_dcp_rank=0))
         alloc, kvcache = self._build()
         virtual = alloc.alloc(4)
         self.assertIsNotNone(virtual)
@@ -419,11 +420,13 @@ class TestMambaAllocatorCpuCopyIsPhysical(unittest.TestCase):
         # through would read and restore other tokens' rows.
         self.assertFalse(torch.equal(physical, virtual))
 
-        alloc.get_cpu_copy(virtual, req_pool_index=0)
-        self.assertTrue(torch.equal(kvcache.seen, physical))
-
-        alloc.load_cpu_copy((None, None), virtual, req_pool_index=0)
-        self.assertTrue(torch.equal(kvcache.seen, physical))
+        entries = alloc.arena.entries("full")
+        entries[physical] = 31
+        saved = alloc.get_cpu_copy(virtual, req_pool_index=0)
+        entries[physical] = 0
+        alloc.load_cpu_copy(saved, virtual, req_pool_index=0)
+        self.assertTrue(torch.all(entries[physical] == 31))
+        self.assertTrue(torch.equal(saved.bands["full"].entries, entries[physical]))
 
 
 if __name__ == "__main__":
