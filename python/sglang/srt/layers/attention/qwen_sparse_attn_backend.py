@@ -452,7 +452,12 @@ class QwenSparseAttnBackend(AttentionBackend):
                 f"capacity={num_tokens}, actual={actual_rows}"
             )
         repeats = extend_lengths.to(device=req_pool_indices.device, dtype=torch.long)
-        row_req_pool_indices = torch.repeat_interleave(req_pool_indices[:bs], repeats)
+        # output_size avoids a device-to-host read of sum(repeats): repeats lives on
+        # the device, and actual_rows is that sum already known on the host, since
+        # row_lengths is the concatenation of one run per extend_lengths entry.
+        row_req_pool_indices = torch.repeat_interleave(
+            req_pool_indices[:bs], repeats, output_size=actual_rows
+        )
         # A draft-extend replay may hold fewer accepted rows than the captured shape;
         # the runner packs real rows first, so give the tail inert metadata.
         padding = num_tokens - actual_rows
