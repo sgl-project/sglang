@@ -1426,6 +1426,8 @@ class UnifiedRadixCache(BasePrefixCache):
             super().free_kv_row(kv, ranges)
 
     def claim_kv_row(self, req: Req) -> bool:
+        if self.linker is not None and req.finished():
+            self.linker.release_request(req.rid)
         # Retraction also enters here: retain its ticket until actual finish.
         if (
             self.cache_controller is not None
