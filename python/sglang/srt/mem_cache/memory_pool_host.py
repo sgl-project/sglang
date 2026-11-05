@@ -86,6 +86,8 @@ from sglang.srt.mem_cache.pool_host.common import (
 )
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
 from sglang.srt.mem_cache.pool_host.npu_memfabric import (
+    acl_host_memory_enabled,
+    alloc_with_acl,
     alloc_with_memfabric,
     memfabric_host_memory_enabled,
 )
@@ -293,11 +295,11 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
                 "layer_first_kv_split",
                 "page_first_kv_split",
             )
-            and not memfabric_host_memory_enabled()
+            and not (memfabric_host_memory_enabled() or acl_host_memory_enabled())
         ):
             raise ValueError(
                 "DeepSeek V4 split layout requires "
-                "SGLANG_HICACHE_HOST_MEM_BACKEND=memfabric"
+                "SGLANG_HICACHE_HOST_MEM_BACKEND=memfabric or acl"
             )
         self.size_per_token = item_bytes
         self.start_layer = 0
@@ -324,13 +326,16 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
             if isinstance(self.gpu_device, torch.device)
             else str(self.gpu_device)
         )
-        use_memfabric = (
+        use_registered_host_memory = (
             _alloc_key == "npu"
             and self.layout in ("layer_first_kv_split", "page_first_kv_split")
-            and memfabric_host_memory_enabled()
         )
         alloc_func = (
-            alloc_with_memfabric if use_memfabric else ALLOC_MEMORY_FUNCS[_alloc_key]
+            alloc_with_memfabric
+            if use_registered_host_memory and memfabric_host_memory_enabled()
+            else alloc_with_acl
+            if use_registered_host_memory and acl_host_memory_enabled()
+            else ALLOC_MEMORY_FUNCS[_alloc_key]
         )
         self.data_refs = []
         if self.layout == "layer_first_kv_split":
@@ -893,10 +898,9 @@ class DeepSeekV4StateHostPool(HostKVCache):
             if isinstance(self.gpu_device, torch.device)
             else str(self.gpu_device)
         )
-        use_memfabric = (
+        use_registered_host_memory = (
             _state_alloc_key == "npu"
             and self.layout in ("layer_first_kv_split", "page_first_kv_split")
-            and memfabric_host_memory_enabled()
         )
         if (
             self.layout
@@ -904,12 +908,14 @@ class DeepSeekV4StateHostPool(HostKVCache):
                 "layer_first_kv_split",
                 "page_first_kv_split",
             )
-            and not use_memfabric
+            and not (memfabric_host_memory_enabled() or acl_host_memory_enabled())
         ):
-            raise ValueError("DeepSeek V4 state split layout requires NPU Memfabric")
+            raise ValueError("DeepSeek V4 state split layout requires NPU Memfabric or ACL")
         alloc_func = (
             alloc_with_memfabric
-            if use_memfabric
+            if use_registered_host_memory and memfabric_host_memory_enabled()
+            else alloc_with_acl
+            if use_registered_host_memory and acl_host_memory_enabled()
             else ALLOC_MEMORY_FUNCS[_state_alloc_key]
         )
         self.data_refs = []

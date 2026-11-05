@@ -34,6 +34,8 @@ from sglang.srt.mem_cache.pool_host.mha import (
 )
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.npu_memfabric import (
+    acl_host_memory_enabled,
+    ensure_acl_capacity,
     ensure_memfabric_capacity,
     memfabric_host_memory_enabled,
 )
@@ -940,7 +942,7 @@ def _build_dsv4_rope_entry(
     )
 
 
-def _reserve_dsv4_paged_memfabric(
+def _reserve_dsv4_paged_host_memory(
     *,
     kvcache: Any,
     page_size: int,
@@ -957,14 +959,15 @@ def _reserve_dsv4_paged_memfabric(
         is_npu()
         and get_memory().hicache_mem_layout
         in ("layer_first_kv_split", "page_first_kv_split")
-        and memfabric_host_memory_enabled()
+        and (memfabric_host_memory_enabled() or acl_host_memory_enabled())
     ):
         return
 
     import torch
 
-    # Memfabric fixes its reservation at the first allocation. Include every
-    # DSV4 paged sidecar before constructing the SWA host pool.
+    # Declare every DSV4 paged host block before constructing the SWA pool.
+    # MemFabric fixes its reservation at the first allocation; ACL tracks
+    # registration on each allocation.
     paged_blocks = []
 
     def add_paged(buffers, item_bytes, pages):
@@ -1005,7 +1008,10 @@ def _reserve_dsv4_paged_memfabric(
         if sibling is not None:
             add_paged(sibling[1], sibling[2], c128_num_host_pages)
     if paged_blocks:
-        ensure_memfabric_capacity(paged_blocks, torch.npu.current_device())
+        if memfabric_host_memory_enabled():
+            ensure_memfabric_capacity(paged_blocks, torch.npu.current_device())
+        elif acl_host_memory_enabled():
+            ensure_acl_capacity(paged_blocks, torch.npu.current_device())
 
 
 def build_deepseek_v4_hicache_stack(
@@ -1076,7 +1082,7 @@ def build_deepseek_v4_hicache_stack(
         swa_page_size=kvcache.swa_page_size,
     )
 
-    _reserve_dsv4_paged_memfabric(
+    _reserve_dsv4_paged_host_memory(
         kvcache=kvcache,
         page_size=page_size,
         num_host_pages=num_host_pages,
