@@ -1121,9 +1121,10 @@ class CosmosDreamsPrepareStage(PipelineStage):
             return None
         if self.profile is None or self.profile.history_mode != HISTORY_MODE_FULL:
             raise ValueError(
-                "Cosmos-Dreams frustum_geometry needs history_mode='full' without "
-                "kv_cache_inference_size/attention_sink_size: retrieval reads the "
-                "complete committed archive."
+                "Cosmos-Dreams frustum_geometry reads the complete committed archive: "
+                "set history_mode='full' in the pipeline config (the default 'auto' "
+                "slides when the export records a K/V window) and leave "
+                "kv_cache_inference_size/attention_sink_size unset."
             )
         if not has_image:
             raise ValueError(

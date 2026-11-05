@@ -21,6 +21,21 @@ pub(crate) struct ModelInfo {
     pub(crate) reasoning_parser: Option<String>,
     pub(crate) tool_call_parser: Option<String>,
     pub(crate) disaggregation_mode: DisaggregationMode,
+    /// Python's launch-time `/model_info` fields, which the HTTP response
+    /// carries after the fields above.
+    #[serde(skip)]
+    pub(crate) launch_fields: Arc<serde_json::Map<String, serde_json::Value>>,
+}
+
+impl ModelInfo {
+    /// The HTTP body: every field of this struct, then the launch-time fields.
+    pub(crate) fn to_json(&self) -> serde_json::Result<serde_json::Value> {
+        let mut body = serde_json::to_value(self)?;
+        if let serde_json::Value::Object(fields) = &mut body {
+            fields.extend((*self.launch_fields).clone());
+        }
+        Ok(body)
+    }
 }
 
 /// Public server metadata plus scheduler-owned runtime metrics.
@@ -47,6 +62,18 @@ pub(crate) struct ServerInfo {
     pub(crate) incremental_streaming_output: bool,
     pub(crate) disaggregation_mode: DisaggregationMode,
     pub(crate) deployment_info: DeploymentInfo,
+    /// Under DP, every rank's listener by rank, published by the listener of
+    /// DP rank 0 so a client can address each rank's listener directly;
+    /// empty, and left out of the JSON, on the other listeners.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) dp_listeners: Vec<DpListener>,
+}
+
+/// One DP rank's listener, as `/server_info`'s `dp_listeners` lists it.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub(crate) struct DpListener {
+    pub(crate) dp_rank: u32,
+    pub(crate) url: String,
 }
 
 impl ServerInfo {

@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
@@ -7,6 +8,7 @@ from sglang.srt.disaggregation.base.conn import KVArgs
 from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.utils import setup_state_kv_args
 from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
+from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=9, suite="base-a-test-cpu")
@@ -30,6 +32,14 @@ def _make_k_only_pool(start_layer: int = 0) -> MiniMaxSparseKVPool:
         device="cpu",
         start_layer=start_layer,
         end_layer=end_layer,
+    )
+
+
+def _static_storage(pool, draft=None, total_kv_layers=None) -> StaticKVStorage:
+    """The storage a static pool registers with PD peers through."""
+    allocator = SimpleNamespace(storage=None, state=None, get_kvcache=lambda: pool)
+    return StaticKVStorage(
+        None, allocator, draft_token_to_kv_pool=draft, num_hidden_layers=total_kv_layers
     )
 
 
@@ -60,14 +70,14 @@ class TestMiniMaxSparseDisaggStateKvArgs(unittest.TestCase):
         self.assertIsNotNone(pool.index_kv_pool)
         kv_args = KVArgs()
         with self.assertRaises(NotImplementedError):
-            setup_state_kv_args(kv_args, pool)
+            setup_state_kv_args(kv_args, _static_storage(pool))
 
     def test_decode_rejects_prefill_with_different_attention_tp(self):
         # Main page rows are head-major and the index state is per rank, so
         # neither can be resliced by head; reject before any transfer.
         kv_args = KVArgs()
         kv_args.page_size = 4
-        setup_state_kv_args(kv_args, _make_k_only_pool())
+        setup_state_kv_args(kv_args, _static_storage(_make_k_only_pool()))
         manager = object.__new__(CommonKVManager)
         manager.kv_args = kv_args
         manager.attn_tp_size = 4

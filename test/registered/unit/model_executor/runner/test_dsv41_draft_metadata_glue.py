@@ -50,6 +50,7 @@ class TestHostFreeDraftPrep(CustomTestCase):
     def test_every_other_setup_says_why(self):
         cases = {
             "not the DSpark draft runner": dict(is_dspark_draft=False),
+            "host sequence lengths": dict(needs_cpu_seq_lens=True),
             "trtllm-gen attention": dict(trtllm_attn=True),
             "online c128 MTP": dict(
                 online_c128_mtp=SimpleNamespace(enabled=lambda: True)
@@ -103,7 +104,7 @@ class TestDraftExtendLengths(CustomTestCase):
 
 class TestGlueCaptureFailure(CustomTestCase):
     def _run_through_capture(self, glue):
-        backend = mock.Mock(attn_backend_list=None)
+        backend = mock.Mock(attn_backend_list=None, requires_eager_metadata=False)
         with (
             mock.patch("torch.cuda.Stream"),
             mock.patch("torch.cuda.CUDAGraph"),
@@ -133,15 +134,17 @@ class TestRunnerGluesTheDraft(CustomTestCase):
         step_own = torch.arange(100, 106)
         view = SimpleNamespace(out_cache_loc=step_own)
         runner._draft_metadata_glue = False
-        runner._glue_draft_inputs(view)
+        runner._glue_draft_inputs(view, 6)
         self.assertIs(view.out_cache_loc, step_own)
         runner._draft_metadata_glue = True
-        runner._glue_draft_inputs(view)
+        runner._glue_draft_inputs(view, 6)
         slot = view.out_cache_loc
         self.assertEqual(slot.data_ptr(), runner.buffers.out_cache_loc.data_ptr())
         self.assertEqual(slot.shape, step_own.shape)
+        runner._glue_draft_inputs(view, 8)
+        self.assertEqual(view.out_cache_loc.shape, (8,))
         idle = SimpleNamespace(out_cache_loc=None)
-        runner._glue_draft_inputs(idle)
+        runner._glue_draft_inputs(idle, 0)
         self.assertIsNone(idle.out_cache_loc)
 
 

@@ -1,9 +1,8 @@
 """SGLANG_OPT_DSV41_DSPARK_SIM_DRAW_AHEAD: the simulated acceptance draw and the sim
-bonus seed move before the draft launch. They read only the host RNG, the batch size
-and the request temperatures, so on fixed seeds the ahead order writes exactly what
+bonus seed move before the draft launch. They read only the server-seeded generator,
+the batch size and the request temperatures, so the ahead order writes exactly what
 the after-draft order wrote; with real acceptance the switch is inert."""
 
-import random
 import sys
 from types import SimpleNamespace
 
@@ -16,6 +15,7 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
     DsparkVerifyEpilogue,
     TargetVerifyExecutor,
 )
+from sglang.srt.speculative.spec_utils import simulated_acc_len_generator
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
@@ -37,6 +37,8 @@ def _worker():
     executor.gamma = GAMMA
     executor._simulate_acc_len = 3.51
     executor._simulated_correct_len = correct_len
+    executor._simulated_acc_len_rng = simulated_acc_len_generator(1234)
+    executor._simulated_bonus_seed = None
     executor.verify_epilogue = epilogue
     w = worker_mod.DSparkWorkerV2.__new__(worker_mod.DSparkWorkerV2)
     w._verify_executor = executor
@@ -63,10 +65,8 @@ def _temps(step):
     return None if step % 3 == 0 else torch.tensor([0.7, 1.0, 0.3]) + step / 100
 
 
-def test_ahead_matches_after_draft_on_fixed_seeds():
+def test_ahead_matches_after_draft():
     steps = 40
-    torch.manual_seed(1234)
-    random.seed(1234)
     after, w = [], _worker()
     for step in range(steps):
         _draft_stand_in()
@@ -75,8 +75,6 @@ def test_ahead_matches_after_draft_on_fixed_seeds():
         w._verify_executor.verify_epilogue.begin_sim_bonus(BS, temps)
         after.append(_snapshot(w))
 
-    torch.manual_seed(1234)
-    random.seed(1234)
     ahead, w = [], _worker()
     for step in range(steps):
         temps = _temps(step)
