@@ -863,10 +863,13 @@ class CudaVmmTensorTransportProxy(CudaIpcTensorTransportProxy):
             self._acknowledge_consumption(device_index, consumer_count)
 
     def reconstruct_on_target_device(
-        self, rebuild_device_idx, consumer_count: int | None = None
+        self, rebuild_device_idx, consumer_count: int | None = None, *, to_host=False
     ):
+        # to_host copies into pinned memory on the current stream; sync before reading.
         consumer_count = self._resolve_consumer_count(consumer_count)
-        rebuild_device = torch.device(f"cuda:{rebuild_device_idx}")
+        rebuild_device = torch.device(
+            "cpu" if to_host else f"cuda:{rebuild_device_idx}"
+        )
         if (
             isinstance(self.reconstruct_tensor, torch.Tensor)
             and self.reconstruct_tensor.device == rebuild_device
@@ -877,12 +880,15 @@ class CudaVmmTensorTransportProxy(CudaIpcTensorTransportProxy):
 
         pool = self._pool(rebuild_device_idx)
         try:
-            with torch.cuda.device(rebuild_device):
+            with torch.cuda.device(rebuild_device_idx):
                 source = pool.memory[
                     self.data_offset : self.data_offset + self.data_nbytes
                 ]
                 reconstructed = torch.empty(
-                    self.shape, dtype=self.dtype, device=rebuild_device
+                    self.shape,
+                    dtype=self.dtype,
+                    device=rebuild_device,
+                    pin_memory=to_host,
                 ).contiguous()
                 reconstructed.reshape(-1).view(torch.uint8).copy_(
                     source, non_blocking=True
@@ -890,7 +896,7 @@ class CudaVmmTensorTransportProxy(CudaIpcTensorTransportProxy):
                 self._acknowledge_consumption(rebuild_device_idx, consumer_count)
         except BaseException as error:
             try:
-                with torch.cuda.device(rebuild_device):
+                with torch.cuda.device(rebuild_device_idx):
                     self._acknowledge_consumption(rebuild_device_idx, consumer_count)
             except BaseException as cleanup_error:
                 error.add_note(
@@ -902,6 +908,14 @@ class CudaVmmTensorTransportProxy(CudaIpcTensorTransportProxy):
 
         self.reconstruct_tensor = reconstructed
         return reconstructed
+
+    def mapped_view(self, device_index: int) -> torch.Tensor:
+        """This tensor in the producer's pool, readable until the slice is released."""
+        if self._consumer_acknowledged:
+            raise RuntimeError("CUDA VMM tensor has already released its pool slice")
+        memory = self._pool(device_index).memory
+        tensor_bytes = memory[self.data_offset : self.data_offset + self.data_nbytes]
+        return tensor_bytes.view(self.dtype).reshape(self.shape)
 
 
 class _CudaVmmPackedTransportOwner(CudaVmmTensorTransportProxy):
@@ -972,9 +986,11 @@ class CudaVmmPackedTensorTransportProxy(CudaVmmTensorTransportProxy):
         self._consumer_acknowledged = True
 
     def reconstruct_on_target_device(
-        self, rebuild_device_idx, consumer_count: int | None = None
+        self, rebuild_device_idx, consumer_count: int | None = None, *, to_host=False
     ):
-        rebuild_device = torch.device(f"cuda:{rebuild_device_idx}")
+        rebuild_device = torch.device(
+            "cpu" if to_host else f"cuda:{rebuild_device_idx}"
+        )
         if (
             isinstance(self.reconstruct_tensor, torch.Tensor)
             and self.reconstruct_tensor.device == rebuild_device
@@ -984,7 +1000,7 @@ class CudaVmmPackedTensorTransportProxy(CudaVmmTensorTransportProxy):
             raise RuntimeError("CUDA VMM tensor has already released its pool slice")
 
         packed_buffer = self._packed_owner.reconstruct_on_target_device(
-            rebuild_device_idx, consumer_count=consumer_count
+            rebuild_device_idx, consumer_count=consumer_count, to_host=to_host
         )
         tensor_bytes = packed_buffer[
             self._packed_relative_offset : self._packed_relative_offset
@@ -994,6 +1010,11 @@ class CudaVmmPackedTensorTransportProxy(CudaVmmTensorTransportProxy):
         self.reconstruct_tensor = reconstructed
         self._consumer_acknowledged = True
         return reconstructed
+
+    def mapped_view(self, device_index: int) -> torch.Tensor:
+        if self._packed_owner._consumer_acknowledged:
+            raise RuntimeError("CUDA VMM tensor has already released its pool slice")
+        return super().mapped_view(device_index)
 
 
 class CudaVmmFeatureTransport:
