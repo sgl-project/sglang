@@ -201,8 +201,7 @@ async fn route_put(State(state): State<Arc<Registry>>, Json(body): Json<Route>) 
         let mut topo = (**current).clone();
         layout_mismatch =
             topo.registered_count > 0 && topo.dsv41_spec_layout != body.dsv41_spec_layout;
-        spec_mismatch = topo.registered_count > 0
-            && topo.spec_kv_layout.is_some()
+        spec_mismatch = topo.spec_kv_layout.is_some()
             && body.spec_kv_layout.is_some()
             && topo.spec_kv_layout != body.spec_kv_layout;
         if layout_mismatch || spec_mismatch {

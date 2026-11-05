@@ -105,15 +105,7 @@ class TestSpecKVLayout(CustomTestCase):
         self.assertEqual(layout("DSPARK"), DSPARK)
         self.assertEqual(layout("DSPARK", num_steps=8, num_draft_tokens=16), DSPARK)
         self.assertEqual(layout("DSPARK", num_draft_entries=0), None)
-        self.assertEqual(
-            layout("DFLASH"),
-            {
-                "algorithm": "DFLASH",
-                "num_draft_entries": 6,
-                "dspark_block_size": 4,
-                "dflash_block_size": None,
-            },
-        )
+        self.assertEqual(layout("DFLASH"), {**DSPARK, "algorithm": "DFLASH"})
 
     def test_decode_compares_only_known_layouts(self):
         cases = {
@@ -173,7 +165,12 @@ class TestSpecKVLayoutBootstrap(CustomTestCase):
         )
 
     def test_draftless_ranks_and_old_decodes_are_compatible(self):
-        for order in ((None, DSPARK), (DSPARK, None)):
+        cases = [
+            ((None, DSPARK), DSPARK),
+            ((DSPARK, None), DSPARK),
+            (({}, {}), {}),
+        ]
+        for order, expected in cases:
             with self.subTest(order=order):
                 server = bootstrap_server()
                 for pp_rank, spec_kv_layout in enumerate(order):
@@ -185,7 +182,7 @@ class TestSpecKVLayoutBootstrap(CustomTestCase):
                 self.assertEqual(status, 200)
                 self.assertNotIn("spec_kv_layout", payload)
                 _, payload = route(server, opt_in=True)
-                self.assertEqual(payload["spec_kv_layout"], DSPARK)
+                self.assertEqual(payload["spec_kv_layout"], expected)
 
     def test_known_layouts_must_agree_across_ranks(self):
         server = bootstrap_server()
@@ -196,15 +193,6 @@ class TestSpecKVLayoutBootstrap(CustomTestCase):
             400,
         )
         self.assertEqual(route(server)[0], 503)
-
-    def test_no_spec_prefill_publishes_an_empty_layout_only_on_opt_in(self):
-        server = bootstrap_server()
-        self.assertEqual(register(server, self.row, spec_kv_layout={}).status, 200)
-        self.assertEqual(
-            register(server, self.row, pp_rank=1, spec_kv_layout={}).status, 200
-        )
-        self.assertNotIn("spec_kv_layout", route(server)[1])
-        self.assertEqual(route(server, opt_in=True)[1]["spec_kv_layout"], {})
 
 
 if __name__ == "__main__":

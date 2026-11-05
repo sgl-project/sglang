@@ -3179,8 +3179,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 status=400,
             )
         if (
-            self._registered_count
-            and self.spec_kv_layout is not None
+            self.spec_kv_layout is not None
             and spec_kv_layout is not None
             and self.spec_kv_layout != spec_kv_layout
         ):
