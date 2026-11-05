@@ -133,12 +133,16 @@ def compute_post_capture_kv_resize(
     )
     # Drafts take the target's token count; the target cell already charges their
     # bytes. A draft that aliases the target pool is finalized once, as the target.
-    draft_pools = tuple(
-        runner.token_to_kv_pool
-        for runner in draft_runners
-        if runner.token_to_kv_pool is not pool
-        and runner.token_to_kv_pool.post_capture_active
-    )
+    owners = {id(pool.backing_owner)}
+    draft_pools = []
+    for runner in draft_runners:
+        draft_pool = runner.token_to_kv_pool
+        if not draft_pool.post_capture_active:
+            continue
+        owner_id = id(draft_pool.backing_owner)
+        if owner_id not in owners:
+            owners.add(owner_id)
+            draft_pools.append(draft_pool)
     budget_bytes = (
         int(max(0.0, free_gb - headroom_gb - mm_reservation_gb) * (1 << 30))
         + pool.post_capture_backed_bytes

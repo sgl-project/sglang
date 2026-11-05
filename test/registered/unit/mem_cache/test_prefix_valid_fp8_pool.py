@@ -7,6 +7,11 @@ from unittest.mock import patch
 import torch
 
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
+from sglang.srt.mem_cache.kv.layout.mha import DraftMHAView, MHASubPoolSpec
+from sglang.srt.mem_cache.layout.fused_draft import (
+    DenseDraftRegion,
+    FusedDraftPlacement,
+)
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, _resolve_fused_scale
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kernels.prefix_valid import (
@@ -15,6 +20,7 @@ from sglang.test.kernels.prefix_valid import (
     make_kv_cache,
 )
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.unified_allocator_fixtures import arena_of
 
 # Preserve the original GPU lanes; the kernel file retains the other 25 seconds.
 register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -75,6 +81,100 @@ class TestPrefixValidFp8Pool(CustomTestCase):
     def setUp(self):
         super().setUp()
         torch.manual_seed(0)
+
+    def test_fused_draft_prefix_commit_preserves_the_host(self):
+        """BF16 and FP8 prefix commits write only accepted fused draft rows;
+        host rows, other draft lanes and rejected rows must stay byte-identical."""
+        for dtype in (torch.bfloat16, fp8_dtype):
+            with self.subTest(dtype=dtype):
+                region = DenseDraftRegion(
+                    lane_num=2,
+                    head_num=1,
+                    head_dim=64,
+                    store_dtype=torch.uint8 if dtype == fp8_dtype else dtype,
+                    kv_dtype=dtype,
+                )
+                host = MHASubPoolSpec(
+                    name="full",
+                    layer_num=2,
+                    head_num=2,
+                    head_dim=8,
+                    store_dtype=torch.bfloat16,
+                    grow_direction="down",
+                    draft_region=region,
+                )
+                peer = MHASubPoolSpec(
+                    name="swa",
+                    layer_num=1,
+                    head_num=2,
+                    head_dim=8,
+                    store_dtype=torch.bfloat16,
+                    grow_direction="up",
+                )
+                arena = arena_of(
+                    [host, peer],
+                    total_bytes=16 * (host.entry_bytes() + peer.entry_bytes()),
+                    device=DEVICE,
+                    page_size=4,
+                    fused_draft=FusedDraftPlacement.from_counts(
+                        counts={"full": [2]},
+                        regions={"full": region},
+                    ),
+                )
+                pool = DraftMHAView(
+                    arena=arena,
+                    host_spec=host,
+                    layer_lanes={10: 1, 11: 0},
+                    page_size=4,
+                )
+                arena.raw.fill_(0x5A)
+                before = arena.raw.clone()
+                untouched = torch.ones_like(arena.raw, dtype=torch.bool)
+                for buffer in (pool.k_buffer[1], pool.v_buffer[1]):
+                    base = buffer.data_ptr() - arena.raw.data_ptr()
+                    stride = buffer.stride(0) * buffer.element_size()
+                    for dst in (5, 9, 12):
+                        offset = base + dst * stride
+                        untouched[offset : offset + 64 * buffer.element_size()] = False
+                loc = torch.tensor(
+                    [[5, 9, -1], [-1, -1, -1], [12, -1, -1]], device=DEVICE
+                )
+                lengths = torch.tensor([2, 0, 1], dtype=torch.int32, device=DEVICE)
+                k = (
+                    torch.linspace(-2, 2, 9 * 64, device=DEVICE)
+                    .to(torch.bfloat16)
+                    .view(9, 1, 64)
+                )
+                v = k.flip(-1)
+                layer = (
+                    _make_layer(0.625, 1.375)
+                    if dtype == fp8_dtype
+                    else SimpleNamespace(k_scale=None, v_scale=None)
+                )
+                layer.layer_id = 10
+                with assert_prefix_commit(
+                    k,
+                    v,
+                    pool.k_buffer[1].view(dtype),
+                    pool.v_buffer[1].view(dtype),
+                    loc,
+                    lengths,
+                    layer.k_scale,
+                    layer.v_scale,
+                ):
+                    pool.set_kv_buffer_prefix_valid(
+                        layer,
+                        loc,
+                        lengths,
+                        k,
+                        v,
+                        layer.k_scale,
+                        layer.v_scale,
+                        layer_id_override=11,
+                    )
+                assert_bytes_equal(
+                    arena.raw[untouched], before[untouched], "uncommitted arena bytes"
+                )
 
     def test_pool_dispatch_uses_gpu_parameter_float_shadows(self):
         """GPU scale Parameters must fuse without synchronizing through item()."""

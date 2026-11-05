@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     import torch
 
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
+    from sglang.srt.managers.io_struct import ProfileReq
 
 # Re-export for convenience
 __all__ = [
@@ -100,6 +101,16 @@ class SRTPlatform(DeviceMixin):
         """
         pass
 
+    def apply_profile_request_defaults(self, req: ProfileReq) -> None:
+        """Fill platform defaults for fields a profile request leaves unset.
+
+        Called in the tokenizer process at the start of ``start_profile``,
+        before core fills unset ``with_stack`` and ``record_shapes`` from
+        ``SGLANG_PROFILE_WITH_STACK`` and ``SGLANG_PROFILE_RECORD_SHAPES``.
+        Mutate ``req`` in place and leave explicitly set fields unchanged.
+        """
+        pass
+
     # ------------------------------------------------------------------
     # Subsystem factory methods
     # ------------------------------------------------------------------
@@ -116,7 +127,10 @@ class SRTPlatform(DeviceMixin):
         """Return the graph runner class, or None for the in-tree default.
 
         ``None`` means "no platform opinion": the caller falls back to the
-        in-tree device-keyed selection.
+        in-tree device-keyed selection. Adaptive speculative decoding also
+        builds one target verify runner per step count from this class, passing
+        ``attn_backend``, ``speculative_num_steps`` and
+        ``speculative_num_draft_tokens`` as keyword arguments.
         """
         return None
 
@@ -184,6 +198,27 @@ class SRTPlatform(DeviceMixin):
         self,
     ) -> Optional[Callable[..., torch.Tensor]]:
         """Return a platform implementation for speculative KV-cache locations."""
+        return None
+
+    def get_speculative_worker_cls(self, algorithm: str) -> Optional[type]:
+        """Return a worker class replacing the built-in one, or None to keep it.
+
+        Consulted for every speculative algorithm on out-of-tree platforms. The
+        class is constructed with the built-in worker's keyword arguments, must
+        expose the same scheduler-facing interface, and must reject flags it
+        cannot serve (for example multi-layer EAGLE).
+        """
+        return None
+
+    def get_speculative_graph_runner_cls(
+        self, algorithm: str, phase: str
+    ) -> Optional[type]:
+        """Return the EAGLE draft graph runner for ``phase``; None runs it eagerly.
+
+        ``phase`` is ``"draft_decode"`` or ``"draft_extend"``; the class is
+        constructed like the built-in runner for that phase. Not consulted when
+        ``capabilities.graph_capture`` is False.
+        """
         return None
 
     def get_quantization_config(
