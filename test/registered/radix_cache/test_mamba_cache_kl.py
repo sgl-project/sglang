@@ -4,6 +4,7 @@ Keep each scenario in its own class so server configurations and cache-pressure
 requirements remain explicit.
 """
 
+import random
 import unittest
 
 import numpy as np
@@ -63,14 +64,19 @@ class TestMambaLazyFullPoolKL(MambaCacheKLMixin, DefaultServerBase):
     publish that buffer under a wrong length.
 
     Compare full-vocabulary next-token distributions at the SAME 255-token prompt,
-    resumed from a 192-token checkpoint that a 32-token decode left behind and from
-    one a prefill alone wrote. Both resume at the same length, so a correct state
-    matches exactly; comparing later free-running tokens would confound cache
-    corruption with different generated histories.
+    all resumed from a 192-token checkpoint; comparing later free-running tokens
+    would confound cache corruption with different generated histories. The reuse
+    resumes from the checkpoint a prefill followed by a 32-token decode left
+    behind, and is checked against two references:
+    - the same prefill without the decode: the same kernels on the same shapes, so
+      a correct state matches bit for bit and any difference is a reuse bug;
+    - a prefill of the first 192 tokens alone: a different prefill split, whose
+      numerical noise must stay below the KL bound.
 
-    GB300 / Qwen3.5-0.8B: publishing a keep buffer the boundary decode wrote under
-    its old length gives KL=0.649448 on the same 192-token hit; a correct state
-    gives KL=0.
+    The prompt is random token ids. A repeated-token prompt saturates the linear
+    attention state, so a checkpoint 32 tokens off stays within the split noise.
+    RTX 5090 with random prompts: split noise 3.1e-4 to 8.2e-4 over 9 seeds; a
+    checkpoint 16 or more tokens off gives 6.0e-3 or more (seed 0).
     """
 
     ignore_eos = True
@@ -109,10 +115,16 @@ class TestMambaLazyFullPoolKL(MambaCacheKLMixin, DefaultServerBase):
         "42",
     ]
 
-    def _warm_prefixes(self):
+    def _resume_at_192(self, prompt, other_prefix, seed_len, seed_new_tokens):
+        """Cache two prefixes, seed a request, then score `prompt` from its 192 hit."""
         self._flush_cache()
-        self._generate([44] * 128, 1)
-        self._generate([42] * 128, 1)
+        self._generate(other_prefix, 1)
+        self._generate(prompt[:128], 1)
+        seed = self._generate(prompt[:seed_len], seed_new_tokens)
+        self.assertEqual(seed["meta_info"]["cached_tokens"], 128)
+        result = self._generate(prompt, 1, score=True)
+        self.assertEqual(result["meta_info"]["cached_tokens"], 192)
+        return self._distribution(result)
 
     def test_lazy_donation_with_four_slots_and_one_request(self):
         """A prefix-hit request must finish without a fifth Mamba slot under overlap."""
@@ -130,34 +142,26 @@ class TestMambaLazyFullPoolKL(MambaCacheKLMixin, DefaultServerBase):
     def test_reuse_distribution_after_boundary_decode(self):
         config = AutoConfig.from_pretrained(self.model)
         self.vocab_ids = list(range(config.get_text_config().vocab_size))
-        prompt = [42] * 128 + [43] * 127
+        rng = random.Random(0)
+        prompt = [rng.randrange(1000, 100000) for _ in range(255)]
+        other_prefix = [rng.randrange(1000, 100000) for _ in range(128)]
 
+        reused = self._resume_at_192(prompt, other_prefix, 255, 32)
         # A single output token does not launch the boundary-crossing decode, so
-        # the 192-token checkpoint comes from the prefill alone.
-        self._warm_prefixes()
-        self._generate(prompt[:192], 1)
-        reference = self._generate(prompt, 1, score=True)
-        self.assertEqual(reference["meta_info"]["cached_tokens"], 192)
-        reference_logprobs = self._distribution(reference)
+        # these 192-token checkpoints come from a prefill alone.
+        same_split = self._resume_at_192(prompt, other_prefix, 255, 1)
+        split = self._resume_at_192(prompt, other_prefix, 192, 1)
 
-        self._warm_prefixes()
-        seed = self._generate(prompt, 32)
-        self.assertEqual(seed["meta_info"]["cached_tokens"], 128)
-        reused = self._generate(prompt, 1, score=True)
-        self.assertEqual(reused["meta_info"]["cached_tokens"], 192)
-        reused_logprobs = self._distribution(reused)
-
-        kl = float(
-            np.sum(np.exp(reference_logprobs) * (reference_logprobs - reused_logprobs))
+        np.testing.assert_array_equal(
+            reused,
+            same_split,
+            "The boundary decode changed the reused 192-token checkpoint",
         )
-        print(
-            f"lazy boundary checkpoint KL(reference || reuse)={kl:.9g}, "
-            f"cached_tokens={reused['meta_info']['cached_tokens']}",
-            flush=True,
-        )
+        kl = float(np.sum(np.exp(split) * (split - reused)))
+        print(f"lazy boundary checkpoint KL(split || reuse)={kl:.9g}", flush=True)
         self.assertGreaterEqual(kl, -1e-12)
-        # Leave room for numerical noise while staying far below the broken run.
-        self.assertLess(kl, 1e-4, "Cache reuse changed the next-token distribution")
+        # Above the split noise (up to 8.2e-4), below a checkpoint 16 tokens off.
+        self.assertLess(kl, 3e-3, "Cache reuse changed the next-token distribution")
 
 
 class TestMambaSpecTruncationKL(MambaCacheKLMixin, DefaultServerBase):
