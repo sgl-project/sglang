@@ -2026,6 +2026,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Bootstrap URL for the ZBAL path (NPU only).</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>""</code></td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_NPU_PREFILL_MOE_TILE_TOKENS</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Maximum token rows per local NPU prefill MoE call in the DeepSeek/GLM model path. Positive values enable tiling for the standard dispatcher with EP1 and local output. Zero disables tiling. Tune with HBM capacity and prefill latency measurements.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0</code></td>
+    </tr>
   </tbody>
 </table>
 
