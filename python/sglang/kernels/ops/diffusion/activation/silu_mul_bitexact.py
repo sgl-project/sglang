@@ -88,7 +88,9 @@ def fused_silu_mul_bitexact(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         raise RuntimeError("invalid input for fused_silu_mul_bitexact")
     out = torch.empty_like(a)
     numel = a.numel()
-    with torch.cuda.device(a.device):
+    device_module = torch.get_device_module(a.device.type)
+
+    with device_module.device(a.device):
         _silu_mul_kernel[(triton.cdiv(numel, 1024),)](
             out,
             a,

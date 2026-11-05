@@ -415,7 +415,7 @@ class QwenImage21ResidualUpBlock(nn.Module):
             shortcut = self.avg_shortcut
             if (
                 type(shortcut) is DupUp3D
-                and x.is_cuda
+                and (x.is_cuda or x.is_xpu)
                 and x.dtype in (torch.float16, torch.bfloat16, torch.float32)
                 and not torch.compiler.is_compiling()
             ):
