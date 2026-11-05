@@ -306,6 +306,20 @@ class PageInterleavePoolAllocator(PagedTokenToKVPoolAllocator):
             assert len(torch.unique(out_indices)) == len(out_indices)
         return out_indices
 
+    def alloc_cyclic(self, start_class: int, need_size: int) -> Optional[torch.Tensor]:
+        """One chain's whole pages at a fixed rotation: owners cycle from
+        ``start_class`` (taken mod N). HiCache copies keep their pages' owners."""
+        lens = torch.tensor([0, need_size], dtype=torch.int64)
+        return self.alloc_extend(
+            prefix_lens=lens[:1],
+            prefix_lens_cpu=lens[:1],
+            seq_lens=lens[1:],
+            seq_lens_cpu=lens[1:],
+            last_loc=lens[:1],
+            extend_num_tokens=need_size,
+            rotation_bases=[start_class],
+        )
+
     def alloc_decode(
         self,
         seq_lens: torch.Tensor,

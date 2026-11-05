@@ -1,10 +1,8 @@
 from array import array
 from types import SimpleNamespace
 
-from sglang.srt.managers.schedule_batch import (
-    FINISH_LENGTH,
-    Req,
-)
+from sglang.srt.managers.req_types import FINISH_LENGTH
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     InsertParams,
@@ -12,9 +10,8 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     TreeLock,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.unified_cache.components.base import (
-    ComponentType,
-)
+from sglang.srt.mem_cache.static_kv_storage import acquire_rows
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.kits.unified_radix_cache.fixtures import (
     build_fixture,
@@ -33,7 +30,6 @@ class ResumableInsertWalkSWAFixtures(UnifiedRadixCacheFixtures):
         seq = list(range(1, self.cfg.sliding_window_size + 1))
         key = RadixKey(array("q", seq))
         evicted = self._alloc(allocator, len(seq))
-        # Window eviction already released the peers below the floor.
         allocator.free_swa(evicted)
         cache.insert(
             InsertParams(
@@ -229,7 +225,6 @@ class SegmentLockFuzzFixtures(UnifiedRadixCacheFixtures):
                 raise
             cache.sanity_check()
 
-        # Drain remaining locks; the tree must come back exactly balanced.
         for node_id, receipt, released in held:
             cache.dec_lock_ref(node_id, receipt.to_dec_params(), skip_swa=released)
         cache.sanity_check()
@@ -260,7 +255,7 @@ class StreamingSessionLockLifecycleFixtures:
     def _admitted_turn(self, cache, allocator, pool, tokens, session):
         """A first turn with its own row and the root lock admission took."""
         req = self._turn(tokens, session)
-        pool.alloc([req])
+        acquire_rows(pool, pool.state, [req])
         pool.write(
             (req.kv.req_pool_idx, slice(0, len(tokens))),
             allocator.alloc(len(tokens)),

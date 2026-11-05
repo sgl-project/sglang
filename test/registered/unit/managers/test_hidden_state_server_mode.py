@@ -8,7 +8,7 @@ from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestHiddenStateServerMode(CustomTestCase):
@@ -26,7 +26,9 @@ class TestHiddenStateServerMode(CustomTestCase):
         manager.allow_auto_truncate = False
         manager.validate_total_tokens = False
         manager.is_generation = True
-        manager.model_config = SimpleNamespace(joint_head_config=None)
+        manager.model_config = SimpleNamespace(
+            joint_head_config=None, pointer_head=None
+        )
         manager.server_args = SimpleNamespace(enable_custom_logit_processor=False)
         manager._validate_token_ids_logprob = Mock()
         return manager

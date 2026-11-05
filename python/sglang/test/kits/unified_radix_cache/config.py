@@ -5,15 +5,12 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.mem_cache.unified_cache.components.base import (
-    ComponentType,
-)
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.test.test_utils import CustomTestCase
 
 
 @dataclass(frozen=True)
 class CacheConfig:
-    # Tree
     page_size: int = 1
     components: tuple[ComponentType, ...] = (ComponentType.FULL,)
 
@@ -21,12 +18,10 @@ class CacheConfig:
     num_layers: int = 24
     full_attention_layer_ids: tuple[int, ...] = (3, 7, 11, 15, 19, 23)
 
-    # SWA
     sliding_window_size: Optional[int] = None
     draft_swa_window: int = 0
     decoder_swa_bounded_replay: bool = False
 
-    # Mamba
     enable_mamba_extra_buffer: bool = False
     mamba_cache_size: int = 20
     mamba_intermediate_size: int = 256
@@ -37,7 +32,6 @@ class CacheConfig:
     mamba_conv_kernel: int = 4
     enable_int8_mamba_checkpoint: bool = False
 
-    # Model / pool
     kv_size: int = 256
     max_num_reqs: int = 10
     max_context_len: int = 512
@@ -193,11 +187,8 @@ CONFIGS: list[CacheConfig] = [
 def requires(predicate, reason):
     """Keep a test only under the configs where ``predicate`` holds.
 
-    Under any other config the test is removed from the bound class, not
-    skipped. ``reason`` documents the requirement and is not read at runtime.
-
-    Stacked requirements are checked top to bottom and stop at the first that
-    fails, so a lower one may assume the ones above it hold.
+    Elsewhere the test is removed, not skipped. Stacked requirements are checked
+    top to bottom, so a lower one may assume the ones above it hold.
     """
 
     def decorate(test):

@@ -4,6 +4,7 @@ from typing import Optional
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import (
     cache_once,
     is_arch_support_pdl,
@@ -11,6 +12,7 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_xpu
 
 from .candidate_table import CANDIDATE_BLOCK_SIZE
@@ -35,31 +37,36 @@ def _jit_topk_v2_module():
         get_max_active_clusters,
     )
 
-    args = make_cpp_args(is_arch_support_pdl())
+    mode = envs.SGLANG_TOPK_V2_MODE.get()
+    assert mode in (0, 1, 2), f"SGLANG_TOPK_V2_MODE must be 0, 1 or 2, got {mode}"
+    extra_cuda_cflags = [f"-DSGL_TOPK_MODE={mode}"]
+    arch = current_arch()
+    # on CUDA, ptxas schedules kernels in parallel to speed up compilation
+    if arch.cuda is not None:
+        extra_cuda_cflags.append("-Xptxas=--split-compile=0")
     # Enable each cluster path only when its occupancy probe reports capacity.
-    extra_cuda_cflags = []
-    if is_arch_support_pdl():  # set the persistent cluster size after hopper
+    if arch.cuda is not None and arch.cuda.supports_cluster:
         for cluster_size, occupancy in ((8, 2), (16, 1)):
             try:
                 max_active_clusters = get_max_active_clusters(
-                    cluster_size, occupancy=occupancy
+                    cluster_size=cluster_size,
+                    occupancy=occupancy,
                 )
             except NoSchedulableClustersError:
                 max_active_clusters = 0
             extra_cuda_cflags.append(
                 f"-DSGL_TOPK_V2_MAX_C{cluster_size}_OCC{occupancy}={max_active_clusters}"
             )
+    args = make_cpp_args(arch.cuda is not None and arch.supports_pdl)
     kernel = f"TopKKernel<{args}>"
     wrappers = [
         ("topk_transform_paged", f"{kernel}::transform_paged"),
         ("topk_transform_ragged", f"{kernel}::transform_ragged"),
+        ("topk_transform_packed", f"{kernel}::transform_packed"),
         ("topk_plan", f"{kernel}::plan"),
         ("topk_transform_kpool", f"{kernel}::transform_kpool"),
         ("topk_transform_kpool_ragged", f"{kernel}::transform_kpool_ragged"),
     ]
-    if is_hip_runtime():
-        # transform_packed only exists under USE_ROCM, see topk_v2.cuh
-        wrappers.append(("topk_transform_packed", f"{kernel}::transform_packed"))
     return load_jit(
         make_name("topk_v2"),
         *args,
@@ -124,30 +131,6 @@ def topk_transform_paged(
         module.topk_transform(
             scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
         )
-
-
-def topk_transform_paged_torch(
-    scores: torch.Tensor,
-    seq_lens: torch.Tensor,
-    page_tables: torch.Tensor,
-    out_page_indices: torch.Tensor,
-    page_size: int,
-    out_raw_indices: Optional[torch.Tensor] = None,
-) -> None:
-    """The torch ``topk_transform_paged``: top-``k`` (``k = out_page_indices.shape[1]``)
-    of each row within its first ``seq_lens[b]`` columns, ascending, as pool slots
-    through ``page_tables`` and as positions when given; ``-1`` padded."""
-    topk = out_page_indices.shape[1]
-    columns = torch.arange(scores.shape[1], device=seq_lens.device)
-    lens_c = seq_lens.unsqueeze(-1)
-    # Columns past a row's length hold garbage.
-    s = scores.masked_fill(columns[None, :] >= lens_c, -torch.inf)
-    idx = s.topk(topk, dim=-1, sorted=False).indices.sort(dim=-1).values
-    reach = idx < lens_c
-    slots = page_tables.gather(-1, idx // page_size) * page_size + (idx % page_size)
-    out_page_indices.copy_(torch.where(reach, slots, -1).to(torch.int32))
-    if out_raw_indices is not None:
-        out_raw_indices.copy_(torch.where(reach, idx, -1).to(torch.int32))
 
 
 # metadata is (batch+1, 2) int32: row 0 = {cluster_threshold, num_cluster_items};
@@ -385,12 +368,7 @@ def topk_transform_packed_v2(
     invalid for that row and the buffer must have no other consumer, so do not
     pass a view with overlapping rows.
     ``seq_lens`` entries must be NON-NEGATIVE, as for the paged entry point.
-
-    ROCm only: the kernel is compiled under ``USE_ROCM`` so that CUDA and XPU
-    builds are untouched. Nothing in it is AMD-specific -- no non-ROCm caller
-    produces this layout today.
     """
-    assert is_hip_runtime(), "topk_transform_packed_v2 is compiled under USE_ROCM only"
     module = _jit_topk_v2_module()
     module.topk_transform_packed(
         scores,

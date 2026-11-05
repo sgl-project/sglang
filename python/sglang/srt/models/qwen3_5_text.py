@@ -17,10 +17,14 @@ import logging
 from typing import Iterable, Optional, Set, Tuple, Union
 
 import torch
+from safetensors.torch import load_file
 from torch import nn
+from transformers.utils import cached_file
 
+from sglang.srt.configs.model_config import load_pointer_adapter, load_pointer_head
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.pointer_head import PointerPooler
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
@@ -29,12 +33,16 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models import qwen3_5
 from sglang.srt.models.qwen2_moe import Qwen2MoeSparseMoeBlock
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_model, get_parallel
 from sglang.srt.utils import LazyValue, add_prefix
 
 logger = logging.getLogger(__name__)
 
 _MODEL_PREFIX = "model."
+# Where a Kev LoRA checkpoint's base keeps the text backbone, and where the
+# adapter keeps its factors.
+_BASE_TEXT_PREFIX = "model.language_model."
+_ADAPTER_PREFIX = "base_model.model."
 
 
 class Qwen3_5ForCausalLM(nn.Module):
@@ -70,7 +78,19 @@ class Qwen3_5ForCausalLM(nn.Module):
             prefix=add_prefix("model", prefix),
         )
 
-        if self.pp_group.is_last_rank:
+        self.pooler = None
+        model = get_model()
+        meta = (
+            load_pointer_head(model.model_path, model.revision)
+            if model.is_embedding
+            else None
+        )
+        if meta is not None:
+            # A Kev checkpoint, whose pointer head scores options from the final
+            # hidden states, and which has no LM head.
+            self.pooler = PointerPooler(config.hidden_size, meta)
+            self.lm_head = PPMissingLayer()
+        elif self.pp_group.is_last_rank:
             if self.pp_group.world_size == 1 and config.tie_word_embeddings:
                 self.lm_head = self.model.embed_tokens
             else:
@@ -165,6 +185,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: Optional[torch.Tensor] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        get_embedding: bool = False,
         **kwargs,
     ) -> Union[torch.Tensor, PPProxyTensors]:
         if self.is_mrope_enabled:
@@ -185,19 +206,55 @@ class Qwen3_5ForCausalLM(nn.Module):
         if isinstance(hidden_states, tuple):
             hidden_states, aux_hidden_states = hidden_states
 
+        if get_embedding and self.pooler is not None:
+            return self.pooler(hidden_states, forward_batch)
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
         )
+
+    def _pointer_adapter(self) -> dict:
+        """LoRA factors of a Kev LoRA checkpoint by backbone module, none for full weights."""
+        model = get_model()
+        meta = load_pointer_adapter(model.model_path, model.revision)
+        if meta is None:
+            return {}
+        tensors = load_file(
+            cached_file(
+                model.model_path, "adapter_model.safetensors", revision=model.revision
+            )
+        )
+        return {
+            name[len(_ADAPTER_PREFIX) : -len(".lora_A.weight")]: (
+                a,
+                tensors[name.replace(".lora_A.", ".lora_B.")],
+                meta["lora_scale"],
+            )
+            for name, a in tensors.items()
+            if name.endswith(".lora_A.weight")
+        }
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
 
+        lora = self._pointer_adapter() if self.pooler is not None else {}
+
         # Keep prefix stripping lazy: materializing mmap-backed checkpoint tensors
         # across model processes can exceed host memory before GPU copies finish.
         def body_weights():
             for name, loaded_weight in weights:
-                if name.startswith(_MODEL_PREFIX):
+                if self.pooler is not None:
+                    # Kev saves the backbone under its own names, and the base of a
+                    # Kev LoRA checkpoint under its text model, next to an LM head
+                    # that Kev does not use.
+                    name = name.removeprefix(_BASE_TEXT_PREFIX)
+                    if name.startswith("lm_head."):
+                        continue
+                    factors = lora.pop(name.removesuffix(".weight"), None)
+                    if factors is not None:
+                        loaded_weight = _merge_lora(loaded_weight, *factors)
+                    yield name, loaded_weight
+                elif name.startswith(_MODEL_PREFIX):
                     yield name[len(_MODEL_PREFIX) :], loaded_weight
                 elif name == "lm_head.weight":
                     if self.config.tie_word_embeddings:
@@ -212,9 +269,21 @@ class Qwen3_5ForCausalLM(nn.Module):
                     loaded_params.add("lm_head.weight")
 
         body_loaded = self.model.load_weights(body_weights())
+        if lora:
+            raise ValueError(
+                f"The Kev adapter has factors for {len(lora)} modules that the "
+                f"base checkpoint does not have, such as {next(iter(lora))}"
+            )
         loaded_params.update(f"{_MODEL_PREFIX}{n}" for n in body_loaded)
 
-        if self.config.tie_word_embeddings and self.pp_group.is_last_rank:
+        if self.pooler is not None:
+            model = get_model()
+            meta = load_pointer_head(model.model_path, model.revision)
+            self.pooler.load_state_dict(meta["head"], strict=True)
+            loaded_params.update(
+                f"pooler.{n}" for n, _ in self.pooler.named_parameters()
+            )
+        elif self.config.tie_word_embeddings and self.pp_group.is_last_rank:
             loaded_params.add("lm_head.weight")
 
         return loaded_params
@@ -253,6 +322,14 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
             num_logical_experts=config.num_experts,
             num_groups=None,
         )
+
+
+def _merge_lora(
+    weight: torch.Tensor, a: torch.Tensor, b: torch.Tensor, scale: float
+) -> torch.Tensor:
+    """The weight plus its LoRA delta, added in FP32 and rounded once, as the Kev
+    reference merges an adapter."""
+    return (weight.float() + scale * (b.float() @ a.float())).to(weight.dtype)
 
 
 EntryClass = [Qwen3_5MoeForCausalLM, Qwen3_5ForCausalLM]
