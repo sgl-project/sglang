@@ -8,7 +8,13 @@ import torch
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sglang.srt.disaggregation.utils import MetadataBuffers
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ReqKvInfo
+from sglang.srt.managers.req_types import FINISH_ABORT
+from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    KeyedReqList,
+    ListKind,
+)
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.runtime_context import get_context
@@ -21,10 +27,9 @@ register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class _Req:
-    def __init__(self, *, inflight_middle_chunks: int, allocated: bool = True):
+    def __init__(self, *, allocated: bool = True):
         self.rid = "aborted-prefill"
         self.cache_request_handle = CacheRequestHandle(self.rid, 0)
-        self.inflight_middle_chunks = inflight_middle_chunks
         self.kv = ReqKvInfo(
             req_pool_idx=1 if allocated else None,
             kv_allocated_len=1 if allocated else 0,
@@ -58,6 +63,7 @@ class _Req:
 
 class _Scheduler(SchedulerDisaggregationPrefillMixin):
     def __init__(self):
+        self.prefill_launched_reqs = KeyedReqList(ListKind.PREFILL_LAUNCHED)
         self.batch_result_processor = SimpleNamespace(
             snapshot_auxiliary_output_starts=Mock(return_value=[]),
             move_logprobs_to_cpu=Mock(),
@@ -66,7 +72,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         )
         self.spec_algorithm = SpeculativeAlgorithm.NONE
         self.tree_cache = Mock()
-        self.disagg_prefill_inflight_queue = []
+        self.disagg_prefill_transfer_queue = IndexedReqList(ListKind.PD_SENDING)
         self.disagg_prefill_pending_chunk_rids = {"aborted-prefill"}
         self.send_kv_chunk = Mock()
         self.output_streamer = Mock()
@@ -80,6 +86,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
 def _batch(req):
     return SimpleNamespace(
         reqs=[req],
+        chunked_req=None,
         spec_info=None,
         prefill_stats=None,
         dp_cooperation_info=None,
@@ -182,7 +189,7 @@ class TestPrefillCompleteResult(CustomTestCase):
     def test_ready_observes_accepted_token_and_speculative_sidecars(self, cache):
         scheduler = _Scheduler()
         scheduler.spec_algorithm = SpeculativeAlgorithm.EAGLE
-        req = _Req(inflight_middle_chunks=0)
+        req = _Req()
         req.to_finish = None
         req.time_stats.set_prefill_transfer_queue_entry_time = Mock()
         draft = SimpleNamespace(
@@ -206,11 +213,12 @@ class TestPrefillCompleteResult(CustomTestCase):
                     req.output_topk_index.tolist(),
                     req.hidden_states_tensor.tolist(),
                     req.output_dsa_topk_indices.tolist(),
-                    req in scheduler.disagg_prefill_inflight_queue,
+                    req in scheduler.disagg_prefill_transfer_queue,
                 )
             )
 
         req.disagg_kv_sender.mark_prefill_complete.side_effect = ready
+        scheduler.prefill_launched_reqs.join([req])
         scheduler.process_batch_result_disagg_prefill(batch, result)
         self.assertEqual(
             observed, [([11], [0.75, 0.25], [3, 4], [1.0, 2.0], [5, 6], True)]
@@ -223,7 +231,7 @@ class TestPrefillCompleteResult(CustomTestCase):
         """Exercise result publication only, without model or KV transfer work."""
         scheduler = _Scheduler()
         scheduler.spec_algorithm = SpeculativeAlgorithm.STANDALONE
-        reqs = [_Req(inflight_middle_chunks=0) for _ in range(2)]
+        reqs = [_Req() for _ in range(2)]
         observed = []
         for i, req in enumerate(reqs):
             req.rid = f"standalone-{i}"
@@ -242,7 +250,7 @@ class TestPrefillCompleteResult(CustomTestCase):
                         req.output_topk_index.tolist(),
                         req.hidden_states_tensor,
                         req.output_dsa_topk_indices,
-                        len(scheduler.disagg_prefill_inflight_queue),
+                        len(scheduler.disagg_prefill_transfer_queue),
                     )
                 )
 
@@ -260,6 +268,7 @@ class TestPrefillCompleteResult(CustomTestCase):
             next_token_ids=torch.tensor([11, 12]), next_draft_input=draft
         )
 
+        scheduler.prefill_launched_reqs.join(reqs)
         scheduler.process_batch_result_disagg_prefill(batch, result)
 
         self.assertEqual(
@@ -269,7 +278,7 @@ class TestPrefillCompleteResult(CustomTestCase):
                 ("standalone-1", [12], [0.25], [7], None, None, 2),
             ],
         )
-        self.assertEqual(scheduler.disagg_prefill_inflight_queue, reqs)
+        self.assertEqual(list(scheduler.disagg_prefill_transfer_queue), reqs)
         for req in reqs:
             req.disagg_kv_sender.mark_prefill_complete.assert_called_once_with()
         scheduler.send_kv_chunk.assert_not_called()
@@ -277,25 +286,25 @@ class TestPrefillCompleteResult(CustomTestCase):
     @patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)
     def test_aborted_final_result_never_publishes_ready(self, release):
         scheduler = _Scheduler()
-        req = _Req(inflight_middle_chunks=0)
+        req = _Req()
         scheduler.process_batch_result_disagg_prefill(_batch(req), _result())
         self.assertTrue(req.finished())
         self.assertFalse(req.kv.holds_kv)
-        self.assertEqual(scheduler.disagg_prefill_inflight_queue, [])
+        self.assertEqual(list(scheduler.disagg_prefill_transfer_queue), [])
         release.assert_called_once_with(req, scheduler.tree_cache, checkpoint=False)
         req.disagg_kv_sender.mark_prefill_complete.assert_not_called()
 
     @patch("sglang.srt.disaggregation.prefill.should_force_retry", return_value=True)
     def test_discarded_attempt_never_publishes_ready(self, force_retry):
         scheduler = _Scheduler()
-        req = _Req(inflight_middle_chunks=0)
+        req = _Req()
         req.to_finish = None
         retried = []
-        scheduler.optimistic_release_and_requeue = lambda r: retried.append(r)
+        scheduler.optimistic_release_and_requeue = lambda r, src: retried.append(r)
         scheduler.process_batch_result_disagg_prefill(_batch(req), _result())
         self.assertEqual(retried, [req])
         self.assertEqual(req.output_ids, [])
-        self.assertEqual(scheduler.disagg_prefill_inflight_queue, [])
+        self.assertEqual(list(scheduler.disagg_prefill_transfer_queue), [])
         req.disagg_kv_sender.mark_prefill_complete.assert_not_called()
 
 

@@ -23,17 +23,14 @@ import torch
 
 from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecution
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.npu.graph_runner.multi_layer_eagle_draft_extend_npu_graph_runner import (
-    MultiLayerEagleMultiStepDraftExtendNpuGraphRunner,
-)
 from sglang.srt.layers.attention.qsa.config import parse_qsa_profile
 from sglang.srt.layers.moe.utils import (
     draft_model_build_scope,
     speculative_moe_backend_context,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.router import STATE_PART
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -41,10 +38,8 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardBatch,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
 from sglang.srt.runtime_context import (
     get_device,
     get_schedule,
@@ -452,8 +447,10 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                     MultiLayerEagleMultiStepDraftExtendCudaGraphRunner(self)
                 )
         else:
+            # NPU length updates live in the backend. Keep one graph per step;
+            # combined multi-step NPU capture is not enabled here.
             self.cuda_graph_runner_for_draft_extend = (
-                MultiLayerEagleMultiStepDraftExtendNpuGraphRunner(self)
+                MultiLayerEagleMultiStepDraftExtendCudaGraphRunner(self)
             )
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         self._specialized_graph_memory_usage["draft_extend"] = (
@@ -1117,21 +1114,20 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         )
 
     @property
-    def draft_swa_window(self) -> int:
-        # The widened extend starts front rows below the committed length, and
-        # each depth reads its own window back from there.
+    def draft_window_reaches(self) -> dict[str, int]:
+        # Widened extend reads front rows before the committed length. The
+        # attention role "swa" may route to a different storage band per runner.
         draft = self._draft_worker
-        windows = [
-            runner.sliding_window_size
-            for runner in draft.draft_runner_list
-            if runner.runner_ids.is_fused_draft
-            and runner.token_to_kv_pool.layer_router.routes_to(
-                IdSpaceKind.SLIDING_WINDOW
-            )
-        ]
-        if not windows:
-            return 0
-        return max(windows) + draft.draft_extend_num_front_tokens
+        reaches = {}
+        for runner in draft.draft_runner_list:
+            if not runner.runner_ids.is_fused_draft:
+                continue
+            router = runner.token_to_kv_pool.layer_router
+            if router.routes_to(IdSpaceKind.SLIDING_WINDOW):
+                name = router.storage_name(IdSpaceKind.SLIDING_WINDOW)
+                reach = runner.sliding_window_size + draft.draft_extend_num_front_tokens
+                reaches[name] = max(reaches.get(name, 0), reach)
+        return reaches
 
     def forward_batch_generation(
         self,
