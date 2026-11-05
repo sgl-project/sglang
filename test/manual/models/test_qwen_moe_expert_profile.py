@@ -258,7 +258,9 @@ def run_engine(args, name, original):
         )
         exported = args.work_dir / f"{name}-weights"
         exported.mkdir()
-        engine.save_sharded_model(path=str(exported), pattern="rank-{rank}.safetensors")
+        engine.save_sharded_model(
+            path=str(exported), pattern="rank-{rank}.safetensors", max_size=None
+        )
         keep = KEEP[int(name[-1])] if name != "full" else [list(range(8))] * 2
         shapes = check_exported_weights(
             exported, original, keep, args.tp_size, name.startswith("reference")
