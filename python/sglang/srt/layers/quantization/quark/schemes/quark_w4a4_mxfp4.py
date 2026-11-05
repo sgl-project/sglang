@@ -45,8 +45,8 @@ _AFP4WFP4_MIN_BLOCK_K = 128
 
 def _afp4wfp4_even_k_block(block_k: int, k: int) -> Optional[int]:
     """BLOCK_SIZE_K that divides ``k`` FP4 elements, or None when none at or above the minimum does."""
-    # gemm_afp4wfp4 itself shrinks a block wider than K to K's next power of two.
-    block_k = min(max(block_k, _AFP4WFP4_MIN_BLOCK_K), 1 << (k - 1).bit_length())
+    # gemm_afp4wfp4 shrinks a block wider than K to K's next power of two, then raises it to the minimum.
+    block_k = max(min(block_k, 1 << (k - 1).bit_length()), _AFP4WFP4_MIN_BLOCK_K)
     while block_k > _AFP4WFP4_MIN_BLOCK_K and k % block_k:
         block_k //= 2
     return block_k if k % block_k == 0 else None

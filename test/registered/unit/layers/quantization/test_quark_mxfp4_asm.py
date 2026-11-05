@@ -136,6 +136,8 @@ class TestAfp4wfp4EvenKBlock(CustomTestCase):
         # No power-of-two divisor of K at or above the minimum block.
         self.assertIsNone(_afp4wfp4_even_k_block(block_k=256, k=160))
         self.assertIsNone(_afp4wfp4_even_k_block(block_k=512, k=2880))
+        # A K below the minimum: the kernel wrapper raises the block back to the minimum.
+        self.assertIsNone(_afp4wfp4_even_k_block(block_k=256, k=64))
 
 
 class TestAfp4wfp4EvenKConfig(CustomTestCase):
