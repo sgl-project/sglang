@@ -555,6 +555,12 @@ def _check_dsa_backend_constraints(
     """Validate DSA backend / platform / kv-cache-dtype constraints."""
     chosen = {prefill_backend, decode_backend}
 
+    # The SM100/SM103/SM107 check is check_prims_ts_sparse_mla_support, at backend init.
+    if "prims_ts" in chosen and (hip or kv_cache_dtype != "fp8_e4m3"):
+        raise ValueError(
+            "The prims_ts DSA backend needs CUDA and --kv-cache-dtype fp8_e4m3."
+        )
+
     rocm_only = {"triton"} & chosen
     if not hip and rocm_only:
         raise ValueError(

@@ -14,7 +14,10 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.dsa.utils import is_graph_dsa_split_op_surface
-from sglang.srt.layers.attention.dsa_backend import prepare_kv_for_attention
+from sglang.srt.layers.attention.dsa_backend import (
+    prepare_kv_for_attention,
+    uses_raw_fp8_dsa_kv_layout,
+)
 from sglang.srt.layers.attention.graph_utils import padded_extend_real_tokens
 from sglang.srt.layers.cp.interleave import (
     DSAInterleaveCPIndexerOverlap,
@@ -1078,8 +1081,8 @@ class DeepseekMLAForwardMixin:
             return False
         if self.current_attention_backend in ("dsa", "nsa"):
             return (
-                get_exec().kernel.dsa_decode_backend == "trtllm"
-                or get_exec().kernel.dsa_prefill_backend == "trtllm"
+                uses_raw_fp8_dsa_kv_layout(get_exec().kernel.dsa_decode_backend)
+                or uses_raw_fp8_dsa_kv_layout(get_exec().kernel.dsa_prefill_backend)
             ) and get_attn_backend().kv_cache_dtype == torch.float8_e4m3fn
 
         return (
