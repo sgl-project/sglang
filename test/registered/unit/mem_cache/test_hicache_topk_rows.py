@@ -35,9 +35,7 @@ class TestHiCacheTopkRows(CustomTestCase):
             "sglang.srt.mem_cache.hicache_topk_rows.get_global_experts_capturer",
             return_value=self.capturer,
         ):
-            self.rows = HostTopkRows.create(
-                host_pool=HOST_POOL, device="cuda", has_storage_backend=False
-            )
+            self.rows = HostTopkRows.create(host_pool=HOST_POOL, device="cuda")
         self.stream = torch.cuda.Stream()
         self.expected = torch.arange(18, dtype=torch.int32).view(3, 2, 3)
 

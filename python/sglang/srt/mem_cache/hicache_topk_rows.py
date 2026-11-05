@@ -16,7 +16,6 @@ copied when its ack is processed, or earlier when get_topk reads rows.
 """
 
 import collections
-import logging
 from typing import Any, Optional
 
 import msgspec
@@ -24,8 +23,6 @@ import torch
 
 from sglang.srt.state_capturer.base import BaseTopkCapturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
-
-logger = logging.getLogger(__name__)
 
 
 class TopkRowCopy(msgspec.Struct):
@@ -50,17 +47,10 @@ class HostTopkRows:
         capturer.add_pre_read_hook(self.apply_pending_loads)
 
     @staticmethod
-    def create(
-        host_pool: Any, device: str, has_storage_backend: bool
-    ) -> Optional["HostTopkRows"]:
+    def create(host_pool: Any, device: str) -> Optional["HostTopkRows"]:
         capturer = get_global_experts_capturer()
         if capturer is None:
             return None
-        if has_storage_backend:
-            logger.warning(
-                "Routed experts are not stored in the HiCache storage backend: "
-                "prefix pages loaded from storage return stale routed-experts rows."
-            )
         # Host slot ids span the logical size (DCP and page-interleaved pools
         # give each physical row several logical slots).
         return HostTopkRows(

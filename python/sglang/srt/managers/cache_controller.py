@@ -390,9 +390,7 @@ class HiCacheController:
         from sglang.srt.mem_cache.hicache_topk_rows import HostTopkRows
 
         self.topk_rows = HostTopkRows.create(
-            host_pool=self.mem_pool_host,
-            device=str(self.device),
-            has_storage_backend=storage_backend is not None,
+            host_pool=self.mem_pool_host, device=str(self.device)
         )
 
         # If a storage backend is provided at startup, treat it as an implicit attach,
@@ -722,6 +720,13 @@ class HiCacheController:
             self.page_get_func = self._generic_page_get
             self.page_set_func = self._generic_page_set
             raise
+
+        # getattr: test doubles build controllers without __init__.
+        if getattr(self, "topk_rows", None) is not None:
+            logger.warning(
+                "Routed experts are not stored in the HiCache storage backend: "
+                "prefix pages loaded from storage return stale routed-experts rows."
+            )
 
     def detach_storage_backend(self):
         """Detach (disable) storage backend at runtime.
