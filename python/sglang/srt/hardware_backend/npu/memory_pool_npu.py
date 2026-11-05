@@ -712,7 +712,24 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self.kr_cache_dim = 0 if self.dsa_kv_cache_store_fp8 else qk_rope_head_dim
         self.index_k_scale_buffer = None
         self.indexer_hadamard_128 = None
-        self.index_page_size = page_size if index_page_size is None else index_page_size
+        compress = index_kpool > 1 and index_kpool_compress
+        if compress:
+            if get_parallel().attn_dcp_size > 1:
+                raise ValueError("NPU DSA KPool does not support DCP > 1")
+            if dtype != torch.bfloat16:
+                raise ValueError("NPU DSA KPool requires a BF16 cache")
+            if page_size != 128 * index_kpool:
+                raise ValueError(
+                    "NPU DSA KPool requires 128 * index_kpool logical pages"
+                )
+        expected_index_page_size = page_size // index_kpool if compress else page_size
+        if compress and index_page_size not in (None, expected_index_page_size):
+            raise ValueError("index_page_size must equal page_size / index_kpool")
+        self.index_page_size = (
+            expected_index_page_size if index_page_size is None else index_page_size
+        )
+        # Capacity is still expressed in original token slots, even when each
+        # logical KV page owns only page_size / r compressed index keys.
         self.index_size = size if index_size is None else index_size
         parallel = get_parallel()
         self.dcp_size = parallel.attn_dcp_size
@@ -776,7 +793,11 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 self.index_k_buffer = torch.zeros(
                     (
                         self.num_indexer_layers,
-                        self.index_size // self.index_page_size
+                        (
+                            self.index_size // self.page_size
+                            if self.kpool_use_compress
+                            else self.index_size // self.index_page_size
+                        )
                         + self.index_page_padding,
                         self.index_page_size,
                         1,
@@ -906,7 +927,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             seq_lens=seq_lens,
             out_cache_loc=out_cache_loc,
             pool_size=self.index_kpool,
-            slots_per_page=self.page_size,
+            slots_per_page=self.index_page_size,
         )
 
     def _mla_buffer_info(self):
@@ -973,6 +994,12 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 kv_size_bytes += get_tensor_size_bytes(index_k_cache)
         if self.index_k_scale_buffer is not None:
             kv_size_bytes += get_tensor_size_bytes(self.index_k_scale_buffer)
+        if self.kpool_use_compress:
+            kv_size_bytes += sum(
+                get_tensor_size_bytes(buf)
+                for buffers in (self._compress_tail_k, self._compress_tail_score)
+                for buf in buffers
+            )
         return kv_size_bytes
 
     def _raise_if_native_kv_cache_disabled(self):
@@ -990,10 +1017,20 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         self._raise_if_native_kv_cache_disabled()
-        return (
-            self.k_buffer[layer_id - self.start_layer],
-            self.v_buffer[layer_id - self.start_layer],
-        )
+        k = self.k_buffer[layer_id - self.start_layer]
+        v = self.v_buffer[layer_id - self.start_layer]
+        if self.kpool_use_compress:
+            physical_page_size = self.page_size // self.index_kpool
+
+            def physical_view(cache):
+                return cache.view(
+                    cache.shape[0] * cache.shape[1] // physical_page_size,
+                    physical_page_size,
+                    *cache.shape[2:],
+                )
+
+            k, v = physical_view(k), physical_view(v)
+        return k, v
 
     def get_state_buf_infos(self):
         if self.index_head_dim is None:
@@ -1196,11 +1233,18 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         """Store MLA latent and RoPE KV tensors in FIA's NZ tile order."""
 
         def scatter(cache: torch.Tensor, values: torch.Tensor, head_dim: int):
+            if head_dim == 0:
+                return
             num_tiles = head_dim // 16
-            indices = _mla_fia_nz_scatter_indices(loc, head_dim, self.page_size)
+            physical_page_size = (
+                self.page_size // self.index_kpool
+                if self.kpool_use_compress
+                else self.page_size
+            )
+            indices = _mla_fia_nz_scatter_indices(loc, head_dim, physical_page_size)
             # Destination rows are ordered [page, tile, slot]. Source rows use
             # the matching [token, tile] order after this reshape.
-            dst = cache.view(-1, 1, num_tiles, self.page_size, 16).view(-1, 16)
+            dst = cache.view(-1, 1, num_tiles, physical_page_size, 16).view(-1, 16)
             src = values.contiguous().view(-1, num_tiles, 16).view(-1, 16)
             torch_npu.npu_scatter_nd_update_(dst, indices, src)
 
@@ -1283,8 +1327,65 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             ]
         return buffers
 
+    def _kpool_copy_pages(self, indices):
+        # Deduplicate in request order, not physical-page order. Reload may use
+        # completely different (and non-monotonic) allocator page IDs.
+        pages = torch.div(indices, self.page_size, rounding_mode="floor").tolist()
+        return torch.tensor(
+            list(dict.fromkeys(pages)), dtype=torch.int64, device=indices.device
+        )
+
+    def _get_kpool_cpu_copy(self, indices, req_pool_index):
+        if req_pool_index is None:
+            raise ValueError("KPool retraction requires a request slot for its tail")
+        pages = self._kpool_copy_pages(indices)
+        buffers = [self.k_buffer, self.v_buffer, self.index_k_buffer]
+        if self.index_k_scale_buffer is not None:
+            buffers.append(self.index_k_scale_buffer)
+        pages_per_chunk = max(1, self.cpu_offloading_chunk_size // self.page_size)
+        snapshot = [
+            [
+                buf[:, pages[start : start + pages_per_chunk]].to("cpu")
+                for buf in buffers
+            ]
+            for start in range(0, pages.numel(), pages_per_chunk)
+        ]
+        tails = [
+            [
+                buf[req_pool_index].to("cpu").clone() if buf.shape[0] else None
+                for buf in group
+            ]
+            for group in (self._compress_tail_k, self._compress_tail_score)
+        ]
+        return snapshot, tails
+
+    def _load_kpool_cpu_copy(self, snapshot, indices, req_pool_index):
+        if req_pool_index is None:
+            raise ValueError("KPool restore requires a request slot for its tail")
+        pages = self._kpool_copy_pages(indices)
+        saved_chunks, saved_tails = snapshot
+        buffers = [self.k_buffer, self.v_buffer, self.index_k_buffer]
+        if self.index_k_scale_buffer is not None:
+            buffers.append(self.index_k_scale_buffer)
+        if sum(chunk[0].shape[1] for chunk in saved_chunks) != pages.numel():
+            raise ValueError("KPool restore logical-page count differs from snapshot")
+        start = 0
+        for chunk in saved_chunks:
+            count = chunk[0].shape[1]
+            for buf, saved in zip(buffers, chunk, strict=True):
+                buf[:, pages[start : start + count]] = saved.to(buf.device)
+            start += count
+        for group, saved_group in zip(
+            (self._compress_tail_k, self._compress_tail_score), saved_tails, strict=True
+        ):
+            for buf, saved in zip(group, saved_group, strict=True):
+                if saved is not None:
+                    buf[req_pool_index].copy_(saved.to(buf.device))
+
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         torch.npu.synchronize()
+        if self.kpool_use_compress:
+            return self._get_kpool_cpu_copy(indices, req_pool_index)
         buf_of_layers = [
             self._get_cpu_offload_layer_buffers(i) for i in range(self.layer_num)
         ]
@@ -1307,6 +1408,10 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
     ):
         torch.npu.synchronize()
+        if self.kpool_use_compress:
+            self._load_kpool_cpu_copy(kv_cache_cpu, indices, req_pool_index)
+            torch.npu.synchronize()
+            return
         chunk_size = self.cpu_offloading_chunk_size
         for local_layer_id in range(self.layer_num):
             buffers = self._get_cpu_offload_layer_buffers(local_layer_id)

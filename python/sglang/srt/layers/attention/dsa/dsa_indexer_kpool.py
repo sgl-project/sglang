@@ -134,6 +134,53 @@ def _mqa_logits_row_chunks(
     )
 
 
+def _prepare_nonempty_pool_key_indexer_inputs(
+    query, weights, query_ends, pool_lens, tail_lens, page_table
+):
+    """Keep CANN's zero-pool and fully padded TND paths supplied with work.
+
+    The trailing request owns graph-padding queries and a sentinel query.
+    Empty real histories read a safe candidate which output packing discards.
+    Allocations belong to this invocation/capture, never a global workspace.
+    """
+    if page_table.shape[1] == 0:
+        page_table = F.pad(page_table, (0, 1))
+    return (
+        torch.cat((query, query.new_zeros((1, *query.shape[1:])))),
+        torch.cat((weights, weights.new_zeros((1, weights.shape[1])))),
+        torch.cat((query_ends, query_ends.new_full((1,), query.shape[0] + 1))),
+        torch.cat((pool_lens.clamp_min(1), pool_lens.new_ones((1,)))),
+        torch.cat((tail_lens, tail_lens.new_zeros((1,)))),
+        torch.cat((page_table, page_table.new_zeros((1, page_table.shape[1])))),
+    )
+
+
+def _pack_pool_key_indexer_indices(
+    indices, positions, query_ends, topk, pool_size, valid_mask=None
+):
+    """Restore real causal tails and remove dummy candidates and padding rows."""
+    rows = indices.shape[0]
+    positions = positions.reshape(-1)[:rows]
+    position_rows = positions.shape[0]
+    positions = F.pad(positions.to(torch.int64), (0, rows - position_rows))
+    row_ids = torch.arange(rows, device=indices.device)
+    valid_rows = row_ids < (query_ends[-1] if query_ends.numel() else 0)
+    valid_rows = valid_rows & (row_ids < position_rows) & (positions >= 0)
+    if valid_mask is not None:
+        valid_mask = valid_mask.reshape(-1)[:rows]
+        valid_rows = valid_rows & F.pad(valid_mask, (0, rows - valid_mask.shape[0]))
+    visible = (positions + 1).clamp_min(0).unsqueeze(1)
+    tail_start = torch.div(visible, pool_size, rounding_mode="floor") * pool_size
+    history = tail_start.clamp_max(topk)
+    cols = torch.arange(topk + pool_size - 1, device=indices.device).unsqueeze(0)
+    history_valid = (cols < history) & (indices >= 0) & (indices < tail_start)
+    result = torch.where(history_valid, indices, -1)
+    tail_col = cols - history
+    tail_valid = (tail_col >= 0) & (tail_col < visible - tail_start)
+    result = torch.where(tail_valid, (tail_start + tail_col).to(torch.int32), result)
+    return torch.where(valid_rows.unsqueeze(1), result, -1)
+
+
 def _a5_full_topk_for_short_sequences(topk_result, causal_lens):
     """Select all causal tokens below the A5 2048-token sparse threshold.
 
@@ -1923,7 +1970,7 @@ class IndexerKPool(MultiPlatformOp):
         dynamic_scale: torch.Tensor = None,
         return_indices: bool = True,
     ) -> Optional[torch.Tensor]:
-        """NPU BF16 compression and vendor lightning-indexer top-k path."""
+        """BF16 compression and request-level pooled-key selection on A3/A5."""
 
         metadata = get_attn_backend().get_indexer_metadata(layer_id, forward_batch)
 
@@ -1982,40 +2029,69 @@ class IndexerKPool(MultiPlatformOp):
                 f"NPU kpool does not support forward_mode={forward_batch.forward_mode}"
             )
 
-        if (
-            is_mtp or forward_batch.forward_mode.is_extend_without_speculative()
-        ) and not return_indices:
+        if not return_indices:
             # Layers that skip top-k only update the index cache and do not need
             # to continue with read-side computation.
             return None
 
-        # Decode prepares weights and pooled page metadata in fused kernels.
-        if forward_batch.forward_mode.is_decode_or_idle():
-            w_bf16, pool_seqlens, pool_block_tables = (
-                self._prepare_decode_indexer_inputs_npu(x, metadata)
+        return self._get_topk_pool_key_npu(
+            layer_id,
+            query,
+            x,
+            positions,
+            metadata,
+            forward_batch.out_cache_loc != 0,
+        )
+
+    def _get_pool_key_indexer_weights_npu(self, x):
+        weights, _ = self.weights_proj(x.float())
+        # PoolKeyIndexer already applies 1/sqrt(D) before ReLU.
+        return (weights * self.n_heads**-0.5).to(torch.bfloat16).contiguous()
+
+    def _get_topk_pool_key_npu(
+        self, layer_id, query, x, positions, metadata, valid_mask
+    ):
+        from sgl_kernel_npu.operators.indexer import pool_key_indexer
+
+        attn = metadata.attn_metadata
+        if attn.pool_query_ends is None:
+            raise RuntimeError(
+                "NPU KPool requires request-level pooled-indexer metadata"
             )
-            topk_result = self._get_topk_paged_npu(
-                layer_id,
-                query,
-                w_bf16,
-                metadata,
-                prepared=(pool_seqlens, pool_block_tables),
-            )
-            return self._fix_short_sequence_topk_a5(topk_result, metadata, mode)
-
-        # ── Compute weights (logits head gate) ──
-        # NPU uses BF16 (no FP8 quant), so q_scale = 1 (no act_quant).
-        # _get_logits_head_gate computes: weights_proj(x) * n_heads^-0.5 * q_scale * softmax_scale
-        # With q_scale=1, this matches the transformers reference exactly:
-        #   scores = relu(q @ k^T * softmax_scale)
-        #   index_scores = matmul(weights_proj(x) * n_heads^-0.5, scores)
-        weights = self._get_logits_head_gate_npu(x)
-
-        # Extend and MTP use per-query causal lengths with vendor paged-cache
-        # top-k. The write phase above rejects unsupported forward modes.
-        topk_result = self._get_topk_ragged_npu(layer_id, query, weights, metadata)
-
-        return self._fix_short_sequence_topk_a5(topk_result, metadata, mode)
+        weights = self._get_pool_key_indexer_weights_npu(x)
+        inputs = _prepare_nonempty_pool_key_indexer_inputs(
+            query.contiguous(),
+            weights,
+            attn.pool_query_ends,
+            attn.pool_key_lens,
+            attn.pool_tail_lens,
+            attn.pool_page_table,
+        )
+        query_safe, weights_safe, ends, lengths, tails, tables = inputs
+        indices = pool_key_indexer(
+            query=query_safe,
+            pool_key=get_token_to_kv_pool().get_index_k_with_scale_buffer(layer_id),
+            weights=weights_safe,
+            pool_tail_k=tails,
+            actual_seq_q=ends,
+            actual_seq_k=lengths,
+            block_table=tables,
+            layout_q="TND",
+            layout_k="PA_BBND",
+            topk=self.index_topk,
+            pool_size=self.index_kpool,
+            mask_mode=3,
+            quant_mode=-1,
+            return_value=False,
+        )
+        return _pack_pool_key_indexer_indices(
+            indices[: query.shape[0]],
+            positions,
+            attn.pool_query_ends,
+            self.index_topk,
+            self.index_kpool,
+            valid_mask,
+        )
 
     def _fix_short_sequence_topk_a5(self, topk_result, metadata, mode):
         if not is_npu_arch35() or self.index_topk < 2048:

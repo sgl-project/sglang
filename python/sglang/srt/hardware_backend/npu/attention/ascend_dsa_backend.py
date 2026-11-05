@@ -39,6 +39,12 @@ class AscendDSAForwardMetadata(ForwardMetadata):
     dsa_seqlens_expanded: Optional[torch.Tensor] = None
     token_to_batch_idx: Optional[torch.Tensor] = None
 
+    # Request-level inputs for the A3/A5 pooled-key indexer.
+    pool_query_ends: Optional[torch.Tensor] = None
+    pool_key_lens: Optional[torch.Tensor] = None
+    pool_tail_lens: Optional[torch.Tensor] = None
+    pool_page_table: Optional[torch.Tensor] = None
+
     # ── KPool plans ──
     kpool_extend_plan: Optional[KPoolExtendPlan] = None
     kpool_write_plan: Optional[KPoolWritePlan] = None
@@ -73,7 +79,7 @@ class AscendDSAIndexerMetadata(BaseIndexerMetadata):
 
     def topk_transform(self, logits: torch.Tensor, topk: int, **_) -> torch.Tensor:
         raise NotImplementedError(
-            "NPU KPool uses the vendor lightning indexer instead of topk_transform"
+            "NPU KPool uses a vendor indexer instead of topk_transform"
         )
 
 
@@ -94,6 +100,9 @@ class AscendDSAAttnBackend(AscendAttnBackend):
                 f"divides page_size; got page_size={self.page_size}, "
                 f"index_kpool={self.dsa_index_kpool}."
             )
+            # Allocator pages own a whole index page; attention still reads
+            # 128-token physical KV pages. Metadata inherits this value.
+            self.page_size //= self.dsa_index_kpool
 
     def _create_forward_metadata(self) -> AscendDSAForwardMetadata:
         return AscendDSAForwardMetadata(page_size=self.page_size)
@@ -214,8 +223,8 @@ class AscendDSAAttnBackend(AscendAttnBackend):
         query_lens = self._query_lens_device(forward_batch)
 
         # The KPool write plan indexes the page table with one row per request.
-        # Expand it per query at the indexer's paged entry point for MTP reads;
-        # do not change the row semantics here.
+        # A3/A5 pooled-key reads also keep request rows. Per-query expansion
+        # remains available for causal positions and the shared write plan.
         max_seq_len_k = self._cache_seqlens_cpu_max(forward_batch)
         page_table_1 = self.req_to_token_pool.req_to_token[
             forward_batch.req_pool_indices[: forward_batch.batch_size],
@@ -269,6 +278,7 @@ class AscendDSAAttnBackend(AscendAttnBackend):
         metadata.real_page_table = real_page_table
         metadata.dsa_seqlens_expanded = seq_lens_expanded
         metadata.token_to_batch_idx = token_request_ids
+        self._update_pool_indexer_metadata(metadata, cache_seqlens, query_lens)
 
         # Allocate the plan once during capture; _replay_dsa_metadata refreshes
         # it in place during replay.
@@ -282,6 +292,41 @@ class AscendDSAAttnBackend(AscendAttnBackend):
                 metadata.dsa_seqlens_expanded,
             )
 
+    def _update_pool_indexer_metadata(
+        self,
+        metadata: AscendDSAForwardMetadata,
+        cache_seqlens: torch.Tensor,
+        query_lens: torch.Tensor,
+        *,
+        replay: bool = False,
+    ) -> None:
+        if self.dsa_index_kpool <= 1:
+            return
+        ratio = self.dsa_index_kpool
+        values = (
+            ("pool_query_ends", torch.cumsum(query_lens, dim=0, dtype=torch.int64)),
+            (
+                "pool_key_lens",
+                torch.div(cache_seqlens, ratio, rounding_mode="floor").to(torch.int64),
+            ),
+            ("pool_tail_lens", torch.remainder(cache_seqlens, ratio).to(torch.int64)),
+            (
+                "pool_page_table",
+                (metadata.real_page_table[:, ::ratio] // ratio).contiguous(),
+            ),
+        )
+        for name, value in values:
+            if replay:
+                target = getattr(metadata, name)
+                if target is None or target.shape != value.shape:
+                    raise RuntimeError(
+                        f"DSA graph replay {name} shape differs from capture: "
+                        f"captured={getattr(target, 'shape', None)}, replay={value.shape}."
+                    )
+                target.copy_(value)
+            else:
+                setattr(metadata, name, value)
+
     def _init_kpool_metadata(
         self,
         metadata: AscendDSAForwardMetadata,
@@ -289,32 +334,31 @@ class AscendDSAAttnBackend(AscendAttnBackend):
         real_page_table: torch.Tensor,
         seq_lens_expanded: torch.Tensor,
     ) -> None:
-        """Compute KPoolExtendPlan / KPoolWritePlan (NPU PyTorch variants).
-
-        Mirrors dsa_backend.py _init_kpool_metadata but uses NPU-safe
-        PyTorch implementations instead of CUDA Triton kernels.
-        """
+        """Build shared KPool plans without GPU ragged-logits metadata."""
         from sglang.srt.layers.attention.dsa.kpool_plan import (
             _alloc_kpool_write_plan_buffers,
-            init_kpool_extend_metadata_npu,
+            init_kpool_extend_metadata,
             update_kpool_write_plan_npu,
         )
 
         pool_size = self.dsa_index_kpool
-        slots_per_page = self.page_size
+        slots_per_page = self.token_to_kv_pool.index_page_size
         forward_mode = forward_batch.forward_mode
 
         # ── Extend: build KPoolExtendPlan (writes + tails) ──
         if forward_mode.is_extend_without_speculative():
-            init_kpool_extend_metadata_npu(
+            planned = init_kpool_extend_metadata(
                 metadata,
                 forward_batch,
-                pool_size=pool_size,
-                real_page_size=self.page_size,
-                slots_per_page=slots_per_page,
+                kpool=pool_size,
+                physical_page_size=self.page_size,
+                index_page_size=slots_per_page,
+                topk_transform_method=None,
                 full_real_page_table=real_page_table,
-                local_seqlens_expanded=seq_lens_expanded,
+                full_seqlens_expanded=seq_lens_expanded,
+                build_ragged_metadata=False,
             )
+            metadata.kpool_extend_plan = planned.kpool_extend_plan
             return
 
         # ── Verify / draft-extend-v2: build KPoolWritePlan ──
@@ -423,6 +467,9 @@ class AscendDSAAttnBackend(AscendAttnBackend):
                 f"replay={new_real_page_table.shape}, batch_size={bs}."
             )
         metadata.real_page_table[:n_rows, :n_cols].copy_(new_real_page_table)
+        self._update_pool_indexer_metadata(
+            metadata, cache_seqlens, query_lens, replay=True
+        )
 
         # 3. dsa_seqlens_expanded — update causal lengths for each query token
         needs_causal_expansion = (
@@ -512,7 +559,7 @@ class AscendDSAAttnBackend(AscendAttnBackend):
                     real_page_size=self.page_size,
                     num_draft_tokens=num_draft_tokens,
                     forward_mode=forward_mode,
-                    slots_per_page=self.page_size,
+                    slots_per_page=self.token_to_kv_pool.index_page_size,
                     effective_n_per_batch=effective_n_per_batch,
                 )
 
