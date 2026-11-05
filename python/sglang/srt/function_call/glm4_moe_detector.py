@@ -16,8 +16,8 @@ from sglang.srt.function_call.core_types import (
     _GetInfoFunc,
 )
 from sglang.srt.function_call.utils import (
+    get_argument_type,
     get_schema_properties,
-    infer_type_from_json_schema,
     safe_literal_eval,
 )
 
@@ -32,39 +32,6 @@ class StreamState(str, Enum):
     IN_KEY = "IN_KEY"
     WAITING_VALUE = "WAITING_VALUE"
     IN_VALUE = "IN_VALUE"
-
-
-def get_argument_type(
-    func_name: str, arg_key: str, defined_tools: List[Tool]
-) -> Optional[str]:
-    """Get the expected type of a function argument from tool definitions.
-
-    Supports complex JSON Schema definitions including:
-    - Direct type field (including type arrays)
-    - anyOf/oneOf: parameter can be any of multiple types
-    - enum: parameter must be one of enum values
-    - allOf: parameter must satisfy all type definitions
-    - properties: inferred as object type
-    - items: inferred as array type
-
-    Args:
-        func_name: Name of the function/tool
-        arg_key: Name of the argument
-        defined_tools: List of available tools
-
-    Returns:
-        The type string (e.g., 'string', 'number', 'object') or None if not found
-    """
-    name2tool = {tool.function.name: tool for tool in defined_tools}
-    if func_name not in name2tool:
-        return None
-    tool = name2tool[func_name]
-    properties = get_schema_properties(tool.function.parameters)
-    if arg_key not in properties:
-        return None
-
-    # Use new type inference function for complex JSON Schema support
-    return infer_type_from_json_schema(properties[arg_key])
 
 
 def _convert_to_number(value: str) -> Any:
