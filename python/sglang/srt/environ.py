@@ -1258,6 +1258,8 @@ class Envs:
     SGLANG_MOE_NVFP4_DISPATCH = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE = EnvBool(False)
+    # Kill switch for fusing dense-MLP SiLU*mul with the NVFP4 down_proj input quant.
+    SGLANG_DISABLE_SILU_FP4_QUANT_FUSION = EnvBool(False)
     # GLM NextN (MTP): cast the draft layer's bf16 fused MoE to per-channel FP8
     # on load. Unrelated to the NVFP4 block-FP8 NextN path above.
     SGLANG_GLM_NEXTN_MOE_PTPC = EnvBool(False)
@@ -1409,6 +1411,9 @@ class Envs:
     # the batch fits the chunk budget.
     SGLANG_TRITON_DENSE_PREFILL_ATTN = EnvBool(True)
     SGLANG_ENABLE_TORCH_COMPILE = EnvBool(False)
+    SGLANG_TORCH_DYNAMIC_SHAPE = EnvBool(False)
+    # torch.compile backend for CPU graphs (defaults to "inductor"; "eager" or "aot_eager" for debugging)
+    SGLANG_CPU_GRAPH_COMPILE_BACKEND = EnvStr("inductor")
     SGLANG_TRITON_DECODE_SPLIT_TILE_SIZE = EnvInt(256)
 
     # ===================================================================
@@ -1572,6 +1577,11 @@ class Envs:
     # and benchmarks at parity, so this is a consolidation escape hatch, not a perf flip.
     SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK = EnvBool(False)
     SGLANG_OPT_USE_TOPK_V2 = EnvBool(True)
+    # Exactness of the top-k v2 kernel, compiled in once per process: 0 fast (an
+    # overflowing threshold bin keeps an arbitrary subset; opt-in), 1 exact (values
+    # equal torch.topk's; the default on every platform), 2 exact with the same
+    # selected set on every run.
+    SGLANG_TOPK_V2_MODE = EnvInt(1)
 
     # ===================================================================
     # Kernel selection and fused backends
