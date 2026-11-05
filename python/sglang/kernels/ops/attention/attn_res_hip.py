@@ -22,6 +22,8 @@ import triton.language as tl
 # limit with H=7168 (one masked tile of 8192) and nvb <= 8.
 MAX_REGISTER_TILE: int = 8 * 8192
 
+_AGG_NUM_WARPS = 4
+
 
 @cache
 def supports_attn_res_hip(hidden_size: int, nvb: int) -> bool:
@@ -43,6 +45,7 @@ def _agg_kernel(
     cw_ptr,  # [H] fp32; score_norm weight * score_proj weight
     ow_ptr,  # [H]; out RMSNorm weight, unread when not APPLY_OUT_NORM
     out_ptr,  # [T, H]
+    out8_ptr,  # [T, H] E4M3 copy of out (unit scale, saturating), written when HAS_OUT8
     score_eps,
     out_eps,
     stride_pm,
@@ -51,6 +54,7 @@ def _agg_kernel(
     stride_bm,
     stride_bb,
     stride_o,
+    stride_o8,
     H: tl.constexpr,
     BLOCK_H: tl.constexpr,
     NVB: tl.constexpr,
@@ -58,6 +62,7 @@ def _agg_kernel(
     HAS_ADD: tl.constexpr,
     WRITE_BANK: tl.constexpr,
     APPLY_OUT_NORM: tl.constexpr,
+    HAS_OUT8: tl.constexpr,
 ):
     """One CTA per token: score the NVB+1 rows, softmax, mix, apply the output
     RMSNorm, all in one launch.
@@ -130,7 +135,114 @@ def _agg_kernel(
         scale = 1.0 / tl.sqrt(tl.sum(acc * acc) / H + out_eps)
         ow = tl.load(ow_ptr + offs, mask=mask, other=0.0).to(tl.float32)
         acc = acc * scale * ow
-    tl.store(out_ptr + t * stride_o + offs, acc.to(out_ptr.dtype.element_ty), mask=mask)
+    ob = acc.to(out_ptr.dtype.element_ty)
+    tl.store(out_ptr + t * stride_o + offs, ob, mask=mask)
+    if HAS_OUT8:
+        # Same value the next static-FP8 GEMM would quantize: the rounded output,
+        # saturated to the E4M3 range (unit activation scale).
+        q = tl.minimum(tl.maximum(ob.to(tl.float32), -448.0), 448.0)
+        tl.store(
+            out8_ptr + t * stride_o8 + offs, q.to(out8_ptr.dtype.element_ty), mask=mask
+        )
+
+
+# Token count from which attn_res_hip switches to _agg_stream_kernel. Below it
+# the launch is a few CTAs and _agg_kernel's all-rows-in-flight shape wins on
+# latency (T=64, NVB=8: 15 vs 16.5us); from ~T=128 the two tie and by T=256 the
+# stream kernel is ahead at every NVB (NVB=8: 19.5 vs 22.5us, T=512: 18.5 vs
+# 32us, T=8192: 284 vs 411us). 256 keeps decode batches on the old kernel.
+# Measured on MI355X (H=7168).
+_STREAM_MIN_T = 256
+_STREAM_NUM_WARPS = 4
+
+
+@triton.jit
+def _agg_stream_kernel(
+    prefix_ptr,
+    addend_ptr,
+    prefix_out_ptr,
+    bank_ptr,
+    cw_ptr,
+    ow_ptr,
+    out_ptr,
+    out8_ptr,
+    score_eps,
+    out_eps,
+    stride_pm,
+    stride_am,
+    stride_om,
+    stride_bm,
+    stride_bb,
+    stride_o,
+    stride_o8,
+    H: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    NVB: tl.constexpr,
+    HAS_ADD: tl.constexpr,
+    WRITE_BANK: tl.constexpr,
+    APPLY_OUT_NORM: tl.constexpr,
+    HAS_OUT8: tl.constexpr,
+):
+    """Bandwidth-bound prefill variant of _agg_kernel: rows stream through an
+    online softmax so the bank is read once with a small register tile (the
+    full [next_pow2(NVB), 8192] tile costs occupancy at large T). Outputs match
+    _agg_kernel up to rare 1-ulp bf16 flips from the running-max rescale."""
+    t = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_H)
+    mask = offs < H
+
+    row = tl.load(prefix_ptr + t * stride_pm + offs, mask=mask, other=0.0)
+    if HAS_ADD:
+        row = (
+            row.to(tl.float32)
+            + tl.load(addend_ptr + t * stride_am + offs, mask=mask, other=0.0).to(
+                tl.float32
+            )
+        ).to(prefix_out_ptr.dtype.element_ty)
+        # Streaming stores (.cs): nothing in this launch reads these back.
+        tl.store(
+            prefix_out_ptr + t * stride_om + offs, row, mask=mask, cache_modifier=".cs"
+        )
+    if WRITE_BANK:
+        tl.store(
+            bank_ptr + t * stride_bm + NVB * stride_bb + offs,
+            row,
+            mask=mask,
+            cache_modifier=".cs",
+        )
+    pv = row.to(tl.float32)
+
+    cw = tl.load(cw_ptr + offs, mask=mask, other=0.0)
+    # the prefix row seeds the running max, mix and denominator
+    m = tl.sum(pv * cw) / tl.sqrt(tl.sum(pv * pv) / H + score_eps)
+    acc = pv
+    den = 1.0
+    brow = bank_ptr + t * stride_bm
+    for r in tl.range(NVB):
+        x = tl.load(brow + r * stride_bb + offs, mask=mask, other=0.0).to(tl.float32)
+        s = tl.sum(x * cw) / tl.sqrt(tl.sum(x * x) / H + score_eps)
+        m_new = tl.maximum(m, s)
+        alpha = tl.exp(m - m_new)
+        e = tl.exp(s - m_new)
+        acc = acc * alpha + e * x
+        den = den * alpha + e
+        m = m_new
+    acc = acc * (1.0 / den)
+
+    if APPLY_OUT_NORM:
+        scale = 1.0 / tl.sqrt(tl.sum(acc * acc) / H + out_eps)
+        ow = tl.load(ow_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+        acc = acc * scale * ow
+    ob = acc.to(out_ptr.dtype.element_ty)
+    tl.store(out_ptr + t * stride_o + offs, ob, mask=mask, cache_modifier=".cs")
+    if HAS_OUT8:
+        q = tl.minimum(tl.maximum(ob.to(tl.float32), -448.0), 448.0)
+        tl.store(
+            out8_ptr + t * stride_o8 + offs,
+            q.to(out8_ptr.dtype.element_ty),
+            mask=mask,
+            cache_modifier=".cs",
+        )
 
 
 def attn_res_hip(
@@ -146,6 +258,7 @@ def attn_res_hip(
     addend: Optional[torch.Tensor] = None,
     prefix_out: Optional[torch.Tensor] = None,
     write_prefix: bool = False,
+    out_fp8: Optional[torch.Tensor] = None,
 ) -> None:
     """Single-kernel attention-residual aggregation for ROCm.
 
@@ -166,6 +279,8 @@ def attn_res_hip(
     addend     : fold a pending residual add in, so the aggregated prefix is
                  prefix_sum + addend; requires prefix_out
     prefix_out : [T, H] bf16 buffer receiving that materialized prefix
+    out_fp8    : optional [T, H] float8_e4m3fn buffer receiving the saturating
+                 E4M3 cast of out (unit scale), for a static-FP8 consumer GEMM
     write_prefix : also snapshot the prefix row into bank[:, nvb, :] (bit-exact
                  copy, fused into the score pass which already has the row in
                  registers); requires NB > nvb
@@ -184,6 +299,37 @@ def attn_res_hip(
     addend_arg = addend if has_add else prefix_sum
     prefix_out_arg = prefix_out if has_add else prefix_sum
     ow_arg = ow if ow is not None else cw
+    out8_arg = out_fp8 if out_fp8 is not None else out
+
+    if T >= _STREAM_MIN_T:
+        _agg_stream_kernel[(T,)](
+            prefix_sum,
+            addend_arg,
+            prefix_out_arg,
+            bank,
+            cw,
+            ow_arg,
+            out,
+            out8_arg,
+            score_eps,
+            out_eps,
+            prefix_sum.stride(0),
+            addend_arg.stride(0),
+            prefix_out_arg.stride(0),
+            bank.stride(0),
+            bank.stride(1),
+            out.stride(0),
+            out8_arg.stride(0),
+            H=H,
+            BLOCK_H=triton.next_power_of_2(H),
+            NVB=nvb,
+            HAS_ADD=has_add,
+            WRITE_BANK=write_prefix,
+            APPLY_OUT_NORM=ow is not None,
+            HAS_OUT8=out_fp8 is not None,
+            num_warps=_STREAM_NUM_WARPS,
+        )
+        return
 
     _agg_kernel[(T,)](
         prefix_sum,
@@ -193,6 +339,7 @@ def attn_res_hip(
         cw,
         ow_arg,
         out,
+        out8_arg,
         score_eps,
         out_eps,
         prefix_sum.stride(0),
@@ -201,6 +348,7 @@ def attn_res_hip(
         bank.stride(0),
         bank.stride(1),
         out.stride(0),
+        out8_arg.stride(0),
         H=H,
         BLOCK_H=triton.next_power_of_2(H),
         NVB=nvb,
@@ -208,5 +356,6 @@ def attn_res_hip(
         HAS_ADD=has_add,
         WRITE_BANK=write_prefix,
         APPLY_OUT_NORM=ow is not None,
-        num_warps=4,
+        HAS_OUT8=out_fp8 is not None,
+        num_warps=_AGG_NUM_WARPS,
     )
