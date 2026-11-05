@@ -3,10 +3,11 @@
 from unittest.mock import patch
 
 import pytest
-import sglang.srt.distributed.parallel_state as ps
 import test_ar_fusion as fixture
 import torch
 import torch.distributed as dist
+
+import sglang.srt.distributed.parallel_state as ps
 from sglang.kernels.ops.attention.dcp_kernels import (
     DcpDirectAllToAll,
     dcp_lse_combine_triton,

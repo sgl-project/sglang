@@ -85,6 +85,15 @@ register_kernel(
 
 register_kernel(
     KernelSpec(
+        op="attention.dcp_push_combine",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.dcp_push_combine:dcp_push_combine",
+        capabilities=CUDA_ONLY,
+    )
+)
+
+register_kernel(
+    KernelSpec(
         op="attention.kda_qwen38_qsa_sm121",
         backend=KernelBackend.KDA,
         target=("sglang.kernels.kda_kernels.qwen38_qsa_sm121:qwen38_qsa_sm121"),
