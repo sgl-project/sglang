@@ -1030,7 +1030,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 request,
                 finish_reason_type,
             )
-            if reasoning_text:
+            if reasoning_text and request.include_reasoning is not False:
                 usage = None
                 if continuous_usage_stats:
                     usage = UsageProcessor.calculate_token_usage(
@@ -2675,6 +2675,7 @@ class OpenAIServingChat(OpenAIServingBase):
                             ""
                             if self.reasoning_parser == "k2_horizon"
                             and request.separate_reasoning
+                            and request.include_reasoning is not False
                             else None
                         ),
                     )
@@ -3080,7 +3081,8 @@ class OpenAIServingChat(OpenAIServingBase):
                     # Only K2 templates replay empty reasoning; other parsers report None.
                     reasoning_content=(
                         reasoning_text
-                        if reasoning_text or self.reasoning_parser == "k2_horizon"
+                        if (reasoning_text or self.reasoning_parser == "k2_horizon")
+                        and request.include_reasoning is not False
                         else None
                     ),
                 ),
