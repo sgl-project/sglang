@@ -3452,11 +3452,16 @@ class UnifiedRadixCache(BasePrefixCache):
                     operation, info, hit_tokens, aux_hit_tokens
                 )
             aux_hit_tokens = hit_tokens
+
+            # Hybrid pools (SWA / Mamba) are trailing-window aligned, so a
+            # shortened recovery boundary may be invalid in storage; only
+            # full-only models may truncate the prefix to fit host capacity.
+            allow_partial = not info.comp_xfers
             host_indices, alloc_len = cc.allocate_storage_hit(
                 operation,
                 hit_tokens,
-                allow_partial=True,
-                min_tokens=self.prefetch_threshold,
+                allow_partial=allow_partial,
+                min_tokens=self.prefetch_threshold if allow_partial else hit_tokens,
                 evict_host=self.evict_host,
             )
             if host_indices is None:

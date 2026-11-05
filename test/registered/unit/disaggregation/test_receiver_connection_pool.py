@@ -513,6 +513,7 @@ class TestCommonReceiverLifecycle(CustomTestCase):
         receiver, _ = self._make_receiver()
         handler = object.__new__(DecodeStagingHandler)
         handler.staging_allocator = SimpleNamespace(_scatter_stream=None)
+        handler._defer_scatter = False
         decode_req = SimpleNamespace(_chunk_events=[])
         handler.release_room(17, decode_req, receiver)
         self.assertEqual(receiver.chunk_staging_infos, [])
