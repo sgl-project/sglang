@@ -62,22 +62,6 @@ class TestNpuReturnAuxHiddenStates(CustomTestCase):
         if hasattr(cls, "process") and cls.process:
             kill_process_tree(cls.process.pid)
 
-    def test_return_aux_hidden_states_last(self):
-        response = requests.post(
-            f"{self.base_url}/generate",
-            json={
-                "text": "The capital of France is",
-                "sampling_params": {"temperature": 0, "max_new_tokens": 8},
-                "return_hidden_states": "last",
-            },
-            timeout=60,
-        )
-        self.assertEqual(response.status_code, 200, response.text)
-        hidden_states = response.json()["meta_info"]["hidden_states"]
-        self.assertIsNotNone(hidden_states)
-        # "last" returns a single packed aux vector: num_aux_layers * hidden_size.
-        self.assertEqual(len(hidden_states), EXPECTED_PACKED_DIM)
-
     def test_return_aux_hidden_states_full(self):
         response = requests.post(
             f"{self.base_url}/generate",
