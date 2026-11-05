@@ -21,8 +21,10 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 class _Processor(QwenVLImageProcessor):
     def __init__(self):
         self.mm_tokens = SimpleNamespace(
-            image_token="<image>",
-            image_token_regex=re.compile(r"<image>"),
+            image_token="<|vision_start|><|image_pad|><|vision_end|>",
+            image_token_regex=re.compile(
+                r"<\|vision_start\|><\|image_pad\|><\|vision_end\|>"
+            ),
             image_token_id=2,
             video_token_id=3,
             audio_token_id=4,
@@ -61,7 +63,8 @@ class TestQwenPromptLifetime(CustomTestCase):
         artifact = _artifact()
         for index in range(8):
             output = processor.compose_image_artifacts(
-                f"<image> conversation turn {index}", [artifact]
+                f"<|vision_start|><|image_pad|><|vision_end|> conversation turn {index}",
+                [artifact],
             )
             self.assertIsNotNone(output)
             del output
@@ -70,7 +73,9 @@ class TestQwenPromptLifetime(CustomTestCase):
 
     def test_completed_prompt_does_not_keep_processor_alive(self):
         processor = _Processor()
-        output = processor.compose_image_artifacts("<image> question", [_artifact()])
+        output = processor.compose_image_artifacts(
+            "<|vision_start|><|image_pad|><|vision_end|> question", [_artifact()]
+        )
         ref = weakref.ref(processor)
         del output, processor
         gc.collect()
@@ -79,10 +84,14 @@ class TestQwenPromptLifetime(CustomTestCase):
     def test_repeated_prompt_outputs_are_independent(self):
         processor = _Processor()
         artifact = _artifact()
-        first = processor.compose_image_artifacts("<image> question", [artifact])
+        first = processor.compose_image_artifacts(
+            "<|vision_start|><|image_pad|><|vision_end|> question", [artifact]
+        )
         expected = first.mrope_positions.clone()
         first.mrope_positions.fill_(-1)
-        second = processor.compose_image_artifacts("<image> question", [artifact])
+        second = processor.compose_image_artifacts(
+            "<|vision_start|><|image_pad|><|vision_end|> question", [artifact]
+        )
         self.assertTrue(torch.equal(second.mrope_positions, expected))
         self.assertEqual(first.input_ids, second.input_ids)
 

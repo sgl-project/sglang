@@ -389,13 +389,11 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
             self.hf_config.vision_config, "tokens_per_second", None
         )
 
-        # Also match the legacy sglang <image> sentinel used by /generate,
-        # so the artifact fast path can normalize it before build_input_ids.
         self.mm_tokens = MultimodalSpecialTokens(
             image_token="<|vision_start|><|image_pad|><|vision_end|>",
             image_token_id=hf_config.image_token_id,
             image_token_regex=re.compile(
-                r"<\|vision_start\|>(?:<\|image_pad\|>)+<\|vision_end\|>|<image>"
+                r"<\|vision_start\|>(?:<\|image_pad\|>)+<\|vision_end\|>"
             ),
             video_token_id=self.VIDEO_TOKEN_ID,
             audio_token_id=self.audio_token_id,
