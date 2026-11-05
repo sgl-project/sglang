@@ -1039,6 +1039,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             bonus=draft_input.bonus_tokens.view(-1) if anchor_ids is not None else None,
             anchor_ids=anchor_ids,
         )
+        if batch.hisparse_coordinator is not None:
+            batch.out_cache_loc = verify_window.verify_cache_loc
+            batch.hisparse_coordinator.prepare_spec_verify(batch)
         if self._verify_inputs_ready is not None:
             # The verify's inputs are final here; the early metadata waits for this.
             self._verify_inputs_ready.record()
@@ -1322,6 +1325,10 @@ class DSparkWorkerV2(BaseSpecWorker):
                     bs=bs,
                     run_compact=run_compact,
                 )
+        if batch.hisparse_coordinator is not None:
+            batch.hisparse_coordinator.spec_swap.commit_compressed_tokens(
+                batch, prefix_lens=prefix_lens, commit_lens=accept.commit_lens
+            )
         logits_output.hidden_states = None
 
         self._observers.observe_verify_step(

@@ -850,5 +850,121 @@ def test_load_cache_to_device_buffer_rocm_large_lru_writeback() -> None:
     assert torch.equal(lru_slots.cpu().view(-1), expected_lru)
 
 
+@pytest.mark.skipif(not is_cuda(), reason="C4 speculative transfers require CUDA.")
+@pytest.mark.parametrize("commit", [0, 3, 6])
+def test_c4_spec_prepare_finalize_boundaries_and_graph_replay(commit):
+    from sglang.kernels.ops.kvcache.hisparse import (
+        finalize_hisparse_spec,
+        prepare_hisparse_spec_verify,
+    )
+
+    hot, width, prefix = 64, 6, 255
+    ids = torch.tensor([1, 1_000_000], dtype=torch.int64, device=DEVICE)
+    prefixes = torch.full_like(ids, prefix)
+    real_reqs = torch.tensor([1], dtype=torch.int32, device=DEVICE)
+    owners = torch.zeros((2, hot + 64), dtype=torch.int64, device=DEVICE)
+    owners[1] = 64 + torch.arange(hot + 64, device=DEVICE)
+    # Cache rotation can leave each layer with different physical locations.
+    locs = torch.stack((owners, owners.roll(8, dims=1))).to(torch.int32)
+    tokens = torch.full_like(locs, -1)
+    tokens[:, 1, :63] = torch.arange(63, device=DEVICE, dtype=torch.int32)
+    req_to_token = torch.zeros((2, prefix + width), dtype=torch.int32, device=DEVICE)
+    req_to_token[1] = 256 + torch.arange(prefix + width, device=DEVICE)
+    full_out = req_to_token[1, prefix:].long()
+    out = torch.where((full_out + 1) % 4 == 0, full_out // 4, 0)
+    padded_out = torch.cat((out, torch.zeros_like(out)))
+    mapping = torch.zeros(256, dtype=torch.int64, device=DEVICE)
+    host_locs = torch.zeros((2, 128), dtype=torch.int64, device=DEVICE)
+    host_locs[1] = torch.arange(128, device=DEVICE)
+    commits = torch.tensor([commit], dtype=torch.int32, device=DEVICE)
+    device = torch.zeros((2, 3, DSV4_PAGE_BYTES), dtype=torch.uint8, device=DEVICE)
+    host = torch.full((2, 3, DSV4_PAGE_BYTES), 0xA5, dtype=torch.uint8, pin_memory=True)
+    device_ptrs = torch.cat([_dsv4_ptrs(layer) for layer in device])
+    host_ptrs = torch.cat([_dsv4_ptrs(layer) for layer in host])
+
+    def prepare():
+        prepare_hisparse_spec_verify(
+            req_pool_indices=ids,
+            prefix_lens=prefixes,
+            hisparse_out_locs=padded_out,
+            req_to_device_buffer=owners,
+            device_buffer_tokens=tokens,
+            num_real_reqs=real_reqs,
+            logical_to_device_mapping=mapping,
+            verify_width=width,
+            hot_buffer_size=hot,
+        )
+
+    prepare()
+    torch.testing.assert_close(mapping[out[out > 0]], owners[1, hot + 1 : hot + 3])
+    torch.testing.assert_close(
+        tokens[:, 1, hot + 1 : hot + 3],
+        torch.tensor([[63, 64], [63, 64]], dtype=torch.int32, device=DEVICE),
+    )
+    for layer in range(2):
+        for ordinal in range(2):
+            _write_dsv4_token(
+                device[layer],
+                int(locs[layer, 1, hot + 1 + ordinal]),
+                seed=100 * layer + ordinal,
+            )
+
+    def finalize():
+        finalize_hisparse_spec(
+            device_ptrs=device_ptrs,
+            host_ptrs=host_ptrs,
+            req_pool_indices=ids[:1],
+            prefix_lens=prefixes[:1],
+            commit_lens=commits,
+            req_to_host_pool=host_locs,
+            device_buffer_locs=locs,
+            req_to_token=req_to_token,
+            device_buffer_tokens=tokens,
+            logical_to_device_mapping=mapping,
+            verify_width=width,
+            hot_buffer_size=hot,
+        )
+
+    finalize()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        prepare()
+        finalize()
+    host.fill_(0xA5)
+    mapping.zero_()
+    tokens[:, 1, hot - 1 : hot + 1].fill_(-1)
+    tokens[:, 1, hot + 1 :].fill_(-99)
+    for layer in range(2):
+        for slot in (hot - 1, hot):
+            _write_dsv4_token(device[layer], int(locs[layer, 1, slot]), seed=999)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    accepted = (prefix + commit) // 4 - prefix // 4
+    assert mapping.eq(0).all()
+    assert tokens[:, 0].eq(-1).all()
+    assert device[:, 0].eq(0).all()
+    assert tokens[:, :, hot + 1 : hot + 3].eq(-1).all()
+    assert tokens[:, 1, 63].eq(63 if accepted else -1).all()
+    assert tokens[:, 1, hot].eq(64 if accepted == 2 else -1).all()
+    for layer in range(2):
+        # Rejected/padded copies must never use host slot zero as a dummy sink.
+        assert _read_dsv4_token(host[layer], 0).eq(0xA5).all()
+        for ordinal in range(2):
+            backed_up = _read_dsv4_token(host[layer], 63 + ordinal)
+            if ordinal < accepted:
+                payload = _read_dsv4_token(
+                    device[layer], int(locs[layer, 1, hot + 1 + ordinal])
+                )
+                torch.testing.assert_close(backed_up, payload.cpu())
+                destination = int(locs[layer, 1, min(63 + ordinal, hot)])
+                torch.testing.assert_close(
+                    _read_dsv4_token(device[layer], destination), payload
+                )
+            else:
+                assert backed_up.eq(0xA5).all()
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))
