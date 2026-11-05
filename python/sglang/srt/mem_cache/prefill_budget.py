@@ -31,6 +31,7 @@ from sglang.srt.layers.cp.utils import (
 )
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.base_prefix_cache import window_sub_pool_of
+from sglang.srt.mem_cache.kv.alloc.demand import chunk_granule
 from sglang.srt.mem_cache.kv.alloc.interim import ChainAdmissionRules
 
 
@@ -205,6 +206,7 @@ class PrefillBudget:
         max_new_tokens: int,
         chunk_limit: int,
         state_slots: int = 0,
+        chunk_align: int | None = None,
     ) -> int | None:
         return chunk_limit
 
@@ -613,6 +615,7 @@ class ChainPrefillBudget(SWAPrefillBudget):
             extend_input_len=kwargs["extend_input_len"],
             max_new_tokens=kwargs["max_new_tokens"],
             chunk_limit=chunk_limit,
+            chunk_align=kwargs.get("chunk_align"),
             fits=lambda tokens, headroom: self.can_allocate_prefill(
                 paged_input=self.ceil_paged_tokens(tokens) + headroom + self.page_size,
                 extend_input_len=tokens,
@@ -622,21 +625,25 @@ class ChainPrefillBudget(SWAPrefillBudget):
             ),
         )
 
-    def _fit_chunk_limit(self, *, extend_input_len, max_new_tokens, chunk_limit, fits):
-        """Choose a bounded chunk with decode headroom only on its final pass."""
+    def _fit_chunk_limit(
+        self, *, extend_input_len, max_new_tokens, chunk_limit, fits, chunk_align=None
+    ):
+        """Choose a bounded chunk with decode headroom only on its final pass.
+        A shrunk chunk lands on `chunk_granule`; None (wait) when none fits."""
         candidate = min(extend_input_len, chunk_limit)
         finishes = candidate >= extend_input_len
         if fits(candidate, max_new_tokens if finishes else 0):
             return chunk_limit
+        granule = chunk_granule(self.page_size, chunk_align)
         upper = max(0, candidate - 1) if finishes else candidate
-        low, high = 0, upper // self.page_size
+        low, high = 0, upper // granule
         while low < high:
             mid = (low + high + 1) // 2
-            if fits(mid * self.page_size, 0):
+            if fits(mid * granule, 0):
                 low = mid
             else:
                 high = mid - 1
-        return min(chunk_limit, low * self.page_size) if low else None
+        return min(chunk_limit, low * granule) if low else None
 
     def can_allocate_prefill(self, **kwargs) -> bool:
         if self.rules.window == "joint":
@@ -883,11 +890,13 @@ class ChainPrefillBudget(SWAPrefillBudget):
         max_new_tokens: int,
         chunk_limit: int,
         state_slots: int = 0,
+        chunk_align: int | None = None,
     ) -> int | None:
         return self._fit_chunk_limit(
             extend_input_len=extend_input_len,
             max_new_tokens=max_new_tokens,
             chunk_limit=chunk_limit,
+            chunk_align=chunk_align,
             fits=lambda tokens, headroom: self._fits(
                 self.ceil_paged_tokens(tokens) + headroom + self.page_size,
                 self.swa_tokens(tokens, headroom, chunk_limit=chunk_limit),
