@@ -521,7 +521,7 @@ class StartupWeightLoadManager:
             target_device=torch.device(self._device_config.device),
             startup_prefetch_active=startup_prefetch_active,
         )
-        current_platform.synchronize()
+        torch.cuda.synchronize()
         changed_names = manifest.changed_names(self._model)
         if changed_names:
             preview = ", ".join(changed_names[:8])
