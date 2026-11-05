@@ -25,6 +25,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
 from sglang.srt.utils.weight_checker_comparator import (
     ComparableWeight,
     Fp8BlockComparable,
+    RawComparable,
     compare_weights,
     select_comparable_weight,
 )
@@ -174,6 +175,27 @@ class TestCompareQuantPair(CustomTestCase):
         s3 = self.e_s.reshape(2, 1, 2)
         equal, *_ = _compare_quant_pair(q3, s3, q3.clone(), s3.clone())
         self.assertTrue(equal)
+
+
+class TestRawComparableCpuAndChunked(CustomTestCase):
+    """RawComparable chunked comparison and CPU fallback when CUDA is unavailable."""
+
+    def test_raw_identical_and_mismatch_across_chunks_without_cuda(self):
+        t_expect = torch.linspace(-1.0, 1.0, 256, dtype=torch.bfloat16)
+        t_actual = t_expect.clone()
+        with (
+            patch("torch.cuda.is_available", return_value=False),
+            patch("sglang.srt.utils.weight_checker_comparator.CHUNK_NUMEL", 64),
+        ):
+            eq_res = compare_weights(RawComparable(t_expect), RawComparable(t_actual))
+            self.assertEqual(eq_res, (True, 0.0, 0.0, 0))
+
+            t_actual[10] += torch.tensor(0.5, dtype=torch.bfloat16)
+            t_actual[200] -= torch.tensor(0.25, dtype=torch.bfloat16)
+            diff_res = compare_weights(RawComparable(t_expect), RawComparable(t_actual))
+            self.assertFalse(diff_res.equal)
+            self.assertAlmostEqual(diff_res.max_abs_err, 0.5, places=2)
+            self.assertEqual(diff_res.num_exceed, 2)
 
 
 # ---------------------------------------------------------------------------
