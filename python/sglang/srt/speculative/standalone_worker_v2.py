@@ -127,6 +127,7 @@ class StandaloneDraftWorker(EagleDraftWorker):
         )
         self.init_token_map()
         self.init_lm_head()
+        self.set_banned_token_ids(column_token_ids=None)
 
     def init_lm_head(self):
         """Override to prevent sharing embeddings and lm_head with target model."""

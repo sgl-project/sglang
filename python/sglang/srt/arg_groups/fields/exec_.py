@@ -204,6 +204,15 @@ class ExecFeatures(msgspec.Struct):
         "Use the same value on disaggregated prefill and decode nodes; clients "
         "should set top_k below the limit to leave headroom for cutoff ties.",
     ] = 4096
+    sampling_banned_token_ids: A[
+        Optional[List[int]],
+        "Token ids that are never sampled. Their logits get the lowest finite "
+        "value in the target model and in EAGLE, EAGLE3, NEXTN, STANDALONE and "
+        "multi-layer EAGLE drafts, so sampling, speculative verification, draft "
+        "proposals and every returned logprob (output, prompt and scoring) are "
+        "normalized over the remaining tokens. Other drafts are not masked; the "
+        "target rejects their banned proposals.",
+    ] = None
     disable_outlines_disk_cache: A[
         bool,
         "Disable disk cache of outlines to avoid possible crashes related to file system or high concurrency.",

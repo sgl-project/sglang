@@ -216,6 +216,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
         self.init_lm_head()
+        self.set_banned_token_ids(column_token_ids=None)
         self._init_boundary_kv_fix_state()
 
     def init_attention_backends(self):
