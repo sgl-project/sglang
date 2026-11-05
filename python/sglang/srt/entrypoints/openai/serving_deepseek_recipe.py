@@ -187,7 +187,9 @@ class DeepSeekRecipeChatEncodingAdapter:
         delta = parser.finish(
             output_ids, finish_reason, keep_matched_stop=request.no_stop_trim
         )
-        parser.check_reasoning_closed(finish_reason)
+        # A task output, such as an action label, has no reasoning to close.
+        if request.task is None:
+            parser.check_reasoning_closed(finish_reason)
         calls = whole_tool_calls(delta)
         if not calls:
             return delta.reasoning or None, delta.content, None, finish_reason
@@ -234,7 +236,8 @@ class DeepSeekRecipeChatEncodingAdapter:
             delta = parser.finish(
                 new_output_ids, finish_reason, keep_matched_stop=request.no_stop_trim
             )
-            parser.check_reasoning_closed(finish_reason)
+            if request.task is None:
+                parser.check_reasoning_closed(finish_reason)
 
         history_tool_calls_cnt = self._hooks.history_tool_calls_count(request)
         if delta.tool_calls:

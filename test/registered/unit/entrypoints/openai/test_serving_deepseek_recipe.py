@@ -9,6 +9,11 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 MODEL = "deepseek-ai/DeepSeek-V4.1-Flash-1017"
 REVISION = "1bae0e1088993b9b82de08f59de5be5a34e42170"
+DSML_CALL = (
+    '\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name="f">\n'
+    '<｜DSML｜ parameter name="x" string="true">1</｜DSML｜ parameter>\n'
+    "</｜DSML｜ invoke>\n</｜DSML｜ calls>"
+)
 
 
 def _tokenizer_file():
@@ -365,18 +370,12 @@ class TestHandlerRequestSemantics(CustomTestCase):
         )
 
     def test_natural_stop_inside_reasoning_fails(self):
-        """A thinking output that stops on its own before </think> fails, also when
-        recipe parses calls out of it or the request sets other stops."""
+        """A thinking output that stops on its own inside its reasoning fails, also
+        when the request sets other stops or parses no calls."""
         from sglang.srt.parser.deepseek_recipe_output import UnclosedReasoningError
 
         chat = _serving(self, self.tokenizer)
         thinking = {"chat_template_kwargs": {"thinking": True}}
-        call = (
-            '\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name="f">\n'
-            '<｜DSML｜ parameter name="x" string="true">1</｜DSML｜ parameter>\n'
-            "</｜DSML｜ invoke>\n</｜DSML｜ calls>"
-        )
-        tool = {"type": "function", "function": {"name": "f", "parameters": {}}}
         other_stops = {
             "stop": "END",
             "stop_regex": ["E+ND"],
@@ -384,8 +383,9 @@ class TestHandlerRequestSemantics(CustomTestCase):
         }
         for text, fields in (
             ("Still thinking.", {}),
-            ("Still thinking." + call, {"tools": [tool]}),
             ("Still thinking.", other_stops),
+            # Without tools, a calls block is reasoning text.
+            ("Still thinking." + DSML_CALL, {}),
         ):
             with (
                 self.subTest(text=text, fields=fields),
@@ -418,9 +418,21 @@ class TestHandlerRequestSemantics(CustomTestCase):
                 self.assertTrue(reasoning.startswith("Still thinking"))
                 self.assertEqual(content, "")
 
-    def test_streams_fail_at_a_natural_stop_inside_reasoning(self):
-        """Streamed chat and Responses outputs fail at such a finish instead of
-        completing."""
+    def test_calls_and_task_outputs_end_without_think_end(self):
+        """A calls block ends reasoning as recipe parses it, and a task output such
+        as an action label has no reasoning to close."""
+        chat = _serving(self, self.tokenizer)
+        thinking = {"chat_template_kwargs": {"thinking": True}}
+        tool = {"type": "function", "function": {"name": "f", "parameters": {}}}
+        _, _, calls = self._parse(
+            chat, "Still thinking." + DSML_CALL, tools=[tool], **thinking
+        )
+        self.assertEqual([call.function.name for call in calls], ["f"])
+        reasoning, content, _ = self._parse(chat, "search", task="action", **thinking)
+        self.assertEqual((reasoning or "") + content, "search")
+
+    def test_other_paths_fail_at_a_natural_stop_inside_reasoning(self):
+        """Streamed chat and both Responses paths fail at such a finish too."""
         from sglang.srt.entrypoints.openai.protocol import (
             ChatCompletionRequest,
             ResponsesRequest,
