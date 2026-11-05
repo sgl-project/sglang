@@ -148,6 +148,7 @@ class TestAllPPLoras(CustomTestCase):
             ),
             processed_tokens_counter=0,
             disagg_prefill_bootstrap_queue=None,
+            disagg_prefill_transfer_queue=None,
             get_num_allocatable_reqs=lambda *args, **kwargs: 1,
             get_prefill_adder_class=lambda: lambda *args, **kwargs: adder,
             request_retirer=None,
