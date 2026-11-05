@@ -26,7 +26,7 @@ try:
 except ImportError:
     TRITON_AVAILABLE = False
 
-register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 
 def run_triton_kernel(

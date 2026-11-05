@@ -220,11 +220,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_observer import SamplingObserver
 from sglang.srt.sampling.watermarking.core import WatermarkState
-from sglang.srt.server_args import (  # noqa: F401  (re-export)
-    CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS,
-    ServerArgs,
-    add_chunked_prefix_cache_attention_backend,
-)
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.adaptive_spec_params import (
     resolve_candidate_steps_from_config,
 )
@@ -502,7 +498,9 @@ class ModelRunner:
         self.init_torch_distributed()
 
         # Init forward stream for overlap schedule
-        self.forward_stream = torch.get_device_module(self.device).Stream()
+        self.forward_stream = torch.get_device_module(self.device).Stream(
+            priority=envs.SGLANG_PLB_STREAM_PRIORITY.get()
+        )
 
         # Read-done mailbox: the scheduler's WAR barrier reads it from the runner
         # its worker names, and treats None as the coarse whole-forward fence.
@@ -1509,6 +1507,13 @@ class ModelRunner:
 
     def maybe_precompile_model_kernels_after_loading(self) -> None:
         maybe_precompile_model_kernels_after_loading(self.model, self.device)
+
+    def _uses_cpu_graph_attention_backend(self) -> bool:
+        return (
+            self.device == "cpu"
+            and self.prefill_attention_backend_str == "intel_amx"
+            and self.decode_attention_backend_str == "intel_amx"
+        )
 
     def maybe_init_dwdp(self):
         if self.is_draft_worker:

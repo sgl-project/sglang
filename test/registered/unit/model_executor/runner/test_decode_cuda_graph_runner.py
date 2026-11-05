@@ -513,6 +513,7 @@ class TestPrePlannedReplayRestage(CustomTestCase):
         runner.ragged_verify_mode = False
         runner.deepep_adapter = SimpleNamespace(replay=lambda: None)
         runner.bs, runner.captured_req_width, runner.raw_num_token = 2, 2, 4
+        runner.raw_bs, runner.require_mlp_tp_gather = 2, False
         runner.buffers = SimpleNamespace(
             input_ids=torch.zeros(4, dtype=torch.int64),
             positions=torch.zeros(4, dtype=torch.int64),
@@ -667,10 +668,13 @@ class TestReplayAttnMetadataWiring(CustomTestCase):
 
     KEY = (2, "TARGET_VERIFY", "TARGET_VERIFY")
 
-    def _replay(self, glue, *, raw_bs=2, bs=2, skip=True, staged=False):
+    def _replay(
+        self, glue, *, raw_bs=2, bs=2, skip=True, staged=False, padded_glue=False
+    ):
         runner = mod.DecodeCudaGraphRunner.__new__(mod.DecodeCudaGraphRunner)
         runner._metadata_glue = glue
         runner._skip_glued_replay_view = skip
+        runner._padded_glue = padded_glue
         runner.enable_two_batch_overlap = False
         runner.model_runner = SimpleNamespace(lora_manager=None)
         runner.capture_forward_mode = mod.ForwardMode.TARGET_VERIFY
@@ -720,6 +724,15 @@ class TestReplayAttnMetadataWiring(CustomTestCase):
 
         glue = _RecordingGlue(captured_keys=[key])
         views, eager = self._replay(glue, raw_bs=1)
+        self.assertEqual((glue.calls, eager), ([], views))
+
+        # A declared DSV4 glue also takes padded replays; IDLE (raw_bs 0) stays eager.
+        glue = _RecordingGlue(captured_keys=[key])
+        views, eager = self._replay(glue, raw_bs=1, padded_glue=True)
+        self.assertEqual((glue.calls, views, eager), ([("replay", key)], [], []))
+
+        glue = _RecordingGlue(captured_keys=[key])
+        views, eager = self._replay(glue, raw_bs=0, padded_glue=True)
         self.assertEqual((glue.calls, eager), ([], views))
 
 

@@ -1,8 +1,10 @@
 """Kimi image identities: full digest, config and grid folding, wide pads."""
 
+import hashlib
 import json
 import unittest
 from array import array
+from dataclasses import replace
 from io import BytesIO
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -20,9 +22,17 @@ from sglang.srt.managers.mm_utils import (
     embed_mm_inputs,
     get_new_expanded_mm_items,
 )
-from sglang.srt.managers.req_types import MM_PAD_SHIFT_VALUE, MultimodalDataItem
-from sglang.srt.managers.schedule_batch import MultimodalInputs
+from sglang.srt.managers.req_types import (
+    MM_PAD_SHIFT_VALUE,
+    MultimodalDataItem,
+    MultimodalInputs,
+)
+from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.multimodal.cache import snapshot_media
+from sglang.srt.multimodal.kimi_k3_image_processing import (
+    DEFERRED_PREPROCESSING_KEY,
+    KimiK3DeferredPreprocessing,
+)
 from sglang.srt.multimodal.modality import Modality, MultimodalInputFormat
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.multimodal.processors.kimi_common import (
@@ -41,7 +51,8 @@ _LEGACY_COLLIDING_FEATURES = (23990, 59582)
 
 class _IdentityOnly(KimiGridMMDataMixin):
     def __init__(self, preprocess_config):
-        self.processor_fingerprint = json.dumps(preprocess_config, sort_keys=True)
+        payload = json.dumps(preprocess_config, sort_keys=True).encode()
+        self.processor_fingerprint = "sha256:" + hashlib.sha256(payload).hexdigest()
         self.hf_config = None
 
 
@@ -161,6 +172,106 @@ class TestKimiImageIdentity(CustomTestCase):
             identities.append(item.identity)
         self.assertEqual(len(set(identities)), 3)
 
+    def test_prepared_inputs_do_not_alias_other_formats(self):
+        """equal tensors need different cache keys when the encoder contract differs"""
+        processor = _IdentityOnly({})
+        feature = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+        reference = _image_item(
+            [1, 4, 4], feature=feature, fmt=MultimodalInputFormat.PROCESSOR_OUTPUT
+        )
+        processor.assign_kimi_image_identities([reference], None)
+        cache = MultiModalStaticCache(1024)
+        cached = EmbeddingResult(embedding=torch.ones(4, 4))
+        cache.set(reference.cache_key, cached)
+
+        changed_format = _image_item(
+            [1, 4, 4], feature=feature, fmt=MultimodalInputFormat.PRECOMPUTED_EMBEDDING
+        )
+        changed_format.feature = None
+        changed_format.precomputed_embeddings = feature
+        processor.assign_kimi_image_identities([changed_format], None)
+        self.assertIsNone(cache.get_single(changed_format.cache_key))
+
+        repeat = _image_item(
+            [1, 4, 4],
+            feature=feature.clone(),
+            fmt=MultimodalInputFormat.PROCESSOR_OUTPUT,
+        )
+        repeat.hash = 7
+        processor.assign_kimi_image_identities([repeat], None)
+        self.assertIs(cache.get_single(repeat.cache_key), cached)
+
+    def test_prepared_inputs_still_require_payload_and_grid(self):
+        processor = _IdentityOnly({})
+        missing_feature = _image_item([1, 2, 2])
+        missing_feature.feature = None
+        missing_grid = _image_item([1, 2, 2])
+        missing_grid.model_specific_data.clear()
+        malformed_grid = _image_item([1, 2, 2, 2])
+        for item in (missing_feature, missing_grid, malformed_grid):
+            with self.subTest(metadata=item.model_specific_data):
+                with self.assertRaises(ValueError):
+                    processor.assign_kimi_image_identities([item], None)
+
+    def test_prepared_inputs_keep_deferred_preprocessing_config(self):
+        processor = _IdentityOnly({})
+        feature = torch.zeros(3, 28, 28, dtype=torch.uint8)
+        config = KimiK3DeferredPreprocessing(
+            backend="cpu",
+            image_mean=[0.5] * 3,
+            image_std=[0.5] * 3,
+            transparent_bg_config=None,
+            resize_config={
+                "new_height": 28,
+                "new_width": 28,
+                "pad_height": 0,
+                "pad_width": 0,
+            },
+        )
+        cache = MultiModalStaticCache(1024)
+        for index, deferred in enumerate(
+            (
+                config,
+                replace(config, image_mean=[0.0] * 3),
+                replace(config, backend="gpu"),
+            )
+        ):
+            with self.subTest(config=deferred):
+                item = _image_item([1, 2, 2], feature=feature)
+                item.model_specific_data[DEFERRED_PREPROCESSING_KEY] = deferred
+                processor.assign_kimi_image_identities([item], None)
+                if index == 0:
+                    cache.set(
+                        item.cache_key, EmbeddingResult(embedding=torch.ones(1, 4))
+                    )
+                else:
+                    self.assertIsNone(cache.get_single(item.cache_key))
+
+    def test_prepared_inputs_use_common_identity_without_snapshot(self):
+        """prepared features stay on their device instead of taking the raw-media snapshot path"""
+        processor = _IdentityOnly({})
+        item = _image_item(
+            [1, 4, 4],
+            feature=torch.arange(16).reshape(4, 4),
+            fmt=MultimodalInputFormat.PROCESSOR_OUTPUT,
+        )
+        expected = _image_item(
+            [1, 4, 4],
+            feature=item.feature.clone(),
+            fmt=MultimodalInputFormat.PROCESSOR_OUTPUT,
+        )
+        expected.bind_processor_fingerprint(processor.processor_fingerprint)
+        expected.set_pad_value()
+        with patch(
+            "sglang.srt.multimodal.processors.kimi_common.snapshot_media",
+            side_effect=AssertionError(
+                "prepared inputs must not be snapshotted to CPU"
+            ),
+        ):
+            processor.assign_kimi_image_identities([item], None)
+        self.assertEqual(item.cache_key, expected.cache_key)
+        self.assertEqual(item.pad_values, expected.pad_values)
+
     def test_same_pixels_different_grid_gives_different_key(self):
         processor = _IdentityOnly({"in_patch_limit": 16384})
         image = _image(0)
@@ -210,7 +321,10 @@ class TestKimiImageIdentity(CustomTestCase):
                 feature=torch.tensor([value], dtype=torch.int64),
             )
             item.set_pad_value()
-            legacy.append(MM_PAD_SHIFT_VALUE + item.hash % (1 << 30))
+            old_hash = int.from_bytes(
+                hashlib.sha256(item.feature.numpy().tobytes()).digest()[:8], "big"
+            )
+            legacy.append(MM_PAD_SHIFT_VALUE + old_hash % (1 << 30))
             generic.append(item.pad_value)
         self.assertEqual(legacy[0], legacy[1])
         self.assertNotEqual(generic[0], generic[1])
@@ -242,12 +356,14 @@ class TestKimiImageIdentity(CustomTestCase):
         self.assertIsNone(item.identity)
         self.assertIsNone(item.pad_values)
 
-    def test_set_hash_clears_wide_identity(self):
+    def test_set_hash_replaces_wide_identity(self):
         item = _image_item([1, 4, 4])
         item.set_identity(kimi_image_identity("sha256:" + "ab" * 32, [1, 4, 4]))
+        old_identity = item.identity
         item.set_hash(7)
-        self.assertIsNone(item.identity)
-        expected = MultimodalDataItem(modality=Modality.IMAGE, hash=7)
+        self.assertNotEqual(item.identity, old_identity)
+        expected = _image_item([1, 4, 4])
+        expected.hash = 7
         expected.set_pad_value()
         self.assertEqual(item.padding_values(), expected.padding_values())
         self.assertEqual(len(item.padding_values()), 4)

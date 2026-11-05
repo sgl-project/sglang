@@ -18,9 +18,9 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
     def test_failed_consumer_reconstruction_releases_remaining_proxies(self):
         from sglang.srt.managers.req_types import (
             MultimodalDataItem,
+            MultimodalInputs,
             MultimodalProcessorOutput,
         )
-        from sglang.srt.managers.schedule_batch import MultimodalInputs
         from sglang.srt.multimodal.modality import Modality
         from sglang.srt.multimodal.transport.cuda_ipc import (
             CudaIpcTensorTransportProxy,
@@ -868,7 +868,7 @@ class TestSchedulerMmTransportBoundary(CustomTestCase):
         scheduler._request_dispatcher.assert_called_once_with(request)
 
     def test_already_materialized_inputs_are_reused(self):
-        from sglang.srt.managers.schedule_batch import MultimodalInputs
+        from sglang.srt.managers.req_types import MultimodalInputs
         from sglang.srt.managers.scheduler import Scheduler
 
         scheduler = object.__new__(Scheduler)

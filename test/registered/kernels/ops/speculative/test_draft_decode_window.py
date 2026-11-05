@@ -51,15 +51,13 @@ from unittest import mock
 
 import torch
 
+from sglang.kernels.ops.speculative.cache_locs import generate_draft_decode_kv_indices
 from sglang.srt.speculative import spec_utils
-from sglang.srt.speculative.spec_utils import (
-    generate_draft_decode_kv_indices,
-    resolve_draft_decode_window,
-)
+from sglang.srt.speculative.spec_utils import resolve_draft_decode_window
 from sglang.srt.utils import next_power_of_2
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 _HAS_CUDA = torch.cuda.is_available()
 

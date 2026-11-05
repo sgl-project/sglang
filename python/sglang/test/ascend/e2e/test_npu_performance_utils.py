@@ -187,7 +187,7 @@ DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH = (
 DEEPSEEK_V4_PRO_0813_W4A8_MODEL_PATH = (
     "/root/.cache/modelscope/hub/models/Eco-Tech/DeepSeek-V4-Pro-0813-w4a8"
 )
-# DeepSeek-V4-Flash default model for a5 testcase
+# DeepSeek-V4-Flash default model for Ascend 950 testcase
 DEEPSEEK_V4_FLASH_DEFAULT_MODEL_PATH = (
     "/root/.cache/modelscope/hub/models/deepseek-ai/DeepSeek-V4-Flash-0731"
 )
@@ -422,7 +422,7 @@ def run_bench_serving(
         cmd_args = [
             PYTHON_FOR_TEST_TOOL,
             "-m",
-            "sglang.bench_serving",
+            "sglang.benchmark.serving",
             "--host",
             host,
             "--port",
@@ -477,7 +477,7 @@ def run_bench_serving(
         cmd_args = [
             PYTHON_FOR_TEST_TOOL,
             "-m",
-            "sglang.bench_serving",
+            "sglang.benchmark.serving",
             "--host",
             host,
             "--port",
@@ -661,9 +661,6 @@ def run_aisbench(
     repeat_rate=None,
     dp=None,
     generation_kwargs=None,
-    api_type="chat",
-    warmup_dp=0,
-    warmup_shape=0,
 ):
 
     if dataset_type == "sharegpt":
@@ -769,12 +766,6 @@ def run_aisbench(
         cmd += f" --dp {dp}"
     if generation_kwargs:
         cmd += f" --generation-kwargs '{generation_kwargs}'"
-    if api_type != "chat":
-        cmd += f" --api-type {api_type}"
-    if warmup_dp:
-        cmd += f" --warmup-dp {warmup_dp}"
-    if warmup_shape:
-        cmd += f" --warmup-shape {warmup_shape}"
 
     logger.info(f"Command: {cmd}")
 
@@ -1363,9 +1354,6 @@ class TestNpuPerformanceTestCaseBase(CustomTestCase):
                 repeat_rate=self.repeat_rate,
                 dp=self.dp,
                 generation_kwargs=self.generation_kwargs,
-                api_type=getattr(self, "api_type", "chat"),
-                warmup_dp=getattr(self, "warmup_dp", 0),
-                warmup_shape=getattr(self, "warmup_shape", 0),
             )
             assert_metrics(self, metrics)
 
@@ -1499,9 +1487,6 @@ class TestNpuPerfMultiNodePdMixTestCaseBase(CustomTestCase):
                 repeat_rate=self.repeat_rate,
                 dp=self.dp,
                 generation_kwargs=self.generation_kwargs,
-                api_type=getattr(self, "api_type", "chat"),
-                warmup_dp=getattr(self, "warmup_dp", 0),
-                warmup_shape=getattr(self, "warmup_shape", 0),
             )
             assert_metrics(self, metrics)
 
@@ -1671,9 +1656,6 @@ class TestNpuPerfMultiNodePdSepTestCaseBase(CustomTestCase):
                 repeat_rate=self.repeat_rate,
                 dp=self.dp,
                 generation_kwargs=self.generation_kwargs,
-                api_type=getattr(self, "api_type", "chat"),
-                warmup_dp=getattr(self, "warmup_dp", 0),
-                warmup_shape=getattr(self, "warmup_shape", 0),
             )
             assert_metrics(self, metrics)
 
