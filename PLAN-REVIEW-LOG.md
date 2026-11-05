@@ -5112,3 +5112,15 @@ parent 阅读完整差异并独立复测 54 项 HTTP 回归全部通过，24.53s
 新策略从 healthy worker、未尝试/未提交、未取消且仍有未来需求的 storage→host PREFETCH 中选择最早 due，在独立 worker probe 前推进。最多连续一次优先，随后一次普通轮转；单独的 RR 游标避免偶数或九任务集合出现固定余数饥饿。每轮仍只推进一个 job，旧策略保留原游标与探测顺序。已尝试含丢回复动作、取消、PIN 到期和收尾继续获得 RR 机会；合法未来兴趣可重新推进从未尝试的 late job。
 
 parent 阅读完整差异并独立复测新增 5 项 unit/本地 HTTP 顺序测试、54 项 HTTP 回归通过（最终 6.42s）。精确 Rust 1.92.0 release Clippy --lib --tests -D warnings 通过（42.75s），fmt/diff 检查通过。扩大 lint 时发现既有 proxy 测试三项诊断，仅改为词法锁作用域、去除多余引用及 Option 匹配，未改生产协议。证据为 lifecycle-opt/due-priority-parent-{unit,http-final,clippy-tests}.log。测试与编译均在 NoPin 测量结束后执行；性能需使用新不可变二进制重新评估，不能沿用筛选结果声明改进。
+
+### O7 — 冻结配置的五轮独立验收与完整归档
+
+正式版本 Engine5a683b6667、Router/负载565de9e132，mem-fraction-static=0.8、Mooncake0.3.14TCP、C32、64×16K工作集为L2的1.51倍。五个预声明独立种子200001/210001/220001/230001/240001，每轮每种策略1792次恢复、空Router成本模型、新salt及目标缓存重置。五轮总17920次恢复及控制全部有效；按需/生命周期有效工作5480.828/4165.503s，8960次/组，分别91.35/69.43分钟。工作吞吐+31.58%，包含公共源发布分摊的完整作业吞吐+22.52%；全部请求合并p95TTFT−26.42%。五轮配对提升均值31.93%，bootstrap95%区间[24.71%,38.97%]，全部预注册门槛通过。
+
+GET API payload13.4538→10.4344TB，重复prefill9169472→16384tokens。只有626次请求发出前确认准备就绪，收益包含在途复用和减少重算；wire bytes及真实trainer等待仍unknown。主配置自动短PIN关闭且3s等待跳过DEMOTE；独立30s三动作补测384次恢复及控制有效但吞吐−2.68%，11次回收/13次部分保存/65次目标缺失及29个PIN子操作完整保留。O3b/O6/已提交GET抢占、自动L3候选排序和完整未消费推测驻留账本仍后置，不以主场景收益覆盖这些未实现项。
+
+parent完成归档318个文件的压缩及解压SHA核验和全部五轮账本回放；补充5份组件/启动与验证proof逐份压缩往返核验，最终323文件SHA及五轮全部请求再次回放通过。复算程序在正常及归档压缩输入上调用既有analyze_lifecycle，另核对输入哈希隔离、空成本模型、.8/真实Mooncake、合并p95、配对区间及时间门槛；Ruff/isort选择规则与格式检查通过。所有原始记录、闭合资源文件和服务日志在仓库外保留，仓库仅收报告/小型结果/来源/校验清单/复算程序，单文件均低于项目1500KiB上限。
+
+实际服务显式使用prefill/decode graph backend=disabled；旧disable_cuda_graph字段为false，已单独保存有效参数及日志证明。Engine启动PYTHONPATH优先使用缓存Mooncake0.3.14，区别于HTTP驱动环境中的其他安装；组件版本、二进制及扩展SHA单独记录。所有Engine操作/读取/保护及Router兴趣、claim、后端不确定状态排空后，逐个核验PID/创建时间/命令并停止本任务Router、两台Engine、Master和三类采样器；端口关闭，GPU0/1无计算进程，其他GPU未操作。报告及复算命令见benchmark/session_kv_control/results/2026-11-05-lifecycle-v2/REPORT.zh-CN.md；原始proof含final-owned-shutdown与final-gpu-idle。
+
+验收资料收紧：将完整资源细项外置、清理凭证保留摘要，减少约9600行生成数据；新增1份cost proof后最终324个归档文件SHA复核通过。原始请求与正式统计未变，新增proof压缩/解压往返一致。仓库保留可直接回放外部归档的校验入口。
