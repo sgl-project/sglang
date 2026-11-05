@@ -318,21 +318,20 @@ class TestHandlerRequestSemantics(CustomTestCase):
         titled = self._prompt(chat, task="title").prompt_ids
         self.assertEqual(titled[-1], self._token("<｜title｜>"))
 
-    def _parse(self, chat, text, *, matched=None, **fields):
+    def _parse(self, chat, text, *, finish_reason=None, **fields):
         from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 
-        eos = self._token("<｜end▁of▁sentence｜>")
         request = ChatCompletionRequest(
             messages=fields.pop("messages", [{"role": "user", "content": "hi"}]),
             **fields,
         )
         output_ids = self.tokenizer.encode(text, add_special_tokens=False)
-        if matched is None:
+        if finish_reason is None:
+            eos = self._token("<｜end▁of▁sentence｜>")
             output_ids.append(eos)
+            finish_reason = {"type": "stop", "matched": eos}
         reasoning, content, tool_calls, _ = chat._encoding_output().parse_chat_response(
-            request=request,
-            output_ids=output_ids,
-            finish_reason={"type": "stop", "matched": matched or eos},
+            request=request, output_ids=output_ids, finish_reason=finish_reason
         )
         return reasoning, content, tool_calls
 
@@ -364,6 +363,126 @@ class TestHandlerRequestSemantics(CustomTestCase):
             )[:2],
             (None, " world"),
         )
+
+    def test_natural_stop_inside_reasoning_fails(self):
+        """A thinking output that stops on its own before </think> fails, also when
+        recipe parses calls out of it or the request sets other stops."""
+        from sglang.srt.parser.deepseek_recipe_output import UnclosedReasoningError
+
+        chat = _serving(self, self.tokenizer)
+        thinking = {"chat_template_kwargs": {"thinking": True}}
+        call = (
+            '\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name="f">\n'
+            '<｜DSML｜ parameter name="x" string="true">1</｜DSML｜ parameter>\n'
+            "</｜DSML｜ invoke>\n</｜DSML｜ calls>"
+        )
+        tool = {"type": "function", "function": {"name": "f", "parameters": {}}}
+        other_stops = {
+            "stop": "END",
+            "stop_regex": ["E+ND"],
+            "stop_token_ids": [self._token("?")],
+        }
+        for text, fields in (
+            ("Still thinking.", {}),
+            ("Still thinking." + call, {"tools": [tool]}),
+            ("Still thinking.", other_stops),
+        ):
+            with (
+                self.subTest(text=text, fields=fields),
+                self.assertRaises(UnclosedReasoningError),
+            ):
+                self._parse(chat, text, **thinking, **fields)
+
+    def test_reasoning_cut_on_purpose_is_returned(self):
+        """A length or abort finish, or a stop the client asked for, returns the
+        reasoning so far."""
+        chat = _serving(self, self.tokenizer)
+        thinking = {"chat_template_kwargs": {"thinking": True}}
+        dot = self._token(".")
+        for finish_reason, fields in (
+            ({"type": "length", "length": 3}, {}),
+            ({"type": "abort", "message": "Aborted"}, {}),
+            ({"type": "stop", "matched": "."}, {"stop": ["END", "."]}),
+            ({"type": "stop", "matched": r"\."}, {"stop_regex": r"\."}),
+            ({"type": "stop", "matched": r"\."}, {"stop_regex": ["E+ND", r"\."]}),
+            ({"type": "stop", "matched": dot}, {"stop_token_ids": [dot]}),
+        ):
+            with self.subTest(finish_reason=finish_reason, fields=fields):
+                reasoning, content, _ = self._parse(
+                    chat,
+                    "Still thinking.",
+                    finish_reason=finish_reason,
+                    **thinking,
+                    **fields,
+                )
+                self.assertTrue(reasoning.startswith("Still thinking"))
+                self.assertEqual(content, "")
+
+    def test_streams_fail_at_a_natural_stop_inside_reasoning(self):
+        """Streamed chat and Responses outputs fail at such a finish instead of
+        completing."""
+        from sglang.srt.entrypoints.openai.protocol import (
+            ChatCompletionRequest,
+            ResponsesRequest,
+        )
+        from sglang.srt.parser.deepseek_recipe_output import UnclosedReasoningError
+
+        adapter = _serving(self, self.tokenizer)._encoding_output()
+        eos = self._token("<｜end▁of▁sentence｜>")
+        output_ids = self.tokenizer.encode("Still thinking.", add_special_tokens=False)
+        output_ids.append(eos)
+        finish = {"type": "stop", "matched": eos}
+        request = ChatCompletionRequest(
+            messages=[{"role": "user", "content": "hi"}],
+            chat_template_kwargs={"thinking": True},
+        )
+        responses_stream = adapter.new_responses_stream(
+            request=ResponsesRequest(input="hi"),
+            require_reasoning=True,
+            separate_reasoning=True,
+            parse_tool_calls=False,
+        )
+        parsers = {}
+
+        def stream_chat(chunk, finish_reason_type):
+            return adapter.stream_chat_chunks(
+                content=chunk,
+                index=0,
+                request=request,
+                created=0,
+                parser_dict=parsers,
+                has_tool_calls={},
+                choice_logprobs=None,
+                finish_reason_type=finish_reason_type,
+                usage=None,
+            )
+
+        for end in range(1, len(output_ids) + 1):
+            last = end == len(output_ids)
+            chunk = {
+                "output_ids": output_ids[:end],
+                "meta_info": {
+                    "id": "chat",
+                    "completion_tokens": end,
+                    "finish_reason": finish if last else None,
+                },
+            }
+            if not last:
+                stream_chat(chunk, None)
+                responses_stream.step(chunk, None)
+        with self.assertRaises(UnclosedReasoningError):
+            stream_chat(chunk, "stop")
+        with self.assertRaises(UnclosedReasoningError):
+            responses_stream.step(chunk, finish)
+        with self.assertRaises(UnclosedReasoningError):
+            adapter.parse_responses_output(
+                request=ResponsesRequest(input="hi"),
+                require_reasoning=True,
+                output_ids=output_ids,
+                finish_reason=finish,
+                separate_reasoning=True,
+                parse_tool_calls=False,
+            )
 
     def test_streamed_tool_call(self):
         from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest

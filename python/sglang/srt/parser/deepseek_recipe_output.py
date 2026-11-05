@@ -48,6 +48,10 @@ class RecipeToolCall(msgspec.Struct, frozen=True):
     arguments: str
 
 
+class UnclosedReasoningError(ValueError):
+    """A thinking output that stopped before closing its reasoning block."""
+
+
 def whole_tool_calls(delta: RecipeOutputDelta) -> list[RecipeToolCall]:
     calls: dict[int, list[str]] = {}
     for piece in delta.tool_calls:
@@ -77,6 +81,8 @@ class DeepSeekRecipeOutputParser:
         separate_reasoning: bool = True,
         stream_reasoning: bool = True,
         stop: Sequence[str] = (),
+        stop_regex: Sequence[str] = (),
+        stop_token_ids: Sequence[int] = (),
     ):
         recipe = load_deepseek_recipe()
         options = recipe.ParsingOptions(
@@ -105,6 +111,15 @@ class DeepSeekRecipeOutputParser:
         self._stop_hold_chars = max(map(len, stop), default=1) - 1
         self._pending_ids: list[int] = []
         self.num_consumed_tokens = 0
+        # A finish reports a matched client stop as its string, its stop_regex
+        # pattern or its token id; EOS reports its token id too.
+        self._client_stops = (*stop, *stop_regex, *stop_token_ids)
+        self._think_end_id = self._hf_tokenizer.token_to_id(THINK_END_TOKEN)
+        # Only </think> closes reasoning: recipe also ends it at a DSML calls
+        # block, which the format allows only after </think>.
+        self._reasoning_open = (
+            thinking_stage is not None and thinking_stage.starts_in_reasoning()
+        )
 
     def feed(self, token_ids: Sequence[int]) -> RecipeOutputDelta:
         self.num_consumed_tokens += len(token_ids)
@@ -114,9 +129,12 @@ class DeepSeekRecipeOutputParser:
         ready = self._release_pending_ids()
         if not ready:
             return RecipeOutputDelta()
-        return self._deltas(
-            self._processor.push(self._recipe.InferenceChunk.tokens(ready))
-        )
+        return self._deltas(self._push(ready))
+
+    def _push(self, token_ids: list[int]) -> list[Any]:
+        if self._think_end_id in token_ids:
+            self._reasoning_open = False
+        return self._processor.push(self._recipe.InferenceChunk.tokens(token_ids))
 
     def _release_pending_ids(self) -> list[int]:
         held = len(self._pending_ids)
@@ -154,11 +172,7 @@ class DeepSeekRecipeOutputParser:
             and token_ids[-1] == matched
         ):
             token_ids = token_ids[:-1]
-        chunks = (
-            self._processor.push(self._recipe.InferenceChunk.tokens(token_ids))
-            if token_ids
-            else []
-        )
+        chunks = self._push(token_ids) if token_ids else []
         if not self._processor.finished:
             reason = {
                 "stop": self._recipe.InferenceFinishReason.Stop,
@@ -171,6 +185,20 @@ class DeepSeekRecipeOutputParser:
                     self._recipe.InferenceChunk.finish(reason)
                 )
         return self._deltas(chunks)
+
+    def check_reasoning_closed(self, finish_reason: dict[str, Any]) -> None:
+        """After `finish`: raise if a thinking output stopped inside its reasoning
+        block on a stop the client did not ask for, such as EOS."""
+        # Length and abort finishes and a matched client stop cut it on purpose.
+        if (
+            self._reasoning_open
+            and finish_reason["type"] == "stop"
+            and finish_reason.get("matched") not in self._client_stops
+        ):
+            raise UnclosedReasoningError(
+                "The model stopped before closing its reasoning with </think>, "
+                "so the turn is incomplete."
+            )
 
     def _cut_at_stop_string(
         self, token_ids: list[int], stop: str, *, keep_stop: bool

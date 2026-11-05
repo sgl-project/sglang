@@ -183,9 +183,11 @@ class DeepSeekRecipeChatEncodingAdapter:
         output_ids: list[int],
         finish_reason: dict[str, Any],
     ) -> tuple[Optional[str], str, Optional[list[ToolCall]], dict[str, Any]]:
-        delta = self._new_output_parser(request).finish(
+        parser = self._new_output_parser(request)
+        delta = parser.finish(
             output_ids, finish_reason, keep_matched_stop=request.no_stop_trim
         )
+        parser.check_reasoning_closed(finish_reason)
         calls = whole_tool_calls(delta)
         if not calls:
             return delta.reasoning or None, delta.content, None, finish_reason
@@ -228,11 +230,11 @@ class DeepSeekRecipeChatEncodingAdapter:
         if finish_reason_type is None:
             delta = parser.feed(new_output_ids)
         else:
+            finish_reason = content["meta_info"]["finish_reason"]
             delta = parser.finish(
-                new_output_ids,
-                content["meta_info"]["finish_reason"],
-                keep_matched_stop=request.no_stop_trim,
+                new_output_ids, finish_reason, keep_matched_stop=request.no_stop_trim
             )
+            parser.check_reasoning_closed(finish_reason)
 
         history_tool_calls_cnt = self._hooks.history_tool_calls_count(request)
         if delta.tool_calls:
@@ -280,6 +282,8 @@ class DeepSeekRecipeChatEncodingAdapter:
             request, require_reasoning, separate_reasoning, parse_tool_calls
         )
         delta = parser.finish(output_ids, finish_reason or {"type": "stop"})
+        if finish_reason is not None:
+            parser.check_reasoning_closed(finish_reason)
         return delta.reasoning, delta.content, _tool_call_items(whole_tool_calls(delta))
 
     def new_responses_stream(
@@ -352,6 +356,8 @@ class DeepSeekRecipeChatEncodingAdapter:
             separate_reasoning=self._separate_reasoning and request.separate_reasoning,
             stream_reasoning=request.stream_reasoning,
             stop=_stop_strings(request.stop),
+            stop_regex=_stop_strings(request.stop_regex),
+            stop_token_ids=request.stop_token_ids or (),
         )
 
     def _new_responses_parser(
@@ -395,6 +401,7 @@ class DeepSeekRecipeResponsesStream:
             delta = self._parser.feed(new_output_ids)
         else:
             delta = self._parser.finish(new_output_ids, finish_reason)
+            self._parser.check_reasoning_closed(finish_reason)
         return delta.reasoning, delta.content, _tool_call_items(delta.tool_calls)
 
 
