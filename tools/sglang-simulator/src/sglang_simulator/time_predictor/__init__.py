@@ -10,17 +10,17 @@ __all__ = (
     "ScheduleRequest",
     "ScheduleBatch",
     "InferTimePredictor",
-    "AIConfiguratorTimePredictor",
+    "AISimulateTimePredictor",
     "MLTimePredictor",
     "ReplayTimePredictor",
 )
 
 
 def __getattr__(name):
-    if name == "AIConfiguratorTimePredictor":
-        from sglang_simulator.time_predictor.aiconfigurator import (
-            AIConfiguratorTimePredictor,
+    if name == "AISimulateTimePredictor":
+        from sglang_simulator.time_predictor.aisimulate import (
+            AISimulateTimePredictor,
         )
 
-        return AIConfiguratorTimePredictor
+        return AISimulateTimePredictor
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

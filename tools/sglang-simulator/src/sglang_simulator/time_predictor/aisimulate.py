@@ -1,6 +1,31 @@
 from typing import Optional
 
 import numpy as np
+
+try:
+    from aisimulate.sdk import models
+    from aisimulate.sdk.backends.factory import get_backend
+    from aisimulate.sdk.common import (
+        CommQuantMode,
+        DatabaseMode,
+        FMHAQuantMode,
+        GEMMQuantMode,
+        KVCacheQuantMode,
+        MoEQuantMode,
+    )
+    from aisimulate.sdk.config import ModelConfig, RuntimeConfig
+    from aisimulate.sdk.inference_session import InferenceSession
+    from aisimulate.sdk.perf_database import get_database, get_systems_paths
+except ModuleNotFoundError as exc:
+    if exc.name not in {"aisimulate", "aisimulate.sdk"}:
+        raise
+    raise ModuleNotFoundError(
+        "Install the AISimulate SDK with: "
+        "pip install -e 'tools/sglang-simulator[aisimulate]'. "
+        "For Replay or ML without automatic KV-cache memory estimation, "
+        "set --max-total-tokens explicitly."
+    ) from exc
+
 from sglang_simulator.simulation.types import (
     SchedulerConfig,
 )
@@ -14,31 +39,7 @@ from sglang_simulator.time_predictor.base import (
 )
 from sglang_simulator.utils import get_logger
 
-try:
-    from aiconfigurator.sdk import models
-    from aiconfigurator.sdk.backends.factory import get_backend
-    from aiconfigurator.sdk.common import (
-        CommQuantMode,
-        DatabaseMode,
-        FMHAQuantMode,
-        GEMMQuantMode,
-        KVCacheQuantMode,
-        MoEQuantMode,
-    )
-    from aiconfigurator.sdk.config import ModelConfig, RuntimeConfig
-    from aiconfigurator.sdk.inference_session import InferenceSession
-    from aiconfigurator.sdk.perf_database import get_database, get_systems_paths
-except ModuleNotFoundError as exc:
-    if exc.name != "aiconfigurator":
-        raise
-    raise ImportError(
-        "AIConfigurator prediction and automatic KV-cache memory estimation "
-        "require the optional 'aiconfigurator' dependency. Install it with "
-        "`pip install 'sglang-simulator[aic]'`. To use Replay or ML without it, "
-        "set --max-total-tokens explicitly."
-    ) from exc
-
-# Map the common data types to AIConfigurator data types.
+# Map the common data types to AISimulate data types.
 MAP_DTYPE_TO_GEMMQuantMode = {
     DataType.FP16: GEMMQuantMode.bfloat16,
     DataType.BF16: GEMMQuantMode.bfloat16,
@@ -98,7 +99,7 @@ def _resolve_comm_quant_mode(sched_config: SchedulerConfig) -> CommQuantMode:
         return MAP_DTYPE_TO_CommQuantMode[sched_config.data_type]
     except KeyError:
         raise ValueError(
-            "AIConfigurator has no communication quantization mapping for "
+            "AISimulate has no communication quantization mapping for "
             f"model data type {sched_config.data_type.value}. Set "
             "comm_quant_mode_override explicitly to half, int8, or fp8."
         ) from None
@@ -141,7 +142,7 @@ def get_perf_model(
         workload_distribution=workload_distribution,
     )
 
-    logger.info(f"Model config for AIConfigurator: {model_config}")
+    logger.info(f"Model config for AISimulate: {model_config}")
 
     return models.get_model(
         model_path=model.model_path,
@@ -150,7 +151,7 @@ def get_perf_model(
     )
 
 
-class AIConfiguratorTimePredictor(InferTimePredictor):
+class AISimulateTimePredictor(InferTimePredictor):
     def __init__(
         self,
         model: ModelInfo,
@@ -185,7 +186,7 @@ class AIConfiguratorTimePredictor(InferTimePredictor):
             raise ValueError("Failed to initialize the database.")
 
         database.set_default_database_mode(database_mode)
-        logger.info(f"AIC Database mode: {database_mode}")
+        logger.info(f"AISimulate database mode: {database_mode}")
 
         self._session = InferenceSession(
             model=get_perf_model(config, model, workload_distribution),

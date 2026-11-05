@@ -40,7 +40,7 @@ def profile_device_available_bytes(
             "simulator never falls back to the local GPU memory capacity."
         )
 
-    from sglang_simulator.time_predictor.aiconfigurator import get_perf_model
+    from sglang_simulator.time_predictor.aisimulate import get_perf_model
 
     perf_model = get_perf_model(scheduler_config, model)
     weights = 0

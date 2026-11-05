@@ -190,9 +190,9 @@ class ConfigManager:
     ) -> InferTimePredictor:
         config = cls._get_raw_config()
         predictor_config = config.get("predictor", {})
-        if predictor_config.get("name") == "aiconfigurator":
-            from sglang_simulator.time_predictor.aiconfigurator import (
-                AIConfiguratorTimePredictor,
+        if predictor_config.get("name") == "aisimulate":
+            from sglang_simulator.time_predictor.aisimulate import (
+                AISimulateTimePredictor,
             )
 
             database_mode = predictor_config.get("database_mode", "SILICON")
@@ -204,7 +204,7 @@ class ConfigManager:
             )
             enable_oom_check = predictor_config.get("enable_oom_check", False)
 
-            return AIConfiguratorTimePredictor(
+            return AISimulateTimePredictor(
                 model,
                 hw=hw,
                 config=sched_config,
@@ -247,7 +247,15 @@ class ConfigManager:
                 miss_knn_k=predictor_config.get("miss_knn_k", 3),
             )
         else:
+            name = predictor_config.get("name")
+            if name == "aiconfigurator":
+                raise ValueError(
+                    "The 'aiconfigurator' predictor was renamed 'aisimulate'. "
+                    "Update the 'predictor.name' field in the simulator "
+                    "configuration to 'aisimulate', and pair it with an "
+                    "AISimulate database backend_version (the examples use "
+                    "'0.5.10')."
+                )
             raise ValueError(
-                f"Unknown predictor name: {predictor_config.get('name')}. "
-                f"Supported: aiconfigurator, ml, replay"
+                f"Unknown predictor name: {name}. Supported: aisimulate, ml, replay"
             )
