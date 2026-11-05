@@ -1,3 +1,4 @@
+import ctypes
 import io
 import logging
 import os
@@ -15,6 +16,7 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    get_gpu_count,
     is_in_ci,
     popen_launch_pd_server,
     popen_with_error_check,
@@ -28,9 +30,8 @@ logger = logging.getLogger(__name__)
 
 def configure_nixl_pd_backend(test_cls):
     test_cls.transfer_backend = ["--disaggregation-transfer-backend", "nixl"]
-    # NIXL backend/network selection is driven by NIXL environment variables
-    # such as SGLANG_DISAGGREGATION_NIXL_BACKEND and backend params, not by the
-    # Mooncake-specific --disaggregation-ib-device argument.
+    # Keep these tests on the configured NIXL/UCX device selection rather than
+    # inheriting the Mooncake fixture's per-side RDMA device lists.
     test_cls.rdma_devices = []
 
 
@@ -48,12 +49,16 @@ def assert_process_healthy(test_case, name, process, url, health_path="/health")
 
 
 class PDDisaggregationServerBase(CustomTestCase):
+    launch_module: ClassVar[str] = "sglang.launch_server"
     capture_per_side_logs: ClassVar[bool] = False
     extra_prefill_env: ClassVar[dict[str, str]] = {}
     extra_decode_env: ClassVar[dict[str, str]] = {}
     prefill_tp_size: ClassVar[int] = 1
     decode_tp_size: ClassVar[int] = 1
     decode_base_gpu_id: ClassVar[int] = 1
+    # False for runners without RDMA NICs (e.g. Intel XPU): CI mode then skips the
+    # NIC lookup, --disaggregation-ib-device, and the MC_GID_INDEX/UCX_NET_DEVICES env.
+    use_rdma: ClassVar[bool] = True
     _prefill_stdout_buf: ClassVar[Optional[io.StringIO]] = None
     _prefill_stderr_buf: ClassVar[Optional[io.StringIO]] = None
     _decode_stdout_buf: ClassVar[Optional[io.StringIO]] = None
@@ -96,10 +101,13 @@ class PDDisaggregationServerBase(CustomTestCase):
         cls._ucx_net_devices_set = False
         if is_in_ci():
             cls.transfer_backend = ["--disaggregation-transfer-backend", "mooncake"]
-            ib_devices = get_rdma_devices_args()
-            cls.rdma_devices = ["--disaggregation-ib-device", ib_devices]
-            cls._mc_gid_index_set = _maybe_set_roce_gid_index(ib_devices)
-            cls._ucx_net_devices_set = _maybe_set_ucx_net_devices(ib_devices)
+            cls.rdma_devices = []
+            if cls.use_rdma:
+                _warn_if_rdma_unopenable()
+                ib_devices = get_rdma_devices_args()
+                cls.rdma_devices = ["--disaggregation-ib-device", ib_devices]
+                cls._mc_gid_index_set = _maybe_set_roce_gid_index(ib_devices)
+                cls._ucx_net_devices_set = _maybe_set_ucx_net_devices(ib_devices)
         else:
             cls.transfer_backend = [
                 "--disaggregation-transfer-backend",
@@ -117,7 +125,7 @@ class PDDisaggregationServerBase(CustomTestCase):
     @classmethod
     def rdma_devices_for(cls, gpu_indices) -> list:
         """`--disaggregation-ib-device` args for a server pinned to these GPUs."""
-        if not is_in_ci():
+        if not is_in_ci() or not cls.rdma_devices:
             return cls.rdma_devices
         return ["--disaggregation-ib-device", get_rdma_devices_args(gpu_indices)]
 
@@ -147,6 +155,7 @@ class PDDisaggregationServerBase(CustomTestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=prefill_args,
             env=dict(cls.extra_prefill_env),
+            launch_module=cls.launch_module,
             return_stdout_stderr=(
                 (cls._prefill_stdout_buf, cls._prefill_stderr_buf)
                 if cls.capture_per_side_logs
@@ -178,6 +187,7 @@ class PDDisaggregationServerBase(CustomTestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=decode_args,
             env=dict(cls.extra_decode_env),
+            launch_module=cls.launch_module,
             return_stdout_stderr=(
                 (cls._decode_stdout_buf, cls._decode_stderr_buf)
                 if cls.capture_per_side_logs
@@ -379,9 +389,7 @@ def get_rdma_devices_args(gpu_indices=None) -> str:
         return ",".join([rdma_all_devices[0], rdma_all_devices[n_rdma // 2]])
 
     try:
-        import torch
-
-        total_gpus = torch.cuda.device_count()
+        total_gpus = get_gpu_count()
     except Exception:
         total_gpus = 0
     total_gpus = total_gpus or max(8, gpu_indices[-1] + 1)
@@ -402,6 +410,41 @@ def get_rdma_devices_args(gpu_indices=None) -> str:
 
 
 _IB_SYSFS = "/sys/class/infiniband"
+
+
+# None means libibverbs is not loadable, not that no device is openable.
+def _ibverbs_device_names() -> Optional[set]:
+    try:
+        lib = ctypes.CDLL("libibverbs.so.1")
+    except OSError:
+        return None
+    lib.ibv_get_device_list.restype = ctypes.POINTER(ctypes.c_void_p)
+    lib.ibv_get_device_list.argtypes = [ctypes.POINTER(ctypes.c_int)]
+    lib.ibv_get_device_name.restype = ctypes.c_char_p
+    lib.ibv_get_device_name.argtypes = [ctypes.c_void_p]
+    lib.ibv_free_device_list.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
+    num = ctypes.c_int(0)
+    devices = lib.ibv_get_device_list(ctypes.byref(num))
+    if not devices:
+        return set()
+    try:
+        return {lib.ibv_get_device_name(devices[i]).decode() for i in range(num.value)}
+    finally:
+        lib.ibv_free_device_list(devices)
+
+
+# Without an openable device the PD transfer backend silently falls back to TCP,
+# and transfers may then fail under load; warn so such failures are traceable.
+def _warn_if_rdma_unopenable() -> None:
+    if not _get_available_ib_devices():
+        return
+    if _ibverbs_device_names() == set():
+        logger.warning(
+            "Active RDMA devices are listed in %s but ibverbs can open none; "
+            "the PD transfer backend will fall back to TCP. "
+            "Check /dev/infiniband in the container.",
+            _IB_SYSFS,
+        )
 
 
 def _roce_v2_gid_index(device: str):
@@ -490,9 +533,13 @@ def _maybe_set_ucx_net_devices(ib_devices) -> bool:
     devices = [d.strip() for d in ib_devices.split(",") if d.strip()]
     if not devices:
         return False
-    net_devices = ",".join(f"{d}:1" for d in devices)
-    # NIXL ignores --disaggregation-ib-device; without this UCX opens every RDMA
-    # device on the host, and that full-device init can stall inside the driver.
+    # UCX applies this list to every network device, not just the RDMA ones, so
+    # an RDMA-only list also drops tcp. NIXL opens an endpoint to itself during
+    # createBackend and tcp is the only transport left that can serve it, so
+    # keep loopback here.
+    net_devices = ",".join([*(f"{d}:1" for d in devices), "lo"])
+    # Limit default UCX device discovery; opening every RDMA device on the host
+    # can stall inside the driver.
     os.environ["UCX_NET_DEVICES"] = net_devices
     logger.warning("Set UCX_NET_DEVICES=%s for NIXL/UCX", net_devices)
     return True

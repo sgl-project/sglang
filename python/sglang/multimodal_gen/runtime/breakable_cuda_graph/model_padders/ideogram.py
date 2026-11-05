@@ -30,16 +30,8 @@ def is_ideogram_transformer(current_model: Any, call_kwargs: dict) -> bool:
     )
 
 
-def _unwrap_model(current_model: Any) -> Any:
-    for attr in ("module", "_orig_mod"):
-        wrapped = getattr(current_model, attr, None)
-        if wrapped is not None:
-            current_model = wrapped
-    return current_model
-
-
 def _dynamic_mask_meta(current_model: Any) -> DynamicVarlenMaskMeta:
-    model = _unwrap_model(current_model)
+    model = bcg_utils.unwrap_model(current_model)
     meta = getattr(model, _DYNAMIC_MASK_META_ATTR, None)
     if not isinstance(meta, DynamicVarlenMaskMeta):
         meta = DynamicVarlenMaskMeta()

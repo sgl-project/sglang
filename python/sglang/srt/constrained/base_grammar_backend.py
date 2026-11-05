@@ -18,7 +18,7 @@ import logging
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Dict, List, NamedTuple, Optional, Tuple
+from typing import Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 import torch
 
@@ -223,6 +223,27 @@ class BaseGrammarBackend:
     def enable_strict_thinking(self):
         return self._enable_strict_thinking
 
+    def get_request_grammar_key(
+        self,
+        key: Tuple[str, str],
+        *,
+        input_ids: Sequence[int],
+        thinking_budget: Optional[int],
+    ) -> Tuple[str, str]:
+        """Cache key for this request's grammar; may depend on how the prompt ends
+        and on the request's thinking budget."""
+        return key
+
+    def reserve_framing_tokens(self, token_ids: Sequence[int]) -> None:
+        """Let ``token_ids`` match only token-level framing, never grammar text."""
+
+    def compile_framed_grammar(
+        self, grammar: BaseGrammarObject, frame: Callable[[dict], dict]
+    ) -> Optional[BaseGrammarObject]:
+        """Compile ``frame(content)``, an XGrammar structural tag embedding ``grammar``
+        as content; None if the backend cannot embed it."""
+        return None
+
     @property
     def is_support_token_filter(self):
         return False
@@ -385,6 +406,7 @@ def create_grammar_backend(
                 vocab_size=vocab_size,
                 model_eos_token_ids=eos_list,
                 any_whitespace=not get_serving().constrained_json_disable_any_whitespace,
+                max_whitespace_cnt=get_serving().constrained_json_max_whitespace_cnt,
             )
         except TokenizerNotSupportedError as e:
             if get_serving().enable_strict_thinking:

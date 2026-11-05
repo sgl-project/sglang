@@ -14,10 +14,12 @@ from sglang.kernels.fused_op import BaseFusedOp
 from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
 from sglang.srt.layers.rotary_embedding.utils import (
     apply_rotary_pos_emb_native,
+    rotary_embedding_cpu,
     rotate_gptj,
     rotate_neox,
 )
 from sglang.srt.layers.rotary_embedding.yarn import (
+    _extend_yarn_cache,
     yarn_find_correction_range,
     yarn_get_mscale,
     yarn_linear_ramp_mask,
@@ -419,6 +421,25 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
             self.sin_cached_total = torch.sin(emb) * self.mscale
         return cache
 
+    def _ensure_cos_sin_cache_length(self, needed_max_pos: int):
+        self.cos_sin_cache, rows = _extend_yarn_cache(
+            cache=self.cos_sin_cache,
+            compute_inv_freq=lambda: self._compute_inv_freq(self.scaling_factor),
+            mscale=self.mscale,
+            needed_max_pos=needed_max_pos,
+        )
+        # NPU also consumes full-width cos/sin tables, built before dtype casting.
+        if rows is not None and self.cos_cached_total is not None:
+            cos, sin = rows.chunk(2, dim=-1)
+            self.cos_cached_total = torch.cat(
+                (self.cos_cached_total, cos.repeat(1, 2).to(self.cos_cached_total)),
+                dim=0,
+            )
+            self.sin_cached_total = torch.cat(
+                (self.sin_cached_total, sin.repeat(1, 2).to(self.sin_cached_total)),
+                dim=0,
+            )
+
     def get_cos_cached_total(self):
         return self.cos_cached_total
 
@@ -527,7 +548,7 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         positions = torch.add(positions, offsets) if offsets is not None else positions
         if _is_cpu_amx_available:
-            return torch.ops.sgl_kernel.rotary_embedding_cpu(
+            return rotary_embedding_cpu(
                 positions, query, key, self.head_size, self.cos_sin_cache, False
             )
         else:

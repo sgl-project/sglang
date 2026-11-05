@@ -61,6 +61,12 @@ class MoeRunner:
         self.config = config
         self.lora_enabled = lora_enabled
 
+        if config.silu_mul_keep_fp32 and not runner_backend.is_deep_gemm():
+            raise ValueError(
+                "silu_mul_keep_fp32 is currently supported only by deep_gemm, "
+                f"got {runner_backend.value}"
+            )
+
         # --moe-runner-backend hpc_ops makes the standard dispatcher keep
         # global expert ids (skip_local_expert_mapping), so every MoE layer
         # must actually run the hpc_ops runner. A quant method that falls

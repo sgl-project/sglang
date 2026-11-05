@@ -5,9 +5,10 @@ implementations, documentation, and benchmarks can consume the same contract
 without each reimplementing a partial list of embedding architectures.
 """
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Sequence
+from typing import Any
 
 
 class EmbeddingTask(str, Enum):
@@ -82,6 +83,9 @@ class EmbeddingModelSpec:
     safe_disable_radix_cache: bool = False
     safe_disable_chunked_prefill: bool = False
     safe_disable_kv_cache: bool = False
+    # Every attention layer is AttentionType.ENCODER_ONLY; with
+    # safe_disable_kv_cache, the FA prefill backend runs without a KV pool.
+    encoder_only_attention: bool = False
 
     @property
     def bcg_eligibility(self) -> BCGEligibility:
@@ -112,6 +116,7 @@ class EmbeddingModelSpec:
             "safe_disable_kv_cache": self.safe_disable_kv_cache,
             "safe_disable_radix_cache": self.safe_disable_radix_cache,
             "safe_disable_chunked_prefill": self.safe_disable_chunked_prefill,
+            "encoder_only_attention": self.encoder_only_attention,
         }
 
 
@@ -168,7 +173,41 @@ def embedding_support_matrix() -> list[dict[str, Any]]:
             **_embedding_gemma_spec().as_dict(),
         }
     )
+    rows.append(
+        {
+            "architecture": "EmbeddingGemma2Model",
+            **_embedding_gemma2_spec().as_dict(),
+        }
+    )
+    rows.append(
+        {
+            "architecture": "Ministral3Model (is_causal=false, pooling=avg)",
+            **_embedding_nemotron3_spec().as_dict(),
+        }
+    )
     return rows
+
+
+def _embedding_gemma2_spec() -> EmbeddingModelSpec:
+    return EmbeddingModelSpec(
+        family="embedding_gemma2",
+        task=EmbeddingTask.EMBED,
+        execution=EmbeddingExecution.MULTIMODAL,
+        attention=AttentionPattern.BIDIRECTIONAL,
+        pooling=PoolingStrategy.MEAN,
+        normalize=True,
+        postprocessor="model_defined",
+        tokenizer_special_tokens="model_default",
+        supports_dimensions=False,
+        supports_token_embeddings=False,
+        supports_multimodal=True,
+        requires_embedding_flag=False,
+        auto_enable_embedding=True,
+        bidirectional_attention=True,
+        bcg_prefill_policy=BCGPrefillPolicy.DEFAULT,
+        safe_disable_radix_cache=True,
+        safe_disable_chunked_prefill=True,
+    )
 
 
 def _embedding_gemma_spec() -> EmbeddingModelSpec:
@@ -191,6 +230,30 @@ def _embedding_gemma_spec() -> EmbeddingModelSpec:
         safe_disable_radix_cache=True,
         safe_disable_chunked_prefill=True,
         safe_disable_kv_cache=True,
+    )
+
+
+def _embedding_nemotron3_spec() -> EmbeddingModelSpec:
+    return EmbeddingModelSpec(
+        family="embedding_nemotron3",
+        task=EmbeddingTask.EMBED,
+        execution=EmbeddingExecution.ENCODER_ONLY,
+        attention=AttentionPattern.BIDIRECTIONAL,
+        pooling=PoolingStrategy.MEAN,
+        normalize=True,
+        postprocessor="model_defined",
+        tokenizer_special_tokens="model_default",
+        supports_dimensions=False,
+        supports_token_embeddings=False,
+        supports_multimodal=False,
+        requires_embedding_flag=False,
+        auto_enable_embedding=True,
+        bidirectional_attention=True,
+        bcg_prefill_policy=BCGPrefillPolicy.DEFAULT,
+        safe_disable_radix_cache=True,
+        safe_disable_chunked_prefill=True,
+        safe_disable_kv_cache=True,
+        encoder_only_attention=True,
     )
 
 
@@ -276,8 +339,14 @@ def resolve_embedding_model_spec(
 
     architecture_set = set(architectures or ())
 
+    if "EmbeddingGemma2Model" in architecture_set:
+        return _embedding_gemma2_spec()
+
     if is_embedding_gemma:
         return _embedding_gemma_spec()
+
+    if "EmbeddingNemotron3Model" in architecture_set:
+        return _embedding_nemotron3_spec()
 
     if architecture_set & _CLASSIFICATION_ARCHITECTURES:
         return EmbeddingModelSpec(

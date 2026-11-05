@@ -14,7 +14,7 @@ from sglang.srt.layers.attention.dsa.utils import (
     INDEXER_K_CACHE_PRESHUFFLE_TILE,
     aiter_can_use_preshuffle_paged_mqa,
 )
-from sglang.srt.utils import is_hip, is_xpu
+from sglang.srt.utils import is_gfx95_supported, is_hip, is_xpu
 
 from .kv_layout import KVLayout
 from .utils import make_name
@@ -150,7 +150,7 @@ _PREFILL_PLAN_BYTES = 24
 
 # ----------------------------------------------------------------------------
 # Plan dataclasses. The element at index 1 is the consumer for
-# `compress_fused_norm_rope_inplace` (which reads ragged_id / seq_len from a
+# `compress_norm_rope_store` (which reads ragged_id / seq_len from a
 # 16-byte plan tensor --- both DecodePlan and CompressPlan satisfy that layout).
 # ----------------------------------------------------------------------------
 
@@ -467,7 +467,10 @@ def compress_norm_rope_store(
         assert kv.shape[-1] == 512 and not use_fp4 and not bf16_store, (
             "the V4.1 layouts are paged FlashMLA main-KV caches"
         )
-        assert not is_hip() and not _is_xpu, "the V4.1 KV layouts are CUDA (sm100) only"
+        assert not _is_xpu, "the V4.1 KV layouts are not supported on XPU"
+        assert not is_hip() or is_gfx95_supported(), (
+            "V4.1 KV stores on HIP require gfx950"
+        )
     if use_fp4:
         assert kv.shape[-1] == 128
     if is_hip() and use_fp4:

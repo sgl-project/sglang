@@ -22,9 +22,7 @@ from typing import Optional
 class ShapeKey:
     # Tokens for prefill/ragged verify; requests for ordinary decode.
     size: int
-    # PDMux stream, or None for a single stream.
-    stream_idx: Optional[int] = None
     # LoRA or prefill-prefix variant; None selects the default.
     variant_label: Optional[str] = None
-    # Independent attention variant; None selects the default.
+    # Independent attention variant (DSA dense/sparse, candidate_*); None is default.
     attention_variant: Optional[str] = None

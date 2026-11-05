@@ -13,7 +13,7 @@
 // MXFP8) carries a bench_serving speed row; MI300X (MXFP8 -> block-fp8) was
 // accuracy-only. MI350X / MI325X inherit their same-arch sibling's recipe
 // (stubs). (sgl-eval does NOT measure serving throughput — TTFT/TPOT/tok-s come
-// from sglang.bench_serving.)
+// from sglang.benchmark.serving.)
 //
 // GSM8K / GPQA — unified on a SINGLE harness: sgl-eval (github.com/sgl-project/sgl-eval)
 // `run gsm8k` (full 1319) / `run gpqa` (GPQA Diamond 198, n-repeats 4), chat
@@ -26,7 +26,7 @@
 // Per-platform re-measurement under sgl-eval is in progress; rows still pending
 // show `gsm8k_pct: null` (no GSM8K row rendered) with the legacy-harness number
 // kept in a comment. Legacy harnesses were NOT comparable across platforms
-// (NVIDIA: few_shot_gsm8k --num-questions 200; AMD: run_eval gsm8k 1319 examples) —
+// (NVIDIA: removed completion harness, 200 questions; AMD: run_eval gsm8k 1319 examples) —
 // which is exactly why we re-measure on one harness.
 export const benchmarks = [
   {

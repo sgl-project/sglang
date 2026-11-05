@@ -88,12 +88,6 @@ def pad_input(hidden_states, indices, batch, seqlen):
 
 
 class VideoMobaAttentionMetadataBuilder(AttentionMetadataBuilder):
-    def __init__(self):
-        pass
-
-    def prepare(self):
-        pass
-
     def build(  # type: ignore
         self,
         current_timestep: int,

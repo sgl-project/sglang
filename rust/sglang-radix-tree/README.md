@@ -4,32 +4,71 @@ Rust tree core for the Unified Radix Cache, covering Full attention, sliding win
 
 ## Usage
 
-Select the backend with:
+Rust is the default tree core. The centralized tree-core registry falls back to
+Python in these cases:
+
+- Session-aware caching.
+- C128 or other unsupported components.
+- Custom component overrides.
+- Non-Linux platforms.
+- PyTorch versions outside 2.11 through 2.14.
+- Devices other than CPU or CUDA.
+- Installations containing neither the Rust extension nor its sources.
+- Source builds with a missing or unusable Rust toolchain.
+
+This policy also applies when Rust is explicitly selected.
+Build, import, and runtime failures in supported configurations remain errors.
+The Rust bindings report unexpected native panics as `RuntimeError` so Python's
+crash handlers can report them and coordinate shutdown. A panic during a core
+operation poisons its mutex, and subsequent calls refuse to reuse that state.
+
+T-LRU accepts integer and floating-point `threshold` and `next_prompt_estimate`
+parameters. In mixed integer/float configurations, the integer estimate must fit
+in i128; larger values raise `OverflowError` at initialization. Native integer
+addition is checked, and overflow is reported as `RuntimeError`.
+
+Select a backend explicitly with:
 
 ```bash
 SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=rust
+# Use the Python implementation instead:
+SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python
 ```
 
-SGLang wheels bundle the production extension. A source checkout falls back to
+Standard SGLang wheels bundle the production extension; some platform
+distributions omit it. A source checkout falls back to
 the shared fingerprinted Rust-extension cache; it never writes a shared object
 into the Python package. LibTorch and the Python headers come from the running
-interpreter's PyTorch install. PyTorch 2.11 through 2.13 are accepted explicitly,
-and `torch_2_13_compat.h` covers two alignment APIs removed in PyTorch 2.13.
+interpreter's PyTorch install. PyTorch 2.11 through 2.14 are accepted explicitly,
+and `torch_compat.h` covers two alignment APIs removed in PyTorch 2.13 plus
+the `cholesky` and `qr` aliases removed in 2.14. Torch 2.12 and later declare
+C++20, so the builds below pass `-std=c++20` over torch-sys's own `-std=c++17`.
+Source checkouts need working `cargo` and `rustc` to use Rust, including for
+fingerprinted cache lookup. If either tool is unavailable, the registry selects
+Python. Trusted bundled extensions do not require a Rust compiler.
 
 ## Development
+
+Alternative backends implement `UnifiedTreeCoreInterface` and register through
+`register_tree_core_backend`. For built-in Mamba and SWA internal-state write-back,
+the core returns a backup request and the controller performs transfers and waits
+for acknowledgment.
+The controller then calls `finish_mamba_state_eviction` or
+`finish_swa_state_eviction` to resume eviction. This keeps I/O outside the Rust
+tree's mutex; both tree cores implement the same contract.
 
 ```bash
 # Build (libtorch from the installed torch package):
 cd rust/sglang-radix-tree
 LIBTORCH_USE_PYTORCH=1 \
   LIBTORCH_BYPASS_VERSION_CHECK=1 \
-  CXXFLAGS="-include $PWD/torch_2_13_compat.h" \
+  CXXFLAGS="-std=c++20 -include $PWD/torch_compat.h" \
   cargo build --release --locked --features python-extension
 
 # Native tests do not enable pyo3's extension-module feature:
 TORCH_ROOT=$(python3 -c 'import pathlib, torch; print(pathlib.Path(torch.__file__).parent)')
 LIBTORCH_USE_PYTORCH=1 LIBTORCH_BYPASS_VERSION_CHECK=1 \
-  CXXFLAGS="-include $PWD/torch_2_13_compat.h" \
+  CXXFLAGS="-std=c++20 -include $PWD/torch_compat.h" \
   LD_LIBRARY_PATH="$TORCH_ROOT/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
   cargo test --locked
 ```
