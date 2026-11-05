@@ -390,7 +390,7 @@ class HiCacheController:
         from sglang.srt.mem_cache.hicache_topk_rows import HostTopkRows
 
         self.topk_rows = HostTopkRows.create(
-            host_size=self.mem_pool_host.size,
+            host_pool=self.mem_pool_host,
             device=str(self.device),
             has_storage_backend=storage_backend is not None,
         )

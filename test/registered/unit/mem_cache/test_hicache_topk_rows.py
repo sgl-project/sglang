@@ -4,6 +4,7 @@ device slots before get_topk reads them."""
 
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
@@ -15,6 +16,8 @@ from sglang.test.test_utils import CustomTestCase
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 
 HOST_SLOTS = [10, 11, 12]
+# A DCP (or page-interleaved) host pool: 16 physical rows, 64 logical slots.
+HOST_POOL = SimpleNamespace(size=16, logical_size=64)
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "needs CUDA")
@@ -28,29 +31,35 @@ class TestHiCacheTopkRows(CustomTestCase):
             device="cuda",
             name="routed_experts",
         )
-        self.rows = HostTopkRows(host_size=32, capturer=self.capturer, device="cuda")
+        with mock.patch(
+            "sglang.srt.mem_cache.hicache_topk_rows.get_global_experts_capturer",
+            return_value=self.capturer,
+        ):
+            self.rows = HostTopkRows.create(
+                host_pool=HOST_POOL, device="cuda", has_storage_backend=False
+            )
         self.stream = torch.cuda.Stream()
         self.expected = torch.arange(18, dtype=torch.int32).view(3, 2, 3)
 
     def tearDown(self):
         self.capturer.destroy()
 
-    def _copy(self, device_slots):
+    def _copy(self, device_slots, host_slots=HOST_SLOTS):
         return HostTopkRows.copy_indices(
             device_indices=torch.tensor(device_slots, device="cuda"),
-            host_indices=torch.tensor(HOST_SLOTS),
+            host_indices=torch.tensor(host_slots),
             stream=self.stream,
         )
 
-    def _write_prefix(self):
+    def _write_prefix(self, host_slots=HOST_SLOTS):
         """Rows of device slots 5..7 are backed up to host slots 10..12, then
         the device slots are reused by another request."""
         self.capturer.host_cache.buffer[[5, 6, 7]] = self.expected
-        self.rows.finish_write(self._copy([5, 6, 7]))
+        self.rows.finish_write(self._copy([5, 6, 7], host_slots))
         self.capturer.host_cache.buffer[[5, 6, 7]] = -1
 
-    def _load(self, device_slots):
-        row_copy = self._copy(device_slots)
+    def _load(self, device_slots, host_slots=HOST_SLOTS):
+        row_copy = self._copy(device_slots, host_slots)
         self.rows.add_load(row_copy)
         return row_copy
 
@@ -65,6 +74,12 @@ class TestHiCacheTopkRows(CustomTestCase):
     def test_load_back_restores_rows_before_read(self):
         self._write_prefix()
         self._load([20, 21, 22])
+        self.assertTrue(torch.equal(self._read([20, 21, 22]), self.expected))
+
+    def test_host_slots_past_the_physical_pool_size(self):
+        logical_slots = [61, 62, 63]
+        self._write_prefix(logical_slots)
+        self._load([20, 21, 22], logical_slots)
         self.assertTrue(torch.equal(self._read([20, 21, 22]), self.expected))
 
     def test_load_ack_restores_rows_once(self):

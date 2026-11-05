@@ -17,7 +17,7 @@ copied when its ack is processed, or earlier when get_topk reads rows.
 
 import collections
 import logging
-from typing import Optional
+from typing import Any, Optional
 
 import msgspec
 import torch
@@ -51,7 +51,7 @@ class HostTopkRows:
 
     @staticmethod
     def create(
-        host_size: int, device: str, has_storage_backend: bool
+        host_pool: Any, device: str, has_storage_backend: bool
     ) -> Optional["HostTopkRows"]:
         capturer = get_global_experts_capturer()
         if capturer is None:
@@ -61,7 +61,11 @@ class HostTopkRows:
                 "Routed experts are not stored in the HiCache storage backend: "
                 "prefix pages loaded from storage return stale routed-experts rows."
             )
-        return HostTopkRows(host_size=host_size, capturer=capturer, device=device)
+        # Host slot ids span the logical size (DCP and page-interleaved pools
+        # give each physical row several logical slots).
+        return HostTopkRows(
+            host_size=host_pool.logical_size, capturer=capturer, device=device
+        )
 
     @staticmethod
     def copy_indices(
