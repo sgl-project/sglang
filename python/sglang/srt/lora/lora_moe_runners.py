@@ -189,7 +189,12 @@ class LoRAInfo:
 
 @dataclass
 class LoRAHooks:
-    """Hook callbacks for injecting LoRA deltas into the MoE pipeline."""
+    """Hook callbacks for injecting LoRA deltas into the MoE pipeline.
+
+    Dropped route IDs remain negative. Hooks must skip those routes before
+    reading their payloads or scores; private inactive intermediates may be
+    uninitialized and routing scores are passed without a sanitized copy.
+    """
 
     after_gate_up: (
         Callable[[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], None] | None
@@ -357,6 +362,8 @@ def _add_lora_gate_up_delta(
             experts_shared_outer_loras_a=lora_info.experts_shared_outer_loras,
             experts_shared_outer_loras_b=False,
             routing_cache=routing_cache,
+            adapter_enabled=lora_info.adapter_enabled,
+            a_output_slices=2 if is_gated else 1,
         )
     else:
         blk = _get_moe_lora_block_config(r)
@@ -432,6 +439,7 @@ def _add_lora_down_delta(
             experts_shared_outer_loras_a=False,
             experts_shared_outer_loras_b=lora_info.experts_shared_outer_loras,
             routing_cache=routing_cache,
+            adapter_enabled=lora_info.adapter_enabled,
         )
     else:
         blk = _get_moe_lora_block_config(lora_info.max_lora_rank)

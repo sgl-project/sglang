@@ -4,13 +4,13 @@ import unittest
 
 import torch
 
-from sglang.kernels.ops.attention.dsa_kpool_metadata.verify import (
-    fused_dsa_target_verify_metadata,
+from sglang.kernels.ops.attention.dsa.kpool_metadata.verify import (
+    fused_dsa_target_verify_metadata_kpool,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 
 class TestKPoolMetadataFusion(CustomTestCase):
@@ -37,7 +37,7 @@ class TestKPoolMetadataFusion(CustomTestCase):
         addresses = {key: value.data_ptr() for key, value in buffers.items()}
 
         def refresh():
-            fused_dsa_target_verify_metadata(
+            fused_dsa_target_verify_metadata_kpool(
                 seq_lens=seq,
                 req_pool_indices=req,
                 req_to_token=table,

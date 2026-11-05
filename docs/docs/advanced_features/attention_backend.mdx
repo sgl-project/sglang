@@ -255,15 +255,6 @@ The support matrix is split into two parts: MHA (standard attention) and MLA (mu
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**TokenSpeed MLA (Blackwell)**</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>32 or 64</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>✅ (required)</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>✅</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>✅</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
-    </tr>
-    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**FA3 (FlashAttention 3)**</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>n/a</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
@@ -330,7 +321,6 @@ MLA page-size constraints:
 - Cutlass MLA: page_size = 128.
 - TRTLLM MLA: page_size ∈ &#123;32, 64&#125;.
 - CuteDSL MLA: page_size ∈ &#123;32, 64&#125; (decode-only; prefill falls back to `trtllm_mla` when unset).
-- TokenSpeed MLA: page_size ∈ &#123;32, 64&#125; (Blackwell SM100/SM12x only; requires `--kv-cache-dtype fp8_e4m3`).
 
 ### GDN Attention Backends
 

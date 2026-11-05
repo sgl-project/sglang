@@ -15,10 +15,33 @@ import triton.language as tl
 
 
 @triton.jit
+def _silu_mul_add_delta_row(
+    x_ptr,
+    d_ptr,
+    out_ptr,
+    N,
+    row,
+    cols,
+    mask,
+    delta_mask,
+):
+    x_row = x_ptr + row * 2 * N
+    d_row = d_ptr + row * 2 * N
+    gate = tl.load(x_row + cols, mask=mask, other=0.0).to(tl.float32)
+    up = tl.load(x_row + N + cols, mask=mask, other=0.0).to(tl.float32)
+    gate += tl.load(d_row + cols, mask=delta_mask, other=0.0).to(tl.float32)
+    up += tl.load(d_row + N + cols, mask=delta_mask, other=0.0).to(tl.float32)
+
+    silu = gate * tl.sigmoid(gate)
+    out = silu * up
+    tl.store(out_ptr + row * N + cols, out.to(out_ptr.dtype.element_ty), mask=mask)
+
+
+@triton.jit
 def _silu_mul_add_delta_kernel(
-    x_ptr,  # [T, 2N] gemm1 output, [gate || up]
-    d_ptr,  # [T, 2N] LoRA gate_up delta, same layout
-    out_ptr,  # [T, N]
+    x_ptr,
+    d_ptr,
+    out_ptr,
     N,
     BLOCK: tl.constexpr,
 ):
@@ -26,17 +49,7 @@ def _silu_mul_add_delta_kernel(
     block = tl.program_id(1)
     cols = block * BLOCK + tl.arange(0, BLOCK)
     mask = cols < N
-
-    x_row = x_ptr + row * 2 * N
-    d_row = d_ptr + row * 2 * N
-    gate = tl.load(x_row + cols, mask=mask, other=0.0).to(tl.float32)
-    up = tl.load(x_row + N + cols, mask=mask, other=0.0).to(tl.float32)
-    gate += tl.load(d_row + cols, mask=mask, other=0.0).to(tl.float32)
-    up += tl.load(d_row + N + cols, mask=mask, other=0.0).to(tl.float32)
-
-    silu = gate * tl.sigmoid(gate)
-    out = silu * up
-    tl.store(out_ptr + row * N + cols, out.to(out_ptr.dtype.element_ty), mask=mask)
+    _silu_mul_add_delta_row(x_ptr, d_ptr, out_ptr, N, row, cols, mask, mask)
 
 
 def silu_and_mul_add_delta(
@@ -44,7 +57,7 @@ def silu_and_mul_add_delta(
     gate_up_delta: torch.Tensor,
     out: torch.Tensor,
 ) -> None:
-    """``out = silu(g + dg) * (u + du)`` over contiguous ``[T, 2N]`` inputs."""
+    """Both producers must define inactive route rows and disabled deltas as zero."""
     T, two_n = gemm1_out.shape
     N = two_n // 2
     assert gate_up_delta.shape == (T, two_n) and out.shape == (T, N)
