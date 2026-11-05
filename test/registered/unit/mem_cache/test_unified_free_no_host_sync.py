@@ -364,6 +364,170 @@ class TestEveryUnifiedAllocatorOverridesFreeSegment(unittest.TestCase):
                 self.assertEqual(alloc.free_page_reps_group, [])
 
 
+class TestIndependentWindowFree(unittest.TestCase):
+    def test_request_cleanup_and_grouped_free_keep_fixed_shapes(self):
+        """Unequal window cursors must not force a device count read during cleanup."""
+        from kv.test_declared_parts import _build
+
+        from sglang.srt.managers.schedule_batch import ReqKvInfo
+        from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+        from sglang.srt.mem_cache.layout.fused_draft import (
+            DenseDraftRegion,
+            DraftBand,
+            FusedDraftPlacement,
+        )
+        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        self.addCleanup(reset_context)
+        for cursors in ((0, 0), (16, 24), (24, 16)):
+            for grouped in (False, True):
+                with self.subTest(cursors=cursors, grouped=grouped):
+                    placement = FusedDraftPlacement.from_counts(
+                        counts={"draft_swa": [1]},
+                        regions={
+                            "draft_swa": DenseDraftRegion(
+                                lane_num=1,
+                                head_num=1,
+                                head_dim=8,
+                                store_dtype=torch.bfloat16,
+                            )
+                        },
+                        new_bands={"draft_swa": DraftBand(kind="window", window=8)},
+                    )
+                    storage, _, _ = _build(fused_draft=placement, lazy_compaction=True)
+                    a = storage.allocator
+                    cache = UnifiedRadixCache(
+                        CacheInitParams(
+                            disable=False,
+                            req_to_token_pool=storage.requests,
+                            token_to_kv_pool_allocator=a,
+                            page_size=4,
+                            sliding_window_size=16,
+                            tree_slots=storage.tree_slots(),
+                            tree_core_backend="python",
+                        )
+                    )
+                    ids = a.alloc(32)
+                    kv = ReqKvInfo(req_pool_idx=0, swa_evict_floor=8)
+                    storage.requests.req_to_token[0, :32] = ids
+                    for name, ct, end in zip(
+                        ("swa", "draft_swa"),
+                        (ComponentType.SWA, ComponentType.AUXILIARY_SWA),
+                        cursors,
+                    ):
+                        start = 8 if ct == ComponentType.SWA and end else 0
+                        a.free_window_segment(name, ids[start:end], start_pos=start)
+                        kv.set_evicted_seqlen(ct, end)
+                    recorder = _ShapeSyncRecorder()
+                    with (
+                        envs.SGLANG_INVARIANT_CHECK.override(
+                            int(InvariantCheckLevel.OFF)
+                        ),
+                        recorder,
+                    ):
+                        if grouped:
+                            a.free_group_begin()
+                        if cursors == (0, 0):
+                            a.free_segment(ids, start_pos=0)
+                        else:
+                            cache.free_kv_row(kv, [(0, 32)])
+                        if grouped:
+                            a.free_group_end()
+                    self.assertEqual(recorder.hits, [])
+                    self.assertEqual(storage.accounting_violations(), [])
+                    self.assertTrue(all(b.allocated_count() == 0 for b in a.bands))
+
+    def test_overlap_frees_only_each_windows_unadopted_segments(self):
+        """Recovering one window must preserve its payload without filtering GPU IDs."""
+        from array import array
+
+        from kv.test_declared_parts import _build
+
+        from sglang.srt.mem_cache.base_prefix_cache import EvictParams, InsertParams
+        from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+        from sglang.srt.mem_cache.layout.fused_draft import (
+            DenseDraftRegion,
+            DraftBand,
+            FusedDraftPlacement,
+        )
+        from sglang.srt.mem_cache.radix_cache import RadixKey
+        from sglang.srt.mem_cache.unified_cache.cache_action import (
+            FreeComponentDeviceSlot,
+            FreeDeviceKV,
+            FreeDeviceKVFullOnly,
+        )
+        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        self.addCleanup(reset_context)
+        placement = FusedDraftPlacement.from_counts(
+            counts={"draft_swa": [1]},
+            regions={
+                "draft_swa": DenseDraftRegion(
+                    lane_num=1, head_num=1, head_dim=8, store_dtype=torch.bfloat16
+                )
+            },
+            new_bands={"draft_swa": DraftBand(kind="window", window=8)},
+        )
+        storage, _, _ = _build(fused_draft=placement, lazy_compaction=True)
+        a = storage.allocator
+        cache = UnifiedRadixCache(
+            CacheInitParams(
+                disable=False,
+                req_to_token_pool=storage.requests,
+                token_to_kv_pool_allocator=a,
+                page_size=4,
+                sliding_window_size=16,
+                tree_slots=storage.tree_slots(),
+                tree_core_backend="python",
+            )
+        )
+        recorder = _ShapeSyncRecorder()
+        apply = cache._apply_cache_action
+
+        def tracked(action):
+            if isinstance(
+                action, (FreeDeviceKV, FreeDeviceKVFullOnly, FreeComponentDeviceSlot)
+            ):
+                with recorder:
+                    apply(action)
+            else:
+                apply(action)
+
+        with (
+            envs.SGLANG_INVARIANT_CHECK.override(int(InvariantCheckLevel.OFF)),
+            mock.patch.object(cache, "_apply_cache_action", side_effect=tracked),
+        ):
+            for primary, auxiliary in ((48, 40), (32, 16)):
+                ids = a.alloc(64)
+                a.free_window_segment("swa", ids[:primary], start_pos=0)
+                a.free_window_segment("draft_swa", ids[:auxiliary], start_pos=0)
+                cache.insert(
+                    InsertParams(
+                        key=RadixKey(array("q", range(64))),
+                        value=ids,
+                        component_evicted_seqlens={
+                            ComponentType.SWA: primary,
+                            ComponentType.AUXILIARY_SWA: auxiliary,
+                        },
+                    )
+                )
+            self.assertEqual(recorder.hits, [])
+            self.assertEqual(
+                {b.sub_pool_name: b.allocated_count() for b in a.bands},
+                {"full": 64, "swa": 32, "draft_swa": 48},
+            )
+            cache.evict(
+                EvictParams(
+                    num_tokens=64, swa_num_tokens=64, auxiliary_swa_num_tokens=64
+                )
+            )
+        self.assertEqual(recorder.hits, [])
+        self.assertEqual(storage.accounting_violations(), [])
+        self.assertTrue(all(b.allocated_count() == 0 for b in a.bands))
+
+
 class TestUnifiedSwaFullSideGroup(unittest.TestCase):
     """`free_full` inside a free group must defer and land at `free_group_end`;
     the composite carries that pile itself, not through the SWA parent's hooks."""
@@ -421,6 +585,9 @@ class TestFreeSwaWindowRatchetNoHostSync(CustomTestCase):
     PS = 4
 
     def _swa_composite(self, lazy=True, ps=None):
+        from sglang.test.unified_allocator_fixtures import setup_allocator_context
+
+        setup_allocator_context()
         from test_multi_ended_allocator import _FakeKVCache, _make_mha_spec
 
         full = _make_mha_spec("full", "up", layer_num=4)
