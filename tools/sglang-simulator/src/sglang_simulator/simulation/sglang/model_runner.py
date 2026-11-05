@@ -304,12 +304,12 @@ class C_KVCacheConfiguratorHook(BaseHook):
 
             budget_config = ConfigManager.get_memory_budget_config()
             if budget_config is not None:
-                from sglang_simulator.simulation.resource_budget import (
-                    estimate_infercast_budget,
-                )
-
                 from sglang.srt.model_executor.pool_configurator import (
                     create_memory_pool_configurator,
+                )
+
+                from sglang_simulator.simulation.resource_budget import (
+                    estimate_infercast_budget,
                 )
 
                 _validate_resource_pool(self)

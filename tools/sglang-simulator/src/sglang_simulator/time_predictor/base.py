@@ -107,4 +107,4 @@ class InferTimePredictor(ABC):
 
     def reset_metrics(self) -> None:
         """Reset predictor-specific metrics after a profile flush."""
-        return None
+        return

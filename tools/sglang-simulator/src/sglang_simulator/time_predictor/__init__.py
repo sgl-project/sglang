@@ -26,12 +26,12 @@ def __getattr__(name: str):
 
 
 __all__ = (
-    "ScheduleRequest",
-    "ScheduleBatch",
-    "InferTimePredictor",
-    "PredictorError",
     "AISimulateTimePredictor",
-    "MLTimePredictor",
-    "ReplayTimePredictor",
     "InferCastTimePredictor",
+    "InferTimePredictor",
+    "MLTimePredictor",
+    "PredictorError",
+    "ReplayTimePredictor",
+    "ScheduleBatch",
+    "ScheduleRequest",
 )
