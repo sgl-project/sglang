@@ -26,6 +26,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.warmup_request_builder import (
     build_warmup_reqs,
     lighten_warmup_req,
+    should_include_warmup_audio,
     should_include_warmup_image,
     supports_synthetic_warmup,
 )
@@ -258,7 +259,7 @@ async def run_async_client_warmup(
         if should_include_warmup_image(server_args, server_based_warmup=True):
             warmup_input_path = prepare_warmup_image_path(server_args)
         warmup_audio_path = None
-        if server_args.pipeline_config.task_type.requires_audio_input():
+        if should_include_warmup_audio(server_args):
             warmup_audio_path = prepare_warmup_audio_path(server_args)
 
         warmup_reqs = build_client_warmup_reqs(
@@ -318,7 +319,7 @@ def run_sync_client_warmup(
     if should_include_warmup_image(server_args, server_based_warmup=True):
         warmup_input_path = prepare_warmup_image_path(server_args)
     warmup_audio_path = None
-    if server_args.pipeline_config.task_type.requires_audio_input():
+    if should_include_warmup_audio(server_args):
         warmup_audio_path = prepare_warmup_audio_path(server_args)
 
     warmup_reqs = build_client_warmup_reqs(

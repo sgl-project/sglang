@@ -580,6 +580,14 @@ def supports_synthetic_warmup(server_args: ServerArgs) -> bool:
     return task_type.is_visual_gen() or task_type.is_mesh_gen()
 
 
+def should_include_warmup_audio(server_args: ServerArgs) -> bool:
+    """Whether server warmup needs a synthetic audio input: only audio-conditioned
+    models (Wan2.2-S2V) do, and get a silent WAV."""
+    if not supports_synthetic_warmup(server_args):
+        return False
+    return server_args.pipeline_config.task_type.requires_audio_input()
+
+
 def build_warmup_reqs(
     server_args: ServerArgs,
     *,

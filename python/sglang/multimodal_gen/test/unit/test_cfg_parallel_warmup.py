@@ -79,6 +79,7 @@ from sglang.multimodal_gen.runtime.warmup_request_builder import (
     _resolve_warmup_num_frames,
     build_warmup_reqs,
     get_model_sampling_defaults,
+    should_include_warmup_audio,
     should_include_warmup_image,
     supports_synthetic_warmup,
 )
@@ -1187,6 +1188,7 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
                 server_based_warmup=True,
             )
             self.assertTrue(should_run_synthetic_server_warmup(server_args))
+            self.assertTrue(should_include_warmup_audio(server_args))
             with self.assertRaisesRegex(RuntimeError, "Warmup audio path"):
                 build_warmup_reqs(
                     server_args,
@@ -1198,6 +1200,8 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         self.assertEqual(len(reqs), 1)
         self.assertEqual(reqs[0].image_path, ["/tmp/warmup.png"])
         self.assertEqual(reqs[0].audio_path, "/tmp/warmup_audio.wav")
+        server_args.pipeline_config = SimpleNamespace(task_type=ModelTaskType.T2V)
+        self.assertFalse(should_include_warmup_audio(server_args))
 
     def test_server_warmup_resolves_sequence_shard_like_a_real_request(self):
         """Synthetic warmups skip SamplingParams._adjust. Left unresolved, the flag sent S2V's
