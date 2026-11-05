@@ -296,36 +296,33 @@ def _require_gpus(n: int) -> None:
         raise unittest.SkipTest(f"need {n} GPUs, have {available}")
 
 
-def _require_gated_model(repo_id: str) -> None:
-    """Skip when a gated checkpoint can be neither downloaded nor read from cache.
+def _require_flux3_package(repo_id: str) -> None:
+    """Skip when the gated FLUX.3 package can be neither downloaded nor read from cache.
 
     Fork PRs get no ``HF_TOKEN``, so the download fails with a 401 unless the
-    runner already has the whole model cached. A partial cache (for example,
-    only ``model_index.json``) would still need a download, so it counts as
-    missing. The completeness checks are the loader's own.
+    runner already has every file the package needs cached. This runs the
+    loader's own resolver with downloads forced to cache-only, so it checks the
+    same files the server will load: the config, the DiT weights, and the VAE,
+    text encoder and tokenizer the config points to, including ``hf://``
+    assets in other repos. Anything missing raises and the test skips.
     """
-    from huggingface_hub import get_token, snapshot_download
-    from huggingface_hub.errors import LocalEntryNotFoundError
+    from functools import partial
+    from unittest import mock
 
-    from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
-        _check_index_files_for_missing_shards,
-        _verify_diffusers_model_complete,
-    )
+    from huggingface_hub import get_token
+
+    from sglang.multimodal_gen.runtime.pipelines import flux3_image_package as pkg
 
     if get_token():
         return
+    cache_only = partial(pkg.snapshot_download, local_files_only=True)
     try:
-        path = snapshot_download(repo_id, local_files_only=True)
-    except LocalEntryNotFoundError:
-        path = None
-    if (
-        path is None
-        or not _verify_diffusers_model_complete(path)
-        or not _check_index_files_for_missing_shards(path)[0]
-    ):
+        with mock.patch.object(pkg, "snapshot_download", cache_only):
+            pkg.resolve_flux3_image_package(repo_id)
+    except pkg.Flux3ImagePackageError as exc:
         raise unittest.SkipTest(
-            f"{repo_id} is gated: needs HF_TOKEN or a fully cached copy"
-        )
+            f"{repo_id} is gated: needs HF_TOKEN or a fully cached copy ({exc})"
+        ) from None
 
 
 class _DisaggTestBase(CustomTestCase):
@@ -337,7 +334,7 @@ class _DisaggTestBase(CustomTestCase):
     gpu_layout: dict[str, list[int]] = {}
     extra_role_args: dict[str, list[str]] = {}
     warmup_kwargs: dict = {}
-    gated_model: bool = False
+    gated_flux3_package: bool = False
 
     cluster: DisaggCluster | None = None
 
@@ -345,8 +342,8 @@ class _DisaggTestBase(CustomTestCase):
     def setUpClass(cls) -> None:
         super().setUpClass()
         _require_gpus(cls.required_gpus)
-        if cls.gated_model:
-            _require_gated_model(cls.model)
+        if cls.gated_flux3_package:
+            _require_flux3_package(cls.model)
         cls.cluster = DisaggCluster(
             model=cls.model,
             name=cls.cluster_name,
@@ -419,7 +416,7 @@ class TestDisaggFlux3Image(_DisaggTestBase):
     """Real four-role T2I/i2i versus the same monolithic model and workload."""
 
     model = "black-forest-labs/flux-3-image-klein"
-    gated_model = True
+    gated_flux3_package = True
     cluster_name = "flux3_split"
     gpu_layout = {
         "prompt_encoder": [0],
