@@ -142,6 +142,12 @@ class Mm(msgspec.Struct):
         "job. Values are unpickled on read, so only trusted processes may write it. "
         "Requires --enable-token-space-preprocess-cache.",
     ] = None
+    token_space_preprocess_cache_check_rate: A[
+        Optional[float],
+        "Share of token-space preprocess cache hits, between 0 and 1, that are computed "
+        "again and compared with the cached features; a mismatch fails the request. "
+        "Unset or 0 turns the check off. Requires --enable-token-space-preprocess-cache.",
+    ] = None
     limit_mm_data_per_request: A[
         Optional[Union[str, Dict[str, int]]],
         Arg(

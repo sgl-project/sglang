@@ -2,6 +2,7 @@ import asyncio
 import functools
 import itertools
 import logging
+import random
 
 import torch
 import transformers
@@ -27,6 +28,25 @@ _MODALITIES = (Modality.IMAGE, Modality.VIDEO, Modality.AUDIO)
 
 def _device_type(device):
     return None if device is None else torch.device(device).type
+
+
+def _check_cached_features(media_item, cached, computed):
+    modality = media_item[0]
+    if cached.keys() != computed.keys():
+        raise RuntimeError(
+            f"The item feature cache holds fields {sorted(cached)} for a {modality.name}"
+            f" item that computes to {sorted(computed)}"
+        )
+    for name, value in computed.items():
+        if not isinstance(value, torch.Tensor):
+            continue
+        other = cached[name]
+        if other.dtype != value.dtype or not torch.equal(other.cpu(), value.cpu()):
+            raise RuntimeError(
+                f"The item feature cache holds other {name} for a {modality.name} item"
+                " than computing it now gives: its key leaves out something the"
+                " features depend on"
+            )
 
 
 class TokenSpaceProcessor(MultimodalProcessorMixin):
@@ -59,11 +79,15 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
         processor_config=None,
         worker_thread_device=None,
         item_feature_cache=None,
+        item_feature_cache_check_rate=None,
     ):
         strategy_class = self.strategy_class
         self._worker_thread_device = worker_thread_device
         # Any map with get and __setitem__, e.g. a dict, an LRU or a disk cache.
         self._item_feature_cache = item_feature_cache
+        # The share of hits computed again and compared with the cache; 0 or None is off.
+        self._item_feature_cache_check_rate = item_feature_cache_check_rate
+        self._item_feature_cache_check_rng = random.Random()
         if processor_config is None:
             processor_config = MultimodalProcessorConfig()
         self._initialize_processor(
@@ -190,6 +214,7 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
         can share one map.
         """
         item_features = [None] * len(media_items)
+        checked = {}
         if self._item_feature_cache is not None:
             media_options = self.strategy.resolve_media_options(
                 self._processor, **request_options
@@ -239,6 +264,17 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
                     for name in self.FEATURE_NAMES:
                         if isinstance(features.get(name), torch.Tensor):
                             features[name] = features[name].to(device)
+            # A key that leaves out something the features depend on fails here, not in training.
+            if self._item_feature_cache_check_rate:
+                checked = {
+                    index: features
+                    for index, features in enumerate(item_features)
+                    if features is not None
+                    and self._item_feature_cache_check_rng.random()
+                    < self._item_feature_cache_check_rate
+                }
+            for index in checked:
+                item_features[index] = None
         missed = [
             index for index, features in enumerate(item_features) if features is None
         ]
@@ -267,6 +303,8 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
         missed_features = await self._process_items(loaded_items, request_options)
         for index, features in zip(missed, missed_features):
             item_features[index] = features
+        for index, cached in checked.items():
+            _check_cached_features(media_items[index], cached, item_features[index])
         if self._item_feature_cache is not None:
             await asyncio.gather(
                 *(
@@ -276,6 +314,7 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
                         item_features[index],
                     )
                     for index in missed
+                    if index not in checked
                 )
             )
         return item_features

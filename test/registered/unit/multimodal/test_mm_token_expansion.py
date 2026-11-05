@@ -24,6 +24,9 @@ TokenSpaceProcessor.process(media, IDs)
   item feature cache, same image on another device -> loaded again
   item feature cache, same image on another GPU (serving vs a trainer rank) -> reused
   one map, processors of another checkpoint, mm_process_config or library version -> loaded again
+  item feature cache, check rate 1 -> a hit is computed again, equal to the cache, not rewritten;
+      the global random stream is untouched
+  item feature cache, a sampled hit computes to other features -> RuntimeError
 
 get_mm_processor -> TokenSpaceSGLangProcessor
   each strategy and serving spec keep the legacy processor's loader and worker defaults
@@ -31,7 +34,7 @@ get_mm_processor -> TokenSpaceSGLangProcessor
   tokenizer + strategy -> served output; caller IDs never decoded
   --allowed-media-domains / max file size -> the core's media URL policy
   budget or trusted URLs without --enable-token-space-preprocess-cache -> the core caches nothing
-  --token-space-preprocess-cache-dir -> the core caches on disk
+  --token-space-preprocess-cache-dir -> the core caches on disk; the check rate reaches the core
   adjacent images -> two offsets from mm_spans, not one scanned run
   equal features, different grids -> different item hashes
   equal feature bytes, different feature shapes -> different item hashes
@@ -42,6 +45,7 @@ import asyncio
 import base64
 import contextlib
 import io
+import random
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -238,6 +242,7 @@ class TestTokenSpaceProcessor(unittest.TestCase):
         mm_process_config=None,
         item_feature_cache=None,
         keep_mm_features_on_device=False,
+        item_feature_cache_check_rate=None,
     ):
         processor = TokenSpaceProcessor.for_strategy(strategy_class)(
             hf_config,
@@ -248,6 +253,7 @@ class TestTokenSpaceProcessor(unittest.TestCase):
                 keep_mm_features_on_device=keep_mm_features_on_device,
             ),
             item_feature_cache=item_feature_cache,
+            item_feature_cache_check_rate=item_feature_cache_check_rate,
         )
         self.addCleanup(processor.shutdown)
         return processor
@@ -428,6 +434,35 @@ class TestTokenSpaceProcessor(unittest.TestCase):
             processor.process([image], input_ids=[1, IMAGE], image_device="meta")
         )
         self.assertEqual(output["pixel_values"].device.type, "meta")
+
+    def test_item_feature_cache_sampled_hit_is_computed_again_and_checked(self):
+        """A checked hit is loaded like a miss, must equal the cache, and is not rewritten."""
+        image = Image.new("RGB", (2, 1))
+        item_feature_cache = {}
+        processor = self._processor(
+            hf_config=_CHECKPOINT, item_feature_cache=item_feature_cache
+        )
+        expected = asyncio.run(processor.process([image], input_ids=[1, IMAGE]))
+        ((key, cached),) = item_feature_cache.items()
+
+        processor = self._processor(
+            hf_config=_CHECKPOINT,
+            item_feature_cache=item_feature_cache,
+            item_feature_cache_check_rate=1,
+        )
+        load = AsyncMock(wraps=processor._load_media_lists)
+        global_random_state = random.getstate()
+        with patch.object(processor, "_load_media_lists", load):
+            output = asyncio.run(processor.process([image], input_ids=[1, IMAGE]))
+        # A trainer seeds the global stream; sampling must not draw from it.
+        self.assertEqual(random.getstate(), global_random_state)
+        self.assertEqual(load.await_args.args[0], [image])
+        self.assertTrue(torch.equal(output["pixel_values"], expected["pixel_values"]))
+        self.assertIs(item_feature_cache[key], cached)
+
+        cached["pixel_values"] = cached["pixel_values"] + 1
+        with self.assertRaisesRegex(RuntimeError, "other pixel_values"):
+            asyncio.run(processor.process([image], input_ids=[1, IMAGE]))
 
     def test_item_feature_cache_is_shared_only_by_matching_processors(self):
         """A trainer and serving may share one map; another checkpoint, config or upgrade must miss."""
@@ -702,6 +737,7 @@ class TestTokenSpaceSGLangProcessor(unittest.TestCase):
                     token_space_preprocess_cache_trust_url=True,
                     enable_token_space_preprocess_cache=True,
                     token_space_preprocess_cache_dir=directory.name,
+                    token_space_preprocess_cache_check_rate=0.5,
                 ),
                 DiskPreprocessCache,
             ),
@@ -723,6 +759,10 @@ class TestTokenSpaceSGLangProcessor(unittest.TestCase):
                 )(None, server_args, _bare_tokenizer(), None)
                 self.addCleanup(processor.shutdown)
                 self.assertIsInstance(processor._core._item_feature_cache, cache_type)
+                self.assertEqual(
+                    processor._core._item_feature_cache_check_rate,
+                    cache_args.get("token_space_preprocess_cache_check_rate"),
+                )
 
     def test_chat_media_reach_a_partially_expanded_request(self):
         """Chat sends every turn's image; only the new turn's placeholder expands."""
