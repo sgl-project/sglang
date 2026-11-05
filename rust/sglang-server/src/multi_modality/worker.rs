@@ -19,9 +19,8 @@ use crate::utils::error::Error;
 use crate::utils::fsm::Event;
 use crate::utils::runtime::Runnable;
 
-/// Python parity: caller hashes override the computed ones so an external
-/// router's keys align with the prefix cache. A length mismatch or malformed
-/// entry warns and keeps the computed hash — never blocks the request.
+/// Preserve legacy routing hints for observers. These do not override the
+/// full content identity computed by `make_buffers` for cache equality.
 fn apply_caller_hashes<'a>(hashes: impl ExactSizeIterator<Item = &'a mut u64>, caller: &[String]) {
     if caller.is_empty() {
         return;
@@ -43,8 +42,7 @@ fn apply_caller_hashes<'a>(hashes: impl ExactSizeIterator<Item = &'a mut u64>, c
 }
 
 /// Hex of any width, as Python's `int(hex_hash, 16)` takes it (a full SHA-256
-/// being the common case), keeping the low 64 bits — only the low 30 are
-/// observable, through `_compute_pad_value`.
+/// being the common case), keeping the low 64 bits in this legacy field only.
 fn parse_caller_hash(entry: &str) -> Option<u64> {
     let hex = entry.strip_prefix("0x").unwrap_or(entry);
     if hex.is_empty() || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -307,7 +305,7 @@ fn place_features(
 /// [`place_features`]), the M-RoPE positions, and the `mm.meta` sidecar --
 /// always last, so a reader that finds it knows the rest is present.
 fn make_buffers(entry: MmEncodedEntry, feature_shm: bool) -> Result<Vec<Buffer>, String> {
-    let meta = MmMeta::of(&entry).encode()?;
+    let meta = MmMeta::of(&entry)?.encode()?;
     let MmEncodedEntry { items, mrope, .. } = entry;
     let features = items.into_iter().map(|item| item.feature).collect();
     let mut buffers = place_features(features, feature_shm, |_| {

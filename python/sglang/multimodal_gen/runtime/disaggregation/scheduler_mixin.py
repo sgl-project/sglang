@@ -60,10 +60,12 @@ from sglang.multimodal_gen.runtime.distributed.ipc_cuda import (
     detach_cuda_tensors,
 )
 from sglang.multimodal_gen.runtime.distributed.utils import broadcast_pyobj
-from sglang.multimodal_gen.runtime.entrypoints.utils import expand_request_outputs
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
     clone_scheduler_runtime,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
+    expand_request_outputs,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
