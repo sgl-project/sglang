@@ -101,11 +101,14 @@ def _chunked_lora_expand_kernel(
         pid_n = tl.full((), 0, tl.int32)
         tile_start = tl.full((), 0, tl.int32)
         for s in tl.static_range(NUM_SLICES):
-            tiles = (SLICE_OFFSETS[s + 1] - SLICE_OFFSETS[s] + BLOCK_N - 1) // BLOCK_N
+            # Older Triton requires unwrapping the tuple and wrapping each value.
+            start = tl.constexpr(SLICE_OFFSETS.value[s])
+            end = tl.constexpr(SLICE_OFFSETS.value[s + 1])
+            tiles = (end - start + BLOCK_N - 1) // BLOCK_N
             belongs = (flat_tile >= tile_start) & (flat_tile < tile_start + tiles)
             slice_id = tl.where(belongs, s, slice_id)
-            slice_start = tl.where(belongs, SLICE_OFFSETS[s], slice_start)
-            slice_end = tl.where(belongs, SLICE_OFFSETS[s + 1], slice_end)
+            slice_start = tl.where(belongs, start, slice_start)
+            slice_end = tl.where(belongs, end, slice_end)
             pid_n = tl.where(belongs, flat_tile - tile_start, pid_n)
             tile_start += tiles
 
