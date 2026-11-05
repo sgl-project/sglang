@@ -30,7 +30,7 @@ import math
 import os
 import time
 from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass, fields
+from dataclasses import KW_ONLY, dataclass, fields
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
 
@@ -1724,14 +1724,13 @@ class KVWriteLoc:
     - ``loc``: the generic per-token write location (``out_cache_loc``).
       PHYSICAL on every pool: by allocation on non-unified pools, the
       iteration's plan's write ids on the unified pool (``IterationIds.bind``).
-    - ``swa_loc``: the SWA-sub-pool location for hybrid SWA pools (``None``
-      otherwise): the same plan's write ids in the sliding-window sub-pool
-      (``RunnerIds.write_ids``).
+    - ``window_locs``: the write ids of each window sub-pool the layers write,
+      keyed by sub-pool name (``window_write_locs``), resolved by the same
+      plan (``RunnerIds.write_ids``); ``None`` when the layers write no
+      window sub-pool. A window layer writes at its own sub-pool's entry.
     - ``full_loc``: OPTIONAL full-attention-sub-pool location, in the same id
       space as ``loc``; pools fall back to ``loc`` when it is ``None``.
 
-    ``swa_loc`` and ``full_loc`` are the parallel pair (each a pre-resolved
-    loc into its sub-pool, mirroring ``swa_kv_pool`` / ``full_kv_pool``);
     ``loc`` is the generic fallback. Bundling them lets a backend issue one
     ``set_kv_buffer`` call regardless of pool type.
 
@@ -1742,28 +1741,29 @@ class KVWriteLoc:
     """
 
     loc: torch.Tensor
-    swa_loc: Optional[torch.Tensor] = None
+    _: KW_ONLY
     full_loc: Optional[torch.Tensor] = None
     physical: bool = False
+    window_locs: Optional[Dict[str, torch.Tensor]] = None
 
     @classmethod
     def for_batch(
         cls,
         forward_batch,
         *,
-        swa_loc: Optional[torch.Tensor] = None,
         full_loc: Optional[torch.Tensor] = None,
+        window_locs: Optional[Dict[str, torch.Tensor]] = None,
     ) -> KVWriteLoc:
         """The batch's ``out_cache_loc`` as a write loc, carrying the batch's
-        physical mark. A ``swa_loc`` or ``full_loc`` passed here travels under
-        the same mark, so it must come from the same plan (as
-        ``RunnerIds.write_ids`` does); a loc produced separately states
-        its own mark with ``KVWriteLoc(loc, physical=...)``."""
+        physical mark. A ``full_loc`` or ``window_locs`` passed here travels
+        under the same mark, so it must come from the same plan (as
+        ``RunnerIds.write_ids`` does); a loc produced separately states its
+        own mark with ``KVWriteLoc(loc, physical=...)``."""
         return cls(
             forward_batch.out_cache_loc,
-            swa_loc,
-            full_loc,
+            full_loc=full_loc,
             physical=forward_batch.out_cache_loc_is_physical,
+            window_locs=window_locs,
         )
 
     @classmethod
@@ -1772,29 +1772,48 @@ class KVWriteLoc:
         forward_batch,
         layer,
         *,
-        swa_loc: Optional[torch.Tensor] = None,
         full_loc: Optional[torch.Tensor] = None,
+        window_locs: Optional[Dict[str, torch.Tensor]] = None,
     ) -> KVWriteLoc:
         """``layer``'s write loc: the batch's, or for a cross-attention layer
         ``encoder_out_cache_loc``, which nothing translates and so is never
         marked physical."""
         if layer.is_cross_attention:
-            return cls(forward_batch.encoder_out_cache_loc, swa_loc, full_loc)
-        return cls.for_batch(forward_batch, swa_loc=swa_loc, full_loc=full_loc)
+            return cls(
+                forward_batch.encoder_out_cache_loc,
+                full_loc=full_loc,
+                window_locs=window_locs,
+            )
+        return cls.for_batch(forward_batch, full_loc=full_loc, window_locs=window_locs)
 
     def __post_init__(self):
-        # swa_loc / full_loc are resolved once at metadata-init from the full
-        # (padded) out_cache_loc; piecewise/DP-padded paths later narrow loc per
-        # layer, so slice these pre-resolved locs to match (same per-token order).
-        # A multi-step draft step's slice is NOT a prefix of the all-steps loc;
-        # its backend derives per-step locs and never relies on this.
-        if self.swa_loc is not None and self.swa_loc.shape[0] != self.loc.shape[0]:
-            self.swa_loc = self.swa_loc[: self.loc.shape[0]]
+        # full_loc / window_locs are resolved once at metadata-init from the
+        # full (padded) out_cache_loc; piecewise/DP-padded paths later narrow
+        # loc per layer, so slice these pre-resolved locs to match (same
+        # per-token order). A multi-step draft step's slice is NOT a prefix of
+        # the all-steps loc; its backend derives per-step locs and never
+        # relies on this.
         if self.full_loc is not None and self.full_loc.shape[0] != self.loc.shape[0]:
             self.full_loc = self.full_loc[: self.loc.shape[0]]
+        if self.window_locs is not None:
+            n = self.loc.shape[0]
+            self.window_locs = {
+                name: ids if ids.shape[0] == n else ids[:n]
+                for name, ids in self.window_locs.items()
+            }
         _check_dense_loc(self.loc, "loc")
-        _check_dense_loc(self.swa_loc, "swa_loc")
         _check_dense_loc(self.full_loc, "full_loc")
+        for name, ids in (self.window_locs or {}).items():
+            _check_dense_loc(ids, f"window_locs[{name!r}]")
+
+    def window_loc(self, sub_pool: str) -> torch.Tensor:
+        """The write ids of window sub-pool ``sub_pool``."""
+        if self.window_locs is None or sub_pool not in self.window_locs:
+            raise KeyError(
+                f"the write loc carries no ids for window sub-pool {sub_pool!r} "
+                f"(it carries {sorted(self.window_locs or ())})"
+            )
+        return self.window_locs[sub_pool]
 
 
 def _check_dense_loc(loc: Optional[torch.Tensor], name: str) -> None:
@@ -1806,10 +1825,41 @@ def _check_dense_loc(loc: Optional[torch.Tensor], name: str) -> None:
         )
 
 
+def window_write_locs(
+    runner_ids, ids: Optional[torch.Tensor]
+) -> Optional[Dict[str, torch.Tensor]]:
+    """``ids``, the write ids a backend with one window rail resolved for its
+    runner's window storage, keyed by the sub-pool that storage is
+    (``RunnerIds.window_storage``); None when ``ids`` is. A backend with no
+    RunnerIds serves a static pool, whose window sub-pool is
+    ``SWAKVPool.WINDOW_SUB_POOL``."""
+    if ids is None:
+        return None
+    if runner_ids is None:
+        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+
+        name = SWAKVPool.WINDOW_SUB_POOL
+    else:
+        name = runner_ids.window_storage
+    return {getattr(name, "value", name): ids}
+
+
+def layer_window_locs(
+    pool, layer_id: int, ids: Optional[torch.Tensor]
+) -> Optional[Dict[str, torch.Tensor]]:
+    """``ids``, the write ids of the window sub-pool layer ``layer_id`` writes in
+    ``pool``, keyed by that sub-pool's name as the layer's route gives it; None
+    when ``ids`` is."""
+    if ids is None:
+        return None
+    sub_pool = pool.layer_router.route(layer_id).sub_pool
+    return {getattr(sub_pool, "value", sub_pool): ids}
+
+
 def unwrap_write_loc(loc_info):
-    """Return ``(loc, swa_loc, full_loc)`` from a ``KVWriteLoc`` or a bare loc."""
+    """Return ``(loc, window_locs, full_loc)`` from a ``KVWriteLoc`` or a bare loc."""
     if isinstance(loc_info, KVWriteLoc):
-        return loc_info.loc, loc_info.swa_loc, loc_info.full_loc
+        return loc_info.loc, loc_info.window_locs, loc_info.full_loc
     _check_dense_loc(loc_info, "loc")
     return loc_info, None, None
 

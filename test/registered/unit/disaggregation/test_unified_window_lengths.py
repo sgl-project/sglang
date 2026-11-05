@@ -29,19 +29,12 @@ from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.kv.build import UnifiedBuildContext, build_kv_storage
 from sglang.srt.mem_cache.kv.decl import (
     MHAGeometry,
+    WindowLayers,
     kv_layer_decls,
     primary_window,
 )
-from sglang.srt.mem_cache.kv.plan import plan_kv_storage, sub_pool_names
+from sglang.srt.mem_cache.kv.plan import plan_kv_storage
 from sglang.srt.mem_cache.kv.sizing import KVSizingInputs, size_plan
-from sglang.srt.mem_cache.layout.fused_draft import (
-    LAYER_WINDOW,
-    DraftKVGeometry,
-    DraftKVProfile,
-    DraftLayerSet,
-    PlacementContext,
-    place_fused_draft,
-)
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import setup_allocator_context
@@ -50,45 +43,23 @@ register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-l
 
 _MHA = MHAGeometry(head_num=1, head_dim=8, v_head_dim=8, kv_cache_dtype=torch.bfloat16)
 _PAGE = 4
-# The target's window (the scheduler's sliding window) and a shorter fused
-# draft window, a sub-pool of its own.
+# The target's window (the scheduler's sliding window) and two shorter windows
+# of their own sub-pools, as draft windows of other lengths are.
 _TARGET_WINDOW = 16
-_WINDOWS = (_TARGET_WINDOW, 8)
-
-
-def _draft_window_placement(decls, target_window, draft_window):
-    return place_fused_draft(
-        profile=DraftKVProfile(
-            num_layers=1,
-            kinds={
-                LAYER_WINDOW: DraftLayerSet(
-                    layer_ids=(0,),
-                    window=draft_window,
-                    geometry=DraftKVGeometry(head_num=1, head_dim=8, v_head_dim=8),
-                )
-            },
-        ),
-        num_runners=1,
-        ctx=PlacementContext(
-            host_names=sub_pool_names(decls), target_window=target_window
-        ),
-        store_dtype=torch.bfloat16,
-    ).placement
+_WINDOWS = (_TARGET_WINDOW, 8, 4)
 
 
 def _storage(windows=_WINDOWS, device="cpu"):
     setup_allocator_context()
-    target, *drafts = windows
-    assert len(drafts) <= 1, "a draft adds at most one window"
     decls = kv_layer_decls(
         full_layer_ids=(0,),
         full_geometry=_MHA,
-        window_layer_ids=(1,),
-        window_geometry=_MHA,
-        window=target,
+        windows=[
+            WindowLayers(layer_ids=(i + 1,), geometry=_MHA, window=w)
+            for i, w in enumerate(windows)
+        ],
     )
-    placement = _draft_window_placement(decls, target, drafts[0]) if drafts else None
-    plan = plan_kv_storage(decls, page_size=_PAGE, fused_draft=placement)
+    plan = plan_kv_storage(decls, page_size=_PAGE)
     sized = size_plan(
         plan,
         KVSizingInputs(
@@ -103,7 +74,7 @@ def _storage(windows=_WINDOWS, device="cpu"):
     ctx = UnifiedBuildContext(
         device=device,
         start_layer=0,
-        end_layer=2,
+        end_layer=len(windows) + 1,
         enable_memory_saver=False,
         need_sort=False,
         max_num_reqs=3,
@@ -233,7 +204,7 @@ class TestUnifiedWindowLengths(CustomTestCase):
         storage.bind_window_retention(_TARGET_WINDOW, {"window_8": 13})
         self.assertEqual(
             storage.retained_window_lengths(),
-            {"window_16": 16, "window_8": 13},
+            {"window_16": 16, "window_8": 13, "window_4": 4},
         )
         for seq_len in (5, 23, 37, 64):
             with self.subTest(seq_len=seq_len):
@@ -268,15 +239,15 @@ class TestUnifiedWindowLengths(CustomTestCase):
 
         def wire(tails):
             kv_args = SimpleNamespace(
-                state_types=["swa"] * 2,
+                state_types=["swa"] * 3,
                 state_sub_pools=list(tails),
                 state_wire_keys=list(tails),
                 state_window_tails=list(tails.values()),
             )
             return state_wire(kv_args)
 
-        widened = wire({"window_16": 16, "window_8": 13})
-        narrow = wire({"window_16": 16, "window_8": 8})
+        widened = wire({"window_16": 16, "window_4": 4, "window_8": 13})
+        narrow = wire({"window_16": 16, "window_4": 4, "window_8": 8})
         check_state_wire(widened, widened)
         # A prefill keeping more of a window sends its decode's tail; one
         # keeping less cannot.
@@ -285,10 +256,16 @@ class TestUnifiedWindowLengths(CustomTestCase):
             check_state_wire(narrow, widened)
 
     def test_storage_answers_windows_for_its_consumers(self):
-        """Readers outside the storage get each window's facts from it: the
-        target's window follows one rule, and a sub-pool's room is the
-        planner's."""
+        """Readers outside the storage get each window's facts from it: a
+        layer's route carries its window, the target's window follows one
+        rule, and a sub-pool's room is the planner's."""
         storage = _storage()
+        router = storage.allocator.get_kvcache().layer_router
+        for i, window in enumerate(_WINDOWS):
+            name = f"window_{window}"
+            self.assertEqual(router.sub_pool(name).window, window)
+            self.assertEqual(router.layer(i + 1).route.window, window)
+        self.assertIsNone(router.layer(0).route.window)
         self.assertEqual(
             storage.allocator.target_window_pool(), f"window_{_TARGET_WINDOW}"
         )

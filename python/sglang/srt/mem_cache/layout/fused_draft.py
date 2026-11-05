@@ -266,14 +266,12 @@ class DraftKVProfile(msgspec.Struct, frozen=True, kw_only=True):
 
 class PlacementContext(msgspec.Struct, frozen=True, kw_only=True):
     """Target-side facts a host kind consults when placing a layer set: the
-    sub-pools the host builds and the target's window. No attention backend
-    is among them: a fused draft's layers are parts of the host sub-pools,
-    read through the same views and id spaces as the target's."""
+    sub-pools the host builds and the windows its layers declare. No attention
+    backend is among them: a fused draft's layers are parts of the host
+    sub-pools, read through the same views and id spaces as the target's."""
 
     host_names: Tuple[str, ...]
-    target_window: Optional[int] = None
-    # The sub-pool the target's window layers store in, by name.
-    target_window_sub_pool: Optional[str] = None
+    target_windows: Tuple[Optional[int], ...] = ()
     dcp_size: int = 1
 
 
@@ -395,22 +393,23 @@ FULL_HOST = register_host_kind(
 
 
 class WindowHostKind(DenseHostKind):
-    """The target's window sub-pool: a draft window layer rides there when its
-    window fits the target's; eviction keeps any further reach the draft worker
-    declares."""
+    """A target window sub-pool: a draft window layer rides in the one whose
+    window equals its own, whichever of the target's windows that is;
+    eviction keeps any further reach the draft worker declares."""
 
     def admits(self, *, layers: DraftLayerSet, ctx: PlacementContext) -> Optional[str]:
         if layers.window is None:
             return "the draft declares no sliding window size"
-        if ctx.target_window is None:
+        if not ctx.target_windows:
             return "the target declares no sliding window size"
-        if layers.window != ctx.target_window:
-            return f"its window {layers.window} differs from the target's window {ctx.target_window}"
+        if layers.window not in ctx.target_windows:
+            return (
+                f"its window {layers.window} differs from the target's windows "
+                f"{list(ctx.target_windows)}"
+            )
         return super().admits(layers=layers, ctx=ctx)
 
     def host_name(self, *, layers: DraftLayerSet, ctx: PlacementContext) -> str:
-        if ctx.target_window_sub_pool is not None:
-            return ctx.target_window_sub_pool
         return window_sub_pool_name(layers.window)
 
 
@@ -594,11 +593,16 @@ def draft_kv_profile(
     attn_tp_size: int,
     dcp_size: int = 1,
     num_depths: Optional[int] = None,
+    window: Optional[int] = None,
 ) -> DraftKVProfile:
     """The draft's layer geometry and execution width, before storage placement.
 
     ``dcp_size`` is the resolved attention execution width.
     ``num_depths`` overrides the checkpoint depth.
+    ``window`` is the window the draft's sliding-window layers attend over, as
+    the draft's runner will resolve it (`resolve_sliding_layer_window_size`):
+    the unit the target's windows are declared in, so equal windows share a
+    sub-pool.
     """
     from sglang.srt.configs.hybrid_arch import mambaish_config
     from sglang.srt.configs.model_config import AttentionArch
@@ -643,9 +647,7 @@ def draft_kv_profile(
                 head_dim=int(mc.swa_head_dim),
                 v_head_dim=int(mc.swa_v_head_dim),
             ),
-            window=(
-                None if mc.sliding_window_size is None else int(mc.sliding_window_size)
-            ),
+            window=None if window is None else int(window),
         )
     state_ids = draft_state_layer_ids(mc, num_depths=num_depths)
     if state_ids:

@@ -471,8 +471,6 @@ def plan_kv_storage(
     groups = _group_parts(decls, page_size)
     if not any(isinstance(lt, FullLifetime) for lt, _ in groups):
         raise ValueError("unified storage needs a FULL virtual-id owner")
-    if len({lt for lt, _ in groups if isinstance(lt, WindowLifetime)}) > 1:
-        raise ValueError("multiple target windows require named model declarations")
     names_by_key = {key: _sub_pool_name(key[0]) for key in groups}
     if fused_draft is not None:
         for name, band in fused_draft.new_bands.items():

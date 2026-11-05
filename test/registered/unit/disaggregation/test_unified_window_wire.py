@@ -1,7 +1,6 @@
 """PD peers carry each window sub-pool of a unified pool as an entry of its own.
 
-A unified pool may hold several windows: the target's and a fused draft's window
-of another length. Each window's pages travel as their
+A unified pool may hold several windows. Each window's pages travel as their
 own state entry, registered with the window's sub-pool; the prefill sends and
 the decode receives that sub-pool's pages for it, and a transfer's rows are
 recorded against it. Two peers pair entries by position, so peers whose
@@ -36,18 +35,11 @@ from sglang.srt.mem_cache.kv.build import UnifiedBuildContext, build_kv_storage
 from sglang.srt.mem_cache.kv.decl import (
     KV_PART,
     MHAGeometry,
+    WindowLayers,
     kv_layer_decls,
 )
-from sglang.srt.mem_cache.kv.plan import plan_kv_storage, sub_pool_names
+from sglang.srt.mem_cache.kv.plan import plan_kv_storage
 from sglang.srt.mem_cache.kv.sizing import KVSizingInputs, size_plan
-from sglang.srt.mem_cache.layout.fused_draft import (
-    LAYER_WINDOW,
-    DraftKVGeometry,
-    DraftKVProfile,
-    DraftLayerSet,
-    PlacementContext,
-    place_fused_draft,
-)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import setup_allocator_context
@@ -55,43 +47,20 @@ from sglang.test.unified_allocator_fixtures import setup_allocator_context
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 _MHA = MHAGeometry(head_num=1, head_dim=8, v_head_dim=8, kv_cache_dtype=torch.bfloat16)
-# The target's window and a fused draft's window of another length.
-_WINDOWS = (16, 8)
-
-
-def _draft_window_placement(decls, target_window, draft_window):
-    return place_fused_draft(
-        profile=DraftKVProfile(
-            num_layers=1,
-            kinds={
-                LAYER_WINDOW: DraftLayerSet(
-                    layer_ids=(0,),
-                    window=draft_window,
-                    geometry=DraftKVGeometry(head_num=1, head_dim=8, v_head_dim=8),
-                )
-            },
-        ),
-        num_runners=1,
-        ctx=PlacementContext(
-            host_names=sub_pool_names(decls), target_window=target_window
-        ),
-        store_dtype=torch.bfloat16,
-    ).placement
+_WINDOWS = (16, 8, 4)
 
 
 def _storage(windows):
     setup_allocator_context()
-    target, *drafts = windows
-    assert len(drafts) <= 1, "a draft adds at most one window"
     decls = kv_layer_decls(
         full_layer_ids=(0,),
         full_geometry=_MHA,
-        window_layer_ids=(1,),
-        window_geometry=_MHA,
-        window=target,
+        windows=[
+            WindowLayers(layer_ids=(i + 1,), geometry=_MHA, window=w)
+            for i, w in enumerate(windows)
+        ],
     )
-    placement = _draft_window_placement(decls, target, drafts[0]) if drafts else None
-    plan = plan_kv_storage(decls, page_size=4, fused_draft=placement)
+    plan = plan_kv_storage(decls, page_size=4)
     sized = size_plan(
         plan,
         KVSizingInputs(
@@ -106,7 +75,7 @@ def _storage(windows):
     ctx = UnifiedBuildContext(
         device="cpu",
         start_layer=0,
-        end_layer=2,
+        end_layer=len(windows) + 1,
         enable_memory_saver=False,
         need_sort=False,
         max_num_reqs=3,
