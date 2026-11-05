@@ -64,6 +64,9 @@ class TestStandalonePdScope(CustomTestCase):
             "disaggregation_mode": role,
             "disable_overlap_schedule": True,
             "attention_backend": "fa3",
+            # The normal pipeline resolves this before the speculative hook;
+            # the dummy constructor deliberately skips that earlier stage.
+            "page_size": 1,
         }
         fields.update(overrides)
         for name, value in fields.items():
