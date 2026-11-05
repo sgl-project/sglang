@@ -465,6 +465,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     mamba_cow_src_indices: Optional[torch.Tensor] = None
     mamba_cow_dst_indices: Optional[torch.Tensor] = None
     mamba_clear_indices: Optional[torch.Tensor] = None
+    mamba_prefill_src_indices: Optional[torch.Tensor] = None
 
     # For input embeddings
     input_embeds: Optional[torch.Tensor] = None
@@ -1012,6 +1013,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             mamba_cow_src_indices=batch.mamba_cow_src_indices,
             mamba_cow_dst_indices=batch.mamba_cow_dst_indices,
             mamba_clear_indices=batch.mamba_clear_indices,
+            mamba_prefill_src_indices=batch.mamba_prefill_src_indices,
             encoder_lens=batch.encoder_lens,
             encoder_out_cache_loc=batch.encoder_out_cache_loc,
             input_embeds=batch.input_embeds,

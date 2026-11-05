@@ -49,6 +49,28 @@ def _state(slots: int) -> StateStorage:
 
 
 class TestStateAcquire(CustomTestCase):
+    def test_default_copy_keeps_the_legacy_two_argument_pool_contract(self):
+        class LegacyPool:
+            def copy_from(self, src, dst):
+                self.copied = (src, dst)
+
+        pool = LegacyPool()
+        state = StateStorage(
+            sub_pool="mamba",
+            pool=pool,
+            slots=None,
+            layer_map={},
+            short_conv_pool=None,
+            ngram_pool=None,
+        )
+        src = torch.tensor([5], dtype=torch.int64)
+        dst = torch.tensor([17], dtype=torch.int64)
+
+        state.copy(src, dst)
+
+        self.assertIs(pool.copied[0], src)
+        self.assertIs(pool.copied[1], dst)
+
     def test_running_out_of_state_slots_gives_back_rows_and_slots(self):
         """Each request takes a state slot and two tracking slots. With slots
         for one request and a half, the second runs out after the first got
