@@ -21,7 +21,11 @@ from transformers import Qwen3MoeConfig
 import sglang as sgl
 from sglang.srt.environ import envs
 
-KEEP = {4: [[7, 1, 5, 3], [6, 2, 4, 0]], 2: [[7, 1], [6, 2]]}
+KEEP = {
+    4: [[7, 1, 5, 3], [6, 2, 4, 0]],
+    3: [[7, 1, 5], [6, 2, 4]],
+    2: [[7, 1], [6, 2]],
+}
 PROMPTS = [[1, 17, 43, 97, 211, 307], [1, 233, 29, 51, 13, 19, 487]]
 
 
@@ -322,7 +326,7 @@ def main():
         "status": "running",
         "comparisons": {},
     }
-    counts = (4,) if args.tp_size == 4 else (4, 2)
+    counts = (4,) if args.tp_size == 4 else (4, 3, 2)
     try:
         run_engine(args, "full", original)
         for count in counts:
