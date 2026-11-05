@@ -164,6 +164,102 @@ def test_replicated_q_keeps_local_projection_and_validates_its_native_slice():
         providers._mla_proxy(attention)
 
 
+def test_prepared_mla_binds_replicated_q_storage_after_backend_initialization():
+    """A stable Parameter/shape can hide a new Q storage pointer before capture."""
+
+    def to_cute(tensor, align=16):
+        view = SimpleNamespace(
+            pointer=tensor.data_ptr(),
+            offset=tensor.storage_offset(),
+            shape=tuple(tensor.shape),
+            stride=tuple(tensor.stride()),
+            alignment=align,
+        )
+        return view
+
+    scope = dict(
+        torch=torch,
+        cutlass=SimpleNamespace(Float32=float),
+        core_for=lambda *args: "trtllm",
+        to_cute=to_cute,
+        layout=lambda tensor: (
+            tuple(tensor.shape),
+            tuple(tensor.stride()),
+            tensor.dtype,
+        ),
+        compile_core=lambda *args: (object(), object()),
+    )
+    definition = ast.ClassDef(
+        name="PreparedMla",
+        bases=[],
+        keywords=[],
+        body=[
+            method("cutedsl/mla/prepared.py", "PreparedMla", name)
+            for name in ("__init__", "prepare_cache")
+        ],
+        decorator_list=[],
+    )
+    exec(
+        compile(
+            ast.fix_missing_locations(ast.Module(body=[definition], type_ignores=[])),
+            "PreparedMla.weight_binding",
+            "exec",
+        ),
+        scope,
+    )
+    rows, columns, rank = 2304, 1536, 3
+    weight = torch.nn.Parameter(
+        torch.empty(rows, columns, dtype=torch.bfloat16), requires_grad=False
+    )
+    original = weight.detach()  # Keep the old allocation distinct from the replica.
+    identity, shape, stride = id(weight), tuple(weight.shape), tuple(weight.stride())
+    attention = SimpleNamespace(
+        q_b_proj=SimpleNamespace(weight=weight),
+        q_a_layernorm=SimpleNamespace(weight=torch.ones(columns, dtype=torch.bfloat16)),
+        kv_a_layernorm=SimpleNamespace(weight=torch.ones(512, dtype=torch.bfloat16)),
+        W_UK_T=torch.empty(12, 128, 512, dtype=torch.bfloat16),
+        W_UV=torch.empty(12, 512, 128, dtype=torch.bfloat16),
+        _q_scale_inv=torch.ones(1),
+        _k_scale_inv=torch.ones(1),
+        _q_scale_float=1.0,
+        _k_scale_float=1.0,
+        rms_norm_eps=1.0e-5,
+        scale=192.0**-0.5,
+    )
+    core = scope["PreparedMla"](
+        attention,
+        {1: 3648},
+        torch.empty(1, 12, 576, dtype=torch.uint8),
+        native_mla=True,
+        kv_shards=8,
+        kv_rank=rank,
+    )
+    replica = torch.empty(8 * rows, columns, dtype=weight.dtype)
+    local = replica.narrow(0, rank * rows, rows)
+    weight.data = local
+    assert (id(weight), tuple(weight.shape), tuple(weight.stride())) == (
+        identity,
+        shape,
+        stride,
+    )
+    assert weight.data_ptr() != original.data_ptr()
+    with patch.object(
+        torch.cuda,
+        "get_device_properties",
+        return_value=SimpleNamespace(multi_processor_count=148),
+    ):
+        assert core.prepare_cache(torch.empty(1, 64, 576, dtype=torch.uint8)) is core
+    q_view = core.views[2]
+    assert core.weights[2] is weight
+    assert q_view.pointer == local.data_ptr()
+    assert (
+        q_view.pointer
+        == replica.data_ptr() + rank * rows * columns * weight.element_size()
+    )
+    assert q_view.offset == rank * rows * columns
+    assert (q_view.shape, q_view.stride, q_view.alignment) == (shape, stride, 16)
+
+
 def test_query_insert_localizes_each_slot_to_exactly_one_dcp_rank():
     # Execute the actual insert method's pre-write slot selection on CPU.
     fn = method("cutedsl/mla/query.py", "MlaQuery", "insert")

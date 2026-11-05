@@ -275,9 +275,6 @@ class PreparedMla:
         softmax = attention.scale * attention._q_scale_float * k_scale
         self.eps = cutlass.Float32(attention.rms_norm_eps)
         self.stock_scales = softmax, k_scale
-        self.views = tuple(
-            to_cute(w, 4 if w.dtype == torch.float32 else 16) for w in self.weights
-        )
         self.query_scratch, self.kernels = query_scratch, {}
         shapes = [(b, q) for b in pitches for q in queries if b % q == 0]
         self.cores = {(b, q): core_for(b, core, q) for b, q in shapes}
@@ -291,6 +288,11 @@ class PreparedMla:
         self.latent = torch.empty(shape, dtype=bf16, device=self.device)
 
     def prepare_cache(self, kv):
+        # Backend initialization can re-alias the local Q Parameter into the
+        # replicated buffer. Bind its final storage only here, before capture.
+        self.views = tuple(
+            to_cute(w, 4 if w.dtype == torch.float32 else 16) for w in self.weights
+        )
         specs = tuple(layout(w) for w in (*self.weights, kv.view(torch.uint8)))
         for batch, q in self.cores:
             device = self.device.index

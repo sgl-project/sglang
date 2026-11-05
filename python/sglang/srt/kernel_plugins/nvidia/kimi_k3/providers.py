@@ -358,10 +358,11 @@ def _final_proxy(backbone: Any) -> Any:
 def _validate_mla_query_shard(attention: Any) -> None:
     """Keep prepared Q local even when the stock path replicates projection.
 
-    SGLang's replicated-Q preparation adds full-head buffers; it does not
-    replace ``q_b_proj.weight`` or ``w_kc``. The prepared kernels deliberately
-    project these original twelve-head shards and gather the resulting Q once
-    across DCP. The native fallback may independently use its replicas. Never
+    SGLang's replicated-Q preparation adds full-head buffers and can re-alias
+    ``q_b_proj.weight`` into its local slice. PreparedMla retains the Parameter
+    and binds its final storage after backend preparation. The kernels still
+    project twelve-head shards and gather the resulting Q once across DCP.
+    The native fallback may independently use its replicas. Never
     feed a 96-head replica into the fixed 12-head query/value kernels or switch
     the native configuration to make this path fit.
     """

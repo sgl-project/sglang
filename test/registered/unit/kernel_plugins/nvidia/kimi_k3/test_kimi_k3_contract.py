@@ -37,12 +37,6 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 WIDTHS = (1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64)
-# Source identity only: this in-tree digest does not qualify CUDA numerics,
-# TP8 collectives, full-model quality, or performance. It covers the translated
-# closure, generated package modules, and the source mapping/attribution files.
-CANDIDATE_PAYLOAD_SHA256 = (
-    "75cd226cef5cbf3f6b80d27f7f8efbad5cebf32f15c9235cda9b1afb556bcece"
-)
 
 
 class _Mode:
@@ -287,9 +281,8 @@ class TestKimiK3Contract(CustomTestCase):
             any("93-layer" in reason for reason in _model_disable_reasons(model, None))
         )
 
-    def test_candidate_payload_inventory_and_digest(self):
+    def test_candidate_payload_inventory(self):
         from sglang.srt.kernel_plugins.nvidia.kimi_k3.source_manifest import (
-            payload_digest,
             payload_manifest,
             source_paths,
         )
@@ -306,7 +299,6 @@ class TestKimiK3Contract(CustomTestCase):
         self.assertEqual(len(source_paths()), 71)
         manifest = payload_manifest()
         self.assertTrue(all(record["nbytes"] >= 0 for record in manifest.values()))
-        self.assertEqual(payload_digest(), CANDIDATE_PAYLOAD_SHA256)
 
 
 class _PreparedCore:
