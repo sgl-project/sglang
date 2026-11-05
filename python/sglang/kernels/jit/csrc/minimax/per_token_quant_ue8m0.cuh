@@ -139,7 +139,7 @@ void per_token_quant_ue8m0_scatter(
   auto E = SymbolicSize{"num_experts"};
   auto MM = SymbolicSize{"m_max"};
   auto G4 = SymbolicSize{"num_groups_div_4"};
-  device.set_options<kDLCUDA>();
+  device.set_options<kDLGPU>();
   TensorMatcher({M, H}).with_dtype<bf16_t>().with_device(device).verify(x);
   TensorMatcher({E, MM, H}).with_dtype<fp8_e4m3_t>().with_device(device).verify(gateup_input);
   TensorMatcher({E, G4, MM}).with_dtype<int32_t>().with_device(device).verify(gateup_input_scale);

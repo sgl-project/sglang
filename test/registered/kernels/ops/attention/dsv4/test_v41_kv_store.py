@@ -309,8 +309,9 @@ class TestV41KVStore(CustomTestCase):
         fused_store_cache: exact-norm rows bitwise against the torch quantizer, and
         general rows bitwise against the unfused kernel chain."""
 
-        # 300 tokens take the block-per-token kernel, 4096 the warp-per-token one.
-        for n, num_pages in ((300, 3), (4096, 20)):
+        # 300 tokens take the block-per-token kernel, 4097 the warp-per-token one; an odd
+        # count leaves half of the last wave64 idle on HIP.
+        for n, num_pages in ((300, 3), (4097, 20)):
             with self.subTest(tokens=n):
                 self._check_fused_k_norm_rope_store(n, num_pages)
 

@@ -6,7 +6,7 @@ Test Coverage:
 - process_req_with_grammar: dispatch by constraint type (json, regex, ebnf,
   structural_tag), no-constraint requests, no-backend error, cache hits,
   cached invalid grammar abort
-- abort_requests: single abort, abort all, future cancellation
+- abort: single abort, abort all, future cancellation
 - get_ready_grammar_requests: future completion, invalid grammar handling,
   timeout with max poll iterations, aborted request handling, queue cleanup
 
@@ -35,6 +35,7 @@ from sglang.srt.constrained.reasoner_grammar_backend import (
 )
 from sglang.srt.constrained.xgrammar_backend import XGrammarGrammarBackend
 from sglang.srt.distributed.communication_tags import P2PTag
+from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.parser.inkling_tokenizer import (
     CONTENT_MODEL_END_SAMPLING,
     CONTENT_THINKING,
@@ -52,6 +53,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.sampling.sampling_params import (
     REQUEST_REASONING_END_TOKEN_IDS_KEY,
+    REQUEST_REASONING_IN_GRAMMAR_KEY,
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -425,6 +427,28 @@ class TestProcessReqWithGrammar(unittest.TestCase):
             req.grammar.accept_token(token_id)
         self.assertTrue(req.grammar._is_generation())
 
+    def test_cache_hit_applies_only_a_request_reasoning_in_grammar(self):
+        for value, expected in ((True, True), ("true", False)):
+            with self.subTest(value=value):
+                mgr = self._make_mgr()
+                grammar_obj = ReasonerGrammarObject(
+                    grammar=MagicMock(), think_end_ids=[7]
+                )
+                grammar_obj.maybe_init_reasoning(True)
+                mgr.grammar_backend.get_cached_or_future_value.return_value = (
+                    grammar_obj,
+                    True,
+                )
+
+                req = _make_req(
+                    structural_tag="tag",
+                    custom_params={REQUEST_REASONING_IN_GRAMMAR_KEY: value},
+                )
+                req.require_reasoning = True
+                mgr.process_req_with_grammar(req)
+
+                self.assertIs(req.grammar.reasoning_in_grammar, expected)
+
     def test_strict_reasoning_grammar_applies_request_thinking_budget(self):
         mgr = self._make_mgr()
         mgr._enable_strict_thinking = True
@@ -446,7 +470,7 @@ class TestAbortRequests(unittest.TestCase):
         reset_context()
         self.addCleanup(reset_context)
 
-    """Test abort_requests handling."""
+    """Test grammar queue abort handling."""
 
     def _make_mgr_with_queue(self):
         scheduler = _make_scheduler()
@@ -462,13 +486,11 @@ class TestAbortRequests(unittest.TestCase):
         req = _make_req(rid="req-123")
         future = MagicMock(spec=Future)
         req.grammar = future
-        mgr.grammar_queue.append(req)
+        mgr.grammar_queue.join([req])
 
-        abort_req = MagicMock()
-        abort_req.abort_all = False
-        abort_req.rid = "req-123"
+        abort_req = AbortReq(rid="req-123", abort_all=False)
 
-        mgr.abort_requests(abort_req)
+        mgr.grammar_queue.abort(abort_req)
         future.cancel.assert_called_once()
         req.set_finish_with_abort.assert_called_once()
 
@@ -476,13 +498,11 @@ class TestAbortRequests(unittest.TestCase):
         mgr = self._make_mgr_with_queue()
         req = _make_req(rid="req-999")
         req.grammar = MagicMock(spec=Future)
-        mgr.grammar_queue.append(req)
+        mgr.grammar_queue.join([req])
 
-        abort_req = MagicMock()
-        abort_req.abort_all = False
-        abort_req.rid = "req-123"
+        abort_req = AbortReq(rid="req-123", abort_all=False)
 
-        mgr.abort_requests(abort_req)
+        mgr.grammar_queue.abort(abort_req)
         req.set_finish_with_abort.assert_not_called()
 
     def test_abort_all(self):
@@ -491,37 +511,31 @@ class TestAbortRequests(unittest.TestCase):
         for i in range(3):
             req = _make_req(rid=f"req-{i}")
             req.grammar = MagicMock(spec=Future)
-            mgr.grammar_queue.append(req)
+            mgr.grammar_queue.join([req])
             reqs.append(req)
 
-        abort_req = MagicMock()
-        abort_req.abort_all = True
-        abort_req.rid = ""
+        abort_req = AbortReq(rid="", abort_all=True)
 
-        mgr.abort_requests(abort_req)
+        mgr.grammar_queue.abort(abort_req)
         for req in reqs:
             req.set_finish_with_abort.assert_called_once()
 
     def test_abort_empty_queue(self):
         """Aborting on an empty queue should not raise."""
         mgr = self._make_mgr_with_queue()
-        abort_req = MagicMock()
-        abort_req.abort_all = True
-        abort_req.rid = ""
-        mgr.abort_requests(abort_req)  # Should not raise
+        abort_req = AbortReq(rid="", abort_all=True)
+        mgr.grammar_queue.abort(abort_req)  # Should not raise
 
     def test_abort_prefix_match(self):
         """rid.startswith means prefix matching, not exact matching."""
         mgr = self._make_mgr_with_queue()
         req = _make_req(rid="req-123-suffix")
         req.grammar = MagicMock(spec=Future)
-        mgr.grammar_queue.append(req)
+        mgr.grammar_queue.join([req])
 
-        abort_req = MagicMock()
-        abort_req.abort_all = False
-        abort_req.rid = "req-123"
+        abort_req = AbortReq(rid="req-123", abort_all=False)
 
-        mgr.abort_requests(abort_req)
+        mgr.grammar_queue.abort(abort_req)
         req.set_finish_with_abort.assert_called_once()
 
 
@@ -555,7 +569,7 @@ class TestGetReadyGrammarRequests(unittest.TestCase):
         req = _make_req(json_schema="schema")
         req.grammar = future
         req.grammar_key = ("json", "schema")
-        mgr.grammar_queue.append(req)
+        mgr.grammar_queue.join([req])
 
         result = mgr.get_ready_grammar_requests()
         self.assertEqual(len(result), 1)
@@ -578,12 +592,15 @@ class TestGetReadyGrammarRequests(unittest.TestCase):
         req = _make_req(json_schema="bad")
         req.grammar = future
         req.grammar_key = ("json", "bad")
-        mgr.grammar_queue.append(req)
+        mgr.grammar_queue.join([req])
 
         result = mgr.get_ready_grammar_requests()
         self.assertEqual(len(result), 1)
         req.set_finish_with_abort.assert_called_once()
         self.assertIn("compile error", req.set_finish_with_abort.call_args[0][0])
+        mgr.grammar_backend.set_cache.assert_called_once_with(
+            ("json", "bad"), invalid_copy
+        )
 
     def test_aborted_req_removed_from_queue(self):
         mgr = self._make_mgr()
@@ -591,7 +608,7 @@ class TestGetReadyGrammarRequests(unittest.TestCase):
         req = _make_req(json_schema="schema")
         req.finished.return_value = True  # Already aborted
         req.grammar = None
-        mgr.grammar_queue.append(req)
+        mgr.grammar_queue.join([req])
 
         result = mgr.get_ready_grammar_requests()
         self.assertEqual(len(result), 1)
@@ -606,7 +623,7 @@ class TestGetReadyGrammarRequests(unittest.TestCase):
         req.grammar = future
         req.grammar_key = ("json", "slow")
         req.grammar_wait_ct = 0
-        mgr.grammar_queue.append(req)
+        mgr.grammar_queue.join([req])
 
         # First call: not ready, increments wait_ct to 1 (== max_poll)
         result = mgr.get_ready_grammar_requests()
@@ -614,11 +631,26 @@ class TestGetReadyGrammarRequests(unittest.TestCase):
         self.assertEqual(len(result), 1)
         req.set_finish_with_abort.assert_called_once()
         self.assertIn("timed out", req.set_finish_with_abort.call_args[0][0])
-        # Cache should store InvalidGrammarObject for timeout
-        mgr.grammar_backend.set_cache.assert_called_once()
-        cached_key, cached_val = mgr.grammar_backend.set_cache.call_args[0]
-        self.assertEqual(cached_key, ("json", "slow"))
-        self.assertIsInstance(cached_val, InvalidGrammarObject)
+
+    def test_timeout_does_not_poison_cache(self):
+        """A grammar that times out once must not abort later requests with the same schema."""
+        mgr = self._make_mgr()
+        mgr.SGLANG_GRAMMAR_MAX_POLL_ITERATIONS = 1
+        backend = BaseGrammarBackend()
+        # Compiles never finish, so every request for the key times out.
+        backend.executor = MagicMock()
+        backend.executor.submit.side_effect = lambda *args: Future()
+        mgr.grammar_backend = backend
+
+        req1 = _make_req(json_schema="slow", rid="r1")
+        self.assertTrue(mgr.process_req_with_grammar(req1))
+        mgr.get_ready_grammar_requests()
+        req1.set_finish_with_abort.assert_called_once()
+        self.assertIn("timed out", req1.set_finish_with_abort.call_args[0][0])
+
+        req2 = _make_req(json_schema="slow", rid="r2")
+        self.assertTrue(mgr.process_req_with_grammar(req2))
+        req2.set_finish_with_abort.assert_not_called()
 
     def test_pending_future_stays_in_queue(self):
         """Futures that aren't done stay in the queue."""
@@ -630,7 +662,7 @@ class TestGetReadyGrammarRequests(unittest.TestCase):
         req.grammar = future
         req.grammar_key = ("json", "pending")
         req.grammar_wait_ct = 0
-        mgr.grammar_queue.append(req)
+        mgr.grammar_queue.join([req])
 
         result = mgr.get_ready_grammar_requests()
         self.assertEqual(len(result), 0)
@@ -657,13 +689,13 @@ class TestGetReadyGrammarRequests(unittest.TestCase):
         pending_req.grammar_key = ("json", "pending")
         pending_req.grammar_wait_ct = 0
 
-        mgr.grammar_queue = [ready_req, pending_req]
+        mgr.grammar_queue.join([ready_req, pending_req])
 
         result = mgr.get_ready_grammar_requests()
         self.assertEqual(len(result), 1)
         self.assertIs(result[0], ready_req)
         self.assertEqual(len(mgr.grammar_queue), 1)
-        self.assertIs(mgr.grammar_queue[0], pending_req)
+        self.assertIs(list(mgr.grammar_queue)[0], pending_req)
 
     def test_empty_queue(self):
         """get_ready_grammar_requests on empty queue should return empty list."""
@@ -682,7 +714,7 @@ class TestGetReadyGrammarRequests(unittest.TestCase):
         req.grammar = future
         req.grammar_key = ("json", "slow")
         req.grammar_wait_ct = 2  # Already waited 2 iterations
-        mgr.grammar_queue.append(req)
+        mgr.grammar_queue.join([req])
 
         # wait_ct increments to 3 (== max), should timeout
         result = mgr.get_ready_grammar_requests()
@@ -702,7 +734,7 @@ class TestGetReadyGrammarRequests(unittest.TestCase):
         req = _make_req(json_schema="schema", custom_params={"thinking_budget": 4})
         req.grammar = future
         req.grammar_key = ("json", "schema")
-        mgr.grammar_queue.append(req)
+        mgr.grammar_queue.join([req])
 
         result = mgr.get_ready_grammar_requests()
 
@@ -734,7 +766,7 @@ class TestGetReadyGrammarRequests(unittest.TestCase):
         req1.grammar_key = ("json", "s1")
         req1.grammar_wait_ct = 0
 
-        mgr.grammar_queue = [req0, req1]
+        mgr.grammar_queue.join([req0, req1])
         mgr.SGLANG_GRAMMAR_MAX_POLL_ITERATIONS = 100
 
         # Simulate all_gather: rank 0 has {0} ready, rank 1 has {0,1} ready
@@ -750,7 +782,7 @@ class TestGetReadyGrammarRequests(unittest.TestCase):
         self.assertIs(result[0], req0)
         # req1 stays in queue
         self.assertEqual(len(mgr.grammar_queue), 1)
-        self.assertIs(mgr.grammar_queue[0], req1)
+        self.assertIs(list(mgr.grammar_queue)[0], req1)
 
     @patch("sglang.srt.constrained.grammar_manager.torch.distributed.all_gather_object")
     def test_multi_rank_sync_unions_failed(self, mock_all_gather):
@@ -765,7 +797,7 @@ class TestGetReadyGrammarRequests(unittest.TestCase):
         req.grammar_key = ("json", "slow")
         req.grammar_wait_ct = 0
 
-        mgr.grammar_queue = [req]
+        mgr.grammar_queue.join([req])
 
         # Simulate: rank 0 has no ready and idx 0 failed, rank 1 has no ready/failed
         def fake_all_gather(output_list, _obj, group=None):  # noqa: ARG001
@@ -1019,7 +1051,7 @@ class TestStrictReasoningPaths(unittest.TestCase):
         req.require_reasoning = True
         req.grammar = future
         req.grammar_key = ("json", '{"type": "object"}')
-        mgr.grammar_queue.append(req)
+        mgr.grammar_queue.join([req])
 
         mgr.SGLANG_GRAMMAR_POLL_INTERVAL = 0.001
         result = mgr.get_ready_grammar_requests()

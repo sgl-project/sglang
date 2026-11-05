@@ -7,8 +7,8 @@ import torch.fx as fx
 
 from sglang.srt.compilation.compilation_config import CompilationConfig
 from sglang.srt.compilation.compilation_counter import compilation_counter
-from sglang.srt.compilation.cuda_piecewise_backend import (
-    CUDAPiecewiseBackend,
+from sglang.srt.compilation.cuda_piecewise_backend import CUDAPiecewiseBackend
+from sglang.srt.model_executor.runner_backend_utils.weak_ref_tensor import (
     weak_ref_tensors,
 )
 
