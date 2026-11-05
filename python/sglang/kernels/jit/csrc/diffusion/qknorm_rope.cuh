@@ -68,13 +68,19 @@ constexpr uint32_t kThreadsPerBlock = 256;
 constexpr uint32_t kWarpsPerBlock = kThreadsPerBlock / device::kWarpThreads;
 
 template <uint32_t kLaneCount>
-constexpr uint32_t active_mask() {
+constexpr device::warp::mask_t active_mask() {
   static_assert(kLaneCount <= device::kWarpThreads, "active_mask lane count must not exceed warp size");
+#ifdef USE_ROCM
+  constexpr uint64_t kLogicalMask =
+      kLaneCount == device::kWarpThreads ? 0xffffffffULL : (1ULL << kLaneCount) - 1ULL;
+  return kLogicalMask | (kLogicalMask << device::kWarpThreads);
+#else
   if constexpr (kLaneCount == device::kWarpThreads) {
     return 0xffffffffu;
   } else {
     return (1u << kLaneCount) - 1u;
   }
+#endif
 }
 
 template <typename CacheDType>
@@ -227,7 +233,7 @@ __global__ void fused_qknorm_rope_warp(const QKNormRopeParamsT<kPackKV, kOutOfPl
   constexpr uint32_t kVecSize = kElemsPerThread / 2;
   constexpr uint32_t kRotaryLanes = kRopeDim / kElemsPerThread;
   constexpr uint32_t kHalfRotaryLanes = kRotaryLanes / 2;
-  constexpr uint32_t kActiveMask = active_mask<kRotaryLanes>();
+  constexpr auto kActiveMask = active_mask<kRotaryLanes>();
   constexpr int64_t kCacheRotaryDim = kCacheHasFullWidth ? 2 * kRopeDim : kRopeDim;
   constexpr int64_t kCosSinStrideBytes = kCacheRotaryDim * sizeof(CacheDType);
 
@@ -346,7 +352,7 @@ __global__ void fused_qknorm_rope_warp(const QKNormRopeParamsT<kPackKV, kOutOfPl
           for (uint32_t j = 0; j < kVecSize; ++j) {
             auto partner_vec = output_vec[j];
             auto partner_bits = reinterpret_cast<const uint32_t&>(partner_vec);
-            partner_bits = __shfl_sync(kActiveMask, partner_bits, partner_lane);
+            partner_bits = __shfl_sync(kActiveMask, partner_bits, partner_lane, device::kWarpThreads);
             reinterpret_cast<uint32_t&>(partner_vec) = partner_bits;
             auto& values = unpack(output_vec[j]);
             const auto& partner_values = unpack(partner_vec);
@@ -425,7 +431,7 @@ __global__ void fused_qknorm_rope_warp(const QKNormRopeParamsT<kPackKV, kOutOfPl
 
 #pragma unroll
         for (uint32_t i = 0; i < kElemsPerThread; ++i) {
-          float swapped = __shfl_sync(kActiveMask, elems[i], partner_lane);
+          float swapped = __shfl_sync(kActiveMask, elems[i], partner_lane, device::kWarpThreads);
           if (lane_id < kHalfRotaryLanes) {
             swapped = -swapped;
           }
