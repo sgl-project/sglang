@@ -77,15 +77,24 @@ class InterleaveCPBCGInput(PrefillCPBCGInput):
     def allows_replay(self, batch_size, num_tokens, prefix_lens, contains_mm_inputs):
         return batch_size > 0 and not contains_mm_inputs and prefix_lens is not None
 
+    # GLM-5.3 Flash (KDA hybrid) and the dense-DSA GLM MoE family
+    # (GLM-5.2 / GLM-5.3 and their fine-tunes) share the interleave BCG path.
+    _SUPPORTED_ARCHITECTURES = (
+        "Glm5NextForConditionalGeneration",
+        "GlmMoeDsaForCausalLM",
+    )
+
     @staticmethod
     def supports(server_args):
         cfg = resolving_view(server_args)
+        architectures = model_config_of(server_args).hf_config.architectures
         return (
             cfg.dp_size == 1
-            and cfg.ep_size == 1
             and resolved_view(server_args).attn_cp_size > 1
-            and "Glm5NextForConditionalGeneration"
-            in model_config_of(server_args).hf_config.architectures
+            and any(
+                arch in architectures
+                for arch in InterleaveCPBCGInput._SUPPORTED_ARCHITECTURES
+            )
         )
 
     def _max_local_tokens(self, extend_seq_lens):
