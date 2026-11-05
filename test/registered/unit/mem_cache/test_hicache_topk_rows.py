@@ -42,6 +42,24 @@ class TestHiCacheTopkRows(CustomTestCase):
     def tearDown(self):
         self.capturer.destroy()
 
+    def test_no_rows_on_a_rank_without_the_host_cache(self):
+        # Only the output rank keeps the capturer's host cache.
+        capturer = BaseTopkCapturer(
+            num_tokens=64,
+            max_batch_size=8,
+            num_layers=2,
+            topk_size=3,
+            device="cuda",
+            name="routed_experts",
+            allocate_caches=False,
+        )
+        with mock.patch(
+            "sglang.srt.mem_cache.hicache_topk_rows.get_global_experts_capturer",
+            return_value=capturer,
+        ):
+            self.assertIsNone(HostTopkRows.create(host_pool=HOST_POOL, device="cuda"))
+        capturer.destroy()
+
     def _copy(self, device_slots, host_slots=HOST_SLOTS):
         return self.rows.copy_indices(
             device_indices=torch.tensor(device_slots, device="cuda"),

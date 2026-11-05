@@ -63,7 +63,9 @@ class HostTopkRows:
     @staticmethod
     def create(host_pool: Any, device: str) -> Optional["HostTopkRows"]:
         capturer = get_global_experts_capturer()
-        if capturer is None:
+        # Only the output rank keeps the capturer's host cache (and returns
+        # routed experts), so the other ranks have no rows to carry.
+        if capturer is None or not capturer.has_host_cache:
             return None
         # Host slot ids span the logical size (DCP and page-interleaved pools
         # give each physical row several logical slots).

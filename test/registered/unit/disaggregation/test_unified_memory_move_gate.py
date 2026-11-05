@@ -20,10 +20,12 @@ import torch
 
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.utils import disagg_transfers_in_flight
+from sglang.srt.managers.scheduler_components.request_list import ListKind
 from sglang.srt.mem_cache.kv.alloc.band import Band
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import FakeReq, decode_queue
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import (
     UnifiedGeometry,
@@ -36,7 +38,7 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 class _FakeTransferQueue:
     def __init__(self):
-        self.queue: List[object] = []
+        self.queue = decode_queue(ListKind.PD_RECEIVING)
 
 
 class _FakePreallocQueue:
@@ -87,8 +89,8 @@ class TestDecodeMoveGate(CustomTestCase):
         self.assertTrue(busy())
 
         # Handing the batch to the transfer queue transfers responsibility.
-        scheduler.disagg_decode_transfer_queue.queue.append(
-            SimpleNamespace(host_staged=False)
+        scheduler.disagg_decode_transfer_queue.queue.join(
+            [SimpleNamespace(req=FakeReq(), host_staged=False)]
         )
         scheduler.disagg_decode_prealloc_queue.note_destinations_queued(1)
         self.assertTrue(busy(), "transfer queue still holds it")
@@ -316,8 +318,8 @@ class TestUnifiedAllocatorsPublishTheTransferContract(CustomTestCase):
                 scheduler.disagg_decode_transfer_queue = _FakeTransferQueue()
                 scheduler.disagg_decode_prealloc_queue = _FakePreallocQueue()
                 check_pins(False)
-                scheduler.disagg_decode_transfer_queue.queue.append(
-                    SimpleNamespace(host_staged=False)
+                scheduler.disagg_decode_transfer_queue.queue.join(
+                    [SimpleNamespace(req=FakeReq(), host_staged=False)]
                 )
                 check_pins(True)
                 scheduler.disagg_decode_transfer_queue.queue.clear()

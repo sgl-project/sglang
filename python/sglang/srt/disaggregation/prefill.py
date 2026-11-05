@@ -73,9 +73,9 @@ from sglang.srt.layers.cp.utils import get_cp_sharded_padded_cache_transfer_indi
 from sglang.srt.managers.req_types import FINISH_ABORT, FINISH_LENGTH
 from sglang.srt.managers.schedule_batch import NextBatchPlan, Req, ScheduleBatch
 from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
     ListKind,
-    RequestList,
-    _RequestList,
+    ReqList,
     move,
 )
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
@@ -113,6 +113,9 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
 
 logger = logging.getLogger(__name__)
+
+# The default window of a window payload: the scheduler's sliding window.
+_SCHEDULER_WINDOW = object()
 
 # TP=1 yield between polls of a pending result. An initial heuristic rather
 # than a tuned value: long enough that the bootstrap, transfer and cache
@@ -208,7 +211,7 @@ class PrefillBootstrapQueue:
         self.pp_size = parallel.pp_size
         self.gpu_id = gpu_id
         self.bootstrap_port = bootstrap_port
-        self.queue = _RequestList(ListKind.PD_BOOTSTRAP, abort=self._abort)
+        self.queue = IndexedReqList(ListKind.PD_BOOTSTRAP, abort=self._abort)
         self.scheduler = scheduler
         self.scheduler_stage_metrics = scheduler_stage_metrics
         # Each rank owns a subset of logical KV pages, so capacity widens by N.
@@ -480,10 +483,8 @@ class PrefillBootstrapQueue:
         for req in self.queue:
             if recv_req.matches(req.rid):
                 logger.debug(f"Abort bootstrap queue request. {req.rid=}")
-                self.scheduler.release_aborted_request(req)
-
-                if hasattr(req.disagg_kv_sender, "abort"):
-                    req.disagg_kv_sender.abort()
+                # Only marks the abort; the exit that releases the request detaches it.
+                req.disagg_kv_sender.abort()
                 if get_parallel().pp_size > 1:
                     prepare_abort(req, "Aborted by AbortReq.")
 
@@ -600,10 +601,14 @@ class SchedulerDisaggregationPrefillMixin:
         prefetch = getattr(kv_mgr, "_prefetch_staging_reqs", None)
         if prefetch is None:
             return
+        lazy = envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
         for req in batch.reqs:
             room = getattr(req, "bootstrap_room", None)
             if room is not None and room in kv_mgr.transfer_infos:
-                prefetch(room)
+                if lazy and req.extend_end is not None:
+                    prefetch(room, upto_tokens=req.extend_end)
+                else:
+                    prefetch(room)
 
     def checkpoint_disagg_prefill(self: Scheduler, req: Req) -> None:
         cache = self.tree_cache
@@ -614,14 +619,21 @@ class SchedulerDisaggregationPrefillMixin:
 
         checkpoint_kv_cache(req, cache)
 
-    def release_aborted_prefill_waiting_req(self: Scheduler, req: Req) -> None:
+    def release_prefill_sender(
+        self: Scheduler, req: Req, *, abort_sender: bool
+    ) -> None:
+        """Release a retiring request's KV send: its pending chunk entry and
+        metadata buffer. ``abort_sender`` stops a live sender; a failed one
+        already concluded through ``failure_exception``."""
         self.clear_pending_chunk_send(req)
-        sender = getattr(req, "disagg_kv_sender", None)
-        if sender is not None and hasattr(sender, "abort"):
-            sender.abort()
+        if abort_sender and req.disagg_kv_sender is not None:
+            try:
+                req.disagg_kv_sender.abort()
+            except Exception:
+                # Transport notification is best effort; local ownership must
+                # still be released or the next idle invariant check will fail.
+                logger.exception("Failed to notify KV sender of abort for %s", req.rid)
         maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
-        if req.kv.holds_kv or req.kv.holds_mamba:
-            release_kv_cache(req, self.tree_cache, checkpoint=False)
         req.pending_bootstrap = False
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
@@ -655,10 +667,7 @@ class SchedulerDisaggregationPrefillMixin:
                 # finalize cannot fail here; if it ever does, the request stays
                 # pending and the post-forward check resolves it.
                 self.disagg_prefill_bootstrap_queue.finalize_bootstrap(req)
-        if failed:
-            self.waiting_queue = [
-                req for req in self.waiting_queue if req not in failed
-            ]
+        self.waiting_queue.leave(failed)
 
     def has_bootstrapped_waiting_req(self: Scheduler) -> bool:
         return any(
@@ -715,7 +724,7 @@ class SchedulerDisaggregationPrefillMixin:
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
-            self.waiting_queue.extend(
+            self.waiting_queue.join(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
 
@@ -844,7 +853,7 @@ class SchedulerDisaggregationPrefillMixin:
                 if should_ingest_requests
                 else []
             )
-            self.waiting_queue.extend(bootstrapped_reqs)
+            self.waiting_queue.join(bootstrapped_reqs)
             # Resume batch creation on completion, new/ready requests, or an idle step.
             if not waiting_for_batch_result or received_inputs or bootstrapped_reqs:
                 skip_batch_creation = False
@@ -1311,11 +1320,7 @@ class SchedulerDisaggregationPrefillMixin:
                     self.batch_result_processor._maybe_collect_routed_experts(req)
                 if not isinstance(req.finished_reason, FINISH_ABORT):
                     req.finish_outside_step(FINISH_LENGTH(length=0))
-                # unlock the tree
-                release_kv_cache(req, self.tree_cache, checkpoint=True)
-                self.tree_cache.finish(
-                    req.cache_request_handle, CacheRequestOutcome.SUCCESS
-                )
+                self.request_retirer.release(req, checkpoint=True)
                 # FIXME: clean up req's data in transfer engine
                 req.disagg_kv_sender.clear()
                 done_reqs.append(req)
@@ -1386,15 +1391,11 @@ class SchedulerDisaggregationPrefillMixin:
         else:
             logger.warning(error_message)
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
-        if req.finished_reason is None:
-            req.finish_outside_step(FINISH_LENGTH(length=0))
-        # unlock the tree
-        release_kv_cache(req, self.tree_cache, checkpoint=True)
-        self.release_aborted_request(req)
         if not isinstance(req.finished_reason, FINISH_ABORT):
             prepare_abort(
                 req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
             )
+        self.request_retirer.release(req, checkpoint=False)
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_transfer_failed_reqs()
         return exc
@@ -1411,34 +1412,21 @@ class SchedulerDisaggregationPrefillMixin:
     def _retire_aborted_prefill_result(self: Scheduler, req: Req) -> bool:
         """Release an aborted request when its last prefill result is safe."""
         self.prefill_launched_reqs.leave([req])
-        self.clear_pending_chunk_send(req)
         owns_resources = (
             req.kv.holds_kv or req.kv.holds_mamba or req.metadata_buffer_index >= 0
         )
         if not owns_resources:
             # A bootstrap failure or earlier abort already retired it.
+            self.clear_pending_chunk_send(req)
             return False
-
-        sender = req.disagg_kv_sender
-        if sender is not None:
-            try:
-                sender.abort()
-            except Exception:
-                # Transport notification is best effort; local ownership must
-                # still be released or the next idle invariant check will fail.
-                logger.exception("Failed to notify KV sender of abort for %s", req.rid)
 
         if req.to_finish is not None and not req.finished():
             req.update_finish_state()
-        maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
-        req.pending_bootstrap = False
-        self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
-        if req.kv.holds_kv or req.kv.holds_mamba:
-            release_kv_cache(req, self.tree_cache, checkpoint=False)
+        self.release_prefill_sender(req, abort_sender=True)
+        self.request_retirer.release(req, checkpoint=False)
         return True
 
     def handle_bootstrap_failure(self: Scheduler, req: Req) -> None:
-        self.clear_pending_chunk_send(req)
         error_message = (
             f"Prefill bootstrap failed for request rank={get_parallel().tp_rank} "
             f"{req.rid=} {req.bootstrap_room=}"
@@ -1455,15 +1443,12 @@ class SchedulerDisaggregationPrefillMixin:
         else:
             logger.warning(error_message)
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
-        if req.kv.holds_kv or req.kv.holds_mamba:
-            release_kv_cache(req, self.tree_cache, checkpoint=False)
-        maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
-        req.pending_bootstrap = False
         prepare_abort(req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+        self.release_prefill_sender(req, abort_sender=False)
+        self.request_retirer.release(req, checkpoint=False)
         self.output_streamer.stream_output([req], req.return_logprob)
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_bootstrap_failed_reqs()
-        self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
 
     def handle_pending_bootstrap(self: Scheduler, req: Req, poll: KVPoll) -> bool:
         """Return True when bootstrap is finalized and KV transfer can proceed."""
@@ -1710,42 +1695,24 @@ class SchedulerDisaggregationPrefillMixin:
                     .numpy()
                 ]
 
-            def _swa_payload():
-                allocator = self.token_to_kv_pool_allocator
-                kvcache = allocator.get_kvcache()
-                # A unified pool (one with transfer storage) keeps its window
-                # in a sub-pool, never in per-request window rows.
-                request_window = (
-                    None if allocator.storage is not None else kvcache.request_window
+            def _swa_payload(sub_pool="swa", window=_SCHEDULER_WINDOW):
+                if window is _SCHEDULER_WINDOW:
+                    # Read only when a window entry is sent.
+                    window = self.sliding_window_size
+                storage = kv_storage_of(
+                    self.req_to_token_pool, self.token_to_kv_pool_allocator
                 )
-                # Under encoder replay the scheduler is not hybrid SWA and keeps no
-                # window size; the pool holds it.
-                window_size = (
-                    self.sliding_window_size
-                    if request_window is None
-                    else kvcache.sliding_window
+                resume = storage.resume_units(
+                    sub_pool,
+                    req,
+                    token_start=req.disagg_decode_prefix_len,
+                    token_boundary=seq_len,
+                    window=window,
                 )
-                window_start = max(req.disagg_decode_prefix_len, seq_len - window_size)
-                window_start = (window_start // page_size) * page_size
-                if request_window is not None:
-                    return request_window.page_indices(
-                        int(req.kv.req_pool_idx), window_start, seq_len
-                    )
-                window_kv_indices_full = self.req_to_token_pool.req_to_token[
-                    req.kv.req_pool_idx, window_start:seq_len
-                ]
-                if is_cp_sharded_padded():
-                    window_kv_indices_full = (
-                        get_cp_sharded_padded_cache_transfer_indices(
-                            window_kv_indices_full
-                        )
-                    )
-                window_kv_indices_swa = (
-                    self.token_to_kv_pool_allocator.translate_swa_indices_for_transfer(
-                        window_kv_indices_full
-                    )
-                )
-                return state_page_indices(window_kv_indices_swa)
+                # The window rides the last segment's send, whose indices_event
+                # is recorded behind this copy on the same stream.
+                units = resume.unit_ids
+                return async_d2h(units).numpy() if host_indices else units.cpu().numpy()
 
             def _full_kv_pages_payload():
                 kv_indices_full = self.req_to_token_pool.req_to_token[
@@ -1815,6 +1782,7 @@ class SchedulerDisaggregationPrefillMixin:
                 StateType.QSA_PENDING: _qsa_pending_payload,
                 StateType.QSA_COMPRESSED: _full_kv_pages_payload,
                 StateType.SWA: _swa_payload,
+                StateType.AUXILIARY_SWA: lambda: _swa_payload("draft_swa", None),
                 StateType.DSA: _dsa_pages_payload,
                 StateType.DSA_TAIL: _dsa_tail_payload,
                 StateType.MINIMAX_INDEX_K: _minimax_payload,
@@ -1911,9 +1879,7 @@ class SchedulerDisaggregationPrefillMixin:
         else:
             self.disagg_prefill_pending_chunk_rids.add(req.rid)
 
-    def optimistic_release_and_requeue(
-        self: Scheduler, req: Req, src: RequestList
-    ) -> None:
+    def optimistic_release_and_requeue(self: Scheduler, req: Req, src: ReqList) -> None:
         """Release KV cache and requeue an optimistic prefill request out of `src`."""
         max_attempts = get_disagg().optimistic_prefill_attempts
         uses_write_through_cache = _uses_write_through_cache(self.tree_cache)
@@ -1978,4 +1944,4 @@ class SchedulerDisaggregationPrefillMixin:
             req.time_stats.set_wait_queue_entry_time()
             req.arrival_processed_tokens = self.processed_tokens_counter
             src.leave([req])
-            self.waiting_queue.insert(0, req)
+            self.waiting_queue.prepend([req])
