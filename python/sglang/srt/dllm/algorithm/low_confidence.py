@@ -16,6 +16,25 @@ class LowConfidence(DllmAlgorithm):
         super().__init__(config)
         self.threshold = config.algorithm_config.get("threshold", 0.95)
 
+    def prefill_tokens(self, batch):
+        """Return input blocks only when a batch needs no denoising."""
+        if batch is None or not batch.reqs:
+            return None
+        blocks = []
+        for req in batch.reqs:
+            if (
+                not req.is_dllm_prefill()
+                or req.dllm_incomplete_ids
+                or req.dllm_algo_state is not None
+                or req.extend_end > len(req.origin_input_ids)
+            ):
+                return None
+            block = req.get_fill_ids()[req.prefix_len :]
+            if len(block) != self.block_size or self.mask_id in block:
+                return None
+            blocks.append(list(block))
+        return blocks
+
     def step(
         self,
         forward_batch: ForwardBatch,
