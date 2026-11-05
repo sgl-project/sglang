@@ -38,7 +38,10 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
     PoolTransferResult,
+    PrefetchTimingMixin,
     count_pool_hits,
+    log_hicache_prefetch_consume,
+    mark_prefetch_timing,
     merge_source_transfers,
 )
 from sglang.srt.mem_cache.l2_transfer import L2Transfer
@@ -197,7 +200,7 @@ class StorageOperation(BaseStorageOperation):
         self.pool_storage_result = PoolTransferResult.empty()
 
 
-class PrefetchOperation(StorageOperation):
+class PrefetchOperation(PrefetchTimingMixin, StorageOperation):
     def __init__(
         self,
         handle: CacheRequestHandle,
@@ -1308,6 +1311,7 @@ class HybridCacheController(BaseHiCacheController):
             pool_transfers=extra_pools,
             assume_stored=assume_stored,
         )
+        mark_prefetch_timing(operation, "enqueue_ts")
         self.prefetch_queue.put(operation)
         return operation
 
@@ -1378,6 +1382,7 @@ class HybridCacheController(BaseHiCacheController):
         # Every rank queries and allocates in ticket order on the worker.
         # Admission waits for the normal completion ACK, including misses.
         operation.is_pp_broadcast = True
+        mark_prefetch_timing(operation, "enqueue_ts")
         state = PPPrefetchState(ticket=ticket, operation=operation)
         with self.pp_prefetch_state_lock:
             if rid in self.pp_prefetch_states:
@@ -1489,6 +1494,11 @@ class HybridCacheController(BaseHiCacheController):
                 return None
             # Keep the ticket for deduplication until the request finishes.
             state.consumed = True
+            log_hicache_prefetch_consume(
+                state.operation,
+                path="pp_handoff",
+                completed_tokens=state.operation.completed_tokens,
+            )
             self.pp_prefetch_decisions.pop(rid, None)
             if (
                 state.operation.host_indices is None
@@ -1512,6 +1522,9 @@ class HybridCacheController(BaseHiCacheController):
                 self.pp_prefetch_states.pop(rid)
                 return False  # Buffer mode owns any remaining staging buffers.
             state.release_requested = True
+            log_hicache_prefetch_consume(
+                state.operation, path="pp_release", loaded_tokens=0
+            )
             if state.ready_event.is_set():
                 self._free_pp_prefetch_state(state)
                 self.pp_prefetch_states.pop(rid, None)
@@ -1561,6 +1574,7 @@ class HybridCacheController(BaseHiCacheController):
                             or None,
                         )
                         operation.is_pp_broadcast = True
+                        mark_prefetch_timing(operation, "enqueue_ts")
                         state = PPPrefetchState(ticket=ticket, operation=operation)
                         self.pp_prefetch_states[rid] = state
                     decision = self.pp_prefetch_decisions.get(rid)
@@ -1569,6 +1583,7 @@ class HybridCacheController(BaseHiCacheController):
                         self.pp_prefetch_decisions.pop(rid)
                     operation = state.operation
 
+                mark_prefetch_timing(operation, "lookup_start_ts")
                 try:
                     if self.storage_stop_event.is_set():
                         # Stopping: a miss without a backend query or a host
@@ -1599,9 +1614,11 @@ class HybridCacheController(BaseHiCacheController):
                     hash_value, storage_hit_count = [], 0
 
                 # A failed query/allocation votes zero in the same MIN as hits.
+                mark_prefetch_timing(operation, "lookup_io_end_ts")
                 storage_hit_count = self._sync_prefetch_hit_query(
                     operation, storage_hit_count
                 )
+                mark_prefetch_timing(operation, "lookup_end_ts")
                 if operation.host_indices is not None:
                     tail = operation.host_indices[storage_hit_count:]
                     if tail.numel():
@@ -2294,6 +2311,8 @@ class HybridCacheController(BaseHiCacheController):
                 if ack is None:
                     continue
                 self._reduce_prefetch_ack(ack)
+                if ack.completed_req:
+                    mark_prefetch_timing(ack.operation, "ack_ready_ts")
                 if not getattr(ack.operation, "is_pp_broadcast", False):
                     self.ack_prefetch_queue.put(ack)
                     continue

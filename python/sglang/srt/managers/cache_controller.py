@@ -29,7 +29,9 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageExtraInfo,
     PoolName,
     PoolTransfer,
+    PrefetchTimingMixin,
     count_pool_hits,
+    mark_prefetch_timing,
 )
 
 if TYPE_CHECKING:
@@ -289,7 +291,7 @@ HICACHE_WRITE_STAGING_POOL_FRACTION = 0.2
 STORAGE_STOP_JOIN_S = 60.0
 
 
-class PrefetchOperation(StorageOperation):
+class PrefetchOperation(PrefetchTimingMixin, StorageOperation):
     def __init__(
         self,
         request_id: str,
@@ -1306,6 +1308,7 @@ class HiCacheController:
         operation = PrefetchOperation(
             request_id, new_input_tokens, last_hash, prefix_keys
         )
+        mark_prefetch_timing(operation, "enqueue_ts")
         self.prefetch_queue.put(operation)
         return operation
 
@@ -1494,6 +1497,7 @@ class HiCacheController:
                 continue
             if operation is None:
                 continue
+            mark_prefetch_timing(operation, "read_start_ts")
             try:
                 self._page_transfer(operation)
             except Exception:
@@ -1506,6 +1510,7 @@ class HiCacheController:
                 )
                 raise
             finally:
+                mark_prefetch_timing(operation, "read_end_ts")
                 self.prefetch_sync_queue.put(
                     PrefetchAck(
                         rid=operation.request_id,
@@ -1604,6 +1609,7 @@ class HiCacheController:
             if operation is None:
                 continue
             self._on_prefetch_dequeue(operation)
+            mark_prefetch_timing(operation, "lookup_start_ts")
             # Everything before the reduce is guarded: the peers are inside
             # that collective, so a failure here answers with 0 hits and still
             # joins it. After the stop event every queued query is answered
@@ -1621,9 +1627,11 @@ class HiCacheController:
                 )
                 hash_value, storage_hit_count = [], 0
 
+            mark_prefetch_timing(operation, "lookup_io_end_ts")
             storage_hit_count = self._sync_prefetch_hit_query(
                 operation, storage_hit_count
             )
+            mark_prefetch_timing(operation, "lookup_end_ts")
 
             # Record the TP-synced hit count; the scheduler thread decides
             # at drain time whether to revoke (below threshold) or allocate.
@@ -1745,6 +1753,8 @@ class HiCacheController:
                 if ack is None:
                     continue
                 self._reduce_prefetch_ack(ack)
+                if ack.completed_req:
+                    mark_prefetch_timing(ack.operation, "ack_ready_ts")
                 self.ack_prefetch_queue.put(ack)
             except Empty:
                 continue
