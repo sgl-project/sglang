@@ -25,7 +25,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     CudaGraphConfig,
     PhaseConfig,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.models.deepseek_v4 import MQALayer, _fp8_wo_a_einsum
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -399,16 +399,32 @@ class TestMegaPackedQueryBuffer(CustomTestCase):
                 self.assertTrue(torch.equal(out, pack_query_reference(q, 64)))
         self.assertEqual(padding_nonzero(backend, 16, 64), 0)
 
-    def test_forward_beyond_the_buffer_fails_without_reallocating(self):
-        # Captured graphs keep the buffer's address, so it is never replaced.
+    def test_forward_beyond_the_buffer_packs_into_fresh_zeros(self):
+        # Captured graphs keep the buffer's address,
+        # so a forward with more rows must pack elsewhere and leave the buffer as it is.
+        torch.manual_seed(3)
         layer = _MegaQueryLayer()
         backend = mega_backend(48)
-        q = torch.randn(49, 16, 512, device="cuda", dtype=torch.bfloat16)
-        forward(layer, backend, q[:48], 64)
+        poison_allocator(48, 64)
+        q = torch.randn(48, 16, 512, device="cuda", dtype=torch.bfloat16)
+        forward(layer, backend, q, 64)
         ptr = backend._packed_query.data_ptr()
-        with self.assertRaisesRegex(RuntimeError, "49 rows exceeds"):
-            forward(layer, backend, q, 64)
+        before = backend._packed_query.clone()
+        q = torch.randn(49, 16, 512, device="cuda", dtype=torch.bfloat16)
+        poison_allocator(49, 64)
+        out = forward(layer, backend, q, 64)
+        self.assertTrue(torch.equal(out, pack_query_reference(q, 64)))
+        self.assertNotEqual(
+            out.untyped_storage().data_ptr(),
+            backend._packed_query.untyped_storage().data_ptr(),
+        )
         self.assertEqual(backend._packed_query.data_ptr(), ptr)
+        self.assertTrue(torch.equal(backend._packed_query, before))
+        self.assertEqual(padding_nonzero(backend, 16, 64), 0)
+        q = torch.randn(48, 16, 512, device="cuda", dtype=torch.bfloat16)
+        out = forward(layer, backend, q, 64)
+        self.assertTrue(torch.equal(out, pack_query_reference(q, 64)))
+        self.assertEqual(out.data_ptr(), ptr)
 
     def test_backends_keep_separate_buffers(self):
         """Backends that run at once on different streams must not share a buffer;
@@ -426,7 +442,7 @@ class TestMegaPackedQueryBuffer(CustomTestCase):
 
 
 class TestMaxPackedQueryRows(CustomTestCase):
-    """The buffer must hold every forward MegaAttention can see:
+    """The buffer must hold every forward bounded at startup:
     a decode or verify batch padded for MLP sync, a prefill chunk,
     and every prefill-graph and decoder-tail bucket, since capture runs each one."""
 
@@ -462,6 +478,9 @@ class TestMaxPackedQueryRows(CustomTestCase):
             (2048, "null", 1024, 512, 64, 48, 1),
             # An 8192-token prefill-graph bucket outgrows a 4096-token chunk.
             (8192, "null", 4096, 8192, 64, 48, 1),
+            # Chunked prefill disabled: no chunk term (longer forwards get fresh zeros),
+            # so the 2048-row decoder-tail bucket.
+            (2048, "null", -1, 512, 64, 48, 1),
             # A PD decode server: 1000 eager requests (over the 256 of the graphs) x 4.
             (4000, "decode", 16384, 2048, 256, 1000, 1),
             # 50 requests padded to 56 for MLP sync, x 4.

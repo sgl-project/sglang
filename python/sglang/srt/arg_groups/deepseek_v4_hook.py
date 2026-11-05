@@ -51,13 +51,6 @@ def _attention_is_tensor_parallel(cfg) -> bool:
     return attn_tp_size > 1
 
 
-def _prefill_is_bounded(cfg) -> bool:
-    # A PD decode server runs no prefill; elsewhere chunked prefill bounds one forward.
-    return cfg.disaggregation_mode == "decode" or (
-        cfg.chunked_prefill_size is not None and cfg.chunked_prefill_size > 0
-    )
-
-
 def _default_dsv4_attention_backend(server_args: ServerArgs) -> str:
     from sglang.srt.utils.common import is_sm100_supported
 
@@ -70,8 +63,6 @@ def _default_dsv4_attention_backend(server_args: ServerArgs) -> str:
         or cfg.kv_cache_dtype != "fp8_e4m3"
         # MegaAttention pads each rank to a 64-head tile under attention TP.
         or (cfg.disaggregation_mode == "null" and _attention_is_tensor_parallel(cfg))
-        # MegaAttention sizes its packed query buffer from the largest forward.
-        or (cfg.disaggregation_mode == "null" and not _prefill_is_bounded(cfg))
         or (layout.is_set() and layout.get().lower() not in ("auto", "v41", "v41_new"))
     ):
         return "flashmla"
@@ -189,12 +180,6 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
             and cfg.device == "cuda"
             and is_sm100_supported()
         ), "--dsv4-attn-backend flashmla_mega requires DeepSeek-V4.1 on SM100/SM103."
-        # The packed query buffer is sized from the prefill chunk bound;
-        # with chunking disabled a single long request has no bound.
-        assert _prefill_is_bounded(cfg), (
-            "--dsv4-attn-backend flashmla_mega requires chunked prefill "
-            "(--chunked-prefill-size > 0); otherwise use --dsv4-attn-backend flashmla."
-        )
 
     if cfg.dsv4_attn_backend == "trtllm":
         from sglang.srt.utils.common import is_sm100_supported

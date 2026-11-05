@@ -82,9 +82,9 @@ class DeepseekV4MegaAttnBackend(DeepseekV4AttnBackend):
 
     def packed_query_buffer(
         self, rows: int, padded_heads: int, dtype: torch.dtype
-    ) -> torch.Tensor:
+    ) -> Optional[torch.Tensor]:
         # Zeroed once and never reallocated, so captured graphs keep its address;
-        # packs write only the real heads' slots.
+        # a forward with more rows gets None and packs into fresh zeros.
         if self._packed_query is None:
             assert not torch.cuda.is_current_stream_capturing()
             self._packed_query = torch.zeros(
@@ -95,13 +95,9 @@ class DeepseekV4MegaAttnBackend(DeepseekV4AttnBackend):
                 device=self.device,
             )
         buf = self._packed_query
-        if rows > buf.shape[0]:
-            raise RuntimeError(
-                f"a MegaAttention forward of {rows} rows exceeds the packed query "
-                f"buffer's {buf.shape[0]}, sized from --chunked-prefill-size, "
-                "--max-running-requests and the CUDA graph sizes"
-            )
         assert buf.shape[1] == padded_heads and buf.dtype == dtype
+        if rows > buf.shape[0]:
+            return None
         return buf[:rows]
 
     def _mega_paged_prefill(

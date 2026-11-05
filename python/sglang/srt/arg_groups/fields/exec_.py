@@ -390,14 +390,12 @@ class ExecKernel(msgspec.Struct):
             help="DeepSeek V4 attention backend. 'auto' (default) resolves to "
             "'flashmla' where 'flashmla_mega' is unsupported or, outside PD "
             "disaggregation, where attention is tensor-parallel across ranks "
-            "(attention TP > 1) or chunked prefill is disabled, and to "
-            "'flashmla_mega' otherwise. "
+            "(attention TP > 1), and to 'flashmla_mega' otherwise. "
             "'trtllm' (opt-in, SM100/SM103 with FP8 KV cache) "
             "switches the SWA/compressed KV pools to a "
             "uniform 512-dim FP8 layout and runs decode and sparse prefill "
             "through the flashinfer trtllm-gen sparse MLA kernel. "
-            "'flashmla_mega' (DeepSeek-V4.1 on SM100/SM103, with chunked prefill "
-            "except on a PD decode server) runs the fused "
+            "'flashmla_mega' (DeepSeek-V4.1 on SM100/SM103) runs the fused "
             "Q-RoPE + sparse attention + inverse-RoPE + MXFP8 FlashMLA kernel. "
             "The backend choice is shared by prefill and decode.",
             choices=["auto", "flashmla", "flashmla_mega", "trtllm"],
