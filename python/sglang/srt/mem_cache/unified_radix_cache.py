@@ -3175,7 +3175,7 @@ class UnifiedRadixCache(BasePrefixCache):
         )
 
     @rank_consensus(same_params=True)
-    def release_aborted_request(self, request: CacheRequestHandle) -> None:
+    def _abandon_attempt(self, request: CacheRequestHandle) -> None:
         rid = request.rid
         self._storage_prefetch_wait.pop(request, None)
         if self.linker is not None:
@@ -3413,7 +3413,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self.cache_controller._finish_op_trace(info.operation)
         # Every revoke path runs before the bounce alloc, so buffer mode
         # holds no occupancy here; post-alloc aborts go through
-        # release_aborted_request instead.
+        # _abandon_attempt instead.
         assert info.host_indices is None or self.host_memory_mode != "buffer_only"
         self._retire_ongoing_prefetch(
             request, None, [x for xfers in info.comp_xfers.values() for x in xfers]

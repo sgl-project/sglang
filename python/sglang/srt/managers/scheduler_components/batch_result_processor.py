@@ -164,7 +164,7 @@ class SchedulerBatchResultProcessor:
             req.update_finish_state()
             if req.finished():
                 req.time_stats.set_quick_finish_time()
-                self.request_retirer.release_finished(req, checkpoint=True)
+                self.request_retirer.release(req, checkpoint=True)
 
         # Note: Logprobs should be handled on the prefill engine.
         self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
@@ -446,7 +446,7 @@ class SchedulerBatchResultProcessor:
                             self._maybe_collect_indexer_topk(req)
                         if batch.decoding_reqs and req in batch.decoding_reqs:
                             self._prepare_kv_cache_release(req)
-                        self.request_retirer.release_finished(
+                        self.request_retirer.release(
                             req, checkpoint=discard_finish_reason is None
                         )
                         req.time_stats.set_completion_time()
@@ -533,7 +533,7 @@ class SchedulerBatchResultProcessor:
                 if req.discard_output_reason is not None and not is_middle_chunk:
                     req.request_finish(req.discard_output_reason)
                     req.update_finish_state(0)
-                    self.request_retirer.release_finished(req, checkpoint=False)
+                    self.request_retirer.release(req, checkpoint=False)
                     req.time_stats.set_completion_time()
                     continue
 
@@ -551,7 +551,7 @@ class SchedulerBatchResultProcessor:
                     req.update_finish_state()
 
                     if req.finished():
-                        self.request_retirer.release_finished(req, checkpoint=True)
+                        self.request_retirer.release(req, checkpoint=True)
                         req.time_stats.set_completion_time()
                     else:
                         checkpoint_kv_cache(req, self.tree_cache)
@@ -1452,7 +1452,7 @@ class SchedulerBatchResultProcessor:
             self.decode_offload_manager.finalize_release_on_finish(req)
         else:
             self._prepare_kv_cache_release(req)
-            self.request_retirer.release_finished(req, checkpoint=False)
+            self.request_retirer.release(req, checkpoint=False)
         req.time_stats.set_completion_time()
 
     def _handle_finish_state_updated_req(
@@ -1539,7 +1539,7 @@ class SchedulerBatchResultProcessor:
                     if get_exec().mamba.enable_mamba_extra_buffer_lazy
                     else True
                 )
-                self.request_retirer.release_finished(req, checkpoint=checkpoint)
+                self.request_retirer.release(req, checkpoint=checkpoint)
 
             req.time_stats.set_completion_time()
 
