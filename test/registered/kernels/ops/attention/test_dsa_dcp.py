@@ -94,6 +94,7 @@ class _IndexerStub:
     def __init__(self):
         gen = torch.Generator(device="cuda").manual_seed(1)
         self.block_size, self.scale_fmt = 128, "ue8m0"
+        self.skip_rope = False
         self.k_norm = SimpleNamespace(
             weight=torch.rand(INDEX_DIM, device="cuda", generator=gen) + 0.5,
             bias=torch.randn(INDEX_DIM, device="cuda", generator=gen) * 0.1,
@@ -819,6 +820,10 @@ def _attention(backend, pool, q, indices):
 class _BackendStub(SimpleNamespace):
     _dcp_flashmla_sched_meta = staticmethod(
         DeepseekSparseAttnBackend._dcp_flashmla_sched_meta
+    )
+    _call_get_mla_metadata = DeepseekSparseAttnBackend._call_get_mla_metadata
+    _call_flash_mla_with_kvcache = (
+        DeepseekSparseAttnBackend._call_flash_mla_with_kvcache
     )
 
 

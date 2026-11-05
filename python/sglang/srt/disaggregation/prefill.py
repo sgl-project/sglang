@@ -1664,10 +1664,9 @@ class SchedulerDisaggregationPrefillMixin:
         # host-tensor indices waits on their copy's event itself, so the scheduler
         # never blocks on these device reads.
         host_indices = (
-            # Only Mooncake's worker consumes the async host snapshots under
+            # Only Mooncake's sender consumes the async host snapshots under
             # indices_event. Other backends keep synchronous .cpu().numpy().
             getattr(sender, "supports_host_tensor_indices", False)
-            and get_disagg().disaggregation_transfer_backend == "mooncake"
             # KV-sharded sends filter host values before enqueueing them.
             and getattr(sender.kv_mgr, "kv_shard_size", 1) == 1
             and not (

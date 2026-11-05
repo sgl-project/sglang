@@ -55,7 +55,7 @@ def pipeline(selective):
     cache.sidecar_pool_specs = []
     cache.storage_existence_cache = StorageExistenceCache()
     cache.token_to_kv_pool_allocator.get_kvcache.return_value = SimpleNamespace(
-        size=128
+        size=128, layer_router=SimpleNamespace(sub_pool=lambda kind: None)
     )
     cache.tree_core.snapshot_buffer_backup.return_value = snapshot()
     cache.tree_core.buffer_backup_pool_keys.return_value = {
@@ -241,6 +241,8 @@ class TestMambaSelectiveBackup(unittest.TestCase):
                 cache.disable = False
                 cache.tree_core = SimpleNamespace(is_eagle=False, page_size=2)
                 cache._components_tuple = ()
+                cache.components = {}
+                cache.linker = None
                 cache.req_to_token_pool = SimpleNamespace(
                     req_to_token=torch.arange(4).reshape(1, 4)
                 )

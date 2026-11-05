@@ -1015,6 +1015,9 @@ class TestFusedDraftDecision(CustomTestCase):
         cfg.model_config = SimpleNamespace(
             hf_config=SimpleNamespace(architectures=["BailingMoeForCausalLMNextN"])
         )
+        cfg.mambaish_config = None
+        cfg.is_hybrid_swa = False
+        cfg.kv_cache_dtype = torch.bfloat16
         for width in (2, 4):
             with self.subTest(dcp=width), get_parallel().override(attn_dcp_size=width):
                 self.assertEqual(cfg.loc_space_scale, 1)

@@ -5,6 +5,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -20,7 +21,11 @@ def registry():
     saved = dict(cg._MODEL_TGV_M_RANGES)
     cg._MODEL_TGV_M_RANGES.clear()
     with (
-        patch.object(cg, "get_device_core_count", return_value=148),
+        patch.object(
+            cg,
+            "current_arch",
+            return_value=SimpleNamespace(num_sms=148, is_sm=lambda *_: False),
+        ),
         patch.object(cg.torch.cuda, "current_device", return_value=0),
     ):
         yield

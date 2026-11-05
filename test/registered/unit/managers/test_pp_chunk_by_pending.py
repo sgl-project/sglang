@@ -8,6 +8,10 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    ListKind,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -35,6 +39,7 @@ def _scheduler(
     scheduler._pp_held_chunk = 0
     scheduler._pp_dip_steps = 0
     scheduler.page_size = 64
+    scheduler.chunked_reqs = IndexedReqList(ListKind.CHUNKED)
     scheduler.chunked_req = chunked_req
     scheduler.waiting_queue = waiting
     scheduler.tree_cache = None
