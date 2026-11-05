@@ -14,6 +14,8 @@ from sglang.srt.mem_cache.device_pool_info import (
     DevicePoolInfo,
     IndexKeyBufferInfo,
     IndexKeyLayout,
+    MLABufferInfo,
+    MLASplitBuffers,
 )
 from sglang.srt.mem_cache.hicache_storage import PoolName, SidecarPoolSpec
 
@@ -42,6 +44,58 @@ class HostPoolGroupConfig(msgspec.Struct, frozen=True, kw_only=True):
     @property
     def pool_names(self) -> tuple[PoolName, ...]:
         return (PoolName.KV, *(config.pool_name for config in self.sidecars))
+
+
+def packed_mla_rows_match(target: Any, drafts: tuple[Any, ...]) -> bool:
+    """Compare physical MLA rows before choosing one shared host layout."""
+    from sglang.srt.mem_cache.kv.memory.views import MLAKVView
+
+    if not isinstance(target, MLAKVView):
+        return True
+
+    def signature(pool, *, is_draft=False):
+        if not isinstance(pool, MLAKVView):
+            return None
+        _, infos = _host_pool_infos(pool)
+        info = infos[PoolName.KV].buffer_info
+        if not isinstance(info, MLABufferInfo):
+            return None
+        split = None
+        if isinstance(info.buffers, MLASplitBuffers):
+            buffers = info.buffers
+            # The packed NPU host pool owns only the target indexer rows.
+            # A draft with its own indexer needs its own host group as well.
+            if is_draft and buffers.index_k is not None and buffers.index_k.numel():
+                return None
+            split = (
+                buffers.k_width,
+                buffers.v_width,
+                buffers.index_width,
+                tuple(
+                    tensor.dtype if tensor is not None else None
+                    for tensor in (
+                        buffers.k,
+                        buffers.v,
+                        buffers.index_k,
+                        buffers.index_scales,
+                    )
+                ),
+            )
+        return (
+            info.dtype,
+            info.kv_cache_dim,
+            info.kv_lora_rank,
+            info.qk_rope_head_dim,
+            info.page_size,
+            info.packed_fp8,
+            type(info.buffers),
+            split,
+        )
+
+    target_signature = signature(target)
+    return target_signature is not None and all(
+        signature(draft, is_draft=True) == target_signature for draft in drafts
+    )
 
 
 def with_packed_draft_layer_mapping(
