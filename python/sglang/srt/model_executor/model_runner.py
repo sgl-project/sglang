@@ -1909,10 +1909,19 @@ class ModelRunner:
             else contextlib.nullcontext()
         )
 
+        recorder = get_global_expert_distribution_recorder()
+        # Draft batches can also be TARGET_VERIFY. Enter the role-based guard
+        # before the recorder resets counters or appends a record.
+        record_ctx = (
+            recorder.disable_this_region()
+            if self.is_draft_worker
+            else contextlib.nullcontext()
+        )
         with (
             canary_ctx,
             step_span_ctx,
-            get_global_expert_distribution_recorder().with_forward_pass(
+            record_ctx,
+            recorder.with_forward_pass(
                 self.forward_pass_id,
                 forward_batch,
             ) as recorder_outputs,
