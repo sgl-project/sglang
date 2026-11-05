@@ -702,13 +702,6 @@ def _is_releasable_feature(feature) -> bool:
     )
 
 
-def _record_on_current_stream(feature) -> None:
-    tensors = feature if isinstance(feature, (list, tuple)) else [feature]
-    for tensor in tensors:
-        if tensor.is_cuda:
-            tensor.record_stream(torch.cuda.current_stream(tensor.device))
-
-
 def should_release_mm_features(server_args) -> bool:
     """Requires radix caching (retract re-prefill reads the retained prompt
     KV) and pp_size==1 (only the first PP stage releases)."""
@@ -719,25 +712,20 @@ def should_release_mm_features(server_args) -> bool:
     return not getattr(server_args, "disable_radix_cache", False)
 
 
-def release_consumed_mm_features(
-    mm_inputs_list: List[MultimodalInputs],
-    extend_prefix_lens: List[int],
-    extend_seq_lens: List[int],
+def release_inserted_mm_features(
+    mm_inputs: MultimodalInputs, inserted_len: int
 ) -> None:
-    """Release image features fully covered by this extend chunk."""
-    for mm_inputs, prefix_len, seq_len in zip(
-        mm_inputs_list, extend_prefix_lens, extend_seq_lens, strict=True
-    ):
-        chunk_end = prefix_len + seq_len
-        for item in mm_inputs.mm_items:
-            if (
-                item.is_image()
-                and _is_releasable_feature(item.feature)
-                and item.offsets
-                and all(end < chunk_end for _, end in item.offsets)
-            ):
-                _record_on_current_stream(item.feature)
-                item.release_feature(consumed=True)
+    """Release image features whose spans lie inside the request's inserted
+    prefix. A retracted request re-prefills only from what the tree holds,
+    which on hybrid models can stop short of the prefilled length."""
+    for item in mm_inputs.mm_items:
+        if (
+            item.is_image()
+            and _is_releasable_feature(item.feature)
+            and item.offsets
+            and all(end < inserted_len for _, end in item.offsets)
+        ):
+            item.release_feature(consumed=True)
 
 
 def prepare_mm_inputs(
@@ -830,10 +818,6 @@ def prepare_mm_inputs(
             # add for qwen3_vl deepstack
             if use_deepstack:
                 kwargs["input_deepstack_embeds"] = other_info["input_deepstack_embeds"]
-            if mm_inputs_list and should_release_mm_features(server_args):
-                release_consumed_mm_features(
-                    mm_inputs_list, extend_prefix_lens, extend_seq_lens
-                )
             # Offload GPU features to CPU instead of discarding them to balance memory
             # efficiency and data persistence.
             # In chunked-prefill, a request is processed across multiple batches, and

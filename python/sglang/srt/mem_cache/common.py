@@ -30,7 +30,7 @@ from sglang.srt.mem_cache.hicache_storage import PoolTransfer
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
-from sglang.srt.runtime_context import get_serving, get_spec
+from sglang.srt.runtime_context import get_server_args, get_serving, get_spec
 from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
@@ -238,6 +238,16 @@ def checkpoint_kv_cache(req: Req, tree_cache: BasePrefixCache) -> None:
     assert not req.finished(), f"checkpointing finished request {req.rid}"
     if not req.skip_radix_cache_insert:
         tree_cache.checkpoint(req, up_to=req.extend_end)
+        if req.multimodal_inputs is not None:
+            from sglang.srt.managers.mm_utils import (
+                release_inserted_mm_features,
+                should_release_mm_features,
+            )
+
+            if should_release_mm_features(get_server_args()):
+                release_inserted_mm_features(
+                    req.multimodal_inputs, req.kv.cache_inserted_len
+                )
     # The next extend resumes after this one, published or not.
     req.prefix_len = req.extend_end
 

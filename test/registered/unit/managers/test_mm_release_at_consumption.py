@@ -28,13 +28,13 @@ if TYPE_CHECKING:
 
 
 def _types():
-    from sglang.srt.managers.mm_utils import release_consumed_mm_features
+    from sglang.srt.managers.mm_utils import release_inserted_mm_features
     from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.multimodal.modality import Modality
 
     return (
-        release_consumed_mm_features,
+        release_inserted_mm_features,
         Modality,
         MultimodalDataItem,
         MultimodalInputs,
@@ -70,8 +70,8 @@ def test_release_and_reprefill_boundaries() -> None:
     ]
     mm_inputs = MultimodalInputs(mm_items=items)
 
-    # Chunk [0, 4): items ending inside are released, the straddler is kept.
-    release([mm_inputs], [0], [4])
+    # Inserted prefix [0, 4): items ending inside are released, the straddler is kept.
+    release(mm_inputs, 4)
     assert items[0].feature is None and items[0].feature_released
     assert items[1].feature is None and items[1].feature_released
     assert isinstance(items[2].feature, torch.Tensor)
@@ -159,7 +159,7 @@ def test_session_turn_with_evicted_released_history_aborts_503() -> None:
         scheduler, sent, retired, _ = _abort_scheduler()
 
         history = _image_item([(0, 9)], torch.zeros(4, 2))
-        release([MultimodalInputs(mm_items=[history])], [0], [10])
+        release(MultimodalInputs(mm_items=[history]), 10)
         assert history.feature_released
 
         req = _req("rid-session-turn", input_len=20)
