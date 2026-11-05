@@ -11,6 +11,8 @@ included; anything less and a token's routing would depend on the batch size.
 Run:  SGLANG_USE_AITER=1 pytest test/registered/kernels/ops/moe/test_moe_route_radix4.py -v
 """
 
+import sys
+
 import pytest
 import torch
 
@@ -356,6 +358,4 @@ def test_route_radix4_coverage():
 
 
 if __name__ == "__main__":
-    import sys
-
-    sys.exit(pytest.main([__file__]))
+    sys.exit(pytest.main([__file__, "-v"]))
