@@ -6,6 +6,7 @@ import torch
 
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.layers.cp.interleave import is_interleave_extend
+from sglang.srt.layers.cp.utils import cp_live_store_rows
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
@@ -145,7 +146,8 @@ def pcg_dsa_indexer_prefill_split(
     # Fused path stores K (no-Hadamard) and computes q_fp8 + head gate in the
     # fused kernels, sliced to the unpadded count. Single stream: the split op is
     # captured, so the dual-stream overlap is disabled.
-    if not cp and indexer.use_dsa_indexer_fusion:
+    in_cp = forward_batch.attn_cp_metadata is not None
+    if indexer.use_dsa_indexer_fusion and not in_cp:
         q_fp8, weights = indexer._fused_q_prepare_and_store(
             x,
             q_lora,
@@ -196,12 +198,19 @@ def pcg_dsa_indexer_prefill_split(
     # Store K cache + ragged top-k, sliced to the unpadded count and writing into
     # the static padded topk_result buffer (the graph contract). Mirrors the eager
     # path's store + _get_topk_ragged.
+    # Under CP the key comes back gathered in global order, so it is sliced
+    # like the non-CP path. BCG replay hands over the bucket-sized static
+    # out_cache_loc and a gathered key whose padding sits at the tail; only
+    # the live rows are stored.
+    n_store = extend_num_tokens
+    if in_cp:
+        n_store = cp_live_store_rows(forward_batch, key.shape[0], "indexer K")
     indexer._store_index_k_cache(
         forward_batch=forward_batch,
         layer_id=layer_id,
-        key=key[:extend_num_tokens],
+        key=key[:n_store],
         act_quant=act_quant,
-        out_cache_loc=forward_batch.out_cache_loc[:extend_num_tokens],
+        out_cache_loc=forward_batch.out_cache_loc[:n_store],
     )
     if not return_indices:
         return
@@ -209,7 +218,8 @@ def pcg_dsa_indexer_prefill_split(
         False,
         forward_batch,
         layer_id,
-        q_fp8[:query_tokens],
+        # CP: every row (interleave CP sliced them to the live local rows)
+        q_fp8 if in_cp else q_fp8[:query_tokens],
         weights,
         metadata,
         topk_result,

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import operator
+from functools import cache
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
@@ -12,7 +14,9 @@ from sglang.srt.constrained.base_grammar_backend import (
     GrammarMask,
     GrammarRow,
 )
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.environ import envs
+from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule, get_spec
 from sglang.srt.sampling.custom_logit_processor import (
     UOCR_PAGE_GUARD_PROCESSOR,
     CustomLogitProcessor,
@@ -687,7 +691,29 @@ class SamplingBatchInfo:
     def copy_for_forward(self):
         # Accumulate the penalty into a pre-allocated buffer to get rid of the dependency of `penalizer_orchestrator` later
         self.update_penalties()
+        if _fast_copy_enabled() and type(self) is SamplingBatchInfo:
+            new = object.__new__(SamplingBatchInfo)
+            new.__dict__.update(zip(_FIELD_NAMES, _FIELD_GETTER(self.__dict__)))
+            new.penalizer_orchestrator = None
+            return new
         return dataclasses.replace(self, penalizer_orchestrator=None)
+
+
+@cache
+def _fast_copy_enabled() -> bool:
+    # Preserve the original EAGLE runtime policy without the resource-pool dependency.
+    return (
+        current_platform.is_cuda()
+        and envs.SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH.get()
+        and (get_spec().speculative_algorithm or "").upper() == "EAGLE"
+        and (get_spec().speculative_eagle_topk or 1) == 1
+        and not get_schedule().disable_overlap_schedule
+        and get_parallel().moe_ep_size == 1
+    )
+
+
+_FIELD_NAMES = tuple(f.name for f in dataclasses.fields(SamplingBatchInfo))
+_FIELD_GETTER = operator.itemgetter(*_FIELD_NAMES)
 
 
 def merge_bias_tensor(

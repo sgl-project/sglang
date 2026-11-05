@@ -115,7 +115,11 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
     make_persistent_multi_ctas_kv_counter_buffer,
 )
 from sglang.srt.layers.cp.base import get_cp_strategy
-from sglang.srt.layers.cp.utils import is_cp_active
+from sglang.srt.layers.cp.utils import (
+    cp_live_store_rows,
+    cp_local_rope_positions,
+    is_cp_active,
+)
 from sglang.srt.layers.dcp.layout import (
     dsa_shards_index_k,
     filter_dcp_local_chunk_kv_indices,
@@ -4391,6 +4395,7 @@ class DeepseekSparseAttnBackend(
         use_prims_ts: bool = False,
     ) -> torch.Tensor:
         """Forward using TRT-LLM sparse MLA kernel, or Prims-TS with use_prims_ts."""
+        cp_store_cache_loc = None
         import flashinfer.decode
 
         metadata = self.forward_metadata
@@ -4457,17 +4462,30 @@ class DeepseekSparseAttnBackend(
                 )
             else:
                 rope_positions = forward_batch.positions
-                if dsa_use_prefill_cp(forward_batch):
-                    rope_positions = get_cp_strategy().shard_position_ids(
-                        rope_positions, forward_batch
+                in_prefill_cp = dsa_use_prefill_cp(forward_batch)
+                if in_prefill_cp:
+                    rope_positions = cp_local_rope_positions(
+                        forward_batch, rope_positions, k
                     )
-                    # The CP graph bridge trims Q to live local rows, while
-                    # deferred KV and sharded positions retain physical padding.
-                    # The fused RoPE kernel requires matching Q/K row counts.
-                    num_query_tokens = q.shape[0]
-                    k = k[:num_query_tokens]
-                    k_rope = k_rope[:num_query_tokens]
-                    rope_positions = rope_positions[:num_query_tokens]
+                    # Interleave BCG narrows q to the live local rows but hands
+                    # k and k_rope over with the CP-aligned physical shard; the
+                    # fused rope/quantize kernel needs one nnz, and the live
+                    # rows are a prefix of the shard.
+                    n_q = q.shape[0]
+                    assert k.shape[0] >= n_q, (
+                        "DSA prefill CP: local K shard has fewer rows than Q "
+                        f"(k={k.shape[0]}, q={n_q}); live rows must be a prefix "
+                        "of the CP-aligned shard"
+                    )
+                    if k.shape[0] > n_q:
+                        k = k[:n_q]
+                        k_rope = k_rope[:n_q]
+                        rope_positions = rope_positions[:n_q]
+                    assert rope_positions.shape[0] == k.shape[0], (
+                        "DSA prefill CP: rope positions do not match the K rows "
+                        f"after narrowing (positions={rope_positions.shape[0]}, "
+                        f"k={k.shape[0]})"
+                    )
 
                 q, k, k_rope = mla_quantize_and_rope_for_fp8(
                     q,
@@ -4480,10 +4498,18 @@ class DeepseekSparseAttnBackend(
                     self.kv_lora_rank,
                     self.qk_rope_head_dim,
                 )
-                if save_kv_cache and dsa_use_prefill_cp(forward_batch):
+                if save_kv_cache and in_prefill_cp:
                     k, k_rope = get_cp_strategy().all_gather_dsa_trtllm_fp8_kv(
                         forward_batch, k, k_rope
                     )
+                    # Store exactly the live global rows: BCG replay hands over
+                    # a bucket-sized static out_cache_loc whose tail is padding.
+                    n_store = cp_live_store_rows(
+                        forward_batch, k.shape[0], "fp8 MLA KV"
+                    )
+                    k = k[:n_store]
+                    k_rope = k_rope[:n_store]
+                    cp_store_cache_loc = forward_batch.out_cache_loc[:n_store]
             merge_query = False
 
             # Save KV cache if requested
@@ -4496,6 +4522,8 @@ class DeepseekSparseAttnBackend(
                 if not layer.is_cross_attention
                 else forward_batch.encoder_out_cache_loc
             )
+            if cp_store_cache_loc is not None:
+                cache_loc = cp_store_cache_loc
             self.kv_layers.layer(layer.layer_id).store_mla(layer, cache_loc, k, k_rope)
 
         k_cache = self.kv_layers.read(layer.layer_id).key()

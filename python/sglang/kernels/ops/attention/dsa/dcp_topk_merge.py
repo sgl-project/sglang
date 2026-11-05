@@ -14,10 +14,8 @@ if TYPE_CHECKING:
 
 
 @cache_once
-def _jit_dcp_topk_merge_module(
-    num_ranks: int, topk: int, cand_k: int, split: bool = False
-) -> Module:
-    args = make_cpp_args(num_ranks, topk, cand_k, int(split))
+def _jit_dcp_topk_merge_module(num_ranks: int, topk: int, cand_k: int) -> Module:
+    args = make_cpp_args(num_ranks, topk, cand_k)
     return load_jit(
         "dcp_topk_merge",
         *args,
@@ -46,10 +44,9 @@ def dcp_topk_merge(
     union_scratch: torch.Tensor,
     out_slots: torch.Tensor,
     out_fallback: torch.Tensor,
-    rank: int,
+    dcp_rank: int,
     span: int,
     cand_k: int,
-    split: bool = False,
 ) -> None:
     """Merge one batch of rows; every rank of the group must call it with the
     same rows, in the same order.
@@ -66,12 +63,9 @@ def dcp_topk_merge(
     rank's selected keys as widened slots ``page_table[p // span] * span + p %
     span``, -1 after them. ``out_fallback``: [rows] int32, 1 where a
     certificate failed.
-
-    ``split`` (KV replicated): rank q scored the 64-token pages p with
-    p % num_ranks == q, and every rank writes all selected keys, not only its own.
     """
     num_ranks = peer_ptrs.shape[0]
-    module = _jit_dcp_topk_merge_module(num_ranks, candidates.shape[1], cand_k, split)
+    module = _jit_dcp_topk_merge_module(num_ranks, candidates.shape[1], cand_k)
     module.dcp_topk_merge(
         candidates,
         buffer,
@@ -83,6 +77,6 @@ def dcp_topk_merge(
         out_slots,
         out_fallback,
         union_scratch,
-        rank,
+        dcp_rank,
         span,
     )

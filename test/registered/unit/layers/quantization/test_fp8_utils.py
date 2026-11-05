@@ -28,6 +28,51 @@ from sglang.test.test_utils import CustomTestCase
 register_cuda_ci(est_time=14, stage="base-b", runner_config="1-gpu-large")
 
 
+class TestFlashinferBmmPrequantContract(unittest.TestCase):
+    def test_e4m3_rows_bypass_quantization_and_restore_producer_dtype(self):
+        for output_dtype in (torch.bfloat16, torch.float16):
+            with self.subTest(output_dtype=output_dtype):
+                self._assert_prequantized_dtype(output_dtype)
+
+    def _assert_prequantized_dtype(self, output_dtype):
+        qinput = torch.empty((2, 4), dtype=torch.float8_e4m3fn, device="cpu")
+        weight = torch.empty((4, 3), dtype=torch.float8_e4m3fn, device="cpu")
+        input_scale = torch.tensor([0.02], device="cpu")
+        weight_scale = torch.tensor([0.01], device="cpu")
+        expected = torch.empty((2, 3), dtype=output_dtype, device="cpu")
+
+        with (
+            patch.object(fp8_utils, "static_quant_fp8") as quantize,
+            patch.object(
+                fp8_utils,
+                "flashinfer_bmm_fp8",
+                return_value=expected,
+                create=True,
+            ) as bmm,
+        ):
+            actual = fp8_utils.apply_fp8_linear_bmm_flashinfer(
+                qinput,
+                weight,
+                weight_scale,
+                input_scale,
+                pre_quant_output_dtype=output_dtype,
+            )
+
+        quantize.assert_not_called()
+        bmm.assert_called_once()
+        got_input, got_weight, got_input_scale, got_weight_scale, got_dtype = (
+            bmm.call_args.args
+        )
+        self.assertEqual(got_input.data_ptr(), qinput.data_ptr())
+        self.assertEqual(tuple(got_input.shape), tuple(qinput.shape))
+        self.assertIs(got_weight, weight)
+        self.assertIs(got_input_scale, input_scale)
+        self.assertIs(got_weight_scale, weight_scale)
+        self.assertIs(got_dtype, output_dtype)
+        self.assertEqual(actual.data_ptr(), expected.data_ptr())
+        self.assertEqual(tuple(actual.shape), (2, 3))
+
+
 class TestMxfp8MoeScaleLayout(CustomTestCase):
     @classmethod
     def setUpClass(cls):
