@@ -5,12 +5,14 @@ import torch
 from sglang.kernels.ops.attention.fused_qk_rmsnorm_rope_gate import (
     fused_qk_gemma_rmsnorm_rope_gate,
 )
+from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
 from sglang.srt.layers.rotary_embedding.mrope import MRotaryEmbedding
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=6, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_amd_ci(est_time=20, stage="jit-kernel-unit", runner_config="amd")
 
 
 def gemma_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
@@ -136,6 +138,57 @@ class TestFusedQKRMSNormRoPEGate(CustomTestCase):
         torch.testing.assert_close(
             gate_out.float(), packed[..., self.head_dim :].float(), atol=0, rtol=0
         )
+
+    def test_gate_view_without_the_copy(self):
+        """copy_gate=False returns the gate heads as a strided view of q_gate (here
+        a split of a qkv projection, as in the model) instead of a copy; q and k are
+        the same either way, and the output gate reads the view as it reads the copy.
+        """
+        q_size = self.num_q_heads * 2 * self.head_dim
+        kv_size = self.num_kv_heads * self.head_dim
+        qkv = torch.randn(
+            self.tokens, q_size + 2 * kv_size, device="cuda", dtype=torch.bfloat16
+        )
+        q_gate, k, _ = qkv.split([q_size, kv_size, kv_size], dim=-1)
+        positions = torch.arange(self.tokens, device="cuda", dtype=torch.int64)
+        args = (
+            q_gate,
+            k,
+            self.q_weight,
+            self.k_weight,
+            self.cos_sin_cache,
+            positions,
+            self.eps,
+            self.num_q_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            self.rotary_dim,
+        )
+        q_copy, k_copy, gate_copy = fused_qk_gemma_rmsnorm_rope_gate(*args)
+        q_view, k_view, gate_view = fused_qk_gemma_rmsnorm_rope_gate(
+            *args, copy_gate=False
+        )
+
+        self.assertTrue(torch.equal(q_view, q_copy))
+        self.assertTrue(torch.equal(k_view, k_copy))
+        self.assertEqual(gate_view.shape, gate_copy.shape)
+        self.assertEqual(
+            gate_view.data_ptr(),
+            q_gate.data_ptr() + self.head_dim * q_gate.element_size(),
+        )
+        self.assertTrue(torch.equal(gate_view, gate_copy))
+
+        attn = torch.randn(
+            self.tokens,
+            self.num_q_heads * self.head_dim,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        want = fused_sigmoid_mul(
+            attn.clone(), gate_copy.view(self.tokens, -1), inplace=True
+        )
+        got = fused_sigmoid_mul(attn.clone(), gate_view, inplace=True)
+        self.assertTrue(torch.equal(got, want))
 
     def test_mrope_matches_the_rotary_module(self):
         """With t == h == w every layout agrees, so only distinct rows catch a wrong
