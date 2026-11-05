@@ -25,7 +25,10 @@ from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_device, get_parallel
 from sglang.srt.utils import is_mps, is_npu
 from sglang.srt.utils.profile_merger import ProfileMerger
-from sglang.srt.utils.profile_utils import ProfileManager
+from sglang.srt.utils.profile_utils import (
+    ProfileManager,
+    sanitize_profile_filename_component,
+)
 from sglang.srt.utils.torch_npu_patch_utils import apply_torch_npu_patches
 
 if TYPE_CHECKING:
@@ -101,6 +104,9 @@ class SchedulerProfilerManager:
         detailed_annotations: bool = False,
         profile_stages: Optional[List[str]] = None,
     ) -> ProfileReqOutput:
+        profile_id = sanitize_profile_filename_component(profile_id)
+        profile_prefix = sanitize_profile_filename_component(profile_prefix)
+
         if envs.SGLANG_PROFILE_V2.get():
             self.detailed_annotations = detailed_annotations
             return self._profile_manager.configure(
