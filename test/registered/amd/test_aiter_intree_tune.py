@@ -1,5 +1,4 @@
-"""In-tree aiter tuned rows and DeepSeek-V4's aiter#6004 / #6029 / #6030 apply only while
-aiter lacks them, never repeat a key, and the mHC tile_m=16 policy is bit-identical."""
+"""In-tree aiter rows and DeepSeek-V4's aiter patches apply only while aiter lacks them."""
 
 import collections
 import glob

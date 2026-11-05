@@ -11,8 +11,8 @@ Three open aiter PRs only change *which* existing kernel aiter picks for a shape
 * ROCm/aiter#6030 -- mHC fused post+pre on gfx950: tile_m=16 for the FP32 fn decode
   GEMM (``aiter.ops.mhc.get_mhc_fused_post_pre_config``, Python only, bit-identical).
 
-The CSV rows of #6004 and #6029 are in ``utils/aiter_tuned_configs/
-a8w8_blockscale_bpreshuffle/deepseek_v4.csv`` and installed with every other in-tree row.
+The CSV rows of #6004 and #6029 are in ``utils/aiter_tuned_configs/`` with every other
+in-tree row.
 
 ``install_aiter_intree_tune()`` registers the rest at DeepSeek-V4 model construction,
 before any GEMM / mHC config lookup:
@@ -26,10 +26,6 @@ content (JSON = the recorded sha256; mHC = the old policy still picks tile_m=32 
 decode M). When aiter has merged the PR, or re-tuned the shape some other way, the item
 is skipped and aiter's version is used, so upgrading the aiter pin switches over
 automatically and never fails at startup.
-
-Switches (default on): ``SGLANG_AITER_INTREE_GEMM_TUNE`` (#6004 + #6029 Triton JSON, and
-every in-tree CSV row) and ``SGLANG_AITER_INTREE_MHC_TILE_M16`` (#6030). Set to 0 to use
-the pinned aiter as is.
 """
 
 from __future__ import annotations
