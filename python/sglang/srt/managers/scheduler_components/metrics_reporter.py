@@ -346,9 +346,7 @@ class SchedulerMetricsReporter:
             enabled=self.enable_metrics,
             query_forward_active=(
                 self.forward_pass_device_timer.is_active
-                if self.enable_metrics
-                and self.forward_pass_device_timer is not None
-                and self.scheduler.device == "cuda"
+                if self.enable_metrics and self.forward_pass_device_timer is not None
                 else None
             ),
         )
