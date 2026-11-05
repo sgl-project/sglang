@@ -75,7 +75,6 @@ from sglang.srt.layers.attention.dsa.dsa_dcp import (
     localize_dcp_page_table,
 )
 from sglang.srt.layers.attention.dsa.dsa_dcp_sharded import (
-    dcp_gather_request_rows,
     dcp_localize_compact,
     init_dcp_candidate_all_gather,
     init_dcp_topk_merge,
@@ -122,7 +121,6 @@ from sglang.srt.layers.cp.utils import (
 )
 from sglang.srt.layers.dcp.layout import (
     dsa_shards_index_k,
-    filter_dcp_local_chunk_kv_indices,
     get_dcp_lens,
 )
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
@@ -370,8 +368,6 @@ class DSAMetadata:
     # The offset of topk indices in ragged kv, prefill only
     # shape: (seq_lens_sum,)
     topk_indices_offset: Optional[torch.Tensor] = None
-    # DCP prefill: this rank's KV rows of page_table_1_flattened, in order
-    dcp_local_kv_rows: Optional[torch.Tensor] = None
 
     # k_start and k_end in kv cache for each token.
     indexer_k_start_end: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
@@ -755,7 +751,7 @@ class DeepseekSparseAttnBackend(
             and _is_cuda
             and get_platform().is_sm100
             # DCP prefill keeps the local TP heads and packs only after
-            # dcp_gather_kv_cache has restored request-ordered FP8 rows.
+            # the DCP extend gather has restored request-ordered FP8 rows.
             # Separate prefill-CP layouts have not been validated here.
             and (self.attn_dcp_size == 1 or not is_dsa_enable_prefill_cp())
             and self.dsa_index_kpool == 1
@@ -1338,20 +1334,6 @@ class DeepseekSparseAttnBackend(
             return metadata.page_table_1.shape[1]
         return self.req_to_token.shape[1]
 
-    def dcp_gather_kv_cache(
-        self, kv_cache: torch.Tensor, forward_batch: ForwardBatch, metadata: DSAMetadata
-    ) -> torch.Tensor:
-        # DCP prefill: the batch's KV rows from all ranks, request after request
-        # in position order, padded to whole pages (the ragged top-k layout)
-        rows = kv_cache.view(torch.uint8).view(-1, self.kv_cache_dim)
-        gathered = dcp_gather_request_rows(
-            rows[metadata.dcp_local_kv_rows], forward_batch.seq_lens_cpu
-        )
-        pad = -gathered.shape[0] % self.physical_page_size
-        if pad:
-            gathered = torch.cat([gathered, gathered.new_zeros(pad, gathered.shape[1])])
-        return gathered.view(kv_cache.dtype)
-
     def _transform_table_1_to_real(self, page_table: torch.Tensor) -> torch.Tensor:
         page_size = self.real_page_span
         if page_size == 1:
@@ -1721,16 +1703,6 @@ class DeepseekSparseAttnBackend(
             real_page_table=self._transform_table_1_to_real(page_table),
             dsa_max_seqlen_q=1,
             topk_indices_offset=topk_indices_offset,
-            dcp_local_kv_rows=(
-                filter_dcp_local_chunk_kv_indices(
-                    page_table_1_flattened,
-                    torch.zeros_like(indexer_seq_lens_cpu),
-                    indexer_seq_lens_cpu,
-                )
-                // self.attn_dcp_size
-                if self.attn_dcp_size > 1 and page_table_1_flattened is not None
-                else None
-            ),
             indexer_k_start_end=indexer_k_start_end,
             indexer_logical_page_table=indexer_logical_page_table,
             indexer_seq_lens_cpu=indexer_seq_lens_cpu,
@@ -2583,9 +2555,7 @@ class DeepseekSparseAttnBackend(
         # Do absorbed multi-latent attention (MLA path)
         kv_cache = self.kv_layers.read(layer.layer_id).key()
         if self.attn_dcp_size > 1 and not forward_batch.forward_mode.is_target_verify():
-            # Prefill attends over the gathered KV; target verify, like decode,
-            # attends over this rank's shard and returns a partial for the merge.
-            kv_cache = self.dcp_gather_kv_cache(kv_cache, forward_batch, metadata)
+            kv_cache = forward_batch.attn_dcp_metadata.dcp_kv_buffer
 
         if q_rope is not None:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
@@ -4528,7 +4498,7 @@ class DeepseekSparseAttnBackend(
 
         k_cache = self.kv_layers.read(layer.layer_id).key()
         if sharded_dcp and not dcp_partial:
-            k_cache = self.dcp_gather_kv_cache(k_cache, forward_batch, metadata)
+            k_cache = forward_batch.attn_dcp_metadata.dcp_kv_buffer
         kv_cache = k_cache.view(
             -1, self.physical_page_size, self.kv_cache_dim
         ).unsqueeze(1)
@@ -4885,7 +4855,7 @@ class DeepseekSparseAttnBackend(
             topk_transform_method = TopkTransformMethod.RAGGED
         elif self.attn_dcp_size > 1 and forward_mode == ForwardMode.EXTEND:
             # DCP prefill attends over the KV gathered from all ranks, laid out
-            # request after request (see dcp_gather_kv_cache).
+            # request after request (see all_gather_kv_cache_for_extend_dsa).
             topk_transform_method = TopkTransformMethod.RAGGED
         else:
             topk_transform_method = TopkTransformMethod.PAGED

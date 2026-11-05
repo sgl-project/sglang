@@ -34,10 +34,12 @@ from sglang.kernels.ops.attention.dcp_kernels import (
     dcp_pack_a2a_send,
     dcp_pack_q,
 )
+from sglang.kernels.ops.quantization.dsa_quant_k_cache import quantize_k_cache_separate
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.distributed.parallel_state import GroupCoordinator
+from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadataDsa
 from sglang.srt.runtime_context import get_parallel, get_platform
 from sglang.srt.utils import is_hip
 from sglang.srt.utils.common import is_fi_a2a_supported
@@ -355,6 +357,37 @@ def all_gather_kv_cache_for_mla_extend(
         ...,
         kv_lora_rank:,
     ] = k_pe[:extend_num_tokens]
+
+
+def all_gather_kv_cache_for_extend_dsa(
+    kv_cache: torch.Tensor,
+    metadata: DecodeContextParallelMetadataDsa,
+    k_nope: torch.Tensor,
+    k_pe: torch.Tensor,
+    kv_cache_store_fp8: bool,
+    kv_scale_ue8m0: bool,
+) -> None:
+    # Prefix rows come packed from the cache; the extend rows are encoded here
+    # exactly as the pool writes them, so no write has to precede the gather.
+    buffer = metadata.dcp_kv_buffer.view(torch.uint8)
+    buffer = buffer.view(buffer.shape[0], -1)
+    if metadata.dcp_extend_prefix_lens_sum > 0:
+        rows = kv_cache.view(torch.uint8)
+        rows = rows.view(rows.shape[0], -1)[metadata.dcp_local_prefix_kv_rows]
+        buffer[metadata.dcp_prefix_dst_rows] = all_gather_kv_cache_for_dcp(
+            rows, rows[:, :0], metadata.dcp_extend_prefix_lens_cpu
+        )
+    num_extend = metadata.dcp_extend_dst_rows.shape[0]
+    k_nope = k_nope[:num_extend].reshape(num_extend, -1)
+    k_pe = k_pe[:num_extend].reshape(num_extend, -1)
+    if kv_cache_store_fp8:
+        nope, rope = quantize_k_cache_separate(k_nope, k_pe, scale_ue8m0=kv_scale_ue8m0)
+        rows = torch.cat([nope, rope], dim=-1)
+    else:
+        # raw layout: the cast-on-write store
+        rows = torch.cat([k_nope, k_pe], dim=-1).to(metadata.dcp_kv_buffer.dtype)
+        rows = rows.view(torch.uint8)
+    buffer[metadata.dcp_extend_dst_rows] = rows
 
 
 # all gather kv cache and re-org to query orders
