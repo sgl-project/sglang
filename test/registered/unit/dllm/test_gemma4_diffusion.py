@@ -206,9 +206,14 @@ def _fa_batch(extend_lens, prefix_lens, mm_items_per_req):
 
 
 def _prepare_on(backend, forward_batch):
+    model = SimpleNamespace(
+        config=SimpleNamespace(
+            text_config=SimpleNamespace(use_bidirectional_attention="vision")
+        )
+    )
     with patch.object(gemma4_mm, "get_attn_backend", return_value=backend):
         Gemma4ForConditionalGeneration.prepare_attn_masks(
-            None, forward_batch, torch.zeros(1, dtype=torch.int64), torch.bfloat16
+            model, forward_batch, torch.zeros(1, dtype=torch.int64), torch.bfloat16
         )
 
 
