@@ -1533,7 +1533,7 @@ class BufferModePipeline:
     ) -> None:
         req.prefix_len = matched_len
         req.last_node = node_id
-        req.kv.cache_protected_len = matched_len
+        req.kv.protect_prefix(matched_len)
 
     def _build_staged_prefetch_plan(
         self, f: _StagedPrefetch, key: RadixKey, matched_len: int
@@ -1589,6 +1589,7 @@ class BufferModePipeline:
         )
         req.host_hit_length = 0
         req.swa_host_hit_length = 0
+        req.matched_auxiliary_swa_host_hit_length = 0
         req.mamba_host_hit_length = 0
         self._clear_storage_hit(req)
         self.release_staged_hold(req.cache_request_handle, reason="device_covered")

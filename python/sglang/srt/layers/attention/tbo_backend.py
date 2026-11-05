@@ -10,8 +10,10 @@ from sglang.srt.layers.attention.base_attn_backend import (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.attention.graph_variants import AttentionGraphVariants
     from sglang.srt.layers.attention.verify_mask import VerifyMask
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.model_executor.forward_mode import ForwardMode
 
 
 class TboAttnBackend(AttentionBackend):
@@ -161,6 +163,15 @@ class TboAttnBackend(AttentionBackend):
                 if forward_batch_child.batch_size > 0:
                     child.init_forward_metadata(forward_batch=forward_batch_child)
 
+    def get_decode_graph_variants(
+        self, capture_forward_mode: ForwardMode, captured_req_width: int
+    ) -> Optional[AttentionGraphVariants]:
+        # Children read the same capture label;
+        # init_new builds them with the primary's creator.
+        return self.primary.get_decode_graph_variants(
+            capture_forward_mode, captured_req_width
+        )
+
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         self.primary.init_cuda_graph_state(max_bs=max_bs, max_num_tokens=max_num_tokens)
         if not self._children_use_cuda_graph():
@@ -259,6 +270,9 @@ def _build_tbo_child_replay_fb_view(
     return SimpleNamespace(
         batch_size=child_bs,
         forward_mode=fb_view.forward_mode,
+        # TBO is mutually exclusive with ragged verify; a parent layout would
+        # describe the full batch, not this child slice.
+        ragged_verify_layout=None,
         actual_forward_mode=getattr(
             fb_view, "actual_forward_mode", fb_view.forward_mode
         ),

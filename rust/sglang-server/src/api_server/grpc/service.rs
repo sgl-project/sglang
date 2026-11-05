@@ -12,13 +12,13 @@ use tonic::{Request, Response, Status};
 
 use super::{info, native_api};
 use crate::api_server::core::HealthStatus;
-use crate::api_server::handlers::{CoreHandle, HiCacheManager};
-use crate::message::config::{PreferredSamplingParams, ServerArgs};
+use crate::api_server::handlers::{AbortEnding, CoreHandle, HiCacheManager};
+use crate::message::config::{
+    DEFAULT_GRPC_RESPONSE_TIMEOUT_SECS, PreferredSamplingParams, ServerArgs,
+};
 use crate::message::request::{GenerationPolicy, into_requests};
 use crate::message::wire::{ClientMaxNewTokens, fill_preferred_sampling};
 use crate::utils::environ;
-
-const DEFAULT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub(super) type ResponseStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
 
@@ -56,7 +56,7 @@ impl GrpcService {
             config: AdapterConfig {
                 preferred_sampling_params: server_args.preferred_sampling_params.clone(),
                 incremental_streaming_output: server_args.incremental_streaming_output,
-                response_timeout: DEFAULT_RESPONSE_TIMEOUT,
+                response_timeout: response_timeout(server_args.grpc_response_timeout_secs),
                 health_timeout: Duration::from_secs(
                     environ::env_i64("SGLANG_HEALTH_CHECK_TIMEOUT", 20).max(0) as u64,
                 ),
@@ -87,6 +87,19 @@ impl GrpcService {
             },
         }
     }
+}
+
+/// A zero timeout would expire every call at once; like the legacy gRPC
+/// bridge, fall back to the default instead.
+fn response_timeout(secs: u64) -> Duration {
+    if secs == 0 {
+        tracing::warn!(
+            default = DEFAULT_GRPC_RESPONSE_TIMEOUT_SECS,
+            "grpc_response_timeout_secs must be positive; using default"
+        );
+        return Duration::from_secs(DEFAULT_GRPC_RESPONSE_TIMEOUT_SECS);
+    }
+    Duration::from_secs(secs)
 }
 
 #[tonic::async_trait]
@@ -151,6 +164,9 @@ impl SglangService for GrpcService {
             Ok(HealthStatus::Stalled) => Err(Status::unavailable(
                 "no scheduler output within the health-check timeout",
             )),
+            Ok(HealthStatus::Draining) => {
+                Err(Status::unavailable("server is draining before shutdown"))
+            }
             Err(error) => Err(native_api::status(error)),
         }
     }
@@ -257,9 +273,10 @@ impl SglangService for GrpcService {
             ));
         }
         Ok(Response::new(api::AbortResponse {
-            success: self
-                .core
-                .abort((!request.abort_all).then_some(request.rid.as_str())),
+            success: self.core.abort(
+                (!request.abort_all).then_some(request.rid.as_str()),
+                AbortEnding::CancelledError,
+            ),
         }))
     }
 }
@@ -319,6 +336,7 @@ mod tests {
                     startup_ready,
                     is_disaggregation: false,
                     mm_limits: Default::default(),
+                    multimodal: false,
                     peer_endpoints: Vec::new(),
                     metadata: CoreMetadata::from(&ServerArgs {
                         served_model_name: "test-model".into(),
@@ -506,8 +524,12 @@ mod tests {
         assert!(harness.abort_rx.try_recv().is_err());
     }
 
+    /// Incremental frames carry each delta with the cumulative completion
+    /// count and cached-token split, which a scheduler abort does not carry.
     #[tokio::test]
     async fn incremental_frames_carry_deltas_with_cumulative_count() {
+        use crate::message::response::{CachedTokensDetails, ChunkExtras};
+
         let harness = Harness::new(2, true, Duration::from_secs(1));
         let mut stream = harness
             .service
@@ -520,14 +542,23 @@ mod tests {
         assert!(intake.admission.try_accept());
         assert_eq!(intake.request.input_ids.as_deref(), Some(&[4, 5][..]));
         assert!(intake.request.text.is_none());
-        intake
-            .sink
-            .try_send(ResponseItem::Frame(chunk(&intake.rid, "A", 10, false)))
-            .unwrap();
-        intake
-            .sink
-            .try_send(ResponseItem::Done(chunk(&intake.rid, "B", 11, true)))
-            .unwrap();
+        let mut first = chunk(&intake.rid, "A", 10, false);
+        first.extras = Some(Box::new(ChunkExtras {
+            cached_tokens_details: Some(CachedTokensDetails {
+                device: 1,
+                host: 1,
+                storage: None,
+                storage_backend: None,
+            }),
+            ..Default::default()
+        }));
+        intake.sink.try_send(ResponseItem::Frame(first)).unwrap();
+        let mut aborted = chunk(&intake.rid, "B", 11, true);
+        aborted.extras = Some(Box::new(ChunkExtras {
+            abort_output: true,
+            ..Default::default()
+        }));
+        intake.sink.try_send(ResponseItem::Done(aborted)).unwrap();
 
         let first = frame(stream.next().await.unwrap().unwrap());
         let finished = frame(stream.next().await.unwrap().unwrap());
@@ -535,6 +566,14 @@ mod tests {
         assert_eq!(output_ids(&finished), [11]);
         assert_eq!(finished.text, "B");
         assert_eq!(meta(&finished).completion_tokens, 2);
+        let split = Some(api::CachedTokensDetails {
+            device: 1,
+            host: 1,
+            storage: None,
+            storage_backend: None,
+        });
+        assert_eq!(meta(&first).cached_tokens_details, split);
+        assert_eq!(meta(&finished).cached_tokens_details, split);
         assert!(stream.next().await.is_none());
     }
 
@@ -647,6 +686,28 @@ mod tests {
         assert_eq!(abort.rid().client_facing(), "too-slow");
     }
 
+    /// `--grpc-response-timeout-secs` sets the per-event wait; 0 keeps the
+    /// legacy gRPC bridge's 300 s default instead of expiring every call.
+    #[tokio::test]
+    async fn response_timeout_follows_the_launch_arg() {
+        let harness = Harness::new(1, false, Duration::from_secs(1));
+        let timeout_for = |secs| {
+            let server_args = ServerArgs {
+                grpc_response_timeout_secs: secs,
+                ..Default::default()
+            };
+            GrpcService::new(
+                harness.service.core.clone(),
+                &server_args,
+                harness.service.hicache_manager.clone(),
+            )
+            .config
+            .response_timeout
+        };
+        assert_eq!(timeout_for(900), Duration::from_secs(900));
+        assert_eq!(timeout_for(0), Duration::from_secs(300));
+    }
+
     #[tokio::test]
     async fn closed_intake_is_a_top_level_unavailable_status() {
         let (intake_tx, intake_rx) = flume::unbounded();
@@ -661,6 +722,7 @@ mod tests {
                 startup_ready: true,
                 is_disaggregation: false,
                 mm_limits: Default::default(),
+                multimodal: false,
                 peer_endpoints: Vec::new(),
                 metadata: CoreMetadata::default(),
                 metrics: None,

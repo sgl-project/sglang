@@ -10,6 +10,10 @@
   },
   "redirects": [
     {
+      "source": "/cookbook/autoregressive/Ernie/:slug*",
+      "destination": "/cookbook/autoregressive/Baidu/:slug*"
+    },
+    {
       "source": "/cookbook/autoregressive/Reflection/Beam-1.0",
       "destination": "/cookbook/autoregressive/Reflection/Beam-1_0"
     },
@@ -1256,6 +1260,7 @@
                   {
                     "group": "Kimi (Moonshot AI)",
                     "pages": [
+                      "cookbook/autoregressive/Moonshotai/Kimi-K3.1-Pro",
                       "cookbook/autoregressive/Moonshotai/Kimi-K3",
                       "cookbook/autoregressive/Moonshotai/Kimi-K2.7-Code",
                       "cookbook/autoregressive/Moonshotai/Kimi-K2.6",
@@ -1407,15 +1412,12 @@
                   {
                     "group": "Baidu",
                     "pages": [
+                      "cookbook/autoregressive/Baidu/ERNIE-5.5-Flash",
+                      "cookbook/autoregressive/Baidu/Ernie4.5",
+                      "cookbook/autoregressive/Baidu/Ernie4.5-VL",
+                      "cookbook/autoregressive/Baidu/Unlimited-OCR-2",
                       "cookbook/autoregressive/Baidu/PaddleOCR-VL",
                       "cookbook/autoregressive/Baidu/Unlimited-OCR"
-                    ]
-                  },
-                  {
-                    "group": "Ernie",
-                    "pages": [
-                      "cookbook/autoregressive/Ernie/Ernie4.5",
-                      "cookbook/autoregressive/Ernie/Ernie4.5-VL"
                     ]
                   },
                   {
@@ -1472,6 +1474,7 @@
                   {
                     "group": "Mistral",
                     "pages": [
+                      "cookbook/autoregressive/Mistral/Mistral-Large-4",
                       "cookbook/autoregressive/Mistral/Ministral-3",
                       "cookbook/autoregressive/Mistral/Mistral-Small-4",
                       "cookbook/autoregressive/Mistral/Mistral-Medium-3.5",
@@ -1543,17 +1546,21 @@
                   {
                     "group": "Tencent",
                     "pages": [
-                      "cookbook/diffusion/Tencent/HunyuanImage3"
+                      "cookbook/diffusion/Tencent/HunyuanImage3",
+                      "cookbook/diffusion/HY-Nomas/HY-Nomas"
                     ]
                   },
                   {
-                    "group": "Cosmos",
+                    "group": "NVIDIA",
                     "pages": [
-                      "cookbook/diffusion/Cosmos/Cosmos3"
+                      "cookbook/diffusion/Cosmos/Cosmos3",
+                      "cookbook/diffusion/SANA-Video/SANA-Video",
+                      "cookbook/diffusion/SANA-WM/SANA-WM",
+                      "cookbook/diffusion/LongLive/LongLive-2.0"
                     ]
                   },
                   {
-                    "group": "FLUX",
+                    "group": "Black Forest Labs",
                     "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/FLUX/FLUX.3",
@@ -1576,26 +1583,20 @@
                     ]
                   },
                   {
-                    "group": "LongLive",
-                    "pages": [
-                      "cookbook/diffusion/LongLive/LongLive-2.0"
-                    ]
-                  },
-                  {
-                    "group": "LTX",
+                    "group": "Lightricks",
                     "pages": [
                       "cookbook/diffusion/LTX/LTX2 & LTX2.3",
                       "cookbook/diffusion/LTX/LTX2.5"
                     ]
                   },
                   {
-                    "group": "JoyAI-Echo",
+                    "group": "JD.com",
                     "pages": [
                       "cookbook/diffusion/JoyEcho/JoyEcho"
                     ]
                   },
                   {
-                    "group": "Qwen-Image",
+                    "group": "Qwen",
                     "pages": [
                       "cookbook/diffusion/Qwen-Image/Qwen-Image-2.1",
                       "cookbook/diffusion/Qwen-Image/Qwen-Image",
@@ -1615,19 +1616,19 @@
                     ]
                   },
                   {
-                    "group": "LongCat-Image",
+                    "group": "Meituan",
                     "pages": [
                       "cookbook/diffusion/LongCat/LongCat-Image"
                     ]
                   },
                   {
-                    "group": "Ming-Image",
+                    "group": "InclusionAI",
                     "pages": [
                       "cookbook/diffusion/inclusionAI/Ming-Image"
                     ]
                   },
                   {
-                    "group": "Z-Image",
+                    "group": "Tongyi-MAI",
                     "pages": [
                       "cookbook/diffusion/Z-Image/Z-Image-Turbo"
                     ]
@@ -1639,27 +1640,23 @@
                     ]
                   },
                   {
-                    "group": "ERNIE-Image",
+                    "group": "Baidu",
                     "pages": [
                       "cookbook/diffusion/Ernie-Image/Ernie-Image"
                     ]
                   },
                   {
-                    "group": "MOVA",
+                    "group": "HiDream",
+                    "tag": "NEW",
                     "pages": [
-                      "cookbook/diffusion/MOVA/MOVA"
+                      "cookbook/diffusion/HiDream/HiDream-O1-Image"
                     ]
                   },
                   {
-                    "group": "MOSS-Image",
+                    "group": "OpenMOSS",
                     "pages": [
+                      "cookbook/diffusion/MOVA/MOVA",
                       "cookbook/diffusion/OpenMOSS/MOSS-Image"
-                    ]
-                  },
-                  {
-                    "group": "SANA Video",
-                    "pages": [
-                      "cookbook/diffusion/SANA-Video/SANA-Video"
                     ]
                   },
                   {
@@ -1677,28 +1674,11 @@
                     ]
                   },
                   {
-                    "group": "LingBot Video",
+                    "group": "Robbyant",
                     "pages": [
-                      "cookbook/diffusion/LingBot-Video/LingBot-Video-MoE"
-                    ]
-                  },
-                  {
-                    "group": "LingBot World",
-                    "pages": [
+                      "cookbook/diffusion/LingBot-Video/LingBot-Video-MoE",
                       "cookbook/diffusion/LingBot-World/LingBot-World",
                       "cookbook/diffusion/LingBot-World/LingBot-World-2.0"
-                    ]
-                  },
-                  {
-                    "group": "SANA-WM",
-                    "pages": [
-                      "cookbook/diffusion/SANA-WM/SANA-WM"
-                    ]
-                  },
-                  {
-                    "group": "HY-Nomas",
-                    "pages": [
-                      "cookbook/diffusion/HY-Nomas/HY-Nomas"
                     ]
                   }
                 ]
@@ -1715,7 +1695,7 @@
                     ]
                   },
                   {
-                    "group": "FLUX",
+                    "group": "Black Forest Labs",
                     "tag": "NEW",
                     "pages": [
                       "cookbook/vla/FLUX/FLUX-3-Action"

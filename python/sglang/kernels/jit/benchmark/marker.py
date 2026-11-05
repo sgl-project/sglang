@@ -21,6 +21,7 @@ from typing import (
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import cache_once
 from sglang.srt.environ import envs
 from sglang.utils import is_in_ci
@@ -98,20 +99,13 @@ def _process_metrics(times: list[float], metrics: tuple[Metric, ...]) -> list[fl
     return results
 
 
-@cache_once
-def _get_l2_cache_size() -> int:
-    device = torch.cuda.current_device()
-    props = torch.cuda.get_device_properties(device)
-    return props.L2_cache_size
-
-
 _L2_SAFE_RATIO = 5
 
 
 def _get_flush_l2_buffer() -> torch.Tensor:
     """Get a buffer sized to flush the L2 cache when accessed."""
     device = torch.device(f"cuda:{torch.cuda.current_device()}")
-    l2_size = _get_l2_cache_size()
+    l2_size = current_arch().l2_cache_bytes
     safe_size = int(l2_size * _L2_SAFE_RATIO)
     return torch.empty(safe_size, device=device, dtype=torch.uint8)
 
@@ -139,7 +133,7 @@ def _calculate_rotation_count(nbytes: int, min_rotations: int = 2) -> int:
     Returns:
         Number of buffer copies needed (1 means no rotation needed).
     """
-    l2_size = _get_l2_cache_size()
+    l2_size = current_arch().l2_cache_bytes
     safe_cache_threshold = l2_size * _L2_SAFE_RATIO
 
     if nbytes <= 0 or nbytes >= safe_cache_threshold:
