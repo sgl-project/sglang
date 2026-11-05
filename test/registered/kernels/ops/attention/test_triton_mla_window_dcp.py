@@ -1,5 +1,4 @@
-"""The Triton sliding-window MLA verify layers' rank-local DCP partials must merge
-to dense fp32 attention over each row's window."""
+"""DCP draft partials must merge to dense fp32 attention over each row's window."""
 
 import math
 import sys
@@ -355,6 +354,7 @@ def test_verify_metadata_builds_no_rail():
     bs = 2
     backend = TritonAttnBackend.__new__(TritonAttnBackend)
     backend.use_mla = True
+    backend.topk = 0
     backend.dcp_size, backend.dcp_rank = 8, 0
     backend.sliding_window_size = WINDOWS[1]
     backend.req_to_token = backend.token_to_kv_pool = None
