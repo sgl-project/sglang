@@ -4,7 +4,7 @@ import math
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Iterable, Optional, Set, Tuple, Union
+from typing import Any, Dict, Iterable, Optional, Set, Tuple, Union
 
 import msgspec
 import sympy
@@ -881,6 +881,22 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         )
 
 
+# Triton only knows the fp8e4nv pointer dtype from SM89 up (its NVIDIA backend adds
+# it at capability >= 89); older parts gather the e4m3 bytes and decode them here.
+_FP8_E4M3_PTR: Dict[int, bool] = {}
+
+
+def _fp8_e4m3_ptr_supported() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    device = torch.cuda.current_device()
+    supported = _FP8_E4M3_PTR.get(device)
+    if supported is None:
+        supported = torch.cuda.get_device_capability(device) >= (8, 9)
+        _FP8_E4M3_PTR[device] = supported
+    return supported
+
+
 @triton.jit
 def _gather_ple_embedding_from_pinned_kernel(
     weight_ptr,
@@ -890,6 +906,7 @@ def _gather_ple_embedding_from_pinned_kernel(
     tp_vocab_start,
     tp_vocab_end,
     is_fp8: tl.constexpr,
+    fp8_native: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
     row_id = tl.program_id(0)
@@ -898,15 +915,34 @@ def _gather_ple_embedding_from_pinned_kernel(
     local_idx = tl.where(in_range, global_idx - tp_vocab_start, 0)
     offsets = tl.arange(0, BLOCK_D)
     mask = offsets < embedding_dim
-    if is_fp8:
+    if is_fp8 and fp8_native:
         weight_ptr = weight_ptr.to(tl.int64).to(tl.pointer_type(tl.float8e4nv))
+        values = tl.load(
+            weight_ptr + local_idx * embedding_dim + offsets,
+            mask=mask,
+            other=0.0,
+        ).to(tl.bfloat16)
+    elif is_fp8:
+        # e4m3fn byte decode: subnormal mant * 2^-9, normal (1 + mant/8) * 2^(exp-7).
+        weight_ptr = weight_ptr.to(tl.int64).to(tl.pointer_type(tl.uint8))
+        raw = tl.load(
+            weight_ptr + local_idx * embedding_dim + offsets, mask=mask, other=0
+        ).to(tl.int32)
+        exp = (raw >> 3) & 0x0F
+        mant = raw & 0x07
+        magnitude = tl.where(
+            exp == 0,
+            mant.to(tl.float32) * 0.001953125,
+            (1.0 + mant.to(tl.float32) * 0.125) * tl.exp2(exp.to(tl.float32) - 7.0),
+        )
+        values = tl.where((raw & 0x80) != 0, -magnitude, magnitude).to(tl.bfloat16)
     else:
         weight_ptr = weight_ptr.to(tl.int64).to(tl.pointer_type(tl.bfloat16))
-    values = tl.load(
-        weight_ptr + local_idx * embedding_dim + offsets,
-        mask=mask,
-        other=0.0,
-    ).to(tl.bfloat16)
+        values = tl.load(
+            weight_ptr + local_idx * embedding_dim + offsets,
+            mask=mask,
+            other=0.0,
+        ).to(tl.bfloat16)
     tl.store(
         output_ptr + row_id * embedding_dim + offsets,
         tl.where(in_range, values, 0.0),
@@ -1043,6 +1079,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                 tp_vocab_start=self.shard_indices.org_vocab_start_index,
                 tp_vocab_end=self.shard_indices.org_vocab_end_index,
                 is_fp8=self.weight.dtype == torch.float8_e4m3fn,
+                fp8_native=_fp8_e4m3_ptr_supported(),
                 BLOCK_D=self._block_d,
             )
         return output
