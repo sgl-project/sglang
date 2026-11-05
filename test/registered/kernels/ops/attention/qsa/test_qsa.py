@@ -633,6 +633,51 @@ def test_sharded_qsa_pool_is_not_fused_eligible():
     assert not QwenSparseAttnBackend._supports_fused_kv_pool(pool)
 
 
+def test_distributed_decode_scores_local_candidates(monkeypatch):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+
+    import sglang.kernels.ops.attention.fast_topk as fast_topk_module
+
+    captured = {}
+
+    def fake_decode(*args, min_scored_len=0, **kwargs):
+        captured["min_scored_len"] = min_scored_len
+        return torch.zeros((1, 512), dtype=torch.float32, device="cuda")
+
+    monkeypatch.setattr(qsa_indexer_module, "qsa_mqa_decode", fake_decode)
+    monkeypatch.setattr(
+        fast_topk_module,
+        "fast_topk",
+        lambda logits, lengths, **kwargs: torch.arange(
+            512, dtype=torch.int32, device=logits.device
+        ).unsqueeze(0),
+    )
+    monkeypatch.setattr(
+        QSAIndexer,
+        "_maybe_merge_distributed_topk",
+        lambda self, logits, local_indices, *args, **kwargs: local_indices,
+    )
+    indexer = QSAIndexer.__new__(QSAIndexer)
+    indexer.block_topk = 512
+    indexer.compress_ratio = 4
+    indexer.token_topk = 2048
+    indexer.distributed_topk_group = object()
+
+    indexer.select_decode_tokens(
+        q=torch.zeros((1, 1, 128), dtype=torch.bfloat16, device="cuda"),
+        compressed_cache=torch.empty(0, device="cuda"),
+        compressed_page_table=torch.empty(0, device="cuda"),
+        compressed_lengths=torch.tensor([256], dtype=torch.int32, device="cuda"),
+        max_model_len=512,
+        query_positions=torch.tensor([0], dtype=torch.int32, device="cuda"),
+        sequence_lengths=torch.tensor([1024], dtype=torch.int32, device="cuda"),
+        defer_expansion=True,
+    )
+
+    assert captured["min_scored_len"] == 0
+
+
 def test_qsa_cuda_extend_ignores_dp_attention_padding(monkeypatch):
     if not torch.cuda.is_available():
         return
