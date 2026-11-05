@@ -14,7 +14,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cuda_ci(
     est_time=15,
     stage="base-b-kernel-unit",
-    runner_config="1-gpu-large",
+    runner_config="1-gpu-small",
 )
 
 
