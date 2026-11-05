@@ -56,7 +56,7 @@ class TestGemma4GraphMetadata(unittest.TestCase):
         backend.device = "cpu"
         backend.dllm_block_size = 4
         backend.sliding_window_size = 6
-        backend.kv_index_translator = _ReadStream()
+        backend.runner_ids = _ReadStream()
         backend.token_to_kv_pool = None
         backend.kv_indptr = torch.zeros(4, dtype=torch.int32)
         backend.qo_indptr = torch.zeros(4, dtype=torch.int32)

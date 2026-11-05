@@ -15,13 +15,9 @@ from sglang.kernels.ops.kvcache.kv_read_table import build_kv_read_table
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.kv.alloc.band import Band
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
-from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
-from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec
+from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec, MHAView
+from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec, MLAView
 from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
-from sglang.srt.mem_cache.unified_memory_pool import (
-    UnifiedMHATokenToKVPool,
-    UnifiedMLATokenToKVPool,
-)
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.unified_allocator_fixtures import build_test_unified_pools
@@ -60,7 +56,7 @@ def _build(device, page_size=1):
         enable_memory_saver=False,
         page_size=page_size,
     )
-    kvcache = UnifiedMLATokenToKVPool(
+    kvcache = MLAView(
         arena=buf,
         spec=buf.spec("full"),
         kv_cache_dtype=torch.bfloat16,
@@ -103,8 +99,11 @@ def _build_mha(device, page_size=8):
         enable_memory_saver=False,
         page_size=page_size,
     )
-    kvcache = UnifiedMHATokenToKVPool(
-        arena=buf, spec=buf.spec("full"), page_size=page_size
+    kvcache = MHAView(
+        arena=buf,
+        spec=buf.spec("full"),
+        page_size=page_size,
+        model_layer_ids=tuple(range(buf.spec("full").layer_num)),
     )
     allocator = Band(
         arena=buf,
@@ -155,11 +154,17 @@ def _build_tri(device, page_size=4):
         page_size=page_size,
     )
     kvcache = SimpleNamespace(
-        full_kv_pool=UnifiedMHATokenToKVPool(
-            arena=buf, spec=buf.spec("full"), page_size=page_size
+        full_kv_pool=MHAView(
+            arena=buf,
+            spec=buf.spec("full"),
+            page_size=page_size,
+            model_layer_ids=tuple(range(buf.spec("full").layer_num)),
         ),
-        swa_kv_pool=UnifiedMHATokenToKVPool(
-            arena=buf, spec=buf.spec("swa"), page_size=page_size
+        swa_kv_pool=MHAView(
+            arena=buf,
+            spec=buf.spec("swa"),
+            page_size=page_size,
+            model_layer_ids=tuple(range(buf.spec("swa").layer_num)),
         ),
         attach_allocators=lambda **_: None,
     )
@@ -219,8 +224,8 @@ class TestUnifiedHandoutZeroing(unittest.TestCase):
         buf.raw.view(torch.int16).fill_(BF16_NAN)
 
     def _env(self, buf, kvcache):
-        return buf.raw[: kvcache._num_pages * kvcache._page_bytes].view(
-            kvcache._num_pages, kvcache._page_bytes
+        return buf.raw[: kvcache.num_pages * kvcache.page_bytes].view(
+            kvcache.num_pages, kvcache.page_bytes
         )
 
     def _phys_pages(self, allocator, virt_tokens):
@@ -252,7 +257,7 @@ class TestUnifiedHandoutZeroing(unittest.TestCase):
         self.assertTrue((env[pages2] == 0).all().item())
 
     def test_zeroing_keys_on_pool_type(self):
-        # UnifiedMLATokenToKVPool has NaN-unsafe partial-page reads whatever
+        # The MLA view has NaN-unsafe partial-page reads whatever
         # its geometry; zeroing must key on the pool type, not on any
         # id-space scale.
         buf, kvcache, allocator = self.build("cuda")
@@ -282,8 +287,8 @@ class TestTriPoolSWAHandoutZeroing(unittest.TestCase):
         buf, swa, allocator = _build_tri("cuda")
         sa = allocator.swa_attn_allocator
         self.assertTrue(sa._zero_pages_on_alloc)
-        env = buf.raw[: swa._num_pages * swa._page_bytes].view(
-            swa._num_pages, swa._page_bytes
+        env = buf.raw[: swa.num_pages * swa.page_bytes].view(
+            swa.num_pages, swa.page_bytes
         )
         for _ in range(2):  # fresh, then recycled
             buf.raw.view(torch.int16).fill_(BF16_NAN)

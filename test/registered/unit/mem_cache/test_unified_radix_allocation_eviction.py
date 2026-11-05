@@ -17,6 +17,7 @@ from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.tree_slots import index_slots
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -27,6 +28,7 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
         cache = object.__new__(UnifiedRadixCache)
         cache.disable = False
         cache.tree_components = (ComponentType.FULL, ComponentType.MAMBA)
+        index_slots(cache, cache.tree_components)
         cache.is_swa_enabled = False
         cache.cache_controller = None
         cache.metrics_collector = None
@@ -71,6 +73,7 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
             if tri_pool
             else (ComponentType.FULL, ComponentType.MAMBA)
         )
+        index_slots(cache, cache.tree_components)
         cache.is_swa_enabled = tri_pool
         cache.cache_controller = None
         cache.metrics_collector = None
@@ -167,6 +170,7 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
         cache = object.__new__(UnifiedRadixCache)
         cache.disable = False
         cache.tree_components = (ComponentType.FULL, ComponentType.MAMBA)
+        index_slots(cache, cache.tree_components)
         cache.is_swa_enabled = False
         cache.cache_controller = None
         cache.metrics_collector = None

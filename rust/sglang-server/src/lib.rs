@@ -32,7 +32,7 @@ pub use multi_modality::encoded::{
     MRope, MmEncodedEntry, MmEncodedItem, MmMetaValue, MmModality, MmTokenIds,
 };
 pub use multi_modality::payload::{ResolvedMediaWork, resolve_media_work};
-pub use multi_modality::worker::{MediaError, MmProcessOutput, MmProcessor};
+pub use multi_modality::worker::{MediaError, MmProcessOutput, MmProcessor, MmRequestInfo};
 pub use sglang_mm::common::fetch::ByteBudget as MediaByteBudget;
 pub use sglang_mm::pipeline::{Tensor, TensorData};
 

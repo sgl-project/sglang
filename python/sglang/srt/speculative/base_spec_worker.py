@@ -194,7 +194,7 @@ class BaseSpecWorker(ABC):
         if not draft_runners:
             return None
         # A fused draft's KV lives in the target's pool: it has none of its own.
-        if draft_runners[0].kv_index_translator.is_fused_draft:
+        if draft_runners[0].runner_ids.is_fused_draft:
             return None
         return draft_runners[0].token_to_kv_pool
 
@@ -281,7 +281,7 @@ class BaseSpecWorker(ABC):
         if not draft_runners:
             return HiCacheDraftPlan()
         draft_pools = tuple(runner.token_to_kv_pool for runner in draft_runners)
-        if any(runner.kv_index_translator.is_fused_draft for runner in draft_runners):
+        if any(runner.runner_ids.is_fused_draft for runner in draft_runners):
             from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
                 validate_fused_hicache_draft,
             )

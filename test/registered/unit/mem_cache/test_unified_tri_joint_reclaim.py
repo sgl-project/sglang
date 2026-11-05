@@ -29,6 +29,7 @@ from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import reset_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.tree_slots import tree_slots_of
 from sglang.test.unified_allocator_fixtures import (
     build_test_unified_pools,
     build_tri_cache,
@@ -528,7 +529,9 @@ class TestTriJointReclaim(CustomTestCase):
                             token_to_kv_pool_allocator=allocator,
                             page_size=1,
                             sliding_window_size=128,
-                            tree_components=(ComponentType.FULL, ComponentType.SWA),
+                            tree_slots=tree_slots_of(
+                                (ComponentType.FULL, ComponentType.SWA), window=128
+                            ),
                         )
                     )
                     slots = allocator.alloc(4)

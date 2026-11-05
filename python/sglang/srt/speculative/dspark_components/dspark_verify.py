@@ -320,7 +320,7 @@ class TargetVerifyExecutor:
             custom_mask=None,
             capture_hidden_mode=CaptureHiddenMode.FULL,
             live_seq_lens_cpu=batch.seq_lens_cpu,
-            kv_loc_plan=verify_window.kv_loc_plan,
+            iteration_ids=verify_window.iteration_ids,
         )
         batch.out_cache_loc = verify_cache_loc
         seq_lens_cpu_backup = batch.seq_lens_cpu
@@ -397,7 +397,7 @@ class TargetVerifyExecutor:
                 hidden_strided=hidden_strided,
                 commit_lens=commit_lens,
                 bs=bs,
-                kv_loc_plan=verify_window.kv_loc_plan,
+                iteration_ids=verify_window.iteration_ids,
             )
             return
         hidden = logits_output.hidden_states
@@ -414,7 +414,7 @@ class TargetVerifyExecutor:
             state_slot = (
                 batch.req_pool_indices[:bs].view(-1, 1).expand(bs, vlen).reshape(-1)
             )
-        cache_loc = self.kv_injector.ids_for(verify_window.kv_loc_plan)
+        cache_loc = self.kv_injector.ids_for(verify_window.iteration_ids)
         self.kv_injector.inject_target_hidden(
             target_hidden=hidden.reshape(-1, hidden.shape[-1]),
             cache_loc=cache_loc,
@@ -431,7 +431,7 @@ class TargetVerifyExecutor:
         layout: RaggedVerifyLayout,
         ragged_window: RaggedVerifyWindow,
         sampling_info,
-        kv_loc_plan,
+        iteration_ids,
     ) -> TargetVerifyResult:
         verify_input = DFlashVerifyInput(
             draft_token=ragged_window.verify_ids,
@@ -442,8 +442,8 @@ class TargetVerifyExecutor:
             ragged_verify_layout=layout,
             live_seq_lens_cpu=batch.seq_lens_cpu,
             # The packed rows are a selection of the planned verify window.
-            kv_loc_plan=kv_loc_plan,
-            kv_loc_cols=ragged_window.window_index,
+            iteration_ids=iteration_ids,
+            iteration_cols=ragged_window.window_index,
         )
         batch.out_cache_loc = ragged_window.verify_cache_loc
         seq_lens_cpu_backup = batch.seq_lens_cpu
@@ -496,7 +496,7 @@ class TargetVerifyExecutor:
             layout=layout,
             ragged_window=ragged_window,
             sampling_info=sampling_info,
-            kv_loc_plan=verify_window.kv_loc_plan,
+            iteration_ids=verify_window.iteration_ids,
         )
         logits_output = target_verify.logits_output
 

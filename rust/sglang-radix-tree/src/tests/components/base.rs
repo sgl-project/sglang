@@ -1,6 +1,8 @@
 use super::*;
 use crate::cache_action::{CacheAction, MambaEvictExcessPathStates};
-use crate::components::{FULL, FullComponent, MAMBA, MambaComponent, SWA, SwaComponent};
+use crate::components::{
+    FULL, Family, FullComponent, MAMBA, MambaComponent, SWA, SwaComponent, native_family,
+};
 use crate::test_utils::expect_action;
 use crate::unified_tree_core::CacheInitParams;
 use std::sync::{Arc, Mutex};
@@ -25,6 +27,10 @@ impl Default for DefaultComponentForTest {
 impl TreeComponent<Vec<i64>> for DefaultComponentForTest {
     fn component_type(&self) -> ComponentType {
         self.component_type
+    }
+
+    fn family(&self) -> Family {
+        native_family(self.component_type())
     }
 
     fn reclaimable_value_len(&self, node: &Node<Vec<i64>>) -> usize {

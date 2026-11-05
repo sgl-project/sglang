@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
-    from sglang.srt.mem_cache.kv_loc_plan import KVLocPlan
+    from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
@@ -129,7 +129,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             or forward_mode.is_draft_extend_v2()
         ):
             self._apply_decode_target_verify_metadata(
-                plan=forward_batch.kv_loc_plan,
+                plan=forward_batch.iteration_ids,
                 bs=forward_batch.batch_size,
                 req_pool_indices=forward_batch.req_pool_indices,
                 seq_lens=forward_batch.seq_lens,
@@ -168,10 +168,10 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         if forward_batch.forward_mode.is_decode_or_idle():
             max_seqlen_pad = triton.cdiv(eager_max_k, PAGE_SIZE)
             block_kv_indices = self._eager_block_kv_indices(bs, max_seqlen_pad)
-            if self.kv_index_translator.reads_are_translated:
+            if self.runner_ids.reads_are_translated:
                 assert self.page_size == PAGE_SIZE
-                self.kv_index_translator.copy_page_table(
-                    forward_batch.kv_loc_plan, out=block_kv_indices
+                self.runner_ids.copy_page_table(
+                    forward_batch.iteration_ids, out=block_kv_indices
                 )
             else:
                 create_flashmla_kv_indices_triton[
@@ -201,10 +201,10 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
 
             max_seqlen_pad = triton.cdiv(eager_max_k + self.num_draft_tokens, PAGE_SIZE)
             block_kv_indices = self._eager_block_kv_indices(bs, max_seqlen_pad)
-            if self.kv_index_translator.reads_are_translated:
+            if self.runner_ids.reads_are_translated:
                 assert self.page_size == PAGE_SIZE
-                self.kv_index_translator.copy_page_table(
-                    forward_batch.kv_loc_plan, out=block_kv_indices
+                self.runner_ids.copy_page_table(
+                    forward_batch.iteration_ids, out=block_kv_indices
                 )
             else:
                 create_flashmla_kv_indices_triton[
@@ -239,10 +239,10 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
 
             max_seqlen_pad = triton.cdiv(eager_max_k + window, PAGE_SIZE)
             block_kv_indices = self._eager_block_kv_indices(bs, max_seqlen_pad)
-            if self.kv_index_translator.reads_are_translated:
+            if self.runner_ids.reads_are_translated:
                 assert self.page_size == PAGE_SIZE
-                self.kv_index_translator.copy_page_table(
-                    forward_batch.kv_loc_plan, out=block_kv_indices
+                self.runner_ids.copy_page_table(
+                    forward_batch.iteration_ids, out=block_kv_indices
                 )
             else:
                 create_flashmla_kv_indices_triton[
@@ -327,7 +327,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
 
     def _apply_decode_target_verify_metadata(
         self,
-        plan: KVLocPlan,
+        plan: IterationIds,
         bs: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
@@ -353,10 +353,10 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             else:
                 max_seqlen_pad = self.cuda_graph_kv_indices.shape[1]
 
-            if self.kv_index_translator.reads_are_translated:
+            if self.runner_ids.reads_are_translated:
                 assert self.page_size == PAGE_SIZE
                 # The plan's table reaches a verify's draft tail.
-                self.kv_index_translator.copy_page_table(
+                self.runner_ids.copy_page_table(
                     plan, out=self.cuda_graph_kv_indices[:bs]
                 )
             else:
@@ -444,14 +444,14 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         if k is not None:
             assert v is not None
             if save_kv_cache:
-                self.token_to_kv_pool.set_kv_buffer(
+                self.kv_layers.layer(layer.layer_id).store(
                     layer,
                     KVWriteLoc.for_batch(forward_batch),
                     k,
                     v,
                 )
         bs = forward_batch.batch_size
-        k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        k_cache = self.kv_layers.read(layer.layer_id).key()
 
         reshape_q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
         if self.is_fp8_kvcache:
@@ -528,12 +528,12 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             if k is not None:
                 assert v is not None
                 if save_kv_cache:
-                    self.token_to_kv_pool.set_kv_buffer(
+                    self.kv_layers.layer(layer.layer_id).store(
                         layer, KVWriteLoc.for_batch(forward_batch), k, v
                     )
 
             bs = forward_batch.batch_size
-            k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+            k_cache = self.kv_layers.read(layer.layer_id).key()
 
             if forward_batch.forward_mode.is_draft_extend_v2():
                 # prepare_for_draft_extend always emits the fixed q window.
@@ -611,7 +611,7 @@ class FlashMLAMultiStepDraftBackend:
             )
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
-        self.kv_index_translator = model_runner.kv_index_translator
+        self.runner_ids = model_runner.runner_ids
         max_bs = model_runner.req_to_token_pool.size * self.topk
         self.kv_indptr = torch.zeros(
             (

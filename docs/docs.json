@@ -955,6 +955,7 @@
               "docs/advanced_features/reasoning_aware_compression",
               "docs/advanced_features/dp_dpa_smg_guide",
               "docs/advanced_features/prefill_cp",
+              "docs/advanced_features/kv_cache_sharing",
               "docs/advanced_features/dcp",
               "docs/advanced_features/expert_parallelism",
               "docs/advanced_features/paged_experts",

@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
@@ -74,7 +75,7 @@ class TestHiCacheAutoSize(CustomTestCase):
         )
         params = CacheInitParams(
             disable=False,
-            req_to_token_pool=None,
+            req_to_token_pool=SimpleNamespace(holds_state_slots=False),
             token_to_kv_pool_allocator=Mock(
                 get_kvcache=Mock(return_value=target), storage=None
             ),
@@ -130,7 +131,7 @@ class TestHiCacheAutoSize(CustomTestCase):
         )
         params = CacheInitParams(
             disable=False,
-            req_to_token_pool=None,
+            req_to_token_pool=SimpleNamespace(holds_state_slots=False),
             token_to_kv_pool_allocator=Mock(
                 get_kvcache=Mock(return_value=target), storage=None
             ),
@@ -153,7 +154,7 @@ class TestHiCacheAutoSize(CustomTestCase):
         )
         params = CacheInitParams(
             disable=False,
-            req_to_token_pool=None,
+            req_to_token_pool=SimpleNamespace(holds_state_slots=False),
             token_to_kv_pool_allocator=Mock(
                 get_kvcache=Mock(return_value=pool), storage=None
             ),

@@ -29,6 +29,7 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.tree_slots import slot_of, tree_slots_of
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -73,14 +74,21 @@ def real_tree_core(backend):
         req_to_token_pool=None,
         token_to_kv_pool_allocator=None,
         page_size=1,
-        tree_components=(ComponentType.FULL,),
+        tree_slots=tree_slots_of((ComponentType.FULL,)),
     )
     if backend == "rust":
         from sglang.srt.mem_cache.rust_tree_core.adapter import RustUnifiedTreeCore
 
         return RustUnifiedTreeCore(params)
     cache = SimpleNamespace(enable_session_radix_cache=False)
-    return UnifiedTreeCore(params, {ComponentType.FULL: FullComponent(cache, params)})
+    return UnifiedTreeCore(
+        params,
+        {
+            ComponentType.FULL: FullComponent(
+                cache, params, slot_of(params, ComponentType.FULL)
+            )
+        },
+    )
 
 
 def pump_insert(core, key):

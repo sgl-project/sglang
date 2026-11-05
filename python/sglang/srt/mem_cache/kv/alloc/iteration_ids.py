@@ -24,8 +24,8 @@ forwards are in flight. So:
     full-attention ids when the plan is built, another sub-pool's on first
     use (`write_ids`), or both by the producer's fused gather. Every writer
     binds them.
-  * A read is translated exactly once, only by the translator's read
-    primitives (`KVIndexTranslator`); a consumer never translates.
+  * A read is translated exactly once, only by the `RunnerIds`' read
+    primitives (`RunnerIds`); a consumer never translates.
   * The read table (`read_table`) exists only once a table reader asks for
     it, built into that reader's own capture-stable table when it is the
     first. Later readers take it; earlier ones translate in their own gather.
@@ -48,9 +48,9 @@ import torch
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
 
 if TYPE_CHECKING:
-    from sglang.srt.mem_cache.kv_index_translator import (
-        KVIndexTable,
-        KVIndexTranslator,
+    from sglang.srt.mem_cache.kv.alloc.runner_ids import (
+        ReadTable,
+        RunnerIds,
     )
 
 
@@ -94,13 +94,13 @@ def pad_with_sink(ids: Optional[torch.Tensor], n: int) -> Optional[torch.Tensor]
     return padded
 
 
-class KVLocPlan:
+class IterationIds:
     """The ids of one iteration, in every sub-pool, each computed once."""
 
     def __init__(
         self,
         *,
-        source: KVIndexTranslator,
+        source: RunnerIds,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         seq_lens_cpu: Optional[torch.Tensor],
@@ -136,17 +136,17 @@ class KVLocPlan:
                 assert ids.shape == write_virtual.shape
                 self._write_ids[space.key] = ids
         self.write_physical = self.write_ids(source)
-        self._read_tables: Dict[Hashable, KVIndexTable] = {}
+        self._read_tables: Dict[Hashable, ReadTable] = {}
 
     # -- writes ----------------------------------------------------------------
 
-    def bind(self, batch, reader: KVIndexTranslator, *, cols: Optional[Cols] = None):
+    def bind(self, batch, reader: RunnerIds, *, cols: Optional[Cols] = None):
         """Give ``batch`` (a ForwardBatch or a stand-in) this plan, the part of
         the window it writes (``cols``), and its full-attention write ids in
         `reader`'s pool. The one way a forward gets its write ids; another
-        sub-pool's come from `KVIndexTranslator.write_ids`."""
-        batch.kv_loc_plan = self
-        batch.kv_loc_cols = cols
+        sub-pool's come from `RunnerIds.write_ids`."""
+        batch.iteration_ids = self
+        batch.iteration_cols = cols
         batch.out_cache_loc = self.write_ids(reader, cols=cols)
         batch.out_cache_loc_virtual = (
             self.virtual_write_ids(cols=cols)
@@ -155,7 +155,7 @@ class KVLocPlan:
         )
         batch.out_cache_loc_is_physical = batch.out_cache_loc is not None
 
-    def bind_replay(self, batch, reader: KVIndexTranslator, *, slots: torch.Tensor):
+    def bind_replay(self, batch, reader: RunnerIds, *, slots: torch.Tensor):
         """`bind`, for the batch a captured graph replays this iteration's
         forward with. Its write ids are ``slots``, the runner's capture-stable
         buffer that already holds this plan's write ids and names the sink past
@@ -166,7 +166,7 @@ class KVLocPlan:
 
     def write_ids(
         self,
-        reader: KVIndexTranslator,
+        reader: RunnerIds,
         *,
         kind: IdSpaceKind = IdSpaceKind.FULL,
         cols: Optional[Cols] = None,
@@ -237,17 +237,17 @@ class KVLocPlan:
 
     def reads_from(
         self,
-        source: KVIndexTranslator,
+        source: RunnerIds,
         *,
         seq_lens: torch.Tensor,
         seq_lens_cpu: Optional[torch.Tensor],
         read_extent: int,
-    ) -> KVLocPlan:
+    ) -> IterationIds:
         """This plan's write ids, with reads planned over ``source``'s own
         `req_to_token` rows and lengths -- a draft that reads a compact table
         of its own while writing the iteration's window. The write ids are
         shared, not translated again."""
-        plan = KVLocPlan(
+        plan = IterationIds(
             source=source,
             req_pool_indices=self.req_pool_indices,
             seq_lens=seq_lens,
@@ -266,7 +266,7 @@ class KVLocPlan:
         self,
         kind: IdSpaceKind = IdSpaceKind.FULL,
         *,
-        reader: Optional[KVIndexTranslator] = None,
+        reader: Optional[RunnerIds] = None,
     ) -> bool:
         """Whether a reader has had the ``kind`` table built yet."""
         return self._read_space(kind, reader).key in self._read_tables
@@ -277,8 +277,8 @@ class KVLocPlan:
         kind: IdSpaceKind = IdSpaceKind.FULL,
         rows: Optional[int] = None,
         into: Optional[torch.Tensor] = None,
-        reader: Optional[KVIndexTranslator] = None,
-    ) -> KVIndexTable:
+        reader: Optional[RunnerIds] = None,
+    ) -> ReadTable:
         """The ``kind`` page table over ``[0, seq_lens + read_extent)``, built
         when a table reader first asks (in place in ``into``, that reader's
         capture-stable table, when given) and shared by every later reader.
@@ -306,14 +306,12 @@ class KVLocPlan:
             )
         return table
 
-    def _read_space(
-        self, kind: IdSpaceKind, reader: Optional[KVIndexTranslator]
-    ) -> IdSpace:
+    def _read_space(self, kind: IdSpaceKind, reader: Optional[RunnerIds]) -> IdSpace:
         # A later depth of a multi-layer draft can route window layers that
         # the depth whose runner built the plan does not.
         return (self._source if reader is None else reader).space(kind)
 
-    def is_read_by(self, reader: KVIndexTranslator) -> bool:
+    def is_read_by(self, reader: RunnerIds) -> bool:
         """Whether `reader` reads this plan's tables: it indexes the plan's
         physical ids and gathers the same `req_to_token` rows. A reader with a
         table of its own (a draft's compact `req_to_token`) plans its own
@@ -323,7 +321,7 @@ class KVLocPlan:
             and reader.req_to_token is self._source.req_to_token
         )
 
-    def is_translated_for(self, reader: KVIndexTranslator) -> bool:
+    def is_translated_for(self, reader: RunnerIds) -> bool:
         """Whether `reader`'s pool indexes this plan's physical ids: the
         target's, and a fused draft's, which lives in the target's full
         sub-pool. A pass-through reader (a static pool, a private draft pool)

@@ -287,6 +287,7 @@ def _init_cuda_graph_replay_metadata(backend, capture_batch_size: int, batch):
     fb_view = SimpleNamespace(
         batch_size=capture_batch_size,
         forward_mode=batch.forward_mode,
+        ragged_verify_layout=None,
         actual_forward_mode=batch.forward_mode,
         input_ids=batch.input_ids,
         positions=getattr(batch, "positions", None),
@@ -297,8 +298,8 @@ def _init_cuda_graph_replay_metadata(backend, capture_batch_size: int, batch):
         encoder_lens=batch.encoder_lens,
         extend_seq_lens=getattr(batch, "extend_seq_lens", None),
         out_cache_loc=getattr(batch, "out_cache_loc", None),
-        kv_loc_plan=batch.kv_loc_plan,
-        kv_loc_cols=batch.kv_loc_cols,
+        iteration_ids=batch.iteration_ids,
+        iteration_cols=batch.iteration_cols,
         spec_info=batch.spec_info,
     )
     backend.init_forward_metadata_out_graph(fb_view)

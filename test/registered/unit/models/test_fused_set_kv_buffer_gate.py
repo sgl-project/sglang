@@ -43,11 +43,13 @@ def _static_window_pool():
     views = {
         IdSpaceKind.SLIDING_WINDOW: SimpleNamespace(requires_physical_write_loc=False)
     }
+    buffer = torch.zeros(_FULL_TO_SWA.numel(), _HEADS, _DIM)
+    layer_kv = SimpleNamespace(key=lambda: buffer, value=lambda: buffer)
     router = SimpleNamespace(
         sub_pool=lambda name: window if name == window.name else None,
         view=lambda name: views[name],
+        read=lambda layer_id: layer_kv,
     )
-    buffer = torch.zeros(_FULL_TO_SWA.numel(), _HEADS, _DIM)
     return SimpleNamespace(
         layer_router=router,
         page_size=_PAGE,
@@ -76,6 +78,7 @@ def _hip_write_slots(pool, layer, out_cache_loc):
     with (
         patch.object(model_utils, "_is_hip", True),
         patch.object(model_utils, "get_token_to_kv_pool", return_value=pool),
+        patch.object(model_utils, "get_kv_layers", return_value=pool.layer_router),
     ):
         arg = model_utils.create_fused_set_kv_buffer_arg(
             torch.zeros(out_cache_loc.numel(), _HEADS * _DIM),

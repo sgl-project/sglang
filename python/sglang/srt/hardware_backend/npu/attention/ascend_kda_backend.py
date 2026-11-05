@@ -353,7 +353,7 @@ class AscendKDAAttnBackend(KDAAttnBackend):
         draft_token_num = forward_batch.spec_info.draft_token_num
         batch_size = query_start_loc.shape[0] - 1
         num_dense_tokens = batch_size * draft_token_num
-        ragged_layout = forward_batch.spec_info.ragged_verify_layout
+        ragged_layout = forward_batch.ragged_verify_layout
         if ragged_layout is None and seq_len == num_dense_tokens:
             dense_token_indices = None
             dense_qkv = mixed_qkv.view(batch_size, draft_token_num, -1)

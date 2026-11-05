@@ -381,12 +381,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             if not broadcaster.is_src:
                 for layer in range(self.num_layers):
                     self.layer_done_counter.complete(counter_index, layer)
-        ready_event = device_module.Event()
-        ready_event.record()
+        ready = self.record_transfer_ready()
         if broadcaster is not None:
-            self.broadcast_loads[counter_index] = (0, prepared, ready_event)
+            self.broadcast_loads[counter_index] = (0, prepared, ready)
         if broadcaster is None or broadcaster.is_src:
-            self.load_queue.put((counter_index, pending, ready_event, queued_at))
+            self.load_queue.put((counter_index, pending, ready, queued_at))
         self.stats["load"] += len(pending)
         return counter_index
 
@@ -394,9 +393,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         batch = self.broadcast_loads.get(index)
         if batch is None:
             return
-        first, prepared, ready_event = batch
+        first, prepared, ready = batch
         if first == 0:
-            device_module.current_stream().wait_event(ready_event)
+            ready.wait(device_module.current_stream())
         # KV access may wait several times per layer, or skip sparse layers.
         # Launch each broadcast exactly once, in order, on the forward stream.
         for layer in range(first, threshold + 1):
@@ -407,7 +406,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             self.broadcast_loads[index] = (
                 max(first, threshold + 1),
                 prepared,
-                ready_event,
+                ready,
             )
 
     def load_thread_func(self) -> None:
@@ -416,9 +415,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             try:
                 if task is None:
                     return
-                counter_index, pending, ready_event, queued_at = task
+                counter_index, pending, ready, queued_at = task
                 try:
-                    ready_event.synchronize()
+                    ready.synchronize()
                     self.load_layer_wise(
                         counter_index,
                         list(pending.values()),
@@ -593,8 +592,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             return True
         kv = next(transfer for transfer in transfers if transfer.name == PoolName.KV)
         tokens = len(kv.keys) * self.page_size
-        ready_events = self.record_offload_ready()
-        self.offload_queue.put((expanded, tokens, ready_events, session_id))
+        ready = self.record_transfer_ready()
+        self.offload_queue.put((expanded, tokens, ready, session_id))
         return True
 
     def offload_thread_func(self) -> None:
@@ -603,9 +602,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             try:
                 if task is None:
                     return
-                expanded, tokens, ready_events, session_id = task
-                for event in ready_events:
-                    event.synchronize()
+                expanded, tokens, ready, session_id = task
+                ready.synchronize()
                 extra_info = (
                     HiCacheStorageExtraInfo(extra_info={"session_id": session_id})
                     if session_id

@@ -37,9 +37,15 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     build_host_pool_group,
     build_hybrid_swa_group,
     build_unified_host_stack,
+    validate_fused_hicache_draft,
 )
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
+from sglang.srt.mem_cache.kv.layout.mha import DraftMHAView
 from sglang.srt.mem_cache.kv.router import PlainPoolRouter
+from sglang.srt.mem_cache.layout.fused_draft import (
+    DenseDraftRegion,
+    FusedDraftPlacement,
+)
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
     HybridLinearKVPool,
@@ -1293,7 +1299,7 @@ class TestTransferLayerSpan(CustomTestCase):
         )
 
 
-def _build_unified_swa_pool(page_size: int = 4):
+def _build_unified_swa_pool(page_size: int = 4, *, fused_draft=None):
     return build_test_unified_pools(
         device="cpu",
         kv_cache_dtype=torch.float16,
@@ -1312,6 +1318,7 @@ def _build_unified_swa_pool(page_size: int = 4):
         enable_memory_saver=False,
         need_sort=False,
         lazy_compaction=True,
+        fused_draft=fused_draft,
     )
 
 
@@ -1326,6 +1333,31 @@ def _build_unified_host_pair(bundle):
         pin_memory=False,
         allocator_type="default",
     )
+
+
+class TestFusedDraftHiCacheValidation(CustomTestCase):
+    def test_fused_draft_binding_uses_its_host_sub_pool(self):
+        """A bound full draft passes HiCache admission; a window draft is refused."""
+        region = DenseDraftRegion(
+            lane_num=1, head_num=2, head_dim=4, store_dtype=torch.float16
+        )
+        for host in ("full", "swa"):
+            with self.subTest(host=host):
+                placement = FusedDraftPlacement.from_counts(
+                    counts={host: [1]}, regions={host: region}
+                )
+                bundle = _build_unified_swa_pool(fused_draft=placement)
+                draft = DraftMHAView(
+                    arena=bundle.arena,
+                    host_spec=bundle.storage.plan.sub_pool(host).spec,
+                    layer_lanes={0: 0},
+                    page_size=bundle.token_to_kv_pool.page_size,
+                )
+                if host == "full":
+                    validate_fused_hicache_draft(draft_device_pools=(draft,))
+                else:
+                    with self.assertRaisesRegex(NotImplementedError, "full-attention"):
+                        validate_fused_hicache_draft(draft_device_pools=(draft,))
 
 
 class TestUnifiedPageEnvelopeHostPool(CustomTestCase):

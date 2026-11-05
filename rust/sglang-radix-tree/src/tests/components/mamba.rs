@@ -161,7 +161,7 @@ fn lru_order(lru: &UnifiedLRUList) -> Vec<NodeIdx_> {
 }
 
 #[test]
-#[should_panic(expected = "get_or_fill_uuid is unsupported for Mamba")]
+#[should_panic(expected = "get_or_fill_uuid is unsupported for state slots")]
 fn get_or_fill_uuid_rejects_mamba() {
     let mut tc = mamba_core(/* page_size = */ 1);
     let [node] = chain::<1>(&mut tc);

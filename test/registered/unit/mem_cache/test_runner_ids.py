@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""KVIndexTranslator -- what a runner reads and writes an iteration's plan
+"""RunnerIds -- what a runner reads and writes an iteration's plan
 through: the plan's read table and write ids per disposition, the readers
 (`read_source`, `pack_read_stream`, `copy_page_table`), and the boot-time
 dispositions.
@@ -35,8 +35,8 @@ from test_multi_ended_allocator import _FakeKVCache, _FakeUnifiedSWAKVPool
 
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
+from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
-from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.state_capturer.base import BaseTopkCapturer
 from sglang.test.test_utils import CustomTestCase
@@ -102,7 +102,7 @@ def _make_source(allocator, req_to_token, ps):
     """The owning runner's source: its token_to_kv_pool IS the allocator's own
     kvcache. (A runner can share the allocator while owning a different pool --
     see TestPoolOwnership.)"""
-    return KVIndexTranslator(
+    return RunnerIds(
         req_to_token=req_to_token,
         token_to_kv_pool_allocator=allocator,
         token_to_kv_pool=allocator.get_kvcache(),
@@ -318,7 +318,7 @@ class TestCopyPageTable(unittest.TestCase):
     def test_passthrough_source_refuses(self):
         """Callers dispatch on `reads_are_translated`; a passthrough source has
         no plan table to copy and must fail loud, not fill garbage."""
-        src = KVIndexTranslator(
+        src = RunnerIds(
             req_to_token=torch.zeros((2, 4), dtype=torch.int64),
             token_to_kv_pool_allocator=SimpleNamespace(hands_out_virtual_ids=False),
             token_to_kv_pool=SimpleNamespace(
@@ -379,7 +379,7 @@ class TestPoolOwnership(unittest.TestCase):
             bundle.token_to_kv_pool_allocator.get_kvcache(),
             bundle.token_to_kv_pool,
         )
-        src = KVIndexTranslator(
+        src = RunnerIds(
             req_to_token=torch.zeros((2, 8), dtype=torch.int32, device=_DEV),
             token_to_kv_pool_allocator=bundle.token_to_kv_pool_allocator,
             token_to_kv_pool=bundle.token_to_kv_pool,
@@ -396,7 +396,7 @@ class TestPoolOwnership(unittest.TestCase):
         own_pool = SimpleNamespace(
             id_spaces=_plain_id_spaces, requires_physical_write_loc=False
         )
-        src = KVIndexTranslator(
+        src = RunnerIds(
             req_to_token=req_to_token,
             token_to_kv_pool_allocator=alloc,
             token_to_kv_pool=own_pool,
@@ -411,7 +411,7 @@ class TestPoolOwnership(unittest.TestCase):
         identity exists to prevent."""
         alloc = _build_composite(ps=1)
         req_to_token = torch.arange(16, dtype=torch.int32, device=_DEV).view(2, 8)
-        src = KVIndexTranslator(
+        src = RunnerIds(
             req_to_token=req_to_token,
             token_to_kv_pool_allocator=alloc,
             token_to_kv_pool=SimpleNamespace(
@@ -658,7 +658,7 @@ class TestWriteIds(CustomTestCase):
         pool = SWAKVPool.__new__(SWAKVPool)
         pool.full_to_swa_index_mapping = torch.arange(10, dtype=torch.int64)
         pool.translate_loc_from_full_to_swa = lambda t: t + 100
-        src = KVIndexTranslator(
+        src = RunnerIds(
             req_to_token=torch.zeros((2, 4), dtype=torch.int64),
             token_to_kv_pool_allocator=SimpleNamespace(hands_out_virtual_ids=False),
             token_to_kv_pool=pool,
@@ -681,7 +681,7 @@ class TestWriteIds(CustomTestCase):
         )
         # Passthrough on a non-SWA pool: a loc is given, but there is no swa
         # id space to derive into.
-        plain = KVIndexTranslator(
+        plain = RunnerIds(
             req_to_token=torch.zeros((2, 4), dtype=torch.int64),
             token_to_kv_pool_allocator=SimpleNamespace(hands_out_virtual_ids=False),
             token_to_kv_pool=SimpleNamespace(

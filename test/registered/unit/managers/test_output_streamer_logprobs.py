@@ -80,6 +80,7 @@ def _make_accumulator(
         default_force_stream_interval=1,
         get_cached_tokens_details=lambda req: None,
         rust_server_mode=rust_server_mode,
+        enable_metrics=False,
         is_request_level_customized_info_key=lambda key: False,
         current_weight_version=None,
     )

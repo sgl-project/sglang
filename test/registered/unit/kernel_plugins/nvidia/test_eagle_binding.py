@@ -247,7 +247,7 @@ def _decode_forward_batch(committed, seq_lens):
         model_config=SimpleNamespace(
             requires_mm_token_modalities=False, model_is_mrope=False
         ),
-        kv_index_translator=SimpleNamespace(
+        runner_ids=SimpleNamespace(
             own_plan=lambda batch: SimpleNamespace(
                 bind=lambda batch, reader, cols=None: None
             )

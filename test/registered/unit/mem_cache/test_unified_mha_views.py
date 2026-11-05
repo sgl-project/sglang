@@ -27,18 +27,22 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache import memory_pool as mem_pool
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
-from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
+from sglang.srt.mem_cache.kv.layout.mha import DraftMHAView, MHASubPoolSpec, MHAView
+from sglang.srt.mem_cache.layout.fused_draft import (
+    DenseDraftRegion,
+    FusedDraftPlacement,
+)
 from sglang.srt.mem_cache.layout.paged_view import paged_view
 from sglang.srt.mem_cache.layout.token_major import ENTRY_ALIGN_BYTES, build_dense_views
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
-from sglang.srt.mem_cache.unified_memory_pool import (
-    UnifiedMHATokenToKVPool,
-)
+from sglang.test.test_utils import CustomTestCase
 
 _DEV = "cpu"
 # `set_kv_buffer` dispatches on the PLATFORM (memory_pool._is_cuda, resolved at
@@ -281,6 +285,14 @@ def _make_pool(ps=1, full_spec=None, device=_DEV):
         device=device,
         enable_memory_saver=False,
         page_size=ps,
+        fused_draft=(
+            FusedDraftPlacement.from_counts(
+                counts={"full": [full.draft_region.lane_num]},
+                regions={"full": full.draft_region},
+            )
+            if full.draft_region is not None
+            else None
+        ),
     )
 
 
@@ -314,15 +326,16 @@ def _layer(l):
 
 def _make_pool_and_kv(ps, device=_DEV):
     kv = _make_pool(ps=ps, device=device)
-    return kv, UnifiedMHATokenToKVPool(
+    return kv, MHAView(
         arena=kv,
         spec=kv.spec("full"),
         page_size=ps,
+        model_layer_ids=tuple(range(kv.spec("full").layer_num)),
         enable_alt_stream=False,
     )
 
 
-class TestUnifiedMHATokenToKVPool(unittest.TestCase):
+class TestMHAView(CustomTestCase):
     def test_size_is_slot_bound(self):
         """`size` drives BOTH the python OOB check and the store kernel's
         device-side size_limit; `size + page_size` must be the view row count."""
@@ -387,11 +400,88 @@ class TestUnifiedMHATokenToKVPool(unittest.TestCase):
             "envelope move did not relocate exactly the named pages",
         )
 
-    def test_prefix_valid_entry_point_fails_loud(self):
-        """Prefix-valid writes still assume token-major buffer indexing."""
-        _, pool = _make_pool_and_kv(1)
-        with self.assertRaises(NotImplementedError):
-            pool.set_kv_buffer_prefix_valid()
+    def test_prefix_valid_writes_preserve_other_arena_bytes(self):
+        """Prefix commits must reach fused draft rows and preserve every other byte;
+        the CPU path must retain physical locations through its masked write."""
+        region = DenseDraftRegion(
+            lane_num=2, head_num=_H, head_dim=_D, store_dtype=_DTYPE
+        )
+        spec = MHASubPoolSpec(
+            name="full",
+            layer_num=2,
+            head_num=_H,
+            head_dim=_D,
+            store_dtype=_DTYPE,
+            grow_direction="down",
+            draft_region=region,
+        )
+        for ps in (1, 4):
+            arena = _make_pool(ps, full_spec=spec)
+            views = (
+                MHAView(
+                    arena=arena,
+                    spec=spec,
+                    page_size=ps,
+                    model_layer_ids=(6, 7),
+                    start_layer=6,
+                    end_layer=7,
+                    enable_alt_stream=False,
+                ),
+                DraftMHAView(
+                    arena=arena,
+                    host_spec=spec,
+                    page_size=ps,
+                    layer_lanes={10: 1, 11: 0},
+                ),
+            )
+            for view in views:
+                for override in (False, True):
+                    with self.subTest(
+                        page_size=ps, view=type(view).__name__, override=override
+                    ):
+                        arena.raw.fill_(0x5A)
+                        expected = arena.raw.clone()
+                        loc = torch.tensor([[5, 9, -1], [-1, -1, -1], [12, -1, -1]])
+                        lengths = torch.tensor([2, 0, 1], dtype=torch.int32)
+                        k = torch.arange(9 * _H * _D, dtype=_DTYPE).view(9, _H, _D)
+                        v = -k - 1
+                        for source, buffer in (
+                            (k, view.k_buffer[1]),
+                            (v, view.v_buffer[1]),
+                        ):
+                            base = buffer.data_ptr() - arena.raw.data_ptr()
+                            stride = buffer.stride(0) * buffer.element_size()
+                            for src, dst in ((0, 5), (1, 9), (6, 12)):
+                                value = (
+                                    source[src].contiguous().view(torch.uint8).flatten()
+                                )
+                                offset = base + dst * stride
+                                expected[offset : offset + value.numel()] = value
+                        layer_id = view.start_layer + 1
+                        kwargs = {"layer_id_override": layer_id} if override else {}
+                        with patch.multiple(
+                            mem_pool,
+                            _is_cuda=False,
+                            _is_hip=False,
+                            _cpu_has_amx_support=False,
+                        ):
+                            view.set_kv_buffer_prefix_valid(
+                                _layer(view.start_layer if override else layer_id),
+                                loc,
+                                lengths,
+                                k,
+                                v,
+                                **kwargs,
+                            )
+                            self.assertTrue(torch.equal(arena.raw, expected))
+                            view.set_kv_buffer_prefix_valid(
+                                _layer(layer_id),
+                                torch.full_like(loc, -1),
+                                torch.zeros_like(lengths),
+                                k,
+                                v,
+                            )
+                        self.assertTrue(torch.equal(arena.raw, expected))
 
     def test_pd_registration_is_one_whole_envelope(self):
         """PD registers ONE region -- the whole raw buffer -- with the page
@@ -406,10 +496,10 @@ class TestUnifiedMHATokenToKVPool(unittest.TestCase):
         self.assertEqual(len(item_lens), 1)
         self.assertEqual(ptrs[0], kv.raw.data_ptr())
         self.assertEqual(lens[0], kv.raw.numel())
-        self.assertEqual(item_lens[0], pool._page_bytes)
+        self.assertEqual(item_lens[0], pool.page_bytes)
         # The whole addressable page range must fit the registered region, or
         # the last page's write would run off the end of the RDMA mapping.
-        self.assertLessEqual(pool._num_pages * item_lens[0], lens[0])
+        self.assertLessEqual(pool.num_pages * item_lens[0], lens[0])
 
     def test_hnd_env_cannot_hijack_layout(self):
         """SGLANG_USE_HND_KVCACHE=1 used to flip the inherited env-driven
@@ -428,7 +518,7 @@ class TestFactoryViews(unittest.TestCase):
     the rebind must emit BOTH write locs."""
 
     def setUp(self):
-        # `KVIndexTranslator.__init__` asks the parallel context for
+        # `RunnerIds.__init__` asks the parallel context for
         # `attn_dcp_size`, which is a quotient of the configured leaves and is
         # computed at publish. A bare process has none, so state one the way a
         # real process does.
@@ -509,7 +599,7 @@ class TestFactoryViews(unittest.TestCase):
         out_cache_loc to FULL-side physical ids and derives the SWA write ids
         from the virtual window -- both checked against the v2p tables over
         the VIRTUAL ids."""
-        from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+        from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
         from sglang.srt.runtime_context import get_parallel
 
         b = self._bundle()
@@ -531,7 +621,7 @@ class TestFactoryViews(unittest.TestCase):
         # published in a unit test, so state both and hold the scope across
         # every call that translates.
         with get_parallel().override(attn_dcp_size=1, dcp_enabled=False):
-            source = KVIndexTranslator(
+            source = RunnerIds(
                 req_to_token=torch.zeros((2, 8), dtype=torch.int64),
                 token_to_kv_pool_allocator=alloc,
                 token_to_kv_pool=b.token_to_kv_pool,

@@ -18,9 +18,13 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.mem_cache import memory_pool as mem_pool
-from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
+from sglang.srt.mem_cache.kv.layout.mha import DraftMHAView, MHASubPoolSpec, MHAView
 from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec
-from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
+from sglang.srt.mem_cache.kv.layout.state import (
+    DraftStateView,
+    MambaSubPoolSpec,
+    StateView,
+)
 from sglang.srt.mem_cache.layout.fused_draft import (
     DenseDraftRegion,
     DraftStateGeometry,
@@ -30,13 +34,7 @@ from sglang.srt.mem_cache.layout.fused_draft import (
 from sglang.srt.mem_cache.layout.token_major import align_entry_bytes
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.unified_draft_pool import (
-    UnifiedDraftKVPool,
-    UnifiedDraftMambaPool,
     routed_draft_pool,
-)
-from sglang.srt.mem_cache.unified_memory_pool import (
-    UnifiedMambaPool,
-    UnifiedMHATokenToKVPool,
 )
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
@@ -162,7 +160,7 @@ class TestFusedRegionConfinement(unittest.TestCase):
                     self.assertLessEqual(hi, (page + 1) * self.PS * entry)
 
 
-class TestUnifiedDraftKVPool(unittest.TestCase):
+class TestDraftMHAView(unittest.TestCase):
     PS = 2
     PAGES = 8
 
@@ -187,7 +185,7 @@ class TestUnifiedDraftKVPool(unittest.TestCase):
         )
 
     def _draft_pool(self, pool):
-        return UnifiedDraftKVPool(
+        return DraftMHAView(
             arena=pool,
             host_spec=pool.spec("full"),
             layer_lanes={0: 0},
@@ -217,8 +215,11 @@ class TestUnifiedDraftKVPool(unittest.TestCase):
         # the arena moves host unit A to B, with no draft-side move.
         pool = self._pool()
         dp = self._draft_pool(pool)
-        host = UnifiedMHATokenToKVPool(
-            arena=pool, spec=pool.spec("full"), page_size=self.PS
+        host = MHAView(
+            arena=pool,
+            spec=pool.spec("full"),
+            page_size=self.PS,
+            model_layer_ids=tuple(range(pool.spec("full").layer_num)),
         )
         src_page, dst_page = 3, 5
         src_t, dst_t = src_page * self.PS, dst_page * self.PS
@@ -263,7 +264,7 @@ class TestUnifiedDraftKVPool(unittest.TestCase):
             page_size=self.PS,
             fused_draft=_placement(region),
         )
-        dp = UnifiedDraftKVPool(
+        dp = DraftMHAView(
             arena=pool,
             host_spec=pool.spec("full"),
             layer_lanes={0: 0},
@@ -336,7 +337,7 @@ class TestFusedStateHost(unittest.TestCase):
 
     def test_host_whole_entry_ops_carry_the_draft_block(self):
         _, pool = self._pool()
-        host = UnifiedMambaPool(
+        host = StateView(
             arena=pool,
             spec=pool.spec("mamba"),
             spec_state_size=2,
@@ -357,9 +358,7 @@ class TestFusedStateHost(unittest.TestCase):
 
     def test_draft_views_alias_the_fused_block(self):
         _, pool = self._pool()
-        draft = UnifiedDraftMambaPool(
-            arena=pool, spec=pool.spec("mamba"), layer_lanes={4: 0}
-        )
+        draft = DraftStateView(arena=pool, spec=pool.spec("mamba"), layer_lanes={4: 0})
         draft_conv, _ = pool.spec("mamba").draft_views(pool)
         self.assertEqual(
             draft.mamba_cache.conv[1].shape, (1, pool.num_entries("mamba"), 2, 4)
@@ -380,10 +379,8 @@ class TestFusedStateHost(unittest.TestCase):
         Equally, they must NOT clear the whole entry: the host's own streams
         share it and stay live while the draft's block is recycled."""
         spec, pool = self._pool()
-        draft = UnifiedDraftMambaPool(
-            arena=pool, spec=pool.spec("mamba"), layer_lanes={4: 0}
-        )
-        host = UnifiedMambaPool(
+        draft = DraftStateView(arena=pool, spec=pool.spec("mamba"), layer_lanes={4: 0})
+        host = StateView(
             arena=pool,
             spec=pool.spec("mamba"),
             spec_state_size=2,
@@ -444,7 +441,7 @@ class TestFusedMLAHost(unittest.TestCase):
     host/draft parts within every slot."""
 
     def setUp(self):
-        # `KVIndexTranslator.__init__` reads `attn_dcp_size`, a derived
+        # `RunnerIds.__init__` reads `attn_dcp_size`, a derived
         # parallel width that only exists once a config is published.
         reset_context()
         self.addCleanup(reset_context)
@@ -509,7 +506,7 @@ class TestFusedMLAHost(unittest.TestCase):
         the mamba allocator's full-side v2p, as on the SWA host; a passthrough
         here would write raw virtual ids into the views."""
         from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
-        from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+        from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
 
         pool = self._pool()
 
@@ -531,27 +528,27 @@ class TestFusedMLAHost(unittest.TestCase):
             forward_stream=None,
             lazy_compaction=False,
         )
-        dp = UnifiedDraftKVPool(
+        dp = DraftMHAView(
             arena=pool,
             host_spec=pool.spec("full"),
             layer_lanes={0: 0},
             page_size=self.PS,
         )
-        translator = KVIndexTranslator(
+        runner_ids = RunnerIds(
             req_to_token=torch.zeros((2, 8), dtype=torch.int32),
             token_to_kv_pool_allocator=alloc,
             token_to_kv_pool=dp,
             page_size=self.PS,
             device=_DEV,
         )
-        self.assertTrue(translator.is_translating)
+        self.assertTrue(runner_ids.is_translating)
         self.assertIs(
-            translator.full_v2p_table, alloc.full_attn_allocator.ids.virtual_to_physical
+            runner_ids.full_v2p_table, alloc.full_attn_allocator.ids.virtual_to_physical
         )
 
     def test_draft_pool_binds_over_the_mla_host(self):
         pool = self._pool()
-        dp = UnifiedDraftKVPool(
+        dp = DraftMHAView(
             arena=pool,
             host_spec=pool.spec("full"),
             layer_lanes={0: 0},

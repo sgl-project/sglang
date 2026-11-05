@@ -2,6 +2,9 @@
 //! boundary ([`ResponseSink`] / [`ResponseItem`]), response frame encodings,
 //! and columnar batch decoding into per-request [`ChunkEvent`]s.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -210,6 +213,11 @@ pub struct BatchHeader {
     /// output-stream batch.
     #[serde(default)]
     pub abort_outputs: Vec<bool>,
+    /// The scheduler's `customized_info` as JSON text (see
+    /// [`CustomizedInfoJson`]); empty when no request in the batch carries
+    /// any.
+    #[serde(default)]
+    pub customized_info: CustomizedInfoJson,
 }
 
 /// The completion tokens `[start, end)` one weight version produced, as the
@@ -219,6 +227,129 @@ pub struct WeightVersionSpan {
     pub version: String,
     pub start: u64,
     pub end: u64,
+}
+
+/// The batch's `customized_info` as the JSON text Python's responses carry
+/// it in (orjson, numpy values as lists, a value it has no form for as its
+/// `str`): per key, one list of values per row, a row whose request lacks the
+/// key padded with nulls, one per new output token. Text, so no value a model
+/// puts there can fail the header's decode.
+#[derive(Debug, Default)]
+pub struct CustomizedInfoJson(Vec<u8>);
+
+impl Serialize for CustomizedInfoJson {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for CustomizedInfoJson {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        /// msgpack bin, as Python's `bytes` encode.
+        struct Text;
+
+        impl serde::de::Visitor<'_> for Text {
+            type Value = CustomizedInfoJson;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("customized_info JSON bytes")
+            }
+
+            fn visit_bytes<E: serde::de::Error>(self, bytes: &[u8]) -> Result<Self::Value, E> {
+                Ok(CustomizedInfoJson(bytes.to_vec()))
+            }
+
+            fn visit_byte_buf<E: serde::de::Error>(self, bytes: Vec<u8>) -> Result<Self::Value, E> {
+                Ok(CustomizedInfoJson(bytes))
+            }
+        }
+
+        deserializer.deserialize_bytes(Text)
+    }
+}
+
+impl CustomizedInfoJson {
+    /// Per key, in the scheduler's order, one list of values per row of a
+    /// `rows`-request batch. A text that is not that shape costs the batch its
+    /// `customized_info` (logged), never the frame.
+    fn columns(&self, rows: usize) -> Vec<(Arc<str>, Vec<Vec<serde_json::Value>>)> {
+        if self.0.is_empty() {
+            return Vec::new();
+        }
+        let columns = serde_json::from_slice::<KeyedColumns>(&self.0)
+            .map_err(|error| error.to_string())
+            .and_then(|KeyedColumns(columns)| {
+                if columns.iter().all(|(_, column)| column.len() == rows) {
+                    Ok(columns)
+                } else {
+                    Err(format!("a column without one entry per request ({rows})"))
+                }
+            });
+        match columns {
+            Ok(columns) => columns
+                .into_iter()
+                .map(|(key, column)| (Arc::from(key), column))
+                .collect(),
+            Err(error) => {
+                static DROPPED: AtomicU64 = AtomicU64::new(0);
+                let dropped = DROPPED.fetch_add(1, Ordering::Relaxed) + 1;
+                if dropped.is_power_of_two() {
+                    tracing::warn!(dropped, %error, "dropped a batch's unreadable customized_info");
+                }
+                Vec::new()
+            }
+        }
+    }
+}
+
+/// A JSON object of columns, read entry by entry so the key order survives.
+struct KeyedColumns(Vec<(String, Vec<Vec<serde_json::Value>>)>);
+
+impl<'de> Deserialize<'de> for KeyedColumns {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Columns;
+
+        impl<'de> serde::de::Visitor<'de> for Columns {
+            type Value = KeyedColumns;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a map of customized_info columns")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut columns = Vec::new();
+                while let Some(column) = map.next_entry()? {
+                    columns.push(column);
+                }
+                Ok(KeyedColumns(columns))
+            }
+        }
+
+        deserializer.deserialize_map(Columns)
+    }
+}
+
+/// One request's `customized_info` in one frame: for each key its batch
+/// carried, the values for the request's new output tokens.
+#[derive(Debug, Clone, Default)]
+pub struct CustomizedInfo(pub(crate) Vec<(Arc<str>, Vec<serde_json::Value>)>);
+
+impl CustomizedInfo {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl IntoIterator for CustomizedInfo {
+    type Item = (Arc<str>, Vec<serde_json::Value>);
+    type IntoIter = std::vec::IntoIter<Self::Item>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
 }
 
 /// Read a request's flat logprob column (`l` val/idx pairs) from `data` at cursors
@@ -417,6 +548,8 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
     let (mut p_ot, mut p_it, mut p_od, mut p_id, mut p_h) =
         (0usize, 0usize, 0usize, 0usize, 0usize);
     let lens_i = |v: &[u32], i: usize| v.get(i).copied().unwrap_or(0) as usize;
+    // Each key once per frame, shared by the rows.
+    let mut customized_columns = h.customized_info.columns(n);
 
     // Decode one request's slice of every column, advancing the cursors. `None` if a
     // read overruns `data` (belt-and-suspenders past the upfront check, which already
@@ -438,6 +571,12 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
         let video_tokens = h.video_tokens.get(i).copied().unwrap_or(0);
         let decode_latency = h.decode_latencies.get(i).copied().flatten();
         let abort_output = h.abort_outputs.get(i).copied().unwrap_or(false);
+        let customized_info = CustomizedInfo(
+            customized_columns
+                .iter_mut()
+                .map(|(key, rows)| (key.clone(), std::mem::take(&mut rows[i])))
+                .collect(),
+        );
 
         // Plain decode frame (no request in the batch asked for logprobs/hidden):
         // the extras columns are all zero-width, so skip reading them entirely,
@@ -448,7 +587,8 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
                 || audio_tokens != 0
                 || video_tokens != 0
                 || decode_latency.is_some()
-                || abort_output;
+                || abort_output
+                || !customized_info.is_empty();
             has_metadata.then(|| {
                 Box::new(ChunkExtras {
                     weight_versions,
@@ -457,6 +597,7 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
                     video_tokens,
                     decode_latency,
                     abort_output,
+                    customized_info,
                     ..Default::default()
                 })
             })
@@ -532,6 +673,7 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
                 video_tokens,
                 decode_latency,
                 abort_output,
+                customized_info,
                 // Explicit, NOT `..Default::default()` — same reason as `ChunkEvent`
                 // below: a new column must fail to compile here until it is decoded.
                 out_lp_txt: Vec::new(),
@@ -682,10 +824,10 @@ pub struct ChunkEvent {
 }
 
 /// Logprob + hidden-state columns for a [`ChunkEvent`], allocated only when the
-/// request enabled logprobs / hidden states, finished (its weight-version spans)
-/// or has media prompt tokens. Columnar `val`/`idx` (+ ragged `lens`)
-/// buffers arrive pre-decode; the detok shard fills the parallel `*_txt` columns
-/// when `return_text_in_logprobs` is set. In-process only — no serde (see
+/// request enabled logprobs / hidden states, finished (its weight-version spans),
+/// has media prompt tokens or its batch carried `customized_info`. Columnar
+/// `val`/`idx` (+ ragged `lens`) buffers arrive pre-decode; the detok shard fills
+/// the parallel `*_txt` columns when `return_text_in_logprobs` is set. In-process only — no serde (see
 /// [`ChunkEvent`]).
 #[derive(Debug, Clone, Default)]
 pub struct ChunkExtras {
@@ -727,6 +869,8 @@ pub struct ChunkExtras {
     /// The scheduler ended this request outside the output stream (see
     /// [`BatchHeader::abort_outputs`]).
     pub abort_output: bool,
+    /// The scheduler's `customized_info` for this frame's new output tokens.
+    pub customized_info: CustomizedInfo,
     /// Decoded logprob token text (`return_text_in_logprobs`), parallel to the
     /// `*_idx` buffers; empty when not requested (the tuple's text slot stays null).
     pub out_lp_txt: Vec<String>,
@@ -754,6 +898,7 @@ impl ChunkExtras {
             && self.video_tokens == 0
             && self.decode_latency.is_none()
             && !self.abort_output
+            && self.customized_info.is_empty()
     }
 }
 
@@ -1362,6 +1507,54 @@ mod tests {
         let extras = events[1].extras.as_deref().unwrap();
         assert_eq!(extras.weight_versions, [span]);
         assert!(extras.out_lp_val.is_empty() && extras.image_tokens == 0);
+    }
+
+    /// Whatever text the `customized_info` column holds, the frame decodes:
+    /// a well-formed one splits by row, keeping the key order and any JSON
+    /// value; malformed JSON, a wrong shape or a short column costs the batch
+    /// only its `customized_info`.
+    #[test]
+    fn customized_info_text_never_rejects_the_frame() {
+        let decode = |text: &str| {
+            let header = BatchHeader {
+                rids: vec!["a".into(), "b".into()],
+                finish_reasons: vec![None, None],
+                prompt_tokens: vec![1, 1],
+                tok_lens: vec![1, 0],
+                cached_tokens: vec![0, 0],
+                reasoning_tokens: vec![0, 0],
+                customized_info: CustomizedInfoJson(text.as_bytes().to_vec()),
+                ..Default::default()
+            };
+            let header = rmp_serde::to_vec(&header).unwrap();
+            let framed = frame_decode_batch_cols(&header, &[&7i64.to_le_bytes()]);
+            let mut events = Vec::new();
+            assert!(
+                for_each_chunk(&framed[1..], |ev| events.push(ev)).ok,
+                "{text}"
+            );
+            events
+                .into_iter()
+                .map(|ev| {
+                    ev.extras
+                        .map(|extras| extras.customized_info.0)
+                        .unwrap_or_default()
+                })
+                .collect::<Vec<_>>()
+        };
+        let rows = decode(r#"{"z": [[{"k": 1}], []], "a": [[null], ["b'x'"]]}"#);
+        let keys: Vec<&str> = rows[0].iter().map(|(key, _)| &**key).collect();
+        assert_eq!(keys, ["z", "a"]);
+        assert_eq!(rows[0][0].1, [serde_json::json!({"k": 1})]);
+        assert_eq!(rows[1][1].1, [serde_json::json!("b'x'")]);
+        for odd in [
+            "{not json",
+            r#"["a", "list"]"#,
+            r#"{"k": [1, 2]}"#,
+            r#"{"k": [[1]]}"#,
+        ] {
+            assert_eq!(decode(odd), [vec![], vec![]], "{odd}");
+        }
     }
 
     /// The common frame must stay small: logprob/hidden columns are boxed behind

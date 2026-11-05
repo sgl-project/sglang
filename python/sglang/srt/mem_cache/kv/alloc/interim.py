@@ -1,16 +1,13 @@
-"""Today's capacity policy of each unified chain shape, kept as data.
+"""Capacity policies selected from unified chain geometry.
 
-`ChainAllocator` owns the bands and every lifecycle fan-out; what still
-differs between the chains it serves (joint pricing, admission hooks, reclaim
-and the per-side capacity views) lives here, one policy per chain shape, chosen
-from the band geometry alone. Each policy reproduces the decisions of the
-allocator that served that shape before, so a replaced chain keeps its
-admission, reclaim and compaction outcomes.
+`ChainAllocator` owns the bands and lifecycle operations. Each policy supplies
+joint pricing, admission hooks, reclaim and per-side capacity views for one
+chain shape.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List, Literal, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple
 
 import msgspec
 import torch
@@ -76,6 +73,11 @@ def _virtual_tokens_to_physical(virtual_tokens: torch.Tensor, band) -> torch.Ten
     return physical_pages * page_size + virtual_tokens % page_size
 
 
+def _state_usage(c: ChainAllocator) -> Dict[str, Tuple[int, int]]:
+    """The state sub-pool's (slots, free slots)."""
+    return {c.roles.state: (c.state.pool.size, c.state_slots.available_size())}
+
+
 class _InterimPolicy:
     """Capacity behavior one chain shape shares with no other.
 
@@ -120,6 +122,11 @@ class _InterimPolicy:
 
     def mamba_full_cache_donor(self, c: ChainAllocator):
         return None
+
+    def usage(self, c: ChainAllocator) -> Dict[str, Tuple[int, int]]:
+        """Each sub-pool's (capacity, available units) as observers report
+        them, by sub-pool name: tokens, or slots for a state sub-pool."""
+        raise NotImplementedError
 
     def resize(self, c: ChainAllocator, config) -> None:
         raise NotImplementedError(
@@ -178,6 +185,12 @@ class _TokenAndSlotEndsPolicy(_InterimPolicy):
 
     def mamba_full_cache_donor(self, c: ChainAllocator):
         return c
+
+    def usage(self, c: ChainAllocator) -> Dict[str, Tuple[int, int]]:
+        return {
+            c.roles.owner: (c.size, c.available_size()),
+            **_state_usage(c),
+        }
 
     def prepare_mamba_allocation(self, c: ChainAllocator, target_size: int) -> None:
         """Make deferred Full reclaim visible to the Mamba capacity view."""
@@ -571,6 +584,12 @@ class _TokenEndsPolicy(_WindowPolicy):
             (c.current_swa_capacity, c.swa_available_size()),
         )
 
+    def usage(self, c: ChainAllocator) -> Dict[str, Tuple[int, int]]:
+        return {
+            c.roles.owner: (c.current_full_capacity, c.full_available_size()),
+            c.roles.window: (c.current_swa_capacity, c.swa_available_size()),
+        }
+
     def max_new_tokens_for_memory(
         self,
         c: ChainAllocator,
@@ -705,7 +724,7 @@ class _TokenEndsPolicy(_WindowPolicy):
             (sa, self._size_swa),
         ):
             pool = c.views[allocator.sub_pool_name]
-            pool._num_pages = allocator.num_pages
+            pool.num_pages = allocator.num_pages
             pool.size = allocator.num_pages * c.page_size - c.page_size
             pool.host_capacity_tokens = host_capacity
             pool.host_capacity_bytes = host_capacity * allocator.entry_bytes
@@ -935,6 +954,20 @@ class _FloatChainPolicy(_WindowPolicy):
             (full_capacity, c.conserve_full_available_size()),
             (swa_capacity, c.conserve_swa_available_size()),
         )
+
+    def usage(self, c: ChainAllocator) -> Dict[str, Tuple[int, int]]:
+        # The static caps the slot-conservation views count down from.
+        return {
+            c.roles.owner: (
+                self._full_max_total_num_tokens,
+                c.conserve_full_available_size(),
+            ),
+            c.roles.window: (
+                self._swa_max_total_num_tokens,
+                c.conserve_swa_available_size(),
+            ),
+            **_state_usage(c),
+        }
 
     @rank_consensus(same_params=["num_tokens"], same_results=True)
     def evict_to_free_tokens(

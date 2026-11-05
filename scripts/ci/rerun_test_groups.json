@@ -136,7 +136,7 @@
     "registered/unit/mem_cache/test_hisparse_allocator.py",
     "registered/unit/mem_cache/test_hisparse_max_token_pool_size.py",
     "registered/unit/mem_cache/test_kda_fused_decode_strided_state.py",
-    "registered/unit/mem_cache/test_kv_index_translator.py",
+    "registered/unit/mem_cache/test_runner_ids.py",
     "registered/unit/mem_cache/test_multi_ended_allocator.py",
     "registered/unit/mem_cache/test_pd_envelope_transfer_layout.py",
     "registered/unit/mem_cache/test_prefill_memory_budget.py",

@@ -11,9 +11,9 @@ import torch
 
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
-from sglang.srt.mem_cache.kv.lifecycle import acquire
 from sglang.srt.mem_cache.kv.state_storage import StateSlotsExhausted, StateStorage
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
+from sglang.srt.mem_cache.static_kv_storage import acquire_rows
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -58,7 +58,7 @@ class TestStateAcquire(CustomTestCase):
         reqs = [SimpleNamespace(kv=ReqKvInfo()) for _ in range(2)]
 
         with self.assertRaises(StateSlotsExhausted):
-            acquire(table, state, reqs)
+            acquire_rows(table, state, reqs)
 
         self.assertEqual(table.available_size(), 4)
         self.assertEqual(state.slots.available_size(), 5)
@@ -75,7 +75,7 @@ class TestStateAcquire(CustomTestCase):
         held = state.slots.alloc(1)
         req = SimpleNamespace(kv=ReqKvInfo(mamba_pool_idx=held[0]))
 
-        (row,) = acquire(table, state, [req])
+        (row,) = acquire_rows(table, state, [req])
 
         self.assertEqual(int(table.req_index_to_mamba_index_mapping[row]), int(held))
         self.assertEqual(state.slots.available_size(), 2)

@@ -137,7 +137,7 @@ def test_dflash_hicache_restores_draft_kv_through_a_sidecar():
     draft_runner = SimpleNamespace(
         token_to_kv_pool=draft_pool,
         # A draft with its own KV pool, not fused into the target's.
-        kv_index_translator=SimpleNamespace(is_fused_draft=False),
+        runner_ids=SimpleNamespace(is_fused_draft=False),
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(architectures=["MiniMaxDFlash2DraftModel"]),
             num_nextn_predict_layers=0,

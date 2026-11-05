@@ -301,8 +301,10 @@ class K31VerifyHostBinding:
         q = r // b
         if not built.supports(b, q, r):
             return None
-        spec = forward_batch.spec_info
-        if spec is None or getattr(spec, "ragged_verify_layout", None) is not None:
+        if (
+            forward_batch.spec_info is None
+            or forward_batch.ragged_verify_layout is not None
+        ):
             return None
         if not torch.cuda.is_current_stream_capturing() and not covers_short_verify(
             forward_batch, q

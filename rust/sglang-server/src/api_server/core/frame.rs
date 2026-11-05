@@ -11,7 +11,7 @@ use sglang_api_types::api::v1 as api;
 
 use super::CoreError;
 use crate::message::finish_reason::{FinishKind, FinishReason, Matched};
-use crate::message::response::{ChunkEvent, ChunkExtras, WeightVersionSpan};
+use crate::message::response::{ChunkEvent, ChunkExtras, CustomizedInfo, WeightVersionSpan};
 use crate::message::types::TokenIds;
 
 /// Canonical transport-neutral output payload for generation events.
@@ -208,6 +208,15 @@ impl CoreEvent {
 }
 
 impl CoreOutput {
+    /// Move this delta's `customized_info` out. Only native `/generate`
+    /// reports it, so the fold above does not accumulate it.
+    pub(crate) fn take_customized_info(&mut self) -> CustomizedInfo {
+        self.extras
+            .as_deref_mut()
+            .map(|extras| std::mem::take(&mut extras.customized_info))
+            .unwrap_or_default()
+    }
+
     /// The scheduler's decode latency for a finished non-streaming request,
     /// whose first token this frontend does not see. It rides only that
     /// request's terminal delta and is read off it there (for a model package's

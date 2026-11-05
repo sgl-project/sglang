@@ -94,7 +94,10 @@ def _batch(reqs, pool, **fields):
         reqs=reqs,
         req_to_token_pool=pool,
         # The allocator carries the state slots.
-        token_to_kv_pool_allocator=SimpleNamespace(state_slots=pool.state_slots),
+        # Static pools: the batch's tracking slots go through the static adapter.
+        token_to_kv_pool_allocator=SimpleNamespace(
+            state_slots=pool.state_slots, storage=None
+        ),
         model_config=SimpleNamespace(
             is_encoder_decoder=False,
             hf_text_config=SimpleNamespace(mamba_chunk_size=STATE_CHUNK),

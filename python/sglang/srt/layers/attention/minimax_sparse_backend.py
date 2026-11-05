@@ -1492,7 +1492,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 layer.idx_k_scale_float,
                 layer.idx_v_scale_float,
             )
-        k_cache, v_cache = self.kv_pool.get_kv_buffer(layer.layer_id)
+        k_cache, v_cache = self.kv_pool.layer_router.read(layer.layer_id).kv()
         if disable_value:
             idx_k_cache = self.kv_pool.get_index_k_buffer(layer.layer_id)
             idx_v_cache = None
@@ -1733,7 +1733,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 layer.idx_k_scale_float,
                 layer.idx_v_scale_float,
             )
-        k_cache, v_cache = self.kv_pool.get_kv_buffer(layer.layer_id)
+        k_cache, v_cache = self.kv_pool.layer_router.read(layer.layer_id).kv()
         if disable_value:
             idx_k_cache = self.kv_pool.get_index_k_buffer(layer.layer_id)
             idx_v_cache = None
@@ -1867,7 +1867,7 @@ class MiniMaxHybridAttnBackend(AttentionBackend):
     ):
         self.dense = dense_backend
         self.sparse = sparse_backend
-        self.kv_index_translator = dense_backend.kv_index_translator
+        self.runner_ids = dense_backend.runner_ids
         self.sparse_layer_ids = sparse_layer_ids
         # Let the sparse decode reuse the dense paged backend (page table + workspace).
         self.sparse.dense_backend = dense_backend

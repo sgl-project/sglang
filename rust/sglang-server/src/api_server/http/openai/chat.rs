@@ -63,6 +63,9 @@ pub(super) struct ChatRequest {
     /// is a 400, as Python's request model makes it.
     #[allow(dead_code)]
     chat_template_kwargs: Option<ChatTemplateKwargs>,
+    /// Python's `skip_special_tokens` request extension; absent keeps the
+    /// sampling default (drop them).
+    skip_special_tokens: Option<bool>,
     #[serde(flatten)]
     routing: PDRoutingFields,
 }
@@ -91,9 +94,13 @@ async fn chat_completions(
         return response;
     }
     let ChatBody {
-        request: ChatRequest {
-            request, routing, ..
-        },
+        request:
+            ChatRequest {
+                request,
+                skip_special_tokens,
+                routing,
+                ..
+            },
         raw,
     } = match Json::from_bytes(&body) {
         Ok(Json(body)) => body,
@@ -218,6 +225,9 @@ async fn chat_completions(
             return openai_error(StatusCode::BAD_REQUEST, message, false);
         }
     };
+    if let Some(skip_special_tokens) = skip_special_tokens {
+        sampling.skip_special_tokens = skip_special_tokens;
+    }
 
     if chat_model.keeps_special_tokens(reasoning_parser.as_deref()) {
         sampling.skip_special_tokens = false;

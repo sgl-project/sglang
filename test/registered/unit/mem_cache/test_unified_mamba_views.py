@@ -12,7 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 """Round-trip correctness of ``MambaSubPoolSpec.views`` -- the
-envelope-strided conv/temporal (SSM) state views that back ``UnifiedMambaPool``.
+envelope-strided conv/temporal (SSM) state views that back ``StateView``.
 Guards against garbled greedy decode from a stride/offset/alignment bug in the
 state views. CPU-only.
 

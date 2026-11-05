@@ -14,7 +14,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.managers.schedule_batch import ReqKvInfo
-from sglang.srt.mem_cache.kv.lifecycle import acquire
+from sglang.srt.mem_cache.static_kv_storage import acquire_rows
 from sglang.test.ci.ci_register import register_mlx_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -46,7 +46,7 @@ class TestMlxAuxiliaryStateAcquire(CustomTestCase):
 
     def test_first_admission_binds_the_row_and_one_slot(self):
         req = _req()
-        rows = acquire(self.table, self.table.state, [req])
+        rows = acquire_rows(self.table, self.table.state, [req])
         self.assertEqual(len(rows), 1)
         self.assertTrue(req.kv.holds_mamba)
         self.assertEqual(self.slots.available_size(), 3)
@@ -59,7 +59,7 @@ class TestMlxAuxiliaryStateAcquire(CustomTestCase):
         req = _req()
         held = self.slots.alloc(1)[0]
         req.kv.mamba_pool_idx = held
-        rows = acquire(self.table, self.table.state, [req])
+        rows = acquire_rows(self.table, self.table.state, [req])
         self.assertEqual(int(req.kv.mamba_pool_idx), int(held))
         self.assertEqual(self.slots.available_size(), 3)
         self.assertEqual(

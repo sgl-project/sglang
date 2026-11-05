@@ -327,7 +327,7 @@ class MockGDNModelRunner(ModelRunner):
             state_id_spaces=lambda: {},
         )
         self.is_draft_worker = False
-        self.init_kv_index_translator()
+        self.init_runner_ids()
         self.attention_chunk_size = None
         self.hisparse_coordinator = None
         self.init_new_workspace = False
@@ -567,7 +567,7 @@ def _make_forward_batch(
         ),
     )
     # Production batches take their KV ids from a plan (`init_new`).
-    runner.kv_index_translator.bind_own_plan(batch)
+    runner.runner_ids.bind_own_plan(batch)
 
     if case.forward_mode.is_extend(include_draft_extend_v2=True):
         extend_seq_lens = torch.tensor(input_lens, dtype=torch.int32, device=device)

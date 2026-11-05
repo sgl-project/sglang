@@ -232,6 +232,7 @@ pub(super) fn translate_runtime_error(error: Error) -> CoreError {
         Error::Validation(message) => {
             CoreError::InvalidArgument(format!("validation failed: {message}"))
         }
+        Error::Encode(error) => error.into(),
         Error::QueueFull => CoreError::Overloaded("to_scheduler channel full".into()),
         Error::Disconnected => CoreError::Cancelled("client disconnected".into()),
         error => CoreError::Internal(error.to_string()),

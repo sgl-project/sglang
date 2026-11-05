@@ -91,6 +91,8 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         # Support _kv_snap diagnostic logging in patched schedulers
         scheduler.token_to_kv_pool_allocator = MagicMock()
         scheduler.token_to_kv_pool_allocator.available_size.return_value = 1000
+        # Static pools: no unified KV storage behind the allocator.
+        scheduler.token_to_kv_pool_allocator.storage = None
         scheduler.max_total_num_tokens = 1000
         scheduler._get_token_info = MagicMock(
             return_value=PoolStats(

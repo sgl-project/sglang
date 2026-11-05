@@ -48,26 +48,60 @@ _SUB_POOL_NAMES: Dict[Type, str] = {
 
 class SubPoolExternal(msgspec.Struct, frozen=True, kw_only=True):
     """The names a sub-pool goes by outside this process, at the values peers,
-    host stores and the radix tree already use: its HiCache host pool (also the
-    suffix of its L3 keys), its radix tree component, and the PD state type it
-    travels as (None for the sub-pool whose token KV PD registers as the
-    transfer's KV entries)."""
+    host stores, the radix tree and metrics already use: its HiCache host pool
+    (also the suffix of its L3 keys), its radix tree component, the family its
+    usage is reported under, and the PD state type it travels as (None for the
+    sub-pool whose token KV PD registers as the transfer's KV entries)."""
 
     host_pool: str
     tree_component: str
+    metrics: str
     wire: Optional[str] = None
 
 
 _EXTERNAL: Dict[Type, SubPoolExternal] = {
-    FullLifetime: SubPoolExternal(host_pool="kv", tree_component="FULL"),
-    WindowLifetime: SubPoolExternal(host_pool="swa", tree_component="SWA", wire="swa"),
+    FullLifetime: SubPoolExternal(
+        host_pool="kv", tree_component="FULL", metrics="full"
+    ),
+    WindowLifetime: SubPoolExternal(
+        host_pool="swa", tree_component="SWA", metrics="swa", wire="swa"
+    ),
     StateLifetime: SubPoolExternal(
-        host_pool="mamba", tree_component="MAMBA", wire="mamba"
+        host_pool="mamba", tree_component="MAMBA", metrics="mamba", wire="mamba"
     ),
 }
 
 # The order PD peers list state entries in: a window's before recurrent state.
 _WIRE_ORDER = ("swa", "mamba")
+
+# How a prefix tree keeps a sub-pool for a cached prefix: every token, the
+# trailing window of tokens, one state checkpoint per grid step, or fixed-size
+# blocks. The tree cores pick a slot's behavior by its family.
+TREE_TOKEN = "token"
+TREE_WINDOW = "window"
+TREE_STATE = "state"
+TREE_BLOCK = "block"
+
+_TREE_FAMILY: Dict[Type, str] = {
+    FullLifetime: TREE_TOKEN,
+    WindowLifetime: TREE_WINDOW,
+    StateLifetime: TREE_STATE,
+}
+
+
+class TreeSlot(msgspec.Struct, frozen=True, kw_only=True):
+    """One slot of a prefix tree: the id the tree, its KV events and its host
+    stores know it by (an external name), the family that decides how a cached
+    prefix keeps it, and the numbers that family keeps it by."""
+
+    component: str
+    family: str
+    # Window family: the tokens a prefix keeps back from its end, which every
+    # reader of the window needs (its layers' attention window, widened by a
+    # reader that reaches further back, such as a fused draft).
+    window: Optional[int] = None
+    # State family: a cached state is valid after a multiple of this many tokens.
+    checkpoint_interval: Optional[int] = None
 
 
 class WireEntry(msgspec.Struct, frozen=True, kw_only=True):
@@ -127,6 +161,44 @@ class KVStoragePlan(msgspec.Struct, frozen=True, kw_only=True):
         """The sub-pools from the owner to the grow-up end: the order host
         pools and transfers list them in."""
         return tuple(reversed(self.sub_pools))
+
+    def drive_order(self) -> Tuple[PlannedSubPool, ...]:
+        """The sub-pools from the longest retention to the shortest: the owner,
+        then windows from the largest, then state; ties by unit, then name.
+        A prefix tree drives eviction and lists its components in this order."""
+        return tuple(
+            sorted(
+                self.sub_pools,
+                key=lambda s: (
+                    tuple(-r for r in s.lifetime.retention()),
+                    s.unit,
+                    s.name,
+                ),
+            )
+        )
+
+    def tree_slots(self, *, window_reach: int = 0) -> Tuple[TreeSlot, ...]:
+        """The prefix tree's slots, one per sub-pool, in drive order.
+        ``window_reach`` is how far back from a request's end a reader beyond
+        the window's own layers (a fused draft) reads the window."""
+        return tuple(
+            TreeSlot(
+                component=s.external.tree_component,
+                family=_TREE_FAMILY[type(s.lifetime)],
+                window=(
+                    max(s.lifetime.window, window_reach)
+                    if isinstance(s.lifetime, WindowLifetime)
+                    and s.lifetime.window is not None
+                    else None
+                ),
+                checkpoint_interval=(
+                    s.lifetime.checkpoint_interval
+                    if isinstance(s.lifetime, StateLifetime)
+                    else None
+                ),
+            )
+            for s in self.drive_order()
+        )
 
     def wire_entries(self) -> Tuple[WireEntry, ...]:
         """The PD state entries, in the order peers list them. The owner's

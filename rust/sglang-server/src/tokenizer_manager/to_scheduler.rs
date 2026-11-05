@@ -10,6 +10,7 @@ use crate::message::response::ResponseItem;
 use crate::runtime::Runnable;
 use crate::tokenizer_manager::channel::ToSchedulerTx;
 pub use crate::tokenizer_manager::to_scheduler_types::{Limits, MmDispatch};
+pub(crate) use crate::tokenizer_manager::to_scheduler_validation::fit_input;
 use crate::tokenizer_manager::to_scheduler_validation::{
     check_total_tokens, validate, validate_input_ids,
 };

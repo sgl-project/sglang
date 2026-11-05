@@ -43,6 +43,7 @@ struct MegaMoEPreDispatchParams {
   uint32_t hidden;
   uint32_t num_groups;  // hidden / group_size
   uint32_t top_k;
+  float topk_weight_scale;
 };
 
 // kGroupSize must match the consuming MoE's activation scale group (quant_group_size).
@@ -151,7 +152,7 @@ __global__ __launch_bounds__(kMaxBlockThreads, 2) void  //
     if (kCopyTopk && tid < params.top_k) {
       const uint32_t off = token_id * params.top_k + tid;
       params.buf_topk_idx[off] = valid ? params.topk_idx[off] : -1;
-      params.buf_topk_weights[off] = valid ? params.topk_weights[off] : 0.0f;
+      params.buf_topk_weights[off] = valid ? __fmul_rn(params.topk_weights[off], params.topk_weight_scale) : 0.0f;
     }
   } else {
     // ---- Pad path: trailing blocks fill [num_tokens, padded_max) with (-1, 0) ----
@@ -199,6 +200,7 @@ struct MegaMoEPreDispatchKernel {
       const tvm::ffi::TensorView buf_topk_weights,
       const tvm::ffi::Optional<tvm::ffi::TensorView> shared_x_sf,
       const int64_t shared_block_m,
+      const double topk_weight_scale,
       const tvm::ffi::Optional<tvm::ffi::TensorView> num_token_non_padded) {
     using namespace host;
 
@@ -322,6 +324,7 @@ struct MegaMoEPreDispatchKernel {
         .hidden = hidden,
         .num_groups = num_groups,
         .top_k = top_k,
+        .topk_weight_scale = static_cast<float>(topk_weight_scale),
     };
 
     if (num_total_blocks == 0) return;

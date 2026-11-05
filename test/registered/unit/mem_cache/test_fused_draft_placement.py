@@ -513,6 +513,8 @@ class TestMambaHostPricing(CustomTestCase):
 
     def test_a_mamba_region_prices_this_runners_state_layers(self):
         cfg = kcc.KVCacheConfigurator.__new__(kcc.KVCacheConfigurator)
+        cfg.sliding_window_size = None
+        self.enterContext(patch.object(kcc, "mamba_cache_chunk_size", return_value=64))
         cfg.is_hybrid_swa = False
         cfg.use_mla_backend = False
         cfg.kv_cache_dtype = _DTYPE
@@ -559,6 +561,8 @@ class TestUnifiedSWAHeadGeometry(CustomTestCase):
 
     def _configurator(self):
         cfg = kcc.KVCacheConfigurator.__new__(kcc.KVCacheConfigurator)
+        # The window the runner resolved for its layers.
+        cfg.sliding_window_size = 128
         cfg.draft_parallel_layout = None
         cfg.is_hybrid_swa = True
         cfg.is_hybrid_swa_compress = False
@@ -659,6 +663,8 @@ class TestFusedDraftDecision(CustomTestCase):
         from sglang.srt.speculative import draft_worker_common
 
         cfg = kvc.KVCacheConfigurator.__new__(kvc.KVCacheConfigurator)
+        # The window the runner resolved for its layers.
+        cfg.sliding_window_size = 128
         cfg.draft_parallel_layout = draft_parallel_layout
         cfg.is_hybrid_swa = True
         cfg.is_hybrid_swa_compress = False
