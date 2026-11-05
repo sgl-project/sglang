@@ -2897,6 +2897,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
 
         batch.out_cache_loc = verify_out_cache_loc
+        if batch.hisparse_coordinator is not None:
+            # Bind the verify slots to the side buffer's extra page before any
+            # consumer (runner_ids plan, attention backends, KV writes) reads
+            # them, mirroring eagle_prepare_for_verify.
+            batch.hisparse_coordinator.prepare_spec_verify(batch)
         sampling_info = batch.sampling_info
 
         seq_lens_pre_verify = (
@@ -3000,6 +3005,21 @@ class DFlashWorkerV2(BaseSpecWorker):
             bs=bs,
             target_predict=target_predict,
         )
+
+        if batch.hisparse_coordinator is not None:
+            # Persist the accepted target-verify KV into the host pool and the
+            # persistent device buffer, mirroring run_eagle_verify's commit. The
+            # DFLASH block is linear, so accepted steps are a prefix: step j
+            # landed at position seq_len + j iff j < commit_lens.
+            steps = torch.arange(block_size, device=device, dtype=torch.int64)
+            accept_indices = torch.where(
+                commit_lens.to(torch.int64).unsqueeze(1) > steps.unsqueeze(0),
+                steps.unsqueeze(0).expand(bs, -1),
+                torch.full((bs, block_size), -1, device=device, dtype=torch.int64),
+            )
+            batch.hisparse_coordinator.commit_spec_accept_tokens(
+                batch=batch, accept_indices=accept_indices
+            )
 
         sampling_mask_capture = SpeculativeSamplingMaskCapture.from_logits(
             sampling_info,

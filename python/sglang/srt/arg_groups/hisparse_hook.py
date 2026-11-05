@@ -28,12 +28,13 @@ HISPARSE_KV_CACHE_DTYPES = ("bfloat16", "fp8_e4m3")
 # (HiSparseCoordinator.prepare_spec_verify / commit_spec_accept_tokens).
 # A worker that never binds those slots would write target-verify KV through
 # unmapped device locations (silent corruption), so unvalidated algorithms
-# are rejected by name. NOTE: STANDALONE and FROZEN_KV_MTP subclass
-# EAGLEWorkerV2 and inherit the same verify path, so the binding mechanism
-# covers them too -- they stay rejected only because the combination has not
-# been validated (draft-input staging, draft-pool sizing); enable them after
-# testing rather than assuming they are unsafe.
-HISPARSE_VALIDATED_SPEC_ALGORITHMS = ("EAGLE", "EAGLE3", "UNO")
+# are rejected by name. DFLASH binds the slots in its own worker. NOTE:
+# STANDALONE and FROZEN_KV_MTP subclass EAGLEWorkerV2 and inherit the same
+# verify path, so the binding mechanism covers them too -- they stay rejected
+# only because the combination has not been validated (draft-input staging,
+# draft-pool sizing); enable them after testing rather than assuming they
+# are unsafe.
+HISPARSE_VALIDATED_SPEC_ALGORITHMS = ("EAGLE", "EAGLE3", "UNO", "DFLASH")
 
 
 def _hisparse_default_backend(kv_cache_dtype: str) -> str:
