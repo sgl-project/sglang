@@ -9,6 +9,7 @@ from torch.nn.parameter import Parameter
 
 from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.sail.deep_gemm import entrypoint as sail_entrypoint
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.amx_utils import (
     CPUQuantMethod,
@@ -85,7 +86,7 @@ def gemm_nt_i8i8bf16(
     Bs: torch.Tensor,
     C: torch.Tensor,
 ) -> None:
-    deep_gemm_wrapper.gemm_nt_i8i8bf16((A, As), (B, Bs), C)
+    sail_entrypoint.gemm_nt_i8i8bf16((A, As), (B, Bs), C)
 
 
 class W8A8Int8Config(QuantizationConfig):

@@ -19,7 +19,7 @@ from sglang.kernels.ops.gemm.sail_deepgemm import (
 from sglang.kernels.ops.moe.ep_moe_kernels import ep_gather, ep_scatter_sail
 from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.environ import envs
-from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.hardware_backend.sail.deep_gemm import entrypoint as sail_entrypoint
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeRunnerConfig,
     register_fused_func,
@@ -85,7 +85,7 @@ def grouped_gemm_nt_i8i8bf16_nopad(
     m_indices: torch.Tensor,
     m_rows: torch.Tensor,
 ) -> None:
-    deep_gemm_wrapper.grouped_gemm_nt_i8i8bf16_nopad(
+    sail_entrypoint.grouped_gemm_nt_i8i8bf16_nopad(
         (A, As), (B, Bs), C, m_indices, m_rows
     )
 
@@ -112,7 +112,7 @@ def grouped_gemm_nt_f8f8bf16_nopad(
     m_indices: torch.Tensor,
     m_rows: torch.Tensor,
 ) -> None:
-    deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_nopad(
+    sail_entrypoint.grouped_gemm_nt_f8f8bf16_nopad(
         (A, As), (B, Bs), C, m_indices, m_rows
     )
 
@@ -137,7 +137,7 @@ def grouped_gemm_nt_bf16bf16bf16_nopad(
     m_indices: torch.Tensor,
     m_rows: torch.Tensor,
 ) -> None:
-    deep_gemm_wrapper.grouped_gemm_nt_bf16_nopad(A, B, C, m_indices, m_rows)
+    sail_entrypoint.grouped_gemm_nt_bf16_nopad(A, B, C, m_indices, m_rows)
 
 
 def grouped_gemm_nt_f4f4bf16_nopad_fake(
@@ -164,7 +164,7 @@ def grouped_gemm_nt_f4f4bf16_nopad(
     m_indices: torch.Tensor,
     m_rows: torch.Tensor,
 ) -> None:
-    deep_gemm_wrapper.grouped_gemm_nt_f4f4bf16_nopad(
+    sail_entrypoint.grouped_gemm_nt_f4f4bf16_nopad(
         (A, As), (B, Bs), bias, C, m_indices, m_rows
     )
 
@@ -189,7 +189,7 @@ def grouped_gemm_nt_bf16i4bf16_nopad(
     m_indices: torch.Tensor,
     m_rows: torch.Tensor,
 ) -> None:
-    deep_gemm_wrapper.grouped_gemm_nt_bf16i4bf16_nopad(A, (B, Bs), C, m_indices, m_rows)
+    sail_entrypoint.grouped_gemm_nt_bf16i4bf16_nopad(A, (B, Bs), C, m_indices, m_rows)
 
 
 def round_up(x: int, y: int) -> int:
