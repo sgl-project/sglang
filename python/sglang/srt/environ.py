@@ -2013,6 +2013,10 @@ class Envs:
     SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE = EnvBool(False)
     SGLANG_OPT_ENGRAM_EXTEND_HASH = EnvBool(False)
     SGLANG_OPT_DSV41_MEGA_MHC_PREFILL = EnvBool(False)
+    # Mega mHC seams with an MXFP8 output of at least ..._MIN_ROWS rows run the CuTe DSL
+    # kernel (mhc_mega_cute.py), bitwise equal to DeepGEMM's. Unset: on SM107 only.
+    SGLANG_OPT_DSV41_MHC_CUTE = EnvBool(None)
+    SGLANG_OPT_DSV41_MHC_CUTE_MIN_ROWS = EnvInt(8192)
     # Deprecated for --engram-config "replication".
     SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT = EnvStr("per_rank")
     # Scheduler-side staging of shared host-table rows on GPUs without ATS

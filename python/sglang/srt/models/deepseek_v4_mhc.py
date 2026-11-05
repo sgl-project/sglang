@@ -688,6 +688,34 @@ def _can_use_mega_mhc(cfg: HcConfig) -> bool:
     )
 
 
+def _use_mhc_cute(y: torch.Tensor, residual: torch.Tensor, hc: HcSubLayer) -> bool:
+    """The CuTe DSL seam for an MXFP8-output batch: on SM107 unless
+    SGLANG_OPT_DSV41_MHC_CUTE says otherwise, from ..._MIN_ROWS rows (DeepGEMM is
+    as fast or faster below 8K rows on VR200), at DSV4.1's mHC shape."""
+    from sglang.kernels.arch import current_arch
+
+    enabled = envs.SGLANG_OPT_DSV41_MHC_CUTE.get()
+    if enabled is None:
+        cuda = current_arch().cuda
+        enabled = cuda is not None and cuda.capability == (10, 7)
+    if not enabled or y.shape[0] < envs.SGLANG_OPT_DSV41_MHC_CUTE_MIN_ROWS.get():
+        return False
+    from sglang.kernels.ops.layernorm import mhc_mega_cute
+
+    return (
+        y.shape[1] == mhc_mega_cute.H
+        and residual.shape[1:] == (mhc_mega_cute.NR, mhc_mega_cute.H)
+        and hc.fn.shape == (mhc_mega_cute.NOUT, mhc_mega_cute.NR * mhc_mega_cute.H)
+        and hc.fn.dtype == torch.float32
+        and y.is_contiguous()
+        and residual.is_contiguous()
+        and hc.fn.is_contiguous()
+        and mhc_mega_cute.deepgemm_uses_16_splits(
+            y.shape[0], mhc_mega_cute.num_sms(y.device)
+        )
+    )
+
+
 def _can_use_decode_post_combine(cfg: HcConfig, rows: int) -> bool:
     return (
         0 < rows <= DECODE_POST_COMBINE_MAX_ROWS
@@ -730,7 +758,14 @@ def _post_fusion(
             )
         elif next.mega_moe_input is not None:
             moe_input = next.mega_moe_input(y)
-        updated, normalized, stats = mhc_mega_boundary(
+        boundary = mhc_mega_boundary
+        if y_fp8 is not None and _use_mhc_cute(y, residual, next_hc):
+            from sglang.kernels.ops.layernorm.mhc_mega_cute import (
+                mhc_mega_boundary_cute,
+            )
+
+            boundary = mhc_mega_boundary_cute
+        updated, normalized, stats = boundary(
             y,
             residual,
             pre,
