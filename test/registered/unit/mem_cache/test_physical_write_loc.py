@@ -38,8 +38,13 @@ from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     write_loc_is_physical,
 )
+from sglang.srt.runtime_context import reset_context
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.unified_allocator_fixtures import arena_of, build_test_unified_pools
+from sglang.test.unified_allocator_fixtures import (
+    arena_of,
+    build_test_unified_pools,
+    setup_allocator_context,
+)
 
 register_cpu_ci(est_time=38, suite="base-a-test-cpu")
 
@@ -163,6 +168,11 @@ class TestKVWriteLocCarriesTheMark(unittest.TestCase):
 
 
 class TestUnifiedDoorsRefuseUnmarkedLocs(unittest.TestCase):
+    def setUp(self):
+        # The pool fixtures read the published server args and parallel config.
+        setup_allocator_context()
+        self.addCleanup(reset_context)
+
     def _kv(self, n=2):
         k = torch.ones((n, _H, _D), dtype=_DTYPE, device=_DEV)
         return k, k * 2
