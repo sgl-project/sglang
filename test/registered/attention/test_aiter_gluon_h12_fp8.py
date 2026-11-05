@@ -474,40 +474,142 @@ class TestMlaDcpDecodeRoute(CustomTestCase):
         self.assertFalse(self._selected(decode_backend="gluon"))
 
 
-class TestMlaGluonSupportsDcpDecode(CustomTestCase):
-    """mla_gluon asserts gfx950, runs decode only in its bh16 regimes (<= 96 heads,
-    not 64, bf16 or e4m3fn KV), and its bh64 regime (64, 128 heads) needs batch % 64.
-    A DCP decode routed to Gluon outside these must fail at startup, not at decode."""
+def _mla_gluon_with_lse(q_nope, q_pe, kv_c, o, *args, return_lse=False, **kwargs):
+    """An aiter mla_gluon that can return the lse."""
 
-    def _supports(self, *, gfx950=True, **overrides):
-        kwargs = dict(gathered_num_head=96, kv_cache_dtype=torch.bfloat16)
+
+class TestMlaGluonDcpUnsupportedReason(CustomTestCase):
+    """mla_gluon asserts gfx950, head dims 512 and 64, and in its bh16 regimes (<= 96
+    heads, not 64) a bf16 query over a bf16 or e4m3fn cache; its bh64 regime (64, 128
+    heads) needs batch % 64. DCP also needs it to return the lse. A DCP route to Gluon
+    outside these must fail at startup, not at decode."""
+
+    def _reason(self, *, gluon_fn=_mla_gluon_with_lse, gfx950=True, **overrides):
+        kwargs = dict(
+            gathered_num_head=96,
+            q_dtype=torch.bfloat16,
+            kv_cache_dtype=torch.bfloat16,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+        )
         kwargs.update(overrides)
         with (
-            mock.patch(_GLUON_FN, return_value=mock.Mock()),
-            mock.patch.object(mod, "is_gfx95_supported", return_value=gfx950),
+            mock.patch(_GLUON_FN, return_value=gluon_fn),
+            mock.patch.object(mod, "_is_gfx950", return_value=gfx950),
         ):
-            return mod.mla_gluon_supports_dcp_decode(**kwargs)
+            return mod.mla_gluon_dcp_unsupported_reason(**kwargs)
 
     def test_bh16_shapes_on_gfx950(self):
-        self.assertTrue(self._supports())
-        self.assertTrue(self._supports(kv_cache_dtype=torch.float8_e4m3fn))
-        self.assertTrue(self._supports(gathered_num_head=48))
+        self.assertIsNone(self._reason())
+        self.assertIsNone(self._reason(kv_cache_dtype=torch.float8_e4m3fn))
+        self.assertIsNone(self._reason(gathered_num_head=48))
 
     def test_bh64_and_oversized_head_counts(self):
         for heads in (64, 97, 128):
-            self.assertFalse(self._supports(gathered_num_head=heads))
+            self.assertIsNotNone(self._reason(gathered_num_head=heads))
 
     def test_other_arch_and_kv_dtype(self):
-        self.assertFalse(self._supports(gfx950=False))
-        self.assertFalse(self._supports(kv_cache_dtype=torch.float8_e4m3fnuz))
+        self.assertIsNotNone(self._reason(gfx950=False))
+        self.assertIsNotNone(self._reason(kv_cache_dtype=torch.float8_e4m3fnuz))
 
-    def test_unavailable_gluon(self):
-        with mock.patch(_GLUON_FN, return_value=None):
-            self.assertFalse(
-                mod.mla_gluon_supports_dcp_decode(
-                    gathered_num_head=96, kv_cache_dtype=torch.bfloat16
-                )
-            )
+    def test_fp16_query(self):
+        self.assertIsNotNone(self._reason(q_dtype=torch.float16))
+
+    def test_other_mla_head_dims(self):
+        self.assertIsNotNone(self._reason(kv_lora_rank=256))
+        self.assertIsNotNone(self._reason(qk_rope_head_dim=32))
+
+    def test_unavailable_gluon_or_no_lse(self):
+        def mla_gluon_without_lse(q_nope, q_pe, kv_c, o, *args, **kwargs):
+            pass
+
+        self.assertIsNotNone(self._reason(gluon_fn=None))
+        self.assertIsNotNone(self._reason(gluon_fn=mla_gluon_without_lse))
+
+    def test_arch_must_be_gfx950_exactly(self):
+        for arch, expected in (("gfx950:sramecc+:xnack-", True), ("gfx951", False)):
+            props = mock.Mock(gcnArchName=arch)
+            with (
+                mock.patch.object(torch.version, "hip", "7.0"),
+                mock.patch("torch.cuda.get_device_properties", return_value=props),
+            ):
+                self.assertEqual(mod._is_gfx950(), expected)
+
+
+_BACKEND = "sglang.srt.layers.attention.aiter_backend"
+
+
+class TestMlaDcpGluonStartupCheck(CustomTestCase):
+    """A DCP server whose decode or target verify fell to a Gluon that cannot run it
+    started, then crashed at the first decode or verify. Building the backend must
+    fail instead, and an fp8 cache on the asm kernels must not need Gluon at all."""
+
+    def _build(self, *, kv_cache_dtype, verify_backend="asm"):
+        # Kimi K3 at TP8 DCP8 (96 gathered heads, 4 draft tokens), on a Gluon that
+        # cannot run it, so any route that reaches Gluon must raise.
+        from sglang.srt.configs.model_config import AttentionArch
+        from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
+
+        runner = mock.Mock(
+            kv_cache_dtype=kv_cache_dtype,
+            device="cpu",
+            decode_attention_backend_str="aiter",
+        )
+        runner.req_to_token_pool.size = 4
+        cfg = runner.model_config
+        cfg.dtype = torch.bfloat16
+        cfg.is_multimodal = False
+        cfg.attention_arch = AttentionArch.MLA
+        cfg.num_attention_heads = 96
+        cfg.get_num_kv_heads.return_value = 1
+        cfg.head_dim = 192
+        cfg.v_head_dim = 128
+        cfg.kv_lora_rank = 512
+        cfg.qk_rope_head_dim = 64
+        cfg.context_len = 4096
+        spec = mock.Mock(
+            speculative_num_draft_tokens=4,
+            speculative_num_steps=3,
+            speculative_algorithm="EAGLE",
+            speculative_attention_mode="decode",
+        )
+        with (
+            envs.SGLANG_AITER_MLA_DECODE_BACKEND.override("asm"),
+            envs.SGLANG_AITER_MLA_VERIFY_BACKEND.override(verify_backend),
+            mock.patch(f"{_BACKEND}.get_schedule", return_value=mock.Mock(page_size=1)),
+            mock.patch(f"{_BACKEND}.get_spec", return_value=spec),
+            mock.patch(
+                f"{_BACKEND}.get_parallel",
+                return_value=mock.Mock(attn_tp_size=8, attn_dcp_size=8),
+            ),
+            mock.patch(f"{_BACKEND}.resolve_window_kv_pool", return_value=None),
+            mock.patch(f"{_BACKEND}.resolve_window_id_space", return_value=None),
+            mock.patch(f"{_BACKEND}._kv_cache_is_vectorized_5d", return_value=False),
+            mock.patch(f"{_BACKEND}._require_untranslated_storage"),
+            mock.patch(f"{_BACKEND}.is_dp_attention_enabled", return_value=False),
+            # __init__ rewrites these module globals; restore them afterwards.
+            mock.patch(f"{_BACKEND}._use_mla_ps_kernel", True),
+            mock.patch(f"{_BACKEND}.fast_mode", False),
+            mock.patch(f"{_BACKEND}.intra_batch_mode", True),
+            mock.patch(_GLUON_FN, return_value=None),
+            mock.patch(
+                f"{_BACKEND}.mla_gluon_dcp_unsupported_reason",
+                return_value="mla_gluon runs only on gfx950",
+            ),
+        ):
+            return AiterAttnBackend(runner, skip_prefill=True)
+
+    def test_bf16_cache_fails_at_startup(self):
+        with self.assertRaisesRegex(ValueError, "DCP decode runs on Gluon"):
+            self._build(kv_cache_dtype=torch.bfloat16)
+
+    def test_fp8_cache_on_the_asm_kernels_needs_no_gluon(self):
+        be = self._build(kv_cache_dtype=fp8_dtype)
+        self.assertTrue(be.use_mla_dcp_asm)
+
+    def test_gluon_verify_fails_at_startup(self):
+        with self.assertRaisesRegex(ValueError, "DCP target verify runs on Gluon"):
+            self._build(kv_cache_dtype=fp8_dtype, verify_backend="gluon")
 
 
 if __name__ == "__main__":
