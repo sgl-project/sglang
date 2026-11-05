@@ -45,6 +45,12 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqOutput,
 )
 from sglang.srt.runtime_context import get_model, get_parallel
+from sglang.srt.utils.sleep_state_utils import (
+    diff_sleep_audit,
+    export_runtime_state,
+    import_runtime_state,
+    snapshot_sleep_audit,
+)
 from sglang.srt.utils.weight_checker import overall_checksum
 
 logger = logging.getLogger(__name__)
@@ -362,6 +368,12 @@ class SchedulerWeightUpdaterManager:
         for tag in tags:
             self.offload_tags.add(tag)
 
+        # Drain in-flight kernels and D2H/H2D before any unmapping: pausing a
+        # pool whose memory is still being touched aborts Ascend devices with
+        # an SDMA channel error (vllm-ascend b6de3df77 / a4743df65 fixed the
+        # same race; sglang previously only synchronized AFTER the pauses).
+        torch.get_device_module().synchronize()
+
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
             if scheduler is not None:
                 if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
@@ -384,6 +396,9 @@ class SchedulerWeightUpdaterManager:
             self.stashed_model_static_state = _export_static_state(
                 self.tp_worker.model_runner.model
             )
+            # The export above enqueues D2H copies; they must hit the wire
+            # before the physical pages they read from are unmapped.
+            torch.get_device_module().synchronize()
             torch.distributed.barrier(self.tp_cpu_group)
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_WEIGHTS)
 
@@ -491,10 +506,17 @@ class SchedulerWeightUpdaterManager:
 
 
 def _export_static_state(model):
+    # Registered buffers plus every plain runtime tensor attr: both must
+    # survive the pause, otherwise resume hands the model zero-filled pages
+    # behind stable virtual addresses (vLLM RFC #53343 class of pollution).
+    # The audit snapshot rides along in the same dict (release -> resume)
+    # because the updaters manager restricts new instance attributes.
     return dict(
         buffers=[
             (name, buffer.detach().clone()) for name, buffer in model.named_buffers()
-        ]
+        ],
+        runtime=export_runtime_state(model),
+        audit=snapshot_sleep_audit(model),
     )
 
 
@@ -503,3 +525,26 @@ def _import_static_state(model, static_params):
         self_named_buffers = dict(model.named_buffers())
         for name, tensor in static_params["buffers"]:
             self_named_buffers[name][...] = tensor
+        import_runtime_state(model, static_params.get("runtime") or [])
+    _report_sleep_audit(model, static_params.get("audit"))
+
+
+def _report_sleep_audit(model, before) -> None:
+    if before is None:
+        return
+    after = snapshot_sleep_audit(model)
+    changed, added, removed = diff_sleep_audit(before, after)
+    if changed or added or removed:
+        logger.warning(
+            "[sleep-audit] %d tensors changed / %d added / %d removed across "
+            "release->resume (candidates for missed restore); changed(sample): %s",
+            len(changed),
+            len(added),
+            len(removed),
+            changed[:20],
+        )
+    else:
+        logger.info(
+            "[sleep-audit] all %d tracked tensors preserved across release->resume",
+            len(before),
+        )
