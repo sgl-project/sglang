@@ -546,6 +546,10 @@ class GenerateReqInput:
         elif isinstance(self.sampling_params, dict):
             self.parallel_sample_num = self.sampling_params.get("n", 1)
         else:  # isinstance(self.sampling_params, list):
+            # Check the length before n is read from the first entry.
+            _check_batch_list_length(
+                "sampling_params", self.sampling_params, self.batch_size
+            )
             self.parallel_sample_num = self.sampling_params[0].get("n", 1)
             for sampling_params in self.sampling_params:
                 if self.parallel_sample_num != sampling_params.get("n", 1):
@@ -569,6 +573,9 @@ class GenerateReqInput:
         """Normalize inputs for a single example."""
         if self.sampling_params is None:
             self.sampling_params = {}
+        elif isinstance(self.sampling_params, list):
+            # _handle_parallel_sampling checked that it has one entry.
+            self.sampling_params = self.sampling_params[0]
         if self.rid is None:
             self.rid = uuid.uuid4().hex
         if self.return_logprob is None:
@@ -755,10 +762,7 @@ class GenerateReqInput:
             self.sampling_params = [{}] * num
         elif isinstance(self.sampling_params, dict):
             self.sampling_params = [self.sampling_params] * num
-        else:  # Already a list
-            _check_batch_list_length(
-                "sampling_params", self.sampling_params, self.batch_size
-            )
+        else:  # A list, whose length _handle_parallel_sampling checked
             self.sampling_params = self.sampling_params * self.parallel_sample_num
 
     def _normalize_watermark(self, num):

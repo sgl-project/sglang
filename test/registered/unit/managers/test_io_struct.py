@@ -1161,6 +1161,27 @@ class TestGenerateReqInputNormalization(CustomTestCase):
                     req.normalize_batch_and_arguments()
                     self.assertEqual(getattr(req[1], field), value)
 
+    def test_sampling_params_list_length_is_checked_before_reading_n(self):
+        """n is read from sampling_params[0], so an empty list used to fail with
+        IndexError before the length check ran."""
+        for text, sampling_params in (
+            (["Hello", "World"], []),
+            ("Hello", []),
+            (["Hello", "World"], [{"max_new_tokens": 3, "n": 2}]),
+        ):
+            with self.subTest(text=text, sampling_params=sampling_params):
+                req = GenerateReqInput(text=text, sampling_params=sampling_params)
+                with self.assertRaisesRegex(ValueError, "batch size"):
+                    req.normalize_batch_and_arguments()
+
+    def test_single_request_uses_its_one_entry_sampling_params_list(self):
+        """With n > 1 such a request becomes a batch of one and already worked;
+        with n = 1 the list reached the tokenizer manager, which expects a dict."""
+        req = GenerateReqInput(text="Hello", sampling_params=[{"max_new_tokens": 3}])
+        req.normalize_batch_and_arguments()
+        self.assertTrue(req.is_single)
+        self.assertEqual(req.sampling_params, {"max_new_tokens": 3})
+
     def test_error_cases(self):
         """Test various error cases."""
         # Test when neither text, input_ids, nor input_embeds is provided
