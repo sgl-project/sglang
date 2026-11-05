@@ -104,7 +104,8 @@ class TargetHiddenKvInjector:
                 output_size=num_tokens,
             )
         # The draft KV goes to the slots the target prefill writes.
-        cache_loc = self.ids_for(self.model_runner.runner_ids.own_plan(batch))
+        iteration_ids = self.model_runner.runner_ids.own_plan(batch)
+        cache_loc = self.ids_for(iteration_ids)
         pool = self.draft_model_runner.token_to_kv_pool
         swa_loc = None
         if hasattr(pool, "set_swa_key_buffer_radix_fused_norm_rope"):
@@ -116,6 +117,10 @@ class TargetHiddenKvInjector:
                 commit_lens=None,
                 state_slot=state_slot,
                 final_pos=final_pos,
+            )
+        else:
+            swa_loc = iteration_ids.write_ids(
+                self.draft_model_runner.runner_ids, kind=IdSpaceKind.SLIDING_WINDOW
             )
         return PrefillPlacement(cache_loc, positions, state_slot, final_pos, swa_loc)
 
@@ -150,6 +155,7 @@ class TargetHiddenKvInjector:
         state_slot: Optional[torch.Tensor] = None,
         final_pos: Optional[torch.Tensor] = None,
         target_hidden_is_projected: bool = False,
+        iteration_ids: Optional[IterationIds] = None,
     ) -> None:
         self._inject(
             target_hidden=target_hidden,
@@ -160,6 +166,7 @@ class TargetHiddenKvInjector:
             state_slot=state_slot,
             final_pos=final_pos,
             target_hidden_is_projected=target_hidden_is_projected,
+            iteration_ids=iteration_ids,
         )
 
     def _inject(
@@ -173,6 +180,7 @@ class TargetHiddenKvInjector:
         state_slot: Optional[torch.Tensor] = None,
         final_pos: Optional[torch.Tensor] = None,
         target_hidden_is_projected: bool = False,
+        iteration_ids: Optional[IterationIds] = None,
         swa_loc: Optional[torch.Tensor] = None,
     ) -> None:
         if target_hidden is None or target_hidden.numel() == 0:
@@ -222,6 +230,12 @@ class TargetHiddenKvInjector:
             )
             return
 
+        if iteration_ids is not None:
+            swa_loc = iteration_ids.write_ids(
+                self.draft_model_runner.runner_ids, kind=IdSpaceKind.SLIDING_WINDOW
+            )
+        if swa_loc is not None:
+            swa_loc = swa_loc.to(device=device, dtype=torch.int64, non_blocking=True)
         with torch.inference_mode():
             self.draft_model.write_target_hidden_kv(
                 target_hidden=target_hidden,
@@ -231,6 +245,7 @@ class TargetHiddenKvInjector:
                 cache_loc_2d=cache_loc_2d,
                 commit_lens=commit_lens,
                 target_hidden_is_projected=target_hidden_is_projected,
+                swa_loc=swa_loc,
             )
 
     def _inject_mla(
@@ -411,4 +426,5 @@ class TargetHiddenKvInjector:
             cache_loc_2d=verify_cache_loc_2d,
             positions=positions_2d.reshape(-1),
             commit_lens=commit_lens,
+            iteration_ids=iteration_ids,
         )
