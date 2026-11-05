@@ -152,6 +152,13 @@ class EnvBool(EnvField):
         raise ValueError(f'"{value}" is not a valid boolean value')
 
 
+class EnvRuntimeBool(EnvBool):
+    """A runtime child cannot enable an optimization while its master is off."""
+
+    def get(self) -> bool:
+        return envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get() and super().get()
+
+
 class EnvInt(EnvField):
     def parse(self, value: str) -> int:
         try:
@@ -282,7 +289,7 @@ class Envs:
     SGLANG_ROLE_NAMESPACES_OUT = EnvStr(None)
     IS_H200 = EnvBool(False)
     SGLANG_ENABLE_TORCH_INFERENCE_MODE = EnvBool(False)
-    # Explicit child values override this default for megakernel runtime optimizations.
+    # Master switch of the runtime optimizations below; off, all of them keep main's paths.
     SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION = EnvBool(False)
 
     # ===================================================================
