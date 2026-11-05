@@ -1014,7 +1014,7 @@ class SchedulerMetricsReporter:
             msg += f"#transfer-req: {len(self.scheduler.disagg_decode_transfer_queue.queue)}, "
             if get_disagg().disaggregation_decode_host_receive_threshold < 1:
                 msg += f"#host-receive-req: {self.stats.num_decode_host_receive_queue_reqs.total}, "
-            msg += f"#retracted-req: {len(self.scheduler.disagg_decode_prealloc_queue.retracted_queue)}, "
+            msg += f"#retracted-req: {len(self.scheduler.disagg_decode_prealloc_queue.retracted_queue) + self.scheduler.disagg_decode_prealloc_queue.num_rebootstrap_in_flight}, "
 
         if (
             get_disagg().language_only

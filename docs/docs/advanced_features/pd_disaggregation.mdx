@@ -860,3 +860,20 @@ python -m  sglang_router.launch_router --prefill ${P_IP}:8000 \
 --pd-disaggregation \
 --health-check-interval-secs 3600 \
 ```
+
+
+## Rebootstrap diagnostics
+
+A retracted decode request can ask its prefill worker to recompute its prefix.
+The decode leader validates a supplied prefill DP rank against the cached prefill
+topology before submitting this request. A rejected rank or executor submission
+ends through the normal transfer-failure path.
+
+The HTTP recompute request uses a connection timeout of five seconds, capped by
+`SGLANG_DISAGGREGATION_WAITING_TIMEOUT`. Its read timeout uses the full waiting
+budget so that prefill can finish recomputing a long prefix.
+
+The `PD retract rebootstrap` log records submission and transfer completion or
+failure with the request ID and bootstrap room. The decode log's
+`#retracted-req` count includes rebootstrap requests held during a pause, waiting
+for bootstrap resolution, queued for preallocation, or receiving recomputed KV.
