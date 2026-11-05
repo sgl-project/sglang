@@ -42,7 +42,7 @@ class GluonFABackend(AttentionBackend):
 
 
 class GluonFAImpl(AttentionImpl):
-    """Dense BF16/FP16 D64/D128/D256 MHA on gfx1250, with AITER fallback."""
+    """Dense BF16/FP16 D64/D128/D256 MHA on gfx1250, with AITER dense fallback."""
 
     def __init__(
         self,
@@ -114,9 +114,6 @@ class GluonFAImpl(AttentionImpl):
         if query.stride(-1) != 1 or key.stride(-1) != 1 or value.stride(-1) != 1:
             return "non-contiguous head dimension"
 
-        kernel, import_error = get_flash_attention_impl(query.device)
-        if kernel is None:
-            return f"Gluon FlashAttention unavailable: {import_error}"
         return None
 
     def _fallback(
@@ -162,8 +159,15 @@ class GluonFAImpl(AttentionImpl):
                 query, key, value, attn_metadata=attn_metadata, reason=reason
             )
 
-        kernel, _ = get_flash_attention_impl(query.device)
-        assert kernel is not None
+        kernel, import_error = get_flash_attention_impl(query.device)
+        if kernel is None:
+            return self._fallback(
+                query,
+                key,
+                value,
+                attn_metadata=attn_metadata,
+                reason=f"Gluon FlashAttention unavailable: {import_error}",
+            )
         return kernel(
             query,
             key,

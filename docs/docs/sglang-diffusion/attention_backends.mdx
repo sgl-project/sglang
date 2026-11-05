@@ -1004,6 +1004,8 @@ non-causal BF16 or FP16 multi-head attention with head dimension 64, 128, or
 sequence lengths can differ. The optimized path requires zero dropout and
 a contiguous head dimension. Unsupported dense contracts use AITER, while
 shared masked-attention routing may use SDPA.
+Packed variable-length attention selects a compatible backend before dispatch;
+the Gluon backend's AITER fallback applies to dense attention.
 
 You need a Triton build with Gluon `amd.cdna5` support, including the TDM
 `async_load_fused`, `update_tensor_descriptor`, and `prefetch` APIs used by
@@ -1065,6 +1067,10 @@ automatic guards; pipeline tiles can still use `local_guarded`. Nonfinite Q/K
 values reject both bounded routes; nonfinite V values reject the norm route. Guard fallback does not sanitize
 nonfinite inputs or make overflowing FP32 dot products finite.
 
+The long BF16 local-guard path is performance-qualified on 96-CU DPX partitions.
+Other CU counts retain global Q/K/V scans before attention dispatch. Benchmark
+those configurations separately before applying the reported DPX speedup.
+
 The device flags `NORM_UNSAFE` and `FUSED_EXP_UNSAFE` describe independent
 failed checks. A passing norm check takes priority even if the element bound
 fails, as can happen with sparse rows. The two bounded algorithms share a JIT
@@ -1078,12 +1084,7 @@ Supplying `num_cus` allows inspection with CPU or meta tensors. A reported
 `guarded` or `local_guarded` mode describes the available GPU routes; the
 helper does not read inputs or cache a decision about their values.
 
-The new 128-key pipeline tiles take sequence lengths at runtime and specialize
-on one-, two-, or three-or-more-key-tile schedules, so nearby lengths within the
-same configuration reuse compiled code. The legacy 64-key pipeline retains
-compile-time lengths to preserve its performance.
-
-#### Upstream validation
+#### Validation
 
 The host policy and adapter checks are registered in the existing upstream
 `stage-a-test-1-gpu-small-amd` and `nightly-amd-1-gpu` suites. They can run on
@@ -1111,14 +1112,19 @@ python test/registered/amd/test_gluon_fa_dpx.py
 
 The DPX replay suite runs only on 96-CU gfx1250 devices; other configurations skip it.
 
-These tests do not require model weights or generation. On a shared development
-host, run them through the site's GPU lock wrapper.
+These tests do not require model weights or generation. On a shared host,
+reserve an idle GPU and select it with `HIP_VISIBLE_DEVICES` before running them.
 
 #### Compilation
 
-Sequence lengths and softmax scale are JIT compile-time constants. A new
-resolution, frame count, prompt length, or scale can trigger a separate
-compilation; repeated calls reuse cached binaries.
+The 128-key pipeline takes sequence lengths at runtime and specializes on
+one-, two-, or three-or-more-key-tile schedules. Lengths within the same launch
+configuration reuse compiled code. The legacy 64-key pipeline, ping-pong,
+persistent, and guarded kernels specialize sequence lengths; the guarded
+kernels also specialize tensor strides. Softmax scale is a compile-time
+constant. A new resolution, frame count, prompt length, layout, or scale can
+therefore trigger compilation depending on the selected route; repeated calls
+reuse cached binaries.
 
 For one Wan2.2-T2V-A14B request at 720×1280 with 193 frames, the latent token
 count is `49 × 45 × 80 = 176400`. Dense self-attention uses

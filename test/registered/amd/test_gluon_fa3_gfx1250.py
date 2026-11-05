@@ -111,11 +111,18 @@ def test_gluon_fa_matches_aiter(
         assert config.llvm_fn_attrs == "amdgpu-sched-strategy=iterative-ilp"
     elif expected_schedule == "pingpong" and seqlen_k <= 512:
         assert config.llvm_fn_attrs == "amdgpu-sched-strategy=max-ilp"
+    actual, expected = actual.float(), expected.float()
+    reference_rms = expected.square().mean().sqrt()
+    assert reference_rms > 0
+    relative_rms_error = (actual - expected).square().mean().sqrt() / reference_rms
+    assert relative_rms_error <= 0.005, (
+        f"relative RMS error: {relative_rms_error.item()}"
+    )
     torch.testing.assert_close(
-        actual.float(),
-        expected.float(),
+        actual,
+        expected,
         rtol=0.04,
-        atol=0.04,
+        atol=0.04 * reference_rms.item(),
     )
 
 
@@ -818,6 +825,54 @@ def test_auto_pipeline_storage_offsets_repeated_fp64(dtype, head_size, shifted_i
 
 
 @pytest.mark.skipif(not _is_gfx1250(), reason="requires AMD gfx1250")
+@pytest.mark.parametrize("head_size", [64, 128])
+@pytest.mark.parametrize("seqlen_k", [257, 511, 512])
+@pytest.mark.parametrize("shifted_inputs", ["q", "k", "v", "qkv"])
+def test_auto_fp16_pingpong_storage_offsets_repeated_fp64(
+    head_size, seqlen_k, shifted_inputs
+):
+    from sglang.kernels.ops.attention.gluon.fa3.gfx1250.forward import flash_attention
+    from sglang.kernels.ops.attention.gluon.fa3.gfx1250.policy import (
+        get_num_cus,
+        resolve_execution_policy,
+    )
+
+    torch.manual_seed(1)
+    seqlen_q = ((get_num_cus(torch.device("cuda:0")) + 5) // 6) * 256 + 1
+    query = torch.randn(2, seqlen_q, 3, head_size, device="cuda", dtype=torch.float16)
+    key = torch.randn(2, seqlen_k, 3, head_size, device="cuda", dtype=torch.float16)
+    value = torch.randn_like(key)
+    inputs = []
+    for name, tensor in zip("qkv", (query, key, value)):
+        if name in shifted_inputs:
+            tensor = (
+                torch.empty(tensor.numel() + 1, device="cuda", dtype=tensor.dtype)[1:]
+                .view(tensor.shape)
+                .copy_(tensor)
+            )
+            assert tensor.storage_offset() == 1
+        inputs.append(tensor)
+
+    policy = resolve_execution_policy(*inputs)
+    assert policy.launch_config.schedule == "pingpong"
+    assert policy.launch_config.llvm_fn_attrs == "amdgpu-sched-strategy=max-ilp"
+    # Check the first and last row of every half-tile, including the query tail.
+    starts = torch.arange(0, seqlen_q, 128, device="cuda")
+    rows = torch.unique(torch.cat((starts, (starts + 127).clamp_max(seqlen_q - 1))))
+    expected = _fp64_attention(
+        inputs[0][:, rows], inputs[1], inputs[2], head_size**-0.5
+    )
+    reference_rms = expected.square().mean().sqrt().item()
+    for _ in range(500):
+        actual = flash_attention(*inputs)[:, rows].double()
+        assert torch.isfinite(actual).all()
+        assert (actual - expected).square().mean().sqrt() <= 0.001 * reference_rms
+        torch.testing.assert_close(
+            actual, expected, rtol=0.01, atol=0.01 * reference_rms
+        )
+
+
+@pytest.mark.skipif(not _is_gfx1250(), reason="requires AMD gfx1250")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("head_size", [64, 128, 256])
 @pytest.mark.parametrize("schedule", ["pipeline", "pingpong"])
@@ -1079,12 +1134,6 @@ def test_pipeline_independent_strides_fp64(dtype, seqlen_k, broadcast_query):
     _assert_extended_attention_fp64(q, k, v, output, 0.017)
 
 
-if __name__ == "__main__":
-    if not _is_gfx1250():
-        raise RuntimeError("The MI45x numerical suite requires an AMD gfx1250 GPU")
-    sys.exit(pytest.main([__file__, "-v"]))
-
-
 @pytest.mark.skipif(not _is_gfx1250(), reason="requires AMD gfx1250")
 @pytest.mark.parametrize("seqlen", [65_536, 65_537])
 @pytest.mark.parametrize("storage_offset", [0, 1])
@@ -1150,3 +1199,9 @@ def test_long_fp16_recomputes_on_graph_replay(seqlen, storage_offset):
             torch.testing.assert_close(
                 actual, expected, rtol=0.01, atol=0.01 * max(rms, 1e-7)
             )
+
+
+if __name__ == "__main__":
+    if not _is_gfx1250():
+        raise RuntimeError("The MI45x numerical suite requires an AMD gfx1250 GPU")
+    sys.exit(pytest.main([__file__, "-v"]))

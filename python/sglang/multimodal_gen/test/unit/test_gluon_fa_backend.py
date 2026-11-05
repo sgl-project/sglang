@@ -37,21 +37,31 @@ def test_rejects_nondivisible_grouped_query_heads():
 
 def test_forward_calls_gluon_kernel_for_supported_contract():
     impl = _impl()
-    query = torch.empty(1, 2, 8, 128)
-    key = torch.empty(1, 3, 8, 128)
-    value = torch.empty_like(key)
-    expected = torch.empty_like(query)
+
+    def tensor(shape):
+        result = mock.Mock(
+            ndim=4,
+            dtype=torch.bfloat16,
+            is_cuda=True,
+            device=torch.device("cuda:0"),
+            shape=shape,
+        )
+        result.stride.return_value = 1
+        return result
+
+    query = tensor((1, 2, 8, 128))
+    key = tensor((1, 3, 8, 128))
+    value = tensor(key.shape)
+    expected = torch.empty(1, 2, 8, 128)
     kernel = mock.Mock(return_value=expected)
 
-    with (
-        mock.patch.object(impl, "_unsupported_reason", return_value=None),
-        mock.patch.object(
-            gluon_fa, "get_flash_attention_impl", return_value=(kernel, None)
-        ),
-    ):
+    with mock.patch.object(
+        gluon_fa, "get_flash_attention_impl", return_value=(kernel, None)
+    ) as resolver:
         output = impl.forward(query, key, value)
 
     assert output is expected
+    resolver.assert_called_once_with(query.device)
     kernel.assert_called_once_with(
         query,
         key,
@@ -70,9 +80,11 @@ def test_unsupported_contract_uses_aiter_fallback():
     key = torch.empty_like(query)
     value = torch.empty_like(query)
 
-    output = impl.forward(query, key, value)
+    with mock.patch.object(gluon_fa, "get_flash_attention_impl") as resolver:
+        output = impl.forward(query, key, value)
 
     assert output is expected
+    resolver.assert_not_called()
     fallback.forward.assert_called_once_with(query, key, value, None)
 
 

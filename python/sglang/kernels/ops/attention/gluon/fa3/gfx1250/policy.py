@@ -181,7 +181,8 @@ def select_launch_config(
             else ""
         )
         return LaunchConfig("pingpong", 256, 64, 8, head_size == 128, scheduler)
-    # max-ilp intermittently corrupts FP16 inputs with nonzero storage offsets.
+    # The four-wave pipeline's max-ilp schedule intermittently corrupts FP16
+    # inputs with nonzero storage offsets.
     # Use default pipeline scheduling until the affected cases are understood.
     return LaunchConfig(
         "pipeline",
