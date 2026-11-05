@@ -24,7 +24,7 @@ def test_fork_join_example_is_independent_of_http_time(tmp_path, monkeypatch):
     for index, delay in enumerate((0, 0.08)):
         runner, endpoint = _start_server(tmp_path / f"run-{index}", monkeypatch)
 
-        async def send(http, base_url, payload):
+        async def send(http, base_url, payload, delay=delay):
             await asyncio.sleep(delay)
             async with http.post(f"{base_url}/generate", json=payload) as response:
                 response.raise_for_status()

@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from functools import wraps
 
 import zmq
+
 from sglang_simulator.compat import validate_coordinator_endpoint
 from sglang_simulator.simulation.coordinator import (
     Cancel,
@@ -224,10 +225,10 @@ class CoordinatedScheduler:
                     if not self.clock.awaiting_ready:
                         raise ProtocolError(f"HTTP abort without Cancel: {req.rid}")
                     self._aborts.add(req.rid)
-            elif kind in ("GetInternalStateReq", "ConfigureLoggingReq", "FreezeGCReq"):
-                self._admin.append(req)
-            elif kind == "ShutdownReq" and (
-                self._finished or self.clock.run_id is None
+            elif (
+                kind in ("GetInternalStateReq", "ConfigureLoggingReq", "FreezeGCReq")
+                or kind == "ShutdownReq"
+                and (self._finished or self.clock.run_id is None)
             ):
                 self._admin.append(req)
             else:

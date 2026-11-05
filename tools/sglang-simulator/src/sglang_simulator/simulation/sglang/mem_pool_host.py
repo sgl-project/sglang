@@ -4,6 +4,7 @@ from functools import lru_cache
 
 import numpy as np
 import torch
+
 from sglang_simulator.hook import BaseHook
 from sglang_simulator.simulation.manager import ConfigManager, StateManager
 from sglang_simulator.utils import get_logger

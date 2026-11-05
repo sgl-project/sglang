@@ -64,7 +64,7 @@ class SGLangServingRunner:
             "--disable-overlap-schedule",
         ]
         cmd.extend(extra_args or [])
-        self.server_proc = subprocess.Popen(cmd, env=env, preexec_fn=os.setsid)
+        self.server_proc = subprocess.Popen(cmd, env=env, start_new_session=True)
         for _ in range(120):
             if self.server_proc.poll() is not None:
                 raise RuntimeError("SGLang Simulator server exited during startup")

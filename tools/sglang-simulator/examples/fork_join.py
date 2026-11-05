@@ -30,9 +30,12 @@ async def run(base_url, coordinator, tool_delay_s=5.0, *, send=generate):
     failure = asyncio.get_running_loop().create_future()
 
     def check_http(task):
-        if not task.cancelled() and (error := task.exception()) is not None:
-            if not failure.done():
-                failure.set_result(error)
+        if (
+            not task.cancelled()
+            and (error := task.exception()) is not None
+            and not failure.done()
+        ):
+            failure.set_result(error)
 
     async def checked(awaitable):
         task = asyncio.ensure_future(awaitable)

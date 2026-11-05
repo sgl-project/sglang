@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from functools import wraps
 
 import msgspec
+
 from sglang_simulator.hook import BaseHook
 from sglang_simulator.simulation.coordinator import Coordinator, ProtocolError
 from sglang_simulator.simulation.sglang.token_events import TokenEventRecorder

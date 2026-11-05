@@ -4,7 +4,7 @@ import json
 import os
 import time
 from dataclasses import asdict
-from typing import Any
+from typing import Any, ClassVar
 
 from sglang_simulator.compat import validate_simulator_server_args
 from sglang_simulator.hook import (
@@ -27,9 +27,8 @@ from sglang_simulator.simulation.utils import (
     calc_iteration_metrics,
     calc_metrics,
 )
-from sglang_simulator.time_predictor import InferTimePredictor
+from sglang_simulator.time_predictor import InferTimePredictor, ScheduleRequest
 from sglang_simulator.time_predictor import ScheduleBatch as SimulationScheduleBatch
-from sglang_simulator.time_predictor import ScheduleRequest
 from sglang_simulator.utils import get_logger
 from sglang_simulator.utils.json import CustomJsonEncoder
 
@@ -280,7 +279,7 @@ class C_SchedulerHook(BaseHook):
     INFERENCE_PREDICTOR: InferTimePredictor = None
     COORDINATOR = None
 
-    ITERATION_STATS: list[dict] = []
+    ITERATION_STATS: ClassVar[list[dict]] = []
     TOTAL_PREDICTOR_TIME_COST = 0
     GET_NEW_BATCH_PREFILL_TIME_COST = 0
 
@@ -368,7 +367,7 @@ class C_SchedulerHook(BaseHook):
                 logger.error(
                     f"Failed to initialize inference time predictor. Error: {e}"
                 )
-                raise e
+                raise
 
         def wrapped_recv_requests(self, *args, **kwargs) -> list:
             if C_SchedulerHook.COORDINATOR is not None:
@@ -641,7 +640,7 @@ class C_SchedulerHook(BaseHook):
                     logger.info(f"Simulation results saved to {output_dir}.")
 
                 except Exception as e:
-                    logger.error(f"Failed to dump results. Error: {e}")
+                    logger.exception(f"Failed to dump results. Error: {e}")
             else:
                 logger.warning("No request statistics available.")
 
@@ -654,10 +653,9 @@ class C_SchedulerHook(BaseHook):
             C_SchedulerHook.REQ_DISPATCHER.profile_active = is_start_profile
             C_SchedulerHook.INFERENCE_PREDICTOR.reset_metrics()
 
-            ProfileReqOutput = getattr(
-                importlib.import_module("sglang.srt.managers.io_struct"),
-                "ProfileReqOutput",
-            )
+            ProfileReqOutput = importlib.import_module(
+                "sglang.srt.managers.io_struct"
+            ).ProfileReqOutput
             result = {
                 "total_request": len(stats),
                 "output_directory": output_dir,
@@ -674,7 +672,7 @@ class C_SchedulerHook(BaseHook):
             _request_dispatcher = getattr(self, "_request_dispatcher", None)
 
             if _request_dispatcher is not None:
-                for ty in _request_dispatcher._mapping.keys():
+                for ty in _request_dispatcher._mapping:
                     if ty.__name__ == "ProfileReq":
                         _request_dispatcher._mapping[ty] = override_profile
             return ret
