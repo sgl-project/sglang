@@ -1,159 +1,226 @@
-"""
-SGLang Embeddings Benchmark Script
+"""Closed-loop synthetic benchmark for the cross-encoder /v1/rerank API.
 
-This script benchmarks SGLang's /v1/embeddings API performance using HTTP requests.
+Example:
+    python benchmark/prefill_only/bench_rerank.py \
+        --model /localdisk2/huggingface/bge-reranker-base \
+        --input-len 256 --query-len 32 --documents 1 \
+        --concurrency 24 --num-requests 1000 --warmup-requests 48
 
-Features:
-- HTTP-only implementation
-- Uses /v1/embeddings API endpoint directly
-- Configurable RPS, duration, and batch sizes
-- Progress tracking and detailed metrics
-- Poisson and constant request distributions
-
-Usage:
-- Update configuration variables at the top of the file
-- Ensure SGLang server is running on the configured HTTP_URL
-- Run: python bench_embeddings.py
+Input length includes query, document, and pair special tokens. Text generation
+and warmup are excluded from timing. Disable server prefix caching for this
+repeated-input workload. This measures performance, not ranking accuracy.
 """
 
+import argparse
 import asyncio
-import logging
-from typing import Optional
+import json
+import math
+import sys
+import time
+from pathlib import Path
 
-from transformers import AutoTokenizer
-from util import (
-    BenchmarkConfig,
-    generate_text_with_token_count,
-    run_benchmark_main,
-    run_generic_benchmark,
-)
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
-logger = logging.getLogger(__name__)
-
-###############################################################################
-# CONFIG
-###############################################################################
-# Create benchmark configuration
-config = BenchmarkConfig()
-config.rps_values = [500]
-config.duration_secs_values = [60]
-config.num_unique_requests = 100
-config.distribution = "POISSON"
-config.profile = False
-config.freeze_gc = True  # Enable GC freeze functionality
-# Profiler output directory - by default uses present working directory (pwd)
-# Uncomment and customize the line below to override the default location:
-# config.profiler_dir = "/sglang-oss-trace"
-
-# HTTP Configuration
-HTTP_URL = "http://localhost:30000/v1/embeddings"
-
-# Embeddings API Config
-EMBEDDINGS_MODEL_PATH = "Qwen/Qwen3-Embedding-0.6B"
-BATCH_SIZE = [1]  # Number of items per request (batch size)
-
-# Configurable input token length
-EMBEDDINGS_INPUT_TOKENS = 500  # Default token length
-MATRYOSHKA_DIMENSIONS: Optional[int] = (
-    None  # Set to None to disable matryoshka embeddings
-)
-
-# Load tokenizer once for embeddings text generation
-print("Loading tokenizer for embeddings input generation...")
-embeddings_tokenizer = AutoTokenizer.from_pretrained(EMBEDDINGS_MODEL_PATH)
-
-# Generate input text with the specified token length using pre-loaded tokenizer
-EMBEDDINGS_INPUT_TEXT = generate_text_with_token_count(
-    EMBEDDINGS_MODEL_PATH,
-    EMBEDDINGS_INPUT_TOKENS,
-    config.special_replicated_token,
-    tokenizer=embeddings_tokenizer,
-)
+import aiohttp
+import numpy as np
+from sglang.srt.utils.hf_transformers import get_tokenizer
 
 
-###############################################################################
-# REQUEST GENERATION (in parallel)
-###############################################################################
-def build_embeddings_request(index: int, item_count: int) -> tuple:
-    """Build a single embeddings request."""
-    try:
-        # For embeddings, input can be a string or list of strings
-        if item_count == 1:
-            input_data = EMBEDDINGS_INPUT_TEXT
-        else:
-            input_data = [EMBEDDINGS_INPUT_TEXT for _ in range(item_count)]
-        req = {
-            "input": input_data,
-            "model": EMBEDDINGS_MODEL_PATH,
-            "dimensions": MATRYOSHKA_DIMENSIONS,
-        }
-        return (index, req)
-    except Exception as e:
-        logger.error(f"Error building request {index}: {e}")
-        return (index, None)
-
-
-def validate_embeddings_response(response_data: dict) -> bool:
-    """Validate embeddings API response."""
-    return (
-        "data" in response_data
-        and len(response_data["data"][0]["embedding"]) == MATRYOSHKA_DIMENSIONS
-        if MATRYOSHKA_DIMENSIONS
-        else True
+def build_payload(args: argparse.Namespace) -> dict:
+    tokenizer = get_tokenizer(args.model)
+    document_len = (
+        args.input_len - args.query_len - tokenizer.num_special_tokens_to_add(pair=True)
     )
-
-
-def build_warmup_embeddings_request() -> dict:
-    """Build a warmup request for the embeddings API."""
+    if document_len < 1:
+        raise ValueError("--input-len must leave space for document and special tokens")
+    if args.input_len > tokenizer.model_max_length:
+        raise ValueError(
+            f"--input-len exceeds tokenizer limit {tokenizer.model_max_length}"
+        )
+    query = " ".join(["test"] * args.query_len)
+    document = " ".join(["the"] * document_len)
+    query_len = len(tokenizer.encode(query, add_special_tokens=False))
+    pair_len = len(
+        tokenizer([[query, document]], return_token_type_ids=True)["input_ids"][0]
+    )
+    if query_len != args.query_len or pair_len != args.input_len:
+        raise ValueError(
+            "Synthetic text does not produce the requested lengths with this "
+            f"tokenizer: query={query_len}, pair={pair_len}"
+        )
     return {
-        "input": EMBEDDINGS_INPUT_TEXT,
-        "model": EMBEDDINGS_MODEL_PATH,
-        "dimensions": MATRYOSHKA_DIMENSIONS,
+        "model": args.model,
+        "query": query,
+        "documents": [document] * args.documents,
+        "return_documents": False,
     }
 
 
-###############################################################################
-# MAIN
-###############################################################################
-async def run_benchmark(rps, duration_secs, item_count):
-    """Run a single embeddings benchmark with the given RPS value."""
-    return await run_generic_benchmark(
-        rps=rps,
-        duration_secs=duration_secs,
-        item_count=item_count,
-        config=config,
-        http_url=HTTP_URL,
-        build_request_func=build_embeddings_request,
-        response_validator=validate_embeddings_response,
-        api_name="EMBEDDINGS",
-        request_description="embeddings requests",
+def validate_response(data: object, documents: int, input_len: int) -> None:
+    if not isinstance(data, list) or len(data) != documents:
+        raise ValueError(f"Expected {documents} rerank results, got {str(data)[:500]}")
+    indices = set()
+    for item in data:
+        if not isinstance(item, dict):
+            raise TypeError(f"Invalid rerank result: {item}")
+        index = item.get("index")
+        score = item.get("score")
+        if (
+            type(index) is not int
+            or not 0 <= index < documents
+            or index in indices
+            or type(score) not in (int, float)
+            or not math.isfinite(score)
+        ):
+            raise ValueError(f"Invalid rerank result: {item}")
+        meta_info = item.get("meta_info")
+        if (
+            not isinstance(meta_info, dict)
+            or meta_info.get("prompt_tokens") != input_len
+        ):
+            raise ValueError(
+                f"Expected {input_len} server-side prompt tokens per pair, "
+                f"got meta_info={meta_info}"
+            )
+        indices.add(index)
+
+
+async def run_requests(
+    *,
+    session: aiohttp.ClientSession,
+    url: str,
+    payload: dict,
+    count: int,
+    concurrency: int,
+    input_len: int,
+) -> tuple[list[float], list[str], float]:
+    requests = iter(range(count))
+    latencies: list[float] = []
+    errors: list[str] = []
+
+    async def worker() -> None:
+        for index in requests:
+            start = time.perf_counter()
+            try:
+                async with session.post(url, json=payload) as response:
+                    body = await response.text()
+                    if response.status != 200:
+                        raise ValueError(f"HTTP {response.status}: {body[:500]}")
+                    validate_response(
+                        json.loads(body), len(payload["documents"]), input_len
+                    )
+                latencies.append(time.perf_counter() - start)
+            except (
+                aiohttp.ClientError,
+                asyncio.TimeoutError,
+                TypeError,
+                ValueError,
+            ) as exc:
+                error = f"Request {index}: {type(exc).__name__}: {exc}"
+                print(error, file=sys.stderr, flush=True)
+                errors.append(error)
+
+    start = time.perf_counter()
+    await asyncio.gather(*(worker() for _ in range(min(count, concurrency))))
+    return latencies, errors, time.perf_counter() - start
+
+
+async def benchmark(args: argparse.Namespace) -> bool:
+    payload = build_payload(args)
+    url = args.base_url.rstrip("/") + "/v1/rerank"
+    print(
+        f"URL: {url}\n"
+        f"Pair tokens: {args.input_len}, documents/request: {args.documents}, "
+        f"concurrency: {args.concurrency}",
+        flush=True,
     )
+    timeout = aiohttp.ClientTimeout(total=args.timeout)
+    connector = aiohttp.TCPConnector(limit=args.concurrency)
+    async with aiohttp.ClientSession(
+        timeout=timeout, connector=connector, trust_env=False
+    ) as session:
+        _, warmup_errors, _ = await run_requests(
+            session=session,
+            url=url,
+            payload=payload,
+            count=args.warmup_requests,
+            concurrency=args.concurrency,
+            input_len=args.input_len,
+        )
+        if warmup_errors:
+            raise RuntimeError("Warmup failed; benchmark was not run")
+        print("Warmup complete; starting measured requests.", flush=True)
+        latencies, errors, duration = await run_requests(
+            session=session,
+            url=url,
+            payload=payload,
+            count=args.num_requests,
+            concurrency=args.concurrency,
+            input_len=args.input_len,
+        )
 
-
-async def main():
-    additional_info = {
-        "Input text length": f"{EMBEDDINGS_INPUT_TOKENS} tokens",
-        "Input text preview": (
-            EMBEDDINGS_INPUT_TEXT[:100] + "..."
-            if len(EMBEDDINGS_INPUT_TEXT) > 100
-            else EMBEDDINGS_INPUT_TEXT
+    completed = len(latencies)
+    result = {
+        "model": args.model,
+        "base_url": args.base_url,
+        "input_tokens_per_pair": args.input_len,
+        "query_tokens": args.query_len,
+        "documents_per_request": args.documents,
+        "concurrency": args.concurrency,
+        "warmup_requests": args.warmup_requests,
+        "num_requests": args.num_requests,
+        "completed": completed,
+        "failed": len(errors),
+        "duration_s": duration,
+        "requests_per_s": completed / duration,
+        "pairs_per_s": completed * args.documents / duration,
+        "input_tokens_per_s": completed * args.documents * args.input_len / duration,
+        "latency_ms": (
+            {
+                "mean": float(np.mean(latencies) * 1000),
+                **{
+                    f"p{p}": float(np.percentile(latencies, p) * 1000)
+                    for p in (50, 90, 95, 99)
+                },
+            }
+            if latencies
+            else None
         ),
+        "errors": errors,
     }
+    output = json.dumps(result, indent=2)
+    print(output)
+    if args.output_file:
+        args.output_file.write_text(output + "\n")
+    return not errors
 
-    await run_benchmark_main(
-        config,
-        run_benchmark,
-        "EMBEDDINGS",
-        HTTP_URL,
-        BATCH_SIZE,
-        additional_info,
-        build_warmup_embeddings_request,
-    )
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model", required=True, help="Local tokenizer/model path")
+    parser.add_argument("--base-url", default="http://127.0.0.1:30000")
+    parser.add_argument("--input-len", type=int, default=256)
+    parser.add_argument("--query-len", type=int, default=32)
+    parser.add_argument("--documents", type=int, default=1)
+    parser.add_argument("--concurrency", type=int, default=24)
+    parser.add_argument("--num-requests", type=int, default=1000)
+    parser.add_argument("--warmup-requests", type=int, default=48)
+    parser.add_argument("--timeout", type=float, default=120)
+    parser.add_argument("--output-file", type=Path)
+    args = parser.parse_args()
+    for name in (
+        "input_len",
+        "query_len",
+        "documents",
+        "concurrency",
+        "num_requests",
+        "timeout",
+    ):
+        value = vars(args)[name]
+        if not math.isfinite(value) or value <= 0:
+            parser.error(f"--{name.replace('_', '-')} must be positive and finite")
+    if args.warmup_requests < 0:
+        parser.error("--warmup-requests must be non-negative")
+    return args
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    sys.exit(0 if asyncio.run(benchmark(parse_args())) else 1)
