@@ -146,7 +146,7 @@ python -m sglang.launch_server \
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>auto</code> / <code>safetensors</code> / <code>mistral</code> / <code>flash_rl</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>max_inflight_bytes</code> (int)</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Cap on the summed size of the safetensors shards the multithreaded loader has submitted but not yet handed out (one shard is always admitted); the shard being consumed comes on top, so peak host RAM is about the cap plus one shard. Bounds host RAM on memory-limited hosts, especially with <code>--weight-loader-disable-mmap</code>, where every in-flight shard is held in memory. Safetensors checkpoints only; ignored for <code>.bin</code> weights.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Cap on the summed size of the safetensors shards the multithreaded loader has submitted but not yet handed out (one shard is always admitted); the shard being consumed comes on top, so peak host RAM is about the cap plus one shard. Bounds host RAM on memory-limited hosts, especially with <code>--weight-loader-disable-mmap</code>, where every in-flight shard is held in memory; in that mode a loading shard briefly needs about twice its size, so peak can reach about twice the cap plus one shard. Safetensors checkpoints only; ignored for <code>.bin</code> weights.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>None (only <code>num_threads</code> + 1 shards)</td>
     </tr>
     <tr>

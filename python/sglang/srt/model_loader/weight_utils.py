@@ -1339,7 +1339,10 @@ def buffered_multi_thread_safetensors_weights_iterator(
     Peak CPU RAM ≈ (max_workers + 2) × shard_file_size.
     ``max_inflight_bytes`` also caps the summed size of the files submitted
     but not yet handed out (one file is always admitted). The shard being
-    yielded is not counted, so peak RAM is about the cap plus one shard.
+    yielded is not counted, so peak RAM is about the cap plus one shard. With
+    ``disable_mmap`` the read bytes stay alive while the tensors are built, so a
+    loading shard briefly needs about twice its size and peak RAM can reach
+    about twice the cap plus one shard.
     """
     prefetch_handle = None
     if prefetch and not disable_mmap:
