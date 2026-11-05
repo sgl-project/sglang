@@ -30,6 +30,7 @@ After all-gather, the blocks are reranged back to their original order:
 
 from __future__ import annotations
 
+import logging
 from contextlib import nullcontext
 from dataclasses import dataclass
 from itertools import accumulate
@@ -52,8 +53,14 @@ from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
 )
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
-from sglang.srt.model_executor.forward_context import get_kv_layers
-from sglang.srt.runtime_context import get_device, get_parallel
+from sglang.srt.model_executor.forward_context import (
+    get_attn_backend,
+    get_kv_layers,
+    has_forward_context,
+)
+from sglang.srt.runtime_context import attention_backends, get_device, get_parallel
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -105,6 +112,7 @@ ContextParallelMetadata = ZigzagContextParallelMetadata
 class ZigzagCPStrategy(ContextParallelStrategy):
     name = "zigzag"
     kind = ContextParallelStrategyKind.ZIGZAG
+    _prefill_backend_supported: Optional[bool] = None
 
     def can_apply(self, num_tokens: int, forward_batch) -> bool:
         if self.cp_size <= 1 or num_tokens < self.cp_size * 2:
@@ -114,9 +122,52 @@ class ZigzagCPStrategy(ContextParallelStrategy):
             return False
 
         extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
-        if extend_lens is None:
+        if extend_lens is not None and not all(
+            int(length) >= self.cp_size * 2 for length in extend_lens
+        ):
+            return False
+        return self._prefill_backend_supports_cp()
+
+    def _prefill_backend_supports_cp(self) -> bool:
+        """Whether the prefill attention backend can run zigzag CP.
+
+        Only FlashInfer's limits are checked here. The answer is fixed for the
+        process, so it is cached once a forward context exposes the backend.
+        """
+        if self._prefill_backend_supported is not None:
+            return self._prefill_backend_supported
+        try:
+            prefill_backend, _ = attention_backends()
+            backend_kind = CPAttentionBackendKind.from_string(prefill_backend)
+        except ValueError:
+            # Unpublished config, or a backend with no CP kind.
             return True
-        return all(int(length) >= self.cp_size * 2 for length in extend_lens)
+        if backend_kind != CPAttentionBackendKind.FLASHINFER:
+            self._prefill_backend_supported = True
+            return True
+        if not has_forward_context():
+            return True
+
+        from sglang.srt.layers.attention.hybrid_attn_backend import (
+            HybridAttnBackend,
+        )
+        from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
+
+        backend = get_attn_backend()
+        while isinstance(backend, (HybridAttnBackend, TboAttnBackend)):
+            backend = (
+                backend.prefill_backend
+                if isinstance(backend, HybridAttnBackend)
+                else backend.primary
+            )
+        reason = backend.prefill_cp_unsupported_reason()
+        if reason is not None:
+            logger.warning(
+                "Prefill context parallelism is disabled for FlashInfer: %s.",
+                reason,
+            )
+        self._prefill_backend_supported = reason is None
+        return self._prefill_backend_supported
 
     def build_metadata(
         self,

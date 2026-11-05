@@ -32,11 +32,12 @@ from sglang.srt.layers.cp.utils import (
 from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.mem_cache_utils import routed
 from sglang.test.test_utils import CustomTestCase
@@ -844,6 +845,39 @@ class TestCPZigzagStrategy(CustomTestCase):
         self.assertTrue(torch.equal(calls[0], q[:6]))
         self.assertTrue(torch.equal(out[:6], q[:6] + 100))
         self.assertTrue(torch.equal(out[6:], torch.zeros_like(q[6:])))
+
+    def _can_apply_with_backend(self, attention_backend, backend):
+        strategy = ZigzagCPStrategy(cp_size=2)
+        fb = SimpleNamespace(forward_mode=_ExtendMode(), extend_seq_lens_cpu=[8])
+        with (
+            get_context().override_server_args(attention_backend=attention_backend),
+            forward_context(ForwardContext(attn_backend=backend)),
+        ):
+            return strategy.can_apply(8, fb), strategy.can_apply(8, fb)
+
+    def test_zigzag_can_apply_falls_back_on_unsupported_flashinfer(self):
+        calls = []
+
+        def reason():
+            calls.append(True)
+            return "prefill CUDA graphs must be disabled"
+
+        backend = SimpleNamespace(prefill_cp_unsupported_reason=reason)
+        with self.assertLogs("sglang.srt.layers.cp.zigzag", level="WARNING"):
+            self.assertEqual(
+                self._can_apply_with_backend("flashinfer", backend), (False, False)
+            )
+        self.assertEqual(len(calls), 1)
+
+    def test_zigzag_can_apply_skips_flashinfer_check_for_other_backends(self):
+        def reason():
+            raise AssertionError("only the FlashInfer prefill backend is asked")
+
+        # TRT-LLM MHA subclasses FlashInferAttnBackend and inherits the method.
+        backend = SimpleNamespace(prefill_cp_unsupported_reason=reason)
+        self.assertEqual(
+            self._can_apply_with_backend("trtllm_mha", backend), (True, True)
+        )
 
 
 class TestCPInterleaveStrategy(CustomTestCase):

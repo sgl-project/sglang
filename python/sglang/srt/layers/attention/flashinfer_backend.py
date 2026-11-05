@@ -41,6 +41,7 @@ from sglang.srt.layers.cp.base import (
     CPAttentionBackendKind,
     get_cp_strategy,
 )
+from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     KVCacheAttentionAccessKind,
 )
@@ -475,16 +476,8 @@ class FlashInferAttnBackend(AttentionBackend):
             envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.set(2048 * 1024 * 1024)
 
         self.use_paged = envs.SGLANG_FLASHINFER_USE_PAGED.get()
-        self.prefill_cp_enabled = bool(
-            prefill_backend == "flashinfer"
-            and get_parallel().enable_prefill_cp
-            and get_parallel().attn_cp_size > 1
-        )
-        if self.prefill_cp_enabled:
-            self._validate_prefill_cp_configuration(
-                model_config=model_runner.model_config,
-                sliding_window_size=model_runner.sliding_window_size,
-            )
+        # Read by prefill_cp_unsupported_reason; the CP strategy owns the check.
+        self._model_config = model_runner.model_config
 
         # Allocate buffers
         # different from flashinfer zero_init_global_workspace_buffer
@@ -615,32 +608,37 @@ class FlashInferAttnBackend(AttentionBackend):
             List[BatchPrefillWithPagedKVCacheWrapper]
         ] = None
 
-    def _validate_prefill_cp_configuration(
-        self, *, model_config, sliding_window_size
-    ) -> None:
-        kv_views = (
-            self.kv_layers.view(sub_pool.name)
-            for sub_pool in self.kv_layers.sub_pools()
-        )
-        if not (
-            get_parallel().cp_strategy == "zigzag"
-            and model_config.attention_arch == AttentionArch.MHA
-            and sliding_window_size is None
-            and not model_config.is_encoder_decoder
-            and model_config.head_dim == model_config.v_head_dim
-            and check_cuda_graph_backend(Phase.PREFILL, Backend.DISABLED)
-            # Unified MHA views label token-major NHD rows as page_major.
-            and all(
-                isinstance(view, MHAKVView)
-                and view.kv_cache_layout in ("nhd", "page_major")
-                for view in kv_views
+    def prefill_cp_unsupported_reason(self) -> Optional[str]:
+        """Why zigzag prefill CP cannot run on this backend, or None if it can.
+
+        Asked by ``ZigzagCPStrategy.can_apply`` only when FlashInfer is the
+        prefill backend, so subclasses such as TRTLLM-MHA never reach it.
+        """
+        model_config = self._model_config
+        if self.skip_prefill:
+            return "the backend was built without prefill wrappers"
+        if model_config.attention_arch != AttentionArch.MHA:
+            return "only dense MHA/GQA attention is supported"
+        # Set for sliding-window and encoder-decoder models.
+        if self.dispatch_reason is not None:
+            return "sliding-window and cross attention are not supported"
+        if model_config.head_dim != model_config.v_head_dim:
+            return "K and V head dims must match"
+        if not check_cuda_graph_backend(Phase.PREFILL, Backend.DISABLED):
+            return "prefill CUDA graphs must be disabled"
+        if self.prefill_uses_dequant_workspace:
+            return "KV caches read through a dequant workspace are not supported"
+        # Unified MHA views label token-major NHD rows as page_major.
+        if not all(
+            isinstance(view, MHAKVView)
+            and view.kv_cache_layout in ("nhd", "page_major")
+            for view in (
+                self.kv_layers.view(sub_pool.name)
+                for sub_pool in self.kv_layers.sub_pools()
             )
-            and not self.prefill_uses_dequant_workspace
         ):
-            raise ValueError(
-                "FlashInfer prefill context parallelism requires eager zigzag "
-                "with direct NHD dense causal MHA/GQA."
-            )
+            return "the KV cache must use a direct NHD layout"
+        return None
 
     def _init_forward_metadata_cp(self, forward_batch: ForwardBatch) -> None:
         cp_metadata = forward_batch.attn_cp_metadata
@@ -1111,7 +1109,7 @@ class FlashInferAttnBackend(AttentionBackend):
         return layer.k_scale, layer.v_scale
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        if self.prefill_cp_enabled and forward_batch.attn_cp_metadata is not None:
+        if is_cp_active(forward_batch):
             self._init_forward_metadata_cp(forward_batch)
             return
 
