@@ -77,9 +77,6 @@ MINIMAX_H3_HIGH_QUALITY_CACHE_DIT_CONFIG: tuple[int, float, int] = (4, 0.04, 1)
 # - ``diffusers`` always scales the reference short edge to 2048 pixels, including
 #   upscaling smaller inputs:
 #       scale = 2048 / reference_short_edge
-#   This preserves the original Diffusers and SGLang reference-image behavior and
-#   should remain the compatibility default unless a checkpoint specifies another
-#   preprocessing policy.
 #
 # See the following references for the policy definitions and training guidance:
 # - https://docs.comfy.org/tutorials/video/minimax/minimax-h3#prompting-tips-3
@@ -87,3 +84,4 @@ MINIMAX_H3_HIGH_QUALITY_CACHE_DIT_CONFIG: tuple[int, float, int] = (4, 0.04, 1)
 MINIMAX_H3_REFERENCE_RESIZE_MODES: frozenset[str] = frozenset(
     {"match", "max", "diffusers"}
 )
+MINIMAX_H3_DEFAULT_REFERENCE_RESIZE_MODE = "max"

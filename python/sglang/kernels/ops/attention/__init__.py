@@ -75,6 +75,15 @@ del _mod, _fn
 
 register_kernel(
     KernelSpec(
+        op="attention.qk_norm_rope",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.qk_norm_rope:qk_norm_rope",
+        capabilities=CUDA_ONLY,
+    )
+)
+
+register_kernel(
+    KernelSpec(
         op="attention.kda_qwen38_qsa_sm121",
         backend=KernelBackend.KDA,
         target=("sglang.kernels.kda_kernels.qwen38_qsa_sm121:qwen38_qsa_sm121"),
