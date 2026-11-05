@@ -111,14 +111,34 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         )
         self.storage.mla_suffix = storage_suffix
         self.storage.mha_suffix = storage_suffix
+        # Interleave PCP materializes full DSA KV and indexer pages on every
+        # rank. KDA state and sidecar draft pools retain their rank namespace.
+        # Use a new namespace so a shared object cannot alias an old CP0 object.
+        pcp_shared = {
+            name
+            for name, pool in self.pools.items()
+            if params.attn_cp_size > 1 and pool.pcp_replicated
+        }
+        self.storage.pool_suffixes = {
+            name: f"pcp_shared_v1_tp{tp_rank}_pp{params.pp_rank}" for name in pcp_shared
+        }
+        self.offload_pools = {
+            name
+            for name in self.pools
+            if self.offload_owner
+            and (name not in pcp_shared or params.attn_cp_rank == 0)
+        }
         logger.info(
             "Mooncake direct linker storage topology: "
-            "rank_replicated=%s, tp_rank=%d/%d, offload_owner=%s, suffix=%s",
+            "rank_replicated=%s, tp_rank=%d/%d, offload_owner=%s, suffix=%s, "
+            "pcp_shared=%s, offload_pools=%s",
             rank_replicated,
             tp_rank,
             tp_size,
             self.offload_owner,
             storage_suffix,
+            sorted(pcp_shared),
+            sorted(self.offload_pools),
         )
 
         self.register_buffers()
@@ -304,6 +324,47 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             finally:
                 self.load_queue.task_done()
 
+    def _get_layer_ranges(self, keys, ptrs, sizes, offsets):
+        store = self.storage.store
+        result = store.batch_get_into_multi_buffer_ranges(keys, ptrs, sizes, offsets)
+        if result is None or isinstance(result, int):
+            return result
+        result = list(result)
+        if len(result) != len(keys):
+            return result
+        expected = [sum(item) for item in sizes]
+        # Mooncake ErrorCode::LEASE_EXPIRED. Session leases can expire between
+        # layers of a long prefix. The synchronous read has drained its writers;
+        # reacquire only those immutable content-addressed objects and retry
+        # their current layer once. Other failures still abort the request.
+        expired = [i for i, value in enumerate(result) if value == -707]
+        if not expired or any(
+            value not in (want, -707) for value, want in zip(result, expected)
+        ):
+            return result
+        expired_keys = [keys[i] for i in expired]
+        renewed = list(store.batch_get_session_start(expired_keys))
+        if renewed != [0] * len(expired_keys):
+            raise RuntimeError(
+                f"Mooncake get session renewal failed: keys={len(expired_keys)}, "
+                f"result_sample={renewed[:8]}"
+            )
+        retried = store.batch_get_into_multi_buffer_ranges(
+            expired_keys,
+            [ptrs[i] for i in expired],
+            [sizes[i] for i in expired],
+            [offsets[i] for i in expired],
+        )
+        if retried is None or isinstance(retried, int):
+            return retried
+        retried = list(retried)
+        if len(retried) != len(expired):
+            raise RuntimeError("Mooncake renewed range get returned wrong result count")
+        for index, value in zip(expired, retried):
+            result[index] = value
+        logger.debug("Refreshed Mooncake read leases for %d objects", len(expired))
+        return result
+
     def load_layer_wise(
         self, counter_index: int, request_transfers: list[list[PoolTransfer]]
     ) -> None:
@@ -323,13 +384,14 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         )
                     )
             for keys, _ in batches.values():
+                # Even a partial start failure may have installed some sessions.
+                started.append(keys)
                 result = self.storage.store.batch_get_session_start(keys)
                 if list(result) != [0] * len(keys):
                     raise RuntimeError(
                         f"Mooncake get session start failed: keys={len(keys)}, "
-                        f"results={result}"
+                        f"result_sample={list(result)[:8]}"
                     )
-                started.append(keys)
 
             for layer in range(self.num_layers):
                 for name, (keys, locations) in batches.items():
@@ -339,12 +401,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     if meta is None:
                         continue
                     ptrs, sizes, offsets = meta
-                    result = self.storage.store.batch_get_into_multi_buffer_ranges(
-                        keys,
-                        ptrs,
-                        sizes,
-                        offsets,
-                    )
+                    result = self._get_layer_ranges(keys, ptrs, sizes, offsets)
                     expected = [sum(item) for item in sizes]
                     if (
                         result is None
@@ -353,8 +410,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     ):
                         raise RuntimeError(
                             f"Mooncake range get failed for pool={name}, "
-                            f"layer={layer}: transferred={result}, "
-                            f"expected={expected}"
+                            f"layer={layer}: objects={len(keys)}, "
+                            f"transferred_sample={result[:8] if isinstance(result, list) else result}, "
+                            f"expected_sample={expected[:8]}"
                         )
                 self.layer_done_counter.complete(counter_index, layer)
         except BaseException as error:
@@ -375,7 +433,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         if not expanded:
             return False
         self.freeze_gc_once()
-        if not self.offload_owner:
+        expanded = [t for t in expanded if t.name in self.offload_pools]
+        if not expanded:
             self.offload_results.put(True)
             return True
         kv = next(transfer for transfer in transfers if transfer.name == PoolName.KV)

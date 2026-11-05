@@ -1175,14 +1175,26 @@ def test_layer_counter_reports_failure_after_the_forward():
     assert counter.finish(index) is False
 
 
-def test_layer_counter_finish_waits_for_layers_still_loading():
-    counter = LayerWiseLoadCounter(1)
+@pytest.mark.parametrize("first_layer_fails", [False, True])
+def test_layer_counter_finish_waits_for_layers_still_loading(first_layer_fails):
+    counter = LayerWiseLoadCounter(2)
     index = counter.update_producer()
-    loader = threading.Timer(0.05, counter.complete, (index, 0))
+    first, pending = counter.futures[index]
+    if first_layer_fails:
+        first.set_exception(RuntimeError("first layer read failed"))
+    else:
+        first.set_result(None)
+    loader = threading.Timer(0.05, pending.set_result, (None,))
     loader.start()
 
-    assert counter.finish(index) is True  # the forward never waited on layer 0
-    loader.join()
+    try:
+        assert counter.finish(index) is (not first_layer_fails)
+        # Even after an earlier failure, GPU destinations cannot be reclaimed
+        # while another layer is still writing into them.
+        assert pending.done()
+        assert index not in counter.futures
+    finally:
+        loader.join()
 
 
 def test_finish_loads_adopts_a_peer_rank_failure():

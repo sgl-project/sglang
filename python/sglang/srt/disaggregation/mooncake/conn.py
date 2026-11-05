@@ -969,11 +969,36 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         ):
             # Appended draft MHA KV uses physical TP shards, while target MLA
             # KV is replicated. The draft transfer cannot reslice those shards.
-            return False, (
-                "CP/TP-sharing DFLASH PD requires the same physical TP size: "
-                f"prefill={self.state_tp_size}, "
-                f"decode={registration_info.dst_attn_tp_size}"
+            # MLA drafts instead register one complete KV row per layer. Allow
+            # those only when both peers publish the same single-entry layout
+            # and token widths; equal widths alone can also occur for MHA.
+            num_draft = self.kv_args.num_draft_entries
+            draft_ids = self.kv_args.kv_layer_ids[-num_draft:]
+            src_lens = self.kv_args.kv_item_lens[-num_draft:]
+            dst_ids = registration_info.dst_kv_layer_ids
+            dst_lens = registration_info.dst_kv_item_lens[-num_draft:]
+            dst_page_scale = (
+                registration_info.dst_dcp_size
+                if registration_info.requires_dcp_relayout
+                else 1
             )
+            replicated_draft = (
+                num_draft > 0
+                and len(draft_ids) == len(set(draft_ids)) == num_draft
+                and dst_ids[-num_draft:] == draft_ids
+                and not set(draft_ids).intersection(dst_ids[:-num_draft])
+                and len(src_lens) == len(dst_lens) == num_draft
+                and all(
+                    src > 0 and dst == src * dst_page_scale
+                    for src, dst in zip(src_lens, dst_lens)
+                )
+            )
+            if not replicated_draft:
+                return False, (
+                    "CP/TP-sharing DFLASH PD requires the same physical TP size: "
+                    f"prefill={self.state_tp_size}, "
+                    f"decode={registration_info.dst_attn_tp_size}"
+                )
         state_types = getattr(self.kv_args, "state_types", [])
         fully_checked = True
         for i, st in enumerate(state_types):
@@ -1339,6 +1364,36 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 "must enable it and use the same page size and model spec."
             )
 
+    def _validate_mla_kv_item_len(
+        self,
+        dst_kv_item_len: Optional[int],
+        dst_device_kv_indices: Optional[npt.NDArray[np.int32]],
+    ) -> None:
+        """Reject an MLA peer whose per-page KV bytes differ from ours.
+
+        MLA KV is replicated across attention TP, so both sides hold the same
+        rows; a different item length means a different row layout (e.g. DSA
+        flashmla_kv 656 B vs trtllm 576 B per token), which a raw copy would
+        silently corrupt. HiSparse destinations (host-backed) and per-pool
+        registrations (item length 0) are not checked.
+        """
+        if not (self.is_mla_backend or self.is_hybrid_mla_backend):
+            return
+        src_item_lens = self.kv_args.kv_item_lens
+        if (
+            not dst_kv_item_len
+            or not src_item_lens
+            or dst_device_kv_indices is not None
+        ):
+            return
+        if src_item_lens[0] != dst_kv_item_len:
+            raise RuntimeError(
+                "PD MLA KV layout mismatch: prefill KV item_len="
+                f"{src_item_lens[0]}, decode item_len={dst_kv_item_len}. Prefill "
+                "and decode must use the same page size, KV cache dtype and DSA "
+                "backends."
+            )
+
     def _await_transfer_futures(self, futures) -> int:
         """Await a chunk's per-layer RDMA writes; return the first non-zero status.
         cancel() is a no-op for a running future, so with deferred release on we
@@ -1373,6 +1428,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         self._validate_envelope_kv_layout(
             dst_kv_ptrs, dst_kv_item_len, dst_attn_tp_size
         )
+        self._validate_mla_kv_item_len(dst_kv_item_len, dst_device_kv_indices)
         dst_device_kv_ptrs = None
         if dst_device_kv_indices is not None:
             compression_ratios = self.kv_args.mla_compression_ratios

@@ -51,6 +51,10 @@ def _require_kimi_k3_aiter_gluon_dcp_support() -> None:
 @_register_for("KimiK3ForConditionalGeneration")
 def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
+    if cfg.enable_prefill_cp:
+        raise ValueError(
+            "Kimi-K3 does not support --enable-prefill-cp yet (Kimi-K3.1 does)."
+        )
     if cfg.dcp_size > 1:
         overrides = {}
         if cfg.enable_symm_mem:

@@ -158,6 +158,7 @@ if _use_aiter:
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.kv_shard_hooks import get_kv_shard_pool
 from sglang.srt.layers.cp.base import get_cp_strategy
+from sglang.srt.layers.cp.interleave import is_interleave_extend
 from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -2100,11 +2101,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             q_fp8, weights = self._fused_q_prepare_and_store(
                 x, q_lora, positions, forward_batch, layer_id, act_quant
             )
-        elif (
-            is_graph_dsa_split_op_surface(forward_batch)
-            and not self.dsa_enable_prefill_cp
+        elif is_graph_dsa_split_op_surface(forward_batch) and (
+            not self.dsa_enable_prefill_cp
+            or (is_in_breakable_cuda_graph() and is_interleave_extend(forward_batch))
         ):
-            # Default path for non-CP prefill under PCG/BCG: run the whole indexer
+            # Prefill under PCG/BCG (including interleave CP): run the indexer
             # (q/k proj, head gate, k-cache store, topk) as a single eager split op
             # instead of capturing it piecemeal in the graph. The split op is
             # fusion-aware, so this also covers the fused path here.
