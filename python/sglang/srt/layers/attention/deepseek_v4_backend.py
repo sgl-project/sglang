@@ -3497,6 +3497,12 @@ class DeepseekV4AttnBackend(
         if layer.layer_id == self.tail_source_kv_layer_id:
             run_compressor = False
         meta = self.forward_metadata
+        if run_indexer and layer.indexer is not None:
+            # Covers full top-k, sparse candidate publish/consume, torch, CP and
+            # captured-source entry paths before any raw-index output is written.
+            cache = meta.sparse_prefill_cache
+            if cache is not None:
+                cache.invalidate_combined_indices()
         if dsa_use_prefill_cp(forward_batch) and forward_batch.forward_mode.is_extend():
             self._forward_low_ratio_sources_cp(
                 layer=layer,
@@ -4552,8 +4558,28 @@ class DeepseekV4AttnBackend(
         else:
             extra_page_size = token_to_kv_pool.get_extra_key_page_size(layer_id)
             extra_k_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
+            from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
+                is_in_breakable_cuda_graph,
+            )
+
+            reuse_combined = (
+                self.is_dsv41
+                and self.mega_attn
+                and compress_ratio in (1, 2)
+                and q_flat.shape[0] >= 16384
+                and forward_batch.forward_mode.is_extend_without_speculative()
+                and self.forward_metadata is not self.tail_forward_metadata
+                and not get_exec().overlap.enable_two_batch_overlap
+                and not get_exec().overlap.enable_single_batch_overlap
+                and not dsa_use_prefill_cp(forward_batch)
+                and not is_in_breakable_cuda_graph()
+                and not torch.cuda.is_current_stream_capturing()
+            )
             flat_token_ids, combined_indices, combined_lens = cache.layer_inputs(
-                compress_ratio, core_attn_metadata, extra_page_size
+                compress_ratio,
+                core_attn_metadata,
+                extra_page_size,
+                reuse_combined=reuse_combined,
             )
             if use_cutedsl_h16 and compress_ratio == 128:
                 combined_indices, combined_lens = cache.get_c128_combined(
