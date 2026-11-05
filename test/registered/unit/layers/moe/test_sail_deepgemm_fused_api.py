@@ -17,6 +17,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.kernels.ops.gemm import sail_deepgemm as ops
 from sglang.srt.hardware_backend.sail.deep_gemm import entrypoint as sail_entrypoint
+from sglang.srt.hardware_backend.sail.deep_gemm import warmup as sail_warmup
 from sglang.srt.layers.deep_gemm_wrapper import compile_utils
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -657,8 +658,8 @@ class TestSailDeepGemmFusedApi(CustomTestCase):
     def test_fp4_warmup_preserves_packed_width_and_scale_bytes(self):
         """The warmup must reuse the packed K and the K-major LHS; already packed
         scales must not be preprocessed twice."""
-        executor = compile_utils._GroupedFusedWarmupExecutor_fp4.__new__(
-            compile_utils._GroupedFusedWarmupExecutor_fp4
+        executor = sail_warmup._GroupedFusedWarmupExecutor_fp4.__new__(
+            sail_warmup._GroupedFusedWarmupExecutor_fp4
         )
         executor.max_m = 3
         executor.lhs_q = torch.full((3, 64), 0x22, dtype=torch.uint8)
@@ -693,7 +694,7 @@ class TestSailDeepGemmFusedApi(CustomTestCase):
         vendor = SimpleNamespace(
             moe_align_block_size=align, m_grouped_gemm_fp4_fp4_bf16_nt_fused=gemm
         )
-        with patch.object(compile_utils, "deep_gemm", vendor, create=True):
+        with patch.object(sail_warmup, "deep_gemm", vendor, create=True):
             executor.execute(2)
         torch.testing.assert_close(
             executor.out[:2], torch.full_like(executor.out[:2], 128)
