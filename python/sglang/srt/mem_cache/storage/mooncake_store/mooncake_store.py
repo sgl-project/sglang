@@ -345,13 +345,30 @@ class MooncakeBaseStore:
 
         return config
 
-    def register_buffer(self, tensor: torch.Tensor):
+    def register_buffer(self, tensor: torch.Tensor, allocator: Any = None):
         if self.store is None:
             raise RuntimeError("Mooncake store is not initialized.")
-        ptr = tensor.data_ptr()
-        size = tensor.numel() * tensor.element_size()
+        # Register the whole backing allocation, not the tensor's own view. Host
+        # pools hand out views of a single allocation (the MHA pool exposes
+        # kv_buffer[0] / kv_buffer[1], two halves of one mapping), and the
+        # allocator rounds the mapping up to its page size. A registration sized
+        # to the view ends the MR inside a HugeTLB page, and the transfer engine
+        # madvise()s the registered range for ibv_reg_mr, which the kernel
+        # rejects at a non-hugepage-aligned boundary with EINVAL.
+        storage = tensor.untyped_storage()
+        ptr = int(storage.data_ptr())
+        size = int(storage.nbytes())
         if size == 0:
             # conv-only models have a 0-element ssm state; nothing to register
+            return
+        mapped_size_fn = getattr(allocator, "mapped_size_for", None)
+        if mapped_size_fn is not None:
+            size = max(size, int(mapped_size_fn(ptr) or 0))
+        # Views of the same allocation collapse onto one extent: register once.
+        registered = getattr(self, "_registered_buffer_extents", None)
+        if registered is None:
+            registered = self._registered_buffer_extents = set()
+        if (ptr, size) in registered:
             return
         ret_code = self.store.register_buffer(ptr, size)
         if ret_code != 0:
@@ -359,6 +376,7 @@ class MooncakeBaseStore:
             raise RuntimeError(
                 f"Failed to register buffer to Mooncake Store, error code: {ret_code}"
             )
+        registered.add((ptr, size))
 
     @cached_property
     def _has_request_context_support(self) -> bool:
@@ -844,9 +862,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             # Hybrid logical anchors only own allocation indices. Their physical
             # tensors are registered through register_mem_host_pool_v2().
             return
+        allocator = getattr(self.mem_pool_host, "allocator", None)
         try:
             for buffer in self._iter_host_pool_buffers(self.mem_pool_host):
-                super().register_buffer(buffer)
+                super().register_buffer(buffer, allocator=allocator)
         except TypeError as err:
             logger.error("Failed to register buffer to Mooncake Store: %s", err)
             raise TypeError("Mooncake Store Register Buffer Error.") from err
@@ -859,9 +878,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # v2 here only registers additional hybrid pools.
         if host_pool_name == PoolName.KV:
             return
+        allocator = getattr(host_pool, "allocator", None)
         if host_pool_name == PoolName.DRAFT:
             self.registered_pools[host_pool_name] = host_pool
-            super().register_buffer(host_pool.kv_buffer)
+            super().register_buffer(host_pool.kv_buffer, allocator=allocator)
             return
 
         # Keep a name->pool mapping so batch v2 can resolve PoolTransfer.name to
@@ -871,7 +891,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # Non-anchor pools are either sidecar-specific pools with their own
         # accessor, or ordinary KV-like host pools used as SWA side pools.
         for buf in self._iter_host_pool_buffers(host_pool):
-            super().register_buffer(buf)
+            super().register_buffer(buf, allocator=allocator)
 
     def _tag_keys(self, keys: List[str]) -> List[str]:
         if self.config_prefix is None:
