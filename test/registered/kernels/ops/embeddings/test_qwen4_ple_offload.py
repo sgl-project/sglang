@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import triton
 from torch import nn
 
 from sglang.srt.configs.qwen4_exp import Qwen4ExpTextConfig
@@ -241,6 +242,98 @@ def test_qwen4_ple_offload_avoids_device_table(single_rank_runtime_context):
     assert emb.weight.device.type == "cpu" and emb.weight.is_pinned()
     assert emb.weight_scale.device.type == DEVICE
     assert not any(t.is_meta for t in (*layer.parameters(), *layer.buffers()))
+
+
+def _all_finite_e4m3_rows(rows: int, embedding_dim: int) -> torch.Tensor:
+    """Every finite e4m3fN value: every exponent's normals, both signed zeros,
+    subnormals and the top 448. 0x7f/0xff are the only NaN patterns and PLE
+    tables are finite."""
+    raw = torch.arange(256, dtype=torch.uint8)
+    raw = raw[(raw != 0x7F) & (raw != 0xFF)]
+    assert raw.numel() == rows
+    return (
+        raw.view(torch.float8_e4m3fn)
+        .repeat_interleave(embedding_dim)
+        .reshape(rows, embedding_dim)
+        .contiguous()
+    )
+
+
+def test_qwen4_ple_fp8_table_gather_matches_torch():
+    # Triton has no fp8e4nv pointer dtype below SM89, so the gather decodes the
+    # e4m3 bytes itself there. Every finite value must survive that decode.
+    rows, embedding_dim = 254, 13
+    source = _make_source_embedding(
+        dtype=torch.float8_e4m3fn,
+        embedding_dim=embedding_dim,
+        vocab_end=rows,
+        org_vocab_size=rows,
+    )
+    offloaded = Qwen4ExpPinnedHostEmbedding(source)
+    table = _all_finite_e4m3_rows(rows, embedding_dim)
+    _load_rows(offloaded, table)
+
+    ids = torch.arange(rows, device=DEVICE)
+    expected = table.to(DEVICE).to(torch.bfloat16)
+    torch.testing.assert_close(offloaded(ids), expected, rtol=0, atol=0)
+
+
+def _fp8_gather(table: torch.Tensor, ids: torch.Tensor, fp8_native: bool):
+    from sglang.srt.models.qwen4_exp import (
+        _gather_ple_embedding_from_pinned_kernel,
+    )
+
+    embedding_dim = table.shape[1]
+    output = torch.empty((ids.numel(), embedding_dim), dtype=torch.bfloat16)
+    output = output.to(DEVICE)
+    _gather_ple_embedding_from_pinned_kernel[(ids.numel(),)](
+        table.data_ptr(),
+        ids,
+        output,
+        embedding_dim=embedding_dim,
+        tp_vocab_start=0,
+        tp_vocab_end=table.shape[0],
+        is_fp8=True,
+        fp8_native=fp8_native,
+        BLOCK_D=triton.next_power_of_2(embedding_dim),
+    )
+    return output
+
+
+@pytest.mark.parametrize("pinned", [False, True])
+def test_qwen4_ple_fp8_gather_byte_decode_matches_torch(pinned):
+    # Pin the byte-decode branch so CI exercises it on parts where the native
+    # fp8 pointer exists and the model would never take it.
+    rows, embedding_dim = 254, 13
+    device_table = _all_finite_e4m3_rows(rows, embedding_dim).to(DEVICE)
+    table = device_table
+    if pinned:
+        table = torch.empty((rows, embedding_dim), dtype=torch.float8_e4m3fn)
+        table = table.pin_memory()
+        table.copy_(device_table.cpu())
+    ids = torch.arange(rows, device=DEVICE)
+    torch.testing.assert_close(
+        _fp8_gather(table, ids, fp8_native=False),
+        device_table.to(torch.bfloat16),
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_qwen4_ple_fp8_gather_native_pointer_matches_torch():
+    from sglang.srt.models.qwen4_exp import _fp8_e4m3_ptr_supported
+
+    if not _fp8_e4m3_ptr_supported():
+        pytest.skip("fp8e4nv pointers need SM89+")
+    rows, embedding_dim = 254, 13
+    table = _all_finite_e4m3_rows(rows, embedding_dim).to(DEVICE)
+    ids = torch.arange(rows, device=DEVICE)
+    torch.testing.assert_close(
+        _fp8_gather(table, ids, fp8_native=True),
+        table.to(torch.bfloat16),
+        rtol=0,
+        atol=0,
+    )
 
 
 def _file_backend_supported() -> bool:

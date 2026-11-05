@@ -11,10 +11,6 @@ is zero or the mapping is pinned.
 GPU part (skipped unless the device reads pageable host memory through the host
 page tables, i.e. unified-memory parts such as GB10): the production Triton
 gather kernel reading from the file-backed table matches a torch gather.
-
-fp8 decode: Triton only registers the fp8e4nv pointer dtype from SM89 up, so on
-older parts the gather reads the e4m3 bytes and decodes them itself. That path
-is checked against torch's own fp8 conversion for every finite e4m3 value.
 """
 
 import os
@@ -35,11 +31,10 @@ from sglang.srt.models.qwen4_exp_ple_table import (
     make_ple_file_rss_trimmer,
     ple_table_file_name,
 )
-from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
-register_cuda_ci(est_time=8, stage="base-b", runner_config="1-gpu-small")
 
 
 class TestPleFileTableAllocator(CustomTestCase):
@@ -326,76 +321,11 @@ class TestPleFileTableGatherOnDevice(CustomTestCase):
                 tp_vocab_start=0,
                 tp_vocab_end=rows,
                 is_fp8=False,
-                fp8_native=False,
                 BLOCK_D=triton.next_power_of_2(dim),
             )
             torch.cuda.synchronize()
             expected = table[ids.cpu()].to("cuda")
             self.assertTrue(torch.equal(out, expected))
-
-
-@unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
-class TestPleFp8Gather(CustomTestCase):
-    """e4m3 decode for parts whose Triton has no fp8e4nv pointer dtype (SM89-)."""
-
-    DIM = 8
-
-    def _gather(self, table, ids, fp8_native):
-        from sglang.srt.models.qwen4_exp import (
-            _gather_ple_embedding_from_pinned_kernel,
-        )
-
-        out = torch.empty((ids.numel(), self.DIM), dtype=torch.bfloat16, device="cuda")
-        _gather_ple_embedding_from_pinned_kernel[(ids.numel(),)](
-            table.data_ptr(),
-            ids,
-            out,
-            embedding_dim=self.DIM,
-            tp_vocab_start=0,
-            tp_vocab_end=table.shape[0],
-            is_fp8=True,
-            fp8_native=fp8_native,
-            BLOCK_D=self.DIM,
-        )
-        torch.cuda.synchronize()
-        return out
-
-    def _table(self):
-        # Every finite e4m3fN value, so normals, subnormals, both signed zeros
-        # and the top exponent are covered. 0x7f/0xff are the only NaNs and PLE
-        # rows are finite.
-        raw = torch.arange(256, dtype=torch.uint8)
-        raw = raw[(raw != 0x7F) & (raw != 0xFF)]
-        values = raw.view(torch.float8_e4m3fn)
-        return values.repeat_interleave(self.DIM).reshape(-1, self.DIM).cuda()
-
-    def test_byte_decode_matches_torch(self):
-        table = self._table()
-        ids = torch.arange(table.shape[0], device="cuda")
-        out = self._gather(table, ids, fp8_native=False)
-        self.assertTrue(torch.equal(out, table.to(torch.bfloat16)))
-
-    def test_byte_decode_reads_a_pinned_host_table(self):
-        # The production layout: the fp8 table lives in pinned host memory and
-        # the gather reads it through the mapped pointer.
-        table = allocate_ple_host_table(
-            (254, self.DIM), torch.float8_e4m3fn, "pinned", None
-        )
-        self.assertTrue(table.is_pinned())
-        table.copy_(self._table().cpu())
-        ids = torch.arange(table.shape[0], device="cuda")
-        out = self._gather(table, ids, fp8_native=False)
-        self.assertTrue(torch.equal(out, table.to(torch.bfloat16).cuda()))
-
-    def test_native_dtype_path_matches_when_available(self):
-        from sglang.srt.models.qwen4_exp import _fp8_e4m3_ptr_supported
-
-        if not _fp8_e4m3_ptr_supported():
-            self.skipTest("fp8e4nv pointers need SM89+")
-        table = self._table()
-        ids = torch.arange(table.shape[0], device="cuda")
-        out = self._gather(table, ids, fp8_native=True)
-        self.assertTrue(torch.equal(out, table.to(torch.bfloat16)))
 
 
 if __name__ == "__main__":
