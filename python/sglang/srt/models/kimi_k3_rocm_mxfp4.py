@@ -1,6 +1,5 @@
 """Optional MXFP4 copies of Kimi-K3's replicated latent MoE projections."""
 
-import logging
 from typing import Optional
 
 import torch
@@ -10,8 +9,6 @@ from sglang.kernels.ops.gemm import latent_mxfp4_aiter_hip
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils.common import print_warning_once
-
-logger = logging.getLogger(__name__)
 
 
 def build_latent_mxfp4_projections() -> Optional["LatentMXFP4Projections"]:
@@ -63,7 +60,7 @@ class LatentMXFP4Projections(nn.Module):
             or not latent_mxfp4_aiter_hip.supported(device=down_weight.device)
         ):
             self.down_weight = self.down_scale = self.up_weight = self.up_scale = None
-            logger.warning(
+            print_warning_once(
                 "Kimi-K3 latent MXFP4 is unavailable for these weights/device; "
                 "keeping the original latent projections"
             )

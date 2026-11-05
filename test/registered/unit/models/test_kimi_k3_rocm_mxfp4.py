@@ -16,6 +16,7 @@ from sglang.srt.models.kimi_k3_rocm_mxfp4 import (
     build_latent_mxfp4_projections,
 )
 from sglang.srt.runtime_context import get_context, get_parallel
+from sglang.srt.utils.common import print_warning_once
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -161,8 +162,14 @@ class TestLatentMXFP4Runtime(CustomTestCase):
         self.assertTrue(projections.can_run(num_tokens=2048))
         self.assertTrue(projections.can_run(num_tokens=2049))
         self.assertEqual(dict(projections.state_dict()), {})
-        with self.assertLogs("sglang.srt.models.kimi_k3_rocm_mxfp4", level="WARNING"):
+        # Unsupported weights warn once per process, not once per MoE layer.
+        print_warning_once.cache_clear()
+        with self.assertLogs(level="WARNING") as logs:
             projections.prepare(down_weight=down.to(torch.float16), up_weight=up)
+            LatentMXFP4Projections(min_tokens=2048).prepare(
+                down_weight=down.to(torch.float16), up_weight=up
+            )
+        self.assertEqual(len(logs.records), 1)
         self.assertFalse(projections.can_run(num_tokens=2048))
         self.assertIsNone(projections.up_weight)
         with self.assertRaisesRegex(RuntimeError, "has not been prepared"):
