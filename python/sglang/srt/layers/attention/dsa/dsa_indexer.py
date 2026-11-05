@@ -1561,24 +1561,26 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         attn_metadata = metadata.attn_metadata
         rows = q_fp8.shape[0]
         per, slot, lo, hi = dcp_split_rows(rows)
-        lengths = metadata.get_seqlens_expanded()[lo:hi]
-        logits = aiter_paged_mqa_logits(
-            q_fp8[lo:hi],
-            kv_cache_fp8,
-            weights[lo:hi],
-            lengths,
-            attn_metadata.real_page_table[lo:hi],
-            max_seq_len,
-            preshuffle=_use_aiter_preshuffle,
-            kv_block_size=block_kv,
-        )
-        self._mask_init_and_local_tokens(logits, lengths)
         topk = torch.empty(
             (per * get_parallel().dcp_group.world_size, self.index_topk),
             dtype=torch.int32,
             device=q_fp8.device,
         )
+        # Fewer rows than ranks leaves the tail ranks with an empty stride, and
+        # the paged MQA logits kernel sizes its split-KV by the row count.
         if hi > lo:
+            lengths = metadata.get_seqlens_expanded()[lo:hi]
+            logits = aiter_paged_mqa_logits(
+                q_fp8[lo:hi],
+                kv_cache_fp8,
+                weights[lo:hi],
+                lengths,
+                attn_metadata.real_page_table[lo:hi],
+                max_seq_len,
+                preshuffle=_use_aiter_preshuffle,
+                kv_block_size=block_kv,
+            )
+            self._mask_init_and_local_tokens(logits, lengths)
             # Packed top-k with a row -> page-table-row map: the slice's rows
             # keep their own page-table rows, and no full-batch plan is read.
             row_ids = torch.arange(lo, hi, dtype=torch.int32, device=q_fp8.device)
