@@ -1657,8 +1657,16 @@ def _a2a_backend_overrides(view: Any) -> dict:
     from sglang.srt.eplb.moe_load_balancer_glue import get_moe_load_balancer_pipeline
 
     pipeline = get_moe_load_balancer_pipeline(view.moe_load_balancer_algorithm)
-    if pipeline is not None and pipeline.capabilities.requires_deepep:
-        moe_a2a_backend = "deepep"
+    if pipeline is not None:
+        supported_backends = pipeline.capabilities.supported_a2a_backends
+        if supported_backends is not None and moe_a2a_backend not in supported_backends:
+            moe_a2a_backend = supported_backends[0]
+            logger.warning(
+                "moe_a2a_backend is overridden to '%s' because the selected EvenMoE "
+                "pipeline supports %s.",
+                moe_a2a_backend,
+                supported_backends,
+            )
     if moe_a2a_backend != view.moe_a2a_backend:
         return {"moe_a2a_backend": moe_a2a_backend}
     return {}

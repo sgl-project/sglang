@@ -401,11 +401,13 @@ def handle_a2a_moe(server_args: Any):
     pipeline = get_moe_load_balancer_pipeline(cfg.moe_load_balancer_algorithm)
     if (
         pipeline is not None
-        and pipeline.capabilities.requires_deepep
+        and pipeline.capabilities.supported_a2a_backends is not None
         and cfg.moe_a2a_backend == "ascend_ops"
+        and cfg.moe_a2a_backend not in pipeline.capabilities.supported_a2a_backends
     ):
         raise ValueError(
-            "The selected EvenMoE pipeline requires DeepEP and is incompatible with ascend_ops."
+            "The selected EvenMoE pipeline is incompatible with ascend_ops; "
+            f"supported A2A backends: {pipeline.capabilities.supported_a2a_backends}."
         )
 
     run_post_process_pass(server_args, _a2a_backend_overrides)
