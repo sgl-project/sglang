@@ -513,9 +513,13 @@ class SchedulerPPMixin:
                     )
                 self._pp_commit_comm_work(send_release_work)
 
-                # Send the current activation before waiting for the next
-                # microbatch's CPU results. Keep control-message order and the
-                # proxy-send fence that protects CUDA Graph output reuse.
+                # Send this slot's messages and activation before waiting on
+                # the next slot's D2H copy. Everything sent here is computed
+                # above and is not touched by _pp_process_batch_result.
+                # Control-message order and the proxy-send fence that protects
+                # CUDA Graph output reuse are unchanged. Only this PD decode
+                # loop was measured; event_loop_pp and the PD prefill loop still
+                # process the previous result before sending.
                 if not self.pp_group.is_last_rank:
                     self.send_req_work = self._pp_send_pyobj_to_next_stage(
                         recv_reqs, async_send=True
@@ -1525,13 +1529,15 @@ class SchedulerPPMixin:
                     target, mb_metadata[next_mb_id], next_pp_outputs
                 )
                 d2h_event = self.device_module.Event()
-                # Read back ready decode IDs before later PP sends add work
-                # to the scheduler stream. Keep the relay/future-map IDs on
-                # device; the result processor waits on copy_done before use.
+                # Copy ready decode IDs to host on the copy stream so the later
+                # .tolist() does not queue behind PP sends on the scheduler
+                # stream. async_d2h handles CPU and non-pinned devices itself.
+                # Relay and future_map keep the device tensor; result processing
+                # waits on copy_done. Extend and speculative results keep the
+                # old path; they were not measured.
                 if (
                     target.forward_mode.is_decode()
                     and target.spec_algorithm.is_none()
-                    and batch_result.next_token_ids.is_cuda
                 ) or (
                     batch_result.logits_output is not None
                     and batch_result.logits_output.sampling_mask_output is not None
