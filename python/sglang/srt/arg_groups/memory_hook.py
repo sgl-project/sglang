@@ -30,14 +30,16 @@ _DEFAULT_PP_PREFILL_CUDA_GRAPH_MAX_TOKENS = 8192
 def handle_offload_compatibility(server_args: Any) -> None:
     """Flag-only check; re-run after the model overrides fill in the PLE default."""
     cfg = resolving_view(server_args)
-    if cfg.ple_offload_embedding and (
-        cfg.cpu_offload_gb > 0 or cfg.offload_group_size > 0
+    for flag, enabled in (
+        ("--ple-offload-embedding", cfg.ple_offload_embedding),
+        ("--ple-offload-token-embedding", cfg.ple_offload_token_embedding),
     ):
-        raise ValueError(
-            "--ple-offload-embedding cannot be combined with "
-            "--cpu-offload-gb or --offload-group-size: generic layer offload "
-            "would stage the pinned PLE embedding back to the device."
-        )
+        if enabled and (cfg.cpu_offload_gb > 0 or cfg.offload_group_size > 0):
+            raise ValueError(
+                f"{flag} cannot be combined with "
+                "--cpu-offload-gb or --offload-group-size: generic layer offload "
+                "would stage the pinned embedding back to the device."
+            )
 
     if cfg.ple_offload_backend == "file" and cfg.ple_offload_embedding is False:
         raise ValueError(

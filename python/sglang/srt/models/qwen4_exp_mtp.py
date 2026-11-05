@@ -17,7 +17,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP, _mtp_quant_config
-from sglang.srt.models.qwen4_exp import Qwen4ExpModel
+from sglang.srt.models.qwen4_exp import Qwen4ExpModel, Qwen4ExpPinnedHostEmbedding
 from sglang.srt.runtime_context import get_model, get_parallel
 from sglang.srt.utils import add_prefix, is_npu
 
@@ -158,6 +158,16 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
         if input_embeds is None:
             input_embeds = self.model.embed_tokens(input_ids)
         return input_embeds
+
+    def set_embed_and_head(self, embed, head):
+        if embed is not None and embed.device.type == "cpu":
+            # The target keeps its token embedding in pinned host memory
+            # (--ple-offload-token-embedding): gather from the same table.
+            self.model.embed_tokens = Qwen4ExpPinnedHostEmbedding(
+                self.model.embed_tokens, host_table=embed
+            )
+            embed = None
+        super().set_embed_and_head(embed, head)
 
     def _set_hc_logits_hidden_states(
         self,
