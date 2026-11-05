@@ -1685,10 +1685,12 @@ def _situ_mul_quant_contig_kernel(
     up_t = 2.0 * tl.sigmoid(2.0 * up / situ_linear_beta) - 1.0
     y = gate * situ_linear_beta * up_t
     amax = tl.clamp(tl.max(tl.abs(y), axis=1), min=1e-10, max=float("inf"))
-    q = (y * (448.0 / amax)[:, None]).to(tl.float8e4nv)
+    # Quantize with the UE8M0 scale that the subsequent packing step preserves.
+    scale = tl.exp2(tl.ceil(tl.log2(amax / 448.0)))
+    q = (y / scale[:, None]).to(tl.float8e4nv)
     tl.store(q_ptr + row * N + offs, q, mask=mask)
     srow = tl.arange(0, KG_POW2)
-    tl.store(s_ptr + row * KG + srow, amax / 448.0, mask=srow < KG)
+    tl.store(s_ptr + row * KG + srow, scale, mask=srow < KG)
 
 
 def _apply_swiglu_limit(
