@@ -20,7 +20,11 @@
 #     finished job is polled for it rather than checked once.
 #
 # Usage:
-#   launch_amd_ci_mi35x.sh --suite NAME [--rocm-version rocm10] [-- run_suite.py args...]
+#   launch_amd_ci_mi35x.sh --suite NAME [--rocm-version rocm10] [--env KEY=VAL]...
+#                          [-- run_suite.py args...]
+#
+#   --env sets a variable inside the test container, as the `-e` flags the ARC
+#   workflows pass to amd_ci_exec.sh do (e.g. a benchmark's workload knobs).
 #
 # Required environment (set in the runner's .env, like the DI nightly runner):
 #   SLURM_PARTITION, SLURM_ACCOUNT, SLURM_QOS
@@ -36,10 +40,17 @@ set -euo pipefail
 
 SUITE=""
 ROCM_VERSION="rocm10"
+EXEC_ENV=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --suite) SUITE="$2"; shift 2 ;;
         --rocm-version) ROCM_VERSION="$2"; shift 2 ;;
+        --env)
+            if [[ ! "$2" =~ ^[A-Za-z_][A-Za-z0-9_]*= || "$2" == *$'\n'* ]]; then
+                echo "ERROR: --env takes KEY=VAL on one line (got '$2')" >&2
+                exit 2
+            fi
+            EXEC_ENV+=("$2"); shift 2 ;;
         --) shift; break ;;
         *) echo "ERROR: unknown argument '$1'" >&2; exit 2 ;;
     esac
@@ -70,6 +81,9 @@ mkdir -p "$RUN_DIR"
 # Read by amd_ci_job_mi35x.sh; sbatch exports the submitting environment.
 export CI_SRC="$GITHUB_WORKSPACE" CI_SUITE="$SUITE" CI_SUITE_ARGS="$SUITE_ARGS"
 export CI_ROCM_VERSION="$ROCM_VERSION" CI_NODE_SCRATCH CI_EXIT_FILE="$RUN_DIR/exit_code"
+# One KEY=VAL per line; an environment variable cannot carry an array.
+CI_EXEC_ENV="$(printf '%s\n' ${EXEC_ENV[@]+"${EXEC_ENV[@]}"})"
+export CI_EXEC_ENV
 
 JOB_ID=""
 cleanup() {
