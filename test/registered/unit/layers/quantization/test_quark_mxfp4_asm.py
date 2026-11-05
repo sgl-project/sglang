@@ -1,22 +1,190 @@
-"""CPU-only tests for Quark MXFP4 AITER ASM layout helpers."""
+"""CPU-only tests for Quark MXFP4 AITER GEMM layout helpers and the ROCm
+--fp4-gemm-backend choices (aiter / triton)."""
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
+import argparse
+import os
+import tempfile
 import unittest
+import warnings
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
 
+from sglang.srt.arg_groups.choices import FP4_GEMM_RUNNER_BACKEND_CHOICES
+from sglang.srt.environ import envs
+from sglang.srt.layers.quantization import fp4_utils
+from sglang.srt.layers.quantization.fp4_utils import (
+    Fp4GemmRunnerBackend,
+    initialize_fp4_gemm_config,
+    resolve_rocm_fp4_gemm_backend,
+)
 from sglang.srt.layers.quantization.quark.schemes import quark_w4a4_mxfp4
 from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4 import (
     _asm_fp4_prequantized_input,
     _asm_fp4_scale_swizzle_supported,
+    _read_tuned_fp4_gemm_shapes,
     _shuffle_asm_fp4_act_scale,
     _swizzle_asm_fp4_scale,
 )
+from sglang.srt.server_args import ServerArgs
 from sglang.test.test_utils import CustomTestCase
+
+
+def _resolve(backend, *, mxfp4=True, legacy_use_aiter_asm=None):
+    return resolve_rocm_fp4_gemm_backend(
+        backend=backend,
+        mxfp4_gemm_supported=mxfp4,
+        legacy_use_aiter_asm=legacy_use_aiter_asm,
+    )
+
+
+class TestFp4GemmBackendCli(CustomTestCase):
+    def test_rocm_backends_parse(self):
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        for backend in ("aiter", "triton"):
+            with self.subTest(backend=backend):
+                args = parser.parse_args(
+                    ["--model", "dummy", "--fp4-gemm-backend", backend]
+                )
+                server_args = ServerArgs.from_cli_args(args)
+                self.assertEqual(server_args.fp4_gemm_runner_backend, backend)
+
+    def test_every_cli_choice_is_a_runner_backend(self):
+        for choice in FP4_GEMM_RUNNER_BACKEND_CHOICES:
+            with self.subTest(choice=choice):
+                self.assertEqual(Fp4GemmRunnerBackend(choice).value, choice)
+
+
+class TestResolveRocmFp4GemmBackend(CustomTestCase):
+    def test_resolution(self):
+        cases = [
+            # (flag, native MXFP4, expected); auto with MXFP4 is left for the
+            # Quark scheme to resolve per layer (tuned shape -> AITER).
+            ("auto", True, "auto"),
+            ("auto", False, "triton"),
+            ("aiter", True, "aiter"),
+            ("triton", True, "triton"),
+            ("triton", False, "triton"),
+        ]
+        for backend, mxfp4, expected in cases:
+            with self.subTest(backend=backend, mxfp4=mxfp4):
+                self.assertEqual(_resolve(backend, mxfp4=mxfp4), expected)
+        with self.assertRaisesRegex(ValueError, "native MXFP4"):
+            _resolve("aiter", mxfp4=False)
+
+    def test_legacy_env_is_honored_under_auto(self):
+        cases = [
+            # (legacy value, mxfp4, expected backend)
+            (True, True, "aiter"),
+            # The env var was a no-op without native MXFP4; it must not start raising.
+            (True, False, "triton"),
+            (False, True, "triton"),
+        ]
+        for legacy, mxfp4, expected in cases:
+            with self.subTest(legacy=legacy, mxfp4=mxfp4):
+                with self.assertWarnsRegex(
+                    DeprecationWarning, "SGLANG_ROCM_USE_AITER_FP4_ASM_GEMM"
+                ):
+                    backend = _resolve("auto", mxfp4=mxfp4, legacy_use_aiter_asm=legacy)
+                self.assertEqual(backend, expected)
+
+    def test_explicit_flag_overrides_legacy_env(self):
+        with self.assertWarnsRegex(DeprecationWarning, "ignored"):
+            backend = _resolve("triton", legacy_use_aiter_asm=True)
+        self.assertEqual(backend, "triton")
+
+    def test_no_warning_without_legacy_env(self):
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", DeprecationWarning)
+            self.assertEqual(_resolve("aiter"), "aiter")
+
+
+class TestInitializeFp4GemmConfig(CustomTestCase):
+    def setUp(self):
+        saved = fp4_utils.FP4_GEMM_RUNNER_BACKEND
+        self.addCleanup(setattr, fp4_utils, "FP4_GEMM_RUNNER_BACKEND", saved)
+
+    def _initialize(self, backend, *, is_hip, mxfp4=True):
+        exec_ctx = SimpleNamespace(
+            kernel=SimpleNamespace(fp4_gemm_runner_backend=backend)
+        )
+        with (
+            mock.patch.object(fp4_utils, "get_exec", return_value=exec_ctx),
+            mock.patch.object(fp4_utils, "is_hip", return_value=is_hip),
+            mock.patch.object(fp4_utils, "is_mxfp4_gemm_supported", return_value=mxfp4),
+        ):
+            initialize_fp4_gemm_config()
+        return fp4_utils.get_fp4_gemm_runner_backend()
+
+    def test_rocm_auto(self):
+        for mxfp4, expected in (
+            (True, Fp4GemmRunnerBackend.AUTO),
+            (False, Fp4GemmRunnerBackend.TRITON),
+        ):
+            with self.subTest(mxfp4=mxfp4):
+                with envs.SGLANG_ROCM_USE_AITER_FP4_ASM_GEMM.override(False):
+                    # Restored to the pre-test state when the override exits.
+                    envs.SGLANG_ROCM_USE_AITER_FP4_ASM_GEMM.clear()
+                    backend = self._initialize("auto", is_hip=True, mxfp4=mxfp4)
+                self.assertEqual(backend, expected)
+
+    def test_rocm_legacy_env_reaches_global_backend(self):
+        with envs.SGLANG_ROCM_USE_AITER_FP4_ASM_GEMM.override(True):
+            with self.assertWarns(DeprecationWarning):
+                backend = self._initialize("auto", is_hip=True)
+        self.assertEqual(backend, Fp4GemmRunnerBackend.AITER)
+
+    def test_rocm_only_backends_rejected_off_rocm(self):
+        for backend in ("aiter", "triton"):
+            with self.subTest(backend=backend):
+                with self.assertRaisesRegex(ValueError, "only supported on ROCm"):
+                    self._initialize(backend, is_hip=False)
+
+
+class TestQuarkMxfp4BackendSelection(CustomTestCase):
+    def setUp(self):
+        saved = fp4_utils.FP4_GEMM_RUNNER_BACKEND
+        self.addCleanup(setattr, fp4_utils, "FP4_GEMM_RUNNER_BACKEND", saved)
+
+    def _make_scheme(self, backend, mxfp4=True):
+        fp4_utils.FP4_GEMM_RUNNER_BACKEND = backend
+        with (
+            mock.patch.object(quark_w4a4_mxfp4, "_is_hip", True),
+            mock.patch.object(
+                quark_w4a4_mxfp4, "is_mxfp4_gemm_supported", return_value=mxfp4
+            ),
+        ):
+            return quark_w4a4_mxfp4.QuarkW4A4MXFP4(
+                weight_quant_spec={}, input_quant_spec={}
+            )
+
+    def test_scheme_follows_fp4_gemm_backend(self):
+        aiter = self._make_scheme(Fp4GemmRunnerBackend.AITER)
+        self.assertTrue(aiter.use_aiter_fp4_gemm)
+        self.assertFalse(aiter.aiter_fp4_gemm_tuned_shapes_only)
+
+        auto = self._make_scheme(Fp4GemmRunnerBackend.AUTO)
+        self.assertTrue(auto.use_aiter_fp4_gemm)
+        self.assertTrue(auto.aiter_fp4_gemm_tuned_shapes_only)
+
+        for backend in (
+            Fp4GemmRunnerBackend.TRITON,
+            Fp4GemmRunnerBackend.FLASHINFER_CUTLASS,
+        ):
+            with self.subTest(backend=backend):
+                self.assertFalse(self._make_scheme(backend).use_aiter_fp4_gemm)
+
+    def test_uninitialized_auto_without_mxfp4_stays_on_triton(self):
+        # get_fp4_gemm_runner_backend() returns AUTO before the scheduler has
+        # resolved the flag; that must not enable the AITER path on e.g. MI300.
+        scheme = self._make_scheme(Fp4GemmRunnerBackend.AUTO, mxfp4=False)
+        self.assertFalse(scheme.use_aiter_fp4_gemm)
 
 
 class TestQuarkMxfp4AsmScaleLayout(CustomTestCase):
@@ -89,32 +257,109 @@ class TestQuarkMxfp4AsmTupleInput(CustomTestCase):
                 _asm_fp4_prequantized_input(fused)
 
 
-class TestQuarkMxfp4AsmNarrowLayer(CustomTestCase):
-    def test_narrow_layer_stays_on_triton(self):
-        """With the ASM flag on, a layer with N <= 128 (Qwen3.8 GDN in_proj_ba,
-        N=96) must keep the Triton GEMM: AITER's untuned ASM heuristic returns
-        wrong rows 1..M-1 for it at small batch sizes."""
-        n, k = 96, 5120
-        layer = torch.nn.Module()
-        weight = torch.nn.Parameter(
-            torch.zeros((n, k // 2), dtype=torch.uint8), requires_grad=False
-        )
-        layer.weight = weight
-        layer.weight_scale = torch.nn.Parameter(
-            torch.zeros((n, k // 32), dtype=torch.uint8), requires_grad=False
-        )
-        scheme = quark_w4a4_mxfp4.QuarkW4A4MXFP4({}, {})
+def _make_mxfp4_layer(n, k):
+    layer = torch.nn.Module()
+    layer.weight = torch.nn.Parameter(
+        torch.zeros((n, k // 2), dtype=torch.uint8), requires_grad=False
+    )
+    layer.weight_scale = torch.nn.Parameter(
+        torch.zeros((n, k // 32), dtype=torch.uint8), requires_grad=False
+    )
+    return layer
 
+
+class TestAiterTunedFp4GemmShapes(CustomTestCase):
+    def _write_csv(self, text):
+        fd, path = tempfile.mkstemp(suffix=".csv")
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        self.addCleanup(os.remove, path)
+        return path
+
+    def test_filters_by_gfx_and_cu_num(self):
+        path = self._write_csv(
+            "gfx,cu_num,M,N,K,kernelName\n"
+            "gfx950,256,1,7168,5120,k0\n"
+            "gfx950,256,64,7168,5120,k1\n"
+            "gfx950,128,1,2048,5120,k2\n"
+            "gfx942,256,1,4096,5120,k3\n"
+        )
+        self.assertEqual(
+            _read_tuned_fp4_gemm_shapes(path, gfx="gfx950", cu_num=256),
+            frozenset({(7168, 5120)}),
+        )
+
+    def test_csv_without_gfx_column_matches_cu_num_only(self):
+        path = self._write_csv(
+            "cu_num,M,N,K,kernelName\n256,1,7168,5120,k0\n304,1,2048,5120,k1\n"
+        )
+        self.assertEqual(
+            _read_tuned_fp4_gemm_shapes(path, gfx="gfx950", cu_num=256),
+            frozenset({(7168, 5120)}),
+        )
+
+
+class TestQuarkMxfp4AutoLayerSelection(CustomTestCase):
+    N, K = 1024, 5120
+
+    def setUp(self):
+        saved = fp4_utils.FP4_GEMM_RUNNER_BACKEND
+        self.addCleanup(setattr, fp4_utils, "FP4_GEMM_RUNNER_BACKEND", saved)
+
+    def _process(self, backend, tuned_shapes, requires_triton=False, n=None):
+        fp4_utils.FP4_GEMM_RUNNER_BACKEND = backend
+        layer = _make_mxfp4_layer(n or self.N, self.K)
+        layer.requires_triton_mxfp4_gemm = requires_triton
+        self.loaded_weight = layer.weight
         with (
-            mock.patch.object(quark_w4a4_mxfp4, "_use_aiter_asm_fp4_gemm", True),
+            mock.patch.object(quark_w4a4_mxfp4, "_is_hip", True),
             mock.patch.object(
-                quark_w4a4_mxfp4, "is_gfx95_supported", return_value=True
+                quark_w4a4_mxfp4, "is_mxfp4_gemm_supported", return_value=True
+            ),
+            mock.patch.object(
+                quark_w4a4_mxfp4,
+                "_aiter_tuned_fp4_gemm_shapes",
+                return_value=frozenset(tuned_shapes),
+            ),
+            mock.patch.object(
+                quark_w4a4_mxfp4,
+                "shuffle_weight",
+                side_effect=lambda w, layout: w.clone(),
+                create=True,
             ),
         ):
+            scheme = quark_w4a4_mxfp4.QuarkW4A4MXFP4({}, {})
             scheme.process_weights_after_loading(layer)
+        return layer
 
+    def test_auto_uses_aiter_for_tuned_shapes_only(self):
+        self.assertTrue(
+            self._process(
+                Fp4GemmRunnerBackend.AUTO, {(self.N, self.K)}
+            ).use_aiter_asm_fp4_gemm
+        )
+        self.assertFalse(
+            self._process(Fp4GemmRunnerBackend.AUTO, set()).use_aiter_asm_fp4_gemm
+        )
+
+    def test_explicit_aiter_ignores_tuned_csv(self):
+        self.assertTrue(
+            self._process(Fp4GemmRunnerBackend.AITER, set()).use_aiter_asm_fp4_gemm
+        )
+
+    def test_requires_triton_layer_stays_on_triton(self):
+        for backend in (Fp4GemmRunnerBackend.AUTO, Fp4GemmRunnerBackend.AITER):
+            with self.subTest(backend=backend):
+                layer = self._process(backend, {(self.N, self.K)}, requires_triton=True)
+                self.assertFalse(layer.use_aiter_asm_fp4_gemm)
+
+    def test_narrow_layer_stays_on_triton(self):
+        """With --fp4-gemm-backend aiter, a layer with N <= 128 (Qwen3.8 GDN
+        in_proj_ba, N=96) must keep the Triton GEMM: AITER's untuned ASM
+        heuristic returns wrong rows 1..M-1 for it at small batch sizes."""
+        layer = self._process(Fp4GemmRunnerBackend.AITER, set(), n=96)
         self.assertFalse(layer.use_aiter_asm_fp4_gemm)
-        self.assertIs(layer.weight, weight)
+        self.assertIs(layer.weight, self.loaded_weight)  # not shuffled for AITER
 
 
 if __name__ == "__main__":
