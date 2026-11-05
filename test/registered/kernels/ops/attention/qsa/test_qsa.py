@@ -36,6 +36,11 @@ from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
     QwenSparseAttnBackend,
     QwenSparseMultiStepDraftBackend,
 )
+from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
+    UnquantizedKVCacheMethod,
+)
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.mem_cache_utils import routed
@@ -590,6 +595,42 @@ def test_qsa_indexer_ignores_dp_attention_token_padding():
     torch.testing.assert_close(padded, unpadded)
     assert padded.shape[0] == 15
     assert calls == {"token_rows": 15, "logical_rows": 15, "rope_rows": 15}
+
+
+def test_sharded_qsa_store_uses_pool_mapping():
+    calls = []
+
+    class Pool:
+        qsa_raw_kv_sharding = object()
+
+        def set_kv_buffer(self, *args):
+            calls.append(args)
+
+    class RoutedLayer:
+        def store(self, *args):
+            raise AssertionError("sharded writes must use the QSA pool mapping")
+
+    backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
+    pool = Pool()
+    pool.layer_router = SimpleNamespace(layer=lambda _layer_id: RoutedLayer())
+    backend.token_to_kv_pool = pool
+    layer = SimpleNamespace(layer_id=7)
+    loc, k, v = object(), object(), object()
+
+    backend._store_kv_cache(layer, loc, k, v)
+
+    assert calls == [(layer, loc, k, v)]
+
+
+def test_sharded_qsa_pool_is_not_fused_eligible():
+    storage = MHATokenToKVPool.__new__(MHATokenToKVPool)
+    storage.quant_method = UnquantizedKVCacheMethod()
+    storage.dtype = torch.bfloat16
+    pool = QSATokenToKVPool.__new__(QSATokenToKVPool)
+    pool.full_kv_pool = storage
+    pool.cache_sharding_runtime = SimpleNamespace(enabled=True)
+
+    assert not QwenSparseAttnBackend._supports_fused_kv_pool(pool)
 
 
 def test_qsa_cuda_extend_ignores_dp_attention_padding(monkeypatch):
