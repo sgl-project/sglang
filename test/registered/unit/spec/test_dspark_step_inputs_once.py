@@ -1,5 +1,6 @@
 import os
 import unittest
+from types import SimpleNamespace
 
 import torch
 
@@ -123,7 +124,9 @@ class TestDraftSamplerVerifyIds(unittest.TestCase):
             s.out[: bs * gamma].copy_(draft.reshape(-1))
             return draft, None
 
-        s._megakernel_steps = lambda b: step
+        s._draft_strategy = SimpleNamespace(
+            run=lambda **kw: step(kw["model_hidden"], kw["anchor_tokens"])
+        )
         input_ids = torch.arange(bs * gamma, dtype=torch.int64) * 3
         s(torch.zeros(bs * gamma, hidden), input_ids)
         anchor = input_ids.view(bs, gamma)[:, :1]
@@ -208,6 +211,8 @@ class TestPostFoldRelay(unittest.TestCase):
         self.assertIs(overlap_utils._offered_relay, relay)
 
         fm = overlap_utils.FutureMap.__new__(overlap_utils.FutureMap)
+        # Deferred relays arrive in R7; production initializes this in __init__.
+        fm._deferred_relay = None
         fm.needs_confidence_relay = False
         fm.spec_algo = SimpleNamespace(is_some=lambda: False, is_ngram=lambda: False)
         fm._adopt_relay(relay)
