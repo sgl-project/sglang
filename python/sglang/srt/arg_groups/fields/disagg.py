@@ -129,7 +129,7 @@ class Disagg(msgspec.Struct):
     nixl_use_cpu_buffer: A[
         bool,
         "Stage NIXL KV transfers through pageable CPU memory (TDX/CC). "
-        "Requires matching TP layouts, PP=CP=DCP=1, and no extra model state.",
+        "Requires matching TP layouts and PP=CP=DCP=1; supports KV, Mamba, and QSA state.",
     ] = False
     nixl_cpu_buffer_size_gb: A[
         float, "Per-rank pageable NIXL staging pool size in GiB."

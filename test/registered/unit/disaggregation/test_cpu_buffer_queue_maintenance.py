@@ -9,7 +9,7 @@ from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     SchedulerDisaggregationDecodeMixin,
 )
-from sglang.srt.managers.schedule_batch import FINISH_ABORT
+from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     ListKind,

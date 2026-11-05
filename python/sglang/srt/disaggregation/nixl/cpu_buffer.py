@@ -8,8 +8,8 @@ Only host addresses are registered with NIXL; CUDA copies stay in PyTorch.
 from __future__ import annotations
 
 import threading
-from dataclasses import dataclass
 
+import msgspec
 import numpy as np
 import torch
 
@@ -82,8 +82,7 @@ class CpuBufferPool:
         return descs
 
 
-@dataclass
-class CpuReceiveRegion:
+class CpuReceiveRegion(msgspec.Struct):
     offset: int | None
     buffer: torch.Tensor
     indices: np.ndarray
