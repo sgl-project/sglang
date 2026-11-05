@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="320" viewBox="0 0 760 320" role="img" aria-label="TPOT versus concurrency target (Qwen3-8B)">
+<rect x="0" y="0" width="760" height="320" rx="12" fill="#f7f8fa"/>
+<text x="24" y="40" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="600" fill="#1c2330">TPOT versus concurrency target (Qwen3-8B)</text>
+<text x="24" y="62" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#6b7280">A3 Series, W8A8 INT8, 1 card, 3.5k input + 1.5k output, EAGLE3 speculative decoding.</text>
+<line x1="300" y1="86" x2="300" y2="250" stroke="#dfe3e9" stroke-width="1"/>
+<text x="286" y="113.0" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="12" fill="#374151">1 concurrent request</text>
+<rect x="300" y="96.0" width="47.5" height="26" rx="4" fill="#2f6feb"/>
+<text x="357.5" y="113.0" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#1c2330">5 ms</text>
+<text x="286" y="188.0" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="12" fill="#374151">64 concurrent requests</text>
+<rect x="300" y="171.0" width="351.5" height="26" rx="4" fill="#f08a24"/>
+<text x="661.5" y="188.0" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#1c2330">37 ms</text>
+<text x="24" y="302" font-family="Helvetica, Arial, sans-serif" font-size="10.5" fill="#8a919e">Source: Qwen3-8B best practice, low-latency and high-throughput configurations.</text>
+</svg>
