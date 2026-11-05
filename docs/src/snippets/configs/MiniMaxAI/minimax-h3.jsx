@@ -576,23 +576,23 @@ return {
       showWhen: (s) => ["ref_image", "ref_image_audio", "mixed_ref"].includes(s.mode),
       description: "Resize Ref2VA image references before encoding; audio, video, and FL2VA keyframes are unaffected.",
       quality: "Preprocessing policy",
-      default: "diffusers",
+      default: "max",
       options: [
+        {
+          id: "max",
+          label: "Preserve reference resolution",
+          recommended: true,
+          description: "Keep smaller inputs at source scale and downscale only when the short edge exceeds 2048 pixels.",
+        },
         {
           id: "diffusers",
           label: "Diffusers-compatible",
-          recommended: true,
-          description: "Preserve the existing behavior by scaling the reference short edge to 2048 pixels, including upscaling.",
+          description: "Reproduce the original preprocessing by scaling the reference short edge to 2048 pixels, including upscaling.",
         },
         {
           id: "match",
           label: "Match target area",
           description: "Match the target canvas pixel area without upscaling; required by ModelTC Ref2VA Turbo.",
-        },
-        {
-          id: "max",
-          label: "2048 short-edge cap",
-          description: "Keep smaller inputs at source scale and downscale only when the short edge exceeds 2048 pixels.",
         },
       ],
     },

@@ -97,7 +97,8 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
     One MultimodalDataItem represents a single multimodal input (one image, one video, or one audio).
     For example, if there are 3 images and 1 audio, there will be 4 MultimodalDataItems.
 
-    Each item has its own hash and pad_value, enabling per-image RadixAttention caching.
+    Each item has a full identity for embedding caching and batch deduplication.
+    KV caching additionally scopes the request by its ordered media identities.
 
     We put the common fields first and the model-specific fields in model_specific_data.
     """
@@ -124,14 +125,16 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
         default_factory=dict
     )
 
-    # optional full identity; otherwise sentinels derive from the 64-bit item hash
+    # Full identity is authoritative for every cache; hash is legacy wire metadata.
     # pad_value remains the first sentinel for scalar-padding consumers
     identity: Optional[bytes] = None
     pad_values: Optional[Tuple[int, ...]] = None
+    processor_fingerprint: Optional[str] = None
 
     def __post_init__(self) -> None:
-        if self.hash is not None:
-            msgspec.Struct.__setattr__(self, "hash", self.hash & _MM_HASH_MASK)
+        if self.hash is not None and not 0 <= self.hash <= _MM_HASH_MASK:
+            # retain full artifact fingerprints before narrowing the wire field
+            self.set_hash(self.hash)
 
     def __getattr__(self, name: str) -> MultimodalDataValue:
         if name in self.model_specific_data:
@@ -157,15 +160,15 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
 
     def set_hash(self, hash_value: int) -> None:
         self.hash = hash_value
-        self.identity = None
-        self.pad_values = _compute_pad_values(self.hash.to_bytes(8, byteorder="big"))
-        self.pad_value = self.pad_values[0]
+        # Preserve the full incoming value before the legacy field masks it.
+        self.set_identity(self._input_identity(hash_value))
+        self.hash = hash_value
 
     def set_identity(self, identity: bytes) -> None:
         """Adopt a full 32-byte digest and derive four 62-bit pad sentinels.
 
-        ``hash`` keeps the leading 64 bits for scalar consumers such as the
-        embedding cache; the radix key uses the full sentinel pattern.
+        ``hash`` keeps a compatibility scalar, never the embedding-cache key.
+        The radix key also binds the full identity in the request namespace.
         """
         if len(identity) != _MM_IDENTITY_BYTES:
             raise ValueError(
@@ -176,6 +179,31 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
         self.hash = int.from_bytes(identity[:8], byteorder="big", signed=False)
         self.pad_values = _compute_pad_values(self.identity)
         self.pad_value = self.pad_values[0]
+
+    @property
+    def cache_key(self) -> bytes:
+        """The full identity, shared by embedding caching and batch dedup."""
+        self.set_pad_value()
+        return self.identity
+
+    def clear_identity(self) -> None:
+        """Invalidate all derived state after slicing or replacing a feature."""
+        self.hash = self.identity = self.pad_value = self.pad_values = None
+
+    def bind_processor_fingerprint(self, fingerprint: str) -> bool:
+        """Scope caches to the serving processor, once per request-owned item."""
+        from sglang.srt.multimodal.cache.digest import structured_digest
+
+        if self.processor_fingerprint == fingerprint:
+            return False
+        if self.processor_fingerprint is not None:
+            raise ValueError("Multimodal item belongs to a different processor")
+        self.processor_fingerprint = fingerprint
+        if self.identity is not None:
+            self.set_identity(
+                structured_digest(("processor", fingerprint, self.identity))
+            )
+        return True
 
     def padding_values(self) -> Tuple[int, ...]:
         return self.pad_values or (self.pad_value,)
@@ -192,17 +220,29 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
         return len([item for item in flatten_nested_list(l) if item is not None]) == 0
 
     def set_pad_value(self):
-        if self.pad_value is not None:
+        if self.identity is not None:
+            if self.pad_value is None:
+                self.set_identity(self.identity)
             return
 
-        from sglang.srt.multimodal.cache import resolve_multimodal_item_hash
+        hash_hint = self.hash
+        self.set_identity(self._input_identity(hash_hint))
+        if hash_hint is not None:
+            self.hash = hash_hint
 
-        self.set_hash(
-            resolve_multimodal_item_hash(
-                existing_hash=self.hash,
-                feature=self.feature,
-                precomputed_embeddings=self.precomputed_embeddings,
-            )
+    def _input_identity(self, hash_hint: Optional[int]) -> bytes:
+        from sglang.srt.multimodal.cache.identity import (
+            resolve_multimodal_item_identity,
+        )
+
+        return resolve_multimodal_item_identity(
+            existing_hash=hash_hint,
+            feature=self.feature,
+            precomputed_embeddings=self.precomputed_embeddings,
+            modality=self.modality.name,
+            input_format=self.format.name,
+            metadata=self.model_specific_data,
+            namespace=self.processor_fingerprint,
         )
 
     def is_modality(self, modality: Modality) -> bool:

@@ -18,8 +18,8 @@ from sglang.srt.managers.scheduler_components.deferred_responses import (
     DeferredResponses,
 )
 from sglang.srt.managers.scheduler_components.request_list import (
+    KeyedReqList,
     ListKind,
-    _RequestList,
 )
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
@@ -35,6 +35,7 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import release_only_retirer
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -112,8 +113,8 @@ class TestSchedulerBatchWeightVersion(CustomTestCase):
         scheduler.load_publisher = MagicMock()
         scheduler.load_inquirer = MagicMock()
         scheduler.tree_cache = SimpleNamespace(flush_pending_backups=MagicMock())
-        scheduler.running_reqs = _RequestList(ListKind.DECODING)
-        scheduler.prefill_launched_reqs = _RequestList(ListKind.PREFILL_LAUNCHED)
+        scheduler.running_reqs = KeyedReqList(ListKind.DECODING)
+        scheduler.prefill_launched_reqs = KeyedReqList(ListKind.PREFILL_LAUNCHED)
         scheduler.invariant_checker = MagicMock()
         scheduler.kv_weight_version_tracker = KvWeightVersionTracker(
             num_slots=8,
@@ -139,6 +140,7 @@ class TestSchedulerBatchWeightVersion(CustomTestCase):
             logprob_result_processor=None,
             output_streamer=MagicMock(),
             beam_coordinator=MagicMock(),
+            request_retirer=release_only_retirer(tree_cache=scheduler.tree_cache),
             abort_request=lambda *args, **kwargs: None,
         )
         for name, value in (

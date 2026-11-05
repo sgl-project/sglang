@@ -100,7 +100,7 @@ class TestRunnerGluesTheTargetVerify(CustomTestCase):
         runner.buffers = SimpleNamespace(out_cache_loc=torch.arange(16))
         view = SimpleNamespace(out_cache_loc=torch.arange(100, 106))
         runner._draft_metadata_glue, runner._target_metadata_glue = False, True
-        runner._glue_draft_inputs(view)
+        runner._glue_draft_inputs(view, 6)
         self.assertEqual(
             view.out_cache_loc.data_ptr(), runner.buffers.out_cache_loc.data_ptr()
         )
