@@ -10,6 +10,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
+import triton
+import triton.language as tl
 
 from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
 
@@ -83,3 +85,114 @@ def dcp_global_slots_hip(
         gathered, positions, global_lens, page_table, out, span, rank
     )
     return out
+
+
+@triton.jit
+def _pack_candidates_kernel(
+    logits,
+    logits_stride,
+    local_idx,
+    out,
+    WORLD: tl.constexpr,
+    RANK: tl.constexpr,
+    TOPK: tl.constexpr,
+):
+    # local top-k positions -> (fp32 score bits, global position or -1) pairs
+    row = tl.program_id(0)
+    offs = tl.arange(0, TOPK)
+    i = tl.load(local_idx + row.to(tl.int64) * TOPK + offs)
+    valid = i >= 0
+    score = tl.load(
+        logits + row.to(tl.int64) * logits_stride + tl.where(valid, i, 0),
+        mask=valid,
+        other=0.0,
+    )
+    base = out + row.to(tl.int64) * TOPK * 2
+    tl.store(base + offs * 2, score.to(tl.int32, bitcast=True))
+    tl.store(base + offs * 2 + 1, tl.where(valid, i * WORLD + RANK, -1))
+
+
+@triton.jit
+def _gather_candidates_kernel(
+    gathered,
+    num_rows,
+    global_lens,
+    scores,
+    positions,
+    lengths,
+    WORLD: tl.constexpr,
+    TOPK: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    # Rank-major [WORLD * rows, TOPK] (score bits, position) pairs -> row-major
+    # [rows, WORLD * TOPK] scores (-inf where none) and positions (-1 where none).
+    src_row = tl.program_id(0)
+    rank = src_row // num_rows
+    row = src_row % num_rows
+    offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    in_block = offs < TOPK
+    # Prefix-only gathers leave the padding undefined; read this rank's share only.
+    n = (tl.load(global_lens + row) + WORLD - 1 - rank) // WORLD
+    mask = offs < tl.minimum(n, TOPK)
+    base = gathered + src_row.to(tl.int64) * TOPK * 2
+    score = tl.load(base + offs * 2, mask=mask, other=0).to(tl.float32, bitcast=True)
+    pos = tl.load(base + offs * 2 + 1, mask=mask, other=-1)
+    keep = mask & (pos >= 0)
+    dst = row.to(tl.int64) * WORLD * TOPK + rank * TOPK + offs
+    tl.store(scores + dst, tl.where(keep, score, float("-inf")), mask=in_block)
+    tl.store(positions + dst, tl.where(keep, pos, -1), mask=in_block)
+    if rank == 0 and tl.program_id(1) == 0:
+        tl.store(lengths + row, WORLD * TOPK)
+
+
+@triton.jit
+def _candidates_to_slots_kernel(
+    idx,
+    positions,
+    page_table,
+    page_table_stride,
+    out,
+    span,
+    NUM_CANDIDATES: tl.constexpr,
+    TOPK: tl.constexpr,
+):
+    # selected candidate -> its global position p -> widened slot, -1 if none
+    row = tl.program_id(0)
+    offs = tl.arange(0, TOPK)
+    i = tl.load(idx + row.to(tl.int64) * TOPK + offs)
+    p = tl.load(
+        positions + row.to(tl.int64) * NUM_CANDIDATES + i, mask=i >= 0, other=-1
+    )
+    valid = p >= 0
+    page = tl.load(
+        page_table + row.to(tl.int64) * page_table_stride + p // span,
+        mask=valid,
+        other=0,
+    )
+    tl.store(
+        out + row.to(tl.int64) * TOPK + offs,
+        tl.where(valid, page * span + p % span, -1),
+    )
+
+
+@triton.jit
+def _all_visible_slots_kernel(
+    global_lens,
+    page_table,
+    page_table_stride,
+    out,
+    span,
+    TOPK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offs = tl.arange(0, TOPK)
+    valid = offs < tl.load(global_lens + row)
+    page = tl.load(
+        page_table + row.to(tl.int64) * page_table_stride + offs // span,
+        mask=valid,
+        other=0,
+    )
+    tl.store(
+        out + row.to(tl.int64) * TOPK + offs,
+        tl.where(valid, page * span + offs % span, -1),
+    )
