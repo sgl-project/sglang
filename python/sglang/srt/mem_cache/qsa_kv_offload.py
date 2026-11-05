@@ -518,7 +518,11 @@ class QSAKVHostOffload:
         reset_req_pool_indices: Optional[torch.Tensor] = None,
     ) -> None:
         """Per-forward setup; an extend passes its requests to reset."""
-        if self.fused is None and torch.cuda.is_current_stream_capturing():
+        if (
+            self.fused is None
+            and self.device.type == "cuda"
+            and torch.cuda.is_current_stream_capturing()
+        ):
             raise RuntimeError(
                 "The QSA K/V offload resolve runs eagerly; launch with "
                 "--disable-cuda-graph"
