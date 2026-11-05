@@ -1109,6 +1109,10 @@ class Gemma4ForCausalLM(PreTrainedModel):
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     _tp_plan = {"lm_head": "colwise_rep"}
 
+    # Request input_embeds reach forward() together with placeholder input_ids,
+    # which it rejects, and per-layer embeddings (when enabled) need real ids.
+    supports_input_embeds = False
+
     # BitandBytes specific attributes
     default_bitsandbytes_target_modules = [
         ".gate_proj.",
