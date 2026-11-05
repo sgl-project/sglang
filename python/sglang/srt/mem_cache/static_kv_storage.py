@@ -482,6 +482,15 @@ class StaticKVStorage:
         # The DSV4-NPU table's free() also releases the c4/c128 state pages.
         self.requests.free(req)
 
+    def park_row(self, holder) -> None:
+        """See `KVStorage.park_row`: no admission rule here reads rows."""
+
+    def unpark_row(self, holder) -> None:
+        """See `KVStorage.unpark_row`."""
+
+    def hold_row(self, holder) -> None:
+        """See `KVStorage.hold_row`."""
+
     def take_rows(self, num_rows: int) -> Optional[List[int]]:
         return self.requests.alloc_rows(num_rows)
 
