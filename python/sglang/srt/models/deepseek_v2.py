@@ -964,12 +964,11 @@ class DeepseekV2MoE(nn.Module):
                 and shared_gate_up_weight.dtype == torch.float8_e4m3fn
             )
             if self.shared_experts_is_fp8 and not _is_npu:
-                if (
-                    _use_aiter
-                    and config.quantization_config.get("quant_method")
-                    == "compressed-tensors"
+                if _use_aiter and config.quantization_config.get("quant_method") in (
+                    "compressed-tensors",
+                    "w8a8_fp8",
                 ):
-                    # For compressed-tensors ptpc model, don't need to check the weight_block_size
+                    # Per-channel (PTPC) checkpoints have no weight_block_size to check.
                     pass
                 else:
                     assert (
