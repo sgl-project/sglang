@@ -570,7 +570,8 @@ EOF
 
             # The toolkit tokenizes prompts client-side with the model's own
             # tokenizer and loads it without trust_remote_code; checkpoints
-            # like Kimi-K3 carry custom code, so patch the disposable copy.
+            # like Kimi-K3 carry custom code, so transformers prompts on
+            # stdin (absent in CI) and aborts. Patch the disposable copy.
             sed -i "s/from_pretrained(tokenizer_path)/from_pretrained(tokenizer_path, trust_remote_code=True)/" "${DEST_COPY_DIR}"/*.py
 
             echo "===== [Mode] Prefix Cache Test (Hit Rate: $REPEAT_RATE) ====="
