@@ -1145,9 +1145,15 @@ def generate_glm_grammar(
         )
     )
 
-    ebnf_lines.append(
-        f"text_block ::= ( {extra_seperator} text_without_special_tokens )?"
-    )
+    if required and functions:
+        # A mandatory call must start within a bounded preamble; otherwise the
+        # model can produce text until max_tokens while EOS is masked.
+        # Excluding "<" also keeps every GLM special token out of the preamble.
+        ebnf_lines.append(f"text_block ::= ( {extra_seperator} [^<]{{0,256}} )?")
+    else:
+        ebnf_lines.append(
+            f"text_block ::= ( {extra_seperator} text_without_special_tokens )?"
+        )
 
     if functions:
         ebnf_lines.extend(
