@@ -117,9 +117,18 @@ def run_eval(args):
     )
     latency = time.perf_counter() - tic
 
+    # A request that failed server-side never sets "answer"; score it as invalid
+    # instead of aborting the whole eval on one transient error.
+    num_errors = sum(1 for s in states if s.error() is not None)
+    if num_errors:
+        warnings.warn(f"{num_errors}/{len(states)} requests failed; scored as invalid")
+
     preds = []
-    for i in range(len(states)):
-        preds.append(get_answer_value(states[i]["answer"]))
+    for s in states:
+        if s.error() is not None:
+            preds.append(INVALID)
+        else:
+            preds.append(get_answer_value(s["answer"]))
 
     # print(f"{preds=}")
     # print(f"{labels=}")
@@ -130,7 +139,9 @@ def run_eval(args):
 
     # Compute speed
     num_output_tokens = sum(
-        s.get_meta_info("answer")["completion_tokens"] for s in states
+        s.get_meta_info("answer")["completion_tokens"]
+        for s in states
+        if s.error() is None
     )
     output_throughput = num_output_tokens / latency
 
@@ -146,6 +157,7 @@ def run_eval(args):
     return {
         "accuracy": acc,
         "invalid": invalid,
+        "num_errors": num_errors,
         "latency": latency,
         "output_throughput": output_throughput,
     }
