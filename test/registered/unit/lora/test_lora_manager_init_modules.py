@@ -236,6 +236,59 @@ class TestAutoDetectTargets(CustomTestCase):
         )
 
 
+class _MockVocabParallelEmbedding(torch.nn.Module):
+    pass
+
+
+class TestAllTargetsEmbeddings(CustomTestCase):
+    """`--lora-target-modules all` adds `embed_tokens`/`lm_head` only for the
+    embedding classes LoRA can wrap."""
+
+    @staticmethod
+    def _resolve_all(embed_tokens):
+        model = torch.nn.Module()
+        model.model = torch.nn.Module()
+        layer = torch.nn.Module()
+        layer.self_attn = torch.nn.Module()
+        layer.self_attn.qkv_proj = _MockLinearBase()
+        layer.self_attn.o_proj = _MockLinearBase()
+        model.model.layers = torch.nn.ModuleList([layer])
+        model.model.embed_tokens = embed_tokens
+        model.lm_head = embed_tokens  # tied
+
+        manager = LoRAManager.__new__(LoRAManager)
+        manager.base_model = model
+        manager.configs = {}
+        manager.lora_added_tokens_size = 0
+        with (
+            patch("sglang.srt.layers.linear.LinearBase", _MockLinearBase),
+            patch(
+                "sglang.srt.layers.moe.fused_moe_triton.layer.FusedMoE", _MockFusedMoE
+            ),
+            patch(
+                "sglang.srt.layers.vocab_parallel_embedding.ParallelLMHead",
+                _MockParallelLMHead,
+            ),
+            patch(
+                "sglang.srt.layers.vocab_parallel_embedding.VocabParallelEmbedding",
+                _MockVocabParallelEmbedding,
+            ),
+        ):
+            manager.init_lora_shapes(max_lora_rank=8, target_modules={"all"})
+        return manager.target_modules
+
+    def test_tied_parallel_embedding_gets_both_targets(self):
+        targets = self._resolve_all(_MockVocabParallelEmbedding())
+        self.assertEqual(targets, {"qkv_proj", "o_proj", "embed_tokens", "lm_head"})
+
+    def test_plain_embedding_gets_no_embedding_targets(self):
+        # Gemma 3/4 tie lm_head to a scaled `nn.Embedding`, which has no
+        # `org_vocab_size`; adding `lm_head` sent init_lora_modules into the
+        # tied-head path and failed with AttributeError.
+        targets = self._resolve_all(torch.nn.Embedding(10, 8))
+        self.assertEqual(targets, {"qkv_proj", "o_proj"})
+
+
 class TestTargetValidation(CustomTestCase):
     """init_state rejects unsupported targets before any module is wrapped."""
 
