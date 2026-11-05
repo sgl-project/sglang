@@ -90,14 +90,17 @@ def test_one_row_per_cta_matches_tilelang(lengths, min_scored_len):
     _assert_bitwise(actual, expected, lengths, min_scored_len)
 
 
+@pytest.mark.parametrize("min_scored_len", [0, 512])
 @pytest.mark.parametrize("rows_per_request", [2, 4])
-def test_verify_rows_share_key_loads(rows_per_request):
+def test_verify_rows_share_key_loads(rows_per_request, min_scored_len):
+    # min_scored_len=0 compares the whole -inf-filled output, so a row writing
+    # past its own length (up to the last row's) is caught.
     starts = [5, 511, 530, 1987, 3000, 64, 700, 1290]
     lengths = [s + i for s in starts for i in range(rows_per_request)]
     q, k_cache, page_table, lengths = _make_inputs(lengths, rows_per_request)
     max_model_len = int(lengths.max())
     expected = tilelang_qsa_mqa_decode(
-        q, k_cache, page_table, lengths, max_model_len, min_scored_len=512
+        q, k_cache, page_table, lengths, max_model_len, min_scored_len=min_scored_len
     )
     actual = cuda_qsa_mqa_decode(
         q,
@@ -105,10 +108,10 @@ def test_verify_rows_share_key_loads(rows_per_request):
         page_table,
         lengths,
         max_model_len,
-        min_scored_len=512,
+        min_scored_len=min_scored_len,
         rows_per_request=rows_per_request,
     )
-    _assert_bitwise(actual, expected, lengths, 512)
+    _assert_bitwise(actual, expected, lengths, min_scored_len)
 
 
 def test_cuda_graph_replay_matches_eager():
