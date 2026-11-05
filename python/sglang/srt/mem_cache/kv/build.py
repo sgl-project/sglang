@@ -305,10 +305,13 @@ def build_kv_storage(
         _wire_mamba_slot_allocator(
             mamba_end=allocator.mamba_allocator,
             take=allocator.alloc_state_slots,
+            capacity=allocator.state_slots_available,
             state=state_storage,
             device=ctx.device,
         )
         allocator.state = state_storage
+    allocator.plan = plan
+    allocator.request_memory = request_memory
     allocator.storage = KVStorage(
         plan=plan,
         sized=sized,

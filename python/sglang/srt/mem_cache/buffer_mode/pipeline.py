@@ -39,7 +39,6 @@ from sglang.srt.managers.cache_controller import HICACHE_WRITE_STAGING_POOL_FRAC
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     DecLockRefParams,
-    EvictParams,
     InitLoadBackParams,
     InsertParams,
     InsertResult,
@@ -51,6 +50,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     SidecarPoolSpec,
 )
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.pool_host.base import HostKVCache
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_prefetch import (
@@ -1887,18 +1887,16 @@ class BufferModePipeline:
         # Evict-before-alloc (mirrors _load_back_transfers): the budget gate
         # counts evictable pages, but cc.load draws from free slots only.
         cache = self._cache
-        if cache.supports_swa():
-            avail = cache.token_to_kv_pool_allocator.full_available_size()
-        else:
-            avail = cache.token_to_kv_pool_allocator.available_size()
-        if avail < load_tokens:
-            needed = load_tokens - avail
-            cache.evict_for_alloc(EvictParams(num_tokens=needed))
+        allocator = cache.token_to_kv_pool_allocator
+
+        def available() -> int:
             if cache.supports_swa():
-                avail = cache.token_to_kv_pool_allocator.full_available_size()
-            else:
-                avail = cache.token_to_kv_pool_allocator.available_size()
-            if avail < load_tokens:
+                return allocator.full_available_size()
+            return allocator.available_size()
+
+        if available() < load_tokens:
+            cache.evict_for_alloc(KVDemand(full_tokens=load_tokens))
+            if available() < load_tokens:
                 return False
         return True
 

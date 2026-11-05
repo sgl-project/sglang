@@ -25,6 +25,7 @@ from sglang.srt.mem_cache.kv.alloc.page_usage import (
     PageUsage,
     Wait,
 )
+from sglang.srt.mem_cache.kv.alloc.pricing import PLAN_STEPS, feasible, plan
 from sglang.srt.mem_cache.kv.alloc.signals import (
     NetworkTransfer,
     StreamTransfer,
@@ -419,6 +420,34 @@ class TestCompactionWaitsTheWritersOfItsSources(_Bands):
         self.assertIn(forward, self.waits.keys)
 
 
+class TestRelocationHoles(_Bands):
+    def test_holes_a_relocation_creates_keep_their_fences(self):
+        """Regression: holes a relocation leaves in its new block keep their fences
+        until the take that writes one clears it."""
+        alloc = _chain()
+        flt = alloc.swa_attn_allocator
+        ids = alloc.alloc(12)
+        self.assertIsNotNone(ids)
+        low, high = flt.low_wm_page, flt.high_wm_page
+        gap_low, _ = flt._gap_pages()
+        self.assertGreater(gap_low, 0, "the geometry left no low gap")
+        reader = _Event()
+        full = alloc.full_attn_allocator
+        alloc.set_latest_forward_done_event(reader)
+        # A neighbour's page there was vacated while the forward still reads it.
+        full.usage.vacate(reader, [(low - 1, low)], page_bytes=flt.entry_bytes_per_page)
+        flt._holes_dirty = False
+        self.assertEqual(flt.relocate_into(low - 1, high), 0)
+        self.assertEqual(self.waits.keys, [])
+        self.assertTrue(flt._holes_dirty)
+        self.assertIn(low - 1, flt._free_pages_snapshot())
+        # A forward's take (zeroed on hand-out) must not overwrite the bytes.
+        holes = len(flt._free_pages_snapshot())
+        pages = flt.acquire(holes, C.FORWARD).tolist()
+        self.assertIn(low - 1, pages)
+        self.assertEqual(self.waits.keys, [reader])
+
+
 class TestWidenedPagesUnderDcp(_Bands):
     """Under decode context parallelism the alloc surface hands out widened
     ids, `dcp_size` per physical row; a forward's write set must name the
@@ -450,55 +479,6 @@ class TestWidenedPagesUnderDcp(_Bands):
                 )
                 self.assertGreater(full.flush_for_allocation(), 0)
                 self.assertIn(forward, self.waits.keys)
-
-
-class TestFloatMoves(_Bands):
-    """A window float moves its pages only on demand (`make_room`,
-    `compact_holes`). The copy writes holes and gap pages, which unfinished
-    work may still touch, and leaves pages a forward may still read."""
-
-    def _float_with_a_hole(self, rank=1):
-        """A float whose ``rank``-th lowest page was freed: a hole inside the
-        span, below the sources a high-side ask moves; then a forward runs."""
-        alloc = _chain()
-        flt = alloc.swa_attn_allocator
-        ids = alloc.alloc(8)
-        pages = flt.ids.virtual_to_physical[ids].tolist()
-        low = sorted(pages)[rank]
-        slot = ids[pages.index(low) : pages.index(low) + 1]
-        alloc.free_swa(slot)
-        forward = self._running_forward(alloc, flt, None)
-        return alloc, flt, forward, low
-
-    def test_a_move_waits_no_forward_that_only_reads_its_sources(self):
-        """The copy waits only a forward that writes a page it moves; the
-        pages it vacates are fenced, and a later copy into them waits."""
-        alloc = _chain()
-        flt = alloc.swa_attn_allocator
-        alloc.alloc(8)
-        reader = _Event()
-        alloc.set_latest_forward_done_event(reader)
-        low, high = flt.low_wm_page, flt.high_wm_page
-        _, gap_high = flt._gap_pages()
-        epp = flt.entry_bytes_per_page
-        flt.make_room(side="high", min_bytes=(gap_high + 1) * epp)
-        self.assertEqual(self.waits.keys, [])
-        self.assertLess(flt.high_wm_page, high)
-        vacated = range(max(flt.high_wm_page, low), high)
-        self.assertTrue(vacated, "the geometry vacated no page")
-        flt._wait_fences(vacated[0], vacated[-1] + 1)
-        self.assertEqual(self.waits.keys, [reader])
-
-    def test_an_interior_shift_waits_every_running_forward(self):
-        """Packing that copies into sources vacated earlier in the same pass
-        orders every copy after the running forwards."""
-        # The two pages below the hole shift up by one: the lower one is
-        # copied into the page the upper one just left.
-        alloc, flt, forward, _ = self._float_with_a_hole(rank=2)
-        self.assertEqual(flt.compact_holes(retreat_side="low"), 2)
-        self.assertIn(forward, self.waits.keys)
-        self.assertEqual(flt._hole_pages(), 0)
-        self.assertFalse(alloc.verify_byte_accounting())
 
 
 class TestTakesReadNoEventCompletion(_Bands):
@@ -583,6 +563,195 @@ class TestReservationRelease(_Bands):
         self.assertEqual(self.waits.keys, [])
         clearance = flt._range_clearance(pages[0], pages[0] + 1, (C.FORWARD,))
         self.assertEqual([key.events for key in clearance.stream], [copy])
+
+
+class TestStateSlotsFusedTake(_Bands):
+    def test_frontier_slots_are_taken_and_bound_in_one_kernel(self):
+        """BUG REGRESSION. State slots lost the fused take-and-bind path."""
+        alloc = _chain()
+        real = band_module.alloc_bind_inplace
+        with mock.patch.object(
+            band_module, "alloc_bind_inplace", side_effect=real
+        ) as fused:
+            slots = alloc.alloc_state_slots(2)
+        self.assertEqual(fused.call_count, 1)
+        state = alloc.mamba_allocator
+        self.assertTrue(bool((state.ids.virtual_to_physical[slots] >= 0).all()))
+
+
+class TestSendRowsMovedOutOfTheBand(_Bands):
+    """Regression: after a relief or compaction moved a send's rows out of the
+    band, later plans keep only in-band send pages and never extend into its bytes."""
+
+    def _run(self, owner_grows, history):
+        """Replay ``history`` on a fresh chain. ``("beyond", None)`` checks
+        that an unreleased send then names a page outside the owner."""
+        alloc = _chain(owner_grows)
+        full = alloc.full_attn_allocator
+        rows, slots, sends = [], [], []
+        for op, arg in history:
+            if op == "alloc":
+                ids = alloc.alloc(arg)
+                if ids is not None:
+                    rows.append(ids)
+            elif op == "free":
+                ids = rows.pop(arg % len(rows))
+                # A row is released only once the sends of it ended.
+                for send, sent, _ in sends:
+                    if sent is ids:
+                        send.released = True
+                alloc.free(ids)
+            elif op == "send":
+                # As the storage records a send: by physical rows.
+                ids = rows[arg % len(rows)]
+                pages = full.ids.virtual_to_physical[ids // full.page_size]
+                send = NetworkTransfer()
+                full.record_transfer(
+                    send,
+                    pages,
+                    writes=False,
+                    release=send,
+                    unit_tokens=full.pool_page_size,
+                )
+                sends.append((send, ids, pages.tolist()))
+            elif op == "state":
+                slot = alloc.alloc_state_slots(1)
+                if slot is not None:
+                    slots.append(slot)
+            elif op == "state_free":
+                alloc.mamba_allocator.free(slots.pop(0))
+            elif op == "relief":
+                alloc.lay_out_for(arg)
+            elif op == "compact":
+                full.flush_for_allocation()
+            elif op == "flush":
+                alloc.flush_opportunistic()
+            elif op == "beyond":
+                first, end = full._span_range()
+                self.assertTrue(
+                    any(
+                        not send.released and not all(first <= p < end for p in pages)
+                        for send, _, pages in sends
+                    ),
+                    "no unreleased send names a page beyond the owner",
+                )
+        self.assertEqual(alloc.verify_byte_accounting(), [])
+        return alloc
+
+    # A relief that could not keep the sends in place moved one out.
+    _AFTER_A_RELIEF = [
+        ("alloc", 3),
+        ("alloc", 10),
+        ("alloc", 6),
+        ("free", 1),
+        ("alloc", 10),
+        ("alloc", 3),
+        ("alloc", 10),
+        ("free", 1),
+        ("alloc", 3),
+        ("alloc", 2),
+        ("send", 3),
+        ("alloc", 10),
+        ("free", 5),
+        ("free", 4),
+        ("send", 4),
+        ("free", 2),
+        ("free", 0),
+        ("relief", {"mamba": 24}),
+        ("beyond", None),
+        ("alloc", 10),
+    ]
+
+    def test_the_next_take_lays_out_around_a_send_a_relief_moved(self):
+        for owner_grows in ("down", "up"):
+            with self.subTest(owner_grows=owner_grows):
+                self._run(owner_grows, self._AFTER_A_RELIEF)
+
+    def test_the_next_take_lays_out_around_a_send_a_compaction_moved(self):
+        self._run(
+            "up",
+            [
+                ("alloc", 1),
+                ("alloc", 3),
+                ("alloc", 6),
+                ("state", None),
+                ("alloc", 4),
+                ("alloc", 10),
+                ("alloc", 6),
+                ("alloc", 3),
+                ("alloc", 4),
+                ("send", 7),
+                ("alloc", 6),
+                ("free", 6),
+                ("state_free", None),
+                ("state", None),
+                ("free", 5),
+                ("state", None),
+                ("compact", None),
+                ("beyond", None),
+                ("state", None),
+            ],
+        )
+
+    def test_a_flush_after_it_moves_only_live_pages(self):
+        self._run(
+            "down",
+            [
+                ("alloc", 1),
+                ("alloc", 4),
+                ("alloc", 10),
+                ("alloc", 6),
+                ("alloc", 6),
+                ("alloc", 1),
+                ("alloc", 10),
+                ("alloc", 1),
+                ("alloc", 1),
+                ("alloc", 3),
+                ("send", 8),
+                ("state", None),
+                ("free", 1),
+                ("compact", None),
+                ("beyond", None),
+                ("free", 3),
+                ("state", None),
+                ("flush", None),
+            ],
+        )
+
+    def test_the_bytes_a_send_reads_bound_every_plan_but_the_last_resort(self):
+        history = self._AFTER_A_RELIEF[: self._AFTER_A_RELIEF.index(("beyond", None))]
+        alloc = self._run("down", history)
+        held = alloc.network_held_bytes()
+        self.assertTrue(held, "the moved send's bytes are not held")
+        snapshot = alloc.held_snapshot()
+        self.assertEqual(snapshot.held, held)
+        # Every band's pages stay inside its span: none of them is fixed
+        # outside it for a plan to reach.
+        for band in alloc.bands:
+            first, end = band._span_range()
+            self.assertTrue(all(first <= p < end for p in band.network_rows()))
+        for name in ("full", "swa", "mamba"):
+            for pages in range(1, 25):
+                for step in PLAN_STEPS:
+                    found = plan(snapshot, {name: pages}, step)
+                    if found is None:
+                        continue
+                    for band_name, take in found.takes.items():
+                        e = snapshot.band(band_name).page_bytes
+                        if take.pages is not None:
+                            lo, hi = take.pages[0] * e, take.pages[1] * e
+                            for h_lo, h_hi in held:
+                                self.assertFalse(lo < h_hi and h_lo < hi, found)
+                    for band_name, (first, end) in found.targets.items():
+                        e = snapshot.band(band_name).page_bytes
+                        for h_lo, h_hi in held:
+                            self.assertFalse(first * e < h_hi and h_lo < end * e, found)
+                # Admission counts every byte: a layout through the held bytes
+                # waits for the send, the last resort.
+                self.assertEqual(
+                    feasible(snapshot, {name: pages}),
+                    feasible(alloc.pricing_snapshot(), {name: pages}),
+                )
 
 
 class TestEndBandsCompactLazily(CustomTestCase):

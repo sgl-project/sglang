@@ -72,27 +72,21 @@ def _get_allocator_type() -> str:
 
 def _evict_swa_for_device_alloc(cache: UnifiedRadixCache, required_size: int) -> None:
     """Make room for a host load of ``required_size`` rows of the target
-    window: its own shortfall, from its own entries. The load writes no other
-    window, so no other window is short."""
-    from sglang.srt.mem_cache.base_prefix_cache import EvictParams, window_sub_pool_of
+    window: a demand of the target alone, whose shortfall the cache measures
+    on the target's own room. The load writes no other window."""
+    from sglang.srt.mem_cache.base_prefix_cache import window_sub_pool_of
+    from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 
     allocator = cache.token_to_kv_pool_allocator
-    shortfall = max(0, required_size - allocator.swa_available_size())
-    if shortfall > 0:
-        cache.evict_for_alloc(
-            EvictParams(window_num_tokens={window_sub_pool_of(allocator): shortfall})
-        )
+    cache.evict_for_alloc(
+        KVDemand(window_tokens={window_sub_pool_of(allocator): required_size})
+    )
 
 
 def _evict_mamba_for_device_alloc(cache: UnifiedRadixCache, required_size: int) -> None:
-    from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+    from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 
-    available_size = (
-        cache.token_to_kv_pool_allocator.state_slots.schedulable_available_size()
-    )
-    shortfall = max(0, required_size - available_size)
-    if shortfall > 0:
-        cache.evict_for_alloc(EvictParams(mamba_num=shortfall))
+    cache.evict_for_alloc(KVDemand(state_slots=required_size))
 
 
 def _make_layer_mapper(
@@ -308,15 +302,8 @@ def _build_cache_controller(
 
 
 def _swa_allocation_callbacks(allocator) -> dict:
-    """Keep allocation and rollback in the same ID space for every SWA stack."""
-    from sglang.srt.mem_cache.kv.alloc.band import Band
-
-    if isinstance(allocator, Band):
-        # Unified SWA loads into physical reservations, bound before the H2D.
-        return dict(
-            device_alloc_fn=allocator.alloc_physical,
-            device_free_fn=allocator.cancel_physical_reservation,
-        )
+    """Keep allocation and rollback in the same ID space for every static SWA
+    stack (a unified pool's loads go through its storage, `host_load_alloc`)."""
     if allocator is None:
         return {}
     return dict(device_alloc_fn=allocator.alloc, device_free_fn=allocator.free)
@@ -1357,20 +1344,17 @@ def _packed_drafts(
 
 def _evict_for_host_load(
     cache: UnifiedRadixCache,
-    storage: KVStorage,
     sub_pool: str,
     component: ComponentType,
     required_size: int,
 ) -> None:
-    from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+    from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 
-    shortfall = max(0, required_size - storage.device_room(sub_pool))
-    if shortfall == 0:
-        return
     if component == ComponentType.MAMBA:
-        cache.evict_for_alloc(EvictParams(mamba_num=shortfall))
+        demand = KVDemand(state_slots=required_size)
     else:
-        cache.evict_for_alloc(EvictParams(window_num_tokens={sub_pool: shortfall}))
+        demand = KVDemand(window_tokens={sub_pool: required_size})
+    cache.evict_for_alloc(demand)
 
 
 def build_unified_host_stack(
@@ -1524,9 +1508,7 @@ def build_unified_host_stack(
                 device_evict_fn=(
                     None
                     if cache is None
-                    else partial(
-                        _evict_for_host_load, cache, storage, s.name, component
-                    )
+                    else partial(_evict_for_host_load, cache, s.name, component)
                 ),
                 device_alloc_fn=alloc[0],
                 device_free_fn=alloc[1],
@@ -2550,10 +2532,15 @@ def attach_hybrid_pool_to_unified_cache(
     storage_prefetch_threshold: int = 256,
 ) -> None:
     """Attach HostPoolGroup + HybridCacheController to UnifiedRadixCache."""
+    from sglang.srt.mem_cache.kv.storage import KVStorage
+    from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
+
     try:
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
-        storage = params.token_to_kv_pool_allocator.storage
-        if storage is not None:
+        storage = kv_storage_of(
+            params.req_to_token_pool, params.token_to_kv_pool_allocator
+        )
+        if isinstance(storage, KVStorage):
             # A unified pool: one host pool per sub-pool of its plan.
             result = build_unified_host_stack(
                 storage=storage,

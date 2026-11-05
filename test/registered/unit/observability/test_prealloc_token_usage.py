@@ -42,7 +42,9 @@ def _queue(reqs):
     queue.transfer_queue = SimpleNamespace(
         queue=decode_queue(ListKind.PD_RECEIVING, reqs)
     )
-    queue.token_to_kv_pool_allocator = SimpleNamespace(page_size=PAGE)
+    queue.token_to_kv_pool_allocator = SimpleNamespace(
+        page_size=PAGE, target_window_pool=lambda: None
+    )
     return queue
 
 
