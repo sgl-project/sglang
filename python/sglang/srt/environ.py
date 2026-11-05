@@ -2337,6 +2337,9 @@ class Envs:
     # ===================================================================
     SGLANG_PLATFORM = EnvStr("")
     SGLANG_PLUGINS = EnvStr("")
+    # Read by the NVIDIA megakernel plugin, not by SGLang: a comma-separated
+    # slot list that replaces the plugin's default. Empty runs the stock paths.
+    SGLANG_NVIDIA_MEGAKERNEL_SLOTS = EnvTuple(())
 
     # ===================================================================
     # KV-Canary and Token-Oracle (testing only)
