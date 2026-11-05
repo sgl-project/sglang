@@ -1204,6 +1204,23 @@ class KVCacheConfigurator:
 
         return sub_pool_names(self._kv_layer_decls())
 
+    def _unified_target_windows(self) -> tuple:
+        """The windows this runner's layers declare, as the plan names its
+        window sub-pools by them."""
+        from sglang.srt.mem_cache.kv.decl import WindowLifetime
+
+        return tuple(
+            sorted(
+                {
+                    part.lifetime.window
+                    for decl in self._kv_layer_decls()
+                    for part in decl.parts
+                    if isinstance(part.lifetime, WindowLifetime)
+                },
+                key=lambda window: WindowLifetime(window=window).retention(),
+            )
+        )
+
     def _fused_draft_decision(self):
         """Place each draft kind by lifetime and price its own row geometry.
 
@@ -1316,6 +1333,7 @@ class KVCacheConfigurator:
             ctx=PlacementContext(
                 host_names=self._unified_host_names(),
                 target_window=self.model_config.sliding_window_size,
+                target_window_sub_pool=self.target_window_sub_pool(),
                 dcp_size=get_parallel().attn_dcp_size,
             ),
             store_dtype=_store_dtype_for(region_kv_dtype),
@@ -1350,6 +1368,17 @@ class KVCacheConfigurator:
             self._kv_layer_decls(), page_size=self.page_size, fused_draft=placement
         )
         return plan.sub_pool(sub_pool_name).spec.entry_bytes()
+
+    def target_window_sub_pool(self) -> Optional[str]:
+        """The sub-pool of the longest window the target's layers declare: the
+        window the single-window sizing prices. None without a unified pool,
+        whose declarations a model that cannot build one may not support."""
+        if not get_memory().enable_unified_memory:
+            return None
+        from sglang.srt.mem_cache.kv.decl import primary_window, window_sub_pool_name
+
+        windows = self._unified_target_windows()
+        return window_sub_pool_name(primary_window(windows)) if windows else None
 
     def _fused_draft_for_pool_factory(self, decision):
         """The placement a pool factory is handed. It logs the decision it

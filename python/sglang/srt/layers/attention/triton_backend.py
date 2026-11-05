@@ -1697,10 +1697,8 @@ class TritonAttnBackend(AttentionBackend):
 
         if k is None and v is None:
             cache_loc = forward_batch.out_cache_loc
-            if (
-                self.use_sliding_window_kv_pool
-                and self.kv_layers.route(layer.layer_id).sub_pool
-                == IdSpaceKind.SLIDING_WINDOW
+            if self.use_sliding_window_kv_pool and self.kv_layers.plays(
+                layer.layer_id, IdSpaceKind.SLIDING_WINDOW
             ):
                 assert self.forward_metadata.swa_out_cache_loc is not None, (
                     "window-layer read-back before the metadata carried a "
@@ -2205,8 +2203,7 @@ class TritonAttnBackend(AttentionBackend):
             layer.sliding_window_size is not None
             and layer.sliding_window_size > -1
             and self.use_sliding_window_kv_pool
-            and self.kv_layers.route(layer.layer_id).sub_pool
-            == IdSpaceKind.SLIDING_WINDOW
+            and self.kv_layers.plays(layer.layer_id, IdSpaceKind.SLIDING_WINDOW)
         ):
             extend_kv_indices = self.forward_metadata.swa_out_cache_loc
             assert extend_kv_indices is not None, (

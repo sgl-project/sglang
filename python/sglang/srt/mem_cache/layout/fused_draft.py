@@ -2,9 +2,9 @@
 
 The nesting, outermost first:
 
-  sub-pool  a named pool inside the unified pool ("full", "swa", "mamba"),
-            with its own grow direction and frontier. HOST is the role it
-            plays when its entries also carry draft bytes.
+  sub-pool  a named pool inside the unified pool ("full", "window_4096",
+            "mamba"), with its own grow direction and frontier. HOST is the
+            role it plays when its entries also carry draft bytes.
   slot      one token entry of that sub-pool. The draft's KV is extra parts of
             every slot, after the host's own parts, so ONE slot id per token
             covers target and draft: one allocation, one free, one whole-page
@@ -36,6 +36,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 import msgspec
 import torch
 
+from sglang.srt.mem_cache.kv.decl import window_sub_pool_name
 from sglang.srt.mem_cache.layout.token_major import DensePart, align_part_offset
 
 LAYER_FULL = "full"
@@ -271,6 +272,8 @@ class PlacementContext(msgspec.Struct, frozen=True, kw_only=True):
 
     host_names: Tuple[str, ...]
     target_window: Optional[int] = None
+    # The sub-pool the target's window layers store in, by name.
+    target_window_sub_pool: Optional[str] = None
     dcp_size: int = 1
 
 
@@ -288,9 +291,15 @@ class HostKind(msgspec.Struct, frozen=True, kw_only=True):
 
     def admits(self, *, layers: DraftLayerSet, ctx: PlacementContext) -> Optional[str]:
         """None when this host's entries can carry ``layers``, else why not."""
-        if self.name not in ctx.host_names:
-            return f"the host has no {self.name!r} sub-pool"
+        if self.host_name(layers=layers, ctx=ctx) not in ctx.host_names:
+            return (
+                f"the host has no {self.host_name(layers=layers, ctx=ctx)!r} sub-pool"
+            )
         return None
+
+    def host_name(self, *, layers: DraftLayerSet, ctx: PlacementContext) -> str:
+        """The target sub-pool whose entries carry ``layers``."""
+        return self.name
 
     def region_for(
         self,
@@ -386,20 +395,23 @@ FULL_HOST = register_host_kind(
 
 
 class WindowHostKind(DenseHostKind):
-    """The swa sub-pool: a draft window layer rides there when its window fits
-    the target's; eviction keeps any further reach the draft worker declares."""
+    """The target's window sub-pool: a draft window layer rides there when its
+    window fits the target's; eviction keeps any further reach the draft worker
+    declares."""
 
     def admits(self, *, layers: DraftLayerSet, ctx: PlacementContext) -> Optional[str]:
-        reason = super().admits(layers=layers, ctx=ctx)
-        if reason is not None:
-            return reason
         if layers.window is None:
             return "the draft declares no sliding window size"
         if ctx.target_window is None:
             return "the target declares no sliding window size"
         if layers.window != ctx.target_window:
             return f"its window {layers.window} differs from the target's window {ctx.target_window}"
-        return None
+        return super().admits(layers=layers, ctx=ctx)
+
+    def host_name(self, *, layers: DraftLayerSet, ctx: PlacementContext) -> str:
+        if ctx.target_window_sub_pool is not None:
+            return ctx.target_window_sub_pool
+        return window_sub_pool_name(layers.window)
 
 
 SWA_HOST = register_host_kind(
@@ -467,21 +479,24 @@ class FusedDraftPlacement(msgspec.Struct, frozen=True, kw_only=True):
     runners: Tuple[RunnerLanes, ...]
     regions: Dict[str, DraftRegion] = {}
     new_bands: Dict[str, DraftBand] = {}
+    # Target sub-pools that carry draft lanes under a name other than their
+    # host kind's (a window named by its length), by host kind.
+    hosted: Dict[str, str] = {}
     source: Optional[Tuple[str, Optional[str]]] = None
 
     def host_kind(self, name: str) -> HostKind:
         declared = self.new_bands.get(name)
         if declared is not None:
             return host_for(declared.kind)
-        return HOST_KINDS[name]
+        return HOST_KINDS[self.hosted.get(name, name)]
 
     def __post_init__(self):
         assert len(self.runners) > 0, "a placement needs at least one draft runner"
         hosts = set(self.regions).union(*(r.ranges for r in self.runners))
         for host in sorted(hosts):
-            assert host in HOST_KINDS or host in self.new_bands, (
-                f"no layout family is declared for sub-pool {host!r}"
-            )
+            assert (
+                host in HOST_KINDS or host in self.new_bands or host in self.hosted
+            ), f"no layout family is declared for sub-pool {host!r}"
             region = self.regions.get(host)
             lanes = [s for r in self.runners for s in r.range_for(host)]
             if region is None:
@@ -496,9 +511,16 @@ class FusedDraftPlacement(msgspec.Struct, frozen=True, kw_only=True):
         return self.regions.get(host)
 
     def hosts(self) -> Tuple[str, ...]:
-        """The hosts carrying draft lanes, in registry order."""
-        return tuple(h for h in HOST_KINDS if h in self.regions) + tuple(
-            h for h in self.new_bands if h not in HOST_KINDS and h in self.regions
+        """The hosts carrying draft lanes: the registered host kinds that
+        carry lanes under their own names, in registry order; then the target
+        sub-pools that carry lanes under another name (`hosted`), in placement
+        order; then the draft's own bands."""
+        return (
+            tuple(h for h in HOST_KINDS if h in self.regions)
+            + tuple(h for h in self.hosted if h in self.regions)
+            + tuple(
+                h for h in self.new_bands if h not in HOST_KINDS and h in self.regions
+            )
         )
 
     def lanes_for(self, runner: int, host: str) -> range:
@@ -511,6 +533,7 @@ class FusedDraftPlacement(msgspec.Struct, frozen=True, kw_only=True):
         counts: Mapping[str, Sequence[int]],
         regions: Mapping[str, DraftRegion],
         new_bands: Optional[Mapping[str, DraftBand]] = None,
+        hosted: Optional[Mapping[str, str]] = None,
     ) -> "FusedDraftPlacement":
         """Tile each host's region with the runners' layer counts, in runner order."""
         num_runners = {len(per_runner) for per_runner in counts.values()}
@@ -531,6 +554,7 @@ class FusedDraftPlacement(msgspec.Struct, frozen=True, kw_only=True):
             runners=tuple(RunnerLanes(ranges=r) for r in ranges),
             regions=dict(regions),
             new_bands={} if new_bands is None else dict(new_bands),
+            hosted={} if hosted is None else dict(hosted),
         )
 
 
@@ -709,15 +733,25 @@ def place_fused_draft(
     host_counts: Dict[str, List[int]] = {}
     regions = {}
     new_bands = {}
+    hosted = {}
     for kind, layers in profile.kinds.items():
         if not any(counts[kind]):
             continue
         host = host_for(kind)
-        name = host.name
-        if host.admits(layers=layers, ctx=ctx) is not None:
+        if host.admits(layers=layers, ctx=ctx) is None:
+            name = host.host_name(layers=layers, ctx=ctx)
+            if name != host.name:
+                hosted[name] = host.name
+        else:
             # Distinct lifetimes retain and retire independently, even when
-            # their row geometry happens to match.
-            name = f"draft_{host.name}" if host.name in ctx.host_names else host.name
+            # their row geometry happens to match: a band of its own, named by
+            # its lifetime as the plan names a target's.
+            if kind == LAYER_WINDOW:
+                name = window_sub_pool_name(layers.window)
+            else:
+                name = (
+                    f"draft_{host.name}" if host.name in ctx.host_names else host.name
+                )
             new_bands[name] = DraftBand(kind=kind, window=layers.window)
         per_runner = counts[kind]
         host_counts[name] = per_runner
@@ -738,6 +772,6 @@ def place_fused_draft(
             )
     return FusedDraftDecision(
         placement=FusedDraftPlacement.from_counts(
-            counts=host_counts, regions=regions, new_bands=new_bands
+            counts=host_counts, regions=regions, new_bands=new_bands, hosted=hosted
         ),
     )

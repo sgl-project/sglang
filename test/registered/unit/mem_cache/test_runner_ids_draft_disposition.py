@@ -92,6 +92,15 @@ class _FakeUnifiedSWAKVPool:
         self.swa_kv_pool = _FakeKVCache(shared_pool, "swa")
         self.full_to_swa_index_mapping = None
 
+    @property
+    def layer_router(self):
+        # Its sub-pools by name; no sub-pool plays a role under another name.
+        from sglang.srt.mem_cache.kv.router import KVLayerRouter
+
+        return KVLayerRouter.from_layer_maps(
+            self, [("full", self.full_kv_pool, {}), ("swa", self.swa_kv_pool, {})]
+        )
+
     def attach_allocators(self, *, full_allocator, swa_allocator):
         self._full_allocator = full_allocator
         self._swa_allocator = swa_allocator

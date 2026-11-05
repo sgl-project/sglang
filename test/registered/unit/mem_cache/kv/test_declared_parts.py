@@ -458,7 +458,7 @@ class TestDeclaredParts(CustomTestCase):
                         req.seqlen = frontier + 1
                         batch.maybe_evict_swa()
                         for name, window in (
-                            ("swa", 16),
+                            ("window_16", 16),
                             ("draft_swa", draft_window + front),
                         ):
                             self.assertLessEqual(
@@ -1525,10 +1525,14 @@ class TestDeclaredParts(CustomTestCase):
         expected = (
             storage.allocator.translate_swa_indices_for_transfer(tokens[4:23])[::4] // 4
         )
-        resume = storage.resume_units("swa", req, token_start=0, token_boundary=23)
+        resume = storage.resume_units(
+            "window_16", req, token_start=0, token_boundary=23
+        )
         self.assertEqual((resume.token_start, resume.token_boundary), (4, 23))
         torch.testing.assert_close(resume.unit_ids, expected)
-        resumed = storage.resume_units("swa", req, token_start=12, token_boundary=23)
+        resumed = storage.resume_units(
+            "window_16", req, token_start=12, token_boundary=23
+        )
         self.assertEqual((resumed.token_start, resumed.token_boundary), (12, 23))
         torch.testing.assert_close(resumed.unit_ids, expected[2:])
 
@@ -1721,14 +1725,15 @@ class TestDeclaredParts(CustomTestCase):
                         ),
                         num_runners=1,
                         ctx=PlacementContext(
-                            host_names=("full", "swa", "mamba")
+                            host_names=("full", "window_16", "mamba")
                             if target_state
-                            else ("full", "swa"),
+                            else ("full", "window_16"),
                             target_window=16,
                         ),
                         store_dtype=torch.bfloat16,
                     ).placement
-                    self.assertEqual(set(placement.new_bands), {"draft_swa"})
+                    draft_band = f"window_{draft_window}"
+                    self.assertEqual(set(placement.new_bands), {draft_band})
                     storage, plan, _ = _build(
                         state=target_state,
                         window_with_state=True,
@@ -1738,9 +1743,9 @@ class TestDeclaredParts(CustomTestCase):
                     self.assertEqual(len(allocator.bands), 4 if target_state else 3)
                     ids = allocator.alloc(8)
                     self.assertIsNotNone(ids)
-                    draft = allocator.window_allocators["draft_swa"]
+                    draft = allocator.window_allocators[draft_band]
                     physical = draft.ids.translate(ids).long()
-                    k, v = plan.sub_pool("draft_swa").spec.draft_views(
+                    k, v = plan.sub_pool(draft_band).spec.draft_views(
                         storage.allocator.arena
                     )
                     k[0][physical] = 11
@@ -2411,7 +2416,7 @@ class TestDeclaredParts(CustomTestCase):
         # This fixture specifies retained contents, independent of prefill order.
         ids = a.full_attn_allocator.alloc(100)
         self.assertIsNotNone(ids)
-        for name, tail in (("swa", 8), ("draft_swa", 4)):
+        for name, tail in (("window_8", 8), ("draft_swa", 4)):
             retained = torch.cat((ids[20 - tail : 20], ids[100 - tail : 100]))
             a.window_allocators[name].alloc_with_virtual(retained[::4] // 4)
         self.assertEqual(storage.accounting_violations(), [])
@@ -2506,7 +2511,9 @@ class TestDeclaredParts(CustomTestCase):
                 },
             ),
             num_runners=1,
-            ctx=PlacementContext(host_names=("full", "swa", "mamba"), target_window=16),
+            ctx=PlacementContext(
+                host_names=("full", "window_16", "mamba"), target_window=16
+            ),
             store_dtype=torch.bfloat16,
         ).placement
         storage, plan, _ = _build(
@@ -2687,7 +2694,8 @@ class TestDeclaredParts(CustomTestCase):
             )
             floors = dict(sized.bs1_floor_terms)
             self.assertEqual(
-                floors["swa_window_kv"], 20 * plan.sub_pool("swa").spec.entry_bytes()
+                floors["window_16_window_kv"],
+                20 * plan.sub_pool("window_16").spec.entry_bytes(),
             )
             self.assertEqual(
                 floors["draft_swa_window_kv"],
@@ -2736,8 +2744,10 @@ class TestDeclaredParts(CustomTestCase):
             lane_num=1, head_num=1, head_dim=3, v_head_dim=5, store_dtype=torch.bfloat16
         )
         placement = FusedDraftPlacement.from_counts(
-            counts={"full": [1], "swa": [1]},
-            regions={"full": region, "swa": region},
+            counts={"full": [1], "window_16": [1]},
+            regions={"full": region, "window_16": region},
+            # The target's window sub-pool hosts as a window.
+            hosted={"window_16": "swa"},
         )
         storage, _, _ = _build(fused_draft=placement)
         with TemporaryDirectory() as directory:
@@ -2756,7 +2766,7 @@ class TestDeclaredParts(CustomTestCase):
                     extra_config={"file_storage_path": directory},
                 )
             )
-            for name, wire in (("full", PoolName.KV), ("swa", PoolName.SWA)):
+            for name, wire in (("full", PoolName.KV), ("window_16", PoolName.SWA)):
                 host = storage.host_layout(name).build(
                     HostPoolOptions(
                         ratio=1,
@@ -2831,7 +2841,7 @@ class TestDeclaredParts(CustomTestCase):
                     plan=plan,
                     owner="full",
                     page_size=4,
-                    lanes_by_host={"swa": {0: 0}},
+                    lanes_by_host={"window_16": {0: 0}},
                 )
                 runner = RunnerIds(
                     req_to_token=storage.requests.req_to_token,
@@ -2860,7 +2870,7 @@ class TestDeclaredParts(CustomTestCase):
                 torch.testing.assert_close(mapping[ids[::4] // 4], physical[::4] // 4)
                 from sglang.srt.mem_cache.kv.layout.base import HostPoolOptions
 
-                for name in ("full", "swa"):
+                for name in ("full", "window_16"):
                     layout = storage.host_layout(name)
                     self.assertEqual(layout.page_size, alloc.page_size)
                     host = layout.build(
@@ -2923,7 +2933,7 @@ class TestDeclaredParts(CustomTestCase):
                 },
             ),
             num_runners=1,
-            ctx=PlacementContext(host_names=("full", "swa")),
+            ctx=PlacementContext(host_names=("full", "window_16")),
             store_dtype=torch.bfloat16,
         ).placement
         storage, plan, _ = _build(fused_draft=placement)

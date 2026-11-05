@@ -180,7 +180,7 @@ class TestUnifiedSWATailAllocation(CustomTestCase):
                     (draft_window, "AUXILIARY_SWA"),
                 )
                 windows = {w.sub_pool_name: w for w in allocator._windows}
-                self.assertEqual(set(windows), {"swa", "draft_swa"})
+                self.assertEqual(set(windows), {"window_16", "draft_swa"})
                 zero = torch.tensor([0], dtype=torch.int64)
                 seq = torch.tensor([seq_len], dtype=torch.int64)
                 target_tail, draft_tail = 16, draft_window
@@ -195,7 +195,7 @@ class TestUnifiedSWATailAllocation(CustomTestCase):
                     window_tail_lens={"draft_swa": draft_tail},
                 )
                 self.assertIsNotNone(out)
-                self.assertEqual(windows["swa"].allocated_count(), target_tail)
+                self.assertEqual(windows["window_16"].allocated_count(), target_tail)
                 self.assertEqual(
                     windows["draft_swa"].allocated_count(),
                     -(-draft_tail // page_size) * page_size,
