@@ -24,7 +24,8 @@ TokenSpaceProcessor.process(media, IDs)
   item feature cache, same image on another device -> loaded again
   item feature cache, same image on another GPU (serving vs a trainer rank) -> reused
   one map, processors of another checkpoint, mm_process_config or library version -> loaded again
-  item feature cache, check rate 1 -> a hit is computed again, equal to the cache, not rewritten
+  item feature cache, check rate 1 -> a hit is computed again, equal to the cache, not rewritten;
+      the global random stream is untouched
   item feature cache, a sampled hit computes to other features -> RuntimeError
 
 get_mm_processor -> TokenSpaceSGLangProcessor
@@ -44,6 +45,7 @@ import asyncio
 import base64
 import contextlib
 import io
+import random
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -449,8 +451,11 @@ class TestTokenSpaceProcessor(unittest.TestCase):
             item_feature_cache_check_rate=1,
         )
         load = AsyncMock(wraps=processor._load_media_lists)
+        global_random_state = random.getstate()
         with patch.object(processor, "_load_media_lists", load):
             output = asyncio.run(processor.process([image], input_ids=[1, IMAGE]))
+        # A trainer seeds the global stream; sampling must not draw from it.
+        self.assertEqual(random.getstate(), global_random_state)
         self.assertEqual(load.await_args.args[0], [image])
         self.assertTrue(torch.equal(output["pixel_values"], expected["pixel_values"]))
         self.assertIs(item_feature_cache[key], cached)

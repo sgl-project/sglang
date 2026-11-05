@@ -87,6 +87,7 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
         self._item_feature_cache = item_feature_cache
         # The share of hits computed again and compared with the cache; 0 or None is off.
         self._item_feature_cache_check_rate = item_feature_cache_check_rate
+        self._item_feature_cache_check_rng = random.Random()
         if processor_config is None:
             processor_config = MultimodalProcessorConfig()
         self._initialize_processor(
@@ -269,7 +270,8 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
                     index: features
                     for index, features in enumerate(item_features)
                     if features is not None
-                    and random.random() < self._item_feature_cache_check_rate
+                    and self._item_feature_cache_check_rng.random()
+                    < self._item_feature_cache_check_rate
                 }
             for index in checked:
                 item_features[index] = None
