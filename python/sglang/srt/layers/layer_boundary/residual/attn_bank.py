@@ -18,14 +18,18 @@ from typing import Callable, Optional, Tuple
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attn_residual import AttnResidual
 from sglang.srt.layers.layer_boundary import ops
 from sglang.srt.layers.layer_boundary.contracts import ReadoutFusion
 from sglang.srt.layers.layer_boundary.facts import residual_facts
 from sglang.srt.layers.layer_boundary.layout import SumGroup
-from sglang.srt.layers.layer_boundary.residual import LayerResidualOps
+from sglang.srt.layers.layer_boundary.residual import LayerResidualOps, attn_bank_hip
 from sglang.srt.layers.layer_boundary.residual.add_norm import PLAIN_ADD
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import is_hip
+
+_is_hip = is_hip()
 
 
 class AttnBank:
@@ -57,22 +61,26 @@ class AttnBank:
 
 def _bank_rows(bank: AttnResidual, hidden_states) -> Optional[slice]:
     """The bank rows that go with ``hidden_states``: all of them, or this
-    rank's contiguous attention-TP shard of them (row_shard: the last ranks'
-    shards may be short or empty), the rows a reduce-scatter over attention
-    TP leaves it."""
-    from sglang.srt.layers.layer_boundary.residual.attn_bank_hip import row_shard
-
+    rank's contiguous attention-TP shard of them, the rows a reduce-scatter
+    over attention TP leaves it."""
     total, rows = bank.block_residual.shape[0], hidden_states.shape[0]
     if rows == total:
         return None
     parallel = get_parallel()
-    start, valid = row_shard(total, parallel.attn_tp_size, parallel.attn_tp_rank)
-    if rows != valid:
+    if _is_hip and envs.SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM.get():
+        # gfx950 row-sharded stream: the last ranks' shards may be short or empty
+        start, valid = attn_bank_hip.row_shard(
+            total, parallel.attn_tp_size, parallel.attn_tp_rank
+        )
+        if rows == valid:
+            return slice(start, start + valid)
+    if rows * parallel.attn_tp_size != total:
         raise RuntimeError(
             f"{rows} rows are neither the bank's {total} rows nor an "
             f"attention-TP shard of them over {parallel.attn_tp_size} ranks"
         )
-    return slice(start, start + valid)
+    rank = parallel.attn_tp_rank
+    return slice(rank * rows, (rank + 1) * rows)
 
 
 @dataclass
@@ -149,14 +157,15 @@ class AttnBankState:
             write=self.writes_block,
         )
         total = self.bank.require().block_residual.shape[0]
-        if normed.shape[0] != total and not self.reads_slices:
+        if (
+            _is_hip
+            and envs.SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM.get()
+            and normed.shape[0] != total
+            and not self.reads_slices
+        ):
             # a stream the MoE tail left on row shards: read here, gather the
             # attention input; the residual stays on the shard
-            from sglang.srt.layers.layer_boundary.residual.attn_bank_hip import (
-                gather_row_shards,
-            )
-
-            normed = gather_row_shards(normed, total)
+            normed = attn_bank_hip.gather_row_shards(normed, total)
         return normed, None if self.writes_block else residual
 
     def update_and_read_ffn_input(self, contribution, residual, norm):
@@ -301,8 +310,6 @@ class _FfnReadout(_BankReadout):
         state = self.state
         fusions = state.ffn_input_fusions
         if state.ffn_row_shards is not None:
-            from sglang.srt.layers.layer_boundary.residual import attn_bank_hip
-
             fusions = (attn_bank_hip.row_sharded_ffn_read(state), *fusions)
         if not state.fuses_slice_collectives:
             return fusions
@@ -365,16 +372,15 @@ class AttnBankOutputRead:
         )
         if read is None:
             read = bank.forward(*read_args, self.norm, rows=rows)
-            if rows is not None and not self.reads_attn_tp_slices:
+            if (
+                rows is not None
+                and _is_hip
+                and envs.SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM.get()
+                and not self.reads_attn_tp_slices
+            ):
                 # a stream the MoE tail left on (possibly short) row shards
-                from sglang.srt.layers.layer_boundary.residual.attn_bank_hip import (
-                    gather_row_shards,
-                )
-
-                read = (
-                    gather_row_shards(read[0], bank.block_residual.shape[0]),
-                    read[1],
-                )
+                total = bank.block_residual.shape[0]
+                read = (attn_bank_hip.gather_row_shards(read[0], total), read[1])
             elif rows is not None:
                 read = (self._gather(read[0]), read[1])
         normed, head = read

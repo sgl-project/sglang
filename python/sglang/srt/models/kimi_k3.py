@@ -3498,8 +3498,10 @@ class KimiK3LinearModel(nn.Module):
         # Only the mixture is needed by the draft. Keep the bank sharded and
         # return owned storage so a later layer's gather cannot overwrite it.
         if rows is not None:
-            # row shards may be short or empty past the last token
-            return gather_row_shards(mixed, bank.block_residual.shape[0])
+            if _is_hip and envs.SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM.get():
+                # gfx950 row-sharded stream: short or empty last shards
+                return gather_row_shards(mixed, bank.block_residual.shape[0])
+            return get_parallel().attn_tp_group.all_gather(mixed, dim=0)
         return mixed
 
 
