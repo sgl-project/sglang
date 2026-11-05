@@ -143,13 +143,28 @@ def handle_multimodal(server_args: Any):
         and cfg.mm_preprocess_cache_size_mb < 0
     ):
         raise ValueError("mm_preprocess_cache_size_mb must be non-negative")
-    if (
-        cfg.token_space_preprocess_cache_trust_url
-        and not cfg.mm_preprocess_cache_size_mb
-    ):
+    if cfg.enable_token_space_preprocess_cache:
+        if not cfg.enable_token_space_processor:
+            raise ValueError(
+                "--enable-token-space-preprocess-cache requires "
+                "--enable-token-space-processor"
+            )
+        if not cfg.token_space_preprocess_cache_trust_url:
+            raise ValueError(
+                "--enable-token-space-preprocess-cache requires "
+                "--token-space-preprocess-cache-trust-url"
+            )
+        if (
+            cfg.token_space_preprocess_cache_dir is None
+            and not cfg.mm_preprocess_cache_size_mb
+        ):
+            raise ValueError(
+                "--enable-token-space-preprocess-cache in memory requires a positive "
+                "--mm-preprocess-cache-size-mb"
+            )
+    elif cfg.token_space_preprocess_cache_dir is not None:
         raise ValueError(
-            "--token-space-preprocess-cache-trust-url requires a positive "
-            "--mm-preprocess-cache-size-mb"
+            "--token-space-preprocess-cache-dir requires --enable-token-space-preprocess-cache"
         )
     if cfg.mm_process_config is not None:
         if not isinstance(cfg.mm_process_config, dict):

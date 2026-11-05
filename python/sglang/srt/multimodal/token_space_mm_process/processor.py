@@ -4,6 +4,7 @@ import itertools
 import logging
 
 import torch
+import transformers
 
 from sglang.srt.multimodal.cache.identity import build_cache_key
 from sglang.srt.multimodal.modality import Modality
@@ -17,10 +18,15 @@ from sglang.srt.multimodal.token_space_mm_process.expansion import (
 )
 from sglang.srt.utils import ImageData, VideoData
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
+from sglang.version import __version__ as sglang_version
 
 logger = logging.getLogger(__name__)
 
 _MODALITIES = (Modality.IMAGE, Modality.VIDEO, Modality.AUDIO)
+
+
+def _device_type(device):
+    return None if device is None else torch.device(device).type
 
 
 class TokenSpaceProcessor(MultimodalProcessorMixin):
@@ -179,27 +185,60 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
         """Each item's features, from the item feature cache or by loading and processing it.
 
         A key is the item's source before loading with everything else its features
-        depend on, so a hit skips both loading and processing. The checkpoint,
-        mm_process_config and image processor backend let a trainer and serving
-        share one map.
+        depend on, including the type of device its modality runs on and the library
+        versions, so a hit skips both loading and processing. A trainer and serving
+        can share one map.
         """
         item_features = [None] * len(media_items)
         if self._item_feature_cache is not None:
+            media_options = self.strategy.resolve_media_options(
+                self._processor, **request_options
+            )
+            # Types, not indices: a trainer rank reuses what serving computed on another GPU.
+            item_devices = {
+                modality: _device_type(options.get("device"))
+                for modality, options in media_options.items()
+            }
+            # The loader decodes a video on the GPU unless its device is "cpu".
+            item_devices[Modality.VIDEO] = (
+                item_devices[Modality.VIDEO],
+                request_options["video_device"] != "cpu",
+            )
             item_keys = [
                 build_cache_key(
                     (
+                        transformers.__version__,
+                        sglang_version,
                         self.hf_config.name_or_path,
                         self.mm_process_config,
                         self.image_processor_backend,
                         modality,
                         source,
                         item_kwargs,
-                        request_options,
+                        item_devices[modality],
                     )
                 )
                 for modality, source, _, item_kwargs in media_items
             ]
-            item_features = [self._item_feature_cache.get(key) for key in item_keys]
+            # A backend may block on IO, e.g. a disk cache reads whole files, so get and
+            # set run in the default thread pool, off the event loop and the media IO pool.
+            item_features = list(
+                await asyncio.gather(
+                    *(
+                        asyncio.to_thread(self._item_feature_cache.get, key)
+                        for key in item_keys
+                    )
+                )
+            )
+            if self.keep_mm_features_on_device:
+                # A hit is loaded on the CPU; misses stay on their modality's device.
+                for (modality, *_), features in zip(media_items, item_features):
+                    device = media_options[modality].get("device")
+                    if features is None or device is None:
+                        continue
+                    for name in self.FEATURE_NAMES:
+                        if isinstance(features.get(name), torch.Tensor):
+                            features[name] = features[name].to(device)
         missed = [
             index for index, features in enumerate(item_features) if features is None
         ]
@@ -228,8 +267,17 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
         missed_features = await self._process_items(loaded_items, request_options)
         for index, features in zip(missed, missed_features):
             item_features[index] = features
-            if self._item_feature_cache is not None:
-                self._item_feature_cache[item_keys[index]] = features
+        if self._item_feature_cache is not None:
+            await asyncio.gather(
+                *(
+                    asyncio.to_thread(
+                        self._item_feature_cache.__setitem__,
+                        item_keys[index],
+                        item_features[index],
+                    )
+                    for index in missed
+                )
+            )
         return item_features
 
     async def _process_items(self, media_items, request_options):
