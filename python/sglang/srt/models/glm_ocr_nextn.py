@@ -30,6 +30,7 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.utils import is_shared_experts_fusion_disabled
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.kv_cache import add_kv_cache_quant_methods
 from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -51,11 +52,12 @@ class GlmOcrModelNextN(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        kv_cache_quant_config = None
         if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
             logger.debug(
                 "Overriding GlmOcrModelNextN quant config for modelopt_fp4 GLM-OCR model."
             )
-            quant_config = None
+            kv_cache_quant_config, quant_config = quant_config, None
 
         self.vocab_size = config.vocab_size
 
@@ -78,6 +80,9 @@ class GlmOcrModelNextN(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("decoder", prefix),
             )
+        add_kv_cache_quant_methods(
+            self.decoder, kv_cache_quant_config, add_prefix("decoder", prefix)
+        )
 
         self.shared_head = nn.Module()
         self.shared_head.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
