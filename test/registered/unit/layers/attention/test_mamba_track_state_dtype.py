@@ -222,7 +222,9 @@ class TestTrackMambaStateDtype(CustomTestCase):
                     ssm_states = torch.zeros(16, 1, 2, 2)[::2]
                     cache = SimpleNamespace(conv=[conv_states], temporal=ssm_states)
                     backend.state_layer_cache = lambda _: cache
-                    expected_indices = torch.arange(2) if contiguous else indices
+                    # Staged copies keep the padding sink at row 0, so the
+                    # requests sit at rows 1..n.
+                    expected_indices = torch.arange(1, 3) if contiguous else indices
 
                     def convolve(_layer, _batch, x, states, slots):
                         torch.testing.assert_close(slots, expected_indices)

@@ -26,15 +26,10 @@ _STEP_CALLERS = {
     "disaggregation/prefill.py:SchedulerDisaggregationPrefillMixin.optimistic_release_and_requeue",
     "disaggregation/prefill.py:SchedulerDisaggregationPrefillMixin.process_disagg_prefill_transfer_queue",
     "disaggregation/prefill.py:SchedulerDisaggregationPrefillMixin.release_aborted_prefill_waiting_req",
-    "dllm/mixin/scheduler.py:SchedulerDllmMixin._finish_dllm_request_if_needed",
     "managers/schedule_batch.py:release_req",
     "managers/scheduler.py:Scheduler.process_pending_chunked_abort",
     "managers/scheduler.py:Scheduler.release_aborted_request",
     "managers/scheduler.py:Scheduler.retire_unadmitted_request",
-    "managers/scheduler_components/batch_result_processor.py:SchedulerBatchResultProcessor._handle_finish_state_updated_req",
-    "managers/scheduler_components/batch_result_processor.py:SchedulerBatchResultProcessor._handle_sampling_mask_abort",
-    "managers/scheduler_components/batch_result_processor.py:SchedulerBatchResultProcessor.process_batch_result_prebuilt",
-    "managers/scheduler_components/batch_result_processor.py:SchedulerBatchResultProcessor.process_batch_result_prefill",
     "managers/scheduler_components/dynamic_chunk_sizer.py:DynamicChunkSizer._profile_prefill_latency",
 }
 

@@ -61,6 +61,15 @@ register_kernel(
 # Public entry points inventoried by logical operator group (RFC #29630).
 register_kernel(
     KernelSpec(
+        op="memory.gpu_tensors_blake3",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.memory.gpu_tensor_hash_blake3:gpu_tensors_blake3",
+        capabilities=CUDA_ONLY,
+    )
+)
+
+register_kernel(
+    KernelSpec(
         op="memory.adler32_strided_checksum",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.memory.adler32:adler32_strided_checksum",
