@@ -115,11 +115,13 @@ class PrefillDelayer:
             or envs.SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH.get()
         )
         tp_group = parallel.tp_group
+        # Cache the GroupCoordinator and resolve the PG per use: comm cleanup
+        # swaps device_group in place.
+        self._gather_pg_source = tp_group
+        self._gather_uses_device_group = use_nccl
         if use_nccl:
-            self._gather_group = tp_group.device_group
             self._gather_device = tp_group.device
         else:
-            self._gather_group = tp_group.cpu_group
             self._gather_device = "cpu"
 
         # Fields packed per rank into the all-gather tensor: prefillable,
@@ -140,6 +142,12 @@ class PrefillDelayer:
         assert not get_schedule().disable_overlap_schedule, (
             "To use PrefillDelayer, disable_overlap_schedule must be False."
         )
+
+    @property
+    def _gather_group(self):
+        if self._gather_uses_device_group:
+            return self._gather_pg_source.device_group
+        return self._gather_pg_source.cpu_group
 
     def _negotiate_should_allow_prefill(
         self,

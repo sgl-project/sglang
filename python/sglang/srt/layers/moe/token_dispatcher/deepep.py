@@ -44,6 +44,7 @@ _use_zbal = _is_npu and envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0
 
 if TYPE_CHECKING:
     from sglang.srt.batch_overlap.single_batch_overlap import CombineOverlapArgs
+    from sglang.srt.distributed.parallel_state import GroupCoordinator
 
 _deepep_import_error: Optional[BaseException] = None
 try:
@@ -316,6 +317,27 @@ class DeepEPBuffer:
         )
 
     @classmethod
+    def invalidate_buffer(cls):
+        """Drop the cached buffer, which holds the old communicator's name.
+
+        Must run before the communicators are destroyed. The next dispatch
+        recreates the buffer on the rebuilt group.
+        """
+        state = cls._state()
+        buffer = getattr(state, "buffer", None)
+        if buffer is None:
+            return
+        try:
+            if buffer.low_latency_mode:
+                buffer.clean_low_latency_buffer(
+                    state.num_max_dispatch_tokens_per_rank,
+                    state.hidden_size,
+                    state.num_experts,
+                )
+        finally:
+            state.buffer = None
+
+    @classmethod
     def set_dispatch_mode_as_normal(cls):
         cls._state().dispatch_mode = DeepEPDispatchMode.NORMAL
 
@@ -368,7 +390,7 @@ class DeepEPConfig(BaseDispatcherConfig):
 class _DeepEPDispatcherImplBase:
     def __init__(
         self,
-        group: torch.distributed.ProcessGroup,
+        group: Union[torch.distributed.ProcessGroup, GroupCoordinator],
         router_topk: int,
         permute_fusion: bool,
         num_experts: int,
@@ -390,7 +412,16 @@ class _DeepEPDispatcherImplBase:
             ) from _deepep_import_error
 
         self.runner_backend = runner_backend
-        self.group = group
+        # Prefer the GroupCoordinator (stable identity): comm cleanup swaps
+        # device_group in place. Raw PGs are still accepted.
+        from sglang.srt.distributed.parallel_state import GroupCoordinator
+
+        if isinstance(group, GroupCoordinator):
+            self._group_coordinator = group
+            self._static_group = None
+        else:
+            self._group_coordinator = None
+            self._static_group = group
         self.router_topk = router_topk
         self.permute_fusion = permute_fusion
         self.num_experts = num_experts
@@ -416,6 +447,13 @@ class _DeepEPDispatcherImplBase:
         self.meta_overlap_args: Optional[dict] = None
 
         self.set_deepep_dispatcher_dtype()
+
+    @property
+    def group(self) -> torch.distributed.ProcessGroup:
+        # Resolved per use, so it is the rebuilt PG after a sleep/wake cycle.
+        if self._group_coordinator is not None:
+            return self._group_coordinator.device_group
+        return self._static_group
 
     def dispatch_a(
         self,
@@ -989,7 +1027,7 @@ class _Stage(Enum):
 class DeepEPDispatcher(BaseDispatcher):
     def __init__(
         self,
-        group: torch.distributed.ProcessGroup,
+        group: Union[torch.distributed.ProcessGroup, GroupCoordinator],
         router_topk: int,
         permute_fusion: bool = False,
         num_experts: int = None,
