@@ -272,7 +272,7 @@ class Gfx950FusedIndexer:
             ix = self.indexer
             q_proj, _ = ix.wq_b(q_lora[:rows])
             k, _ = ix.wk(x)
-            weights = ix._weights_proj_bf16_in_fp32_out(x)
+            weights = ix._project_head_gates(x)
             k, weights = k[:rows], weights[:rows]
 
         # node 2: k_norm | rope | Hadamard(q,k) | act_quant(q) |

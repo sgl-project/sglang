@@ -19,6 +19,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.f
     crop_output,
     denoise_flow_map,
     denoise_packed,
+    exact_vae_convolutions,
     latent_ids,
     load_references,
     noise_tokens,
@@ -245,6 +246,48 @@ class TestFlux3PackedSampler(unittest.TestCase):
                         stage._cache_dit_requested_for_batch(batch), expected
                     )
                     self.assertEqual(stage._cache_dit_requested(), sp_size == 1)
+
+
+class TestFlux3ExactVaeConvolutions(unittest.TestCase):
+    def _flags(self):
+        return torch.backends.cudnn.deterministic, torch.backends.cudnn.benchmark
+
+    def _run(self, *, hip: bool, exact: bool, fail: bool = False):
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages import (
+            flux3_image as stages,
+        )
+
+        cudnn = torch.backends.cudnn
+        saved = self._flags()
+        cudnn.deterministic, cudnn.benchmark = False, True
+        try:
+            with mock.patch.object(
+                stages, "current_platform", SimpleNamespace(is_hip=lambda: hip)
+            ):
+                try:
+                    with exact_vae_convolutions(exact):
+                        inside = self._flags()
+                        if fail:
+                            raise RuntimeError("vae failed")
+                except RuntimeError:
+                    pass
+            return inside, self._flags()
+        finally:
+            cudnn.deterministic, cudnn.benchmark = saved
+
+    def test_exact_on_rocm_pins_deterministic_kernels_and_restores(self):
+        for fail in (False, True):
+            with self.subTest(fail=fail):
+                inside, after = self._run(hip=True, exact=True, fail=fail)
+                self.assertEqual(inside, (True, False))
+                self.assertEqual(after, (False, True))
+
+    def test_other_tiers_and_platforms_are_untouched(self):
+        for hip, exact in ((True, False), (False, True), (False, False)):
+            with self.subTest(hip=hip, exact=exact):
+                inside, after = self._run(hip=hip, exact=exact)
+                self.assertEqual(inside, (False, True))
+                self.assertEqual(after, (False, True))
 
 
 if __name__ == "__main__":
