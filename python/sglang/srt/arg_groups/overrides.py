@@ -1696,6 +1696,33 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
                 moe_runner_backend,
             )
             moe_runner_backend = mxfp8_default
+        # trtllm-gen MoE has no kernels for consumer Blackwell. The batched-GEMM
+        # runner of the pinned flashinfer keeps only configs whose cubin arch
+        # matches the device (isArchCompatible: Sm100a->100, Sm100f->100/103,
+        # Sm103a->103, Sm107a->107 in its Rubin build), and fused_moe/api.py says
+        # it outright for FP8: _TRTLLM_ROUTED_FP8_ARCHS = (100, 103), "the outer
+        # JIT module compiles for major 12 as well, but those cubins fail at
+        # runtime on SM120/121". The launcher's own gate admits major 12, so the
+        # refusal lands at the first MoE call, in that runner's constructor
+        # (trtllm_batched_gemm_runner.cu): "the trtllm-gen batched GEMM cubin
+        # manifest contains no kernels runnable on sm120". The modelopt_fp4 arm
+        # below already reads the same limit. Checked after the device-free
+        # `allowed` handling so a request that does not end on a trtllm backend
+        # keeps its current answer.
+        if moe_runner_backend in (
+            "flashinfer_trtllm",
+            "flashinfer_trtllm_routed",
+        ) and (get_platform().is_sm110 or get_platform().is_sm120):
+            raise ValueError(
+                f"--quantization mxfp8 resolves the MoE runner to "
+                f"{moe_runner_backend}, which dispatches flashinfer's trtllm-gen "
+                "MoE kernels; its batched-GEMM runner accepts SM100/SM103 (plus "
+                f"SM107 on its Rubin build), not SM{get_platform().device_sm}, "
+                "where the launch fails mid-forward with no config matching the "
+                "device architecture. The remaining "
+                "MXFP8_MOE_RUNNER_BACKEND_CHOICES are not what this pass picks on "
+                "CUDA and are not validated for mxfp8 here."
+            )
     if (
         moe_runner_backend == "auto"
         and view.quantization == "modelopt_fp4"
