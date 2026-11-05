@@ -38,14 +38,14 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.components.base import EvictLayer
-from sglang.srt.mem_cache.unified_cache.unified_tree_core import (
-    UnifiedLRUList,
-    UnifiedTreeNode,
-)
 from sglang.srt.mem_cache.unified_cache.swa_recompute import (
     init_swa_recompute,
     release_swa_recompute_workspace,
     swa_recompute_hit_length,
+)
+from sglang.srt.mem_cache.unified_cache.unified_tree_core import (
+    UnifiedLRUList,
+    UnifiedTreeNode,
 )
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     EvictDeviceLeafResult,
