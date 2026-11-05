@@ -67,10 +67,6 @@ def grouped_gemm_nt_f8f8bf16_masked(
     num_groups, _, k = lhs[0].shape
     _, n, _ = rhs[0].shape
     kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED
-    if _is_sail and lhs[1].shape[-1] == 1 and rhs[1].shape[-1] == 1:
-        kernel_type = (
-            compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED_CHANNEL
-        )
 
     _sanity_check_input(lhs)
     _sanity_check_input(rhs)
@@ -98,18 +94,10 @@ def grouped_gemm_nt_f8f8bf16_masked(
                 expected_m,
                 **fp4_kwargs,
                 **(
-                    (
-                        dict(
-                            enable_overlap=True,
-                            max_block_n=max_block_n,
-                            signal=overlap_args.signal,
-                        )
-                        if not _is_sail  # SAIL names its SBO argument differently
-                        else dict(
-                            enable_sbo_overlap=True,
-                            max_block_n=max_block_n,
-                            signal=overlap_args.signal,
-                        )
+                    dict(
+                        enable_overlap=True,
+                        max_block_n=max_block_n,
+                        signal=overlap_args.signal,
                     )
                     if overlap_args is not None
                     else {}
@@ -132,8 +120,6 @@ def grouped_gemm_nt_bf16_masked(
     d: torch.Tensor,
     masked_m: torch.Tensor,
     expected_m: int,
-    overlap_args: Optional[Any] = None,
-    max_block_n: int = 256,
 ):
     num_groups, _, k = a.shape
     _, n, _ = b.shape
@@ -148,19 +134,6 @@ def grouped_gemm_nt_bf16_masked(
             d,
             masked_m,
             expected_m,
-            **(
-                dict(
-                    **(
-                        {"enable_sbo_overlap": True}
-                        if _is_sail
-                        else {"enable_overlap": True}
-                    ),
-                    max_block_n=max_block_n,
-                    signal=overlap_args.signal,
-                )
-                if overlap_args is not None
-                else {}
-            ),
         )
 
 
@@ -175,10 +148,6 @@ def grouped_gemm_nt_f8f8bf16_contig(
     m, k = lhs[0].shape
     num_groups, n, _ = rhs[0].shape
     kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG
-    if _is_sail and lhs[1].shape[-1] == 1 and rhs[1].shape[-1] == 1:
-        kernel_type = (
-            compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG_CHANNEL
-        )
 
     if m == 0:
         return
