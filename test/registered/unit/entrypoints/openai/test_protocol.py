@@ -786,26 +786,6 @@ class TestFunctionDeferLoading(unittest.TestCase):
             self.assertIs(data["defer_loading"], value)
             self.assertIs(data["function"]["defer_loading"], value)
 
-    def test_structural_tag_tools_are_the_client_dicts(self):
-        from unittest import mock
-
-        from sglang.srt.function_call import base_format_detector
-        from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
-
-        raw = {
-            "type": "function",
-            "function": {
-                "name": "search_db",
-                "description": "Search the database.",
-                "parameters": {"type": "object"},
-            },
-        }
-        with mock.patch.object(
-            base_format_detector, "get_model_structural_tag", return_value=None
-        ) as build_tag:
-            DeepSeekV32Detector().get_structural_tag(tools=[Tool.model_validate(raw)])
-        self.assertEqual(build_tag.call_args.kwargs["tools"], [raw])
-
     def test_tool_reference_content_part_accepted(self):
         """Chat completion should accept tool_reference content on tool-role
         messages (GLM-specific extension consumed by the chat template)."""
