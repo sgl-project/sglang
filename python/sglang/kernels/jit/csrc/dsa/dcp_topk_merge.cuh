@@ -213,16 +213,16 @@ SGL_DEVICE void poll_tagged(const uint64_t* src, int step, uint64_t tag, uint64_
 struct Params {
   const int2* __restrict__ candidates;    // [rows, kTopK] (score bits, global position)
   uint64_t* __restrict__ buffer;          // this rank's symmetric buffer
-  uint64_t* mc_buffer;                    // its multicast address
+  uint64_t* multicast_ptr;                // its multicast address
   const int64_t* __restrict__ peer_ptrs;  // [kNumRanks] symmetric buffer of each rank
   int64_t* __restrict__ counters;         // [max_rows] calls per row slot
   const int32_t* __restrict__ global_lens;
   const int32_t* __restrict__ page_table;
   int64_t page_table_stride;
-  int32_t* __restrict__ out;             // [rows, kTopK] widened slots, -1 after
+  int32_t* __restrict__ out_slots;       // [rows, kTopK] widened slots, -1 after
   int32_t* __restrict__ fallback;        // [rows] 1 when the certificate failed
   uint64_t* __restrict__ union_scratch;  // [max_rows, kNumRanks * kTopK] fallback union; global, so smem stays small
-  int32_t rank;
+  int32_t dcp_rank;
   int32_t span;  // page_size * kNumRanks
   int32_t max_rows;
 };
@@ -314,7 +314,7 @@ __global__ void __launch_bounds__(32 * kNumRanks) merge_kernel(const __grid_cons
   // ---- push the best kCandK to every rank ----
   bool sel[kPerThread];
   select_at_least(own, select_kth(visit_keys(own), min(n_own, kCandK), s), sel);
-  uint64_t* const dst = p.mc_buffer + base + static_cast<int64_t>(p.rank) * kCandK;
+  uint64_t* const dst = p.multicast_ptr + base + static_cast<int64_t>(p.dcp_rank) * kCandK;
   compact<kCandK, kThreads>(
       sel,
       [&](int e, int i) { device::ptx::multimem_store_relaxed(dst + e, pack_entry(v[i].x, v[i].y, tag)); },
@@ -364,7 +364,7 @@ __global__ void __launch_bounds__(32 * kNumRanks) merge_kernel(const __grid_cons
   if (tid == 0) p.fallback[row] = fail != 0;
   if (fail) t = fallback_kth<kNumRanks, kTopK, kCandK>(p, row, fail, full_off, tag, cand, s);
 
-  int32_t* const out = p.out + static_cast<int64_t>(row) * kTopK;
+  int32_t* const out = p.out_slots + static_cast<int64_t>(row) * kTopK;
   const auto pad = [&](int e) { out[e] = -1; };
   // ---- this rank's keys >= t*, compacted ----
   select_at_least(own, t, sel);
@@ -387,7 +387,7 @@ struct DcpTopKMergeKernel {
   static void
   run(tvm::ffi::TensorView candidates,
       tvm::ffi::TensorView buffer,
-      int64_t mc_buffer,
+      int64_t multicast_ptr,
       tvm::ffi::TensorView peer_ptrs,
       tvm::ffi::TensorView counters,
       tvm::ffi::TensorView global_lens,
@@ -395,7 +395,7 @@ struct DcpTopKMergeKernel {
       tvm::ffi::TensorView out_slots,
       tvm::ffi::TensorView out_fallback,
       tvm::ffi::TensorView union_scratch,
-      int64_t rank,
+      int64_t dcp_rank,
       int64_t span) {
     using namespace host;
 
@@ -428,16 +428,16 @@ struct DcpTopKMergeKernel {
     const auto params = dcp_topk_merge::Params{
         .candidates = static_cast<const int2*>(candidates.data_ptr()),
         .buffer = static_cast<uint64_t*>(buffer.data_ptr()),
-        .mc_buffer = reinterpret_cast<uint64_t*>(mc_buffer),
+        .multicast_ptr = reinterpret_cast<uint64_t*>(multicast_ptr),
         .peer_ptrs = static_cast<const int64_t*>(peer_ptrs.data_ptr()),
         .counters = static_cast<int64_t*>(counters.data_ptr()),
         .global_lens = static_cast<const int32_t*>(global_lens.data_ptr()),
         .page_table = static_cast<const int32_t*>(page_table.data_ptr()),
         .page_table_stride = page_table.stride(0),
-        .out = static_cast<int32_t*>(out_slots.data_ptr()),
+        .out_slots = static_cast<int32_t*>(out_slots.data_ptr()),
         .fallback = static_cast<int32_t*>(out_fallback.data_ptr()),
         .union_scratch = static_cast<uint64_t*>(union_scratch.data_ptr()),
-        .rank = static_cast<int32_t>(rank),
+        .dcp_rank = static_cast<int32_t>(dcp_rank),
         .span = static_cast<int32_t>(span),
         .max_rows = max_rows,
     };

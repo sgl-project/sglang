@@ -50,7 +50,7 @@ class DcpTopKMerge:
     def __init__(self, group, max_rows: int, topk: int):
         import torch.distributed._symmetric_memory as symm_mem
 
-        self.rank = group.rank_in_group
+        self.dcp_rank = group.rank_in_group
         self.max_rows = max_rows
         self.buffer: Optional[torch.Tensor] = None
         self.multicast_ptr = 0
@@ -106,7 +106,7 @@ class DcpTopKMerge:
         candidates: torch.Tensor,
         global_lens: torch.Tensor,
         page_table: torch.Tensor,
-        out: torch.Tensor,
+        out_slots: torch.Tensor,
         span: int,
     ) -> None:
         dcp_topk_merge(
@@ -118,9 +118,9 @@ class DcpTopKMerge:
             peer_ptrs=self.peer_ptrs,
             counters=self.counters,
             union_scratch=self.union_scratch,
-            out_slots=out,
-            out_fallback=self.fallback[: out.shape[0]],
-            dcp_rank=self.rank,
+            out_slots=out_slots,
+            out_fallback=self.fallback[: out_slots.shape[0]],
+            dcp_rank=self.dcp_rank,
             span=span,
             cand_k=_DCP_MERGE_CAND_K,
         )
