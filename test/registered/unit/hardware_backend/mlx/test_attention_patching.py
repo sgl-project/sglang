@@ -1247,8 +1247,11 @@ class TestMlxOverlapScheduler(unittest.TestCase):
             setattr(SchedulerBatchResultProcessor, name, value)
         req = SimpleNamespace(
             rid="r0",
-            kv=SimpleNamespace(holds_kv=True, holds_mamba=False),
+            kv=SimpleNamespace(
+                holds_kv=True, holds_mamba=False, retraction_backup=None
+            ),
             finished=lambda: True,
+            finished_reason=None,
             multimodal_inputs=None,
             session=None,
             return_routed_experts=False,
