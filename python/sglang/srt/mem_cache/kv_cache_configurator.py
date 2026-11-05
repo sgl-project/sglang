@@ -2880,6 +2880,10 @@ class KVCacheConfigurator:
         return token_to_kv_pool_allocator
 
     def _profile_available_bytes(self, pre_model_load_memory: int) -> int:
+        if envs.SGLANG_KVSERVE_CONFIG.get():
+            from sglang.srt.disaggregation.kvserve_runtime import prepare_runtime
+
+            prepare_runtime(self)
         # KV pool budget = currently-free GPU memory minus the non-static runtime
         # slack (pre_model_load_memory * (1 - mem_fraction_static)). Whatever is
         # already resident (model weights, etc.) is thus charged against it.

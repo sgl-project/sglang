@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import dataclasses
+import json
 import logging
 import os
 import struct
@@ -178,6 +179,7 @@ class KVArgsRegisterInfo:
     staging_total_size: int = 0
     dst_aux_item_lens: Optional[List[int]] = None
     staging: Optional[StagingRegisterInfo] = None
+    kvserve: Optional[dict] = None
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -230,6 +232,7 @@ class KVArgsRegisterInfo:
                 if len(msg) > 20 and msg[20]
                 else []
             ),
+            kvserve=json.loads(msg[21]) if len(msg) > 21 and msg[21] else None,
             # Note: always put the staging field at the final
             staging=StagingRegisterInfo.from_zmq_fields(msg, 15, slot_ids_index=19),
         )
@@ -259,6 +262,8 @@ def _uses_flat_entry_layout(
 
 
 class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
+    kvserve = None
+    kvserve_enabled = False
     sender_trace_module = "mooncake"
 
     AUX_DATA_HEADER = b"AUX_DATA"
@@ -281,6 +286,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             enable_custom_mem_pool, custom_mem_pool_type
         )
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+        self.kvserve = None
+        from sglang.srt.disaggregation.kvserve_runtime import is_enabled
+
+        self.kvserve_enabled = is_enabled()
         self.init_engine()
         self.register_buffer_to_engine()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
@@ -459,6 +468,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         The KV cache pool memory is owned by the scheduler and is NOT freed
         here; only mooncake-side registrations / sockets are released.
         """
+        # Codec/TX drain still needs the ACK/READY listeners and sockets. Never
+        # stop that control plane first. Failed drain deliberately leaves its
+        # registered arenas and owner alive rather than freeing unsettled work.
+        if self.kvserve is not None:
+            self.kvserve.assert_close_owner()
+            self._kvserve_quiescing = True
+            self.kvserve.close()
+            self.kvserve = None
         self._stopped = True
 
         # Stop the failed-session probe loop (PREFILL role) if running.
@@ -563,6 +580,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             "page_size": page_size,
             "slot_layer_ids": list(slot_layer_ids or []),
         }
+        if self.kvserve_enabled:
+            from sglang.srt.disaggregation.mooncake.kvserve_optimized import (
+                OptimizedKVServeAdapter as KVServeAdapter,
+            )
+
+            self.kvserve = KVServeAdapter(
+                self, k_buffers, v_buffers, page_size, slot_layer_ids
+            )
 
     def _register_staging_memory(self, ptr: int, size: int) -> None:
         self.engine.batch_register([ptr], [size])
@@ -2525,6 +2550,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
         while True:
             kv_chunk: Optional[TransferKVChunk] = None
+            staging_deferred = False
+            source_unsettled = False
             try:
                 kv_chunk = queue.get()
                 # teardown() pushes a None sentinel to unblock get() and stop
@@ -2685,11 +2712,54 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             target_rank_registration_info
                         )
                         if (
+                            getattr(self, "kvserve_enabled", False)
+                            and kv_chunk.is_last_chunk
+                            and StateType.MAMBA in self.kv_args.state_types
+                        ):
+                            state_pos = self.kv_args.state_types.index(StateType.MAMBA)
+                            try:
+                                src_state = kv_chunk.state_indices[state_pos]
+                                dst_state = req.dst_state_indices[state_pos]
+                                valid_state = (
+                                    not skip_state
+                                    and len(src_state) == len(dst_state) == 1
+                                    and int(src_state[0]) >= 0
+                                    and int(dst_state[0]) >= 0
+                                )
+                            except (TypeError, ValueError, IndexError, OverflowError):
+                                valid_state = False
+                            if not valid_state:
+                                self.conclude_failure(
+                                    bootstrap_room=kv_chunk.room,
+                                    failure_reason="KVServe requires one valid Mamba state slot on each peer",
+                                )
+                                break
+                        if (
                             len(kv_chunk.prefill_kv_indices) == 0
                             or not self.kv_args.kv_data_ptrs
                             or skip_kv
                         ):
                             ret = 0
+                        elif getattr(self, "kvserve_enabled", False):
+                            try:
+                                if getattr(self, "_kvserve_quiescing", False):
+                                    raise RuntimeError("KVServe manager is quiescing")
+                                if self.kvserve is None:
+                                    raise RuntimeError(
+                                        "KVServe KV buffers were not bound"
+                                    )
+                                ret = self.kvserve.send(
+                                    kv_chunk.room,
+                                    req,
+                                    target_rank_registration_info,
+                                    kv_chunk.prefill_kv_indices,
+                                    chunked_dst_kv_indice,
+                                    kv_chunk.num_kv_tokens,
+                                )
+                            except Exception as exc:
+                                logger.exception("KVServe transfer failed")
+                                self.record_failure(kv_chunk.room, str(exc))
+                                ret = -1
                         elif is_dcp_transfer:
                             dcp_token_item_lens = (
                                 target_rank_registration_info.dcp_token_item_lens
@@ -2801,6 +2871,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 # send also marks the room Failed.
                                 if state_rc != 0:
                                     self._poison_unsettled_send(kv_chunk.room)
+                                    # A timed-out native state write may still read
+                                    # the Prefill request's Mamba state slot.
+                                    if getattr(self, "kvserve_enabled", False):
+                                        source_unsettled = True
                                 if (
                                     self.request_status.get(
                                         kv_chunk.room, KVPoll.Failed
@@ -2837,6 +2911,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 # The aux write targets decode's metadata
                                 # slot, which the deferred release also frees.
                                 self._poison_unsettled_send(req.room)
+                                # It can still read Prefill's metadata buffer.
+                                if getattr(self, "kvserve_enabled", False):
+                                    source_unsettled = True
                             polls.append(True if ret == 0 else False)
                             dst_ranks_infos.append((req.endpoint, req.dst_port))
 
@@ -2913,9 +2990,19 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
                 if kv_chunk is not None:
                     self.poison_deferred_ack_room(kv_chunk.room)
+                    # A worker crash may follow an unknown GPU/transport state.
+                    # Keep this source owner until process exit rather than
+                    # treating a crashed worker as a completed reader.
+                    source_unsettled = True
                 raise RuntimeError(
                     f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
                 )
+            finally:
+                # A queued chunk owns its source pages even before dequeue.
+                # Preserve that ownership if staging re-enqueued the chunk.
+                gate = getattr(kv_chunk, "_kvserve_source_gate", None)
+                if gate is not None and not staging_deferred and not source_unsettled:
+                    gate.release()
 
     def _handle_abort_notification(self, msg: List[bytes]) -> bool:
         if not msg or msg[0] != ABORT_TAG:
@@ -2998,6 +3085,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 waiting_req_bytes = recv()
                 if waiting_req_bytes is None:
                     continue
+                if self.kvserve is not None and self.kvserve.handle_ack(
+                    waiting_req_bytes
+                ):
+                    continue
                 room = waiting_req_bytes[0].decode("ascii")
                 # Staging: decode reports consumption watermark back to prefill
                 if room == "WATERMARK":
@@ -3079,6 +3170,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 msg = recv()
                 if msg is None:
                     continue
+                if self.kvserve is not None and self.kvserve.handle_ready(msg):
+                    continue
                 if msg[0] == MooncakeKVManager.AUX_DATA_HEADER:
                     self._handle_aux_data(msg)
                     continue
@@ -3099,6 +3192,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 if parsed is None:
                     continue
                 room, status, prefill_rank, reason = parsed
+                if self.kvserve is not None:
+                    status = self.kvserve.check_success(room, status)
                 self.apply_prefill_status(
                     bootstrap_room=room,
                     status=status,
@@ -3125,9 +3220,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         wait_event: Optional[object] = None,
         indices_event: Optional[object] = None,
         trace_ctx: Optional[Union[TraceReqContext, TraceNullContext]] = None,
+        source_gate=None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last_chunk or (is_last_chunk and aux_index is not None)
+
+        if getattr(self, "_kvserve_quiescing", False):
+            self.conclude_failure(bootstrap_room, "KVServe manager is quiescing")
+            return
 
         if (
             bootstrap_room not in self.request_status
@@ -3150,24 +3250,40 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_infos = self.transfer_infos[bootstrap_room].keys()
         session_port_sum = sum(int(session.rsplit(":", 1)[1]) for session in dst_infos)
         shard_idx = session_port_sum % len(self.transfer_queues)
+        if getattr(self, "kvserve_enabled", False):
+            # Preserve FIFO within a room while allowing independent rooms to
+            # progress on native workers even while another waits for restore.
+            shard_idx = bootstrap_room % len(self.transfer_queues)
 
         if trace_ctx is None:
             trace_ctx = TraceNullContext()
 
-        self.transfer_queues[shard_idx].put(
-            TransferKVChunk(
-                room=bootstrap_room,
-                prefill_kv_indices=kv_indices,
-                index_slice=index_slice,
-                is_last_chunk=is_last_chunk,
-                prefill_aux_index=aux_index,
-                state_indices=state_indices,
-                num_kv_tokens=num_kv_tokens,
-                trace_ctx=trace_ctx,
-                wait_event=wait_event,
-                indices_event=indices_event,
-            )
+        chunk = TransferKVChunk(
+            room=bootstrap_room,
+            prefill_kv_indices=kv_indices,
+            index_slice=index_slice,
+            is_last_chunk=is_last_chunk,
+            prefill_aux_index=aux_index,
+            state_indices=state_indices,
+            num_kv_tokens=num_kv_tokens,
+            trace_ctx=trace_ctx,
+            wait_event=wait_event,
+            indices_event=indices_event,
         )
+        if getattr(self, "kvserve_enabled", False):
+            if source_gate is None:
+                raise RuntimeError(
+                    "KVServe transfer is missing its source ownership gate"
+                )
+            if not source_gate.acquire():
+                return
+            chunk._kvserve_source_gate = source_gate
+        try:
+            self.transfer_queues[shard_idx].put(chunk)
+        except BaseException:
+            if source_gate is not None:
+                source_gate.release()
+            raise
 
     def get_session_id(self):
         return self.engine.get_session_id()
@@ -3318,7 +3434,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 f"{len(self.kv_args.kv_item_lens)}Q",
                 *self.kv_args.kv_item_lens,
             ),
-        ]
+        ] + (
+            [json.dumps(self.kvserve.registration()).encode()]
+            if self.kvserve is not None
+            else []
+        )
 
     def build_receiver_metadata_message(
         self,
@@ -3332,6 +3452,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         is_dummy: bool,
         device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
     ) -> List[bytes]:
+        if getattr(self, "_kvserve_quiescing", False):
+            raise RuntimeError("KVServe manager is quiescing")
+        if self.kvserve is not None:
+            self.kvserve.expect_room(bootstrap_room, kv_indices, is_dummy)
         return [
             str(bootstrap_room).encode("ascii"),
             self.local_ip.encode("ascii"),
@@ -3352,6 +3476,37 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
 class MooncakeKVSender(CommonKVSender):
     supports_host_tensor_indices = True
+
+    def __init__(self, mgr, *args, **kwargs):
+        self._kvserve_source_gate = None
+        if getattr(mgr, "kvserve_enabled", False):
+            from sglang.srt.disaggregation.mooncake.kvserve_pipeline import (
+                SourceRoomGate,
+            )
+
+            self._kvserve_source_gate = SourceRoomGate()
+        super().__init__(mgr, *args, **kwargs)
+
+    def is_source_release_safe(self):
+        if not getattr(self.kv_mgr, "kvserve_enabled", False):
+            return True
+        if not self._kvserve_source_gate.close_and_is_idle():
+            return False
+        adapter = getattr(self.kv_mgr, "kvserve", None)
+        safe = getattr(adapter, "source_encode_release_safe", None)
+        return safe is None or safe(self.bootstrap_room)
+
+    def _poll_with_status(self, check_status):
+        # A failed session can still have a codec reading its source KV. Keep
+        # ownership on the scheduler until the native transfer worker drains;
+        # this is only a CPU query, never a CUDA wait on the scheduler thread.
+        status = super()._poll_with_status(check_status)
+        if (
+            status in (KVPoll.Success, KVPoll.Failed)
+            and not self.is_source_release_safe()
+        ):
+            return KVPoll.Transferring
+        return status
 
     @mooncake_trace_func(MooncakeRequestStage.MOONCAKE_SEND)
     def send(
@@ -3391,7 +3546,38 @@ class MooncakeKVSender(CommonKVSender):
 
 
 class MooncakeKVReceiver(CommonKVReceiver):
-    pass
+    def _send_bootstrap_message(self, *, bootstrap_info, message, operation):
+        adapter = getattr(self.kv_mgr, "kvserve", None)
+        if adapter is not None:
+            try:
+                adapter.claim_prefill_peer(bootstrap_info)
+            except ValueError as error:
+                self.kv_mgr.record_failure(self.bootstrap_room, str(error))
+                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                self.conclude_state = KVPoll.Failed
+                return False
+        return super()._send_bootstrap_message(
+            bootstrap_info=bootstrap_info, message=message, operation=operation
+        )
+
+    def is_local_restore_release_safe(self):
+        adapter = getattr(self.kv_mgr, "kvserve", None)
+        return adapter is None or adapter.local_restore_release_safe(
+            self.bootstrap_room
+        )
+
+    def quarantine_unsettled_restore_transport(self):
+        adapter = getattr(self.kv_mgr, "kvserve", None)
+        if adapter is not None:
+            adapter.quarantine_remote_restore(self.bootstrap_room)
+
+    def clear(self) -> None:
+        adapter = getattr(self.kv_mgr, "kvserve", None)
+        if adapter is not None:
+            adapter.cancel_room(self.bootstrap_room)
+        super().clear()
+        if adapter is not None:
+            adapter.drop_room(self.bootstrap_room)
 
 
 class MooncakeKVBootstrapServer(CommonKVBootstrapServer):

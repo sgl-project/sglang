@@ -4025,19 +4025,27 @@ class Scheduler(
         prepare_abort(req, reason.message, reason.status_code)
         req.time_stats.trace_ctx.abort(abort_info={"reason": reason.message})
         req.clear_requested_finish()
+        defer_source_release = False
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.clear_pending_chunk_send(req)
             req.disagg_kv_sender.abort()
-            maybe_release_metadata_buffer(
-                req, self.req_to_metadata_buffer_idx_allocator
-            )
+            defer_source_release = self.defer_aborted_kvserve_source_release(req)
+            if not defer_source_release:
+                maybe_release_metadata_buffer(
+                    req, self.req_to_metadata_buffer_idx_allocator
+                )
             req.pending_bootstrap = False
-        self.release_aborted_request(req)
+        if not defer_source_release:
+            self.release_aborted_request(req)
+        elif self.enable_hisparse:
+            # The transfer queue owns the eventual source/page release.
+            req._kvserve_deferred_hisparse_cleanup = True
         # No member rows exist before the leader's prefill ends.
         self.beam_coordinator.retire_group(req)
-        if self.enable_hisparse:
-            self.hisparse_coordinator.request_finished(req)
-        release_kv_cache(req, self.tree_cache, checkpoint=False)
+        if not defer_source_release:
+            if self.enable_hisparse:
+                self.hisparse_coordinator.request_finished(req)
+            release_kv_cache(req, self.tree_cache, checkpoint=False)
 
         self.chunked_req = None
         self._pending_chunked_abort_req = None

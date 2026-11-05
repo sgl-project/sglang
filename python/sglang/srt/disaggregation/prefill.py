@@ -386,7 +386,10 @@ class PrefillBootstrapQueue:
         )
         # Pass KV pool tensor refs to the manager for GPU gather (staging mode)
         if (
-            envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+            (
+                envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+                or getattr(kv_manager, "kvserve_enabled", False)
+            )
             and hasattr(kv_manager, "set_kv_buffer_tensors")
             and not self.is_mla_backend
         ):
@@ -405,6 +408,8 @@ class PrefillBootstrapQueue:
                     kv_pool.page_size,
                     slot_layer_ids=slot_layer_ids,
                 )
+        if getattr(kv_manager, "kvserve_enabled", False) and kv_manager.kvserve is None:
+            raise ValueError("KVServe requires a supported full-attention KV pool")
         return kv_manager
 
     def create_sender(self, req: Req, num_kv_heads: int) -> bool:
@@ -626,10 +631,36 @@ class SchedulerDisaggregationPrefillMixin:
         sender = getattr(req, "disagg_kv_sender", None)
         if sender is not None and hasattr(sender, "abort"):
             sender.abort()
+        if self.defer_aborted_kvserve_source_release(req):
+            return
         maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
         if req.kv.holds_kv or req.kv.holds_mamba:
             release_kv_cache(req, self.tree_cache, checkpoint=False)
         req.pending_bootstrap = False
+
+    def defer_aborted_kvserve_source_release(self: Scheduler, req: Req) -> bool:
+        """Keep source pages owned until a cancelled codec reader has drained.
+
+        The sender must already be aborted, so queued chunks cannot start a new
+        read after this CPU-only ownership check. Terminal polling then releases
+        pages on this same scheduler thread through the normal failure path.
+        """
+        sender = getattr(req, "disagg_kv_sender", None)
+        safe = getattr(sender, "is_source_release_safe", None)
+        if safe is None or not getattr(
+            getattr(sender, "kv_mgr", None), "kvserve_enabled", False
+        ):
+            return False
+        # A later overlapping forward result may retire the same request after
+        # the codec has drained. The transfer queue remains the unique releaser.
+        if any(item is req for item in self.disagg_prefill_transfer_queue):
+            return True
+        if safe():
+            return False
+        self.clear_pending_chunk_send(req)
+        req.pending_bootstrap = False
+        self.disagg_prefill_transfer_queue.join([req])
+        return True
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
     def resolve_waiting_queue_bootstrap(self: Scheduler) -> None:
@@ -1392,6 +1423,10 @@ class SchedulerDisaggregationPrefillMixin:
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
         if req.finished_reason is None:
             req.finish_outside_step(FINISH_LENGTH(length=0))
+        # A chunked abort deferred by KVServe still owns HiSparse state.
+        if getattr(req, "_kvserve_deferred_hisparse_cleanup", False):
+            self.hisparse_coordinator.request_finished(req)
+            req._kvserve_deferred_hisparse_cleanup = False
         # unlock the tree
         release_kv_cache(req, self.tree_cache, checkpoint=True)
         self.release_aborted_request(req)
@@ -1434,6 +1469,8 @@ class SchedulerDisaggregationPrefillMixin:
 
         if req.to_finish is not None and not req.finished():
             req.update_finish_state()
+        if self.defer_aborted_kvserve_source_release(req):
+            return False
         maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
         req.pending_bootstrap = False
         self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)

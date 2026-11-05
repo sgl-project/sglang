@@ -290,6 +290,47 @@ python -m sglang.launch_server \
 
 PD Disaggregation with Mooncake supports the following environment variables for fine-grained control over system behavior.
 
+#### KV cache compression with KVServe
+
+On NVIDIA CUDA, you can enable KVServe compression for Mooncake P/D transfer. Install a KVServe runtime revision with the fused and standard CUDA backends on both workers. This integration supports BF16 full-attention caches, including hybrid models with linear-attention state, TP1/PP1, and one prefill endpoint per decode instance. Only the full-attention K/V is compressed; Mooncake transfers the recurrent state through its native path. Hybrid models using `--enable-unified-memory` are not supported.
+
+Install the pinned KVServe revision on both workers. For CUDA 13, for example:
+
+```bash
+pip install "kvserve_v1[runtime-fused-cu13] @ git+https://github.com/hpdps-group/KVServe.git@14a87a227a935257f8ab6749f809539d3a24ca60"
+```
+
+For CUDA 12, use `runtime-fused-cu12` instead. Both extras install nvCOMP 6.0.0.12; prefill and decode must use the same nvCOMP version because it is not included in the wire-profile check.
+
+Create a JSON file on each worker and set `SGLANG_KVSERVE_CONFIG` to its path before starting the server:
+
+```json
+{
+  "enable-compression-pipeline": true
+}
+```
+
+With no other fields, the profile uses Hadamard, quantization, and ANS. Key quantization uses 12/6 levels for high/low precision layers; value quantization uses 8/4 levels. These numbers are quantization levels, not bit widths. The default layer split uses low precision for the final approximately one-third of layers. The default is two slots and 1,024 tokens per codec chunk; the chunk size must be divisible by the native page size. Omitting the environment variable or setting `"enable-compression-pipeline": false` keeps the native transfer path.
+
+You can choose the stages and quantization parameters in the same file. For example, to omit Hadamard and use different quantization levels:
+
+```json
+{
+  "enable-compression-pipeline": true,
+  "pipeline": ["quantizer", "codec"],
+  "axis_key": "channel",
+  "axis_value": "token",
+  "high_key_num_levels": 16,
+  "low_key_num_levels": 8,
+  "high_value_num_levels": 16,
+  "low_value_num_levels": 8
+}
+```
+
+`pipeline` selects an ordered subset of `transformer`, `quantizer`, and `codec`; it must include `quantizer` or `codec`. The available transformer is `hadamard`, and the available codec is `ans`. The C++/CUDA quantizer supports `channel` and `token` axes and 2–256 levels. To split by attention head instead of layer, set `split_type` to `head`, provide `score_path` on both workers, and optionally set `hybrid_ratio` to the fraction of heads assigned low precision. `score_path` and `hybrid_ratio` apply only to head-split quantization.
+
+The default algorithm profile selects the fused backend when supported. Other profiles use KVServe's standard C++/CUDA backend. Prefill and decode must select compatible profiles and execution backends; a mismatch is rejected. If their hardware selects different backends automatically, set `SGLANG_KVSERVE_EXECUTION_BACKEND=standard` on both. The `slot_count` may differ between workers, but the codec chunk size and representation settings must match.
+
 #### NVLink Transport Configuration
 To enable NVLink transport for KV cache transfers with the mooncake backend (recommended for NVL72 deployments), set the following environment variables. Note that auxiliary data transfer will still use TCP as a temporary workaround.
 

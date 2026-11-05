@@ -880,7 +880,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 "Transfer backend does not support decode host KV destinations"
             )
         # Staging buffer setup (only when heterogeneous TP staging is enabled)
-        if self.enable_staging and not self.is_mla_backend:
+        if (
+            self.enable_staging or getattr(kv_manager, "kvserve_enabled", False)
+        ) and not self.is_mla_backend:
             kv_pool_for_heads = self.token_to_kv_pool.layer_router.view(
                 IdSpaceKind.FULL
             )
@@ -906,6 +908,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         kv_pool.page_size,
                         slot_layer_ids=slot_layer_ids,
                     )
+        if getattr(kv_manager, "kvserve_enabled", False) and kv_manager.kvserve is None:
+            raise ValueError("KVServe requires a supported full-attention KV pool")
         return kv_manager
 
     def add(
@@ -3184,6 +3188,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         kv_manager._staging_handler = self.staging_handler
 
     def _release_request(self, decode_req: DecodeRequest) -> None:
+        if self._has_local_restore_pending(decode_req):
+            raise RuntimeError(
+                "KVServe native pages still have an unsettled local restore"
+            )
         # HiSparse host pages are the transfer destination; free them with the KV.
         if self.scheduler.enable_hisparse:
             self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
@@ -3195,6 +3203,14 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
     def _is_host_destination(self, decode_req: DecodeRequest) -> bool:
         return self.enable_host_receive and decode_req.host_staged
+
+    @staticmethod
+    def _has_local_restore_pending(decode_req: DecodeRequest) -> bool:
+        # Never query/synchronize CUDA here. Completion workers maintain the
+        # predicate, and the scheduler simply keeps the allocation deferred.
+        receiver = decode_req.kv_receiver
+        check = getattr(receiver, "is_local_restore_release_safe", None)
+        return check is not None and not check()
 
     def _record_transfer_failure(self, failure_reason: str) -> None:
         if self.scheduler.metrics_reporter.enable_metrics:
@@ -3339,7 +3355,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                         i,
                         decode_req,
                         requires_host_drain
-                        or (deferrable and decode_req.kv_receiver.abort_notified),
+                        or (deferrable and decode_req.kv_receiver.abort_notified)
+                        or self._has_local_restore_pending(decode_req),
                     )
                 )
                 indices_to_remove.add(i)
@@ -3519,6 +3536,11 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     decode_req.req.bootstrap_room, required_acks
                 )
                 is_ready = is_drained or now >= deadline
+            # A remote drain/timeout says nothing about already submitted local
+            # decompression kernels. Never release their native destinations.
+            local_safe = not self._has_local_restore_pending(decode_req)
+            is_drained = is_drained and local_safe
+            is_ready = is_ready and local_safe
             drained.append(is_drained)
             ready.append(is_ready)
         # Acks and deadlines are rank-local. Releasing only on some ranks would
@@ -3553,6 +3575,14 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 )
             outcome = "drained" if drained else "timeout"
             try:
+                if not drained:
+                    quarantine = getattr(
+                        decode_req.kv_receiver,
+                        "quarantine_unsettled_restore_transport",
+                        None,
+                    )
+                    if quarantine is not None:
+                        quarantine()
                 self._do_release(decode_req, idx)
             except Exception:
                 # Isolate a failed release so the rest still run; entry already dropped.
@@ -3565,6 +3595,23 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
     def release_memory_occupation(self):
         """Clean up in-flight transfers before releasing GPU memory."""
+        # Newer SGLang tracks these queues in keyed containers; their items()
+        # exposes the same request/tuple records as the older list baseline.
+        queue = self.queue.items() if hasattr(self.queue, "items") else self.queue
+        deferred = (
+            self._deferred_releases.items()
+            if hasattr(self._deferred_releases, "items")
+            else self._deferred_releases
+        )
+        receivers = [r.kv_receiver for r in queue]
+        receivers.extend(r.kv_receiver for r, *_ in deferred)
+        if any(
+            getattr(getattr(r, "kv_mgr", None), "kvserve", None) is not None
+            for r in receivers
+        ):
+            raise RuntimeError(
+                "Drain KVServe requests before releasing the native KV pool"
+            )
         self.queue.clear()
         # Pool is being torn down; drop held entries without per-request release.
         self._deferred_releases.clear()

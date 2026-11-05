@@ -2379,6 +2379,11 @@ class CommonKVSender(BaseKVSender):
             wait_event=wait_event,
             indices_event=indices_event,
             trace_ctx=self.trace_ctx.copy_for_thread(),
+            **(
+                {"source_gate": self._kvserve_source_gate}
+                if getattr(self, "_kvserve_source_gate", None) is not None
+                else {}
+            ),
         )
         self._record_transfer_indices(kv_indices, state_indices)
 
