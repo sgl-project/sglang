@@ -335,6 +335,10 @@ class TgvGemmCuteExtKernel:
         bar_tmem_alloc_arr = cute_ext.allocate(
             cutlass.Int64, cute.AddressSpace.smem, cute.make_layout(1), alignment=8
         )
+        # 2-CTA: rendezvous of the two MMA warps before the collective TMEM dealloc.
+        bar_tmem_dealloc_arr = cute_ext.allocate(
+            cutlass.Int64, cute.AddressSpace.smem, cute.make_layout(1), alignment=8
+        )
         # alloc_tmem writes the TMEM base address to this slot; both MMA and
         # EPILOG read it back via retrieve_tmem_ptr.
         tmem_base_arr = cute_ext.allocate(
@@ -346,6 +350,7 @@ class TgvGemmCuteExtKernel:
         bar_tma_epilog = bar_tma_epilog_arr.iterator  # Pointer[Int64]
         bar_mma_epilog = bar_mma_epilog_arr.iterator  # Pointer[Int64]
         bar_tmem_alloc = bar_tmem_alloc_arr.iterator  # Pointer[Int64]
+        bar_tmem_dealloc = bar_tmem_dealloc_arr.iterator  # Pointer[Int64]
         tmem_base_ptr = tmem_base_arr.iterator  # Pointer[Int32]
 
         # ---- Barrier init (1 thread, PTX mbarrier.init is single-thread) ----
@@ -364,6 +369,8 @@ class TgvGemmCuteExtKernel:
                 cute.arch.mbarrier_init(
                     bar_tmem_alloc, 32 + 128
                 )  # MMA + 4 EPILOG warps
+                if cutlass.const_expr(self.use_2cta):
+                    cute.arch.mbarrier_init(bar_tmem_dealloc, 32)  # peer CTA's MMA warp
 
         cute.arch.mbarrier_init_fence()
         if cutlass.const_expr(self.use_2cta):
@@ -462,6 +469,8 @@ class TgvGemmCuteExtKernel:
                 bar_empty,
                 bar_mma_epilog,
                 bar_tmem_alloc,
+                bar_tmem_dealloc,
+                cta_rank_in_cluster,
                 tiled_mma,
                 sA,
                 sB,
@@ -670,6 +679,8 @@ class TgvGemmCuteExtKernel:
         bar_empty,  # Pointer[Int64], DMA_Stage entries
         bar_mma_epilog,  # Pointer[Int64], 1 entry
         bar_tmem_alloc,  # Pointer[Int64], 1 entry, 160-arrival
+        bar_tmem_dealloc,  # Pointer[Int64], 1 entry, 32-arrival (2-CTA peer handshake)
+        cta_rank_in_cluster: cutlass.Int32,
         tiled_mma: cute.TiledMma,
         sA: cute.Tensor,  # ((Mma_M, Mma_K), NumMma_M, NumMma_K, DMA_Stage)
         sB: cute.Tensor,  # ((Mma_N, Mma_K), NumMma_N, NumMma_K, DMA_Stage)
@@ -765,12 +776,29 @@ class TgvGemmCuteExtKernel:
                 tcgen05.commit(bar_mma_epilog, commit_mask, self.cta_group)
 
         # ---- TMEM dealloc: wait for own EPILOG's tcgen05.ld to retire, free.
-        # bar_tmem_alloc phase 1 fires after EPILOG's tcgen05.ld is observable
-        # (post fence_view_async_tmem_load). 2-CTA dealloc is per-CTA (no
-        # cross-CTA handshake) because each CTA owns its own physical TMEM
-        # half; the cluster-shared accumulator is just a logical view.
+        # The release arrival below must land in phase 1 of bar_tmem_alloc. This
+        # warp has not waited for phase 0 (the allocation hand-off): if two or
+        # more EPILOG warps have not yet made their phase-0 arrival at :796 when
+        # we get here, our arrival counts toward phase 0, phase 0 stays open and
+        # mbarrier_wait(bar_tmem_alloc, 1) returns at once (parity 1 then names
+        # the complete preceding phase), so the dealloc would run before the
+        # EPILOG's tcgen05.ld. In the 2-CTA non-leader CTA there is no K-loop
+        # between the two arrivals, so this is a sub-microsecond race. Observe
+        # phase 0 first (same fix as flashinfer PR 7443 for the split-K kernel).
+        cute.arch.mbarrier_wait(bar_tmem_alloc, 0)
         cute.arch.mbarrier_arrive(bar_tmem_alloc)  # phase 1: 32 of 160
         cute.arch.mbarrier_wait(bar_tmem_alloc, 1)
+        if cutlass.const_expr(self.use_2cta):
+            # tcgen05.dealloc.cta_group::2 is one collective operation of the CTA
+            # pair. The PTX ISA (Tensor Memory Allocation and Management
+            # Instructions: tcgen05.alloc, tcgen05.dealloc,
+            # tcgen05.relinquish_alloc_permit) says the issuing warp and the peer
+            # CTA's warp "must synchronize Tensor Memory accesses before
+            # attempting to collectively deallocate". Rendezvous with the peer MMA warp so
+            # neither CTA's EPILOG can still be loading when the pair's columns
+            # are freed, as cutlass's TmemAllocator.free does.
+            cute.arch.mbarrier_arrive(bar_tmem_dealloc, cta_rank_in_cluster ^ 1)
+            cute.arch.mbarrier_wait(bar_tmem_dealloc, 0)
         cute.arch.dealloc_tmem(tmem_ptr, num_tmem_cols, is_two_cta=self.use_2cta)
 
     # ====================================================================
