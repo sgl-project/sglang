@@ -50,6 +50,7 @@ fn resolve_media_work_with_budget(
         audio_data,
         prefetched,
         mm_hashes: _,
+        admission: _,
     } = mm;
     let mut prefetched = prefetched.into_iter();
     let budget = ByteBudget::new(max_request_bytes);
@@ -145,6 +146,7 @@ pub fn to_mm_input(input_ids: TokenIds, mm: MmData) -> Result<MmInput, MediaErro
         audio_data,
         prefetched,
         mm_hashes: _,
+        admission: _,
     } = mm;
     if !video_data.is_empty() || !audio_data.is_empty() {
         return Err(MediaError::Client(
