@@ -178,8 +178,7 @@ class TestRdna4Nvfp4BackendSelection(CustomTestCase):
                     bias=False,
                     params_dtype=torch.bfloat16,
                     quant_config=config,
-                    tp_rank=0,
-                    tp_size=1,
+                    parallel_group="replicated",
                 )
                 expected_scales = torch.tensor(scales, dtype=torch.float32)
                 for shard_id, scale in enumerate(scales):

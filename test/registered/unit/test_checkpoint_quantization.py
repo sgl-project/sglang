@@ -4,7 +4,6 @@ import unittest
 from unittest import mock
 
 import torch
-
 from transformers import PretrainedConfig
 
 from sglang.srt.layers.modelopt_utils import canonicalize_modelopt_quant_algo

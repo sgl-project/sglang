@@ -45,10 +45,15 @@ class TestRdna4RopeFallback(CustomTestCase):
             mock.patch.object(
                 model_utils,
                 "get_token_to_kv_pool",
-                return_value=SimpleNamespace(dtype=torch.bfloat16),
+                return_value=SimpleNamespace(
+                    dtype=torch.bfloat16,
+                    layer_router=SimpleNamespace(sub_pool=lambda kind: None),
+                ),
             ),
             mock.patch.object(
-                model_utils, "is_prefill_context_parallel_enabled", return_value=False
+                model_utils,
+                "get_parallel",
+                return_value=SimpleNamespace(dcp_enabled=False),
             ),
         ):
             for gfx1201 in (True, False):
