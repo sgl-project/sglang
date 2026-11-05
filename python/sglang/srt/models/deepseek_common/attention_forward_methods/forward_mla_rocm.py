@@ -143,10 +143,6 @@ if _use_aiter_gfx95:
         fused_rms_fp8_group_quant,
     )
 
-    from sglang.kernels.ops.gemm.mla_value_bmm_mxfp4_hip import (
-        batched_gemm_a16wfp4_flatten_mxfp4_quant,
-        can_fuse_mla_value_bmm_mxfp4_quant,
-    )
     from sglang.srt.layers.quantization.rocm_mxfp4_utils import (
         batched_gemm_afp4wfp4_pre_quant,
         fused_flatten_mxfp4_quant,
@@ -156,6 +152,25 @@ if _use_aiter_gfx95:
         fused_fp8_bmm_rope_cat_and_cache_mla,
         fused_qk_rope_cat_and_cache_mla,
     )
+
+_use_fused_mla_value_mxfp4_quant = (
+    _use_aiter_gfx95 and envs.SGLANG_OPT_HIP_FUSE_MLA_VALUE_MXFP4_QUANT.get()
+)
+if _use_fused_mla_value_mxfp4_quant:
+    # The fused kernel imports private AITER Triton helpers; if AITER moves them,
+    # keep the split value projection rather than failing every MLA model import.
+    try:
+        from sglang.kernels.ops.gemm.mla_value_bmm_mxfp4_hip import (
+            batched_gemm_a16wfp4_flatten_mxfp4_quant,
+            can_fuse_mla_value_bmm_mxfp4_quant,
+        )
+    except ImportError as e:
+        logger.warning(
+            "Fused MLA value projection + MXFP4 quant is unavailable (%s); "
+            "using the split path.",
+            e,
+        )
+        _use_fused_mla_value_mxfp4_quant = False
 
 
 _ABSORB_BMM_DECODE_MAX_M = 256
@@ -292,15 +307,14 @@ def _can_fuse_rocm_mla_value_mxfp4_quant(
     attn: DeepseekV2AttentionMLA,
     forward_batch: ForwardBatch,
 ) -> bool:
+    # The caller has already checked that w_vc is MXFP4.
     return (
-        _use_aiter_gfx95
-        and envs.SGLANG_OPT_HIP_FUSE_MLA_VALUE_MXFP4_QUANT.get()
+        _use_fused_mla_value_mxfp4_quant
         and forward_batch.forward_mode.is_decode_or_idle()
         and attn.current_attention_backend == "aiter"
         and not attn.use_dsa
         and not _SGLANG_EXPERIMENTAL_LORA_OPTI
         and not is_kv_b_lora_active(attn)
-        and attn.w_vc.dtype == torch.uint8
         and attn.o_proj.weight.dtype == torch.uint8
         and attn.kv_lora_rank == 512
         and attn.v_head_dim == 128
@@ -314,43 +328,34 @@ def rocm_absorb_v_bmm(
 ) -> torch.Tensor:
     """Absorb ``attn_output @ w_vc`` (+ optional fused flatten quant) on HIP."""
     # TODO(haishaw): add bmm_fp8 to ROCm
-    fuse_value_quant = False
     if _use_aiter_gfx95 and attn.w_vc.dtype == torch.uint8:
         x = attn_output.transpose(0, 1)
         w_vc = attn.w_vc.transpose(-2, -1)
         w_scale_v = attn.w_scale_v.transpose(-2, -1)
-        fuse_value_quant = _can_fuse_rocm_mla_value_mxfp4_quant(
+        if _can_fuse_rocm_mla_value_mxfp4_quant(
             attn=attn, forward_batch=forward_batch
-        ) and can_fuse_mla_value_bmm_mxfp4_quant(x, w_vc, w_scale_v)
-        if fuse_value_quant:
-            attn_bmm_output = batched_gemm_a16wfp4_flatten_mxfp4_quant(
-                x, w_vc, w_scale_v
-            )
-            _bmm_buf = None
-            logger.info_once(
-                "ROCm MLA value projection + MXFP4 output quantization "
-                "fusion is enabled."
-            )
-        else:
-            B_heads, M_batch = x.shape[0], x.shape[1]
-            N_vdim = attn.w_vc.shape[2]
-            # Allocate in (batch, heads, dim) so the post-GEMM
-            # transpose+flatten is a free view instead of a copy.
-            _bmm_buf = torch.empty(
-                M_batch,
-                B_heads,
-                N_vdim,
-                device=x.device,
-                dtype=torch.bfloat16,
-            )
-            attn_bmm_output = _bmm_buf.transpose(0, 1)
-            batched_gemm_afp4wfp4_pre_quant(
-                x,
-                w_vc,
-                w_scale_v,
-                torch.bfloat16,
-                attn_bmm_output,
-            )
+        ) and can_fuse_mla_value_bmm_mxfp4_quant(x, w_vc, w_scale_v):
+            # Emits the flattened MXFP4 o_proj input; there is no BF16 value output.
+            return batched_gemm_a16wfp4_flatten_mxfp4_quant(x, w_vc, w_scale_v)
+        B_heads, M_batch = x.shape[0], x.shape[1]
+        N_vdim = attn.w_vc.shape[2]
+        # Allocate in (batch, heads, dim) so the post-GEMM
+        # transpose+flatten is a free view instead of a copy.
+        _bmm_buf = torch.empty(
+            M_batch,
+            B_heads,
+            N_vdim,
+            device=x.device,
+            dtype=torch.bfloat16,
+        )
+        attn_bmm_output = _bmm_buf.transpose(0, 1)
+        batched_gemm_afp4wfp4_pre_quant(
+            x,
+            w_vc,
+            w_scale_v,
+            torch.bfloat16,
+            attn_bmm_output,
+        )
     else:
         _bmm_buf = None
         if _use_aiter_gfx95 and attn.w_kc.dtype == torch.float8_e4m3fn:
@@ -408,10 +413,7 @@ def rocm_absorb_v_bmm(
                 _absorb_weight_bf16(attn.w_vc, attn.w_scale),
             )
 
-    if fuse_value_quant:
-        # The fused GEMM already emitted the flattened MXFP4 o_proj input.
-        pass
-    elif _bmm_buf is not None:
+    if _bmm_buf is not None:
         # _bmm_buf is already (batch, heads, dim) contiguous
         if attn.o_proj.weight.dtype == torch.uint8:
             attn_bmm_output = fused_flatten_mxfp4_quant(_bmm_buf)

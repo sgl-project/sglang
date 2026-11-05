@@ -16,7 +16,6 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.models.deepseek_common.attention_forward_methods import (
     forward_mla_rocm,
 )
@@ -27,7 +26,6 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 _CAN_FUSE = forward_mla_rocm._can_fuse_bmm_rope_cat_and_cache
 _ABSORB_CONFIG = forward_mla_rocm._absorb_bmm_config
-_VALUE_QUANT_ENV = envs.SGLANG_OPT_HIP_FUSE_MLA_VALUE_MXFP4_QUANT
 _CAN_FUSE_VALUE_QUANT = forward_mla_rocm._can_fuse_rocm_mla_value_mxfp4_quant
 
 
@@ -125,7 +123,6 @@ def _value_attn(**overrides):
     attn = SimpleNamespace(
         current_attention_backend="aiter",
         use_dsa=False,
-        w_vc=torch.empty(1, dtype=torch.uint8),
         o_proj=SimpleNamespace(weight=torch.empty(1, dtype=torch.uint8)),
         kv_lora_rank=512,
         v_head_dim=128,
@@ -152,14 +149,15 @@ class TestValueQuantFusionGate(CustomTestCase):
         stack = contextlib.ExitStack()
         self.addCleanup(stack.close)
         stack.enter_context(
-            mock.patch.object(forward_mla_rocm, "_use_aiter_gfx95", True)
+            mock.patch.object(
+                forward_mla_rocm, "_use_fused_mla_value_mxfp4_quant", True
+            )
         )
         stack.enter_context(
             mock.patch.object(
                 forward_mla_rocm, "is_kv_b_lora_active", return_value=False
             )
         )
-        stack.enter_context(_VALUE_QUANT_ENV.override(True))
 
     def test_takes_the_fused_path_when_every_term_holds(self):
         self.assertTrue(_CAN_FUSE_VALUE_QUANT(_value_attn(), _forward_batch()))
@@ -172,12 +170,11 @@ class TestValueQuantFusionGate(CustomTestCase):
             self.assertFalse(_CAN_FUSE_VALUE_QUANT(_value_attn(), _forward_batch()))
 
     def test_each_term_alone_turns_it_off(self):
-        # The kernel is decode-only on the AITER MLA backend, reads scaled MXFP4 W_vc,
-        # feeds an MXFP4 o_proj, and is pinned to the Kimi N=128, K=512 shape.
+        # The kernel is decode-only on the AITER MLA backend, feeds an MXFP4 o_proj,
+        # and is pinned to the Kimi N=128, K=512 shape.
         for name, broken in (
             ("current_attention_backend", "triton"),
             ("use_dsa", True),
-            ("w_vc", torch.empty(1, dtype=torch.bfloat16)),
             ("o_proj", SimpleNamespace(weight=torch.empty(1, dtype=torch.bfloat16))),
             ("kv_lora_rank", 576),
             ("v_head_dim", 64),
@@ -192,8 +189,11 @@ class TestValueQuantFusionGate(CustomTestCase):
             self.assertFalse(
                 _CAN_FUSE_VALUE_QUANT(_value_attn(), _forward_batch(False))
             )
-        with self.subTest(term="env"):
-            with _VALUE_QUANT_ENV.override(False):
+        # Off when the env var disables it or AITER lacks the kernel's helpers.
+        with self.subTest(term="_use_fused_mla_value_mxfp4_quant"):
+            with mock.patch.object(
+                forward_mla_rocm, "_use_fused_mla_value_mxfp4_quant", False
+            ):
                 self.assertFalse(_CAN_FUSE_VALUE_QUANT(_value_attn(), _forward_batch()))
 
 
