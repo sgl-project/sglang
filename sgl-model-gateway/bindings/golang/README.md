@@ -9,7 +9,7 @@ A high-level Go SDK for interacting with SGLang gRPC API, designed with an OpenA
 - [Features](#features)
 - [Installation](#installation)
 - [Quick Start](#quick-start)
-  - [Basic Usage](#basic-usage)
+  - [Basic Usage (Non-streaming)](#basic-usage-non-streaming)
   - [Streaming Usage](#streaming-usage)
 - [Examples](#examples)
 - [Configuration](#configuration)
