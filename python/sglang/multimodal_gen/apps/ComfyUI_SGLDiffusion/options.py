@@ -23,6 +23,9 @@ _ATTENTION_IDS = {
 }
 # Display names -> SGLANG_DIFFUSION_CONVROT_INT8_BACKEND values.
 _INT8_GEMMS = {"auto": "auto", "sglang_jit": "jit", "comfy_kitchen": "comfy_kitchen"}
+# Reverse maps, so SGLDWorkerStatus reports the values the widgets show.
+ATTENTION_DISPLAY = {backend: name for name, backend in _ATTENTION_IDS.items()}
+INT8_GEMM_DISPLAY = {backend: name for name, backend in _INT8_GEMMS.items()}
 
 
 def _field(group, kind, default, tooltip="", **kwargs):

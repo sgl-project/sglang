@@ -409,6 +409,55 @@ class TestCustomTopK(CustomTestCase):
         )
         torch.testing.assert_close(topk_weights, expected_weights, atol=1e-5, rtol=1e-5)
 
+    def test_fused_moe_router_cpu(self):
+        for (
+            num_tokens,
+            hidden_dim,
+            num_experts,
+            topk,
+            softcap,
+            with_bias,
+        ) in itertools.product(
+            [17, 128],
+            [64, 257],
+            [8, 16, 32],
+            [1, 2, 4],
+            [0.0, 30.0],
+            [False, True],
+        ):
+            torch.manual_seed(0)
+            hidden_states = (
+                torch.randn((num_tokens, hidden_dim), dtype=torch.bfloat16) / 16
+            )
+            router_weight = (
+                torch.randn((num_experts, hidden_dim), dtype=torch.float32) / 16
+            )
+            router_weight[:, 0] += torch.linspace(-0.03, 0.03, num_experts)
+            correction_bias = (
+                torch.linspace(-0.05, 0.05, num_experts) if with_bias else None
+            )
+
+            logits = hidden_states.float() @ router_weight.t()
+            if softcap != 0:
+                logits = torch.tanh(logits / softcap) * softcap
+            if correction_bias is not None:
+                logits = logits + correction_bias
+            ref_weights, ref_ids = torch.topk(
+                torch.softmax(logits, dim=-1), topk, dim=-1
+            )
+
+            out_weights, out_ids = torch.ops.sgl_kernel.fused_moe_router_cpu(
+                moe_softcapping=softcap,
+                hidden_states=hidden_states,
+                gating_output=router_weight,
+                topk=topk,
+                renormalize=False,
+                correction_bias=correction_bias,
+            )
+
+            torch.testing.assert_close(out_ids, ref_ids.to(torch.int32), rtol=0, atol=0)
+            torch.testing.assert_close(out_weights, ref_weights, rtol=5e-4, atol=5e-4)
+
 
 if __name__ == "__main__":
     unittest.main()

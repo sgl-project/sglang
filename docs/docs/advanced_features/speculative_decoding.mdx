@@ -547,7 +547,7 @@ print(response.choices[0].message.content)
 - Grammar decoding, returned logprobs or hidden states, sampling penalties, `min_p`, logit bias, custom logit processors, strict thinking, and deterministic inference are not yet supported.
 - In tree mode, both speculative acceptance thresholds must remain at 1.0, `V` must be at least `B` and at most 128, and `V * K` must not exceed 2048. SGLang validates the remaining tree-capacity and EAGLE parent-representation constraints at startup.
 - Mixed chunked prefill is disabled for UNO.
-- Ordinary overlap scheduling is supported. Tree mode does not yet support PDMux or the separate `--enable-two-batch-overlap` feature.
+- Ordinary overlap scheduling is supported. Tree mode does not yet support the separate `--enable-two-batch-overlap` feature.
 
 ---
 
