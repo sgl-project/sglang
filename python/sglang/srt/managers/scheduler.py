@@ -2742,7 +2742,7 @@ class Scheduler(
     def _observed_storage(self):
         """The sub-pools the pool observers report: a unified pool's own
         storage, else the static pools described by their sizing."""
-        global_tokens = self.max_total_num_tokens * self.kv_shard_widening
+        global_tokens = self.max_total_num_tokens
         if is_cp_sharded_padded():
             global_tokens = from_cp_sharded(global_tokens)
         return kv_storage_of(
@@ -2850,13 +2850,13 @@ class Scheduler(
         self._prev_step: Optional[Tuple[int, float, bool]] = None
         self._prev_prefill_end_ts: Optional[float] = None
         self._sched_idled = False
-        global_tokens = self.max_total_num_tokens * self.kv_shard_widening
+        global_tokens = self.max_total_num_tokens
         if is_cp_sharded_padded():
             global_tokens = from_cp_sharded(global_tokens)
         self.load_inquirer = SchedulerLoadInquirer(
             disaggregation_mode=self.disaggregation_mode,
             server_args=self.server_args,
-            # The worker reports logical DCP capacity; add KV shard widening.
+            # The worker already reports logical DCP/page-interleave capacity.
             max_total_num_tokens=global_tokens,
             max_running_requests=self.max_running_requests,
             pool_stats_observer=self.pool_stats_observer,

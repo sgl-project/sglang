@@ -14,33 +14,6 @@ from sglang.srt.distributed.device_communicators.triton_symm_mem_ag import (
 )
 from sglang.srt.distributed.utils import all_gather_single
 
-_INTEGER_DTYPES = (
-    torch.uint8,
-    torch.int8,
-    torch.int16,
-    torch.int32,
-    torch.int64,
-)
-
-
-def _validate_topk(topk: int) -> None:
-    if not isinstance(topk, int) or topk <= 0:
-        raise ValueError(f"topk must be a positive integer, got {topk!r}")
-
-
-def _validate_scores(scores: torch.Tensor, expected_width: int | None = None) -> None:
-    if not isinstance(scores, torch.Tensor):
-        raise TypeError(f"scores must be a tensor, got {type(scores)!r}")
-    if scores.ndim != 2:
-        raise ValueError(f"scores must have shape [rows, states], got {scores.shape}")
-    if not scores.dtype.is_floating_point:
-        raise TypeError(f"scores must have floating-point dtype, got {scores.dtype}")
-    if expected_width is not None and scores.shape[1] != expected_width:
-        raise ValueError(
-            f"local score width must equal local shard size {expected_width}, "
-            f"got {scores.shape[1]}"
-        )
-
 
 def all_gather_qsa_topk_candidates(
     candidate_scores: torch.Tensor,
@@ -51,10 +24,9 @@ def all_gather_qsa_topk_candidates(
 ) -> torch.Tensor:
     """All-gather fixed-width candidates through a ``GroupCoordinator``."""
 
-    _validate_scores(candidate_scores)
     if candidate_global_indices.shape != candidate_scores.shape:
         raise ValueError("candidate scores and indices must have matching shapes")
-    if candidate_global_indices.dtype not in _INTEGER_DTYPES:
+    if candidate_global_indices.dtype not in (torch.int32, torch.int64):
         raise TypeError("candidate indices must have integer dtype")
     if static_buffers is None:
         packed = torch.empty(
@@ -248,24 +220,6 @@ def fused_publish_and_merge_qsa_topk_candidates(
     )
 
 
-def _candidate_order_keys(scores: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
-    """Order published candidates by score descending, then id ascending."""
-
-    score_bits = scores.contiguous().view(torch.int32).to(torch.int64)
-    score_bits &= 0xFFFFFFFF
-    # IEEE floats become monotonically ordered unsigned integers. Canonicalize
-    # signed zero and reject NaNs from selection without a device-to-host sync.
-    score_bits = torch.where(scores == 0, 0, score_bits)
-    negative = (score_bits & 0x80000000) != 0
-    ordered_score = torch.where(
-        negative, (~score_bits) & 0xFFFFFFFF, score_bits ^ 0x80000000
-    )
-    valid = (indices >= 0) & ~torch.isnan(scores)
-    index_tiebreak = 0xFFFFFFFF - indices.to(torch.int64)
-    keys = (ordered_score - 0x80000000) * 0x100000000 + index_tiebreak
-    return keys.masked_fill(~valid, torch.iinfo(torch.int64).min)
-
-
 @triton.jit
 def _merge_qsa_topk_candidates_kernel(
     candidates_ptr,
@@ -361,7 +315,6 @@ def merge_qsa_topk_candidates(
     only make the merge deterministic among candidates that were published.
     """
 
-    _validate_topk(topk)
     if gathered_candidates.ndim == 4:
         if gathered_candidates.shape[-1] != 2:
             raise ValueError("candidate transport must end in score/index pairs")
@@ -382,31 +335,11 @@ def merge_qsa_topk_candidates(
         )
     if gathered_candidates.dtype != torch.float32:
         raise TypeError("candidate transport must use float32")
+    if not gathered_candidates.is_cuda:
+        raise ValueError("distributed QSA candidate merge requires CUDA")
 
     with torch.profiler.record_function("qsa.candidate_merge"):
-        if gathered_candidates.is_cuda:
-            return _merge_qsa_topk_candidates_triton(gathered_candidates, topk=topk)
-        return _merge_qsa_topk_candidates_impl(gathered_candidates, topk=topk)
-
-
-def _merge_qsa_topk_candidates_impl(
-    gathered_candidates: torch.Tensor,
-    *,
-    topk: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    scores = gathered_candidates[..., 0]
-    indices = gathered_candidates[..., 1].contiguous().view(torch.int32)
-    valid = (indices >= 0) & ~torch.isnan(scores)
-
-    keys = _candidate_order_keys(scores, indices)
-    positions = torch.topk(keys, k=topk, dim=-1, largest=True, sorted=True).indices
-    output_indices = indices.gather(-1, positions)
-    output_scores = scores.gather(-1, positions)
-    output_valid = valid.gather(-1, positions)
-    return (
-        output_scores.masked_fill(~output_valid, float("-inf")),
-        output_indices.masked_fill(~output_valid, -1),
-    )
+        return _merge_qsa_topk_candidates_triton(gathered_candidates, topk=topk)
 
 
 def gather_and_merge_qsa_topk_candidates(
@@ -435,11 +368,3 @@ def gather_and_merge_qsa_topk_candidates(
         static_buffers.candidate_scores[:rows, :topk],
         static_buffers.candidate_indices[:rows, :topk],
     )
-
-
-__all__ = [
-    "all_gather_qsa_topk_candidates",
-    "fused_publish_and_merge_qsa_topk_candidates",
-    "gather_and_merge_qsa_topk_candidates",
-    "merge_qsa_topk_candidates",
-]
