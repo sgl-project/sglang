@@ -161,6 +161,7 @@ def _assert_norm_close(x: torch.Tensor, ref: torch.Tensor, num_norm_rows: int):
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("bs", PUSH_BS)
 @pytest.mark.parametrize("use_residual", [False, True])
 @torch.inference_mode()
@@ -176,6 +177,7 @@ def test_ar_fusion_push(bs: int, use_residual: bool):
     torch.testing.assert_close(x, ref, atol=0, rtol=0)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("bs", PULL_BS)
 @pytest.mark.parametrize("use_residual", [False, True])
 @torch.inference_mode()
@@ -193,6 +195,7 @@ def test_ar_fusion_pull_2shot(bs: int, use_residual: bool):
     torch.testing.assert_close(x, ref, atol=0, rtol=0)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("num_blocks", [1, 2, 4, 8])
 @pytest.mark.parametrize("unroll", [4, 8])
 @torch.inference_mode()
@@ -214,6 +217,7 @@ def test_ar_fusion_pull_tuning_grid(num_blocks: int, unroll: int):
     torch.testing.assert_close(x, ref, atol=0, rtol=0)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("num_tokens", PULL_BS)
 @pytest.mark.parametrize("rows_per_token", [3, 1])  # [N|2N] MoE buf / latent-only
 @torch.inference_mode()
@@ -233,6 +237,7 @@ def test_ar_fusion_pull_norm(num_tokens: int, rows_per_token: int):
     _assert_norm_close(x, ref, num_tokens)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("num_tokens", [1, 8, 24])
 @pytest.mark.parametrize("rows_per_token", [3, 1])
 @torch.inference_mode()
@@ -390,6 +395,7 @@ def test_flashinfer_ep_finalize_skips_nonlocal_routes(m: int):
         torch.testing.assert_close(got, want, atol=atol, rtol=2e-2)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("w_dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("bs", PUSH_BS)
 @torch.inference_mode()
@@ -409,6 +415,7 @@ def test_ar_fusion_finalize_push_norm(bs: int, w_dtype: torch.dtype):
     torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @torch.inference_mode()
 def test_ar_fusion_finalize_push_norm_stress():
     """Back-to-back fused calls interleaved with plain pushes exercise the
@@ -438,6 +445,7 @@ def test_ar_fusion_finalize_push_norm_stress():
         torch.testing.assert_close(x, ref2, atol=0, rtol=0)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("num_blocks", [1, 4, 16])
 @pytest.mark.parametrize("unroll", [4, 8])
 @torch.inference_mode()
@@ -468,6 +476,7 @@ def test_ar_fusion_pull_norm_tuning_grid(num_blocks: int, unroll: int):
     _assert_norm_close(x, ref, num_tokens)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @torch.inference_mode()
 def test_ar_fusion_stress_mixed():
     """Back-to-back mixed calls exercise the push phase double-buffering and
@@ -491,6 +500,7 @@ def test_ar_fusion_stress_mixed():
         torch.testing.assert_close(y, ref2, atol=0, rtol=0)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @torch.inference_mode()
 def test_ar_fusion_graph_capture():
     comm = _init_comm()

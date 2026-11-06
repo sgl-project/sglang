@@ -23,6 +23,7 @@ class TestQRopeStore(CustomTestCase):
             deepseek_v4_rope.set_batched_rope(True)
             self.addCleanup(deepseek_v4_rope.set_batched_rope, previous)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_exact_output_and_padding(self):
         torch.manual_seed(911)
         freqs = torch.polar(
@@ -49,6 +50,7 @@ class TestQRopeStore(CustomTestCase):
                     torch.testing.assert_close(q, original, rtol=0, atol=0)
                     self.assertTrue((padding[:, heads:] == 7).all().item())
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_large_prefill_exact_output_and_padding(self):
         torch.manual_seed(911)
         freqs = torch.polar(
@@ -95,9 +97,11 @@ class TestQRopeStore(CustomTestCase):
             fused_rope_inplace(expected[..., 448:], None, freqs, positions)
             torch.testing.assert_close(output, expected, rtol=0, atol=0)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_graph_replay(self):
         self._check_graph_replay(6)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_large_prefill_graph_replay(self):
         self._check_graph_replay(4097)
 

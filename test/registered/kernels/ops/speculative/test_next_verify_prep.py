@@ -12,6 +12,7 @@ from sglang.kernels.ops.speculative.eagle import (
 )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("bs", [0, 1, 3, 128, 256])
 @pytest.mark.parametrize("width", [1, 4, 7])
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
@@ -52,6 +53,7 @@ def test_prepare_integer_outputs(bs, width, dtype):
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("bs", [0, 1, 128, 257])
 @pytest.mark.parametrize("front", [0, 3])
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
@@ -73,6 +75,7 @@ def test_draft_extend_lengths(bs, front, dtype):
             torch.testing.assert_close(a, b, rtol=0, atol=0)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("mixed", [False, True])
 def test_spec_mrope_positions_graph(dtype, mixed):
@@ -105,6 +108,7 @@ def test_spec_mrope_positions_graph(dtype, mixed):
         torch.testing.assert_close(output.mrope_positions, expected, rtol=0, atol=0)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("bs", [0, 1, 3, 129])
 @pytest.mark.parametrize("width", [1, 4, 7])
 @pytest.mark.parametrize("mrope", [False, True])
@@ -141,6 +145,7 @@ def test_draft_extend_layout_graph(bs, width, mrope):
             assert info[2] is None
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("bs", [1, 3, 128, 256])
 @pytest.mark.parametrize("depth", [1, 3, 7])
 @pytest.mark.parametrize("preallocated", [False, True])
@@ -197,6 +202,7 @@ def test_chain_tree_graph(bs, depth, preallocated):
             assert not buf[-19:].any()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("bs", [0, 1, 3, 128])
 @pytest.mark.parametrize("depth", [1, 3, 7])
 @pytest.mark.parametrize("mrope", [False, True])
@@ -242,6 +248,7 @@ def test_chain_tree_prepared_outputs_graph(bs, depth, mrope):
             assert out[7] is None
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("bs", [1, 128])
 @pytest.mark.parametrize("steps", [1, 7])
 @pytest.mark.parametrize("mrope", [False, True])
@@ -289,6 +296,7 @@ def test_draft_cache_positions_graph(bs, steps, mrope):
             )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("bs", [0, 1, 7, 128, 257])
 @pytest.mark.parametrize("width", [1, 4, 7])
 @pytest.mark.parametrize("interval", [0, 16, 512])
@@ -333,6 +341,7 @@ def test_combined_verify_commit_metadata(bs, width, interval):
             assert tracking is None
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize(
     "operation",
     ["cache", "commit", "commit_basic", "inputs", "lengths", "layout", "tree"],

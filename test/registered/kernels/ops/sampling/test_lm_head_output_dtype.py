@@ -23,6 +23,7 @@ class TestLMHeadOutputDtype(CustomTestCase):
         self.addCleanup(reset_context)
         publish(ServerArgs(model_path="dummy"), role="test")
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_bf16_output_rounding_changes_greedy_winner(self):
         """BF16 output ties scores that are distinct with the same BF16 operands."""
         head = nn.Linear(2, 2, bias=False, device="cuda", dtype=torch.bfloat16)

@@ -7,9 +7,6 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=4, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 register_amd_ci(est_time=4, stage="jit-kernel-unit", runner_config="amd")
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="Test requires CUDA"
-)
 
 DEVICE = "cuda"
 
@@ -18,6 +15,7 @@ def reference_sigmoid_gate_mul(x, gate):
     return x * torch.sigmoid(gate)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize(
     "shape",
@@ -45,6 +43,7 @@ def test_sigmoid_gate_mul_correctness(shape, dtype):
     torch.testing.assert_close(out, ref, rtol=rtol, atol=atol)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("shape", [(4, 4096), (1, 128)])
 def test_sigmoid_gate_mul_does_not_modify_inputs(shape):
     from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
@@ -61,6 +60,7 @@ def test_sigmoid_gate_mul_does_not_modify_inputs(shape):
     torch.testing.assert_close(gate, gate_orig, rtol=0, atol=0)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_sigmoid_gate_mul_output_dtype():
     from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
 
@@ -71,6 +71,7 @@ def test_sigmoid_gate_mul_output_dtype():
         assert out.dtype == dtype, f"Expected {dtype}, got {out.dtype}"
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_sigmoid_gate_mul_contiguous_output():
     from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
 

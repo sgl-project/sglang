@@ -5,6 +5,10 @@ import sys
 import pytest
 import torch
 
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
+
 from sglang.kernels.ops.attention.minimax_sparse.common.nvfp4 import Nvfp4Cache
 from sglang.kernels.ops.attention.minimax_sparse.decode import (
     verify_topk_idx as verify_module,

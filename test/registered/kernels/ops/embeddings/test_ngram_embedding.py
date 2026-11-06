@@ -11,9 +11,6 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 register_amd_ci(est_time=8, stage="jit-kernel-unit", runner_config="amd")
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="Test requires CUDA"
-)
 
 
 def _make_ngram_params(ne_n: int, ne_k: int, vocab_size: int):
@@ -58,6 +55,7 @@ def _reference_n_gram_ids(
     return torch.tensor(ids, dtype=torch.int32)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("batch_size", [1, 17, 128])
 def test_update_table_and_compute_n_gram_ids_match_reference(batch_size: int) -> None:
     ne_n = 8

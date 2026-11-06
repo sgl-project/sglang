@@ -11,10 +11,6 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 register_amd_ci(est_time=60, suite="nightly-amd-kernel-1-gpu", nightly=True)
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="Test requires CUDA"
-)
-
 
 DEVICE = "cuda"
 
@@ -47,6 +43,7 @@ def _ref(k_nope, k_pe, v, k_scale_inv, v_scale_inv, fp8_dtype):
     return k_fp8, v_fp8
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("shape", SHAPES)
 @pytest.mark.parametrize("num_heads", NUM_HEADS)
@@ -72,6 +69,7 @@ def test_correctness(dtype, shape, num_heads, batch_size):
     torch.testing.assert_close(v_fp8.float(), v_ref.float(), rtol=1e-2, atol=0.5)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_strided_inputs(dtype):
     s, h = 16, 32
@@ -92,6 +90,7 @@ def test_strided_inputs(dtype):
     torch.testing.assert_close(v_fp8.float(), v_ref.float(), rtol=1e-2, atol=0.5)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_kpe_2d_accepted():
     s, h = 8, 16
     qk_nope, qk_rope, v_head = 128, 64, 128

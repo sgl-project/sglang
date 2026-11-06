@@ -24,9 +24,7 @@ from sglang.test.kernels.kv_canary._invariants import PlanInvariants
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 register_amd_ci(est_time=30, stage="jit-kernel-unit", runner_config="amd")
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="Test requires CUDA"
-)
+
 
 _DEVICE = torch.device("cuda")
 
@@ -114,6 +112,9 @@ def _run_label(
 
 
 class TestBasicShape:
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="Triton kernel requires CUDA"
+    )
     def test_single_req_extend_basic(self) -> None:
         """bs=1, prefix=0, extend=5 → verify entries empty; write_offsets[0:2] = [0, 5]; seed = -1."""
         # Step 1: build a one-req batch with no prefix and 5 extend tokens.
@@ -138,6 +139,9 @@ class TestBasicShape:
         assert int(triton_w.write_offsets[1].item()) == 5
         assert int(triton_w.write_seed_slot_indices[0].item()) == -1
 
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="Triton kernel requires CUDA"
+    )
     def test_single_req_decode(self) -> None:
         """extend=1, prefix=K → write_seed_slot = req_to_token[rp, K-1]; verify covers all K prefix tokens."""
         max_seq_len = 16
@@ -159,6 +163,9 @@ class TestBasicShape:
         assert int(triton_v.verify_num_valid[0].item()) == 7
         assert int(triton_w.write_seed_slot_indices[0].item()) == 2 * max_seq_len + 6
 
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="Triton kernel requires CUDA"
+    )
     def test_multi_req_mixed_extend_decode(self) -> None:
         """bs=3 mixed extend/decode → write_offsets cumsum is byte-equal across Triton + ref."""
         req_to_token = make_req_to_token(
@@ -185,6 +192,9 @@ class TestBasicShape:
 
 
 class TestSeedSlot:
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="Triton kernel requires CUDA"
+    )
     def test_prefix_zero_seed_is_minus_one(self) -> None:
         """prefix=0 → seed_slot_idx = -1 (no predecessor to anchor on)."""
         req_to_token = make_req_to_token(
@@ -202,6 +212,9 @@ class TestSeedSlot:
 
         assert int(plans[0][1].write_seed_slot_indices[0].item()) == -1
 
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="Triton kernel requires CUDA"
+    )
     def test_prev_slot_minus_one_at_chain_head(self) -> None:
         """pos=0 entry → verify_prev_slot_indices == -1 (chain head)."""
         req_to_token = make_req_to_token(
@@ -220,6 +233,9 @@ class TestSeedSlot:
         # First entry has pos=0 → prev_slot = -1.
         assert int(plans[0][0].verify_prev_slot_indices[0].item()) == -1
 
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="Triton kernel requires CUDA"
+    )
     def test_prev_slot_is_self_minus_one(self) -> None:
         """pos>0 entry → prev = req_to_token[rp, pos-1] (SWA-translated when SWA enabled)."""
         max_seq_len = 16
@@ -242,6 +258,9 @@ class TestSeedSlot:
         # entry[2] is pos=2: prev_slot = req_to_token[2, 1] = 2 * max_seq_len + 1 = 33.
         assert int(triton_v.verify_prev_slot_indices[2].item()) == 2 * max_seq_len + 1
 
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="Triton kernel requires CUDA"
+    )
     def test_seed_translated_through_permuted_lut(self) -> None:
         """Permuted LUT: seed slot is the LUT-lookup of req_to_token[rp, prefix-1], NOT identity."""
         rng = random.Random(42)
@@ -288,6 +307,9 @@ class TestSeedSlot:
                 f"[{label}] permuted-LUT seed expected {expected_seed} got {actual_seed}"
             )
 
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="Triton kernel requires CUDA"
+    )
     def test_swa_window_head_prev_slot_is_real_predecessor(self) -> None:
         """SWA window with non-zero window_start: head entry's prev_slot != -1; it is the real predecessor."""
         rng = random.Random(13)
@@ -338,6 +360,9 @@ class TestSeedSlot:
 
 
 class TestPadding:
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="Triton kernel requires CUDA"
+    )
     def test_padding_rows_contribute_zero(self) -> None:
         """``req_pool_indices[r] == 0`` rows → no verify entry, no write entry, seed = -1."""
         req_to_token = make_req_to_token(
@@ -364,6 +389,9 @@ class TestPadding:
         # Padding row's seed must be -1.
         assert int(triton_w.write_seed_slot_indices[1].item()) == -1
 
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="Triton kernel requires CUDA"
+    )
     def test_per_req_slot_when_req_to_token_is_sparse(self) -> None:
         """sparse_permuted rtt: verify_slot_indices read directly from the constructed table."""
         rng = random.Random(7)
@@ -410,6 +438,9 @@ class TestPadding:
                 f"[{label}] sparse-rtt slots expected {expected_slots} got {actual_slots}"
             )
 
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="Triton kernel requires CUDA"
+    )
     def test_padding_row_with_garbage_prefix_does_not_oob(self) -> None:
         """rpi==0 padding row with absurd prefix_lens must not OOB-read req_to_token (row is skipped)."""
         req_pool_indices = _tensor([1, 0, 2])
@@ -455,6 +486,9 @@ class TestPadding:
 
 
 class TestSwa:
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="Triton kernel requires CUDA"
+    )
     def test_swa_window_clip_prefix_less_than_window(self) -> None:
         """SWA: prefix=3 < window=128 → window_start=0, verify covers 3 entries (no clip)."""
         req_to_token = make_req_to_token(
@@ -477,6 +511,9 @@ class TestSwa:
 
         assert int(plans[0][0].verify_num_valid[0].item()) == 3
 
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="Triton kernel requires CUDA"
+    )
     def test_swa_window_clip_prefix_gt_window(self) -> None:
         """SWA: prefix=200 > window=128 → window_start=72, verify covers 128 entries."""
         req_to_token = make_req_to_token(
@@ -501,6 +538,9 @@ class TestSwa:
         # First verify entry should be at position 72.
         assert int(triton_v.verify_expected_positions[0].item()) == 72
 
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="Triton kernel requires CUDA"
+    )
     def test_swa_lut_translates_verify_slots(self) -> None:
         """FULL slot → SWA slot translation is performed inside the plan kernel for verify_slot_indices."""
         max_seq_len = 16
@@ -531,6 +571,9 @@ class TestSwa:
         assert int(triton_v.verify_slot_indices[1].item()) == 1 * max_seq_len + 1 + 100
         assert int(triton_v.verify_slot_indices[2].item()) == 1 * max_seq_len + 2 + 100
 
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="Triton kernel requires CUDA"
+    )
     def test_swa_lut_translates_seed_slot(self) -> None:
         """write_seed_slot_indices is also SWA-translated inside the plan kernel."""
         max_seq_len = 16
@@ -559,6 +602,9 @@ class TestSwa:
             int(triton_w.write_seed_slot_indices[0].item()) == 1 * max_seq_len + 2 + 100
         )
 
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="Triton kernel requires CUDA"
+    )
     def test_verify_covers_all_tokens_in_swa_window(self) -> None:
         """SWA group with window=128 + bs=4 → verify_num_valid == Σ min(prefix_lens[r], 128)."""
         window = 128
@@ -586,6 +632,9 @@ class TestSwa:
 
 
 class TestNoExtras:
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="Triton kernel requires CUDA"
+    )
     def test_plan_num_valid_counts_only_per_req_entries(self) -> None:
         """Sweep extras are written directly into VerifyPlan; plan kernel does not append them."""
         req_to_token = make_req_to_token(
@@ -604,6 +653,9 @@ class TestNoExtras:
         triton_v = plans[0][0]
         assert int(triton_v.verify_num_valid[0].item()) == 3
 
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="Triton kernel requires CUDA"
+    )
     def test_zero_prefix_has_no_verify_entries(self) -> None:
         req_to_token = make_req_to_token(
             kind="linear", max_reqs=4, max_seq_len=16, device=_DEVICE
@@ -620,6 +672,9 @@ class TestNoExtras:
 
         assert int(plans[0][0].verify_num_valid[0].item()) == 0
 
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="Triton kernel requires CUDA"
+    )
     def test_verify_capacity_just_fits_per_req_entries(self) -> None:
         rp = 1
         prefix = 4
@@ -655,6 +710,9 @@ class TestNoExtras:
             assert n == total_verify, f"[{label}] num_valid {n}"
             assert int(v_plan.enable[0].item()) == 1
 
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="Triton kernel requires CUDA"
+    )
     def test_verify_capacity_undershoot_by_one(self) -> None:
         rp = 1
         prefix = 3
@@ -706,6 +764,9 @@ class TestNoExtras:
 
 
 class TestMisc:
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="Triton kernel requires CUDA"
+    )
     def test_zero_extend_writes_empty_write_plan(self) -> None:
         """``extend_seq_lens`` all zero → write offsets stay zero; VerifyPlan still populated."""
         req_to_token = make_req_to_token(
@@ -732,6 +793,9 @@ class TestMisc:
         assert int(triton_w.write_seed_slot_indices[0].item()) == -1
         assert int(triton_w.write_seed_slot_indices[1].item()) == -1
 
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="Triton kernel requires CUDA"
+    )
     def test_replay_same_inputs_yields_same_outputs(self) -> None:
         """Two consecutive runs on identical inputs produce byte-equal plans (kernel is pure)."""
         req_pool_indices = _tensor([1, 2, 3])
@@ -788,6 +852,9 @@ class TestMisc:
                 run1_w.write_num_valid_reqs, run2_w.write_num_valid_reqs
             ), label
 
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="Triton kernel requires CUDA"
+    )
     def test_shrink_bs_clears_stale_write_offsets(self) -> None:
         """Reusing a WritePlan with smaller bs: write_offsets beyond new bs must be zeroed by the kernel."""
         rtt = make_req_to_token(
@@ -856,6 +923,9 @@ class TestMisc:
 
 
 class TestVerifyContent:
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="Triton kernel requires CUDA"
+    )
     def test_verify_num_valid_aggregate(self) -> None:
         """``verify_num_valid == sum(per-req verify_count)``."""
         req_to_token = make_req_to_token(
@@ -873,6 +943,9 @@ class TestVerifyContent:
 
         assert int(plans[0][0].verify_num_valid[0].item()) == 11
 
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="Triton kernel requires CUDA"
+    )
     def test_verify_covers_all_tokens_no_skip(self) -> None:
         """FULL group + bs=4 → verify_num_valid == Σ(prefix_lens) — every prefix token verified."""
         # Step: 4 reqs with mixed prefix and extend; FULL group means no SWA window clip.
@@ -893,6 +966,9 @@ class TestVerifyContent:
 
         assert int(plans[0][0].verify_num_valid[0].item()) == sum(prefix_values)
 
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="Triton kernel requires CUDA"
+    )
     def test_plan_verify_expected_positions_strictly_increment_per_req(self) -> None:
         """Per req, verify_expected_positions[verify_offsets[r]:verify_offsets[r+1]] == [window_start..prefix-1]."""
         req_to_token = make_req_to_token(
@@ -915,6 +991,9 @@ class TestVerifyContent:
         assert req0_positions == [0, 1, 2, 3, 4]
         assert req1_positions == [0, 1, 2, 3, 4, 5, 6, 7]
 
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="Triton kernel requires CUDA"
+    )
     def test_write_num_valid_reqs_excludes_padding(self) -> None:
         """Padding rows (rpi == 0) contribute zero to write_offsets so the write kernel does no work for them, but they ARE included in write_num_valid_reqs, which equals bs (the full batch size including padding)."""
         req_to_token = make_req_to_token(
@@ -939,6 +1018,9 @@ class TestVerifyContent:
 
 
 class TestByteEqual:
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="Triton kernel requires CUDA"
+    )
     def test_byte_equal_python_reference(self) -> None:
         """End-to-end Triton vs Python ref byte-equal across a representative bs=4 case (no SWA)."""
         req_to_token = make_req_to_token(
@@ -954,6 +1036,9 @@ class TestByteEqual:
             extras=empty_extras(),
         )
 
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="Triton kernel requires CUDA"
+    )
     def test_byte_equal_python_reference_hardcoded(self) -> None:
         """bs=3, three prefix combinations → hand-computed verify_offsets / write_offsets / seed slots."""
         # Step 1: pin (prefix, extend) per req.
@@ -998,6 +1083,9 @@ class TestByteEqual:
 
 
 class TestBoundarySweep:
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="Triton kernel requires CUDA"
+    )
     @pytest.mark.parametrize("bs", [1, 31, 32, 33, 128])
     def test_bs_boundary_byte_equal_sweep(self, bs: int) -> None:
         """Sweep bs boundary values around Triton block boundaries; assert Triton vs ref byte-equal."""
@@ -1022,6 +1110,9 @@ class TestBoundarySweep:
             extras=empty_extras(),
         )
 
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="Triton kernel requires CUDA"
+    )
     @pytest.mark.parametrize("prefix_val", [0, 1, 127, 128, 129, 4096])
     def test_prefix_lens_boundary_byte_equal_sweep(self, prefix_val: int) -> None:
         """Sweep prefix_lens boundary values; assert Triton vs ref byte-equal."""
@@ -1042,6 +1133,9 @@ class TestBoundarySweep:
             extras=empty_extras(),
         )
 
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="Triton kernel requires CUDA"
+    )
     @pytest.mark.parametrize("extend_val", [1, 128, 4096])
     def test_extend_seq_lens_boundary_byte_equal_sweep(self, extend_val: int) -> None:
         """Sweep extend_seq_lens boundary values; assert Triton vs ref byte-equal."""
@@ -1130,6 +1224,9 @@ class TestExpectedTokenPool:
     def _expected(values: list[int]) -> torch.Tensor:
         return torch.tensor(values, dtype=torch.int64, device=_DEVICE)
 
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="Triton kernel requires CUDA"
+    )
     def test_pool_disabled_writes_minus_one_sentinel(self) -> None:
         """pool=None default path: every verify entry's expected_token slot is -1."""
         got = self._run(
@@ -1140,6 +1237,9 @@ class TestExpectedTokenPool:
         assert got.shape[0] == 8
         assert torch.equal(got, self._expected([-1] * 8))
 
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="Triton kernel requires CUDA"
+    )
     def test_pool_enabled_target_offset_0_byte_equal(self) -> None:
         """offset=0 (target pool): expected_token[i] == pool[rp, position[i]]."""
         got = self._run(
@@ -1157,6 +1257,9 @@ class TestExpectedTokenPool:
             ),
         )
 
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="Triton kernel requires CUDA"
+    )
     def test_pool_enabled_eagle_offset_plus_1_byte_equal(self) -> None:
         """offset=+1 (EAGLE draft): expected_token[i] == pool[rp, position[i] + 1]."""
         got = self._run(
@@ -1175,6 +1278,9 @@ class TestExpectedTokenPool:
             ),
         )
 
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="Triton kernel requires CUDA"
+    )
     def test_pool_oob_above_size0_writes_sentinel(self) -> None:
         """positions whose ``position + offset`` exceed pool_max_context_len get -1; in-range slots stay correct."""
         pool_cols = 4
@@ -1191,6 +1297,9 @@ class TestExpectedTokenPool:
             self._expected([1000 + pos if pos < pool_cols else -1 for pos in range(6)]),
         )
 
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="Triton kernel requires CUDA"
+    )
     def test_pool_oob_offset_plus_1_byte_equal_triggers_sentinel(self) -> None:
         """offset=+1 path that pushes the last entry past pool cols still byte-equals the ref (sentinel scatter)."""
         pool_cols = 4
@@ -1269,6 +1378,9 @@ class TestExpectedTokenPoolValidLens:
     def _expected(values: list[int]) -> torch.Tensor:
         return torch.tensor(values, dtype=torch.int64, device=_DEVICE)
 
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="Triton kernel requires CUDA"
+    )
     def test_valid_lens_boundary_emits_sentinel_at_limit(self) -> None:
         """sot_pos == valid_lens[r] is OUT of range; the kernel must emit -1 even though the pool has a real value at that slot."""
         got = self._run(
@@ -1278,6 +1390,9 @@ class TestExpectedTokenPoolValidLens:
         )
         assert torch.equal(got, self._expected([1000, 1001, -1]))
 
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="Triton kernel requires CUDA"
+    )
     def test_valid_lens_within_limit_reads_pool(self) -> None:
         """sot_pos == valid_lens[r] - 1 is IN range; the kernel must gather the pool value, not -1."""
         got = self._run(
@@ -1287,6 +1402,9 @@ class TestExpectedTokenPoolValidLens:
         )
         assert torch.equal(got, self._expected([1000, 1001, 1002]))
 
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="Triton kernel requires CUDA"
+    )
     def test_valid_lens_mixed_across_reqs(self) -> None:
         """Per-req different valid_lens in one batch: each req's gather is bounded by its own lens, not the batch max."""
         got = self._run(
@@ -1296,6 +1414,9 @@ class TestExpectedTokenPoolValidLens:
         )
         assert torch.equal(got, self._expected([1000, 1001, -1, 2000, 2001, 2002]))
 
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="Triton kernel requires CUDA"
+    )
     def test_valid_lens_zero_emits_all_sentinel_for_that_req(self) -> None:
         """valid_lens[r] == 0 disables every gather for req r regardless of pool content."""
         got = self._run(
@@ -1305,6 +1426,9 @@ class TestExpectedTokenPoolValidLens:
         )
         assert torch.equal(got, self._expected([-1, -1, -1]))
 
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="Triton kernel requires CUDA"
+    )
     def test_valid_lens_masks_stale_pool_data_above_bound(self) -> None:
         """Pool has realistic-looking values past valid_lens (the recycled-slot motivation): kernel still emits -1 for them."""
         # Positions 2..15 carry a longer previous owner's leftover token; the bound must hide them.
@@ -1319,6 +1443,9 @@ class TestExpectedTokenPoolValidLens:
         )
         assert torch.equal(got, self._expected([1000, 1001, -1, -1, -1]))
 
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="Triton kernel requires CUDA"
+    )
     def test_valid_lens_with_offset_plus_1_bounds_after_shift(self) -> None:
         """``sot_pos = position + offset`` is compared against valid_lens; the offset shifts before the bound check."""
         # sot_pos for positions 0,1,2 is 1,2,3. valid_lens=2 → only sot_pos=1 reads pool.
@@ -1330,6 +1457,9 @@ class TestExpectedTokenPoolValidLens:
         )
         assert torch.equal(got, self._expected([1001, -1, -1]))
 
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="Triton kernel requires CUDA"
+    )
     def test_valid_lens_applies_under_swa_window(self) -> None:
         """SWA-windowed verify entries are bounded by valid_lens the same way as the FULL pool path."""
         # prefix=5, swa_window=3 → entries cover positions 2,3,4. valid_lens=4 admits pos 2,3 only.
@@ -1346,6 +1476,9 @@ class TestExpectedTokenPoolValidLens:
         )
         assert torch.equal(got, self._expected([1002, 1003, -1]))
 
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="Triton kernel requires CUDA"
+    )
     def test_pool_set_but_valid_lens_missing_raises(self) -> None:
         """One-way contract: passing the pool without per-req valid_lens is rejected at the Python wrapper."""
         triton_v, triton_w = _plan_pair(verify_capacity=64, write_req_capacity=4)[0]

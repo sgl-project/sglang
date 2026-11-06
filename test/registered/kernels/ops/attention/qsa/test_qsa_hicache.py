@@ -107,6 +107,7 @@ def compressed_slots(indices):
     return indices[::RATIO] // RATIO
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize(
     "pools",
     [
@@ -171,6 +172,7 @@ def test_qsa_host_roundtrip_and_consumer_fence(pools):
     assert host.size_per_token * PAGE == sum(x[0].nbytes for x in host.device_buffers)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("pools", [("page_first_direct", "direct")], indirect=True)
 def test_qsa_file_restart_and_missing_sidecar(pools):
     device, anchor, host, backend = pools
@@ -226,6 +228,7 @@ def test_qsa_file_restart_and_missing_sidecar(pools):
         assert sizes == [host.get_data_page(0).nbytes] * len(keys)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("pools", [("page_first_direct", "direct")], indirect=True)
 def test_packed_mtp_indexer_roundtrip(pools):
     device, anchor, _, backend = pools

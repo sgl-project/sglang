@@ -11,10 +11,6 @@ from sglang.test.ci.ci_register import register_cuda_ci
 register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-large")
 register_cuda_ci(est_time=15, stage="base-b", runner_config="4-gpu-b200")
 
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="Test requires CUDA"
-)
-
 
 @pytest.fixture
 def stated_tp_group():
@@ -423,6 +419,7 @@ def test_hopper_mhc_stats_stream_graph(num_tokens):
             torch.testing.assert_close(result, reference, rtol=0, atol=0)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_mhc_refresh_without_deepgemm_prenorm():
     from unittest.mock import patch
 

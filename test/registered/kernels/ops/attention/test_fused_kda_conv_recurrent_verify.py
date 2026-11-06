@@ -257,11 +257,13 @@ def _compare_case(case, num_warps=None, use_ring=False, weight_dtype=torch.bfloa
         )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("case", _CASES)
 def test_matches_unfused_reference(case):
     _compare_case(case, num_warps=4)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("case_index", [8, 9])
 def test_glm_fp32_weights_match_unfused_reference(case_index):
     _compare_case(_CASES[case_index], weight_dtype=torch.float32)
@@ -283,6 +285,7 @@ def test_glm_fp32_weights_bit_exact_on_rocm(case_index):
     assert torch.equal(ic_fus[valid], ic_ref[valid])
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_output_does_not_depend_on_cta_scheduling():
     """The verify output must not change with how the CTAs happen to be
     scheduled. H=1 with HV=16 shares one Q/K history across 16 V tiles."""
@@ -305,6 +308,7 @@ def test_output_does_not_depend_on_cta_scheduling():
     assert torch.equal(full, squeezed)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("case", _RING_CASES)
 def test_replayssm_ring_matches_unfused(case):
     _compare_case(case, num_warps=4, use_ring=True)

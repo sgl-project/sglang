@@ -15,6 +15,7 @@ register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="4-gpu-b
 
 
 class TestCandidateTableBoundary(CustomTestCase):
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_speculative_context_boundary(self):
         torch.manual_seed(0)
         page_size = 128

@@ -8,9 +8,6 @@ from sglang.srt.models.utils import fused_qk_gemma_rmsnorm_with_gate
 from sglang.test.ci.ci_register import register_amd_ci
 
 register_amd_ci(est_time=20, stage="jit-kernel-unit", runner_config="amd")
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="Test requires CUDA"
-)
 
 
 def reference_qk_gemma_rmsnorm_with_gate(
@@ -54,6 +51,7 @@ NUM_KV_HEADS_LIST = [2, 4, 8]
 HEAD_DIM_LIST = [64, 128]
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize(
     "seq_len,num_heads,num_kv_heads,head_dim",
     list(itertools.product(SEQ_LENS, NUM_HEADS_LIST, NUM_KV_HEADS_LIST, HEAD_DIM_LIST)),
@@ -93,6 +91,7 @@ def test_fused_qk_gemma_rmsnorm_with_gate(
     torch.testing.assert_close(gate_out, gate_ref, atol=0, rtol=0)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("head_dim", [64, 128, 256])
 def test_gate_is_exact_copy(head_dim: int):
     """Gate output must be a bitwise-exact copy of the input gate data."""
@@ -121,6 +120,7 @@ def test_gate_is_exact_copy(head_dim: int):
     assert torch.equal(gate_out, gate_expected), "Gate must be bitwise exact"
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("seq_len", [1, 8])
 def test_contiguous_k_also_works(seq_len: int):
     """Kernel should work even when k is already contiguous."""

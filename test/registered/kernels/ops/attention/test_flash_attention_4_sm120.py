@@ -2,6 +2,13 @@
 
 import math
 
+import pytest
+import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
+
 import cutlass.cute as cute
 import pytest
 import torch

@@ -174,6 +174,7 @@ class TestKDAFusedVerifyBackend(CustomTestCase):
             for layer, (mixed, a, b) in zip(layers, inputs)
         ]
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_verify_commit_verify(self):
         # B=1 exercises the enabled path. Platform override makes the dispatch
         # testable on any CUDA CI runner; it does not replace a GPU kernel.
@@ -261,6 +262,7 @@ class TestKDAFusedVerifyBackend(CustomTestCase):
                     torch.testing.assert_close(actual, expected, **_OUTPUT_TOL)
                 self.assertEqual(fused._fused_chain_verify_fn.call_count, 4)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_ring_dispatch_falls_back(self):
         # B=2 and the measured regression sizes on the enabled architectures,
         # plus B=1 on an architecture without ring measurements.
@@ -302,6 +304,7 @@ class TestKDAFusedVerifyBackend(CustomTestCase):
                         getattr(state, name), getattr(ref_state, name), rtol=0, atol=0
                     )
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_snapshot_dispatch_is_unchanged(self):
         for platform in (
             {"is_sm90": True, "is_sm100": False},

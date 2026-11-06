@@ -18,9 +18,7 @@ register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-l
 # Nightly is not redundant here: it sets SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1 to expand get_ci_test_range sweeps.
 register_cuda_ci(est_time=20, stage="nightly", runner_config="1-gpu-large")
 register_amd_ci(est_time=20, stage="jit-kernel-unit", runner_config="amd")
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="Test requires CUDA"
-)
+
 
 OPS = SUPPORTED_ACTIVATIONS
 DTYPES = [torch.float16, torch.bfloat16, torch.float32]
@@ -62,6 +60,7 @@ def _tolerances(dtype: torch.dtype) -> tuple[float, float]:
     return 1e-2, 1e-2
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("op_name", OPS)
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("shape", SHAPES)
@@ -75,6 +74,7 @@ def test_activation_correctness(
     torch.testing.assert_close(out, expected, atol=atol, rtol=rtol)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("op_name", OPS)
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("shape", SHAPES)
@@ -97,6 +97,7 @@ FILTER_SHAPES = get_ci_test_range(
 EXPERT_STEPS = [1, 16]
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("op_name", OPS)
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("shape", FILTER_SHAPES)
@@ -142,6 +143,7 @@ def test_activation_filter_expert(
         )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("op_name", OPS)
 def test_activation_filter_expert_all_skipped(op_name: str) -> None:
     """If every expert id is -1, the output must be left entirely untouched."""
@@ -158,6 +160,7 @@ def test_activation_filter_expert_all_skipped(op_name: str) -> None:
     assert torch.isnan(out).all()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("op_name", OPS)
 def test_activation_filter_expert_none_skipped(op_name: str) -> None:
     """No -1 in expert_ids must yield bit-identical output to the unfiltered path."""
@@ -170,6 +173,7 @@ def test_activation_filter_expert_none_skipped(op_name: str) -> None:
     torch.testing.assert_close(out_filtered, out_unfiltered, atol=0.0, rtol=0.0)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("op_name", OPS)
 @pytest.mark.parametrize("block_m", [16, 64])
 def test_activation_sorted_rows(op_name: str, block_m: int) -> None:
@@ -207,6 +211,7 @@ def test_activation_sorted_rows(op_name: str, block_m: int) -> None:
     assert torch.isnan(out[~kept]).all()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_activation_filter_expert_int64_under_torch_compile() -> None:
     """torch.topk routing ids remain usable after AOTAutograd realizes int64."""
     shape = (32, 512)
@@ -251,6 +256,7 @@ UNARY_SHAPES = get_ci_test_range(
 )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("shape", UNARY_SHAPES)
 def test_relu2_correctness(dtype: torch.dtype, shape: tuple[int, ...]) -> None:
@@ -261,6 +267,7 @@ def test_relu2_correctness(dtype: torch.dtype, shape: tuple[int, ...]) -> None:
     torch.testing.assert_close(out, expected, atol=atol, rtol=rtol)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("shape", UNARY_SHAPES)
 def test_relu2_out_param(dtype: torch.dtype, shape: tuple[int, ...]) -> None:
@@ -273,6 +280,7 @@ def test_relu2_out_param(dtype: torch.dtype, shape: tuple[int, ...]) -> None:
     torch.testing.assert_close(out, expected, atol=atol, rtol=rtol)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_relu2_negative_inputs_zeroed() -> None:
     """All-negative input must produce an all-zero output."""
     x = -torch.rand((64, 512), dtype=torch.bfloat16, device="cuda") - 1e-3
@@ -310,6 +318,7 @@ def test_rounded_silu_clamp_graph(dtype, limit):
     torch.testing.assert_close(actual, reference(), rtol=0, atol=0, equal_nan=True)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_swiglu_oai_split_is_the_marlin_gpt_oss_activation() -> None:
     """Marlin's GPT-OSS-style activation, gate * sigmoid(alpha * gate) * (up + 1)
     with gate clamped above and up clamped both ways, runs through

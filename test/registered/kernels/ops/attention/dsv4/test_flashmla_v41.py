@@ -4,7 +4,12 @@ adds around them (precomputed metadata, reuse across layers, CUDA graphs)."""
 
 import unittest
 
+import pytest
 import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
 
 from sglang.kernels.ops.attention import flash_mla_interface
 from sglang.kernels.ops.attention.flash_mla_interface import SPLIT_KV_MIN_TOPK

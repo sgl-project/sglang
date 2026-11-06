@@ -20,6 +20,7 @@ def _cos_sin_cache():
     return torch.cat([freqs.cos(), freqs.sin()], dim=-1)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("num_tokens", [1, 17, 700])
 @pytest.mark.parametrize("rope", [False, True])
 @pytest.mark.parametrize("cache_dtype", [None, torch.bfloat16, torch.float8_e4m3fn])

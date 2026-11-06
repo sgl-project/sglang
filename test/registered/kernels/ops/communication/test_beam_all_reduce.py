@@ -132,6 +132,7 @@ class TestBeamAllReduce(CustomTestCase):
             reduced,
         )
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_rounding_graph_replay_and_interleaved_collectives(self):
         if dist.get_world_size() == 8:
             # Both TP8 launch shapes (5-CTA clusters and one CTA per row) must run.

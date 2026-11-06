@@ -88,6 +88,7 @@ def _inputs(rows: int, seed: int):
     return residual, gamma
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("rows", PLAIN_ROWS)
 def test_all_reduce_residual_norm(rows: int):
     coord = _init()
@@ -105,6 +106,7 @@ def test_all_reduce_residual_norm(rows: int):
     _check(normed, residual_out, partial, residual, gamma)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("rows", FINALIZE_ROWS)
 def test_moe_finalize_all_reduce_residual_norm(rows: int):
     coord = _init()

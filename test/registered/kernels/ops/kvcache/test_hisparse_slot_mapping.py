@@ -13,6 +13,7 @@ register_amd_ci(est_time=20, stage="jit-kernel-unit", runner_config="amd")
 
 
 class TestHiSparseSlotMapping(CustomTestCase):
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_accepts_weak_mapping_used_by_pool(self):
         from sglang.kernels.ops.kvcache.hisparse_slot_mapping import (
             translate_padded_hisparse_locations as translate,
@@ -25,6 +26,7 @@ class TestHiSparseSlotMapping(CustomTestCase):
 
         torch.testing.assert_close(actual, torch.tensor([117, -1, 118], device="cuda"))
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_fused_slot_mapping_matches_padded_gather(self):
         from sglang.kernels.ops.kvcache.hisparse_slot_mapping import (
             translate_padded_hisparse_locations as translate,

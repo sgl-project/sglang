@@ -16,6 +16,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
+
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.kernels.ops.attention.sparse_mla_q8kv8_prefill_sm90 import (
     cast_q_fp8_for_q8kv8_prefill,
@@ -464,6 +468,7 @@ def _patched_sparse_kernels(
             sys.modules[q8_module_name] = old_q8_module
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
 @pytest.mark.parametrize("compress_ratio", [0, 4, 128])
 def test_q8kv8_sparse_prefill_helper_builds_fp8_workspace_matching_bf16_path(
@@ -626,6 +631,7 @@ def test_q8kv8_sparse_prefill_rejects_invalid_topk_length_bounds(
         sparse_mla_q8kv8_prefill_fwd(**args)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.skipif(
     not _sm90_available(), reason="Q8KV8 sparse prefill requires SM90 CUDA"
 )
@@ -720,6 +726,7 @@ def test_q8kv8_sparse_prefill_real_kernel_repeated_launch_stable():
             )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
 @pytest.mark.parametrize("ratio", [0, 1, 2, 4, 128])
 @pytest.mark.parametrize("scenario", ["first", "next", "replay", "tail", "large"])
@@ -861,6 +868,7 @@ def test_request_window_sparse_prefill_matches_paged_attention(ratio, scenario):
     torch.testing.assert_close(actual, expected.squeeze(1), atol=2e-2, rtol=2e-2)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.skipif(not _sm90_available(), reason="native H16 prefill requires SM90")
 @pytest.mark.parametrize("compress_ratio", [4, 128])
 @torch.inference_mode()

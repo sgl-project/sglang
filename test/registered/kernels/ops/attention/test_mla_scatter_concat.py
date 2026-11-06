@@ -56,6 +56,7 @@ def _make_mla_inputs(batch_size, num_heads, seed):
 
 
 class TestMLAScatterConcat(CustomTestCase):
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_mla_scatter_concat_bf16_and_fp8(self):
         batch_size, num_heads = 64, 8
         pool, loc, k_nope, k_rope, q_nope, q_rope = _make_mla_inputs(

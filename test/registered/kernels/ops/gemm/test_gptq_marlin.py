@@ -2,6 +2,10 @@ import sys
 
 import pytest
 import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
 from sgl_kernel.scalar_type import scalar_types
 
 from sglang.kernels.ops.gemm.gptq_marlin import gptq_marlin_gemm
@@ -15,9 +19,6 @@ from sglang.test.test_marlin_utils import (
 )
 
 register_cuda_ci(est_time=13, stage="base-b-kernel-unit", runner_config="1-gpu-small")
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="Test requires CUDA"
-)
 
 MNK_FACTORS = [
     (1, 1, 1),

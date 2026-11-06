@@ -144,6 +144,7 @@ def _make_seq_lens(bs: int, max_ctx: int, seed: int = 0) -> torch.Tensor:
 # -----------------------------------------------------------------------------
 # Tests
 # -----------------------------------------------------------------------------
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("bs,max_ctx", list(itertools.product(BS_LIST, MAX_CTX_LIST)))
 def test_matches_pytorch_ref(bs: int, max_ctx: int):
     """Kernel output bit-exact vs PyTorch reference across the shape envelope."""
@@ -169,6 +170,7 @@ _KSPLITKV_BOUNDARY_LENS = [
 ]
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("seq_lens_data", _KSPLITKV_BOUNDARY_LENS)
 def test_matches_pytorch_ref_at_ksplitkv_boundary(seq_lens_data):
     """Bit-exact vs ref on hand-crafted kSplitKV=256 boundary inputs.
@@ -185,6 +187,7 @@ def test_matches_pytorch_ref_at_ksplitkv_boundary(seq_lens_data):
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("bs", BS_CORRECTNESS_FLOOR)
 @pytest.mark.parametrize("max_ctx", [8192])
 def test_byte_equal_at_correctness_floor(bs: int, max_ctx: int):
@@ -205,6 +208,7 @@ def test_byte_equal_at_correctness_floor(bs: int, max_ctx: int):
 # thread counts on some paths, so the per-target write loop must stride
 # rather than use a `tx <= num_sm` thread guard.
 # -----------------------------------------------------------------------------
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize(
     "bs,num_sm",
     [

@@ -87,6 +87,7 @@ def _expand(site, geometry, out):
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_cache_normalizes_device_and_keeps_distinct_destination_columns():
     rows = (0, 96, 192)
     same = slice_geometry(rows, 64, DEVICE)
@@ -100,6 +101,7 @@ def test_cache_normalizes_device_and_keeps_distinct_destination_columns():
     ]
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_a_captured_graph_keeps_its_tables_when_other_geometries_appear():
     offsets = (0, 96, 224, 304)
     site, expected = _site(offsets, seed=11)

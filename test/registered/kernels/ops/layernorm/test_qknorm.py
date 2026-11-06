@@ -11,9 +11,6 @@ from sglang.test.ci.ci_register import register_cuda_ci
 register_cuda_ci(est_time=37, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 # Nightly is not redundant here: it sets SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1 to expand get_ci_test_range sweeps.
 register_cuda_ci(est_time=130, stage="nightly", runner_config="1-gpu-small")
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="Test requires CUDA"
-)
 
 
 def sglang_aot_qknorm(
@@ -68,6 +65,7 @@ DTYPE = torch.bfloat16
 # so we allow a small rel/abs tolerance in correctness test.
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize(
     "batch_size,n_k,n_q,head_dim",
     list(itertools.product(BS_LIST, N_K_LIST, N_Q_LIST, HEAD_DIM_LIST)),
@@ -85,6 +83,7 @@ def test_qknorm(batch_size: int, n_k: int, n_q: int, head_dim: int) -> None:
     triton.testing.assert_close(q_k_aot[1], q_k_jit[1], atol=1e-2, rtol=1e-2)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize(
     "dtype,pad", [(torch.bfloat16, 0), (torch.float16, 0), (torch.bfloat16, 4)]
 )

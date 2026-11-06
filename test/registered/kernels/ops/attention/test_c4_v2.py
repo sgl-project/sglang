@@ -26,10 +26,6 @@ from sglang.test.kernels.deepseek_v4.common import (
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 register_amd_ci(est_time=30, suite="nightly-amd-kernel-1-gpu", nightly=True)
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="Test requires CUDA"
-)
-
 
 Context = Union[LegacyContext, PagedContext]
 
@@ -93,6 +89,7 @@ def _make_inputs(
 # -----------------------------------------------------------------------------
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("ring_size", [8, 16])
 @pytest.mark.parametrize(
     ("gpu_inputs", "use_cuda_graph"),
@@ -178,6 +175,7 @@ def test_unified_request_ring_plans_ignore_full_to_state(
     assert got_decode[0, 1] != got_decode[1, 1]
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("mode", ["legacy", "paged"])
 @pytest.mark.parametrize("seq_len", [4, 8, 32, 256, 1024])
 def test_prefill_no_context(mode: str, seq_len: int) -> None:
@@ -215,6 +213,7 @@ def test_prefill_no_context(mode: str, seq_len: int) -> None:
         )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("mode", ["legacy", "paged"])
 @pytest.mark.parametrize("prefix_len", [4, 256])
 def test_prefill_then_decode(mode: str, prefix_len: int) -> None:
@@ -266,6 +265,7 @@ def test_prefill_then_decode(mode: str, prefix_len: int) -> None:
     triton.testing.assert_close(final_out[0].cpu(), gt, atol=ATOL, rtol=RTOL)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("mode", ["legacy", "paged"])
 @pytest.mark.parametrize("prefix_len", [256, 512, 768])
 @pytest.mark.parametrize("extend_len", [4, 32])
@@ -320,6 +320,7 @@ def test_prefill_then_extend(mode: str, prefix_len: int, extend_len: int) -> Non
         )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_paged_buffer_intermediate() -> None:
     """Paged-only: after a multi-page prefill, verify the trailing 4 tokens of
     every swa_page sit in the correct state-pool slots.
@@ -371,6 +372,7 @@ def test_paged_buffer_intermediate() -> None:
             )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("mode", ["legacy", "paged"])
 def test_prefill_multibatch(mode: str) -> None:
     """Multi-batch prefill, both modes."""

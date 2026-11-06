@@ -48,6 +48,7 @@ def inputs(d, batch, hq, hk, seed, padded=False, position_dtype=torch.int64):
     return storage, x, positions, qw, kw, cache
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("d", [64, 128, 256])
 @pytest.mark.parametrize(
     "batch,hq,hk,padded,pos_dtype",
@@ -76,6 +77,7 @@ def test_cuda_sequence_is_bit_exact(d, batch, hq, hk, padded, pos_dtype):
         assert_same_bits(storage[:, -8:], before[:, -8:])
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("d,section", [(64, [16, 8, 8]), (128, [24, 20, 20])])
 @pytest.mark.parametrize("layout", ["sections", "interleaved", "interleaved_glm"])
 @pytest.mark.parametrize(
@@ -129,6 +131,7 @@ def test_bf16_mrope_matches_triton_mrope(d, section, batch, hq, hk, layout):
     assert_same_bits(x, expected)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("d", [64, 128, 256])
 @pytest.mark.parametrize("eps", [1e-6, 1e-5])
 def test_extreme_values_and_rounding(d, eps):
@@ -147,6 +150,7 @@ def test_extreme_values_and_rounding(d, eps):
     assert_same_bits(x, expected)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("d", [64, 128, 256])
 def test_inplace_repeated_large_grid(d):
     """Repeated launches catch unsynchronized reads/stores across warps."""
@@ -164,6 +168,7 @@ def test_inplace_repeated_large_grid(d):
         assert_same_bits(actual, expected)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("invalid", ["dtype", "qkv_stride", "table", "positions"])
 def test_cuda_mode_rejects_invalid_inputs(invalid):
     """Malformed typed/strided inputs must fail before raw-pointer addressing."""
@@ -180,6 +185,7 @@ def test_cuda_mode_rejects_invalid_inputs(invalid):
         table_qk_norm_rope_(x, pos, qw, kw, cache, 8, 2, 128, 1e-6, match_cuda=True)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize(
     "d,dtype,batch",
     [

@@ -2,6 +2,13 @@
 
 import unittest
 
+import pytest
+import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
+
 import sgl_kernel  # noqa: F401
 import torch
 from gguf import GGML_QUANT_SIZES, GGMLQuantizationType

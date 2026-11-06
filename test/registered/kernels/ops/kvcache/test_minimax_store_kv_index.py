@@ -19,6 +19,7 @@ dev = "cuda"
 HEAD_DIM = 128
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("num_kv_heads", [1, 4, 8])
 @pytest.mark.parametrize("has_v", [False, True])

@@ -33,9 +33,6 @@ register_cuda_ci(
     stage="extra-b",
     runner_config="8-gpu-h200",
 )
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="Test requires CUDA"
-)
 
 
 # ---------------------------------------------------------------------------
@@ -156,6 +153,7 @@ def _rmsnorm_ref(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Ten
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("batch_size", BATCH_SIZES)
 @pytest.mark.parametrize("q_k_dim", Q_K_DIMS)

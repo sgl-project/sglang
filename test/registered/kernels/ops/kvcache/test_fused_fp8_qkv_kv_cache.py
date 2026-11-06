@@ -19,6 +19,7 @@ def _bytes(t: torch.Tensor) -> torch.Tensor:
     return t.reshape(-1).view(torch.uint8)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize(
     "hq,hkv,head_dim", [(8, 1, 128), (8, 8, 128), (4, 2, 64), (64, 2, 128)]
@@ -85,6 +86,7 @@ def test_fused_fp8_qkv_kv_cache(
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize(
     "hkv,head_dim,extra", [(8, 128, 1024), (2, 64, 128), (1, 128, 32)]

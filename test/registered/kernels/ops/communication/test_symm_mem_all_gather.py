@@ -120,6 +120,7 @@ def _nccl_all_gather(x: torch.Tensor, group: dist.ProcessGroup, world_size: int)
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("skip_entry_sync", [False, True])
 @pytest.mark.parametrize("safe", [False, True])
 @pytest.mark.parametrize("hidden", TEST_HIDDEN)

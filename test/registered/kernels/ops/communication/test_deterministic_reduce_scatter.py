@@ -45,6 +45,7 @@ def group():
     ps.destroy_distributed_environment()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("use_graph", [False, True])
 def test_batch_and_destination_invariance(group, dtype, use_graph):

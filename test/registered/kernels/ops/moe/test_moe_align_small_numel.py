@@ -146,6 +146,7 @@ ALIGN_CASES = get_ci_test_range(
 )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("block_size,num_experts,topk,num_tokens", ALIGN_CASES)
 def test_matches_reference(block_size, num_experts, topk, num_tokens):
     """Exact against the oracle, plus drop-in equivalence with the CUDA path
@@ -160,6 +161,7 @@ def test_matches_reference(block_size, num_experts, topk, num_tokens):
         _assert_blockwise(got, _run_cuda(topk_ids, block_size, num_experts), block_size)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_ep_filtered_ids_map_to_expert_minus_one():
     """EP-filtered pairs (-1) collect in bucket 0, whose blocks carry -1 so
     fused_moe's filter_expert skips them."""
@@ -174,6 +176,7 @@ def test_ep_filtered_ids_map_to_expert_minus_one():
     assert -1 in ref[1].tolist(), "filtered pairs must produce an expert_id == -1 block"
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize(
     "numel", [SMALL_NUMEL_LIMIT - 1, SMALL_NUMEL_LIMIT, SMALL_NUMEL_LIMIT + 1]
 )
@@ -192,6 +195,7 @@ def test_runner_dispatch_boundary(numel):
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_runner_defers_for_ignore_invalid_expert():
     """ignore_invalid_expert is a different contract than the '+1 offset'
     convention the triton kernel implements, so the runner must keep producing

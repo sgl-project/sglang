@@ -74,6 +74,7 @@ def _run_draft(kern_inputs, topk, steps, page_size, nb, kw):
 
 
 class TestSpecKvIndicesGrid(CustomTestCase):
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_draft_grid_equivalence(self):
         torch.manual_seed(0)
         for seqs in LENSETS:
@@ -107,6 +108,7 @@ class TestSpecKvIndicesGrid(CustomTestCase):
                             self.assertTrue(torch.equal(ref[0], out[0]), key)
                             self.assertTrue(torch.equal(ref[1], out[1]), key)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_draft_reference(self):
         torch.manual_seed(1)
         seqs, steps = [100_000, 33, 4096, 16], 3
@@ -152,6 +154,7 @@ class TestSpecKvIndicesGrid(CustomTestCase):
                         (it, z, topk, page_size),
                     )
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_flat_grid_equivalence(self):
         torch.manual_seed(0)
         dev = "cuda"

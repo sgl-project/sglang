@@ -27,6 +27,7 @@ def _triton_ref(x2d, tau):
     return out
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("rows", [1, 3, 16, 200, 4096])
 @pytest.mark.parametrize("inner", [8, 256, 2048, 16384])
 @pytest.mark.parametrize("strided", [False, True])
@@ -44,6 +45,7 @@ def test_row_scale_bitexact(rows, inner, strided):
     assert torch.equal(out, ref)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_dispatch_through_apply_log_scaling_tau():
     from sglang.kernels.ops.elementwise.row_scale import apply_log_scaling_tau
 

@@ -38,6 +38,7 @@ def _packed_qkv(tokens: int, heads: int, generator: torch.Generator):
     return views
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("img_tokens,txt_tokens,heads", [(17, 7, 4), (256, 64, 8)])
 def test_flux2_qkv_epilogue_is_bit_exact(
     img_tokens: int, txt_tokens: int, heads: int
@@ -104,6 +105,7 @@ def test_flux2_qkv_epilogue_is_bit_exact(
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize(
     "guard",
     ["torch.compiler.is_compiling", "torch.cuda.is_current_stream_capturing"],

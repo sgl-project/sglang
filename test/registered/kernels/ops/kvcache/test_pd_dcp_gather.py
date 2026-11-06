@@ -15,6 +15,7 @@ register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-s
 
 
 class TestPdDcpGather(CustomTestCase):
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_gathers_strided_rows_layer_major(self):
         dim = 8
         kv0 = torch.arange(32 * dim, dtype=torch.float32, device="cuda").view(
@@ -41,6 +42,7 @@ class TestPdDcpGather(CustomTestCase):
         torch.testing.assert_close(packed0, kv0[row_indices], rtol=0, atol=0)
         torch.testing.assert_close(packed1, kv1[row_indices], rtol=0, atol=0)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_packed_tp2_pp2_to_dcp4_preserves_kv(self):
         """Packing must preserve both target rows and draft head shards across PP stages."""
         for custom_pool in (False, True):

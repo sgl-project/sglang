@@ -1,7 +1,12 @@
 import unittest
 from unittest import mock
 
+import pytest
 import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
 
 from sglang.kernels.ops.attention import kda_decode_mtp
 from sglang.kernels.ops.attention.kda_decode_mtp import fused_kda_decode_mtp_dspark

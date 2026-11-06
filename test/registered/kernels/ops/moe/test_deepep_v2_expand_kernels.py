@@ -59,24 +59,29 @@ class TestFillMIndicesFromPsum(CustomTestCase):
         self.assertEqual(m_indices.tolist(), expected)
         return m_indices
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_align_128(self):
         self._run([200, 50, 128], align=128)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_align_not_128(self):
         # The kernel this replaces silently assumed expert_alignment == 128; a
         # separate ALIGN parameter is the fix, so cover a non-128 alignment.
         self._run([100, 30, 64], align=64)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_empty_expert_segment(self):
         # An expert with count == 0 (start == seg_end) must label no rows.
         self._run([128, 0, 64], align=128)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_segments_tile_exactly(self):
         # do_cpu_sync=True => total_rows == align(psum[-1]), so the aligned
         # segments tile the array and no -1 sentinel survives.
         m_indices = self._run([200, 50, 128], align=128)
         self.assertNotIn(-1, m_indices.tolist())
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_sentinel_survives_capacity_tail(self):
         # A capacity-sized buffer leaves rows past the last segment at -1 -- the
         # defensive torch.full(-1) fill that guards the out-of-bounds weight read.
@@ -92,11 +97,13 @@ class TestScaleExpandedRows(CustomTestCase):
         scale_expanded_rows_(x, weights)
         torch.testing.assert_close(x, ref)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_contiguous(self):
         x = torch.randn(37, 128, device=DEVICE)
         weights = torch.rand(37, device=DEVICE)
         self._check(x, weights)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_transposed_view(self):
         # mul_ must update a non-contiguous (transposed) view in place.
         base = torch.randn(16, 40, device=DEVICE)
@@ -105,6 +112,7 @@ class TestScaleExpandedRows(CustomTestCase):
         weights = torch.rand(40, device=DEVICE)
         self._check(x, weights)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_rows_zero(self):
         x = torch.randn(0, 128, device=DEVICE)
         weights = torch.empty(0, device=DEVICE)
@@ -112,6 +120,7 @@ class TestScaleExpandedRows(CustomTestCase):
         scale_expanded_rows_(x, weights)
         self.assertEqual(x.shape, (0, 128))
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_rejects_non_fp32(self):
         # A bf16 x would round the weights; a packed UE8M0 scale cannot take them.
         for dtype in (torch.bfloat16, torch.int32):

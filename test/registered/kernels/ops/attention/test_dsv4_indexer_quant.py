@@ -17,6 +17,11 @@ branches introduced by the scheduling optimization.
 from __future__ import annotations
 
 import pytest
+import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
 import sgl_kernel  # noqa: F401  the ROCm path dispatches to torch.ops.sgl_kernel
 import torch
 

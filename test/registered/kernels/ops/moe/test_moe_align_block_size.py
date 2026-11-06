@@ -12,9 +12,6 @@ from sglang.test.kernels.moe_align import ceil_div, moe_align_block_size_triton
 register_cuda_ci(est_time=28, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 # Nightly is not redundant here: it sets SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1 to expand get_ci_test_range sweeps.
 register_cuda_ci(est_time=50, stage="nightly", runner_config="1-gpu-small")
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="Test requires CUDA"
-)
 
 
 MOE_ALIGN_CASES = get_ci_test_range(
@@ -37,6 +34,7 @@ MOE_ALIGN_CASES = get_ci_test_range(
 )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize(
     "block_size,num_tokens,topk,num_experts,pad_sorted_token_ids",
     MOE_ALIGN_CASES,
@@ -142,6 +140,7 @@ def test_moe_align_block_size_compare_implementations(
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize(
     "block_size,num_tokens,topk,num_experts",
     list(
@@ -235,6 +234,7 @@ def test_moe_align_block_size_v2_large_num_experts(
         )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("remainder", [1, 2, 3])
 @pytest.mark.parametrize(
     "num_experts,num_tokens",
@@ -289,6 +289,7 @@ def test_moe_align_block_size_pad_fill_stays_in_bounds(
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("write_inactive_prefix_count", [False, True])
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("num_tokens,num_experts", [(65, 4), (512, 128), (65, 1025)])
@@ -374,6 +375,7 @@ def test_moe_align_block_size_completes_expert_capacity(
         assert expected_start == used
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize(
     "rows,num_experts",
@@ -442,6 +444,7 @@ def test_moe_align_inactive_prefix_count_graph(rows, num_experts, dtype):
             offset += padded
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("route_ids", [(-1, -1, -1), (2, -1, 0), (2, 0, 1)])
 def test_moe_align_single_token_inactive_prefix_count(route_ids):
     from sglang.kernels.ops.moe.moe_align_single_token import moe_align_single_token
@@ -460,6 +463,7 @@ def test_moe_align_single_token_inactive_prefix_count(route_ids):
     assert [route_ids[i] for i in order] == sorted(route_ids)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("num_experts", [8, 65, 1025])
 @pytest.mark.parametrize("empty", [False, True])
 @pytest.mark.parametrize("write_inactive_prefix_count", [False, True])
@@ -493,6 +497,7 @@ def test_moe_align_count_publication_bounds(
     assert count_backing.cpu().tolist() == [total, prefix]
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("num_experts", [8, 129, 1500])
 @pytest.mark.parametrize("write_inactive_prefix_count", [False, True])

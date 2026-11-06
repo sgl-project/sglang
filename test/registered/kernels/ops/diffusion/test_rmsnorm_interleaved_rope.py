@@ -8,6 +8,10 @@ from unittest.mock import patch
 
 import pytest
 import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
 from flashinfer.norm import rmsnorm
 
 from sglang.kernels.ops.diffusion import (
@@ -130,6 +134,7 @@ def test_runs_on_the_current_stream():
             )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @torch.no_grad()
 def test_wan_block_fused_qk_norm_rope_is_bit_exact():
     """A Wan block gives the same bits with the q/k norm and RoPE fused or not."""

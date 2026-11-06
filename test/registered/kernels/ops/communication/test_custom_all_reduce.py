@@ -48,9 +48,6 @@ register_cuda_ci(
 )
 # Nightly is not redundant here: it sets SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1 to expand get_ci_test_range sweeps.
 register_cuda_ci(est_time=110, stage="nightly", runner_config="8-gpu-h200")
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="Test requires CUDA"
-)
 
 # ---------------------------------------------------------------------------
 # Test parameters
@@ -185,6 +182,7 @@ def _init_comm_once(max_push_blocks: int | None = None) -> CustomAllReduceV2:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("use_graph", USE_GRAPH_OPTIONS)
 @pytest.mark.parametrize("algo", TEST_ALGOS)
 @pytest.mark.parametrize("dtype", TEST_DTYPES)
@@ -199,6 +197,7 @@ def test_custom_all_reduce(
     _check_custom_all_reduce(size, dtype, algo, use_graph, _init_comm_once())
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("use_graph", USE_GRAPH_OPTIONS)
 @pytest.mark.parametrize("dtype", TEST_DTYPES)
 @pytest.mark.parametrize("nbytes", [32, 288 * 1024])
@@ -274,6 +273,7 @@ def _eager_all_reduce(comm: CustomAllReduceV2, x: torch.Tensor) -> torch.Tensor:
     return torch.stack(outs)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("dtype", TEST_DTYPES)
 @pytest.mark.parametrize("size", TEST_SIZES)
 @torch.inference_mode()
@@ -297,6 +297,7 @@ def test_custom_all_reduce_tuned_eager(size: int, dtype: torch.dtype) -> None:
         )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @torch.inference_mode()
 def test_custom_all_reduce_eager_plan_follows_config() -> None:
     """The cached eager launch is rebuilt when the config object is replaced."""

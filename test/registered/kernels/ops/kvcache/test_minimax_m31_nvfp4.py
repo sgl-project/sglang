@@ -99,6 +99,7 @@ def test_fused_store_matches_separate_stores(gen, heads, loc_dtype, n):
         assert torch.equal(a, b)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_move_slots_carries_every_buffer():
     torch.manual_seed(42)
     pool = _sparse_pool(heads=2)
@@ -116,6 +117,7 @@ def test_move_slots_carries_every_buffer():
         assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_fused_store_selected_exactly_on_sm100():
     pool = _sparse_pool(heads=2)
     assert pool.use_nvfp4_fused_quantize_store == get_platform().is_sm100
@@ -123,6 +125,7 @@ def test_fused_store_selected_exactly_on_sm100():
     assert pool.use_minimax_fused_kv_index_store is False
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_disabled_fused_store_builds_no_kernel(monkeypatch):
     import sglang.kernels.ops.kvcache.nvfp4_store_kv_index as fused_store
 

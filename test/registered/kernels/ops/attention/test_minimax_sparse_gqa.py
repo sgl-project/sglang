@@ -10,6 +10,10 @@ import sys
 import pytest
 import torch
 
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
+
 from sglang.kernels.ops.attention.minimax_sparse.decode.topk_sparse import (
     flash_decode_with_gqa_share_sparse,
 )
@@ -207,6 +211,7 @@ CASES = [
 ]
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("bs,nqh,nkh,hd,blk,tk,with_sink,seq_pat,paged", CASES)
 def test_sparse_gqa_vs_reference(bs, nqh, nkh, hd, blk, tk, with_sink, seq_pat, paged):
     """Kernel output must match PyTorch reference (attend only to topk blocks)."""

@@ -14,6 +14,7 @@ register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
 
 
 class TestEplbMapRecord(CustomTestCase):
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_map_and_record_filters_padding(self):
         topk_ids = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32, device="cuda")
         dispatch = torch.tensor([2, 0, 3, 1], dtype=torch.int32, device="cuda")
@@ -28,6 +29,7 @@ class TestEplbMapRecord(CustomTestCase):
             torch.equal(load.cpu(), torch.tensor([1, 0, 1, 0], dtype=torch.int32))
         )
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_record_physical_counts_skips_invalid_ids(self):
         topk_ids = torch.tensor(
             [[-1, 0, 3, 4], [3, 9, 0, 3]], dtype=torch.int64, device="cuda"

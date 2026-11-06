@@ -12,10 +12,6 @@ register_cuda_ci(est_time=28, stage="base-b-kernel-unit", runner_config="1-gpu-s
 # Nightly is not redundant here: it sets SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1 to expand get_ci_test_range sweeps.
 register_cuda_ci(est_time=40, stage="nightly", runner_config="1-gpu-small")
 register_amd_ci(est_time=55, stage="jit-kernel-unit", runner_config="amd")
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="Test requires CUDA"
-)
-
 
 BS_LIST = [2**n for n in range(0, 15)]
 BS_LIST += [x + 1 + i for i, x in enumerate(BS_LIST)]
@@ -28,6 +24,7 @@ DTYPE = torch.bfloat16
 DEVICE = "cuda"
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize(
     "batch_size,element_dim",
     list(itertools.product(BS_LIST, HIDDEN_DIMS)),
@@ -51,6 +48,7 @@ REPR_DIMS = get_ci_test_range([64, 128, 512, 1024, 96], [64, 1024, 96])
 SMALL_CACHE = 4096
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize(
     "batch_size,element_dim",
@@ -71,6 +69,7 @@ def test_store_cache_dtypes(
     assert torch.all(v_cache[indices] == v)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize(
     "batch_size,element_dim",
     list(itertools.product(REPR_BS, REPR_DIMS)),
@@ -91,6 +90,7 @@ def test_store_cache_int32_indices(batch_size: int, element_dim: int) -> None:
     assert torch.all(v_cache[indices.long()] == v)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
 def test_store_cache_reserved_skip_index(index_dtype: torch.dtype) -> None:
     element_dim = 1024
@@ -122,6 +122,7 @@ def test_store_cache_reserved_skip_index(index_dtype: torch.dtype) -> None:
     torch.testing.assert_close(v_cache[indices[3].long()], v[3], rtol=0.0, atol=0.0)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_store_cache_zero_index_can_be_written_when_skip_disabled() -> None:
     element_dim = 64
     k = torch.randn((1, element_dim), dtype=DTYPE, device=DEVICE)
@@ -147,6 +148,7 @@ ASYM_DIM_PAIRS = get_ci_test_range(
 # The kernel is a byte copier specialized on (k_row_bytes, v_row_bytes) -- no dtype
 # in its template args -- so equal-itemsize dtypes share one instantiation. bf16 and
 # fp32 are the two distinct itemsizes; fp16 would just re-run the bf16 one.
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("k_dim,v_dim", ASYM_DIM_PAIRS)
 def test_store_cache_asymmetric(k_dim: int, v_dim: int, dtype: torch.dtype) -> None:
@@ -170,6 +172,7 @@ def test_store_cache_asymmetric(k_dim: int, v_dim: int, dtype: torch.dtype) -> N
     assert torch.all(v_cache[untouched] == v_before[untouched])
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_can_use_store_cache() -> None:
     assert can_use_store_cache(128)
     assert can_use_store_cache(256)
