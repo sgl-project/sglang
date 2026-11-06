@@ -513,8 +513,8 @@ class TestMegakernelRuntime(CustomTestCase):
                 torch.cuda, "is_current_stream_capturing", return_value=False
             ):
                 lm(forward_batch.input_ids, None, forward_batch)
-        MegakernelBinding.forward_view.assert_called_once_with(forward_batch)
-        MegakernelBinding.prefill_view.assert_not_called()
+            MegakernelBinding.forward_view.assert_called_once_with(forward_batch)
+            MegakernelBinding.prefill_view.assert_not_called()
 
 
 if __name__ == "__main__":
