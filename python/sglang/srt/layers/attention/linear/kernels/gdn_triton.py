@@ -268,6 +268,8 @@ class TritonGDNKernel(LinearAttnKernelBase):
             seq_lens_cpu=seq_lens_cpu,
             track_state=track_state,
             track_chunk_idx=track_chunk_idx,
+            chunk_indices=kwargs.get("chunk_indices"),
+            chunk_offsets=kwargs.get("chunk_offsets"),
         )
         if track_state is not None and h is not None:
             _fill_track_state_from_h(h, track_state, track_chunk_idx, query_start_loc)
@@ -288,16 +290,18 @@ class TritonGDNKernel(LinearAttnKernelBase):
         seq_lens_cpu: list[int] | None,
         track_state: torch.Tensor | None,
         track_chunk_idx: torch.Tensor | None,
+        chunk_indices: torch.Tensor | None,
+        chunk_offsets: torch.Tensor | None,
     ) -> tuple:
         recurrent_state = ssm_states
         recurrent_state_indices_args = {"initial_state_indices": cache_indices}
         inplace_update_args = {"inplace_update": inplace_update}
         # Static tables of a CUDA-graph captured prefill (gdn_prefill_graph.py).
         graph_table_args = {}
-        if kwargs.get("chunk_indices") is not None:
+        if chunk_indices is not None:
             graph_table_args = {
-                "chunk_indices": kwargs["chunk_indices"],
-                "chunk_offsets": kwargs["chunk_offsets"],
+                "chunk_indices": chunk_indices,
+                "chunk_offsets": chunk_offsets,
             }
         if is_cpu():
             if not inplace_update:
@@ -318,6 +322,9 @@ class TritonGDNKernel(LinearAttnKernelBase):
         elif (
             _is_hip
             and inplace_update
+            # AITER plans chunks from host seq_lens_cpu, so a graph replay would
+            # reuse the captured lengths instead of the static chunk tables.
+            and chunk_indices is None
             and seq_lens_cpu is not None
             and len(seq_lens_cpu) == query_start_loc.numel() - 1
             and ssm_states.is_contiguous()
