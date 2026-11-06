@@ -59,7 +59,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
     RotaryEmbedding,
-    apply_flashinfer_rope_qk_inplace
+    apply_flashinfer_rope_qk_inplace,
 )
 from sglang.multimodal_gen.runtime.layers.visual_embedding import (
     ModulateProjection,
