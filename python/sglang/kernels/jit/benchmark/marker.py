@@ -24,7 +24,6 @@ import torch
 from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import cache_once
 from sglang.srt.environ import envs
-from sglang.utils import is_in_ci
 
 F = TypeVar("F", bound=Callable[..., "BenchResult"])
 Metric: TypeAlias = "float | Literal['avg']"
@@ -410,7 +409,9 @@ def parametrize(names: str, vals: List[Any], ci_vals: Optional[List[Any]] = None
         return out
 
     def decorator(bench: Benchmark[F]) -> Benchmark[F]:
-        chosen = ci_vals if (ci_vals is not None and is_in_ci()) else vals
+        chosen = (
+            ci_vals if (ci_vals is not None and envs.SGLANG_IS_IN_CI.get()) else vals
+        )
         bench.add_config(name_tuple, _normalize(chosen))
         return bench
 

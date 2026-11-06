@@ -66,7 +66,7 @@ from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
-from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
+from sglang.srt.layers.dcp.layout import dsa_shards_index_k, maybe_dcp_kernel_indices
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     UnquantizedKVCacheMethod,
 )
@@ -4293,6 +4293,7 @@ class HybridLinearKVPool(KVCache):
         # full-attention layers instead of constructing one internally.
         full_kv_pool: Optional[KVCache] = None,
         post_capture_active: bool = False,
+        use_fp4_indexer: bool = False,
     ):
         self.size = size
         self.dtype = dtype
@@ -4365,6 +4366,7 @@ class HybridLinearKVPool(KVCache):
                 max_running_requests=max_running_requests,
                 skip_topk_layers=skip_topk_layers,
                 kv_scale_ue8m0=kv_scale_ue8m0,
+                use_fp4_indexer=use_fp4_indexer,
             )
         else:
             MLAPoolClass = (
@@ -4931,6 +4933,10 @@ class MLATokenToKVPool(KVCache, MLAKVView):
             else tuple(self.kv_scale_buffer[start:end]),
         )
 
+    def layer_buffer_rows(self, layer_index: int) -> int:
+        """Rows for one layer's KV buffer; 0 in a subclass that skips the layer."""
+        return self.size + self.page_size
+
     def _create_buffers(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
@@ -4941,11 +4947,11 @@ class MLATokenToKVPool(KVCache, MLAKVView):
                 # The padded slot 0 is used for writing dummy outputs from padded tokens.
                 self.kv_buffer = [
                     torch.zeros(
-                        (self.size + self.page_size, 1, self.kv_cache_dim),
+                        (self.layer_buffer_rows(i), 1, self.kv_cache_dim),
                         dtype=self.store_dtype,
                         device=self.device,
                     )
-                    for _ in range(self.layer_num)
+                    for i in range(self.layer_num)
                 ]
 
     def _clear_buffers(self):
@@ -5381,11 +5387,38 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
                 cache_k_rope_fp4_sf,
             )
 
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        super().move_kv_cache(tgt_loc, src_loc)
+        if tgt_loc.numel() == 0:
+            return
+
+        tgt_loc_flat = tgt_loc.view(-1).long()
+        src_loc_flat = src_loc.view(-1).long()
+        for kv_scale in self.kv_scale_buffer:
+            kv_scale[tgt_loc_flat] = kv_scale[src_loc_flat]
+
 
 class DSATokenToKVPool(MLATokenToKVPool):
     quant_block_size = 128
     index_k_with_scale_buffer_dtype = torch.uint8
     rope_storage_dtype = torch.bfloat16  # rope is always stored in bf16
+    # The fp8 index-K layout; __init__ sets the instance value.
+    use_fp4_indexer = False
+
+    @staticmethod
+    def index_bytes_per_token_for(
+        index_head_dim: int, use_fp4_indexer: bool = False
+    ) -> int:
+        if use_fp4_indexer:
+            # Packed E2M1 values and four per-32 UE8M0 exponents.
+            return index_head_dim // 2 + index_head_dim // 32
+        return index_head_dim + index_head_dim // DSATokenToKVPool.quant_block_size * 4
+
+    @property
+    def index_key_bytes_per_token(self) -> int:
+        """Bytes of one token's index-K values, without its scale."""
+        # Packed E2M1 stores two values per byte.
+        return self.index_head_dim // 2 if self.use_fp4_indexer else self.index_head_dim
 
     def __init__(
         self,
@@ -5409,6 +5442,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         skip_topk_layers: Optional[List[bool]] = None,
         dcp_replicated: bool = False,
         kv_scale_ue8m0: bool = False,
+        use_fp4_indexer: bool = False,
     ):
         override_dim = (
             kv_cache_dim if kv_cache_dim != kv_lora_rank + qk_rope_head_dim else None
@@ -5433,6 +5467,12 @@ class DSATokenToKVPool(MLATokenToKVPool):
         # self.index_k_dtype = torch.float8_e4m3fn
         # self.index_k_scale_dtype = torch.float32
         self.index_head_dim = index_head_dim
+        self.use_fp4_indexer = use_fp4_indexer
+        if self.use_fp4_indexer and index_kpool != 1:
+            raise ValueError("FP4 indexer does not yet support pooled index keys.")
+        self.index_bytes_per_token = self.index_bytes_per_token_for(
+            index_head_dim, self.use_fp4_indexer
+        )
         self.index_kpool = index_kpool
         self.index_kpool_compress = index_kpool_compress
         self.tail_extra_slots = tail_extra_slots
@@ -5446,7 +5486,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
             dcp_size = get_parallel().attn_dcp_size
             index_buf_size = (
                 size
-                if dcp_replicated
+                if dcp_replicated or dsa_shards_index_k()
                 else (size + self.page_size) * dcp_size - self.page_size
             )
         self.index_buf_size = index_buf_size
@@ -5508,7 +5548,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
 
         if (self.index_head_dim, self.quant_block_size) != (128, 128):
             raise ValueError(
-                f"PAGED_FP8_KEYS_WITH_SCALES index key layout requires index_head_dim=128 and "
+                f"Paged index key layouts require index_head_dim=128 and "
                 f"quant_block_size=128, got {self.index_head_dim} and {self.quant_block_size}"
             )
 
@@ -5534,7 +5574,11 @@ class DSATokenToKVPool(MLATokenToKVPool):
                 buffers=tuple(
                     self.index_key_cache.buffer[i] for i in index_buffer_layer_ids
                 ),
-                key_layout=IndexKeyLayout.PAGED_FP8_KEYS_WITH_SCALES,
+                key_layout=(
+                    IndexKeyLayout.PAGED_FP4_KEYS_WITH_SCALES
+                    if self.use_fp4_indexer
+                    else IndexKeyLayout.PAGED_FP8_KEYS_WITH_SCALES
+                ),
             ),
         )
         return (*kv_infos, index_info)
@@ -5757,12 +5801,19 @@ class DSATokenToKVPool(MLATokenToKVPool):
                 tail_score.device, non_blocking=True
             )
 
+    def _index_k_rows(self, indices):
+        if not dsa_shards_index_k():
+            return indices
+        return maybe_dcp_kernel_indices(
+            indices, self._write_loc_dcp_span, get_parallel().attn_dcp_rank
+        )
+
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         # Retraction reuses index-cache pages; offload index/scale with KV so resume cannot read another request's entries.
         kv_cache_cpu = super().get_cpu_copy(indices, mamba_indices=mamba_indices)
         cpu_copy = {
             "kv": kv_cache_cpu,
-            "index_k": self.index_key_cache.cpu_copy(indices),
+            "index_k": self.index_key_cache.cpu_copy(self._index_k_rows(indices)),
         }
         compress_tail = self._get_compress_tail_cpu_copy(req_pool_index)
         if compress_tail is not None:
@@ -5783,7 +5834,9 @@ class DSATokenToKVPool(MLATokenToKVPool):
             mamba_indices=mamba_indices,
             req_pool_index=req_pool_index,
         )
-        self.index_key_cache.load_cpu_copy(kv_cache_cpu_dict["index_k"], indices)
+        self.index_key_cache.load_cpu_copy(
+            kv_cache_cpu_dict["index_k"], self._index_k_rows(indices)
+        )
         self._load_compress_tail_cpu_copy(
             kv_cache_cpu_dict.get("tail_k"),
             kv_cache_cpu_dict.get("tail_score"),
