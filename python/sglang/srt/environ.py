@@ -2266,6 +2266,10 @@ class Envs:
     # and joint router/pooler projections.
     SGLANG_MUSE_FUSED_QKV_CACHE = EnvBool(True)
     SGLANG_MUSE_QK_ROPE_CACHE = EnvBool(True)
+    # Row cap of the fused QK norm / RoPE / cache-write kernel (one program per row and Q head, no limit of its own).
+    SGLANG_MUSE_QK_ROPE_CACHE_MAX_ROWS = EnvInt(512)
+    # Row cap of the joint router + pooler GEMM; above 64 rows only the joint form (BM 128 row-major tile) serves.
+    SGLANG_MUSE_JOINT_ROUTER_MAX_ROWS = EnvInt(128)
     SGLANG_MUSE_FUSED_UNPOOL_BOUNDARY = EnvBool(True)
     SGLANG_MUSE_COMPACT_A4_VERIFY = EnvBool(True)
     SGLANG_MUSE_A4W4_MOE = EnvBool(True)

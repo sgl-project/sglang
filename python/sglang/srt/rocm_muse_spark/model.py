@@ -1415,7 +1415,7 @@ class MuseSpark1xDecoderLayer(nn.Module):
             and (
                 (
                     sp is None
-                    and 0 < attn_output.shape[0] <= _FP8_MAX_ROWS
+                    and 0 < attn_output.shape[0] <= router_pooler.FP8_JOINT_MAX_M
                     and (forward_batch.forward_mode.is_decode() or target_verify)
                 )
                 or (
