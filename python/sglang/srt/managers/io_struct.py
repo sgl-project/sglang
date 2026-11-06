@@ -2561,7 +2561,19 @@ class OpenSessionReqOutput(BaseReq, kw_only=True):
 
 
 class HealthCheckOutput(BaseReq, kw_only=True):
-    pass
+    """Acknowledges a /health_generate probe with completed inference.
+
+    The scheduler sends one per pending probe rid after a batch finished a
+    real forward (positive prefill chunk, decode or verify step) whose device
+    results were synchronized. ``incarnation`` identifies the scheduler
+    process and ``completion_seq`` counts such completions, so the consumer
+    can reject stale or replayed acknowledgements. An instance without them
+    proves nothing.
+    """
+
+    incarnation: Optional[str] = None
+    completion_seq: Optional[int] = None
+    dp_rank: int = 0
 
 
 class ExpertDistributionReqType(Enum):

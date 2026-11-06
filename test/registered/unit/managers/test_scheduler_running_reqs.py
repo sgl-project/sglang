@@ -111,7 +111,7 @@ def _scheduler():
     s._record_step_counters = Mock()
     s.enable_fpm = False
     s._maybe_clear_mm_inputs = Mock()
-    s.maybe_send_health_check_signal = Mock()
+    s.health_monitor = MagicMock()
     return s
 
 

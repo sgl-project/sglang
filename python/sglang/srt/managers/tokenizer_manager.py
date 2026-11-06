@@ -280,6 +280,15 @@ _INCREMENTAL_STREAMING_META_INFO_KEYS = (
 
 
 @dataclasses.dataclass
+class HealthProbeState:
+    """A /health_generate probe waiting for a completed-inference ack."""
+
+    # (incarnation, completion_seq) last accepted per dp_rank when registered.
+    baseline: Dict[int, Tuple[str, int]]
+    event: asyncio.Event = dataclasses.field(default_factory=asyncio.Event)
+
+
+@dataclasses.dataclass
 class ReqState:
     """Store the state a request."""
 
@@ -765,7 +774,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Health check
         self.server_status = ServerStatus.Starting
         self.gracefully_exit = False
+        # Any scheduler/detokenizer message; feeds diagnostics, never health.
         self.last_receive_tstamp = real_time()
+        # dp_rank -> (incarnation, completion_seq) of the last accepted ack.
+        self.health_progress: Dict[int, Tuple[str, int]] = {}
+        self.pending_health_probes: Dict[str, HealthProbeState] = {}
 
         # Session
         self.session_futures = {}  # session_id -> asyncio event
@@ -780,6 +793,51 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def is_ready(self) -> bool:
         """Return whether this server should receive new requests."""
         return not self.is_pause and self.is_healthy()
+
+    def register_health_probe(self, rid: str) -> HealthProbeState:
+        probe = HealthProbeState(baseline=dict(self.health_progress))
+        self.pending_health_probes[rid] = probe
+        return probe
+
+    def discard_health_probe(self, rid: str) -> None:
+        self.pending_health_probes.pop(rid, None)
+
+    def _handle_health_check_output(self, recv_obj: HealthCheckOutput) -> None:
+        """Pass a pending probe only on proof of completed inference.
+
+        The ack must name a pending probe, carry the scheduler incarnation and
+        completion sequence, and be newer than what that worker had already
+        reported when the probe was registered. A legacy empty ack, a stray or
+        replayed one, or one for another probe changes nothing.
+        """
+        probe = self.pending_health_probes.get(recv_obj.rid)
+        if probe is None:
+            logger.debug("Ignoring health ack for unknown probe %s", recv_obj.rid)
+            return
+        if recv_obj.incarnation is None or recv_obj.completion_seq is None:
+            logger.warning(
+                "Ignoring health ack for %s without completion evidence", recv_obj.rid
+            )
+            return
+        baseline = probe.baseline.get(recv_obj.dp_rank)
+        if (
+            baseline is not None
+            and baseline[0] == recv_obj.incarnation
+            and recv_obj.completion_seq <= baseline[1]
+        ):
+            logger.warning(
+                "Ignoring stale health ack for %s: dp_rank=%d seq=%d <= baseline %d",
+                recv_obj.rid,
+                recv_obj.dp_rank,
+                recv_obj.completion_seq,
+                baseline[1],
+            )
+            return
+        self.health_progress[recv_obj.dp_rank] = (
+            recv_obj.incarnation,
+            recv_obj.completion_seq,
+        )
+        probe.event.set()
 
     def init_request_logging_and_dumping(self):
         # TODO: Refactor and organize the log export code.
@@ -941,7 +999,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 ),
                 (FreezeGCReq, lambda x: None),
                 # For handling case when scheduler skips detokenizer and forwards back to the tokenizer manager, we ignore it.
-                (HealthCheckOutput, lambda x: None),
+                (HealthCheckOutput, self._handle_health_check_output),
                 # Same skip-detokenizer forwarding case as above.
                 (ConfigureLoggingReq, lambda x: None),
                 (ActiveRanksOutput, self.update_active_ranks),
@@ -2697,7 +2755,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         for i, rid in enumerate(recv_obj.rids):
             state = self.rid_to_state.get(rid, None)
             if state is None:
-                # Known race: /health_generate pops its rid as soon as ANY message bumps last_receive_tstamp.
+                # A probe's own late output: health is decided by the
+                # HealthCheckOutput ack, and the handler drops the rid state.
                 if rid.startswith(HEALTH_CHECK_RID_PREFIX):
                     continue
                 logger.warning(

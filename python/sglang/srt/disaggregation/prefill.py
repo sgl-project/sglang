@@ -1275,7 +1275,6 @@ class SchedulerDisaggregationPrefillMixin:
             can_run_cuda_graph=can_run_cuda_graph,
             dp_cooperation_info=batch.dp_cooperation_info,
         )
-        self.maybe_send_health_check_signal()
 
     def _abort_prefill_transfer(self: Scheduler, recv_req: AbortReq) -> None:
         for req in self.disagg_prefill_transfer_queue:
