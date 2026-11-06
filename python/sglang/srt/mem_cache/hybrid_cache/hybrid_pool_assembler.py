@@ -2057,8 +2057,10 @@ class _DeepSeekV4Strategy(StackStrategy):
             (PoolName.DEEPSEEK_V4_C4_STATE, PoolName.SWA),
             (PoolName.DEEPSEEK_V4_C4_INDEXER_STATE, PoolName.SWA),
             (PoolName.DEEPSEEK_V4_C128_STATE, PoolName.SWA),
-            (PoolName.ERNIE5_5_MLA, PoolName.KV),
-            (PoolName.ERNIE5_5_MLA_INDEXER, PoolName.KV),
+            *(
+                (region.pool_name, PoolName.KV)
+                for region in kvcache.extra_host_regions()
+            ),
         ]
         if ComponentType.C128 not in cache.components:
             _sidecar_srcs.append((PoolName.DEEPSEEK_V4_C128, PoolName.KV))

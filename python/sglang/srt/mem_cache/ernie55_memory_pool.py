@@ -24,7 +24,7 @@ stores its latent KV plus the DSA lightning-indexer key in
 
 from __future__ import annotations
 
-from typing import Sequence
+from typing import TYPE_CHECKING, Sequence
 
 import torch
 
@@ -35,6 +35,11 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
 )
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
+from sglang.srt.runtime_context import get_exec, get_spec
+
+if TYPE_CHECKING:
+    from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 
 # FlashMLA sparse and the DSA indexer kernels are built for 64-token pages.
 DSA_PAGE_SIZE = 64
@@ -92,6 +97,20 @@ class _StageLocalLayerCounter:
 
 
 class Ernie5_5TokenToKVPool(DeepSeekV4TokenToKVPool):
+    @staticmethod
+    def stage_kwargs(hf_config, start_layer: int, end_layer: int) -> dict:
+        """The arguments beyond the compressed-KV pool's, for one pipeline stage."""
+        return dict(
+            # Only this pipeline stage's MLA layers get latent storage.
+            mla_layer_ids=[
+                i for i in hf_config.mla_layer_ids if start_layer <= i < end_layer
+            ],
+            mla_kv_lora_rank=hf_config.hybrid_mla_kv_lora_rank,
+            mla_qk_rope_head_dim=hf_config.hybrid_mla_qk_rope_head_dim,
+            index_head_dim=hf_config.index_head_dim,
+            use_fp4_indexer=get_exec().kernel.enable_fp4_indexer,
+        )
+
     def __init__(
         self,
         *,
@@ -223,4 +242,33 @@ class Ernie5_5TokenToKVPool(DeepSeekV4TokenToKVPool):
                 },
             )
             for pool_name, layer_views in views.items()
+        )
+
+
+class Ernie5_5PoolConfigurator(DSV4PoolConfigurator):
+    """ERNIE 5.5 Flash: the MLA layers keep a latent + index key per full token
+    and no SWA buffer (Ernie5_5TokenToKVPool._swa_layer_ids)."""
+
+    def __init__(self, kvc: KVCacheConfigurator):
+        self._hf_config = kvc.model_config.hf_config
+        self.use_fp4_indexer = get_exec().kernel.enable_fp4_indexer
+        stage = range(kvc.layer_info.start_layer, kvc.layer_info.end_layer)
+        self._num_mla_layers = sum(i in stage for i in kvc.model_config.mla_layer_ids)
+        # The MTP draft is one MLA layer, priced here instead of by inflation.
+        self._draft_kv_priced_exactly = (
+            get_spec().speculative_algorithm is not None
+            and not kvc.spec_algorithm.is_dspark()
+        )
+        super().__init__(kvc)
+
+    @property
+    def num_swa_layers(self) -> int:
+        return self.num_layers_total - self._num_mla_layers
+
+    def _get_bytes_per_full_token(self) -> float:
+        mla_layers = self._num_mla_layers + int(self._draft_kv_priced_exactly)
+        return super()._get_bytes_per_full_token() + mla_layers * (
+            mla_layer_bytes_per_token(
+                self._hf_config, self.kv_cache_dtype_str, self.use_fp4_indexer
+            )
         )

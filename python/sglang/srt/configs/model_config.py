@@ -1570,6 +1570,11 @@ class ModelConfig:
             self.v_head_dim = self.head_dim
             self.index_head_dim = self.hf_config.index_head_dim
             self.compress_ratios = self.hf_config.compress_ratios
+            # Layers that run full-context MLA, with their own latent KV, instead
+            # of compressed attention.
+            self.mla_layer_ids = (
+                self.hf_config.mla_layer_ids if is_ernie5_5(self.hf_config) else ()
+            )
             self.attention_arch = AttentionArch.MHA
             self._init_mla_scaling(self.hf_config.rope_scaling)
         elif "Glm4MoeForCausalLMNextN" in self.hf_config.architectures:

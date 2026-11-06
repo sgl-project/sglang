@@ -19,7 +19,6 @@ from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.arg_groups.model_overrides.deepseek_v4 import (
     DSV4_DEFAULT_SWA_FULL_TOKENS_RATIO,
 )
-from sglang.srt.configs.ernie55 import ERNIE5_5_MOE_ARCH
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.configs.model_config import (
     AttentionArch,
@@ -1805,42 +1804,15 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         return self._to_config(sizes)
 
 
-class Ernie5_5PoolConfigurator(DSV4PoolConfigurator):
-    """ERNIE 5.5 Flash: the MLA layers keep a latent + index key per full token
-    and no SWA buffer (Ernie5_5TokenToKVPool._swa_layer_ids)."""
-
-    def __init__(self, kvc: KVCacheConfigurator):
-        self._hf_config = kvc.model_config.hf_config
-        self.use_fp4_indexer = get_exec().kernel.enable_fp4_indexer
-        stage = range(kvc.layer_info.start_layer, kvc.layer_info.end_layer)
-        self._num_mla_layers = sum(i in stage for i in self._hf_config.mla_layer_ids)
-        # The MTP draft is one MLA layer, priced here instead of by inflation.
-        self._draft_kv_priced_exactly = (
-            get_spec().speculative_algorithm is not None
-            and not kvc.spec_algorithm.is_dspark()
-        )
-        super().__init__(kvc)
-
-    @property
-    def num_swa_layers(self) -> int:
-        return self.num_layers_total - self._num_mla_layers
-
-    def _get_bytes_per_full_token(self) -> float:
-        from sglang.srt.mem_cache.ernie55_memory_pool import mla_layer_bytes_per_token
-
-        mla_layers = self._num_mla_layers + int(self._draft_kv_priced_exactly)
-        return super()._get_bytes_per_full_token() + mla_layers * (
-            mla_layer_bytes_per_token(
-                self._hf_config, self.kv_cache_dtype_str, self.use_fp4_indexer
-            )
-        )
-
-
 def create_memory_pool_configurator(
     kvc: KVCacheConfigurator,
 ) -> MemoryPoolConfigurator:
     if uses_compressed_kv_attention(kvc.model_config.hf_config) and kvc.is_hybrid_swa:
-        if kvc.model_config.hf_config.architectures[0] == ERNIE5_5_MOE_ARCH:
+        if kvc.model_config.mla_layer_ids:
+            from sglang.srt.mem_cache.ernie55_memory_pool import (
+                Ernie5_5PoolConfigurator,
+            )
+
             return Ernie5_5PoolConfigurator(kvc)
         return DSV4PoolConfigurator(kvc)
     if kvc.is_hybrid_swa:

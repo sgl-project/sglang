@@ -17,7 +17,11 @@
 import logging
 from typing import Any, Dict
 
-from sglang.srt.arg_groups.model_override_base import _register_for, resolving_view
+from sglang.srt.arg_groups.model_override_base import (
+    _register_for,
+    register_dspark_dp_a2a_backends,
+    resolving_view,
+)
 from sglang.srt.arg_groups.model_overrides.deepseek_v4 import (
     DSV4_DEFAULT_SWA_FULL_TOKENS_RATIO,
     DSV4_PAGE_SIZE,
@@ -30,6 +34,9 @@ logger = logging.getLogger(__name__)
 # The MLA latent sub-pool is allocated as e4m3 or bf16,
 # and the memory budget follows the same choice, so no other KV dtype is servable.
 _SUPPORTED_KV_CACHE_DTYPES = ("auto", "fp8_e4m3", "bfloat16")
+
+# DSpark with DP attention is validated on DeepEP here; MegaMoE is rejected below.
+register_dspark_dp_a2a_backends(ERNIE5_5_MOE_ARCH, ("none", "deepep"))
 
 
 def _validate_features(cfg: Any) -> None:

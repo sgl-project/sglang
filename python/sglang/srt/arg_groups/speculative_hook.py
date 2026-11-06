@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Optional
 from sglang.srt.arg_groups.choices import DRAFT_ATTENTION_BACKEND_CHOICES
 from sglang.srt.arg_groups.model_override_base import (
     attention_backends_of,
+    dspark_dp_a2a_backends,
     model_config_of,
     resolved_view,
     resolving_view,
@@ -678,12 +679,9 @@ def _handle_dspark(server_args: ServerArgs) -> None:
     if cfg.attn_dp_size > 1:
         if not cfg.enable_dp_lm_head:
             raise ValueError("DSpark with dp attention requires --enable-dp-lm-head.")
-        allowed_a2a_backends = ("none", "megamoe", "mori")
-        target_arch = model_config_of(server_args).hf_config.architectures[0]
-        if target_arch == ERNIE5_5_MOE_ARCH:
-            # DeepEP is validated on ERNIE 5.5 Flash only: static ragged verify
-            # gives it EAGLE's per-rank shapes. Its override rejects MegaMoE.
-            allowed_a2a_backends = ("none", "deepep")
+        allowed_a2a_backends = dspark_dp_a2a_backends(
+            model_config_of(server_args).hf_config.architectures[0]
+        )
         if not _is_npu and cfg.moe_a2a_backend not in allowed_a2a_backends:
             raise ValueError(
                 "DSpark with dp attention supports moe_a2a_backend "

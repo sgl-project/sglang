@@ -32,7 +32,6 @@ from sglang.srt.configs.model_config import (
     get_unlimited_ocr_v2_sparse_config,
     is_deepseek_dsa,
     is_deepseek_v4,
-    is_ernie5_5,
     is_kimi_k31,
     is_minimax_sparse,
     is_unlimited_ocr_v2,
@@ -1962,25 +1961,18 @@ class KVCacheConfigurator:
             kv_layout_kwargs = dict(
                 kv_layout=kv_layout, compressed_kv_layout=compressed_kv_layout
             )
-            hf_config = self.model_config.hf_config
-            # The target, and an MTP draft, keep MLA layers; a DSpark draft has none.
-            if is_ernie5_5(hf_config) and hf_config.mla_layer_ids:
+            if self.model_config.mla_layer_ids:
                 from sglang.srt.mem_cache.ernie55_memory_pool import (
                     Ernie5_5TokenToKVPool,
                 )
 
                 pool_cls = Ernie5_5TokenToKVPool
                 kv_layout_kwargs.update(
-                    # Only this pipeline stage's MLA layers get latent storage.
-                    mla_layer_ids=[
-                        i
-                        for i in hf_config.mla_layer_ids
-                        if self.layer_info.start_layer <= i < self.layer_info.end_layer
-                    ],
-                    mla_kv_lora_rank=hf_config.hybrid_mla_kv_lora_rank,
-                    mla_qk_rope_head_dim=hf_config.hybrid_mla_qk_rope_head_dim,
-                    index_head_dim=hf_config.index_head_dim,
-                    use_fp4_indexer=get_exec().kernel.enable_fp4_indexer,
+                    pool_cls.stage_kwargs(
+                        self.model_config.hf_config,
+                        self.layer_info.start_layer,
+                        self.layer_info.end_layer,
+                    )
                 )
 
         unified_fp8 = unified_fp8_for_dsv4_pool(
