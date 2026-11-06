@@ -1918,9 +1918,79 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
         return skip_kv, skip_state
 
+    def get_mla_kv_ptrs_with_pp(
+        self,
+        src_kv_ptrs: List[int],
+        dst_kv_ptrs: List[int],
+        state_type: Optional[StateType] = None,
+    ) -> Tuple[List[int], List[int], int]:
+        """Map the Ascend DSV4 pools used by Mooncake's NPU transfer engine.
+
+        The common compressed-MLA layout groups C4 KV, C4 indexer KV and C128
+        KV entries. Ascend exposes a different main-KV layout
+        ([C4 KV, index K, index scale]) and registers C128/C4 state separately.
+        Keep this specialization behind the Mooncake-on-Ascend opt-in so the
+        ordinary Mooncake/GPU layout continues through CommonKVManager.
+        """
+        if envs.ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE.get():
+            mla_ratios = getattr(self.kv_args, "mla_compression_ratios", None)
+            if mla_ratios:
+                if len(src_kv_ptrs) == len(dst_kv_ptrs):
+                    return src_kv_ptrs, dst_kv_ptrs, len(src_kv_ptrs)
+
+                start_layer = self.kv_args.prefill_start_layer
+                end_layer = self.kv_args.prefill_end_layer
+                if end_layer is None:
+                    raise ValueError(
+                        "KVArgs.prefill_end_layer must be set when using "
+                        "compressed-MLA PD with PP"
+                    )
+                c4_full = sum(ratio == 4 for ratio in mla_ratios)
+                c4_start = sum(ratio == 4 for ratio in mla_ratios[:start_layer])
+                c4_end = sum(ratio == 4 for ratio in mla_ratios[:end_layer])
+                c128_start = sum(ratio == 128 for ratio in mla_ratios[:start_layer])
+                c128_end = sum(ratio == 128 for ratio in mla_ratios[:end_layer])
+
+                state_type_value = getattr(state_type, "value", state_type)
+                if state_type_value == "dsv4_c128":
+                    dst = list(dst_kv_ptrs[c128_start:c128_end])
+                    return src_kv_ptrs, dst, len(src_kv_ptrs)
+
+                if state_type_value == "dsv4_c4_state":
+                    # Layout: [attention C4 state, indexer C4 state].
+                    dst = []
+                    for offset in (0, c4_full):
+                        dst.extend(
+                            dst_kv_ptrs[offset + c4_start : offset + c4_end]
+                        )
+                    return src_kv_ptrs, dst, len(src_kv_ptrs)
+
+                if state_type is None and len(dst_kv_ptrs) == 3 * c4_full:
+                    # Ascend main-KV layout: [C4 KV, index K, index scale].
+                    dst = []
+                    for offset in (0, c4_full, 2 * c4_full):
+                        dst.extend(
+                            dst_kv_ptrs[offset + c4_start : offset + c4_end]
+                        )
+                    return src_kv_ptrs, dst, len(src_kv_ptrs)
+
+                has_separate_c4_state = any(
+                    getattr(st, "value", st) == "dsv4_c4_state"
+                    for st in (self.kv_args.state_types or [])
+                )
+                if state_type == StateType.SWA and has_separate_c4_state:
+                    # Ascend 950 registers C4 state separately from SWA KV.
+                    dst = list(dst_kv_ptrs[start_layer:end_layer])
+                    return src_kv_ptrs, dst, len(src_kv_ptrs)
+
+        return super().get_mla_kv_ptrs_with_pp(
+            src_kv_ptrs, dst_kv_ptrs, state_type
+        )
+
     def _is_generic_kvcache_state_type(self, st: StateType) -> bool:
         """State types sent via the page-indexed ``_send_kvcache_generic`` path
         (not the mamba-state path); subclasses extend for hardware components."""
+        state_type_value = getattr(st, "value", st)
         return st in (
             StateType.SWA,
             StateType.AUXILIARY_SWA,
@@ -1932,16 +2002,23 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             StateType.REQUEST_ROW,
             StateType.BLOCK_SCALE,
             StateType.BLOCK_SCALE_SWA,
+        ) or (
+            envs.ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE.get()
+            and state_type_value in ("dsv4_c128", "dsv4_c4_state")
         )
 
     def _requires_exact_state_index_match(self, st: StateType) -> bool:
         """State types whose page lists are positional and must not be truncated."""
+        state_type_value = getattr(st, "value", st)
         return st in (
             StateType.QSA_PENDING,
             StateType.QSA_COMPRESSED,
             StateType.SWA_RING,
             StateType.DSV4_REQUEST_STATE,
             StateType.REQUEST_ROW,
+        ) or (
+            envs.ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE.get()
+            and state_type_value in ("dsv4_c128", "dsv4_c4_state")
         )
 
     def _prepare_sharded_dsa_indices(self, src_indices, dst_indices):
