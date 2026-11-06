@@ -503,8 +503,12 @@ class Envs:
     SGLANG_DEBUG_REVERT_PR = EnvInt(0)
     SGLANG_PHASE_CHECKER_DEBUG = EnvBool(False)
     SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(True)
-    # Per-check levels of the scheduler state checks. When set explicitly,
-    # each of these wins over SGLANG_INVARIANT_CHECK for the checks it gates.
+    # Scheduler state checks: each check reads one flag, whose default is its
+    # prod/CI level; on is STRICT. When set explicitly, a flag wins over
+    # SGLANG_INVARIANT_CHECK for its check. BUSY (its value also sets the log
+    # verbosity) gates the busy pool check; IDLE gates the idle pool, req pool,
+    # and byte checks, and off means WARN, not skipped. The busy pool and KV
+    # page checks are deep: they run only by their own flags.
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY = EnvInt(0)
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE = EnvBool(True)
     # The explicit environment variable still takes precedence over this CI
@@ -512,7 +516,8 @@ class Envs:
     SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK = EnvBool(_default_on_in_ci)
     # Check each schedule that the running requests equal the ones batches hold.
     SGLANG_ENABLE_RUNNING_REQS_CHECK = EnvBool(_default_on_in_ci)
-    # Physical KV-page checks: committed<=allocated + no page alias.
+    # Physical KV-page checks: committed<=allocated + no page alias. Gates only
+    # the kv_pages check, independent of the BUSY and IDLE flags.
     SGLANG_CHECK_KV_PAGE_INVARIANTS = EnvBool(False)
     SGLANG_TBO_DEBUG = EnvBool(False)
     # Timing probe: run the swap-in fully but skip the host->device KV bytes,
@@ -528,12 +533,12 @@ class Envs:
     # adds throttled logging, STRICT (CI default) crashes on violations.
     # Supersedes SGLANG_ENABLE_ASYNC_ASSERT, which is bridged as STRICT until
     # every callsite migrates.
-    # When set explicitly, it is also the level of every scheduler state check
-    # whose own flag (SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY/_IDLE,
-    # SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK, SGLANG_ENABLE_RUNNING_REQS_CHECK,
-    # SGLANG_CHECK_KV_PAGE_INVARIANTS) is unset. Unset, or reached only through
-    # the SGLANG_ENABLE_ASYNC_ASSERT bridge, it leaves those checks on their own
-    # flags' defaults.
+    # When set explicitly, it is also the level of every cheap scheduler state
+    # check whose own flag (SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE,
+    # SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK, SGLANG_ENABLE_RUNNING_REQS_CHECK)
+    # is unset; the busy pool and KV page checks ignore it. Unset, or reached
+    # only through the SGLANG_ENABLE_ASYNC_ASSERT bridge, it leaves all checks
+    # on their own flags' defaults.
     SGLANG_INVARIANT_CHECK = EnvInt(InvariantCheckLevel.OFF)
 
     # ===================================================================

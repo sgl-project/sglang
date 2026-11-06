@@ -178,8 +178,8 @@ class TestStateCheckLevels(CustomTestCase):
             return {c.name: c.level() for cs in checker.checks.values() for c in cs}
 
     def test_legacy_flags_decide_the_level(self):
-        """With SGLANG_INVARIANT_CHECK unset, every registered check keeps the
-        level its own flags gave it, in prod and in CI."""
+        """With SGLANG_INVARIANT_CHECK unset, every registered check takes its
+        level from its one flag, in prod and in CI."""
         prod = self._table(**self._idle(self.STRICT))
         ci = self._table(
             prod,
@@ -198,7 +198,8 @@ class TestStateCheckLevels(CustomTestCase):
             (False, {}, prod),
             (True, {}, ci),
             (True, no_ci_checks, prod),
-            (False, {kv: True}, prod),
+            (False, {kv: True}, self._table(prod, kv_pages=self.STRICT)),
+            (False, {kv: True, busy: 0}, self._table(prod, kv_pages=self.STRICT)),
             (False, {busy: 2}, self._table(prod, busy_pools=self.STRICT)),
             (
                 False,
@@ -207,7 +208,7 @@ class TestStateCheckLevels(CustomTestCase):
                     prod,
                     **self._idle(self.WARN),
                     busy_pools=self.STRICT,
-                    kv_pages=self.WARN,
+                    kv_pages=self.STRICT,
                 ),
             ),
         ]
@@ -220,15 +221,22 @@ class TestStateCheckLevels(CustomTestCase):
             with self.subTest(level=level):
                 self.assertEqual(
                     self._levels(False, SGLANG_INVARIANT_CHECK=int(level)),
-                    self._table(**dict.fromkeys(self._table(), level)),
+                    self._table(
+                        dict.fromkeys(self._table(), level),
+                        busy_pools=self.OFF,
+                        kv_pages=self.OFF,
+                    ),
                 )
-        # An explicit check flag beats the explicit level, for its checks only.
+        # The deep checks, busy_pools and kv_pages, ignore the explicit level.
+        # An explicit check flag beats it, for its checks only; the BUSY and
+        # IDLE flags do not touch kv_pages.
         self.assertEqual(
             self._levels(
                 True,
                 SGLANG_INVARIANT_CHECK=int(self.OFF),
                 SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE=False,
                 SGLANG_ENABLE_RUNNING_REQS_CHECK=True,
+                SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY=0,
             ),
             self._table(
                 **self._idle(self.WARN),

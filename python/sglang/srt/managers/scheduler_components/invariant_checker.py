@@ -89,64 +89,36 @@ class StateCheck:
     skip: Optional[Callable[[], bool]] = None
 
 
-def _strict_if(enabled: bool) -> InvariantCheckLevel:
-    return InvariantCheckLevel.STRICT if enabled else InvariantCheckLevel.OFF
-
-
-def _idle_leak_legacy_level() -> InvariantCheckLevel:
-    if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE.get():
-        return InvariantCheckLevel.STRICT
-    return InvariantCheckLevel.WARN
-
-
-def _kv_pages_legacy_level() -> InvariantCheckLevel:
-    if not (
-        envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get()
-        and envs.SGLANG_CHECK_KV_PAGE_INVARIANTS.get()
-    ):
-        return InvariantCheckLevel.OFF
-    return _idle_leak_legacy_level()
-
-
 def _level_resolver(
-    legacy_level: Callable[[], InvariantCheckLevel], *legacy_flags: EnvField
+    flag: EnvField,
+    off: InvariantCheckLevel = InvariantCheckLevel.OFF,
+    deep: bool = False,
 ) -> Callable[[], InvariantCheckLevel]:
-    """A check's level: an explicitly set SGLANG_INVARIANT_CHECK, unless one of
-    the check's own `legacy_flags` is set explicitly; otherwise `legacy_level`.
+    """A check's level from its one flag: STRICT when the flag is on, else `off`.
+    An explicitly set SGLANG_INVARIANT_CHECK wins unless the flag is set too, or
+    the check is `deep`: a deep check costs every loop iteration, so a global
+    STRICT must not turn it on.
 
     The SGLANG_ENABLE_ASYNC_ASSERT bridge to STRICT does not count as set."""
 
     def resolve() -> InvariantCheckLevel:
-        if envs.SGLANG_INVARIANT_CHECK.is_set() and not any(
-            flag.is_set() for flag in legacy_flags
-        ):
+        if not deep and envs.SGLANG_INVARIANT_CHECK.is_set() and not flag.is_set():
             return InvariantCheckLevel(envs.SGLANG_INVARIANT_CHECK.get())
-        return legacy_level()
+        return InvariantCheckLevel.STRICT if flag.get() else off
 
     return resolve
 
 
-_running_reqs_level = _level_resolver(
-    lambda: _strict_if(envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.get()),
-    envs.SGLANG_ENABLE_RUNNING_REQS_CHECK,
-)
+_running_reqs_level = _level_resolver(envs.SGLANG_ENABLE_RUNNING_REQS_CHECK)
 _busy_pools_level = _level_resolver(
-    lambda: _strict_if(envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get()),
-    envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY,
+    envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, deep=True
 )
-_kv_pages_level = _level_resolver(
-    _kv_pages_legacy_level,
-    envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY,
-    envs.SGLANG_CHECK_KV_PAGE_INVARIANTS,
-    envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE,
-)
+_kv_pages_level = _level_resolver(envs.SGLANG_CHECK_KV_PAGE_INVARIANTS, deep=True)
+# An off idle flag downgrades a leak to a warning instead of skipping the check.
 _idle_leak_level = _level_resolver(
-    _idle_leak_legacy_level, envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE
+    envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE, off=InvariantCheckLevel.WARN
 )
-_tree_cache_level = _level_resolver(
-    lambda: _strict_if(envs.SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK.get()),
-    envs.SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK,
-)
+_tree_cache_level = _level_resolver(envs.SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK)
 
 
 @dataclass(kw_only=True, slots=True)
