@@ -2388,6 +2388,13 @@ class KVCacheConfigurator:
         swa_max_total_num_tokens: Optional[int],
         mha_pool_class: type,
     ) -> KVCache:
+        quant_method = self._build_mha_quant_method(
+            num_layers=self.layer_info.num_effective_layers
+        )
+        if quant_method is not None and is_float4_e2m1fn_x2(self.kv_cache_dtype):
+            assert not self._page_major_enabled(), (
+                "page-major KV layout is not supported with fp4 KV cache"
+            )
         kwargs = {}
         if self.is_hybrid_swa_compress:
             kwargs = {
@@ -2418,7 +2425,7 @@ class KVCacheConfigurator:
             size_swa=size_swa,
             page_size=self.pool_page_size,
             dtype=self.kv_cache_dtype,
-            post_capture_active=self.post_capture_kv_active,
+            post_capture_active=self.post_capture_kv_active and quant_method is None,
             head_num=self.model_config.get_num_kv_heads(
                 get_parallel().attn_tp_size, get_parallel().attn_dcp_size
             ),
@@ -2429,6 +2436,7 @@ class KVCacheConfigurator:
             enable_kv_cache_copy=(get_spec().speculative_algorithm is not None),
             token_to_kv_pool_class=swa_pool_class,
             enable_memory_saver=get_exec().features.enable_memory_saver,
+            quant_method=quant_method,
             **kwargs,
         )
         return token_to_kv_pool
