@@ -24,6 +24,7 @@ import torch.nn.functional as F
 from einops import rearrange
 from transformers import PretrainedConfig
 
+from sglang.srt.hf_transformers import get_processor
 from sglang.srt.layers.activation import QuickGELU
 from sglang.srt.layers.attention.vision import (
     VisionAttention,
@@ -46,7 +47,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.ernie45_moe_vl import Ernie4_5_VLMoeModel
 from sglang.srt.utils import add_prefix
-from sglang.srt.utils.hf_transformers import get_processor
 
 logger = logging.getLogger(__name__)
 
