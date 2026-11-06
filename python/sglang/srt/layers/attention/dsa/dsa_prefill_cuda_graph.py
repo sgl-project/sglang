@@ -76,34 +76,16 @@ def pcg_dsa_indexer_prefill_split(
     metadata = get_attn_backend().get_indexer_metadata(layer_id, forward_batch)
 
     extend_num_tokens = forward_batch.extend_num_tokens
-    # Interleave BCG replays a bucket-sized local shard: only its live rows
-    # are queried, and the top-k rows past this rank's logical tokens stay -1.
-    cp = is_interleave_extend(forward_batch)
-    if cp:
-        from sglang.srt.layers.cp.bcg.interleave_bcg import cp_interleave_indexer_rows
-
-        query_tokens, logical_tokens = cp_interleave_indexer_rows(forward_batch)
-        parts = x if isinstance(x, tuple) else (x,)
-        if not 0 <= logical_tokens <= query_tokens or any(
-            query_tokens > part.shape[0] for part in parts
-        ):
-            raise ValueError("Invalid CP indexer live rows")
-        if query_tokens > q_lora.shape[0] or query_tokens > positions.shape[0]:
-            raise ValueError("CP indexer input rows do not cover the live shard")
-        x = (
-            tuple(part[:query_tokens] for part in parts)
-            if isinstance(x, tuple)
-            else x[:query_tokens]
-        )
-        q_lora, positions = q_lora[:query_tokens], positions[:query_tokens]
-        topk_result.fill_(-1)
+    in_cp = forward_batch.attn_cp_metadata is not None
     # Empty buffer encodes return_indices=False for graph dispatch.
     return_indices = topk_result.numel() != 0
     k_only = not return_indices or (
         indexer._should_skip_logits_computation(forward_batch)
         and not indexer.dsa_enable_prefill_cp
     )
-    if k_only and not cp:
+    # The K-only path stores the local K without the CP all-gather, so a
+    # top-k-reuse layer under CP takes the gathered store below instead.
+    if k_only and not in_cp:
         indexer._forward_cuda_k_only(
             x,
             positions,
@@ -118,7 +100,7 @@ def pcg_dsa_indexer_prefill_split(
         return
 
     # Same fused Q/K writer as the eager ROCm path, sliced to the unpadded count.
-    if not cp and indexer._aiter_fused_fp8_active(forward_batch):
+    if indexer._aiter_fused_fp8_active(forward_batch):
         q_fp8, weights = indexer._aiter_fused_fp8_prepare_and_store(
             x,
             q_lora,
@@ -141,7 +123,6 @@ def pcg_dsa_indexer_prefill_split(
     # Fused path stores K and computes q_fp8 + head gate in the
     # fused kernels, sliced to the unpadded count. Single stream: the split op is
     # captured, so the dual-stream overlap is disabled.
-    in_cp = forward_batch.attn_cp_metadata is not None
     if indexer.use_dsa_indexer_fusion and not in_cp:
         q_fp8, weights = indexer._fused_q_prepare_and_store(
             x,
@@ -206,7 +187,12 @@ def pcg_dsa_indexer_prefill_split(
         metadata,
         topk_result,
     )
-    if cp:
+    if is_interleave_extend(forward_batch):
+        # Interleave BCG replays a bucket-sized local shard: the top-k rows
+        # past this rank's logical tokens stay -1.
+        from sglang.srt.layers.cp.bcg.interleave_bcg import cp_interleave_indexer_rows
+
+        _, logical_tokens = cp_interleave_indexer_rows(forward_batch)
         topk_result[logical_tokens:].fill_(-1)
 
 
