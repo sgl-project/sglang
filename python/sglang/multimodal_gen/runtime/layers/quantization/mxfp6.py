@@ -29,7 +29,7 @@ if _IMPORT_ERROR is None:
         in_features: int,
     ) -> torch.Tensor:
         x_fp6, x_scale = quant_mxfp6_gemm(x)
-        return gemm_a6w6(
+        y = gemm_a6w6(
             x_fp6,
             weight,
             x_scale,
@@ -39,6 +39,10 @@ if _IMPORT_ERROR is None:
             in_features,
             dtype=torch.bfloat16,
         )
+        # The gemm returns a slice of its 256-padded output, which is strided
+        # when out_features is not a multiple of 256; the op must hand back the
+        # dense layout its fake implementation reports.
+        return y.contiguous()
 
     def _mxfp6_quant_gemm_fake(
         x: torch.Tensor,

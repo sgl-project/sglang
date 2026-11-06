@@ -61,6 +61,11 @@ def test_packed_mx_linear_matches_bf16(request, fmt) -> None:
 
     x = torch.randn(rows, in_f, generator=g).to("cuda", torch.bfloat16)
     out, _ = layer(x)
+    # out_f is not a multiple of the gemm's 256-wide tile, so the kernel hands
+    # back a strided slice of its padded output. The custom op must return the
+    # dense layout its fake implementation reports, or a compiled graph plans
+    # the wrong strides for everything downstream.
+    assert out.is_contiguous()
     ref = x.float() @ weight.float().t()
     rel = ((out.float() - ref).norm() / ref.norm()).item()
     # a6w4's 4-bit weights carry more error than mxfp6's 6-bit ones; both

@@ -4,7 +4,8 @@
 Both kernels take operands that a packer has already flattened into an opaque
 uint8 blob plus packed E8M0 scales, laid out for the kernel's 256-row / 128-K
 tiling. The blob carries no shape, so N and K travel to the GEMM as ints, and
-the GEMM slices its padded output, which can leave the result non-contiguous.
+the GEMM slices its 256-padded output, so each custom op makes the result dense
+again before it returns.
 Both are ROCm gfx95x (MI350+) only and emit bf16, so a layer whose parameters
 are not bf16 keeps the unquantized linear.
 """
@@ -130,7 +131,7 @@ class PackedMXLinearMethod(LinearMethodBase):
         out_features: int,
         in_features: int,
     ) -> torch.Tensor:
-        """Quantize activations and run the GEMM, returning bf16 [M, N]."""
+        """Quantize activations and run the GEMM, returning dense bf16 [M, N]."""
         raise NotImplementedError
 
     def _require_kernels(self) -> None:
@@ -241,8 +242,6 @@ class PackedMXLinearMethod(LinearMethodBase):
         if bias is not None:
             y = y + bias
 
-        # The gemm slices its padded output, so the result can be
-        # non-contiguous and only reshape can restore the leading dims.
         return y.reshape(*original_shape[:-1], out_features)
 
 
