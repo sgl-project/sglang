@@ -2624,10 +2624,10 @@ class DeepseekV4AttnBackend(
                     ).to(torch.int32)
                 )
 
-            # Refresh low-ratio source metadata from the live decode inputs.
-            if (
-                metadata.core_metadata.low_ratios
-                and forward_batch.forward_mode.is_decode()
+            # Refresh low-ratio source metadata from the live decode or verify inputs.
+            if metadata.core_metadata.low_ratios and (
+                forward_batch.forward_mode.is_decode()
+                or forward_batch.forward_mode.is_target_verify()
             ):
                 metadata.low_ratio_req_indices = token_req_indices(forward_batch)
                 metadata.low_ratio_pos_i64 = forward_batch.positions.to(torch.int64)

@@ -11,11 +11,13 @@ from torch.nn.parameter import Parameter
 from sglang.kernels.ops.gemm.fp8_gfx1250 import (
     gfx1250_fp8_scaled_mm,
     gfx1250_fp8_scaled_mm_supported,
-    per_token_quant_fp8_gfx1250,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import (
     is_fp8_fnuz,
     per_token_group_quant_fp8,
+)
+from sglang.kernels.ops.quantization.per_token_quant_fp8_gfx1250 import (
+    per_token_quant_fp8_gfx1250,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_tensor_model_parallel_world_size,
