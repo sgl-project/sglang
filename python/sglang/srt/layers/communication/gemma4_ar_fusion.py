@@ -61,7 +61,7 @@ def _get_state() -> Optional[_State]:
         CustomAllReduceV2,
     )
     from sglang.srt.runtime_context import get_parallel
-    from sglang.srt.utils.common import get_device_sm
+    from sglang.srt.utils.device import get_device_sm
 
     if get_device_sm() != 90:
         logger.warning(
