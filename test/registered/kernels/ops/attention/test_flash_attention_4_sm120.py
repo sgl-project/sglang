@@ -19,6 +19,7 @@ from sglang.kernels.ops.attention.flash_attention_v4_sm120 import (
     flash_attn_with_kvcache,
     get_flash_attention_v4_sm120_runtime_policy,
 )
+from sglang.kernels.ops.attention.flash_attn.cute.interface import _flash_attn_fwd
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
@@ -1840,6 +1841,46 @@ def test_sm120_forward_only_varlen_cache_is_pack_order_independent(monkeypatch):
     )
     assert cache_hits[-1]
     _assert_attention_close(alternate_output, alternate_reference)
+
+
+def test_sm120_explicit_tile_varlen_launch_stores_no_plan(monkeypatch):
+    """A varlen launch with an explicit tile_mn must not store a plan; a later
+    default call on the same shapes would replay that tile."""
+    sm120_forward_host.clear_launch_plans()
+    registrations = []
+    original_register_varlen = sm120_forward_host.register_varlen
+
+    def record_registration(**kwargs):
+        registrations.append(kwargs)
+        return original_register_varlen(**kwargs)
+
+    monkeypatch.setattr(sm120_forward_host, "register_varlen", record_registration)
+    torch.manual_seed(20261105)
+    lengths = (128, 111, 97)
+    num_q_heads, num_kv_heads, head_dim = 8, 2, 128
+    q = torch.randn(
+        sum(lengths), num_q_heads, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    k = torch.randn(
+        sum(lengths), num_kv_heads, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    offsets = [0]
+    for length in lengths:
+        offsets.append(offsets[-1] + length)
+    cu_seqlens = torch.tensor(offsets, dtype=torch.int32, device="cuda")
+    _flash_attn_fwd(
+        q,
+        k,
+        torch.randn_like(k),
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_k=cu_seqlens,
+        max_seqlen_q=max(lengths),
+        max_seqlen_k=max(lengths),
+        causal=True,
+        tile_mn=(64, 64),
+    )
+    torch.cuda.synchronize()
+    assert registrations == []
 
 
 def test_sm120_varlen_padding_ctas_are_inert_across_tile_specializations():

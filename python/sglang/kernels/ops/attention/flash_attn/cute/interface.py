@@ -1787,6 +1787,7 @@ def _flash_attn_fwd(
             compiled_fwd = _flash_attn_fwd.compile_cache[compile_key]
             if (
                 arch_forward_host is not None
+                and uses_default_tiles
                 and cu_seqlens_q is not None
                 and cu_seqlens_k is not None
                 and seqused_q is None
