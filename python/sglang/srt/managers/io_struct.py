@@ -30,6 +30,7 @@ from array import array
 from collections import Counter
 from dataclasses import dataclass, field
 from enum import Enum
+from http import HTTPStatus
 from typing import (
     TYPE_CHECKING,
     Annotated,
@@ -91,6 +92,10 @@ else:
     Image = Any
 
 logger = logging.getLogger(__name__)
+
+# Abort status codes answered as an HTTP error rather than as a finished
+# response with finish_reason "abort".
+HTTP_ERROR_ABORT_STATUSES = frozenset(range(HTTPStatus.BAD_REQUEST, 600))
 
 
 class BaseReq(msgspec.Struct, tag=True, kw_only=True, array_like=True):
