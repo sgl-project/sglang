@@ -18,13 +18,13 @@ import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
 from sglang.srt.environ import envs
+from sglang.srt.multimodal.media_io import ImageData, VideoData
 from sglang.srt.runtime_context import get_context, get_exec
 from sglang.srt.sampling.watermarking.core import (
     WATERMARK_CONTAINER_FIELD_NAMES,
     WATERMARK_SECRET_FIELD_NAMES,
     redact_watermark_secrets,
 )
-from sglang.srt.utils import ImageData, VideoData
 from sglang.srt.utils.log_utils import create_log_targets, log_json
 
 if TYPE_CHECKING:
