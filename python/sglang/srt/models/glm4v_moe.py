@@ -15,12 +15,13 @@ from sglang.srt.layers.moe.utils import get_num_fused_shared_experts
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.glm4_moe import Glm4MoeModel
 from sglang.srt.models.glm4v import Glm4vForConditionalGeneration, Glm4vVisionModel
 from sglang.srt.runtime_context import get_mm, get_parallel
-from sglang.srt.utils import add_prefix, get_device_sm, is_cuda, log_info_on_rank0
+from sglang.srt.utils import get_device_sm, is_cuda, log_info_on_rank0
 
 _is_cuda = is_cuda()
 _device_sm = get_device_sm()
