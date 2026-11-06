@@ -1,206 +1,24 @@
-"""Unit tests for bench_serving response accounting."""
+"""Unit tests for prompt length and usage accounting in bench_serving."""
 
-import asyncio
 import copy
-import json
-import threading
 import unittest
-from argparse import Namespace
 from dataclasses import replace
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from types import SimpleNamespace
 
 from sglang.benchmark.datasets.common import DatasetRow
 from sglang.benchmark.serving import (
-    RequestFuncInput,
     async_request_openai_chat_completions,
     async_request_openai_completions,
-    async_request_sglang_generate,
     calculate_metrics,
-    set_global_args,
     wrap_multi_turn_request_func,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.kits.bench_serving_http import (
+    ROW_PROMPT_LEN,
+    _BenchServingHTTPTestCase,
+)
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
-
-# The dataset row's value; never what the stub reports.
-ROW_PROMPT_LEN = 9999
-
-
-class _ServingHandler(BaseHTTPRequestHandler):
-    """Serve native events or chat responses with opt-in streaming usage."""
-
-    def do_POST(self):  # noqa: N802
-        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-        self.server.bodies.append(body)
-        usage = {
-            "completion_tokens": 1,
-            "prompt_tokens": self.server.prompt_tokens[len(self.server.bodies) - 1],
-        }
-        if body.get("stream"):
-            if self.path == "/generate":
-                chunks = self.server.native_chunks
-            else:
-                choice = (
-                    {"index": 0, "text": "hi"}
-                    if self.path == "/v1/completions"
-                    else {"index": 0, "delta": {"content": "hi"}}
-                )
-                chunks = [{"choices": [choice]}]
-                if (body.get("stream_options") or {}).get(
-                    "include_usage"
-                ) and not self.server.omit_usage:
-                    chunks.append({"choices": [], "usage": usage})
-            content_type = "text/event-stream"
-            payload = b"".join(f"data: {json.dumps(c)}\n\n".encode() for c in chunks)
-            payload += b"data: [DONE]\n\n"
-        else:
-            message = {"role": "assistant", "content": "hi"}
-            choice = {"index": 0, "message": message, "finish_reason": "length"}
-            content_type = "application/json"
-            payload = json.dumps({"choices": [choice], "usage": usage}).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", content_type)
-        self.end_headers()
-        self.wfile.write(payload)
-
-    def log_message(self, fmt, *args):
-        pass
-
-
-class _BenchServingHTTPTestCase(CustomTestCase):
-    def setUp(self):
-        self.server = HTTPServer(("127.0.0.1", 0), _ServingHandler)
-        self.server.omit_usage = False
-        threading.Thread(target=self.server.serve_forever, daemon=True).start()
-        self.addCleanup(self.server.server_close)
-        self.addCleanup(self.server.shutdown)
-
-    def _run(
-        self, request_func, prompt, prompt_tokens, stream=True, extra=None, success=True
-    ):
-        self.server.bodies = []
-        self.server.prompt_tokens = prompt_tokens
-        set_global_args(
-            Namespace(
-                disable_stream=not stream,
-                disable_ignore_eos=True,
-                print_requests=False,
-                tokenizer="",
-                header=None,
-                cache_report=False,
-                temperature=0.0,
-                top_p=1.0,
-                return_logprob=False,
-                return_routed_experts=False,
-                logprob_start_len=-1,
-                top_logprobs_num=0,
-                token_ids_logprob=None,
-            )
-        )
-        endpoint = {
-            async_request_sglang_generate: "/generate",
-            async_request_openai_completions: "/v1/completions",
-        }.get(request_func, "/v1/chat/completions")
-        request = RequestFuncInput(
-            prompt=prompt,
-            api_url=f"http://127.0.0.1:{self.server.server_port}{endpoint}",
-            prompt_len=ROW_PROMPT_LEN,
-            output_len=8,
-            model="dummy-model",
-            lora_name="",
-            image_data=None,
-            extra_request_body=extra or {},
-        )
-        out = asyncio.run(request_func(request))
-        outputs = out if isinstance(out, list) else [out]
-        for o in outputs:
-            self.assertEqual(o.success, success, o.error)
-        return outputs
-
-
-class TestBenchServingNativeStream(_BenchServingHTTPTestCase):
-    def test_native_streamed_failures_are_excluded_from_metrics(self):
-        """HTTP 200 must not make an aborted stream count as successful work."""
-        message = "Input length exceeds the maximum allowed length."
-        normal = {
-            "text": "hi",
-            "meta_info": {"prompt_tokens": 7, "completion_tokens": 1},
-        }
-        self.server.native_chunks = [normal]
-        good = self._run(async_request_sglang_generate, "hello", [7])[0]
-        row = DatasetRow(prompt="hello", prompt_len=ROW_PROMPT_LEN, output_len=8)
-        cases = [
-            (
-                "abort",
-                {"meta_info": {"finish_reason": {"type": "abort", "message": message}}},
-                message,
-            ),
-            (
-                "abort without message",
-                {"meta_info": {"finish_reason": {"type": "abort"}}},
-                "Request aborted",
-            ),
-            ("error object", {"error": {"message": message}}, message),
-            ("error string", {"error": message}, message),
-            ("empty error", {"error": {}}, "Server returned an error"),
-        ]
-        for name, terminal, error in cases:
-            for prefix in ([], [normal]):
-                with self.subTest(name=name, partial_output=bool(prefix)):
-                    self.server.native_chunks = prefix + [terminal]
-                    failed = self._run(
-                        async_request_sglang_generate, "hello", [7], success=False
-                    )[0]
-                    self.assertIn(error, failed.error)
-                    self.assertEqual(failed.output_len, 0)
-                    metrics, output_lens = calculate_metrics(
-                        input_requests=[row, row],
-                        outputs=[good, failed],
-                        dur_s=2.0,
-                        tokenizer=SimpleNamespace(
-                            encode=lambda text, **kwargs: list(text)
-                        ),
-                        backend="sglang",
-                    )
-                    self.assertEqual(metrics.completed, 1)
-                    self.assertEqual(metrics.total_input, 7)
-                    self.assertEqual(metrics.total_output, 1)
-                    self.assertEqual(metrics.total_throughput, 4.0)
-                    self.assertEqual(output_lens, [1, 0])
-
-    def test_native_completion_count_does_not_require_visible_text(self):
-        """An empty or metadata-only chunk can still report a token count."""
-        for completion_tokens, prefix in ((0, []), (3, []), (3, ["hi"])):
-            with self.subTest(completion_tokens=completion_tokens, prefix=prefix):
-                self.server.native_chunks = [
-                    {"text": text, "meta_info": {"completion_tokens": 1}}
-                    for text in prefix
-                ] + [
-                    {"text": "", "meta_info": {"completion_tokens": completion_tokens}}
-                ]
-                output = self._run(async_request_sglang_generate, "hello", [7])[0]
-                self.assertEqual(output.output_len, completion_tokens)
-                self.assertEqual(output.generated_text, "".join(prefix))
-                self.assertEqual(len(output.itl), max(0, completion_tokens - 1))
-
-    def test_native_metadata_only_token_deltas_update_itl(self):
-        self.server.native_chunks = [
-            {"meta_info": {"prompt_tokens": 7}},
-            {"text": "", "meta_info": {"completion_tokens": 0}},
-            {"text": "a", "meta_info": {"completion_tokens": 1}},
-            {"text": "abcdefgh", "meta_info": {"completion_tokens": 8}},
-            {"meta_info": {"completion_tokens": 10}},
-            {"text": "", "meta_info": {"completion_tokens": 10}},
-        ]
-        output = self._run(async_request_sglang_generate, "hello", [7])[0]
-        self.assertEqual(output.output_len, 10)
-        self.assertEqual(output.generated_text, "abcdefgh")
-        self.assertEqual(len(output.itl), 9)
-        self.assertGreater(output.ttft, 0.0)
-        self.assertGreater(sum(output.itl), 0.0)
 
 
 class TestBenchServingPromptLen(_BenchServingHTTPTestCase):
