@@ -278,6 +278,9 @@ class ServerArgs:
                 validate_mps_model_config(
                     model_config_of(self),
                     lora_enabled=lora_enabled,
+                    attention_backend=cfg.attention_backend,
+                    prefill_attention_backend=cfg.prefill_attention_backend,
+                    decode_attention_backend=cfg.decode_attention_backend,
                 )
         except BaseException:
             self._resolution_failed = True

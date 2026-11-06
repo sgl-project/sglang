@@ -182,6 +182,21 @@ class TestEarlyEmbeddings(CustomTestCase):
         self.assertIsNone(early.prefetched(b"a" * 32, 6))
         self.assertIsNone(early.prefetched(None, 5))
 
+    def test_mps_encodes_parked_pages_at_prefill(self):
+        """The early encode runs on a CUDA side stream; MPS has none, so only
+        MPS turns it off and encodes the pages at prefill."""
+        early = p.EarlyEmbeddings(encode=lambda items: None)
+        for device, encode_ahead in (("cuda", True), ("xpu", True), ("mps", False)):
+            with self.subTest(device=device):
+                prefetch = p.DocPrefetch(
+                    early=early,
+                    device=torch.device(device),
+                    forward_stream=None,
+                    tp_size=1,
+                    abort_windows=lambda reqs, finished_reason: None,
+                )
+                self.assertEqual(prefetch._encode_ahead, encode_ahead)
+
 
 if __name__ == "__main__":
     unittest.main()
