@@ -1154,5 +1154,95 @@ class TestBackendOptIn(CustomTestCase):
         self.assertFalse(CommonKVManager.supports_deferred_decode_kv_release)
 
 
+class _EarlyReceiver(CommonKVReceiver):
+    """Concrete CommonKVReceiver shell that preserves real clear() and
+    failure_exception() implementations."""
+
+    def poll(self):
+        return self.kv_mgr.check_status(self.bootstrap_room)
+
+
+class TestReceiverClearIdempotency(CustomTestCase):
+    """Under default 'early' decode allocation (defer_decode_allocation=False),
+    a failed receiver is cleared once in failure_exception() and a second time
+    when _do_release() resolves the deferred release. The second clear() must
+    be a no-op so it cannot evict a new receiver's request_status entry on the
+    same bootstrap_room."""
+
+    def setUp(self):
+        super().setUp()
+        _run_as_single_rank(self)
+
+    def _make_early_mgr(self):
+        mgr = _make_manager()
+        mgr.defer_decode_allocation = False
+        mgr.request_status = {}
+        mgr.required_prefill_response_num_table = {}
+        mgr.prefill_response_tracker = {}
+        mgr.addr_to_rooms_tracker = {"10.0.0.2:6000": set()}
+        mgr.failure_lock = threading.Lock()
+        mgr.failure_records = {}
+        return mgr
+
+    def _make_early_receiver(self, mgr, room: int):
+        recv = _EarlyReceiver.__new__(_EarlyReceiver)
+        recv.kv_mgr = mgr
+        recv.bootstrap_room = room
+        recv.bootstrap_addr = "10.0.0.2:6000"
+        recv.bootstrap_infos = [{"rank": 0}]
+        recv.conclude_state = None
+        recv.abort_notified = True
+        recv._owns_bootstrap_room = True
+        mgr.addr_to_rooms_tracker[recv.bootstrap_addr].add(room)
+        mgr.prefill_response_tracker[room] = set()
+        mgr.request_status[room] = KVPoll.WaitingForInput
+        return recv
+
+    def test_second_clear_under_early_allocation_preserves_reopened_room_status(self):
+        mgr = self._make_early_mgr()
+        r1 = self._make_early_receiver(mgr, room=42)
+        dreq1 = SimpleNamespace(
+            req=FakeReq(bootstrap_room=42, rid="r1", return_logprob=False),
+            kv_receiver=r1,
+            metadata_buffer_index=3,
+            hicache_restore_status=None,
+            host_staged=False,
+            awaiting_publish=False,
+            pending_metadata=None,
+            is_rebootstrap=False,
+        )
+        generation = mgr.register_deferred_abort_room(42)
+        q = _make_pop_queue(mgr)
+        q.queue.join([dreq1])
+
+        with (
+            patch.object(decode_mod, "prepare_abort"),
+            patch.object(q.scheduler.request_retirer, "release"),
+        ):
+            # Step 1: pop_transferred() sees KVPoll.Failed, invokes
+            # r1.failure_exception() -> first r1.clear(), and holds dreq1 in
+            # q._deferred_releases.
+            q.pop_transferred()
+            self.assertFalse(r1._owns_bootstrap_room)
+            self.assertNotIn(42, mgr.request_status)
+            self.assertEqual(len(q._deferred_releases), 1)
+
+            # Step 2: A second receiver re-opens room 42 before r1's drain ACK
+            # arrives.
+            r2 = self._make_early_receiver(mgr, room=42)
+            self.assertEqual(r2.poll(), KVPoll.WaitingForInput)
+
+            # Step 3: r1's drain ACK arrives and resolve_deferred_releases()
+            # runs _do_release(dreq1) -> second r1.clear().
+            mgr.note_abort_ack(42, 0, generation)
+            q.resolve_deferred_releases()
+
+        self.assertEqual(len(q._deferred_releases), 0)
+        # r2's status entry must remain intact so r2.poll() -> check_status()
+        # does not raise KeyError.
+        self.assertEqual(r2.poll(), KVPoll.WaitingForInput)
+        self.assertIn(42, mgr.addr_to_rooms_tracker["10.0.0.2:6000"])
+
+
 if __name__ == "__main__":
     unittest.main()
