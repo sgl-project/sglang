@@ -822,7 +822,7 @@ class TestKernelMetadataGraphBuffers(unittest.TestCase):
         )
         return backend.graph_metadata[batch]
 
-    def test_metadata_sizes_follow_kernel_outputs_and_replay_preserves_addresses(self):
+    def test_graph_metadata_uses_abi_sizes_without_launching_kernels(self):
         # Cover both hardware generations and distinct attention/indexer ABIs.
         # The 2048-element case reproduces the CANN 9.2 A3 service failure.
         for arch35 in (False, True):
@@ -836,6 +836,15 @@ class TestKernelMetadataGraphBuffers(unittest.TestCase):
                             dspark=dspark,
                         ),
                         patch(self._BACKEND + ".is_npu_arch35", return_value=arch35),
+                        patch(
+                            self._BACKEND
+                            + ".npu_transformer_compat.get_transformer_metadata_size",
+                            side_effect=lambda name: (
+                                indexer_size
+                                if name == "quant_lightning_indexer_metadata"
+                                else attention_size
+                            ),
+                        ),
                         patch(self._BACKEND + "._sparse_attn_ops") as select_ops,
                         patch(self._BACKEND + ".npu_indexer_ops") as indexer_ops,
                     ):
@@ -863,6 +872,8 @@ class TestKernelMetadataGraphBuffers(unittest.TestCase):
                         )
                         backend = self._make_backend(dspark=dspark)
                         backend._init_dsv4_graph_buffers(max_bs=2, max_num_tokens=12)
+                        select_ops.assert_not_called()
+                        indexer_ops.quant_lightning_indexer_metadata.assert_not_called()
                         expected_sizes = {
                             "c1a_metadata": attention_size,
                             "c4a_metadata": attention_size,
@@ -897,6 +908,10 @@ class TestKernelMetadataGraphBuffers(unittest.TestCase):
     def test_swa_only_allocates_only_the_enabled_metadata_api(self):
         with (
             patch(self._BACKEND + ".is_npu_arch35", return_value=False),
+            patch(
+                self._BACKEND + ".npu_transformer_compat.get_transformer_metadata_size",
+                return_value=2048,
+            ),
             patch(self._BACKEND + "._sparse_attn_ops") as select_ops,
             patch(self._BACKEND + ".npu_indexer_ops") as indexer_ops,
         ):
@@ -906,6 +921,7 @@ class TestKernelMetadataGraphBuffers(unittest.TestCase):
             )
             backend = self._make_backend(has_compress=False)
             backend._init_dsv4_graph_buffers(max_bs=2, max_num_tokens=2)
+            select_ops.assert_not_called()
             metadata = self._capture_bucket(backend, 1)
             self.assertEqual(set(metadata.kernel_metadata), {"c1a_metadata"})
             self.assertEqual(metadata.kernel_metadata["c1a_metadata"].shape, (2048,))
