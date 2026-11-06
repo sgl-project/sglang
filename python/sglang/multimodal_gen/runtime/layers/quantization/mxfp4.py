@@ -54,7 +54,9 @@ if _is_hip and gemm_a4w4 is not None and get_hip_quant is not None:
         weight: torch.Tensor,
         weight_scale: torch.Tensor,
     ) -> torch.Tensor:
-        x_fp4, x_scale = _activation_quant(x, shuffle=True)
+        # The HIP quantizer reads each row as one dense run, so the input must
+        # have a contiguous last dimension; this is a no-op when it already does.
+        x_fp4, x_scale = _activation_quant(x.contiguous(), shuffle=True)
         return gemm_a4w4(x_fp4, weight, x_scale, weight_scale)
 
     def _mxfp4_quant_gemm_fake(
