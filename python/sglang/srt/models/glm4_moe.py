@@ -36,6 +36,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.hf_transformers import get_rope_config
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.dp_attention import (
@@ -98,7 +99,6 @@ from sglang.srt.utils import (
     log_info_on_rank0,
     make_pp_layers,
 )
-from sglang.srt.utils.hf_transformers import get_rope_config
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
