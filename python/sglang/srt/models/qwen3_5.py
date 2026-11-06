@@ -48,6 +48,7 @@ from sglang.srt.distributed import get_pp_indices
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.hf_transformers import get_processor, get_rope_config
 from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
@@ -154,7 +155,6 @@ from sglang.srt.utils import (
     set_weight_attrs,
     use_intel_amx_backend,
 )
-from sglang.srt.utils.hf_transformers import get_processor, get_rope_config
 
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
