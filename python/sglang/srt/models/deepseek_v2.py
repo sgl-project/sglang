@@ -70,7 +70,7 @@ from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.amx_utils import PackWeightMethod
-from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer
+from sglang.srt.layers.attention.dsa.dsa_fp4_indexer import dsa_indexer_cls
 from sglang.srt.layers.attention.dsa.dsa_indexer_kpool import IndexerKPool
 from sglang.srt.layers.attention.dsa.utils import (
     maybe_prefetch_next_full_attention_kv,
@@ -2180,7 +2180,9 @@ class DeepseekV2AttentionMLA(
             if not self.skip_topk or is_nextn:
                 is_neox_style = not getattr(config, "indexer_rope_interleave", False)
                 indexer_cls = (
-                    IndexerKPool if get_dsa_index_kpool(config) > 1 else Indexer
+                    IndexerKPool
+                    if get_dsa_index_kpool(config) > 1
+                    else dsa_indexer_cls()
                 )
                 indexer_kwargs = dict(
                     hidden_size=hidden_size,

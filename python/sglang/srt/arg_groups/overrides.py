@@ -2029,10 +2029,13 @@ def post_capture_kv_sizing_planned(server_args: Any) -> bool:
         ):
             return False
 
-    from sglang.srt.configs.model_config import is_deepseek_v4, is_minimax_sparse
+    from sglang.srt.configs.model_config import (
+        is_minimax_sparse,
+        uses_compressed_kv_attention,
+    )
 
     hf_config = model_config.hf_config
-    if is_deepseek_v4(hf_config) or is_minimax_sparse(hf_config):
+    if uses_compressed_kv_attention(hf_config) or is_minimax_sparse(hf_config):
         return False
 
     return True
