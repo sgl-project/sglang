@@ -128,12 +128,10 @@ class Qwen2MLP(nn.Module):
             gate_up, _ = self.gate_up_proj(x)
             if can_run_silu_fp4_quant_fusion(self, gate_up):
                 x = silu_and_mul_fp4_quant(self, gate_up)
-            elif forward_batch is not None and forward_batch.forward_mode.is_decode():
-                x = self.activation_quant.forward_decode(
-                    gate_up, self.act_fn, self.down_proj
-                )
             else:
-                x = self.act_fn(gate_up)
+                x = self.activation_quant(
+                    x=gate_up, act_fn=self.act_fn, down_proj=self.down_proj
+                )
         x, _ = self.down_proj(x, forward_batch=forward_batch)
         return x
 
