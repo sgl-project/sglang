@@ -38,7 +38,7 @@ _PASS1_IN_PROCESS: dict = {}
 
 def record_pass1(case_id: str, metrics: dict) -> None:
     """Persist the pass-1 metrics snapshot for the pass-2 comparison."""
-    _PASS1_IN_PROCESS[case_id] = metrics
+    _PASS1_IN_PROCESS[case_id] = {k: float(v) for k, v in metrics.items()}
     path = _handoff_path(case_id)
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
