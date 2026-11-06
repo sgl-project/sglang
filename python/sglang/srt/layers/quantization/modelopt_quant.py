@@ -36,7 +36,9 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.fp4_utils import (
+    apply_fused_global_scale_ratio,
     fp4_quantize,
+    fused_global_scale_ratio,
     get_fp4_gemm_runner_backend,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod, Fp8MoEMethod
@@ -1766,21 +1768,6 @@ class HybridFp8NvFp4Config(Fp8Config):
         self.nvfp4_config.apply_weight_name_mapper(hf_to_sglang_mapper)
 
 
-def _warn_if_fused_weight_scale_2_differ(
-    weight_scale_2: torch.Tensor, scheme: str
-) -> None:
-    """The FP4 GEMMs take one weight_scale_2 per layer, the largest of the
-    fused projections' (q/k/v, gate/up). A projection with a smaller one is
-    dequantized with the wrong scale."""
-    if torch.unique(weight_scale_2).numel() != 1:
-        logger.warning(
-            "In %s linear, weight_scale_2 differs across fused parallel layers "
-            "(%s); the largest is used for all of them. Accuracy may be degraded.",
-            scheme,
-            weight_scale_2.tolist(),
-        )
-
-
 class ModelOptFp4LinearMethod(LinearMethodBase):
     """Linear method for NVFP4.
     Supports loading NVFP4 checkpoints with the following structure:
@@ -1899,8 +1886,11 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         input_scale_2 = layer.input_scale.max().to(torch.float32)
-        _warn_if_fused_weight_scale_2_differ(layer.weight_scale_2, "NVFP4")
-        weight_scale_2 = layer.weight_scale_2.max().to(torch.float32)
+        # The GEMMs take one weight_scale_2 per layer; fused projections (q/k/v,
+        # gate/up) whose scales differ get theirs back on the output.
+        weight_scale_2, layer.fused_global_scale_ratio = fused_global_scale_ratio(
+            layer.weight_scale_2.data, layer.logical_widths, divisor=False
+        )
 
         if self.quant_mode == "w4a16":
             from flashinfer import prepare_bf16_fp4_weights
@@ -2094,8 +2084,9 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        ratio = getattr(layer, "fused_global_scale_ratio", None)
         if get_fp4_gemm_runner_backend().is_marlin():
-            return apply_fp4_marlin_linear(
+            out = apply_fp4_marlin_linear(
                 input=x,
                 weight=layer.weight,
                 weight_scale=layer.weight_scale,
@@ -2103,8 +2094,12 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
                 workspace=layer.workspace,
                 size_n=layer.output_size_per_partition,
                 size_k=layer.input_size_per_partition,
-                bias=bias,
+                bias=bias if ratio is None else None,
             )
+            if ratio is None:
+                return out
+            out = apply_fused_global_scale_ratio(out, ratio)
+            return out if bias is None else out + bias
 
         if self.quant_mode == "w4a4":
             # `_accepts_prequantized_fp4` is the explicit opt-in so an accidental
@@ -2154,6 +2149,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
 
             # Slice output to remove N-dimension padding
             out = slice_nvfp4_output(out, output_size)
+            out = apply_fused_global_scale_ratio(out, ratio)
 
             if bias is not None:
                 out = out + bias
@@ -2171,6 +2167,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
                 layer.output_size_per_partition,
                 self.quant_mode,
             )
+            out = apply_fused_global_scale_ratio(out, ratio)
             if bias is not None:
                 out = out + bias
             return out.view(*x.shape[:-1], layer.output_size_per_partition)
@@ -2285,13 +2282,12 @@ class ModelOptNvFp4A16LinearMethod(LinearMethodBase):
         if hasattr(layer, "input_scale"):
             del layer.input_scale
 
-        _warn_if_fused_weight_scale_2_differ(layer.weight_scale_2, "NVFP4A16")
-
-        copy_or_rebind_param(
-            layer,
-            "weight_global_scale",
-            layer.weight_scale_2.max().to(torch.float32),
+        # The Marlin kernel takes one weight_scale_2 per layer; fused projections
+        # (q/k/v, gate/up) whose scales differ get theirs back on the output.
+        weight_scale_2, layer.fused_global_scale_ratio = fused_global_scale_ratio(
+            layer.weight_scale_2.data, layer.logical_widths, divisor=False
         )
+        copy_or_rebind_param(layer, "weight_global_scale", weight_scale_2)
         del layer.weight_scale_2
 
         if self.quant_config.group_size != 16:
@@ -2307,7 +2303,8 @@ class ModelOptNvFp4A16LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        return apply_fp4_marlin_linear(
+        ratio = getattr(layer, "fused_global_scale_ratio", None)
+        out = apply_fp4_marlin_linear(
             input=x,
             weight=layer.weight,
             weight_scale=layer.weight_scale,
@@ -2315,8 +2312,12 @@ class ModelOptNvFp4A16LinearMethod(LinearMethodBase):
             workspace=layer.workspace,
             size_n=layer.output_size_per_partition,
             size_k=layer.input_size_per_partition,
-            bias=bias,
+            bias=bias if ratio is None else None,
         )
+        if ratio is None:
+            return out
+        out = apply_fused_global_scale_ratio(out, ratio)
+        return out if bias is None else out + bias
 
 
 def _input_scale_to_local_experts(

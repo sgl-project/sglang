@@ -32,8 +32,13 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW8A8Fp8MoE,
     CompressedTensorsWNA16,
     compressed_tensors_w4a4_nvfp4,
+    compressed_tensors_w4a16_nvfp4,
 )
-from sglang.srt.layers.quantization.fp4_utils import Fp4GemmRunnerBackend
+from sglang.srt.layers.quantization.fp4_utils import (
+    Fp4GemmRunnerBackend,
+    apply_fused_global_scale_ratio,
+    fused_global_scale_ratio,
+)
 from sglang.srt.runtime_context import override_platform
 from sglang.test.test_utils import CustomTestCase
 
@@ -313,14 +318,28 @@ class TestWeightOnlyFp4WeightCreation(CustomTestCase):
         layer = _linear_layer(CompressedTensorsW4A16Mxfp4(has_input_activations=True))
         self.assertFalse(hasattr(layer, "input_global_scale"))
 
-    def test_mismatched_fused_global_scales_are_rejected(self):
-        """Both kernels take one global scale per layer, so fused projections
-        (q/k/v) whose scales differ cannot be served without changing weights."""
+    def test_mismatched_fused_global_scales_get_an_output_ratio(self):
+        """Both kernels take one global scale per layer: the largest (smallest
+        divisor), and each fused projection's columns get their own back."""
         scheme = CompressedTensorsW4A16Fp4()
         layer = _linear_layer(scheme, output_partition_sizes=(256, 128, 128))
         layer.weight_global_scale.data.copy_(torch.tensor([2.0, 2.0, 4.0]))
-        with self.assertRaisesRegex(ValueError, "share one weight_global_scale"):
+        with (
+            mock.patch.object(
+                compressed_tensors_w4a16_nvfp4,
+                "_use_flashinfer_bf16_fp4",
+                return_value=False,
+            ),
+            mock.patch.object(
+                compressed_tensors_w4a16_nvfp4, "prepare_nvfp4_layer_for_marlin"
+            ),
+        ):
             scheme.process_weights_after_loading(layer)
+        self.assertEqual(layer.weight_global_scale.item(), 0.5)
+        torch.testing.assert_close(
+            layer.fused_global_scale_ratio,
+            torch.cat([torch.ones(384), torch.full((128,), 0.5)]),
+        )
 
     def test_moe_parameters_match_checkpoint_layout(self):
         for name, cls, group_size, scale_dtype, has_global in MOE_FORMATS:
@@ -386,8 +405,7 @@ class TestWeightOnlyFp4WeightCreation(CustomTestCase):
 
 class TestW4A4Fp4FusedGlobalScales(CustomTestCase):
     """The NVFP4 W4A4 GEMM takes one weight global scale per layer. Fused
-    projections whose scales differ cannot share one without changing the
-    other projections' weights, as in the weight-only path."""
+    projections whose scales differ get their own back on the output."""
 
     def _process(self, global_scales):
         scheme = CompressedTensorsW4A4Fp4()
@@ -404,14 +422,60 @@ class TestW4A4Fp4FusedGlobalScales(CustomTestCase):
             scheme.process_weights_after_loading(layer)
         return layer
 
-    def test_mismatched_fused_global_scales_are_rejected(self):
-        with self.assertRaisesRegex(ValueError, "share one weight_global_scale"):
-            self._process([256.0, 1024.0, 1024.0])
+    def test_mismatched_fused_global_scales_get_an_output_ratio(self):
+        # divisors: q_proj's scale (1/256) is the largest; k and v get 1/4 of it
+        layer = self._process([256.0, 1024.0, 1024.0])
+        self.assertEqual(layer.weight_global_scale.item(), 256.0)
+        self.assertEqual(layer.alpha.item(), 1 / (2.0 * 256.0))
+        torch.testing.assert_close(
+            layer.fused_global_scale_ratio,
+            torch.cat([torch.ones(256), torch.full((256,), 0.25)]),
+        )
 
     def test_shared_fused_global_scale_is_kept(self):
         layer = self._process([1024.0, 1024.0, 1024.0])
         self.assertEqual(layer.weight_global_scale.item(), 1024.0)
         self.assertEqual(layer.alpha.item(), 1 / (2.0 * 1024.0))
+        self.assertIsNone(layer.fused_global_scale_ratio)
+
+
+class TestFusedGlobalScaleRatio(CustomTestCase):
+    """Running a fused NVFP4 GEMM with the largest global scale and scaling
+    each projection's output columns by its own over it is exact."""
+
+    def test_multiplier_convention(self):
+        kept, ratio = fused_global_scale_ratio(
+            torch.tensor([0.25, 1.0]), [2, 3], divisor=False
+        )
+        self.assertEqual(kept.item(), 1.0)
+        torch.testing.assert_close(ratio, torch.tensor([0.25, 0.25, 1.0, 1.0, 1.0]))
+
+    def test_divisor_convention(self):
+        kept, ratio = fused_global_scale_ratio(
+            torch.tensor([4.0, 1.0]), [1, 2], divisor=True
+        )
+        self.assertEqual(kept.item(), 1.0)
+        torch.testing.assert_close(ratio, torch.tensor([0.25, 1.0, 1.0]))
+
+    def test_shared_scale_needs_no_ratio(self):
+        kept, ratio = fused_global_scale_ratio(
+            torch.tensor([2.0, 2.0]), [4, 4], divisor=False
+        )
+        self.assertEqual(kept.item(), 2.0)
+        self.assertIsNone(ratio)
+
+    def test_ratio_restores_each_projection(self):
+        """Dequantizing with the kept scale and rescaling the output equals
+        dequantizing each projection with its own scale."""
+        torch.manual_seed(0)
+        x = torch.randn(3, 8)
+        w = torch.randn(5, 8)
+        scales = torch.tensor([0.125, 0.5])
+        widths = [2, 3]
+        own = torch.cat([scales[0].expand(2), scales[1].expand(3)]).unsqueeze(1)
+        kept, ratio = fused_global_scale_ratio(scales, widths, divisor=False)
+        out = apply_fused_global_scale_ratio(x @ (w * kept).T, ratio)
+        torch.testing.assert_close(out, x @ (w * own).T)
 
 
 class TestWeightOnlyFp4BackendSelection(CustomTestCase):

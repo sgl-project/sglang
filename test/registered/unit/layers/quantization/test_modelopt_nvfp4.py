@@ -156,29 +156,9 @@ class TestModelOptNvfp4(CustomTestCase):
 
 class TestModelOptNvfp4FusedWeightScale2(CustomTestCase):
     """The NVFP4 GEMMs take one weight_scale_2 per layer, the largest of the
-    fused projections'. A projection with a smaller one is dequantized wrong,
-    so the post-load step warns, as the NVFP4A16 linear method does."""
+    fused projections'; the others get theirs back on the output."""
 
-    def test_warns_when_fused_weight_scale_2_differ(self):
-        with self.assertLogs(modelopt_quant.logger, level="WARNING") as logs:
-            modelopt_quant._warn_if_fused_weight_scale_2_differ(
-                torch.tensor([0.25, 1.0]), "NVFP4"
-            )
-        self.assertIn("weight_scale_2 differs across fused", logs.output[0])
-
-    def test_shared_weight_scale_2_is_silent(self):
-        with self.assertNoLogs(modelopt_quant.logger, level="WARNING"):
-            modelopt_quant._warn_if_fused_weight_scale_2_differ(
-                torch.tensor([1.0, 1.0]), "NVFP4"
-            )
-
-    def test_fp4_linear_post_load_checks_weight_scale_2(self):
-        config = ModelOptFp4Config(
-            is_checkpoint_nvfp4_serialized=True,
-            group_size=16,
-            use_per_token_activation=False,
-        )
-        method = ModelOptFp4LinearMethod(config)
+    def _layer(self, method):
         layer = nn.Module()
         method.create_weights(
             layer,
@@ -190,18 +170,51 @@ class TestModelOptNvfp4FusedWeightScale2(CustomTestCase):
             weight_loader=default_weight_loader,
         )
         layer.weight_scale_2.data.copy_(torch.tensor([0.25, 1.0]))
+        return layer
+
+    def test_nvfp4a16_linear_keeps_largest_and_a_ratio(self):
+        config = ModelOptFp4Config(is_checkpoint_nvfp4_serialized=True, group_size=16)
+        method = modelopt_quant.ModelOptNvFp4A16LinearMethod(config)
+        layer = self._layer(method)
+        with patch.object(modelopt_quant, "prepare_nvfp4_layer_for_marlin"):
+            method.process_weights_after_loading(layer)
+        self.assertEqual(layer.weight_global_scale.item(), 1.0)
+        torch.testing.assert_close(
+            layer.fused_global_scale_ratio,
+            torch.cat([torch.full((16,), 0.25), torch.ones(16)]),
+        )
+
+    def test_fp4_linear_post_load_computes_the_ratio(self):
+        config = ModelOptFp4Config(
+            is_checkpoint_nvfp4_serialized=True,
+            group_size=16,
+            use_per_token_activation=False,
+        )
+        method = ModelOptFp4LinearMethod(config)
+        layer = self._layer(method)
 
         class Checked(Exception):
             pass
 
+        real = modelopt_quant.fused_global_scale_ratio
+        seen = {}
+
+        def record(*args, **kwargs):
+            seen["result"] = real(*args, **kwargs)
+            seen["divisor"] = kwargs["divisor"]
+            raise Checked
+
         with patch.object(
-            modelopt_quant,
-            "_warn_if_fused_weight_scale_2_differ",
-            side_effect=Checked,
-        ) as check:
+            modelopt_quant, "fused_global_scale_ratio", side_effect=record
+        ):
             with self.assertRaises(Checked):
                 method.process_weights_after_loading(layer)
-        torch.testing.assert_close(check.call_args.args[0], torch.tensor([0.25, 1.0]))
+        kept, ratio = seen["result"]
+        self.assertFalse(seen["divisor"])
+        self.assertEqual(kept.item(), 1.0)
+        torch.testing.assert_close(
+            ratio, torch.cat([torch.full((16,), 0.25), torch.ones(16)])
+        )
 
 
 if __name__ == "__main__":

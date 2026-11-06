@@ -17,7 +17,9 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsLinearScheme,
 )
 from sglang.srt.layers.quantization.fp4_utils import (
+    apply_fused_global_scale_ratio,
     fp4_quantize,
+    fused_global_scale_ratio,
     get_fp4_gemm_runner_backend,
 )
 from sglang.srt.layers.quantization.modelopt_quant import (
@@ -97,21 +99,12 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsLinearScheme):
         global_input_scale = layer.input_global_scale.max().to(torch.float32)
         layer.input_global_scale = Parameter(global_input_scale, requires_grad=False)
 
-        # The GEMM takes one weight global scale per layer. With fused
-        # projections (q/k/v, gate/up) that only matches the checkpoint if every
-        # projection shares it: keeping the largest one while keeping the other
-        # projections' group scales would silently change their dequantized
-        # weights. llm-compressor fuses these global scales when exporting.
-        global_scale = layer.weight_global_scale.data
-        if torch.unique(global_scale).numel() != 1:
-            raise ValueError(
-                "NVFP4 linear requires all fused projections to share one "
-                f"weight_global_scale, got {global_scale.tolist()}. Re-export the "
-                "checkpoint with fused global scales."
-            )
-        layer.weight_global_scale = Parameter(
-            global_scale[0].to(torch.float32), requires_grad=False
+        # The GEMM takes one weight global scale per layer; fused projections
+        # (q/k/v, gate/up) whose scales differ get theirs back on the output.
+        global_scale, layer.fused_global_scale_ratio = fused_global_scale_ratio(
+            layer.weight_global_scale.data, layer.logical_widths, divisor=True
         )
+        layer.weight_global_scale = Parameter(global_scale, requires_grad=False)
 
         if get_fp4_gemm_runner_backend().is_flashinfer_trtllm():
             # FlashInfer TRTLLM FP4 GEMM requires a different weight layout.
@@ -177,6 +170,9 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsLinearScheme):
             layer.alpha,
             output_dtype,
             w_n,
+        )
+        out = apply_fused_global_scale_ratio(
+            out, getattr(layer, "fused_global_scale_ratio", None)
         )
         if bias is not None:
             out = out + bias
