@@ -1619,6 +1619,13 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             )
 
         node = state.target_node
+        if self.enable_external_cache_linker:
+            # A Mamba state newly attached to an existing node (e.g. a branch
+            # point split off a stored node) has no external copy yet.
+            return (
+                node.component_data[ComponentType.MAMBA].value is not None
+                and not state.result.mamba_exist
+            )
         return (
             self.enable_hicache
             and node.backuped
@@ -3139,6 +3146,23 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
         transfers = []
         for component in self.components:
+            transfer = component.build_external_linker_transfer(
+                LinkerTransferPhase.OFFLOAD, node, None
+            )
+            if transfer is not None:
+                transfers.append(transfer)
+        return transfers
+
+    def build_external_linker_state_offload_transfers(
+        self, node_id: NodeId
+    ) -> list[PoolTransfer]:
+        """Build transfers for a node's state components alone: their data
+        arrived after the node's KV was stored or queued."""
+        node = self.node_by_id(node_id)
+        transfers = []
+        for component in self.components:
+            if component.component_type == BASE_COMPONENT_TYPE:
+                continue
             transfer = component.build_external_linker_transfer(
                 LinkerTransferPhase.OFFLOAD, node, None
             )

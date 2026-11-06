@@ -2397,6 +2397,15 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         }
 
         let node = self.arena.node(target_node_id);
+        if self.enable_external_cache_linker {
+            // A Mamba state newly attached to an existing node (e.g. a branch
+            // point split off a stored node) has no external copy yet.
+            return node.has_device_value(MAMBA)
+                && state
+                    .result
+                    .as_ref()
+                    .is_some_and(|result| !result.mamba_exist);
+        }
         self.enable_hicache
             && node.backuped()
             && node.write_through_pending_id.is_none()
@@ -4919,6 +4928,21 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             .filter_map(|component| component.build_external_linker_offload_transfer(self, node_id))
             .collect();
         Ok(Some(transfers))
+    }
+
+    /// Build transfers for a node's state components alone: their data
+    /// arrived after the node's KV was stored or queued.
+    pub fn build_external_linker_state_offload_transfers(
+        &self,
+        node_id: NodeId,
+    ) -> Result<Vec<PoolTransfer>, NodeAccessError> {
+        let node_id = self.arena.resolve(node_id)?;
+        Ok(self
+            .components
+            .iter()
+            .filter(|component| component.component_type() != BASE_COMPONENT_TYPE)
+            .filter_map(|component| component.build_external_linker_offload_transfer(self, node_id))
+            .collect())
     }
 
     fn needs_external_linker_offload_(node: &Node<K>) -> bool {
