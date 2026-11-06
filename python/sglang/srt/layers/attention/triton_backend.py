@@ -244,11 +244,7 @@ class TritonAttnBackend(AttentionBackend):
         self.topk = get_spec().speculative_eagle_topk or 0
         # Split-KV verify is bit-equivalent only for a pure-causal chain (topk==1)
         # and is gfx95-only; else fall back to extend_attention_fwd.
-        self.use_verify_splitkv = (
-            is_gfx95_supported()
-            and envs.SGLANG_ENABLE_SPLITKV_VERIFY.get()
-            and self.topk == 1
-        )
+        self.use_verify_splitkv = is_gfx95_supported() and self.topk == 1
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         # The grouped-head verify kernel is tuned for Kimi-K3 MLA and Qwen3.5
         # GQA with exactly one TP-local KV head.
@@ -275,10 +271,13 @@ class TritonAttnBackend(AttentionBackend):
             get_parallel().attn_tp_size, get_parallel().attn_dcp_size
         )
         mla_config = model_runner.model_config
+        # MLA prefill with a cached prefix runs one dense (non-absorbed) FP8 MHA:
+        # the prefix is up-projected out of the latent KV cache instead of running
+        # the absorbed 576/512 prefill. It materializes K/V for the whole batch, so
+        # it only engages when the batch fits the chunk budget.
         self.use_dense_fp8_chunked_prefill = (
             self.use_mla
             and is_gfx95_supported()
-            and envs.SGLANG_TRITON_DENSE_PREFILL_ATTN.get()
             and envs.SGLANG_TRITON_FP8_PREFILL_ATTN.get()
             and model_runner.kv_cache_dtype == torch.float8_e4m3fn
             and self.num_head == 12

@@ -22,6 +22,8 @@ PAGED = TopkTransformMethod.PAGED
 
 def _make_backend(prefill_impl: str, *, fp8_kv_cache: bool):
     backend = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)
+    backend.dsa_shards_index_k = False
+    backend.attn_dcp_size, backend.attn_dcp_rank = 1, 0
     backend.dsa_kv_cache_store_fp8 = fp8_kv_cache
     backend.dsa_prefill_impl = prefill_impl
     return backend
@@ -123,6 +125,8 @@ def test_q8_validator_rejects_an_unpacked_fp8_pool():
 
 def _make_padder():
     backend = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)
+    backend.dsa_shards_index_k = False
+    backend.attn_dcp_size, backend.attn_dcp_rank = 1, 0
     backend._q8kv8_topk_pad_buf = None
     backend._q8kv8_topk_pad_width = None
     return backend

@@ -201,7 +201,7 @@ def read_intree_rows(table: AiterTable, csvs: Sequence[str]):
     to the ROCm in its ``rocm`` column, and a FlyDSL row needs an aiter that imports FlyDSL."""
     import pandas as pd
 
-    from sglang.srt.utils.common import get_hip_version
+    from sglang.srt.utils.device import get_hip_version
 
     rows = pd.concat(
         [pd.read_csv(p, dtype={"rocm": str}) for p in csvs], ignore_index=True
@@ -294,7 +294,7 @@ def install_aiter_tuned_tables() -> Optional[dict]:
     if _report is not None:
         return _report
     from sglang.srt.environ import envs
-    from sglang.srt.utils.common import is_hip
+    from sglang.srt.utils.device import is_hip
 
     if not (is_hip() and envs.SGLANG_USE_AITER.get()):
         return None

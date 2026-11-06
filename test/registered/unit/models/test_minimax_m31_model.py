@@ -357,7 +357,7 @@ class TestMiniMaxM31Rocm(CustomTestCase):
             device="cuda",
         )
         args._model_config = SimpleNamespace(hf_config=config)
-        with patch("sglang.srt.utils.hf_transformers.get_config", return_value=config):
+        with patch("sglang.srt.hf_transformers.get_config", return_value=config):
             _handle_dspark(args)
         self.assertEqual(
             resolution_result(args, "speculative_draft_model_path"), "dummy-draft"

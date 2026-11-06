@@ -23,6 +23,7 @@ CP_MIN_VERIFY_REQS_IPC = 12
 def unsupported_reason(
     *,
     gfx950,
+    sm90,
     tp_size,
     attn_tp_size,
     attn_cp_size,
@@ -42,16 +43,25 @@ def unsupported_reason(
     dense_sparse_decode,
 ):
     """Run-level gates: identical on every rank, with no device data reads."""
-    if not gfx950:
-        return "requires AMD gfx950"
-    if (tp_size, attn_tp_size, attn_cp_size, attn_dp_size) != (4, 4, 1, 1):
-        return "requires TP4 with attention CP/DP size 1"
+    if gfx950:
+        if (tp_size, attn_tp_size, attn_cp_size, attn_dp_size) != (4, 4, 1, 1):
+            return "requires TP4 with attention CP/DP size 1"
+    elif sm90:
+        # At TP8 each rank still serves one index head; head pairs are replicated.
+        if attn_tp_size not in (4, 8) or (tp_size, attn_cp_size, attn_dp_size) != (
+            attn_tp_size,
+            1,
+            1,
+        ):
+            return "requires TP4 or TP8 with attention CP/DP size 1"
+    else:
+        return "requires AMD gfx950 or NVIDIA SM90"
     if (index_heads, kv_heads, head_dim, block_size, topk) != (4, 4, 128, 128, 16):
         return "requires four index/KV heads, dimension 128, block 128, top-k 16"
     if score_type != "max" or not radix_topk:
-        return "requires max scores and the ROCm radix top-k tie ordering"
+        return "requires max scores and the radix decode top-k"
     if not 0 < max_context_len <= 16384 * 128:
-        return "context length exceeds the ROCm radix selector contract"
+        return "context length exceeds the radix selector contract"
     if not draft_is_chain:
         return "verify rows must be chain drafts: no speculation, or EAGLE with top-k 1"
     if tbo or hisparse or fp8_query or dense_sparse_decode:
@@ -83,7 +93,7 @@ def make_indexer_cp(backend, runner, sparse_cfg):
         return None
     from sglang.srt.layers.moe.utils import is_tbo_enabled
     from sglang.srt.runtime_context import get_parallel, get_spec
-    from sglang.srt.utils import is_hip
+    from sglang.srt.utils import is_hip, is_sm90_supported
 
     parallel = get_parallel()
     spec = get_spec()
@@ -94,6 +104,7 @@ def make_indexer_cp(backend, runner, sparse_cfg):
     )
     reason = unsupported_reason(
         gfx950=arch.split(":")[0] == "gfx950",
+        sm90=not is_hip() and is_sm90_supported(),
         tp_size=parallel.tp_size,
         attn_tp_size=parallel.attn_tp_size,
         attn_cp_size=parallel.attn_cp_size,
@@ -127,8 +138,9 @@ def make_indexer_cp(backend, runner, sparse_cfg):
         cp.exchange = CpExchange(cp.group, cp.group.device)
     cp.warmup()
     logger.info(
-        "MiniMax indexer CP enabled: TP4, decode-only, replicated index cache, "
+        "MiniMax indexer CP enabled: TP%d, decode-only, replicated index cache, "
         "query gather + %s, top-k 16; index-value layers use TP",
+        cp.world,
         "IPC candidate exchange" if cp.exchange is not None else "candidate gather",
     )
     return cp
@@ -136,16 +148,17 @@ def make_indexer_cp(backend, runner, sparse_cfg):
 
 class MiniMaxIndexerCP:
     def __init__(self, group):
-        if group.world_size != 4:
-            raise ValueError("MiniMax indexer CP requires a four-rank group")
+        if group.world_size not in (4, 8):
+            raise ValueError("MiniMax indexer CP requires a four- or eight-rank group")
         self.group = group
+        self.world = group.world_size
         self.rank = group.rank_in_group
         self.exchange = None
 
     def warmup(self):
         """Initialize both runtime and PyNCCL gather paths before graph capture."""
         probe = torch.zeros((1, 128), dtype=torch.bfloat16, device=self.group.device)
-        output = torch.empty((4, 128), dtype=probe.dtype, device=probe.device)
+        output = torch.empty((self.world, 128), dtype=probe.dtype, device=probe.device)
         self.group.all_gather_into_tensor(output, probe)
         comm = self.group.get_available_pynccl_comm()
         if comm is not None:
@@ -235,9 +248,10 @@ class MiniMaxIndexerCP:
         if batch == 0:
             return torch.empty((1, 0, 16), dtype=torch.int32, device=q.device)
         local_q = q[:, 0].contiguous()
-        gathered_q = torch.empty((4 * batch, 128), dtype=q.dtype, device=q.device)
+        world = self.world
+        gathered_q = torch.empty((world * batch, 128), dtype=q.dtype, device=q.device)
         self.group.all_gather_into_tensor(gathered_q, local_q)
-        q_heads = gathered_q.view(4, batch, 128)
+        q_heads = gathered_q.view(world, batch, 128)
         sm_scale = 128**-0.5 if sm_scale is None else sm_scale
         nvfp4 = isinstance(k_cache, Nvfp4Cache)
         if nvfp4:
@@ -272,7 +286,7 @@ class MiniMaxIndexerCP:
                 init_blocks=init_blocks,
                 local_blocks=local_blocks,
                 sm_scale=nvfp4_sm_scale,
-                world=4,
+                world=world,
                 rank=self.rank,
             )
         else:
@@ -292,12 +306,14 @@ class MiniMaxIndexerCP:
                 packed_queries=packed_queries,
             )
             keys = select_local_candidates(scores, seq_lens, self.rank, max_seqlen)
-        received = torch.empty((4, 4, batch, 16), dtype=torch.int64, device=q.device)
+        received = torch.empty(
+            (world, world, batch, 16), dtype=torch.int64, device=q.device
+        )
         # Pure byte copies: numeric conversion would destroy the score/ID keys.
         # Float32 views also qualify for the runtime's AITER custom gather.
         self.group.all_gather_into_tensor(
-            received.view(torch.float32).view(16 * batch, 32),
-            keys.view(torch.float32).view(4 * batch, 32),
+            received.view(torch.float32).view(world * world * batch, 32),
+            keys.view(torch.float32).view(world * batch, 32),
         )
         if nvfp4:
             return cp_verify_merge(
