@@ -9,7 +9,7 @@ from sglang.kernels.ops.attention.dsv4.topk import topk_v2_plan_is_written
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
 from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_parallel
 
 BS, NEXT_N, WIDTH, TOPK, POOL = 4, 6, 131072, 2048, 4
@@ -33,6 +33,9 @@ def make_backend(mode, seq, req, *, fusion=True):
     backend.device_sm_major = torch.cuda.get_device_capability()[0]
     backend.num_q_heads = 64
     backend.physical_page_size = 64
+    backend.real_page_span = 64
+    backend.dsa_shards_index_k = False
+    backend.attn_dcp_size, backend.attn_dcp_rank = 1, 0
     backend.dsa_index_topk = TOPK
     backend.dsa_index_kpool = POOL
     backend.speculative_num_draft_tokens = NEXT_N

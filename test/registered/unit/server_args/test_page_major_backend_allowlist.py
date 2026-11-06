@@ -37,13 +37,14 @@ import msgspec
 
 from sglang.srt.arg_groups.kv_cache_hook import (
     ASYMMETRIC_KV_BACKENDS,
+    draft_rows_refusal,
     handle_page_major_kv_layout,
 )
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 
 def _accepts(
@@ -54,6 +55,7 @@ def _accepts(
     linear_decode: str | None = None,
     linear_prefill: str | None = None,
     has_asymmetric_kv: bool = False,
+    draft_backend: str | None = None,
 ) -> bool:
     """Run just `handle_page_major_kv_layout` against a minimal stand-in, since
     ServerArgs' real constructor pulls in a model config."""
@@ -70,6 +72,7 @@ def _accepts(
         "linear_attn_decode_backend": linear_decode,
         "linear_attn_prefill_backend": linear_prefill,
         "mamba_backend": "triton",
+        "speculative_draft_attention_backend": draft_backend,
     }.items():
         msgspec.Struct.__setattr__(sa, name, value)
     setattr(
@@ -162,6 +165,46 @@ class TestPageMajorBackendAllowlist(unittest.TestCase):
                 f"{backend} reads V at K's head_dim (or refuses unequal dims) "
                 "and must stay rejected for an asymmetric-K/V model",
             )
+
+    def test_the_gate_judges_the_target_backends_only(self):
+        """An external draft has its own K/V geometry, so the gate does not
+        judge a draft backend by the target's: an asymmetric target on fa3
+        with a symmetric DFLASH draft on flashinfer passes it."""
+        self.assertTrue(
+            _accepts(
+                "fa3",
+                use_mla=False,
+                has_asymmetric_kv=True,
+                draft_backend="flashinfer",
+            )
+        )
+
+    def test_draft_rows_are_judged_by_the_draft_geometry(self):
+        """The draft runner's check reads the draft model's rows: asymmetric
+        rows need backends that carry v_head_dim, whether set for the draft or
+        inherited from the target; symmetric rows and MLA rows need none."""
+        cases = [
+            # (draft rows asymmetric, draft uses MLA, draft backends, refused)
+            (
+                False,
+                False,
+                ("flashinfer",),
+                False,
+            ),  # asymmetric target, symmetric draft
+            (True, False, ("flashinfer",), True),  # symmetric target, asymmetric draft
+            (True, False, ("trtllm_mha",), True),
+            (True, False, ("fa3",), False),
+            (True, False, ("triton", "fa3"), False),  # inherited from the target
+            (True, False, ("triton", "flashinfer"), True),
+            (True, False, (None, "fa4"), False),
+            (True, True, ("flashinfer",), False),
+        ]
+        for asymmetric, mla, backends, refused in cases:
+            with self.subTest(asymmetric=asymmetric, mla=mla, backends=backends):
+                reason = draft_rows_refusal(
+                    has_asymmetric_kv=asymmetric, uses_mla=mla, backends=backends
+                )
+                self.assertEqual(reason is not None, refused, reason)
 
     def test_asymmetric_dims_do_not_screen_out_mla(self):
         """Screening on `has_asymmetric_kv` alone would lock every real MLA
