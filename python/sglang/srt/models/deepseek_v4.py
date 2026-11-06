@@ -2954,7 +2954,16 @@ class MQALayer(MqaAttentionBase):
                     # TRT-LLM returns BF16 even with FP8 queries.
                     dtype=x.dtype,
                 )
-                bcg_deepseek_v4_attention_with_output(
+                # NPU backends refresh capacity-sized metadata before each
+                # replay, so the attention can stay inside the captured
+                # segment.  Every other platform keeps ending the segment.
+                attention_with_output = (
+                    deepseek_v4_attention_with_output
+                    if _is_npu
+                    and attn_backend.use_captured_forward_metadata_for_breakable_cuda_graph
+                    else bcg_deepseek_v4_attention_with_output
+                )
+                attention_with_output(
                     attn_q,
                     attn_k,
                     o,

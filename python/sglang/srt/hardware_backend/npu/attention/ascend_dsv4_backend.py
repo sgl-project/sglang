@@ -20,9 +20,18 @@ from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
     AscendAttnBackend,
     ForwardMetadata,
 )
+from sglang.srt.hardware_backend.npu.attention.dsv4_prefill_graph import (
+    MAX_PREFILL_GRAPH_REQS,
+    Dsv4PrefillGraphMetadata,
+)
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE, rope_cos_sin
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.cp.base import get_cp_strategy
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
+)
 from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.forward_mode import ForwardMode
@@ -915,7 +924,7 @@ class C4IndexerAscendBackendMixin:
         # skip_compressor=True is the CP full-metadata protocol: the compressor
         # already ran via forward_indexer_compressor.
         self._ensure_npu_c4_indexer(c4_indexer, x.device)
-        if self._can_use_indexer_multi_stream():
+        if enable_multi_stream and self._can_use_indexer_multi_stream():
             q, weights = self._forward_prepare_multi_stream(
                 c4_indexer, x, q_lora, forward_batch, q_lora_ready, skip_compressor
             )
@@ -924,11 +933,18 @@ class C4IndexerAscendBackendMixin:
                 c4_indexer, x, q_lora, forward_batch, skip_compressor
             )
         topk_idxs = self._forward_indexer(c4_indexer, x, q, weights, forward_batch)
+        graph_state = getattr(self.forward_metadata, "dsv4_prefill_graph_state", None)
+        if graph_state is not None:
+            # The indexer runs inside the captured segment while the attention
+            # break runs eagerly at replay.  Keep this layer's capture-time
+            # output object so the break reads the right buffer per layer.
+            topk_idxs = graph_state.stage_topk(c4_indexer.layer_id, topk_idxs)
+        else:
+            compress_layer_id = self.token_to_kv_pool.layer_mapping[
+                c4_indexer.layer_id
+            ].compress_layer_id
+            maybe_capture_indexer_topk(compress_layer_id, topk_idxs)
         self.forward_metadata.c4_topk_indices = topk_idxs
-        compress_layer_id = self.token_to_kv_pool.layer_mapping[
-            c4_indexer.layer_id
-        ].compress_layer_id
-        maybe_capture_indexer_topk(compress_layer_id, topk_idxs)
 
     def _cp_local_positions(self, forward_batch: ForwardBatch) -> torch.Tensor:
         """Per-rank positions under CP-v2 (the batch keeps full-length ones)."""
@@ -1013,6 +1029,36 @@ class DeepseekV4AscendAttnBackend(
         # High-water mark of written page-table columns per shared graph
         # buffer; see _copy_page_table_into_graph.
         self._graph_table_high_water: dict[str, int] = {}
+
+        # The prefill graph records compressor / indexer kernels, so their
+        # metadata must live in stable, capacity-sized buffers.  See
+        # dsv4_prefill_graph.py for the refresh contract.
+        self.use_captured_forward_metadata_for_breakable_cuda_graph = (
+            self._supports_dsv4_prefill_graph_capture()
+        )
+        if self.use_captured_forward_metadata_for_breakable_cuda_graph:
+            self.prefill_cuda_graph_max_batch_size = MAX_PREFILL_GRAPH_REQS
+            logger.info(
+                "DSV4 NPU breakable prefill graph: compressor/indexer captured, "
+                "max %d request(s) per replay.",
+                MAX_PREFILL_GRAPH_REQS,
+            )
+
+    def _supports_dsv4_prefill_graph_capture(self) -> bool:
+        if not check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE):
+            return False
+        # Draft workers keep the eager prefill metadata path; their graph
+        # coverage is handled by the speculative runner.
+        if self.is_draft_worker:
+            return False
+        parallel = get_parallel()
+        if is_npu_arch35() or parallel.attn_cp_size != 1 or parallel.attn_dcp_size != 1:
+            raise ValueError(
+                "DSV4 breakable prefill graph captures the compressor and "
+                "indexer and requires an A3 model without CP/DCP. Disable "
+                "--cuda-graph-backend-prefill=breakable for this model."
+            )
+        return True
 
     def _is_dspark_draft_block(self, forward_batch: ForwardBatch) -> bool:
         spec_algorithm = forward_batch.spec_algorithm
@@ -2113,6 +2159,87 @@ class DeepseekV4AscendAttnBackend(
         if self._dsv4_compress_ratios:
             self._build_npu_compress_metadata(forward_batch)
 
+    def init_forward_metadata_for_breakable_cuda_graph_capture(
+        self, forward_batch: ForwardBatch
+    ) -> ForwardMetadata:
+        """Build the capacity-sized metadata a prefill bucket captures.
+
+        The eager builder is still the source of the capture values; this
+        hook copies them into fixed tensors and replaces every field a
+        captured kernel reads by address.
+        """
+        if forward_batch.batch_size > MAX_PREFILL_GRAPH_REQS:
+            raise RuntimeError(
+                "DSV4 prefill graph capture batch has "
+                f"{forward_batch.batch_size} requests, capacity is "
+                f"{MAX_PREFILL_GRAPH_REQS}. Reduce the prefill token bucket or "
+                "raise MAX_PREFILL_GRAPH_REQS after verifying zero-length "
+                "request slots."
+            )
+        if forward_batch.can_run_tbo:
+            raise RuntimeError(
+                "DSV4 prefill graph does not support TBO; disable "
+                "--enable-two-batch-overlap or --cuda-graph-backend-prefill=breakable."
+            )
+        self.init_forward_metadata(forward_batch)
+        # allocate() refreshes the eager metadata in place, so this object is
+        # also the one the capture forward reads.
+        return Dsv4PrefillGraphMetadata.allocate(
+            backend=self,
+            seed=self.forward_metadata,
+            num_tokens=int(forward_batch.positions.shape[0]),
+        ).metadata
+
+    def prepare_forward_metadata_for_breakable_cuda_graph_replay(
+        self,
+        capture_metadata,
+        forward_batch: ForwardBatch,
+        *,
+        static_forward_batch: Optional[ForwardBatch] = None,
+    ) -> None:
+        state = getattr(capture_metadata, "dsv4_prefill_graph_state", None)
+        if state is None:
+            raise RuntimeError(
+                "DSV4 prefill graph replay is missing its captured metadata"
+            )
+        # The static batch does not carry tbo_split_seq_index, so read the
+        # live one.
+        if forward_batch.can_run_tbo:
+            raise RuntimeError("DSV4 prefill graph does not support TBO")
+        self.init_forward_metadata(forward_batch)
+        state.refresh(
+            backend=self,
+            live=self.forward_metadata,
+            forward_batch=forward_batch,
+        )
+        # The captured object owns every tensor the graph reads; eager
+        # attention breaks read it too, so they see the refreshed values.
+        self.forward_metadata = capture_metadata
+
+    def _build_dsv4_prefill_graph_state_table(
+        self,
+        *,
+        ratio: int,
+        req_pool_indices: torch.Tensor,
+        start_pos: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        seqused: torch.Tensor,
+        max_input_capacity: int,
+    ) -> torch.Tensor:
+        # Matches Compressor.coff = 1 + overlap; only ratio 4 overlaps.
+        return _build_explicit_state_block_table(
+            compress_ratio=ratio,
+            coff=2 if ratio == 4 else 1,
+            state_pool=self._dsv4_state_pools_by_ratio[ratio],
+            token_to_kv_pool=self.token_to_kv_pool,
+            req_to_token=self.req_to_token,
+            req_pool_indices=req_pool_indices,
+            start_pos=start_pos,
+            cu_seqlens=cu_seqlens,
+            seqused=seqused,
+            max_input_capacity=max_input_capacity,
+        )
+
     def _compute_kernel_metadata(self, forward_batch: ForwardBatch) -> dict:
         fm = self.forward_metadata
         return self._kernel_metadata_from_parts(
@@ -2352,14 +2479,34 @@ class DeepseekV4AscendAttnBackend(
             cmp_block_table=cmp_block_table,
         )
         # c4 attends via indexer topk; c128 reads the full compressed history
+        topk = None
+        attn_kwargs["cmp_sparse_indices"] = None
         if compress_ratio == 4:
             topk = fm.c4_topk_indices
+            graph_state = getattr(fm, "dsv4_prefill_graph_state", None)
+            if graph_state is not None:
+                # The shared attribute only remembers the last layer assigned
+                # during capture; each eager attention break needs its own.
+                topk = graph_state.topk_by_layer[layer.layer_id]
+                real_tokens = forward_batch.global_num_token_non_padded_cpu
+                if real_tokens is not None and 0 < real_tokens < topk.shape[0]:
+                    # The captured buffer is capacity-sized; q was already
+                    # sliced to the live rows by the break.
+                    topk = topk[:real_tokens]
             attn_kwargs["cmp_sparse_indices"] = topk.view(-1, 1, topk.shape[-1])
-        else:
-            attn_kwargs["cmp_sparse_indices"] = None
         q_arg = attn_kwargs.pop("q")
         _, attn_op = _sparse_attn_ops()
-        out, _ = attn_op(q_arg, **attn_kwargs)
+        try:
+            out, _ = attn_op(q_arg, **attn_kwargs)
+        except RuntimeError as exc:
+            # The op's own error names neither the layer nor the sparse
+            # metadata, which is what distinguishes the failure modes here.
+            raise RuntimeError(
+                f"DSV4 sparse attention failed: layer={layer.layer_id} "
+                f"ratio={compress_ratio} q={tuple(q_arg.shape)} "
+                f"cmp_kv={tuple(cmp_kv.shape)} "
+                f"topk={None if topk is None else tuple(topk.shape)}"
+            ) from exc
         return out
 
     def get_swa_out_cache_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
