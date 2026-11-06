@@ -629,7 +629,7 @@ Accuracy: 92.34%
 
 - Benchmark Command:
 ```shell Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --model MiniMaxAI/MiniMax-M2.7 \
   --dataset-name random \
@@ -671,7 +671,7 @@ Median ITL (ms):                         8.02
 
 - Benchmark Command:
 ```shell Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --model MiniMaxAI/MiniMax-M2.7 \
   --dataset-name random \

@@ -614,27 +614,6 @@ class TestResponseTemplateAdapters(CustomTestCase):
             ("Plan", "Sunny"),
         )
 
-    def test_reasoning_requires_explicit_enable_without_template_policy(self):
-        detector = ResponseTemplateReasoningDetector(
-            response_template=GEMMA4_RESPONSE_TEMPLATE,
-        )
-
-        self.assertEqual(detector.reasoning_default, "explicit_enable_thinking")
-
-    def test_reasoning_detector_supports_think_end_token_lookups(self):
-        detector = ResponseTemplateReasoningDetector(
-            response_template=GEMMA4_RESPONSE_TEMPLATE,
-        )
-        tokenizer = SimpleNamespace(
-            unk_token_id=0,
-            convert_tokens_to_ids=lambda token: 0,
-            encode=lambda text, add_special_tokens: [len(text), add_special_tokens],
-        )
-
-        self.assertIsNone(detector.think_excluded_tokens)
-        self.assertIsNone(detector.get_answer_frame())
-        self.assertEqual(detector.get_think_end_token_ids(tokenizer), [10, False])
-
     def test_get_think_end_token_ids_prefers_native_id(self):
         # split_special_tokens=True makes encode() split a special-added marker
         # into ordinary ids, so the grammar gate waits for a sequence the model

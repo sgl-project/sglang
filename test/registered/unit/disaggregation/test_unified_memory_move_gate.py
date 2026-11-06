@@ -4,7 +4,7 @@ The source decides when lazy compaction may relocate physical pages. A page is
 exposed to the peer from the moment its address is published until the transfer
 concludes, and for part of that lifetime the request sits in NEITHER end's
 queue. Both cases below are exactly those windows: an earlier version of the
-predicates looked only at `disagg_prefill_inflight_queue` /
+predicates looked only at `disagg_prefill_transfer_queue` /
 `disagg_decode_transfer_queue` (plus `scheduler.chunked_req`) and reported idle
 here, letting compaction move pages under in-flight RDMA -- silent KV
 corruption with no crash.
@@ -18,14 +18,15 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.disaggregation.utils import (
-    DisaggregationMode,
-    disagg_transfers_in_flight,
-)
+from sglang.srt.disaggregation.decode import DecodePreallocQueue
+from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.disaggregation.utils import disagg_transfers_in_flight
+from sglang.srt.managers.scheduler_components.request_list import ListKind
 from sglang.srt.mem_cache.kv.alloc.band import Band
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import FakeReq, decode_queue
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import (
     UnifiedGeometry,
@@ -38,14 +39,15 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 class _FakeTransferQueue:
     def __init__(self):
-        self.queue: List[object] = []
+        self.queue = decode_queue(ListKind.PD_RECEIVING)
 
 
-class _FakePreallocQueue:
+class _FakePreallocQueue(DecodePreallocQueue):
     """Mirrors the real queue's published-destination bookkeeping."""
 
-    def __init__(self):
+    def __init__(self, transfer_queue):
         self._num_published_destinations = 0
+        self.transfer_queue = transfer_queue
 
     @property
     def has_published_destinations(self) -> bool:
@@ -64,10 +66,12 @@ class _FakeScheduler:
     def __init__(self, mode: DisaggregationMode):
         self.disaggregation_mode = mode
         self.chunked_req: Optional[object] = None
-        self.disagg_prefill_inflight_queue: List[object] = []
+        self.disagg_prefill_transfer_queue: List[object] = []
         self.disagg_prefill_pending_chunk_rids: Set[str] = set()
         self.disagg_decode_transfer_queue = _FakeTransferQueue()
-        self.disagg_decode_prealloc_queue = _FakePreallocQueue()
+        self.disagg_decode_prealloc_queue = _FakePreallocQueue(
+            self.disagg_decode_transfer_queue
+        )
         self.decode_offload_manager = None
 
 
@@ -89,7 +93,9 @@ class TestDecodeMoveGate(CustomTestCase):
         self.assertTrue(busy())
 
         # Handing the batch to the transfer queue transfers responsibility.
-        scheduler.disagg_decode_transfer_queue.queue.append(object())
+        scheduler.disagg_decode_transfer_queue.queue.join(
+            [SimpleNamespace(req=FakeReq(), host_staged=False)]
+        )
         scheduler.disagg_decode_prealloc_queue.note_destinations_queued(1)
         self.assertTrue(busy(), "transfer queue still holds it")
 
@@ -100,7 +106,7 @@ class TestDecodeMoveGate(CustomTestCase):
 class TestPrefillMoveGate(CustomTestCase):
     def test_closed_after_final_chunk_clears_chunked_req(self):
         """Scheduling the final chunk clears `scheduler.chunked_req`, but the
-        request only reaches `disagg_prefill_inflight_queue` later in the result
+        request only reaches `disagg_prefill_transfer_queue` later in the result
         path. Earlier middle chunks may still be draining in that window, so the
         source must not key off `chunked_req` alone.
         """
@@ -115,15 +121,15 @@ class TestPrefillMoveGate(CustomTestCase):
 
         # Final chunk scheduled: chunked_req cleared, not yet inflight-queued.
         scheduler.chunked_req = None
-        self.assertFalse(scheduler.disagg_prefill_inflight_queue)
+        self.assertFalse(scheduler.disagg_prefill_transfer_queue)
         self.assertTrue(busy())
 
         # Last chunk sent: the request is on the inflight queue, which covers it.
-        scheduler.disagg_prefill_inflight_queue.append(object())
+        scheduler.disagg_prefill_transfer_queue.append(object())
         scheduler.disagg_prefill_pending_chunk_rids.discard("r0")
         self.assertTrue(busy())
 
-        scheduler.disagg_prefill_inflight_queue.clear()
+        scheduler.disagg_prefill_transfer_queue.clear()
         self.assertFalse(busy())
 
     def test_reopens_when_middle_sent_request_is_retired_without_final_chunk(self):
@@ -312,11 +318,15 @@ class TestUnifiedAllocatorsPublishTheTransferContract(CustomTestCase):
                 check_pins(False)
 
                 scheduler.disaggregation_mode = DisaggregationMode.DECODE
-                scheduler.disagg_prefill_inflight_queue = None
+                scheduler.disagg_prefill_transfer_queue = None
                 scheduler.disagg_decode_transfer_queue = _FakeTransferQueue()
-                scheduler.disagg_decode_prealloc_queue = _FakePreallocQueue()
+                scheduler.disagg_decode_prealloc_queue = _FakePreallocQueue(
+                    scheduler.disagg_decode_transfer_queue
+                )
                 check_pins(False)
-                scheduler.disagg_decode_transfer_queue.queue.append(object())
+                scheduler.disagg_decode_transfer_queue.queue.join(
+                    [SimpleNamespace(req=FakeReq(), host_staged=False)]
+                )
                 check_pins(True)
                 scheduler.disagg_decode_transfer_queue.queue.clear()
                 offload = SimpleNamespace(busy=True)

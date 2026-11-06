@@ -108,5 +108,5 @@ class Lora(msgspec.Struct):
     ] = False
     lora_drain_wait_threshold: A[
         float,
-        "When any LoRA adapter request waits longer than this threshold (in seconds), the scheduler will selectively drain one running adapter to make room. This mitigates extreme tail latency under high or skewed workloads by preventing a small set of adapters from monopolizing batch slots. Set to 0 to disable draining (default).",
+        "For LoRA adapters whose requests wait longer than this threshold (seconds) and need a slot, selectively drain unpinned running adapters to make room. Draining is best effort: freed slots are not reserved and waiting time is not bounded. Set to 0 to disable draining (default).",
     ] = 0.0

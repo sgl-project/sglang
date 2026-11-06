@@ -58,6 +58,7 @@ pub(super) fn configured_handle(
             startup_ready,
             is_disaggregation,
             mm_limits,
+            multimodal: false,
             metrics: None,
             peer_endpoints: Vec::new(),
             metadata: CoreMetadata::default(),

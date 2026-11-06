@@ -5,10 +5,11 @@ from __future__ import annotations
 import json
 import logging
 import os
+import socket
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
-from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.disaggregation.kv_events import select_kv_publisher_dp_rank
 from sglang.srt.entrypoints.v1_loads import (
     _accelerator_name,
@@ -34,7 +35,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
-from sglang.srt.utils.common import build_server_info
+from sglang.srt.utils.common import build_model_info_fields, build_server_info
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.version import __version__
 
@@ -108,9 +109,11 @@ def _build_server_args(
         ),
         # Every Rust listener of the deployment (`RustServer.gather_server_endpoints`).
         "rust_server_endpoints": scheduler.rust_server_endpoints,
+        "node_listeners": _node_listeners(grpc_port=grpc_port),
     }
     # `/v1/loads` reads this rank's slot of the scheduler's shared-memory
-    # snapshots directly; the ZMQ transport (multi-node DP) has no file to read.
+    # snapshots directly, from the file on this node even under multi-node DP;
+    # only a forced ZMQ transport leaves no file to read.
     shm_writer = scheduler.load_snapshot_writer
     if not isinstance(shm_writer, ShmLoadSnapshotWriter):
         shm_writer = None
@@ -131,6 +134,7 @@ def _build_server_args(
         # The shared field is also populated for legacy SMG mode; only forward
         # it when it selects SGLang's native gRPC transport.
         grpc_port=grpc_port,
+        grpc_response_timeout_secs=get_serving().grpc_response_timeout_secs,
         log_level=get_observability().log_level,
         log_level_http=get_observability().log_level_http,
         chat_template=get_serving().chat_template,
@@ -192,13 +196,17 @@ def _build_server_args(
         tokenizer_model_max_length=_tokenizer_model_max_length(
             scheduler.tokenizer, mc.context_len
         ),
-        # Launch-time facts Python's /server_info reports from
-        # scheduler_info / the package — stamped here so the rust endpoint
-        # can serve them statically (no scheduler round-trip).
+        # Launch-time facts Python's /server_info and /model_info report from
+        # scheduler_info / the package / the model — stamped here so the rust
+        # endpoints can serve them statically (no scheduler round-trip).
         version=__version__,
         max_total_num_tokens=scheduler.max_total_num_tokens,
         deployment_info=json.dumps(deployment_info),
         launch_server_info=_launch_server_info(scheduler),
+        launch_model_info=json.dumps(
+            msgspec_to_builtins(build_model_info_fields(mc, scheduler.server_args)),
+            default=str,
+        ),
         load_snapshot_path=shm_writer.path if shm_writer else None,
         load_snapshot_dp_size=shm_writer.dp_size if shm_writer else 0,
         load_snapshot_dp_rank=shm_writer.dp_rank if shm_writer else 0,
@@ -235,6 +243,42 @@ def _build_metrics_config(ext: ModuleType):
     )
 
 
+def _node_listeners(*, grpc_port: Optional[int]) -> List[Dict[str, Any]]:
+    """`DeploymentInfo.node_listeners`: every Rust listener on this listener's
+    node, in port-offset order, so each of them reports the same table."""
+    parallel = get_parallel()
+    nnodes_per_tp_group = max(parallel.nnodes // parallel.pp_size, 1)
+    tp_size_per_node = parallel.tp_size // nnodes_per_tp_group
+    first_tp_rank = tp_size_per_node * (parallel.node_rank % nnodes_per_tp_group)
+    node_tp_ranks = range(first_tp_rank, first_tp_rank + tp_size_per_node)
+    # Each attention DP group hosts a listener on its first rank (CP=TP=0).
+    dp_group_width = parallel.attn_tp_size * parallel.attn_cp_size
+    leader_tp_ranks = [tp for tp in node_tp_ranks if tp % dp_group_width == 0]
+    # Plain DP launches every replica on these leaders; otherwise only this one.
+    if not parallel.attn_dp_enabled and parallel.dp_size > 1:
+        replicas = range(parallel.dp_size)
+    else:
+        replicas = [parallel.dp_rank]
+    # Each listener reports this as its own `dp_rank`.
+    listener_dp_ranks = [
+        select_kv_publisher_dp_rank(
+            parallel.attn_dp_size, tp_rank // dp_group_width, dp_rank
+        )
+        for dp_rank in replicas
+        for tp_rank in leader_tp_ranks
+    ]
+    # RustServer.launch offsets a listener by the node's listeners before it.
+    return [
+        {
+            "port_offset": offset,
+            "dp_rank": dp_rank,
+            "http_port": get_serving().port + offset,
+            "grpc_port": None if grpc_port is None else grpc_port + offset,
+        }
+        for offset, dp_rank in enumerate(listener_dp_ranks)
+    ]
+
+
 def _launch_server_info(scheduler: Scheduler) -> str:
     """The `/server_info` fields Python's HTTP server reports that are fixed
     at launch, as a JSON object: the resolved `server_args`,
@@ -269,17 +313,49 @@ def _tokenizer_model_max_length(tokenizer: Any, context_len: int) -> int:
     return context_len
 
 
+def _frontend_cpu_key() -> Optional[Tuple[str, Tuple[int, ...]]]:
+    """This process's ``(hostname, allowed cores)``: listeners with equal keys
+    would partition the same cores, or ``None`` without an affinity API."""
+    if not hasattr(os, "sched_getaffinity"):
+        return None
+    try:
+        return socket.gethostname(), tuple(sorted(os.sched_getaffinity(0)))
+    except OSError:
+        return None
+
+
+def _frontend_cpu_share(
+    cpu_keys: List[Optional[Tuple[str, Tuple[int, ...]]]], rank: int
+) -> Tuple[int, int]:
+    """``(index, count)`` of ``rank`` among the ranks whose key equals its own,
+    in rank order; ``(0, 1)`` for a rank that contributed no key."""
+    own_key = cpu_keys[rank]
+    if own_key is None:
+        return 0, 1
+    peers = [peer for peer, key in enumerate(cpu_keys) if key == own_key]
+    return peers.index(rank), len(peers)
+
+
 def _partition_cores(
     mm_workers: int = 0,
     server_core_budget: Optional[Callable[[int, int], int]] = None,
+    cpu_share: Tuple[int, int] = (0, 1),
 ) -> Tuple[Optional[List[int]], Optional[List[int]]]:
     """Split this rank's allowed cores into ``(launch_cores, server_cores)``.
 
-    Pure computation — no affinity is changed here. Both sets are a subset
-    of this rank's NUMA-local cores (when affinity/NUMA bind is on), so the
-    partition stays NUMA-local. Returns ``(None, None)`` (server runs
-    unpinned, confined only by the process affinity) when the platform has
-    no affinity API or too few cores to split.
+    ``launch_cores`` are left out of ``server_cores``, so the scheduler thread
+    always finds cores no frontend thread can take; the scheduler thread itself
+    is not pinned to them. Pure computation — no affinity is changed here.
+    Both sets are a subset of this rank's NUMA-local cores (when affinity/NUMA
+    bind is on), so the partition stays NUMA-local. Returns ``(None, None)``
+    (server runs unpinned, confined only by the process affinity) when the
+    platform has no affinity API or too few cores to split.
+
+    ``cpu_share`` is ``(index, count)`` from ``_frontend_cpu_share``: under
+    attention DP every DP rank hosts a listener, and ranks launched with one
+    affinity mask would otherwise all pin their frontends onto the same first
+    cores of it. The mask is cut into ``count`` contiguous blocks and only
+    block ``index`` is partitioned.
     """
     if not hasattr(os, "sched_getaffinity"):
         return None, None
@@ -288,6 +364,19 @@ def _partition_cores(
     except OSError as e:
         logger.warning("rust server: cannot read cpu affinity: %s", e)
         return None, None
+
+    index, count = cpu_share
+    if count > 1:
+        block = len(allowed) // count
+        if block >= 4:
+            allowed = allowed[index * block : (index + 1) * block]
+        else:
+            logger.warning(
+                "rust server: %d cores shared by %d listeners; their frontend "
+                "cores overlap",
+                len(allowed),
+                count,
+            )
 
     # Need enough cores to reserve launch cores and still pin the pools.
     if len(allowed) < 4:
@@ -317,7 +406,7 @@ def _partition_cores(
     )
     server_cores = allowed[reserve : reserve + pool_budget]
     logger.info(
-        "rust server cores=%s, scheduler launch cores=%s",
+        "rust server cores=%s, cores kept free for the scheduler=%s",
         server_cores,
         launch_cores,
     )
