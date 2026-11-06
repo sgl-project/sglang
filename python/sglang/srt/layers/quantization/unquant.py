@@ -3,7 +3,7 @@ from __future__ import annotations
 import collections
 import logging
 from enum import Enum
-from typing import TYPE_CHECKING, Callable, List, Optional
+from typing import TYPE_CHECKING, Callable, Iterable, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +33,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.utils import copy_or_rebind_param
+from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.runtime_context import (
     get_exec,
     get_lora,
@@ -48,7 +49,6 @@ from sglang.srt.utils import (
     is_hip,
     is_npu,
     is_xpu,
-    set_weight_attrs,
     use_intel_amx_backend,
 )
 from sglang.srt.utils.custom_op import register_custom_op
@@ -305,19 +305,62 @@ _BF16_WARP_SPLITK_TUNED_TACTICS = {
     (32, 1280, 8192): (32, 16, 256, 9, 2),
 }
 
+# GLM-5 TP4 decode on SM107 (Vera Rubin NVL72), added to the active table on SM107 only;
+# FlashInfer's default tactics, each faster than TGV/cuBLAS/fused_a per call with PDL.
+_BF16_SM107_WARP_SPLITK_TUNED_TACTICS = {
+    # o_proj.
+    (1, 6144, 4096): (32, 8, 256, 11, 2),
+    (4, 6144, 4096): (32, 8, 256, 11, 2),
+    (5, 6144, 4096): (32, 8, 256, 11, 2),
+    (20, 6144, 4096): (32, 32, 256, 6, 2),
+    # fused_qkv_a.
+    (1, 2624, 6144): (16, 8, 256, 16, 2),
+    (4, 2624, 6144): (16, 8, 256, 16, 2),
+    (5, 2624, 6144): (16, 8, 256, 16, 2),
+    (20, 2624, 6144): (16, 32, 256, 9, 2),
+    # Indexer wk and weights_proj.
+    (5, 160, 6144): (16, 8, 256, 16, 2),
+    # Shared expert gate_up and down.
+    (1, 1024, 6144): (16, 8, 256, 16, 2),
+    (4, 1024, 6144): (16, 8, 256, 16, 2),
+    (5, 1024, 6144): (16, 8, 256, 16, 2),
+    (20, 1024, 6144): (16, 16, 256, 13, 2),
+    (1, 6144, 512): (32, 8, 128, 4, 1),
+    (4, 6144, 512): (32, 8, 128, 4, 1),
+    (5, 6144, 512): (32, 8, 128, 4, 1),
+}
+# fused_qkv_a keys that leave the fused_a JIT (M <= 16) for warp split-K on SM107.
+_BF16_SM107_FUSED_A_SPLITK_KEYS = frozenset(
+    {(1, 2624, 6144), (4, 2624, 6144), (5, 2624, 6144)}
+)
+_use_sm107_splitk_tactics = False
+# The warp split-K table in use; rebound by initialize_bf16_gemm_config.
+_active_warp_splitk_tactics = _BF16_WARP_SPLITK_TUNED_TACTICS
+
 
 def use_bf16_splitk_gemm(m: int, n: int, k: int) -> bool:
     key = (m, n, k)
-    return key in _BF16_SPLITK_TUNED_TACTICS or key in _BF16_WARP_SPLITK_TUNED_TACTICS
+    return key in _BF16_SPLITK_TUNED_TACTICS or key in _active_warp_splitk_tactics
 
 
-def precompile_splitk_tactics() -> bool:
-    """JIT-compile every tuned tactic through the real dispatch,
+def prefer_bf16_splitk_over_fused_a(x: torch.Tensor, weight: torch.Tensor) -> bool:
+    return (
+        _use_sm107_splitk_tactics
+        and (x.shape[0], *weight.shape) in _BF16_SM107_FUSED_A_SPLITK_KEYS
+    )
+
+
+def precompile_splitk_tactics(
+    keys: Optional[Iterable[tuple[int, int, int]]] = None,
+) -> bool:
+    """JIT-compile every tuned tactic (or only ``keys``) through the real dispatch,
     so CUDA graph capture never hits a cold kernel."""
     if not _enable_bf16_splitk_gemm:
         return False
+    if keys is None:
+        keys = {**_BF16_SPLITK_TUNED_TACTICS, **_active_warp_splitk_tactics}
     device = torch.cuda.current_device()
-    for m, n, k in {**_BF16_SPLITK_TUNED_TACTICS, **_BF16_WARP_SPLITK_TUNED_TACTICS}:
+    for m, n, k in keys:
         x = torch.zeros(m, k, dtype=torch.bfloat16, device=device)
         weight = torch.zeros(n, k, dtype=torch.bfloat16, device=device)
         out = torch.empty(m, n, dtype=torch.bfloat16, device=device)
@@ -326,9 +369,10 @@ def precompile_splitk_tactics() -> bool:
     return True
 
 
-def should_enable_bf16_splitk_gemm(backend: Bf16GemmBackend) -> bool:
-    """Return whether the optional Split-K path should be initialized."""
-    return backend.is_cutedsl() and envs.SGLANG_ENABLE_BF16_SPLITK_GEMM.get()
+def precompile_sm107_splitk_tactics() -> bool:
+    return _use_sm107_splitk_tactics and precompile_splitk_tactics(
+        keys=_BF16_SM107_WARP_SPLITK_TUNED_TACTICS
+    )
 
 
 def initialize_bf16_gemm_config() -> None:
@@ -340,7 +384,8 @@ def initialize_bf16_gemm_config() -> None:
     global _prefer_direct
     global _run_direct_dense
     global _warp_splitk_tactic, _run_warp_splitk_dense
-    global _enable_bf16_splitk_gemm
+    global _enable_bf16_splitk_gemm, _use_sm107_splitk_tactics
+    global _active_warp_splitk_tactics
     global _skip_aiter_unquant
 
     _skip_aiter_unquant = (
@@ -399,7 +444,9 @@ def initialize_bf16_gemm_config() -> None:
         _use_cutedsl_bf16_gemm = use_cutedsl_bf16_gemm
 
     _enable_bf16_splitk_gemm = False
-    if should_enable_bf16_splitk_gemm(backend):
+    _use_sm107_splitk_tactics = False
+    _active_warp_splitk_tactics = _BF16_WARP_SPLITK_TUNED_TACTICS
+    if backend.is_cutedsl():
         from flashinfer.gemm.kernels.dense_bf16_gemm_direct import (
             default_tactic,
             prefer_direct_bf16_gemm_sm100,
@@ -422,6 +469,12 @@ def initialize_bf16_gemm_config() -> None:
         _warp_splitk_tactic = WarpSplitKTactic
         _run_warp_splitk_dense = run_warp_splitk_dense
         _enable_bf16_splitk_gemm = True
+        if get_platform().device_sm == 107:
+            _active_warp_splitk_tactics = {
+                **_BF16_WARP_SPLITK_TUNED_TACTICS,
+                **_BF16_SM107_WARP_SPLITK_TUNED_TACTICS,
+            }
+            _use_sm107_splitk_tactics = True
 
     _BF16_GEMM_BACKEND = backend
 
@@ -455,7 +508,7 @@ def _bf16_splitk_gemm_out(
     out: torch.Tensor,
 ) -> torch.Tensor:
     m, n, k = x_2d.shape[0], weight.shape[0], weight.shape[1]
-    warp_tactic = _BF16_WARP_SPLITK_TUNED_TACTICS.get((m, n, k))
+    warp_tactic = _active_warp_splitk_tactics.get((m, n, k))
     if warp_tactic is not None:
         _run_warp_splitk_dense(
             x_2d, weight.T, out, True, _warp_splitk_tactic(*warp_tactic), bias
@@ -597,7 +650,7 @@ def maybe_pad_weight_for_gfx115(weight: torch.Tensor) -> torch.Tensor:
     slice, not the full checkpoint K. Non-contiguous weights, including ones
     already padded, come back unchanged, which keeps a reload from padding twice.
     """
-    if not _is_gfx115 or envs.SGLANG_DISABLE_GFX115_WEIGHT_PADDING.get():
+    if not _is_gfx115:
         return weight
     if weight.dim() != 2 or not weight.is_contiguous():
         return weight
@@ -618,7 +671,7 @@ def finalize_gfx115_weight_padding(model: torch.nn.Module) -> None:
     Also runs after every weight update; already-padded weights are skipped, so
     storage pointers stay stable for CUDA graphs.
     """
-    if not _is_gfx115 or envs.SGLANG_DISABLE_GFX115_WEIGHT_PADDING.get():
+    if not _is_gfx115:
         return
     for head in _unquantized_lm_heads(model):
         head.weight.data = maybe_pad_weight_for_gfx115(head.weight.data)
