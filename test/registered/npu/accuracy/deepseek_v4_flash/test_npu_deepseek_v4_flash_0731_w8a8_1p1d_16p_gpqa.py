@@ -54,7 +54,7 @@ HICACHE_STORAGE_EXTRA_CONFIG = json.dumps(
         "log_level": "info",
         "world_size": 16,
         "protocol": "device_sdma",
-        "dram_size": "20GB",
+        "dram_size": "10GB",
     }
 )
 
