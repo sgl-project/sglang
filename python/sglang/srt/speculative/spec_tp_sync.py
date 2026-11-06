@@ -33,6 +33,8 @@ class SpecTpSyncSite(IntEnum):
     DFLASH_ACCEPT_SAMPLE = 14
     DFLASH_ACCEPT_GREEDY = 15
     DFLASH_TARGET = 16
+    # The draft block every rank verifies; the draft runs replicated per rank.
+    DFLASH_DRAFT = 18
 
     @property
     def slug(self) -> str:
