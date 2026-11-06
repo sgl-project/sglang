@@ -49,6 +49,58 @@ RESPONSE_TEMPLATE = {
 
 
 class NonHarmonyStreamTestCase(CustomTestCase):
+    def test_prompt_usage_matches_chat_without_recounting_metadata_only_chunks(self):
+        for encoding, raw_prompt, stub, expected_prompt, cached, expected_cached in (
+            ("kimi_k3", 11, 3, 8, 3, 3),
+            ("kimi_k3", 11, 3, 8, 10, 8),
+            ("kimi_k3", 2, 3, 0, 2, 0),
+            ("kimi_k3", 11, 5, 6, 10, 6),
+            (None, 11, 3, 11, 10, 10),
+        ):
+            for final_has_prompt in (False, True):
+                with self.subTest(
+                    encoding=encoding,
+                    stub=stub,
+                    cached=cached,
+                    final_has_prompt=final_has_prompt,
+                ):
+                    serving = make_serving()
+                    serving.chat_encoding_spec = encoding
+                    serving._KIMI_K3_GENERATION_STUB_TOKENS = stub
+                    serving.enable_prompt_tokens_details = True
+                    serving.reasoning_parser = None
+                    serving.tool_call_parser = None
+                    first = engine_chunk("do", 1)
+                    final = engine_chunk("done", 7, finish=True)
+                    first["meta_info"]["prompt_tokens"] = raw_prompt
+                    first["meta_info"]["cached_tokens"] = cached
+                    final["meta_info"]["cached_tokens"] = cached
+                    if final_has_prompt:
+                        final["meta_info"]["prompt_tokens"] = raw_prompt
+                    else:
+                        final["meta_info"].pop("prompt_tokens")
+                    # A raw engine total must not reintroduce K3's input stub.
+                    final["meta_info"]["total_tokens"] = 99
+                    request = ResponsesRequest(
+                        model="x", input="hi", stream=True, store=False
+                    )
+                    fixture = StreamFixture(serving, request)
+                    events = fixture.run([first, final])
+                    usage = find_completed_event(events)["response"]["usage"]
+                    self.assertEqual(usage["input_tokens"], expected_prompt)
+                    self.assertEqual(usage["output_tokens"], 7)
+                    self.assertEqual(
+                        usage["input_tokens_details"]["cached_tokens"], expected_cached
+                    )
+                    self.assertEqual(
+                        usage["total_tokens"],
+                        expected_prompt + 7 if encoding == "kimi_k3" else 99,
+                    )
+                    self.assertEqual(
+                        fixture.request_metadata.final_usage_info.prompt_tokens,
+                        expected_prompt,
+                    )
+
     def test_beam_cut_off_regions_match_full_output(self):
         serving = make_serving()
         serving.reasoning_parser = "beam"
