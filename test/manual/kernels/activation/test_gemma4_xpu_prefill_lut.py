@@ -2,6 +2,7 @@
 
 import unittest
 from types import MethodType
+from unittest.mock import patch
 
 import torch
 import torch.nn.functional as F
@@ -50,9 +51,16 @@ class TestGemma4PrefillLut(CustomTestCase):
             ):
                 for intermediate in (6144, 12288):
                     with self.subTest(intermediate=intermediate):
-                        mlp = Gemma4MLP(1536, intermediate, "gelu_pytorch_tanh").to(
-                            device="xpu", dtype=torch.bfloat16
-                        )
+                        # Exercise the standalone lookup fallback even when a
+                        # newer optional wheel provides fast fused prefill.
+                        with patch(
+                            "sgl_kernel.bf16_dense_gelu_tanh_mul_lut_xe20_prefill_supported",
+                            return_value=False,
+                            create=True,
+                        ):
+                            mlp = Gemma4MLP(1536, intermediate, "gelu_pytorch_tanh").to(
+                                device="xpu", dtype=torch.bfloat16
+                            )
                         mlp.gate_up_proj.weight.fill_(1 / 256)
                         mlp.down_proj.weight.fill_(1 / 256)
                         self.assertIsNotNone(mlp._xpu_gelu_mul_lut)
