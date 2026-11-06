@@ -38,7 +38,10 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    maybe_remap_kv_scale_name,
+)
 from sglang.srt.models.llama import LlamaDecoderLayer, LlamaForCausalLM, LlamaMLP
 from sglang.srt.runtime_context import get_parallel
 
@@ -354,6 +357,16 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
 
             if "t2d" in name:
                 continue
+
+            # KV-cache scales go to RadixAttention; map them before the
+            # k_proj/v_proj -> qkv_proj rename below takes their names.
+            if "scale" in name:
+                model_name = name if name.startswith("model.") else f"model.{name}"
+                kv_scale_name = maybe_remap_kv_scale_name(model_name, params_dict)
+                if kv_scale_name is None:
+                    continue
+                if kv_scale_name != model_name:
+                    name = kv_scale_name
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
