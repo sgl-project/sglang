@@ -13,6 +13,7 @@ from sglang.srt.disaggregation.base.conn import KVPoll, KVTransferDestination
 from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeRequest
 from sglang.srt.disaggregation.fake.conn import FakeKVManager
 from sglang.srt.disaggregation.utils import ReqToMetadataIdxAllocator, TransferBackend
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     SchedulerPoolStatsObserver,
@@ -522,6 +523,17 @@ class TestDecodeRetractionBackup(CustomTestCase):
         self.assertEqual(
             (full_host.available_size(), swa_host.available_size()), capacities
         )
+
+    @patch("torch.distributed.get_world_size", return_value=1)
+    def test_host_receive_turns_off_the_hicache_verify_check(self, _world_size):
+        with envs.SGLANG_DEBUG_HICACHE_VERIFY.override(True):
+            env = self._build_cache(
+                hicache_ratio=2.0, shared_receive=True, host_receive_threshold=0
+            )
+        engine = env.cache.cache_controller.l2_transfer_engine
+        self.assertIsNotNone(engine._verifier)
+        self._receive_queue(env)
+        self.assertIsNone(engine._verifier)
 
     @patch("torch.distributed.get_world_size", return_value=1)
     def test_host_receive_threshold_controls_device_allocation(self, _world_size):

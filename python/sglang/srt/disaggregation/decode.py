@@ -784,6 +784,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     "Host receive supports full KV and separate paged SWA pools"
                 )
             self.host_pool = group.get_pool(PoolName.KV)
+            self.tree_cache.cache_controller.l2_transfer_engine.disable_verifier(
+                reason="decode host receive is enabled; host slots the prefill "
+                "peer writes have no device-to-host backup to check against"
+            )
             self.host_reserved_tokens = decode_retraction_max_tokens(
                 self.req_to_token_pool, pool
             )

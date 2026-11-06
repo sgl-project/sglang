@@ -81,6 +81,16 @@ class L2TransferEngine:
         # Set inside `on_current_stream`: host-to-device submissions then run on
         # the caller's current stream instead of the engine's streams.
         self._h2d_on_current_stream = False
+        self._verifier = None
+        if envs.SGLANG_DEBUG_HICACHE_VERIFY.get():
+            from sglang.srt.mem_cache.hicache_verify import HiCacheVerifier
+
+            self._verifier = HiCacheVerifier(resolve_rows=self._resolve_device_indices)
+
+    def disable_verifier(self, reason: str) -> None:
+        if self._verifier is not None:
+            self._verifier = None
+            logger.warning("HiCache verify disabled: %s", reason)
 
     @contextmanager
     def on_current_stream(self):
@@ -181,6 +191,9 @@ class L2TransferEngine:
                 )
 
     def submit_device_to_host(self, transfers: list[L2Transfer]) -> TransferCompletion:
+        # The verifier hashes the requested transfers (host slots as the caller
+        # gave them); `transfers` is rebound to the prepared ones below.
+        requested = transfers
         with self._submission(
             transfers, self.device_to_host_stream, "device_to_host"
         ) as (transfers, completion):
@@ -191,6 +204,9 @@ class L2TransferEngine:
                     transfer.device_indices,
                     self.io_backend,
                 )
+        if self._verifier is not None:
+            completion.finish_event.synchronize()
+            self._verifier.record_backup(requested)
         return completion
 
     def submit_host_to_device(
@@ -206,6 +222,9 @@ class L2TransferEngine:
             if self._h2d_on_current_stream
             else self.host_to_device_stream
         )
+        # The verifier hashes the requested transfers (host slots as the caller
+        # gave them); `transfers` is rebound to the prepared ones below.
+        requested = transfers
         with self._submission(transfers, stream, "host_to_device", start_event) as (
             transfers,
             completion,
@@ -237,6 +256,9 @@ class L2TransferEngine:
                     )
                 if on_layer_done is not None:
                     on_layer_done(layer_id)
+        if self._verifier is not None:
+            completion.finish_event.synchronize()
+            self._verifier.check_load(requested)
         return completion
 
     @staticmethod

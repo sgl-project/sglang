@@ -113,6 +113,7 @@ def _controller(cls: type, storage_host_pool: Any, mem_pool_host: Any) -> Any:
     controller.pp_group = None
     controller.prefetch_hits_sync_groups = []
     controller.prefetch_completion_sync_groups = []
+    controller.l2_transfer_engine = mock.Mock()
     if cls is HybridCacheController:
         controller.pp_prefetch_command_thread = None
         controller.pp_prefetch_command_group = None
@@ -181,6 +182,15 @@ class TestRegistrationBurstOrder(CustomTestCase):
         _attach(controller, RecordingBackend(order), order)
 
         self.assertEqual(order, ["v1", "complete", "threads"])
+
+    def test_attach_turns_off_the_hicache_verify_check(self):
+        order: List[str] = []
+        pool = _fake_pool("kv")
+        controller = _controller(HiCacheController, pool, pool)
+
+        _attach(controller, RecordingBackend(order), order)
+
+        controller.l2_transfer_engine.disable_verifier.assert_called_once()
 
     def test_base_hook_failure_rolls_the_attach_back(self):
         # On the base path the hook runs inside the attach's guarded section,

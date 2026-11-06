@@ -635,6 +635,10 @@ class HiCacheController:
                 self.storage_backend.on_host_pools_registered()
 
             self.enable_storage = True
+            self.l2_transfer_engine.disable_verifier(
+                reason="a storage backend is attached; host slots it fills "
+                "have no device-to-host backup to check against"
+            )
             # todo: threshold policy for prefetching
             self.prefetch_threshold = max(prefetch_threshold, self.page_size)
             if self.host_memory_mode == "buffer_only":
