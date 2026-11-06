@@ -4,7 +4,7 @@ import os
 import subprocess
 from functools import lru_cache
 
-from huggingface_hub import HfApi
+from huggingface_hub.errors import GatedRepoError
 
 from sglang.srt.environ import envs
 from sglang.utils import (
@@ -24,7 +24,17 @@ def _is_overlay_diffusion_model(model_path: str) -> bool:
     return has_diffusion_overlay_registry_match(model_path, _load_overlay_registry())
 
 
+def _diffusion_deps_available() -> bool:
+    # Locating diffusers is cheap; importing the registry costs ~2 s and then
+    # fails anyway without it. A false positive is caught by the caller.
+    import importlib.util
+
+    return importlib.util.find_spec("diffusers") is not None
+
+
 def _is_diffusion_model_from_registry(model_path: str) -> bool:
+    if not _diffusion_deps_available():
+        return False
     try:
         from sglang.multimodal_gen.registry import is_registered_diffusion_model_path
     except ImportError:
@@ -34,21 +44,44 @@ def _is_diffusion_model_from_registry(model_path: str) -> bool:
     return is_registered_diffusion_model_path(model_path)
 
 
-def _is_diffusers_model_dir(model_dir: str) -> bool:
-    """Check if a local directory contains a valid diffusers model_index.json."""
-    config_path = os.path.join(model_dir, "model_index.json")
-    if not os.path.exists(config_path):
+def is_registered_native_pipeline(pipeline_class_name: str | None) -> bool:
+    """Whether ``pipeline_class_name`` names a registered native diffusion pipeline.
+
+    Lets a caller treat an explicit ``--pipeline-class-name`` as a diffusion
+    signal even when the ``model_path`` itself is not auto-detectable (e.g. a bare
+    ``.safetensors`` file with no ``model_index.json``, as with FLUX.3). Guarded so
+    LLM-only installs (no diffusion deps) simply return False.
+    """
+    if not pipeline_class_name:
+        return False
+    try:
+        from sglang.multimodal_gen.registry import (
+            _PIPELINE_REGISTRY,
+            _discover_and_register_pipelines,
+        )
+    except ImportError:
+        # if diffusion dependencies are not installed
         return False
 
-    with open(config_path) as f:
-        config = json.load(f)
+    _discover_and_register_pipelines()
+    return pipeline_class_name in _PIPELINE_REGISTRY
 
-    return "_diffusers_version" in config
+
+def _is_diffusers_model_dir(model_dir: str) -> bool:
+    """Check for a standard or modular Diffusers pipeline index."""
+    for filename in ("model_index.json", "modular_model_index.json"):
+        config_path = os.path.join(model_dir, filename)
+        if os.path.isfile(config_path):
+            with open(config_path) as f:
+                return "_diffusers_version" in json.load(f)
+    return False
 
 
 def _is_gated_diffusion_repo(repo_id: str) -> bool:
     """Query HF model card metadata to check if a gated repo is a diffusers model."""
     try:
+        from huggingface_hub import HfApi  # lazy: ~0.3 s at CLI entry otherwise
+
         info = HfApi().model_info(repo_id)
         return getattr(info, "library_name", None) == "diffusers"
     except Exception:
@@ -61,7 +94,7 @@ def get_is_diffusion_model(model_path: str) -> bool:
     For registered models, consults the diffusion registry first.
     For other local directories, checks the filesystem directly.
     For other HF/ModelScope model IDs, attempts to fetch only model_index.json.
-    For gated repos where file download fails, falls back to HF model card
+    For gated HF repos where file download fails, falls back to HF model card
     metadata (library_name == "diffusers").
     Returns False on any failure (network error, 404, offline mode, etc.)
     so that the caller falls through to the standard LLM server path.
@@ -78,8 +111,10 @@ def get_is_diffusion_model(model_path: str) -> bool:
     if os.path.isdir(model_path):
         return _is_diffusers_model_dir(model_path)
 
+    use_modelscope = envs.SGLANG_USE_MODELSCOPE.get()
+
     try:
-        if envs.SGLANG_USE_MODELSCOPE.get():
+        if use_modelscope:
             from modelscope import model_file_download
 
             file_path = model_file_download(
@@ -93,6 +128,8 @@ def get_is_diffusion_model(model_path: str) -> bool:
         return _is_diffusers_model_dir(os.path.dirname(file_path))
     except Exception as e:
         logger.debug("Failed to auto-detect diffusion model for %s: %s", model_path, e)
+        if not use_modelscope and isinstance(e, GatedRepoError):
+            return _is_gated_diffusion_repo(model_path)
         return False
 
 
@@ -129,6 +166,51 @@ def get_model_path(extra_argv):
                 "Error: --model-path is required. Please provide the path to the model."
             )
     return model_path
+
+
+def get_pipeline_class_name(extra_argv):
+    """Return the explicitly selected pipeline class, or None if absent.
+
+    Mirrors :func:`get_model_path`'s lightweight pre-parse (handles both
+    spellings accepted by ``ServerArgs`` and their ``--flag=value`` forms) so
+    the generate dispatcher can consult it before the full parser runs. If the
+    pipeline is selected only in a JSON/YAML ``--config``, inspect that as a
+    fallback; malformed configs are left for the full parser to diagnose.
+    """
+    pipeline_flags = ("--pipeline", "--pipeline-class-name")
+    for i, arg in enumerate(extra_argv):
+        if arg in pipeline_flags:
+            if i + 1 < len(extra_argv):
+                return extra_argv[i + 1]
+        elif any(arg.startswith(f"{flag}=") for flag in pipeline_flags):
+            return arg.split("=", 1)[1]
+
+    config_path = None
+    for i, arg in enumerate(extra_argv):
+        if arg == "--config" and i + 1 < len(extra_argv):
+            config_path = extra_argv[i + 1]
+            break
+        if arg.startswith("--config="):
+            config_path = arg.split("=", 1)[1]
+            break
+    if config_path:
+        try:
+            with open(config_path) as f:
+                if config_path.endswith(".json"):
+                    config = json.load(f)
+                elif config_path.endswith((".yaml", ".yml")):
+                    import yaml
+
+                    config = yaml.safe_load(f)
+                else:
+                    return None
+            if isinstance(config, dict):
+                return config.get("pipeline_class_name") or config.get("pipeline")
+        except (ImportError, OSError, ValueError) as exc:
+            logger.debug(
+                "Failed to pre-parse pipeline class from %s: %s", config_path, exc
+            )
+    return None
 
 
 @lru_cache(maxsize=1)

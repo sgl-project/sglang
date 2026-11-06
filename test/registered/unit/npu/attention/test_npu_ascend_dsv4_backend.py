@@ -10,9 +10,12 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+# Loaded before the torch_npu mock below: importing transformers runs
+# accelerate's find_spec("torch_npu"), which fails on a mock without __spec__.
+import sglang.srt.hf_transformers  # noqa: F401
 from sglang.test.ci.ci_register import register_npu_ci
 
-register_npu_ci(est_time=4, suite="base-a-test-1-npu-a2")
+register_npu_ci(est_time=4, suite="base-a-test-npu")
 
 for mod in (
     "torch_npu",
@@ -26,6 +29,7 @@ for mod in (
     "sglang.srt.speculative.decoupled_spec_io",
     "sglang.srt.speculative.spec_info",
     "sglang.srt.speculative.eagle_info",
+    "sglang.srt.speculative.base_spec_worker",
 ):
     sys.modules.setdefault(mod, MagicMock())
 
@@ -516,6 +520,7 @@ class TestCompressorStateTableABI(unittest.TestCase):
     )
     def test_arch35_eager_metadata_builds_cycle_table(self, _):
         backend = CompressorAscendBackendMixin.__new__(CompressorAscendBackendMixin)
+        backend._is_dspark_algorithm = False
         backend.forward_metadata = SimpleNamespace()
         backend.token_to_kv_pool = MagicMock()
         backend.req_to_token = torch.empty((0, 0), dtype=torch.int32)
@@ -571,7 +576,32 @@ class TestCompressorStateTableABI(unittest.TestCase):
         ):
             setattr(backend, name, MagicMock())
 
-        backend._apply_dsv4_graph_metadata(SimpleNamespace())
+        backend.is_hybrid_swa = False
+        backend.page_size = 1
+        backend.req_to_token = torch.arange(8 * 4, dtype=torch.int32).view(8, 4)
+        backend.graph_metadata = {
+            2: SimpleNamespace(block_tables=torch.zeros(2, 4, dtype=torch.int64))
+        }
+        graph_mode = MagicMock()
+        graph_mode.is_decode.return_value = False
+        graph_mode.is_target_verify.return_value = False
+        graph_mode.is_decode_or_idle.return_value = False
+
+        forward_batch = SimpleNamespace(
+            batch_size=1,
+            req_pool_indices=torch.arange(7, 19, dtype=torch.int64),
+            seq_lens_cpu=torch.tensor([3], dtype=torch.int32),
+            forward_mode=graph_mode,
+            spec_info=None,
+        )
+
+        backend._apply_dsv4_graph_metadata(
+            metadata_key=2,
+            forward_batch=forward_batch,
+            in_capture=False,
+        )
+
+        # backend._apply_dsv4_graph_metadata(SimpleNamespace())
 
         self.assertIs(ctx.fm.dsv4_cycle_state_block_table, table)
         self.assertEqual(table.tolist(), [7])
@@ -582,10 +612,10 @@ class TestCompressorStateTableABI(unittest.TestCase):
     )
     def test_arch35_graph_capture_allocates_cycle_table_buffer(self, _):
         backend = DeepseekV4AscendAttnBackend.__new__(DeepseekV4AscendAttnBackend)
-        metadata = SimpleNamespace()
         backend.device = "cpu"
+        backend.is_hybrid_swa = False
         backend.graph_metadata = {
-            2: metadata,
+            "block_tables": torch.full((2, 4), -1, dtype=torch.int32),
             "swa_page_table": torch.full((2, 4), -1, dtype=torch.int32),
             "c4_page_table": torch.full((2, 4), -1, dtype=torch.int32),
             "c128_page_table": torch.full((2, 4), -1, dtype=torch.int32),
@@ -603,9 +633,13 @@ class TestCompressorStateTableABI(unittest.TestCase):
         forward_mode = MagicMock()
         forward_mode.is_target_verify.return_value = False
         forward_mode.is_draft_extend_v2.return_value = False
+        forward_batch = SimpleNamespace(batch_size=2, forward_mode=forward_mode)
 
-        backend._init_dsv4_graph_metadata(2, forward_mode)
+        backend._init_dsv4_graph_metadata(
+            metadata_key=2, forward_batch=forward_batch, ragged_layout=None
+        )
 
+        metadata = backend.graph_metadata[2]
         table = getattr(metadata, "dsv4_cycle_state_block_table", None)
         self.assertIsNotNone(table)
         self.assertEqual(tuple(table.shape), (2,))
@@ -712,7 +746,7 @@ class TestArch35SparseAttentionDispatch(unittest.TestCase):
             kwargs = _sparse_attn_kv_quant_kwargs()
 
         self.assertIs(metadata_op, custom_ops.npu_sparse_attn_sharedkv_metadata)
-        self.assertIs(attention_op, npu_ops.sparse_attn_sharedkv)
+        self.assertIs(attention_op, custom_ops.npu_sparse_attn_sharedkv)
         self.assertEqual(kwargs, {})
 
 
@@ -754,9 +788,6 @@ class TestSparseAttentionMetadata(unittest.TestCase):
                     bs=2,
                     actual_seq_lengths_q_pa=cu_seqlens_q,
                     actual_seq_lengths_kv=seqused_kv,
-                    block_tables=torch.zeros((2, 1), dtype=torch.int32),
-                    max_seqlen_q=2,
-                    is_nextn=False,
                 )
 
                 metadata_op = getattr(custom_ops, metadata_op_name)
@@ -771,11 +802,12 @@ class TestSparseAttentionMetadata(unittest.TestCase):
         cu_seqlens_q_cpu = cu_seqlens_q.clone()
         seqused_kv_cpu = seqused_kv.clone()
 
+        metadata_op = MagicMock()
         with (
-            patch("torch.ops.npu", MagicMock(), create=True) as npu_ops,
+            patch("torch.ops.npu", MagicMock(), create=True),
             patch(
                 "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend._sparse_attn_ops",
-                return_value=(MagicMock(), MagicMock()),
+                return_value=(metadata_op, MagicMock()),
             ),
         ):
             backend = DeepseekV4AscendAttnBackend.__new__(DeepseekV4AscendAttnBackend)
@@ -795,12 +827,8 @@ class TestSparseAttentionMetadata(unittest.TestCase):
                 bs=2,
                 actual_seq_lengths_q_pa=cu_seqlens_q,
                 actual_seq_lengths_kv=seqused_kv,
-                block_tables=torch.zeros((2, 1), dtype=torch.int32),
-                max_seqlen_q=2,
-                is_nextn=False,
             )
 
-        metadata_op = npu_ops.sparse_attn_sharedkv_metadata_host
         metadata_op.assert_called_once()
         self.assertIs(kernel_metadata["c1a_metadata"], metadata_op.return_value)
         self.assertIs(metadata_op.call_args.kwargs["cu_seqlens_q"], cu_seqlens_q_cpu)
@@ -961,55 +989,6 @@ class TestStepOutCacheLoc(unittest.TestCase):
         forward_batch = SimpleNamespace(out_cache_loc=loc, batch_size=2)
         result = backend._step_out_cache_loc(forward_batch, 0)
         self.assertIsInstance(result, torch.Tensor)
-
-
-class TestCommonTemplate(unittest.TestCase):
-    def _make_backend(self, speculative_num_steps):
-        backend = object.__new__(DeepseekV4AscendMultiStepDraftBackend)
-        backend.speculative_num_steps = speculative_num_steps
-        return backend
-
-    def test_calls_call_fn_for_each_step(self):
-        backend = self._make_backend(speculative_num_steps=4)
-        forward_batch = SimpleNamespace(spec_info=object())
-        call_fn = MagicMock()
-        backend.common_template(forward_batch, call_fn)
-        # range(speculative_num_steps - 1) = range(3) -> i=0,1,2
-        self.assertEqual(call_fn.call_count, 3)
-        for i, call in enumerate(call_fn.call_args_list):
-            self.assertEqual(call.args[0], i)
-            self.assertIs(call.args[1], forward_batch)
-
-    def test_single_step_no_calls(self):
-        backend = self._make_backend(speculative_num_steps=1)
-        forward_batch = SimpleNamespace(spec_info=object())
-        call_fn = MagicMock()
-        backend.common_template(forward_batch, call_fn)
-        self.assertEqual(call_fn.call_count, 0)
-
-    def test_two_steps_one_call(self):
-        backend = self._make_backend(speculative_num_steps=2)
-        forward_batch = SimpleNamespace(spec_info=object())
-        call_fn = MagicMock()
-        backend.common_template(forward_batch, call_fn)
-        self.assertEqual(call_fn.call_count, 1)
-        self.assertEqual(call_fn.call_args_list[0].args[0], 0)
-
-    def test_asserts_spec_info_not_none(self):
-        backend = self._make_backend(speculative_num_steps=3)
-        forward_batch = SimpleNamespace(spec_info=None)
-        call_fn = MagicMock()
-        with self.assertRaises(AssertionError):
-            backend.common_template(forward_batch, call_fn)
-        self.assertEqual(call_fn.call_count, 0)
-
-    def test_call_fn_exception_propagates(self):
-        backend = self._make_backend(speculative_num_steps=3)
-        forward_batch = SimpleNamespace(spec_info=object())
-        call_fn = MagicMock(side_effect=RuntimeError("boom"))
-        with self.assertRaises(RuntimeError):
-            backend.common_template(forward_batch, call_fn)
-        self.assertEqual(call_fn.call_count, 1)
 
 
 class TestCompressorEpilogEmptyWrite(unittest.TestCase):

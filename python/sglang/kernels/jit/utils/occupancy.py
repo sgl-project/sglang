@@ -10,7 +10,11 @@ from sglang.kernels.jit.utils.compile import load_jit
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
-__all__ = ["get_max_active_clusters"]
+__all__ = ["NoSchedulableClustersError", "get_max_active_clusters"]
+
+
+class NoSchedulableClustersError(ValueError):
+    """The occupancy query succeeded, but no cluster fits the requested shape."""
 
 
 @cache_once
@@ -36,11 +40,13 @@ def get_max_active_clusters(cluster_size: int, occupancy: int) -> int:
     dividing a GPC evenly. The probe kernel is pinned to ``occupancy`` blocks per
     SM, so pass the occupancy the real kernel reaches (its second
     ``__launch_bounds__`` argument). Raises ``RuntimeError`` before sm90, which
-    has no clusters, and ``ValueError`` when nothing is schedulable.
+    has no clusters, and ``NoSchedulableClustersError`` (a ``ValueError``)
+    when the query succeeds but nothing is schedulable. Other probe errors
+    propagate to the caller.
     """
     result = _get_max_active_clusters(cluster_size, occupancy)
     if result == 0:
-        raise ValueError(
+        raise NoSchedulableClustersError(
             f"no cluster of {cluster_size} fits at occupancy {occupancy}; "
             "the cluster width is likely beyond what this device supports"
         )

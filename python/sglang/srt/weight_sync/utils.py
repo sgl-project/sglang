@@ -23,6 +23,8 @@ async def update_weights(
     """
     Update weights for the inference engine.
     This function is designed to be stateless, so that the caller process could keep the stateful engine.
+    The caller must hold an open weight-update session (engine.begin_weight_update() ...
+    engine.end_weight_update()) around one or more calls.
     Example Use Case:
         - Multiple Producer Process will call this function in a SPMD style
 

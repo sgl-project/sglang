@@ -5,7 +5,7 @@ from typing import List, Optional, Tuple
 import requests
 import torch
 
-from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.arg_groups.serving_hook import ssl_verify_of
 from sglang.srt.entrypoints.EngineBase import EngineBase
 from sglang.srt.entrypoints.http_server import launch_server
@@ -85,6 +85,12 @@ class HttpServerEngineAdapter(EngineBase):
         )
         response.raise_for_status()
         return response.json()
+
+    def begin_weight_update(self, selector: str = "all"):
+        return self._make_request("begin_weight_update", {"selector": selector})
+
+    def end_weight_update(self):
+        return self._make_request("end_weight_update")
 
     def update_weights_from_tensor(
         self,

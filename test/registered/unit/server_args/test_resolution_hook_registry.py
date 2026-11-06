@@ -4,7 +4,7 @@ end-to-end proof that an override reaches a real `resolve_once()`."""
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 import ast
 import glob
@@ -242,11 +242,10 @@ class TestEndToEnd(_IsolatedRegistry):
         sa.resolve_once()
         self.assertTrue(getattr(sa, "_test_plugin_ran", False))
         self.assertEqual(resolution_result(sa, "random_seed"), 999)
-        # And the neighboring step (must run right after, per the comment at
-        # the call site) still ran and still saw a real config to chunk.
+        # And the later steps still ran and still saw a real config to chunk.
         self.assertIsNotNone(
             resolution_result(sa, "chunked_prefill_size"),
-            "apply_glm5_chunked_prefill_default's neighbor did not run",
+            "steps after handle_cuda_graph_config did not run",
         )
 
     def test_with_nothing_registered_resolution_is_unchanged(self):

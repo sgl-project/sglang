@@ -9,7 +9,7 @@ import torch
 
 from sglang.kernels.ops.kvcache.pd_dcp_gather import copy_mla_rows_into_pack
 from sglang.srt.disaggregation.common.staging_buffer import StagingBuffer
-from sglang.srt.runtime_context import get_schedule, max_prefill_buffer_tokens
+from sglang.srt.utils import device_stream_context
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +42,9 @@ def try_pack_dcp_src(
     kv_data_ptrs: Sequence[int],
     src_token_indices: npt.NDArray[np.integer],
     token_item_lens: Sequence[int],
+    src_token_item_lens: Optional[Sequence[int]] = None,
     pack_offset_bytes: int = 0,
+    pack_capacity_bytes: Optional[int] = None,
 ) -> Optional[Tuple[List[int], npt.NDArray[np.int64]]]:
     if pack_offset_bytes < 0:
         raise ValueError(
@@ -54,13 +56,17 @@ def try_pack_dcp_src(
         return [], empty
     required = n * sum(int(item_len) for item_len in token_item_lens)
     required_end = pack_offset_bytes + required
-    if not pack_buffer.fits(required_end):
+    if (
+        pack_capacity_bytes is not None and required > pack_capacity_bytes
+    ) or not pack_buffer.fits(required_end):
         logger.warning(
-            "PD DCP pack buffer too small for byte range [%s, %s) (have %s); "
+            "PD DCP pack buffer too small for byte range [%s, %s) "
+            "(have %s, region capacity %s); "
             "falling back to per-token RDMA",
             pack_offset_bytes,
             required_end,
             pack_buffer.get_size(),
+            pack_capacity_bytes,
         )
         return None
 
@@ -69,9 +75,11 @@ def try_pack_dcp_src(
         src_token_indices, device=pack.device, dtype=torch.int64
     )
     gather_stream = pack_buffer.get_gather_stream()
-    gather_stream.wait_stream(torch.cuda.default_stream(pack.device))
-    with torch.cuda.stream(gather_stream):
-        copy_mla_rows_into_pack(kv_data_ptrs, row_indices, pack, token_item_lens)
+    gather_stream.wait_stream(pack_buffer.producer_stream())
+    with device_stream_context(gather_stream):
+        copy_mla_rows_into_pack(
+            kv_data_ptrs, row_indices, pack, token_item_lens, src_token_item_lens
+        )
     gather_stream.synchronize()
 
     packed_ptrs: List[int] = []
@@ -88,17 +96,26 @@ def init_dcp_pack_buffers(
     kv_args,
     count: int,
     dcp_size: int,
+    max_tokens: int,
+    *,
+    device_type: str,
+    include_draft: bool = False,
 ) -> List[StagingBuffer]:
     from sglang.srt.disaggregation.common.staging_handler import (
+        _bare_device_type,
         _get_custom_mem_pool,
     )
 
-    max_tokens = max_prefill_buffer_tokens()
-    if max_tokens <= 0:
-        max_tokens = get_schedule().max_prefill_tokens
+    device_type = _bare_device_type(device_type)
+    # copy_mla_rows_into_pack packs kv_data_ptrs as int64, which rejects XPU
+    # pointers with bit 63 set; no buffers routes callers to per-token RDMA.
+    if device_type != "cuda":
+        logger.info("PD DCP pack disabled on %s; using per-token transfer", device_type)
+        return []
+
     kv_item_lens = kv_args.kv_item_lens
-    if kv_args.num_draft_entries > 0:
-        kv_item_lens = kv_item_lens[: len(kv_item_lens) - kv_args.num_draft_entries]
+    if not include_draft and kv_args.num_draft_entries:
+        kv_item_lens = kv_item_lens[: -kv_args.num_draft_entries]
     # Note(kpham-sgl): size = dcp_size x ceil(max_tokens / dcp_size)
     # x sum(per-layer token bytes). At 32,768 tokens and 61 MLA layers
     # x 576 bf16 dims x 2 B: 2.14 GiB/buffer, 8.58 GiB for 4 queues.
@@ -106,7 +123,7 @@ def init_dcp_pack_buffers(
         kv_item_lens, kv_args.page_size, max_tokens, dcp_size
     )
     gpu_id = kv_args.gpu_id
-    device = f"cuda:{gpu_id}"
+    device = f"{device_type}:{gpu_id}"
     custom_mem_pool, _ = _get_custom_mem_pool(device)
 
     buffers = []

@@ -1,6 +1,7 @@
 import collections
 import collections.abc
 import logging
+from array import array
 from collections.abc import Callable, Sequence
 from typing import Iterable, List, Optional, Tuple, TypeAlias, cast
 
@@ -13,19 +14,16 @@ from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.conv import Conv2dLayer
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    pad_mm_tokens,
 )
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputs,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
-from sglang.srt.utils import add_prefix
+from sglang.srt.multimodal.modality import Modality
 
 logger = logging.getLogger(__name__)
 _Tuple2: TypeAlias = int | tuple[int, int] | Sequence[int]
@@ -502,10 +500,9 @@ class MiDashengLMModel(nn.Module):
         self.logits_processor = self.language_model.logits_processor
         self.quant_config = quant_config
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         """Pad input IDs with multimodal tokens."""
-        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
-        return pattern.pad_input_tokens(input_ids, mm_inputs)
+        return pad_mm_tokens(input_ids, mm_inputs)
 
     def get_audio_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         """Process audio inputs and return embeddings.

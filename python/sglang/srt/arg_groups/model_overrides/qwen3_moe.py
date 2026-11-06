@@ -1,7 +1,4 @@
-"""Config-time override declarations for qwen3_moe.
-
-Architectures: InternS2PreviewForConditionalGeneration, Qwen3MoeForCausalLM, Qwen3NextForCausalLM, Qwen3VLMoeForConditionalGeneration, Qwen3_5ForConditionalGeneration, Qwen3_5MoeForConditionalGeneration, Qwen4ExpForConditionalGeneration.
-"""
+"""Config-time override declarations for qwen3_moe."""
 
 import logging
 from typing import Any, Dict
@@ -10,9 +7,9 @@ from sglang.srt.arg_groups.model_override_base import (
     _register_for,
     resolving_view,
 )
+from sglang.srt.configs.quant_utils import get_quantization_config
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils.common import get_quantization_config
 
 logger = logging.getLogger(__name__)
 

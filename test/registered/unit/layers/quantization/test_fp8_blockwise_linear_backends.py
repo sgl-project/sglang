@@ -11,12 +11,19 @@ from types import SimpleNamespace
 from unittest import mock
 
 import torch
+from flashinfer import block_scale_interleave
 
-from sglang.srt.layers.quantization import fp8_utils
+from sglang.kernels.ops.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
+from sglang.srt.layers.quantization import fp8, fp8_utils, mxfp8_input
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_utils import Fp8GemmRunnerBackend
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8Config
-from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
+from sglang.srt.layers.quantization.mxfp8_input import (
+    Mxfp8SwizzledInput,
+    deepgemm_mxfp8_linear_input,
+    deepgemm_pair_takes_flashinfer,
+    zero_deepgemm_mxfp8_scale_rows,
+)
 from sglang.srt.utils import get_device_sm
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.layer_ut_utils import (
@@ -27,9 +34,9 @@ from sglang.test.layer_ut_utils import (
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=15, stage="base-b", runner_config="4-gpu-b200")
-register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-small")
-register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=139, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=14, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=141, stage="base-b", runner_config="1-gpu-large")
 
 FP8_MAX = 448.0
 
@@ -192,6 +199,70 @@ class TestFp8BlockwiseLinearBackends(_LinearBackendCheck):
     def test_deep_gemm(self):
         self._run("deep_gemm")
 
+    @unittest.skipUnless(
+        get_device_sm() in (100, 103), "Packed block-FP8 scales on SM100"
+    )
+    def test_deep_gemm_prequantized(self):
+        """Packed activations must skip requantization and preserve the GEMM result."""
+        torch.manual_seed(9)
+        with mock.patch.object(
+            fp8_utils, "FP8_GEMM_RUNNER_BACKEND", Fp8GemmRunnerBackend.DEEP_GEMM
+        ):
+            for m, n, k in FP8_BLOCK_SHAPES:
+                with self.subTest(shape=(m, n, k)):
+                    layer, _ = self._build_layer(n, k)
+                    layer.quant_method.process_weights_after_loading(layer)
+                    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+                    q, s = fp8_utils.sglang_per_token_group_quant_fp8(
+                        x,
+                        128,
+                        column_major_scales=True,
+                        scale_tma_aligned=True,
+                        scale_ue8m0=True,
+                    )
+                    expected, _ = layer(x)
+                    actual, _ = layer((q, s))
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                    linear = fp8_utils.deepgemm_w8a8_block_fp8_linear_with_fallback
+                    for bad_scale in (s.new_empty(s.shape), s[:, :-1], s.cpu()):
+                        with self.assertRaisesRegex(ValueError, "packed UE8M0"):
+                            linear(
+                                q,
+                                layer.weight,
+                                [128, 128],
+                                layer.weight_scale_inv,
+                                bad_scale,
+                            )
+                    # This shape normally takes Triton, which cannot read packed A scales.
+                    with self.assertRaisesRegex(ValueError, "packed UE8M0"):
+                        linear(
+                            q, layer.weight[:65], [128, 128], layer.weight_scale_inv, s
+                        )
+
+    @unittest.skipUnless(
+        get_device_sm() == 90, "SM90 UE8M0 activation-scale regression"
+    )
+    def test_deep_gemm_ue8m0_activation_scales(self):
+        torch.manual_seed(7)
+        x = torch.randn(3, 128, device="cuda", dtype=torch.bfloat16)
+        weight = torch.eye(128, device="cuda").to(torch.float8_e4m3fn)
+        weight_scale = torch.ones(1, 1, device="cuda")
+        q, scale = fp8_utils.sglang_per_token_group_quant_fp8(x, 128, scale_ue8m0=True)
+        ref = (q.float() * scale).to(torch.bfloat16)
+        for backend in (Fp8GemmRunnerBackend.AUTO, Fp8GemmRunnerBackend.DEEP_GEMM):
+            with mock.patch.object(fp8_utils, "FP8_GEMM_RUNNER_BACKEND", backend):
+                self.assertIs(
+                    fp8_utils.dispatch_w8a8_block_fp8_linear([128, 128]),
+                    fp8_utils.deepgemm_w8a8_block_fp8_linear_with_fallback,
+                )
+                linear = fp8_utils.dispatch_w8a8_block_fp8_linear(
+                    [128, 128], act_scale_ue8m0=True
+                )
+                for n in (128, 96):
+                    with self.subTest(backend=backend, n=n):
+                        out = linear(x, weight[:n], [128, 128], weight_scale)
+                        torch.testing.assert_close(out, ref[:, :n], rtol=0, atol=0)
+
     def test_flashinfer_trtllm(self):
         self._run("flashinfer_trtllm")
 
@@ -303,10 +374,7 @@ class TestBlockFp8AsMxfp8Linear(_LinearBackendCheck):
     def test_mxfp8_view_and_swizzled_input(self):
         if "flashinfer_cutedsl" not in _block32_backends():
             self.skipTest(f"cutedsl not in SM{get_device_sm()} backend set")
-        from sglang.kernels.ops.attention.dsv4.wo_a_bf16 import (
-            _quantize_partial,
-            _wo_a_reduce,
-        )
+        from sglang.kernels.ops.gemm.dsv4_wo_a import _quantize_partial, _wo_a_reduce
 
         torch.manual_seed(7)
         with mock.patch.object(
@@ -340,6 +408,161 @@ class TestBlockFp8AsMxfp8Linear(_LinearBackendCheck):
             self.assertFalse(plain_layer.block_fp8_mxfp8_ready)
             with self.assertRaises(ValueError):
                 plain_layer.quant_method.apply(plain_layer, Mxfp8SwizzledInput(q, s))
+
+    def test_deepgemm_producer_flashinfer_layout(self):
+        if "flashinfer_cutedsl" not in _block32_backends():
+            self.skipTest(f"cutedsl not in SM{get_device_sm()} backend set")
+
+        def as_flashinfer_4d(scale):
+            # DeepGEMM-packed [rows, K / 128] int32 -> [ceil(rows / 128), K / 128, 32, 4]
+            rows, k_tiles = scale.shape
+            padded = -(-rows // 128) * 128
+            scale = torch.nn.functional.pad(
+                scale.contiguous(), (0, 0, 0, padded - rows)
+            ).contiguous()
+            return (
+                scale.view(padded // 128, 4, 32, k_tiles)
+                .permute(0, 3, 2, 1)
+                .contiguous()
+            )
+
+        self.assertTrue(deepgemm_pair_takes_flashinfer())
+        with mock.patch.object(
+            mxfp8_input, "batch_invariant_or_deterministic", return_value=True
+        ):
+            self.assertFalse(deepgemm_pair_takes_flashinfer())
+
+        torch.manual_seed(7)
+        with mock.patch.object(
+            fp8_utils,
+            "FP8_GEMM_RUNNER_BACKEND",
+            Fp8GemmRunnerBackend.FLASHINFER_CUTEDSL,
+        ):
+            n, k = 512, 2048
+            layer, w_dequant = self._build_layer(n, k)
+            layer.deepgemm_mxfp8_input = True
+            layer.quant_method.process_weights_after_loading(layer)
+            if not layer.deepgemm_mxfp8_input:
+                self.skipTest("DeepGEMM-packed MXFP8 input is not available")
+
+            for rows in (200, 256):
+                with self.subTest(rows=rows):
+                    x = torch.randn(rows, k, device="cuda", dtype=torch.bfloat16) / 10
+                    q, s = sglang_per_token_group_quant_fp8(
+                        x,
+                        32,
+                        column_major_scales=True,
+                        scale_tma_aligned=True,
+                        scale_ue8m0=True,
+                    )
+                    s4 = as_flashinfer_4d(s)
+                    swizzled = deepgemm_mxfp8_linear_input(q, s4)
+                    self.assertIsInstance(swizzled, Mxfp8SwizzledInput)
+                    expected = block_scale_interleave(
+                        s.contiguous().view(torch.uint8).view(rows, k // 32)
+                    )
+                    self.assertTrue(
+                        torch.equal(swizzled.scales.flatten(), expected.flatten())
+                    )
+
+                    outs = {}
+                    for name, inp in (("fi", swizzled), ("dg", (q, s))):
+                        with mock.patch.object(
+                            fp8,
+                            "deepgemm_w8a8_mxfp8_linear_with_fallback",
+                            wraps=fp8.deepgemm_w8a8_mxfp8_linear_with_fallback,
+                        ) as dg:
+                            outs[name] = layer.quant_method.apply(layer, inp)
+                        self.assertEqual(dg.call_count, int(name == "dg"))
+
+                    ref = x.float() @ w_dequant.T
+                    assert_output_close(self, outs["fi"], ref, rtol=5e-2, atol=1e-1)
+                    assert_output_close(
+                        self, outs["fi"], outs["dg"].float(), rtol=1e-2, atol=1e-2
+                    )
+
+                    for start in (0, 33, 100, 129, rows - 1):
+                        zeroed = s.contiguous().clone()
+                        zeroed[start:] = 0
+                        got = s4.clone()
+                        zero_deepgemm_mxfp8_scale_rows(got, start)
+                        self.assertTrue(torch.equal(got, as_flashinfer_4d(zeroed)))
+
+
+@unittest.skipUnless(get_device_sm() == 90, "Native block32 DeepGEMM requires SM90")
+class TestSm90Block32Linear(_LinearBackendCheck):
+    _build_layer = staticmethod(_build_block32_layer)
+    _shapes = [(1, 96, 288), (6, 5120, 288), (65, 1792, 5120), (512, 512, 512)]
+
+    def test_deepgemm_and_auto_use_native_blocks(self):
+        for backend in ("deep_gemm", "auto"):
+            with (
+                self.subTest(backend=backend),
+                mock.patch.object(
+                    fp8_utils,
+                    "triton_w8a8_block_fp8_linear",
+                    side_effect=AssertionError(
+                        "native block32 unexpectedly fell back to Triton"
+                    ),
+                ),
+            ):
+                self._check_backend(backend, [backend], self._shapes, self._build_layer)
+
+    def test_triton_override(self):
+        self._check_backend("triton", ["triton"], self._shapes, self._build_layer)
+
+    def test_unsupported_shape_keeps_triton_and_bf16_fallback(self):
+        torch.manual_seed(7)
+        with (
+            mock.patch.object(
+                fp8_utils, "FP8_GEMM_RUNNER_BACKEND", Fp8GemmRunnerBackend.DEEP_GEMM
+            ),
+            mock.patch.object(
+                fp8_utils.envs.SGLANG_OPT_HOPPER_BLOCK_FP8_BF16,
+                "get",
+                return_value=True,
+            ),
+            mock.patch.object(
+                fp8_utils,
+                "w8a8_block_fp8_matmul_deepgemm",
+                side_effect=AssertionError("unsupported shape reached DeepGEMM"),
+            ),
+        ):
+            layer, w_dequant = self._build_layer(32, 64)
+            layer.weight.data = layer.weight.data[:10].contiguous()
+            layer.quant_method.process_weights_after_loading(layer)
+            self.assertIsNotNone(getattr(layer, "_block_fp8_bf16_weight", None))
+            x = torch.randn(65, 64, device="cuda", dtype=torch.bfloat16) / 10
+            q, scales = fp8_utils.sglang_per_token_group_quant_fp8(
+                x, 32, scale_ue8m0=True
+            )
+            ref = fp8_utils.dequant_group_fp8_to_bf16(q, scales).float()
+            ref = ref @ w_dequant[:10].T
+            for inputs in (x, (q, scales)):
+                out = layer.quant_method.apply(layer, inputs)
+                assert_output_close(self, out, ref, rtol=5e-2, atol=1e-1)
+
+    def test_preserves_checkpoint_and_prequantized_input(self):
+        torch.manual_seed(7)
+        with mock.patch.object(
+            fp8_utils, "FP8_GEMM_RUNNER_BACKEND", Fp8GemmRunnerBackend.DEEP_GEMM
+        ):
+            layer, _ = self._build_layer(96, 288)
+            original_weight = layer.weight.detach().clone()
+            layer.quant_method.process_weights_after_loading(layer)
+            self.assertIsNone(getattr(layer, "_block_fp8_bf16_weight", None))
+            torch.testing.assert_close(
+                layer.weight.float(), original_weight.float(), rtol=0, atol=0
+            )
+            self.assertEqual(tuple(layer.weight_scale_inv.shape), (3, 9))
+            x = torch.randn(5, 288, device="cuda", dtype=torch.bfloat16) / 10
+            q, scales = fp8_utils.sglang_per_token_group_quant_fp8(
+                x, 32, scale_ue8m0=True
+            )
+            bias = torch.randn(96, device="cuda", dtype=torch.bfloat16)
+            plain = layer.quant_method.apply(layer, x, bias)
+            quantized = layer.quant_method.apply(layer, (q, scales), bias)
+            torch.testing.assert_close(plain, quantized, rtol=0, atol=0)
 
 
 @unittest.skipUnless(
@@ -390,7 +613,7 @@ class TestBlockFp8AsMxfp8PrefillAutotune(_LinearBackendCheck):
         self.assertEqual(methods[0].apply.call_args.args[1].shape, (4096, 128))
         methods[1].apply.assert_not_called()
         for method in methods:
-            self.assertEqual(method.mxfp8_prefill_autotune_min_tokens, 4096)
+            self.assertEqual(method.mxfp8_prefill_autotune_min_tokens, 1)
         self.assertIsNone(fallback.quant_method.mxfp8_prefill_autotune_min_tokens)
 
     def test_block_fp8_dispatch_keeps_decode_and_determinism_pinned(self):
@@ -409,12 +632,14 @@ class TestBlockFp8AsMxfp8PrefillAutotune(_LinearBackendCheck):
                 rows=rows, invariant=invariant, deterministic=deterministic
             ):
                 with (
-                    mock.patch(
-                        "sglang.srt.batch_invariant_ops.is_batch_invariant_mode_enabled",
+                    mock.patch.object(
+                        mxfp8_input,
+                        "is_batch_invariant_mode_enabled",
                         return_value=invariant,
                     ),
-                    mock.patch(
-                        "sglang.srt.runtime_context.get_exec",
+                    mock.patch.object(
+                        mxfp8_input,
+                        "get_exec",
                         return_value=SimpleNamespace(
                             deterministic=SimpleNamespace(
                                 enable_deterministic_inference=deterministic
@@ -424,36 +649,6 @@ class TestBlockFp8AsMxfp8PrefillAutotune(_LinearBackendCheck):
                 ):
                     method.apply(layer, torch.empty(rows, 128, device="cuda"))
                 self.assertEqual(call.call_args.kwargs.get("pin_tactic"), expected)
-
-    def test_prefill_tuning_leaves_decode_bit_identical(self):
-        """Tuning the prefill buckets must not move the decode tactic: below the
-        stamped min_tokens the output has to stay bit-for-bit what it was."""
-        from flashinfer.autotuner import autotune
-
-        from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
-
-        runtime_patch = mock.patch(
-            "sglang.srt.runtime_context.get_exec",
-            return_value=SimpleNamespace(
-                deterministic=SimpleNamespace(enable_deterministic_inference=False)
-            ),
-        )
-        runtime_patch.start()
-        self.addCleanup(runtime_patch.stop)
-        layer = self._ready_layer(1792, 5120)
-        method = layer.quant_method
-        x = torch.randn(6, 5120, device="cuda", dtype=torch.bfloat16)
-        original = method.apply(layer, x)
-        model = SimpleNamespace(
-            config=SimpleNamespace(model_type="deepseek_v41"),
-            model=torch.nn.ModuleList([layer]),
-        )
-        with autotune(True):
-            DeepseekV4ForCausalLM.autotune_prefill_kernels(
-                model, 4096, dtype=torch.bfloat16
-            )
-        self.assertEqual(method.mxfp8_prefill_autotune_min_tokens, 4096)
-        torch.testing.assert_close(method.apply(layer, x), original, rtol=0, atol=0)
 
 
 @unittest.skipIf(get_device_sm() < 90, "FP8 GEMM backends require SM90+")
