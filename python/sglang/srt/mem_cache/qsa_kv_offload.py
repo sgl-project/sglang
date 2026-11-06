@@ -271,7 +271,7 @@ class QSAKVHostOffload:
 
     On CUDA the resolve is the fused, CUDA-graph-safe one
     (``qsa_kv_offload_kernels``). The torch resolve here is the reference: eager,
-    with host synchronizations; ``SGLANG_ENABLE_QSA_KV_OFFLOAD_TORCH_RESOLVE``
+    with host synchronizations; ``SGLANG_USE_QSA_KV_OFFLOAD_TORCH_RESOLVE``
     selects it on CUDA.
     """
 
@@ -339,7 +339,7 @@ class QSAKVHostOffload:
         self.use_fused = (
             self.device.type == "cuda"
             and not is_hip()
-            and not envs.SGLANG_ENABLE_QSA_KV_OFFLOAD_TORCH_RESOLVE.get()
+            and not envs.SGLANG_USE_QSA_KV_OFFLOAD_TORCH_RESOLVE.get()
         )
         self.fused = None
         self._resolve_errors_host = torch.zeros(
