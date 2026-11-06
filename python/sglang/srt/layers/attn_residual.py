@@ -24,7 +24,7 @@ import triton.language as tl
 
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
-from sglang.srt.utils import is_cuda, is_hip, is_npu
+from sglang.srt.utils import bind_or_assign, is_cuda, is_hip, is_npu
 
 _BLOCK_H: int = 1024  # H = 7168 = 7 x 1024
 _MAX_ROWS: int = 16  # next_pow2(8 + 1), K3 has <= 8 snapshots
@@ -63,6 +63,12 @@ def _use_hip_fused(hidden_size: int, nvb: int) -> bool:
     return _HIP_SHAPE_GATE(hidden_size, nvb)
 
 
+def _cw_product(
+    proj: ReplicatedLinear, norm: RMSNorm, dtype: torch.dtype
+) -> torch.Tensor:
+    return (norm.weight.float() * proj.weight.squeeze().float()).contiguous().to(dtype)
+
+
 def get_cw(
     proj: ReplicatedLinear,
     norm: RMSNorm,
@@ -78,9 +84,19 @@ def get_cw(
         proj._attn_res_cw_cache = cache
     cw = cache.get(dtype)
     if cw is None:
-        cw = (norm.weight.float() * proj.weight.squeeze().float()).contiguous()
-        cw = cache[dtype] = cw.to(dtype)
+        cw = cache[dtype] = _cw_product(proj, norm, dtype)
     return cw
+
+
+def refresh_cw(proj: ReplicatedLinear, norm: RMSNorm) -> None:
+    """Compute both cached products of ``get_cw`` (bf16 for the fast kernel, fp32
+    for triton) from the current weights, in place once cached: captured CUDA
+    graphs hold the cached tensors."""
+    cache = getattr(proj, "_attn_res_cw_cache", {})
+    proj._attn_res_cw_cache = {
+        dtype: bind_or_assign(cache.get(dtype), _cw_product(proj, norm, dtype))
+        for dtype in (torch.bfloat16, torch.float32)
+    }
 
 
 def _aggregate_fast(
