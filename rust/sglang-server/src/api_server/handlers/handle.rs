@@ -22,6 +22,7 @@ use crate::tokenizer_manager::wiring::{AbortSource, RequestAdmission, TmEvent};
 use crate::utils::error::Error;
 use crate::utils::fsm::RequestState;
 
+use super::control::PEER_ABORT_MAX_IN_FLIGHT;
 use super::generate::{Cancellation, Generation, Generations};
 use crate::api_server::core::fanout::{ControlTarget, RankId};
 use crate::api_server::core::{CoreError, DrainEnd, DrainState, FrontendMetrics};
@@ -136,6 +137,9 @@ pub(super) struct CoreInner {
     /// Overrides [`GRACEFUL_CLOSE_TIMEOUT`] (see
     /// [`CoreHandle::set_graceful_close_timeout`]).
     pub(super) graceful_close_timeout: OnceLock<Duration>,
+    /// Relayed aborts in flight at once, across every abort (see
+    /// [`CoreHandle::abort_peers`]).
+    pub(super) peer_abort_permits: tokio::sync::Semaphore,
 }
 
 impl CoreHandle {
@@ -163,6 +167,7 @@ impl CoreHandle {
                 peer_endpoints: config.peer_endpoints,
                 drain: Arc::default(),
                 graceful_close_timeout: OnceLock::new(),
+                peer_abort_permits: tokio::sync::Semaphore::new(PEER_ABORT_MAX_IN_FLIGHT),
             }),
         }
     }

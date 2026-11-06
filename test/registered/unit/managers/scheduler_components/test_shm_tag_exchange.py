@@ -17,6 +17,7 @@ import torch.multiprocessing
 from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler_components import shm_tag_exchange
 from sglang.srt.managers.scheduler_components.request_receiver import (
+    SchedulerRequestReceiver,
     _broadcast_via_exchange,
 )
 from sglang.srt.managers.scheduler_components.shm_tag_exchange import ShmTagExchange
@@ -85,7 +86,7 @@ def _sync_hicache_ready_counts(rank: int, init_file: str) -> None:
     )
     try:
         with (
-            envs.SGLANG_Q35MF_EDGE_SHM_SYNC.override(True),
+            envs.SGLANG_OPT_SCHEDULER_SHM_SYNC.override(True),
             _sleep_on_idle(False),
             _shm_names(),
         ):
@@ -113,7 +114,7 @@ def _exchange_rounds(rank: int, init_file: str) -> None:
     )
     group = torch.distributed.group.WORLD
     try:
-        with envs.SGLANG_Q35MF_EDGE_SHM_SYNC.override(True):
+        with envs.SGLANG_OPT_SCHEDULER_SHM_SYNC.override(True):
             # --sleep-on-idle keeps the gloo path: the other ranks would spin
             with _sleep_on_idle(True):
                 assert shm_tag_exchange.get_shm_exchange(group, "idle") is None
@@ -143,6 +144,27 @@ def _exchange_rounds(rank: int, init_file: str) -> None:
 
 
 class TestShmTagExchange(CustomTestCase):
+    def test_request_receiver_opts_into_multihost_exchange_with_runtime_switch(self):
+        cpu_group = object()
+        tp_group = SimpleNamespace(cpu_group=cpu_group, rank=0, ranks=list(range(8)))
+        parallel = SimpleNamespace(attn_dp_enabled=False, tp_size=8, tp_group=tp_group)
+        exchange, requests = object(), [{"rid": "a"}]
+        module = "sglang.srt.managers.scheduler_components.request_receiver."
+        for enabled in (False, True):
+            with (
+                patch(module + "get_parallel", return_value=parallel),
+                patch(
+                    module + "get_shm_exchange", return_value=exchange
+                ) as get_exchange,
+                patch(module + "_broadcast_via_exchange", return_value=requests),
+                envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(enabled),
+            ):
+                got = SchedulerRequestReceiver._broadcast_reqs_across_ranks(
+                    None, requests
+                )
+            self.assertEqual(got, requests)
+            self.assertEqual(get_exchange.call_args.kwargs["multihost"], enabled)
+
     def test_rounds_and_request_broadcast_match_on_every_rank(self):
         """Every rank reads every rank's values of each call, through repeated reuse
         of both table halves with one rank late, and the request broadcast hands
