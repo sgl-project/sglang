@@ -22,6 +22,7 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
+#include <sgl_kernel/activation.cuh>
 #include <sgl_kernel/utils.cuh>
 
 #include <dlpack/dlpack.h>
@@ -286,7 +287,7 @@ __global__ __launch_bounds__(1024, 1) void inkling_attn_prologue_kernel(const __
       acc += tap * __bfloat162float(wt[j][iw]);
     }
     acc += xj * __bfloat162float(wt[j][W1]);
-    if constexpr (USE_SILU) acc = __fdividef(acc, 1.0f + __expf(-acc));
+    if constexpr (USE_SILU) acc = device::activation::silu(acc);
     if constexpr (USE_RESIDUAL) acc += xj;
     y[j] = acc;
   }
@@ -691,7 +692,7 @@ __global__ __launch_bounds__(1024, 1) void inkling_attn_prologue_decode_kernel(
       acc += h * cm * __bfloat162float(wt[j][w]);
     }
     acc += xj * __bfloat162float(wt[j][W1]);
-    if constexpr (USE_SILU) acc = __fdividef(acc, 1.0f + __expf(-acc));
+    if constexpr (USE_SILU) acc = device::activation::silu(acc);
     if constexpr (USE_RESIDUAL) acc += xj;
     y[j] = acc;
   }
@@ -1118,7 +1119,7 @@ __global__ __launch_bounds__(1024, 1) void inkling_attn_prologue_extend_kernel(
       acc += tap * __bfloat162float(wt[j][iw]);
     }
     acc += xj * __bfloat162float(wt[j][W1]);
-    if constexpr (USE_SILU) acc = __fdividef(acc, 1.0f + __expf(-acc));
+    if constexpr (USE_SILU) acc = device::activation::silu(acc);
     if constexpr (USE_RESIDUAL) acc += xj;
     y[j] = acc;
   }
