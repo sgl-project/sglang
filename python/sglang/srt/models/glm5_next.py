@@ -60,7 +60,8 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
-from sglang.srt.layers.utils.common import PPMissingLayer
+from sglang.srt.layers.utils.common import PPMissingLayer, add_prefix, set_weight_attrs
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -71,7 +72,7 @@ from sglang.srt.managers.mm_utils import (
     pad_mm_tokens,
     prepare_mm_inputs,
 )
-from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -119,16 +120,12 @@ from sglang.srt.runtime_context import (
     get_mm,
     get_parallel,
     get_spec,
+    linear_attn_parallel_group,
+    linear_attn_tp_size,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.utils.common import (
-    BumpAllocator,
-    LazyValue,
-    add_prefix,
-    log_info_on_rank0,
-    make_pp_layers,
-    set_weight_attrs,
-)
+from sglang.srt.utils.common import BumpAllocator, LazyValue
+from sglang.srt.utils.log_utils import log_info_on_rank0
 
 if _use_aiter_gfx95:
     from sglang.srt.layers.rocm_linear_utils import (
@@ -397,11 +394,6 @@ class Glm5NextLinearAttention(nn.Module):
         **kwargs,
     ) -> None:
         super().__init__()
-        from sglang.srt.runtime_context import (
-            linear_attn_parallel_group,
-            linear_attn_tp_size,
-        )
-
         head_shard_size = linear_attn_tp_size()
         head_parallel_group = linear_attn_parallel_group()
 
@@ -842,7 +834,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 update=residual.attn_update,
                 tp_group=SumGroup.TP
                 if config.is_kda_layer(layer_id)
-                and get_parallel().enable_cp_tp_group_sharing
+                and linear_attn_parallel_group() == "tp"
                 else SumGroup.ATTN_TP,
             ),
             declare_ffn(

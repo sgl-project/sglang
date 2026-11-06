@@ -11,9 +11,9 @@ from transformers import PretrainedConfig
 
 from sglang.srt.layers.attention.dsa.dsa_indexer import (
     DUAL_STREAM_TOKEN_THRESHOLD,
-    BaseIndexerMetadata,
     rotate_activation,
 )
+from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import BaseIndexerMetadata
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
 from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
     DSAPagedMQALogitsBackend,
@@ -30,11 +30,12 @@ from sglang.srt.layers.attention.mqa_logits_utils import (
     mqa_logits_should_chunk,
 )
 from sglang.srt.layers.layernorm import LayerNorm
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
 from sglang.srt.utils import (
-    add_prefix,
     ceil_align,
     is_cuda,
+    is_gfx1250_supported,
     is_gfx95_supported,
     is_hip,
     is_npu,
@@ -1699,11 +1700,16 @@ class IndexerKPool(MultiPlatformOp):
         buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
 
         def _compress_write() -> None:
+            # Only rows covered by the write plan belong to verify sequences;
+            # trailing MoE padding must not update per-request KPool state.
+            num_write_tokens = plan.req.shape[0] * num_draft_tokens
             kpool_write_tail_and_maybe_compress(
                 pool=pool,
                 buf=buf,
-                key=key,
-                score=self._compute_gate_score_if_missing(x, gate_score_maybe),
+                key=key[:num_write_tokens],
+                score=self._compute_gate_score_if_missing(x, gate_score_maybe)[
+                    :num_write_tokens
+                ],
                 tail_k=tail_k_buf,
                 tail_score=tail_score_buf,
                 ape=self.index_kpool_compress_ape,
@@ -1711,7 +1717,7 @@ class IndexerKPool(MultiPlatformOp):
                 write_start=plan.write_start,
                 tail_logical_start=plan.tail_logical_start,
                 write_loc=plan.write_loc,
-                out_cache_loc=forward_batch.out_cache_loc,
+                out_cache_loc=forward_batch.out_cache_loc[:num_write_tokens],
                 num_draft_tokens=num_draft_tokens,
                 round_scale=self.scale_fmt is not None,
                 effective_n_per_batch=plan.effective_n_per_batch,
@@ -1747,9 +1753,11 @@ class IndexerKPool(MultiPlatformOp):
         forward_batch: ForwardBatch,
         layer_id: int,
         return_indices: bool = True,
+        use_cuda_graph: bool = True,
     ) -> Optional[torch.Tensor]:
         if (
-            is_in_breakable_cuda_graph()
+            use_cuda_graph
+            and is_in_breakable_cuda_graph()
             and forward_batch.forward_mode.is_extend_without_speculative()
         ):
             from sglang.srt.layers.attention.dsa.kpool_prefill_cuda_graph import (
@@ -1772,8 +1780,17 @@ class IndexerKPool(MultiPlatformOp):
             )
             return output if return_indices else None
         return self._forward_cuda_impl(
-            x, q_lora, positions, forward_batch, layer_id, return_indices
+            x,
+            q_lora,
+            positions,
+            forward_batch,
+            layer_id,
+            return_indices,
         )
+
+    @property
+    def topk_output_width(self):
+        return self.index_topk + self.index_kpool - 1
 
     def _forward_cuda_impl(
         self,
@@ -1784,7 +1801,7 @@ class IndexerKPool(MultiPlatformOp):
         layer_id: int,
         return_indices: bool = True,
     ) -> Optional[torch.Tensor]:
-        if is_hip():
+        if is_hip() and not is_gfx1250_supported():
             from sglang.kernels.ops.quantization.act_quant_tilelang import act_quant
         elif not is_npu():
             from sglang.kernels.ops.quantization.act_quant_triton import act_quant
