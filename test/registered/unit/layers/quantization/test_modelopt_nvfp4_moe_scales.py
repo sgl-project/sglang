@@ -256,6 +256,60 @@ class TestNvfp4MoeScaleLoading(CustomTestCase):
                     torch.testing.assert_close(layer.gemm1_beta, torch.tensor([25.0]))
 
 
+class TestNvfp4MoeSwizzledBlockscales(CustomTestCase):
+    def test_create_weights_allocates_swizzled_scales_only_when_read(self):
+        """Marlin never reads the swizzled block scales and returns from
+        process_weights_after_loading() before freeing them, so an eager copy
+        pins a second set of expert scales for the server's lifetime."""
+        for backend, expect_swizzled in [
+            (MoeRunnerBackend.MARLIN, False),
+            (MoeRunnerBackend.LORA_MARLIN, False),
+            # Resolves to MARLIN on SM80-SM90 in create_moe_runner().
+            (MoeRunnerBackend.AUTO, False),
+            (MoeRunnerBackend.FLASHINFER_TRTLLM, False),
+            (MoeRunnerBackend.FLASHINFER_CUTLASS, True),
+            (MoeRunnerBackend.FLASHINFER_CUTEDSL, True),
+        ]:
+            with (
+                self.subTest(backend=backend),
+                get_flags().moe.override(
+                    runner_backend=backend, a2a_backend=MoeA2ABackend.NONE
+                ),
+                mock.patch.object(
+                    modelopt_quant,
+                    "get_platform",
+                    return_value=SimpleNamespace(is_blackwell=True),
+                ),
+            ):
+                method = ModelOptNvFp4FusedMoEMethod(
+                    SimpleNamespace(
+                        group_size=16,
+                        is_checkpoint_nvfp4_serialized=True,
+                        use_per_token_activation=False,
+                        get_name=lambda: "modelopt_fp4",
+                    )
+                )
+                layer = torch.nn.Module()
+                layer.num_experts = layer.num_local_experts = 2
+                layer.moe_runner_config = MoeRunnerConfig(is_gated=True)
+                method.create_weights(
+                    layer,
+                    num_experts=2,
+                    hidden_size=128,
+                    intermediate_size_per_partition=128,
+                    params_dtype=torch.bfloat16,
+                    weight_loader=lambda *args, **kwargs: None,
+                )
+                for swizzled in (
+                    layer.w13_blockscale_swizzled,
+                    layer.w2_blockscale_swizzled,
+                ):
+                    if expect_swizzled:
+                        self.assertIsInstance(swizzled, torch.nn.Parameter)
+                    else:
+                        self.assertIsNone(swizzled)
+
+
 class TestGemm1Alphas(CustomTestCase):
     """w13 gate/up global-scale split feeding g1_alphas / g1_alphas_up."""
 
