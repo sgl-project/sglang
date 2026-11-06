@@ -12,6 +12,52 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def test_native_abort_and_retracted_abort_notify_after_native_detachment():
+    run_python(
+        """
+from array import array
+from types import SimpleNamespace as NS
+from sglang_simulator.simulation.sglang.hook_bootstrap import install_simulator_hooks
+install_simulator_hooks()
+from sglang.srt.managers.req_types import FINISH_ABORT
+from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
+from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang_simulator.simulation.sglang.scheduler import C_SchedulerHook
+
+events = []
+def noop(*args, **kwargs): pass
+def note(*, rid, natural_stop):
+    assert ('media', rid) in events
+    assert natural_stop is False
+    events.append(('history', rid))
+C_SchedulerHook.INFERENCE_PREDICTOR = NS(supports_dspark=True,
+    dspark_runtime=NS(note_request_finished=note))
+retirer = RequestRetirer(
+    tree_cache=NS(finish=lambda *args: events.append(('cache', args[0]))),
+    beam_coordinator=NS(retire_group=noop), hisparse_coordinator=None,
+    uocr_runtime=None, send_abort_output=noop)
+for retracted in (False, True):
+    rid = 'retracted' if retracted else 'queued'
+    params = SamplingParams(max_new_tokens=8, ignore_eos=True)
+    params.normalize(None)
+    req = Req(rid, '', array('q', [1, 2]), params)
+    req.release_mm_inputs_on_abort = lambda rid=rid: events.append(('media', rid))
+    assert not req.kv.holds_kv and not req.kv.holds_mamba
+    if retracted:
+        retirer.abort_retracted(req, reason=FINISH_ABORT())
+    else:
+        retirer.abort(req)
+        assert req.finished()
+    assert events.count(('history', rid)) == 1
+assert [event for event in events if event[0] == 'history'] == [
+    ('history', 'queued'), ('history', 'retracted')]
+""",
+        bootstrap=True,
+        cpu=True,
+    )
+
+
 def test_native_result_next_input_and_cpu_reserve_use_native_sglang_types():
     run_python(
         """
