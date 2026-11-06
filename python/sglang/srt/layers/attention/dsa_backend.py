@@ -243,9 +243,18 @@ def _plan_live_rows(
     """
     if q_rows >= meta_rows:
         return _RowPlan(meta_rows, q_rows - meta_rows, 0)
+    from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
+        is_in_breakable_cuda_graph,
+    )
+
     if not (
         getattr(forward_batch, "attn_cp_metadata", None) is not None
         or dsa_cache_seqlens_may_be_padded(forward_batch)
+        # A breakable prefill graph replays on a view without
+        # global_num_tokens_cpu, but its metadata was planned on the real batch
+        # (DP padded count included) and the eager bridge narrows q to the
+        # live rows.
+        or is_in_breakable_cuda_graph()
     ):
         raise AssertionError(
             f"DSA metadata rows ({meta_rows}) exceed q rows ({q_rows})"
