@@ -88,6 +88,21 @@ if USE_AITER:
     from aiter import rmsnorm2d_fwd as rms_norm
     from aiter import rmsnorm2d_fwd_with_add as fused_add_rms_norm
 
+
+def _aiter_rmsnorm_reads_strided_rows(x_2d: torch.Tensor) -> bool:
+    # aiter's HIP rmsnorm reads input.stride(0) and moves rows in 16-byte vectors;
+    # it serves 2-byte dtypes with hidden <= 8192 and hidden % 8 == 0 (opus does the rest).
+    hidden = x_2d.shape[-1]
+    return (
+        x_2d.stride(-1) == 1
+        and hidden <= 8192
+        and hidden % 8 == 0
+        and x_2d.stride(0) % 8 == 0
+        and x_2d.stride(0) < 2**31
+        and x_2d.data_ptr() % 16 == 0
+    )
+
+
 if _is_xpu:
     from sgl_kernel import fused_inplace_qknorm_rope
 
@@ -292,7 +307,7 @@ class RMSNorm(CustomOp):
         x_2d = x.reshape(
             -1, shape[-1]
         )  # (bs, seq_len, hidden_size) -> (bs*seq_len, hidden_size)
-        if not x_2d.is_contiguous():
+        if residual is not None or not _aiter_rmsnorm_reads_strided_rows(x_2d):
             x_2d = x_2d.contiguous()
 
         if residual is not None:
