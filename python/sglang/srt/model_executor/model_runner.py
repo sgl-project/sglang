@@ -93,8 +93,8 @@ from sglang.srt.layers.cp.utils import (
 )
 from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.layers.logits_processor import (
-    LogitsProcessor,
     LogitsProcessorOutput,
+    set_banned_token_ids_on_model,
 )
 from sglang.srt.layers.moe.mega_moe import allocate_mega_moe_buffers
 from sglang.srt.layers.sampler import create_sampler
@@ -877,11 +877,9 @@ class ModelRunner:
         # masks the draft after setting up the head.
         if not token_ids or self.is_draft_worker:
             return
-        num_masked = 0
-        for module in self.model.modules():
-            if isinstance(module, LogitsProcessor):
-                module.set_banned_token_ids(token_ids=token_ids, device=self.device)
-                num_masked += 1
+        num_masked = set_banned_token_ids_on_model(
+            model=self.model, token_ids=token_ids, device=self.device
+        )
         # Some models build their LogitsProcessor on the last pipeline stage only.
         if num_masked == 0 and self.pp_group.is_last_rank:
             raise ValueError(

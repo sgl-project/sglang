@@ -1755,3 +1755,21 @@ def should_apply_lm_head_quant_method(lm_head, quant_method) -> bool:
         )
 
     return True
+
+
+def set_banned_token_ids_on_model(
+    *,
+    model: nn.Module,
+    token_ids: List[int],
+    device: torch.device,
+    column_token_ids: Optional[torch.Tensor] = None,
+) -> int:
+    """Mask token_ids in every LogitsProcessor of model; return how many."""
+    num_masked = 0
+    for module in model.modules():
+        if isinstance(module, LogitsProcessor):
+            module.set_banned_token_ids(
+                token_ids=token_ids, device=device, column_token_ids=column_token_ids
+            )
+            num_masked += 1
+    return num_masked

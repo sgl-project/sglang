@@ -86,16 +86,15 @@ class EagleDraftWorkerBase(ABC):
         token_ids = get_exec().features.sampling_banned_token_ids
         if not token_ids:
             return
-        from sglang.srt.layers.logits_processor import LogitsProcessor
+        from sglang.srt.layers.logits_processor import set_banned_token_ids_on_model
 
         for runner in self.draft_runners:
-            for module in runner.model.modules():
-                if isinstance(module, LogitsProcessor):
-                    module.set_banned_token_ids(
-                        token_ids=token_ids,
-                        device=runner.device,
-                        column_token_ids=column_token_ids,
-                    )
+            set_banned_token_ids_on_model(
+                model=runner.model,
+                token_ids=token_ids,
+                device=runner.device,
+                column_token_ids=column_token_ids,
+            )
 
     @property
     def graph_memory_usage(self) -> dict[str, float]:
