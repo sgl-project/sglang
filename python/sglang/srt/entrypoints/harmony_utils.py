@@ -4,7 +4,8 @@
 # Slight differences in processing chat messages
 import datetime
 import logging
-from collections.abc import Iterable
+import re
+from collections.abc import Collection, Iterable
 from typing import Optional, Union
 
 import orjson
@@ -33,10 +34,12 @@ from openai_harmony import (
     Conversation,
     DeveloperContent,
     HarmonyEncodingName,
+    HarmonyError,
     Message,
     ReasoningEffort,
     Role,
     StreamableParser,
+    StreamState,
     SystemContent,
     TextContent,
     ToolDescription,
@@ -284,6 +287,182 @@ def get_stop_tokens_for_assistant_actions() -> list[int]:
 
 def get_streamable_parser_for_assistant() -> StreamableParser:
     return StreamableParser(get_encoding(), role=Role.ASSISTANT)
+
+
+# Narrow output recovery adapted from vLLM PR #59387, commit
+# 756ee24f369475638e4bb887828fa45333425864. Prompt rendering is unchanged.
+def _harmony_token_id(text: str) -> int:
+    return get_encoding().encode(text, allowed_special={text}, disallowed_special=())[0]
+
+
+def _current_harmony_header(parser: StreamableParser):
+    # Native history includes the token that raised. Only inspect it on recovery.
+    tokens = parser.tokens
+    start = _harmony_token_id("<|start|>")
+    offset = next((i for i in range(len(tokens) - 1, -1, -1) if tokens[i] == start), 0)
+    return tokens[:offset], tokens[offset:]
+
+
+def _is_assistant_harmony_prefix(tokens: list[int]) -> bool:
+    if tokens and tokens[0] == _harmony_token_id("<|start|>"):
+        prefix = get_encoding().decode(tokens[1:])
+        pattern = r"assistant(?: to=[A-Za-z0-9_.-]+)?"
+    else:
+        # Responses contexts prime the native parser with the assistant role.
+        prefix = get_encoding().decode(tokens)
+        pattern = r"(?: to=[A-Za-z0-9_.-]+)?"
+    return re.fullmatch(pattern, prefix) is not None
+
+
+def _replay_harmony_tokens(tokens: list[int]) -> StreamableParser | None:
+    if tokens and tokens[0] == _harmony_token_id("<|start|>"):
+        parser = StreamableParser(get_encoding(), role=None)
+    else:
+        parser = get_streamable_parser_for_assistant()
+    try:
+        for token in tokens:
+            parser.process(token)
+    except HarmonyError:
+        return None
+    return parser
+
+
+def recover_harmony_header(parser: StreamableParser) -> StreamableParser | None:
+    """Repair recognized spliced metadata after a native header parse failure."""
+    encoding = get_encoding()
+    prefix, tokens = _current_harmony_header(parser)
+    message = _harmony_token_id("<|message|>")
+    if not tokens or tokens[-1] != message:
+        return None
+    tokens = tokens[:-1]
+    channel_marker = _harmony_token_id("<|channel|>")
+    constrain_marker = _harmony_token_id("<|constrain|>")
+    try:
+        channel = tokens.index(channel_marker)
+        constrain = tokens.index(constrain_marker, channel + 1)
+    except ValueError:
+        return None
+    if not _is_assistant_harmony_prefix(tokens[:channel]):
+        return None
+    header = (
+        encoding.decode(tokens[:channel])
+        + " "
+        + encoding.decode(tokens[channel + 1 : constrain])
+    )
+    recipients = re.findall(r"(?:^|\s)to=([A-Za-z0-9_.-]+)(?=\s|$)", header)
+    if len(recipients) != 1:
+        return None
+    parts, plain = [], []
+    duplicate_marker = False
+    for token in tokens[constrain + 1 :]:
+        if token in (channel_marker, constrain_marker):
+            parts.extend(encoding.decode(plain).split())
+            plain.clear()
+            duplicate_marker = True
+        elif encoding.is_special_token(token):
+            return None
+        else:
+            plain.append(token)
+    parts.extend(encoding.decode(plain).split())
+    if not parts or (len(parts) < 2 and not duplicate_marker):
+        return None
+    if parts[-1] not in ("code", "json"):
+        return None
+    if any(
+        part not in ("analysis", "commentary", "final", recipients[0])
+        and re.fullmatch(r"to=[A-Za-z0-9_.-]+", part) is None
+        for part in parts[:-1]
+    ):
+        return None
+    corrected = (
+        prefix
+        + tokens[: constrain + 1]
+        + encoding.encode(parts[-1], disallowed_special=())
+        + [message]
+    )
+    # Replay preserves earlier messages without keeping a second message store.
+    return _replay_harmony_tokens(corrected)
+
+
+def _harmony_argument_tokens(payload: list[int], boundary: int) -> list[int]:
+    # Preserve every argument ID except a token straddling the header/body boundary.
+    encoding = get_encoding()
+    for index in range(1, len(payload) + 1):
+        try:
+            prefix = encoding.decode_utf8(payload[:index])
+        except HarmonyError:
+            continue
+        if len(prefix) >= boundary:
+            return (
+                encoding.encode(prefix[boundary:], disallowed_special=())
+                + payload[index:]
+            )
+    return []
+
+
+def recover_harmony_missing_message(
+    parser: StreamableParser, function_names: Collection[str] | None
+) -> StreamableParser | None:
+    """Recover a complete declared function call still in HEADER at generation end."""
+    if parser.state != StreamState.HEADER:
+        return None
+    encoding = get_encoding()
+    prefix, tokens = _current_harmony_header(parser)
+    call = _harmony_token_id("<|call|>")
+    if not tokens or tokens[-1] != call:
+        return None
+    try:
+        channel_index = tokens.index(_harmony_token_id("<|channel|>"))
+        role_prefix = tokens[:channel_index]
+        # Only channel-first assistant function headers are recognized.
+        if role_prefix and role_prefix != encoding.encode(
+            "<|start|>assistant", allowed_special={"<|start|>"}
+        ):
+            return None
+        payload = tokens[channel_index + 1 : -1]
+        constrain = _harmony_token_id("<|constrain|>")
+        argument_tokens = None
+        if constrain in payload:
+            index = payload.index(constrain)
+            header = encoding.decode_utf8(payload[:index]).rstrip(" \t")
+            if (
+                re.fullmatch(
+                    r"(?:analysis|commentary) to=functions\.[A-Za-z0-9_-]+", header
+                )
+                is None
+            ):
+                return None
+            argument_tokens = payload[index + 1 :]
+            payload = encoding.encode(header, disallowed_special=()) + argument_tokens
+        if any(encoding.is_special_token(token) for token in payload):
+            return None
+        match = re.fullmatch(
+            r"(analysis|commentary) to=(functions\.[A-Za-z0-9_-]+)"
+            r"([ \t\r\n]*\{.*\}[ \t\r\n]*)",
+            encoding.decode_utf8(payload),
+            re.DOTALL,
+        )
+        if match is None:
+            return None
+        channel, recipient, arguments = match.groups()
+        if (
+            function_names is not None
+            and recipient.removeprefix("functions.") not in function_names
+        ):
+            return None
+        if not isinstance(orjson.loads(arguments), dict):
+            return None
+        if argument_tokens is None:
+            argument_tokens = _harmony_argument_tokens(payload, match.start(3))
+    except (HarmonyError, ValueError, RecursionError):
+        return None
+    header = encoding.encode(
+        f"<|channel|>{channel} to={recipient} <|constrain|>json<|message|>",
+        allowed_special={"<|channel|>", "<|constrain|>", "<|message|>"},
+    )
+    return _replay_harmony_tokens(
+        prefix + role_prefix + header + argument_tokens + [call]
+    )
 
 
 def parse_output_message(message: Message):

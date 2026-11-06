@@ -1977,6 +1977,106 @@ class HarmonyHeaderRecoveryTestCase(CustomTestCase):
                     argument_tokens,
                 )
 
+    def test_successive_repairs_preserve_history_and_partial_content(self):
+        """A later repair must retain earlier messages and their argument tokens."""
+        encoding = get_encoding()
+        arguments = '{"text":"literal <|start|> and <|call|> café"}'
+        argument_tokens = [
+            token
+            for char in arguments
+            for token in encoding.encode(char, disallowed_special=())
+        ]
+        self.assertNotEqual(
+            argument_tokens, encoding.encode(arguments, disallowed_special=())
+        )
+        prefix = encoding.encode(
+            "<|channel|>analysis<|message|>before<|end|>"
+            "<|start|>assistant<|channel|>commentary to=functions.echo "
+            "<|constrain|>analysis json<|message|>",
+            allowed_special="all",
+        )
+        between = encoding.encode(
+            "<|call|><|start|>assistant<|channel|>final<|message|>between<|end|>"
+            "<|start|>assistant<|channel|>analysis to=functions.echo",
+            allowed_special="all",
+        )
+        call_token = encoding.encode("<|call|>", allowed_special="all")[0]
+        partial_arguments = '{"text":"unfinished'
+        for partial in (False, True):
+            tail = (
+                encoding.encode("<|message|>", allowed_special="all")
+                + encoding.encode(partial_arguments, disallowed_special=())
+                if partial
+                else argument_tokens + [call_token]
+            )
+            tokens = prefix + argument_tokens + between + tail
+            for mode in ("nonstream", "cumulative", "incremental"):
+                with self.subTest(mode=mode, partial=partial):
+                    context_type = (
+                        HarmonyContext
+                        if mode == "nonstream"
+                        else StreamingHarmonyContext
+                    )
+                    context = context_type([], {}, function_names={"echo"})
+                    if mode == "nonstream":
+                        chunks = [(tokens, len(tokens))]
+                    elif mode == "cumulative":
+                        chunks = [
+                            (tokens[:end], end) for end in range(1, len(tokens) + 1)
+                        ]
+                    else:
+                        chunks = [([token], end) for end, token in enumerate(tokens, 1)]
+                    for ids, end in chunks:
+                        chunk = engine_chunk("", end, finish=end == len(tokens))
+                        chunk["output_ids"] = ids
+                        if partial and end == len(tokens):
+                            chunk["meta_info"]["finish_reason"] = {"type": "length"}
+                        context.append_output(chunk)
+
+                    expected = ["before", arguments, "between"]
+                    if not partial:
+                        expected.append(arguments)
+                    self.assertEqual(
+                        [message.content[0].text for message in context.messages],
+                        expected,
+                    )
+                    repaired_tokens = context.parser.tokens
+                    first_call = repaired_tokens.index(call_token)
+                    self.assertEqual(
+                        repaired_tokens[first_call - len(argument_tokens) : first_call],
+                        argument_tokens,
+                    )
+                    if partial:
+                        self.assertEqual(
+                            context.parser.current_content, partial_arguments
+                        )
+                        self.assertEqual(
+                            context.parser.current_recipient, "functions.echo"
+                        )
+                    else:
+                        self.assertEqual(
+                            repaired_tokens[-len(argument_tokens) - 1 : -1],
+                            argument_tokens,
+                        )
+
+                    if mode != "nonstream":
+                        # A terminal notification may contain no new engine tokens.
+                        messages = [message.to_dict() for message in context.messages]
+                        chunk = engine_chunk("", len(tokens), finish=True)
+                        chunk["output_ids"] = tokens if mode == "cumulative" else []
+                        if partial:
+                            chunk["meta_info"]["finish_reason"] = {"type": "length"}
+                        context.append_output(chunk)
+                        self.assertEqual(
+                            [message.to_dict() for message in context.messages],
+                            messages,
+                        )
+                        self.assertEqual(context.parser.tokens, repaired_tokens)
+                        if partial:
+                            self.assertEqual(
+                                context.parser.current_content, partial_arguments
+                            )
+
 
 class HarmonyResponsesTestCase(CustomTestCase):
     def test_developer_message_skips_unsupported_tool_types(self):

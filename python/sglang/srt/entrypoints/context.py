@@ -13,11 +13,13 @@ try:
 except ImportError as e:
     mcp = e
 
-from openai_harmony import Author, Message, Role, StreamState, TextContent
+from openai_harmony import Author, HarmonyError, Message, Role, StreamState, TextContent
 
-from sglang.srt.entrypoints.harmony_recovery import RecoveringHarmonyParser
 from sglang.srt.entrypoints.harmony_utils import (
     get_encoding,
+    get_streamable_parser_for_assistant,
+    recover_harmony_header,
+    recover_harmony_missing_message,
     render_for_completion,
 )
 from sglang.srt.entrypoints.tool import Tool
@@ -71,9 +73,8 @@ class HarmonyContext(ConversationContext):
         self._messages = messages
         self.tool_sessions = tool_sessions
 
-        self.parser = RecoveringHarmonyParser(
-            get_encoding(), function_names=function_names
-        )
+        self.parser = get_streamable_parser_for_assistant()
+        self.function_names = function_names
         self.num_init_messages = len(messages)
         # TODO
         self.num_prompt_tokens = 0
@@ -87,7 +88,7 @@ class HarmonyContext(ConversationContext):
             output_token_ids = output["output_ids"]
 
             for token_id in output_token_ids:
-                self.parser.process(token_id)
+                self._process_token(token_id)
             meta_info = output["meta_info"]
 
             if isinstance(meta_info, dict):
@@ -99,7 +100,7 @@ class HarmonyContext(ConversationContext):
                     self.num_output_tokens += meta_info["completion_tokens"]
                 self._record_finish_reason(meta_info)
                 if meta_info.get("finish_reason") is not None:
-                    self.parser.finish()
+                    self._finish_parser()
 
             output_msgs = self.parser.messages
 
@@ -107,6 +108,20 @@ class HarmonyContext(ConversationContext):
             output_msgs = output
 
         self._messages.extend(output_msgs)
+
+    def _process_token(self, token_id: int) -> None:
+        try:
+            self.parser.process(token_id)
+        except HarmonyError:
+            repaired = recover_harmony_header(self.parser)
+            if repaired is None:
+                raise
+            self.parser = repaired
+
+    def _finish_parser(self) -> None:
+        repaired = recover_harmony_missing_message(self.parser, self.function_names)
+        if repaired is not None:
+            self.parser = repaired
 
     def _record_finish_reason(self, meta_info: dict) -> None:
         # Last non-null wins: a builtin-tool continuation turn supersedes the
@@ -223,9 +238,9 @@ class StreamingHarmonyContext(HarmonyContext):
             self._record_finish_reason(meta_info)
 
             for token_id in new_token_ids:
-                self.parser.process(token_id)
+                self._process_token(token_id)
             if meta_info.get("finish_reason") is not None:
-                self.parser.finish()
+                self._finish_parser()
 
         else:
             # Handle the case of tool output in direct message format
