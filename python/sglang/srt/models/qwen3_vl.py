@@ -29,6 +29,7 @@ from transformers.activations import ACT2FN
 
 from sglang.srt.configs.qwen3_vl import Qwen3VLConfig, Qwen3VLVisionConfig
 from sglang.srt.environ import envs
+from sglang.srt.hf_transformers import get_processor
 from sglang.srt.layers.attention.vision import (
     BATCH_BUCKETS,
     FLASHINFER_MAX_SEQLEN_BUCKETS,
@@ -55,6 +56,7 @@ from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -85,14 +87,7 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
 )
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
 from sglang.srt.runtime_context import get_exec, get_mm, get_parallel
-from sglang.srt.utils import (
-    add_prefix,
-    cpu_has_amx_support,
-    is_cpu,
-    is_npu,
-    round_up,
-)
-from sglang.srt.utils.hf_transformers import get_processor
+from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_npu, round_up
 
 _is_npu = is_npu()
 graph_runners_dict = defaultdict(lambda: ViTCudaGraphRunner)

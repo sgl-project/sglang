@@ -22,7 +22,10 @@ from sglang.srt.hardware_backend.npu.attention.dcp_metadata import (
 from sglang.srt.hardware_backend.npu.attention.dsa_dcp import (
     forward_dcp_sparse_attention,
 )
-from sglang.srt.hardware_backend.npu.attention.mla_cache import gather_mla_cache_pages
+from sglang.srt.hardware_backend.npu.attention.mla_cache import (
+    build_mla_prefix_token_indices,
+    gather_mla_cache_tokens,
+)
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_enabled,
@@ -131,6 +134,8 @@ class ForwardMetadata:
 
     # prefix cache
     prefix_lens: Optional[torch.Tensor] = None
+    # None means the local prefix pages are full and need no token compaction.
+    prefix_token_indices: Optional[torch.Tensor] = None
     flatten_prefix_block_tables: Optional[torch.Tensor] = None
 
 
@@ -790,6 +795,7 @@ class AscendAttnBackend(AttentionBackend):
                 local_lens, block_tables = self._get_kv_lens_and_block_tables(
                     self.forward_metadata.prefix_lens, forward_batch.req_pool_indices
                 )
+                seq_prefix_lens = local_lens.tolist()
                 local_page_counts = (
                     (local_lens + self.page_size - 1) // self.page_size
                 ).tolist()
@@ -814,6 +820,14 @@ class AscendAttnBackend(AttentionBackend):
                             torch.flatten(req_prefix_block_tables),
                         )
                     )
+            # Indices address the pages stored by this rank. DCP reconstructs
+            # the global prefix only after these local page tails are removed.
+            if any(length % self.page_size for length in seq_prefix_lens):
+                self.forward_metadata.prefix_token_indices = (
+                    build_mla_prefix_token_indices(
+                        seq_prefix_lens, self.page_size, device=self.device
+                    )
+                )
 
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
             self.forward_metadata.swa_out_cache_loc = (
@@ -1760,49 +1774,30 @@ class AscendAttnBackend(AttentionBackend):
         """Load a full MLA prefix, gathering rank-local DCP shards if needed."""
         k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
         v_buffer = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
-        kv_cached = gather_mla_cache_pages(
+        kv_cached = gather_mla_cache_tokens(
             k_buffer,
             self.forward_metadata.flatten_prefix_block_tables,
+            self.forward_metadata.prefix_token_indices,
             is_nz=is_fia_nz(),
         )
         modelslim_kv_scheme = getattr(layer, "scheme", None)
         if modelslim_kv_scheme is not None:
             kv_cached = modelslim_kv_scheme.dequantize_cache(kv_cached)[0]
-        k_rope_cached = gather_mla_cache_pages(
+        k_rope_cached = gather_mla_cache_tokens(
             v_buffer,
             self.forward_metadata.flatten_prefix_block_tables,
+            self.forward_metadata.prefix_token_indices,
             is_nz=is_fia_nz(),
         )
         if self.dcp_size > 1:
-            prefix_lens = self.forward_metadata.prefix_lens
-            local_lens = get_dcp_lens(
-                prefix_lens,
-                self.dcp_size,
-                self.dcp_rank,
-                interleave_size=self.page_size,
-            ).tolist()
-            local_page_counts = [
-                (length + self.page_size - 1) // self.page_size for length in local_lens
-            ]
-
-            def trim_pages(cache):
-                return torch.cat(
-                    [
-                        pages.flatten(0, 1)[:length]
-                        for pages, length in zip(
-                            cache.split(local_page_counts), local_lens
-                        )
-                    ]
-                )
-
             gathered = all_gather_kv_cache_for_dcp(
-                trim_pages(kv_cached),
-                trim_pages(k_rope_cached),
-                prefix_lens,
+                kv_cached,
+                k_rope_cached,
+                self.forward_metadata.prefix_lens,
                 interleave_size=self.page_size,
             )
             return gathered.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        return kv_cached, k_rope_cached.flatten(0, 1)
+        return kv_cached, k_rope_cached
 
     def forward_extend(
         self,
