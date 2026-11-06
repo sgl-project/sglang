@@ -20,7 +20,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
     pre_capture_activation_reserve_mb,
 )
-from sglang.srt.utils.common import get_available_gpu_memory, get_device_memory_capacity
+from sglang.srt.utils.device import get_available_gpu_memory, get_device_memory_capacity
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
