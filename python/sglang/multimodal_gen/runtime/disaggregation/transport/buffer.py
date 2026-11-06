@@ -4,9 +4,9 @@
 from __future__ import annotations
 
 import logging
-import math
 from dataclasses import dataclass, field
 
+import math
 import torch
 
 from sglang.multimodal_gen.runtime.disaggregation.transport.allocator import (
