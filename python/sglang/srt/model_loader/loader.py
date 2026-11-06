@@ -55,6 +55,7 @@ from sglang.srt.runtime_context import (
     get_model,
     get_parallel,
     get_server_args,
+    get_spec,
 )
 from sglang.srt.utils import get_available_gpu_memory
 
@@ -219,6 +220,14 @@ def _get_quantization_config(
         # (yizhang2077) workaround for nvidia/Llama-4-Maverick-17B-128E-Eagle3
         if quant_config is None:
             return None
+        if _is_npu and model_config.quantization == "modelslim":
+            draft_kv_cache_dtype = get_spec().speculative_draft_kv_cache_dtype
+            requested_dtype = (
+                draft_kv_cache_dtype
+                if model_config.is_draft_model and draft_kv_cache_dtype is not None
+                else get_model().kv_cache_dtype
+            )
+            quant_config.configure_kv_cache_quantization(requested_dtype)
         from sglang.srt.layers.quantization.fp8 import Fp8Config
 
         if isinstance(quant_config, Fp8Config):
@@ -934,7 +943,7 @@ class DefaultModelLoader(BaseModelLoader):
                 local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
             )
         except (KeyError, ValueError):
-            from sglang.srt.utils.hf_transformers import get_config
+            from sglang.srt.hf_transformers import get_config
 
             hf_config = get_config(
                 model_config.model_path,

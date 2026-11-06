@@ -232,6 +232,102 @@ class TestHostPoolSizingUnderDcp(CustomTestCase):
             cc.attach_storage_backend("file")
         return cc
 
+    def test_unified_mla_dcp_keeps_native_l3_host_layout(self):
+        """Plain unified MLA must retain DCP-aware host IO for File and Mooncake."""
+        from sglang.srt.mem_cache.hicache_storage import PoolName
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+            HybridCacheController,
+        )
+        from sglang.srt.mem_cache.kv.layout.base import HostPoolOptions
+        from sglang.srt.mem_cache.pool_host.group import HostPoolGroup, PoolEntry
+        from sglang.srt.runtime_context import get_memory, get_parallel
+        from sglang.test.unified_allocator_fixtures import (
+            build_mamba_pool,
+            setup_allocator_context,
+        )
+
+        setup_allocator_context()
+        for factor in (2, 4):
+            for rank in range(factor):
+                for layout in ("page_first", "page_first_direct"):
+                    with (
+                        self.subTest(dcp=factor, rank=rank, layout=layout),
+                        get_parallel().override(
+                            attn_dcp_size=factor, attn_dcp_rank=rank, dcp_enabled=True
+                        ),
+                        get_memory().override(hicache_storage_key_scheme="rank-suffix"),
+                    ):
+                        bundle, allocator = build_mamba_pool(page_size=64, mla=True)
+                        storage = bundle.storage
+                        entries = []
+                        for name, pool_name in (
+                            ("full", PoolName.KV),
+                            ("mamba", PoolName.MAMBA),
+                        ):
+                            host = storage.host_layout(name).build(
+                                HostPoolOptions(
+                                    ratio=1,
+                                    size=0,
+                                    page_size=allocator.page_size,
+                                    layout=layout,
+                                    allocator_type="default",
+                                    pool_label=name,
+                                    dcp_size=factor,
+                                    dcp_rank=rank,
+                                    pin_memory=False,
+                                )
+                            )
+                            self.addCleanup(host.destroy)
+                            entries.append(
+                                PoolEntry(
+                                    name=pool_name,
+                                    host_pool=host,
+                                    device_pool=storage.view(name),
+                                    layer_mapper=lambda layer: layer,
+                                    is_primary_index_anchor=name == "full",
+                                )
+                            )
+                        group = HostPoolGroup(entries)
+                        host = entries[0].host_pool
+                        for backend in ("file", "mooncake"):
+                            with self.subTest(backend=backend):
+                                cc = HybridCacheController.__new__(
+                                    HybridCacheController
+                                )
+                                cc.mem_pool_host = group
+                                cc.storage_host_pool = host
+                                cc.page_size = allocator.page_size
+                                cc.enable_storage = False
+                                cc.host_memory_mode = "cache"
+                                cc.pp_group = cc.pp_prefetch_command_group = None
+                                cc.storage_stop_event = threading.Event()
+                                cc._stop_storage_threads = mock.Mock()
+                                cc._start_storage_threads = mock.Mock()
+                                cc._create_sync_groups = mock.Mock(return_value=[])
+                                cc._generate_storage_config = mock.Mock()
+                                with mock.patch(
+                                    "sglang.srt.mem_cache.storage.StorageBackendFactory.create_backend"
+                                ) as factory:
+                                    cc.attach_storage_backend(
+                                        backend, host_pools=entries
+                                    )
+                                self.assertTrue(cc.enable_storage)
+                                self.assertIs(factory.call_args.args[2], host)
+                        self.assertIsInstance(host, MLATokenToKVPoolHost)
+                        self.assertEqual(host.dcp_size, factor)
+                        self.assertEqual(host.dcp_rank, rank)
+                        ids = allocator.alloc(allocator.page_size)
+                        physical = maybe_dcp_kernel_indices(
+                            storage.host_ids("full")(ids), factor, rank
+                        )
+                        torch.testing.assert_close(
+                            physical.long(),
+                            allocator.full_attn_allocator.ids.translate_write(ids)[
+                                rank::factor
+                            ].long(),
+                        )
+                        allocator.free(ids)
+
     def test_prefetch_throttles_at_half_the_logical_capacity(self):
         for dcp_size in (1, 2, 8):
             with self.subTest(dcp_size=dcp_size):

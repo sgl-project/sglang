@@ -19,10 +19,6 @@ from sglang.srt.managers.scheduler_components.deferred_responses import (
 from sglang.srt.managers.scheduler_components.output_streamer import (
     SchedulerOutputStreamer,
 )
-from sglang.srt.managers.scheduler_components.request_list import (
-    ListKind,
-    _RequestList,
-)
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
@@ -33,6 +29,7 @@ from sglang.srt.utils.weight_versions import (
     compute_weight_version_spans,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import empty_request_lists
 from sglang.test.test_utils import published_topology
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
@@ -54,17 +51,8 @@ def _req(rid, return_logprob=False):
 def _scheduler():
     scheduler = object.__new__(Scheduler)
     scheduler.disaggregation_mode = DisaggregationMode.NULL
-    scheduler.waiting_queue = []
-    scheduler.chunked_req = None
-    scheduler.hisparse_coordinator = None
+    empty_request_lists(scheduler)
     scheduler.collect_inflight_reqs = lambda: set()
-    scheduler.prefill_launched_reqs = _RequestList(ListKind.PREFILL_LAUNCHED)
-    scheduler.running_reqs = []
-    scheduler.dllm_config = None
-    scheduler.disagg_prefill_bootstrap_queue = None
-    scheduler.disagg_prefill_transfer_queue = _RequestList(ListKind.PD_SENDING)
-    scheduler.disagg_decode_prealloc_queue = None
-    scheduler.disagg_decode_transfer_queue = None
     scheduler.ipc_channels = Mock()
     scheduler.rust_server = None
     streamer = object.__new__(SchedulerOutputStreamer)

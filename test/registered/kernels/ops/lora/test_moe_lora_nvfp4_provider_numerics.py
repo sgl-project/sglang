@@ -21,6 +21,7 @@ from sglang.srt.lora.moe.runner import MoeLoraBatch, MoeLoraRunner
 from sglang.srt.lora.utils import Phase, architecture_for_capability
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kernels.moe_lora import rel_l2, standalone_output_allocation
 
 register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 # The H100 pool skips the sm100 shared-outer NVFP4 decode plan row (skipped elsewhere); the B200 pool runs it per PR.
@@ -102,14 +103,6 @@ def _marlin_quant_info(layer):
     return MoeLoraNvFp4MarlinQuantInfo.from_layer(layer)
 
 
-def _rel_l2(a, b):
-    return (a - b).norm() / b.norm().clamp(min=1e-12)
-
-
-def _standalone_output_allocation(runner, *, num_tokens, dtype, device):
-    return torch.empty((num_tokens, runner.hidden_size), dtype=dtype, device=device)
-
-
 @pytest.mark.parametrize("slices,intermediate", [(2, _I), (1, _I), (1, 64)])
 def test_nvfp4_marlin_gateup_and_down_match_reference(slices, intermediate):
     _skip_unless_supported()
@@ -152,7 +145,7 @@ def test_nvfp4_marlin_gateup_and_down_match_reference(slices, intermediate):
             "ph,pnh->pn", hidden[tokens].float(), w13_eff[experts]
         )
         got_gateup = gateup[pair_idx].float()
-        assert _rel_l2(got_gateup, ref_gateup) < 2e-2
+        assert rel_l2(got_gateup, ref_gateup) < 2e-2
 
         act_pairs = (torch.randn_like(ref_gateup[:, :intermediate]) * 0.1).to(
             torch.bfloat16
@@ -168,7 +161,7 @@ def test_nvfp4_marlin_gateup_and_down_match_reference(slices, intermediate):
 
         ref_down = torch.einsum("pi,phi->ph", act_pairs.float(), w2_eff[experts])
         got_down = down[pair_idx].float()
-        assert _rel_l2(got_down, ref_down) < 2e-2
+        assert rel_l2(got_down, ref_down) < 2e-2
 
         if intermediate == _I:
             return
@@ -235,7 +228,7 @@ def test_nvfp4_marlin_gateup_and_down_match_reference(slices, intermediate):
             for _ in range(2):
                 run()
         torch.cuda.synchronize()
-        assert _rel_l2(output.float(), reference()) < 3e-2
+        assert rel_l2(output.float(), reference()) < 3e-2
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=stream):
             run()
@@ -243,7 +236,7 @@ def test_nvfp4_marlin_gateup_and_down_match_reference(slices, intermediate):
             hidden.mul_(-0.5)
             graph.replay()
             torch.cuda.synchronize()
-            assert _rel_l2(output.float(), reference()) < 3e-2
+            assert rel_l2(output.float(), reference()) < 3e-2
 
 
 @pytest.mark.parametrize("slices", (2, 1), ids=("gated-silu", "relu2"))
@@ -260,9 +253,7 @@ def test_nvfp4_shared_outer_decode_plan_matches_reference(
     major = torch.cuda.get_device_capability(device)[0]
     if major != 10:
         pytest.skip("decode.shared.nvfp4 is an sm100 plan row")
-    monkeypatch.setattr(
-        MoeLoraRunner, "_allocate_output", _standalone_output_allocation
-    )
+    monkeypatch.setattr(MoeLoraRunner, "_allocate_output", standalone_output_allocation)
     g = torch.Generator(device="cpu").manual_seed(23)
 
     def rand(*shape, scale=0.05):
@@ -373,9 +364,9 @@ def test_nvfp4_shared_outer_decode_plan_matches_reference(
 
     output = forward()
     torch.cuda.synchronize()
-    assert _rel_l2(output.float(), reference(mapping)) < 3e-2
+    assert rel_l2(output.float(), reference(mapping)) < 3e-2
     # LoRA math must be present, not bypassed within tolerance.
-    assert _rel_l2(reference(torch.full_like(mapping, -1)), reference(mapping)) > 0.1
+    assert rel_l2(reference(torch.full_like(mapping, -1)), reference(mapping)) > 0.1
 
     batch.use_cuda_graph = True
     # Workspace scratch is stream-local: warm up on the capture stream.
@@ -391,7 +382,7 @@ def test_nvfp4_shared_outer_decode_plan_matches_reference(
         captured = forward()
     graph.replay()
     torch.cuda.synchronize()
-    assert _rel_l2(captured.float(), reference(mapping)) < 3e-2
+    assert rel_l2(captured.float(), reference(mapping)) < 3e-2
 
     # Replay over new adapter slots, routing, and inputs in the captured buffers.
     mapping.copy_(mapping.roll(1))
@@ -399,7 +390,7 @@ def test_nvfp4_shared_outer_decode_plan_matches_reference(
     hidden.mul_(-0.5)
     graph.replay()
     torch.cuda.synchronize()
-    assert _rel_l2(captured.float(), reference(mapping)) < 3e-2
+    assert rel_l2(captured.float(), reference(mapping)) < 3e-2
 
 
 def test_single_token_align_matches_general_path_with_invalid_ids():
