@@ -561,6 +561,7 @@ def run_eagle_verify(
     post_verify_graphs: Optional[EaglePostVerifyGraphs] = None,
     simulated_acc_len_rng: Optional[torch.Generator] = None,
     sparse_bonus_argmax: bool = False,
+    execution=None,
 ) -> GenerationBatchResult:
     """Shared verify step: target-verify forward, sampling, acceptance bookkeeping.
 
@@ -576,6 +577,8 @@ def run_eagle_verify(
     """
     fwd_stream = torch.get_device_module(device).current_stream()
     verify_input: EagleVerifyInput = batch.spec_info
+    if execution is not None:
+        execution.verify_num_tokens_per_req = verify_input.num_tokens_per_req
     record_stream_for_v2_verify(batch, verify_input, fwd_stream)
 
     bs = len(batch.seq_lens)
@@ -659,6 +662,8 @@ def run_eagle_verify(
         pp_proxy_tensors=pp_proxy_tensors,
     )
     logits_output = forward_batch_output.logits_output
+    if execution is not None:
+        execution.record("target_verify", graph=forward_batch_output.can_run_cuda_graph)
 
     kvcache = token_to_kv_pool_allocator.get_kvcache()
     clears_c128 = isinstance(kvcache, DeepSeekV4TokenToKVPool)

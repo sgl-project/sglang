@@ -44,6 +44,7 @@ if TYPE_CHECKING:
         FpmTiming,
         ScheduledRequestMetrics,
     )
+    from sglang.srt.speculative.execution_info import SpecRoundExecution
     from sglang.srt.speculative.spec_info import SpecInput
 
 
@@ -83,6 +84,10 @@ class GenerationBatchResult:
     accept_length_per_req_cpu: Optional[List[int]] = None
     dllm_algo_state: Optional[List[Any]] = None
     can_run_cuda_graph: bool = False
+    # Immutable observations from this completed round, independent of the
+    # controller's current tier. None means unsupported/not instrumented.
+    spec_execution: Optional[SpecRoundExecution] = None
+    spec_execution_accounted: bool = False
 
     # PP skip output comm: True when output send/recv was skipped and
     # next_token_ids are placeholder zeros. Used by process_batch_result_prefill

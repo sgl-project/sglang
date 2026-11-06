@@ -1083,6 +1083,8 @@ class SchedulerBatchResultProcessor:
             self.metrics_collector.increment_decode_cuda_graph_pass(
                 value=can_run_cuda_graph
             )
+        if result.spec_execution is not None:
+            self.metrics_reporter.observe_spec_execution(result)
 
         self.token_to_kv_pool_allocator.free_group_begin()
 

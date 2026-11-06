@@ -99,6 +99,10 @@ from sglang.srt.speculative.eagle_worker_common import (
     prepare_for_draft_extend,
     run_eagle_verify,
 )
+from sglang.srt.speculative.execution_info import (
+    SpecExecutionRecorder,
+    observe_model_forward,
+)
 from sglang.srt.speculative.pp_draft_embedding import resolve_draft_embed_and_head
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
@@ -664,7 +668,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 f"avail mem={after_mem:.2f} GB.",
             )
 
-    def draft(self, batch: ScheduleBatch, *, with_topology: bool = False):
+    def draft(
+        self, batch: ScheduleBatch, *, with_topology: bool = False, execution=None
+    ):
         draft_input: EagleDraftInput = batch.spec_info
         forward_batch, can_run_decode_cuda_graph, iteration_ids = prepare_for_draft(
             draft_input,
@@ -709,6 +715,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 parent_list, top_scores_index, draft_tokens, draft_probs = (
                     self.cuda_graph_runner.execute(forward_batch)
                 )
+                if execution is not None:
+                    execution.record(
+                        "draft",
+                        graph=True,
+                        num_forwards=self.cuda_graph_runner.speculative_num_steps - 1,
+                    )
                 if draft_probs is not None:
                     # draft_probs is the one graph output read after the target
                     # forward rather than by it, and it points into the graph's
@@ -726,7 +738,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     self.draft_attn_backend.init_forward_metadata(forward_batch)
                     forward_batch.mark_forward_metadata_ready()
                 parent_list, top_scores_index, draft_tokens, draft_probs = (
-                    self.draft_forward(forward_batch)
+                    self.draft_forward(forward_batch, execution=execution)
+                    if execution is not None
+                    else self.draft_forward(forward_batch)
                 )
 
         verify_input = build_eagle_verify_input(
@@ -754,7 +768,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             return verify_input, parent_list, top_scores_index
         return verify_input
 
-    def draft_forward(self, forward_batch: ForwardBatch):
+    def draft_forward(self, forward_batch: ForwardBatch, *, execution=None):
         # Parse args
         spec_info: EagleDraftInput = forward_batch.spec_info
         if forward_batch.forward_mode.is_idle():
@@ -859,8 +873,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     ),
                     canary_index_ctx,
                 ):
-                    logits_output = self.draft_runner.forward(
-                        forward_batch
+                    logits_output = observe_model_forward(
+                        execution, "draft", self.draft_runner.forward, forward_batch
                     ).logits_output
                 maybe_detect_nan(
                     logits_output.next_token_logits, f"draft_forward step {i}"
@@ -1129,6 +1143,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         batch_result: GenerationBatchResult,
         *,
         iteration_ids: Optional[IterationIds] = None,
+        execution=None,
     ):
         self.draft_runtime.note_draft_extend()
         # Cast to int64 before entering plan stream to avoid cross-stream
@@ -1224,9 +1239,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 draft_logits_output = self.cuda_graph_runner_for_draft_extend.execute(
                     forward_batch, select_index
                 )
+                if execution is not None:
+                    execution.record("draft_extend", graph=True)
             else:
-                draft_logits_output = self.draft_runner.forward(
-                    forward_batch
+                draft_logits_output = observe_model_forward(
+                    execution, "draft_extend", self.draft_runner.forward, forward_batch
                 ).logits_output
 
         maybe_detect_nan(
@@ -1501,6 +1518,21 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     )
         else:
             self.activate_step_by_batch(batch.seq_lens.shape[0])
+            # Only this local, single-stage adaptive CUDA path has all three
+            # phase observations. PP tail-drafts belong to a different round.
+            execution = (
+                SpecExecutionRecorder(
+                    self.speculative_num_steps,
+                    self.topk,
+                    self.speculative_num_draft_tokens,
+                )
+                if self.adaptive_controller is not None
+                and self.device == "cuda"
+                and get_parallel().pp_size == 1
+                and not batch.forward_mode.is_idle()
+                else None
+            )
+            execution_kwargs = {"execution": execution} if execution is not None else {}
 
             if batch.spec_info is None:
                 capture_mode = (
@@ -1535,13 +1567,16 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     speculative_moe_a2a_backend_context(),
                     spec_stage_span("draft"),
                 ):
-                    verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
+                    verify_input: EagleVerifyInput = self.draft_worker.draft(
+                        batch, **execution_kwargs
+                    )
             assert verify_input.is_verify_input()
             batch.spec_info = verify_input
             batch_output = self.verify(
                 batch,
                 pp_proxy_tensors=pp_proxy_tensors,
                 grammar_barrier=grammar_barrier,
+                **execution_kwargs,
             )
             # Publish before draft_extend so the fence is at verify-end.
             if on_publish is not None:
@@ -1559,7 +1594,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     spec_stage_span("draft_extend"),
                 ):
                     self.draft_worker._draft_extend_for_decode(
-                        batch, batch_output, iteration_ids=verify_input.iteration_ids
+                        batch,
+                        batch_output,
+                        iteration_ids=verify_input.iteration_ids,
+                        **execution_kwargs,
                     )
             if self._post_verify_graphs is not None:
                 # The mamba state commit may still run on a side stream.
@@ -1604,6 +1642,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 batch_output.next_verify_parent_list = parent_list.clone()
                 batch_output.next_verify_top_scores_index = top_scores_index.clone()
 
+            if execution is not None:
+                batch_output.spec_execution = execution.finish()
             return batch_output
 
     def _forward_prefill_batch(
@@ -2037,7 +2077,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
             dw._rebuild_topk1_chain_buffers()
 
-    def verify(self, batch: ScheduleBatch, pp_proxy_tensors=None, grammar_barrier=None):
+    def verify(
+        self,
+        batch: ScheduleBatch,
+        pp_proxy_tensors=None,
+        grammar_barrier=None,
+        *,
+        execution=None,
+    ):
         # SGLANG_OPT_SPEC_COMPACT_VERIFY_SAMPLING: the compact top-k branch, when
         # every request allows it, in the post-verify graphs and the eager verify
         max_top_k = compact_verify_max_top_k(batch)
@@ -2059,4 +2106,5 @@ class EAGLEWorkerV2(BaseSpecWorker):
             post_verify_graphs=self._post_verify_graphs,
             simulated_acc_len_rng=self._simulated_acc_len_rng,
             sparse_bonus_argmax=max_top_k is not None,
+            execution=execution,
         )
