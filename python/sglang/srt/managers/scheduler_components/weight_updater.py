@@ -41,6 +41,7 @@ from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
+    ModelExpressWeightUpdateReqOutput,
     PluginWeightUpdateReqInput,
     PluginWeightUpdateReqOutput,
     ReleaseMemoryOccupationReqInput,
@@ -53,6 +54,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromIPCReqOutput,
+    UpdateWeightsFromModelExpressReqInput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
@@ -136,7 +138,7 @@ class SchedulerWeightUpdaterManager:
         # Edge-trigger weight_load_duration_seconds at the end of each
         # update_weights_from_* call. Engine is paused during the update so
         # the periodic log_stats path can't carry this.
-        # `source` distinguishes disk vs distributed vs tensor vs ipc.
+        # `source` distinguishes disk vs distributed vs tensor vs ipc vs modelexpress.
         t0 = time.perf_counter()
         try:
             yield
@@ -190,6 +192,29 @@ class SchedulerWeightUpdaterManager:
             return UpdateWeightFromDiskReqOutput(
                 success=success, message=message, num_paused_requests=0
             )
+
+    def update_weights_from_modelexpress(
+        self, recv_req: UpdateWeightsFromModelExpressReqInput
+    ):
+        if get_parallel().pp_size > 1:
+            return ModelExpressWeightUpdateReqOutput(
+                success=False,
+                message="ModelExpress does not support pipeline parallelism",
+            )
+        if self.draft_worker is not None:
+            return ModelExpressWeightUpdateReqOutput(
+                success=False, message="ModelExpress does not support draft models"
+            )
+        with self._observe_weight_load("modelexpress"):
+            success, message = self.tp_worker.update_weights_from_modelexpress(recv_req)
+            if success:
+                self.record_weight_version_after_update(recv_req.weight_version)
+                success, message = self.flush_cache_after_weight_update(
+                    recv_req, success, message
+                )
+            if not success:
+                logger.error(message)
+            return ModelExpressWeightUpdateReqOutput(success=success, message=message)
 
     def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
         """Initialize the online model parameter update group."""
