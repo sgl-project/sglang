@@ -274,46 +274,46 @@ class TestNPUDeepSeekV4Flash0731W8A8PDSEPGPQAHigh(
 ):
     """Test NPU accuracy for DeepSeek-V4-Flash W8A8 16p 1P1D GPQA."""
 
-    @classmethod
-    def setUpClass(cls):
-        # Follow the HiCache L3 wiki: inspect and clean host memory on the
-        # prefill node before starting MetaService and the model server.
-        if "prefill" in os.environ.get("HOSTNAME", ""):
-            commands = [
-                ("Host memory before cache cleanup", ["free", "-g"], False),
-                (
-                    "drop_caches execution result",
-                    "sync && echo 1 > /proc/sys/vm/drop_caches",
-                    True,
-                ),
-                ("Host memory after cache cleanup", ["free", "-g"], False),
-            ]
-            for description, command, use_shell in commands:
-                result = subprocess.run(
-                    command,
-                    shell=use_shell,
-                    executable="/bin/bash" if use_shell else None,
-                    capture_output=True,
-                    text=True,
-                )
-                logger.info(
-                    "%s: command=%r, returncode=%d\nstdout:\n%s\nstderr:\n%s",
-                    description,
-                    command,
-                    result.returncode,
-                    result.stdout,
-                    result.stderr,
-                )
-                if result.returncode != 0:
-                    # Best-effort host maintenance, not a test assertion: raising
-                    # here makes the prefill pod exit early and the multi-node
-                    # harness then reports a misleading "pod is not running".
-                    logger.warning(
-                        "%s failed with returncode %d; continuing without it",
-                        description,
-                        result.returncode,
-                    )
-        super().setUpClass()
+    # @classmethod
+    # def setUpClass(cls):
+    #     # Follow the HiCache L3 wiki: inspect and clean host memory on the
+    #     # prefill node before starting MetaService and the model server.
+    #     if "prefill" in os.environ.get("HOSTNAME", ""):
+    #         commands = [
+    #             ("Host memory before cache cleanup", ["free", "-g"], False),
+    #             (
+    #                 "drop_caches execution result",
+    #                 "sync && echo 1 > /proc/sys/vm/drop_caches",
+    #                 True,
+    #             ),
+    #             ("Host memory after cache cleanup", ["free", "-g"], False),
+    #         ]
+    #         for description, command, use_shell in commands:
+    #             result = subprocess.run(
+    #                 command,
+    #                 shell=use_shell,
+    #                 executable="/bin/bash" if use_shell else None,
+    #                 capture_output=True,
+    #                 text=True,
+    #             )
+    #             logger.info(
+    #                 "%s: command=%r, returncode=%d\nstdout:\n%s\nstderr:\n%s",
+    #                 description,
+    #                 command,
+    #                 result.returncode,
+    #                 result.stdout,
+    #                 result.stderr,
+    #             )
+    #             if result.returncode != 0:
+    #                 # Best-effort host maintenance, not a test assertion: raising
+    #                 # here makes the prefill pod exit early and the multi-node
+    #                 # harness then reports a misleading "pod is not running".
+    #                 logger.warning(
+    #                     "%s failed with returncode %d; continuing without it",
+    #                     description,
+    #                     result.returncode,
+    #                 )
+    #     super().setUpClass()
 
     model_config = DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_MODEL_CONFIG
     # Start the npu_memcache MetaService on the prefill node before the model
