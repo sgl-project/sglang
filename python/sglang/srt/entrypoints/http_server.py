@@ -120,6 +120,12 @@ from sglang.srt.entrypoints.openai.serving_transcription import (
     OpenAIServingTranscription,
 )
 from sglang.srt.entrypoints.request_headers import apply_header_overrides
+from sglang.srt.entrypoints.server_utils import (
+    add_prometheus_middleware,
+    build_model_info_fields,
+    build_server_info,
+    set_uvicorn_logging_configs,
+)
 from sglang.srt.entrypoints.sidecar import rust_server_sidecar
 from sglang.srt.entrypoints.systemone.protocol import SystemOneRequest
 from sglang.srt.entrypoints.systemone.serving import SystemOneServing
@@ -192,15 +198,11 @@ from sglang.srt.parser.template_manager import TemplateManager
 from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
-    add_prometheus_middleware,
-    build_model_info_fields,
-    build_server_info,
     delete_directory,
     freeze_gc,
     get_bool_env_var,
     is_mps,
     kill_process_tree,
-    set_uvicorn_logging_configs,
 )
 from sglang.srt.utils.auth import AuthLevel, app_has_admin_force_endpoints, auth_level
 from sglang.srt.utils.json_response import (

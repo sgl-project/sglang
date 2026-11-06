@@ -19,6 +19,12 @@ from sglang.srt.models.llava import (
 )
 from sglang.srt.models.llavavid import LlavaVidForCausalLM
 from sglang.srt.models.mistral import Mistral3ForConditionalGeneration
+from sglang.srt.multimodal.media_io import (
+    CLIENT_MEDIA_EXCEPTIONS,
+    ImageData,
+    get_image_bytes,
+    load_image,
+)
 from sglang.srt.multimodal.mm_utils import (
     ensure_numpy,
     expand2square,
@@ -26,13 +32,7 @@ from sglang.srt.multimodal.mm_utils import (
 )
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
-from sglang.srt.utils import (
-    CLIENT_MEDIA_EXCEPTIONS,
-    ImageData,
-    get_image_bytes,
-    load_image,
-    logger,
-)
+from sglang.srt.utils import logger
 from sglang.utils import get_exception_traceback
 
 

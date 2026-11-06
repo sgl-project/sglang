@@ -64,12 +64,12 @@ from sglang.srt.managers.req_types import (
     SamplingLogprobsMode,
     get_return_hidden_states_mode,
 )
+from sglang.srt.multimodal.media_io import ImageData, VideoData
 from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.observability.req_time_stats import SchedulerOutputTimeStats
 from sglang.srt.sampling.sampling_mask import SamplingMaskChunk
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.utils import ImageData, VideoData
 from sglang.srt.utils.field_validators import validate_optional_list_i64_1d_2d
 from sglang.srt.utils.msgpack_utils import (
     dec_hook,
@@ -2289,7 +2289,7 @@ class CheckWeightsReqInput(BaseReq, kw_only=True):
 
 
 # Wire versions of the pydantic ParallelismInfo/ChecksumInfo in
-# sglang.srt.utils.weight_checker. Not array_like: the payload is read by field
+# sglang.srt.model_executor.weight_checker. Not array_like: the payload is read by field
 # name and re-serialized to JSON, so it must stay a {field: value} map.
 class ParallelismInfo(msgspec.Struct, kw_only=True):
     # "target", or a draft role such as "draft" / "draft_step_0"

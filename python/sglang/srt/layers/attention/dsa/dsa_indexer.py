@@ -60,6 +60,7 @@ from sglang.srt.layers.attention.mqa_logits_utils import (
     mqa_logits_static_budget_bytes,
 )
 from sglang.srt.layers.layernorm import LayerNorm, RMSNorm
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
 )
@@ -75,7 +76,6 @@ from sglang.srt.state_capturer.indexer_topk import (
     maybe_capture_indexer_topk,
 )
 from sglang.srt.utils import (
-    add_prefix,
     ceil_align,
     get_bool_env_var,
     is_cuda,
