@@ -449,9 +449,10 @@ class StreamExecutor:
                 self._execute(expr)
             except Exception as e:
                 warnings.warn(f"Error in stream_executor: {get_exception_traceback()}")
+                error = e
                 with self._worker_lock:
                     self._worker_stopped = True
-                    self.error_ = e
+                    self.error_ = error
                     self.queue.task_done()
                     while True:
                         try:
