@@ -1407,6 +1407,8 @@ class TestDflashDraftKvBudget(CustomTestCase):
             head_dim=64,
             v_head_dim=32,
             get_num_kv_heads=lambda tp: 8 // tp,
+            hf_config=None,
+            attention_arch=AttentionArch.MHA,
         )
         aux = SpecAuxHiddenStateConfig(
             draft_model_config=draft, dflash_draft_num_layers=2
