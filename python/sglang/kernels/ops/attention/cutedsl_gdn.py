@@ -85,7 +85,7 @@ def _define_kernels():
             v_base = warp_idx * V_PER_WARP_SMALL
             v_idx = v_base + v_local
 
-            smem = cutlass.utils.SmemAllocator()
+            smem = cutlass.memory.SmemAllocator()
             sData = smem.allocate_tensor(cutlass.Float32, smem_layout_staged, 128)
             smem_o_layout = cute.make_layout((TILE_V_SMALL,), stride=(1,))
             smem_o = smem.allocate_tensor(cutlass.Float32, smem_o_layout, 128)
@@ -218,7 +218,7 @@ def _define_kernels():
                 r_v = cutlass.Float32(v[i_n, 0, i_hv, v_global])
 
                 sum_hk = 0.0
-                for k_iter in cutlass.range_dynamic(NUM_K_ITERS_SMALL, unroll=16):
+                for k_iter in cutlass.range(NUM_K_ITERS_SMALL, unroll=16):
                     k_base = k_iter * ROWS_PER_ITER_SMALL
                     k_idx = k_base + k_local
                     h_val = sData[(k_idx, v_idx, stage)] * r_g
@@ -237,7 +237,7 @@ def _define_kernels():
                 v_new = cute.arch.shuffle_sync(v_new, v_local)
 
                 sum_hq = 0.0
-                for k_iter in cutlass.range_dynamic(NUM_K_ITERS_SMALL, unroll=16):
+                for k_iter in cutlass.range(NUM_K_ITERS_SMALL, unroll=16):
                     k_base = k_iter * ROWS_PER_ITER_SMALL
                     k_idx = k_base + k_local
                     h_old = sData[(k_idx, v_idx, stage)] * r_g
@@ -317,7 +317,7 @@ def _define_kernels():
             v_base = warp_idx * V_PER_WARP_SMALL
             v_idx = v_base + v_local
 
-            smem = cutlass.utils.SmemAllocator()
+            smem = cutlass.memory.SmemAllocator()
             sData = smem.allocate_tensor(cutlass.Float32, smem_layout_staged, 128)
             smem_o_layout = cute.make_layout((TILE_V_SMALL,), stride=(1,))
             smem_o = smem.allocate_tensor(cutlass.Float32, smem_o_layout, 128)
@@ -450,7 +450,7 @@ def _define_kernels():
                 r_v = cutlass.Float32(v[0, i_n, i_hv, v_global])
 
                 sum_hk = 0.0
-                for k_iter in cutlass.range_dynamic(NUM_K_ITERS_SMALL, unroll=16):
+                for k_iter in cutlass.range(NUM_K_ITERS_SMALL, unroll=16):
                     k_base = k_iter * ROWS_PER_ITER_SMALL
                     k_idx = k_base + k_local
                     h_val = sData[(k_idx, v_idx, stage)] * r_g
@@ -469,7 +469,7 @@ def _define_kernels():
                 v_new = cute.arch.shuffle_sync(v_new, v_local)
 
                 sum_hq = 0.0
-                for k_iter in cutlass.range_dynamic(NUM_K_ITERS_SMALL, unroll=16):
+                for k_iter in cutlass.range(NUM_K_ITERS_SMALL, unroll=16):
                     k_base = k_iter * ROWS_PER_ITER_SMALL
                     k_idx = k_base + k_local
                     h_old = sData[(k_idx, v_idx, stage)] * r_g
@@ -543,7 +543,7 @@ def _define_kernels():
             v_base = warp_idx * V_PER_WARP
             v_idx = v_base + v_local
 
-            smem = cutlass.utils.SmemAllocator()
+            smem = cutlass.memory.SmemAllocator()
             sData = smem.allocate_tensor(cutlass.Float32, smem_layout_staged, 128)
             smem_o_layout = cute.make_layout((TILE_V,), stride=(1,))
             smem_o = smem.allocate_tensor(cutlass.Float32, smem_o_layout, 128)
@@ -673,7 +673,7 @@ def _define_kernels():
                 r_v = cutlass.Float32(v[i_n, 0, i_hv, v_global])
 
                 sum_hk = 0.0
-                for k_iter in cutlass.range_dynamic(NUM_K_ITERS, unroll=8):
+                for k_iter in cutlass.range(NUM_K_ITERS, unroll=8):
                     k_base = k_iter * ROWS_PER_ITER
                     k_idx = k_base + k_local
                     h_val = sData[(k_idx, v_idx, stage)] * r_g
@@ -689,7 +689,7 @@ def _define_kernels():
                 v_new = cute.arch.shuffle_sync(v_new, v_local)
 
                 sum_hq = 0.0
-                for k_iter in cutlass.range_dynamic(NUM_K_ITERS, unroll=8):
+                for k_iter in cutlass.range(NUM_K_ITERS, unroll=8):
                     k_base = k_iter * ROWS_PER_ITER
                     k_idx = k_base + k_local
                     h_old = sData[(k_idx, v_idx, stage)] * r_g
@@ -760,7 +760,7 @@ def _define_kernels():
             v_base = warp_idx * V_PER_WARP
             v_idx = v_base + v_local
 
-            smem = cutlass.utils.SmemAllocator()
+            smem = cutlass.memory.SmemAllocator()
             sData = smem.allocate_tensor(cutlass.Float32, smem_layout_staged, 128)
             smem_o_layout = cute.make_layout((TILE_V,), stride=(1,))
             smem_o = smem.allocate_tensor(cutlass.Float32, smem_o_layout, 128)
@@ -890,7 +890,7 @@ def _define_kernels():
                 r_v = cutlass.Float32(v[0, i_n, i_hv, v_global])
 
                 sum_hk = 0.0
-                for k_iter in cutlass.range_dynamic(NUM_K_ITERS, unroll=8):
+                for k_iter in cutlass.range(NUM_K_ITERS, unroll=8):
                     k_base = k_iter * ROWS_PER_ITER
                     k_idx = k_base + k_local
                     h_val = sData[(k_idx, v_idx, stage)] * r_g
@@ -906,7 +906,7 @@ def _define_kernels():
                 v_new = cute.arch.shuffle_sync(v_new, v_local)
 
                 sum_hq = 0.0
-                for k_iter in cutlass.range_dynamic(NUM_K_ITERS, unroll=8):
+                for k_iter in cutlass.range(NUM_K_ITERS, unroll=8):
                     k_base = k_iter * ROWS_PER_ITER
                     k_idx = k_base + k_local
                     h_old = sData[(k_idx, v_idx, stage)] * r_g

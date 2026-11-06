@@ -4,8 +4,8 @@ from typing import Optional
 
 from sglang.multimodal_gen.configs.models.dits.joy_echo import JoyEchoConfig
 from sglang.multimodal_gen.configs.models.vaes.ltx_video import LTXVideoVAEConfig
-from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 
 
 def _default_joy_echo_vae_config() -> LTXVideoVAEConfig:

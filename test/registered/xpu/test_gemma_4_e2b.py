@@ -25,14 +25,14 @@ import requests
 import torch
 
 from sglang.srt.utils.common import is_xpu
-from sglang.srt.utils.hf_transformers_utils import (
+from sglang.srt.utils.hf_transformers import (
     get_processor,
     get_tokenizer_from_processor,
 )
 from sglang.test.ci.ci_register import register_xpu_ci
-from sglang.test.test_utils import CustomTestCase
-from sglang.test.vlm_utils import (
+from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     popen_launch_server,
     terminate_and_kill_process_tree,
 )
