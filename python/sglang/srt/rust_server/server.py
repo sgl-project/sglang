@@ -27,6 +27,7 @@ import orjson
 import psutil
 
 from sglang.srt.disaggregation.kv_events import select_kv_publisher_dp_rank
+from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import ShutdownReq
 from sglang.srt.managers.utils import (
     MsgpackDecodeError,
@@ -55,7 +56,6 @@ from sglang.srt.rust_server.multimodal import (
     settle_shm_buffers,
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.utils.common import get_bool_env_var
 from sglang.srt.utils.flatten import (
     FlatPairColumns,
     NestedRowColumns,
@@ -461,7 +461,7 @@ class RustServer:
         (``sglang.srt.rust_server.shutdown``), as Python mode's tokenizer
         manager drains: health answers 503 at once, requests are still
         admitted, the listener closes once none is left in flight, and then
-        :meth:`drain` stops the schedulers. ``SGL_FORCE_SHUTDOWN`` skips the
+        :meth:`drain` stops the schedulers. ``SGLANG_FORCE_SHUTDOWN`` skips the
         wait for requests, as in Python.
 
         The drain begins from a Rust thread woken through the signal wakeup
@@ -476,7 +476,7 @@ class RustServer:
                 "rust server: not on the main thread; SIGTERM will not drain"
             )
             return
-        force = get_bool_env_var("SGL_FORCE_SHUTDOWN")
+        force = envs.SGLANG_FORCE_SHUTDOWN.get()
         if not self._broadcasts_shutdown:
             notify = None
 
