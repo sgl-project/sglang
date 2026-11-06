@@ -828,7 +828,10 @@ class TestRustServerExtension(CustomTestCase):
                 ):
                     RustServer.gather_server_endpoints(hosts_listener=False)
 
-    def test_gather_server_endpoints_checks_bind_family_on_every_rank(self):
+    def test_gather_server_endpoints_publishes_an_address_the_bind_serves(self):
+        """An IPv4 wildcard listener publishes 127.0.0.1 for SGLANG_HOST_IP=::1
+        (the same machine) and refuses any other IPv6 SGLANG_HOST_IP, which it
+        does not serve, on every rank, listener or not."""
         parallel = SimpleNamespace(
             nnodes=1,
             attn_dp_size=1,
@@ -837,40 +840,44 @@ class TestRustServerExtension(CustomTestCase):
             world_group=SimpleNamespace(all_gather_object=Mock()),
         )
         serving = SimpleNamespace(host="0.0.0.0", port=30000)
-        with (
-            patch.object(server_module, "get_parallel", return_value=parallel),
-            patch.object(
-                server_module,
-                "get_exec",
-                return_value=SimpleNamespace(moe=SimpleNamespace(is_ep_joiner=False)),
-            ),
-            patch.object(server_module, "get_serving", return_value=serving),
-            patch.object(RustServer, "_port_offset", return_value=0),
-            patch.object(server_module, "get_local_ip_auto") as advertised,
+        for bind, host_ip, published in (
+            ("0.0.0.0", "10.0.0.1", "10.0.0.1"),
+            ("::", "2001:db8::1", "2001:db8::1"),
+            ("::", "::1", "::1"),
+            ("0.0.0.0", "::1", "127.0.0.1"),
+            ("0.0.0.0", "2001:db8::1", None),
         ):
-            for bind, host in (
-                ("0.0.0.0", "10.0.0.1"),
-                ("::", "2001:db8::1"),
-                ("0.0.0.0", "2001:db8::1"),
+            serving.host = bind
+            gathered = []
+
+            def gather(entry):
+                if entry is not None:
+                    gathered[:] = [entry]
+                return [*gathered, None]
+
+            parallel.world_group.all_gather_object.side_effect = gather
+            with (
+                patch.dict(os.environ, {"SGLANG_HOST_IP": host_ip}),
+                patch.object(server_module, "get_parallel", return_value=parallel),
+                patch.object(
+                    server_module,
+                    "get_exec",
+                    return_value=SimpleNamespace(
+                        moe=SimpleNamespace(is_ep_joiner=False)
+                    ),
+                ),
+                patch.object(server_module, "get_serving", return_value=serving),
+                patch.object(RustServer, "_port_offset", return_value=0),
             ):
-                serving.host = bind
-                advertised.return_value = host
-                gathered = []
-
-                def gather(entry):
-                    if entry is not None:
-                        gathered.append(entry)
-                    return gathered
-
-                parallel.world_group.all_gather_object.side_effect = gather
                 for hosts_listener in (True, False):
-                    with self.subTest(bind=bind, host=host, listener=hosts_listener):
-                        if bind == "0.0.0.0" and ":" in host:
+                    with self.subTest(
+                        bind=bind, host_ip=host_ip, listener=hosts_listener
+                    ):
+                        if published is None:
                             with self.assertRaisesRegex(
                                 ValueError, "DP rank 0.*IPv4.*2001:db8::1"
                             ):
                                 RustServer.gather_server_endpoints(hosts_listener)
-                            self.assertEqual(len(gathered), 1)
                         else:
                             self.assertEqual(
                                 RustServer.gather_server_endpoints(hosts_listener),
@@ -878,7 +885,7 @@ class TestRustServerExtension(CustomTestCase):
                                     {
                                         "dp_rank": 0,
                                         "endpoint": server_module.NetworkAddress(
-                                            host, 30000
+                                            published, 30000
                                         ).to_url(),
                                     }
                                 ],
