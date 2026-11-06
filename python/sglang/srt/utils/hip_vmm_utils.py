@@ -18,9 +18,6 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
-from sglang.srt.distributed.device_communicators.cuda_wrapper import (
-    find_loaded_library,
-)
 from sglang.srt.utils.cuda_vmm_utils import exchange_posix_fds
 
 logger = logging.getLogger(__name__)
@@ -134,6 +131,10 @@ def _hip() -> ctypes.CDLL:
     """The HIP runtime torch already loaded, with the VMM entry points typed."""
     global _LIB
     if _LIB is None:
+        from sglang.srt.distributed.device_communicators.cuda_wrapper import (
+            find_loaded_library,
+        )
+
         torch.cuda.init()
         path = find_loaded_library("libamdhip64")
         if path is None:
