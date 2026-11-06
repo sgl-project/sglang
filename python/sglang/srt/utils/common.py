@@ -198,23 +198,27 @@ def is_npu() -> bool:
     return True
 
 
+# Cache host CPU capability checks at import time to prevent TorchDynamo
+# from graph-breaking on `torch.cpu.is_available()` (torch op returning non-Tensor).
+_IS_HOST_CPU_X86 = (
+    platform.machine().lower() in ("x86_64", "amd64", "i386", "i686")
+    and hasattr(torch, "cpu")
+    and torch.cpu.is_available()
+)
+_IS_HOST_CPU_ARM64 = (
+    platform.machine().lower() in ("aarch64", "arm64")
+    and hasattr(torch, "cpu")
+    and torch.cpu.is_available()
+)
+
+
 @lru_cache(maxsize=1)
 def is_host_cpu_x86() -> bool:
-    machine = platform.machine().lower()
-    return (
-        machine in ("x86_64", "amd64", "i386", "i686")
-        and hasattr(torch, "cpu")
-        and torch.cpu.is_available()
-    )
+    return _IS_HOST_CPU_X86
 
 
 def is_host_cpu_arm64() -> bool:
-    machine = platform.machine().lower()
-    return (
-        machine in ("aarch64", "arm64")
-        and hasattr(torch, "cpu")
-        and torch.cpu.is_available()
-    )
+    return _IS_HOST_CPU_ARM64
 
 
 @lru_cache(maxsize=1)
@@ -284,11 +288,6 @@ def _check_cuda_device_version(
     )
 
 
-is_ampere_with_cuda_12_3 = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version, device_capability_majors=[8], cuda_version=(12, 3)
-    )
-)
 is_hopper_with_cuda_12_3 = lru_cache(maxsize=1)(
     partial(
         _check_cuda_device_version, device_capability_majors=[9], cuda_version=(12, 3)
@@ -490,8 +489,8 @@ def get_available_gpu_memory(
     elif device == "cpu":
         # TODO: rename the variables in the current function to be not GPU specific
         total_free_memory = get_free_cpu_memory()
-        n_numa_node: int = len(get_cpu_ids_by_node())
-        free_gpu_memory = round(total_free_memory / n_numa_node, 3)
+        n_node = len(get_cpu_ids_by_node()) or 1
+        free_gpu_memory = round(total_free_memory / n_node, 3)
     elif device == "npu":
         num_gpus = torch.npu.device_count()
         assert gpu_id < num_gpus
@@ -917,14 +916,14 @@ def get_cpu_memory_capacity():
             "You need to set proper --max-total-tokens to avoid the out-of-memory error."
         )
         return None
-    n_numa_node = len(get_cpu_ids_by_node()) or 1
+    n_node = len(get_cpu_ids_by_node()) or 1
     total_cpu_memory = psutil.virtual_memory().total
     instance_max_cpu_memory = get_instance_memory_status("/sys/fs/cgroup/memory.max")
     if instance_max_cpu_memory is not None:
         total_cpu_memory = min(total_cpu_memory, instance_max_cpu_memory)
-    per_numa_mem = total_cpu_memory / n_numa_node
+    per_node_mem = total_cpu_memory / n_node
     # Retrieved value in Byte, need MB
-    return float(per_numa_mem // (1 << 20))
+    return float(per_node_mem // (1 << 20))
 
 
 def get_xpu_memory_capacity():
@@ -1342,29 +1341,6 @@ def get_cuda_driver_bindings():
         from cuda import cuda as cuda_driver
 
     return cuda_driver
-
-
-def get_device_sm_nvidia_smi():
-    try:
-        # Run nvidia-smi command and capture output
-        result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-
-        # Get the first line of output (assuming at least one GPU exists)
-        compute_cap_str = result.stdout.strip().split("\n")[0]
-
-        # Convert string (e.g., "9.0") to tuple of integers (9, 0)
-        major, minor = map(int, compute_cap_str.split("."))
-        return (major, minor)
-
-    except (subprocess.CalledProcessError, FileNotFoundError, ValueError) as e:
-        # Handle cases where nvidia-smi isn't available or output is unexpected
-        logger.error("Error getting compute capability: %s", e)
-        return (0, 0)  # Default/fallback value
 
 
 @contextmanager
@@ -2346,8 +2322,22 @@ def configure_hf_hub_logger():
 
 
 def suppress_noisy_warnings():
-    """Suppress known noisy warnings from third-party libraries."""
+    """Suppress known noisy third-party output: warnings, and the HF Hub and httpx loggers."""
     configure_hf_hub_logger()
+    filter_noisy_warnings()
+
+    # Suppress noisy third-party HTTP loggers.
+    # huggingface_hub uses httpx which logs every HTTP request at INFO level.
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
+def filter_noisy_warnings():
+    """Drop known noisy warnings from third-party libraries; logging is untouched.
+
+    pytest re-enables DeprecationWarning per test, so test/pytest.ini repeats
+    the DeprecationWarning entries below; keep the two in sync.
+    """
     warnings.filterwarnings(
         "ignore", category=UserWarning, message="The given NumPy array is not writable"
     )
@@ -2362,41 +2352,52 @@ def suppress_noisy_warnings():
         category=FutureWarning,
     )
 
-    # cutlass-dsl emits these inside `catch_warnings()+simplefilter("always")`,
-    # which bypasses filterwarnings; override showwarning to drop them too.
-    cutlass_dsl_noisy = {
+    # flashinfer and quack still import pre-4.8 cutlass-dsl paths. Matching only
+    # those packages keeps sglang's own uses of the old paths visible.
+    third_party = "flashinfer|quack"
+    # (category, message regex, emitting packages, or None for any)
+    noisy_warnings = [
         (
             DeprecationWarning,
-            "Using `struct.scalar` as pointer is deprecated.",
+            re.escape("Using `struct.scalar` as pointer is deprecated."),
+            None,
         ),
         (
             UserWarning,
-            "NamedBarrier wait also arrives on the barrier. "
-            "Routing call to NamedBarrier.arrive_and_wait().",
+            re.escape(
+                "NamedBarrier wait also arrives on the barrier. "
+                "Routing call to NamedBarrier.arrive_and_wait()."
+            ),
+            None,
         ),
-        (
-            DeprecationWarning,
-            "builtin type swigvarlink has no __module__ attribute",
-        ),
-    }
-    for cat, msg in cutlass_dsl_noisy:
-        warnings.filterwarnings("ignore", message=re.escape(msg), category=cat)
+        (DeprecationWarning, r"builtin type \w+ has no __module__ attribute", None),
+        (DeprecationWarning, r"cutlass\.\S+ is deprecated; use cutlass\.", third_party),
+        (DeprecationWarning, r"Arch from arch\.py is deprecated", third_party),
+    ]
+    for cat, message, packages in noisy_warnings:
+        module = rf"({packages})(\.|$)" if packages else ""
+        warnings.filterwarnings("ignore", message=message, category=cat, module=module)
 
-    if not getattr(warnings.showwarning, "_sglang_patched_cutlass_dsl", False):
+    # cutlass-dsl emits some of these inside `catch_warnings()+simplefilter("always")`,
+    # which bypasses filterwarnings; override showwarning to drop them too.
+    if not getattr(warnings.showwarning, "_sglang_noisy_warning_filter", False):
         prev_showwarning = warnings.showwarning
 
-        def _filtered_showwarning(message, category, *args, **kwargs):
-            if (category, str(message)) in cutlass_dsl_noisy:
-                return
-            prev_showwarning(message, category, *args, **kwargs)
+        def _filtered_showwarning(message, category, filename, *args, **kwargs):
+            for cat, pattern, packages in noisy_warnings:
+                if (
+                    issubclass(category, cat)
+                    and re.match(pattern, str(message))
+                    and (
+                        packages is None
+                        or re.search(rf"[/\\]({packages})[/\\]", filename)
+                    )
+                ):
+                    return
+            prev_showwarning(message, category, filename, *args, **kwargs)
 
-        _filtered_showwarning._sglang_patched_cutlass_dsl = True
+        _filtered_showwarning._sglang_noisy_warning_filter = True
         warnings.showwarning = _filtered_showwarning
-
-    # Suppress noisy third-party HTTP loggers.
-    # huggingface_hub uses httpx which logs every HTTP request at INFO level.
-    for name in ("httpx", "httpcore"):
-        logging.getLogger(name).setLevel(logging.WARNING)
 
 
 def suppress_other_loggers():
@@ -3841,10 +3842,10 @@ def retry(
             traceback.print_exc()
 
             if try_index >= max_retry:
-                raise Exception(f"retry() exceed maximum number of retries.")
+                raise Exception("retry() exceed maximum number of retries.")
 
             if not should_retry(e):
-                raise Exception(f"retry() observe errors that should not be retried.")
+                raise Exception("retry() observe errors that should not be retried.")
 
             delay = min(initial_delay * (2**try_index), max_delay) * (
                 0.75 + 0.25 * random.random()
@@ -4311,7 +4312,7 @@ def dim_is_supported(weight):
 def _process_weight_after_loading(module, weight_names, transpose_dims=None) -> None:
     # Pack weight for get better performance on CPU
     devices = {getattr(module, weight_name).device for weight_name in weight_names}
-    assert len(devices) == 1, f"Expects all weights to be on the same device"
+    assert len(devices) == 1, "Expects all weights to be on the same device"
     device = devices.pop()
 
     if transpose_dims:
@@ -4504,68 +4505,61 @@ def ceil_div(x: int, y: int) -> int:
 
 def parse_lscpu_topology():
     try:
-        # Get CPU topology: CPU,Core,Socket,Node
+        # Get CPU topology: CPU,Core,Socket,Node,Cache (L3 identifies CBB).
         output = subprocess.check_output(
-            ["lscpu", "-p=CPU,Core,Socket,Node"], text=True
+            ["lscpu", "-p=CPU,Core,Socket,Node,Cache"], text=True
         )
     except Exception as e:
         raise RuntimeError(f"Unexpected error running 'lscpu': {e}")
 
-    # Parse only data lines (skip comments)
     cpu_info = []
     for line in output.splitlines():
-        if not line.startswith("#"):
-            parts = line.strip().split(",")
-            if len(parts) != 4:
-                logger.warning("Skipping malformed lscpu line: %s", line.strip())
-                continue
-            cpu = int(parts[0])  # CPU id must always be present
-            core, socket, node = [int(p) if p else 0 for p in parts[1:]]
-            cpu_info.append((cpu, core, socket, node))
+        # Parse only data lines (skip comments)
+        if line.startswith("#"):
+            continue
+        parts = line.split(",")
+        numa_parts = parts[:4]  # CPU, Core, Socket, Node
+        cache_str = parts[-1] if len(parts) > 4 else "0"
+        cache_parts = cache_str.split(":")
+        line_info = list()
+        # 5 elements expected: [cpu, core, socket, node, L3]
+        for p in numa_parts:
+            line_info.append(int(p) if p.isdigit() else 0)
+        l3_cache_index = int(cache_parts[-1]) if cache_parts[-1] else 0
+        line_info.append(l3_cache_index)
+        cpu_info.append(line_info)
 
-    # [(0,0,0,0),(1,1,0,0),...,(43,43,0,1),...,(256,0,0,0),...]
+    # [(0,0,0,0,0),(1,1,0,0,0),...,(43,43,0,1,0),...,(256,0,0,0,0),...]
     return cpu_info
 
 
-def get_physical_cpus_by_numa():
+def get_physical_cpus_by_numa_or_block():
     cpu_info = parse_lscpu_topology()
+    n_nodes = len({node for _, _, _, node, _ in cpu_info})
+    n_blocks = len({block for _, _, _, _, block in cpu_info})
+    use_block = n_blocks > n_nodes
+    physical_by_group = defaultdict(dict)
 
-    # Map NUMA node -> set of (core_id, socket) to avoid duplicates
-    # 0: {(0,0): 0, (1, 0): 1,...}
-    # ...
-    # 5: {(214,1): 214, (215,1): 215}
-    physical_by_node = defaultdict(dict)  # node -> core_id -> cpu_id
-
-    for cpu, core, socket, node in cpu_info:
-        key = (core, socket)
-        if key not in physical_by_node[node]:
-            physical_by_node[node][key] = (
-                cpu  # pick first CPU seen for that physical core
-            )
+    for cpu, core, socket_id, node, block in cpu_info:
+        group = block if use_block else node
+        key = (core, socket_id)
+        if key not in physical_by_group[group]:
+            # Pick the first CPU seen for that physical core.
+            physical_by_group[group][key] = cpu
 
     # Retrieves CPUs that the current process is allowed to run on
     cpus_allowed_list = psutil.Process().cpu_affinity()
-
-    # Convert to list of physical CPUs per node
-    # 0: [0,1,2,...,42]
-    # ...
-    # 2: [86,87,...,127]
-    # ...
-    # 5: [214,215,...,255]
-    node_to_cpus = {}
-    for node, core_to_cpu in physical_by_node.items():
-        cpus = sorted(core_to_cpu.values())
-        allowed_cpus = set(cpus).intersection(cpus_allowed_list)
-        node_to_cpus[node] = allowed_cpus
-
-    return node_to_cpus
+    return {
+        group: set(core_to_cpu.values()).intersection(cpus_allowed_list)
+        for group, core_to_cpu in physical_by_group.items()
+    }
 
 
 # Only physical cores are used. Logical cores are excluded.
 @lru_cache(maxsize=1)
 def get_cpu_ids_by_node():
-    node_to_cpus = get_physical_cpus_by_numa()
-    # Sort by NUMA node index
+    node_to_cpus = get_physical_cpus_by_numa_or_block()
+    # Sort by NUMA node index or CBB block index
     # ['0,1,2,3', '4,5,6,7', '8,9,10,11', '12,13,14,15', '16,17,18,19', '20,21,22,23']
     return [
         ",".join(map(str, sorted(cpus)))
@@ -4759,6 +4753,7 @@ SUPPORTED_LORA_TARGET_MODULES = [
     "wk",
     "weights_proj",
     "gate_proj",
+    "self_attn.gate_proj",
     "up_proj",
     "down_proj",
     "qkv_proj",
@@ -4871,19 +4866,6 @@ def json_list_type(value):
         raise argparse.ArgumentTypeError(
             f"Invalid JSON list: {value}. Please provide a valid JSON list."
         )
-
-
-def get_extend_input_len_swa_limit(
-    sliding_window_size: int, chunked_prefill_size: int, page_size: int
-) -> int:
-    # 1. a factor of 2x is because each prefill contains chunked_prefill_size tokens,
-    #    and between prefills, we run the tree cache's checkpoint(),
-    #    so we unlock the previously locked nodes.
-    # 2. max is to handle the case that chunked_prefill_size is larger than sliding_window_size.
-    #    in that case, each prefill contains chunked_prefill_size tokens,
-    #    and we can only free out-of-sliding-window kv indices after each prefill.
-    # 3. page_size is because we want to have 1 token extra for generated tokens.
-    return page_size + 2 * max(sliding_window_size, chunked_prefill_size)
 
 
 def get_num_new_pages(
@@ -5094,20 +5076,6 @@ def calc_diff(x, y):
     denominator = (x * x + y * y).sum()
     sim = 2 * (x * y).sum() / denominator
     return 1 - sim
-
-
-@contextmanager
-def temp_attr_context(obj, attr, value):
-    if obj is None:
-        yield
-        return
-
-    original_value = getattr(obj, attr)
-    setattr(obj, attr, value)
-    try:
-        yield
-    finally:
-        setattr(obj, attr, original_value)
 
 
 def raise_error_or_warn(obj, strict, counter_name, message, log_interval=1000):
