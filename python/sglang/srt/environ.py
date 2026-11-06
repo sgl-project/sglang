@@ -1635,6 +1635,11 @@ class Envs:
     SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PUSH_SIZE_KB = EnvInt(None)
     # See docs/references/environment_variables.
     SGLANG_ENABLE_PCIE_IPC_ALLREDUCE = EnvBool(False)
+    # Path to allreduce_configs.json from the all-reduce tuner. Tensor-parallel
+    # groups use it to pick custom all-reduce, NCCL, symmetric memory, or
+    # QuickReduce (and its codec, such as INT4) from the measured message size.
+    # Unset keeps the built-in order.
+    SGLANG_ALLREDUCE_TUNE_CONFIG = EnvStr(None)
     SGLANG_PCIE_IPC_MAX_NUMEL = EnvInt(0)
 
     # ===================================================================

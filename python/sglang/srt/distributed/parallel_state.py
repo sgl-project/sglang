@@ -51,6 +51,11 @@ from sglang.srt.distributed.utils import (
     reduce_scatter_single,
     set_global_tcp_store,
 )
+from sglang.srt.distributed.device_communicators.allreduce_tune_table import (
+    TUNE_TABLE_GROUPS,
+    load_allreduce_tune_table,
+    parse_tune_backend,
+)
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
@@ -319,6 +324,7 @@ class GroupCoordinator:
     ):
         # Set group info
         group_name = group_name or "anonymous"
+        self.group_name = group_name
         self.unique_name = _get_unique_name(group_name)
         _register_group(self)
 
@@ -487,6 +493,14 @@ class GroupCoordinator:
 
         self.ca_comm: Optional[Any] = None
         self.qr_comm: Optional[QuickAllReduce] = None
+        self.qr_by_quant: Dict[str, QuickAllReduce] = {}
+        self.allreduce_tune = None
+        self._tune_fallback_logged = False
+        if self.group_name in TUNE_TABLE_GROUPS and self.world_size > 1:
+            self.allreduce_tune = load_allreduce_tune_table(
+                envs.SGLANG_ALLREDUCE_TUNE_CONFIG.get(),
+                self.world_size,
+            )
 
         self.pcie_ipc_comm: Optional[Any] = None
         from sglang.srt.distributed.device_communicators.pcie_ipc_ar import (
@@ -533,9 +547,28 @@ class GroupCoordinator:
                     # complement to custom allreduce.
                     # Based on quickreduce (https://github.com/mk1-project/quickreduce).
                     if qr_rocm_arch_available():
-                        self.qr_comm = QuickAllReduce(
-                            group=self.cpu_group, device=self.device
+                        codecs = (
+                            self.allreduce_tune.qr_codecs
+                            if self.allreduce_tune is not None
+                            else ()
                         )
+                        if codecs:
+                            for quant in codecs:
+                                comm = _quick_allreduce_with_quant(
+                                    self.cpu_group, self.device, quant
+                                )
+                                if not comm.disabled:
+                                    self.qr_by_quant[quant] = comm
+                            if self.qr_by_quant:
+                                self.qr_comm = next(iter(self.qr_by_quant.values()))
+                                logger.info(
+                                    "[AR] QuickReduce codecs from the tune table: %s",
+                                    ", ".join(self.qr_by_quant),
+                                )
+                        else:
+                            self.qr_comm = QuickAllReduce(
+                                group=self.cpu_group, device=self.device
+                            )
                 except Exception as e:
                     logger.warning(f"Failed to initialize QuickAllReduce: {e}")
         elif self.world_size > 1 and is_hip():
@@ -972,11 +1005,61 @@ class GroupCoordinator:
         except Exception:
             return None
 
+    def _tuned_outplace_method(self, input_: torch.Tensor):
+        """Method chosen by the tune table, or ``_TUNE_NO_DECISION``."""
+        table = self.allreduce_tune
+        if table is None:
+            return _TUNE_NO_DECISION
+        nbytes = input_.numel() * input_.element_size()
+        backend = table.backend_for(nbytes, str(input_.dtype))
+        method = parse_tune_backend(backend)
+        if method is None:
+            return _TUNE_NO_DECISION
+        if method == "nccl":
+            return None
+        if method == "ca":
+            comm = self.ca_comm
+            if (
+                comm is not None
+                and not comm.disabled
+                and comm.should_custom_ar(input_)
+            ):
+                return "ca"
+        elif method == "torch_symm_mem":
+            comm = self.torch_symm_mem_comm
+            if (
+                comm is not None
+                and not comm.disabled
+                and comm.should_torch_symm_mem_allreduce(input_)
+            ):
+                return "torch_symm_mem"
+        elif method.startswith("qr:"):
+            quant = method.split(":", 1)[1]
+            comm = self.qr_by_quant.get(quant)
+            if (
+                comm is not None
+                and not comm.disabled
+                and comm.should_quick_allreduce(input_)
+            ):
+                return method
+        if not self._tune_fallback_logged:
+            logger.info(
+                "[AR] Tune table chose %s for %d bytes, which this group cannot "
+                "run. Using the built-in all-reduce order for that size.",
+                backend,
+                nbytes,
+            )
+            self._tune_fallback_logged = True
+        return _TUNE_NO_DECISION
+
     def _resolve_outplace_all_reduce_method(
         self,
         input_: torch.Tensor,
         should_use_pymscclpp_allreduce: Optional[bool] = None,
     ) -> Optional[str]:
+        tuned = self._tuned_outplace_method(input_)
+        if tuned is not _TUNE_NO_DECISION:
+            return tuned
         if should_use_pymscclpp_allreduce is None:
             should_use_pymscclpp_allreduce = (
                 self.pymscclpp_comm is not None
@@ -1074,8 +1157,14 @@ class GroupCoordinator:
         if outplace_all_reduce_method == "ca":
             assert not ca_comm.disabled
             out = ca_comm.custom_all_reduce(input_)
-        elif outplace_all_reduce_method == "qr":
-            assert not qr_comm.disabled
+        elif outplace_all_reduce_method == "qr" or (
+            isinstance(outplace_all_reduce_method, str)
+            and outplace_all_reduce_method.startswith("qr:")
+        ):
+            if outplace_all_reduce_method.startswith("qr:"):
+                quant = outplace_all_reduce_method.split(":", 1)[1]
+                qr_comm = self.qr_by_quant.get(quant)
+            assert qr_comm is not None and not qr_comm.disabled
             out = qr_comm.quick_all_reduce(input_)
         elif outplace_all_reduce_method == "torch_symm_mem":
             assert not torch_symm_mem_comm.disabled
@@ -2335,6 +2424,32 @@ def graph_capture(stream=None):
 
 
 logger = logging.getLogger(__name__)
+
+# Returned by the tune-table lookup when the table does not choose a method.
+_TUNE_NO_DECISION = object()
+_QR_QUANT_ENVS = (
+    "ROCM_QUICK_REDUCE_QUANTIZATION",
+    "AITER_QUICK_REDUCE_QUANTIZATION",
+)
+
+def _quick_allreduce_with_quant(group, device, quant: str):
+    """Build QuickAllReduce at one codec. Init reads the quant from the env."""
+    from sglang.srt.distributed.device_communicators.quick_all_reduce import (
+        QuickAllReduce,
+    )
+
+    previous = {name: os.environ.get(name) for name in _QR_QUANT_ENVS}
+    for name in _QR_QUANT_ENVS:
+        os.environ[name] = quant
+    try:
+        return QuickAllReduce(group, device)
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
 
 _ENABLE_CUSTOM_ALL_REDUCE = True
 _ENABLE_MSCCLPP = False
