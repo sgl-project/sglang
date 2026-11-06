@@ -73,6 +73,7 @@ from sglang.srt.observability.trace import (
     TraceReqContext,
     trace_set_thread_info,
 )
+from sglang.srt.observability.pd_timing import run_pd_transfer
 from sglang.srt.runtime_context import (
     get_device,
     get_memory,
@@ -2796,7 +2797,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 if self._dcp_pack_buffers
                                 else None
                             )
-                            ret = self.send_kvcache_dcp(
+                            ret = run_pd_transfer(
+                                kv_chunk.room,
+                                self.send_kvcache_dcp,
                                 req.mooncake_session_id,
                                 kv_chunk.prefill_kv_indices,
                                 target_rank_registration_info.dst_kv_ptrs,
@@ -2822,7 +2825,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             or self.attn_tp_size
                             == target_rank_registration_info.dst_attn_tp_size
                         ):
-                            ret = self.send_kvcache(
+                            ret = run_pd_transfer(
+                                kv_chunk.room,
+                                self.send_kvcache,
                                 req.mooncake_session_id,
                                 kv_chunk.prefill_kv_indices,
                                 target_rank_registration_info.dst_kv_ptrs,

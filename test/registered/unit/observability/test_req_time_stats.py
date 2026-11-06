@@ -363,5 +363,78 @@ class TestStorageAdmissionWait(CustomTestCase):
             self.assertIsNone(stats.storage_staging_wait_s)
 
 
+class TestPDTimingLog(CustomTestCase):
+    def test_pd_timing_disabled_does_not_read_clocks(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.observability import pd_timing
+
+        with (
+            pd_timing.envs.SGLANG_ENABLE_PD_TIMING_LOG.override(False),
+            mock.patch.object(pd_timing.time, "time_ns", side_effect=AssertionError),
+            mock.patch.object(pd_timing.time, "monotonic_ns", side_effect=AssertionError),
+        ):
+            pd_timing.log_pd_timing(SimpleNamespace(bootstrap_room=42), "p_sender_create")
+
+    def test_pd_engine_timing_propagates_to_workers_and_resets_on_failure(self):
+        import concurrent.futures
+        import contextvars
+        import json
+
+        from sglang.srt.observability import pd_timing
+
+        def native(session, src, dst, lengths):
+            if session == "fail":
+                raise RuntimeError("transport failed")
+            return -7
+
+        def transfer(session):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                return executor.submit(
+                    contextvars.copy_context().run,
+                    pd_timing.run_pd_engine_transfer,
+                    native,
+                    session,
+                    [100],
+                    [200],
+                    [64],
+                ).result()
+
+        with pd_timing.envs.SGLANG_ENABLE_PD_TIMING_LOG.override(True):
+            with self.assertLogs(pd_timing.logger, level="INFO") as logs:
+                self.assertEqual(pd_timing.run_pd_transfer(42, transfer, "peer"), -7)
+                with self.assertRaisesRegex(RuntimeError, "transport failed"):
+                    pd_timing.run_pd_transfer(43, transfer, "fail")
+            self.assertIsNone(pd_timing._transfer_room.get())
+        rows = [json.loads(line.split("PD_TIMING ", 1)[1]) for line in logs.output]
+        engine = [r for r in rows if r["stage"].startswith("engine_call_")]
+        self.assertEqual([r["bootstrap_room"] for r in engine], [42, 42, 43, 43])
+        self.assertEqual(engine[0]["call_id"], engine[1]["call_id"])
+        self.assertEqual(engine[1]["status"], -7)
+        self.assertIsNone(engine[3]["status"])
+        self.assertEqual(engine[1]["bytes"], 64)
+        self.assertNotIn("buffers", engine[0])
+
+    def test_pd_timing_correlates_by_room_without_logging_payload(self):
+        import json
+        from types import SimpleNamespace
+
+        from sglang.srt.observability import pd_timing
+
+        req = SimpleNamespace(rid="p-request", bootstrap_room=42,
+                              bootstrap_host="2.2.2.2", input_text="private prompt")
+        with pd_timing.envs.SGLANG_ENABLE_PD_TIMING_LOG.override(True):
+            with self.assertLogs(pd_timing.logger, level="INFO") as logs:
+                pd_timing.log_pd_timing(req, "p_sender_create")
+                req.rid = "d-request"
+                pd_timing.log_pd_timing(req, "d_pending_queue_enter")
+        rows = [json.loads(line.split("PD_TIMING ", 1)[1]) for line in logs.output]
+        self.assertEqual(rows[0]["bootstrap_room"], rows[1]["bootstrap_room"])
+        self.assertNotEqual(rows[0]["rid"], rows[1]["rid"])
+        self.assertLessEqual(rows[0]["monotonic_ns"], rows[1]["monotonic_ns"])
+        self.assertIsInstance(rows[0]["wall_time_ns"], int)
+        self.assertNotIn("private prompt", " ".join(logs.output))
+
+
 if __name__ == "__main__":
     unittest.main()

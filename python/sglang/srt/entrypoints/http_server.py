@@ -71,6 +71,7 @@ from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 from fastapi.routing import APIRoute
 from uvicorn.supervisors.multiprocess import Multiprocess
 
+from sglang.srt.observability.pd_timing import log_pd_timing
 from sglang.srt.configs.model_config import load_joint_head_config, load_pointer_head
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST, DisaggregationMode
@@ -945,13 +946,18 @@ async def serve_generate_request(obj: GenerateReqInput, request: Request):
     this directly, so the body is not decoded and checked a second time."""
     if envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get():
         apply_header_overrides(obj, request.headers)
+    log_pd_timing(obj, "http_request_enter", role=get_disagg().disaggregation_mode)
     if obj.stream:
 
         async def stream_results() -> AsyncIterator[bytes]:
+            first_output = True
             try:
                 async for out in _global_state.tokenizer_manager.generate_request(
                     obj, request
                 ):
+                    if first_output:
+                        log_pd_timing(obj, "http_first_output_yield", role=get_disagg().disaggregation_mode)
+                        first_output = False
                     yield b"data: " + dumps_json(out) + b"\n\n"
             except ValueError as e:
                 # A client disconnect also surfaces here. It's a client-side

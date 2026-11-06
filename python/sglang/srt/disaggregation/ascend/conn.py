@@ -1,4 +1,5 @@
 import concurrent.futures
+import contextvars
 import enum
 import logging
 from typing import List, Optional, Tuple
@@ -368,32 +369,53 @@ class AscendKVManager(MooncakeKVManager):
                 for layer_id in range(num_layers)
             ]
 
-        def set_transfer_blocks(
-            src_ptr: int, dst_ptr: int, item_len: int
-        ) -> List[Tuple[int, int, int]]:
-            transfer_blocks = []
+        def append_transfer_addresses(
+            src_ptr: int,
+            dst_ptr: int,
+            item_len: int,
+            src_addrs: List[int],
+            dst_addrs: List[int],
+            lengths: List[int],
+        ) -> None:
+            # Build the final engine arguments directly. Per-segment tuples and
+            # the subsequent _transfer_data zip(*) transpose create many GC
+            # containers on fragmented KV transfers, causing host-side pauses.
             for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
-                src_addr = src_ptr + int(prefill_index[0]) * item_len
-                dst_addr = dst_ptr + int(decode_index[0]) * item_len
-                length = item_len * len(prefill_index)
-                transfer_blocks.append((src_addr, dst_addr, length))
-            return transfer_blocks
+                src_addrs.append(src_ptr + int(prefill_index[0]) * item_len)
+                dst_addrs.append(dst_ptr + int(decode_index[0]) * item_len)
+                lengths.append(item_len * len(prefill_index))
 
         # Worker function for processing a single layer
         def process_layer(src_ptr: int, dst_ptr: int, item_len: int) -> int:
-            transfer_blocks = set_transfer_blocks(src_ptr, dst_ptr, item_len)
-            return self._transfer_data(mooncake_session_id, transfer_blocks)
+            # Each concurrent worker owns its lists until its sync call returns.
+            src_addrs, dst_addrs, lengths = [], [], []
+            append_transfer_addresses(
+                src_ptr, dst_ptr, item_len, src_addrs, dst_addrs, lengths
+            )
+            if not src_addrs:
+                return 0
+            return self.engine.batch_transfer_sync(
+                mooncake_session_id, src_addrs, dst_addrs, lengths
+            )
 
         # Worker function for processing all layers in a batch
         def process_layers(layers_params: List[Tuple[int, int, int]]) -> int:
-            transfer_blocks = []
+            src_addrs, dst_addrs, lengths = [], [], []
             for src_ptr, dst_ptr, item_len in layers_params:
-                transfer_blocks.extend(set_transfer_blocks(src_ptr, dst_ptr, item_len))
-            return self._transfer_data(mooncake_session_id, transfer_blocks)
+                append_transfer_addresses(
+                    src_ptr, dst_ptr, item_len, src_addrs, dst_addrs, lengths
+                )
+            if not src_addrs:
+                return 0
+            # Keep the engine wrapper, including transfer timing/error handling.
+            return self.engine.batch_transfer_sync(
+                mooncake_session_id, src_addrs, dst_addrs, lengths
+            )
 
         if self.enable_custom_mem_pool:
             futures = [
                 executor.submit(
+                    contextvars.copy_context().run,
                     process_layer,
                     src_ptr,
                     dst_ptr,

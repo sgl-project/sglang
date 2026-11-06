@@ -352,6 +352,7 @@ class Envs:
     # ===================================================================
     # Logging
     # ===================================================================
+    SGLANG_ENABLE_PD_TIMING_LOG = EnvBool(False)
     SGLANG_LOG_GC = EnvBool(False)
     SGLANG_LOG_FORWARD_ITERS = EnvBool(False)
     SGLANG_LOG_DECODE_GRAPH_KEY = EnvBool(False)
@@ -751,6 +752,8 @@ class Envs:
     SGLANG_ENABLE_DISAGG_PREFILL_CONTINUOUS_INPUT_POLLING = EnvBool(False)
     # Opt-in: retire finished prefill KV transfers while a forward result is pending.
     SGLANG_DISAGG_PREFILL_POLL_TRANSFERS_WHILE_WAITING = EnvBool(False)
+    # Coordinated, fixed-site wait loop: idle attention-DP ranks participate too.
+    SGLANG_DISAGG_PREFILL_DP_POLL_TRANSFERS_WHILE_WAITING = EnvBool(False)
     # Override NVML Confidential Computing autodetection. None = autodetect.
     SGLANG_FORCE_CONFIDENTIAL_COMPUTE = EnvBool(None)
 

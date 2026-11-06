@@ -14,7 +14,7 @@ use axum::{
     },
     response::{IntoResponse, Response},
 };
-use futures_util::StreamExt;
+use futures_util::{future::BoxFuture, StreamExt};
 use memchr::memmem;
 use reqwest::Client;
 use serde::Serialize;
@@ -57,7 +57,7 @@ use crate::{
     },
 };
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PDRouter {
     pub worker_registry: Arc<WorkerRegistry>,
     pub policy_registry: Arc<PolicyRegistry>,
@@ -675,6 +675,112 @@ impl PDRouter {
         }
     }
 
+    // Native /generate streams contain cumulative text. Unlike OpenAI deltas,
+    // they can switch producers without changing the detokenization context.
+    async fn prefill_first_response(
+        &self,
+        headers: Option<&HeaderMap>,
+        json_request: Value,
+        context: PDRequestContext<'_>,
+        prefill: Arc<dyn Worker>,
+        decode: Option<Arc<dyn Worker>>,
+        start_time: Instant,
+    ) -> Response {
+        let router = self.clone();
+        let headers = headers.cloned();
+        let model_id = context.model_id.map(str::to_owned);
+        let route = context.route;
+        let batch_size = context.batch_size;
+        let request_text = context.request_text.clone();
+        let context_headers = context.headers.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Result<bytes::Bytes, Response>>();
+        let first_sent = Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let producer_first = first_sent.clone();
+        tokio::spawn(async move {
+            let context = PDRequestContext {
+                route, batch_size, is_stream: true, return_logprob: false,
+                request_text, model_id: model_id.as_deref(), headers: context_headers,
+            };
+            let dispatch = router.execute_dual_dispatch_with_prefill_token(
+                headers.as_ref(), json_request, context, prefill, decode, start_time,
+                Some((tx.clone(), producer_first.clone())),
+            );
+            let (response, _) = tokio::select! {
+                result = dispatch => result,
+                _ = tx.closed() => return,
+            };
+            if !response.status().is_success() {
+                let _ = tx.send(Err(response));
+                return;
+            }
+            let mut stream = response.into_body().into_data_stream();
+            let mut pending = Vec::new();
+            loop {
+                tokio::select! {
+                    _ = tx.closed() => break,
+                    chunk = stream.next() => match chunk {
+                        Some(Ok(chunk)) => {
+                            pending.extend_from_slice(&chunk);
+                            while let Some(end) = memmem::find(&pending, b"\n\n") {
+                                let frame: Vec<u8> = pending.drain(..end + 2).collect();
+                                let origin = producer_first.compare_exchange(0, 2,
+                                    std::sync::atomic::Ordering::AcqRel,
+                                    std::sync::atomic::Ordering::Acquire).unwrap_or_else(|origin| origin);
+                                let duplicate = origin == 1 && Self::native_single_token_frame(&frame);
+                                if !duplicate {
+                                    if tx.send(Ok(bytes::Bytes::from(frame))).is_err() { return; }
+                                }
+                            }
+                        }
+                        Some(Err(e)) => {
+                            let _ = tx.send(Err(error::bad_gateway("decode_stream_error", e.to_string())));
+                            break;
+                        }
+                        None => {
+                            if !pending.is_empty() { let _ = tx.send(Ok(pending.into())); }
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        match rx.recv().await {
+            Some(Ok(first)) => {
+                let stream = futures_util::stream::once(async { Ok::<_, String>(first) })
+                    .chain(UnboundedReceiverStream::new(rx).map(|item| item.map_err(|response| {
+                        format!("PD upstream failed: {}", response.status())
+                    })));
+                let mut response = Response::new(Body::from_stream(stream));
+                response.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+                let source = if first_sent.load(std::sync::atomic::Ordering::Acquire) == 1 {
+                    "prefill"
+                } else {
+                    "decode"
+                };
+                response.headers_mut().insert(
+                    "x-sglang-pd-first-token-source", HeaderValue::from_static(source),
+                );
+                tracing::info!(first_token_source = source, "PD prefill-first stream started");
+                response.extensions_mut().insert(BreakerOutcomesRecorded);
+                response
+            }
+            Some(Err(mut response)) => {
+                response.extensions_mut().insert(BreakerOutcomesRecorded);
+                response
+            }
+            None => error::bad_gateway("pd_stream_closed", "PD stream closed before its first token"),
+        }
+    }
+
+    fn native_single_token_frame(frame: &[u8]) -> bool {
+        frame.strip_prefix(b"data: ")
+            .and_then(|data| serde_json::from_slice::<Value>(data).ok())
+            .is_some_and(|value| {
+                value.pointer("/meta_info/completion_tokens").and_then(Value::as_u64) == Some(1)
+                    && value.pointer("/meta_info/finish_reason").map_or(true, Value::is_null)
+            })
+    }
+
     // Internal method that performs the actual dual dispatch (without retry logic)
     #[allow(clippy::too_many_arguments)]
     async fn execute_dual_dispatch_internal(
@@ -685,6 +791,38 @@ impl PDRouter {
         prefill: Arc<dyn Worker>,
         decode: Option<Arc<dyn Worker>>,
         _start_time: Instant,
+    ) -> (Response, Option<Arc<dyn Worker>>) {
+        let enabled = headers.and_then(|h| h.get("x-sglang-pd-prefill-first-token"))
+            .is_some_and(|v| v == "true");
+        if enabled {
+            if context.route != "/generate" || !context.is_stream || context.return_logprob
+                || context.batch_size.is_some()
+                || json_request.pointer("/sampling_params/n").and_then(Value::as_u64).unwrap_or(1) != 1
+            {
+                return (error::bad_request("unsupported_prefill_first_request",
+                    "Prefill-first output requires a single /generate streaming request without logprobs"), None);
+            }
+            let response = self.prefill_first_response(
+                headers, json_request, context, prefill, decode, _start_time,
+            ).await;
+            return (response, None);
+        }
+        self.execute_dual_dispatch_with_prefill_token(
+            headers, json_request, context, prefill, decode, _start_time, None,
+        ).await
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    async fn execute_dual_dispatch_with_prefill_token(
+        &self,
+        headers: Option<&HeaderMap>,
+        json_request: Value,
+        context: PDRequestContext<'_>,
+        prefill: Arc<dyn Worker>,
+        decode: Option<Arc<dyn Worker>>,
+        _start_time: Instant,
+        first_token: Option<(tokio::sync::mpsc::UnboundedSender<Result<bytes::Bytes, Response>>,
+            Arc<std::sync::atomic::AtomicU8>)>,
     ) -> (Response, Option<Arc<dyn Worker>>) {
         // Count the request from dispatch so load-based policies see it before
         // upstream headers arrive; streaming responses attach their own guards.
@@ -777,6 +915,80 @@ impl PDRouter {
             Ok((decode, decode_guard, result))
         };
 
+        if context.is_stream && !context.return_logprob {
+            // Keep the prefill future owned by the handler, then by the stream
+            // pump. Dropping either cancels its upstream request as well.
+            let prefill_worker = prefill.clone();
+            let mut prefill_pending: Option<BoxFuture<'static, Result<(), Response>>> =
+                Some(Box::pin(async move {
+                    let _guard = _prefill_guard;
+                    let result = prefill_request.send().await;
+                    let ok = result.as_ref().is_ok_and(|r| {
+                        r.status().is_success() || r.status().is_client_error()
+                    });
+                    let result = Self::process_prefill_token_response(
+                        result, prefill_worker.url(), first_token,
+                    ).await;
+                    prefill_worker.record_outcome(ok);
+                    result.map(|_| ())
+                }));
+            tokio::pin!(decode_leg);
+            let leg = loop {
+                tokio::select! {
+                    biased;
+                    result = async { prefill_pending.as_mut().unwrap().await },
+                        if prefill_pending.is_some() => {
+                        prefill_pending = None;
+                        if let Some(slot) = &slot {
+                            slot.release();
+                        }
+                        if let Err(mut response) = result {
+                            response.extensions_mut().insert(BreakerOutcomesRecorded);
+                            return (response, None);
+                        }
+                    }
+                    leg = &mut decode_leg => break leg,
+                }
+            };
+            let (decode, _decode_guard, result) = match leg {
+                Ok(leg) => leg,
+                Err(mut response) => {
+                    response.extensions_mut().insert(BreakerOutcomesRecorded);
+                    return (response, None);
+                }
+            };
+            events::RequestReceivedEvent {}.emit();
+            let mut response = match result {
+                Ok(res) if res.status().is_success() => {
+                    let status = res.status();
+                    let response_headers = header_utils::preserve_response_headers(res.headers());
+                    self.create_monitored_streaming_response(
+                        res.bytes_stream(),
+                        status,
+                        None,
+                        false,
+                        Some(response_headers),
+                        prefill.clone(),
+                        decode.clone(),
+                        prefill_pending,
+                    )
+                }
+                Ok(res) => {
+                    self.handle_decode_error_response(res, &context, prefill.clone(), decode.clone())
+                        .await
+                }
+                Err(e) => {
+                    decode.record_outcome(false);
+                    error::bad_gateway(
+                        "decode_server_error",
+                        format!("Decode server error: {}", e),
+                    )
+                }
+            };
+            response.extensions_mut().insert(BreakerOutcomesRecorded);
+            return (response, Some(decode));
+        }
+
         // Run both in this handler task (not a detached tokio::spawn) so a client
         // disconnect cancels the pending decode request too, keeping the
         // upstream-cancel behavior from #19524.
@@ -830,8 +1042,7 @@ impl PDRouter {
             prefill.record_outcome(prefill_ok);
 
             // Status-faithful error shaping (4xx forwarded, transport/5xx -> 502).
-            let mut response = match self
-                .process_prefill_response(prefill_result, prefill.url(), false)
+            let mut response = match Self::process_prefill_response(prefill_result, prefill.url(), false)
                 .await
             {
                 Err(error_response) => error_response,
@@ -927,21 +1138,19 @@ impl PDRouter {
 
                 // Process prefill response
                 let prefill_body = if context.return_logprob {
-                    match self
-                        .process_prefill_response(
-                            prefill_result,
-                            prefill.url(),
-                            context.return_logprob,
-                        )
-                        .await
+                    match Self::process_prefill_response(
+                        prefill_result,
+                        prefill.url(),
+                        context.return_logprob,
+                    )
+                    .await
                     {
                         Ok((_, body)) => body,
                         Err(error_response) => return error_response,
                     }
                 } else {
                     // Even if we don't need logprobs, we should check prefill status
-                    match self
-                        .process_prefill_response(prefill_result, prefill.url(), false)
+                    match Self::process_prefill_response(prefill_result, prefill.url(), false)
                         .await
                     {
                         Ok((_, body)) => body,
@@ -1217,6 +1426,23 @@ impl PDRouter {
         prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
     ) -> Response {
+        self.create_monitored_streaming_response(
+            stream, status, prefill_logprobs, return_logprob, headers, prefill, decode, None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_monitored_streaming_response(
+        &self,
+        stream: impl futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
+        status: StatusCode,
+        prefill_logprobs: Option<Value>,
+        return_logprob: bool,
+        headers: Option<HeaderMap>,
+        prefill: Arc<dyn Worker>,
+        decode: Arc<dyn Worker>,
+        mut prefill_pending: Option<BoxFuture<'static, Result<(), Response>>>,
+    ) -> Response {
         use crate::core::AttachedBody;
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1246,6 +1472,21 @@ impl PDRouter {
             loop {
                 tokio::select! {
                     biased;
+                    result = async { prefill_pending.as_mut().unwrap().await },
+                        if prefill_pending.is_some() => {
+                        prefill_pending = None;
+                        if let Err(response) = result {
+                            // Headers are committed: report failure in the SSE
+                            // stream, then drop decode without blaming its breaker.
+                            let payload = json!({"error": {
+                                "message": "Prefill failed during PD streaming",
+                                "type": "prefill_server_error",
+                                "status": response.status().as_u16(),
+                            }});
+                            let _ = tx.send(Ok(bytes::Bytes::from(format!("data: {payload}\n\n"))));
+                            break;
+                        }
+                    }
                     chunk_result = tracked.next() => {
                         match chunk_result {
                             Some(Ok(chunk)) => {
@@ -1365,9 +1606,44 @@ impl PDRouter {
         }
     }
 
+    #[allow(clippy::type_complexity)]
+    async fn process_prefill_token_response(
+        result: Result<reqwest::Response, reqwest::Error>,
+        url: &str,
+        first_token: Option<(tokio::sync::mpsc::UnboundedSender<Result<bytes::Bytes, Response>>,
+            Arc<std::sync::atomic::AtomicU8>)>,
+    ) -> Result<(StatusCode, Option<bytes::Bytes>), Response> {
+        let Some((sender, sent)) = first_token else {
+            return Self::process_prefill_response(result, url, false).await;
+        };
+        let response = match result {
+            Ok(response) if response.status().is_success() => response,
+            other => return Self::process_prefill_response(other, url, false).await,
+        };
+        let status = response.status();
+        let mut stream = response.bytes_stream();
+        let mut pending = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| error::bad_gateway("prefill_stream_error", e.to_string()))?;
+            if sent.load(std::sync::atomic::Ordering::Acquire) != 0 { continue; }
+            pending.extend_from_slice(&chunk);
+            while let Some(end) = memmem::find(&pending, b"\n\n") {
+                let frame: Vec<u8> = pending.drain(..end + 2).collect();
+                if Self::native_single_token_frame(&frame) {
+                    if sent.compare_exchange(0, 1, std::sync::atomic::Ordering::AcqRel,
+                        std::sync::atomic::Ordering::Acquire).is_ok() {
+                        let _ = sender.send(Ok(frame.into()));
+                    }
+                    pending.clear();
+                    break;
+                }
+            }
+        }
+        Ok((status, None))
+    }
+
     // Helper to process prefill response and extract body if needed for logprobs
     async fn process_prefill_response(
-        &self,
         prefill_result: Result<reqwest::Response, reqwest::Error>,
         prefill_url: &str,
         return_logprob: bool,
@@ -1893,6 +2169,135 @@ mod tests {
         Box::new(worker)
     }
 
+    #[tokio::test]
+    async fn test_prefill_token_arrives_before_decode_headers() {
+        use axum::{routing::post, Router};
+        let release_decode = Arc::new(tokio::sync::Notify::new());
+        let gate = release_decode.clone();
+        let first = "data: {\"text\":\"A\",\"meta_info\":{\"completion_tokens\":1,\"finish_reason\":null}}\n\n";
+        let second = "data: {\"text\":\"AB\",\"meta_info\":{\"completion_tokens\":2,\"finish_reason\":null}}\n\ndata: [DONE]\n\n";
+        let app = Router::new()
+            .route("/prefill/generate", post(move || async move {
+                Body::from_stream(futures_util::stream::once(async move {
+                    Ok::<_, std::io::Error>(bytes::Bytes::from_static(first.as_bytes()))
+                }).chain(futures_util::stream::pending()))
+            }))
+            .route("/decode/generate", post(move || {
+                let gate = gate.clone();
+                async move {
+                    gate.notified().await;
+                    format!("{first}{second}")
+                }
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let router = create_test_pd_router();
+        let prefill: Arc<dyn Worker> = Arc::from(create_test_worker(
+            format!("http://{addr}/prefill"), WorkerType::Prefill { bootstrap_port: None }, true));
+        let decode: Arc<dyn Worker> = Arc::from(create_test_worker(
+            format!("http://{addr}/decode"), WorkerType::Decode, true));
+        let context = PDRequestContext { route: "/generate", batch_size: None,
+            is_stream: true, return_logprob: false, request_text: None,
+            model_id: None, headers: None };
+        let mut headers = HeaderMap::new();
+        headers.insert("x-sglang-pd-prefill-first-token", HeaderValue::from_static("true"));
+        let (response, _) = tokio::time::timeout(Duration::from_secs(2),
+            router.execute_dual_dispatch_internal(Some(&headers), json!({"text":"prompt", "stream":true}),
+                context, prefill, Some(decode), Instant::now())).await
+            .expect("first token must not wait for decode headers");
+        assert_eq!(response.headers()["x-sglang-pd-first-token-source"], "prefill");
+        let mut body = response.into_body().into_data_stream();
+        assert_eq!(body.next().await.unwrap().unwrap(), first.as_bytes());
+        release_decode.notify_one();
+        let rest = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut bytes = Vec::new();
+            while let Some(chunk) = body.next().await { bytes.extend_from_slice(&chunk.unwrap()); }
+            bytes
+        }).await.unwrap();
+        assert_eq!(rest, second.as_bytes());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_stream_starts_before_prefill_and_reports_late_prefill_failure() {
+        check_prefill_streaming_failure(false).await;
+    }
+
+    #[tokio::test]
+    async fn test_prefill_failure_before_decode_returns_http_error() {
+        check_prefill_streaming_failure(true).await;
+    }
+
+    async fn check_prefill_streaming_failure(fail_before_decode: bool) {
+        use axum::{routing::post, Router};
+        use futures_util::stream;
+        use tokio::sync::Notify;
+
+        let release_prefill = Arc::new(Notify::new());
+        let gate = release_prefill.clone();
+        let app = Router::new()
+            .route("/prefill/generate", post(move || {
+                let gate = gate.clone();
+                async move {
+                    gate.notified().await;
+                    (StatusCode::SERVICE_UNAVAILABLE, "prefill failed")
+                }
+            }))
+            .route("/decode/generate", post(move || async move {
+                if fail_before_decode {
+                    std::future::pending::<()>().await;
+                }
+                Body::from_stream(
+                    stream::once(async {
+                        Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"data: {\"text\":\"first\"}\n\n"))
+                    }).chain(stream::pending()),
+                )
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let router = create_test_pd_router();
+        let prefill: Arc<dyn Worker> = Arc::from(create_test_worker(
+            format!("http://{addr}/prefill"),
+            WorkerType::Prefill { bootstrap_port: None }, true,
+        ));
+        let decode: Arc<dyn Worker> = Arc::from(create_test_worker(
+            format!("http://{addr}/decode"), WorkerType::Decode, true,
+        ));
+        let context = PDRequestContext {
+            route: "/generate", batch_size: None, is_stream: true,
+            return_logprob: false, request_text: None, model_id: None, headers: None,
+        };
+        if fail_before_decode {
+            release_prefill.notify_one();
+        }
+        let (response, _) = tokio::time::timeout(Duration::from_secs(2),
+            router.execute_dual_dispatch_internal(
+                None, json!({"text": "hello", "stream": true}), context,
+                prefill, Some(decode), Instant::now(),
+            ),
+        ).await.expect("decode headers must not wait for prefill");
+        if fail_before_decode {
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            server.abort();
+            return;
+        }
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.extensions().get::<BreakerOutcomesRecorded>().is_some());
+        let mut body = response.into_body().into_data_stream();
+        let first = tokio::time::timeout(Duration::from_secs(2), body.next())
+            .await.unwrap().unwrap().unwrap();
+        assert!(String::from_utf8_lossy(&first).contains("first"));
+        release_prefill.notify_one();
+        let failure = tokio::time::timeout(Duration::from_secs(2), body.next())
+            .await.unwrap().unwrap().unwrap();
+        assert!(String::from_utf8_lossy(&failure).contains("prefill_server_error"));
+        assert!(tokio::time::timeout(Duration::from_secs(2), body.next())
+            .await.unwrap().is_none());
+        server.abort();
+    }
+
     #[test]
     fn test_chat_request_text_uses_full_conversation() {
         // Regression test for https://github.com/sgl-project/sglang/issues/26263
@@ -2111,7 +2516,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_streaming_load_tracking() {
-        use futures_util::StreamExt;
+        use futures_util::{future::BoxFuture, StreamExt};
         use tokio::time::{sleep, Duration};
 
         let router = create_test_pd_router();

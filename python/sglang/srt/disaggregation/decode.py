@@ -44,6 +44,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
+from sglang.srt.observability.pd_timing import log_pd_timing
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.base import KVPoll
@@ -931,6 +932,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # request owns a host KV backup that `retracted_queue` releases, and by
         # this point carries none of the markers `is_unadmitted_reject` reads,
         # so take the caller's word for it rather than sniffing.
+        log_pd_timing(req, "d_pending_queue_enter", retracted=is_retracted, rebootstrap=is_rebootstrap)
         if not is_retracted and not is_rebootstrap and is_unadmitted_reject(req):
             self.scheduler.retire_unadmitted_request(req)
             return
@@ -1263,6 +1265,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             elif poll == KVPoll.WaitingForInput:
                 decode_req.waiting_for_input = True
                 decode_req.req.time_stats.set_bootstrap_done_time()
+                log_pd_timing(decode_req.req, "d_bootstrap_done")
             elif poll == KVPoll.Failed:
                 error_message = f"Decode handshake failed for request rank={self.tp_rank} {decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
                 is_propagated = False
@@ -1760,6 +1763,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 assert decode_req.metadata_buffer_index is not None
                 decode_req.awaiting_publish = True
                 decode_req.req.time_stats.set_decode_transfer_queue_entry_time()
+                log_pd_timing(decode_req.req, "d_transfer_queue_enter")
                 # Counted as published until extend(): a later allocation in this
                 # loop must not compact (move) pages the publish will read back.
                 self._num_published_destinations += 1
@@ -2133,6 +2137,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if not metadata_buffer_preassigned:
             # Deferred publishes record this when the transfer queue takes the request.
             decode_req.req.time_stats.set_decode_transfer_queue_entry_time()
+            log_pd_timing(decode_req.req, "d_transfer_queue_enter")
 
     def _pre_alloc_host(self, decode_req: DecodeRequest) -> bool:
         seq_len = len(decode_req.req.origin_input_ids)
@@ -3214,6 +3219,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         decode_req.kv_receiver.clear()
         decode_req.kv_receiver = None
         decode_req.req.time_stats.set_wait_queue_entry_time()
+        log_pd_timing(decode_req.req, "d_kv_committed")
         return
 
     def _pollers(self) -> list:
@@ -4014,6 +4020,8 @@ class SchedulerDisaggregationDecodeMixin:
             return None
 
         set_time_batch(can_run_list, "set_forward_entry_time")
+        for req in can_run_list:
+            log_pd_timing(req, "d_batch_scheduled", batch_requests=len(can_run_list))
 
         # construct a schedule batch with those requests and mark as decode
         new_batch = ScheduleBatch.init_new(

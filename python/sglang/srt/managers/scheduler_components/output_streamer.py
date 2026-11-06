@@ -18,6 +18,7 @@ from typing import (
 import torch
 import zmq
 
+from sglang.srt.observability.pd_timing import log_pd_timing
 from sglang.srt.beam_search.output import (
     beam_completion_tokens,
     pack_beam_search_output,
@@ -609,6 +610,15 @@ class _GenerationStreamAccumulator:
         if not should_output:
             return
 
+        if (req.send_token_offset == 0 and req.output_ids_through_stop) or req.finished():
+            log_pd_timing(
+                req,
+                "scheduler_output_submit",
+                role=self.disaggregation_mode.value,
+                first_output=req.send_token_offset == 0 and bool(req.output_ids_through_stop),
+                completion_tokens=len(req.output_ids_through_stop),
+                finished=req.finished(),
+            )
         send_token_offset = req.send_token_offset
         send_output_token_logprobs_offset = req.send_output_token_logprobs_offset
         self.rids.append(req.rid)
