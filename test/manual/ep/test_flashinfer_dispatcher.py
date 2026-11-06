@@ -45,7 +45,8 @@ def assert_exact(actual, expected):
 
 
 class Round(NamedTuple):
-    """What one dispatch and combine produced, copied out of the workspace."""
+    """What one dispatch and combine produced; the dispatch output is copied out of
+    the workspace."""
 
     round_index: int
     dispatch_output: FlashinferDispatchOutput
@@ -60,8 +61,7 @@ def mark_columns(marks):
 
 
 def uneven_token_counts(world_size, num_tokens):
-    """Token counts as DP ranks with uneven batches have them: EMPTY_RANK has no
-    tokens, SHORT_RANK has num_tokens - 1 and the others num_tokens."""
+    """Token counts as DP ranks with uneven batches have them."""
     counts = [num_tokens] * world_size
     counts[EMPTY_RANK] = 0
     counts[SHORT_RANK] = num_tokens - 1
@@ -178,7 +178,8 @@ class TestFlashinferDispatcher(CustomTestCase):
         # In the payload too, so a check can pair each payload row with its weight.
         hidden_states[:, 0], hidden_states[:, 1] = mark_columns(marks)
         topk_output = StandardTopKOutput(
-            topk_weights=marks.unsqueeze(1),
+            # A copy, so a dispatch that writes to it cannot change the expected marks.
+            topk_weights=marks.unsqueeze(1).clone(),
             topk_ids=torch.full(
                 (num_tokens, 1), target_rank, dtype=torch.int32, device="cuda"
             ),
