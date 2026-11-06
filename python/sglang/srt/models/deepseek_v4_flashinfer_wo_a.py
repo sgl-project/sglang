@@ -1,9 +1,9 @@
 """DeepSeek-V4.1 MegaAttention ``wo_a`` (``bhr,hdr->bhd``) on FlashInfer's SM107 batched MXFP8 GEMM.
 
-FlashMLA's prefill writes its output scales in FlashInfer's 128x4 layout (``out_sf_flashinfer_layout``)
+FlashMLA's prefill writes its output scales in the 128x4-swizzled scale layout (``out_sf_swizzled_128x4``)
 and ``flashinfer.bmm_mxfp8(backend="cute-dsl")`` runs the head groups in one launch, writing the FP8
 result and its 128x4 scales straight into ``wo_b``'s input. The output bytes equal DeepGEMM's
-``fp8_einsum`` with a FlashInfer-layout output pair.
+``fp8_einsum`` with a 128x4-swizzled output pair.
 """
 
 import functools
@@ -23,19 +23,19 @@ def _available() -> bool:
         import flashinfer
 
         from sglang.kernels.ops.attention.flash_mla_interface import (
-            MEGA_PREFILL_FLASHINFER_SF,
+            MEGA_PREFILL_SWIZZLED_SF,
         )
     except ImportError:
         return False
     return (
-        MEGA_PREFILL_FLASHINFER_SF
+        MEGA_PREFILL_SWIZZLED_SF
         and "out_scale" in inspect.signature(flashinfer.bmm_mxfp8).parameters
         and get_device_sm() == 107
     )
 
 
 def flashinfer_wo_a_enabled(rows: int, device: torch.device) -> bool:
-    """Whether a MegaAttention prefill of ``rows`` tokens should hand FlashInfer-layout scales to wo_a."""
+    """Whether a MegaAttention prefill of ``rows`` tokens should hand 128x4-swizzled scales to wo_a."""
     return (
         envs.SGLANG_OPT_DSV41_FLASHINFER_WO_A.get()
         and device.type == "cuda"
@@ -46,8 +46,8 @@ def flashinfer_wo_a_enabled(rows: int, device: torch.device) -> bool:
     )
 
 
-def scales_in_flashinfer_layout(o_s: torch.Tensor) -> bool:
-    # FlashMLA returns FlashInfer-layout scales as a [s_q, groups, words] view with stride(0) != 1;
+def scales_swizzled_128x4(o_s: torch.Tensor) -> bool:
+    # FlashMLA returns 128x4-swizzled scales as a [s_q, groups, words] view with stride(0) != 1;
     # its default (DeepGEMM) layout is contiguous along s_q.
     return o_s.stride(0) != 1
 

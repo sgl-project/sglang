@@ -185,7 +185,7 @@ from sglang.srt.models.deepseek_common.utils import (
 )
 from sglang.srt.models.deepseek_v4_flashinfer_wo_a import (
     flashinfer_wo_a_einsum,
-    scales_in_flashinfer_layout,
+    scales_swizzled_128x4,
     wo_a_scale_to_flashinfer,
 )
 from sglang.srt.models.deepseek_v4_mhc import MHC_POST_MULT_VALUE
@@ -1692,7 +1692,7 @@ class MQALayer(MqaAttentionBase):
                 data.device,
                 flashinfer=deepgemm_pair_takes_flashinfer(),
             )
-        if scales_in_flashinfer_layout(o_s):
+        if scales_swizzled_128x4(o_s):
             if self._mega_wo_a_flashinfer_scale is None:
                 self._mega_wo_a_flashinfer_scale = wo_a_scale_to_flashinfer(
                     *self.mega_wo_a

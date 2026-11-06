@@ -122,7 +122,7 @@ class DeepseekV4MegaAttnBackend(DeepseekV4AttnBackend):
             attn_sink=attn_sink,
             topk_length=topk_length,
             use_legacy=not self._swa_interleaved,
-            out_sf_flashinfer_layout=self._swa_interleaved
+            out_sf_swizzled_128x4=self._swa_interleaved
             and flashinfer_wo_a_enabled(q.shape[0], q.device),
         )
         return data, scale

@@ -1,4 +1,4 @@
-"""wo_a on FlashInfer's SM107 batched MXFP8 GEMM, fed by FlashMLA's FlashInfer-layout scales, gives the same
+"""wo_a on FlashInfer's SM107 batched MXFP8 GEMM, fed by FlashMLA's 128x4-swizzled scales, gives the same
 bytes as DeepGEMM's fp8_einsum on FlashMLA's default scales."""
 
 import unittest
@@ -20,10 +20,10 @@ GROUPS, RANK = 8, 1024
 
 @unittest.skipUnless(
     torch.cuda.is_available() and fi_wo_a._available(),
-    "needs CC 10.7, FlashMLA's out_sf_flashinfer_layout and flashinfer.bmm_mxfp8(out_scale=...)",
+    "needs CC 10.7, FlashMLA's out_sf_swizzled_128x4 and flashinfer.bmm_mxfp8(out_scale=...)",
 )
 class TestFlashInferWoA(CustomTestCase):
-    def _attention(self, rows, flashinfer_layout):
+    def _attention(self, rows, swizzled):
         g = torch.Generator(device="cuda").manual_seed(rows)
         h_q, d_qk, s_kv = 64, 512, 4096
         q = torch.randn(
@@ -49,7 +49,7 @@ class TestFlashInferWoA(CustomTestCase):
             d_qk**-0.5,
             attn_sink=sink,
             use_legacy=False,
-            out_sf_flashinfer_layout=flashinfer_layout,
+            out_sf_swizzled_128x4=swizzled,
         )
         return data, scale
 
@@ -63,8 +63,8 @@ class TestFlashInferWoA(CustomTestCase):
         for rows in (128, 512, 4096):
             data, scale = self._attention(rows, False)
             data_fi, scale_fi = self._attention(rows, True)
-            self.assertFalse(fi_wo_a.scales_in_flashinfer_layout(scale))
-            self.assertTrue(fi_wo_a.scales_in_flashinfer_layout(scale_fi))
+            self.assertFalse(fi_wo_a.scales_swizzled_128x4(scale))
+            self.assertTrue(fi_wo_a.scales_swizzled_128x4(scale_fi))
 
             y_ref, sf_ref = empty_deepgemm_mxfp8_pair(
                 rows, GROUPS * RANK, "cuda", flashinfer=True
