@@ -36,7 +36,7 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.arg_groups.platform_hook import (
     handle_sail_attention_backend_compatibility,
 )
-from sglang.srt.configs.model_config import uses_kda_attention
+from sglang.srt.configs.model_config import is_kimi_k3, uses_kda_attention
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
@@ -346,8 +346,23 @@ def handle_linear_attn_backend(server_args: Any):
             "(FlashKDA stays on prefill)."
         )
 
+    # The opt-in Kimi fused consumer owns an FP32 pool. Its uncovered
+    # shapes use Triton; the separate recurrent FlashInfer API stays BF16.
+    fp32_kimi_fused_decode = False
     if (
         decode == "flashinfer"
+        and cfg.mamba_ssm_dtype == "float32"
+        and cfg.speculative_algorithm is None
+        and cfg.linear_attn_verify_backend != "flashinfer"
+        and get_platform().is_cuda
+        and torch.cuda.get_device_capability() in ((10, 0), (10, 3))
+    ):
+        hf_config = model_config_of(server_args).hf_config
+        fp32_kimi_fused_decode = is_kimi_k3(hf_config) and uses_kda_attention(hf_config)
+
+    if (
+        decode == "flashinfer"
+        and not fp32_kimi_fused_decode
         and cfg.mamba_ssm_dtype != "bfloat16"
         and get_platform().is_cuda
         and torch.cuda.get_device_capability()[0] >= 10
@@ -360,7 +375,17 @@ def handle_linear_attn_backend(server_args: Any):
 
     verify = cfg.linear_attn_verify_backend
     if verify is None and decode == "flashinfer":
-        verify = "flashinfer"
+        if fp32_kimi_fused_decode:
+            # NoSpec does not need recurrent FI verify, whose state is BF16.
+            # Publish the choice too, so backend construction sees this value.
+            declare_resolution(
+                server_args,
+                "_handle_linear_attn_backend",
+                linear_attn_verify_backend="triton",
+            )
+            verify = "triton"
+        else:
+            verify = "flashinfer"
     if (
         pp_spec_stable_rows_enabled()
         and verify == "flashinfer"

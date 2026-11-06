@@ -8,6 +8,7 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
+from sglang.srt.configs.model_config import is_kimi_k3, uses_kda_attention
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear.kda_prefill_graph import (
@@ -487,7 +488,26 @@ class KDAAttnBackend(MambaAttnBackendBase):
     prefill_graph_metadata: Optional[KDAPrefillGraphMetadata] = None
 
     def _create_kernel_dispatcher(self, backends):
-        return KDAKernelDispatcher(backends.decode, backends.prefill, backends.verify)
+        decode_backend = backends.decode
+        if (
+            decode_backend.is_flashinfer()
+            and get_exec().mamba.mamba_ssm_dtype == "float32"
+            and get_spec().speculative_algorithm is None
+            and self.state_pool.mamba_cache.temporal.dtype == torch.float32
+            and get_platform().is_cuda
+            and torch.cuda.get_device_capability() in ((10, 0), (10, 3))
+        ):
+            model_config = getattr(self._model_runner, "model_config", None)
+            if (
+                model_config is not None
+                and is_kimi_k3(model_config.hf_config)
+                and uses_kda_attention(model_config.hf_config)
+            ):
+                # Fused FI is selected before this fallback dispatcher. The
+                # recurrent FI API needs BF16 and is not needed by this route;
+                # do not import/probe it for an FP32 Kimi pool.
+                decode_backend = LinearAttnKernelBackend.TRITON
+        return KDAKernelDispatcher(decode_backend, backends.prefill, backends.verify)
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
