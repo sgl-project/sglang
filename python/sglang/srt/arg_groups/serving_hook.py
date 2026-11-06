@@ -14,15 +14,14 @@ from sglang.srt.arg_groups.model_override_base import model_config_of, resolving
 from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
+from sglang.srt.multimodal.media_io import configure_media_url_security
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.sampling.watermarking.config import load_watermark_config
-from sglang.srt.utils.common import (
-    configure_media_url_security,
+from sglang.srt.utils.device import (
     get_device,
     is_gfx95_supported,
     is_mnnvl_fabric_device,
 )
-from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
 
@@ -243,7 +242,7 @@ def handle_grammar_backend(server_args: Any):
 
 def handle_debug_utils(server_args: Any):
     cfg = resolving_view(server_args)
-    if is_in_ci() and cfg.soft_watchdog_timeout is None:
+    if envs.SGLANG_IS_IN_CI.get() and cfg.soft_watchdog_timeout is None:
         logger.info("Set soft_watchdog_timeout since in CI")
         declare_resolution(
             server_args, "_handle_debug_utils", soft_watchdog_timeout=300

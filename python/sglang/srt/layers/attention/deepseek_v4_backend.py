@@ -36,6 +36,7 @@ from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
     gather_dequant_requant_fp8_paged_dsv4,
 )
 from sglang.kernels.ops.attention.dsv4.index_logits import (
+    deep_gemm_paged_varlen,
     flat_index_logits_row_alignment,
 )
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
@@ -151,7 +152,7 @@ from sglang.srt.speculative.ragged_verify import (
     read_ragged_verify_mode,
 )
 from sglang.srt.utils import ceil_align, is_cuda, is_xpu
-from sglang.srt.utils.common import async_h2d
+from sglang.srt.utils.device import async_h2d
 
 if TYPE_CHECKING:
     from flash_mla.flash_mla_interface import FlashMLASchedMeta
@@ -1618,6 +1619,8 @@ class DeepseekV4AttnBackend(
             use_prefill_cuda_graph=use_prefill_cuda_graph,
             compress_ratio=compress_ratio,
             rows_per_request=rows_per_request,
+            # The dsv41 low-ratio indexers call deep_gemm_fp4_paged_mqa_logits.
+            deep_gemm_varlen=compress_ratio != 4 and deep_gemm_paged_varlen(),
         )
 
     def init_forward_metadata_decode(
@@ -2620,10 +2623,10 @@ class DeepseekV4AttnBackend(
                     ).to(torch.int32)
                 )
 
-            # Refresh low-ratio source metadata from the live decode inputs.
-            if (
-                metadata.core_metadata.low_ratios
-                and forward_batch.forward_mode.is_decode()
+            # Refresh low-ratio source metadata from the live decode or verify inputs.
+            if metadata.core_metadata.low_ratios and (
+                forward_batch.forward_mode.is_decode()
+                or forward_batch.forward_mode.is_target_verify()
             ):
                 metadata.low_ratio_req_indices = token_req_indices(forward_batch)
                 metadata.low_ratio_pos_i64 = forward_batch.positions.to(torch.int64)
