@@ -3,11 +3,11 @@ on:
   schedule:
     - cron: '0 16 * * *'  # Execute at 0:00 a.m. Beijing Time every day
   # Uncomment to trigger the nightly pipeline from a PR that modifies this workflow.
-  # pull_request:
-  #   branches:
-  #     - main
-  #   paths:
-  #     - ".github/workflows/nightly-test-npu.yml"
+  pull_request:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/nightly-test-npu.yml"
   workflow_dispatch:
     inputs:
       ref:
@@ -353,7 +353,7 @@ jobs:
           #   prefill_size: 2
           #   decode_size: 2
           #   router_size: 1
-          #   test_case: test/registered/npu/accuracy/deepseek_v4_pro/test_npu_deepseek_v4_pro_0813_w4a8_1p1d_32p_gpqa.py
+          #   test_case: test/registered/npu/accuracy/deepseek_v4_pro/test_npu_deepseek_v4_pro_w4a8_1p1d_32p_gpqa.py
           #   test_type: 'accuracy'
           #   prefill_decode_deployment: 'separation'
           # glm_5_2 accuracy tests (2 prefill + 2 decode nodes)
@@ -373,7 +373,7 @@ jobs:
           #   prefill_decode_deployment: 'separation'
     uses: ./.github/workflows/nightly-test-npu-e2e-multi-node.yml
     with:
-      runner: linux-amd64-cpu-4
+      runner: linux-amd64-cpu-test-8
       test_type: ${{ matrix.test_config.test_type || 'perf' }}
       test_config_name: ${{ matrix.test_config.name }}
       prefill_size: ${{ matrix.test_config.prefill_size }}
@@ -420,14 +420,14 @@ jobs:
             test_type: 'perf'
     uses: ./.github/workflows/nightly-test-npu-e2e-multi-node.yml
     with:
-      runner: linux-amd64-cpu-4
+      runner: linux-amd64-cpu-test-8
       test_type: ${{ matrix.test_config.test_type || 'perf' }}
       test_config_name: ${{ matrix.test_config.name }}
       node_size: ${{ matrix.test_config.node_size }}
       test_case: ${{ matrix.test_config.test_case }}
       image: ${{ needs.set-image-config.outputs.image_a3 }}
       install_sglang_from_source: false
-      prefill_decode_deployment: 'mix'
+      prefill_decode_deployment: 'separation'
       transformers_version: ''
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
 
