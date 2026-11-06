@@ -13,7 +13,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cuda_ci(est_time=60, stage="nightly", runner_config="1-gpu-small")
 # backend-specific: the HIP build of the Triton LoRA kernels serving an adapter
 # that arrived as serialized tensors, checked by the exact-text oracle.
-register_amd_ci(est_time=90, suite="extra-a-test-1-gpu-large-amd")
+register_amd_ci(est_time=90, suite="nightly-amd-1-gpu", nightly=True)
 
 MODEL_PATH = "Qwen/Qwen3-0.6B"
 LORA_REPO = "charent/self_cognition_Alice"
