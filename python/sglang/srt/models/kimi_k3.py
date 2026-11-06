@@ -2004,6 +2004,7 @@ class KimiK3DeltaAttention(nn.Module):
                 self._kda_hip_fused_decode_ready = True
             return
         layer = self.attn
+        layer._k3_flashinfer_fused_decode = None
         w = layer.conv_weights
         if _is_npu:
             return
@@ -2051,6 +2052,22 @@ class KimiK3DeltaAttention(nn.Module):
             self.o_norm.weight.data.float().contiguous(),
             float(self.o_norm.eps),
         )
+        mamba = get_exec().mamba
+        if (
+            mamba.linear_attn_decode_backend or mamba.linear_attn_backend
+        ) == "flashinfer" and SpeculativeAlgorithm.from_string(
+            get_spec().speculative_algorithm
+        ).is_none():
+            from sglang.srt.layers.attention.linear.kernels.kda_flashinfer_fused import (
+                prepare_fused_kda_decode,
+            )
+
+            layer._k3_flashinfer_fused_decode = prepare_fused_kda_decode(
+                layer._k3_fused_decode_args,
+                layer.dt_bias,
+                has_conv_bias=layer.bias is not None,
+                lower_bound=layer.lower_bound,
+            )
         self._kda_fused_decode_ready = True
 
     def forward_qkvbfg_fused(

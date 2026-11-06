@@ -520,12 +520,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 enable_two_batch_overlap=get_exec().overlap.enable_two_batch_overlap,
                 prefill_cuda_graph_backend=get_exec().graph.cuda_graph_config.prefill.backend,
             )
-        # One-shot; emitted at the first fused-decode interception below.
-        self._fused_override_notice = (
-            "K3 fused KDA decode engaged: --linear-attn-decode-backend "
-            f"{decode_backend} only picks the fallback kernel for shapes "
-            "the fused kernel does not cover."
-        )
+        # One-shot; include the actual fused provider selected below, rather
+        # than inferring it from the requested fallback backend.
+        self._fused_override_notice = str(decode_backend)
         self._fused_chain_verify_fn = None
         if (
             envs.SGLANG_OPT_FUSED_KDA_VERIFY.get()
@@ -916,29 +913,63 @@ class KDAAttnBackend(MambaAttnBackendBase):
                     onorm_gate,
                 )
             ):
-                if self._fused_override_notice is not None:
-                    rank0_log(self._fused_override_notice)
-                    self._fused_override_notice = None
                 w_q_t, w_k_t, w_v_t, conv_bias, a_log, onorm_w, onorm_eps = fused_static
-                core_attn_out = kda_fused_decode.kda_fused_decode(
-                    mixed_qkv,
-                    a,
-                    b[0],
-                    conv_states,
-                    w_q_t,
-                    w_k_t,
-                    w_v_t,
-                    conv_bias,
-                    a_log,
-                    layer.dt_bias,
-                    onorm_gate,
-                    onorm_w,
-                    ssm_states,
-                    cache_indices,
-                    scale=layer.head_k_dim**-0.5,
-                    onorm_eps=onorm_eps,
-                    lower_bound=layer.lower_bound,
+                flashinfer_fused = getattr(layer, "_k3_flashinfer_fused_decode", None)
+                use_flashinfer = (
+                    flashinfer_fused is not None
+                    and flashinfer_fused.covered(
+                        mixed_qkv,
+                        a,
+                        b[0],
+                        conv_states,
+                        ssm_states,
+                        cache_indices,
+                        onorm_gate,
+                    )
                 )
+                if self._fused_override_notice is not None:
+                    provider = (
+                        "FlashInfer (backend=auto)"
+                        if use_flashinfer
+                        else "native CUDA JIT"
+                    )
+                    rank0_log(
+                        f"K3 fused KDA decode provider: {provider}; requested "
+                        f"decode backend: {self._fused_override_notice}."
+                    )
+                    self._fused_override_notice = None
+                if use_flashinfer:
+                    # Do not catch launch errors: either state pool may already
+                    # have been updated, so retrying the native kernel is unsafe.
+                    core_attn_out = flashinfer_fused.run(
+                        mixed_qkv,
+                        a,
+                        b[0],
+                        conv_states,
+                        ssm_states,
+                        cache_indices,
+                        onorm_gate,
+                    )
+                else:
+                    core_attn_out = kda_fused_decode.kda_fused_decode(
+                        mixed_qkv,
+                        a,
+                        b[0],
+                        conv_states,
+                        w_q_t,
+                        w_k_t,
+                        w_v_t,
+                        conv_bias,
+                        a_log,
+                        layer.dt_bias,
+                        onorm_gate,
+                        onorm_w,
+                        ssm_states,
+                        cache_indices,
+                        scale=layer.head_k_dim**-0.5,
+                        onorm_eps=onorm_eps,
+                        lower_bound=layer.lower_bound,
+                    )
                 layer._k3_onorm_consumed = True
                 self._track_mamba_state_decode(
                     forward_batch,
