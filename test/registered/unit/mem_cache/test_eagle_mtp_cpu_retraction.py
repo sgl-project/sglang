@@ -50,7 +50,9 @@ def make_req(indices):
     req.kv = ReqKvInfo(req_pool_idx=0)
     req.origin_input_ids = [1] * (len(indices) + 1)
     req.output_ids = []
-    req_pool = SimpleNamespace(req_to_token=indices.unsqueeze(0).clone())
+    req_pool = SimpleNamespace(
+        req_to_token=indices.unsqueeze(0).clone(), holds_state_slots=False
+    )
     return req, req_pool
 
 
@@ -162,12 +164,12 @@ class TestEagleMtpCpuRetraction(unittest.TestCase):
         req, req_pool = make_req(torch.arange(1, 9))
         req.offload_kv_cache(req_pool, allocator)
         saved = weakref.ref(req.kv.retraction_backup.draft_cpu_tensors[0]["kv"][0][0])
-        discard_kv_cache_backup(req, None, "cpu_tensor")
+        discard_kv_cache_backup(req, None)
         gc.collect()
         self.assertIsNone(req.kv.retraction_backup)
         self.assertIsNone(saved())
         # Idempotent discard: abort/teardown can share this cleanup path.
-        discard_kv_cache_backup(req, None, "cpu_tensor")
+        discard_kv_cache_backup(req, None)
 
     def test_failed_restore_retains_backup_for_cleanup(self):
         target, draft = make_pool(100), make_pool(200)
@@ -181,7 +183,7 @@ class TestEagleMtpCpuRetraction(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "restore"):
                 req.load_kv_cache(req_pool, allocator)
         self.assertIsNotNone(req.kv.retraction_backup)
-        discard_kv_cache_backup(req, None, "cpu_tensor")
+        discard_kv_cache_backup(req, None)
         self.assertIsNone(req.kv.retraction_backup)
 
     def test_class_default_does_not_require_base_constructor(self):
