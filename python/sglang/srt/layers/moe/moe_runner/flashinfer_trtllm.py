@@ -334,6 +334,9 @@ def select_trtllm_routed_body(
         and method.hidden_size == x.shape[-1]
     ) or _flashinfer_lacks_sm107_moe_fixes(x.device):
         return None
+    # The Kimi-K3.1 decode MoE kernels route from the packed top-k themselves.
+    if getattr(layer, "k31_decode_moe", False) and x.shape[0] <= k31.MAX_TOKENS:
+        return None
     try:
         from flashinfer.autotuner import AutoTuner
         from flashinfer.fused_moe.da_moe import DABody
