@@ -49,7 +49,7 @@ class _DispatchIndexer:
         self.selected = "prefill"
         return torch.tensor([1])
 
-    def select_decode_tokens(self, *args, defer_expansion=False):
+    def select_decode_tokens(self, *args, defer_expansion=False, **kwargs):
         self.selected = "decode"
         return torch.tensor([2])
 
@@ -65,6 +65,7 @@ class _DispatchMetadata:
     compress_member_rows = None
     decode_logical_positions = None
     pending_ring_slots = None
+    is_cuda_graph = False
     # Consumed by the real _pending_ring_slots helper the dispatch indexer
     # borrows: one token row owned by request slot 1.
     token_to_batch_idx = torch.zeros(2, dtype=torch.int32)
@@ -185,6 +186,7 @@ class TestQSACompressGroupOOBClampOnRealXpu(unittest.TestCase):
         compressed_k = torch.zeros(3, 1, 8, dtype=torch.float32, device="xpu")
         metadata = SimpleNamespace(
             token_to_kv_pool=SimpleNamespace(
+                get_qsa_compressed_k_buffer=lambda layer_id: compressed_k,
                 set_qsa_compressed_k_buffer=lambda layer_id, loc, val: (
                     compressed_k.__setitem__(loc.long(), val)
                 ),
@@ -194,6 +196,8 @@ class TestQSACompressGroupOOBClampOnRealXpu(unittest.TestCase):
             ),
             is_cuda_graph=False,
             write_locs=torch.arange(3, dtype=torch.long, device="xpu"),
+            write_owner_mask=torch.ones(3, dtype=torch.bool, device="xpu"),
+            local_write_locs=torch.arange(3, dtype=torch.long, device="xpu"),
             compress_group_positions=torch.zeros(3, dtype=torch.long, device="xpu"),
             extend_rope_matrix=None,
         )
@@ -217,6 +221,7 @@ class TestQSACompressGroupOOBClampOnRealXpu(unittest.TestCase):
         reference_k = torch.zeros(1, 1, 8, dtype=torch.float32, device="xpu")
         reference_metadata = SimpleNamespace(
             token_to_kv_pool=SimpleNamespace(
+                get_qsa_compressed_k_buffer=lambda layer_id: reference_k,
                 set_qsa_compressed_k_buffer=lambda layer_id, loc, val: (
                     reference_k.__setitem__(loc.long(), val)
                 ),
@@ -224,6 +229,8 @@ class TestQSACompressGroupOOBClampOnRealXpu(unittest.TestCase):
             compress_member_rows=torch.tensor([5], dtype=torch.long, device="xpu"),
             is_cuda_graph=False,
             write_locs=torch.zeros(1, dtype=torch.long, device="xpu"),
+            write_owner_mask=torch.ones(1, dtype=torch.bool, device="xpu"),
+            local_write_locs=torch.zeros(1, dtype=torch.long, device="xpu"),
             compress_group_positions=torch.zeros(1, dtype=torch.long, device="xpu"),
             extend_rope_matrix=None,
         )
