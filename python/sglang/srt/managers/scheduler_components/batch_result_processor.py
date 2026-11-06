@@ -402,6 +402,16 @@ class SchedulerBatchResultProcessor:
                     # Decode req in a mixed batch, or a retracted req. Keep an
                     # aborted middle chunk in the chunked branch so its logprob
                     # offset is still accounted and it is not streamed.
+                    if batch.forward_mode.is_mixed() and batch.return_logprob:
+                        assert extend_input_len_per_req is not None
+                        assert extend_logprob_start_len_per_req is not None
+                        logprob_pt += (
+                            self.logprob_result_processor.calculate_num_input_logprobs(
+                                req,
+                                extend_input_len_per_req[i],
+                                extend_logprob_start_len_per_req[i],
+                            )
+                        )
                     continue
 
                 if not is_middle_chunk:
