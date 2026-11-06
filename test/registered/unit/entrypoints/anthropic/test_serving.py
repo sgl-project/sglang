@@ -32,6 +32,7 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 class _FakeOpenAIServingChat:
     native_reasoning_history = False
+    reasoning_parser = "qwen3"
 
     def __init__(self, stream_lines=None, chat_template=None):
         self.stream_lines = stream_lines or []
@@ -922,6 +923,16 @@ class TestAnthropicServing(unittest.TestCase):
                 with self.assertRaises(ValidationError) as ctx:
                     self._anthropic_request(thinking=thinking, stream=False)
                 self.assertIn(field, str(ctx.exception))
+
+    def test_request_thinking_adaptive_without_reasoning_parser_is_disabled(self):
+        """Claude Code sends ``thinking.type='adaptive'`` on every request. A
+        server without a reasoning parser must answer without thinking instead
+        of rejecting the request with a 400."""
+        serving = self._serving()
+        serving.openai_serving_chat.reasoning_parser = None
+        request = self._anthropic_request(thinking={"type": "adaptive"}, stream=False)
+        serving._convert_to_chat_completion_request(request)
+        self.assertEqual(serving.openai_serving_chat.apply_reasoning_calls, [False])
 
     def test_request_thinking_display_omitted_logs_warning_but_still_enables(self):
         """Reasoning text cannot be suppressed, so ``omitted`` warns and keeps reasoning on."""
