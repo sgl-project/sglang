@@ -24,7 +24,7 @@ from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.unified_allocator_fixtures import build_test_unified_pools
 
-register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=12, stage="jit-kernel-unit", runner_config="amd")
 
 pytestmark = pytest.mark.skipif(
@@ -652,7 +652,8 @@ def _page_unified_index_pairs(token_count, host_tokens, device_tokens):
     "groups,layers,page_size,heads_per_group,dim",
     [(1, 1, 1, 1, 16), (3, 5, 3, 2, 24), (8, 3, 64, 1, 128)],
 )
-@pytest.mark.parametrize("dtype", [torch.uint8, torch.float16, torch.bfloat16])
+# A byte copy: only the element size reaches the kernel, so bf16 repeats fp16.
+@pytest.mark.parametrize("dtype", [torch.uint8, torch.float16])
 @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("token_count", [0, 1, 8])
 def test_page_unified_load_back(
@@ -716,7 +717,8 @@ def test_page_unified_load_back(
 @pytest.mark.parametrize(
     "layers,page_size,dim", [(1, 1, 16), (5, 3, 512), (3, 64, 576)]
 )
-@pytest.mark.parametrize("dtype", [torch.uint8, torch.float16, torch.bfloat16])
+# A byte copy: only the element size reaches the kernel, so bf16 repeats fp16.
+@pytest.mark.parametrize("dtype", [torch.uint8, torch.float16])
 @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("token_count", [0, 1, 8])
 def test_page_unified_mla_load_back(

@@ -39,6 +39,7 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.hf_transformers import get_hf_text_config
 from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -65,7 +66,6 @@ from sglang.srt.models.utils import AutoWeightsLoader, WeightsMapper
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import get_device
 from sglang.srt.utils.common import direct_register_custom_op
-from sglang.srt.utils.hf_transformers import get_hf_text_config
 
 
 def can_enable_torch_compile(config: PretrainedConfig) -> bool:
