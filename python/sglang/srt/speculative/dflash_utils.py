@@ -9,7 +9,7 @@ from typing import Any, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
-from sglang.kernels.ops.sampling.renorm import top_k_renorm_prob, top_p_renorm_prob
+from sglang.kernels.ops.sampling import argmax as sampling_argmax
 from sglang.kernels.ops.speculative.verify_sampling import (
     tree_speculative_sampling_target_only,
 )
@@ -18,6 +18,7 @@ from sglang.srt.layers.sampler import (
     apply_custom_logit_processor,
     top_p_normalize_probs_torch,
 )
+from sglang.srt.layers.sampling_renorm import top_k_renorm_prob, top_p_renorm_prob
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.runner_utils.pool import borrow_graph_pool
 from sglang.srt.runtime_context import get_spec
@@ -191,7 +192,7 @@ def scale_kv_cell_size_per_token_for_dflash(
 def resolve_dflash_verify_mask_policy(attn_backend: Any) -> tuple[str, bool]:
     from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
     from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
-    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.model_executor.forward_mode import ForwardMode
 
     backend = attn_backend
     for _ in range(4):
@@ -944,17 +945,18 @@ def apply_dflash_simulated_acceptance(
     simulate_acc_token_mode: str,
     next_token_logits: Optional[torch.Tensor] = None,
     fixed_token_id: int = 100,
+    generator: Optional[torch.Generator] = None,
 ) -> None:
     """Forces the DFlash acceptance length (SGLANG_SIMULATE_ACC_LEN benchmark knob).
     ``next_token_logits`` gives the target argmax when ``target_predict`` is None."""
     bs, block_size = candidates.shape
     if simulate_acc_token_mode == "real-draft-token" and target_predict is None:
         # The sampling-verify branch does not materialize the target argmax.
-        target_predict = torch.argmax(next_token_logits, dim=-1).view(bs, block_size)
+        target_predict = sampling_argmax(next_token_logits).view(bs, block_size)
 
     # sample_simulated_acc_len clamps to [1, block_size].
     forced_commit_len = sample_simulated_acc_len(
-        simulate_acc_len, simulate_acc_method, block_size
+        simulate_acc_len, simulate_acc_method, block_size, generator=generator
     )
     forced_accept_len = forced_commit_len - 1
 
@@ -1118,6 +1120,25 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
     return correct_len, bonus
 
 
+@torch.compile(dynamic=True)
+def _adjust_top_p_for_top_k(
+    scaled_topk_logits: torch.Tensor,
+    full_logits: torch.Tensor,
+    top_ps: torch.Tensor,
+    temperatures: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Rescale top-p to retained top-k mass for unseeded sampling."""
+    if temperatures is not None:
+        full_logits = full_logits.float() / temperatures
+    # Retained top-k contains the global maximum, saving a full-vocabulary max pass.
+    # Fusing the shifted sums avoids a full-size exponential intermediate.
+    # FP32 rounding differs from logsumexp and can change top-p boundary membership.
+    max_logits = scaled_topk_logits.amax(dim=-1, keepdim=True)
+    topk_sum = (scaled_topk_logits - max_logits).exp().sum(dim=-1, keepdim=True)
+    full_sum = (full_logits - max_logits).exp().sum(dim=-1, keepdim=True)
+    return torch.clamp(top_ps * (full_sum / topk_sum), max=1.0)
+
+
 def build_speculative_verify_target_probs(
     *,
     next_token_logits: torch.Tensor,
@@ -1128,6 +1149,8 @@ def build_speculative_verify_target_probs(
     uniform_top_k_value: Optional[int] = None,
     use_sparse_topk: bool = True,
 ) -> torch.Tensor:
+    from sglang.srt.utils import is_cuda
+
     device = next_token_logits.device
     need_top_k = bool(getattr(sampling_info, "need_top_k_sampling", True))
     need_top_p = bool(getattr(sampling_info, "need_top_p_sampling", False))
@@ -1152,7 +1175,7 @@ def build_speculative_verify_target_probs(
         elif max_top_k > vocab_size:
             max_top_k = vocab_size
 
-        # Sparse exact path for top-k/top-p (top-k-first semantics), then scatter to dense.
+        # Sparse exact path for joint top-k/top-p filtering, then scatter to dense.
         if 0 < max_top_k < vocab_size:
             topk_logits, topk_indices = torch.topk(scaled_logits, k=max_top_k, dim=-1)
             if uniform_top_k_value is None or int(uniform_top_k_value) != max_top_k:
@@ -1167,7 +1190,18 @@ def build_speculative_verify_target_probs(
                 repeated_top_ps = torch.repeat_interleave(
                     sampling_info.top_ps, draft_token_num, dim=0
                 )
-                topk_probs = _dflash_top_p_renorm_prob(topk_probs, repeated_top_ps)
+                if is_cuda() and getattr(sampling_info, "sampling_seed", None) is None:
+                    adjusted_top_ps = _adjust_top_p_for_top_k(
+                        topk_logits, scaled_logits, repeated_top_ps[:, None]
+                    ).squeeze(-1)
+                else:
+                    # Preserve the existing rounding for seeded sampling and other backends.
+                    topk_mass = torch.exp(
+                        torch.logsumexp(topk_logits, dim=-1)
+                        - torch.logsumexp(scaled_logits, dim=-1)
+                    )
+                    adjusted_top_ps = torch.clamp(repeated_top_ps / topk_mass, max=1.0)
+                topk_probs = _dflash_top_p_renorm_prob(topk_probs, adjusted_top_ps)
 
             target_probs = torch.zeros_like(scaled_logits, dtype=topk_probs.dtype)
             target_probs.scatter_(1, topk_indices, topk_probs)
@@ -1175,15 +1209,15 @@ def build_speculative_verify_target_probs(
 
     if not sparse_topk_applied:
         target_probs = F.softmax(scaled_logits, dim=-1)
-        if need_top_k:
-            target_probs = _dflash_top_k_renorm_prob(
-                target_probs,
-                torch.repeat_interleave(sampling_info.top_ks, draft_token_num, dim=0),
-            )
         if need_top_p:
             target_probs = _dflash_top_p_renorm_prob(
                 target_probs,
                 torch.repeat_interleave(sampling_info.top_ps, draft_token_num, dim=0),
+            )
+        if need_top_k:
+            target_probs = _dflash_top_k_renorm_prob(
+                target_probs,
+                torch.repeat_interleave(sampling_info.top_ks, draft_token_num, dim=0),
             )
     return target_probs.view(bs, draft_token_num, -1).contiguous()
 

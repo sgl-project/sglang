@@ -12,7 +12,10 @@ from sglang.kernels.ops.speculative.dspark.dspark_schedule import (
 )
 from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.environ import InvariantCheckLevel, envs
-from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.dp_attention import (
+    is_dp_attention_enabled,
+    require_mlp_tp_gather,
+)
 from sglang.srt.managers.overlap_utils import (
     CONFIDENCE_RELAY_RING_LAG,
     FutureMap,
@@ -41,7 +44,6 @@ from sglang.srt.speculative.ragged_verify import (
     round_up_grid,
 )
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
-from sglang.srt.utils.common import require_mlp_tp_gather
 from sglang.srt.utils.invariants import (
     Bucket,
     Invariant,

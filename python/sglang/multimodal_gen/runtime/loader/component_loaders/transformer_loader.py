@@ -346,6 +346,12 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
                             "separate AdaLN cache or online AdaLN rebuild"
                         )
 
+        resolve_checkpoint_quantization = getattr(
+            model_cls, "resolve_checkpoint_quantization", None
+        )
+        if resolve_checkpoint_quantization is not None:
+            checkpoint_quant_config = resolve_checkpoint_quantization(safetensors_list)
+
         quant_spec = resolve_transformer_quant_load_spec(
             hf_config=config,
             server_args=component_server_args,
@@ -379,6 +385,11 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
             or cpu_offload_flag
         )
         use_fsdp = server_args.should_use_fsdp_for_component(component_name)
+        if use_fsdp and not getattr(quant_spec.quant_config, "supports_fsdp", True):
+            raise ValueError(
+                f"{quant_spec.quant_config.get_name()} does not support FSDP; "
+                "use TP and/or Ulysses SP"
+            )
         if quant_spec.uses_comfy_layer_markers and use_fsdp:
             raise ValueError(
                 "Comfy quantized checkpoints do not support FSDP "
@@ -499,6 +510,9 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
                 runtime_quant_config=quant_spec.runtime_quant_config,
                 quantized_cpu_load_supported=(
                     quant_spec.gguf_file is not None
+                    or getattr(
+                        quant_spec.quant_config, "supports_quantized_cpu_load", False
+                    )
                     or quant_spec.is_convrot_int8
                     or quant_spec.is_serialized_kitchen_w4a8
                 ),

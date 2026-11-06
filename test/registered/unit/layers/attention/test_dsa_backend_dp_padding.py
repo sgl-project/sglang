@@ -15,7 +15,7 @@ from sglang.srt.layers.dp_attention import DpPaddingMode
 from sglang.srt.layers.moe.utils import MoeA2ABackend
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.router import PlainPoolRouter
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -118,6 +118,8 @@ class TestDSABackendDPPadding(CustomTestCase):
             fake_sparse_fwd,
         )
         backend = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)
+        backend.dsa_shards_index_k = False
+        backend.attn_dcp_size, backend.attn_dcp_rank = 1, 0
         backend.__dict__.update(
             dsa_prefill_impl=implementation,
             use_mha=False,
@@ -205,7 +207,8 @@ class TestDSABackendDPPadding(CustomTestCase):
             device="cpu",
             num_q_heads=2,
             num_dcp_q_heads=2,
-            dcp_size=1,
+            attn_dcp_size=1,
+            dsa_shards_index_k=False,
         )
         backend._pad_topk_indices = MethodType(
             DeepseekSparseAttnBackend._pad_topk_indices, backend

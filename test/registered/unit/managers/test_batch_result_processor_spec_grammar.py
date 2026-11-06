@@ -25,6 +25,7 @@ from sglang.srt.sampling.sampling_params import (
     SamplingParams,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import release_only_retirer
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -93,6 +94,7 @@ def _make_processor() -> SchedulerBatchResultProcessor:
         logprob_result_processor=None,
         output_streamer=SimpleNamespace(),
         beam_coordinator=SimpleNamespace(),
+        request_retirer=release_only_retirer(),
         abort_request=lambda *a, **k: None,
     )
 
@@ -147,7 +149,8 @@ def _commit_disagg_handoff(
             None,
             None,
             torch.tensor([1], dtype=torch.long),
-        )
+        ),
+        get_customized_info=lambda _: None,
     )
     req.bootstrap_host = "127.0.0.1"
     req.bootstrap_room = 1

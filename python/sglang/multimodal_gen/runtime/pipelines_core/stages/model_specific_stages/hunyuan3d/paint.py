@@ -827,11 +827,12 @@ class Hunyuan3DPaintPostprocessStage(PipelineStage):
         return_path = batch.extra["shape_return_path"]
         obj_dir = os.path.dirname(obj_path) or "."
         files_before_export = set(os.listdir(obj_dir))
-        textured_mesh.export(obj_path)
         if self.config.paint_save_glb:
             return_path = os.path.splitext(obj_path)[0] + ".glb"
             textured_mesh.export(return_path)
             self._cleanup_obj_artifacts(obj_path, files_before_export)
+        else:
+            textured_mesh.export(obj_path)
 
         return OutputBatch(output_file_paths=[return_path], metrics=batch.metrics)
 

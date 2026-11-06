@@ -10,12 +10,8 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.kernels.jit.utils import (
-    cache_once,
-    get_jit_cuda_arch,
-    load_jit,
-    make_cpp_args,
-)
+from sglang.kernels.arch import current_arch
+from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -31,8 +27,7 @@ def _jit_causal_conv1d_module(dtype: torch.dtype) -> Module:
     # The AOT wheel ships an SM90 build compiled with `-use_fast_math` and a
     # precise-math build for every other arch; match that split so the SiLU
     # epilogue keeps producing the same bits as the op being replaced.
-    arch = get_jit_cuda_arch()
-    use_fast_math = (arch.major, arch.minor) == (9, 0)
+    use_fast_math = current_arch().is_sm(9, 0)
     math_mode = "fast_math" if use_fast_math else "precise_math"
     args = make_cpp_args(dtype)
     return load_jit(

@@ -25,6 +25,9 @@ from sglang.multimodal_gen.runtime.loader.weight_utils import (
     get_lock,
     safetensors_weights_iterator,
 )
+from sglang.multimodal_gen.runtime.post_training.tensor_update_checker import (
+    compute_tensor_sha256,
+)
 from sglang.multimodal_gen.runtime.weights.source import (
     filter_duplicate_precision_variant_safetensors,
 )
@@ -484,6 +487,16 @@ class TestCheckpointReadFailure(unittest.TestCase):
                             )
                         )
                         torch.testing.assert_close(loaded["weight"], torch.ones(2))
+
+
+class TestPostTrainingTensorChecksum(unittest.TestCase):
+    def test_scalar_bfloat16_tensor_has_sha256_checksum(self):
+        scalar = torch.tensor(1.0, dtype=torch.bfloat16)
+
+        digest = compute_tensor_sha256(scalar)
+
+        self.assertEqual(len(digest), 64)
+        self.assertEqual(digest, compute_tensor_sha256(scalar))
 
 
 if __name__ == "__main__":

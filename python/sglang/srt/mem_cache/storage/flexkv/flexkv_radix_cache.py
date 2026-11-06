@@ -478,7 +478,7 @@ class FlexKVRadixCache(RadixCache):
     # Optional pass-throughs used by the scheduler
     # ------------------------------------------------------------------
 
-    def release_aborted_request(self, handle: CacheRequestHandle) -> None:
+    def _abandon_attempt(self, handle: CacheRequestHandle) -> None:
         """Clean up tracking for an aborted request without invoking FlexKV."""
         self._load_markers.pop(handle, None)
         with self._node_lock:

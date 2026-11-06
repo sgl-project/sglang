@@ -24,7 +24,7 @@ from sglang.srt.layers.layer_boundary.layout import SumGroup
 from sglang.srt.layers.layer_boundary.residual import batch
 from sglang.srt.layers.layer_boundary.residual.add_norm import REPLACE_AT_EXIT
 from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.boundary_fixtures import build_stages
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.communicator_patch import patch_communicator

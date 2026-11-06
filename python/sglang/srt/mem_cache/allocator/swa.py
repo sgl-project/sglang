@@ -9,9 +9,10 @@ from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
+from sglang.srt.mem_cache.utils import get_num_new_pages
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils import is_npu
-from sglang.srt.utils.common import async_h2d, get_num_new_pages
+from sglang.srt.utils.device import async_h2d
 from sglang.srt.utils.invariants import Bucket, Invariant, IsTrue, expect
 
 logger = logging.getLogger(__name__)

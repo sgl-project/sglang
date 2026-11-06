@@ -107,6 +107,21 @@ uv pip install --prerelease=allow --index-strategy unsafe-best-match --extra-ind
 
 </Accordion>
 
+<Accordion title="Optional GEMM backends" id="optional-gemm-backends">
+
+Some GEMM backends ship as optional packages because they are published outside PyPI or target a single GPU generation. The official Docker image installs them when a compatible wheel exists; outside Docker, install the package into the same environment as SGLang.
+
+For example, the HALOps MXFP8 dense GEMM backend (`--fp8-gemm-backend halops`, Blackwell SM100) is published on PaddlePaddle's CUDA 13.2 package page:
+
+```bash Command
+uv pip install halops==0.1.0 \
+  -f https://www.paddlepaddle.org.cn/packages/stable/cu132/halops/
+```
+
+The `halops` wheel is cp312 Linux only (x86_64 and aarch64). When no wheel matches the build platform, the Docker build skips the package instead of failing, and the backend reports that `halops` is missing when selected.
+
+</Accordion>
+
 For `CUDA_HOME` errors, see [Troubleshooting](#cuda_home).
 
 </Tab>

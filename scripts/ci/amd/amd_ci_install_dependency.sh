@@ -38,7 +38,11 @@ if [ -n "$OPTIONAL_DEPS" ]; then
 fi
 
 # Host names look like: linux-mi35x-gpu-1-xxxxx-runner-zzzzz
-if [[ "${HOSTNAME_VALUE}" =~ ^linux-(mi[0-9]+[a-z]*)-gpu-[0-9]+ ]]; then
+# Non-ARC runners have no such hostname and set AMD_CI_GPU_ARCH instead.
+if [[ -n "${AMD_CI_GPU_ARCH:-}" ]]; then
+  GPU_ARCH="${AMD_CI_GPU_ARCH}"
+  echo "Using GPU architecture from AMD_CI_GPU_ARCH: ${GPU_ARCH}"
+elif [[ "${HOSTNAME_VALUE}" =~ ^linux-(mi[0-9]+[a-z]*)-gpu-[0-9]+ ]]; then
   GPU_ARCH="${BASH_REMATCH[1]}"
   echo "Detected GPU architecture from hostname: ${GPU_ARCH}"
 else

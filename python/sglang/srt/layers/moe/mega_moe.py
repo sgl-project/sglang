@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import functools
+import logging
 from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, NamedTuple, Optional
 
@@ -23,6 +24,7 @@ import torch
 
 from sglang.kernels.ops.moe.dsv4 import mega_moe_pre_dispatch
 from sglang.srt.environ import envs
+from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
 from sglang.srt.layers.moe.mega_gate import run_mega_gate, should_use_mega_gate
@@ -43,25 +45,34 @@ if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
 
 
+logger = logging.getLogger(__name__)
+
 _MEGA_MOE_SYMM_BUFFER: dict = {}
 _is_hip = is_hip()
 
 
 def _use_amd_flydsl_mega_moe() -> bool:
-    # aiter MegaMoEv2 exists only on ROCm; the platform check keeps the env from
-    # diverting a CUDA run into a path whose kernels it does not have.
-    return _is_hip and envs.SGLANG_AMD_USE_FLYDSL_MEGA_MOE.get()
+    # DeepGEMM MegaMoE has no ROCm kernels: megamoe on ROCm is aiter MegaMoEv2.
+    return _is_hip and get_moe_a2a_backend().is_megamoe()
 
 
 def _mega_moe_mma_type(experts) -> str:
     if experts._mega_moe_nvfp4:
         return "nvfp4xnvfp4"
     # Per layer: a draft may differ from the target (draft_model_build_scope).
-    return "mxf4xmxf4" if experts._mega_moe_w4a4 else "fp8xfp4"
+    if experts._mega_moe_w4a4:
+        return "mxf4xmxf4"
+    # The kernel dispatches on the weight dtype: E4M3 weights are the W8A8
+    # (fp8xfp8) kind, packed E2M1 weights (int8/uint8) are W4A8.
+    return "fp8xfp8" if experts.w13_weight.dtype == torch.float8_e4m3fn else "fp8xfp4"
 
 
-@functools.lru_cache(maxsize=1)
-def _mega_moe_max_num_sms() -> Optional[int]:
+# Decode/target-verify on sm107: SMs left for the mHC stats stream beside MegaMoE.
+_MEGA_MOE_SM107_DECODE_RESERVED_SMS = 18
+
+
+@functools.cache
+def _mega_moe_max_num_sms(decode_like: bool) -> Optional[int]:
     if _device_sm < 100:
         # The SM90 MegaMoE implementation does not use the whole-grid clustered
         # launch that needs a residency margin.
@@ -70,13 +81,16 @@ def _mega_moe_max_num_sms() -> Optional[int]:
     # Physical count, not deep_gemm.get_num_sms(): two-batch overlap and the DSA
     # indexer reconfigure that process-wide, so reserving on top would compound.
     num_sms = torch.cuda.get_device_properties(device="cuda").multi_processor_count
-    reserved_num_sms = max(envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS.get(), 0)
+    reserved_num_sms = max(
+        envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS.get(),
+        _MEGA_MOE_SM107_DECODE_RESERVED_SMS if decode_like and _device_sm == 107 else 0,
+    )
     return max(2, num_sms - reserved_num_sms)
 
 
 @contextmanager
-def _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
-    max_num_sms = _mega_moe_max_num_sms()
+def _configure_mega_moe_deep_gemm_num_sms(deep_gemm, decode_like: bool = False):
+    max_num_sms = _mega_moe_max_num_sms(decode_like)
     if max_num_sms is None:
         yield
         return
@@ -104,7 +118,7 @@ def check_mega_moe_shapes(hidden: int, intermediate: int, mma_type: str) -> None
     # Flash's 2304-wide intermediate dimension.
     # Keep the existing restrictions on the other MMA paths.
     scale_group = 16 if mma_type == "nvfp4xnvfp4" else 32
-    align = 128 if mma_type == "fp8xfp4" else 16 * scale_group
+    align = 128 if mma_type in ("fp8xfp4", "fp8xfp8") else 16 * scale_group
     hidden_align = 16 * scale_group
     if hidden % hidden_align != 0 or intermediate % align != 0:
         raise ValueError(
@@ -190,14 +204,21 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
     else:
         max_tokens_per_rank = hidden_states.shape[0]
     cap = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
-    return max_tokens_per_rank <= cap
+    if max_tokens_per_rank <= cap:
+        return True
+    assert not getattr(moe.experts, "_mega_moe_weights_localized", False), (
+        f"mega MoE: {max_tokens_per_rank} tokens per rank exceed "
+        f"SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK={cap}; localized "
+        f"weights have no non-mega fallback — raise the env var to cover the "
+        f"per-rank rows"
+    )
+    return False
 
 
 def should_fuse_mega_moe_shared_experts(moe: DeepseekV2MoE) -> bool:
     # DeepGEMM's in-kernel shared expert takes FP8 weights on SM100 fp8xfp4 only.
     return (
-        envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_FUSE_SHARED_EXPERTS.get()
-        and get_moe_a2a_backend().is_megamoe()
+        get_moe_a2a_backend().is_megamoe()
         and getattr(moe.experts, "_mega_moe_weights_built", False)
         and is_sm100_supported()
         and _mega_moe_mma_type(moe.experts) == "fp8xfp4"
@@ -240,9 +261,23 @@ def forward_mega_moe(
 
     shared_output = None if fused_shared else moe._forward_shared_experts(hidden_states)
 
-    with mega_stream_ctx:
+    # MegaMoE counts the layer's EPLB load in-kernel; the router must not count it too.
+    eplb_load_row = _local_eplb_load_row(moe)
+    with (
+        mega_stream_ctx,
+        (
+            get_global_expert_distribution_recorder().disable_this_region()
+            if eplb_load_row is not None
+            else nullcontext()
+        ),
+    ):
         y = _run_mega_routed(
-            moe, hidden_states, forward_batch, input_ids_global, num_tokens
+            moe,
+            hidden_states,
+            forward_batch,
+            input_ids_global,
+            num_tokens,
+            eplb_load_row=eplb_load_row,
         )
 
     if fork_mega_moe:
@@ -270,6 +305,28 @@ def _mega_moe_buffer(moe: DeepseekV2MoE):
         ),
         mma_type=_mega_moe_mma_type(moe.experts),
     )
+
+
+def allocate_mega_moe_buffers(model: torch.nn.Module) -> None:
+    """Allocate the MegaMoE symmetric buffers before the KV cache is sized, so the
+    KV budget charges them like the weights rather than the runtime slack."""
+    if not get_moe_a2a_backend().is_megamoe() or _use_amd_flydsl_mega_moe():
+        return
+    from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
+
+    buffers = {}
+    for module in model.modules():
+        if isinstance(module, DeepseekV2MoE) and is_mega_moe_experts_ready(
+            module.experts
+        ):
+            buf = _mega_moe_buffer(module)
+            buffers[id(buf)] = buf
+    if buffers:
+        logger.info(
+            "MegaMoE symmetric buffers resident before KV cache sizing: "
+            f"{len(buffers)}, "
+            f"{sum(b.buffer.nbytes for b in buffers.values()) / (1 << 30):.2f} GB"
+        )
 
 
 MEGA_MOE_INPUT_TAG = "_mega_moe_input_in_buffer"
@@ -341,22 +398,23 @@ def _run_mega_routed(
     forward_batch: Optional[ForwardBatch],
     input_ids_global: Optional[torch.Tensor],
     num_tokens: int,
+    eplb_load_row: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     hidden_size = moe.config.hidden_size
+    buf = _mega_moe_buffer(moe)
 
     routing = None
     if should_use_mega_gate(moe, hidden_states, forward_batch):
         import deep_gemm
 
-        # Only the fp8xfp4 pre-dispatch can skip its top-k copy (kCopyTopk).
-        buf = (
-            _mega_moe_buffer(moe)
-            if _mega_moe_mma_type(moe.experts) == "fp8xfp4"
-            else None
-        )
         with _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
             routing = run_mega_gate(
-                moe, hidden_states, input_ids_global, buf, forward_batch
+                moe,
+                hidden_states,
+                input_ids_global,
+                # Only the fp8xfp4 pre-dispatch can skip its top-k copy (kCopyTopk).
+                buf if _mega_moe_mma_type(moe.experts) == "fp8xfp4" else None,
+                forward_batch,
             )
 
     if routing is not None:
@@ -393,6 +451,8 @@ def _run_mega_routed(
             else float(moe.routed_scaling_factor)
         )
 
+    mode = forward_batch.forward_mode if forward_batch is not None else None
+    decode_like = mode is not None and (mode.is_decode() or mode.is_target_verify())
     return run_mega_routed_experts(
         moe.experts,
         hidden_states,
@@ -410,6 +470,31 @@ def _run_mega_routed(
         shared_l1_weights=moe.mega_shared_l1_weights,
         shared_l2_weights=moe.mega_shared_l2_weights,
         routing_in_buffer=routing is not None and routing.in_buffer,
+        buf=buf,
+        eplb_load_row=eplb_load_row,
+        decode_like=decode_like,
+    )
+
+
+def _local_eplb_load_row(moe: DeepseekV2MoE) -> Optional[torch.Tensor]:
+    # MegaMoE adds the rows each local expert receives to this rank's slice of the
+    # physical count row; the cross-rank sum at dump time gives the global counts.
+    if (
+        _device_sm == 90
+        or _mega_moe_mma_type(moe.experts) != "fp8xfp4"
+        # Per-rank shared slots are physical experts EPLB does not know about.
+        or moe.num_fused_shared_experts > 0
+    ):
+        return None
+    from sglang.srt.runtime_context import get_parallel
+
+    group = get_parallel().moe_ep_group.device_group
+    return (
+        get_global_expert_distribution_recorder().get_current_pass_local_count_buffer(
+            num_experts=moe.experts.num_experts,
+            ep_rank=group.rank(),
+            ep_size=group.size(),
+        )
     )
 
 
@@ -430,14 +515,15 @@ def run_mega_routed_experts(
     shared_l1_weights=None,
     shared_l2_weights=None,
     routing_in_buffer: bool = False,
+    buf: Optional[SymmBuffer] = None,
+    eplb_load_row: Optional[torch.Tensor] = None,
+    decode_like: bool = False,
 ) -> torch.Tensor:
     # Rows are this rank's tokens; the returned rows are fully combined.
     import deep_gemm
 
     from sglang.srt.runtime_context import get_parallel
 
-    ep_group = get_parallel().moe_ep_group.device_group
-    num_experts = experts.num_experts
     num_max_tokens_per_rank = (
         envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
     )
@@ -449,17 +535,18 @@ def run_mega_routed_experts(
     )
 
     mma_type = _mega_moe_mma_type(experts)
-    buf = _get_mega_moe_symm_buffer(
-        ep_group,
-        num_experts=num_experts,
-        num_max_tokens_per_rank=num_max_tokens_per_rank,
-        num_topk=top_k,
-        hidden=hidden_size,
-        intermediate_hidden=intermediate_size,
-        num_shared_experts=num_shared_experts,
-        mma_type=mma_type,
-        activation=activation,
-    )
+    if buf is None:
+        buf = _get_mega_moe_symm_buffer(
+            get_parallel().moe_ep_group.device_group,
+            num_experts=experts.num_experts,
+            num_max_tokens_per_rank=num_max_tokens_per_rank,
+            num_topk=top_k,
+            hidden=hidden_size,
+            intermediate_hidden=intermediate_size,
+            num_shared_experts=num_shared_experts,
+            mma_type=mma_type,
+            activation=activation,
+        )
 
     if routing_in_buffer:
         assert num_tokens > 0 and _device_sm != 90 and mma_type == "fp8xfp4"
@@ -484,7 +571,9 @@ def run_mega_routed_experts(
             routed_scaling_factor=routed_scaling_factor,
         )
 
-    jit_pre_dispatch = mma_type == "fp8xfp4"
+    # Both FP8 types go through the JIT pre-dispatch below, which folds the scale
+    # in-kernel; scaling here as well would apply it twice.
+    jit_pre_dispatch = mma_type in ("fp8xfp4", "fp8xfp8")
     if routed_scaling_factor != 1.0:
         assert not routing_in_buffer
         if not jit_pre_dispatch:
@@ -570,6 +659,8 @@ def run_mega_routed_experts(
 
     if global_num_tokens is not None:
         mega_kwargs["global_num_tokens"] = global_num_tokens
+    if eplb_load_row is not None:
+        mega_kwargs["cumulative_local_expert_recv_stats"] = eplb_load_row
 
     # Allocate at least one row so y has a non-null CUDA data_ptr;
     # the DeepGEMM tvm-ffi binding rejects nullptr in convert_to_torch_tensor().
@@ -578,7 +669,7 @@ def run_mega_routed_experts(
         dtype=torch.bfloat16,
         device=hidden_states.device,
     )
-    with _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
+    with _configure_mega_moe_deep_gemm_num_sms(deep_gemm, decode_like):
         deep_gemm.fp8_fp4_mega_moe(
             y,
             experts.mega_l1_weights,
@@ -620,17 +711,6 @@ def _interleave_mega_moe_gate_up(t: torch.Tensor, gran: int = 8) -> torch.Tensor
     return torch.empty_like(t).copy_(result)
 
 
-def _interleave_mega_moe_l1_weights(
-    l1_weights: tuple[torch.Tensor, torch.Tensor],
-    mma_type: str,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    gran = 16 if mma_type == "mxf4xmxf4" else 8
-    return (
-        _interleave_mega_moe_gate_up(l1_weights[0], gran=gran),
-        _interleave_mega_moe_gate_up(l1_weights[1], gran=gran),
-    )
-
-
 def _transpose_mega_moe_sf_for_utccp(sf: torch.Tensor) -> torch.Tensor:
     num_groups, mn, packed_sf_k = sf.shape
     assert sf.dtype == torch.int and mn % 128 == 0
@@ -640,6 +720,18 @@ def _transpose_mega_moe_sf_for_utccp(sf: torch.Tensor) -> torch.Tensor:
         .reshape(num_groups, mn, packed_sf_k)
     )
     return torch.empty_like(sf).copy_(result)
+
+
+def _mega_moe_sf_as_fp32(sf: torch.Tensor) -> torch.Tensor:
+    """Scale factor as fp32 multipliers, whatever form the quantizer left it in.
+
+    MXFP4 experts carry fp32 per-32 scales; MXFP8 experts carry UE8M0 exponent
+    bytes (``format_ue8m0``), which `transform_sf_into_required_layout` takes as
+    fp32 powers of two.
+    """
+    if sf.dtype == torch.uint8:
+        return (sf.to(torch.int32) << 23).view(torch.float32)
+    return sf
 
 
 def build_mega_moe_experts_weights(experts) -> None:
@@ -660,15 +752,16 @@ def build_mega_moe_experts_weights(experts) -> None:
 
     mma_type = _mega_moe_mma_type(experts)
     w13 = experts.w13_weight.data
-    w13_sf_fp32 = experts.w13_weight_scale_inv.data
+    w13_sf_fp32 = _mega_moe_sf_as_fp32(experts.w13_weight_scale_inv.data)
     w2 = experts.w2_weight.data
-    w2_sf_fp32 = experts.w2_weight_scale_inv.data
+    w2_sf_fp32 = _mega_moe_sf_as_fp32(experts.w2_weight_scale_inv.data)
 
-    num_groups, n1, half_k1 = w13.shape
-    k1 = half_k1 * 2
+    num_groups, n1, packed_k1 = w13.shape
+    # Packed E2M1 weights hold two K elements per byte; E4M3 holds one.
+    k1 = packed_k1 * (1 if mma_type == "fp8xfp8" else 2)
     check_mega_moe_shapes(hidden=k1, intermediate=n1 // 2, mma_type=mma_type)
-    _, n2, half_k2 = w2.shape
-    k2 = half_k2 * 2
+    _, n2, packed_k2 = w2.shape
+    k2 = packed_k2 * (1 if mma_type == "fp8xfp8" else 2)
 
     w13_sf = transform_sf_into_required_layout(
         w13_sf_fp32,
@@ -693,20 +786,32 @@ def build_mega_moe_experts_weights(experts) -> None:
     # the deep-ep path consumes the non-transposed interleaved scale and a
     # swizzle-aware activation kernel. L2 weight is untouched by the mega
     # transform, so the existing `w2_weight.data` is shared directly.
-    w13_interleaved, w13_sf_interleaved = _interleave_mega_moe_l1_weights(
-        (w13, w13_sf), mma_type
-    )
+    gran = 16 if mma_type == "mxf4xmxf4" else 8
+    w13_sf_interleaved = _interleave_mega_moe_gate_up(w13_sf, gran=gran)
     w13_sf_utccp = _transpose_mega_moe_sf_for_utccp(w13_sf_interleaved)
     w2_sf_utccp = _transpose_mega_moe_sf_for_utccp(w2_sf)
+    w13_interleaved = _interleave_mega_moe_gate_up(w13, gran=gran)
+
+    localize = _is_mega_moe_localization_enabled()
+    mega_l1, mega_l2 = w13_interleaved, w2
+    if localize:
+        import deep_gemm
+
+        # (domains, experts, N / domains, K) for the kernel; the parameters get the
+        # expert-major view of the same memory.
+        mega_l1, mega_l2 = deep_gemm.localize(mega_l1), deep_gemm.localize(mega_l2)
+        w13_interleaved, w2 = mega_l1.transpose(0, 1), mega_l2.transpose(0, 1)
+        experts._mega_moe_weights_localized = True
 
     experts.w13_weight.data = w13_interleaved
+    experts.w2_weight.data = w2
     experts.w13_weight_scale_inv.data = w13_sf_interleaved
     experts.w2_weight_scale_inv.data = w2_sf
     experts.w13_weight_scale_inv.format_ue8m0 = True
     experts.w2_weight_scale_inv.format_ue8m0 = True
 
-    experts.mega_l1_weights = (experts.w13_weight.data, w13_sf_utccp)
-    experts.mega_l2_weights = (experts.w2_weight.data, w2_sf_utccp)
+    experts.mega_l1_weights = (mega_l1, w13_sf_utccp)
+    experts.mega_l2_weights = (mega_l2, w2_sf_utccp)
     # EPLB moves each expert's slice of every parameter, so the UTCCP copies
     # move with the scales they are transposed from.
     experts.register_parameter(
@@ -719,6 +824,9 @@ def build_mega_moe_experts_weights(experts) -> None:
     )
 
     experts._mega_moe_weights_built = True
+    if localize:
+        del w13, w13_sf, w13_sf_fp32, w2_sf_fp32
+        torch.cuda.empty_cache()
 
 
 def build_mega_moe_shared_weights(
@@ -727,12 +835,26 @@ def build_mega_moe_shared_weights(
     from deep_gemm import transform_weights_for_mega_moe
 
     gate_up_proj, down_proj = shared_experts.gate_up_proj, shared_experts.down_proj
-    # L1 is copied interleaved (2*moe_intermediate*hidden FP8 bytes per layer);
-    # the original stays for the forward_normal fallback above the token cap.
-    return transform_weights_for_mega_moe(
+    # L1 is copied interleaved (2*moe_intermediate*hidden FP8 bytes per layer).
+    # Without localization the original stays for the forward_normal fallback
+    # above the token cap; with it, both originals are freed below.
+    l1, l2 = transform_weights_for_mega_moe(
         (gate_up_proj.weight.data, _transform_mega_moe_shared_sf(gate_up_proj)),
         (down_proj.weight.data, _transform_mega_moe_shared_sf(down_proj)),
     )
+    if _is_mega_moe_localization_enabled():
+        import deep_gemm
+
+        l1 = (deep_gemm.localize(l1[0]), l1[1])
+        l2 = (deep_gemm.localize(l2[0]), l2[1])
+        gate_up_proj.weight.data = gate_up_proj.weight.data.new_empty(0)
+        down_proj.weight.data = down_proj.weight.data.new_empty(0)
+        torch.cuda.empty_cache()
+    return l1, l2
+
+
+def _is_mega_moe_localization_enabled() -> bool:
+    return envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_LOCALIZE.get() and _device_sm == 107
 
 
 def _transform_mega_moe_shared_sf(linear) -> torch.Tensor:

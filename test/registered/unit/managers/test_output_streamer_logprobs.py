@@ -2,7 +2,7 @@ import unittest
 from array import array
 from types import SimpleNamespace
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.io_struct import RequestOutputStats
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler_components.output_streamer import (

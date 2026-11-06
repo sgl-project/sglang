@@ -25,15 +25,13 @@ from typing import TYPE_CHECKING, Any, List, Optional, Sequence, Tuple
 from sglang.srt.configs.model_config import is_deepseek_dsa
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.cp.cp_decode_attn_tp import can_defer_cp_decode_attn_tp
+from sglang.srt.layers.dp_attention import get_cuda_graph_batch_size_alignment
 from sglang.srt.model_executor.runner.base_runner import BaseRunner
 from sglang.srt.runtime_context import (
     get_exec,
     get_flags,
 )
-from sglang.srt.utils import (
-    ceil_align,
-    get_cuda_graph_batch_size_alignment,
-)
+from sglang.srt.utils import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.input_buffers import ForwardInputBuffers

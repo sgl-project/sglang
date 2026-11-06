@@ -467,7 +467,7 @@ class TestGetDcpLens(CustomTestCase):
                         configurator,
                         sizes=sizes,
                         token_to_kv_pool=physical_kv_cache,
-                        is_dsv4_model=False,
+                        is_compressed_kv_model=False,
                         req_to_token_pool=object(),
                         token_to_kv_pool_allocator=None,
                     )

@@ -58,11 +58,14 @@ class DensePart(msgspec.Struct, frozen=True, kw_only=True):
     layer_num: int
     row_shape: Tuple[int, ...]
     dtype: torch.dtype
+    layer_offsets: Optional[Tuple[int, ...]] = None
 
     def row_bytes(self) -> int:
         return _prod(self.row_shape) * self.dtype.itemsize
 
     def layer_offset_bytes(self, layer: int) -> int:
+        if self.layer_offsets is not None:
+            return self.layer_offsets[layer]
         return self.offset_bytes + layer * self.layer_stride_bytes
 
 
@@ -92,14 +95,16 @@ class DenseEntryLayout(msgspec.Struct, frozen=True, kw_only=True):
             assert (
                 p.offset_bytes % ROW_ALIGN_BYTES == 0
                 and p.layer_stride_bytes % ROW_ALIGN_BYTES == 0
-                and row % ROW_ALIGN_BYTES == 0
+                and row % p.dtype.itemsize == 0
             ), (
                 f"part {p.name!r}: offset {p.offset_bytes}, layer stride "
-                f"{p.layer_stride_bytes} and row {row} B must all be multiples of "
-                f"{ROW_ALIGN_BYTES} (vector stores)"
+                f"{p.layer_stride_bytes} must be {ROW_ALIGN_BYTES}-byte aligned; "
+                f"the {row}-byte payload must fit its dtype"
             )
+            assert p.layer_offsets is None or len(p.layer_offsets) == p.layer_num
             for l in range(p.layer_num):
                 lo = p.layer_offset_bytes(l)
+                assert lo % ROW_ALIGN_BYTES == 0
                 assert 0 <= lo and lo + row <= self.entry_bytes, (
                     f"part {p.name!r} layer {l} spans [{lo}, {lo + row}) outside "
                     f"the {self.entry_bytes}-byte entry"
@@ -136,7 +141,7 @@ def build_dense_views(
         f"build_dense_views: {num_slots} slots of {layout.entry_bytes} B end at byte "
         f"{end} but the raw buffer holds only {raw.numel() * raw.itemsize} bytes"
     )
-    as_dtype_view = raw.view(part.dtype)
+    as_dtype_view = raw[: raw.numel() // itemsize * itemsize].view(part.dtype)
     stride = (layout.entry_bytes // itemsize, *_contiguous_strides(part.row_shape))
     views: List[torch.Tensor] = []
     for layer in range(part.layer_num):
@@ -209,7 +214,7 @@ def build_mamba_entry_views(
         f"misaligned mamba spec: anchor_bytes={anchor_bytes} is not a multiple "
         f"of the conv-state itemsize {conv_itemsize} B"
     )
-    as_conv_dtype = raw.view(conv_dtype)
+    as_conv_dtype = raw[: raw.numel() // conv_itemsize * conv_itemsize].view(conv_dtype)
     conv_slot_stride_elems = entry_bytes // conv_itemsize
 
     offset_bytes_within_entry = offset_bytes
@@ -257,7 +262,7 @@ def build_mamba_entry_views(
         f"temporal-state itemsize {itemsize} B"
     )
     offset_elems = (anchor_bytes + offset_bytes_within_entry) // itemsize
-    as_temporal_dtype = raw.view(temporal_dtype)
+    as_temporal_dtype = raw[: raw.numel() // itemsize * itemsize].view(temporal_dtype)
     stride = (
         inner_shape_bytes // itemsize,
         entry_bytes // itemsize,
@@ -269,3 +274,49 @@ def build_mamba_entry_views(
         storage_offset=offset_elems,
     )
     return conv_views, temporal_view
+
+
+def replicated_token_layout(parts, region):
+    """Keep target rows intact across equal-width replicated draft entries.
+
+    Target rows are greedily balanced across the replicas' padding prefixes.
+    A target token strides over every replica; draft tokens stride over one.
+    """
+    replicas = region.token_replicas
+    used = [0] * replicas
+    offsets = {p.name: [None] * p.layer_num for p in parts}
+    rows = sorted(
+        (
+            (p.row_bytes(), p.name, layer, p)
+            for p in parts
+            for layer in range(p.layer_num)
+        ),
+        key=lambda row: (-row[0], row[1], row[2]),
+    )
+    for nbytes, name, layer, part in rows:
+        bucket = min(range(replicas), key=used.__getitem__)
+        offsets[name][layer] = (bucket, used[bucket])
+        used[bucket] += align_part_offset(nbytes)
+    prefix = max(used)
+    stride = align_entry_bytes(prefix + region.entry_bytes())
+    target = tuple(
+        msgspec.structs.replace(
+            p,
+            layer_offsets=tuple(
+                bucket * stride + offset for bucket, offset in offsets[p.name]
+            ),
+        )
+        for p in parts
+    )
+    draft = region.parts(prefix)
+    all_draft = tuple(
+        msgspec.structs.replace(
+            p, name=f"{p.name}.{r}", offset_bytes=p.offset_bytes + r * stride
+        )
+        for r in range(replicas)
+        for p in draft
+    )
+    return (
+        DenseEntryLayout(entry_bytes=stride * replicas, parts=target + all_draft),
+        DenseEntryLayout(entry_bytes=stride, parts=draft),
+    )

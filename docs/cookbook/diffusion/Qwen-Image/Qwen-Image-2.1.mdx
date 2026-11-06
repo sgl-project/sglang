@@ -59,13 +59,15 @@ batch size one. Explicit placement and attention overrides preserve each recipe.
 | GPU | Placement / attention | Generation | Edit | Peak VRAM |
 | --- | --- | --- | --- | --- |
 | H200 141GB | Resident / FlashAttention | 4.48 s | 5.29 s | 38.4 GiB |
-| B200 192GB | Resident / FlashAttention | 2.46 s | 3.02 s | 38.5 GiB |
+| B200 192GB | Resident / cuDNN SDPA | 2.22 s | 2.70 s | 38.5 GiB |
 | RTX PRO 6000 96GB | Resident / Torch SDPA | 8.03 s | 9.63 s | 38.4 GiB |
 | RTX 4090 24GB | DiT and VAE resident, encoder layerwise offload / FlashAttention | 18.68 s | 21.68 s | 22.7 GiB |
 | DGX Spark 128GB unified | Resident / Torch SDPA | 35.36 s | 42.23 s | — (unified) |
 
 Measured with the original checkpoint on 2026-09-20 at 1024×1024, 40 steps, CFG 1, and one RGBA PNG per
-request. Times are median HTTP latency after warmup, including PNG serialization
+request. The B200 row was measured again on 2026-11-01 when one B200 moved to cuDNN SDPA,
+with FlashAttention on the same build for reference: 2.32 s generation and 2.89 s edit (peak VRAM from the
+2026-09-20 FlashAttention run). Times are median HTTP latency after warmup, including PNG serialization
 and excluding startup; VRAM is the sampled request-phase peak. Prompts and
 software versions affect both latency and memory use.
 

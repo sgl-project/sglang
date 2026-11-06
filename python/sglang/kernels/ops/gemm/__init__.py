@@ -224,13 +224,6 @@ register_kernel(
 register_kernel(
     KernelSpec(
         op="gemm.dsv3_fused_a_gemm",
-        backend=KernelBackend.AOT,
-        target="sgl_kernel:dsv3_fused_a_gemm",
-    )
-)
-register_kernel(
-    KernelSpec(
-        op="gemm.dsv3_fused_a_gemm",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.gemm.dsv3_fused_a_gemm:dsv3_fused_a_gemm",
         capabilities=CUDA_ONLY,
@@ -241,22 +234,6 @@ register_kernel(
         op="gemm.tiny_gemm",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.gemm.tiny_gemm:tiny_gemm_bf16",
-        capabilities=CUDA_ONLY,
-    )
-)
-register_kernel(
-    KernelSpec(
-        op="gemm.n128k512",
-        backend=KernelBackend.JIT,
-        target="sglang.kernels.ops.gemm.small_gemm_bf16:n128k512_gemm_bf16",
-        capabilities=CUDA_ONLY,
-    )
-)
-register_kernel(
-    KernelSpec(
-        op="gemm.n32k5120",
-        backend=KernelBackend.JIT,
-        target="sglang.kernels.ops.gemm.small_gemm_bf16:n32k5120_gemm_bf16",
         capabilities=CUDA_ONLY,
     )
 )
@@ -559,14 +536,6 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
-        op="gemm.muse_spark_router_gemm",
-        backend=KernelBackend.JIT,
-        target="sglang.kernels.ops.gemm.muse_spark_router_gemm:router_gemm",
-        capabilities=CUDA_ONLY,
-    )
-)
-register_kernel(
-    KernelSpec(
         op="gemm.muse_spark_router_gemv",
         backend=KernelBackend.CUTE_DSL,
         target="sglang.kernels.ops.gemm.muse_spark_router_gemv_cutedsl:router_gemv_cute",
@@ -587,5 +556,29 @@ register_kernel(
         backend=KernelBackend.TORCH,
         target="sglang.kernels.ops.gemm.router_gemv:router_gemm_bf16x3_cublas",
         capabilities=CUDA_ONLY,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.hopper_fp8_block_gemv",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.gemm.hopper_fp8_block_gemv:hopper_fp8_block_gemv",
+        capabilities=_SM90,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.hopper_bf16_tiny_gemv",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.gemm.hopper_bf16_tiny_gemv:hopper_bf16_tiny_gemv",
+        capabilities=_SM90,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.router_gate_matvec_cuda",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.gemm.router_gate_matvec_cuda:router_gate_matvec_cuda",
+        capabilities=_SM90,
     )
 )

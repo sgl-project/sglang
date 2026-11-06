@@ -8,6 +8,7 @@ from torch import nn
 
 from sglang.srt.configs.qwen4_exp import Qwen4ExpTextConfig
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
+from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbeddingShardIndices,
 )
@@ -17,10 +18,9 @@ from sglang.srt.models.qwen4_exp import (
     Qwen4ExpPLELayer,
 )
 from sglang.srt.runtime_context import get_context, get_parallel
-from sglang.srt.utils import set_weight_attrs
 from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
 
-register_cuda_ci(est_time=45, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=45, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 register_xpu_ci(est_time=45, suite="stage-b-test-1-gpu-xpu")
 
 _accelerator = torch.accelerator.current_accelerator()

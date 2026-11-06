@@ -24,7 +24,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.router import PlainPoolRouter
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.unified_cache.components.base import ComponentType
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     BufferBackupSnapshot,
 )

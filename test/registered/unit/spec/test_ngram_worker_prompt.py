@@ -19,23 +19,19 @@ from sglang.srt.speculative.ngram_worker import NGRAMWorker
 
 class TestNgramWorkerPrompt(CustomTestCase):
     def test_multimodal_padding_stays_out_of_corpus(self):
-        for overlap, grammar, prompt_sam_budget in [
-            (False, False, 0),
-            (True, False, 0),
-            (True, True, 0),
-            (False, False, 2),
-            (True, False, 2),
-            (True, True, 2),
+        for last_round_pending, prompt_sam_budget in [
+            (False, 0),
+            (True, 0),
+            (False, 2),
+            (True, 2),
         ]:
             for multimodal in [False, True]:
                 with self.subTest(
-                    overlap=overlap,
-                    grammar=grammar,
+                    last_round_pending=last_round_pending,
                     multimodal=multimodal,
                     prompt_sam_budget=prompt_sam_budget,
                 ):
                     worker = object.__new__(NGRAMWorker)
-                    worker.enable_overlap = overlap
                     worker.max_trie_depth = 12
                     worker.draft_token_num = 4
                     worker.ngram_corpus = NgramCorpus(
@@ -51,10 +47,10 @@ class TestNgramWorkerPrompt(CustomTestCase):
                         # scheduler replaces cache IDs while preserving the original prompt
                         req.origin_input_ids = array("q", [1] + [1 << 60] * 16 + [2, 3])
                     req.output_ids = array("q", [4])
-                    splice = overlap and not grammar
+                    # This launch, plus the unprocessed last round when pending.
+                    req.inflight_steps = 2 if last_round_pending else 1
                     batch = SimpleNamespace(
                         reqs=[req],
-                        grammar_needs_sync=lambda: grammar,
                         spec_info=SimpleNamespace(
                             accept_tokens=torch.tensor([5, 0, 0, 0]),
                             accept_lens=torch.tensor([1]),
@@ -76,7 +72,9 @@ class TestNgramWorkerPrompt(CustomTestCase):
                     padded = req.origin_input_ids[:]
                     for step in range(2):
                         tokens = (
-                            [1, 2, 3] + list(req.output_ids) + ([5] if splice else [])
+                            [1, 2, 3]
+                            + list(req.output_ids)
+                            + ([5] if last_round_pending else [])
                         )
                         expected = reference.batch_get(
                             [req.rid],

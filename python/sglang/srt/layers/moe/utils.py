@@ -29,7 +29,7 @@ from sglang.srt.utils import is_cuda, is_npu
 
 _is_npu = is_npu()
 
-from sglang.srt.utils.common import log_info_on_rank0
+from sglang.srt.utils.log_utils import log_info_on_rank0
 
 logger = logging.getLogger(__name__)
 
@@ -268,6 +268,9 @@ class _MoeRunnerBackendPredicates:
     def is_intel_xpu(self):
         return self.value == MoeRunnerBackend.INTEL_XPU.value
 
+    def is_gluon(self):
+        return self.value == MoeRunnerBackend.GLUON.value
+
 
 class MoeRunnerBackend(_MoeRunnerBackendPredicates, Enum):
     AUTO = "auto"
@@ -292,6 +295,7 @@ class MoeRunnerBackend(_MoeRunnerBackendPredicates, Enum):
     AITER = "aiter"
     HPC_OPS = "hpc_ops"
     INTEL_XPU = "intel_xpu"
+    GLUON = "gluon"
 
 
 @dataclass(frozen=True)

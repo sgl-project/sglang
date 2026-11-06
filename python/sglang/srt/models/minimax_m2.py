@@ -29,6 +29,7 @@ from transformers import PretrainedConfig
 from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_stages
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.hf_transformers import get_rope_config
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
     AuxHiddenStateList,
@@ -60,6 +61,8 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -86,9 +89,8 @@ from sglang.srt.runtime_context import (
 # Importing from the wrong module causes this file to fail import, which prevents the
 # native MiniMaxM2ForCausalLM from registering in ModelRegistry. The fallback to the
 # transformers wrapper then crashes on config.rope_parameters (transformers v5 issue).
-# Other files (custom_all_reduce.py, hf_transformers_utils.py) also use sglang.srt.utils.
+# Other files (custom_all_reduce.py, hf_transformers/) also use sglang.srt.utils.
 from sglang.srt.utils import (
-    add_prefix,
     cpu_has_amx_support,
     get_bool_env_var,
     get_compiler_backend,
@@ -96,10 +98,8 @@ from sglang.srt.utils import (
     is_cuda,
     is_npu,
     is_xpu,
-    make_pp_layers,
 )
 from sglang.srt.utils.custom_op import register_custom_op
-from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 logger = logging.getLogger(__name__)
 _is_cpu = is_cpu()

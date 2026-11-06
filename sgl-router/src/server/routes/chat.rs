@@ -6,6 +6,8 @@ mod openai;
 mod preparation;
 mod reorg;
 
+pub(super) use preparation::enforce_minimax_m31_thinking;
+
 use crate::buckets_reorg::BucketResolver;
 use crate::config::{SessionAffinityMode, DEFAULT_MIN_LOAD_CHOICES};
 use crate::discovery::{ModelId, WorkerId, WorkerMode};
@@ -29,7 +31,7 @@ use preparation::{
     forwarded_prompt_ids, parse_embedding_request, parse_routing_fields, PreparedRequest,
     CHAT_PATH, CLASSIFY_PATH, COMPLETIONS_PATH, EMBEDDINGS_PATH, GENERATE_PATH, RERANK_PATH,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -203,6 +205,7 @@ async fn prepare<'a>(
             let model = fields.model.take();
             let model =
                 ModelId(model.ok_or_else(|| ApiError::BadRequest("missing `model` field".into()))?);
+            let (model, body) = canonicalize_model_alias(ctx, model, body)?;
             let (model, routing) = ModelRouting::lookup_openai(ctx, model)?;
             let needs_tokens = routing.needs_request_tokens(ctx);
             let path = if matches!(endpoint, Endpoint::Chat) {
@@ -226,7 +229,9 @@ async fn prepare<'a>(
         }
         Endpoint::Embeddings | Endpoint::Classify => {
             let path = endpoint.path();
-            let (model, value) = parse_embedding_request(&body)?;
+            let (model, mut value) = parse_embedding_request(&body)?;
+            let (model, body) = canonicalize_model_alias(ctx, model, body)?;
+            value["model"] = model.0.clone().into();
             let (model, routing) = ModelRouting::lookup_openai(ctx, model)?;
             require_plain_workers(ctx, &model, path)?;
             let request = PreparedRequest::embeddings(ctx, path, model, body, value)?;
@@ -240,6 +245,29 @@ async fn prepare<'a>(
         }
     };
     Ok((request, routing))
+}
+
+/// Resolve aliases before either lowering or forwarding. The engine only knows
+/// its served name, so an unchanged URI alias would be parsed as a LoRA request.
+fn canonicalize_model_alias(
+    ctx: &AppContext,
+    model: ModelId,
+    body: Bytes,
+) -> Result<(ModelId, Bytes), ApiError> {
+    let Some(canonical) = ctx.config.model.canonical_alias(&model.0) else {
+        return Ok((model, body));
+    };
+    // Keep every other JSON value verbatim, including numbers outside f64's
+    // range, for the engine to validate rather than rounding or rejecting them.
+    let mut fields: BTreeMap<String, &serde_json::value::RawValue> = serde_json::from_slice(&body)
+        .map_err(|_| ApiError::BadRequest("invalid request: body must be a JSON object".into()))?;
+    let encoded = serde_json::value::to_raw_value(&canonical)
+        .map_err(|error| ApiError::Internal(error.into()))?;
+    fields.insert("model".into(), &encoded);
+    let body = serde_json::to_vec(&fields)
+        .map_err(|error| ApiError::Internal(error.into()))?
+        .into();
+    Ok((ModelId(canonical), body))
 }
 
 /// Prefill and decode engines serve generation only.
@@ -269,9 +297,16 @@ impl<'a> ModelRouting<'a> {
     }
 
     /// Like `lookup`, but `base:adapter` (SGLang's LoRA syntax) resolves to
-    /// `base`; the body still names the adapter for the engine.
+    /// `base`; the body still names the adapter for the engine. Aliases have
+    /// already been canonicalized in both the routing model and the body.
     fn lookup_openai(ctx: &'a AppContext, model: ModelId) -> Result<(ModelId, Self), ApiError> {
-        match (Self::lookup(ctx, &model), model.0.split_once(':')) {
+        let split = model
+            .0
+            .strip_prefix(&ctx.config.model.id)
+            .and_then(|suffix| suffix.strip_prefix(':'))
+            .map(|adapter| (ctx.config.model.id.as_str(), adapter))
+            .or_else(|| model.0.split_once(':'));
+        match (Self::lookup(ctx, &model), split) {
             (Err(error), Some((base, _))) => {
                 let base = ModelId(base.trim().to_owned());
                 let routing = Self::lookup(ctx, &base).map_err(|_| error)?;
@@ -726,6 +761,67 @@ fn parse_optional_positive_f64_header(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aliases_match_whole_names_and_the_longest_lora_prefix() {
+        let mut ctx = AppContext::stub();
+        ctx.config.model.id = "s3://bucket/served".into();
+        ctx.config.model.aliases = vec![
+            "s3".into(),
+            "short".into(),
+            "s3://bucket/model".into(),
+            "s3://bucket/model:version".into(),
+        ];
+        for (input, expected) in [
+            ("s3://bucket/served", None),
+            ("s3://bucket/served:adapter", None),
+            ("short", Some("s3://bucket/served")),
+            ("short:adapter", Some("s3://bucket/served:adapter")),
+            ("s3://bucket/model", Some("s3://bucket/served")),
+            ("s3://bucket/model:version", Some("s3://bucket/served")),
+            (
+                "s3://bucket/model:version:adapter",
+                Some("s3://bucket/served:adapter"),
+            ),
+            ("unknown:adapter", None),
+        ] {
+            assert_eq!(
+                ctx.config.model.canonical_alias(input).as_deref(),
+                expected,
+                "{input}"
+            );
+        }
+        ctx.policies =
+            Arc::new(crate::policies::factory::build_registry_with_defaults(&ctx.config).unwrap());
+        let (base, _) =
+            ModelRouting::lookup_openai(&ctx, ModelId("s3://bucket/served:adapter".into()))
+                .unwrap_or_else(|_| panic!("the full served URI must resolve before its adapter"));
+        assert_eq!(base.0, ctx.config.model.id);
+    }
+
+    #[test]
+    fn alias_rewrite_preserves_other_json_values() {
+        let mut ctx = AppContext::stub();
+        ctx.config.model.aliases = vec!["s3://bucket/model".into()];
+        let body = Bytes::from_static(
+            br#"{"model":"s3://bucket/model","temperature":1e400,"extra":{"n":18446744073709551617,"text":"s3://bucket/model"}}"#,
+        );
+        let (model, body) =
+            canonicalize_model_alias(&ctx, ModelId("s3://bucket/model".into()), body).unwrap();
+        assert_eq!(model.0, "stub-model");
+        let fields: BTreeMap<String, &serde_json::value::RawValue> =
+            serde_json::from_slice(&body).unwrap();
+        assert_eq!(fields["model"].get(), r#""stub-model""#);
+        assert_eq!(fields["temperature"].get(), "1e400");
+        assert_eq!(
+            fields["extra"].get(),
+            r#"{"n":18446744073709551617,"text":"s3://bucket/model"}"#
+        );
+        let original = Bytes::from_static(br#"{ "model": "stub-model", "temperature": 1e400 }"#);
+        let (_, unchanged) =
+            canonicalize_model_alias(&ctx, ModelId("stub-model".into()), original.clone()).unwrap();
+        assert_eq!(unchanged, original);
+    }
 
     #[test]
     fn unavailable_indexer_degrades_to_empty_prefix_signal() {

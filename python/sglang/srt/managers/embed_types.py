@@ -25,7 +25,7 @@ from typing import Callable, List
 import msgspec
 import torch
 
-from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
+from sglang.srt.multimodal.transport.cuda_ipc import CudaIpcTensorTransportProxy
 
 
 class PositionalEmbeds(msgspec.Struct, array_like=True):

@@ -71,6 +71,11 @@ def _create_startup_linker(*args, **kwargs):
 
 class TestExternalLinkerConfig(unittest.TestCase):
     def test_cli_json_and_programmatic_config(self):
+        config = {
+            **_CONFIG,
+            "load_mode": "prefetch",
+            "prefetch_policy": "wait_complete",
+        }
         parser = argparse.ArgumentParser()
         ServerArgs.add_cli_args(parser)
         parsed = parser.parse_args(
@@ -81,16 +86,16 @@ class TestExternalLinkerConfig(unittest.TestCase):
                 "--unified-cache-external-linker-backend",
                 "dynamic",
                 "--unified-cache-external-linker-config",
-                json.dumps(_CONFIG),
+                json.dumps(config),
             ]
         )
-        self.assertEqual(parsed.unified_cache_external_linker_config, _CONFIG)
+        self.assertEqual(parsed.unified_cache_external_linker_config, config)
         self.assertEqual(parsed.unified_cache_external_linker_backend, "dynamic")
         args = ServerArgs(
             model_path="dummy",
             enable_unified_cache_external_linker=True,
             unified_cache_external_linker_backend="dynamic",
-            unified_cache_external_linker_config=_CONFIG,
+            unified_cache_external_linker_config=config,
         )
         # Validation must not import the plugin in the frontend.
         with patch(
@@ -180,6 +185,14 @@ class TestExternalLinkerConfig(unittest.TestCase):
                         unified_cache_external_linker_config=config,
                     )
                 )
+        for key in ("load_mode", "prefetch_policy"):
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, key):
+                handle_hicache(
+                    ServerArgs(
+                        model_path="dummy",
+                        unified_cache_external_linker_config={key: "invalid"},
+                    )
+                )
 
     def test_conflicting_server_args(self):
         for overrides in (
@@ -222,11 +235,17 @@ class TestExternalLinkerFactory(unittest.TestCase):
             )
 
     def test_passes_forward_stream_to_plugin(self):
+        """Legacy layer-wise plugins remain usable without a prefetch override."""
         stream = object()
-        self.assertIs(self._create(forward_stream=stream).forward_stream, stream)
+        linker = self._create(forward_stream=stream)
+        self.assertIs(linker.forward_stream, stream)
+        self.assertEqual(linker.load_mode, "layer_wise")
+        self.assertIsNone(linker.prefetch([]))
 
     def test_loads_unregistered_module_and_copies_extra_config(self):
-        linker = self._create()
+        linker = self._create(load_mode="prefetch", prefetch_policy="wait_complete")
+        self.assertEqual(linker.load_mode, "prefetch")
+        self.assertEqual(linker.prefetch_policy, "wait_complete")
         self.assertEqual(linker.args[:3], ("args", "params", {"full"}))
         self.assertEqual(linker.args[3], _CONFIG["linker_extra_config"])
         linker.args[3]["nested"]["directory"] = "changed"
@@ -353,7 +372,15 @@ class TestBuiltinLinkerConfig(unittest.TestCase):
             module = importlib.import_module(
                 f"sglang.srt.mem_cache.storage.{module_path}"
             )
-            for config in (None, {}, {"master_server_address": "selected:50051"}):
+            for config in (
+                None,
+                {},
+                {
+                    "master_server_address": "selected:50051",
+                    "load_mode": "prefetch" if backend == "mooncake" else "layer_wise",
+                    "prefetch_policy": "wait_complete",
+                },
+            ):
                 with (
                     self.subTest(backend=backend, config=config),
                     get_context().override_server_args(
@@ -378,6 +405,8 @@ class TestBuiltinLinkerConfig(unittest.TestCase):
                     _create_startup_linker("args", params, components={"full"})
                 passed = storage_config.call_args.kwargs["extra_config"]
                 expected = legacy if config is None else config
+                self.assertNotIn("load_mode", passed)
+                self.assertNotIn("prefetch_policy", passed)
                 self.assertEqual(
                     passed.get("master_server_address"),
                     expected.get("master_server_address"),
@@ -387,6 +416,19 @@ class TestBuiltinLinkerConfig(unittest.TestCase):
                     self.assertNotIn("ssd_enabled", expected)
                 if config == {}:
                     self.assertNotIn("master_server_address", passed)
+
+    def test_unsupported_prefetch_fails_before_storage_initialization(self):
+        from sglang.srt.mem_cache.storage.umbp.umbp_direct_linker import (
+            UMBPDirectLinker,
+        )
+
+        with self.assertRaisesRegex(ValueError, "does not implement prefetch"):
+            UMBPDirectLinker(
+                Mock(),
+                Mock(),
+                components={"full"},
+                extra_config={"load_mode": "prefetch"},
+            )
 
 
 if __name__ == "__main__":

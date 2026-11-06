@@ -179,7 +179,9 @@ jobs:
         timeout-minutes: 10
         working-directory: python
         run: |
-          python3 -m pytest -v sglang/multimodal_gen/test/unit/test_fp8_fa_sm120_attn.py
+          python3 -m pytest -v -rs \
+            sglang/multimodal_gen/test/unit/test_fp8_fa_sm120_attn.py \
+            sglang/multimodal_gen/test/unit/test_subblock_sparse_attention.py::TestSubBlockNumerics
 
       - name: Run 5090 diffusion canary tests
         timeout-minutes: 120
@@ -433,21 +435,35 @@ jobs:
         run: |
           python3 -m pytest -v python/sglang/multimodal_gen/test/single_test_file/test_wan_vae_parallel_groups_4_gpu.py
 
+      - name: Install ComfyUI Kitchen
+        timeout-minutes: 5
+        run: |
+          uv pip install --no-deps comfy-kitchen==0.2.36
+
       - name: Run Blackwell-only diffusion unit tests
-        timeout-minutes: 10
+        timeout-minutes: 15
         working-directory: python
         run: |
-          python3 -m pytest -v \
+          python3 -m pytest -v -rs \
             sglang/multimodal_gen/test/unit/test_mxfp8_online_gemm.py \
-            sglang/multimodal_gen/test/unit/test_wan_gelu_mlp.py
+            sglang/multimodal_gen/test/unit/test_wan_gelu_mlp.py \
+            sglang/multimodal_gen/test/unit/test_cuda_attention_backend.py::TestFlashAttentionForwardInto \
+            sglang/multimodal_gen/test/unit/test_subblock_sparse_attention.py::TestSubBlockNumerics \
+            sglang/multimodal_gen/test/unit/test_text_encoder_loader.py::test_comfy_nvfp4_dynamic_matmul
 
       - name: Run 4-GPU diffusion unit tests
-        timeout-minutes: 15
+        timeout-minutes: 25
         working-directory: python
         run: |
           python3 -m pytest -v \
             sglang/multimodal_gen/test/unit/test_kandinsky6_sequence_parallel.py::test_joint_video_audio_tensor_sequence_parallel \
-            sglang/multimodal_gen/test/unit/test_kandinsky6_sr_sequence_parallel.py::test_sr_four_gpus
+            sglang/multimodal_gen/test/unit/test_kandinsky6_sr_sequence_parallel.py::test_sr_four_gpus \
+            "sglang/multimodal_gen/test/unit/test_kandinsky6_sr_decode_parallel.py::test_sr_parallel_decode[tiles-4-2-1]" \
+            "sglang/multimodal_gen/test/unit/test_kandinsky6_sr_decode_parallel.py::test_sr_parallel_decode[tiles-4-1-2]" \
+            "sglang/multimodal_gen/test/unit/test_kandinsky6_sr_decode_parallel.py::test_sr_parallel_decode[spatial-4-2-1]" \
+            "sglang/multimodal_gen/test/unit/test_kandinsky6_sr_decode_parallel.py::test_sr_parallel_decode[spatial-4-1-2]" \
+            sglang/multimodal_gen/test/single_test_file/test_ipc_a2a_multi_gpu.py::TestIpcA2AMultiGpu::test_four_ranks_match_sequential_bitwise \
+            sglang/multimodal_gen/test/single_test_file/test_usp_pipelined_attention_multi_gpu.py::TestUspPipelinedAttentionMultiGpu::test_four_ranks_match_sequential_bitwise
 
       - name: Run diffusion server tests
         timeout-minutes: 240
@@ -518,6 +534,11 @@ jobs:
           # quant-videogen pins an incompatible torch, so install it without deps
           # plus the import-time deps of the diffusion-qvg extra.
           uv pip install --no-deps quant-videogen==0.1.0 "loguru>=0.7" "termcolor>=2.3"
+
+      - name: Install ComfyUI Kitchen
+        timeout-minutes: 5
+        run: |
+          uv pip install --no-deps comfy-kitchen==0.2.36
 
       - name: Run diffusion unit tests
         timeout-minutes: 60

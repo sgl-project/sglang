@@ -9,7 +9,7 @@ import torch
 from sglang.srt.layers.quantization import fp8_utils
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_utils import Fp8GemmRunnerBackend
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.utils import get_device_sm
 from sglang.test.ci.ci_register import register_cuda_ci

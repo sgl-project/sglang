@@ -44,6 +44,8 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import get_layer_id
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -61,6 +63,7 @@ from sglang.srt.models.bailing_moe import BailingMoEForCausalLM
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mha import (
     DeepseekMHAForwardMixin,
 )
+from sglang.srt.models.utils import bind_or_assign
 from sglang.srt.runtime_context import (
     attention_backends,
     get_exec,
@@ -71,11 +74,8 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.utils import (
     BumpAllocator,
-    add_prefix,
-    bind_or_assign,
     is_cuda,
     is_nvidia_cublas_version_ge_12_9,
-    make_pp_layers,
     next_power_of_2,
 )
 

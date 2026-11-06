@@ -21,7 +21,7 @@ from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     CudaGraphBufferRegistry,
     GraphSlot,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
 )
@@ -34,7 +34,7 @@ from sglang.srt.model_executor.runner_utils import capture_mode
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
-register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 KEY = (2, "TARGET_VERIFY", "TARGET_VERIFY", DSV41_CANDIDATE_UNFILTERED)
 HEAD = object()  # the head's event the side stream waits for

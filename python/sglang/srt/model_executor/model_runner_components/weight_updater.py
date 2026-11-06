@@ -171,6 +171,18 @@ class WeightUpdater:
                 f"Restart with --weight-cache-mode off to use this operation."
             )
 
+    def load_rejection(self: WeightUpdater, op: str) -> Optional[str]:
+        """Why ``op`` may not write this runner's weights, or None.
+
+        Startup-determined and rank-uniform: the CUDA IPC weight cache, and
+        derived-weight caches that in-place writes would leave stale.
+        """
+        try:
+            self._assert_weight_cache_inactive(op)
+        except RuntimeError as e:
+            return str(e)
+        return _unsupported_derived_weight_cache_error(self.get_model())
+
     def update_weights_from_disk(
         self: WeightUpdater,
         model_path: str,

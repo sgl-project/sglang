@@ -118,7 +118,6 @@ class TestReqKvLengthMethods(CustomTestCase):
             mamba_last_track_idx=0,
             mamba_last_track_seqlen=8,
             mamba_prev_track_seqlen=4,
-            mamba_untracked_decode_batch_idx=3,
             mamba_needs_clear=True,
         )
         kv.set_evicted_seqlen(ComponentType.SWA, 6)
@@ -133,7 +132,6 @@ class TestReqKvLengthMethods(CustomTestCase):
             "mamba_last_track_idx",
             "mamba_last_track_seqlen",
             "mamba_prev_track_seqlen",
-            "mamba_untracked_decode_batch_idx",
             "mamba_cow_src_index",
             "mamba_needs_clear",
         }

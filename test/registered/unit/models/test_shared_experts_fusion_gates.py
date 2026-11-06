@@ -4,6 +4,7 @@ import importlib.util
 import sys
 import unittest
 import unittest.mock
+from contextlib import contextmanager
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -98,6 +99,18 @@ class _FusionGateCase(CustomTestCase):
         override.install()
         self.addCleanup(override.restore)
 
+    @contextmanager
+    def _on_cuda(self, model_module):
+        # Pass the gates' platform check as an sm90 GPU would, so a CPU runner
+        # reaches the branches after it.
+        with (
+            unittest.mock.patch.object(model_module, "_is_cuda", True),
+            unittest.mock.patch.object(
+                torch.cuda, "get_device_capability", return_value=(9, 0)
+            ),
+        ):
+            yield
+
     def _reason(
         self,
         model_class,
@@ -190,12 +203,16 @@ class TestDeepseekV2Gate(_FusionGateCase):
         )
 
     def test_expert_parallelism_blocks_fusion_off_rocm(self):
+        import sglang.srt.models.deepseek_v2 as deepseek_v2
         from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
 
         self._seed()
-        self.assertTrue(
-            self._reason(DeepseekV2ForCausalLM, self._config(), moe_ep_size=2)
-        )
+        with self._on_cuda(deepseek_v2):
+            self.assertIsNone(self._reason(DeepseekV2ForCausalLM, self._config()))
+            self.assertIn(
+                "under expert parallelism",
+                self._reason(DeepseekV2ForCausalLM, self._config(), moe_ep_size=2),
+            )
 
     def test_mixed_precision_quant_vetoes_even_when_enforced(self):
         """A precision mismatch causes crash when shared expert fusion is enabled,
@@ -273,25 +290,25 @@ class TestGlmMoeLiteGate(_FusionGateCase):
         return SimpleNamespace(**base)
 
     def test_more_than_one_shared_expert_cannot_fuse(self):
+        import sglang.srt.models.glm4_moe_lite as glm4_moe_lite
         from sglang.srt.models.glm4_moe_lite import Glm4MoeLiteForCausalLM
 
         self._seed()
-        self.assertTrue(
-            self._reason(Glm4MoeLiteForCausalLM, self._config(n_shared_experts=2))
-        )
+        with self._on_cuda(glm4_moe_lite):
+            self.assertIsNone(self._reason(Glm4MoeLiteForCausalLM, self._config()))
+            self.assertIn(
+                "Only GLM-4.5 or GLM-4.6",
+                self._reason(Glm4MoeLiteForCausalLM, self._config(n_shared_experts=2)),
+            )
 
     def test_expert_parallelism_blocks_fusion(self):
+        import sglang.srt.models.glm4_moe_lite as glm4_moe_lite
         from sglang.srt.models.glm4_moe_lite import Glm4MoeLiteForCausalLM
 
         self._seed()
-        config = self._config()
-        reason = self._reason(Glm4MoeLiteForCausalLM, config, moe_ep_size=2)
-        self.assertTrue(reason)
-        # This family checks the device capability before expert parallelism, so
-        # only ask *which* branch refused on a device that would otherwise fuse
-        # (a CPU runner never gets past the capability check).
-        if self._reason(Glm4MoeLiteForCausalLM, config) is None:
-            self.assertIn("expert parallelism", reason)
+        with self._on_cuda(glm4_moe_lite):
+            reason = self._reason(Glm4MoeLiteForCausalLM, self._config(), moe_ep_size=2)
+        self.assertIn("under expert parallelism", reason)
 
     def test_the_nextn_draft_declares_its_own_architecture(self):
         from sglang.srt.models.glm4_moe_lite_nextn import Glm4MoeLiteForCausalLMNextN
@@ -304,13 +321,17 @@ class TestGlmMoeLiteGate(_FusionGateCase):
 
 class TestGlmMoeGate(_FusionGateCase):
     def test_a_w4afp8_checkpoint_cannot_fuse(self):
+        import sglang.srt.models.glm4_moe as glm4_moe
         from sglang.srt.models.glm4_moe import Glm4MoeForCausalLM
 
         self._seed()
-        reason = self._reason(
-            Glm4MoeForCausalLM, SimpleNamespace(n_shared_experts=1), _quant("w4afp8")
-        )
-        self.assertTrue(reason)
+        config = SimpleNamespace(n_shared_experts=1)
+        with self._on_cuda(glm4_moe):
+            self.assertIsNone(self._reason(Glm4MoeForCausalLM, config, _quant("fp8")))
+            self.assertIn(
+                "W4AFP8",
+                self._reason(Glm4MoeForCausalLM, config, _quant("w4afp8")),
+            )
 
     def test_the_dsa_nextn_draft_can_fuse_the_target_layout(self):
         from sglang.srt.models.glm4_moe import GlmMoeDsaForCausalLMNextN
@@ -722,14 +743,7 @@ class TestBailingMoeV3Gate(_FusionGateCase):
         bailing_moe_v3, _ = _import_bailing_modules()
 
         self._seed()
-        with (
-            unittest.mock.patch.object(bailing_moe_v3, "_is_cuda", True),
-            unittest.mock.patch.object(
-                bailing_moe_v3.torch.cuda,
-                "get_device_capability",
-                return_value=(9, 0),
-            ),
-        ):
+        with self._on_cuda(bailing_moe_v3):
             return self._reason(
                 model_class or bailing_moe_v3.BailingMoeV3ForCausalLM,
                 config if config is not None else self._config(),
@@ -805,14 +819,7 @@ class TestBailingMoeV3Gate(_FusionGateCase):
         config.model_type = "bailing_hybrid"
         config.use_kda = True
         self._seed()
-        with (
-            unittest.mock.patch.object(bailing_moe_v3, "_is_cuda", True),
-            unittest.mock.patch.object(
-                bailing_moe_v3.torch.cuda,
-                "get_device_capability",
-                return_value=(9, 0),
-            ),
-        ):
+        with self._on_cuda(bailing_moe_v3):
             reason = self._reason(
                 bailing_moe_nextn.BailingMoeForCausalLMNextN,
                 config,
@@ -838,20 +845,6 @@ class TestBailingMoeV3Gate(_FusionGateCase):
 
 
 class TestQwen3_5Gate(_FusionGateCase):
-    def test_every_entry_class_answers(self):
-        import sglang.srt.models.qwen3_5 as qwen3_5
-
-        for cls in (
-            qwen3_5.Qwen3_5ForCausalLM,
-            qwen3_5.Qwen3_5MoeForCausalLM,
-            qwen3_5.Qwen3_5ForConditionalGeneration,
-            qwen3_5.Qwen3_5MoeForConditionalGeneration,
-        ):
-            self.assertTrue(
-                hasattr(cls, "shared_experts_fusion_disable_reason"),
-                f"{cls.__name__} would silently skip the ROCm auto-disable",
-            )
-
     def test_the_auto_disable_is_rocm_only(self):
         import sglang.srt.models.qwen3_5 as qwen3_5
 
@@ -1182,17 +1175,6 @@ class TestA2ABackendGate(_FusionGateCase):
         self._seed()
         self._use_backend("none")
         self.assertTrue(can_fuse_shared_expert(self._config(), None))
-
-
-class TestFamiliesWithoutAGate(_FusionGateCase):
-    def test_qwen2_moe_style_families_follow_the_intent(self):
-        """A family with no gate must not grow one by accident: the installer
-        falls back to the user's intent for it."""
-        from sglang.srt.models.qwen2_moe import Qwen2MoeForCausalLM
-
-        self.assertFalse(
-            hasattr(Qwen2MoeForCausalLM, "shared_experts_fusion_disable_reason")
-        )
 
 
 if __name__ == "__main__":

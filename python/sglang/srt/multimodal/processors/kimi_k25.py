@@ -10,7 +10,7 @@ from PIL import Image
 
 from sglang.kernels.ops.mm.process import normalize_and_patchify
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
+from sglang.srt.managers.req_types import MultimodalProcessorOutput
 from sglang.srt.models.kimi_k25 import KimiK25ForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,

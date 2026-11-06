@@ -33,6 +33,7 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -40,16 +41,14 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.models import deepseek_v4_boundary as hc_boundary
+from sglang.srt.models.deepseek_common.utils import _is_cuda, _is_npu
 from sglang.srt.models.deepseek_v4 import (
     DeepseekV4DecoderLayer,
     DeepseekV4ForCausalLM,
-    _is_cuda,
-    _is_npu,
     wo_a_fp8_gemm_enabled,
 )
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
 

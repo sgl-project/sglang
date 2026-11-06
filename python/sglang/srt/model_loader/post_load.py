@@ -134,7 +134,7 @@ def stage_module_for_post_load(
     owner_origins: dict[int, set[torch.device]] = {}
     module_origins: set[torch.device] = set()
     tensor_states: dict[int, _TensorState] = {}
-    # Offloader-parked parameters (see sglang.srt.utils.offloader) live on the
+    # Offloader-parked parameters (see sglang.srt.layers.offloader) live on the
     # meta device through post-load processing; kernels are expected to skip
     # them. Pass them through untouched, matching the pre-staging behaviour.
     meta_tensor_ids: set[int] = set()

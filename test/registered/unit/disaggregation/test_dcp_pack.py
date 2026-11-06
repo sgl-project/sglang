@@ -156,7 +156,8 @@ class TestHostTensorIndicesEvent(CustomTestCase):
         )
         req = SimpleNamespace(
             rid="host-indices",
-            kv=SimpleNamespace(req_pool_idx=0),
+            kv=SimpleNamespace(req_pool_idx=0, cache_protected_len=total),
+            skip_radix_cache_insert=False,
             origin_input_ids=[0] * total,
             extend_end=total,
             start_send_idx=0,
@@ -165,6 +166,7 @@ class TestHostTensorIndicesEvent(CustomTestCase):
         )
         scheduler = SimpleNamespace(
             enable_staging=False,
+            tree_cache=SimpleNamespace(supports_prefix_sharing=lambda: True),
             device_module=SimpleNamespace(Event=_Event, current_stream=lambda: stream),
             token_to_kv_pool_allocator=SimpleNamespace(
                 page_size=page_size,

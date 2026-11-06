@@ -150,15 +150,22 @@ class TestUnifiedJointAllocationEviction(CustomTestCase):
         self.assertIsNotNone(allocator.alloc(4))
         self.check_prefixes(allocator, cache, records, range(1, 96))
 
-    def test_explicit_and_legacy_allocation_eviction_keep_count_contract(self):
-        for legacy in (False, True):
-            with self.subTest(legacy=legacy):
+    def test_explicit_and_allocation_eviction_respect_their_targets(self):
+        for allocation in (False, True):
+            with self.subTest(allocation=allocation):
                 allocator, cache = self.build_cache()
                 records = self.mark_prefixes(allocator, cache, 96)
-                method = cache.evict_for_alloc if legacy else cache.evict
+                before = allocator.full_attn_allocator.available_size()
+                method = cache.evict_for_alloc if allocation else cache.evict
                 result = method(EvictParams(num_tokens=2))
-                self.assertEqual(result.num_tokens_evicted, 2)
-                self.check_prefixes(allocator, cache, records, range(2, 96))
+                # Allocation targets availability: a cascaded SWA free also
+                # increases the FULL band's shared-arena borrowing capacity.
+                expected = 1 if allocation else 2
+                self.assertEqual(result.num_tokens_evicted, expected)
+                self.assertGreaterEqual(
+                    allocator.full_attn_allocator.available_size(), before + 2
+                )
+                self.check_prefixes(allocator, cache, records, range(expected, 96))
 
     def test_schedule_batch_decode_uses_allocator_contract(self):
         from sglang.srt.managers.schedule_batch import ScheduleBatch

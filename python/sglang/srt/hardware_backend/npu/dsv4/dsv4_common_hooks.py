@@ -11,7 +11,7 @@ these hooks then:
 
 Compressor state is fixed ring storage and does not participate in this
 allocation/write path. PD reuses the public SWA/C128-state payloads and builds
-NPU-specific payloads for the independently addressed C128 KV pool and A5 C4
+NPU-specific payloads for the independently addressed C128 KV pool and Ascend 950 C4
 compress-state rows.
 
 Non-DSV4 paths leave ``batch.out_cache_loc_dsv4`` None, so this module is a
@@ -78,10 +78,10 @@ def dsv4_state_payloads(
     cross-hardware ``StateType.SWA`` / ``StateType.DSV4_REQUEST_STATE`` defaults:
 
     * ``DSV4_C128`` — C128 KV pages from ``req_to_c128_sidecar``.
-    * ``DSV4_C4_STATE`` (A5 only) — live C4 compress-state rows.  Prefill
+    * ``DSV4_C4_STATE`` (Ascend 950 only) — live C4 compress-state rows.  Prefill
       and decode derive physical rows using their own local ring sizes, so
       decode-only MTP can safely transfer from an 8-row ring to a 16-row ring.
-      Pre-A5 uses EXPLICIT cache_mode and the C4 state is handled by the
+      Pre-Ascend 950 uses EXPLICIT cache_mode and the C4 state is handled by the
       shared ``StateType.SWA`` payload.
     """
 
@@ -277,7 +277,18 @@ def maybe_build_dsv4_verify_bundle(
         live_seq_lens_cpu = batch.seq_lens[: len(req_indices)].cpu()
     live_seq_lens = live_seq_lens_cpu[: len(req_indices)].tolist()
 
-    verify_lens = [int(draft_token_num)] * len(req_indices)
+    ragged_layout = getattr(
+        getattr(batch, "spec_info", None), "ragged_verify_layout", None
+    )
+    if ragged_layout is None:
+        verify_lens = [int(draft_token_num)] * len(req_indices)
+    elif ragged_layout.verify_lens_cpu is not None:
+        verify_lens = [int(v) for v in ragged_layout.verify_lens_cpu]
+    else:
+        # This helper only runs while preparing eager NPU verify metadata. A
+        # device layout is allowed here; compact graph replay has its own
+        # static metadata buffers and must not take this host path.
+        verify_lens = [int(v) for v in ragged_layout.verify_lens.cpu().tolist()]
 
     def flatten_interval(table: torch.Tensor, ratio: int) -> torch.Tensor:
         page_size = pool.c128_page_size

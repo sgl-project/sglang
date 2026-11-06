@@ -24,19 +24,15 @@ from sglang.srt.managers.kv_hints import (
     KvHintsEnvelope,
     decode_kv_hints_envelope,
 )
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputFormat,
-    MultimodalProcessorOutput,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.multimodal.kimi_k3_image_processing import KimiK3DeferredPreprocessing
-from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.utils.cuda_vmm_transport_utils import (
+from sglang.srt.multimodal.modality import Modality, MultimodalInputFormat
+from sglang.srt.multimodal.transport.cuda_vmm import (
     CudaVmmPackedTensorTransportProxy,
     _CudaVmmPackedTensorLayout,
     _CudaVmmPackedTransportOwner,
 )
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils.msgpack_utils import _restore_torch_tensor, enc_hook, ext_hook
 from sglang.test.ci.ci_register import (
     register_amd_ci,
@@ -725,6 +721,51 @@ class TestGenerateReqInputNormalization(CustomTestCase):
 
         # Modalities should be set for all 3 examples
         self.assertEqual(req.modalities, ["image", "image", "image"])
+
+    def test_parallel_sampling_keeps_every_media_item_of_a_single_request(self):
+        """With n > 1, each sample of a multi-image/video/audio request gets all of its media."""
+        for field_name in ("image_data", "video_data", "audio_data"):
+            with self.subTest(field_name=field_name):
+                req = GenerateReqInput(
+                    text="Compare these",
+                    sampling_params={"n": 2},
+                    **{field_name: ["m1", "m2"]},
+                )
+                req.normalize_batch_and_arguments()
+                self.assertEqual(getattr(req[0], field_name), ["m1", "m2"])
+
+        req = GenerateReqInput(
+            text="Compare these",
+            image_data=["i1", "i2"],
+            mm_hashes=["h1", "h2"],
+            sampling_params={"n": 2},
+        )
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req[0].image_data, ["i1", "i2"])
+        self.assertEqual(req[0].mm_hashes, ["h1", "h2"])
+        self.assertEqual(req[0].modalities, "multi-images")
+
+    def test_parallel_sampling_keeps_media_already_nested_per_request(self):
+        """With n > 1, media already given as one list per request must not gain another level."""
+        for field_name in ("image_data", "video_data", "audio_data"):
+            with self.subTest(field_name=field_name):
+                req = GenerateReqInput(
+                    text="Compare these",
+                    sampling_params={"n": 2},
+                    **{field_name: [["m1", "m2"]]},
+                )
+                req.normalize_batch_and_arguments()
+                self.assertEqual(getattr(req[0], field_name), ["m1", "m2"])
+
+        req = GenerateReqInput(
+            text="Compare these",
+            image_data=[["i1", "i2"]],
+            mm_hashes=[["h1", "h2"]],
+            sampling_params={"n": 2},
+        )
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req[0].image_data, ["i1", "i2"])
+        self.assertEqual(req[0].mm_hashes, ["h1", "h2"])
 
     def test_parallel_sampling_preserves_reasoning_controls(self):
         single = GenerateReqInput(
