@@ -6,6 +6,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.attention.fla.utils import autotune_cache_kwargs
 from sglang.srt.utils import is_gfx95_supported
 
 from ..common.tile_ptr import tile_ptrs_2d, tile_ptrs_3d
@@ -72,6 +73,7 @@ def _sparse_subk(block_size_k: int) -> int:
         "v_head_dim",
         "gqa_group_size",
     ],
+    **autotune_cache_kwargs,
 )
 @triton.jit
 def _gqa_share_sparse_fwd_kernel(
