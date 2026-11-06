@@ -15,6 +15,7 @@ from sglang.srt.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
+from sglang.srt.layers.moe import reduce_moe_output
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
@@ -189,6 +190,21 @@ class DraftMoE(nn.Module):
         self.shared_expert_gate = (
             nn.Linear(hidden_size, 1, bias=False) if spec.shared_expert_gated else None
         )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        x = hidden_states.view(-1, self.hidden_size)
+        if x.shape[0] == 0:
+            topk_output = self.topk.empty_topk_output(x.device)
+        else:
+            router_logits, _ = self.gate(x)
+            topk_output = self.topk(x, router_logits.float())  # fp32 scores, as trained
+        out = self.experts(x, topk_output)
+        if self.shared_expert is not None:
+            shared = self.shared_expert(x)
+            if self.shared_expert_gate is not None:
+                shared = torch.sigmoid(self.shared_expert_gate(x)) * shared
+            out = out + shared
+        return reduce_moe_output(out).view_as(hidden_states)
 
 
 def _routing_method(spec: DraftMoeFFNSpec):
