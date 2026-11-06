@@ -167,6 +167,7 @@ class TestReceiverControlMessages(CustomTestCase):
             kv_item_lens=[16],
             kv_data_mem_kinds=["VRAM"],
             kv_layer_ids=[7],
+            num_draft_entries=0,
             aux_data_ptrs=[0x2000],
             aux_item_lens=[64],
             state_data_ptrs=[[0x3000]],
@@ -235,6 +236,7 @@ class TestReceiverControlMessages(CustomTestCase):
                 b"0",
                 b"",
                 struct.pack("Q", 16),
+                b"0",
             ],
             "nixl": [
                 b"NixlMsgGuard",
@@ -311,6 +313,14 @@ class TestReceiverControlMessages(CustomTestCase):
                 self.assertEqual(info.dst_aux_item_lens, [64] if enabled else None)
                 self.assertEqual(info.dst_kv_item_lens, [16])
                 self.assertEqual(info.dst_state_item_lens, [[32]])
+                if backend == "mooncake":
+                    self.assertEqual(info.dst_num_draft_entries, 0)
+                    # A legacy receiver omits the appended draft count.
+                    legacy = registration_type.from_zmq(frames[:-1])
+                    self.assertIsNone(legacy.dst_num_draft_entries)
+                    self.assertEqual(legacy.dst_kv_item_lens, [16])
+                    with_draft = registration_type.from_zmq(frames[:-1] + [b"1"])
+                    self.assertEqual(with_draft.dst_num_draft_entries, 1)
                 if backend == "nixl":
                     self.assertEqual(info.dst_state_data_lens, [[512]])
 

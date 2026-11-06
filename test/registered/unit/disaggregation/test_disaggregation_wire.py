@@ -2009,6 +2009,51 @@ class TestStagingScatterLifecycle(CustomTestCase):
 
 
 class TestMooncakeHiSparseSpecIndices(CustomTestCase):
+    def test_pp_uses_remote_draft_count_with_packed_or_absent_local_draft(self):
+        for stage_start, src_ptrs in ((0, [1000, 2000]), (2, [1000, 2000, 3000])):
+            with self.subTest(stage_start=stage_start):
+                manager = object.__new__(MooncakeKVManager)
+                manager.kv_args = SimpleNamespace(
+                    mla_compression_ratios=None,
+                    prefill_start_layer=stage_start,
+                    kv_data_ptrs=src_ptrs,
+                    kv_item_lens=[100] * len(src_ptrs),
+                    kv_layer_ids=[],
+                    # Earlier stages have no draft. The tail's HiCache packs
+                    # draft into target KV, also leaving no separate suffix.
+                    num_draft_entries=0,
+                )
+                manager.is_mla_backend = True
+                manager.is_hybrid_mla_backend = False
+                manager.enable_custom_mem_pool = False
+                manager.max_transfer_batch_indices = 0
+                manager.pp_size = 2
+                manager._transfer_data = Mock(return_value=0)
+                dst = [10000, 20000, 30000, 40000, 50000]
+                with patch(
+                    "sglang.srt.disaggregation.mooncake.conn.get_memory",
+                    return_value=SimpleNamespace(enable_unified_memory=False),
+                ):
+                    status = manager.send_kvcache(
+                        mooncake_session_id="session",
+                        prefill_kv_indices=np.array([1, 2], dtype=np.int32),
+                        dst_kv_ptrs=dst,
+                        dst_kv_indices=np.array([7, 8], dtype=np.int32),
+                        dst_device_kv_indices=np.array([21, 22], dtype=np.int32),
+                        dst_num_draft_entries=1,
+                        executor=None,
+                    )
+                self.assertEqual(status, 0)
+                expected = [
+                    (
+                        src + 100,
+                        dst[stage_start + i] + (2100 if stage_start + i == 4 else 700),
+                        200,
+                    )
+                    for i, src in enumerate(src_ptrs)
+                ]
+                self.assertEqual(manager._transfer_data.call_args.args[1], expected)
+
     def test_draft_buffers_use_logical_device_indices(self):
         """A local target layer count must not turn remote target KV into draft KV."""
         for pp_size, stage_start in ((1, 0), (2, 0), (2, 2)):

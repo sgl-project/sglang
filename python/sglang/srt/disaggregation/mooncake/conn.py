@@ -174,6 +174,7 @@ class KVArgsRegisterInfo:
     requires_dcp_relayout: bool = False
     dcp_token_item_lens: Optional[List[int]] = None
     dst_kv_item_lens: List[int] = dataclasses.field(default_factory=list)
+    dst_num_draft_entries: Optional[int] = None
     staging_base_ptr: int = 0
     staging_total_size: int = 0
     dst_aux_item_lens: Optional[List[int]] = None
@@ -229,6 +230,9 @@ class KVArgsRegisterInfo:
                 list(struct.unpack(f"{len(msg[20]) // 8}Q", msg[20]))
                 if len(msg) > 20 and msg[20]
                 else []
+            ),
+            dst_num_draft_entries=(
+                int(msg[21].decode("ascii")) if len(msg) > 21 and msg[21] else None
             ),
             # Note: always put the staging field at the final
             staging=StagingRegisterInfo.from_zmq_fields(msg, 15, slot_ids_index=19),
@@ -1466,6 +1470,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
         dst_kv_item_len: Optional[int] = None,
         dst_attn_tp_size: Optional[int] = None,
+        dst_num_draft_entries: Optional[int] = None,
     ):
         self._validate_envelope_kv_layout(
             dst_kv_ptrs, dst_kv_item_len, dst_attn_tp_size
@@ -1483,7 +1488,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             else:
                 # The remote target prefix is host-backed, even across PP stages;
                 # only the draft suffix uses logical device page IDs.
-                num_draft_entries = self.kv_args.num_draft_entries
+                # A prefill PP stage may have no draft, or HiCache may pack
+                # it into target KV. Use the receiver's host/device boundary.
+                num_draft_entries = (
+                    self.kv_args.num_draft_entries
+                    if dst_num_draft_entries is None
+                    else dst_num_draft_entries
+                )
                 if not 0 < num_draft_entries < len(dst_kv_ptrs):
                     raise ValueError(
                         "HiSparse spec PD transfer requires an appended device-only "
@@ -2832,6 +2843,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 dst_device_kv_indices=chunked_dst_device_kv_indice,
                                 dst_kv_item_len=target_rank_registration_info.dst_kv_item_len,
                                 dst_attn_tp_size=target_rank_registration_info.dst_attn_tp_size,
+                                dst_num_draft_entries=target_rank_registration_info.dst_num_draft_entries,
                             )
                         elif (
                             self.enable_staging
@@ -3414,6 +3426,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 f"{len(self.kv_args.kv_item_lens)}Q",
                 *self.kv_args.kv_item_lens,
             ),
+            str(self.kv_args.num_draft_entries).encode("ascii"),
         ]
 
     def build_receiver_metadata_message(
