@@ -221,6 +221,7 @@ export const Llama31Deployment = () => {
       args.push(`--disable-overlap-schedule`);
     } else if (hardware === 'arc_b') {
       args.push(`--device xpu`);
+      args.push(`--attention-backend intel_xpu`);
     }
 
     if (tpSize) {

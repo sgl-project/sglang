@@ -7,7 +7,8 @@ export const Qwen25VLDeployment = () => {
         { id: 'mi300x', label: 'MI300X', default: true },
         { id: 'mi325x', label: 'MI325X', default: false },
         { id: 'mi355x', label: 'MI355X', default: false },
-        { id: 'xeon', label: 'XEON', default: false }
+        { id: 'xeon', label: 'XEON', default: false },
+        { id: 'arc_b', label: 'BMG', default: false }
       ]
     },
     modelsize: {
@@ -49,6 +50,7 @@ export const Qwen25VLDeployment = () => {
       mi300x: { tp: 1, ep: 0 },
       mi325x: { tp: 1, ep: 0 },
       mi355x: { tp: 1, ep: 0 },
+      arc_b: { tp: 1, ep: 0 },
       xeon: { tp: 3, ep: 0 }
     },
     '3b': {
@@ -77,6 +79,9 @@ export const Qwen25VLDeployment = () => {
 
     let cmd = 'python -m sglang.launch_server \\\n';
     cmd += `  --model ${modelName}`;
+    if (hardware === 'arc_b') {
+      cmd += ` \\\n  --device xpu \\\n  --attention-backend intel_xpu`;
+    }
 
     if (hardware === 'xeon') {
       cmd += ` \\\n  --device cpu \\\n  --disable-overlap-schedule`;
@@ -151,7 +156,12 @@ export const Qwen25VLDeployment = () => {
   }, []);
 
   const handleRadioChange = (optionName, value) => {
-    setValues((prev) => ({ ...prev, [optionName]: value }));
+    setValues((prev) => {
+      if (prev.hardware === 'arc_b' && optionName === 'modelsize' && value !== '7b') return prev;
+      const next = { ...prev, [optionName]: value };
+      if (optionName === 'hardware' && value === 'arc_b') next.modelsize = '7b';
+      return next;
+    });
   };
 
   const handleCheckboxChange = (optionName, itemId, isChecked) => {
@@ -325,7 +335,7 @@ export const Qwen25VLDeployment = () => {
               ) : (
                 items.map((item) => {
                   const isChecked = values[option.name] === item.id;
-                  const isDisabled = Boolean(item.disabled);
+                  const isDisabled = Boolean(item.disabled || (values.hardware === 'arc_b' && option.name === 'modelsize' && item.id !== '7b'));
                   return (
                     <label
                       key={item.id}
