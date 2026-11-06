@@ -128,6 +128,9 @@ class _StageExecutor:
         self._child_ctx = replace(
             child_ctx if child_ctx is not None else get_forward_context(),
             moe_num_token_non_padded=forward_batch.moe_num_token_non_padded,
+            # Only a TBO child carries its range in the parent batch.
+            is_micro_batch=forward_batch.tbo_parent_token_range is not None,
+            dp_global_num_tokens_bound=forward_batch.tbo_dp_global_num_tokens_bound,
         )
         self._global_dp_buffer_len = forward_batch.global_dp_buffer_len
         self._local_dp_buffer_len = forward_batch.tbo_padded_len

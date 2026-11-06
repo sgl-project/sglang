@@ -690,6 +690,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For two-batch overlap
     tbo_parent_token_range: Optional[Tuple[int, int]] = None
+    # Per-rank rows that bound a TBO child's MoE dispatch: its own when the DP
+    # gather carried every rank's split, else its parent's.
+    tbo_dp_global_num_tokens_bound: Optional[List[int]] = None
+    # Every DP rank's first-micro-batch rows, gathered with the TBO decision.
+    global_tbo_split_num_tokens: Optional[List[int]] = None
     tbo_padded_len: Optional[int] = None
     tbo_children: Optional[List[ForwardBatch]] = None
 
@@ -1032,6 +1037,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             capture_hidden_mode=capture_hidden_mode,
             return_hidden_states_before_norm=return_hidden_states_before_norm,
             tbo_split_seq_index=batch.tbo_split_seq_index,
+            global_tbo_split_num_tokens=batch.global_tbo_split_num_tokens,
             input_ids_from_graph=input_ids_from_graph,
             # Host-side metadata
             top_logprobs_nums=batch.top_logprobs_nums,

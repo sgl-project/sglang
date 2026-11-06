@@ -185,7 +185,9 @@ from sglang.srt.models.deepseek_common.utils import (
 )
 from sglang.srt.models.deepseek_v4_mhc import MHC_POST_MULT_VALUE
 from sglang.srt.models.deepseek_v4_platform_stage import (
+    DSparkTboCapture,
     NonCudaDecoderMixin,
+    capture_dspark_tbo_share,
     forward_layer_fused_boundary,
     fused_boundary_attn_input,
 )
@@ -3756,6 +3758,7 @@ class DeepseekV4CudaDecoderLayer(DeepseekV4DecoderLayerBase):
         hidden_states = residual_batch.read_output(
             hidden_states, batch, hc_boundary.FinalRead(), None
         )
+        capture_dspark_tbo_share(batch, self.layer_id, hidden_states)
         output = dict(
             positions=state.positions,
             hidden_states=hidden_states,
@@ -4353,12 +4356,14 @@ class DeepseekV4Model(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        dspark_aux_hidden_states: Optional[List[torch.Tensor]] = None,
     ) -> torch.Tensor:
         from sglang.srt.batch_overlap.operations import execute_overlapped_operations
         from sglang.srt.batch_overlap.operations_strategy import OperationsStrategy
         from sglang.srt.batch_overlap.two_batch_overlap import (
             _model_forward_filter_inputs,
             _model_forward_tbo_merge_key,
+            _model_forward_tbo_merge_values,
         )
 
         layers = [self.layers[i] for i in range(self.start_layer, self.end_layer)]
@@ -4435,6 +4440,18 @@ class DeepseekV4Model(nn.Module):
                 tp_group.all_gatherv(local_ids_shard, sizes=tp_sizes, output=gids)
                 child._tbo_global_input_ids = gids
 
+        capture_layers = (
+            frozenset(self.dspark_layers_to_capture)
+            if dspark_aux_hidden_states is not None
+            else None
+        )
+        for child in forward_batch.tbo_children:
+            child._dspark_tbo_capture = (
+                None
+                if capture_layers is None
+                else DSparkTboCapture(layer_ids=capture_layers)
+            )
+
         try:
             outputs_arr = execute_overlapped_operations(
                 inputs_arr=inputs_arr,
@@ -4442,10 +4459,27 @@ class DeepseekV4Model(nn.Module):
                 delta_stages=[0, operations_strategy.tbo_delta_stages],
             )
 
+            num_tokens = hidden_states.shape[0]
+            if dspark_aux_hidden_states is not None:
+                # Both ubatches run every layer, so their captures pair up in
+                # layer order; stitch each pair back into the parent's rows.
+                child_a, child_b = forward_batch.tbo_children
+                for share_a, share_b in zip(
+                    child_a._dspark_tbo_capture.shares,
+                    child_b._dspark_tbo_capture.shares,
+                    strict=True,
+                ):
+                    dspark_aux_hidden_states.append(
+                        _model_forward_tbo_merge_values(
+                            share_a, share_b, child_a, child_b, num_tokens
+                        )
+                    )
             return _model_forward_tbo_merge_key(
-                outputs_arr[0], outputs_arr[1], "hidden_states", hidden_states.shape[0]
+                outputs_arr[0], outputs_arr[1], "hidden_states", num_tokens
             )
         finally:
+            for child in forward_batch.tbo_children:
+                child._dspark_tbo_capture = None
             if _is_cuda:
                 for child in forward_batch.tbo_children:
                     residual_batch.clear(child)
@@ -4537,7 +4571,7 @@ class DeepseekV4Model(nn.Module):
             if hasattr(forward_batch, _attr):
                 delattr(forward_batch, _attr)
 
-        run_tbo = self._can_run_tbo(forward_batch) and not capture_dspark
+        run_tbo = self._can_run_tbo(forward_batch)
 
         if _is_npu and not run_tbo:
             # Rope cos/sin for the whole forward: one bf16 gather per rope
@@ -4576,6 +4610,9 @@ class DeepseekV4Model(nn.Module):
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
+                dspark_aux_hidden_states=(
+                    dspark_aux_hidden_states if capture_dspark else None
+                ),
             )
         else:
             if _is_cuda:

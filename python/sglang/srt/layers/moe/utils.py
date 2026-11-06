@@ -109,6 +109,16 @@ class MoeA2ABackend(Enum):
             MoeA2ABackend.MORI,
         )
 
+    def tbo_splits_extend_in_low_latency(self) -> bool:
+        # MORI EPv2's AsyncLL kernels take extend batches, so low_latency
+        # does not have to block TBO on them.
+        return self.is_mori_epv2()
+
+    def tbo_uses_micro_batch_rows(self) -> bool:
+        # Whether TBO gathers every rank's first-micro-batch rows: MORI EPv2 bounds
+        # each micro-batch's MoE receive by its own per-rank rows.
+        return self.is_mori_epv2()
+
 
 @dataclass
 class AscendOpsConfig:

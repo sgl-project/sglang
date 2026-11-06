@@ -36,6 +36,7 @@ class TestDPAttnSchedulerMetadata(CustomTestCase):
             seq_lens_cpu=torch.ones(4, dtype=torch.int64),
         )
         tbo_preparer = Mock()
+        tbo_preparer.local_tbo_split_num_tokens = 0
         tbo_preparer.prepare_all_gather.return_value = (
             True,
             ForwardMode.DECODE.value,
@@ -118,6 +119,7 @@ class TestDPBalanceStats(CustomTestCase):
         )
         gathered_mode = forward_mode or ForwardMode.IDLE
         tbo_preparer = Mock()
+        tbo_preparer.local_tbo_split_num_tokens = 0
         tbo_preparer.prepare_all_gather.return_value = (True, gathered_mode.value)
         tbo_preparer.compute_output.return_value = (None, gathered_mode)
 
