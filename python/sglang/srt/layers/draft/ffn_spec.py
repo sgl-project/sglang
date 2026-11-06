@@ -20,6 +20,10 @@ FFN_KIND_DENSE = "dense"
 FFN_KIND_MOE = "moe"
 FFN_KINDS = (FFN_KIND_DENSE, FFN_KIND_MOE)
 _EXPERT_COUNT_KEYS = ("num_local_experts", "num_experts", "n_routed_experts")
+# What sglang's MoE stack implements: TopK scoring, FusedMoE activations, top-k methods.
+_SCORING_FUNCS = ("softmax", "sigmoid", "sqrtsoftplus")
+_HIDDEN_ACTS = ("silu", "swigluoai")
+_TOPK_METHODS = (None, "greedy", "noaux_tc")
 
 
 def _expert_count(text: Any) -> Optional[int]:
@@ -35,6 +39,16 @@ def _expert_count(text: Any) -> Optional[int]:
             f"values: {present}."
         )
     return next(iter(present.values()), None)
+
+
+def _optional_positive_float(value: Any, field_name: str) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        raise ValueError(
+            f"Draft FFN: {field_name} must be a positive number, got {value!r}."
+        )
+    return float(value)
 
 
 class DraftDenseFFNSpec(msgspec.Struct, frozen=True, kw_only=True):
@@ -55,14 +69,22 @@ class DraftDenseFFNSpec(msgspec.Struct, frozen=True, kw_only=True):
 
 
 class DraftMoeFFNSpec(msgspec.Struct, frozen=True, kw_only=True):
+    """The HF MoE semantics sglang's TopK and FusedMoE can run, family-neutral."""
+
     num_experts: int
     top_k: int
     intermediate_size: int
+    scoring_func: str  # softmax, sigmoid or sqrtsoftplus
     norm_topk_prob: bool  # renormalize the chosen experts' scores to sum to one
-    scoring_func: str
-    hidden_act: str
-    shared_expert_intermediate_size: Optional[int]  # None: no shared expert
     expert_bias: bool  # the checkpoint carries a trained expert-selection bias
+    num_expert_group: Optional[int]  # None: plain top-k, no group limit
+    topk_group: Optional[int]
+    routed_scaling_factor: float
+    hidden_act: str
+    swiglu_limit: Optional[float]  # None: no clamp on the expert activation
+    swiglu_alpha: Optional[float]
+    shared_expert_intermediate_size: Optional[int]  # None: no shared expert
+    shared_expert_gated: bool  # sigmoid gate on the shared expert (Qwen style)
 
     @classmethod
     def from_config(cls, draft_hf_config: Any) -> DraftMoeFFNSpec:
@@ -88,29 +110,102 @@ class DraftMoeFFNSpec(msgspec.Struct, frozen=True, kw_only=True):
             "moe_intermediate_size",
             "for MoE layers (intermediate_size is not a substitute)",
         )
-        shared_size = cfg_get(text, "shared_expert_intermediate_size", 0)
-        shared_size = 0 if shared_size is None else shared_size
-        if not is_int(shared_size) or shared_size < 0:
+        scoring_func = str(cfg_get(text, "scoring_func", "softmax"))
+        if scoring_func not in _SCORING_FUNCS:
             raise ValueError(
-                "Draft FFN: shared_expert_intermediate_size must be a non-negative "
-                f"integer, got {shared_size!r}."
+                f"Draft FFN: scoring_func={scoring_func!r} is not implemented by "
+                f"sglang's TopK router; available are {_SCORING_FUNCS}."
             )
-        expert_bias = dflash_cfg.get(
+        hidden_act = str(cfg_get(text, "hidden_act", "silu"))
+        if hidden_act not in _HIDDEN_ACTS:
+            raise ValueError(
+                f"Draft FFN: hidden_act={hidden_act!r} is not implemented by "
+                f"sglang's MoE experts; available are {_HIDDEN_ACTS}."
+            )
+        topk_method = cfg_get(text, "topk_method", None)
+        if topk_method not in _TOPK_METHODS:
+            raise ValueError(
+                f"Draft FFN: topk_method={topk_method!r} is not implemented; "
+                f"available are {_TOPK_METHODS}."
+            )
+        num_expert_group, topk_group = cls._groups(text, num_experts, top_k)
+        bias_flag = dflash_cfg.get(
             "moe_router_enable_expert_bias",
             cfg_get(text, "moe_router_enable_expert_bias", False),
         )
+        shared_size, shared_gated = cls._shared_expert(text, intermediate_size)
         return cls(
             num_experts=num_experts,
             top_k=top_k,
             intermediate_size=intermediate_size,
+            scoring_func=scoring_func,
             norm_topk_prob=required_bool(
                 cfg_get(text, "norm_topk_prob", True), "norm_topk_prob"
             ),
-            scoring_func=str(cfg_get(text, "scoring_func", "softmax")),
-            hidden_act=str(cfg_get(text, "hidden_act", "silu")),
-            shared_expert_intermediate_size=int(shared_size) or None,
-            expert_bias=required_bool(expert_bias, "moe_router_enable_expert_bias"),
+            expert_bias=required_bool(bias_flag, "moe_router_enable_expert_bias")
+            or topk_method == "noaux_tc",
+            num_expert_group=num_expert_group,
+            topk_group=topk_group,
+            routed_scaling_factor=_optional_positive_float(
+                cfg_get(text, "routed_scaling_factor", None), "routed_scaling_factor"
+            )
+            or 1.0,
+            hidden_act=hidden_act,
+            swiglu_limit=_optional_positive_float(
+                cfg_get(text, "swiglu_limit", None), "swiglu_limit"
+            ),
+            swiglu_alpha=_optional_positive_float(
+                cfg_get(text, "swiglu_alpha", None), "swiglu_alpha"
+            ),
+            shared_expert_intermediate_size=shared_size,
+            shared_expert_gated=shared_gated,
         )
+
+    @staticmethod
+    def _groups(
+        text: Any, num_experts: int, top_k: int
+    ) -> Tuple[Optional[int], Optional[int]]:
+        """DeepSeek's group-limited routing: n_group / num_expert_group and topk_group."""
+        groups = cfg_get(text, "n_group", cfg_get(text, "num_expert_group", None))
+        groups = optional_positive_int(groups, "n_group")
+        if groups is None or groups == 1:
+            return None, None
+        if num_experts % groups:
+            raise ValueError(
+                f"Draft FFN: n_group={groups} does not divide num_experts={num_experts}."
+            )
+        topk_group = required_positive_int(
+            cfg_get(text, "topk_group", None), "topk_group", "when n_group > 1"
+        )
+        if topk_group > groups:
+            raise ValueError(
+                f"Draft FFN: topk_group={topk_group} exceeds n_group={groups}."
+            )
+        return groups, topk_group
+
+    @staticmethod
+    def _shared_expert(text: Any, intermediate_size: int) -> Tuple[Optional[int], bool]:
+        """Qwen's gated shared expert, or DeepSeek's summed ones, never both."""
+        gated_size = cfg_get(text, "shared_expert_intermediate_size", None) or 0
+        summed_count = cfg_get(text, "n_shared_experts", None) or 0
+        for name, value in (
+            ("shared_expert_intermediate_size", gated_size),
+            ("n_shared_experts", summed_count),
+        ):
+            if not is_int(value) or value < 0:
+                raise ValueError(
+                    f"Draft FFN: {name} must be a non-negative integer, got {value!r}."
+                )
+        if gated_size and summed_count:
+            raise ValueError(
+                "Draft FFN: shared_expert_intermediate_size and n_shared_experts "
+                "declare two shared-expert layouts; set only one."
+            )
+        if gated_size:
+            return int(gated_size), True
+        if summed_count:
+            return int(summed_count) * intermediate_size, False
+        return None, False
 
 
 class DraftMixFFNSpec(msgspec.Struct, frozen=True, kw_only=True):
