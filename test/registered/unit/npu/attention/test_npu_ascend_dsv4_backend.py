@@ -67,11 +67,11 @@ from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
     DeepseekV4AscendMultiStepDraftBackend,
     _apply_hadamard,
     _build_cycle_state_block_table,
+    _fill_verify_positions_cmp_padding_one_fused,
     _get_kv_indices,
     _sparse_attn_kv_quant_kwargs,
     _sparse_attn_ops,
     _walsh_hadamard_matrix,
-    _fill_verify_positions_cmp_padding_one_fused,
 )
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     dsv4_state_payloads,
