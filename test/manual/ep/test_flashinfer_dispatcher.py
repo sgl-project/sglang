@@ -1,4 +1,16 @@
+"""Manual multi-GPU tests for the FlashInfer EP token dispatcher.
+
+Needs 4 NVLink-connected GPUs of compute capability 10.0 or 10.3, the only ones
+FlashInfer builds its Lamport transport for; elsewhere test_dispatch_basic and
+test_dispatch_above_lamport_limit fail their preconditions. The other tests do
+not check which transport they take. Run:
+
+    torchrun --nproc_per_node=4 test/manual/ep/test_flashinfer_dispatcher.py
+"""
+
 import unittest
+from typing import NamedTuple
+from unittest import mock
 
 import torch
 
@@ -6,18 +18,63 @@ from sglang.srt.distributed import init_distributed_environment
 from sglang.srt.distributed.parallel_state import (
     destroy_distributed_environment,
     destroy_model_parallel,
-    get_tp_group,
     initialize_model_parallel,
 )
-from sglang.srt.layers.dp_attention import set_dp_buffer_len
-from sglang.srt.layers.moe.token_dispatcher.flashinfer import FlashinferDispatcher
-from sglang.srt.layers.moe.utils import initialize_moe_config
-from sglang.srt.runtime_context import get_context, publish
-from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from sglang.srt.layers.dp_attention import initialize_dp_attention, set_dp_buffer_len
+from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
+    FlashinferCombineInput,
+    FlashinferDispatcher,
+    FlashinferDispatchOutput,
+)
+from sglang.srt.layers.moe.topk import StandardTopKOutput
+from sglang.srt.layers.moe.utils import MoeRunnerBackend, initialize_moe_config
+from sglang.srt.runtime_context import get_context, get_parallel, get_server_args
 from sglang.test.test_utils import CustomTestCase, publish_build_topology
+
+HIDDEN_SIZE = 128
+EMPTY_RANK = 1
+# One token short of the full ranks, so its block at the receiver ends in padding.
+SHORT_RANK = 2
+# bf16 holds integers up to 256 exactly; a mark travels back as two base-256 digits.
+MARK_RADIX = 256
+# The rank each BF16 round sends to, as an offset from the sending rank; 0 is itself.
+ROUND_OFFSETS = (1, 2, 3, 1, 0)
+
+
+def assert_exact(actual, expected):
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+class Round(NamedTuple):
+    """What one dispatch and combine produced, copied out of the workspace."""
+
+    round_index: int
+    dispatch_output: FlashinferDispatchOutput
+    combined: torch.Tensor
+    marks: torch.Tensor
+    workspace_payload: bool
+
+
+def mark_columns(marks):
+    """A mark as the expert returns it: low part, then high part."""
+    return marks % MARK_RADIX, torch.div(marks, MARK_RADIX, rounding_mode="floor")
+
+
+def uneven_token_counts(world_size, num_tokens):
+    """Token counts as DP ranks with uneven batches have them: EMPTY_RANK has no
+    tokens, SHORT_RANK has num_tokens - 1 and the others num_tokens."""
+    counts = [num_tokens] * world_size
+    counts[EMPTY_RANK] = 0
+    counts[SHORT_RANK] = num_tokens - 1
+    return counts
 
 
 class TestFlashinferDispatcher(CustomTestCase):
+    # Marks never repeat across rounds, and every rank uses the same ones,
+    # so a combine output read from memory an earlier round freed fails.
+    marks_used = 0
+
     @classmethod
     def setUpClass(cls):
         # Dist-init first: world_size (and so the tp/ep width ServerArgs must
@@ -29,393 +86,323 @@ class TestFlashinferDispatcher(CustomTestCase):
             local_rank=-1,  # Auto-detect from environment
             backend="nccl",
         )
-        world_size = torch.distributed.get_world_size()
-        rank = torch.distributed.get_rank()
-        device = torch.device(f"cuda:{rank % torch.cuda.device_count()}")
-        torch.cuda.set_device(device)
+        cls.world_size = torch.distributed.get_world_size()
+        cls.rank = torch.distributed.get_rank()
+        torch.cuda.set_device(cls.rank % torch.cuda.device_count())
 
-        server_args = ServerArgs(
-            model_path="dummy", tp_size=world_size, ep_size=world_size
+        # The ordinary geometry for this backend, attention DP over the whole TP group,
+        # so global_num_tokens holds one token count per EP rank.
+        publish_build_topology(
+            world_rank=cls.rank,
+            tp_size=cls.world_size,
+            ep_size=cls.world_size,
+            attn_dp_size=cls.world_size,
+            moe_a2a_backend="flashinfer",
         )
-        server_args.moe_runner_backend = "flashinfer_cutlass"
-        server_args.moe_a2a_backend = "flashinfer"
-        cls.server_args = server_args
-        set_global_server_args_for_scheduler(server_args)
-        publish(server_args, role="scheduler")
-        initialize_moe_config()
-
-        publish_build_topology(tp_size=world_size, ep_size=world_size, world_rank=rank)
         initialize_model_parallel()
+        initialize_dp_attention(get_server_args())
+        initialize_moe_config()
 
     @classmethod
     def tearDownClass(cls):
-        try:
-            from flashinfer.comm.trtllm_moe_alltoall import MoeAlltoAll
-
-            for workspace in MoeAlltoAll._WORKSPACE_CACHE.values():
-                mnnvl_mem = workspace.get("mnnvl_mem")
-                if mnnvl_mem is not None and "ptr" in vars(mnnvl_mem):
-                    del mnnvl_mem.ptr
-            MoeAlltoAll._WORKSPACE_CACHE.clear()
-        except ImportError:
-            pass
         destroy_model_parallel()
         destroy_distributed_environment()
 
-    def create_dispatcher(
-        self, router_topk=2, num_experts=8, num_local_experts=4, hidden_size=128
-    ):
-        """Helper to create dispatcher instance"""
-        return FlashinferDispatcher(
-            group=get_tp_group().device_group,
-            router_topk=router_topk,
-            num_experts=num_experts,
-            num_local_experts=num_local_experts,
-            hidden_size=hidden_size,
-            params_dtype=torch.bfloat16,
-        )
+    def _callTestMethod(self, method):
+        # No retry: a rank that retries alone re-enters collectives its peers have left.
+        unittest.TestCase._callTestMethod(self, method)
 
-    def set_dispatch_type(self, dispatch_type):
+    def create_dispatcher(self, dispatch_type, quant_config, runner_backend=None):
         get_context().override(
             "test_flashinfer_dispatcher",
             flashinfer_a2a_dispatch_type=dispatch_type,
         )
-
-    def _zero_moe_a2a_dispatch_payloads(self):
-        # Shared MoeAlltoAll workspaces keep stale recv payloads across tests.
-        # Zero only the payload region so unused-source == 0 asserts stay valid.
-        try:
-            from flashinfer.comm.trtllm_moe_alltoall import (
-                MoeAlltoAll,
-                get_moe_alltoall_module,
+        # Without a runner backend the dispatcher builds this config itself.
+        moe_runner_config = None
+        if runner_backend is not None:
+            moe_runner_config = MoeRunnerConfig(
+                num_experts=self.world_size,
+                num_local_experts=1,
+                num_fused_shared_experts=0,
+                hidden_size=HIDDEN_SIZE,
+                top_k=1,
+                runner_backend=runner_backend,
             )
-        except ImportError:
-            return
-
-        module = get_moe_alltoall_module()
-        for ws in MoeAlltoAll._WORKSPACE_CACHE.values():
-            workspace = ws["workspace"]
-            aux = int(
-                module.moe_a2a_get_aux_data_size(
-                    ws["ep_size"],
-                    ws["max_num_tokens"],
-                    ws["eplb_stats_num_experts"],
-                )
-            )
-            aux = ((aux + 127) // 128) * 128
-            if aux < workspace.shape[1]:
-                workspace[:, aux:].zero_()
-
-    def test_dispatch_basic(self):
-        """Test basic dispatch functionality"""
-        self.set_dispatch_type("bf16")
-        num_tokens = 16
-        hidden_size = 128
-        router_topk = 1  # Single expert per token for simplicity
-        world_size = torch.distributed.get_world_size()
-        rank = torch.distributed.get_rank()
-        num_experts = world_size
-        num_local_experts = 1  # One expert per rank
-
-        set_dp_buffer_len(
-            global_dp_buffer_len=num_tokens * world_size,
-            local_dp_buffer_len=num_tokens,
-            dp_max_padding=True,
-            global_num_tokens=None,
+        # One expert per rank, so expert i lives on rank i.
+        dispatcher = FlashinferDispatcher(
+            group=get_parallel().tp_group.device_group,
+            router_topk=1,
+            num_experts=self.world_size,
+            num_local_experts=1,
+            hidden_size=HIDDEN_SIZE,
+            params_dtype=torch.bfloat16,
+            moe_runner_config=moe_runner_config,
         )
+        dispatcher.set_quant_config(quant_config)
+        self.addCleanup(self.destroy_dispatcher, dispatcher)
+        return dispatcher
 
-        # Create tokens with rank number
-        hidden_states = torch.full(
-            (num_tokens, hidden_size), 100.0 + rank, dtype=torch.bfloat16, device="cuda"
-        )
-
-        # Route all tokens from rank i to expert (i+1) % world_size
-        target_rank = (rank + 1) % world_size
-        target_expert = target_rank  # Since we have 1 expert per rank
-
-        topk_ids = torch.full(
-            (num_tokens, router_topk), target_expert, dtype=torch.int32, device="cuda"
-        )
-        topk_weights = torch.ones(
-            (num_tokens, router_topk), dtype=torch.float32, device="cuda"
-        )
-
-        from sglang.srt.layers.moe.topk import StandardTopKOutput
-
-        topk_output = StandardTopKOutput(
-            topk_weights=topk_weights, topk_ids=topk_ids, router_logits=None
-        )
-
+    @staticmethod
+    def destroy_dispatcher(dispatcher):
+        # Every rank must finish its combine before the workspace is freed.
+        torch.cuda.synchronize()
         torch.distributed.barrier()
-        dispatcher = self.create_dispatcher(
-            router_topk=router_topk,
-            num_experts=num_experts,
-            num_local_experts=num_local_experts,
-            hidden_size=hidden_size,
-        )
-        dispatcher.set_quant_config({"input_global_scale": None})
+        dispatcher.moe_a2a.destroy()
 
-        dispatch_output = dispatcher.dispatch(hidden_states, topk_output)
-        received_hidden_states = dispatch_output.hidden_states
-        self.assertEqual(dispatch_output.hidden_states_scale, None)
+    def target(self, round_index):
+        return (self.rank + ROUND_OFFSETS[round_index]) % self.world_size
 
-        # Expected: we should receive tokens from rank (rank - 1) % world_size
-        expected_source_rank = (rank - 1 + world_size) % world_size
+    def source(self, round_index):
+        return (self.rank - ROUND_OFFSETS[round_index]) % self.world_size
 
-        # Verify we received the right number of tokens
-        self.assertEqual(
-            received_hidden_states.shape[0],
-            num_tokens * world_size,
-            f"Should receive {num_tokens * world_size} tokens",
-        )
+    def run_round(self, dispatcher, hidden_states, global_num_tokens, round_index=0):
+        """Each token carries a mark, new in each round, in its routing weight and
+        in columns 0 and 1 of its row of hidden_states, which this overwrites.
+        Its expert returns the mark in columns 0 and 1 and its own rank + 1
+        elsewhere.
 
-        # Verify tokens came from the expected source
-        self.assertTrue(
-            torch.all(
-                received_hidden_states[
-                    expected_source_rank * num_tokens : (expected_source_rank + 1)
-                    * num_tokens
-                ]
-                == 100.0 + expected_source_rank
-            )
-        )
-        self.assertTrue(
-            torch.all(
-                received_hidden_states[: expected_source_rank * num_tokens] == 0.0
-            )
-        )
-        self.assertTrue(
-            torch.all(
-                received_hidden_states[(expected_source_rank + 1) * num_tokens :] == 0.0
-            )
-        )
-
-    def test_dispatch_with_empty_tokens(self):
-        """Test dispatch when there are no tokens (edge case)"""
-        self.set_dispatch_type("bf16")
-        # This tests the dummy token handling
-        num_tokens = 16
-        hidden_size = 128
-        router_topk = 1  # Single expert per token for simplicity
-        world_size = torch.distributed.get_world_size()
-        rank = torch.distributed.get_rank()
-        num_experts = world_size
-        num_local_experts = 1  # One expert per rank
-
+        Checks run later: a rank raising between rounds would leave its peers
+        inside the next round's collectives.
+        """
         set_dp_buffer_len(
-            global_dp_buffer_len=num_tokens * world_size,
-            local_dp_buffer_len=num_tokens,
+            global_dp_buffer_len=sum(global_num_tokens),
+            local_dp_buffer_len=global_num_tokens[self.rank],
             dp_max_padding=False,
-            global_num_tokens=[16, 0, 16, 16],
+            global_num_tokens=global_num_tokens,
         )
-
-        # Route all tokens from rank i to expert (i+1) % world_size
-        target_rank = (rank + 1) % world_size
-        target_expert = target_rank  # Since we have 1 expert per rank
-
-        # Create tokens with rank number, rank 1 has no tokens
-        if rank == 1:
-            hidden_states = torch.empty(
-                0, hidden_size, dtype=torch.bfloat16, device="cuda"
-            )
-            topk_ids = torch.empty(0, router_topk, dtype=torch.int32, device="cuda")
-            topk_weights = torch.empty(
-                0, router_topk, dtype=torch.float32, device="cuda"
-            )
-        else:
-            hidden_states = torch.full(
-                (num_tokens, hidden_size),
-                100.0 + rank,
+        num_tokens = hidden_states.shape[0]
+        target_rank = self.target(round_index)
+        # fp32 routing weights hold these marks exactly.
+        first_mark = type(self).marks_used + 1
+        type(self).marks_used += max(global_num_tokens)
+        marks = (torch.arange(num_tokens, device="cuda") + first_mark).float()
+        # In the payload too, so a check can pair each payload row with its weight.
+        hidden_states[:, 0], hidden_states[:, 1] = mark_columns(marks)
+        topk_output = StandardTopKOutput(
+            topk_weights=marks.unsqueeze(1),
+            topk_ids=torch.full(
+                (num_tokens, 1), target_rank, dtype=torch.int32, device="cuda"
+            ),
+            router_logits=None,
+        )
+        dispatch_output = dispatcher.dispatch(hidden_states, topk_output)
+        # The checks read copies: these views are valid only until the combine,
+        # and unmapped once the workspace is freed.
+        received = dispatch_output._replace(
+            hidden_states=dispatch_output.hidden_states.clone(),
+            hidden_states_scale=(
+                None
+                if dispatch_output.hidden_states_scale is None
+                else dispatch_output.hidden_states_scale.clone()
+            ),
+            topk_output=dispatch_output.topk_output._replace(
+                topk_ids=dispatch_output.topk_output.topk_ids.clone(),
+                topk_weights=dispatch_output.topk_output.topk_weights.clone(),
+            ),
+            moe_output=None,
+        )
+        # A cutlass runner's expert writes into the combine buffer, read in place.
+        expert_output = dispatch_output.moe_output
+        if expert_output is None:
+            expert_output = torch.empty(
+                (received.hidden_states.shape[0], HIDDEN_SIZE),
                 dtype=torch.bfloat16,
                 device="cuda",
             )
-            topk_ids = torch.full(
-                (num_tokens, router_topk),
-                target_expert,
-                dtype=torch.int32,
-                device="cuda",
-            )
-            topk_weights = torch.ones(
-                (num_tokens, router_topk), dtype=torch.float32, device="cuda"
-            )
+        # Padding rows carry stale weights; neither combine sums their output.
+        low, high = mark_columns(received.topk_output.topk_weights[:, 0])
+        expert_output.fill_(self.rank + 1.0)
+        expert_output[:, 0] = low
+        expert_output[:, 1] = high
+        # The fence combine skips staging only for a payload at the buffer's address;
+        # record the address it receives.
+        buffer_address = dispatcher.moe_a2a.get_combine_input_buffer(
+            expert_output.dtype
+        ).data_ptr()
+        received_payloads = []
+        combine = dispatcher.moe_a2a.combine
 
-        from sglang.srt.layers.moe.topk import StandardTopKOutput
+        def recording_combine(payload, **kwargs):
+            received_payloads.append(payload.data_ptr())
+            return combine(payload, **kwargs)
 
-        topk_output = StandardTopKOutput(
-            topk_weights=topk_weights, topk_ids=topk_ids, router_logits=None
+        with mock.patch.object(dispatcher.moe_a2a, "combine", recording_combine):
+            combined = dispatcher.combine(FlashinferCombineInput(expert_output))
+        return Round(
+            round_index=round_index,
+            dispatch_output=received,
+            combined=combined,
+            marks=marks,
+            workspace_payload=received_payloads == [buffer_address],
         )
 
-        self._zero_moe_a2a_dispatch_payloads()
-        torch.distributed.barrier()
+    def check_round(self, dispatcher, round_, global_num_tokens):
+        """Check a finished round: whether its combine was handed the workspace's
+        combine buffer, the expert ids it received, and what its own tokens
+        brought back from their expert."""
+        self.assertEqual(round_.workspace_payload, dispatcher.payload_in_workspace)
+        # A rank receives its source's tokens in that source's rows;
+        # the rest is padding, marked with num_experts, these runners' invalid id.
+        source_rank = self.source(round_.round_index)
+        expected_topk_ids = torch.full(
+            (self.world_size, max(global_num_tokens), 1),
+            dispatcher.num_experts,
+            dtype=torch.int32,
+            device="cuda",
+        )
+        expected_topk_ids[source_rank, : global_num_tokens[source_rank]] = self.rank
+        assert_exact(
+            round_.dispatch_output.topk_output.topk_ids,
+            expected_topk_ids.flatten(0, 1),
+        )
+        target_rank = self.target(round_.round_index)
+        expected = torch.full(
+            (round_.marks.numel(), HIDDEN_SIZE),
+            target_rank + 1.0,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        expected[:, 0], expected[:, 1] = mark_columns(round_.marks)
+        assert_exact(round_.combined, expected)
+        return round_.dispatch_output
 
+    def one_round(self, dispatcher, hidden_states, global_num_tokens):
+        return self.check_round(
+            dispatcher,
+            self.run_round(dispatcher, hidden_states, global_num_tokens),
+            global_num_tokens,
+        )
+
+    def check_bf16_dispatch(self, dispatcher, global_num_tokens):
+        """Five rounds, as serving runs one per MoE layer. The Lamport transport
+        alternates two expert-id sets, so rounds 2 and 3 reuse the sets of rounds
+        0 and 1, now filled from other sources. Round 3 also goes back to round
+        0's target, so it rereads the payload, weight and combine rows that round
+        0 used. Round 4 sends each rank's tokens to itself, which Lamport handles
+        without its landing rows. No two rounds send the same values, so a round
+        that reads another's leftovers fails."""
+        # Offsets 1, 2 and 3 must name three different peers.
+        self.assertGreaterEqual(self.world_size, 4)
+
+        def value(round_index, source):
+            # Unique per round and source, and small enough to be exact in bf16.
+            return 100.0 + self.world_size * round_index + source
+
+        rounds = [
+            self.run_round(
+                dispatcher,
+                torch.full(
+                    (global_num_tokens[self.rank], HIDDEN_SIZE),
+                    value(round_index, self.rank),
+                    dtype=torch.bfloat16,
+                    device="cuda",
+                ),
+                global_num_tokens,
+                round_index,
+            )
+            for round_index in range(len(ROUND_OFFSETS))
+        ]
+        tokens_per_rank = max(global_num_tokens)
+        for round_ in rounds:
+            with self.subTest(round=round_.round_index):
+                source_rank = self.source(round_.round_index)
+                dispatch_output = self.check_round(
+                    dispatcher, round_, global_num_tokens
+                )
+                self.assertIsNone(dispatch_output.hidden_states_scale)
+                self.assertEqual(dispatch_output.hidden_states.dtype, torch.bfloat16)
+                self.assertEqual(
+                    dispatch_output.hidden_states.shape,
+                    (self.world_size * tokens_per_rank, HIDDEN_SIZE),
+                )
+                rows = slice(global_num_tokens[source_rank])
+                received = dispatch_output.hidden_states.view(
+                    self.world_size, tokens_per_rank, HIDDEN_SIZE
+                )[source_rank][rows]
+                weights = dispatch_output.topk_output.topk_weights.view(
+                    self.world_size, tokens_per_rank
+                )[source_rank][rows]
+                # A row's payload and its weight must carry one token's mark.
+                expected = torch.full_like(
+                    received, value(round_.round_index, source_rank)
+                )
+                expected[:, 0], expected[:, 1] = mark_columns(weights)
+                assert_exact(received, expected)
+
+    def test_dispatch_basic(self):
+        """Small BF16 rounds, which FlashInfer sends over Lamport."""
+        dispatcher = self.create_dispatcher("bf16", {"input_global_scale": None})
+        num_tokens = 16
+        self.assertGreaterEqual(dispatcher.moe_a2a.lamport_max_tokens, num_tokens)
+        self.check_bf16_dispatch(dispatcher, [num_tokens] * self.world_size)
+
+    def test_dispatch_above_lamport_limit(self):
+        """BF16 above FlashInfer's Lamport limit takes the fence path, whose combine
+        stages the expert output unless it is already in the workspace."""
         dispatcher = self.create_dispatcher(
-            router_topk=router_topk,
-            num_experts=num_experts,
-            num_local_experts=num_local_experts,
-            hidden_size=hidden_size,
+            "bf16",
+            {"input_global_scale": None},
+            runner_backend=MoeRunnerBackend.FLASHINFER_CUTLASS,
         )
-        dispatcher.set_quant_config({"input_global_scale": None})
+        # The cutlass runner is what moves the combine payload into the workspace.
+        self.assertTrue(dispatcher.payload_in_workspace)
+        # Without Lamport the limit is 0, so this would be a one-token round.
+        self.assertTrue(dispatcher.moe_a2a.lamport_enabled)
+        num_tokens = dispatcher.moe_a2a.lamport_max_tokens + 1
+        self.check_bf16_dispatch(dispatcher, [num_tokens] * self.world_size)
 
-        dispatch_output = dispatcher.dispatch(hidden_states, topk_output)
-        received_hidden_states = dispatch_output.hidden_states
-
-        # Expected: we should receive tokens from rank (rank - 1) % world_size
-        expected_source_rank = (rank - 1 + world_size) % world_size
-
-        # Verify we received the right number of tokens
-        self.assertEqual(
-            received_hidden_states.shape[0],
-            num_tokens * world_size,
-            f"Should receive {num_tokens * world_size} tokens",
-        )
-
-        # Verify tokens came from the expected source
-        if rank == 2:
-            # Rank 2 should receive no tokens since rank 1 was empty
-            self.assertTrue(
-                torch.all(received_hidden_states == 0.0),
-                "Rank should receive no tokens",
-            )
-        else:
-            self.assertTrue(
-                torch.all(
-                    received_hidden_states[
-                        expected_source_rank * num_tokens : (expected_source_rank + 1)
-                        * num_tokens
-                    ]
-                    == 100.0 + expected_source_rank
-                ),
-                "Rank {rank} should receive tokens from the expected source {expected_source_rank}",
-            )
-            self.assertTrue(
-                torch.all(
-                    received_hidden_states[: expected_source_rank * num_tokens] == 0.0
-                ),
-                "Rank should receive no tokens from previous ranks",
-            )
-            self.assertTrue(
-                torch.all(
-                    received_hidden_states[(expected_source_rank + 1) * num_tokens :]
-                    == 0.0
-                ),
-                "Rank should receive no tokens from next ranks",
-            )
+    def test_dispatch_with_empty_tokens(self):
+        """A rank with no tokens still takes part in the round, and a rank with
+        fewer tokens than the round's maximum leaves padding after them."""
+        dispatcher = self.create_dispatcher("bf16", {"input_global_scale": None})
+        self.check_bf16_dispatch(dispatcher, uneven_token_counts(self.world_size, 16))
 
     def test_dispatch_with_fp4_quantization(self):
-        """Test dispatch with FP4 quantization enabled"""
-        self.set_dispatch_type("nvfp4")
+        """NVFP4 dispatch packs two values per byte and carries a block scale,
+        also from a rank without tokens."""
         num_tokens = 128
-        hidden_size = 128
-        router_topk = 1  # Single expert per token for simplicity
-        world_size = torch.distributed.get_world_size()
-        rank = torch.distributed.get_rank()
-        num_experts = world_size
-        num_local_experts = 1  # One expert per rank
-
-        set_dp_buffer_len(
-            global_dp_buffer_len=num_tokens * world_size,
-            local_dp_buffer_len=num_tokens,
-            dp_max_padding=True,
-            global_num_tokens=None,
-        )
-
-        # Create tokens with random values
-        hidden_states = torch.randn(
-            (num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda"
-        )
-
-        # Route all tokens from rank i to expert (i+1) % world_size
-        target_rank = (rank + 1) % world_size
-        target_expert = target_rank  # Since we have 1 expert per rank
-
-        topk_ids = torch.full(
-            (num_tokens, router_topk), target_expert, dtype=torch.int32, device="cuda"
-        )
-        topk_weights = torch.ones(
-            (num_tokens, router_topk), dtype=torch.float32, device="cuda"
-        )
-
-        from sglang.srt.layers.moe.topk import StandardTopKOutput
-
-        topk_output = StandardTopKOutput(
-            topk_weights=topk_weights, topk_ids=topk_ids, router_logits=None
-        )
-
-        dispatcher = self.create_dispatcher(
-            router_topk=router_topk,
-            num_experts=num_experts,
-            num_local_experts=num_local_experts,
-            hidden_size=hidden_size,
-        )
+        global_num_tokens = uneven_token_counts(self.world_size, num_tokens)
         # Set input global scale to enable FP4 quantization
         input_global_scale = torch.tensor(1.0, dtype=torch.float32, device="cuda")
-        dispatcher.set_quant_config({"input_global_scale": input_global_scale})
-
-        dispatch_output = dispatcher.dispatch(hidden_states, topk_output)
+        dispatcher = self.create_dispatcher(
+            "nvfp4", {"input_global_scale": input_global_scale}
+        )
+        hidden_states = torch.randn(
+            (global_num_tokens[self.rank], HIDDEN_SIZE),
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        dispatch_output = self.one_round(dispatcher, hidden_states, global_num_tokens)
 
         self.assertEqual(
             dispatch_output.hidden_states.shape,
-            (num_tokens * world_size, hidden_size // 2),
+            (num_tokens * self.world_size, HIDDEN_SIZE // 2),
         )
         self.assertEqual(dispatch_output.hidden_states.dtype, torch.uint8)
 
-        self.assertNotEqual(dispatch_output.hidden_states_scale, None)
+        self.assertIsNotNone(dispatch_output.hidden_states_scale)
         self.assertEqual(
-            dispatch_output.hidden_states_scale.numel(),
-            num_tokens * world_size * (hidden_size // 16),
+            dispatch_output.hidden_states_scale.shape,
+            (num_tokens * self.world_size, HIDDEN_SIZE // 16),
         )
         self.assertEqual(dispatch_output.hidden_states_scale.dtype, torch.uint8)
 
     def test_dispatch_with_mxfp8_quantization(self):
-        """Test dispatch with MXFP8 quantization enabled"""
-        self.set_dispatch_type("mxfp8")
+        """MXFP8 dispatch sends FP8 rows, a block scale and the routing ids."""
         num_tokens = 128
-        hidden_size = 128
-        router_topk = 1
-        world_size = torch.distributed.get_world_size()
-        rank = torch.distributed.get_rank()
-        num_experts = world_size
-        num_local_experts = 1
-
-        set_dp_buffer_len(
-            global_dp_buffer_len=num_tokens * world_size,
-            local_dp_buffer_len=num_tokens,
-            dp_max_padding=True,
-            global_num_tokens=None,
-        )
-
-        hidden_states = torch.randn(
-            (num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda"
-        )
-
-        target_rank = (rank + 1) % world_size
-        target_expert = target_rank
-        topk_ids = torch.full(
-            (num_tokens, router_topk), target_expert, dtype=torch.int32, device="cuda"
-        )
-        topk_weights = torch.ones(
-            (num_tokens, router_topk), dtype=torch.float32, device="cuda"
-        )
-
-        from sglang.srt.layers.moe.topk import StandardTopKOutput
-
-        topk_output = StandardTopKOutput(
-            topk_weights=topk_weights, topk_ids=topk_ids, router_logits=None
-        )
-
         dispatcher = self.create_dispatcher(
-            router_topk=router_topk,
-            num_experts=num_experts,
-            num_local_experts=num_local_experts,
-            hidden_size=hidden_size,
+            "mxfp8", {"input_global_scale": None, "use_mxfp8": True}
         )
-        dispatcher.set_quant_config({"input_global_scale": None, "use_mxfp8": True})
-
-        dispatch_output = dispatcher.dispatch(hidden_states, topk_output)
+        hidden_states = torch.randn(
+            (num_tokens, HIDDEN_SIZE), dtype=torch.bfloat16, device="cuda"
+        )
+        dispatch_output = self.one_round(
+            dispatcher, hidden_states, [num_tokens] * self.world_size
+        )
 
         self.assertEqual(
             dispatch_output.hidden_states.shape,
-            (num_tokens * world_size, hidden_size),
+            (num_tokens * self.world_size, HIDDEN_SIZE),
         )
         self.assertEqual(dispatch_output.hidden_states.dtype, torch.float8_e4m3fn)
         self.assertEqual(dispatch_output.output_dtype, torch.bfloat16)
@@ -423,80 +410,35 @@ class TestFlashinferDispatcher(CustomTestCase):
         self.assertIsNotNone(dispatch_output.hidden_states_scale)
         self.assertEqual(
             dispatch_output.hidden_states_scale.shape,
-            (num_tokens * world_size, hidden_size // 32),
+            (num_tokens * self.world_size, HIDDEN_SIZE // 32),
         )
         self.assertEqual(dispatch_output.hidden_states_scale.dtype, torch.uint8)
-        self.assertEqual(
-            dispatch_output.topk_output.topk_ids.shape,
-            (num_tokens * world_size, router_topk),
-        )
-        self.assertEqual(dispatch_output.topk_output.topk_ids.dtype, torch.int32)
 
     def test_dispatch_with_mxfp8_quantization_and_empty_rank(self):
         """All ranks must contribute the same payload dtypes, including empty ranks."""
-        self.set_dispatch_type("mxfp8")
         num_tokens = 16
-        hidden_size = 128
-        router_topk = 1
-        world_size = torch.distributed.get_world_size()
-        rank = torch.distributed.get_rank()
-        empty_rank = 1
-
-        global_num_tokens = [num_tokens] * world_size
-        global_num_tokens[empty_rank] = 0
-        set_dp_buffer_len(
-            global_dp_buffer_len=num_tokens * world_size,
-            local_dp_buffer_len=num_tokens,
-            dp_max_padding=False,
-            global_num_tokens=global_num_tokens,
+        global_num_tokens = uneven_token_counts(self.world_size, num_tokens)
+        dispatcher = self.create_dispatcher(
+            "mxfp8", {"input_global_scale": None, "use_mxfp8": True}
         )
-
-        local_tokens = 0 if rank == empty_rank else num_tokens
         hidden_states = torch.randn(
-            (local_tokens, hidden_size), dtype=torch.bfloat16, device="cuda"
-        )
-        target_expert = (rank + 1) % world_size
-        topk_ids = torch.full(
-            (local_tokens, router_topk),
-            target_expert,
-            dtype=torch.int32,
+            (global_num_tokens[self.rank], HIDDEN_SIZE),
+            dtype=torch.bfloat16,
             device="cuda",
         )
-        topk_weights = torch.ones(
-            (local_tokens, router_topk), dtype=torch.float32, device="cuda"
-        )
-
-        from sglang.srt.layers.moe.topk import StandardTopKOutput
-
-        dispatcher = self.create_dispatcher(
-            router_topk=router_topk,
-            num_experts=world_size,
-            num_local_experts=1,
-            hidden_size=hidden_size,
-        )
-        dispatcher.set_quant_config({"input_global_scale": None, "use_mxfp8": True})
-        self._zero_moe_a2a_dispatch_payloads()
-        torch.distributed.barrier()
-        dispatch_output = dispatcher.dispatch(
-            hidden_states,
-            StandardTopKOutput(
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                router_logits=None,
-            ),
-        )
+        dispatch_output = self.one_round(dispatcher, hidden_states, global_num_tokens)
 
         self.assertEqual(dispatch_output.hidden_states.dtype, torch.float8_e4m3fn)
         self.assertEqual(dispatch_output.hidden_states_scale.dtype, torch.uint8)
         self.assertEqual(
             dispatch_output.hidden_states.shape,
-            (num_tokens * world_size, hidden_size),
+            (num_tokens * self.world_size, HIDDEN_SIZE),
+        )
+        self.assertEqual(
+            dispatch_output.hidden_states_scale.shape,
+            (num_tokens * self.world_size, HIDDEN_SIZE // 32),
         )
 
 
 if __name__ == "__main__":
-    """
-    Usage
-    torchrun --nproc_per_node=4 test_flashinfer_dispatcher.py
-    """
     unittest.main()
