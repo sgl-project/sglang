@@ -40,6 +40,50 @@ def next_layer():
 
 
 class TestIndependentStageConstruction(CustomTestCase):
+    def test_kda_compute_owned_cp_gather_preserves_output_contract(self):
+        """Deferring the input gather must not defer the KDA output sum."""
+        from sglang.srt.layers.layer_boundary import SumGroup, TokenAxis
+
+        parallel = fixture.parallel_of(
+            attn_dp=1,
+            attn_tp=1,
+            attn_cp=4,
+            enable_prefill_cp=True,
+            enable_cp_tp_group_sharing=True,
+            cp_strategy="interleave",
+        )
+        with fixture.planning(parallel, dsa_cp=True):
+            baseline = build_stages(
+                (declare_attn(tp_group=SumGroup.TP), fixture.Norm()),
+                (declare_ffn(sparse=True), fixture.Norm()),
+            )[0]
+            optimized = build_stages(
+                (
+                    declare_attn(tp_group=SumGroup.TP, gathers_attn_cp_input=True),
+                    fixture.Norm(),
+                ),
+                (declare_ffn(sparse=True), fixture.Norm()),
+            )[0]
+            for variant in baseline.plan.edges:
+                a = baseline.plan.edges[variant]
+                b = optimized.plan.edges[variant]
+                self.assertEqual(a.outgoing, b.outgoing)
+                self.assertEqual(a.incoming.residual_to, b.incoming.residual_to)
+                expected = (
+                    frozenset({TokenAxis.ATTN_CP})
+                    if variant is BatchVariant.CONTEXT_PARALLEL
+                    else frozenset()
+                )
+                self.assertEqual(b.incoming.need.gathered_by_compute, expected)
+                self.assertEqual(a.incoming.need.layout, b.incoming.need.layout)
+        declaration = declare_attn(tp_group=SumGroup.TP, gathers_attn_cp_input=True)
+        self.assertTrue(facts_of(declaration).gathers_attn_cp_input)
+        with fixture.planning(
+            SimpleNamespace(**{**vars(parallel), "cp_strategy": "zigzag"}), dsa_cp=True
+        ):
+            with self.assertRaisesRegex(NotImplementedError, "interleave CP/TP"):
+                build_stages((declaration, fixture.Norm()), terminal=True)
+
     def test_active_variant_without_a_bound_path_never_falls_back(self):
         from sglang.srt.layers.layer_boundary import construction
         from sglang.test.boundary_fixtures import stub_plan
