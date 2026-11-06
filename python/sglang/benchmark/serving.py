@@ -2342,10 +2342,17 @@ def cli_main():
             "longbench_v2",
             "speed-bench",
         ],
-        help="Name of the dataset to benchmark on.",
+        help=(
+            "Name of the dataset to benchmark on. 'random' samples tokens from "
+            "ShareGPT (downloaded from Hugging Face unless --dataset-path is "
+            "provided). 'random-ids' generates token IDs without a dataset download."
+        ),
     )
     parser.add_argument(
-        "--dataset-path", type=str, default="", help="Path to the dataset."
+        "--dataset-path",
+        type=str,
+        default="",
+        help="Path to the dataset. For 'random', provide a local ShareGPT JSON file to avoid downloading it.",
     )
     parser.add_argument(
         "--dataset-offset",
