@@ -135,6 +135,28 @@ hicache:
       - 'python/sglang/srt/mem_cache/**/*storage*'
       - 'python/sglang/srt/mem_cache/l2_transfer.py'
 
+# A *mooncake* filename glob also matches benchmark/datasets/mooncake.py.
+mooncake:
+  - changed-files:
+    - any-glob-to-any-file:
+      # PD KV transfer.
+      - 'python/sglang/srt/disaggregation/mooncake/**/*'
+      - 'python/sglang/srt/distributed/device_communicators/mooncake_transfer_engine.py'
+      - 'python/sglang/srt/observability/mooncake_trace.py'
+      - 'test/registered/unit/disaggregation/**/*mooncake*'
+      - 'test/manual/kv_transfer/**/*mooncake*'
+      # HiCache store.
+      - 'python/sglang/srt/mem_cache/storage/mooncake_store/**/*'
+      - 'python/sglang/test/mooncake_utils.py'
+      - 'test/registered/unit/mem_cache/**/*mooncake*'
+      - 'test/registered/hicache/**/*mooncake*'
+      # MoE EP. elastic_ep.py also implements nixl.
+      - 'python/sglang/srt/layers/moe/token_dispatcher/mooncake.py'
+      - 'python/sglang/srt/elastic_ep/expert_backup_client.py'
+      - 'python/sglang/srt/elastic_ep/expert_backup_manager.py'
+      - 'test/registered/ep/**/*mooncake*'
+      - 'test/manual/ep/**/*mooncake*'
+
 # Deterministic
 deterministic:
   - changed-files:

@@ -39,6 +39,12 @@ class Model(msgspec.Struct):
         doc="Whether weight loading overlaps startup.",
     )
 
+    # Runtime-only binding: loaders/runners scope the immutable model-owned value.
+    shared_experts = Derived(
+        fn="sglang.srt.configs.shared_experts.default_shared_experts_config",
+        doc="Shared-expert layout of the model being constructed or executed.",
+    )
+
     # -------------------------------------------------------------------------
     # Model and tokenizer
     # -------------------------------------------------------------------------

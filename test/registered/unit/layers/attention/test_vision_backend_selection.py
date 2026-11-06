@@ -10,7 +10,7 @@ from einops import rearrange
 from sglang.srt.layers.attention import vision
 from sglang.test.ci.ci_register import register_cpu_ci, register_npu_ci
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 register_npu_ci(est_time=2, suite="base-b-test-1-npu-a3")
 register_npu_ci(est_time=2, suite="nightly-1-npu-a3", nightly=True)
 
@@ -259,3 +259,64 @@ def test_ascend_attention_unmasked_inputs_keep_fused_path(
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
+
+
+SDPA_NUM_HEADS = 2
+SDPA_HEAD_DIM = 8
+
+
+def _sdpa_qkv(s):
+    torch.manual_seed(0)
+    return [torch.randn(s, SDPA_NUM_HEADS, SDPA_HEAD_DIM) for _ in range(3)]
+
+
+def _masked_forward(backend, q, k, v, cu_seqlens):
+    """The original path: an explicit attention_mask bypasses the per-sequence split."""
+    mask = backend.generate_patch_attention_mask(
+        q.shape[0], cu_seqlens, flatten_batch=backend.flatten_batch
+    )
+    return backend(q=q, k=k, v=v, bsz=1, cu_seqlens=cu_seqlens, attention_mask=mask)
+
+
+@pytest.mark.parametrize(
+    ("flatten_batch", "cu"),
+    [
+        (False, [0, 12]),  # one image: the mask is all-True
+        (True, [0, 12]),
+        (True, [0, 5, 12, 20]),  # several images: block-diagonal mask
+        (True, [0, 5, 5, 12]),  # zero-length segment
+    ],
+)
+def test_per_sequence_sdpa_matches_masked(flatten_batch, cu):
+    backend = vision.VisionSdpaAttention(
+        head_dim=SDPA_HEAD_DIM,
+        num_heads=SDPA_NUM_HEADS,
+        num_kv_heads=SDPA_NUM_HEADS,
+        flatten_batch=flatten_batch,
+    )
+    cu_seqlens = torch.tensor(cu, dtype=torch.int32)
+    q, k, v = _sdpa_qkv(cu[-1])
+
+    assert backend._maskless_seq_lens(s=cu[-1], bsz=1, cu_seqlens=cu_seqlens)
+    output = backend(q=q, k=k, v=v, bsz=1, cu_seqlens=cu_seqlens)
+
+    torch.testing.assert_close(output, _masked_forward(backend, q, k, v, cu_seqlens))
+
+
+@pytest.mark.parametrize(
+    ("flatten_batch", "cu", "s"),
+    [
+        (True, [0, 6, 10], 12),  # cu_seqlens does not cover the padded tail
+        (False, [0, 6, 12], 12),  # non-flatten masks are padding masks, not blocks
+    ],
+)
+def test_mask_kept_when_not_block_diagonal(flatten_batch, cu, s):
+    backend = vision.VisionSdpaAttention(
+        head_dim=SDPA_HEAD_DIM,
+        num_heads=SDPA_NUM_HEADS,
+        num_kv_heads=SDPA_NUM_HEADS,
+        flatten_batch=flatten_batch,
+    )
+    cu_seqlens = torch.tensor(cu, dtype=torch.int32)
+
+    assert backend._maskless_seq_lens(s=s, bsz=1, cu_seqlens=cu_seqlens) is None

@@ -10,6 +10,7 @@ from sglang.kernels.ops.gemm.router_gemv_hip import (
     rocm_router_reduce_partials,
 )
 from sglang.kernels.ops.moe.rocm_router_gate import rocm_router_gate
+from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
@@ -135,7 +136,7 @@ class TestRocmRouterGate(CustomTestCase):
             config = TopKConfig(
                 top_k=TOPK + 1,
                 renormalize=True,
-                num_fused_shared_experts=1,
+                shared_experts=SharedExpertsConfig(num_fused_shared_experts=1),
                 correction_bias=self.bias_bf16,
                 routed_scaling_factor=1.5,
                 fused_shared_experts_scaling_factor=scaling,

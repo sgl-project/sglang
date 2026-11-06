@@ -870,3 +870,167 @@ def test_lingbot_context_cache_update_skips_unused_projection(monkeypatch):
     assert kwargs["encoder_hidden_states_image"] == "image"
     assert kwargs["c2ws_plucker_emb"] == "pose"
     assert kwargs["skip_final_projection"] is True
+
+
+def _fusable_qkv_block():
+    block = object.__new__(CausalLingBotWorldTransformerBlock)
+    torch.nn.Module.__init__(block)
+    block.to_q = torch.nn.Linear(4, 6, bias=True)
+    block.to_k = torch.nn.Linear(4, 6, bias=True)
+    block.to_v = torch.nn.Linear(4, 6, bias=True)
+    block._qkv_fused = False
+    return block
+
+
+def _qkv_reference(block, x):
+    return torch.cat([block.to_q(x), block.to_k(x), block.to_v(x)], dim=-1)
+
+
+def test_lingbot_qkv_fusion_shares_storage_and_sees_weight_updates():
+    block = _fusable_qkv_block()
+    assert block.fuse_qkv_projection()
+    packed, _ = block._packed_qkv_params()
+    for layer in (block.to_q, block.to_k, block.to_v):
+        assert (
+            layer.weight.untyped_storage().data_ptr()
+            == packed.untyped_storage().data_ptr()
+        )
+    x = torch.randn(3, 4)
+    with torch.no_grad():
+        block.to_k.weight.add_(1.0)  # in-place update, like a LoRA merge
+    q, k, v = block._project_qkv(x)
+    torch.testing.assert_close(torch.cat([q, k, v], dim=-1), _qkv_reference(block, x))
+
+
+def test_lingbot_qkv_repack_follows_replaced_weights():
+    block = _fusable_qkv_block()
+    block.fuse_qkv_projection()
+    with torch.no_grad():
+        for layer in (block.to_q, block.to_k, block.to_v):
+            layer.weight.data = torch.randn_like(layer.weight)
+    block.repack_qkv_projection()
+    x = torch.randn(3, 4)
+    q, k, v = block._project_qkv(x)
+    torch.testing.assert_close(torch.cat([q, k, v], dim=-1), _qkv_reference(block, x))
+
+
+def test_lingbot_qkv_repacks_after_dtype_move():
+    """After block.to(dtype), the fused projection must follow the layers'
+    new weights instead of failing on a dtype mismatch."""
+    block = _fusable_qkv_block()
+    block.fuse_qkv_projection()
+    block.to(dtype=torch.float64)
+    x = torch.randn(3, 4, dtype=torch.float64)
+    q, k, v = block._project_qkv(x)
+    torch.testing.assert_close(torch.cat([q, k, v], dim=-1), _qkv_reference(block, x))
+
+
+def test_lingbot_model_refresh_repacks_qkv_after_weight_swap():
+    block = _fusable_qkv_block()
+    block.fuse_qkv_projection()
+    model = object.__new__(CausalLingBotWorldTransformer3DModel)
+    torch.nn.Module.__init__(model)
+    model.blocks = torch.nn.ModuleList([block])
+    with torch.no_grad():
+        for layer in (block.to_q, block.to_k, block.to_v):
+            layer.weight.data = torch.randn_like(layer.weight)
+    model.refresh_weight_derived_caches(weights_path=None)
+    x = torch.randn(3, 4)
+    q, k, v = block._project_qkv(x)
+    torch.testing.assert_close(torch.cat([q, k, v], dim=-1), _qkv_reference(block, x))
+
+
+def test_lingbot_qkv_pack_is_freed_by_layerwise_release(monkeypatch):
+    """release_layer() must drop the packed QKV allocation: the block may not
+    keep its own reference to it, and the fused path must repack after the
+    layer is prefetched again."""
+    from sglang.multimodal_gen.runtime.managers.memory_managers import (
+        layerwise_offload as layerwise_offload_mod,
+    )
+    from sglang.multimodal_gen.test.unit.test_layerwise_offload import (
+        _FakeDeviceModule,
+    )
+
+    monkeypatch.setattr(
+        layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
+    )
+    monkeypatch.setattr(layerwise_offload_mod.current_platform, "device_type", "cpu")
+
+    block = _fusable_qkv_block()
+    model = torch.nn.Module()
+    model.blocks = torch.nn.ModuleList([block])
+    manager = layerwise_offload_mod.LayerwiseOffloadManager(
+        model=model,
+        layers_attr_str="blocks",
+        num_layers=1,
+        enabled=True,
+        pin_cpu_memory=False,
+        prefetch_size=1,
+    )
+    x = torch.randn(3, 4)
+    expected = _qkv_reference(block, x)
+    q, k, v = block._project_qkv(x)
+    torch.testing.assert_close(torch.cat([q, k, v], dim=-1), expected)
+    assert block._packed_qkv_params() is not None
+
+    manager.release_layer(0)
+    assert not [
+        name for name, value in vars(block).items() if isinstance(value, torch.Tensor)
+    ]
+    assert all(
+        getattr(layer, name).numel() <= 1
+        for layer in (block.to_q, block.to_k, block.to_v)
+        for name in ("weight", "bias")
+    )
+
+    manager.prefetch_layer(0, non_blocking=False)
+    q, k, v = block._project_qkv(x)
+    torch.testing.assert_close(torch.cat([q, k, v], dim=-1), expected)
+
+
+def test_lingbot_causal_attention_without_cache_applies_rope_once(monkeypatch):
+    attn = object.__new__(lingbot_world_module.LingBotWorldCausalSelfAttention)
+    torch.nn.Module.__init__(attn)
+    seen = {}
+
+    def fake_parent_forward(
+        self, q, k, v, freqs_cis, block_mask, kv_cache, current_start, cache_start
+    ):
+        seen["q"] = q.clone()
+        seen["k"] = k.clone()
+        return v
+
+    def fake_inplace_rope(q, k, cos_sin_cache, is_neox):
+        q.add_(1.0)
+        k.add_(1.0)
+        return q, k
+
+    monkeypatch.setattr(
+        lingbot_world_module.CausalWanSelfAttention, "forward", fake_parent_forward
+    )
+    monkeypatch.setattr(lingbot_world_module, "_is_cuda", True)
+    monkeypatch.setattr(
+        lingbot_world_module, "apply_flashinfer_rope_qk_inplace", fake_inplace_rope
+    )
+    monkeypatch.setattr(
+        lingbot_world_module,
+        "get_forward_context",
+        lambda: SimpleNamespace(forward_batch=None),
+    )
+    q = torch.randn(1, 2, 3, 4)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    cos, sin = torch.ones(2, 2), torch.zeros(2, 2)
+    q_before, k_before = q.clone(), k.clone()
+    attn.forward(q, k, v, (cos, sin), None, None, 0, None)
+    torch.testing.assert_close(seen["q"], q_before)
+    torch.testing.assert_close(seen["k"], k_before)
+
+
+def test_lingbot_sequence_strategies_needing_equal_chunks_reject_uneven_splits():
+    check = lingbot_world_module._check_sequence_split_strategy
+    for strategy in ("kvgather_replicated", "kvgather_sharded", "ring"):
+        with pytest.raises(NotImplementedError):
+            check(strategy, [3, 5])
+        check(strategy, [4, 4])
+    check("ulysses", [3, 5])

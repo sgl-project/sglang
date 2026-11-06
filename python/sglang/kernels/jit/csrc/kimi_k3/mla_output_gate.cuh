@@ -27,7 +27,7 @@ template <int kThreads, bool kUsePDL>
 __global__ void mla_output_gate_kernel(const MlaOutputGateParams __grid_constant__ params) {
   using namespace device;
 
-  constexpr int kVecN = 8;
+  constexpr int kVecN = 4;
   using vec_bf16_t = AlignedVector<bf16_t, kVecN>;
 
   const uint32_t v = blockIdx.x * kThreads + threadIdx.x;
@@ -60,7 +60,7 @@ struct MlaOutputGateKernel {
 
     auto N_ = SymbolicSize{"numel"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     TensorMatcher({N_}).with_dtype<bf16_t>().with_device(device).verify(x);
     TensorMatcher({N_}).with_dtype<bf16_t>().with_device(device).verify(gate);
@@ -74,7 +74,7 @@ struct MlaOutputGateKernel {
         .x = static_cast<const bf16_t*>(x.data_ptr()),
         .gate = static_cast<const bf16_t*>(gate.data_ptr()),
         .out = static_cast<bf16_t*>(out.data_ptr()),
-        .n_vecs = N / 8,
+        .n_vecs = N / 4,
     };
     const uint32_t n_blocks = (params.n_vecs + kThreads - 1) / kThreads;
     LaunchKernel(n_blocks, kThreads, device.unwrap()).enable_pdl(kUsePDL)(kernel, params);

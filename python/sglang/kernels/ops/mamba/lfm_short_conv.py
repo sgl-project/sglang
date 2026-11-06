@@ -13,6 +13,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.arch import current_arch
+
 _DISABLE_LFM_FUSED_CONV = os.getenv("SGLANG_DISABLE_LFM_FUSED_CONV", "0") == "1"
 
 
@@ -240,7 +242,7 @@ def can_use_fused_lfm_short_conv(
         not _DISABLE_LFM_FUSED_CONV
         and b.is_cuda
         and torch.version.hip is None
-        and torch.cuda.get_device_capability(b.device) == (9, 0)
+        and current_arch().is_sm(9, 0)
         and c.is_cuda
         and x.is_cuda
         and weight.is_cuda
