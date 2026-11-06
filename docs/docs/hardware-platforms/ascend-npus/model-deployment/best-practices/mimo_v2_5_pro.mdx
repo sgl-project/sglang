@@ -111,7 +111,7 @@ python3 -m sglang.launch_server \
     --host <your decode ip> --max-running-requests 32 \
     --mem-fraction-static 0.88 \
     --swa-full-tokens-ratio 0.3 \
-    --cuda-graph-bs 1 2 4 8 12 16 \
+    --cuda-graph-bs-decode 1 2 4 8 12 16 \
     --disaggregation-mode decode --disaggregation-transfer-backend ascend \
     --disaggregation-bootstrap-port 8996 \
     --moe-a2a-backend deepep --deepep-mode low_latency \
