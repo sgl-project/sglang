@@ -54,6 +54,7 @@ from sglang.srt.layers.attention.graph_variants import (
 from sglang.srt.layers.cp.utils import is_mla_cp_enabled
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
+    dp_capacity_for,
     require_attn_tp_gather,
     require_mlp_tp_gather,
     set_dp_buffer_len,
@@ -1166,6 +1167,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
 
         global_num_tokens_cpu = self._global_num_tokens_for_graph(num_tokens)
+        # Captured at the buffer ceiling; replay fills only the live num_dp_ranks.
+        if self.require_mlp_tp_gather:
+            global_num_tokens_cpu = [num_tokens] * dp_capacity_for(self.num_dp_ranks)
 
         if global_num_tokens_cpu is not None:
             global_dp_buffer_len = sum(global_num_tokens_cpu)
