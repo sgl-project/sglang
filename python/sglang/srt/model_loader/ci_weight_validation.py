@@ -76,12 +76,12 @@ def _write_per_run_marker(
         logger.debug("Cannot write per-run marker: invalid snapshot_dir")
         return
 
-    from datetime import datetime
+    from datetime import datetime, timezone
 
     snapshot_hash = os.path.basename(snapshot_dir)
 
     marker = {
-        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "model_id": model_id,
         "snapshot_hash": snapshot_hash,
         "validation_passed": True,

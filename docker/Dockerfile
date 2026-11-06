@@ -209,7 +209,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 COPY python/pyproject.toml /tmp/sglang_deps/python/pyproject.toml
 COPY rust/sglang-grpc      /tmp/sglang_deps/rust/sglang-grpc
 COPY rust/sglang-mm        /tmp/sglang_deps/rust/sglang-mm
-COPY rust/sglang-api-types /tmp/sglang_deps/rust/sglang-api-types
+COPY rust/sglang-runtime-v1-types /tmp/sglang_deps/rust/sglang-runtime-v1-types
 
 # Install sglang dependencies (torch, transformers, etc.).
 # Generate constraints.txt to prevent reinstalling these deps in later stages.
@@ -663,7 +663,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # SM103, compiled at runtime); disable with --build-arg ENABLE_SGL_NVIDIA_MEGA=0.
 ARG ENABLE_SGL_NVIDIA_MEGA=1
 ARG SGL_NVIDIA_MEGA_REPO="https://github.com/sgl-project/sgl-nvidia-mega.git"
-ARG SGL_NVIDIA_MEGA_COMMIT="54b428921749fef89fcbd043000f839ac9cc4638"
+ARG SGL_NVIDIA_MEGA_COMMIT="77360f1fd74dc46010056ebdac0ed5e0b87d3978"
 RUN --mount=type=cache,target=/root/.cache/uv \
     if [ "${ENABLE_SGL_NVIDIA_MEGA}" != "1" ]; then \
         echo "[sgl-nvidia-mega] skip (ENABLE_SGL_NVIDIA_MEGA=${ENABLE_SGL_NVIDIA_MEGA})"; \
