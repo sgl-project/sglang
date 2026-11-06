@@ -639,8 +639,8 @@ def _check_gdn_replayssm_ucache_megakernel(cfg: Any, *, flag: str) -> None:
             f"{flag} cannot run with --enable-nvidia-megakernel: its verify step "
             "reads the GDN pool without the u-cache rings."
         )
-    # The deferred side-stream cursor commit is not ordered before the
-    # schedule-stream hist_len reset of a reacquired slot.
+    # A late-joined cursor commit from a slot's previous owner can land after
+    # the forward-stream extend reset (reset_gdn_ucache_cursors).
     if envs.SGLANG_PLB_COMMIT_LATE_JOIN.get():
         raise ValueError(f"{flag} cannot run with SGLANG_PLB_COMMIT_LATE_JOIN.")
     if envs.SGLANG_Q38C_MK_GDN.get():
