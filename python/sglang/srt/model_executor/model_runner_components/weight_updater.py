@@ -13,7 +13,10 @@ from sglang.srt.model_loader.loader import (
     get_model_loader,
     post_load_weights,
 )
-from sglang.srt.model_loader.utils import set_default_torch_dtype
+from sglang.srt.model_loader.utils import (
+    WeightUpdateRejected,
+    set_default_torch_dtype,
+)
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     get_pp_stage_load_group,
@@ -373,7 +376,14 @@ class WeightUpdater:
             _model_load_weights_direct(self.get_model(), named_tensors)
         elif load_format in self.custom_weight_loaders:
             custom_loader = dynamic_import(load_format)
-            custom_loader(self.get_model(), named_tensors)
+            try:
+                custom_loader(self.get_model(), named_tensors)
+            except WeightUpdateRejected as e:
+                # Only the first pipeline stage reports the result, so the other
+                # stages could not learn of a rejection and fail the call too.
+                if get_parallel().pp_size > 1:
+                    raise
+                return False, f"{load_format} rejected the update: {e}"
         elif load_format is None:
             self.get_model().load_weights(named_tensors)
         else:

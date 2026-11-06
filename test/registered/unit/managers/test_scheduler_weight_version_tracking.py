@@ -546,5 +546,45 @@ class TestWeightUpdateSession(_WeightUpdaterManagerTestBase):
         target.weight_updater.receive_weights_from_distributed.assert_not_called()
 
 
+class TestTensorUpdatePartiallyApplied(_WeightUpdaterManagerTestBase):
+    """A tensor update applied somewhere and rejected elsewhere reports failure,
+    records no version, and still flushes the cache of the applied weights."""
+
+    def _manager_with_flush_log(self, target, draft=None):
+        manager = self._manager(target, draft)
+        flushes = []
+        manager.flush_cache = lambda **kwargs: flushes.append(kwargs) or True
+        return manager, flushes
+
+    def test_draft_rejecting_after_the_target_flushes_without_a_version(self):
+        manager, flushes = self._manager_with_flush_log(
+            _runner(), draft=_runner((False, "draft refuses"))
+        )
+        output = manager.update_weights_from_tensor(_request())
+
+        self.assertFalse(output.success)
+        self.assertIn("draft refuses", output.message)
+        self.assertEqual(self.recorded, [])
+        self.assertEqual(len(flushes), 1)
+
+    def test_rejection_on_another_rank_fails_the_update_here(self):
+        manager, flushes = self._manager_with_flush_log(_runner())
+        manager.tp_cpu_group = object()
+
+        def another_rank_rejected(flags, **kwargs):
+            flags[0] = 1
+
+        with (
+            patch("torch.distributed.get_world_size", return_value=2),
+            patch("torch.distributed.all_reduce", side_effect=another_rank_rejected),
+        ):
+            output = manager.update_weights_from_tensor(_request())
+
+        self.assertFalse(output.success)
+        self.assertIn("another tensor-parallel rank", output.message)
+        self.assertEqual(self.recorded, [])
+        self.assertEqual(len(flushes), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

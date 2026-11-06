@@ -21,6 +21,17 @@ from sglang.srt.utils import get_device_sm
 logger = logging.getLogger(__name__)
 
 
+class WeightUpdateRejected(ValueError):
+    """Raised by a custom weight loader before it writes any weight.
+
+    update_weights_from_tensor then returns success=False with this message on
+    every tensor-parallel rank. The served weights stay unchanged only if no
+    rank and no earlier runner (the target, before a draft) applied the update.
+    With pipeline parallelism (pp_size > 1) it is not caught, like any other
+    loader exception, because only the first stage reports the result.
+    """
+
+
 @contextlib.contextmanager
 def set_default_torch_dtype(dtype: torch.dtype):
     """Sets the default torch dtype to the given dtype."""
