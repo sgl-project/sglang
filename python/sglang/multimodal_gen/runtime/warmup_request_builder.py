@@ -29,7 +29,7 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     align_num_frames_for_num_gpus,
     resolve_sequence_shard,
 )
-from sglang.multimodal_gen.configs.task_type import ModelTaskType
+from sglang.multimodal_gen.configs.task_type import DataType, ModelTaskType
 from sglang.multimodal_gen.registry import get_pipeline_config_classes
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import (
@@ -649,7 +649,14 @@ def build_warmup_reqs(
 
     # build warmup reqs
     warmup_reqs = []
-    include_warmup_image = should_include_warmup_image(server_args, server_based_warmup)
+    cosmos3_graph_warmup = (
+        type(server_args.pipeline_config).__name__ == "Cosmos3Config"
+        and server_args.enable_breakable_cuda_graph is True
+        and server_args.warmup_sampling_params is not None
+    )
+    include_warmup_image = not cosmos3_graph_warmup and should_include_warmup_image(
+        server_args, server_based_warmup
+    )
     for width, height, num_frames, is_probe in shapes:
         req_kwargs = dict(
             task_type=task_type,
@@ -658,6 +665,15 @@ def build_warmup_reqs(
             height=height,
             prompt=DEFAULT_PLACEHOLDER_PROMPT,
         )
+        if cosmos3_graph_warmup:
+            # Cosmos3's GEN graph depends on the real UND length and on the
+            # conditioning mode. An explicit profile supplies both for BCG
+            # startup warmup, including T2I/T2V/I2V/V2V.
+            req_kwargs["prompt"] = (
+                sampling_defaults.prompt or DEFAULT_PLACEHOLDER_PROMPT
+            )
+            if sampling_defaults.video_path:
+                req_kwargs["video_path"] = sampling_defaults.video_path
         req_kwargs["sampling_params"] = copy(sampling_defaults)
         req_kwargs.update(
             negative_prompt=negative_prompt,
@@ -698,7 +714,7 @@ def build_warmup_reqs(
         prompts = (
             (DEFAULT_PLACEHOLDER_PROMPT,) + TORCH_COMPILE_REAL_PATH_PREWARM_PROMPTS
             if run_real_path_prewarm
-            else (DEFAULT_PLACEHOLDER_PROMPT,)
+            else (req_kwargs["prompt"],)
         )
         for prompt_idx, prompt in enumerate(prompts):
             prompt_req_kwargs = req_kwargs.copy()
@@ -716,6 +732,10 @@ def build_warmup_reqs(
             req.sampling_params.prepare_synthetic_warmup_request_for_queue(
                 req, server_args
             )
+            if cosmos3_graph_warmup and req.num_frames == 1:
+                req.task_type = ModelTaskType.T2I
+                req.sampling_params.data_type = DataType.IMAGE
+                req.data_type = DataType.IMAGE
             if return_warmup_result:
                 req.extra["return_warmup_result"] = True
             if server_based_warmup:

@@ -25,12 +25,18 @@ from sglang.multimodal_gen.configs.sample.cosmos3 import (
     Cosmos3SamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
-from sglang.multimodal_gen.configs.task_type import DataType
+from sglang.multimodal_gen.configs.task_type import DataType, ModelTaskType
 from sglang.multimodal_gen.registry import (
     _PIPELINE_REGISTRY,
     _discover_and_register_pipelines,
     _get_config_info,
     get_non_diffusers_pipeline_name,
+)
+from sglang.multimodal_gen.runtime.breakable_cuda_graph.replay_token import (
+    replay_token_scope,
+)
+from sglang.multimodal_gen.runtime.breakable_cuda_graph.runner import (
+    _signature_kwargs,
 )
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.entrypoints.action.protocol import (
@@ -58,7 +64,9 @@ from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.models.dits.cosmos3video import (
     Cosmos3OmniTransformer,
     DomainAwareLinear,
+    _attend_past_bcg_prefix_pad,
     _can_enable_t1_fused_qk_norm_rope,
+    _Cosmos3PrefixPad,
     compute_mrope_position_ids_action,
     compute_mrope_position_ids_sound,
     compute_mrope_position_ids_vision,
@@ -82,6 +90,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_guardrails import (
     is_cosmos_guardrail_available,
 )
+from sglang.multimodal_gen.runtime.warmup_request_builder import build_warmup_reqs
 from sglang.srt.environ import envs
 from sglang.test.test_utils import CustomTestCase
 
@@ -2410,6 +2419,247 @@ class TestCosmos3VideoPreprocess(CustomTestCase):
             stage.vae.use_tiling = True
             self.assertTrue(torch.equal(stage._vae_encode(video), video * 2))
             self.assertEqual(stage.vae.calls, 3)
+
+
+class TestCosmos3BCGWarmup(CustomTestCase):
+    def test_v2v_warmup_keeps_conditioning_and_prompt(self):
+        """A startup capture must exercise the V2V mask and real UND length.
+
+        Dropping either field captures a T2V graph or a placeholder-length
+        graph, so the first measured V2V request silently runs eager.
+        """
+        defaults = Cosmos3SamplingParams(
+            width=832,
+            height=480,
+            num_frames=45,
+            num_inference_steps=35,
+            prompt="A robotic arm moves tools into a box on a clean table.",
+            negative_prompt="blurry, distorted, high quality",
+            video_path="/tmp/cosmos3_warmup.mp4",
+            condition_frame_indexes=[0, 1],
+        )
+        args = mock.MagicMock()
+        args.pipeline_config = Cosmos3Config()
+        args.enable_breakable_cuda_graph = True
+        args.enable_torch_compile = False
+        args.enable_cfg_parallel = False
+        args.warmup_sampling_params = {"video_path": defaults.video_path}
+        args.warmup_num_frames = 45
+        args.warmup_steps = 1
+        args.num_gpus = 1
+        with mock.patch(
+            "sglang.multimodal_gen.runtime.warmup_request_builder.get_model_sampling_defaults",
+            return_value=defaults,
+        ):
+            reqs = build_warmup_reqs(
+                args,
+                warmup_resolutions=["832x480"],
+                server_based_warmup=True,
+            )
+        self.assertEqual(len(reqs), 1)
+        req = reqs[0]
+        self.assertTrue(req.is_warmup)
+        self.assertEqual(req.prompt, defaults.prompt)
+        self.assertEqual(req.negative_prompt, defaults.negative_prompt)
+        self.assertEqual(req.video_path, defaults.video_path)
+        self.assertIsNone(req.image_path)
+        self.assertEqual(req.condition_frame_indexes, [0, 1])
+        self.assertEqual(req.num_frames, 45)
+        self.assertEqual(req.num_inference_steps, 35)
+        self.assertFalse(req.save_output)
+
+    def test_t2i_warmup_keeps_image_output_and_text_condition(self):
+        defaults = Cosmos3SamplingParams(
+            width=640,
+            height=640,
+            num_frames=1,
+            num_inference_steps=35,
+            prompt="A robotic arm moves tools into a box.",
+        )
+        args = mock.MagicMock()
+        args.pipeline_config = Cosmos3Config()
+        args.enable_breakable_cuda_graph = True
+        args.enable_torch_compile = False
+        args.enable_cfg_parallel = False
+        args.warmup_sampling_params = {"num_frames": 1}
+        args.warmup_num_frames = 1
+        args.warmup_steps = 35
+        args.num_gpus = 1
+        with mock.patch(
+            "sglang.multimodal_gen.runtime.warmup_request_builder.get_model_sampling_defaults",
+            return_value=defaults,
+        ):
+            req = build_warmup_reqs(
+                args,
+                warmup_resolutions=["640x640"],
+                server_based_warmup=True,
+            )[0]
+        self.assertEqual(req.prompt, defaults.prompt)
+        self.assertIsNone(req.image_path)
+        self.assertIsNone(req.video_path)
+        self.assertEqual(req.num_frames, 1)
+        self.assertEqual(req.task_type, ModelTaskType.T2I)
+        self.assertEqual(req.data_type, DataType.IMAGE)
+        self.assertFalse(req.save_output)
+
+
+class TestCosmos3BCGTextBuckets(unittest.TestCase):
+    def test_one_frame_conditioned_request_stays_eager(self):
+        class Transformer:
+            pass
+
+        stage = Cosmos3DenoisingStage.__new__(Cosmos3DenoisingStage)
+        stage.server_args = types.SimpleNamespace(enable_breakable_cuda_graph=True)
+        stage.transformer = Transformer()
+        latents = types.SimpleNamespace(
+            device=types.SimpleNamespace(type="cuda"),
+            dtype=torch.bfloat16,
+            shape=(1, 1, 1, 2, 2),
+        )
+        with mock.patch(
+            "sglang.multimodal_gen.runtime.pipelines_core.stages."
+            "model_specific_stages.cosmos3.Cosmos3OmniTransformer",
+            Transformer,
+        ):
+            self.assertIsNone(stage._maybe_get_bcg_runner(latents, None, torch.ones(1)))
+
+    def test_prefix_pad_reads_new_value_on_each_replay(self):
+        rows = torch.tensor(3)
+        prefix_pad = _Cosmos3PrefixPad(rows)
+        with replay_token_scope():
+            self.assertEqual(prefix_pad.get(), 3)
+            rows.fill_(1)
+            self.assertEqual(prefix_pad.get(), 3)
+        with replay_token_scope():
+            self.assertEqual(prefix_pad.get(), 1)
+
+    def test_warmup_captures_all_buckets_and_serving_uses_the_smallest_fit(self):
+        stage = Cosmos3DenoisingStage.__new__(Cosmos3DenoisingStage)
+        stage._bcg_kv_buckets = {}
+        stage._extra_transformer_kwargs = {}
+        stage.server_args = types.SimpleNamespace(
+            resolved_bcg_text_buckets=lambda: (8, 16)
+        )
+        stage._current_batch_is_warmup = True
+        runner = mock.Mock(return_value="graph")
+        stage._maybe_get_bcg_runner = lambda *_args: runner
+
+        def prepare(**kwargs):
+            seq = kwargs["max_text_seq_len"]
+            kv = [(torch.ones(1, seq, 2, 8), torch.ones(1, seq, 2, 8))]
+            return kv, (torch.zeros(1), torch.zeros(1))
+
+        stage.transformer = mock.Mock()
+        stage.transformer.prepare_gen_condition.side_effect = prepare
+        latents = torch.zeros(1, 1, 1, 2, 2)
+        timestep = torch.zeros(1)
+
+        def run(length):
+            mask = torch.zeros(1, 16, dtype=torch.long)
+            mask[:, :length] = 1
+            return stage._run_transformer(
+                latents=latents,
+                timestep=timestep,
+                text_ids=torch.ones(1, 16, dtype=torch.long),
+                text_mask=mask,
+                video_shape=(1, 2, 2),
+                fps=24.0,
+                max_text_seq_len=length,
+            )
+
+        with mock.patch(
+            "sglang.multimodal_gen.runtime.pipelines_core.stages."
+            "model_specific_stages.cosmos3.set_forward_context",
+            return_value=contextlib.nullcontext(),
+        ):
+            self.assertEqual(run(13), "graph")
+            self.assertEqual(runner.capture.call_count, 2)
+            capture_short = runner.capture.call_args_list[0].kwargs
+            capture_long = runner.capture.call_args_list[1].kwargs
+            self.assertEqual(capture_short["precomputed_kv"][0][0].shape[1], 8)
+            self.assertEqual(capture_long["precomputed_kv"][0][0].shape[1], 16)
+            stage._current_batch_is_warmup = False
+            self.assertEqual(run(5), "graph")
+            serving = runner.call_args.kwargs
+            self.assertEqual(serving["bcg_und_prefix_pad"].item(), 3)
+            self.assertEqual(
+                _signature_kwargs(capture_short), _signature_kwargs(serving)
+            )
+            self.assertEqual(runner.capture.call_count, 2)
+            self.assertIs(
+                stage._run_transformer(
+                    latents=latents,
+                    timestep=timestep,
+                    text_ids=torch.ones(1, 17, dtype=torch.long),
+                    text_mask=torch.ones(1, 17, dtype=torch.long),
+                    video_shape=(1, 2, 2),
+                    fps=24.0,
+                    max_text_seq_len=17,
+                ),
+                stage.transformer.return_value,
+            )
+            self.assertEqual(runner.call_count, 2)
+
+    def test_different_text_lengths_share_a_signature_and_keep_exact_attention_kv(self):
+        stage = Cosmos3DenoisingStage.__new__(Cosmos3DenoisingStage)
+        stage._bcg_kv_buckets = {}
+        q = torch.zeros(1, 2, 4, 8)
+        suffix_k = torch.full((1, 2, 2, 8), 17.0)
+        suffix_v = torch.full((1, 2, 2, 8), 19.0)
+        seen = []
+
+        class Attention:
+            def __init__(self):
+                self.attn_impl = self
+
+            def forward(self, query, key, value, metadata):
+                seen.append((key.clone(), value.clone(), metadata))
+                return query
+
+        signatures = []
+        with mock.patch(
+            "sglang.multimodal_gen.runtime.models.dits.cosmos3video.get_forward_context",
+            return_value=types.SimpleNamespace(attn_metadata=None),
+        ):
+            for length in (5, 13, 5):
+                k = torch.arange(length * 16, dtype=torch.float32).reshape(
+                    1, length, 2, 8
+                )
+                v = k + 1000
+                padded, pad_rows = stage._bcg_padded_kv([(k, v)], "cond", 16)
+                signatures.append(
+                    _signature_kwargs(
+                        {"precomputed_kv": padded, "bcg_und_prefix_pad": pad_rows}
+                    )
+                )
+                _attend_past_bcg_prefix_pad(
+                    Attention(),
+                    q,
+                    torch.cat([padded[0][0], suffix_k], dim=1),
+                    torch.cat([padded[0][1], suffix_v], dim=1),
+                    _Cosmos3PrefixPad(pad_rows),
+                )
+                self.assertTrue(torch.equal(seen[-1][0], torch.cat([k, suffix_k], 1)))
+                self.assertTrue(torch.equal(seen[-1][1], torch.cat([v, suffix_v], 1)))
+                self.assertIsNone(seen[-1][2])
+        self.assertEqual(signatures[0], signatures[1])
+        self.assertEqual(signatures[0], signatures[2])
+
+    def test_bucket_cache_reuses_only_the_same_request_kv(self):
+        stage = Cosmos3DenoisingStage.__new__(Cosmos3DenoisingStage)
+        stage._bcg_kv_buckets = {}
+        first_kv = [(torch.ones(1, 5, 2, 8), torch.ones(1, 5, 2, 8))]
+        first, first_pad = stage._bcg_padded_kv(first_kv, "cond", 8)
+        again, again_pad = stage._bcg_padded_kv(first_kv, "cond", 8)
+        self.assertIs(first, again)
+        self.assertIs(first_pad, again_pad)
+        self.assertEqual(first_pad.item(), 3)
+        self.assertFalse(first[0][0][:, :3].any())
+
+        next_kv = [(torch.full((1, 5, 2, 8), 2), torch.full((1, 5, 2, 8), 3))]
+        changed, _ = stage._bcg_padded_kv(next_kv, "cond", 8)
+        self.assertIsNot(first, changed)
+        self.assertTrue(torch.equal(changed[0][0][:, 3:], next_kv[0][0]))
 
 
 if __name__ == "__main__":

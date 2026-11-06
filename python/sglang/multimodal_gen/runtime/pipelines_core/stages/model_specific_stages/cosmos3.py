@@ -47,6 +47,9 @@ from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_c
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
+from sglang.multimodal_gen.runtime.models.dits.cosmos3video import (
+    Cosmos3OmniTransformer,
+)
 from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import (
     use_vae_fast_path,
 )
@@ -77,7 +80,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
-from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 from sglang.multimodal_gen.runtime.post_training.rollout_hooks import (
     finalize_rollout_if_enabled,
     init_rollout_env_if_enabled,
@@ -1284,6 +1290,10 @@ class Cosmos3DenoisingStage(PipelineStage):
         # ``batch.extra["transformer_extra_kwargs"]`` (e.g. the Cosmos3
         # multiview attention layout and temporal wrap period).
         self._extra_transformer_kwargs: dict[str, Any] = {}
+        self._bcg_runner = None
+        self._bcg_kv_buckets: dict[
+            tuple[str, int], tuple[list, list, torch.Tensor]
+        ] = {}
 
         # Apply torch.compile if enabled
         if server_args is not None:
@@ -1362,6 +1372,81 @@ class Cosmos3DenoisingStage(PipelineStage):
         if profiler:
             profiler.step_denoising_step()
 
+    def _maybe_get_bcg_runner(
+        self, latents: torch.Tensor, control_latents, noisy_frame_mask
+    ):
+        args = self.server_args
+        if args is None or not args.enable_breakable_cuda_graph:
+            return None
+        # Variant subclasses can replace the GEN attention layout. They need
+        # their own capture validation before sharing the base Cosmos3 graph.
+        if type(self.transformer) is not Cosmos3OmniTransformer:
+            return None
+        if (
+            latents.device.type != "cuda"
+            or latents.dtype != torch.bfloat16
+            or latents.shape[2] != 1
+            or noisy_frame_mask is not None
+            or args.num_gpus != 1
+            or not self.transformer.bcg_bf16_eligible
+            or self.transformer.step_precision_controller is not None
+            or self.transformer._gen_layers_torch_compiled
+            or get_sp_world_size() != 1
+            or control_latents is not None
+            or self._extra_transformer_kwargs
+            or args.enable_torch_compile
+            or args.dit_cpu_offload
+            or args.dit_layerwise_offload
+            or "transformer" in (args.cpu_offload_components or [])
+            or "transformer" in (args.layerwise_offload_components or [])
+            or args.component_residency is not None
+            or args.lora_path is not None
+            or any(
+                layer.cross_attention.attn.backend
+                not in (
+                    AttentionBackendEnum.TORCH_SDPA,
+                    AttentionBackendEnum.DYNAMIC_CUDNN_SDPA,
+                )
+                for layer in self.transformer.gen_layers
+            )
+        ):
+            return None
+        if self._bcg_runner is None:
+            from sglang.multimodal_gen.runtime.breakable_cuda_graph.runner import (
+                DiffusionBreakableCudaGraphRunner,
+            )
+
+            self._bcg_runner = DiffusionBreakableCudaGraphRunner(
+                self.transformer, latents.device
+            )
+        return self._bcg_runner
+
+    def _bcg_padded_kv(
+        self,
+        cached_kv: list[tuple[torch.Tensor, torch.Tensor]],
+        cache_key: str,
+        bucket: int,
+    ) -> tuple[list[tuple[torch.Tensor, torch.Tensor]], torch.Tensor]:
+        """Left-pad UND K/V once per request, preserving the eager UND output."""
+        key = (cache_key, bucket)
+        entry = self._bcg_kv_buckets.get(key)
+        if entry is not None and entry[0] is cached_kv:
+            return entry[1], entry[2]
+        seq = cached_kv[0][0].shape[1]
+        if seq > bucket:
+            raise ValueError("BCG bucket is smaller than the UND K/V sequence")
+        pad = bucket - seq
+        padded = [
+            (
+                F.pad(k, (0, 0, 0, 0, pad, 0)) if pad else k,
+                F.pad(v, (0, 0, 0, 0, pad, 0)) if pad else v,
+            )
+            for k, v in cached_kv
+        ]
+        prefix_pad = torch.tensor(pad, dtype=torch.int32, device=cached_kv[0][0].device)
+        self._bcg_kv_buckets[key] = (cached_kv, padded, prefix_pad)
+        return padded, prefix_pad
+
     def _run_transformer(
         self,
         latents: torch.Tensor,
@@ -1398,7 +1483,7 @@ class Cosmos3DenoisingStage(PipelineStage):
         if current_timestep is None:
             current_timestep = int(timestep.flatten()[0].item())
         with set_forward_context(current_timestep=current_timestep, attn_metadata=None):
-            return self.transformer(
+            call_kwargs = dict(
                 hidden_states=latents,
                 encoder_hidden_states=None,  # Not used by Cosmos3
                 timestep=timestep,
@@ -1419,6 +1504,107 @@ class Cosmos3DenoisingStage(PipelineStage):
                     self, "_share_vision_temporal_positions", True
                 ),
                 **self._extra_transformer_kwargs,
+            )
+            # Sound/action heads and their step-dependent layouts need their
+            # own capture and accuracy validation. Keep those paths eager.
+            has_extra_modality = any(
+                value is not None
+                for value in (
+                    sound_latents,
+                    action_latents,
+                    action_noisy_mask,
+                    action_domain_ids,
+                )
+            )
+            runner = (
+                None
+                if has_extra_modality
+                else self._maybe_get_bcg_runner(
+                    latents, control_latents, noisy_frame_mask
+                )
+            )
+            if runner is None:
+                return self.transformer(**call_kwargs)
+
+            buckets = self.server_args.resolved_bcg_text_buckets()
+            text_len = (
+                max_text_seq_len
+                if max_text_seq_len is not None
+                else int(text_mask.sum(dim=1).max().item())
+            )
+            bucket = next((size for size in buckets if text_len <= size), None)
+            if bucket is None and not self._current_batch_is_warmup:
+                return self.transformer(**call_kwargs)
+
+            cached_kv, gen_rope_inputs = self.transformer.prepare_gen_condition(
+                hidden_states=latents,
+                text_ids=text_ids,
+                text_mask=text_mask,
+                fps=fps,
+                cache_key=cache_key,
+                max_text_seq_len=max_text_seq_len,
+                sound_frames=(
+                    sound_latents.shape[-1] if sound_latents is not None else 0
+                ),
+                action_frames=(
+                    action_latents.shape[1] if action_latents is not None else 0
+                ),
+                action_fps=action_fps,
+                action_start_frame_offset=action_start_frame_offset,
+                transfer_share_vision_temporal_positions=getattr(
+                    self, "_share_vision_temporal_positions", True
+                ),
+                activation_dtype=latents.dtype,
+            )
+            # No text or cache key enters the graph. The current request's UND
+            # K/V and RoPE are copied into persistent static tensor inputs on
+            # every replay; an eager miss uses the same explicit inputs.
+            call_kwargs.update(
+                text_ids=None,
+                text_mask=None,
+                cache_key="bcg",
+                max_text_seq_len=None,
+                precomputed_gen_rope_inputs=gen_rope_inputs,
+            )
+            if self._current_batch_is_warmup:
+                for capture_bucket in buckets:
+                    if text_len <= capture_bucket:
+                        capture_kv, capture_pad = self._bcg_padded_kv(
+                            cached_kv, cache_key, capture_bucket
+                        )
+                    else:
+                        # The warmup prompt may exceed a smaller bucket. Its
+                        # content is irrelevant to capture: use a valid short
+                        # prefix solely to record that bucket's graph shape.
+                        capture_kv = [
+                            (k[:, :capture_bucket], v[:, :capture_bucket])
+                            for k, v in cached_kv
+                        ]
+                        capture_pad = torch.zeros(
+                            (), dtype=torch.int32, device=latents.device
+                        )
+                    runner.capture(
+                        **dict(
+                            call_kwargs,
+                            precomputed_kv=capture_kv,
+                            bcg_und_prefix_pad=capture_pad,
+                        )
+                    )
+            if bucket is None:
+                return self.transformer(
+                    **dict(
+                        call_kwargs,
+                        precomputed_kv=cached_kv,
+                        bcg_und_prefix_pad=None,
+                    )
+                )
+            padded_kv, prefix_pad = self._bcg_padded_kv(cached_kv, cache_key, bucket)
+            return runner(
+                **dict(
+                    call_kwargs,
+                    precomputed_kv=padded_kv,
+                    bcg_und_prefix_pad=prefix_pad,
+                )
             )
 
     @staticmethod
@@ -1756,6 +1942,7 @@ class Cosmos3DenoisingStage(PipelineStage):
 
         # Drop any cached UND K/V from a previous request — its text differs.
         self.transformer.reset_cache()
+        self._bcg_kv_buckets.clear()
 
         self.log_info(
             f"Starting denoising with {len(timesteps)} steps, CFG={do_cfg}, "
