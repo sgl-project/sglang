@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.configs.draft_parallel import DraftParallelLayout
+from sglang.srt.configs.model_config import uses_compressed_kv_attention
 from sglang.srt.mem_cache.kv.router import STATE_PART
 from sglang.srt.model_executor.graph_memory_usage import (
     merge_graph_memory_usage,
@@ -48,12 +49,11 @@ def _can_pack_hicache_mtp(
             runner.model_config.num_nextn_predict_layers for runner in draft_runners
         )
     )
-    is_dspark_dsv4 = (
+    is_dspark_compressed_kv = (
         spec_algorithm.is_dspark()
-        and draft_runners[0].model_config.hf_config.architectures[0]
-        == "DeepseekV4ForCausalLMDSpark"
+        and uses_compressed_kv_attention(draft_runners[0].model_config.hf_config)
     )
-    return is_nextn_mtp or is_dspark_dsv4
+    return is_nextn_mtp or is_dspark_compressed_kv
 
 
 class EagleDraftWorkerBase(ABC):

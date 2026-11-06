@@ -24,6 +24,7 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import RotaryEmbedding, get_rope
 from sglang.srt.layers.rotary_embedding.mrope import MRotaryEmbedding
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -52,7 +53,7 @@ from sglang.srt.runtime_context import (
     get_spec,
     get_stream,
 )
-from sglang.srt.utils import add_prefix, get_bool_env_var, is_cuda, is_hip, is_npu
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, is_npu
 
 Qwen3Config = None
 
