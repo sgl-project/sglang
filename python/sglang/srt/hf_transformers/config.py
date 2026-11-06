@@ -32,8 +32,8 @@ from sglang.srt.configs.model_config_parser_registry import (
 )
 from sglang.srt.connector import create_remote_connector
 from sglang.srt.utils import is_remote_url, lru_cache_frozenset
+from sglang.srt.utils.hf_transformers_patches import _ensure_gguf_version
 
-from ..hf_transformers_patches import _ensure_gguf_version
 from .common import (
     _CONFIG_REGISTRY,
     AutoConfig,

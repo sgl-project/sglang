@@ -28,9 +28,9 @@ from transformers import (
 
 from sglang.srt.connector import create_remote_connector
 from sglang.srt.utils import is_remote_url, logger
+from sglang.srt.utils.hf_transformers_patches import _ensure_gguf_version
 from sglang.srt.utils.patch_tokenizer import patch_tokenizer
 
-from ..hf_transformers_patches import _ensure_gguf_version
 from .common import (
     _resolve_local_or_cached_file,
     attach_additional_stop_token_ids,

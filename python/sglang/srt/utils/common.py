@@ -1660,8 +1660,8 @@ def make_layers(
         check_declared_stages,
         layer_stack,
     )
+    from sglang.srt.layers.offloader import get_offloader
     from sglang.srt.layers.utils import PPMissingLayer
-    from sglang.srt.utils.offloader import get_offloader
 
     assert not pp_size or num_hidden_layers >= pp_size
     start_layer, end_layer = (

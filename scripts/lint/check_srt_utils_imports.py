@@ -30,24 +30,6 @@ ALLOWED = (
     "sglang.srt.observability.func_timer",
 )
 
-# Modules that predate the rule. A stale entry fails the check, so the list only
-# shrinks.
-KNOWN_VIOLATIONS = {
-    "crash_dump.py": {"sglang.srt.sampling"},
-    "cuda_vmm_transport_utils.py": {"sglang.srt.multimodal"},
-    "hf_transformers/common.py": {"sglang.srt.configs"},
-    "hf_transformers/config.py": {"sglang.srt.configs", "sglang.srt.connector"},
-    "hf_transformers/gguf_native.py": {"sglang.srt.configs"},
-    "hf_transformers/processor.py": {"sglang.srt.multimodal"},
-    "hf_transformers/tokenizer.py": {"sglang.srt.connector"},
-    "host_shared_memory.py": {"sglang.srt.distributed"},
-    "offloader.py": {"sglang.srt.distributed", "sglang.srt.layers"},
-    "profile_utils.py": {"sglang.srt.managers", "sglang.srt.model_executor"},
-    "request_logger.py": {"sglang.srt.sampling"},
-    "weight_checker.py": {"sglang.srt.managers", "sglang.srt.mem_cache"},
-    "weight_checker_comparator.py": {"sglang.srt.layers"},
-}
-
 
 def _is_type_checking(test: ast.expr) -> bool:
     return (isinstance(test, ast.Name) and test.id == "TYPE_CHECKING") or (
@@ -88,45 +70,29 @@ def _is_allowed(module: str) -> bool:
     return any(module == a or module.startswith(a + ".") for a in ALLOWED)
 
 
-def domain_imports() -> dict[str, set[str]]:
-    found = {}
-    for path in sorted(UTILS_DIR.rglob("*.py")):
+def main() -> int:
+    paths = sorted(UTILS_DIR.rglob("*.py"))
+    if not paths:
+        print(f"ERROR: no Python files under {UTILS_DIR}; update UTILS_DIR.")
+        return 1
+    errors = []
+    for path in paths:
         packages = {
             ".".join(module.split(".")[:3])
             for module in _module_level_imports(path)
             if module.startswith("sglang.srt.") and not _is_allowed(module)
         }
         if packages:
-            found[path.relative_to(UTILS_DIR).as_posix()] = packages
-    return found
-
-
-def main() -> int:
-    found = domain_imports()
-    new = [
-        f"  {UTILS_DIR}/{rel}: {sorted(packages - KNOWN_VIOLATIONS.get(rel, set()))}"
-        for rel, packages in found.items()
-        if packages - KNOWN_VIOLATIONS.get(rel, set())
-    ]
-    stale = [
-        f"  {UTILS_DIR}/{rel}: {sorted(packages - found.get(rel, set()))}"
-        for rel, packages in KNOWN_VIOLATIONS.items()
-        if packages - found.get(rel, set())
-    ]
-    if new:
+            errors.append(f"  {path}: {sorted(packages)}")
+    if errors:
         print("ERROR: sglang.srt.utils imports an srt domain package at module level:")
-        print("\n".join(new))
+        print("\n".join(errors))
         print(
             "Move the helper to the package that owns it, import inside the "
             "function, or import under TYPE_CHECKING when only annotations use it."
         )
-    if stale:
-        print(
-            "ERROR: these imports are gone; drop them from KNOWN_VIOLATIONS in "
-            "scripts/lint/check_srt_utils_imports.py:"
-        )
-        print("\n".join(stale))
-    return 1 if new or stale else 0
+        return 1
+    return 0
 
 
 if __name__ == "__main__":

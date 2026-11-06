@@ -32,6 +32,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_pre_permute,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend, get_moe_a2a_backend
+from sglang.srt.layers.offloader import get_offloader
 from sglang.srt.runtime_context import (
     get_exec,
     get_flags,
@@ -46,7 +47,6 @@ from sglang.srt.utils import (
     is_musa,
     is_npu,
 )
-from sglang.srt.utils.offloader import get_offloader
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.deepep import (

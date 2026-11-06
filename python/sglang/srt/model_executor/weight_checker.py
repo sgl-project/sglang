@@ -9,15 +9,15 @@ from pydantic import BaseModel, ConfigDict
 
 from sglang.srt.managers.mm_utils import tensor_hash
 from sglang.srt.mem_cache.storage.mmap.mmap_allocator import alloc_mmap
-from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils.weight_checker_comparator import (
+from sglang.srt.model_executor.weight_checker_comparator import (
     CHUNK_NUMEL,
     ComparableWeight,
     RawComparable,
     compare_weights,
     select_comparable_weight,
 )
+from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
 
