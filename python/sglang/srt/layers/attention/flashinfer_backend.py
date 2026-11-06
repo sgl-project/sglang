@@ -2185,7 +2185,14 @@ class FlashInferIndicesUpdaterPrefill:
             raise RuntimeError(
                 "NVFP4 custom KV indices are only supported by the single-wrapper FlashInfer path."
             )
-        if prefix_lens is None:
+        if (
+            prefix_lens is None
+            and spec_info is not None
+            and spec_info.spec_input_type == SpecInputType.EAGLE_DRAFT_EXTEND
+        ):
+            prefix_lens = seq_lens - spec_info.num_tokens_per_req
+            prefix_is_full_seq = False
+        elif prefix_lens is None:
             num_accept_tokens = getattr(spec_info, "num_accept_tokens", None)
             # Spec verify keeps its query block outside seq_lens, so an unset
             # prefix means the whole sequence is already-cached prefix.
