@@ -1729,6 +1729,11 @@ class Envs:
     # The default syncs only the startup memory probes: ranks compute every per-step
     # decision alike. If TP ranks still diverge or hang, set "all" and report a repro.
     SGLANG_SPEC_TP_SYNC = EnvStr("init")
+    # DFLASH sampling selector: build the committed block in one kernel; when SGLANG_SPEC_TP_SYNC
+    # syncs dflash-selector, it also pushes rank 0's accept lengths and bonus tokens to every rank.
+    SGLANG_OPT_DFLASH_EAGER_COMMIT = EnvBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
     # Kill-switch for the draft-extend cuda graph. Draft extend then always runs
     # eager. Escape hatch for setups where the capture's memory pool costs more
     # than the graph saves (e.g. DeepEP MoE workspace captured at full dispatch

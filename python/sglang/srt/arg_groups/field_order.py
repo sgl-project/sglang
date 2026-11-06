@@ -560,5 +560,6 @@ POSITIONAL_FIELD_ORDER = (
     "uocr_doc_page_window",
     "uocr_max_page_tokens",
     "enable_fp4_indexer",
+    "speculative_overlap_ctx_projection",
 )
 # fmt: on
