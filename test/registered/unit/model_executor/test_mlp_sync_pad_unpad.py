@@ -107,7 +107,9 @@ class TestMlpSyncPadUnpad(CustomTestCase):
         self.assertEqual(fb.original_global_num_tokens_cpu, [2, 0, 3])
         self.assertEqual(fb.global_num_tokens_cpu, [8, 0, 12])
         self.assertEqual(fb.global_num_tokens_for_logprob_cpu, [4, 0, 6])
-        torch.testing.assert_close(fb.global_num_tokens_gpu, torch.tensor([8, 0, 12]))
+        # Only allocated here; prepare_mlp_sync_batch writes the padded counts.
+        self.assertEqual(fb.global_num_tokens_gpu.shape, (3,))
+        self.assertEqual(fb.global_num_tokens_gpu.dtype, torch.int64)
         torch.testing.assert_close(
             fb.global_num_tokens_for_logprob_gpu, torch.tensor([4, 0, 6])
         )
@@ -428,6 +430,9 @@ class TestDraftScopeMlpSync(CustomTestCase):
         with get_flags().dp.override(max_len_with_idle=True):
             fb = self._sync_in_draft_scope([9, 0, 6, 4])
         self.assertEqual(fb.global_num_tokens_cpu, [9, 9, 9, 9])
+        torch.testing.assert_close(
+            fb.global_num_tokens_gpu, torch.tensor([9, 9, 9, 9], dtype=torch.int32)
+        )
         self._assert_token_rows(fb, rows=9)
         torch.testing.assert_close(fb.mm_input_embeds[6:], torch.zeros(3, self.HIDDEN))
 

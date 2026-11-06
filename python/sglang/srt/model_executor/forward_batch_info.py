@@ -876,10 +876,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 (global_num_tokens, global_num_tokens_for_logprob),
             )
         else:
+            # prepare_mlp_sync_batch overwrites every element with the padded counts
+            # before any read, so only the allocation is needed here.
+            self.global_num_tokens_gpu = torch.empty(
+                len(global_num_tokens), dtype=torch.int64, device=device
+            )
             pin_memory = is_pin_memory_available(device)
-            self.global_num_tokens_gpu = torch.tensor(
-                global_num_tokens, dtype=torch.int64, pin_memory=pin_memory
-            ).to(device, non_blocking=True)
             self.global_num_tokens_for_logprob_gpu = torch.tensor(
                 global_num_tokens_for_logprob,
                 dtype=torch.int64,
