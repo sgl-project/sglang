@@ -356,7 +356,6 @@ POSITIONAL_FIELD_ORDER = (
     "enable_linear_replayssm",
     "linear_replayssm_cache_len",
     "enable_linear_replayssm_spec",
-    "enable_linear_lossless_verify",
     "enable_hierarchical_cache",
     "hicache_host_memory_mode",
     "hicache_ratio",
@@ -560,5 +559,6 @@ POSITIONAL_FIELD_ORDER = (
     "uocr_doc_split",
     "uocr_doc_page_window",
     "uocr_max_page_tokens",
+    "enable_linear_lossless_verify",
 )
 # fmt: on

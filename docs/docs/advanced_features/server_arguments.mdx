@@ -2118,6 +2118,12 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>triton</code>, <code>cutedsl</code>, <code>flashinfer</code></td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-linear-lossless-verify`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Keep per-draft (u, k, g) tuples instead of full SSM-state snapshots during GDN speculative target-verify and replay the accepted state at commit. Bit-identical to the default verify with ~64x less verify scratch; the freed memory goes to the KV cache. GDN hybrid models with a linear draft chain (<code>--speculative-eagle-topk 1</code>: EAGLE/MTP, DFLASH, DSPARK) and the Triton verify kernel, on CUDA or ROCm.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
+    </tr>
 </tbody>
 </table>
 
