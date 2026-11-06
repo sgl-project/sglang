@@ -1582,8 +1582,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         elif _is_npu and self.forward_mode.is_target_verify():
             column_starts = self.seq_lens
             req_lens = self.spec_info.draft_token_num
-        elif _is_npu and self.forward_mode.is_idle():
-            column_starts, req_lens = 0, 0
         else:
             column_starts, req_lens = self.extend_prefix_lens, self.extend_seq_lens
         self.ngram_embedding_info = NgramEmbeddingInfo.create(

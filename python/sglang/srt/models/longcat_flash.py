@@ -109,7 +109,6 @@ from sglang.srt.utils import (
     bind_or_assign,
     cpu_has_amx_support,
     get_bool_env_var,
-    get_device_module,
     get_device_sm,
     is_cpu,
     is_cuda,
@@ -868,10 +867,9 @@ class LongcatFlashForCausalLM(nn.Module):
                         self_attn.w_kc,
                         w_kc.transpose(1, 2).contiguous().transpose(1, 2),
                     )
-                    w_vc = w_vc.contiguous().transpose(1, 2)
-                    if _is_npu:
-                        w_vc = w_vc.contiguous()
-                    self_attn.w_vc = bind_or_assign(self_attn.w_vc, w_vc)
+                    self_attn.w_vc = bind_or_assign(
+                        self_attn.w_vc, w_vc.contiguous().transpose(1, 2)
+                    )
                     if (
                         hasattr(self_attn.kv_b_proj, "weight_scale")
                         and self_attn.w_scale is None
@@ -1162,9 +1160,8 @@ class LongcatFlashForCausalLM(nn.Module):
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        device_module = get_device_module()
-        device_module.empty_cache()
-        device_module.synchronize()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
