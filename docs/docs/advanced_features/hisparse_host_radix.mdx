@@ -1,0 +1,123 @@
+---
+title: "HiSparse Host-Tier Radix Cache"
+metatags:
+    description: "Share prompt prefixes across requests on a HiSparse decode engine by keeping them in the host tier of the decode radix tree, so P->D transfers only the uncached suffix and decode concurrency is no longer capped by host memory."
+---
+
+[HiSparse](./hisparse_guide) keeps each decode request's full latent KV in host memory and swaps only the top-k pages into a small per-request GPU buffer. Without a radix cache, every request owns a private host copy of its whole sequence, so requests that share a long prompt prefix (system prompt, RAG context, multi-turn history) each store, transfer, and back up that prefix again.
+
+The host-tier radix cache lets those requests share one host copy of the prefix. The decode radix tree holds host-only nodes: a matched prefix stays on the host, its latent KV is swapped in by the normal top-k path, and only its index-K is restored to the GPU. The prefill instance sends just the unmatched suffix. With `host_token_capacity`, the host pool is sized independently of the GPU pool, so with [index-K elision](./dsa_index_k_elision) on, decode concurrency is no longer capped by host memory (see [Sizing the host pool](#sizing-the-host-pool)).
+
+The feature is off by default. It does not change model outputs: greedy decoding produces token-identical results with and without it.
+
+## Requirements
+
+- PD disaggregation, on the **decode** instance.
+- A DSA model, for example GLM-5.2 or DeepSeek V3.2. DeepSeek V4 is not supported.
+- Only the L2 (host) tier is used. `--hicache-storage-backend` must be unset.
+- The decode radix tree runs on the Python TreeCore. If the Rust TreeCore is selected, the server falls back to the Python one and logs `Using the Python TreeCore: HiSparse host-tier sharing requires the Python TreeCore`.
+- Validated with `--pp-size 1`.
+
+## Enable it
+
+On the decode instance, replace `--disable-radix-cache` with the decode radix cache and hierarchical cache flags:
+
+```bash Command
+python3 -m sglang.launch_server \
+    --model-path MODEL_PATH \
+    --trust-remote-code \
+    --tp-size 8 \
+    --disaggregation-mode decode \
+    --disaggregation-decode-enable-radix-cache \
+    --enable-hierarchical-cache \
+    --enable-hisparse \
+    --hisparse-config='{"top_k": 2048, "device_buffer_size": 4096, "host_to_device_ratio": 16, "host_token_capacity": 4649984}'
+```
+
+The prefill instance needs no change.
+
+`--disaggregation-decode-enable-radix-cache` with `--enable-hisparse` is rejected unless `--enable-hierarchical-cache` is also set, because HiSparse keeps latent KV on the host and only the host tier of the tree can hold it.
+
+## How a prefix hit is served
+
+1. **Match.** At pre-allocation the decode engine matches the prompt against the host tier of the tree. The matched host slots are borrowed into the request's host table; the tree keeps ownership and the request holds a reference until it finishes.
+2. **Transfer.** The request allocates logical rows for its whole prompt, but the prefill instance sends KV only for the unmatched suffix. The tree matches whole pages and never matches the last prompt token, so even a full hit transfers the final partial page (at most one page).
+3. **Restore index-K.** Before the first top-k scan, the prefix index-K is copied host-to-device into the request's own logical rows. Latent KV is not loaded back; it stays on the host and is swapped in per step like any other HiSparse page.
+4. **Publish.** After the batch launches, the prompt is inserted into the tree as host-only nodes so later requests can match it.
+5. **Finish.** The full sequence is inserted into the tree and its host slots are handed to the tree instead of being freed. They are reclaimed by host-tier LRU eviction when admission or a decode step needs host space.
+
+Logical rows are never shared across requests, because index-K is addressed by a request's logical row. The cache therefore saves host memory and P->D transfer, not device memory.
+
+## Sizing the host pool
+
+By default the HiSparse host pool has one slot per logical row (`max_total_num_tokens × host_to_device_ratio`). With [index-K elision](./dsa_index_k_elision) the logical pool grows much faster than the host memory it needs, so on a large `host_to_device_ratio` the default host pool may not fit in RAM and the server fails at startup with `Not enough host memory available`.
+
+Set `host_token_capacity` in `--hisparse-config` to size the host pool independently:
+
+| Parameter | Type / default | Description |
+|---|---|---|
+| `host_token_capacity` | positive int, a multiple of the page size; default: unset (host pool = logical pool) | Number of token slots in the HiSparse host pool. Must hold at least one maximum-length request (about `context_len` tokens), otherwise startup fails with `must hold one max-length request`. Supported only for the DSA HiSparse host pool: DeepSeek V4 and MiniMax M3 reject it. |
+
+With the radix cache on, the host pool also backs the shared index-K (`132 B` per token for each indexer-owning layer, `21 × 132 = 2,772 B` for GLM-5.2). Budget `latent + index-K` bytes per host token: `51,168 + 2,772 = 53,940 B` for GLM-5.2, so `host_token_capacity=4649984` takes about 250.8 GB per rank.
+
+When the host pool can run out before the logical pool (the radix cache is on, or `host_token_capacity` is set), admission checks host capacity before pre-allocating a request:
+
+- It reserves the request's prompt and output plus the remaining output of every admitted request. Like the device-side estimate, each output is clipped to `SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION` (default 4096). A retracted request counts the tokens it already generated.
+- If the host is short, it evicts unreferenced tree nodes first. If it is still short, the request is deferred: it stays queued and is not dropped. The log line is `hisparse prealloc deferred: ... admission is host-capacity bound`.
+- Growth past the clipped estimate is checked every decode step. When the next step's host pages do not fit even after eviction, the scheduler retracts requests (`KV cache pool is full. Retract requests.`) instead of failing the host allocation. A retracted HiSparse request is re-bootstrapped through prefill.
+
+## When it raises concurrency
+
+Decode concurrency is bounded by three pools:
+
+- GPU hot buffer: `max_total_num_tokens / (device_buffer_size + padding)`.
+- Logical rows: `max_total_num_tokens × host_to_device_ratio / (input_len + output_len)`.
+- Host pool: without the radix cache each request needs `input_len + output_len` host slots; with it, a shared prefix is stored once and each request needs only its private suffix and output.
+
+The cache raises concurrency only when the host pool would otherwise be the binding limit. That happens with index-K elision on and a large `host_to_device_ratio`: elision shrinks the device cost of a logical row, so `max_total_num_tokens` (and with it a host pool tied to the logical pool) grows until host memory, not the GPU, caps it.
+
+With the cache on, size the GPU pool for the GPU alone and set `host_token_capacity` for the host. When the GPU hot buffer or the logical rows are the limit, the running batch is the same with or without prefix sharing; the cache then only saves host memory and P->D transfer.
+
+## Measured results
+
+Setup: GLM-5.2 NVFP4 weights with an FP8 KV cache, 8× RTX PRO 6000 (SM120), TP8 / PP1, PD disaggregation with HiSparse on the decode engine, 2 TB of host memory (host pool budget about 259.65 GB per rank), decode `--mem-fraction-static 0.95`, prefill `0.80`, `top_k=2048`, `device_buffer_size=4096`, shared-index prefetch off, 2,000 output tokens unless noted. The load is a closed loop at a fixed concurrency set to the computed limit of each configuration, with all clients starting together. No request was deferred or retracted in these runs.
+
+Three configurations are compared:
+
+- **Native**: HiSparse without index-K elision or the radix cache.
+- **Elision**: index-K elision on, no radix cache. The host pool is tied to the logical pool, so `--max-total-tokens` caps the GPU pool to keep the host pool within host memory.
+- **Elision + host radix**: this feature with `host_token_capacity=4649984`. `--max-total-tokens` leaves headroom for CUDA graph capture at `--mem-fraction-static 0.95`.
+
+A 131,210-token prompt shared by every request (100% prefix hit):
+
+| `host_to_device_ratio` | Configuration | `max_total_num_tokens` | Binding pool | Running batch | Output throughput | TPOT p50 | TTFT p50 / p99 |
+|---|---|---|---|---|---|---|---|
+| 16 | Native | 170,496 | Logical rows | 20 | 327 tok/s | 56.2 ms | 2.89 / 47.5 s |
+| 16 | Elision | 311,424 (capped) | Host memory | 37 | 454 tok/s | 75.2 ms | 3.03 / 87.1 s |
+| 16 | Elision + host radix | 369,600 | Logical rows | 44 | 504 tok/s | 82.9 ms | 0.96 / 8.7 s |
+| 20 | Native | 143,168 | Logical rows | 21 | 337 tok/s | 56.6 ms | 2.92 / 52.3 s |
+| 20 | Elision | 249,088 (capped) | Host memory | 37 | 455 tok/s | 74.9 ms | 2.94 / 89.5 s |
+| 20 | Elision + host radix | 331,072 | Logical rows | 49 | 550 tok/s | 88.2 ms | 0.87 / 9.5 s |
+
+Output throughput is wall-clock. Without the radix cache, host memory holds about 38 such requests whatever the ratio, so the elision configuration stays at 37. With the cache the logical rows bind, and they grow with the ratio: at ratio 16 the running batch rises 19% and output throughput 11%; at ratio 20 the running batch rises 32% and output throughput 21%.
+
+With a 262,000-token shared prompt at ratio 16, native HiSparse rejects the request (it exceeds `max_total_num_tokens`), elision runs 18 requests at 257 tok/s, and elision with the host radix runs 22 requests at 323 tok/s.
+
+A full hit also shortens TTFT. Each new request transfers at most one page instead of the whole prompt, so P->D transfers no longer queue on the network when many requests finish together. TTFT p99 drops from 87–90 s to 8.7–9.5 s at 128K. These latencies include the initial burst of the closed loop.
+
+A 32,440-token prompt with a 70% shared prefix (22,700 shared and 9,725 unique tokens), 4,000 output tokens, ratio 20:
+
+| Configuration | `max_total_num_tokens` | Binding pool | Running batch | Output throughput | TPOT p50 | TTFT p50 / p99 |
+|---|---|---|---|---|---|---|
+| Native | 143,168 | GPU hot buffer | 34 | 511 tok/s | 61.5 ms | 4.16 / 68.8 s |
+| Elision | 249,088 (capped) | GPU hot buffer | 59 | 655 tok/s | 83.0 ms | 4.25 / 117.8 s |
+| Elision + host radix | 331,072 | GPU hot buffer | 79 | 735 tok/s | 100.6 ms | 4.25 / 155.1 s |
+
+Here every configuration is bound by the GPU hot buffer. The elision configuration still loses batch size to host memory, through the `--max-total-tokens` cap it needs. The gain comes from `host_token_capacity` lifting that cap; prefix sharing additionally cuts the host footprint and the P->D transfer of the shared 70%. TTFT p50 is about 4.2 s in all three. TTFT p99 grows with the running batch because the initial burst queues more prefill work on the prefill instance; the decode-side change does not cause it.
+
+## Limitations
+
+- A request whose prompt has no cached prefix still pays a full P->D transfer.
+- The prefix index-K restore occupies GPU logical rows for each request that reuses the prefix; the GPU copy is not shared.
+- Retracting a HiSparse request re-bootstraps it: the prefill instance recomputes its KV.
+- Finished requests' private suffixes stay in the host tier until LRU eviction reclaims them, so host pool usage grows toward `host_token_capacity` under sustained load. This does not reduce admission, which evicts unreferenced nodes on demand.

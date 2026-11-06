@@ -478,6 +478,11 @@ def build_kv_cache(
             and hicache_draft_plan.mode == HiCacheDraftMode.SIDECAR
             else ()
         ),
+        hisparse_host_kv_pool=getattr(
+            getattr(tp_worker.model_runner, "hisparse_coordinator", None),
+            "mem_pool_host",
+            None,
+        ),
     )
     if params.swa_retain_window != sliding_window_size:
         logger.info(

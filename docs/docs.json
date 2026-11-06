@@ -952,6 +952,7 @@
               "docs/advanced_features/attention_backend",
               "docs/advanced_features/hisparse_guide",
               "docs/advanced_features/dsa_index_k_elision",
+              "docs/advanced_features/hisparse_host_radix",
               "docs/advanced_features/speculative_decoding",
               "docs/advanced_features/adaptive_speculative_decoding",
               "docs/advanced_features/structured_outputs",

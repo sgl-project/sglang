@@ -113,6 +113,11 @@ Pass as a JSON string via `--hisparse-config`:
       <td>int / 960</td>
       <td>CUDA thread-block size for the HiSparse swap-in kernel</td>
     </tr>
+    <tr>
+      <td><code>host_token_capacity</code></td>
+      <td>int / unset</td>
+      <td>Size of the HiSparse host pool in tokens; unset means one slot per logical row. See <a href="./hisparse_host_radix">HiSparse Host-Tier Radix Cache</a></td>
+    </tr>
   </tbody>
 </table>
 
@@ -200,6 +205,7 @@ python3 -m sglang.benchmark.serving \
 - For DSA models, `--kv-cache-dtype bfloat16` uses `flashmla_sparse`, and `--kv-cache-dtype fp8_e4m3` uses `flashmla_kv`.
 - On SM120/SM121 (e.g. RTX PRO 6000, RTX 5090) with GLM DSA models and `--kv-cache-dtype fp8_e4m3`, both DSA backends resolve to `flashinfer_sparse_mla`, which is the only DSA kernel available on that architecture. HiSparse accepts it there; no extra flag is needed.
 - For DeepSeek V4, DSA backend flags are not applicable. DeepSeek V4 uses the `dsv4` attention backend and `fp8_e4m3` KV cache by default.
+- The decode instance can keep a host-tier radix cache instead of `--disable-radix-cache`, so requests share one host copy of a common prompt prefix; see [HiSparse Host-Tier Radix Cache](./hisparse_host_radix).
 - `host_to_device_ratio` should be configured based on the host machine's available memory. For example:
   - **~1 TB** host memory → `host_to_device_ratio: 5`
   - **~2 TB** host memory → `host_to_device_ratio: 10`

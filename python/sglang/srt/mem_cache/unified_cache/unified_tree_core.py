@@ -2735,9 +2735,14 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         node_id: NodeId,
         key: RadixKey,
         host_value: torch.Tensor,
-        hash_value: list[str],
+        hash_value: Optional[list[str]],
     ) -> InsertResult:
-        """Insert a host-side (backuped) tree path descending from the given node."""
+        """Insert a host-side (backuped) tree path descending from the given node.
+
+        ``hash_value`` is one storage key per page, or None for a host tier with
+        no L3 identity (the HiSparse host-only publish), which leaves the
+        inserted nodes' hash_value None.
+        """
         node = self.node_by_id(node_id)
         total_len = len(key)
         self._touch_node(node)
@@ -2757,11 +2762,16 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             prefix_len = node.key.match(key, page_size=self.page_size)
 
             matched_host_value = host_value[:prefix_len]
-            matched_hash_value = hash_value[: prefix_len // self.page_size]
+            matched_hash_value = (
+                hash_value[: prefix_len // self.page_size]
+                if hash_value is not None
+                else None
+            )
 
             key = key[prefix_len:]
             host_value = host_value[prefix_len:]
-            hash_value = hash_value[prefix_len // self.page_size :]
+            if hash_value is not None:
+                hash_value = hash_value[prefix_len // self.page_size :]
             matched_length += prefix_len
 
             if prefix_len < len(node.key):
@@ -2776,7 +2786,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 full_data = node.component_data[BASE_COMPONENT_TYPE]
                 if full_data.host_value is None:
                     full_data.host_value = matched_host_value.clone()
-                    if node.hash_value is None:
+                    if node.hash_value is None and matched_hash_value is not None:
                         node.hash_value = list(matched_hash_value)
                     self.kv_events.record_store(node, medium=StorageMedium.CPU)
                     self._update_evictable_leaf_sets(node)
@@ -3713,6 +3723,25 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def full_protected_size(self) -> int:
         return self.protected_size()
+
+    def gather_host_prefix_indices(
+        self,
+        node_id: NodeId,
+        component_type: ComponentType = BASE_COMPONENT_TYPE,
+    ) -> torch.Tensor:
+        """Used for prefix adoption and index-K H2D restore."""
+        parts = []
+        node = self.node_by_id(node_id)
+        while node is not None and node is not self.root_node:
+            host_value = node.component_data[component_type].host_value
+            if host_value is None:
+                break
+            parts.append(host_value)
+            node = node.parent
+        if not parts:
+            return torch.empty(0, dtype=torch.int64, device=self.device)
+        parts.reverse()
+        return torch.cat(parts)
 
     def slot_id(self, family: str) -> Optional[ComponentType]:
         """The id of the tree's slot of ``family``; None when it has none."""

@@ -554,6 +554,11 @@ class TpModelWorker(BaseTpWorker):
         )
         if is_cp_sharded_padded():
             kv_capacity = from_cp_sharded(kv_capacity)
+        # HiSparse admits against its host-backed logical pool, not the device
+        # rows (ModelRunner.max_token_pool_size, the capacity the decode admission
+        # check already uses), so the input-length limit must follow it too.
+        if self.model_runner.enable_hisparse:
+            kv_capacity = max(kv_capacity, self.model_runner.max_token_pool_size)
         # Not an error: a deployment that never sends max-length requests may
         # want a small pool. Checked here because this is the final served value.
         if kv_capacity < self.model_config.context_len:

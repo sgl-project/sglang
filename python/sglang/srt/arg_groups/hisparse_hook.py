@@ -109,6 +109,31 @@ def validate_hisparse_feature_combos(server_args: ServerArgs) -> None:
         )
 
 
+def uses_hisparse_host_radix(server_args: ServerArgs, hf_config=None) -> bool:
+    """True when HiSparse shares the decode-side L2 (host) radix tree.
+
+    The only HiSparse topology that may keep the radix cache on: a DSA decode
+    engine with hierarchical cache, reusing the host tier (the only tier holding
+    host_value). DSV4 is excluded -- its C4 host layout plus SWA/C128 layers need
+    prefix recovery the host tree cannot provide.
+    """
+    cfg = resolving_view(server_args)
+    if not cfg.enable_hisparse:
+        return False
+
+    from sglang.srt.configs.model_config import is_deepseek_v4
+
+    if hf_config is None:
+        hf_config = model_config_of(server_args).hf_config
+    if is_deepseek_v4(hf_config):
+        return False
+    return (
+        cfg.disaggregation_mode == "decode"
+        and cfg.disaggregation_decode_enable_radix_cache
+        and cfg.enable_hierarchical_cache
+    )
+
+
 def validate_hisparse(server_args: ServerArgs) -> None:
     """Validate --enable-hisparse constraints (model class, radix cache, DSA backend)."""
 
@@ -131,9 +156,21 @@ def validate_hisparse(server_args: ServerArgs) -> None:
         "models (e.g., DeepSeek V3.2, GLM-5), DeepSeek V4, and MiniMax M3 now. "
     )
 
-    assert cfg.disable_radix_cache, (
-        "Hierarchical sparse attention currently requires --disable-radix-cache."
+    assert cfg.disable_radix_cache or uses_hisparse_host_radix(
+        server_args, hf_config
+    ), (
+        "Hierarchical sparse attention requires --disable-radix-cache, unless running "
+        "a DSA decode server with --disaggregation-decode-enable-radix-cache and "
+        "--enable-hierarchical-cache (host-tier radix sharing)."
     )
+    if uses_hisparse_host_radix(server_args, hf_config):
+        # Only the L2 (host) tier is wired; an L3 storage backend restores into
+        # the device tier, which does not match HiSparse's hot-buffer layout.
+        assert cfg.hicache_storage_backend is None, (
+            "--hicache-storage-backend is not supported with --enable-hisparse: only "
+            "the L2 host tier of the radix tree is integrated, not the L3 storage "
+            "restore path."
+        )
     validate_hisparse_feature_combos(server_args)
 
     enable_spec = (

@@ -574,6 +574,10 @@ class Scheduler(
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
         self.max_new_tokens_limit = envs.SGLANG_MAX_NEW_TOKENS_LIMIT.get()
         self.enable_hisparse = get_memory().enable_hisparse
+        # True only when HiSparse AND decode-side hierarchical radix cache are on.
+        self.enable_hisparse_host_radix = (
+            self.enable_hisparse and self.enable_decode_hicache
+        )
         self.attn_dp_enabled = get_parallel().attn_dp_enabled
         self.enable_unified_memory = get_memory().enable_unified_memory
 
@@ -1367,6 +1371,26 @@ class Scheduler(
         # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture.
         self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
         self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
+
+        if (
+            self.enable_hisparse_host_radix
+            or self.hisparse_coordinator.host_pool_decoupled
+        ):
+            self.token_to_kv_pool_allocator.set_host_decode_capacity_fn(
+                self.hisparse_coordinator.host_decode_capacity_ok
+            )
+
+        if self.enable_hisparse_host_radix:
+            from sglang.srt.mem_cache.hicache_storage import PoolName
+
+            self.hisparse_coordinator.set_host_evict_fn(self.tree_cache.evict_host)
+            self.tree_cache.hisparse_coordinator = self.hisparse_coordinator
+            self.hisparse_coordinator.set_host_borrow_release_fn(
+                self.tree_cache.release_host_prefix
+            )
+            self.hisparse_coordinator.indexer_host_pool = (
+                self.tree_cache.host_pool_group.get_pool(PoolName.INDEXER)
+            )
 
     def init_running_status(self):
         self.tp_size = get_parallel().tp_size
@@ -2884,6 +2908,7 @@ class Scheduler(
             uocr_runtime=self.uocr_runtime,
             send_abort_output=self.send_abort_output,
             stream_output=self.output_streamer.stream_output,
+            enable_hisparse_host_radix=self.enable_hisparse_host_radix,
         )
 
     def maybe_init_decode_offload_manager(self) -> None:

@@ -278,14 +278,19 @@ def _evict_until_allocatable(
             return total
 
 
-def dsv4_needs_rebootstrap(
+def retraction_needs_rebootstrap(
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
 ) -> bool:
+    from sglang.srt.mem_cache.allocator.hisparse import (
+        HiSparseTokenToKVPoolAllocator,
+    )
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 
     pool = token_to_kv_pool_allocator.get_kvcache()
-    # No DeepSeek-V4 pool keeps a host copy of a request's KV; the prefill recomputes it.
-    return isinstance(pool, DeepSeekV4TokenToKVPool)
+    # Neither pool keeps a host copy of a retracted request's KV, the prefill recomputes it.
+    return isinstance(pool, DeepSeekV4TokenToKVPool) or isinstance(
+        token_to_kv_pool_allocator, HiSparseTokenToKVPoolAllocator
+    )
 
 
 def backup_kv_cache(
@@ -299,7 +304,7 @@ def backup_kv_cache(
     the caller aborts it."""
     if backend == "none":
         return False
-    if dsv4_needs_rebootstrap(token_to_kv_pool_allocator):
+    if retraction_needs_rebootstrap(token_to_kv_pool_allocator):
         if not req.resumable_by_rebootstrap:
             return False
         # Drain the in-flight forward before its slots can receive recomputed KV.

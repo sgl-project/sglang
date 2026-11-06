@@ -1574,12 +1574,18 @@ def build_unified_host_stack(
     )
 
 
-def build_host_pool_group(*, config: HostPoolGroupConfig) -> HostPoolGroup:
-    root_host_pool = build_kv_host_pool(
-        kv_pool=config.root,
-        page_size=config.transfer_page_size,
-        mtp_draft_device_pools=config.packed_draft_device_pools,
-    )
+def build_host_pool_group(
+    *,
+    config: HostPoolGroupConfig,
+    root_host_pool: Any = None,
+) -> HostPoolGroup:
+    """``root_host_pool`` reuses an existing host pool as the KV root."""
+    if root_host_pool is None:
+        root_host_pool = build_kv_host_pool(
+            kv_pool=config.root,
+            page_size=config.transfer_page_size,
+            mtp_draft_device_pools=config.packed_draft_device_pools,
+        )
     return HostPoolGroup(
         _build_pool_entries(config=config, root_host_pool=root_host_pool)
     )
@@ -2430,7 +2436,17 @@ class _KvStrategy(StackStrategy):
             transfer_page_size=params.page_size,
             packed_draft_device_pools=params.mtp_draft_device_pools,
         )
-        host_pool_group = build_host_pool_group(config=config)
+        hisparse_host = getattr(params, "hisparse_host_kv_pool", None)
+        if hisparse_host is not None:
+            # A tree node's host_value must cover its page-aligned key exactly, so
+            # the tree page and the HiSparse host page must match.
+            assert hisparse_host.page_size == config.transfer_page_size, (
+                "HiSparse host-radix requires equal page sizes, got "
+                f"tree={config.transfer_page_size} host={hisparse_host.page_size}"
+            )
+        host_pool_group = build_host_pool_group(
+            config=config, root_host_pool=hisparse_host
+        )
         cache_controller = _build_cache_controller(
             params=params,
             host_pool_group=host_pool_group,

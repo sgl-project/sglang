@@ -642,9 +642,13 @@ class UnifiedTreeCoreInterface(ABC):
         node_id: NodeId,
         key: RadixKey,
         host_value: torch.Tensor,
-        hash_value: list[str],
+        hash_value: Optional[list[str]],
     ) -> InsertResult:
-        """Insert a host-side (backuped) tree path descending from the given node."""
+        """Insert a host-side (backuped) tree path descending from the given node.
+
+        ``hash_value`` is one storage key per page, or None for a host tier with
+        no L3 identity. An implementation may decline None (the Rust core does).
+        """
         ...
 
     @abstractmethod

@@ -58,6 +58,9 @@ class SparseConfig:
     top_k: int = 2048
     device_buffer_size: int = 4096
     host_to_device_ratio: int = 2
+    # HiSparse host pool size in tokens per rank; None keeps it at the logical
+    # capacity (device size x host_to_device_ratio).
+    host_token_capacity: Optional[int] = None
     swap_in_block_size: int = 960
     algorithm: Optional[str] = None
     backend: Optional[str] = None

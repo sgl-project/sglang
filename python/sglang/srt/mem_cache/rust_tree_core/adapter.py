@@ -1022,8 +1022,14 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         node_id: NodeId,
         key: RadixKey,
         host_value: torch.Tensor,
-        hash_value: list[str],
+        hash_value: Optional[list[str]],
     ) -> InsertResult:
+        if hash_value is None:
+            # unsupported by the Rust TreeCore
+            raise NotImplementedError(
+                "the Rust TreeCore has no host-only insert_host (hash_value=None); "
+                "HiSparse host-tier sharing requires the Python TreeCore"
+            )
         result = self._binding.insert_host(
             node_id,
             key.extra_key,

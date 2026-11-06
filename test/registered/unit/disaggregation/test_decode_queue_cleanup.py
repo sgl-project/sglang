@@ -381,6 +381,7 @@ class TestDeferredDestinationPublish(CustomTestCase):
         queue.scheduler = MagicMock(
             enable_priority_scheduling=False,
             enable_hisparse=False,
+            enable_hisparse_host_radix=False,
             enable_lora=False,
             enable_decode_hicache=False,
         )
