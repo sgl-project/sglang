@@ -56,12 +56,12 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos3_multiview import (
 from sglang.multimodal_gen.runtime.models.dits.cosmos3_simulation.multiview_attention import (
     TRITON_SPARSE_BLOCK_SIZES,
     MultiviewBlockSparsity,
+    _make_pair_allowed,
     build_multiview_block_sparsity,
     build_multiview_flex_metadata,
     fa4_sparse_block_sizes,
     get_multiview_attention_plan,
     layout_sparse_block_sizes,
-    multiview_pair_predicate,
     padded_multiview_flex_attention,
     resolve_masked_backend,
 )
@@ -252,10 +252,24 @@ def _fa4_available() -> bool:
         return False
     try:
         import cutlass  # noqa: F401
-        import flash_attn.cute  # noqa: F401
+
+        import sglang.kernels.ops.attention.flash_attn.cute  # noqa: F401
     except Exception:
         return False
     return True
+
+
+def _pair_predicate(metadata, q_index, kv_index):
+    """The exact token visibility predicate the block masks are built from."""
+    pair_allowed = _make_pair_allowed(
+        metadata.query_vectors(),
+        metadata.key_vectors(),
+        metadata.attention_scope,
+        metadata.decomposed_temporal_window_seconds,
+        metadata.control_attends_sensor,
+        metadata.lidar_attends_captions,
+    )
+    return pair_allowed(q_index, kv_index)
 
 
 def _tiny_metadata(
@@ -357,7 +371,7 @@ def _dense_masked_oracle(q, k, v, k_und, v_und, layout, real_und_len):
     key_index = torch.cat([torch.arange(real_und_len), padded_und + torch.arange(gen)])[
         None, :
     ]
-    mask = multiview_pair_predicate(metadata, q_index, key_index)
+    mask = _pair_predicate(metadata, q_index, key_index)
     keys = torch.cat([k_und, k], dim=1).float()
     values = torch.cat([v_und, v], dim=1).float()
     group = q.shape[2] // k.shape[2]
@@ -411,7 +425,7 @@ class TestVisibilityPredicate(unittest.TestCase):
                         )
                         q_index = torch.arange(metadata.q_len)[:, None]
                         kv_index = torch.arange(metadata.kv_len)[None, :]
-                        actual = multiview_pair_predicate(metadata, q_index, kv_index)
+                        actual = _pair_predicate(metadata, q_index, kv_index)
                         q_vectors = metadata.query_vectors()
                         k_vectors = metadata.key_vectors()
                         expected = torch.zeros_like(actual)
@@ -446,7 +460,7 @@ class TestVisibilityPredicate(unittest.TestCase):
         metadata = _tiny_metadata()
 
         def visible(q, keys):
-            return multiview_pair_predicate(
+            return _pair_predicate(
                 metadata, torch.tensor(q), torch.tensor(keys)
             ).tolist()
 
@@ -465,9 +479,7 @@ class TestVisibilityPredicate(unittest.TestCase):
         # control_attends_sensor opens the own-camera RGB keys to control queries.
         enabled = _tiny_metadata(control_attends_sensor=True)
         self.assertEqual(
-            multiview_pair_predicate(
-                enabled, torch.tensor(0), torch.tensor([6, 7, 8])
-            ).tolist(),
+            _pair_predicate(enabled, torch.tensor(0), torch.tensor([6, 7, 8])).tolist(),
             [True, True, False],
         )
 
@@ -483,7 +495,7 @@ class TestVisibilityPredicate(unittest.TestCase):
                     num_und=2,
                     attention_scope=attention_scope,
                 )
-                allowed = multiview_pair_predicate(
+                allowed = _pair_predicate(
                     metadata,
                     torch.arange(metadata.q_len)[:, None],
                     torch.arange(metadata.kv_len)[None, :],
@@ -510,9 +522,7 @@ class TestVisibilityPredicate(unittest.TestCase):
                 # temporal window decides.
                 metadata.timestamp[6] = q_timestamp
                 metadata.timestamp[9] = k_timestamp
-                allowed = multiview_pair_predicate(
-                    metadata, torch.tensor(4), torch.tensor([9])
-                )
+                allowed = _pair_predicate(metadata, torch.tensor(4), torch.tensor([9]))
                 self.assertEqual(bool(allowed[0]), expected)
 
     def test_window_is_past_only_and_registers_lidar_sweeps_by_capture_time(self):
@@ -553,7 +563,7 @@ class TestVisibilityPredicate(unittest.TestCase):
 
         def sees(token, keys):
             # Query indexes are relative to the first GEN token; keys are absolute.
-            return multiview_pair_predicate(
+            return _pair_predicate(
                 metadata, torch.tensor(token - query_start), torch.tensor(keys)
             ).tolist()
 
@@ -570,7 +580,7 @@ class TestVisibilityPredicate(unittest.TestCase):
         self.assertEqual(sees(sweeps + 7, [rgb, rgb + 1]), [False, True])
         # Own view is always reachable at every frame (same-view rule), once.
         self.assertEqual(sees(rgb + 1, [rgb, rgb + 1]), [True, True])
-        full = multiview_pair_predicate(
+        full = _pair_predicate(
             metadata,
             torch.arange(metadata.q_len)[:, None],
             torch.arange(metadata.kv_len)[None, :],
@@ -610,7 +620,7 @@ class TestBlockSparsity(unittest.TestCase):
         sparsity = build_multiview_block_sparsity(
             metadata, q_block_size=q_block, kv_block_size=kv_block
         )
-        dense = multiview_pair_predicate(
+        dense = _pair_predicate(
             metadata,
             torch.arange(metadata.q_len)[:, None],
             torch.arange(metadata.kv_len)[None, :],
@@ -647,7 +657,7 @@ class TestBlockSparsity(unittest.TestCase):
         sparsity = build_multiview_block_sparsity(
             metadata, q_block_size=4, kv_block_size=4
         )
-        dense = multiview_pair_predicate(
+        dense = _pair_predicate(
             metadata,
             torch.arange(metadata.q_len)[:, None],
             torch.arange(metadata.kv_len)[None, :],
@@ -675,7 +685,7 @@ class TestBlockSparsity(unittest.TestCase):
         )
         block_mask = sparsity.to_block_mask()
         self.assertEqual(block_mask.seq_lengths, (metadata.q_len, metadata.kv_len))
-        dense = multiview_pair_predicate(
+        dense = _pair_predicate(
             metadata,
             torch.arange(metadata.q_len)[:, None],
             torch.arange(metadata.kv_len)[None, :],
@@ -847,7 +857,7 @@ class TestPaddedFlexAttention(unittest.TestCase):
 
     @unittest.skipUnless(
         _fa4_available(),
-        "needs an SM90 or SM100 device with the flash-attn-4 CuTe package",
+        "needs an SM90 or SM100 device with the FA4 CuTe kernels",
     )
     def test_cuda_fa4_kernel_matches_dense_oracle(self):
         context = self._run(
@@ -892,7 +902,7 @@ class TestPaddedFlexAttention(unittest.TestCase):
                     geometry.padded_und_len + geometry.padded_q_len,
                 )
                 metadata = plan.metadata
-                dense = multiview_pair_predicate(
+                dense = _pair_predicate(
                     metadata,
                     torch.arange(metadata.q_len)[:, None],
                     torch.arange(metadata.kv_len)[None, :],

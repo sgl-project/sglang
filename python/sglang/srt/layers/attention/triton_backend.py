@@ -11,6 +11,7 @@ from sglang.kernels.ops.attention.mla_kv_pack_quantize_fp8 import (
     mla_kv_pack_quantize_fp8,
 )
 from sglang.kernels.ops.speculative.cache_locs import generate_draft_decode_kv_indices
+from sglang.srt.configs.attention_execution import attention_dcp_size
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.configs.model_config import (
     AttentionArch,
@@ -238,11 +239,7 @@ class TritonAttnBackend(AttentionBackend):
         self.topk = get_spec().speculative_eagle_topk or 0
         # Split-KV verify is bit-equivalent only for a pure-causal chain (topk==1)
         # and is gfx95-only; else fall back to extend_attention_fwd.
-        self.use_verify_splitkv = (
-            is_gfx95_supported()
-            and envs.SGLANG_ENABLE_SPLITKV_VERIFY.get()
-            and self.topk == 1
-        )
+        self.use_verify_splitkv = is_gfx95_supported() and self.topk == 1
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         # The grouped-head verify kernel is tuned for Kimi-K3 MLA and Qwen3.5
         # GQA with exactly one TP-local KV head.
@@ -252,19 +249,15 @@ class TritonAttnBackend(AttentionBackend):
             self.use_mla,
             self.use_verify_splitkv,
         )
-        # TODO: this logic should be fixed in non-hip platform
-        self.is_hip_dspark_draft = (
-            _is_hip
-            and model_runner.is_draft_worker
-            and model_runner.spec_algorithm.is_dspark()
+        self.dcp_size = attention_dcp_size(
+            backend="triton",
+            model_config=model_runner.model_config,
+            dcp_size=get_parallel().attn_dcp_size,
+            is_draft_worker=model_runner.is_draft_worker,
+            is_dspark=model_runner.spec_algorithm.is_dspark(),
+            is_hip=_is_hip,
         )
-        if self.is_hip_dspark_draft:
-            # Drafts never join the dcp group so we ignore it
-            self.dcp_size = 1
-            self.dcp_rank = 0
-        else:
-            self.dcp_size = get_parallel().attn_dcp_size
-            self.dcp_rank = get_parallel().attn_dcp_rank
+        self.dcp_rank = get_parallel().attn_dcp_rank if self.dcp_size > 1 else 0
         self.num_head = (
             model_runner.model_config.get_max_num_attention_heads()
             // get_parallel().attn_tp_size
@@ -273,10 +266,13 @@ class TritonAttnBackend(AttentionBackend):
             get_parallel().attn_tp_size, get_parallel().attn_dcp_size
         )
         mla_config = model_runner.model_config
+        # MLA prefill with a cached prefix runs one dense (non-absorbed) FP8 MHA:
+        # the prefix is up-projected out of the latent KV cache instead of running
+        # the absorbed 576/512 prefill. It materializes K/V for the whole batch, so
+        # it only engages when the batch fits the chunk budget.
         self.use_dense_fp8_chunked_prefill = (
             self.use_mla
             and is_gfx95_supported()
-            and envs.SGLANG_TRITON_DENSE_PREFILL_ATTN.get()
             and envs.SGLANG_TRITON_FP8_PREFILL_ATTN.get()
             and model_runner.kv_cache_dtype == torch.float8_e4m3fn
             and self.num_head == 12
