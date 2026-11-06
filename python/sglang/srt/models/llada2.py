@@ -34,6 +34,7 @@ from triton.language.extra import libdevice
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.hf_transformers import get_rope_config
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
@@ -91,7 +92,6 @@ from sglang.srt.utils import (
     is_npu,
     make_pp_layers,
 )
-from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 LoraConfig = None
 logger = logging.getLogger(__name__)
@@ -682,7 +682,10 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
         self.topk.topk_config.apply_routed_scaling_factor_on_output = (
             _is_npu or self.experts.should_fuse_routed_scaling_factor_in_topk
         )
-        self.topk.bind_runner_backend(self.experts.runner_backend)
+        self.topk.bind_runner_backend(
+            self.experts.runner_backend,
+            routing_method_type=self.experts.routing_method_type,
+        )
         if self.use_block_routing:
             _require_block_routing_runner_compatibility(self.experts, self.top_k)
         # shared expert

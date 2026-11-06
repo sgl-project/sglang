@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.kernels.jit.utils import get_jit_cuda_arch, is_hip_runtime
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.gemm.cutedsl_dual_gemm import (
     DualGemmActivationType,
     DualGemmQuantMode,
@@ -16,7 +16,7 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=15, stage="base-b", runner_config="4-gpu-b200")
 
 _HIDDEN_SIZE = 2048
 _INTERMEDIATE_SIZE = 2048
@@ -161,7 +161,7 @@ def _make_gemma4_diffusion_self_conditioning(dtype=torch.bfloat16):
 class TestDualGemm(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        if is_hip_runtime() or get_jit_cuda_arch().major != 10:
+        if not current_arch().is_sm(10):
             raise unittest.SkipTest("NVIDIA SM10x required")
 
     def test_decode_token_gate(self):

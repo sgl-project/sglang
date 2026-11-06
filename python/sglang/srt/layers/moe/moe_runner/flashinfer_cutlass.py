@@ -278,8 +278,7 @@ def _prepare_input(
 def _sm120_mtp_mma_supported() -> bool:
     import os
 
-    # This implementation preserves FlashInfer's default FP4 quantizer and
-    # fused FC2 epilogue. Other quantization recipes retain the stock runner.
+    # Matches only FlashInfer's default FP4 quantizer with the fused FC2 epilogue.
     return (
         is_sm120()
         and envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get()

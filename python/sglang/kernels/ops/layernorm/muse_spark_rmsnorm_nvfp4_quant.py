@@ -1,7 +1,7 @@
-"""Fused RMS norm + per-token NVFP4 quantization for MuseSpark v1.2.
+"""Fused RMS norm + (per-token) NVFP4 quantization for MuseSpark v1.2.
 
 Byte-exact with FlashInfer's per-token ``layout_linear`` CuTe-DSL quantizer on
-the same bf16 row.
+the same bf16 row. The static-scale mode matches FlashInfer's CUDA ``fp4_quantize``.
 """
 
 from __future__ import annotations
@@ -48,9 +48,16 @@ def _jit_module(hidden_size: int, num_threads: int) -> Module:
         *args,
         cuda_files=["muse_spark/norm_fp4_quant.cuh"],
         cuda_wrappers=[
-            ("run_quant", f"MuseSparkNormFp4Quant<{args}, true, false>::run"),
-            ("run_quant_normed", f"MuseSparkNormFp4Quant<{args}, true, true>::run"),
-            ("run_normed", f"MuseSparkNormFp4Quant<{args}, false, true>::run"),
+            ("run_quant", f"MuseSparkNormFp4Quant<{args}, true, false, false>::run"),
+            (
+                "run_quant_normed",
+                f"MuseSparkNormFp4Quant<{args}, true, true, false>::run",
+            ),
+            ("run_normed", f"MuseSparkNormFp4Quant<{args}, false, true, false>::run"),
+            (
+                "run_quant_static",
+                f"MuseSparkNormFp4Quant<{args}, true, false, true>::run",
+            ),
         ],
     )
 
@@ -99,7 +106,7 @@ def _fused_norm_fp4_quant_jit(
         fn = module.run_quant
     else:
         fn = module.run_normed
-    fn(x, weight, normed, fp4, sf, pts, float(eps), float(global_scale_inv))
+    fn(x, weight, normed, fp4, sf, pts, None, float(eps), float(global_scale_inv))
     return fp4, sf, pts, normed
 
 
@@ -304,3 +311,31 @@ def fused_norm_fp4_quant(
         quantize=quantize,
         want_normed=want_normed,
     )
+
+
+def fused_norm_fp4_quant_static(
+    x: torch.Tensor,
+    weight: Optional[torch.Tensor],
+    eps: float,
+    global_scale: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return ``(fp4, sf)``: RMS norm, then NVFP4 with the static fp32 ``global_scale``.
+
+    ``fp4`` is ``[M, K/2]`` uint8 and ``sf`` is ``[M, K/16]`` uint8 (e4m3 bits,
+    row-major).
+    """
+    assert x.dtype == torch.bfloat16 and x.dim() == 2 and x.is_contiguous()
+    assert global_scale.dtype == torch.float32 and global_scale.numel() == 1
+    m, hidden_size = x.shape
+    if weight is not None:
+        assert weight.dtype == torch.bfloat16 and weight.shape == (hidden_size,)
+        weight = weight.contiguous()
+    fp4 = torch.empty(m, hidden_size // 2, dtype=torch.uint8, device=x.device)
+    sf = torch.empty(m, hidden_size // _BLOCK, dtype=torch.uint8, device=x.device)
+    if m == 0:
+        return fp4, sf
+    module = _jit_module(hidden_size, _num_threads(hidden_size))
+    module.run_quant_static(
+        x, weight, None, fp4, sf, None, global_scale.reshape(1), float(eps), 0.0
+    )
+    return fp4, sf

@@ -739,6 +739,16 @@ async fn default_pd_groups_apply_configured_inflight_admission() {
         let response = app.clone().oneshot(request(body("hi"))).await.unwrap();
         assert_eq!(response.status(), expected);
         response.into_body().collect().await.unwrap();
+        if expected == StatusCode::OK {
+            // Prefill is dispatched in the background, so wait for it before checking.
+            tokio::time::timeout(TEST_TIMEOUT, async {
+                while prefill.captured.lock().unwrap().last_body.is_none() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        }
         assert_eq!(
             prefill.captured.lock().unwrap().last_body.is_some(),
             expected == StatusCode::OK
@@ -986,6 +996,14 @@ async fn full_decode_group_falls_back_to_another_version_group() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+    // Prefill is dispatched in the background, so wait for it before checking.
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        while workers[1].captured.lock().unwrap().last_body.is_none() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
     let dispatched: Vec<_> = workers
         .iter()
         .map(|w| w.captured.lock().unwrap().last_body.is_some())
