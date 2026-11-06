@@ -1511,6 +1511,41 @@ class TestDflashDraftKvBudget(CustomTestCase):
 
         self.assertLess(_tokens(10240), _tokens(None))
 
+    def test_draft_on_swa_slots_is_charged_per_swa_token(self):
+        draft_kv_per_token = 10240
+        ratio = 0.5
+
+        def _pool(on_swa):
+            mr = _make_model_runner(
+                self,
+                is_hybrid_swa=True,
+                full_attention_layer_ids=list(range(16)),
+                swa_attention_layer_ids=list(range(16, 32)),
+                swa_num_kv_heads=4,
+                swa_full_tokens_ratio=ratio,
+            )
+            mr.spec_algorithm.is_dflash.return_value = True
+            mr.spec_algorithm.is_dflash_family.return_value = True
+            mr.dflash_draft_cell_size_per_token = draft_kv_per_token
+            mr.spec_aux_config = SimpleNamespace(
+                eagle_draft_num_layers=None,
+                dflash_draft_num_layers=5,
+                draft_model_config=SimpleNamespace(dflash_draft_kv_on_swa=on_swa),
+            )
+            with mock_cpu_env():
+                from sglang.srt.model_executor.pool_configurator import (
+                    create_memory_pool_configurator,
+                )
+
+                cfg = create_memory_pool_configurator(mr)
+                config = cfg.calculate_pool_sizes(10_000_000, get_schedule().page_size)
+            return cfg._cell_size, config.full_max_total_num_tokens
+
+        per_token_cell, per_token_full = _pool(False)
+        on_swa_cell, on_swa_full = _pool(True)
+        self.assertEqual(per_token_cell - on_swa_cell, (1 - ratio) * draft_kv_per_token)
+        self.assertGreater(on_swa_full, per_token_full)
+
 
 class TestSWAPoolFloor(CustomTestCase):
     """An SWA pool below the prefill admission floor must fail here, not livelock

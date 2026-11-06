@@ -6,7 +6,9 @@ from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.arg_groups.speculative_hook import (
     _publish_dspark_mla_draft_backend,
     _resolve_dflash_draft_attention_backend,
+    _resolve_dflash_draft_kv_on_swa,
 )
+from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.platforms.interface import SRTPlatform
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -168,6 +170,69 @@ class TestDFlashDraftBackendResolution(CustomTestCase):
                 ),
                 expected,
             )
+
+
+class TestDFlashDraftKvOnSwaResolution(CustomTestCase):
+    def _resolve(self, **overrides):
+        kwargs = dict(
+            model_path="dummy",
+            device="custom",
+            speculative_algorithm="DFLASH",
+            speculative_draft_model_path="draft",
+            speculative_num_draft_tokens=8,
+            speculative_draft_attention_backend="fa4",
+            disaggregation_mode="prefill",
+            disaggregation_transfer_backend="mooncake",
+        )
+        kwargs.update(overrides)
+        args = ServerArgs(**kwargs)
+        platform = Mock(spec=SRTPlatform)
+        platform.is_out_of_tree.return_value = False
+        draft = SimpleNamespace(
+            num_hidden_layers=2,
+            is_causal=True,
+            dflash_config={"attention_mode": "gqa"},
+            layer_types=["sliding_attention"] * 2,
+            sliding_window=2048,
+        )
+        target = SimpleNamespace(
+            attention_arch=AttentionArch.MHA,
+            is_hybrid_swa=True,
+            is_hybrid_swa_compress=False,
+            sliding_window_size=2048,
+            hf_config=SimpleNamespace(
+                model_type="muse_spark", architectures=["MuseSparkForCausalLM"]
+            ),
+        )
+        with (
+            patch(f"{HOOK_MODULE}.current_platform", platform),
+            patch(
+                f"{HOOK_MODULE}.get_platform",
+                return_value=SimpleNamespace(is_cuda=True),
+            ),
+            patch(f"{HOOK_MODULE}.model_config_of", return_value=target),
+            patch("sglang.srt.hf_transformers.get_config", return_value=draft),
+        ):
+            _resolve_dflash_draft_kv_on_swa(args)
+        return (
+            resolution_result(args, "speculative_dflash_draft_kv_on_swa"),
+            resolution_result(args, "speculative_dflash_draft_window_transfer"),
+        )
+
+    def test_launch_gates(self):
+        cases = (
+            ({}, (True, 2048)),
+            ({"disaggregation_transfer_backend": "nixl"}, (False, None)),
+            # A real launch rejects PP > 1 earlier; this pins the resolver's own guard.
+            ({"pp_size": 2}, (False, None)),
+            ({"attn_cp_size": 2}, (False, None)),
+            ({"dcp_size": 2}, (False, None)),
+            # The window transfer does not depend on the draft backend.
+            ({"speculative_draft_attention_backend": "flashinfer"}, (False, 2048)),
+        )
+        for overrides, expected in cases:
+            with self.subTest(**overrides):
+                self.assertEqual(self._resolve(**overrides), expected)
 
 
 if __name__ == "__main__":

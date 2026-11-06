@@ -1058,16 +1058,13 @@ def _dflash_draft_window(server_args: ServerArgs) -> Optional[int]:
             model_override_args=json.loads(cfg.json_model_override_args),
             **kwargs,
         )
-        draft_text_config = (
-            getattr(draft_hf_config, "text_config", None) or draft_hf_config
-        )
+        draft_config = parse_dflash_draft_config(draft_hf_config=draft_hf_config)
         layer_types = get_dflash_layer_types(draft_hf_config)
         if not (
             layer_types
-            and len(layer_types)
-            == getattr(draft_text_config, "num_hidden_layers", None)
+            and len(layer_types) == draft_config.num_hidden_layers
             and set(layer_types) == {"sliding_attention"}
-            and not parse_dflash_draft_config(draft_hf_config=draft_hf_config).is_mla
+            and not draft_config.is_mla
         ):
             return None
         window_left = int(get_dflash_attention_sliding_window_size(draft_hf_config))
@@ -1119,12 +1116,10 @@ def _plain_swa_mha_target(server_args: ServerArgs) -> bool:
     hf_config = target.hf_config
     return (
         target.attention_arch == AttentionArch.MHA
-        and not getattr(target, "is_hybrid_swa_compress", False)
-        and getattr(hf_config, "model_type", None)
-        not in ("deepseek_v4", "deepseek_v41")
+        and not target.is_hybrid_swa_compress
+        and hf_config.model_type not in ("deepseek_v4", "deepseek_v41")
         and not any(
-            arch.startswith("DeepseekV4")
-            for arch in getattr(hf_config, "architectures", None) or ()
+            arch.startswith("DeepseekV4") for arch in (hf_config.architectures or ())
         )
     )
 
