@@ -6,6 +6,7 @@ from typing import Any, Dict
 from sglang.srt.arg_groups.model_override_base import (
     _register_for,
     model_config_of,
+    register_dspark_dp_a2a_backends,
     resolving_view,
 )
 from sglang.srt.environ import envs
@@ -13,6 +14,12 @@ from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils import is_flashinfer_available
 
 logger = logging.getLogger(__name__)
+
+# Over DeepEP, the DSpark draft's narrower MoE dispatches in the target's low-latency buffer layout
+# (_DeepEPDispatcherImplLowLatency._buffer_layout).
+register_dspark_dp_a2a_backends(
+    "DeepseekV4ForCausalLM", ("none", "megamoe", "mori", "deepep")
+)
 
 
 @_register_for("DeepseekV4ForCausalLM")
