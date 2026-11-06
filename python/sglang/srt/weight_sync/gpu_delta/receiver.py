@@ -186,7 +186,7 @@ def _qualify_canonical_plan(backend, manifest):
     for name, entry in entries.items():
         if name not in backend.layout.inventory or backend.layout.excluded.get(
             name
-        ) not in {None, "expert owned by another EP rank"}:
+        ) not in {None, "expert projection owned by another EP/TP rank"}:
             raise ValueError(f"delta publication has an unadmitted tensor: {name}")
         canonical = backend.layout.inventory[name]
         if (

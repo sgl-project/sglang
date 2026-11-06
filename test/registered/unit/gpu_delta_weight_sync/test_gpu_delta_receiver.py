@@ -89,7 +89,7 @@ class TestCanonicalPlanCache(unittest.TestCase):
                     name: {"dtype": "U8", "shape": [2, 4]}
                     for name in ("local", "foreign")
                 },
-                excluded={"foreign": "expert owned by another EP rank"},
+                excluded={"foreign": "expert projection owned by another EP/TP rank"},
                 bindings=[
                     SimpleNamespace(name="local", view_id="a", slices=[[0, 2], [0, 2]])
                 ],

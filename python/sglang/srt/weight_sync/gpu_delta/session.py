@@ -268,9 +268,12 @@ class DeltaSession:
 
 def with_gpu_delta_controls(scheduler, dispatcher):
     """Register only delta requests; ordinary handlers remain unchanged."""
+    from sglang.srt.runtime_context import get_parallel
     from sglang.utils import TypeBasedDispatcher
 
-    control = GpuDeltaSchedulerControl(scheduler)
+    parallel = get_parallel()
+    reply_group = parallel.attn_tp_group if parallel.attn_tp_size > 1 else None
+    control = GpuDeltaSchedulerControl(scheduler, reply_group)
     dispatcher += TypeBasedDispatcher(
         [
             (delta_io.GetGpuDeltaInfoReqInput, control.handle),
@@ -289,8 +292,9 @@ def with_gpu_delta_controls(scheduler, dispatcher):
 class GpuDeltaSchedulerControl:
     """Small scheduler adapter; dependencies are lazy for ordinary disk users."""
 
-    def __init__(self, scheduler):
+    def __init__(self, scheduler, reply_group=None):
         self.scheduler = scheduler
+        self.reply_group = reply_group
         self.session: DeltaSession | None = None
 
     def _describe(self, engine_id: str) -> dict:
@@ -305,16 +309,14 @@ class GpuDeltaSchedulerControl:
             raise ValueError(
                 "GPU delta requires the global control broadcast without EP scale joiners"
             )
-        # The existing reply transport emits one reply per DP route.
-        # Reject hidden TP/CP/PP followers and unsupported DCP consumer caches.
-        if (
-            parallel.attn_tp_size != 1
-            or parallel.attn_cp_size != 1
-            or parallel.attn_dcp_size != 1
-            or parallel.pp_size != 1
-        ):
+        # DCP partitions KV inside an attention-TP group; every weight owner
+        # still replies through that group's leader. Prefill CP and PP require
+        # separate control and consumer admission.
+        if parallel.attn_cp_size != 1 or parallel.pp_size != 1:
+            raise ValueError("GPU delta currently requires attention CP1 and PP1")
+        if parallel.attn_tp_size % parallel.attn_dcp_size:
             raise ValueError(
-                "GPU delta currently requires attention TP1/CP1/DCP1 and PP1"
+                "GPU delta requires DCP groups inside attention TP groups"
             )
         if scheduler.enable_lora or str(scheduler.disaggregation_mode.value) != "null":
             raise ValueError(
@@ -444,6 +446,26 @@ class GpuDeltaSchedulerControl:
             )
             success, message = False, str(exc)
         receipt["generation_paused"] = self.scheduler._engine_paused
+        replies = [(success, message, receipt)]
+        if self.reply_group is not None:
+            from torch.distributed import gather_object
+
+            group = self.reply_group
+            replies = [None] * group.world_size if group.rank_in_group == 0 else None
+            # Use the scheduler's CPU group, including failed rank replies. Only
+            # its leader owns the tokenizer socket; the tokenizer waits for every
+            # DP route before advancing prepare/apply/resume to the next phase.
+            gather_object(
+                (success, message, receipt),
+                replies,
+                dst=group.ranks[0],
+                group=group.cpu_group,
+            )
+            if replies is None:
+                return None
         return delta_io.GpuDeltaReqOutput(
-            rid=request.rid, success=success, message=message, participant=receipt
+            rid=request.rid,
+            success=all(reply[0] for reply in replies),
+            message=" | ".join(reply[1] for reply in replies if reply[1]),
+            participants=[reply[2] for reply in replies],
         )

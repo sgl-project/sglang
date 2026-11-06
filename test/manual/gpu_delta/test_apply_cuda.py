@@ -161,6 +161,22 @@ def case(kind, index):
         slices = [[0, 3], [0, 5], [2, 9]]
         storage = torch.full((4, 7, 11), 0x5A, dtype=torch.uint8, device="cuda")
         target = storage[:3, 1:6, 1:8]
+    elif isinstance(kind, tuple) and kind[0] == "tp":
+        _, tp_size, rank, axis = kind
+        canonical_shape = (32, 8192)
+        slices = [[0, size] for size in canonical_shape]
+        width = canonical_shape[axis] // tp_size
+        slices[axis] = [rank * width, (rank + 1) * width]
+        rows, columns = (stop - start for start, stop in slices)
+        storage = torch.full(
+            (rows * columns + 32,), 0x5A, dtype=torch.uint8, device="cuda"
+        )
+        # A full canonical mask feeds a rank-local interleaved destination.
+        # Column TP must retain the global source row stride, including its
+        # nonzero shard offset. Padding outside the target must remain intact.
+        target = (
+            storage[16:-16].view(rows // 4, columns // 4, 4, 4).permute(0, 2, 1, 3)
+        )
     else:
         size, padding = kind
         canonical_shape = (1, size)
@@ -195,6 +211,10 @@ def test_changed_counts_layouts_and_alignment_reuse_three_fixed_modules_and_exac
         ["affine", (4097, 1), (8192, 16), "row", (1, 1)],
         [(17, 1)] * 5,
     ]
+    variants.extend(
+        [("tp", tp_size, rank, axis) for rank in range(tp_size) for axis in (0, 1)]
+        for tp_size in (1, 2, 4, 8)
+    )
     populated_families = set()
     for kinds in variants:
         items = [case(kind, index) for index, kind in enumerate(kinds)]

@@ -30,7 +30,7 @@ def _bytes(tensor):
 
 def _apply_binding(binding, mask):
     for view in binding.apply_bindings():
-        selected = view.selected_bytes(mask.reshape(-1)) if binding.segments else mask
+        selected = view.selected_bytes(mask.reshape(-1))
         for destination in view.destinations:
             destination.bitwise_xor_(selected.reshape(destination.shape))
 
@@ -88,12 +88,13 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                     expected = decoded.view(dtype).reshape(12, 20)[2:10, 5:13]
                     torch.testing.assert_close(_bytes(payload), _bytes(expected))
 
-    def test_unfused_bf16_shared_experts_follow_linear_partition_group(self):
+    def test_attention_and_shared_experts_follow_their_linear_partition_groups(self):
         for tp_rank, tp_size in ((0, 1), (3, 8)):
-            with self.subTest(tp_rank=tp_rank, tp_size=tp_size):
-                self._check_shared_expert_partition(tp_rank, tp_size)
+            for dcp in (False, True):
+                with self.subTest(tp_rank=tp_rank, tp_size=tp_size, dcp=dcp):
+                    self._check_shared_expert_partition(tp_rank, tp_size, dcp)
 
-    def _check_shared_expert_partition(self, tp_rank, tp_size):
+    def _check_shared_expert_partition(self, tp_rank, tp_size, dcp):
         intermediate, hidden = 32, 16
         shard = intermediate // tp_size
         before = {
@@ -143,12 +144,95 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
             }
             for key, value in before.items()
         }
+        # Attention and shared experts may use different TP groups. MLA's
+        # projected K/V caches must refresh from the selected local kv_b shard.
+        attn = layer.self_attn = torch.nn.Module()
+        attn_group = SimpleNamespace(rank_in_group=3, world_size=4)
+        attn.qk_nope_head_dim, attn.v_head_dim = 4, 6
+        attn.qk_head_dim = 8
+        attn.q_b_proj_qrep = None
+        attn.q_b_proj_qrep_weight = attn.w_kc_qrep = None
+        attention_before, attention_after = {}, {}
+        for name, shape, axis in (
+            ("q_b_proj", (32, hidden), 0),
+            ("kv_b_proj", (40, hidden), 0),
+            ("o_proj", (hidden, 24), 1),
+        ):
+            module = type(
+                "RowParallelLinear" if axis == 1 else "ColumnParallelLinear",
+                (torch.nn.Module,),
+                {},
+            )()
+            module.tp_group = attn_group
+            value = torch.randn(shape).bfloat16()
+            attention_before[name] = value
+            attention_after[name] = torch.randn_like(value)
+            width = shape[axis] // 4
+            module.weight = torch.nn.Parameter(
+                value.narrow(axis, 3 * width, width).clone(), requires_grad=False
+            )
+            setattr(module.weight, "input_dim" if axis == 1 else "output_dim", axis)
+            setattr(attn, name, module)
+            inventory[f"model.layers.0.self_attn.{name}.weight"] = {
+                "dtype": "BF16",
+                "shape": list(shape),
+            }
+        key, value = attn.kv_b_proj.weight.unflatten(0, (1, 10)).split([4, 6], dim=1)
+        attn.w_kc = key.clone().detach()
+        attn.w_vc = value.transpose(1, 2).clone().detach()
+        if dcp:
+            # TP4 / DCP2, rank3: gathered consumers cover heads2:4, while local
+            # parameters cover only head3. The source origin is nonzero for both.
+            attn.q_b_proj_qrep_weight = attention_before["q_b_proj"][16:].clone()
+            attn.w_kc_qrep = (
+                attention_before["kv_b_proj"][20:].reshape(2, 10, hidden)[:, :4].clone()
+            )
         plan = layout.GpuDeltaLayout(root, inventory)
         for binding in plan.bindings:
-            key = binding.name.split(".")[-2].removesuffix("_proj")
-            mask = _bytes(before[key]) ^ _bytes(after[key])
-            _apply_binding(binding, binding.selected_bytes(mask))
+            if ".self_attn." in binding.name:
+                key = binding.name.split(".")[-2]
+                mask = _bytes(attention_before[key]) ^ _bytes(attention_after[key])
+            else:
+                key = binding.name.split(".")[-2].removesuffix("_proj")
+                mask = _bytes(before[key]) ^ _bytes(after[key])
+            _apply_binding(binding, mask)
+        for image in plan.derived:
+            image.destination.copy_(image.source)
         plan.check_identity()
+        for name, value in attention_after.items():
+            axis = 1 if name == "o_proj" else 0
+            width = value.shape[axis] // 4
+            torch.testing.assert_close(
+                _bytes(getattr(attn, name).weight),
+                _bytes(value.narrow(axis, 3 * width, width)),
+                rtol=0,
+                atol=0,
+            )
+        key, value = attention_after["kv_b_proj"][30:].unflatten(0, (1, 10)).split(
+            [4, 6], dim=1
+        )
+        torch.testing.assert_close(_bytes(attn.w_kc), _bytes(key), rtol=0, atol=0)
+        torch.testing.assert_close(
+            _bytes(attn.w_vc), _bytes(value.transpose(1, 2)), rtol=0, atol=0
+        )
+        if dcp:
+            torch.testing.assert_close(
+                _bytes(attn.q_b_proj_qrep_weight),
+                _bytes(attention_after["q_b_proj"][16:]),
+                rtol=0,
+                atol=0,
+            )
+            torch.testing.assert_close(
+                _bytes(attn.w_kc_qrep),
+                _bytes(attention_after["kv_b_proj"][20:].reshape(2, 10, hidden)[:, :4]),
+                rtol=0,
+                atol=0,
+            )
+            original = attn.w_kc_qrep
+            attn.w_kc_qrep = original.clone()
+            with self.assertRaisesRegex(RuntimeError, "consumer storage changed"):
+                plan.check_identity()
+            attn.w_kc_qrep = original
         torch.testing.assert_close(
             _bytes(shared.gate_up_proj.weight),
             _bytes(torch.cat([after["gate"][selection], after["up"][selection]])),
@@ -299,6 +383,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
             for key in ("weight", "bias")
         }
         attn = layer.self_attn
+        attn.w_kc_qrep = attn.q_b_proj_qrep_weight = attn.q_b_proj_qrep = None
         attn.fused_qkv_a_proj_with_mqa = torch.nn.Linear(8, 7, bias=False).bfloat16()
         attn.indexer.wk_weights_proj = torch.nn.Linear(8, 9, bias=False).bfloat16()
         attn.kv_b_proj = torch.nn.Linear(8, 20, bias=False).bfloat16()
@@ -462,7 +547,6 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
         prefix = "model.layers.0.mlp.experts"
         name = prefix + ".0.gate_proj.input_scale"
         for override in (
-            {"moe_tp_size": 2},
             {"use_presharded_weights": True},
             {"quant_method": type("UnadmittedMoE", (), {"runner": None})()},
         ):

@@ -60,7 +60,7 @@ class ResumeGpuDeltaReqInput(BaseReq, kw_only=True):
 class GpuDeltaReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str
-    participant: Dict[str, Any]
+    participants: List[Dict[str, Any]]
 
 
 # Register before tokenizer/scheduler/DP-controller receive loops start.

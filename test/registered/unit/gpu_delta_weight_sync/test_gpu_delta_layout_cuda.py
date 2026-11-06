@@ -73,7 +73,10 @@ def _apply_prepared_masks(bindings, masks, derived=()):
     # Compilation and module loading must not execute against live weights.
     for value, before in saved:
         torch.testing.assert_close(
-            value.view(torch.uint8), before.view(torch.uint8), rtol=0, atol=0
+            value.contiguous().view(torch.uint8),
+            before.contiguous().view(torch.uint8),
+            rtol=0,
+            atol=0,
         )
     decoder = SimpleNamespace(
         enqueue=lambda: decoded[:size].copy_(payload),
@@ -99,7 +102,10 @@ def _apply_prepared_masks(bindings, masks, derived=()):
         assert prepared.error.item() == 1
         for value, before in saved:
             torch.testing.assert_close(
-                value.view(torch.uint8), before.view(torch.uint8), rtol=0, atol=0
+                value.contiguous().view(torch.uint8),
+                before.contiguous().view(torch.uint8),
+                rtol=0,
+                atol=0,
             )
     prepared.error.zero_()
     decoder.statuses.zero_()
@@ -110,7 +116,7 @@ def _apply_prepared_masks(bindings, masks, derived=()):
     return group
 
 
-def _reference_layer(values, independent_mma=False):
+def _reference_layer(values, independent_mma=False, tp_rank=0, tp_size=1):
     from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
 
     from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl import (
@@ -125,7 +131,8 @@ def _reference_layer(values, independent_mma=False):
     )
 
     layer = torch.nn.Module()
-    layer.moe_tp_size = 1
+    layer.moe_tp_size, layer.moe_tp_rank = tp_size, tp_rank
+    layer.use_padded_loading = False
     layer.use_presharded_weights = False
     layer.moe_ep_rank = 1
     layer.num_experts, layer.num_local_experts = 4, 2
@@ -139,10 +146,17 @@ def _reference_layer(values, independent_mma=False):
     )
     layer._cutedsl_wrapper = SimpleNamespace(quant_mode="w4a16")
     for suffix in ("weight", "weight_scale"):
+        gate, up, down = (
+            values[projection, suffix] for projection in ("gate", "up", "down")
+        )
+        rows, cols = gate.shape[1] // tp_size, down.shape[2] // tp_size
+        gate = gate[:, tp_rank * rows : (tp_rank + 1) * rows]
+        up = up[:, tp_rank * rows : (tp_rank + 1) * rows]
+        down = down[:, :, tp_rank * cols : (tp_rank + 1) * cols]
         # The actual checkpoint loader puts Up before Gate for CuTe DSL.
-        fused = torch.cat([values["up", suffix], values["gate", suffix]], dim=1)
+        fused = torch.cat([up, gate], dim=1)
         copy_or_rebind_param(layer, "w13_" + suffix, interleave_w13_halves(fused))
-        copy_or_rebind_param(layer, "w2_" + suffix, values["down", suffix].clone())
+        copy_or_rebind_param(layer, "w2_" + suffix, down.clone())
     for stem in ("w13", "w2"):
         scale = getattr(layer, stem + "_weight_scale")
         alias_or_bind_derived_param(
@@ -222,8 +236,9 @@ def _canonical(seed):
 
 
 @pytest.mark.parametrize("independent_mma", [False, True])
+@pytest.mark.parametrize("tp_size,tp_rank", [(1, 0), (2, 1)])
 def test_expert_delta_matches_full_loader_layout_and_scale_refresh(
-    monkeypatch, independent_mma
+    monkeypatch, independent_mma, tp_size, tp_rank
 ):
     from sglang.srt.weight_sync.gpu_delta.bindings import _moe_binding
     from sglang.srt.weight_sync.gpu_delta.derived import (
@@ -235,8 +250,8 @@ def test_expert_delta_matches_full_loader_layout_and_scale_refresh(
     monkeypatch.setenv("SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16", "1")
     old, new = _canonical(13), _canonical(29)
     live, expected = (
-        _reference_layer(old, independent_mma=independent_mma),
-        _reference_layer(new),
+        _reference_layer(old, independent_mma, tp_rank, tp_size),
+        _reference_layer(new, tp_rank=tp_rank, tp_size=tp_size),
     )
     images = {
         name: parameter
@@ -433,7 +448,11 @@ def test_scale_binding_matches_loader_padding():
 
 
 def test_cached_mla_refresh_survives_graph_replay_and_failure_gate():
-    from sglang.srt.weight_sync.gpu_delta.models import DeepSeekMlaMapping
+    from sglang.srt.weight_sync.gpu_delta.bindings import _direct_binding
+    from sglang.srt.weight_sync.gpu_delta.models import (
+        DeepSeekMlaMapping,
+        _with_replicated_projection,
+    )
 
     weight = torch.zeros((2 * (4 + 6), 8), dtype=torch.bfloat16, device="cuda")
     key, value = weight.unflatten(0, (2, 10)).split([4, 6], dim=1)
@@ -443,10 +462,36 @@ def test_cached_mla_refresh_survives_graph_replay_and_failure_gate():
         v_head_dim=6,
         w_kc=key.transpose(1, 2).contiguous().transpose(1, 2),
         w_vc=value.contiguous().transpose(1, 2),
+        w_kc_qrep=torch.zeros((4, 4, 8), dtype=torch.bfloat16, device="cuda"),
     )
     plan = DeepSeekMlaMapping.__new__(DeepSeekMlaMapping)
     plan.derived = []
     plan._add_derived("attention", attn)
+    # TP4 / DCP2 rank3: local heads6:8 plus gathered K rows for heads4:8.
+    # One runtime affine descriptor selects all K rows from the complete
+    # canonical [8*(K+V), rank] mask; no per-head kernels or extra collective.
+    binding = _direct_binding(
+        "model.layers.0.self_attn.kv_b_proj.weight",
+        {"dtype": "BF16", "shape": [80, 8]},
+        weight,
+        [[60, 80], [0, 8]],
+    )
+    binding = _with_replicated_projection(binding, attn.w_kc_qrep, 10, 4)
+    mask = torch.randint(256, (80 * 8 * 2,), dtype=torch.uint8, device="cuda")
+    _apply_prepared_masks([binding], [mask], plan.derived)
+    expected = mask.view(torch.bfloat16).reshape(8, 10, 8)
+    torch.testing.assert_close(
+        attn.w_kc_qrep.view(torch.uint8),
+        expected[4:, :4].contiguous().view(torch.uint8),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        weight.view(torch.uint8),
+        expected[6:].reshape(20, 8).view(torch.uint8),
+        rtol=0,
+        atol=0,
+    )
     identity = [
         (d.destination.data_ptr(), d.destination.stride()) for d in plan.derived
     ]
@@ -538,6 +583,7 @@ def _matrix_canonical(format, seed, hidden, intermediate):
 def _matrix_loader_reference(values, layout, hidden, intermediate):
     """Run ordinary preprocessing, independent of GPU-delta address formulas."""
     layer = torch.nn.Module()
+    layer.moe_tp_size = 1
     layer.quant_method = SimpleNamespace()
     layer.moe_runner_config = SimpleNamespace(is_gated=True)
     layer.num_local_experts = 2
@@ -679,8 +725,9 @@ def _matrix_loader_reference(values, layout, hidden, intermediate):
         ("mxfp4", "megamoe", 256, ""),
     ],
 )
+@pytest.mark.parametrize("tp_size,tp_rank", [(1, 0), (2, 1)])
 def test_flashinfer_matrix_matches_native_preprocessing(
-    format, backend, intermediate, quant_mode, monkeypatch
+    format, backend, intermediate, quant_mode, tp_size, tp_rank, monkeypatch
 ):
     from sglang.srt.weight_sync.gpu_delta.bindings import (
         _moe_binding,
@@ -697,12 +744,23 @@ def test_flashinfer_matrix_matches_native_preprocessing(
         up_first=format in {"nvfp4", "mxfp4"} and backend == "trtllm",
     )
     old, new = (
-        _matrix_canonical(format, seed, hidden, intermediate) for seed in (17, 43)
+        _matrix_canonical(format, seed, hidden, intermediate * tp_size)
+        for seed in (17, 43)
     )
+    local_values = []
+    for values in (old, new):
+        local = {}
+        for (projection, suffix), value in values.items():
+            axis = 2 if projection == "down" else 1
+            size = value.shape[axis] // tp_size
+            local[projection, suffix] = value.narrow(axis, tp_rank * size, size)
+        local_values.append(local)
     live, expected = (
         _matrix_loader_reference(values, layout, hidden, intermediate)
-        for values in (old, new)
+        for values in local_values
     )
+    live.moe_tp_size, live.moe_tp_rank = tp_size, tp_rank
+    live.use_padded_loading = backend == "trtllm" and format != "mxfp4"
     images = dict(live.named_parameters())
     identity = {
         name: (value.data_ptr(), value.stride()) for name, value in images.items()

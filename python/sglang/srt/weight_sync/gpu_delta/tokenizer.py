@@ -199,7 +199,7 @@ class GpuDeltaTokenizerControl:
 
     async def _request(self, obj):
         results = await self.communicator(obj)
-        participants = [result.participant for result in results]
+        participants = [rank for result in results for rank in result.participants]
         success = all(result.success for result in results)
         return {
             "success": success,

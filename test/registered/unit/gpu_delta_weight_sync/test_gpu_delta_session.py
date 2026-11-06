@@ -136,7 +136,7 @@ def test_prepare_and_status_do_not_wait_for_file_io(make_session):
         delta_io.PrepareGpuDeltaReqInput(**req, validate_payload_hash=False)
     )
     assert accepted.success
-    preparing = accepted.participant
+    preparing = accepted.participants[0]
     assert session._session.request["validate_payload_hash"] is False
     assert preparing["state"] == "PREPARING"
     assert backend.started.wait(2)
@@ -146,12 +146,17 @@ def test_prepare_and_status_do_not_wait_for_file_io(make_session):
     matched = control.handle(
         delta_io.GetGpuDeltaStatusReqInput(session_id="publication-1")
     )
-    assert matched.success and matched.participant["session_id"] == "publication-1"
+    assert matched.success and matched.participants[0]["session_id"] == "publication-1"
     mismatched = control.handle(
         delta_io.GetGpuDeltaStatusReqInput(session_id="another-publication")
     )
     assert not mismatched.success and "different session" in mismatched.message
-    for receipt in (preparing, status, matched.participant, mismatched.participant):
+    for receipt in (
+        preparing,
+        status,
+        matched.participants[0],
+        mismatched.participants[0],
+    ):
         for key in req.keys() - {"manifest_path", "participants"}:
             assert receipt[key] == req[key]
     assert session.status()["state"] == "PREPARING"
@@ -313,10 +318,9 @@ def test_scheduler_blocked_timing_excludes_background_prepare(
             "global control",
         ),
         ({}, True, "global control"),
-        ({"attn_tp_size": 2}, False, "TP1/CP1/DCP1"),
-        ({"attn_cp_size": 2}, False, "TP1/CP1/DCP1"),
-        ({"attn_dcp_size": 2}, False, "TP1/CP1/DCP1"),
-        ({"pp_size": 2}, False, "TP1/CP1/DCP1"),
+        ({"attn_cp_size": 2}, False, "CP1 and PP1"),
+        ({"attn_dcp_size": 2}, False, "DCP groups inside attention TP"),
+        ({"pp_size": 2}, False, "CP1 and PP1"),
     ],
 )
 def test_describe_rejects_unsupported_control_topologies(
@@ -349,6 +353,63 @@ def test_describe_rejects_unsupported_control_topologies(
     with pytest.raises(ValueError, match=message):
         control._describe("engine-0")
     assert control.session is None
+
+
+@pytest.mark.parametrize("rank", [None, 0, 1], ids=["singleton", "leader", "follower"])
+def test_tp_replies_preserve_follower_failure_and_original_identity(
+    monkeypatch, rank
+):
+    # A nonzero global leader is important for mixed attention-DP/TP engines.
+    group = (
+        None
+        if rank is None
+        else SimpleNamespace(
+            rank_in_group=rank, world_size=2, ranks=[2, 3], cpu_group=object()
+        )
+    )
+    receipts = [
+        dict(
+            identity=identity(rank=2),
+            session_id="publication-1",
+            state="APPLIED",
+            generation_paused=True,
+        ),
+        dict(
+            identity=identity(rank=3),
+            session_id="publication-1",
+            state="POISONED",
+            message="failed follower decode",
+            generation_paused=True,
+        ),
+    ]
+    control = GpuDeltaSchedulerControl(SimpleNamespace(_engine_paused=True), group)
+    control.session = SimpleNamespace(status=lambda: receipts[rank or 0].copy())
+    gathered = []
+
+    def gather_object(local, output, dst, group):
+        assert rank is not None and dst == 2 and group is control.reply_group.cpu_group
+        assert local[2] == receipts[rank]
+        gathered.append(local)
+        if rank == 0:
+            output[:] = [
+                (True, "", receipts[0]),
+                (False, receipts[1]["message"], receipts[1]),
+            ]
+        else:
+            assert output is None
+
+    monkeypatch.setattr("torch.distributed.gather_object", gather_object)
+    result = control.handle(
+        delta_io.GetGpuDeltaStatusReqInput(session_id="publication-1", rid="status")
+    )
+    if rank is None:
+        assert not gathered and result.success and result.participants == receipts[:1]
+    elif rank == 0:
+        assert len(gathered) == 1 and not result.success
+        assert result.rid == "status" and result.message == receipts[1]["message"]
+        assert result.participants == receipts
+    else:
+        assert len(gathered) == 1 and result is None
 
 
 @pytest.mark.parametrize("cache", ["shared IPC", "derived HPC"])
@@ -463,11 +524,11 @@ def test_clear_drains_release_before_private_close_and_shared_unlink(
         delta_io.PrepareGpuDeltaReqInput(**request([session.identity]))
     )
     assert not rejected.success and "base version" in rejected.message
-    assert rejected.participant["state"] == "CLEARED"
-    assert rejected.participant["version"] == 7
-    assert rejected.participant["identity"] == session.identity
-    assert not rejected.participant["generation_paused"]
-    for receipt in (receipt, session.status(), rejected.participant):
+    assert rejected.participants[0]["state"] == "CLEARED"
+    assert rejected.participants[0]["version"] == 7
+    assert rejected.participants[0]["identity"] == session.identity
+    assert not rejected.participants[0]["generation_paused"]
+    for receipt in (receipt, session.status(), rejected.participants[0]):
         for key in req.keys() - {"manifest_path", "participants"}:
             assert receipt[key] == req[key]
 
@@ -557,7 +618,13 @@ def test_update_owns_pause_fence_retract_and_resume_order(
         ("version", version)
     )
     control = delta_runtime.GpuDeltaSchedulerControl(scheduler)
-    monkeypatch.setattr(delta_runtime, "GpuDeltaSchedulerControl", lambda _: control)
+    monkeypatch.setattr(
+        "sglang.srt.runtime_context.get_parallel",
+        lambda: SimpleNamespace(attn_tp_size=1),
+    )
+    monkeypatch.setattr(
+        delta_runtime, "GpuDeltaSchedulerControl", lambda _, group: control
+    )
     wrapped = delta_runtime.with_gpu_delta_controls(scheduler, TypeBasedDispatcher([]))
     who = {"engine_id": "e0", "rank_id": "original"}
     session = control.session = delta_runtime.DeltaSession(
@@ -596,22 +663,22 @@ def test_update_owns_pause_fence_retract_and_resume_order(
         assert result.rid == "apply-rid" and scheduler._engine_paused
         expected = ["fence", "retract"] + (["flush"] if flush_cache else []) + ["apply"]
         assert result.success and events == expected
-        assert result.participant["generation_paused"]
-        assert result.participant["result"] == {"applied": True, "target_version": 1}
+        assert result.participants[0]["generation_paused"]
+        assert result.participants[0]["result"] == {"applied": True, "target_version": 1}
         result = wrapped(
             delta_io.ResumeGpuDeltaReqInput(
                 session_id="p", keep_pause=keep_pause, weight_version=weight_version
             )
         )
-        assert result.success and result.participant["state"] == "RESUMED"
-        assert result.participant["result"]["timings"] == {"host_prepare_s": 0.25}
+        assert result.success and result.participants[0]["state"] == "RESUMED"
+        assert result.participants[0]["result"]["timings"] == {"host_prepare_s": 0.25}
         expected += [("version", "1" if weight_version is None else weight_version)] + (
             [] if keep_pause else ["resume"]
         )
         assert events[: len(expected)] == expected
         assert scheduler._engine_paused is keep_pause
-        assert result.participant["generation_paused"] is keep_pause
-        timing = result.participant["scheduler_timing"]
+        assert result.participants[0]["generation_paused"] is keep_pause
+        timing = result.participants[0]["scheduler_timing"]
         assert (timing["resumed_ns"] is None) is keep_pause
         assert (timing["blocked_s"] is None) is keep_pause
         repeated = wrapped(
@@ -626,25 +693,41 @@ def test_update_owns_pause_fence_retract_and_resume_order(
         assert not any(event == ("version", "conflicting-version") for event in events)
         assert scheduler._engine_paused is keep_pause
         cleared = wrapped(delta_io.ClearGpuDeltaStateReqInput())
-        assert cleared.success and cleared.participant["version"] == 1
+        assert cleared.success and cleared.participants[0]["version"] == 1
         assert events[len(expected) :] == ["release", "close"]
         released = wrapped(
             delta_io.ReleaseGpuDeltaCacheReqInput(owner_rank_ids=["original"])
         )
-        assert released.success and released.participant["state"] == "CLEARED"
+        assert released.success and released.participants[0]["state"] == "CLEARED"
         assert scheduler._engine_paused is keep_pause
-        assert released.participant["generation_paused"] is keep_pause
+        assert released.participants[0]["generation_paused"] is keep_pause
     finally:
         session._executor.shutdown(wait=True)
 
 
 @pytest.mark.parametrize(
-    "tp_size,dp_size,attn_dp_size,world_rank,dp_rank",
-    [(8, 1, 8, 7, 7), (1, 2, 1, 0, 1), (1, 1, 1, 0, None)],
-    ids=["attention-dp", "replica-dp", "singleton"],
+    "tp_size,dp_size,attn_dp_size,dcp_size,world_rank,dp_rank",
+    [
+        (8, 1, 8, 1, 7, 7),
+        (4, 1, 2, 1, 3, 1),
+        (2, 1, 1, 1, 1, None),
+        (4, 1, 2, 2, 3, 1),
+        (2, 1, 1, 2, 1, None),
+        (1, 2, 1, 1, 0, 1),
+        (1, 1, 1, 1, 0, None),
+    ],
+    ids=[
+        "attention-dp",
+        "attention-dp-tp",
+        "attention-tp",
+        "attention-dp-tp-dcp",
+        "attention-tp-dcp",
+        "replica-dp",
+        "singleton",
+    ],
 )
 def test_describe_binds_published_scheduler_ranks(
-    monkeypatch, tp_size, dp_size, attn_dp_size, world_rank, dp_rank
+    monkeypatch, tp_size, dp_size, attn_dp_size, dcp_size, world_rank, dp_rank
 ):
     from sglang.srt.disaggregation.utils import DisaggregationMode
     from sglang.srt.managers.scheduler import Scheduler
@@ -660,6 +743,7 @@ def test_describe_binds_published_scheduler_ranks(
                 tp_size=tp_size,
                 dp_size=dp_size,
                 attn_dp_size=attn_dp_size,
+                dcp_size=dcp_size,
                 ep_size=tp_size,
             ),
             role="test",
