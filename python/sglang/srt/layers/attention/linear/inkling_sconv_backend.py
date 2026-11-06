@@ -67,6 +67,7 @@ from sglang.srt.models.inkling_common.kernels.sconv import (
     precompute_helion_extend_metadata,
 )
 from sglang.srt.runtime_context import (
+    decode_cuda_graph_max_bs,
     get_exec,
     get_spec,
     mamba_cache_chunk_size,
@@ -126,14 +127,15 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
         cuda_graph_config = get_exec().graph.cuda_graph_config
         decode_bs: list[int] = []
         prefill_tokens: list[int] = []
-        decode_max_bs = 0
         if cuda_graph_config is not None:
             decode_bs = list(cuda_graph_config.decode.bs or [])
             prefill_tokens = list(cuda_graph_config.prefill.bs or [])
-            decode_max_bs = cuda_graph_config.decode.max_bs or 0
         draft_token_num = get_spec().speculative_num_draft_tokens or 1
-        # req_to_token_pool.size is the runner's max_bs for both graph phases.
-        max_bs = max([self.req_to_token_pool.size, decode_max_bs, *decode_bs])
+        # req_to_token_pool.size is the runner's max_bs for both graph phases;
+        # the padded decode top bucket can exceed both it and the configured max.
+        max_bs = max(
+            [self.req_to_token_pool.size, decode_cuda_graph_max_bs(), *decode_bs]
+        )
         max_tokens = max([max_bs, *prefill_tokens, max_bs * draft_token_num])
 
         dev = self.device
