@@ -182,9 +182,11 @@ def _all_gather_dcp_kv_cache(kv_a: torch.Tensor):
     # keeping every rank's wire dtype/count unchanged.
     reorder_dtype = None
     if (
-        get_platform().is_sm100
+        (
+            get_platform().is_hip
+            or (get_platform().is_sm100 and gathered_kv_a.numel() >= 64 * 1024 * 1024)
+        )
         and kv_a.dtype == torch.uint8
-        and gathered_kv_a.numel() >= 64 * 1024 * 1024
         and kv_a.shape[-1] % 4 == 0
     ):
         reorder_dtype = torch.int64 if kv_a.shape[-1] % 8 == 0 else torch.int32
