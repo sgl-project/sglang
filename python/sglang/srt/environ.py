@@ -2212,6 +2212,11 @@ class Envs:
     # Tiled 17..64-row GEMMs for the weight shapes the ROCm Muse Spark model
     # registers (O projection, MoE pooler, DFlash draft MLP).
     SGLANG_MUSE_DENSE_TILED = EnvBool(True)
+    # ROCm Muse Spark model (sglang.srt.rocm_muse_spark): fused QKV projection /
+    # QK norm / RoPE / FP8 cache write, QK norm / RoPE / cache write, unpooler +
+    # FFN-boundary fusion, compact A4 verify MoE, a4w4 prefill MoE, sequence-
+    # parallel prefill, Ulysses attention, tuned verify-width dense GEMMs, shared
+    # and joint router/pooler projections.
     SGLANG_MUSE_FUSED_QKV_CACHE = EnvBool(True)
     SGLANG_MUSE_QK_ROPE_CACHE = EnvBool(True)
     SGLANG_MUSE_FUSED_UNPOOL_BOUNDARY = EnvBool(True)
