@@ -104,7 +104,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
 )
 from sglang.srt.utils import is_npu, rank_consensus_checker
-from sglang.srt.utils.common import async_d2h
+from sglang.srt.utils.device import async_d2h
 
 if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import AbortReq
@@ -858,11 +858,16 @@ class SchedulerDisaggregationPrefillMixin:
             if not waiting_for_batch_result or received_inputs or bootstrapped_reqs:
                 skip_batch_creation = False
 
-            # Keep at most two batches in flight.
+            # Keep at most two batches in flight. On shutdown, launch nothing new
+            # except the one selection whose MLP-sync gather carries this rank's
+            # ShutdownReq to the other attention-DP ranks.
             if (
                 should_ingest_requests
                 and len(self.result_queue) < 2
-                and not self.gracefully_exit
+                and (
+                    not self.gracefully_exit
+                    or self.dp_attn_adapter.shutdown_vote_pending()
+                )
                 and not self._deferred_input_requests
                 and not skip_batch_creation
             ):
