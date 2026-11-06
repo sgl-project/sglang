@@ -10,14 +10,14 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.server_fixtures.disaggregation_fixture import get_rdma_devices_args
 from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
-    DEFAULT_MODEL_NAME_FOR_TEST_MLA,
+    DEFAULT_MLA_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
 )
 
-TEST_MODEL = os.environ.get("NIXL_EP_TEST_MODEL", DEFAULT_MODEL_NAME_FOR_TEST_MLA)
+TEST_MODEL = os.environ.get("NIXL_EP_TEST_MODEL", DEFAULT_MLA_MODEL_NAME_FOR_TEST)
 os.environ.setdefault("SGLANG_NIXL_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK", "1024")
 
 ib_devices = get_rdma_devices_args()
