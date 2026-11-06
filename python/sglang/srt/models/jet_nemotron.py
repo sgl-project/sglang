@@ -10,6 +10,7 @@ from sglang.kernels.ops.attention.fla.fused_recurrent import (
 )
 from sglang.kernels.ops.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
 from sglang.srt.configs.jet_nemotron import JetBlockConfig, JetNemotronConfig
+from sglang.srt.hf_transformers import get_rope_config
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
     MambaAttnBackendBase,
@@ -32,7 +33,6 @@ from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2MLP, Qwen2Model
 from sglang.srt.utils import add_prefix
-from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 
 class DynamicShortConvolutionKernelGenerator(nn.Module):
@@ -264,9 +264,7 @@ class JetBlock(nn.Module):
         assert isinstance(get_attn_backend().linear_attn_backend, MambaAttnBackendBase)
         linear_attn_backend = get_attn_backend().linear_attn_backend
         forward_metadata = linear_attn_backend.forward_metadata
-        layer_cache = linear_attn_backend.req_to_token_pool.mamba2_layer_cache(
-            self.layer_id
-        )
+        layer_cache = linear_attn_backend.state_layer_cache(self.layer_id)
 
         qkvabz, _ = self.qkvabz_proj(hidden_states)
         q, k, v, a, beta, z = qkvabz.split(

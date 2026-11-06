@@ -29,7 +29,7 @@ from transformers import PretrainedConfig
 from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_stages
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
+from sglang.srt.hf_transformers import get_rope_config
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
     AuxHiddenStateList,
@@ -87,7 +87,7 @@ from sglang.srt.runtime_context import (
 # Importing from the wrong module causes this file to fail import, which prevents the
 # native MiniMaxM2ForCausalLM from registering in ModelRegistry. The fallback to the
 # transformers wrapper then crashes on config.rope_parameters (transformers v5 issue).
-# Other files (custom_all_reduce.py, hf_transformers_utils.py) also use sglang.srt.utils.
+# Other files (custom_all_reduce.py, hf_transformers/) also use sglang.srt.utils.
 from sglang.srt.utils import (
     add_prefix,
     cpu_has_amx_support,
@@ -100,7 +100,6 @@ from sglang.srt.utils import (
     make_pp_layers,
 )
 from sglang.srt.utils.custom_op import register_custom_op
-from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 logger = logging.getLogger(__name__)
 _is_cpu = is_cpu()
@@ -552,6 +551,7 @@ class MiniMaxM2MoE(nn.Module):
             correction_bias=self.e_score_correction_bias,
             routed_scaling_factor=1.0,
         )
+        self.topk.bind_runner_backend(self.experts.runner_backend)
 
         self.gate = ReplicatedLinear(
             config.hidden_size,
@@ -613,10 +613,6 @@ class MiniMaxM2MoE(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=forward_batch.moe_num_token_non_padded(),
-                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                    layer_id=self.layer_id,
-                ),
             )
         else:
             topk_output = self.topk.empty_topk_output(device=hidden_states.device)

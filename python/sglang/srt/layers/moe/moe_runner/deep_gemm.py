@@ -8,10 +8,8 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.moe.dsv4 import (
-    silu_and_mul_clamp,
-    silu_and_mul_masked_post_quant,
-)
+from sglang.kernels.ops.activation.silu_and_mul_clamp import silu_and_mul_clamp
+from sglang.kernels.ops.moe.dsv4 import silu_and_mul_masked_post_quant
 from sglang.kernels.ops.moe.triton_pad_expert_counts import pad_expert_counts
 from sglang.kernels.ops.quantization.per_token_group_quant import per_token_group_quant
 
@@ -34,6 +32,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_pre_permute,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend, get_moe_a2a_backend
+from sglang.srt.layers.offloader import get_offloader
 from sglang.srt.runtime_context import (
     get_exec,
     get_flags,
@@ -48,7 +47,6 @@ from sglang.srt.utils import (
     is_musa,
     is_npu,
 )
-from sglang.srt.utils.offloader import get_offloader
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.deepep import (
@@ -402,7 +400,9 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         quant_info: DeepGemmMoeQuantInfo,
         running_state: dict,
     ) -> torch.Tensor:
-        from sglang.kernels.ops.moe.dsv4 import silu_and_mul_contig_post_quant
+        from sglang.kernels.ops.activation.silu_and_mul_clamp import (
+            silu_and_mul_contig_post_quant,
+        )
         from sglang.kernels.ops.moe.ep_moe_kernels import tma_align_input_scale
         from sglang.kernels.ops.quantization.fp8_kernel import (
             create_per_token_group_quant_fp8_output_scale,
@@ -1509,7 +1509,9 @@ def _varlen_deep_gemm_situ_mul_quant(
     linear_beta: float,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Fused SiTU activation + per-group fp8 quant via CUDA JIT kernel."""
-    from sglang.kernels.ops.moe import situ_and_mul_masked_post_quant
+    from sglang.kernels.ops.moe.kimi_k3_situ_and_mul_quant import (
+        situ_and_mul_masked_post_quant,
+    )
 
     E, N, D_2 = gateup_output.shape
     D = D_2 // 2

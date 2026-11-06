@@ -62,14 +62,23 @@ def empty_sentinel(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     return torch.empty(0, dtype=dtype, device=device)
 
 
-@cache_once
 def is_hip_runtime() -> bool:
-    return bool(torch.version.hip)
+    from sglang.kernels.spec import PlatformInfo
+
+    return PlatformInfo.detect().is_hip
+
+
+def is_musa_runtime() -> bool:
+    from sglang.kernels.spec import PlatformInfo
+
+    return PlatformInfo.detect().is_musa
 
 
 @cache_once
-def is_musa_runtime() -> bool:
-    return getattr(torch.version, "musa", None) is not None
+def is_sail_runtime() -> bool:
+    # T-HEAD SAIL device names carry the "ZW" tag; keep the check aligned with
+    # sglang.srt.utils.is_sail so all layers agree on what "running on SAIL" means.
+    return bool(torch.cuda.is_available() and "ZW" in torch.cuda.get_device_name())
 
 
 _REGISTERED_CLASSES: Dict[type, type] = {}

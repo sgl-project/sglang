@@ -17,7 +17,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 # suite is the right slot (matches existing jit_kernel test_*.py pattern).
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
-if not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10):
+if not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10):
     pytest.skip(
         "GDN CuteDSL prefill requires CUDA SM10x (Blackwell).",
         allow_module_level=True,

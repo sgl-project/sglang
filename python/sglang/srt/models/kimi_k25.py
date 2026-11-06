@@ -31,11 +31,7 @@ from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
     pad_mm_tokens,
 )
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputs,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV3ForCausalLM
@@ -46,6 +42,7 @@ from sglang.srt.multimodal.mm_utils import (
     materialize_multimodal_features,
     run_dp_sharded_mrope_vision_model,
 )
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import (
     get_exec,
     get_mm,
@@ -632,6 +629,11 @@ def mm_projection_auto(
     return projected.reshape(-1, projected.shape[-1])
 
 
+def _fused_moe_text_config(hf_config):
+    """Return the nested fusable MoE config, or None for other branches."""
+    return None if hf_config.encoder_only else hf_config.text_config
+
+
 class KimiK25ForConditionalGeneration(nn.Module):
     supports_cuda_vmm_feature_transport = True
 
@@ -646,11 +648,19 @@ class KimiK25ForConditionalGeneration(nn.Module):
 
     @staticmethod
     def shared_experts_fusion_disable_reason(hf_config, quant_config):
-        if hf_config.encoder_only:
+        text_config = _fused_moe_text_config(hf_config)
+        if text_config is None:
             return None
         return DeepseekV3ForCausalLM.shared_experts_fusion_disable_reason(
-            hf_config.text_config, quant_config
+            text_config, quant_config
         )
+
+    @staticmethod
+    def num_fusable_shared_experts(hf_config) -> int:
+        text_config = _fused_moe_text_config(hf_config)
+        if text_config is None:
+            return 0
+        return DeepseekV3ForCausalLM.num_fusable_shared_experts(text_config)
 
     def __init__(
         self,

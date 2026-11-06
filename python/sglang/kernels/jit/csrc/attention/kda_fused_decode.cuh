@@ -954,7 +954,7 @@ struct KdaFusedDecodeKernel {
     auto B_ = SymbolicSize{"batch"};
     auto Slots_ = SymbolicSize{"pool_slots"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     TensorMatcher({B_, 3 * kSeg}).with_dtype<bf16_t>().with_device(device).with_strides({-1, 1}).verify(mixed_qkv);
     TensorMatcher({B_, kSeg}).with_dtype<bf16_t>().with_device(device).with_strides({-1, 1}).verify(a);

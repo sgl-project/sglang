@@ -23,15 +23,11 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.attention.decode_attention import _extract_kv_strides
-from sglang.kernels.ops.attention.prefill_attention import context_attention_fwd
 from sglang.kernels.ops.attention.score_mod import unpack_aux_tensors
 from sglang.srt.environ import envs
-from sglang.srt.utils import is_cuda, is_gfx95_supported, is_gfx1250_supported, is_hip
-
-_is_cuda = is_cuda()
-if _is_cuda:
-    CUDA_CAPABILITY = torch.cuda.get_device_capability()
+from sglang.srt.utils import is_gfx95_supported, is_gfx1250_supported, is_hip
 
 _is_hip = is_hip()
 _is_gfx95 = _is_hip and is_gfx95_supported()
@@ -82,19 +78,19 @@ def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
             # late-prefill kernel from ~12.57 ms to ~5.24 ms.
             BLOCK_M, BLOCK_N = (64, 32)
             num_warps = 4
-        elif _is_gfx95 and 128 < Lq <= 256:
-            # gfx950 (CDNA4), 128 < head_dim <= 256: a larger query tile halves KV bytes
-            # streamed per call (each workgroup reads the whole prefix); 8 warps
-            # hide the loads. Measured on MI350X head_dim 256: -36% kernel time,
-            # 28% -> 44% MFU, numerically equivalent (BLOCK_N reduction order
-            # unchanged). Other AMD archs / head dims keep the default below.
+        elif _is_gfx95 and Lq <= 256:
+            # gfx950 (CDNA4), head_dim <= 256: every workgroup streams the whole
+            # prefix, so a larger query tile halves the KV bytes read per call;
+            # BLOCK_M / num_warps = 16 rows per warp is exactly one MFMA tile at
+            # matrix_instr_nonkdim=16. Measured on MI350X at head_dim 64, 128, 256.
             BLOCK_M, BLOCK_N = (128, 64)
             num_warps = 8
         else:
             BLOCK_M, BLOCK_N = (64, 64)
             num_warps = 4
     else:
-        if _is_cuda and CUDA_CAPABILITY[0] == 12:
+        arch = current_arch()
+        if arch.is_sm(12):
             # sm120 workstation Blackwell architecture (RTX Pro 6000) has a much smaller shared memory size (100K)
             if Lq <= 128:
                 BLOCK_M, BLOCK_N = (64, 128)
@@ -102,7 +98,7 @@ def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
                 BLOCK_M, BLOCK_N = (64, 64)
             else:
                 BLOCK_M, BLOCK_N = (32, 32)
-        elif _is_cuda and CUDA_CAPABILITY[0] == 10:
+        elif arch.is_sm(10):
             # Blackwell data-center architecture (GB200, B200, sm_100a)
             # sm_100a has different register constraints from Hopper; Hopper block sizes
             # cause PTX register exhaustion (>255 regs) for large head dims (Lq=512).
@@ -110,7 +106,7 @@ def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
                 BLOCK_M, BLOCK_N = (64, 64)
             else:
                 BLOCK_M, BLOCK_N = (16, 64)
-        elif _is_cuda and CUDA_CAPABILITY[0] >= 9:
+        elif arch.is_sm_at_least(9):
             # Hopper architecture (H100, etc.)
             if Lq <= 128:
                 BLOCK_M, BLOCK_N = (128, 64)
@@ -118,10 +114,10 @@ def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
                 BLOCK_M, BLOCK_N = (64, 64)
             else:
                 BLOCK_M, BLOCK_N = (32, 64)
-        elif _is_cuda and CUDA_CAPABILITY[0] >= 8:
+        elif arch.is_sm_at_least(8):
             # Ampere architecture (A100, etc.)
             # sm86/sm89 has a much smaller shared memory size (100K) than sm80 (160K)
-            if CUDA_CAPABILITY[1] == 9 or CUDA_CAPABILITY[1] == 6:
+            if arch.is_sm(8, 9) or arch.is_sm(8, 6):
                 if Lq <= 128:
                     BLOCK_M, BLOCK_N = (64, 128)
                 elif Lq <= 256:
@@ -559,7 +555,9 @@ def _fwd_kernel(
                 mask=(mask_m[:, None] & mask_n[None, :]),
                 other=0,
             )
-            final_mask &= custom_mask
+            # The mask buffer is int8; narrow it to i1, since a score_mod hands
+            # final_mask to tl.load, which rejects an i8 mask.
+            final_mask &= custom_mask != 0
         if SLIDING_WINDOW_SIZE > 0:
             # Add mask where q_id <= kv_id + sliding_window_size
             # q_id = prefix_len + cur_m, kv_id = cur_n
@@ -581,6 +579,9 @@ def _fwd_kernel(
                     mask=mask_n,
                     other=0,
                 )
+            # Callers may pass int32 kv_indices; slot * stride overflows int32
+            # once slot >= 2^31 / stride (2M tokens at 8 heads x 128 dim).
+            offs_kv_loc = offs_kv_loc.to(tl.int64)
 
             # Page-aware KV address math. At PAGE_SIZE==1
             # (legacy / non-shared / shared-at-ps=1), Triton specializes
@@ -749,7 +750,8 @@ def _fwd_kernel(
                 mask=(mask_m[:, None] & mask_n[None, :]),
                 other=0,
             )
-            custom_mask &= mask_m[:, None] & mask_n[None, :]
+            # int8 -> i1 before the &=; see the prefix loop above.
+            custom_mask = (custom_mask != 0) & mask_m[:, None] & mask_n[None, :]
             final_mask &= custom_mask
         elif IS_CAUSAL:
             mask_causual = (cur_block_m * BLOCK_M + offs_m[:, None]) >= (
@@ -1167,43 +1169,6 @@ def extend_attention_fwd(
     )
 
 
-def redundant_attention(
-    q_extend,
-    o_extend,
-    k_buffer,
-    v_buffer,
-    b_req_idx,
-    b_start_loc,
-    b_seq_len,
-    b_seq_len_prefix,
-    max_len_in_batch,
-):
-    total_token_num = k_buffer.shape[0]
-    B, H_Q, D = b_req_idx.shape[0], q_extend.shape[-2], q_extend.shape[-1]
-    q_buffer = torch.empty(
-        (total_token_num, H_Q, D), dtype=q_extend.dtype, device=q_extend.device
-    )
-
-    pt = 0
-    for i in range(B):
-        cur_seq_len_extend = b_seq_len[i] - b_seq_len_prefix[i]
-        pl, pr = b_start_loc[i] + b_seq_len_prefix[i], b_start_loc[i] + b_seq_len[i]
-        q_buffer[pl:pr] = q_extend[pt : pt + cur_seq_len_extend]
-        pt += cur_seq_len_extend
-
-    o_buffer = torch.empty_like(q_buffer)
-    context_attention_fwd(
-        q_buffer, k_buffer, v_buffer, o_buffer, b_start_loc, b_seq_len, max_len_in_batch
-    )
-
-    pt = 0
-    for i in range(B):
-        cur_seq_len_extend = b_seq_len[i] - b_seq_len_prefix[i]
-        pl, pr = b_start_loc[i] + b_seq_len_prefix[i], b_start_loc[i] + b_seq_len[i]
-        o_extend[pt : pt + cur_seq_len_extend] = o_buffer[pl:pr]
-        pt += cur_seq_len_extend
-
-
 @triton.jit
 def _fwd_kernel_unified(
     Q,
@@ -1349,7 +1314,8 @@ def _fwd_kernel_unified(
                 mask=(mask_m[:, None] & mask_n[None, :]),
                 other=0,
             )
-            final_mask &= custom_mask
+            # int8 -> i1 before the &=; see `_fwd_kernel`'s prefix loop.
+            final_mask &= custom_mask != 0
 
         # Apply causal mask for extend part
         if IS_CAUSAL and not USE_CUSTOM_MASK:
@@ -1399,7 +1365,7 @@ def _fwd_kernel_unified(
                 kv_indices + cur_seq_kv_start_idx + start_n + offs_n,
                 mask=mask_n,
                 other=0,
-            )
+            ).to(tl.int64)
 
             # Page-aware KV address math (see _fwd_kernel_stage1).
             if PAGE_SIZE == 1:
@@ -1595,6 +1561,12 @@ def extend_attention_fwd_unified(
     BLOCK_DMODEL, BLOCK_DPE, BLOCK_DV, BLOCK_M, BLOCK_N, num_warps = (
         _get_block_sizes_for_extend_attention(Lq, Lv)
     )
+    if _is_gfx95 and Lq <= 128 and Lv <= 128 and BLOCK_N == 64:
+        # gfx950, head_dim <= 128: each workgroup streams the whole prefix, so a 256-row query tile
+        # cuts the KV bytes read per query row 4x. BLOCK_N, and so the reduction order, is unchanged:
+        # outputs are bitwise identical. Measured on MI350X (head_dim 128 and 64, 8k-token chunks after
+        # 0-56k-token prefixes): 2.0-2.6x kernel speed.
+        BLOCK_M, num_warps = 256, 8
 
     sm_scale = sm_scale or 1.0 / (Lq**0.5)
     batch_size, head_num = qo_indptr.shape[0] - 1, q.shape[1]
