@@ -504,7 +504,7 @@ class ModelRunner:
 
         # Read-done mailbox: the scheduler's WAR barrier reads it from the runner
         # its worker names, and treats None as the coarse whole-forward fence.
-        self.shared_read_done_event: Optional[torch.cuda.Event] = None
+        self.shared_read_done_event: Optional[torch.Event] = None
         # Set by the scheduler when every KV offload copy waits for forward_stream.
         self.kv_offload_fenced_on_forward_stream = False
 

@@ -29,7 +29,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.state_capturer.base import TopkCaptureOutput
 from sglang.srt.utils.common import async_d2h as _async_d2h
-from sglang.srt.utils.common import is_cuda
+from sglang.srt.utils.common import is_cuda, is_xpu
 from sglang.srt.utils.weight_versions import compute_weight_version_spans
 
 if TYPE_CHECKING:
@@ -65,7 +65,7 @@ def allocate_distinct_stream(device_module, avoid_streams):
 
 
 def is_war_barrier_enabled() -> bool:
-    return is_cuda() or envs.SGLANG_ENABLE_WAR_BARRIER.get()
+    return is_cuda() or is_xpu() or envs.SGLANG_ENABLE_WAR_BARRIER.get()
 
 
 @dataclasses.dataclass
