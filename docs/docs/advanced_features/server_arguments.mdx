@@ -1086,6 +1086,11 @@ Background requests, including streaming requests, require both `--enable-respon
 Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `decode` fails at startup. PD clients must send explicit conversation history in foreground requests. Built-in web search and code interpreter calls are also unsupported under PD.
 
 ## API related
+
+<Warning>
+When `--api-key` is set and `--admin-api-key` is not, the ordinary API key also authorizes `ADMIN_OPTIONAL` management endpoints, including `/update_weights_from_disk`, `/load_lora_adapter`, and `/start_profile`. This preserves legacy single-key deployments. Set `--admin-api-key` so an ordinary credential is not a management credential. The server logs a warning at startup in that configuration.
+</Warning>
+
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
     <col style={{width: "25%"}} />
@@ -1104,13 +1109,13 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
   <tbody>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--api-key`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Set API key of the server. It is also used in the OpenAI API compatible server.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Set API key of the server. It is also used in the OpenAI API compatible server. When <code>--admin-api-key</code> is unset, this ordinary key also authorizes ADMIN_OPTIONAL management endpoints (for example <code>/update_weights_from_disk</code>, <code>/load_lora_adapter</code>, and <code>/start_profile</code>). Set <code>--admin-api-key</code> to separate ordinary and management credentials.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: str</td>
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--admin-api-key`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Set <strong>admin API key</strong> for administrative/control endpoints (e.g., weights update, cache flush, <code>/server_info</code>). Endpoints marked as admin-only require <code>Authorization: Bearer &lt;admin_api_key&gt;</code> when this is set.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Set admin API key for sensitive management endpoints (for example <code>/update_weights_from_disk</code>, <code>/load_lora_adapter</code>, <code>/start_profile</code>, and <code>/hicache/storage-backend/clear</code>). When set, those endpoints require this key and do not accept <code>--api-key</code>. If only <code>--api-key</code> is set, that ordinary key also authorizes ADMIN_OPTIONAL management endpoints; configure <code>--admin-api-key</code> to separate ordinary and management credentials.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: str</td>
     </tr>

@@ -5,10 +5,55 @@ This module is intentionally lightweight (no torch import) so it can be used in 
 
 from __future__ import annotations
 
+import logging
 import secrets
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
+
+# Representative ADMIN_OPTIONAL management routes. The ordinary key reaches
+# every endpoint tagged with that level; these are the ones operators most
+# often do not realize share the same credential as inference.
+ADMIN_OPTIONAL_EXAMPLE_PATHS = (
+    "/update_weights_from_disk",
+    "/load_lora_adapter",
+    "/start_profile",
+)
+
+
+def _english_list(items: tuple[str, ...]) -> str:
+    if len(items) <= 1:
+        return "".join(items)
+    if len(items) == 2:
+        return f"{items[0]} and {items[1]}"
+    return ", ".join(items[:-1]) + f", and {items[-1]}"
+
+
+_ADMIN_OPTIONAL_EXAMPLES = _english_list(ADMIN_OPTIONAL_EXAMPLE_PATHS)
+
+API_KEY_HELP = (
+    "Set API key of the server. It is also used in the OpenAI API compatible server. "
+    "When --admin-api-key is unset, this ordinary key also authorizes ADMIN_OPTIONAL "
+    f"management endpoints (for example {_ADMIN_OPTIONAL_EXAMPLES}). "
+    "Set --admin-api-key to separate ordinary and management credentials."
+)
+ADMIN_API_KEY_HELP = (
+    "Set admin API key for sensitive management endpoints (for example "
+    f"{_english_list(ADMIN_OPTIONAL_EXAMPLE_PATHS + ('/hicache/storage-backend/clear',))}). "
+    "When set, those endpoints require this key and do not accept --api-key. "
+    "If only --api-key is set, that ordinary key also authorizes ADMIN_OPTIONAL "
+    "management endpoints; configure --admin-api-key to separate ordinary and "
+    "management credentials."
+)
+
+_SINGLE_KEY_ADMIN_OPTIONAL_WARNING = (
+    "Only --api-key is set and --admin-api-key is unset. The ordinary API key "
+    "also authorizes ADMIN_OPTIONAL management endpoints such as "
+    f"{_ADMIN_OPTIONAL_EXAMPLES}. Configure --admin-api-key to separate "
+    "ordinary and management credentials."
+)
 
 
 @dataclass(frozen=True)
@@ -127,7 +172,9 @@ def decide_request_auth(
 
     # Optional-auth endpoints:
     # - no keys configured: allow
-    # - only api_key: require api_key
+    # - only api_key: require api_key (legacy single-key compat from #15908).
+    #   Startup logs a warning via warn_single_key_admin_optional; do not
+    #   reject the ordinary key here. A rejection needs a deprecation cycle.
     # - only admin_api_key: require admin_api_key
     # - both: require admin_api_key (api_key is NOT accepted)
     if auth_level == AuthLevel.ADMIN_OPTIONAL:
@@ -149,6 +196,29 @@ def decide_request_auth(
         return AuthDecision(allowed=_check_bearer_token(authorization_header, api_key))
 
     return AuthDecision(allowed=True)
+
+
+def single_key_authorizes_admin_optional(
+    api_key: Optional[str], admin_api_key: Optional[str]
+) -> bool:
+    """True when the ordinary key is also the ADMIN_OPTIONAL credential.
+
+    Truthiness matches ``decide_request_auth``: an empty string counts as unset.
+    """
+    return bool(api_key) and not admin_api_key
+
+
+def warn_single_key_admin_optional(
+    api_key: Optional[str], admin_api_key: Optional[str]
+) -> None:
+    """Warn at startup when a single ordinary key is a management credential.
+
+    Does not change authorization. ``decide_request_auth`` still accepts
+    ``api_key`` for ``ADMIN_OPTIONAL`` when ``admin_api_key`` is unset.
+    """
+    if not single_key_authorizes_admin_optional(api_key, admin_api_key):
+        return
+    logger.warning(_SINGLE_KEY_ADMIN_OPTIONAL_WARNING)
 
 
 def add_api_key_middleware(
