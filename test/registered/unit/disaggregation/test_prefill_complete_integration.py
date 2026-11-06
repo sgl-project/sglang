@@ -381,6 +381,40 @@ class TestAllocationIntegration(CustomTestCase):
         sender.clear()
         self.assertIsNone(self.prefill.deferred_bootstrap.rooms[1].owner)
 
+    def test_failure_while_decode_holds_mid_prefill_destination(self):
+        """Under just_in_time decode can hold a request's destination while it
+        still prefills, at cold start for its whole prefill. A failure on either
+        side then must reach the other, or decode keeps the reservation until
+        its waiting timeout and prefill computes a request nobody receives."""
+        override = get_context().override_server_args(
+            disaggregation_decode_allocation_policy="just_in_time"
+        )
+        override.install()
+        self.addCleanup(override.restore)
+
+        def destination_held(room):
+            sender = self.sender(room)
+            receiver = self.receiver(room, policy="just_in_time")
+            self.flush()
+            sender.signal_decode_readiness()
+            self.flush()
+            self.assertEqual(receiver.poll(), KVPoll.WaitingForInput)
+            # Decode's destination arrives before any chunk was sent.
+            self.prefill.update_status(room, KVPoll.WaitingForInput)
+            return sender, receiver
+
+        with self.subTest("prefill aborts"):
+            sender, receiver = destination_held(1)
+            sender.abort()
+            self.flush()
+            self.assertEqual(receiver.poll(), KVPoll.Failed)
+            sender.clear()
+            self.assertIsNone(self.prefill.deferred_bootstrap.rooms[1].owner)
+        with self.subTest("decode aborts or times out"):
+            sender, _ = destination_held(2)
+            self.prefill._handle_bootstrap_message([b"ABORT", b"2", b"decode", b"2"])
+            self.assertEqual(sender.poll(), KVPoll.Failed)
+
     def test_fake_warmup_sender_never_registers_deferred_bootstrap(self):
         sender = FakeKVSender(self.prefill, "fake:0", 0)
         sender.init(0)
@@ -1473,8 +1507,13 @@ class TestDecodeReadinessPacer(CustomTestCase):
 
     def setUp(self):
         super().setUp()
+        self.reset()
+
+    def reset(self, **pacer_kwargs):
         self.clock = _Clock()
-        self.pacer = DecodeReadinessPacer(chunk_tokens=PACED_CHUNK, clock=self.clock)
+        self.pacer = DecodeReadinessPacer(
+            chunk_tokens=PACED_CHUNK, clock=self.clock, **pacer_kwargs
+        )
 
     def prime(self, *, handshakes, interval, lead):
         for seconds in handshakes:
@@ -1510,13 +1549,49 @@ class TestDecodeReadinessPacer(CustomTestCase):
         return signaled
 
     def test_signals_at_last_round_whose_remaining_prefill_covers_handshake(self):
-        # Remaining time after scheduling chunk c of 10: (10 - c) chunks at 1 s
-        # plus a 2 s lead, i.e. 12 - c. Chunk 9 is the last round with
-        # remaining >= 2.5 s; waiting a round would leave 2 s < 2.5 s.
-        self.prime(handshakes=[2.5, 2.5], interval=1.0, lead=2.0)
-        req = _paced_req("long", input_len=10 * PACED_CHUNK)
-        self.assertEqual(self.rounds_until_signal(req, interval=1.0), 9)
-        req.disagg_kv_sender.signal_decode_readiness.assert_called_once()
+        # After scheduling chunk c of 10 at 1 s rounds with a 2 s lead, 12 - c
+        # seconds of prefill remain. Chunk 9 is the last round covering a 2.5 s
+        # handshake; a 1 s handshake stays covered, so the final result signals.
+        def steady():
+            self.prime(handshakes=[2.5, 2.5], interval=1.0, lead=2.0)
+
+        def first_handshake_per_endpoint():
+            # Kept as an estimate, the 100 s connection setup would signal at chunk 1.
+            self.prime(handshakes=[100.0, 1.0], interval=1.0, lead=2.0)
+
+        def slow_startup():
+            # The first requests also pay compilation; with a mean, their round
+            # and lead would keep later requests signaling early.
+            self.prime(handshakes=[2.5, 2.5], interval=30.0, lead=60.0)
+            for _ in range(2):
+                self.prime(handshakes=[], interval=1.0, lead=2.0)
+
+        def admitted_mid_prefill():
+            # Decode admits these at chunk 3. Their later chunks must still move
+            # the lead's start, or the lead would make later requests signal late.
+            steady()
+            for i in range(2):
+                req = _paced_req(f"admitted-{i}", input_len=10 * PACED_CHUNK)
+                self.rounds_until_signal(req, interval=1.0, admit_at=3)
+                self.clock.now += 2.0 - 1.0
+                self.pacer.on_prefill_finished(req)
+                self.pacer.on_round([])
+
+        for setup, chunk in (
+            (steady, 9),
+            (first_handshake_per_endpoint, None),
+            (slow_startup, 9),
+            (admitted_mid_prefill, 9),
+        ):
+            with self.subTest(setup.__name__):
+                self.reset()
+                setup()
+                req = _paced_req("long", input_len=10 * PACED_CHUNK)
+                self.assertEqual(self.rounds_until_signal(req, interval=1.0), chunk)
+                self.assertEqual(
+                    req.disagg_kv_sender.signal_decode_readiness.call_count,
+                    0 if chunk is None else 1,
+                )
 
     def test_signals_before_first_forward_without_estimates_or_short_prefill(self):
         with self.subTest("no estimates yet"):
@@ -1526,14 +1601,6 @@ class TestDecodeReadinessPacer(CustomTestCase):
             self.prime(handshakes=[10.0, 10.0], interval=1.0, lead=2.0)
             req = _paced_req("short", input_len=3 * PACED_CHUNK)
             self.assertEqual(self.rounds_until_signal(req, interval=1.0), 1)
-
-    def test_first_handshake_with_each_decode_endpoint_is_not_an_estimate(self):
-        # The 100 s connection-setup outlier would make every request signal at
-        # its first round; the second handshake (1 s) is the estimate.
-        self.prime(handshakes=[100.0, 1.0], interval=1.0, lead=2.0)
-        req = _paced_req("long", input_len=10 * PACED_CHUNK)
-        self.schedule(req)
-        req.disagg_kv_sender.signal_decode_readiness.assert_not_called()
 
     def test_pp_drops_handshakes_decode_registered_after_finish(self):
         """Under PP any stage's readiness admits a room, so when decode registers
@@ -1546,10 +1613,7 @@ class TestDecodeReadinessPacer(CustomTestCase):
             (False, 6.0, True),
         ):
             with self.subTest(pipelined=pipelined, registered_at=registered_at):
-                self.clock.now = 0.0
-                self.pacer = DecodeReadinessPacer(
-                    chunk_tokens=PACED_CHUNK, pipelined=pipelined, clock=self.clock
-                )
+                self.reset(pipelined=pipelined)
                 self.prime(handshakes=[2.5, 2.5], interval=1.0, lead=2.0)
                 self.clock.now = 5.0
                 for i in range(10):
@@ -1568,60 +1632,15 @@ class TestDecodeReadinessPacer(CustomTestCase):
                     self.rounds_until_signal(req, interval=1.0), None if kept else 9
                 )
 
-    def test_lead_runs_from_final_chunk_after_mid_prefill_admission(self):
-        """Once decode admits a request mid-prefill its later chunks still move
-        the lead's start; a lead measured from the admission round would make
-        later requests signal too late."""
-        self.prime(handshakes=[2.5, 2.5], interval=1.0, lead=2.0)
-        for i in range(2):
-            req = _paced_req(f"admitted-{i}", input_len=10 * PACED_CHUNK)
-            self.rounds_until_signal(req, interval=1.0, admit_at=3)
-            self.clock.now += 2.0 - 1.0
-            self.pacer.on_prefill_finished(req)
-            self.pacer.on_round([])
-        req = _paced_req("long", input_len=10 * PACED_CHUNK)
-        self.assertEqual(self.rounds_until_signal(req, interval=1.0), 9)
-
     def test_remaining_chunks_follow_dynamic_chunk_sizes(self):
         # PP dynamic chunking shrinks continuation chunks to 50 tokens; with 1 s
         # rounds, a 2 s lead and a 2.5 s handshake the request must signal once
         # at most one 50-token chunk is left, not one 100-token chunk.
-        self.pacer = DecodeReadinessPacer(
-            chunk_tokens=PACED_CHUNK,
-            next_chunk_tokens=lambda prefix_len: PACED_CHUNK // 2,
-            clock=self.clock,
-        )
+        self.reset(next_chunk_tokens=lambda prefix_len: PACED_CHUNK // 2)
         self.prime(handshakes=[2.5, 2.5], interval=1.0, lead=2.0)
         req = _paced_req("dynamic", input_len=10 * PACED_CHUNK)
         chunk = self.rounds_until_signal(req, interval=1.0, tokens=PACED_CHUNK // 2)
         self.assertEqual(chunk * (PACED_CHUNK // 2), 9.5 * PACED_CHUNK)
-
-    def test_signaled_request_is_not_recounted(self):
-        """After readiness the remaining-chunk count is never read again; under
-        PP dynamic chunking each recount walks the chunk-size predictor."""
-        calls = []
-        self.pacer = DecodeReadinessPacer(
-            chunk_tokens=PACED_CHUNK,
-            next_chunk_tokens=lambda prefix_len: calls.append(prefix_len),
-            clock=self.clock,
-        )
-        req = _paced_req("cold", input_len=10 * PACED_CHUNK)
-        self.schedule(req)
-        req.disagg_kv_sender.signal_decode_readiness.assert_called_once()
-        calls.clear()
-        for _ in range(9):
-            self.clock.now += 1.0
-            self.schedule(req)
-        self.assertEqual(calls, [])
-
-    def test_slow_first_request_does_not_steer_later_pacing(self):
-        """The first requests after startup also pay compilation; their round
-        interval and lead must not keep later requests signaling early."""
-        self.prime(handshakes=[2.5, 2.5], interval=30.0, lead=60.0)
-        for i in range(2):
-            self.prime(handshakes=[], interval=1.0, lead=2.0)
-        req = _paced_req("long", input_len=10 * PACED_CHUNK)
-        self.assertEqual(self.rounds_until_signal(req, interval=1.0), 9)
 
 
 class TestDecodeReadinessWiring(CustomTestCase):

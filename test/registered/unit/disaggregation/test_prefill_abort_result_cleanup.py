@@ -236,6 +236,7 @@ class TestPrefillCompleteResult(CustomTestCase):
         req = _Req()
         req.to_finish = None
         req.time_stats.set_prefill_transfer_queue_entry_time = Mock()
+        scheduler.prefill_launched_reqs.join([req])
         with patch("sglang.srt.disaggregation.prefill.checkpoint_kv_cache"):
             scheduler.process_batch_result_disagg_prefill(_batch(req), _result())
         pacer.on_prefill_finished.assert_called_once_with(req)
