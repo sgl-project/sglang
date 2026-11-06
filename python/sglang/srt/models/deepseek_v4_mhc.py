@@ -30,14 +30,25 @@ import torch
 import torch.nn.functional as F
 
 from sglang.kernels.ops.layernorm.mhc_mega import mhc_mega_boundary
+from sglang.kernels.ops.layernorm.mhc_post_combine_norm_decode import (
+    MAX_ROWS as DECODE_POST_COMBINE_MAX_ROWS,
+)
+from sglang.kernels.ops.layernorm.mhc_post_combine_norm_decode import (
+    mhc_post_combine_norm_decode,
+)
 from sglang.kernels.ops.layernorm.mhc_post_split_h import mhc_post_split_h
 from sglang.kernels.ops.quantization.fp8_kernel import (
     create_per_token_group_quant_fp8_output_scale,
 )
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
+from sglang.srt.layers.quantization.mxfp8_input import (
+    Mxfp8SwizzledInput,
+    deepgemm_mxfp8_linear_input,
+    deepgemm_pair_takes_flashinfer,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.runner import compile_in_capture_mode
 from sglang.srt.model_executor.runner_utils.prefill_graph import (
@@ -68,8 +79,16 @@ def fused_mxfp8_rows(rows: int) -> bool:
     return rows <= FUSED_MXFP8_PRODUCER_MAX_ROWS
 
 
-def empty_deepgemm_mxfp8_scales(rows: int, cols: int, device) -> torch.Tensor:
-    """Empty DeepGEMM-packed UE8M0 scales for ``rows`` x ``cols`` fp8 data."""
+def empty_deepgemm_mxfp8_scales(
+    rows: int, cols: int, device, flashinfer: bool = False
+) -> torch.Tensor:
+    """Empty UE8M0 scales for ``rows`` x ``cols`` fp8 data from a DeepGEMM producer:
+    DeepGEMM-packed, or ``[ceil(rows / 128), cols / 128, 32, 4]`` int32 in
+    FlashInfer's 128x4 layout."""
+    if flashinfer:
+        return torch.empty(
+            (-(-rows // 128), cols // 128, 32, 4), device=device, dtype=torch.int32
+        )
     return create_per_token_group_quant_fp8_output_scale(
         (rows, cols),
         device,
@@ -81,11 +100,11 @@ def empty_deepgemm_mxfp8_scales(rows: int, cols: int, device) -> torch.Tensor:
 
 
 def empty_deepgemm_mxfp8_pair(
-    rows: int, cols: int, device
+    rows: int, cols: int, device, flashinfer: bool = False
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Empty fp8 rows and DeepGEMM-packed UE8M0 scales for a producer to fill."""
+    """Empty fp8 rows and UE8M0 scales for a DeepGEMM producer to fill."""
     data = torch.empty((rows, cols), device=device, dtype=torch.float8_e4m3fn)
-    return data, empty_deepgemm_mxfp8_scales(rows, cols, device)
+    return data, empty_deepgemm_mxfp8_scales(rows, cols, device, flashinfer=flashinfer)
 
 
 def fused_mhc_tp_ok(tp_size: int) -> bool:
@@ -245,6 +264,14 @@ class HcNextBoundary(NamedTuple):
     hc: Optional[HcSubLayer] = None
     accepts_mxfp8_deepgemm: bool = False
     mega_moe_input: Optional[Callable[[torch.Tensor], Any]] = None
+    extend: bool = False
+
+
+def is_local_extend(forward_batch: Optional[ForwardBatch]) -> bool:
+    if forward_batch is None:
+        return False
+    mode = forward_batch.forward_mode
+    return mode.is_extend() and not mode.is_target_verify()
 
 
 def is_deferred_finalize(routed) -> bool:
@@ -276,6 +303,7 @@ def make_boundary(
     hc: Optional[HcSubLayer] = None,
     accepts_mxfp8_deepgemm: bool = False,
     mega_moe_input: Optional[Callable[[torch.Tensor], Any]] = None,
+    extend: bool = False,
 ) -> HcNextBoundary:
     """Can this hyper-connection's norm fold into the previous post, and does its
     sublayer take a pre-quantized input."""
@@ -293,6 +321,7 @@ def make_boundary(
         hc=hc,
         accepts_mxfp8_deepgemm=accepts_mxfp8_deepgemm,
         mega_moe_input=mega_moe_input,
+        extend=extend,
     )
 
 
@@ -536,8 +565,8 @@ def post(
     if _is_npu:
         if not is_npu_arch35():
             return torch.ops.custom.npu_hc_post(x, residual, post_mix, comb)
-        # The A5 build of npu_hc_post is batched -- it requires a leading batch axis
-        # on every operand.
+        # The Ascend 950 build of npu_hc_post is batched -- it requires a leading
+        # batch axis on every operand.
         return torch.ops.custom.npu_hc_post(
             x.unsqueeze(0),
             residual.unsqueeze(0),
@@ -659,6 +688,18 @@ def _can_use_mega_mhc(cfg: HcConfig) -> bool:
     )
 
 
+def _can_use_decode_post_combine(cfg: HcConfig, rows: int) -> bool:
+    return (
+        0 < rows <= DECODE_POST_COMBINE_MAX_ROWS
+        and get_platform().is_blackwell
+        and cfg.pre_from_prev
+        and cfg.mult == 4
+        and cfg.hidden == 5120
+        and not cfg.cp_prefill
+        and not is_batch_invariant_mode_enabled()
+    )
+
+
 def _post_fusion(
     hc: HcSubLayer,
     y: torch.Tensor,
@@ -675,13 +716,18 @@ def _post_fusion(
         next is not None
         and next.norm_fusable
         and next.hc is not None
+        and next.extend
         and _can_use_mega_mhc(cfg)
         and y.shape[0] > 0
     ):
         next_hc = next.hc
         y_fp8 = y_sf = moe_input = None
         if next.accepts_mxfp8_deepgemm and fused_mxfp8_rows(y.shape[0]):
-            y_fp8, y_sf = empty_deepgemm_mxfp8_pair(*y.shape, y.device)
+            y_fp8, y_sf = empty_deepgemm_mxfp8_pair(
+                *y.shape,
+                y.device,
+                flashinfer=deepgemm_pair_takes_flashinfer(),
+            )
         elif next.mega_moe_input is not None:
             moe_input = next.mega_moe_input(y)
         updated, normalized, stats = mhc_mega_boundary(
@@ -703,10 +749,32 @@ def _post_fusion(
             moe_input=None if moe_input is None else moe_input.views(),
         )
         if y_fp8 is not None:
-            return HcState(updated, pre, HcQuantized(normalized, (y_fp8, y_sf)), stats)
+            pair = deepgemm_mxfp8_linear_input(y_fp8, y_sf)
+            return HcState(updated, pre, HcQuantized(normalized, pair), stats)
         if moe_input is not None:
             moe_input.mark(normalized)
         return HcState(updated, pre, HcNormed(normalized), stats)
+    if (
+        next is not None
+        and next.norm_fusable
+        and _can_use_decode_post_combine(cfg, y.shape[0])
+    ):
+        quant = next.accepts_mxfp8
+        updated, normalized, q, sf = mhc_post_combine_norm_decode(
+            y,
+            residual,
+            post_mix,
+            comb,
+            pre,
+            next.norm.weight,
+            next.norm.variance_epsilon,
+            quant=quant,
+        )
+        if quant:
+            return HcState(
+                updated, pre, HcQuantized(normalized, Mxfp8SwizzledInput(q, sf))
+            )
+        return HcState(updated, pre, HcNormed(normalized))
     if (
         next is not None
         and next.norm_fusable

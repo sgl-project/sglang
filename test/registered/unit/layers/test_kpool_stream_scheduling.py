@@ -14,7 +14,7 @@ from sglang.kernels.ops.quantization import act_quant_triton
 from sglang.srt.layers.attention.dsa import dsa_indexer_kpool as indexer_module
 from sglang.srt.layers.attention.dsa.dsa_indexer_kpool import IndexerKPool
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase

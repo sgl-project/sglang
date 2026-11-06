@@ -21,7 +21,6 @@ from sglang.multimodal_gen.configs.models.dits.cosmos3_sim_auto import (
     load_cosmos3_sim_auto_manifest,
     multiview_deployment_from_manifest,
 )
-from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import (
     Cosmos3Config,
     _transformer_config,
@@ -33,6 +32,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.cosmos3_multiview import (
 from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
     ModelDeploymentConfig,
 )
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)

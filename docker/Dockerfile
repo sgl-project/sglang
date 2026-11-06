@@ -19,7 +19,7 @@ ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
 ARG INSTALL_FLASHINFER_JIT_CACHE=0
 ARG FLASHINFER_VERSION=0.7.2
-ARG MOONCAKE_VERSION=0.3.13.post1
+ARG MOONCAKE_VERSION=0.3.14
 ARG MSCCLPP_VERSION=sglang-v0.10.1
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -165,6 +165,7 @@ ENV LANG=en_US.UTF-8 \
 #     |
 #     +-- torch_deps ------> flashinfer_cache (needs flashinfer)
 #     |                  \-> hpc_ops_builder (cmake-only build)
+#     |                  \-> halops_wheel (prebuilt wheel download)
 #     |
 #     +-- devtools_builder (independent)
 #     +-- gateway_builder  (independent, only needs gateway source)
@@ -208,7 +209,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 COPY python/pyproject.toml /tmp/sglang_deps/python/pyproject.toml
 COPY rust/sglang-grpc      /tmp/sglang_deps/rust/sglang-grpc
 COPY rust/sglang-mm        /tmp/sglang_deps/rust/sglang-mm
-COPY rust/sglang-api-types /tmp/sglang_deps/rust/sglang-api-types
+COPY rust/sglang-runtime-v1-types /tmp/sglang_deps/rust/sglang-runtime-v1-types
 
 # Install sglang dependencies (torch, transformers, etc.).
 # Generate constraints.txt to prevent reinstalling these deps in later stages.
@@ -270,6 +271,26 @@ RUN mkdir -p /wheels && \
         git checkout ${HPC_OPS_COMMIT} && \
         python3 setup.py bdist_wheel -d /wheels; \
     fi
+
+########################################################
+# PARALLEL STAGE 2b: HALOps Wheel (needs torch_deps)
+########################################################
+FROM torch_deps AS halops_wheel
+
+# HALOps (https://github.com/PaddlePaddle/HALOps): MXFP8 w8a8 dense GEMM kernels
+# for the opt-in --fp8-gemm-backend=halops. Only prebuilt wheels are published,
+# so fetch the one matching this image's Python and platform. A missing or
+# mismatched wheel leaves /wheels empty and the install step skips it.
+ARG HALOPS_VERSION=0.1.0
+ARG HALOPS_INDEX_URL=https://www.paddlepaddle.org.cn/packages/stable/cu132/halops/
+
+WORKDIR /build
+
+RUN mkdir -p /wheels && \
+    (python3 -m pip download "halops==${HALOPS_VERSION}" \
+        --no-deps --only-binary=:all: --no-index \
+        -f "${HALOPS_INDEX_URL}" -d /wheels \
+    || echo "WARNING: no halops ${HALOPS_VERSION} wheel for this platform; skipping")
 
 ########################################################
 # PARALLEL STAGE 3: FlashInfer Cache (needs torch_deps)
@@ -408,6 +429,17 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     if ls /tmp/wheels/hpc-ops/*.whl >/dev/null 2>&1; then \
         uv pip install --no-deps /tmp/wheels/hpc-ops/*.whl; \
     fi && rm -rf /tmp/wheels/hpc-ops
+
+# Copy HALOps wheel and install if it was staged; a platform-mismatched or
+# otherwise unusable wheel must not fail the image build.
+COPY --from=halops_wheel /wheels /tmp/wheels/halops
+RUN --mount=type=cache,target=/root/.cache/uv \
+    if ls /tmp/wheels/halops/*.whl >/dev/null 2>&1; then \
+        uv pip install --no-deps /tmp/wheels/halops/*.whl \
+        || (uv pip uninstall halops >/dev/null 2>&1 || true; \
+            echo "WARNING: halops wheel install failed; building without it"); \
+    fi; \
+    rm -rf /tmp/wheels/halops
 
 # Copy flashinfer cubin (always) and jit-cache (if installed) packages
 COPY --from=flashinfer_cache /flashinfer_jit_output/ /opt/sglang/lib/python3.12/site-packages/
@@ -589,31 +621,7 @@ RUN if [ "$BRANCH_TYPE" = "local" ]; then \
 RUN --mount=type=cache,target=/root/.cache/uv \
     cd /sgl-workspace/sglang \
     && uv pip install --no-deps -e "python[${BUILD_TYPE}]" \
-    && kernels lock python \
-    && ( success=0; \
-         # aarch64: kernels-community/sgl-flash-attn3 ships no arm variants; JIT-compile at runtime.
-         # Remove this branch once arm cubins are published upstream.
-         if [ "$(uname -m)" = "aarch64" ]; then \
-             echo "Skipping kernels-community/sgl-flash-attn3 cubin download on aarch64 (no variants published upstream); kernels will be JIT-compiled at runtime"; \
-             success=1; \
-         else \
-             for i in 1 2 3; do \
-                 echo "Attempt $i/3: downloading sgl-kernel cubins..." && \
-                 kernels download python && \
-                 success=1 && break; \
-                 echo "sgl-kernel cubin download failed, retrying in 30s..." && sleep 30; \
-             done; \
-             # x86: if no prebuilt sgl-flash-attn3 variant matches this torch+CUDA \
-             # combo, fall back to runtime JIT instead of failing the build, \
-             # mirroring the aarch64 branch. \
-             if [ "$success" != "1" ]; then \
-                 echo "WARNING: no matching sgl-flash-attn3 cubin variant for this torch+CUDA; kernels will be JIT-compiled at runtime"; \
-                 success=1; \
-             fi; \
-         fi; \
-         [ "$success" = "1" ] ) \
     && mkdir -p /root/.cache/huggingface /root/.cache/sglang \
-    && ( if [ -f python/kernels.lock ]; then mv python/kernels.lock /root/.cache/sglang/; fi ) \
     && ( find /opt/sglang/lib/python3.12/site-packages -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true )
 
 ENV SGLANG_RUST_BUILD_MODE=never
@@ -631,7 +639,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # SM103, compiled at runtime); disable with --build-arg ENABLE_SGL_NVIDIA_MEGA=0.
 ARG ENABLE_SGL_NVIDIA_MEGA=1
 ARG SGL_NVIDIA_MEGA_REPO="https://github.com/sgl-project/sgl-nvidia-mega.git"
-ARG SGL_NVIDIA_MEGA_COMMIT="54b428921749fef89fcbd043000f839ac9cc4638"
+ARG SGL_NVIDIA_MEGA_COMMIT="77360f1fd74dc46010056ebdac0ed5e0b87d3978"
 RUN --mount=type=cache,target=/root/.cache/uv \
     if [ "${ENABLE_SGL_NVIDIA_MEGA}" != "1" ]; then \
         echo "[sgl-nvidia-mega] skip (ENABLE_SGL_NVIDIA_MEGA=${ENABLE_SGL_NVIDIA_MEGA})"; \
