@@ -121,7 +121,9 @@ class TensorBinding:
         return tuple(
             replace(
                 self,
-                shape=self.shape if segment.source_shape is None else segment.source_shape,
+                shape=self.shape
+                if segment.source_shape is None
+                else segment.source_shape,
                 slices=[list(axis) for axis in segment.slices],
                 destinations=segment.destinations,
                 segments=(),

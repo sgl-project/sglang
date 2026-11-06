@@ -54,13 +54,28 @@ gate/up alphas before any live writes. CuTe wrappers and derived buffers must
 already be initialized. Layout/native tests cover the matrix; full serving
 qualification remains NVFP4 W4A16.
 
-Fixed topology is required when routed experts are bound: expert TP=1, no
-presharded canonical checkpoint, EPLB, redundant experts or elastic joiners. The
-selected FlashInfer runner must match its dispatcher. Dense-only mappings do not
-need a MoE configuration. Ordinary globally ordered control broadcast is required;
-local broadcast, LoRA, disaggregated serving, attention TP/CP/DCP or pipeline
-widths above one, shared IPC weight storage and HPC-Ops derived-weight caches are
-rejected at admission. Delta application adds no distributed collectives.
+Attention, routed-expert and shared-expert TP follow their existing loader
+partition groups, including padded expert slices. Each rank decodes complete
+canonical tensors and applies only its admitted byte views. Attention DCP is
+supported within an attention-TP group: its width must divide attention TP.
+DeepSeek/GLM MLA's unquantized replicated Q/K consumers receive the same XOR mask
+through prepared affine views; local K/V caches refresh from the local KV-B shard.
+This adds no apply-time all-gather or kernel specialization. Quantized replicated
+Q projections remain unsupported.
+
+Prefill CP reuses those module-owned partitions: CP partners may repeat attention
+views while routed and shared experts retain their own TP groups. The optional
+`enable_cp_decode_attn_tp` optimization is rejected because it caches independent
+weight slices and temporarily swaps live parameter storage. Prefill CP has unit
+coverage; a dedicated serving end-to-end test is not included.
+
+Fixed topology is required when routed experts are bound: no presharded canonical
+checkpoint, EPLB, redundant experts or elastic joiners. The selected FlashInfer
+runner must match its dispatcher. Dense-only mappings do not need a MoE
+configuration. Ordinary globally ordered control broadcast is required;
+local broadcast, LoRA, disaggregated serving or pipeline widths above one,
+shared IPC weight storage and HPC-Ops derived-weight caches are rejected at
+admission. Control replies include every original TP/CP/DP participant.
 
 ## Ownership and lifecycle
 

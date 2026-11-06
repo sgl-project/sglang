@@ -318,9 +318,13 @@ def test_scheduler_blocked_timing_excludes_background_prepare(
             "global control",
         ),
         ({}, True, "global control"),
-        ({"attn_cp_size": 2}, False, "CP1 and PP1"),
+        (
+            {"attn_cp_size": 2, "enable_cp_decode_attn_tp": True},
+            False,
+            "CP decode attention TP caches",
+        ),
         ({"attn_dcp_size": 2}, False, "DCP groups inside attention TP"),
-        ({"pp_size": 2}, False, "CP1 and PP1"),
+        ({"pp_size": 2}, False, "PP1"),
     ],
 )
 def test_describe_rejects_unsupported_control_topologies(
@@ -338,6 +342,7 @@ def test_describe_rejects_unsupported_control_topologies(
                     attn_tp_size=1,
                     attn_cp_size=1,
                     attn_dcp_size=1,
+                    enable_cp_decode_attn_tp=False,
                     pp_size=1,
                 )
                 | override
@@ -355,46 +360,62 @@ def test_describe_rejects_unsupported_control_topologies(
     assert control.session is None
 
 
-@pytest.mark.parametrize("rank", [None, 0, 1], ids=["singleton", "leader", "follower"])
-def test_tp_replies_preserve_follower_failure_and_original_identity(
-    monkeypatch, rank
+@pytest.mark.parametrize(
+    "cp_size,tp_size,rank",
+    [(1, 1, 0), (1, 2, 0), (1, 2, 1), (2, 1, 0), (2, 1, 1)]
+    + [(2, 2, rank) for rank in range(4)],
+)
+def test_cp_tp_replies_preserve_follower_failure_and_original_identity(
+    monkeypatch, cp_size, tp_size, rank
 ):
-    # A nonzero global leader is important for mixed attention-DP/TP engines.
-    group = (
-        None
-        if rank is None
-        else SimpleNamespace(
-            rank_in_group=rank, world_size=2, ranks=[2, 3], cpu_group=object()
+    # Use a nonzero global root, as in another attention-DP shard.
+    cp_rank, tp_rank = divmod(rank, tp_size)
+    cp_ranks = [4 + cp * tp_size + tp_rank for cp in range(cp_size)]
+    tp_ranks = [4 + cp_rank * tp_size + tp for tp in range(tp_size)]
+    groups = tuple(
+        SimpleNamespace(
+            rank_in_group=local_rank,
+            world_size=len(ranks),
+            ranks=ranks,
+            cpu_group=object(),
         )
+        for local_rank, ranks in ((cp_rank, cp_ranks), (tp_rank, tp_ranks))
+        if len(ranks) > 1
     )
+    count = cp_size * tp_size
     receipts = [
         dict(
-            identity=identity(rank=2),
+            identity=identity(rank=4 + index),
             session_id="publication-1",
-            state="APPLIED",
+            state="POISONED" if count > 1 and index == count - 1 else "APPLIED",
+            message=(
+                "failed follower decode" if count > 1 and index == count - 1 else ""
+            ),
             generation_paused=True,
-        ),
-        dict(
-            identity=identity(rank=3),
-            session_id="publication-1",
-            state="POISONED",
-            message="failed follower decode",
-            generation_paused=True,
-        ),
+        )
+        for index in range(count)
     ]
-    control = GpuDeltaSchedulerControl(SimpleNamespace(_engine_paused=True), group)
-    control.session = SimpleNamespace(status=lambda: receipts[rank or 0].copy())
-    gathered = []
+    values = [(r["state"] == "APPLIED", r["message"], r) for r in receipts]
+    control = GpuDeltaSchedulerControl(SimpleNamespace(_engine_paused=True), groups)
+    control.session = SimpleNamespace(status=lambda: receipts[rank].copy())
+    calls = []
 
     def gather_object(local, output, dst, group):
-        assert rank is not None and dst == 2 and group is control.reply_group.cpu_group
-        assert local[2] == receipts[rank]
-        gathered.append(local)
-        if rank == 0:
-            output[:] = [
-                (True, "", receipts[0]),
-                (False, receipts[1]["message"], receipts[1]),
+        expected = groups[len(calls)]
+        assert dst == expected.ranks[0] and group is expected.cpu_group
+        if cp_size > 1 and not calls:
+            assert local == [values[rank]]
+            peer_values = [[values[peer - 4]] for peer in cp_ranks]
+        else:
+            assert cp_rank == 0
+            assert local == [values[cp * tp_size + tp_rank] for cp in range(cp_size)]
+            peer_values = [
+                [values[cp * tp_size + tp] for cp in range(cp_size)]
+                for tp in range(tp_size)
             ]
+        calls.append(dst)
+        if expected.rank_in_group == 0:
+            output[:] = peer_values
         else:
             assert output is None
 
@@ -402,19 +423,21 @@ def test_tp_replies_preserve_follower_failure_and_original_identity(
     result = control.handle(
         delta_io.GetGpuDeltaStatusReqInput(session_id="publication-1", rid="status")
     )
-    if rank is None:
-        assert not gathered and result.success and result.participants == receipts[:1]
-    elif rank == 0:
-        assert len(gathered) == 1 and not result.success
-        assert result.rid == "status" and result.message == receipts[1]["message"]
-        assert result.participants == receipts
+    if rank == 0:
+        assert len(calls) == len(groups)
+        assert result.success is (count == 1)
+        assert result.rid == "status" and result.message == receipts[-1]["message"]
+        assert (
+            sorted(result.participants, key=lambda r: r["identity"]["pid"]) == receipts
+        )
     else:
-        assert len(gathered) == 1 and result is None
+        assert len(calls) == (1 if cp_rank else len(groups)) and result is None
 
 
 @pytest.mark.parametrize("cache", ["shared IPC", "derived HPC"])
+@pytest.mark.parametrize("attn_cp_size", [1, 2])
 def test_unsafe_weight_caches_reject_before_plan_or_session_creation(
-    cache, monkeypatch
+    cache, attn_cp_size, monkeypatch
 ):
     from sglang.srt import runtime_context
 
@@ -430,8 +453,9 @@ def test_unsafe_weight_caches_reject_before_plan_or_session_creation(
         "get_parallel",
         lambda: SimpleNamespace(
             attn_tp_size=1,
-            attn_cp_size=1,
+            attn_cp_size=attn_cp_size,
             attn_dcp_size=1,
+            enable_cp_decode_attn_tp=False,
             pp_size=1,
             enable_dp_attention_local_control_broadcast=False,
         ),
@@ -620,11 +644,14 @@ def test_update_owns_pause_fence_retract_and_resume_order(
     control = delta_runtime.GpuDeltaSchedulerControl(scheduler)
     monkeypatch.setattr(
         "sglang.srt.runtime_context.get_parallel",
-        lambda: SimpleNamespace(attn_tp_size=1),
+        lambda: SimpleNamespace(attn_cp_size=1, attn_tp_size=1),
     )
-    monkeypatch.setattr(
-        delta_runtime, "GpuDeltaSchedulerControl", lambda _, group: control
-    )
+
+    def make_control(_, groups):
+        assert groups == ()
+        return control
+
+    monkeypatch.setattr(delta_runtime, "GpuDeltaSchedulerControl", make_control)
     wrapped = delta_runtime.with_gpu_delta_controls(scheduler, TypeBasedDispatcher([]))
     who = {"engine_id": "e0", "rank_id": "original"}
     session = control.session = delta_runtime.DeltaSession(
@@ -664,7 +691,10 @@ def test_update_owns_pause_fence_retract_and_resume_order(
         expected = ["fence", "retract"] + (["flush"] if flush_cache else []) + ["apply"]
         assert result.success and events == expected
         assert result.participants[0]["generation_paused"]
-        assert result.participants[0]["result"] == {"applied": True, "target_version": 1}
+        assert result.participants[0]["result"] == {
+            "applied": True,
+            "target_version": 1,
+        }
         result = wrapped(
             delta_io.ResumeGpuDeltaReqInput(
                 session_id="p", keep_pause=keep_pause, weight_version=weight_version
