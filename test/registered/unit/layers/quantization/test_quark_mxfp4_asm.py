@@ -11,7 +11,7 @@ import torch
 
 from sglang.srt.layers.quantization.quark.schemes import quark_w4a4_mxfp4
 from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4 import (
-    _afp4wfp4_even_k_block,
+    _afp4wfp4_k_tail_safe_tiling,
     _asm_fp4_prequantized_input,
     _asm_fp4_scale_swizzle_supported,
     _shuffle_asm_fp4_act_scale,
@@ -118,31 +118,46 @@ class TestQuarkMxfp4AsmNarrowLayer(CustomTestCase):
         self.assertIs(layer.weight, weight)
 
 
-class TestAfp4wfp4EvenKBlock(CustomTestCase):
-    def test_narrows_to_whole_k_blocks(self):
-        # Kimi-K3 TP8 shared-expert down (K=768) and dense down (K=4224).
-        self.assertEqual(_afp4wfp4_even_k_block(block_k=512, k=768), 256)
-        self.assertEqual(_afp4wfp4_even_k_block(block_k=1024, k=768), 256)
-        self.assertEqual(_afp4wfp4_even_k_block(block_k=512, k=4224), 128)
+class TestAfp4wfp4KTailSafeTiling(CustomTestCase):
+    def test_narrows_a_tail_in_an_unfilled_stage(self):
+        # Two K blocks in three stages: the tail lands in a never-filled stage.
+        self.assertEqual(
+            _afp4wfp4_k_tail_safe_tiling(1024, k=1536, num_stages=3), (512, 3)
+        )
+        # No power of two >= 128 divides 2880; six blocks of 512 put the tail in a filled stage.
+        self.assertEqual(
+            _afp4wfp4_k_tail_safe_tiling(1024, k=2880, num_stages=3), (512, 3)
+        )
+        # A block wider than K is shrunk to K's next power of two first, as the kernel wrapper does.
+        self.assertEqual(
+            _afp4wfp4_k_tail_safe_tiling(2048, k=768, num_stages=3), (256, 3)
+        )
 
-    def test_keeps_even_blocks(self):
-        self.assertEqual(_afp4wfp4_even_k_block(block_k=1024, k=7168), 1024)
-        # A block wider than K is shrunk to K, as the kernel wrapper does.
-        self.assertEqual(_afp4wfp4_even_k_block(block_k=2048, k=1024), 1024)
-        # A block below the minimum is raised to it, as the kernel wrapper does.
-        self.assertEqual(_afp4wfp4_even_k_block(block_k=64, k=768), 128)
+    def test_keeps_a_tail_in_a_filled_stage(self):
+        # Kimi-K3 TP8 dense down_proj: five blocks in three stages keep AITER's block (128 is 1.7x slower).
+        self.assertEqual(
+            _afp4wfp4_k_tail_safe_tiling(1024, k=4224, num_stages=3), (1024, 3)
+        )
+        # The boundary: one block more than stages.
+        self.assertEqual(
+            _afp4wfp4_k_tail_safe_tiling(1024, k=3136, num_stages=3), (1024, 3)
+        )
+        self.assertEqual(
+            _afp4wfp4_k_tail_safe_tiling(512, k=1088, num_stages=2), (512, 2)
+        )
 
-    def test_no_even_block(self):
-        # No power-of-two divisor of K at or above the minimum block.
-        self.assertIsNone(_afp4wfp4_even_k_block(block_k=256, k=160))
-        self.assertIsNone(_afp4wfp4_even_k_block(block_k=512, k=2880))
-        # A K below the minimum: the kernel wrapper raises the block back to the minimum.
-        self.assertIsNone(_afp4wfp4_even_k_block(block_k=256, k=64))
+    def test_drops_stages_when_the_minimum_block_is_not_enough(self):
+        # Three blocks of the minimum 128 in three stages.
+        self.assertEqual(
+            _afp4wfp4_k_tail_safe_tiling(256, k=320, num_stages=3), (128, 2)
+        )
+        # One masked block cannot share a stage with a full one.
+        self.assertIsNone(_afp4wfp4_k_tail_safe_tiling(256, k=96, num_stages=3))
 
 
-class TestAfp4wfp4EvenKConfig(CustomTestCase):
-    def _config(self, get_config, m=16, n=7168, k_packed=384):
-        quark_w4a4_mxfp4._afp4wfp4_even_k_config.cache_clear()
+class TestAfp4wfp4KTailConfig(CustomTestCase):
+    def _config(self, get_config, m=16, n=7168, k_packed=768):
+        quark_w4a4_mxfp4._afp4wfp4_k_tail_config.cache_clear()
         try:
             with (
                 mock.patch.object(
@@ -152,21 +167,33 @@ class TestAfp4wfp4EvenKConfig(CustomTestCase):
                     quark_w4a4_mxfp4, "is_gfx95_supported", return_value=True
                 ),
             ):
-                return quark_w4a4_mxfp4._afp4wfp4_even_k_config(
+                return quark_w4a4_mxfp4._afp4wfp4_k_tail_config(
                     m=m, n=n, k_packed=k_packed
                 )
         finally:
-            quark_w4a4_mxfp4._afp4wfp4_even_k_config.cache_clear()
+            quark_w4a4_mxfp4._afp4wfp4_k_tail_config.cache_clear()
+
+    # AITER's untuned decode config for 8 < M <= 32.
+    _DECODE_CONFIG = {
+        "BLOCK_SIZE_M": 32,
+        "BLOCK_SIZE_K": 1024,
+        "num_stages": 3,
+        "NUM_KSPLIT": 1,
+    }
 
     def test_narrows_the_kernels_own_config(self):
-        aiter_config = {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_K": 512, "NUM_KSPLIT": 1}
-        get_config = mock.Mock(return_value=(aiter_config, False))
+        get_config = mock.Mock(return_value=(dict(self._DECODE_CONFIG), False))
 
-        config = self._config(get_config, m=4096)
+        config = self._config(get_config, k_packed=768)
 
         # gemm_afp4wfp4's _get_config takes packed K, as gemm_afp4wfp4 passes it.
-        get_config.assert_called_once_with(4096, 7168, 384)
-        self.assertEqual(config, {**aiter_config, "BLOCK_SIZE_K": 256})
+        get_config.assert_called_once_with(16, 7168, 768)
+        self.assertEqual(config, {**self._DECODE_CONFIG, "BLOCK_SIZE_K": 512})
+
+    def test_tail_in_a_filled_stage_keeps_aiters_config(self):
+        # Kimi-K3 TP8 dense down_proj, K=4224.
+        get_config = mock.Mock(return_value=(dict(self._DECODE_CONFIG), False))
+        self.assertIsNone(self._config(get_config, k_packed=2112))
 
     def test_failed_lookup_keeps_the_default_path(self):
         for error in (
@@ -180,15 +207,8 @@ class TestAfp4wfp4EvenKConfig(CustomTestCase):
         self.assertIsNone(self._config(None))
 
     def test_split_k_config_is_left_to_aiter(self):
-        split_k = {"BLOCK_SIZE_K": 512, "NUM_KSPLIT": 4}
+        split_k = {"BLOCK_SIZE_K": 512, "num_stages": 2, "NUM_KSPLIT": 4}
         self.assertIsNone(self._config(mock.Mock(return_value=(split_k, False))))
-
-    def test_k_without_an_even_block_keeps_the_default_path(self):
-        aiter_config = {"BLOCK_SIZE_K": 1024, "NUM_KSPLIT": 1}
-        # gpt-oss hidden size: 2880 % 128 == 64.
-        self.assertIsNone(
-            self._config(mock.Mock(return_value=(aiter_config, False)), k_packed=1440)
-        )
 
 
 if __name__ == "__main__":

@@ -43,13 +43,29 @@ _ASM_FP4_UNSAFE_MAX_N = 128
 _AFP4WFP4_MIN_BLOCK_K = 128
 
 
-def _afp4wfp4_even_k_block(block_k: int, k: int) -> Optional[int]:
-    """BLOCK_SIZE_K that divides ``k`` FP4 elements, or None when none at or above the minimum does."""
+def _afp4wfp4_k_tail_in_unfilled_stage(block_k: int, k: int, num_stages: int) -> bool:
+    """Whether ``k`` FP4 elements leave a masked K-tail block in an LDS stage that no full K block filled."""
+    # The pipeline cycles K blocks through num_stages LDS buffers (Triton 3.7.0 TTGIR). With more K blocks
+    # than stages, the tail's stale lanes hold an earlier block's finite scales over zero-filled data;
+    # otherwise they hold what the previous kernel left: every NaN of an MI355X sweep (N=7168, K <= 8192).
+    return k % block_k != 0 and -(-k // block_k) <= num_stages
+
+
+def _afp4wfp4_k_tail_safe_tiling(
+    block_k: int, k: int, num_stages: int
+) -> Optional[tuple[int, int]]:
+    """Widest BLOCK_SIZE_K, then most num_stages, that keep the K tail out of an unfilled LDS stage."""
     # gemm_afp4wfp4 shrinks a block wider than K to K's next power of two, then raises it to the minimum.
     block_k = max(min(block_k, 1 << (k - 1).bit_length()), _AFP4WFP4_MIN_BLOCK_K)
-    while block_k > _AFP4WFP4_MIN_BLOCK_K and k % block_k:
-        block_k //= 2
-    return block_k if k % block_k == 0 else None
+    while _afp4wfp4_k_tail_in_unfilled_stage(block_k, k, num_stages):
+        if block_k > _AFP4WFP4_MIN_BLOCK_K:
+            block_k //= 2
+            continue
+        # Even the minimum block leaves too few K blocks, e.g. K=320 in three blocks of 128.
+        num_stages = -(-k // block_k) - 1
+        if num_stages < 1:
+            return None
+    return block_k, num_stages
 
 
 _aiter_afp4wfp4_get_config = None
@@ -64,10 +80,10 @@ if _is_hip:
 
 
 @functools.cache
-def _warn_no_even_k_block(k: int) -> None:
+def _warn_no_k_tail_safe_tiling(k: int) -> None:
     logger.warning(
-        "MXFP4 gemm_afp4wfp4: K=%d has no power-of-two BLOCK_SIZE_K >= %d dividing it; "
-        "it keeps the masked K-tail path of triton-lang/triton#11256.",
+        "MXFP4 gemm_afp4wfp4: K=%d has no BLOCK_SIZE_K >= %d and num_stages that keep its K tail out "
+        "of an unfilled LDS stage; it keeps the masked K-tail path of triton-lang/triton#11256.",
         k,
         _AFP4WFP4_MIN_BLOCK_K,
     )
@@ -83,7 +99,7 @@ def _warn_aiter_get_config_failed() -> None:
 
 
 @functools.lru_cache(maxsize=1024)
-def _afp4wfp4_even_k_config(m: int, n: int, k_packed: int) -> Optional[dict]:
+def _afp4wfp4_k_tail_config(m: int, n: int, k_packed: int) -> Optional[dict]:
     # None keeps AITER's own config selection.
     if not is_gfx95_supported() or _aiter_afp4wfp4_get_config is None:
         return None
@@ -101,11 +117,16 @@ def _afp4wfp4_even_k_config(m: int, n: int, k_packed: int) -> Optional[dict]:
         # loads scales via registers, not direct-to-LDS, so triton#11256 does not hit it (Triton 3.7.0).
         return None
     k = 2 * k_packed
-    even_block_k = _afp4wfp4_even_k_block(block_k=config["BLOCK_SIZE_K"], k=k)
-    if even_block_k is None:
-        _warn_no_even_k_block(k)
+    tiling = _afp4wfp4_k_tail_safe_tiling(
+        block_k=config["BLOCK_SIZE_K"], k=k, num_stages=config["num_stages"]
+    )
+    if tiling is None:
+        _warn_no_k_tail_safe_tiling(k)
         return None
-    return {**config, "BLOCK_SIZE_K": even_block_k}
+    block_k, num_stages = tiling
+    if block_k == config["BLOCK_SIZE_K"] and num_stages == config["num_stages"]:
+        return None
+    return {**config, "BLOCK_SIZE_K": block_k, "num_stages": num_stages}
 
 
 # Keep this path opt-in while the AITER ASM integration is validated across the
@@ -252,7 +273,7 @@ if _is_hip:
     ) -> None:
         # Workaround for triton-lang/triton#11256: a masked K-tail scale load keeps stale LDS (NaN);
         # drop once every ROCm image's Triton has the fix, which 3.7.0 and 3.8.0+git4cff872c lack.
-        config = _afp4wfp4_even_k_config(
+        config = _afp4wfp4_k_tail_config(
             m=x.shape[0], n=w.shape[0], k_packed=x.shape[1]
         )
         _gemm_afp4wfp4_orig(

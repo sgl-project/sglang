@@ -12,9 +12,10 @@ from sglang.test.test_utils import CustomTestCase
 register_amd_ci(est_time=30, stage="stage-b", runner_config="1-gpu-small-amd-mi35x")
 
 # Untuned at ROCm/aiter@285579b62, so DEFAULT.json picks BLOCK_SIZE_K=1024 for 8 < M <= 32;
-# an M that is a multiple of 16 takes the stale-LDS path.
-N, K = 7168, 1536
-MS = (16, 32)
+# an M that is a multiple of 16 takes the stale-LDS path. No power of two >= 128 divides K=2880,
+# so its fix keeps a K tail, in an LDS stage a full K block filled.
+N = 7168
+SHAPES = {1536: (16, 32), 2880: (16,)}
 # Power of two at or above the ~105 KB of LDS this GEMM config uses.
 _LDS_BYTES = 128 * 1024
 
@@ -55,36 +56,42 @@ class TestQuarkAfp4wfp4KTail(CustomTestCase):
             return values * scale[:, : values.shape[-1]]
 
         torch.manual_seed(0)
-        w_q, w_s = dynamic_mxfp4_quant(
-            (torch.randn(N, K, device="cuda") * 0.05).to(torch.bfloat16)
-        )
-        cls.w_q = w_q
-        # Checkpoint weight scales are row-major; activation scales keep the quant layout.
-        cls.w_s = w_s.contiguous()
-        w_ref = dequant(w_q, w_s)
         cls.inputs = {}
-        for m in MS:
-            x_q, x_s = dynamic_mxfp4_quant(
-                (torch.randn(m, K, device="cuda") * 0.05).to(torch.bfloat16)
+        for k, ms in SHAPES.items():
+            w_q, w_s = dynamic_mxfp4_quant(
+                (torch.randn(N, k, device="cuda") * 0.05).to(torch.bfloat16)
             )
-            cls.inputs[m] = (x_q, x_s, dequant(x_q, x_s) @ w_ref.t())
+            # Checkpoint weight scales are row-major; activation scales keep the quant layout.
+            w_s = w_s.contiguous()
+            w_ref = dequant(w_q, w_s)
+            for m in ms:
+                x_q, x_s = dynamic_mxfp4_quant(
+                    (torch.randn(m, k, device="cuda") * 0.05).to(torch.bfloat16)
+                )
+                ref = dequant(x_q, x_s) @ w_ref.t()
+                cls.inputs[k, m] = (x_q, x_s, w_q, w_s, ref)
         cls.lds_fill = staticmethod(_make_lds_fill())
 
     def _assert_matches_reference(self):
         from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4 import (
+            _afp4wfp4_k_tail_in_unfilled_stage,
             _aiter_afp4wfp4_get_config,
             gemm_afp4wfp4,
         )
 
-        for m, (x_q, x_s, ref) in self.inputs.items():
-            with self.subTest(m=m):
-                aiter_config, _ = _aiter_afp4wfp4_get_config(m, N, K // 2)
-                # Guard the premise: once AITER tunes this shape to an even block, pick another.
-                self.assertNotEqual(K % aiter_config["BLOCK_SIZE_K"], 0)
+        for (k, m), (x_q, x_s, w_q, w_s, ref) in self.inputs.items():
+            with self.subTest(k=k, m=m):
+                aiter_config, _ = _aiter_afp4wfp4_get_config(m, N, k // 2)
+                # Guard the premise: once AITER tunes this shape off the stale-LDS path, pick another.
+                self.assertTrue(
+                    _afp4wfp4_k_tail_in_unfilled_stage(
+                        aiter_config["BLOCK_SIZE_K"], k, aiter_config["num_stages"]
+                    )
+                )
                 y = torch.zeros((m, N), dtype=torch.bfloat16, device="cuda")
                 # 0xFF is a NaN E8M0 scale; a K-tail that reads stale LDS turns it into NaN.
                 self.lds_fill(0xFF)
-                gemm_afp4wfp4(x_q, self.w_q, x_s, self.w_s, torch.bfloat16, y)
+                gemm_afp4wfp4(x_q, w_q, x_s, w_s, torch.bfloat16, y)
                 err = (y.float() - ref).abs().nan_to_num(float("inf"))
                 self.assertLessEqual(err.max().item(), 0.02 * ref.abs().max().item())
 
