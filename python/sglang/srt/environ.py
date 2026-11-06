@@ -2213,6 +2213,12 @@ class Envs:
     # Target verify full layers on the FlyDSL kernel (exact BF16, 4.75 TB/s at TP4 n8) when flydsl is importable;
     # =0 keeps the Triton pair kernel (SGLANG_MUSE_VERIFY_FULL_V2 / _FP8).
     SGLANG_MUSE_VERIFY_FLYDSL = EnvBool(True)
+    # That FlyDSL full-layer verify with a length-balanced split-KV work list (equal KV chunks per program instead of
+    # equal splits per request), from 4 requests at 4 KV heads per rank and 8 at 2.
+    SGLANG_MUSE_VERIFY_BALANCED = EnvBool(True)
+    # Sliding-layer verify on the FlyDSL kernel (fixed splits over the window), from 16 requests at 4 KV heads per
+    # rank and 48 at 2; Triton below.
+    SGLANG_MUSE_VERIFY_SWA_FLYDSL = EnvBool(True)
     # aiter patch 05 tiles: long-prefill 2D config, unmasked interior 2D tiles,
     # 64-row verify tiles with an exact q-block grid and 256 split-KV segments.
     SGLANG_MUSE_PREFILL_2D_TILES = EnvBool(True)

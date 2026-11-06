@@ -120,6 +120,12 @@ from sglang.kernels.ops.attention.verify_reduce_norm_gate import (
 )
 
 try:
+    from sglang.kernels.ops.attention.muse_verify_balanced import (
+        gqa_verify_flydsl_balanced,
+        swa_verify_flydsl,
+        use_balanced_full,
+        use_flydsl_sliding,
+    )
     from sglang.kernels.ops.attention.muse_verify_flydsl import gqa_verify_flydsl
 except Exception:  # no flydsl / aiter FlyDSL in this environment
     gqa_verify_flydsl = None
@@ -260,7 +266,7 @@ def _muse_verify_attention(
     sliding_window = 1 + window_size[0]
     if not (
         num_seqs > 0
-        and block_size == 16
+        and block_size in (16, 32, 64, 128)
         and head_size == 64
         and num_query_heads == 8 * num_kv_heads
         and int(max_seqlen_q) == 8
@@ -274,6 +280,21 @@ def _muse_verify_attention(
     # Splits were tuned at 2 KV heads per rank (TP8); more KV heads (TP4: 4) divide them to keep the CTA count.
     kv_scale = max(1, num_kv_heads // 2)
     if sliding_window == 2047 and window_size[1] == 0:
+        if (
+            "swa_fly" in kernels
+            and gqa_verify_flydsl is not None
+            and num_kv_heads in (2, 4)
+            and k.stride() == v.stride()
+            and use_flydsl_sliding(num_seqs, num_kv_heads)
+        ):
+            _defer_or_merged(
+                swa_verify_flydsl(
+                    q, k, v, out, seqused_k, block_table, softmax_scale, k_descale, v_descale,
+                    window=sliding_window, defer_reduce=_VERIFY_REDUCE_DEFERRAL.requested,
+                ),
+                v_descale,
+            )  # fmt: skip
+            return True
         if "swa_splitkv" in kernels and 0 < num_seqs <= 8:
             _defer_or_merged(
                 swa_verify_splitkv(
@@ -305,13 +326,18 @@ def _muse_verify_attention(
         and num_kv_heads in (2, 4)
         and k.stride() == v.stride()
     ):
+        balanced = "full_fly_bal" in kernels and use_balanced_full(
+            num_seqs, num_kv_heads
+        )
         if ("fly", num_seqs) not in _muse_verify_v2_logged:
             _muse_verify_v2_logged.add(("fly", num_seqs))
             logger.info(
-                "Muse verify FlyDSL full layers: num_seqs=%d mode=exact", num_seqs
+                "Muse verify FlyDSL full layers: num_seqs=%d mode=exact balanced=%s",
+                num_seqs,
+                balanced,
             )
         _defer_or_merged(
-            gqa_verify_flydsl(
+            (gqa_verify_flydsl_balanced if balanced else gqa_verify_flydsl)(
                 q, k, v, out, seqused_k, block_table, softmax_scale, k_descale, v_descale,
                 defer_reduce=_VERIFY_REDUCE_DEFERRAL.requested,
             ),
@@ -925,6 +951,8 @@ class AiterAttnBackend(AttentionBackend):
                 ("full_v2", envs.SGLANG_MUSE_VERIFY_FULL_V2),
                 ("full_v2_fp8", envs.SGLANG_MUSE_VERIFY_FP8),
                 ("full_fly", envs.SGLANG_MUSE_VERIFY_FLYDSL),
+                ("full_fly_bal", envs.SGLANG_MUSE_VERIFY_BALANCED),
+                ("swa_fly", envs.SGLANG_MUSE_VERIFY_SWA_FLYDSL),
                 ("full_gqa", envs.SGLANG_MUSE_VERIFY_FULL_GQA),
             )
             if self.use_muse_attention_paths and self._use_unified_verify and env.get()
