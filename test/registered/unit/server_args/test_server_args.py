@@ -21,6 +21,8 @@ from sglang.srt.arg_groups import (
     validation_hook,
 )
 from sglang.srt.arg_groups.attention_hook import (
+    _check_gdn_replayssm_ucache_cache,
+    _pin_gdn_ucache_state_dtype_env,
     handle_attention_backend_compatibility,
     handle_deterministic_inference,
 )
@@ -55,6 +57,7 @@ from sglang.srt.arg_groups.mamba_hook import (
     handle_mamba_backend,
 )
 from sglang.srt.arg_groups.memory_hook import handle_gpu_memory_settings
+from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.arg_groups.model_path_hook import handle_load_format
 from sglang.srt.arg_groups.moe_hook import (
     handle_a2a_moe,
@@ -1133,6 +1136,73 @@ class TestInt8MambaCheckpointCompatibility(unittest.TestCase):
         handle_int8_mamba_checkpoint(
             ServerArgs(model_path="dummy", enable_unified_memory=True)
         )
+
+
+class TestGdnReplaySsmUcacheRadixGuard(unittest.TestCase):
+    """--enable-gdn-replayssm-ucache lets the radix tree hold only states with an
+    empty u-cache window: prefill states, or decode-time states materialized into
+    an extra_buffer track slot. A no_buffer finish would donate a lagging live slot."""
+
+    FLAG = "--enable-gdn-replayssm-ucache"
+
+    def _check(self, **kwargs):
+        server_args = ServerArgs(model_path="dummy", **kwargs)
+        _check_gdn_replayssm_ucache_cache(resolving_view(server_args), flag=self.FLAG)
+
+    def test_radix_with_skip_decode_insert_is_accepted_on_any_strategy(self):
+        for strategy in ("auto", "no_buffer", "extra_buffer", "extra_buffer_lazy"):
+            self._check(
+                radix_cache_skip_decode_insert=True,
+                mamba_radix_cache_strategy=strategy,
+            )
+
+    def test_decode_inserts_with_extra_buffer_are_accepted(self):
+        for strategy in ("extra_buffer", "extra_buffer_lazy"):
+            self._check(mamba_radix_cache_strategy=strategy)
+
+    def test_decode_inserts_without_extra_buffer_are_rejected(self):
+        for strategy in ("auto", "no_buffer"):
+            with self.assertRaisesRegex(ValueError, "extra_buffer_lazy"):
+                self._check(mamba_radix_cache_strategy=strategy)
+
+    def test_radix_off_is_accepted_on_any_strategy(self):
+        self._check(disable_radix_cache=True, mamba_radix_cache_strategy="no_buffer")
+
+    def _pin(self, **kwargs):
+        server_args = ServerArgs(model_path="dummy", **kwargs)
+        _pin_gdn_ucache_state_dtype_env(resolving_view(server_args), flag=self.FLAG)
+
+    def test_state_dtype_env_is_set_to_fp16_and_conflicts_rejected(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("GDN_UCACHE_STATE_DTYPE", None)
+            self._pin(mamba_radix_cache_strategy="extra_buffer")
+            self.assertEqual(os.environ["GDN_UCACHE_STATE_DTYPE"], "fp16")
+        with patch.dict(os.environ, {"GDN_UCACHE_STATE_DTYPE": "bf16"}):
+            with self.assertRaisesRegex(ValueError, "GDN_UCACHE_STATE_DTYPE=fp16"):
+                self._pin(mamba_radix_cache_strategy="extra_buffer_lazy")
+
+    def test_state_dtype_env_is_left_alone_without_decode_inserts(self):
+        for kwargs in (
+            dict(disable_radix_cache=True),
+            dict(radix_cache_skip_decode_insert=True),
+        ):
+            with patch.dict(os.environ, {"GDN_UCACHE_STATE_DTYPE": "bf16"}):
+                self._pin(**kwargs)
+                self.assertEqual(os.environ["GDN_UCACHE_STATE_DTYPE"], "bf16")
+
+    def test_host_cache_offload_is_rejected(self):
+        for kwargs in (
+            dict(enable_hierarchical_cache=True),
+            dict(enable_lmcache=True),
+        ):
+            with self.assertRaisesRegex(ValueError, "--enable-hierarchical-cache"):
+                self._check(mamba_radix_cache_strategy="extra_buffer_lazy", **kwargs)
+
+    def test_int8_checkpoint_is_rejected_with_radix(self):
+        with self.assertRaisesRegex(ValueError, "--enable-int8-mamba-checkpoint"):
+            self._check(
+                radix_cache_skip_decode_insert=True, enable_int8_mamba_checkpoint=True
+            )
 
 
 class TestKV4Compatibility(unittest.TestCase):

@@ -1560,8 +1560,15 @@ class KVCacheConfigurator:
                     or self.hybrid_kda_config is not None
                 )
             ),
+            enable_gdn_replayssm_ucache=self._gdn_replayssm_ucache_active(),
         )
         return req_to_token_pool
+
+    def _gdn_replayssm_ucache_active(self) -> bool:
+        return (
+            get_exec().mamba.enable_gdn_replayssm_ucache
+            and self.hybrid_gdn_config is not None
+        )
 
     def _build_default_req_pool(
         self,
@@ -3051,6 +3058,24 @@ class KVCacheConfigurator:
             )
         return config
 
+    def _gdn_ucache_ring_bytes_per_slot(self, config, pp_layer_scale: float) -> int:
+        if not self._gdn_replayssm_ucache_active():
+            return 0
+        from sglang.srt.layers.attention.linear.gdn_replayssm_ucache import (
+            gdn_ucache_ring_bytes_per_slot,
+        )
+
+        params = config.mamba2_cache_params
+        num_v_heads, head_v_dim, head_k_dim = params.shape.temporal
+        ring_bytes = gdn_ucache_ring_bytes_per_slot(
+            num_layers=len(params.layers),
+            num_k_heads=params.shape.num_k_heads_per_tp,
+            num_v_heads=num_v_heads,
+            head_k_dim=head_k_dim,
+            head_v_dim=head_v_dim,
+        )
+        return int(ring_bytes * pp_layer_scale)
+
     def _handle_max_mamba_cache(self, total_rest_memory):
         config = self.mambaish_config
         assert config is not None
@@ -3113,12 +3138,16 @@ class KVCacheConfigurator:
         else:
             replayssm_fixed_bytes = 0
             replayssm_ring_per_slot = replayssm_ring_per_req
-        extra_per_slot = replayssm_ring_per_slot + int(
-            self.extra_mamba_cache_bytes_per_req * pp_layer_scale
+        ucache_active = self._gdn_replayssm_ucache_active()
+        extra_per_slot = (
+            replayssm_ring_per_slot
+            + self._gdn_ucache_ring_bytes_per_slot(config, pp_layer_scale)
+            + int(self.extra_mamba_cache_bytes_per_req * pp_layer_scale)
         )
         reserves_spec_state = (
             has_spec_dec
             and not replayssm_active
+            and not ucache_active
             and not _pd_prefill_skips_mamba_spec_state()
         )
         if has_spec_dec:

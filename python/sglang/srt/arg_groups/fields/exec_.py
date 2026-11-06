@@ -596,6 +596,27 @@ class ExecMamba(msgspec.Struct):
         bool,
         "Enable the ReplaySSM spec-verify: fold-every-commit -- a per-slot raw-input window replaces the recurrent verify's per-draft full-state snapshots. GDN or KDA hybrid linear-attn models, linear-chain (--speculative-eagle-topk in {None, 1}) only.",
     ] = False
+    enable_gdn_replayssm_ucache: A[
+        bool,
+        "Enable the deferred-fold GDN ReplaySSM target verify on FlashInfer's "
+        "u-cache kernels (gated_delta_rule_mtp_ucache_flush_umma, SM100; the Rubin "
+        "build on SM107). Each verify reads the fp16 checkpoint plus a per-slot "
+        "window of up to 16 committed (k, u, g) records and folds a full window "
+        "into the checkpoint inside the same launch, so the state is written "
+        "about once every 4 verifies instead of every step. Numerics differ from "
+        "the per-step fold (16-bit ring records, one rounding per fold). Requires "
+        "a GDN hybrid model, a linear draft chain with at most 8 draft tokens, "
+        "--mamba-ssm-dtype float16. With the radix cache, decode-time states "
+        "are cached through --mamba-radix-cache-strategy extra_buffer or "
+        "extra_buffer_lazy (each crossing writes FlashInfer's "
+        "gdn_prefix_materialize fold of the window into the track slot), or "
+        "--radix-cache-skip-decode-insert caches prompt prefixes only; no_buffer "
+        "decode inserts are refused. With decode inserts on, sets "
+        "GDN_UCACHE_STATE_DTYPE=fp16 for FlashInfer and refuses another value. "
+        "Refuses mixed chunk, streaming sessions, unified memory, int8 "
+        "mamba checkpoints, HiCache, LMCache and PD disaggregation; needs "
+        "FlashInfer >= 0.7.3.",
+    ] = False
 
 
 class ExecGraph(msgspec.Struct):

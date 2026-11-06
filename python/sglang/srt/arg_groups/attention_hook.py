@@ -306,6 +306,10 @@ def handle_linear_attn_backend(server_args: Any):
             "defaulting --linear-attn-decode-backend to flashinfer."
         )
 
+    if cfg.enable_gdn_replayssm_ucache:
+        _check_gdn_replayssm_ucache(server_args)
+        _pin_gdn_ucache_state_dtype_env(cfg, flag="--enable-gdn-replayssm-ucache")
+
     # SM100+ FlashInfer GDN decode requires bf16 state; SM90 uses float32.
     decode = cfg.linear_attn_decode_backend or cfg.linear_attn_backend
 
@@ -332,9 +336,12 @@ def handle_linear_attn_backend(server_args: Any):
             "(FlashKDA stays on prefill)."
         )
 
+    # The u-cache verify replaces the FlashInfer bf16-state decode/verify kernels
+    # (plain decode never runs under it), while FlashInfer prefill takes fp16 state.
     if (
         decode == "flashinfer"
         and cfg.mamba_ssm_dtype != "bfloat16"
+        and not cfg.enable_gdn_replayssm_ucache
         and get_platform().is_cuda
         and torch.cuda.get_device_capability()[0] >= 10
     ):
@@ -367,6 +374,7 @@ def handle_linear_attn_backend(server_args: Any):
     if (
         verify == "flashinfer"
         and cfg.mamba_ssm_dtype != "bfloat16"
+        and not cfg.enable_gdn_replayssm_ucache
         and get_platform().is_cuda
         and torch.cuda.get_device_capability()[0] >= 10
     ):
@@ -521,6 +529,186 @@ def handle_linear_attn_backend(server_args: Any):
                 "verify window; validate long-sequence accuracy and throughput.",
                 cfg.mamba_ssm_dtype,
             )
+
+
+# Branch-only Qwen3.8 GDN knobs that would route a target verify through their own
+# conv or in-projection path; read raw at their call sites, so mirrored here.
+_Q38_GDN_VERIFY_KNOBS = ("Q38_GDN_FRONT", "Q38_GDN_INPROJ_CONV", "Q38_GDN_PDL")
+
+
+def _check_gdn_replayssm_ucache(server_args: Any) -> None:
+    cfg = resolving_view(server_args)
+    flag = "--enable-gdn-replayssm-ucache"
+    _check_gdn_replayssm_ucache_model(server_args, flag=flag)
+    _check_gdn_replayssm_ucache_spec(cfg, flag=flag)
+    _check_gdn_replayssm_ucache_cache(cfg, flag=flag)
+    _check_gdn_replayssm_ucache_megakernel(cfg, flag=flag)
+    if cfg.mamba_ssm_dtype is None:
+        logger.info(f"{flag}: setting --mamba-ssm-dtype float16 (UMMA fp16 state).")
+        declare_resolution(
+            server_args, "_handle_linear_attn_backend", mamba_ssm_dtype="float16"
+        )
+    elif cfg.mamba_ssm_dtype != "float16":
+        raise ValueError(
+            f"{flag} requires --mamba-ssm-dtype float16 (the UMMA kernels keep an "
+            f"fp16 state pool); got {cfg.mamba_ssm_dtype!r}."
+        )
+
+
+def _pin_gdn_ucache_state_dtype_env(cfg: Any, *, flag: str) -> None:
+    """Sets GDN_UCACHE_STATE_DTYPE=fp16, refusing another value, when decode-time
+    radix inserts load FlashInfer's gdn_prefix_materialize."""
+    # PM fixes its state dtype when flashinfer.gdn_kernels is first imported;
+    # scheduler processes inherit this. The UMMA verify kernels take their dtypes
+    # from the tensors, so the other configs leave the variable alone. After
+    # _check_gdn_replayssm_ucache_cache, decode inserts imply an extra_buffer
+    # strategy, which is when the backend builds the track materializer.
+    if cfg.disable_radix_cache or cfg.radix_cache_skip_decode_insert:
+        return
+    value = os.environ.setdefault("GDN_UCACHE_STATE_DTYPE", "fp16")
+    if value.strip().lower() != "fp16":
+        raise ValueError(
+            f"{flag} needs GDN_UCACHE_STATE_DTYPE=fp16 (an fp16 state pool for "
+            f"gdn_prefix_materialize); got {value!r}."
+        )
+
+
+def _check_gdn_replayssm_ucache_model(server_args: Any, *, flag: str) -> None:
+    import torch
+
+    from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
+
+    model_config = model_config_of(server_args)
+    if hybrid_gdn_config(model_config) is None or uses_kda_attention(
+        model_config.hf_config
+    ):
+        raise ValueError(f"{flag} requires a GDN hybrid linear-attention model.")
+    if not get_platform().is_cuda or torch.cuda.get_device_capability() not in (
+        (10, 0),
+        (10, 7),
+    ):
+        raise ValueError(f"{flag} requires an SM100 or SM107 CUDA GPU.")
+
+
+def _check_gdn_replayssm_ucache_spec(cfg: Any, *, flag: str) -> None:
+    from sglang.srt.speculative.ragged_verify import (
+        RaggedVerifyMode,
+        read_ragged_verify_mode,
+    )
+
+    if cfg.speculative_algorithm is None:
+        raise ValueError(f"{flag} requires speculative decoding (it is a verify path).")
+    if read_ragged_verify_mode() is not RaggedVerifyMode.STATIC:
+        raise ValueError(f"{flag} requires SGLANG_RAGGED_VERIFY_MODE=static.")
+    if pp_spec_stable_rows_enabled():
+        raise ValueError(f"{flag} does not support SGLANG_ENABLE_PP_SPEC.")
+    if cfg.enable_linear_replayssm or cfg.enable_linear_replayssm_spec:
+        raise ValueError(
+            f"{flag} is mutually exclusive with --enable-linear-replayssm and "
+            "--enable-linear-replayssm-spec."
+        )
+
+
+def _check_gdn_replayssm_ucache_cache(cfg: Any, *, flag: str) -> None:
+    # The tree must hold states with an empty window: prefill writes them, and
+    # each verify commit materializes decode-time track states into the extra
+    # buffer; every target extend restarts its slot's window.
+    # TODO(ameynaik-hub): no_buffer decode inserts need the live slot's window
+    # folded before its finish donation.
+    if (
+        not cfg.disable_radix_cache
+        and not cfg.radix_cache_skip_decode_insert
+        and cfg.mamba_radix_cache_strategy not in ("extra_buffer", "extra_buffer_lazy")
+    ):
+        raise ValueError(
+            f"{flag} with the radix cache needs --mamba-radix-cache-strategy "
+            "extra_buffer or extra_buffer_lazy, or --radix-cache-skip-decode-insert; "
+            f"got {cfg.mamba_radix_cache_strategy!r}: a no_buffer finish would "
+            "donate a checkpoint that lags its unfolded window."
+        )
+    if cfg.enable_int8_mamba_checkpoint:
+        raise ValueError(
+            f"{flag} does not support --enable-int8-mamba-checkpoint: the "
+            "u-cache keeps an fp16 checkpoint pool."
+        )
+    # TODO(ameynaik-hub): validate host offload and load-back of tree states, then
+    # lift this; the rings and cursors are not in the transfer set.
+    if cfg.enable_hierarchical_cache or cfg.enable_lmcache:
+        raise ValueError(
+            f"{flag} does not support --enable-hierarchical-cache or "
+            "--enable-lmcache yet: offload and load-back of u-cache states is "
+            "not validated."
+        )
+    if cfg.enable_mixed_chunk:
+        raise ValueError(
+            f"{flag} does not support --enable-mixed-chunk: decode rows of a mixed "
+            "batch would read the checkpoint without its unfolded window."
+        )
+    if cfg.disaggregation_mode != "null":
+        raise ValueError(
+            f"{flag} does not support PD disaggregation; got "
+            f"--disaggregation-mode={cfg.disaggregation_mode!r}."
+        )
+    # TODO(ameynaik-hub): support sessions by folding the window into the
+    # checkpoint before an extend on a held slot; resetting hist_len alone is wrong.
+    if cfg.enable_streaming_session:
+        raise ValueError(
+            f"{flag} does not support --enable-streaming-session: a session turn "
+            "reuses its mamba slot, and the next prefill would read the checkpoint "
+            "without its unfolded window."
+        )
+    # Page-major layout requires unified memory, so this covers both flags.
+    if cfg.enable_unified_memory or cfg.enable_page_major_kv_layout:
+        raise ValueError(
+            f"{flag} does not support --enable-unified-memory or "
+            "--enable-page-major-kv-layout: the arena state pool (StateView) "
+            "allocates no u-cache rings."
+        )
+
+
+def _check_gdn_replayssm_ucache_megakernel(cfg: Any, *, flag: str) -> None:
+    if cfg.enable_nvidia_megakernel:
+        raise ValueError(
+            f"{flag} cannot run with --enable-nvidia-megakernel: its verify step "
+            "reads the GDN pool without the u-cache rings."
+        )
+    # A late-joined cursor commit from a slot's previous owner can land after
+    # the forward-stream extend reset (reset_gdn_ucache_cursors).
+    if envs.SGLANG_PLB_COMMIT_LATE_JOIN.get():
+        raise ValueError(f"{flag} cannot run with SGLANG_PLB_COMMIT_LATE_JOIN.")
+    if envs.SGLANG_Q38C_MK_GDN.get():
+        raise ValueError(f"{flag} cannot run with SGLANG_Q38C_MK_GDN.")
+    for name in _Q38_GDN_VERIFY_KNOBS:
+        if os.environ.get(name, "0") == "1":
+            raise ValueError(f"{flag} cannot run with {name}=1.")
+
+
+def handle_gdn_replayssm_ucache_spec_shape(server_args: Any) -> None:
+    """Validate the resolved draft shape for --enable-gdn-replayssm-ucache.
+
+    Runs after the speculative hook: NGRAM forces topk > 1, and EAGLE-family
+    resolution may rewrite the draft-token count.
+    """
+    cfg = resolving_view(server_args)
+    if not cfg.enable_gdn_replayssm_ucache:
+        return
+    flag = "--enable-gdn-replayssm-ucache"
+    if cfg.speculative_algorithm not in ("EAGLE", "EAGLE3"):
+        raise ValueError(
+            f"{flag} requires a linear EAGLE / EAGLE3 / NEXTN draft chain; got "
+            f"--speculative-algorithm {cfg.speculative_algorithm!r}."
+        )
+    if cfg.speculative_eagle_topk != 1:
+        raise ValueError(
+            f"{flag} requires a linear draft chain (--speculative-eagle-topk 1); "
+            f"got {cfg.speculative_eagle_topk!r}."
+        )
+    num_draft_tokens = cfg.speculative_num_draft_tokens
+    if num_draft_tokens is None or not 1 <= num_draft_tokens <= 8:
+        raise ValueError(
+            f"{flag} supports 1 to 8 draft tokens per verify; got "
+            f"--speculative-num-draft-tokens={num_draft_tokens}."
+        )
 
 
 def handle_multi_item_scoring(server_args: Any):
