@@ -296,6 +296,8 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
             reqs=batch.reqs[:],
         )
         scheduler.result_queue = deque([pending])
+        # The partial scheduler has none of the lists request_lists() reads.
+        scheduler.request_lists = lambda: {}
 
         self.assertEqual(scheduler.collect_inflight_reqs(), {req})
 
