@@ -98,6 +98,5 @@ register_kernel(
         op="memory.interleave_rows",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.memory.interleave_rows:interleave_rows",
-        capabilities=CUDA_ONLY,
     )
 )
