@@ -7,6 +7,7 @@ from typing import Iterable, List, Optional, Tuple
 import torch
 import torch.nn as nn
 
+from sglang.srt.hf_transformers import get_rope_config
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.utils import (
     get_moe_a2a_backend,
@@ -52,7 +53,6 @@ from sglang.srt.utils import (
     is_hip,
     log_info_on_rank0,
 )
-from sglang.srt.utils.hf_transformers import get_rope_config
 
 logger = logging.getLogger(__name__)
 

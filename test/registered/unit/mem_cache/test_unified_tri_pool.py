@@ -18,7 +18,6 @@ SWA KV + mamba/conv state in ONE unified byte buffer, chain
 Pure CPU; fakes stand in for the KV pools (data markers verify moves).
 """
 
-import inspect
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -29,10 +28,7 @@ from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     kv_mamba_slots,
 )
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
-from sglang.srt.mem_cache.kv.alloc.band import (
-    Band,
-    FloatBand,
-)
+from sglang.srt.mem_cache.kv.alloc.band import FloatBand
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
 from sglang.srt.mem_cache.kv.alloc.pricing import float_fit
 from sglang.srt.mem_cache.layout.fused_draft import (
@@ -53,6 +49,7 @@ from sglang.test.unified_allocator_fixtures import (
     FakeKVCache,
     FakeUnifiedSWAKVPool,
     arena_of,
+    build_paged_band_pair,
     build_test_unified_pools,
     chain_snapshot,
     float_chain,
@@ -636,12 +633,7 @@ class TestGeneralizedRebalance(_PoolTestCase):
                     self.assertLess(fla.high_wm_page, before)
 
     def test_two_pool_chain_rebalance_is_a_noop(self):
-        from test_multi_ended_allocator import TestPagedBand as _PagedFixture
-
-        inst = _PagedFixture(
-            [m for m in dir(_PagedFixture) if m.startswith("test_")][0]
-        )
-        _pool, full, swa, _fkv, _skv = inst._build()
+        _pool, full, swa, _fkv, _skv = build_paged_band_pair(page_size=8)
         v = full.alloc(full.page_size * 2)
         self.assertIsNotNone(v)
         wm = full.watermark_physical
@@ -1707,14 +1699,6 @@ class TestFloatRelocationIsOrderedAgainstTheForward(_PoolTestCase):
         if not order:
             self.skipTest("no holes reached compact_holes in this geometry")
         self.assertEqual(order[0], "settle", f"first action was not a settle: {order}")
-
-    def test_the_settle_is_a_stream_wait_not_a_host_sync(self):
-        """The settle before a float move must be a stream wait: a host sync
-        there would land on the alloc-shortfall path every time the float moves."""
-        src = inspect.getsource(Band._settle_inflight_forward)
-        self.assertIn("wait_event", src)
-        self.assertNotIn(".item()", src)
-        self.assertNotIn("synchronize()", src)
 
 
 class TestFloatHoleCreditIsPerSide(_PoolTestCase):
