@@ -80,6 +80,7 @@ def _bcg_config(
         patch(module + ".resolved_view", return_value=resolved),
         patch(module + ".attention_backends_of", return_value=(backend, backend)),
         patch(module + ".bcg.resolving_view", return_value=cfg),
+        patch(module + ".dsv4_bcg.resolving_view", return_value=cfg),
         patch(module + ".bcg.resolved_view", return_value=resolved),
         patch(module + ".bcg.attention_backends_of", return_value=(backend, backend)),
     ):
@@ -157,6 +158,25 @@ class TestCPBCGConfiguration(CustomTestCase):
         for case in cases:
             with self.subTest(case=case), _bcg_config(**case) as cfg:
                 self.assertFalse(supports_prefill_cp_bcg(cfg))
+
+    def test_kimi_interleave_pipeline_parallel_support_is_preserved(self):
+        module = "sglang.srt.layers.cp.bcg.interleave_bcg"
+        with _bcg_config(backend="dsa", pp=2) as cfg:
+            cfg.dp_size = 1
+            model_config = SimpleNamespace(
+                hf_config=SimpleNamespace(
+                    architectures=["KimiK31ForConditionalGeneration"]
+                )
+            )
+            with (
+                patch(module + ".resolving_view", return_value=cfg),
+                patch(
+                    module + ".resolved_view",
+                    return_value=SimpleNamespace(attn_cp_size=8, ep_size=1),
+                ),
+                patch(module + ".model_config_of", return_value=model_config),
+            ):
+                self.assertTrue(supports_prefill_cp_bcg(cfg))
 
     def test_trtllm_zigzag_support_is_preserved(self):
         with _bcg_config(strategy="zigzag", backend="trtllm_mha") as cfg:

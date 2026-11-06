@@ -836,7 +836,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
     def _get_layer_model_positions(self, forward_batch: ForwardBatch) -> torch.Tensor:
         """Mirror outer multimodal wrappers when BCG captures layer_model directly."""
-        if getattr(self, "enable_cp_bcg_capture", False):
+        if self.enable_cp_bcg_capture:
             cp_positions = self.prefill_cp_bcg_input.model_positions(forward_batch)
             if cp_positions is not None:
                 return cp_positions
@@ -950,7 +950,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 # BCG / Full: capture the transformer body only.
                 positions = self._get_layer_model_positions(forward_batch)
                 input_ids = forward_batch.input_ids
-                if getattr(self, "enable_cp_bcg_capture", False):
+                if self.enable_cp_bcg_capture:
                     input_ids = self.prefill_cp_bcg_input.model_input_ids(forward_batch)
                 kwargs = _build_layer_model_forward_kwargs(
                     self.layer_model, forward_batch, pp_proxy_tensors
