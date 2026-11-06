@@ -504,7 +504,7 @@ def _passthrough_video_metadata(video, video_config):
 
 
 class Glm4vImageProcessor(SGLangBaseProcessor):
-    smart_rgb_conversion = True
+    rgb_conversion = "smart"
     video_preprocessing_device = "cpu"
     models = [
         m

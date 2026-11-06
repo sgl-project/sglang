@@ -9,12 +9,15 @@ from sglang.srt.multimodal.modality import Modality, MultimodalInputFormat
 from sglang.srt.multimodal.processors.executor import MultimodalProcessorExecutor
 from sglang.srt.utils import (
     CLIENT_MEDIA_EXCEPTIONS,
+    GPUImageDecodeMode,
     configure_media_url_security,
     load_audio,
     load_image,
     load_video,
     logger,
-    smart_to_rgb,
+    resolve_gpu_image_decode,
+    resolve_rgb_conversion,
+    to_rgb,
 )
 
 
@@ -32,8 +35,10 @@ def _tokenizer_of(processor):
 class MultimodalProcessorMixin:
     """Share media loading and preprocessing resources across training and serving."""
 
+    # The image loader's defaults for this processor class; mm_process_config overrides them per server
+    # ("image_decoder": pil | nvjpeg | nvjpeg_fancy, "image_rgb_conversion": convert | white | smart).
     gpu_image_decode = True  # Enable GPU decoding by default
-    smart_rgb_conversion = False
+    rgb_conversion = "convert"
     auto_mm_io_worker_num = 4
     # Processors opt out only when their preprocessing is not thread-safe. The
     # worker pool gives each thread its own `copy.deepcopy` of the HF processor
@@ -68,6 +73,12 @@ class MultimodalProcessorMixin:
         self.image_config = mm_process_config.get("image", {})
         self.video_config = mm_process_config.get("video", {})
         self.audio_config = mm_process_config.get("audio", {})
+        self.gpu_image_decode = resolve_gpu_image_decode(
+            mm_process_config, type(self).gpu_image_decode
+        )
+        self.rgb_conversion = resolve_rgb_conversion(
+            mm_process_config, type(self).rgb_conversion
+        )
 
         # name of the feature filed
         # TODO: pass from processors
@@ -202,28 +213,32 @@ class MultimodalProcessorMixin:
         audio_sample_rate: Optional[int] = None,
         discard_alpha_channel=True,
         video_decode_device: Optional[str] = None,
+        gpu_image_decode: Optional[GPUImageDecodeMode] = None,
+        rgb_conversion: Optional[str] = None,
     ):
         """
         Load a single multimodal data.
 
         If data is processor_output or precomputed embedding, return directly.
 
-        Class method that can be pickled for multiprocessing
+        Class method that can be pickled for multiprocessing. ``gpu_image_decode`` and
+        ``rgb_conversion`` default to the class attributes when not given.
         """
         if cls._is_preprocessed_input(data):
             return data
         try:
             if modality == Modality.IMAGE:
-                img, _ = load_image(data, cls.gpu_image_decode)
+                if gpu_image_decode is None:
+                    gpu_image_decode = cls.gpu_image_decode
+                if rgb_conversion is None:
+                    rgb_conversion = cls.rgb_conversion
+                img, _ = load_image(data, gpu_image_decode)
                 if isinstance(img, torch.Tensor):
                     return img  # JPEG already decoded on GPU by nvJPEG
+                if discard_alpha_channel:
+                    img = to_rgb(img, rgb_conversion)
                 # PIL decodes lazily; do it here in the io worker so the decode
                 # doesn't run later on the event-loop thread.
-                if discard_alpha_channel:
-                    if cls.smart_rgb_conversion:
-                        return smart_to_rgb(img)
-                    if img.mode != "RGB":
-                        return img.convert("RGB")
                 img.load()
                 return img
             elif modality == Modality.VIDEO:
@@ -278,6 +293,8 @@ class MultimodalProcessorMixin:
         audio_sample_rate: Optional[int],
         discard_alpha_channel: bool,
         video_decode_device: Optional[str] = None,
+        gpu_image_decode: Optional[GPUImageDecodeMode] = None,
+        rgb_conversion: Optional[str] = None,
     ) -> List[Tuple[Modality, int, concurrent.futures.Future]]:
         """
         Simple version: For one modal data submit IO load task.
@@ -293,12 +310,6 @@ class MultimodalProcessorMixin:
             )
             return futures
 
-        # Legacy loader overrides predate the argument, so only a chosen device is sent.
-        load_kwargs = (
-            {}
-            if video_decode_device is None
-            else {"video_decode_device": video_decode_device}
-        )
         for idx, data in enumerate(data_list):
             logger.debug(
                 "[_submit_mm_data_loading_tasks_simple] submit load task: "
@@ -314,7 +325,9 @@ class MultimodalProcessorMixin:
                 None,  # frame_count_limit: no consider for fast path
                 audio_sample_rate,
                 discard_alpha_channel,
-                **load_kwargs,
+                video_decode_device=video_decode_device,
+                gpu_image_decode=gpu_image_decode,
+                rgb_conversion=rgb_conversion,
             )
             futures.append((modality, idx, future))
 
@@ -373,6 +386,8 @@ class MultimodalProcessorMixin:
         audio_sample_rate: Optional[int],
         discard_alpha_channel: bool,
         video_decode_device: Optional[str] = None,
+        gpu_image_decode: Optional[GPUImageDecodeMode] = None,
+        rgb_conversion: Optional[str] = None,
     ) -> Tuple[List[Any], List[Any], List[Any]]:
         futures: List[Tuple[Modality, int, concurrent.futures.Future]] = []
 
@@ -390,6 +405,8 @@ class MultimodalProcessorMixin:
                     audio_sample_rate,
                     discard_alpha_channel,
                     video_decode_device=video_decode_device,
+                    gpu_image_decode=gpu_image_decode,
+                    rgb_conversion=rgb_conversion,
                 )
             )
 
