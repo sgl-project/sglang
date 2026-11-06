@@ -32,6 +32,7 @@ from sglang.srt.utils import (
     get_image_bytes,
     load_image,
     logger,
+    media_url_timeout,
 )
 from sglang.utils import get_exception_traceback
 
@@ -145,7 +146,7 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
         if self.cpu_executor is not None:
             loop = asyncio.get_running_loop()
             executor = self.cpu_executor
-            timeout = int(os.environ.get("REQUEST_TIMEOUT", "10"))
+            timeout = media_url_timeout(10)
             deadline = loop.time() + timeout
             try:
                 # ProcessPoolExecutor.submit() can itself block after a worker

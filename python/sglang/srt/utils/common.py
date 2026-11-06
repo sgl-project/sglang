@@ -39,6 +39,7 @@ import resource
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -118,6 +119,13 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 torch_release = pkg_version.parse(torch.__version__).release
+
+try:
+    from pillow_heif import register_heif_opener
+
+    register_heif_opener()
+except ImportError:
+    pass
 
 
 # ==============================================================================
@@ -1821,6 +1829,13 @@ def _assert_media_url_allowed(url: str) -> None:
         )
 
 
+def media_url_timeout(default: float) -> float:
+    timeout = envs.SGLANG_MEDIA_URL_TIMEOUT.get()
+    if timeout is None:
+        timeout = float(os.getenv("REQUEST_TIMEOUT", default))
+    return timeout
+
+
 def download_remote_media(url: str, timeout: float) -> bytes:
     """Download one HTTP(S) media object under the configured URL policy.
 
@@ -1923,6 +1938,27 @@ CLIENT_MEDIA_EXCEPTIONS = (
 )
 
 
+def _assert_local_media_allowed() -> None:
+    if not envs.SGLANG_MEDIA_ALLOW_LOCAL_FILES.get():
+        raise ValueError("Local media files are not allowed")
+
+
+def read_local_media_file(path: str) -> bytes:
+    """Read a client-named local media file under the URL download limits."""
+    _assert_local_media_allowed()
+    try:
+        if not stat.S_ISREG(os.stat(path).st_mode):
+            raise ValueError(f"Media path is not a regular file: {path!r}")
+        max_bytes = _media_url_max_file_size_bytes
+        with open(path, "rb") as f:
+            data = f.read(max_bytes + 1) if max_bytes else f.read()
+    except OSError as e:
+        raise ValueError(f"Could not read media file {path!r}: {e}") from e
+    if max_bytes and len(data) > max_bytes:
+        raise ValueError(f"Media file exceeds the {max_bytes} byte limit")
+    return data
+
+
 def load_audio(
     audio_file: Union[str, bytes], sr: Optional[int] = None, mono: bool = True
 ) -> np.ndarray:
@@ -1937,11 +1973,13 @@ def load_audio(
     elif isinstance(audio_file, str) and (
         audio_file.startswith("http://") or audio_file.startswith("https://")
     ):
-        timeout = int(os.getenv("REQUEST_TIMEOUT", "5"))
+        timeout = media_url_timeout(5)
         source = download_remote_media(audio_file, timeout=timeout)
     elif isinstance(audio_file, str) and audio_file.startswith("file://"):
+        _assert_local_media_allowed()
         source = unquote(urlparse(audio_file).path)
     elif isinstance(audio_file, str):
+        _assert_local_media_allowed()
         source = audio_file
     else:
         raise ValueError(f"Invalid audio format: {audio_file}")
@@ -2042,7 +2080,18 @@ class VideoData:
     max_long_side_pixel: Optional[int] = None
 
 
-image_extension_names = (".png", ".jpg", ".jpeg", ".webp", ".gif")
+image_extension_names = (
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".webp",
+    ".gif",
+    ".bmp",
+    ".tif",
+    ".tiff",
+    ".heic",
+    ".heif",
+)
 GPUImageDecodeMode = Union[bool, Literal["nvjpeg_fancy"]]
 
 
@@ -2145,7 +2194,7 @@ def _load_image(
                 )
     try:
         image = Image.open(BytesIO(image_bytes))
-    except (OSError, SyntaxError) as e:
+    except (OSError, SyntaxError, Image.DecompressionBombError) as e:
         raise ValueError(f"Could not decode image: {e}") from e
     return _fully_load_pil_image(image)
 
@@ -2154,7 +2203,7 @@ def _fully_load_pil_image(image: Image.Image) -> Image.Image:
     """Force PIL's lazy decode while malformed input is still request-local."""
     try:
         image.load()
-    except (OSError, SyntaxError) as e:
+    except (OSError, SyntaxError, Image.DecompressionBombError) as e:
         raise ValueError(f"Could not decode image: {e}") from e
     return image
 
@@ -2206,11 +2255,14 @@ def get_image_bytes(image_file: Union[str, bytes]) -> bytes:
     if isinstance(image_file, bytes):
         return image_file
     if image_file.startswith(("http://", "https://")):
-        timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
+        timeout = media_url_timeout(3)
         return download_remote_media(image_file, timeout=timeout)
-    if image_file.startswith(("file://", "/")):
-        with open(image_file, "rb") as f:
-            return f.read()
+    if image_file.startswith("file://"):
+        return read_local_media_file(unquote(urlparse(image_file).path))
+    # Raw base64 JPEG also starts with "/" ("/9j/..."), so only real files
+    # take the path branch.
+    if image_file.startswith("/") and os.path.isfile(image_file):
+        return read_local_media_file(image_file)
     if isinstance(image_file, str) and image_file.startswith("data:"):
         _, encoded = image_file.split(",", 1)
         return pybase64.b64decode(encoded, validate=True)
@@ -2232,14 +2284,16 @@ def _normalize_video_input(
         return video_file
     elif isinstance(video_file, str):
         if video_file.startswith(("http://", "https://")):
-            timeout = int(os.getenv("REQUEST_TIMEOUT", "10"))
+            timeout = media_url_timeout(10)
             return download_remote_media(video_file, timeout=timeout)
         elif video_file.startswith("data:"):
             _, encoded = video_file.split(",", 1)
             return pybase64.b64decode(encoded, validate=True)
         elif video_file.startswith("file://"):
+            _assert_local_media_allowed()
             return unquote(urlparse(video_file).path)
         elif os.path.isfile(unquote(urlparse(video_file).path)):
+            _assert_local_media_allowed()
             return video_file
         else:
             return pybase64.b64decode(video_file, validate=True)

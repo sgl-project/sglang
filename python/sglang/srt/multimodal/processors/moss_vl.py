@@ -17,7 +17,7 @@ from sglang.srt.multimodal.processors.base_processor import (
 from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
-from sglang.srt.utils.common import download_remote_media
+from sglang.srt.utils.common import download_remote_media, media_url_timeout
 
 
 class MossVLImageProcessor(SGLangBaseProcessor):
@@ -429,7 +429,7 @@ class MossVLImageProcessor(SGLangBaseProcessor):
             return value, None
 
         if value.startswith(("http://", "https://")):
-            timeout = int(os.getenv("REQUEST_TIMEOUT", "10"))
+            timeout = media_url_timeout(10)
             content = download_remote_media(value, timeout=timeout)
             suffix = os.path.splitext(urlparse(value).path)[1] or ".mp4"
             temp_path = self._write_video_bytes_to_tempfile(content, suffix=suffix)
