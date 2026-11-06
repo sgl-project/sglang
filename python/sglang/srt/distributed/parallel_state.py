@@ -71,6 +71,7 @@ from sglang.srt.utils import (
     is_cuda_alike,
     is_gfx95_supported,
     is_hip,
+    is_mlu,
     is_musa,
     is_npu,
     is_shm_available,
@@ -84,7 +85,7 @@ _is_npu = is_npu()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _is_musa = is_musa()
-
+_is_mlu = is_mlu()
 # Under CUDA-graph capture, stage aiter custom all-gather / reduce-scatter inputs
 # through the pre-registered IPC pool instead of registering graph-pool tensors:
 # the registered path makes peers read stale data over IPC on replay (garbage
@@ -2144,6 +2145,8 @@ def _group_coordinator_device(local_rank: int) -> torch.device:
         return torch.device(f"xpu:{local_rank}")
     if _is_musa:
         return torch.device(f"musa:{local_rank}")
+    if _is_mlu:
+        return torch.device(f"mlu:{local_rank}")
     platform = platforms.current_platform
     if platform.is_out_of_tree():
         return platform.get_group_coordinator_device(local_rank)
@@ -2206,7 +2209,7 @@ def init_model_parallel_group(
         if platform.is_out_of_tree() and not platform.capabilities.supports_pynccl:
             use_pynccl = False
         else:
-            use_pynccl = not (_is_npu or _is_xpu or backend == "mooncake")
+            use_pynccl = not (_is_npu or _is_xpu or _is_mlu or backend == "mooncake")
     return GroupCoordinator(
         group_ranks=group_ranks,
         local_rank=local_rank,
@@ -2595,8 +2598,9 @@ def initialize_model_parallel(
             the KV cache across GPUs within each tensor-parallel group during
             decoding. Must be a divisor of `tp_size` and is currently only
             supported on the AMD HIP platform.
-        shared_experts_tp_size: optional shared-expert TP width. Must divide
-            attention TP; subgroups never cross attention replicas.
+        shared_experts_tp_size: optional shared-expert TP width. May span
+            interleave prefill CP within one attention replica; the validated
+            width divides attention TP x CP and never crosses DP or PP.
 
     Let's say we have a total of 8 GPUs denoted by g0 ... g7 and we
     use 2 GPUs to parallelize the model tensor, and 4 GPUs to parallelize
@@ -2828,8 +2832,9 @@ def initialize_model_parallel(
         if shared_experts_tensor_parallel_size == attn_tp_size:
             _SHARED_EXPERTS_TP = _ATTN_TP
         else:
-            # Attention TP groups are contiguous, and the requested width
-            # divides each one. These groups also stay inside their PP stage.
+            # Rank layout is [PP, attention DP, CP, attention TP]. The
+            # validated width divides attention TP x CP, so contiguous groups
+            # may span interleave PCP but never cross DP replicas or PP stages.
             shared_size = shared_experts_tensor_parallel_size
             shared_group_ranks = [
                 list(range(start, start + shared_size))

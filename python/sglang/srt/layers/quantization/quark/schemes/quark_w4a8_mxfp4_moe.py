@@ -13,13 +13,13 @@ from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.utils import get_moe_weight_sizes
 from sglang.srt.layers.quantization.quark.schemes import QuarkMoEScheme
 from sglang.srt.layers.quantization.utils import all_close_1d
+from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.utils import (
     get_bool_env_var,
     is_gfx95_supported,
     is_gfx1250_supported,
     is_hip,
     round_up,
-    set_weight_attrs,
 )
 
 if TYPE_CHECKING:

@@ -41,8 +41,8 @@ from sglang.srt.multimodal.cache import (
     parse_content_hash,
     snapshot_media,
 )
+from sglang.srt.multimodal.media_io import load_image
 from sglang.srt.multimodal.modality import Modality
-from sglang.srt.utils import load_image
 
 
 @runtime_checkable
