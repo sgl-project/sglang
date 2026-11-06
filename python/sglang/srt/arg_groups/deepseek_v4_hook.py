@@ -31,7 +31,7 @@ from sglang.srt.runtime_context import (
     derive_attn_tp_size,
     get_platform,
 )
-from sglang.srt.utils.common import is_gfx95_supported, is_npu
+from sglang.srt.utils.device import is_gfx95_supported, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -52,7 +52,7 @@ def _attention_is_tensor_parallel(cfg) -> bool:
 
 
 def _default_dsv4_attention_backend(server_args: ServerArgs) -> str:
-    from sglang.srt.utils.common import is_sm100_supported
+    from sglang.srt.utils.device import is_sm100_supported
 
     cfg = resolving_view(server_args)
     layout = envs.SGLANG_DSV4_KV_LAYOUT
@@ -151,7 +151,7 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
     # (MI355X), which breaks the disaggregation nightly. Keep the previous
     # (dense prefill) behavior on ROCm until the sparse kernel is validated
     # there;
-    if get_platform().is_hip:
+    if get_platform().is_hip and not envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.is_set():
         logger.warning(
             "Disabling SGLANG_OPT_FLASHMLA_SPARSE_PREFILL by default on ROCm/HIP "
             f"for {model_arch}; set it explicitly to override."
@@ -173,7 +173,7 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
         )
 
     if cfg.dsv4_attn_backend == "flashmla_mega":
-        from sglang.srt.utils.common import is_sm100_supported
+        from sglang.srt.utils.device import is_sm100_supported
 
         assert (
             model_config_of(server_args).hf_config.model_type == "deepseek_v41"
@@ -182,7 +182,7 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
         ), "--dsv4-attn-backend flashmla_mega requires DeepSeek-V4.1 on SM100/SM103."
 
     if cfg.dsv4_attn_backend == "trtllm":
-        from sglang.srt.utils.common import is_sm100_supported
+        from sglang.srt.utils.device import is_sm100_supported
 
         assert cfg.device == "cuda" and is_sm100_supported(), (
             "--dsv4-attn-backend trtllm requires an SM100/SM103 (Blackwell) GPU."

@@ -60,6 +60,7 @@ from sglang.srt.multimodal.encoder_preprocessing import (
     get_encoder_preprocessed_items,
     resolve_encoder_media_processor_config,
 )
+from sglang.srt.multimodal.media_io import configure_media_url_security
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.observability.metrics_collector import EncoderMetricsCollector
 from sglang.srt.runtime_context import (
@@ -73,7 +74,6 @@ from sglang.srt.runtime_context import (
     publish,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import configure_media_url_security
 from sglang.srt.utils.network import (
     NetworkAddress,
     config_socket,
