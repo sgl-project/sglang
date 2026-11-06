@@ -141,7 +141,7 @@ from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_token_to_kv_pool,
 )
-from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.runner import (
     compile_in_capture_mode,
     get_is_capture_mode,
@@ -1513,6 +1513,30 @@ class MQALayer(MqaAttentionBase):
             and _is_cuda
             and get_exec().kernel.dsv4_attn_backend == "flashmla_mega"
         )
+        # ShardQ (token-sharded prefill, see dsv4/shard_q.py) covers only the
+        # layers before both the bounded-replay cut and the candidate scheme.
+        # At/after either boundary, indexer buffers are addressed in full-batch
+        # row order, which ShardQ's compact per-rank layout does not preserve.
+        replay_cut = (
+            max(config.kv_source_layer_ids)
+            if config.kv_source_layer_ids
+            else config.num_hidden_layers
+        )
+        candidate_cut = (
+            config.candidate_source_layer_id
+            if config.candidate_source_layer_id >= 0
+            else config.num_hidden_layers
+        )
+        shard_q_cut = min(replay_cut, candidate_cut)
+        self.use_shardq = (
+            self.is_dsv41
+            and _is_cuda
+            and get_parallel().attn_tp_size > 1
+            and not self.use_mega_attention
+            and self.compress_ratio in (0, 1, 2)
+            and self.layer_id < shard_q_cut
+            and (self.indexer is None or not self.indexer.uses_candidates)
+        )
         self.mega_cos_sin_cache = None
         if self.use_mega_attention:
             from sglang.kernels.ops.attention.dsv4.rope import (
@@ -2266,6 +2290,7 @@ class MQALayer(MqaAttentionBase):
         q_rope_out: Optional[torch.Tensor] = None,
         k_nope_out: Optional[torch.Tensor] = None,
         k_rope_out: Optional[torch.Tensor] = None,
+        shard_q_plan=None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         x_linear = x_quant if x_quant is not None else x
         if self.fuse_wqa_wkv:
@@ -2581,6 +2606,31 @@ class MQALayer(MqaAttentionBase):
         ):
             if _low_ratio_sources_break(attn_backend, forward_batch):
                 bcg_deepseek_v4_low_ratio_sources(self, x, q_lora, positions)
+            elif shard_q_plan is not None:
+                # The compressed-KV pool is replicated like the main KV cache:
+                # every rank must write every token's compressed KV (the full
+                # rows, under the main metadata), so only the indexer -- which
+                # the candidate-source/consumer gate already keeps off this
+                # layer -- scores this rank's zigzag rows under the swapped
+                # (smaller) metadata.
+                attn_backend.forward_low_ratio_sources(
+                    layer=self,
+                    x=x,
+                    q_lora=q_lora,
+                    positions=positions,
+                    forward_batch=forward_batch,
+                    run_indexer=False,
+                )
+                token_ids = shard_q_plan.exchange.token_ids
+                with attn_backend.use_shard_q_metadata(shard_q_plan):
+                    attn_backend.forward_low_ratio_sources(
+                        layer=self,
+                        x=x.index_select(0, token_ids),
+                        q_lora=q_lora.index_select(0, token_ids),
+                        positions=positions.index_select(0, token_ids),
+                        forward_batch=forward_batch,
+                        run_compressor=False,
+                    )
             else:
                 attn_backend.forward_low_ratio_sources(
                     layer=self,
@@ -2786,6 +2836,23 @@ class MQALayer(MqaAttentionBase):
                 q_out = q_padded[:, tp_slice, :]
         attn_sink = self._local_attn_sink(kernel_num_heads)
 
+        # This step's ShardQ view, when one exists and this layer is eligible
+        # (see self.use_shardq): only the plain eager extend, never the paths
+        # above that already have their own fused Q/KV handling.
+        shard_q_plan = None
+        if (
+            self.use_shardq
+            and forward_batch.forward_mode == ForwardMode.EXTEND
+            and forward_batch._original_forward_mode is None
+            and not enable_multi_stream
+            and not low_ratio_multi_stream
+            and not unified
+            and not get_is_capture_mode()
+            and not get_attn_tp_context().input_scattered
+            and not forward_batch.attn_tp_sequence_sharded
+        ):
+            shard_q_plan = getattr(attn_backend.forward_metadata, "shard_q", None)
+
         if enable_multi_stream:
             # Multi-stream path always fuses cache write into the K kernel,
             # so the bf16 KV intermediate is gone.
@@ -2838,6 +2905,7 @@ class MQALayer(MqaAttentionBase):
                 q_rope_out=q_rope,
                 k_nope_out=k_nope,
                 k_rope_out=k_rope,
+                shard_q_plan=shard_q_plan,
             )
 
         if unified_fp8_prefill and is_cp_active(forward_batch):
@@ -2918,6 +2986,42 @@ class MQALayer(MqaAttentionBase):
                     attn_sink,
                     save_kv_cache,
                 )
+            elif shard_q_plan is not None:
+                # attn_k is a save_kv_cache=False sentinel the kernel never
+                # reads; q_local's own rows (this rank's zigzag share, every
+                # head) take its place so no assert on q/k/v sharing a shape
+                # trips. The compressed/SWA KV pools are replicated and
+                # already hold every token (written above before the
+                # indexer's reduced pass), so the same pool serves this
+                # rank's query view unchanged.
+                assert kv is None, (
+                    "ShardQ expects the eager extend's fused KV store"
+                )
+                q_local = shard_q_plan.exchange.scatter_q(
+                    attn_q[:, : self.n_local_heads]
+                )
+                assert q_local.shape[1] == self.n_heads, (
+                    q_local.shape,
+                    self.n_heads,
+                )
+                assert self.attn_sink.numel() == self.n_heads, (
+                    self.attn_sink.shape,
+                    self.n_heads,
+                )
+                with attn_backend.use_shard_q_metadata(shard_q_plan):
+                    o_local = attn_backend.forward(
+                        q=q_local,
+                        k=q_local,
+                        v=q_local,
+                        layer=self.attn_mqa,
+                        forward_batch=forward_batch,
+                        compress_ratio=self.compress_ratio,
+                        attn_sink=self.attn_sink,
+                        save_kv_cache=False,
+                        **({} if inv_rope is None else {"inv_rope": inv_rope}),
+                    )
+                o = shard_q_plan.exchange.gather_o(o_local)
+                tp_slice = slice(None)
             else:
                 o = attn_backend.forward(
                     q=attn_q,
