@@ -12,6 +12,14 @@ from transformers import PretrainedConfig
 from sglang.kernels.ops.attention.unlimited_ocr_dash.dispatch import (
     apply_page2d_rope_pair,
 )
+from sglang.kernels.ops.elementwise.sam_rel_pos_bias import (
+    can_use_sam_rel_pos_bias,
+    sam_rel_pos_bias,
+)
+from sglang.kernels.ops.elementwise.window_unpartition_add import (
+    can_use_window_unpartition_add,
+    window_unpartition_add,
+)
 from sglang.srt.configs.unlimited_ocr import UnlimitedVLConfig
 from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
 from sglang.srt.layers.linear import (
@@ -33,7 +41,13 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek import DeepseekMLP, DeepseekMoE
-from sglang.srt.models.deepseek_ocr import clear_sam_rel_pos_cache
+from sglang.srt.models.deepseek_ocr import (
+    add_decomposed_rel_pos,
+    clear_sam_rel_pos_cache,
+    get_abs_pos_sam,
+    window_partition,
+    window_unpartition,
+)
 from sglang.srt.models.unlimited_ocr import UnlimitedOCRForCausalLM
 from sglang.srt.models.unlimited_ocr_v2_support.crop_transfer import (
     UnlimitedOcrCropTransfer,
@@ -349,7 +363,11 @@ class UnlimitedOCRV2ForCausalLM(UnlimitedOCRForCausalLM):
             model_dtype=self.vision_model.dtype
         )
         # The image encoder; split-document prefetch fills it ahead of prefill.
-        self.early_embeddings = EarlyEmbeddings(encode=self.get_image_feature)
+        self.early_embeddings = EarlyEmbeddings(
+            encode=self.get_image_feature,
+            encode_steps=self.get_image_feature_steps,
+            step_context=self.vision_step_context,
+        )
 
     def _build_language_model(self, config, quant_config, prefix):
         # construct the DASH tower directly, without allocating a discarded v1 tower
@@ -489,6 +507,247 @@ class UnlimitedOCRV2ForCausalLM(UnlimitedOCRForCausalLM):
                     parts.insert(0, local)
                 pages.append(torch.cat(parts, dim=0))
         return pages
+
+    # The encoder above, cut into steps: one SAM window block, one query chunk of
+    # a SAM global block, the neck, or a few CLIP layers each. On MPS a parked
+    # window's pages are encoded one step at a time between decode steps, so
+    # vision never holds the single Torch MPS command queue for more than ~15 ms.
+    # Prefill keeps the one-shot encoder; the steps give the same tensor.
+    _CLIP_LAYERS_PER_STEP = 4
+    _SAM_GLOBAL_Q_CHUNK_TOKENS = 1024
+
+    def vision_step_context(self):
+        """Context for every vision step: no grad, and no cuDNN SDPA (its
+        nondeterminism can flip OCR logits)."""
+        from contextlib import ExitStack
+
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+
+        stack = ExitStack()
+        stack.enter_context(torch.no_grad())
+        stack.enter_context(
+            sdpa_kernel(
+                [
+                    SDPBackend.FLASH_ATTENTION,
+                    SDPBackend.EFFICIENT_ATTENTION,
+                    SDPBackend.MATH,
+                ]
+            )
+        )
+        return stack
+
+    def _sam_global_block_steps(self, blk: nn.Module, x: torch.Tensor):
+        """Run a global-attention SAM block, yielding after each query chunk."""
+        shortcut = x
+        x = blk.norm1(x)
+        B, H, W, _ = x.shape
+        attn = blk.attn
+        qkv = attn.qkv(x).view(B, H * W, 3, attn.num_heads, -1)
+        q, k, v = qkv.unbind(2)
+        q = q.permute(0, 2, 1, 3)
+        k = k.permute(0, 2, 1, 3)
+        v = v.permute(0, 2, 1, 3)
+        if not attn.use_rel_pos:
+            out = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+            yield
+        else:
+            rel_h, rel_w = add_decomposed_rel_pos(
+                q.reshape(B * attn.num_heads, H * W, -1),
+                attn.rel_pos_h,
+                attn.rel_pos_w,
+                (H, W),
+                (H, W),
+            )
+            rel_h = rel_h.view(
+                B, attn.num_heads, rel_h.size(1), rel_h.size(2), rel_h.size(3)
+            )
+            rel_w = rel_w.view(
+                B, attn.num_heads, rel_w.size(1), rel_w.size(2), rel_w.size(3)
+            )
+            yield
+            q_len = H * W
+            k_h, k_w = rel_h.size(3), rel_w.size(4)
+            q_chunk = max(
+                attn._REL_POS_MIN_Q_CHUNK,
+                self._SAM_GLOBAL_Q_CHUNK_TOKENS // max(1, B),
+            )
+            out = torch.empty_like(q)
+            for s in range(0, q_len, q_chunk):
+                e = min(s + q_chunk, q_len)
+                rel_h_c = rel_h[:, :, s:e]
+                rel_w_c = rel_w[:, :, s:e]
+                if can_use_sam_rel_pos_bias(rel_h_c, rel_w_c):
+                    bias = sam_rel_pos_bias(rel_h_c, rel_w_c)
+                else:
+                    bias = (rel_h_c + rel_w_c).view(B, attn.num_heads, e - s, k_h * k_w)
+                out[:, :, s:e] = torch.nn.functional.scaled_dot_product_attention(
+                    q[:, :, s:e], k, v, attn_mask=bias
+                )
+                yield
+        x = (
+            out.view(B, attn.num_heads, H, W, -1)
+            .permute(0, 2, 3, 1, 4)
+            .reshape(B, H, W, -1)
+        )
+        x = shortcut + attn.proj(x)
+        x = x + blk.mlp(blk.norm2(x))
+        yield
+        return x
+
+    def _encode_ocr1_feature_steps(self, images: torch.Tensor):
+        """``UnlimitedOCRForCausalLM._encode_ocr1_features``, one slice per step."""
+        sam = self.sam_model
+        x = sam.patch_embed(images)
+        if sam.pos_embed is not None:
+            x = x + get_abs_pos_sam(sam.pos_embed, x.size(1))
+        yield
+        for blk in sam.blocks:
+            if blk.window_size == 0:
+                x = yield from self._sam_global_block_steps(blk, x)
+            elif images.shape[0] > 2:
+                shortcut = x
+                x = blk.norm1(x)
+                H, W = x.shape[1], x.shape[2]
+                x, pad_hw = window_partition(x, blk.window_size)
+                x = blk.attn(x)
+                if can_use_window_unpartition_add(x, shortcut, blk.window_size):
+                    x = window_unpartition_add(x, shortcut, blk.window_size)
+                else:
+                    x = window_unpartition(x, blk.window_size, pad_hw, (H, W))
+                    x = shortcut + x
+                yield
+                x = x + blk.mlp(blk.norm2(x))
+                yield
+            else:
+                x = blk(x)
+                yield
+        x = sam.neck(x.permute(0, 3, 1, 2))
+        features_1 = sam.net_3(sam.net_2(x).clone())
+        yield
+        clip = self.vision_model
+        h = clip.pre_layrnorm(clip.embeddings(images, features_1))
+        for i, layer in enumerate(clip.transformer.layers):
+            h = layer(h)
+            if (i + 1) % self._CLIP_LAYERS_PER_STEP == 0:
+                yield
+        features = torch.cat((h[:, 1:], features_1.flatten(2).permute(0, 2, 1)), dim=-1)
+        return self.projector(features)
+
+    def _encode_ocr1_features_grouped_steps(self, tiles: List[torch.Tensor]):
+        """Order follows ``tiles``, split by shape at ``_VIT_MAX_BATCH``; batched
+        bf16 results may differ from per-stack encoding.
+        """
+        n = len(tiles)
+        counts = [t.shape[0] for t in tiles]
+        out: List[Optional[torch.Tensor]] = [None] * n
+        groups: dict = {}
+        for idx, t in enumerate(tiles):
+            groups.setdefault(tuple(t.shape[1:]), []).append(idx)
+        for _shape, idxs in groups.items():
+            batch = (
+                tiles[idxs[0]]
+                if len(idxs) == 1
+                else torch.cat([tiles[i] for i in idxs], dim=0)
+            )
+            feat_chunks = []
+            for s in range(0, batch.shape[0], self._VIT_MAX_BATCH):
+                chunk = batch[s : s + self._VIT_MAX_BATCH]
+                feat_chunks.append((yield from self._encode_ocr1_feature_steps(chunk)))
+            feats = (
+                feat_chunks[0]
+                if len(feat_chunks) == 1
+                else torch.cat(feat_chunks, dim=0)
+            )
+            pos = 0
+            for i in idxs:
+                out[i] = feats[pos : pos + counts[i]]
+                pos += counts[i]
+        return out
+
+    def _pixel_values_to_embedding_steps(
+        self,
+        pixel_values: torch.Tensor,
+        images_crop: torch.Tensor,
+        images_spatial_crop: torch.Tensor,
+        has_local_crops: Optional[List[bool]] = None,
+    ):
+        """Trim crop padding, encode pages in batches, then assemble each page."""
+        n = images_spatial_crop.size(0)
+
+        local_tiles = {}
+        for j in range(n):
+            patches = images_crop[j][0].to(torch.bfloat16)
+            crop_shape = images_spatial_crop[j][0]
+            n_tiles = int(crop_shape[0]) * int(crop_shape[1])
+            if 0 < n_tiles < patches.shape[0]:
+                patches = patches[:n_tiles]
+            use_local = (
+                has_local_crops[j]
+                if has_local_crops is not None
+                else torch.sum(patches).item() != 0
+            )
+            if use_local:
+                local_tiles[j] = patches
+        yield
+
+        # group global and local views separately, preserving page and tile order
+        global_feats = yield from self._encode_ocr1_features_grouped_steps(
+            [pixel_values[j] for j in range(n)]
+        )
+        local_feats = {}
+        if local_tiles:
+            encoded = yield from self._encode_ocr1_features_grouped_steps(
+                list(local_tiles.values())
+            )
+            local_feats = dict(zip(local_tiles, encoded))
+        pages = []
+        for j in range(n):
+            parts = [
+                self._format_ocr1_global_features(global_feats[j]),
+                self.view_seperator[None, :],
+            ]
+            if j in local_feats:
+                local = self._format_ocr1_local_features(
+                    local_feats[j], images_spatial_crop[j][0]
+                )
+                parts.insert(0, local)
+            pages.append(torch.cat(parts, dim=0))
+        return pages
+
+    def _stack_image_input(self, mm_items: List[MultimodalDataItem]):
+        """The stacking half of ``UnlimitedOCRForCausalLM._process_image_input``."""
+        target_dtype = self.vision_model.dtype
+        has_local_crops = self._collect_mm_flag(mm_items, "has_local_crops")
+        pv = torch.stack([it.feature for it in mm_items], dim=0).type(target_dtype)
+        ic, sc = self._stack_crop_inputs(
+            mm_items,
+            has_local_crops=has_local_crops,
+            target_dtype=target_dtype,
+            device=pv.device,
+        )
+        pv = pv.view(pv.shape[0] * pv.shape[1], 1, *pv.shape[2:])
+        ic = ic.view(ic.shape[0] * ic.shape[1], 1, *ic.shape[2:])
+        sc = sc.view(sc.shape[0] * sc.shape[1], 1, *sc.shape[2:])
+        return pv, ic, sc, has_local_crops, target_dtype
+
+    def _process_image_input_steps(self, mm_items: List[MultimodalDataItem]):
+        """Batch matching crop geometries; encode mixed geometries separately."""
+        if (
+            len(mm_items) > 1
+            and len({tuple(it.images_crop.shape) for it in mm_items}) > 1
+        ):
+            groups = [[it] for it in mm_items]
+        else:
+            groups = [mm_items]
+        feats = []
+        for group in groups:
+            pv, ic, sc, hlc, dtype = self._stack_image_input(group)
+            pages = yield from self._pixel_values_to_embedding_steps(pv, ic, sc, hlc)
+            feats.append(torch.cat(pages, dim=0).type(dtype))
+        return feats[0] if len(feats) == 1 else torch.cat(feats, dim=0)
+
+    def get_image_feature_steps(self, items: List[MultimodalDataItem]):
+        return self._process_image_input_steps(items)
 
     def get_attention_sliding_window_size(self) -> Optional[int]:
         """Use a full KV pool; DASH applies its local window in the kernel."""

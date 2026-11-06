@@ -51,6 +51,10 @@ _NOT_LISTS = {
     "DecodePreallocQueue.pending_reqs",
     # A subset of `waiting_queue`.
     "DllmManager.staging_queue",
+    # Predecessor windows the running batch holds.
+    "DocPrefetch._live",
+    # Early follow-ups the waiting queue or the chunked-prefill slot holds.
+    "DocPrefetch._early_out",
 }
 
 _HOLDS_REQUESTS = re.compile(r"\b(Req|DecodeRequest)\b")

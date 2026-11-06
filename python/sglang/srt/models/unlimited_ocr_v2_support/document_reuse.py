@@ -131,6 +131,14 @@ TAIL_TOKENS = 128
 # window does not transcribe it, so decode resumes past it.
 CONTEXT_PAGES = 1
 
+# Early prefill (MPS, see ``DocReuse.match_early``): a window prefills its new
+# pages while its predecessor decodes, one chunk of this many tokens per this
+# many decode steps, and keeps its last prompt tokens back until that ends. A
+# chunk costs one ~0.15 s forward on MPS, so they are spread apart.
+EARLY_CHUNK_TOKENS = 256
+EARLY_CHUNK_STRIDE = 48
+EARLY_HOLD_TOKENS = 1
+
 
 class TailCopyPlan(msgspec.Struct, frozen=True):
     """Image tail to copy, and the rewritten prompt that matches it.
@@ -494,6 +502,15 @@ class UocrReqState(msgspec.Struct):
     pinned_blocks: List[Any] = []
     # Prefetch: the window has been through ``DocPrefetch.park``.
     released: bool = False
+    # Early prefill: the predecessor still decoding while this window prefills
+    # (``DocReuse.match_early``); None once it ended (``attach_early``).
+    early_source: Optional[Any] = None
+    # Set while ``match_early`` runs the one match that takes the early path.
+    early_go: bool = False
+    # Continuation carries for the text splice, built when the predecessor ends.
+    early_carry: Optional[Tuple[Any, Any, Any]] = None
+    # The early match cannot apply; the window waits for its predecessor.
+    early_failed: bool = False
 
 
 def req_state(req: Req) -> UocrReqState:
@@ -731,6 +748,11 @@ class DocReuse:
         self._ops: Deque[Tuple[Optional[str], Callable[[Any], None]]] = deque()
         # req_pool_idx -> token the next decode step must read instead.
         self._input_overrides: Dict[int, int] = {}
+        # The window held for its decoding predecessor (one at a time: it takes
+        # the scheduler's single chunked-prefill slot), and the decode steps
+        # since it last ran a chunk.
+        self._early_window: Optional[Req] = None
+        self._early_idle = 0
 
     # -- Queued GPU work --
 
@@ -865,15 +887,20 @@ class DocReuse:
             alloc.numel(),
         )
 
-    def on_req_dropped(self, req: Req) -> None:
-        """Release reuse state of a dropped or aborted request, before its row is
-        freed. For one that ran a batch, `_free_pending` finds its slots in that
-        row, and the source and pins go as on the finished-window path."""
+    def _drop_match_state(self, req) -> None:
+        """Undo what a match left behind: queued copies, slots, source, pins."""
         # Its queued copies write slots freed below and read the source window.
         self._cancel(req.rid)
         self._free_pending(req)
         self._release_source(req)
         self._unpin(req)
+
+    def on_req_dropped(self, req: Req) -> None:
+        """Release reuse state of a dropped or aborted request, before its row is
+        freed. For one that ran a batch, `_free_pending` finds its slots in that
+        row, and the source and pins go as on the finished-window path."""
+        self._drop_match_state(req)
+        self._clear_early(req)
 
     def release_doc(self, doc_id: str) -> None:
         """Free a document's retained window once no follow-up will consume it."""
@@ -890,6 +917,7 @@ class DocReuse:
         self.sources.clear()
         self._ops.clear()
         self._input_overrides.clear()
+        self._early_window = None
         if self._backend is not None:
             self._enqueue(None, lambda be: be.unpin_coord_rows(None))
 
@@ -905,6 +933,7 @@ class DocReuse:
 
     def on_retracted(self, req: Req) -> None:
         """Give a retracted rewritten window its original prompt to recompute."""
+        self._clear_early(req)
         st = req.uocr_doc
         if st is None or st.orig_prompt is None:
             return
@@ -927,11 +956,13 @@ class DocReuse:
         """Waiting-queue index for a follow-up window whose source is retained.
 
         A retained window holds a full window of KV until its follow-up runs, so
-        follow-ups go ahead of new documents (in arrival order among themselves).
-        None means append as usual.
+        follow-ups go ahead of new documents (in arrival order among themselves),
+        as does a window held to prefill early. None means append as usual.
         """
         cp = _doc_params(req)
-        if cp is None or not cp.get(KEY_REUSE) or cp[KEY_DOC_ID] not in self.docs:
+        if cp is None or not cp.get(KEY_REUSE):
+            return None
+        if cp[KEY_DOC_ID] not in self.docs and not self.is_held(req):
             return None
         req_state(req).front = True
         pos = 0
@@ -1086,6 +1117,7 @@ class DocReuse:
         cp = _doc_params(req)
         if cp is None:
             return False
+        self._clear_early(req)
         self._release_source(req)
         self._unpin(req)
         if req.finished() and req.uocr_doc is not None:
@@ -1219,14 +1251,24 @@ class DocReuse:
         if cp is None or not cp.get(KEY_REUSE):
             return None
         st = req_state(req)
+        if st.early_source is not None and not st.early_go:
+            # A held window is matched only by the adder that admits it early.
+            return None
         st.match = (None, req.retraction_count)
         if req.retraction_count or req.output_ids:
             return None
-        entry = self.docs.pop(cp[KEY_DOC_ID], None)
-        if entry is None or self._backend is None:
+        if self._backend is None:
             return None
-        st.source = entry
-        self.sources[id(entry)] = entry
+        early = st.early_source is not None
+        if early:
+            entry = self._live_entry(st.early_source)
+        else:
+            entry = self.docs.pop(cp[KEY_DOC_ID], None)
+            if entry is not None:
+                st.source = entry
+                self.sources[id(entry)] = entry
+        if entry is None:
+            return None
         overlap = int(cp.get(KEY_OVERLAP) or 0)
         try:
             result = self._build_reuse(
@@ -1234,6 +1276,7 @@ class DocReuse:
                 entry,
                 overlap=overlap,
                 page_base=int(cp.get(KEY_PAGE_BASE) or 0) + overlap,
+                early=early,
             )
         except Exception:
             logger.exception(
@@ -1243,11 +1286,15 @@ class DocReuse:
         if result is None:
             # Nothing consumes the source entry or the slots the planner may have
             # allocated before it gave up.
-            self.on_req_dropped(req)
+            self._drop_match_state(req)
+            # A held window then waits for its predecessor like any follow-up.
+            st.early_failed = early
         st.match = (result, req.retraction_count)
         return result
 
-    def _build_reuse(self, req, entry: DocEntry, *, overlap: int, page_base: int):
+    def _build_reuse(
+        self, req, entry: DocEntry, *, overlap: int, page_base: int, early: bool = False
+    ):
         from sglang.srt.mem_cache.base_prefix_cache import MatchResult
 
         b = self._backend
@@ -1284,20 +1331,31 @@ class DocReuse:
             )
             return None
 
-        text = text_tail(entry.output_ids, TAIL_TOKENS, page_id)
-        if text is None or len(text[1]) + 2 >= (
-            req.sampling_params.max_new_tokens or 0
-        ):
-            # Only the spliced marker makes decode skip the context page the
-            # rewritten prompt carries, so without text there is nothing to reuse.
-            logger.info(
-                "[Unlimited-OCR v2] %s: no output to continue from; recomputing",
-                req.rid,
-            )
-            return None
-        # The copied KV can still predict EOS where that window stopped; the
-        # forced marker moves decode off it.
-        forced = text[1] + [page_id]
+        if early:
+            # Only a copied lookahead page plus new pages has a prefill to start
+            # before the predecessor's text exists; the rest waits for it.
+            if (
+                plan.copied_pages != 1
+                or len(plan.new_ids) - plan.copy_len <= EARLY_HOLD_TOKENS
+            ):
+                return None
+            text = forced = None
+        else:
+            text = text_tail(entry.output_ids, TAIL_TOKENS, page_id)
+            if text is None or len(text[1]) + 2 >= (
+                req.sampling_params.max_new_tokens or 0
+            ):
+                # Only the spliced marker makes decode skip the context page the
+                # rewritten prompt carries, so without text there is nothing to
+                # reuse.
+                logger.info(
+                    "[Unlimited-OCR v2] %s: no output to continue from; recomputing",
+                    req.rid,
+                )
+                return None
+            # The copied KV can still predict EOS where that window stopped; the
+            # forced marker moves decode off it.
+            forced = text[1] + [page_id]
 
         alloc = self._alloc_prefix_slots(plan.copy_len, bs)
         if alloc is None:
@@ -1310,25 +1368,32 @@ class DocReuse:
             cache.token_to_kv_pool_allocator.free(alloc)
             return None
         _mark_rewritten(req, alloc=alloc, page_base=page_base)
-        req_state(req).text_plan = self._queue_prefix_copy(
-            req,
-            entry=entry,
-            plan=plan,
-            dst=alloc[: plan.copy_len],
-            text=text,
-            forced=forced,
+        carry = self._queue_prefix_copy(
+            req, entry=entry, plan=plan, dst=alloc[: plan.copy_len]
         )
-        logger.info(
-            "[Unlimited-OCR v2] %s: reuse tail copy=%d forced_text=%d copied_pages=%d "
-            "(old_pages=%d new_pages=%d overlap=%d)",
-            req.rid,
-            plan.copy_len,
-            len(forced),
-            plan.copied_pages,
-            plan.old_pages,
-            plan.new_pages,
-            overlap,
-        )
+        if early:
+            req_state(req).early_carry = carry
+            logger.info(
+                "[Unlimited-OCR v2] %s: early reuse tail copy=%d prefill=%d while "
+                "%s decodes",
+                req.rid,
+                plan.copy_len,
+                len(plan.new_ids) - plan.copy_len,
+                entry.holder.rid,
+            )
+        else:
+            req_state(req).text_plan = self._text_plan(entry, carry, text, forced)
+            logger.info(
+                "[Unlimited-OCR v2] %s: reuse tail copy=%d forced_text=%d "
+                "copied_pages=%d (old_pages=%d new_pages=%d overlap=%d)",
+                req.rid,
+                plan.copy_len,
+                len(forced),
+                plan.copied_pages,
+                plan.old_pages,
+                plan.new_pages,
+                overlap,
+            )
         # The prefix KV is not on a tree path: `prefix_device_indices` hands
         # alloc_for_extend the pending slots, and with cache_protected_len 0 the
         # request's row owns (and frees) them from then on. The root anchor is
@@ -1361,10 +1426,8 @@ class DocReuse:
         entry: DocEntry,
         plan: TailCopyPlan,
         dst: torch.Tensor,
-        text: Tuple[int, List[int]],
-        forced: List[int],
-    ) -> TextPlan:
-        """Queue the prefix KV copy and return the text splice for after prefill."""
+    ) -> Tuple[Tuple[int, int, int], Tuple[int, int, List[int]], torch.Tensor]:
+        """Queue the prefix KV copy; return the carries the text splice resumes from."""
         b = self._backend
         page_id = b.page_state.page_token_id
         image_id = b.page_state.image_token_id
@@ -1404,17 +1467,238 @@ class DocReuse:
                 coord=(first_block, prefix_carry[0], prefix_carry[1], prefix_carry[2]),
             ),
         )
+        return gen_iso, gen_coord, first_block
 
-        start = len(entry.input_ids) + text[0]
-        n_copy_text = len(forced) - 1
-        text_src = old_row[start : start + n_copy_text].to(torch.int64).clone()
+    def _text_plan(
+        self,
+        entry: DocEntry,
+        carry,
+        text: Optional[Tuple[int, List[int]]],
+        forced: List[int],
+    ) -> TextPlan:
+        """The text splice for after prefill: ``forced`` copied from ``entry``.
+
+        With no ``text`` only the marker is spliced (see ``_splice_text``).
+        """
+        iso, coord, first_block = carry
+        if text is None:
+            src_slots = torch.empty(0, dtype=torch.int64, device=first_block.device)
+        else:
+            old_row = self._cache.req_to_token_pool.req_to_token[
+                entry.holder.kv.req_pool_idx
+            ]
+            start = len(entry.input_ids) + text[0]
+            n_copy_text = len(forced) - 1
+            src_slots = old_row[start : start + n_copy_text].to(torch.int64).clone()
         return TextPlan(
             forced=forced,
-            src_slots=text_src,
-            iso=gen_iso,
-            coord=gen_coord,
+            src_slots=src_slots,
+            iso=iso,
+            coord=coord,
             first_block=first_block,
         )
+
+    # -- Early prefill (MPS) --
+    #
+    # A follow-up's boundary is the LM prefill of its new pages, with nothing to
+    # decode meanwhile. Their KV depends on the predecessor's prompt, not on its
+    # text, so a window can prefill them while the predecessor still decodes: it
+    # is admitted as the scheduler's one chunked request, runs a chunk every
+    # EARLY_CHUNK_STRIDE decode steps and keeps EARLY_HOLD_TOKENS back. When the
+    # predecessor ends, ``attach_early`` adds the text splice and the last chunk
+    # runs like any follow-up's prefill.
+
+    def is_held(self, req) -> bool:
+        """Whether ``req`` waits for its decoding predecessor to end."""
+        st = req.uocr_doc
+        return st is not None and st.early_source is not None
+
+    def early_busy(self) -> bool:
+        """Whether a window holds the chunked-prefill slot for its predecessor."""
+        return self._early_window is not None
+
+    def _live_entry(self, pred) -> Optional[DocEntry]:
+        """A predecessor still decoding, seen as a retained window with no text."""
+        b = self._backend
+        cp = _doc_params(pred)
+        if b is None or cp is None or pred.finished() or not pred.kv.holds_kv:
+            return None
+        lookahead = int(cp.get(KEY_LOOKAHEAD) or 0)
+        overlap = int(cp.get(KEY_OVERLAP) or 0)
+        next_page = next_page_after(
+            pred.origin_input_ids,
+            int(cp.get(KEY_PAGE_BASE) or 0) + overlap,
+            _context_pages(pred) or overlap,
+            b.page_state.page_token_id,
+            b.page_state.image_token_id,
+            lookahead=lookahead,
+        )
+        if next_page is None:
+            return None
+        return DocEntry(
+            holder=pred,
+            input_ids=list(pred.origin_input_ids),
+            output_ids=[],
+            next_page=next_page,
+            lookahead=lookahead,
+        )
+
+    def can_start_early(self, req, pred) -> bool:
+        """Whether ``req`` has new pages to prefill against ``pred``'s prompt.
+
+        A window that never can (no copied page, nothing past it) is marked so
+        the caller stops asking.
+        """
+        b = self._backend
+        cp = _doc_params(req)
+        if b is None or cp is None or not cp.get(KEY_REUSE):
+            return False
+        if req.retraction_count or req.output_ids:
+            return False
+        entry = self._live_entry(pred)
+        if entry is None:
+            return False
+        overlap = int(cp.get(KEY_OVERLAP) or 0)
+        plan = None
+        if entry.next_page == int(cp.get(KEY_PAGE_BASE) or 0) + overlap:
+            plan = plan_tail_copy(
+                entry.input_ids,
+                list(req.origin_input_ids),
+                overlap,
+                b.page_state.page_token_id,
+                b.page_state.image_token_id,
+                b.block_size,
+                old_lookahead=entry.lookahead,
+            )
+        if (
+            plan is None
+            or plan.copied_pages != 1
+            or len(plan.new_ids) - plan.copy_len <= EARLY_HOLD_TOKENS
+        ):
+            req_state(req).early_failed = True
+            return False
+        return True
+
+    def hold(self, req, pred) -> None:
+        """Make ``req`` wait for ``pred``, prefilling its new pages meanwhile."""
+        st = req_state(req)
+        st.early_source = pred
+        st.early_failed = False
+        self._early_window = req
+        self._early_idle = 0
+
+    def match_early(self, req, tree_cache) -> bool:
+        """Match a held window against its live predecessor; True if it took.
+
+        Runs the request's normal round setup again, now letting
+        ``try_match_prefix`` take the early path.
+        """
+        st = req.uocr_doc
+        if (
+            st is None
+            or st.early_source is None
+            or st.early_failed
+            or st.match is not None
+        ):
+            return False
+        st.early_go = True
+        try:
+            req.init_next_round_input(tree_cache)
+        finally:
+            st.early_go = False
+        return st.early_carry is not None
+
+    def unmatch_early(self, req) -> None:
+        """Undo ``match_early`` for a held window the adder did not admit.
+
+        It then waits for its predecessor like any follow-up.
+        """
+        self._drop_match_state(req)
+        _restore_prompt(req)
+        st = req_state(req)
+        st.early_carry = None
+        st.early_failed = True
+        st.match = None
+        req.prefix_len = 0
+        req.kv.protect_prefix(0)
+
+    def _early_left(self, req) -> int:
+        """Prompt tokens a held window may still prefill before its predecessor ends."""
+        return len(req.full_untruncated_fill_ids) - req.prefix_len - EARLY_HOLD_TOKENS
+
+    def early_first_chunk(self, req) -> int:
+        return min(EARLY_CHUNK_TOKENS, self._early_left(req))
+
+    def early_chunk_cap(self, req) -> Optional[int]:
+        """Tokens a held window's next chunk may take; 0 parks it, None: not held."""
+        st = req.uocr_doc
+        if st is None or st.early_source is None or st.early_carry is None:
+            return None
+        left = self._early_left(req)
+        if left <= 0 or self._early_idle < EARLY_CHUNK_STRIDE:
+            return 0
+        return min(EARLY_CHUNK_TOKENS, left)
+
+    def note_forward(self, batch: ScheduleBatch) -> None:
+        """Pace a held window's chunks by its predecessor's decode steps."""
+        if self._early_window is None or batch.forward_mode is None:
+            return
+        if batch.forward_mode.is_decode():
+            self._early_idle += 1
+        elif batch.forward_mode.is_extend() and any(
+            r is self._early_window for r in batch.reqs
+        ):
+            self._early_idle = 0
+
+    def attach_early(self, req) -> None:
+        """Release a held window: its predecessor ended, retained or not."""
+        st = req.uocr_doc
+        if st is None or st.early_source is None:
+            return
+        carry = st.early_carry
+        self._clear_early(req)
+        st.early_failed = False
+        if carry is None:
+            # Never matched early: it reuses the retained window like any follow-up.
+            st.match = None
+            return
+        cp = _doc_params(req)
+        page_id = self._backend.page_state.page_token_id
+        overlap = int(cp.get(KEY_OVERLAP) or 0)
+        entry = self.docs.get(cp[KEY_DOC_ID])
+        text = None
+        if (
+            entry is not None
+            and entry.next_page == int(cp.get(KEY_PAGE_BASE) or 0) + overlap
+        ):
+            self.docs.pop(cp[KEY_DOC_ID])
+            st.source = entry
+            self.sources[id(entry)] = entry
+            text = text_tail(entry.output_ids, TAIL_TOKENS, page_id)
+            if text is not None and len(text[1]) + 2 >= (
+                req.sampling_params.max_new_tokens or 0
+            ):
+                text = None
+        # Without the predecessor's text only the marker is spliced: the window
+        # still decodes its own page, without the previous page's text as context.
+        forced = [page_id] if text is None else text[1] + [page_id]
+        st.text_plan = self._text_plan(entry, carry, text, forced)
+        logger.info(
+            "[Unlimited-OCR v2] %s: early window released, %d prompt tokens left, "
+            "forced_text=%d",
+            req.rid,
+            len(req.full_untruncated_fill_ids) - req.prefix_len,
+            len(forced),
+        )
+
+    def _clear_early(self, req) -> None:
+        st = req.uocr_doc
+        if st is not None:
+            st.early_source = None
+            st.early_go = False
+            st.early_carry = None
+        if self._early_window is req:
+            self._early_window = None
 
     # -- After the follow-up's prefill --
 

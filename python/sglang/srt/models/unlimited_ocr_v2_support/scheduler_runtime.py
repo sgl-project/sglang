@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.overlap_utils import resolve_forward_inputs
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
@@ -94,11 +95,21 @@ class UocrSchedulerRuntime:
         self._reuse = DocReuse(
             cache=tree_cache,
             backend=backend,
-            on_window_finished=self._prefetch.on_window_finished,
+            on_window_finished=self._window_finished,
         )
         if backend is not None:
             backend.attach_doc_reuse(self._reuse)
         tree_cache.enable_uocr_doc_reuse(self._reuse)
+        # MPS runs one command queue, so a follow-up's prefill at the window
+        # boundary stalls the stream; there it starts under the previous decode.
+        self._early_prefill = (
+            backend is not None
+            and device.type == "mps"
+            and not enable_overlap
+            and tp_size == 1
+            and envs.SGLANG_ENABLE_UOCR_DOC_PREFETCH.get()
+            and envs.SGLANG_ENABLE_UOCR_DOC_EARLY_PREFILL.get()
+        )
         # Resolved per step: a decode-graph recapture replaces the runner's I/O.
         self._decode_graph_io = decode_graph_io
         self._last_graph_io: Optional[UOCRDecodeGraphIO] = None
@@ -106,8 +117,24 @@ class UocrSchedulerRuntime:
     # -- Waiting queue and admission --
 
     def take_released(self) -> List[Req]:
-        """Parked windows whose predecessor finished, to queue in this order."""
-        return self._prefetch.take_released()
+        """Parked windows whose predecessor finished, to queue in this order.
+
+        Plus, on MPS, one parked window to prefill before its predecessor ends.
+        """
+        released = self._prefetch.take_released()
+        if self._early_prefill and not self._reuse.early_busy():
+            for req, pred in self._prefetch.early_candidates():
+                if self._reuse.can_start_early(req, pred):
+                    self._prefetch.start_early(req)
+                    self._reuse.hold(req, pred)
+                    released.append(req)
+                    break
+        return released
+
+    def _window_finished(self, req: Req) -> None:
+        """Release the follow-ups of a finished window, held early ones included."""
+        for follow in self._prefetch.on_window_finished(req):
+            self._reuse.attach_early(follow)
 
     def request_lists(self) -> Dict[ListKind, ReqList]:
         return self._prefetch.request_lists()
@@ -116,6 +143,7 @@ class UocrSchedulerRuntime:
         """Release reuse and prefetch state of a dropped or aborted request."""
         self._reuse.on_req_dropped(req)
         self._prefetch.release_early(req.rid)
+        self._prefetch.forget_early(req.rid)
 
     def free_for_decode(self, batch: ScheduleBatch) -> None:
         """Evict retained windows before the decode batch would retract."""
@@ -197,8 +225,15 @@ class UocrSchedulerRuntime:
     def after_forward(
         self, batch: ScheduleBatch, *, chunked_req: Optional[Req]
     ) -> None:
-        """Splice the overlap pages' text into windows whose prefill just ran."""
+        """Splice the overlap pages' text into windows whose prefill just ran.
+
+        On MPS, also pace the early prefill and the parked windows' encode.
+        """
         self._reuse.after_prefill_forward(batch, chunked_req=chunked_req)
+        if self._early_prefill:
+            self._prefetch.note_running(batch)
+            self._reuse.note_forward(batch)
+        self._prefetch.step()
 
     # -- Results and accounting --
 
@@ -233,6 +268,9 @@ class UocrSchedulerRuntime:
         """queue a follow-up in reuse order, or keep it parked until its source finishes"""
         if is_retracted:
             self._reuse.on_retracted(req)
+            # An early window retracted while its predecessor runs waits again.
+            if self._prefetch.repark_early(req):
+                return False
         if not is_retracted and self._prefetch.park(req):
             return False
         pos = self._reuse.queue_position(waiting_queue, req)

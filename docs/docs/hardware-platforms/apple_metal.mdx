@@ -115,6 +115,7 @@ sglang serve \
 
 - `--max-total-tokens` caps the KV pool. On a 16 GB Mac the default pool leaves too little memory for the vision encoder and the system starts swapping.
 - Requests that send `DeepseekOCRNoRepeatNGramLogitProcessor` as `custom_logit_processor` need `--enable-custom-logit-processor`.
+- With `--uocr-doc-split`, the next window's pages are encoded while the current window still decodes: the vision encoder runs in short slices between decode steps. The window's new page is then prefilled in 256-token chunks, also before the current window ends, so the stream does not stop at the window boundary for that prefill. On an M5 with 16 GB and three gundam pages, the longest pause in the stream drops from 1.4 s at the first window boundary to 0.2 s (each prefill chunk), and decode slows to about 50 tokens/s while the next window's pages are encoded. Set `SGLANG_ENABLE_UOCR_DOC_EARLY_PREFILL=0` to prefill at the boundary instead.
 - Overlap scheduling and CUDA graphs are not available on MPS. The first request of each new image geometry also pays for compiling the PyTorch MPS graphs of the vision encoder.
 
 On an M5 MacBook Pro with 16 GB of memory, one document decodes at about 70 tokens/s.

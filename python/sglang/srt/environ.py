@@ -1762,6 +1762,8 @@ class Envs:
     SGLANG_ENABLE_UOCR_DOC_PREFETCH = EnvBool(True)
     # GPU memory for early-encoded follow-up pages; past it they encode at prefill.
     SGLANG_UOCR_DOC_PREFETCH_MAX_MB = EnvInt(1024)
+    # MPS: prefill that window's new pages in chunks while the current one decodes.
+    SGLANG_ENABLE_UOCR_DOC_EARLY_PREFILL = EnvBool(True)
     # Stage Unlimited-OCR crops in pinned host memory ahead of the forward.
     SGLANG_ENABLE_UOCR_CROP_PREFETCH = EnvBool(True)
     # Pinned host memory for prefetched crops; past it crops stage inline.
