@@ -9,9 +9,9 @@ from sglang.srt.arg_groups.model_override_base import (
     resolving_view,
 )
 from sglang.srt.arg_groups.model_overrides import minimax_m3_hip as _hip
+from sglang.srt.configs.quant_utils import get_quantization_config
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils.common import get_quantization_config
 
 logger = logging.getLogger(__name__)
 

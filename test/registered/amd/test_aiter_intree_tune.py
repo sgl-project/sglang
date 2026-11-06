@@ -91,7 +91,7 @@ class TestHipblasltRows(CustomTestCase):
                 with (
                     self.subTest(rocm=rocm),
                     mock.patch(
-                        "sglang.srt.utils.common.get_hip_version", return_value=rocm
+                        "sglang.srt.utils.device.get_hip_version", return_value=rocm
                     ),
                 ):
                     out = tables.read_intree_rows(tables.GEMM_BF16, csvs)

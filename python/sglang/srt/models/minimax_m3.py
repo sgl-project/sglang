@@ -39,6 +39,7 @@ from sglang.srt.configs.model_config import (
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
+from sglang.srt.hf_transformers import get_rope_config
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
@@ -82,7 +83,8 @@ from sglang.srt.layers.quantization.mxfp8_input import (
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer
-from sglang.srt.layers.utils.common import get_layer_id
+from sglang.srt.layers.utils.common import add_prefix, get_layer_id
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -123,16 +125,13 @@ from sglang.srt.runtime_context import (
     get_stream,
 )
 from sglang.srt.utils import (
-    add_prefix,
     get_device_sm,
     is_cuda,
     is_gfx95_supported,
     is_hip,
     is_npu,
     log_info_on_rank0,
-    make_pp_layers,
 )
-from sglang.srt.utils.hf_transformers import get_rope_config
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -954,7 +953,6 @@ class MiniMaxM3Attention(nn.Module):
         # only the Blackwell NVFP4 backend consumes FP8 Q; gate on the predicate that selects it
         self._fp8_q_epilogue_ok = (
             self._combined_qknorm_ok
-            and envs.SGLANG_OPT_USE_MINIMAX_FP8_Q_EPILOGUE.get()
             and uses_minimax_m3_nvfp4_native_stack(
                 quant_config.get_name() if quant_config is not None else None
             )
