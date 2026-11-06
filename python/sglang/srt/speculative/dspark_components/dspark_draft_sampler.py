@@ -17,6 +17,9 @@ from sglang.srt.speculative.dspark_components.dspark_draft import (
     select_draft_hidden_without_anchor,
     step_logits_width,
 )
+from sglang.srt.speculative.online_acceptance_estimator import (
+    OnlineAcceptanceEstimator,
+)
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync
 from sglang.srt.utils import is_xpu
 
@@ -42,6 +45,7 @@ class DsparkDraftSampler:
         greedy_draft: bool,
         sharded_accept: bool = False,
         out=None,
+        acceptance_estimator: Optional[OnlineAcceptanceEstimator] = None,
     ):
         self.model = model
         self.markov_head = model.markov_head
@@ -65,7 +69,15 @@ class DsparkDraftSampler:
                 (self.max_bs, self.gamma + 1), dtype=torch.int64, device=device
             )
         confidence_head = model.confidence_head
-        if confidence_head is None:
+        self.acceptance_estimator = acceptance_estimator
+        self.acceptance_features_out: Optional[torch.Tensor] = None
+        if acceptance_estimator is not None:
+            self.acceptance_features_out = torch.empty(
+                (self.max_bs, self.gamma), dtype=torch.float32, device=device
+            )
+            self.confidence_out = torch.empty_like(self.acceptance_features_out)
+            self.confidence_raw_out = None
+        elif confidence_head is None:
             self.confidence_out = self.confidence_raw_out = None
         else:
             self.confidence_out = torch.empty(
@@ -109,6 +121,7 @@ class DsparkDraftSampler:
                 dtype=self.markov_head.step_logits_dtype(torch.bfloat16),
                 device=self.out.device,
             ),
+            specialize=acceptance_estimator is None,
         )
         self._draft_strategy = bound_strategy.strategy
         self.step_logits = bound_strategy.step_logits
@@ -154,7 +167,14 @@ class DsparkDraftSampler:
             batch_size=bs,
             stock=self._markov_block,
         )
-        if self.confidence_out is not None:
+        if self.acceptance_estimator is not None:
+            self.acceptance_estimator.predict(
+                logits=self.step_logits[:bs],
+                temperatures=self.params.step_temperatures[:bs],
+                features_out=self.acceptance_features_out[:bs],
+                predictions_out=self.confidence_out[:bs],
+            )
+        elif self.confidence_out is not None:
             confidence, confidence_raw = self.model.compute_confidence(
                 anchor_tokens=anchor,
                 draft_tokens=draft_tokens,
@@ -209,6 +229,7 @@ def maybe_build_draft_sampler(
     tp_sync: SpecTpSync,
     sharded_accept: bool = False,
     out=None,
+    acceptance_estimator: Optional[OnlineAcceptanceEstimator] = None,
 ) -> Optional[DsparkDraftSampler]:
     """Build the graph-folded draft sampler, or None (reason logged) when the
     proposal must stay eager."""
@@ -232,6 +253,7 @@ def maybe_build_draft_sampler(
         greedy_draft=greedy_draft,
         sharded_accept=sharded_accept,
         out=out,
+        acceptance_estimator=acceptance_estimator,
     )
     if tp_rank == 0:
         logger.info(

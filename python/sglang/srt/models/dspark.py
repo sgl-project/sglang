@@ -25,12 +25,9 @@ from sglang.srt.models.dflash import DFlashDraftModel, DFlashMLAAttention
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dflash_utils import can_dflash_slice_qkv_weight
 from sglang.srt.speculative.dspark_components.dspark_config import (
+    builds_confidence_head,
     get_dspark_sample_from_anchor,
     parse_dspark_draft_config,
-)
-from sglang.srt.speculative.ragged_verify import (
-    RaggedVerifyMode,
-    read_ragged_verify_mode,
 )
 from sglang.srt.utils import is_gfx95_supported
 from sglang.srt.utils.invariants import Bucket, InClosedRange, Invariant, expect
@@ -486,13 +483,8 @@ class DSparkConfidenceHead(nn.Module):
 
 
 def build_confidence_head(config) -> Optional[nn.Module]:
-    if read_ragged_verify_mode() is RaggedVerifyMode.STATIC:
+    if not builds_confidence_head(config):
         return None
-    if not hasattr(config, "enable_confidence_head"):
-        logger.warning(
-            "DSpark draft config has no enable_confidence_head field; treating the "
-            "confidence head as enabled."
-        )
     hidden_size = int(config.hidden_size)
     markov_rank = int(getattr(config, "markov_rank", 0))
     with_markov = bool(getattr(config, "confidence_head_with_markov", markov_rank > 0))
@@ -698,7 +690,7 @@ class DSparkDraftMixin:
             raise ValueError(
                 f"DSpark confidence head is enabled but the checkpoint is missing "
                 f"{sorted(missing)}. Provide a checkpoint with trained confidence weights, "
-                f"or disable the confidence head (enable_confidence_head=False)."
+                f"or use --speculative-confidence-source online."
             )
 
     def _fused_kv_write_bundle(self, pool):
