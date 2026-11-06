@@ -26,8 +26,8 @@ from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.utils.async_probe import maybe_detect_nan, sanitize_nan_logits
-from sglang.srt.utils.common import (
-    get_bool_env_var,
+from sglang.srt.utils.common import get_bool_env_var
+from sglang.srt.utils.device import (
     is_cuda,
     is_gfx1250_supported,
     is_hip,

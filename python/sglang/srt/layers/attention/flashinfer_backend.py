@@ -41,6 +41,7 @@ from sglang.srt.layers.cp.base import (
     get_cp_strategy,
 )
 from sglang.srt.layers.cp.utils import is_cp_active
+from sglang.srt.layers.dp_attention import get_cuda_graph_max_batch_size
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     KVCacheAttentionAccessKind,
 )
@@ -71,12 +72,7 @@ from sglang.srt.speculative.spec_utils import (
     fill_draft_window_rail,
     resolve_draft_decode_window,
 )
-from sglang.srt.utils import (
-    get_cuda_graph_max_batch_size,
-    get_int_env_var,
-    is_flashinfer_available,
-    next_power_of_2,
-)
+from sglang.srt.utils import get_int_env_var, is_flashinfer_available, next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention

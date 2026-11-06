@@ -25,11 +25,8 @@ from sglang.srt.layers.quantization.online_quantization import CopyNumelCounter
 from sglang.srt.layers.quantization.quark.schemes import QuarkLinearScheme
 from sglang.srt.layers.quantization.quark.utils import Nvfp4SourceConfig
 from sglang.srt.utils import is_hip
-from sglang.srt.utils.common import (
-    direct_register_custom_op,
-    is_gfx95_supported,
-    is_gfx1250_supported,
-)
+from sglang.srt.utils.custom_op import direct_register_custom_op
+from sglang.srt.utils.device import is_gfx95_supported, is_gfx1250_supported
 
 NVFP4_BLOCK_SIZE = 16
 

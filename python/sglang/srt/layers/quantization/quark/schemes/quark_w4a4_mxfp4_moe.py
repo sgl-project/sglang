@@ -23,12 +23,12 @@ from sglang.srt.layers.quantization.mxfp4 import (
 from sglang.srt.layers.quantization.online_quantization import CopyNumelCounter
 from sglang.srt.layers.quantization.quark.schemes import QuarkMoEScheme
 from sglang.srt.layers.quantization.quark.utils import Nvfp4SourceConfig
+from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.utils import (
     get_bool_env_var,
     is_gfx95_supported,
     is_gfx1250_supported,
     is_hip,
-    set_weight_attrs,
 )
 
 NVFP4_BLOCK_SIZE = 16

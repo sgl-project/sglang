@@ -66,7 +66,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_spec,
 )
-from sglang.srt.utils.common import (
+from sglang.srt.utils.device import (
     async_d2h,
     is_cpu,
     is_gfx1250_supported,
