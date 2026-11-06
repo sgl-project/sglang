@@ -254,6 +254,13 @@ def handle_model_specific_adjustments(server_args: Any):
         apply_kimi_k3_linear_attn_defaults(server_args)
         apply_kimi_k3_spec_backend_defaults(server_args)
 
+    if model_arch == "UnlimitedOCRV2ForCausalLM":
+        from sglang.srt.arg_groups.model_overrides.unlimited_ocr_v2 import (
+            apply_unlimited_ocr_v2_mps_defaults,
+        )
+
+        apply_unlimited_ocr_v2_mps_defaults(server_args)
+
     if model_arch == "Glm5NextForConditionalGeneration":
         from sglang.srt.arg_groups.glm5_next_hook import (
             apply_glm5_next_spec_backend_defaults,

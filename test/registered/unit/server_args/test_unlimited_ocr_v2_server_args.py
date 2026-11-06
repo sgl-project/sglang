@@ -60,6 +60,43 @@ class TestUnsupportedServingModes(CustomTestCase):
         self.assertEqual(overrides["attention_backend"], "unlimited_ocr_v2")
         self.assertEqual(overrides["page_size"], 32)
 
+    def test_mps_enables_startup_warmup_and_window_kv_cap_by_default(self):
+        from unittest import mock
+
+        from sglang.srt.arg_groups.model_overrides import unlimited_ocr_v2 as uocr_ov
+
+        def run(*, mem_mib=12124, **fields):
+            sa = ServerArgs(model_path="/tmp/uocr", device="mps", **fields)
+            with (
+                mock.patch.object(uocr_ov, "use_mlx", return_value=False),
+                mock.patch.object(
+                    uocr_ov, "get_device_memory_capacity", return_value=mem_mib
+                ),
+            ):
+                uocr_ov.apply_unlimited_ocr_v2_mps_defaults(sa)
+            return {
+                k: v
+                for _, decl in getattr(sa, "_resolved_overrides", ())
+                for k, v in decl.items()
+            }
+
+        # 16 GB Mac (~12 GiB recommended working set) -> 1 window (15,168 tokens).
+        resolved_16g = run(uocr_doc_split=True, uocr_max_page_tokens=8000)
+        self.assertEqual(resolved_16g.get("warmups"), "unlimited_ocr_v2")
+        self.assertEqual(resolved_16g.get("max_total_tokens"), 15168)
+        # 64 GB Mac (~48 GiB working set) scales up to 5 windows (75,840 tokens).
+        resolved_64g = run(
+            mem_mib=48 * 1024, uocr_doc_split=True, uocr_max_page_tokens=8000
+        )
+        self.assertEqual(resolved_64g.get("max_total_tokens"), 5 * 15168)
+        self.assertNotIn("warmups", run(skip_server_warmup=True))
+        self.assertNotIn("warmups", run(warmups="custom"))
+        self.assertNotIn(
+            "max_total_tokens",
+            run(uocr_doc_split=True, uocr_max_page_tokens=8000, max_total_tokens=16384),
+        )
+        self.assertNotIn("max_total_tokens", run(uocr_doc_split=False))
+
     def test_data_parallelism_is_rejected_while_documents_split(self):
         for fields in ({"dp_size": 2}, {"attn_dp_size": 2, "tp_size": 2}):
             with self.subTest(**fields):
