@@ -237,6 +237,7 @@ def _forget_parent_executor_wakeups():
 class BaseMultimodalProcessor(ABC):
     models = []
     gpu_image_decode = True  # Enable GPU decoding by default
+    npu_image_decode = True  # Enable NPU decoding by default
     smart_rgb_conversion = False
     video_preprocessing_device = None
     # Redo preprocessing on CPU when the GPU runs out of memory (the tokenizer
@@ -505,6 +506,7 @@ class BaseMultimodalProcessor(ABC):
                 f"{type(self._processor).__qualname__}"
             ),
             "gpu_image_decode": self.gpu_image_decode,
+            "npu_image_decode": self.npu_image_decode,
             "image_processor_backend": self.image_processor_backend,
             "feature_transport": self.mm_feature_transport,
             "image_config": self.image_config,
@@ -827,7 +829,7 @@ class BaseMultimodalProcessor(ABC):
                 and processor.video_processor is not None
             ):
                 npu_apply_minimax_m3_video_preprocess_patch(processor.video_processor)
-            return "npu"
+            return f"npu:{server_args.base_gpu_id}"
         if processor.__class__.__name__ not in {"Glm4vProcessor", "Glm46VProcessor"}:
             # For qwen-vl, the processor hits a reshape issue from the Ascend
             # dims restriction.
@@ -836,14 +838,17 @@ class BaseMultimodalProcessor(ABC):
             )
 
             npu_apply_qwen_image_preprocess_patch()
-            return "npu"
+            return f"npu:{server_args.base_gpu_id}"
         if processor.__class__.__name__ == "Glm46VProcessor":
             from sglang.srt.hardware_backend.npu.modules.glm46v_processor import (
                 npu_apply_glm46v_image_preprocess_patch,
             )
 
             npu_apply_glm46v_image_preprocess_patch()
-            return "npu"
+            return f"npu:{server_args.base_gpu_id}"
+        if processor.__class__.__name__ == "Glm4vProcessor":
+            # GLM-4V patch extraction exceeds the NPU tensor dimension limit.
+            return "cpu"
         return None
 
     @contextmanager
@@ -1024,9 +1029,13 @@ class BaseMultimodalProcessor(ABC):
             return data
         try:
             if modality == Modality.IMAGE:
-                img, _ = load_image(data, cls.gpu_image_decode)
+                img, _ = load_image(
+                    data,
+                    gpu_image_decode=cls.gpu_image_decode,
+                    npu_image_decode=cls.npu_image_decode,
+                )
                 if isinstance(img, torch.Tensor):
-                    return img  # JPEG already decoded on GPU by nvJPEG
+                    return img  # JPEG already decoded to a device tensor
                 # PIL decodes lazily; do it here in the io worker so the decode
                 # doesn't run later on the event-loop thread.
                 if discard_alpha_channel:

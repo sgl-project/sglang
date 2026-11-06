@@ -157,7 +157,11 @@ class MediaArtifactCacheMixin:
         if isinstance(data, Image.Image):
             data.load()
             return data
-        image, _ = load_image(data, self.gpu_image_decode)
+        image, _ = load_image(
+            data,
+            gpu_image_decode=self.gpu_image_decode,
+            npu_image_decode=self.npu_image_decode,
+        )
         if isinstance(image, Image.Image):
             image.load()
         return image
