@@ -420,10 +420,11 @@ def _case_qo_indptr(tc):
     torch.manual_seed(17)
     cls = ragged_verify_kernels.BuildQoIndptr
     for dtype in (torch.int32, torch.int64):
-        verify_lens = _ri(1, 8, (129,), dtype)  # straddles the 128 block
-        ref = cls.torch(verify_lens=verify_lens)
-        got = cls.triton(verify_lens=verify_lens.to(torch.int32))
-        tc._eq(got, ref)
+        for bs in (129, 600):
+            verify_lens = _ri(1, 8, (bs,), dtype)
+            ref = cls.torch(verify_lens=verify_lens)
+            got = cls.triton(verify_lens=verify_lens.to(torch.int32))
+            tc._eq(got, ref)
     # Aliasing regression: the two outputs must not share storage.
     vl = torch.tensor([3, 1, 5], device=DEVICE, dtype=torch.int32)
     got = cls.triton(verify_lens=vl)

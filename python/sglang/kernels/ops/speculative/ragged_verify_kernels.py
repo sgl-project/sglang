@@ -65,7 +65,7 @@ def build_qo_indptr(*, verify_lens: torch.Tensor) -> QoIndptrResult:
     return QoIndptrResult(qo_indptr=qo_indptr, extend_start_loc=extend_start_loc)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["bs"])
 def _qo_indptr_kernel(
     verify_lens_ptr,
     qo_indptr_ptr,
@@ -73,14 +73,16 @@ def _qo_indptr_kernel(
     bs,
     BLOCK: tl.constexpr,
 ):
-    idx = tl.arange(0, BLOCK)
-    valid = idx < bs
-    vl = tl.load(verify_lens_ptr + idx, mask=valid, other=0).to(tl.int32)
-    incl = tl.cumsum(vl, axis=0)
-    excl = incl - vl
     tl.store(qo_indptr_ptr, 0)
-    tl.store(qo_indptr_ptr + 1 + idx, incl, mask=valid)
-    tl.store(extend_start_loc_ptr + idx, excl, mask=valid)
+    total = 0
+    for row0 in range(0, bs, BLOCK):
+        idx = row0 + tl.arange(0, BLOCK)
+        valid = idx < bs
+        vl = tl.load(verify_lens_ptr + idx, mask=valid, other=0).to(tl.int32)
+        incl = total + tl.cumsum(vl, axis=0)
+        tl.store(qo_indptr_ptr + 1 + idx, incl, mask=valid)
+        tl.store(extend_start_loc_ptr + idx, incl - vl, mask=valid)
+        total += tl.sum(vl, axis=0)
 
 
 def build_qo_indptr_triton(*, verify_lens: torch.Tensor) -> QoIndptrResult:
@@ -89,13 +91,12 @@ def build_qo_indptr_triton(*, verify_lens: torch.Tensor) -> QoIndptrResult:
     verify_lens = verify_lens.contiguous()
     qo_indptr = torch.empty(bs + 1, dtype=torch.int32, device=device)
     extend_start_loc = torch.empty(bs, dtype=torch.int32, device=device)
-    BLOCK = triton.next_power_of_2(max(bs, 1))
     _qo_indptr_kernel[(1,)](
         verify_lens,
         qo_indptr,
         extend_start_loc,
         bs,
-        BLOCK=BLOCK,
+        BLOCK=256,
     )
     return QoIndptrResult(qo_indptr=qo_indptr, extend_start_loc=extend_start_loc)
 
