@@ -2245,7 +2245,7 @@ def load_video(video_file: Union[str, bytes, VideoData], use_gpu: bool = True):
     if source is None:
         raise ValueError(f"Unsupported video input type: {type(video_file)}")
 
-    device = "cuda" if use_gpu else "cpu"
+    device = _video_decode_device(use_gpu=use_gpu)
     try:
         return VideoDecoderWrapper(source, device=device)
     except (ImportError, MemoryError):
@@ -2253,6 +2253,17 @@ def load_video(video_file: Union[str, bytes, VideoData], use_gpu: bool = True):
     except Exception as e:
         # Broad on purpose: torchcodec raises RuntimeError, decord its own type.
         raise ValueError(f"Could not decode video: {e}") from e
+
+
+def _video_decode_device(*, use_gpu: bool) -> str:
+    """CPU unless use_gpu; then CUDA as before, or on XPU the media engine when usable."""
+    if not use_gpu:
+        return "cpu"
+    if is_xpu():
+        from sglang.srt.utils.video_decoder_xpu import xpu_video_decode_device
+
+        return xpu_video_decode_device() or "cpu"
+    return "cuda"
 
 
 def sample_video_frames(video, *, desired_fps: int, max_frames: int) -> list[int]:

@@ -2,6 +2,7 @@
 
 import logging
 import os
+from contextlib import nullcontext
 
 import numpy as np
 
@@ -33,6 +34,13 @@ def _try_cuda_backend() -> bool:
     return _cuda_backend_enabled
 
 
+def _try_xpu_backend() -> bool:
+    # Lazy import: keeps torch/XPU out of the module import path.
+    from sglang.srt.utils.video_decoder_xpu import xpu_video_decode_device
+
+    return xpu_video_decode_device() is not None
+
+
 def _is_cpu_engine() -> bool:
     # Lazy import to avoid circular dependency issues and unnecessary imports on module load
     from sglang.srt.utils.common import is_cpu
@@ -40,15 +48,21 @@ def _is_cpu_engine() -> bool:
     return is_cpu()
 
 
+def _as_output(data):
+    return data if data.device.type != "cpu" else data.numpy()
+
+
 class VideoDecoderWrapper:
     """Unified video decoder that uses torchcodec when available, decord as fallback.
 
-    All frames are returned in NHWC uint8 numpy format for consistency.
+    All frames are returned in NHWC uint8 format: numpy on the CPU, a torch
+    tensor on an accelerator (CUDA or XPU).
     """
 
     def __init__(self, source, device: str = "cpu", num_decode_threads: int = 0):
         """source: file path (str) or video bytes.
-        device: "cpu" or "cuda". GPU decoding only supported with torchcodec.
+        device: "cpu", "cuda" or "xpu[:N]". GPU decoding only supported with
+            torchcodec; XPU additionally needs the torchcodec-xpu plugin.
         num_decode_threads: number of parallel decoder instances for frame
             extraction (torchcodec only). 0 = auto (capped at 16),
             1 = single decoder. Set > 1 to split frame indices across
@@ -59,21 +73,38 @@ class VideoDecoderWrapper:
         self._source_bytes = source if isinstance(source, bytes) else None
         self._source_path = source if isinstance(source, str) else None
         self._tmp_path = None
+        self._tc_kwargs = {}
         if _BACKEND == "torchcodec":
             kwargs = {"dimension_order": "NHWC"}
             if device == "cuda" and _try_cuda_backend():
                 kwargs["device"] = "cuda"
+            elif device.startswith("xpu") and _try_xpu_backend():
+                kwargs["device"] = device
             self._tc_kwargs = kwargs
             try:
-                self._decoder = VideoDecoder(source, **kwargs)
-            except RuntimeError:
+                with self._xpu_slot():
+                    self._decoder = VideoDecoder(source, **kwargs)
+            except RuntimeError as error:
                 if "device" in kwargs:
-                    logger.warning("CUDA video decoding failed, falling back to CPU.")
+                    logger.warning(
+                        "%s video decoding failed, falling back to CPU: %s",
+                        kwargs["device"].upper(),
+                        error,
+                    )
                     kwargs.pop("device")
                     self._tc_kwargs = kwargs
                     self._decoder = VideoDecoder(source, **kwargs)
                 else:
                     raise
+            if (
+                kwargs.get("device", "cpu").startswith("xpu")
+                and num_decode_threads == 0
+            ):
+                # Auto on XPU means one decoder per codec engine, not one per
+                # CPU core, bounded by the process-wide concurrency limit.
+                from sglang.srt.utils.video_decoder_xpu import xpu_decoders_per_video
+
+                self._num_decode_threads = xpu_decoders_per_video()
         else:
             from decord import VideoReader, cpu
 
@@ -94,11 +125,12 @@ class VideoDecoderWrapper:
         return len(self._decoder)
 
     def __getitem__(self, idx):
-        """Return one NHWC uint8 frame (numpy on CPU, tensor on CUDA)."""
+        """Return one NHWC uint8 frame (numpy on CPU, tensor on an accelerator)."""
         if _BACKEND == "torchcodec":
-            frame = self._decoder[idx]
+            with self._xpu_slot():
+                frame = self._decoder[idx]
             data = frame.data if hasattr(frame, "data") else frame
-            return data if data.is_cuda else data.numpy()
+            return _as_output(data)
         else:
             frame = self._decoder[idx]
             return frame.asnumpy() if hasattr(frame, "asnumpy") else np.array(frame)
@@ -122,10 +154,13 @@ class VideoDecoderWrapper:
         return int(shape[-3]), int(shape[-2])
 
     def get_frames_at(self, indices: list):
-        """Return NHWC uint8 frames (numpy on CPU, tensor on CUDA)."""
+        """Return NHWC uint8 frames (numpy on CPU, tensor on an accelerator)."""
         if _BACKEND == "torchcodec":
-            batch = self._decoder.get_frames_at(indices)
-            return batch.data if batch.data.is_cuda else batch.data.numpy()
+            self._decode_dense_video_on_cpu(num_frames=len(indices))
+            with self._xpu_slot():
+                batch = self._decoder.get_frames_at(indices)
+            self._check_xpu_fallback()
+            return _as_output(batch.data)
         else:
             return self._decoder.get_batch(indices).asnumpy()
 
@@ -133,6 +168,8 @@ class VideoDecoderWrapper:
         """Return frames at given indices as a torch tensor (NHWC, uint8, pinned memory)."""
         import torch
 
+        if _BACKEND == "torchcodec":
+            self._decode_dense_video_on_cpu(num_frames=len(indices))
         if (
             _BACKEND == "torchcodec"
             and self._num_decode_threads != 1
@@ -146,14 +183,45 @@ class VideoDecoderWrapper:
                 return self._parallel_decode(indices, num_threads)
 
         if _BACKEND == "torchcodec":
-            batch = self._decoder.get_frames_at(indices)
-            if _is_cpu_engine():
+            with self._xpu_slot():
+                batch = self._decoder.get_frames_at(indices)
+            self._check_xpu_fallback()
+            if _is_cpu_engine() or batch.data.device.type != "cpu":
                 return batch.data
-            return batch.data if batch.data.is_cuda else batch.data.pin_memory()
+            return batch.data.pin_memory()
         else:
             arr = self._decoder.get_batch(indices).asnumpy()
             output = torch.from_numpy(arr)
             return output if _is_cpu_engine() else output.pin_memory()
+
+    def _on_xpu(self) -> bool:
+        return self._tc_kwargs.get("device", "cpu").startswith("xpu")
+
+    def _decode_dense_video_on_cpu(self, *, num_frames: int) -> None:
+        # WORKAROUND(torchcodec-xpu): intel/torchlib-xpu#162; see note_video_frames.
+        if not self._on_xpu():
+            return
+        from sglang.srt.utils.video_decoder_xpu import note_video_frames
+
+        if not note_video_frames(num_frames):
+            return
+        self._tc_kwargs = {k: v for k, v in self._tc_kwargs.items() if k != "device"}
+        self._decoder = VideoDecoder(self._source, **self._tc_kwargs)
+        self._num_decode_threads = 0  # CPU auto: up to 16 parallel decoders
+
+    def _xpu_slot(self):
+        """Process-wide concurrency guard for XPU hardware decodes; no-op elsewhere."""
+        if not self._on_xpu():
+            return nullcontext()
+        from sglang.srt.utils.video_decoder_xpu import xpu_decode_slot
+
+        return xpu_decode_slot()
+
+    def _check_xpu_fallback(self):
+        if self._on_xpu():
+            from sglang.srt.utils.video_decoder_xpu import warn_once_on_cpu_fallback
+
+            warn_once_on_cpu_fallback(self._decoder)
 
     def _parallel_decode(self, indices, num_threads):
         """Decode frames using multiple VideoDecoder instances in parallel threads."""
@@ -161,20 +229,25 @@ class VideoDecoderWrapper:
 
         import torch
 
+        from sglang.srt.platforms import current_platform
+
         chunks = [list(c) for c in np.array_split(indices, num_threads) if len(c) > 0]
         source = self._source
         kwargs = self._tc_kwargs
-        cuda_device = None
-        if kwargs.get("device") == "cuda":
-            cuda_device = torch.cuda.current_device()
+        device = None
+        if "device" in kwargs:
+            device = current_platform.get_device(
+                device_id=torch.get_device_module(kwargs["device"]).current_device()
+            )
 
         def _decode_chunk(chunk):
-            # CUDA's current device is thread-local.  Without this, decoder
-            # workers created by TP rank > 0 silently default to GPU 0.
-            if cuda_device is not None:
-                torch.cuda.set_device(cuda_device)
-            d = VideoDecoder(source, **kwargs)
-            return d.get_frames_at(chunk).data
+            # The accelerator's current device is thread-local.  Without this,
+            # decoder workers created by TP rank > 0 silently default to GPU 0.
+            if device is not None:
+                current_platform.set_device(device)
+            with self._xpu_slot():
+                d = VideoDecoder(source, **kwargs)
+                return d.get_frames_at(chunk).data
 
         with ThreadPoolExecutor(max_workers=len(chunks)) as executor:
             future_to_idx = {
@@ -187,9 +260,9 @@ class VideoDecoderWrapper:
                 results[idx] = future.result()
 
         output = torch.cat(results, dim=0)
-        if _is_cpu_engine():
+        if _is_cpu_engine() or output.device.type != "cpu":
             return output
-        return output if output.is_cuda else output.pin_memory()
+        return output.pin_memory()
 
     @property
     def source_bytes(self) -> bytes | None:

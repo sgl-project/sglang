@@ -66,6 +66,7 @@ dependencies = [
   "torch==2.14.0+xpu",
   "torchaudio==2.11.0+xpu",
   "torchcodec==0.17.0 ; sys_platform != 'linux' or (sys_platform == 'linux' and platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l')", # torch==2.14.0 on XPU uses torchcodec 0.17.0
+  "torchcodec-xpu==0.17.0 ; sys_platform == 'linux' and platform_machine == 'x86_64'", # Intel media-engine plugin; 0.17 pairs with torch 2.14 / torchcodec 0.17
   "torchvision==0.29.0+xpu",
   "tqdm",
   "transformers==5.19.0",

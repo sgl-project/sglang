@@ -1251,6 +1251,15 @@ class Envs:
     # only, the bit-exact result does not depend on it; 4 measured fastest on
     # Arc Pro B70.
     SGLANG_XPU_LN_MOD_NUM_WARPS = EnvInt(4)
+    # Opt-in: decode video inputs on the XPU media engine (torchcodec-xpu); decoded
+    # frames need memory headroom on the card, which the default memory fraction may not leave.
+    SGLANG_ENABLE_XPU_VIDEO_HW_DECODE = EnvBool(False)
+    # WORKAROUND(torchcodec-xpu): hardware decodes allowed at once per process; drop
+    # once intel/torchlib-xpu#161 is fixed and decode one video per codec engine.
+    SGLANG_XPU_VIDEO_MAX_CONCURRENT_DECODES = EnvInt(1)
+    # WORKAROUND(torchcodec-xpu): a video sampling more frames moves the process to
+    # CPU decode; drop once intel/torchlib-xpu#162 is fixed.
+    SGLANG_XPU_VIDEO_HW_MAX_FRAMES = EnvInt(128)
 
     # ===================================================================
     # Quantization

@@ -176,6 +176,33 @@ Additionally, the requests can be formed with
 [OpenAI Completions API](../basic_usage/openai_api_completions)
 and sent via the command line (e.g. using `curl`) or via your own script.
 
+## Hardware Video Decoding for Multimodal Models
+
+Video inputs for vision-language models (for example Qwen3-VL and Gemma 4) can decode on the Intel GPU media engine through the [torchcodec-xpu](https://pypi.org/project/torchcodec-xpu) plugin. It is off by default; set `SGLANG_ENABLE_XPU_VIDEO_HW_DECODE=1` to turn it on. torchcodec loads the plugin automatically, decoded frames stay on the XPU as `uint8` tensors, and the resize and normalization steps of the processor run on the same device. SGLang runs one hardware decode at a time per process. Without the plugin, or on GPUs without a media engine such as Intel Data Center GPU Max, decoding runs on the CPU.
+
+The plugin is part of the XPU dependency manifest (`python/pyproject_xpu.toml`) and the XPU Docker image. For a manual install, match the versions pinned there and make sure the system FFmpeg libraries are built with VAAPI support:
+
+```bash
+pip install torchcodec==0.17.0 --index-url https://download.pytorch.org/whl/xpu --no-deps
+pip install torchcodec-xpu==0.17.0 --no-deps
+```
+
+Environment variables:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `SGLANG_ENABLE_XPU_VIDEO_HW_DECODE` | `0` | Set to `1` to decode video inputs on the media engine. Other platforms never read this. |
+| `SGLANG_XPU_VIDEO_MAX_CONCURRENT_DECODES` | `1` | Hardware decodes allowed at once per process. |
+| `SGLANG_XPU_VIDEO_HW_MAX_FRAMES` | `128` | The first video sampling more frames than this switches the process to CPU video decode. |
+
+torchcodec and the plugin have their own settings: `TORCHCODEC_DEVICE_BACKEND_AUTOLOAD=0` stops torchcodec from loading device plugins, and torchcodec-xpu's `CPU_FALLBACK=off` makes unsupported codecs raise instead of silently decoding on the CPU.
+
+Decoded frames live in device memory outside the scheduler's `--mem-fraction-static` budget, roughly 170 MB per 60 sampled 720p frames plus the processor's pixel tensors. Leave headroom on the card for the number of videos you expect in flight at once; with the card full, decode and preprocessing slow down by an order of magnitude instead of failing.
+
+Hardware decode is validated for sparse sampling, up to roughly 100 frames per video. With dense sampling (for example `--mm-process-config '{"video": {"fps": 4, "max_frames": 512}}'` on long clips), the first time a video samples more than `SGLANG_XPU_VIDEO_HW_MAX_FRAMES` frames (default 128), SGLang switches the process to CPU video decode and logs it once.
+
+SGLang logs a warning once if the plugin reports that it fell back to CPU decoding. To check the engine directly, run `benchmark/video_decode/bench_video_decode.py --clip <file> --device xpu` and compare the CPU time of the two rows.
+
 ## XPU Graph [Experimental]
 
 SGLang enables XPU graph capture to reduce per-step kernel-launch overhead.

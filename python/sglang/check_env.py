@@ -50,6 +50,7 @@ PACKAGE_LIST = [
     "anthropic",
     "litellm",
     "torchcodec",
+    "torchcodec-xpu",
 ]
 
 

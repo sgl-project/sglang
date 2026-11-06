@@ -100,8 +100,8 @@ class Gemma4SGLangProcessor(SGLangBaseProcessor):
             indices = list(range(total))
         else:
             indices = torch.arange(0, total, total / num_frames).int().tolist()
-        frames_np = vdw.get_frames_at(indices)  # (N, H, W, C)
-        return torch.from_numpy(frames_np).permute(0, 3, 1, 2).contiguous()
+        frames = vdw.get_frames_at(indices)  # (N, H, W, C)
+        return torch.as_tensor(frames).permute(0, 3, 1, 2).contiguous()
 
     def process_mm_data(
         self, input_text, images=None, videos=None, audios=None, **kwargs
