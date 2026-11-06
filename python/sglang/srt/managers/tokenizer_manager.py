@@ -22,7 +22,6 @@ import gc
 import json
 import logging
 import os
-import pickle
 import signal
 import socket
 import sys
@@ -70,6 +69,12 @@ from sglang.srt.elastic_ep.topology import (
     physical_ep_size_to_dp_size,
 )
 from sglang.srt.environ import envs
+from sglang.srt.hf_transformers import (
+    get_processor,
+    get_tokenizer,
+    get_tokenizer_from_processor,
+    resolve_image_processor_backend,
+)
 from sglang.srt.kv_canary.canary_info.tokenizer_manager_hook import (
     CanaryInfoTokenizerManagerHook,
     ReqStateCanaryInfo,
@@ -142,6 +147,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.multimodal.transport import determine_tensor_transport_mode
 from sglang.srt.multimodal.transport.cuda_ipc import CudaIpcTensorTransportProxy
+from sglang.srt.multimodal.transport.cuda_vmm import CudaVmmFeatureTransport
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_TOKENIZER,
@@ -157,6 +163,12 @@ from sglang.srt.observability.req_time_stats import (
     real_time,
     set_time_batch,
 )
+from sglang.srt.observability.request_dump import (
+    build_request_dump,
+    save_request_dump,
+    write_crash_dump,
+)
+from sglang.srt.observability.request_logger import RequestLogger
 from sglang.srt.observability.request_metrics_exporter import (
     RequestMetricsExporterManager,
 )
@@ -203,21 +215,12 @@ from sglang.srt.utils import (
     print_warning_once,
 )
 from sglang.srt.utils.aio_rwlock import RWLock
-from sglang.srt.utils.crash_dump import write_crash_dump
-from sglang.srt.utils.cuda_vmm_transport_utils import CudaVmmFeatureTransport
 from sglang.srt.utils.cudacore_pyspy_dump_utils import (
     collect_scheduler_processes,
     pyspy_dump_schedulers,
     trigger_cuda_user_coredump,
 )
-from sglang.srt.utils.hf_transformers import (
-    get_processor,
-    get_tokenizer,
-    get_tokenizer_from_processor,
-    resolve_image_processor_backend,
-)
 from sglang.srt.utils.network import get_zmq_socket
-from sglang.srt.utils.request_logger import RequestLogger
 from sglang.srt.utils.watchdog import Watchdog
 from sglang.srt.utils.weight_versions import (
     add_weight_versions_to_meta_info,
@@ -3535,34 +3538,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self, data_list: List[Tuple], filename: str, log_message: str
     ):
         logger.info(log_message)
-        to_dump_with_server_args = {
-            "server_args": self._server_args_for_dump(),
-            "config_updates": redact_watermark_secrets(get_context().overrides_log()),
-            "resolved_config": self._dump_config_snapshot(),
-            "requests": redact_watermark_secrets(data_list.copy()),
-        }
-
-        def background_task():
-            os.makedirs(os.path.dirname(filename), exist_ok=True)
-            with open(filename, "wb") as f:
-                try:
-                    pickle.dump(to_dump_with_server_args, f)
-                except Exception as e:
-                    # When the server is launched with --trust-remote-code,
-                    # server_args sometimes fails to pickle. Retry without
-                    # server_args so the request data still gets persisted.
-                    logger.error(
-                        f"Failed to pickle dump with server_args: {e!r}; "
-                        "retrying without server_args"
-                    )
-                    f.seek(0)
-                    f.truncate()
-                    to_dump_with_server_args["server_args"] = None
-                    # The snapshot copies the same object field by field.
-                    to_dump_with_server_args["resolved_config"] = None
-                    pickle.dump(to_dump_with_server_args, f)
-
-        asyncio.create_task(asyncio.to_thread(background_task))
+        data = build_request_dump(
+            data_list.copy(),
+            self._server_args_for_dump(),
+            self._dump_config_snapshot(),
+        )
+        asyncio.create_task(asyncio.to_thread(save_request_dump, filename, data))
 
     def dump_requests_before_crash(
         self, hostname: str = os.getenv("HOSTNAME", socket.gethostname())
