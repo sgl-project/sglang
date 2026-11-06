@@ -51,8 +51,6 @@ inline constexpr auto cudaSuccess = hipSuccess;
 #define cudaMemcpyAsync hipMemcpyAsync
 #define cudaMemcpyHostToDevice hipMemcpyHostToDevice
 #define cudaMemcpyDeviceToHost hipMemcpyDeviceToHost
-#define cudaMemcpyDeviceToDevice hipMemcpyDeviceToDevice
-#define cudaGetDevice hipGetDevice
 #define cudaDeviceGetAttribute hipDeviceGetAttribute
 #define cudaDevAttrComputeCapabilityMajor hipDeviceAttributeComputeCapabilityMajor
 #define cudaDevAttrComputeCapabilityMinor hipDeviceAttributeComputeCapabilityMinor

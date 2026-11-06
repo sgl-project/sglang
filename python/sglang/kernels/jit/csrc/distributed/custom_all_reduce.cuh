@@ -39,6 +39,13 @@
 #include <cstring>
 #include <string>
 
+// Kept out of sgl_kernel/utils.cuh: every JIT build's cache key covers that
+// header's contents, so an edit there rebuilds every CUDA kernel.
+#ifdef USE_ROCM
+#define cudaMemcpyDeviceToDevice hipMemcpyDeviceToDevice
+#define cudaGetDevice hipGetDevice
+#endif
+
 namespace sglang {
 
 using device::distributed::PullWorkSpace, device::distributed::PushWorkSpace;
