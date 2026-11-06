@@ -532,7 +532,7 @@ find_library(TORCH_PYTHON_LIBRARY torch_python PATHS "${TORCH_INSTALL_PREFIX}/li
 target_link_libraries(infllm_ops PRIVATE ${TORCH_LIBRARIES} ${TORCH_PYTHON_LIBRARY} c10 cuda)
 install(TARGETS infllm_ops LIBRARY DESTINATION "sgl_kernel")
 
-# ============================ Extra Install: FLashMLA ============================= #
+# The packed Main KV direct reader still needs the pinned mixed FlashMLA extension.
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/flashmla.cmake)
 
 # ============================ Extra Install: triton kernels ============================= #
