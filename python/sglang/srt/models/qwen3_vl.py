@@ -29,6 +29,7 @@ from transformers.activations import ACT2FN
 
 from sglang.srt.configs.qwen3_vl import Qwen3VLConfig, Qwen3VLVisionConfig
 from sglang.srt.environ import envs
+from sglang.srt.hf_transformers import get_processor
 from sglang.srt.layers.attention.vision import (
     BATCH_BUCKETS,
     FLASHINFER_MAX_SEQLEN_BUCKETS,
@@ -92,7 +93,6 @@ from sglang.srt.utils import (
     is_npu,
     round_up,
 )
-from sglang.srt.utils.hf_transformers import get_processor
 
 _is_npu = is_npu()
 graph_runners_dict = defaultdict(lambda: ViTCudaGraphRunner)

@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import contextlib
+import io
+import shlex
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -12,9 +15,11 @@ from sglang.cli.serve_backends import (
     ServeBackendRegistry,
     ServeRequest,
 )
+from sglang.srt.server_args import prepare_server_args
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def _make_entry_point(name, factory, distribution=None):
@@ -243,6 +248,168 @@ class TestServeBackendDispatch(unittest.TestCase):
         self.assertIsNone(request.model_path)
         mock_load_plugins.assert_not_called()
         mock_kill.assert_not_called()
+
+
+DIFFUSION_MODELS = {"black-forest-labs/FLUX.1-dev"}
+
+
+def _cookbook_argv(command):
+    lines = [line.rstrip(" \\") for line in command.strip().splitlines()]
+    lines = [line for line in lines if line and not line.startswith("#")]
+    start = next(i for i, line in enumerate(lines) if line.startswith("sglang serve"))
+    return shlex.split(" ".join(lines[start:]))[2:]
+
+
+DEEPSEEK_V4_H200 = r"""
+sglang serve \
+  --trust-remote-code \
+  --model-path deepseek-ai/DeepSeek-V4-Pro-0813 \
+  --tp 8 \
+  --moe-runner-backend flashinfer_mxfp4 \
+  --speculative-algorithm DSPARK \
+  --mem-fraction-static 0.90 \
+  --host 0.0.0.0 \
+  --port 30000
+"""
+
+QWEN38_GB300_MULTI_NODE = r"""
+SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK=2048 \
+EP_DISABLE_GIN=1 \
+sglang serve \
+  --trust-remote-code \
+  --model-path Qwen/Qwen3.8-2.4T-A95B-FP8 \
+  --tp-size 16 \
+  --attn-dp-size 4 \
+  --nnodes 4 \
+  --node-rank <node-rank> \
+  --dist-init-addr <node0-ip>:20000 \
+  --ep-size 16 \
+  --kv-cache-dtype fp8_e4m3 \
+  --speculative-algorithm NEXTN \
+  --speculative-num-steps 3 \
+  --cuda-graph-bs-decode 1 2 4 8 16 32 \
+  --reasoning-parser qwen3 \
+  --host 0.0.0.0 \
+  --port 30000
+"""
+
+KIMI_K3_B200 = r"""
+sglang serve \
+  --trust-remote-code \
+  --model-path moonshotai/Kimi-K3 \
+  --tp-size 16 \
+  --mem-fraction-static 0.85 \
+  --model-loader-extra-config '{"enable_multithread_load": true}' \
+  --host 0.0.0.0 \
+  --port 30000
+"""
+
+DIRECT_LAUNCH_CASES = {
+    "docs quickstart, positional model": (
+        ["Qwen/Qwen3-0.6B", "--host", "127.0.0.1", "--port", "30000"],
+        "llm",
+        ["--model-path", "Qwen/Qwen3-0.6B", "--host", "127.0.0.1", "--port", "30000"],
+    ),
+    "CI popen_launch_server": (
+        ["--model-path", "meta-llama/Llama-3.1-8B-Instruct"]
+        + ["--host", "127.0.0.1", "--port", "21000"],
+        "llm",
+        None,
+    ),
+    "--model-path=value": (
+        ["--model-path=Qwen/Qwen3-8B", "--tp-size", "2"],
+        "llm",
+        None,
+    ),
+    "--model alias": (["--model", "Qwen/Qwen3-8B", "--tp", "2"], "llm", None),
+    "explicit llm backend": (
+        ["Qwen/Qwen3-8B", "--model-type", "llm", "--tp-size", "2"],
+        "llm",
+        ["--model-path", "Qwen/Qwen3-8B", "--tp-size", "2"],
+    ),
+    "explicit backend, = form": (
+        ["--model-type=llm", "--model-path", "Qwen/Qwen3-8B"],
+        "llm",
+        ["--model-path", "Qwen/Qwen3-8B"],
+    ),
+    "diffusion model detected": (
+        ["black-forest-labs/FLUX.1-dev", "--port", "30000"],
+        "diffusion",
+        ["--model-path", "black-forest-labs/FLUX.1-dev", "--port", "30000"],
+    ),
+    "explicit diffusion backend": (
+        ["black-forest-labs/flux-3-action-droid", "--model-type", "diffusion"],
+        "diffusion",
+        ["--model-path", "black-forest-labs/flux-3-action-droid"],
+    ),
+    "cookbook DeepSeek-V4 on H200": (_cookbook_argv(DEEPSEEK_V4_H200), "llm", None),
+    "cookbook Qwen3.8 on GB300, multi-node": (
+        _cookbook_argv(QWEN38_GB300_MULTI_NODE),
+        "llm",
+        None,
+    ),
+    "cookbook Kimi-K3 on B200, JSON flag": (_cookbook_argv(KIMI_K3_B200), "llm", None),
+}
+
+# TODO(Yichi): expect the CLI Guide for these once it lands.
+GUIDE_CASES = {
+    "bare model": (["Qwen/Qwen3-8B"], "llm", ["--model-path", "Qwen/Qwen3-8B"]),
+    "bare model with --mode": (
+        ["Qwen/Qwen3-8B", "--mode", "balanced"],
+        "llm",
+        ["--model-path", "Qwen/Qwen3-8B", "--mode", "balanced"],
+    ),
+}
+
+
+class TestServeDirectLaunch(CustomTestCase):
+    def _serve(self, argv):
+        ran = []
+
+        def capture(name):
+            return lambda request: ran.append((name, request.argv))
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch("sglang.cli.serve._run_llm", capture("llm")))
+            stack.enter_context(
+                patch("sglang.cli.serve._run_diffusion", capture("diffusion"))
+            )
+            stack.enter_context(
+                patch(
+                    "sglang.cli.serve.get_is_diffusion_model",
+                    lambda path: path in DIFFUSION_MODELS,
+                )
+            )
+            stack.enter_context(
+                patch("sglang.cli.serve_backends.entry_points", return_value=[])
+            )
+            stack.enter_context(patch("sglang.srt.plugins.load_plugins"))
+            stack.enter_context(patch("sglang.cli.serve.kill_process_tree"))
+            serve(None, list(argv))
+
+        self.assertEqual(len(ran), 1)
+        return ran[0]
+
+    def _assert_cases(self, cases):
+        for name, (argv, backend, received) in cases.items():
+            with self.subTest(name):
+                expected = tuple(argv if received is None else received)
+                self.assertEqual(self._serve(argv), (backend, expected))
+
+    def test_direct_launch_reaches_backend_unchanged(self):
+        self._assert_cases(DIRECT_LAUNCH_CASES)
+
+    def test_guide_candidates_launch_directly_today(self):
+        self._assert_cases(GUIDE_CASES)
+
+    def test_mode_is_not_a_server_flag(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            prepare_server_args(["--model-path", "Qwen/Qwen3-8B", "--mode", "balanced"])
+
+    # TODO(Yichi): expect the CLI Guide's model prompt once it lands.
+    def test_missing_model_is_rejected(self):
+        with self.assertRaisesRegex(Exception, "--model-path is required"):
+            self._serve([])
 
 
 if __name__ == "__main__":
