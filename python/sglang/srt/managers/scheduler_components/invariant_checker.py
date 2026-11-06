@@ -59,13 +59,13 @@ BUSY_MEM_CHECK_LOG_RING_SIZE = 1000
 class CheckPhase(Enum):
     """Where in the scheduler loop a state check runs."""
 
-    # A step is launched (`Scheduler._on_step_launch`).
+    # A step is launched.
     LAUNCH = "launch"
-    # A step's result is processed (`Scheduler._on_step_processed`).
+    # A step's result is processed.
     RESULT = "result"
     # The end of an event-loop iteration; checks run only if it ran a batch.
     BUSY = "busy"
-    # A fully idle iteration (`Scheduler.on_idle`).
+    # A fully idle iteration.
     IDLE = "idle"
 
 
@@ -74,7 +74,7 @@ class StateCheck:
     # Identifies the check; the checker itself never reads it.
     name: str
     phase: CheckPhase
-    # Whether the check runs this time, read on every run.
+    # Evaluated on every run.
     when: Callable[[], bool]
     # A LAUNCH or RESULT check takes the step's batch: `fn(batch)`, else `fn()`.
     fn: Callable[..., None]
