@@ -55,6 +55,12 @@ pub struct SamplingParams {
     pub seed: ::core::option::Option<i64>,
     #[prost(message, optional, tag = "17")]
     pub guided_decoding: ::core::option::Option<GuidedDecoding>,
+    /// Preserve Python's three states for max_new_tokens over proto3:
+    /// unset uses the server default (128), max_new_tokens sets an explicit cap,
+    /// and this flag requests the HTTP `max_new_tokens: null` behavior (no cap).
+    /// Must not be true when max_new_tokens is set.
+    #[prost(bool, optional, tag = "18")]
+    pub no_max_new_tokens_limit: ::core::option::Option<bool>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GuidedDecoding {
