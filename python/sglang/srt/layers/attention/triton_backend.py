@@ -607,6 +607,11 @@ class TritonAttnBackend(AttentionBackend):
     ):
         """Fill all cuda-graph buffers for target_verify mode."""
         num_tokens_per_req = self._target_verify_num_tokens_per_req(spec_info)
+        swa = self.sliding_window_size is not None and self.sliding_window_size > 0
+        window_kv_indptr = self.window_kv_indptr
+        window_kv_indices = self.cuda_graph_window_kv_indices if swa else None
+        window_num_kv_splits = self.cuda_graph_window_num_kv_splits if swa else None
+        window_kv_offsets = self.cuda_graph_window_kv_offsets if swa else None
         if (
             self._use_dflash_draft_verify
             and (spec_info is None or spec_info.custom_mask is None)
@@ -616,11 +621,10 @@ class TritonAttnBackend(AttentionBackend):
             and seq_lens.shape[0] == bs
             and bs <= 1024
         ):
-            from sglang.kernels.ops.attention.k3_draft_verify_metadata import (
+            from sglang.kernels.ops.attention.dflash_draft_verify_metadata import (
                 fill_draft_verify_metadata,
             )
 
-            swa = self.sliding_window_size is not None and self.sliding_window_size > 0
             fill_draft_verify_metadata(
                 bs=bs,
                 seq_lens=seq_lens,
@@ -633,61 +637,51 @@ class TritonAttnBackend(AttentionBackend):
                 mask_indptr=self.mask_indptr,
                 window_size=self.sliding_window_size if swa else None,
                 window_kv_indptr=self.window_kv_indptr if swa else None,
-                window_kv_indices=self.cuda_graph_window_kv_indices if swa else None,
-                window_kv_offsets=self.cuda_graph_window_kv_offsets if swa else None,
+                window_kv_indices=window_kv_indices,
+                window_kv_offsets=window_kv_offsets,
             )
-            return (
-                self.qo_indptr[: bs + 1],
-                self.kv_indptr[: bs + 1],
-                None,
-                self.mask_indptr[: bs + 1],
-                self.window_kv_indptr[: bs + 1] if swa else self.window_kv_indptr,
-                self.cuda_graph_window_kv_indices if swa else None,
-                self.cuda_graph_window_num_kv_splits if swa else None,
-                self.cuda_graph_window_kv_offsets if swa else None,
-            )
-        qo_indptr = self.qo_indptr[: bs + 1]
-        qo_indptr[: bs + 1] = torch.arange(
-            0,
-            (1 + bs) * num_tokens_per_req,
-            step=num_tokens_per_req,
-            dtype=torch.int32,
-            device=self.device,
-        )
-        kv_indptr = self._fill_kv_indptr_and_indices(
-            plan, bs, seq_lens, req_pool_indices, self.cuda_graph_kv_indices
-        )
-        window_kv_indptr = self.window_kv_indptr
-        window_kv_indices = None
-        window_num_kv_splits = None
-        window_kv_offsets = None
-        if self.sliding_window_size is not None and self.sliding_window_size > 0:
-            window_kv_indices = self.cuda_graph_window_kv_indices
-            window_num_kv_splits = self.cuda_graph_window_num_kv_splits
-            window_kv_offsets = self.cuda_graph_window_kv_offsets
-            window_kv_indptr, window_kv_indices, _, window_kv_offsets[:bs] = (
-                update_sliding_window_buffer(
-                    self.window_kv_indptr,
-                    self.runner_ids,
-                    plan,
-                    req_pool_indices,
-                    self.sliding_window_size,
-                    seq_lens[:bs],
-                    bs,
-                    token_to_kv_pool=self.token_to_kv_pool,
-                    window_kv_indices=window_kv_indices,
-                )
-            )
-        custom_mask = (
-            self._verify_mask.buffer if self._verify_mask is not None else None
-        )
-        if spec_info is not None and spec_info.custom_mask is not None:
-            custom_mask[: spec_info.custom_mask.shape[0]] = spec_info.custom_mask
-        else:
+            qo_indptr = self.qo_indptr[: bs + 1]
+            kv_indptr = self.kv_indptr[: bs + 1]
             custom_mask = None
-        seq_mask_len = num_tokens_per_req * (seq_lens + num_tokens_per_req)
-        mask_indptr = self.mask_indptr[: bs + 1]
-        mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
+            mask_indptr = self.mask_indptr[: bs + 1]
+            if swa:
+                window_kv_indptr = self.window_kv_indptr[: bs + 1]
+        else:
+            qo_indptr = self.qo_indptr[: bs + 1]
+            qo_indptr[: bs + 1] = torch.arange(
+                0,
+                (1 + bs) * num_tokens_per_req,
+                step=num_tokens_per_req,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            kv_indptr = self._fill_kv_indptr_and_indices(
+                plan, bs, seq_lens, req_pool_indices, self.cuda_graph_kv_indices
+            )
+            if swa:
+                window_kv_indptr, window_kv_indices, _, window_kv_offsets[:bs] = (
+                    update_sliding_window_buffer(
+                        self.window_kv_indptr,
+                        self.runner_ids,
+                        plan,
+                        req_pool_indices,
+                        self.sliding_window_size,
+                        seq_lens[:bs],
+                        bs,
+                        token_to_kv_pool=self.token_to_kv_pool,
+                        window_kv_indices=window_kv_indices,
+                    )
+                )
+            custom_mask = (
+                self._verify_mask.buffer if self._verify_mask is not None else None
+            )
+            if spec_info is not None and spec_info.custom_mask is not None:
+                custom_mask[: spec_info.custom_mask.shape[0]] = spec_info.custom_mask
+            else:
+                custom_mask = None
+            seq_mask_len = num_tokens_per_req * (seq_lens + num_tokens_per_req)
+            mask_indptr = self.mask_indptr[: bs + 1]
+            mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
         return (
             qo_indptr,
             kv_indptr,
@@ -1904,7 +1898,7 @@ class TritonAttnBackend(AttentionBackend):
             and self.forward_metadata.custom_mask is None
             and forward_batch.forward_mode.is_target_verify()
         ):
-            from sglang.kernels.ops.attention import k3_draft_swa_verify as _dsv
+            from sglang.kernels.ops.attention import dflash_draft_swa_verify as _dsv
 
             q3 = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
             k3 = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)

@@ -1,4 +1,4 @@
-"""Kimi-K3 DFlash draft sliding-window verify attention.
+"""DFlash draft sliding-window verify attention.
 
 ``draft_swa_verify_fwd`` reads the new draft K/V in place and splits long
 windows across programs. It must match ``extend_attention_fwd`` with the same
@@ -10,11 +10,11 @@ import unittest
 
 import torch
 
-from sglang.kernels.ops.attention.extend_attention import extend_attention_fwd
-from sglang.kernels.ops.attention.k3_draft_swa_verify import (
+from sglang.kernels.ops.attention.dflash_draft_swa_verify import (
     can_handle,
     draft_swa_verify_fwd,
 )
+from sglang.kernels.ops.attention.extend_attention import extend_attention_fwd
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -35,7 +35,7 @@ BATCHES = [
 ]
 
 
-class TestK3DraftSwaVerify(CustomTestCase):
+class TestDFlashDraftSwaVerify(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         torch.manual_seed(0)
