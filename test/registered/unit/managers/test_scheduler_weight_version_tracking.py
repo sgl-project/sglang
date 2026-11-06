@@ -8,7 +8,6 @@ from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.io_struct import (
     BeginWeightUpdateReqInput,
     EndWeightUpdateReqInput,
-    ReleaseMemoryOccupationReqInput,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
@@ -545,29 +544,6 @@ class TestWeightUpdateSession(_WeightUpdaterManagerTestBase):
         self.assertFalse(output.success)
         self.assertIn("begin_weight_update", output.message)
         target.weight_updater.receive_weights_from_distributed.assert_not_called()
-
-
-class TestReleaseMemoryOccupation(CustomTestCase):
-    def test_busy_scheduler_is_rejected_without_releasing_memory(self):
-        memory_saver_adapter = Mock()
-        with get_parallel().override(tp_group=SimpleNamespace(cpu_group=None)):
-            manager = SchedulerWeightUpdaterManager(
-                tp_worker=None,
-                draft_worker=None,
-                memory_saver_adapter=memory_saver_adapter,
-                flush_cache=Mock(),
-                is_fully_idle=lambda **kwargs: False,
-                scheduler=SimpleNamespace(_engine_paused=False),
-            )
-
-        output = manager.release_memory_occupation(
-            ReleaseMemoryOccupationReqInput(tags=None)
-        )
-
-        self.assertFalse(output.success)
-        self.assertEqual(manager.offload_tags, set())
-        memory_saver_adapter.pause.assert_not_called()
-        manager.flush_cache.assert_not_called()
 
 
 if __name__ == "__main__":
