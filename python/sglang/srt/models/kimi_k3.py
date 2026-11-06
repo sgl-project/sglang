@@ -7,7 +7,6 @@
 #   - Full-rank KDA gate (use_full_rank_gate)
 
 import logging
-import os
 import re
 from array import array
 from collections.abc import Iterable
@@ -21,6 +20,7 @@ from torch import nn
 from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
 from sglang.srt.configs.kimi_k3 import KimiK3Config
 from sglang.srt.configs.kimi_linear import KimiLinearConfig
+from sglang.srt.configs.model_config import is_kimi_k31
 from sglang.srt.distributed import (
     divide,
     tensor_model_parallel_all_reduce,
@@ -39,6 +39,7 @@ from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStatePacker,
 )
 from sglang.srt.layers.communication import k3_ar_fusion, k3_sp_collective
+from sglang.srt.layers.dcp.layout import set_dsa_shards_index_k
 from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
 from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
@@ -94,6 +95,8 @@ from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
 from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils.common import add_prefix, set_weight_attrs
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -140,14 +143,9 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.utils import is_hip, is_npu, make_pp_layers
-from sglang.srt.utils.common import (
-    BumpAllocator,
-    add_prefix,
-    get_bool_env_var,
-    rank0_log,
-    set_weight_attrs,
-)
+from sglang.srt.utils import is_hip, is_npu
+from sglang.srt.utils.common import BumpAllocator, get_bool_env_var
+from sglang.srt.utils.log_utils import rank0_log
 
 logger = logging.getLogger(__name__)
 
@@ -1969,9 +1967,7 @@ class KimiK3DeltaAttention(nn.Module):
             layer = self.attn
             w = layer.conv_weights
             f_b_weight = self.f_b_proj.weight
-            backend = os.environ.get(
-                "SGLANG_ROCM_K3_KDA_FUSED_BACKEND", "gfx950"
-            ).lower()
+            backend = envs.SGLANG_ROCM_K3_KDA_FUSED_BACKEND.get().lower()
             fused_ops = {
                 "aiter": kda_fused_decode_aiter_hip,
                 "gfx950": kda_fused_decode_gfx950,
@@ -2240,6 +2236,8 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
         # The fused Ascend split+RMSNorm path is not numerically equivalent for
         # Kimi-K3. Other MLA models retain the existing fused fast path.
         self._disable_npu_fused_split_qk_norm = True
+        if is_kimi_k31(config) and get_parallel().attn_dcp_size > 1:
+            set_dsa_shards_index_k()
         super().__init__(
             layer_id=layer_idx,
             hidden_size=config.hidden_size,
