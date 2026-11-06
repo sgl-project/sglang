@@ -20,6 +20,7 @@ from transformers import AutoProcessor
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.environ import envs
+from sglang.srt.hf_transformers import resolve_image_processor_backend
 from sglang.srt.multimodal.cache import parse_content_hash, snapshot_media
 from sglang.srt.multimodal.encoder_preprocessing import (
     EncoderMediaProcessorConfig,
@@ -54,7 +55,6 @@ from sglang.srt.utils import (
     load_image,
     load_video,
 )
-from sglang.srt.utils.hf_transformers import resolve_image_processor_backend
 
 logger = logging.getLogger(__name__)
 

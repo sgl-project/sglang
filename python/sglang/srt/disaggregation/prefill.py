@@ -1887,9 +1887,12 @@ class SchedulerDisaggregationPrefillMixin:
     def optimistic_release_and_requeue(self: Scheduler, req: Req, src: ReqList) -> None:
         """Release KV cache and requeue an optimistic prefill request out of `src`."""
         max_attempts = get_disagg().optimistic_prefill_attempts
-        uses_write_through_cache = _uses_write_through_cache(self.tree_cache)
-        if not uses_write_through_cache:
-            checkpoint_kv_cache(req, self.tree_cache)
+        # Publish the computed prefix before releasing it. A write-through cache
+        # keeps optimistic KV request-owned only to keep the backup off the
+        # decode bootstrap path; a yielded request has no bootstrap to delay, and
+        # publishing backs its KV up to L3 so the retry fetches it back instead
+        # of recomputing it once the device copy is evicted.
+        checkpoint_kv_cache(req, self.tree_cache)
         # The cached prefix is evictable once the KV is released. Its length
         # (capped at what a retry can match) seeds the retry's storage baseline,
         # so an evicted prefix is looked up in L3 once before it is recomputed.
