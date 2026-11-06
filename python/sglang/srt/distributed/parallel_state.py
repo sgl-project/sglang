@@ -407,7 +407,11 @@ class GroupCoordinator:
                 cpu_group = torch.distributed.new_group(
                     ranks,
                     backend="gloo",
-                    timeout=gloo_timeout,
+                    timeout=(
+                        subgroup_timeout
+                        if subgroup_timeout is not None
+                        else gloo_timeout
+                    ),
                     group_desc=f"{group_name}:cpu",
                     use_local_synchronization=use_local_synchronization,
                 )

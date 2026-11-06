@@ -4109,12 +4109,12 @@ class SchedulerDisaggregationDecodeMixin:
     def process_decode_queue(self: Scheduler, defer_prealloc: bool = False) -> bool:
         """Return whether the overlap loop must preallocate after its launch."""
         if self.enable_decode_hicache:
-            self.tree_cache.check_hicache_events()
+            self._check_hicache_events()
         elif (
             getattr(self.tree_cache, "linker", None) is not None
             and self.tree_cache.linker.pending_offloads
         ):
-            self.tree_cache.check_hicache_events()
+            self._check_hicache_events()
 
         if get_disagg().disaggregation_decode_enable_offload_kvcache:
             self.decode_offload_manager.check_offload_progress()

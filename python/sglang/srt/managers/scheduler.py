@@ -4089,6 +4089,10 @@ class Scheduler(
         # todo hisparse, maybe other info to contain for the new batch
         return batch
 
+    def _check_hicache_events(self) -> None:
+        with self.watchdog.watch("hicache_events"):
+            self.tree_cache.check_hicache_events()
+
     def _process_hicache_events(
         self, should_retry_storage_prefetch: bool = True
     ) -> None:
@@ -4100,7 +4104,7 @@ class Scheduler(
             or self.enable_unified_cache_external_linker
             or self.enable_lmcache
         ):
-            self.tree_cache.check_hicache_events()
+            self._check_hicache_events()
             if self.enable_hicache_storage and should_retry_storage_prefetch:
                 self._process_storage_prefetch_retries()
 

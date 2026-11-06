@@ -576,11 +576,12 @@ def create_scheduler_watchdog(
             _, messages = scheduler.invariant_checker._check_all_pools(
                 scheduler.pool_stats_observer.get_pool_stats(),
             )
-            parts += [
-                f"{scheduler.cur_batch_for_debug.batch_size()=}",
-                f"{scheduler.cur_batch_for_debug.reqs=}",
-                *messages,
-            ]
+            parts.extend(messages)
+            if scheduler.cur_batch_for_debug is not None:
+                parts += [
+                    f"{scheduler.cur_batch_for_debug.batch_size()=}",
+                    f"{scheduler.cur_batch_for_debug.reqs=}",
+                ]
         return "\n".join(parts)
 
     return WatchdogRaw(

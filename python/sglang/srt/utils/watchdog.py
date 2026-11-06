@@ -116,10 +116,20 @@ class WatchdogRaw:
         self.watchdog_timeout = watchdog_timeout
         self.soft = soft
         self.dump_info = dump_info
+        self._scope: Optional[tuple[str, float]] = None
 
         self.parent_process = psutil.Process().parent()
         t = threading.Thread(target=self._watchdog_thread, daemon=True)
         t.start()
+
+    @contextmanager
+    def watch(self, name: str):
+        previous = self._scope
+        self._scope = (name, time.perf_counter())
+        try:
+            yield
+        finally:
+            self._scope = previous
 
     def _watchdog_thread(self):
         try:
@@ -136,6 +146,10 @@ class WatchdogRaw:
 
         while True:
             current = time.perf_counter()
+            scope = self._scope
+            if scope is not None and current > scope[1] + self.watchdog_timeout:
+                logger.error(f"{self.debug_name} watchdog stalled in {scope[0]}")
+                break
             if self.is_active():
                 current_counter = self.get_counter()
                 if watchdog_last_counter == current_counter:
@@ -144,6 +158,9 @@ class WatchdogRaw:
                 else:
                     watchdog_last_counter = current_counter
                     watchdog_last_time = current
+            else:
+                watchdog_last_counter = self.get_counter()
+                watchdog_last_time = current
             time.sleep(self.watchdog_timeout / 2)
 
         if self.dump_info is not None and (info_msg := self.dump_info()):
