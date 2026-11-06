@@ -246,15 +246,6 @@ def _restore_trtllm_decode_dp_padding(
     )
 
 
-def _flashmla_kv_padded_heads(num_heads: int) -> int:
-    if num_heads <= 64:
-        return 64
-    if num_heads <= 128:
-        return 128
-    # Keep original head count if it exceeds current padded variants.
-    return num_heads
-
-
 @dataclass(frozen=True)
 class DSAFlashMLAMetadata:
     """Metadata only needed by FlashMLA"""
@@ -675,10 +666,19 @@ class DeepseekSparseAttnBackend(
             deterministic=get_exec().deterministic.enable_deterministic_inference,
         )
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.resolve(model_runner)
-        self.flashmla_kv_num_q_heads = _flashmla_kv_padded_heads(self.num_q_heads)
-        self.flashmla_kv_num_q_heads_prefill = _flashmla_kv_padded_heads(
-            self.local_num_q_heads
-        )
+        if self.num_q_heads <= 64:
+            self.flashmla_kv_num_q_heads = 64
+        elif self.num_q_heads <= 128:
+            self.flashmla_kv_num_q_heads = 128
+        else:
+            # Keep original head count if it exceeds current padded variants.
+            self.flashmla_kv_num_q_heads = self.num_q_heads
+        if self.local_num_q_heads <= 64:
+            self.flashmla_kv_num_q_heads_prefill = 64
+        elif self.local_num_q_heads <= 128:
+            self.flashmla_kv_num_q_heads_prefill = 128
+        else:
+            self.flashmla_kv_num_q_heads_prefill = self.local_num_q_heads
         self.enable_auto_select_prefill_impl = self.dsa_prefill_impl == "flashmla_auto"
         self._sink_pad_cache: dict[tuple[int, int], torch.Tensor] = {}
         # Keep graph-captured buffers alive per stream.
@@ -3522,12 +3522,11 @@ class DeepseekSparseAttnBackend(
         # TODO the 2nd dim is seq_len_q, need to be >1 when MTP
         q_all = q_all.view(-1, 1, layer.tp_q_head_num, layer.head_dim)
         num_q_heads = q_all.shape[2]
-        target_q_heads = _flashmla_kv_padded_heads(num_q_heads)
-        assert target_q_heads == (
+        target_q_heads = (
             self.flashmla_kv_num_q_heads_prefill
             if self.attn_dcp_size > 1 and not dcp_partial
             else self.flashmla_kv_num_q_heads
-        ), (target_q_heads, dcp_partial)
+        )
         if target_q_heads != num_q_heads:
             # Pad q heads to match FlashMLA decode supported head-count variants.
             q_input = q_all.new_zeros(
