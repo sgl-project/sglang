@@ -4,7 +4,7 @@ import dataclasses
 import os
 import threading
 import unittest
-from collections import defaultdict
+from collections import defaultdict, deque
 from types import SimpleNamespace
 from unittest.mock import ANY, Mock, call, patch
 
@@ -20,6 +20,7 @@ from sglang.srt.disaggregation.common.staging_buffer import (
 from sglang.srt.disaggregation.common.staging_handler import (
     DecodeStagingHandler,
     handle_staging_req,
+    prefetch_staging_reqs,
 )
 from sglang.srt.disaggregation.common.utils import (
     FastQueue,
@@ -37,6 +38,7 @@ from sglang.srt.disaggregation.mooncake.conn import (
     TransferInfo,
 )
 from sglang.srt.disaggregation.nixl.conn import NixlKVManager
+from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     build_transfer_entry_pairs,
@@ -84,6 +86,57 @@ def _static_storage(pool, draft=None, total_kv_layers=None) -> StaticKVStorage:
     return StaticKVStorage(
         None, allocator, draft_token_to_kv_pool=draft, num_hidden_layers=total_kv_layers
     )
+
+
+class TestBatchStagingReservations(CustomTestCase):
+    def test_incremental_reservations_cover_each_chunk_once(self):
+        socket = Mock()
+        session = SimpleNamespace(
+            is_dummy=False,
+            dst_kv_indices=list(range(10)),
+            endpoint="127.0.0.1",
+            dst_port=1234,
+        )
+        requested, sockets = set(), {}
+        args = (7, {7: {"session": session}}, {"page_size": 16}, 32, requested, sockets)
+        with patch("zmq.Context.instance") as context:
+            context.return_value.socket.return_value = socket
+            prefetch_staging_reqs(*args, upto_tokens=16)
+            self.assertEqual(socket.send_multipart.call_count, 1)
+            prefetch_staging_reqs(*args, upto_tokens=33)
+            self.assertEqual(socket.send_multipart.call_count, 2)
+            prefetch_staging_reqs(*args, upto_tokens=160)
+            messages = [c.args[0] for c in socket.send_multipart.call_args_list]
+            self.assertEqual([int(m[2]) for m in messages], list(range(5)))
+            self.assertEqual(sum(int(m[3]) for m in messages), 10)
+            socket.reset_mock()
+            requested.clear()
+            session.is_dummy = True
+            prefetch_staging_reqs(*args, upto_tokens=32)
+            socket.send_multipart.assert_not_called()
+            session.is_dummy = False
+            prefetch_staging_reqs(*args)
+            self.assertEqual(socket.send_multipart.call_count, 5)
+
+    def test_master_switch_and_unsupported_manager_fallback(self):
+        prefetch = Mock()
+        manager = SimpleNamespace(
+            transfer_infos={7: {}}, _prefetch_staging_reqs=prefetch
+        )
+        scheduler = SimpleNamespace(
+            disagg_prefill_bootstrap_queue=SimpleNamespace(kv_manager=manager)
+        )
+        batch = SimpleNamespace(reqs=[SimpleNamespace(bootstrap_room=7, extend_end=33)])
+        run = SchedulerDisaggregationPrefillMixin.maybe_prefetch_staging_for_batch
+        with envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True):
+            run(scheduler, batch)
+            prefetch.assert_called_once_with(7, upto_tokens=33)
+        prefetch.reset_mock()
+        with envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(False):
+            run(scheduler, batch)
+            prefetch.assert_called_once_with(7)
+        del manager._prefetch_staging_reqs
+        run(scheduler, batch)
 
 
 class TestMixedSWAKVBlockScales(CustomTestCase):
@@ -1689,6 +1742,8 @@ class TestStagingScatterLifecycle(CustomTestCase):
         handler._room_tokens = {room: object()}
         handler._inflight_submits = {}
         handler._claimed_chunks = set()
+        handler._defer_scatter = False
+        handler._pending_scatters = deque()
         handler._scatter_region = Mock(return_value=True)
         self.assertTrue(handler.submit_chunk_scatter(room, 0, 0, 3))
 
@@ -1734,6 +1789,8 @@ class TestStagingScatterLifecycle(CustomTestCase):
         handler._inflight_submits = {}
         handler._claimed_chunks = set()
         handler._closing_rooms = set()
+        handler._defer_scatter = False
+        handler._pending_scatters = deque()
         handler._free_and_send_watermark = Mock()
 
         scatter_started = threading.Event()
@@ -1772,6 +1829,70 @@ class TestStagingScatterLifecycle(CustomTestCase):
         handler._free_and_send_watermark.assert_called_once_with(alloc_id, decode_req)
         self.assertNotIn(room, context.room_receivers)
         self.assertNotIn(room, context.room_bootstrap)
+
+    def make_deferred_handler(self, defer=True):
+        room = 7
+        receiver = SimpleNamespace(chunk_staging_infos=[(5, 4096, 0, 8192, 3)])
+        request = SimpleNamespace(_chunk_events=[], _staging_all_success=False)
+        handler = object.__new__(DecodeStagingHandler)
+        handler.device = torch.device("cpu")
+        handler.tp_rank = 0
+        handler.staging_allocator = SimpleNamespace(_scatter_stream=Mock())
+        handler.kv_manager = SimpleNamespace(
+            _staging_ctx=SimpleNamespace(
+                room_receivers={room: receiver}, room_bootstrap={room: object()}
+            )
+        )
+        handler._staging_lifecycle = threading.Condition()
+        handler._room_to_decode_req = {room: request}
+        handler._room_to_receiver = {room: receiver}
+        handler._room_tokens = {room: object()}
+        handler._writer_counts = {}
+        handler._inflight_submits = {}
+        handler._claimed_chunks = set()
+        handler._closing_rooms = set()
+        handler._defer_scatter = defer
+        handler._pending_scatters = deque()
+        handler._scatter_region = Mock(return_value=True)
+        handler._free_and_send_watermark = Mock()
+        handler.num_writers_for = Mock(return_value=2)
+        return handler, request, receiver
+
+    @patch("sglang.srt.disaggregation.common.staging_handler.create_device_event")
+    def test_deferred_fanin_uses_forward_stream_and_waits_before_free(self, make_event):
+        handler, request, receiver = self.make_deferred_handler()
+        self.assertFalse(handler.handle_chunk_arrived(7, 0, 0, 3, "writer-0"))
+        self.assertTrue(handler.handle_chunk_arrived(7, 0, 0, 3, "writer-1"))
+        handler._scatter_region.assert_not_called()
+        stream = Mock()
+        handler.flush_pending_scatters(stream)
+        handler._scatter_region.assert_called_once_with(
+            4096, 0, 3, request, receiver, stream
+        )
+        event = make_event.return_value
+        event.record.assert_called_once_with(stream)
+        self.assertEqual(
+            receiver.chunk_staging_infos[0][1], StagingAllocator.CHUNK_SCATTERED
+        )
+        event.query.return_value = False
+        handler.advance_scatter(request)
+        handler._free_and_send_watermark.assert_not_called()
+        order = Mock()
+        order.attach_mock(event.synchronize, "wait")
+        order.attach_mock(handler._free_and_send_watermark, "free")
+        handler.release_room(7, request, receiver)
+        self.assertEqual(order.mock_calls, [call.wait(), call.free(5, request)])
+
+    @patch("sglang.srt.disaggregation.common.staging_handler.create_device_event")
+    def test_disabled_scatter_submits_on_background_stream(self, make_event):
+        handler, _, _ = self.make_deferred_handler(defer=False)
+        handler.num_writers_for.return_value = 1
+        self.assertTrue(handler.handle_chunk_arrived(7, 0, 0, 3, "writer"))
+        handler._scatter_region.assert_called_once()
+        make_event.return_value.record.assert_called_once_with(
+            handler.staging_allocator._scatter_stream
+        )
+        self.assertFalse(handler._pending_scatters)
 
 
 class TestMooncakeHiSparseSpecIndices(CustomTestCase):
@@ -1828,6 +1949,7 @@ class TestMooncakeHiSparseSpecIndices(CustomTestCase):
 class TestHiSparseStagedSpecRelay(CustomTestCase):
     def test_builds_lightweight_eagle_relay_handle(self):
         future_map = object.__new__(FutureMap)
+        future_map._deferred_relay = None
         future_map.spec_algo = SpeculativeAlgorithm.EAGLE
         future_map.dsa_topk_indices_buf = None
         future_indices = torch.tensor([2, 5], device="cpu")
@@ -1840,6 +1962,7 @@ class TestHiSparseStagedSpecRelay(CustomTestCase):
     @patch("sglang.srt.managers.overlap_utils.gather_spec_extras")
     def test_staged_relay_restores_rejection_sampling_probs(self, gather_spec_extras):
         future_map = object.__new__(FutureMap)
+        future_map._deferred_relay = None
         future_map.spec_algo = SpeculativeAlgorithm.EAGLE
         future_map.device = torch.device("cpu")
         future_map.need_topk = True

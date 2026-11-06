@@ -228,7 +228,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
     def test_deferred_features_are_not_packed(self):
         from sglang.srt.managers.req_types import MultimodalDataItem
         from sglang.srt.multimodal.modality import Modality
-        from sglang.srt.utils.cuda_ipc_transport_utils import (
+        from sglang.srt.multimodal.transport.cuda_ipc import (
             DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
         )
         from sglang.srt.utils.cuda_vmm_transport_utils import (
