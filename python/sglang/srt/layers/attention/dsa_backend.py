@@ -68,7 +68,10 @@ from sglang.srt.layers.attention.dsa.dsa_backend_mtp_precompute import (
 )
 from sglang.srt.layers.attention.dsa.dsa_dcp import (
     DcpPageTableCache,
+    dcp_gathered_page_table,
+    dcp_gathered_prefill_crossover,
     dcp_trtllm_sparse_attention,
+    dcp_use_gathered_prefill,
     localize_dcp_page_table,
 )
 from sglang.srt.layers.attention.dsa.dsa_dcp_sharded import (
@@ -113,6 +116,7 @@ from sglang.srt.layers.cp.utils import (
     cp_local_rope_positions,
     is_cp_active,
 )
+from sglang.srt.layers.dcp import is_dsa_dcp_gathered_prefill
 from sglang.srt.layers.dcp.layout import (
     dsa_shards_index_k,
     filter_dcp_local_chunk_kv_indices,
@@ -605,6 +609,7 @@ class DeepseekSparseAttnBackend(
         self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
         self.kv_lora_rank = model_runner.model_config.kv_lora_rank
         self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
+        self.v_head_dim = model_runner.model_config.v_head_dim
         # FlashMLA cannot tell the 528 B/token zero-RoPE cache from V4.1 by shape.
         self.flashmla_kv_format = "V32_NO_ROPE" if self.qk_rope_head_dim == 0 else "V32"
 
@@ -614,6 +619,9 @@ class DeepseekSparseAttnBackend(
         self._kv_shard_pool = get_kv_shard_pool(self.token_to_kv_pool)
         self.hisparse_coordinator = model_runner.hisparse_coordinator
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self.dcp_gathered_prefill_crossover = self._init_dcp_prefill_crossover(
+            model_runner
+        )
 
         self.use_mha: bool = False
         # Dense MHA expands prefix KV outside the DSA metadata path. Keep
@@ -1544,7 +1552,99 @@ class DeepseekSparseAttnBackend(
             kpool_inputs=kpool_inputs,
         )
         self.forward_metadata = metadata
+        # Re-plan only over this backend's own plan: another planner's metadata
+        # (prepare_context_parallel_metadata_for_dcp) is not ours to replace.
+        if (
+            _is_hip
+            and self.attn_dcp_size > 1
+            and (
+                forward_batch.attn_dcp_metadata is None
+                or is_dsa_dcp_gathered_prefill(forward_batch.attn_dcp_metadata)
+            )
+        ):
+            forward_batch.attn_dcp_metadata = self._plan_dcp_gathered_prefill(
+                forward_batch, page_table.shape[1]
+            )
         self.init_kernel_metadata(forward_batch)
+
+    def _dcp_gathered_prefill(self, forward_batch: ForwardBatch) -> bool:
+        # A sharded index-K gathers its own KV and breaks the replicated-index
+        # assumption this route is planned against.
+        if not _is_hip or self.dsa_shards_index_k or self.attn_dcp_size == 1:
+            return False
+        return is_dsa_dcp_gathered_prefill(forward_batch.attn_dcp_metadata)
+
+    def _init_dcp_prefill_crossover(self, model_runner) -> float:
+        parallel = get_parallel()
+        # The partials are projected before the merge, and the query is built
+        # locally, only on the a2a backend with q-replicate on.
+        a2a = parallel.dcp_comm_backend in ("a2a", "fi_a2a")
+        crossover = dcp_gathered_prefill_crossover(
+            v_head_dim=self.v_head_dim,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            # The owned route's a2a carries the partials in the model dtype.
+            partial_dtype=model_runner.dtype,
+            kv_dtype=self.token_to_kv_pool.dtype,
+            project_before_merge=a2a,
+            q_all_gather=not (a2a and parallel.dcp_replicate_q_proj),
+        )
+        if self.attn_dcp_size > 1:
+            logger.info(
+                "dsa dcp gathered prefill: crossover %.3f prefix tokens per "
+                "extend token and gathered head",
+                crossover,
+            )
+        return crossover
+
+    def _plan_dcp_gathered_prefill(
+        self, forward_batch: ForwardBatch, page_table_width: int
+    ):
+        """Gathered-prefix DCP prefill plan, or None to attend owned slots."""
+        if not (
+            _is_hip
+            and self.dsa_prefill_impl == "triton"
+            and not self.use_mha
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and not self._is_in_tc_piecewise_cuda_graph()
+            and not self._is_in_breakable_cuda_graph()
+            and forward_batch.extend_prefix_lens is not None
+            and dcp_use_gathered_prefill(
+                forward_batch.extend_prefix_lens_cpu,
+                forward_batch.extend_num_tokens,
+                self.num_dcp_q_heads,
+                self.dcp_gathered_prefill_crossover,
+            )
+        ):
+            return None
+        from sglang.kernels.ops.attention.kv_indices import (
+            create_chunked_prefix_cache_kv_indices,
+        )
+        from sglang.srt.layers.dcp.planner import (
+            prepare_decode_context_parallel_metadata,
+        )
+
+        dcp_meta = prepare_decode_context_parallel_metadata(
+            seq_lens=forward_batch.seq_lens,
+            extend_prefix_lens=forward_batch.extend_prefix_lens,
+            extend_prefix_lens_cpu=forward_batch.extend_prefix_lens_cpu,
+            extend_seq_lens=forward_batch.extend_seq_lens,
+            req_pool_indices=forward_batch.req_pool_indices,
+            req_to_token=self.req_to_token,
+            seq_lens_sum=forward_batch.seq_lens_sum,
+            kv_buffer_shape=self.token_to_kv_pool.get_kv_buffer_shape()[0],
+            kv_cache_dtype=self.token_to_kv_pool.dtype,
+            kv_cache_device=forward_batch.seq_lens.device,
+            create_chunked_prefix_cache_kv_indices_fn=create_chunked_prefix_cache_kv_indices,
+        )
+        dcp_meta.dsa_page_table_1 = dcp_gathered_page_table(
+            dcp_meta.dcp_kv_indptr,
+            dcp_meta.dcp_kv_indices,
+            forward_batch.seq_lens,
+            page_table_width,
+        )
+        dcp_meta.dsa_gathered_prefill = True
+        return dcp_meta
 
     def _cal_indexer_k_start_end(
         self,
@@ -2381,6 +2481,10 @@ class DeepseekSparseAttnBackend(
 
         # Do absorbed multi-latent attention (MLA path)
         kv_cache = self.kv_layers.read(layer.layer_id).key()
+        dcp_gathered = self._dcp_gathered_prefill(forward_batch)
+        if dcp_gathered:
+            # The caller all-gathered the prefix and appended this extend's KV.
+            kv_cache = forward_batch.attn_dcp_metadata.dcp_kv_buffer
         if self.dsa_shards_index_k:
             kv_cache = self.dcp_gather_kv_cache(kv_cache, forward_batch, metadata)
 
@@ -2415,7 +2519,7 @@ class DeepseekSparseAttnBackend(
                 "rejected at launch)."
             )
 
-        if self.use_fused_topk:
+        if self.use_fused_topk and not dcp_gathered:
             if topk_indices is not None:
                 topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
 
@@ -2438,7 +2542,11 @@ class DeepseekSparseAttnBackend(
             elif topk_transform_method == TopkTransformMethod.PAGED:
                 assert metadata.dsa_extend_seq_lens_list is not None
                 page_table_1 = transform_index_page_table_prefill(
-                    page_table=metadata.page_table_1,
+                    page_table=(
+                        forward_batch.attn_dcp_metadata.dsa_page_table_1
+                        if dcp_gathered
+                        else metadata.page_table_1
+                    ),
                     topk_indices=topk_indices,
                     extend_lens_cpu=metadata.dsa_extend_seq_lens_list,
                     page_size=1,
@@ -2485,7 +2593,12 @@ class DeepseekSparseAttnBackend(
                 v_head_dim=layer.v_head_dim,
             )
         elif dsa_impl == "triton":
-            if _is_hip and self.attn_dcp_size > 1 and not self.dsa_shards_index_k:
+            if (
+                _is_hip
+                and self.attn_dcp_size > 1
+                and not self.dsa_shards_index_k
+                and not dcp_gathered
+            ):
                 assert topk_transform_method == TopkTransformMethod.PAGED
                 return self._forward_triton_dcp(
                     q_nope=q_nope,
@@ -4422,12 +4535,17 @@ class DeepseekSparseAttnBackend(
     def get_indexer_metadata(
         self, layer_id: int, forward_batch: ForwardBatch
     ) -> DSAIndexerMetadata:
-        force_unfused = not self.use_fused_topk or (
-            self.hisparse_coordinator is not None
-            and (
-                forward_batch.forward_mode.is_decode_or_idle()
-                or forward_batch.forward_mode.is_target_verify()
+        force_unfused = (
+            not self.use_fused_topk
+            or (
+                self.hisparse_coordinator is not None
+                and (
+                    forward_batch.forward_mode.is_decode_or_idle()
+                    or forward_batch.forward_mode.is_target_verify()
+                )
             )
+            # The gathered prefix is addressed by position, not by slot.
+            or self._dcp_gathered_prefill(forward_batch)
         )
         return DSAIndexerMetadata(
             attn_metadata=self.forward_metadata,

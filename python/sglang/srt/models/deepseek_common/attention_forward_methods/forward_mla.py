@@ -25,6 +25,7 @@ from sglang.srt.layers.dcp import (
     all_gather_q_for_mla_decode,
     cp_lse_ag_out_rs_mla,
     dcp_a2a_lse_reduce,
+    is_dsa_dcp_gathered_prefill,
 )
 from sglang.srt.layers.dcp.layout import dsa_shards_index_k
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
@@ -171,10 +172,11 @@ class DeepseekMLAForwardMixin:
             or mode.is_target_verify()
             or (
                 self.use_dsa
-                # ROCm only: the draft shards its KV like the target, so its
-                # extend merges per-rank partials the same way the target does.
+                # ROCm only: the draft shards its KV like the target, and a
+                # gathered prefix attends this rank's heads, not merged partials.
                 and mode.is_extend(include_draft_extend_v2=_is_hip)
                 and not dsa_shards_index_k()
+                and not is_dsa_dcp_gathered_prefill(forward_batch.attn_dcp_metadata)
             )
         )
 
@@ -188,7 +190,13 @@ class DeepseekMLAForwardMixin:
             return True
         # DSA extend on HIP merges owned partials like decode, so replicating
         # q_b_proj replaces the per-layer [T, H, 576] Q all-gather there too.
-        return self.use_dsa and _is_hip and mode.is_extend(include_draft_extend_v2=True)
+        # A gathered prefix attends this rank's heads, so it needs the local Q.
+        return (
+            self.use_dsa
+            and _is_hip
+            and mode.is_extend(include_draft_extend_v2=True)
+            and not is_dsa_dcp_gathered_prefill(forward_batch.attn_dcp_metadata)
+        )
 
     def init_mla_forward(self: DeepseekV2AttentionMLA):
         self.flashinfer_mla_disable_ragged = (
