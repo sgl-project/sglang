@@ -11,8 +11,8 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     fp8_min,
 )
 
-# per_token_group_quant_8bit_v2 is DEPRECATED (no production call sites); the
-# kernel is kept only as the perf baseline for this benchmark.
+# per_token_group_quant_8bit_v2 is the perf baseline; production only routes
+# fp32 UE8M0 scales to it.
 from sglang.kernels.ops.quantization.per_token_group_quant import (
     per_token_group_quant,
 )
@@ -22,7 +22,7 @@ from sglang.kernels.ops.quantization.per_token_group_quant_8bit_v2 import (
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
-    est_time=25, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
+    est_time=25, stage="base-b-kernel-benchmark", runner_config="1-gpu-small"
 )
 
 # name -> (moe_intermediate_size, topk, num_experts, group_size)

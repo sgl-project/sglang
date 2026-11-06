@@ -17,7 +17,7 @@ from typing import Any
 
 from transformers.configuration_utils import PretrainedConfig
 
-from sglang.srt.configs.nemotron_h import NemotronHConfig
+from sglang.srt.configs.nemotron_h import NemotronHConfig, NemotronHPuzzleConfig
 from sglang.srt.configs.radio import RadioConfig
 from sglang.srt.multimodal.internvl_utils import IMAGENET_MEAN, IMAGENET_STD
 
@@ -78,7 +78,13 @@ class NemotronH_Nano_VL_V2_Config(PretrainedConfig):
 
         # Handle both cases: when loading from JSON (llm_config is dict) and when called internally by transformers (llm_config; vision_config are None)
         if llm_config is not None:
-            self.llm_config = NemotronHConfig(**llm_config)
+            if llm_config.get("model_type") != "nemotron_h_puzzle":
+                self.llm_config = NemotronHConfig(**llm_config)
+            else:
+                self.llm_config = NemotronHPuzzleConfig(**llm_config)
+                # Puzzle requires block_configs; nested diff serialization cannot
+                # construct a default instance of its config.
+                self.has_no_defaults_at_init = True
             assert isinstance(vision_config, dict), "vision_config must be a dictionary"
             self.raw_vision_config = vision_config
         else:

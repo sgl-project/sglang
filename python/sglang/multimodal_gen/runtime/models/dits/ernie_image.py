@@ -87,34 +87,19 @@ def _ernie_norm_scale_shift(
     first call verifies ``torch.equal`` against the eager chain and disables
     the fast path permanently on any mismatch.
     """
-    verified = _ERNIE_NORM.verified
     if (
-        not _ERNIE_NORM.disabled
-        and x.is_cuda
+        x.is_cuda
         and norm.variance_size_override is None
         and can_use_fused_rmsnorm_scale_shift(x.dtype, x.shape[-1])
-        and (verified or _ERNIE_NORM.can_attempt_once())
     ):
-        try:
-            out = fused_rmsnorm_scale_shift_bitexact(
+        return _ERNIE_NORM.run(
+            lambda: fused_rmsnorm_scale_shift_bitexact(
                 x, norm.weight, scale, shift, norm.variance_epsilon
-            )
-        except Exception as exc:
-            _ERNIE_NORM.on_exception(exc, logger=logger)
-        else:
-            if verified:
-                return out
-            return _ERNIE_NORM.accept_or_fallback(
-                out,
-                _eager_norm_scale_shift(norm, x, scale, shift),
-                logger=logger,
-                mismatch_msg=(
-                    "ERNIE fused-norm fast path is not bit-exact against this "
-                    "platform's rmsnorm dispatch; falling back to eager"
-                ),
-                diagnostic_hint=flashinfer_rmsnorm_diagnostic_hint,
-            )
-
+            ),
+            lambda: _eager_norm_scale_shift(norm, x, scale, shift),
+            logger=logger,
+            diagnostic_hint=flashinfer_rmsnorm_diagnostic_hint,
+        )
     return _eager_norm_scale_shift(norm, x, scale, shift)
 
 
@@ -162,10 +147,6 @@ def _ernie_gated_norm_scale_shift(
                 (ref, res_ref),
                 equal=tensors_equal,
                 logger=logger,
-                mismatch_msg=(
-                    "ERNIE fused gated-norm fast path is not bit-exact against "
-                    "this platform's rmsnorm dispatch; falling back to eager"
-                ),
                 diagnostic_hint=flashinfer_rmsnorm_diagnostic_hint,
             )
 
@@ -456,29 +437,12 @@ def _ernie_rope(
     rounding boundary exactly; the first call still verifies ``torch.equal``
     against the eager chain and disables the fast path on any mismatch.
     """
-    verified = _ERNIE_ROPE.verified
-    if (
-        not _ERNIE_ROPE.disabled
-        and x.is_cuda
-        and x.dtype is torch.bfloat16
-        and (verified or _ERNIE_ROPE.can_attempt_once())
-    ):
-        try:
-            out = fused_rope_rotate_half_bitexact(x, cos_, sin_)
-        except Exception as exc:
-            _ERNIE_ROPE.on_exception(exc, logger=logger)
-        else:
-            if verified:
-                return out
-            return _ERNIE_ROPE.accept_or_fallback(
-                out,
-                _apply_rotary_bshd_eager(x, cos_, sin_),
-                logger=logger,
-                mismatch_msg=(
-                    "ERNIE fused RoPE fast path is not bit-exact on this "
-                    "platform; falling back to eager"
-                ),
-            )
+    if x.is_cuda and x.dtype is torch.bfloat16:
+        return _ERNIE_ROPE.run(
+            lambda: fused_rope_rotate_half_bitexact(x, cos_, sin_),
+            lambda: _apply_rotary_bshd_eager(x, cos_, sin_),
+            logger=logger,
+        )
     return _apply_rotary_bshd_eager(x, cos_, sin_)
 
 
@@ -554,10 +518,6 @@ def _ernie_qknorm_rope(
                 ref,
                 equal=tensors_equal,
                 logger=logger,
-                mismatch_msg=(
-                    "ERNIE fused QKNorm+RoPE fast path is not bit-exact on "
-                    "this platform; falling back to split kernels"
-                ),
             )
 
     return _ernie_qknorm_rope_reference(
@@ -577,31 +537,17 @@ def _ernie_geglu(gate_up: torch.Tensor) -> torch.Tensor:
     to bf16 before the multiply exactly like the eager two-step; first call
     self-verifies like :func:`_ernie_rope`.
     """
-    verified = _ERNIE_GEGLU.verified
     if (
-        not _ERNIE_GEGLU.disabled
-        and gate_up.dtype in (torch.bfloat16, torch.float16)
+        gate_up.dtype in (torch.bfloat16, torch.float16)
         and gate_up.is_cuda
         and gate_up.is_contiguous()
         and gate_up.shape[-1] % 2 == 0
-        and (verified or _ERNIE_GEGLU.can_attempt_once())
     ):
-        try:
-            out = gelu_and_mul_with_activation_rounding(gate_up)
-        except Exception as exc:
-            _ERNIE_GEGLU.on_exception(exc, logger=logger)
-        else:
-            if verified:
-                return out
-            return _ERNIE_GEGLU.accept_or_fallback(
-                out,
-                _eager_geglu(gate_up),
-                logger=logger,
-                mismatch_msg=(
-                    "ERNIE fused GELU-mul fast path is not bit-exact on this "
-                    "platform; falling back to eager"
-                ),
-            )
+        return _ERNIE_GEGLU.run(
+            lambda: gelu_and_mul_with_activation_rounding(gate_up),
+            lambda: _eager_geglu(gate_up),
+            logger=logger,
+        )
     return _eager_geglu(gate_up)
 
 

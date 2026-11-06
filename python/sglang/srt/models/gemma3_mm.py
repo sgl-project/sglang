@@ -27,6 +27,7 @@ import torch
 from torch import nn
 from transformers import Gemma3Config, PreTrainedModel
 
+from sglang.srt.hf_transformers import get_processor
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.layernorm import Gemma3RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -35,21 +36,17 @@ from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
     pad_mm_token_pairs,
 )
-from sglang.srt.managers.schedule_batch import (
-    MultimodalDataItem,
-    MultimodalInputs,
-    flatten_nested_list,
-)
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.models.gemma3_causal import Gemma3ForCausalLM
 from sglang.srt.models.siglip import SiglipVisionModel
-from sglang.srt.utils import add_prefix
-from sglang.srt.utils.hf_transformers_utils import get_processor
+from sglang.srt.utils import add_prefix, flatten_nested_list, is_xpu
 
 logger = logging.getLogger(__name__)
 
@@ -221,7 +218,8 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
         mask_dtype: torch.dtype,
     ):
         """Prepare attention masks for multimodal inputs."""
-        if isinstance(get_attn_backend(), TritonAttnBackend):
+        backend = get_attn_backend()
+        if isinstance(backend, TritonAttnBackend):
             assert forward_batch.forward_mode == ForwardMode.EXTEND
             bidirectional_attn_masks_list = []
             bidirectional_attn_mask_indptr = torch.zeros(
@@ -272,6 +270,47 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
                 get_attn_backend().forward_metadata.custom_mask = (
                     bidirectional_attn_masks
                 )
+        elif is_xpu():
+            # XPU takes a per extend-token image-block id (image index, -1 for
+            # text); the sgl-kernel-xpu FMHA prefill turns it into bidirectional
+            # image attention (see xpu_backend.forward_extend). Import lazily so
+            # non-XPU builds are unaffected.
+            from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
+
+            if isinstance(backend, XPUAttentionBackend):
+                assert forward_batch.forward_mode == ForwardMode.EXTEND
+                backend.bidirectional_block_ids = self._build_xpu_image_block_ids(
+                    forward_batch=forward_batch, device=input_ids.device
+                )
+
+    @staticmethod
+    def _build_xpu_image_block_ids(forward_batch: ForwardBatch, device):
+        # Image spans are sglang layout, so they are read here; the kernel package
+        # cannot import sglang types and only builds the id tensor.
+        from sgl_kernel.flash_attn import build_bidirectional_block_ids
+
+        # Ids cover whole sequences (cached prefix + extend); with a prefix the backend
+        # pads the queries to match. None keeps the plain causal path.
+        seq_lens, block_spans = [], []
+        for i in range(forward_batch.batch_size):
+            start = forward_batch.extend_prefix_lens_cpu[i]
+            end = start + forward_batch.extend_seq_lens_cpu[i]
+            spans = []
+            mm_inputs = forward_batch.mm_inputs[i]
+            if mm_inputs is not None:
+                for mm_item in mm_inputs.mm_items:
+                    if mm_item.is_image():
+                        for begin, last in mm_item.offsets:
+                            last = min(last, end - 1)
+                            # Fewer than two image tokens in this extend attend the
+                            # same keys under causal attention.
+                            if max(begin, start) < last:
+                                spans.append((begin, last))
+            seq_lens.append(end)
+            block_spans.append(spans)
+        return build_bidirectional_block_ids(
+            seq_lens=seq_lens, block_spans=block_spans, device=device
+        )
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.language_model.get_input_embeddings()

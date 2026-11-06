@@ -11,7 +11,7 @@ No server, no model loading — pure CPU.
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 import asyncio
 import concurrent.futures
@@ -27,7 +27,7 @@ import requests
 import torch
 from PIL import Image
 
-from sglang.srt.managers.schedule_batch import Modality
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.utils import common
 from sglang.srt.utils.nvjpeg_decoder import _NvJpegDecoderPool

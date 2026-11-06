@@ -29,10 +29,7 @@ from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
     pad_mm_tokens,
 )
-from sglang.srt.managers.schedule_batch import (
-    MultimodalDataItem,
-    MultimodalInputs,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.bailing_moe_v3 import (
@@ -67,6 +64,10 @@ class BailingMoeV3VLForConditionalGeneration(nn.Module):
         return BailingMoeV3ForCausalLM.shared_experts_fusion_disable_reason(
             hf_config.text_config, quant_config
         )
+
+    @staticmethod
+    def num_fusable_shared_experts(hf_config) -> int:
+        return BailingMoeV3ForCausalLM.num_fusable_shared_experts(hf_config.text_config)
 
     def __init__(
         self,
