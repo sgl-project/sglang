@@ -23,6 +23,7 @@ import torch
 
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.environ import envs
+from sglang.srt.hf_transformers import AutoConfig
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -58,7 +59,6 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_available_gpu_memory, replace_submodule
-from sglang.srt.utils.hf_transformers import AutoConfig
 
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 

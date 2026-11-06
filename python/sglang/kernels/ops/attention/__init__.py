@@ -531,7 +531,6 @@ for _mod, _fn, _backend in [
         )
     )
 del _mod, _fn, _backend
-# Its PDL probe reads the device major only, which also enables PDL on ROCm gfx9.
 register_kernel(
     KernelSpec(
         op="attention.dash_sparse_attn_decode",
