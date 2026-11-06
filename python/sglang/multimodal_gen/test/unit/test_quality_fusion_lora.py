@@ -30,10 +30,6 @@ from sglang.kernels.ops.diffusion import (
 from sglang.kernels.ops.diffusion.sites.fused_linear_gelu_site import (
     can_use_linear_gelu_static,
 )
-from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-    maybe_init_distributed_environment_and_model_parallel,
-    model_parallel_is_initialized,
-)
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -48,9 +44,6 @@ from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
 from sglang.multimodal_gen.runtime.models.dits.wanvideo import _WanGELUMLP
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
     _QUALITY_FUSION_HANDLERS,
-)
-from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
-    ensure_distributed_env_defaults,
 )
 
 DIM = 64
@@ -78,13 +71,6 @@ _ADAPTER_SAFE_FUSIONS = {
     MINIMAX_H3_NORM_MODULATE: "norm and modulation, no linear",
     SANA_VIDEO_LINEAR_ATTENTION: "runs on the projections' outputs",
 }
-
-
-def _ensure_single_process_parallel_runtime() -> None:
-    if model_parallel_is_initialized():
-        return
-    ensure_distributed_env_defaults()
-    maybe_init_distributed_environment_and_model_parallel(tp_size=1, sp_size=1)
 
 
 def _wan_gelu_mlp():
@@ -130,7 +116,6 @@ def _attach_dynamic_lora(site: nn.Module, name: str) -> BaseLayerWithLoRA:
 
 
 def _site_with_dynamic_lora(make_site):
-    _ensure_single_process_parallel_runtime()
     torch.manual_seed(0)
     site, linear_names, run = make_site()
     site = site.to(device=DEVICE, dtype=torch.bfloat16)
@@ -154,6 +139,7 @@ def test_every_quality_fusion_has_a_lora_site_or_a_reason():
 
 
 @pytest.mark.parametrize("fusion, make_site", _LORA_SITES)
+@pytest.mark.usefixtures("single_process_model_parallel")
 @torch.no_grad()
 def test_mounted_fusion_keeps_the_dynamic_lora_delta(fusion, make_site):
     site, wrappers, run, x = _site_with_dynamic_lora(make_site)
@@ -173,6 +159,7 @@ def test_mounted_fusion_keeps_the_dynamic_lora_delta(fusion, make_site):
 
 
 @requires_cuda
+@pytest.mark.usefixtures("single_process_model_parallel")
 @torch.no_grad()
 def test_linear_gelu_guard_follows_the_adapter_state():
     site, (wrapper,), _, x = _site_with_dynamic_lora(_wan_gelu_mlp)
@@ -190,8 +177,8 @@ def test_linear_gelu_guard_follows_the_adapter_state():
         FUSED_LINEAR_GELU.unmount(site)
 
 
+@pytest.mark.usefixtures("single_process_model_parallel")
 def test_linear_gelu_static_guard_reads_the_wrapped_layer():
-    _ensure_single_process_parallel_runtime()
     linear = ColumnParallelLinear(
         DIM, 4 * DIM, bias=True, gather_output=False, params_dtype=torch.bfloat16
     )

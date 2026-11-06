@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.dp_attention import get_eager_max_batch_size
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -38,7 +39,6 @@ from sglang.srt.runtime_context import (
     max_speculative_num_draft_tokens,
 )
 from sglang.srt.utils import empty_context, log_info_on_rank0
-from sglang.srt.utils.common import get_eager_max_batch_size
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
@@ -149,13 +149,13 @@ def should_run_flashinfer_autotune(
     else:
         fp8_gemm_needs_autotune = _serves_block_fp8_as_mxfp8_on_flashinfer(mr)
 
-    from sglang.srt.layers.quantization.unquant import get_bf16_gemm_backend
+    from sglang.srt.layers.quantization.unquant import bf16_gemm_needs_autotune
 
     if not (
         moe_needs_autotune
         or fp4_gemm_needs_autotune
         or fp8_gemm_needs_autotune
-        or get_bf16_gemm_backend().is_cutedsl()
+        or bf16_gemm_needs_autotune()
     ):
         return False
 

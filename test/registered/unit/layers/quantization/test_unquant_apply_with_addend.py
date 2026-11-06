@@ -127,6 +127,7 @@ class TestApplyWithAddend(CustomTestCase):
             "non_nvidia",
             "compiling",
             "cutedsl",
+            "splitk",
             "low_m_autotune",
             "hopper_gemv",
             "noncontiguous_addend",
@@ -166,6 +167,15 @@ class TestApplyWithAddend(CustomTestCase):
                         _fake_kernel(kernel_calls, route),
                     )
                 )
+            elif route == "splitk":
+                enter(patch.object(unquant, "use_bf16_splitk_gemm", lambda *a: True))
+                enter(
+                    patch.object(
+                        unquant,
+                        "_bf16_splitk_gemm",
+                        _fake_kernel(kernel_calls, route),
+                    )
+                )
             elif route == "low_m_autotune":
                 enter(
                     patch.object(
@@ -193,7 +203,7 @@ class TestApplyWithAddend(CustomTestCase):
         torch.testing.assert_close(
             output, self._reference(x, before, bias), rtol=_BF16_RTOL, atol=_BF16_ATOL
         )
-        if route in ("cutedsl", "low_m_autotune", "hopper_gemv"):
+        if route in ("cutedsl", "splitk", "low_m_autotune", "hopper_gemv"):
             self.assertEqual(kernel_calls, [route])
 
 
