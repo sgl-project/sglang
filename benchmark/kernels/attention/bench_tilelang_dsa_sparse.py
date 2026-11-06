@@ -22,6 +22,7 @@ TOPK = 2112
 DEFAULT_LIVE_TOPK = 2051
 DEFAULT_KV_LEN = 13_299_712
 DEFAULT_M = (128, 512, 2048, 4096, 8192, 12288, 16384)
+KV_DTYPES = {"bfloat16": torch.bfloat16, "fp8_e4m3": torch.float8_e4m3fn}
 
 
 def _time_ms(fn, warmup: int, repeats: int) -> float:
@@ -153,6 +154,25 @@ def _run_cell(
             "complete_ms": complete_ms,
         }
 
+    if kv.dtype != torch.bfloat16:
+        from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
+            tilelang_sparse_fwd,
+        )
+
+        def run_complete():
+            return tilelang_sparse_fwd(q, kv, indices, 1.0 / math.sqrt(256), d_v=DIM)
+
+        actual = run_complete()
+        torch.cuda.synchronize()
+        complete_ms = _time_ms(run_complete, warmup, repeats)
+        return actual, {
+            "backend": backend,
+            "heads": heads,
+            "m": m,
+            "live_topk": live_topk,
+            "complete_ms": complete_ms,
+        }
+
     q4 = q.unsqueeze(0)
     kv4 = kv.unsqueeze(0)
     indices4 = indices.unsqueeze(0)
@@ -212,12 +232,17 @@ def main():
     parser.add_argument(
         "--index-pattern", choices=("shared", "random"), default="shared"
     )
+    parser.add_argument(
+        "--kv-dtype", choices=tuple(KV_DTYPES), default="bfloat16"
+    )
     args = parser.parse_args()
     if not 0 <= args.live_topk <= TOPK:
         parser.error(f"--live-topk must be in [0, {TOPK}]")
 
     torch.manual_seed(20260928)
-    kv = torch.zeros((args.kv_len, 1, DIM), device="cuda", dtype=torch.bfloat16)
+    kv = torch.zeros(
+        (args.kv_len, 1, DIM), device="cuda", dtype=KV_DTYPES[args.kv_dtype]
+    )
     for m in args.m:
         torch.manual_seed(20260928 + m)
         baseline, baseline_row = _run_cell(
@@ -261,6 +286,7 @@ def main():
                 * 100,
                 "finite": bool(torch.isfinite(candidate).all()),
                 "index_pattern": args.index_pattern,
+                "kv_dtype": args.kv_dtype,
                 "max_abs": delta.abs().max().item(),
                 "mean_abs": delta.abs().mean().item(),
             }

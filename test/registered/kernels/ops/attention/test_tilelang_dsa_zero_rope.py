@@ -68,12 +68,24 @@ class TestPackedRowInference(CustomTestCase):
         self.assertTrue(
             can_use_glm53_triton_sparse_attention(**base, num_tokens=None, num_heads=16)
         )
+        for q_dtype in (torch.bfloat16, torch.float8_e4m3fn):
+            with self.subTest(q_dtype=q_dtype, kv_dtype=torch.float8_e4m3fn):
+                self.assertTrue(
+                    can_use_glm53_triton_sparse_attention(
+                        **base | dict(q_dtype=q_dtype, kv_dtype=torch.float8_e4m3fn),
+                        num_tokens=None,
+                        num_heads=16,
+                    )
+                )
 
         for override in (
             dict(num_tokens=65537, num_heads=16),
             dict(num_tokens=131073, num_heads=8),
             dict(num_tokens=8192, num_heads=16, topk_width=2048),
             dict(num_tokens=8192, num_heads=16, q_dtype=torch.float32),
+            dict(num_tokens=8192, num_heads=16, q_dtype=torch.float8_e4m3fn),
+            dict(num_tokens=8192, num_heads=16, kv_dtype=torch.float8_e4m3fnuz),
+            dict(num_tokens=8192, num_heads=16, kv_dtype=torch.float32),
             dict(num_tokens=8192, num_heads=16, q_rope_dim=64),
             dict(
                 num_tokens=8192,
@@ -85,6 +97,28 @@ class TestPackedRowInference(CustomTestCase):
             args = base | override
             self.assertFalse(can_use_glm53_triton_sparse_attention(**args))
 
+    def test_glm53_fp8_prefill_tuning_covers_measured_rows(self):
+        from sglang.kernels.ops.attention.dsa import triton_sparse_mla
+
+        gate = triton_sparse_mla._is_gfx950_sparse_mla_fp8
+        fp8 = torch.float8_e4m3fn
+        with patch.object(triton_sparse_mla, "is_gfx95_supported", return_value=True):
+            for heads, seq in ((16, 128), (16, 512), (8, 128), (8, 32768)):
+                with self.subTest(heads=heads, seq=seq):
+                    self.assertTrue(gate(fp8, heads, 512, 0, 512, seq))
+            for args in (
+                (fp8, 16, 512, 0, 512, 127),
+                (fp8, 16, 512, 0, 512, 513),
+                (fp8, 8, 512, 0, 512, 64),
+                (fp8, 8, 512, 0, 512, None),
+                (torch.float8_e4m3fnuz, 8, 512, 0, 512, 1024),
+                (torch.bfloat16, 8, 512, 0, 512, 1024),
+            ):
+                with self.subTest(args=args):
+                    self.assertFalse(gate(*args))
+            self.assertTrue(gate(fp8, 16, 512, 64, 576))
+            self.assertTrue(gate(fp8, 16, 512, 64, 576, 65536))
+
     def test_glm53_2051_prune_selects_the_measured_config(self):
         from sglang.kernels.ops.attention.dsa import triton_sparse_mla
 
@@ -93,19 +127,21 @@ class TestPackedRowInference(CustomTestCase):
             "q_nope_ptr": torch.empty(1, 16, 512, device="meta"),
             "kv_ptr": torch.empty(1, 1, 512, device="meta"),
         }
-        with patch.object(triton_sparse_mla, "_IS_GFX95", True):
-            configs = triton_sparse_mla._prune_configs(
-                triton_sparse_mla._SPLIT_DIM_CONFIGS,
-                named_args,
-                USE_FP8_DOT=False,
-                H=16,
-                D_V=512,
-                D_TAIL=0,
-            )
-        self.assertEqual(len(configs), 1)
-        self.assertEqual(configs[0].kwargs["BLOCK_N"], 32)
-        self.assertEqual(configs[0].num_warps, 2)
-        self.assertEqual(configs[0].num_stages, 3)
+        for use_fp8_dot in (False, True):
+            with self.subTest(use_fp8_dot=use_fp8_dot):
+                with patch.object(triton_sparse_mla, "_IS_GFX95", True):
+                    configs = triton_sparse_mla._prune_configs(
+                        triton_sparse_mla._SPLIT_DIM_CONFIGS,
+                        named_args,
+                        USE_FP8_DOT=use_fp8_dot,
+                        H=16,
+                        D_V=512,
+                        D_TAIL=0,
+                    )
+                self.assertEqual(len(configs), 1)
+                self.assertEqual(configs[0].kwargs["BLOCK_N"], 32)
+                self.assertEqual(configs[0].num_warps, 2)
+                self.assertEqual(configs[0].num_stages, 3)
 
     def test_query_strides_are_runtime_arguments(self):
         from sglang.kernels.ops.attention.dsa import (
@@ -542,6 +578,99 @@ class TestTritonDSAZeroRope(CustomTestCase):
                 actual = self._run(q, kv, indices)
                 self.assertEqual(actual.shape, (1, tokens, heads, 512))
                 self.assertTrue(torch.isfinite(actual).all())
+                self.assertTrue(torch.equal(actual, torch.zeros_like(actual)))
+                del q, indices, actual
+                empty_gpu_cache()
+
+    @staticmethod
+    def _fp8_inputs(tokens, heads, seed, live_topk=2051):
+        torch.manual_seed(seed)
+        q = torch.randn(tokens, heads, 512, device="cuda", dtype=torch.bfloat16)
+        kv = torch.randn(4096, 1, 512, device="cuda", dtype=torch.bfloat16)
+        indices = torch.randint(
+            0, 4096, (tokens, 1, 2051), device="cuda", dtype=torch.int32
+        )
+        indices[..., live_topk:] = -1
+        return q, kv.to(torch.float8_e4m3fn), indices
+
+    def test_glm53_raw_fp8_kv_write_matches_cast(self):
+        from sglang.kernels.ops.kvcache.mla_buffer import (
+            set_mla_kv_buffer_triton_fp8_quant,
+        )
+
+        torch.manual_seed(7)
+        nope = torch.randn(64, 1, 512, device="cuda", dtype=torch.bfloat16) * 100
+        rope = nope.new_empty(64, 1, 0)
+        loc = torch.randperm(299, device="cuda")[:64] + 1
+        loc[5] = 0
+        buffer = torch.zeros(300, 1, 512, device="cuda", dtype=torch.uint8)
+        set_mla_kv_buffer_triton_fp8_quant(buffer, loc, nope, rope, torch.float8_e4m3fn)
+        expected = nope.to(torch.float8_e4m3fn).view(torch.uint8)
+        written = loc != 0
+        self.assertTrue(torch.equal(buffer[loc[written]], expected[written]))
+        self.assertTrue(torch.equal(buffer[0], torch.zeros_like(buffer[0])))
+
+    def test_glm53_fp8_kv_matches_torch(self):
+        cases = ((17, 16), (128, 16), (513, 16), (17, 8), (128, 8), (1024, 8))
+        for tokens, heads in cases:
+            for seed in (7, 11):
+                for live_topk in (1, 512, 2051):
+                    with self.subTest(
+                        tokens=tokens, heads=heads, seed=seed, live_topk=live_topk
+                    ):
+                        q, kv, indices = self._fp8_inputs(
+                            tokens, heads, seed, live_topk
+                        )
+                        expected = _torch_sparse_attention(
+                            q.to(torch.float8_e4m3fn),
+                            kv,
+                            indices,
+                            1.0 / math.sqrt(256),
+                            d_v=512,
+                        )
+                        prefill = self._run(q, kv, indices).squeeze(0)
+                        torch.testing.assert_close(
+                            prefill, expected, atol=0.05, rtol=0.05
+                        )
+                        if tokens <= 128:
+                            decode = self._run_decode(q, kv, indices, []).squeeze(0)
+                            torch.testing.assert_close(
+                                decode, expected, atol=0.05, rtol=0.05
+                            )
+
+    def test_glm53_fp8_kv_masked_rows_and_cuda_graph_replay(self):
+        for tokens, heads in ((17, 16), (128, 16), (128, 8)):
+            with self.subTest(tokens=tokens, heads=heads):
+                q, kv, indices = self._fp8_inputs(tokens, heads, seed=7)
+                indices[0].fill_(-1)
+                workspace = []
+                eager = self._run(q, kv, indices)
+                eager_decode = self._run_decode(q, kv, indices, workspace)
+                self.assertTrue(torch.isfinite(eager).all())
+                self.assertTrue(torch.equal(eager[0, 0], torch.zeros_like(eager[0, 0])))
+                torch.cuda.synchronize()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    captured = self._run(q, kv, indices)
+                    captured_decode = self._run_decode(q, kv, indices, workspace)
+                graph.replay()
+                torch.cuda.synchronize()
+                torch.testing.assert_close(captured, eager, atol=0, rtol=0)
+                torch.testing.assert_close(
+                    captured_decode, eager_decode, atol=0, rtol=0
+                )
+
+    def test_glm53_fp8_kv_production_grids_are_finite(self):
+        kv = torch.zeros(2112, 1, 512, device="cuda", dtype=torch.float8_e4m3fn)
+        base_indices = torch.arange(2051, device="cuda", dtype=torch.int32)
+        for tokens, heads in ((65536, 16), (131072, 8)):
+            with self.subTest(tokens=tokens, heads=heads):
+                q = torch.zeros(tokens, heads, 512, device="cuda", dtype=torch.bfloat16)
+                indices = (
+                    base_indices.view(1, 1, -1).expand(tokens, -1, -1).contiguous()
+                )
+                actual = self._run(q, kv, indices)
+                self.assertEqual(actual.shape, (1, tokens, heads, 512))
                 self.assertTrue(torch.equal(actual, torch.zeros_like(actual)))
                 del q, indices, actual
                 empty_gpu_cache()
