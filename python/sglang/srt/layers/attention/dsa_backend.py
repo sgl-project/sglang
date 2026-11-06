@@ -1494,7 +1494,7 @@ class DeepseekSparseAttnBackend(
         self.init_kernel_metadata(forward_batch)
 
     def _dcp_gathered_prefill(self, forward_batch: ForwardBatch) -> bool:
-        if self.dcp_size == 1:
+        if not _is_hip or self.dcp_size == 1:
             return False
         return is_dsa_dcp_gathered_prefill(forward_batch.attn_dcp_metadata)
 
