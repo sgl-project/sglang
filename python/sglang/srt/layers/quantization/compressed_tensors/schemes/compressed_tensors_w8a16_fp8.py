@@ -20,7 +20,10 @@ from sglang.srt.layers.quantization.marlin_utils_fp8 import (
     apply_fp8_marlin_linear,
     prepare_fp8_layer_for_marlin,
 )
-from sglang.srt.layers.quantization.utils import convert_to_channelwise
+from sglang.srt.layers.quantization.utils import (
+    convert_to_channelwise,
+    requantize_with_max_scale,
+)
 from sglang.srt.utils import cpu_has_amx_support, is_cpu
 
 __all__ = ["CompressedTensorsW8A16Fp8"]
@@ -52,13 +55,13 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsLinearScheme):
                 raise NotImplementedError(
                     "CPU compressed-tensors W8A16 FP8 currently supports only per-tensor weight scales."
                 )
-            if layer.weight_scale.numel() != 1:
-                raise NotImplementedError(
-                    "CPU compressed-tensors W8A16 FP8 does not support fused layers with multiple weight scales."
-                )
-            layer.weight = torch.nn.Parameter(layer.weight.data, requires_grad=False)
+            # The CPU GEMM takes a single scale, so fused shards are requantized to the max scale.
+            max_w_scale, weight = requantize_with_max_scale(
+                layer.weight.data, layer.weight_scale.data, layer.logical_widths
+            )
+            layer.weight = torch.nn.Parameter(weight, requires_grad=False)
             layer.weight_scale = torch.nn.Parameter(
-                layer.weight_scale.reshape(()), requires_grad=False
+                max_w_scale.reshape(()), requires_grad=False
             )
             # Packs the weight into the AMX layout and converts the bias to fp32.
             _amx_process_weight_after_loading(layer, ["weight"])
