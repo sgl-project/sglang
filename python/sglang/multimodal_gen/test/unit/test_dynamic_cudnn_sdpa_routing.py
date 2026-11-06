@@ -1,6 +1,7 @@
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -98,6 +99,40 @@ class TestDynamicCudnnSDPARouting(unittest.TestCase):
             self.assertEqual(get_forward_context().quality, "lossless")
         with set_forward_context(0, None):
             self.assertEqual(get_forward_context().quality, "exact")
+
+
+def _impl(capability: tuple[int, int], head_size: int = 128) -> DynamicCudnnSDPAImpl:
+    # the constructor also pins the process-wide FA version; keep it untouched
+    with (
+        patch("torch.cuda.get_device_capability", return_value=capability),
+        patch(
+            "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn.set_fa_ver"
+        ),
+    ):
+        return DynamicCudnnSDPAImpl(
+            num_heads=2, head_size=head_size, causal=False, softmax_scale=0.125
+        )
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+class TestDynamicCudnnSelection(unittest.TestCase):
+    """Which kernel the constructed impl picks for each Blackwell variant."""
+
+    def test_sm103_long_self_attention_takes_fa4(self):
+        impl = _impl((10, 3))
+        self.assertFalse(impl._use_cudnn_sdpa(*_qkv(16384, 16384, 2, 128)))
+        self.assertFalse(impl._use_cudnn_sdpa(*_qkv(75600, 75600, 2, 128)))
+
+    def test_sm103_short_cross_and_hd64_keep_cudnn(self):
+        impl = _impl((10, 3))
+        self.assertTrue(impl._use_cudnn_sdpa(*_qkv(8192, 8192, 2, 128)))
+        self.assertTrue(impl._use_cudnn_sdpa(*_qkv(37800, 512, 2, 128)))
+        impl64 = _impl((10, 3), head_size=64)
+        self.assertTrue(impl64._use_cudnn_sdpa(*_qkv(18900, 18900, 2, 64)))
+
+    def test_sm100_keeps_cudnn(self):
+        impl = _impl((10, 0))
+        self.assertTrue(impl._use_cudnn_sdpa(*_qkv(75600, 75600, 2, 128)))
 
 
 if __name__ == "__main__":

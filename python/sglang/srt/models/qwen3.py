@@ -5,6 +5,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import torch
 from torch import nn
 
+from sglang.kernels.ops.attention.qk_norm_rope import qk_norm_rope
 from sglang.kernels.ops.attention.table_qk_norm_rope import table_qk_norm_rope_
 from sglang.srt.environ import envs
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
@@ -23,6 +24,7 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import RotaryEmbedding, get_rope
 from sglang.srt.layers.rotary_embedding.mrope import MRotaryEmbedding
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -31,6 +33,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import get_kv_layers
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
@@ -44,8 +47,14 @@ from sglang.srt.models.utils import (
     maybe_enable_silu_fp4_quant_fusion,
 )
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
-from sglang.srt.utils import add_prefix, get_bool_env_var, is_cuda, is_hip, is_npu
+from sglang.srt.runtime_context import (
+    attention_backends,
+    get_exec,
+    get_parallel,
+    get_spec,
+    get_stream,
+)
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, is_npu
 
 Qwen3Config = None
 
@@ -183,6 +192,7 @@ class Qwen3Attention(nn.Module):
         attention_bias: bool = False,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
+        enable_prefill_qk_norm_rope: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -288,6 +298,23 @@ class Qwen3Attention(nn.Module):
             2 if type(self.rotary_emb) is MRotaryEmbedding else 1
         )
 
+        # Only the ordinary dense-Qwen3 caller opts in; inherited callers stay native.
+        self.use_prefill_qk_norm_rope = (
+            enable_prefill_qk_norm_rope
+            and self.use_table_qk_norm_rope
+            and type(self) is Qwen3Attention
+            and type(self.rotary_emb) is RotaryEmbedding
+            and quant_config is None
+            and attn_tp_size == 1
+            and self.head_dim == 128
+            and torch.cuda.get_device_capability()[0] == 9
+            and attention_backends()[0] in ("fa3", "flashinfer")
+            and get_spec().speculative_algorithm is None
+            and self.rotary_emb.is_neox_style
+            and self.rotary_emb.rotary_dim == self.head_dim
+            and self.q_norm.variance_epsilon == self.k_norm.variance_epsilon
+        )
+
         self.use_fused_qk_norm_mrope = (
             _has_fused_qk_norm_mrope
             and isinstance(self.rotary_emb, MRotaryEmbedding)
@@ -349,6 +376,29 @@ class Qwen3Attention(nn.Module):
                 self.q_norm.variance_epsilon,
                 match_cuda=True,
                 axis_map=axis_map,
+            )
+        elif (
+            self.use_prefill_qk_norm_rope
+            and forward_batch.forward_mode == ForwardMode.EXTEND
+            and not torch.compiler.is_compiling()
+            and qkv.is_cuda
+            and qkv.is_contiguous()
+            and qkv.dtype in (torch.bfloat16, torch.float16)
+            and self.q_norm.weight.dtype == qkv.dtype
+            and self.k_norm.weight.dtype == qkv.dtype
+            and self.rotary_emb.cos_sin_cache.dtype == torch.float32
+            and positions.is_contiguous()
+            and positions.dtype in (torch.int32, torch.int64)
+        ):
+            q = qk_norm_rope(
+                q=q,
+                k=k,
+                q_weight=self.q_norm.weight,
+                k_weight=self.k_norm.weight,
+                cos_sin_cache=self.rotary_emb.cos_sin_cache,
+                positions=positions,
+                head_dim=self.head_dim,
+                eps=self.q_norm.variance_epsilon,
             )
         else:
             q, k = apply_qk_norm_rope(
@@ -497,6 +547,9 @@ class Qwen3DecoderLayer(nn.Module):
             attention_bias=config.attention_bias,
             prefix=add_prefix("self_attn", prefix),
             alt_stream=alt_stream,
+            enable_prefill_qk_norm_rope=(
+                type(self) is Qwen3DecoderLayer and config.model_type == "qwen3"
+            ),
         )
         self.mlp = Qwen3MLP(
             hidden_size=self.hidden_size,

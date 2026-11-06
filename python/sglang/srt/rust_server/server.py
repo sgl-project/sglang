@@ -34,7 +34,13 @@ from sglang.srt.managers.utils import (
 )
 from sglang.srt.multimodal.cache.identity import build_processor_fingerprint
 from sglang.srt.observability.startup_time import build_engine_startup_time
-from sglang.srt.runtime_context import get_exec, get_mm, get_parallel, get_serving
+from sglang.srt.runtime_context import (
+    get_device,
+    get_exec,
+    get_mm,
+    get_parallel,
+    get_serving,
+)
 from sglang.srt.rust_server.config import (
     _build_server_args,
     _frontend_cpu_key,
@@ -263,7 +269,17 @@ class RustServer:
         host = get_serving().host
         if host in ("", "0.0.0.0", "::"):
             # An unspecified bind address is not reachable from another node.
-            host = get_local_ip_auto(fallback="127.0.0.1")
+            detected = get_local_ip_auto(fallback="127.0.0.1")
+            if (
+                host == "0.0.0.0"
+                and NetworkAddress(detected, 0).is_ipv6
+                and _is_loopback(detected)
+            ):
+                # SGLANG_HOST_IP=::1 names this machine, which this IPv4
+                # listener serves at 127.0.0.1. It does not serve any other
+                # IPv6 address; gather_server_endpoints refuses those.
+                detected = "127.0.0.1"
+            host = detected
         return host
 
     @classmethod
@@ -507,9 +523,13 @@ class RustServer:
 
     def wait_request(self, timeout_ms: int) -> None:
         """Block until a request is pushed into the in-process ring or the timeout
-        elapses.
+        elapses. Without --sleep-on-idle, return at once, so the idle loop
+        polls the ring without blocking as Python's polls its sockets: a parked
+        thread starts each request's step on a cold core. A subclass that
+        holds drained requests back still parks on those.
         """
-        self.server.wait_request(timeout_ms)
+        if get_device().sleep_on_idle:
+            self.server.wait_request(timeout_ms)
 
     def drain(self, max_recv: int) -> List[Any]:
         """Ingress: non-blocking drain of the in-process ring → list of decoded
