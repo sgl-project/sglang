@@ -16,7 +16,7 @@ from sglang.srt.models.kimi_k3_rocm_mxfp4 import (
     build_latent_mxfp4_projections,
 )
 from sglang.srt.runtime_context import get_context, get_parallel
-from sglang.srt.utils.common import print_warning_once
+from sglang.srt.utils import print_warning_once
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 

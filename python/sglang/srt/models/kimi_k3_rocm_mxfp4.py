@@ -8,7 +8,7 @@ from torch import nn
 from sglang.kernels.ops.gemm import latent_mxfp4_aiter_hip
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_exec
-from sglang.srt.utils.common import print_warning_once
+from sglang.srt.utils import print_warning_once
 
 
 def build_latent_mxfp4_projections() -> Optional["LatentMXFP4Projections"]:
