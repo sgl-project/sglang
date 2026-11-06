@@ -51,6 +51,20 @@ def _optional_positive_float(value: Any, field_name: str) -> Optional[float]:
     return float(value)
 
 
+def _kind_list(raw: Any, key: str, names: dict) -> Tuple[str, ...]:
+    """A per-layer list of kind names, mapped to FFN_KINDS."""
+    if not isinstance(raw, (list, tuple)) or len(raw) == 0:
+        raise ValueError(
+            f"Draft FFN: {key} must be a non-empty list of {tuple(names)}, got {raw!r}."
+        )
+    for index, name in enumerate(raw):
+        if name not in names:
+            raise ValueError(
+                f"Draft FFN: {key}[{index}]={name!r} is not one of {tuple(names)}."
+            )
+    return tuple(names[name] for name in raw)
+
+
 class DraftDenseFFNSpec(msgspec.Struct, frozen=True, kw_only=True):
     intermediate_size: int
     hidden_act: str
@@ -105,10 +119,13 @@ class DraftMoeFFNSpec(msgspec.Struct, frozen=True, kw_only=True):
                 f"Draft FFN: num_experts_per_tok={top_k} exceeds num_experts="
                 f"{num_experts}."
             )
+        # Mixtral-style configs size the experts with intermediate_size alone.
         intermediate_size = required_positive_int(
-            cfg_get(text, "moe_intermediate_size", None),
+            cfg_get(
+                text, "moe_intermediate_size", cfg_get(text, "intermediate_size", None)
+            ),
             "moe_intermediate_size",
-            "for MoE layers (intermediate_size is not a substitute)",
+            "for MoE layers",
         )
         scoring_func = str(cfg_get(text, "scoring_func", "softmax"))
         if scoring_func not in _SCORING_FUNCS:
@@ -237,32 +254,60 @@ class DraftMixFFNSpec(msgspec.Struct, frozen=True, kw_only=True):
     def _layer_kinds(
         text: Any, num_layers: Optional[int], default_kind: str
     ) -> Optional[Tuple[str, ...]]:
-        raw = cfg_get(text, "ffn_layer_types", None)
-        if raw is None:
+        """Per-layer kinds from whichever HF schedule key the config uses."""
+        kinds = DraftMixFFNSpec._schedule(text, num_layers, default_kind)
+        if kinds is None:
             return None if num_layers is None else (default_kind,) * num_layers
-        if not isinstance(raw, (list, tuple)) or len(raw) == 0:
-            raise ValueError(
-                f"Draft FFN: ffn_layer_types must be a non-empty list of "
-                f"{FFN_KINDS}, got {raw!r}."
-            )
-        kinds = tuple(raw)
-        for index, kind in enumerate(kinds):
-            if kind not in FFN_KINDS:
-                raise ValueError(
-                    f"Draft FFN: ffn_layer_types[{index}]={kind!r} is not one of "
-                    f"{FFN_KINDS}."
-                )
         if num_layers is not None and len(kinds) != num_layers:
             raise ValueError(
-                f"Draft FFN: ffn_layer_types has {len(kinds)} entries but "
+                f"Draft FFN: the FFN schedule has {len(kinds)} entries but "
                 f"num_hidden_layers={num_layers}."
             )
         if FFN_KIND_MOE in kinds and default_kind == FFN_KIND_DENSE:
             raise ValueError(
-                "Draft FFN: ffn_layer_types names MoE layers but none of "
+                "Draft FFN: the FFN schedule names MoE layers but none of "
                 f"{_EXPERT_COUNT_KEYS} is set."
             )
         return kinds
+
+    @staticmethod
+    def _schedule(
+        text: Any, num_layers: Optional[int], default_kind: str
+    ) -> Optional[Tuple[str, ...]]:
+        """ffn_layer_types, mlp_layer_types, moe_layer_freq, first_k_dense_replace, mlp_only_layers."""
+        if (raw := cfg_get(text, "ffn_layer_types", None)) is not None:
+            return _kind_list(
+                raw, "ffn_layer_types", {"dense": FFN_KIND_DENSE, "moe": FFN_KIND_MOE}
+            )
+        if (raw := cfg_get(text, "mlp_layer_types", None)) is not None:
+            return _kind_list(
+                raw,
+                "mlp_layer_types",
+                {"dense": FFN_KIND_DENSE, "sparse": FFN_KIND_MOE},
+            )
+        freq = cfg_get(text, "moe_layer_freq", None)
+        if isinstance(freq, (list, tuple)):  # MiniMax: 0 marks a dense layer
+            return tuple(FFN_KIND_MOE if f else FFN_KIND_DENSE for f in freq)
+        first_dense = cfg_get(text, "first_k_dense_replace", None)
+        only_dense = cfg_get(text, "mlp_only_layers", None)
+        sparse_step = cfg_get(text, "decoder_sparse_step", None)
+        if first_dense is None and only_dense is None and sparse_step is None:
+            return None
+        if num_layers is None:
+            raise ValueError("Draft FFN: the FFN schedule needs num_hidden_layers.")
+        first_dense = int(first_dense or 0)  # DeepSeek: the first k layers are dense
+        freq = int(freq or 1)
+        only_dense = set(int(i) for i in (only_dense or ()))  # Qwen3-MoE
+        sparse_step = int(sparse_step or 1)
+        return tuple(
+            FFN_KIND_MOE
+            if i >= first_dense
+            and i % freq == 0
+            and i not in only_dense
+            and (i + 1) % sparse_step == 0
+            else FFN_KIND_DENSE
+            for i in range(num_layers)
+        )
 
     def kind(self, layer_id: int) -> str:
         if self.layer_kinds is None:
