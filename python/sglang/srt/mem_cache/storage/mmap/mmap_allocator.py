@@ -49,6 +49,8 @@ _MAP_FAILED = ctypes.c_void_p(-1).value
 _MADV_POPULATE_WRITE = getattr(mmap, "MADV_POPULATE_WRITE", 23)
 _MADV_DONTFORK = getattr(mmap, "MADV_DONTFORK", 10)
 _MADV_HUGEPAGE = getattr(mmap, "MADV_HUGEPAGE", 14)
+_MADV_NOHUGEPAGE = getattr(mmap, "MADV_NOHUGEPAGE", 15)
+_THP_ALIGN = 2 * 1024 * 1024
 _PROT_RW = mmap.PROT_READ | mmap.PROT_WRITE
 # Prefault chunks are THP-aligned so no huge page straddles two threads.
 _THP_SIZE = 2 * 1024 * 1024
@@ -160,8 +162,41 @@ def _alloc_hugepage(n_bytes: int, alloc_bytes: int, extra_flags: int) -> ctypes.
     return array
 
 
+def _alloc_thp(n_bytes: int, alloc_bytes: int) -> ctypes.Array:
+    """Anonymous private mmap backed by transparent huge pages (THP "madvise" mode).
+
+    Needs no hugetlbfs reservation. The hint goes on before MADV_POPULATE_WRITE
+    so the pre-fault lands on 2 MiB pages, and fully populated private anonymous
+    memory has no COW or late-fault race for cudaHostRegister to pin across.
+    MADV_NOHUGEPAGE afterwards keeps the pages it got but stops khugepaged from
+    later collapsing (migrating) any 4 KiB remainder: on ROCm a migration in a
+    registered USERPTR range stalls every GPU queue.
+    One extra 2 MiB stripe keeps the returned region 2 MiB-aligned; munmap of
+    the whole mapping fires via weakref.finalize when the tensor is freed.
+    """
+    map_bytes = alloc_bytes + _THP_ALIGN
+    ptr = _libc.mmap(
+        None, map_bytes, _PROT_RW, mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS, -1, 0
+    )
+    if ptr is None or ptr == _MAP_FAILED:
+        errno = ctypes.get_errno()
+        raise OSError(errno, os.strerror(errno))
+    aligned = (ptr + _THP_ALIGN - 1) & ~(_THP_ALIGN - 1)
+    for advice in (_MADV_HUGEPAGE, _MADV_POPULATE_WRITE, _MADV_NOHUGEPAGE):
+        if _libc.madvise(
+            ctypes.c_void_p(aligned), ctypes.c_size_t(alloc_bytes), advice
+        ):
+            errno = ctypes.get_errno()
+            _libc.munmap(ctypes.c_void_p(ptr), map_bytes)
+            raise OSError(errno, os.strerror(errno))
+    array = (ctypes.c_uint8 * n_bytes).from_address(aligned)
+    weakref.finalize(array, _libc.munmap, ctypes.c_void_p(ptr), map_bytes)
+    return array
+
+
 def alloc_mmap(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
-    """Allocate a host tensor via anonymous mmap. Set SGLANG_HUGEPAGE_SIZE=2MB or 1GB for hugepages.
+    """Allocate a host tensor via anonymous mmap. Set SGLANG_HUGEPAGE_SIZE=2MB or 1GB for
+    hugetlbfs pages, or THP for transparent huge pages (no reserved pool needed).
 
     MAP_SHARED + MAP_POPULATE are both required so cudaHostRegister pins real,
     pre-faulted physical pages (otherwise pinning can race with COW or page
@@ -180,15 +215,31 @@ def alloc_mmap(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
         page_size, extra_flags = 2 * 1024 * 1024, _MAP_HUGETLB | _MAP_HUGE_2MB
     elif hugepage_size == "1GB":
         page_size, extra_flags = 1024 * 1024 * 1024, _MAP_HUGETLB | _MAP_HUGE_1GB
+    elif hugepage_size == "THP":
+        page_size, extra_flags = _THP_ALIGN, 0
     else:
         logger.warning(
-            "Unrecognized SGLANG_HUGEPAGE_SIZE=%r; expected '2MB' or '1GB'. "
+            "Unrecognized SGLANG_HUGEPAGE_SIZE=%r; expected '2MB', '1GB' or 'THP'. "
             "Falling back to plain page-size mmap.",
             envs.SGLANG_HUGEPAGE_SIZE.get(),
         )
         page_size, extra_flags = mmap.PAGESIZE, 0
 
     alloc_bytes = math.ceil(n_bytes / page_size) * page_size
+
+    if hugepage_size == "THP" and _libc is not None:
+        try:
+            array = _alloc_thp(n_bytes, alloc_bytes)
+            return torch.frombuffer(array, dtype=dtype, count=math.prod(dims)).reshape(
+                dims
+            )
+        except OSError as e:
+            logger.error(
+                "THP mmap failed (%s); falling back to plain mmap. "
+                "SGLANG_HUGEPAGE_SIZE=THP will be ignored.",
+                e,
+            )
+        alloc_bytes = math.ceil(n_bytes / mmap.PAGESIZE) * mmap.PAGESIZE
 
     if extra_flags:
         if _libc is None:

@@ -81,12 +81,23 @@ inline void copy_page_first_pages_fallback(
     const size_t src_page_bytes = static_cast<size_t>(page_size * src_stride0 * elem_size);
     const size_t dst_page_bytes = static_cast<size_t>(page_size * dst_stride0 * elem_size);
     RuntimeCheck(src_page_bytes == dst_page_bytes, "Source and destination page spans must match");
-    for (const auto page_offset : irange(num_pages)) {
+    // The staging source is contiguous by page; a run of destination pages whose
+    // leading rows advance by page_size is contiguous too, so it is one copy.
+    int64_t page_offset = 0;
+    while (page_offset < num_pages) {
+      const int64_t first_row = dst_indices_ptr[page_offset * page_size];
+      int64_t run_pages = 1;
+      while (page_offset + run_pages < num_pages &&
+             dst_indices_ptr[(page_offset + run_pages) * page_size] == first_row + run_pages * page_size) {
+        ++run_pages;
+      }
       const char* src_ptr = static_cast<const char*>(src_ptrs[tensor_id].data_ptr()) +
                             static_cast<size_t>(page_offset * page_size * src_stride0 * elem_size);
-      char* dst_ptr = static_cast<char*>(dst_ptrs[tensor_id].data_ptr()) +
-                      static_cast<size_t>(dst_indices_ptr[page_offset * page_size] * dst_stride0 * elem_size);
-      RuntimeDeviceCheck(cudaMemcpyAsync(dst_ptr, src_ptr, src_page_bytes, cudaMemcpyDeviceToHost, stream));
+      char* dst_ptr =
+          static_cast<char*>(dst_ptrs[tensor_id].data_ptr()) + static_cast<size_t>(first_row * dst_stride0 * elem_size);
+      RuntimeDeviceCheck(cudaMemcpyAsync(
+          dst_ptr, src_ptr, static_cast<size_t>(run_pages) * src_page_bytes, cudaMemcpyDeviceToHost, stream));
+      page_offset += run_pages;
     }
   }
 }
