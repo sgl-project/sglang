@@ -12,9 +12,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-pytest.importorskip("flydsl")
-qsa_flydsl = pytest.importorskip("aiter.ops.flydsl.qsa_sparse_decode")
-
 from sglang.srt.utils import is_gfx95_supported
 from sglang.test.ci.ci_register import register_amd_ci
 
@@ -23,6 +20,12 @@ register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 def _gfx950_available() -> bool:
     if not torch.cuda.is_available() or not is_gfx95_supported():
+        return False
+    # Not a module-level importorskip: CI runs this file as a script, where the
+    # Skipped it raises is an uncaught exception.
+    try:
+        import aiter.ops.flydsl.qsa_sparse_decode as qsa_flydsl
+    except ImportError:
         return False
     probe = torch.empty(1, 1, 256, dtype=torch.bfloat16, device="cuda")
     return qsa_flydsl.can_use_flydsl_qsa_sparse_decode(probe, probe, probe)

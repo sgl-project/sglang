@@ -15,6 +15,7 @@ import itertools
 import torch
 
 from sglang.kernels.jit.benchmark import marker
+from sglang.srt.utils import is_gfx95_supported
 from sglang.test.ci.ci_register import register_amd_ci
 
 register_amd_ci(est_time=120, stage="jit-kernel-benchmark", runner_config="amd")
@@ -25,6 +26,17 @@ MAX_CTX = 8192
 POOL_SLOTS = 1 << 21  # 2 GiB of bf16 K+V at Hkv=2
 # Touch at least 4x the last-level cache across the rotated calls.
 COLD_BYTES = 4 << 30
+
+
+def _flydsl_available() -> bool:
+    # The CI runner is MI300 (gfx942), and AITER may predate the kernel.
+    if not is_gfx95_supported():
+        return False
+    try:
+        import aiter.ops.flydsl.qsa_sparse_decode  # noqa: F401
+    except ImportError:
+        return False
+    return True
 
 
 def _fused_flydsl(q, k, v, req_to_token, row_req, indices, seq_lens, splits, ws):
@@ -89,7 +101,8 @@ FN_MAP = {"fused_flydsl": _fused_flydsl, "gather_triton": _gather_triton}
 @marker.parametrize("batch", [1, 4, 16, 64, 128], [1, 64])
 @marker.benchmark("impl", ["fused_flydsl", "gather_triton"])
 def benchmark(num_kv_heads: int, group: int, batch: int, impl: str):
-    from aiter.ops.flydsl.qsa_sparse_decode import recommended_num_splits
+    if impl == "fused_flydsl" and not _flydsl_available():
+        marker.skip("gfx950 and aiter.ops.flydsl.qsa_sparse_decode required")
 
     gen = torch.Generator(device="cuda").manual_seed(0)
     q = torch.randn(batch, num_kv_heads * group, DIM, generator=gen, device="cuda")
@@ -119,13 +132,17 @@ def benchmark(num_kv_heads: int, group: int, batch: int, impl: str):
             for _ in range(batch)
         ]
     ).int()
-    splits = recommended_num_splits(batch, num_kv_heads, TOPK, q.device)
-    partials = batch * num_kv_heads * group * splits
-    workspace = (
-        torch.empty(partials, device="cuda"),
-        torch.empty(partials, device="cuda"),
-        torch.empty(partials * DIM, device="cuda"),
-    )
+    splits, workspace = None, None
+    if impl == "fused_flydsl":
+        from aiter.ops.flydsl.qsa_sparse_decode import recommended_num_splits
+
+        splits = recommended_num_splits(batch, num_kv_heads, TOPK, q.device)
+        partials = batch * num_kv_heads * group * splits
+        workspace = (
+            torch.empty(partials, device="cuda"),
+            torch.empty(partials, device="cuda"),
+            torch.empty(partials * DIM, device="cuda"),
+        )
     fn = FN_MAP[impl]
     rotation = itertools.cycle(row_reqs)
 
