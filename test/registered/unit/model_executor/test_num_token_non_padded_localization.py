@@ -630,6 +630,106 @@ class TestDecoderReplayTailMoeBound(CustomTestCase):
             )
 
 
+class TestTailBreakCaptureGate(CustomTestCase):
+    def test_break_captures_only_when_every_dp_rank_breaks_out(self):
+        """A DP rank whose prefill-graph bucket keeps the tail inline never reaches
+        the TP-group barriers a tail-graph capture waits at, so a break must not
+        capture on such a step (every rank's MegaMoE then hung); it runs eagerly."""
+        for every_rank in (False, True):
+            gate = {"every_rank_reaches_rank_barrier": True} if every_rank else {}
+            with (
+                self.subTest(every_rank=every_rank),
+                get_parallel().override(attn_dp_size=1, attn_cp_size=1),
+                get_flags().dp.override(capturing_prefill_graph=False, **gate),
+            ):
+                batch, tail = TestDecoderReplayTailMoeBound._batch_and_tail(
+                    False, 3, 7, False
+                )
+                runner = RowBucketGraphRunner(row_step=8, max_rows=16, label="test")
+                runner._warm = True
+                recorded = SimpleNamespace(
+                    graph=SimpleNamespace(replay=Mock()),
+                    packed_token_counts=None,
+                    num_token_non_padded=None,
+                    outputs=[torch.ones(8, 1)],
+                )
+
+                def run(*, state, forward_batch, **kwargs):
+                    # The real tail's run, minus its layer stack.
+                    passed = {k: v for k, v in kwargs.items() if k == "may_capture"}
+                    outputs = runner.run(
+                        key=(),
+                        live=[state[0]],
+                        forward_batch=forward_batch,
+                        body=lambda inputs, batch: inputs,
+                        context=lambda batch: nullcontext(),
+                        **passed,
+                    )
+                    return None if outputs is None else (outputs[0], None, [])
+
+                eager_out = (torch.zeros(3, 1), None, [])
+                tail_layers = SimpleNamespace(
+                    runner=runner,
+                    _can_capture_moe_bound=lambda forward_batch: True,
+                    run=run,
+                    _run_layers_eagerly=Mock(return_value=eager_out),
+                    _log_uncaptured_break=Mock(),
+                    _write_bridge=Mock(),
+                )
+                backend = SimpleNamespace(
+                    forward_metadata=SimpleNamespace(late_layer_tail=tail),
+                    exit_late_layer_tail=Mock(),
+                )
+                with (
+                    patch.object(replay_tail, "get_attn_backend", return_value=backend),
+                    patch.object(
+                        replay_tail,
+                        "get_tc_piecewise_forward_context",
+                        return_value=SimpleNamespace(forward_batch=batch),
+                    ),
+                    patch.object(
+                        replay_tail,
+                        "_enter_eager_tail_in_prefill_graph",
+                        return_value=(None, batch),
+                    ),
+                    patch.object(runner, "_capture", return_value=recorded) as capture,
+                    patch(
+                        "sglang.srt.model_executor.runner.row_bucket_graph_runner"
+                        ".graph_pool_replay_scope",
+                        nullcontext,
+                    ),
+                ):
+                    replay_tail._tail_layers_in_prefill_graph(
+                        tail_layers,
+                        lambda tensors: tensors,
+                        False,
+                        4,
+                        None,
+                        False,
+                        (False, False),
+                        None,
+                        [torch.zeros(4, 1)],
+                        torch.arange(4),
+                        batch.input_ids,
+                        batch.input_ids,
+                    )
+                outputs = tail_layers._write_bridge.call_args.kwargs["outputs"]
+                if every_rank:
+                    # Largest bucket first, down to this step's.
+                    self.assertEqual(
+                        [c.args[0] for c in capture.call_args_list], [16, 8]
+                    )
+                    recorded.graph.replay.assert_called_once()
+                    self.assertEqual(
+                        outputs[0].data_ptr(), recorded.outputs[0].data_ptr()
+                    )
+                    tail_layers._run_layers_eagerly.assert_not_called()
+                else:
+                    capture.assert_not_called()
+                    self.assertIs(outputs[0], eager_out[0])
+                    tail_layers._log_uncaptured_break.assert_called_once_with(3)
+
+
 class TestDecoderReplayTailBridge(CustomTestCase):
     def test_a_graph_keeps_writing_the_bridge_it_captured(self):
         tail = object.__new__(replay_tail.DecoderReplayTail)

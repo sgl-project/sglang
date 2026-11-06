@@ -41,6 +41,7 @@ import copy
 import dataclasses
 import inspect
 import logging
+import time
 from collections.abc import Sequence
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
@@ -748,6 +749,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             )
 
         # --- capture --------------------------------------------------
+        # Captured shapes whose graphs hold breaks that capture behind
+        # TP-group barriers (note_rank_barrier_in_prefill_graph).
+        self._rank_barrier_shapes: frozenset[int] = frozenset()
         self.device_module.synchronize()
         get_parallel().tp_group.barrier()
         self.capture()
@@ -1050,15 +1054,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # DSV4 DP attention / DeepEP collectives need every DP rank to enter
         # the same replay path. Sparse-DP batches (one or more ranks with
         # zero local tokens) fall back to eager to avoid hanging ranks.
-        # MegaMoE graphs without a captured DP gather or rank barrier tolerate
-        # per-rank buckets and an eager idle rank; others fall through.
+        # MegaMoE graphs without a captured DP gather tolerate per-rank buckets
+        # and an eager idle rank, as their rank-barrier breaks skip capture on
+        # a step some rank does not reach (_every_rank_reaches_rank_barrier).
         global_num_tokens = forward_batch.global_num_tokens_cpu
         if global_num_tokens is None:
             return False
-        if (
-            prefill_graph_tolerates_sum_len()
-            and not get_flags().dp.prefill_graph_has_rank_barrier
-        ):
+        if prefill_graph_tolerates_sum_len():
             return False
         return len(global_num_tokens) > 1 and any(
             int(num_tokens) == 0 for num_tokens in global_num_tokens
@@ -1790,6 +1792,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     def capture(self) -> None:
         with self.model_context():
             self._capture()
+            self._prime_rank_barrier_breaks()
 
     def _capture(self) -> None:
         # Warm up + autotune kernels once before capture (run-once across the
@@ -1840,13 +1843,88 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 capture_range.set_description(
                     f"Capturing prefill shape ({num_tokens=} {avail_mem=:.2f} GB)"
                 )
-            self.capture_one_shape(num_tokens)
-            if self._capture_chunked_prefix:
-                for captured_n in self._prefix_capture_variants:
-                    self.capture_one_shape(
-                        num_tokens,
-                        prefix_num_chunks=captured_n,
-                    )
+            self._capture_shape(num_tokens)
+
+    def _capture_shape(self, num_tokens: int) -> None:
+        """Captures one token shape and its variants, noting whether its graphs
+        hold rank-barrier breaks."""
+        dp_flags = get_flags().dp
+        dp_flags.prefill_graph_shape_has_rank_barrier = False
+        self.capture_one_shape(num_tokens)
+        if self._capture_chunked_prefix:
+            for captured_n in self._prefix_capture_variants:
+                self.capture_one_shape(
+                    num_tokens,
+                    prefix_num_chunks=captured_n,
+                )
+        if dp_flags.prefill_graph_shape_has_rank_barrier:
+            self._rank_barrier_shapes = self._rank_barrier_shapes | {num_tokens}
+
+    def _prime_rank_barrier_breaks(self) -> None:
+        """Runs the smallest rank-barrier shape once eagerly on every rank together,
+        so its breaks capture their graphs now rather than while serving."""
+        if not self._rank_barrier_shapes or self.enable_cp_bcg_capture:
+            return
+        num_tokens = min(self._rank_barrier_shapes)
+        start = time.perf_counter()
+        forward_batch, attn_backend = self.capture_prepare(num_tokens)
+        self._prepare_model_for_capture_batch(forward_batch)
+        if forward_batch.lora_ids is not None:
+            self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
+        with forward_context(
+            ForwardContext(attn_backend=attn_backend), forward_batch=forward_batch
+        ):
+            if self.use_captured_attn_metadata:
+                # A fresh object: each captured shape keeps reading its own.
+                attn_backend.init_forward_metadata_for_breakable_cuda_graph_capture(
+                    forward_batch
+                )
+            else:
+                attn_backend.init_forward_metadata(forward_batch)
+        self.device_module.synchronize()
+        get_parallel().tp_group.barrier()
+        with self.backend.replay_session(), self._rank_barrier_scope(True):
+            self._run_forward(forward_batch, num_tokens)
+        self.device_module.synchronize()
+        if get_parallel().tp_rank == 0:
+            logger.info(
+                "Primed the rank-barrier breaks of prefill shapes %s with one "
+                "%d-token eager forward in %.2f s.",
+                sorted(self._rank_barrier_shapes),
+                num_tokens,
+                time.perf_counter() - start,
+            )
+
+    def _every_rank_reaches_rank_barrier(self, forward_batch: ForwardBatch) -> bool:
+        """Whether every DP rank replays a shape holding rank-barrier breaks this
+        step, which every rank decides alike from the synced token counts."""
+        if not self._rank_barrier_shapes or self.enable_cp_bcg_capture:
+            return False
+        # prepare_mlp_sync_batch sets each rank's entry to its padded input length.
+        counts = forward_batch.global_num_tokens_cpu
+        if counts is None:
+            counts = [len(forward_batch.input_ids)]
+        return all(
+            0 < n <= self.capture_num_tokens[-1]
+            and self._pad_to_bucket(n, self.capture_num_tokens)
+            in self._rank_barrier_shapes
+            for n in counts
+        )
+
+    @contextmanager
+    def _rank_barrier_scope(self, every_rank: bool):
+        dp_flags = get_flags().dp
+        dp_flags.every_rank_reaches_rank_barrier = every_rank
+        try:
+            yield
+        finally:
+            dp_flags.every_rank_reaches_rank_barrier = False
+
+    def _prepare_model_for_capture_batch(self, forward_batch: ForwardBatch) -> None:
+        # Recapture can follow decode replay, which may change model-owned storage.
+        prepare = getattr(self.model_runner.model, "prepare_for_forward", None)
+        if prepare is not None:
+            prepare(forward_batch)
 
     def capture_one_shape(self, size: int, *, prefix_num_chunks: int = 0) -> None:
         """Per-shape capture: build dummy ForwardBatch + run_once,
@@ -1854,10 +1932,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         """
         num_tokens = size
         forward_batch, attn_backend = self.capture_prepare(num_tokens)
-        # Recapture can follow decode replay, which may change model-owned storage.
-        prepare = getattr(self.model_runner.model, "prepare_for_forward", None)
-        if prepare is not None:
-            prepare(forward_batch)
+        self._prepare_model_for_capture_batch(forward_batch)
         if self.enable_cp_bcg_capture:
             assert self.prefill_cp_bcg_input is not None
             self.prefill_cp_bcg_input.prepare(
@@ -2460,7 +2535,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self, forward_batch: ForwardBatch, **kwargs
     ) -> Optional[Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]]:
         self._validate_capture_hidden_mode(forward_batch)
-        with self.model_context(), self.backend.replay_session():
+        with (
+            self.model_context(),
+            self.backend.replay_session(),
+            self._rank_barrier_scope(
+                self._every_rank_reaches_rank_barrier(forward_batch)
+            ),
+        ):
             static_forward_batch, shared_read_ends = self.load_batch(
                 forward_batch, **kwargs
             )
