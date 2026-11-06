@@ -872,6 +872,8 @@ class DFlashDraftModel(nn.Module):
     draft_parallel_spec = DraftParallelSpec(tp_execution=DraftTPExecution.SINGLE_GROUP)
 
     decoder_layer_cls = DFlashDecoderLayer
+    # Customized drafts build their layers from the draft config's specs; native ones mirror the target.
+    customized = False
     supports_fused_context_kv = True
     # Layer prefixes and a quant_config-aware `fc`, for quantized checkpoints.
     supports_quantization = False
@@ -935,7 +937,7 @@ class DFlashDraftModel(nn.Module):
                     attention_conv=grouped_conv(),
                     mlp_conv=grouped_conv(),
                     quant_config=quant_config,
-                    ffn_spec=draft_config.ffn,
+                    ffn_spec=draft_config.ffn if self.customized else None,
                     prefix=(
                         (f"{prefix}.layers.{i}" if prefix else f"layers.{i}")
                         if self.quantizable
@@ -1534,8 +1536,20 @@ class DFlash2BeamDraftModel(DFlash2DraftModel):
     """Alias for checkpoints declaring architectures=["DFlash2BeamDraftModel"]."""
 
 
+class CustomizedDFlashDraftModel(DFlashDraftModel):
+    """A DFlash draft whose FFN follows the draft config, dense or MoE per layer."""
+
+    customized = True
+
+
+class CustomizedDFlash2DraftModel(DFlash2DraftModel):
+    customized = True
+
+
 EntryClass = [
     DFlashDraftModel,
+    CustomizedDFlashDraftModel,
+    CustomizedDFlash2DraftModel,
     DFlashLagunaForCausalLM,
     MuseGlimmerAssistantModel,
     DFlash2DraftModel,

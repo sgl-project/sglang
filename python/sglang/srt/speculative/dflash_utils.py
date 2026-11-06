@@ -592,6 +592,21 @@ def validate_dflash_mla_draft_config(draft_hf_config: Any) -> None:
         )
 
 
+# Drafts whose layers follow the draft config's specs instead of mirroring the target.
+CUSTOMIZED_DRAFT_ARCHITECTURES = frozenset(
+    {
+        "CustomizedDFlashDraftModel",
+        "CustomizedDFlash2DraftModel",
+        "CustomizedDSparkDraftModel",
+    }
+)
+
+
+def is_customized_draft_config(config: Any) -> bool:
+    architectures = _cfg_get(config, "architectures", None) or ()
+    return any(arch in CUSTOMIZED_DRAFT_ARCHITECTURES for arch in architectures)
+
+
 @dataclass(frozen=True)
 class DFlashDraftConfig:
     num_hidden_layers: Optional[int]

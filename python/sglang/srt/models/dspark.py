@@ -1022,4 +1022,15 @@ class LingDSparkModel(DSparkDraftModel):
     pass
 
 
-EntryClass = [Qwen3DSparkModel, LingDSparkModel, DSparkDraftModel]
+class CustomizedDSparkDraftModel(DSparkDraftModel):
+    """A DSpark draft whose FFN follows the draft config, dense or MoE per layer."""
+
+    customized = True
+
+
+EntryClass = [
+    Qwen3DSparkModel,
+    LingDSparkModel,
+    DSparkDraftModel,
+    CustomizedDSparkDraftModel,
+]
