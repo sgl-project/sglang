@@ -194,6 +194,20 @@ global_override_indptr_cpu = None
 global_override_window_indptr_cpu = None
 
 
+def _verify_plan_uniform_q_len(spec_info) -> Optional[int]:
+    """EAGLE verify gives every request exactly num_tokens_per_req query rows.
+    Every plan through a captured verify wrapper must carry the same
+    per-request q length: capture fixes the kernel's query tile from it.
+    None keeps plan() unchanged."""
+    if spec_info is None or spec_info.spec_input_type != SpecInputType.EAGLE_VERIFY:
+        return None
+    # SpecInput defaults num_tokens_per_req to -1 ("not set"). EagleVerifyInput
+    # sets it to draft_token_num (>= 1), so real verify batches never return here.
+    if spec_info.num_tokens_per_req <= 0:
+        return None
+    return int(spec_info.num_tokens_per_req)
+
+
 def fast_prefill_plan(
     self,
     qo_indptr: torch.Tensor,
@@ -228,6 +242,7 @@ def fast_prefill_plan(
     max_q_len: int,
     max_kv_len: int,
     uniform_verify_width: Optional[int] = None,
+    uniform_q_len: int = 0,
 ) -> None:
     """Sync-free ``BatchPrefillWithPagedKVCacheWrapper.plan`` for the EAGLE
     draft-extend or uniform-width verify CUDA graph (FlashInfer fa2 only).
@@ -329,7 +344,7 @@ def fast_prefill_plan(
         fixed_split_size if fixed_split_size is not None else -1,
         False,  # disable_split_kv
         0,  # num_colocated_ctas
-        0,  # uniform_q_len
+        uniform_q_len,
     ]
     self._plan_info = self._cached_module.plan(*args)
 
@@ -2557,6 +2572,12 @@ class FlashInferIndicesUpdaterPrefill:
             and window.window_left >= 0
         ):
             paged_plan_kwargs["window_left"] = window.window_left
+
+        # A captured kernel keeps the tile size FlashInfer picked from this hint,
+        # so every replay must pass the same hint, including fast_prefill_plan.
+        uniform_q_len = _verify_plan_uniform_q_len(spec_info)
+        if uniform_q_len is not None:
+            paged_plan_kwargs["uniform_q_len"] = uniform_q_len
 
         wrapper_paged.begin_forward(
             qo_indptr,
