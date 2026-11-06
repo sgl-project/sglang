@@ -45,7 +45,7 @@ from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
     draft_kv_indices_used_len,
 )
-from sglang.srt.utils import is_gfx95_supported
+from sglang.srt.utils import is_gfx95_supported, is_gfx1250_supported
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -86,6 +86,7 @@ from sglang.kernels.ops.attention.dcp_kernels import (
     create_mla_kv_page_table_for_dcp,
 )
 from sglang.kernels.ops.attention.merge_state import merge_state_triton
+from sglang.kernels.ops.attention.mla_qk_prep import concat_and_cast_mha_k_triton
 from sglang.kernels.ops.attention.pad import pad_sequence_with_mask
 from sglang.kernels.ops.kvcache.cache_ops import launch_reshape_and_cache_flash
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, scaled_fp8_quant
@@ -112,6 +113,12 @@ _use_mla_ps_kernel = get_bool_env_var("SGLANG_AITER_MLA_PERSIST", "True")
 # Use fp8 prefill only on gfx95
 _use_fp8_prefill_attn = (
     get_bool_env_var("SGLANG_AITER_FP8_PREFILL_ATTN", "True") and is_gfx95_supported()
+)
+
+# FP8 MLA prefill over a cached prefix on gfx1250, through the FlyDSL a8w8 FMHA.
+_use_gfx1250_fp8_prefill_attn = (
+    get_bool_env_var("SGLANG_AITER_GFX1250_FP8_PREFILL_ATTN", "False")
+    and is_gfx1250_supported()
 )
 
 # Max qlen limitation of the asm ps kernels to handle q with bf16 dtype
@@ -1966,6 +1973,34 @@ class AiterAttnBackend(AttentionBackend):
             return_lse=True,
         )
         return merge_state_triton(out_a, lse_a, out_b, lse_b.view(n_rows, num_heads))
+
+    def _mla_gfx1250_fp8_prefill_attn(
+        self,
+        q: torch.Tensor,
+        k_nope: torch.Tensor,
+        k_pe: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+    ) -> torch.Tensor:
+        from aiter.ops.flydsl.kernels.fmha_gfx1250.fmha_fwd_prefill_a8w8_m32x8 import (
+            flash_attn_varlen_a8w8_m32x8,
+        )
+
+        # Unit scales, as in mla_fp8_prefill_attn on gfx950.
+        k = k_nope.new_empty((*k_nope.shape[:2], layer.qk_head_dim), dtype=fp8_dtype)
+        concat_and_cast_mha_k_triton(k, k_nope, k_pe)
+        md = self.forward_metadata
+        return flash_attn_varlen_a8w8_m32x8(
+            q.to(fp8_dtype),
+            k,
+            v.to(fp8_dtype),
+            md.qo_indptr,
+            md.kv_indptr,
+            md.max_q_len,
+            md.max_kv_len,
+            softmax_scale=layer.scaling,
+            causal=True,
+        )
 
     def mla_fp8_prefill_attn(
         self,
@@ -4072,6 +4107,10 @@ class AiterAttnBackend(AttentionBackend):
                         k, v = torch.split(
                             kv, [qk_nope_head_dim, layer.v_head_dim], dim=-1
                         )
+                        if _use_gfx1250_fp8_prefill_attn:
+                            return self._mla_gfx1250_fp8_prefill_attn(
+                                q, k, k_pe, v, layer
+                            )
                         k = torch.cat(
                             [
                                 k,
