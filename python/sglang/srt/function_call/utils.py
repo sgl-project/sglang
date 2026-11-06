@@ -115,7 +115,7 @@ def _normalize_type_list(raw_items: List[Any]) -> List[Any]:
 # non-empty fragment, which the draft-07 plain-name style (``"$id": "#foo"``)
 # does. Dropping them before ``check_schema`` accepts such schemas without
 # changing which instances validate.
-_SCHEMA_IDENTIFIER_KEYWORDS = ("$id", "$anchor", "$dynamicAnchor")
+_SCHEMA_IDENTIFIER_KEYWORDS = ("$id", "$anchor", "$dynamicAnchor", "$dynamicRef")
 
 
 def without_schema_identifiers(schema: Any) -> Any:

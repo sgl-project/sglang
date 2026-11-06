@@ -1227,6 +1227,10 @@ class OpenAIServingChat(OpenAIServingBase):
                 # guards against hand-crafted cyclic schemas so the request gets
                 # a 400 instead of crashing into a 500.
                 normalize_json_schema_types(tool.function.parameters)
+                # Identifier keywords are checked for URI form by the 2020-12
+                # metaschema but constrain no instance, so a draft-07-style
+                # `$id: "#name"` would 400 a schema this stack renders and
+                # constrains correctly. Validate without them.
                 Draft202012Validator.check_schema(
                     without_schema_identifiers(tool.function.parameters)
                 )
@@ -1946,6 +1950,12 @@ class OpenAIServingChat(OpenAIServingBase):
                     request.tool_choice,
                     parallel_tool_calls=request.parallel_tool_calls,
                     thinking_mode=xgrammar_reasoning,
+                    # With reasoning off, the K3 encoder's generation prompt
+                    # opens the response channel, so a forced call has to close
+                    # it before the tools section.
+                    response_channel_open=(
+                        self.chat_encoding_spec == "kimi_k3" and not thinking_mode
+                    ),
                 )
                 if (
                     tool_call_constraint is not None
@@ -3877,6 +3887,8 @@ class OpenAIServingChat(OpenAIServingBase):
         # Get the last tool call that was being processed
         tool_index = len(detector.prev_tool_call_arr) - 1
         if tool_index < 0 or tool_index >= len(detector.streamed_args_for_tool):
+            return None
+        if tool_index in _incomplete_tool_call_indices(parser):
             return None
 
         # Get expected vs actual arguments
