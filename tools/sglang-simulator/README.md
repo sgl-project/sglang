@@ -551,6 +551,16 @@ throughput, and prefix-cache reuse against measured traces.
 
 ## Optional committed-output ledger
 
+Iteration records retain their complete JSONL representation in
+`iteration.jsonl`. During a profile window, the scheduler compresses these
+records into an exclusive `.iteration-*.spool` file in the configured output
+directory and keeps only small metric summaries in memory. Provision disk space
+for the spool and final exports; select an output directory on disk for long
+CPU simulations. This changes evidence storage, not virtual costs or progress.
+The spool is removed after a successful export and profile reset. Export or
+spool-write failures preserve it for diagnosis and must not be treated as a
+completed profile.
+
 For coordinated OFFLINE runs, set
 `SGLANG_SIMULATOR_TOKEN_EVENTS=/absolute/path/to/token_events.jsonl` to retain
 native visible output-token commits. The parent directory must exist and the

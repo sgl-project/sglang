@@ -15,6 +15,7 @@ from sglang_simulator.hook import (
     validate_required_class_hooks,
 )
 from sglang_simulator.hook.utils import get_obj_from_args
+from sglang_simulator.simulation.iteration_stats import IterationStats
 from sglang_simulator.simulation.manager import ConfigManager, Envs, StateManager
 from sglang_simulator.simulation.sglang.dspark import (
     DSparkStepResult,
@@ -440,7 +441,7 @@ class C_SchedulerHook(BaseHook):
     INFERENCE_PREDICTOR: InferTimePredictor = None
     COORDINATOR = None
 
-    ITERATION_STATS: ClassVar[list[dict]] = []
+    ITERATION_STATS: ClassVar[IterationStats] = IterationStats(Envs.output_dir)
     TOTAL_PREDICTOR_TIME_COST = 0
     CURRENT_PREDICTOR_TIME_COST = 0
     CURRENT_PREDICTED_LATENCY = 0
@@ -1145,7 +1146,12 @@ class C_SchedulerHook(BaseHook):
                     C_SchedulerHook.TOTAL_PREDICTOR_TIME_COST
                 )
                 metrics.update(
-                    calc_iteration_metrics(C_SchedulerHook.ITERATION_STATS, metrics)
+                    calc_iteration_metrics(
+                        C_SchedulerHook.ITERATION_STATS.metric_rows()
+                        if isinstance(C_SchedulerHook.ITERATION_STATS, IterationStats)
+                        else C_SchedulerHook.ITERATION_STATS,
+                        metrics,
+                    )
                 )
                 metrics.update(C_SchedulerHook.INFERENCE_PREDICTOR.get_metrics())
                 memory_budget = ConfigManager.get_memory_budget_metrics()
@@ -1157,8 +1163,11 @@ class C_SchedulerHook(BaseHook):
                         f.write(json.dumps(metrics, cls=CustomJsonEncoder) + "\n")
 
                     with open(f"{output_dir}/iteration.jsonl", "w") as f:
-                        for item in C_SchedulerHook.ITERATION_STATS:
-                            f.write(json.dumps(item) + "\n")
+                        if isinstance(C_SchedulerHook.ITERATION_STATS, IterationStats):
+                            C_SchedulerHook.ITERATION_STATS.write_jsonl(f)
+                        else:
+                            for item in C_SchedulerHook.ITERATION_STATS:
+                                f.write(json.dumps(item) + "\n")
 
                     with open(f"{output_dir}/request.jsonl", "w") as f:
                         for item in stats:
