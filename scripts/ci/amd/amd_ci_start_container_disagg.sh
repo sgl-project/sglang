@@ -312,6 +312,21 @@ add_mount_if_exists "libmnl" "libmnl.so*"
 
 echo "Mount args: $MOUNT_ARGS"
 
+# Optional HF caching proxy set by the runner (HF_ENDPOINT must be a node IP,
+# not 127.0.0.1). Fall back to huggingface.co if it doesn't answer.
+HF_PROXY_ENV=()
+if [[ -n "${HF_ENDPOINT:-}" ]]; then
+  if curl -sf --max-time 5 -o /dev/null "${HF_ENDPOINT%/}/healthz"; then
+    echo "Using HF proxy: ${HF_ENDPOINT}"
+    HF_PROXY_ENV+=(-e "HF_ENDPOINT=${HF_ENDPOINT}")
+    if [[ -n "${HF_HUB_DISABLE_XET:-}" ]]; then
+      HF_PROXY_ENV+=(-e "HF_HUB_DISABLE_XET=${HF_HUB_DISABLE_XET}")
+    fi
+  else
+    echo "Warning: HF proxy ${HF_ENDPOINT} is not responding; downloading from huggingface.co directly" >&2
+  fi
+fi
+
 echo "Launching container: ci_sglang"
 docker run -dt --user root \
   --device=/dev/kfd \
@@ -339,6 +354,7 @@ docker run -dt --user root \
   -e HF_HOME=/sgl-data/hf-cache \
   -e HF_HUB_ETAG_TIMEOUT=300 \
   -e HF_HUB_DOWNLOAD_TIMEOUT=300 \
+  ${HF_PROXY_ENV[@]+"${HF_PROXY_ENV[@]}"} \
   -e MIOPEN_USER_DB_PATH=/sgl-data/miopen-cache \
   -e MIOPEN_CUSTOM_CACHE_DIR=/sgl-data/miopen-cache \
   -w /sglang-checkout \
