@@ -56,8 +56,9 @@ from sglang.srt.utils import (
     is_musa,
     is_xpu,
 )
-from sglang.srt.utils.common import print_warning_once, torch_release
+from sglang.srt.utils.common import torch_release
 from sglang.srt.utils.custom_op import register_custom_op
+from sglang.srt.utils.log_utils import print_warning_once
 
 if TYPE_CHECKING:
     from sglang.srt.layers.linear import LinearBase

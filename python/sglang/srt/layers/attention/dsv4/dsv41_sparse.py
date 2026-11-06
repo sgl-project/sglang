@@ -21,8 +21,9 @@ from sglang.kernels.ops.quantization.fp4_fake_quant import (
 )
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.speculative.ragged_verify import ragged_verify_token_rows
-from sglang.srt.utils import add_prefix, is_gfx95_supported
+from sglang.srt.utils import is_gfx95_supported
 
 
 def _fused_dsv41_kernels(x: torch.Tensor) -> bool:

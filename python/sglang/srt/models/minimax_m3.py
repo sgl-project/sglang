@@ -82,7 +82,8 @@ from sglang.srt.layers.quantization.mxfp8_input import (
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer
-from sglang.srt.layers.utils.common import get_layer_id
+from sglang.srt.layers.utils.common import add_prefix, get_layer_id
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -119,14 +120,12 @@ from sglang.srt.runtime_context import (
     get_stream,
 )
 from sglang.srt.utils import (
-    add_prefix,
     get_device_sm,
     is_cuda,
     is_gfx95_supported,
     is_hip,
     is_npu,
     log_info_on_rank0,
-    make_pp_layers,
 )
 
 _is_cuda = is_cuda()
