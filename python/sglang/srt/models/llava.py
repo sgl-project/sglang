@@ -39,21 +39,17 @@ from transformers.models.llava.modeling_llava import LlavaMultiModalProjector
 import sglang.srt.models as sgl_models
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import general_mm_embed_routine
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputs,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaForCausalLM
-from sglang.srt.models.mistral import MistralForCausalLM
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
 from sglang.srt.multimodal.mm_utils import (
     get_anyres_image_grid_shape,
     unpad_image,
     unpad_image_shape,
 )
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.utils import add_prefix, flatten_nested_list, logger
 
 _KNOWN_BROKEN_AUTOMODEL_CONFIG = "VoxtralRealtimeTextConfig"
@@ -604,6 +600,9 @@ class LlavaMistralForCausalLM(LlavaBaseForCausalLM):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
+        # mistral.py subclasses LlavaForConditionalGeneration from this module
+        from sglang.srt.models.mistral import MistralForCausalLM
+
         super().__init__()
 
         self.config = config

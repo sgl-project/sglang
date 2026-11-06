@@ -24,7 +24,6 @@ def _jit_inkling_all_reduce_module(dtype: torch.dtype, world_size: int) -> Modul
         *args,
         cuda_files=["inkling/inkling_all_reduce.cuh"],
         cuda_wrappers=[
-            ("two_shot_all_reduce", f"inkling_two_shot_all_reduce<{args}>"),
             ("two_shot_all_reduce_fused", f"inkling_two_shot_all_reduce_fused<{args}>"),
             ("multimem_one_shot_fused", f"inkling_multimem_one_shot_fused<{args}>"),
             ("multimem_full_oneshot", f"inkling_multimem_full_oneshot<{args}>"),
@@ -141,32 +140,6 @@ def select_ar_config(num_tokens: int, world_size: int = 4):
 def compile_inkling_all_reduce(dtype: torch.dtype, world_size: int) -> None:
     """Warm the JIT module for (dtype, world_size) so the first call is cheap."""
     _jit_inkling_all_reduce_module(dtype, world_size)
-
-
-def inkling_two_shot_all_reduce(
-    buffer: torch.Tensor,
-    peer_ptrs_dev: int,
-    rank: int,
-    world_size: int,
-    num_items: int,
-) -> None:
-    """Two-shot all-reduce in place over ``num_items`` elements of the symm buffer.
-
-    Args:
-        buffer: this rank's symm buffer (1D, contiguous, bf16), sliced to
-            ``num_items``; used for device/dtype validation. The producer must
-            have already written this rank's shard into it.
-        peer_ptrs_dev: ``hdl.buffer_ptrs_dev`` -- device address of the array of
-            ``world_size`` peer buffer base pointers.
-        rank: this rank within the TP group.
-        world_size: TP world size (compile-time template arg).
-        num_items: number of elements to reduce (multiple of 8 for bf16).
-
-    The caller is responsible for ``hdl.barrier()`` before (producers done) and
-    after (result visible) this call.
-    """
-    module = _jit_inkling_all_reduce_module(buffer.dtype, world_size)
-    module.two_shot_all_reduce(buffer, peer_ptrs_dev, rank, num_items)
 
 
 def inkling_two_shot_all_reduce_fused(

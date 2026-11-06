@@ -1,7 +1,9 @@
 """The DeepGEMM two-level indexer on the dense prefill path against the torch
 block selection and the dense implementation of the same protocol."""
 
+import os
 import unittest
+from contextlib import contextmanager
 from typing import NamedTuple
 
 import msgspec
@@ -10,7 +12,13 @@ import torch
 from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
     select_candidate_block_ids,
 )
-from sglang.kernels.ops.attention.dsv4.fp4_indexer import quantize_fp4_indexer_tensor
+from sglang.kernels.ops.attention.dsv4.index_logits import (
+    index_logits_dtype,
+    index_weights_dtype,
+)
+from sglang.kernels.ops.quantization.fp4_indexer_quant import (
+    quantize_fp4_indexer_tensor,
+)
 from sglang.srt.layers.attention.dsv4.v41_indexer.scoring import (
     DeepGEMMPrefillData,
 )
@@ -23,6 +31,8 @@ HEADS, DIM = 32, 128
 TOPK_BLOCKS, BLOCK, TOPK = 2048, 8, 512
 PAGE = 128  # index-K pool page size under DeepGEMM's paged sparse logits
 CASES = [(256, 40000), (64, 3000)]  # (query rows, context): above and below 2048 blocks
+# (query rows, context, ranks): a padded last share, an even split, an empty share
+SHARD_CASES = [(250, 40000, 4), (256, 3000, 2), (10, 3000, 4)]
 
 # The sparse kernel scores with bf16 weights and accumulation, the dense one in
 # fp32; picks a few bf16 ulps from the selection floor can go either way.
@@ -47,6 +57,11 @@ def make_case(rows, ctx, seed) -> Case:
     index K in the pool page layout [pages, PAGE * 64 payload | PAGE * 4 scale]."""
     from deep_gemm import fp8_fp4_mqa_logits
 
+    from sglang.kernels.ops.attention.dsv4.index_logits import (
+        index_logits_dtype,
+        index_weights_dtype,
+    )
+
     torch.manual_seed(seed)
     dev = "cuda"
     n_slots = (ctx + PAGE - 1) // PAGE * PAGE
@@ -70,15 +85,17 @@ def make_case(rows, ctx, seed) -> Case:
     lens[0] = 0  # a query that sees no compressed position yet
     width = (ctx + 7) // 8 * 8
     starts = torch.zeros(rows, device=dev, dtype=torch.int32)
+    # Score in the dtypes the indexer uses on this GPU, so the reference matches.
     dense = fp8_fp4_mqa_logits(
         (q_fp4, q_sf),
         (k_fp4[:width], k_sf[:width]),
-        weights,
+        weights.to(index_weights_dtype()),
         starts,
         lens,
         False,
         width,
-    )
+        logits_dtype=index_logits_dtype(),
+    ).float()
     data = DeepGEMMPrefillData(
         k_slots=torch.arange(width, device=dev),
         request_starts=starts,
@@ -206,7 +223,7 @@ def reference_blocks(case: Case) -> torch.Tensor:
     return keep[:, :num_blocks]
 
 
-def publish_sparse(case: Case):
+def publish_sparse(case: Case, row_shard=None):
     """(the DeepGEMM sparse table, the source layer's own top-k)."""
     from sglang.srt.layers.attention.dsv4.v41_indexer.sparse_table import (
         publish_prefill_table,
@@ -220,8 +237,63 @@ def publish_sparse(case: Case):
         index_page_size=PAGE,
         topk_blocks=TOPK_BLOCKS,
         out_positions=own,
+        row_shard=row_shard,
     )
     return table, own
+
+
+class _CaptureShares:
+    """Pass one of an in-process all-gather: records, in call order, the share
+    this rank contributes to each gather. It returns the replicated result,
+    keyed by width, because the code after a gather relies on real values: the
+    table build wants ascending, distinct block ids, and crashes on zeros."""
+
+    def __init__(self, replicated):
+        self.replicated = replicated
+        self.shares = []
+
+    def all_gather_into_tensor(self, out, local):
+        self.shares.append(local.clone())
+        full = self.replicated[local.shape[1]]
+        out.zero_()
+        out[: full.shape[0]].copy_(full)
+
+
+class _ReplayShares:
+    """Pass two: every gather returns all ranks' recorded shares in rank order,
+    which is what the attention-TP all-gather returns."""
+
+    def __init__(self, captures):
+        self.captures = captures
+        self.calls = 0
+
+    def all_gather_into_tensor(self, out, local):
+        out.copy_(torch.cat([c.shares[self.calls] for c in self.captures]))
+        self.calls += 1
+
+
+def on_every_rank(world: int, num_rows: int, run, replicated):
+    """``run(row_shard)`` as each rank of a ``world``-rank attention-TP group
+    sees it, every rank's share scored by the code under test; ``replicated``
+    maps a gathered width to its unsharded result. The returned results derive
+    from the recorded shares only, never from ``replicated``."""
+    from sglang.srt.layers.attention.dsv4.v41_indexer.types import RowShard
+
+    def shard(rank, group):
+        return RowShard(group=group, rank=rank, world=world, row_align=128 // HEADS)
+
+    # Rows a broken partition leaves out reach the table build uninitialized and
+    # crash it, which poisons the CUDA context for every later test; fail first.
+    covered = []
+    for rank in range(world):
+        rows = shard(rank, None).local_rows(num_rows)
+        covered.extend(range(rows.start, rows.stop))
+    assert covered == list(range(num_rows)), "row shares must tile the rows in order"
+
+    captures = [_CaptureShares(replicated) for _ in range(world)]
+    for rank in range(world):
+        run(shard(rank, captures[rank]))
+    return [run(shard(rank, _ReplayShares(captures))) for rank in range(world)]
 
 
 def select_sparse(table, data: DeepGEMMPrefillData, k_cache: torch.Tensor):
@@ -281,8 +353,51 @@ def logits_of(table, data: DeepGEMMPrefillData, k_cache: torch.Tensor):
     )
 
 
+def block_scores(case: Case) -> torch.Tensor:
+    """[rows, blocks] max dense score per block, the score blocks are ranked by."""
+    j = torch.arange(case.dense.shape[1], device=case.dense.device)
+    scores = case.dense.masked_fill(j[None, :] >= case.lens[:, None], -torch.inf)
+    pad = -scores.shape[1] % BLOCK
+    if pad:
+        scores = torch.nn.functional.pad(scores, (0, pad), value=-torch.inf)
+    scores = scores.unflatten(-1, (-1, BLOCK)).amax(dim=-1)
+    # the block of the last causal position is always kept
+    last = (case.lens.long() - 1) // BLOCK
+    blocks = torch.arange(scores.shape[1], device=scores.device)
+    return scores.masked_fill(blocks[None, :] == last[:, None], torch.inf)
+
+
+def valid_scores(table, case: Case) -> torch.Tensor:
+    """The paged sparse scores ``table`` drives, at every row's valid positions
+    only; the logits past a row's length are never written."""
+    logits = logits_of(table, case.data, case.k_cache)
+    cols = torch.arange(logits.shape[1], device=logits.device)
+    return logits[cols[None, :] < table.valid_lens[:, None]]
+
+
 def picks(positions: torch.Tensor, row: int) -> set:
     return set(positions[row].tolist()) - {-1}
+
+
+@contextmanager
+def fp32_index_logits():
+    """Pin the index logits (and weights) to fp32: bf16 logits vary with the
+    tile's row count, so the shard and replicated passes -- equal by
+    construction -- still pick differently a few ulps from the floor."""
+    key = "SGLANG_OPT_DSV41_BF16_INDEX_LOGITS"
+    old = os.environ.get(key)
+    os.environ[key] = "0"
+    index_logits_dtype.cache_clear()
+    index_weights_dtype.cache_clear()
+    try:
+        yield
+    finally:
+        if old is None:
+            del os.environ[key]
+        else:
+            os.environ[key] = old
+        index_logits_dtype.cache_clear()
+        index_weights_dtype.cache_clear()
 
 
 @unittest.skipUnless(
@@ -304,7 +419,14 @@ class TestPrefillSparseIndexer(CustomTestCase):
                 # INT32_MAX padding lands in a spare column instead of a block
                 got = torch.zeros(rows, nb + 1, dtype=torch.bool, device="cuda")
                 got.scatter_(1, table.blocks.clamp_max(nb).long(), True)
-                self.assertTrue(torch.equal(got[:, :nb], expected))
+                got = got[:, :nb]
+                # bf16 scores tie often: blocks may differ only among those tied
+                # at the row's selection floor.
+                self.assertTrue(torch.equal(got.sum(-1), expected.sum(-1)))
+                scores = block_scores(case)[:, :nb]
+                floor = scores.masked_fill(~expected, torch.inf).amin(-1, keepdim=True)
+                differ = got ^ expected
+                self.assertTrue((~differ | (scores == floor)).all())
                 self.assertFalse(got[0, :nb].any(), "an empty row keeps no block")
                 _, own_dense = publish_dense(case)
                 for r in range(rows):
@@ -318,9 +440,13 @@ class TestPrefillSparseIndexer(CustomTestCase):
         for rows, ctx in CASES:
             with self.subTest(rows=rows, ctx=ctx):
                 case = make_case(rows, ctx, seed=rows * 3 + ctx)
-                got = select_sparse(publish_sparse(case)[0], case.data, case.k_cache)
+                table = publish_sparse(case)[0]
+                got = select_sparse(table, case.data, case.k_cache)
                 want = select_dense(publish_dense(case)[0], case)
-                keep = reference_blocks(case).repeat_interleave(BLOCK, dim=1)
+                nb = -(-case.dense.shape[1] // BLOCK)
+                keep = torch.zeros(rows, nb + 1, dtype=torch.bool, device="cuda")
+                keep.scatter_(1, table.blocks.clamp_max(nb).long(), True)
+                keep = keep[:, :nb].repeat_interleave(BLOCK, dim=1)
                 self.assertEqual(picks(got, 0), set(), "an empty row selects nothing")
                 for r in range(1, rows):
                     g, w = picks(got, r), picks(want, r)
@@ -328,7 +454,17 @@ class TestPrefillSparseIndexer(CustomTestCase):
                     self.assertTrue(
                         keep[r, list(g)].all(), f"row {r}: outside its blocks"
                     )
-                    self.assertGreaterEqual(len(g & w), MIN_OVERLAP * len(w), r)
+                    # A dense pick the sparse side dropped at its own selection
+                    # floor is a rounding swap, not a miss.
+                    g_floor = case.dense[r, list(g)].min()
+                    swaps = sum(
+                        bool(
+                            case.dense[r, p]
+                            <= g_floor + g_floor.abs() * FLOOR_TOLERANCE
+                        )
+                        for p in w - g
+                    )
+                    self.assertGreaterEqual(len(g & w) + swaps, MIN_OVERLAP * len(w), r)
                     floor = case.dense[r, list(w)].min()
                     self.assertTrue(
                         (
@@ -355,7 +491,15 @@ class TestPrefillSparseIndexer(CustomTestCase):
         part = select_sparse(sub, rows_of(case.data, idx), case.k_cache)
         for r in range(tail):
             a, b = picks(full, rows - tail + r), picks(part, r)
-            self.assertGreaterEqual(len(a & b), MIN_TAIL_OVERLAP * len(a), r)
+            # A full-table pick the tail dropped at its own selection floor is a
+            # rounding swap, as in the dense comparison above.
+            scores = case.dense[rows - tail + r]
+            b_floor = scores[list(b)].min()
+            swaps = sum(
+                bool(scores[p] <= b_floor + b_floor.abs() * FLOOR_TOLERANCE)
+                for p in a - b
+            )
+            self.assertGreaterEqual(len(a & b) + swaps, MIN_TAIL_OVERLAP * len(a), r)
 
     @torch.inference_mode()
     def test_row_pair_ids_schedule_the_same_logits_as_per_request_ids(self):
@@ -426,6 +570,83 @@ class TestPrefillSparseIndexer(CustomTestCase):
             torch.cuda.set_sync_debug_mode("default")
         rows = [3, 4, 12, 13, 14, 15, 16, 17, 18, 19]
         torch.testing.assert_close(tail.blocks, blocks[rows])
+
+    @torch.inference_mode()
+    def test_row_shards_publish_the_replicated_table(self):
+        """Each attention-TP rank scoring only its share of the rows and
+        all-gathering the selections publishes, on every rank, the replicated
+        path's own top-k and table bit for bit, and a schedule that drives the
+        same scores: shares that pad, come out empty, or cut a request in two
+        included."""
+        with fp32_index_logits():
+            cases = [
+                (make_case(rows, ctx, seed=rows + ctx), world)
+                for rows, ctx, world in SHARD_CASES
+            ]
+            cases.append((make_multi_case([100, 37, 120], 40000, seed=7), 4))
+            for case, world in cases:
+                with self.subTest(rows=case.data.num_rows, world=world):
+                    table, own = publish_sparse(case)
+                    ranks = on_every_rank(
+                        world,
+                        case.data.num_rows,
+                        lambda s: publish_sparse(case, s),
+                        {TOPK: own, TOPK_BLOCKS: table.blocks},
+                    )
+                    for rank, (got_table, got_own) in enumerate(ranks):
+                        # the own top-k is unordered within a row
+                        self.assertTrue(
+                            torch.equal(got_own.sort(-1).values, own.sort(-1).values),
+                            f"rank {rank}: own top-k",
+                        )
+                        for field in ("blocks", "phys_blocks", "valid_lens"):
+                            self.assertTrue(
+                                torch.equal(
+                                    getattr(got_table, field), getattr(table, field)
+                                ),
+                                f"rank {rank}: {field}",
+                            )
+                        # The schedule buffer holds bytes its build never writes,
+                        # so two replicated builds of one input already differ
+                        # byte for byte; what it must reproduce is the scores it
+                        # drives.
+                        self.assertTrue(
+                            torch.equal(
+                                valid_scores(got_table, case), valid_scores(table, case)
+                            ),
+                            f"rank {rank}: schedule",
+                        )
+
+    @torch.inference_mode()
+    def test_row_shards_select_the_replicated_full_topk(self):
+        """An index layer outside the candidate scheme selects the replicated
+        full top-k when its rows are scored by shares and all-gathered."""
+        from sglang.srt.layers.attention.dsv4.v41_indexer.scoring import (
+            dense_prefill_topk,
+            sharded_dense_prefill_topk,
+        )
+
+        with fp32_index_logits():
+            for rows, ctx, world in SHARD_CASES:
+                with self.subTest(rows=rows, world=world):
+                    case = make_case(rows, ctx, seed=rows * 5 + ctx)
+                    expected = case.data.empty_selection(TOPK)
+                    dense_prefill_topk(case.data, case.kv, out=expected)
+
+                    def run(shard):
+                        out = case.data.empty_selection(TOPK)
+                        sharded_dense_prefill_topk(
+                            case.data, case.kv, out=out, shard=shard
+                        )
+                        return out
+
+                    for rank, got in enumerate(
+                        on_every_rank(world, rows, run, {TOPK: expected})
+                    ):
+                        self.assertTrue(
+                            torch.equal(got.sort(-1).values, expected.sort(-1).values),
+                            f"rank {rank}",
+                        )
 
 
 if __name__ == "__main__":

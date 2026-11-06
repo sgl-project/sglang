@@ -428,7 +428,7 @@ struct AllReduceKernel {
     const auto& comm = *comm_ref.get();
     CHECK_HOST(algo == "1shot_pull" || algo == "2shot_pull" || algo == "1shot_push" || algo == "2shot_push") << algo;
     CHECK_HOST(comm.get_world_size() == kWorldSize) << comm.get_world_size();
-    CHECK_HOST(in.IsContiguous() && is_type<T>(in.dtype()) && in.device().device_type == kDLCUDA);
+    CHECK_HOST(in.IsContiguous() && is_type<T>(in.dtype()) && in.device().device_type == kDLGPU);
     const auto num_elems_int64 = in.numel();
     const auto num_elems = static_cast<uint32_t>(num_elems_int64);
     const auto nbytes = static_cast<int64_t>(num_elems_int64 * sizeof(T));

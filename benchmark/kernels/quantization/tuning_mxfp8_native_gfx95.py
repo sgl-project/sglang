@@ -1,5 +1,5 @@
 """Tune the gfx950 native MXFP8 dense route for one (N, K) and write its rows into
-python/sglang/kernels/ops/quantization/mxfp8_gemv_gfx95_configs.json.
+python/sglang/kernels/ops/gemm/mxfp8_gemv_gfx95_configs.json.
 
 Two tables: the scaled-MFMA GEMV config per M bucket (1 ... 32) and the dot_scaled tile per
 M bucket (64 ... 16384). Each candidate is timed by HIP-graph replay rotating over weight
@@ -18,7 +18,7 @@ import torch
 from triton.runtime.errors import OutOfResources
 
 from sglang.kernels.jit.utils import empty_sentinel
-from sglang.kernels.ops.quantization import mxfp8_native_amd_gfx95 as native
+from sglang.kernels.ops.gemm import mxfp8_native_amd_gfx95 as native
 from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import fp8_grid_quantize
 
 GRAPH_CALLS = 20
