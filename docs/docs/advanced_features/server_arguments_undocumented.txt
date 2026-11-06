@@ -61,6 +61,7 @@
 --mm-processor-worker-num
 --otlp-service-name
 --prefill-kv-cache-dequant-dtype
+--qsa-cache-sharding-size
 --qsa-indexer-dtype
 --radix-eviction-policy-config
 --return-input-ids
