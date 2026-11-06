@@ -19,14 +19,19 @@ def build_qsa_indexer(
         raise ValueError(
             "build_qsa_indexer requires a config with a QSA indexer schema"
         )
+    from sglang.srt.layers.attention.qsa.cache_sharding import (
+        get_qsa_cache_sharding_runtime,
+    )
     from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
 
+    cache_sharding_runtime = get_qsa_cache_sharding_runtime()
     return QSAIndexer(
         config=config,
         layer_id=layer_id,
         quant_config=quant_config,
         prefix=prefix,
         rotary_emb=rotary_emb,
+        cache_sharding_runtime=cache_sharding_runtime,
     )
 
 
