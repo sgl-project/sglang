@@ -2194,6 +2194,19 @@ class Envs:
     SGLANG_MUSE_REUSE_EXTEND_METADATA = EnvBool(True)
     # target-verify KV lengths once per batch / per graph replay, not per layer.
     SGLANG_MUSE_REUSE_VERIFY_LENGTHS = EnvBool(True)
+    # FP8 Q (per-tensor dynamic scale) for full-layer extend of >= 256 tokens.
+    SGLANG_MUSE_EXTEND_FP8_Q = EnvBool(True)
+    # aiter patch 05 tiles: long-prefill 2D config, unmasked interior 2D tiles,
+    # 64-row verify tiles with an exact q-block grid and 256 split-KV segments.
+    SGLANG_MUSE_PREFILL_2D_TILES = EnvBool(True)
+    SGLANG_MUSE_UNMASKED_INTERIOR = EnvBool(True)
+    SGLANG_MUSE_VERIFY_BM64 = EnvBool(True)
+    # Verify kernels: sliding layers split-KV (<= 8 requests) / GQA-folded
+    # (> 8); full layers two-KV-head kernel, else GQA-folded from 8 requests.
+    SGLANG_MUSE_VERIFY_SWA_SPLITKV = EnvBool(True)
+    SGLANG_MUSE_VERIFY_SWA_GQA = EnvBool(True)
+    SGLANG_MUSE_VERIFY_FULL_V2 = EnvBool(True)
+    SGLANG_MUSE_VERIFY_FULL_GQA = EnvBool(True)
     # Triton extend: DFlash draft block (8 x 8 heads, 1 KV head, HD128) split-KV.
     SGLANG_MUSE_DFLASH_SPLITKV = EnvBool(True)
     # Tiled 17..64-row GEMMs for the weight shapes the ROCm Muse Spark model
