@@ -34,7 +34,7 @@ class _SharedModel:
 
 
 class TestRoutingBoundary(CustomTestCase):
-    def test_draft_build_excludes_target_replicas_and_restores_on_failure(self):
+    def test_draft_build_excludes_target_placement_and_restores_on_failure(self):
         from sglang.srt.runtime_context import get_exec
 
         with get_context().override_server_args(
@@ -43,12 +43,12 @@ class TestRoutingBoundary(CustomTestCase):
             with self.assertRaisesRegex(RuntimeError, "draft failed"):
                 with draft_model_build_scope():
                     self.assertIsNone(get_exec().moe.moe_load_balancer_algorithm)
-                    self.assertEqual(get_exec().moe.ep_num_redundant_experts, 0)
+                    # The draft keeps the native redundant slots, unused as on main.
+                    self.assertEqual(get_exec().moe.ep_num_redundant_experts, 8)
                     raise RuntimeError("draft failed")
             self.assertEqual(
                 get_exec().moe.moe_load_balancer_algorithm, "lplb+waterfill"
             )
-            self.assertEqual(get_exec().moe.ep_num_redundant_experts, 8)
 
     def test_empty_target_calls_balancer_but_draft_keeps_native_slots(self):
         pipeline = SimpleNamespace(

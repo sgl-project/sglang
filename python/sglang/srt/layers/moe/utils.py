@@ -645,7 +645,7 @@ def draft_model_build_scope():
 
     - ``boundary_reduction`` is ``--speculative-boundary-reduction``.
       Boundaries built here keep the resolved value after exit.
-    - EvenMoE target placement and redundant slots are excluded from the draft.
+    - EvenMoE target placement is excluded from the draft.
     - ``enable_w4a4_mxfp4_megamoe`` is ``--speculative-enable-w4a4-mxfp4-megamoe``
       when set, else inherited. ``FusedMoE`` layers built here keep the
       draft's MegaMoE MMA type after exit.
@@ -666,9 +666,7 @@ def draft_model_build_scope():
             ),
             _draft_w4a4_mxfp4_megamoe_override(),
             (
-                get_exec().moe.override(
-                    moe_load_balancer_algorithm=None, ep_num_redundant_experts=0
-                )
+                get_exec().moe.override(moe_load_balancer_algorithm=None)
                 if get_exec().moe.moe_load_balancer_algorithm is not None
                 else nullcontext()
             ),
