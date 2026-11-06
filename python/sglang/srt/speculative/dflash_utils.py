@@ -888,7 +888,6 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
                 f"DFLASH Domino requires block_size > 1, got {block_size}."
             )
 
-
     return DFlashDraftConfig(
         num_hidden_layers=num_hidden_layers,
         num_target_layers=num_target_layers,
