@@ -1,6 +1,6 @@
-"""DeepSeek-V4 C4 FP4 indexer logits on gfx950: today's schedule kernels against AITER's
-row-group kernel (SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP) for decode (1 row a request) and
-DSpark target-verify (4 or 7 rows a request).
+"""DeepSeek-V4 C4 FP4 indexer logits on gfx950: the schedule kernels against AITER's
+row-group kernel for decode (1 row a request) and DSpark target-verify (4 or 7 rows a
+request).
 
 Shapes are the serving ones: 64 heads, 64-slot index-K pages, a page table as wide as the
 captured graph's (``--max-context``, the server's context length), every request at the
