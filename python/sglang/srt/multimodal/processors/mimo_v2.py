@@ -4,7 +4,6 @@ import asyncio
 import base64
 import copy
 import math
-import os
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -36,7 +35,7 @@ from sglang.srt.multimodal.processors.mimo_audio import (
 from sglang.srt.multimodal.processors.qwen_vl import smart_nframes
 from sglang.srt.runtime_context import get_device
 from sglang.srt.utils import ImageData, VideoData
-from sglang.srt.utils.common import download_remote_media
+from sglang.srt.utils.common import download_remote_media, media_url_timeout
 from sglang.utils import logger
 
 
@@ -468,7 +467,7 @@ class MiMoProcessor:
         if isinstance(path_or_data, str) and path_or_data.startswith(
             ("http://", "https://")
         ):
-            timeout = int(os.getenv("REQUEST_TIMEOUT", "10"))
+            timeout = media_url_timeout(10)
             path_or_data = download_remote_media(path_or_data, timeout=timeout)
 
         if isinstance(path_or_data, bytes):

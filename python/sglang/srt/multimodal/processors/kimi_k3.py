@@ -357,7 +357,7 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
         grids = [tuple(int(value) for value in grid) for grid in grid_thws.tolist()]
         patch_counts = [math.prod(grid) for grid in grids]
         if sum(patch_counts) != pixel_values.shape[0]:
-            raise ValueError(
+            raise RuntimeError(
                 "Kimi-K3 processor feature length does not match image grids: "
                 f"{pixel_values.shape[0]} != {sum(patch_counts)}"
             )
@@ -474,7 +474,7 @@ class KimiK3ImageProcessor(
             input_ids.flatten(), self.mm_tokens.image_token_id
         )
         if len(offsets) != len(base_output.images):
-            raise ValueError("Expected one Kimi-K3 image span for each image")
+            raise RuntimeError("Expected one Kimi-K3 image span for each image")
 
         items = []
         for image, resize_config, offset in zip(images, resize_configs, offsets):
@@ -636,7 +636,7 @@ class KimiK3ImageProcessor(
         ).flatten()
         offsets = self.get_mm_items_offset(input_ids, self.mm_tokens.image_token_id)
         if len(offsets) != len(artifacts):
-            raise ValueError("Expected one Kimi-K3 image span for each image")
+            raise RuntimeError("Expected one Kimi-K3 image span for each image")
 
         # 2. build request-owned items from prompt-independent artifacts
         items = []
