@@ -13,7 +13,11 @@ from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.managers.scheduler_components.request_list import RequestList
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    KeyedReqList,
+    ListKind,
+)
 from sglang.srt.runtime_context import get_context
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -62,10 +66,12 @@ class TestHeldRowAdmission(CustomTestCase):
         s.grammar_manager = SimpleNamespace(has_waiting_grammars=lambda: False)
         s.enable_priority_preemption = False
         s.is_hybrid_swa = False
-        s.waiting_queue = waiting
+        s.waiting_queue = IndexedReqList(ListKind.WAITING)
+        s.waiting_queue.join(waiting)
+        s.chunked_reqs = IndexedReqList(ListKind.CHUNKED)
         s.chunked_req = final_chunk
         s.min_free_slots_delayer = None
-        s.policy = Mock()
+        s.policy = Mock(calc_priority=lambda waiting, *args, **kwargs: list(waiting))
         s.policy.shortest_prefill_chunk_limit.return_value = None
         s.processed_tokens_counter = 0
         s.chunked_prefill_size = 8192
@@ -74,6 +80,7 @@ class TestHeldRowAdmission(CustomTestCase):
             model_runner=SimpleNamespace(attn_backend=SimpleNamespace())
         )
         s.get_prefill_adder_class = lambda: _Adder
+        s.request_retirer = None
         s.page_size = 1
         s.tree_cache = SimpleNamespace(
             buffer_pipeline=None, storage_prefetch_retries=None
@@ -100,7 +107,7 @@ class TestHeldRowAdmission(CustomTestCase):
             available_size=lambda: NUM_ROWS - len(running) - 1
         )
         s.beam_coordinator = SimpleNamespace(pending_member_rows=lambda batch: 0)
-        s.running_reqs = RequestList()
+        s.running_reqs = KeyedReqList(ListKind.DECODING)
         return s
 
     def _admitted(self, disaggregation_mode):

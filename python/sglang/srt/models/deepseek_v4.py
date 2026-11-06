@@ -43,6 +43,7 @@ from sglang.kernels.ops.gemm.dsv4_wo_a import (
 )
 from sglang.kernels.ops.quantization.fp8_group_major_quant_ue8m0 import (
     sglang_per_token_group_quant_fp8_dsv4_wo_a,
+    sglang_per_token_group_quant_fp8_dsv4_wo_a_with_rope,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
@@ -63,6 +64,7 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import (
 from sglang.srt.hardware_backend.npu.utils import (
     use_npu_arch35_mxfp8_wo_a,
 )
+from sglang.srt.hf_transformers import get_rope_config
 from sglang.srt.layers.attention.dsa.utils import (
     is_dsa_enable_prefill_cp,
 )
@@ -109,7 +111,12 @@ from sglang.srt.layers.quantization.fp8_utils import (
     Mxfp8DenseGemmBackend,
     view_aiter_fused_rms_transposed_fp8_scale,
 )
-from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
+from sglang.srt.layers.quantization.mxfp8_input import (
+    Mxfp8SwizzledInput,
+    deepgemm_mxfp8_linear_input,
+    deepgemm_pair_takes_flashinfer,
+    zero_deepgemm_mxfp8_scale_rows,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
@@ -121,8 +128,7 @@ from sglang.srt.managers.mm_utils import (
     embed_mm_inputs,
     pad_mm_tokens,
 )
-from sglang.srt.managers.req_types import MM_PAD_SHIFT_VALUE
-from sglang.srt.managers.schedule_batch import MultimodalInputs
+from sglang.srt.managers.req_types import MM_PAD_SHIFT_VALUE, MultimodalInputs
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -212,7 +218,6 @@ from sglang.srt.utils import (
     make_pp_layers,
 )
 from sglang.srt.utils.custom_op import register_custom_op
-from sglang.srt.utils.hf_transformers import get_rope_config
 
 # NPU-only: bind torch_npu here so _compute_q_b / _forward_prepare can call
 # torch_npu.npu_rms_norm directly (imports elsewhere aren't visible in this module).
@@ -869,14 +874,19 @@ def deepseek_v4_mega_attention_with_mxfp8_output(
     forward_batch = get_tc_piecewise_forward_context().forward_batch
     real_num_tokens = forward_batch.global_num_token_non_padded_cpu
     if real_num_tokens:
-        # DeepGEMM writes the scales at the TMA-aligned stride of the live rows,
+        # DeepGEMM writes packed scales at the TMA-aligned stride of the live rows,
         # while the captured wo_b reads them at the stride of the padded rows.
-        restride = scale.stride(-1) != ceil_align(real_num_tokens, 4)
-        live_scale = (
-            mhc.empty_deepgemm_mxfp8_scales(real_num_tokens, data.shape[1], data.device)
-            if restride
-            else scale[:real_num_tokens]
-        )
+        # FlashInfer-layout scales of the live rows are a prefix of the padded ones.
+        swizzled = scale.dim() == 4
+        restride = not swizzled and scale.stride(-1) != ceil_align(real_num_tokens, 4)
+        if swizzled:
+            live_scale = scale[: -(-real_num_tokens // 128)]
+        elif restride:
+            live_scale = mhc.empty_deepgemm_mxfp8_scales(
+                real_num_tokens, data.shape[1], data.device
+            )
+        else:
+            live_scale = scale[:real_num_tokens]
         layer._mega_core(
             query[:real_num_tokens],
             attn_sink,
@@ -887,7 +897,7 @@ def deepseek_v4_mega_attention_with_mxfp8_output(
         if restride:
             scale[:real_num_tokens].copy_(live_scale)
     data[real_num_tokens:].zero_()
-    scale[real_num_tokens:].zero_()
+    zero_deepgemm_mxfp8_scale_rows(scale, real_num_tokens)
 
 
 bcg_deepseek_v4_mega_attention_with_mxfp8_output = eager_on_graph(True)(
@@ -1066,7 +1076,7 @@ class MqaAttentionBase(nn.Module):
             if wo_b_reduce_results is None
             else wo_b_reduce_results
         )
-        # NPU arch35 runs wo_a as a batched MXFP8 GEMM instead of deep_gemm's FP8 one,
+        # NPU Ascend 950 runs wo_a as a batched MXFP8 GEMM instead of deep_gemm's FP8 one,
         # but it needs the same quantized weights.
         self.use_npu_arch35_mxfp8_wo_a = use_npu_arch35_mxfp8_wo_a(
             quant_config, wo_a_keeps_quant_config
@@ -1136,7 +1146,7 @@ class MqaAttentionBase(nn.Module):
                 "FP8 quant_config must create weight_scale_inv"
             )
         if self.use_npu_arch35_mxfp8_wo_a:
-            # Read by the NPU arch35 MXFP8 weight processor to batch the
+            # Read by the NPU Ascend 950 MXFP8 weight processor to batch the
             # weight/scale per attention group for npu_transpose_quant_batchmatmul.
             self.wo_a._dsv4_npu_arch35_mxfp8_wo_a = True
             self.wo_a._dsv4_num_groups = self.n_local_groups
@@ -1538,6 +1548,15 @@ class MQALayer(MqaAttentionBase):
             and self.wo_a.weight.shape == (self.n_local_groups * self.o_lora_rank, 4096)
             and can_use_fused_wo_a(self.n_local_groups, self.o_lora_rank)
         )
+        self.use_fused_rope_quant = (
+            envs.SGLANG_OPT_FP8_WO_A_FUSED_INVROPE.get()
+            and self.wo_a_fp8
+            and _FP8_WO_A_UE8M0
+            and not _is_npu
+            and not _is_hip
+            and self.qk_rope_head_dim == 64
+            and self.head_dim == 512
+        )
         if _is_hip:
             _hip.init_mqa_layer(self, quant_config)
 
@@ -1623,12 +1642,15 @@ class MQALayer(MqaAttentionBase):
             rows = q.shape[0]
             if self._mega_mxfp8_output(rows):
                 y, y_sf = mhc.empty_deepgemm_mxfp8_pair(
-                    rows, self.n_local_groups * self.o_lora_rank, q.device
+                    rows,
+                    self.n_local_groups * self.o_lora_rank,
+                    q.device,
+                    flashinfer=deepgemm_pair_takes_flashinfer(),
                 )
                 bcg_deepseek_v4_mega_attention_with_mxfp8_output(
                     self, q, y, y_sf, attn_sink
                 )
-                return y, y_sf
+                return deepgemm_mxfp8_linear_input(y, y_sf)
             o = q.new_empty((rows, self.n_local_groups, self.o_lora_rank))
             bcg_deepseek_v4_mega_attention_with_output(self, q, o, attn_sink)
             return o
@@ -1665,7 +1687,10 @@ class MQALayer(MqaAttentionBase):
         o_fp8, o_s = data[:, :groups], scale[:, :groups]
         if out is None and allow_mxfp8_output and self._mega_mxfp8_output(rows):
             out = mhc.empty_deepgemm_mxfp8_pair(
-                rows, groups * self.o_lora_rank, data.device
+                rows,
+                groups * self.o_lora_rank,
+                data.device,
+                flashinfer=deepgemm_pair_takes_flashinfer(),
             )
         if isinstance(out, tuple):
             y, y_sf = out
@@ -1676,7 +1701,7 @@ class MQALayer(MqaAttentionBase):
                 recipe=(1, 1, 32),
                 out=(y.view(rows, groups, -1), y_sf),
             )
-            return y, y_sf
+            return deepgemm_mxfp8_linear_input(y, y_sf)
         return _fp8_wo_a_einsum(o_fp8, o_s, *self.mega_wo_a, recipe=(1, 1, 32), out=out)
 
     def _get_npu_rope_position_cache(
@@ -2163,12 +2188,17 @@ class MQALayer(MqaAttentionBase):
             qkv_a = None
 
         if self.use_fused_qk_norm_rope:
-            if _is_gfx95_supported or _is_gfx1250_supported:
+            q_lora_e8m0 = (
+                _is_gfx95_supported or _is_gfx1250_supported
+            ) and self._q_lora_quant_e8m0(with_indexer=False)
+            if (_is_gfx95_supported or _is_gfx1250_supported) and (
+                _use_aiter or q_lora_e8m0
+            ):
                 q_for_wqb, q_lora = _fused_rmsnorm_fp8_quant(
                     q_lora,
                     self.q_norm.weight,
                     self.q_norm.variance_epsilon,
-                    e8m0=self._q_lora_quant_e8m0(with_indexer=False),
+                    e8m0=q_lora_e8m0,
                 )
                 q, _ = self.wq_b(q_for_wqb)
             else:
@@ -2305,12 +2335,17 @@ class MQALayer(MqaAttentionBase):
         # The indexer's wq_b reuses the fp8 quant of the normed q_lora made here.
         q_lora_quant = None
         if do_fused_qk_norm_rope:
-            if _is_gfx95_supported or _is_gfx1250_supported:
+            q_lora_e8m0 = (
+                _is_gfx95_supported or _is_gfx1250_supported
+            ) and self._q_lora_quant_e8m0(with_indexer=True)
+            if (_is_gfx95_supported or _is_gfx1250_supported) and (
+                _use_aiter or q_lora_e8m0
+            ):
                 q_for_wqb, q_lora = _fused_rmsnorm_fp8_quant(
                     q_lora,
                     self.q_norm.weight,
                     self.q_norm.variance_epsilon,
-                    e8m0=self._q_lora_quant_e8m0(with_indexer=True),
+                    e8m0=q_lora_e8m0,
                 )
                 q, _ = self.wq_b(q_for_wqb)
                 q_lora_quant = q_for_wqb
@@ -2940,6 +2975,14 @@ class MQALayer(MqaAttentionBase):
                 self.use_fused_wo_a and 0 < o.shape[0] <= _FUSED_WO_A_MAX_TOKENS
             )
 
+            fuse_rope_quant = (
+                self.use_fused_rope_quant
+                and not is_in_breakable_cuda_graph()
+                and inv_rope is None
+                and o.shape[-1] == 512
+                and o.dtype == torch.bfloat16
+            )
+
             if _is_npu:
                 cos4, sin4 = self._get_npu_rope_position_cache(
                     forward_batch, positions, o.dtype, inverse=True
@@ -2951,7 +2994,7 @@ class MQALayer(MqaAttentionBase):
                     sin4,
                     qk_nope_dim=self.qk_nope_head_dim,
                 )
-            elif inv_rope is None and not fuse_rope_wo_a:
+            elif inv_rope is None and not fuse_rope_wo_a and not fuse_rope_quant:
                 # The fused path folds this in; it must not run twice.
                 fused_rope_inplace(
                     o[..., -self.qk_rope_head_dim :],
@@ -3005,7 +3048,14 @@ class MQALayer(MqaAttentionBase):
                 if _FP8_WO_A_UE8M0:
                     # Blackwell (including SM120): UE8M0 scales via the dedicated
                     # JIT kernel.
-                    o_fp8, o_s = sglang_per_token_group_quant_fp8_dsv4_wo_a(o)
+                    if fuse_rope_quant:
+                        o_fp8, o_s = (
+                            sglang_per_token_group_quant_fp8_dsv4_wo_a_with_rope(
+                                o, self.freqs_cis, positions
+                            )
+                        )
+                    else:
+                        o_fp8, o_s = sglang_per_token_group_quant_fp8_dsv4_wo_a(o)
                     recipe = (1, 1, 128)
                 else:
                     # sm90 (Hopper): fp32 scales.
@@ -4771,6 +4821,8 @@ class DeepseekV4ForCausalLM(nn.Module):
                 # Deterministic execution keeps its pinned tactic.
                 method.mxfp8_prefill_autotune_min_tokens = 1
             weight = layer.weight
+            if weight.numel() == 0:
+                continue
             scale = layer.weight_scale_inv_swizzled
             key = (
                 weight.shape,
@@ -5327,11 +5379,10 @@ class DeepseekV4ForCausalLM(nn.Module):
                     and loaded_weight.dtype != torch.float8_e4m3fn
                 ):
                     raise ValueError(
-                        f"SGLANG_OPT_FP8_WO_A_GEMM is enabled but {name} has "
+                        f"FP8 wo_a is enabled but {name} has "
                         f"dtype {loaded_weight.dtype}, expected "
                         "torch.float8_e4m3fn. This checkpoint does not provide "
-                        "a supported fp8-quantized wo_a; rerun with "
-                        "SGLANG_OPT_FP8_WO_A_GEMM=0."
+                        "a supported fp8-quantized wo_a."
                     )
                 try:
                     use_async_loading = should_async_load(loaded_weight)
