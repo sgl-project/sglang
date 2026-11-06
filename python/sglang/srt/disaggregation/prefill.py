@@ -110,6 +110,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import AbortReq
     from sglang.srt.managers.scheduler import Scheduler
     from sglang.srt.managers.utils import GenerationBatchResult
+    from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.mem_cache.memory_pool import KVCache
 
 logger = logging.getLogger(__name__)
@@ -135,6 +136,24 @@ def should_force_retry(req: Req) -> bool:
 
     digest = hashlib.sha256(str(req.rid).encode()).digest()
     return int.from_bytes(digest[:8], "big") < retry_prob * 2**64
+
+
+def clamp_kv_send_end(
+    req: Req,
+    cache: BasePrefixCache,
+    *,
+    last_chunk: bool = False,
+    end_idx: Optional[int] = None,
+) -> Optional[int]:
+    """Keep non-final transfers within the prefix protected from deduplication."""
+    if last_chunk or not cache.supports_prefix_sharing() or req.skip_radix_cache_insert:
+        return end_idx
+    # A checkpoint can stop short of the computed chunk (e.g. at an SWA
+    # branch). A later checkpoint may deduplicate and free the unprotected
+    # tail. Keep checkpointing for SWA reclamation and send that tail later.
+    if end_idx is None:
+        end_idx = min(req.extend_end, len(req.origin_input_ids))
+    return min(end_idx, req.kv.cache_protected_len)
 
 
 def _uses_write_through_cache(cache: object) -> bool:
@@ -757,13 +776,12 @@ class SchedulerDisaggregationPrefillMixin:
     def _supports_result_wait_polling(self: Scheduler) -> bool:
         """Whether the overlap loop can wait for a result without blocking.
 
-        Attention DP and CP shards keep different queues, so one shard could
-        leave the wait while another enters the TP-wide readiness all-reduce.
+        The wait runs only collectives within one attention-DP shard, so shards may
+        leave it on different passes; attention CP peers sit outside the shard.
         """
         parallel = get_parallel()
         return (
-            parallel.attn_dp_size == 1
-            and parallel.attn_cp_size == 1
+            parallel.attn_cp_size == 1
             and self.spec_algorithm.is_none()
             and self.is_generation
             and self.dllm_config is None
@@ -774,6 +792,8 @@ class SchedulerDisaggregationPrefillMixin:
         if not envs.SGLANG_ENABLE_DISAGG_PREFILL_CONTINUOUS_INPUT_POLLING.get():
             return False
         enabled = self._supports_result_wait_polling()
+        # Intake and batch creation run TP-wide collectives on per-shard arrivals.
+        enabled &= get_parallel().attn_dp_size == 1
         if not enabled:
             logger.warning(
                 "Continuous prefill input polling requires attention DP=CP=1 and "
@@ -789,8 +809,21 @@ class SchedulerDisaggregationPrefillMixin:
         if not enabled:
             logger.warning(
                 "Polling KV transfers while a forward result is pending requires "
-                "attention DP=CP=1 and non-speculative autoregressive generation; "
+                "attention CP=1 and non-speculative autoregressive generation; "
                 "finished transfers retire between forwards."
+            )
+        return enabled
+
+    def _is_hicache_wait_polling_enabled(self: Scheduler) -> bool:
+        """Check support once on entry to the prefill overlap loop."""
+        if not envs.SGLANG_DISAGG_PREFILL_POLL_HICACHE_WHILE_WAITING.get():
+            return False
+        enabled = self._supports_result_wait_polling()
+        if not enabled:
+            logger.warning(
+                "Polling HiCache while a forward result is pending requires "
+                "attention CP=1 and non-speculative autoregressive generation; "
+                "HiCache events drain between forwards."
             )
         return enabled
 
@@ -802,8 +835,8 @@ class SchedulerDisaggregationPrefillMixin:
         return ev is None or envs.SGLANG_FORCE_COARSE_WAR_BARRIER.get()
 
     def _yield_gil_if_needed(self: Scheduler) -> None:
-        if self.tp_size == 1:
-            # No collective parks this thread at TP=1. A bounded sleep lets
+        if self.dp_tp_group.world_size == 1:
+            # No collective parks this thread at shard size 1. A bounded sleep lets
             # bootstrap, transfer and cache workers reacquire the GIL.
             time.sleep(PREFILL_INPUT_POLL_INTERVAL_S)
 
@@ -820,6 +853,7 @@ class SchedulerDisaggregationPrefillMixin:
             self._is_continuous_input_polling_enabled()
         )
         poll_transfers_while_waiting = self._is_transfer_wait_polling_enabled()
+        poll_hicache_while_waiting = self._is_hicache_wait_polling_enabled()
         self.result_queue = deque()
         batch_result_completion_status = torch.empty(1, dtype=torch.int32, device="cpu")
         # True when intake repeats while the oldest batch result is unfinished.
@@ -858,11 +892,16 @@ class SchedulerDisaggregationPrefillMixin:
             if not waiting_for_batch_result or received_inputs or bootstrapped_reqs:
                 skip_batch_creation = False
 
-            # Keep at most two batches in flight.
+            # Keep at most two batches in flight. On shutdown, launch nothing new
+            # except the one selection whose MLP-sync gather carries this rank's
+            # ShutdownReq to the other attention-DP ranks.
             if (
                 should_ingest_requests
                 and len(self.result_queue) < 2
-                and not self.gracefully_exit
+                and (
+                    not self.gracefully_exit
+                    or self.dp_attn_adapter.shutdown_vote_pending()
+                )
                 and not self._deferred_input_requests
                 and not skip_batch_creation
             ):
@@ -899,10 +938,23 @@ class SchedulerDisaggregationPrefillMixin:
                     batch_result = None
 
             if self.last_batch:
-                # Poll until the oldest result is ready on all TP ranks while there
-                # is input to take or a transfer to retire; otherwise block.
-                if self.enable_continuous_input_polling or (
-                    poll_transfers_while_waiting and self.disagg_prefill_transfer_queue
+                # L3 I/O (fenced on forward_stream) also makes the wait poll, so
+                # prefetch completions and write acks land during the forward.
+                pump_hicache = (
+                    poll_hicache_while_waiting
+                    and self.enable_hierarchical_cache
+                    and self.enable_hicache_storage
+                    and isinstance(self.tree_cache, UnifiedRadixCache)
+                )
+                # Poll until the oldest result is ready on all shard ranks while there
+                # is input to take, a transfer to retire or L3 I/O; otherwise block.
+                if (
+                    self.enable_continuous_input_polling
+                    or pump_hicache
+                    or (
+                        poll_transfers_while_waiting
+                        and self.disagg_prefill_transfer_queue
+                    )
                 ):
                     oldest_batch_result = self.result_queue[0][1]
                     if (
@@ -917,6 +969,10 @@ class SchedulerDisaggregationPrefillMixin:
                         if war_barrier_pending:
                             self._apply_war_barrier()
                             war_barrier_pending = False
+                        if pump_hicache:
+                            self._process_hicache_events(
+                                should_retry_storage_prefetch=False
+                            )
                         self._yield_gil_if_needed()
                         continue
                 # Process the oldest batch result.
@@ -954,12 +1010,12 @@ class SchedulerDisaggregationPrefillMixin:
         ):
             # 1: copy unfinished; 2: copy finished locally.
             state = 2 if batch_result.copy_done.query() else 1
-        if self.tp_size > 1:
+        if self.dp_tp_group.world_size > 1:
             batch_result_completion_status.fill_(state)
             torch.distributed.all_reduce(
                 batch_result_completion_status,
                 op=torch.distributed.ReduceOp.MIN,
-                group=self.tp_cpu_group,
+                group=self.dp_tp_cpu_group,
             )
             state = batch_result_completion_status.item()
         if state == 0:
@@ -1619,6 +1675,7 @@ class SchedulerDisaggregationPrefillMixin:
         )
 
         if not last_chunk:
+            end_idx = clamp_kv_send_end(req, self.tree_cache, end_idx=end_idx)
             # if not the last chunk and the last page is partial, delay the last partial page to the next send
             end_idx = end_idx - end_idx % page_size
             if self.enable_staging:

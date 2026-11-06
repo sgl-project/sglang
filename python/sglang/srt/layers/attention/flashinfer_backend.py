@@ -15,7 +15,6 @@ Each backend supports two operators: extend (i.e. prefill with cached prefix) an
 """
 
 import logging
-import os
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import partial
@@ -308,6 +307,10 @@ def fast_prefill_plan(
     )
     self._cached_o_data_type = o_data_type
     self._block_tables = None
+    # FlashInfer's plan() clears this on every call and may set it again for its
+    # SM90 fp8-KV verify kernel. This plan never takes that route, so clear it
+    # here too rather than let run() launch it with a previous plan's state.
+    self._eagle_verify_fp8kv_sm90_state = None
 
     args = [
         self._float_workspace_buffer,
@@ -330,6 +333,7 @@ def fast_prefill_plan(
         False,  # disable_split_kv
         0,  # num_colocated_ctas
         0,  # uniform_q_len
+        False,  # fixed_uniform_q_len
     ]
     self._plan_info = self._cached_module.plan(*args)
 
@@ -2980,10 +2984,9 @@ def should_use_tensor_core(
     Returns:
         bool: Whether to use tensor cores
     """
-    # Try to use environment variable first
-    env_override = os.environ.get("SGLANG_FLASHINFER_USE_TENSOR_CORE")
-    if env_override is not None:
-        return env_override.lower() == "true"
+    forced = envs.SGLANG_FLASHINFER_USE_TENSOR_CORE.get()
+    if forced is not None:
+        return forced
 
     # Try to use _grouped_size_compiled_for_decode_kernels if available
     # This is for flashinfer <=0.1.6. Otherwise, there is an accuracy bug

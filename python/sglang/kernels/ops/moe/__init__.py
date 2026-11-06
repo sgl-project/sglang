@@ -337,3 +337,11 @@ register_kernel(
         capabilities=CUDA_ONLY,
     )
 )
+register_kernel(
+    KernelSpec(
+        op="moe.multi_router_topk",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.moe.multi_router:multi_router_topk",
+        capabilities=CUDA_ONLY,
+    )
+)
