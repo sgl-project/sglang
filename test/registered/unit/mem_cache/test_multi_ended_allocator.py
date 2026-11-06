@@ -1667,7 +1667,7 @@ class TestPagedBand(unittest.TestCase):
     # page; most decode steps reuse the prefix's tail page and bind nothing.
     def test_paged_alloc_decode_binds_v2p_p2v_on_page_wrap(self):
         from sglang.srt.mem_cache.kv.alloc.chain import take_new_pages
-        from sglang.srt.utils.common import get_num_new_pages
+        from sglang.srt.mem_cache.utils import get_num_new_pages
 
         _, full_alloc, _, _, _ = self._build()
         PS = self.PAGE_SIZE
@@ -1738,7 +1738,7 @@ class TestPagedBand(unittest.TestCase):
     # the watermark or touch v2p / p2v.
     def test_paged_alloc_decode_no_op_when_no_new_page(self):
         from sglang.srt.mem_cache.kv.alloc.chain import take_new_pages
-        from sglang.srt.utils.common import get_num_new_pages
+        from sglang.srt.mem_cache.utils import get_num_new_pages
 
         _, full_alloc, _, _, _ = self._build()
         PS = self.PAGE_SIZE

@@ -27,6 +27,7 @@ from sglang.srt.layers.dcp import (
     dcp_a2a_lse_reduce,
     is_dsa_dcp_gathered_prefill,
 )
+from sglang.srt.layers.dcp.layout import dsa_shards_index_k
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.lora.utils import kv_b_lora_correction
@@ -92,6 +93,8 @@ def _select_local_dcp_heads_for_autotune(
 
 
 def is_mla_dcp_lse_base_on_e(attention_backend: Optional[str]) -> bool:
+    if attention_backend == "dsa":
+        return dsa_shards_index_k()
     return attention_backend in {"flashmla", "cutedsl_mla", "aiter"}
 
 
@@ -172,6 +175,7 @@ class DeepseekMLAForwardMixin:
                 # ROCm only: the draft shards its KV like the target, and a
                 # gathered prefix attends this rank's heads, not merged partials.
                 and mode.is_extend(include_draft_extend_v2=_is_hip)
+                and not dsa_shards_index_k()
                 and not is_dsa_dcp_gathered_prefill(forward_batch.attn_dcp_metadata)
             )
         )
@@ -767,14 +771,15 @@ class DeepseekMLAForwardMixin:
                     )
             elif forward_batch.forward_mode.is_extend():
                 # for extend, gather kv
-                bcg_dcp_extend_kv_gather(
-                    get_token_to_kv_pool(),
-                    self.attn_mqa,
-                    forward_batch,
-                    self.kv_lora_rank,
-                    k_nope,
-                    k_pe,
-                )
+                if not self.use_dsa:
+                    bcg_dcp_extend_kv_gather(
+                        get_token_to_kv_pool(),
+                        self.attn_mqa,
+                        forward_batch,
+                        self.kv_lora_rank,
+                        k_nope,
+                        k_pe,
+                    )
             else:
                 logger.warning(
                     f"not supported forward_mode {forward_batch.forward_mode}"
