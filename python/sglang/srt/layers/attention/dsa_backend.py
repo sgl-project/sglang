@@ -1480,11 +1480,13 @@ class DeepseekSparseAttnBackend(
         self.forward_metadata = metadata
         # Re-plan only over this backend's own plan: another planner's metadata
         # (prepare_context_parallel_metadata_for_dcp) is not ours to replace.
-        existing = forward_batch.attn_dcp_metadata
         if (
             _is_hip
             and self.dcp_size > 1
-            and (existing is None or is_dsa_dcp_gathered_prefill(existing))
+            and (
+                forward_batch.attn_dcp_metadata is None
+                or is_dsa_dcp_gathered_prefill(forward_batch.attn_dcp_metadata)
+            )
         ):
             forward_batch.attn_dcp_metadata = self._plan_dcp_gathered_prefill(
                 forward_batch, page_table.shape[1]
