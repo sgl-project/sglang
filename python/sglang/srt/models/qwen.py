@@ -42,7 +42,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
-from sglang.srt.utils.hf_transformers_utils import get_rope_config
+from sglang.srt.utils.hf_transformers import get_rope_config
 
 
 class QWenMLP(nn.Module):
@@ -286,42 +286,6 @@ class QWenLMHeadModel(nn.Module):
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
         )
-
-    @torch.no_grad()
-    def forward_split_prefill(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        split_interval: Tuple[int, int],  # [start, end) 0-based
-    ):
-        start, end = split_interval
-        # embed
-        if start == 0:
-            forward_batch.hidden_states = self.transformer.wte(input_ids)
-
-        # decoder layer
-        for i in range(start, end):
-            layer = self.transformer.h[i]
-            forward_batch.hidden_states = layer(
-                positions,
-                forward_batch.hidden_states,
-                forward_batch,
-            )
-
-        if end == self.transformer.config.num_hidden_layers:
-            # norm
-            forward_batch.hidden_states = self.transformer.ln_f(
-                forward_batch.hidden_states
-            )
-            # logits process
-            result = self.logits_processor(
-                input_ids, forward_batch.hidden_states, self.lm_head, forward_batch
-            )
-        else:
-            result = None
-
-        return result
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

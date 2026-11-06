@@ -76,11 +76,6 @@ def _tensor(mapped: mmap.mmap, base: int, meta: dict) -> torch.Tensor:
     return flat.view(shape)
 
 
-def safetensors_keys(path: str) -> list[str]:
-    header, _ = _header(_mapping(path))
-    return [name for name in header if name != "__metadata__"]
-
-
 def iter_safetensors_readonly(path: str) -> Iterator[tuple[str, torch.Tensor]]:
     """(name, tensor) for every tensor in the file, as views of a read-only mapping."""
     mapped = _mapping(path)

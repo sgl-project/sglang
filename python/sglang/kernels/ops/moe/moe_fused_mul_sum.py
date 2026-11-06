@@ -16,7 +16,7 @@ def moe_fused_mul_sum_kernel(
     num_tokens,
     stride_m,
     has_expert_map: tl.constexpr,
-    is_ep: tl.constexpr,
+    has_topk_ids: tl.constexpr,
     top_k: tl.constexpr,
     size: tl.constexpr,
     routed_scaling_factor: tl.constexpr,
@@ -43,16 +43,23 @@ def moe_fused_mul_sum_kernel(
         if routed_scaling_factor != 1.0:
             b_val = b_val * routed_scaling_factor
         if has_expert_map:
-            id_val = tl.load(top_ids_ptr + offs_m * top_k + n, mask=m_mask, other=0)
-            expert_mask = tl.load(expert_map_ptr + id_val) >= 0
+            id_val = tl.load(top_ids_ptr + offs_m * top_k + n, mask=m_mask, other=-1)
+            mapped_id = tl.load(
+                expert_map_ptr + tl.maximum(id_val, 0),
+                mask=m_mask & (id_val >= 0),
+                other=-1,
+            )
+            expert_mask = mapped_id >= 0
+            b_val = tl.where(expert_mask, b_val, 0.0)
             a_vec = tl.load(
                 a_base + n * size,
                 mask=mask & expert_mask[:, None],
                 other=0.0,
             ).to(tl.float32)
-        elif is_ep:
+        elif has_topk_ids:
             id_val = tl.load(top_ids_ptr + offs_m * top_k + n, mask=m_mask, other=0)
             expert_mask = id_val >= 0
+            b_val = tl.where(expert_mask, b_val, 0.0)
             a_vec = tl.load(
                 a_base + n * size,
                 mask=mask & expert_mask[:, None],
@@ -164,8 +171,8 @@ def moe_fused_mul_sum(
             Shape: (num_tokens, top_k).
         outputs: Optional pre-allocated output tensor.
             Shape: (num_tokens, hidden_size).
-        topk_ids: Optional indices of the top-k experts. Used when
-            `expert_map` is provided. Shape: (num_tokens, top_k).
+        topk_ids: Optional indices of the top-k experts. Negative ids always
+            skip the corresponding input load. Shape: (num_tokens, top_k).
         expert_map: Optional mapping for Expert Parallelism. A value < 0
             indicates an invalid token/expert pair that will be skipped.
 
@@ -180,6 +187,7 @@ def moe_fused_mul_sum(
     assert inputs.dtype in (torch.float32, torch.float16, torch.bfloat16)
     assert topk_weights.dtype in (torch.float32, torch.float16, torch.bfloat16)
 
+    # Keep is_ep as a compatible host argument; route validity follows ids.
     num_tokens, top_k, size = inputs.shape
     output_shape = (num_tokens, size)
     if outputs is None:
@@ -205,7 +213,7 @@ def moe_fused_mul_sum(
             num_tokens,
             top_k * size,
             expert_map is not None,
-            is_ep,
+            topk_ids is not None,
             top_k,
             size,
             1.0 if routed_scaling_factor is None else routed_scaling_factor,
