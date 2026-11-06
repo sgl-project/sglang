@@ -11,6 +11,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.attention.minimax_sparse.common.tile_ptr import (
     tile_ptrs_1d,
     tile_ptrs_2d,
@@ -19,7 +20,6 @@ from sglang.kernels.ops.attention.minimax_sparse.common.tile_ptr import (
 from sglang.kernels.ops.attention.unlimited_ocr_dash.common import (
     _FP8_DTYPES,
     SPARSE_BLOCK_SIZE,
-    _arch_supports_pdl,
     _merge_topk_attn_out_kernel,
 )
 
@@ -760,7 +760,7 @@ def dash_sparse_attn_decode(
     """
     total_q, num_heads, head_dim = q.shape
     assert total_q == seq_lens.shape[0] * decode_query_len
-    use_pdl = _arch_supports_pdl()
+    use_pdl = current_arch().supports_pdl
     bias_t, b_strides = _bias_operand(blk_bias, topk_idx)
     cw = topk_idx.shape[-1] if chunk_width is None else int(chunk_width)
     num_topk_chunks = _num_topk_chunks(cw, total_q, num_kv_heads)
