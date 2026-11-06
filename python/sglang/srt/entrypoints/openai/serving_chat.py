@@ -1458,6 +1458,11 @@ class OpenAIServingChat(OpenAIServingBase):
             session_id=request.session_id,
             extra_key=request.extra_key,
             cache_salt=request.cache_salt,
+            cache_retention_ttl_s=(
+                request.prompt_cache_options.ttl_seconds()
+                if request.prompt_cache_options is not None
+                else None
+            ),
             require_reasoning=processed_messages.require_reasoning,
             priority=request.priority,
             routing_key=self.extract_routing_key(raw_request),

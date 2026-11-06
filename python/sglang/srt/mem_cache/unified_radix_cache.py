@@ -1645,6 +1645,15 @@ class UnifiedRadixCache(BasePrefixCache):
         req.kv.protect_prefix(len(new_indices))
         req.last_node = new_last_node
 
+        if is_finished and self.enable_storage and self.cache_controller is not None:
+            # Pages served from device/host memory never reach storage; let
+            # the backend renew (or, with a requested TTL, start) retention
+            # for the request's whole prefix.
+            self.cache_controller.touch_storage(
+                self.get_prefix_hash_values(new_last_node),
+                getattr(req, "cache_retention_ttl_s", None) or 0,
+            )
+
         # cleanup
         for comp in self._components_tuple:
             comp.cleanup_after_caching_req(

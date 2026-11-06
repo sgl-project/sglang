@@ -367,6 +367,20 @@ class HiCacheStorage(ABC):
         be amended -- should do so here; raising fails the attach.
         """
 
+    def batch_touch(
+        self,
+        keys: List[str],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> None:
+        """Report that ``keys`` (one request's whole page-hash chain, from the
+        sequence start) were just used. Backends with retention may renew or
+        start protection: ``extra_info.extra_info["retain_ttl_s"]`` carries
+        the request's requested minimum lifetime in seconds, if any. Pages
+        served from device/host memory never reach storage otherwise. Called
+        asynchronously, after the request's prefix is inserted; some keys may
+        still be in the backup queue. Default: no-op."""
+        return None
+
     def batch_exists_v2(
         self,
         keys: List[str],
@@ -636,6 +650,9 @@ class HiCacheStorageFailureInjector(HiCacheStorage):
 
     def on_host_pools_registered(self) -> None:
         self._backend.on_host_pools_registered()
+
+    def batch_touch(self, keys, extra_info=None) -> None:
+        self._backend.batch_touch(keys, extra_info)
 
     def batch_exists_v2(
         self,

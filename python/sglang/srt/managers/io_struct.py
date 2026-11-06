@@ -326,6 +326,9 @@ class GenerateReqInput:
 
     # Priority for the request
     priority: Optional[int] = None
+    # Minimum storage retention (seconds) requested for this prompt's prefix;
+    # honored by HiCache storage backends that implement batch_touch.
+    cache_retention_ttl_s: Optional[int] = None
     # Extra cache key for caller-defined request classification.
     extra_key: Optional[Union[List[str], str]] = None
 
@@ -1054,6 +1057,7 @@ class GenerateReqInput:
             require_reasoning=self.require_reasoning,
             max_thinking_tokens=self.max_thinking_tokens,
             priority=self.priority,
+            cache_retention_ttl_s=self.cache_retention_ttl_s,
             extra_key=self.extra_key[i] if self.extra_key is not None else None,
             cache_salt=(self.cache_salt[i] if self.cache_salt is not None else None),
             kv_hints=(self.kv_hints[i] if self.kv_hints is not None else None),
@@ -1149,6 +1153,8 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 
     # Priority for the request
     priority: Optional[int] = None
+    # Minimum storage retention (seconds) for this prompt's prefix.
+    cache_retention_ttl_s: Optional[int] = None
 
     # Extra cache key for caller-defined request classification.
     extra_key: Optional[str] = None
