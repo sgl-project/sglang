@@ -147,6 +147,25 @@ multiple-of-8 floor already keeps half of them. 4096 sits well below any real
 video sequence and well above where either effect bites; it was chosen on that
 reasoning rather than from a measured threshold sweep.
 
+## Optional plane-major Ulysses QKV layout
+
+`_usp_input_all_to_all_packed_qkv(q, k, v, plane_major=True)` packs each
+all-to-all destination as `[S_local, 3, H_local, D]` instead of the default
+`[S_local, H_local, 3*D]`. The returned Q/K/V views still have shape
+`[S_global, H_local, D]`, with strides `(3*H_local*D, D, 1)`.
+This lets a consumer read packed head/channel dimensions without first
+materializing each tensor. The transport and number of collectives are unchanged.
+
+The option defaults to false, and no model caller is changed here. Both the
+Triton packer and its fallback accept the layout; a single-rank call returns
+its original input views. Layout/collective tests cover the default and opt-in
+paths. For real NCCL, run on two or four GPUs:
+
+```bash
+python -m torch.distributed.run --standalone --nproc-per-node=4 \
+  python/sglang/multimodal_gen/test/single_test_file/test_usp_plane_major_nccl.py
+```
+
 ## Measured
 
 MiniMax-H3 t2va, 1344x768 / 5 s / 50 steps, 8x B200, Ulysses-8, bf16, at the
