@@ -877,6 +877,10 @@ class AiterAttnBackend(AttentionBackend):
             and self.topk == 1
             and get_bool_env_var("SGLANG_AITER_UNIFIED_VERIFY", "1")
         )
+        # Every other verify path still reads the host seq_lens mirror.
+        self.needs_cpu_seq_lens = not (
+            self._use_unified_verify and envs.SGLANG_AITER_SYNC_FREE_VERIFY.get()
+        )
 
         # Muse Spark TP8 shapes on gfx950: head_dim 64, GQA 8, SWA KV pool, unified
         # Triton attention. Extend and target verify take the Muse fast paths below
