@@ -193,14 +193,12 @@ def fused_boundary_this_step(forward_batch) -> bool:
     """Whether this step's hc_boundary_fused layers take the fused mHC boundary.
 
     Mega-mHC runs the seam from forward_hc_pre_from_prev instead; running both would
-    apply the same post twice. It replaces the fused boundary on every step, except
-    under the AMD monokernel, where only prefill takes it: the monokernel's kernels
-    follow the fused boundary, so the decode steps it leaves to SGLang keep that path.
+    apply the same post twice. _post_fusion takes Mega-mHC on prefill only, so every
+    other step keeps the fused boundary.
     """
     if not envs.SGLANG_OPT_DSV41_MEGA_MHC_PREFILL.get():
         return True
-    prefill = forward_batch.forward_mode.is_extend_without_speculative()
-    return get_exec().kernel.enable_amd_monokernel and not prefill
+    return not forward_batch.forward_mode.is_extend_without_speculative()
 
 
 def hc_post(cfg, x, residual, post, comb) -> Optional[torch.Tensor]:

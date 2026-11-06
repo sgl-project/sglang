@@ -107,6 +107,7 @@ class NonCudaDecoderMixin:
         self._next_layer = None
         self.local_boundary = None
         self.next_boundary = None
+        self._extend_boundaries = (None, None)
 
     def bind_next(self, next_layer):
         if not self.hc_pre_from_prev_sublayer:
@@ -140,6 +141,11 @@ class NonCudaDecoderMixin:
         """The layer's two hyper-connections, each collapsing with the previous one's
         pre-mix."""
         self._init_boundaries()
+        local_boundary, next_boundary = (
+            self._extend_boundaries
+            if mhc.is_local_extend(forward_batch)
+            else (self.local_boundary, self.next_boundary)
+        )
         stats_stream = None
         if mhc.use_stats_stream(self.hc_cfg, forward_batch, state.residual):
             stats_stream = self.hc_stats_stream
@@ -171,7 +177,7 @@ class NonCudaDecoderMixin:
                 y,
                 residual,
                 stats_stream=stats_stream,
-                next=self.local_boundary,
+                next=local_boundary,
                 world_size=world_size,
                 precomputed=precomputed,
             )
@@ -200,7 +206,7 @@ class NonCudaDecoderMixin:
                 y,
                 residual,
                 stats_stream=stats_stream,
-                next=self.next_boundary,
+                next=next_boundary,
                 world_size=self.mlp.tp_size,
                 precomputed=precomputed,
             )
@@ -226,6 +232,11 @@ class NonCudaDecoderMixin:
                 hc=self._next_layer.attn_hc,
                 accepts_mxfp8_deepgemm=self._next_layer.self_attn.accepts_deepgemm_mxfp8_input(),
             )
+        # Built once, but Mega-mHC reads `extend` per step.
+        self._extend_boundaries = tuple(
+            None if b is None else b._replace(extend=True)
+            for b in (self.local_boundary, self.next_boundary)
+        )
 
     def forward(
         self,

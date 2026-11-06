@@ -6,8 +6,9 @@ from unittest import mock
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.models import deepseek_v4_mhc as mhc
+from sglang.srt.models import deepseek_v4_platform_stage
 from sglang.srt.models.deepseek_common.amd import deepseek_v4_hip
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -71,6 +72,7 @@ class TestHipFlydslDispatch(unittest.TestCase):
             accepts_mxfp8=False,
             norm_fusable=True,
             hc=hc,
+            extend=True,
         )
 
     def test_calls_flydsl_bf16_and_packs_next_stats(self):
@@ -125,6 +127,58 @@ class TestHipFlydslDispatch(unittest.TestCase):
         self.assertTrue(torch.equal(state.pre, pre))
 
 
+class TestHipBoundaryExtend(unittest.TestCase):
+    def test_prefill_boundaries_extend(self):
+        layer = deepseek_v4_platform_stage.NonCudaDecoderMixin()
+        layer.hc_cfg = _cfg()
+        layer.hc_stats_stream = None
+        layer.attn_hc = layer.ffn_hc = _sublayer(_cfg())
+        layer.post_attention_layernorm = _Norm()
+        layer._next_layer = mock.Mock()
+        layer.self_attn = mock.MagicMock(attn_tp_size=1)
+        layer.self_attn.accepts_mxfp8_swizzled_input.return_value = False
+        layer._can_fuse_attn_mhc = layer._can_fuse_ffn_mhc = False
+        layer.mlp = mock.Mock(tp_size=1)
+        layer._run_moe_ffn_dp_sync = mock.Mock()
+        seen = []
+
+        def boundary(norm, **kwargs):
+            return mhc.HcNextBoundary(
+                norm=norm, accepts_mxfp8=False, norm_fusable=True, hc=kwargs["hc"]
+            )
+
+        def post(hc, y, residual, *, next, **kwargs):
+            seen.append(next.extend)
+            return mock.Mock()
+
+        modes = {
+            ForwardMode.EXTEND: True,
+            ForwardMode.MIXED: True,
+            ForwardMode.DECODE: False,
+            ForwardMode.TARGET_VERIFY: False,
+        }
+        with (
+            mock.patch.object(mhc, "make_boundary", side_effect=boundary),
+            mock.patch.object(mhc, "use_stats_stream", return_value=False),
+            mock.patch.object(mhc, "fork_stats_stream"),
+            mock.patch.object(mhc, "combine"),
+            mock.patch.object(mhc, "run_attn_post", side_effect=post),
+            mock.patch.object(mhc, "run_moe_post", side_effect=post),
+        ):
+            for mode, extend in modes.items():
+                with self.subTest(mode=mode.name):
+                    seen.clear()
+                    layer.forward_hc_pre_from_prev(
+                        None,
+                        mock.Mock(),
+                        None,
+                        types.SimpleNamespace(forward_mode=mode),
+                        None,
+                    )
+                    # the attention seam, then the MoE seam
+                    self.assertEqual(seen, [extend, extend])
+
+
 class TestFusedBoundaryRouting(unittest.TestCase):
     def test_routing(self):
         layer = mock.Mock(hc_pre_from_prev_sublayer=True, hc_mult=4)
@@ -152,25 +206,14 @@ class TestFusedBoundaryRouting(unittest.TestCase):
             ForwardMode.TARGET_VERIFY,
             ForwardMode.DRAFT_EXTEND_V2,
         )
-        # (mega, monokernel) -> whether prefill and decode steps take the fused boundary
-        cases = {
-            (False, False): (True, True),
-            (False, True): (True, True),
-            (True, False): (False, False),
-            (True, True): (False, True),
-        }
-        for (mega, monokernel), (fused_prefill, fused_decode) in cases.items():
-            exec_cfg = types.SimpleNamespace(
-                kernel=types.SimpleNamespace(enable_amd_monokernel=monokernel)
-            )
+        # mega -> whether prefill and decode steps take the fused boundary
+        cases = {False: (True, True), True: (False, True)}
+        for mega, (fused_prefill, fused_decode) in cases.items():
             for modes, expected in ((prefill, fused_prefill), (decode, fused_decode)):
                 for mode in modes:
                     with (
-                        self.subTest(mega=mega, monokernel=monokernel, mode=mode.name),
+                        self.subTest(mega=mega, mode=mode.name),
                         envs.SGLANG_OPT_DSV41_MEGA_MHC_PREFILL.override(mega),
-                        mock.patch.object(
-                            deepseek_v4_hip, "get_exec", return_value=exec_cfg
-                        ),
                     ):
                         fused = deepseek_v4_hip.fused_boundary_this_step(
                             types.SimpleNamespace(forward_mode=mode)
