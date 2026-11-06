@@ -9,7 +9,7 @@ import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Any, List, Optional, Sequence, Set
+from typing import TYPE_CHECKING, Any, Iterable, List, Optional, Sequence, Set
 
 import torch
 
@@ -52,6 +52,9 @@ class HiCacheStorageConfig:
     # order. The key grid is layer-major, whereas page bytes are head-major.
     unified_chunk_spans: Optional[List[tuple[int, int]]] = None
 
+    # Whole-page replication can differ from the target's attention layout.
+    rank_replicated: Optional[bool] = None
+
     def __post_init__(self):
         if self.dcp_size < 1 or not 0 <= self.dcp_rank < self.dcp_size:
             raise ValueError("Invalid DCP size or rank for HiCache storage.")
@@ -73,6 +76,12 @@ class HiCacheStorageConfig:
             raise ValueError("DCP storage requires a DCP-aligned logical page size.")
 
     @property
+    def is_rank_replicated(self) -> bool:
+        return (
+            self.is_mla_model if self.rank_replicated is None else self.rank_replicated
+        )
+
+    @property
     def is_storage_writer(self) -> bool:
         """Select one writer for each shared storage object.
 
@@ -83,7 +92,7 @@ class HiCacheStorageConfig:
         """
         if self.unified_suffixes is not None and self.attn_cp_rank != 0:
             return False
-        return not self.is_mla_model or self.tp_rank == self.dcp_rank
+        return not self.is_rank_replicated or self.tp_rank == self.dcp_rank
 
 
 @dataclass
@@ -168,6 +177,34 @@ class PoolTransfer:
     # BLOCK_GROUPS geometry: FULL pages per block and keys (pages) per group.
     block_pages: int = 0
     group_pages: int = 0
+
+
+def merge_source_transfers(
+    transfers: Iterable[PoolTransfer], pool: PoolName
+) -> Optional[PoolTransfer]:
+    """Every independent transfer of ``pool`` as one span, in transfer order.
+
+    A pool may be staged in several transfers; a sidecar deriving its indices
+    from that pool must cover all of them. A lone transfer is returned as is,
+    so a sidecar keeps aliasing its tensors. Returns None when ``pool`` has no
+    independent transfer.
+    """
+    sources = [t for t in transfers if t.indices_from_pool is None and t.name == pool]
+    if len(sources) <= 1:
+        return sources[0] if sources else None
+
+    def cat(parts):
+        parts = list(parts)
+        return None if any(part is None for part in parts) else torch.cat(parts)
+
+    keys = [t.keys for t in sources]
+    return PoolTransfer(
+        name=pool,
+        host_indices=cat(t.host_indices for t in sources),
+        device_indices=cat(t.device_indices for t in sources),
+        keys=None if any(k is None for k in keys) else [k for ks in keys for k in ks],
+        hit_policy=sources[0].hit_policy,
+    )
 
 
 @dataclass(frozen=True)
@@ -807,9 +844,19 @@ class HiCacheFile(HiCacheStorage):
         )
         self.config_suffix = (
             f"_{model_name}{shard_suffix}"
-            if storage_config.is_mla_model
+            if storage_config.is_rank_replicated
             else self.tp_config_suffix
         )
+        # TODO: Include KV dtype and stored layout in keys for both DCP and
+        # non-DCP caches; raw file payloads do not describe their format.
+        if storage_config.dcp_size > 1:
+            # Equivalent MLA shards in different DCP groups share a file.
+            dcp_suffix = (
+                f"_tp{storage_config.tp_size}_dcp{storage_config.dcp_rank}_{storage_config.dcp_size}"
+                f"_page{storage_config.logical_page_size}"
+            )
+            self.config_suffix += dcp_suffix
+            self.tp_config_suffix += dcp_suffix
 
     def __init__(
         self, storage_config: HiCacheStorageConfig, file_path: str = "/tmp/hicache"
@@ -823,17 +870,6 @@ class HiCacheFile(HiCacheStorage):
         self._init_config_suffix(storage_config)
         tp_rank = storage_config.tp_rank
         attn_cp_rank = storage_config.attn_cp_rank
-
-        # TODO: Include KV dtype and stored layout in keys for both DCP and
-        # non-DCP caches; raw file payloads do not describe their format.
-        if storage_config.dcp_size > 1:
-            # Equivalent MLA shards in different DCP groups share a file.
-            dcp_suffix = (
-                f"_tp{storage_config.tp_size}_dcp{storage_config.dcp_rank}_{storage_config.dcp_size}"
-                f"_page{storage_config.logical_page_size}"
-            )
-            self.config_suffix += dcp_suffix
-            self.tp_config_suffix += dcp_suffix
 
         if not os.path.exists(self.file_path) and tp_rank == 0 and attn_cp_rank == 0:
             os.makedirs(self.file_path)
@@ -877,7 +913,7 @@ class HiCacheFile(HiCacheStorage):
             # Each rank owns its TP-sharded state; selected DCP writers
             # also own their shared MLA shard files.
             owned_suffixes = (self.tp_config_suffix,)
-            if storage_config.is_mla_model and storage_config.is_storage_writer:
+            if storage_config.is_rank_replicated and storage_config.is_storage_writer:
                 owned_suffixes += (self.config_suffix,)
         self._evictor = LRUFileEvictor(
             self.file_path,

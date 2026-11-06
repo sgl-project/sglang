@@ -665,6 +665,7 @@ mod tests {
             },
             observability: Default::default(),
             model: ModelConfig {
+                aliases: Vec::new(),
                 id: id.into(),
                 tokenizer_path: Some("/tmp/x".into()),
                 disable_input_ids_forwarding: false,
