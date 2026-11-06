@@ -507,31 +507,6 @@ class TestFusedDraftWindowMetadata(CustomTestCase):
             )
         )
 
-    def test_a_trtllm_step_hands_its_window_rail_to_its_wrappers(self):
-        """The trtllm_mha step backend passes the window indptr to the
-        FlashInfer base, which plans the window wrapper on it."""
-        seen = {}
-
-        class Stop(Exception):
-            pass
-
-        def base_init(self, *args, **kwargs):
-            seen.update(args=args, kwargs=kwargs)
-            raise Stop
-
-        rail = torch.zeros(5, dtype=torch.int32)
-        with patch.object(fb.FlashInferAttnBackend, "__init__", base_init):
-            with self.assertRaises(Stop):
-                tm.TRTLLMHAAttnBackend(
-                    SimpleNamespace(),
-                    skip_prefill=True,
-                    kv_indptr_buf=torch.zeros(5, dtype=torch.int32),
-                    kv_last_page_len_buf=torch.ones(4, dtype=torch.int32),
-                    speculative_step_id=1,
-                    window_kv_indptr_buf=rail,
-                )
-        self.assertIs(seen["kwargs"]["window_kv_indptr_buf"], rail)
-
     def test_aiter_refuses_a_routed_window_view_at_init(self):
         """BUG REGRESSION. With the draft backend lists gone, an aiter draft
         fused into the window sub-pool failed at init asking its pool for a

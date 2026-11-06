@@ -335,7 +335,6 @@ DSV4_ENV=(
   -e SGLANG_USE_ROCM700A=$ROCM700A
   -e SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton
   -e SGLANG_OPT_FP8_WO_A_GEMM=false -e SGLANG_OPT_USE_JIT_INDEXER_METADATA=false
-  -e SGLANG_OPT_USE_TOPK_V2=false -e SGLANG_OPT_USE_AITER_INDEXER=true
   -e SGLANG_OPT_USE_TILELANG_INDEXER=false -e SGLANG_OPT_USE_TILELANG_MHC_PRE=false
   -e SGLANG_OPT_USE_TILELANG_MHC_POST=false -e SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=1
   -e SGLANG_OPT_USE_MULTI_STREAM_OVERLAP=false -e SGLANG_ROCM_USE_MULTI_STREAM=false
@@ -718,7 +717,11 @@ for f in README.md LICENSE; do
 done
 
 python3 -m pip uninstall -y sglang || true
-python3 -m pip install --no-deps --no-build-isolation -e "$RUNTIME_CHECKOUT/python"
+# Install with runtime_base (the torch-free deps) instead of --no-deps: the
+# image can predate a dependency the checkout imports (blake3 from #47120
+# failed every 11-05 job on image 20261104). pip's default only-if-needed
+# strategy leaves already-satisfied packages, including torch/aiter, alone.
+python3 -m pip install --no-build-isolation -e "$RUNTIME_CHECKOUT/python[runtime_base]"
 
 export RUNTIME_CHECKOUT
 export PYTHONPATH="$RUNTIME_CHECKOUT/python:${PYTHONPATH:-}"

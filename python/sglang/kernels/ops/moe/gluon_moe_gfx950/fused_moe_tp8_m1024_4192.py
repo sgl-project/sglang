@@ -7,11 +7,9 @@ import triton
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
-_artifact_next_power_of_2 = triton.constexpr_function(triton.next_power_of_2)
+from .common import _add
 
-@gluon.jit
-def _add(a, b):
-    return a + b
+_artifact_next_power_of_2 = triton.constexpr_function(triton.next_power_of_2)
 
 @gluon.jit
 def _quantize_packed(x, shared):
