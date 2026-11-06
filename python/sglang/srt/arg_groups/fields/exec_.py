@@ -291,7 +291,7 @@ class ExecKernel(msgspec.Struct):
     fp8_gemm_runner_backend: A[
         str,
         Arg(
-            help="Choose the runner backend for Blockwise FP8 GEMM operations. Options: 'auto' (default, auto-selects based on hardware; MXFP8 dense picks flashinfer_cutedsl on SM100/SM103 and FlashInfer CUTLASS on other supported Blackwell GPUs), 'deep_gemm' (JIT-compiled; enabled by default on NVIDIA Hopper (SM90) and Blackwell (SM100) when DeepGEMM is installed), 'flashinfer_trtllm' (optimal for Blackwell and low-latency), 'flashinfer_cutlass' (FlashInfer CUTLASS groupwise FP8 GEMM), 'flashinfer_cutedsl' (FlashInfer CuTe DSL MXFP8 GEMM on SM100/SM103), 'flashinfer_deepgemm' (Hopper SM90 only; uses swapAB optimization for small M dimensions in decoding), 'cutlass' (optimal for SM120 GPUs), 'triton' (fallback, widely compatible), 'aiter' (ROCm only), 'halops' (MXFP8 w8a8 dense GEMM from the optional HALOps wheel; SM100 only). ",
+            help="Choose the runner backend for Blockwise FP8 GEMM operations. Options: 'auto' (default, auto-selects based on hardware; MXFP8 dense picks flashinfer_cutedsl on SM100/SM103 and FlashInfer CUTLASS on other supported Blackwell GPUs), 'deep_gemm' (JIT-compiled; enabled by default on NVIDIA Hopper (SM90) and Blackwell (SM100) when DeepGEMM is installed), 'flashinfer_trtllm' (optimal for Blackwell and low-latency), 'flashinfer_cutlass' (FlashInfer CUTLASS groupwise FP8 GEMM), 'flashinfer_cutedsl' (FlashInfer CuTe DSL MXFP8 GEMM on SM100/SM103), 'flashinfer_deepgemm' (Hopper SM90 only; uses swapAB optimization for small M dimensions in decoding), 'cutlass' (optimal for SM120 GPUs), 'triton' (fallback, widely compatible), 'aiter' (ROCm only), 'halops' (MXFP8 w8a8 dense GEMM from the optional HALOps wheel; SM100 only), 'xpu_scaled_mm' (Intel XPU only; torch scaled_mm, which auto already selects on XPU). ",
             cli_name="--fp8-gemm-backend",
             choices=FP8_GEMM_RUNNER_BACKEND_CHOICES,
             resolvable=True,
@@ -465,6 +465,10 @@ class ExecKernel(msgspec.Struct):
     enable_deepseek_v4_fp4_indexer: A[
         bool,
         "Enable the experimental FP4 C4 indexer path for DeepSeek V4. Default keeps the existing indexer implementation.",
+    ] = False
+    enable_fp4_indexer: A[
+        bool,
+        "Use FP4 queries and index-K cache in the DSA lightning indexer of DeepSeek-V3.2-style sparse attention, ERNIE 5.5 Flash's MLA layers included; requires SM100. DeepSeek V4's C4 indexer has its own switch, --enable-deepseek-v4-fp4-indexer. Default keeps the FP8 indexer.",
     ] = False
     enable_dsa_fused_indexer: A[
         Optional[bool],
