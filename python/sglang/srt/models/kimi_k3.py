@@ -43,11 +43,6 @@ from sglang.srt.layers.cp.interleave import (
     cp_interleave_to_sequence_order,
     cp_sequence_to_interleave_order,
 )
-from sglang.srt.layers.cp.utils import (
-    cp_gather_after_forward,
-    cp_shard_model_inputs,
-    is_cp_active,
-)
 from sglang.srt.layers.dcp.layout import set_dsa_shards_index_k
 from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
 from sglang.srt.layers.dp_attention import (
@@ -114,6 +109,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
     pad_mm_tokens,
+    prepare_mm_inputs,
 )
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
@@ -3009,12 +3005,12 @@ class KimiK3LinearModel(nn.Module):
         input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        inputs_embeds: torch.Tensor | None = None,
+        input_embeds: torch.Tensor | None = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
         if get_parallel().pp_group.is_first_rank:
-            if inputs_embeds is not None:
-                hidden_states = inputs_embeds
+            if input_embeds is not None:
+                hidden_states = input_embeds
             else:
                 hidden_states = self.embed_tokens(input_ids)
             residual_batch.start(forward_batch)
@@ -3277,14 +3273,9 @@ class KimiK3LinearForCausalLM(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
         embeds = input_embeds if input_embeds is not None else inputs_embeds
-        if is_cp_active(forward_batch):
-            hidden_states = self._forward_cp(
-                input_ids, positions, forward_batch, embeds, pp_proxy_tensors
-            )
-        else:
-            hidden_states = self.model(
-                input_ids, positions, forward_batch, embeds, pp_proxy_tensors
-            )
+        hidden_states = self.model(
+            input_ids, positions, forward_batch, embeds, pp_proxy_tensors
+        )
         if self.pp_group.is_last_rank:
             aux_hidden_states = None
             if self.capture_aux_hidden_states:
@@ -3298,46 +3289,14 @@ class KimiK3LinearForCausalLM(nn.Module):
             )
         return hidden_states
 
-    def _forward_cp(
-        self,
-        input_ids: Optional[torch.Tensor],
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        embeds: Optional[torch.Tensor],
-        pp_proxy_tensors: Optional[PPProxyTensors],
-    ):
-        """Prefill CP under CP-TP group sharing: the model owns the CP row
-        layout. Embed every token, run the layers on this rank's CP shard
-        (a later pipeline rank receives the shard), and gather the rows
-        before the logits. DFlash aux captures are taken on the CP-local
-        stream rows and ride the same gather."""
-        if self.pp_group.is_first_rank and embeds is None:
-            embeds = self.model.embed_tokens(input_ids)
-        with cp_shard_model_inputs(embeds, positions, forward_batch, input_ids) as (
-            embeds,
-            positions,
-            input_ids,
-        ):
-            hidden_states = self.model(
-                input_ids, positions, forward_batch, embeds, pp_proxy_tensors
-            )
-        if not self.pp_group.is_last_rank:
-            return hidden_states
-        stream = torch.cuda.current_stream()
-        if not self.capture_aux_hidden_states:
-            return cp_gather_after_forward(hidden_states, forward_batch, stream)
-        hidden_states, aux_hidden_states = hidden_states
-        hidden_states = cp_gather_after_forward(hidden_states, forward_batch, stream)
-        if isinstance(aux_hidden_states, torch.Tensor):
-            aux_hidden_states = cp_gather_after_forward(
-                aux_hidden_states, forward_batch, stream
-            )
-        else:
-            aux_hidden_states = [
-                cp_gather_after_forward(aux, forward_batch, stream)
-                for aux in aux_hidden_states
-            ]
-        return hidden_states, aux_hidden_states
+    def prepare_cp_inputs(self, forward_batch: ForwardBatch, **kwargs):
+        """Prefill CP under CP-TP group sharing: embed every token on the first
+        pipeline rank so the runner can shard the rows; a later pipeline rank
+        receives its CP shard through the PP proxy."""
+        input_embeds = kwargs.pop("input_embeds", None)
+        if input_embeds is None and self.pp_group.is_first_rank:
+            input_embeds = self.model.embed_tokens(forward_batch.input_ids)
+        return input_embeds, forward_batch.positions, kwargs
 
     def prepare_context_parallel_metadata_for_dcp(
         self,
@@ -3816,6 +3775,21 @@ class KimiK3ForConditionalGeneration(nn.Module):
             raise AttributeError("lm_head is not available in encoder-only mode")
         return self.language_model.lm_head
 
+    # Prefill CP runs the text body directly, then uses this outer wrapper
+    # for the gather/logits tail. Keep the aux flag live: DFlash enables its
+    # target taps after model construction.
+    @property
+    def pp_group(self):
+        return self.language_model.pp_group
+
+    @property
+    def capture_aux_hidden_states(self):
+        return self.language_model.capture_aux_hidden_states
+
+    @property
+    def logits_processor(self):
+        return self.language_model.logits_processor
+
     def get_pp_proxy_dspark_hidden_size(self) -> int:
         if self.language_model is None:
             return 0
@@ -4078,6 +4052,20 @@ class KimiK3ForConditionalGeneration(nn.Module):
             kv_cache_device=kv_cache_device,
             create_chunked_prefix_cache_kv_indices_fn=create_chunked_prefix_cache_kv_indices_fn,
         )
+
+    def prepare_cp_inputs(self, forward_batch: ForwardBatch, **kwargs):
+        """Finish multimodal embedding injection before the runner shards tokens."""
+        input_embeds = kwargs.pop("input_embeds", None)
+        if input_embeds is None or forward_batch.contains_mm_inputs():
+            input_embeds = prepare_mm_inputs(
+                forward_batch.input_ids,
+                forward_batch,
+                self.language_model,
+                kwargs,
+                multimodal_model=self,
+                data_embedding_funcs={Modality.IMAGE: self.get_image_feature},
+            )
+        return input_embeds, forward_batch.positions, kwargs
 
     def forward(
         self,
