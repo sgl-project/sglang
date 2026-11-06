@@ -290,8 +290,12 @@ class HfModelConfigParser(ModelConfigParserBase):
             from sglang.srt.configs.mamba2 import Mamba2Config
 
             if not isinstance(config, (Mamba2Config, MambaConfig, FalconMambaConfig)):
+                # Keep --decrypted-draft-config-file across the reload.
+                reload_kwargs = {}
+                if kwargs.get("_configuration_file") is not None:
+                    reload_kwargs["_configuration_file"] = kwargs["_configuration_file"]
                 config = _CONFIG_REGISTRY[model_type].from_pretrained(
-                    model, revision=revision
+                    model, revision=revision, **reload_kwargs
                 )
 
             # Re-check after reloading config from registry
