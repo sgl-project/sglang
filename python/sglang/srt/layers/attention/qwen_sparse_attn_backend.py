@@ -253,10 +253,9 @@ class QwenSparseAttnBackend(AttentionBackend):
                 self.token_to_kv_pool, "cache_sharding_runtime", None
             )
             if pool_runtime is None:
-                raise ValueError(
-                    "backend QSA cache-sharding runtime mismatch: QSA pool did "
-                    "not publish its construction contract"
-                )
+                if isinstance(self.token_to_kv_pool, QSATokenToKVPool):
+                    raise ValueError("QSA pool did not publish its sharding contract")
+                pool_runtime = cache_sharding_runtime
         assert_qsa_cache_sharding_runtime_match(
             cache_sharding_runtime,
             pool_runtime,

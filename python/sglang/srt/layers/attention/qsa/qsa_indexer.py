@@ -64,9 +64,6 @@ def _qsa_prefill_row_chunk_size(
     if collective_keys is not None:
         if collective_world_size <= 0:
             raise ValueError("collective_world_size must be positive")
-        # Every rank must issue the same sequence of candidate collectives.
-        # Rank-local sharded cache lengths can differ, so derive the workspace
-        # schedule from the shared global key count instead.
         keys = -(collective_keys // -collective_world_size)
     block_q = max(1, 128 // heads)
     bytes_per_row = keys * torch.float32.itemsize
@@ -481,8 +478,6 @@ class QSAIndexer(MultiPlatformOp):
         compressed = self.normalize_compressed_keys(
             compressed, compressed_rope_positions
         )
-        # Graph metadata already contains local slots. The global-address pool
-        # setter would localize twice and dynamically compact the owner rows.
         buffer = pool.get_qsa_compressed_k_buffer(self.layer_id)
         if compressed.is_cuda:
             from sglang.kernels.ops.attention.qsa_indexer import (
@@ -761,8 +756,6 @@ class QSAIndexer(MultiPlatformOp):
         static_buffers=None,
     ) -> torch.Tensor:
         row_starts = torch.zeros_like(compressed_lengths, dtype=torch.int32)
-        # fast_topk (k = 512) writes 0..length-1 for rows that fit k without
-        # reading their scores, and never reads past a row's length.
         use_fast_topk = (
             q.is_cuda
             and self.block_topk == 512
@@ -1040,9 +1033,6 @@ class QSAIndexer(MultiPlatformOp):
         if group is not None:
             host_lengths = indexer_metadata.prefill_sequence_lengths_cpu
             if host_lengths is None:
-                # Hand-built metadata may not carry scheduler lengths. A
-                # shape-derived upper bound keeps every rank's collective
-                # schedule identical without synchronizing a CUDA scalar.
                 collective_keys = (
                     indexer_metadata.sequence_lengths.numel()
                     * indexer_metadata.token_slot_table.shape[1]
