@@ -190,15 +190,8 @@ def _kimi_k31_overrides(server_args: Any, hf_config: Any) -> dict:
             or cfg.enable_hierarchical_cache
         ):
             raise ValueError(
-                "Kimi-K3.1 DCP does not support speculative decoding other than "
-                "DSPARK and DFLASH, PD disaggregation or HiCache yet."
-            )
-        if cfg.speculative_algorithm == "DFLASH" and (
-            cfg.speculative_draft_attention_backend not in (None, "cutedsl_mla")
-        ):
-            raise ValueError(
-                "Kimi-K3.1 DCP + DFLASH needs --speculative-draft-attention-backend "
-                "cutedsl_mla."
+                "Kimi-K3.1 DCP supports only DSPARK and DFLASH speculative "
+                "decoding, and not PD disaggregation or HiCache yet."
             )
         if cfg.speculative_algorithm == "DSPARK":
             from sglang.srt.speculative.ragged_verify import (
@@ -206,15 +199,18 @@ def _kimi_k31_overrides(server_args: Any, hf_config: Any) -> dict:
                 read_ragged_verify_mode,
             )
 
-            ragged_mode = read_ragged_verify_mode()
-            if ragged_mode is not RaggedVerifyMode.STATIC:
+            if read_ragged_verify_mode() is not RaggedVerifyMode.STATIC:
                 raise ValueError(
-                    "Kimi-K3.1 DCP + DSPARK requires SGLANG_RAGGED_VERIFY_MODE=static; "
-                    f"compact/cap-accept are not validated under DCP (got {ragged_mode.value!r})."
+                    "Kimi-K3.1 DCP + DSPARK requires SGLANG_RAGGED_VERIFY_MODE=static."
                 )
         if cfg.speculative_algorithm == "DFLASH":
+            if cfg.speculative_draft_attention_backend not in (None, "cutedsl_mla"):
+                raise ValueError(
+                    "Kimi-K3.1 DCP + DFLASH needs "
+                    "--speculative-draft-attention-backend cutedsl_mla."
+                )
             overrides["speculative_draft_attention_backend"] = "cutedsl_mla"
-        if cfg.speculative_algorithm in ("DSPARK", "DFLASH"):
+        if cfg.speculative_algorithm is not None:
             # NOTE(yhyang201): DCP target verify runs the DSA decode path; each
             # rank attends over its KV shard and the (o, lse) partials are merged.
             overrides["speculative_attention_mode"] = "decode"
