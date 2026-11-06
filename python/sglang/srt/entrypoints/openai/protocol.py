@@ -1033,8 +1033,6 @@ class ChatCompletionRequest(PDRoutingFields):
     stop: Optional[Union[str, List[str]]] = None
     stream: bool = False
     stream_options: Optional[StreamOptions] = None
-    # Set by /v1/messages, whose message_start takes prompt usage from the
-    # continuous usage chunks; they are then kept even on the K3 wire.
     _keep_continuous_usage: bool = PrivateAttr(default=False)
     temperature: Optional[float] = None
     top_p: Optional[float] = None

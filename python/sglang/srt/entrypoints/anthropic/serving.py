@@ -1134,8 +1134,7 @@ class AnthropicServing:
                     include_output=True,
                 )
 
-            # Usage-only chunk (empty choices with usage info). A completion
-            # without content deltas starts the message here, with its usage.
+            # Usage-only chunk (empty choices with usage info)
             if not chunk.choices and chunk.usage:
                 for frame in _ensure_message_started(chunk.usage):
                     yield frame
