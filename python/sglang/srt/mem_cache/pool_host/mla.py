@@ -35,6 +35,7 @@ from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
     HostKVCache,
 )
+from sglang.srt.mem_cache.pool_host.coalesce_reload import bulk_reload
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     make_kernel_ptr_table,
@@ -749,7 +750,14 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
 
         if io_backend == "kernel":
             if self.layout == "layer_first":
-                if self.can_use_jit:
+                if bulk_reload(
+                    self.kv_buffer[host_layer_id],
+                    device_buffer,
+                    host_indices,
+                    device_indices,
+                ):
+                    pass
+                elif self.can_use_jit:
                     jit_transfer_hicache_one_layer_mla(
                         page_size=self.page_size,
                         cache_dst=device_buffer,
