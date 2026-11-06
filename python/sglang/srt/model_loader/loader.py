@@ -2950,7 +2950,7 @@ class BitsAndBytesModelLoader(BaseModelLoader):
                 index,
             ) in model.bitsandbytes_stacked_params_mapping.items():
                 if (
-                    model_type in ["qwen2_vl", "qwen2_5_vl"]
+                    model_type in ["qwen2_vl", "qwen2_5_vl", "qwen3_vl", "qwen3_vl_moe"]
                     and "visual" in quant_param_name
                 ):
                     break
@@ -2960,7 +2960,7 @@ class BitsAndBytesModelLoader(BaseModelLoader):
                     break
 
             if (
-                model_type in ["qwen2_vl", "qwen2_5_vl"]
+                model_type in ["qwen2_vl", "qwen2_5_vl", "qwen3_vl", "qwen3_vl_moe"]
                 and "visual" in quant_param_name
             ):
                 quant_param_name = quant_param_name.replace(
