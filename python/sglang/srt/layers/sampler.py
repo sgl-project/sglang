@@ -26,8 +26,8 @@ from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.utils.async_probe import maybe_detect_nan, sanitize_nan_logits
-from sglang.srt.utils.common import (
-    get_bool_env_var,
+from sglang.srt.utils.common import get_bool_env_var
+from sglang.srt.utils.device import (
     is_cuda,
     is_gfx1250_supported,
     is_hip,
@@ -405,8 +405,10 @@ class Sampler(nn.Module):
                     f"Sampling seed is not supported for {backend} backend"
                 )
                 if sampling_info.need_min_p_sampling:
-                    probs = top_k_renorm_prob(probs, sampling_info.top_ks)
+                    # Apply top-p before top-k renormalization to preserve the original
+                    # nucleus and match the other samplers' joint support.
                     probs = top_p_renorm_prob(probs, sampling_info.top_ps)
+                    probs = top_k_renorm_prob(probs, sampling_info.top_ks)
                     batch_next_token_ids = min_p_sampling_from_probs(
                         probs, sampling_info.min_ps
                     )
@@ -751,7 +753,7 @@ def register_sampler_backend(backend: str, factory: Callable[[], "Sampler"]) -> 
     if not backend:
         raise ValueError("backend must be a non-empty string")
 
-    from sglang.srt.server_args import SAMPLING_BACKEND_CHOICES
+    from sglang.srt.arg_groups.choices import SAMPLING_BACKEND_CHOICES
 
     if backend in _CUSTOM_SAMPLER_FACTORIES:
         logger.warning("Overriding existing sampler factory for backend '%s'", backend)

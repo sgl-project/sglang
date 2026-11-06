@@ -6,9 +6,9 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from sglang.srt.environ import envs
+from sglang.srt.managers.mm_utils import ShmPointerMMData
 from sglang.srt.models.unlimited_ocr_v2_support.async_shm import (
     AsyncShmMaterializer,
-    ShmPointerMMData,
     create_async_shm_materializer,
     estimate_shm_bytes,
 )

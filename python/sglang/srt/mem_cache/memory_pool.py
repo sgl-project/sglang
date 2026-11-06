@@ -46,6 +46,13 @@ from sglang.kernels.ops.kvcache.cache_move import (
 )
 from sglang.kernels.ops.kvcache.cache_ops import launch_reshape_and_cache_flash
 from sglang.kernels.ops.kvcache.kvcache import can_use_store_cache, store_cache
+from sglang.kernels.ops.kvcache.mla_buffer import (
+    get_mla_kv_buffer_triton,
+    set_mla_kv_buffer_dcp_sharded_triton,
+    set_mla_kv_buffer_triton,
+    set_mla_kv_buffer_triton_fp8_quant,
+    set_mla_kv_scale_buffer_triton,
+)
 from sglang.kernels.ops.quantization.dsa_quant_k_cache import (
     quantize_k_cache,
     quantize_k_cache_separate,
@@ -76,14 +83,7 @@ from sglang.srt.mem_cache.layout.token_major import (
     build_mamba_entry_views,
     mamba_entry_bytes,
 )
-from sglang.srt.mem_cache.utils import (
-    get_mla_kv_buffer_triton,
-    maybe_init_custom_mem_pool,
-    set_mla_kv_buffer_dcp_sharded_triton,
-    set_mla_kv_buffer_triton,
-    set_mla_kv_buffer_triton_fp8_quant,
-    set_mla_kv_scale_buffer_triton,
-)
+from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_flags, get_parallel, get_platform
 from sglang.srt.utils import (
@@ -515,6 +515,7 @@ class ReqToTokenPool:
 
 class MambaPool:
     host_capacity_tokens: Optional[int] = None
+    host_capacity_bytes: Optional[int] = None
 
     # Axis of each two-dimensional conv state that represents the sliding window.
     # Upstream states use (dim, K-1); subclasses may preserve another layout.
@@ -1791,12 +1792,25 @@ class KVWriteLoc:
             self.swa_loc = self.swa_loc[: self.loc.shape[0]]
         if self.full_loc is not None and self.full_loc.shape[0] != self.loc.shape[0]:
             self.full_loc = self.full_loc[: self.loc.shape[0]]
+        _check_dense_loc(self.loc, "loc")
+        _check_dense_loc(self.swa_loc, "swa_loc")
+        _check_dense_loc(self.full_loc, "full_loc")
+
+
+def _check_dense_loc(loc: Optional[torch.Tensor], name: str) -> None:
+    # The KV write kernels index a loc by flat offset; a strided view would
+    # silently write other rows' slots.
+    if loc is not None and not loc.is_contiguous():
+        raise ValueError(
+            f"KV write {name} must be contiguous: {tuple(loc.shape)=} {loc.stride()=}"
+        )
 
 
 def unwrap_write_loc(loc_info):
     """Return ``(loc, swa_loc, full_loc)`` from a ``KVWriteLoc`` or a bare loc."""
     if isinstance(loc_info, KVWriteLoc):
         return loc_info.loc, loc_info.swa_loc, loc_info.full_loc
+    _check_dense_loc(loc_info, "loc")
     return loc_info, None, None
 
 
@@ -1843,6 +1857,12 @@ class KvBufferDesc:
 class KVCache(abc.ABC):
     layer_shard_enabled: bool = False
     post_capture_active: bool = False
+
+    @property
+    def backing_owner(self):
+        """Identity of the allocation whose post-capture bytes this pool reports."""
+        return self
+
     # Prepared before final KV sizing; reused by the host pool after resizing.
     # page_first MHA uses separate K/V buffers; page_unified uses one page buffer.
     hicache_write_back_staging: (
@@ -4127,6 +4147,7 @@ class HybridLinearKVPool(KVCache):
         tail_extra_slots: int = 0,
         max_running_requests: Optional[int] = None,
         skip_topk_layers: Optional[List[bool]] = None,
+        kv_scale_ue8m0: bool = False,
         start_layer: Optional[int] = None,
         full_kv_pool_class: Optional[type] = None,
         quant_method=None,
@@ -4205,6 +4226,7 @@ class HybridLinearKVPool(KVCache):
                 tail_extra_slots=tail_extra_slots,
                 max_running_requests=max_running_requests,
                 skip_topk_layers=skip_topk_layers,
+                kv_scale_ue8m0=kv_scale_ue8m0,
             )
         else:
             MLAPoolClass = (
@@ -4235,6 +4257,10 @@ class HybridLinearKVPool(KVCache):
             self.mem_usage = (k_size + v_size) / GB
 
     @property
+    def backing_owner(self):
+        return self.full_kv_pool.backing_owner
+
+    @property
     def post_capture_active(self) -> bool:
         return self.full_kv_pool.post_capture_active
 
@@ -4250,6 +4276,10 @@ class HybridLinearKVPool(KVCache):
     @property
     def dsa_kv_cache_store_fp8(self) -> bool:
         return getattr(self.full_kv_pool, "dsa_kv_cache_store_fp8", False)
+
+    @property
+    def kv_scale_ue8m0(self) -> bool:
+        return getattr(self.full_kv_pool, "kv_scale_ue8m0", False)
 
     @property
     def kv_cache_dim(self):
@@ -4290,6 +4320,10 @@ class HybridLinearKVPool(KVCache):
 
     def get_contiguous_buf_infos(self):
         return self.full_kv_pool.get_contiguous_buf_infos()
+
+    def get_device_pool_infos(self) -> tuple[DevicePoolInfo, ...]:
+        # Pools owned beside full_kv_pool, which describes the full KV itself.
+        return ()
 
     def get_kv_layer_ids(self):
         """Global layer ids aligned with the full-attention KV buffers."""
@@ -4640,7 +4674,24 @@ class HybridLinearKVPool(KVCache):
         )
 
 
+def _prefix_valid_mla_write_loc(loc_2d, commit_lens, cache_k_nope):
+    if loc_2d.ndim != 2 or commit_lens.shape != (loc_2d.shape[0],):
+        raise ValueError(f"{tuple(loc_2d.shape)=} {tuple(commit_lens.shape)=}")
+    if cache_k_nope.shape[0] != loc_2d.numel():
+        raise ValueError(f"{tuple(cache_k_nope.shape)=} {tuple(loc_2d.shape)=}")
+    # Rows past commit_lens go to the reserved slot 0,
+    # which this pool's MLA writes skip, as they do for CUDA-graph padding.
+    offsets = torch.arange(loc_2d.shape[1], device=loc_2d.device)
+    loc = torch.where(
+        offsets < commit_lens[:, None].to(torch.int64), loc_2d.to(torch.int64), 0
+    ).reshape(-1)
+    return KVWriteLoc(loc, physical=True)
+
+
 class MLATokenToKVPool(KVCache, MLAKVView):
+    # fp8_ds_mla tile scales rounded up to powers of two (Kimi-K3.1)
+    kv_scale_ue8m0 = False
+
     def __init__(
         self,
         size: int,
@@ -4877,7 +4928,12 @@ class MLATokenToKVPool(KVCache, MLAKVView):
             self.write_loc_is_dcp_resolved
             and (self.use_dsa or self.dsa_kv_cache_store_fp8)
         ), "the DSA write paths have no resolved-loc variant"
-        if _is_hip and self.use_dsa and self.dtype == fp8_dtype:
+        if (
+            _is_hip
+            and self.use_dsa
+            and self.dtype == fp8_dtype
+            and not self.dsa_kv_cache_store_fp8
+        ):
             # HIP TileLang FP8 consumes the model's raw MLA layout
             # (NoPE + optional RoPE) without per-block scales.
             # Fuse BF16/FP16 -> FP8 cast with paged KV write.
@@ -4895,7 +4951,7 @@ class MLATokenToKVPool(KVCache, MLAKVView):
             # This also enables reuse of set_mla_kv_buffer_triton two-tensor write path
             # quantize_k_cache_separate returns (nope_part, rope_part) as uint8 bytes
             cache_k_nope_fp8, cache_k_rope_fp8 = quantize_k_cache_separate(
-                cache_k_nope, cache_k_rope
+                cache_k_nope, cache_k_rope, scale_ue8m0=self.kv_scale_ue8m0
             )
 
             # Reuse existing two-tensor write kernel (works with FP8 byte layout)
@@ -4949,18 +5005,11 @@ class MLATokenToKVPool(KVCache, MLAKVView):
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
     ):
-        if loc_2d.ndim != 2 or commit_lens.shape != (loc_2d.shape[0],):
-            raise ValueError(f"{tuple(loc_2d.shape)=} {tuple(commit_lens.shape)=}")
-        if cache_k_nope.shape[0] != loc_2d.numel():
-            raise ValueError(f"{tuple(cache_k_nope.shape)=} {tuple(loc_2d.shape)=}")
-        # Rows past commit_lens go to the reserved slot 0,
-        # which this pool's MLA writes skip, as they do for CUDA-graph padding.
-        offsets = torch.arange(loc_2d.shape[1], device=loc_2d.device)
-        loc = torch.where(
-            offsets < commit_lens[:, None].to(torch.int64), loc_2d.to(torch.int64), 0
-        ).reshape(-1)
         self.set_mla_kv_buffer(
-            layer, KVWriteLoc(loc, physical=True), cache_k_nope, cache_k_rope
+            layer,
+            _prefix_valid_mla_write_loc(loc_2d, commit_lens, cache_k_nope),
+            cache_k_nope,
+            cache_k_rope,
         )
 
     def get_mla_kv_buffer(
@@ -5194,6 +5243,16 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
                 cache_k_rope_fp4_sf,
             )
 
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        super().move_kv_cache(tgt_loc, src_loc)
+        if tgt_loc.numel() == 0:
+            return
+
+        tgt_loc_flat = tgt_loc.view(-1).long()
+        src_loc_flat = src_loc.view(-1).long()
+        for kv_scale in self.kv_scale_buffer:
+            kv_scale[tgt_loc_flat] = kv_scale[src_loc_flat]
+
 
 class DSATokenToKVPool(MLATokenToKVPool):
     quant_block_size = 128
@@ -5221,6 +5280,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         max_running_requests: Optional[int] = None,
         skip_topk_layers: Optional[List[bool]] = None,
         dcp_replicated: bool = False,
+        kv_scale_ue8m0: bool = False,
     ):
         override_dim = (
             kv_cache_dim if kv_cache_dim != kv_lora_rank + qk_rope_head_dim else None
@@ -5241,6 +5301,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
             override_kv_cache_dim=override_dim,
             dcp_replicated=dcp_replicated,
         )
+        self.kv_scale_ue8m0 = kv_scale_ue8m0
         # self.index_k_dtype = torch.float8_e4m3fn
         # self.index_k_scale_dtype = torch.float32
         self.index_head_dim = index_head_dim

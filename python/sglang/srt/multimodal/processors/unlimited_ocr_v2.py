@@ -6,10 +6,7 @@ from typing import Any, ClassVar, Optional
 import torch
 
 from sglang.srt.configs.unlimited_ocr import merge_mm_processor_kwargs
-from sglang.srt.managers.schedule_batch import (
-    MultimodalDataItem,
-    MultimodalProcessorOutput,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.models.unlimited_ocr_v2 import UnlimitedOCRV2ForCausalLM
 from sglang.srt.multimodal.processors.unlimited_ocr import (
     _DEFAULT_MODE,

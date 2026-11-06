@@ -88,6 +88,8 @@ from sglang.srt.layers.quantization.fp8_utils import (
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -97,11 +99,7 @@ from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
     pad_mm_token_pairs,
 )
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputs,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
@@ -115,6 +113,8 @@ from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
 )
 from sglang.srt.models.deepseek_common.utils import tiny_router_gemm_max_tokens
 from sglang.srt.models.dots3_common.fp8 import per_token_group_quant_einsum_fp8
+from sglang.srt.models.utils import bind_or_assign
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import (
     get_device,
     get_exec,
@@ -123,13 +123,10 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils import (
     BumpAllocator,
     LazyValue,
-    add_prefix,
-    bind_or_assign,
     ceil_align,
     ceil_div,
     is_cuda,
     log_info_on_rank0,
-    make_pp_layers,
 )
 
 _is_cuda = is_cuda()
@@ -256,9 +253,7 @@ class Dots3MoEGate(nn.Module):
     def forward(self, hidden_states):
         # Use the fused router only for its tuned shapes.
         if hidden_states.shape[0] <= self.tiny_router_gemm_max_tokens:
-            logits = tiny_gemm_bf16(
-                hidden_states, self.weight, max_m=self.tiny_router_gemm_max_tokens
-            )
+            logits = tiny_gemm_bf16(hidden_states, self.weight)
         else:
             logits = F.linear(hidden_states, self.weight, None)
 

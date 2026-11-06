@@ -23,7 +23,7 @@ from sglang.srt.mem_cache.memory_pool import (
     HybridReqToTokenPool,
 )
 from sglang.srt.mem_cache.memory_pool import MambaPool as StatePool
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
