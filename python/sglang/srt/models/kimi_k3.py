@@ -7,7 +7,6 @@
 #   - Full-rank KDA gate (use_full_rank_gate)
 
 import logging
-import os
 import re
 from array import array
 from collections.abc import Iterable
@@ -21,6 +20,7 @@ from torch import nn
 from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
 from sglang.srt.configs.kimi_k3 import KimiK3Config
 from sglang.srt.configs.kimi_linear import KimiLinearConfig
+from sglang.srt.configs.model_config import is_kimi_k31
 from sglang.srt.distributed import (
     divide,
     tensor_model_parallel_all_reduce,
@@ -39,6 +39,7 @@ from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStatePacker,
 )
 from sglang.srt.layers.communication import k3_ar_fusion, k3_sp_collective
+from sglang.srt.layers.dcp.layout import set_dsa_shards_index_k
 from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
 from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
@@ -94,6 +95,8 @@ from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
 from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils.common import add_prefix, set_weight_attrs
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -103,11 +106,7 @@ from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
     pad_mm_tokens,
 )
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputs,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
@@ -136,6 +135,7 @@ from sglang.srt.multimodal.kimi_k3_image_processing import (
     to_chw_uint8,
 )
 from sglang.srt.multimodal.mm_utils import materialize_multimodal_features
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -143,14 +143,9 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.utils import is_hip, is_npu, make_pp_layers
-from sglang.srt.utils.common import (
-    BumpAllocator,
-    add_prefix,
-    get_bool_env_var,
-    rank0_log,
-    set_weight_attrs,
-)
+from sglang.srt.utils import is_hip, is_npu
+from sglang.srt.utils.common import BumpAllocator, get_bool_env_var
+from sglang.srt.utils.log_utils import rank0_log
 
 logger = logging.getLogger(__name__)
 
@@ -1340,7 +1335,7 @@ class KimiK3MoE(nn.Module):
 
     def _forward_routed(self, hidden_states, router_logits, routed_input, latent):
         if self._route_quant_fuse_eligible:
-            route_quant_handoff.stage(routed_input)
+            route_quant_handoff.stage(routed_input, layer=self.experts)
         try:
             topk_output = self.topk(hidden_states, router_logits)
             with zero_copy_context.set_moe_output(latent):
@@ -1356,7 +1351,7 @@ class KimiK3MoE(nn.Module):
         expanded_idx_to_permuted_idx, expert_weights) for the finalize-fused
         all-reduce."""
         if self._route_quant_fuse_eligible:
-            route_quant_handoff.stage(routed_input)
+            route_quant_handoff.stage(routed_input, layer=self.experts)
         try:
             topk_output = self.topk(hidden_states, router_logits)
             return self.experts.forward_deferred_finalize(routed_input, topk_output)
@@ -1930,7 +1925,9 @@ class KimiK3DeltaAttention(nn.Module):
         that a raw row-cat would silently drop."""
         if not (_is_hip and envs.SGLANG_ROCM_K3_FUSE_KDA_INPROJ.get()):
             return False
-        if not (self.do_fuse_qkvbfg and self.use_full_rank_gate):
+        if not self.use_full_rank_gate:
+            return False
+        if not (self.do_fuse_qkvbfg or get_exec().kernel.enable_amd_monokernel):
             return False
         # Block-FP8 in-proj needs dequantized BF16 buffers; a raw row-cat
         # would drop the scales. Leave fusion to the split [f_a|b] path.
@@ -1963,9 +1960,7 @@ class KimiK3DeltaAttention(nn.Module):
             layer = self.attn
             w = layer.conv_weights
             f_b_weight = self.f_b_proj.weight
-            backend = os.environ.get(
-                "SGLANG_ROCM_K3_KDA_FUSED_BACKEND", "gfx950"
-            ).lower()
+            backend = envs.SGLANG_ROCM_K3_KDA_FUSED_BACKEND.get().lower()
             fused_ops = {
                 "aiter": kda_fused_decode_aiter_hip,
                 "gfx950": kda_fused_decode_gfx950,
@@ -2014,21 +2009,27 @@ class KimiK3DeltaAttention(nn.Module):
         w = layer.conv_weights
         if _is_npu:
             return
-        seg = 12 * 128  # compiled for H = HV = 12 heads of 128 (TP8)
+        from sglang.kernels.ops.attention import kda_fused_decode
+
+        heads = self.local_num_heads
+        seg = heads * 128
         if (
-            w is None
+            heads not in kda_fused_decode.SUPPORTED_HEADS
+            or w is None
             or w.ndim != 2
             or w.shape != (3 * seg, 4)
             or w.dtype != torch.float32
             or layer.A_log is None
-            or layer.A_log.numel() != 12
+            or layer.A_log.numel() != heads
             or layer.A_log.dtype != torch.float32
             or layer.dt_bias is None
             or tuple(layer.dt_bias.shape) != (seg,)
             or layer.dt_bias.dtype != torch.float32
         ):
             rank0_log(
-                "K3 fused KDA decode disabled: unexpected conv/A_log/dt_bias "
+                f"K3 fused KDA decode disabled: {heads} local heads "
+                f"(kernel supports {sorted(kda_fused_decode.SUPPORTED_HEADS)}) or "
+                "unexpected conv/A_log/dt_bias "
                 f"layout (conv {None if w is None else tuple(w.shape)}, "
                 f"A_log {None if layer.A_log is None else tuple(layer.A_log.shape)}, "
                 f"dt_bias {None if layer.dt_bias is None else tuple(layer.dt_bias.shape)})"
@@ -2048,7 +2049,7 @@ class KimiK3DeltaAttention(nn.Module):
             wt[:, seg : 2 * seg].contiguous(),
             wt[:, 2 * seg :].contiguous(),
             conv_bias,
-            layer.A_log.detach().reshape(-1),  # view; kernel wants [12]
+            layer.A_log.detach().reshape(-1),  # view; kernel wants [heads]
             self.o_norm.weight.data.float().contiguous(),
             float(self.o_norm.eps),
         )
@@ -2129,8 +2130,9 @@ class KimiK3DeltaAttention(nn.Module):
             )
         return qkv, beta, forget_gate, g_proj_states
 
-    def forward(
+    def forward_pre_o_proj(
         self,
+        *,
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
@@ -2183,7 +2185,21 @@ class KimiK3DeltaAttention(nn.Module):
         if not fused_onorm:
             norm_gate = g_proj_states.unflatten(-1, (-1, self.head_dim))
             core_attn_out = self.o_norm(core_attn_out, norm_gate)
-        core_attn_out = core_attn_out.squeeze(0).flatten(-2)
+        return core_attn_out.squeeze(0).flatten(-2)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        zero_allocator: BumpAllocator,
+    ) -> torch.Tensor:
+        core_attn_out = self.forward_pre_o_proj(
+            hidden_states=hidden_states,
+            positions=positions,
+            forward_batch=forward_batch,
+            zero_allocator=zero_allocator,
+        )
         if self.all_reduce_fusion:
             out = _k3_symm_o_proj_out(self.o_proj, core_attn_out)
             partial, _ = self.o_proj(core_attn_out, output_tensor=out)
@@ -2213,6 +2229,8 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
         # The fused Ascend split+RMSNorm path is not numerically equivalent for
         # Kimi-K3. Other MLA models retain the existing fused fast path.
         self._disable_npu_fused_split_qk_norm = True
+        if is_kimi_k31(config) and get_parallel().attn_dcp_size > 1:
+            set_dsa_shards_index_k()
         super().__init__(
             layer_id=layer_idx,
             hidden_size=config.hidden_size,
@@ -2330,6 +2348,8 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
                 if self._gate_alt_stream is not None
                 else 0
             )
+            self._pre_o_proj_out: Optional[torch.Tensor] = None
+            self._return_pre_o_proj = False
             _orig_o_proj_forward = self.o_proj.forward
 
             def _gated_o_proj_forward(x, *args, **kwargs):
@@ -2349,6 +2369,26 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
                     # Even a skipped gate must close its capture branch.
                     torch.cuda.current_stream().wait_stream(self._gate_pending_stream)
                     self._gate_pending_stream = None
+                if self._return_pre_o_proj:
+                    # forward_pre_o_proj() sets _return_pre_o_proj. Skipping
+                    # o_proj hands its GEMM and its attention-TP reduction to
+                    # the caller. The MLA cores only unpack a 2-tuple from it.
+                    if isinstance(x, tuple):
+                        # A quantized o_proj makes the core quantize its input,
+                        # and the gate above is skipped along with it.
+                        raise RuntimeError(
+                            f"forward_pre_o_proj: layer {self.layer_id} has a "
+                            "quantized o_proj input, so there is no gated bf16 "
+                            "output to hand back"
+                        )
+                    if self._pre_o_proj_out is not None:
+                        raise RuntimeError(
+                            f"forward_pre_o_proj: layer {self.layer_id} reached "
+                            "o_proj twice in one attention forward; the second "
+                            "output would overwrite the first"
+                        )
+                    self._pre_o_proj_out = x
+                    return x, None
                 return _orig_o_proj_forward(x, *args, **kwargs)
 
             self.o_proj.forward = _gated_o_proj_forward
@@ -2411,6 +2451,25 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
         return super().forward(
             positions, hidden_states, forward_batch, zero_allocator, **kwargs
         )
+
+    def forward_pre_o_proj(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        zero_allocator: BumpAllocator,
+        **kwargs,
+    ) -> torch.Tensor:
+        assert self.use_output_gate, "forward_pre_o_proj needs the gated o_proj wrapper"
+        assert not self._return_pre_o_proj, "forward_pre_o_proj is not re-entrant"
+        self._return_pre_o_proj, self._pre_o_proj_out = True, None
+        self.forward(positions, hidden_states, forward_batch, zero_allocator, **kwargs)
+        out = self._pre_o_proj_out
+        self._return_pre_o_proj, self._pre_o_proj_out = False, None
+        if out is None:
+            raise RuntimeError("MLA forward returned without reaching o_proj")
+        return out
 
 
 def _is_moe_layer(config: KimiLinearConfig, layer_idx: int) -> bool:
@@ -2719,6 +2778,8 @@ class KimiK3DecoderLayer(nn.Module):
             forward_batch=forward_batch,
             zero_allocator=zero_allocator,
         )
+        if isinstance(result, tuple):
+            result = result[0]
 
         if qkv_latent_func is not None:
             get_attn_tp_context().clear_attn_inputs()
@@ -3156,6 +3217,8 @@ class KimiK3LinearForCausalLM(nn.Module):
         kv_cache_device,
         create_chunked_prefix_cache_kv_indices_fn,
     ):
+        if _is_npu:
+            return None
         return prepare_decode_context_parallel_metadata(
             seq_lens=seq_lens,
             extend_prefix_lens=extend_prefix_lens,
@@ -3364,8 +3427,21 @@ class KimiK3LinearForCausalLM(nn.Module):
                         weight_loader(param, loaded_weight, **kwargs)
             loaded_params.add(name)
 
+        self._check_dsa_indexer_loaded(loaded_params)
         self.post_load_weights()
         return loaded_params
+
+    def _check_dsa_indexer_loaded(self, loaded_params: set[str]) -> None:
+        if self.config.dsa_config is None:
+            return
+        expected = {
+            name for name, _ in self.named_parameters() if ".self_attn.indexer." in name
+        }
+        missing = sorted(expected - loaded_params)
+        assert not missing, (
+            f"Kimi-K3.1: {len(missing)} DSA indexer params were not loaded, "
+            f"e.g. {missing[:4]}"
+        )
 
     def post_load_weights(self):
         # Also invoked by loader post-load hooks (DummyModelLoader,
@@ -3924,4 +4000,12 @@ class KimiK3ForConditionalGeneration(nn.Module):
                 pass
 
 
-EntryClass = [KimiK3ForConditionalGeneration, KimiK3LinearForCausalLM]
+class KimiK31ForConditionalGeneration(KimiK3ForConditionalGeneration):
+    pass
+
+
+EntryClass = [
+    KimiK3ForConditionalGeneration,
+    KimiK31ForConditionalGeneration,
+    KimiK3LinearForCausalLM,
+]

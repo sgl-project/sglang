@@ -80,13 +80,8 @@ from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     build_prefill_registry,
 )
 from sglang.srt.model_executor.cuda_graph_config import Backend
-from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
-    create_chunked_prefix_cache_kv_indices,
-)
 from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
     ForwardBatch,
-    ForwardMode,
     NgramEmbeddingInfo,
     PPProxyTensors,
     compute_local_num_token_non_padded,
@@ -99,6 +94,7 @@ from sglang.srt.model_executor.forward_context import (
     get_req_to_token_pool,
     get_token_to_kv_pool,
 )
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
     BaseCudaGraphRunner,
     freeze_gc,
@@ -144,6 +140,12 @@ def _has_chunked_local_attn(model_runner: Any) -> bool:
     )
 
 
+from sglang.srt.layers.dp_attention import (
+    get_cuda_graph_max_batch_size,
+    require_attn_tp_gather,
+    require_gathered_buffer,
+    require_mlp_tp_gather,
+)
 from sglang.srt.model_executor.runner_backend_utils import (
     PREFILL_CUDA_GRAPH_CAPTURE_FAILED_MSG,
 )
@@ -175,15 +177,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
 )
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
-from sglang.srt.utils import (
-    get_available_gpu_memory,
-    get_cuda_graph_max_batch_size,
-    is_cuda,
-    is_npu,
-    require_attn_tp_gather,
-    require_gathered_buffer,
-    require_mlp_tp_gather,
-)
+from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_npu
 from sglang.srt.utils.aiter import maybe_pre_warm_aiter_chip_info
 
 if TYPE_CHECKING:
@@ -372,7 +366,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         prefill_attn_backend = getattr(
             model_runner.attn_backend, "prefill_backend", model_runner.attn_backend
         )
-        self._fa4_prefill = getattr(prefill_attn_backend, "fa_impl_ver", None) == 4
+        self._fa4_prefill = getattr(
+            prefill_attn_backend, "fa_impl_ver", None
+        ) == 4 or getattr(prefill_attn_backend, "fa3_upgrades_to_fa4", False)
         # --- model flags ----------------------------------------------
         self.quant_config = getattr(model_runner.model, "quant_config", None)
         self.is_multimodal = model_runner.model_config.is_multimodal

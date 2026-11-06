@@ -11,7 +11,7 @@ from unittest.mock import Mock, patch
 
 from parameterized import parameterized
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.managers import scheduler as scheduler_module
 from sglang.srt.managers.io_struct import (
@@ -20,8 +20,13 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    KeyedReqList,
+    ListKind,
+)
 from sglang.srt.managers.utils import GenerationBatchResult
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -64,6 +69,11 @@ def load_mlx_scheduler_module():
     with patch.dict(sys.modules, {spec.name: module, "mlx": mlx, "mlx.core": core}):
         spec.loader.exec_module(module)
     return module
+
+
+class _Request(SimpleNamespace):
+    # Requests are tracked by identity.
+    __hash__ = object.__hash__
 
 
 class TestSchedulerIdleStepCounters(CustomTestCase):
@@ -286,6 +296,8 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
             reqs=batch.reqs[:],
         )
         scheduler.result_queue = deque([pending])
+        # The partial scheduler has none of the lists request_lists() reads.
+        scheduler.request_lists = lambda: {}
 
         self.assertEqual(scheduler.collect_inflight_reqs(), {req})
 
@@ -427,7 +439,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
     def make_batch(self, mode, *, launch_ts=None, extend_num_tokens=1024):
         return ScheduleBatch(
             reqs=[
-                SimpleNamespace(
+                _Request(
                     rid="request", finished=Mock(return_value=False), inflight_steps=0
                 )
             ],
@@ -537,7 +549,14 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
 
     def make_scheduler(self, schedule):
         scheduler = Scheduler.__new__(Scheduler)
+        scheduler.running_reqs = KeyedReqList(ListKind.DECODING)
+        scheduler.prefill_launched_reqs = KeyedReqList(ListKind.PREFILL_LAUNCHED)
         scheduler.tp_size = get_parallel().tp_size
+        scheduler.dp_tp_group = SimpleNamespace(
+            world_size=get_parallel().attn_tp_size
+            if get_parallel().attn_dp_enabled
+            else get_parallel().tp_size
+        )
         scheduler.gracefully_exit = False
         scheduler._engine_paused = False
         scheduler._deferred_input_requests = []
@@ -567,9 +586,12 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.decode_moment_totals = [0.0] * 6
         scheduler.running_batch = ScheduleBatch(reqs=[])
         scheduler.last_batch = None
-        scheduler.chunked_req = None
-        scheduler.waiting_queue = []
+        scheduler.chunked_reqs = IndexedReqList(ListKind.CHUNKED)
+        scheduler.waiting_queue = IndexedReqList(ListKind.WAITING)
         scheduler.disagg_prefill_transfer_queue = []
+        scheduler.disagg_decode_transfer_queue = SimpleNamespace(
+            queue=[], staging_handler=None
+        )
         scheduler.enable_staging = False
         scheduler.request_receiver = SimpleNamespace(
             recv_requests=Mock(side_effect=[[]] * len(schedule) + [StopIteration])
@@ -581,7 +603,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.disagg_decode_prealloc_queue = SimpleNamespace(
             prefetch_prefill_dp_rank_queries=Mock(), queue=[]
         )
-        scheduler.process_decode_queue = Mock()
+        scheduler.process_decode_queue = Mock(return_value=False)
         scheduler.ngram_embedding_manager = SimpleNamespace(
             prepare_for_forward=lambda batch, chunked_req: batch
         )
@@ -630,7 +652,39 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
             maybe_prepare_mlp_sync_batch=lambda batch: batch
         )
         scheduler.disagg_prefill_transfer_queue = []
-        scheduler.disagg_decode_transfer_queue = SimpleNamespace(queue=[])
+        scheduler.disagg_decode_transfer_queue = SimpleNamespace(
+            queue=[], staging_handler=None
+        )
+
+
+class TestPrefillOverlapShutdownVote(CustomTestCase):
+    """On shutdown the overlap prefill loop launches nothing new, yet still runs
+    the one batch selection whose MLP-sync gather carries a group-local
+    ShutdownReq to the other attention-DP ranks."""
+
+    def setUp(self):
+        super().setUp()
+        enter_scope(self, published_topology(role="scheduler"))
+
+    def _selections_after_shutdown(self, vote_pending: bool) -> int:
+        scheduler = TestSchedulerIdleStepCounters.make_scheduler(self, [None])
+
+        def honor_shutdown(**kwargs):
+            scheduler.gracefully_exit = True
+            return True
+
+        scheduler.ingest_requests = Mock(side_effect=honor_shutdown)
+        scheduler.dp_attn_adapter = SimpleNamespace(
+            shutdown_vote_pending=lambda: vote_pending
+        )
+        Scheduler.event_loop_overlap_disagg_prefill(scheduler)
+        return scheduler.get_next_disagg_prefill_batch_to_run.call_count
+
+    def test_unsent_vote_still_reaches_the_gather(self):
+        self.assertEqual(self._selections_after_shutdown(vote_pending=True), 1)
+
+    def test_no_new_selection_without_a_vote_to_send(self):
+        self.assertEqual(self._selections_after_shutdown(vote_pending=False), 0)
 
 
 if __name__ == "__main__":

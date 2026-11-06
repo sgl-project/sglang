@@ -139,7 +139,7 @@ class TestAttnDpSize(CustomTestCase):
         """`attn_dp_enabled` is also true for an elastic scale joiner at width
         one. The readback reports the configured width instead, so a joiner's
         replicas are not folded into attention-DP groups when it is read back."""
-        from sglang.srt.arg_groups.overrides import resolving_view
+        from sglang.srt.arg_groups.model_override_base import resolving_view
         from sglang.srt.runtime_context import attn_dp_enabled_of
 
         joiner = ServerArgs(
