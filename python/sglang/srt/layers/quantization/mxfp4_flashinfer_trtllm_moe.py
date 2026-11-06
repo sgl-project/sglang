@@ -10,8 +10,9 @@ from torch.nn.parameter import Parameter
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
-from sglang.srt.layers.moe.utils import RoutingMethodType
+from sglang.srt.layers.moe.utils import MoeRunnerBackend, RoutingMethodType
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -29,7 +30,10 @@ _MXFP8_QUANTIZE_BACKEND = "cute-dsl" if get_platform().is_sm100 else "cuda"
 if is_flashinfer_available():
     from flashinfer import shuffle_matrix_a, shuffle_matrix_sf_a
     from flashinfer.fp4_quantization import block_scale_interleave
-    from flashinfer.fused_moe import trtllm_fp4_block_scale_routed_moe
+    from flashinfer.fused_moe import (
+        trtllm_fp4_block_scale_moe,
+        trtllm_fp4_block_scale_routed_moe,
+    )
     from flashinfer.fused_moe.core import (
         _maybe_get_cached_w3_w1_permute_indices,
         get_w2_permute_indices_with_cache,
@@ -39,6 +43,7 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
+    from sglang.srt.layers.moe.topk import TopKConfig
 
 from sglang.srt.utils.common import get_bool_env_var
 
@@ -115,9 +120,25 @@ class Mxfp8RoutedInputPreQuant(NamedTuple):
 class Mxfp4FlashinferTrtllmMoEMethod:
     fuse_routed_scaling_factor_in_topk = True
 
+    def configure_bypassed_topk(self, config: TopKConfig) -> bool:
+        """Select the FlashInfer routing contract before Top-K can be bypassed."""
+        supported = (
+            config.use_grouped_topk
+            and config.scoring_func == "sigmoid"
+            and config.correction_bias is not None
+            and config.custom_routing_function is None
+            and config.num_shared_topk_slots == 0
+            and not config.torch_native
+        )
+        self._bypassed_routing_method = (
+            RoutingMethodType.DeepSeekV3 if supported else None
+        )
+        return supported
+
     def __init__(self, fp8_method, prefix: str):
         self._fp8 = fp8_method
         self.prefix = prefix
+        self._bypassed_routing_method = None
         # precision=fp8 is an SM90 knob (Humming W4A8); this SM100 trtllm path
         # already runs MXFP8 activations, so the flag is inert here rather than
         # an error -- one config can move across hardware.
@@ -143,6 +164,14 @@ class Mxfp4FlashinferTrtllmMoEMethod:
             if swiglu_limit is not None
             else None
         )
+
+    def get_moe_runner_backend(self, layer):
+        return MoeRunnerBackend.FLASHINFER_MXFP4
+
+    def get_moe_routing_method_type(
+        self, layer: Module, requested_method: RoutingMethodType | None
+    ) -> RoutingMethodType | None:
+        return requested_method
 
     def create_weights(
         self,
@@ -370,15 +399,40 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         if w2_scale.dim() == 2:
             w2_scale = w2_scale.reshape(num_local_experts, hidden_size, -1)
 
-        if TopKOutputChecker.format_is_bypassed(topk_output):
-            raise NotImplementedError(
-                "the old code in this branch is WRONG. e.g. it does not consider HashTopK, and may miss args"
+        bypassed = TopKOutputChecker.format_is_bypassed(topk_output)
+        if TopKOutputChecker.format_is_standard(topk_output):
+            top_k = topk_output.topk_ids.shape[1]
+            moe_call = trtllm_fp4_block_scale_routed_moe
+            routing = dict(
+                topk_ids=(topk_output.topk_ids, topk_output.topk_weights),
+                routing_bias=None,
+                routing_method_type=int(RoutingMethodType.TopK),
+                n_group=1,
+                topk_group=1,
+                routed_scaling_factor=1.0,
             )
-        if not TopKOutputChecker.format_is_standard(topk_output):
+        elif bypassed:
+            if self._bypassed_routing_method is None:
+                raise NotImplementedError("MxFP4 bypassed routing is not configured")
+            config = topk_output.topk_config
+            top_k = config.top_k
+            moe_call = trtllm_fp4_block_scale_moe
+            routing = dict(
+                routing_logits=topk_output.router_logits,
+                routing_bias=config.correction_bias,
+                routing_method_type=int(self._bypassed_routing_method),
+                norm_topk_prob=config.renormalize,
+                n_group=config.num_expert_group,
+                topk_group=config.topk_group,
+                routed_scaling_factor=(
+                    config.routed_scaling_factor
+                    if config.apply_routed_scaling_factor_on_output
+                    and config.routed_scaling_factor is not None
+                    else 1.0
+                ),
+            )
+        else:
             raise ValueError(f"Unsupported topk output format: {topk_output.format}")
-
-        topk_ids = topk_output.topk_ids
-        topk_weights = topk_output.topk_weights
 
         precision = self.flashinfer_mxfp4_moe_precision
         input_ready: Optional[torch.cuda.Event] = None
@@ -415,11 +469,14 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         # Deferred finalize returns the permuted GEMM2 output plus the routing
         # triple instead of the finalized [T, hidden] tensor.
         defer_finalize = is_deferred_finalize_enabled()
+        # FlashInfer keys its tactic cache on the output shape. At <= 32 rows the tuned
+        # tactic measured slower on real routing, so those keep the (M, 0) key.
+        if envs.SGLANG_OPT_MXFP4_DEFERRED_FINALIZED_SHAPE.get():
+            deferred_output_shape = num_tokens > 32
+        else:
+            deferred_output_shape = 96 < num_tokens <= 384
         symm_output = None
-        # Preserve the ordinary output shape in the medium-batch autotuner
-        # cache key. The deferred ABI ignores this allocation and returns the
-        # expanded GEMM output for the separate fused finalize epilogue.
-        if not defer_finalize or 96 < num_tokens <= 384:
+        if not defer_finalize or deferred_output_shape:
             with use_symmetric_memory(
                 get_parallel().tp_group, disabled=not is_allocation_symmetric()
             ):
@@ -439,9 +496,8 @@ class Mxfp4FlashinferTrtllmMoEMethod:
             # The op launches the routing kernel, so the join must precede it.
             torch.cuda.current_stream().wait_event(input_ready)
 
-        result = trtllm_fp4_block_scale_routed_moe(
-            topk_ids=(topk_ids, topk_weights),
-            routing_bias=None,
+        result = moe_call(
+            **routing,
             hidden_states=x_quant,
             hidden_states_scale=x_scale,
             gemm1_weights=w13,
@@ -457,21 +513,17 @@ class Mxfp4FlashinferTrtllmMoEMethod:
             output1_scale_gate_scalar=layer.output1_scale_gate_scalar,
             output2_scale_scalar=layer.output2_scale_scalar,
             num_experts=layer.num_experts,
-            top_k=topk_ids.shape[1],
-            n_group=1,
-            topk_group=1,
+            top_k=top_k,
             intermediate_size=intermediate_size,
             local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
             local_num_experts=num_local_experts,
-            routed_scaling_factor=1.0,
-            routing_method_type=int(RoutingMethodType.TopK),
             do_finalize=not defer_finalize,
             tune_max_num_tokens=next_power_of_2(num_tokens),
             output=symm_output,
             enable_pdl=trtllm_moe_enable_pdl(num_tokens),
         )
         if defer_finalize:
-            output = _make_deferred_finalize_output(result, top_k=topk_ids.shape[1])
+            output = _make_deferred_finalize_output(result, top_k=top_k)
         else:
             output = result[0]
 
@@ -519,82 +571,69 @@ def maybe_fuse_routed_scale_and_shared_add(
     return routed
 
 
-# Fused finalize + shared add + TP all-reduce
-_fused_finalize_all_reduce_world_size: Optional[int] = None
-_fused_finalize_all_reduce_probed = False
-_fused_finalize_all_reduce_comm = None
+# Fused finalize + shared add + TP all-reduce, staged through a CustomAllReduceV2
+# push plane: the TP group's own, or a dedicated push-only one.
+
+_fused_all_reduce_comm = None
 
 
-def _fused_finalize_all_reduce_comm_world_size() -> Optional[int]:
-    """Reserve a separate push plane for up to 384 rows of fused MoE output."""
-    global _fused_finalize_all_reduce_world_size, _fused_finalize_all_reduce_probed
-    global _fused_finalize_all_reduce_comm
-    if not _fused_finalize_all_reduce_probed:
-        # The eager warmup must initialize peer workspaces before capture.
-        if torch.cuda.is_current_stream_capturing():
-            return None
-        _fused_finalize_all_reduce_probed = True
-        from sglang.kernels.ops.communication import all_reduce_fusion
-        from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
-            CustomAllReduceV2,
+def register_fused_all_reduce_comm(
+    *, max_push_size: Optional[int] = None, max_push_blocks: Optional[int] = None
+) -> None:
+    """Hand a push plane to the fusion kernels, once per process: the TP group's
+    own, or with ``max_push_size`` a dedicated push-only plane of that slot size
+    and ``max_push_blocks`` row counters. Must run before graph capture;
+    unregistered means everything runs unfused."""
+    global _fused_all_reduce_comm
+    if _fused_all_reduce_comm is not None:
+        return
+    from sglang.kernels.ops.communication import all_reduce_fusion
+    from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
+        CustomAllReduceV2,
+    )
+
+    comm = get_parallel().tp_group.ca_comm
+    if (
+        isinstance(comm, CustomAllReduceV2)
+        and not comm.disabled
+        and max_push_size is not None
+    ):
+        from sglang.srt.distributed.comm_cleanup import register_comm_cleanup
+
+        comm = CustomAllReduceV2(
+            comm.group,
+            comm.device,
+            max_pull_size=0,
+            max_pull_blocks=0,
+            max_push_size=max_push_size,
+            max_push_blocks=max_push_blocks,
+        )
+        register_comm_cleanup(comm)
+    if isinstance(comm, CustomAllReduceV2) and not comm.disabled:
+        all_reduce_fusion.register_comm(comm.obj)
+        _fused_all_reduce_comm = comm
+    else:
+        log_info_on_rank0(
+            logger,
+            "Fused MoE finalize: TP group has no "
+            "CustomAllReduceV2 push plane; keeping the unfused finalize path",
         )
 
-        ca_comm = get_parallel().tp_group.ca_comm
-        if isinstance(ca_comm, CustomAllReduceV2) and not ca_comm.disabled:
-            fused_comm = ca_comm
-            if ca_comm.world_size == 4:
-                from sglang.kernels.ops.communication.mp import register_comm_cleanup
 
-                fused_comm = CustomAllReduceV2(
-                    ca_comm.group,
-                    ca_comm.device,
-                    max_pull_size=0,
-                    max_pull_blocks=0,
-                    max_push_size=4 * 1024 * 1024,
-                    max_push_blocks=512,
-                )
-                register_comm_cleanup(fused_comm)
-            if fused_comm.disabled:
-                return None
-            _fused_finalize_all_reduce_comm = fused_comm
-            all_reduce_fusion.register_comm(fused_comm.obj)
-            _fused_finalize_all_reduce_world_size = fused_comm.world_size
-        else:
-            log_info_on_rank0(
-                logger,
-                "Fused MoE finalize: TP group has no "
-                "CustomAllReduceV2 push plane; keeping the unfused finalize path",
-            )
-    return _fused_finalize_all_reduce_world_size
+def can_fuse_all_reduce(num_tokens: int, hidden_dim: int) -> bool:
+    """Whether the registered push plane can stage ``[num_tokens, hidden_dim]``
+    BF16 rows: one slot holds them and each row owns a push phase counter. The
+    384 ceiling is the bench-validated range of the fused collective family.
 
-
-def should_use_fuse_finalize_all_reduce(
-    experts, num_tokens: int, hidden_dim: int
-) -> bool:
-    """Capability only; the batch-size policy cap lives at the call site. The
-    kernel never rescales, so the expert weights must carry the routed scaling."""
-    if not isinstance(experts.quant_method, Mxfp4FlashinferTrtllmMoEMethod):
-        return False
-    if experts.quant_method.flashinfer_mxfp4_moe_precision != "default":
-        return False
-    if not experts.should_fuse_routed_scaling_factor_in_topk:
-        return False
-    if num_tokens <= 0:
-        return False
-    if num_tokens > 96:
-        from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
-
-        if is_batch_invariant_mode_enabled():
-            return False
+    The deferred-finalize handle type carries its own numeric contract (every
+    producer folds the routed scaling; no consumer rescales)."""
     from sglang.kernels.ops.communication import all_reduce_fusion
 
-    if not all_reduce_fusion.valid_cluster_sizes(hidden_dim):
+    comm = _fused_all_reduce_comm
+    if comm is None or comm.world_size != get_parallel().tp_size:
         return False
-    tp_group = get_parallel().tp_group
-    if _fused_finalize_all_reduce_comm_world_size() != tp_group.world_size:
-        return False
-    comm = _fused_finalize_all_reduce_comm
-    # Each token row owns a push phase counter on the epilogue's plane.
-    if num_tokens > comm.config.num_push_blocks:
-        return False
-    return all_reduce_fusion.fits_push_slot(comm.max_push_size, num_tokens, hidden_dim)
+    return (
+        num_tokens <= 384
+        and num_tokens <= comm.config.num_push_blocks
+        and all_reduce_fusion.fits_push_slot(comm.max_push_size, num_tokens, hidden_dim)
+    )

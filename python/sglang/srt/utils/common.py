@@ -51,6 +51,7 @@ import warnings
 from array import array
 from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
+from ctypes import byref
 from dataclasses import dataclass
 from decimal import Decimal
 from functools import lru_cache, partial
@@ -69,7 +70,6 @@ from typing import (
     Generic,
     Iterator,
     List,
-    NamedTuple,
     Optional,
     Protocol,
     Sequence,
@@ -101,13 +101,16 @@ from sglang.srt.environ import envs
 from sglang.srt.observability.func_timer import enable_func_timer
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
+    describe_kv_events_publisher,
     get_exec,
     get_flags,
     get_model,
     get_parallel,
     get_platform,
+    get_serving,
     get_spec,
 )
+from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.video_decoder import _BACKEND, VideoDecoderWrapper
 
 if TYPE_CHECKING:
@@ -136,7 +139,7 @@ torch_release = pkg_version.parse(torch.__version__).release
 # https://pytorch.org/docs/stable/notes/hip.html#checking-for-hip
 @lru_cache(maxsize=1)
 def is_hip() -> bool:
-    return torch.version.hip is not None
+    return torch.version.hip is not None and torch.cuda.is_available()
 
 
 if is_hip():
@@ -158,7 +161,7 @@ def is_cuda():
 
 @lru_cache(maxsize=1)
 def is_cuda_alike():
-    return is_cuda() or is_hip()
+    return is_cuda() or is_hip() or is_sail()
 
 
 @lru_cache(maxsize=1)
@@ -195,29 +198,34 @@ def is_npu() -> bool:
     return True
 
 
+# Cache host CPU capability checks at import time to prevent TorchDynamo
+# from graph-breaking on `torch.cpu.is_available()` (torch op returning non-Tensor).
+_IS_HOST_CPU_X86 = (
+    platform.machine().lower() in ("x86_64", "amd64", "i386", "i686")
+    and hasattr(torch, "cpu")
+    and torch.cpu.is_available()
+)
+_IS_HOST_CPU_ARM64 = (
+    platform.machine().lower() in ("aarch64", "arm64")
+    and hasattr(torch, "cpu")
+    and torch.cpu.is_available()
+)
+
+
 @lru_cache(maxsize=1)
 def is_host_cpu_x86() -> bool:
-    machine = platform.machine().lower()
-    return (
-        machine in ("x86_64", "amd64", "i386", "i686")
-        and hasattr(torch, "cpu")
-        and torch.cpu.is_available()
-    )
+    return _IS_HOST_CPU_X86
 
 
 def is_host_cpu_arm64() -> bool:
-    machine = platform.machine().lower()
-    return (
-        machine in ("aarch64", "arm64")
-        and hasattr(torch, "cpu")
-        and torch.cpu.is_available()
-    )
+    return _IS_HOST_CPU_ARM64
 
 
 @lru_cache(maxsize=1)
 def is_cpu() -> bool:
-    is_host_cpu_supported = is_host_cpu_x86() or is_host_cpu_arm64()
-    return os.getenv("SGLANG_USE_CPU_ENGINE", "0") == "1" and is_host_cpu_supported
+    if os.getenv("SGLANG_USE_CPU_ENGINE", "0") != "1":
+        return False
+    return is_host_cpu_x86() or is_host_cpu_arm64()
 
 
 @lru_cache(maxsize=1)
@@ -232,8 +240,18 @@ def is_musa() -> bool:
 
 
 @lru_cache(maxsize=1)
+def is_mlu() -> bool:
+    return hasattr(torch, "mlu") and torch.mlu.is_available()
+
+
+@lru_cache(maxsize=1)
 def is_mps() -> bool:
-    return torch.backends.mps.is_available()
+    return hasattr(torch, "mps") and torch.mps.is_available()
+
+
+@lru_cache(maxsize=1)
+def is_sail() -> bool:
+    return torch.cuda.is_available() and "ZW" in torch.cuda.get_device_name()
 
 
 def is_float4_e2m1fn_x2(dtype) -> bool:
@@ -275,11 +293,6 @@ def _check_cuda_device_version(
     )
 
 
-is_ampere_with_cuda_12_3 = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version, device_capability_majors=[8], cuda_version=(12, 3)
-    )
-)
 is_hopper_with_cuda_12_3 = lru_cache(maxsize=1)(
     partial(
         _check_cuda_device_version, device_capability_majors=[9], cuda_version=(12, 3)
@@ -309,6 +322,11 @@ is_sm100_or_sm110_supported = lru_cache(maxsize=1)(
         _check_cuda_device_version,
         device_capability_majors=[10, 11],
         cuda_version=(12, 8),
+    )
+)
+is_sm110_supported = lru_cache(maxsize=1)(
+    partial(
+        _check_cuda_device_version, device_capability_majors=[11], cuda_version=(12, 8)
     )
 )
 is_sm80_supported = lru_cache(maxsize=1)(
@@ -381,18 +399,6 @@ def is_flashinfer_available():
     return importlib.util.find_spec("flashinfer") is not None and is_cuda()
 
 
-@lru_cache(maxsize=1)
-def is_tokenspeed_mla_available():
-    """
-    Check whether the tokenspeed_mla CuTe DSL kernels are available.
-    Only available on NVIDIA Blackwell (SM100) at the moment.
-    """
-    return (
-        importlib.util.find_spec("tokenspeed_mla") is not None
-        and is_blackwell_supported()
-    )
-
-
 def is_nvidia_cublas_version_ge_12_9():
     """
     temporary fix for issue #11272 (cublas 12.9+)
@@ -453,6 +459,22 @@ def get_available_gpu_memory(
         else:
             free_gpu_memory, _ = torch.cuda.mem_get_info(gpu_id)
 
+    elif device == "mlu":
+        num_gpus = torch.mlu.device_count()
+        assert gpu_id < num_gpus
+
+        if torch.mlu.current_device() != gpu_id:
+            logger.warning(
+                "current device is not %s, but %s, which may cause useless "
+                "memory allocation for torch MLU context.",
+                gpu_id,
+                torch.mlu.current_device(),
+            )
+
+        if empty_cache:
+            empty_device_cache(torch.mlu)
+        free_gpu_memory, _ = torch.mlu.mem_get_info(gpu_id)
+
     elif device == "xpu":
         num_gpus = torch.xpu.device_count()
         assert gpu_id < num_gpus
@@ -487,9 +509,9 @@ def get_available_gpu_memory(
 
     elif device == "cpu":
         # TODO: rename the variables in the current function to be not GPU specific
-        total_free_memory = psutil.virtual_memory().available
-        n_numa_node: int = len(get_cpu_ids_by_node())
-        free_gpu_memory = round(total_free_memory / n_numa_node, 3)
+        total_free_memory = get_free_cpu_memory()
+        n_node = len(get_cpu_ids_by_node()) or 1
+        free_gpu_memory = round(total_free_memory / n_node, 3)
     elif device == "npu":
         num_gpus = torch.npu.device_count()
         assert gpu_id < num_gpus
@@ -533,9 +555,26 @@ def get_available_gpu_memory(
             # available due to not including cache memory. So we use the system available
             # memory metric instead.
             free_gpu_memory = psutil.virtual_memory().available
-        free_gpu_memory, total_gpu_memory = torch.musa.mem_get_info()
+        else:
+            free_gpu_memory, _ = torch.musa.mem_get_info(gpu_id)
     elif device == "mps":
-        free_gpu_memory = psutil.virtual_memory().available
+        from sglang.srt.hardware_backend.mlx.runtime import use_mlx
+
+        num_gpus = torch.mps.device_count()
+        assert gpu_id < num_gpus
+
+        if use_mlx():
+            # Torch's allocator does not track MLX Metal allocations.
+            free_gpu_memory = psutil.virtual_memory().available
+        else:
+            if empty_cache:
+                empty_device_cache(torch.mps)
+            # Bound free memory by host RAM and Metal's working-set limit.
+            total_gpu_memory = torch.mps.recommended_max_memory()
+            metal_headroom = max(
+                0, total_gpu_memory - torch.mps.driver_allocated_memory()
+            )
+            free_gpu_memory = min(psutil.virtual_memory().available, metal_headroom)
     else:
         if not current_platform.is_out_of_tree():
             raise ValueError(
@@ -558,16 +597,43 @@ def get_available_gpu_memory(
 
 
 def is_pin_memory_available(device=None) -> bool:
+    # Under NVIDIA Confidential Computing host<->device copies go through a
+    # bounce buffer, so host staging is pageable there.
+    if is_confidential_compute():
+        return False
     return current_platform.is_pin_memory_available(device)
 
 
+def async_h2d(args: List, *, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    """A host list on ``device``; staged in pinned memory so the copy is enqueued
+    on the current stream instead of synchronizing like a pageable copy."""
+    pin = is_pin_memory_available(device)
+    return torch.tensor(args, dtype=dtype, pin_memory=pin).to(device, non_blocking=pin)
+
+
+def async_h2d_stack(
+    tensors: List[torch.Tensor], *, device: torch.device
+) -> torch.Tensor:
+    """``torch.stack(tensors)`` on ``device``; host tensors are stacked straight
+    into pinned memory and copied like ``async_h2d``."""
+    if not tensors[0].is_cpu:
+        return torch.stack(tensors).to(device)
+    pin = is_pin_memory_available(device)
+    out = torch.empty(
+        (len(tensors), *tensors[0].shape), dtype=tensors[0].dtype, pin_memory=pin
+    )
+    return torch.stack(tensors, out=out).to(device, non_blocking=pin)
+
+
 def async_d2h(tensor: torch.Tensor) -> torch.Tensor:
-    """Enqueue a CUDA-to-pinned-host copy on the current stream."""
-    if not tensor.is_cuda:
-        return tensor.to("cpu", non_blocking=True)
+    """Enqueue an accelerator-to-pinned-host copy on the current stream."""
+    if tensor.device.type == "cpu":
+        return tensor
+    if not is_pin_memory_available(tensor.device):
+        return tensor.to("cpu")
     host = torch.empty(tensor.shape, dtype=tensor.dtype, pin_memory=True)
     host.copy_(tensor, non_blocking=True)
-    tensor.record_stream(torch.cuda.current_stream(tensor.device))
+    tensor.record_stream(torch.get_device_module(tensor.device).current_stream())
     return host
 
 
@@ -595,7 +661,12 @@ def get_device_module():
         return torch.xpu
     if is_musa():
         return torch.musa
-    return torch.get_device_module()
+    # From torch 2.14, a bare torch.get_device_module() is torch.cuda on a CUDA wheel
+    # even with no usable device; require an available accelerator instead.
+    accelerator = torch.accelerator.current_accelerator(check_available=True)
+    if accelerator is None:
+        return torch.cpu
+    return torch.get_device_module(accelerator)
 
 
 def create_device_stream(device):
@@ -612,13 +683,20 @@ def device_stream_context(stream):
 
 def is_device_stream_capturing(device: torch.device) -> bool:
     """Whether ``device``'s current stream is mid graph capture (False if unsupported)."""
-    # Every platform answering support_cuda_graph() already calls
-    # device_module.is_current_stream_capturing() during capture, so it cannot be missing.
-    if device.type != current_platform.device_type:
+    # Every platform declaring capabilities.graph_capture calls
+    # device_module.is_current_stream_capturing() during capture, except CPU,
+    # whose graph runner compiles instead of capturing a stream.
+    if device.type != current_platform.device_type or device.type == "cpu":
         return False
-    if not current_platform.support_cuda_graph():
+    if not current_platform.capabilities.graph_capture:
         return False
     return torch.get_device_module(device).is_current_stream_capturing()
+
+
+def create_device_event(device):
+    if not isinstance(device, torch.device):
+        device = torch.device(device)
+    return torch.get_device_module(device).Event()
 
 
 def get_amdgpu_memory_capacity():
@@ -822,35 +900,57 @@ def get_npu_memory_capacity():
         raise ImportError("torch_npu is required when run on npu device.")
 
 
+def get_instance_memory_status(cgroup_file: str) -> Optional[int]:
+    try:
+        with open(cgroup_file, "r") as f:
+            content = f.read().strip()
+            # "max" or other non memory size content will be skipped
+            if not content.isdigit():
+                raise ValueError
+
+            return int(content)
+    except (PermissionError, FileNotFoundError, ValueError):
+        return None
+
+
+def get_free_cpu_memory() -> int:
+    free_cpu_memory = psutil.virtual_memory().available
+    instance_max_cpu_memory = get_instance_memory_status("/sys/fs/cgroup/memory.max")
+    instance_current_cpu_memory = get_instance_memory_status(
+        "/sys/fs/cgroup/memory.current"
+    )
+    if instance_max_cpu_memory is not None and instance_current_cpu_memory is not None:
+        instance_free_cpu_memory = max(
+            0, instance_max_cpu_memory - instance_current_cpu_memory
+        )
+        free_cpu_memory = min(free_cpu_memory, instance_free_cpu_memory)
+
+    return free_cpu_memory
+
+
+def get_mlu_memory_capacity():
+    if not is_mlu():
+        raise RuntimeError("MLU device is not available.")
+    return torch.mlu.mem_get_info()[1] // 1024 // 1024  # unit: MB
+
+
 def get_cpu_memory_capacity():
     # Per-rank memory capacity cannot be determined for customized core settings
     if os.environ.get("SGLANG_CPU_OMP_THREADS_BIND", ""):
+        logger.warning(
+            "SGLANG_CPU_OMP_THREADS_BIND is set for explicit control of CPU cores for each TP rank."
+            "Please beware that in this case the available memory amounts of the ranks cannot be determined in prior."
+            "You need to set proper --max-total-tokens to avoid the out-of-memory error."
+        )
         return None
-    n_numa_node: int = len(get_cpu_ids_by_node())
-    if n_numa_node == 0:
-        # Cannot determine NUMA config, fallback to total memory and avoid ZeroDivisionError.
-        return float(psutil.virtual_memory().total // (1 << 20))
-    try:
-        numa_mem_list = list()
-        file_prefix = "/sys/devices/system/node/"
-        for numa_id in range(n_numa_node):
-            file_meminfo = f"node{numa_id}/meminfo"
-            with open(os.path.join(file_prefix, file_meminfo), "r") as f:
-                # MemTotal info is at the 1st line
-                line = f.readline()
-                # Expected format: "Node 0 MemTotal:       100000000 kB"
-                parts = line.split()
-                if len(parts) >= 4 and parts[2] == "MemTotal:":
-                    numa_mem_list.append(int(parts[3]))
-                else:
-                    raise ValueError(f"Unexpected format in {file_meminfo}: {line}")
-        # Retrieved value in KB, need MB
-        numa_mem = float(min(numa_mem_list) // 1024)
-        return numa_mem
-    except (FileNotFoundError, ValueError, IndexError):
-        numa_mem = psutil.virtual_memory().total / n_numa_node
-        # Retrieved value in Byte, need MB
-        return float(numa_mem // (1 << 20))
+    n_node = len(get_cpu_ids_by_node()) or 1
+    total_cpu_memory = psutil.virtual_memory().total
+    instance_max_cpu_memory = get_instance_memory_status("/sys/fs/cgroup/memory.max")
+    if instance_max_cpu_memory is not None:
+        total_cpu_memory = min(total_cpu_memory, instance_max_cpu_memory)
+    per_node_mem = total_cpu_memory / n_node
+    # Retrieved value in Byte, need MB
+    return float(per_node_mem // (1 << 20))
 
 
 def get_xpu_memory_capacity():
@@ -860,6 +960,16 @@ def get_xpu_memory_capacity():
         raise ValueError("No GPU memory values found.")
     except AttributeError:
         raise RuntimeError("torch.xpu is not available.")
+
+
+def get_mps_memory_capacity():
+    # Metal's working-set limit is smaller than unified system RAM.
+    try:
+        if torch.mps.is_available():
+            return torch.mps.recommended_max_memory() // 1024 // 1024  # unit: MB
+        raise ValueError("No GPU memory values found.")
+    except AttributeError:
+        raise RuntimeError("torch.mps is not available.")
 
 
 def get_mtgpu_memory_capacity():
@@ -914,6 +1024,8 @@ def get_device_memory_capacity(device: str = None):
         gpu_mem = get_nvgpu_memory_capacity()
     elif is_hip():
         gpu_mem = get_amdgpu_memory_capacity()
+    elif device == "mps":
+        gpu_mem = get_mps_memory_capacity()
     elif device == "hpu":
         gpu_mem = get_hpu_memory_capacity()
     elif device == "npu":
@@ -924,6 +1036,8 @@ def get_device_memory_capacity(device: str = None):
         gpu_mem = get_xpu_memory_capacity()
     elif device == "musa":
         gpu_mem = get_mtgpu_memory_capacity()
+    elif device == "mlu":
+        gpu_mem = get_mlu_memory_capacity()
     else:
         # GPU memory is not known yet or no GPU is available.
         gpu_mem = None
@@ -932,6 +1046,12 @@ def get_device_memory_capacity(device: str = None):
 
 
 def get_device_name(device_id: int = 0) -> str:
+    if hasattr(torch, "mps") and torch.mps.is_available():
+        return torch.backends.mps.get_name()
+
+    if is_mlu():
+        return torch.mlu.get_device_name(device_id)
+
     if (hasattr(torch, "cuda") and torch.cuda.is_available()) or is_musa():
         return torch.cuda.get_device_name(device_id)
 
@@ -947,14 +1067,21 @@ def get_device_name(device_id: int = 0) -> str:
 
 @lru_cache(maxsize=1)
 def is_mnnvl_fabric_device() -> bool:
-    """Whether the GPU sits on an MNNVL fabric (cross-node NVLink), keyed on
-    the device name: the GB200/GB300 superchips. Used to auto-select
-    fabric-dependent communication paths (NCCL cuMem/MNNVL, custom all-reduce
-    v2 multinode, DCP fi_a2a)."""
+    """Whether the GPU sits on an MNNVL fabric (cross-node NVLink). Used to
+    auto-select fabric-dependent communication paths (NCCL cuMem/MNNVL, custom
+    all-reduce v2 multinode, DCP fi_a2a).
+
+    The GB200/GB300 superchips are recognized by device name. Other NVLink
+    fabric parts (SM107 systems report a generic device name) are recognized
+    by NVML: the GPU has completed NVLink fabric registration."""
     if not (hasattr(torch, "cuda") and torch.cuda.is_available()):
         return False
     name = (torch.cuda.get_device_name(0) or "").upper()
-    return any(tag in name for tag in ("GB200", "GB300"))
+    if any(tag in name for tag in ("GB200", "GB300")):
+        return True
+    from sglang.srt.utils.cuda_vmm_utils import is_gpu_fabric_ready
+
+    return is_gpu_fabric_ready(torch.device("cuda", 0))
 
 
 def is_fi_a2a_supported(
@@ -983,6 +1110,11 @@ def get_device(device_id: Optional[int] = None) -> str:
                 "CPU device enabled, using torch native backend, low performance expected."
             )
         return "cpu"
+
+    if is_mlu():
+        if device_id is None:
+            return "mlu"
+        return "mlu:{}".format(device_id)
 
     if hasattr(torch, "cuda") and torch.cuda.is_available():
         if device_id is None:
@@ -1026,12 +1158,24 @@ def get_device(device_id: Optional[int] = None) -> str:
         return current_platform.get_device(device_id)
     except Exception:
         raise RuntimeError(
-            "No accelerator (CUDA, XPU, HPU, NPU, MUSA, MPS) or platform plugin is available."
+            "No accelerator (CUDA, XPU, HPU, NPU, MUSA, MPS, MLU) or platform plugin is available."
         )
 
 
 @lru_cache(maxsize=1)
 def get_device_count() -> int:
+    if hasattr(torch, "mps") and torch.mps.is_available():
+        try:
+            return torch.mps.device_count()
+        except RuntimeError:
+            return 0
+
+    if is_mlu():
+        try:
+            return torch.mlu.device_count()
+        except RuntimeError:
+            return 0
+
     if (hasattr(torch, "cuda") and torch.cuda.is_available()) or is_musa():
         try:
             return torch.cuda.device_count()
@@ -1096,6 +1240,10 @@ def get_compiler_backend(mode=None) -> str:
     if current_platform.is_out_of_tree():
         return current_platform.get_compile_backend(mode)
 
+    if hasattr(torch, "mps") and torch.mps.is_available():
+        # MPS has no SGLang graph runner.
+        return "eager"
+
     if hasattr(torch, "hpu") and torch.hpu.is_available():
         return "hpu_backend"
 
@@ -1135,7 +1283,7 @@ def is_gfx95_supported():
 
     False on every non-HIP build, so callers do not need their own is_hip().
     """
-    if torch.version.hip:
+    if is_hip():
         gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
         return any(gfx in gcn_arch for gfx in ["gfx95"])
     else:
@@ -1147,9 +1295,21 @@ def is_gfx942_supported():
     """
     Returns whether the current platform is AMD CDNA3 (gfx942 — MI300X / MI325X).
     """
-    if torch.version.hip:
+    if is_hip():
         gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
         return any(gfx in gcn_arch for gfx in ["gfx942"])
+    else:
+        return False
+
+
+@lru_cache(maxsize=1)
+def is_gfx115_supported():
+    """
+    Returns whether the current platform is AMD RDNA3.5 (gfx115x, e.g. gfx1150, gfx1151).
+    """
+    if torch.version.hip and torch.cuda.is_available():
+        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
+        return gcn_arch.startswith("gfx115")
     else:
         return False
 
@@ -1159,7 +1319,7 @@ def is_gfx1250_supported():
     """
     Returns whether the current platform is AMD RDNA4 (gfx1250).
     """
-    if torch.version.hip:
+    if is_hip():
         gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
         return any(gfx in gcn_arch for gfx in ["gfx1250"])
     else:
@@ -1226,29 +1386,6 @@ def get_cuda_driver_bindings():
     return cuda_driver
 
 
-def get_device_sm_nvidia_smi():
-    try:
-        # Run nvidia-smi command and capture output
-        result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-
-        # Get the first line of output (assuming at least one GPU exists)
-        compute_cap_str = result.stdout.strip().split("\n")[0]
-
-        # Convert string (e.g., "9.0") to tuple of integers (9, 0)
-        major, minor = map(int, compute_cap_str.split("."))
-        return (major, minor)
-
-    except (subprocess.CalledProcessError, FileNotFoundError, ValueError) as e:
-        # Handle cases where nvidia-smi isn't available or output is unexpected
-        logger.error("Error getting compute capability: %s", e)
-        return (0, 0)  # Default/fallback value
-
-
 @contextmanager
 def maybe_reindex_device_id(gpu_id: int) -> Iterator[int]:
     if not envs.SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS.get():
@@ -1272,15 +1409,6 @@ def get_current_device_stream_fast():
 # ==============================================================================
 # END: Multi-Device & CUDA Version Utilities
 # ==============================================================================
-
-
-class Range(NamedTuple):
-    start: int
-    end: int
-
-    @property
-    def length(self) -> int:
-        return self.end - self.start
 
 
 def assert_int64_array(values: array, name: str) -> None:
@@ -1385,7 +1513,10 @@ def temp_set_env(*, allow_sglang: bool = False, **env_vars: Any):
 
 
 def support_triton(backend: str) -> bool:
-    return backend not in ["torch_native", "intel_amx"]
+    return current_platform.capabilities.supports_triton and backend not in [
+        "torch_native",
+        "intel_amx",
+    ]
 
 
 _ENABLE_TORCH_INFERENCE_MODE = get_bool_env_var(
@@ -1508,10 +1639,27 @@ def make_layers(
     prefix: str = "",
     return_tuple: bool = False,
     offloader_kwargs: Optional[Dict[str, Any]] = None,
+    final_read: Optional[Any] = None,
+    stage_facts: Optional[Callable[[int], Sequence[Any]]] = None,
 ) -> Tuple[torch.nn.Module, int, int]:
-    """Make a list of layers with the given layer function"""
+    """Make a list of layers with the given layer function.
+
+    The local layers are built inside one layer stack, so layers that declare
+    stage boundaries connect in order without naming their neighbours. Across
+    a pipeline stage boundary the stack learns the neighbouring stage from
+    ``stage_facts``: the model's shared declaration function, which returns
+    the stages the layer at a global index declares without building it (an
+    empty sequence when it declares none), and which the layer itself uses
+    for its own declarations. A model whose layers declare stages must give
+    it to run under pipeline parallelism. ``final_read`` is the stack's
+    terminal read when it is not a plain final norm (see layer_stack).
+    """
     # circular imports
     from sglang.srt.distributed import get_pp_indices
+    from sglang.srt.layers.layer_boundary.factories import (
+        check_declared_stages,
+        layer_stack,
+    )
     from sglang.srt.layers.utils import PPMissingLayer
     from sglang.srt.utils.offloader import get_offloader
 
@@ -1525,20 +1673,36 @@ def make_layers(
         if pp_rank is not None and pp_size is not None
         else (0, num_hidden_layers)
     )
-    modules = torch.nn.ModuleList(
-        [PPMissingLayer(return_tuple=return_tuple) for _ in range(start_layer)]
-        + get_offloader().wrap_modules(
-            (
-                layer_fn(idx=idx, prefix=add_prefix(idx, prefix))
-                for idx in range(start_layer, end_layer)
-            ),
-            **(offloader_kwargs or {}),
+
+    def neighbour(idx):
+        if stage_facts is not None:
+            return functools.partial(stage_facts, idx)
+        return functools.partial(_no_stage_facts, layer_fn)
+
+    def build(stack, idx):
+        appended = len(stack.appends)
+        layer = layer_fn(idx=idx, prefix=add_prefix(idx, prefix))
+        if stage_facts is not None and (pp_size or 1) > 1:
+            # Another rank binds this layer's stages from stage_facts alone.
+            check_declared_stages(stack, appended, stage_facts(idx), f"layer {idx}")
+        return layer
+
+    with layer_stack(
+        previous_layers=[neighbour(idx) for idx in reversed(range(start_layer))],
+        next_layers=[neighbour(idx) for idx in range(end_layer, num_hidden_layers)],
+        final_read=final_read,
+    ) as stack:
+        modules = torch.nn.ModuleList(
+            [PPMissingLayer(return_tuple=return_tuple) for _ in range(start_layer)]
+            + get_offloader().wrap_modules(
+                (build(stack, idx) for idx in range(start_layer, end_layer)),
+                **(offloader_kwargs or {}),
+            )
+            + [
+                PPMissingLayer(return_tuple=return_tuple)
+                for _ in range(end_layer, num_hidden_layers)
+            ]
         )
-        + [
-            PPMissingLayer(return_tuple=return_tuple)
-            for _ in range(end_layer, num_hidden_layers)
-        ]
-    )
     if pp_rank is None or pp_size is None:
         return modules
     return modules, start_layer, end_layer
@@ -1550,10 +1714,13 @@ def make_pp_layers(
     prefix: str = "",
     return_tuple: bool = False,
     offloader_kwargs: Optional[Dict[str, Any]] = None,
+    final_read: Optional[Any] = None,
+    stage_facts: Optional[Callable[[int], Sequence[Any]]] = None,
 ) -> Tuple[torch.nn.Module, int, int]:
     """Make this pipeline stage's layers, and return them with the stage's range.
 
     Layers outside ``[start_layer, end_layer)`` are ``PPMissingLayer`` stand-ins.
+    ``stage_facts`` is the model's shared declaration function (see make_layers).
     """
     parallel = get_parallel()
     return make_layers(
@@ -1564,6 +1731,19 @@ def make_pp_layers(
         prefix=prefix,
         return_tuple=return_tuple,
         offloader_kwargs=offloader_kwargs,
+        final_read=final_read,
+        stage_facts=stage_facts,
+    )
+
+
+def _no_stage_facts(layer_fn: LayerFn) -> None:
+    """Stands in for the shared declaration function of a model that gives
+    none: called only if this pipeline rank's layers declare stages."""
+    module = getattr(getattr(layer_fn, "func", layer_fn), "__module__", None)
+    raise ValueError(
+        f"{module} declares stage boundaries under pipeline parallelism "
+        "without a shared declaration function: give make_layers its "
+        "stage_facts, the stages a layer declares without building it"
     )
 
 
@@ -1576,6 +1756,8 @@ def set_random_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
     if torch.xpu.is_available():
         torch.xpu.manual_seed_all(seed)
+    if is_mlu():
+        torch.mlu.manual_seed_all(seed)
 
 
 _mm_http_session = threading.local()
@@ -1748,9 +1930,12 @@ def get_mm_http_session() -> requests.Session:
 
 # Raised by the loaders below when client-supplied media cannot be fetched or
 # decoded. ValueError is in the set because invalid base64 raises binascii.Error.
+# Pillow raises DecompressionBombError from Image.open, before any decode, for an
+# image above twice Image.MAX_IMAGE_PIXELS; it subclasses Exception, not OSError.
 CLIENT_MEDIA_EXCEPTIONS = (
     ValueError,
     UnidentifiedImageError,
+    Image.DecompressionBombError,
     requests.exceptions.RequestException,
 )
 
@@ -1856,6 +2041,7 @@ class ImageData:
     max_dynamic_patch: Optional[int] = None
     preprocess_kwargs: Optional[Dict] = None
     content_hash: Optional[str] = None
+    max_long_side_pixel: Optional[int] = None
 
 
 GLM_MEDIA_CONFIG_KEYS = (
@@ -1870,6 +2056,7 @@ GLM_MEDIA_CONFIG_KEYS = (
 class VideoData:
     url: str
     preprocess_kwargs: Optional[Dict] = None
+    max_long_side_pixel: Optional[int] = None
 
 
 image_extension_names = (".png", ".jpg", ".jpeg", ".webp", ".gif")
@@ -2180,8 +2367,22 @@ def configure_hf_hub_logger():
 
 
 def suppress_noisy_warnings():
-    """Suppress known noisy warnings from third-party libraries."""
+    """Suppress known noisy third-party output: warnings, and the HF Hub and httpx loggers."""
     configure_hf_hub_logger()
+    filter_noisy_warnings()
+
+    # Suppress noisy third-party HTTP loggers.
+    # huggingface_hub uses httpx which logs every HTTP request at INFO level.
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
+def filter_noisy_warnings():
+    """Drop known noisy warnings from third-party libraries; logging is untouched.
+
+    pytest re-enables DeprecationWarning per test, so test/pytest.ini repeats
+    the DeprecationWarning entries below; keep the two in sync.
+    """
     warnings.filterwarnings(
         "ignore", category=UserWarning, message="The given NumPy array is not writable"
     )
@@ -2196,41 +2397,52 @@ def suppress_noisy_warnings():
         category=FutureWarning,
     )
 
-    # cutlass-dsl emits these inside `catch_warnings()+simplefilter("always")`,
-    # which bypasses filterwarnings; override showwarning to drop them too.
-    cutlass_dsl_noisy = {
+    # flashinfer and quack still import pre-4.8 cutlass-dsl paths. Matching only
+    # those packages keeps sglang's own uses of the old paths visible.
+    third_party = "flashinfer|quack"
+    # (category, message regex, emitting packages, or None for any)
+    noisy_warnings = [
         (
             DeprecationWarning,
-            "Using `struct.scalar` as pointer is deprecated.",
+            re.escape("Using `struct.scalar` as pointer is deprecated."),
+            None,
         ),
         (
             UserWarning,
-            "NamedBarrier wait also arrives on the barrier. "
-            "Routing call to NamedBarrier.arrive_and_wait().",
+            re.escape(
+                "NamedBarrier wait also arrives on the barrier. "
+                "Routing call to NamedBarrier.arrive_and_wait()."
+            ),
+            None,
         ),
-        (
-            DeprecationWarning,
-            "builtin type swigvarlink has no __module__ attribute",
-        ),
-    }
-    for cat, msg in cutlass_dsl_noisy:
-        warnings.filterwarnings("ignore", message=re.escape(msg), category=cat)
+        (DeprecationWarning, r"builtin type \w+ has no __module__ attribute", None),
+        (DeprecationWarning, r"cutlass\.\S+ is deprecated; use cutlass\.", third_party),
+        (DeprecationWarning, r"Arch from arch\.py is deprecated", third_party),
+    ]
+    for cat, message, packages in noisy_warnings:
+        module = rf"({packages})(\.|$)" if packages else ""
+        warnings.filterwarnings("ignore", message=message, category=cat, module=module)
 
-    if not getattr(warnings.showwarning, "_sglang_patched_cutlass_dsl", False):
+    # cutlass-dsl emits some of these inside `catch_warnings()+simplefilter("always")`,
+    # which bypasses filterwarnings; override showwarning to drop them too.
+    if not getattr(warnings.showwarning, "_sglang_noisy_warning_filter", False):
         prev_showwarning = warnings.showwarning
 
-        def _filtered_showwarning(message, category, *args, **kwargs):
-            if (category, str(message)) in cutlass_dsl_noisy:
-                return
-            prev_showwarning(message, category, *args, **kwargs)
+        def _filtered_showwarning(message, category, filename, *args, **kwargs):
+            for cat, pattern, packages in noisy_warnings:
+                if (
+                    issubclass(category, cat)
+                    and re.match(pattern, str(message))
+                    and (
+                        packages is None
+                        or re.search(rf"[/\\]({packages})[/\\]", filename)
+                    )
+                ):
+                    return
+            prev_showwarning(message, category, filename, *args, **kwargs)
 
-        _filtered_showwarning._sglang_patched_cutlass_dsl = True
+        _filtered_showwarning._sglang_noisy_warning_filter = True
         warnings.showwarning = _filtered_showwarning
-
-    # Suppress noisy third-party HTTP loggers.
-    # huggingface_hub uses httpx which logs every HTTP request at INFO level.
-    for name in ("httpx", "httpcore"):
-        logging.getLogger(name).setLevel(logging.WARNING)
 
 
 def suppress_other_loggers():
@@ -2702,111 +2914,6 @@ def add_prometheus_middleware(app):
     app.routes.append(metrics_route)
 
 
-class RefCountedGauge:
-    def __init__(self, gauge):
-        self._gauge = gauge
-        self._refcount: Dict[str, int] = {}
-
-    def inc(self, key: str):
-        if key in self._refcount:
-            self._refcount[key] += 1
-        else:
-            self._refcount[key] = 1
-            self._gauge.inc()
-
-    def dec(self, key: str):
-        if key in self._refcount:
-            self._refcount[key] -= 1
-            if self._refcount[key] == 0:
-                del self._refcount[key]
-                self._gauge.dec()
-
-
-def add_prometheus_track_response_middleware(
-    app, extra_labels: Optional[Dict[str, str]] = None
-):
-    from prometheus_client import Counter, Gauge
-
-    extra_labels = extra_labels or {}
-    extra_label_names = list(extra_labels.keys())
-
-    http_request_counter = Counter(
-        name="sglang:http_requests_total",
-        documentation="Total number of HTTP requests by endpoint and method",
-        labelnames=extra_label_names + ["endpoint", "method"],
-    )
-
-    http_response_counter = Counter(
-        name="sglang:http_responses_total",
-        documentation="Total number of HTTP responses by endpoint and status code",
-        labelnames=extra_label_names + ["endpoint", "status_code", "method"],
-    )
-
-    http_requests_active = Gauge(
-        name="sglang:http_requests_active",
-        documentation="Number of currently active HTTP requests",
-        labelnames=extra_label_names + ["endpoint", "method"],
-        multiprocess_mode="livesum",
-    )
-
-    routing_keys_active = RefCountedGauge(
-        Gauge(
-            name="sglang:routing_keys_active",
-            documentation="Number of unique routing keys with active requests",
-            multiprocess_mode="livesum",
-        )
-    )
-
-    # Fix: replace BaseHTTPMiddleware's call_next with a pure ASGI version
-    # that passes `receive` through, so request.is_disconnected() keeps working.
-    from sglang.srt.utils.http_middleware_patch import patch_app_http_middleware
-
-    patch_app_http_middleware(app)
-
-    @app.middleware("http")
-    async def track_http_status_code(request, call_next):
-        # With recording all requests, we have the risk of high cardinality if requests have arbitrary unhandled paths.
-        # But given that SGLang engines with metrics enabled are usually behind routers this looks safe.
-        path, is_handled_path = _get_fastapi_request_path(request)
-        method = request.method
-        routing_key = request.headers.get("x-smg-routing-key")
-
-        http_request_counter.labels(**extra_labels, endpoint=path, method=method).inc()
-        http_requests_active.labels(**extra_labels, endpoint=path, method=method).inc()
-        if routing_key:
-            routing_keys_active.inc(routing_key)
-
-        try:
-            response = await call_next(request)
-
-            http_response_counter.labels(
-                **extra_labels,
-                endpoint=path,
-                method=method,
-                status_code=str(response.status_code),
-            ).inc()
-
-            return response
-        finally:
-            http_requests_active.labels(
-                **extra_labels, endpoint=path, method=method
-            ).dec()
-            if routing_key:
-                routing_keys_active.dec(routing_key)
-
-
-# https://github.com/blueswen/fastapi-observability/blob/132a3c576f8b09e5311c68bd553215013bc75685/fastapi_app/utils.py#L98
-def _get_fastapi_request_path(request) -> Tuple[str, bool]:
-    from starlette.routing import Match
-
-    for route in request.app.routes:
-        match, child_scope = route.matches(request.scope)
-        if match == Match.FULL:
-            return getattr(route, "path", request.url.path), True
-
-    return request.url.path, False
-
-
 # Copy from pytorch and OpenRLHF to allow creating multiple main groups.
 # https://github.com/pytorch/pytorch/blob/main/torch/distributed/distributed_c10d.py
 # https://github.com/OpenRLHF/OpenRLHF/blob/main/openrlhf/utils/distributed_util.py
@@ -2952,13 +3059,16 @@ def direct_register_custom_op(
 
     try:
         my_lib.define(op_name + schema_str)
-        if is_npu():
+        if is_npu() or current_platform.is_out_of_tree():
             # https://github.com/sgl-project/sglang/pull/12287/files#r2499583982
+            # Out-of-tree devices are torch PrivateUse1 backends too.
             my_lib.impl(op_name, op_func, "PrivateUse1")
         elif is_xpu():
             my_lib.impl(op_name, op_func, "XPU")
         elif is_musa():
             my_lib.impl(op_name, op_func, "MUSA")
+        elif is_mlu():
+            my_lib.impl(op_name, op_func, "MLU")
         else:
             my_lib.impl(op_name, op_func, "CUDA")
         if fake_impl is not None:
@@ -3173,6 +3283,7 @@ class SafeUnpickler(pickle.Unpickler):
         ("torch", "Size"),
         ("torch", "device"),
         ("torch", "dtype"),
+        ("torch", "bcomplex32"),
         ("torch", "bfloat16"),
         ("torch", "bit"),
         ("torch", "bits16"),
@@ -3300,6 +3411,7 @@ class SafeUnpickler(pickle.Unpickler):
         ("sglang.srt.managers.io_struct", "EmbeddingReqInput"),
         ("sglang.srt.disaggregation.encoder.receiver", "EmbeddingData"),
         ("sglang.srt.managers.schedule_batch", "Modality"),
+        ("sglang.srt.multimodal.modality", "Modality"),
         ("sglang.srt.weight_sync.tensor_bucket", "FlattenedTensorMetadata"),
         ("sglang.srt.weight_sync.tensor_bucket", "FlattenedTensorBucket"),
         (
@@ -3532,15 +3644,83 @@ def _configure_uvicorn_access_log_filter(
             filters_list.append(filter_name)
 
 
+def build_server_info(server_args, scheduler_info: Dict[str, Any]) -> Dict[str, Any]:
+    """Build server metadata shared by HTTP and native gRPC.
+
+    Callers add transport-specific fields and serialize the result.
+    """
+    result = server_args.resolved_dict()
+    result["launch_command"] = server_args.launch_command
+    result.update(scheduler_info)
+    result["kv_events"] = describe_kv_events_publisher(server_args)
+    return result
+
+
+def build_model_info_fields(model_config, server_args) -> Dict[str, Any]:
+    """The `/model_info` fields that describe the loaded model: its
+    modalities, `model_type`, `architectures` and, when the model has an
+    embedding spec, its resolved embedding plan.
+
+    Shared by the HTTP server and the Rust frontend's launch configuration.
+    """
+    from sglang.srt.arg_groups.model_override_base import resolving_view
+    from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
+
+    result = {
+        "has_image_understanding": model_config.is_image_understandable_model,
+        "has_audio_understanding": model_config.is_audio_understandable_model,
+        "model_type": getattr(model_config.hf_config, "model_type", None),
+        "architectures": getattr(model_config.hf_config, "architectures", None),
+        # "hf_config": model_config.hf_config.to_dict(),
+    }
+    embedding_model_spec = getattr(model_config, "embedding_model_spec", None)
+    if embedding_model_spec is not None:
+        result["embedding"] = resolved_embedding_plan(
+            embedding_model_spec,
+            config=resolving_view(server_args),
+            model_config=model_config,
+        )
+    return result
+
+
+def start_follower_grpc_server(server_args, scheduler_info: Dict[str, Any]):
+    """Expose GetServerInfo only, without constructing a TokenizerManager.
+
+    The snapshot is taken after scheduler readiness. This does not launch a
+    sidecar or enable inference/control RPCs.
+    """
+    serving = get_serving()
+    if serving.grpc_port is None or serving.smg_grpc_mode or serving.grpc_mode:
+        return None
+    if envs.SGLANG_RUST_SERVER.get():
+        return None
+
+    from sglang.srt.rust_extensions import load_rust_extension
+    from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
+
+    grpc_native = load_rust_extension("sglang.srt.rust_extensions._grpc")
+    return grpc_native.start_metadata_server(
+        host=serving.host,
+        port=serving.grpc_port,
+        server_info_json=json.dumps(
+            msgspec_to_builtins(
+                redact_watermark_secrets(build_server_info(server_args, scheduler_info))
+            ),
+            default=str,
+        ),
+    )
+
+
 def launch_dummy_health_check_server(host, port, enable_metrics):
     import asyncio
 
     import uvicorn
     from fastapi import FastAPI, Response
 
+    from sglang.srt.observability.trace import fastapi_telemetry_disabled_kwargs
     from sglang.srt.utils.network import NetworkAddress
 
-    app = FastAPI()
+    app = FastAPI(**fastapi_telemetry_disabled_kwargs())
 
     @app.get("/ping")
     async def ping():
@@ -3709,10 +3889,10 @@ def retry(
             traceback.print_exc()
 
             if try_index >= max_retry:
-                raise Exception(f"retry() exceed maximum number of retries.")
+                raise Exception("retry() exceed maximum number of retries.")
 
             if not should_retry(e):
-                raise Exception(f"retry() observe errors that should not be retried.")
+                raise Exception("retry() observe errors that should not be retried.")
 
             delay = min(initial_delay * (2**try_index), max_delay) * (
                 0.75 + 0.25 * random.random()
@@ -4005,8 +4185,8 @@ def require_mlp_tp_gather(*, moe_a2a_backend=None):
             return True
         elif moe_a2a_backend.is_none():
             return True
-        elif moe_a2a_backend.is_flashinfer():
-            # FlashInfer MoE A2A needs a rank-invariant, DP-synchronized per-rank
+        elif moe_a2a_backend.is_flashinfer() or moe_a2a_backend.is_mori_epv2():
+            # FlashInfer/MORI EPv2 A2A need a rank-invariant, DP-synchronized per-rank
             # token count: MoeAlltoAll uses fixed-geometry buffers and the decode
             # cuda-graph bucket must be identical across EP ranks, otherwise ranks
             # replay different-sized graphs -> geometry mismatch -> illegal memory
@@ -4015,9 +4195,12 @@ def require_mlp_tp_gather(*, moe_a2a_backend=None):
             # reuse this flag's DP-sync bookkeeping (uniform global_num_tokens +
             # max-based graph bucket). See #30432 re: the misleading flag name.
             return True
-        elif moe_a2a_backend.is_mori() and get_bool_env_var(
-            "SGLANG_MORI_RECV_BOUND", "false"
-        ):
+        elif moe_a2a_backend.is_flashinfer_megamoe():
+            # MegaMoE's capacity profiles require the same decode graph
+            # bucket on every EP rank. As for FlashInfer A2A above, this only
+            # enables DP-count bookkeeping; expert inputs remain local.
+            return True
+        elif moe_a2a_backend.is_mori() and envs.SGLANG_MORI_RECV_BOUND.get():
             # Same bookkeeping, for the same reason. Bounding mori's receive
             # buffer means baking a fan-in size into a captured graph, and the
             # fan-in depends on what the *peers* send. Without a DP-synchronized
@@ -4072,14 +4255,25 @@ def require_mlp_sync():
     return get_parallel().attn_dp_enabled or require_gathered_buffer()
 
 
-def get_cuda_graph_batch_size_alignment() -> int:
+def get_cuda_graph_batch_size_alignment(
+    *,
+    gathered_buffer_required: Optional[bool] = None,
+    include_cp_alignment: bool = True,
+) -> int:
+    """Decode may waive CP alignment only when no gathered buffer needs it."""
+    if gathered_buffer_required is None:
+        gathered_buffer_required = require_gathered_buffer()
     alignment = 1
     if get_exec().overlap.enable_two_batch_overlap:
         alignment *= 2
-    if require_gathered_buffer():
+    if gathered_buffer_required:
         alignment *= get_parallel().attn_tp_size
     # TODO: unverified on NVIDIA; drop the gate once validated on CUDA.
-    if not is_hip() and alignment % get_parallel().attn_cp_size != 0:
+    if (
+        (include_cp_alignment or gathered_buffer_required)
+        and not is_hip()
+        and alignment % get_parallel().attn_cp_size != 0
+    ):
         alignment *= get_parallel().attn_cp_size
     return alignment
 
@@ -4107,12 +4301,12 @@ def find_local_repo_dir(repo_id: str, revision: Optional[str] = None) -> Optiona
         hf.constants.REPO_ID_SEPARATOR.join(["models", *repo_id.split("/")]),
     )
 
-    # Get revision from main ref if not specified
-    if not revision:
-        ref_path = os.path.join(cache_path, "refs", "main")
-        if os.path.isfile(ref_path):
-            with open(ref_path) as f:
-                revision = f.read().strip()
+    # A branch or tag name (default "main") maps to a commit through refs/;
+    # snapshots/ is keyed by commit only.
+    ref_path = os.path.join(cache_path, "refs", revision or "main")
+    if os.path.isfile(ref_path):
+        with open(ref_path) as f:
+            revision = f.read().strip()
 
     # List files from revision directory
     if revision:
@@ -4165,7 +4359,7 @@ def dim_is_supported(weight):
 def _process_weight_after_loading(module, weight_names, transpose_dims=None) -> None:
     # Pack weight for get better performance on CPU
     devices = {getattr(module, weight_name).device for weight_name in weight_names}
-    assert len(devices) == 1, f"Expects all weights to be on the same device"
+    assert len(devices) == 1, "Expects all weights to be on the same device"
     device = devices.pop()
 
     if transpose_dims:
@@ -4282,7 +4476,9 @@ def configure_gc_warning(warn_threshold_secs):
     gc.callbacks.append(gc_callback)
 
 
-def freeze_gc(context: str):
+def freeze_gc(context: str, gc_threshold: Optional[Sequence[int]] = None):
+    if gc_threshold is not None:
+        gc.set_threshold(*gc_threshold)
     g0_before, g1_before, g2_before = gc_object_counts()
     gc.freeze()
     g0_after, g1_after, g2_after = gc_object_counts()
@@ -4356,73 +4552,67 @@ def ceil_div(x: int, y: int) -> int:
 
 def parse_lscpu_topology():
     try:
-        # Get CPU topology: CPU,Core,Socket,Node
+        # Get CPU topology: CPU,Core,Socket,Node,Cache (L3 identifies CBB).
         output = subprocess.check_output(
-            ["lscpu", "-p=CPU,Core,Socket,Node"], text=True
+            ["lscpu", "-p=CPU,Core,Socket,Node,Cache"], text=True
         )
     except Exception as e:
         raise RuntimeError(f"Unexpected error running 'lscpu': {e}")
 
-    # Parse only data lines (skip comments)
     cpu_info = []
     for line in output.splitlines():
-        if not line.startswith("#"):
-            parts = line.strip().split(",")
-            if len(parts) != 4:
-                logger.warning("Skipping malformed lscpu line: %s", line.strip())
-                continue
-            cpu = int(parts[0])  # CPU id must always be present
-            core, socket, node = [int(p) if p else 0 for p in parts[1:]]
-            cpu_info.append((cpu, core, socket, node))
+        # Parse only data lines (skip comments)
+        if line.startswith("#"):
+            continue
+        parts = line.split(",")
+        numa_parts = parts[:4]  # CPU, Core, Socket, Node
+        cache_str = parts[-1] if len(parts) > 4 else "0"
+        cache_parts = cache_str.split(":")
+        line_info = list()
+        # 5 elements expected: [cpu, core, socket, node, L3]
+        for p in numa_parts:
+            line_info.append(int(p) if p.isdigit() else 0)
+        l3_cache_index = int(cache_parts[-1]) if cache_parts[-1] else 0
+        line_info.append(l3_cache_index)
+        cpu_info.append(line_info)
 
-    # [(0,0,0,0),(1,1,0,0),...,(43,43,0,1),...,(256,0,0,0),...]
+    # [(0,0,0,0,0),(1,1,0,0,0),...,(43,43,0,1,0),...,(256,0,0,0,0),...]
     return cpu_info
 
 
-def get_physical_cpus_by_numa():
+def get_physical_cpus_by_numa_or_block():
     cpu_info = parse_lscpu_topology()
+    n_nodes = len({node for _, _, _, node, _ in cpu_info})
+    n_blocks = len({block for _, _, _, _, block in cpu_info})
+    use_block = n_blocks > n_nodes
+    physical_by_group = defaultdict(dict)
 
-    # Map NUMA node -> set of (core_id, socket) to avoid duplicates
-    # 0: {(0,0): 0, (1, 0): 1,...}
-    # ...
-    # 5: {(214,1): 214, (215,1): 215}
-    physical_by_node = defaultdict(dict)  # node -> core_id -> cpu_id
-
-    for cpu, core, socket, node in cpu_info:
-        key = (core, socket)
-        if key not in physical_by_node[node]:
-            physical_by_node[node][key] = (
-                cpu  # pick first CPU seen for that physical core
-            )
+    for cpu, core, socket_id, node, block in cpu_info:
+        group = block if use_block else node
+        key = (core, socket_id)
+        if key not in physical_by_group[group]:
+            # Pick the first CPU seen for that physical core.
+            physical_by_group[group][key] = cpu
 
     # Retrieves CPUs that the current process is allowed to run on
     cpus_allowed_list = psutil.Process().cpu_affinity()
-
-    # Convert to list of physical CPUs per node
-    # 0: [0,1,2,...,42]
-    # ...
-    # 2: [86,87,...,127]
-    # ...
-    # 5: [214,215,...,255]
-    node_to_cpus = {}
-    for node, core_to_cpu in physical_by_node.items():
-        cpus = sorted(core_to_cpu.values())
-        allowed_cpus = set(cpus).intersection(cpus_allowed_list)
-        node_to_cpus[node] = allowed_cpus
-
-    return node_to_cpus
+    return {
+        group: set(core_to_cpu.values()).intersection(cpus_allowed_list)
+        for group, core_to_cpu in physical_by_group.items()
+    }
 
 
 # Only physical cores are used. Logical cores are excluded.
+@lru_cache(maxsize=1)
 def get_cpu_ids_by_node():
-    node_to_cpus = get_physical_cpus_by_numa()
-    # Sort by NUMA node index
-    cpu_ids = [
-        ",".join(map(str, sorted(node_to_cpus[node]))) for node in sorted(node_to_cpus)
-    ]
-
+    node_to_cpus = get_physical_cpus_by_numa_or_block()
+    # Sort by NUMA node index or CBB block index
     # ['0,1,2,3', '4,5,6,7', '8,9,10,11', '12,13,14,15', '16,17,18,19', '20,21,22,23']
-    return cpu_ids
+    return [
+        ",".join(map(str, sorted(cpus)))
+        for _, cpus in sorted(node_to_cpus.items())
+        if cpus
+    ]
 
 
 def is_shm_available(dtype, world_size, local_size):
@@ -4610,6 +4800,7 @@ SUPPORTED_LORA_TARGET_MODULES = [
     "wk",
     "weights_proj",
     "gate_proj",
+    "self_attn.gate_proj",
     "up_proj",
     "down_proj",
     "qkv_proj",
@@ -4722,19 +4913,6 @@ def json_list_type(value):
         raise argparse.ArgumentTypeError(
             f"Invalid JSON list: {value}. Please provide a valid JSON list."
         )
-
-
-def get_extend_input_len_swa_limit(
-    sliding_window_size: int, chunked_prefill_size: int, page_size: int
-) -> int:
-    # 1. a factor of 2x is because each prefill contains chunked_prefill_size tokens,
-    #    and between prefills, we run the tree cache's checkpoint(),
-    #    so we unlock the previously locked nodes.
-    # 2. max is to handle the case that chunked_prefill_size is larger than sliding_window_size.
-    #    in that case, each prefill contains chunked_prefill_size tokens,
-    #    and we can only free out-of-sliding-window kv indices after each prefill.
-    # 3. page_size is because we want to have 1 token extra for generated tokens.
-    return page_size + 2 * max(sliding_window_size, chunked_prefill_size)
 
 
 def get_num_new_pages(
@@ -4947,20 +5125,6 @@ def calc_diff(x, y):
     return 1 - sim
 
 
-@contextmanager
-def temp_attr_context(obj, attr, value):
-    if obj is None:
-        yield
-        return
-
-    original_value = getattr(obj, attr)
-    setattr(obj, attr, value)
-    try:
-        yield
-    finally:
-        setattr(obj, attr, original_value)
-
-
 def raise_error_or_warn(obj, strict, counter_name, message, log_interval=1000):
     if strict:
         raise ValueError(message)
@@ -4979,6 +5143,59 @@ def get_or_create_event_loop():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         return loop
+
+
+@lru_cache(maxsize=1)
+def is_confidential_compute() -> bool:
+    """Whether the GPU is running in NVIDIA Confidential Computing (CC) mode.
+
+    Detected once via NVML and cached.
+    Overridable with ``SGLANG_FORCE_CONFIDENTIAL_COMPUTE``.
+    """
+    forced = envs.SGLANG_FORCE_CONFIDENTIAL_COMPUTE.get()
+    if forced is not None:
+        return forced
+    if not is_cuda():
+        return False
+
+    try:
+        import pynvml
+    except ImportError:
+        logger.warning("pynvml not available; assuming Confidential Computing is off")
+        return False
+
+    cc_enabled = False
+    try:
+        pynvml.nvmlInit()
+
+        # Hopper and newer supports a more nuanced query of confidential
+        # compute settings
+        cc_settings = pynvml.c_nvmlSystemConfComputeSettings_v1_t()
+        ret = pynvml.nvmlSystemGetConfComputeSettings(byref(cc_settings))
+        pynvml._nvmlCheckReturn(ret)
+        # PPCIE implies CC
+        cc_enabled = (
+            cc_settings.ccFeature == pynvml.NVML_CC_SYSTEM_FEATURE_ENABLED
+            or cc_settings.multiGpuMode == pynvml.NVML_CC_SYSTEM_MULTIGPU_PROTECTED_PCIE
+        )
+    except pynvml.NVMLError_NotSupported:
+        # Simple query for older GPUs
+        try:
+            cc_state = pynvml.nvmlSystemGetConfComputeState()
+            cc_enabled = cc_state.ccFeature == pynvml.NVML_CC_SYSTEM_FEATURE_ENABLED
+        except pynvml.NVMLError as error:
+            logger.warning(f"Error querying CC state: {error!s}")
+    except pynvml.NVMLError as error:
+        logger.warning(f"Error querying CC state: {error!s}")
+    finally:
+        # Shutdown
+        try:
+            pynvml.nvmlShutdown()
+        except pynvml.NVMLError:
+            # Ignore shutdown errors
+            pass
+
+    return cc_enabled
 
 
 def init_cublas():

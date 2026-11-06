@@ -27,10 +27,11 @@ from sglang.srt.utils.hf_transformers import (
     get_rope_config,
     get_tokenizer,
 )
+from sglang.srt.utils.hf_transformers.config import POINTER_ADAPTER_BASES
 from sglang.srt.utils.patch_tokenizer import unpatch_tokenizer
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 
 class TestHFTransformersLoading(unittest.TestCase):
@@ -129,6 +130,55 @@ class TestHFTransformersLoading(unittest.TestCase):
         self.assertEqual(get_context_length(text), 1024)
         self.assertEqual(config.vision_config.patch_size, 14)
 
+    def llama3_rope_config(self):
+        config = self.text_config()
+        config["rope_parameters"] = {
+            "rope_type": "llama3",
+            "rope_theta": 500000.0,
+            "factor": 8.0,
+            "low_freq_factor": 1.0,
+            "high_freq_factor": 4.0,
+            "original_max_position_embeddings": 128,
+        }
+        return config
+
+    def test_rope_scaling_override_merges_with_checkpoint(self):
+        # Regression for #41227: v5's rope_scaling setter replaces
+        # rope_parameters wholesale, dropping an unmentioned rope_theta.
+        self.write_config(self.llama3_rope_config())
+        restated = {
+            "rope_type": "llama3",
+            "factor": 32.0,
+            "low_freq_factor": 1.0,
+            "high_freq_factor": 4.0,
+            "original_max_position_embeddings": 128,
+        }
+
+        for key in ("rope_scaling", "rope_parameters"):
+            with self.subTest(key=key):
+                config = get_config(
+                    self.model_path,
+                    trust_remote_code=False,
+                    local_files_only=True,
+                    model_override_args={key: restated},
+                )
+                theta, rope = get_rope_config(get_hf_text_config(config))
+
+                self.assertEqual(theta, 500000.0)
+                self.assertEqual(rope["factor"], 32.0)
+                self.assertEqual(rope["rope_type"], "llama3")
+
+        config = get_config(
+            self.model_path,
+            trust_remote_code=False,
+            local_files_only=True,
+            model_override_args={"rope_scaling": {"rope_theta": 1000000.0}},
+        )
+        theta, rope = get_rope_config(get_hf_text_config(config))
+
+        self.assertEqual(theta, 1000000.0)
+        self.assertEqual(rope["factor"], 8.0)
+
     def test_tokenizer_loading_preserves_batch_special_tokens_and_chat(self):
         self.write_config(self.text_config())
         self.make_tokenizer().save_pretrained(self.model_path)
@@ -186,6 +236,50 @@ class TestHFTransformersLoading(unittest.TestCase):
                 self.assertTrue(torch.isfinite(batch["pixel_values"]).all())
                 self.assertEqual(batch["input_ids"].tolist(), [[3, 3, 3, 3, 5]])
                 self.assertEqual(batch["attention_mask"].tolist(), [[1, 1, 1, 1, 1]])
+
+    def test_kev_adapter_reads_the_text_config_of_its_pinned_base(self):
+        """A Kev LoRA checkpoint has no config.json. Its config is the text config
+        of the base its head.pt pins, served by the text-only class, and the base
+        is recorded so its weights load. A base without the Qwen3.5 backbone, as
+        Kev-0.5B's Qwen2.5, is refused, and so is an adapter trained on a BF16
+        backbone, as Kev-27B v1, which Kev applies unmerged."""
+        Path(self.model_path, "config.json").write_text(
+            json.dumps(
+                {
+                    "model_type": "qwen3_5",
+                    "architectures": ["Qwen3_5ForConditionalGeneration"],
+                    "text_config": {"model_type": "qwen3_5_text", "hidden_size": 32},
+                }
+            )
+        )
+
+        def adapter(base, weights_dtype="fp32"):
+            directory = tempfile.TemporaryDirectory()
+            self.addCleanup(directory.cleanup)
+            Path(directory.name, "adapter_config.json").write_text(
+                json.dumps({"r": 16, "lora_alpha": 32})
+            )
+            torch.save(
+                {"base": base, "base_revision": None, "weights_dtype": weights_dtype},
+                Path(directory.name, "head.pt"),
+            )
+            return directory.name
+
+        path = adapter(self.model_path)
+        config = get_config(path, trust_remote_code=False, local_files_only=True)
+        self.assertEqual(
+            (config.model_type, config.architectures, config.hidden_size),
+            ("qwen3_5_text", ["Qwen3_5ForCausalLM"], 32),
+        )
+        self.assertEqual(POINTER_ADAPTER_BASES[(path, None)], (self.model_path, None))
+
+        llama = tempfile.TemporaryDirectory()
+        self.addCleanup(llama.cleanup)
+        Path(llama.name, "config.json").write_text(json.dumps(self.text_config()))
+        with self.assertRaisesRegex(ValueError, "on a llama base"):
+            get_config(adapter(llama.name), trust_remote_code=False)
+        with self.assertRaisesRegex(ValueError, "trained on a bf16 backbone"):
+            get_config(adapter(self.model_path, "bf16"), trust_remote_code=False)
 
 
 if __name__ == "__main__":

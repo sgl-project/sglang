@@ -10,7 +10,8 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import ProfileReqOutput
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.step_span_utils import (
     build_detailed_annotation_suffix,
     detailed_annotations_enabled,
@@ -403,12 +404,12 @@ class _ProfilerMemory(_ProfilerConcreteBase):
 class _ProfilerCudart(_ProfilerConcreteBase):
     def start(self):
         if self.first_rank_in_node:
-            logger.info(f"Call cudaProfilerStart")
+            logger.info("Call cudaProfilerStart")
             torch.cuda.cudart().cudaProfilerStart()
 
     def stop(self):
         if self.first_rank_in_node:
-            logger.info(f"Call cudaProfilerStop")
+            logger.info("Call cudaProfilerStop")
             torch.cuda.cudart().cudaProfilerStop()
 
 
@@ -464,6 +465,7 @@ def build_step_span_name(
     detailed_annotations: bool | None = None,
     *,
     is_draft_worker: bool = False,
+    forward_id: int | None = None,
 ) -> str:
     """Build the profile-trace span name for one forward step.
 
@@ -475,6 +477,8 @@ def build_step_span_name(
     The target-verify step is labeled ``VERIFY``; every step a draft model
     runner emits is labeled ``DRAFT`` (some draft paths borrow the TARGET_VERIFY
     mode, so the mode name alone cannot tell the two models apart).
+    When detailed annotations are enabled, ``forward_id`` binds the span to
+    the expert-distribution recorder's forward ID for this model runner.
     """
     if detailed_annotations is None:
         detailed_annotations = detailed_annotations_enabled()
@@ -497,4 +501,6 @@ def build_step_span_name(
         suffix = build_detailed_annotation_suffix(forward_batch)
         if suffix:
             base = f"{base} {suffix}"
+        if forward_id is not None:
+            base = f"{base} forward_id={forward_id}"
     return f"{base}]"

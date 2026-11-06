@@ -43,7 +43,14 @@ class Mixer2RMSNormGated(BaseFusedOp):
         if self.use_rms_norm:
             # Register norm weight only if we're actually applying RMSNorm
             self.weight = torch.nn.Parameter(torch.ones(self.per_rank_hidden_size))
-            set_weight_attrs(self.weight, {"weight_loader": sharded_weight_loader(0)})
+            set_weight_attrs(
+                self.weight,
+                {
+                    "weight_loader": sharded_weight_loader(
+                        0, parallel_group="attn_tp" if self.use_attn_tp_group else "tp"
+                    )
+                },
+            )
         else:
             # Avoid checkpoint mismatch by skipping unused parameter
             self.register_parameter("weight", None)

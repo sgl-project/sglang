@@ -14,7 +14,7 @@ from sglang.srt.utils.common import configure_media_url_security
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class TestServerArgsAnnotatedCli(CustomTestCase):
@@ -168,7 +168,7 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
             return sa.disable_cuda_graph, config.decode.backend, config.prefill.backend
 
         # Not a literal: the prefill default is BREAKABLE on CUDA and
-        # TC_PIECEWISE elsewhere, and this file runs on the CPU runner.
+        # disabled elsewhere, and this file runs on the CPU runner.
         self.assertEqual(backends([]), (False, Backend.FULL, default_prefill_backend()))
         self.assertEqual(
             backends(["--disable-cuda-graph"]),

@@ -76,12 +76,12 @@ def _write_per_run_marker(
         logger.debug("Cannot write per-run marker: invalid snapshot_dir")
         return
 
-    from datetime import datetime
+    from datetime import datetime, timezone
 
     snapshot_hash = os.path.basename(snapshot_dir)
 
     marker = {
-        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "model_id": model_id,
         "snapshot_hash": snapshot_hash,
         "validation_passed": True,
@@ -412,8 +412,11 @@ def _validate_sharded_model(
                     corrupted_files.append(f)
 
         if group_info["suffix"] == "safetensors":
+            # Qwen3.5 names shards `model.safetensors-00001-of-00014.safetensors`,
+            # so the prefix may already end with the suffix.
+            index_stem = group_info["prefix"].removesuffix(".safetensors")
             index_file = os.path.join(
-                snapshot_dir, f"{group_info['prefix']}.safetensors.index.json"
+                snapshot_dir, f"{index_stem}.safetensors.index.json"
             )
             if not os.path.exists(index_file):
                 return (

@@ -10,12 +10,28 @@
   },
   "redirects": [
     {
+      "source": "/cookbook/autoregressive/Ernie/:slug*",
+      "destination": "/cookbook/autoregressive/Baidu/:slug*"
+    },
+    {
+      "source": "/cookbook/autoregressive/Reflection/Beam-1.0",
+      "destination": "/cookbook/autoregressive/Reflection/Beam-1_0"
+    },
+    {
+      "source": "/cookbook/autoregressive/Meta/MuseSpark",
+      "destination": "/cookbook/autoregressive/Meta/MuseSparkOpen"
+    },
+    {
       "source": "/docs/references/learn_more",
       "destination": "/"
     },
     {
       "source": "/cookbook",
       "destination": "/cookbook/intro"
+    },
+    {
+      "source": "/cookbook/autoregressive/Perplexity/pplx-decider-v1-27b",
+      "destination": "/cookbook/autoregressive/Perplexity/PPLX-Decider-v1-27B"
     },
     {
       "source": "/whl",
@@ -148,10 +164,6 @@
     {
       "source": "/advanced_features/pd_disaggregation.html",
       "destination": "/docs/advanced_features/pd_disaggregation"
-    },
-    {
-      "source": "/advanced_features/piecewise_cuda_graph.html",
-      "destination": "/docs/advanced_features/piecewise_cuda_graph"
     },
     {
       "source": "/advanced_features/pipeline_parallelism.html",
@@ -694,6 +706,10 @@
       "destination": "/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/deepseek_r1"
     },
     {
+      "source": "/platforms/cambricon_mlu.html",
+      "destination": "/docs/hardware-platforms/cambricon_mlu"
+    },
+    {
       "source": "/platforms/cpu_server.html",
       "destination": "/docs/hardware-platforms/cpu_server"
     },
@@ -932,6 +948,7 @@
               "docs/advanced_features/session_radix_cache",
               "docs/advanced_features/radix_eviction_policy",
               "docs/advanced_features/hyperparameter_tuning",
+              "docs/advanced_features/text_watermarking",
               "docs/advanced_features/attention_backend",
               "docs/advanced_features/hisparse_guide",
               "docs/advanced_features/speculative_decoding",
@@ -940,13 +957,17 @@
               "docs/advanced_features/structured_outputs_for_reasoning_models",
               "docs/advanced_features/tool_parser",
               "docs/advanced_features/separate_reasoning",
+              "docs/advanced_features/thinking_budget",
               "docs/advanced_features/quantization",
               "docs/advanced_features/quantized_kv_cache",
               "docs/advanced_features/reasoning_aware_compression",
               "docs/advanced_features/dp_dpa_smg_guide",
               "docs/advanced_features/prefill_cp",
+              "docs/advanced_features/kv_cache_sharing",
               "docs/advanced_features/dcp",
               "docs/advanced_features/expert_parallelism",
+              "docs/advanced_features/paged_experts",
+              "docs/advanced_features/engram",
               "docs/advanced_features/lora",
               "docs/advanced_features/pd_disaggregation",
               "docs/advanced_features/epd_disaggregation",
@@ -965,7 +986,6 @@
               "docs/advanced_features/dp_for_multi_modal_encoder",
               "docs/advanced_features/cuda_graph_for_multi_modal_encoder",
               "docs/advanced_features/breakable_cuda_graph",
-              "docs/advanced_features/piecewise_cuda_graph",
               "docs/advanced_features/sgl_model_gateway",
               "docs/advanced_features/llm-d",
               "docs/advanced_features/deterministic_inference",
@@ -1124,6 +1144,8 @@
                           "docs/hardware-platforms/ascend-npus/model-deployment/tutorials/deepseek_v4_flash",
                           "docs/hardware-platforms/ascend-npus/model-deployment/tutorials/glm_5_1",
                           "docs/hardware-platforms/ascend-npus/model-deployment/tutorials/glm_5_2",
+                          "docs/hardware-platforms/ascend-npus/model-deployment/tutorials/glm_5_3",
+                          "docs/hardware-platforms/ascend-npus/model-deployment/tutorials/glm_5_3_flash",
                           "docs/hardware-platforms/ascend-npus/model-deployment/tutorials/hy3",
                           "docs/hardware-platforms/ascend-npus/model-deployment/tutorials/kimi_k2_6",
                           "docs/hardware-platforms/ascend-npus/model-deployment/tutorials/minimax_m2_5",
@@ -1192,6 +1214,7 @@
                   "docs/hardware-platforms/ascend-npus/faq"
                 ]
               },
+              "docs/hardware-platforms/cambricon_mlu",
               "docs/hardware-platforms/cpu_server",
               {
                 "group": "Edge & Embedded",
@@ -1200,6 +1223,7 @@
                 ]
               },
               "docs/hardware-platforms/mthreads_gpu",
+              "docs/hardware-platforms/sail",
               "docs/hardware-platforms/tpu",
               "docs/hardware-platforms/xpu",
               "docs/hardware-platforms/plugin"
@@ -1220,6 +1244,12 @@
                 "pages": [
                   "cookbook/autoregressive/intro",
                   {
+                    "group": "Reflection",
+                    "pages": [
+                      "cookbook/autoregressive/Reflection/Beam-1_0"
+                    ]
+                  },
+                  {
                     "group": "IQuestLab",
                     "pages": [
                       "cookbook/autoregressive/IQuestLab/IQuest-Q1"
@@ -1228,12 +1258,14 @@
                   {
                     "group": "IFM",
                     "pages": [
+                      "cookbook/autoregressive/IFM/Jais-3",
                       "cookbook/autoregressive/IFM/K2-Horizon"
                     ]
                   },
                   {
                     "group": "Kimi (Moonshot AI)",
                     "pages": [
+                      "cookbook/autoregressive/Moonshotai/Kimi-K3.1-Pro",
                       "cookbook/autoregressive/Moonshotai/Kimi-K3",
                       "cookbook/autoregressive/Moonshotai/Kimi-K2.7-Code",
                       "cookbook/autoregressive/Moonshotai/Kimi-K2.6",
@@ -1307,12 +1339,14 @@
                   {
                     "group": "DeepReinforce",
                     "pages": [
+                      "cookbook/autoregressive/DeepReinforce/Ornith-1.5",
                       "cookbook/autoregressive/DeepReinforce/Ornith-1.0"
                     ]
                   },
                   {
                     "group": "Meta",
                     "pages": [
+                      "cookbook/autoregressive/Meta/MuseSparkOpen",
                       "cookbook/autoregressive/Meta/MuseGlimmer",
                       "cookbook/autoregressive/Meta/Llama4",
                       "cookbook/autoregressive/Meta/Llama3.3-70B",
@@ -1335,6 +1369,7 @@
                     "group": "Google",
                     "pages": [
                       "cookbook/autoregressive/Google/EmbeddingGemma",
+                      "cookbook/autoregressive/Google/EmbeddingGemma2",
                       "cookbook/autoregressive/Google/Gemma4",
                       "cookbook/autoregressive/Google/DiffusionGemma"
                     ]
@@ -1348,6 +1383,7 @@
                   {
                     "group": "LiquidAI",
                     "pages": [
+                      "cookbook/autoregressive/LiquidAI/LFM3",
                       "cookbook/autoregressive/LiquidAI/LFM2.5"
                     ]
                   },
@@ -1360,6 +1396,7 @@
                   {
                     "group": "MiniMax",
                     "pages": [
+                      "cookbook/autoregressive/MiniMax/MiniMax-M3.1",
                       "cookbook/autoregressive/MiniMax/MiniMax-M3",
                       "cookbook/autoregressive/MiniMax/MiniMax-M2.7",
                       "cookbook/autoregressive/MiniMax/MiniMax-M2",
@@ -1369,6 +1406,7 @@
                   {
                     "group": "NVIDIA",
                     "pages": [
+                      "cookbook/autoregressive/NVIDIA/Nemotron3.5-Super",
                       "cookbook/autoregressive/NVIDIA/Nemotron3.5-Lightning",
                       "cookbook/autoregressive/NVIDIA/Nemotron3-Ultra",
                       "cookbook/autoregressive/NVIDIA/Nemotron3-Nano-Omni",
@@ -1379,20 +1417,18 @@
                   {
                     "group": "Baidu",
                     "pages": [
+                      "cookbook/autoregressive/Baidu/ERNIE-5.5-Flash",
+                      "cookbook/autoregressive/Baidu/Ernie4.5",
+                      "cookbook/autoregressive/Baidu/Ernie4.5-VL",
+                      "cookbook/autoregressive/Baidu/Unlimited-OCR-2",
                       "cookbook/autoregressive/Baidu/PaddleOCR-VL",
                       "cookbook/autoregressive/Baidu/Unlimited-OCR"
                     ]
                   },
                   {
-                    "group": "Ernie",
-                    "pages": [
-                      "cookbook/autoregressive/Ernie/Ernie4.5",
-                      "cookbook/autoregressive/Ernie/Ernie4.5-VL"
-                    ]
-                  },
-                  {
                     "group": "StepFun",
                     "pages": [
+                      "cookbook/autoregressive/StepFun/Step-5-Preview",
                       "cookbook/autoregressive/StepFun/Step-3.7-Flash",
                       "cookbook/autoregressive/StepFun/Step3.5",
                       "cookbook/autoregressive/StepFun/Step3-VL-10B"
@@ -1401,6 +1437,7 @@
                   {
                     "group": "InclusionAI",
                     "pages": [
+                      "cookbook/autoregressive/InclusionAI/Ling-3.1-flash",
                       "cookbook/autoregressive/InclusionAI/Ling-3.0-flash-VL",
                       "cookbook/autoregressive/InclusionAI/Ling-3.0-flash",
                       "cookbook/autoregressive/InclusionAI/Ling-3.0-tiny",
@@ -1428,6 +1465,7 @@
                   {
                     "group": "OpenBMB",
                     "pages": [
+                      "cookbook/autoregressive/OpenBMB/MiniCPM-V-4_7",
                       "cookbook/autoregressive/OpenBMB/MiniCPM5-2B",
                       "cookbook/autoregressive/OpenBMB/MiniCPM-V-4_6"
                     ]
@@ -1441,6 +1479,7 @@
                   {
                     "group": "Mistral",
                     "pages": [
+                      "cookbook/autoregressive/Mistral/Mistral-Large-4",
                       "cookbook/autoregressive/Mistral/Ministral-3",
                       "cookbook/autoregressive/Mistral/Mistral-Small-4",
                       "cookbook/autoregressive/Mistral/Mistral-Medium-3.5",
@@ -1470,6 +1509,12 @@
                     ]
                   },
                   {
+                    "group": "Recursive",
+                    "pages": [
+                      "cookbook/autoregressive/Recursive/Flint"
+                    ]
+                  },
+                  {
                     "group": "Poolside",
                     "pages": [
                       "cookbook/autoregressive/Poolside/Laguna-S-2.1",
@@ -1481,7 +1526,20 @@
                   {
                     "group": "Perplexity",
                     "pages": [
-                      "cookbook/autoregressive/Perplexity/pplx-decider-v1-27b"
+                      "cookbook/autoregressive/Perplexity/PPLX-Decider-v1.1-27B",
+                      "cookbook/autoregressive/Perplexity/PPLX-Decider-v1-27B"
+                    ]
+                  },
+                  {
+                    "group": "Cloudflare",
+                    "pages": [
+                      "cookbook/autoregressive/Cloudflare/clef"
+                    ]
+                  },
+                  {
+                    "group": "Kev",
+                    "pages": [
+                      "cookbook/autoregressive/Kev/kev"
                     ]
                   }
                 ]
@@ -1491,14 +1549,26 @@
                 "pages": [
                   "cookbook/diffusion/intro",
                   {
-                    "group": "Cosmos",
+                    "group": "Tencent",
                     "pages": [
-                      "cookbook/diffusion/Cosmos/Cosmos3"
+                      "cookbook/diffusion/Tencent/HunyuanImage3",
+                      "cookbook/diffusion/HY-Nomas/HY-Nomas"
                     ]
                   },
                   {
-                    "group": "FLUX",
+                    "group": "NVIDIA",
                     "pages": [
+                      "cookbook/diffusion/Cosmos/Cosmos3",
+                      "cookbook/diffusion/SANA-Video/SANA-Video",
+                      "cookbook/diffusion/SANA-WM/SANA-WM",
+                      "cookbook/diffusion/LongLive/LongLive-2.0"
+                    ]
+                  },
+                  {
+                    "group": "Black Forest Labs",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/diffusion/FLUX/FLUX.3",
                       "cookbook/diffusion/FLUX/FLUX"
                     ]
                   },
@@ -1510,33 +1580,28 @@
                   },
                   {
                     "group": "Wan",
+                    "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/Wan/Wan2.1",
-                      "cookbook/diffusion/Wan/Wan2.2"
+                      "cookbook/diffusion/Wan/Wan2.2",
+                      "cookbook/diffusion/Wan/Wan-Animate-2"
                     ]
                   },
                   {
-                    "group": "LongLive",
-                    "pages": [
-                      "cookbook/diffusion/LongLive/LongLive-2.0"
-                    ]
-                  },
-                  {
-                    "group": "LTX",
-                    "tag": "NEW",
+                    "group": "Lightricks",
                     "pages": [
                       "cookbook/diffusion/LTX/LTX2 & LTX2.3",
                       "cookbook/diffusion/LTX/LTX2.5"
                     ]
                   },
                   {
-                    "group": "JoyAI-Echo",
+                    "group": "JD.com",
                     "pages": [
                       "cookbook/diffusion/JoyEcho/JoyEcho"
                     ]
                   },
                   {
-                    "group": "Qwen-Image",
+                    "group": "Qwen",
                     "pages": [
                       "cookbook/diffusion/Qwen-Image/Qwen-Image-2.1",
                       "cookbook/diffusion/Qwen-Image/Qwen-Image",
@@ -1551,26 +1616,24 @@
                   },
                   {
                     "group": "SenseNova",
-                    "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/SenseNova/SenseNova-U1.5-8B-MoT"
                     ]
                   },
                   {
-                    "group": "LongCat-Image",
-                    "tag": "NEW",
+                    "group": "Meituan",
                     "pages": [
                       "cookbook/diffusion/LongCat/LongCat-Image"
                     ]
                   },
                   {
-                    "group": "Ming-Image",
+                    "group": "InclusionAI",
                     "pages": [
                       "cookbook/diffusion/inclusionAI/Ming-Image"
                     ]
                   },
                   {
-                    "group": "Z-Image",
+                    "group": "Tongyi-MAI",
                     "pages": [
                       "cookbook/diffusion/Z-Image/Z-Image-Turbo"
                     ]
@@ -1582,49 +1645,45 @@
                     ]
                   },
                   {
-                    "group": "ERNIE-Image",
+                    "group": "Baidu",
                     "pages": [
                       "cookbook/diffusion/Ernie-Image/Ernie-Image"
                     ]
                   },
                   {
-                    "group": "MOVA",
+                    "group": "HiDream",
+                    "tag": "NEW",
                     "pages": [
-                      "cookbook/diffusion/MOVA/MOVA"
+                      "cookbook/diffusion/HiDream/HiDream-O1-Image"
                     ]
                   },
                   {
-                    "group": "SANA Video",
-                    "tag": "NEW",
+                    "group": "OpenMOSS",
                     "pages": [
-                      "cookbook/diffusion/SANA-Video/SANA-Video"
+                      "cookbook/diffusion/MOVA/MOVA",
+                      "cookbook/diffusion/OpenMOSS/MOSS-Image"
                     ]
                   },
                   {
                     "group": "MiniMax",
-                    "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/MiniMax/MiniMax-H3"
                     ]
                   },
                   {
-                    "group": "LingBot Video",
+                    "group": "Kandinsky",
                     "tag": "NEW",
                     "pages": [
-                      "cookbook/diffusion/LingBot-Video/LingBot-Video-MoE"
+                      "cookbook/diffusion/Kandinsky/Kandinsky6",
+                      "cookbook/diffusion/Kandinsky/Kandinsky6-SR"
                     ]
                   },
                   {
-                    "group": "LingBot World",
+                    "group": "Robbyant",
                     "pages": [
+                      "cookbook/diffusion/LingBot-Video/LingBot-Video-MoE",
                       "cookbook/diffusion/LingBot-World/LingBot-World",
                       "cookbook/diffusion/LingBot-World/LingBot-World-2.0"
-                    ]
-                  },
-                  {
-                    "group": "SANA-WM",
-                    "pages": [
-                      "cookbook/diffusion/SANA-WM/SANA-WM"
                     ]
                   }
                 ]
@@ -1641,7 +1700,7 @@
                     ]
                   },
                   {
-                    "group": "FLUX",
+                    "group": "Black Forest Labs",
                     "tag": "NEW",
                     "pages": [
                       "cookbook/vla/FLUX/FLUX-3-Action"

@@ -8,7 +8,7 @@ from sglang.srt.speculative.domino_utils import _domino_gru_cell, domino_greedy_
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
@@ -39,6 +39,7 @@ class TestDFlashDominoRollout(CustomTestCase):
             vocab_size=31,
             shift_label=shift_label,
             candidate_pool_size=pool_size,
+            in_cuda_graph=False,
         )
 
     def test_gru_feedback_matches_sequence(self):

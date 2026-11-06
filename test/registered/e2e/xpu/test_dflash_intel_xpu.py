@@ -22,7 +22,7 @@ from registered.spec.dflash import test_dflash as _dflash_base
 
 from sglang.test.ci.ci_register import register_xpu_ci
 
-register_xpu_ci(est_time=600, suite="nightly-xpu-1-gpu", nightly=True)
+register_xpu_ci(est_time=600, suite="nightly-xpu-kernel-main-1-gpu", nightly=True)
 
 # Appended after the base launch_args by setUpClass: the trailing
 # --mem-fraction-static overrides the base 0.7, and --device selects the Intel

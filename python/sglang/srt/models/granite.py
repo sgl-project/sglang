@@ -79,7 +79,9 @@ def build_attention_sinks(num_heads: int) -> nn.Parameter:
     attn_backend = get_exec().kernel.attention_backend
     sinks_dtype = torch.float32 if attn_backend == "trtllm_mha" else torch.bfloat16
     sinks = nn.Parameter(torch.empty(num_heads, dtype=sinks_dtype), requires_grad=False)
-    set_weight_attrs(sinks, {"weight_loader": sharded_weight_loader(0)})
+    set_weight_attrs(
+        sinks, {"weight_loader": sharded_weight_loader(0, parallel_group="tp")}
+    )
     return sinks
 
 

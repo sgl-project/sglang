@@ -341,9 +341,17 @@ class BlackwellFusedMultiHeadAttentionForward:
         stride_b_lse = h_r64 * h_k64 * s_lse64 if cum_seqlen_q is None else 0
 
         # (s, d, ((h_r, h_k), b))
+        if cutlass.const_expr(q_rank == 5):
+            q_row_stride = Int64(q_tensor.stride[1])
+            q_head_stride = (Int64(q_tensor.stride[3]), Int64(q_tensor.stride[2]))
+        else:
+            q_row_stride = Int64(q_tensor.stride[q_rank - 3])
+            head_stride = Int64(q_tensor.stride[q_rank - 2])
+            q_head_stride = (head_stride, head_stride * h_r64)
+        q_batch_stride = Int64(q_tensor.stride[0]) if cum_seqlen_q is None else 0
         q_layout = cute.make_layout(
             (s_q_total, d, ((h_r, h_k), b)),
-            stride=(d64 * h_r64 * h_k64, 1, ((d64, d64 * h_r64), stride_b_qo)),
+            stride=(q_row_stride, 1, (q_head_stride, q_batch_stride)),
         )
         q = cute.make_tensor(q_tensor.iterator, q_layout)
         if cutlass.const_expr(mPageTable is not None):

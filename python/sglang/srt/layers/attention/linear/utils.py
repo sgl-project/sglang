@@ -68,7 +68,7 @@ class LinearAttnBackends(msgspec.Struct, frozen=True):
     """One runner's linear-attn kernel choice, per phase.
 
     Per runner, not per process: a target and its draft coexist and can want
-    different kernels (only the runner whose model is GDN gets the SM100
+    different kernels (only eligible GDN/KDA runners get the
     FlashInfer prefill default, and an explicit flag applies to whichever runner
     was launched with it).
     """
@@ -83,8 +83,8 @@ def resolve_linear_attn_backends(
 ) -> LinearAttnBackends:
     """This runner's kernel choice from the published leaves.
 
-    ``prefill_default`` is the caller's own auto-default (the SM100 GDN
-    domain); an explicitly configured ``--linear-attn-prefill-backend`` wins.
+    ``prefill_default`` is the caller's own auto-default;
+    an explicitly configured ``--linear-attn-prefill-backend`` wins.
     """
     mamba = get_exec().mamba
     base = mamba.linear_attn_backend

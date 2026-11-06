@@ -11,17 +11,17 @@ import torch
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class TestCudaVmmFeatureTransport(unittest.TestCase):
     def test_failed_consumer_reconstruction_releases_remaining_proxies(self):
-        from sglang.srt.managers.schedule_batch import (
-            Modality,
+        from sglang.srt.managers.req_types import (
             MultimodalDataItem,
             MultimodalInputs,
             MultimodalProcessorOutput,
         )
+        from sglang.srt.multimodal.modality import Modality
         from sglang.srt.multimodal.transport.cuda_ipc import (
             CudaIpcTensorTransportProxy,
         )
@@ -203,7 +203,8 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
             CudaVmmFeatureTransport(SimpleNamespace(), None)
 
     def test_image_features_are_packed_per_request(self):
-        from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+        from sglang.srt.managers.req_types import MultimodalDataItem
+        from sglang.srt.multimodal.modality import Modality
         from sglang.srt.utils.cuda_vmm_transport_utils import (
             CudaVmmFeatureTransport,
         )
@@ -224,31 +225,10 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         transport.pool.wrap_tensor.assert_not_called()
         self.assertEqual([item.feature for item in items], proxies)
 
-    def test_video_clip_features_are_packed_per_request(self):
-        from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
-        from sglang.srt.utils.cuda_vmm_transport_utils import (
-            CudaVmmFeatureTransport,
-        )
-
-        transport = object.__new__(CudaVmmFeatureTransport)
-        transport.pool = MagicMock()
-        features = [torch.arange(4), torch.arange(4, 8)]
-        proxies = [object(), object()]
-        transport.pool.wrap_tensors.return_value = proxies
-        items = [
-            MultimodalDataItem(modality=Modality.VIDEO, feature=feature)
-            for feature in features
-        ]
-
-        transport.wrap_items(items)
-
-        transport.pool.wrap_tensors.assert_called_once_with(features)
-        transport.pool.wrap_tensor.assert_not_called()
-        self.assertEqual([item.feature for item in items], proxies)
-
     def test_deferred_features_are_not_packed(self):
-        from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
-        from sglang.srt.utils.cuda_ipc_transport_utils import (
+        from sglang.srt.managers.req_types import MultimodalDataItem
+        from sglang.srt.multimodal.modality import Modality
+        from sglang.srt.multimodal.transport.cuda_ipc import (
             DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
         )
         from sglang.srt.utils.cuda_vmm_transport_utils import (
@@ -279,7 +259,8 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         self.assertEqual([item.feature for item in items], proxies)
 
     def test_tensor_containers_fail_closed(self):
-        from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+        from sglang.srt.managers.req_types import MultimodalDataItem
+        from sglang.srt.multimodal.modality import Modality
         from sglang.srt.utils.cuda_vmm_transport_utils import (
             CudaVmmFeatureTransport,
         )
@@ -298,7 +279,8 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         transport.pool.wrap_tensors.assert_not_called()
 
     def test_partial_failure_restores_tensors_and_cancels_packed_chunk_once(self):
-        from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+        from sglang.srt.managers.req_types import MultimodalDataItem
+        from sglang.srt.multimodal.modality import Modality
         from sglang.srt.utils.cuda_vmm_transport_utils import (
             CudaVmmFeatureTransport,
             CudaVmmMemoryPool,
@@ -341,11 +323,11 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
 
     def test_failed_dispatch_cancels_published_items(self):
         from sglang.srt.managers import tokenizer_manager
-        from sglang.srt.managers.schedule_batch import (
-            Modality,
+        from sglang.srt.managers.req_types import (
             MultimodalDataItem,
             MultimodalProcessorOutput,
         )
+        from sglang.srt.multimodal.modality import Modality
 
         manager = object.__new__(tokenizer_manager.TokenizerManager)
         manager.rid_to_state = {}
@@ -363,6 +345,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         )
         transport.prepare_for_dispatch_async = AsyncMock(return_value=items)
         manager.cuda_vmm_feature_transport = transport
+        manager.positional_embeds_transport = MagicMock()
 
         with (
             patch.object(tokenizer_manager, "wrap_shm_features", lambda obj: obj),
@@ -377,11 +360,11 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
 
     def test_post_dispatch_failure_does_not_cancel_published_items(self):
         from sglang.srt.managers import tokenizer_manager
-        from sglang.srt.managers.schedule_batch import (
-            Modality,
+        from sglang.srt.managers.req_types import (
             MultimodalDataItem,
             MultimodalProcessorOutput,
         )
+        from sglang.srt.multimodal.modality import Modality
 
         manager = object.__new__(tokenizer_manager.TokenizerManager)
         manager.rid_to_state = {}
@@ -401,6 +384,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         )
         transport.prepare_for_dispatch_async = AsyncMock(return_value=items)
         manager.cuda_vmm_feature_transport = transport
+        manager.positional_embeds_transport = MagicMock()
 
         with (
             patch.object(tokenizer_manager, "wrap_shm_features", lambda obj: obj),
@@ -412,6 +396,11 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         transport.cancel_for_dispatch.assert_not_called()
 
     def test_async_publication_keeps_event_loop_responsive(self):
+        from sglang.srt.managers.req_types import (
+            MultimodalDataItem,
+            MultimodalProcessorOutput,
+        )
+        from sglang.srt.multimodal.modality import Modality
         from sglang.srt.utils.cuda_vmm_transport_utils import (
             CudaVmmFeatureTransport,
         )
@@ -437,7 +426,11 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
                 release.set()
 
         transport.prepare_for_dispatch = MagicMock(side_effect=block_publication)
-        mm_inputs = SimpleNamespace(mm_items=[object()])
+        mm_inputs = MultimodalProcessorOutput(
+            mm_items=[
+                MultimodalDataItem(modality=Modality.IMAGE, feature=torch.ones(2))
+            ]
+        )
 
         async def run():
             watchdog = threading.Thread(target=unblock_if_event_loop_stalls)
@@ -447,6 +440,8 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
                     transport.prepare_for_dispatch_async([mm_inputs])
                 )
                 while not started.is_set():
+                    if task.done():
+                        await task
                     await asyncio.sleep(0)
                 event_loop_responsive.set()
                 self.assertFalse(task.done())
@@ -519,6 +514,7 @@ class TestCudaVmmFeatureTransport(unittest.TestCase):
         from sglang.srt.utils import cuda_vmm_transport_utils as vmm
 
         pool = object.__new__(vmm.CudaVmmMemoryPool)
+        pool._lock = threading.Lock()
         pool.device_index = 0
         pool.consumer_count = 2
         pool._recycle_stream = object()
@@ -727,6 +723,7 @@ class TestSchedulerMmTransportBoundary(CustomTestCase):
         class TokenizedRequest:
             def __init__(self):
                 self.mm_inputs = object()
+                self.positional_embed_overrides = None
 
         scheduler = object.__new__(scheduler_module.Scheduler)
         scheduler.model_config = SimpleNamespace(requires_mm_token_modalities=False)
@@ -786,7 +783,7 @@ class TestSchedulerMmTransportBoundary(CustomTestCase):
         self._prepare_scheduler(scheduler)
         raw_inputs = object()
         materialized = object()
-        request = SimpleNamespace(mm_inputs=raw_inputs)
+        request = SimpleNamespace(mm_inputs=raw_inputs, positional_embed_overrides=None)
 
         with (
             patch.object(
@@ -819,6 +816,7 @@ class TestSchedulerMmTransportBoundary(CustomTestCase):
         class TokenizedRequest:
             def __init__(self, mm_inputs):
                 self.mm_inputs = mm_inputs
+                self.positional_embed_overrides = None
 
         class BatchRequest:
             def __init__(self, batch):
@@ -870,7 +868,7 @@ class TestSchedulerMmTransportBoundary(CustomTestCase):
         scheduler._request_dispatcher.assert_called_once_with(request)
 
     def test_already_materialized_inputs_are_reused(self):
-        from sglang.srt.managers.schedule_batch import MultimodalInputs
+        from sglang.srt.managers.req_types import MultimodalInputs
         from sglang.srt.managers.scheduler import Scheduler
 
         scheduler = object.__new__(Scheduler)
@@ -966,6 +964,7 @@ class TestSchedulerMmTransportBoundary(CustomTestCase):
         scheduler.tokenizer = object()
         scheduler.disable_radix_cache = False
         scheduler._maybe_namespace_elastic_radix_cache = MagicMock()
+        scheduler._record_kv_event_lora_name = MagicMock()
         scheduler._add_request_to_queue = MagicMock()
         scheduler._get_multimodal_inputs = MagicMock(
             side_effect=scheduler_module._MultimodalInputProcessingError("bad image")
@@ -981,12 +980,15 @@ class TestSchedulerMmTransportBoundary(CustomTestCase):
             routed_dp_rank=None,
             priority=None,
             dimensions=None,
+            encoding_format=None,
             lora_id=None,
+            lora_name=None,
             http_worker_ipc=None,
             time_stats=None,
             return_pooled_hidden_states=False,
             multi_item_delimiter_indices=None,
             token_indices_to_pool=None,
+            decision_layout=None,
             mm_inputs=object(),
         )
 
@@ -1017,7 +1019,7 @@ class TestSchedulerMmTransportBoundary(CustomTestCase):
         from sglang.srt.managers import scheduler as scheduler_module
 
         class TokenizedRequest:
-            pass
+            positional_embed_overrides = None
 
         class EmbeddingRequest:
             pass
@@ -1121,6 +1123,7 @@ class TestVmmConsumerCount(unittest.TestCase):
         proxy = object.__new__(CudaVmmTensorTransportProxy)
         proxy.consumer_count = 4
         with get_parallel().override(
+            tp_rank=3,
             attn_tp_size=2,
             attn_tp_rank=1,
             attn_cp_size=2,

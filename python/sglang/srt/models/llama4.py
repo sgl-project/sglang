@@ -30,9 +30,9 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layer_boundary import (
+    append_stages,
     declare_attn,
     declare_ffn,
-    make_stages,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
@@ -43,15 +43,13 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from sglang.srt.model_executor.forward_batch_info import (
-    ForwardBatch,
-    ForwardMode,
-    PPProxyTensors,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.models.llama import LlamaForCausalLM, LlamaMLP
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.runtime_context import get_parallel
@@ -124,7 +122,12 @@ class Llama4MoE(nn.Module):
             reduce_results=False,
             quant_config=quant_config,
             apply_router_weight_on_input=True,
+            routing_method_type=RoutingMethodType.Llama4,
             prefix=add_prefix("experts", prefix),
+        )
+        self.topk.bind_runner_backend(
+            self.experts.runner_backend,
+            routing_method_type=self.experts.routing_method_type,
         )
 
         self.shared_expert = LlamaMLP(
@@ -212,7 +215,6 @@ class Llama4Attention(nn.Module):
         self.use_rope = (layer_id + 1) % 4 != 0
         self.use_qk_norm = config.use_qk_norm and self.use_rope
 
-        attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
 
         self.total_num_heads = num_heads
@@ -264,8 +266,7 @@ class Llama4Attention(nn.Module):
             bias=bias,
             quant_config=qkv_quant_config,
             prefix=add_prefix("qkv_proj", prefix),
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
         )
 
         self.o_proj = RowParallelLinear(
@@ -274,8 +275,7 @@ class Llama4Attention(nn.Module):
             bias=bias_o_proj,
             quant_config=o_quant_config,
             prefix=add_prefix("o_proj", prefix),
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
+            parallel_group="attn_tp",
             reduce_results=False,
         )
         is_neox_style = True
@@ -398,7 +398,6 @@ class Llama4DecoderLayer(nn.Module):
         )
         self.config = config
         is_moe_layer = self._is_moe_layer(layer_id)
-        is_previous_moe_layer = self._is_moe_layer(layer_id - 1)
         is_next_moe_layer = self._is_moe_layer(layer_id + 1)
 
         if is_moe_layer:
@@ -422,7 +421,7 @@ class Llama4DecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
-        self.attn_boundary, self.ffn_boundary = make_stages(
+        self.attn_boundary, self.ffn_boundary = append_stages(
             (declare_attn(), self.input_layernorm),
             (
                 declare_ffn(
@@ -431,12 +430,6 @@ class Llama4DecoderLayer(nn.Module):
                 ),
                 self.post_attention_layernorm,
             ),
-            previous=declare_ffn(
-                sparse=is_previous_moe_layer, next_layer_sparse=is_moe_layer
-            )
-            if layer_id != 0
-            else None,
-            terminal=layer_id == config.num_hidden_layers - 1,
         )
 
     def _is_moe_layer(self, layer_id: int) -> bool:
@@ -499,7 +492,10 @@ class Llama4Model(nn.Module):
         self.layers = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: Llama4DecoderLayer(
-                config=config, layer_id=idx, quant_config=quant_config, prefix=prefix
+                config=config,
+                layer_id=idx,
+                quant_config=quant_config,
+                prefix=prefix,
             ),
             prefix=add_prefix("layers", prefix),
         )
@@ -557,31 +553,6 @@ class Llama4ForCausalLM(LlamaForCausalLM):
         prefix: str = "",
     ):
         super().__init__(config, quant_config, prefix)
-
-    @torch.no_grad()
-    def forward_split_prefill(
-        self, input_ids, positions, forward_batch, split_interval, input_embeds=None
-    ):
-        start, end = split_interval
-        if start == 0:
-            residual_batch.start(forward_batch)
-            forward_batch.hidden_states = (
-                self.model.embed_tokens(input_ids)
-                if input_embeds is None
-                else input_embeds
-            )
-        for layer in self.model.layers[start:end]:
-            forward_batch.hidden_states = layer(
-                positions, forward_batch.hidden_states, forward_batch
-            )
-        if end != self.model.config.num_hidden_layers:
-            return None
-        forward_batch.hidden_states = residual_batch.final_norm(
-            forward_batch.hidden_states, forward_batch, self.model.norm
-        )
-        return self.logits_processor(
-            input_ids, forward_batch.hidden_states, self.lm_head, forward_batch
-        )
 
     def get_input_embeddings(self):
         return self.model.embed_tokens

@@ -16,7 +16,12 @@ from sglang.srt.arg_groups.overrides import (
     modelexpress_url_of,
 )
 from sglang.srt.configs.device_config import DeviceConfig
-from sglang.srt.configs.load_config import LoadConfig, LoadFormat
+from sglang.srt.configs.load_config import (
+    _DEFAULT_LOAD_GROUP,
+    LoadConfig,
+    LoadFormat,
+    LoadGroup,
+)
 from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
 from sglang.srt.debug_utils.tensor_dump_forward_hook import (
     register_forward_hook_for_model,
@@ -115,6 +120,12 @@ def load_kv_cache_scales(*, model, kv_cache_dtype: str) -> None:
     """``kv_cache_dtype`` is the caller's resolved value. Required rather than
     defaulted: a fallback to ``server_args`` would be a hidden global read for
     any future caller that forgets to pass one."""
+    quant_config = getattr(model, "quant_config", None)
+    if _is_npu and quant_config is not None and quant_config.get_name() == "modelslim":
+        # This helper loads a separate --quantization-param-path calibration file.
+        # ModelSlim loads KV scales from the checkpoint with model weights.
+        return
+
     if kv_cache_dtype == "fp8_e4m3":
         if get_model().quantization_param_path is not None:
             if callable(getattr(model, "load_kv_cache_scales", None)):
@@ -202,6 +213,7 @@ def build_load_config(
     draft_model_idx: int | None,
     weight_cache_mode: str,
     weight_cache_socket: str | None,
+    load_group: LoadGroup = _DEFAULT_LOAD_GROUP,
 ) -> LoadConfig:
     from sglang.srt.configs.modelopt_config import ModelOptConfig
 
@@ -231,6 +243,7 @@ def build_load_config(
         draft_model_idx=draft_model_idx,
         weight_cache_mode=weight_cache_mode,
         weight_cache_socket=weight_cache_socket,
+        load_group=load_group,
     )
 
 

@@ -1,3 +1,4 @@
+from functools import partial
 from typing import Iterable, Optional
 
 import torch
@@ -11,9 +12,9 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.layer_boundary import (
+    append_stages,
     declare_attn,
     declare_ffn,
-    make_stages,
 )
 from sglang.srt.layers.layer_boundary.output import OutputTransform
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
@@ -40,32 +41,34 @@ from sglang.srt.utils import make_pp_layers
 from .granitemoe import GraniteMoeMoE, GraniteMoeSharedMLP
 
 
-def _make_stages(layer, config, layer_idx: int):
-    """Both kinds of layer scale their mixer and FFN outputs by
-    residual_multiplier, add them in the activation dtype and normalize the sum
-    as a separate step."""
-    scale = OutputTransform(layer._scale_output)
-    sparse = layer.block_sparse_moe is not None
-    return make_stages(
-        (
-            declare_attn(read=UNFUSED_NORM_READOUT, output_transform=scale),
-            layer.input_layernorm,
+def _has_moe(config: GraniteMoeHybridConfig) -> bool:
+    return getattr(config, "num_local_experts", 0) > 0
+
+
+def stage_facts(config: GraniteMoeHybridConfig, layer_idx: int, scale=None):
+    """The stages a layer of either kind declares, from the config alone: the
+    model's shared declaration function, which the layers declare with too
+    (see make_layers). Both kinds of layer scale their mixer and FFN outputs
+    by residual_multiplier (``scale``), add them in the activation dtype and
+    normalize the sum as a separate step."""
+    scale = OutputTransform(scale)
+    sparse = _has_moe(config)
+    return (
+        declare_attn(read=UNFUSED_NORM_READOUT, output_transform=scale),
+        declare_ffn(
+            sparse=sparse,
+            next_layer_sparse=sparse,
+            read=UNFUSED_NORM_READOUT,
+            output_transform=scale,
         ),
-        (
-            declare_ffn(
-                sparse=sparse,
-                next_layer_sparse=sparse,
-                read=UNFUSED_NORM_READOUT,
-                output_transform=scale,
-            ),
-            layer.post_attention_layernorm,
-        ),
-        previous=(
-            declare_ffn(sparse=sparse, next_layer_sparse=sparse)
-            if layer_idx != 0
-            else None
-        ),
-        terminal=layer_idx == config.num_hidden_layers - 1,
+    )
+
+
+def _make_stages(layer, config: GraniteMoeHybridConfig, layer_idx: int):
+    attn, ffn = stage_facts(config, layer_idx, scale=layer._scale_output)
+    return append_stages(
+        (attn, layer.input_layernorm),
+        (ffn, layer.post_attention_layernorm),
     )
 
 
@@ -97,7 +100,7 @@ class GraniteMoeHybridMambaDecoderLayer(nn.Module):
         )
 
         self.block_sparse_moe = None
-        if getattr(config, "num_local_experts", 0) > 0:
+        if _has_moe(config):
             self.block_sparse_moe = GraniteMoeMoE(
                 num_experts=config.num_local_experts,
                 top_k=config.num_experts_per_tok,
@@ -288,7 +291,7 @@ class GraniteMoeHybridAttentionDecoderLayer(nn.Module):
         )
 
         self.block_sparse_moe = None
-        if getattr(config, "num_local_experts", 0) > 0:
+        if _has_moe(config):
             self.block_sparse_moe = GraniteMoeMoE(
                 num_experts=config.num_local_experts,
                 top_k=config.num_experts_per_tok,
@@ -401,6 +404,7 @@ class GraniteMoeHybridModel(nn.Module):
             config.num_hidden_layers,
             get_layer,
             prefix=f"{prefix}.layers",
+            stage_facts=partial(stage_facts, config),
         )
 
         if self.pp_group.is_last_rank:

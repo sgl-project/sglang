@@ -51,6 +51,12 @@ framework-specific optimization workflow.
 - `python/sglang/multimodal_gen/runtime/models/vaes/autoencoder_kl_qwenimage.py`
 - `python/sglang/multimodal_gen/runtime/models/dits/qwen_image21.py`
 - `python/sglang/kernels/ops/diffusion/rope/qknorm_complex_rope_jit.py`
+
+- `python/sglang/multimodal_gen/runtime/models/vaes/qwen_image21_vae_cuda_opt.py`
+- `python/sglang/multimodal_gen/runtime/models/vaes/conv_fold.py`
+- `python/sglang/kernels/ops/diffusion/norm/channel_rmsnorm_finish_silu_jit.py`
+- `python/sglang/kernels/ops/diffusion/norm/channel_rmsnorm_silu_nhwc_jit.py`
+- `python/sglang/kernels/ops/diffusion/elementwise/bias_residual_add_jit.py`
 - `python/sglang/multimodal_gen/runtime/breakable_cuda_graph/runner.py`
 - `test/registered/kernels/ops/diffusion/test_modulate.py`
 - `test/registered/kernels/ops/diffusion/test_norm.py`
@@ -110,12 +116,12 @@ framework-specific optimization workflow.
   check dtype, alignment, shape, BCG/compile context, and the one-time equality
   self-test before proposing another fusion.
 
-4. Request-scoped fusion gates at `quality=extra-high` or `quality=high`
+4. Request-scoped fusion gates at `quality=lossless` or `quality=high`
 - Locations: `quality_gate.py`, `fused_ln_modulate.py`, `denoising.py`,
   `decoding.py`, `fast_path_gate.py`, `flux2_vae_cuda_opt.py`, and
   `wan_vae_cuda_opt.py`.
 - Behavior: `quality="lossless"` is the default exact reference path.
-  `quality="extra-high"` and `quality="high"` mount the same validated but
+  `quality="lossless"` and `quality="high"` mount the same validated but
   non-bit-exact DiT fusions and decode-scoped VAE rewrites. `high` is
   cumulative and may additionally enable model-owned approximate paths.
   Mounting is all-or-nothing per
@@ -127,7 +133,9 @@ framework-specific optimization workflow.
   decoder rewrites used by FLUX.1/FLUX.2/Z-Image/SD3, and Wan / Qwen-Image
   VAE RMSNorm+SiLU (the Qwen-Image VAE is the Wan 2.1 VAE; its gate also
   re-expresses the `Resample` upsample input with canonical NHWC strides so
-  the 2D conv runs channels_last end-to-end).
+  the 2D conv runs channels_last end-to-end), and the Qwen-Image 2.1 VAE
+  channels_last decode with its NHWC channel RMSNorm + SiLU kernel
+  (pattern 18).
 - Do not confuse request `--quality` with `--output-quality`, which controls
   output-file compression rather than model math.
 - Validation: `test/registered/kernels/ops/diffusion/test_sites.py`,
@@ -233,6 +241,16 @@ framework-specific optimization workflow.
   reduction order of the eager RMSNorm that follows under fp32 autocast
   (Wan pipelines decode with fp32 VAE weights under bf16 autocast, where this
   was measured non-bit-exact even though the add itself is commutative).
+- `conv_bias_epilogue` (`modulate/conv_bias_epilogue_triton.py`): PyTorch's
+  cuDNN conv adds its bias as a separate unvectorised `add_` on channels_last
+  outputs (~10% of a Wan 2.1 decode). `WanCausalConv3d._conv_with_epilogue`
+  runs the conv without bias and applies it in one bit-exact pass, fused with
+  the residual add for `conv2` (`residual=`) and deferred into `norm2` for
+  `conv1` (`skip_bias=` + `WanRMS_norm.forward(x, conv_bias=...)`; the gated
+  `wan_rmsnorm_silu` absorbs it via `conv_bias=`). `wan_rmsnorm_silu` itself
+  now tiles `[ROWS, C]` pixels per program (0.63 -> ~3 TB/s at C = 96); its
+  reduction tree changed, which moves ~2e-6 of the elements by one bf16 ulp
+  relative to the previous kernel, within the same quality-gated contract.
 - The Qwen-Image VAE (`autoencoder_kl_qwenimage.py`) uses the same
   `cat_pad_channels_last_3d` + compact-cache helper for every causal conv
   slot; single-frame image decodes keep the compact cache at the reference
@@ -304,7 +322,7 @@ framework-specific optimization workflow.
   layouts (B > 1, SP > 1, LoRA-wrapped or quantized projections,
   head_dim != 128) and first-sight mismatches keep the Triton
   `qknorm_complex_rope` / `qknorm_complex_rope_kv` chain.
-- Validation: `test/registered/kernels/ops/diffusion/test_qknorm_complex_rope.py`,
+- Validation: `test/registered/kernels/ops/diffusion/test_complex_rope.py`,
   the `test_qwen21_cuda_qk_rope_*` cases in `test_model_fast_paths.py`, and
   `python/sglang/multimodal_gen/test/unit/test_qwen_image21_cuda.py`.
 - Workflow rule: if a Qwen-Image 2.1 trace still shows
@@ -314,6 +332,72 @@ framework-specific optimization workflow.
   remaining non-GEMM/attention time per block is the SiLU-mul and the
   residual-gate + LayerNorm chain, both measured at the DRAM roofline; a fused
   gated LayerNorm was tried and was slower than the two-kernel chain.
+
+18. Qwen-Image 2.1 VAE decode
+- Kernels: `channel_rmsnorm_finish_silu`, `channel_rmsnorm_silu_nhwc`,
+  `bias_residual_add`, and `dup_up3d_add`'s bias input.
+- Locations: `norm/channel_rmsnorm_finish_silu_jit.py`,
+  `norm/channel_rmsnorm_silu_nhwc_jit.py`,
+  `norm/bias_residual_add_jit.py` (with their `.cuh` files),
+  `layout/wan_causal_cache_triton.py`, `vaes/conv_fold.py`, and
+  `runtime/models/vaes/qwen_image21_vae_cuda_opt.py` (mounted from
+  `optimize_vae` in `platforms/cuda.py`).
+- Default-on and bit-exact: the decoder's channel RMSNorm keeps the aten fp32
+  `norm(dim=1)` reduction and fuses only the pointwise finish
+  (`max(norm, 1e-12)`, divide, scale, gamma, `+0.0`) with SiLU; the causal
+  convs fold their symmetric `F.pad` into the conv padding, verified per
+  (dtype, shape, stride) signature because cuDNN may pick another algorithm
+  (only attempted above 2^18 output elements, where a bit-exact match is
+  decisive; two engines with different accumulation orders agree on all but
+  ~1e-4 of the elements, so small convs keep the padded path);
+  aten's separate conv-bias pass disappears for each residual block's second
+  conv (`bias_residual_add` applies bias and residual in one pass) and for the
+  upsampler conv (`dup_up3d_add` takes the bias on the shortcut add).
+- Under `quality=extra-high` / `high` (`VaeFastPathGate`, decode scoped): the
+  decoder switches to channels_last, the channel RMSNorm + SiLU runs as one
+  lane-group-per-pixel NHWC kernel (own fp32 reduction order, not bit-exact)
+  that also takes the first conv's bias, and the nearest 2x upsample + conv3x3
+  of each upsampler becomes one ConvTranspose2d(k4, s2, p1) with fp32-folded
+  weights (`conv_fold.py`, shared with FLUX.2); leaving the scope restores the
+  NCHW parameter layout. Measured on one SM120 GPU at 1024x1024: decode
+  186.0 ms -> 159.8 ms (lossless) -> 100.4 ms (extra-high), RGBA PSNR 59 dB and
+  SSIM > 0.9999 against the lossless image. The remaining extra-high decode is
+  ~80% cuDNN conv time (the last up block runs six 3x3 convs at 1024x1024).
+- Validation: `test/registered/kernels/ops/diffusion/test_channel_rmsnorm_finish_silu.py`,
+  `test_channel_rmsnorm_silu_nhwc.py`, `test_bias_residual_add.py`, the
+  `dup_up3d_add` bias case in `test_layout.py`, and
+  `test_qwen_image21_vae_fast_paths.py`.
+
+19. MiniMax-H3 video VAE batched decode and output kernels
+- Kernels: `minimax_h3_vae_temporal_blend_write`, `minimax_h3_vae_denorm_clamp`.
+- Locations: `layout/minimax_h3_vae_output_jit.py` (with its `.cuh`),
+  `runtime/models/vaes/minimax_h3_video_vae/klvae.py`, `processor.py` and
+  `batching.py`, and `runtime/models/vaes/minimax_h3_vae_cuda_opt.py` (one
+  `VaeFastPathGate` shared with the fused QK RMSNorm+RoPE / cuDNN SDPA
+  attention; mounted from `optimize_vae` in `platforms/cuda.py`).
+- Not quality-gated and bit-exact (SM100+): the temporal window blend
+  written straight into the output frames and the RGB de-normalization +
+  clamp run as one kernel each at every level. The blend write spells klvae's
+  `a * (1 - w) + b * w` and the denorm `(x - mean) / std` with one fp32
+  rounding per op; `sites/bitexact_gate.py`
+  verifies each site against the eager chain on first sight and falls back for
+  good on a mismatch. The denorm kernel runs in place when the decode stage
+  owns the frames.
+- Under `quality=lossless` / `high` (`VaeFastPathGate`, decode scoped): the
+  tiled decode runs up to `vae_config.decoder_tile_batch` (64) spatial tiles
+  and `vae_config.window_batch` (1) temporal windows per decoder forward, in
+  the original order. Batching changes cuBLAS/cuDNN algorithm selection, so it
+  stays behind the gate, which the CUDA installer registers (other platforms
+  keep one tile per forward); `exact` keeps one tile and one window per forward,
+  `--performance-mode memory` does so at every level, and FastH3 sets the tile
+  cap to 0 (all of a rank's tiles).
+- Validation: `test/registered/kernels/ops/diffusion/test_minimax_h3_vae_output.py` and
+  `multimodal_gen/test/unit/test_minimax_h3_vae_fast_path.py`.
+- Workflow rule: if a `lossless` H3 decode trace still runs one decoder
+  forward per tile, check the gate around the decode (`use_vae_fast_path`)
+  and the config caps before proposing another kernel. If the temporal blend
+  or denorm kernel is absent from an SM100+ trace, look for the first-sight
+  fallback warning.
 
 **Faster CUDA Kernel Usage Points**
 
@@ -350,7 +434,7 @@ framework-specific optimization workflow.
   - `can_use_fused_inplace_qknorm(head_dim, dtype)` returns true.
   - Supported head dims: `64, 128, 256, 512, 1024`.
 - Behavior: Fused path operates on `q` and `k` in place after reshaping to `[B, -1, head_dim]`. If preconditions fail, fall back to per-tensor RMSNorm.
-- Validation: `test/registered/kernels/ops/layernorm/test_qknorm.py` and `test/registered/kernels/ops/layernorm/test_qknorm_across_heads.py`.
+- Validation: `test/registered/kernels/ops/layernorm/test_qknorm.py`.
 
 **QK Norm + RoPE Optimization**
 
@@ -397,13 +481,13 @@ framework-specific optimization workflow.
 
 **Request-Scoped DiT Fusions with Breakable CUDA Graphs**
 
-- DiT sites at `quality=extra-high` or `quality=high` are mounted at a request boundary. BCG warmup uses
+- DiT sites at `quality=lossless` or `quality=high` are mounted at a request boundary. BCG warmup uses
   the model's lossless sampling default unless a quality-aware graph variant
   was captured explicitly.
 - A graph captured before the request-quality mount retains the lossless module
   branches. Replaying it after the mount silently bypasses the requested fused
   kernels even when the tensor signature matches.
-- Workflow rule: an extra-high/high+BCG cell is valid only when the model has no
+- Workflow rule: an lossless/high+BCG cell is valid only when the model has no
   request-scoped DiT quality sites, or when logs prove those sites were mounted
   before the matching graph capture. A mount after `[Diffusion BCG] captured`
   invalidates the row; do not use its latency or output as request-quality
@@ -434,7 +518,7 @@ framework-specific optimization workflow.
   selector when its CUDA layout guard passes. Check that guard before treating
   the `topk`/mask chain as a new opportunity. Its fused Triton RMSNorm row
   kernels remain request-gated by weight dtype and hidden size at
-  `quality=extra-high` and `quality=high`; check those separate quality-site
+  `quality=lossless` and `quality=high`; check those separate quality-site
   guards before treating an expanded `pow/mean/rsqrt` chain as new work.
 - LTX-2.5 reuses the mature LTX-2 DiT paths. Treat the optional diffusion
   decoder separately: confirm NATTEN `na3d` is active, then inspect its
@@ -448,7 +532,7 @@ framework-specific optimization workflow.
 - AdaLN modulation: `LayerNormScaleShift`, `RMSNormScaleShift`, `ScaleResidual*` in `layernorm.py`.
 - Bit-exact adaLN modulation / LayerNorm folding: `modulate_scale_shift` and
   `fused_layernorm_modulate` through `flux.py`, `glm_image.py`, and `sana.py`.
-- Request-scoped extra-high/high acceleration: `QualityGatedFusion` in
+- Request-scoped lossless/high acceleration: `QualityGatedFusion` in
   `quality_gate.py`, `_maybe_toggle_quality_fusions` in `denoising.py`, and
   `use_vae_fast_path` in `decoding.py`.
 - Bit-exact first-sight verify/disable: `BitExactFusionGate` in
@@ -466,8 +550,8 @@ framework-specific optimization workflow.
 - LingBot Video MoE routing: `LingBotVideoRouter._group_limited_topk` uses
   `group_limited_topk` through the diffusion facade when the CUDA layout guard
   passes, otherwise it retains the eager reference chain.
-- LTX2 RMSNorm+modulate and FFN GELU epilogue under `quality="extra-high"` and `quality="high"`:
-  `mark_ltx2_rms_norm_modulate_site` / `fused_ltx2_rms_norm_modulate` in
+- LTX2 RMSNorm+modulate and FFN GELU epilogue under `quality="lossless"` and `quality="high"`:
+  `LTX2_RMS_NORM_MODULATE.mark` / `fused_ltx2_rms_norm_modulate` in
   `kernels/ops/diffusion/sites/ltx2_rmsnorm_modulate_site.py` (mount-based
   `QualityGatedFusion`, not a first-sight `BitExactFusionGate` — the fused
   kernel is <=1 ULP off aten, so it is request-gated instead of verified),

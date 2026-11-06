@@ -5,12 +5,8 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import msgspec
 
-from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.runtime_context import (
-    get_model,
-    get_parallel,
-    get_spec,
-)
+from sglang.srt.configs.model_config import ModelConfig, is_deepseek_v4
+from sglang.srt.runtime_context import get_exec, get_spec
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -42,8 +38,16 @@ class SpecAuxHiddenStateConfig(msgspec.Struct, kw_only=True):
     dflash_use_aux_hidden_state: bool = False
     dflash_draft_num_layers: Optional[int] = None
     dflash_target_layer_ids: Any = None
-    # DFLASH draft KV bytes/token; None when unresolved.
-    dflash_draft_cell_size_per_token: int | None = None
+    # DeepSeek-V4 DSpark draft stages (DeepseekV4ForCausalLMDSpark.num_stages); a
+    # bundled head inherits the target's num_hidden_layers, so that overcounts.
+    dspark_num_stages: Optional[int] = None
+    # The draft checkpoint read in draft mode, and its KV layer count, for
+    # every drafting algorithm: the fused-draft placement's input. A private
+    # EAGLE draft pool is sized by `eagle_draft_num_layers` instead.
+    draft_model_config: Optional[ModelConfig] = None
+    draft_kv_num_layers: Optional[int] = None
+    # Route the DFLASH-family capture to the model's DSPARK hook when it has one.
+    is_dspark: bool = False
 
 
 def resolve_spec_aux_hidden_state_config(
@@ -53,7 +57,13 @@ def resolve_spec_aux_hidden_state_config(
     spec_algorithm: SpeculativeAlgorithm,
     is_draft_worker: bool,
 ) -> SpecAuxHiddenStateConfig:
-    config = SpecAuxHiddenStateConfig()
+    config = SpecAuxHiddenStateConfig(is_dspark=spec_algorithm.is_dspark())
+    _resolve_capture_only_aux_hidden_state(
+        config=config,
+        model_config=model_config,
+        spec_algorithm=spec_algorithm,
+        is_draft_worker=is_draft_worker,
+    )
     _resolve_eagle_aux_hidden_state(
         config=config,
         server_args=server_args,
@@ -71,6 +81,54 @@ def resolve_spec_aux_hidden_state_config(
     return config
 
 
+def _resolve_capture_only_aux_hidden_state(
+    *,
+    config: SpecAuxHiddenStateConfig,
+    model_config: ModelConfig,
+    spec_algorithm: SpeculativeAlgorithm,
+    is_draft_worker: bool,
+) -> None:
+    """--enable-return-aux-hidden-states: aux capture on a target without a draft.
+
+    No draft layer counts are set, so the KV pool reserves nothing for a draft.
+    """
+    features = get_exec().features
+    method = features.aux_hidden_state_capture
+    if method is None or is_draft_worker or not spec_algorithm.is_none():
+        return
+    layer_ids = features.return_aux_hidden_state_layer_ids
+    if layer_ids is not None:
+        _check_capture_layer_ids_in_range(layer_ids, model_config)
+    if method == "eagle3":
+        config.eagle_use_aux_hidden_state = True
+        config.eagle_aux_hidden_state_layer_ids = (
+            list(layer_ids) if layer_ids is not None else None
+        )
+    else:
+        config.dflash_use_aux_hidden_state = True
+        config.dflash_target_layer_ids = list(layer_ids)
+        config.is_dspark = method == "dspark"
+
+
+def _check_capture_layer_ids_in_range(layer_ids, model_config: ModelConfig) -> None:
+    num_layers = getattr(model_config.hf_text_config, "num_hidden_layers", None)
+    if num_layers is None:
+        raise ValueError(
+            "--return-aux-hidden-state-layer-ids requires target num_hidden_layers "
+            "in config."
+        )
+    # Loop models: target layer ids span num_hidden_layers * num_loops.
+    num_layers = int(num_layers) * int(
+        getattr(model_config.hf_text_config, "num_loops", 1)
+    )
+    out_of_range = [layer_id for layer_id in layer_ids if layer_id >= num_layers]
+    if out_of_range:
+        raise ValueError(
+            f"--return-aux-hidden-state-layer-ids {out_of_range} out of range for a "
+            f"target with {num_layers} layers."
+        )
+
+
 def _resolve_eagle_aux_hidden_state(
     *,
     config: SpecAuxHiddenStateConfig,
@@ -85,24 +143,37 @@ def _resolve_eagle_aux_hidden_state(
     ):
         return
 
-    draft_model_config = model_config
-    if get_spec().speculative_draft_model_path:
-        draft_model_config = ModelConfig.from_server_args(
-            server_args,
-            model_path=get_spec().speculative_draft_model_path,
-            model_revision=get_spec().speculative_draft_model_revision,
-            is_draft_model=True,
+    draft_path = get_spec().speculative_draft_model_path
+    # The draft read in draft mode. A path-less NEXTN/MTP head is the TARGET
+    # checkpoint rewritten to its MTP form, which is where its
+    # `num_nextn_predict_layers` gets filled in.
+    draft_mode_config = ModelConfig.from_server_args(
+        server_args,
+        model_path=draft_path,
+        model_revision=get_spec().speculative_draft_model_revision,
+        is_draft_model=True,
+    )
+    if draft_mode_config.num_nextn_predict_layers is not None:
+        config.draft_kv_num_layers = int(draft_mode_config.num_nextn_predict_layers)
+    elif draft_path:
+        config.draft_kv_num_layers = int(
+            max(
+                draft_mode_config.num_hidden_layers,
+                draft_mode_config.num_attention_layers,
+            )
         )
+    if config.draft_kv_num_layers is not None:
+        config.draft_model_config = draft_mode_config
+
+    # A private draft pool is sized off the TARGET config when path-less, so
+    # a path-less MTP deployment's token budget does not depend on the
+    # draft-mode rewrite.
+    draft_model_config = draft_mode_config if draft_path else model_config
     num_nextn_predict_layers = draft_model_config.num_nextn_predict_layers
     if num_nextn_predict_layers is not None:
         config.eagle_draft_num_layers = int(num_nextn_predict_layers)
-    elif get_spec().speculative_draft_model_path:
-        config.eagle_draft_num_layers = int(
-            max(
-                draft_model_config.num_hidden_layers,
-                draft_model_config.num_attention_layers,
-            )
-        )
+    elif draft_path:
+        config.eagle_draft_num_layers = config.draft_kv_num_layers
     else:
         return
 
@@ -201,54 +272,12 @@ def _resolve_dflash_aux_hidden_state(
                 )
             if dspark_draft_config.target_layer_ids is not None:
                 target_layer_ids = list(dspark_draft_config.target_layer_ids)
+                # Dense DSpark drafts build num_hidden_layers stages instead.
+                if is_deepseek_v4(draft_model_config.hf_config):
+                    config.dspark_num_stages = len(target_layer_ids)
 
         config.dflash_use_aux_hidden_state = True
         config.dflash_draft_num_layers = int(draft_num_layers)
+        config.draft_model_config = draft_model_config
+        config.draft_kv_num_layers = int(draft_num_layers)
         config.dflash_target_layer_ids = target_layer_ids
-        config.dflash_draft_cell_size_per_token = _resolve_dflash_draft_cell_size(
-            draft_model_config=draft_model_config,
-            draft_num_layers=int(draft_num_layers),
-        )
-
-
-def _resolve_dflash_draft_cell_size(
-    *,
-    draft_model_config: ModelConfig,
-    draft_num_layers: int,
-) -> int | None:
-    """Bytes/token the DFLASH draft KV pool will cost the target's pool budget.
-
-    Resolved from the draft's own attention geometry and the KV dtype the draft
-    worker will actually resolve. Returns None if anything is unresolvable,
-    leaving callers on layer-count scaling.
-    """
-    from sglang.srt.mem_cache.kv_cache_dtype import configure_kv_cache_dtype
-    from sglang.srt.speculative.dflash_utils import dflash_draft_cell_size_per_token
-
-    try:
-        _, draft_kv_cache_dtype = configure_kv_cache_dtype(
-            server_args_kv_cache_dtype=get_model().kv_cache_dtype,
-            speculative_draft_kv_cache_dtype=(
-                get_spec().speculative_draft_kv_cache_dtype
-            ),
-            model=None,
-            model_dtype=draft_model_config.dtype,
-            is_draft_worker=True,
-            is_dflash=True,
-            speculative_draft_attention_backend=(
-                get_spec().speculative_draft_attention_backend
-            ),
-        )
-        return dflash_draft_cell_size_per_token(
-            draft_model_config=draft_model_config,
-            draft_num_layers=draft_num_layers,
-            draft_kv_cache_dtype=draft_kv_cache_dtype,
-            tp_size=get_parallel().tp_size,
-        )
-    except Exception as e:  # noqa: BLE001
-        logger.warning(
-            "Could not resolve DFLASH draft KV bytes/token (%s); falling back to "
-            "layer-count scaling for the KV pool budget.",
-            e,
-        )
-        return None

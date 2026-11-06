@@ -27,10 +27,12 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.layer_boundary import layer_stack
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe.utils import get_num_fused_shared_experts
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -70,7 +72,6 @@ class BailingMoEModelNextN(nn.Module):
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        num_fused_shared_experts: int = 0,
     ) -> None:
         super().__init__()
         self.layer_group_size = 1
@@ -109,27 +110,27 @@ class BailingMoEModelNextN(nn.Module):
         self.is_hybrid = (
             hasattr(config, "model_type") and config.model_type == "bailing_hybrid"
         )
-        if self.is_hybrid:
-            config.attention_type = 1
-            decoder_layer_cls = BailingMoELinearDecoderLayer
-            decoder_kwargs = {
-                "quant_config": quant_config,
-                "layer_id": 0,
-                "is_nextn": True,
-                "prefix": add_prefix(f"layers.{config.num_hidden_layers}", prefix),
-            }
-            if _is_bailing_moe_v3_config(config):
-                decoder_layer_cls = BailingMoeV3DecoderLayer
-                decoder_kwargs["num_fused_shared_experts"] = num_fused_shared_experts
-            self.decoder = decoder_layer_cls(config, **decoder_kwargs)
-        else:
-            self.decoder = BailingMoEBlock(
-                config,
-                0,
-                quant_config=quant_config,
-                prefix=add_prefix("decoder", prefix),
-                is_nextn=True,
-            )
+        with layer_stack():
+            if self.is_hybrid:
+                config.attention_type = 1
+                decoder_layer_cls = BailingMoELinearDecoderLayer
+                decoder_kwargs = {
+                    "quant_config": quant_config,
+                    "layer_id": 0,
+                    "is_nextn": True,
+                    "prefix": add_prefix(f"layers.{config.num_hidden_layers}", prefix),
+                }
+                if _is_bailing_moe_v3_config(config):
+                    decoder_layer_cls = BailingMoeV3DecoderLayer
+                self.decoder = decoder_layer_cls(config, **decoder_kwargs)
+            else:
+                self.decoder = BailingMoEBlock(
+                    config,
+                    0,
+                    quant_config=quant_config,
+                    prefix=add_prefix("decoder", prefix),
+                    is_nextn=True,
+                )
 
         self.shared_head = nn.Module()
         self.final_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -211,6 +212,12 @@ class BailingMoeForCausalLMNextN(nn.Module):
             expected_architecture="BailingMoeForCausalLMNextN",
         )
 
+    @classmethod
+    def num_fusable_shared_experts(cls, hf_config) -> int:
+        if not _is_bailing_moe_v3_config(hf_config):
+            return 0
+        return BailingMoeV3ForCausalLM.num_fusable_shared_experts(hf_config)
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -220,19 +227,16 @@ class BailingMoeForCausalLMNextN(nn.Module):
         nn.Module.__init__(self)
         self.config = config
         self.quant_config = quant_config
-        self.num_fused_shared_experts = 0
+        # The weight loader reads this after the build.
+        self.num_fused_shared_experts = get_num_fused_shared_experts()
         is_bailing_moe_v3 = _is_bailing_moe_v3_config(config)
         if is_bailing_moe_v3:
-            BailingMoeV3ForCausalLM.determine_num_fused_shared_experts(self)
-        elif hasattr(self, "determine_num_fused_shared_experts"):
-            # Asystem has determine_num_fused_shared_experts but theta does not.
-            self.determine_num_fused_shared_experts("BailingMoeForCausalLMNextN")
+            BailingMoeV3ForCausalLM.log_shared_experts_fusion(self)
 
         self.model = BailingMoEModelNextN(
             config,
             quant_config,
             prefix=add_prefix("model", prefix),
-            num_fused_shared_experts=self.num_fused_shared_experts,
         )
         self.lm_head = ParallelLMHead(
             config.vocab_size,
