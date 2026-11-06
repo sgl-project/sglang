@@ -165,25 +165,20 @@ fn encode_output(output: MmOutput) -> Result<MmProcessOutput, String> {
     let MmOutput {
         input_ids,
         items,
-        offsets,
         positions,
     } = output;
-    if items.len() != offsets.len() {
-        return Err(format!(
-            "mm: {} items but {} spans",
-            items.len(),
-            offsets.len()
-        ));
-    }
     let items = items
         .into_iter()
-        .zip(offsets)
-        .map(|(item, span)| {
+        .map(|item| {
             Ok(MmEncodedItem {
-                modality: MmModality::Image,
+                modality: match item.modality {
+                    dynamo::Modality::Image => MmModality::Image,
+                    dynamo::Modality::Video => MmModality::Video,
+                    other => return Err(format!("mm: no scheduler modality for {other:?}")),
+                },
                 feature: tensor(item.feature)?,
                 hash: item.hash,
-                offsets: vec![span],
+                offsets: item.offsets,
                 model_specific_data: item
                     .aux
                     .into_iter()
@@ -249,8 +244,8 @@ pub struct MmContext {
 
 impl MmContext {
     pub fn new(spec: MmSpec) -> Result<Self, String> {
-        let pipeline =
-            sglang_processor::MmProcessor::from_spec(spec.pipeline).map_err(|e| e.to_string())?;
+        let pipeline = sglang_processor::MmProcessor::from_spec(spec.pipeline, None)
+            .map_err(|e| e.to_string())?;
         Ok(Self {
             processor: Arc::new(ImageMmProcessor { pipeline }),
             feature_shm: spec.feature_shm,
@@ -527,7 +522,8 @@ mod tests {
     /// carries over; 1-D positions leave `mrope` empty.
     #[test]
     fn pipeline_output_maps_directly() {
-        let item = |shape: Vec<usize>, hash| MmOutputItem {
+        let item = |shape: Vec<usize>, hash, offsets| MmOutputItem {
+            modality: dynamo::Modality::Image,
             feature: dynamo_tensor(shape, dynamo::TensorData::F32(vec![0.5; 12])),
             aux: vec![
                 (
@@ -539,12 +535,15 @@ mod tests {
                     dynamo_tensor(vec![], dynamo::TensorData::I64(vec![7])),
                 ),
             ],
+            offsets,
             hash,
         };
         let output = MmOutput {
             input_ids: vec![1, 2, 2, 3],
-            items: vec![item(vec![6, 2], 11), item(vec![2, 6], 22)],
-            offsets: vec![(1, 2), (3, 3)],
+            items: vec![
+                item(vec![6, 2], 11, vec![(1, 2)]),
+                item(vec![2, 6], 22, vec![(3, 3)]),
+            ],
             positions: PositionOutput::MRope {
                 positions: vec![0; 12],
                 delta: -2,
@@ -572,7 +571,6 @@ mod tests {
         let plain = MmOutput {
             input_ids: vec![1],
             items: vec![],
-            offsets: vec![],
             positions: PositionOutput::Rope1D,
         };
         assert!(encode_output(plain).unwrap().result.mrope.is_none());
@@ -580,20 +578,43 @@ mod tests {
         let bad = MmOutput {
             input_ids: vec![1],
             items: vec![MmOutputItem {
+                modality: dynamo::Modality::Image,
                 feature: dynamo_tensor(vec![1], dynamo::TensorData::F32(vec![1.0])),
                 aux: vec![(
                     "scale".into(),
                     dynamo_tensor(vec![1], dynamo::TensorData::F32(vec![1.0])),
                 )],
+                offsets: vec![(0, 0)],
                 hash: 1,
             }],
-            offsets: vec![(0, 0)],
             positions: PositionOutput::Rope1D,
         };
         let Err(err) = encode_output(bad) else {
             panic!("an f32 aux tensor must be rejected");
         };
         assert!(err.contains("no metadata form"), "{err}");
+    }
+
+    /// A video item keeps its modality and one span per temporal patch.
+    #[test]
+    fn video_output_keeps_modality_and_spans() {
+        let output = MmOutput {
+            input_ids: vec![9; 8],
+            items: vec![MmOutputItem {
+                modality: dynamo::Modality::Video,
+                feature: dynamo_tensor(vec![2, 1], dynamo::TensorData::F32(vec![0.0; 2])),
+                aux: vec![(
+                    "video_grid_thw".into(),
+                    dynamo_tensor(vec![3], dynamo::TensorData::I64(vec![2, 1, 1])),
+                )],
+                offsets: vec![(2, 2), (5, 5)],
+                hash: 3,
+            }],
+            positions: PositionOutput::Rope1D,
+        };
+        let item = &encode_output(output).unwrap().result.items[0];
+        assert_eq!(item.modality, MmModality::Video);
+        assert_eq!(item.offsets, [(2, 2), (5, 5)]);
     }
 
     /// The built-in Qwen shape: two items with grids, spans and M-RoPE.
