@@ -21,7 +21,7 @@ from sglang.srt.mem_cache.memory_pool import (
     _as_token_head_dim,
     _has_dense_kv_rows,
 )
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import get_device_sm, is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=34, stage="base-b-kernel-unit", runner_config="1-gpu-small")
@@ -688,12 +688,18 @@ FP8_KV_DTYPES = [
         ),
     ),
 ]
+# Mirrors `MHATokenToKVPool._triton_casts_fp8_e4m3`, which `_PoolStub` forces on.
+requires_triton_fp8_cast = pytest.mark.skipif(
+    not is_hip() and get_device_sm() < 89,
+    reason="Triton casts to float8_e4m3fn on CUDA only from sm89",
+)
 
 
 def _fp8_isnan(raw: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     return raw.view(dtype).float().isnan()
 
 
+@requires_triton_fp8_cast
 @pytest.mark.parametrize("dtype", FP8_KV_DTYPES)
 @pytest.mark.parametrize("layout", ["contiguous", "qkv_slice"])
 def test_store_kv_fused_cast_every_bf16_value(layout: str, dtype: torch.dtype) -> None:
@@ -745,6 +751,7 @@ def test_store_kv_fused_cast_every_bf16_value(layout: str, dtype: torch.dtype) -
         )
 
 
+@requires_triton_fp8_cast
 @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
 def test_store_kv_fused_cast_skips_reserved_slot(index_dtype: torch.dtype) -> None:
     pool = _PoolStub()
@@ -765,6 +772,7 @@ def test_store_kv_fused_cast_skips_reserved_slot(index_dtype: torch.dtype) -> No
     torch.testing.assert_close(pool.v_buffer[0], expected_v, rtol=0.0, atol=0.0)
 
 
+@requires_triton_fp8_cast
 def test_store_kv_fused_cast_skips_out_of_range_slots(async_assert_off) -> None:
     pool = _PoolStub()
     shape = tuple(pool.k_buffer[0].shape)
@@ -813,8 +821,8 @@ def _minimax_sparse_pool() -> MiniMaxSparseKVPool:
 @pytest.mark.parametrize(
     "branch,layout",
     [
-        ("fused_cast", "qkv_split"),
-        ("fused_cast", "unit_head_stride"),
+        pytest.param("fused_cast", "qkv_split", marks=requires_triton_fp8_cast),
+        pytest.param("fused_cast", "unit_head_stride", marks=requires_triton_fp8_cast),
         ("set_kv_buffer", "qkv_split"),
     ],
 )
