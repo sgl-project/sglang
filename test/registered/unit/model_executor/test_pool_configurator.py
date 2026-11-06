@@ -1677,12 +1677,16 @@ class TestSWAPoolFloor(CustomTestCase):
         self.assertEqual(owners, {4: [8], 2: [9]})
 
     def test_dsv4_paged_kv_budget(self):
+        from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
         from sglang.srt.environ import envs
 
         cfg = self._dsv4_configurator_for_budget()
         cfg._unified = False
         cfg.encoder_replay = False
         cfg.page_size = 256
+        cfg._dsv4_kv_layout = KVLayout.V4
+        cfg._dsv4_compressed_kv_layout = None
+        cfg._dsv41_main_kv_layout_specs = None
         cfg.kv_bytes = 584
         cfg.attn_head_dim = 512
         cfg.num_layers_total = 3
@@ -1994,7 +1998,18 @@ class TestDSV4LowRatioBudget(CustomTestCase):
 
     @contextlib.contextmanager
     def _planner(
-        self, layout, option, page_size, index_page_size, ratios, sources, stage=None
+        self,
+        layout,
+        option,
+        page_size,
+        index_page_size,
+        ratios,
+        sources,
+        stage=None,
+        *,
+        backend="flashmla",
+        main_kv_layout="auto",
+        resolve_layouts=False,
     ):
         from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
         from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
@@ -2008,7 +2023,9 @@ class TestDSV4LowRatioBudget(CustomTestCase):
         )
         _publish_config(
             self,
-            dsv4_attn_backend="flashmla",
+            dsv4_attn_backend=backend,
+            dsv41_main_kv_layout=main_kv_layout,
+            dsv41_main_kv_consumer="auto",
             enable_encoder_swa_bounded_replay=False,
             page_size=page_size,
             max_running_requests=2,
@@ -2029,15 +2046,40 @@ class TestDSV4LowRatioBudget(CustomTestCase):
         if stage is not None:
             mr.layer_info.start_layer, mr.layer_info.end_layer = stage
             mr.pp_size = 2
+        if resolve_layouts:
+            from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+            kvc = KVCacheConfigurator.__new__(KVCacheConfigurator)
+            kvc._dsv4_layouts_resolved = False
+            for name in (
+                "kv_cache_dtype_str",
+                "model_config",
+                "layer_info",
+                "pp_size",
+                "pp_group",
+                "sliding_window_size",
+                "page_size",
+                "spec_algorithm",
+                "attn_dp_size",
+                "spec_aux_config",
+            ):
+                setattr(kvc, name, getattr(mr, name))
+            kvc.server_args = SimpleNamespace(dsv41_main_kv_layout=main_kv_layout)
+        else:
+            kvc = mr
         module = "sglang.srt.mem_cache.deepseek_v4_memory_pool"
         with (
-            patch(
-                f"{module}.select_dsv4_kv_layout",
-                return_value=(KVLayout(layout), option),
+            (
+                contextlib.nullcontext()
+                if resolve_layouts
+                else patch(
+                    f"{module}.select_dsv4_kv_layout",
+                    return_value=(KVLayout(layout), option),
+                )
             ),
             patch(f"{module}.DSV41_INDEX_PAGE_SIZE", index_page_size),
         ):
-            planner = DSV4PoolConfigurator(mr)
+            planner = DSV4PoolConfigurator(kvc)
             # Isolate global KV and its request-scoped pair state. SWA's existing
             # ratio/cap/replay tests above cover its separate budget contract.
             planner.swa_cap_tokens = 0
@@ -2045,20 +2087,23 @@ class TestDSV4LowRatioBudget(CustomTestCase):
             planner.bytes_per_full_token = planner._get_bytes_per_full_token()
             yield planner
 
-    def _allocated_bytes(self, planner, full_tokens, layout, option):
+    def _allocated_bytes(
+        self, planner, full_tokens, layout, option, *, uniform_fp8=False
+    ):
         import torch
 
         from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
             DeepSeekV4SingleKVPool,
             DeepSeekV4TokenToKVPool,
+            DeepSeekV4UniformFP8KVPool,
         )
 
         # Run the production factories, including their page rounding and
         # dummy pages, without allocating unrelated SWA or model weights.
         pool = object.__new__(DeepSeekV4TokenToKVPool)
         pool._unified_kv = False
-        pool.uniform_fp8 = False
+        pool.uniform_fp8 = uniform_fp8
         pool.compressed_pool_configs = {}
         pool.sources_by_ratio = planner.stage_owner_layers
         pool.full_size = full_tokens
@@ -2067,6 +2112,7 @@ class TestDSV4LowRatioBudget(CustomTestCase):
         pool.indexer_head_dim = 128
         pool.kv_layout = KVLayout(layout)
         pool.compressed_kv_layout_option = option
+        pool.main_kv_layout_specs = {}
         pool.device = "cpu"
         pool.num_req_slots = planner.requested_max_running_requests_per_worker + 1
         pool._init_compressed_pools(
@@ -2076,7 +2122,9 @@ class TestDSV4LowRatioBudget(CustomTestCase):
             device="cpu",
             enable_memory_saver=False,
             enable_hisparse=False,
-            kv_pool_cls=DeepSeekV4SingleKVPool,
+            kv_pool_cls=(
+                DeepSeekV4UniformFP8KVPool if uniform_fp8 else DeepSeekV4SingleKVPool
+            ),
         )
         main = sum(b.nbytes for p in pool.kv_pools.values() for b in p.kv_buffer)
         index = sum(
@@ -2089,6 +2137,113 @@ class TestDSV4LowRatioBudget(CustomTestCase):
             for _ in pool.sources_by_ratio.get(2, ())
         )
         return main, index, state
+
+    def test_trtllm_default_low_ratio_budget_matches_uniform_fp8_growth(self):
+        """C1/C2 uniform-FP8 growth must not lose capacity to FlashMLA page pricing."""
+        from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
+        from sglang.srt.environ import envs
+
+        with (
+            envs.SGLANG_DSV4_KV_LAYOUT.override("auto"),
+            envs.SGLANG_DSV4_COMPRESSED_KV_LAYOUT.override("auto"),
+        ):
+            for ratio in (1, 2):
+                with (
+                    self.subTest(ratio=ratio),
+                    self._planner(
+                        "v4",
+                        None,
+                        256,
+                        128,
+                        [ratio],
+                        [0],
+                        backend="trtllm",
+                        resolve_layouts=True,
+                    ) as planner,
+                ):
+                    self.assertIs(planner._dsv4_kv_layout, KVLayout.V4)
+                    small = self._allocated_bytes(
+                        planner, 0, "v4", None, uniform_fp8=True
+                    )
+                    large = self._allocated_bytes(
+                        planner, 512, "v4", None, uniform_fp8=True
+                    )
+                    self.assertEqual(large[0] - small[0], 512 // ratio * 512)
+                    growth = sum(large) - sum(small)
+                    self.assertEqual(planner.bytes_per_full_token * 512, growth)
+                    budget = growth + large[2]
+                    self.assertEqual(
+                        planner.calculate_pool_sizes(budget, 256).max_total_num_tokens,
+                        512,
+                    )
+
+    def test_sm100_main_layout_override_prices_allocated_paged_layouts(self):
+        """SM100 overrides must price every paged pool using its allocated layout."""
+        import torch
+
+        from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
+        from sglang.srt.environ import envs
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4SingleKVPool
+
+        with (
+            patch("torch.cuda.is_available", return_value=True),
+            patch("torch.cuda.get_device_capability", return_value=(10, 0)),
+            patch("torch.version.cuda", "13.0"),
+            envs.SGLANG_DSV4_KV_LAYOUT.override("auto"),
+            envs.SGLANG_DSV4_COMPRESSED_KV_LAYOUT.override("auto"),
+        ):
+            for option, main_layout in (
+                ("auto", KVLayout.V41),
+                ("flashmla_fp8", KVLayout.V4),
+            ):
+                with (
+                    self.subTest(option=option),
+                    self._planner(
+                        main_layout.value,
+                        None,
+                        256,
+                        128,
+                        [1, 2, 4, 128],
+                        [0, 1],
+                        main_kv_layout=option,
+                        resolve_layouts=True,
+                    ) as planner,
+                ):
+                    self.assertIs(planner._dsv4_kv_layout, main_layout)
+                    prices = {}
+                    for ratio in (0, 1, 2, 4, 128):
+                        layout = (
+                            KVLayout.V41_FP4
+                            if option == "auto" and ratio in (1, 2)
+                            else main_layout
+                        )
+                        page_slots = 256 // (ratio or 1)
+                        pool = DeepSeekV4SingleKVPool(
+                            size=page_slots,
+                            page_size=page_slots,
+                            global_page_size=256,
+                            dtype=torch.float8_e4m3fn,
+                            qk_nope_head_dim=448,
+                            qk_rope_head_dim=64,
+                            layer_num=1,
+                            device="cpu",
+                            enable_memory_saver=False,
+                            kv_layout=layout,
+                        )
+                        prices[ratio] = pool.kv_buffer[0][0].nbytes / page_slots
+                        with self.subTest(ratio=ratio):
+                            self.assertEqual(
+                                planner._get_paged_kv_bytes_per_token(ratio),
+                                prices[ratio],
+                            )
+                    with (
+                        envs.SGLANG_DSV4_KV_LAYOUT.override("v4"),
+                        envs.SGLANG_DSV4_COMPRESSED_KV_LAYOUT.override("fp8"),
+                    ):
+                        for ratio, price in prices.items():
+                            self.assertEqual(
+                                planner._get_paged_kv_bytes_per_token(ratio), price
+                            )
 
     def test_low_ratio_coefficient_matches_allocated_growth(self):
         for layout, option in (("v4", None), ("v41", "fp8"), ("v41", None)):
