@@ -31,6 +31,7 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.kv_cache import add_kv_cache_quant_methods
 from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -340,16 +341,23 @@ class Eagle3DeepseekV2ForCausalLM(nn.Module):
         self.config = config
         loader_quant_config = quant_config
         quant_config = self.own_quant_config(config, quant_config)
+        # The bf16 draft's attention keeps the checkpoint's KV-cache method, as
+        # the target's attention does.
+        kv_cache_quant_config = None
         if loader_quant_config is not None and quant_config is None:
             logger.warning(
                 "Overriding Eagle3DeepseekV2ForCausalLM quant config for "
                 "modelopt_fp4 target; draft weights are bf16."
             )
+            kv_cache_quant_config = loader_quant_config
         self.quant_config = quant_config
         self.pp_group = get_parallel().pp_group
 
         self.model = Eagle3MLAModel(
             config, quant_config=quant_config, prefix=add_prefix("model", prefix)
+        )
+        add_kv_cache_quant_methods(
+            self.model, kv_cache_quant_config, add_prefix("model", prefix)
         )
 
         # llama_eagle3 sets a load-from-target flag when draft_vocab_size is
