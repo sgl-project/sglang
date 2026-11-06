@@ -525,6 +525,101 @@ class TestA3Backend(unittest.TestCase):
                 self.assertEqual(namespace["_kernel_num_heads"](layer, 1), expected)
 
 
+class TestA3GraphInitContract(unittest.TestCase):
+    """Capture must forward the live batch through mainline's graph init flow."""
+
+    def setUp(self):
+        backend_class = next(
+            node
+            for node in ast.parse(BACKEND.read_text()).body
+            if isinstance(node, ast.ClassDef)
+            and node.name == "DeepseekV4AscendAttnBackend"
+        )
+        names = {"init_forward_metadata_out_graph", "_init_dsv4_graph_metadata"}
+        methods = [
+            node
+            for node in backend_class.body
+            if isinstance(node, ast.FunctionDef) and node.name in names
+        ]
+        module = ast.Module(
+            body=[
+                ast.ImportFrom(
+                    module="__future__", names=[ast.alias("annotations")], level=0
+                )
+            ]
+            + methods,
+            type_ignores=[],
+        )
+        namespace = {
+            "torch": torch,
+            "ForwardMetadata": SimpleNamespace,
+            "is_npu_arch35": lambda: False,
+        }
+        exec(compile(ast.fix_missing_locations(module), str(BACKEND), "exec"), namespace)  # noqa: S102
+        backend_type = type(
+            "GraphInitBackend", (), {name: namespace[name] for name in names}
+        )
+        self.backend = backend_type()
+        b = self.backend
+        b.device = torch.device("cpu")
+        b.is_hybrid_swa = False
+        b._dsv4_has_low_ratio = True
+        b._is_dspark_draft_worker = False
+        b._dsv4_sliding_window_size = 128
+        b._dspark_ragged_verify_layout = Mock(return_value=None)
+        b._init_dsv41_graph_metadata = Mock()
+        b._apply_dsv4_graph_metadata = Mock()
+        b.graph_metadata = {
+            key: torch.zeros((2, 4), dtype=torch.int32)
+            for key in (
+                "block_tables",
+                "swa_page_table",
+                "c4_page_table",
+                "c128_page_table",
+            )
+        }
+        b.graph_metadata.update(
+            {
+                f"kernel_metadata_{name}": torch.zeros(2048, dtype=torch.int32)
+                for name in ("c1a", "c4a", "c128a", "li_quant")
+            }
+        )
+        b.graph_metadata["c4_topk_indices"] = torch.full((2, 512), -1, dtype=torch.int32)
+        self.forward_batch = SimpleNamespace(
+            batch_size=2,
+            seq_lens=torch.tensor([129, 128], dtype=torch.int32),
+            forward_mode=SimpleNamespace(
+                is_target_verify=lambda: False,
+                is_draft_extend_v2=lambda: False,
+            ),
+        )
+
+    def test_capture_passes_live_batch_to_low_ratio_init(self):
+        b = self.backend
+        b.init_forward_metadata_out_graph(self.forward_batch, in_capture=True)
+        b._init_dsv41_graph_metadata.assert_called_once_with(
+            b.graph_metadata[2], 2, 1, b.device, forward_batch=self.forward_batch
+        )
+        self.assertIs(
+            b._init_dsv41_graph_metadata.call_args.kwargs["forward_batch"],
+            self.forward_batch,
+        )
+        b._apply_dsv4_graph_metadata.assert_called_once_with(
+            metadata_key=2, forward_batch=self.forward_batch, in_capture=True
+        )
+
+    def test_replay_applies_existing_metadata_without_reinitializing(self):
+        b = self.backend
+        metadata = SimpleNamespace()
+        b.graph_metadata[2] = metadata
+        b.init_forward_metadata_out_graph(self.forward_batch)
+        b._init_dsv41_graph_metadata.assert_not_called()
+        self.assertIs(b.graph_metadata[2], metadata)
+        b._apply_dsv4_graph_metadata.assert_called_once_with(
+            metadata_key=2, forward_batch=self.forward_batch, in_capture=False
+        )
+
+
 class TestA3OpLoading(unittest.TestCase):
     def setUp(self):
         self.ns = _definitions(

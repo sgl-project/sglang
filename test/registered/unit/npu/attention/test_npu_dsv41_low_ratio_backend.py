@@ -1554,6 +1554,9 @@ class TestVerifyGraphGuard(unittest.TestCase):
         def is_target_verify(self):
             return self._target_verify
 
+        def is_decode_or_idle(self):
+            return self.is_decode()
+
     _REFRESHES = (
         "_refresh_graph_seq_metadata",
         "_refresh_graph_compress_page_tables_direct",
@@ -1567,11 +1570,28 @@ class TestVerifyGraphGuard(unittest.TestCase):
     def _apply(self, *, has_low_ratio, target_verify=True, is_idle_replay=False):
         backend = _low_ratio_backend()
         backend._dsv4_has_low_ratio = has_low_ratio
+        backend.is_hybrid_swa = False
+        backend.speculative_num_draft_tokens = 2
+        backend.req_to_token = torch.arange(256).reshape(2, 128)
+        graph_mode = self._GraphMode(target_verify)
+        forward_batch = SimpleNamespace(
+            batch_size=1,
+            req_pool_indices=torch.tensor([1], dtype=torch.int64),
+            seq_lens=torch.tensor([7], dtype=torch.int32),
+            seq_lens_cpu=torch.tensor([7], dtype=torch.int32),
+            forward_mode=graph_mode,
+            spec_info=None,
+        )
+        metadata = SimpleNamespace(
+            block_tables=torch.full((1, 2), -1, dtype=torch.int32),
+            dsv4_cycle_state_block_table=torch.zeros(1, dtype=torch.int32),
+        )
+        backend.graph_metadata[1] = metadata
         ctx = SimpleNamespace(
-            fm=SimpleNamespace(dsv4_cycle_state_block_table=torch.zeros(1)),
+            fm=metadata,
             bs=1,
-            forward_batch=SimpleNamespace(req_pool_indices=torch.zeros(1)),
-            graph_mode=self._GraphMode(target_verify),
+            forward_batch=forward_batch,
+            graph_mode=graph_mode,
             is_idle_replay=is_idle_replay,
             # c4/c128 are absent for V4.1, so both verify sub-arms are skipped.
             has_compress=False,
@@ -1586,7 +1606,9 @@ class TestVerifyGraphGuard(unittest.TestCase):
             )
             for name in self._REFRESHES:
                 stack.enter_context(patch.object(backend, name))
-            backend._apply_dsv4_graph_metadata(None)
+            backend._apply_dsv4_graph_metadata(
+                metadata_key=1, forward_batch=forward_batch, in_capture=False
+            )
 
     def test_v41_verify_replay_raises_instead_of_corrupting(self):
         with self.assertRaisesRegex(RuntimeError, "target-verify"):

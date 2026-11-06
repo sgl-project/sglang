@@ -52,6 +52,13 @@ class _IndexerBase:
 
 
 def _pool_classes(arch35=False):
+    def paged_info(buffers, **kwargs):
+        return SimpleNamespace(
+            buffers=tuple(buffers),
+            page_bytes=buffers[0][0].numel() * buffers[0].element_size(),
+            **kwargs,
+        )
+
     return _load_definitions(
         POOL_FILE,
         {
@@ -71,6 +78,8 @@ def _pool_classes(arch35=False):
             "DeepSeekV4SingleKVPool": object,
             "DeepSeekV4IndexerPool": _IndexerBase,
             "DeepSeekV4TokenToKVPool": object,
+            "DSV4PagedBufferInfo": SimpleNamespace(from_buffers=paged_info),
+            "DSV4IndexerBufferInfo": SimpleNamespace,
             "KVLayout": SimpleNamespace(V4=object()),
             "GPU_MEMORY_TYPE_KV_CACHE": "kv_cache",
             "_DSV41_LOW_RATIOS": (1, 2),
@@ -231,6 +240,23 @@ class TestA3Cache(unittest.TestCase):
         self.assertEqual(pool.get_index_k(0).shape[-1], 64)
         self.assertEqual(pool.get_index_scale(0).shape[-1], 4)
         self.assertEqual(pool.get_index_k(0).dtype, torch.uint8)
+
+    def test_indexer_page_descriptors_match_physical_a3_and_a5_storage(self):
+        for arch35 in (False, True):
+            with self.subTest(arch35=arch35):
+                pool = _index_pool(_pool_classes(arch35=arch35))
+                info = pool.indexer_buffer_info()
+                self.assertIs(info.key.buffers[0], pool.get_index_k(0))
+                self.assertEqual(info.key.page_slots, 64)
+                self.assertEqual(info.key.layout, "pa_nd")
+                self.assertEqual(info.key.page_bytes, 64 * (64 if arch35 else 256))
+                if arch35:
+                    self.assertIs(info.scale.buffers[0], pool.get_index_scale(0))
+                    self.assertEqual(info.scale.page_bytes, 64 * 4)
+                    self.assertEqual(info.scale.page_slots, 64)
+                    self.assertEqual(info.scale.layout, "pa_nd")
+                else:
+                    self.assertIsNone(info.scale)
 
     def test_owner_mapping_routes_a3_writes_without_a5_ops(self):
         classes = _pool_classes()
