@@ -789,6 +789,12 @@ fn media_item(item: &MmItem) -> Value {
             if let Some(detail) = &hints.detail {
                 item.insert("detail".into(), detail.as_str().into());
             }
+            if let Some(num_frames) = hints.num_frames {
+                item.insert("num_frames".into(), num_frames.into());
+            }
+            if let Some(min_frames) = hints.min_frames {
+                item.insert("min_frames".into(), min_frames.into());
+            }
             if let Some(max_frames) = hints.max_frames {
                 item.insert("max_frames".into(), max_frames.into());
             }

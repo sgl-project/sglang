@@ -16,19 +16,27 @@ pub enum MmItem {
     Ref { url: String, hints: MediaHints },
 }
 
-/// The `MediaRef` hints a processor may read, grown as processors need them;
-/// the rest serve Python-side model families the Rust pipeline does not run.
-/// A bare source carries none, and the built-in families ignore them.
+/// The `MediaRef` hints a processor may read, grown as processors need them,
+/// and the names of the others a request set. A bare source carries none.
+/// The built-in video path applies `fps` and the frame counts per request; Python's Qwen3-VL
+/// reads only `--mm-process-config`, so the two servers sample such a request differently.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct MediaHints {
     /// Video: the requested frame sampling rate.
     pub fps: Option<f64>,
     /// Image: the requested detail level ("auto" | "low" | "high").
     pub detail: Option<String>,
+    /// Video: an exact frame count.
+    pub num_frames: Option<i64>,
+    /// Video: the fewest frames to sample.
+    pub min_frames: Option<i64>,
     /// Video: the most frames to sample.
     pub max_frames: Option<i64>,
     /// Video: the most tokens per sampled frame.
     pub max_tokens_per_frame: Option<i64>,
+    /// `MediaRef` fields the request set that no field above carries. The
+    /// video pipeline refuses them rather than sample differently than asked.
+    pub unread: Vec<&'static str>,
 }
 
 impl MmItem {
@@ -161,9 +169,9 @@ mod tests {
     }
 
     /// Object items are typed `MediaRef`s: the `url` and the hints a processor
-    /// reads ride along (`max_dynamic_patch` does not), a hint the schema does
-    /// not name is an error, and a preprocessed-input dict is not a wire shape
-    /// at all (its values are tensors; Engine-only).
+    /// reads ride along (`max_dynamic_patch` only by name, as unread), a hint
+    /// the schema does not name is an error, and a preprocessed-input dict is
+    /// not a wire shape at all (its values are tensors; Engine-only).
     #[test]
     fn parses_item_objects() {
         assert_eq!(
@@ -172,6 +180,7 @@ mod tests {
                 url: "u".into(),
                 hints: MediaHints {
                     detail: Some("low".into()),
+                    unread: vec!["max_dynamic_patch"],
                     ..Default::default()
                 },
             })
