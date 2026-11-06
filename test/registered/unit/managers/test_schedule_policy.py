@@ -124,6 +124,17 @@ class TestSchedulePolicyHRRN(CustomTestCase):
         self.assertEqual(waiting_queue[1].rid, "b")
         self.assertEqual(waiting_queue[2].rid, "c")
 
+    def test_hrrn_counts_retracted_output_as_uncached_work(self):
+        """A retracted request re-prefills its generated output tokens."""
+        replay = _make_req("a_replay", "", list(range(100)))
+        replay.output_ids, replay.num_matched_prefix_tokens = array("q", [0] * 90), 90
+        fresh = _make_req("b_fresh", "", list(range(100)))
+        fresh.num_matched_prefix_tokens = 90
+
+        queue = [replay, fresh]
+        SchedulePolicy._sort_by_hrrn(queue, set(), processed_tokens=1000)
+        self.assertEqual([r.rid for r in queue], ["b_fresh", "a_replay"])
+
 
 class TestShortestPrefillFirst(CustomTestCase):
     def setUp(self):
