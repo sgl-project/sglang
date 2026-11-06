@@ -150,7 +150,7 @@ jobs:
     if: |
       ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
       inputs.multimodal_gen == 'true'
-    runs-on: 1-gpu-5090
+    runs-on: 1-gpu-5090-vast
     timeout-minutes: 180
     steps:
       - name: Checkout code
