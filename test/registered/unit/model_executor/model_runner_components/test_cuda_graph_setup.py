@@ -40,11 +40,11 @@ def test_cp_decode_dispatch_capture_buckets(
     model_overrides,
     expected,
 ):
+    from sglang.srt.layers.dp_attention import get_cuda_graph_batch_size_alignment
     from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
         get_batch_sizes_to_capture,
     )
     from sglang.srt.runtime_context import get_context
-    from sglang.srt.utils.common import get_cuda_graph_batch_size_alignment
 
     hf_config = SimpleNamespace(
         **{
@@ -144,11 +144,11 @@ def test_reuse_tables_pass_through_but_distinct_duplicates_raise():
 
 def test_draft_startup_preserves_runner_local_capture_sizes(monkeypatch, caplog):
     """Startup must not reject local draft buckets using global TP alignment."""
+    from sglang.srt.layers import dp_attention
     from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
         get_batch_sizes_to_capture,
     )
     from sglang.srt.runtime_context import get_context
-    from sglang.srt.utils import common
 
     capture_bs = [1, 2, 3, 4, 8]
     # The capture decision reads the graph configuration and the MoE backends
@@ -187,9 +187,11 @@ def test_draft_startup_preserves_runner_local_capture_sizes(monkeypatch, caplog)
     model_runner = TestModelRunner()
     monkeypatch.setattr(cuda_graph_setup, "check_cuda_graph_backend", lambda *_: False)
     monkeypatch.setattr(cuda_graph_setup, "get_available_gpu_memory", lambda *_: 10.0)
-    monkeypatch.setattr(common, "require_gathered_buffer", lambda: True)
+    monkeypatch.setattr(dp_attention, "require_gathered_buffer", lambda: True)
     monkeypatch.setattr(
-        common, "get_parallel", lambda: SimpleNamespace(attn_tp_size=16, attn_cp_size=1)
+        dp_attention,
+        "get_parallel",
+        lambda: SimpleNamespace(attn_tp_size=16, attn_cp_size=1),
     )
     monkeypatch.setattr(
         cuda_graph_setup.current_platform, "is_out_of_tree", lambda: False
