@@ -1041,9 +1041,8 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "dynamo-multimodal"
-version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "59f050bab8f84b8881f319ef02c47ba76996b3ddcbba37f05e822be68115a571"
+version = "0.2.4"
+source = "git+https://github.com/sherlockwu/frontend-crates.git?rev=ebf6d290bc3e18f8caa7f65e9b85cc66a88f33aa#ebf6d290bc3e18f8caa7f65e9b85cc66a88f33aa"
 dependencies = [
  "blake3",
  "gif",

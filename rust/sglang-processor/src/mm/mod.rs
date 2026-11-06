@@ -1,8 +1,8 @@
 //! Multimodal preprocessing over `dynamo-multimodal`.
 
-use dynamo_multimodal::image::decode::{DecodeLimits, decode_rgb};
+use dynamo_multimodal::image::decode::DecodeLimits;
 use dynamo_multimodal::processor::{
-    DecodedMedia, MmFamilyProcessor, NamedTensors, PositionOutput, ProcessedItem, Tensor,
+    MmFamilyProcessor, NamedTensors, PositionOutput, ProcessedItem, Tensor,
 };
 use dynamo_multimodal::registry::{ProcessorSpec, build_processor};
 use dynamo_multimodal::{MmError, content_hash_bytes, token_layout};
@@ -92,12 +92,13 @@ impl MmProcessor {
         })
     }
 
-    /// Python's Qwen path decodes with PIL and only `convert("RGB")`s: no EXIF transpose.
+    /// Dynamo selects the family's decode policy, including GLM's EXIF and alpha.
     fn process_image(&self, bytes: &[u8]) -> Result<ProcessedItem, ProcessorError> {
-        let (rgb, height, width) = decode_rgb(bytes, &self.limits).map_err(mm_error)?;
-        self.family
-            .process_item(&DecodedMedia::Image { rgb, height, width })
-            .map_err(mm_error)
+        let media = self
+            .family
+            .decode_image(bytes, &self.limits)
+            .map_err(mm_error)?;
+        self.family.process_item(&media).map_err(mm_error)
     }
 }
 
