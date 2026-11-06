@@ -29,6 +29,7 @@ from transformers import (
 )
 
 from sglang.srt.distributed.utils import get_group_rank_size
+from sglang.srt.hf_transformers.common import _resolve_local_or_cached_file
 from sglang.srt.layers.activation import GeluAndMul
 from sglang.srt.layers.layernorm import Gemma3RMSNorm
 from sglang.srt.layers.linear import (
@@ -53,7 +54,6 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, cpu_has_amx_support, is_cpu, make_layers
-from sglang.srt.utils.hf_transformers.common import _resolve_local_or_cached_file
 
 _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
