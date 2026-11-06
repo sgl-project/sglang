@@ -151,6 +151,8 @@ def register():
                 and "sana_wm" not in hf_id.lower()
                 and "sana-video" not in hf_id.lower()
                 and "sana_video" not in hf_id.lower()
+                and "sana-sprint" not in hf_id.lower()
+                and "sana_sprint" not in hf_id.lower()
             )
         ],
     )

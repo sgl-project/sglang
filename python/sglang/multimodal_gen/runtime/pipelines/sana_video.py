@@ -55,6 +55,8 @@ def select_sana_video_prompt_window(
 class SanaVideoTextEncodingStage(TextEncodingStage):
     """Apply SANA-Video's asymmetric positive/negative prompt encoding."""
 
+    complex_human_instruction = SANA_VIDEO_COMPLEX_HUMAN_INSTRUCTION
+
     @staticmethod
     def _normalize_text(text: str | list[str]) -> str | list[str]:
         if isinstance(text, str):
@@ -80,10 +82,10 @@ class SanaVideoTextEncodingStage(TextEncodingStage):
         prompt = self._normalize_text(batch.prompt)
         prompt_list = [prompt] if isinstance(prompt, str) else prompt
         enhanced_prompt = [
-            SANA_VIDEO_COMPLEX_HUMAN_INSTRUCTION + item for item in prompt_list
+            self.complex_human_instruction + item for item in prompt_list
         ]
         instruction_tokens = len(
-            self.tokenizers[0].encode(SANA_VIDEO_COMPLEX_HUMAN_INSTRUCTION)
+            self.tokenizers[0].encode(self.complex_human_instruction)
         )
         encoded_length = instruction_tokens + max_sequence_length - 2
         positive_outputs = list(

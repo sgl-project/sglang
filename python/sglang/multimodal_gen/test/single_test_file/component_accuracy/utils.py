@@ -515,17 +515,22 @@ def generate_name_candidates(
             if entry and entry[0] not in candidates:
                 candidates.append(entry[0])
 
-    for prefix in TARGET_PREFIXES:
-        if clean.startswith(prefix):
-            stripped = clean[len(prefix) :]
-            if stripped and stripped not in candidates:
-                candidates.append(stripped)
+    # Normalization can corrupt a real name (DC-AE's "to_qkv_multiscale"
+    # becomes "to_qkv_multiweight"), so derive candidates from both spellings.
+    bases = [name] if clean == name else [name, clean]
+    for base in bases:
+        for prefix in TARGET_PREFIXES:
+            if base.startswith(prefix):
+                stripped = base[len(prefix) :]
+                if stripped and stripped not in candidates:
+                    candidates.append(stripped)
 
-    parts = clean.split(".")
-    for i in range(1, len(parts)):
-        cand = ".".join(parts[i:])
-        if cand not in candidates:
-            candidates.append(cand)
+    for base in bases:
+        parts = base.split(".")
+        for i in range(1, len(parts)):
+            cand = ".".join(parts[i:])
+            if cand not in candidates:
+                candidates.append(cand)
 
     return candidates
 
