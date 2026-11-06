@@ -448,6 +448,12 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
         _CUDA,
     ),
     (
+        "diffusion.gelu_tanh_inplace",
+        KernelBackend.TRITON,
+        "activation.gelu_tanh_triton:gelu_tanh_inplace_",
+        _HIP,
+    ),
+    (
         "diffusion.linear_gelu_tanh",
         KernelBackend.AOT,
         "sites.fused_linear_gelu_site:fused_linear_gelu_tanh",
@@ -667,6 +673,7 @@ _EXPORTS: dict[str, str] = {
     "can_use_fp8_rowwise": "quantization.fp8_rowwise_triton",
     "fp8_rowwise": "quantization.fp8_rowwise_triton",
     "fused_gelu_tanh_cat": "activation.gelu_tanh_cat_jit",
+    "gelu_tanh_inplace_": "activation.gelu_tanh_triton",
     "load_extension_with_recovery": "sglang.srt.utils.cpp_extension_loader",
     # Normalization: RMSNorm / LayerNorm / GroupNorm and their fused epilogues
     "can_defer_flux2_gated_residual": "norm.flux2_gated_resnorm_jit",
