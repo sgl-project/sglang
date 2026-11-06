@@ -507,6 +507,7 @@ def test_reclassified_public_entry_points_are_inventoried():
         "kv_canary.write",
         "kv_canary.verify",
         "kv_canary.scatter_req_token_ids",
+        "kvcache.int8_mamba_checkpoint",
         "mm.process.image",
         "speculative.row_argmax",
     )

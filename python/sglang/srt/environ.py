@@ -1796,6 +1796,10 @@ class Envs:
     # mamba pool ratio accordingly. Frees one resident slot per running request,
     # raising max_running_requests. Off = original locking + ratio (escape hatch).
     SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK = EnvBool(False)
+    # Opt-in Triton codec for INT8 Mamba checkpoints; non-CUDA stays eager.
+    SGLANG_EXPERIMENTAL_FUSED_INT8_CHECKPOINT = EnvBool(False)
+    # Re-run eager codec for numerical checks outside CUDA graph capture.
+    SGLANG_DEBUG_VERIFY_FUSED_INT8_CHECKPOINT = EnvBool(False)
     # Opt-in: store radix mamba checkpoints only in the hicache host pool.
     # Matched prefixes and donated checkpoints then occupy no GPU mamba slot,
     # so the pool ratio is the live slot plus the ping-pong slots extra-buffer
