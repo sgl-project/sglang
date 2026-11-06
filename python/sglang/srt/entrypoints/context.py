@@ -89,7 +89,7 @@ class HarmonyContext(ConversationContext):
             meta_info = output["meta_info"]
 
             if isinstance(meta_info, dict):
-                if "prompt_token_ids" in meta_info:
+                if "prompt_tokens" in meta_info:
                     self.num_prompt_tokens = meta_info["prompt_tokens"]
                 if "cached_tokens" in meta_info:
                     self.num_cached_tokens = meta_info["cached_tokens"]
