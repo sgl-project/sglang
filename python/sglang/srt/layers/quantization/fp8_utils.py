@@ -2151,12 +2151,11 @@ _SM107_CUDNN_MXFP8_MIN_M = 8192
 
 
 @lru_cache(maxsize=1)
-def _sm107_cudnn_mxfp8_available() -> bool:
-    if not (_is_cuda and get_device_sm() == 107 and is_flashinfer_available()):
-        return False
-    from flashinfer.gemm.gemm_base import CUDNN_AVAILABLE
+def _cudnn_mxfp8_reuses_graphs() -> bool:
+    # Without override-shape support cuDNN builds a new graph for every distinct M.
+    from flashinfer.gemm import gemm_base
 
-    return CUDNN_AVAILABLE
+    return getattr(gemm_base, "_is_cudnn_override_shape_available", lambda: False)()
 
 
 def flashinfer_mxfp8_blockscaled_linear(
@@ -2205,14 +2204,12 @@ def flashinfer_mxfp8_blockscaled_linear(
         backend == "cute-dsl"
         and input_2d.shape[0] >= _SM107_CUDNN_MXFP8_MIN_M
         and (weight.shape[0], k) in _SM107_CUDNN_MXFP8_NK
-        and x_scale_u8.is_contiguous()
-        and weight_scale.is_contiguous()
-        and _sm107_cudnn_mxfp8_available()
+        and get_platform().device_sm == 107
+        and _cudnn_mxfp8_reuses_graphs()
     ):
         backend = "cudnn"
-        x_scale_u8 = x_scale_u8.view(-1)
 
-    if backend in ("trtllm", "cudnn"):
+    if backend == "trtllm":
         weight_scale_t = weight_scale.view(-1)
     else:
         weight_scale_t = weight_scale.t() if weight_scale.ndim == 2 else weight_scale
