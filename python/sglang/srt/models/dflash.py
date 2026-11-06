@@ -18,6 +18,8 @@ from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecutio
 from sglang.srt.configs.laguna import normalize_gating
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.draft.ffn import build_draft_ffn
+from sglang.srt.layers.draft.ffn_spec import DraftMixFFNSpec
 from sglang.srt.layers.layer_boundary import AttentionInputs, get_attn_tp_context
 from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
 from sglang.srt.layers.linear import (
@@ -776,6 +778,7 @@ class DFlashDecoderLayer(nn.Module):
         mlp_conv: Optional[DFlashGroupedConv] = None,
         quant_config=None,
         prefix: str = "",
+        ffn_spec: Optional[DraftMixFFNSpec] = None,
     ) -> None:
         super().__init__()
         hidden_size = int(config.hidden_size)
@@ -792,8 +795,21 @@ class DFlashDecoderLayer(nn.Module):
         )
         self.post_attention_layernorm = norm_cls(hidden_size, eps=rms_norm_eps)
         mlp_prefix = f"{prefix}.mlp" if prefix else ""
-        self.mlp = DFlashMLP(
-            config=config, quant_config=quant_config, prefix=mlp_prefix
+        dense = partial(
+            DFlashMLP, config=config, quant_config=quant_config, prefix=mlp_prefix
+        )
+        # The dense FFN as before; the factory swaps in a DraftMoE for MoE layers.
+        self.mlp = (
+            dense()
+            if ffn_spec is None
+            else build_draft_ffn(
+                ffn_spec,
+                layer_id,
+                hidden_size,
+                dense=dense,
+                quant_config=quant_config,
+                prefix=mlp_prefix,
+            )
         )
 
         self.attention_conv = attention_conv
@@ -919,6 +935,7 @@ class DFlashDraftModel(nn.Module):
                     attention_conv=grouped_conv(),
                     mlp_conv=grouped_conv(),
                     quant_config=quant_config,
+                    ffn_spec=draft_config.ffn,
                     prefix=(
                         (f"{prefix}.layers.{i}" if prefix else f"layers.{i}")
                         if self.quantizable
