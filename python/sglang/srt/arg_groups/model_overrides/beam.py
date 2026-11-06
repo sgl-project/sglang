@@ -11,8 +11,8 @@ from sglang.srt.arg_groups.model_override_base import (
     is_attention_backend_not_set,
     resolving_view,
 )
+from sglang.srt.configs.quant_utils import get_quantization_config
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils.common import get_quantization_config
 
 logger = logging.getLogger(__name__)
 

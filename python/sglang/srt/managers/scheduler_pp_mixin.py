@@ -34,7 +34,7 @@ from sglang.srt.sampling.sampling_observer_pp import (
     pop_auxiliary_output_from_pp_tensors,
 )
 from sglang.srt.utils import DynamicGradMode, point_to_point_pyobj
-from sglang.srt.utils.common import is_npu
+from sglang.srt.utils.device import is_npu
 
 _is_npu = is_npu()
 logger = logging.getLogger(__name__)
