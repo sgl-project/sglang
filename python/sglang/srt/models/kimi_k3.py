@@ -3936,9 +3936,11 @@ class KimiK3LinearForCausalLM(nn.Module):
                 continue
             if isinstance(layer.mlp, KimiK3MoE):
                 layer.mlp._merge_front_weights()
-                if layer.mlp._use_mega_moe:
-                    # The shared EP workspace must count against the KV budget,
-                    # not first appear during warmup or graph capture.
+                if layer.mlp._use_mega_moe and get_parallel().attn_cp_size > 1:
+                    # Under prefill CP the shared EP workspace must count
+                    # against the KV budget, not first appear during warmup or
+                    # graph capture. Other MegaMoE recipes are sized with the
+                    # workspace taken from the non-static slack, as on main.
                     layer.mlp._mega_moe_buffer()
                 # Convert the correction bias to fp32 once so the per-call
                 # .to(float32) in topk is a no-op, not one upcast kernel per
