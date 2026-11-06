@@ -11,6 +11,7 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.srt.utils import is_xpu
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -21,6 +22,10 @@ logger = logging.getLogger(__name__)
 
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
 _SUPPORTED_CACHE_DTYPES = (*_SUPPORTED_DTYPES, torch.float32)
+
+_is_xpu = is_xpu()
+if _is_xpu:
+    from sgl_kernel import fused_inplace_qknorm_rope as fused_inplace_qknorm_rope_xpu
 
 
 @cache_once
@@ -82,6 +87,19 @@ def _can_use_fused_qknorm_rope(
             cache_dtype,
         )
         return False
+    if _is_xpu:
+        # no JIT compile on XPU: dispatches straight to the prebuilt SYCL
+        # kernel (sgl_kernel), which has its own (wider) head_dim whitelist
+        # that already covers head_dim=96
+        if pack_kv:
+            logger.warning("Fused QKNorm+RoPE KV packing has no SYCL backend")
+            return False
+        if head_dim not in (64, 96, 128, 256):
+            logger.warning(
+                f"Unsupported head_dim={head_dim} for SYCL fused QKNorm+RoPE"
+            )
+            return False
+        return True
     if head_dim not in (64, 128, 256):
         logger.warning(f"Unsupported head_dim={head_dim} for JIT fused QKNorm+RoPE")
         return False
@@ -180,6 +198,20 @@ def fused_inplace_qknorm_rope(
     if not rope_dim:
         cache_width = cos_sin_cache.size(-1)
         rope_dim = cache_width // 2 if cache_has_full_width else cache_width
+    if _is_xpu:
+        fused_inplace_qknorm_rope_xpu(
+            q=q,
+            k=k,
+            q_weight=q_weight,
+            k_weight=k_weight,
+            cos_sin_cache=cos_sin_cache,
+            positions=positions,
+            is_neox=is_neox,
+            eps=eps,
+            head_dim=head_dim,
+            rope_dim=rope_dim,
+        )
+        return
     module = _jit_qknorm_rope_module(
         head_dim,
         rope_dim,
@@ -217,6 +249,24 @@ def fused_qknorm_rope_out_of_place(
     if not rope_dim:
         cache_width = cos_sin_cache.size(-1)
         rope_dim = cache_width // 2 if cache_has_full_width else cache_width
+    if _is_xpu:
+        # no out-of-place SYCL kernel exists yet: copy then run the in-place
+        # kernel on the copy, which is the same arithmetic and leaves q/k untouched
+        q_out.copy_(q)
+        k_out.copy_(k)
+        fused_inplace_qknorm_rope_xpu(
+            q=q_out,
+            k=k_out,
+            q_weight=q_weight,
+            k_weight=k_weight,
+            cos_sin_cache=cos_sin_cache,
+            positions=positions,
+            is_neox=is_neox,
+            eps=eps,
+            head_dim=head_dim,
+            rope_dim=rope_dim,
+        )
+        return
     module = _jit_qknorm_rope_module(
         head_dim,
         rope_dim,
