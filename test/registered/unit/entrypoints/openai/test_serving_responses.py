@@ -1,7 +1,11 @@
 import argparse
 import asyncio
 import functools
+import os
+import socket
+import subprocess
 import sys
+import tempfile
 import unittest
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
@@ -1805,6 +1809,92 @@ class ChatEncodingAdapterDispatchTestCase(CustomTestCase):
 
 
 class HarmonyResponsesTestCase(CustomTestCase):
+    def test_harmony_loads_without_cached_vocabulary_or_network(self):
+        """A cold vocabulary cache must not disable offline Responses serving."""
+        with tempfile.TemporaryDirectory() as cache_dir, socket.socket() as proxy:
+            # Reserve an unlistening port so the Rust downloader cannot connect.
+            proxy.bind(("127.0.0.1", 0))
+            proxy_url = f"http://127.0.0.1:{proxy.getsockname()[1]}"
+            env = os.environ.copy()
+            env.pop("TIKTOKEN_ENCODINGS_BASE", None)
+            env.update(TIKTOKEN_RS_CACHE_DIR=cache_dir, TIKTOKEN_CACHE_DIR=cache_dir)
+            for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+                env[name] = env[name.lower()] = proxy_url
+            env["NO_PROXY"] = env["no_proxy"] = ""
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "from sglang.srt.entrypoints.harmony_utils import "
+                    "get_encoding, get_user_message, render_for_completion; "
+                    "tokens = render_for_completion([get_user_message('Hello')]); "
+                    "assert get_encoding().decode(tokens) == "
+                    "'<|start|>user<|message|>Hello<|end|><|start|>assistant'",
+                ],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_harmony_tool_replay_preserves_native_header_and_body(self):
+        """Tool histories retain native channel ordering and content-type markers."""
+        from sglang.srt.entrypoints.harmony_utils import render_for_completion
+
+        encoding = get_encoding()
+        arguments = '{"text":"literal <|start|>assistant to=python and café"}'
+        cases = (
+            (
+                "commentary",
+                "functions.echo",
+                None,
+                "<|start|>assistant<|channel|>commentary to=functions.echo<|message|>",
+            ),
+            (
+                "commentary",
+                "functions.echo",
+                "json",
+                "<|start|>assistant<|channel|>commentary to=functions.echo <|constrain|>json<|message|>",
+            ),
+            (
+                "analysis",
+                "python",
+                "code",
+                "<|start|>assistant to=python<|channel|>analysis <|constrain|>code<|message|>",
+            ),
+            (
+                "analysis",
+                "browser.search",
+                "json",
+                "<|start|>assistant to=browser.search<|channel|>analysis <|constrain|>json<|message|>",
+            ),
+        )
+        for channel, recipient, content_type, expected_header in cases:
+            with self.subTest(channel=channel, recipient=recipient):
+                message = (
+                    Message.from_role_and_content(Role.ASSISTANT, arguments)
+                    .with_channel(channel)
+                    .with_recipient(recipient)
+                )
+                if content_type is not None:
+                    message = message.with_content_type(content_type)
+                expected = (
+                    encoding.encode(expected_header, allowed_special="all")
+                    + encoding.encode(arguments, disallowed_special=())
+                    + encoding.encode(
+                        "<|call|><|start|>assistant", allowed_special="all"
+                    )
+                )
+                actual = render_for_completion([message])
+                self.assertEqual(actual, expected)
+                self.assertEqual(
+                    actual,
+                    encoding.render_conversation_for_completion(
+                        Conversation.from_messages([message]), Role.ASSISTANT
+                    ),
+                )
+
     def test_developer_message_skips_unsupported_tool_types(self):
         from sglang.srt.entrypoints.harmony_utils import get_developer_message
         from sglang.srt.entrypoints.openai.protocol import ResponseTool
