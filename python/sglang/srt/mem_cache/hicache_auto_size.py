@@ -59,23 +59,25 @@ def _leaf_bytes(pool) -> int:
     return sum(sizes) if isinstance(sizes, tuple) else sizes
 
 
-def _draft_bytes(target, draft) -> int:
+def _draft_bytes(target, draft, *, loc_space_scale: int = 1) -> int:
     if draft.layer_router.sub_pool(
         IdSpaceKind.SLIDING_WINDOW
     ) is not None or isinstance(draft, DeepSeekV4TokenToKVPool):
-        # Match sidecar construction: only SWA drafts follow target SWA slots.
+        # Match sidecar construction: only SWA drafts follow target SWA slots,
+        # which DCP never widens.
         target = (
             target.layer_router.view(IdSpaceKind.SLIDING_WINDOW)
             if target.layer_router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None
             else target.swa_kv_pool
         )
         draft = draft.swa_kv_pool
+        loc_space_scale = 1
     # A sidecar has one host slot per target slot, however few slots the draft has.
-    return _pool_bytes(draft) * target.size // draft.size
+    return _pool_bytes(draft) * target.size * loc_space_scale // draft.size
 
 
 def _estimate_hicache_bytes(
-    params: CacheInitParams, draft_plan: HiCacheDraftPlan | None
+    params: CacheInitParams, draft_plan: HiCacheDraftPlan | None, *, dcp_size: int = 1
 ) -> int:
     """Device bytes whose host mirrors scale with the HiCache ratio."""
     # Every token KV view the pool routes to, and the recurrent state beside it.
@@ -89,9 +91,14 @@ def _estimate_hicache_bytes(
     if params.req_to_token_pool.holds_state_slots:
         total += _leaf_bytes(params.token_to_kv_pool_allocator.state.pool)
     drafts = params.mtp_draft_device_pools
+    loc_space_scale = 1
     if draft_plan is not None and draft_plan.mode == "sidecar":
         drafts = draft_plan.device_pools
-    return total + sum(_draft_bytes(pool, draft) for draft in drafts)
+        # A full sidecar spans the anchor's logical slots: dcp_size per host row.
+        loc_space_scale = dcp_size
+    return total + sum(
+        _draft_bytes(pool, draft, loc_space_scale=loc_space_scale) for draft in drafts
+    )
 
 
 @contextmanager
@@ -107,7 +114,9 @@ def auto_size_hicache(
         yield
         return
     requested = get_memory().hicache_ratio
-    device_bytes = _estimate_hicache_bytes(params, draft_plan)
+    device_bytes = _estimate_hicache_bytes(
+        params, draft_plan, dcp_size=get_parallel().attn_dcp_size
+    )
     budget = int(host_memory_budget_bytes(auto_size=True) * fraction)
     ratio = min(requested, budget * (1 - _ALLOCATION_SLACK_FRACTION) / device_bytes)
     # One collective before any pool is built: PP stages own different pool
