@@ -24,6 +24,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Optional
 
 import torch
+import triton
+import triton.language as tl
 
 from sglang.kernels.jit.utils import (
     cache_once,
@@ -34,6 +36,49 @@ from sglang.kernels.jit.utils import (
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
+
+
+@triton.jit
+def _qsa_store_compressed_keys_kernel(
+    source,
+    cache,
+    local_locs,
+    owner_mask,
+    WIDTH: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    if tl.load(owner_mask + row):
+        slot = tl.load(local_locs + row).to(tl.int64)
+        offsets = tl.arange(0, BLOCK)
+        values = tl.load(source + row * WIDTH + offsets, mask=offsets < WIDTH)
+        tl.store(cache + slot * WIDTH + offsets, values, mask=offsets < WIDTH)
+
+
+def qsa_store_compressed_keys(
+    compressed_keys: torch.Tensor,
+    cache: torch.Tensor,
+    local_locs: torch.Tensor,
+    owner_mask: torch.Tensor,
+) -> None:
+    """Store graph fallback keys at local slots without dynamic owner filtering.
+
+    Active destinations must be unique. Masked rows may share a safe slot,
+    including slot zero even when another row owns that real local slot.
+    """
+    rows = compressed_keys.shape[0]
+    if rows == 0:
+        return
+    keys = compressed_keys.flatten(1).contiguous().to(cache.dtype)
+    width = keys.shape[1]
+    _qsa_store_compressed_keys_kernel[(rows,)](
+        keys,
+        cache,
+        local_locs,
+        owner_mask,
+        WIDTH=width,
+        BLOCK=triton.next_power_of_2(width),
+    )
 
 
 @cache_once
@@ -147,7 +192,8 @@ def qsa_index_k_compress_store(
     cos_sin_cache: torch.Tensor,
     axis_map: torch.Tensor,
     weight: torch.Tensor,
-    write_locs: torch.Tensor,
+    owner_mask: torch.Tensor,
+    local_write_locs: torch.Tensor,
     compressed_k_buffer: torch.Tensor,
     compress_ratio: int,
     rotary_dim: int,
@@ -167,7 +213,9 @@ def qsa_index_k_compress_store(
     cos_sin_cache    : CUDA fp32 [capacity, rotary_dim] RoPE cache
     axis_map         : CUDA int32 [rotary_dim // 2] position-axis per pair index
     weight           : [head_dim] gemma norm weight (kernel applies 1 + w)
-    write_locs       : CUDA int32 [groups] compressed-cache slots to write
+    owner_mask       : CUDA int32 [groups], zero skips all reads and writes
+    local_write_locs : CUDA int32 [groups] rank-local compressed-cache slots;
+                       ignored where owner_mask is zero
     compressed_k_buffer : CUDA [compressed_slots, head_dim] (written), ring dtype
                        or fp8 e4m3
     compress_ratio   : raw keys per compressed key
@@ -186,7 +234,8 @@ def qsa_index_k_compress_store(
         cos_sin_cache,
         axis_map,
         weight,
-        write_locs,
+        owner_mask,
+        local_write_locs,
         compressed_k_buffer,
         compress_ratio,
         rotary_dim,

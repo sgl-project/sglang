@@ -2895,9 +2895,8 @@ class Scheduler(
         )
         # PrefillAdder reserves one page per shard; the allocator reserves one.
         # Subtract the other N - 1 pages to keep queue admission schedulable.
-        token_capacity = (
-            self.max_total_num_tokens * self.kv_shard_widening
-            - self.page_size * (self.kv_shard_widening - 1)
+        token_capacity = self.max_total_num_tokens - self.page_size * (
+            self.kv_shard_widening - 1
         )
         if is_cp_sharded_padded():
             token_capacity = from_cp_sharded(token_capacity)
