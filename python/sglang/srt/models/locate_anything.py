@@ -35,7 +35,10 @@ from sglang.srt.managers.mm_utils import (
 )
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    maybe_remap_kv_scale_name,
+)
 from sglang.srt.models.kimi_vl_moonvit import MoonVitPretrainedModel
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
 from sglang.srt.multimodal.modality import Modality
@@ -181,6 +184,12 @@ class LocateAnythingForConditionalGeneration(nn.Module):
                 if name.startswith(src):
                     name = dst + name[len(src) :]
                     break
+
+            # Remap KV-cache scale names before the q/k/v_proj -> qkv_proj rename.
+            if "scale" in name:
+                name = maybe_remap_kv_scale_name(name, params_dict)
+                if name is None:
+                    continue
 
             if "rotary_emb.inv_freq" in name:
                 continue

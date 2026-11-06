@@ -107,7 +107,10 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph.context_manager import (
     is_in_tc_piecewise_cuda_graph,
 )
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    maybe_remap_kv_scale_name,
+)
 from sglang.srt.models.utils import (
     can_run_silu_fp4_quant_fusion,
     silu_and_mul_fp4_quant,
@@ -1343,6 +1346,12 @@ class Qwen2MoeForCausalLM(nn.Module):
                 continue
             if "rotary_emb.inv_freq" in name:
                 continue
+            # Remap KV-cache scale names before the q/k/v_proj -> qkv_proj rename.
+            if "scale" in name:
+                name = maybe_remap_kv_scale_name(name, params_dict)
+                if name is None:
+                    continue
+
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).
                 if weight_name not in name:

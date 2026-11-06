@@ -56,7 +56,10 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    maybe_remap_kv_scale_name,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_npu
 
@@ -613,6 +616,12 @@ class AfmoeForCausalLM(nn.Module):
                 name = name.replace(".mlp.router.gate.", ".mlp.gate.")
 
             # Handle stacked params (qkv_proj, gate_up_proj)
+            # Remap KV-cache scale names before the q/k/v_proj -> qkv_proj rename.
+            if "scale" in name:
+                name = maybe_remap_kv_scale_name(name, params_dict)
+                if name is None:
+                    continue
+
             handled = False
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:

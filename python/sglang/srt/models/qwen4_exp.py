@@ -2528,6 +2528,9 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 continue
             if "language_model" in name:
                 name = name.replace("model.language_model.", "model.")
+            if name.endswith((".self_attn.k_scale", ".self_attn.v_scale")):
+                # compressed-tensors stores the scales on the attention module.
+                name = name.replace(".self_attn.", ".self_attn.attn.")
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
             if name.endswith(".k_proj.k_scale"):
