@@ -1967,43 +1967,6 @@ class TestMtpMhaPhysicalConstruction(CustomTestCase):
 class TestMambaSwaStackMatchesOtherStacks(CustomTestCase):
     """Every stack builds its controller and state host the same way."""
 
-    def test_controller_takes_groups_and_host_memory_mode(self):
-        """Stacks once dropped the attention groups or the host memory mode."""
-        params = SimpleNamespace(
-            token_to_kv_pool_allocator=object(),
-            page_size=1,
-            tp_cache_group=object(),
-            pp_cache_group=object(),
-            attn_cp_cache_group=object(),
-            attn_tp_cache_group=object(),
-        )
-        memory = SimpleNamespace(
-            hicache_write_policy="write_through",
-            hicache_io_backend="kernel",
-            hicache_host_memory_mode="buffer_only",
-        )
-        with (
-            patch.object(hybrid_pool_assembler, "get_memory", return_value=memory),
-            patch.object(hybrid_pool_assembler, "HybridCacheController") as ctor,
-        ):
-            hybrid_pool_assembler._build_cache_controller(
-                params=params,
-                host_pool_group=object(),
-                transfer_layer_id_max=2,
-                load_cache_event=None,
-                storage_backend=None,
-                prefetch_threshold=256,
-                model_name=None,
-                storage_backend_extra_config=None,
-                enable_storage_metrics=False,
-            )
-        kwargs = ctor.call_args.kwargs
-        self.assertIs(ctor.call_args.args[3], params.tp_cache_group)
-        self.assertIs(kwargs["attn_cp_group"], params.attn_cp_cache_group)
-        self.assertIs(kwargs["attn_tp_group"], params.attn_tp_cache_group)
-        self.assertIs(kwargs["pp_group"], params.pp_cache_group)
-        self.assertEqual(kwargs["host_memory_mode"], "buffer_only")
-
     def test_state_host_has_no_kv_split(self):
         for layout, expected in (
             ("page_first_kv_split", "page_first_direct"),

@@ -8,13 +8,16 @@ import torch
 
 kernel = torch.ops.sgl_kernel
 
-from sglang.srt.utils.common import (
+from sglang.srt.utils.device import (
     get_cpu_ids_by_node,
     get_physical_cpus_by_numa_or_block,
 )
 from sglang.srt.utils.numa_utils import init_threads_binding
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import (
+    CustomTestCase,
+    get_available_cpu_ids,
+)
 
 register_cpu_ci(est_time=6, suite="stage-a-tp-test-cpu-intel")
 
@@ -24,7 +27,13 @@ class TestBinding(CustomTestCase):
         start_id = 1
         n_cpu = 6
 
-        expected_cores = list(map(str, range(start_id, start_id + n_cpu)))
+        # Confine to an already-set SGLANG_CPU_OMP_THREADS_BIND; otherwise
+        # fall back to the original hardcoded core range.
+        cpu_ids_list = get_available_cpu_ids(n_cpu)
+        if cpu_ids_list is None:
+            expected_cores = list(map(str, range(start_id, start_id + n_cpu)))
+        else:
+            expected_cores = list(map(str, cpu_ids_list[:n_cpu]))
         cpu_ids = ",".join(expected_cores)
         output = kernel.init_cpu_threads_env(cpu_ids)
 
@@ -35,8 +44,8 @@ class TestBinding(CustomTestCase):
 
 
 class TestCPUTopology(CustomTestCase):
-    @patch("sglang.srt.utils.common.psutil.Process")
-    @patch("sglang.srt.utils.common.parse_lscpu_topology")
+    @patch("sglang.srt.utils.device.psutil.Process")
+    @patch("sglang.srt.utils.device.parse_lscpu_topology")
     def test_group_selection_and_affinity(self, mock_topology, mock_process):
         cases = [
             (

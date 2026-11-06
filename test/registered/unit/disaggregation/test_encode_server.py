@@ -34,7 +34,7 @@ from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import
 from sglang.srt.managers.io_struct import unwrap_from_pickle
 from sglang.srt.multimodal.encoder_preprocessing import EncoderMediaProcessorConfig
 from sglang.srt.multimodal.modality import Modality
-from sglang.srt.utils.common import safe_pickle_loads
+from sglang.srt.utils.serialization import safe_pickle_loads
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 

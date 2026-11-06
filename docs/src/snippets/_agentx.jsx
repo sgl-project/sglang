@@ -14,6 +14,8 @@
 //                            to block i of this cell's submitted router).
 //   point.patch[r]           later points: null | {replace: blocks} | per-block
 //                            {args: {flag: [values]|null}, env: {k: v|null}} | {block: full}.
+//   point.files[r]           later points whose config files differ from the cell's first point
+//                            (e.g. an nginx.conf for another frontend count): their file ids.
 // `data` may also be an array of such files (a generated snapshot plus a hand-maintained
 // platform): they render as one explorer, and each file's source.text labels its own hardware.
 export const AgentX = ({ data: input }) => {
@@ -388,13 +390,14 @@ export const AgentX = ({ data: input }) => {
   const point = pointInfo(cell, cell.points[pi]);
   const kv = kvChoice && kvSelectable(cell, point, kvChoice) ? kvChoice : point.kv;
   const routerData = cell.routers[router];
+  const fileIds = ((cell.points[pi] || {}).files || {})[router] || routerData.files;
   const blocks = blocksFor(cellIdx, pi, router, kv);
   const status = router === cell.submitted && kv === point.kv ? point.status : "derived";
   const workerCount = blocks.filter((b) => b.kind === "worker").reduce((n, b) => n + (b.workers || 1), 0);
   const blockText = blocks.map(formatBlock);
   const blockTitle = (b) => (b.kind === "worker" ? ROLE_TITLE[b.role] : KIND_TITLE[b.kind] || b.kind);
   const allText = blocks.map((b, i) => `# ${blockTitle(b)}\n${blockText[i]}`).join("\n\n");
-  const usedPlaceholders = [...new Set((allText + JSON.stringify(routerData.files.map((f) => data.files[f]))).match(/\$[A-Z][A-Z0-9_]*/g) || [])]
+  const usedPlaceholders = [...new Set((allText + JSON.stringify(fileIds.map((f) => data.files[f]))).match(/\$[A-Z][A-Z0-9_]*/g) || [])]
     .map((p) => p.slice(1))
     .filter((p) => placeholderText(p));
   const exportText = usedPlaceholders.map((p) => `export ${p}=<${placeholderText(p)}>`).join("\n");
@@ -407,7 +410,7 @@ export const AgentX = ({ data: input }) => {
     return n > 1 ? `${base} ×${n}` : base;
   };
   // Config files sit in the tab of the process that reads them (nats.conf under NATS, ...).
-  const fileList = routerData.files.map((fid) => data.files[fid]);
+  const fileList = fileIds.map((fid) => data.files[fid]);
   const looseFiles = fileList.filter((f) => !blockText.some((t) => t.includes(f.name)));
   const tabs = [
     ...(usedPlaceholders.length ? [{ id: "exports", label: "Env Vars" }] : []),

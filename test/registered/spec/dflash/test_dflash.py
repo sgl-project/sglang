@@ -9,10 +9,7 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.kits.json_constrained_kit import JSONConstrainedMixin
 from sglang.test.kits.matched_stop_kit import MatchedStopMixin
-from sglang.test.kits.radix_cache_server_kit import (
-    gen_radix_tree,
-    run_radix_attention_test,
-)
+from sglang.test.kits.radix_cache_server_kit import run_radix_attention_test
 from sglang.test.kits.spec_server_kits import SpecGrammarKit, SpecLogprobKit
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_DFLASH,
@@ -24,7 +21,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=894, stage="extra-a", runner_config="1-gpu-small")
-register_amd_ci(est_time=420, stage="stage-b", runner_config="1-gpu-small-amd")
+register_amd_ci(est_time=420, stage="extra-a", runner_config="1-gpu-small-amd")
 
 
 class TestDFlashServerBase(
@@ -144,18 +141,7 @@ class TestDFlashServerPage256(TestDFlashServerBase):
     page_size = 256
 
     def test_radix_attention(self):
-        import requests
-
-        nodes = gen_radix_tree(num_nodes=50)
-        data = {
-            "input_ids": [node["input_ids"] for node in nodes],
-            "sampling_params": [
-                {"max_new_tokens": node["decode_len"], "temperature": 0}
-                for node in nodes
-            ],
-        }
-        res = requests.post(self.base_url + "/generate", json=data)
-        assert res.status_code == 200
+        run_radix_attention_test(self.base_url, num_nodes=50)
         assert self.process.poll() is None
 
 
