@@ -521,7 +521,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         ):
             raise RuntimeError("the arena must be backed before allocator.resize")
         for band in self.members:
-            if band.allocated_count() or band._pending_reuse:
+            if band.allocated_count() or band._pending_reuse or band._unsettled_free:
                 raise RuntimeError(
                     f"cannot resize non-empty band {band.sub_pool_name!r}"
                 )
@@ -780,11 +780,21 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             + swa_pages * self.swa_attn_allocator.entry_bytes_per_page
         )
 
-    def set_latest_forward_done_event(self, event: Optional[torch.cuda.Event]) -> None:
-        """Forward the per-batch `forward_done` event to every member."""
+    def set_latest_forward_done_event(
+        self,
+        event: Optional[torch.cuda.Event],
+        stream: Optional[torch.cuda.Stream] = None,
+    ) -> None:
+        """Forward the per-batch `forward_done` event (and the forward stream) to
+        every member."""
         with record_function("ChainAllocator.set_latest_forward_done_event"):
             for member in self.members:
-                member.set_latest_forward_done_event(event)
+                member.set_latest_forward_done_event(event, stream)
+
+    def reuse_fences(self) -> List[torch.cuda.Event]:
+        """Members' pending `Band.reuse_fence` events."""
+        fences = (member.reuse_fence() for member in self.members)
+        return [fence for fence in fences if fence is not None]
 
     def set_inflight_forward(
         self,
@@ -805,7 +815,9 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         """Non-urgent flush of every member, ends before floats; sync-free."""
         with record_function("ChainAllocator.flush_opportunistic"):
             if all(
-                m._free_phys_pages.numel() == 0 and not m._pending_reuse
+                m._free_phys_pages.numel() == 0
+                and not m._pending_reuse
+                and not m._unsettled_free
                 for m in self.members
             ):
                 return 0
