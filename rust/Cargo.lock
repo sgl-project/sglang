@@ -1041,13 +1041,14 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "dynamo-multimodal"
-version = "0.2.3"
+version = "0.2.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "59f050bab8f84b8881f319ef02c47ba76996b3ddcbba37f05e822be68115a571"
+checksum = "18d2d23e198d6ea7835245d2b9170a42df7b26a8eec22a0acb8dd58f1a53b350"
 dependencies = [
  "blake3",
  "gif",
  "image",
+ "matroska-demuxer",
  "png",
  "serde",
  "serde_json",
@@ -2365,6 +2366,12 @@ dependencies = [
  "autocfg",
  "rawpointer",
 ]
+
+[[package]]
+name = "matroska-demuxer"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4cbf36668475a45a46bf8710e927e7458b7c387e7c46ddb5457ae0c71cf5e817"
 
 [[package]]
 name = "maybe-rayon"

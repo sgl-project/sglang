@@ -30,7 +30,7 @@ fn processing_a_request_spawns_no_threads() {
         .into();
 
     let before = thread_count();
-    let processor = MmProcessor::from_spec(serde_json::from_value(spec).unwrap()).unwrap();
+    let processor = MmProcessor::from_spec(serde_json::from_value(spec).unwrap(), None).unwrap();
     // Two images, so any per-item fan-out is exercised.
     let output = processor
         .process(
