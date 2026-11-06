@@ -554,7 +554,6 @@ class PreparedDelta:
         from sglang.srt.weight_sync.gpu_delta.memory import device_empty
 
         started = time.perf_counter()
-        self.stream.wait_stream(torch.cuda.default_stream(self.device))
         allocate = device_empty if self.hardware else torch.empty
         with torch.cuda.stream(self.stream):
             self.decoded = (
@@ -634,8 +633,13 @@ class PreparedDelta:
         self.backend.layout.check_identity()
         self.timings["host_apply_identity_s"] = time.perf_counter() - apply_started
         with torch.cuda.device(self.device), torch.no_grad():
-            self._allocate_paused()
+            self.stream.wait_stream(torch.cuda.default_stream(self.device))
             with torch.cuda.stream(self.stream):
+                # Queue raw replacements before allocating and binding matrix buffers.
+                with self._phase("raw_apply"):
+                    for targets, sources in self.raw_copies.values():
+                        torch._foreach_copy_(targets, sources)
+                self._allocate_paused()
                 with self._phase("paused_gpu_pipeline"):
                     if self.batches:
                         self.io_stream.wait_stream(self.stream)
@@ -643,9 +647,6 @@ class PreparedDelta:
                             self._decode_batch(self.batches[0], 0)
                         else:
                             self._copy_batch(self.batches[0], 0)
-                    with self._phase("raw_apply"):
-                        for targets, sources in self.raw_copies.values():
-                            torch._foreach_copy_(targets, sources)
                     matrices_started = time.perf_counter()
                     if self.batches:
                         if self.hardware:
