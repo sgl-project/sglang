@@ -1183,16 +1183,27 @@ class MambaPool:
         if temporal.numel() > 0:
             temporal.index_fill_(1, idx64, 0)
 
-    def copy_from(self, src_indices: torch.Tensor, dst_indices: torch.Tensor):
-        """Clone mamba state (conv + temporal) from src slots into dst slots.
+    @property
+    def supports_temporal_cow_elision(self) -> bool:
+        return True
+
+    def copy_from(
+        self,
+        src_indices: torch.Tensor,
+        dst_indices: torch.Tensor,
+        *,
+        copy_temporal: bool = True,
+    ):
+        """Clone mamba state from src slots into dst slots.
 
         ReplaySSM invariant: the SOURCE must be a fully-flushed checkpoint
-        (``write_pos[src] == 0``). Only ``temporal`` is copied, not the ring, so
-        an un-flushed source would drop its last ``write_pos`` updates. Callers
-        comply: COW copies radix checkpoints; a ``checkpoint`` copies an
-        active slot only during prefill (ring empty); ``checkpoint``
-        caps the donate to the last flush boundary. The dst cursor is reset to 0
-        (the copied checkpoint has no pending ring entries).
+        (``write_pos[src] == 0``). The ring is never copied, so an un-flushed
+        source would drop its last ``write_pos`` updates. With copy_temporal=False,
+        only conv and registered siblings are copied; GDN pool prefill reads the
+        source temporal state directly. Callers comply: COW copies radix checkpoints;
+        a ``checkpoint`` copies an active slot only during prefill (ring empty);
+        ``checkpoint`` caps the donate to the last flush boundary. The dst cursor
+        is reset to 0 (the copied checkpoint has no pending ring entries).
         """
         if self.replayssm_write_pos is not None and self.debug_memory_pool:
             # Debug-only (syncs): catch any copy of an active, un-flushed slot.
@@ -1213,16 +1224,17 @@ class MambaPool:
                 )
             fused_copy_conv_slots(self._conv_slot_desc, src_indices, dst_indices)
             temporal = self.mamba_cache.temporal
-            if temporal.numel() > 0:
+            if copy_temporal and temporal.numel() > 0:
                 temporal[:, dst_indices] = temporal[:, src_indices]
         else:
             for i in range(len(self.mamba_cache.conv)):
                 self.mamba_cache.conv[i][:, dst_indices] = self.mamba_cache.conv[i][
                     :, src_indices
                 ]
-            self.mamba_cache.temporal[:, dst_indices] = self.mamba_cache.temporal[
-                :, src_indices
-            ]
+            if copy_temporal:
+                self.mamba_cache.temporal[:, dst_indices] = self.mamba_cache.temporal[
+                    :, src_indices
+                ]
         if self.replayssm_write_pos is not None:
             self.replayssm_write_pos[dst_indices] = 0
         for sibling in self._slot_siblings:
@@ -1654,6 +1666,30 @@ class HybridReqToTokenPool(ReqToTokenPool):
         maps state slot ids through the allocator's id space; this stays for
         integrations outside sglang that call it (LMCache's sglang adapter)."""
         return mamba_indices
+
+    def use_gdn_pool_prefill(self, forward_batch) -> bool:
+        """Whether every GDN layer can use pool I/O and skip temporal COW."""
+        src_indices = getattr(forward_batch, "mamba_prefill_src_indices", None)
+        state = self.state
+        temporal = state.pool.mamba_cache.temporal
+        return bool(
+            getattr(self, "gdn_prefill_pool_io", False)
+            and state.ckpt_pool is None
+            and state.pool.supports_temporal_cow_elision
+            and temporal.dtype == torch.bfloat16
+            and temporal.dim() == 5
+            and temporal.data_ptr() % 64 == 0
+            and temporal.stride(0) * temporal.element_size() % 64 == 0
+            and temporal.stride(1) * temporal.element_size() % 64 == 0
+            and temporal.stride(-3) == temporal.size(-2) * temporal.size(-1)
+            and temporal.stride(-2) == temporal.size(-1)
+            and temporal.stride(-1) == 1
+            and src_indices is not None
+            and len(src_indices) == forward_batch.batch_size
+            and forward_batch.forward_mode.is_extend()
+            and not forward_batch.forward_mode.is_target_verify()
+            and not forward_batch.forward_mode.is_draft_extend_v2()
+        )
 
     def get_mamba_ping_pong_other_idx(self, mamba_next_track_idx: int) -> int:
         if self.mamba_ping_pong_track_buffer_size == 2:

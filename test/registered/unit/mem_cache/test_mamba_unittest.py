@@ -8,7 +8,7 @@ import torch
 from sglang.kernels.ops.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
@@ -390,6 +390,110 @@ class TestMamba(unittest.TestCase):
             torch.equal(ngram.context[dst.long()], window),
             f"copy_from lost the N-gram window: got {ngram.context[dst.long()]}",
         )
+
+    def test_gdn_pool_cow_preserves_temporal_and_copies_siblings(self):
+        pool = object.__new__(MambaPool)
+        conv = torch.arange(12, dtype=torch.float32).reshape(1, 2, 3, 2)
+        temporal = torch.arange(8, dtype=torch.float32).reshape(1, 2, 1, 2, 2)
+        pool.mamba_cache = MambaPool.State(conv=[conv], temporal=temporal)
+        pool.replayssm_write_pos = None
+        pool.debug_memory_pool = False
+        copied = []
+        sibling = SimpleNamespace(
+            copy_slots=lambda src, dst: copied.append((src.clone(), dst.clone()))
+        )
+        pool._slot_siblings = [sibling]
+        src = torch.tensor([0])
+        dst = torch.tensor([1])
+        temporal_before = temporal.clone()
+
+        pool.copy_from(src, dst, copy_temporal=False)
+
+        self.assertTrue(torch.equal(conv[:, 1], conv[:, 0]))
+        self.assertTrue(torch.equal(temporal, temporal_before))
+        self.assertEqual(len(copied), 1)
+        self.assertTrue(torch.equal(copied[0][0], src))
+        self.assertTrue(torch.equal(copied[0][1], dst))
+
+        pool.copy_from(src, dst)
+        self.assertTrue(torch.equal(temporal[:, 1], temporal[:, 0]))
+
+    def test_gdn_pool_prefill_sources_follow_batch_rows(self):
+        batch = object.__new__(ScheduleBatch)
+        reqs = [
+            SimpleNamespace(
+                kv=SimpleNamespace(
+                    mamba_pool_idx=torch.tensor(17),
+                    mamba_cow_src_index=torch.tensor([5]),
+                    mamba_needs_clear=False,
+                )
+            ),
+            SimpleNamespace(
+                kv=SimpleNamespace(
+                    mamba_pool_idx=torch.tensor(29),
+                    mamba_cow_src_index=None,
+                    mamba_needs_clear=True,
+                )
+            ),
+        ]
+
+        ScheduleBatch._collect_deferred_mamba_cow_and_clear(batch, reqs)
+
+        self.assertEqual(batch.mamba_cow_src_indices.tolist(), [5])
+        self.assertEqual(batch.mamba_cow_dst_indices.tolist(), [17])
+        self.assertEqual(batch.mamba_clear_indices.tolist(), [29])
+        self.assertEqual(batch.mamba_prefill_src_indices.tolist(), [5, 29])
+        self.assertIsNone(reqs[0].kv.mamba_cow_src_index)
+        self.assertFalse(reqs[1].kv.mamba_needs_clear)
+
+    def test_gdn_pool_prefill_capability_checks_real_layout(self):
+        from sglang.srt.model_executor.forward_mode import ForwardMode
+
+        pool = object.__new__(HybridReqToTokenPool)
+        pool.gdn_prefill_pool_io = True
+        temporal = torch.empty(1, 3, 2, 4, 4, dtype=torch.bfloat16)
+        pool.state = SimpleNamespace(
+            ckpt_pool=None,
+            pool=SimpleNamespace(
+                supports_temporal_cow_elision=True,
+                mamba_cache=SimpleNamespace(temporal=temporal),
+            ),
+        )
+        forward_batch = SimpleNamespace(
+            mamba_prefill_src_indices=torch.tensor([5, 29]),
+            batch_size=2,
+            forward_mode=ForwardMode.EXTEND,
+        )
+
+        self.assertTrue(pool.use_gdn_pool_prefill(forward_batch))
+        pool.state.pool.mamba_cache.temporal = temporal.transpose(-1, -2)
+        self.assertFalse(pool.use_gdn_pool_prefill(forward_batch))
+        pool.state.pool.mamba_cache.temporal = temporal.float()
+        self.assertFalse(pool.use_gdn_pool_prefill(forward_batch))
+        pool.state.pool.mamba_cache.temporal = temporal.as_strided(
+            temporal.shape, (temporal.stride(0) + 1, *temporal.stride()[1:])
+        )
+        self.assertFalse(pool.use_gdn_pool_prefill(forward_batch))
+        pool.state.pool.mamba_cache.temporal = temporal
+        pool.state.ckpt_pool = object()
+        self.assertFalse(pool.use_gdn_pool_prefill(forward_batch))
+
+    def test_gdn_unified_pool_cow_preserves_temporal(self):
+        from sglang.srt.mem_cache.kv.layout.state import StateView
+
+        pool = object.__new__(StateView)
+        conv = torch.arange(12, dtype=torch.float32).reshape(1, 2, 3, 2)
+        temporal = torch.arange(8, dtype=torch.float32).reshape(1, 2, 1, 2, 2)
+        pool.mamba_cache = StateView.State(conv=[conv], temporal=temporal)
+        pool.supports_temporal_cow_elision = True
+        src = torch.tensor([0])
+        dst = torch.tensor([1])
+        temporal_before = temporal.clone()
+
+        pool.copy_from(src, dst, copy_temporal=False)
+
+        self.assertTrue(torch.equal(conv[:, 1], conv[:, 0]))
+        self.assertTrue(torch.equal(temporal, temporal_before))
 
     def test_ngram_cpu_offload_roundtrip(self):
         """The window survives a host offload round-trip along with mamba state."""

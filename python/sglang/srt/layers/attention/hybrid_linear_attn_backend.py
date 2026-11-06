@@ -221,7 +221,21 @@ class MambaAttnBackendBase(AttentionBackend):
         mamba_cache_indices = self.req_to_token_pool.get_mamba_indices(
             forward_batch.req_pool_indices
         )
-        mamba_cache_indices = self._translate_mamba_indices(mamba_cache_indices)
+        mamba_cache_indices = (
+            self._translate_mamba_indices(mamba_cache_indices)
+            .to(dtype=torch.int32)
+            .contiguous()
+        )
+        use_gdn_pool_prefill = self.req_to_token_pool.use_gdn_pool_prefill(
+            forward_batch
+        )
+        mamba_prefill_src_indices = None
+        if use_gdn_pool_prefill:
+            mamba_prefill_src_indices = (
+                self._translate_mamba_indices(forward_batch.mamba_prefill_src_indices)
+                .to(dtype=torch.int32)
+                .contiguous()
+            )
         replayssm_ring_indices = None
         if self._replayssm_request_ring():
             replayssm_ring_indices = forward_batch.req_pool_indices[:bs].to(
@@ -381,6 +395,8 @@ class MambaAttnBackendBase(AttentionBackend):
             logical_num_tokens=logical_num_tokens,
             mamba_track_mask_indices=track_mask_indices,
             mamba_cache_indices=mamba_cache_indices,
+            mamba_prefill_src_indices=mamba_prefill_src_indices,
+            use_gdn_pool_prefill=use_gdn_pool_prefill,
             replayssm_ring_indices=replayssm_ring_indices,
             # Physical track destinations (None when tracking off); cuda-graph
             # supplies this via the static backend buffer in _replay_metadata.

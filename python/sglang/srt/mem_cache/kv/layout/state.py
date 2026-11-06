@@ -182,9 +182,10 @@ class MambaSubPoolSpec(SubPoolSpec):
 class StateView:
     """One state sub-pool's conv and temporal state over its band of a
     `KVArena`: per-layer ``[layer, slot, ...]`` tensors whose slot stride is the
-    whole entry, indexed by the physical slot id. Clears and copies act on whole
-    entries, so a fused draft's state block moves with the host's. Slots and
-    their virtual-to-physical tables are the chain allocator's state band.
+    whole entry, indexed by the physical slot id. Clears and default copies act
+    on whole entries, so a fused draft's state block moves with the host's.
+    Temporal COW elision copies only conv and is rejected for a fused draft.
+    Slots and their virtual-to-physical tables are the chain allocator's state band.
 
     The speculative-decoding work space (per draft token, per running request)
     is not per slot, so it lives beside the arena.
@@ -230,6 +231,7 @@ class StateView:
         self._arena = arena
         self._sub_pool_name = spec.name
         self._entry_bytes = spec.entry_bytes()
+        self.supports_temporal_cow_elision = spec.draft_region is None
         # PD state transfer maps entries by global layer id.
         self.mamba_layer_ids = list(mamba_layer_ids)
         self.num_mamba_layers = spec.layer_num
@@ -342,9 +344,20 @@ class StateView:
                     part.row_axis, indices.to(torch.int64), part.reset_value
                 )
 
-    def copy_from(self, src_indices: torch.Tensor, dst_indices: torch.Tensor) -> None:
-        entries = self._arena.entries(self._sub_pool_name)
-        entries[dst_indices] = entries[src_indices]
+    def copy_from(
+        self,
+        src_indices: torch.Tensor,
+        dst_indices: torch.Tensor,
+        *,
+        copy_temporal: bool = True,
+    ) -> None:
+        if copy_temporal:
+            entries = self._arena.entries(self._sub_pool_name)
+            entries[dst_indices] = entries[src_indices]
+        else:
+            assert self.supports_temporal_cow_elision
+            for conv in self.mamba_cache.conv:
+                conv[:, dst_indices] = conv[:, src_indices]
 
     def get_cpu_copy(self, indices):
         current_platform.synchronize()
@@ -456,6 +469,8 @@ class DraftStateView(StateView):
     clear and copy touch the block alone, and it has no transfer or copy of its
     own."""
 
+    supports_temporal_cow_elision = False
+
     def __init__(
         self,
         *,
@@ -508,8 +523,15 @@ class DraftStateView(StateView):
             view[:, indices] = 0
         self.mamba_cache.temporal[:, indices] = 0
 
-    def copy_from(self, src_indices: torch.Tensor, dst_indices: torch.Tensor) -> None:
+    def copy_from(
+        self,
+        src_indices: torch.Tensor,
+        dst_indices: torch.Tensor,
+        *,
+        copy_temporal: bool = True,
+    ) -> None:
         """Copy-on-write this runner's state block, the block only."""
+        assert copy_temporal
         for view in self.mamba_cache.conv:
             view[:, dst_indices] = view[:, src_indices]
         self.mamba_cache.temporal[:, dst_indices] = self.mamba_cache.temporal[

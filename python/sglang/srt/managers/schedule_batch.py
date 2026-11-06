@@ -1990,6 +1990,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     mamba_cow_src_indices: torch.Tensor = None
     mamba_cow_dst_indices: torch.Tensor = None
     mamba_clear_indices: torch.Tensor = None
+    mamba_prefill_src_indices: torch.Tensor = None
 
     # Encoder-decoder device tensors (host fields in the host metadata group)
     encoder_lens: Optional[torch.Tensor] = None
@@ -2672,15 +2673,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         cow_src_tensors = []
         cow_dst_tensors = []
         clear_tensors = []
+        prefill_src_tensors = []
         for req in reqs:
+            src_index = req.kv.mamba_pool_idx.unsqueeze(0)
             if req.kv.mamba_cow_src_index is not None:
-                cow_src_tensors.append(req.kv.mamba_cow_src_index)
+                src_index = req.kv.mamba_cow_src_index
+                cow_src_tensors.append(src_index)
                 cow_dst_tensors.append(req.kv.mamba_pool_idx.unsqueeze(0))
                 req.kv.mamba_cow_src_index = None
                 req.kv.mamba_needs_clear = False
             elif req.kv.mamba_needs_clear:
                 clear_tensors.append(req.kv.mamba_pool_idx.unsqueeze(0))
                 req.kv.mamba_needs_clear = False
+            prefill_src_tensors.append(src_index)
         self.mamba_cow_src_indices = (
             torch.cat(cow_src_tensors) if cow_src_tensors else None
         )
@@ -2688,6 +2693,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             torch.cat(cow_dst_tensors) if cow_dst_tensors else None
         )
         self.mamba_clear_indices = torch.cat(clear_tensors) if clear_tensors else None
+        self.mamba_prefill_src_indices = torch.cat(prefill_src_tensors)
 
     def mix_with_running(self, running_batch: ScheduleBatch):
         self.forward_mode = ForwardMode.MIXED
@@ -3181,6 +3187,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_cow_src_indices = None
         self.mamba_cow_dst_indices = None
         self.mamba_clear_indices = None
+        self.mamba_prefill_src_indices = None
 
         # Clear context parallel metadata - CP is only for prefill, not decode
         if hasattr(self, "attn_cp_metadata") and self.attn_cp_metadata is not None:
@@ -3337,6 +3344,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_cow_src_indices = None
         self.mamba_cow_dst_indices = None
         self.mamba_clear_indices = None
+        self.mamba_prefill_src_indices = None
         self.return_logprob = any(req.return_logprob for req in self.reqs)
         if self.return_logprob:
             self.top_logprobs_nums = [self.top_logprobs_nums[i] for i in keep_indices]

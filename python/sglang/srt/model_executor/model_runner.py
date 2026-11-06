@@ -2020,6 +2020,7 @@ class ModelRunner:
                 state.copy(
                     state_ids.ids(forward_batch.mamba_cow_src_indices),
                     state_ids.ids(forward_batch.mamba_cow_dst_indices),
+                    copy_temporal=not pool.use_gdn_pool_prefill(forward_batch),
                 )
         forward_batch.mamba_clear_indices = None
         forward_batch.mamba_cow_src_indices = None

@@ -277,7 +277,16 @@ class StateStorage:
 
     # -- state operations --
 
-    def copy(self, src_index: torch.Tensor, dst_index: torch.Tensor) -> None:
+    def copy(
+        self,
+        src_index: torch.Tensor,
+        dst_index: torch.Tensor,
+        *,
+        copy_temporal: bool = True,
+    ) -> None:
         if src_index.numel() == 0:
             return
-        self.pool.copy_from(src_index, dst_index)
+        if copy_temporal:
+            self.pool.copy_from(src_index, dst_index)
+        else:
+            self.pool.copy_from(src_index, dst_index, copy_temporal=False)

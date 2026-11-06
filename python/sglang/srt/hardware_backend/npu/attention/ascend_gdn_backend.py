@@ -25,6 +25,10 @@ fused_gdn_gating = fused_gdn_gating_npu
 class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
+        self._pool_prefill_enabled = hasattr(
+            torch.ops.npu, "chunk_gated_delta_rule_pool"
+        )
+        model_runner.req_to_token_pool.gdn_prefill_pool_io = self._pool_prefill_enabled
         self.conv_states_shape = torch.Size(
             (
                 *model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape[
@@ -315,8 +319,24 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             ).contiguous()
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
 
+            use_pool = forward_metadata.use_gdn_pool_prefill
+            src_slots = (
+                forward_metadata.mamba_prefill_src_indices
+                if use_pool
+                else cache_indices
+            )
             core_attn_out, last_recurrent_state, h = self.chunk_gdn(
-                query, key, value, g, beta, ssm_states[cache_indices], query_start_loc
+                query,
+                key,
+                value,
+                g,
+                beta,
+                ssm_states,
+                src_slots,
+                cache_indices,
+                has_initial_states,
+                query_start_loc,
+                use_pool=use_pool,
             )
 
             if last_recurrent_state is not None:
@@ -338,8 +358,13 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         v,
         g,
         beta,
-        initial_state,
+        state_pool,
+        src_slots,
+        dst_slots,
+        has_initial_state,
         cu_seqlens,
+        *,
+        use_pool=False,
     ):
         q = l2norm_fwd(q)  # [T, Nk, Dk]
         k = l2norm_fwd(k)  # [T, Nk, Dk]
@@ -356,6 +381,26 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             len(chunk_indices), v.shape[-2], v.shape[-1], k.shape[-1]
         )  # [NT, NH, DV, Dk]
 
+        if use_pool:
+            core_attn_out = torch.ops.npu.chunk_gated_delta_rule_pool(
+                q,
+                k,
+                v,
+                state_pool,
+                src_slots,
+                dst_slots,
+                beta=beta,
+                actual_seq_lengths=self.actual_seq_lengths,
+                scale=scale,
+                chunk_state=h,
+                g=g,
+                has_initial_state=has_initial_state,
+            )
+            return core_attn_out, None, h
+
+        initial_state = state_pool[src_slots.long()].contiguous()
+        if has_initial_state is not None:
+            initial_state *= has_initial_state.view(-1, 1, 1, 1)
         core_attn_out, last_recurrent_state = torch.ops.npu.chunk_gated_delta_rule(
             q,
             k,

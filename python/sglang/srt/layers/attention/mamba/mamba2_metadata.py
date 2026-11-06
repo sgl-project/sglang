@@ -29,6 +29,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 class ForwardMetadata:
     query_start_loc: torch.Tensor
     mamba_cache_indices: torch.Tensor
+    mamba_prefill_src_indices: Optional[torch.Tensor] = None
+    use_gdn_pool_prefill: bool = False
     conv_block_table: Optional[torch.Tensor] = None
     logical_num_tokens: Optional[int] = None
     mamba_cache_indices_gdn: Optional[torch.Tensor] = None
