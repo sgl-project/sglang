@@ -252,6 +252,18 @@ class DSAFlashMLAMetadata:
         self.num_splits.copy_(other.num_splits)
 
 
+def _slice_flashmla_cache_seqlens(
+    cache_seqlens: torch.Tensor, num_splits: torch.Tensor
+) -> torch.Tensor:
+    num_queries = num_splits.shape[0] - 1
+    if num_queries < 0 or cache_seqlens.shape[0] < num_queries:
+        raise RuntimeError(
+            "Invalid FlashMLA metadata row count: "
+            f"query_rows={num_queries}, cache_seqlens_rows={cache_seqlens.shape[0]}"
+        )
+    return cache_seqlens[:num_queries]
+
+
 @dataclass(frozen=True)
 class DSAMetadata:
     page_size: int
@@ -1402,9 +1414,20 @@ class DeepseekSparseAttnBackend(
             dsa_index_topk=self.dsa_index_topk,
             index_kpool=self.dsa_index_kpool,
         )
+        flashmla_cache_seqlens = dsa_cache_seqlens_int32
         dsa_cache_seqlens_int32 = pad_dsa_cache_seqlens(
             forward_batch, dsa_cache_seqlens_int32
         )
+        # Prefill graphs slice Q to real rows while the indexer keeps DP padding.
+        if not (
+            use_flashmla_kv
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and (
+                self._is_in_breakable_cuda_graph()
+                or self._is_in_tc_piecewise_cuda_graph()
+            )
+        ):
+            flashmla_cache_seqlens = dsa_cache_seqlens_int32
         dsa_cu_seqlens_k = compute_cu_seqlens(dsa_cache_seqlens_int32)
         dsa_cu_seqlens_q = self.get_device_int32_arange(len(dsa_cu_seqlens_k))
 
@@ -1440,7 +1463,7 @@ class DeepseekSparseAttnBackend(
             page_table_1_flattened=page_table_1_flattened,
             flashmla_metadata=(
                 self._compute_flashmla_metadata(
-                    cache_seqlens=dsa_cache_seqlens_int32,
+                    cache_seqlens=flashmla_cache_seqlens,
                     seq_len_q=1,
                 )
                 if use_flashmla_kv and not _is_xpu
@@ -3398,8 +3421,11 @@ class DeepseekSparseAttnBackend(
         metadata: DSAMetadata,
         page_table_1,
     ) -> torch.Tensor:
-        cache_seqlens = metadata.dsa_cache_seqlens_int32
         assert metadata.flashmla_metadata is not None
+        flashmla_metadata = metadata.flashmla_metadata
+        cache_seqlens = _slice_flashmla_cache_seqlens(
+            metadata.dsa_cache_seqlens_int32, flashmla_metadata.num_splits
+        )
 
         # TODO the 2nd dim is seq_len_q, need to be >1 when MTP
         q_all = q_all.view(-1, 1, layer.tp_q_head_num, layer.head_dim)
@@ -3426,13 +3452,21 @@ class DeepseekSparseAttnBackend(
             indices.shape[-1] == self.dsa_index_topk
         )  # requirement of FlashMLA decode kernel
 
+        query_rows = q_input.shape[0]
+        if not query_rows == cache_seqlens.shape[0] == indices.shape[0]:
+            raise RuntimeError(
+                "FlashMLA row mismatch before kernel launch: "
+                f"q_rows={query_rows}, cache_seqlens_rows={cache_seqlens.shape[0]}, "
+                f"indices_rows={indices.shape[0]}"
+            )
+
         o, _ = self._call_flash_mla_with_kvcache(
             q=q_input,
             k_cache=kv_cache,
             cache_seqlens=cache_seqlens,
             head_dim_v=v_head_dim,
-            tile_scheduler_metadata=metadata.flashmla_metadata.flashmla_metadata,
-            num_splits=metadata.flashmla_metadata.num_splits,
+            tile_scheduler_metadata=flashmla_metadata.flashmla_metadata,
+            num_splits=flashmla_metadata.num_splits,
             softmax_scale=sm_scale,
             indices=indices,
             # doc says it is not used, but if pass in None then error
