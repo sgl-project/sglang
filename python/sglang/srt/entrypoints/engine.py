@@ -2229,13 +2229,6 @@ def _rust_server_startup_time_sink() -> Callable[[Dict[str, Any]], None]:
 
 def node_hosts_rust_server() -> bool:
     """Whether this node contains a Rust listener rank, assuming Rust mode."""
-    parallel = get_parallel()
-    pp_rank_range, tp_rank_range, _, _ = _calculate_rank_ranges(parallel.node_rank)
-    if 0 not in pp_rank_range:
-        return False
+    from sglang.srt.rust_server.server import node_listener_ports
 
-    if get_exec().moe.is_ep_scale_joiner:
-        # Scale joiners launch the full local TP group, including its first rank.
-        return True
-
-    return any(_rank_hosts_rust_listener(0, tp_rank) for tp_rank in tp_rank_range)
+    return bool(node_listener_ports())
