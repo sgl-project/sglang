@@ -28,7 +28,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.utils.common import log_info_on_rank0
+from sglang.srt.utils.log_utils import log_info_on_rank0
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache

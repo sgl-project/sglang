@@ -33,6 +33,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.utils import copy_or_rebind_param
+from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.runtime_context import (
     get_exec,
     get_lora,
@@ -48,7 +49,6 @@ from sglang.srt.utils import (
     is_hip,
     is_npu,
     is_xpu,
-    set_weight_attrs,
     use_intel_amx_backend,
 )
 from sglang.srt.utils.custom_op import register_custom_op
