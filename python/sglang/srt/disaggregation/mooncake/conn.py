@@ -1933,6 +1933,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             StateType.REQUEST_ROW,
             StateType.BLOCK_SCALE,
             StateType.BLOCK_SCALE_SWA,
+            StateType.DFLASH_DRAFT_WINDOW,
         )
 
     def _requires_exact_state_index_match(self, st: StateType) -> bool:
@@ -2109,6 +2110,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 if slice_kv_heads and st not in (
                     StateType.SWA,
                     StateType.AUXILIARY_SWA,
+                    StateType.DFLASH_DRAFT_WINDOW,
                 ):
                     raise RuntimeError(
                         f"PD Disaggregation does NOT support PD different TP sizes for non-MLA {st.upper()} hybrid models yet."

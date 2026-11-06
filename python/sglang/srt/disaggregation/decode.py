@@ -153,6 +153,7 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_memory,
     get_parallel,
+    get_spec,
 )
 from sglang.srt.utils import (
     ceil_align,
@@ -741,7 +742,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             kv_item_lens += device_kv_item_lens[c4_layer_num:]
             kv_data_mem_kinds += ["VRAM"] * len(device_kv_data_ptrs[c4_layer_num:])
         num_draft_entries = 0
-        if self.draft_token_to_kv_pool is not None:
+        if (
+            self.draft_token_to_kv_pool is not None
+            and not get_spec().speculative_dflash_draft_window_transfer
+        ):
             # Draft KV shares target virtual ids. Unified target KV is transferred
             # with physical ids, so it needs a separate draft index vector.
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
@@ -1921,6 +1925,24 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
             return resume.unit_ids.cpu().numpy()
 
+        def _dflash_draft_window_payload():
+            from sglang.srt.disaggregation.utils import is_draft_kv_on_target_swa
+
+            window = get_spec().speculative_dflash_draft_window_transfer
+            window_start = page_align_floor(
+                max(total_prefix_len, seq_len - window), page_size
+            )
+            window_kv_indices = self.req_to_token_pool.req_to_token[
+                decode_req.req.kv.req_pool_idx, window_start:seq_len
+            ]
+            if is_draft_kv_on_target_swa(self.draft_token_to_kv_pool):
+                window_kv_indices = (
+                    self.token_to_kv_pool_allocator.translate_swa_indices_for_transfer(
+                        window_kv_indices
+                    )
+                )
+            return kv_to_page_indices(window_kv_indices, page_size)
+
         def _full_kv_pages_payload():
             kv_indices_full = self.req_to_token_pool.req_to_token[
                 decode_req.req.kv.req_pool_idx, :seq_len
@@ -2002,6 +2024,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             StateType.REQUEST_ROW: _request_row_payload,
             StateType.BLOCK_SCALE: _full_kv_pages_payload,
             StateType.BLOCK_SCALE_SWA: _swa_payload,
+            StateType.DFLASH_DRAFT_WINDOW: _dflash_draft_window_payload,
         }
         if _is_npu and isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool):
             from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (

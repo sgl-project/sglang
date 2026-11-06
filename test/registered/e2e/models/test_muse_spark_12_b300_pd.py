@@ -141,6 +141,14 @@ class TestMuseSpark12B300PD(SpecDecodingMixin, PDDisaggregationServerBase):
         self.assertEqual(metrics["error_rate"], 0.0)
         return metrics
 
+    def test_dflash_draft_kv_on_swa(self):
+        for url in (self.prefill_url, self.decode_url):
+            response = requests.get(f"{url}/server_info", timeout=30)
+            response.raise_for_status()
+            info = response.json()
+            self.assertIs(info["speculative_dflash_draft_kv_on_swa"], True)
+            self.assertEqual(info["speculative_dflash_draft_window_transfer"], 2048)
+
     def test_mmmu_pro(self):
         metrics = self._run_accuracy_eval("mmmu_pro", self.mmmu_pro_num_examples)
         if is_in_ci():

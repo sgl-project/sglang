@@ -102,6 +102,7 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_parallel,
     get_schedule,
+    get_spec,
 )
 from sglang.srt.utils import is_npu, rank_consensus_checker
 from sglang.srt.utils.common import async_d2h
@@ -322,7 +323,10 @@ class PrefillBootstrapQueue:
             else None
         )
         num_draft_entries = 0
-        if draft_kv_pool is not None:
+        if (
+            draft_kv_pool is not None
+            and not get_spec().speculative_dflash_draft_window_transfer
+        ):
             # Draft KV shares target virtual ids. Unified target KV is transferred
             # with physical ids, so it needs a separate draft index vector.
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
@@ -1720,6 +1724,22 @@ class SchedulerDisaggregationPrefillMixin:
                 ]
                 return state_page_indices(kv_indices_full)
 
+            def _dflash_draft_window_payload():
+                from sglang.srt.disaggregation.utils import is_draft_kv_on_target_swa
+
+                window = get_spec().speculative_dflash_draft_window_transfer
+                window_start = max(req.disagg_decode_prefix_len, seq_len - window)
+                window_start = (window_start // page_size) * page_size
+                window_kv_indices = self.req_to_token_pool.req_to_token[
+                    req.kv.req_pool_idx, window_start:seq_len
+                ]
+                draft_pool = self.disagg_prefill_bootstrap_queue.draft_token_to_kv_pool
+                if is_draft_kv_on_target_swa(draft_pool):
+                    window_kv_indices = self.token_to_kv_pool_allocator.translate_swa_indices_for_transfer(
+                        window_kv_indices
+                    )
+                return state_page_indices(window_kv_indices)
+
             def _minimax_payload():
                 return minimax_index_transfer_pages(
                     self.req_to_token_pool.req_to_token[req.kv.req_pool_idx, :seq_len],
@@ -1792,6 +1812,7 @@ class SchedulerDisaggregationPrefillMixin:
                 StateType.REQUEST_ROW: _request_row_payload,
                 StateType.BLOCK_SCALE: _full_kv_pages_payload,
                 StateType.BLOCK_SCALE_SWA: _swa_payload,
+                StateType.DFLASH_DRAFT_WINDOW: _dflash_draft_window_payload,
             }
             if _is_npu and isinstance(
                 self.token_to_kv_pool_allocator.get_kvcache(),

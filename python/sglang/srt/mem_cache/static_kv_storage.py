@@ -1117,6 +1117,14 @@ def _static_state_entries(
         if row_ptrs:
             add(StateType.REQUEST_ROW, row_ptrs, row_lens, row_item_lens)
 
+    from sglang.srt.runtime_context import get_spec
+
+    if (
+        draft_token_to_kv_pool is not None
+        and get_spec().speculative_dflash_draft_window_transfer
+    ):
+        _add_dflash_draft_window(token_to_kv_pool, draft_token_to_kv_pool, add)
+
     # The recurrent state pool, when the KV pool does not describe it (a
     # window KV pool beside a state sub-pool).
     if StateType.MAMBA not in types and state_pool is not None:
@@ -1149,6 +1157,43 @@ def _static_state_entries(
         regions=regions,
         views=views,
         wire_entries=tuple(wire_entries),
+    )
+
+
+def _add_dflash_draft_window(token_to_kv_pool, draft_token_to_kv_pool, add) -> None:
+    from sglang.srt.disaggregation.base.conn import StateType
+    from sglang.srt.disaggregation.utils import is_draft_kv_on_target_swa
+    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+    from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+
+    if is_draft_kv_on_target_swa(draft_token_to_kv_pool):
+        draft_rows = draft_token_to_kv_pool.swa_kv_pool
+        if not (
+            isinstance(token_to_kv_pool, SWAKVPool)
+            and token_to_kv_pool.full_to_swa_index_mapping is not None
+            and token_to_kv_pool.full_to_swa_index_mapping
+            is draft_token_to_kv_pool.full_to_swa_index_mapping
+            and token_to_kv_pool.page_size == draft_token_to_kv_pool.page_size
+        ):
+            raise RuntimeError(
+                "A draft on the target's SWA slots requires a hybrid-SWA target "
+                "pool sharing the draft's SWA index mapping and page size."
+            )
+        buf_infos = draft_token_to_kv_pool.get_state_buf_infos()
+    else:
+        draft_rows = draft_token_to_kv_pool
+        buf_infos = draft_token_to_kv_pool.get_contiguous_buf_infos()
+    # Exact type: an MXFP8 pool would also need its block scales sent.
+    if type(draft_rows) is not MHATokenToKVPool:
+        raise NotImplementedError(
+            "PD transfer of a DFLASH draft window supports plain MHA pools only, "
+            f"got {type(draft_rows).__name__}."
+        )
+    add(
+        StateType.DFLASH_DRAFT_WINDOW,
+        *buf_infos,
+        kv_layout=draft_rows.kv_cache_layout,
+        view=lambda: draft_rows,
     )
 
 

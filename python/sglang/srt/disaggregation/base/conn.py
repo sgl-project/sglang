@@ -39,6 +39,7 @@ class StateType(str, enum.Enum):
     # KV it describes (whole sequence for full attention, window for SWA).
     BLOCK_SCALE = "block_scale"
     BLOCK_SCALE_SWA = "block_scale_swa"
+    DFLASH_DRAFT_WINDOW = "dflash_draft_window"
 
 
 @dataclasses.dataclass

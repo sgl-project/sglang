@@ -31,9 +31,11 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocation import assign_req_to_token_pool_func
+from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
@@ -49,7 +51,9 @@ from sglang.srt.model_executor.runner_utils.pool import (
 from sglang.srt.models.dflash import DFlashMLAAttention
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
+    get_disagg,
     get_exec,
+    get_memory,
     get_parallel,
     get_schedule,
     get_spec,
@@ -448,6 +452,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         self.draft_model_runner = bundle.draft_model_runner
         self._draft_sampler = None
         self.draft_model = bundle.draft_model
+        self._draft_kv_on_swa = (
+            self.draft_model_runner.model_config.dflash_draft_kv_on_swa
+        )
+        if self._draft_kv_on_swa:
+            self._check_draft_kv_on_swa(
+                resolved_attention_backend=bundle.resolved_attention_backend
+            )
         self.selector = self.draft_model.candidate_selector
         # Ascend keeps selector proposal aligned with its greedy-only verify path.
         self._selector_sampling_enabled = not _is_npu
@@ -690,6 +701,96 @@ class DFlashWorkerV2(BaseSpecWorker):
                 ),
                 token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             )
+        if self._draft_kv_on_swa:
+            self._check_draft_pool_on_swa(token_to_kv_pool_allocator)
+
+    def _check_draft_kv_on_swa(self, *, resolved_attention_backend: str) -> None:
+        """Launch resolution already ruled these out; a hit is a resolution bug."""
+        parallel = get_parallel()
+        disagg = get_disagg()
+        pd = disagg.disaggregation_mode != "null"
+        draft_windows = [
+            layer.self_attn.sliding_window_size for layer in self.draft_model.layers
+        ]
+        target_window = self.model_runner.sliding_window_size
+        unsupported = [
+            reason
+            for reason, applies in (
+                (
+                    "a target without sliding-window layers",
+                    not self.model_runner.is_hybrid_swa,
+                ),
+                ("--speculative-draft-window-size", self.use_compact_draft_cache),
+                ("--enable-unified-memory", get_memory().enable_unified_memory),
+                (
+                    f"draft attention backend {resolved_attention_backend!r}",
+                    resolved_attention_backend not in ("trtllm_mha", "fa4"),
+                ),
+                ("DP attention", parallel.attn_dp_enabled),
+                ("context parallelism", parallel.attn_cp_size > 1),
+                ("decode context parallelism", parallel.attn_dcp_size > 1),
+                # The draft window state entry is validated only on mooncake.
+                (
+                    f"PD disaggregation over {disagg.disaggregation_transfer_backend!r}",
+                    pd and disagg.disaggregation_transfer_backend != "mooncake",
+                ),
+                (
+                    "PD disaggregation with pipeline parallelism",
+                    pd and parallel.pp_size > 1,
+                ),
+                # The target's SWA eviction keeps every slot the draft reads only
+                # if the draft reads no further back than the target.
+                (
+                    f"draft windows {draft_windows} beyond the target window "
+                    f"{target_window}",
+                    target_window is None
+                    or min(draft_windows) <= 0
+                    or max(draft_windows) > target_window,
+                ),
+            )
+            if applies
+        ]
+        if unsupported:
+            raise ValueError(
+                "DFLASH draft KV on the target's SWA slots does not support "
+                + ", ".join(unsupported)
+                + "."
+            )
+        if parallel.tp_rank == 0:
+            logger.info(
+                "DFLASH draft KV on the target's SWA slots: %d sliding-window "
+                "layers, draft window_left=%d, target window_left=%d, "
+                "disaggregation_mode=%s.",
+                len(draft_windows),
+                max(draft_windows),
+                target_window,
+                disagg.disaggregation_mode,
+            )
+
+    def _check_draft_pool_on_swa(self, token_to_kv_pool_allocator) -> None:
+        pool = self.draft_model_runner.token_to_kv_pool
+        if not (
+            isinstance(pool, SWAKVPool)
+            and pool.full_layer_nums == 0
+            and isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator)
+            and pool.full_to_swa_index_mapping
+            is token_to_kv_pool_allocator.full_to_swa_index_mapping
+        ):
+            raise RuntimeError(
+                "DFLASH draft KV on SWA slots expects an all-SWA draft pool on "
+                "the target allocator's full->SWA mapping, got "
+                f"{type(pool).__name__} on {type(token_to_kv_pool_allocator).__name__}."
+            )
+
+    def _draft_swa_write_ids(self, plan: IterationIds) -> Optional[torch.Tensor]:
+        # Read before on_publish: the scheduler may then rewrite the mapping.
+        if not self._draft_kv_on_swa:
+            return None
+        ids = plan.write_ids(
+            self.model_runner.runner_ids, kind=IdSpaceKind.SLIDING_WINDOW
+        )
+        assert ids is not None, "the target plan has no SWA write ids"
+        return ids
 
     def init_attention_backends(self):
         with (
@@ -2415,6 +2516,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 return_iteration_ids=True,
             )
             iteration_ids, batch_output.iteration_ids = batch_output.iteration_ids, None
+            swa_cache_loc = self._draft_swa_write_ids(iteration_ids)
 
             logits_output, next_token_ids = (
                 batch_output.logits_output,
@@ -2471,8 +2573,12 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._append_target_hidden_to_draft_kv_by_loc(
                 target_hidden=logits_output.hidden_states,
                 cache_loc=self._draft_write_ids(iteration_ids),
-                swa_cache_loc=self._draft_write_ids(
-                    iteration_ids, IdSpaceKind.SLIDING_WINDOW
+                swa_cache_loc=(
+                    swa_cache_loc
+                    if self._draft_kv_on_swa
+                    else self._draft_write_ids(
+                        iteration_ids, IdSpaceKind.SLIDING_WINDOW
+                    )
                 ),
                 positions=positions,
                 extend_lens=ctx_lens,
@@ -2662,6 +2768,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             write_virtual=verify_out_cache_loc,
             read_extent=block_size,
         )
+        verify_swa_cache_loc = self._draft_swa_write_ids(iteration_ids)
 
         seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
         if self.use_compact_draft_cache:
@@ -3053,8 +3160,10 @@ class DFlashWorkerV2(BaseSpecWorker):
             target_hidden=hidden.reshape(-1, hidden.shape[-1]),
             cache_loc=cache_loc,
             cache_loc_2d=cache_loc.view(verify_out_cache_loc_2d.shape),
-            swa_cache_loc=self._draft_write_ids(
-                iteration_ids, IdSpaceKind.SLIDING_WINDOW
+            swa_cache_loc=(
+                verify_swa_cache_loc
+                if self._draft_kv_on_swa
+                else self._draft_write_ids(iteration_ids, IdSpaceKind.SLIDING_WINDOW)
             ),
             positions=positions,
             commit_lens=commit_lens,

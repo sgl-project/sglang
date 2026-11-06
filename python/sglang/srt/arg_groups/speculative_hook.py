@@ -439,6 +439,7 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             )
 
     _resolve_dflash_draft_attention_backend(server_args)
+    _resolve_dflash_draft_kv_on_swa(server_args)
 
     if cfg.max_running_requests is None:
         declare_resolution(
@@ -1025,6 +1026,168 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
         server_args,
         "_resolve_dflash_draft_attention_backend",
         speculative_draft_attention_backend=draft_backend,
+    )
+
+
+def _plain_kv_cache_dtypes(cfg) -> bool:
+    # Block-scaled dtypes would also need their scales transferred.
+    plain = ("auto", "bf16", "bfloat16", "fp8_e4m3", "fp8_e5m2")
+    return cfg.kv_cache_dtype in plain and cfg.speculative_draft_kv_cache_dtype in (
+        None,
+        *plain,
+    )
+
+
+def _dflash_draft_window(server_args: ServerArgs) -> Optional[int]:
+    cfg = resolving_view(server_args)
+    from sglang.srt.hf_transformers import get_config
+    from sglang.srt.speculative.dflash_utils import (
+        get_dflash_attention_sliding_window_size,
+        get_dflash_layer_types,
+        parse_dflash_draft_config,
+    )
+
+    kwargs = {}
+    if cfg.decrypted_draft_config_file and cfg.decrypted_draft_config_file.strip():
+        kwargs["_configuration_file"] = cfg.decrypted_draft_config_file.strip()
+    try:
+        draft_hf_config = get_config(
+            cfg.speculative_draft_model_path,
+            trust_remote_code=cfg.trust_remote_code,
+            revision=cfg.speculative_draft_model_revision,
+            model_override_args=json.loads(cfg.json_model_override_args),
+            **kwargs,
+        )
+        draft_text_config = (
+            getattr(draft_hf_config, "text_config", None) or draft_hf_config
+        )
+        layer_types = get_dflash_layer_types(draft_hf_config)
+        if not (
+            layer_types
+            and len(layer_types)
+            == getattr(draft_text_config, "num_hidden_layers", None)
+            and set(layer_types) == {"sliding_attention"}
+            and not parse_dflash_draft_config(draft_hf_config=draft_hf_config).is_mla
+        ):
+            return None
+        window_left = int(get_dflash_attention_sliding_window_size(draft_hf_config))
+    except Exception as e:  # noqa: BLE001
+        logger.info("DFLASH draft window unresolved (%s).", e)
+        return None
+    # RadixAttention reads window_left 0 as full attention.
+    return window_left + 1 if window_left > 0 else None
+
+
+def _target_window(server_args: ServerArgs) -> Optional[int]:
+    target = model_config_of(server_args)
+    window = target.sliding_window_size if target.is_hybrid_swa else None
+    try:
+        window = int(window)
+    except (TypeError, ValueError):
+        return None
+    return window if window > 0 else None
+
+
+def _dflash_draft_window_transfer(
+    server_args: ServerArgs, draft_window: Optional[int], target_window: Optional[int]
+) -> Optional[int]:
+    cfg = resolving_view(server_args)
+    if (
+        cfg.disaggregation_mode == "null"
+        or cfg.disaggregation_transfer_backend != "mooncake"
+        # KV checksums hash every state buffer at the target's SWA indices.
+        or cfg.disaggregation_enable_kv_checksum
+        or cfg.pp_size != 1
+        or (cfg.attn_cp_size or 1) > 1
+        or (cfg.dcp_size or 1) > 1
+        or current_platform.is_out_of_tree()
+        or not get_platform().is_cuda
+        or not _plain_kv_cache_dtypes(cfg)
+        or not _plain_swa_mha_target(server_args)
+    ):
+        return None
+    if draft_window is None or target_window is None or draft_window > target_window:
+        return None
+    return draft_window
+
+
+def _plain_swa_mha_target(server_args: ServerArgs) -> bool:
+    # Only validated with plain hybrid-SWA MHA targets.
+    from sglang.srt.configs.model_config import AttentionArch
+
+    target = model_config_of(server_args)
+    hf_config = target.hf_config
+    return (
+        target.attention_arch == AttentionArch.MHA
+        and not getattr(target, "is_hybrid_swa_compress", False)
+        and getattr(hf_config, "model_type", None)
+        not in ("deepseek_v4", "deepseek_v41")
+        and not any(
+            arch.startswith("DeepseekV4")
+            for arch in getattr(hf_config, "architectures", None) or ()
+        )
+    )
+
+
+def _dflash_draft_kv_on_swa_blocker(
+    server_args: ServerArgs,
+    draft_window: Optional[int],
+    target_window: Optional[int],
+    window_transfer: Optional[int],
+) -> Optional[str]:
+    cfg = resolving_view(server_args)
+    if current_platform.is_out_of_tree() or not get_platform().is_cuda:
+        return "a non-CUDA platform"
+    if draft_window is None:
+        return "a draft that is not all sliding-window MHA"
+    if cfg.disable_hybrid_swa_memory or not _plain_swa_mha_target(server_args):
+        return "a target without a plain hybrid-SWA pool"
+    if target_window is None or draft_window > target_window:
+        return f"draft window {draft_window} beyond the target window {target_window}"
+    pd = cfg.disaggregation_mode != "null"
+    backend = cfg.speculative_draft_attention_backend
+    if backend not in ("trtllm_mha", "fa4"):
+        return f"draft attention backend {backend!r}"
+    for reason, applies in (
+        (
+            "--speculative-draft-window-size",
+            cfg.speculative_draft_window_size is not None,
+        ),
+        ("--enable-unified-memory", cfg.enable_unified_memory),
+        ("a block-scaled KV cache dtype", not _plain_kv_cache_dtypes(cfg)),
+        ("DP attention", attn_dp_enabled_of(cfg)),
+        ("context parallelism", (cfg.attn_cp_size or 1) > 1),
+        ("decode context parallelism", (cfg.dcp_size or 1) > 1),
+        (
+            "PD disaggregation without the DFLASH draft window transfer",
+            pd and window_transfer is None,
+        ),
+    ):
+        if applies:
+            return reason
+    return None
+
+
+def _resolve_dflash_draft_kv_on_swa(server_args: ServerArgs) -> None:
+    draft_window = _dflash_draft_window(server_args)
+    target_window = _target_window(server_args)
+    window = _dflash_draft_window_transfer(server_args, draft_window, target_window)
+    if window is not None:
+        declare_resolution(
+            server_args,
+            "_resolve_dflash_draft_kv_on_swa",
+            speculative_dflash_draft_window_transfer=window,
+        )
+    blocker = _dflash_draft_kv_on_swa_blocker(
+        server_args, draft_window, target_window, window
+    )
+    if blocker is not None:
+        logger.info("DFLASH draft KV keeps a per-token pool: %s.", blocker)
+        return
+    declare_resolution(
+        server_args,
+        "_resolve_dflash_draft_kv_on_swa",
+        speculative_dflash_draft_kv_on_swa=True,
     )
 
 
