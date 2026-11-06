@@ -271,11 +271,7 @@ if _is_cuda or _is_hip or _is_xpu:
         from sgl_kernel import topk_sigmoid, topk_softmax
     else:
         from sglang.kernels.ops.moe import topk_softmax
-
-        try:
-            from sglang.kernels.ops.moe.moe_topk_sigmoid import topk_sigmoid
-        except ImportError:
-            pass
+        from sglang.kernels.ops.moe.moe_topk_sigmoid import topk_sigmoid
 if _use_aiter:
     try:
         from aiter import biased_grouped_topk as aiter_biased_grouped_topk
@@ -2127,7 +2123,6 @@ def biased_grouped_topk_gpu(
             num_fused_shared_experts,
             num_expert_group,
             topk_group,
-            gating_output.device.index,
         ) and moe_route_warp.bias_layout_ok(correction_bias):
             return moe_route_warp.moe_route_warp(
                 gating_output,
@@ -2203,6 +2198,31 @@ def biased_grouped_topk_gpu(
             )
 
         return topk_weights, topk_ids
+
+    elif (
+        _is_cuda
+        and not dynamic_bias
+        and num_experts == 512
+        and num_expert_group == 8
+        and topk_group == 4
+        and 1 <= topk_routed <= 8
+        and 0 <= num_fused_shared_experts <= 1
+    ):
+        from sglang.kernels.ops.moe.bailing_moe_topk import (
+            bailing_moe_biased_grouped_topk,
+        )
+
+        return bailing_moe_biased_grouped_topk(
+            gating_output.to(dtype=torch.float32),
+            correction_bias.to(dtype=torch.float32),
+            num_expert_group,
+            topk_group,
+            topk,
+            renormalize,
+            num_fused_shared_experts,
+            routed_scaling_factor if routed_scaling_factor is not None else 1.0,
+            bool(apply_routed_scaling_factor_on_output),
+        )
 
     elif _is_cuda and num_expert_group > 1 and not dynamic_bias:
         # CUDA grouped fallback (flashinfer unavailable / constraints unmet): the

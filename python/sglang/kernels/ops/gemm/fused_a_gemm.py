@@ -15,7 +15,7 @@ from enum import Enum
 
 import torch
 
-from sglang.srt.utils.common import get_device_sm, is_cuda, is_sm120_supported
+from sglang.srt.utils.device import get_device_sm, is_cuda, is_sm120_supported
 
 
 class FusedAGemmBackend(str, Enum):
@@ -31,7 +31,7 @@ _AUTO_BACKEND = (
 # Mirrors the K asserts in each backend's _dsv3_fused_a_gemm_run.
 _K_ALIGNMENT = {
     FusedAGemmBackend.JIT: 256,
-    FusedAGemmBackend.CUTEDSL: 1024,
+    FusedAGemmBackend.CUTEDSL: 256,
 }
 
 _IS_CUDA = is_cuda()
@@ -50,6 +50,8 @@ def fused_a_gemm_weight_eligible(
 ) -> bool:
     return (
         layer.weight.dtype == torch.bfloat16
+        # The kernels compute x @ weight.T only, so a biased layer keeps its own path.
+        and layer.bias is None
         and layer.weight.shape[0] % 16 == 0
         and layer.weight.shape[1] % _K_ALIGNMENT[_resolve_backend(backend)] == 0
         and _IS_CUDA

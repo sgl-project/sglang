@@ -58,17 +58,38 @@ from sglang.srt.runtime_context import (
     get_spec,
     max_speculative_num_draft_tokens,
 )
-from sglang.srt.utils.common import (
-    ceil_align,
-    ceil_div,
-    is_float4_e2m1fn_x2,
-    is_hip,
-    is_npu,
-    spec_decode_alloc_len_per_request,
-)
+from sglang.srt.utils.common import ceil_align, ceil_div
+from sglang.srt.utils.device import is_float4_e2m1fn_x2, is_hip, is_npu
 
 _is_hip = is_hip()
 _is_npu = is_npu()
+
+
+def spec_decode_alloc_len_per_request(
+    *,
+    page_size,
+    speculative_num_steps,
+    speculative_eagle_topk,
+    speculative_num_draft_tokens,
+) -> int:
+    """Per-request KV tokens a (spec-v1) decode step allocates: the draft-decode
+    topk*num_steps peak vs. the verify num_draft_tokens, page-aligned. A pure
+    function of the resolved values its one caller reads off the bags.
+    """
+    len_per_topk = speculative_num_steps or 1
+    spec_topk = speculative_eagle_topk or 1
+    spec_tokens = speculative_num_draft_tokens or 1
+
+    if page_size > 1 and spec_topk > 1:
+        # last partial page and ceil alignment
+        len_per_topk = ceil_align(len_per_topk + page_size, page_size)
+        spec_tokens = ceil_align(spec_tokens, page_size)
+    elif page_size > 1:
+        # only page alignment
+        len_per_topk = ceil_align(len_per_topk, page_size)
+        spec_tokens = ceil_align(spec_tokens, page_size)
+
+    return max(len_per_topk * spec_topk, spec_tokens)
 
 
 @dataclass
@@ -92,6 +113,10 @@ class MemoryPoolConfig:
     # Unified pool only: the profiled byte budget the buffer is sized from,
     # instead of re-summing token counts; None when a user token cap is the budget.
     unified_total_bytes: Optional[int] = None
+
+    # Live owner-token ceiling (user or PP), distinct from the arena's share.
+    # None allows token KV to borrow unused state/window capacity.
+    unified_full_cap_tokens: Optional[int] = None
 
     def __post_init__(self):
         if self.max_total_num_tokens <= 0:
@@ -1275,6 +1300,41 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 + (slots * draft_ring_size + self.page_size)
                 * draft_ring_layers
                 * self.kv_bytes
+            )
+            # Keep the separate metadata/scratch reserve, but bound the budget
+            # below by the exact packed pages, tags and capture workspace.
+            from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+                select_dsv4_kv_layout,
+            )
+            from sglang.srt.mem_cache.dsv41_request_window import (
+                RequestWindowSpec,
+                request_window_workspace_rows,
+            )
+
+            request_slots = self._get_num_req_slots(
+                self.requested_max_running_requests_per_worker
+            )
+            window_layout, _ = select_dsv4_kv_layout()
+            window_spec = RequestWindowSpec.create(
+                num_slots=request_slots,
+                layers=layers,
+                page_size=self.page_size,
+                capacity=self.sliding_window_size
+                + self.online_c128_mtp_max_draft_tokens,
+                workspace_rows=request_window_workspace_rows(
+                    request_slots,
+                    self.sliding_window_size,
+                    self.online_c128_mtp_max_draft_tokens,
+                ),
+                kv_layout=window_layout,
+            )
+            draft_ring_bytes = (
+                (request_slots * draft_ring_size + self.page_size)
+                * draft_ring_layers
+                * self.kv_bytes
+            )
+            self.request_window_bytes = max(
+                self.request_window_bytes, window_spec.nbytes + draft_ring_bytes
             )
             if not self.paged_draft_layers:
                 self.swa_ratio = 0
