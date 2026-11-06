@@ -99,6 +99,97 @@ import { KimiK26Deployment } from '/src/snippets/autoregressive/kimi-k26-deploym
 - **Tool Call Parser**: Add `--tool-call-parser kimi_k2` for structured tool calls.
 - **AMD FP8 KV Cache**: On AMD platforms the generator adds `--kv-cache-dtype fp8_e4m3` by default and sets `--mem-fraction-static 0.8` to fit the INT4 weights plus KV cache. FP8 KV cache trades a small amount of accuracy for memory; omit the flag if you observe accuracy regressions on your workload.
 
+### 3.3 Ascend NPU Deployment
+
+Kimi-K2.6 can also be deployed on the **Ascend A3 Series** (e.g., Atlas 800I A3) with the W4A8 INT8 quantized checkpoint and an EAGLE3 draft model for speculative decoding. Select **A3** as the hardware platform in the generator above, then pick a **Deployment Shape** to get the full command set:
+
+- **1×A3, PD co-located** — a single 8-card node serving prefill and decode together, tuned for low latency (reference TPOT ≈ 20 ms on 3.5k+1.5k).
+- **2×A3, PD disaggregated** — one prefill node plus one decode node behind the SGLang router, tuned for long-context throughput (reference TPOT ≈ 100 ms on 64k+1.5k).
+
+<Note>
+On the A3 Series each card has 2 dies and SGLang counts devices per die, so an 8-card node uses `--tp-size 16` (see [Ascend NPU Reference](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware)). For driver/CANN setup, the container image, and model weight download, follow the [Kimi-K2.6 Ascend Tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/kimi_k2_6). The full tuning matrix (including 2-node PD-mixed and prefix-cache variants) lives in [Kimi-K2.6 Ascend Best Practices](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/kimi_k2_6).
+</Note>
+
+<Note>
+For the 2×A3 shape, cross-node KV transfer uses the `ascend` transfer backend (`memfabric`). Install `memfabric_hybrid` on both nodes (already in the reference container image), set `ASCEND_MF_STORE_URL` to the prefill node, and source the CANN environment in every shell that starts a server or the router. In minimal containers that mount only `driver/include` and `driver/lib64`, also make sure `/usr/local/Ascend/driver/version.info` is present — see the [Ascend NPU installation guide](/docs/hardware-platforms/ascend-npus/getting-started/installation) for driver and container setup.
+</Note>
+
+Startup takes several minutes (126 weight shards plus CUDA-graph capture); the server is ready when the log prints `The server is fired up and ready to roll!`. Verify with a chat request — the co-located server listens on port `30000`; for the PD shape send requests to the router on port `6688`:
+
+```bash Command
+curl http://127.0.0.1:30000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"model\": \"$MODEL_PATH\",
+    \"messages\": [{\"role\": \"user\", \"content\": \"What is 17 + 25?\"}],
+    \"max_tokens\": 256
+  }"
+```
+
+Benchmark the co-located shape (random dataset, 3.5k input / 1.5k output, concurrency 64):
+
+```bash Command
+python -m sglang.bench_serving \
+    --dataset-name random \
+    --backend sglang \
+    --host 127.0.0.1 \
+    --port 30000 \
+    --max-concurrency 64 \
+    --num-prompts 256 \
+    --random-input-len 3500 \
+    --random-output-len 1500 \
+    --random-range-ratio 1 \
+    --warmup-requests 0 \
+    --seed 1
+```
+
+Measured on one Atlas 800I A3 server (16 dies, W4A8 + EAGLE3, `--mem-fraction-static 0.85`):
+
+| Metric | Result |
+| --- | --- |
+| Accuracy (EvalScope, GSM8K, limit 100) | 98% |
+| Median time per output token | 21.5 ms (reference 20 ms) |
+| Mean time per output token | 26.55 ms |
+| Output throughput | 1491 tok/s (peak 2745 tok/s) |
+| EAGLE3 acceptance length | 4.25 |
+
+<Warning>
+**Device OOM under burst load on custom builds.** The co-located command is tuned for the reference container image, in which `--mem-fraction-static 0.865` leaves only ~2.7 GB free per die after startup. On self-built environments whose kernels reserve more workspace, a 64-way concurrent burst can exhaust that headroom and crash a scheduler (allocation failure inside `deep_ep` dispatch / `AtbRingMLA`). If this happens, lower `--mem-fraction-static` (e.g. `0.85`; the minimum viable value for this model is ~0.828) and re-run.
+</Warning>
+
+Benchmark the PD shape against the router (random dataset, 64k input / 1.5k output, long-context throughput):
+
+```bash Command
+python -m sglang.bench_serving \
+    --dataset-name random \
+    --backend sglang \
+    --host 127.0.0.1 \
+    --port 6688 \
+    --max-concurrency 1 \
+    --num-prompts 1 \
+    --request-rate inf \
+    --random-input-len 64000 \
+    --random-output-len 1500 \
+    --random-range-ratio 1 \
+    --seed 1
+```
+
+Measured on two Atlas 800I A3 nodes (1P1D, W4A8 + EAGLE3, single request):
+
+| Metric | Result |
+| --- | --- |
+| Accuracy (EvalScope, GSM8K, limit 100) | 99% |
+| Time per output token | 35.77 ms (reference 100 ms) |
+| Mean time to first token | 8318 ms (64k prefill) |
+
+<Info>
+In offline environments, pass `--tokenizer <local model path>` and `--dataset-path <local ShareGPT json>` to `bench_serving` so it does not try to download them; note that some SGLang versions no longer accept the legacy `--max-attempts` flag. End-to-end accuracy can be verified against the running server with EvalScope (e.g. `--datasets gsm8k`) — see [Accuracy Evaluation](/docs/hardware-platforms/ascend-npus/evaluation/accuracy_evaluation).
+</Info>
+
+<Info>
+A single-script variant of the PD shape that starts both roles and auto-detects the local node's role from its IP address is available in [Best Practices](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/kimi_k2_6#kimi-k2-6-w4a8-1p1d-16p-in64k-out1k5-100ms), which also covers the 128k-context and 90%-prefix-cache variants.
+</Info>
+
 ## 4. Model Invocation
 
 ### 4.1 Basic Usage
