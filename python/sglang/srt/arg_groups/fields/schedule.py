@@ -12,8 +12,8 @@ import msgspec
 from sglang.srt.arg_groups.arg_utils import (
     A,
     Arg,
-    human_readable_int,
 )
+from sglang.srt.utils.common import human_readable_int
 
 
 class Schedule(msgspec.Struct):
