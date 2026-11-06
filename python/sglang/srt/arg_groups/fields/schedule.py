@@ -97,9 +97,49 @@ class Schedule(msgspec.Struct):
                 "routing-key",
                 "hrrn",
                 "shortest-prefill-first",
+                "uniboost",
             ],
         ),
     ] = "fcfs"
+    uniboost_gamma: A[
+        Optional[float],
+        Arg(
+            help=(
+                "Gamma of the uniboost schedule policy (UniBoost, ICML 2026). Larger "
+                "gamma orders more like FCFS (stronger anti-starvation), smaller "
+                "gamma more like shortest-uncached-work first. Units follow "
+                "--uniboost-clock: per token under 'tokens' (default 1e-4), 1/s under "
+                "'wall' (default 0.1). With --uniboost-adaptive-gamma this is the "
+                "starting value."
+            ),
+        ),
+    ] = None
+    uniboost_bin_size: A[
+        int,
+        "Bin size k of the uniboost geometric work quantization. The largest boost any request can get is b_gamma(k), which bounds how far a newcomer may overtake a waiting request. A power of two is recommended.",
+    ] = 256
+    uniboost_clock: A[
+        str,
+        Arg(
+            help=(
+                "Clock of the uniboost arrival and work axes. 'tokens' counts "
+                "prefill tokens processed by the scheduler (the paper's clock). "
+                "'wall' stamps arrival in wall seconds and converts uncached work "
+                "to seconds of service at the measured prefill token rate, so "
+                "--uniboost-gamma is in 1/s and its meaning does not drift with "
+                "the cache hit rate."
+            ),
+            choices=["tokens", "wall"],
+        ),
+    ] = "tokens"
+    uniboost_adaptive_gamma: A[
+        bool,
+        "Adapt the uniboost gamma online from the response-time tail of completed requests (gamma-Ada, UniBoost Eq. 9): ln(5) / (t99 - t95) over the last 128 requests, EMA-smoothed, floored by --uniboost-adaptive-max-jump-s. Requires --uniboost-clock wall.",
+    ] = False
+    uniboost_adaptive_max_jump_s: A[
+        float,
+        "Max-jump bound of adaptive uniboost gamma, in wall seconds: gamma is floored so that the largest boost any request can get, b_gamma(bin_size / prefill token rate), stays within this, which bounds how long a newcomer can delay a waiting request.",
+    ] = 60.0
     enable_priority_scheduling: A[
         bool,
         "Enable priority scheduling. Requests with higher priority integer values will be scheduled first by default.",

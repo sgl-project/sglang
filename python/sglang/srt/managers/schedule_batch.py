@@ -862,6 +862,15 @@ class Req(ReqDllmMixin):
         # Snapshot of the scheduler prefill-token counter taken at waiting_queue entry; used by HRRN aging.
         self.arrival_processed_tokens: int = 0
 
+        # UniBoost arrival A(r) on its token / wall clock, stamped once when
+        # first sorted; reset_for_retract keeps them (seniority survives).
+        self.uniboost_arrival_tokens: Optional[int] = None
+        self.uniboost_arrival_s: Optional[float] = None
+        # UniBoost commit gate: held out of the current admission pass, and
+        # when its first hold began (bounds the cumulative hold).
+        self.uniboost_commit_hold = False
+        self.uniboost_commit_hold_first_s: Optional[float] = None
+
     def get_mm_token_counts(self) -> Tuple[int, int, int]:
         """Return per-modality prompt counts, scanning media at most once."""
         if not self.mm_token_counts_ready and self.multimodal_inputs is not None:

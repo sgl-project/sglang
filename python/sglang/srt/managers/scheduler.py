@@ -1512,6 +1512,11 @@ class Scheduler(
             self.enable_hierarchical_cache,
             self.enable_priority_scheduling,
             self.schedule_low_priority_values_first,
+            uniboost_gamma=get_schedule().uniboost_gamma,
+            uniboost_bin_size=get_schedule().uniboost_bin_size,
+            uniboost_clock=get_schedule().uniboost_clock,
+            uniboost_adaptive_gamma=get_schedule().uniboost_adaptive_gamma,
+            uniboost_adaptive_max_jump_s=get_schedule().uniboost_adaptive_max_jump_s,
         )
         self.prefill_delayer: Optional[PrefillDelayer] = None
         self.prefill_bs_tracker = RecentPrefillBatchSizeTracker(
@@ -4344,6 +4349,7 @@ class Scheduler(
                     if self.disagg_prefill_bootstrap_queue is not None
                     else []
                 ),
+                chunked_req=self.chunked_req,
             )
         )
 
@@ -4435,6 +4441,9 @@ class Scheduler(
             if adder.budget_state() == AddReqResult.OTHER:
                 break
             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
+                continue
+            # Set by the uniboost commit gate for this pass only.
+            if req.uniboost_commit_hold:
                 continue
 
             # A forward batch runs one pooling mode, so setwise readout requests
@@ -5418,6 +5427,7 @@ class Scheduler(
         elif batch.forward_mode.is_idle():
             self.batch_result_processor.process_batch_result_idle(batch, result)
         self._on_step_processed(batch)
+        self.policy.record_completed_requests(batch.reqs)
 
         # Submit this batch's queued host backups before the next scheduler step.
         self.tree_cache.flush_pending_backups()
