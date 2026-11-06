@@ -582,6 +582,9 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.chunked_reqs = IndexedReqList(ListKind.CHUNKED)
         scheduler.waiting_queue = IndexedReqList(ListKind.WAITING)
         scheduler.disagg_prefill_transfer_queue = []
+        scheduler.disagg_decode_transfer_queue = SimpleNamespace(
+            queue=[], staging_handler=None
+        )
         scheduler.enable_staging = False
         scheduler.request_receiver = SimpleNamespace(
             recv_requests=Mock(side_effect=[[]] * len(schedule) + [StopIteration])
@@ -593,7 +596,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.disagg_decode_prealloc_queue = SimpleNamespace(
             prefetch_prefill_dp_rank_queries=Mock(), queue=[]
         )
-        scheduler.process_decode_queue = Mock()
+        scheduler.process_decode_queue = Mock(return_value=False)
         scheduler.ngram_embedding_manager = SimpleNamespace(
             prepare_for_forward=lambda batch, chunked_req: batch
         )
@@ -642,7 +645,39 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
             maybe_prepare_mlp_sync_batch=lambda batch: batch
         )
         scheduler.disagg_prefill_transfer_queue = []
-        scheduler.disagg_decode_transfer_queue = SimpleNamespace(queue=[])
+        scheduler.disagg_decode_transfer_queue = SimpleNamespace(
+            queue=[], staging_handler=None
+        )
+
+
+class TestPrefillOverlapShutdownVote(CustomTestCase):
+    """On shutdown the overlap prefill loop launches nothing new, yet still runs
+    the one batch selection whose MLP-sync gather carries a group-local
+    ShutdownReq to the other attention-DP ranks."""
+
+    def setUp(self):
+        super().setUp()
+        enter_scope(self, published_topology(role="scheduler"))
+
+    def _selections_after_shutdown(self, vote_pending: bool) -> int:
+        scheduler = TestSchedulerIdleStepCounters.make_scheduler(self, [None])
+
+        def honor_shutdown(**kwargs):
+            scheduler.gracefully_exit = True
+            return True
+
+        scheduler.ingest_requests = Mock(side_effect=honor_shutdown)
+        scheduler.dp_attn_adapter = SimpleNamespace(
+            shutdown_vote_pending=lambda: vote_pending
+        )
+        Scheduler.event_loop_overlap_disagg_prefill(scheduler)
+        return scheduler.get_next_disagg_prefill_batch_to_run.call_count
+
+    def test_unsent_vote_still_reaches_the_gather(self):
+        self.assertEqual(self._selections_after_shutdown(vote_pending=True), 1)
+
+    def test_no_new_selection_without_a_vote_to_send(self):
+        self.assertEqual(self._selections_after_shutdown(vote_pending=False), 0)
 
 
 if __name__ == "__main__":

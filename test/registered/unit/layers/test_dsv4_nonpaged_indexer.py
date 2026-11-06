@@ -53,7 +53,6 @@ class TestDSV4PagedIndexerMetadata(CustomTestCase):
         with (
             patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
             envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(True),
-            envs.SGLANG_OPT_USE_AITER_INDEXER.override(False),
             envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.override(True),
             envs.SGLANG_OPT_USE_TOPK_V2.override(False),
             patch(
@@ -80,7 +79,6 @@ class TestDSV4PagedIndexerMetadata(CustomTestCase):
     def test_torch_fallback_skips_deep_gemm_and_ineligible_topk_plan(self):
         with (
             envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(True),
-            envs.SGLANG_OPT_USE_AITER_INDEXER.override(False),
             envs.SGLANG_OPT_USE_TOPK_V2.override(True),
             patch("sglang.kernels.ops.attention.dsv4.plan_topk_v2") as plan_topk_v2,
         ):
@@ -272,7 +270,6 @@ class TestDSV4TopKDispatch(CustomTestCase):
         indexer_capturer = MagicMock()
         with (
             envs.SGLANG_OPT_USE_TILELANG_INDEXER.override(False),
-            envs.SGLANG_OPT_USE_AITER_INDEXER.override(False),
             envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(True),
             envs.SGLANG_OPT_USE_TOPK_V2.override(True),
             patch(
@@ -320,7 +317,6 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
                 overrides.get("enabled", True)
             ),
             envs.SGLANG_OPT_USE_TILELANG_INDEXER.override(False),
-            envs.SGLANG_OPT_USE_AITER_INDEXER.override(False),
             envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(False),
             patch(f"{_INDEXER}.is_cuda", return_value=True),
             patch(f"{_INDEXER}.is_hip", return_value=False),
@@ -775,7 +771,7 @@ class TestPagedIndexerMetadataChunking(CustomTestCase):
                     self.assertEqual(result, 4096)
                     budget.assert_called_once_with(device_index=0, allow_sync=True)
 
-    def _build(self, *, num_rows: int, budget, use_topk_v2: bool):
+    def _build(self, *, num_rows: int, budget, use_topk_v2: bool, **kwargs):
         deep_gemm = SimpleNamespace(
             get_num_sms=MagicMock(return_value=1),
             get_paged_mqa_logits_metadata=MagicMock(
@@ -809,6 +805,7 @@ class TestPagedIndexerMetadataChunking(CustomTestCase):
                 page_table=page_table,
                 compressed_seq_lens=c4_seq_lens,
                 use_topk_v2=use_topk_v2,
+                **kwargs,
             )
         return metadata, deep_gemm, plan_topk_v2
 
@@ -856,6 +853,49 @@ class TestPagedIndexerMetadataChunking(CustomTestCase):
         self.assertEqual(
             [r.shape[0] for r in plan_rows[1:]], [c.stop - c.start for c in chunks]
         )
+
+    def test_varlen_schedules_take_per_row_lens_and_chunk_indices(self):
+        num_rows, group = 4096, 2
+        metadata, deep_gemm, _ = self._build(
+            num_rows=num_rows,
+            budget=512 << 20,
+            use_topk_v2=False,
+            rows_per_request=group,
+            deep_gemm_varlen=True,
+        )
+        chunks = [rows for rows, _ in metadata.row_chunks()]
+        self.assertGreater(len(chunks), 1)
+        self.assertEqual(metadata.deep_gemm_indices.shape[0], metadata.rows_per_chunk)
+        calls = deep_gemm.get_paged_mqa_logits_metadata.call_args_list
+        for rows, call in zip(chunks, calls):
+            lens, _block_kv, _num_sms, indices = call.args
+            n = rows.stop - rows.start
+            torch.testing.assert_close(
+                lens, metadata.compressed_seq_lens[rows].view(-1, 1).int()
+            )
+            torch.testing.assert_close(
+                indices, torch.arange(n, dtype=torch.int32) // group
+            )
+            torch.testing.assert_close(metadata.deep_gemm_indices[:n], indices)
+
+    def test_varlen_row_bounds(self):
+        for num_rows, group, varlen in (
+            (64, 4, False),
+            (29032, 8, True),
+            (29040, 8, False),
+        ):
+            metadata, deep_gemm, _ = self._build(
+                num_rows=num_rows,
+                budget=None,
+                use_topk_v2=False,
+                rows_per_request=group,
+                deep_gemm_varlen=True,
+            )
+            self.assertEqual(metadata.deep_gemm_indices is not None, varlen)
+            self.assertEqual(
+                len(deep_gemm.get_paged_mqa_logits_metadata.call_args.args),
+                4 if varlen else 3,
+            )
 
     def test_no_budget_keeps_the_single_call_shape(self):
         metadata, deep_gemm, plan_topk_v2 = self._build(
@@ -986,6 +1026,7 @@ class TestChunkedPagedDecode(CustomTestCase):
             use_topk_v2=True,
             rows_per_request=1,
             row_chunks=lambda: list(zip(self.chunks, self.plans)),
+            deep_gemm_indices=None,
         )
         inputs = DecodeInputs(
             indexer=None,
@@ -1011,7 +1052,7 @@ class TestChunkedPagedDecode(CustomTestCase):
     def _mocks(self):
         width = self.width
         deep_gemm = MagicMock(
-            side_effect=lambda q, *_args: torch.zeros(
+            side_effect=lambda q, *_args, **_kwargs: torch.zeros(
                 (q[0].shape[0], width), dtype=torch.float32
             )
         )
@@ -1099,7 +1140,7 @@ class TestChunkedPagedDecode(CustomTestCase):
 class TestGroupedVerifyRows(CustomTestCase):
     """Static verify rows reach the paged logits kernel as one request per block."""
 
-    def _args(self, rows_per_request, rows=slice(None)):
+    def _args(self, rows_per_request, rows=slice(None), indices=None):
         from sglang.srt.layers.attention.dsv4.v41_indexer.scoring import (
             DeepGEMMDecodeData,
         )
@@ -1112,6 +1153,7 @@ class TestGroupedVerifyRows(CustomTestCase):
             compressed_seq_lens=lens,
             page_table=table.repeat_interleave(block, dim=0),
             rows_per_request=rows_per_request,
+            deep_gemm_indices=indices,
         )
         data = DeepGEMMDecodeData(
             q_fp4=torch.arange(num_rows * heads * 64, dtype=torch.int8).view(
@@ -1126,14 +1168,17 @@ class TestGroupedVerifyRows(CustomTestCase):
         return data, metadata, table, data.paged_logits_args(metadata, rows)
 
     def test_one_row_per_request_keeps_the_per_row_layout(self):
-        data, metadata, _table, ((q, sf), lens, table) = self._args(1)
+        data, metadata, _table, ((q, sf), lens, table, indices) = self._args(1)
+        self.assertIsNone(indices)
         self.assertTrue(torch.equal(q, data.q_fp4))
         self.assertTrue(torch.equal(sf, data.q_sf))
         self.assertTrue(torch.equal(lens, metadata.compressed_seq_lens))
         self.assertTrue(torch.equal(table, metadata.page_table))
 
     def test_block_rows_become_one_request(self):
-        data, metadata, per_request_table, ((q, sf), lens, table) = self._args(6)
+        data, metadata, per_request_table, ((q, sf), lens, table, indices) = self._args(
+            6
+        )
         self.assertEqual(tuple(q.shape), (3, 6, 2, 64))
         self.assertEqual(tuple(sf.shape), (3, 6, 2))
         self.assertTrue(torch.equal(q.reshape(-1, 1, 2, 64), data.q_fp4))
@@ -1142,8 +1187,19 @@ class TestGroupedVerifyRows(CustomTestCase):
         self.assertTrue(torch.equal(table, per_request_table))
         self.assertEqual(table.stride(1), 1)
 
+    def test_varlen_indices_keep_the_per_row_layout(self):
+        request_ids = torch.arange(12, dtype=torch.int32) // 6
+        data, metadata, _table, ((q, sf), lens, table, indices) = self._args(
+            6, slice(6, 18), request_ids
+        )
+        self.assertTrue(torch.equal(indices, request_ids))
+        self.assertTrue(torch.equal(q, data.q_fp4[6:18]))
+        self.assertTrue(torch.equal(sf, data.q_sf[6:18]))
+        self.assertTrue(torch.equal(lens, metadata.compressed_seq_lens[6:18]))
+        self.assertTrue(torch.equal(table, metadata.page_table[6:18]))
+
     def test_row_chunk_groups_its_own_rows(self):
-        data, metadata, per_request_table, ((q, sf), lens, table) = self._args(
+        data, metadata, per_request_table, ((q, sf), lens, table, indices) = self._args(
             6, slice(6, 18)
         )
         self.assertEqual(tuple(q.shape), (2, 6, 2, 64))
@@ -1162,7 +1218,7 @@ class TestCandidateIndexerGating(CustomTestCase):
         )
 
         def sm100(value):
-            return patch.object(v41_indexer, "is_sm100_or_newer", lambda: value)
+            return patch.object(v41_indexer, "is_sm100", lambda: value)
 
         def make(topk_blocks, block_size):
             # The prefill choice reads the real DeepGEMM build and is cached.

@@ -1,10 +1,11 @@
 //! The generator: every checked-in binding of `proto/sglang/`, from one protoc.
 //!
 //! Targets (see [`TARGETS`]):
-//! Both targets land in `rust/sglang-api-types/src/generated/`:
-//! - `sglang.api.v1`: prost structs, tonic services, schema-driven serde, plus
-//!   `python/sglang/api/v1/types.py`.
-//! - `sglang.runtime.v1`: prost structs and tonic services only.
+//! - `sglang.api.v1`: prost structs, tonic services, schema-driven serde in
+//!   `rust/sglang-api-types/src/generated/`, plus
+//!   `python/sglang/api/v1/api_types.py`.
+//! - `sglang.runtime.v1` (deprecated): prost structs and tonic services only, in
+//!   `rust/sglang-runtime-v1-types/src/generated/`.
 //!
 //! Pass 1 (prost-build + tonic-prost-build) emits the prost structs and tonic
 //! service code, plus a `FileDescriptorSet`. For targets with a JSON contract
@@ -62,7 +63,7 @@ const TARGETS: &[Target] = &[
     Target {
         root: "sglang/runtime/v1/sglang.proto",
         package: "sglang.runtime.v1",
-        rust_out: "rust/sglang-api-types/src/generated",
+        rust_out: "rust/sglang-runtime-v1-types/src/generated",
         python_out: None,
         boxed: &[],
         default_stubs: true,

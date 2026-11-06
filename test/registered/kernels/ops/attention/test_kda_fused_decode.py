@@ -27,7 +27,7 @@ from sglang.srt.models import glm5_next
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=8, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=8, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 _HEAD_DIM = 128
 _CONV_STATE_W = 3
