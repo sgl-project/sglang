@@ -16,7 +16,9 @@ from sglang.srt.layers.moe.topk import (
 from sglang.srt.layers.moe.utils import (
     get_moe_a2a_backend,
 )
-from sglang.srt.utils import is_cuda_alike
+from sglang.srt.utils import is_cuda_alike, is_hip
+
+_is_hip = is_hip()
 
 
 def vision_topk(
@@ -170,6 +172,12 @@ def _finish_vision_topk(
     if num_token_non_padded is not None and (
         not padded_rows_masked or (use_mega_moe and config.num_shared_topk_slots)
     ):
-        _mask_topk_ids_padded_region(indices, num_token_non_padded)
+        # Keep _post_process_topk_ids' padded id: 0 on ROCm, where the AITER MoE
+        # kernels cannot index with -1. Mega MoE kernels skip -1.
+        _mask_topk_ids_padded_region(
+            indices,
+            num_token_non_padded,
+            fill_value=0 if _is_hip and not use_mega_moe else -1,
+        )
         _zero_topk_weights_padded_region(weights, num_token_non_padded)
     return weights, indices
