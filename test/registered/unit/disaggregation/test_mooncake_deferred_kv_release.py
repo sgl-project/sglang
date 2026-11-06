@@ -7,6 +7,7 @@ Only the transfer worker can send that ACK after its write has drained.
 import threading
 import unittest
 from collections import defaultdict
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -15,6 +16,7 @@ from test_deferred_decode_kv_release import (
     DeferredAbortNotificationScenarios,
     TaggedAbortNotificationScenarios,
     WorkerFailureAbortScenarios,
+    _TestSender,
 )
 
 from sglang.srt.disaggregation.base.conn import KVPoll
@@ -233,6 +235,122 @@ class TestMooncakeAbortNotification(
 
                 manager.send_aux.assert_called_once()
                 self.assertEqual(manager._sent, [])
+
+
+class TestEarlyTransferInfoAcrossRoomClear(CustomTestCase):
+    """Verify early-arriving TransferInfo for a reused room survives the prior sender's clear()."""
+
+    ROOM = 4242
+
+    def _make_mgr(self):
+        mgr = MooncakeKVManager.__new__(MooncakeKVManager)
+        mgr.request_status = {}
+        mgr.transfer_infos = {}
+        mgr.req_to_decode_prefix_len = {}
+        mgr.prefill_response_tracker = {}
+        mgr._deferred_ack_targets = {}
+        mgr._deferred_ack_poisoned_rooms = set()
+        mgr._staging_outstanding = {}
+        mgr.resolve_kv_replica_factor = MagicMock()
+        return mgr
+
+    def _make_sender(self, mgr):
+        sender = _TestSender.__new__(_TestSender)
+        sender.kv_mgr = mgr
+        sender.bootstrap_room = self.ROOM
+        sender.conclude_state = None
+        return sender
+
+    def _deliver_transfer_info(
+        self,
+        mgr,
+        session_id: str,
+        required_dst_info_num: int = 1,
+        prefix_len: int = 16,
+    ):
+        room = self.ROOM
+        info = SimpleNamespace(
+            room=room,
+            mooncake_session_id=session_id,
+            required_dst_info_num=required_dst_info_num,
+            decode_prefix_len=prefix_len,
+            is_dummy=False,
+        )
+        if mgr.request_status.get(room) == KVPoll.Success:
+            mgr.transfer_infos.setdefault(~room, {})[session_id] = info
+            return
+        if room not in mgr.transfer_infos:
+            mgr.transfer_infos[room] = {}
+        parked_infos = mgr.transfer_infos.pop(~room, None)
+        if parked_infos:
+            mgr.transfer_infos[room].update(parked_infos)
+        mgr.transfer_infos[room][session_id] = info
+        if len(mgr.transfer_infos[room]) == required_dst_info_num:
+            mgr.resolve_kv_replica_factor(mgr.transfer_infos[room])
+            mgr.req_to_decode_prefix_len[room] = next(
+                (
+                    i.decode_prefix_len
+                    for i in mgr.transfer_infos[room].values()
+                    if i.decode_prefix_len is not None
+                ),
+                0,
+            )
+            mgr.update_status(room, KVPoll.WaitingForInput)
+
+    def test_early_transfer_info_survives_prior_sender_clear(self):
+        """r2 TransferInfo arrives while r1 is KVPoll.Success, then r1.clear() runs before r2 opens."""
+        mgr = self._make_mgr()
+        r1_sender = self._make_sender(mgr)
+
+        # r1 completes KV transfer; status is Success before scheduler calls r1_sender.clear()
+        mgr.update_status(self.ROOM, KVPoll.Bootstrapping)
+        mgr.update_status(self.ROOM, KVPoll.Success)
+
+        # r2 reuses ROOM; its decode TransferInfo arrives before r1_sender.clear()
+        self._deliver_transfer_info(
+            mgr, "decode-sess-r2", required_dst_info_num=1, prefix_len=32
+        )
+        self.assertEqual(mgr.request_status[self.ROOM], KVPoll.Success)
+
+        # r1 scheduler cleanup runs
+        r1_sender.clear()
+        self.assertNotIn(self.ROOM, mgr.request_status)
+
+        # r2 creates its KVSender (which calls update_status(ROOM, KVPoll.Bootstrapping))
+        mgr.update_status(self.ROOM, KVPoll.Bootstrapping)
+
+        # r2's TransferInfo must be restored and room immediately promoted to WaitingForInput
+        self.assertEqual(mgr.request_status[self.ROOM], KVPoll.WaitingForInput)
+        self.assertIn("decode-sess-r2", mgr.transfer_infos.get(self.ROOM, {}))
+        self.assertEqual(mgr.req_to_decode_prefix_len.get(self.ROOM), 32)
+        self.assertNotIn(~self.ROOM, mgr.transfer_infos)
+
+    def test_multi_rank_split_arrival_across_clear(self):
+        """Rank 0 arrives while r1 is KVPoll.Success, r1.clear() runs, then Rank 1 arrives."""
+        mgr = self._make_mgr()
+        r1_sender = self._make_sender(mgr)
+
+        mgr.update_status(self.ROOM, KVPoll.Bootstrapping)
+        mgr.update_status(self.ROOM, KVPoll.Success)
+
+        # Rank 0 arrives before r1.clear()
+        self._deliver_transfer_info(
+            mgr, "decode-rank-0", required_dst_info_num=2, prefix_len=64
+        )
+        r1_sender.clear()
+
+        # Rank 1 arrives after r1.clear() before r2_sender opens, then r2_sender opens
+        self._deliver_transfer_info(
+            mgr, "decode-rank-1", required_dst_info_num=2, prefix_len=64
+        )
+        mgr.update_status(self.ROOM, KVPoll.Bootstrapping)
+
+        self.assertEqual(mgr.request_status[self.ROOM], KVPoll.WaitingForInput)
+        self.assertEqual(
+            set(mgr.transfer_infos[self.ROOM].keys()),
+            {"decode-rank-0", "decode-rank-1"},
+        )
+        self.assertEqual(mgr.req_to_decode_prefix_len[self.ROOM], 64)
 
 
 if __name__ == "__main__":
