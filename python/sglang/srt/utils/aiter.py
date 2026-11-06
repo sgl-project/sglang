@@ -17,7 +17,8 @@ import functools
 import logging
 import os
 
-from sglang.srt.utils.common import get_bool_env_var, is_hip
+from sglang.srt.utils.common import get_bool_env_var
+from sglang.srt.utils.device import is_hip
 
 logger = logging.getLogger(__name__)
 

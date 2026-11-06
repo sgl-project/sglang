@@ -35,23 +35,6 @@ def _hybrid_ctrl(page_size=2):
 
 
 class TestHybridCacheControllerRequestId(unittest.TestCase):
-    def test_thread_trace_info_registers_storage_config_ranks(self):
-        """Hybrid storage threads read rank placement from storage_config."""
-        ctrl = _hybrid_ctrl()
-        ctrl.storage_config = SimpleNamespace(tp_rank=2, dp_rank=1, pp_rank=3)
-        with mock.patch.object(hybrid_cc_module, "trace_set_thread_info") as set_info:
-            ctrl._register_thread_trace_info("Prefetch")
-
-        set_info.assert_called_once_with("Prefetch", 2, 1, 3)
-
-    def test_thread_trace_info_defaults_missing_config_ranks_to_none(self):
-        ctrl = _hybrid_ctrl()
-        ctrl.storage_config = SimpleNamespace()
-        with mock.patch.object(hybrid_cc_module, "trace_set_thread_info") as set_info:
-            ctrl._register_thread_trace_info("Backup")
-
-        set_info.assert_called_once_with("Backup", None, None, None)
-
     def test_storage_hit_query_no_pools_uses_batch_exists_with_request_id(self):
         ctrl = _hybrid_ctrl()
         ctrl.storage_backend.batch_exists.return_value = 2
@@ -261,6 +244,7 @@ class TestHybridCacheControllerRequestId(unittest.TestCase):
             host_indices=list(range(6)),
             completed_tokens=0,
             id=7,
+            request_id="r-1",
             trace_ctx=object(),
         )
         with mock.patch.object(

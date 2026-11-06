@@ -35,7 +35,7 @@ def get_dspark_sample_from_anchor(draft_hf_config: Any) -> bool:
 
 
 def _draft_hf_config() -> Optional[Any]:
-    from sglang.srt.utils.hf_transformers import get_config
+    from sglang.srt.hf_transformers import get_config
 
     draft_model_path = get_spec().speculative_draft_model_path
     if not draft_model_path:
@@ -179,7 +179,7 @@ def read_draft_checkpoint_config(*, server_args: ServerArgs) -> DSparkDraftConfi
     silently drops the checkpoint's gamma and the cross-check with
     `--speculative-num-draft-tokens` along with it.
     """
-    from sglang.srt.utils.hf_transformers import get_config
+    from sglang.srt.hf_transformers import get_config
 
     resolving = resolved_view(server_args)
     draft_hf_config = get_config(
