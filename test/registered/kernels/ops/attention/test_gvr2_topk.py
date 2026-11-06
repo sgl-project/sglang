@@ -10,11 +10,10 @@ replay with changed lengths and scores.
 from __future__ import annotations
 
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
-
-from types import SimpleNamespace
 
 from sglang.kernels.ops.attention.dsa.gvr2_topk import (
     gvr2_fused_page_table_available,
@@ -110,9 +109,7 @@ def test_gvr2_topk_paged_noncontiguous_page_table():
     seq_lens = [width, 20000, k, 7, width, 9000, 0, 30000]
     scores, lengths, page_table = _make_inputs(batch, width, seq_lens)
     # A column slice of a wider table runs the separate Triton lookup.
-    wide = torch.zeros(
-        batch, page_table.shape[1] + 8, dtype=torch.int32, device="cuda"
-    )
+    wide = torch.zeros(batch, page_table.shape[1] + 8, dtype=torch.int32, device="cuda")
     wide[:, : page_table.shape[1]] = page_table
     sliced = wide[:, : page_table.shape[1]]
     assert not sliced.is_contiguous()
@@ -132,9 +129,7 @@ def test_gvr2_topk_paged_fused_matches_lookup():
         batch, width, seq_lens, row_stride=width + 64
     )
     fused = gvr2_topk_transform_paged(scores, lengths, k, page_table, PAGE_SIZE)
-    wide = torch.zeros(
-        batch, page_table.shape[1] + 8, dtype=torch.int32, device="cuda"
-    )
+    wide = torch.zeros(batch, page_table.shape[1] + 8, dtype=torch.int32, device="cuda")
     wide[:, : page_table.shape[1]] = page_table
     lookup = gvr2_topk_transform_paged(
         scores, lengths, k, wide[:, : page_table.shape[1]], PAGE_SIZE

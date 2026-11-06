@@ -52,8 +52,7 @@ class _RowPitchView:
 
 
 def _restore_storage_extent(logits: torch.Tensor) -> torch.Tensor:
-    """Give multi-row DeepGEMM logits a storage that spans the padded last row.
-    """
+    """Give multi-row DeepGEMM logits a storage that spans the padded last row."""
     rows, width = logits.shape
     pitch = logits.stride(0)
     if (
