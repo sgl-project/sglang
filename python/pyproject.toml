@@ -123,6 +123,7 @@ diffusion = [
   "msgpack",
   "nvidia-modelopt",
   "opencv-python-headless==4.10.0.84",
+  "PyNvVideoCodec==2.2.3 ; sys_platform == 'linux'",
   "PyYAML==6.0.1",
   "remote-pdb==2.1.0",
   "runai_model_streamer>=0.15.7",
