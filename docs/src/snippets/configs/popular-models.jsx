@@ -13,6 +13,23 @@
 
 export const popularModels = [
   {
+    name: "ERNIE-5.5-Flash",
+    vendor: "ERNIE",
+    href: "/cookbook/autoregressive/Baidu/ERNIE-5.5-Flash",
+    logo: "/cards/logos/ernie.svg",
+    badge: "New",
+    tags: ["5 platforms", "HCA + MLA-DSA hybrid", "FP8 / BF16"],
+    hero: {
+      eyebrow: "Featured model \u00b7 New",
+      headline: "Meet ERNIE-5.5-Flash on SGLang",
+      blurb:
+        "280B/14B multi-router latent MoE combining HCA and MLA-DSA attention, with ECHO speculative decoding. Recipes cover B300, GB300, B200, GB200 and H100, with HiCache and PD disaggregation.",
+      tags: ["280B / 14B active", "HCA + MLA-DSA", "ECHO speculative decoding"],
+      cta: "Open the ERNIE-5.5-Flash cookbook",
+      caption: "ERNIE-5.5-Flash deployment guide",
+    },
+  },
+  {
     name: "Kimi-K3.1-Pro",
     vendor: "Moonshot AI",
     href: "/cookbook/autoregressive/Moonshotai/Kimi-K3.1-Pro",

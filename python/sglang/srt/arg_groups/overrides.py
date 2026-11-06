@@ -814,6 +814,7 @@ _DEEPSEEK_FAMILY_ARCHS = frozenset(
         "LongcatFlashForCausalLM",
         "LongcatFlashForCausalLMNextN",
         "Dots3NoteForCausalLM",
+        "Xing4_0ForCausalLM",
         "KimiK31ForConditionalGeneration",
     }
 )
@@ -1007,6 +1008,7 @@ _FLASHINFER_ALLREDUCE_FUSION_ARCHS = frozenset(
         "NemotronHForCausalLM",
         "NemotronHPuzzleForCausalLM",
         "NemotronH_Omni_Reasoning_V3",
+        "Xing4_0ForCausalLM",
     }
 )
 
@@ -1112,6 +1114,7 @@ def _deterministic_is_deepseek_model(view: Any) -> bool:
             "PixtralForConditionalGeneration",
             "GlmMoeDsaForCausalLM",
             "Glm4MoeLiteForCausalLM",
+            "Xing4_0ForCausalLM",
         ]
     except Exception:
         return False
@@ -1176,14 +1179,35 @@ def _deterministic_attention_backend(view: Any) -> dict:
                 "without speculative decoding)"
             )
 
+    prefill_choices = list(DETERMINISTIC_ATTENTION_BACKEND_CHOICES)
+    prefill_note = ""
+    if prefill_backend == "aiter":
+        # AITER batch prefill is batch-invariant when every call gets the same
+        # max_seqlen_q (the backend fixes it) and every split of a prompt, at a chunk
+        # end or a cached prefix, falls on its 128-row query tile (page size 128,
+        # _deterministic_aiter_prefill_page_size). Verified on gfx950.
+        # The fp8 KV-cache prefill kernel was not batch-invariant in the same tests.
+        if (
+            is_gfx95_supported()
+            and not use_mla_backend(view)
+            and view.speculative_algorithm is None
+            and view.kv_cache_dtype in ("auto", "bf16", "bfloat16")
+        ):
+            prefill_choices.append("aiter")
+        else:
+            prefill_note = (
+                " (aiter prefill is accepted only on gfx950, for non-MLA models, "
+                "without speculative decoding and with a bf16 KV cache)"
+            )
+
     # A per-phase backend overrides --attention-backend for its phase. Unset (None)
     # means the phase uses --attention-backend, which is checked below.
     for flag, backend, choices, note in (
         (
             "--prefill-attention-backend",
             prefill_backend,
-            DETERMINISTIC_ATTENTION_BACKEND_CHOICES,
-            "",
+            prefill_choices,
+            prefill_note,
         ),
         (
             "--decode-attention-backend",
@@ -1471,6 +1495,31 @@ def _intel_xpu_page_constraint(view: Any) -> dict:
                 f"{msg} only supports page_sizes of {supported_page_sizes}, changing page_size from {view.page_size} to 128."
             )
             return {"page_size": 128}
+    return {}
+
+
+@register_post_process
+def _deterministic_aiter_prefill_page_size(view: Any) -> dict:
+    # AITER batch prefill gives a row the same bits however its prompt is split only
+    # when the split falls on a multiple of its 128-row query tile. Page size 128 puts
+    # radix-cache prefixes and chunk ends there.
+    if not (
+        view.enable_deterministic_inference
+        and getattr(view, "prefill_attention_backend", None) == "aiter"
+    ):
+        return {}
+    chunk = view.chunked_prefill_size
+    if chunk is not None and chunk > 0 and chunk % 128 != 0:
+        raise ValueError(
+            "Deterministic inference with aiter prefill attention needs a "
+            f"--chunked-prefill-size that is a multiple of 128, got {chunk}."
+        )
+    if view.page_size is None or view.page_size % 128 != 0:
+        logger.warning(
+            "Deterministic inference with aiter prefill attention needs a page_size "
+            f"that is a multiple of 128, changing page_size from {view.page_size} to 128."
+        )
+        return {"page_size": 128}
     return {}
 
 
@@ -1796,7 +1845,7 @@ def _speculative_moe_runner_default(view: Any) -> dict:
 
 @register_post_process
 def _gguf_quantization(view: Any) -> dict:
-    from sglang.srt.utils.hf_transformers import check_gguf_file
+    from sglang.srt.hf_transformers import check_gguf_file
 
     if (view.load_format == "auto" or view.load_format == "gguf") and check_gguf_file(
         view.model_path
@@ -1942,9 +1991,9 @@ def post_capture_kv_sizing_planned(server_args: Any) -> bool:
         return False
     if cfg.device != "cuda":
         return False
-    if cfg.dcp_size != 1:
+    if cfg.dcp_size != 1 and not cfg.enable_unified_memory:
         return False
-    if mla_enabled:
+    if mla_enabled and not cfg.enable_unified_memory:
         return False
     if cfg.prefill_only_disable_kv_cache:
         return False
@@ -1960,19 +2009,7 @@ def post_capture_kv_sizing_planned(server_args: Any) -> bool:
     ):
         return False
 
-    # Only the hybrid-SWA byte pool has a matching post-capture resize path.
     model_config = model_config_of(server_args)
-    if cfg.enable_unified_memory:
-        from sglang.srt.mem_cache.kv.decl import declared_lifetime_types
-        from sglang.srt.mem_cache.kv.plan import resized_after_capture
-        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-
-        if not resized_after_capture(declared_lifetime_types(model_config)):
-            return False
-        # The solver budgets these independent draft pools again after capture.
-        spec = SpeculativeAlgorithm.from_string(cfg.speculative_algorithm)
-        if spec.is_eagle() or spec.is_standalone() or spec.is_dflash_family():
-            return False
 
     if (
         cfg.disaggregation_mode != "prefill"

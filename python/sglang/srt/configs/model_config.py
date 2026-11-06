@@ -35,17 +35,17 @@ from sglang.srt.configs.unlimited_ocr_v2 import (
     UocrDocumentConfig,
 )
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_platform
-from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import is_hip, retry
-from sglang.srt.utils.hf_transformers import (
+from sglang.srt.hf_transformers import (
     get_config,
     get_context_length,
     get_generation_config,
     get_hf_text_config,
     get_sparse_attention_config,
 )
-from sglang.srt.utils.hf_transformers.config import POINTER_ADAPTER_BASES
+from sglang.srt.hf_transformers.config import POINTER_ADAPTER_BASES
+from sglang.srt.runtime_context import get_platform
+from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils import is_hip, is_npu, retry
 from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 from sglang.utils import is_in_ci
 
@@ -206,6 +206,7 @@ def is_deepseek_dsa(config) -> bool:
             "Glm5NextForConditionalGeneration",
             "LongcatFlashForCausalLM",
             "LongcatFlashForCausalLMNextN",
+            "Xing4_0ForCausalLM",
             "Dots3NoteForCausalLM",
             "Dots3NoteForCausalLMNextN",
             "HYV4ForCausalLM",
@@ -222,6 +223,23 @@ def dsa_draft_shards_under_dcp(config, dcp_size: int) -> bool:
     with dcp_size 1.
     """
     return dcp_size > 1 and is_hip() and is_deepseek_dsa(config)
+
+
+def mla_attention_dcp_size(config, *, dcp_size: int, is_nextn: bool) -> int:
+    """The DCP width used by MLA execution, including platform draft policies.
+
+    KV planning must use this same width before the attention module is built.
+    """
+    # Ascend draft backends use allocator-global slots and non-DCP attention.
+    if is_nextn and is_npu():
+        return 1
+    if (
+        is_nextn
+        and is_deepseek_dsa(config)
+        and not dsa_draft_shards_under_dcp(config, dcp_size)
+    ):
+        return 1
+    return dcp_size
 
 
 def is_glm_moe_dsa(config) -> bool:
@@ -1106,6 +1124,12 @@ class ModelConfig:
         ]:
             self.hf_config.architectures[0] = "DeepseekV3ForCausalLMNextN"
 
+        # Xing4_0 bundles a DeepSeek-V3-compatible MTP head (layer index ==
+        # num_hidden_layers); reuse DeepseekV3ForCausalLMNextN as the draft arch.
+        if is_draft_model and self.hf_config.architectures[0] == "Xing4_0ForCausalLM":
+            self.hf_config.architectures[0] = "DeepseekV3ForCausalLMNextN"
+            self.hf_config.num_nextn_predict_layers = 1
+
         if is_draft_model and self.hf_config.architectures[0] == "GlmMoeDsaForCausalLM":
             self.hf_config.architectures[0] = "GlmMoeDsaForCausalLMNextN"
 
@@ -1492,6 +1516,7 @@ class ModelConfig:
             or "Eagle3DeepseekV2ForCausalLM" in self.hf_config.architectures
             or "GigaChat35ForCausalLM" in self.hf_config.architectures
             or "GigaChat35ForCausalLMNextN" in self.hf_config.architectures
+            or "Xing4_0ForCausalLM" in self.hf_config.architectures
         ):
             self.head_dim = 256
             self.attention_arch = AttentionArch.MLA
@@ -1685,6 +1710,16 @@ class ModelConfig:
             self.spec_hidden_size, self.hc_hidden_size = resolve_spec_hidden_size(
                 self.hf_config, self.hidden_size, hc_mult
             )
+            # Models that declare ``hc_contract_for_draft`` (e.g. Xing4_0)
+            # merge the mHC streams back to hidden_size before the Eagle draft
+            # (so spec_hidden_size stays contracted, as resolved above) but
+            # still carry an mHC-internal residual stream (n * hidden_size)
+            # used to size the main model's activation buffers. Restore that
+            # width here; resolve_spec_hidden_size only sizes it for DSV4.
+            if hc_mult > 1 and getattr(
+                self.hf_text_config, "hc_contract_for_draft", False
+            ):
+                self.hc_hidden_size = self.hidden_size * hc_mult
         self.num_hidden_layers = self.hf_text_config.num_hidden_layers
         self.num_attention_layers = self.num_hidden_layers
         if "LongcatFlashForCausalLM" in self.hf_config.architectures:
