@@ -11,6 +11,7 @@ from typing import (
     Dict,
     Iterable,
     List,
+    Mapping,
     Optional,
     Set,
     Tuple,
@@ -73,52 +74,30 @@ class CheckPhase(Enum):
 _STAGED_PHASES = (CheckPhase.BUSY, CheckPhase.IDLE)
 
 
+_ON_OFF = {True: InvariantCheckLevel.STRICT, False: InvariantCheckLevel.OFF}
+# The idle flag picks how a leak is reported, not whether the check runs.
+_STRICT_OR_WARN = {True: InvariantCheckLevel.STRICT, False: InvariantCheckLevel.WARN}
+
+
 @dataclass(frozen=True, slots=True)
 class StateCheck:
     # Identifies the check; the checker itself never reads it.
     name: str
     phase: CheckPhase
-    # Resolved on every run. OFF skips the check, STRICT raises on a failure,
-    # WARN logs a throttled warning and counts it.
-    level: Callable[[], InvariantCheckLevel]
+    # The check's one flag, read on every run.
+    flag: EnvField
     # Called with the resolved level (never OFF); a LAUNCH or RESULT check
     # also takes the step's batch: `fn(level, batch)`, else `fn(level)`.
     fn: Callable[..., None]
+    # The level for each flag value. OFF skips the check, STRICT raises on a
+    # failure, WARN logs a throttled warning and counts it.
+    levels: Mapping[bool, InvariantCheckLevel] = field(default_factory=lambda: _ON_OFF)
     # Skips the check when it returns True; evaluated once per run however
     # many checks carry it.
     skip: Optional[Callable[[], bool]] = None
 
-
-def _level_resolver(
-    flag: EnvField,
-    off: InvariantCheckLevel = InvariantCheckLevel.OFF,
-    deep: bool = False,
-) -> Callable[[], InvariantCheckLevel]:
-    """A check's level from its one flag: STRICT when the flag is on, else `off`.
-    An explicitly set SGLANG_INVARIANT_CHECK wins unless the flag is set too, or
-    the check is `deep`: a deep check costs every loop iteration, so a global
-    STRICT must not turn it on.
-
-    The SGLANG_ENABLE_ASYNC_ASSERT bridge to STRICT does not count as set."""
-
-    def resolve() -> InvariantCheckLevel:
-        if not deep and envs.SGLANG_INVARIANT_CHECK.is_set() and not flag.is_set():
-            return InvariantCheckLevel(envs.SGLANG_INVARIANT_CHECK.get())
-        return InvariantCheckLevel.STRICT if flag.get() else off
-
-    return resolve
-
-
-_running_reqs_level = _level_resolver(envs.SGLANG_ENABLE_RUNNING_REQS_CHECK)
-_busy_pools_level = _level_resolver(
-    envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, deep=True
-)
-_kv_pages_level = _level_resolver(envs.SGLANG_CHECK_KV_PAGE_INVARIANTS, deep=True)
-# An off idle flag downgrades a leak to a warning instead of skipping the check.
-_idle_leak_level = _level_resolver(
-    envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE, off=InvariantCheckLevel.WARN
-)
-_tree_cache_level = _level_resolver(envs.SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK)
+    def level(self) -> InvariantCheckLevel:
+        return self.levels[bool(self.flag.get())]
 
 
 @dataclass(kw_only=True, slots=True)
@@ -144,8 +123,6 @@ class SchedulerInvariantChecker:
     get_skip_idle_pool_checks: Callable[[], bool] = field(default=lambda: False)
     count_req_pool_leak_warnings: int = 0
     count_memory_leak_warnings: int = 0
-    # WARN-level failures of the request-list, batch, and tree checks.
-    count_state_check_warnings: int = 0
     recent_busy_msgs: Deque[str] = field(
         default_factory=lambda: deque(maxlen=BUSY_MEM_CHECK_LOG_RING_SIZE)
     )
@@ -160,54 +137,57 @@ class SchedulerInvariantChecker:
             StateCheck(
                 name="request_lists",
                 phase=CheckPhase.LAUNCH,
-                level=_running_reqs_level,
+                flag=envs.SGLANG_ENABLE_RUNNING_REQS_CHECK,
                 fn=self._check_request_lists,
             ),
             StateCheck(
                 name="batch_consistency",
                 phase=CheckPhase.RESULT,
-                level=_running_reqs_level,
+                flag=envs.SGLANG_ENABLE_RUNNING_REQS_CHECK,
                 fn=self._check_batch_consistency,
             ),
             StateCheck(
                 name="busy_pools",
                 phase=CheckPhase.BUSY,
-                level=_busy_pools_level,
+                flag=envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY,
                 fn=self._check_busy_pools,
                 skip=no_last_batch,
             ),
             StateCheck(
                 name="kv_pages",
                 phase=CheckPhase.BUSY,
-                level=_kv_pages_level,
+                flag=envs.SGLANG_CHECK_KV_PAGE_INVARIANTS,
                 fn=self._check_kv_page_invariants,
                 skip=no_last_batch,
             ),
             StateCheck(
                 name="idle_pools",
                 phase=CheckPhase.IDLE,
-                level=_idle_leak_level,
+                flag=envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE,
+                levels=_STRICT_OR_WARN,
                 fn=self._check_idle_pools,
                 skip=self.get_skip_idle_pool_checks,
             ),
             StateCheck(
                 name="req_pool",
                 phase=CheckPhase.IDLE,
-                level=_idle_leak_level,
+                flag=envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE,
+                levels=_STRICT_OR_WARN,
                 fn=self._check_req_pool,
                 skip=self.get_skip_idle_pool_checks,
             ),
             StateCheck(
                 name="pool_bytes",
                 phase=CheckPhase.IDLE,
-                level=_idle_leak_level,
+                flag=envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE,
+                levels=_STRICT_OR_WARN,
                 fn=self._check_pool_bytes,
                 skip=self.get_skip_idle_pool_checks,
             ),
             StateCheck(
                 name="tree_cache",
                 phase=CheckPhase.IDLE,
-                level=_tree_cache_level,
+                flag=envs.SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK,
                 fn=self._check_tree_cache,
             ),
         ):
@@ -665,7 +645,6 @@ class SchedulerInvariantChecker:
                 level,
                 RuntimeError,
                 f"{message}: {sorted(req.rid for req in reqs)}",
-                "count_state_check_warnings",
             )
 
     def _check_request_lists(
@@ -682,7 +661,6 @@ class SchedulerInvariantChecker:
                         level,
                         RuntimeError,
                         f"Request {req.rid} is in both {owners[req].name} and {kind.name}",
-                        "count_state_check_warnings",
                     )
                 owners[req] = kind
 
@@ -737,7 +715,6 @@ class SchedulerInvariantChecker:
                 RuntimeError,
                 f"Step processed with requests {[req.rid for req in batch.reqs]}, "
                 f"launched with {[req.rid for req in launched]}",
-                "count_state_check_warnings",
             )
         uncounted = [req.rid for req in batch.reqs if req.inflight_steps <= 0]
         if uncounted:
@@ -745,7 +722,6 @@ class SchedulerInvariantChecker:
                 level,
                 RuntimeError,
                 f"Requests processed by a step they were not launched in: {uncounted}",
-                "count_state_check_warnings",
             )
 
     def _check_tree_cache(self, level: InvariantCheckLevel) -> None:
@@ -758,18 +734,7 @@ class SchedulerInvariantChecker:
             )
         ):
             return
-        try:
-            self.tree_cache.sanity_check()
-        except AssertionError as e:
-            # The cache raises its own AssertionError; STRICT keeps it as is.
-            if level is InvariantCheckLevel.STRICT:
-                raise
-            self._fail(
-                level,
-                AssertionError,
-                f"Tree cache sanity check failed: {e}",
-                "count_state_check_warnings",
-            )
+        self.tree_cache.sanity_check()
 
 
 def create_scheduler_watchdog(

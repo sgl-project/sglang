@@ -153,8 +153,6 @@ class TestStateCheckLevels(CustomTestCase):
     def _levels(self, in_ci, **flags):
         with patch.dict(os.environ, {}, clear=False):
             for env in (
-                envs.SGLANG_INVARIANT_CHECK,
-                envs.SGLANG_ENABLE_ASYNC_ASSERT,
                 envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY,
                 envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE,
                 envs.SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK,
@@ -177,9 +175,9 @@ class TestStateCheckLevels(CustomTestCase):
             )
             return {c.name: c.level() for cs in checker.checks.values() for c in cs}
 
-    def test_legacy_flags_decide_the_level(self):
-        """With SGLANG_INVARIANT_CHECK unset, every registered check takes its
-        level from its one flag, in prod and in CI."""
+    def test_each_flag_decides_its_check_level(self):
+        """Every registered check takes its level from its one flag, in prod and
+        in CI; SGLANG_INVARIANT_CHECK does not apply."""
         prod = self._table(**self._idle(self.STRICT))
         ci = self._table(
             prod,
@@ -215,40 +213,6 @@ class TestStateCheckLevels(CustomTestCase):
         for in_ci, flags, expected in cases:
             with self.subTest(in_ci=in_ci, **flags):
                 self.assertEqual(self._levels(in_ci, **flags), expected)
-
-    def test_explicit_level_applies_unless_the_check_flag_is_set(self):
-        for level in (self.OFF, self.WARN, self.STRICT):
-            with self.subTest(level=level):
-                self.assertEqual(
-                    self._levels(False, SGLANG_INVARIANT_CHECK=int(level)),
-                    self._table(
-                        dict.fromkeys(self._table(), level),
-                        busy_pools=self.OFF,
-                        kv_pages=self.OFF,
-                    ),
-                )
-        # The deep checks, busy_pools and kv_pages, ignore the explicit level.
-        # An explicit check flag beats it, for its checks only; the BUSY and
-        # IDLE flags do not touch kv_pages.
-        self.assertEqual(
-            self._levels(
-                True,
-                SGLANG_INVARIANT_CHECK=int(self.OFF),
-                SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE=False,
-                SGLANG_ENABLE_RUNNING_REQS_CHECK=True,
-                SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY=0,
-            ),
-            self._table(
-                **self._idle(self.WARN),
-                request_lists=self.STRICT,
-                batch_consistency=self.STRICT,
-            ),
-        )
-        # The SGLANG_ENABLE_ASYNC_ASSERT bridge is not an explicit level.
-        self.assertEqual(
-            self._levels(False, SGLANG_ENABLE_ASYNC_ASSERT=True),
-            self._levels(False),
-        )
 
 
 class TestPrivateSwaTokens(CustomTestCase):

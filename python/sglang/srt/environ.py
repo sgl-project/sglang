@@ -235,8 +235,7 @@ class ToolStrictLevel(IntEnum):
 
 
 class InvariantCheckLevel(IntEnum):
-    """Signal level for value/index validity checks (see invariants.py) and
-    for the scheduler state checks (see scheduler_components/invariant_checker.py).
+    """Signal level for value/index validity checks (see invariants.py).
 
     OFF: data layer only (sanitize/containment); no detection, no signal.
     WARN: detect + throttled log/count; degrade, never crash (prod on-demand).
@@ -503,12 +502,10 @@ class Envs:
     SGLANG_DEBUG_REVERT_PR = EnvInt(0)
     SGLANG_PHASE_CHECKER_DEBUG = EnvBool(False)
     SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(True)
-    # Scheduler state checks: each check reads one flag, whose default is its
-    # prod/CI level; on is STRICT. When set explicitly, a flag wins over
-    # SGLANG_INVARIANT_CHECK for its check. BUSY (its value also sets the log
-    # verbosity) gates the busy pool check; IDLE gates the idle pool, req pool,
-    # and byte checks, and off means WARN, not skipped. The busy pool and KV
-    # page checks are deep: they run only by their own flags.
+    # Scheduler state checks: each check reads one flag; on is STRICT, off skips
+    # the check. BUSY (its value also sets the log verbosity) gates the busy pool
+    # check; IDLE gates the idle pool, req pool, and byte checks, and off means
+    # WARN, not skipped. SGLANG_INVARIANT_CHECK does not apply to them.
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY = EnvInt(0)
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE = EnvBool(True)
     # The explicit environment variable still takes precedence over this CI
@@ -533,12 +530,6 @@ class Envs:
     # adds throttled logging, STRICT (CI default) crashes on violations.
     # Supersedes SGLANG_ENABLE_ASYNC_ASSERT, which is bridged as STRICT until
     # every callsite migrates.
-    # When set explicitly, it is also the level of every cheap scheduler state
-    # check whose own flag (SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE,
-    # SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK, SGLANG_ENABLE_RUNNING_REQS_CHECK)
-    # is unset; the busy pool and KV page checks ignore it. Unset, or reached
-    # only through the SGLANG_ENABLE_ASYNC_ASSERT bridge, it leaves all checks
-    # on their own flags' defaults.
     SGLANG_INVARIANT_CHECK = EnvInt(InvariantCheckLevel.OFF)
 
     # ===================================================================
