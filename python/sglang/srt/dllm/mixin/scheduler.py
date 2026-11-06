@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from array import array
-from typing import TYPE_CHECKING, Callable, List, Optional, Set, Union
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Set, Union
 
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.req import DllmReqPhase
@@ -109,6 +109,10 @@ class SchedulerDllmMixin:
             "FDFO dLLM result is missing accept lengths."
         )
 
+        # Prompt-only blocks emit no tokens but still produce carried state.
+        if self.dllm_config.carries_block_state:
+            self._store_dllm_block_state(batch.reqs, result.dllm_algo_state)
+
         # FDFO also commits unresolved blocks so their KV can be reused.
         if fdfo_mode or result.next_token_ids:
             block_size = self.dllm_config.block_size
@@ -180,6 +184,14 @@ class SchedulerDllmMixin:
             can_run_cuda_graph=result.can_run_cuda_graph,
             dp_cooperation_info=batch.dp_cooperation_info,
         )
+
+    @staticmethod
+    def _store_dllm_block_state(reqs: List[Req], states: Optional[List[Any]]) -> None:
+        assert states is not None and len(states) == len(reqs), (
+            "A dLLM algorithm that carries block state must return one per request."
+        )
+        for req, state in zip(reqs, states):
+            req.dllm_algo_state = state
 
     def _finish_dllm_request_if_needed(self: Scheduler, req: Req) -> None:
         if (
