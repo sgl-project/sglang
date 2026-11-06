@@ -155,7 +155,7 @@ class Gemma4ArFusion:
         )
 
     @classmethod
-    def create(cls, hidden_size: int, eps: float) -> Optional["Gemma4ArFusion"]:
+    def create(cls, hidden_size: int, eps: float) -> Optional[Gemma4ArFusion]:
         state = _get_state()
         if state is None:
             return None
