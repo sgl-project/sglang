@@ -33,7 +33,6 @@ class DevicePoolEntry:
         page_size: int,
         rows_are_pages: bool,
         packed: bool = True,
-        pcp_replicated: bool = False,
         tp_replicated: bool = False,
         dcp_sharded: bool = False,
         index_mapper: Callable[[torch.Tensor], torch.Tensor] | None = None,
@@ -45,12 +44,10 @@ class DevicePoolEntry:
         self.layer_mapping = layer_mapping
         self.page_size = page_size
         self.packed = packed
-        # PCP can replicate DSA pages while the same group holds sharded KDA
-        # states. Replication is a property of a physical pool, not the group.
-        self.pcp_replicated = pcp_replicated
-        # Same per-pool granularity along the attention-TP axis: an MLA-family
-        # pool has no head dimension to shard, so every attention-TP rank holds
-        # byte-identical pages, while KDA state in the same group is sharded.
+        # Replication is a property of a physical pool, not the group: an
+        # MLA-family pool has no head dimension to shard, so every attention-TP
+        # rank holds byte-identical pages, while KDA state in the same group is
+        # sharded.
         self.tp_replicated = tp_replicated
         self.dcp_sharded = dcp_sharded
         self._index_mapper = index_mapper
@@ -595,7 +592,6 @@ def _build_mamba_device_pool_group(
             ),
             page_size=page_size // dcp_size,
             rows_are_pages=False,
-            pcp_replicated=is_dsa,
             tp_replicated=True,
             dcp_sharded=dcp_sharded,
             index_mapper=dcp_mapper,
@@ -625,7 +621,6 @@ def _build_mamba_device_pool_group(
                     },
                     page_size=page_size // dcp_size,
                     rows_are_pages=True,
-                    pcp_replicated=True,
                     tp_replicated=True,
                     dcp_sharded=dcp_sharded,
                     index_mapper=dcp_mapper,
