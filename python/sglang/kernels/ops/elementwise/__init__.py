@@ -8,6 +8,8 @@ Individual functions register (or are imported) under the functional op id
 they logically belong to.
 """
 
+from typing import TYPE_CHECKING
+
 from sglang.kernels.registry import register_kernel
 from sglang.kernels.spec import (
     CUDA_ONLY,
@@ -16,7 +18,31 @@ from sglang.kernels.spec import (
     KernelSpec,
 )
 
-__all__ = []
+if TYPE_CHECKING:
+    import torch
+
+__all__ = ["bf16_add_then_scale"]
+
+register_kernel(
+    KernelSpec(
+        op="elementwise.bf16_add_then_scale",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.elementwise.xpu_bf16_add_then_scale:bf16_add_then_scale",
+        capabilities=frozenset({CapabilityRequirement.XPU}),
+    )
+)
+
+
+def bf16_add_then_scale(
+    x: "torch.Tensor", y: "torch.Tensor", scale: "torch.Tensor"
+) -> "torch.Tensor":
+    """Two eager BF16 pointwise operations in one XPU pass."""
+    from sglang.kernels.ops.elementwise.xpu_bf16_add_then_scale import (
+        bf16_add_then_scale as implementation,
+    )
+
+    return implementation(x, y, scale)
+
 
 for _fn in ("hc_combine_gate", "hc_combine_apply", "hc_combine_apply_norm"):
     register_kernel(
