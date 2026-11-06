@@ -15,8 +15,8 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.kernels.ops.gemm import sail_deepgemm as ops
 from sglang.srt.hardware_backend.sail.deep_gemm import entrypoint as sail_entrypoint
+from sglang.srt.hardware_backend.sail.deep_gemm import sail_fused_deepgemm_ops as ops
 from sglang.srt.hardware_backend.sail.deep_gemm import warmup as sail_warmup
 from sglang.srt.hardware_backend.sail.deep_gemm.kernel_types import (
     SailDeepGemmKernelType,

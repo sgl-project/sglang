@@ -1,4 +1,10 @@
-"""SAIL gather-read grouped GEMM; routing metadata is built once and reused by GEMM1."""
+"""SAIL gather-read grouped GEMM; routing metadata is built once and reused by GEMM1.
+
+This is the torch-custom-op surface over :mod:`entrypoint`, so it lives beside it
+rather than under ``sglang.kernels.ops``: the five fused entry points are SAIL
+exclusive and are imported directly by the SAIL MoE runners instead of being
+looked up through the kernel registry.
+"""
 
 from typing import Tuple
 

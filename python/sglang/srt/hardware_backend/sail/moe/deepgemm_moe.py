@@ -9,17 +9,17 @@ from sglang.kernels.ops.activation import silu_and_mul, situ_and_mul
 from sglang.kernels.ops.activation.silu_mul_quant import (
     silu_and_mul_post_quant_mxfp4,
 )
-from sglang.kernels.ops.gemm.sail_deepgemm import (
+from sglang.kernels.ops.moe.ep_moe_kernels import ep_gather, ep_scatter_sail
+from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
+from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.sail.deep_gemm import entrypoint as sail_entrypoint
+from sglang.srt.hardware_backend.sail.deep_gemm.sail_fused_deepgemm_ops import (
     grouped_gemm_nt_bf16bf16bf16_fused,
     grouped_gemm_nt_bf16i4bf16_fused,
     grouped_gemm_nt_f4f4bf16_fused,
     grouped_gemm_nt_f8f8bf16_fused,
     grouped_gemm_nt_i8i8bf16_fused,
 )
-from sglang.kernels.ops.moe.ep_moe_kernels import ep_gather, ep_scatter_sail
-from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
-from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.sail.deep_gemm import entrypoint as sail_entrypoint
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeRunnerConfig,
     register_fused_func,
