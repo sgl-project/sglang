@@ -2,6 +2,7 @@
 """SR decode parallelism must preserve causal state and request isolation."""
 
 import os
+from contextlib import nullcontext
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -97,12 +98,15 @@ def _decode(rank, world_size, tp_size, dp_size, port, spatial):
             spatial_factor=2 ** (len(TINY_KVAE["ch_mult"]) - 1),
         )
     )
+    # bf16 is not bit-stable across input shapes, and this tiny random VAE amplifies
+    # a 1-ulp conv flip to ~9/255; check spatial sharding bit-exactly in fp32 instead.
+    vae_dtype = torch.float32 if spatial_active else torch.bfloat16
     torch.manual_seed(17)
-    reference_vae = Kandinsky6SRVAE(config).eval().to(device=rank, dtype=torch.bfloat16)
+    reference_vae = Kandinsky6SRVAE(config).eval().to(device=rank, dtype=vae_dtype)
     config = replace(
         config, use_parallel_decode=spatial, parallel_decode_mode="spatial_shard"
     )
-    vae = Kandinsky6SRVAE(config).eval().to(device=rank, dtype=torch.bfloat16)
+    vae = Kandinsky6SRVAE(config).eval().to(device=rank, dtype=vae_dtype)
     vae.load_state_dict(reference_vae.state_dict())
     assert (
         any(isinstance(m, SpatialParallelConv3d) for m in vae.decoder.modules())
@@ -114,7 +118,15 @@ def _decode(rank, world_size, tp_size, dp_size, port, spatial):
     stage = Kandinsky6SRDecodeStage(vae)
     stage.server_args = args
 
-    with torch.inference_mode():
+    keep_vae_dtype = (
+        patch(
+            "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6_sr.tiled.bf16_autocast",
+            lambda device: nullcontext(),
+        )
+        if spatial_active
+        else nullcontext()
+    )
+    with keep_vae_dtype, torch.inference_mode():
         for offload in (False, True):
             if offload:
                 vae.configure_layerwise_offload(
@@ -181,9 +193,7 @@ def _decode(rank, world_size, tp_size, dp_size, port, spatial):
                     assert len(actual) == len(expected)
                     for tile, reference in zip(actual, expected):
                         assert tile.device.type == "cpu" and tile.dtype == torch.uint8
-                        torch.testing.assert_close(
-                            tile, reference, rtol=0, atol=2 if spatial_active else 0
-                        )
+                        torch.testing.assert_close(tile, reference, rtol=0, atol=0)
                 if frames == 9:
                     if first is None:
                         first = actual
