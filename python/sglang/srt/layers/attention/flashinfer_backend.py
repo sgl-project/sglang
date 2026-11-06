@@ -15,7 +15,6 @@ Each backend supports two operators: extend (i.e. prefill with cached prefix) an
 """
 
 import logging
-import os
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import partial
@@ -2976,10 +2975,9 @@ def should_use_tensor_core(
     Returns:
         bool: Whether to use tensor cores
     """
-    # Try to use environment variable first
-    env_override = os.environ.get("SGLANG_FLASHINFER_USE_TENSOR_CORE")
-    if env_override is not None:
-        return env_override.lower() == "true"
+    forced = envs.SGLANG_FLASHINFER_USE_TENSOR_CORE.get()
+    if forced is not None:
+        return forced
 
     # Try to use _grouped_size_compiled_for_decode_kernels if available
     # This is for flashinfer <=0.1.6. Otherwise, there is an accuracy bug
