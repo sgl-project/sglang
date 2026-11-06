@@ -19,7 +19,6 @@ Also supports JSON format:
 
 import ast
 import json
-import keyword as _python_keyword
 import logging
 import re
 from typing import Any, Dict, List, Optional, Tuple
