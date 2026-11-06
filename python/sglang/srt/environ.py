@@ -2186,6 +2186,8 @@ class Envs:
     # Use the experimental FlyDSL split-K paged GQA kernel for Muse Spark's
     # short-window decode layers on gfx950.
     SGLANG_MUSE_FLYDSL_DECODE = EnvBool(False)
+    # Triton extend: DFlash draft block (8 x 8 heads, 1 KV head, HD128) split-KV.
+    SGLANG_MUSE_DFLASH_SPLITKV = EnvBool(True)
     # Tiled 17..64-row GEMMs for the weight shapes the ROCm Muse Spark model
     # registers (O projection, MoE pooler, DFlash draft MLP).
     SGLANG_MUSE_DENSE_TILED = EnvBool(True)
