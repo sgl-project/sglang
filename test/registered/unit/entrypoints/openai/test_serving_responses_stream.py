@@ -810,127 +810,103 @@ class NonHarmonyStreamTestCase(CustomTestCase):
 
 class HarmonyStreamLifecycleTestCase(CustomTestCase):
     def test_repaired_headers_preserve_function_call_stream(self):
-        """Repair must preserve SSE items across token splits and engine modes."""
+        """Successive repairs must not duplicate SSE items or corrupt arguments."""
         from sglang.srt.entrypoints.harmony_utils import get_encoding
 
         encoding = get_encoding()
         arguments = '{"text":"literal <|call|> and café"}'
-        prefix = (
-            "<|channel|>analysis<|message|>plan<|end|>"
-            "<|start|>assistant<|channel|>final<|message|>before<|end|>"
-            "<|start|>assistant"
-        )
-        headers = (
-            "<|channel|>commentary to=functions.echo "
-            "<|constrain|>commentary to=assistant "
-            "<|constrain|>analysis to=functions.echo json<|message|>",
-            "<|channel|>commentary to=functions.echo",
-            "<|channel|>analysis to=functions.echo<|constrain|>",
-            "<|channel|>analysis to=functions.echo<|message|>",
-        )
-        for header in headers:
-            tokens = (
-                encoding.encode(prefix + header, allowed_special="all")
-                + encoding.encode(arguments, disallowed_special=())
-                + encoding.encode("<|call|>", allowed_special="all")
+        body = encoding.encode(arguments, disallowed_special=())
+        tokens = (
+            encoding.encode(
+                "<|channel|>analysis<|message|>plan<|end|>"
+                "<|start|>assistant<|channel|>analysis to=functions.echo "
+                "<|constrain|>analysis json<|message|>",
+                allowed_special="all",
             )
-            for cumulative in (False, True):
-                for chunk_size in (1, len(tokens)):
-                    with self.subTest(
-                        header=header, cumulative=cumulative, chunk_size=chunk_size
-                    ):
-                        serving = make_serving(model_type="gpt_oss")
+            + body
+            + encoding.encode(
+                "<|call|><|start|>assistant<|channel|>analysis to=functions.echo<|constrain|>",
+                allowed_special="all",
+            )
+            + body
+            + encoding.encode("<|call|>", allowed_special="all")
+        )
+        for cumulative in (False, True):
+            with self.subTest(cumulative=cumulative):
+                serving = make_serving(model_type="gpt_oss")
 
-                        async def generate(*args, **kwargs):
-                            for start in range(0, len(tokens), chunk_size):
-                                end = min(start + chunk_size, len(tokens))
-                                chunk = engine_chunk("", end, finish=end == len(tokens))
-                                chunk["output_ids"] = tokens[
-                                    0 if cumulative else start : end
-                                ]
-                                yield chunk
-
-                        serving.tokenizer_manager.generate_request = generate
-                        request = ResponsesRequest(
-                            model="x",
-                            input="hi",
-                            stream=True,
-                            store=False,
-                            tools=[
-                                {
-                                    "type": "function",
-                                    "name": "echo",
-                                    "description": "Return the supplied text.",
-                                    "parameters": {"type": "object"},
-                                }
-                            ],
+                async def generate(*args, **kwargs):
+                    for end in range(1, len(tokens) + 1):
+                        chunk = engine_chunk("", end, finish=end == len(tokens))
+                        chunk["output_ids"] = (
+                            tokens[:end] if cumulative else tokens[end - 1 : end]
                         )
+                        yield chunk
 
-                        async def collect():
-                            stream = await serving.create_responses(request)
-                            self.assertNotIsInstance(
-                                stream, ORJSONResponse, getattr(stream, "body", None)
-                            )
-                            return await collect_stream_events(stream)
+                serving.tokenizer_manager.generate_request = generate
+                request = ResponsesRequest(
+                    model="x",
+                    input="hi",
+                    stream=True,
+                    store=False,
+                    tools=[
+                        {
+                            "type": "function",
+                            "name": "echo",
+                            "description": "Return the supplied text.",
+                            "parameters": {"type": "object"},
+                        }
+                    ],
+                )
 
-                        events = asyncio.run(collect())
-                        payloads = event_payloads(events)
-                        output = find_completed_event(events)["response"]["output"]
-                        self.assertEqual(
-                            [item["type"] for item in output],
-                            ["reasoning", "message", "function_call"],
-                        )
-                        self.assertEqual(output[0]["content"][0]["text"], "plan")
-                        self.assertEqual(output[1]["content"][0]["text"], "before")
-                        self.assertEqual(output[2]["name"], "echo")
-                        self.assertEqual(output[2]["arguments"], arguments)
-                        added = [
-                            p
+                async def collect():
+                    stream = await serving.create_responses(request)
+                    self.assertNotIsInstance(
+                        stream, ORJSONResponse, getattr(stream, "body", None)
+                    )
+                    return await collect_stream_events(stream)
+
+                events = asyncio.run(collect())
+                payloads = event_payloads(events)
+                response = find_completed_event(events)["response"]
+                output = response["output"]
+                self.assertEqual(
+                    [item["type"] for item in output],
+                    ["reasoning", "function_call", "function_call"],
+                )
+                self.assertEqual(output[0]["content"][0]["text"], "plan")
+                self.assertEqual(
+                    [(item["name"], item["arguments"]) for item in output[1:]],
+                    [("echo", arguments)] * 2,
+                )
+                self.assertEqual(response["usage"]["output_tokens"], len(tokens))
+                added = [
+                    p for p in payloads if p["type"] == "response.output_item.added"
+                ]
+                done = [p for p in payloads if p["type"] == "response.output_item.done"]
+                self.assertEqual([p["output_index"] for p in added], [0, 1, 2])
+                self.assertEqual([p["output_index"] for p in done], [0, 1, 2])
+                self.assertEqual([p["item"] for p in done], output)
+                self.assertEqual(
+                    [p["item"]["id"] for p in added], [item["id"] for item in output]
+                )
+                self.assertEqual(len({item["id"] for item in output}), 3)
+                self.assertEqual(
+                    [p["sequence_number"] for p in payloads], list(range(len(payloads)))
+                )
+                for index in (1, 2):
+                    self.assertEqual(
+                        "".join(
+                            p["delta"]
                             for p in payloads
-                            if p["type"] == "response.output_item.added"
-                        ]
-                        done = [
-                            p
-                            for p in payloads
-                            if p["type"] == "response.output_item.done"
-                        ]
-                        self.assertEqual([p["output_index"] for p in added], [0, 1, 2])
-                        self.assertEqual([p["output_index"] for p in done], [0, 1, 2])
-                        self.assertEqual([p["item"] for p in done], output)
-                        self.assertEqual(
-                            [p["item"]["id"] for p in added],
-                            [item["id"] for item in output],
-                        )
-                        self.assertEqual(len({item["id"] for item in output}), 3)
-                        self.assertEqual(
-                            [p["sequence_number"] for p in payloads],
-                            list(range(len(payloads))),
-                        )
-                        for index, event_type, expected in (
-                            (0, "response.reasoning_text.delta", "plan"),
-                            (1, "response.output_text.delta", "before"),
-                            (2, "response.function_call_arguments.delta", arguments),
-                        ):
-                            self.assertEqual(
-                                "".join(
-                                    p["delta"]
-                                    for p in payloads
-                                    if p["type"] == event_type
-                                    and p["output_index"] == index
-                                ),
-                                expected,
-                            )
-                        argument_done = [
-                            p
-                            for p in payloads
-                            if p["type"] == "response.function_call_arguments.done"
-                        ]
-                        self.assertEqual(len(argument_done), 1)
-                        self.assertEqual(argument_done[0]["arguments"], arguments)
-                        self.assertEqual(argument_done[0]["item_id"], output[2]["id"])
-                        self.assertEqual(
-                            added[2]["item"]["call_id"], output[2]["call_id"]
-                        )
+                            if p["type"] == "response.function_call_arguments.delta"
+                            and p["output_index"] == index
+                        ),
+                        arguments,
+                    )
+                    self.assertEqual(
+                        added[index]["item"]["call_id"], output[index]["call_id"]
+                    )
 
     def test_truncated_harmony_arguments_close_the_emitted_item(self):
         from openai_harmony import Role

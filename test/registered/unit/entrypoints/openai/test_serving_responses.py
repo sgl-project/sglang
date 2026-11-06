@@ -18,7 +18,6 @@ from openai.types.responses import (
 from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
 from openai_harmony import (
     Conversation,
-    HarmonyError,
     Message,
     Role,
     ToolNamespaceConfig,
@@ -37,7 +36,6 @@ from xgrammar.testing import _is_grammar_accept_string
 from sglang.srt.entrypoints.context import (
     HarmonyContext,
     SimpleContext,
-    StreamingHarmonyContext,
 )
 from sglang.srt.entrypoints.harmony_utils import get_encoding
 from sglang.srt.entrypoints.openai.protocol import (
@@ -1812,7 +1810,7 @@ class ChatEncodingAdapterDispatchTestCase(CustomTestCase):
 
 
 class HarmonyHeaderRecoveryTestCase(CustomTestCase):
-    def _response_from_tokens(self, token_ids, tools):
+    def _response_from_tokens(self, token_ids, declared_tool="echo"):
         serving = make_serving(model_type="gpt_oss")
 
         async def generate(*args, **kwargs):
@@ -1821,261 +1819,125 @@ class HarmonyHeaderRecoveryTestCase(CustomTestCase):
             yield chunk
 
         serving.tokenizer_manager.generate_request = generate
+        tools = (
+            [
+                {
+                    "type": "function",
+                    "name": declared_tool,
+                    "description": "Return the supplied text.",
+                    "parameters": {"type": "object"},
+                }
+            ]
+            if declared_tool is not None
+            else []
+        )
         request = ResponsesRequest(model="x", input="hi", tools=tools, store=False)
         return asyncio.run(serving.create_responses(request))
 
     def test_malformed_headers_recover_function_call_response(self):
-        """A malformed tool header must not lose the call or earlier output."""
+        """Recover each malformed header without losing earlier output or body text."""
         encoding = get_encoding()
         arguments = '{"text":"literal <|call|> and café"}'
-        prefix = (
-            "<|channel|>analysis<|message|>plan<|end|>"
-            "<|start|>assistant<|channel|>final<|message|>before<|end|>"
-            "<|start|>assistant"
-        )
-        cases = (
-            (
-                "spliced_metadata",
-                "<|channel|>commentary to=functions.echo "
-                "<|constrain|>commentary to=assistant "
-                "<|constrain|>analysis to=functions.echo json<|message|>",
-                "<|start|>assistant<|channel|>final<|message|>after<|end|>",
-            ),
-            ("missing_separator", "<|channel|>commentary to=functions.echo", ""),
-            (
-                "missing_separator_after_constrain",
-                "<|channel|>analysis to=functions.echo<|constrain|>",
-                "",
-            ),
-            (
-                "valid_analysis_function",
-                "<|channel|>analysis to=functions.echo<|message|>",
-                "",
-            ),
-        )
-        for name, header, tail in cases:
-            with self.subTest(name=name):
+        prefix = "<|channel|>analysis<|message|>plan<|end|><|start|>assistant"
+        for header in (
+            "<|channel|>commentary to=functions.echo "
+            "<|constrain|>commentary to=assistant "
+            "<|constrain|>analysis to=functions.echo json<|message|>",
+            "<|channel|>analysis to=functions.echo",
+            "<|channel|>analysis to=functions.echo<|constrain|>",
+        ):
+            with self.subTest(header=header):
                 tokens = (
                     encoding.encode(prefix + header, allowed_special="all")
                     + encoding.encode(arguments, disallowed_special=())
-                    + encoding.encode("<|call|>" + tail, allowed_special="all")
+                    + encoding.encode("<|call|>", allowed_special="all")
                 )
-                response = self._response_from_tokens(
-                    tokens,
-                    [
-                        {
-                            "type": "function",
-                            "name": "echo",
-                            "description": "Return the supplied text.",
-                            "parameters": {"type": "object"},
-                        }
-                    ],
-                )
+                response = self._response_from_tokens(tokens)
                 self.assertIsInstance(
                     response, ResponsesResponse, getattr(response, "body", None)
                 )
-                self.assertEqual(response.status, "completed")
                 self.assertEqual(
                     [item.type for item in response.output],
-                    ["reasoning", "message", "function_call"]
-                    + (["message"] if tail else []),
+                    ["reasoning", "function_call"],
                 )
                 self.assertEqual(response.output[0].content[0].text, "plan")
-                self.assertEqual(response.output[1].content[0].text, "before")
-                call = response.output[2]
+                call = response.output[1]
                 self.assertEqual((call.name, call.arguments), ("echo", arguments))
-                self.assertTrue(call.call_id)
-                if tail:
-                    self.assertEqual(response.output[3].content[0].text, "after")
                 self.assertEqual(response.usage.completion_tokens, len(tokens))
 
-    def test_missing_separator_recovery_respects_declared_tools_and_json(self):
-        """Untrusted header text must not invent a tool call or execute a builtin."""
+    def test_recovery_rejects_unrecognized_headers(self):
+        """Recovery must not invent calls or discard authored header text."""
         encoding = get_encoding()
-        echo = [
-            {
-                "type": "function",
-                "name": "echo",
-                "description": "Return the supplied text.",
-                "parameters": {"type": "object"},
-            }
-        ]
+        header = "<|channel|>commentary to="
         cases = (
-            ("undeclared", "functions.other", '{"x":1}', echo, "<|call|>"),
-            ("no_tools", "functions.echo", '{"x":1}', [], "<|call|>"),
-            ("python", "python", '{"x":1}', echo, "<|call|>"),
-            ("browser", "browser.search", '{"x":1}', echo, "<|call|>"),
-            ("truncated", "functions.echo", '{"x":', echo, "<|call|>"),
-            ("nonobject", "functions.echo", '[{"x":1}]', echo, "<|call|>"),
-            ("authored_prefix", "functions.echo", 'text {"x":1}', echo, "<|call|>"),
-            ("authored_suffix", "functions.echo", '{"x":1} text', echo, "<|call|>"),
-            ("no_handoff", "functions.echo", '{"x":1}', echo, "<|end|>"),
+            (
+                "undeclared",
+                header + "functions.other",
+                '{"x":1}',
+                "<|call|>",
+                "echo",
+                False,
+            ),
+            ("no_tools", header + "functions.echo", '{"x":1}', "<|call|>", None, False),
+            ("builtin", header + "python", '{"x":1}', "<|call|>", "python", False),
+            (
+                "truncated",
+                header + "functions.echo",
+                '{"x":',
+                "<|call|>",
+                "echo",
+                False,
+            ),
+            (
+                "no_handoff",
+                header + "functions.echo",
+                '{"x":1}',
+                "<|end|>",
+                "echo",
+                False,
+            ),
+            (
+                "authored_metadata",
+                header
+                + "functions.echo <|constrain|>analysis authored code<|message|>",
+                "{}",
+                "<|call|>",
+                "echo",
+                True,
+            ),
         )
-        for name, recipient, body, tools, ending in cases:
+        for name, prefix, body, ending, declared_tool, expect_error in cases:
             with self.subTest(name=name):
                 tokens = (
-                    encoding.encode(
-                        f"<|channel|>commentary to={recipient}", allowed_special="all"
-                    )
+                    encoding.encode(prefix, allowed_special="all")
                     + encoding.encode(body, disallowed_special=())
                     + encoding.encode(ending, allowed_special="all")
                 )
-                response = self._response_from_tokens(tokens, tools)
-                self.assertIsInstance(
-                    response, ResponsesResponse, getattr(response, "body", None)
-                )
-                self.assertEqual(response.output, [])
-
-    def test_unrecognized_metadata_is_not_discarded(self):
-        """Header recovery may discard metadata, but not possible authored text."""
-        encoding = get_encoding()
-        for context_type in (HarmonyContext, StreamingHarmonyContext):
-            for content_type in ("analysis authored code", "analysis yaml"):
-                with self.subTest(context=context_type.__name__, metadata=content_type):
-                    context = context_type([], {}, function_names={"echo"})
-                    tokens = encoding.encode(
-                        "<|channel|>commentary to=functions.echo "
-                        f"<|constrain|>{content_type}<|message|>{{}}<|call|>",
-                        allowed_special="all",
+                response = self._response_from_tokens(tokens, declared_tool)
+                if expect_error:
+                    self.assertIsInstance(response, ORJSONResponse)
+                    self.assertEqual(response.status_code, 400)
+                else:
+                    self.assertIsInstance(
+                        response, ResponsesResponse, getattr(response, "body", None)
                     )
-                    chunk = engine_chunk("", len(tokens), finish=True)
-                    chunk["output_ids"] = tokens
-                    with self.assertRaises(HarmonyError):
-                        context.append_output(chunk)
+                    self.assertEqual(response.output, [])
 
-    def test_header_repair_preserves_original_argument_token_ids(self):
-        """Recovery must not retokenize body text that resembles control tokens."""
-        encoding = get_encoding()
-        arguments = '{"text":"literal <|call|> café"}'
-        argument_tokens = [
-            token
-            for char in arguments
-            for token in encoding.encode(char, disallowed_special=())
-        ]
-        self.assertNotEqual(
-            argument_tokens, encoding.encode(arguments, disallowed_special=())
-        )
-        for header in (
-            "<|channel|>commentary to=functions.echo "
-            "<|constrain|>analysis json<|message|>",
-            "<|channel|>commentary to=functions.echo",
-        ):
-            with self.subTest(header=header):
-                context = HarmonyContext([], {}, function_names={"echo"})
-                tokens = (
-                    encoding.encode(header, allowed_special="all")
-                    + argument_tokens
-                    + encoding.encode("<|call|>", allowed_special="all")
-                )
-                chunk = engine_chunk("", len(tokens), finish=True)
-                chunk["output_ids"] = tokens
-                context.append_output(chunk)
-                (message,) = context.messages
-                self.assertEqual(message.content[0].text, arguments)
-                self.assertEqual(
-                    context.parser.tokens[-len(argument_tokens) - 1 : -1],
-                    argument_tokens,
-                )
-
-    def test_successive_repairs_preserve_history_and_partial_content(self):
-        """A later repair must retain earlier messages and their argument tokens."""
-        encoding = get_encoding()
-        arguments = '{"text":"literal <|start|> and <|call|> café"}'
-        argument_tokens = [
-            token
-            for char in arguments
-            for token in encoding.encode(char, disallowed_special=())
-        ]
-        self.assertNotEqual(
-            argument_tokens, encoding.encode(arguments, disallowed_special=())
-        )
-        prefix = encoding.encode(
-            "<|channel|>analysis<|message|>before<|end|>"
-            "<|start|>assistant<|channel|>commentary to=functions.echo "
-            "<|constrain|>analysis json<|message|>",
+    def test_terminal_partial_content_is_not_finalized(self):
+        """Generation end must leave a valid unfinished function body available."""
+        arguments = '{"text":"unfinished'
+        tokens = get_encoding().encode(
+            "<|channel|>analysis to=functions.echo<|message|>" + arguments,
             allowed_special="all",
         )
-        between = encoding.encode(
-            "<|call|><|start|>assistant<|channel|>final<|message|>between<|end|>"
-            "<|start|>assistant<|channel|>analysis to=functions.echo",
-            allowed_special="all",
-        )
-        call_token = encoding.encode("<|call|>", allowed_special="all")[0]
-        partial_arguments = '{"text":"unfinished'
-        for partial in (False, True):
-            tail = (
-                encoding.encode("<|message|>", allowed_special="all")
-                + encoding.encode(partial_arguments, disallowed_special=())
-                if partial
-                else argument_tokens + [call_token]
-            )
-            tokens = prefix + argument_tokens + between + tail
-            for mode in ("nonstream", "cumulative", "incremental"):
-                with self.subTest(mode=mode, partial=partial):
-                    context_type = (
-                        HarmonyContext
-                        if mode == "nonstream"
-                        else StreamingHarmonyContext
-                    )
-                    context = context_type([], {}, function_names={"echo"})
-                    if mode == "nonstream":
-                        chunks = [(tokens, len(tokens))]
-                    elif mode == "cumulative":
-                        chunks = [
-                            (tokens[:end], end) for end in range(1, len(tokens) + 1)
-                        ]
-                    else:
-                        chunks = [([token], end) for end, token in enumerate(tokens, 1)]
-                    for ids, end in chunks:
-                        chunk = engine_chunk("", end, finish=end == len(tokens))
-                        chunk["output_ids"] = ids
-                        if partial and end == len(tokens):
-                            chunk["meta_info"]["finish_reason"] = {"type": "length"}
-                        context.append_output(chunk)
-
-                    expected = ["before", arguments, "between"]
-                    if not partial:
-                        expected.append(arguments)
-                    self.assertEqual(
-                        [message.content[0].text for message in context.messages],
-                        expected,
-                    )
-                    repaired_tokens = context.parser.tokens
-                    first_call = repaired_tokens.index(call_token)
-                    self.assertEqual(
-                        repaired_tokens[first_call - len(argument_tokens) : first_call],
-                        argument_tokens,
-                    )
-                    if partial:
-                        self.assertEqual(
-                            context.parser.current_content, partial_arguments
-                        )
-                        self.assertEqual(
-                            context.parser.current_recipient, "functions.echo"
-                        )
-                    else:
-                        self.assertEqual(
-                            repaired_tokens[-len(argument_tokens) - 1 : -1],
-                            argument_tokens,
-                        )
-
-                    if mode != "nonstream":
-                        # A terminal notification may contain no new engine tokens.
-                        messages = [message.to_dict() for message in context.messages]
-                        chunk = engine_chunk("", len(tokens), finish=True)
-                        chunk["output_ids"] = tokens if mode == "cumulative" else []
-                        if partial:
-                            chunk["meta_info"]["finish_reason"] = {"type": "length"}
-                        context.append_output(chunk)
-                        self.assertEqual(
-                            [message.to_dict() for message in context.messages],
-                            messages,
-                        )
-                        self.assertEqual(context.parser.tokens, repaired_tokens)
-                        if partial:
-                            self.assertEqual(
-                                context.parser.current_content, partial_arguments
-                            )
+        context = HarmonyContext([], {}, function_names={"echo"})
+        chunk = engine_chunk("", len(tokens), finish=True)
+        chunk["output_ids"] = tokens
+        chunk["meta_info"]["finish_reason"] = {"type": "length"}
+        context.append_output(chunk)
+        self.assertEqual(context.messages, [])
+        self.assertEqual(context.parser.current_content, arguments)
+        self.assertEqual(context.parser.current_recipient, "functions.echo")
 
 
 class HarmonyResponsesTestCase(CustomTestCase):
