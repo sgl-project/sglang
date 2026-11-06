@@ -1180,6 +1180,23 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         self.assertTrue(req[0].return_prompt_token_ids)
         self.assertTrue(req[1].return_prompt_token_ids)
 
+    def test_getitem_preserves_request_scoped_video_config(self):
+        video_config = {"_question": "Describe the clip", "seq": 32768}
+        cases = (
+            (["Hello", "World"], [{}, {}]),
+            ("Hello", {"n": 2}),
+        )
+        for text, sampling_params in cases:
+            with self.subTest(text=text):
+                req = GenerateReqInput(
+                    text=text,
+                    video_config=video_config,
+                    sampling_params=sampling_params,
+                )
+                req.normalize_batch_and_arguments()
+                for index in range(len(req.rid)):
+                    self.assertEqual(req[index].video_config, video_config)
+
     def test_regenerate_rid(self):
         """Test the regenerate_rid method."""
         req = GenerateReqInput(text="Hello")
