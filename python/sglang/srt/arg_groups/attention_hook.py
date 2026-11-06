@@ -308,6 +308,7 @@ def handle_linear_attn_backend(server_args: Any):
 
     if cfg.enable_gdn_replayssm_ucache:
         _check_gdn_replayssm_ucache(server_args)
+        _pin_gdn_ucache_state_dtype_env(cfg, flag="--enable-gdn-replayssm-ucache")
 
     # SM100+ FlashInfer GDN decode requires bf16 state; SM90 uses float32.
     decode = cfg.linear_attn_decode_backend or cfg.linear_attn_backend
@@ -542,7 +543,6 @@ def _check_gdn_replayssm_ucache(server_args: Any) -> None:
     _check_gdn_replayssm_ucache_spec(cfg, flag=flag)
     _check_gdn_replayssm_ucache_cache(cfg, flag=flag)
     _check_gdn_replayssm_ucache_megakernel(cfg, flag=flag)
-    _set_gdn_ucache_state_dtype_env(flag=flag)
     if cfg.mamba_ssm_dtype is None:
         logger.info(f"{flag}: setting --mamba-ssm-dtype float16 (UMMA fp16 state).")
         declare_resolution(
@@ -555,10 +555,16 @@ def _check_gdn_replayssm_ucache(server_args: Any) -> None:
         )
 
 
-def _set_gdn_ucache_state_dtype_env(*, flag: str) -> None:
-    # FlashInfer's gdn_prefix_materialize fixes its state dtype when
-    # flashinfer.gdn_kernels is first imported; scheduler processes inherit this.
-    # The UMMA verify kernels take their dtypes from the tensors.
+def _pin_gdn_ucache_state_dtype_env(cfg: Any, *, flag: str) -> None:
+    """Sets GDN_UCACHE_STATE_DTYPE=fp16, refusing another value, when decode-time
+    radix inserts load FlashInfer's gdn_prefix_materialize."""
+    # PM fixes its state dtype when flashinfer.gdn_kernels is first imported;
+    # scheduler processes inherit this. The UMMA verify kernels take their dtypes
+    # from the tensors, so the other configs leave the variable alone. After
+    # _check_gdn_replayssm_ucache_cache, decode inserts imply an extra_buffer
+    # strategy, which is when the backend builds the track materializer.
+    if cfg.disable_radix_cache or cfg.radix_cache_skip_decode_insert:
+        return
     value = os.environ.setdefault("GDN_UCACHE_STATE_DTYPE", "fp16")
     if value.strip().lower() != "fp16":
         raise ValueError(
