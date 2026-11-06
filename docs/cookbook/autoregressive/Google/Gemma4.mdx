@@ -584,6 +584,13 @@ Follow these specific instructions for formatting the answer:
 
 For speech translation (AST), ask for the transcription in the source language first, then the translation: *"Transcribe the following speech segment in {SOURCE_LANGUAGE}, then translate it into {TARGET_LANGUAGE}. ..."*
 
+For plain transcription you can also use the OpenAI-compatible `/v1/audio/transcriptions` endpoint. The server builds the model card's language-agnostic transcription prompt ("Transcribe the following speech segment in its original language. ..."), splits clips longer than the 30-second audio limit, and keeps the model from emitting empty thought-channel blocks, which it otherwise sometimes repeats instead of transcribing under greedy decoding:
+
+```bash Command
+curl http://localhost:30000/v1/audio/transcriptions \
+  -F file=@sample.wav -F model=google/gemma-4-12B-it -F response_format=json
+```
+
 ## 5. Benchmark
 
 ### 5.1 Speed Benchmark

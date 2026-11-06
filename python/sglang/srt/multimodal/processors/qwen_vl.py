@@ -46,6 +46,10 @@ from sglang.srt.multimodal.processors.base_processor import (
 from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
+from sglang.srt.multimodal.processors.whisper import (
+    ISO639_1_SUPPORTED_LANGS,
+    normalize_language_to_code,
+)
 from sglang.srt.multimodal.transport.cuda_ipc import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
 )
@@ -999,6 +1003,43 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
             mrope_position_delta,
         )
 
+    def _build_omni_transcription_prompt(self, input_text, request_obj):
+        """Fall back to the Qwen3-Omni ASR prompt for audio-only requests.
+
+        ``/v1/audio/transcriptions`` sends empty text (and hence empty
+        ``input_ids``), which carries no audio placeholder. Render the
+        evaluation prompt from the Qwen3-Omni model card instead: audio first,
+        then "Transcribe the <language> audio into text.", no system prompt.
+        """
+        language = self._pop_transcription_language(request_obj)
+        # Caller-supplied text or input_ids pass through unchanged.
+        if input_text and (not isinstance(input_text, str) or input_text.strip()):
+            return input_text
+
+        try:
+            language_code = normalize_language_to_code(language)
+        except ValueError:
+            language_code = None
+        if language_code == "zh":
+            instruction = "请将这段中文语音转换为纯文本。"
+        elif language_code in ISO639_1_SUPPORTED_LANGS:
+            language_name = ISO639_1_SUPPORTED_LANGS[language_code]
+            instruction = f"Transcribe the {language_name} audio into text."
+        else:
+            instruction = "Transcribe the audio into text."
+        conversation = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "audio", "audio": ""},
+                    {"type": "text", "text": instruction},
+                ],
+            }
+        ]
+        return self._processor.apply_chat_template(
+            conversation, add_generation_prompt=True, tokenize=False
+        )
+
     async def _process_mm_data_uncached(
         self,
         image_data: List[Union[str, bytes]],
@@ -1008,6 +1049,8 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
         **kwargs,
     ):
         entry_time = time.perf_counter()
+        if self.model_type == "qwen3_omni_moe" and request_obj.audio_data:
+            input_text = self._build_omni_transcription_prompt(input_text, request_obj)
         base_output = await self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
