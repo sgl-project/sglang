@@ -1314,7 +1314,11 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
         head_dim_v: int,
         effective_q_rows: int,
     ) -> bool:
-        """Qualify shapes covered by the SM12x paged-decode launch cache."""
+        """Shapes whose plans key on KV blocks instead of the exact max_seqlen_k.
+
+        select_config and resolve_plan read it only as KV blocks under the chosen tile;
+        drop a shape if that changes.
+        """
         head_dims = (head_dim, head_dim_v)
         return (
             head_dims in LOW_HD_DECODE_SHAPES or head_dims == (256, 256)
