@@ -36,10 +36,12 @@ from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     ListKind,
 )
+from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import release_only_retirer
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
@@ -69,10 +71,13 @@ def _make_scheduler():
     the retirement are only ever tested apart, and a step missing from the
     retirement passes every door test.
     """
+    beam_coordinator = MagicMock()
     sched = SimpleNamespace(
         output_streamer=MagicMock(),
-        beam_coordinator=MagicMock(),
-        release_aborted_request=MagicMock(),
+        beam_coordinator=beam_coordinator,
+        request_retirer=release_only_retirer(
+            MagicMock(), beam_coordinator=beam_coordinator
+        ),
     )
     sched.retire_unadmitted_request = MagicMock(
         side_effect=lambda req: Scheduler.retire_unadmitted_request(sched, req)
@@ -317,7 +322,9 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
 
         # PREFILL arms the cache's paced-retry set via `_prefetch_kvcache`
         # before the door, and only this call clears it again.
-        sched.release_aborted_request.assert_called_once_with(req)
+        sched.request_retirer.tree_cache.finish.assert_called_once_with(
+            req.cache_request_handle, CacheRequestOutcome.ABORT
+        )
         session.abort_req.assert_called_once()
         self.assertIsNone(req.session)
         sched.beam_coordinator.retire_group.assert_called_once_with(req)
