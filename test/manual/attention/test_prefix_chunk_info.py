@@ -6,7 +6,7 @@ from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_context
-from sglang.srt.utils.common import get_device, is_hip
+from sglang.srt.utils.device import get_device, is_hip
 from sglang.test.test_utils import CustomTestCase
 
 # HIP checks the "rocm" tables, the packed layout of forward_batch_deepseek_mha_rocm.py,

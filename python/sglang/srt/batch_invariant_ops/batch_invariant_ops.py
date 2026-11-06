@@ -11,12 +11,8 @@ import triton.language as tl
 
 from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
 from sglang.srt.utils import is_gfx95_supported, is_npu
-from sglang.srt.utils.common import (
-    calc_diff,
-    get_bool_env_var,
-    get_device_core_count,
-    get_dispatch_device_backend,
-)
+from sglang.srt.utils.common import calc_diff, get_bool_env_var
+from sglang.srt.utils.device import get_device_core_count, get_dispatch_device_backend
 
 _is_npu = is_npu()
 _is_gfx95 = is_gfx95_supported()
