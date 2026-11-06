@@ -57,3 +57,23 @@ program selection during preparation. Keep that selection in FlashInfer. Its
 reported PDL-enabled warm-L2 standalone timings regress for some B >= 25 rows,
 while the same rows improve behind a PDL predecessor. Qualify the actual
 predecessor and complete call before drawing a serving-performance conclusion.
+
+The author's [subsequent assessment](https://github.com/flashinfer-ai/flashinfer/issues/8795#issuecomment-6681591837)
+keeps the two shipped programs: gains from other variants do not justify another
+program for the default dependent-PDL consumer. Revisit that decision when the
+consumer's launch mode or shapes change, rather than adding another kernel here.
+
+SM103 checks with the complete FI `f454a17f` source package used normal FI and
+SGLang package initialization, the real slot/environment and operator registry,
+and FI's supported AOT loader. A native load failure in a private test-library
+copy reproduced the old device-wide refusal after the library was restored;
+the corrected adapter recovered and passed B25/q1 and B64/q2 eager and
+changed-input graph checks. Layout refusals were already bucket-local in the
+original adapter and are not evidence of that regression.
+
+With CuTeDSL 4.8.0, the unchanged `MlaValue` and this FI preparation path also
+produced identical output bits at B1/q1, B25/q1 and B64/q2, in eager execution and
+changed-input graph replay. The CuTe launch uses the current runtime stream,
+including during capture. These are source-package/operator checks; installed
+wheel-trio compatibility, the complete K3 executor, TP8/DCP/HiCache, task quality
+and matched serving performance still require separate qualification.
