@@ -9,6 +9,8 @@ and the Jinja template a checkpoint renders with, with the special tokens its
 context carries. The tokenizer comes from SGLang's `get_tokenizer`.
 
 MiniMax cases may also supply `chat_template` for a server-side template override.
+A fixture with `"multimodal": true` is served as a multimodal model and also
+records the image and video URLs the processor receives, in order.
 
 Run from rust/sglang-processor in a SGLang Python environment with the
 checkpoints cached:
@@ -67,9 +69,11 @@ class RecordingTokenizer:
         return getattr(self.tokenizer, name)
 
 
-def serving_chat(model, path, revision, config, tokenizer, tool_call_parser):
+def serving_chat(
+    model, path, revision, config, tokenizer, tool_call_parser, is_multimodal
+):
     """The state `OpenAIServingChat.__init__` resolves for this checkpoint, without
-    a reasoning parser. Served text-only: the processor leaves media to the engine."""
+    a reasoning parser."""
     server = object.__new__(OpenAIServingChat)
     hf_config = SimpleNamespace(
         model_type=config.get("model_type"),
@@ -79,7 +83,13 @@ def serving_chat(model, path, revision, config, tokenizer, tool_call_parser):
         tokenizer=tokenizer,
         processor=None,
         model_path=path,
-        model_config=SimpleNamespace(is_multimodal=False, hf_config=hf_config),
+        model_config=SimpleNamespace(
+            is_multimodal=is_multimodal,
+            hf_config=hf_config,
+            # `_validate_request` bounds `top_logprobs` by it.
+            vocab_size=config.get("vocab_size")
+            or config.get("text_config", {}).get("vocab_size"),
+        ),
     )
     server.template_manager = TemplateManager()
     server.template_manager.load_chat_template(server.tokenizer_manager, None, model)
@@ -98,6 +108,11 @@ def serving_chat(model, path, revision, config, tokenizer, tool_call_parser):
     server._prompt_text_round_trip_is_lossy = server._probe_prompt_text_round_trip()
     server._chat_template_cache = OrderedDict()
     return server
+
+
+def media_urls(items):
+    """`ImageData`, `VideoData` or a bare URL, as the URL."""
+    return [getattr(item, "url", item) for item in items or []]
 
 
 def generate(fixture_path):
@@ -121,6 +136,7 @@ def generate(fixture_path):
         config,
         tok,
         fixture.get("tool_call_parser"),
+        fixture.get("multimodal", False),
     )
     # What the processor reads from config.json.
     fixture["config"] = {
@@ -170,7 +186,11 @@ def generate(fixture_path):
                 effort = request.chat_template_kwargs.pop("reasoning_effort", None)
                 if effort is not None:
                     request.reasoning_effort = effort
-            ids = server._process_messages(request, is_multimodal=False).prompt_ids
+            result = server._process_messages(
+                request,
+                is_multimodal=server.tokenizer_manager.model_config.is_multimodal,
+            )
+            ids = result.prompt_ids
         except AttributeError:
             raise  # The stub server lacks what this model's path reads; extend it.
         except Exception as error:
@@ -188,10 +208,16 @@ def generate(fixture_path):
                 b"".join(i.to_bytes(4, "little") for i in ids)
             ).hexdigest(),
         )
+        if fixture.get("multimodal"):
+            case.update(
+                image_data=media_urls(result.image_data),
+                video_data=media_urls(result.video_data),
+            )
     keys = (
         "model",
         "revision",
         "tool_call_parser",
+        "multimodal",
         "config",
         "bos_token_id",
         "special_tokens",
