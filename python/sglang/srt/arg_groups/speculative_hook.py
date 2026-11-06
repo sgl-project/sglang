@@ -293,11 +293,11 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
 
 def _customized_draft_moe_spec(server_args: ServerArgs):
     """The MoE spec of a customized draft, or None for native drafts and dense ones."""
+    from sglang.srt.hf_transformers import get_config
     from sglang.srt.speculative.dflash_utils import (
         is_customized_draft_config,
         parse_dflash_draft_config,
     )
-    from sglang.srt.hf_transformers import get_config
 
     cfg = resolving_view(server_args)
     if cfg.speculative_draft_model_path is None:
