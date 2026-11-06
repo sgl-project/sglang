@@ -479,20 +479,26 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         # layers of a long prefix. The synchronous read has drained its writers;
         # reacquire only those immutable content-addressed objects and retry
         # their current layer once. Other failures still abort the request.
-        expired = [i for i, value in enumerate(result) if value == -707]
-        if not expired or any(
-            value not in (want, -707) for value, want in zip(result, expected)
+        # A key read more than once in one call (requests sharing a prefix)
+        # reports the expiry once; its repeats fail with -600.
+        lapsed = {key for key, value in zip(keys, result) if value == -707}
+        expired = [
+            i
+            for i, value in enumerate(result)
+            if value == -707 or (value == -600 and keys[i] in lapsed)
+        ]
+        if not expired or len(expired) != sum(
+            value != want for value, want in zip(result, expected)
         ):
             return result
-        expired_keys = [keys[i] for i in expired]
-        renewed = list(store.batch_get_session_start(expired_keys))
-        if renewed != [0] * len(expired_keys):
+        renewed = list(store.batch_get_session_start(list(lapsed)))
+        if renewed != [0] * len(lapsed):
             raise RuntimeError(
-                f"Mooncake get session renewal failed: keys={len(expired_keys)}, "
+                f"Mooncake get session renewal failed: keys={len(lapsed)}, "
                 f"result_sample={renewed[:8]}"
             )
         retried = store.batch_get_into_multi_buffer_ranges(
-            expired_keys,
+            [keys[i] for i in expired],
             [ptrs[i] for i in expired],
             [sizes[i] for i in expired],
             [offsets[i] for i in expired],
