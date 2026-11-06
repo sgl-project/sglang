@@ -22,7 +22,7 @@ from sglang.test.kernels.kv_canary._fuzz_driver import (
 )
 from sglang.test.kernels.kv_canary._invariants import PlanInvariants
 
-register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 register_amd_ci(est_time=30, stage="jit-kernel-unit", runner_config="amd")
 
 

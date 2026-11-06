@@ -1,7 +1,7 @@
 import abc
 from collections import OrderedDict
 from dataclasses import dataclass, replace
-from typing import List, Optional
+from typing import Hashable, List, Optional
 
 import torch
 
@@ -15,17 +15,17 @@ class MultimodalCache(abc.ABC):
     ): ...
 
     @staticmethod
-    def combine_hashes(mm_hashes: List[int]) -> Optional[int]:
+    def combine_hashes(mm_hashes: List[Hashable]) -> Optional[tuple]:
         """
-        Get a combined hash from individual mm item hashes
+        Keep the ordered identities themselves as the equality key.
         """
         if not mm_hashes:
             return None
-        return hash(tuple(mm_hashes))
+        return tuple(mm_hashes)
 
     @abc.abstractmethod
     def get(
-        self, mm_hashes: List[int], combined_hash: Optional[int] = None
+        self, mm_hashes: List[Hashable], combined_hash: Optional[tuple] = None
     ) -> Optional[torch.Tensor]:
         """
         Extract the embedding with the hash-ids of the queried items. Try combined hash first, if missed, fallback to individual hashes
@@ -36,7 +36,7 @@ class MultimodalCache(abc.ABC):
     @abc.abstractmethod
     def set(
         self,
-        mm_hash: int,
+        mm_hash: Hashable,
         embedding: torch.Tensor,
         mm_embedding_allocator: BaseTokenToKVPoolAllocator,
     ) -> bool:
@@ -46,12 +46,12 @@ class MultimodalCache(abc.ABC):
         raise NotImplementedError()
 
     @abc.abstractmethod
-    def has(self, mm_hash: int) -> bool:
+    def has(self, mm_hash: Hashable) -> bool:
         raise NotImplementedError()
 
     @abc.abstractmethod
     def free(
-        self, mm_hash: int, mm_embedding_allocator: BaseTokenToKVPoolAllocator
+        self, mm_hash: Hashable, mm_embedding_allocator: BaseTokenToKVPoolAllocator
     ) -> bool:
         raise NotImplementedError()
 
@@ -85,11 +85,11 @@ class MultiModalStaticCache(MultimodalCache):
     ):
         super().__init__()
         self.max_size = max_size
-        self.mm_cache: OrderedDict[int, EmbeddingResult] = OrderedDict()
+        self.mm_cache: OrderedDict[Hashable, EmbeddingResult] = OrderedDict()
         self.current_size = 0
 
     def get(
-        self, mm_hashes: List[int], combined_hash: Optional[int] = None
+        self, mm_hashes: List[Hashable], combined_hash: Optional[tuple] = None
     ) -> Optional[EmbeddingResult]:
         combined_hash = self.combine_hashes(mm_hashes)
         # MultiModalStaticCache does not fallback to individual item lookup
@@ -101,7 +101,7 @@ class MultiModalStaticCache(MultimodalCache):
 
     def set(
         self,
-        mm_hash: int,
+        mm_hash: Hashable,
         embedding: EmbeddingResult,
         loc: Optional[torch.Tensor] = None,
     ) -> bool:
@@ -129,18 +129,18 @@ class MultiModalStaticCache(MultimodalCache):
         self.current_size += data_size
         return True
 
-    def get_single(self, mm_hash: int) -> Optional[EmbeddingResult]:
+    def get_single(self, mm_hash: Hashable) -> Optional[EmbeddingResult]:
         """Get a single cached embedding by its hash (no combine_hashes)."""
         embedding = self.mm_cache.get(mm_hash)
         if embedding is not None:
             self.mm_cache.move_to_end(mm_hash)
         return embedding
 
-    def has(self, mm_hash: int) -> bool:
+    def has(self, mm_hash: Hashable) -> bool:
         return mm_hash in self.mm_cache
 
     def free(
-        self, mm_hash: int, mm_embedding_allocator: BaseTokenToKVPoolAllocator
+        self, mm_hash: Hashable, mm_embedding_allocator: BaseTokenToKVPoolAllocator
     ) -> bool:
         if mm_hash not in self.mm_cache:
             return False

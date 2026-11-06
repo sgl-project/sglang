@@ -23,14 +23,14 @@ import tempfile
 
 import torch
 
-from sglang.srt.distributed.device_communicators.cuda_wrapper import find_loaded_library
+from sglang.kernels.arch import current_arch
+from sglang.kernels.jit.utils.hipcc import check_hip, hip_lib
 
 logger = logging.getLogger(__name__)
 
 _DIR = os.path.dirname(os.path.abspath(__file__))
 _LOG2E = 1.4426950408889634
 
-_hip = None
 _kernels = {}
 _build_dir = None
 _available = None
@@ -99,63 +99,18 @@ def _declared_kernarg_size(source_file):
     return int(m.group(1))
 
 
-def _hip_lib():
-    global _hip
-    if _hip is None:
-        # ROCm 10 ships the HIP runtime (_rocm_sdk_core) and the toolchain
-        # (_rocm_sdk_devel) as separate wheels. Torch maps core's
-        # libamdhip64.so.7, which an unversioned CDLL("libamdhip64.so") does not
-        # match, so the loader takes devel's copy off LD_LIBRARY_PATH as a
-        # second HIP runtime and every launch on a torch stream then fails with
-        # hipErrorContextIsDestroyed (709). Initialize CUDA first so torch's
-        # copy is mapped, then bind to that one.
-        torch.cuda.current_device()
-        _hip = ctypes.CDLL(find_loaded_library("libamdhip64") or "libamdhip64.so")
-        _hip.hipModuleLoad.restype = ctypes.c_int
-        _hip.hipModuleLoad.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
-        _hip.hipModuleGetFunction.restype = ctypes.c_int
-        _hip.hipModuleGetFunction.argtypes = [
-            ctypes.c_void_p,
-            ctypes.c_void_p,
-            ctypes.c_char_p,
-        ]
-        _hip.hipModuleLaunchKernel.restype = ctypes.c_int
-        _hip.hipModuleLaunchKernel.argtypes = [
-            ctypes.c_void_p,
-            ctypes.c_uint,
-            ctypes.c_uint,
-            ctypes.c_uint,
-            ctypes.c_uint,
-            ctypes.c_uint,
-            ctypes.c_uint,
-            ctypes.c_uint,
-            ctypes.c_void_p,
-            ctypes.c_void_p,
-            ctypes.c_void_p,
-        ]
-        _hip.hipGetErrorString.restype = ctypes.c_char_p
-    return _hip
-
-
-def _check(rc, what):
-    if rc != 0:
-        raise RuntimeError(
-            f"vattn_asm: {what} failed: {rc} "
-            f"({_hip_lib().hipGetErrorString(rc).decode()})"
-        )
-
-
 class _Kernel:
     def __init__(self, co_path, name, kernarg_size):
-        h = _hip_lib()
         self.mod = ctypes.c_void_p()
-        _check(
-            h.hipModuleLoad(ctypes.byref(self.mod), co_path.encode()),
+        check_hip(
+            hip_lib().hipModuleLoad(ctypes.byref(self.mod), co_path.encode()),
             f"hipModuleLoad {co_path}",
         )
         self.fn = ctypes.c_void_p()
-        _check(
-            h.hipModuleGetFunction(ctypes.byref(self.fn), self.mod, name.encode()),
+        check_hip(
+            hip_lib().hipModuleGetFunction(
+                ctypes.byref(self.fn), self.mod, name.encode()
+            ),
             f"hipModuleGetFunction {name}",
         )
         self.kernarg_size = kernarg_size
@@ -170,8 +125,8 @@ class _Kernel:
             ctypes.cast(ctypes.byref(size), ctypes.c_void_p).value,
             3,
         )
-        _check(
-            _hip_lib().hipModuleLaunchKernel(
+        check_hip(
+            hip_lib().hipModuleLaunchKernel(
                 self.fn,
                 grid[0],
                 grid[1],
@@ -198,10 +153,12 @@ def asm_kernel_available() -> bool:
     failure disables the kernel for the rest of the process."""
     global _available
     if _available is None:
-        arch = ""
-        if torch.version.hip and torch.cuda.is_available():
-            arch = torch.cuda.get_device_properties(0).gcnArchName
-        _available = arch.startswith("gfx950") and os.path.exists(_clang())
+        hip = current_arch().hip
+        _available = (
+            hip is not None
+            and hip.gcn_arch.startswith("gfx950")
+            and os.path.exists(_clang())
+        )
     return _available and _disabled_reason is None
 
 
@@ -301,9 +258,7 @@ def _magic_u32(d):
 
 
 def mtp_verify_attn_num_segments(num_seqs: int, num_kv_heads: int) -> int:
-    num_cus = torch.cuda.get_device_properties(
-        torch.cuda.current_device()
-    ).multi_processor_count
+    num_cus = current_arch().num_sms
     segs = max(1, num_cus // max(1, num_seqs * num_kv_heads))
     segs = 1 << (segs.bit_length() - 1)
     return max(1, min(64, segs))
@@ -315,12 +270,7 @@ _SEG_PLAN_TARGET_WGS = None
 def _seg_plan_target_wgs() -> int:
     global _SEG_PLAN_TARGET_WGS
     if _SEG_PLAN_TARGET_WGS is None:
-        _SEG_PLAN_TARGET_WGS = max(
-            1,
-            torch.cuda.get_device_properties(
-                torch.cuda.current_device()
-            ).multi_processor_count,
-        )
+        _SEG_PLAN_TARGET_WGS = max(1, current_arch().num_sms)
     return _SEG_PLAN_TARGET_WGS
 
 

@@ -5,6 +5,7 @@ import time
 import unittest
 from array import array
 from contextlib import ExitStack
+from queue import Queue
 from types import SimpleNamespace
 from unittest import mock
 
@@ -40,10 +41,8 @@ from sglang.srt.mem_cache.static_kv_storage import acquire_rows
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeComponentHostSlot,
 )
-from sglang.srt.mem_cache.unified_cache.components.base import (
-    CacheTransferPhase,
-    ComponentType,
-)
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.mem_cache.unified_cache.components.base import CacheTransferPhase
 from sglang.srt.mem_cache.unified_cache.storage_attachment import StorageAttachment
 from sglang.srt.mem_cache.unified_radix_cache import (
     UnifiedRadixCache,
@@ -405,8 +404,8 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         lambda cfg: cfg.has_swa and not cfg.has_mamba,
         "SWA-only fixture required to exercise extra pool",
     )
-    def test_release_aborted_request_l3_prefetch_io_in_progress(self):
-        """release_aborted_request while a prefetch IO is still in progress; the IO
+    def test_abandon_attempt_l3_prefetch_io_in_progress(self):
+        """_abandon_attempt while a prefetch IO is still in progress; the IO
         thread owns the buffers until it finishes."""
 
         # SWA prefetch is all-or-nothing over one full sliding window: size the
@@ -522,8 +521,8 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         lambda cfg: cfg.has_swa and not cfg.has_mamba,
         "SWA-only fixture required to exercise extra pool",
     )
-    def test_release_aborted_request_l3_prefetch_io_done(self):
-        """release_aborted_request after the prefetch IO completed releases the
+    def test_abandon_attempt_l3_prefetch_io_done(self):
+        """_abandon_attempt after the prefetch IO completed releases the
         buffers."""
 
         # SWA prefetch is all-or-nothing over one full sliding window: size the
@@ -2546,6 +2545,81 @@ class TestUnifiedTreeCoreSWAPrefetchBackends(UnifiedRadixCacheFixtures, CustomTe
 
 class TestPrefetchCommitOrdering(CustomTestCase):
     """The prefetch commit's action ordering (mock-based)."""
+
+    def test_hybrid_prefetch_rejects_partial_host_allocation(self):
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+            HybridCacheController,
+        )
+
+        for component, pool in (
+            (ComponentType.SWA, PoolName.SWA),
+            (ComponentType.MAMBA, PoolName.MAMBA),
+        ):
+            with self.subTest(component=component):
+                cache = mock.MagicMock()
+                cache.host_memory_mode = "cache"
+                cache.page_size = 4
+                cache.prefetch_threshold = 4
+                cc = cache.cache_controller
+                cc.page_size = cache.page_size
+                cc.mem_pool_host.anchor_entry.host_pool = object()
+                cc.mem_pool_host.available_size.return_value = 4
+                cc.prefetch_hit_queue = Queue()
+                cc.prefetch_buffer = Queue()
+                cc.allocate_storage_hit = (
+                    HybridCacheController.allocate_storage_hit.__get__(cc)
+                )
+
+                # A full hit cannot fit, but a page-sized partial allocation can.
+                def allocate_host_buffers(operation, num_tokens):
+                    return list(range(num_tokens)) if num_tokens <= 4 else None
+
+                cc.alloc_prefetch_host_buffers.side_effect = allocate_host_buffers
+                operation = mock.Mock()
+                operation.handle = CacheRequestHandle("hybrid-capacity", 0)
+                operation.storage_start = 4
+                operation.storage_hit_count = 8
+                operation.hash_value = ["h1", "h2"]
+                operation.host_indices = None
+                operation.is_terminated.return_value = False
+                cache.ongoing_prefetch = {
+                    operation.handle: _OngoingPrefetch(
+                        anchor_node_id=0,
+                        prefetch_key=RadixKey(array("q", range(8))),
+                        host_indices=None,
+                        operation=operation,
+                        anchor_lock_params=None,
+                        comp_xfers={component: [PoolTransfer(name=pool)]},
+                    )
+                }
+                cc.prefetch_hit_queue.put(operation)
+
+                UnifiedRadixCache._drain_storage_control_queues_impl(
+                    cache,
+                    n_storage_hit=1,
+                    n_ack_prefetch=0,
+                    n_backup=0,
+                    n_release=0,
+                    extra_release_counts=None,
+                    log_metrics=False,
+                )
+
+                self.assertEqual(
+                    cc.alloc_prefetch_host_buffers.call_args_list,
+                    [mock.call(operation, 8), mock.call(operation, 8)],
+                )
+                self.assertTrue(cc.prefetch_buffer.empty())
+                self.assertIsNone(operation.host_indices)
+                self.assertEqual(operation.storage_hit_count, 8)
+                self.assertEqual(operation.hash_value, ["h1", "h2"])
+                cache._alloc_prefetch_aux_staging.assert_not_called()
+                cache._finish_storage_prefetch.assert_called_once_with(
+                    operation.handle, fulfilled_tokens=0, reason="host_capacity"
+                )
+                cache.revoke_pending_prefetch.assert_called_once_with(operation.handle)
+                cache.storage_prefetch_retries.poll_miss.assert_called_once_with(
+                    operation.handle.rid, 12
+                )
 
     def test_prefetch_commit_applies_host_insert_actions_before_transfers(self):
         """The prefetch commit applies the host-insert walk's actions before

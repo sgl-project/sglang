@@ -155,6 +155,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "lora_triton",
     "lora_marlin",
     "hpc_ops",  # HPC-Ops (https://github.com/Tencent/hpc-ops), FP8 MoE on Hopper (SM90) only
+    "gluon",
     "megamoe",
     "intel_xpu",
 ]
@@ -177,6 +178,8 @@ FP8_GEMM_RUNNER_BACKEND_CHOICES = [
     "cutlass",
     "triton",
     "aiter",
+    "halops",
+    "xpu_scaled_mm",
 ]
 
 FP4_GEMM_RUNNER_BACKEND_CHOICES = [

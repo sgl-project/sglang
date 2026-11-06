@@ -30,8 +30,7 @@ from __future__ import annotations
 import hashlib
 import warnings
 from dataclasses import dataclass
-from enum import IntEnum, auto
-from functools import lru_cache, total_ordering
+from functools import lru_cache
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
 
 import torch
@@ -55,6 +54,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     ForwardBatchDeepSeekMHAMixin,
 )
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.runtime_context import (
     get_exec,
     get_flags,
@@ -70,7 +70,8 @@ from sglang.srt.utils import (
     is_npu,
     support_triton,
 )
-from sglang.srt.utils.common import ceil_align, is_pin_memory_available
+from sglang.srt.utils.common import ceil_align
+from sglang.srt.utils.device import is_pin_memory_available
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -79,7 +80,8 @@ if TYPE_CHECKING:
     from sglang.srt.layers.engram_staging import StagedRows
     from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-    from sglang.srt.managers.schedule_batch import MultimodalInputs, ScheduleBatch
+    from sglang.srt.managers.req_types import MultimodalInputs
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.mem_cache.kv.alloc.iteration_ids import Cols, IterationIds
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -233,124 +235,6 @@ def _elastic_should_preserve_local_token_counts(
 
     uneven_token_count = len(set(global_num_tokens)) > 1
     return uneven_token_count
-
-
-class ForwardMode(IntEnum):
-    # Extend a sequence. The KV cache of the beginning part of the sequence is already computed (e.g., system prompt).
-    # It is also called "prefill" in common terminology.
-    EXTEND = auto()
-    # Decode one token.
-    DECODE = auto()
-    # Contains both EXTEND and DECODE when doing chunked prefill.
-    MIXED = auto()
-    # No sequence to forward. For data parallel attention, some workers will be IDLE if no sequence are allocated.
-    IDLE = auto()
-
-    # Used in speculative decoding: verify a batch in the target model.
-    TARGET_VERIFY = auto()
-    # Used in speculative decoding: extend a batch in the draft model.
-    DRAFT_EXTEND_V2 = auto()
-
-    # Used in disaggregated decode worker
-    # Represent a batch of requests having their KV cache ready to start decoding
-    PREBUILT = auto()
-
-    # Used in dLLM
-    DLLM_EXTEND = auto()
-
-    def is_prefill(self, include_draft_extend_v2: bool = False):
-        return self.is_extend(include_draft_extend_v2=include_draft_extend_v2)
-
-    def is_extend(self, include_draft_extend_v2: bool = False):
-        return (
-            self == ForwardMode.EXTEND
-            or self == ForwardMode.MIXED
-            or (include_draft_extend_v2 and self == ForwardMode.DRAFT_EXTEND_V2)
-            or self == ForwardMode.TARGET_VERIFY
-            or self == ForwardMode.DLLM_EXTEND
-        )
-
-    def is_context_parallel_extend(self, include_draft_extend_v2: bool = False):
-        return (
-            self == ForwardMode.EXTEND
-            or self == ForwardMode.MIXED
-            or (
-                self == ForwardMode.DRAFT_EXTEND_V2
-                if include_draft_extend_v2
-                else False
-            )
-        )
-
-    def is_decode(self):
-        return self == ForwardMode.DECODE
-
-    def is_mixed(self):
-        return self == ForwardMode.MIXED
-
-    def is_idle(self):
-        return self == ForwardMode.IDLE
-
-    def is_decode_or_idle(self):
-        return self == ForwardMode.DECODE or self == ForwardMode.IDLE
-
-    def is_target_verify(self):
-        return self == ForwardMode.TARGET_VERIFY
-
-    def is_draft_extend_v2(self):
-        # For fixed shape logits output in eagle v2 worker
-        return self == ForwardMode.DRAFT_EXTEND_V2
-
-    def is_extend_or_draft_extend_or_mixed(self, include_draft_extend_v2: bool = False):
-        return (
-            self == ForwardMode.EXTEND
-            or self == ForwardMode.MIXED
-            or (include_draft_extend_v2 and self == ForwardMode.DRAFT_EXTEND_V2)
-        )
-
-    def is_cuda_graph(self):
-        return (
-            self == ForwardMode.DECODE
-            or self == ForwardMode.TARGET_VERIFY
-            or self == ForwardMode.IDLE
-            or self == ForwardMode.DLLM_EXTEND
-        )
-
-    def is_cpu_graph(self):
-        return self == ForwardMode.DECODE
-
-    def is_dllm_extend(self):
-        return self == ForwardMode.DLLM_EXTEND
-
-    def is_extend_without_speculative(self):
-        return self.is_extend() and not self.is_target_verify()
-
-    def is_prebuilt(self):
-        return self == ForwardMode.PREBUILT
-
-    def is_dllm_extend(self):
-        return self == ForwardMode.DLLM_EXTEND
-
-
-@total_ordering
-class CaptureHiddenMode(IntEnum):
-    # Do not capture anything.
-    NULL = 0
-    # Capture a hidden state of the last token.
-    LAST = 1
-    # Capture hidden states of all tokens.
-    FULL = 2
-
-    def need_capture(self):
-        return self != CaptureHiddenMode.NULL
-
-    def is_full(self):
-        return self == CaptureHiddenMode.FULL
-
-    def is_last(self):
-        return self == CaptureHiddenMode.LAST
-
-    def __lt__(self, other):
-        return self.value < other.value
 
 
 def get_server_return_hidden_states_mode() -> CaptureHiddenMode:
@@ -624,8 +508,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For two-batch overlap
     tbo_split_seq_index: Optional[int] = None
 
-    # Unlimited-OCR v2: the decode CUDA graph loads input_ids and positions itself.
-    uocr_graph_io_deferred: bool = False
+    # the decode graph owns input_ids and positions until replay or eager fallback
+    input_ids_from_graph: bool = False
 
     # === Borrowed from ScheduleBatch: host metadata (CPU lists / mirrors) ===
     # Optional seq_lens on cpu (CPU mirror of seq_lens)
@@ -667,6 +551,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # True for synthetic capture batches; init_new snapshots real request ranges.
     # Running decode rows do not complete a prefill.
     contains_last_prefill_chunk: bool = True
+    # Per-request completion of an extend (including resumed/retracted prompts).
+    # None for decode and synthetic capture batches. Running decode requests in
+    # a mixed batch also end at a prediction boundary.
+    extend_is_final_cpu: Optional[List[bool]] = None
     # For LoRA
     lora_ids: Optional[List[str]] = None
     # For dumper: request IDs for cross-step sequence tracking
@@ -1015,7 +903,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         pp_loras: Optional[set[Optional[str]]] = None,
         iteration_ids: Optional[IterationIds] = None,
         write_cols: Optional[Cols] = None,
-        uocr_graph_io_deferred: bool = False,
+        input_ids_from_graph: bool = False,
     ):
         # init_new must not mutate ScheduleBatch; use explicit forward overrides.
         # Speculative forwards share iteration_ids and select their write_cols;
@@ -1066,11 +954,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             batch.seq_lens_sum = int(seq_lens_cpu.sum())
 
         contains_last_prefill_chunk = False
+        extend_is_final_cpu = None
         if batch.forward_mode.is_extend_without_speculative():
             decoding_req_ids = {id(req) for req in (batch.decoding_reqs or ())}
-            contains_last_prefill_chunk = any(
-                req.extend_end == len(req.full_untruncated_fill_ids)
+            extend_is_final_cpu = [
+                id(req) in decoding_req_ids
+                or req.extend_end == len(req.full_untruncated_fill_ids)
                 for req in batch.reqs
+            ]
+            contains_last_prefill_chunk = any(
+                final
+                for req, final in zip(batch.reqs, extend_is_final_cpu)
                 if id(req) not in decoding_req_ids
             )
 
@@ -1134,11 +1028,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             global_forward_mode=batch.global_forward_mode,
             is_prefill_only=batch.is_prefill_only,
             contains_last_prefill_chunk=contains_last_prefill_chunk,
+            extend_is_final_cpu=extend_is_final_cpu,
             spec_algorithm=batch.spec_algorithm,
             capture_hidden_mode=capture_hidden_mode,
             return_hidden_states_before_norm=return_hidden_states_before_norm,
             tbo_split_seq_index=batch.tbo_split_seq_index,
-            uocr_graph_io_deferred=uocr_graph_io_deferred,
+            input_ids_from_graph=input_ids_from_graph,
             # Host-side metadata
             top_logprobs_nums=batch.top_logprobs_nums,
             token_ids_logprobs=batch.token_ids_logprobs,
@@ -1275,7 +1170,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         # Init position information
         if ret.forward_mode.is_decode() or ret.forward_mode.is_target_verify():
-            if ret.positions is None and not ret.uocr_graph_io_deferred:
+            if ret.positions is None and not ret.input_ids_from_graph:
                 ret.positions = clamp_position(batch.seq_lens)
         else:
             if isinstance(extend_seq_lens, list):
@@ -1456,7 +1351,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         A replicated (``sharded=False``) forward keeps the full DP-group count.
         """
-        from sglang.srt.utils.common import require_mlp_tp_gather
+        from sglang.srt.layers.dp_attention import require_mlp_tp_gather
 
         if self.global_num_tokens_cpu is not None:
             # DP / MLP-sync path: per-DP padded width.

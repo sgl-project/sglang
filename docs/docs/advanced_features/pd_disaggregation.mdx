@@ -109,6 +109,8 @@ Serving-side capability enforcement is tracked in [#39122](https://github.com/sg
 uv pip install mooncake-transfer-engine
 ```
 
+On Intel XPU, the PyPI wheel has no XPU support. Use the XPU Docker image (`docker/xpu.Dockerfile`), or build Mooncake from source with icpx and `-DUSE_XPU=ON -DUSE_TENT=ON`; see [Intel GPUs (XPU)](../hardware-platforms/xpu) for the runtime settings.
+
 ### AWS EFA
 
 #### EFA Docker images
@@ -302,7 +304,7 @@ To utilize Intra-Node NVLink for KV cache transfers with the Mooncake backend (r
 export SGLANG_MOONCAKE_CUSTOM_MEM_POOL=INTRA_NODE_NVLINK
 export MC_INTRANODE_NVLINK=true
 ```
-The `SGLANG_MOONCAKE_CUSTOM_MEM_POOL` environment variable enables the custom memory pool. Supported values are `NVLINK` (or `True`), `BAREX`, and `INTRA_NODE_NVLINK`.
+The `SGLANG_MOONCAKE_CUSTOM_MEM_POOL` environment variable enables the custom memory pool. Supported values are `NVLINK` (or `True`), `BAREX`, and `INTRA_NODE_NVLINK`. These pools use Mooncake's CUDA allocators and are CUDA-only; do not set them on Intel XPU.
 
 #### Prefill Server Configuration
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
@@ -477,6 +479,8 @@ git clone https://github.com/ai-dynamo/nixl.git
 cd nixl
 pip install . --config-settings=setup-args="-Ducx_path=/path/to/ucx"
 ```
+
+On Intel XPU, the PyPI wheel's bundled UCX has no Level Zero transport. Use the XPU Docker image (`docker/xpu.Dockerfile`), or build UCX with `--with-ze` and NIXL against it; see [Intel GPUs (XPU)](../hardware-platforms/xpu).
 
 
 ### Usage

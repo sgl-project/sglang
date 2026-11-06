@@ -25,6 +25,7 @@ import torch.distributed as dist
 
 from sglang.srt.configs.model_config import get_dsa_mtp_topk_width, is_deepseek_dsa
 from sglang.srt.disaggregation.base import KVPoll
+from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
@@ -50,7 +51,6 @@ if TYPE_CHECKING:
 #########################
 # Constants & Enums
 #########################
-FAKE_BOOTSTRAP_HOST = "2.2.2.2"
 
 
 def pp_sync_polls(
@@ -147,20 +147,6 @@ def get_qsa_pending_state_indices(req: Req) -> np.ndarray:
     return np.array([int(req_pool_idx)], dtype=np.int32)
 
 
-class DisaggregationMode(Enum):
-    NULL = "null"
-    PREFILL = "prefill"
-    DECODE = "decode"
-
-    @staticmethod
-    def to_engine_type(mode: str) -> str:
-        if mode == DisaggregationMode.PREFILL.value:
-            return "prefill"
-        elif mode == DisaggregationMode.DECODE.value:
-            return "decode"
-        return "unified"
-
-
 def disagg_transfers_in_flight(scheduler):
     """A PD node's pin source over the unified memory pool.
 
@@ -188,16 +174,13 @@ def disagg_transfers_in_flight(scheduler):
     def busy() -> bool:
         if scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
             return bool(
-                scheduler.disagg_prefill_inflight_queue
+                scheduler.disagg_prefill_transfer_queue
                 or scheduler.disagg_prefill_pending_chunk_rids
             )
         if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
             decode_offload_manager = scheduler.decode_offload_manager
             return bool(
-                any(
-                    not decode_req.host_staged
-                    for decode_req in scheduler.disagg_decode_transfer_queue.queue
-                )
+                scheduler.disagg_decode_prealloc_queue.has_device_destinations
                 or scheduler.disagg_decode_prealloc_queue.has_published_destinations
                 or (
                     decode_offload_manager is not None
@@ -1596,7 +1579,7 @@ def setup_state_kv_args(
         else None
     )
     for entry in storage.wire_entries():
-        region = storage.regions(entry.sub_pool)
+        region = storage.regions(entry.sub_pool, part=entry.part)
         state_type = _wire_state_type(entry.state_type)
         append_state_component(
             kv_args,
@@ -1665,7 +1648,7 @@ def get_pd_kv_layout(token_to_kv_pool) -> Optional[str]:
 
 
 def prepare_abort(req: Req, error_message: str, status_code=None):
-    from sglang.srt.managers.schedule_batch import FINISH_ABORT
+    from sglang.srt.managers.req_types import FINISH_ABORT
 
     # populate finish metadata and stream output
     req.finish_outside_step(FINISH_ABORT(error_message, status_code))
@@ -1709,7 +1692,7 @@ def is_unadmitted_reject(req: Req) -> bool:
 
 
 def is_aborted(req: Req) -> bool:
-    from sglang.srt.managers.schedule_batch import FINISH_ABORT
+    from sglang.srt.managers.req_types import FINISH_ABORT
 
     return isinstance(req.to_finish, FINISH_ABORT) or isinstance(
         req.finished_reason, FINISH_ABORT
