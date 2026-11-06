@@ -983,6 +983,20 @@ class GroupCoordinator:
                 self.pymscclpp_comm is not None
                 and self.pymscclpp_comm.should_mscclpp_allreduce(input_)
             )
+        # Quick reduce goes before ``ca``: ``qr_comm`` is only built, and only
+        # leaves ``disabled``, when the user opts in with
+        # ROCM_QUICK_REDUCE_QUANTIZATION, and ``should_quick_allreduce`` admits
+        # only sizes at or above the kernel-tested quick-reduce/custom-AR
+        # crossover (``_QR_MIN_SIZE``). Custom AR accepts everything up to its own
+        # ``max_size`` -- 1 GiB for the AITER backend that is the ROCm default --
+        # which covers that whole crossover band, so with ``ca`` first the opt-in
+        # had no effect at all.
+        if (
+            self.qr_comm is not None
+            and not self.qr_comm.disabled
+            and self.qr_comm.should_quick_allreduce(input_)
+        ):
+            return "qr"
         if (
             self.ca_comm is not None
             and not self.ca_comm.disabled
@@ -1000,12 +1014,6 @@ class GroupCoordinator:
             and self.pcie_ipc_comm.should_pcie_ipc_ar(input_)
         ):
             return "pcie_ipc"
-        if (
-            self.qr_comm is not None
-            and not self.qr_comm.disabled
-            and self.qr_comm.should_quick_allreduce(input_)
-        ):
-            return "qr"
         if self.pymscclpp_comm is not None and should_use_pymscclpp_allreduce:
             return "pymscclpp"
         if (
