@@ -158,6 +158,17 @@ def _index_q_inputs(tokens: int, heads: int, kind: str, gen: torch.Generator):
     elif kind == "grid_ties":
         grid = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0, 6.0], device=device)
         x = x.sign() * grid[torch.randint(0, 8, shape, device=device, generator=gen)]
+    elif kind == "extreme":
+        # Per-row scales across the whole bf16 exponent range, subnormals included.
+        exponent = torch.randint(
+            -150, 126, (tokens, heads, 1), device=device, generator=gen
+        )
+        x = x * torch.exp2(exponent.float())
+    elif kind == "nonfinite":
+        u = torch.rand(shape, device=device, generator=gen)
+        x = torch.where(u < 0.003, float("inf"), x)
+        x = torch.where((u >= 0.003) & (u < 0.006), float("-inf"), x)
+        x = torch.where((u >= 0.006) & (u < 0.009), float("nan"), x)
     x = x.bfloat16()
     if kind == "sparse":
         # Signed zeros: the packer clears the -0 code.
@@ -170,9 +181,15 @@ def _index_q_inputs(tokens: int, heads: int, kind: str, gen: torch.Generator):
     return x, positions, head_weights
 
 
-@pytest.mark.skipif(_is_xpu, reason="CUDA JIT kernel")
+@pytest.mark.skipif(
+    _is_xpu
+    or not torch.cuda.is_available()
+    or torch.cuda.get_device_capability()[0] != 10,
+    reason="Only SM100-family GPUs take the block kernel; elsewhere both calls use the warp kernel",
+)
 @pytest.mark.parametrize(
-    "kind", ["normal", "row_scales", "sparse", "tiny", "grid_ties"]
+    "kind",
+    ["normal", "row_scales", "sparse", "tiny", "grid_ties", "extreme", "nonfinite"],
 )
 @pytest.mark.parametrize("pos_dtype", [torch.int32, torch.int64])
 def test_index_q_rope_pack_prefill_matches_decode_kernel(kind, pos_dtype) -> None:
