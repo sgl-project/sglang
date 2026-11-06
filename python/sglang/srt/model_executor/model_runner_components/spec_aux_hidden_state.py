@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import msgspec
 
-from sglang.srt.configs.model_config import ModelConfig, is_deepseek_v4
+from sglang.srt.configs.model_config import ModelConfig, uses_compressed_kv_attention
 from sglang.srt.runtime_context import get_exec, get_spec
 
 if TYPE_CHECKING:
@@ -177,7 +177,10 @@ def _resolve_eagle_aux_hidden_state(
     else:
         return
 
-    if draft_model_config.is_hybrid_swa and not draft_model_config.is_deepseek_v4_arch:
+    if (
+        draft_model_config.is_hybrid_swa
+        and not draft_model_config.is_compressed_kv_arch
+    ):
         config.eagle_draft_swa_num_layers = len(
             draft_model_config.swa_attention_layer_ids
         )
@@ -273,7 +276,7 @@ def _resolve_dflash_aux_hidden_state(
             if dspark_draft_config.target_layer_ids is not None:
                 target_layer_ids = list(dspark_draft_config.target_layer_ids)
                 # Dense DSpark drafts build num_hidden_layers stages instead.
-                if is_deepseek_v4(draft_model_config.hf_config):
+                if uses_compressed_kv_attention(draft_model_config.hf_config):
                     config.dspark_num_stages = len(target_layer_ids)
 
         config.dflash_use_aux_hidden_state = True

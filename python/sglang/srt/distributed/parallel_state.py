@@ -86,11 +86,6 @@ _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _is_musa = is_musa()
 _is_mlu = is_mlu()
-# Under CUDA-graph capture, stage aiter custom all-gather / reduce-scatter inputs
-# through the pre-registered IPC pool instead of registering graph-pool tensors:
-# the registered path makes peers read stale data over IPC on replay (garbage
-# rows / NaN under DP attention + TP MoE on MI355X). Set to 0 to restore it.
-_AITER_CAPTURE_COPY_IN = os.environ.get("SGLANG_AITER_CAPTURE_COPY_IN", "0") == "1"
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
@@ -1217,7 +1212,10 @@ class GroupCoordinator:
             return False
         if getattr(ca_comm, "_IS_CAPTURING", False):
             if torch.cuda.is_current_stream_capturing():
-                if envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get() or _AITER_CAPTURE_COPY_IN:
+                if (
+                    envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
+                    or envs.SGLANG_AITER_CAPTURE_COPY_IN.get()
+                ):
                     ca_comm.reduce_scatter(input, output, registered=False)
                 else:
                     ca_comm.reduce_scatter(input, output, registered=True)
@@ -1334,7 +1332,7 @@ class GroupCoordinator:
                 if torch.cuda.is_current_stream_capturing():
                     if (
                         envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
-                        or _AITER_CAPTURE_COPY_IN
+                        or envs.SGLANG_AITER_CAPTURE_COPY_IN.get()
                     ):
                         ca_comm.all_gather_unreg(input, out=output, dim=0)
                     else:
@@ -2598,8 +2596,9 @@ def initialize_model_parallel(
             the KV cache across GPUs within each tensor-parallel group during
             decoding. Must be a divisor of `tp_size` and is currently only
             supported on the AMD HIP platform.
-        shared_experts_tp_size: optional shared-expert TP width. Must divide
-            attention TP; subgroups never cross attention replicas.
+        shared_experts_tp_size: optional shared-expert TP width. May span
+            interleave prefill CP within one attention replica; the validated
+            width divides attention TP x CP and never crosses DP or PP.
 
     Let's say we have a total of 8 GPUs denoted by g0 ... g7 and we
     use 2 GPUs to parallelize the model tensor, and 4 GPUs to parallelize
@@ -2831,8 +2830,9 @@ def initialize_model_parallel(
         if shared_experts_tensor_parallel_size == attn_tp_size:
             _SHARED_EXPERTS_TP = _ATTN_TP
         else:
-            # Attention TP groups are contiguous, and the requested width
-            # divides each one. These groups also stay inside their PP stage.
+            # Rank layout is [PP, attention DP, CP, attention TP]. The
+            # validated width divides attention TP x CP, so contiguous groups
+            # may span interleave PCP but never cross DP replicas or PP stages.
             shared_size = shared_experts_tensor_parallel_size
             shared_group_ranks = [
                 list(range(start, start + shared_size))

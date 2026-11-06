@@ -489,11 +489,13 @@ def _make_mtp_configurator(use_mla=True):
     return kvc, target
 
 
-def _build_mtp_pool(kvc, *, capacity=128, is_dsa_model=False, is_dsv4_model=False):
+def _build_mtp_pool(
+    kvc, *, capacity=128, is_dsa_model=False, is_compressed_kv_model=False
+):
     return kvc._build_token_to_kv_pool(
         sizes=SimpleNamespace(max_total_num_tokens=capacity),
         is_dsa_model=is_dsa_model,
-        is_dsv4_model=is_dsv4_model,
+        is_compressed_kv_model=is_compressed_kv_model,
         req_to_token_pool=None,
     )
 
@@ -553,7 +555,7 @@ class TestMTPKVShardConfig(CustomTestCase):
                     kvc._build_token_to_kv_pool_allocator(
                         sizes=SimpleNamespace(max_total_num_tokens=128),
                         token_to_kv_pool=pool,
-                        is_dsv4_model=False,
+                        is_compressed_kv_model=False,
                         req_to_token_pool=None,
                         token_to_kv_pool_allocator=allocator,
                     ),
@@ -670,7 +672,7 @@ class TestMTPKVShardConfig(CustomTestCase):
                 _build_mtp_pool(kvc)
         for options, message in (
             ({"is_dsa_model": True}, "same DSA indexer layout"),
-            ({"is_dsv4_model": True}, "MLA, DSA and MHA"),
+            ({"is_compressed_kv_model": True}, "MLA, DSA and MHA"),
         ):
             with (
                 self.subTest(options=options),

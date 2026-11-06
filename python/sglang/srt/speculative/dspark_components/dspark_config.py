@@ -49,11 +49,11 @@ def _draft_hf_config() -> Optional[Any]:
     )
 
 
-def draft_is_deepseek_v4() -> bool:
-    from sglang.srt.configs.model_config import is_deepseek_v4
+def draft_uses_compressed_kv_attention() -> bool:
+    from sglang.srt.configs.model_config import uses_compressed_kv_attention
 
     draft_hf_config = _draft_hf_config()
-    return draft_hf_config is not None and is_deepseek_v4(draft_hf_config)
+    return draft_hf_config is not None and uses_compressed_kv_attention(draft_hf_config)
 
 
 def _translated_draft_hf_config() -> Optional[Any]:
