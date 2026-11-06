@@ -2641,8 +2641,12 @@ class DeepseekV2AttentionMLA(
 
     def q_b_proj_forward(self, q_lora: torch.Tensor) -> torch.Tensor:
         if self._use_min_latency_q_b_gemm is None:
+            # Like the fused QKV-A GEMM in prepare_qkv_latent: the min-latency
+            # kernel only serves M <= 16, so a token's q would depend on the
+            # batch size under deterministic inference.
             self._use_min_latency_q_b_gemm = (
                 self._q_b_proj_verified_shape
+                and not get_exec().deterministic.enable_deterministic_inference
                 and fused_a_gemm_weight_eligible(
                     self.q_b_proj, backend=self.fused_a_gemm_backend
                 )
