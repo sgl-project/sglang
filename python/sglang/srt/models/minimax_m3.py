@@ -944,7 +944,6 @@ class MiniMaxM3Attention(nn.Module):
         # selects it and its KV pool, so the three cannot disagree.
         self._fp8_q_epilogue_ok = (
             self._combined_qknorm_ok
-            and envs.SGLANG_OPT_USE_MINIMAX_FP8_Q_EPILOGUE.get()
             and uses_minimax_m3_nvfp4_native_stack(
                 quant_config.get_name() if quant_config is not None else None
             )
