@@ -32,6 +32,37 @@ def available() -> bool:
     return hip is not None and hip.gcn_arch == "gfx950"
 
 
+def covers(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    ssm_states: torch.Tensor,
+    *,
+    A_log: torch.Tensor | None,
+    dt_bias: torch.Tensor | None,
+    lower_bound: float | None,
+    beta_is_raw: bool,
+) -> bool:
+    """Whether the kernel handles these shapes, dtypes and gate settings."""
+    return (
+        available()
+        and lower_bound == -5.0
+        and beta_is_raw
+        and A_log is not None
+        and dt_bias is not None
+        and all(x.dtype == torch.bfloat16 for x in (q, k, v, g, beta))
+        and ssm_states.dtype == torch.float32
+        and ssm_states.is_contiguous()
+        and q.shape == k.shape == v.shape == g.shape
+        and q.ndim == 4
+        and q.shape[0] == 1
+        and q.shape[-1] == 128
+        and ssm_states.shape[-2:] == (128, 128)
+    )
+
+
 def extend(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -60,10 +91,10 @@ def extend(
     track_chunk_idx = kwargs.get("track_chunk_idx")
     track_ssm_h_src = kwargs.get("track_ssm_h_src")
     if not (
-        available()
         # spec-decode extends stay on the reference path
-        and not kwargs.get("is_spec_decode", False)
-        # breakable prefill CUDA graphs pass padded chunk tables
+        not kwargs.get("is_spec_decode", False)
+        # breakable prefill CUDA graphs pass padded chunk tables; their extend
+        # reaches this kernel through kda_prefill_graph's eager break instead
         and kwargs.get("chunk_indices") is None
         and (track_state is None) == (track_chunk_idx is None)
         # aligned-only tracking reads the final state, so h is not needed
@@ -72,18 +103,18 @@ def extend(
             and track_state is None
             and (track_ssm_h_src is None or track_ssm_h_src.numel() > 0)
         )
-        and lower_bound == -5.0
-        and beta_is_raw
-        and A_log is not None
-        and dt_bias is not None
-        and all(x.dtype == torch.bfloat16 for x in (q, k, v, g, beta))
-        and ssm_states.dtype == torch.float32
-        and ssm_states.is_contiguous()
-        and q.shape == k.shape == v.shape == g.shape
-        and q.ndim == 4
-        and q.shape[0] == 1
-        and q.shape[-1] == 128
-        and ssm_states.shape[-2:] == (128, 128)
+        and covers(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            ssm_states,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            lower_bound=lower_bound,
+            beta_is_raw=beta_is_raw,
+        )
     ):
         return None
     # the launch layout depends on the longest sequence; T bounds it without a sync

@@ -33,6 +33,7 @@ import numpy as np
 import torch
 import triton
 
+from sglang.kernels.ops.attention.linear import kda_gfx950_prefill
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     CAUSAL_CONV1D_FWD_BLOCK_M,
     PAD_SLOT_ID,
@@ -49,6 +50,10 @@ from sglang.srt.layers.attention.linear.kda_flashinfer_prefill_graph import (
 )
 from sglang.srt.layers.attention.mamba.prefill_track_metadata import (
     build_prefill_track_plan,
+)
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    eager_on_graph,
+    is_in_breakable_cuda_graph,
 )
 
 if TYPE_CHECKING:
@@ -98,6 +103,9 @@ class KDAPrefillGraphMetadata(msgspec.Struct, frozen=True):
     track_conv_start: torch.Tensor  # [max_seqs]
     num_logical_tokens: torch.Tensor  # [1]
     host: np.ndarray  # int32 staging for `packed`
+    # Host (sequences, sequences with a real state slot, longest sequence,
+    # tokens) of the batch, read by the gfx950 HIP extend's eager break.
+    host_batch: np.ndarray
 
     # Filled on the device from the batch.
     cache_indices: torch.Tensor  # [max_seqs], PAD_SLOT_ID past the batch
@@ -148,6 +156,7 @@ class KDAPrefillGraphMetadata(msgspec.Struct, frozen=True):
             track_conv_start=views[6],
             num_logical_tokens=views[7],
             host=np.zeros(sum(sizes), dtype=np.int32),
+            host_batch=np.zeros(4, dtype=np.int64),
             cache_indices=torch.full(
                 (max_seqs,), PAD_SLOT_ID, dtype=cache_index_dtype, device=device
             ),
@@ -180,14 +189,20 @@ class KDAPrefillGraphMetadata(msgspec.Struct, frozen=True):
         cache_indices: torch.Tensor,
         extend_prefix_lens: torch.Tensor,
         track_rows: Optional[KDAPrefillTrackRows],
+        num_real_seqs: Optional[int] = None,
     ) -> None:
         """Rebuild the tables for this batch. ``cache_indices`` and
-        ``extend_prefix_lens`` are the batch's device tensors."""
+        ``extend_prefix_lens`` are the batch's device tensors; rows from
+        ``num_real_seqs`` on are padding whose slots are PAD_SLOT_ID."""
         bs = len(extend_seq_lens)
         assert self.can_fit(extend_seq_lens), (
             f"batch of {bs} sequences / {sum(extend_seq_lens)} tokens exceeds the "
             f"captured bounds ({self.max_seqs} / {self.num_tokens})"
         )
+        self.host_batch[0] = bs
+        self.host_batch[1] = bs if num_real_seqs is None else min(bs, num_real_seqs)
+        self.host_batch[2] = max(extend_seq_lens, default=0)
+        self.host_batch[3] = sum(extend_seq_lens)
         self._write_host_tables(
             lens=np.asarray(extend_seq_lens, dtype=np.int64), track_rows=track_rows
         )
@@ -314,6 +329,79 @@ def build_track_rows(
     )
 
 
+def _chunk_extend_on_tables(
+    q, k, v, g, beta, ssm_states, h_track, *, meta, kernel_dispatcher, layer
+):
+    return kernel_dispatcher.extend(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        ssm_states=ssm_states,
+        cache_indices=meta.cache_indices,
+        query_start_loc=meta.cu_seqlens,
+        A_log=layer.A_log,
+        dt_bias=layer.dt_bias,
+        lower_bound=layer.lower_bound,
+        beta_is_raw=True,
+        extend_seq_lens_cpu=None,
+        is_spec_decode=False,
+        return_intermediate_states=False,
+        track_state=h_track,
+        track_chunk_idx=meta.track_chunk_idx if meta.track else None,
+        chunk_indices=meta.chunk_indices,
+        chunk_offsets=meta.chunk_offsets,
+    )
+
+
+@eager_on_graph
+def _hip_extend_between_segments(
+    q, k, v, g, beta, ssm_states, h_track, out, *, meta, kernel_dispatcher, layer
+):
+    """gfx950 HIP extend on the batch's real rows and tokens, written into
+    ``out``. The kernel reads every row's state slot and picks its launch layout
+    from the host token count, row count and longest row, so it cannot be
+    captured over the bucket's padded rows; on the real rows it matches the
+    eager extend bitwise."""
+    bs, real_bs, max_seqlen, total = (int(x) for x in meta.host_batch)
+    if real_bs < bs:
+        out.copy_(
+            _chunk_extend_on_tables(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                ssm_states,
+                h_track,
+                meta=meta,
+                kernel_dispatcher=kernel_dispatcher,
+                layer=layer,
+            )
+        )
+        return
+    out[:, :total].copy_(
+        kda_gfx950_prefill.extend(
+            q[:, :total],
+            k[:, :total],
+            v[:, :total],
+            g[:, :total],
+            beta[:, :total],
+            ssm_states=ssm_states,
+            cache_indices=meta.cache_indices[:bs],
+            query_start_loc=meta.cu_seqlens[: bs + 1],
+            A_log=layer.A_log,
+            dt_bias=layer.dt_bias,
+            lower_bound=layer.lower_bound,
+            beta_is_raw=True,
+            extend_seq_lens_cpu=[max_seqlen],
+            track_state=None if h_track is None else h_track[:bs],
+            track_chunk_idx=None if h_track is None else meta.track_chunk_idx[:bs],
+        )
+    )
+
+
 def kda_extend_in_graph(
     *,
     layer: RadixLinearAttention,
@@ -391,27 +479,53 @@ def kda_extend_in_graph(
             ssm_states=ssm_states,
             h_track=h_track,
         )
-    else:
-        core_attn_out = kernel_dispatcher.extend(
-            q=q,
-            k=k,
-            v=v,
-            g=a,
-            beta=b,
-            ssm_states=ssm_states,
-            cache_indices=meta.cache_indices,
-            query_start_loc=meta.cu_seqlens,
+    elif (
+        # The HIP extend needs an eager break; a plain graph would bake in the
+        # capture batch's launch layout.
+        is_in_breakable_cuda_graph()
+        and kernel_dispatcher.effective_extend_kernel(
+            layer.lower_bound, q.shape[1], meta.max_seqs
+        )
+        is kernel_dispatcher.triton_kernel
+        and kda_gfx950_prefill.covers(
+            q,
+            k,
+            v,
+            a,
+            b,
+            ssm_states,
             A_log=layer.A_log,
             dt_bias=layer.dt_bias,
             lower_bound=layer.lower_bound,
             beta_is_raw=True,
-            extend_seq_lens_cpu=None,
-            is_spec_decode=False,
-            return_intermediate_states=False,
-            track_state=h_track,
-            track_chunk_idx=meta.track_chunk_idx if meta.track else None,
-            chunk_indices=meta.chunk_indices,
-            chunk_offsets=meta.chunk_offsets,
+        )
+    ):
+        core_attn_out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
+        _hip_extend_between_segments(
+            q,
+            k,
+            v,
+            a,
+            b,
+            ssm_states,
+            h_track,
+            core_attn_out,
+            meta=meta,
+            kernel_dispatcher=kernel_dispatcher,
+            layer=layer,
+        )
+    else:
+        core_attn_out = _chunk_extend_on_tables(
+            q,
+            k,
+            v,
+            a,
+            b,
+            ssm_states,
+            h_track,
+            meta=meta,
+            kernel_dispatcher=kernel_dispatcher,
+            layer=layer,
         )
 
     if meta.track:
