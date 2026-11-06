@@ -517,13 +517,23 @@ def test_qsa_mtp_cuda_graph_padding_stays_below_compression_boundary():
         def _replay_cuda_graph_metadata(self, *, bs, seq_lens, **kwargs):
             self.replay_lengths = seq_lens[:bs].clone()
 
+    class FakeOffload:
+        def __init__(self):
+            self.num_real = []
+
+        def set_num_real(self, num_requests):
+            self.num_real.append(num_requests)
+
     recorders = [Recorder() for _ in backend.attn_backends]
+    # Every draft step shares the draft pool's offload; the first backend holds it.
+    offload = recorders[0]._kv_offload = FakeOffload()
     backend.attn_backends = recorders
     forward_batch.spec_info = SimpleNamespace()
 
     backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
     forward_batch.num_padding = 1
     backend.init_forward_metadata_out_graph(forward_batch)
+    assert offload.num_real[-1] == forward_batch.batch_size - 1
 
     assert [r.capture_lengths.tolist() for r in recorders] == [[1, 1]] * 3
     assert [r.replay_lengths.tolist() for r in recorders] == [
