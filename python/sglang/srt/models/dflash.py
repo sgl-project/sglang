@@ -845,12 +845,77 @@ class DFlashDecoderLayer(nn.Module):
         return hidden_states, residual
 
 
+class DFlashSharedContextKV(nn.Module):
+    """Target hidden -> the context K/V that every draft layer reads, written once
+    as layer 0: RMSNorm over the target features, one projection to [K | V],
+    RMSNorm on each K head (V is not normed), then the layers' RoPE on K."""
+
+    def __init__(self, features, attn, norm_cls, eps, quant_config, prefix):
+        super().__init__()
+        self.head_dim = attn.head_dim
+        self.total_num_kv_heads = attn.total_num_kv_heads
+        self.num_kv_heads = attn.num_kv_heads
+        # This rank's K/V heads, sharded as DFlashAttention shards them.
+        tp_size, tp_rank = int(get_parallel().tp_size), int(get_parallel().tp_rank)
+        if self.total_num_kv_heads >= tp_size:
+            self.kv_head_start = tp_rank * self.num_kv_heads
+        else:
+            self.kv_head_start = tp_rank // (tp_size // self.total_num_kv_heads)
+        self.input_norm = norm_cls(features, eps=eps)
+        self.kv_proj = ReplicatedLinear(
+            features,
+            2 * self.total_num_kv_heads * self.head_dim,
+            bias=False,
+            quant_config=quant_config,
+            prefix=f"{prefix}.kv_proj",
+        )
+        self.k_norm = norm_cls(self.head_dim, eps=eps)
+
+    def write_context_kv(
+        self,
+        *,
+        attn: DFlashAttention,
+        pool,
+        positions: torch.Tensor,
+        target_hidden: torch.Tensor,
+        cache_loc: torch.Tensor,
+        cache_loc_2d: Optional[torch.Tensor] = None,
+        commit_lens: Optional[torch.Tensor] = None,
+    ) -> None:
+        """With cache_loc_2d, writes only each request's first commit_lens rows."""
+        # The native path reduces the wide input (all target layers) in fp32.
+        kv, _ = self.kv_proj(self.input_norm.forward_native(target_hidden))
+        n = int(target_hidden.shape[0])
+        heads = slice(self.kv_head_start, self.kv_head_start + self.num_kv_heads)
+        kv = kv.view(n, 2, self.total_num_kv_heads, self.head_dim)[:, :, heads]
+        k = self.k_norm(kv[:, 0].reshape(-1, self.head_dim)).view(n, -1)
+        k = attn.apply_k_rope(positions, k).view(n, -1, self.head_dim)
+        v = kv[:, 1].contiguous()
+        if attn.v_scale is not None:
+            v = v * attn.v_scale
+        layer = attn.attn
+        if cache_loc_2d is None:
+            pool.layer_router.layer(layer.layer_id).store(
+                layer,
+                KVWriteLoc(cache_loc, physical=True),
+                k,
+                v,
+                layer.k_scale,
+                layer.v_scale,
+            )
+        else:
+            pool.set_kv_buffer_prefix_valid(
+                layer, cache_loc_2d, commit_lens, k, v, layer.k_scale, layer.v_scale
+            )
+
+
 class DFlashDraftModel(nn.Module):
     """SGLang DFlash draft model with an optional Nemotron embedding.
 
     The checkpoint provides:
       - transformer weights for `layers.*`
-      - `fc.weight`, `hidden_norm.weight` for projecting target context features
+      - `fc.weight`, `hidden_norm.weight` for projecting target context features,
+        or, with `dflash_config.shared_context_kv`, `shared_context_kv.*`
       - `norm.weight` for final normalization
     """
 
@@ -946,20 +1011,24 @@ class DFlashDraftModel(nn.Module):
         num_context_features = len(target_layer_ids)
 
         self.num_context_features = int(num_context_features)
-        if self.quantizable:
-            fc_prefix = f"{prefix}.fc" if prefix else "fc"
-            self.fc = ReplicatedLinear(
-                self.num_context_features * hidden_size,
-                hidden_size,
-                bias=False,
-                quant_config=quant_config,
-                prefix=fc_prefix,
-            )
+        self.shared_context_kv: Optional[DFlashSharedContextKV] = None
+        if draft_config.shared_context_kv:
+            self._init_shared_context_kv(norm_cls, quant_config, prefix)
         else:
-            self.fc = nn.Linear(
-                self.num_context_features * hidden_size, hidden_size, bias=False
-            )
-        self.hidden_norm = norm_cls(hidden_size, eps=rms_norm_eps)
+            if self.quantizable:
+                fc_prefix = f"{prefix}.fc" if prefix else "fc"
+                self.fc = ReplicatedLinear(
+                    self.num_context_features * hidden_size,
+                    hidden_size,
+                    bias=False,
+                    quant_config=quant_config,
+                    prefix=fc_prefix,
+                )
+            else:
+                self.fc = nn.Linear(
+                    self.num_context_features * hidden_size, hidden_size, bias=False
+                )
+            self.hidden_norm = norm_cls(hidden_size, eps=rms_norm_eps)
 
         # The model loader calls load_weights() before set_block_size(). Build
         # Domino projector modules here so their parameters are present while
@@ -989,6 +1058,37 @@ class DFlashDraftModel(nn.Module):
                     int(draft_config.emb_dim), int(config.vocab_size), bias=False
                 ),
             )
+
+    def _init_shared_context_kv(self, norm_cls, quant_config, prefix: str) -> None:
+        attns = [layer.self_attn for layer in self.layers]
+        a0 = attns[0]
+        # Every layer reads the same cached rows.
+        if any(
+            type(a) is not DFlashAttention
+            or a.attn.sliding_window_size != a0.attn.sliding_window_size
+            or a.attn.attn_type != a0.attn.attn_type
+            for a in attns
+        ):
+            raise ValueError(
+                "DFLASH shared_context_kv needs DFlashAttention layers with one "
+                "attention window."
+            )
+        self.shared_context_kv = DFlashSharedContextKV(
+            self.num_context_features * int(self.config.hidden_size),
+            a0,
+            norm_cls,
+            self.rms_norm_eps,
+            quant_config if self.quantizable else None,
+            f"{prefix}.shared_context_kv" if prefix else "shared_context_kv",
+        )
+        # No per-layer context K/V weights for the fused materializer to stack.
+        self.supports_fused_context_kv = False
+        # One pool layer (the runner sizes it [start_layer, end_layer)): every
+        # layer reads and writes it as layer 0. Layers run in order and each
+        # writes its block K/V right before attending, so block rows can share it.
+        self.end_layer = 1
+        for a in attns:
+            a.attn.layer_id = 0
 
     def set_block_size(self, block_size: int) -> None:
         """Adopt the block size the worker resolved.

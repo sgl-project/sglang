@@ -279,6 +279,9 @@ def _resolve_dflash_aux_hidden_state(
                 if uses_compressed_kv_attention(draft_model_config.hf_config):
                     config.dspark_num_stages = len(target_layer_ids)
 
+        # A shared context K/V draft keeps one K/V layer for all its layers.
+        if dflash_draft_config.shared_context_kv:
+            draft_num_layers = 1
         config.dflash_use_aux_hidden_state = True
         config.dflash_draft_num_layers = int(draft_num_layers)
         config.draft_model_config = draft_model_config

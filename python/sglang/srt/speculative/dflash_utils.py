@@ -613,6 +613,7 @@ class DFlashDraftConfig:
     attention_sink_bias: bool = False
     attention_value_scale: Optional[float] = None
     is_mla: bool = False
+    shared_context_kv: bool = False
 
     @property
     def is_domino(self) -> bool:
@@ -894,6 +895,7 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
         attention_sink_bias=attention_sink_bias,
         attention_value_scale=attention_value_scale,
         is_mla=is_mla,
+        shared_context_kv=bool(dflash_cfg.get("shared_context_kv", False)),
     )
 
 

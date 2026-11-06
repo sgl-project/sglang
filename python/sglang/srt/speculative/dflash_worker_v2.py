@@ -1947,6 +1947,18 @@ class DFlashWorkerV2(BaseSpecWorker):
             torch.inference_mode(),
             draft_tp_context(self.draft_parallel_layout),
         ):
+            shared_context_kv = getattr(self.draft_model, "shared_context_kv", None)
+            if shared_context_kv is not None:
+                shared_context_kv.write_context_kv(
+                    attn=self.draft_model.layers[0].self_attn,
+                    pool=self.draft_model_runner.token_to_kv_pool,
+                    positions=positions,
+                    target_hidden=target_hidden,
+                    cache_loc=cache_loc,
+                    cache_loc_2d=cache_loc_2d,
+                    commit_lens=commit_lens,
+                )
+                return
             ctx_hidden = self.draft_model.project_target_hidden(target_hidden)
             if self.lilicorr is not None:
                 self._lilicorr_anchor = publish_anchor(
