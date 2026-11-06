@@ -567,6 +567,12 @@ class UnifiedTreeCoreInterface(ABC):
         """Whether matching every waiting request is cheap enough for scheduling."""
         return False
 
+    def peek_prefix_len(self, key: RadixKey) -> Optional[int]:
+        """Tokens that match_prefix would report as cached for ``key``, computed
+        without changing the tree: no node split, LRU refresh or access-time
+        update. None when the tree core does not support it."""
+        return None
+
     @property
     @abstractmethod
     def empty_match_result(self) -> MatchResult:

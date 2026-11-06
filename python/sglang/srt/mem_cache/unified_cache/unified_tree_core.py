@@ -1058,6 +1058,44 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             device_validators=device_validators,
         )
 
+    def peek_prefix_len(self, key: RadixKey) -> Optional[int]:
+        """Read-only twin of _match_prefix_helper: the length up to the deepest
+        node every component accepts, host-backed nodes included under HiCache.
+        A partial match into a node counts only when FULL is the sole component;
+        with auxiliary components (Mamba, SWA) the split point would carry no
+        state, so it is not a match boundary."""
+        key, _ = key.maybe_to_bigram_view(self.is_eagle)
+        if len(key) == 0:
+            return 0
+        key = key.page_aligned(self.page_size)
+        if len(key) == 0:
+            return 0
+        validators = tuple(
+            comp.create_match_validator(match_device_only=not self.enable_hicache)
+            for comp in self.components
+        )
+        full_only = len(self.components) == 1
+        node = self.root_node
+        key_offset = 0
+        best_len = 0
+        child_key = key.child_key_at(key_offset, self.page_size)
+        while key_offset < len(key) and child_key in node.children:
+            child = node.children[child_key]
+            if child.evicted and not child.backuped:
+                break
+            prefix_len = child.key.match_at(key, key_offset, page_size=self.page_size)
+            if prefix_len < len(child.key):
+                if full_only and all(v(child) for v in validators):
+                    best_len = key_offset + prefix_len
+                break
+            node = child
+            key_offset += prefix_len
+            if all(v(node) for v in validators):
+                best_len = key_offset
+            if key_offset < len(key):
+                child_key = key.child_key_at(key_offset, self.page_size)
+        return best_len
+
     def _device_prefix_covered_by_match(
         self, best_match_node: UnifiedTreeNode
     ) -> Optional[tuple[UnifiedTreeNode, int]]:

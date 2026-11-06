@@ -559,5 +559,7 @@ POSITIONAL_FIELD_ORDER = (
     "uocr_doc_split",
     "uocr_doc_page_window",
     "uocr_max_page_tokens",
+    "pp_min_chunked_prefill_size",
+    "pp_chunk_overhead_tokens",
 )
 # fmt: on
