@@ -22,6 +22,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+import torch._dynamo.testing
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -501,6 +502,33 @@ def test_mounted_gelu_site_compiles_fullgraph():
     torch.testing.assert_close(
         torch.compile(site, fullgraph=True)(x), expected, atol=2e-2, rtol=2e-2
     )
+
+
+class _GeluBlock(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.ff = _GeluSite()
+        self.audio_ff = _GeluSite()
+
+    def forward(self, x):
+        return self.ff(x) + self.audio_ff(x)
+
+
+@requires_cuda
+@torch.no_grad()
+def test_mounted_gelu_sites_compile_one_frame_across_linears():
+    # DiT blocks share one compiled forward; a new linear must not recompile it
+    torch._dynamo.reset()
+    blocks = nn.ModuleList(_GeluBlock() for _ in range(12))
+    assert linear_gelu.FUSED_LINEAR_GELU.mount(blocks)
+    counter = torch._dynamo.testing.CompileCounter()
+    for block in blocks:
+        block.compile(backend=counter)
+    x = torch.randn(16, 64, device="cuda", dtype=torch.bfloat16)
+    for _ in range(2):
+        for block in blocks:
+            block(x)
+    assert counter.frame_count == 1
 
 
 @requires_cuda

@@ -14,8 +14,9 @@ from sglang.srt.model_executor.cuda_graph_config import (
     CudaGraphConfig,
     PhaseConfig,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mha import (
     forward_dsa_indexer_for_mha,
@@ -401,8 +402,13 @@ class DSAMockModelRunner(ModelRunner):
             enable_memory_saver=False,
             kv_cache_dim=pool_kv_cache_dim,
         )
-        self.token_to_kv_pool_allocator = SimpleNamespace(page_size=case.page_size)
-        self.init_kv_index_translator()
+        # A static allocator: ids index the pools as they are.
+        self.token_to_kv_pool_allocator = SimpleNamespace(
+            page_size=case.page_size,
+            hands_out_virtual_ids=False,
+            state_id_spaces=lambda: {},
+        )
+        self.init_runner_ids()
         self.attention_chunk_size = None
         self.hisparse_coordinator = None
         self.init_new_workspace = False
@@ -1245,13 +1251,13 @@ DSA_DECODE_IMPL_VARIANTS: tuple[str, ...] = (
 # Impls that accept an FP8-stored K cache. The flashmla *sparse* and FA3
 # kernels require BF16 K (`kv must have dtype torch::kBFloat16`), so they
 # fall back to the inline-quantize-of-bf16 path that production *doesn't*
-# take in FP8 deployments. The `flashmla_kv` decode kernel and *both*
-# flashmla prefill kernels are the production-relevant FP8 paths.
+# take in FP8 deployments. AITER decode, the `flashmla_kv` decode kernel,
+# and both flashmla prefill kernels are the production-relevant FP8 paths.
 DSA_FP8_COMPATIBLE_PREFILL_IMPLS: frozenset[str] = frozenset(
-    {"flashmla_sparse", "flashmla_kv", "flashmla_auto", "triton_sparse_mla"}
+    {"aiter", "flashmla_sparse", "flashmla_kv", "flashmla_auto", "triton_sparse_mla"}
 )
 DSA_FP8_COMPATIBLE_DECODE_IMPLS: frozenset[str] = frozenset(
-    {"flashmla_kv", "flashmla_auto"}
+    {"aiter", "flashmla_kv", "flashmla_auto"}
 )
 
 
@@ -1395,8 +1401,8 @@ def run_dsa_sparse_fp8_prefill_case(
     if dsa_prefill_backend not in DSA_FP8_COMPATIBLE_PREFILL_IMPLS:
         testcase.skipTest(
             f"DSA prefill impl `{dsa_prefill_backend}` does not support FP8 KV "
-            f"cache (only `flashmla_sparse`, `flashmla_kv`, and `flashmla_auto` "
-            f"read FP8 K directly; others require BF16 K)."
+            f"cache (only `aiter`, `flashmla_sparse`, `flashmla_kv`, and "
+            f"`flashmla_auto` read FP8 K directly; others require BF16 K)."
         )
     if not case.forward_mode.is_extend_without_speculative():
         raise ValueError("run_dsa_sparse_fp8_prefill_case expects an EXTEND case.")
@@ -1414,15 +1420,21 @@ def run_dsa_sparse_fp8_decode_case(
     *,
     dsa_decode_backend: str = "flashmla_kv",
 ) -> None:
-    """FP8-KV-cache decode. Only `flashmla_kv` (and `flashmla_auto`
-    which resolves to it for FP8) accepts an FP8-stored K cache;
-    `flashmla_sparse` and `fa3` decode kernels assert BF16 K and would
-    fall back to the inline-quantize-of-bf16 path that production
+    """FP8-KV-cache decode. AITER and `flashmla_kv` (including
+    `flashmla_auto`, which resolves to it for FP8) accept an FP8-stored K
+    cache; `flashmla_sparse` and `fa3` decode kernels assert BF16 K and
+    would fall back to the inline-quantize-of-bf16 path that production
     doesn't take in FP8 deployments."""
+    supported, reason = dsa_impl_capability(dsa_decode_backend)
+    if not supported:
+        testcase.skipTest(
+            f"DSA decode impl `{dsa_decode_backend}` not supported: {reason}"
+        )
     if dsa_decode_backend not in DSA_FP8_COMPATIBLE_DECODE_IMPLS:
         testcase.skipTest(
             f"DSA decode impl `{dsa_decode_backend}` does not support FP8 KV "
-            f"cache (only `flashmla_kv` / `flashmla_auto` read FP8 K directly)."
+            f"cache (only `aiter`, `flashmla_kv`, and `flashmla_auto` read "
+            f"FP8 K directly)."
         )
     if not case.forward_mode.is_decode():
         raise ValueError("run_dsa_sparse_fp8_decode_case expects a DECODE case.")
@@ -1508,7 +1520,6 @@ def run_dsa_mtp_seed_handoff_case(
                 q_lora=fixture.input_hidden,
                 positions=batch.positions,
                 forward_batch=batch,
-                layer_id=0,
             )
         else:
             state = IndexTopKShareState.from_mtp_carry(batch)

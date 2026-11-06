@@ -32,7 +32,6 @@ _TRITON_KERNELS = [
     ("lilicorr", "lilicorr_topk_lse"),
     ("lilicorr", "lilicorr_sample_path"),
     ("reject_sampling", "chain_speculative_sampling_triton"),
-    ("row_argmax", "row_argmax"),
     ("reconstruct_tree", "reconstruct_indices_from_tree_mask_triton"),
     ("reconstruct_tree", "reconstruct_indices_from_tree_mask_func"),
 ]
@@ -45,6 +44,15 @@ for _mod, _fn in _TRITON_KERNELS:
         )
     )
 del _mod, _fn
+
+register_kernel(
+    KernelSpec(
+        op="speculative.simulated_accept",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.speculative.simulated_accept:simulated_accept",
+        capabilities=CUDA_ONLY,
+    )
+)
 
 register_kernel(
     KernelSpec(

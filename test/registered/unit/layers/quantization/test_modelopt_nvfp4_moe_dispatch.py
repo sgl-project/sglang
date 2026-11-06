@@ -12,7 +12,7 @@ tensors, so the tests stay on CPU; the kernels are covered on-device.
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=6, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 import sys
 import unittest
@@ -367,7 +367,9 @@ class TestNvFp4MoeDispatch(CustomTestCase):
                 (None, 2),
             ):
                 with self.subTest(policy=policy):
-                    layer.routing_method_type = policy
+                    layer.routing_method_type = method.get_moe_routing_method_type(
+                        layer, policy
+                    )
                     self.assertEqual(
                         method.apply(
                             layer, SimpleNamespace(hidden_states=torch.zeros((1, 4)))

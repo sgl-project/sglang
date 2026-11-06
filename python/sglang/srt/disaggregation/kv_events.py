@@ -507,7 +507,10 @@ class ZmqEventPublisher(EventPublisher):
     def shutdown(self) -> None:
         """Stop the publisher thread and clean up resources."""
         self._running = False
-        self._event_queue.put_nowait(None)
+        try:
+            self._event_queue.put_nowait(None)
+        except queue.Full:
+            pass
 
         start = time.time()
         pending_items = True
@@ -667,7 +670,7 @@ class ZmqEventPublisher(EventPublisher):
         if not endpoint or data_parallel_rank == 0:
             return endpoint
 
-        if "inproc" in endpoint:
+        if "inproc" in endpoint or endpoint.startswith("ipc://"):
             return f"{endpoint}_dp{data_parallel_rank}"
         if "tcp" in endpoint:
             if endpoint and ":" in endpoint:
@@ -678,7 +681,7 @@ class ZmqEventPublisher(EventPublisher):
                 new_port = base_port + data_parallel_rank
                 return f"{base_addr}:{new_port}"
             return endpoint
-        raise ValueError("Invalid endpoint: must contain 'inproc' or 'tcp'")
+        raise ValueError("Invalid endpoint: must contain 'inproc', 'ipc' or 'tcp'")
 
 
 class KVEventsConfig(BaseModel):

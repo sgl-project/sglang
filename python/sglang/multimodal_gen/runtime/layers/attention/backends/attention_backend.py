@@ -157,6 +157,19 @@ class AttentionImpl(ABC, Generic[T]):
     ) -> torch.Tensor:
         raise NotImplementedError
 
+    def forward_into(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        out: torch.Tensor | None,
+        attn_metadata: T,
+    ) -> bool:
+        """Write what ``forward`` returns into ``out`` (any token stride), or with
+        ``out=None`` only answer; False, having written nothing, when this
+        backend cannot serve these inputs that way."""
+        return False
+
     def forward_varlen(
         self,
         query: torch.Tensor,

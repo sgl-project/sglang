@@ -58,12 +58,12 @@ from sglang.multimodal_gen.runtime.weights.source import (
     materialize_weight_set_config,
     resolve_safetensors_weight_set,
 )
-from sglang.srt.model_loader.checkpoint_quantization import (
-    resolve_checkpoint_quant_spec,
-)
-from sglang.srt.utils.hf_transformers import (
+from sglang.srt.hf_transformers import (
     check_gguf_file,
     resolve_hf_gguf_reference,
+)
+from sglang.srt.model_loader.checkpoint_quantization import (
+    resolve_checkpoint_quant_spec,
 )
 
 logger = init_logger(__name__)

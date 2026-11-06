@@ -23,6 +23,11 @@ def _config_keys(action: argparse.Action) -> set[str]:
     }
 
 
+def _takes_one_value(action: argparse.Action) -> bool:
+    # Passed as "--flag value", like store; e.g. a deprecated valued alias.
+    return isinstance(action, argparse._StoreAction) or action.nargs is None
+
+
 class ConfigArgumentMerger:
     """Handles merging of configuration file arguments with command-line arguments."""
 
@@ -32,7 +37,7 @@ class ConfigArgumentMerger:
         boolean_actions: List[str] = None,
     ):
         """Initialize with list of store_true action names."""
-        # NOTE: The current code does not support actions other than "store_true" and "store".
+        # NOTE: Only store_true, store and other single-value actions are supported.
         if parser is not None:
             self.parser = parser
             self.store_true_actions = [
@@ -41,16 +46,23 @@ class ConfigArgumentMerger:
                 if isinstance(action, argparse._StoreTrueAction)
                 for key in _config_keys(action)
             ]
+            supported = [
+                a
+                for a in parser._actions
+                if isinstance(a, argparse._StoreTrueAction) or _takes_one_value(a)
+            ]
+            supported_keys = {key for a in supported for key in _config_keys(a)}
             self.unsupported_actions = {
                 key: a
                 for a in parser._actions
                 if a.option_strings
-                and not isinstance(a, argparse._StoreTrueAction)
-                and not isinstance(a, argparse._StoreAction)
+                and a not in supported
                 and "--config" not in a.option_strings
                 and "--help" not in a.option_strings
                 and "-h" not in a.option_strings
                 for key in _config_keys(a)
+                # a key a supported flag also reads, e.g. a shared dest, stays usable
+                if key not in supported_keys
             }
         elif boolean_actions is not None:
             # Legacy interface for compatibility

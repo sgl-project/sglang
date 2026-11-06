@@ -1,0 +1,13 @@
+{"name": "window_retirement_p64", "chain": "swa", "page_size": 64, "lazy": true, "ops": [
+  {"op": "extend", "req": 0, "n": 320},
+  {"op": "extend", "req": 1, "n": 138},
+  {"op": "decode", "reqs": [0, 1]},
+  {"op": "decode", "reqs": [0, 1]},
+  {"op": "decode", "reqs": [0, 1]},
+  {"op": "retire", "req": 0, "upto": 256},
+  {"op": "retire", "req": 1, "upto": 64},
+  {"op": "extend", "req": 2, "n": 384},
+  {"op": "decode", "reqs": [0, 1, 2]},
+  {"op": "free", "req": 0},
+  {"op": "extend", "req": 3, "n": 384}
+]}

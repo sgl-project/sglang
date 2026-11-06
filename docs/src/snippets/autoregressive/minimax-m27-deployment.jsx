@@ -29,7 +29,7 @@ export const MiniMaxM27Deployment = () => {
         const isXeon = hw === 'xeon';
         if (isXeon) {
           return [
-            { id: 'tp6', label: 'TP=6', default: true, disabled: false }
+            { id: 'tp6', label: 'TP=6', default: true, disabled: true }
           ];
         }
         const canUse2GPU = isAMD || isGB300;
@@ -116,7 +116,7 @@ export const MiniMaxM27Deployment = () => {
         const items = option.getDynamicItems(next);
         const current = items.find(i => i.id === next[key]);
         if (!current || current.disabled) {
-          const fallback = items.find(i => i.default && !i.disabled) || items.find(i => !i.disabled);
+          const fallback = items.find(i => i.default && !i.disabled) || items.find(i => !i.disabled) || items[0];
           if (fallback) next[key] = fallback.id;
         }
       }
@@ -125,7 +125,9 @@ export const MiniMaxM27Deployment = () => {
   }, [values.hardware]);
 
   const handleRadioChange = (optionName, value) => {
-    setValues(prev => ({ ...prev, [optionName]: value }));
+    setValues(prev => prev.hardware === 'xeon' && optionName === 'gpuCount'
+      ? prev
+      : { ...prev, [optionName]: value });
   };
 
   // Generate command mirrors sgl-cookbook src/components/autoregressive/MiniMaxM27ConfigGenerator/index.js

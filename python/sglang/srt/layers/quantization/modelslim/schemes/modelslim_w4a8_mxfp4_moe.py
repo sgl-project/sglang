@@ -10,7 +10,7 @@ from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
     NPUW4A8MXFP4MoEMethod,
 )
 from sglang.srt.layers.quantization.modelslim.schemes import ModelSlimMoEScheme
-from sglang.srt.utils import set_weight_attrs
+from sglang.srt.layers.utils.common import set_weight_attrs
 
 W4A8_MXFP4_BLOCK_SIZE = 32
 W4A8_MXFP4_PACK_FACTOR = 2

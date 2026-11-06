@@ -27,6 +27,7 @@ import ssl
 import tempfile
 import threading
 import time
+import traceback
 import uuid
 from contextlib import asynccontextmanager
 from functools import partial
@@ -47,6 +48,8 @@ import aiohttp
 import numpy as np
 import orjson
 import requests
+import setproctitle
+import torch
 import uvicorn
 import uvloop
 from fastapi import (
@@ -68,11 +71,9 @@ from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 from fastapi.routing import APIRoute
 from uvicorn.supervisors.multiprocess import Multiprocess
 
-from sglang.srt.arg_groups.overrides import resolving_view
-from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
 from sglang.srt.configs.model_config import load_joint_head_config, load_pointer_head
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
-from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
+from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.entrypoints.anthropic.protocol import (
     AnthropicCountTokensRequest,
     AnthropicMessagesRequest,
@@ -82,8 +83,7 @@ from sglang.srt.entrypoints.api_contract import generate_contract_error
 from sglang.srt.entrypoints.engine import (
     Engine,
     init_tokenizer_manager,
-    run_detokenizer_process,
-    run_scheduler_process,
+    node_hosts_rust_server,
 )
 from sglang.srt.entrypoints.ollama.protocol import (
     OllamaChatRequest,
@@ -91,6 +91,7 @@ from sglang.srt.entrypoints.ollama.protocol import (
     OllamaShowRequest,
 )
 from sglang.srt.entrypoints.ollama.serving import OllamaServing
+from sglang.srt.entrypoints.openai.chat_encoding_adapters import native_text_parser
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ClassifyRequest,
@@ -120,11 +121,19 @@ from sglang.srt.entrypoints.openai.serving_transcription import (
     OpenAIServingTranscription,
 )
 from sglang.srt.entrypoints.request_headers import apply_header_overrides
+from sglang.srt.entrypoints.server_utils import (
+    add_prometheus_middleware,
+    build_model_info_fields,
+    build_server_info,
+    set_uvicorn_logging_configs,
+)
+from sglang.srt.entrypoints.sidecar import rust_server_sidecar
 from sglang.srt.entrypoints.systemone.protocol import SystemOneRequest
 from sglang.srt.entrypoints.systemone.serving import SystemOneServing
 from sglang.srt.entrypoints.warmup import execute_warmups
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
+from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 from sglang.srt.managers.io_struct import (
     AbortReq,
     AttachHiCacheStorageReqInput,
@@ -147,6 +156,7 @@ from sglang.srt.managers.io_struct import (
     ParseFunctionCallReq,
     PauseGenerationReqInput,
     PdRoleSwitchReqInput,
+    PluginWeightUpdateReqInput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
@@ -164,13 +174,16 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.multi_tokenizer_mixin import (
     MultiTokenizerRouter,
-    TokenizerWorker,
     get_main_process_id,
-    get_tokenizer_worker_class,
     read_from_shared_memory,
     write_data_for_multi_tokenizer,
 )
-from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
+from sglang.srt.managers.scheduler import run_scheduler_process
+from sglang.srt.managers.tokenizer_manager import (
+    ServerStatus,
+    TokenizerManager,
+    get_tokenizer_worker_class,
+)
 from sglang.srt.observability.func_timer import enable_func_timer
 from sglang.srt.observability.http_request_metrics import (
     add_http_request_metrics_middleware,
@@ -187,14 +200,11 @@ from sglang.srt.parser.template_manager import TemplateManager
 from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
-    add_prometheus_middleware,
-    build_server_info,
     delete_directory,
     freeze_gc,
     get_bool_env_var,
     is_mps,
     kill_process_tree,
-    set_uvicorn_logging_configs,
 )
 from sglang.srt.utils.auth import AuthLevel, app_has_admin_force_endpoints, auth_level
 from sglang.srt.utils.json_response import (
@@ -205,7 +215,6 @@ from sglang.srt.utils.json_response import (
 )
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.watchdog import SubprocessWatchdog
-from sglang.utils import get_exception_traceback
 from sglang.version import __version__
 
 logger = logging.getLogger(__name__)
@@ -219,7 +228,7 @@ WAIT_WEIGHTS_READY_TIMEOUT = int(os.getenv("SGLANG_WAIT_WEIGHTS_READY_TIMEOUT", 
 # Store global states
 @dataclasses.dataclass
 class _GlobalState:
-    tokenizer_manager: Union[TokenizerManager, MultiTokenizerRouter, TokenizerWorker]
+    tokenizer_manager: Union[TokenizerManager, MultiTokenizerRouter]
     template_manager: TemplateManager
     scheduler_info: Dict
 
@@ -267,6 +276,8 @@ async def init_multi_tokenizer() -> ServerArgs:
     )
 
     # Launch multi-tokenizer manager process
+    setproctitle.setproctitle(f"sglang::tokenizer_worker:{os.getpid()}")
+    torch.set_num_threads(1)
     tokenizer_worker_class = get_tokenizer_worker_class(server_args)
     tokenizer_manager = tokenizer_worker_class(server_args, port_args)
     template_manager = TemplateManager()
@@ -303,7 +314,7 @@ async def lifespan(fast_api_app: FastAPI):
     else:
         # Initialize multi-tokenizer support for worker processes
         server_args = await init_multi_tokenizer()
-        worker_id = _global_state.tokenizer_manager.worker_id
+        worker_id = os.getpid()
         warmup_thread_kwargs = _multi_tokenizer_warmup_kwargs(server_args, worker_id)
         thread_label = f"MultiTokenizer-{worker_id}"
 
@@ -409,7 +420,7 @@ async def lifespan(fast_api_app: FastAPI):
             f"OpenAIServingResponses init failed ({type(e).__name__}: {e})"
         )
         logger.debug(
-            f"OpenAIServingResponses init traceback:\n{get_exception_traceback()}"
+            f"OpenAIServingResponses init traceback:\n{traceback.format_exc()}"
         )
 
     # Execute custom warmups
@@ -747,7 +758,7 @@ async def health_generate(request: Request) -> Response:
 
     sampling_params = {"max_new_tokens": 1, "temperature": 0.0}
     # uuid keeps rids unique across tokenizer workers (a bare time.time() can
-    # collide and crash the shared DetokenizerManager decode_status).
+    # collide, and colliding rids overwrite each other's detokenize state).
     rid = f"{HEALTH_CHECK_RID_PREFIX}_{uuid.uuid4().hex}"
 
     if _global_state.tokenizer_manager.is_generation:
@@ -809,7 +820,6 @@ async def get_model_info():
 @app.get("/model_info")
 async def model_info():
     """Get the model information."""
-    model_config = _global_state.tokenizer_manager.model_config
     result = {
         "model_path": _global_state.tokenizer_manager.model_path,
         # Manager-owned, and moved by a weight update alongside `model_path`:
@@ -831,19 +841,11 @@ async def model_info():
         "disaggregation_mode": _global_state.tokenizer_manager.config_value(
             "disaggregation_mode"
         ),
-        "has_image_understanding": model_config.is_image_understandable_model,
-        "has_audio_understanding": model_config.is_audio_understandable_model,
-        "model_type": getattr(model_config.hf_config, "model_type", None),
-        "architectures": getattr(model_config.hf_config, "architectures", None),
-        # "hf_config": model_config.hf_config.to_dict(),
+        **build_model_info_fields(
+            _global_state.tokenizer_manager.model_config,
+            _global_state.tokenizer_manager.server_args,
+        ),
     }
-    embedding_model_spec = getattr(model_config, "embedding_model_spec", None)
-    if embedding_model_spec is not None:
-        result["embedding"] = resolved_embedding_plan(
-            embedding_model_spec,
-            config=resolving_view(_global_state.tokenizer_manager.server_args),
-            model_config=model_config,
-        )
     return msgspec_to_builtins(result)
 
 
@@ -1196,6 +1198,25 @@ async def hicache_storage_backend_status():
     }
 
 
+# example usage:
+# curl -s http://127.0.0.1:30000/get_hicache_l3_cache_layout
+@app.get("/get_hicache_l3_cache_layout")
+async def get_hicache_l3_cache_layout():
+    """Get the HiCache L3 (mooncake) object-key layout for external KV routers."""
+    from sglang.srt.mem_cache.hicache_storage import (
+        disabled_l3_layout,
+        merge_l3_layouts,
+    )
+
+    layouts = await _global_state.tokenizer_manager.get_hicache_l3_cache_layout()
+    merged = merge_l3_layouts(layouts)
+    if ((merged or {}).get("hicache_object_layout") or {}).get("pp_size", 1) > 1:
+        # Only pp rank 0 replies here; the startup info already merged every stage.
+        info = getattr(_global_state, "scheduler_info", None) or {}
+        merged = info.get("hicache_object_layout", merged)
+    return merged or disabled_l3_layout("No scheduler layout replies")
+
+
 @app.api_route("/start_profile", methods=["GET", "POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def start_profile_async(obj: Annotated[Optional[ProfileReq], Body()] = None):
@@ -1463,6 +1484,24 @@ async def end_weight_update(
     )
 
 
+@app.post("/plugin_weight_update")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def plugin_weight_update(
+    obj: Annotated[PluginWeightUpdateReqInput, Body()], request: Request
+):
+    """Receive weights through a platform transport and load them, as /update_weights_from_distributed does."""
+    reply = await _global_state.tokenizer_manager.plugin_weight_update(obj, request)
+    content = {
+        "success": reply.success,
+        "message": reply.message,
+        "received_tensor_counts": reply.received_tensor_counts,
+    }
+    if reply.success:
+        return ORJSONResponse(content, status_code=200)
+    else:
+        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+
+
 @app.post("/update_weights_from_distributed")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def update_weights_from_distributed(
@@ -1716,15 +1755,27 @@ async def parse_function_call_request(
     """
     A native API endpoint to parse function calls from a text.
     """
-    # 1) Initialize the parser based on the request body
-    parser = FunctionCallParser(
-        tools=obj.tools,
-        tool_call_parser=obj.tool_call_parser,
-        tokenizer=get_global_state().tokenizer_manager.tokenizer,
-    )
+    chat = request.app.state.openai_serving_chat
+    try:
+        text_parser = native_text_parser(
+            obj.tool_call_parser,
+            chat_encoding_spec=chat.chat_encoding_spec,
+            adapter=chat.encoding_adapter,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=str(error))
+    if text_parser is not None:
+        normal_text, calls = text_parser.parse_function_call_text(obj.text, obj.tools)
+    else:
+        # 1) Initialize the parser based on the request body
+        parser = FunctionCallParser(
+            tools=obj.tools,
+            tool_call_parser=obj.tool_call_parser,
+            tokenizer=get_global_state().tokenizer_manager.tokenizer,
+        )
 
-    # 2) Call the non-stream parsing method (non-stream)
-    normal_text, calls = parser.parse_non_stream(obj.text)
+        # 2) Call the non-stream parsing method (non-stream)
+        normal_text, calls = parser.parse_non_stream(obj.text)
 
     # 3) Organize the response content
     response_data = {
@@ -1744,22 +1795,38 @@ async def separate_reasoning_request(
     """
     A native API endpoint to separate reasoning from a text.
     """
-    # 1) Initialize the parser based on the request body
-    parser = ReasoningParser(
-        model_type=obj.reasoning_parser,
-        request=request,
-        tokenizer=get_global_state().tokenizer_manager.tokenizer,
-    )
-
-    # 2) Call the non-stream parsing method (non-stream)
-    if obj.return_blocks:
-        blocks = parser.parse_non_stream_blocks(obj.text)
-        reasoning_blocks = [b["text"] for b in blocks if b["type"] == "reasoning"]
-        text_blocks = [b["text"] for b in blocks if b["type"] == "text"]
-        reasoning_text = "".join(reasoning_blocks)
-        normal_text = "".join(text_blocks)
+    chat = request.app.state.openai_serving_chat
+    try:
+        text_parser = native_text_parser(
+            obj.reasoning_parser,
+            chat_encoding_spec=chat.chat_encoding_spec,
+            adapter=chat.encoding_adapter,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST, detail=str(error))
+    if text_parser is not None:
+        reasoning_text, normal_text = text_parser.separate_reasoning_text(obj.text)
+        blocks = (
+            [{"type": "reasoning", "text": reasoning_text}] if reasoning_text else []
+        )
+        blocks.append({"type": "text", "text": normal_text})
     else:
-        reasoning_text, normal_text = parser.parse_non_stream(obj.text)
+        # 1) Initialize the parser based on the request body
+        parser = ReasoningParser(
+            model_type=obj.reasoning_parser,
+            request=request,
+            tokenizer=get_global_state().tokenizer_manager.tokenizer,
+        )
+
+        # 2) Call the non-stream parsing method (non-stream)
+        if obj.return_blocks:
+            blocks = parser.parse_non_stream_blocks(obj.text)
+            reasoning_text = "".join(
+                b["text"] for b in blocks if b["type"] == "reasoning"
+            )
+            normal_text = "".join(b["text"] for b in blocks if b["type"] == "text")
+        else:
+            reasoning_text, normal_text = parser.parse_non_stream(obj.text)
 
     # 3) Organize the response content
     response_data = {
@@ -1767,8 +1834,12 @@ async def separate_reasoning_request(
         "text": normal_text,
     }
     if obj.return_blocks:
-        response_data["reasoning_blocks"] = reasoning_blocks
-        response_data["text_blocks"] = text_blocks
+        response_data["reasoning_blocks"] = [
+            b["text"] for b in blocks if b["type"] == "reasoning"
+        ]
+        response_data["text_blocks"] = [
+            b["text"] for b in blocks if b["type"] == "text"
+        ]
         response_data["blocks"] = blocks
 
     return ORJSONResponse(content=response_data, status_code=200)
@@ -1832,8 +1903,10 @@ async def openai_v1_chat_completions(
 )
 async def openai_v1_embeddings(request: EmbeddingRequest, raw_request: Request):
     """OpenAI-compatible embeddings endpoint."""
-    return await raw_request.app.state.openai_serving_embedding.handle_request(
-        request, raw_request
+    return model_json_response(
+        await raw_request.app.state.openai_serving_embedding.handle_request(
+            request, raw_request
+        )
     )
 
 
@@ -2135,8 +2208,14 @@ async def systemone_decisions(request: SystemOneRequest, raw_request: Request):
 ## SageMaker API
 @app.get("/ping")
 async def sagemaker_health() -> Response:
-    """Check the health of the http server."""
-    return Response(status_code=200)
+    """SageMaker health check: 200 when is_healthy(), else 503.
+
+    Unlike /ready, a paused server still reports 200, so an intentional pause
+    (e.g. a weight sync) does not get the instance replaced. Stays a flag check
+    because SageMaker times out /ping after 2 seconds.
+    """
+    status_code = 200 if _global_state.tokenizer_manager.is_healthy() else 503
+    return Response(status_code=status_code)
 
 
 @app.post("/invocations")
@@ -2239,7 +2318,8 @@ def _get_vlm_warmup_image_base64(model_info: dict) -> str:
     architectures = model_info.get("architectures") or []
     if (
         "KimiK3ForConditionalGeneration" in architectures
-        or model_info.get("model_type") == "kimi_k3"
+        or "KimiK31ForConditionalGeneration" in architectures
+        or model_info.get("model_type") in ("kimi_k3", "kimi_k31")
     ):
         logger.info(
             "Using a 448x448 image for Kimi K3 VLM startup warmup to exercise "
@@ -2317,7 +2397,7 @@ def _execute_server_warmup(server_args: ServerArgs):
             success = True
             break
         except (AssertionError, requests.exceptions.RequestException):
-            last_traceback = get_exception_traceback()
+            last_traceback = traceback.format_exc()
             pass
 
     if not success:
@@ -2469,7 +2549,7 @@ def _execute_server_warmup(server_args: ServerArgs):
             )
 
     except Exception:
-        last_traceback = get_exception_traceback()
+        last_traceback = traceback.format_exc()
         logger.error(f"Initialization failed. warmup error: {last_traceback}")
         kill_process_tree(os.getpid())
         return False
@@ -2679,6 +2759,19 @@ def _reserve_reuseport_socket(config: uvicorn.Config) -> socket.socket:
         raise SystemExit(1) from error
 
 
+def _granian_http1_settings():
+    from granian.http import HTTP1Settings
+
+    if not envs.SGLANG_TIMEOUT_KEEP_ALIVE.is_set():
+        return HTTP1Settings()
+    timeout_s = envs.SGLANG_TIMEOUT_KEEP_ALIVE.get()
+    if timeout_s <= 0:
+        raise ValueError(
+            f"SGLANG_TIMEOUT_KEEP_ALIVE must be a positive number of seconds, got {timeout_s}"
+        )
+    return HTTP1Settings(header_read_timeout=timeout_s * 1000)
+
+
 def _run_granian_server(
     host,
     port,
@@ -2722,6 +2815,7 @@ def _run_granian_server(
         port=port,
         interface=Interfaces.ASGI,
         http=HTTPModes.auto,
+        http1_settings=_granian_http1_settings(),
         http2_settings=HTTP2Settings(
             initial_connection_window_size=http2_initial_connection_window_size,
             max_concurrent_streams=http2_max_concurrent_streams,
@@ -3095,9 +3189,30 @@ def launch_server(
         # main process has no Python HTTP server / tokenizer manager to run.
         # Each Rust listener runs its own startup warmup and keeps /health at
         # 503 until it succeeds, so the main process does not warm up here.
-        if launch_callback is not None:
-            launch_callback()
-        scheduler_init_result.block_until_scheduler_exits()
+        from sglang.srt.rust_server.server import drain_notify_name
+        from sglang.srt.rust_server.shutdown import RustServerSigtermDrain
+
+        drain = None
+        # Without a local listener (the DP controller starts the schedulers),
+        # SIGTERM keeps its previous effect. Installed before the sidecar
+        # block, so SIGTERM stops the sidecar first and then reaches the drain.
+        if scheduler_init_result.rust_listener_procs:
+            drain = RustServerSigtermDrain(
+                scheduler_init_result.scheduler_procs,
+                scheduler_init_result.rust_listener_procs,
+                subprocess_watchdog,
+                drain_notify_name(port_args.instance_id),
+            )
+            drain.install()
+        # Every listener is bound before its scheduler reports ready, so the
+        # sidecar can connect at once.
+        with rust_server_sidecar(node_hosts_rust_server()):
+            if launch_callback is not None:
+                launch_callback()
+            if drain is not None:
+                drain.wait()
+            else:
+                scheduler_init_result.block_until_scheduler_exits()
     else:
         _setup_and_run_http_server(
             server_args,

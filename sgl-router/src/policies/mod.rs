@@ -920,6 +920,7 @@ mod tests {
                 best_prefix_blocks: 8,
             },
             query_blocks: 8,
+            pending_winners: Vec::new(),
             block_hashes: None,
         };
         let ctx = SelectionContext::new(&model, None)
@@ -964,6 +965,7 @@ mod tests {
                 best_prefix_blocks: 8,
             },
             query_blocks: 8,
+            pending_winners: Vec::new(),
             block_hashes: None,
         };
         let ctx = SelectionContext::new(&model, None)
@@ -1014,6 +1016,7 @@ mod tests {
                 best_prefix_blocks: workers.len() as u32,
             },
             query_blocks: 64,
+            pending_winners: Vec::new(),
             block_hashes: None,
         };
         let ctx = SelectionContext::new(&model, None)
@@ -1071,6 +1074,7 @@ mod tests {
                 best_prefix_blocks: 4,
             },
             query_blocks: 4,
+            pending_winners: Vec::new(),
             block_hashes: None,
         };
         let ctx = SelectionContext::new(&model, None)
@@ -1123,6 +1127,7 @@ mod tests {
                 best_prefix_blocks: 4,
             },
             query_blocks: 8,
+            pending_winners: Vec::new(),
             block_hashes: None,
         };
         let ctx = SelectionContext::new(&model, None)
@@ -1163,6 +1168,7 @@ mod tests {
                 best_prefix_blocks: 3,
             },
             query_blocks: 8,
+            pending_winners: Vec::new(),
             block_hashes: None,
         };
         let ctx = SelectionContext::new(&model, None)
@@ -1195,6 +1201,7 @@ mod tests {
                 best_prefix_blocks: 2,
             },
             query_blocks: 4_125,
+            pending_winners: Vec::new(),
             block_hashes: None,
         };
         let ctx = SelectionContext::new(&model, None)

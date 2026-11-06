@@ -32,7 +32,7 @@ PushPlaneObj::PushPlaneObj(
   auto N = SymbolicSize{"slot_bytes"};
   auto M = SymbolicSize{"num_blocks"};
   auto device_sym = SymbolicDevice{};
-  device_sym.set_options<kDLCUDA>();
+  device_sym.set_options<kDLGPU>();
   for (uint32_t i = 0; i < world_size; ++i) {
     TensorMatcher({2 * world_size, N})  //
         .with_dtype<uint8_t>()
@@ -76,7 +76,7 @@ PullPlaneObj::PullPlaneObj(
   auto N = SymbolicSize{"num_bytes"};
   auto M = SymbolicSize{"num_blocks"};
   auto device_sym = SymbolicDevice{};
-  device_sym.set_options<kDLCUDA>();
+  device_sym.set_options<kDLGPU>();
   for (uint32_t i = 0; i < world_size; ++i) {
     TensorMatcher({N})  //
         .with_dtype<uint8_t>()

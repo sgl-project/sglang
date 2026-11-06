@@ -24,7 +24,7 @@ from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager, TransferI
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 ROOM = 106
 DECODE_IP = "10.0.0.2"
@@ -35,6 +35,7 @@ def _manager(
     *, enabled: bool = True, status: KVPoll | None = KVPoll.WaitingForInput
 ) -> MooncakeKVManager:
     manager = MooncakeKVManager.__new__(MooncakeKVManager)
+    manager.customized_info_enabled = False
     manager.enable_deferred_decode_kv_release = enabled
     manager.request_status = {} if status is None else {ROOM: status}
     manager._deferred_ack_targets = {}
@@ -56,7 +57,6 @@ def _chunk() -> TransferKVChunk:
         prefill_kv_indices=np.array([1], dtype=np.int32),
         index_slice=slice(0, 1),
         is_last_chunk=False,
-        chunk_id=0,
         prefill_aux_index=None,
         state_indices=None,
     )
@@ -68,7 +68,6 @@ def _last_chunk() -> TransferKVChunk:
         prefill_kv_indices=np.array([1], dtype=np.int32),
         index_slice=slice(0, 1),
         is_last_chunk=True,
-        chunk_id=0,
         prefill_aux_index=0,
         state_indices=[[1]],
     )
@@ -115,14 +114,18 @@ class TestMooncakeAbortNotification(
         manager.failed_sessions = set()
         manager.state_layout_rejections = {}
         manager.req_to_decode_prefix_len = {}
-        manager.kv_args = MagicMock(kv_data_ptrs=[0x1000])
+        manager.kv_args = MagicMock(
+            kv_data_ptrs=[0x1000], aux_data_ptrs=[0] * 8, aux_item_lens=[64] * 8
+        )
         manager._get_dsa_cache_transfer_skip_flags = lambda info: (False, False)
         manager.decode_kv_args_table = {}
         manager.transfer_infos = {ROOM: {}}
         for i in range(num_dsts):
             session = f"decode-session-{i}"
             manager.decode_kv_args_table[session] = MagicMock(
-                requires_dcp_relayout=False
+                requires_dcp_relayout=False,
+                dst_aux_ptrs=[0] * 8,
+                dst_aux_item_lens=None,
             )
             manager.transfer_infos[ROOM][(DECODE_IP, DECODE_PORT + i)] = TransferInfo(
                 room=ROOM,

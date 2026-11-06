@@ -9,7 +9,9 @@
 # handled, mirroring the vLLM enablement:
 #   1. The in-kernel TDM gather fails to compile on gfx1250, so we disable the
 #      TDM routing path and gather activation rows into expert-sorted order in
-#      torch (passing ``gather_indx=None`` to the GEMM).
+#      torch (passing ``gather_indx=None`` to the GEMM). With
+#      SGLANG_GFX1250_W4A8_BACKEND=triton, SGLANG_GFX1250_W4A8_KERNEL_GATHER=1
+#      lets the plain-Triton kernel gather the rows instead.
 #   2. The gfx1250 ``moe_gemm_a8w4`` reads a CDNA4-swizzled MX scale as garbage,
 #      so the weight scale is kept unswizzled and ``swizzle_mx_scale=None`` is
 #      passed to the kernel.
@@ -21,7 +23,22 @@ from typing import Optional
 import torch
 import triton
 
+from sglang.srt.environ import envs
+
 _TDM_DISABLED = False
+
+# None lets aiter pick its default backend (gluon on gfx1250).
+_BACKEND = envs.SGLANG_GFX1250_W4A8_BACKEND.get().strip().lower() or None
+_KERNEL_GATHER = envs.SGLANG_GFX1250_W4A8_KERNEL_GATHER.get()
+if _BACKEND not in (None, "triton", "gluon"):
+    raise ValueError(
+        f"SGLANG_GFX1250_W4A8_BACKEND={_BACKEND!r}: expected triton, gluon or unset"
+    )
+if _KERNEL_GATHER and _BACKEND != "triton":
+    raise ValueError(
+        "SGLANG_GFX1250_W4A8_KERNEL_GATHER=1 needs SGLANG_GFX1250_W4A8_BACKEND=triton: "
+        "the gluon kernel gathers with TDM, which does not compile on gfx1250"
+    )
 
 
 def _import_aiter_w4a8():
@@ -251,18 +268,25 @@ def aiter_w4a8_gfx1250_forward(
         gate_valid = None
     gammas = routing_data.gate_scal
 
-    # gfx1250: the in-kernel gather is broken, so we pass gather_indx=None to
-    # moe_gemm_a8w4 and perform the gather ourselves.
-    gather_src = gather_idx.to(torch.long) // topk
-    if expert_map is not None:
-        # Rows past the local experts (sentinel bin) are left unwritten by
-        # ep_sort_routing and never consumed by the GEMMs.
-        gather_src = gather_src.clamp_(0, hidden_states.shape[0] - 1)
-    x = hidden_states[gather_src]
-    if apply_router_weight_on_input:
-        # Router weights must be applied in bf16 before quantization.
-        x = x * gammas[:, None].to(x.dtype)
-    x_fp8 = downcast_to_static_fp8(x, a13_scale)
+    if _KERNEL_GATHER and expert_map is None and not apply_router_weight_on_input:
+        # Downcast the num_tokens rows, and let GEMM 1 gather them: cheaper than
+        # gathering then downcasting num_tokens * topk bf16 rows.
+        x_fp8 = downcast_to_static_fp8(hidden_states, a13_scale)
+        gemm1_gather = gather_idx
+    else:
+        # gfx1250: the gluon in-kernel gather is broken, so we pass
+        # gather_indx=None to moe_gemm_a8w4 and perform the gather ourselves.
+        gather_src = gather_idx.to(torch.long) // topk
+        if expert_map is not None:
+            # Rows past the local experts (sentinel bin) are left unwritten by
+            # ep_sort_routing and never consumed by the GEMMs.
+            gather_src = gather_src.clamp_(0, hidden_states.shape[0] - 1)
+        x = hidden_states[gather_src]
+        if apply_router_weight_on_input:
+            # Router weights must be applied in bf16 before quantization.
+            x = x * gammas[:, None].to(x.dtype)
+        x_fp8 = downcast_to_static_fp8(x, a13_scale)
+        gemm1_gather = None
 
     # GEMM1: FP8 activations x MXFP4 weights, fused SwiGLU, requantize the
     # intermediate to FP8 using the down_proj activation scale (a2_scale) so
@@ -276,7 +300,7 @@ def aiter_w4a8_gfx1250_forward(
         a2_scale,
         w13_weight_bias,
         routing_data,
-        gather_indx=None,
+        gather_indx=gemm1_gather,
         scatter_indx=None,
         gammas=None,
         swizzle_mx_scale=None,
@@ -284,6 +308,7 @@ def aiter_w4a8_gfx1250_forward(
         apply_swiglu=True,
         alpha=gemm1_alpha,
         limit=gemm1_limit,
+        backend=_BACKEND,
     )
 
     # GEMM2: down projection, scatter back to token order and apply the router
@@ -303,6 +328,7 @@ def aiter_w4a8_gfx1250_forward(
         swizzle_mx_scale=None,
         out_dtype=torch.bfloat16,
         gate_valid=gate_valid,
+        backend=_BACKEND,
     )
 
     return intermediate_cache3.contiguous()

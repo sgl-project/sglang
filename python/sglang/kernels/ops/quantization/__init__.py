@@ -105,6 +105,7 @@ _TRITON_KERNELS = [
     ("fp8_kernel", "dequant_group_fp8_to_bf16"),
     ("fp8_kernel", "per_tensor_quant_mla_fp8"),
     ("fp8_kernel", "per_token_group_quant_mla_deep_gemm_masked_fp8"),
+    ("fp8_kernel", "block_quant_fp8"),
     ("int8_kernel", "per_token_quant_int8"),
     ("int8_kernel", "per_token_group_quant_int8"),
     ("awq_triton", "awq_dequantize_triton"),
@@ -124,6 +125,15 @@ del _mod, _fn
 
 register_kernel(
     KernelSpec(
+        op="quantization.mxfp8_quantize_swizzled",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.quantization.mxfp8_swizzled_triton:mxfp8_quantize_swizzled",
+        capabilities=CUDA_ONLY,
+    )
+)
+
+register_kernel(
+    KernelSpec(
         op="quantization.quantize_fp4_indexer_tensor",
         backend=KernelBackend.TRITON,
         target=(
@@ -140,5 +150,13 @@ register_kernel(
         op="quantization.act_quant",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.quantization.act_quant_triton:act_quant",
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="quantization.split_fp32_to_bf16x3",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.quantization.bf16x3_split:split_fp32_to_bf16x3",
+        capabilities=CUDA_ONLY,
     )
 )

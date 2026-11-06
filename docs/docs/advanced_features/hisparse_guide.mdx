@@ -177,7 +177,7 @@ Dense-layer K/V and index K stay on GPU; sparse-layer K/V use host memory plus a
 ### Benchmark
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
     --backend sglang \
     --dataset-path /path/to/ShareGPT_V3_unfiltered_cleaned_split.json \
     --dataset-name random \

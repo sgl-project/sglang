@@ -1,6 +1,7 @@
 """Unit tests for the MXFP8 MHA host pool: UE8M0 scales must round-trip
 through L2 alongside the fp8 payload."""
 
+import ctypes
 import unittest
 from unittest import mock
 
@@ -199,12 +200,88 @@ class TestMXFP8MHATokenToKVPoolHost(CustomTestCase):
             self.assertTrue(torch.equal(v_rows[layer][2:4], expected_v[layer]))
             self.assertTrue(torch.all(k_rows[layer][:2] == 0))
 
-    def test_storage_pages_are_rejected(self):
+    def test_flat_storage_pages_are_rejected(self):
         host = MHATokenToKVPoolMXFP8Host.__new__(MHATokenToKVPoolMXFP8Host)
         with self.assertRaises(NotImplementedError):
             host.get_dummy_flat_data_page()
         with self.assertRaises(NotImplementedError):
             host.get_data_page(0)
+
+    def test_storage_objects_round_trip_payload_and_scales(self):
+        """A page's K and V objects hold its payload then its scales: storing
+        them by pointer and loading them into another pool restores both."""
+
+        def make(seed):
+            host = _make_host([], [])
+            host.size = host.page_num * PAGE_SIZE
+            host.head_num, host.head_dim = HEAD_NUM, HEAD_DIM
+            host.dtype = torch.uint8
+            generator = torch.Generator().manual_seed(seed)
+            host.kv_buffer = torch.randint(
+                0,
+                256,
+                (2 * host.size * LAYER_NUM * HEAD_NUM * HEAD_DIM,),
+                dtype=torch.uint8,
+                generator=generator,
+            )
+            for scales in (host.k_scale_host, host.v_scale_host):
+                scales.copy_(
+                    torch.randint(
+                        0, 256, scales.shape, dtype=torch.uint8, generator=generator
+                    )
+                )
+            return host
+
+        def read(ptrs, sizes):
+            return b"".join(ctypes.string_at(p, s) for p, s in zip(ptrs, sizes))
+
+        def to_indices(pages):
+            return torch.cat(
+                [torch.arange(p * PAGE_SIZE, (p + 1) * PAGE_SIZE) for p in pages]
+            )
+
+        src, dst = make(0), make(1)
+        src_pages, dst_pages = [2, 0], [1, 3]
+        src_ptrs, src_sizes = src.get_page_buffer_meta(to_indices(src_pages))
+        objects = [read(p, s) for p, s in zip(src_ptrs, src_sizes)]
+        self.assertEqual(len(objects), 2 * len(src_pages))
+
+        payload_bytes = LAYER_NUM * PAGE_SIZE * HEAD_NUM * HEAD_DIM
+        v_offset = src.size * LAYER_NUM * HEAD_NUM * HEAD_DIM
+        for i, page in enumerate(src_pages):
+            k_start = page * payload_bytes
+            v_start = v_offset + k_start
+            self.assertEqual(
+                objects[2 * i],
+                bytes(src.kv_buffer[k_start : k_start + payload_bytes])
+                + bytes(src.k_scale_host[page].flatten()),
+            )
+            self.assertEqual(
+                objects[2 * i + 1],
+                bytes(src.kv_buffer[v_start : v_start + payload_bytes])
+                + bytes(src.v_scale_host[page].flatten()),
+            )
+
+        dst_ptrs, dst_sizes = dst.get_page_buffer_meta(to_indices(dst_pages))
+        for obj, ptrs, sizes in zip(objects, dst_ptrs, dst_sizes):
+            offset = 0
+            for ptr, size in zip(ptrs, sizes):
+                ctypes.memmove(ptr, obj[offset : offset + size], size)
+                offset += size
+        for src_page, dst_page in zip(src_pages, dst_pages):
+            self.assertTrue(
+                torch.equal(dst.k_scale_host[dst_page], src.k_scale_host[src_page])
+            )
+            self.assertTrue(
+                torch.equal(dst.v_scale_host[dst_page], src.v_scale_host[src_page])
+            )
+        self.assertEqual(
+            [
+                read(p, s)
+                for p, s in zip(*dst.get_page_buffer_meta(to_indices(dst_pages)))
+            ],
+            objects,
+        )
 
 
 if __name__ == "__main__":

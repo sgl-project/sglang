@@ -3,6 +3,7 @@ import time
 import unittest
 from types import SimpleNamespace
 
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.few_shot_gsm8k import run_eval
 from sglang.test.server_fixtures.disaggregation_fixture import (
@@ -15,6 +16,21 @@ from sglang.test.test_utils import (
 )
 
 register_amd_ci(est_time=600, suite="stage-b-test-large-8-gpu-mi35x-disaggregation-amd")
+
+_aux_tcp_ctx = None
+
+
+def setUpModule():
+    # Send aux data over TCP. Mooncake routes the host-memory aux buffers over
+    # RDMA between the two same-node servers, and that path intermittently
+    # stalls for 30 s under PP (#45849). KV still goes through Mooncake.
+    global _aux_tcp_ctx
+    _aux_tcp_ctx = envs.SGLANG_MOONCAKE_SEND_AUX_TCP.override(True)
+    _aux_tcp_ctx.__enter__()
+
+
+def tearDownModule():
+    _aux_tcp_ctx.__exit__(None, None, None)
 
 
 class TestDisaggregationPrefillPPAccuracy(PDDisaggregationServerBase):

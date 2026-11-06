@@ -9,7 +9,7 @@ import torch.distributed as dist
 
 from sglang.srt.connector import BaseConnector
 from sglang.srt.utils import init_custom_process_group
-from sglang.srt.utils.common import is_npu
+from sglang.srt.utils.device import is_npu
 
 logger = logging.getLogger(__name__)
 

@@ -13,8 +13,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecution
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.runtime_context import get_spec
-from sglang.srt.utils import add_prefix
 
 # Adapted from
 # https://github.com/SafeAILab/EAGLE/blob/main/eagle/model/cnets.py
@@ -269,6 +270,8 @@ class LlamaModel(nn.Module):
 
 
 class LlamaForCausalLMEagle3(LlamaForCausalLM):
+    draft_parallel_spec = DraftParallelSpec(tp_execution=DraftTPExecution.SINGLE_GROUP)
+
     def __init__(
         self,
         config: LlamaConfig,

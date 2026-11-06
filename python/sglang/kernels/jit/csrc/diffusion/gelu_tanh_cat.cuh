@@ -56,7 +56,7 @@ void gelu_tanh_cat(tvm::ffi::TensorView attn, tvm::ffi::TensorView mlp, tvm::ffi
   auto dtype = SymbolicDType{};
   dtype.set_options<T>();
   auto device_ = SymbolicDevice{};
-  device_.set_options<kDLCUDA>();
+  device_.set_options<kDLGPU>();
   for (const auto tensor : {attn, mlp, output}) {
     dtype.verify(tensor.dtype());
     device_.verify(tensor.device());

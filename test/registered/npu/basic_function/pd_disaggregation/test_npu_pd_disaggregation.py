@@ -9,7 +9,7 @@ from typing import Dict
 
 import requests
 
-from sglang.bench_serving import get_tokenizer
+from sglang.benchmark.utils import get_tokenizer
 from sglang.test.ascend.npu_eval_accuracy_kit import _is_pr_pipeline
 from sglang.test.ascend.test_ascend_utils import QWEN3_32B_WEIGHTS_PATH
 from sglang.test.ci.ci_register import register_npu_ci
@@ -22,8 +22,8 @@ from sglang.test.test_utils import (
     popen_with_error_check,
 )
 
-register_npu_ci(est_time=400, suite="base-b-test-16-npu-a3")
-register_npu_ci(est_time=400, suite="nightly-16-npu-a3", nightly=True)
+register_npu_ci(est_time=400, suite="base-b-test-4-npu-a3")
+register_npu_ci(est_time=400, suite="nightly-4-npu-a3", nightly=True)
 
 
 class DisaggregationHiCacheBase(PDDisaggregationServerBase):

@@ -7,11 +7,11 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
-from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.unified_allocator_fixtures import build_test_unified_pools
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
@@ -199,7 +199,7 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
             self.assertEqual(req.sampling_params.min_new_tokens, 16)
 
     def test_unified_budget_rounds_prompt_and_decode_together(self):
-        bundle = init_unified_swa_pools(
+        bundle = build_test_unified_pools(
             device="cpu",
             kv_cache_dtype=torch.float16,
             head_num=1,

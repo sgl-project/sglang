@@ -2,7 +2,7 @@ import numpy as np
 from sglang_simulator.simulation.types import RequestStats, SchedulerConfig
 from sglang_simulator.spec.accelerator import AcceleratorInfo
 from sglang_simulator.spec.model import ModelInfo
-from sglang_simulator.time_predictor.aiconfigurator import get_perf_model
+from sglang_simulator.time_predictor.aisimulate import get_perf_model
 
 
 def calc_kv_cache_cell_elems(model_info: ModelInfo, tp_size: int, pp_size: int) -> int:

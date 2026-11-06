@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Generator, List, Optional, Tuple
 
 import zmq
 
-from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import sock_recv, sock_send, wrap_as_pickle
 from sglang.srt.runtime_context import get_parallel

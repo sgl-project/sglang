@@ -6,6 +6,7 @@ from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import WhitespaceSplit
 from transformers import (
     PreTrainedTokenizerFast,
+    Qwen2_5_VLConfig,
     Qwen2VLProcessor,
     Qwen2VLVideoProcessor,
 )
@@ -57,14 +58,13 @@ def make_processor(case, config, image_processor_cls=None):
         video_processor=Qwen2VLVideoProcessor(),
         tokenizer=tokenizer,
     )
-    hf_config = SimpleNamespace(
-        model_type="qwen2_5_vl",
+    hf_config = Qwen2_5_VLConfig(
         architectures=["Qwen2_5_VLForConditionalGeneration"],
         vision_start_token_id=1,
         image_token_id=2,
         vision_end_token_id=3,
         video_token_id=5,
-        vision_config=SimpleNamespace(spatial_merge_size=2, tokens_per_second=2),
+        vision_config={"spatial_merge_size": 2, "tokens_per_second": 2},
     )
     server_args = SimpleNamespace(
         # Non-auto: get_resolved_model_impl would choke on a SimpleNamespace.
