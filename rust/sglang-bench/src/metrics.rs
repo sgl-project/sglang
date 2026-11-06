@@ -198,10 +198,9 @@ pub fn calculate(
     }
 }
 
-/// Peak output tokens per second and peak concurrent requests, bucketed into
-/// one-second windows from the first request's start. Token times are
-/// reconstructed from each request's TTFT plus its inter-token latencies,
-/// which is how the Python script derives them.
+/// Token throughput uses one-second windows from the first request's start,
+/// with token times reconstructed from TTFT and ITLs. Peak concurrency counts
+/// overlapping half-open request intervals, matching the Python client.
 fn peak_windows(outputs: &[RequestOutput]) -> (f64, usize) {
     let successful = || outputs.iter().filter(|o| o.success);
     let Some(min_start) = successful().map(|o| o.start_time).reduce(f64::min) else {
@@ -213,7 +212,7 @@ fn peak_windows(outputs: &[RequestOutput]) -> (f64, usize) {
 
     let buckets = (max_end - min_start).ceil() as usize + 1;
     let mut tokens_per_second = vec![0u64; buckets];
-    let mut concurrent_per_second = vec![0u64; buckets];
+    let mut concurrency_events = Vec::new();
 
     for output in successful() {
         let mut token_time = output.start_time + output.ttft;
@@ -229,17 +228,26 @@ fn peak_windows(outputs: &[RequestOutput]) -> (f64, usize) {
             record(token_time);
         }
 
-        let start_second = (output.start_time - min_start) as usize;
-        let end_second = ((output.start_time + output.latency) - min_start) as usize;
-        let last = (end_second + 1).min(buckets);
-        for bucket in &mut concurrent_per_second[start_second.min(last)..last] {
-            *bucket += 1;
+        let end = output.start_time + output.latency;
+        // Empty half-open intervals cannot contribute to concurrency.
+        if end > output.start_time {
+            concurrency_events.push((output.start_time, 1i64));
+            concurrency_events.push((end, -1i64));
         }
+    }
+
+    // Departures precede arrivals at the same timestamp for [start, end).
+    concurrency_events.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    let mut active = 0i64;
+    let mut peak_concurrency = 0;
+    for (_, delta) in concurrency_events {
+        active += delta;
+        peak_concurrency = peak_concurrency.max(active as usize);
     }
 
     (
         tokens_per_second.iter().copied().max().unwrap_or(0) as f64,
-        concurrent_per_second.iter().copied().max().unwrap_or(0) as usize,
+        peak_concurrency,
     )
 }
 
@@ -623,8 +631,8 @@ mod tests {
         assert_eq!(metrics.max_concurrent_requests, 0);
     }
 
-    /// The peak windows bucket token arrivals by whole second from the first
-    /// start, so two requests overlapping in second 0 peak at 2.
+    /// Token throughput uses whole-second buckets, but sequential requests
+    /// within the same bucket have a peak concurrency of one.
     #[test]
     fn peak_windows_bucket_by_second() {
         let outputs = vec![
@@ -650,7 +658,37 @@ mod tests {
         let (peak_tokens, peak_requests) = peak_windows(&outputs);
         // Second 0 holds 3 tokens from the first request plus 1 from the second.
         assert_eq!(peak_tokens, 4.0);
-        assert_eq!(peak_requests, 2);
+        assert_eq!(peak_requests, 1);
+    }
+
+    #[test]
+    fn peak_concurrency_counts_half_open_intervals() {
+        let cases: &[(&[(f64, f64)], usize)] = &[
+            (&[(10.0, 0.125), (10.25, 0.125), (10.5, 0.125)], 1),
+            (&[(10.0, 1.0), (11.0, 1.0)], 1),
+            (&[(10.0, 0.125), (10.125, 0.125)], 1),
+            (&[(10.0, 0.5), (10.0, 0.5), (10.5, 0.5), (10.5, 0.5)], 2),
+            (&[(10.25, 0.5), (10.0, 0.5), (10.125, 0.5)], 3),
+            (&[(10.0, 0.0)], 0),
+            (&[(10.25, 0.0), (10.0, 0.5), (10.125, 0.5)], 2),
+        ];
+        for &(intervals, expected) in cases {
+            let mut outputs: Vec<_> = intervals
+                .iter()
+                .map(|&(start_time, latency)| RequestOutput {
+                    start_time,
+                    latency,
+                    ..output(0.0, vec![], latency, 1)
+                })
+                .collect();
+            outputs.push(RequestOutput {
+                success: false,
+                start_time: 10.0,
+                latency: 2.0,
+                ..Default::default()
+            });
+            assert_eq!(peak_windows(&outputs).1, expected, "{intervals:?}");
+        }
     }
 
     #[test]
