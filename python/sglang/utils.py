@@ -105,7 +105,7 @@ def convert_json_schema_to_str(json_schema: Union[dict, str, Type[BaseModel]]) -
         schema_str = json.dumps(json_schema)
     elif isinstance(json_schema, str):
         schema_str = json_schema
-    elif issubclass(json_schema, BaseModel):
+    elif isinstance(json_schema, type) and issubclass(json_schema, BaseModel):
         schema_str = json.dumps(json_schema.model_json_schema())
     else:
         raise ValueError(
