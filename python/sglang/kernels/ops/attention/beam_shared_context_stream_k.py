@@ -61,11 +61,11 @@ _MAX_OFFSET = 2**31
 
 @triton.jit
 def _tile_units(
-    context_cu_seqlens,
-    decode_lens,
-    group,
-    BLOCK_N: tl.constexpr,
-    SETUP_UNITS: tl.constexpr,
+    context_cu_seqlens,  # [groups + 1] int32 offsets into context_slots
+    decode_lens,  # [groups] int32, decode steps per group
+    group,  # the group whose tiles are counted
+    BLOCK_N: tl.constexpr,  # prompt tokens per work unit
+    SETUP_UNITS: tl.constexpr,  # units charged for starting a tile
 ):
     context_length = tl.load(context_cu_seqlens + group + 1) - tl.load(
         context_cu_seqlens + group
@@ -75,12 +75,12 @@ def _tile_units(
 
 @triton.jit
 def _total_units(
-    context_cu_seqlens,
-    decode_lens,
-    num_groups,
-    TILES_PER_GROUP: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    SETUP_UNITS: tl.constexpr,
+    context_cu_seqlens,  # [groups + 1] int32 offsets into context_slots
+    decode_lens,  # [groups] int32, decode steps per group
+    num_groups,  # groups in the bucket
+    TILES_PER_GROUP: tl.constexpr,  # Q_HEADS * BEAM_BLOCKS
+    BLOCK_N: tl.constexpr,  # prompt tokens per work unit
+    SETUP_UNITS: tl.constexpr,  # units charged for starting a tile
 ):
     total = 0
     for group in range(0, num_groups):
@@ -92,13 +92,13 @@ def _total_units(
 
 @triton.jit
 def _locate_unit(
-    unit,
-    context_cu_seqlens,
-    decode_lens,
-    num_groups,
-    TILES_PER_GROUP: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    SETUP_UNITS: tl.constexpr,
+    unit,  # index into the units of all tiles, in order
+    context_cu_seqlens,  # [groups + 1] int32 offsets into context_slots
+    decode_lens,  # [groups] int32, decode steps per group
+    num_groups,  # groups in the bucket
+    TILES_PER_GROUP: tl.constexpr,  # Q_HEADS * BEAM_BLOCKS
+    BLOCK_N: tl.constexpr,  # prompt tokens per work unit
+    SETUP_UNITS: tl.constexpr,  # units charged for starting a tile
 ):
     """Group of a unit, the group's first unit and its units per tile."""
     group_base = 0
@@ -119,47 +119,51 @@ def _locate_unit(
 
 
 @triton.jit
-def _unit_owner(unit, total_units, num_ctas):
+def _unit_owner(
+    unit,  # index into the units of all tiles, in order
+    total_units,  # units of all tiles
+    num_ctas,  # CTAs in the persistent grid
+):
     # CTA c owns units [c * total // num_ctas, (c + 1) * total // num_ctas).
     return ((unit + 1) * num_ctas - 1) // total_units
 
 
 @triton.jit
 def _shared_context_stream_k_kernel(
-    q,
-    k_buffer,
-    v_buffer,
-    row_indices,
-    context_slots,
-    context_cu_seqlens,
-    decode_slots,
-    decode_lens,
-    output,
-    partial_output,
-    partial_lse,
-    softmax_scale,
-    num_groups,
-    num_ctas,
-    stride_q_row,
-    stride_q_head,
-    stride_row_group,
-    stride_row_beam,
-    stride_k_slot,
-    stride_k_head,
-    stride_v_slot,
-    stride_v_head,
-    stride_decode_group,
-    stride_out_row,
-    stride_out_head,
-    BEAM_WIDTH: tl.constexpr,
-    Q_PER_KV: tl.constexpr,
-    Q_HEADS: tl.constexpr,
-    BEAM_BLOCKS: tl.constexpr,
-    HEAD_DIM: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-    SETUP_UNITS: tl.constexpr,
+    q,  # [rows, q_heads, HEAD_DIM], contiguous along HEAD_DIM
+    k_buffer,  # [kv_slots, kv_heads, HEAD_DIM], the layer's K cache
+    v_buffer,  # [kv_slots, kv_heads, HEAD_DIM], the layer's V cache
+    row_indices,  # [groups, BEAM_WIDTH] int32, each beam's row of q and output
+    context_slots,  # [>= total prompt tokens] int32 KV slots, groups back to back
+    context_cu_seqlens,  # [groups + 1] int32, each group's start in context_slots
+    decode_slots,  # [groups, capacity * BEAM_WIDTH] int32 KV slots, step-major
+    decode_lens,  # [groups] int32, decode steps each beam attends to
+    output,  # like q; written here for tiles that one CTA covers
+    partial_output,  # fp32 [tiles + num_ctas, BLOCK_M, HEAD_DIM], contiguous
+    partial_lse,  # fp32 [tiles + num_ctas, BLOCK_M], log2 softmax sums
+    softmax_scale,  # float, scales q.k before the softmax
+    num_groups,  # groups in the bucket, row_indices.shape[0]
+    num_ctas,  # CTAs in the persistent grid
+    stride_q_row,  # q.stride(0); all strides are in elements
+    stride_q_head,  # q.stride(1)
+    stride_row_group,  # row_indices.stride(0)
+    stride_row_beam,  # row_indices.stride(1)
+    stride_k_slot,  # k_buffer.stride(0)
+    stride_k_head,  # k_buffer.stride(1)
+    stride_v_slot,  # v_buffer.stride(0)
+    stride_v_head,  # v_buffer.stride(1)
+    stride_decode_group,  # decode_slots.stride(0); stride(1) must be 1
+    stride_out_row,  # output.stride(0)
+    stride_out_head,  # output.stride(1)
+    BEAM_WIDTH: tl.constexpr,  # beams per group, row_indices.shape[1]
+    Q_PER_KV: tl.constexpr,  # query heads per KV head
+    Q_HEADS: tl.constexpr,  # query heads
+    BEAM_BLOCKS: tl.constexpr,  # tiles per group and query head
+    HEAD_DIM: tl.constexpr,  # q.shape[2]
+    BLOCK_M: tl.constexpr,  # beams per tile
+    BLOCK_N: tl.constexpr,  # prompt tokens per work unit
+    BLOCK_D: tl.constexpr,  # HEAD_DIM rounded up to a power of 2
+    SETUP_UNITS: tl.constexpr,  # units charged for starting a tile
 ):
     TILES_PER_GROUP: tl.constexpr = Q_HEADS * BEAM_BLOCKS
     cta = tl.program_id(0)
@@ -336,27 +340,27 @@ def _shared_context_stream_k_kernel(
 
 @triton.jit
 def _merge_segments_kernel(
-    partial_output,
-    partial_lse,
-    row_indices,
-    output,
-    context_cu_seqlens,
-    decode_lens,
-    num_groups,
-    num_ctas,
-    stride_row_group,
-    stride_row_beam,
-    stride_out_row,
-    stride_out_head,
-    BEAM_WIDTH: tl.constexpr,
-    Q_HEADS: tl.constexpr,
-    BEAM_BLOCKS: tl.constexpr,
-    HEAD_DIM: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-    SETUP_UNITS: tl.constexpr,
-    MERGE_ROWS: tl.constexpr,
+    partial_output,  # fp32 [tiles + num_ctas, BLOCK_M, HEAD_DIM], contiguous
+    partial_lse,  # fp32 [tiles + num_ctas, BLOCK_M], log2 softmax sums
+    row_indices,  # [groups, BEAM_WIDTH] int32, each beam's row of output
+    output,  # [rows, Q_HEADS, HEAD_DIM]; written for tiles split across CTAs
+    context_cu_seqlens,  # [groups + 1] int32 offsets into context_slots
+    decode_lens,  # [groups] int32, decode steps per group
+    num_groups,  # groups in the bucket, row_indices.shape[0]
+    num_ctas,  # CTAs of the stream-K grid that wrote the partials
+    stride_row_group,  # row_indices.stride(0); all strides are in elements
+    stride_row_beam,  # row_indices.stride(1)
+    stride_out_row,  # output.stride(0)
+    stride_out_head,  # output.stride(1)
+    BEAM_WIDTH: tl.constexpr,  # beams per group, row_indices.shape[1]
+    Q_HEADS: tl.constexpr,  # query heads
+    BEAM_BLOCKS: tl.constexpr,  # tiles per group and query head
+    HEAD_DIM: tl.constexpr,  # output.shape[2]
+    BLOCK_M: tl.constexpr,  # beams per tile
+    BLOCK_N: tl.constexpr,  # prompt tokens per work unit
+    BLOCK_D: tl.constexpr,  # HEAD_DIM rounded up to a power of 2
+    SETUP_UNITS: tl.constexpr,  # units charged for starting a tile
+    MERGE_ROWS: tl.constexpr,  # beams merged per program
 ):
     TILES_PER_GROUP: tl.constexpr = Q_HEADS * BEAM_BLOCKS
     tile = tl.program_id(0)
@@ -436,18 +440,18 @@ def _merge_segments_kernel(
 
 
 def shared_context_attention_stream_k(
-    q: torch.Tensor,
-    k_buffer: torch.Tensor,
-    v_buffer: torch.Tensor,
-    row_indices: torch.Tensor,
-    context_slots: torch.Tensor,
-    context_cu_seqlens: torch.Tensor,
-    decode_slots: torch.Tensor,
-    decode_lens: torch.Tensor,
+    q: torch.Tensor,  # [rows, q_heads, head_dim]
+    k_buffer: torch.Tensor,  # [kv_slots, kv_heads, head_dim], the layer's K cache
+    v_buffer: torch.Tensor,  # [kv_slots, kv_heads, head_dim], the layer's V cache
+    row_indices: torch.Tensor,  # [groups, beam_width] int32, each beam's row of q
+    context_slots: torch.Tensor,  # [>= total prompt tokens] int32 KV slots
+    context_cu_seqlens: torch.Tensor,  # [groups + 1] int32 offsets into context_slots
+    decode_slots: torch.Tensor,  # [groups, capacity * beam_width] int32, step-major
+    decode_lens: torch.Tensor,  # [groups] int32, decode steps per group
     *,
-    output: torch.Tensor | None = None,
-    softmax_scale: float,
-    num_ctas: Optional[int] = None,
+    output: torch.Tensor | None = None,  # like q; allocated when None
+    softmax_scale: float,  # scales q.k before the softmax
+    num_ctas: Optional[int] = None,  # persistent grid size
 ) -> torch.Tensor:
     """Shared prompt and per-beam suffix attention on a persistent stream-K grid.
 
