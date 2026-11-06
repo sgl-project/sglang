@@ -22,6 +22,10 @@ from sglang_simulator.time_predictor.simopus_native import SimOpusNativeCostAdap
 
 @pytest.fixture(params=[2, 4])
 def public_adapter(request, monkeypatch):
+    pytest.importorskip(
+        "simopus.sdk",
+        reason="install the current SimOpus SDK for native public integration controls",
+    )
     from simopus.sdk import DecodeExecutionProfile
     from simopus.sdk.models.umd import umd_static
     from simopus.sdk.models.umd.prediction_result import DatabaseProvenance

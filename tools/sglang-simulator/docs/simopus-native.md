@@ -90,3 +90,10 @@ tail drains. Synthetic leaf values exercise software contracts only. Neither
 passing these controls nor initialization grants timing, silicon or accuracy
 acceptance. Use the exact matching qualified data and separately declared
 evaluation protocol for numerical accuracy work.
+
+For bounded CPU HTTP controls, select SGLang's existing Python TreeCore with
+`SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python`. A complete source checkout may
+otherwise build its optional Rust extension at startup. This selection tests
+the native Python cache policy and does not validate Rust/JIT execution or
+represent a performance comparison. Install the current SimOpus SDK explicitly
+for its integration controls; the simulator does not install an older SDK.
