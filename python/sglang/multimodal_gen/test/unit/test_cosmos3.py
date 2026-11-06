@@ -2504,6 +2504,25 @@ class TestCosmos3BCGWarmup(CustomTestCase):
 
 
 class TestCosmos3BCGTextBuckets(unittest.TestCase):
+    def test_one_frame_conditioned_request_stays_eager(self):
+        class Transformer:
+            pass
+
+        stage = Cosmos3DenoisingStage.__new__(Cosmos3DenoisingStage)
+        stage.server_args = types.SimpleNamespace(enable_breakable_cuda_graph=True)
+        stage.transformer = Transformer()
+        latents = types.SimpleNamespace(
+            device=types.SimpleNamespace(type="cuda"),
+            dtype=torch.bfloat16,
+            shape=(1, 1, 1, 2, 2),
+        )
+        with mock.patch(
+            "sglang.multimodal_gen.runtime.pipelines_core.stages."
+            "model_specific_stages.cosmos3.Cosmos3OmniTransformer",
+            Transformer,
+        ):
+            self.assertIsNone(stage._maybe_get_bcg_runner(latents, None, torch.ones(1)))
+
     def test_prefix_pad_reads_new_value_on_each_replay(self):
         rows = torch.tensor(3)
         prefix_pad = _Cosmos3PrefixPad(rows)

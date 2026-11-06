@@ -1372,7 +1372,9 @@ class Cosmos3DenoisingStage(PipelineStage):
         if profiler:
             profiler.step_denoising_step()
 
-    def _maybe_get_bcg_runner(self, latents: torch.Tensor, control_latents):
+    def _maybe_get_bcg_runner(
+        self, latents: torch.Tensor, control_latents, noisy_frame_mask
+    ):
         args = self.server_args
         if args is None or not args.enable_breakable_cuda_graph:
             return None
@@ -1384,6 +1386,7 @@ class Cosmos3DenoisingStage(PipelineStage):
             latents.device.type != "cuda"
             or latents.dtype != torch.bfloat16
             or latents.shape[2] != 1
+            or noisy_frame_mask is not None
             or args.num_gpus != 1
             or not self.transformer.bcg_bf16_eligible
             or self.transformer.step_precision_controller is not None
@@ -1516,7 +1519,9 @@ class Cosmos3DenoisingStage(PipelineStage):
             runner = (
                 None
                 if has_extra_modality
-                else self._maybe_get_bcg_runner(latents, control_latents)
+                else self._maybe_get_bcg_runner(
+                    latents, control_latents, noisy_frame_mask
+                )
             )
             if runner is None:
                 return self.transformer(**call_kwargs)
