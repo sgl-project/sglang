@@ -70,13 +70,13 @@ from sglang.srt.multimodal.cache import DiskPreprocessCache, MultimodalPreproces
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.multimodal.processors.processor_config import MultimodalProcessorConfig
+from sglang.srt.multimodal.token_space_mm_process import processor as processor_module
 from sglang.srt.multimodal.token_space_mm_process.expansion import (
     expand_token_placeholders,
 )
 from sglang.srt.multimodal.token_space_mm_process.process_strategy import (
     TokenSpaceProcessStrategy,
 )
-from sglang.srt.multimodal.token_space_mm_process import processor as processor_module
 from sglang.srt.multimodal.token_space_mm_process.processor import (
     TokenSpaceProcessor,
 )
@@ -539,6 +539,8 @@ class TestTokenSpaceProcessor(unittest.TestCase):
         class LoaderOptionsStrategy(_ImageWidthStrategy):
             audio_sample_rate = 24000
             discard_alpha_channel = False
+            gpu_image_decode = False
+            rgb_conversion = "white"
 
         processor = self._processor(LoaderOptionsStrategy)
         load = AsyncMock(return_value=([Image.new("RGB", (1, 1))], [], []))
@@ -551,13 +553,28 @@ class TestTokenSpaceProcessor(unittest.TestCase):
             audio_sample_rate=24000,
             discard_alpha_channel=False,
             video_decode_device=None,
+            gpu_image_decode=False,
+            rgb_conversion="white",
         )
+
+    def test_mm_process_config_image_options_override_the_strategy(self):
+        processor = self._processor(
+            mm_process_config={
+                "image_decoder": "nvjpeg_fancy",
+                "image_rgb_conversion": "smart",
+            }
+        )
+        load = AsyncMock(return_value=([Image.new("RGB", (1, 1))], [], []))
+        with patch.object(processor, "_load_media_lists", load):
+            asyncio.run(processor.process(["image"], input_ids=[1, IMAGE]))
+        self.assertEqual(load.await_args.kwargs["gpu_image_decode"], "nvjpeg_fancy")
+        self.assertEqual(load.await_args.kwargs["rgb_conversion"], "smart")
 
 
 # Class attributes the media loader and worker pools read.
 _LOADER_ATTRIBUTES = (
     "gpu_image_decode",
-    "smart_rgb_conversion",
+    "rgb_conversion",
     "video_preprocessing_device",
     "supports_mm_processor_concurrency",
 )
@@ -592,7 +609,9 @@ def _token_space_defaults(strategy_class, hf_config):
     # Serving takes the IO thread default from the serving spec, not the core.
     serving_spec = serving_spec_for(hf_config)(hf_config)
     defaults["auto_mm_io_worker_num"] = serving_spec.auto_mm_io_worker_num
-    defaults["video_preprocessing_device"] = strategy_class.video_preprocessing_device
+    # The strategy's loader defaults apply per instance; the class keeps the mixin's.
+    for name in ("gpu_image_decode", "rgb_conversion", "video_preprocessing_device"):
+        defaults[name] = getattr(strategy_class, name)
     return defaults
 
 

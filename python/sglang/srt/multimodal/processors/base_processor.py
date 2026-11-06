@@ -379,6 +379,7 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
                 f"{type(self._processor).__qualname__}"
             ),
             "gpu_image_decode": self.gpu_image_decode,
+            "rgb_conversion": self.rgb_conversion,
             "image_processor_backend": self.image_processor_backend,
             "feature_transport": self._feature_transport.mm_feature_transport,
             "image_config": self.image_config,
@@ -855,6 +856,8 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
                         frame_count_limit,
                         audio_sample_rate,
                         discard_alpha_channel,
+                        gpu_image_decode=self.gpu_image_decode,
+                        rgb_conversion=self.rgb_conversion,
                     )
                 )
                 task_info.append((modality, data, frame_count_limit))
@@ -1008,6 +1011,8 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
             audio_data,
             audio_sample_rate=audio_sample_rate,
             discard_alpha_channel=discard_alpha_channel,
+            gpu_image_decode=self.gpu_image_decode,
+            rgb_conversion=self.rgb_conversion,
         )
 
         return BaseMultiModalProcessorOutput(
