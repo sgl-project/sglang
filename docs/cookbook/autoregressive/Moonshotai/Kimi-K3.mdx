@@ -1,7 +1,6 @@
 ---
 title: Kimi-K3
 description: "Deploy Moonshot AI's Kimi-K3 with SGLang — a 2.8T-parameter hybrid Mixture-of-Experts vision-language model (Kimi Delta Attention + MLA, 16/896 active experts) with NVIDIA, AMD, and NPU recipes."
-tag: NEW
 ---
 
 ## Deployment

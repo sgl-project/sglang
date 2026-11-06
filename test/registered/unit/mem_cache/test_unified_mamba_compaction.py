@@ -31,7 +31,6 @@ class TestMambaCompaction(CustomTestCase):
         kv = StateView(
             arena=pool,
             spec=pool.spec("mamba"),
-            spec_state_size=0,
             mamba_layer_ids=[1, 3],
         )
         alloc = Band(

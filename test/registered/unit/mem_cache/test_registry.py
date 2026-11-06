@@ -74,7 +74,7 @@ def _make_ctx(
     # Static pools: the tree's slots follow the pool shape.
     params.token_to_kv_pool_allocator.storage = None
     params.sliding_window_size = 128
-    params.draft_swa_window = 0
+    params.draft_window_reaches = {}
     return TreeCacheBuildContext(
         server_args=server_args,
         params=params,
@@ -182,6 +182,7 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
             ),
             page_size=64,
             sliding_window_size=128,
+            tree_slots=(TreeSlot(component="SWA", family=TREE_WINDOW, window=128),),
         )
         component = SWAComponent(
             MagicMock(),
