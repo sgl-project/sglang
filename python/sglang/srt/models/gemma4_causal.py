@@ -52,7 +52,7 @@ from sglang.srt.layers.linear import (
     _resolve_linear_group,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
+from sglang.srt.layers.moe.executor_provider import resolve_moe_executor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -283,9 +283,7 @@ class Gemma4MoE(nn.Module):
             custom_routing_function=routing_function,
         )
 
-        experts_type = get_moe_impl_class(quant_config)
-
-        self.experts = experts_type(
+        expert_args = dict(
             num_experts=config.num_experts + get_exec().moe.ep_num_redundant_experts,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
@@ -296,6 +294,16 @@ class Gemma4MoE(nn.Module):
             activation=activation,
             reduce_results=reduce_results,
         )
+        selection = resolve_moe_executor(
+            expert_args,
+            model_type=config.model_type,
+            model_class=type(self).__name__,
+        )
+        output_format = selection.topk_output_format(
+            self.topk.topk_config.output_format
+        )
+        self.experts = selection.factory(**expert_args)
+        self.topk.topk_config.output_format = output_format
         self.topk.bind_runner_backend(self.experts.runner_backend)
 
     def forward(

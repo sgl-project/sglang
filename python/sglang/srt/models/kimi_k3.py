@@ -77,7 +77,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import route_quant_handoff
-from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
+from sglang.srt.layers.moe.executor_provider import resolve_moe_executor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import (
     TopK,
@@ -502,7 +502,7 @@ class KimiK3MoE(nn.Module):
 
         # Routed experts (operate in moe_hidden_size space)
         # gate_up_interleaved=False: K3 loads per-expert w1/w3 into non-interleaved layout
-        self.experts = get_moe_impl_class(moe_quant_config)(
+        expert_args = dict(
             num_experts=getattr(config, "n_routed_experts", config.num_experts),
             top_k=config.num_experts_per_token,
             hidden_size=self.moe_hidden_size,
@@ -522,6 +522,12 @@ class KimiK3MoE(nn.Module):
             ),
             prefix=add_prefix("experts", prefix),
         )
+        selection = resolve_moe_executor(
+            expert_args,
+            model_type=config.model_type,
+            model_class=type(self).__name__,
+        )
+        self.experts = selection.factory(**expert_args)
 
         self.topk = TopK(
             top_k=config.num_experts_per_token,
@@ -537,7 +543,7 @@ class KimiK3MoE(nn.Module):
             apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
             # TRT-LLM cannot consume fused-front's row-strided router logits;
             # keep K3's FP32 router and pass precomputed top-k instead.
-            output_format=(
+            output_format=selection.topk_output_format(
                 TopKOutputFormat.STANDARD
                 if quant_config is None
                 or (
