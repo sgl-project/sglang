@@ -1,7 +1,8 @@
 """End-to-end Unlimited-OCR v2 (BF16) on the standard Torch ModelRunner on Apple MPS.
 
 Covers the multimodal path (processor, SAM/CLIP encoder, DASH decoder with the
-Metal kernels) and document splitting, against drawn pages with known text.
+Metal kernels), document splitting and the MPS startup defaults (warmup, KV
+pool size), against drawn pages with known text.
 """
 
 import base64
@@ -77,14 +78,22 @@ class TestUnlimitedOcrV2TorchMps(CustomTestCase):
                 "unlimited-ocr",
                 "--enable-custom-logit-processor",
                 "--uocr-doc-split",
-                "--max-total-tokens",
-                "16384",
+                # With no --max-total-tokens, the MPS defaults size the KV pool.
+                "--uocr-max-page-tokens",
+                "8000",
             ],
         )
 
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid, wait_timeout=30)
+
+    def test_mps_defaults_cap_the_kv_pool_and_warm_up(self):
+        info = requests.get(f"{self.base_url}/server_info", timeout=30).json()
+        self.assertEqual(info["warmups"], "unlimited_ocr_v2")
+        # A whole number of 15,168-token windows (one page, 8000 page tokens).
+        self.assertGreater(info["max_total_tokens"], 0)
+        self.assertEqual(info["max_total_tokens"] % 15168, 0)
 
     def _ocr(self, titles: list[str]) -> str:
         content = [

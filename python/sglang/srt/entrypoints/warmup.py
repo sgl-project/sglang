@@ -159,3 +159,55 @@ async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerM
             generate_req_input.bootstrap_host = FAKE_BOOTSTRAP_HOST
 
         await tokenizer_manager.generate_request(generate_req_input, None).__anext__()
+
+
+def _drawn_page(title: str) -> str:
+    """A white page with a title and numbered lines, as a PNG data URL."""
+    import base64
+    import io
+
+    from PIL import Image, ImageDraw, ImageFont
+
+    image = Image.new("RGB", (980, 1400), "white")
+    draw = ImageDraw.Draw(image)
+    draw.text((90, 90), title, fill="black", font=ImageFont.load_default(size=56))
+    body = ImageFont.load_default(size=34)
+    for i in range(8):
+        draw.text(
+            (90, 220 + i * 60),
+            f"{i + 1}. {title} line {i + 1}.",
+            fill="black",
+            font=body,
+        )
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+
+
+@warmup("unlimited_ocr_v2")
+async def unlimited_ocr_v2(
+    disaggregation_mode: str, tokenizer_manager: TokenizerManager
+):
+    """Run a one-page gundam and a two-page base document through the model.
+
+    The first image request otherwise pays one-time costs in the vision
+    encoder and decoder (graph compiles, kernel builds); on Apple MPS that
+    made the first request's TTFT 10-18 s instead of about 1 s.
+    """
+    for mode, titles in (
+        ("gundam", ["Warmup"]),
+        ("gundam", ["Warmup A", "Warmup B"]),
+        ("base", ["Warmup A", "Warmup B"]),
+    ):
+        req = GenerateReqInput(
+            text="<PAGE><image>" * len(titles) + "Multi page parsing.",
+            image_data=[_drawn_page(title) for title in titles],
+            images_config={"image_mode": mode},
+            sampling_params={"max_new_tokens": 8, "temperature": 0},
+        )
+        if disaggregation_mode != "null":
+            req.bootstrap_room = 0
+            req.bootstrap_host = FAKE_BOOTSTRAP_HOST
+        async for _ in tokenizer_manager.generate_request(req, None):
+            pass
+    logger.info("Unlimited-OCR v2 warmup done.")

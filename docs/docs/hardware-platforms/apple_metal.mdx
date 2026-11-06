@@ -109,13 +109,13 @@ sglang serve \
   --chat-template unlimited-ocr \
   --uocr-doc-split \
   --enable-streaming-session \
-  --uocr-max-page-tokens 8000 \
-  --max-total-tokens 32768
+  --uocr-max-page-tokens 8000
 ```
 
-- `--max-total-tokens` caps the KV pool. On a 16 GB Mac the default pool leaves too little memory for the vision encoder and the system starts swapping.
+- With `--uocr-doc-split` and `--uocr-max-page-tokens`, SGLang sizes the KV pool in document windows. One window is `--uocr-doc-page-window` * `--uocr-max-page-tokens` plus prompt and lookahead slack: 15,168 tokens for one page and 8000 tokens. The pool holds one window when the Mac's Metal working-set limit is up to 14 GiB (a 16 GB Mac has 12 GiB), so unified memory does not swap, and one more window for each further 8 GiB, up to eight. Pass `--max-total-tokens` to size the pool yourself, for example `--max-total-tokens 32768` to serve eight documents at once on a 16 GB Mac.
 - Requests that send `DeepseekOCRNoRepeatNGramLogitProcessor` as `custom_logit_processor` need `--enable-custom-logit-processor`.
-- Overlap scheduling and CUDA graphs are not available on MPS. The first request of each new image geometry also pays for compiling the PyTorch MPS graphs of the vision encoder.
+- Startup runs a built-in `unlimited_ocr_v2` warmup over one- and two-page documents, so the first request does not pay for building the PyTorch MPS graphs of the vision encoder and decoder (pass `--skip-server-warmup` to skip it).
+- Overlap scheduling and CUDA graphs are not available on MPS.
 
 On an M5 MacBook Pro with 16 GB of memory, one document decodes at about 70 tokens/s.
 
