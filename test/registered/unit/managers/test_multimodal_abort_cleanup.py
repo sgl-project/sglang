@@ -455,10 +455,8 @@ def _pause_scheduler(disaggregation_mode):
     scheduler.running_batch.reqs = []
     scheduler.disaggregation_mode = disaggregation_mode
     scheduler.decode_offload_manager = None
-    scheduler.hisparse_coordinator = None
     scheduler.tree_cache = MagicMock()
-    scheduler.req_to_token_pool = MagicMock()
-    scheduler.token_to_kv_pool_allocator = MagicMock()
+    scheduler.request_retirer = MagicMock()
     scheduler._add_request_to_queue = MagicMock()
     scheduler.metrics_reporter = MagicMock()
     scheduler.metrics_reporter.current_scheduler_metrics_enabled = False
@@ -519,7 +517,7 @@ def test_weights_only_memory_release_drops_kept_rows(kept_rows):
 
 @pytest.mark.parametrize("prefix_len, in_progress", [(4, True), (0, False)])
 def test_dllm_context_is_in_progress_once_part_is_prefilled(prefix_len, in_progress):
-    manager = DllmManager(dllm_config=None, release_aborted=Mock())
+    manager = DllmManager(dllm_config=None, abort=Mock())
     manager.waiting_queue.join(
         [
             SimpleNamespace(
@@ -539,7 +537,7 @@ def test_dllm_abort_drops_only_the_aborted_rows(published_server_args, kept_rows
     scheduler.waiting_queue.clear()
     scheduler.dllm_config = object()
     scheduler.dllm_manager = DllmManager(
-        dllm_config=None, release_aborted=scheduler._release_aborted_dllm_req
+        dllm_config=None, abort=scheduler._abort_dllm_req
     )
     scheduler.dllm_manager.waiting_queue.join([req, survivor])
     scheduler.dllm_manager.staging_queue.extend([req, survivor])
