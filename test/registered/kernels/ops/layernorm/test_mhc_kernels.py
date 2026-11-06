@@ -426,6 +426,144 @@ def test_moe_post_reduces_before_adding_replicated_shared(
     torch.testing.assert_close(actual, torch.full((2, 3), expected))
 
 
+_EPS = 1e-6
+_SINKHORN_ITERS = 20
+_POST_MULT = 2.0
+
+
+@pytest.fixture
+def single_process(monkeypatch, stated_tp_group):
+    monkeypatch.setattr(mhc, "use_symmetric_memory", lambda *a, **kw: nullcontext())
+    monkeypatch.setattr(mhc, "is_allocation_symmetric", lambda: False)
+    yield
+
+
+def _mhc_pre_reference(residual, fn, hc_scale, hc_base, *, eps_outside_sqrt):
+    hc_mult = residual.shape[1]
+    x = residual.flatten(1).float()
+    mixes = x @ fn.t()
+    mean_sq = x.pow(2).mean(-1, keepdim=True)
+    if eps_outside_sqrt:
+        rms = 1.0 / (mean_sq.sqrt() + _EPS)
+    else:
+        rms = torch.rsqrt(mean_sq + _EPS)
+    mixes = mixes * rms
+    pre = torch.sigmoid(mixes[:, :hc_mult] * hc_scale[0] + hc_base[:hc_mult]) + _EPS
+    post = _POST_MULT * torch.sigmoid(
+        mixes[:, hc_mult : 2 * hc_mult] * hc_scale[1] + hc_base[hc_mult : 2 * hc_mult]
+    )
+    comb = (mixes[:, 2 * hc_mult :] * hc_scale[2] + hc_base[2 * hc_mult :]).view(
+        -1, hc_mult, hc_mult
+    )
+    comb = torch.exp(comb - comb.amax(-1, keepdim=True))
+    comb = comb / comb.sum(-1, keepdim=True) + _EPS
+    comb = comb / (comb.sum(-2, keepdim=True) + _EPS)
+    for _ in range(_SINKHORN_ITERS - 1):
+        comb = comb / (comb.sum(-1, keepdim=True) + _EPS)
+        comb = comb / (comb.sum(-2, keepdim=True) + _EPS)
+    layer_input = (pre.unsqueeze(-1) * residual.float()).sum(1)
+    return post, comb, layer_input
+
+
+def _eps_outside_sqrt_inputs(num_tokens, hc_mult=4, hidden=4096):
+    torch.manual_seed(0)
+    mix = hc_mult * (2 + hc_mult)
+    # A small residual puts mean_sq near eps, where the two eps placements differ.
+    residual = (
+        torch.randn(num_tokens, hc_mult, hidden, device="cuda") * 1e-3
+    ).bfloat16()
+    fn = torch.randn(mix, hc_mult * hidden, device="cuda") * 0.01
+    hc_scale = torch.rand(3, device="cuda")
+    hc_base = torch.randn(mix, device="cuda") * 0.1
+    return residual, fn, hc_scale, hc_base
+
+
+def _run_mhc_pre_eps_outside_sqrt(residual, fn, hc_scale, hc_base, **norm):
+    return mhc_pre(
+        residual,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps=_EPS,
+        hc_pre_eps=_EPS,
+        hc_sinkhorn_eps=_EPS,
+        hc_post_mult_value=_POST_MULT,
+        sinkhorn_repeat=_SINKHORN_ITERS,
+        eps_outside_sqrt=True,
+        **norm,
+    )
+
+
+def _assert_post_uses_eps_outside_sqrt(post, inputs):
+    ref_post, _, _ = _mhc_pre_reference(*inputs, eps_outside_sqrt=True)
+    dsv4_post, _, _ = _mhc_pre_reference(*inputs, eps_outside_sqrt=False)
+    # Tolerance covers the kernel's split-K fp32 GEMM order.
+    torch.testing.assert_close(post.squeeze(-1), ref_post, rtol=2e-3, atol=2e-3)
+    assert (post.squeeze(-1) - dsv4_post).abs().max() > 1e-2
+
+
+@pytest.mark.parametrize("num_tokens", [7, 300, 3000])
+def test_mhc_pre_eps_outside_sqrt(num_tokens, single_process):
+    inputs = _eps_outside_sqrt_inputs(num_tokens)
+    post, comb, layer_input = _run_mhc_pre_eps_outside_sqrt(*inputs)
+    _, ref_comb, ref_input = _mhc_pre_reference(*inputs, eps_outside_sqrt=True)
+    _assert_post_uses_eps_outside_sqrt(post, inputs)
+    torch.testing.assert_close(comb, ref_comb, rtol=2e-3, atol=2e-3)
+    torch.testing.assert_close(layer_input.float(), ref_input, rtol=2e-2, atol=1e-4)
+
+
+@pytest.mark.parametrize("num_tokens", [7, 300])
+def test_mhc_pre_eps_outside_sqrt_fused_norm(num_tokens, single_process):
+    inputs = _eps_outside_sqrt_inputs(num_tokens)
+    hidden = inputs[0].shape[-1]
+    norm_weight = (1 + 0.1 * torch.randn(hidden, device="cuda")).bfloat16()
+    post, _, layer_input = _run_mhc_pre_eps_outside_sqrt(
+        *inputs, norm_weight=norm_weight, norm_eps=_EPS
+    )
+    _assert_post_uses_eps_outside_sqrt(post, inputs)
+    _, _, ref_input = _mhc_pre_reference(*inputs, eps_outside_sqrt=True)
+    ref = torch.nn.functional.rms_norm(ref_input, (hidden,), norm_weight.float(), _EPS)
+    # The reference norms the fp32 layer input; the kernel scales a bf16 stash.
+    torch.testing.assert_close(layer_input.float(), ref, rtol=2e-2, atol=2e-2)
+
+
+def _hc_head_reference(x, fn, scale, base, norm_eps, hc_eps, eps_outside_sqrt):
+    flat = x.flatten(1).float()
+    mean_sq = flat.square().mean(-1, keepdim=True)
+    if eps_outside_sqrt:
+        rsqrt = 1.0 / (mean_sq.sqrt() + norm_eps)
+    else:
+        rsqrt = torch.rsqrt(mean_sq + norm_eps)
+    pre = torch.sigmoid(torch.nn.functional.linear(flat, fn) * rsqrt * scale + base)
+    return torch.sum((pre + hc_eps).unsqueeze(-1) * x.float(), dim=1).to(x.dtype)
+
+
+@pytest.mark.parametrize("eps_outside_sqrt", [False, True])
+def test_fused_hc_head(eps_outside_sqrt):
+    from sglang.kernels.ops.layernorm.mhc_head import fused_hc_head
+
+    torch.manual_seed(0)
+    num_tokens, hc, hidden = 33, 4, 4096
+    x = torch.randn(num_tokens, hc, hidden, device="cuda").bfloat16()
+    fn = torch.randn(hc, hc * hidden, device="cuda") * 0.1
+    scale = torch.ones(1, device="cuda")
+    base = torch.randn(hc, device="cuda") * 0.1
+    # A large eps puts a quarter or more of the outputs of the two formulas
+    # outside the tolerance of each other.
+    norm_eps = 0.5
+    out = fused_hc_head(
+        x,
+        fn,
+        scale,
+        base,
+        norm_eps=norm_eps,
+        hc_eps=1e-6,
+        eps_outside_sqrt=eps_outside_sqrt,
+    )
+    ref = _hc_head_reference(x, fn, scale, base, norm_eps, 1e-6, eps_outside_sqrt)
+    torch.testing.assert_close(out, ref, rtol=2e-2, atol=2e-2)
+
+
 if __name__ == "__main__":
     import sys
 
