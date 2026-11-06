@@ -134,7 +134,11 @@ class DraftMoE(nn.Module):
     ) -> None:
         super().__init__()
         from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
-        from sglang.srt.layers.moe.topk import TopK
+        from sglang.srt.layers.moe.topk import (
+            TopK,
+            TopKOutputFormat,
+            fused_topk_torch_native,
+        )
 
         _check_parallel_fit(spec)
         self.spec = spec
@@ -154,27 +158,15 @@ class DraftMoE(nn.Module):
             if spec.expert_bias
             else None
         )
-        grouped = spec.num_expert_group is not None
-        self.topk = TopK(
-            spec.top_k,
-            layer_id=layer_id,
-            renormalize=spec.norm_topk_prob,
-            use_grouped_topk=grouped,
-            num_expert_group=spec.num_expert_group,
-            topk_group=spec.topk_group,
-            scoring_func=spec.scoring_func,
-            correction_bias=self.gate.expert_bias,
-            quant_config=quant_config,
-            routed_scaling_factor=(
-                None
-                if spec.routed_scaling_factor == 1.0
-                else spec.routed_scaling_factor
-            ),
-        )
-        # The fused softmax router ignores the bias; the torch path adds it to the scores.
-        if spec.expert_bias and spec.scoring_func == "softmax" and not grouped:
-            self.topk.topk_config.torch_native = True
         swigluoai = spec.hidden_act == "swigluoai"
+        if not swigluoai and spec.swiglu_limit not in (None, 10):
+            raise ValueError(
+                "Draft FFN: the fused MoE kernel clamps SwiGLU at 10 only "
+                f"(DeepSeek-V4); got swiglu_limit={spec.swiglu_limit}."
+            )
+        scale = (
+            None if spec.routed_scaling_factor == 1.0 else spec.routed_scaling_factor
+        )
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=spec.num_experts,
             top_k=spec.top_k,
@@ -188,12 +180,46 @@ class DraftMoE(nn.Module):
             gemm1_alpha=(spec.swiglu_alpha or SWIGLUOAI_ALPHA) if swigluoai else None,
             gemm1_clamp_limit=spec.swiglu_limit if swigluoai else None,
             swiglu_limit=None if swigluoai else spec.swiglu_limit,
+            routed_scaling_factor=scale,
             routing_method_type=_routing_method(spec),
+        )
+        grouped = spec.num_expert_group is not None
+        # The fused softmax routers ignore the bias; route those in torch, as trained.
+        biased_softmax = (
+            spec.expert_bias and spec.scoring_func == "softmax" and not grouped
+        )
+        self.topk = TopK(
+            spec.top_k,
+            layer_id=layer_id,
+            renormalize=spec.norm_topk_prob,
+            use_grouped_topk=grouped,
+            num_expert_group=spec.num_expert_group,
+            topk_group=spec.topk_group,
+            scoring_func=spec.scoring_func,
+            correction_bias=self.gate.expert_bias,
+            custom_routing_function=(
+                partial(fused_topk_torch_native, correction_bias=self.gate.expert_bias)
+                if biased_softmax
+                else None
+            ),
+            quant_config=quant_config,
+            routed_scaling_factor=scale,
+            apply_routed_scaling_factor_on_output=(
+                self.experts.should_fuse_routed_scaling_factor_in_topk
+            ),
         )
         self.topk.bind_runner_backend(
             self.experts.runner_backend,
             routing_method_type=self.experts.routing_method_type,
         )
+        if biased_softmax and (
+            self.topk.topk_config.output_format is not TopKOutputFormat.STANDARD
+        ):
+            raise ValueError(
+                "Draft FFN: a softmax router with expert_bias needs the triton MoE "
+                f"runner (--speculative-moe-runner-backend triton), not "
+                f"{self.experts.runner_backend}."
+            )
         self.shared_expert = (
             DraftMLP(
                 hidden_size,
@@ -216,16 +242,20 @@ class DraftMoE(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         x = hidden_states.view(-1, self.hidden_size)
+        shared = None
+        if (
+            self.shared_expert is not None
+        ):  # first: the experts may overwrite x in place
+            shared = self.shared_expert(x)
+            if self.shared_expert_gate is not None:
+                shared = torch.sigmoid(self.shared_expert_gate(x)) * shared
         if x.shape[0] == 0:
             topk_output = self.topk.empty_topk_output(x.device)
         else:
             router_logits, _ = self.gate(x)
             topk_output = self.topk(x, router_logits.float())  # fp32 scores, as trained
         out = self.experts(x, topk_output)
-        if self.shared_expert is not None:
-            shared = self.shared_expert(x)
-            if self.shared_expert_gate is not None:
-                shared = torch.sigmoid(self.shared_expert_gate(x)) * shared
+        if shared is not None:
             out = out + shared
         return reduce_moe_output(out).view_as(hidden_states)
 
