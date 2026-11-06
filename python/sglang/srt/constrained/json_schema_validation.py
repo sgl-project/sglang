@@ -5,6 +5,7 @@ import threading
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import unquote
 
 try:
     import re._parser as sre_parse
@@ -263,25 +264,29 @@ MAX_DFA_STATES = 10000
 
 @dataclass
 class TraversalContext:
-    """Thread-local traversal context passed explicitly down the call stack.
-
-    This ensures thread safety by avoiding global or thread-local counters.
-    """
+    """Bound schema traversal depth and total expanded nodes."""
 
     depth: int = 0
-    total_nodes: int = 0
+    total_nodes: int = 1
     active_ref_stack: list[str] = field(default_factory=list)
     max_depth: int = MAX_SCHEMA_DEPTH
     max_total_nodes: int = MAX_TOTAL_NODES
+    _node_count: list[int] = field(default_factory=list, repr=False)
+
+    def __post_init__(self) -> None:
+        if not self._node_count:
+            self._node_count.append(self.total_nodes)
 
     def enter(self) -> "TraversalContext":
-        """Create a new context for a child node with incremented depth."""
+        """Create a child context, sharing the traversal-wide node budget."""
+        self._node_count[0] += 1
         return TraversalContext(
             depth=self.depth + 1,
-            total_nodes=self.total_nodes + 1,
+            total_nodes=self._node_count[0],
             active_ref_stack=self.active_ref_stack,
             max_depth=self.max_depth,
             max_total_nodes=self.max_total_nodes,
+            _node_count=self._node_count,
         )
 
     def check_bounds(self) -> None:
@@ -290,9 +295,9 @@ class TraversalContext:
             raise JSONSchemaDepthExceeded(
                 f"JSON schema nesting depth exceeds allowable limit of {self.max_depth}"
             )
-        if self.total_nodes > self.max_total_nodes:
+        if self._node_count[0] > self.max_total_nodes:
             raise JSONSchemaStateExplosion(
-                f"JSON schema total nodes ({self.total_nodes}) exceeds maximum allowed ({self.max_total_nodes})"
+                f"JSON schema total nodes ({self._node_count[0]}) exceeds maximum allowed ({self.max_total_nodes})"
             )
 
     def push_ref(self, ref: str) -> None:
@@ -309,77 +314,102 @@ class TraversalContext:
             self.active_ref_stack.pop()
 
 
+def _resolve_schema_ref(root_schema: Any, ref: str) -> tuple[Any, str]:
+    """Resolve a local JSON Pointer reference and return its canonical pointer."""
+    if not ref.startswith("#"):
+        raise ValueError(f"Only local JSON Schema references are supported: {ref!r}")
+
+    fragment = unquote(ref[1:])
+    if not fragment:
+        return root_schema, "#"
+    if not fragment.startswith("/"):
+        raise ValueError(f"Only JSON Pointer references are supported: {ref!r}")
+
+    tokens = []
+    for encoded_token in fragment[1:].split("/"):
+        token_chars = []
+        index = 0
+        while index < len(encoded_token):
+            char = encoded_token[index]
+            if char != "~":
+                token_chars.append(char)
+                index += 1
+                continue
+            if index + 1 >= len(encoded_token) or encoded_token[index + 1] not in "01":
+                raise ValueError(f"Invalid JSON Pointer escape in reference: {ref!r}")
+            token_chars.append("~" if encoded_token[index + 1] == "0" else "/")
+            index += 2
+        tokens.append("".join(token_chars))
+
+    target = root_schema
+    for token in tokens:
+        if isinstance(target, dict) and token in target:
+            target = target[token]
+        elif isinstance(target, list) and token.isdigit() and str(int(token)) == token:
+            array_index = int(token)
+            if array_index >= len(target):
+                raise ValueError(f"Unresolved JSON Schema reference: {ref!r}")
+            target = target[array_index]
+        else:
+            raise ValueError(f"Unresolved JSON Schema reference: {ref!r}")
+
+    canonical_ref = "#/" + "/".join(_escape_json_pointer(token) for token in tokens)
+    return target, canonical_ref
+
+
 def validate_schema_depth(
     schema: Any,
     max_depth: int = MAX_SCHEMA_DEPTH,
     max_total_nodes: int = MAX_TOTAL_NODES,
 ) -> None:
-    """
-    Validate that JSON schema nesting depth does not exceed the maximum allowed limit.
-
-    Only traverses schema-bearing keywords to avoid false positives from instance data.
-
-    Args:
-        schema: The JSON schema to validate
-        max_depth: Maximum allowed nesting depth
-        max_total_nodes: Maximum allowed total nodes in traversal
-
-    Raises:
-        JSONSchemaDepthExceeded: If nesting depth exceeds max_depth
-        JSONSchemaStateExplosion: If total nodes exceeds max_total_nodes
-        JSONSchemaCircularRef: If a circular $ref is detected
-    """
+    """Validate depth and total nodes in the schema after resolving local refs."""
     ctx = TraversalContext(max_depth=max_depth, max_total_nodes=max_total_nodes)
-    _validate_schema_depth_recursive(schema, ctx)
+    _validate_schema_depth_recursive(schema, ctx, schema)
 
 
-def _validate_schema_depth_recursive(schema: Any, ctx: TraversalContext) -> None:
-    """Recursive implementation using explicit TraversalContext."""
+def _validate_schema_depth_recursive(
+    schema: Any, ctx: TraversalContext, root_schema: Any
+) -> None:
+    """Recursively validate embedded schemas and their referenced targets."""
     ctx.check_bounds()
 
     if not isinstance(schema, dict):
         return
 
-    # Handle $ref for circular reference detection
     ref = schema.get("$ref")
     if isinstance(ref, str):
-        ctx.push_ref(ref)
+        target, canonical_ref = _resolve_schema_ref(root_schema, ref)
+        ctx.push_ref(canonical_ref)
         try:
-            # Note: We don't resolve the ref here, just detect cycles in the ref chain
-            # Actual ref resolution happens at compile time
-            pass
+            _validate_schema_depth_recursive(target, ctx.enter(), root_schema)
         finally:
             ctx.pop_ref()
 
-    # Single subschema keywords
     for keyword in _SINGLE_SUBSCHEMA_KEYWORDS:
         child = schema.get(keyword)
         if isinstance(child, (bool, dict)):
-            _validate_schema_depth_recursive(child, ctx.enter())
+            _validate_schema_depth_recursive(child, ctx.enter(), root_schema)
         elif keyword == "items" and isinstance(child, list):
             for item in child:
-                _validate_schema_depth_recursive(item, ctx.enter())
+                _validate_schema_depth_recursive(item, ctx.enter(), root_schema)
 
-    # Array subschema keywords
     for keyword in _SUBSCHEMA_ARRAY_KEYWORDS:
         children = schema.get(keyword)
         if isinstance(children, list):
             for child in children:
-                _validate_schema_depth_recursive(child, ctx.enter())
+                _validate_schema_depth_recursive(child, ctx.enter(), root_schema)
 
-    # Map subschema keywords
     for keyword in _SUBSCHEMA_MAP_KEYWORDS:
         children = schema.get(keyword)
         if isinstance(children, dict):
             for child in children.values():
-                _validate_schema_depth_recursive(child, ctx.enter())
+                _validate_schema_depth_recursive(child, ctx.enter(), root_schema)
 
-    # Dependencies
     dependencies = schema.get("dependencies")
     if isinstance(dependencies, dict):
         for child in dependencies.values():
             if isinstance(child, (bool, dict)):
-                _validate_schema_depth_recursive(child, ctx.enter())
+                _validate_schema_depth_recursive(child, ctx.enter(), root_schema)
 
 
 def _estimate_fixed_regex_states(pattern: str) -> int | None:
@@ -461,6 +491,143 @@ def _estimate_fixed_regex_states(pattern: str) -> int | None:
                 return None
         return width
 
+    def char_set(op, arg):
+        if op == sre_parse.LITERAL:
+            return ((arg, arg),)
+        if op != sre_parse.IN:
+            return None
+        intervals = []
+        for class_op, class_arg in arg:
+            if class_op == sre_parse.LITERAL:
+                intervals.append((class_arg, class_arg))
+            elif class_op == sre_parse.RANGE:
+                intervals.append(class_arg)
+            else:
+                return None
+        intervals.sort()
+        merged = []
+        for start, end in intervals:
+            if merged and start <= merged[-1][1] + 1:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            else:
+                merged.append((start, end))
+        return tuple(merged)
+
+    def sets_intersect(left, right):
+        if left is None or right is None:
+            return True
+        return any(
+            left_start <= right_end and right_start <= left_end
+            for left_start, left_end in left
+            for right_start, right_end in right
+        )
+
+    def fixed_description(subpattern):
+        width = 0
+        first_set = last_set = None
+        for op, arg in subpattern:
+            if op in character_atom_ops:
+                part_width = 1
+                part_first = part_last = char_set(op, arg)
+            elif op == sre_parse.AT:
+                continue
+            elif op == sre_parse.SUBPATTERN:
+                description = fixed_description(arg[3])
+                if description is None:
+                    return None
+                part_width, part_first, part_last = description
+            elif op in (sre_parse.MAX_REPEAT, sre_parse.MIN_REPEAT):
+                min_rep, max_rep, child = arg
+                if min_rep != max_rep or max_rep == sre_parse.MAXREPEAT:
+                    return None
+                description = fixed_description(child)
+                if description is None:
+                    return None
+                child_width, child_first, child_last = description
+                part_width = max_rep * child_width
+                part_first = child_first if part_width else None
+                part_last = child_last if part_width else None
+            else:
+                return None
+
+            if part_width:
+                if width == 0:
+                    first_set = part_first
+                last_set = part_last
+                width += part_width
+        return width, first_set, last_set
+
+    def bounded_composition_segments(subpattern):
+        segments = []
+        for op, arg in subpattern:
+            if op in character_atom_ops:
+                charset = char_set(op, arg)
+                segments.append(("fixed", 1, charset, charset))
+            elif op == sre_parse.AT:
+                continue
+            elif op == sre_parse.SUBPATTERN:
+                nested = bounded_composition_segments(arg[3])
+                if nested is None:
+                    return None
+                segments.extend(nested)
+            elif op in (sre_parse.MAX_REPEAT, sre_parse.MIN_REPEAT):
+                min_rep, max_rep, child = arg
+                if min_rep == max_rep and max_rep != sre_parse.MAXREPEAT:
+                    description = fixed_description(child)
+                    if description is None:
+                        return None
+                    child_width, child_first, child_last = description
+                    width = max_rep * child_width
+                    if width:
+                        segments.append(("fixed", width, child_first, child_last))
+                elif (
+                    max_rep != sre_parse.MAXREPEAT
+                    and len(child) == 1
+                    and child[0][0] in character_atom_ops
+                ):
+                    repeated_set = char_set(child[0][0], child[0][1])
+                    if repeated_set is None:
+                        return None
+                    if max_rep:
+                        segments.append(
+                            ("variable", max_rep, repeated_set, repeated_set)
+                        )
+                else:
+                    return None
+            else:
+                return None
+
+        merged = []
+        for segment in segments:
+            if segment[0] == "fixed" and merged and merged[-1][0] == "fixed":
+                previous = merged[-1]
+                merged[-1] = (
+                    "fixed",
+                    previous[1] + segment[1],
+                    previous[2],
+                    segment[3],
+                )
+            else:
+                merged.append(segment)
+        return merged
+
+    def bounded_composition_states(subpattern):
+        segments = bounded_composition_segments(subpattern)
+        if segments is None:
+            return None
+
+        for index, segment in enumerate(segments):
+            if segment[0] != "variable":
+                continue
+            if index and sets_intersect(segment[2], segments[index - 1][3]):
+                return None
+            if index + 1 < len(segments) and sets_intersect(
+                segment[2], segments[index + 1][2]
+            ):
+                return None
+
+        return 1 + sum(segment[1] for segment in segments)
+
     if body and body[-1][0] in (sre_parse.MAX_REPEAT, sre_parse.MIN_REPEAT):
         min_rep, max_rep, child = body[-1][1]
         if (
@@ -472,67 +639,88 @@ def _estimate_fixed_regex_states(pattern: str) -> int | None:
             if prefix_width is not None:
                 return prefix_width + max_rep + 1
 
+    composition_states = bounded_composition_states(body)
+    if composition_states is not None:
+        return composition_states
+
     width = fixed_width(parsed)
     return None if width is None else width + 1
 
 
-def _estimate_dfa_states(schema: Any, depth: int = 0) -> int:
-    """
-    Estimate the number of DFA states that would be generated from a JSON schema.
-    This is a heuristic to catch schemas that would cause state explosion.
+def _estimate_dfa_states(
+    schema: Any,
+    depth: int = 0,
+    *,
+    root_schema: Any = None,
+    max_states: int = MAX_DFA_STATES,
+    max_depth: int = MAX_SCHEMA_DEPTH,
+    max_total_nodes: int = MAX_TOTAL_NODES,
+    ctx: TraversalContext | None = None,
+) -> int:
+    """Estimate DFA states while bounding the expanded schema, including refs."""
+    if root_schema is None:
+        root_schema = schema
+    if ctx is None:
+        ctx = TraversalContext(
+            depth=depth, max_depth=max_depth, max_total_nodes=max_total_nodes
+        )
+    ctx.check_bounds()
 
-    Only traverses schema-bearing keywords to match validation behavior.
+    state_count = 1
 
-    Args:
-        schema: The JSON schema to estimate
-        depth: Current nesting depth
+    def add_states(additional_states: int) -> None:
+        nonlocal state_count
+        state_count += additional_states
+        if state_count > max_states:
+            raise JSONSchemaStateExplosion(
+                f"JSON schema estimated DFA states ({state_count}) exceeds "
+                f"maximum allowed ({max_states}). Schema may cause DoS via state explosion."
+            )
 
-    Returns:
-        Estimated number of DFA states
-    """
     if not isinstance(schema, dict):
-        return 1
+        return state_count
 
-    state_count = 1  # Base state for this schema level
+    ref = schema.get("$ref")
+    if isinstance(ref, str):
+        target, canonical_ref = _resolve_schema_ref(root_schema, ref)
+        ctx.push_ref(canonical_ref)
+        try:
+            add_states(
+                _estimate_dfa_states(
+                    target,
+                    depth + 1,
+                    root_schema=root_schema,
+                    max_states=max_states,
+                    max_depth=max_depth,
+                    max_total_nodes=max_total_nodes,
+                    ctx=ctx.enter(),
+                )
+            )
+        finally:
+            ctx.pop_ref()
 
-    # Each property adds states
     properties = schema.get("properties", {})
     if isinstance(properties, dict):
-        state_count += len(properties) * 2  # Property name + value states
+        add_states(len(properties) * 2)
 
-    # Handle string patterns - regex patterns can cause exponential state explosion
-    # We estimate based on pattern complexity (rough heuristic)
     pattern = schema.get("pattern")
     if isinstance(pattern, str):
-        # Estimate regex complexity: count of quantifiers, alternations, groups
-        # A pattern like "[ab]*a[ab]{13}" can generate ~16K states
         import re
 
-        # Match quantifiers properly: *, +, ?, {N}, {N,}, {N,M}
         quantifier_count = len(re.findall(r"[*+?]|\{\d+,?\d*\}", pattern))
         alt_count = pattern.count("|")
         group_count = pattern.count("(")
         char_class_count = pattern.count("[")
-        # Look for {N} quantifiers with large N
         brace_quantifiers = re.findall(r"\{(\d+)(?:,\d*)?\}", pattern)
         large_quantifier_sum = sum(int(n) for n in brace_quantifiers if int(n) > 10)
-        # Heuristic: each quantifier/alternation/group roughly multiplies states
-        # Check for nested quantifiers (e.g., (a+)+, (a{100})+) which are truly explosive
-        # vs independent linear concatenations (e.g., \d{4}-\d{2}-\d{2}) which are fine
         has_unbounded = "*" in pattern or "+" in pattern
         has_bounded = bool(brace_quantifiers)
-        # Detect nested quantifier patterns: quantifier inside a capturing group that itself has a quantifier
-        # Pattern: \(...[+*?{].*[+*?}]\) or similar nesting indicators
         nested_quantifier_pattern = r"\([^)]*[\+\*\?\{][^)]*\)[\+\*\?\{]"
         has_nested_quantifiers = bool(re.search(nested_quantifier_pattern, pattern))
         linear_states = _estimate_fixed_regex_states(pattern)
         if linear_states is not None:
-            # Fixed-width patterns and bounded single-character repetitions
-            # grow linearly. Do not apply the explosion-risk multiplier.
             pattern_complexity = linear_states
         elif has_unbounded and has_bounded and has_nested_quantifiers:
-            # Nested quantifiers (e.g., (a{100})+ ) can cause exponential blowup
-            # Multiply by the product of bounded quantifiers
             bounded_product = 1
             for n in brace_quantifiers:
                 bounded_product *= max(1, int(n))
@@ -543,8 +731,6 @@ def _estimate_dfa_states(schema: Any, depth: int = 0) -> int:
                 + bounded_product * 100,
             )
         elif has_unbounded and has_bounded:
-            # Unbounded + bounded but no clear nesting (e.g., .*a{100})
-            # Linear blowup: sum of bounded quantifiers, not product
             bounded_sum = sum(max(1, int(n)) for n in brace_quantifiers)
             pattern_complexity = max(
                 1,
@@ -557,43 +743,87 @@ def _estimate_dfa_states(schema: Any, depth: int = 0) -> int:
                 (quantifier_count + alt_count + group_count + char_class_count) * 100
                 + large_quantifier_sum * 500,
             )
-        state_count += pattern_complexity
+        add_states(pattern_complexity)
 
-    # Handle format constraints - xgrammar supports certain formats
-    # that add DFA states (e.g., email, date, uuid add ~2-3 states each)
     format_name = schema.get("format")
     if isinstance(format_name, str) and format_name in _XGRAMMAR_STRING_FORMATS:
-        state_count += 3  # Approximate DFA states per format constraint
+        add_states(3)
 
-    # Single subschema keywords
     for keyword in _SINGLE_SUBSCHEMA_KEYWORDS:
         child = schema.get(keyword)
         if isinstance(child, (bool, dict)):
-            state_count += _estimate_dfa_states(child, depth + 1)
+            add_states(
+                _estimate_dfa_states(
+                    child,
+                    depth + 1,
+                    root_schema=root_schema,
+                    max_states=max_states,
+                    max_depth=max_depth,
+                    max_total_nodes=max_total_nodes,
+                    ctx=ctx.enter(),
+                )
+            )
         elif keyword == "items" and isinstance(child, list):
             for item in child:
-                state_count += _estimate_dfa_states(item, depth + 1)
+                add_states(
+                    _estimate_dfa_states(
+                        item,
+                        depth + 1,
+                        root_schema=root_schema,
+                        max_states=max_states,
+                        max_depth=max_depth,
+                        max_total_nodes=max_total_nodes,
+                        ctx=ctx.enter(),
+                    )
+                )
 
-    # Array subschema keywords
     for keyword in _SUBSCHEMA_ARRAY_KEYWORDS:
         children = schema.get(keyword)
         if isinstance(children, list):
             for child in children:
-                state_count += _estimate_dfa_states(child, depth + 1)
+                add_states(
+                    _estimate_dfa_states(
+                        child,
+                        depth + 1,
+                        root_schema=root_schema,
+                        max_states=max_states,
+                        max_depth=max_depth,
+                        max_total_nodes=max_total_nodes,
+                        ctx=ctx.enter(),
+                    )
+                )
 
-    # Map subschema keywords
     for keyword in _SUBSCHEMA_MAP_KEYWORDS:
         children = schema.get(keyword)
         if isinstance(children, dict):
             for child in children.values():
-                state_count += _estimate_dfa_states(child, depth + 1)
+                add_states(
+                    _estimate_dfa_states(
+                        child,
+                        depth + 1,
+                        root_schema=root_schema,
+                        max_states=max_states,
+                        max_depth=max_depth,
+                        max_total_nodes=max_total_nodes,
+                        ctx=ctx.enter(),
+                    )
+                )
 
-    # Dependencies
     dependencies = schema.get("dependencies")
     if isinstance(dependencies, dict):
         for child in dependencies.values():
             if isinstance(child, (bool, dict)):
-                state_count += _estimate_dfa_states(child, depth + 1)
+                add_states(
+                    _estimate_dfa_states(
+                        child,
+                        depth + 1,
+                        root_schema=root_schema,
+                        max_states=max_states,
+                        max_depth=max_depth,
+                        max_total_nodes=max_total_nodes,
+                        ctx=ctx.enter(),
+                    )
+                )
 
     return state_count
 
@@ -620,11 +850,12 @@ def validate_schema_bounds(
         JSONSchemaStateExplosion: If estimated DFA states exceeds max_states or total nodes exceeds max_total_nodes
         JSONSchemaCircularRef: If a circular $ref is detected
     """
-    # First validate depth and total nodes (also detects circular refs)
-    validate_schema_depth(schema, max_depth=max_depth, max_total_nodes=max_total_nodes)
-
-    # Then estimate DFA states
-    estimated_states = _estimate_dfa_states(schema)
+    estimated_states = _estimate_dfa_states(
+        schema,
+        max_states=max_states,
+        max_depth=max_depth,
+        max_total_nodes=max_total_nodes,
+    )
     if estimated_states > max_states:
         raise JSONSchemaStateExplosion(
             f"JSON schema estimated DFA states ({estimated_states}) exceeds "
@@ -725,27 +956,69 @@ def _escape_json_pointer(value: str) -> str:
 
 
 def _iter_subschemas(
-    schema: Any, pointer: str = "#"
+    schema: Any,
+    pointer: str = "#",
+    *,
+    root_schema: Any = None,
+    active_refs: list[str] | None = None,
+    resolve_refs: bool = False,
 ) -> Iterator[tuple[dict[str, Any], str]]:
-    """Walk schema-bearing keywords without inspecting instance-valued data."""
+    """Walk schema-bearing keywords, optionally following local references."""
+    if root_schema is None:
+        root_schema = schema
+    if active_refs is None:
+        active_refs = []
     if not isinstance(schema, dict):
         return
 
     yield schema, pointer
 
+    ref = schema.get("$ref")
+    if resolve_refs and isinstance(ref, str):
+        target, canonical_ref = _resolve_schema_ref(root_schema, ref)
+        if canonical_ref in active_refs:
+            raise JSONSchemaCircularRef(
+                f"Circular $ref detected: {' -> '.join(active_refs + [canonical_ref])}"
+            )
+        yield from _iter_subschemas(
+            target,
+            f"{pointer}/$ref",
+            root_schema=root_schema,
+            active_refs=active_refs + [canonical_ref],
+            resolve_refs=resolve_refs,
+        )
+
     for keyword in _SINGLE_SUBSCHEMA_KEYWORDS:
         child = schema.get(keyword)
         if isinstance(child, (bool, dict)):
-            yield from _iter_subschemas(child, f"{pointer}/{keyword}")
+            yield from _iter_subschemas(
+                child,
+                f"{pointer}/{keyword}",
+                root_schema=root_schema,
+                active_refs=active_refs,
+                resolve_refs=resolve_refs,
+            )
         elif keyword == "items" and isinstance(child, list):
             for index, item in enumerate(child):
-                yield from _iter_subschemas(item, f"{pointer}/{keyword}/{index}")
+                yield from _iter_subschemas(
+                    item,
+                    f"{pointer}/{keyword}/{index}",
+                    root_schema=root_schema,
+                    active_refs=active_refs,
+                    resolve_refs=resolve_refs,
+                )
 
     for keyword in _SUBSCHEMA_ARRAY_KEYWORDS:
         children = schema.get(keyword)
         if isinstance(children, list):
             for index, child in enumerate(children):
-                yield from _iter_subschemas(child, f"{pointer}/{keyword}/{index}")
+                yield from _iter_subschemas(
+                    child,
+                    f"{pointer}/{keyword}/{index}",
+                    root_schema=root_schema,
+                    active_refs=active_refs,
+                    resolve_refs=resolve_refs,
+                )
 
     for keyword in _SUBSCHEMA_MAP_KEYWORDS:
         children = schema.get(keyword)
@@ -753,7 +1026,11 @@ def _iter_subschemas(
             for name, child in children.items():
                 escaped_name = _escape_json_pointer(name)
                 yield from _iter_subschemas(
-                    child, f"{pointer}/{keyword}/{escaped_name}"
+                    child,
+                    f"{pointer}/{keyword}/{escaped_name}",
+                    root_schema=root_schema,
+                    active_refs=active_refs,
+                    resolve_refs=resolve_refs,
                 )
 
     dependencies = schema.get("dependencies")
@@ -762,7 +1039,11 @@ def _iter_subschemas(
             if isinstance(child, (bool, dict)):
                 escaped_name = _escape_json_pointer(name)
                 yield from _iter_subschemas(
-                    child, f"{pointer}/dependencies/{escaped_name}"
+                    child,
+                    f"{pointer}/dependencies/{escaped_name}",
+                    root_schema=root_schema,
+                    active_refs=active_refs,
+                    resolve_refs=resolve_refs,
                 )
 
 
@@ -829,8 +1110,11 @@ def validate_xgrammar_json_schema(schema: Any) -> None:
 
 
 def validate_outlines_json_schema(schema: Any) -> None:
-    """Reject constraints Outlines Core 0.1.x accepts without preserving."""
-    for subschema, pointer in _iter_subschemas(schema):
+    """Reject unsupported constraints and over-budget expanded Outlines schemas."""
+    validate_schema_bounds(schema)
+    for subschema, pointer in _iter_subschemas(
+        schema, root_schema=schema, resolve_refs=True
+    ):
         unsupported = sorted(_OUTLINES_UNSUPPORTED_KEYWORDS.intersection(subschema))
         if unsupported:
             _raise_unsupported(

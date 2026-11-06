@@ -9,6 +9,7 @@ from xgrammar import GrammarCompiler, TokenizerInfo
 
 from sglang.srt.constrained.base_grammar_backend import InvalidGrammarObject
 from sglang.srt.constrained.json_schema_validation import (
+    JSONSchemaCircularRef,
     JSONSchemaDepthExceeded,
     JSONSchemaStateExplosion,
     UnsupportedJSONSchemaFeature,
@@ -31,6 +32,21 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(1.0, "base-a-test-cpu")
+
+
+def _doubled_ref_schema(depth=30):
+    definitions = {}
+    for level in range(depth):
+        target_ref = f"#/$defs/level_{level + 1}"
+        definitions[f"level_{level}"] = {
+            "type": "object",
+            "properties": {
+                "left": {"$ref": target_ref},
+                "right": {"$ref": target_ref},
+            },
+        }
+    definitions[f"level_{depth}"] = {"type": "string"}
+    return {"$defs": definitions, "$ref": "#/$defs/level_0"}
 
 
 class TestXGrammarJSONSchemaValidation(unittest.TestCase):
@@ -205,6 +221,15 @@ class TestOutlinesJSONSchemaValidation(unittest.TestCase):
                 {"properties": {"a/b~c": {"type": "integer", "multipleOf": 2}}}
             )
 
+    def test_checks_unsupported_constraints_in_referenced_schemas(self):
+        schema = {
+            "$defs": {"nonnegative": {"type": "number", "minimum": 0}},
+            "$ref": "#/$defs/nonnegative",
+        }
+
+        with self.assertRaisesRegex(UnsupportedJSONSchemaFeature, "minimum"):
+            validate_outlines_json_schema(schema)
+
 
 class TestBackendJSONSchemaPrevalidation(unittest.TestCase):
     def test_xgrammar_rejects_before_compilation(self):
@@ -328,6 +353,13 @@ class TestBoundedLinearPatterns(CustomTestCase):
     def test_linear_patterns_still_obey_state_budget(self):
         validate_schema_bounds({"type": "string", "pattern": "^[ab]{64}$"})
         for pattern in (
+            "^[a-z]{100,200}[0-9]{100,200}$",
+            "^id_[a-z]{100,200}_[0-9]{100,200}$",
+        ):
+            with self.subTest(pattern=pattern):
+                validate_schema_bounds({"type": "string", "pattern": pattern})
+
+        for pattern in (
             "^[ab]{10001}$",
             "^[ab]{0,10001}$",
             "[ab]{10001}",
@@ -415,9 +447,33 @@ class TestSchemaBoundsValidation(unittest.TestCase):
     def test_validate_schema_bounds_rejects_circular_ref(self):
         """Schema with circular $ref should be rejected."""
         schema = {"type": "object", "properties": {"self": {"$ref": "#"}}}
-        # This won't actually detect as circular without ref resolution
-        # but validates the check exists
-        validate_schema_bounds(schema)
+
+        with self.assertRaises(JSONSchemaCircularRef):
+            validate_schema_bounds(schema)
+
+    def test_outlines_validators_bound_expanded_reference_cost(self):
+        schema = _doubled_ref_schema()
+
+        with self.assertRaises(JSONSchemaStateExplosion):
+            validate_schema_bounds(schema)
+        with self.assertRaises(JSONSchemaStateExplosion):
+            validate_outlines_json_schema(schema)
+
+    def test_outlines_rejects_expanded_refs_before_regex_generation(self):
+        backend = object.__new__(OutlinesGrammarBackend)
+        backend.whitespace_pattern = None
+        backend._compile_regex = MagicMock()
+        schema = json.dumps(_doubled_ref_schema())
+
+        with patch(
+            "sglang.srt.constrained.outlines_backend.build_regex_from_object"
+        ) as build_regex:
+            result = backend.dispatch_json(schema)
+
+        self.assertIsInstance(result, InvalidGrammarObject)
+        self.assertIn("estimated DFA states", result.error_message)
+        build_regex.assert_not_called()
+        backend._compile_regex.assert_not_called()
 
     def test_validate_schema_bounds_rejects_regex_explosion(self):
         """Schema with complex regex pattern should be rejected."""

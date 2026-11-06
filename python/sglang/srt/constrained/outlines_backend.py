@@ -38,7 +38,6 @@ from sglang.srt.constrained.json_schema_validation import (
     build_fsm_with_budget,
     check_regex_ast_complexity,
     validate_outlines_json_schema,
-    validate_schema_bounds,
 )
 from sglang.srt.constrained.outlines_jump_forward import OutlinesJumpForwardMap
 
@@ -186,7 +185,6 @@ class OutlinesGrammarBackend(BaseGrammarBackend):
         try:
             schema = json.loads(key_string)
             validate_outlines_json_schema(schema)
-            validate_schema_bounds(schema)
             regex = build_regex_from_object(
                 key_string,
                 whitespace_pattern=self.whitespace_pattern,
