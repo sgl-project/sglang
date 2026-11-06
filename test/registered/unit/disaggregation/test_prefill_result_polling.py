@@ -240,7 +240,8 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.send_kv_chunk = Mock()
         self.process_pending_chunked_abort = Mock()
         self.dp_attn_adapter = SimpleNamespace(
-            maybe_prepare_mlp_sync_batch=lambda batch: batch
+            maybe_prepare_mlp_sync_batch=lambda batch: batch,
+            shutdown_vote_pending=lambda: False,
         )
 
     def _process_hicache_events(self, should_retry_storage_prefetch=True):

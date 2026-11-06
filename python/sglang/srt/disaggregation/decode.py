@@ -433,6 +433,9 @@ class _PendingPublish(msgspec.Struct, frozen=True):
     prefix_len: int
     total_prefix_len: int
     fill_len: int
+    # The allocator's reuse fences after this allocation: prefill's RDMA into the
+    # destination follows no stream, so it is published only once they complete.
+    reuse_fences: Tuple[torch.cuda.Event, ...] = ()
 
 
 class DecodePreallocQueue(DecodeHiCachePreallocMixin):
@@ -1773,6 +1776,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         prefix_len=prefix_len,
                         total_prefix_len=total_prefix_len,
                         fill_len=fill_len,
+                        reuse_fences=tuple(
+                            self.token_to_kv_pool_allocator.reuse_fences()
+                        ),
                     )
                 )
             else:
@@ -1828,6 +1834,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             # Gate the readback on this allocation only, not on the forward the
             # schedule stream has been fenced behind since.
             self._publish_stream.wait_event(entry.allocated)
+            for fence in entry.reuse_fences:
+                self._publish_stream.wait_event(fence)
             with torch.cuda.stream(self._publish_stream):
                 self._publish_destination(
                     decode_req=entry.decode_req,
