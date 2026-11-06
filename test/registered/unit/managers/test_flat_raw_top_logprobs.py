@@ -547,6 +547,26 @@ class TestSchedulerFlatAssembly(CustomTestCase):
             chunked.logprob.input_top_logprobs_flat_null_prefix,
         )
 
+    def test_input_logprobs_preserve_max_valid_token(self):
+        """Prompt logprob IDs retain the last vocab token, not a zero replacement."""
+        input_ids = array("q", [0, 999_998, 999_999, 1_000_000, 1_000_123])
+        for flat in (False, True):
+            for chunk_sizes in ([5], [2, 3]):
+                with self.subTest(flat=flat, chunk_sizes=chunk_sizes):
+                    req = self._make_req(flat=flat)
+                    req.origin_input_ids = input_ids[:]
+                    self._run_prefill(req, chunk_sizes)
+
+                    self.assertEqual(
+                        req.logprob.input_token_logprobs_idx,
+                        [0, 999_998, 999_999, 0, 0],
+                    )
+                    self.assertEqual(
+                        req.logprob.input_token_logprobs_val,
+                        [None] + [row[0] for row in _SCHED_VAL_ROWS[:-1]],
+                    )
+                    self.assertEqual(req.origin_input_ids, input_ids)
+
     def test_unrepresentable_rows_fall_back_to_nested(self):
         req = self._make_req(flat=True, num_tokens=3)
         processor = _make_logprob_processor()
