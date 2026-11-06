@@ -13,12 +13,13 @@ import tempfile
 import unittest
 from types import SimpleNamespace
 from typing import Optional
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from sglang.srt.arg_groups import model_override_base as base_module
 from sglang.srt.arg_groups import overrides as overrides_module
 from sglang.srt.arg_groups.arg_utils import A, Arg, resolvable_fields
 from sglang.srt.arg_groups.model_override_base import register_model_override
+from sglang.srt.arg_groups.model_overrides import gemma4 as gemma4_module
 from sglang.srt.arg_groups.model_overrides import minicpm as minicpm_module
 from sglang.srt.arg_groups.model_overrides import qwen3_5 as qwen3_5_module
 from sglang.srt.arg_groups.model_overrides import qwen3_vl as qwen3_vl_module
@@ -30,6 +31,7 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.configs.minicpm import MiniCPMHybridConfig
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.environ import envs
+from sglang.srt.platforms.interface import SRTPlatform
 from sglang.srt.runtime_context import (
     get_context,
     get_exec,
@@ -3912,6 +3914,80 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     "enable_tf32_matmul": True,
                 },
             )
+
+    def test_gemma4_uses_oot_platform_attention_backend(self):
+        from sglang.srt.arg_groups.model_overrides.gemma4 import (
+            _gemma4_overrides,
+            gemma4_attention_backends,
+        )
+
+        def _args(**kw):
+            defaults = dict(
+                attention_backend=None,
+                prefill_attention_backend=None,
+                decode_attention_backend=None,
+                moe_runner_backend="triton",
+                quantization=None,
+            )
+            defaults.update(kw)
+            return SimpleNamespace(**defaults)
+
+        platform = Mock(spec=SRTPlatform)
+        platform.is_out_of_tree.return_value = True
+        platform.get_default_attention_backend.return_value = "custom_attention"
+
+        with patch.object(gemma4_module, "current_platform", platform):
+            self.assertEqual(
+                _gemma4_overrides(_args(), None),
+                {"attention_backend": "custom_attention"},
+            )
+            self.assertEqual(
+                _gemma4_overrides(_args(attention_backend="triton"), None), {}
+            )
+            self.assertEqual(
+                _gemma4_overrides(
+                    _args(prefill_attention_backend="custom_attention"), None
+                ),
+                {"attention_backend": "custom_attention"},
+            )
+            self.assertEqual(
+                _gemma4_overrides(
+                    _args(decode_attention_backend="custom_attention"), None
+                ),
+                {"attention_backend": "custom_attention"},
+            )
+            self.assertEqual(
+                _gemma4_overrides(
+                    _args(),
+                    SimpleNamespace(architectures=["DiffusionGemmaForBlockDiffusion"]),
+                ),
+                {"attention_backend": "triton"},
+            )
+            self.assertIn("custom_attention", gemma4_attention_backends())
+            self.assertIn("fa4", gemma4_attention_backends())
+
+    def test_gemma4_explicit_builtin_backend_does_not_require_oot_default(self):
+        from sglang.srt.arg_groups.model_overrides.gemma4 import (
+            _gemma4_overrides,
+            gemma4_attention_backends,
+        )
+
+        args = SimpleNamespace(
+            attention_backend="triton",
+            prefill_attention_backend=None,
+            decode_attention_backend=None,
+            moe_runner_backend="triton",
+            quantization=None,
+        )
+        platform = Mock(spec=SRTPlatform)
+        platform.is_out_of_tree.return_value = True
+        platform.get_default_attention_backend.side_effect = NotImplementedError
+
+        with patch.object(gemma4_module, "current_platform", platform):
+            self.assertEqual(_gemma4_overrides(args, None), {})
+            platform.get_default_attention_backend.assert_not_called()
+            self.assertIn("triton", gemma4_attention_backends())
+            platform.get_default_attention_backend.assert_called_once()
 
     def test_deepseek_moe_quant_slot_pass(self):
         from sglang.srt.arg_groups.model_override_base import ResolvedView
