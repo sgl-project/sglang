@@ -413,6 +413,9 @@ class TestDcpDsaIndexKTransfer(unittest.TestCase):
                     max_transfer_batch_indices=0,
                     enable_custom_mem_pool=False,
                     _transfer_data=transfer,
+                    _await_transfer_futures=lambda futures: max(
+                        f.result() for f in futures
+                    ),
                     get_mla_kv_ptrs_with_pp=lambda src, dst, *_: (src, dst, len(src)),
                 )
                 manager._dsa_index_k_dcp_params = lambda *args, **kwargs: (
