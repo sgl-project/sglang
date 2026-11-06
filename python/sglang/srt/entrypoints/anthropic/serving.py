@@ -577,6 +577,7 @@ class AnthropicServing:
             )
 
         chat_request = ChatCompletionRequest(**request_data)
+        chat_request._keep_continuous_usage = chat_request.stream
 
         if anthropic_request.thinking is not None:
             if anthropic_request.thinking.budget_tokens is not None:
@@ -856,7 +857,7 @@ class AnthropicServing:
     ) -> AsyncGenerator[str, None]:
         """Convert OpenAI chat stream to Anthropic event stream."""
         openai_stream = self.openai_serving_chat._generate_chat_stream(
-            adapted_request, processed_request, raw_request, keep_continuous_usage=True
+            adapted_request, processed_request, raw_request
         )
 
         content_block_index = 0

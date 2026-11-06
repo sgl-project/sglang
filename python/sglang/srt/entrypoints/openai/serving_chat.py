@@ -2696,8 +2696,6 @@ class OpenAIServingChat(OpenAIServingBase):
         request: ChatCompletionRequest,
         raw_request: Request,
         usage_headers: Optional[Dict[str, str]] = None,
-        *,
-        keep_continuous_usage: bool = False,
     ) -> AsyncGenerator[str, None]:
         """Generate streaming chat completion response"""
         created = self._stream_created(request)
@@ -2748,7 +2746,10 @@ class OpenAIServingChat(OpenAIServingBase):
             )
             # K3 allows top-level usage only in the final choices=[] summary;
             # a caller that re-encodes the stream for another API may keep it.
-            if self.chat_encoding_spec == "kimi_k3" and not keep_continuous_usage:
+            if (
+                self.chat_encoding_spec == "kimi_k3"
+                and not request._keep_continuous_usage
+            ):
                 continuous_usage_stats = False
 
             return_input_ids = self._should_return_input_ids(request)
