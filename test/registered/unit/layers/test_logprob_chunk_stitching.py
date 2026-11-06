@@ -193,6 +193,37 @@ class TestLogprobChunkStitching(CustomTestCase):
         self.assertEqual(expected[0][1:], [[], []])
         self.assertEqual(expected[1], [[1, 3], [], []])
 
+    def test_decode_normalization_accepts_host_logprob_rows(self):
+        output = LogitsProcessorOutput(
+            next_token_logits=None,
+            next_token_logprobs=torch.tensor([-0.5]),
+            next_token_top_logprobs_val=[[-0.5]],
+            next_token_top_logprobs_idx=[[3]],
+            next_token_token_ids_logprobs_val=[[-0.5]],
+            next_token_token_ids_logprobs_idx=[[3]],
+        )
+        batch = SimpleNamespace(
+            return_logprob=True,
+            spec_algorithm=SimpleNamespace(is_none=lambda: True),
+        )
+
+        next_token_ids, next_token_logprobs = (
+            SchedulerBatchResultProcessor._normalize_decode_outputs(
+                None,
+                batch=batch,
+                result=SimpleNamespace(),
+                logits_output=output,
+                next_token_ids=[3],
+            )
+        )
+
+        self.assertEqual(next_token_ids, [[3]])
+        self.assertEqual(next_token_logprobs, [-0.5])
+        self.assertEqual(output.next_token_top_logprobs_val, [[-0.5]])
+        self.assertEqual(output.next_token_top_logprobs_idx, [[3]])
+        self.assertEqual(output.next_token_token_ids_logprobs_val, [[-0.5]])
+        self.assertEqual(output.next_token_token_ids_logprobs_idx, [[3]])
+
 
 if __name__ == "__main__":
     unittest.main()
