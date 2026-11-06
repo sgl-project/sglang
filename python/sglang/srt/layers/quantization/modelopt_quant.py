@@ -3,6 +3,7 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/modelopt.py
 from __future__ import annotations
 
+import enum
 import logging
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
@@ -63,6 +64,7 @@ from sglang.srt.layers.quantization.utils import (
     per_tensor_dequantize,
     requantize_with_max_scale,
     swizzle_blockscale,
+    unswizzle_blockscale,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils import alias_or_bind_derived_param, copy_or_rebind_param
@@ -2358,6 +2360,15 @@ def _compute_gemm1_alphas(
     return g1_alphas, g1_alphas_up
 
 
+class Fp4MoeRepack(enum.Enum):
+    """Whether an NVFP4 MoE layer's in-place repack can be undone for an update."""
+
+    CHECKPOINT = "checkpoint"  # loaded or restored, not post-processed
+    TRTLLM = "trtllm"
+    CUTLASS = "cutlass"
+    NOT_RESTORABLE = "not_restorable"
+
+
 class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
     """
        MoE Method for FP4 Quantization with Blockscales and PerTensorScales
@@ -2448,14 +2459,17 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         # nvfp4_online overrides this for serialized FP8 source weights.
         return False
 
-    def _align_fp4_moe_weights_for_flashinfer_trtllm(self, layer) -> None:
-        """Align TRT-LLM weights, allowing model-specific storage layouts."""
+    def _align_fp4_moe_weights_for_flashinfer_trtllm(self, layer) -> bool:
+        """Align TRT-LLM weights, allowing model-specific storage layouts.
+
+        Returns whether the aligned layout can be restored (no padding).
+        """
         from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
             align_fp4_moe_weights_for_flashinfer_trtllm,
             trtllm_nvfp4_hidden_alignment,
         )
 
-        align_fp4_moe_weights_for_flashinfer_trtllm(
+        return not align_fp4_moe_weights_for_flashinfer_trtllm(
             layer,
             hidden_alignment=trtllm_nvfp4_hidden_alignment(
                 use_per_token_activation=self.quant_config.use_per_token_activation,
@@ -2645,6 +2659,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
         w2_input_scale._sglang_require_global_experts = True
         layer.register_parameter("w2_input_scale", w2_input_scale)
+        layer._fp4_moe_repack = Fp4MoeRepack.CHECKPOINT
 
     def _build_mega_moe_weights(self, layer: torch.nn.Module) -> None:
         assert not self.use_flashinfer_trtllm_weight_layout, (
@@ -2710,9 +2725,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Transform packed FP4 MoE weights and scales for the selected backend."""
-        if getattr(layer, "inference_moe_w13_interleaved", False) and not getattr(
-            layer, "_w13_deinterleaved", False
-        ):
+        # The restorable layouts below overwrite this; an interleaved w13
+        # checkpoint layout cannot be restored.
+        layer._fp4_moe_repack = Fp4MoeRepack.NOT_RESTORABLE
+        w13_interleaved = getattr(layer, "inference_moe_w13_interleaved", False)
+        if w13_interleaved and not getattr(layer, "_w13_deinterleaved", False):
             up_first = self.use_flashinfer_trtllm_weight_layout
             layer.w13_weight.data = deinterleave_w13(
                 layer.w13_weight.data, up_first=up_first
@@ -2844,6 +2861,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             (1 / w2_input_scale).to(torch.float32),
         )
 
+        w13_scales_rescaled = False
         if layer.moe_runner_config.is_gated and self.enable_flashinfer_trtllm_moe:
             runner_config = layer.moe_runner_config
             is_situ = runner_config.activation == "situ"
@@ -2867,6 +2885,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     block_scales.copy_(
                         block_scales.float().mul_(ratios[:, :, None, None])
                     )
+                    w13_scales_rescaled = True
                     copy_or_rebind_param(layer, "g1_alphas", shared_alphas)
                     copy_or_rebind_param(layer, "g1_alphas_up", shared_alphas)
                 copy_or_rebind_param(
@@ -2967,11 +2986,15 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             and shuffle_matrix_sf_a is not None
         ):
             # FlashInfer TRTLLM processing - handles both w13 and w2
-            self._align_fp4_moe_weights_for_flashinfer_trtllm(layer)
+            restorable = self._align_fp4_moe_weights_for_flashinfer_trtllm(layer)
             # TRTLLM doesn't read *_blockscale_swizzled; alias to free the
             # placeholders from create_weights.
             layer.w13_blockscale_swizzled = layer.w13_weight_scale
             layer.w2_blockscale_swizzled = layer.w2_weight_scale
+            # Exact restore needs unrescaled E4M3 scales and the standard
+            # aligner without padding.
+            if restorable and not w13_scales_rescaled and not w13_interleaved:
+                layer._fp4_moe_repack = Fp4MoeRepack.TRTLLM
 
         else:
             # CUTLASS processing - handle w13 and w2 separately
@@ -3050,6 +3073,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 w2_blockscale_swizzled,
             )
 
+            if (
+                self.enable_flashinfer_cutlass_moe
+                and not intermediate_size_pad
+                and not w13_interleaved
+            ):
+                layer._fp4_moe_repack = Fp4MoeRepack.CUTLASS
+
             if self._is_cutedsl_v2_standard:
                 # CuteDSL v2 only: convert blockscales to MMA layout for
                 # CuteDslMoEWrapper.  The v1 (deepep) path uses the
@@ -3095,6 +3125,45 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 )
                 if layer._cutedsl_wrapper is not None:
                     refresh_cutedsl_standard_scales_for_weight_update(layer)
+
+    def restore_weights_before_loading(self, layer: torch.nn.Module) -> None:
+        """Undo the in-place FP4 repack before a weight update.
+
+        `process_weights_after_loading` permutes weights and block scales in
+        place, so running it again on experts an update did not rewrite would
+        permute them twice. Restoring the checkpoint layout first keeps those
+        experts bit-identical.
+        """
+        repack = layer._fp4_moe_repack
+        if repack is Fp4MoeRepack.CHECKPOINT:
+            # Not post-processed since loading or the last restore.
+            return
+        if repack is Fp4MoeRepack.NOT_RESTORABLE:
+            logger.warning_once(
+                "This NVFP4 MoE layout cannot be restored before a weight update "
+                "(a padded or interleaved layout, rescaled w13 scales, or a MoE "
+                "backend that repacks without a restore): experts the update does "
+                "not rewrite are post-processed twice. Update every expert tensor."
+            )
+            return
+        if repack is Fp4MoeRepack.TRTLLM:
+            from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+                restore_fp4_moe_weights_from_flashinfer_trtllm,
+            )
+
+            restore_fp4_moe_weights_from_flashinfer_trtllm(
+                layer, self._cache_permute_indices
+            )
+        else:
+            for scale, swizzled in (
+                (layer.w13_weight_scale, layer.w13_blockscale_swizzled),
+                (layer.w2_weight_scale, layer.w2_blockscale_swizzled),
+            ):
+                # A separately allocated swizzled copy leaves the source intact.
+                if swizzled is scale:
+                    scale.data.copy_(unswizzle_blockscale(scale.data))
+        # Set only once the layer is back in the checkpoint layout.
+        layer._fp4_moe_repack = Fp4MoeRepack.CHECKPOINT
 
     @property
     def load_up_proj_weight_first(self) -> bool:

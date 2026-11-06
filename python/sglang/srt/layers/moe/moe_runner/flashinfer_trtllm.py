@@ -625,7 +625,7 @@ def trtllm_nvfp4_hidden_alignment(
 
 def align_fp4_moe_weights_for_flashinfer_trtllm(
     layer: Module, hidden_alignment: int = 1
-) -> None:
+) -> bool:
     """Prepare FP4 MoE weights/scales for FlashInfer TRT-LLM kernels.
 
     This function handles the weight transformation needed for FP4 TRTLLM MoE:
@@ -635,6 +635,9 @@ def align_fp4_moe_weights_for_flashinfer_trtllm(
     - Reorders weights for gated activation GEMM
     - Shuffles weights and scales for transposed MMA output
     - Computes the output scale factors
+
+    Returns whether any weight or scale was padded (such a layout cannot be
+    restored for a weight update).
     """
     from sglang.srt.layers.quantization.utils import (
         prepare_static_weights_for_trtllm_fp4_moe,
@@ -667,6 +670,15 @@ def align_fp4_moe_weights_for_flashinfer_trtllm(
     )
     layer.trtllm_padded_hidden_size = (
         padded_hidden_size if padded_hidden_size != hidden_size else None
+    )
+    # nvfp4_block_scale_interleave pads scale rows to 128 and columns to 4.
+    padded = (
+        w13_weight.shape != layer.w13_weight.shape
+        or w2_weight.shape != layer.w2_weight.shape
+        or any(
+            scale.shape[-2] % 128 or scale.shape[-1] % 4
+            for scale in (w13_weight_scale, w2_weight_scale)
+        )
     )
 
     (
@@ -710,6 +722,128 @@ def align_fp4_moe_weights_for_flashinfer_trtllm(
 
     # Update intermediate_size_per_partition to reflect any padding applied
     layer.intermediate_size_per_partition = intermediate_size
+    return padded
+
+
+def _fp4_block_scale_interleave_sources(
+    shape: torch.Size, device: torch.device
+) -> torch.Tensor:
+    """Source position of every output byte of ``nvfp4_block_scale_interleave``.
+
+    The kernel only moves bytes, so running it on the bytes of each element's
+    flat index recovers the permutation without restating its layout here.
+    """
+    from flashinfer import nvfp4_block_scale_interleave
+
+    numel = shape.numel()
+    positions = torch.arange(numel, device=device, dtype=torch.int64)
+    sources = torch.zeros(numel, device=device, dtype=torch.int64)
+    shift = 0
+    while (numel - 1) >> shift:
+        plane = ((positions >> shift) & 0xFF).to(torch.uint8).view(shape)
+        moved = nvfp4_block_scale_interleave(plane).reshape(-1)
+        sources |= moved.to(torch.int64) << shift
+        shift += 8
+    if not torch.equal(sources.sort().values, positions):
+        raise RuntimeError(
+            f"nvfp4_block_scale_interleave is not a permutation for shape "
+            f"{tuple(shape)}; the TRT-LLM scale layout cannot be undone."
+        )
+    return sources
+
+
+# Every MoE layer has the same scale shapes, so one copy per shape and device is
+# shared by all of them (the per-layer permute-index caches would keep one each).
+_FP4_SCALE_INTERLEAVE_SOURCES: dict = {}
+
+
+def _get_fp4_block_scale_interleave_sources(
+    shape: torch.Size, device: torch.device
+) -> torch.Tensor:
+    key = (tuple(shape), torch.device(device))
+    sources = _FP4_SCALE_INTERLEAVE_SOURCES.get(key)
+    if sources is None:
+        sources = _fp4_block_scale_interleave_sources(shape, device)
+        _FP4_SCALE_INTERLEAVE_SOURCES[key] = sources
+    return sources
+
+
+def _inverse_permutation(indices: torch.Tensor) -> torch.Tensor:
+    if not torch.equal(
+        indices.sort().values,
+        torch.arange(indices.numel(), device=indices.device),
+    ):
+        raise RuntimeError(
+            "flashinfer TRT-LLM row permutation is not a bijection, so the "
+            "FP4 MoE layout cannot be undone for a weight update."
+        )
+    return torch.argsort(indices)
+
+
+def restore_fp4_moe_weights_from_flashinfer_trtllm(
+    layer: Module, cache_permute_indices: dict
+) -> None:
+    """Undo the shuffles of ``align_fp4_moe_weights_for_flashinfer_trtllm`` in place.
+
+    Every step is a byte permutation, so restoring and aligning again leaves
+    experts that a weight update does not rewrite bit-identical. Only for
+    layouts that needed no padding. Every permutation is built and checked
+    before any byte moves, so a failed check leaves the layer as it was.
+    """
+    from flashinfer.fused_moe.core import (
+        _maybe_get_cached_w3_w1_permute_indices,
+        get_w2_permute_indices_with_cache,
+    )
+
+    epilogue_tile_m = 128
+    is_gated = layer.moe_runner_config.is_gated
+    plans = []
+    for weight_param, scale_param, is_w13 in (
+        (layer.w13_weight, layer.w13_weight_scale, True),
+        (layer.w2_weight, layer.w2_weight_scale, False),
+    ):
+        weight = weight_param.data.view(torch.uint8)
+        scale = scale_param.data.view(torch.uint8)
+        if is_w13:
+            weight_indices = _maybe_get_cached_w3_w1_permute_indices(
+                cache_permute_indices,
+                weight[0],
+                epilogue_tile_m,
+                is_gated_act_gemm=is_gated,
+            )
+            scale_indices = _maybe_get_cached_w3_w1_permute_indices(
+                cache_permute_indices,
+                scale[0],
+                epilogue_tile_m,
+                num_elts_per_sf=16,
+                is_gated_act_gemm=is_gated,
+            )
+        else:
+            weight_indices = get_w2_permute_indices_with_cache(
+                cache_permute_indices, weight[0], epilogue_tile_m
+            )
+            scale_indices = get_w2_permute_indices_with_cache(
+                cache_permute_indices, scale[0], epilogue_tile_m, num_elts_per_sf=16
+            )
+
+        sources = _get_fp4_block_scale_interleave_sources(scale[0].shape, scale.device)
+        plans.append(
+            (
+                weight,
+                _inverse_permutation(weight_indices.to(weight.device)),
+                scale,
+                sources,
+                _inverse_permutation(scale_indices.to(scale.device)),
+            )
+        )
+
+    # One expert at a time keeps the temporaries to a single expert's size.
+    for weight, weight_inverse, scale, sources, scale_inverse in plans:
+        permuted_rows = torch.empty_like(scale[0])
+        for expert in range(weight.shape[0]):
+            weight[expert].copy_(weight[expert][weight_inverse])
+            permuted_rows.view(-1)[sources] = scale[expert].reshape(-1)
+            scale[expert].copy_(permuted_rows[scale_inverse])
 
 
 def get_activation_type(activation: str, is_gated: bool = True) -> int:

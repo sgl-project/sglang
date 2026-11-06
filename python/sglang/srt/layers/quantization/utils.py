@@ -603,6 +603,16 @@ def swizzle_blockscale(scale: torch.Tensor):
     )
 
 
+def unswizzle_blockscale(swizzled_scale: torch.Tensor) -> torch.Tensor:
+    """Inverse of `swizzle_blockscale` for a 3D scale that needed no padding."""
+    B, M, K = swizzled_scale.shape
+    return (
+        swizzled_scale.reshape(B, M // 128, K // 4, 32, 4, 4)
+        .permute((0, 1, 4, 3, 2, 5))
+        .reshape(B, M, K)
+    )
+
+
 def swap_w13_to_w31(x: torch.Tensor) -> torch.Tensor:
     return (
         x.reshape(-1, 2, x.shape[-2] // 2, x.shape[-1]).flip(dims=[1]).reshape(x.shape)
