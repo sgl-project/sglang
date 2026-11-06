@@ -58,8 +58,8 @@ def save_base64_image_to_path(
     if uploads_root is not None:
         target_path = ensure_path_within_root(target_path, uploads_root)
     try:
-        image_data = base64.b64decode(data)
+        image_data = base64.b64decode(data, validate=True)
     except Exception as exc:
-        raise Exception(f"Failed to decode base64 image: {str(exc)}") from exc
+        raise ValueError(f"Failed to decode base64 image: {exc!s}") from exc
 
     return save_image_bytes_to_path(image_data, target_path)
