@@ -10,15 +10,15 @@ import torch
 from sglang.srt.layers.cp.bcg.dsv4_bcg import DSV4CPBCGInput
 from sglang.srt.layers.cp.interleave import InterleaveCPStrategy
 from sglang.srt.layers.cp.padding import pad_logical_token_to_physical
-from sglang.srt.managers.schedule_batch import MultimodalInputs
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.layers.cp.zigzag import ZigzagContextParallelMetadata
+from sglang.srt.managers.req_types import MM_PAD_SHIFT_VALUE, MultimodalInputs
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.model_interfaces import LanguageModelInputPreparation
 from sglang.srt.model_executor.runner.eager_runner import EagerRunner
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
 )
 from sglang.srt.models.deepseek_v4 import (
-    MM_PAD_SHIFT_VALUE,
     DeepseekV4ForCausalLM,
     _v41_vision_a2a_supported,
 )
@@ -158,6 +158,40 @@ class TestDSV41MultimodalCP(CustomTestCase):
                     patch(MODEL + "._is_cuda", True),
                 ):
                     self.assertEqual(_v41_vision_a2a_supported(), expected)
+
+    def test_bcg_prepare_rejects_non_interleave_metadata(self):
+        cp_input = DSV4CPBCGInput(
+            input_embeds=torch.empty(4, 1),
+            positions=torch.empty(4, dtype=torch.int64),
+            bucket_local_tokens={8: 4},
+        )
+        for capture in (True, False):
+            for metadata in (
+                None,
+                NS(per_rank_actual_token=[4, 4]),
+                ZigzagContextParallelMetadata(per_rank_actual_token=[4, 4]),
+            ):
+                with self.subTest(capture=capture, metadata=type(metadata).__name__):
+                    batch = NS(out_cache_loc=torch.arange(8))
+
+                    def prepare_metadata(forward_batch):
+                        forward_batch.attn_cp_metadata = metadata
+
+                    with (
+                        patch(
+                            BCG + ".prepare_cp_forward", side_effect=prepare_metadata
+                        ),
+                        patch(BCG + ".cp_shard_hidden_states") as shard,
+                        self.assertRaisesRegex(
+                            TypeError,
+                            "DSV4 CP BCG requires InterleaveContextParallelMetadata, "
+                            f"got {type(metadata).__name__}",
+                        ),
+                    ):
+                        cp_input.prepare(
+                            NS(), batch, static_num_tokens=8, capture=capture
+                        )
+                    shard.assert_not_called()
 
     def test_bcg_router_ids_follow_moe_row_layout_across_replays(self):
         for backend_name in ("none", "megamoe"):
@@ -314,7 +348,7 @@ class TestDSV41MultimodalCP(CustomTestCase):
                         model.logits_processor.call_args.args[1], full
                     )
                     torch.testing.assert_close(batch.input_ids, original)
-                    self.assertFalse(hasattr(batch, "input_ids_global"))
+                    self.assertNotIn("input_ids_global", vars(batch))
 
     def test_chunk_prefix_metadata_and_scheduler_hashes_survive_embedder(self):
         for prefixes, lengths in (([0, 0], [3, 6]), ([16384, 127], [3, 6])):
@@ -402,7 +436,7 @@ class TestDSV41MultimodalCP(CustomTestCase):
             with self.assertRaisesRegex(RuntimeError, "vision failure"):
                 DeepseekV4ForCausalLM._prepare_mm_embeddings(model, ids, batch)
         torch.testing.assert_close(ids, original)
-        self.assertFalse(hasattr(batch, "mm_input_embeds"))
+        self.assertNotIn("mm_input_embeds", vars(batch))
 
 
 class TestDSV41MultimodalInputs(CustomTestCase):
@@ -491,7 +525,7 @@ class TestDSV41MultimodalInputs(CustomTestCase):
         self.model.get_input_embeddings = Mock(
             side_effect=AssertionError("Raw hashes must not enter text embedding")
         )
-        self.model.model = Mock(return_value=self.embeds[1::4])
+        self.model.model = Mock(spec=[], return_value=self.embeds[1::4])
         self.model.capture_aux_hidden_states = False
         self.model.pp_group = NS(is_last_rank=True)
         self.model.lm_head = object()
