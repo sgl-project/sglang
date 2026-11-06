@@ -60,6 +60,7 @@ from sglang.srt.multimodal.processors.kimi_k25 import (
     _get_image_dimensions,
     _gpu_preprocess_images,
     _grid_thw_from_resize_config,
+    _release_preprocess_cache,
     navit_resize_config,
 )
 from sglang.srt.multimodal.transport.cuda_ipc import (
@@ -249,7 +250,9 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
             self._patch_size,
             to_chw=_k3_to_cuda_chw,
             post_resize=lambda x: _fill_transparent_bg(x, self._transparent_bg_config),
+            max_gpu_resize_pixels=_MAX_GPU_RESIZE_PIXELS,
         )
+        _release_preprocess_cache()
 
         return {
             "input_ids": input_ids,
@@ -351,6 +354,7 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
                     ),
                     max_gpu_resize_pixels=_MAX_GPU_RESIZE_PIXELS,
                 )
+                _release_preprocess_cache()
             except torch.OutOfMemoryError:
                 gpu_oom = True
             if gpu_oom:

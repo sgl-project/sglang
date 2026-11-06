@@ -3750,6 +3750,9 @@ class KimiK3ForConditionalGeneration(nn.Module):
                             post_resize=lambda x: fill_transparent_bg(
                                 x, first_config.transparent_bg_config
                             ),
+                            # Deferred preprocessing runs on this rank's GPU in
+                            # the forward pass, so resizes never move to the CPU.
+                            max_gpu_resize_pixels=None,
                         )
                         expected_grids = grid_thws_host[global_indices]
                         if not torch.equal(produced_grids.cpu(), expected_grids):

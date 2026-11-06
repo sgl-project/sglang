@@ -275,6 +275,14 @@ def _resize_images_by_source_shape(
 
 
 _GPU_PREPROCESS_CHUNK_BYTES = 512 * 1024 * 1024
+# Tokenizer-side preprocessing shares GPU 0 with TP rank 0; above this much
+# reserved memory, return the cached peak of a large request to the device.
+_GPU_PREPROCESS_RELEASE_BYTES = 2 * _GPU_PREPROCESS_CHUNK_BYTES
+
+
+def _release_preprocess_cache() -> None:
+    if torch.cuda.memory_reserved() > _GPU_PREPROCESS_RELEASE_BYTES:
+        torch.cuda.empty_cache()
 
 
 def _gpu_preprocess_bytes(
@@ -313,12 +321,14 @@ def _gpu_preprocess_images(
     patch_size: int,
     to_chw: Callable[[Union[torch.Tensor, Image.Image]], torch.Tensor] = _to_cuda_chw,
     post_resize: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
-    max_gpu_resize_pixels: Optional[int] = None,
+    *,
+    max_gpu_resize_pixels: Optional[int],
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """GPU preprocessing pipeline for a batch of images.
 
     Groups images with the same target padded size for batch processing.
-    Sources larger than ``max_gpu_resize_pixels`` are resized on the CPU.
+    Sources larger than ``max_gpu_resize_pixels`` are resized on the CPU;
+    ``None`` keeps every resize on the GPU.
     """
     n = len(images)
     if n == 0:
@@ -520,6 +530,7 @@ class KimiGPUProcessorWrapper:
             self._patch_size,
             max_gpu_resize_pixels=_MAX_GPU_RESIZE_PIXELS,
         )
+        _release_preprocess_cache()
 
         return {
             "input_ids": input_ids,

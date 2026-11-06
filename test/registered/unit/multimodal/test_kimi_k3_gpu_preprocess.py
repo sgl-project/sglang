@@ -167,12 +167,16 @@ def test_gpu_preprocess_chunks_match_single_batch(monkeypatch):
     configs = [dict(new_height=56, new_width=84, pad_height=0, pad_width=0)] * 5
     scale, bias = _norm_tensors()
     args = (images, configs, scale, bias, 14)
-    whole, whole_grids = kimi_k25._gpu_preprocess_images(*args, to_chw=_cpu_chw)
+    whole, whole_grids = kimi_k25._gpu_preprocess_images(
+        *args, to_chw=_cpu_chw, max_gpu_resize_pixels=None
+    )
 
     monkeypatch.setattr(kimi_k25, "_GPU_PREPROCESS_CHUNK_BYTES", 1)
     group = [(i, image, config) for i, (image, config) in enumerate(zip(*args[:2]))]
     assert len(kimi_k25._byte_bounded_chunks(group, 56 * 84)) == 5
-    chunked, chunked_grids = kimi_k25._gpu_preprocess_images(*args, to_chw=_cpu_chw)
+    chunked, chunked_grids = kimi_k25._gpu_preprocess_images(
+        *args, to_chw=_cpu_chw, max_gpu_resize_pixels=None
+    )
 
     torch.testing.assert_close(chunked, whole)
     assert torch.equal(chunked_grids, whole_grids)
@@ -202,7 +206,7 @@ def test_prepare_image_features_falls_back_to_cpu_on_gpu_oom(monkeypatch):
             imgs
         )
         pixel_values, grids = kimi_k25._gpu_preprocess_images(
-            imgs, configs, scale, bias, 14, to_chw=_cpu_chw
+            imgs, configs, scale, bias, 14, to_chw=_cpu_chw, max_gpu_resize_pixels=None
         )
         return {"pixel_values": pixel_values, "image_grid_thw": grids}
 
@@ -230,6 +234,37 @@ def test_prepare_image_features_falls_back_to_cpu_on_gpu_oom(monkeypatch):
 
     assert cpu_calls == [2]
     assert len(features) == len(grids) == 2
+
+
+def test_k3_tokenizer_entry_points_pass_resize_cap(monkeypatch):
+    """Both tokenizer-side K3 GPU paths cap source size; only model-side
+    deferred preprocessing keeps every resize on the GPU."""
+    images = [Image.fromarray(_natural_image(56, 84))] * 2
+    scale, bias = _norm_tensors()
+    caps = []
+
+    def record(imgs, *args, max_gpu_resize_pixels, **kwargs):
+        caps.append(max_gpu_resize_pixels)
+        return torch.zeros(0, 3, 14, 14), torch.zeros(len(imgs), 3, dtype=torch.int64)
+
+    fake = SimpleNamespace(
+        _patch_size=14,
+        _merge_kernel_size=2,
+        _in_patch_limit=16384,
+        _patch_limit_on_one_side=512,
+        _fixed_output_tokens=None,
+        _transparent_bg_config=None,
+        _image_token="<image>",
+        _get_gpu_norm_tensors=lambda: (scale, bias),
+        _prepare_input_ids=lambda *args: torch.zeros(1, dtype=torch.int64),
+    )
+    monkeypatch.setattr(kimi_k3, "_gpu_preprocess_images", record)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+
+    kimi_k3.KimiK3GPUProcessorWrapper._gpu_call(fake, "<image><image>", images)
+    kimi_k3.KimiK3GPUProcessorWrapper.prepare_image_features(fake, images)
+
+    assert caps == [kimi_k25._MAX_GPU_RESIZE_PIXELS] * 2
 
 
 if __name__ == "__main__":
