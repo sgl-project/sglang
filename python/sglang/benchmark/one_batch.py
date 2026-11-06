@@ -55,6 +55,7 @@ import json
 import logging
 import multiprocessing
 import os
+import sys
 import time
 from array import array
 from types import SimpleNamespace
@@ -110,6 +111,23 @@ from sglang.srt.utils import (
     set_gpu_proc_affinity,
     suppress_other_loggers,
 )
+
+
+def configure_output_streams():
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(line_buffering=True, write_through=True)
+
+
+def get_rank_print(tp_rank):
+    if tp_rank != 0:
+        return lambda *args, **kwargs: None
+
+    def rank_print(*args, **kwargs):
+        kwargs.setdefault("flush", True)
+        print(*args, **kwargs)
+
+    return rank_print
 
 
 def _init_process_global_configs() -> None:
@@ -911,9 +929,11 @@ def latency_test(
     if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
         set_gpu_proc_affinity(tp_rank)
 
+    configure_output_streams()
+
     # Configure the logger
     configure_logger(server_args, prefix=f" TP{tp_rank}")
-    rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
+    rank_print = get_rank_print(tp_rank)
 
     # Load the model
     model_runner, tokenizer = load_model(server_args, port_args, gpu_id, tp_rank)
