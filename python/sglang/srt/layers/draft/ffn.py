@@ -22,9 +22,9 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.moe import reduce_moe_output
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix
 
 SWIGLUOAI_ALPHA = 1.702  # gpt-oss's fixed sigmoid slope
 # Checkpoint names an MoE layer accepts, relative to the layer's mlp.
