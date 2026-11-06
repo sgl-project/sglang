@@ -1,3 +1,6 @@
+import io
+import re
+import time
 import unittest
 
 import requests
@@ -36,6 +39,7 @@ class TestMultiTokenizer(CustomTestCase, MMLUMixin):
     def setUpClass(cls):
         cls.model = DEFAULT_TARGET_MODEL_EAGLE_DP_ATTN
         cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.output = io.StringIO()
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
@@ -53,6 +57,7 @@ class TestMultiTokenizer(CustomTestCase, MMLUMixin):
                 "--mem-fraction-static",
                 0.7,
             ],
+            return_stdout_stderr=(cls.output, cls.output),
         )
 
     @classmethod
@@ -121,6 +126,18 @@ class TestMultiTokenizer(CustomTestCase, MMLUMixin):
         self.assertEqual(len(results), len(batch_input_ids))
         for result in results:
             self.assertIn("text", result)
+
+    def test_every_tokenizer_worker_logs_at_info(self):
+        """Each worker's INFO lines reach the log, under its own pid prefix."""
+        # the server answers once one worker is up; the rest may still be starting
+        deadline = time.monotonic() + 30
+        while True:
+            output = self.output.getvalue()
+            workers = set(re.findall(r"TokenizerWorker-(\d+)\]", output))
+            if len(workers) >= 8 or time.monotonic() > deadline:
+                break
+            time.sleep(1)
+        self.assertEqual(len(workers), 8, "\n".join(output.splitlines()[-30:]))
 
 
 if __name__ == "__main__":
