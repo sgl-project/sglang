@@ -466,7 +466,29 @@ python python/sglang/multimodal_gen/benchmarks/bench_pi05_openpi.py \
 
 Use `--skip-sglang --openpi-pytorch-compile-mode none` to measure an OpenPI eager baseline in the same environment. For a PyTorch-native OpenPI baseline, point `--openpi-checkpoint` at a checkpoint directory containing `model.safetensors` and the OpenPI `assets/` norm-stat tree. The `keep` mode preserves OpenPI's checkpoint default compile setting. The grouped Python path currently requires compatible fresh-prefix requests without split prefix/action workers or effective prefix-cache hits; other cases fall back to per-request execution.
 
-## 8. Validation Notes
+## 8. Training interfaces
+
+External trainers such as RLinf can construct `Pi05CoreModel(config, action_training=True)` to update the action expert while keeping the vision-language prefix frozen. Use this mode for both sampling and gradient replay: the model uses the same differentiable GELU, RoPE, and attention operations even when sampling under `torch.no_grad()`.
+
+The trainer calls these interfaces directly in each worker process:
+
+- `encode_prefix(..., return_hidden_states=True)` returns the prefix K/V cache, padding mask, full-attention flag, and frozen prefix hidden states for a value head. The default call still returns the original three values.
+- `forward_suffix(...)` returns action-expert hidden states with their autograd graph. Apply `action_out_proj` to obtain the flow velocity, or use the hidden states in a trainer-owned head.
+- `denoise_step(...)` remains the inference-only velocity interface.
+
+Training mode requires a resident model (`runtime_role="all"`, `prefix_tensor_parallel=False`) without tensor or sequence parallelism. FP32 and BF16 are covered by the tests below. The trainer owns checkpoint loading, observation transforms, stochastic sampling and log probabilities, loss computation, distributed wrapping, optimizer updates, and weight synchronization.
+
+Install a SGLang checkout providing these interfaces in the trainer's Python environment. The trainer imports the installed `sglang` package; it does not need a repository URL or branch name in its model code. Check the checkout's dependency requirements when preparing that environment.
+
+Run the layer-level sampling/replay and backward checks without downloading a checkpoint:
+
+```bash
+python -m pytest test/registered/unit/diffusion/test_pi05_training.py -q
+```
+
+The tests cover CPU and NVIDIA CUDA; CUDA cases skip when CUDA is unavailable. End-to-end trainer validation must also check parameter updates and rollout/actor probability consistency with the intended checkpoint.
+
+## 9. Validation Notes
 
 The following checks were run on H100 GPUs with the native SGLang Pi0.5 path:
 
