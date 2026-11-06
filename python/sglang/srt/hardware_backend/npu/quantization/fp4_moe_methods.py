@@ -18,7 +18,7 @@ from sglang.srt.hardware_backend.npu.quantization.moe_utils import (
     process_npu_fp4_expert_weights,
 )
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
-from sglang.srt.utils import set_weight_attrs
+from sglang.srt.layers.utils.common import set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import DispatchOutput
