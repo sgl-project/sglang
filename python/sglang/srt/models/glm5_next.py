@@ -294,7 +294,6 @@ class _KdaFp8LinearMethod(Fp8LinearMethod):
             or layer.input_scale is not None
             or layer.weight.shape[0] % 16
         )
-        self._use_tuned_tiles = envs.SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE.get()
         # An out-of-tree platform may replace the kernel fp8_scaled_mm selects.
         self._in_tree_platform = not current_platform.is_out_of_tree()
         self._quantized = True
@@ -320,12 +319,8 @@ class _KdaFp8LinearMethod(Fp8LinearMethod):
         x_2d = x.view(-1, x.shape[-1])
         num_tokens = x_2d.shape[0]
         x_q, x_scale = sglang_per_token_quant_fp8(x_2d)
-        tile = (
-            get_w8a8_channelwise_fp8_config(
-                N=weight.shape[1], K=weight.shape[0], M=num_tokens
-            )
-            if self._use_tuned_tiles
-            else None
+        tile = get_w8a8_channelwise_fp8_config(
+            N=weight.shape[1], K=weight.shape[0], M=num_tokens
         )
         if tile is not None:
             out = triton_scaled_mm(

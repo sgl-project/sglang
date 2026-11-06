@@ -3,6 +3,7 @@ real load-time quantization and padding, the real quantizer and GEMM kernels, an
 graph replay. On H200 and H20 it also checks the tuned tile tables."""
 
 import unittest
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -67,6 +68,17 @@ def padded(n):
 TUNED = torch.cuda.is_available() and all(
     get_w8a8_channelwise_fp8_configs(padded(n), k) for n, k in SHAPES.values()
 )
+
+
+@contextmanager
+def without_tuned_tables():
+    # The projection and apply_fp8_linear look the tile up on every call;
+    # with no table both take the path of a GPU without tables.
+    with (
+        patch.object(glm5_next, "get_w8a8_channelwise_fp8_config", return_value=None),
+        patch.object(fp8_utils, "get_w8a8_channelwise_fp8_config", return_value=None),
+    ):
+        yield
 
 
 def magnitudes(rows, generator):
@@ -161,7 +173,6 @@ class TestGlm53KdaFp8Projection(CustomTestCase):
 
     def setUp(self):
         super().setUp()
-        self.enterContext(envs.SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE.override(True))
         self.enterContext(envs.SGLANG_OPT_GLM53_KDA_PTPC_MODULES.override(""))
 
     def test_load_pads_and_quantizes_per_channel(self):
@@ -185,14 +196,16 @@ class TestGlm53KdaFp8Projection(CustomTestCase):
         for name, (n, k) in SHAPES.items():
             tiles, cutlass = table_tokens(n, k)
             tiles_seen += len(tiles)
+            method, layer, weight = make_layer(n, k)
             for tune, tokens in (
                 (True, {1, 8191, 8192, *tiles, *cutlass}),
                 (False, {1, 64}),
             ):
-                with envs.SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE.override(tune):
-                    method, layer, weight = make_layer(n, k)
                 for m in sorted(tokens):
-                    with self.subTest(shape=name, tune=tune, m=m):
+                    with (
+                        self.subTest(shape=name, tune=tune, m=m),
+                        nullcontext() if tune else without_tuned_tables(),
+                    ):
                         x = make_input(m, k, seed=m)
                         y = method.apply(layer, x)
                         self.assertEqual(tuple(y.shape), (m, n))
@@ -214,13 +227,13 @@ class TestGlm53KdaFp8Projection(CustomTestCase):
             x = make_input(m, k, seed=7)
             x_q, x_scale = sglang_per_token_quant_fp8(x)
             gemm = (x_q, layer.weight, x_scale, layer.weight_scale)
-            ran = kernel_names(lambda: method.apply(layer, x))
-            want = kernel_names(lambda: expected(x, gemm))
-            y = method.apply(layer, x)
-            self.assertTrue(torch.equal(y, expected(x, gemm)[:, :n]))
-            # Bit-identical to the generic path it replaces, under the same tile setting.
-            with envs.SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE.override(tune):
+            with nullcontext() if tune else without_tuned_tables():
+                ran = kernel_names(lambda: method.apply(layer, x))
+                y = method.apply(layer, x)
+                # Bit-identical to the generic path it replaces, with the same tables.
                 replaced = Fp8LinearMethod.apply(method, layer, x)
+            want = kernel_names(lambda: expected(x, gemm))
+            self.assertTrue(torch.equal(y, expected(x, gemm)[:, :n]))
             self.assertTrue(torch.equal(y, replaced[:, :n]))
             self.assertTrue(want)
             self.assertLessEqual(want, ran)
@@ -237,8 +250,7 @@ class TestGlm53KdaFp8Projection(CustomTestCase):
         def triton_default(x, gemm):
             return triton_scaled_mm(*gemm, torch.bfloat16, None)
 
-        with envs.SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE.override(False):
-            method, layer, _ = make_layer(n, k)
+        method, layer, _ = make_layer(n, k)
         for m in (16, 8191):
             with self.subTest(case="aot", m=m):
                 check(
@@ -265,11 +277,8 @@ class TestGlm53KdaFp8Projection(CustomTestCase):
 
         # An out-of-tree platform may replace the kernel fp8_scaled_mm picks, so the
         # projection must hand the GEMM to fp8_scaled_mm instead of calling sgl_kernel.
-        with (
-            patch.object(
-                glm5_next.current_platform, "is_out_of_tree", return_value=True
-            ),
-            envs.SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE.override(False),
+        with patch.object(
+            glm5_next.current_platform, "is_out_of_tree", return_value=True
         ):
             oot_method, oot_layer, _ = make_layer(n, k)
         with (
@@ -285,7 +294,6 @@ class TestGlm53KdaFp8Projection(CustomTestCase):
             self.subTest(case="USE_TRITON_W8A8_FP8_KERNEL"),
             patch.object(glm5_next, "use_triton_w8a8_fp8_kernel", True),
             patch.object(fp8_utils, "use_triton_w8a8_fp8_kernel", True),
-            envs.SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE.override(False),
         ):
             triton_method, triton_layer, _ = make_layer(n, k)
             check(
