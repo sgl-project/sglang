@@ -11,12 +11,11 @@ vendor build diverges on (per-channel kernel types, ``enable_sbo_overlap`` and
 the optional overlap arguments), so the shared wrappers stay upstream-faithful
 and SAIL callers import the variant from here.
 
-Both the registry-side custom-op wrapper
-``sglang.kernels.ops.gemm.sail_deepgemm`` and the SAIL MoE runners import from
-this module directly. Routing them through ``deep_gemm_wrapper`` instead would
-make that package depend on ``srt.hardware_backend``, and the wrapper's
-``from .entrypoint import *`` re-export cannot host these functions without a
-package-level import cycle.
+Both the sibling custom-op wrapper ``sail_fused_deepgemm_ops`` and the SAIL MoE
+runners import from this module directly. Routing them through
+``deep_gemm_wrapper`` instead would make that package depend on
+``srt.hardware_backend``, and the wrapper's ``from .entrypoint import *``
+re-export cannot host these functions without a package-level import cycle.
 """
 
 from typing import Any, Optional, Tuple
