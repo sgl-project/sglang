@@ -17,6 +17,25 @@ logger = logging.getLogger(__name__)
     "BailingMoeV3ForCausalLM",
     "BailingMoeV3VLForConditionalGeneration",
 )
+def _bailing_moe_v3_parser_overrides(server_args: Any, hf_config: Any) -> dict:
+    cfg = resolving_view(server_args)
+    model_arch = hf_config.architectures[0]
+    overrides = {}
+    # Template detection may resolve a Ling3 template to the GLM XML parser,
+    # which rejects Ling3's tool-call variants.
+    if cfg.tool_call_parser in (None, "auto"):
+        logger.info("Use ling3 as tool-call parser for %s.", model_arch)
+        overrides["tool_call_parser"] = "ling3"
+    if cfg.reasoning_parser == "auto":
+        logger.info("Use ling3 as reasoning parser for %s.", model_arch)
+        overrides["reasoning_parser"] = "ling3"
+    return overrides
+
+
+@_register_for(
+    "BailingMoeV3ForCausalLM",
+    "BailingMoeV3VLForConditionalGeneration",
+)
 def _bailing_moe_v3_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
     if (

@@ -73,6 +73,11 @@ class BaseGrammarObject:
     def rollback(self, k: int):
         raise NotImplementedError()
 
+    def try_accept_tokens(self, tokens: List[int]) -> bool:
+        """Accept all of ``tokens`` if the grammar allows them; otherwise leave the
+        state untouched and return False. Backends that cannot probe return False."""
+        return False
+
     def is_terminated(self):
         return False
 

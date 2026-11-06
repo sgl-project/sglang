@@ -4,6 +4,10 @@ from typing import Callable, List, Optional
 from pydantic import BaseModel
 
 
+class NativeToolConstraintError(ValueError):
+    """A native tool constraint failed and must not fall back to another format."""
+
+
 class ToolCallItem(BaseModel):
     """Simple encapsulation of the parsed ToolCall result for easier usage in streaming contexts."""
 
