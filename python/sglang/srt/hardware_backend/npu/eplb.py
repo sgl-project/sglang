@@ -251,7 +251,6 @@ def _full_expert_weight(weight: torch.Tensor) -> torch.Tensor:
     owner = weight if weight._base is None else weight._base
     if (
         weight.ndim == 0
-        or owner.ndim != weight.ndim
         or weight.storage_offset() != 0
         or owner.storage_offset() != 0
         or weight.shape[1:] != owner.shape[1:]
@@ -322,7 +321,6 @@ class _PhysicalExpertWeightStaging(_ExpertWeightStaging):
                     f"[NPU EPLB] rank={rank} layer={layer}: expert storage layouts "
                     "must match across the migration chunk"
                 )
-        self._storage_snapshots: list[tuple[torch.Tensor, torch.Tensor]] = []
 
     def create_temp_buffers(self, weights: list[torch.Tensor]) -> list[torch.Tensor]:
         return [
@@ -334,7 +332,7 @@ class _PhysicalExpertWeightStaging(_ExpertWeightStaging):
 
     def load(self, weights: list[torch.Tensor]) -> list[torch.Tensor]:
         self._begin_layer()
-        self._storage_snapshots = []
+        self._storage_snapshots: list[tuple[torch.Tensor, torch.Tensor]] = []
         migration_weights = []
         for weight, layout, needs_staging in zip(
             weights, self._layouts, self._needs_staging, strict=True
