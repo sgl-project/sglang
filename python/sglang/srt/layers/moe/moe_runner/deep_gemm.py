@@ -1615,11 +1615,13 @@ def _varlen_deep_gemm_silu_mul_quant(
     # Only explicit precision requests opt additional callers into this kernel;
     # the generic fused quantizer rounds its SiLU intermediates to BF16.
     if swiglu_limit is not None or swizzle or silu_mul_keep_fp32:
-        assert N % 4 == 0 and G % 4 == 0 and D // 8 >= E, (
-            "DSV4 JIT activation requires N % 4 == 0, G % 4 == 0 and "
-            f"D // 8 >= num_experts, got N={N} G={G} D={D} E={E}"
-        )
         packed_ue8m0 = deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+        # The packed UE8M0 layout is [E, G // 4, N] int32; FP32 scales are [E, N, G] at any G.
+        assert D // 8 >= E and (not packed_ue8m0 or (N % 4 == 0 and G % 4 == 0)), (
+            "DSV4 JIT activation requires D // 8 >= num_experts, and N % 4 == 0 and "
+            f"G % 4 == 0 for packed UE8M0 scales, got N={N} G={G} D={D} E={E} "
+            f"packed_ue8m0={packed_ue8m0}"
+        )
         down_input = torch.empty(
             (E, N, D), device=hidden_states_device, dtype=torch.float8_e4m3fn
         )
