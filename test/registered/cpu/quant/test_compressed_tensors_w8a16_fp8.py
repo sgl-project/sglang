@@ -55,10 +55,26 @@ def _quantize_fp8_channelwise(w: torch.Tensor):
 
 @unittest.skipUnless(is_cpu() and cpu_has_amx_support(), "requires an Intel AMX CPU")
 class TestCompressedTensorsW8A16Fp8(CustomTestCase):
-    @parametrize(M=[1, 11], N=[32, 96], K=[64, 128], has_bias=[False, True])
-    def test_apply_weights(self, M, N, K, has_bias):
+    @parametrize(
+        input_layout=[
+            ((1,), False),
+            ((11,), False),
+            ((5, 1), False),
+            ((2, 3), False),
+            ((2, 3, 4), False),
+            ((2, 3), True),
+        ],
+        N=[32, 96],
+        K=[64, 128],
+        has_bias=[False, True],
+    )
+    def test_apply_weights(self, input_layout, N, K, has_bias):
+        """CPU FP8 linear preserves leading dimensions, including strided batches."""
         torch.manual_seed(0)
-        x = torch.randn(M, K, dtype=torch.bfloat16) / 10
+        batch_shape, transpose_input = input_layout
+        x = torch.randn(*batch_shape, K, dtype=torch.bfloat16) / 10
+        if transpose_input:
+            x = x.transpose(0, 1)
         w = torch.randn(N, K) / 10
         w_fp8, scale, w_dequant = _quantize_fp8_channelwise(w)
         bias = torch.randn(N, dtype=torch.bfloat16) / 10 if has_bias else None

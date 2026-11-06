@@ -137,11 +137,13 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsLinearScheme):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if _is_cpu:
+            batch_shape = x.shape[:-1]
+            x = x.reshape(-1, x.shape[-1])
             # block_size_N == 1 selects the per-channel (as opposed to block)
             # weight-only scale layout in fp8_scaled_mm_cpu: one scale value
             # per output row (layer.weight_scale is [N, 1]), constant across K.
             # The kernel requires bias to be float32 regardless of x's dtype.
-            return torch.ops.sgl_kernel.fp8_scaled_mm_cpu(
+            output = torch.ops.sgl_kernel.fp8_scaled_mm_cpu(
                 x,
                 layer.weight,
                 layer.weight_scale,
@@ -150,6 +152,7 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsLinearScheme):
                 x.dtype,
                 use_intel_amx_backend(layer),  # is_vnni
             )
+            return output.reshape(*batch_shape, output.shape[-1])
         return apply_fp8_marlin_linear(
             input=x,
             weight=layer.weight,
