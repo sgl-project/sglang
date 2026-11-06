@@ -70,7 +70,7 @@ class _ServingHandler(BaseHTTPRequestHandler):
         pass
 
 
-class TestBenchServingPromptLen(CustomTestCase):
+class _BenchServingHTTPTestCase(CustomTestCase):
     def setUp(self):
         self.server = HTTPServer(("127.0.0.1", 0), _ServingHandler)
         self.server.omit_usage = False
@@ -120,6 +120,8 @@ class TestBenchServingPromptLen(CustomTestCase):
             self.assertEqual(o.success, success, o.error)
         return outputs
 
+
+class TestBenchServingNativeStream(_BenchServingHTTPTestCase):
     def test_native_streamed_failures_are_excluded_from_metrics(self):
         """HTTP 200 must not make an aborted stream count as successful work."""
         message = "Input length exceeds the maximum allowed length."
@@ -200,6 +202,8 @@ class TestBenchServingPromptLen(CustomTestCase):
         self.assertGreater(output.ttft, 0.0)
         self.assertGreater(sum(output.itl), 0.0)
 
+
+class TestBenchServingPromptLen(_BenchServingHTTPTestCase):
     def test_single_turn_stream_usage_defaults_and_fallback(self):
         cases = [
             None,
