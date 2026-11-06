@@ -60,9 +60,7 @@ class TestBaseReasoningFormatDetector(CustomTestCase):
     def test_detect_and_parse_quoted_think_end_uses_last_occurrence(self):
         """Bug regression (#48791): quoted think_end_token inside reasoning
         must remain in reasoning_text when the real closing tag comes later."""
-        text = (
-            "<think>mentions `</think>` mid-thought then continues</think>answer"
-        )
+        text = "<think>mentions `</think>` mid-thought then continues</think>answer"
         result = self.detector.detect_and_parse(text)
         self.assertEqual(
             result.reasoning_text, "mentions `</think>` mid-thought then continues"
