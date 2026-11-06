@@ -488,8 +488,10 @@ def test_lora_alpha_override_updates_cached_adapter_scale():
     layer = _make_layer()
     pipeline = _make_pipeline(layer)
 
-    pipeline.load_lora_adapter = lambda path, nickname, rank, lora_alpha: (
-        pipeline.loaded_adapter_alphas.update({nickname: lora_alpha})
+    pipeline.load_lora_adapter = (
+        lambda path, nickname, rank, lora_alpha, allow_lokr=True: (
+            pipeline.loaded_adapter_alphas.update({nickname: lora_alpha})
+        )
     )
 
     with patch(_RANK_PATCH, return_value=0):
