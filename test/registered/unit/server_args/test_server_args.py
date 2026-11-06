@@ -5472,5 +5472,39 @@ class TestPagedExpertsNumResident(unittest.TestCase):
                 _paged_experts_num_resident(bad)
 
 
+class TestUniBoostPolicyArgs(CustomTestCase):
+    def _checked(self, **kwargs):
+        directory = tempfile.mkdtemp(prefix="uniboost_args_")
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+        with open(os.path.join(directory, "config.json"), "w") as handle:
+            json.dump(
+                {
+                    "architectures": ["LlamaForCausalLM"],
+                    "model_type": "llama",
+                    "hidden_size": 16,
+                    "intermediate_size": 32,
+                    "num_attention_heads": 2,
+                    "num_key_value_heads": 2,
+                    "num_hidden_layers": 2,
+                    "vocab_size": 128,
+                    "max_position_embeddings": 2048,
+                },
+                handle,
+            )
+        args = ServerArgs(model_path=directory, device="cuda", **kwargs)
+        args.resolve_once()
+        args.check_server_args()
+        return args
+
+    def test_invalid_knobs_are_rejected(self):
+        with self.assertRaisesRegex(AssertionError, "--uniboost-gamma must be > 0"):
+            self._checked(schedule_policy="uniboost", uniboost_gamma=0.0)
+        with self.assertRaisesRegex(AssertionError, "--uniboost-bin-size must be >= 1"):
+            self._checked(schedule_policy="uniboost", uniboost_bin_size=0)
+
+    def test_other_policies_ignore_uniboost_knobs(self):
+        self._checked(schedule_policy="lpm", uniboost_gamma=0.0)
+
+
 if __name__ == "__main__":
     unittest.main()

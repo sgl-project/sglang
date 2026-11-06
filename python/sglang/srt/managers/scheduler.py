@@ -1512,6 +1512,9 @@ class Scheduler(
             self.enable_hierarchical_cache,
             self.enable_priority_scheduling,
             self.schedule_low_priority_values_first,
+            uniboost_gamma=get_schedule().uniboost_gamma,
+            uniboost_bin_size=get_schedule().uniboost_bin_size,
+            uniboost_clock=get_schedule().uniboost_clock,
         )
         self.prefill_delayer: Optional[PrefillDelayer] = None
         self.prefill_bs_tracker = RecentPrefillBatchSizeTracker(
