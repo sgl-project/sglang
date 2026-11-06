@@ -163,7 +163,10 @@ def test_mounted_fusion_keeps_the_dynamic_lora_delta(fusion, make_site):
 @torch.no_grad()
 def test_linear_gelu_guard_follows_the_adapter_state():
     site, (wrapper,), _, x = _site_with_dynamic_lora(_wan_gelu_mlp)
-    fusable = torch.cuda.get_device_capability() < (12, 0)
+    from sglang.multimodal_gen.runtime.platforms.aiter import USE_AITER_GFX1250
+
+    # gfx1250 reports capability 12.5 but runs its own backend, not the SM120-excluded epilogue.
+    fusable = USE_AITER_GFX1250 or torch.cuda.get_device_capability() < (12, 0)
     assert FUSED_LINEAR_GELU.mount(site)
     try:
         assert not can_use_linear_gelu(wrapper, x)
