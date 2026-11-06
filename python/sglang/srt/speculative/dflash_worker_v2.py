@@ -2978,6 +2978,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 next_token_logits=logits_output.next_token_logits,
                 sampling_info=sampling_info,
                 draft_token_num=int(self.block_size),
+                verify_input_ids=draft_tokens,
             )
 
         # Constrain every chain position before accept picks from it.
