@@ -1072,7 +1072,6 @@ class TestDSAIndexerPoolInfo(CustomTestCase):
     def test_host_bytes_match_observed_allocation(self):
         info = self._stub().get_device_pool_infos()[1].buffer_info
         self.assertEqual(info.page_bytes, 8448)
-        self.assertEqual(284256 * 5 * info.page_bytes, 12006973440)
 
     def test_sharded_rank_without_index_buffers_keeps_remote_callbacks(self):
         from sglang.srt.mem_cache.hybrid_cache.host_pool_config import (
@@ -1140,6 +1139,25 @@ class TestDSAIndexerPoolInfo(CustomTestCase):
         )
         self.assertEqual(packed._draft_host_layer(5), 2)
         self.assertEqual(packed.get_size_per_token(), 132 * 3)
+
+
+class TestStridedStateDetection(CustomTestCase):
+    def test_contiguous_slots_are_not_strided(self):
+        for shape in ((8, 4), (8, 4, 3), (1, 5)):
+            with self.subTest(shape=shape):
+                self.assertFalse(
+                    MambaPoolHost._slots_are_strided(torch.zeros(shape)),
+                    "a contiguous slot array must take the direct path",
+                )
+
+    def test_envelope_strided_slots_are_detected(self):
+        num_slots, per_slot, envelope = 6, 4, 10
+        raw = torch.zeros(num_slots * envelope)
+        view = torch.as_strided(raw, size=(num_slots, per_slot), stride=(envelope, 1))
+        self.assertTrue(MambaPoolHost._slots_are_strided(view))
+
+    def test_empty_tensor_is_not_strided(self):
+        self.assertFalse(MambaPoolHost._slots_are_strided(torch.zeros((0, 4))))
 
 
 class TestMambaHostPoolOnXpu(CustomTestCase):
