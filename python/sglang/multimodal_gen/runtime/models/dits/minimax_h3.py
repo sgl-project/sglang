@@ -665,7 +665,9 @@ def _apply_qk_norm_rope(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     def unfused():
         normed_q, normed_k = _apply_qk_norm(q, k, q_norm, k_norm, head_dim)
-        return _apply_rope_qk(normed_q, normed_k, cos_sin_cache, positions, rotary_emb)
+        return _apply_rope_qk(
+            normed_q, normed_k, cos_sin_cache, positions, rotary_emb=rotary_emb
+        )
 
     if (
         q_norm.eps is not None
