@@ -48,12 +48,15 @@ from sglang.srt.utils import (
     retry,
 )
 from sglang.srt.utils.hf_transformers_patches import apply_all_hf_patches
+from sglang.srt.utils.log_utils import filter_noisy_warnings
 from sglang.srt.utils.network import is_port_available
 from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.utils import normalize_base_url
 
 # Tests load HF configs, tokenizers, and models straight from transformers.
 apply_all_hf_patches()
+# unittest.main turns DeprecationWarning back on in every test process.
+filter_noisy_warnings()
 
 # General test models
 DEFAULT_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.1-8B-Instruct"
@@ -1284,7 +1287,7 @@ def run_score_benchmark_multi(
 
     async def _run_benchmark(batch_size, warmup):
         # Load tokenizer for generating test data
-        from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+        from sglang.srt.hf_transformers import get_tokenizer
 
         tokenizer = get_tokenizer(model)
 
@@ -1511,8 +1514,13 @@ def run_bench_serving_multi(
     return res_l
 
 
-def run_bench_one_batch(model, other_args):
-    """Launch an offline process with automatic device detection."""
+def run_bench_one_batch(model, other_args, env=None):
+    """Launch a offline process with automatic device detection.
+
+    Args:
+        device: Device type ("auto", "cuda", "rocm" or "cpu").
+                If "auto", will detect available platforms automatically.
+    """
     # Auto-detect device if needed
 
     device = auto_config_device()
@@ -1533,7 +1541,9 @@ def run_bench_one_batch(model, other_args):
     ]
     if model is not None:
         command += ["--model-path", model]
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    process = subprocess.Popen(
+        command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env
+    )
 
     prefill_latency = None
     decode_throughput = None
@@ -1616,7 +1626,7 @@ def run_bench_one_batch_server(
     other_server_args,
     simulate_spec_acc_lens=None,
 ):
-    from sglang.bench_one_batch_server import run_benchmark
+    from sglang.benchmark.one_batch_server import run_benchmark
 
     if simulate_spec_acc_lens is not None:
         env = {**os.environ, "SIMULATE_ACC_LEN": str(simulate_spec_acc_lens)}
@@ -2674,6 +2684,77 @@ def write_results_to_json(model, metrics, mode="a"):
         json.dump(existing_results, f, indent=2)
 
 
+def _parse_cpu_list(spec):
+    """One numa_parse_cpustring-style group ("0,1" / "0-31") into int ids."""
+    cpu_ids = []
+    for token in spec.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if "-" in token:
+            start, end = token.split("-")
+            cpu_ids.extend(range(int(start), int(end) + 1))
+        else:
+            cpu_ids.append(int(token))
+    return cpu_ids
+
+
+def _bind_groups_from_cpu_ids(cpu_ids, tp_size):
+    cpu_ids = sorted(cpu_ids)
+    quotient, remainder = divmod(len(cpu_ids), tp_size)
+    bind_groups = []
+    offset = 0
+    for rank in range(tp_size):
+        group_size = quotient + (rank < remainder)
+        bind_groups.append(",".join(map(str, cpu_ids[offset : offset + group_size])))
+        offset += group_size
+    return "|".join(bind_groups)
+
+
+def get_available_cpu_ids(min_cpus):
+    """CPU ids confined to an already-set SGLANG_CPU_OMP_THREADS_BIND.
+
+    Returns None when the env var is unset/empty/"all" so callers fall back
+    to their original behavior instead of picking a NUMA node on their own.
+    """
+    bind_value = os.environ.get("SGLANG_CPU_OMP_THREADS_BIND", "")
+    if not bind_value or bind_value == "all":
+        return None
+
+    cpu_ids = sorted(
+        {cpu_id for group in bind_value.split("|") for cpu_id in _parse_cpu_list(group)}
+    )
+    if len(cpu_ids) < min_cpus:
+        raise RuntimeError(
+            f"Only {len(cpu_ids)} CPUs available "
+            f"(SGLANG_CPU_OMP_THREADS_BIND={bind_value!r}) for TP{min_cpus}"
+        )
+    return cpu_ids
+
+
+def get_tp_cpu_bind(tp_size):
+    """Align an existing SGLANG_CPU_OMP_THREADS_BIND with tp_size ranks."""
+    bind_value = os.environ.get("SGLANG_CPU_OMP_THREADS_BIND", "")
+    if not bind_value or bind_value == "all":
+        return None
+
+    bind_groups = bind_value.split("|")
+    if len(bind_groups) == 1 and tp_size > 1:
+        return _bind_groups_from_cpu_ids(get_available_cpu_ids(tp_size), tp_size)
+    return bind_value
+
+
+def _get_tp_size(args):
+    tp_flags = ("--tp", "--tp-size", "--tensor-parallel-size")
+    for index, arg in enumerate(args):
+        if arg in tp_flags:
+            return int(args[index + 1])
+        for flag in tp_flags:
+            if arg.startswith(f"{flag}="):
+                return int(arg.removeprefix(f"{flag}="))
+    return 1
+
+
 def intel_amx_benchmark(extra_args=None, min_throughput=None):
     def decorator(test_func):
         @wraps(test_func)
@@ -2687,8 +2768,12 @@ def intel_amx_benchmark(extra_args=None, min_throughput=None):
             full_args = common_args + (extra_args or [])
 
             model = test_func(self)
+            env = None
+            bind = get_tp_cpu_bind(_get_tp_size(full_args))
+            if bind is not None:
+                env = {**os.environ, "SGLANG_CPU_OMP_THREADS_BIND": bind}
             prefill_latency, decode_throughput, decode_latency = run_bench_one_batch(
-                model, full_args
+                model, full_args, env=env
             )
 
             print(f"{model=}")

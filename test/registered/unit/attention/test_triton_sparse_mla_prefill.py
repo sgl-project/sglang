@@ -233,14 +233,14 @@ class TestTritonSparseMLATopkTransformRouting(CustomTestCase):
         )
 
     def test_extend_uses_ragged_for_bf16_kv_backends(self):
-        from sglang.srt.layers.attention.dsa_backend import TopkTransformMethod
+        from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
 
         for impl in ("flashmla_sparse", "flashmla_sparse_q8", "triton_sparse_mla"):
             with self.subTest(impl=impl):
                 self.assertEqual(self._method(impl), TopkTransformMethod.RAGGED, impl)
 
     def test_other_backends_keep_paged(self):
-        from sglang.srt.layers.attention.dsa_backend import TopkTransformMethod
+        from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
 
         self.assertEqual(
             self._method("flashinfer_sparse_mla"), TopkTransformMethod.PAGED

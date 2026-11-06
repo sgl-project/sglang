@@ -12,7 +12,7 @@ import numpy as np
 import pybase64
 import torch
 
-from sglang.srt.utils import common
+from sglang.srt.multimodal import media_io
 from sglang.utils import logger
 
 try:
@@ -189,7 +189,7 @@ class MiMoAudioPipeline:
                     dl_start = time.perf_counter()
                     timeout = int(os.getenv("REQUEST_TIMEOUT", "5"))
                     try:
-                        content = common.download_remote_media(audio, timeout=timeout)
+                        content = media_io.download_remote_media(audio, timeout=timeout)
                         dl_elapsed_ms = (time.perf_counter() - dl_start) * 1000
                         if dl_elapsed_ms > 1000.0:
                             logger.warning(

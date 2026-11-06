@@ -24,6 +24,7 @@ from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     SchedulerPoolStatsObserver,
     kv_private_swa_tokens,
 )
+from sglang.srt.managers.scheduler_components.request_list import ListKind
 from sglang.srt.mem_cache.allocator.page_interleave import PageInterleavePoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -205,8 +206,10 @@ class TestShardedFullPoolInvariant(CustomTestCase):
             pool_stats_observer=observer,
             get_last_batch=lambda: self.last_batch,
             get_request_lists=lambda: {
-                "chunked": [] if self.chunked_req is None else [self.chunked_req],
-                "running": self.running_batch.reqs,
+                ListKind.CHUNKED: (
+                    [] if self.chunked_req is None else [self.chunked_req]
+                ),
+                ListKind.DECODING: self.running_batch.reqs,
             },
             scheduler_stage_metrics=None,
         )

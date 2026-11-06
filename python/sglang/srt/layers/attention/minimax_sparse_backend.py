@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
-from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.configs.model_config import (
     get_minimax_sparse_attention_config,
     get_minimax_sparse_disable_value_layer_ids,

@@ -26,11 +26,13 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeComponentHostSlot,
     MambaEvictExcessPathStates,
 )
-from sglang.srt.mem_cache.unified_cache.components.base import (
+from sglang.srt.mem_cache.unified_cache.component_type import (
     BASE_COMPONENT_TYPE,
+    ComponentType,
+)
+from sglang.srt.mem_cache.unified_cache.components.base import (
     BufferLoadBackContext,
     CacheTransferPhase,
-    ComponentType,
     EvictLayer,
     ExternalLinkerLoadPhase,
     InternalStateBackup,
@@ -54,11 +56,9 @@ if TYPE_CHECKING:
         CacheAction,
         ComponentAction,
     )
-    from sglang.srt.mem_cache.unified_radix_cache import (
-        NodeId,
-        UnifiedRadixCache,
-        UnifiedTreeNode,
-    )
+    from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeNode
+    from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import NodeId
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
 
 class MambaComponent(TreeComponent):

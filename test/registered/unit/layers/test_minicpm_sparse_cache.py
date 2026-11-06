@@ -81,10 +81,7 @@ def make_pool_and_req(capacity: int = 64):
         kernel_stride=2,
         enable_memory_saver=False,
     )
-    req = SimpleNamespace(
-        inflight_middle_chunks=0,
-        kv=ReqKvInfo(),
-    )
+    req = SimpleNamespace(kv=ReqKvInfo())
     req_pool_idx = pool.alloc([req])[0]
     return pool, req, req_pool_idx, allocator
 

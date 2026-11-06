@@ -116,6 +116,8 @@ from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
 from sglang.srt.utils import ceil_align, is_gfx95_supported
 
 if TYPE_CHECKING:
+    from flash_mla.flash_mla_interface import FlashMLASchedMeta
+
     from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
         FP4DecodeWorkspace,
         FP4KWriteMetadata,
@@ -123,7 +125,6 @@ if TYPE_CHECKING:
         FP4RowgroupDecodeWorkspace,
         FP4RowgroupPrefillWorkspace,
     )
-    from sglang.kernels.ops.attention.flash_mla_interface import FlashMLASchedMeta
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
 

@@ -26,6 +26,7 @@ from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     kv_private_swa_tokens,
     kv_private_tokens,
 )
+from sglang.srt.managers.scheduler_components.request_list import ListKind
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
@@ -70,11 +71,11 @@ class SchedulerInvariantChecker:
     pool_stats_observer: SchedulerPoolStatsObserver
     get_last_batch: Callable
     scheduler_stage_metrics: SchedulerStageMetricsRecorder
-    # The lists that hold the live requests, by name (`Scheduler.request_lists`).
-    get_request_lists: Callable[[], Dict[str, List[Req]]] = field(default=lambda: {})
+    # The lists that hold the live requests, by kind (`Scheduler.request_lists`).
+    get_request_lists: Callable[[], Dict[ListKind, Iterable[Req]]] = field(
+        default=lambda: {}
+    )
     get_chunked_req: Callable = field(default=lambda: None)
-    get_running_reqs: Callable[[], Iterable[Req]] = field(default=lambda: ())
-    get_prefill_launched_reqs: Callable[[], Iterable[Req]] = field(default=lambda: ())
     get_running_batches: Callable = field(default=lambda: ())
     # Under PP, the micro-batches' launched steps.
     get_pp_mbs: Callable = field(default=lambda: ())
@@ -484,14 +485,15 @@ class SchedulerInvariantChecker:
         live request is in exactly one list, one that matches its state."""
         if not envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.get():
             return
-        owners: Dict[Req, str] = {}
-        for name, reqs in self.get_request_lists().items():
+        lists = self.get_request_lists()
+        owners: Dict[Req, ListKind] = {}
+        for kind, reqs in lists.items():
             for req in reqs:
                 if req in owners:
                     raise RuntimeError(
-                        f"Request {req.rid} is in both {owners[req]} and {name}"
+                        f"Request {req.rid} is in both {owners[req].name} and {kind.name}"
                     )
-                owners[req] = name
+                owners[req] = kind
 
         chunked_req = self.get_chunked_req()
 
@@ -506,14 +508,14 @@ class SchedulerInvariantChecker:
         in_step = {
             req for b in (batch, *self.get_pp_mbs()) if b is not None for req in b.reqs
         }
-        running = set(self.get_running_reqs())
+        running = set(lists.get(ListKind.DECODING, ()))
 
         _raise_if_any(
             live(in_running_batch | in_step) - owners.keys(),
             "Requests held by a running batch or a step but in no list",
         )
         _raise_if_any(
-            in_running_batch & set(self.get_prefill_launched_reqs()),
+            in_running_batch & set(lists.get(ListKind.PREFILL_LAUNCHED, ())),
             "Requests in prefill_launched but in a running batch",
         )
         _raise_if_any(

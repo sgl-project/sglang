@@ -17,7 +17,8 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.overlap_utils import RelayPayload
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
+from sglang.srt.managers.req_types import FINISH_ABORT
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.utils import (
     GenerationBatchResult,
     allocate_distinct_stream,
@@ -33,7 +34,7 @@ from sglang.srt.sampling.sampling_observer_pp import (
     pop_auxiliary_output_from_pp_tensors,
 )
 from sglang.srt.utils import DynamicGradMode, point_to_point_pyobj
-from sglang.srt.utils.common import is_npu
+from sglang.srt.utils.device import is_npu
 
 _is_npu = is_npu()
 logger = logging.getLogger(__name__)
@@ -429,6 +430,7 @@ class SchedulerPPMixin:
 
                 cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
                 self.cur_batch_for_debug = cur_batch
+                self._flush_staging_scatters()
                 if cur_batch:
                     server_is_idle = False
                     pp_proxy_tensors = None
@@ -613,7 +615,7 @@ class SchedulerPPMixin:
 
     def process_bootstrapped_queue(self: Scheduler):
         reqs = self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
-        self.waiting_queue.extend(reqs)
+        self.waiting_queue.join(reqs)
 
     def _pp_pd_get_prefill_transferred_ids(self: Scheduler) -> Dict[str, bool]:
         """Return {rid: failed} for the transfers every stage so far has concluded.
@@ -1299,9 +1301,9 @@ class SchedulerPPMixin:
         first decode after prefill) carries a degenerate row -- bonus token
         plus zero drafts over a chain topology -- whose drafts simply get
         rejected, costing acceptance rate, not correctness."""
+        from sglang.kernels.ops.speculative.spec_tree import TreeMaskMode
         from sglang.srt.speculative.eagle_info import EagleVerifyInput
         from sglang.srt.speculative.eagle_utils import (
-            TreeMaskMode,
             build_tree_kernel_efficient,
             default_tree_mask_mode,
         )
@@ -1747,7 +1749,7 @@ class SchedulerPPMixin:
         if self.pp_group.is_first_rank:
             # First rank, pop the preallocated reqs from the prealloc queue
             good_prealloc_rids, bad_prealloc_rids = self.get_rids(
-                self.disagg_decode_prealloc_queue.queue,
+                list(self.disagg_decode_prealloc_queue.queue.items()),
                 False,
                 [KVPoll.WaitingForInput],
                 [KVPoll.Failed],
@@ -1757,7 +1759,7 @@ class SchedulerPPMixin:
             prev_prealloc_rids = self._pp_recv_pyobj_from_prev_stage()
             prev_good_prealloc_rids, prev_bad_prealloc_rids = prev_prealloc_rids
             curr_good_prealloc_rids, curr_bad_prealloc_rids = self.get_rids(
-                self.disagg_decode_prealloc_queue.queue,
+                list(self.disagg_decode_prealloc_queue.queue.items()),
                 False,
                 [KVPoll.WaitingForInput],
                 [KVPoll.Failed],
@@ -1770,9 +1772,9 @@ class SchedulerPPMixin:
             )
         # Same abort routing as the prefill bootstrap consensus above.
         aborted_rids = {
-            decode_req.req.rid
-            for decode_req in self.disagg_decode_prealloc_queue.queue
-            if isinstance(decode_req.req.finished_reason, FINISH_ABORT)
+            req.rid
+            for req in self.disagg_decode_prealloc_queue.queue
+            if isinstance(req.finished_reason, FINISH_ABORT)
         }
         good_prealloc_rids, bad_prealloc_rids = self._route_aborts_to_bad(
             good_prealloc_rids, bad_prealloc_rids, aborted_rids
@@ -1804,7 +1806,7 @@ class SchedulerPPMixin:
         waiting queues stay in step with the others.
         """
         succeeded, failed = self.get_rids(
-            self.disagg_decode_transfer_queue.queue,
+            list(self.disagg_decode_transfer_queue.queue.items()),
             False,
             [KVPoll.Success],
             [KVPoll.Failed],
@@ -1827,7 +1829,7 @@ class SchedulerPPMixin:
             resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs(
                 retract_rids
             )
-            self.waiting_queue.extend(resumed_reqs)
+            self.waiting_queue.join(resumed_reqs)
             return [req.rid for req in resumed_reqs]
         return None
 
@@ -1870,6 +1872,6 @@ class SchedulerPPMixin:
             if self.enable_hisparse:
                 for req in released_reqs:
                     self.hisparse_coordinator.admit_request_direct(req)
-            self.waiting_queue.extend(released_reqs)
+            self.waiting_queue.join(released_reqs)
             return outcomes
         return None

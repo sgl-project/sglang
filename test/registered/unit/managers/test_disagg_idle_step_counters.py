@@ -20,7 +20,11 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.managers.scheduler_components.request_list import RequestList
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    KeyedReqList,
+    ListKind,
+)
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_parallel
@@ -543,8 +547,8 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
 
     def make_scheduler(self, schedule):
         scheduler = Scheduler.__new__(Scheduler)
-        scheduler.running_reqs = RequestList()
-        scheduler.prefill_launched_reqs = RequestList()
+        scheduler.running_reqs = KeyedReqList(ListKind.DECODING)
+        scheduler.prefill_launched_reqs = KeyedReqList(ListKind.PREFILL_LAUNCHED)
         scheduler.tp_size = get_parallel().tp_size
         scheduler.gracefully_exit = False
         scheduler._engine_paused = False
@@ -575,9 +579,12 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.decode_moment_totals = [0.0] * 6
         scheduler.running_batch = ScheduleBatch(reqs=[])
         scheduler.last_batch = None
-        scheduler.chunked_req = None
-        scheduler.waiting_queue = []
+        scheduler.chunked_reqs = IndexedReqList(ListKind.CHUNKED)
+        scheduler.waiting_queue = IndexedReqList(ListKind.WAITING)
         scheduler.disagg_prefill_transfer_queue = []
+        scheduler.disagg_decode_transfer_queue = SimpleNamespace(
+            queue=[], staging_handler=None
+        )
         scheduler.enable_staging = False
         scheduler.request_receiver = SimpleNamespace(
             recv_requests=Mock(side_effect=[[]] * len(schedule) + [StopIteration])
@@ -589,7 +596,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.disagg_decode_prealloc_queue = SimpleNamespace(
             prefetch_prefill_dp_rank_queries=Mock(), queue=[]
         )
-        scheduler.process_decode_queue = Mock()
+        scheduler.process_decode_queue = Mock(return_value=False)
         scheduler.ngram_embedding_manager = SimpleNamespace(
             prepare_for_forward=lambda batch, chunked_req: batch
         )
@@ -638,7 +645,9 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
             maybe_prepare_mlp_sync_batch=lambda batch: batch
         )
         scheduler.disagg_prefill_transfer_queue = []
-        scheduler.disagg_decode_transfer_queue = SimpleNamespace(queue=[])
+        scheduler.disagg_decode_transfer_queue = SimpleNamespace(
+            queue=[], staging_handler=None
+        )
 
 
 if __name__ == "__main__":

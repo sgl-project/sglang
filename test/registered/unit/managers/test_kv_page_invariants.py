@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.managers.scheduler_components.request_list import ListKind
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -62,7 +63,9 @@ class _FakeOwner:
 class TestKVPageInvariants(CustomTestCase):
     def test_committed_gt_allocated_raises(self):
         chk, rtt, tc, alloc = _make_checker()
-        chk.get_request_lists = lambda: {"running": [_FakeOwner(0, 145, 144, rid="a")]}
+        chk.get_request_lists = lambda: {
+            ListKind.DECODING: [_FakeOwner(0, 145, 144, rid="a")]
+        }
         with self.assertRaises(AssertionError):
             chk._check_kv_page_invariants()
 
@@ -79,13 +82,15 @@ class TestKVPageInvariants(CustomTestCase):
         rtt[0, :3] = torch.tensor(
             [5 * _PAGE_SIZE, 5 * _PAGE_SIZE + 1, 5 * _PAGE_SIZE + 2]
         )
-        chk.get_request_lists = lambda: {"running": [_FakeOwner(0, 3, 3, rid="a")]}
+        chk.get_request_lists = lambda: {
+            ListKind.DECODING: [_FakeOwner(0, 3, 3, rid="a")]
+        }
         with self.assertRaises(ValueError):
             chk._check_kv_page_invariants()
 
     def test_requests_in_any_list_are_checked(self):
         # A request still owns its row while running or parked between chunks.
-        for where in ("running", "chunked"):
+        for where in (ListKind.DECODING, ListKind.CHUNKED):
             with self.subTest(where=where):
                 chk, rtt, tc, alloc = _make_checker(free_pages=torch.tensor([5, 6, 7]))
                 rtt[0, :3] = torch.tensor(
@@ -104,7 +109,7 @@ class TestKVPageInvariants(CustomTestCase):
         )
         rtt[0, :1] = torch.tensor([5 * alloc.page_size])
         chk.get_request_lists = lambda: {
-            "running": [_FakeOwner(0, 1, 1, rid="classed")]
+            ListKind.DECODING: [_FakeOwner(0, 1, 1, rid="classed")]
         }
 
         with patch(
@@ -119,7 +124,9 @@ class TestKVPageInvariants(CustomTestCase):
     def test_free_pool_duplicate_raises(self):
         chk, rtt, tc, alloc = _make_checker(free_pages=torch.tensor([3, 3, 4]))
         rtt[0, :1] = torch.tensor([10 * _PAGE_SIZE])  # owner page 10, not in free
-        chk.get_request_lists = lambda: {"running": [_FakeOwner(0, 1, 1, rid="a")]}
+        chk.get_request_lists = lambda: {
+            ListKind.DECODING: [_FakeOwner(0, 1, 1, rid="a")]
+        }
         with self.assertRaises(ValueError):
             chk._check_kv_page_invariants()
 

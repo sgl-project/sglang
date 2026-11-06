@@ -530,7 +530,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
     def test_snapshot_builds_cache_only_for_sparse_prefill(self):
         from sglang.srt.environ import envs
         from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
-        from sglang.srt.layers.attention.deepseek_v4_backend import (
+        from sglang.srt.layers.attention.dsv4.metadata import (
             _LARGE_INDEXER_QUERY_THRESHOLD,
         )
 
@@ -577,7 +577,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
 
     def test_prefill_snapshot_skips_layers_reading_live_tables(self):
         from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
-        from sglang.srt.layers.attention.deepseek_v4_backend import (
+        from sglang.srt.layers.attention.dsv4.metadata import (
             _LARGE_INDEXER_QUERY_THRESHOLD,
         )
 
@@ -739,6 +739,46 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             trtllm._check_trtllm_query_rows(64)
             with self.assertRaisesRegex(RuntimeError, "exceeds the persistent"):
                 trtllm._check_trtllm_query_rows(65)
+
+    def test_trtllm_kv_counter_buffer_is_sized_by_query_rows_and_shared(self):
+        from sglang.srt.layers.attention import deepseek_v4_trtllm_backend as trtllm
+
+        buffers = {}
+        sizing_calls = []
+
+        def fake_bytes(batch_size, num_qo_heads, sm_count):
+            sizing_calls.append((batch_size, num_qo_heads, sm_count))
+            return batch_size * num_qo_heads * 4
+
+        def fake_get_buffer(name, factory):
+            # Same contract as runtime_context.get_buffer: build only on a miss.
+            if name not in buffers:
+                buffers[name] = factory()
+            return buffers[name]
+
+        with (
+            mock.patch.object(trtllm, "_trtllm_semaphore_rows", 0),
+            mock.patch.object(trtllm, "get_buffer", side_effect=fake_get_buffer),
+            mock.patch.object(
+                trtllm, "get_trtllm_gen_multi_ctas_kv_counter_bytes", fake_bytes
+            ),
+            mock.patch.object(trtllm, "get_device_sm_count", return_value=148),
+        ):
+            trtllm._reserve_trtllm_query_rows(8192)
+            first = trtllm._get_trtllm_kv_counter_buffer(16, torch.device("cpu"))
+            # FlashInfer's default sizes by request count; this must use rows.
+            self.assertEqual(sizing_calls, [(8192, 16, 148)])
+            self.assertEqual(first.numel(), 8192 * 16 * 4)
+            self.assertEqual(first.dtype, torch.uint8)
+            self.assertFalse(first.any())
+            # One persistent buffer per head count, reused across launches.
+            self.assertIs(
+                trtllm._get_trtllm_kv_counter_buffer(16, torch.device("cpu")), first
+            )
+            self.assertEqual(len(sizing_calls), 1)
+            other = trtllm._get_trtllm_kv_counter_buffer(64, torch.device("cpu"))
+            self.assertIsNot(other, first)
+            self.assertEqual(other.numel(), 8192 * 64 * 4)
 
     def test_sparse_prefill_kv_buffer_reuses_and_grows(self):
         from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
