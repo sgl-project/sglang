@@ -81,6 +81,7 @@ from sglang.srt.layers.quantization.unquant import bf16_gemm_dispatch
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -94,8 +95,8 @@ from sglang.srt.model_executor.forward_context import (
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_forward, get_memory, get_parallel
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
-from sglang.srt.utils import add_prefix, is_cpu, use_intel_amx_backend
-from sglang.srt.utils.common import get_device_capability, is_cuda
+from sglang.srt.utils import is_cpu, use_intel_amx_backend
+from sglang.srt.utils.device import get_device_capability, is_cuda
 
 _is_cpu = is_cpu()
 
@@ -1107,7 +1108,7 @@ class MuseSpark1xModel(nn.Module):
             layer.bind_next_pre_attn_norm(next_layer.input_layernorm)
         self._sp_moe_dispatcher = None
         self._finalize_ar_workspace = None
-        if is_cuda() and envs.SGLANG_ENABLE_MUSE_SPARK_FINALIZE_AR.get():
+        if is_cuda():
             from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
                 CustomAllReduceV2,
             )

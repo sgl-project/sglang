@@ -18,14 +18,17 @@ from __future__ import annotations
 import asyncio
 import copy
 import dataclasses
+import gc
 import json
 import logging
 import os
+import pickle
 import signal
 import socket
 import sys
 import threading
 import time
+import traceback
 from array import array
 from collections import deque
 from contextlib import nullcontext
@@ -211,8 +214,10 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_or_create_event_loop,
     kill_process_tree,
+    print_warning_once,
 )
 from sglang.srt.utils.aio_rwlock import RWLock
+from sglang.srt.utils.common import TypeBasedDispatcher
 from sglang.srt.utils.cudacore_pyspy_dump_utils import (
     collect_scheduler_processes,
     pyspy_dump_schedulers,
@@ -224,7 +229,6 @@ from sglang.srt.utils.weight_versions import (
     add_weight_versions_to_meta_info,
     weight_version_spans_to_json,
 )
-from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
@@ -795,7 +799,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             "hidden_states",
         ]
         self.dump_request_list: List[Tuple] = []
-        self.crash_dump_request_list: deque[Tuple] = deque()
+        # (finish time, pickled (obj, out_dict, created time, finish time))
+        self.crash_dump_request_list: deque[Tuple[float, bytes]] = deque()
         self.crash_dump_performed = False  # Flag to ensure dump is only called once
 
         # Initialize performance metrics loggers with proper skip names
@@ -1337,7 +1342,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def _normalize_mm_content_hashes(obj: GenerateReqInput) -> None:
         """Merge Native/OpenAI content identities and validate their alignment."""
         from sglang.srt.multimodal.cache import parse_content_hash
-        from sglang.srt.utils import ImageData
+        from sglang.srt.multimodal.media_io import ImageData
 
         images = obj.image_data or []
         explicit = obj.mm_content_hashes
@@ -3504,28 +3509,30 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     def record_request_for_crash_dump(self, state: ReqState, out_dict: dict):
         current_time = real_time()
-        request = state.obj
-        input_ids = request.input_ids
-        if isinstance(input_ids, list):
-            # Keep replay data intact without making full GC traverse every token.
-            request = copy.copy(request)
-            request.input_ids = (
-                tuple(tuple(row) for row in input_ids)
-                if input_ids and isinstance(input_ids[0], list)
-                else tuple(input_ids)
-            )
-        self.crash_dump_request_list.append(
-            (
-                request,
-                out_dict,
-                convert_time_to_realtime(state.time_stats.created_time),
-                current_time,
-            )
+        record = (
+            state.obj,
+            out_dict,
+            convert_time_to_realtime(state.time_stats.created_time),
+            current_time,
         )
+        # Keep the record pickled: bytes are not tracked by the cyclic GC. As live
+        # objects, five minutes of finished requests under load are a large number
+        # of tracked objects, and every gen2 collection walks them all, stalling
+        # this event loop for the whole walk.
+        try:
+            blob = pickle.dumps(record, protocol=pickle.HIGHEST_PROTOCOL)
+        except Exception as e:
+            # The crash dump pickles the same tuple, so it could not hold this one.
+            print_warning_once(
+                "Leaving a finished request out of the crash dump history: "
+                f"it does not pickle ({type(e).__name__})."
+            )
+            return
+        self.crash_dump_request_list.append((current_time, blob))
         # Remove requests older than 5 minutes based on finish time
         while (
             self.crash_dump_request_list
-            and current_time - self.crash_dump_request_list[0][3] >= 300
+            and current_time - self.crash_dump_request_list[0][0] >= 300
         ):
             self.crash_dump_request_list.popleft()
 
@@ -3561,10 +3568,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if self.crash_dump_folder:
             logger.error(f"Dumping requests before crash. {self.crash_dump_folder=}")
 
-            # Add finished requests from crash_dump_request_list
-            data_to_dump = []
-            if self.crash_dump_request_list:
-                data_to_dump.extend(self.crash_dump_request_list)
+            # Add finished requests from crash_dump_request_list (kept pickled). GC is
+            # paused while they are rebuilt: each record becomes several tracked
+            # objects, and every full collection would walk all of them built so far.
+            gc_enabled = gc.isenabled()
+            gc.disable()
+            try:
+                data_to_dump = [
+                    pickle.loads(blob) for _, blob in self.crash_dump_request_list
+                ]
+            finally:
+                if gc_enabled:
+                    gc.enable()
 
             # Add unfinished requests from rid_to_state
             unfinished_requests = []
@@ -3645,7 +3660,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 self.force_exit_handler()
                 break
 
-            elif get_bool_env_var("SGL_FORCE_SHUTDOWN"):
+            elif envs.SGLANG_FORCE_SHUTDOWN.get():
                 # if force shutdown flag set, exit immediately
                 logger.error(
                     "Signal SIGTERM received while force shutdown flag set. Force exiting."
@@ -4166,8 +4181,7 @@ async def print_exception_wrapper(func):
     try:
         await func()
     except Exception:
-        traceback = get_exception_traceback()
-        logger.error(f"TokenizerManager hit an exception: {traceback}")
+        logger.error(f"TokenizerManager hit an exception: {traceback.format_exc()}")
         if hasattr(func, "__self__") and isinstance(func.__self__, TokenizerManager):
             func.__self__.dump_requests_before_crash()
         kill_process_tree(os.getpid(), include_parent=True)
