@@ -2841,12 +2841,6 @@ def apply_fp8_linear(
     use_cutlass_channelwise_gemm = (
         channelwise_cutlass and cutlass_compatible_b and not use_triton_w8a8_fp8_kernel
     )
-    # Consider a tuned Triton tile only where the shape would otherwise go to
-    # CUTLASS (that is the path the offline sweep tuned against). On by default;
-    # SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE=0 is the kill switch.
-    use_tuned_triton_channelwise = (
-        use_cutlass_channelwise_gemm and envs.SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE.get()
-    )
     native_scalar_a_scale = use_cutlass_channelwise_gemm and (
         get_platform().is_sm90 or get_platform().is_sm100 or get_platform().is_sm120
     )
@@ -2936,12 +2930,14 @@ def apply_fp8_linear(
     if channelwise_cutlass:
         # A tuned config exists only for shapes where tuned Triton beat the
         # CUTLASS dispatch on this GPU; otherwise this is None and the backend
-        # choice below is unchanged. weight is [K, N] here.
+        # choice below is unchanged. Only shapes that would otherwise go to
+        # CUTLASS consult it (the path the offline sweep tuned against).
+        # weight is [K, N] here.
         tuned_config = (
             get_w8a8_channelwise_fp8_config(
                 N=weight.shape[1], K=weight.shape[0], M=qinput.shape[0]
             )
-            if use_tuned_triton_channelwise
+            if use_cutlass_channelwise_gemm
             else None
         )
         if not use_cutlass_channelwise_gemm:
