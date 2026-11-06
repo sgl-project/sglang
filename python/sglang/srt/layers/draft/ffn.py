@@ -1,4 +1,4 @@
-"""Draft FFN modules built from DraftMixFFNSpec; dense now, MoE next."""
+"""Draft FFN modules built from DraftMixFFNSpec: DraftMLP and DraftMoE."""
 
 from __future__ import annotations
 
@@ -9,8 +9,14 @@ import torch
 from torch import nn
 
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.linear import MergedColumnParallelLinear, RowParallelLinear
+from sglang.srt.layers.draft.ffn_spec import DraftMoeFFNSpec
+from sglang.srt.layers.linear import (
+    MergedColumnParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
 
 SWIGLUOAI_ALPHA = 1.702  # gpt-oss's fixed sigmoid slope
@@ -90,3 +96,124 @@ class DraftMLP(nn.Module):
         gate_up, _ = self.gate_up_proj(x)
         out, _ = self.down_proj(self.act_fn(gate_up))
         return out
+
+
+class DraftMoE(nn.Module):
+    """Routed experts plus an optional shared expert, built from a DraftMoeFFNSpec."""
+
+    def __init__(
+        self,
+        spec: DraftMoeFFNSpec,
+        hidden_size: int,
+        *,
+        layer_id: int,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
+        from sglang.srt.layers.moe.topk import TopK
+
+        _check_parallel_fit(spec)
+        self.spec = spec
+        self.hidden_size = hidden_size
+        self.gate = ReplicatedLinear(
+            hidden_size,
+            spec.num_experts,
+            bias=False,
+            quant_config=None,
+            prefix=add_prefix("gate", prefix),
+        )
+        # The trained fp32 selection bias lives on the gate, where the checkpoint keeps it.
+        self.gate.expert_bias = (
+            nn.Parameter(
+                torch.empty(spec.num_experts, dtype=torch.float32), requires_grad=False
+            )
+            if spec.expert_bias
+            else None
+        )
+        grouped = spec.num_expert_group is not None
+        self.topk = TopK(
+            spec.top_k,
+            layer_id=layer_id,
+            renormalize=spec.norm_topk_prob,
+            use_grouped_topk=grouped,
+            num_expert_group=spec.num_expert_group,
+            topk_group=spec.topk_group,
+            scoring_func=spec.scoring_func,
+            correction_bias=self.gate.expert_bias,
+            quant_config=quant_config,
+            routed_scaling_factor=(
+                None
+                if spec.routed_scaling_factor == 1.0
+                else spec.routed_scaling_factor
+            ),
+        )
+        # The fused softmax router ignores the bias; the torch path adds it to the scores.
+        if spec.expert_bias and spec.scoring_func == "softmax" and not grouped:
+            self.topk.topk_config.torch_native = True
+        swigluoai = spec.hidden_act == "swigluoai"
+        self.experts = get_moe_impl_class(quant_config)(
+            num_experts=spec.num_experts,
+            top_k=spec.top_k,
+            hidden_size=hidden_size,
+            intermediate_size=spec.intermediate_size,
+            layer_id=layer_id,
+            reduce_results=False,
+            quant_config=quant_config,
+            prefix=add_prefix("experts", prefix),
+            activation=spec.hidden_act,
+            gemm1_alpha=(spec.swiglu_alpha or SWIGLUOAI_ALPHA) if swigluoai else None,
+            gemm1_clamp_limit=spec.swiglu_limit if swigluoai else None,
+            swiglu_limit=None if swigluoai else spec.swiglu_limit,
+            routing_method_type=_routing_method(spec),
+        )
+        self.topk.bind_runner_backend(
+            self.experts.runner_backend,
+            routing_method_type=self.experts.routing_method_type,
+        )
+        self.shared_expert = (
+            DraftMLP(
+                hidden_size,
+                spec.shared_expert_intermediate_size,
+                spec.hidden_act,
+                swiglu_limit=spec.swiglu_limit,
+                swiglu_alpha=spec.swiglu_alpha,
+                reduce_results=False,
+                quant_config=quant_config,
+                prefix=add_prefix("shared_expert", prefix),
+            )
+            if spec.shared_expert_intermediate_size
+            else None
+        )
+        self.shared_expert_gate = (
+            nn.Linear(hidden_size, 1, bias=False) if spec.shared_expert_gated else None
+        )
+
+
+def _routing_method(spec: DraftMoeFFNSpec):
+    """The RoutingMethodType the fused routers key on; TopK itself reads the spec fields."""
+    from sglang.srt.layers.moe.utils import RoutingMethodType
+
+    if spec.scoring_func != "softmax" or spec.num_expert_group is not None:
+        return RoutingMethodType.DeepSeekV3
+    return (
+        RoutingMethodType.Renormalize
+        if spec.norm_topk_prob
+        else RoutingMethodType.Default
+    )
+
+
+def _check_parallel_fit(spec: DraftMoeFFNSpec) -> None:
+    """FusedMoE shards the expert width over MoE TP and the experts over MoE EP."""
+    parallel = get_parallel()
+    if spec.intermediate_size % parallel.moe_tp_size:
+        raise ValueError(
+            f"Draft FFN: moe_intermediate_size={spec.intermediate_size} is not "
+            f"divisible by the MoE tensor-parallel size {parallel.moe_tp_size}."
+        )
+    if spec.num_experts % parallel.moe_ep_size:
+        raise ValueError(
+            f"Draft FFN: num_experts={spec.num_experts} is not divisible by the "
+            f"MoE expert-parallel size {parallel.moe_ep_size}."
+        )
