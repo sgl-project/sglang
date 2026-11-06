@@ -39,7 +39,10 @@ class TestDeviceRegistration(CustomTestCase):
         )
         self.assertEqual(
             client.register_memory.call_args_list,
-            [unittest.mock.call(4096, 8192, gpu, 3), unittest.mock.call(16384, 1024, gpu, 1)],
+            [
+                unittest.mock.call(4096, 8192, gpu, 3),
+                unittest.mock.call(16384, 1024, gpu, 1),
+            ],
         )
         self.assertEqual(linker._registered, [(4096, 8192), (16384, 1024)])
 

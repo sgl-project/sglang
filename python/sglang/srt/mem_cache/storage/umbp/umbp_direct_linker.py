@@ -374,7 +374,9 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             for buffer in pool.get_hybrid_pool_buffer():
                 device = buffer.device
                 if device.type != "cuda" or device.index is None:
-                    raise ValueError("Direct UMBP requires CUDA/ROCm device KV buffers.")
+                    raise ValueError(
+                        "Direct UMBP requires CUDA/ROCm device KV buffers."
+                    )
                 storage = buffer.untyped_storage()
                 allocation = (int(storage.data_ptr()), int(storage.nbytes()))
                 if allocation in seen:
