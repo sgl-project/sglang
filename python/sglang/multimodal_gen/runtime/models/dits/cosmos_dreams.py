@@ -37,15 +37,230 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos3video import (
     compute_mrope_position_ids_text,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.runtime_context import get_stream
 
 KVPair = tuple[torch.Tensor, torch.Tensor]
-# Per-layer history: a list, or a view that gathers one layer at a time.
+# Per-layer history: legacy lists or request-local buffers.
 HistoryKV = Sequence[KVPair]
 logger = init_logger(__name__)
 
 
+class CosmosDreamsKVCache(Sequence[KVPair]):
+    """Keep text, committed history, and current K/V in one buffer per layer.
+
+    Attention overwrites only the current suffix. A clean refresh is committed
+    explicitly; denoising never changes the visible history. Sliding compaction
+    uses one scratch tensor shared by all layers, rather than a second full KV
+    cache. Compaction on a separate stream prepares each layer; the next
+    forward waits before accessing its history or current suffix.
+    """
+
+    def __init__(
+        self,
+        text_kv: Sequence[KVPair],
+        *,
+        tokens_per_frame: int,
+        sink_frames: int,
+        window_frames: int,
+        max_current_frames: int,
+        max_history_frames: int | None = None,
+    ) -> None:
+        if not text_kv:
+            raise ValueError("Cosmos-Dreams KV cache requires at least one layer.")
+        if (
+            min(tokens_per_frame, window_frames, max_current_frames) <= 0
+            or sink_frames < 0
+        ):
+            raise ValueError("Cosmos-Dreams KV cache dimensions must be positive.")
+        first = text_kv[0][0]
+        if first.ndim != 4 or first.shape[0] != 1:
+            raise ValueError("Cosmos-Dreams text KV must have shape [1,S,H,D].")
+        self.text_tokens = first.shape[1]
+        self.sink_tokens = sink_frames * tokens_per_frame
+        self.window_tokens = window_frames * tokens_per_frame
+        self.history_capacity = self.sink_tokens + self.window_tokens
+        if max_history_frames is not None:
+            if max_history_frames < 0:
+                raise ValueError(
+                    "Cosmos-Dreams request history capacity cannot be negative."
+                )
+            self.history_capacity = min(
+                self.history_capacity, max_history_frames * tokens_per_frame
+            )
+        self.current_capacity = max_current_frames * tokens_per_frame
+        self.history_tokens = 0
+        capacity = self.text_tokens + self.history_capacity + self.current_capacity
+        shape = (2, 1, capacity, *first.shape[-2:])
+        self._buffers: list[torch.Tensor] = []
+        for key, value in text_kv:
+            if any(
+                t.shape != first.shape
+                or t.dtype != first.dtype
+                or t.device != first.device
+                for t in (key, value)
+            ):
+                raise ValueError(
+                    "Cosmos-Dreams KV cache layers must have matching geometry."
+                )
+            buffer = first.new_empty(shape)
+            buffer[0, :, : self.text_tokens].copy_(key)
+            buffer[1, :, : self.text_tokens].copy_(value)
+            self._buffers.append(buffer)
+        scratch_tokens = (
+            self.window_tokens
+            if self.history_capacity == self.sink_tokens + self.window_tokens
+            else 0
+        )
+        self._scratch = first.new_empty((2, 1, scratch_tokens, *first.shape[-2:]))
+        self._stream = (
+            get_stream("cosmos3_kv_compaction")
+            if first.is_cuda and scratch_tokens
+            else None
+        )
+        self._ready = (
+            [torch.cuda.Event() for _ in self._buffers] if self._stream else []
+        )
+        self._pending = [False] * len(self)
+
+    def __enter__(self) -> "CosmosDreamsKVCache":
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        # Drain even on failure before the request releases buffers or scratch.
+        if self._stream is not None:
+            self._stream.synchronize()
+            self._pending = [False] * len(self)
+
+    def _wait_layer(self, index: int) -> None:
+        if self._pending[index]:
+            torch.cuda.current_stream(self._buffers[index].device).wait_event(
+                self._ready[index]
+            )
+            self._pending[index] = False
+
+    def __len__(self) -> int:
+        return len(self._buffers)
+
+    def __getitem__(self, index: int) -> KVPair:
+        """Expose only committed history, without the text or current suffix."""
+        self._wait_layer(index)
+        buffer = self._buffers[index]
+        start = self.text_tokens
+        end = start + self.history_tokens
+        return buffer[0, :, start:end], buffer[1, :, start:end]
+
+    def attention_buffer(self, layer_index: int, current_tokens: int) -> KVPair:
+        """Return text + history + current views; the caller fills current K/V."""
+        if not 0 < current_tokens <= self.current_capacity:
+            raise ValueError("Cosmos-Dreams current KV exceeds its reserved capacity.")
+        self._wait_layer(layer_index)
+        end = self.text_tokens + self.history_tokens + current_tokens
+        buffer = self._buffers[layer_index]
+        return buffer[0, :, :end], buffer[1, :, :end]
+
+    def load_selected(
+        self,
+        archive: "CosmosDreamsKVCache",
+        frame_ids: Sequence[int],
+        tokens_per_frame: int,
+    ) -> None:
+        """Copy a chunk's selected history once, ready one layer at a time."""
+        ids = list(frame_ids)
+        stored = archive.history_tokens // tokens_per_frame
+        if ids != sorted(set(ids)) or (ids and (ids[0] < 0 or ids[-1] >= stored)):
+            raise ValueError(
+                "Selected frames must be ordered unique committed frames, "
+                f"got {ids} with {stored} committed."
+            )
+        count = len(ids) * tokens_per_frame
+        if count > self.history_capacity:
+            raise ValueError("Cosmos-Dreams selected history exceeds its capacity.")
+        device = self._buffers[0].device
+        spans = []
+        for frame in ids:
+            if spans and frame == spans[-1][1]:
+                spans[-1][1] += 1
+            else:
+                spans.append([frame, frame + 1])
+        if device.type == "cuda":
+            if self._stream is None:
+                self._stream = get_stream("cosmos3_kv_gather")
+                self._ready = [torch.cuda.Event() for _ in self._buffers]
+            # Protect archive writes and the preceding chunk's reads before
+            # reusing this working set.
+            self._stream.wait_stream(torch.cuda.current_stream(device))
+        with torch.cuda.stream(self._stream):
+            for index, (source, dest) in enumerate(
+                zip(archive._buffers, self._buffers, strict=True)
+            ):
+                dest_start = self.text_tokens
+                for start, end in spans:
+                    source_start = archive.text_tokens + start * tokens_per_frame
+                    tokens = (end - start) * tokens_per_frame
+                    for kind in range(2):
+                        dest[kind, :, dest_start : dest_start + tokens].copy_(
+                            source[kind, :, source_start : source_start + tokens],
+                            non_blocking=True,
+                        )
+                    dest_start += tokens
+                if self._stream is not None:
+                    self._ready[index].record()
+        if self._stream is not None:
+            self._pending = [True] * len(self)
+        self.history_tokens = count
+
+    def commit(self, frame_tokens: int) -> None:
+        """Commit one clean frame already written by the preceding forward.
+
+        That forward consumes each layer's ready dependency before writing the
+        suffix. Commit only advances or compacts history; it never imports K/V.
+        """
+        if not 0 < frame_tokens <= min(self.current_capacity, self.window_tokens):
+            raise ValueError("Cosmos-Dreams clean frame exceeds its reserved capacity.")
+        if self.history_tokens + frame_tokens <= self.history_capacity:
+            self.history_tokens += frame_tokens
+            return
+        if self.history_capacity < self.sink_tokens + self.window_tokens:
+            raise ValueError("Cosmos-Dreams request history capacity exceeded.")
+        tail_old = self.window_tokens - frame_tokens
+        old_start = self.text_tokens + self.history_tokens - tail_old
+        dest_start = self.text_tokens + self.sink_tokens
+        new_start = self.text_tokens + self.history_tokens
+        new_dest = dest_start + tail_old
+        if self._stream is not None:
+            # All layers must finish reading the old history before any move.
+            self._stream.wait_stream(torch.cuda.current_stream(self._buffers[0].device))
+        with torch.cuda.stream(self._stream):
+            for index, buffer in enumerate(self._buffers):
+                # Copy K/V separately so each slice is contiguous.
+                for kind in range(2):
+                    if tail_old:
+                        # The source and destination overlap; stage via scratch.
+                        scratch = self._scratch[kind, :, :tail_old]
+                        scratch.copy_(
+                            buffer[kind, :, old_start : old_start + tail_old],
+                            non_blocking=True,
+                        )
+                        buffer[kind, :, dest_start : dest_start + tail_old].copy_(
+                            scratch, non_blocking=True
+                        )
+                    buffer[kind, :, new_dest : new_dest + frame_tokens].copy_(
+                        buffer[kind, :, new_start : new_start + frame_tokens],
+                        non_blocking=True,
+                    )
+                if self._stream is not None:
+                    self._ready[index].record()
+        if self._stream is not None:
+            self._pending = [True] * len(self)
+        self.history_tokens = self.history_capacity
+
+
 class CosmosDreamsForwardOutput(msgspec.Struct):
-    """Velocity for the current chunk plus its per-layer ``[1, S, H_kv, D]`` K/V."""
+    """Velocity and per-layer ``[1, S, H_kv, D]`` K/V for the current chunk.
+
+    With a request KV cache, these K/V alias its current suffix until the next
+    forward or history commit.
+    """
 
     video: torch.Tensor
     current_kv: list[KVPair]
@@ -199,11 +414,12 @@ def _joint_attention(
     attention: Cosmos3CrossAttention,
     hidden: torch.Tensor,
     *,
-    prefix_k: torch.Tensor,
-    prefix_v: torch.Tensor,
+    text_kv: KVPair,
+    history_kv: KVPair | None,
     cos_sin_cache: torch.Tensor,
     rope_positions: torch.Tensor,
     null_token_slices: list[slice],
+    kv_buffer: KVPair | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """One softmax over ``[prefix (text + history) | current chunk]``.
 
@@ -233,9 +449,22 @@ def _joint_attention(
     v = v.contiguous()
     for null_slice in null_token_slices:
         v[:, null_slice] = 0.0
-    out = attention.attn(
-        q, torch.cat([prefix_k, k], dim=1), torch.cat([prefix_v, v], dim=1)
-    )
+    if kv_buffer is None:
+        text_k, text_v = text_kv
+        keys, values = [text_k], [text_v]
+        if history_kv is not None:
+            keys.append(history_kv[0])
+            values.append(history_kv[1])
+        keys.append(k)
+        values.append(v)
+        all_k, all_v = torch.cat(keys, dim=1), torch.cat(values, dim=1)
+    else:
+        all_k, all_v = kv_buffer
+        current_k, current_v = all_k[:, -seq_len:], all_v[:, -seq_len:]
+        current_k.copy_(k)
+        current_v.copy_(v)
+        k, v = current_k, current_v
+    out = attention.attn(q, all_k, all_v)
     out, _ = attention.to_out(out.reshape(batch_size, seq_len, -1))
     return out, k, v
 
@@ -275,14 +504,6 @@ def project_actions(
         )
     flat = action_latents.reshape(tokens, action_latents.shape[-1])
     return projection(flat, domain_ids).reshape(1, tokens, hidden_size)
-
-
-def _prefix_kv(text_kv: KVPair, history_kv: KVPair | None) -> KVPair:
-    text_k, text_v = text_kv
-    if history_kv is None or history_kv[0].shape[1] == 0:
-        return text_k, text_v
-    history_k, history_v = history_kv
-    return torch.cat([text_k, history_k], dim=1), torch.cat([text_v, history_v], dim=1)
 
 
 class CosmosDreamsTransformer(Cosmos3OmniTransformer):
@@ -468,14 +689,17 @@ class CosmosDreamsTransformer(Cosmos3OmniTransformer):
 
         current_kv: list[KVPair] = []
         for layer_idx, layer in enumerate(self.gen_layers):
-            prefix_k, prefix_v = _prefix_kv(
-                text_kv[layer_idx],
-                None if history_kv is None else history_kv[layer_idx],
-            )
+            if isinstance(history_kv, CosmosDreamsKVCache):
+                kv_buffer = history_kv.attention_buffer(layer_idx, hidden.shape[1])
+                layer_history = None
+            else:
+                kv_buffer = None
+                layer_history = None if history_kv is None else history_kv[layer_idx]
             hidden, k, v = layer(
                 hidden,
-                prefix_k=prefix_k,
-                prefix_v=prefix_v,
+                text_kv=text_kv[layer_idx],
+                history_kv=layer_history,
+                kv_buffer=kv_buffer,
                 cos_sin_cache=cos_sin_cache,
                 rope_positions=rope_positions,
                 null_token_slices=null_slices,

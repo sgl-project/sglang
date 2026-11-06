@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for Cosmos-Dreams frustum K/V retrieval: selector geometry, pose
-recovery from unified rows, the per-layer archive view and request resolution."""
+"""Unit tests for Cosmos-Dreams frustum K/V retrieval: selector geometry,
+pose recovery from unified rows and request resolution."""
 
 import math
 import unittest
@@ -10,7 +10,6 @@ import torch
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_simulation.frustum import (
     POSE_CHUNK_FRAMES,
     FrustumHistorySelector,
-    SelectedHistory,
     chunk_anchored_poses,
     denormalize_unified_slots,
     describe_selection,
@@ -88,6 +87,16 @@ class TestFrustumSelector(unittest.TestCase):
         )
         self.assertEqual(zero.select(10), [])
         self.assertEqual(selector.partition(50), (2, 46))
+
+    def test_describe_selection(self):
+        selector = _selector(
+            [_pose() for _ in range(100)], sink_size=2, retrieved_size=3, recent_size=4
+        )
+        selected = selector.select(50)
+        self.assertEqual(
+            describe_selection(selector, 50, selected),
+            "9 frames: 2 sinks, 4 recent, retrieved [43, 44, 45]",
+        )
 
     def test_multi_frame_query_averages_over_the_chunk(self):
         poses = (
@@ -240,39 +249,6 @@ class TestPoseRecovery(unittest.TestCase):
         )
         # ...and the second chunk re-anchors on the last pose of the first.
         self.assertAlmostEqual(absolute[POSE_CHUNK_FRAMES + 1, 2, 3].item(), 2.0)
-
-
-class TestSelectedHistory(unittest.TestCase):
-    def test_gathers_selected_frames_per_layer(self):
-        tokens = 3
-        frames = torch.arange(6, dtype=torch.float32).repeat_interleave(tokens)
-        archive = [
-            (frames.view(1, -1, 1, 1) + layer * 100, -frames.view(1, -1, 1, 1))
-            for layer in range(2)
-        ]
-        view = SelectedHistory(archive, frame_ids=[0, 3, 5], tokens_per_frame=tokens)
-        self.assertEqual(len(view), 2)
-        self.assertEqual(view.frame_ids, (0, 3, 5))
-        key, value = view[1]
-        self.assertEqual(
-            key[0, :, 0, 0].tolist(), [100, 100, 100, 103, 103, 103, 105, 105, 105]
-        )
-        self.assertEqual(value[0, ::tokens, 0, 0].tolist(), [0, -3, -5])
-        empty = SelectedHistory(archive, frame_ids=[], tokens_per_frame=tokens)
-        self.assertEqual(empty[0][0].shape[1], 0)
-        for bad in ([3, 0], [0, 0], [6], [-1]):
-            with self.subTest(bad=bad), self.assertRaises(ValueError):
-                SelectedHistory(archive, frame_ids=bad, tokens_per_frame=tokens)
-
-    def test_describe_selection(self):
-        selector = _selector(
-            [_pose() for _ in range(100)], sink_size=2, retrieved_size=3, recent_size=4
-        )
-        selected = selector.select(50)
-        self.assertEqual(
-            describe_selection(selector, 50, selected),
-            "9 frames: 2 sinks, 4 recent, retrieved [43, 44, 45]",
-        )
 
 
 class TestResolveFrustumSelector(unittest.TestCase):
