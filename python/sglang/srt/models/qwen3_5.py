@@ -2633,7 +2633,9 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         return module_name.startswith("model.layers.")
 
     def _get_num_fused_shared_experts(self):
-        if not hasattr(self.model, "layers"):
+        # nn.Module.__getattr__ raises on missing attrs, so check self first
+        # before touching self.model (absent under --encoder-only).
+        if not hasattr(self, "model") or not hasattr(self.model, "layers"):
             return 0
         for layer_id in range(self.model.start_layer, self.model.end_layer):
             mlp = getattr(self.model.layers[layer_id], "mlp", None)
