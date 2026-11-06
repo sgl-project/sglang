@@ -289,6 +289,9 @@ def match_kv_cache(
         match_result.swa_host_hit_length,
         match_result.mamba_host_hit_length,
     )
+    req.matched_auxiliary_swa_host_hit_length = (
+        match_result.auxiliary_swa_host_hit_length
+    )
     max_len = req._compute_max_prefix_len(len(token_ids))
     req.num_matched_prefix_tokens = min(req.prefix_len + req.host_hit_length, max_len)
     req.swa_branching_seqlen = match_result.swa_branching_seqlen
@@ -296,7 +299,7 @@ def match_kv_cache(
     if match_result.mamba_branching_seqlen is not None:
         req.mamba_branching_seqlen = match_result.mamba_branching_seqlen
     if match_result.cache_protected_len is not None:
-        req.kv.cache_protected_len = match_result.cache_protected_len
+        req.kv.protect_prefix(match_result.cache_protected_len)
     return match_result
 
 
@@ -372,8 +375,7 @@ def backup_kv_cache(
     if backend == "none":
         return False
     if dsv4_needs_rebootstrap(token_to_kv_pool_allocator):
-        if req.multimodal_inputs is not None:
-            # The recompute payload carries token ids only; images would be lost.
+        if not req.resumable_by_rebootstrap:
             return False
         # Drain the in-flight forward before its slots can receive recomputed KV.
         device = token_to_kv_pool_allocator.get_kvcache().device
@@ -431,19 +433,13 @@ def finish_restore_kv_cache(req: Req, tree_cache: BasePrefixCache) -> None:
     unified_cache.finish_restore_kv_cache(req)
 
 
-def discard_kv_cache_backup(
-    req: Req, tree_cache: BasePrefixCache, backend: str
-) -> None:
-    if backend == "cpu_tensor":
-        req.kv.retraction_backup = None
+def discard_kv_cache_backup(req: Req, tree_cache: BasePrefixCache) -> None:
+    backup = req.kv.retraction_backup
+    if backup is None:
         return
-    if backend != "host_pool":
-        raise ValueError(f"Unknown retraction backup backend: {backend}")
-    if req.kv.retraction_backup is None:
-        return
-
-    unified_cache = cast("UnifiedRadixCache", tree_cache)
-    unified_cache.discard_kv_cache_backup(req.kv.retraction_backup)
+    # A host-pool backup holds host pages; a cpu_tensor one only CPU tensors.
+    if backup.host_indices is not None:
+        cast("UnifiedRadixCache", tree_cache).discard_kv_cache_backup(backup)
     req.kv.retraction_backup = None
 
 

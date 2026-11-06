@@ -47,8 +47,8 @@ from sglang.kernels.ops.diffusion import (
     vdn_silu_l2norm,
     vdn_temporal_conv_act,
 )
-from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
-    MiniMaxH3DiTArchConfig,
+from sglang.multimodal_gen.configs.models.dits.minimax_h3 import MiniMaxH3DiTArchConfig
+from sglang.multimodal_gen.configs.models.dits.minimax_h3_vdn import (
     VDNHybridAttentionArchConfig,
 )
 from sglang.multimodal_gen.runtime.distributed import (

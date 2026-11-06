@@ -41,7 +41,7 @@ import torch
 
 from sglang.srt.mem_cache.kv.alloc import runner_ids
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
-from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.alloc.iteration_ids import TokenSpan
 from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
 from sglang.srt.mem_cache.kv.layout.mha import DraftMHAView, MHASubPoolSpec
@@ -50,12 +50,17 @@ from sglang.srt.mem_cache.layout.fused_draft import (
     FusedDraftPlacement,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang.test.unified_allocator_fixtures import arena_of, stand_in_views
+from sglang.test.unified_allocator_fixtures import (
+    FakeKVCache,
+    FakeUnifiedSWAKVPool,
+    arena_of,
+    stand_in_views,
+)
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -110,43 +115,6 @@ class _HostStreamGather:
             out[lo : lo + int(seq_lens[b])] = tok.to(out.dtype)
 
 
-class _FakeKVCache:
-    # A private pool, indexed by the allocator's ids as they are.
-    requires_physical_write_loc = False
-
-    def __init__(self, source, name=None):
-        # A bare size for a private pool; else the band of ``source`` (a test
-        # arena) whose unit moves this buffer follows.
-        size = source if name is None else source.num_entries(name)
-        if name is not None:
-            source.follow(name, self)
-        self.buf = torch.full((size,), -1, dtype=torch.int64)
-        self.allocator = None
-
-    def move_units(self, dst_pages, src_pages, page_size):
-        slots = torch.arange(page_size, device=dst_pages.device)
-        dst_loc = (dst_pages[:, None] * page_size + slots).flatten()
-        src_loc = (src_pages[:, None] * page_size + slots).flatten()
-        self.buf[dst_loc] = self.buf[src_loc].clone()
-
-    def id_spaces(self):
-        return {IdSpaceKind.FULL: IdSpace(key=(IdSpaceKind.FULL, None))}
-
-    def attach_allocator(self, allocator):
-        self.allocator = allocator
-
-
-class _FakeUnifiedSWAKVPool:
-    def __init__(self, shared_pool):
-        self.full_kv_pool = _FakeKVCache(shared_pool, "full")
-        self.swa_kv_pool = _FakeKVCache(shared_pool, "swa")
-        self.full_to_swa_index_mapping = None
-
-    def attach_allocators(self, *, full_allocator, swa_allocator):
-        self._full_allocator = full_allocator
-        self._swa_allocator = swa_allocator
-
-
 class TestIterationIds(CustomTestCase):
     def setUp(self):
         # `RunnerIds.__init__` reads `attn_dcp_size`, a derived
@@ -186,7 +154,7 @@ class TestIterationIds(CustomTestCase):
                 counts={"full": [1]}, regions={"full": full_spec.draft_region}
             ),
         )
-        kvcache = _FakeUnifiedSWAKVPool(pool)
+        kvcache = FakeUnifiedSWAKVPool(pool)
         self.allocator = ChainAllocator(
             roles=ChainRoles(owner="full", window="swa"),
             arena=pool,
@@ -210,7 +178,7 @@ class TestIterationIds(CustomTestCase):
         self.draft_pool = draft_pool
         self.target = self._runner_ids(kvcache)
         self.fused_draft = self._runner_ids(draft_pool)
-        self.private_draft = self._runner_ids(_FakeKVCache(64))
+        self.private_draft = self._runner_ids(FakeKVCache(64))
 
         # Two requests, two pages each; the second page of each is this
         # iteration's write window (one token per request).
@@ -722,7 +690,7 @@ class TestIterationIds(CustomTestCase):
                 RunnerIds(
                     req_to_token=self.req_to_token,
                     token_to_kv_pool_allocator=self.allocator,
-                    token_to_kv_pool=_FakeKVCache(64),
+                    token_to_kv_pool=FakeKVCache(64),
                     page_size=4,
                     device=_DEV,
                     is_draft_worker=is_draft_worker,
