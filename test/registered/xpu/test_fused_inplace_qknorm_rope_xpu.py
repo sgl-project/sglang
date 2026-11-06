@@ -1,9 +1,10 @@
-"""Qwen3-MoE's XPU fused QK-norm + RoPE call against the model's unfused path.
+"""Qwen3 / Qwen3-MoE's XPU fused QK-norm + RoPE call against the models' unfused path.
 
 Kernel correctness is tested in sgl-kernel-xpu; this guards the sglang side of
 the contract: ``RotaryEmbedding.cos_sin_cache`` (including RoPE scaling baked
 into it) is what ``sgl_kernel.fused_inplace_qknorm_rope`` reads, fed the way
-``Qwen3MoeAttention.apply_qk_norm_rope`` feeds it.
+``Qwen3MoeAttention.apply_qk_norm_rope`` and ``Qwen3Attention.forward_prepare_native``
+feed it.
 """
 
 import sys
@@ -44,15 +45,18 @@ YARN_SCALING = {
 @pytest.mark.parametrize("head_dim,rotary_dim", [(128, 128), (128, 64)])
 @pytest.mark.parametrize("is_neox", [False, True])
 @pytest.mark.parametrize("num_tokens", [1, 257])
+# Per-rank heads at TP4: Qwen3-30B-A3B (32/4 q, 4/4 kv) and Qwen3-32B (64/4 q, 8/4 kv).
+@pytest.mark.parametrize("num_q_heads,num_kv_heads", [(8, 1), (16, 2)])
 def test_qknorm_rope_matches_model_unfused_path(
     rope_scaling,
     head_dim: int,
     rotary_dim: int,
     is_neox: bool,
     num_tokens: int,
+    num_q_heads: int,
+    num_kv_heads: int,
 ) -> None:
     """The fused call fed from a model's RotaryEmbedding matches its unfused apply_qk_norm + rotary_emb path."""
-    num_q_heads, num_kv_heads = 8, 1
     max_position = 131072
     rotary_emb = get_rope(
         head_dim,
