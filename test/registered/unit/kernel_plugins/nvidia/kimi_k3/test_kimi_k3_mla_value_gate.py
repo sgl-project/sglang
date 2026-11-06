@@ -62,13 +62,23 @@ def _gate(supported=True):
     )
 
 
-def test_value_gate_is_opt_in_and_bucket_refusals_keep_mla_value():
+@pytest.mark.parametrize(
+    "prepare_error",
+    [
+        pytest.param(ValueError("w_uv alignment"), id="layout"),
+        pytest.param(RuntimeError("program load failed"), id="runtime"),
+        pytest.param(torch.cuda.OutOfMemoryError("out of memory"), id="oom"),
+        pytest.param(OSError("program load failed"), id="load"),
+        pytest.param(RuntimeError("prepare outside capture"), id="capture"),
+    ],
+)
+def test_value_gate_is_opt_in_and_bucket_refusals_keep_mla_value(prepare_error):
     w_uv, calls = _w_uv(), []
 
     def prepare(weight, **kwargs):
         calls.append((weight, kwargs))
         if kwargs["max_rows"] == 3:
-            raise ValueError("w_uv must start on a 16-byte boundary")
+            raise prepare_error
         return SimpleNamespace(program="program", arch="sm_103a")
 
     with (
@@ -94,7 +104,7 @@ def test_value_gate_is_opt_in_and_bucket_refusals_keep_mla_value():
                     enable_pdl=True,
                 )
                 assert calls == [(w_uv, expected)]
-                # A weight the kernel refuses costs one bucket, not the device.
+                # A failed preparation must not disable later healthy buckets.
                 assert flashinfer_value.prepare_value_gate(w_uv, rows=3, q=1) is None
                 (message,), _ = logger.warning_once.call_args
                 assert "using MlaValue" in message
@@ -102,40 +112,32 @@ def test_value_gate_is_opt_in_and_bucket_refusals_keep_mla_value():
                 assert len(calls) == 3 and flashinfer_value._REFUSED == {}
 
 
-@pytest.mark.parametrize("refusal", ["unsupported", "missing", "build", "capture"])
-def test_device_refusal_is_remembered_so_buckets_do_not_retry(refusal):
-    """A failed JIT build or load must not be retried for every layer and bucket."""
+@pytest.mark.parametrize("refusal", ["unsupported", "missing", "unavailable"])
+def test_capability_refusal_is_remembered_so_buckets_do_not_retry(refusal):
+    """A missing module, architecture or program affects all buckets."""
     w_uv, calls = _w_uv(), []
 
     def prepare(weight, **kwargs):
         calls.append(kwargs["max_rows"])
-        raise RuntimeError("ninja: build stopped")
+        raise NotImplementedError("no program for this architecture")
 
     modules = _flashinfer(prepare)
     if refusal == "missing":
         modules = {"flashinfer.cake_mla_value_gate": None}
-    capturing = refusal == "capture"
     with (
         patch.object(flashinfer_value, "logger") as logger,
         patch.dict(flashinfer_value._REFUSED, clear=True),
         patch.dict(sys.modules, modules),
         envs.SGLANG_NVIDIA_MEGAKERNEL_SLOTS.override(SLOT),
         _gate(refusal != "unsupported") as gate,
-        patch.object(torch.cuda, "is_available", return_value=capturing),
-        patch.object(torch.cuda, "is_current_stream_capturing", return_value=capturing),
     ):
         for rows in (1, 8, 64):
             assert flashinfer_value.prepare_value_gate(w_uv, rows=rows, q=1) is None
-    if capturing:
-        # Prepare refused under capture says nothing about the device.
-        assert calls == [1, 8, 64] and flashinfer_value._REFUSED == {}
-        assert logger.warning_once.call_count == 3
-    else:
-        assert gate.call_count == 1
-        assert calls == ([1] if refusal == "build" else [])
-        logger.warning.assert_called_once()
-        (message,), _ = logger.warning.call_args
-        assert "using MlaValue" in message
+    assert gate.call_count == 1
+    assert calls == ([1] if refusal == "unavailable" else [])
+    logger.warning.assert_called_once()
+    (message,), _ = logger.warning.call_args
+    assert "using MlaValue" in message
 
 
 def _binding_scope(prepared):

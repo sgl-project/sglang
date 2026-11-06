@@ -27,8 +27,8 @@ from sglang.srt.environ import envs
 logger = logging.getLogger(__name__)
 
 SLOT = "k3_flashinfer_mla_value"
-# Device index -> why no bucket on it can use the Cake gate. A failed JIT build or
-# load is deterministic; without this, every layer and bucket would retry it.
+# Device index -> an explicit capability refusal shared by all buckets. Runtime
+# and load failures can be transient or bucket-local, so do not cache them here.
 _REFUSED: dict[Any, str] = {}
 
 
@@ -53,15 +53,12 @@ def prepare_value_gate(w_uv: torch.Tensor, *, rows: int, q: int) -> Any:
         runner = attention_ops.prepare_cake_mla_value_gate(
             w_uv, max_rows=rows, rows_per_request=q
         )
-    except (ImportError, OSError, RuntimeError) as error:
+    except (ImportError, NotImplementedError) as error:
         reason = f"FlashInfer cannot prepare ({type(error).__name__}: {error})"
-        # A refusal during graph capture says nothing about the device.
-        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
-            logger.warning_once(f"Kimi K3 {SLOT}: {reason}; using MlaValue")
-        else:
-            _refuse(device, reason)
+        _refuse(device, reason)
         return None
-    # An unsupported weight layout affects only this bucket.
+    # Invalid layouts, capture refusals, OOM and unclassified JIT/load errors
+    # affect this preparation only. A RuntimeError is not a capability verdict.
     except Exception as error:
         logger.warning_once(
             f"Kimi K3 {SLOT}: FlashInfer cannot prepare this bucket "

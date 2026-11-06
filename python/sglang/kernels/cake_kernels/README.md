@@ -32,3 +32,21 @@ replaced W_UV storage needs a new runner. Kimi K3 selects it per prepared bucket
 with the `k3_flashinfer_mla_value` slot and keeps MlaValue otherwise. It needs
 FlashInfer's `cake_mla_value_gate` module, which SGLang's pinned FlashInfer does not
 ship yet.
+
+The upstream primitive is merged in FlashInfer
+[#8867](https://github.com/flashinfer-ai/flashinfer/pull/8867); the request-length
+L1-load update is merged in
+[#8904](https://github.com/flashinfer-ai/flashinfer/pull/8904)
+(`ba14d1e28bfa89473f3ed25ce450b0e9f7a74091`). Those PRs contain component
+validation, not full-model qualification of this adapter. Record the exact
+FlashInfer revision and matching package versions when qualifying the slot;
+SGLang's pinned `flashinfer_python==0.7.2` retains `MlaValue`.
+
+Only an explicit capability refusal (missing module, unsupported architecture or
+unavailable program) disables the adapter for the device. Other prepare errors,
+including OOM, capture refusal and unclassified JIT/load errors, keep `MlaValue`
+for that preparation and allow later buckets to try. Preparation stays outside
+graph capture; launch errors propagate rather than switching kernels in a graph.
+The slot replaces `MlaValue` in DCP1 and native-MLA paths; fused DCP8 keeps
+`DcpValue`. Measure the slot separately with the same profile and workload so its
+effect is not mixed into the native-MLA versus fused-attention comparison.
