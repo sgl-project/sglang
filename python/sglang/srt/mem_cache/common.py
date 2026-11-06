@@ -244,6 +244,26 @@ def _req_radix_key(
     )
 
 
+def storage_prefetch_end(
+    tree_cache: BasePrefixCache,
+    req: Req,
+    max_prefix_len: int,
+) -> int:
+    """Raw-token end of the L3 prefetch span for ``req`` (before page alignment).
+
+    The span must stop where the match key stops. :func:`_req_radix_key` caps
+    the key at ``len - swa_reprefill_tail_tokens()``: a prefetch commits its
+    only SWA host window to the span's last page, so a span reaching past that
+    cap puts the window beyond the boundary the matcher may consume. The
+    boundary node then carries no SWA host value and admission drops the whole
+    transfer, after the L3 read has already been paid for.
+
+    ``prefetch_from_storage`` still floors the result to ``page_size``.
+    """
+    token_ids = req.full_untruncated_fill_ids
+    return len(_req_radix_key(tree_cache, req, token_ids, max_prefix_len))
+
+
 def touch_waiting_prefix(req: Req, tree_cache: BasePrefixCache) -> None:
     tree_cache.touch_prefix(
         _req_radix_key(tree_cache, req, req.origin_input_ids + req.output_ids)
@@ -288,6 +308,9 @@ def match_kv_cache(
         match_result.host_hit_length,
         match_result.swa_host_hit_length,
         match_result.mamba_host_hit_length,
+    )
+    req.matched_auxiliary_swa_host_hit_length = (
+        match_result.auxiliary_swa_host_hit_length
     )
     max_len = req._compute_max_prefix_len(len(token_ids))
     req.num_matched_prefix_tokens = min(req.prefix_len + req.host_hit_length, max_len)
@@ -372,8 +395,7 @@ def backup_kv_cache(
     if backend == "none":
         return False
     if dsv4_needs_rebootstrap(token_to_kv_pool_allocator):
-        if req.multimodal_inputs is not None:
-            # The recompute payload carries token ids only; images would be lost.
+        if not req.resumable_by_rebootstrap:
             return False
         # Drain the in-flight forward before its slots can receive recomputed KV.
         device = token_to_kv_pool_allocator.get_kvcache().device
@@ -431,19 +453,13 @@ def finish_restore_kv_cache(req: Req, tree_cache: BasePrefixCache) -> None:
     unified_cache.finish_restore_kv_cache(req)
 
 
-def discard_kv_cache_backup(
-    req: Req, tree_cache: BasePrefixCache, backend: str
-) -> None:
-    if backend == "cpu_tensor":
-        req.kv.retraction_backup = None
+def discard_kv_cache_backup(req: Req, tree_cache: BasePrefixCache) -> None:
+    backup = req.kv.retraction_backup
+    if backup is None:
         return
-    if backend != "host_pool":
-        raise ValueError(f"Unknown retraction backup backend: {backend}")
-    if req.kv.retraction_backup is None:
-        return
-
-    unified_cache = cast("UnifiedRadixCache", tree_cache)
-    unified_cache.discard_kv_cache_backup(req.kv.retraction_backup)
+    # A host-pool backup holds host pages; a cpu_tensor one only CPU tensors.
+    if backup.host_indices is not None:
+        cast("UnifiedRadixCache", tree_cache).discard_kv_cache_backup(backup)
     req.kv.retraction_backup = None
 
 
