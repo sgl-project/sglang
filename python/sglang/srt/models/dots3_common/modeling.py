@@ -39,6 +39,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.batch_overlap.two_batch_overlap import (
     MaybeTboDeepEPDispatcher,
@@ -53,7 +54,7 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer
+from sglang.srt.layers.attention.dsa.dsa_fp4_indexer import dsa_indexer_cls
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layer_boundary import (
     append_stages,
@@ -679,7 +680,7 @@ class Dots3AttentionMLA(nn.Module):
             assert self.q_lora_rank is not None, (
                 "Dots3 NSA requires q_lora_rank to be set in the config."
             )
-            self.indexer = Indexer(
+            self.indexer = dsa_indexer_cls()(
                 hidden_size=self.hidden_size,
                 index_n_heads=config.index_n_heads,
                 index_head_dim=config.index_head_dim,
@@ -1780,6 +1781,7 @@ class Dots3LanguageModelForCausalLM(nn.Module):
                 if not (
                     self_attn.qk_nope_head_dim % weight_block_size[0] == 0
                     and self_attn.v_head_dim % weight_block_size[0] == 0
+                    and current_arch().is_sm(9)
                     and envs.SGLANG_USE_DEEPGEMM_BMM.get()
                 ):
                     # NOTE(xiaozhi): At this point, we do not requant but change to use BF16.

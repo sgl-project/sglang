@@ -22,7 +22,6 @@ from sglang.srt.utils.device import (
     is_gfx95_supported,
     is_mnnvl_fabric_device,
 )
-from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
 
@@ -243,7 +242,7 @@ def handle_grammar_backend(server_args: Any):
 
 def handle_debug_utils(server_args: Any):
     cfg = resolving_view(server_args)
-    if is_in_ci() and cfg.soft_watchdog_timeout is None:
+    if envs.SGLANG_IS_IN_CI.get() and cfg.soft_watchdog_timeout is None:
         logger.info("Set soft_watchdog_timeout since in CI")
         declare_resolution(
             server_args, "_handle_debug_utils", soft_watchdog_timeout=300
@@ -453,7 +452,6 @@ def handle_environment_variables(server_args: Any):
                 server_args, "_handle_environment_variables", debug_cuda_graph=False
             )
         else:
-            envs.SGLANG_USE_BREAKABLE_CUDA_GRAPH.set("1")
             logger.warning(
                 "Debug mode for CUDA graph is enabled via breakable CUDA graph. "
                 "All operations will run eagerly through the graph capture/replay path."
@@ -464,6 +462,10 @@ def handle_environment_variables(server_args: Any):
         raise ValueError(
             "--enable-deepseek-v4-fp4-indexer requires SM100, SM120, or gfx95 GPUs "
             "with FP4 indexer support."
+        )
+    if cfg.enable_fp4_indexer and not get_platform().is_sm100:
+        raise ValueError(
+            "--enable-fp4-indexer requires SM100 GPUs with FP4 indexer support."
         )
     # FP8 W_o GEMM needs DeepGEMM JIT. Enable exactly where the runtime can
     # run it, mirroring the forward scale split: the default sm100 UE8M0

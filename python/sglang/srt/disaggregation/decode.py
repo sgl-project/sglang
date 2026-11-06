@@ -159,7 +159,6 @@ from sglang.srt.utils import ceil_align, is_npu, rank_consensus_checker
 from sglang.srt.utils.device import async_h2d
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
-from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
 
@@ -3937,7 +3936,10 @@ class SchedulerDisaggregationDecodeMixin:
         # keeps going and drops just this request; CI fails instead, because a
         # single aborted request is easy to miss in a passing run -- unless the
         # mismatch was injected to exercise this very path.
-        if is_in_ci() and envs.SGLANG_TEST_DISAGG_KV_CHECKSUM_MISMATCH_PROB.get() == 0:
+        if (
+            envs.SGLANG_IS_IN_CI.get()
+            and envs.SGLANG_TEST_DISAGG_KV_CHECKSUM_MISMATCH_PROB.get() == 0
+        ):
             raise RuntimeError(msg)
         prepare_abort(
             req,
