@@ -5993,9 +5993,8 @@ class Scheduler(
             if batch is not None
             for req in batch.reqs
         }
-        if self.hisparse_coordinator is not None:
-            # Prefilled and in no batch until their host copy lands.
-            inflight_reqs.update(self.hisparse_coordinator.ack_staging_queue)
+        # Prefilled and in no batch until their host copy lands.
+        inflight_reqs.update(self.request_lists().get(ListKind.HISPARSE_STAGING, ()))
         return inflight_reqs
 
     def _collect_inflight_batches(self) -> list[ScheduleBatch | None]:
@@ -6124,11 +6123,11 @@ class Scheduler(
             # Pending offload copies may still read the device KV that retraction frees,
             # and the paused decode loop never drains them.
             self.decode_offload_manager.drain_before_retraction()
-        unresumable = []
+        reqs_to_abort = []
         if retract_reqs:
             # Decode-side retract rebootstraps or aborts, so a host backup would
             # be discarded; non-decode modes never offload.
-            unresumable = retract_all(
+            reqs_to_abort = retract_all(
                 reqs=retract_reqs,
                 tree_cache=self.tree_cache,
                 request_retirer=self.request_retirer,
@@ -6140,7 +6139,7 @@ class Scheduler(
         self.running_reqs.leave(retract_reqs)
         self.prefill_launched_reqs.leave(retract_reqs)
         for req in retract_reqs:
-            if req in unresumable:
+            if req in reqs_to_abort:
                 # retract_all recorded the reason and freed any member rows.
                 self.request_retirer.abort_retracted(req, reason=req.to_finish)
             elif self.disaggregation_mode == DisaggregationMode.DECODE:
