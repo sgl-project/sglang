@@ -30,8 +30,6 @@ docker pull lmsysorg/sglang:v0.5.13-xeon
 #### Build from Dockerfile
 
 A [Dockerfile](https://github.com/sgl-project/sglang/blob/main/docker/xeon.Dockerfile) is provided to facilitate the installation from latest source code.
-The `VER_SGLANG` build argument accepts a branch, tag, or commit SHA from `SGLANG_REPO`.
-Xeon CI pins it to the workspace checkout SHA so the installed Python package, CPU kernels, and tests use the same revision.
 Replace `<secret>` below with your [HuggingFace access token](https://huggingface.co/docs/hub/en/security-tokens).
 
 ```bash Command
