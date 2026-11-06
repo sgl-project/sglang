@@ -146,6 +146,7 @@ class TestCapturerWidthFollowsTheInstalledCount(CustomTestCase):
                 ),
                 model_config=SimpleNamespace(),
                 num_tokens=8,
+                max_req_len=8,
                 max_running_requests=2,
                 device="cpu",
             )

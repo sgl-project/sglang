@@ -44,6 +44,7 @@ class TestIndexerTopkNpuSupport(CustomTestCase):
             result = indexer_topk_mod.create_indexer_capturer(
                 model_config=config,
                 num_tokens=32,
+                max_req_len=64,
                 max_running_requests=4,
                 device="npu",
             )
@@ -68,6 +69,7 @@ class TestIndexerTopkNpuSupport(CustomTestCase):
             result = indexer_topk_mod.create_indexer_capturer(
                 model_config=config,
                 num_tokens=32,
+                max_req_len=64,
                 max_running_requests=4,
                 device="npu",
             )
@@ -90,6 +92,7 @@ class TestIndexerTopkNpuSupport(CustomTestCase):
             result = indexer_topk_mod.create_indexer_capturer(
                 model_config=config,
                 num_tokens=32,
+                max_req_len=64,
                 max_running_requests=4,
                 device="npu",
             )
@@ -105,6 +108,7 @@ class TestIndexerTopkNpuSupport(CustomTestCase):
                 num_indexer_layers=2,
                 index_topk=0,
                 num_tokens=32,
+                max_req_len=64,
                 max_running_requests=4,
                 device="npu",
             )
