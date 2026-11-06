@@ -9,9 +9,10 @@ from sglang.srt.layers.attention.dsa.utils import (
     INDEXER_K_CACHE_PRESHUFFLE_TILE,
     aiter_can_use_preshuffle_paged_mqa,
 )
-from sglang.srt.utils import is_hip, is_xpu
+from sglang.srt.utils import is_hip, is_npu, is_xpu
 
 _is_hip = is_hip()
+_is_npu = is_npu()
 _is_xpu = is_xpu()
 _is_fp8_fnuz = is_fp8_fnuz()
 # aiter cp_gather kernel with preshuffle=True is only valid when the indexer
@@ -141,7 +142,7 @@ def _set_k_and_s_triton(
     page_size: int,
 ):
     """
-    :param buf: (num_pages, page_size 64 * (128B data + 4B scale)), uint8
+    :param buf: (num_pages, page_size * (128B data + 4B scale)), uint8
     :param loc: (num_tokens_to_write,), int, element := the token index to write to
     :param index_k: (num_tokens_to_write, 128 elem), fp8
     :param index_k_scale: (num_tokens_to_write, 1 elem), fp32
@@ -175,6 +176,10 @@ def _set_k_and_s_triton(
             64,
             128,
         ), f"XPU DSA requires page_size 64 or 128, got {page_size}"
+    elif _is_npu:
+        assert 16 <= page_size <= 1024 and page_size % 16 == 0, (
+            "NPU DSA requires page_size to be a multiple of 16 in [16, 1024]"
+        )
     else:
         assert page_size == 64
 

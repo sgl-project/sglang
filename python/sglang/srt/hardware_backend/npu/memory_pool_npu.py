@@ -767,16 +767,31 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             self.index_k_buffer = None
             if self.index_head_dim is not None:
                 # index_size, not self.size: the indexer is replicated.
-                self.index_k_buffer = torch.zeros(
-                    (
+                if self.dsa_kv_cache_store_fp8 and self.num_indexer_layers > 0:
+                    # One allocation per layer: [P*128 FP8 bytes][P FP32 scales].
+                    index_shape = (
+                        self.num_indexer_layers,
+                        self.index_size // self.index_page_size
+                        + self.index_page_padding,
+                        self.index_page_size
+                        * (self.index_head_dim + torch.float32.itemsize),
+                    )
+                else:
+                    index_shape = (
                         self.num_indexer_layers,
                         self.index_size // self.index_page_size
                         + self.index_page_padding,
                         self.index_page_size,
                         1,
                         self.index_head_dim,
+                    )
+                self.index_k_buffer = torch.zeros(
+                    index_shape,
+                    dtype=(
+                        torch.uint8
+                        if self.dsa_kv_cache_store_fp8 and self.num_indexer_layers > 0
+                        else self.store_dtype
                     ),
-                    dtype=self.store_dtype,
                     device=self.device,
                 )
                 if self.dsa_kv_cache_store_fp8 and self.num_indexer_layers > 0:
@@ -784,11 +799,6 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                         create_npu_hadamard_128,
                     )
 
-                    self.index_k_scale_buffer = torch.zeros(
-                        (*self.index_k_buffer.shape[:-2], 1),
-                        dtype=torch.float32,
-                        device=self.device,
-                    )
                     self.indexer_hadamard_128 = create_npu_hadamard_128(
                         self.index_head_dim, self.device
                     )
@@ -821,17 +831,32 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     def _mla_native_buffers(self):
         from sglang.srt.mem_cache.device_pool_info import MLASplitBuffers
 
+        index_width = self.index_head_dim or 0
+        if self.dsa_kv_cache_store_fp8 and self.num_indexer_layers > 0:
+            index_width += torch.float32.itemsize
         return MLASplitBuffers(
             k=self.k_buffer,
             v=self.v_buffer,
-            index_k=self.index_k_buffer,
+            # Existing NPU HiCache exchanges whole pages using a 5D descriptor.
+            # This is an opaque byte view, NOT token-major [K, scale] records.
+            index_k=(
+                self.index_k_buffer.view(
+                    self.num_indexer_layers,
+                    self.index_k_buffer.shape[1],
+                    self.index_page_size,
+                    1,
+                    index_width,
+                )
+                if self.dsa_kv_cache_store_fp8 and self.num_indexer_layers > 0
+                else self.index_k_buffer
+            ),
             index_scales=self.index_k_scale_buffer,
             index_layer_indices=tuple(
                 i - self.start_layer for i in self.indexer_layer_ids
             ),
             k_width=self.kv_cache_dim,
             v_width=self.kr_cache_dim,
-            index_width=self.index_head_dim or 0,
+            index_width=index_width,
         )
 
     def _copy_indices_for_buffer(self, indices, uses_global_slots):
@@ -925,16 +950,20 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     def _get_indexer_slot(self, layer_id: int) -> int:
         return self.indexer_layer_id_to_slot[layer_id]
 
-    def get_index_k_scale_buffer(self, layer_id: int):
+    def get_index_k_with_scale_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        return self.index_k_scale_buffer[self._get_indexer_slot(layer_id)]
+        return self.index_k_buffer[self._get_indexer_slot(layer_id)]
 
-    def set_index_k_scale_buffer(self, layer_id: int, loc, scale):
-        torch_npu.npu_scatter_nd_update_(
-            self.index_k_scale_buffer[self._get_indexer_slot(layer_id)].view(-1, 1),
-            loc.view(-1, 1),
-            scale.view(-1, 1),
+    def set_index_k_scale_buffer(self, layer_id: int, loc, index_k, index_k_scale):
+        from sglang.kernels.ops.kvcache.dsa_index_k_cache import SetKAndS
+
+        SetKAndS.execute(
+            pool=self,
+            buf=self.index_k_buffer[self._get_indexer_slot(layer_id)],
+            loc=loc.reshape(-1).contiguous(),
+            index_k=index_k.reshape(-1, self.index_head_dim).contiguous(),
+            index_k_scale=index_k_scale.reshape(-1).contiguous(),
         )
 
     def _get_disagg_buffer_entries(self):
@@ -1094,6 +1123,8 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         loc: torch.Tensor,
         index_k: torch.Tensor,
     ):
+        if self.dsa_kv_cache_store_fp8 and self.num_indexer_layers > 0:
+            raise RuntimeError("Packed NPU DSA must write K and scale together")
         # The indexer writes at the raw, untranslated loc.
         maybe_detect_oob(
             loc,
