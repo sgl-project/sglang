@@ -237,6 +237,7 @@ def test_scheduler_polls_until_a_held_response_completes(state):
     scheduler.is_fully_idle.return_value = state == "idle"
     scheduler.enable_fpm = False
     scheduler._last_stall_publish_ts = float("inf")
+    scheduler._last_spin_publish_ts = float("-inf")
     scheduler.enable_hicache_storage = False
     scheduler.enable_lmcache = False
     scheduler.disaggregation_mode = DisaggregationMode.NULL
