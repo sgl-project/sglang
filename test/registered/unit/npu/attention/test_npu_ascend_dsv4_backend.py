@@ -673,6 +673,8 @@ class TestCompressorStateTableABI(unittest.TestCase):
         }
         backend._dsv4_graph_tokens_per_req = 1
         backend._dsv4_index_topk = 1
+        backend._dsv4_has_c4 = True
+        backend._dsv4_has_c128 = True
         backend._dsv4_state_pools_by_ratio = {}
         backend._dsv4_sliding_window_size = 128
         backend._is_dspark_draft_worker = False
@@ -784,6 +786,130 @@ class TestArch35SparseAttentionDispatch(unittest.TestCase):
         self.assertIs(metadata_op, ops.sparse_flash_mla_metadata)
         self.assertIs(attn_op, ops.sparse_flash_mla)
         self.assertEqual(_sparse_attn_kv_quant_kwargs(), {})
+
+
+class TestKernelMetadataGraphBuffers(unittest.TestCase):
+    _BACKEND = "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend"
+
+    def _make_backend(self, *, has_compress=True, dspark=False):
+        backend = DeepseekV4AscendAttnBackend.__new__(DeepseekV4AscendAttnBackend)
+        backend.device = "cpu"
+        backend.is_hybrid_swa = False
+        backend.graph_metadata = {"block_tables": torch.zeros(2, 4, dtype=torch.int32)}
+        backend._dsv4_q_head_num = 64
+        backend._dsv4_kv_head_num = 1
+        backend._dsv4_head_dim = 512
+        backend._dsv4_index_n_heads = 16
+        backend._dsv4_index_head_dim = 128
+        backend._dsv4_index_topk = 512
+        backend._dsv4_has_c4 = has_compress
+        backend._dsv4_has_c128 = has_compress
+        backend._dsv4_sliding_window_size = 128
+        backend._dsv4_graph_tokens_per_req = 6 if dspark else 1
+        backend._dsv4_state_pools_by_ratio = {}
+        backend._is_dspark_draft_worker = dspark
+        backend.forward_metadata = None
+        return backend
+
+    def _capture_bucket(self, backend, batch, *, dspark=False):
+        mode = MagicMock()
+        mode.is_target_verify.return_value = dspark
+        mode.is_draft_extend_v2.return_value = False
+        backend._init_dsv4_graph_metadata(
+            metadata_key=batch,
+            forward_batch=SimpleNamespace(batch_size=batch, forward_mode=mode),
+            ragged_layout=None,
+        )
+        return backend.graph_metadata[batch]
+
+    def test_metadata_sizes_follow_kernel_outputs_and_replay_preserves_addresses(self):
+        # Cover both hardware generations and distinct attention/indexer ABIs.
+        # The 2048-element case reproduces the CANN 9.2 A3 service failure.
+        for arch35 in (False, True):
+            for attention_size, indexer_size in ((1024, 1024), (2048, 4096)):
+                for dspark in (False, True):
+                    with (
+                        self.subTest(
+                            arch35=arch35,
+                            attention_size=attention_size,
+                            indexer_size=indexer_size,
+                            dspark=dspark,
+                        ),
+                        patch(self._BACKEND + ".is_npu_arch35", return_value=arch35),
+                        patch(self._BACKEND + "._sparse_attn_ops") as select_ops,
+                        patch(self._BACKEND + ".npu_indexer_ops") as indexer_ops,
+                    ):
+
+                        def make_attention(**kwargs):
+                            return torch.full(
+                                (attention_size,),
+                                kwargs["batch_size"] + int(kwargs["seqused_ori_kv"][0]),
+                                dtype=torch.int32,
+                            )
+
+                        def make_indexer(*args, **kwargs):
+                            batch = kwargs["cu_seqlens_q"].numel() - 1
+                            kv_len = int(
+                                kwargs["seqused_k"][0] * 4 + kwargs["cmp_residual_k"][0]
+                            )
+                            return torch.full(
+                                (indexer_size,), batch + kv_len, dtype=torch.int32
+                            )
+
+                        metadata_op = MagicMock(side_effect=make_attention)
+                        select_ops.return_value = metadata_op, MagicMock()
+                        indexer_ops.quant_lightning_indexer_metadata.side_effect = (
+                            make_indexer
+                        )
+                        backend = self._make_backend(dspark=dspark)
+                        backend._init_dsv4_graph_buffers(max_bs=2, max_num_tokens=12)
+                        expected_sizes = {
+                            "c1a_metadata": attention_size,
+                            "c4a_metadata": attention_size,
+                            "c128a_metadata": attention_size,
+                            "li_quant_metadata": indexer_size,
+                        }
+                        first = self._capture_bucket(backend, 1, dspark=dspark)
+                        second = self._capture_bucket(backend, 2, dspark=dspark)
+                        pointers = {}
+                        for key, size in expected_sizes.items():
+                            buffer = first.kernel_metadata[key]
+                            self.assertEqual(buffer.shape, (size,))
+                            self.assertEqual(buffer.dtype, torch.int32)
+                            self.assertIs(buffer, second.kernel_metadata[key])
+                            pointers[key] = buffer.data_ptr()
+
+                        # Simulate successive replays with changed query/KV lengths.
+                        for batch in (2, 1):
+                            fm = backend.graph_metadata[batch]
+                            fm.actual_seq_lengths_kv.fill_(128 + batch)
+                            backend.forward_metadata = fm
+                            backend._refresh_graph_kernel_metadata(
+                                SimpleNamespace(fm=fm, bs=batch)
+                            )
+                            for key in expected_sizes:
+                                buffer = fm.kernel_metadata[key]
+                                self.assertEqual(buffer.data_ptr(), pointers[key])
+                                self.assertTrue(
+                                    torch.all(buffer == 128 + 2 * batch).item()
+                                )
+
+    def test_swa_only_allocates_only_the_enabled_metadata_api(self):
+        with (
+            patch(self._BACKEND + ".is_npu_arch35", return_value=False),
+            patch(self._BACKEND + "._sparse_attn_ops") as select_ops,
+            patch(self._BACKEND + ".npu_indexer_ops") as indexer_ops,
+        ):
+            select_ops.return_value = (
+                MagicMock(return_value=torch.empty(2048, dtype=torch.int32)),
+                MagicMock(),
+            )
+            backend = self._make_backend(has_compress=False)
+            backend._init_dsv4_graph_buffers(max_bs=2, max_num_tokens=2)
+            metadata = self._capture_bucket(backend, 1)
+            self.assertEqual(set(metadata.kernel_metadata), {"c1a_metadata"})
+            self.assertEqual(metadata.kernel_metadata["c1a_metadata"].shape, (2048,))
+            indexer_ops.quant_lightning_indexer_metadata.assert_not_called()
 
 
 class TestSparseAttentionMetadata(unittest.TestCase):
