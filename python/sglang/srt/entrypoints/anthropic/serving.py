@@ -868,7 +868,7 @@ class AnthropicServing:
     ) -> AsyncGenerator[str, None]:
         """Convert OpenAI chat stream to Anthropic event stream."""
         openai_stream = self.openai_serving_chat._generate_chat_stream(
-            adapted_request, processed_request, raw_request
+            adapted_request, processed_request, raw_request, keep_continuous_usage=True
         )
 
         content_block_index = 0
