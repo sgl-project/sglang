@@ -28,6 +28,7 @@ from transformers import PretrainedConfig
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.hf_transformers import get_rope_config
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateAccumulator
 from sglang.srt.layers.layer_boundary import (
     append_stages,
@@ -77,7 +78,6 @@ from sglang.srt.utils import (
     is_npu,
     is_xpu,
 )
-from sglang.srt.utils.hf_transformers import get_rope_config
 
 _is_cuda = is_cuda()
 _is_cpu = is_cpu()

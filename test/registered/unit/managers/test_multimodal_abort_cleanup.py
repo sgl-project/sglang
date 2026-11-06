@@ -25,11 +25,11 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.multimodal.modality import Modality
+from sglang.srt.multimodal.transport import cuda_vmm as vmm
 from sglang.srt.multimodal.transport.cuda_ipc import CudaIpcTensorTransportProxy
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.session.session_controller import Session
-from sglang.srt.utils import cuda_vmm_transport_utils as vmm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.scheduler_test_utils import empty_request_lists
 
