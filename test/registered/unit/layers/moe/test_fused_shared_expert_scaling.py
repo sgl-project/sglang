@@ -103,7 +103,7 @@ class TestFusedSharedExpertScaling(CustomTestCase):
                 return_value=output,
             ) as route,
         ):
-            topk._apply_moe_load_balancer(output, 1)
+            topk._apply_moe_load_balancer(output)
         return 1.0 / route.call_args.kwargs["routed_scaling_factor"]
 
     def test_load_balancer_shared_weight_matches_the_per_rank_slot(self):

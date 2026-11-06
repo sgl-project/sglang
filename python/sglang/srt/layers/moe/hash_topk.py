@@ -124,12 +124,11 @@ class HashTopK(nn.Module):
                     (0, topk_output.topk_weights.shape[-1] + n)
                 ),
             )
-        return self._apply_moe_load_balancer(topk_output, num_tokens=0)
+        return self._apply_moe_load_balancer(topk_output)
 
     def _apply_moe_load_balancer(
         self,
         topk_output: StandardTopKOutput,
-        num_tokens: int,
         *,
         num_token_non_padded: Optional[torch.Tensor] = None,
     ) -> StandardTopKOutput:
@@ -277,7 +276,6 @@ class HashTopK(nn.Module):
         if self.moe_load_balancer is not None:
             return self._apply_moe_load_balancer(
                 StandardTopKOutput(topk_weights, topk_ids, router_logits),
-                hidden_states.shape[0],
                 num_token_non_padded=num_token_non_padded,
             )
         num_shared_topk_slots = self.num_shared_topk_slots
@@ -325,20 +323,9 @@ class HashTopK(nn.Module):
             recorder_topk_ids = recorder_topk_ids.masked_fill(
                 (rows >= num_token_non_padded)[:, None], -1
             )
-        if self.moe_load_balancer is None:
-            get_global_expert_distribution_recorder().on_select_experts(
-                topk_ids=recorder_topk_ids
-            )
-        topk_output = StandardTopKOutput(
+        get_global_expert_distribution_recorder().on_select_experts(
+            topk_ids=recorder_topk_ids
+        )
+        return StandardTopKOutput(
             topk_weights=topk_weights, topk_ids=topk_ids, router_logits=router_logits
         )
-        topk_output = self._apply_moe_load_balancer(
-            topk_output,
-            hidden_states.shape[0],
-            num_token_non_padded=num_token_non_padded,
-        )
-        if _is_hip or _is_npu:
-            _zero_topk_weights_padded_region(
-                topk_output.topk_weights, num_token_non_padded
-            )
-        return topk_output

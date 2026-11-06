@@ -878,7 +878,6 @@ class TopK(BaseFusedOp):
     def _apply_moe_load_balancer(
         self,
         topk_output: TopKOutput,
-        num_tokens: int,
         *,
         num_token_non_padded: Optional[torch.Tensor] = None,
     ) -> TopKOutput:
@@ -1144,7 +1143,7 @@ class TopK(BaseFusedOp):
                     (0, topk_output.topk_weights.shape[-1] + n)
                 ),
             )
-        return self._apply_moe_load_balancer(topk_output, 0)
+        return self._apply_moe_load_balancer(topk_output)
 
     def forward_xpu(
         self,
