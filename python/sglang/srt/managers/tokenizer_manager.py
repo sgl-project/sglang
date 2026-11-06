@@ -63,7 +63,6 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
 from sglang.srt.disaggregation.mode import DisaggregationMode
-from sglang.srt.dllm.metrics import make_dllm_metrics
 from sglang.srt.elastic_ep.topology import (
     attn_replica_size,
     physical_ep_size_to_dp_size,
@@ -2770,17 +2769,21 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     }
                 )
                 if recv_obj.dllm_forward_counts is not None:
-                    meta_info["dllm_metrics"] = make_dllm_metrics(
-                        recv_obj.dllm_forward_counts[i],
-                        recv_obj.completion_tokens[i],
-                        prompt_forward_count=recv_obj.dllm_prompt_forward_counts[i],
-                        generation_forward_count=recv_obj.dllm_generation_forward_counts[
+                    generation_forwards = recv_obj.dllm_generation_forward_counts[i]
+                    meta_info["dllm_metrics"] = {
+                        "forward_count": recv_obj.dllm_forward_counts[i],
+                        "prompt_forward_count": recv_obj.dllm_prompt_forward_counts[i],
+                        "generation_forward_count": generation_forwards,
+                        "recompute_forward_count": recv_obj.dllm_recompute_forward_counts[
                             i
                         ],
-                        recompute_forward_count=recv_obj.dllm_recompute_forward_counts[
-                            i
-                        ],
-                    )
+                        "completion_tokens": recv_obj.completion_tokens[i],
+                        "tokens_per_forward": (
+                            recv_obj.completion_tokens[i] / generation_forwards
+                            if generation_forwards
+                            else 0.0
+                        ),
+                    }
                 if (
                     recv_obj.weight_versions is not None
                     and (spans := recv_obj.weight_versions[i]) is not None

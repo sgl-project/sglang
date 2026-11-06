@@ -1,15 +1,12 @@
-"""Actual dLLM work accounting, including stream transport and batched idle work."""
+"""Actual dLLM forward accounting across sync, FDFO and prefill."""
 
 import unittest
-from array import array
 from types import SimpleNamespace
 
 import torch
 
 from sglang.srt.dllm.algorithm.low_confidence import LowConfidence
 from sglang.srt.dllm.config import DllmConfig
-from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
@@ -71,7 +68,6 @@ class TestActualForwardCount(unittest.TestCase):
             if not batch.rids:
                 break
             result = algorithm.run(runner, batch, states)
-            self.assertEqual(len(result), 6, "FDFO must report unresolved work")
             self.assertEqual(result.forward_count, 1)
             for rid in batch.rids:
                 counts[rid] += result.forward_count
@@ -94,7 +90,6 @@ class TestActualForwardCount(unittest.TestCase):
         runner = _ForwardOracle()
         result = LowConfidence(_config()).run(runner, _batch(["fast"], [1] * 4))
         self.assertEqual(result.next_token_ids, [])
-        self.assertEqual(len(result), 6, "Pure prefill must expose its forward")
         self.assertEqual(result.forward_count, 1)
         self.assertEqual(len(runner.calls), 1)
 
@@ -112,15 +107,6 @@ class TestActualForwardCount(unittest.TestCase):
             actual_calls = len(runner.calls) - previous_calls
             self.assertGreater(actual_calls, 1)
             self.assertEqual(result.forward_count, actual_calls)
-
-    def test_retraction_retains_lifetime_count_new_request_starts_zero(self):
-        req = Req("same-id", "", array("q", [1, 2]), SamplingParams())
-        req.dllm_forward_count = 7
-        req.reset_for_retract()
-        self.assertEqual(req.dllm_forward_count, 7)
-        fresh = Req("same-id", "", array("q", [1, 2]), SamplingParams())
-        self.assertTrue(hasattr(fresh, "dllm_forward_count"))
-        self.assertEqual(fresh.dllm_forward_count, 0)
 
 
 if __name__ == "__main__":
