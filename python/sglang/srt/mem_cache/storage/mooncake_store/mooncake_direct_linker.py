@@ -49,7 +49,6 @@ def _storage_suffix(
 def _shared_pool_suffix(
     *,
     tp_shared: bool,
-    cp_shared: bool,
     tp_rank: int,
     attn_cp_rank: int,
     pp_rank: int,
@@ -57,23 +56,16 @@ def _shared_pool_suffix(
     dcp_size: int,
     dcp_rank: int,
 ) -> str:
-    """Key suffix for a pool whose pages are byte-identical along some axes.
+    """Key suffix for a pool whose pages are byte-identical across attention TP.
 
-    Dropping an axis makes one object serve every rank on it, so the store
-    holds one copy instead of one per rank. Each dropped axis adds its own
-    namespace term so a shared object can never alias an older per-rank one.
-    The CP-only term keeps its original spelling, so a store written before
-    the TP axis existed stays readable.
+    Dropping the TP axis makes one object serve every attention-TP rank, so
+    the store holds one copy instead of one per rank. The dropped axis adds its
+    own namespace term so a shared object can never alias an older per-rank one.
     """
-    parts = []
-    if cp_shared:
-        parts.append("pcp_shared_v1")
-    parts.append("tpshared_v1" if tp_shared else f"tp{tp_rank}")
+    parts = ["tpshared_v1" if tp_shared else f"tp{tp_rank}"]
     if dcp_sharded:
         parts.append(f"dcp{dcp_size}r{dcp_rank}")
-    if not cp_shared:
-        parts.append(f"cp{attn_cp_rank}")
-    parts.append(f"pp{pp_rank}")
+    parts.extend((f"cp{attn_cp_rank}", f"pp{pp_rank}"))
     return "_".join(parts)
 
 
@@ -84,7 +76,6 @@ def _storage_sharing(
     tp_rank: int,
     tp_size: int,
     attn_cp_rank: int,
-    attn_cp_size: int,
     pp_rank: int,
     offload_owner: bool,
     dcp_size: int,
@@ -92,17 +83,14 @@ def _storage_sharing(
 ):
     """Per-pool key suffixes and the pools this rank offloads.
 
-    A pool replicated along an axis is written by rank 0 of that axis only;
-    every rank still reads it, with its own indices, under the shared key.
+    A pool replicated across attention TP is written by attention-TP rank 0
+    only; every rank still reads it, with its own indices, under the shared key.
     A rank-replicated group has no sharded pool, so its group-level suffix
     already drops the tp term and nothing is overridden here.
     A DCP-sharded pool is written by the first DCP block of the TP group,
     one object per DCP rank.
     """
     dcp_sharded = {name for name, pool in pools.items() if pool.dcp_sharded}
-    cp_shared = {
-        name for name, pool in pools.items() if attn_cp_size > 1 and pool.pcp_replicated
-    }
     tp_shared = {
         name
         for name, pool in pools.items()
@@ -111,7 +99,6 @@ def _storage_sharing(
     suffixes = {
         name: _shared_pool_suffix(
             tp_shared=name in tp_shared,
-            cp_shared=name in cp_shared,
             tp_rank=tp_rank,
             attn_cp_rank=attn_cp_rank,
             pp_rank=pp_rank,
@@ -119,18 +106,17 @@ def _storage_sharing(
             dcp_size=dcp_size,
             dcp_rank=dcp_rank,
         )
-        for name in cp_shared | tp_shared | dcp_sharded
+        for name in tp_shared | dcp_sharded
     }
     offload_pools = {
         name
         for name in pools
         if offload_owner
-        and (name not in cp_shared or attn_cp_rank == 0)
         and (
             name not in tp_shared or tp_rank < (dcp_size if name in dcp_sharded else 1)
         )
     }
-    return suffixes, offload_pools, cp_shared, tp_shared
+    return suffixes, offload_pools, tp_shared
 
 
 class MooncakeDirectLinker(UnifiedCacheLinker):
@@ -200,33 +186,28 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         )
         self.storage.mla_suffix = storage_suffix
         self.storage.mha_suffix = storage_suffix
-        # Interleave PCP materializes full DSA KV and indexer pages on every
-        # rank, and an MLA-family pool holds identical pages on every
-        # attention-TP rank. KDA state stays in its own rank namespace.
-        self.storage.pool_suffixes, self.offload_pools, pcp_shared, tp_shared = (
-            _storage_sharing(
-                self.pools,
-                rank_replicated=rank_replicated,
-                tp_rank=tp_rank,
-                tp_size=tp_size,
-                attn_cp_rank=params.attn_cp_rank,
-                attn_cp_size=params.attn_cp_size,
-                pp_rank=params.pp_rank,
-                offload_owner=self.offload_owner,
-                dcp_size=parallel.attn_dcp_size,
-                dcp_rank=parallel.attn_dcp_rank,
-            )
+        # An MLA-family pool holds identical pages on every attention-TP rank.
+        # KDA state stays in its own rank namespace.
+        self.storage.pool_suffixes, self.offload_pools, tp_shared = _storage_sharing(
+            self.pools,
+            rank_replicated=rank_replicated,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            attn_cp_rank=params.attn_cp_rank,
+            pp_rank=params.pp_rank,
+            offload_owner=self.offload_owner,
+            dcp_size=parallel.attn_dcp_size,
+            dcp_rank=parallel.attn_dcp_rank,
         )
         logger.info(
             "Mooncake direct linker storage topology: "
             "rank_replicated=%s, tp_rank=%d/%d, offload_owner=%s, suffix=%s, "
-            "pcp_shared=%s, tp_shared=%s, offload_pools=%s, pool_suffixes=%s",
+            "tp_shared=%s, offload_pools=%s, pool_suffixes=%s",
             rank_replicated,
             tp_rank,
             tp_size,
             self.offload_owner,
             storage_suffix,
-            sorted(pcp_shared),
             sorted(tp_shared),
             sorted(self.offload_pools),
             dict(sorted(self.storage.pool_suffixes.items())),

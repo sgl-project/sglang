@@ -52,15 +52,14 @@ to 16 MiB. Size it for concurrent reads and writes, including large recurrent
 state objects. This is per-client transient memory, separate from the shared
 `global_segment_size`; include both in the host memory budget.
 
-### Direct Linker with PCP and RDMA
+### Direct Linker with RDMA
 
 The direct Linker requires `--pp-size 1`; pipeline parallelism is not supported.
-For K31's hybrid DSA/KDA pools, interleave PCP keeps complete DSA KV and
-indexer pages on each GPU. The direct Linker shares these objects across
-replicated PCP and attention-TP ranks, with one writer per shared pool.
-Every rank reads the shared objects into its own GPU buffers. KDA state keeps
-rank-specific objects; replicated MLA draft pools also share across attention-TP
-ranks. This deduplicates L3 storage, not GPU allocations.
+For K31's hybrid DSA/KDA pools, every attention-TP rank holds identical DSA KV,
+indexer and MLA draft pages. The direct Linker shares these objects across
+attention-TP ranks, with one writer per shared pool. Every rank reads the shared
+objects into its own GPU buffers. KDA state keeps rank-specific objects. This
+deduplicates L3 storage, not GPU allocations.
 Use a distinct `extra_backend_tag` for each model/draft revision, dtype, page
 layout and parallel topology; the shared keys do not enable cross-topology reuse.
 
