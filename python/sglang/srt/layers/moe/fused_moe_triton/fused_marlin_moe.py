@@ -141,7 +141,6 @@ def _scale_up_half(
     gemm1_out: torch.Tensor,
     up_scale_ratio: torch.Tensor,
     topk_ids: torch.Tensor,
-    expert_map: Optional[torch.Tensor],
 ) -> None:
     """Rescale the up half of each GEMM1 output row by its expert's up/gate ratio.
 
@@ -149,13 +148,15 @@ def _scale_up_half(
     checkpoint stores different global scales for the gate (w1) and up (w3)
     projections, the kernel gets the gate's, and the up half of its output is
     off by up_scale / gate_scale. Rows are in (token, top-k) order.
+
+    topk_ids index the local experts, as they do for the kernel's weights: with
+    expert parallelism the dispatcher has already mapped global ids to local ones
+    and marked experts of other ranks with -1, whose rows are not computed here.
     """
     expert = topk_ids.reshape(-1).to(torch.long)
-    if expert_map is not None:
-        expert = expert_map[expert].to(torch.long)
-    ratio = up_scale_ratio.to(torch.float32)[expert.clamp(min=0)]
-    if expert_map is not None:
-        ratio = torch.where(expert >= 0, ratio, torch.ones_like(ratio))
+    local = (expert >= 0) & (expert < up_scale_ratio.numel())
+    ratio = up_scale_ratio.to(torch.float32)[torch.where(local, expert, 0)]
+    ratio = torch.where(local, ratio, torch.ones_like(ratio))
     up = gemm1_out[:, gemm1_out.shape[1] // 2 :]
     up.copy_((up.float() * ratio.unsqueeze(1)).to(up.dtype))
 
@@ -376,7 +377,6 @@ def fused_marlin_moe(
             intermediate_cache1.view(-1, gemm1_n),
             w1_up_scale_ratio,
             topk_ids,
-            expert_map,
         )
 
     if activation == "silu" and is_gated and gemm1_alpha is not None:

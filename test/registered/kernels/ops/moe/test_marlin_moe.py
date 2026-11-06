@@ -520,16 +520,31 @@ class TestFusedMarlinMoe(CustomTestCase):
         """The kernel applies one w13 scale per expert; w1_up_scale_ratio rescales
         the up half of the GEMM1 output, as for FP4 checkpoints whose gate and up
         global scales differ."""
+        from sglang.srt.layers.moe.token_dispatcher.standard import (
+            _map_topk_ids_to_local_experts,
+        )
         from sglang.srt.layers.moe.topk import fused_topk_torch_native
 
         n, k, topk, group_size = 256, 256, 2, 128
         dtype = torch.bfloat16
         quant_type = scalar_types.uint4b8
-        for m, e, ep_size in ((1, 8, 1), (33, 8, 1), (16, 8, 2)):
-            with self.subTest(m=m, e=e, ep_size=ep_size):
+        # (m, e, ep_size, ep_rank); a nonzero rank makes local and global ids differ
+        for m, e, ep_size, ep_rank in (
+            (1, 8, 1, 0),
+            (33, 8, 1, 0),
+            (16, 8, 2, 0),
+            (16, 8, 2, 1),
+            (64, 16, 4, 3),
+        ):
+            with self.subTest(m=m, e=e, ep_size=ep_size, ep_rank=ep_rank):
                 torch.manual_seed(7)
                 local_e = e // ep_size
-                e_ids = torch.arange(local_e, device="cuda", dtype=torch.int32)
+                e_ids = torch.arange(
+                    ep_rank * local_e,
+                    (ep_rank + 1) * local_e,
+                    device="cuda",
+                    dtype=torch.int32,
+                )
                 e_map = None
                 if ep_size > 1:
                     e_map = torch.full((e,), -1, device="cuda", dtype=torch.int32)
@@ -573,18 +588,26 @@ class TestFusedMarlinMoe(CustomTestCase):
                 (w_ref1, qweight1, scales1), (w_ref2, qweight2, scales2) = quantized
 
                 # reference: the up rows (n..2n) of w1 carry the ratio
+                w_ref1_plain = w_ref1
                 w_ref1 = w_ref1.clone()
                 w_ref1[:, n:, :] = (w_ref1[:, n:, :].float() * ratio.view(-1, 1, 1)).to(
                     dtype
                 )
-                w_ref1_full, w_ref2_full = w1_full.clone(), w2_full.clone()
-                w_ref1_full[e_ids], w_ref2_full[e_ids] = w_ref1, w_ref2
 
                 topk_weights, topk_ids = fused_topk_torch_native(a, score, topk, False)
+                # The kernel indexes local experts: map global ids the way the
+                # standard dispatcher does under expert parallelism.
+                kernel_topk_ids = topk_ids
+                if e_map is not None:
+                    kernel_topk_ids = _map_topk_ids_to_local_experts(
+                        topk_ids, e_map
+                    ).to(topk_ids.dtype)
+                # torch_moe maps global ids through expert_map, then indexes
+                # the local experts' weights.
                 torch_output = torch_moe(
                     a,
-                    w_ref1_full,
-                    w_ref2_full,
+                    w_ref1,
+                    w_ref2,
                     score,
                     topk,
                     global_num_experts=e,
@@ -598,16 +621,28 @@ class TestFusedMarlinMoe(CustomTestCase):
                     scales2,
                     score,
                     topk_weights,
-                    topk_ids,
+                    kernel_topk_ids,
                     global_num_experts=e,
                     expert_map=e_map,
                     w1_up_scale_ratio=ratio,
                     num_bits=4,
                     is_k_full=True,
                 )
-                torch.testing.assert_close(
-                    marlin_output, torch_output, atol=5e-2, rtol=2e-2
+                # The same MoE without the ratio: how far a kernel that drops
+                # it would be off. The kernel must be far closer than that.
+                plain_output = torch_moe(
+                    a,
+                    w_ref1_plain,
+                    w_ref2,
+                    score,
+                    topk,
+                    global_num_experts=e,
+                    expert_map=e_map,
                 )
+                err = (marlin_output.float() - torch_output.float()).norm()
+                effect = (plain_output.float() - torch_output.float()).norm()
+                self.assertGreater(effect, 0.3 * torch_output.float().norm())
+                self.assertLess(err, 0.1 * effect)
 
 
 if __name__ == "__main__":
