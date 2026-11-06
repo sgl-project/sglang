@@ -11,6 +11,10 @@ import sys
 import pytest
 import torch
 
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
+
 from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
 from sglang.kernels.ops.attention.flash_attn.cute import interface as fa4_interface
 from sglang.kernels.ops.attention.flash_attn.cute.flash_fwd_sm100 import (

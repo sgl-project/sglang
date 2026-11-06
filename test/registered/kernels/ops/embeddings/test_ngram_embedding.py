@@ -55,6 +55,7 @@ def _reference_n_gram_ids(
     return torch.tensor(ids, dtype=torch.int32)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("batch_size", [1, 17, 128])
 def test_update_table_and_compute_n_gram_ids_match_reference(batch_size: int) -> None:
     ne_n = 8

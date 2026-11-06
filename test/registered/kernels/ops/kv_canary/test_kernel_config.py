@@ -100,6 +100,7 @@ def _build_plan_fixtures(
     return req_pool_indices, prefix_lens, extend_seq_lens, req_to_token
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_verify_byte_equal_across_repeated_launches_10x() -> None:
     num_launches = 10
     plan_cuda, plan_ref = _build_verify_plan_5_entries(device=_DEVICE)
@@ -146,6 +147,7 @@ def test_verify_byte_equal_across_repeated_launches_10x() -> None:
         )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_write_byte_equal_across_repeated_launches_10x() -> None:
     num_launches = 10
     plan_cuda, plan_ref, input_ids, positions, out_cache_loc = _build_write_fixtures(
@@ -201,6 +203,7 @@ def test_write_byte_equal_across_repeated_launches_10x() -> None:
         )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_plan_byte_equal_across_repeated_launches_10x() -> None:
     num_launches = 10
     req_pool_indices, prefix_lens, extend_seq_lens, req_to_token = _build_plan_fixtures(
@@ -268,6 +271,7 @@ def test_plan_byte_equal_across_repeated_launches_10x() -> None:
         )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_verify_multi_launch_100x_counter_linear() -> None:
     num_launches = 100
 
@@ -310,6 +314,7 @@ def test_verify_multi_launch_100x_counter_linear() -> None:
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_verify_check_disabled_byte_equal() -> None:
     """check_verify_expected_token True vs False produce equivalent violation logs on a clean plan."""
     plan_true_cuda, plan_true_ref = _build_verify_plan_5_entries(device=_DEVICE)
@@ -379,6 +384,7 @@ def test_verify_check_disabled_byte_equal() -> None:
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("per_req_present", [False, True])
 def test_plan_per_req_present_or_absent(per_req_present: bool) -> None:
     max_reqs = 4

@@ -217,6 +217,7 @@ def _run_dual(scores, seq_lens, page_table, inv_cpu, k):
     return transformed_raw, direct_raw
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("page_mode", ["identity", "perm"])
 @pytest.mark.parametrize("k", [512, 1024, 2048])
 @pytest.mark.parametrize("batch,seq", FIXED_CONFIGS)
@@ -237,6 +238,7 @@ def test_topk_v2(batch: int, seq: int, k: int, page_mode: str) -> None:
     _assert_topk_close(scores.cpu(), ref_raw, our_raw, batch, seq_lens.cpu(), k)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("k", [512, 1024, 2048])
 @pytest.mark.parametrize(
     "batch,shape",
@@ -281,6 +283,7 @@ def test_topk_v2_ragged(batch: int, shape: str, k: int, per_row_pt: bool) -> Non
     _assert_topk_close(scores.cpu(), ref_raw, our_raw, batch, lengths.cpu(), k)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("k", [512, 1024, 2048])
 @pytest.mark.parametrize("batch,seq", FIXED_CONFIGS)
 @torch.inference_mode()
@@ -304,6 +307,7 @@ def test_topk_v2_output_indices(batch: int, seq: int, k: int) -> None:
     _assert_topk_close(scores.cpu(), ref_raw, our_raw, batch, seq_lens.cpu(), k)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize(
     "batch,seq", [(8, 256), (8, 8192), (4, 32768), (2, 131072), (31, 131072)]
 )
@@ -325,6 +329,7 @@ def test_topk_v2_dual_output(batch: int, seq: int) -> None:
     _assert_topk_close(scores.cpu(), ref_raw, direct_raw, batch, seq_lens.cpu(), k)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("batch", [1, 16])
 @torch.inference_mode()
 def test_topk_v2_cluster_refine_page_outputs(batch: int) -> None:
@@ -446,6 +451,7 @@ def _assert_smallest_index_ties(scores_cpu, our_raw, batch, seq_lens, k):
         )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("dist", NARROW_DISTRIBUTIONS)
 @pytest.mark.parametrize("batch,seq", [(6, 8192), (4, 20480), (4, 32768), (4, 65536)])
 @torch.inference_mode()
@@ -541,6 +547,7 @@ def _start_exact_mode_checks():
         log.close()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("mode", [MODE_FAST, MODE_DETERMINISTIC])
 def test_topk_v2_modes(mode: int) -> None:
     """FAST / DETERMINISTIC in their own process, since one process builds one mode."""
@@ -612,6 +619,7 @@ def _run_ragged(scores, lengths, starts, offsets, k):
     ]
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("k", [512, 1024, 2048])
 @pytest.mark.parametrize("offset_shift", [0, 4321])
 @pytest.mark.parametrize("name,rows", RAGGED_CONFIGS)
@@ -655,6 +663,7 @@ def _assert_topk_values(window, indices, k):
     assert torch.equal(actual, expected)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("num_ties", [48, 96])
 @torch.inference_mode()
 def test_topk_v2_negative_infinity_ties(num_ties: int) -> None:
@@ -671,6 +680,7 @@ def test_topk_v2_negative_infinity_ties(num_ties: int) -> None:
     _assert_topk_values(scores[0, :length], out[0], k)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("length", [257, 8193, 16385])
 @torch.inference_mode()
 def test_topk_v2_ragged_negative_infinity(length: int) -> None:
@@ -695,6 +705,7 @@ def test_topk_v2_ragged_negative_infinity(length: int) -> None:
         )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("k", [512, 2048])
 @torch.inference_mode()
 def test_topk_v2_ragged_no_row_starts(k: int) -> None:
@@ -709,6 +720,7 @@ def test_topk_v2_ragged_no_row_starts(k: int) -> None:
         assert sorted(explicit[i]) == sorted(implicit[i]), f"row {i} differs"
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("k", [512, 2048])
 @pytest.mark.parametrize(
     "extend_lens",
@@ -787,6 +799,7 @@ def test_topk_v2_packed_rows(extend_lens: list[int], k: int) -> None:
         )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("residue", [1, 2, 3])
 @pytest.mark.parametrize("boundary", [8192, 16384])
 @torch.inference_mode()
@@ -857,6 +870,7 @@ def test_topk_v2_packed_level_boundary(boundary: int, residue: int) -> None:
         )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.skipif(is_hip(), reason="ROCm split path keeps its own tie merge")
 @pytest.mark.parametrize("num_ties", [129, 700, 1500])
 @pytest.mark.parametrize("seq", [5000, 12000, 40000, 131072])
@@ -909,6 +923,7 @@ def test_topk_v2_ties_by_index(path: str, seq: int, num_ties: int) -> None:
         assert torch.equal(actual, expected), f"row {row}: tie order not stable"
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.skipif(is_hip(), reason="CUDA candidate epilogue")
 @pytest.mark.parametrize("seq", [100, 2048, 5000, 12000, 40000])
 @pytest.mark.parametrize("with_row_starts", [False, True])

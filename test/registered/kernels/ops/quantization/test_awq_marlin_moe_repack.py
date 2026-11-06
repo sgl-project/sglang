@@ -2,6 +2,10 @@ import sys
 
 import pytest
 import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
 from sgl_kernel.scalar_type import scalar_types
 
 from sglang.kernels.ops.quantization.awq_marlin_repack import (
@@ -12,9 +16,6 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_marlin_utils import awq_pack
 
 register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-small")
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="Test requires CUDA"
-)
 
 
 @pytest.mark.parametrize("num_bits", [4])

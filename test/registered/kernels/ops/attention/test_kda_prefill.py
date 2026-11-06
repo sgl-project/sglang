@@ -1,8 +1,13 @@
 import unittest
 from unittest.mock import patch
 
+import pytest
 import torch
 import torch.nn.functional as F
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
 
 from sglang.kernels.ops.attention.fla.kda import chunk_kda
 from sglang.kernels.ops.attention.linear.kda_nvidia_prefill import (
@@ -89,6 +94,7 @@ def _reference(q, k, v, gate, beta, a_log, dt_bias, state, fused_qk_norm):
 
 
 class TestKdaPrefill(CustomTestCase):
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     @torch.inference_mode()
     def test_ptx_padded_raw_beta(self):
         """Raw beta must match Triton, including final state after neutral padding."""
@@ -125,6 +131,7 @@ class TestKdaPrefill(CustomTestCase):
         )
         torch.testing.assert_close(actual_state, state, rtol=2e-2, atol=3e-2)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     @torch.inference_mode()
     def test_nvidia_prefill(self):
         if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
@@ -161,6 +168,7 @@ class TestKdaPrefill(CustomTestCase):
             atol=3e-2,
         )
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     @torch.inference_mode()
     def test_ptx_prefill(self):
         if not _ptx_supported():
@@ -204,6 +212,7 @@ class TestKdaPrefill(CustomTestCase):
             atol=3e-2,
         )
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     @torch.inference_mode()
     def test_ptx_without_lower_bound_matches_triton(self):
         """Without a gate lower bound (Kimi-Linear) the kernel's per-chunk decay

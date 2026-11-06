@@ -91,6 +91,7 @@ SCALE_BYTES = 4
 PAGE_SIZE = 64
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("num_tokens", [1, 16, 96])
 def test_fp4_fused_norm_rope_store_layout(num_tokens: int) -> None:
     torch.manual_seed(num_tokens + 100)
@@ -153,6 +154,7 @@ def test_fp4_fused_norm_rope_store_layout(num_tokens: int) -> None:
     torch.testing.assert_close(cache, expected)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.skipif(
     _is_xpu,
     reason="fused_q_indexer_rope_hadamard_fp4_quant is not supported by Intel GPU",
@@ -339,6 +341,7 @@ def _reference_logits(q, weights, slots, lens, table):
     return logits.masked_fill(position[None, :] >= lens[:, None], -torch.inf)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("heads", [32, 64])
 @pytest.mark.parametrize("rows", [1, 6, 13])
 @pytest.mark.parametrize("width", [0, 1, 63, 64, 65, 129])
@@ -351,6 +354,7 @@ def test_fp4_logits_visibility_boundaries(heads, rows, width):
     assert actual.dtype == torch.float32
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("heads", [32, 64])
 @pytest.mark.parametrize("rows", [1, 6])
 def test_fp4_logits_noncontiguous_queries_and_weights(heads, rows):
@@ -372,6 +376,7 @@ def test_fp4_logits_noncontiguous_queries_and_weights(heads, rows):
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("heads", [32, 64])
 @pytest.mark.skipif(_is_xpu, reason="CUDA graph replay requires a CUDA device")
 def test_fp4_logits_graph_replay_updates_visibility_and_mapping(heads):
@@ -397,6 +402,7 @@ def test_fp4_logits_graph_replay_updates_visibility_and_mapping(heads):
         assert torch.isneginf(actual[invalid]).all().item()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
 def test_fp4_logits_invisible_tiles_ignore_nonfinite_queries(value):
     args = _make_logits_case(6, 32, 129)
@@ -409,6 +415,7 @@ def test_fp4_logits_invisible_tiles_ignore_nonfinite_queries(value):
     assert torch.isneginf(actual).all().item()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.skipif(_is_xpu, reason="Paged decode uses CUDA persistent kernels")
 @pytest.mark.parametrize(
     "batch,ratio,width,masked",
@@ -556,6 +563,7 @@ def test_verify_reuses_key_tiles_under_replay(ratio):
         torch.testing.assert_close(actual[visible], expected[visible], atol=0, rtol=0)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.skipif(_is_xpu, reason="Paged decode uses CUDA persistent kernels")
 @pytest.mark.parametrize("heads", [32, 64])
 @pytest.mark.parametrize("ratio,masked", [(1, False), (2, True)])
@@ -781,6 +789,7 @@ def test_hopper_indexer_backends_replay(ratio):
                 assert (out.raw_indices[batch] == -1).all().item()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize(
     "bs,n,bpp",
     [(1024, 2049, 4), (1024, 2049, 2), (3, 17, 2), (0, 10, 4), (5, 9, 3)],

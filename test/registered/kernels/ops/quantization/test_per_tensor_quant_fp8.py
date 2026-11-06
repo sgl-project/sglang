@@ -14,9 +14,6 @@ from sglang.test.ci.ci_register import register_cuda_ci
 register_cuda_ci(est_time=16, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 # Nightly is not redundant here: it sets SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1 to expand get_ci_test_range sweeps.
 register_cuda_ci(est_time=20, stage="nightly", runner_config="1-gpu-small")
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="Test requires CUDA"
-)
 
 try:
     from sglang.srt.utils import is_hip
@@ -62,6 +59,7 @@ PER_TENSOR_QUANT_CASES = get_ci_test_range(
 )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("num_tokens,hidden_dim", PER_TENSOR_QUANT_CASES)
 def test_jit_per_tensor_quant_compare_implementations(
     num_tokens: int,
@@ -78,6 +76,7 @@ def test_jit_per_tensor_quant_compare_implementations(
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("shape", [(4, 8, 64), (2, 16, 128), (19260817, 1, 1)])
 def test_jit_per_tensor_quant_supports_3d(shape):
     device = torch.device("cuda")

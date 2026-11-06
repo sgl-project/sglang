@@ -12,6 +12,7 @@ register_amd_ci(est_time=35, stage="base-b", runner_config="1-gpu-small-amd")
 
 
 class TestMXFP8HostAllocation(CustomTestCase):
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_constructor_counts_payload_and_scale_pages(self):
         pool = MHATokenToKVPoolMXFP8(
             size=256,
@@ -52,6 +53,7 @@ class TestMXFP8HostAllocation(CustomTestCase):
             host.size * expected_token_bytes,
         )
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_host_reuses_prebudget_staging(self):
         from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
         from sglang.srt.mem_cache.pool_host.mha import (
@@ -111,6 +113,7 @@ class TestMXFP8HostAllocation(CustomTestCase):
             self.assertEqual(actual.shape[0], host.staging_token_capacity)
         self.assertIsNone(pool.hicache_write_back_staging)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_payload_and_scales_restore_without_device_owner(self):
         """Captured scale buffers must restore without the removed owner helpers."""
         pool = MHATokenToKVPoolMXFP8(

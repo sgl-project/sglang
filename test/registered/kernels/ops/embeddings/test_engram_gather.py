@@ -39,6 +39,7 @@ def _assert_bits_equal(actual: torch.Tensor, expected: torch.Tensor) -> None:
     assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_engram_gather_decodes_packed_mxfp4_bit_exactly() -> None:
     """Every E2M1 byte, -0 included, gathers to the spec value, packed or widened."""
     packed, exps = _packed_table(rows=64)
@@ -59,6 +60,7 @@ def test_engram_gather_decodes_packed_mxfp4_bit_exactly() -> None:
         _assert_bits_equal(out, expected)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_engram_gather_peer_decodes_packed_mxfp4() -> None:
     """The peer kernel decodes packed rows as it reads widened ones."""
     packed, exps = _packed_table(rows=64)

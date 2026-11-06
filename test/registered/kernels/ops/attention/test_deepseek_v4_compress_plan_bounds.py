@@ -18,6 +18,7 @@ register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-s
 
 
 class TestCompressWritePlanBounds(CustomTestCase):
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_64k_prefill_preserves_last_token(self):
         """65536 tokens fit uint16 indices; the last token must not wrap or vanish."""
         for cr in (4, 128):
@@ -48,6 +49,7 @@ class TestCompressWritePlanBounds(CustomTestCase):
                         # no raw tail remains to persist into the state ring.
                         self.assertEqual(len(w[w[:, 0] != -1]), 0)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_prefill_rejects_uint16_index_overflow(self):
         for ctx in (
             make_paged_context(bs=16, compress_ratio=4, num_swa_pages_per_req=17),
@@ -59,6 +61,7 @@ class TestCompressWritePlanBounds(CustomTestCase):
             with self.assertRaisesRegex(RuntimeError, "plan_compress_prefill"):
                 ctx.make_prefill_plan(seq_lens, extend_lens, num_q)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_prefill_rejects_packed_invalid_sentinel(self):
         # A 65536-request, one-token-per-request batch makes the last packed
         # (batch_id, ragged_id) equal (65535, 65535), the invalid write sentinel.

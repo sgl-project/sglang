@@ -83,6 +83,7 @@ def _q_ref(t, dq, dkv, tau):
     return out.view(t, dq)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("t", [1, 3, 8, 32])
 def test_prologue_decode_tau_fold(t):
     dq, dkv = 2048, 256
@@ -107,6 +108,7 @@ def test_prologue_decode_tau_fold(t):
     assert torch.equal(q_tau, refold)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("t", [1, 7, 64, 2048])
 def test_rel_logits_proj_prescale_tau(t):
     """RelLogitsProj's operand-side tau fold (r*tau before the einsum) must
@@ -143,6 +145,7 @@ def _strided_r(t, h=16, d_rel=16, elem_offset=0):
     return qkvr[:, off:].view(t, h, d_rel)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("t", [1, 2, 48, 49, 64, 200, 1024])
 def test_rel_logits_proj_strided_dispatch(t):
     """_project on the production strided layout must be BIT-identical to the
@@ -171,6 +174,7 @@ def test_rel_logits_proj_strided_dispatch(t):
     torch.testing.assert_close(m(r, tau).float(), ref_tau.float(), rtol=2e-2, atol=2e-2)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_rel_logits_proj_dispatch_fallbacks():
     """The compact band must fall back to the plain einsum (and stay exact)
     when the JIT copy is ineligible -- e.g. a 2-byte-aligned r slice -- and

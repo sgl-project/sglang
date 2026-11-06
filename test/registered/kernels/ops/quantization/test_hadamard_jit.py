@@ -20,9 +20,6 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=32, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 register_cuda_ci(est_time=128, stage="nightly", runner_config="1-gpu-small")
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="Test requires CUDA"
-)
 
 # Exact M×N Hadamard matrices (±1 entries) copied from
 # python/sglang/kernels/jit/csrc/fast-hadamard-transform/code_gen.py.
@@ -259,6 +256,7 @@ _POWER_OF_TWO_CASES = get_ci_test_range(
 )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("dim,dtype", _POWER_OF_TWO_CASES)
 def test_hadamard_transform(dim, dtype):
     device = "cuda"
@@ -295,6 +293,7 @@ _NON_POWER_OF_TWO_CASES = get_ci_test_range(
 )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("dim,dtype", _NON_POWER_OF_TWO_CASES)
 def test_hadamard_transform_non_power_of_two(dim, dtype):
     device = "cuda"
@@ -318,6 +317,7 @@ def test_hadamard_transform_non_power_of_two(dim, dtype):
     torch.testing.assert_close(out.float(), out_ref, rtol=rtol, atol=atol)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_hadamard_transform_3d_input(dtype):
     device = "cuda"
@@ -339,6 +339,7 @@ def test_hadamard_transform_3d_input(dtype):
     torch.testing.assert_close(out.float(), out_ref, rtol=rtol, atol=atol)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_hadamard_transform_scale_one(dtype):
     device = "cuda"
@@ -379,6 +380,7 @@ def _mn_cases(dims):
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("dim,dtype", _mn_cases(_12N_DIMS))
 def test_hadamard_transform_12n(dim, dtype):
     device = "cuda"
@@ -402,6 +404,7 @@ def test_hadamard_transform_12n(dim, dtype):
     torch.testing.assert_close(out.float(), out_ref, rtol=rtol, atol=atol)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("dim,dtype", _mn_cases(_20N_DIMS))
 def test_hadamard_transform_20n(dim, dtype):
     device = "cuda"
@@ -425,6 +428,7 @@ def test_hadamard_transform_20n(dim, dtype):
     torch.testing.assert_close(out.float(), out_ref, rtol=rtol, atol=atol)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("dim,dtype", _mn_cases(_28N_DIMS))
 def test_hadamard_transform_28n(dim, dtype):
     device = "cuda"
@@ -448,6 +452,7 @@ def test_hadamard_transform_28n(dim, dtype):
     torch.testing.assert_close(out.float(), out_ref, rtol=rtol, atol=atol)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("dim,dtype", _mn_cases(_40N_DIMS))
 def test_hadamard_transform_40n(dim, dtype):
     device = "cuda"

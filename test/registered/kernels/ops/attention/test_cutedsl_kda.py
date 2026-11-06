@@ -5,6 +5,10 @@ import sys
 import pytest
 import torch
 
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
+
 from sglang.kernels.ops.attention.cutedsl_kda import (
     cutedsl_fused_sigmoid_gating_kda_update,
 )

@@ -80,6 +80,7 @@ def _assert_routes(out_idx, out_bias, ref_idx, ref_bias):
     torch.testing.assert_close(out_bias[:, :M].cpu(), ref_bias, atol=2e-4, rtol=1e-4)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize(
     "width,dql,with_img,budget",
     [
@@ -131,6 +132,7 @@ def test_decode_route_full_width(width, dql, with_img, budget):
     _assert_routes(out_idx, out_bias, *ref)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("width", [1000, 4096, 4097, 6000])
 def test_decode_route_windowed_scans(width):
     """Rows whose allowed span fits SCAN_TILE take the narrow window launch; the
@@ -218,6 +220,7 @@ def test_tiled_router_boundary():
     assert _want_tiled(8192)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("with_img", [False, True])
 @pytest.mark.parametrize("q_chunk", [2048, 16])
 def test_prefill_route(with_img, q_chunk):
@@ -281,6 +284,7 @@ def test_prefill_route(with_img, q_chunk):
     _assert_routes(out_idx, out_bias, *ref)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_kbar_refresh_summarizes_planned_pages_only():
     """Zero-token plan entries (pages past the live tail) must not be written."""
     gen = torch.Generator().manual_seed(3)

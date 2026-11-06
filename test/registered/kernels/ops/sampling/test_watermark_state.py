@@ -50,6 +50,7 @@ def _force(state, logits, req_pool_indices, sampling_info, rows):
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_repeated_context_and_greedy_bypass():
     device = "cuda"
     state = WatermarkState(
@@ -98,6 +99,7 @@ def test_repeated_context_and_greedy_bypass():
     assert state.num_watermarked_contexts.tolist() == [1, 0]
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_low_entropy_bypass_does_not_consume_context():
     state = WatermarkState(
         max_num_reqs=1,
@@ -133,6 +135,7 @@ def test_low_entropy_bypass_does_not_consume_context():
     assert state.num_watermarked_contexts[0].item() == 1
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_retracted_request_restores_context_history():
     device = "cuda"
     state = WatermarkState(
@@ -188,6 +191,7 @@ def test_retracted_request_restores_context_history():
     assert state.num_watermarked_contexts[1].item() == 2
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_speculative_record_stops_at_context_capacity():
     state = WatermarkState(
         max_num_reqs=1,
@@ -359,6 +363,7 @@ def test_speculative_tree_paths_match_tensor_reference():
         )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("block_verification", [False, True])
 def test_dspark_chain_commits_non_speculative_contexts(block_verification):
     from sglang.kernels.ops.speculative.dspark.dspark_accept import AcceptSampling

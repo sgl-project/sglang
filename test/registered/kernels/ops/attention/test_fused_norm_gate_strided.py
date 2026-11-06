@@ -17,6 +17,7 @@ def _strided_gate(num_tokens):
     return proj[:, _PROJ_WIDTH - _HEADS * _HEAD_DIM :].unflatten(-1, (-1, _HEAD_DIM))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("activation", ["sigmoid", "swish"])
 @pytest.mark.parametrize("num_tokens", [1, 2, 8, 33, 1000])
 @torch.inference_mode()
@@ -35,6 +36,7 @@ def test_strided_gate_matches_contiguous(activation, num_tokens):
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("head_dim", [64, 128, 256, 512])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("activation", ["sigmoid", "silu"])
@@ -54,6 +56,7 @@ def test_strided_gate_widths_and_dtypes(head_dim, dtype, activation):
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize(
     "layout", ["2d", "inner_stride", "head_stride", "batch", "wide"]
 )
@@ -85,6 +88,7 @@ def test_unsupported_gate_layouts_fall_back(layout):
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("with_residual", [False, True])
 @torch.inference_mode()
 def test_strided_gate_cuda_graph_and_prenorm(with_residual):
@@ -113,6 +117,7 @@ def test_strided_gate_cuda_graph_and_prenorm(with_residual):
         torch.testing.assert_close(result, reference, rtol=0, atol=0)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @torch.inference_mode()
 def test_strided_gate_launches_no_copy():
     norm = FusedRMSNormGated(

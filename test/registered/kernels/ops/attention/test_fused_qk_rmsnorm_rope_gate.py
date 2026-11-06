@@ -105,6 +105,7 @@ class TestFusedQKRMSNormRoPEGate(CustomTestCase):
         )
         return buffer[:, : self.tokens]
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_matches_reference_for_1d_positions(self):
         positions = torch.arange(self.tokens, device="cuda", dtype=torch.int64)
         q_out, k_out, gate_out = self.call(positions)
@@ -137,6 +138,7 @@ class TestFusedQKRMSNormRoPEGate(CustomTestCase):
             gate_out.float(), packed[..., self.head_dim :].float(), atol=0, rtol=0
         )
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_mrope_matches_the_rotary_module(self):
         """With t == h == w every layout agrees, so only distinct rows catch a wrong
         axis. Interleaved [11, 11, 10] is what Qwen3.6-35B-A3B ships, and [24, 20, 20]
@@ -181,6 +183,7 @@ class TestFusedQKRMSNormRoPEGate(CustomTestCase):
                     k_out.float(), want_k.float(), atol=2e-2, rtol=2e-2
                 )
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_rejects_positions_and_map_apart(self):
         flat = torch.arange(self.tokens, device="cuda", dtype=torch.int64)
         axis_map = self.build_mrope([11, 11, 10], interleaved=True).axis_map

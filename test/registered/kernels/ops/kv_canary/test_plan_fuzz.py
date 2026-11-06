@@ -205,6 +205,7 @@ def _summarize(inputs: PlanFuzzInputs) -> str:
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("seed", FUZZ_SEEDS_PR)
 def test_plan_fuzz_full_combo(seed: int) -> None:
     """Multi-dim plan fuzzer: random LUT/rtt/padding/capacity/swa × N iters, byte-equal."""

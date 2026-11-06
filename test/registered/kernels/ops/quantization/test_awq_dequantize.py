@@ -10,9 +10,6 @@ from sglang.kernels.ops.quantization.awq_dequantize import (
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=9, stage="base-b-kernel-unit", runner_config="1-gpu-small")
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="Test requires CUDA"
-)
 
 
 def reverse_awq_order(t: torch.Tensor):
@@ -65,6 +62,7 @@ def awq_dequantize_torch(
     return (iweights - zeros) * scales
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize(
     "qweight_row,qweight_col,is_bf16_act",
     list(

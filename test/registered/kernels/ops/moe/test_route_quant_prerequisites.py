@@ -67,6 +67,7 @@ def _route_oracle(
 
 
 class TestRouteQuant(CustomTestCase):
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_moe_auxiliary_kernels(self):
         x = torch.randn(2, TOPK, 7168, device="cuda", dtype=torch.bfloat16)
         out = torch.empty(2, 7168, device="cuda", dtype=torch.bfloat16)
@@ -91,6 +92,7 @@ class TestRouteQuant(CustomTestCase):
         self.assertTrue(torch.equal(wide, ref))
         self.assertTrue(torch.equal(narrow, wide))
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_moe_route_and_quant(self):
         torch.manual_seed(1)
         scores = torch.randn(8, NUM_EXPERTS, device="cuda", dtype=torch.bfloat16)
@@ -137,6 +139,7 @@ class TestRouteQuant(CustomTestCase):
         )
         torch.testing.assert_close(scale, ref_scale, rtol=0, atol=0)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_route_radix_ties_and_nan(self):
         """The cases the self-comparison could not see.
 

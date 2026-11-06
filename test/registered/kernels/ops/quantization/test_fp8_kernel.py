@@ -1,6 +1,11 @@
 import unittest
 
+import pytest
 import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
 
 from sglang.kernels.ops.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
@@ -34,6 +39,7 @@ class TestPerTokenGroupQuantFP8(TestFP8Base):
 
 
 class TestFlashinferBmmPrequantizedInput(unittest.TestCase):
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_prequantized_rows_are_not_quantized_twice(self):
         if not _is_cuda or torch.cuda.get_device_capability()[0] < 9:
             return

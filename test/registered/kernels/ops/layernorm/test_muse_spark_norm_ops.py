@@ -27,6 +27,7 @@ def _bf16_module(module):
     return module.to(device="cuda", dtype=torch.bfloat16)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("backend", _BACKENDS)
 @pytest.mark.parametrize("num_tokens", [1, 9, 300])
 @pytest.mark.parametrize(
@@ -90,6 +91,7 @@ def _boundary(post_input_scale, hidden):
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("backend", _BACKENDS)
 @pytest.mark.parametrize("num_tokens", [1, 7, 300])
 @pytest.mark.parametrize("post_input_scale", [False, True])

@@ -13,6 +13,7 @@ register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-s
 
 
 class TestSplitConvOutput(CustomTestCase):
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_varlen_planes_preserve_state_and_replay_new_inputs(self):
         # Unequal sequence lengths distinguish the full output-plane pitch
         # from a request's length. H=128 also straddles a 256-channel CTA.

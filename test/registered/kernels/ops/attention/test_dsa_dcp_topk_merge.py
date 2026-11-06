@@ -175,6 +175,7 @@ class _Case:
         return bad
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize(
     "kind",
     ["random", "ties", "periodic", "periodic2", "periodic3", "signed_zeros", "short"],

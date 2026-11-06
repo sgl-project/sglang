@@ -51,6 +51,7 @@ def _fp64(A, B, alpha):
     return alpha.double().unsqueeze(-1) * inv, B.double() @ inv
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("frames,heads,tokens", [(1, 1, 16), (5, 3, 64), (11, 7, 1008)])
 @pytest.mark.parametrize("beta_scale", [1.0, 50.0])
 def test_matches_eager_and_fp64(frames, heads, tokens, beta_scale):
@@ -72,6 +73,7 @@ def test_matches_eager_and_fp64(frames, heads, tokens, beta_scale):
     torch.testing.assert_close(j_fused, j_eager, rtol=1e-4, atol=1e-4)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("rule", ["vdn_solve", "vdn_scaled"])
 def test_delta_factor_apply_fused_path(rule):
     A, B, alpha = _inputs(4, 2, 48)
@@ -81,6 +83,7 @@ def test_delta_factor_apply_fused_path(rule):
         torch.testing.assert_close(x, y, rtol=2e-5, atol=2e-5)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_sana_scaled_ignores_fused():
     A, B, alpha = _inputs(2, 2, 32)
     eager = vdn.delta_factor_apply(
@@ -102,6 +105,7 @@ def _storage_offset_copy(t: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("which", ["A", "B", "alpha"])
 def test_storage_offset_input_matches_aligned(which):
     """A contiguous input with a storage offset must not fault in the float4 loads."""

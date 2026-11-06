@@ -130,6 +130,7 @@ def _inputs(batch_size: int, hidden_size: int, dtype: torch.dtype, residual: boo
     return x, w, res
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("batch_size,hidden_size", CASES)
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("in_place", [False, True])
@@ -147,6 +148,7 @@ def test_rmsnorm(
     _assert_close_16(out, ref)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("batch_size,hidden_size", CASES)
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_fused_add_rmsnorm(
@@ -159,6 +161,7 @@ def test_fused_add_rmsnorm(
     _assert_close_16(x, ref)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("batch_size,hidden_size", CASES)
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_rmsnorm_hf(batch_size: int, hidden_size: int, dtype: torch.dtype) -> None:
@@ -173,6 +176,7 @@ def test_rmsnorm_hf(batch_size: int, hidden_size: int, dtype: torch.dtype) -> No
     _assert_close_16(x, ref_fused, max_ulp=2)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.skipif(is_hip(), reason="fp8 e4m3 quant modes are CUDA-only")
 @pytest.mark.parametrize("batch_size,hidden_size", CASES)
 @pytest.mark.parametrize("fused", [False, True])
@@ -199,6 +203,7 @@ def test_rmsnorm_quant(
     )  # <= 1 ulp of e4m3 (2^-3)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_rmsnorm_strided_rows() -> None:
     x_full = torch.randn(64, 4096 + 64, device=DEVICE, dtype=torch.bfloat16)
     x = x_full[:, :4096]
@@ -212,6 +217,7 @@ def test_rmsnorm_strided_rows() -> None:
     assert torch.equal(out_full[:, 4096:], padding)  # untouched padding
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_rmsnorm_empty() -> None:
     x = torch.empty(0, 4096, device=DEVICE, dtype=torch.bfloat16)
     w = torch.ones(4096, device=DEVICE, dtype=torch.bfloat16)
@@ -219,6 +225,7 @@ def test_rmsnorm_empty() -> None:
     jit_norm.rmsnorm(x, w, out, EPS)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize(
     ("hidden_size", "expected"),
     [

@@ -31,6 +31,7 @@ def _ref(r, proj, tau):
     return torch.einsum("thd,de->the", rf, proj.float())
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("t", [1, 2, 5, 16, 32])
 @pytest.mark.parametrize("strided", [False, True])
 @pytest.mark.parametrize("with_tau", [False, True])
@@ -50,6 +51,7 @@ def test_rel_proj_small_t(t, strided, with_tau):
     torch.testing.assert_close(out.float(), ref, rtol=2e-2, atol=2e-2)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_rel_proj_tau_isolation():
     """tau must only scale: kernel(tau) == kernel(no tau) computed on the
     pre-rounded r*tau operand -- guards the round-before-dot placement (a

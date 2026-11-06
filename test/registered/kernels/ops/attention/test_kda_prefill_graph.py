@@ -14,6 +14,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
 
 from sglang.srt.layers.attention.linear.kda_backend import (
@@ -271,12 +272,14 @@ class TestKDAPrefillGraph(CustomTestCase):
         self.assertTrue(bool((out[:, total:] == 0).all()), "padded rows not zeroed")
         self.assertTrue(torch.equal(self.conv_pool, ref_conv), "conv pool differs")
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_without_radix_tracking(self):
         meta, graph, out = self._capture(track=False)
         self._check_replay(
             meta, graph, out, lens=[129, 7], prefixes=[64, 0], track=None, seed=300
         )
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_replays_match_eager(self):
         meta, graph, out = self._capture()
         cases = [
@@ -306,6 +309,7 @@ class TestKDAPrefillGraph(CustomTestCase):
                     seed=100 + i,
                 )
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_replays_match_eager_4d_gate(self):
         """Kimi passes the gate as [1, T, H, K]; the graph must still apply the
         beta sigmoid the eager extend applies."""
@@ -321,6 +325,7 @@ class TestKDAPrefillGraph(CustomTestCase):
             seed=200,
         )
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_capacity(self):
         meta = KDAPrefillGraphMetadata.allocate(
             num_tokens=BUCKET,
@@ -341,6 +346,7 @@ class TestKDAPrefillGraph(CustomTestCase):
 class TestFlashInferKDAPrefillGraph(TestKDAPrefillGraph):
     prefill_backend = LinearAttnKernelBackend.FLASHINFER
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_small_buckets_with_padded_sequences(self):
         for num_tokens in (1, 8, 16, 128):
             with self.subTest(num_tokens=num_tokens):

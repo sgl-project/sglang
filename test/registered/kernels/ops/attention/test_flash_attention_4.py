@@ -9,6 +9,10 @@ import unittest
 
 import pytest
 import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
 from einops import rearrange, repeat
 
 from sglang.kernels.ops.attention.flash_attention import (
