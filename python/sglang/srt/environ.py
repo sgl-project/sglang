@@ -909,6 +909,11 @@ class Envs:
     # ===================================================================
     # Staging buffer for heterogeneous TP KV transfer
     SGLANG_DISAGG_STAGING_BUFFER = EnvBool(False)
+    # Equal-TP fragmented KV transfer (#5450): route a chunk through staging
+    # when its concurrent-contiguity group count reaches this threshold.
+    SGLANG_DISAGG_STAGING_MIN_GROUPS = EnvInt(8)
+    # Route every equal-TP chunk through staging regardless of fragmentation.
+    SGLANG_DISAGG_STAGING_ALWAYS = EnvBool(False)
     SGLANG_DISAGG_STAGING_POOL_SIZE_MB = EnvInt(4096)
     # Queue incoming KV scatters between forwards; disabled by default.
     SGLANG_PLB_SCATTER_DEFER = EnvBool(False)
