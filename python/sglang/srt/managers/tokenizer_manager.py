@@ -655,6 +655,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     def init_tokenizer_and_processor(self):
         server_args = self.server_args
+        # Logprob outputs decode the same ids over and over, and one id always
+        # decodes to the same text.
+        self._logprob_token_text_cache: dict[int, str] = {}
 
         # Initialize tokenizer and processor
         if self.model_config.is_multimodal and not get_disagg().language_model_only:
@@ -3326,12 +3329,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             ]
         else:
             assert self.tokenizer is not None
-            # In transformers v5, batch_decode([1, 2, 3]) concatenates all tokens
-            # into one string. Wrap each ID in its own list so they decode separately.
-            token_texts = self.tokenizer.batch_decode(
-                [[idx] for idx in token_logprobs_idx]
-            )
-            return list(zip(token_logprobs_val, token_logprobs_idx, token_texts))
+            cache = self._logprob_token_text_cache
+            missing = [
+                idx for idx in dict.fromkeys(token_logprobs_idx) if idx not in cache
+            ]
+            if missing:
+                # In transformers v5, batch_decode([1, 2, 3]) concatenates all tokens
+                # into one string. Wrap each ID in its own list so they decode separately.
+                token_texts = self.tokenizer.batch_decode([[idx] for idx in missing])
+                cache.update(zip(missing, token_texts))
+            return [
+                (logprob, idx, cache[idx])
+                for logprob, idx in zip(token_logprobs_val, token_logprobs_idx)
+            ]
 
     def detokenize_top_logprobs_tokens(
         self,
