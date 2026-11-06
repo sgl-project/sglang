@@ -4,7 +4,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
-from sglang.srt.disaggregation.base.conn import KVArgs
+from sglang.srt.disaggregation.base.conn import KVArgs, StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.utils import setup_state_kv_args
 from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
@@ -65,6 +65,21 @@ def _make_kv_pool(start_layer: int = 0) -> MiniMaxSparseKVPool:
 
 
 class TestMiniMaxSparseDisaggStateKvArgs(unittest.TestCase):
+    def test_setup_state_kv_args_minimax_components(self):
+        pool = _make_k_only_pool()
+        kv_args = KVArgs()
+        setup_state_kv_args(kv_args, _static_storage(pool))
+        self.assertEqual(
+            kv_args.state_types,
+            [StateType.MINIMAX_INDEX_K, StateType.MINIMAX_DENSE_KV],
+        )
+        self.assertEqual(len(kv_args.state_data_ptrs), 2)
+        self.assertEqual(len(kv_args.state_data_ptrs[0]), pool.index_k_pool.layer_num)
+        self.assertEqual(len(kv_args.state_item_lens[0]), pool.index_k_pool.layer_num)
+        self.assertEqual(len(kv_args.state_data_ptrs[1]), 6)
+        self.assertEqual(len(kv_args.state_item_lens[1]), 6)
+        self.assertEqual(kv_args.state_layer_ids, [[3, 4, 5, 6], []])
+
     def test_index_kv_pool_raises(self):
         pool = _make_kv_pool()
         self.assertIsNotNone(pool.index_kv_pool)

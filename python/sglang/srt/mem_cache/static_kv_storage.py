@@ -811,7 +811,13 @@ def _static_state_entries(
             )
         if token_to_kv_pool.index_k_pool is not None:
             dp, dl, il = token_to_kv_pool.get_index_k_state_buf_infos()
-            add(StateType.MINIMAX_INDEX_K, dp, dl, il)
+            add(
+                StateType.MINIMAX_INDEX_K,
+                dp,
+                dl,
+                il,
+                layer_ids=token_to_kv_pool.index_k_layer_id_mapping,
+            )
         dense_ptrs, dense_lens, dense_item_lens = (
             token_to_kv_pool.get_dense_kv_state_buf_infos()
         )
