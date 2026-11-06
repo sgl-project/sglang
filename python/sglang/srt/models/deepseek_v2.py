@@ -157,6 +157,7 @@ from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
     maybe_fuse_routed_scale_and_shared_add,
     routed_hidden_size,
 )
+from sglang.srt.layers.quantization.unquant import prefer_bf16_splitk_over_fused_a
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer
@@ -2619,7 +2620,9 @@ class DeepseekV2AttentionMLA(
                     self.fused_qkv_a_proj_with_mqa, backend=self.fused_a_gemm_backend
                 )
             )
-        if self._use_min_latency_fused_a_gemm:
+        if self._use_min_latency_fused_a_gemm and not prefer_bf16_splitk_over_fused_a(
+            x=hidden_states, weight=self.fused_qkv_a_proj_with_mqa.weight
+        ):
             return linear_with_fused_a_gemm(
                 self.fused_qkv_a_proj_with_mqa,
                 hidden_states,
