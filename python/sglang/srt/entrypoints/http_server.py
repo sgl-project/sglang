@@ -21,6 +21,7 @@ import asyncio
 import dataclasses
 import errno
 import logging
+import math
 import os
 import socket
 import ssl
@@ -67,7 +68,6 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import (
-    JSONResponse,
     ORJSONResponse,
     Response,
     StreamingResponse,
@@ -1955,7 +1955,13 @@ async def cohere_v2_embed(request: CohereEmbedRequest, raw_request: Request):
         )
         if isinstance(response, Response):
             return response
-        return JSONResponse(content=response.model_dump(exclude_none=True))
+        for row in response.embeddings.float or []:
+            if not all(map(math.isfinite, row)):
+                raise ValueError("Out of range float values are not JSON compliant")
+        return Response(
+            content=response.model_dump_json(exclude_none=True),
+            media_type="application/json",
+        )
     except HTTPException:
         raise  # The global handler preserves the HTTP status and Cohere format.
     except Exception:
