@@ -861,10 +861,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if not model_runner.spec_algorithm.is_dspark():
             return False
         from sglang.srt.speculative.dspark_components.dspark_config import (
-            draft_is_deepseek_v4,
+            draft_uses_compressed_kv_attention,
         )
 
-        return not draft_is_deepseek_v4()
+        return not draft_uses_compressed_kv_attention()
 
     def _ragged_capture_slots(self, num_tokens: int) -> int:
         if envs.SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE.get():

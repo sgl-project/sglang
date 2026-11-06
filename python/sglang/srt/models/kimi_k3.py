@@ -20,6 +20,7 @@ from torch import nn
 from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
 from sglang.srt.configs.kimi_k3 import KimiK3Config
 from sglang.srt.configs.kimi_linear import KimiLinearConfig
+from sglang.srt.configs.model_config import is_kimi_k31
 from sglang.srt.distributed import (
     divide,
     tensor_model_parallel_all_reduce,
@@ -38,6 +39,7 @@ from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStatePacker,
 )
 from sglang.srt.layers.communication import k3_ar_fusion, k3_sp_collective
+from sglang.srt.layers.dcp.layout import set_dsa_shards_index_k
 from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
 from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
@@ -2256,6 +2258,8 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
         # The fused Ascend split+RMSNorm path is not numerically equivalent for
         # Kimi-K3. Other MLA models retain the existing fused fast path.
         self._disable_npu_fused_split_qk_norm = True
+        if is_kimi_k31(config) and get_parallel().attn_dcp_size > 1:
+            set_dsa_shards_index_k()
         super().__init__(
             layer_id=layer_idx,
             hidden_size=config.hidden_size,
