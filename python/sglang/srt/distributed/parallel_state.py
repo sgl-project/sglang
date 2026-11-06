@@ -2724,16 +2724,22 @@ def initialize_model_parallel(
                 dcp_group_ranks.append(
                     tp_group[start : start + decode_context_parallel_size]
                 )
-        _DCP = init_model_parallel_group(
-            dcp_group_ranks,
-            get_world_group().local_rank,
-            backend,
-            use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
-            group_name="dcp",
-            recovered_rank=recovered_rank,
-            rank_offset=rank_offset,
-            max_world_size=max_world_size,
-        )
+        if is_hip() and dcp_group_ranks == group_ranks:
+            # DCP spans each whole TP group: share its communicators rather than
+            # allocate a second RCCL communicator and custom all-reduce (about
+            # 9 GiB a GPU at TP8 on MI355X). ROCm only, where it is validated.
+            _DCP = _TP
+        else:
+            _DCP = init_model_parallel_group(
+                dcp_group_ranks,
+                get_world_group().local_rank,
+                backend,
+                use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
+                group_name="dcp",
+                recovered_rank=recovered_rank,
+                rank_offset=rank_offset,
+                max_world_size=max_world_size,
+            )
         if _TP.rank_in_group == 0:
             logger.info(
                 f"DCP enabled, dcp_size={decode_context_parallel_size}, tp_size={tensor_model_parallel_size}"
