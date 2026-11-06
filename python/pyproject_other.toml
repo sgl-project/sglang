@@ -65,7 +65,7 @@ runtime_base = [
   "soundfile==0.13.1",
   "tiktoken",
   "tqdm",
-  "transformers==5.19.0",
+  "transformers>=5.19.0,<5.23.0",  # exact pin lives in each srt_* platform extra; srt_empty gets the range
   "uvicorn",
   "uvloop",
   "xxhash",
@@ -125,6 +125,7 @@ srt_hip = [
   "sglang[monokernels_hip]",
   "sglang[runtime_common]",
   "torch",
+  "transformers==5.22.0",
   "petit_kernel==0.0.2",
   "wave-lang==3.8.2",
 ]
@@ -138,6 +139,7 @@ srt_hip_rocm724 = [
   "sglang[monokernels_hip]",
   "sglang[runtime_common]",
   "torch==2.11.0",
+  "transformers==5.22.0",
   "wave-lang==3.8.2",
 ]
 
@@ -148,6 +150,7 @@ srt_hip_rocm101 = [
   "petit_kernel==0.0.2",
   "sglang[runtime_common]",
   "torch==2.12.0",
+  "transformers==5.22.0",
   "wave-lang==3.8.2",
 ]
 
@@ -162,7 +165,10 @@ diffusion_hip = [
 
 # For Intel Gaudi(device : hpu) follow the installation guide
 # https://docs.vllm.ai/en/latest/getting_started/gaudi-installation.html
-srt_hpu = ["sglang[runtime_common]"]
+srt_hpu = [
+  "sglang[runtime_common]",
+  "transformers==5.22.0",
+]
 
 # https://docs.sglang.io/hardware-platforms/sail
 srt_sail = [
@@ -172,6 +178,7 @@ srt_sail = [
   "sailify==1.0.0",
   "sglang[runtime_common]",
   "torch-for-sail",
+  "transformers==5.22.0",
   "triton-for-sail",
 ]
 
@@ -204,6 +211,7 @@ srt_musa = [
   "torchada>=0.1.90",
   "torchaudio==2.11.0+musa5.2.0",
   "torchvision==0.26.0.post1+musa5.2.0",
+  "transformers==5.19.0",  # MUSA image ships Python 3.10; transformers>=5.21 requires 3.11
   "triton==3.2.0",
 ]
 
@@ -224,6 +232,7 @@ srt_mps = [
     "torchaudio==2.11.0",
     "torchcodec==0.15.0",
     "torchvision==0.28.0",
+    "transformers==5.22.0",
 ]
 
 diffusion_mps = [

@@ -276,9 +276,6 @@ class HFRunner:
         torch_dtype,
         matryoshka_dim: Optional[int] = None,
     ):
-        # Apply model-specific patches
-        monkey_patch_gemma2_sdpa()
-
         # Validate and clean corrupted files in HF cache (CI only)
         # This is needed because HFRunner bypasses SGLang's weight validation
         ci_validate_and_clean_hf_cache(model_path)
@@ -453,6 +450,7 @@ class HFRunner:
         self._stop_model_proc()
 
     @staticmethod
+    @torch.inference_mode()
     def forward_generation_raw(
         base_model,
         prompts: Union[List[str], List[torch.Tensor]],
@@ -925,21 +923,6 @@ class SRTRunner:
         return ModelOutput(
             output_strs=output_strs,
         )
-
-
-def monkey_patch_gemma2_sdpa():
-    """
-    Use sdpa by default to fix the OOM issue.
-    Revert this commit:
-    https://github.com/huggingface/transformers/commit/975b988bfe6e7ebb47390cd9a1556c6888804883#diff-5f76eac6f18f4b491521314c318a9692318feb4d19228e9576cce7bde4240834R660
-    """
-    from transformers.models.gemma2.modeling_gemma2 import Gemma2PreTrainedModel
-
-    def _check_and_enable_sdpa(config, hard_check_only: bool = False):
-        config._attn_implementation = "sdpa"
-        return config
-
-    setattr(Gemma2PreTrainedModel, "_check_and_enable_sdpa", _check_and_enable_sdpa)
 
 
 def check_close_model_outputs(

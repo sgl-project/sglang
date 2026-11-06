@@ -15,11 +15,17 @@
 
 from typing import Any
 
+import transformers
+from packaging.version import Version
 from transformers.configuration_utils import PretrainedConfig
 
 from sglang.srt.configs.nemotron_h import NemotronHConfig, NemotronHPuzzleConfig
 from sglang.srt.configs.radio import RadioConfig
 from sglang.srt.multimodal.internvl_utils import IMAGENET_MEAN, IMAGENET_STD
+
+# transformers < 5.20 reads has_no_defaults_at_init in to_diff_dict(); 5.20+ dropped
+# the attribute, where an instance value would only leak into to_dict().
+_TRANSFORMERS_LT_5_20 = Version(transformers.__version__) < Version("5.20.0")
 
 
 def float_triplet(seq: Any):
@@ -73,9 +79,10 @@ class NemotronH_Nano_VL_V2_Config(PretrainedConfig):
                 self.llm_config = NemotronHConfig(**llm_config)
             else:
                 self.llm_config = NemotronHPuzzleConfig(**llm_config)
-                # Puzzle requires block_configs; nested diff serialization cannot
-                # construct a default instance of its config.
-                self.has_no_defaults_at_init = True
+                if _TRANSFORMERS_LT_5_20:
+                    # Puzzle requires block_configs; nested diff serialization cannot
+                    # construct a default instance of its config.
+                    self.has_no_defaults_at_init = True
             assert isinstance(vision_config, dict), "vision_config must be a dictionary"
             self.raw_vision_config = vision_config
         else:
