@@ -18,8 +18,8 @@ from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     SchedulerPoolStatsObserver,
 )
 from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
     ListKind,
-    _RequestList,
 )
 from sglang.srt.managers.utils import allocate_distinct_stream
 from sglang.srt.mem_cache.allocator import (
@@ -52,7 +52,7 @@ from sglang.srt.speculative.base_spec_worker import (
     HiCacheDraftPlan,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.scheduler_test_utils import FakeReq
+from sglang.test.scheduler_test_utils import FakeReq, decode_queue
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.tree_slots import tree_slots_of
 
@@ -373,10 +373,12 @@ class TestDecodeRetractionBackup(CustomTestCase):
             transfer_backend=TransferBackend.FAKE,
             is_mla_backend=False,
             enable_staging=False,
-            transfer_queue=SimpleNamespace(queue=[], enable_staging=False),
-            queue=[],
+            transfer_queue=SimpleNamespace(
+                queue=decode_queue(ListKind.PD_RECEIVING), enable_staging=False
+            ),
+            queue=decode_queue(ListKind.PD_PREALLOC),
             pending_reqs=[],
-            retracted_queue=_RequestList(ListKind.PD_RETRACTED),
+            retracted_queue=IndexedReqList(ListKind.PD_RETRACTED),
             _prefill_dp_rank_queries={},
             _num_published_destinations=0,
             num_reserved_decode_tokens=0,
@@ -555,7 +557,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
                 receiver = Mock(supports_host_destination=True)
                 receiver.poll.return_value = KVPoll.WaitingForInput
                 decode_req = DecodeRequest(req=req, kv_receiver=receiver)
-                queue.queue = [decode_req]
+                queue.queue = decode_queue(ListKind.PD_PREALLOC, [decode_req])
                 self.assertEqual(queue.pop_preallocated(), ([decode_req], []))
                 self.assertEqual(decode_req.host_staged, host_staged)
                 self.assertEqual(len(host_admissions), int(host_staged))
@@ -605,7 +607,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
                 receiver = Mock(supports_host_destination=False)
                 receiver.poll.return_value = KVPoll.WaitingForInput
                 decode_req = DecodeRequest(req=req, kv_receiver=receiver)
-                queue.queue = [decode_req]
+                queue.queue = decode_queue(ListKind.PD_PREALLOC, [decode_req])
                 host_free_before = cache.host_pool_group.available_size()
                 blocker = env.allocator.alloc(self.pool_size)
                 self.assertEqual(queue.pop_preallocated(), ([], []))
@@ -675,9 +677,9 @@ class TestDecodeRetractionBackup(CustomTestCase):
                     sampling_params=SamplingParams(max_new_tokens=1),
                 )
                 pending = DecodeRequest(req=pending_req, kv_receiver=receiver)
-                queue.queue = [pending]
+                queue.queue = decode_queue(ListKind.PD_PREALLOC, [pending])
                 self.assertEqual(queue.pop_preallocated(), ([], []))
-                self.assertEqual(queue.queue, [pending])
+                self.assertEqual(list(queue.queue.items()), [pending])
                 self.assertIsNone(pending_req.kv.req_pool_idx)
                 self.assertIsNone(pending_req.kv.retraction_backup)
                 self.assertEqual(
@@ -774,7 +776,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
                     (resumed.kv.req_pool_idx, slice(0, self.num_tokens)), reused
                 )
 
-            queue.retracted_queue = _RequestList(ListKind.PD_RETRACTED)
+            queue.retracted_queue = IndexedReqList(ListKind.PD_RETRACTED)
             queue.retracted_queue.join([req])
             with (
                 patch.object(queue, "_uses_swa_reservation", return_value=False),
@@ -828,7 +830,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
         receiver = Mock(supports_host_destination=True)
         receiver.poll.return_value = KVPoll.WaitingForInput
         decode_req = DecodeRequest(req=req, kv_receiver=receiver)
-        queue.queue = [decode_req]
+        queue.queue = decode_queue(ListKind.PD_PREALLOC, [decode_req])
         host_free_before = cache.host_pool_group.available_size()
         self.assertEqual(queue.pop_preallocated(), ([decode_req], []))
         self.assertIsNone(req.kv.req_pool_idx)

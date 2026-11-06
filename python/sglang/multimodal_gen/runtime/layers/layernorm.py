@@ -893,10 +893,6 @@ class ScaleResidualLayerNormScaleShift(_ScaleResidualNormScaleShift):
     norm_type = "layer"
 
 
-class ScaleResidualRMSNormScaleShift(_ScaleResidualNormScaleShift):
-    norm_type = "rms"
-
-
 class _NormScaleShift(CustomOp):
     """
     Fused kernel that combines:
