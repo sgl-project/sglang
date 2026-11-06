@@ -1195,13 +1195,19 @@ class HybridCacheController(BaseHiCacheController):
             if device_indices is None:
                 return None
 
-        pool_transfers = self._resolve_device_transfers(
-            extra_pools,
-            kv_device_indices=(
-                anchor_indices if anchor_indices is not None else device_indices
-            ),
-            kv_host_indices=host_indices,
-        )
+        try:
+            pool_transfers = self._resolve_device_transfers(
+                extra_pools,
+                kv_device_indices=(
+                    anchor_indices if anchor_indices is not None else device_indices
+                ),
+                kv_host_indices=host_indices,
+            )
+        except Exception:
+            # Side pools roll themselves back; the anchor belongs to this call.
+            if need_load_kv and not caller_owned:
+                full_allocator.free(device_indices)
+            raise
         if pool_transfers is None and extra_pools:
             if need_load_kv and not caller_owned:
                 full_allocator.free(device_indices)
@@ -2084,55 +2090,68 @@ class HybridCacheController(BaseHiCacheController):
             return None
         newly_allocated: list[tuple[PoolTransfer, Callable, torch.Tensor]] = []
         derived_transfers: list[PoolTransfer] = []
+        derived_originals: list[
+            tuple[PoolTransfer, Optional[torch.Tensor], Optional[torch.Tensor]]
+        ] = []
 
         def rollback_allocated() -> None:
-            for prev_pool, prev_free_fn, prev_indices in reversed(newly_allocated):
-                prev_free_fn(prev_indices)
+            while derived_originals:
+                transfer, host_indices, device_indices = derived_originals.pop()
+                transfer.host_indices = host_indices
+                transfer.device_indices = device_indices
+            while newly_allocated:
+                prev_pool, prev_free_fn, prev_indices = newly_allocated.pop()
                 prev_pool.device_indices = None
+                prev_free_fn(prev_indices)
 
-        for pool in extra_pools:
-            if pool.indices_from_pool is not None:
-                derived_transfers.append(pool)
-                continue
-            entry = self.mem_pool_host.entry_map.get(pool.name)
-            if entry is None:
-                continue
-            if pool.device_indices is not None or pool.host_indices is None:
-                continue
-            # device_alloc_fn / device_free_fn override entry.device_pool's
-            # methods for pools whose device_pool is a raw KV pool (layout)
-            # rather than an allocator (e.g. SWA).
-            alloc_fn = entry.device_alloc_fn or entry.device_pool.alloc
-            free_fn = entry.device_free_fn or entry.device_pool.free
-            evict_fn = entry.device_evict_fn
-            size = len(pool.host_indices)
-            indices = alloc_fn(size)
-            if indices is None and evict_fn:
-                evict_fn(size)
+        try:
+            for pool in extra_pools:
+                if pool.indices_from_pool is not None:
+                    derived_transfers.append(pool)
+                    continue
+                entry = self.mem_pool_host.entry_map.get(pool.name)
+                if entry is None:
+                    continue
+                if pool.device_indices is not None or pool.host_indices is None:
+                    continue
+                # device_alloc_fn / device_free_fn override entry.device_pool's
+                # methods for pools whose device_pool is a raw KV pool (layout)
+                # rather than an allocator (e.g. SWA).
+                alloc_fn = entry.device_alloc_fn or entry.device_pool.alloc
+                free_fn = entry.device_free_fn or entry.device_pool.free
+                evict_fn = entry.device_evict_fn
+                size = len(pool.host_indices)
                 indices = alloc_fn(size)
-            if indices is None:
-                # Atomic rollback: free everything we successfully allocated.
-                rollback_allocated()
-                return None
-            pool.device_indices = indices
-            newly_allocated.append((pool, free_fn, indices))
+                if indices is None and evict_fn:
+                    evict_fn(size)
+                    indices = alloc_fn(size)
+                if indices is None:
+                    rollback_allocated()
+                    return None
+                pool.device_indices = indices
+                newly_allocated.append((pool, free_fn, indices))
 
-        # Assign indices to deferred pools from their source.
-        for pool in derived_transfers:
-            if pool.indices_from_pool == PoolName.KV:
-                pool.host_indices = kv_host_indices
+            # Preserve aliases on failure, including caller-supplied indices.
+            for pool in derived_transfers:
+                derived_originals.append((pool, pool.host_indices, pool.device_indices))
+                if pool.indices_from_pool == PoolName.KV:
+                    pool.host_indices = kv_host_indices
+                    if pool.device_indices is None:
+                        pool.device_indices = kv_device_indices
+                    continue
+
+                source = merge_source_transfers(extra_pools, pool.indices_from_pool)
+                if source is None:
+                    rollback_allocated()
+                    return None
+                pool.host_indices = source.host_indices
                 if pool.device_indices is None:
-                    pool.device_indices = kv_device_indices
-                continue
-
-            source = merge_source_transfers(extra_pools, pool.indices_from_pool)
-            if source is None:
-                rollback_allocated()
-                return None
-            pool.host_indices = source.host_indices
-            if pool.device_indices is None:
-                pool.device_indices = source.device_indices
-        return extra_pools
+                    pool.device_indices = source.device_indices
+            return extra_pools
+        except Exception:
+            # Reservations have not been queued for transfer yet.
+            rollback_allocated()
+            raise
 
     def _reduce_prefetch_ack(self, ack: PrefetchAck) -> None:
         # Handle KV-derived pool.
