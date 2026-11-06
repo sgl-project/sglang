@@ -987,7 +987,7 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         if _use_triton_w4a16:
             self._process_weights_triton_w4a16(layer)
             return
-        if not _use_aiter:
+        if not _use_aiter and getattr(layer, "_gluon_moe_backend", None) is None:
             raise RuntimeError(
                 "Quark MXFP4 MoE weight post-processing requires aiter on this "
                 "device (set SGLANG_USE_AITER=1 and install aiter). Consumer RDNA "
