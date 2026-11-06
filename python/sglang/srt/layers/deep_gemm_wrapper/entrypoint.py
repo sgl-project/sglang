@@ -243,7 +243,12 @@ def gemm_nt_f8f8bf16(
         else compile_utils.DeepGemmKernelType.GEMM_NT_F8F8BF16
     )
     if _is_sail and recipe is None and lhs[1].shape[-1] == rhs[1].shape[-1] == 1:
-        kernel_type = compile_utils.DeepGemmKernelType.GEMM_NT_F8F8BF16_CHANNEL
+        # The vendor build is the only one that reads per-channel weight scales.
+        from sglang.srt.hardware_backend.sail.deep_gemm.kernel_types import (
+            SailDeepGemmKernelType,
+        )
+
+        kernel_type = SailDeepGemmKernelType.GEMM_NT_F8F8BF16_CHANNEL
 
     _sanity_check_input(lhs)
     _sanity_check_input(rhs)
