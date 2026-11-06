@@ -129,6 +129,127 @@ class TestIQuestQ1WeightLoading(CustomTestCase):
                 )
 
 
+class TestIQuestQ1FP8ExpertLoading(CustomTestCase):
+    def _make_model(self, is_mtp, first_expert):
+        from sglang.srt.layers.quantization.fp8 import Fp8Config
+        from sglang.srt.models.iquest_q1 import IQuestQ1ForCausalLM
+        from sglang.srt.models.iquest_q1_mtp import IQuestQ1MTP
+
+        cls = IQuestQ1MTP if is_mtp else IQuestQ1ForCausalLM
+        model = cls.__new__(cls)
+        torch.nn.Module.__init__(model)
+        model.config = IQuestQ1Config(num_experts=2, intermediate_size=2)
+        model.quant_config = Fp8Config(
+            is_checkpoint_fp8_serialized=True, weight_block_size=[128, 128]
+        )
+        if is_mtp:
+            prefix = "model.mtp_layer.mtp_model_layer.mlp.experts"
+            checkpoint_prefix = "mtp.mtp_model_layer.mlp.experts"
+        else:
+            prefix = "model.layers.0.mlp.experts"
+            checkpoint_prefix = prefix
+
+        experts = model
+        for component in prefix.split("."):
+            child = torch.nn.Module()
+            experts.add_module(component, child)
+            experts = child
+
+        def load_expert(param, weight, name, shard_id, expert_id):
+            # Simulate an EP rank that owns only a subset of the experts.
+            if expert_id < first_expert:
+                return
+            destination = param.data[expert_id - first_expert]
+            if shard_id == "w1":
+                destination[:2].copy_(weight)
+            elif shard_id == "w3":
+                destination[2:].copy_(weight)
+            else:
+                self.assertEqual(shard_id, "w2")
+                destination.copy_(weight)
+
+        for name, width in (
+            ("w13_weight", 4),
+            ("w2_weight", 2),
+            ("w13_weight_scale_inv", 4),
+            ("w2_weight_scale_inv", 2),
+        ):
+            param = torch.nn.Parameter(
+                torch.full((2 - first_expert, width, 2), float("nan")),
+                requires_grad=False,
+            )
+            param.weight_loader = load_expert
+            experts.register_parameter(name, param)
+        return model, experts, checkpoint_prefix
+
+    def test_fp8_expert_scales(self):
+        for is_mtp in (False, True):
+            for first_expert in (0, 1):
+                for packed_weights in (False, True):
+                    with self.subTest(
+                        is_mtp=is_mtp,
+                        first_expert=first_expert,
+                        packed_weights=packed_weights,
+                    ):
+                        model, experts, prefix = self._make_model(is_mtp, first_expert)
+                        fc = torch.arange(16, dtype=torch.float32).reshape(2, 4, 2)
+                        proj = torch.arange(8, dtype=torch.float32).reshape(2, 2, 2)
+                        weights = []
+                        if packed_weights:
+                            weights.extend(
+                                [(f"{prefix}.fc", fc), (f"{prefix}.proj", proj)]
+                            )
+                        for expert_id in range(2):
+                            for projection, weight, scale in (
+                                ("gate_proj", fc[expert_id, :2], 10 + expert_id),
+                                ("up_proj", fc[expert_id, 2:], 20 + expert_id),
+                                ("down_proj", proj[expert_id], 30 + expert_id),
+                            ):
+                                name = f"{prefix}.{expert_id}.{projection}"
+                                if not packed_weights:
+                                    weights.append((f"{name}.weight", weight))
+                                weights.append(
+                                    (
+                                        f"{name}.weight_scale_inv",
+                                        torch.full((2, 2), float(scale)),
+                                    )
+                                )
+                        model.load_weights(iter(weights))
+                        torch.testing.assert_close(
+                            experts.w13_weight, fc[first_expert:]
+                        )
+                        torch.testing.assert_close(
+                            experts.w2_weight, proj[first_expert:]
+                        )
+                        for expert_id in range(first_expert, 2):
+                            local_id = expert_id - first_expert
+                            scales = experts.w13_weight_scale_inv[local_id]
+                            torch.testing.assert_close(
+                                scales[:2], torch.full((2, 2), float(10 + expert_id))
+                            )
+                            torch.testing.assert_close(
+                                scales[2:], torch.full((2, 2), float(20 + expert_id))
+                            )
+                            torch.testing.assert_close(
+                                experts.w2_weight_scale_inv[local_id],
+                                torch.full((2, 2), float(30 + expert_id)),
+                            )
+
+    def test_unknown_expert_parameters_rejected(self):
+        for is_mtp in (False, True):
+            model, _, prefix = self._make_model(is_mtp, first_expert=0)
+            for suffix in (
+                "0.gate_proj.misspelled_scale",
+                "0.unknown_proj.weight_scale_inv",
+                "2.gate_proj.weight_scale_inv",
+            ):
+                with (
+                    self.subTest(is_mtp=is_mtp, suffix=suffix),
+                    self.assertRaisesRegex(ValueError, "Unexpected IQuest Q1 weight"),
+                ):
+                    model.load_weights([(f"{prefix}.{suffix}", torch.ones(2, 2))])
+
+
 class TestIQuestQ1MTPDraft(CustomTestCase):
     def test_mtp_loads_own_weights(self):
         from sglang.srt.models.iquest_q1_mtp import IQuestQ1MTP
