@@ -283,7 +283,7 @@ class TestNPUDeepSeekV4Flash0731W8A8PDSEPGPQAHigh(
                 ("Host memory before cache cleanup", ["free", "-g"], False),
                 (
                     "drop_caches execution result",
-                    "sync && echo 1 | sudo tee /proc/sys/vm/drop_caches",
+                    "sync && echo 1 > /proc/sys/vm/drop_caches",
                     True,
                 ),
                 ("Host memory after cache cleanup", ["free", "-g"], False),
@@ -304,7 +304,15 @@ class TestNPUDeepSeekV4Flash0731W8A8PDSEPGPQAHigh(
                     result.stdout,
                     result.stderr,
                 )
-                result.check_returncode()
+                if result.returncode != 0:
+                    # Best-effort host maintenance, not a test assertion: raising
+                    # here makes the prefill pod exit early and the multi-node
+                    # harness then reports a misleading "pod is not running".
+                    logger.warning(
+                        "%s failed with returncode %d; continuing without it",
+                        description,
+                        result.returncode,
+                    )
         super().setUpClass()
 
     model_config = DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_MODEL_CONFIG
