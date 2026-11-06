@@ -1664,8 +1664,9 @@ def _a2a_backend_overrides(view: Any) -> dict:
         moe_a2a_backend = resolve_pipeline_a2a_backend(pipeline, moe_a2a_backend)
         if moe_a2a_backend != view.moe_a2a_backend:
             logger.warning(
-                "moe_a2a_backend is overridden to '%s' because the selected EvenMoE "
-                "pipeline supports %s.",
+                "moe_a2a_backend is overridden from '%s' to '%s' because the "
+                "selected EvenMoE pipeline supports %s.",
+                view.moe_a2a_backend,
                 moe_a2a_backend,
                 pipeline.capabilities.supported_a2a_backends,
             )

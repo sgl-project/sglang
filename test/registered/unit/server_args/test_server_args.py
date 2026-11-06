@@ -3474,6 +3474,19 @@ class TestLoadBalancerBackendSelection(CustomTestCase):
                 self.assertEqual(overrides.get("moe_a2a_backend", backend), expected)
                 self.assertEqual(args.moe_a2a_backend, backend)
 
+    def test_backend_override_warning_names_both_backends(self):
+        from sglang.srt.arg_groups import overrides as overrides_module
+
+        args = ServerArgs(
+            model_path="dummy",
+            moe_load_balancer_algorithm="ultraep",
+            moe_a2a_backend="megamoe",
+        )
+        with self.assertLogs(overrides_module.logger, level="WARNING") as logs:
+            overrides = overrides_module._a2a_backend_overrides(args)
+        self.assertEqual(overrides, {"moe_a2a_backend": "deepep"})
+        self.assertIn("from 'megamoe' to 'deepep'", "\n".join(logs.output))
+
     @override_platform(is_npu=False)
     def test_ascend_rejection_depends_on_pipeline_backend_contract(self):
         from evenmoe import A2A_DEEPEP, RoutingCapabilities
