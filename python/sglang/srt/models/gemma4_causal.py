@@ -125,14 +125,16 @@ class Gemma4MLP(Gemma3MLP):
             if (
                 type(self.act_fn) is GeluAndMul
                 and self.act_fn.approximate == "tanh"
-                and getattr(self.act_fn.dispatch_forward, "__func__", None)
-                is BaseFusedOp.dispatch_forward
+                and getattr(self.act_fn._resolve_forward_method, "__func__", None)
+                is BaseFusedOp._resolve_forward_method
             ):
                 # Resolve the standard platform dispatch before graph capture.
                 # Calling its hardware queries from forward breaks Dynamo when
                 # fusion means the standalone activation has never cached it.
-                selected = self.act_fn.dispatch_forward()
-                self._xpu_gate_up_activation_dispatch = BaseFusedOp.dispatch_forward
+                selected = self.act_fn._resolve_forward_method()
+                self._xpu_gate_up_activation_dispatch = (
+                    BaseFusedOp._resolve_forward_method
+                )
                 self._xpu_gate_up_default_activation_forward = getattr(
                     selected, "__func__", None
                 )
@@ -187,8 +189,8 @@ class Gemma4MLP(Gemma3MLP):
             and type(self.act_fn) is GeluAndMul
             and self.act_fn.approximate == "tanh"
             and get_fused_op_backend() is None
-            and isinstance(self.act_fn.dispatch_forward, MethodType)
-            and self.act_fn.dispatch_forward.__func__
+            and isinstance(self.act_fn._resolve_forward_method, MethodType)
+            and self.act_fn._resolve_forward_method.__func__
             is self._xpu_gate_up_activation_dispatch
             and (
                 (
@@ -1203,7 +1205,7 @@ class Gemma4TextModel(PreTrainedModel):
         device = eligible[0].gate_up_proj.weight.device
         table = getattr(self, "_xpu_gate_up_lut_owner", None)
         if table is None or table.device != device or table.dtype != torch.bfloat16:
-            from sglang.kernels.ops.activation import GeluTanhAndMulOp
+            from sgl_kernel import gelu_tanh_and_mul
 
             with torch.xpu.device(device):
                 if torch.xpu.is_current_stream_capturing():
@@ -1216,7 +1218,7 @@ class Gemma4TextModel(PreTrainedModel):
                 inputs = torch.cat([values, torch.ones_like(values)]).unsqueeze(0)
                 # Store the actual native BF16 GELU intermediate for every bit
                 # pattern; FP32 GELU values would change output rounding.
-                table = GeluTanhAndMulOp().forward_aot(inputs).flatten()
+                table = gelu_tanh_and_mul(inputs).flatten()
             self.register_buffer("_xpu_gate_up_lut_owner", table, persistent=False)
         for module in eligible:
             if module.gate_up_proj.weight.device == device:
