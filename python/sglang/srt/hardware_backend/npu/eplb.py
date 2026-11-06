@@ -304,8 +304,9 @@ def _expert_storage_layout(weight: torch.Tensor) -> _ExpertStorageLayout:
 class _PhysicalExpertWeightStaging(_ExpertWeightStaging):
     """Move A5 expert storage unchanged, including NZ padding and packed bytes.
 
-    Only the ND snapshots are viewed as bytes. Model tensors retain their
-    original dtype, format, strides and addresses throughout migration.
+    Contiguous ND weights use byte views of the routed prefix. Other layouts
+    use full-storage snapshots to preserve padding and shared-expert suffixes.
+    Model tensors retain their dtype, format, strides and addresses.
     """
 
     def __init__(self, weights_by_layer, layer_ids, rank):
@@ -321,9 +322,9 @@ class _PhysicalExpertWeightStaging(_ExpertWeightStaging):
                     f"[NPU EPLB] rank={rank} layer={layer}: expert storage layouts "
                     "must match across the migration chunk"
                 )
-        self._buffers: list[torch.Tensor] = []
+        self._storage_snapshots: list[tuple[torch.Tensor, torch.Tensor]] = []
 
-    def create_temp_buffers(self, weights):
+    def create_temp_buffers(self, weights: list[torch.Tensor]) -> list[torch.Tensor]:
         return [
             torch.empty(
                 layout.wire_shape(weight), dtype=torch.uint8, device=weight.device
@@ -331,27 +332,35 @@ class _PhysicalExpertWeightStaging(_ExpertWeightStaging):
             for weight, layout in zip(weights, self._layouts, strict=True)
         ]
 
-    def load(self, weights):
+    def load(self, weights: list[torch.Tensor]) -> list[torch.Tensor]:
         self._begin_layer()
-        self._buffers = []
+        self._storage_snapshots = []
         migration_weights = []
-        for weight, layout in zip(weights, self._layouts, strict=True):
-            buffer = torch.empty(
+        for weight, layout, needs_staging in zip(
+            weights, self._layouts, self._needs_staging, strict=True
+        ):
+            if not needs_staging:
+                # Keep byte transport for FP8 scales, without copying ND storage.
+                migration_weights.append(
+                    weight.view(torch.uint8).view(layout.wire_shape(weight))
+                )
+                continue
+            # The chunk's owners and layouts were validated during initialization.
+            owner = weight if weight._base is None else weight._base
+            snapshot = torch.empty(
                 layout.storage_elements, dtype=weight.dtype, device=weight.device
             )
-            torch.ops.npu.copy_memory_(
-                buffer, _full_expert_weight(weight), non_blocking=True
-            )
-            self._buffers.append(buffer)
+            torch.ops.npu.copy_memory_(snapshot, owner, non_blocking=True)
+            self._storage_snapshots.append((owner, snapshot))
             # Reinterpret bytes; a dtype conversion would alter FP4/FP8 values.
-            rows = buffer.view(torch.uint8).view(layout.num_experts, -1)
+            rows = snapshot.view(torch.uint8).view(layout.num_experts, -1)
             migration_weights.append(rows[: weight.shape[0]])
         return migration_weights
 
-    def store(self, weights, migration_weights):
-        for weight, buffer in zip(weights, self._buffers, strict=True):
-            # The full snapshot retains shared-expert rows outside the routed
-            # prefix. Write it back without copy_'s NZ-view restrictions.
-            torch.ops.npu.copy_memory_(
-                _full_expert_weight(weight), buffer, non_blocking=True
-            )
+    def store(
+        self, weights: list[torch.Tensor], migration_weights: list[torch.Tensor]
+    ) -> None:
+        # Direct ND views already updated model storage. Snapshots also retain
+        # the shared-expert suffix, which is outside migration_weights.
+        for owner, snapshot in self._storage_snapshots:
+            torch.ops.npu.copy_memory_(owner, snapshot, non_blocking=True)
