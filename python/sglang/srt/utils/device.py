@@ -1030,8 +1030,13 @@ def get_device_memory_capacity(device: str = None):
         if mem_bytes:
             return mem_bytes / (1 << 20)  # bytes -> MiB
         return None
-    if is_cuda():
+    if is_cuda() and not is_sail():
         gpu_mem = get_nvgpu_memory_capacity()
+    elif is_sail():
+        gpu_mem = min(
+            torch.cuda.get_device_properties(i).total_memory
+            for i in range(torch.cuda.device_count())
+        ) // (1 << 20)
     elif is_hip():
         gpu_mem = get_amdgpu_memory_capacity()
     elif device == "mps":
