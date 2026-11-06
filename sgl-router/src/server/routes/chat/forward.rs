@@ -756,13 +756,19 @@ fn prompt_dp_rank(
         _ => Vec::new(),
     };
     let rank_tokens = rank_tokens(ctx, worker, model.dp_rank_policy);
-    select_dp_rank(
+    let rank = select_dp_rank(
         worker,
         key,
         &prefix_depths,
         &rank_tokens,
         model.dp_rank_policy,
-    )
+    );
+    if let (Some(rank), Some(provider), Some(tokens)) =
+        (rank, &ctx.dp_rank_prefix_provider, &request.tokens)
+    {
+        provider.record_rank(&tokens.ids, &request.cache_namespace, &worker.url, rank);
+    }
+    rank
 }
 
 /// KV tokens per rank of `worker` when `policy` is `least_tokens`: what each
