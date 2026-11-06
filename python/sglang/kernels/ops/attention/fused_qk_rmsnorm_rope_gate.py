@@ -30,6 +30,31 @@ _ENABLE_PDL = _pdl_supported()
 
 
 @triton.jit
+def _xpu_fp16_intermediate(value):
+    # An FP32 -> FP16 -> FP32 pair can be removed before an XPU FMA by the
+    # device compiler. Decode the observable FP16 bits to retain that rounding.
+    bits = value.to(tl.float16).to(tl.uint16, bitcast=True).to(tl.uint32)
+    sign = (bits & 0x8000) << 16
+    exponent = (bits >> 10) & 0x1F
+    fraction = bits & 0x3FF
+    normal = sign | ((exponent + 112) << 23) | (fraction << 13)
+    special = sign | 0x7F800000 | (fraction << 13)
+    subnormal = fraction.to(tl.float32) * (2.0**-24)
+    subnormal = (subnormal.to(tl.uint32, bitcast=True) | sign).to(
+        tl.float32, bitcast=True
+    )
+    return tl.where(
+        exponent == 0,
+        subnormal,
+        tl.where(
+            exponent == 31,
+            special.to(tl.float32, bitcast=True),
+            normal.to(tl.float32, bitcast=True),
+        ),
+    )
+
+
+@triton.jit
 def _fused_qk_rmsnorm_rope_gate_kernel(
     q_gate_ptr,
     k_ptr,
@@ -63,6 +88,7 @@ def _fused_qk_rmsnorm_rope_gate_kernel(
     ENABLE_PDL: tl.constexpr,
     WEIGHT_SHIFT: tl.constexpr = 1.0,
     EXPLICIT_ROPE_FMA: tl.constexpr = False,
+    EXPLICIT_XPU_ROPE_FMA: tl.constexpr = False,
 ):
     token = tl.program_id(0)
     head = tl.program_id(1)
@@ -107,8 +133,14 @@ def _fused_qk_rmsnorm_rope_gate_kernel(
     wr2 = tl.load(w_ptr + HALF_ROTARY + rot_offs, mask=rot_mask, other=0.0).to(
         tl.float32
     )
-    xr1 = (xr1 * inv_rms * (wr1 + WEIGHT_SHIFT)).to(out_dtype).to(tl.float32)
-    xr2 = (xr2 * inv_rms * (wr2 + WEIGHT_SHIFT)).to(out_dtype).to(tl.float32)
+    xr1 = xr1 * inv_rms * (wr1 + WEIGHT_SHIFT)
+    xr2 = xr2 * inv_rms * (wr2 + WEIGHT_SHIFT)
+    if FP16 and EXPLICIT_XPU_ROPE_FMA:
+        xr1 = _xpu_fp16_intermediate(xr1)
+        xr2 = _xpu_fp16_intermediate(xr2)
+    else:
+        xr1 = xr1.to(out_dtype).to(tl.float32)
+        xr2 = xr2.to(out_dtype).to(tl.float32)
 
     if MROPE:
         axis = tl.load(mrope_axis_map_ptr + rot_offs, mask=rot_mask, other=0)
@@ -127,6 +159,11 @@ def _fused_qk_rmsnorm_rope_gate_kernel(
     if EXPLICIT_ROPE_FMA:
         first = tl.fma(xr1, cos, -libdevice.mul_rn(xr2, sin))
         second = tl.fma(xr2, cos, libdevice.mul_rn(xr1, sin))
+    elif EXPLICIT_XPU_ROPE_FMA:
+        # Match the native XPU cache-based RoPE: contract the x product in
+        # both expressions. The y products remain separately rounded.
+        first = tl.fma(xr1, cos, -xr2 * sin)
+        second = tl.fma(xr1, sin, xr2 * cos)
     else:
         first = xr1 * cos - xr2 * sin
         second = xr2 * cos + xr1 * sin

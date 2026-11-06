@@ -420,7 +420,7 @@ register_kernel(
         op="attention.gemma_qkv_norm_rope",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.attention.gemma_qkv_norm_rope:gemma_qkv_norm_rope",
-        capabilities=CUDA_ONLY,
+        capabilities=frozenset({CapabilityRequirement.CUDA, CapabilityRequirement.XPU}),
     )
 )
 register_kernel(
