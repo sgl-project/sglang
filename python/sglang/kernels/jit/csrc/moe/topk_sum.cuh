@@ -75,7 +75,7 @@ struct TopkSumKernel {
     auto T_ = SymbolicSize{"topk"};
     auto K_ = SymbolicSize{"hidden"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     TensorMatcher({M_, T_, K_}).with_dtype<bf16_t>().with_device(device).verify(in);
     TensorMatcher({M_, K_}).with_dtype<bf16_t>().with_device(device).verify(out);

@@ -13,11 +13,8 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
-from sglang.multimodal_gen.configs.sample.sampling_params import (
-    DataType,
-    SamplingParams,
-)
-from sglang.multimodal_gen.configs.task_type import ModelTaskType
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.task_type import DataType, ModelTaskType
 
 COSMOS3_DEFAULT_GUIDANCE_SCALE = 4.0
 COSMOS3_EDGE_T2I_GUIDANCE_SCALE = 7.0
@@ -72,6 +69,8 @@ class Cosmos3SamplingParams(SamplingParams):
     pick the right resolution at request time in
     :meth:`_resolve_variant_defaults`.
     """
+
+    _explicit_fields: ClassVar[set[str] | None] = None
 
     height: int | None = None
     width: int | None = None
@@ -183,6 +182,9 @@ class Cosmos3SamplingParams(SamplingParams):
     # into physical units with ``action_normalization``.
     action_stats_path: str | None = None
     action_normalization: str = "quantile"
+
+    def is_explicit(self, name: str) -> bool:
+        return self._explicit_fields is not None and name in self._explicit_fields
 
     @classmethod
     def image_request_extra_fields(cls) -> frozenset[str]:

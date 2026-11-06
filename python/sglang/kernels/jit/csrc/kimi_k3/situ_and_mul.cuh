@@ -128,7 +128,7 @@ struct SituAndMulKernel {
     auto D_in = SymbolicSize{"input_width"};
     auto D_out = SymbolicSize{"output_width"};
     auto device_ = SymbolicDevice{};
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLGPU>();
 
     TensorMatcher({N, D_out})  //
         .with_dtype<TOut>()
@@ -389,7 +389,7 @@ struct SituAndMulMaskedPostQuantKernel {
     auto D = SymbolicSize{"hidden_dim x 2"};
     auto N = SymbolicSize{"hidden_dim"};
     auto G = SymbolicSize{"num_groups"};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     TensorMatcher({E, T, D})  // input
         .with_dtype<bf16_t>()

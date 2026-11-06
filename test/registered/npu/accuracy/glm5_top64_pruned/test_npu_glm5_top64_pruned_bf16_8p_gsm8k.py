@@ -12,6 +12,9 @@ register_npu_ci(est_time=3600, suite="base-c-test-acc-16-npu-a3")
 register_npu_ci(est_time=4800, suite="nightly-acc-16-npu-a3", nightly=True)
 
 ENVS = {
+    "PYTORCH_NPU_ALLOC_CONF": (
+        "expandable_segments:True,pin_memory_expandable_segments:True"
+    ),
     "SGLANG_SET_CPU_AFFINITY": "1",
     "STREAMS_PER_DEVICE": "32",
     "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "600",

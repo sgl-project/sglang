@@ -229,6 +229,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn decode_dispatch_limit(mut self, limit: usize) -> Self {
+        self.config.decode_dispatch_limit = Some(limit);
+        self
+    }
+
     pub fn rate_limit_tokens_per_second(mut self, tokens: i32) -> Self {
         self.config.rate_limit_tokens_per_second = Some(tokens);
         self
@@ -528,6 +533,11 @@ impl RouterConfigBuilder {
 
     pub fn maybe_request_id_headers(mut self, headers: Option<Vec<String>>) -> Self {
         self.config.request_id_headers = headers;
+        self
+    }
+
+    pub fn maybe_decode_dispatch_limit(mut self, limit: Option<usize>) -> Self {
+        self.config.decode_dispatch_limit = limit;
         self
     }
 
