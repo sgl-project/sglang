@@ -2598,8 +2598,9 @@ def initialize_model_parallel(
             the KV cache across GPUs within each tensor-parallel group during
             decoding. Must be a divisor of `tp_size` and is currently only
             supported on the AMD HIP platform.
-        shared_experts_tp_size: optional shared-expert TP width. Must divide
-            attention TP; subgroups never cross attention replicas.
+        shared_experts_tp_size: optional shared-expert TP width. May span
+            interleave prefill CP within one attention replica; the validated
+            width divides attention TP x CP and never crosses DP or PP.
 
     Let's say we have a total of 8 GPUs denoted by g0 ... g7 and we
     use 2 GPUs to parallelize the model tensor, and 4 GPUs to parallelize
@@ -2831,8 +2832,9 @@ def initialize_model_parallel(
         if shared_experts_tensor_parallel_size == attn_tp_size:
             _SHARED_EXPERTS_TP = _ATTN_TP
         else:
-            # Attention TP groups are contiguous, and the requested width
-            # divides each one. These groups also stay inside their PP stage.
+            # Rank layout is [PP, attention DP, CP, attention TP]. The
+            # validated width divides attention TP x CP, so contiguous groups
+            # may span interleave PCP but never cross DP replicas or PP stages.
             shared_size = shared_experts_tensor_parallel_size
             shared_group_ranks = [
                 list(range(start, start + shared_size))
