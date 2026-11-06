@@ -1488,6 +1488,8 @@ class DeepseekSparseAttnBackend(
         self.init_kernel_metadata(forward_batch)
 
     def _dcp_gathered_prefill(self, forward_batch: ForwardBatch) -> bool:
+        if self.dcp_size == 1:
+            return False
         return is_dsa_dcp_gathered_prefill(forward_batch.attn_dcp_metadata)
 
     def _init_dcp_prefill_crossover(self, model_runner) -> float:
@@ -2396,12 +2398,10 @@ class DeepseekSparseAttnBackend(
 
         # Do absorbed multi-latent attention (MLA path)
         kv_cache = self.kv_layers.read(layer.layer_id).key()
-        prefill_page_table_1 = metadata.page_table_1
         dcp_gathered = self._dcp_gathered_prefill(forward_batch)
         if dcp_gathered:
             # The caller all-gathered the prefix and appended this extend's KV.
             kv_cache = forward_batch.attn_dcp_metadata.dcp_kv_buffer
-            prefill_page_table_1 = forward_batch.attn_dcp_metadata.dsa_page_table_1
 
         if q_rope is not None:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
@@ -2457,7 +2457,11 @@ class DeepseekSparseAttnBackend(
             elif topk_transform_method == TopkTransformMethod.PAGED:
                 assert metadata.dsa_extend_seq_lens_list is not None
                 page_table_1 = transform_index_page_table_prefill(
-                    page_table=prefill_page_table_1,
+                    page_table=(
+                        forward_batch.attn_dcp_metadata.dsa_page_table_1
+                        if dcp_gathered
+                        else metadata.page_table_1
+                    ),
                     topk_indices=topk_indices,
                     extend_lens_cpu=metadata.dsa_extend_seq_lens_list,
                     page_size=1,
