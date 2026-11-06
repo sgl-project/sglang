@@ -82,6 +82,16 @@ ALL_REPOS = [
 
 
 # ======================= Version ======================= #
+# The SAIL wheel keeps the upstream `sglang-kernel` distribution name, so it is
+# told apart from the CUDA build of the same version by the `+sail` local version
+# (see scripts/update_kernel_whl_index.py --sail and
+# .github/workflows/release-whl-kernel-sail.yml). It is appended here rather than
+# declared in pyproject_sail.toml so scripts/release/bump_kernel_version.py can
+# keep every pyproject on the same plain version; building against a non-SAIL
+# Torch stays untagged.
+SAIL_LOCAL_VERSION = "+sail" if getattr(torch.version, "sail", None) else ""
+
+
 def _get_version():
     with open(root / "pyproject_sail.toml") as f:
         for line in f:
@@ -534,7 +544,7 @@ _packages += _triton_pkgs
 # ======================= Setup ======================= #
 setup(
     name="sglang-kernel",
-    version=_get_version(),
+    version=f"{_get_version()}{SAIL_LOCAL_VERSION}",
     packages=_packages,
     package_dir=_package_dir,
     ext_modules=ext_modules,
