@@ -115,8 +115,8 @@ def _transfer_queue(decode_reqs):
     queue._clean_hicache_prefetch_resources = MagicMock()
     queue._commit_transfer_to_req = MagicMock()
     queue._record_transfer_failure = MagicMock()
-    queue._release_request = MagicMock()
     queue.scheduler = SimpleNamespace(
+        request_retirer=MagicMock(),
         enable_decode_hicache=False,
         enable_hisparse=False,
         metrics_reporter=SimpleNamespace(enable_metrics=False),
@@ -140,7 +140,6 @@ class TestPopTransferredFollowsConsensusOutcome(CustomTestCase):
                 },
             ),
             ("sglang.srt.disaggregation.decode.prepare_abort", {}),
-            ("sglang.srt.disaggregation.decode.release_kv_cache", {}),
         ):
             patcher = patch(target, **kwargs)
             patcher.start()
@@ -158,7 +157,9 @@ class TestPopTransferredFollowsConsensusOutcome(CustomTestCase):
         self.assertEqual(outcomes, {"s": False, "f": True})
         self.assertEqual(list(queue.queue.items()), [not_yet_agreed])
         queue._commit_transfer_to_req.assert_called_once_with(admitted)
-        queue._release_request.assert_called_once_with(failed_elsewhere)
+        queue.scheduler.request_retirer.release.assert_called_once_with(
+            failed_elsewhere.req, checkpoint=False
+        )
         queue._record_transfer_failure.assert_called_once_with(
             "Failed due to an unknown reason from another rank"
         )
