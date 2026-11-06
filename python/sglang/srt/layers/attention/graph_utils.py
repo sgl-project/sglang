@@ -161,6 +161,27 @@ def padded_extend_real_tokens(
     return real_num_tokens
 
 
+@contextmanager
+def real_rows_scope(forward_batch: ForwardBatch, real_num_tokens: int):
+    out_cache_loc = forward_batch.out_cache_loc
+    positions = forward_batch.positions
+    forward_batch.out_cache_loc = out_cache_loc[:real_num_tokens]
+    if positions is not None:
+        forward_batch.positions = positions[:real_num_tokens]
+    try:
+        yield
+    finally:
+        forward_batch.out_cache_loc = out_cache_loc
+        forward_batch.positions = positions
+
+
+def zero_padded_rows(t: torch.Tensor, num_tokens: int) -> torch.Tensor:
+    full = t.new_empty((num_tokens, *t.shape[1:]))
+    full[: t.shape[0]].copy_(t)
+    full[t.shape[0] :].zero_()
+    return full
+
+
 def _attention_on_real_rows(
     layer: RadixAttention,
     real_num_tokens: int,
@@ -217,36 +238,27 @@ def _attention_on_real_rows(
         or kwargs.get("idx_q") is not None
         else _new_attention_output(layer, q, v)
     )
-    out_cache_loc = forward_batch.out_cache_loc
-    positions = forward_batch.positions
     attn_output = forward_batch._attn_output
-    forward_batch.out_cache_loc = out_cache_loc[:real_num_tokens]
-    if positions is not None:
-        forward_batch.positions = positions[:real_num_tokens]
     if output is not None:
         forward_batch._attn_output = output[:real_num_tokens]
     try:
-        ret = get_attn_backend().forward(
-            queries(q),
-            keys(k),
-            keys(v),
-            layer,
-            forward_batch,
-            save_kv_cache,
-            **kwargs,
-        )
+        with real_rows_scope(forward_batch, real_num_tokens):
+            ret = get_attn_backend().forward(
+                queries(q),
+                keys(k),
+                keys(v),
+                layer,
+                forward_batch,
+                save_kv_cache,
+                **kwargs,
+            )
     finally:
-        forward_batch.out_cache_loc = out_cache_loc
-        forward_batch.positions = positions
         forward_batch._attn_output = attn_output
 
     def padded(t):
         if not isinstance(t, torch.Tensor) or t.shape[0] != real_num_tokens:
             return t
-        full = t.new_empty((num_tokens, *t.shape[1:]))
-        full[:real_num_tokens].copy_(t)
-        full[real_num_tokens:].zero_()
-        return full
+        return zero_padded_rows(t, num_tokens)
 
     if isinstance(ret, tuple):
         return tuple(padded(t) for t in ret)

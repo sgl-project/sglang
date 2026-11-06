@@ -3,6 +3,7 @@ from __future__ import annotations
 import enum
 import functools
 import logging
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
@@ -98,6 +99,10 @@ from sglang.srt.layers.attention.dsv4.v41_indexer import (
 from sglang.srt.layers.attention.dsv4.v41_indexer.scoring import prefill_k_slots
 from sglang.srt.layers.attention.dsv4.v41_indexer.sparse_table import (
     SparseTableBackend,
+)
+from sglang.srt.layers.attention.graph_utils import (
+    padded_extend_real_tokens,
+    real_rows_scope,
 )
 from sglang.srt.layers.attention.graph_variants import DSV41_EARLY_VERIFY_VARIANTS
 from sglang.srt.layers.attention.verify_mask import (
@@ -1019,11 +1024,29 @@ class LateLayerTail(msgspec.Struct, frozen=True):
         )
 
 
+@contextmanager
+def extend_metadata_rows(forward_batch: ForwardBatch):
+    """Narrow an eager extend that MLP sync padded to its real rows while its
+    metadata is built, yielding their count; prefill CP pads in its own layout."""
+    real_num_tokens = (
+        padded_extend_real_tokens(forward_batch.positions, forward_batch)
+        if _get_logical_forward_mode(forward_batch).is_prefill()
+        and not is_cp_active(forward_batch)
+        else None
+    )
+    if real_num_tokens is None:
+        yield None
+        return
+    with real_rows_scope(forward_batch, real_num_tokens):
+        yield real_num_tokens
+
+
 def _tail_rows(
     t: torch.Tensor, *, token_indices: torch.Tensor, contiguous_start: Optional[int]
 ) -> torch.Tensor:
     if contiguous_start is not None:
-        return t[contiguous_start:]
+        # The view of t[token_indices]; rows past the extend are padding.
+        return t[contiguous_start : contiguous_start + token_indices.shape[0]]
     return t[token_indices]
 
 
@@ -1137,6 +1160,9 @@ class DSV4Metadata:
     # Captured with the late layers on a tail block (decoder SWA bounded replay
     # inside the prefill CUDA graph); replay rebuilds the tail metadata iff set.
     prefill_graph_tail: bool = False
+    # Set when MLP sync padded this eager extend to a multiple of attention TP:
+    # the metadata covers only the leading real rows, as attention computes them.
+    real_num_tokens: Optional[int] = None
 
     @property
     def core_metadata(self) -> DSV4AttnMetadata:
@@ -2943,14 +2969,17 @@ class DeepseekV4AttnBackend(
             self.online_c128_mtp.clear()
             return
 
-        self.forward_metadata = self._build_forward_metadata(forward_batch)
-        self.init_forward_metadata_in_graph(forward_batch)
-        self.tail_forward_metadata = (
-            self._build_late_layer_tail_metadata(forward_batch)
-            if self.enable_decoder_swa_bounded_replay
-            and forward_batch.forward_mode.is_extend_without_speculative()
-            else None
-        )
+        with extend_metadata_rows(forward_batch) as real_num_tokens:
+            self.forward_metadata = self._build_forward_metadata(forward_batch)
+            self.init_forward_metadata_in_graph(forward_batch)
+            self.tail_forward_metadata = (
+                self._build_late_layer_tail_metadata(forward_batch)
+                if self.enable_decoder_swa_bounded_replay
+                and forward_batch.forward_mode.is_extend_without_speculative()
+                else None
+            )
+        if real_num_tokens is not None:
+            self.forward_metadata.real_num_tokens = real_num_tokens
 
         self._activate_request_window()
 
@@ -3039,6 +3068,9 @@ class DeepseekV4AttnBackend(
 
         metadata = self.forward_metadata
         assert isinstance(metadata, DSV4Metadata)
+        if metadata.real_num_tokens is not None:
+            # Attention queries only the rows the metadata covers.
+            num_qo_tokens = metadata.real_num_tokens
         if self._use_sparse_prefill(forward_batch, num_qo_tokens=num_qo_tokens):
             metadata.sparse_prefill_cache = self._build_sparse_prefill_chunk_cache(
                 forward_batch, metadata.core_attn_metadata, num_qo_tokens=num_qo_tokens
