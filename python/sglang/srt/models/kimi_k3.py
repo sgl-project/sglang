@@ -38,6 +38,11 @@ from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStatePacker,
 )
 from sglang.srt.layers.communication import k3_ar_fusion, k3_sp_collective
+from sglang.srt.layers.cp.utils import (
+    cp_gather_after_forward,
+    cp_split_before_forward,
+    is_cp_active,
+)
 from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
 from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
@@ -116,6 +121,7 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods import (
     AttnForwardMethod,
 )
+from sglang.srt.models.deepseek_common.moe_transport import _every_row_routed
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA, MoEGate
 from sglang.srt.models.kimi_k3_vl import (
     KimiK3MultiModalProjector,
@@ -137,6 +143,9 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_platform,
     get_spec,
+    linear_attn_parallel_group,
+    linear_attn_tp_rank,
+    linear_attn_tp_size,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import is_hip, is_npu, make_pp_layers
@@ -281,6 +290,14 @@ def _dense_mlp_parallel_group() -> str:
         "attn_tp"
         if get_parallel().enable_dense_mlp_attn_tp and is_dp_attention_enabled()
         else "tp"
+    )
+
+
+def _shards_rows_over_cp(forward_batch: ForwardBatch) -> bool:
+    return (
+        get_parallel().enable_cp_tp_group_sharing
+        and forward_batch.attn_cp_metadata is not None
+        and is_cp_active(forward_batch)
     )
 
 
@@ -1044,33 +1061,40 @@ class KimiK3MoE(nn.Module):
             return self._latent_norm(latent)
         return self._latent_norm(tensor_model_parallel_all_reduce(latent))
 
-    def _gather_shared_expert_inputs(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        group = self._shared_experts_tp_group
+    def _gather_shared_expert_inputs(
+        self, hidden_states: torch.Tensor, *, group=None
+    ) -> torch.Tensor:
+        group = self._shared_experts_tp_group if group is None else group
         # The attention DP buffer spans the entire attention-TP replica.
         # Size this buffer from the subgroup's actual token shards instead.
         with use_symmetric_memory(group, disabled=not is_allocation_symmetric()):
             gathered = hidden_states.new_empty(
                 (hidden_states.shape[0] * group.world_size, *hidden_states.shape[1:])
             )
-        group.all_gather_into_tensor(gathered, hidden_states)
+        group.all_gather_into_tensor(gathered, hidden_states.contiguous())
         return gathered
 
     def _reduce_scatter_shared_experts(
-        self, shared_output: torch.Tensor, hidden_states: torch.Tensor
+        self, shared_output: torch.Tensor, hidden_states: torch.Tensor, *, group=None
     ) -> torch.Tensor:
+        group = self._shared_experts_tp_group if group is None else group
         output = torch.empty_like(hidden_states)
-        self._shared_experts_tp_group.reduce_scatter_tensor(output, shared_output)
+        group.reduce_scatter_tensor(output, shared_output.contiguous())
         return output
 
-    def _forward_shared_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Run TP-sharded shared experts while DeepEP tokens stay scattered."""
-        if not self._shared_experts_tp_comm:
+    def _forward_shared_experts(
+        self, hidden_states: torch.Tensor, *, group=None
+    ) -> torch.Tensor:
+        """Run TP-sharded shared experts on scattered DeepEP or CP tokens."""
+        if group is None and not self._shared_experts_tp_comm:
             return self.shared_experts(hidden_states)
 
-        gathered_hidden_states = self._gather_shared_expert_inputs(hidden_states)
+        gathered_hidden_states = self._gather_shared_expert_inputs(
+            hidden_states, group=group
+        )
         gathered_shared_output = self.shared_experts(gathered_hidden_states)
         return self._reduce_scatter_shared_experts(
-            gathered_shared_output, hidden_states
+            gathered_shared_output, hidden_states, group=group
         )
 
     def _can_overlap_shared_experts_npu(self, hidden_states: torch.Tensor) -> bool:
@@ -1106,6 +1130,8 @@ class KimiK3MoE(nn.Module):
         hidden_states: torch.Tensor,
         *,
         prefix_sum: Optional[torch.Tensor],
+        forward_batch: Optional[ForwardBatch] = None,
+        cp_group=None,
     ) -> torch.Tensor:
         """Front section with three separate GEMMs, each reading
         hidden_states: shared-expert MLP, router gate, latent down-proj."""
@@ -1116,7 +1142,18 @@ class KimiK3MoE(nn.Module):
         # boundaries:
         #   current: front ---------- dispatch ---------- routed GEMMs -- tail
         #   alt:     all-gather ----- shared MLP -------- reduce-scatter
-        fine_grained_overlap = self._can_overlap_shared_experts_npu(hidden_states)
+        # CP reuses the shared-expert side stream, with its collectives on
+        # the current stream. Fine-grained dispatch hooks require DeepEP,
+        # which the CP/TP-sharing configuration does not use.
+        shared_tp_comm = cp_group is not None or self._shared_experts_tp_comm
+        shared_overlap = self._sbo_shared_overlap or (
+            cp_group is not None
+            and self.shared_experts is not None
+            and self.alt_stream is not None
+        )
+        fine_grained_overlap = (
+            cp_group is None and self._can_overlap_shared_experts_npu(hidden_states)
+        )
         shared_input = None
         shared_output = None
         shared_event = None
@@ -1135,20 +1172,24 @@ class KimiK3MoE(nn.Module):
                     shared_input = self._gather_shared_expert_inputs(hidden_states)
                     shared_input.record_stream(self.alt_stream)
                 return
-            if self._sbo_shared_overlap:
+            if shared_overlap:
                 current_stream = torch.cuda.current_stream()
                 # Keep HCCL collectives on the current stream. The alternate
                 # stream only executes the shared-expert MLP.
                 shared_input = hidden_states
-                if self._shared_experts_tp_comm:
-                    shared_input = self._gather_shared_expert_inputs(hidden_states)
+                if shared_tp_comm:
+                    shared_input = self._gather_shared_expert_inputs(
+                        hidden_states, group=cp_group
+                    )
                 shared_input.record_stream(self.alt_stream)
                 self.alt_stream.wait_stream(current_stream)
                 with torch.cuda.stream(self.alt_stream):
                     shared_output = self.shared_experts(shared_input)
                     shared_event = self.alt_stream.record_event()
             else:
-                shared_output = self._forward_shared_experts(hidden_states)
+                shared_output = self._forward_shared_experts(
+                    hidden_states, group=cp_group
+                )
 
         def run_experts(expert_input, topk_output):
             if not fine_grained_overlap:
@@ -1203,20 +1244,22 @@ class KimiK3MoE(nn.Module):
             current_stream = torch.cuda.current_stream()
             current_stream.wait_event(shared_event)
             shared_output.record_stream(current_stream)
-            if self._shared_experts_tp_comm and not fine_grained_overlap:
+            if shared_tp_comm and not fine_grained_overlap:
                 shared_output = self._reduce_scatter_shared_experts(
-                    shared_output, hidden_states
+                    shared_output, hidden_states, group=cp_group
                 )
 
         # Give the NPU shared-expert branch a head start. At this point
         # hidden_states is the decoder layer's post-attention RMSNorm output.
-        if _is_npu and self._sbo_shared_overlap:
+        if _is_npu and shared_overlap:
             issue_shared()
 
         # Front: gate + TopK (+ latent down-proj when merged). Strategy table:
         # kernels/ops/moe/moe_front.py.
-        routed_input = self._ep_front(hidden_states)
-        if routed_input is None and not fine_grained_overlap:
+        # CP routes the gathered physical rows below. The optimized EP
+        # fronts return local TopK results and cannot be used for that layout.
+        routed_input = self._ep_front(hidden_states) if cp_group is None else None
+        if routed_input is None and cp_group is None and not fine_grained_overlap:
             routed_input = self._ep_front_overlap(hidden_states)
         topk_output = None
         if routed_input is not None:
@@ -1226,8 +1269,9 @@ class KimiK3MoE(nn.Module):
             # or tiny_gemm_bf16); non-CUDA falls back to F.linear (bf16). The
             # fp32 logits reach the radix router from moe_fused_gate.
             router_logits = self.gate(hidden_states)
-            topk_output = self.topk(hidden_states, router_logits)
-        if not (_is_npu and self._sbo_shared_overlap):
+            if cp_group is None:
+                topk_output = self.topk(hidden_states, router_logits)
+        if not (_is_npu and shared_overlap):
             issue_shared()
 
         if not self.use_latent_moe:
@@ -1253,25 +1297,46 @@ class KimiK3MoE(nn.Module):
                 routed_input = hidden_states.new_empty((0, self.moe_hidden_size))
             else:
                 routed_input, _ = self.routed_expert_down_proj(hidden_states)
-        expert_output = run_experts(routed_input, topk_output)
+        if cp_group is not None:
+            # Keep replicated projections local; only the TP experts need
+            # matching rows on every rank. Shared GEMMs can overlap these
+            # gathers and the routed experts on the existing side stream.
+            routed_local = routed_input
+            routed_input = self._gather_shared_expert_inputs(
+                routed_local, group=cp_group
+            )
+            router_logits = self._gather_shared_expert_inputs(
+                router_logits, group=cp_group
+            )
+            # Rank blocks contain interspersed padding, not a single suffix.
+            # Route every physical row and discard padding at the CP exit.
+            with _every_row_routed(forward_batch, routed_input.shape[0]):
+                topk_output = self.topk(routed_input, router_logits)
+                expert_output = run_experts(routed_input, topk_output)
+        else:
+            expert_output = run_experts(routed_input, topk_output)
         if expert_output.shape[0] == 0:
             # The EP combine returns one row per source token.  Keep the
             # source-side empty result while avoiding empty RMSNorm/up-proj
             # launches; the collective itself has already completed above.
             out = hidden_states.new_empty((0, hidden_states.shape[1]))
         else:
-            latent = self._reduce_latent(expert_output)
+            if cp_group is not None:
+                # Complete the TP sum before the nonlinear norm, returning
+                # just this rank's rows for the replicated up projection.
+                latent = self._reduce_scatter_shared_experts(
+                    expert_output, routed_local, group=cp_group
+                )
+                latent = self._latent_norm(latent)
+            else:
+                latent = self._reduce_latent(expert_output)
             # up_proj is replicated, so the routed output is now fully reduced.
             out, _ = self.routed_expert_up_proj(latent)
         wait_and_finalize_shared_experts()
         if shared_output is not None:
             # tp1 shared experts (SP-MoE) are complete per-rank; TP-sharded
             # ones need the partial-sum reduction.
-            if (
-                self.tp_size > 1
-                and not self._shared_experts_tp1
-                and not self._shared_experts_tp_comm
-            ):
+            if self.tp_size > 1 and not self._shared_experts_tp1 and not shared_tp_comm:
                 shared_output = self._reduce_shared(shared_output)
             out = _add3(out, shared_output, prefix_sum)
             return out
@@ -1516,6 +1581,7 @@ class KimiK3MoE(nn.Module):
         hidden_states: torch.Tensor,
         *,
         prefix_sum: Optional[torch.Tensor] = None,
+        forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
         """A latent MoE, which writes the next stream itself, takes the pending
         prefix_sum: folded into the 3-way JIT tail add when covered, plain adds
@@ -1523,10 +1589,28 @@ class KimiK3MoE(nn.Module):
         residual add to its stage boundary and takes none."""
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
-        if hidden_states.shape[0] > 0 and self._eligible_for_fused_front:
+        cp_group = None
+        if (
+            self.use_latent_moe
+            and forward_batch is not None
+            and _shards_rows_over_cp(forward_batch)
+        ):
+            cp_group = get_parallel().attn_cp_group
+        # The fused front/tail assumes replicated TP rows and all-reduce.
+        # CP must use the unfused gather/reduce-scatter schedule instead.
+        if (
+            cp_group is None
+            and hidden_states.shape[0] > 0
+            and self._eligible_for_fused_front
+        ):
             out = self._forward_fused(hidden_states, prefix_sum=prefix_sum)
         else:
-            out = self._forward_unfused(hidden_states, prefix_sum=prefix_sum)
+            out = self._forward_unfused(
+                hidden_states,
+                prefix_sum=prefix_sum,
+                forward_batch=forward_batch,
+                cp_group=cp_group,
+            )
         return out.view(num_tokens, hidden_size)
 
 
@@ -1558,10 +1642,11 @@ class KimiK3DeltaAttention(nn.Module):
             else 0
         )
         self.tp_size = get_parallel().tp_size
-        # KDA is an attention layer: head-sharded params follow the
-        # attention-TP group, matching the mamba state cache sizing.
-        self.attn_tp_size = get_parallel().attn_tp_size
-        self.attn_tp_rank = get_parallel().attn_tp_rank
+        # CP keeps the complete sequence and distributes linear heads over TP.
+        # Retain the group in projections and loaders as well as cache sizing.
+        self.attn_tp_size = linear_attn_tp_size()
+        self.attn_tp_rank = linear_attn_tp_rank()
+        parallel_group = linear_attn_parallel_group()
         self.hidden_size = hidden_size
         self.config = config
         self.head_dim = config.linear_attn_config["head_dim"]
@@ -1608,7 +1693,7 @@ class KimiK3DeltaAttention(nn.Module):
                 ],
                 bias=False,
                 quant_config=quant_config,
-                parallel_group="attn_tp",
+                parallel_group=parallel_group,
                 prefix=f"{prefix}.fused_qkvg_proj",
             )
             self.split_sizes = [
@@ -1620,7 +1705,7 @@ class KimiK3DeltaAttention(nn.Module):
                 self.num_heads,
                 bias=False,
                 quant_config=quant_config,
-                parallel_group="attn_tp",
+                parallel_group=parallel_group,
                 prefix=f"{prefix}.b_proj",
                 # TP8 shards K3's 96 beta rows below the 128-row FP8 block.
                 skip_block_quant_check=self._bfa_uses_block_fp8,
@@ -1637,7 +1722,7 @@ class KimiK3DeltaAttention(nn.Module):
                 projection_size,
                 bias=False,
                 quant_config=quant_config,
-                parallel_group="attn_tp",
+                parallel_group=parallel_group,
                 prefix=f"{prefix}.f_b_proj",
             )
             # Merged [f_a | b] weight, built after weight loading by
@@ -1690,7 +1775,7 @@ class KimiK3DeltaAttention(nn.Module):
                 self.num_k_heads,
                 bias=False,
                 quant_config=quant_config,
-                parallel_group="attn_tp",
+                parallel_group=parallel_group,
                 v_head_size=self.head_v_dim,
                 prefix=f"{prefix}.qkv_proj",
             )
@@ -1707,7 +1792,7 @@ class KimiK3DeltaAttention(nn.Module):
                 projection_size,
                 bias=False,
                 quant_config=quant_config,
-                parallel_group="attn_tp",
+                parallel_group=parallel_group,
                 prefix=f"{prefix}.f_b_proj",
             )
             self.b_proj = ColumnParallelLinear(
@@ -1715,7 +1800,7 @@ class KimiK3DeltaAttention(nn.Module):
                 self.num_heads,
                 bias=False,
                 quant_config=quant_config,
-                parallel_group="attn_tp",
+                parallel_group=parallel_group,
                 prefix=f"{prefix}.b_proj",
             )
 
@@ -1725,7 +1810,7 @@ class KimiK3DeltaAttention(nn.Module):
                     projection_size,
                     bias=False,
                     quant_config=quant_config,
-                    parallel_group="attn_tp",
+                    parallel_group=parallel_group,
                     prefix=f"{prefix}.g_proj",
                 )
             else:
@@ -1741,7 +1826,7 @@ class KimiK3DeltaAttention(nn.Module):
                     projection_size,
                     bias=False,
                     quant_config=quant_config,
-                    parallel_group="attn_tp",
+                    parallel_group=parallel_group,
                     prefix=f"{prefix}.g_b_proj",
                 )
 
@@ -1750,7 +1835,7 @@ class KimiK3DeltaAttention(nn.Module):
         )
         set_weight_attrs(
             self.dt_bias,
-            {"weight_loader": sharded_weight_loader(0, parallel_group="attn_tp")},
+            {"weight_loader": sharded_weight_loader(0, parallel_group=parallel_group)},
         )
 
         self.qkv_conv1d = MergedColumnParallelLinear(
@@ -1758,7 +1843,7 @@ class KimiK3DeltaAttention(nn.Module):
             output_sizes=[projection_size, projection_size, projection_size],
             bias=False,
             params_dtype=torch.float32,
-            parallel_group="attn_tp",
+            parallel_group=parallel_group,
             prefix=f"{prefix}.qkv_conv1d",
         )
         self.qkv_conv1d.weight.data = self.qkv_conv1d.weight.data.unsqueeze(1)
@@ -1798,17 +1883,19 @@ class KimiK3DeltaAttention(nn.Module):
             # The stage boundary completes the attention-TP sum.
             reduce_results=False,
             quant_config=quant_config,
-            parallel_group="attn_tp",
+            parallel_group=parallel_group,
             # Symmetric memory of the attention-TP group, which sums the output;
             # off under all_reduce_fusion, whose caller owns the output buffer.
-            use_dp_attention_reduce=not self.all_reduce_fusion,
+            use_dp_attention_reduce=(
+                not self.all_reduce_fusion and parallel_group == "attn_tp"
+            ),
             prefix=f"{prefix}.o_proj",
         )
         if self.all_reduce_fusion and not _o_proj_takes_output(self.o_proj):
             # the fused AR reduces o_proj's output in place out of a symmetric
             # buffer, which needs the GEMM to write into caller-owned storage
             self.all_reduce_fusion = False
-            self.o_proj.use_dp_attention_reduce = True
+            self.o_proj.use_dp_attention_reduce = parallel_group == "attn_tp"
         conv_weights = self.qkv_conv1d.weight.squeeze(1)
         bias = self.qkv_conv1d.bias
 
@@ -2582,18 +2669,36 @@ def _stage_facts(
                 else bank.ffn_update
             ),
         )
+    latent_cp = (
+        get_parallel().enable_cp_tp_group_sharing
+        and is_moe
+        and _uses_latent_moe(config)
+    )
+    if latent_cp:
+        # K3 owns the latent MoE's expert gather and reduction. The boundary
+        # sees complete local input/output rows, not TP1 expert weights.
+        # Actual dense layers declare their own compute width below.
+        dense_tp_size = 1
+    elif is_moe:
+        dense_tp_size = None
+    else:
+        dense_tp_size = resolve_linear_parallel_group(_dense_mlp_parallel_group())[1]
     return (
-        declare_attn(**attn_ops),
+        declare_attn(
+            **attn_ops,
+            tp_group=(
+                SumGroup.TP
+                if config.is_kda_layer(layer_idx)
+                and linear_attn_parallel_group() == "tp"
+                else SumGroup.ATTN_TP
+            ),
+            in_token_order=config.is_kda_layer(layer_idx),
+        ),
         declare_ffn(
             **ffn_ops,
-            sparse=is_moe,
+            sparse=is_moe and not latent_cp,
             next_layer_sparse=_is_moe_layer(config, layer_idx + 1),
-            # The TP width the dense MLP is built with.
-            dense_tp_size=(
-                None
-                if is_moe
-                else resolve_linear_parallel_group(_dense_mlp_parallel_group())[1]
-            ),
+            dense_tp_size=dense_tp_size,
             # A latent MoE completes its output sum together with
             # the latent reduction its norm needs.
             output_complete=is_moe and _uses_latent_moe(config),
@@ -2801,7 +2906,17 @@ class KimiK3DecoderLayer(nn.Module):
         )
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
-        if self._ffn_writes_stream:
+        if self._is_moe_layer and self.mlp.use_latent_moe:
+            hidden_states = self.mlp(
+                hidden_states,
+                forward_batch=forward_batch,
+                prefix_sum=(
+                    residual_batch.written_residual(forward_batch)
+                    if self._ffn_writes_stream
+                    else None
+                ),
+            )
+        elif self._ffn_writes_stream:
             hidden_states = self.mlp(
                 hidden_states,
                 prefix_sum=residual_batch.written_residual(forward_batch),
@@ -2938,6 +3053,12 @@ class KimiK3LinearModel(nn.Module):
                 pp_proxy_tensors, forward_batch
             )
 
+        shards_rows = _shards_rows_over_cp(forward_batch)
+        if shards_rows:
+            hidden_states, positions = cp_split_before_forward(
+                hidden_states, positions, forward_batch
+            )
+
         total_num_layers = self.end_layer - self.start_layer
         device = hidden_states.device
         zero_allocator = BumpAllocator(
@@ -3033,6 +3154,8 @@ class KimiK3LinearModel(nn.Module):
         )
         if self.attn_bank is not None:
             self.attn_bank.close()
+        if shards_rows:
+            hidden_states = cp_gather_after_forward(hidden_states, forward_batch)
 
         if packs_aux:
             return hidden_states, aux_hidden_states.finalize()

@@ -4,11 +4,16 @@ for hybrid linear-attention models where the CP group is the TP group."""
 
 from typing import Any
 
-from sglang.srt.arg_groups.model_override_base import resolved_view, resolving_view
+from sglang.srt.arg_groups.model_override_base import (
+    attention_backends_of,
+    resolved_view,
+    resolving_view,
+)
 from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
+from sglang.srt.runtime_context import get_platform
 
 # Architectures whose model code implements CP-TP group sharing: the CP group
 # is the TP group, the residual stream / attention / indexer are CP-sharded,
@@ -16,19 +21,29 @@ from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_pha
 # gathers the sequence where its recurrence needs it). Model ports register
 # here; every other model keeps the ordinary prefill CP path.
 _SUPPORTED_MODELS: set[str] = {
+    # GLM
     "Glm5NextForConditionalGeneration",
+    # Qwen
     "Qwen4ExpForConditionalGeneration",
+    # Kimi
+    "KimiLinearForCausalLM",
+    "KimiK3LinearForCausalLM",
+    "KimiK3ForConditionalGeneration",
 }
 
 
 def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
     cfg, view = resolving_view(server_args), resolved_view(server_args)
-    if (
-        not cfg.enable_prefill_cp
-        or view.attn_cp_size <= 1
-        or model.hf_config.architectures[0] not in _SUPPORTED_MODELS
-    ):
+    if not cfg.enable_prefill_cp or view.attn_cp_size <= 1:
         return
+    architecture = model.hf_config.architectures[0]
+    if architecture not in _SUPPORTED_MODELS:
+        if mambaish_config(model) is not None:
+            raise ValueError(
+                f"Linear-attention prefill CP is not integrated with {architecture}."
+            )
+        return
+    is_kimi = architecture.startswith("Kimi")
     # Attention DP or attention TP would leave the CP group narrower than TP.
     if view.attn_cp_size != cfg.tp_size:
         raise ValueError(
@@ -66,8 +81,9 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
         "dcp-size > 1": cfg.dcp_size > 1,
         "enable-mixed-chunk": cfg.enable_mixed_chunk,
         "moe-dp-size > 1": cfg.moe_dp_size > 1,
+        "attn-dp-size > 1": view.attn_dp_size > 1,
     }
-    if model.hf_config.architectures[0] == "Qwen4ExpForConditionalGeneration":
+    if architecture == "Qwen4ExpForConditionalGeneration" or is_kimi:
         unsupported |= {
             # The MoE runs TP experts on rows gathered over the TP group.
             # Waterfill turns on DeepEP and EP after this hook.
@@ -78,6 +94,10 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
             # Prefill only: a decode node serves plain TP.
             "disaggregation-mode decode": cfg.disaggregation_mode == "decode",
         }
+        if is_kimi:
+            unsupported["disaggregation-mode != null"] = (
+                cfg.disaggregation_mode != "null"
+            )
     elif model.hf_config.architectures[0] == "Glm5NextForConditionalGeneration":
         if cfg.disaggregation_mode != "null":
             unsupported |= {
@@ -102,6 +122,26 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
         )
 
     linear_config = mambaish_config(model)
+    if architecture.startswith("KimiK3"):
+        prefill_backend, _ = attention_backends_of(view)
+        if prefill_backend not in ("fa3", "fa4"):
+            raise ValueError(
+                "Kimi-K3 prefill CP requires --prefill-attention-backend fa3 or fa4 "
+                "(or --attention-backend fa3 or fa4) for absorbed MLA."
+            )
+        if prefill_backend == "fa4":
+            if not get_platform().is_sm100_or_sm110:
+                raise ValueError(
+                    "Kimi-K3 prefill CP with fa4 requires SM100/SM110 for absorbed MLA."
+                )
+            if (
+                linear_config.kv_lora_rank != 512
+                or linear_config.qk_rope_head_dim != 64
+            ):
+                raise ValueError(
+                    "Kimi-K3 prefill CP with fa4 requires kv_lora_rank=512 "
+                    "and qk_rope_head_dim=64."
+                )
     if getattr(linear_config, "linear_num_key_heads", None) is not None:
         heads = {
             name: getattr(linear_config, name)
@@ -117,8 +157,8 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
             )
 
     fields = {"enable_cp_tp_group_sharing": True}
-    if model.hf_config.architectures[0] == "Qwen4ExpForConditionalGeneration":
-        # Qwen's sequence collectives still have batch-dependent sizes.
+    if architecture != "Glm5NextForConditionalGeneration":
+        # These sequence collectives still have batch-dependent sizes.
         fields["cuda_graph_config"] = with_phase(
             cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
         )
