@@ -7,7 +7,7 @@ import sglang.srt
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=23, suite="base-a-test-cpu")
+register_cpu_ci(est_time=34, suite="base-a-test-cpu")
 
 
 class TestNgramMambaVerifyUpdate(CustomTestCase):
@@ -17,7 +17,10 @@ class TestNgramMambaVerifyUpdate(CustomTestCase):
         target_worker.model_runner.attn_backend.update_mamba_state_after_mtp_verify = (
             MagicMock()
         )
-        mamba_pool = target_worker.model_runner.req_to_token_pool.mamba_pool
+        mamba_pool = MagicMock()
+        # The runner's KV pool router binds the state pool.
+        router = target_worker.model_runner.token_to_kv_pool.layer_router
+        router.part_view.return_value = mamba_pool
         mamba_pool.replayssm_spec_fold = False
         mamba_pool.replayssm_cache_base = None
         return target_worker
@@ -205,13 +208,16 @@ class TestPPReplaySSMVerifySourceRows(CustomTestCase):
 
         target_worker = MagicMock()
         req_pool = target_worker.model_runner.req_to_token_pool
-        req_pool.mamba_pool.replayssm_spec_fold = False
-        req_pool.mamba_pool.replayssm_is_kda = False
-        req_pool.mamba_pool.replayssm_cache_base = torch.empty(1)
+        mamba_pool = MagicMock()
+        router = target_worker.model_runner.token_to_kv_pool.layer_router
+        router.part_view.return_value = mamba_pool
+        mamba_pool.replayssm_spec_fold = False
+        mamba_pool.replayssm_is_kda = False
+        mamba_pool.replayssm_cache_base = torch.empty(1)
         req_pool.get_mamba_indices.return_value = torch.tensor(
             [5, 7], dtype=torch.int32
         )
-        req_pool.get_speculative_mamba2_params_all_layers.return_value = (
+        mamba_pool.get_speculative_mamba2_params_all_layers.return_value = (
             self._spec_state()
         )
         batch = MagicMock()

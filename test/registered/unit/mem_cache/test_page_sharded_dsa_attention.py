@@ -34,7 +34,7 @@ from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase, publish_build_topology
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
-register_cuda_ci(est_time=120, stage="base-c", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=120, stage="extra-b", runner_config="4-gpu-b200")
 
 
 # =============================================================================
@@ -690,6 +690,7 @@ def _attention_backend(pool, req_to_token, device, prefill_impl="flashmla_sparse
     backend.dsa_index_kpool = 1
     backend.dsa_index_topk = 2048
     backend.dsa_topk_backend = DSATopKBackend.SGL_KERNEL
+    backend.dsa_packed_extend_topk = False
     backend.physical_page_size = 64
     backend.use_mha = False
     backend.use_fused_topk = False
@@ -755,7 +756,7 @@ class _MetadataShardPool(PageInterleaveKVPoolMixin):
 class TestShardedDSAMetadata(unittest.TestCase):
     def test_cp_request_filtering_keeps_both_address_spaces_aligned(self):
         from sglang.srt.layers.attention import dsa_backend
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.model_executor.forward_mode import ForwardMode
 
         lengths = torch.tensor([129, 65, 193])
         req_ids = torch.tensor([2, 0, 4])
@@ -814,16 +815,16 @@ class TestShardedDSAMetadata(unittest.TestCase):
         self.assertIs(pool.begin_args[1], req_ids)
         self.assertEqual(pool.begin_args[2], [128, 64, 192])
 
-    def test_prefill_cp_shard_keeps_the_legacy_topk(self):
-        """On CUDA the packed prefill top-k takes an unsharded batch, never a CP
-        shard. ROCm takes the packed kernel for both, as it already did."""
+    def test_prefill_cp_shard_topk_route(self):
+        """The packed prefill top-k takes an unsharded batch, and a CP shard only
+        with packed_extend_topk."""
         import sys
         import types
         from unittest.mock import MagicMock
 
         from sglang.srt.layers.attention import dsa_backend
         from sglang.srt.layers.attention.dsa import dsa_topk_backend
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.model_executor.forward_mode import ForwardMode
 
         # Two requests extend 3 and 2 tokens over 7 and 4 keys. Rank 1 of an
         # interleaved CP2 holds batch tokens 1 and 3: one of each request.
@@ -838,16 +839,17 @@ class TestShardedDSAMetadata(unittest.TestCase):
                 torch.tensor([0, 1]),
             ),
         )
-        # (is_hip, cp_sharded, (packed, legacy) calls). ROCm's packed branch
-        # predates the CP check and ignores it, so ROCm sends both batches there.
+        # (packed_extend_topk, cp_sharded, (packed, legacy) calls)
         cases = (
             (False, False, (1, 0)),
             (False, True, (0, 1)),
             (True, False, (1, 0)),
             (True, True, (1, 0)),
         )
-        for is_hip, cp_sharded, want_calls in cases:
-            with self.subTest(is_hip=is_hip, cp_sharded=cp_sharded):
+        for packed_extend_topk, cp_sharded, want_calls in cases:
+            with self.subTest(
+                packed_extend_topk=packed_extend_topk, cp_sharded=cp_sharded
+            ):
                 batch = SimpleNamespace(
                     forward_mode=ForwardMode.EXTEND,
                     batch_size=2,
@@ -864,6 +866,7 @@ class TestShardedDSAMetadata(unittest.TestCase):
                     dsa_kv_cache_store_fp8=True, dtype=torch.float8_e4m3fn
                 )
                 backend = _attention_backend(pool, req_to_token, "cpu")
+                backend.dsa_packed_extend_topk = packed_extend_topk
                 # trtllm prefill with an fp8 cache: the PAGED top-k transform.
                 backend.dsa_prefill_impl = "trtllm"
                 backend.use_fused_topk = True
@@ -893,7 +896,6 @@ class TestShardedDSAMetadata(unittest.TestCase):
                     envs.SGLANG_DSA_FUSE_TOPK.override(True),
                     envs.SGLANG_OPT_USE_TOPK_V2.override(True),
                     patch.dict(sys.modules, {"sgl_kernel": sgl_kernel}),
-                    patch.object(dsa_topk_backend, "_is_hip", is_hip),
                     patch.object(
                         dsa_topk_backend, "_topk_transform_v2_packed"
                     ) as packed,
@@ -972,7 +974,7 @@ def _real_indexer_topk(check, backends, batch, layer_id, query, weights):
 def _check_attention_batch(check, requests, *, generation, prefill_impl, topk_backend):
     from sglang.srt.layers.attention.dsa import dsa_indexer
     from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
-    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.model_executor.forward_mode import ForwardMode
 
     device = check.device
     lengths = [length for _, _, length in requests]
