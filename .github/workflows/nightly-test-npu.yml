@@ -2,6 +2,12 @@ name: Nightly Test (NPU)
 on:
   schedule:
     - cron: '0 16 * * *'  # Execute at 0:00 a.m. Beijing Time every day
+  # Uncomment to trigger the nightly pipeline from a PR that modifies this workflow.
+  # pull_request:
+  #   branches:
+  #     - main
+  #   paths:
+  #     - ".github/workflows/nightly-test-npu.yml"
   workflow_dispatch:
     inputs:
       ref:

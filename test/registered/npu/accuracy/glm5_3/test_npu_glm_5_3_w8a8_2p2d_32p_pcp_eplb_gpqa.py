@@ -97,10 +97,11 @@ GLM_5_3_PCP_EPLB_PD_SEP_PREFILL_ARGS = [
     65536,
     "--context-length",
     220000,
+    # AO-A2A-01: ascend_ops with explicit all-default config, plus EPLB below
     "--moe-a2a-backend",
-    "deepep",
-    "--deepep-mode",
-    "normal",
+    "ascend_ops",
+    "--moe-ascend-ops-config",
+    '{"prefill":"alltoallv","decode":"low_latency","ll_dispatch_alg":"fullmesh_v1","ll_combine_alg":""}',
     "--disable-shared-experts-fusion",
     "--disable-cuda-graph",
     "--dtype",
@@ -110,8 +111,6 @@ GLM_5_3_PCP_EPLB_PD_SEP_PREFILL_ARGS = [
     1,
     "--pp-size",
     4,
-    "--speculative-draft-model-quantization",
-    "unquant",
     "--speculative-algorithm",
     "NEXTN",
     "--speculative-num-steps",
@@ -167,10 +166,11 @@ GLM_5_3_PCP_EPLB_PD_SEP_DECODE_ARGS = [
     "--tool-call-parser",
     "glm47",
     "--enable-metrics",
+    # AO-A2A-01: ascend_ops with explicit all-default config, plus EPLB below
     "--moe-a2a-backend",
-    "deepep",
-    "--deepep-mode",
-    "low_latency",
+    "ascend_ops",
+    "--moe-ascend-ops-config",
+    '{"prefill":"alltoallv","decode":"low_latency","ll_dispatch_alg":"fullmesh_v1","ll_combine_alg":""}',
     "--cuda-graph-max-bs-decode",
     8,
     "--disaggregation-transfer-backend",
@@ -184,8 +184,6 @@ GLM_5_3_PCP_EPLB_PD_SEP_DECODE_ARGS = [
     "--disable-shared-experts-fusion",
     "--dtype",
     "bfloat16",
-    "--speculative-draft-model-quantization",
-    "unquant",
     "--load-balance-method",
     "round_robin",
     "--speculative-algorithm",
@@ -230,6 +228,8 @@ GLM_5_3_PCP_EPLB_PD_SEP_MODEL_CONFIG = {
 # PCP variant with EPLB
 # 4-node PD separation, prefill tp8 + attn-cp8 (interleave) + pp4,
 # decode tp32/dp32/ep32, EPLB enabled on both P and D with GLM-5.3-w8a8
+# MoE A2A backend: AO-A2A-01 ascend_ops (all-default: prefill=alltoallv,
+# decode=low_latency) on both P and D
 class TestNPUGLM5_3_W8A8_2P2D_PCP_EPLB_GPQA(TestNpuAccuracyMultiNodePdSepTestCaseBase):
     """Test NPU accuracy for GLM-5.3-w8a8 PD separation 2p2d with PCP and EPLB on gpqa_diamond"""
 
