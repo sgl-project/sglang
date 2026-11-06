@@ -148,3 +148,7 @@ def test_qsa_multimem_owner_pipeline_eager_and_cuda_graph():
     if torch.cuda.device_count() < 4 or torch.cuda.get_device_capability()[0] != 9:
         pytest.skip("four SM90 CUDA devices are required")
     mp.spawn(_worker, args=(4, find_available_port(29500)), nprocs=4, join=True)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
