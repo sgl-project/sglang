@@ -68,7 +68,7 @@ def static_budget_bytes(kv_configurator, pre_model_load_memory: float) -> int:
     non-static slack and the multimodal reserve, as the KV configurator measures it (its other
     terms are for multi-GPU and post-capture KV sizing, which paged experts do not run)."""
     from sglang.srt.mem_cache.kv_cache_configurator import mm_runtime_reservation_gb
-    from sglang.srt.utils.common import get_available_gpu_memory
+    from sglang.srt.utils.device import get_available_gpu_memory
 
     gc.collect()
     free_gb = get_available_gpu_memory(kv_configurator.device, kv_configurator.gpu_id)
