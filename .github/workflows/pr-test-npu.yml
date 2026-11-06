@@ -946,11 +946,6 @@ jobs:
           echo "Coverage dir: ${COV_ROOT}"
           echo "Source dir: ${COVSTUB}"
 
-          # This job exists to produce the test case map and the OBS baseline,
-          # and the recommend job hard-depends on them — there is no useful
-          # "skip" path. Missing coverage data is a collection failure and must
-          # go red here rather than silently leave the previous baseline in
-          # place (the action would also emit an empty {} map in that case).
           if [ ! -d "${COV_ROOT}" ]; then
             echo "::error::Coverage dir not found: ${COV_ROOT}; cannot build the test case map"
             exit 1
