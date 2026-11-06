@@ -13,6 +13,7 @@ import torch_npu
 from sgl_kernel_npu.operators import attention as npu_attention_ops
 from sgl_kernel_npu.operators import indexer as npu_indexer_ops
 from sgl_kernel_npu.operators import mem_cache as npu_cache_ops
+from sgl_kernel_npu.operators.utils import transformer_compat as npu_transformer_compat
 
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
@@ -1312,27 +1313,27 @@ class DeepseekV4AscendAttnBackend(
             (max_bs, max_pages), -1, dtype=torch.int32, device=device
         )
 
-        # Opaque metadata sizes belong to the selected kernel implementation.
-        # Query each API before capture instead of assuming a shared SDK ABI.
-        kernel_metadata = self._kernel_metadata_from_parts(
-            bs=max_bs,
-            actual_seq_lengths_q_pa=torch.arange(
-                max_bs + 1, dtype=torch.int32, device=device
-            ),
-            # Keep compressed KV lengths positive for both c4 and c128 probes.
-            actual_seq_lengths_kv=torch.full(
-                (max_bs,), 128, dtype=torch.int32, device=device
-            ),
-            forward_metadata=SimpleNamespace(
-                ori_sparse_indices=None,
-                ori_mask_mode=4,
-                ori_win_left=self._dsv4_sliding_window_size - 1,
-                ori_win_right=0,
-            ),
+        # Allocation uses the kernel-owned ABI; do not execute metadata kernels
+        # on temporary synthetic inputs merely to discover their output shapes.
+        attention_metadata_size = npu_transformer_compat.get_transformer_metadata_size(
+            "mixed_quant_sparse_flash_mla_metadata"
+            if is_npu_arch35()
+            else "sparse_flash_mla_metadata"
         )
-        for key, value in kernel_metadata.items():
-            graph_key = "kernel_metadata_" + key.removesuffix("_metadata")
-            self.graph_metadata[graph_key] = torch.zeros_like(value, device=device)
+        metadata_sizes = {"kernel_metadata_c1a": attention_metadata_size}
+        if self._dsv4_has_c4:
+            metadata_sizes["kernel_metadata_c4a"] = attention_metadata_size
+            metadata_sizes["kernel_metadata_li_quant"] = (
+                npu_transformer_compat.get_transformer_metadata_size(
+                    "quant_lightning_indexer_metadata"
+                )
+            )
+        if self._dsv4_has_c128:
+            metadata_sizes["kernel_metadata_c128a"] = attention_metadata_size
+        for key, size in metadata_sizes.items():
+            self.graph_metadata[key] = torch.zeros(
+                size, dtype=torch.int32, device=device
+            )
 
         self.graph_metadata["c4_topk_indices"] = torch.full(
             (max_num_tokens, self._dsv4_index_topk),
@@ -2208,9 +2209,8 @@ class DeepseekV4AscendAttnBackend(
         bs: int,
         actual_seq_lengths_q_pa: torch.Tensor,
         actual_seq_lengths_kv: torch.Tensor,
-        forward_metadata: Optional[ForwardMetadata] = None,
     ) -> dict:
-        fm = self.forward_metadata if forward_metadata is None else forward_metadata
+        fm = self.forward_metadata
         common = {
             **_sparse_attn_kv_quant_kwargs(),
             "cu_seqlens_q": actual_seq_lengths_q_pa,
