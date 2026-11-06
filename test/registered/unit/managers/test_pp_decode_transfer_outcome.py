@@ -14,7 +14,10 @@ from unittest.mock import MagicMock, patch
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.common.conn import KVTransferError
 from sglang.srt.disaggregation.decode import DecodeTransferQueue
-from sglang.srt.managers.scheduler_components.request_list import ListKind
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    ListKind,
+)
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.scheduler_test_utils import FakeReq, decode_queue
@@ -112,8 +115,8 @@ def _transfer_queue(decode_reqs):
     queue._clean_hicache_prefetch_resources = MagicMock()
     queue._commit_transfer_to_req = MagicMock()
     queue._record_transfer_failure = MagicMock()
-    queue._release_request = MagicMock()
     queue.scheduler = SimpleNamespace(
+        request_retirer=MagicMock(),
         enable_decode_hicache=False,
         enable_hisparse=False,
         metrics_reporter=SimpleNamespace(enable_metrics=False),
@@ -137,7 +140,6 @@ class TestPopTransferredFollowsConsensusOutcome(CustomTestCase):
                 },
             ),
             ("sglang.srt.disaggregation.decode.prepare_abort", {}),
-            ("sglang.srt.disaggregation.decode.release_kv_cache", {}),
         ):
             patcher = patch(target, **kwargs)
             patcher.start()
@@ -155,7 +157,9 @@ class TestPopTransferredFollowsConsensusOutcome(CustomTestCase):
         self.assertEqual(outcomes, {"s": False, "f": True})
         self.assertEqual(list(queue.queue.items()), [not_yet_agreed])
         queue._commit_transfer_to_req.assert_called_once_with(admitted)
-        queue._release_request.assert_called_once_with(failed_elsewhere)
+        queue.scheduler.request_retirer.release.assert_called_once_with(
+            failed_elsewhere.req, checkpoint=False
+        )
         queue._record_transfer_failure.assert_called_once_with(
             "Failed due to an unknown reason from another rank"
         )
@@ -187,13 +191,13 @@ class TestProcessDecodeTransferQueueForwardsOutcomes(CustomTestCase):
                 ),
             ),
             enable_hisparse=False,
-            waiting_queue=[],
+            waiting_queue=IndexedReqList(ListKind.WAITING),
         )
         forwarded = SchedulerPPMixin.process_decode_transfer_queue(
             scheduler, {"s": False, "f": True, "h": False}
         )
         self.assertEqual(forwarded, {"s": False, "f": True})
-        self.assertEqual(scheduler.waiting_queue, [admitted])
+        self.assertEqual(list(scheduler.waiting_queue), [admitted])
 
     def test_no_consensus_means_nothing_to_forward(self):
         scheduler = SimpleNamespace(

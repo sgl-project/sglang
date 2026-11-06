@@ -23,6 +23,7 @@ def make_backend(*, dflash=False, dspark=False, width=1, bs=4, raw_bs=2):
         captured_req_width=width,
         capture_forward_mode=SimpleNamespace(is_target_verify=lambda: True),
         model_runner=SimpleNamespace(
+            kv_cache_configurator=SimpleNamespace(modelslim_cache_layout=None),
             model_config=SimpleNamespace(
                 hf_config=SimpleNamespace(architectures=["DeepseekV3ForCausalLM"])
             ),

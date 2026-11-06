@@ -7,12 +7,14 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
+from sglang.srt.runtime_context import reset_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import (
     FakeKVCache,
     FakeUnifiedSWAKVPool,
     arena_of,
+    setup_allocator_context,
     stand_in_views,
     tri_sub_pool_specs,
 )
@@ -124,6 +126,11 @@ def payload(a, kv, mk):
 
 
 class TestFloatMovementGate(CustomTestCase):
+    def setUp(self):
+        # The pool fixtures read the published server args and parallel config.
+        setup_allocator_context()
+        self.addCleanup(reset_context)
+
     def check_saved(self, a, saved):
         for member, buf, ids, values in saved:
             self.assertTrue(
