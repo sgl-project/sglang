@@ -4473,8 +4473,8 @@ class AiterAttnBackend(AttentionBackend):
             # default aiter backend take it; topk>1 and the kill switch fall
             # through to the padded CK path below.
             if (
-                self._use_unified_draft_extend
-                and forward_batch.forward_mode.is_draft_extend_v2()
+                forward_batch.forward_mode.is_draft_extend_v2()
+                and self._use_unified_draft_extend
             ):
                 bs = forward_batch.batch_size
                 if layer.qk_head_dim != layer.v_head_dim:
