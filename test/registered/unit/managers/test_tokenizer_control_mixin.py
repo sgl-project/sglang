@@ -5,7 +5,13 @@ import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from sglang.srt.managers import tokenizer_control_mixin
-from sglang.srt.managers.io_struct import ProfileReq, ProfileReqOutput, ProfileReqType
+from sglang.srt.managers.io_struct import (
+    ProfileReq,
+    ProfileReqOutput,
+    ProfileReqType,
+    ReleaseMemoryOccupationReqInput,
+    ReleaseMemoryOccupationReqOutput,
+)
 from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
 from sglang.srt.platforms.interface import SRTPlatform
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -55,6 +61,23 @@ class TestStartProfilePlatformDefaults(CustomTestCase):
                 self.assertFalse(sent.with_stack)
                 self.assertFalse(sent.record_shapes)
                 self.assertEqual(sent.num_steps, 2)
+
+
+class TestReleaseMemoryOccupation(CustomTestCase):
+    def test_refused_release_raises_on_the_caller(self):
+        manager = MagicMock()
+        manager.release_memory_occupation_communicator = AsyncMock(
+            return_value=[
+                ReleaseMemoryOccupationReqOutput(success=True, message="Success"),
+                ReleaseMemoryOccupationReqOutput(success=False, message="busy"),
+            ]
+        )
+        with self.assertRaisesRegex(RuntimeError, "busy"):
+            asyncio.run(
+                TokenizerControlMixin.release_memory_occupation(
+                    manager, ReleaseMemoryOccupationReqInput()
+                )
+            )
 
 
 if __name__ == "__main__":

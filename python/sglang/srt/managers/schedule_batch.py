@@ -1820,17 +1820,39 @@ def retract_all(
     request_retirer: RequestRetirer,
     offload_kv: bool = True,
 ) -> List[Req]:
-    """Returns the requests that cannot be resumed."""
+    """Returns the requests that cannot be resumed, each with its abort reason
+    recorded. Beam groups cannot be requeued, so their leaders are among them."""
     unresumable = []
-    for idx in range(len(reqs)):
-        if not release_req(
-            req=reqs[idx],
+    for idx, req in enumerate(reqs):
+        reason = None
+        if req.beam_group is not None:
+            reason = FINISH_ABORT(
+                "Beam search group aborted: beam groups cannot be retracted, "
+                "so they are aborted instead of being requeued.",
+                status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+            # Before release_req: it needs the leader's lockstep allocated length.
+            free_member_rows(
+                req.beam_group,
+                kv_storage_of(
+                    tree_cache.req_to_token_pool, tree_cache.token_to_kv_pool_allocator
+                ),
+            )
+        resumable = release_req(
+            req=req,
             remaing_req_count=len(reqs) - idx,
             tree_cache=tree_cache,
             request_retirer=request_retirer,
-            offload_kv=offload_kv,
-        ):
-            unresumable.append(reqs[idx])
+            offload_kv=offload_kv and reason is None,
+        )
+        if reason is None and not resumable:
+            reason = FINISH_ABORT(
+                unresumable_abort_message(),
+                status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+        if reason is not None:
+            req.request_finish(reason)
+            unresumable.append(req)
     return unresumable
 
 
