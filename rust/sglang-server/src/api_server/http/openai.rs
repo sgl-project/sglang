@@ -179,16 +179,16 @@ fn indexed_decode_stream(
     .boxed()
 }
 
-/// Content-part keys that carry media; images first.
+/// Content-part keys that carry media: images, video, then audio and files.
 const MEDIA_KEYS: [&str; 5] = ["image_url", "video_url", "input_audio", "audio_url", "file"];
 
 fn contains_media(value: &serde_json::Value) -> bool {
     contains_any_key(value, &MEDIA_KEYS)
 }
 
-/// Media the multimodal pipeline does not take yet: anything but images.
-fn contains_non_image_media(value: &serde_json::Value) -> bool {
-    contains_any_key(value, &MEDIA_KEYS[1..])
+/// Media the multimodal pipeline does not take yet: audio and files.
+fn contains_audio_or_file(value: &serde_json::Value) -> bool {
+    contains_any_key(value, &MEDIA_KEYS[2..])
 }
 
 fn contains_any_key(value: &serde_json::Value, keys: &[&str]) -> bool {

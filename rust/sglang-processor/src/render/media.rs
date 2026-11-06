@@ -21,6 +21,23 @@ pub fn extract_images(messages: &Value) -> Result<Vec<String>, String> {
         .collect()
 }
 
+/// The source of every `video_url` part of `messages`, in message order then
+/// part order, as `process_content_for_template_format` builds `video_data`;
+/// a part without a URL fails, as there.
+pub fn extract_videos(messages: &Value) -> Result<Vec<String>, String> {
+    let parts = (messages.as_array().into_iter().flatten())
+        .filter_map(|message| message.get("content")?.as_array())
+        .flatten()
+        .filter(|part| part["type"] == "video_url");
+    parts
+        .map(|part| {
+            (part["video_url"]["url"].as_str())
+                .map(str::to_owned)
+                .ok_or_else(|| "video content part has no video_url url".to_owned())
+        })
+        .collect()
+}
+
 /// `image_url` is an object with `url`, or (the flat form) the URL itself.
 fn image_url(part: &Value) -> Option<&str> {
     match &part["image_url"] {

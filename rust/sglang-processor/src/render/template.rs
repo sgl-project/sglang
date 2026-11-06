@@ -70,6 +70,7 @@ impl ChatFormatter {
             _ => last_assistant_message(request, continuing)?,
         }
         .unzip();
+        let messages = messages.or_else(|| messages_with_video_parts(request));
         let jinja = matches!(
             self,
             ChatFormatter::HuggingFace { .. }
@@ -118,6 +119,31 @@ fn tool_model_dump(tool: &Value) -> Option<Value> {
     Some(json!({"type": kind, "function": function_dump(tool).ok()?, "defer_loading": defer}))
 }
 
+/// The messages, when one has a `video_url` part, with each such part as the
+/// template must see it (see [`rewrite_video_parts`]); `None` otherwise.
+fn messages_with_video_parts(request: &CreateChatCompletionRequest) -> Option<minijinja::Value> {
+    let Ok(Value::Array(mut messages)) = serde_json::to_value(&request.messages) else {
+        return None;
+    };
+    rewrite_video_parts(&mut messages).then(|| minijinja::Value::from_serialize(&messages))
+}
+
+/// Python's `process_content_for_template_format` hands the template
+/// `{"type": "video"}` for a `video_url` part, the only form Qwen-VL templates
+/// match (`content.type == 'video'`). Whether any part was rewritten.
+fn rewrite_video_parts(messages: &mut [Value]) -> bool {
+    let mut rewritten = false;
+    let parts = messages
+        .iter_mut()
+        .filter_map(|m| m["content"].as_array_mut())
+        .flatten();
+    for part in parts.filter(|part| part["type"] == "video_url") {
+        *part = serde_json::json!({"type": "video"});
+        rewritten = true;
+    }
+    rewritten
+}
+
 /// [`split_continuation`] over the request's messages when the last is an
 /// assistant turn, its null content first set to "" as `_process_messages` does.
 fn last_assistant_message(
@@ -138,6 +164,7 @@ fn last_assistant_message(
     {
         *content = "".into();
     }
+    rewrite_video_parts(&mut messages);
     let prefix = split_continuation(&mut messages, continuing);
     // `apply_chat_template` fails on an empty conversation.
     if messages.is_empty() {
@@ -173,6 +200,32 @@ mod tests {
 
     fn trailing(content: Value) -> Value {
         json!([{"role": "user", "content": "Hi"}, {"role": "assistant", "content": content}])
+    }
+
+    /// A `video_url` part reaches the template as `{"type": "video"}`, the form
+    /// Qwen-VL templates match (their tests, copied below); an `image_url` part
+    /// is left as it is, which they match by key. Also on the path that splits
+    /// off a trailing assistant turn.
+    #[test]
+    fn video_parts_render_as_qwen_vl_templates_expect() {
+        let formatter = jinja(concat!(
+            "{%- for m in messages %}{%- for c in m.content %}",
+            "{%- if c.type == 'image' or 'image' in c or 'image_url' in c %}<I>",
+            "{%- elif c.type == 'video' or 'video' in c %}<V>",
+            "{%- elif c.type == 'text' %}{{ c.text }}{%- endif %}",
+            "{%- endfor %}|{%- endfor %}"
+        ));
+        let user = json!({"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "http://h/a.png"}},
+            {"type": "video_url", "video_url": {"url": "http://h/v.mp4"}},
+            {"type": "text", "text": "x"},
+        ]});
+        let (prompt, _) = render(&formatter, json!({"messages": [user]}), &HashMap::new());
+        assert_eq!(prompt, "<I><V>x|");
+        let assistant = json!({"role": "assistant", "content": [{"type": "text", "text": "y"}]});
+        let body = json!({"messages": [user, assistant], "continue_final_message": true});
+        let (prompt, _) = render(&formatter, body, &HashMap::new());
+        assert!(prompt.starts_with("<I><V>x|"), "{prompt}");
     }
 
     /// Python's `_handle_last_assistant_message`: a trailing assistant turn is
