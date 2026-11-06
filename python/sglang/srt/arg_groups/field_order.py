@@ -568,5 +568,6 @@ POSITIONAL_FIELD_ORDER = (
     "token_space_preprocess_cache_trust_url",
     "enable_token_space_preprocess_cache",
     "token_space_preprocess_cache_dir",
+    "token_space_preprocess_cache_check_rate",
 )
 # fmt: on

@@ -166,6 +166,14 @@ def handle_multimodal(server_args: Any):
         raise ValueError(
             "--token-space-preprocess-cache-dir requires --enable-token-space-preprocess-cache"
         )
+    check_rate = cfg.token_space_preprocess_cache_check_rate
+    if check_rate is not None and not 0 <= check_rate <= 1:
+        raise ValueError("--token-space-preprocess-cache-check-rate must be in [0, 1]")
+    if check_rate and not cfg.enable_token_space_preprocess_cache:
+        raise ValueError(
+            "--token-space-preprocess-cache-check-rate requires "
+            "--enable-token-space-preprocess-cache"
+        )
     if cfg.mm_process_config is not None:
         if not isinstance(cfg.mm_process_config, dict):
             raise TypeError(
