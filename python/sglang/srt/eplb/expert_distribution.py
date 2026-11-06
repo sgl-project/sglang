@@ -50,6 +50,7 @@ from sglang.srt.observability.metrics_collector import (
 from sglang.srt.runtime_context import get_device as get_device_namespace
 from sglang.srt.runtime_context import (
     get_exec,
+    get_parallel,
     get_platform,
     get_schedule,
     logs_expert_balancedness_to_server_log,
@@ -190,6 +191,9 @@ class ExpertDistributionRecorder(ABC):
     ):
         pass
 
+    def adopt_single_pass_gatherers(self, previous: ExpertDistributionRecorder):
+        pass
+
     def start_record(self):
         self._on_not_implemented()
 
@@ -239,6 +243,22 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
                 f"expert_balancedness_report_mode={get_exec().moe.expert_balancedness_report_mode}"
             )
             self.start_record()
+
+    def adopt_single_pass_gatherers(self, previous: ExpertDistributionRecorder):
+        """Take over ``previous``'s gatherers, which a kept decode graph writes.
+
+        Reuse mode allocates at maximum capacity. Collect reads the live width,
+        while graphs keep writing the same storage across growth and shrink.
+        """
+        if not isinstance(previous, _ExpertDistributionRecorderReal):
+            return
+        kept = previous._single_pass_gatherers
+        assert kept.keys() == self._single_pass_gatherers.keys(), (
+            f"{sorted(kept)} != {sorted(self._single_pass_gatherers)}"
+        )
+        for gatherer in kept.values():
+            gatherer.reset()
+        self._single_pass_gatherers = kept
 
     def with_current_layer(self, layer_idx):
         return self._current_layer_idx.with_value(layer_idx)
@@ -603,15 +623,15 @@ class _LayerBasedGpuSinglePassGatherer(_SinglePassGatherer):
         device = get_device()
 
         self._enable_global_physical_experts = enable_global_physical_experts
+        num_experts = self._expert_location_metadata.num_local_physical_experts
+        if enable_global_physical_experts:
+            num_experts = self._expert_location_metadata.num_physical_experts
+            if get_exec().moe.elastic_ep_reuse_cuda_graph:
+                num_experts = (
+                    get_parallel().max_ep_size or self._expert_location_metadata.ep_size
+                ) * self._expert_location_metadata.num_local_physical_experts
         self._data = torch.zeros(
-            (
-                self._expert_location_metadata.num_layers,
-                (
-                    self._expert_location_metadata.num_physical_experts
-                    if enable_global_physical_experts
-                    else self._expert_location_metadata.num_local_physical_experts
-                ),
-            ),
+            (self._expert_location_metadata.num_layers, num_experts),
             dtype=torch.int,
             device=device,
         )
@@ -621,7 +641,10 @@ class _LayerBasedGpuSinglePassGatherer(_SinglePassGatherer):
 
     def collect(self) -> Dict:
         if self._enable_global_physical_experts:
-            global_physical_count = self._data
+            # Wider than the live width after a shrink that kept these gatherers.
+            global_physical_count = self._data[
+                :, : self._expert_location_metadata.num_physical_experts
+            ]
         else:
             # Can optimize if bottleneck
             global_physical_count = _convert_local_to_global_physical_count(
@@ -643,9 +666,7 @@ class _SelectExpertsSinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
             record_physical_counts(topk_ids, self._data[layer_idx])
             return
         topk_ids = topk_ids.flatten()
-        mask = (topk_ids >= 0) & (
-            topk_ids < self._expert_location_metadata.num_physical_experts
-        )
+        mask = (topk_ids >= 0) & (topk_ids < self._data.shape[1])
         self._data[layer_idx, :].scatter_add_(
             dim=0, index=topk_ids.masked_fill(~mask, 0).long(), src=mask.int()
         )

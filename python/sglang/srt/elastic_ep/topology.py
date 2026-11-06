@@ -11,6 +11,17 @@ def attn_replica_size() -> int:
     return parallel.attn_tp_size * parallel.attn_cp_size
 
 
+def response_dp_rank() -> int | None:
+    """Translate the cohort-local DP rank to the controller's public routing slot."""
+    parallel = get_parallel()
+    rank = parallel.dp_rank
+    if rank is None or parallel.ep_join_rank_offset == 0:
+        return rank
+    return rank + physical_ep_rank_to_dp_rank(
+        parallel.ep_join_rank_offset, attn_replica_size()
+    )
+
+
 def validate_matching_attention_topology(
     *,
     primary_attn_tp_size: int,
