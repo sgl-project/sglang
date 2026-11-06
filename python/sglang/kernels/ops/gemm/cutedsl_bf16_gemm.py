@@ -80,7 +80,28 @@ _TGV_CUTE_EXT_TACTIC_CONFIGS: List[Tuple[int, int, int, bool]] = [
     (128, 32, 6, True),  # 26
     (128, 64, 5, True),  # 27
     (128, 128, 4, True),  # 28
+    # SM107 only: the tiles above with the deepest A/B pipeline that fits SM107 SMEM;
+    # appended so tactic ids 0-28 keep their meaning on every arch.
+    (64, 8, 18, False),  # 29
+    (64, 16, 16, False),  # 30
+    (64, 32, 13, False),  # 31
+    (64, 64, 10, False),  # 32
+    (64, 128, 6, False),  # 33
+    (128, 8, 9, False),  # 34
+    (128, 16, 9, False),  # 35
+    (128, 32, 8, False),  # 36
+    (128, 64, 6, False),  # 37
+    (128, 128, 5, False),  # 38
+    (64, 16, 18, True),  # 39
+    (64, 32, 16, True),  # 40
+    (64, 64, 13, True),  # 41
+    (64, 128, 10, True),  # 42
+    (128, 16, 9, True),  # 43
+    (128, 32, 9, True),  # 44
+    (128, 64, 8, True),  # 45
+    (128, 128, 6, True),  # 46
 ]
+_TGV_CUTE_EXT_FIRST_SM107_TACTIC: int = 29
 
 
 class WorkTileInfo(NamedTuple):
@@ -113,6 +134,7 @@ class TgvGemmCuteExtKernel:
         pdl_count: int = -1,
         has_bias: bool = False,
         out_dtype: Type[cutlass.Numeric] = cutlass.BFloat16,
+        arch: str = "sm_100",
     ):
         self.acc_dtype = acc_dtype
         self.out_dtype = out_dtype
@@ -129,6 +151,9 @@ class TgvGemmCuteExtKernel:
         # adds it to the accumulator before the bf16 cast. When False, all
         # bias-related code is elided via cutlass.const_expr.
         self.has_bias = has_bias
+        # Dynamic SMEM requested at launch: the capacity of ``arch``.
+        self.arch = arch
+        self.smem_capacity = utils.get_smem_capacity_in_bytes(self.arch)
 
         # 1-CTA: cta_n ∈ [8, 256] step 8 (bf16 tcgen05.mma atom limit).
         # 2-CTA: cta_n ∈ [16, 256] step 16 (bf16 K-major cluster mma).
@@ -188,7 +213,7 @@ class TgvGemmCuteExtKernel:
             grid=grid,
             block=(self.threads_per_cta, 1, 1),
             cluster=self.cluster_shape,
-            smem=cute.Int64(utils.get_smem_capacity_in_bytes("sm_100")),
+            smem=cute.Int64(self.smem_capacity),
             stream=stream,
             use_pdl=self.pdl_launch,
         )
@@ -1103,6 +1128,7 @@ def _get_compiled_cute_ext_kernel(
     a_leading: int,
     b_leading: int,
     c_leading: int,
+    arch: str = "sm_100",
 ):
     """Compile (or fetch from cache) a TgvGemmCuteExtKernel for the given
     config + layout pattern. Returns a callable with signature
@@ -1124,6 +1150,7 @@ def _get_compiled_cute_ext_kernel(
         a_leading,
         b_leading,
         c_leading,
+        arch,
     )
     cached = _TGV_CUTE_EXT_COMPILE_CACHE.get(key)
     if cached is not None:
@@ -1149,6 +1176,7 @@ def _get_compiled_cute_ext_kernel(
         use_pdl=use_pdl,
         has_bias=has_bias,
         out_dtype=_TORCH_TO_CUTLASS_OUT_DTYPE[c_dtype],
+        arch=arch,
     )
 
     a_, b_, c_, bias_ = _make_compile_repr_tensors(
@@ -1263,6 +1291,8 @@ def _run_tgv(
     """Dispatch one TGV GEMM: a (M, K) @ b (K, N) -> out (M, N), bias (N,)."""
     cta_m, cta_n, num_ab_stage, use_2cta = _resolve_tactic(tactic)
     has_bias = bias is not None
+    if tactic >= _TGV_CUTE_EXT_FIRST_SM107_TACTIC and not current_arch().is_sm(10, 7):
+        raise ValueError(f"cute_ext tactic {tactic} needs SM107 SMEM.")
 
     a_, b_, c_, bias_, (a_leading, b_leading, c_leading) = _to_cute_swap(
         a,
@@ -1284,6 +1314,7 @@ def _run_tgv(
         a_leading=a_leading,
         b_leading=b_leading,
         c_leading=c_leading,
+        arch="sm_107" if tactic >= _TGV_CUTE_EXT_FIRST_SM107_TACTIC else "sm_100",
     )
 
     stream = cuda.CUstream(torch.cuda.current_stream(a.device).cuda_stream)
@@ -1306,6 +1337,15 @@ _TGV_TACTIC_LADDER = (
     (27, 128, 64, 2),
 )
 
+# SM107: the deeper-pipeline SM107-only tactics.
+_TGV_TACTIC_LADDER_SM107 = (
+    (39, 64, 16, 2),
+    (40, 64, 32, 2),
+    (41, 64, 64, 2),
+    (42, 64, 128, 2),
+    (46, 128, 128, 2),
+)
+
 
 def _grid_ctas(m: int, n: int, cta_m: int, cta_n: int, num_mma_ctas: int) -> int:
     # Kernel axes are swapped: kernel-M = pytorch N, kernel-N = pytorch M.
@@ -1316,8 +1356,17 @@ def _grid_ctas(m: int, n: int, cta_m: int, cta_n: int, num_mma_ctas: int) -> int
 def _pick_tactic(m: int, n: int, k: int) -> int:
     """Pick the first ladder tactic whose grid fits one wave of the SMs."""
     num_sms = current_arch().num_sms
+    if current_arch().is_sm(10, 7):
+        # Measured on SM107 up to M = 128: one token tile covering all M rows (64-row feature tiles)
+        # beats the one-wave rule, even when the grid takes more than one wave.
+        for tactic, cta_m, cta_n, _ in _TGV_TACTIC_LADDER_SM107:
+            if cta_m == 64 and cta_n >= m:
+                return tactic
+    ladder = (
+        _TGV_TACTIC_LADDER_SM107 if current_arch().is_sm(10, 7) else _TGV_TACTIC_LADDER
+    )
     best, best_ctas = None, None
-    for tactic, cta_m, cta_n, num_mma_ctas in _TGV_TACTIC_LADDER:
+    for tactic, cta_m, cta_n, num_mma_ctas in ladder:
         ctas = _grid_ctas(m, n, cta_m, cta_n, num_mma_ctas)
         if ctas <= num_sms:
             return tactic
@@ -1372,6 +1421,16 @@ _MUSE_SPARK_TGV_M_RANGES = {
     (7168, 8192): (24, 32),  # hidden 8192 / inter 28672 TP8 gate_up (DFLASH draft)
 }
 
+# Measured in serving on SM107 (MuseSpark TP4 + DFlash, M = 8..1024); other shapes keep the GB300 ranges.
+# The split-K tables in unquant.py take precedence where they have an entry.
+_MUSE_SPARK_TGV_M_RANGES_SM107 = {
+    **_MUSE_SPARK_TGV_M_RANGES,
+    (1024, 8192): (320, 512),  # TP4 pooler slice: cuBLAS below
+    (2560, 8192): (0, 0),  # DFlash draft qkv: cuBLAS
+    (14336, 8192): (40, 64),  # DFlash draft gate_up
+    (8192, 7168): (1, 64),  # DFlash draft down
+}
+
 
 def use_cutedsl_bf16_gemm(m: int, n: int, k: int) -> bool:
     """TGV-vs-cuBLAS (``F.linear``) decision, CUPTI-measured on B300 under CUDA
@@ -1384,7 +1443,12 @@ def use_cutedsl_bf16_gemm(m: int, n: int, k: int) -> bool:
         return False
     if k % 8 != 0:  # TMA requires 16B-aligned rows
         return False
-    m_range = _MUSE_SPARK_TGV_M_RANGES.get((n, k))
+    m_ranges = (
+        _MUSE_SPARK_TGV_M_RANGES_SM107
+        if current_arch().is_sm(10, 7)
+        else _MUSE_SPARK_TGV_M_RANGES
+    )
+    m_range = m_ranges.get((n, k))
     if m_range is not None:
         return m_range[0] <= m <= m_range[1]
     if (
