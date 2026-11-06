@@ -20,6 +20,7 @@ from sglang.srt.configs.model_config import (
     is_deepseek_dsa,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.qsa.config import is_qwen_qsa
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import attn_dp_enabled_of
 from sglang.srt.utils.common import get_device_memory_capacity
@@ -29,6 +30,17 @@ logger = logging.getLogger(__name__)
 
 def validate_kv_shard_attention_backend(server_args: Any, cfg: Any = None) -> None:
     cfg = cfg or resolving_view(server_args)
+    if is_qwen_qsa(model_config_of(server_args).hf_config):
+        # QwenSparseAttnBackend serves every full-attention layer whatever
+        # --attention-backend says; it reads the prefix through the shard
+        # scratch only on the CP-TP group sharing path.
+        if not cfg.enable_cp_tp_group_sharing:
+            raise ValueError(
+                "KV sharding for compressed-QSA models (Qwen4-Exp) requires "
+                "CP-TP group sharing: --enable-prefill-cp with --attn-cp-size "
+                "equal to --tp-size."
+            )
+        return
     prefill_backend, _ = attention_backends_of(resolved_view(server_args))
     if prefill_backend == "dsa":
         hf_config = model_config_of(server_args).hf_config
