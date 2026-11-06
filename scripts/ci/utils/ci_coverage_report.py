@@ -78,7 +78,7 @@ _MM_GEN_SUBDIR_BACKENDS = {
     "server/ascend": ("NPU",),
     "layers": ("CUDA",),
     # unit/ are portable CPU-style unit tests. The `unit` suite also runs on
-    # ROCm (both 7.0.0 and 7.2.0), as a step of multimodal-gen-test-1-gpu-amd
+    # ROCm (both 7.0.0 and 7.2.0), as a step of multimodal-gen-test-1-gpu-mi30x
     # part 0, so they are AMD-covered too, not CUDA-only.
     "unit": ("CUDA", "AMD"),
     "cli": ("CUDA",),

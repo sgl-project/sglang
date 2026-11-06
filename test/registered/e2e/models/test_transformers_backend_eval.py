@@ -13,7 +13,7 @@ from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 from sglang.test.test_utils import auto_config_device
 
 register_cuda_ci(est_time=65, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=48, suite="stage-b-test-1-gpu-small-amd")
+register_amd_ci(est_time=48, stage="base-b", runner_config="1-gpu-small-mi30x")
 register_cpu_ci(est_time=206, suite="stage-b-test-cpu-intel")
 
 

@@ -45,7 +45,14 @@ def _filter_legacy_amd_job_rows(job_data: Dict[str, Dict]) -> Dict[str, Dict]:
             continue
 
         leaf_name = name_parts[-1]
-        if leaf_name.startswith(("wait-for-stage-a-amd", "wait-for-stage-b-amd")):
+        if leaf_name.startswith(
+            (
+                "wait-for-base-a-amd",
+                "wait-for-base-b-amd",
+                "wait-for-stage-a-amd",
+                "wait-for-stage-b-amd",
+            )
+        ):
             continue
         if leaf_name in {
             "call-gate",

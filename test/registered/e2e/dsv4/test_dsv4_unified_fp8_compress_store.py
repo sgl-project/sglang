@@ -32,7 +32,7 @@ from sglang.test.test_utils import CustomTestCase
 
 # the kernel takes E4M3FN vs E4M3FNUZ from the arch and the two-pool layout is only
 # ever allocated on gfx95, so on the default mi300 runner every case here would skip
-register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=60, stage="base-b", runner_config="1-gpu-small-mi35x")
 
 DEVICE = torch.device("cuda")
 

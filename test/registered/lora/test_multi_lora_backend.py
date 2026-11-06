@@ -31,7 +31,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cuda_ci(est_time=105, stage="base-b", runner_config="1-gpu-small")
 # backend-specific: ROCm's Triton build of the chunked-SGMV LoRA kernels on
 # mixed-adapter batches.
-register_amd_ci(est_time=65, suite="stage-b-test-1-gpu-small-amd")
+register_amd_ci(est_time=65, stage="base-b", runner_config="1-gpu-small-mi30x")
 
 
 class TestMultiLoRABackend(CustomTestCase):

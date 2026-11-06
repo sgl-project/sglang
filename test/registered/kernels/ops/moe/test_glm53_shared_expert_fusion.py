@@ -16,7 +16,7 @@ from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase, empty_gpu_cache
 
 # backend-specific: exercises AITER's gfx950 block-FP8 fused-MoE path.
-register_amd_ci(est_time=100, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=100, stage="base-b", runner_config="1-gpu-small-mi35x")
 
 
 @unittest.skipUnless(

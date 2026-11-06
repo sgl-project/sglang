@@ -29,3 +29,24 @@ runner_configs:
   8-gpu-b200:        { install: *default, artifact_version: v6, install_timeout: "20", runs_on: 8-gpu-b200 }
   8-gpu-b300:        { install: *default, artifact_version: v6, install_timeout: "20", runs_on: 8-gpu-b300 }
   8-gpu-h20:         { install: *default, artifact_version: v4, install_timeout: "20", runs_on: 8-gpu-h20, rdma_devices: "mlx5_1,mlx5_2,mlx5_3,mlx5_4" }
+
+# AMD counterpart: the `runner_config` field on `register_amd_ci(...)` calls.
+# Consumed by `runner_configs.py --amd-map`, called by pr-test-amd.yml and
+# pr-test-amd-extra.yml for their jobs' `runs-on:` and container env.
+# Names are the CUDA runner_config plus the GPU family: mi30x (MI300/MI325,
+# gfx942) or mi35x (MI355, gfx950).
+# Each AMD runner_config carries:
+#   - runs_on: GHA runner label. `$amd_arch` is substituted with the
+#     workflows' `runner_arch` input (mi300 | mi325).
+#   - extra_envs (optional): space-separated KEY=VAL pairs passed into the CI
+#     container (`amd_ci_exec.sh -e`); absent means none.
+amd_runner_configs:
+  1-gpu-small-mi30x:  { runs_on: linux-$amd_arch-1gpu-sglang }
+  1-gpu-large-mi30x:  { runs_on: linux-$amd_arch-1gpu-sglang }
+  2-gpu-large-mi30x:  { runs_on: linux-$amd_arch-2gpu-sglang }
+  4-gpu-mi30x:        { runs_on: linux-$amd_arch-4gpu-sglang, extra_envs: "NCCL_CUMEM_ENABLE=0 NCCL_NVLS_ENABLE=0 RCCL_MSCCL_ENABLE=0 SGLANG_USE_ROCM700A=1" }
+  8-gpu-mi30x:        { runs_on: linux-$amd_arch-8gpu-sglang }
+  1-gpu-small-mi35x:  { runs_on: linux-mi35x-gpu-1 }
+  8-gpu-mi35x:        { runs_on: linux-mi35x-gpu-8 }
+  # MI355 8-GPU pool whose nodes have RDMA NICs, for PD disaggregation.
+  8-gpu-mi35x-fabric: { runs_on: linux-mi35x-gpu-8.fabric }

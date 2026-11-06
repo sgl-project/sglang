@@ -7,7 +7,7 @@ from sglang.srt.environ import envs
 from sglang.srt.utils import get_device, is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=15, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=15, stage="base-b", runner_config="1-gpu-small-mi35x")
 
 
 @unittest.skipUnless(

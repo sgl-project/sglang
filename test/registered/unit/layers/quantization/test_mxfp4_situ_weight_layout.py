@@ -4,7 +4,7 @@ import pytest
 
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=5, stage="stage-b", runner_config="1-gpu-small-amd")
+register_amd_ci(est_time=5, stage="base-b", runner_config="1-gpu-small-mi30x")
 
 
 @pytest.mark.parametrize(

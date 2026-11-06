@@ -32,7 +32,8 @@ from sglang.test.test_utils import (
 # Embedding model tests
 register_amd_ci(
     est_time=73,
-    suite="stage-b-test-1-gpu-small-amd",
+    stage="base-b",
+    runner_config="1-gpu-small-mi30x",
     disabled="see https://github.com/sgl-project/sglang/issues/11127",
 )
 register_cuda_ci(est_time=105, stage="base-b", runner_config="1-gpu-small")

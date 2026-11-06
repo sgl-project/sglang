@@ -17,7 +17,7 @@ from sglang.test.kv_canary.runner_test_base import (
 )
 
 register_cuda_ci(est_time=14, stage="extra-a", runner_config="1-gpu-small")
-register_amd_ci(est_time=45, suite="extra-a-test-1-gpu-small-amd")
+register_amd_ci(est_time=45, stage="extra-a", runner_config="1-gpu-small-mi30x")
 
 
 def _run_one_cycle(manager, forward_batch) -> None:

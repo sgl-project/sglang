@@ -20,7 +20,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=310, stage="base-b", runner_config="2-gpu-large")
-register_amd_ci(est_time=355, suite="stage-b-test-2-gpu-large-amd")
+register_amd_ci(est_time=355, stage="base-b", runner_config="2-gpu-large-mi30x")
 
 
 class TestMultiTokenizer(CustomTestCase, MMLUMixin):

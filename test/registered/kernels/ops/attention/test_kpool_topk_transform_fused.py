@@ -28,7 +28,9 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 # backend-specific: compile the HIP JIT path and exercise wave64 graph replay.
-register_amd_ci(est_time=90, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(
+    est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-large-mi30x"
+)
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "Test requires a GPU")
