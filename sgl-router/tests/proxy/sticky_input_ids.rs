@@ -110,7 +110,7 @@ fn build_ctx(worker_urls: &[String]) -> Arc<AppContext> {
         });
     }
     // Sticky needs no cache-aware deps, so the defaults registry is fine — the
-    // ingress tokenizes via `ctx.tokenizers`, not the policy.
+    // ingress tokenizes via `ctx.preprocessor.tokenizers()`, not the policy.
     let policies = Arc::new(build_policy_registry(&cfg).unwrap());
     let proxy = Arc::new(Proxy::new(Duration::from_secs(5)).unwrap());
     Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies))

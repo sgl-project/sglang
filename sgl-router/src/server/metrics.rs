@@ -401,16 +401,7 @@ impl CacheAwareDecision {
     }
 }
 
-/// Whether a dispatched chat request carried router-rendered `input_ids` to
-/// the engine, and why not otherwise. See the module doc for each label.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InputIdsForwarding {
-    Forwarded,
-    Disabled,
-    Ineligible,
-    IneligibleMultimodal,
-    TokenizeFailed,
-}
+pub use crate::tokenizer::InputIdsForwarding;
 
 impl InputIdsForwarding {
     fn as_str(self) -> &'static str {
