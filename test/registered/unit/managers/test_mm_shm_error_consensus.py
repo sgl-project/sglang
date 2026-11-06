@@ -424,15 +424,14 @@ class TestModelSpecificDataShmWrap(CustomTestCase):
         self._gate(True)
         item = self._item()
         item.set("tiny", torch.zeros(16))  # 64 bytes, below the threshold
+        tiny = item.model_specific_data["tiny"]
         small = item.model_specific_data["images_crop"]  # 3*3*8*8*4 = 2304 bytes
 
         self._wrap(item)
         self._track(item)
 
         self.assertIsInstance(item.model_specific_data["images_crop"], torch.Tensor)
-        self.assertIs(
-            item.model_specific_data["tiny"], item.model_specific_data["tiny"]
-        )
+        self.assertIs(item.model_specific_data["tiny"], tiny)
         self.assertEqual(small.shape, item.model_specific_data["images_crop"].shape)
 
     def test_gate_off_leaves_other_models_untouched(self):
