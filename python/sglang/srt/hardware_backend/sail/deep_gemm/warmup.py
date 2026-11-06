@@ -20,7 +20,6 @@ from sglang.srt.hardware_backend.sail.deep_gemm.kernel_types import (
     SailDeepGemmKernelType,
 )
 from sglang.srt.layers.deep_gemm_wrapper.compile_utils import (
-    DeepGemmKernelType,
     _BaseWarmupExecutor,
     _empty_block_fp8,
     _empty_token_fp8,
@@ -607,8 +606,7 @@ class _GroupedNopadWarmupExecutor_int4_mma(_GroupedNopadWarmupExecutor_int4):
 
 _SAIL_WARMUP_EXECUTORS = {
     SailDeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_NOPAD: _GroupedNopadWarmupExecutor,
-    # Still a shared type: the shared entrypoint falls back to it as well.
-    DeepGemmKernelType.GEMM_NT_F8F8BF16_CHANNEL: _NormalWarmupExecutor_channel,
+    SailDeepGemmKernelType.GEMM_NT_F8F8BF16_CHANNEL: _NormalWarmupExecutor_channel,
     SailDeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG_CHANNEL: _GroupedContWarmupExecutor_channel,
     SailDeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED_CHANNEL: _GroupedMaskedWarmupExecutor_channel,
     SailDeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_NOPAD_CHANNEL: _GroupedNopadWarmupExecutor_channel,
@@ -636,6 +634,22 @@ _SAIL_WARMUP_EXECUTORS = {
     SailDeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_FUSED: _GroupedFusedWarmupExecutor_int4,
     SailDeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_VALU_FUSED: _GroupedFusedWarmupExecutor_mxfp4_valu,
 }
+
+
+# Grouped layouts this build stores contiguously along M. Only the M values the
+# build's M alignment admits compile, so the shared warmup trims its M list to
+# them before compiling.
+_CONTIG_LAYOUTS = frozenset(
+    {
+        SailDeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG_CHANNEL.name,
+        SailDeepGemmKernelType.GROUPED_GEMM_NT_I8I8BF16_CONTIG.name,
+    }
+)
+
+
+def is_contig_layout(name: str) -> bool:
+    """Whether this build stores the grouped GEMM contiguously along M."""
+    return name in _CONTIG_LAYOUTS
 
 
 def create_sail_warmup_executor(kernel_type: SailDeepGemmKernelType, **kwargs):

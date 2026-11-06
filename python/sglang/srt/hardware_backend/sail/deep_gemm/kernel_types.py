@@ -25,6 +25,11 @@ class SailDeepGemmKernelType(Enum):
     GROUPED_GEMM_NT_F8F8BF16_CONTIG_CHANNEL = auto()
     GROUPED_GEMM_NT_F8F8BF16_NOPAD_CHANNEL = auto()
 
+    # The dense fp8 GEMM with one scale per output channel. Declared here
+    # because only the vendor build accepts that scale layout, so the shared
+    # entrypoint names it inside its vendor branch.
+    GEMM_NT_F8F8BF16_CHANNEL = auto()
+
     GROUPED_GEMM_NT_I8I8BF16_MASKED = auto()
     GROUPED_GEMM_NT_I8I8BF16_CONTIG = auto()
     GROUPED_GEMM_NT_I8I8BF16_NOPAD = auto()

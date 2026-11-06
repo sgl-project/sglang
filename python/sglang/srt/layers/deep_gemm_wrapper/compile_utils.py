@@ -127,17 +127,15 @@ class DeepGemmKernelType(IntEnum):
     GEMM_NT_F8F8BF16 = auto()
     GEMM_NT_F8F8BF16_BLOCK32 = auto()
     GEMM_NT_BF16BF16F32 = auto()
-    # The fp8 GEMM with one scale per output channel. Still shared because the
-    # shared entrypoint falls back to it; the types only some builds serve live
-    # in that build's own enum.
-    GEMM_NT_F8F8BF16_CHANNEL = auto()
+    # Every other layout is served by a build-specific enum: the per-channel,
+    # nopad, int8, fp4 and int4 GEMMs have no scale layout the CUDA build takes.
 
 
-# Grouped layouts whose M list is trimmed to the build's M alignment.
+# Grouped layouts every build stores contiguously along M, so their warmup M
+# list is trimmed to the build's M alignment. A build that serves contiguous
+# layouts of its own answers through _trims_to_contiguous_alignment.
 _CONTIG_KERNEL_TYPES = {
     "GROUPED_GEMM_NT_F8F8BF16_CONTIG",
-    "GROUPED_GEMM_NT_F8F8BF16_CONTIG_CHANNEL",
-    "GROUPED_GEMM_NT_I8I8BF16_CONTIG",
     "GROUPED_GEMM_NT_BF16_CONTIG",
 }
 
@@ -213,6 +211,24 @@ def _maybe_compile_deep_gemm_one_type_all(
             )
 
 
+def _trims_to_contiguous_alignment(kernel_type: Enum) -> bool:
+    """Whether the warmup M list is trimmed to the build's M alignment.
+
+    ``_CONTIG_KERNEL_TYPES`` covers the contiguous layouts every build serves.
+    A member of another enum is served by a build that declares its own, so ask
+    that build, imported on demand the way ``create`` reaches its executors.
+    """
+    if kernel_type.name in _CONTIG_KERNEL_TYPES:
+        return True
+    if isinstance(kernel_type, DeepGemmKernelType):
+        # Shared types are fully answered above; the CUDA build never imports
+        # the platform tree.
+        return False
+    from sglang.srt.hardware_backend.sail.deep_gemm.warmup import is_contig_layout
+
+    return is_contig_layout(kernel_type.name)
+
+
 def _contiguous_m_alignment() -> int:
     """M alignment of the contiguous grouped layouts.
 
@@ -241,7 +257,7 @@ def _compile_deep_gemm_one_type_all(
     # Temporary disable symmetric memory during compilation since it only runs on the first rank.
     saved_context = disable_symmetric_memory_context()
     try:
-        if kernel_type.name in _CONTIG_KERNEL_TYPES:
+        if _trims_to_contiguous_alignment(kernel_type):
             m_alignment = _contiguous_m_alignment()
             m_list = sorted(list(set(m for m in m_list if m % m_alignment == 0)))
 
@@ -346,176 +362,76 @@ class _BaseWarmupExecutor(metaclass=_BaseWarmupExecutorMeta):
         # FP32 input scales remain live while DeepGEMM converts their layout.
         _GB = 1 << 30
         name = kernel_type.name
-        if "FUSED" in name:
-            # Warmup uses topk=1; this bounds the vendor's block_m 16..256 metadata.
-            n_align = max_m + 1 - num_groups
-            max_blocks = num_groups - 1 + ceil_div(n_align, 16)
-            sorted_rows = (num_groups - 1 + ceil_div(n_align, 256)) * 256
-            block_size = 1 << max(0, num_groups - 1).bit_length()
-            padded_blocks = ceil_div(sorted_rows, block_size)
-            alignment_bytes = (
-                40
-                + num_groups * 4
-                + max_blocks * 16
-                + sorted_rows * 4
-                + 4
-                + max_m * 8
-                + (2 * padded_blocks + 2) * num_groups * 4
-            )
-            if "BF16I4BF16" in name:
-                scale_bytes = 1 if "MMA" in name or "VALU" in name else 2
-                tensor_bytes = (
-                    max_m * k * 2
-                    + num_groups * n * (k // 2)
-                    + num_groups * n * (k // 32) * scale_bytes
-                    + max_m * n * 2
-                )
-                return (tensor_bytes + alignment_bytes) / _GB
-            bf16 = name == "GROUPED_GEMM_NT_BF16_FUSED"
-            tensor_bytes = (max_m * k + num_groups * n * k) * (
-                2 if bf16 else 1
-            ) + max_m * n * 2
-            if not bf16:
-                if "F4F4" in name:
-                    # K is the packed byte width; a uint16 holds the scales of
-                    # two g32 groups. During RHS preprocessing the raw scales and
-                    # the output are live at the same time, while the LHS is only
-                    # a view.
-                    tensor_bytes += (max_m + 2 * num_groups * n) * ceil_div(k, 32) * 2
-                elif "CHANNEL" in name or "I8I8" in name:
-                    tensor_bytes += (max_m + num_groups * n) * 4
-                else:
-                    tensor_bytes += (
-                        max_m * ceil_div(k, _BLOCK_SIZE)
-                        + num_groups
-                        * ceil_div(n, _BLOCK_SIZE)
-                        * ceil_div(k, _BLOCK_SIZE)
-                    ) * 4
-            return (tensor_bytes + alignment_bytes) / _GB
-        if "CHANNEL" in name or "I8I8" in name or "F4F4" in name:
-            masked = "MASKED" in name
-            grouped = name.startswith("GROUPED_")
-            lhs_groups = num_groups if masked else 1
-            rhs_groups = num_groups if grouped else 1
-            # For FP4 scales the input and the preprocessed output are live at the
-            # same time; the packed K is already a byte width.
-            scale_bytes = 2 * (k // 16) if "F4F4" in name else 4
-            return (
-                lhs_groups * max_m * k
-                + rhs_groups * n * k
-                + (lhs_groups * max_m + rhs_groups * n) * scale_bytes
-                + (num_groups if masked else max_m) * 4 * grouped
-                + lhs_groups * max_m * n * 2
-                + (rhs_groups * n * 4 if name.endswith("_BIAS") else 0)
-            ) / _GB
-        is_dense_fp8 = name in ("GEMM_NT_F8F8BF16", "GEMM_NT_F8F8BF16_BLOCK32")
-        block_size = 32 if name == "GEMM_NT_F8F8BF16_BLOCK32" else _BLOCK_SIZE
-        lhs_scales = max_m * ceil_div(k, block_size) * 4
-        rhs_scales = ceil_div(n, block_size) * ceil_div(k, block_size) * 4
-        scale_workspace = _get_fp8_scale_workspace(
-            max_m,
-            n,
-            k,
-            lhs_groups=(num_groups if name == "GROUPED_GEMM_NT_F8F8BF16_MASKED" else 1),
-            rhs_groups=1 if is_dense_fp8 else num_groups,
-            block_size=block_size,
-        )
-        if is_dense_fp8:
-            return (
-                max_m * k
-                + n * k
-                + max_m * n * 2
-                + lhs_scales
-                + rhs_scales
-                + scale_workspace
-            ) / _GB
-        elif name in (
-            "GROUPED_GEMM_NT_F8F8BF16_CONTIG",
-            "GROUPED_GEMM_NT_F8F8BF16_NOPAD",
-        ):
-            return (
-                max_m * k
-                + num_groups * n * k
-                + max_m * 4
-                + max_m * n * 2
-                + lhs_scales
-                + scale_workspace
-                + num_groups * rhs_scales
-            ) / _GB
-        elif name in (
-            "GROUPED_GEMM_NT_BF16_CONTIG",
-            "GROUPED_GEMM_NT_BF16_NOPAD",
-        ):
-            return (
-                max_m * k * 2 + num_groups * n * k * 2 + max_m * 4 + max_m * n * 2
-            ) / _GB
-        elif name == "GROUPED_GEMM_NT_F8F8BF16_MASKED":
-            return (
-                num_groups * max_m * k
-                + num_groups * n * k
-                + num_groups * 4
-                + num_groups * max_m * n * 2
-                + num_groups * (lhs_scales + rhs_scales)
-                + scale_workspace
-            ) / _GB
-        elif name == "GEMM_NT_BF16BF16F32":
+        if name == "GEMM_NT_BF16BF16F32":
             # bf16 lhs + bf16 rhs + fp32 out
             return (max_m * k * 2 + n * k * 2 + max_m * n * 4) / _GB
-        elif name == "GROUPED_GEMM_NT_BF16_MASKED":
+        if name == "GROUPED_GEMM_NT_BF16_MASKED":
             return (
                 num_groups * max_m * k * 2
                 + num_groups * n * k * 2
                 + num_groups * 4
                 + num_groups * max_m * n * 2
             ) / _GB
-        elif name == "GROUPED_GEMM_NT_F4F4BF16_NOPAD_BIAS":
+        if name == "GROUPED_GEMM_NT_BF16_CONTIG":
+            return (
+                max_m * k * 2 + num_groups * n * k * 2 + max_m * 4 + max_m * n * 2
+            ) / _GB
+        block_size = 32 if name == "GEMM_NT_F8F8BF16_BLOCK32" else _BLOCK_SIZE
+        lhs_scales = max_m * ceil_div(k, block_size) * 4
+        rhs_scales = ceil_div(n, block_size) * ceil_div(k, block_size) * 4
+        if name in ("GEMM_NT_F8F8BF16", "GEMM_NT_F8F8BF16_BLOCK32"):
             return (
                 max_m * k
-                + num_groups * n * k
-                + num_groups * n * 4
-                + max_m * 4
+                + n * k
                 + max_m * n * 2
+                + lhs_scales
+                + rhs_scales
+                + _get_fp8_scale_workspace(
+                    max_m, n, k, lhs_groups=1, rhs_groups=1, block_size=block_size
+                )
             ) / _GB
-        elif name == "GROUPED_GEMM_NT_F4F4BF16_MASKED_BIAS":
+        if name == "GROUPED_GEMM_NT_F8F8BF16_MASKED":
             return (
                 num_groups * max_m * k
                 + num_groups * n * k
-                + num_groups * n * 4
                 + num_groups * 4
                 + num_groups * max_m * n * 2
+                + num_groups * (lhs_scales + rhs_scales)
+                + _get_fp8_scale_workspace(
+                    max_m,
+                    n,
+                    k,
+                    lhs_groups=num_groups,
+                    rhs_groups=num_groups,
+                    block_size=block_size,
+                )
             ) / _GB
-        elif name == "GEMM_NT_F4F4BF16_BIAS":
-            return (max_m * k + n * k + n * 4 + max_m * n * 2) / _GB
-        elif name in (
-            "GROUPED_GEMM_NT_BF16I4BF16_MMA_NOPAD",
-            "GROUPED_GEMM_NT_BF16I4BF16_MMA_MASKED",
-        ):
-            lhs_groups = num_groups if "MASKED" in name else 1
+        if name == "GROUPED_GEMM_NT_F8F8BF16_CONTIG":
             return (
-                lhs_groups * max_m * k * 2
-                + num_groups * n * (k // 2)
-                + num_groups * n * (k // 32)
-                + (num_groups if "MASKED" in name else max_m) * 4
-                + lhs_groups * max_m * n * 2
-            ) / _GB
-        elif name == "GROUPED_GEMM_NT_BF16I4BF16_NOPAD":
-            return (
-                max_m * k * 2
-                + num_groups * (k // 16) * (n * 2) * 4
-                + num_groups * (k // 32) * n * 2
+                max_m * k
+                + num_groups * n * k
                 + max_m * 4
                 + max_m * n * 2
+                + lhs_scales
+                + _get_fp8_scale_workspace(
+                    max_m,
+                    n,
+                    k,
+                    lhs_groups=1,
+                    rhs_groups=num_groups,
+                    block_size=block_size,
+                )
+                + num_groups * rhs_scales
             ) / _GB
-        elif name == "GROUPED_GEMM_NT_BF16I4BF16_MASKED":
-            return (
-                num_groups * max_m * k * 2
-                + num_groups * (k // 16) * (n * 2) * 4
-                + num_groups * (k // 32) * n * 2
-                + num_groups * 4
-                + num_groups * max_m * n * 2
-            ) / _GB
-        else:
-            raise ValueError(f"Invalid kernel type: {name}")
+        # Every remaining layout is declared by the build that serves it; that
+        # build's module prices it against the buffers its own executors allocate.
+        from sglang.srt.hardware_backend.sail.deep_gemm.memory import (
+            sail_memory_requirement,
+        )
+
+        return sail_memory_requirement(
+            kernel_type, max_m=max_m, n=n, k=k, num_groups=num_groups
+        )
 
     def __init__(self, max_m: int, n: int, k: int, num_groups: int):
         self.max_m = max_m
