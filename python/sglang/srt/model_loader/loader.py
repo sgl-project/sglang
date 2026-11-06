@@ -1774,7 +1774,9 @@ class PreshardedModelLoader(DefaultModelLoader):
         model_config: ModelConfig,
         device_config: DeviceConfig,
     ) -> nn.Module:
-        shard_config = self._collect_shard_config(model_config)
+        shard_config = self._collect_shard_config(
+            model_config, torch.device(device_config.device)
+        )
         presharded_dir = self._presharded_dir(model_config, shard_config)
         if self._presharded_ready(presharded_dir) and self._shard_config_matches(
             presharded_dir, shard_config
@@ -1811,7 +1813,9 @@ class PreshardedModelLoader(DefaultModelLoader):
             root = os.path.join(model_config.model_path, self.DEFAULT_SUBDIR)
         return os.path.join(root, subfolder)
 
-    def _collect_shard_config(self, model_config: ModelConfig) -> Dict[str, Any]:
+    def _collect_shard_config(
+        self, model_config: ModelConfig, target_device: Optional[torch.device] = None
+    ) -> Dict[str, Any]:
         def _safe(fn) -> int:
             try:
                 return fn()
@@ -1819,9 +1823,13 @@ class PreshardedModelLoader(DefaultModelLoader):
                 return 1
 
         from sglang.srt.layers.dp_attention import get_moe_cp_size
+        from sglang.srt.layers.moe.utils import (
+            get_moe_a2a_backend,
+            get_moe_runner_backend,
+        )
 
         parallel = get_parallel()
-        return {
+        shard_config = {
             "tp": _safe(lambda: parallel.tp_size),
             "dp": _safe(get_moe_cp_size),
             "ep": _safe(lambda: parallel.moe_ep_size),
@@ -1839,6 +1847,20 @@ class PreshardedModelLoader(DefaultModelLoader):
             ),
             "structural_signature": self._compute_structural_signature(model_config),
         }
+        a2a_backend = get_moe_a2a_backend()
+        if get_moe_runner_backend().is_flashinfer_cutedsl() and (
+            a2a_backend.is_none() or a2a_backend.is_flashinfer()
+        ):
+            from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl import (
+                use_cutedsl_moe_swap_ab,
+            )
+
+            # Presharded files contain processed rows; equal shapes do not
+            # distinguish old up64/gate64 weights from swap-AB up16/gate16.
+            shard_config["flashinfer_cutedsl_swap_ab"] = use_cutedsl_moe_swap_ab(
+                target_device or torch.device(current_platform.device_type)
+            )
+        return shard_config
 
     @staticmethod
     def _normalize_init_expert_location(value: Optional[str]) -> Optional[str]:

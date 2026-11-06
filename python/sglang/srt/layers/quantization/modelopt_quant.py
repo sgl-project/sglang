@@ -2422,7 +2422,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
     #
     # "v2" (standard): cutedsl + none/flashinfer a2a.
     #   - MoeRunner fused func calls CuteDslMoEWrapper kernels.
-    #   - Expects W13 in [Up, Gate] order, interleaved in 64-row chunks.
+    #   - Expects W13 in [Up, Gate] order, interleaved in 16-row chunks for
+    #     Blackwell swap-AB, or 64-row chunks for the legacy layout.
     #   - Uses MMA-layout blockscales (w13_blockscale_mma).
 
     @property
@@ -2980,27 +2981,23 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             # CUTLASS processing - handle w13 and w2 separately
 
             if self._is_cutedsl_v2_standard and layer.moe_runner_config.is_gated:
-                # CuteDSL v2 only: interleave the two logical W13 halves in
-                # 64-row chunks for the fused SwiGLU GEMM1 layout expected by
-                # CuteDslMoEWrapper.  The v1 (deepep) path uses
-                # grouped_gemm_nt_masked which expects plain contiguous halves.
+                # Prepare paired [up, gate] weights/scales before swizzling,
+                # using the same layout as CuteDslMoEWrapper. The v1 (deepep)
+                # masked GEMM keeps plain contiguous halves.
+                from flashinfer.fused_moe import interleave_cute_dsl_moe_weights
+
                 from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl import (
-                    interleave_w13_halves,
+                    use_cutedsl_moe_swap_ab,
                 )
 
-                copy_or_rebind_param(
-                    layer,
-                    "w13_weight",
-                    interleave_w13_halves(
-                        layer.w13_weight.view(torch.uint8), group_size=64, dim=1
-                    ).contiguous(),
+                w13_weight, w13_weight_scale = interleave_cute_dsl_moe_weights(
+                    layer.w13_weight.view(torch.uint8),
+                    layer.w13_weight_scale,
+                    swap_ab=use_cutedsl_moe_swap_ab(layer.w13_weight.device),
                 )
+                copy_or_rebind_param(layer, "w13_weight", w13_weight.contiguous())
                 copy_or_rebind_param(
-                    layer,
-                    "w13_weight_scale",
-                    interleave_w13_halves(
-                        layer.w13_weight_scale, group_size=64, dim=1
-                    ).contiguous(),
+                    layer, "w13_weight_scale", w13_weight_scale.contiguous()
                 )
 
             # Process w13 weights

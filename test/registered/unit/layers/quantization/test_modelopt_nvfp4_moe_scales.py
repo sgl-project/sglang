@@ -47,6 +47,7 @@ from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
 # isort: on
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl import use_cutedsl_moe_swap_ab
 from sglang.srt.layers.moe.utils import MoeA2ABackend, MoeRunnerBackend
 from sglang.srt.runtime_context import get_flags
 from sglang.test.test_utils import CustomTestCase
@@ -118,6 +119,31 @@ def _nvfp4_loader_layer(*, is_gated=True, tp_rank=0):
 
 
 class TestNvfp4MoeScaleLoading(CustomTestCase):
+    def test_cutedsl_swap_ab_uses_the_weight_device_and_exact_sm(self):
+        device = torch.device("cuda:2")
+        for capability in (
+            (9, 0),
+            (10, 0),
+            (10, 3),
+            (10, 7),
+            (11, 0),
+            (12, 0),
+            (12, 1),
+        ):
+            with (
+                self.subTest(capability=capability),
+                mock.patch(
+                    "torch.cuda.get_device_capability", return_value=capability
+                ) as get_capability,
+            ):
+                self.assertEqual(
+                    use_cutedsl_moe_swap_ab(device), capability in ((10, 0), (10, 3))
+                )
+                get_capability.assert_called_once_with(device)
+        with mock.patch("torch.cuda.get_device_capability") as get_capability:
+            self.assertFalse(use_cutedsl_moe_swap_ab(torch.device("cpu")))
+            get_capability.assert_not_called()
+
     def test_global_scales_keep_gate_up_order_across_weight_layouts(self):
         """Changing backend layout must not change which projection an alpha scales.
 
