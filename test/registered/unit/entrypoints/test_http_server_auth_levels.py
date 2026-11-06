@@ -18,6 +18,9 @@ ADMIN_PATHS = [
     "/stop_profile",
     "/set_trace_level",
     "/freeze_gc",
+    "/hicache/storage-backend/clear",
+    "/init_weights_send_group_for_remote_instance",
+    "/send_weights_to_remote_instance",
 ]
 
 
@@ -40,6 +43,7 @@ class TestAdminEndpointAuthLevels(CustomTestCase):
             with self.subTest(path=path):
                 self.assertFalse(self._decide(path, None).allowed)
                 self.assertTrue(self._decide(path, "Bearer admin-secret").allowed)
+                self.assertFalse(self._decide(path, "Bearer user-api-key").allowed)
 
 
 if __name__ == "__main__":
