@@ -3,6 +3,7 @@
 unmount transitions in DenoisingStage (CPU-only, mount boundary patched)."""
 
 import unittest
+import uuid
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -12,6 +13,9 @@ from sglang.multimodal_gen.runtime.cache import cache_dit_integration
 from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
     cache_dit_overrides_key,
     resolve_cache_dit_request_overrides,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.comfyui_mode import (
+    release_comfyui_session,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     denoising as denoising_module,
@@ -118,6 +122,7 @@ class TestPerRequestCacheDitTransitions(unittest.TestCase):
             enable_breakable_cuda_graph=False,
             enable_torch_compile=False,
             enable_cfg_parallel=False,
+            comfyui_mode=False,
         )
         self.stage.transformer = object()
         self.stage.transformer_2 = None
@@ -129,11 +134,13 @@ class TestPerRequestCacheDitTransitions(unittest.TestCase):
         self.disable_calls = []
         self.refresh_calls = []
         self.cfg_modes = []
+        self.cfg_overrides = []
         self.refresh_options = []
 
         def fake_enable(transformer, config, **kwargs):
             self.enable_calls.append(config)
             self.cfg_modes.append(kwargs["has_separate_cfg"])
+            self.cfg_overrides.append(kwargs.get("separate_cfg_override"))
             return transformer
 
         def fake_disable(transformer):
@@ -165,6 +172,53 @@ class TestPerRequestCacheDitTransitions(unittest.TestCase):
         self.assertEqual(
             self.stage._cache_dit_active_key, (cache_dit_overrides_key({}), False)
         )
+
+    def test_comfyui_run_keeps_one_context_across_step_requests(self):
+        """ComfyUI sends one request per sampler step; only a run's first request
+        may mount or refresh, otherwise every step restarts the cache context."""
+        self.stage.server_args.comfyui_mode = True
+        family = uuid.uuid4().hex
+
+        def step(run):
+            batch = _batch(enable_cache_dit=True)
+            batch.extra = {
+                "comfyui_session_id": f"{family}:{run}",
+                "comfyui_num_steps": 25,
+            }
+            self.stage._maybe_enable_cache_dit(1, batch)
+
+        try:
+            for _ in range(3):
+                step(1)
+            step(2)
+            step(2)
+        finally:
+            release_comfyui_session(f"{family}:2")
+        self.assertEqual(len(self.enable_calls), 1)
+        self.assertEqual(self.enable_calls[0].num_inference_steps, 25)
+        self.assertEqual(self.refresh_calls, [25])
+
+    def test_comfyui_cfg_run_mounts_with_separate_cfg(self):
+        """ComfyUI sends cond and uncond as separate one-row requests, so the
+        request has no CFG of its own; a CFG run must still mount separate CFG,
+        and registered adapters only honor it through the explicit override."""
+        self.stage.server_args.comfyui_mode = True
+        family = uuid.uuid4().hex
+        try:
+            for run, separate_cfg in ((1, False), (2, True)):
+                batch = _batch(enable_cache_dit=True)
+                batch.extra = {
+                    "comfyui_session_id": f"{family}:{run}",
+                    "comfyui_num_steps": 25,
+                    "comfyui_separate_cfg": separate_cfg,
+                }
+                self.stage._maybe_enable_cache_dit(1, batch)
+        finally:
+            release_comfyui_session(f"{family}:2")
+        self.assertEqual(self.cfg_modes, [False, True])
+        # a no-CFG run must say so, or cache-dit falls back to its registered
+        # default (separate CFG for Wan, QwenImage, ...)
+        self.assertEqual(self.cfg_overrides, [False, True])
 
     def test_cfg_change_remounts_and_parallel_cfg_has_one_branch_per_rank(self):
         self.stage._maybe_enable_cache_dit(8, _batch(enable_cache_dit=True))
@@ -334,6 +388,35 @@ class TestPerRequestCacheDitTransitions(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "scm_compute_bins and scm_cache_bins"):
             self.stage._parse_cache_dit_scm_bins()
+
+
+class TestCacheDitRemountAfterDisable(unittest.TestCase):
+    def test_knob_change_remounts_a_registered_transformer(self):
+        """A per-request knob change unmounts and remounts Cache-DiT; with a
+        bare registered transformer the remount used to assert inside
+        cache-dit because the first mount was never fully released."""
+        from diffusers import FluxTransformer2DModel
+
+        transformer = FluxTransformer2DModel(
+            patch_size=1,
+            in_channels=4,
+            num_layers=1,
+            num_single_layers=1,
+            attention_head_dim=8,
+            num_attention_heads=2,
+            joint_attention_dim=16,
+            pooled_projection_dim=8,
+            axes_dims_rope=(2, 2, 4),
+        )
+        for threshold in (0.24, 0.08):
+            cache_dit_integration.cache_dit.enable_cache(
+                transformer,
+                cache_config=cache_dit_integration.DBCacheConfig(
+                    num_inference_steps=4, residual_diff_threshold=threshold
+                ),
+            )
+            self.assertTrue(hasattr(transformer, "_context_manager"))
+            cache_dit_integration.disable_cache_on_transformer(transformer)
 
 
 if __name__ == "__main__":

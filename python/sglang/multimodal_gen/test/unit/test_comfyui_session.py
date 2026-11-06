@@ -20,6 +20,8 @@ from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.zimage import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.comfyui_mode import (
     bind_comfyui_session,
+    comfyui_cache_dit_run,
+    get_or_create_run_state,
     get_run_state,
     initialize_comfyui_pipeline,
     release_comfyui_session,
@@ -118,6 +120,28 @@ def test_release_run_state_keeps_conditioning():
     assert torch.equal(second.prompt_embeds[0], first.prompt_embeds[0])
     assert second.extra["model_payload"]["audio_scale"] == 0.5
     release_comfyui_session(sid)
+
+
+def test_cache_dit_first_call_ignores_other_run_state() -> None:
+    """A model stage (Qwen-Image-2.1 conds) fills the run state before
+    denoising; Cache-DiT must still see each run's first call exactly once."""
+    family = uuid.uuid4().hex
+    seen = {1: [], 2: []}
+    for run in (1, 2):
+        for _step in range(3):
+            req = _Req()
+            req.extra = {
+                "comfyui_session_id": f"{family}:{run}",
+                "comfyui_num_steps": 3,
+            }
+            bind_comfyui_session(req)
+            conds = get_or_create_run_state(req, dict)
+            conds.setdefault("cond", "built once per run")
+            seen[run].append(comfyui_cache_dit_run(req)[1])
+            # The model stage's state is left untouched by Cache-DiT.
+            assert get_run_state(req) == {"cond": "built once per run"}
+    assert seen == {1: [True, False, False], 2: [True, False, False]}
+    release_comfyui_session(f"{family}:2")
 
 
 def test_session_restores_extra_keys_on_later_steps() -> None:
