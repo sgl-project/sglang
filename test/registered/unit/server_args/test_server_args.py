@@ -3544,6 +3544,72 @@ class TestPipelineParallelPrefillCudaGraphPolicy(CustomTestCase):
                 self.assertEqual((prefill.max_bs, prefill.bs[-1]), (expected, expected))
 
 
+class TestHybridLinearPrefillCudaGraphPolicy(CustomTestCase):
+    def test_full_prefill_cudagraph_auto_disabled_for_hybrid_linear_models(self):
+        args = ServerArgs(
+            model_path="dummy",
+            cuda_graph_config=CudaGraphConfig(
+                prefill=PhaseConfig(backend=Backend.FULL)
+            ),
+        )
+        args._cuda_graph_config_locked = set()
+        args._model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["Qwen3NextForCausalLM"])
+        )
+        with patch(
+            "sglang.srt.configs.hybrid_arch.mambaish_config",
+            return_value=SimpleNamespace(layer_types=["linear_attn"]),
+        ):
+            apply_cuda_graph_compatibility(args)
+            self.assertEqual(
+                resolution_result(args, "cuda_graph_config").prefill.backend,
+                Backend.DISABLED,
+            )
+
+    def test_full_prefill_cudagraph_preserved_for_non_hybrid_models(self):
+        args = ServerArgs(
+            model_path="dummy",
+            cuda_graph_config=CudaGraphConfig(
+                prefill=PhaseConfig(backend=Backend.FULL)
+            ),
+        )
+        args._cuda_graph_config_locked = set()
+        args._model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"])
+        )
+        with patch(
+            "sglang.srt.configs.hybrid_arch.mambaish_config",
+            return_value=None,
+        ):
+            apply_cuda_graph_compatibility(args)
+            self.assertEqual(
+                resolution_result(args, "cuda_graph_config").prefill.backend,
+                Backend.FULL,
+            )
+
+    def test_full_prefill_cudagraph_explicit_lock_rejected_by_validator(self):
+        from sglang.srt.arg_groups.cuda_graph_hook import validate_cuda_graph_config
+
+        args = ServerArgs(
+            model_path="dummy",
+            cuda_graph_config=CudaGraphConfig(
+                prefill=PhaseConfig(backend=Backend.FULL)
+            ),
+        )
+        args._cuda_graph_config_locked = {(Phase.PREFILL, "backend")}
+        args._model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["Qwen3NextForCausalLM"])
+        )
+        with patch(
+            "sglang.srt.configs.hybrid_arch.mambaish_config",
+            return_value=SimpleNamespace(layer_types=["linear_attn"]),
+        ):
+            with self.assertRaisesRegex(
+                ValueError, "Full prefill CUDA graph is incompatible"
+            ):
+                validate_cuda_graph_config(args)
+
+
 class TestCudaGraphDisaggregationRoles(CustomTestCase):
     def _handled_args(self, **overrides):
         args = ServerArgs(model_path="dummy", **overrides)
