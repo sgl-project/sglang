@@ -1,7 +1,5 @@
 from typing import List
 
-from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
-
 
 def expand_base_rid(rid: str, num: int) -> List[str]:
     """Expand one base rid into ``num`` zero-padded sub-rids ``<rid>_<i>``.
@@ -9,6 +7,8 @@ def expand_base_rid(rid: str, num: int) -> List[str]:
     The scheduler aborts by rid prefix, so unpadded ``<rid>_1`` would also abort
     ``<rid>_10``.
     """
+    from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
+
     if not rid:
         raise ValueError("The rid should be a non-empty string.")
     # Sub-rids keep the base prefix, so a health-check prefix would make every
