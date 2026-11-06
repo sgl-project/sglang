@@ -108,8 +108,12 @@ def get_perf_model(
         attention_dp_size=sched_config.attn_dp_size,
         cp_size=sched_config.cp_size,
         cp_style=sched_config.cp_style,
-        gemm_quant_mode=MAP_DTYPE_TO_GEMMQuantMode.get(
-            sched_config.data_type, GEMMQuantMode.bfloat16
+        gemm_quant_mode=(
+            getattr(GEMMQuantMode, sched_config.gemm_quant_mode_override)
+            if sched_config.gemm_quant_mode_override
+            else MAP_DTYPE_TO_GEMMQuantMode.get(
+                sched_config.data_type, GEMMQuantMode.bfloat16
+            )
         ),
         moe_quant_mode=(
             getattr(MoEQuantMode, sched_config.moe_quant_mode_override)
@@ -134,6 +138,15 @@ def get_perf_model(
 
     logger.info(f"Model config for AIConfigurator: {model_config}")
 
+    for field, value in (
+        ("moe_backend", sched_config.moe_backend_override),
+        ("attention_backend", sched_config.attention_backend_override),
+    ):
+        if value is not None:
+            if not hasattr(model_config, field):
+                raise ValueError(f"Selected AIC API does not support {field}")
+            setattr(model_config, field, value)
+
     return models.get_model(
         model_path=model.model_path,
         model_config=model_config,
@@ -154,6 +167,9 @@ class AIConfiguratorTimePredictor(InferTimePredictor):
         prefill_min_latency: float = 0,
         workload_distribution: str = "balanced",
         enable_oom_check: bool = False,
+        aic_config_path: Optional[str] = None,
+        aic_repository_root: Optional[str] = None,
+        systems_dataset: str = "community_systems_root",
     ):
         super().__init__(model, hw, config)
 
@@ -163,10 +179,24 @@ class AIConfiguratorTimePredictor(InferTimePredictor):
         if isinstance(database_mode, str):
             database_mode = self._get_database_mode(database_mode)
 
-        database = get_database(
+        if aic_config_path is not None:
+            if database_path is not None:
+                raise ValueError("Choose database_path or aic_config_path, not both")
+            from sglang_simulator.aic_providers import load_aic_config
+
+            selected = load_aic_config(
+                aic_config_path, repository_root=aic_repository_root
+            )
+            if systems_dataset not in ("community_systems_root", "legacy_systems_root"):
+                raise ValueError(
+                    "Ordinary predictor requires an explicit systems dataset"
+                )
+            database_path = selected[systems_dataset]
+        database = _sdk.database(
             system=hw.name,
             backend=config.backend_name,
             version=config.backend_version,
+            database_mode=database_mode,
             systems_paths=(
                 [database_path] if database_path is not None else get_systems_paths()
             ),
@@ -175,7 +205,6 @@ class AIConfiguratorTimePredictor(InferTimePredictor):
         if database is None:
             raise ValueError("Failed to initialize the database.")
 
-        database.set_default_database_mode(database_mode)
         logger.info(
             f"AIC API: {_sdk.api}, SDK: {_sdk.version}, data: {database.version}, mode: {database_mode}"
         )
@@ -196,7 +225,7 @@ class AIConfiguratorTimePredictor(InferTimePredictor):
             "EMPIRICAL": DatabaseMode.EMPIRICAL,
             "SOL": DatabaseMode.SOL,
             "SOL_FULL": DatabaseMode.SOL_FULL,
-        }.get(mode.upper(), DatabaseMode.SILICON)
+        }[mode.upper()]
 
     def ctx_attn_flops_ratio_with_avg(self, reqs: list[ScheduleRequest]) -> float:
         if len(reqs) == 1:

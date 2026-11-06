@@ -14,6 +14,9 @@ class SchedulerConfig:
     # AIC adapter overrides — bypass MAP_DTYPE_TO_* lookup when set.
     # Pass aiconfigurator MoEQuantMode/FMHAQuantMode/CommQuantMode enum name as string
     # (e.g. 'w4a8_mxfp4_mxfp8' for DSv4-Pro on Blackwell).
+    gemm_quant_mode_override: Optional[str] = None
+    moe_backend_override: Optional[str] = None
+    attention_backend_override: Optional[str] = None
     moe_quant_mode_override: Optional[str] = None
     fmha_quant_mode_override: Optional[str] = None
     comm_quant_mode_override: Optional[str] = None

@@ -130,6 +130,9 @@ class ConfigManager:
             "backend_version",
             "kv_bytes_per_token_per_gpu",
             "hicache_ratio",
+            "gemm_quant_mode_override",
+            "moe_backend_override",
+            "attention_backend_override",
             "moe_quant_mode_override",
             "fmha_quant_mode_override",
             "comm_quant_mode_override",
@@ -225,6 +228,19 @@ class ConfigManager:
                 prefill_min_latency=prefill_min_latency,
                 workload_distribution=workload_distribution,
                 enable_oom_check=enable_oom_check,
+                aic_config_path=(
+                    predictor_config.get("aic_config_path")
+                    if predictor_config.get("aic_repository_root")
+                    else cls.resolve_config_relative_path(
+                        predictor_config.get("aic_config_path")
+                    )
+                ),
+                aic_repository_root=cls.resolve_config_relative_path(
+                    predictor_config.get("aic_repository_root")
+                ),
+                systems_dataset=predictor_config.get(
+                    "systems_dataset", "community_systems_root"
+                ),
             )
         elif predictor_config.get("name") == "ml":
             from sglang_simulator.time_predictor.ml import MLTimePredictor

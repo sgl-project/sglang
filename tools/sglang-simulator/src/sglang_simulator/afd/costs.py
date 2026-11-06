@@ -7,6 +7,8 @@ into non-overlapping record keys. No model, backend or rank defaults live here.
 import copy
 import math
 
+from sglang_simulator.aic_costs import quote_record, validate_snapshot
+
 from .contracts import CostMapping
 
 
@@ -30,8 +32,14 @@ def template(config, mapping):
 class CostTable:
     def __init__(self, document, mapping: CostMapping):
         document = copy.deepcopy(document)
-        if document["schema_version"] != 1 or type(document["fixture"]) is not bool:
+        schema = document["schema_version"]
+        self.schema_version = schema
+        if schema not in (1, 2) or type(document["fixture"]) is not bool:
             raise ValueError("AFD_COST_SCHEMA_UNSUPPORTED")
+        if schema == 2 and document["fixture"]:
+            raise ValueError("AFD_COST_SCHEMA2_FIXTURE_UNSUPPORTED")
+        if schema == 2:
+            validate_snapshot(document)
         self.config = document["deployment"]
         self.synthetic = document["fixture"]
         self.by = document["costs"]
@@ -45,6 +53,16 @@ class CostTable:
             )
         for key, shape in expected.items():
             record = self.by[key]
+            if schema == 2:
+                validated = quote_record(
+                    shape,
+                    record["source"],
+                    request=record["request"],
+                    consumer_key=key,
+                    **document["cost_policy"],
+                )
+                if record != validated:
+                    raise ValueError(f"AFD_COST_QUOTE_RECORD_MISMATCH: {key}")
             ns = record["duration_ns"]
             if (
                 isinstance(ns, bool)
@@ -63,8 +81,10 @@ class CostTable:
             if basis not in (
                 ("fixture",)
                 if self.synthetic
-                else ("exact", "interpolation", "formula")
+                else ("exact", "interpolation", "formula", "table_lookup_unknown")
             ):
+                raise ValueError(f"AFD_COST_BASIS_INVALID: {key}")
+            if schema == 1 and basis == "table_lookup_unknown":
                 raise ValueError(f"AFD_COST_BASIS_INVALID: {key}")
             if basis == "interpolation" and not record.get("neighbors"):
                 raise ValueError(f"AFD_COST_INTERPOLATION_NEIGHBORS_MISSING: {key}")
@@ -85,5 +105,17 @@ class CostTable:
 
     def quote(self, kind, **metadata):
         records = self.components(kind, **metadata)
-        self.queries.append(dict(kind=kind, **metadata))
+        query = dict(kind=kind, **metadata)
+        if self.schema_version == 2:
+            query["resolved_costs"] = [
+                {
+                    "key": key,
+                    "shape": record["shape"],
+                    "method": record["basis"],
+                    "source": record["source"]["source"],
+                    "qualification": record["source"]["qualification"],
+                }
+                for key, record in records
+            ]
+        self.queries.append(query)
         return round(sum(record["duration_ns"] for _, record in records))

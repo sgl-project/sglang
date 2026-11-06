@@ -98,9 +98,63 @@ apply. For example, this fragment uses an exported `AIC_SYSTEMS_PATH`:
 Add the platform and scheduler sections from [Configuration](#configuration).
 Model/tokenizer files and operator data are separate inputs. `SILICON` selects a
 database mode; inspect individual query provenance for a performance comparison.
-The AFD event runner instead consumes prepared cost records, as described in
-[Supply operator costs](AFD.md#supply-operator-costs). Installing AIC does not
-provide that conversion; a matching cost consumer is not included in this patch.
+The AFD event runner consumes prepared cost records, as described in
+[Typed AIC costs](AFD.md#typed-aic-costs). Use the preparation entry point to bind
+operator requests to a matching execution adapter; installing data alone does not
+infer model or module boundaries.
+
+### Compiled core and published native data
+
+Use the reviewed AIC maintenance checkout for the internal module APIs; the
+community core alone does not include these branch extensions. Python 3.11–3.13
+and a compatible Rust toolchain are required to build the native core. Install
+into a dedicated environment rather than replacing a serving image's packages:
+
+```bash
+# AIC_REPO is a checkout of the matching maintenance branch, with LFS data present.
+git -C "$AIC_REPO" lfs pull
+python -m pip install -e "$AIC_REPO/aic-core"
+python -m pip install -e tools/sglang-simulator
+export SGLANG_SIMULATOR_AIC_API=core
+```
+
+The `aic-core` extra records the 0.12.0 distribution family; the native-module
+extensions still require the matching source checkout. Binaries are built for
+the deployment OS/architecture, not copied from another host. Core query and
+fixed-step checks work on CPU; full Scheduler/HTTP also requires the normal
+SGLang runtime dependencies. A missing `triton` or `sgl_kernel` stops that path.
+
+For ordinary prediction, select either `database_path` or a published config:
+
+```json
+{
+  "predictor": {
+    "name": "aiconfigurator",
+    "aic_config_path": "data/aic/native/SDK_CONFIG.json",
+    "aic_repository_root": "/path/to/aiconfigurator",
+    "systems_dataset": "community_systems_root",
+    "database_mode": "HYBRID"
+  },
+  "scheduler": {
+    "backend_name": "sglang",
+    "backend_version": "0.5.14",
+    "gemm_quant_mode_override": "fp8_static",
+    "moe_backend_override": "DEEPGEMM",
+    "attention_backend_override": "trtllm_mha"
+  }
+}
+```
+
+The published config follows
+`aiconfigurator_core.sdk.dataset_config.load_config(config_path, repository_root=...)`:
+all operational paths are relative to the selected repository root. The Simulator
+also reads the older package-relative config format. Neither format changes the
+imported SDK automatically. Select `legacy|core|auto` before importing the predictor;
+use an explicit family for reproducible runs. An invalid mode is rejected.
+Overrides select AIC model options; they do not prove that a serving kernel,
+Graph mode or recipe matches. Ordinary prediction still uses the selected AIC
+model/backend; module/PPU/external requests are supported by the explicit preparation
+API, not automatically injected into every model forward.
 
 ## Quick start
 

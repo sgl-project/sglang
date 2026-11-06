@@ -45,7 +45,9 @@ def critical_path(events, provider):
         current = by[max(previous)]
     total = sum(event["duration"] for event in path)
     assert total == max(event["finish_ns"] for event in events)
-    contributions = dict(exact=0.0, interpolation=0.0, formula=0.0, fixture=0.0)
+    contributions = dict(
+        exact=0.0, interpolation=0.0, formula=0.0, table_lookup_unknown=0.0, fixture=0.0
+    )
     for event in path:
         if not event["duration"]:
             continue

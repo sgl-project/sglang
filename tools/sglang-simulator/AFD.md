@@ -27,7 +27,7 @@ Use `--afd-execution-mode attention|ffn` and `--afd-config` with
 
 | Boundary | Status |
 | :--- | :--- |
-| Cost catalog | Prepared exact/interpolated/formula records; no live AIC lookup in the runner |
+| Cost catalog | Schema1 declared costs or schema2 typed AIC snapshots; no live AIC lookup in the runner |
 | Unsupported | Auto negotiation, unequal KV, request migration, cross-iteration overlap |
 | Not validated | Capacity admission, numerical model output, full HTTP performance accuracy |
 | New models/backends | Require matching execution and cost adapters |
@@ -214,6 +214,123 @@ Ordinary AIC prediction supports `SGLANG_SIMULATOR_AIC_API=legacy|core|auto`;
 `auto` prefers installed core. The public example selects core explicitly.
 `configure_experiment.py --aic-root … --aic-ref …` records either data layout.
 SDK provenance is retained; kernel and page-layout matching remain conditional.
+
+### Typed AIC costs
+
+AIC owns measurements, bounded interpolation and formulas. Simulator maps each
+execution invocation to a disjoint cost record, checks its contract and advances
+virtual events. The event coordinator and HTTP request lifecycle do not perform
+numerical interpolation or choose a fallback database.
+
+| Layer | Contract |
+| :--- | :--- |
+| Configuration | `data/aic/native/SDK_CONFIG.json` plus an explicit AIC repository root; resolve relative operational paths and verify declared inputs |
+| Request | `op`, `system`, `query`, `conditions`, `scope`, `resolution`, `shape_bindings`; one request per adapter cost key |
+| Provider | `core`, `module`, `ppu`, `external`, or `formula`; no retry through another provider on a miss |
+| Quote | `aic.cost_quote.v1`: latency in ms; independent source, method, qualification, scope and provenance |
+| Snapshot | schema2 retains requests/quotes and bound input identities; costs convert ms→ns once; replay does not query AIC |
+| Event / metric | Events use ns; fixed-step output uses ms and token/s; ordinary predictors return seconds |
+
+Module, PPU and formula providers require matching `module_costs`,
+`ppu_modules`, `analytical_costs` and typed-quote APIs. Existing scalar queries
+also support legacy/core compatibility; module providers require core. The
+published native config is an internal maintenance interface, not a promise
+that upstream AIC includes these datasets.
+
+Configure existing checkouts without installing or rebasing them:
+
+```bash
+python tools/sglang-simulator/scripts/configure_experiment.py \
+  --simulator-root "$PWD" --source-root "$AFD_SOURCE_ROOT" --routing direct \
+  --aic-root "$AIC_REPO" --aic-config "$AIC_REPO/data/aic/native/SDK_CONFIG.json" \
+  --aic-api core --output ./experiment-env
+. ./experiment-env/env.sh
+```
+
+Prepare a new snapshot from a model-specific deployment and request map, then
+use the same fixed-step CLI or list the snapshot in the existing decode catalog:
+
+```bash
+python -m sglang_simulator.aic_prepare \
+  --aic-config "$AIC_REPO/data/aic/native/SDK_CONFIG.json" \
+  --aic-repository-root "$AIC_REPO" --deployment deployment.json \
+  --requests requests.json --source-root "$AFD_SOURCE_ROOT" \
+  --allow-conditional --output costs.json
+python -m sglang_simulator.afd.cli --routing direct \
+  --source-root "$AFD_SOURCE_ROOT" --costs costs.json --output result.json
+```
+
+`deployment.json` uses the selected adapter's template configuration.
+`requests.json` has exactly its expected cost keys. Every prepared request declares
+`billing.group` and `billing.kind` (module or leaf). For each key, provide the
+full AIC query/conditions/scope and explicit bindings from every consumer shape
+field to a quote field (`quote_path`, with documented nonnumeric aliases or
+numeric factor/offset only when required by the actual mapping). No query shapes
+are inferred from a model name. A module request has this structure:
+
+```json
+{
+  "qkv": {
+    "op": "qkv", "system": "gb300",
+    "query": {"m": 16, "n": 9216, "k": 4096},
+    "conditions": {"actual_mode": "graph"},
+    "scope": {"included": ["projection"], "excluded": []},
+    "resolution": {"provider": "module", "dataset": "gb300_module"},
+    "shape_bindings": {"m": {"quote_path": "query.m"}},
+    "billing": {"group": "attention.qkv", "kind": "module"}
+  }
+}
+```
+
+This is a structure example: copy the **complete** native contract and all
+consumer shape bindings for the selected dataset/adapter; the shortened fields
+above intentionally do not constitute a runnable full-model request map.
+
+| Provider | Explicit `resolution` fields / behavior |
+| :--- | :--- |
+| `core` | `dataset` systems-root key, `backend`, `version`, `database_mode`, `operation`; query contains scalar SDK arguments. Backend/data-version conditions must agree |
+| `module` | `dataset` config key; exact native query, conditions and full module scope |
+| `ppu` | `dataset`; either a named `curve_id`/`coordinate`, or explicit Attention query. Optional KV interpolation is a separate boolean opt-in |
+| `external` | `name` selects a callable explicitly registered by a trusted Python caller through `external_providers`; JSON cannot import extension code |
+| `formula` | systems `dataset`, `backend`, `version`, named `formula`, explicit `parameters` and assumptions; computation stays in AIC |
+
+Default qualification is `matched`. `--allow-conditional`, `--allow-unknown`
+and `--allow-unknown-source` are independent opt-ins. `unsupported`, mismatched
+scope/shape, missing keys, changed snapshots and missing/out-of-domain costs fail.
+An `active:false` dataset additionally requires `--allow-archive-control` and
+`purpose=historical_control` on its request. No archive is selected by default.
+
+Methods remain exact/interpolation/formula; `table_lookup_unknown` preserves a
+scalar SDK lookup that does not distinguish exact hits from interpolation. It is
+not converted to a fabricated neighbor list. Source and qualification remain
+independent of the numerical lookup method. For a known billing
+boundary, all related records declare the same `billing.group` and
+`kind=module|leaf`; a complete module cannot coexist with its leaves in that group.
+A missing billing declaration in a historical snapshot does not certify its mapping.
+
+Schema1 remains available for old declared-cost and control fixtures. Schema2
+is checked by both fixed-step and decode-catalog consumers; prefill remains an
+explicit whole-batch declared cost. Adding module/PPU/external pricing does **not**
+add model-specific execution, nonuniform-KV or general heterogeneous HTTP support.
+Those require matching model/execution mappings. No scheduling core change or
+new serving-accuracy claim follows from this format integration.
+
+### Contract validation
+
+With the matching core checkout installed, run the native contract checks:
+
+```bash
+SGLANG_SIMULATOR_AIC_CONFIG="$AIC_REPO/data/aic/native/SDK_CONFIG.json" \
+SGLANG_SIMULATOR_AIC_REPOSITORY_ROOT="$AIC_REPO" \
+PYTHONPATH="tools/sglang-simulator/src${PYTHONPATH:+:$PYTHONPATH}" \
+python -m pytest -q tools/sglang-simulator/test/test_aic_cost_contracts.py
+```
+
+The focused CPU regressions cover native construction and stage splitting,
+source-module restoration, request clocks, cost/billing contracts, dataset
+selection and legacy/core compatibility. Same-cost fixed-step comparisons retain
+identical predictions. These checks do not add full HTTP performance or new
+hardware-accuracy qualification.
 
 ## Demo results
 

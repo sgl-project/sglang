@@ -41,6 +41,17 @@ def main():
         if name != "source":
             p.add_argument("--" + name + "-ref")
     p.add_argument("--systems-path", type=Path)
+    p.add_argument(
+        "--aic-config",
+        type=Path,
+        help="Published SDK_CONFIG.json, with relative data paths",
+    )
+    p.add_argument("--aic-api", choices=("auto", "legacy", "core"))
+    p.add_argument(
+        "--systems-dataset",
+        choices=("community_systems_root", "legacy_systems_root"),
+        default="community_systems_root",
+    )
     p.add_argument("--mode", choices=["afd"], default="afd")
     p.add_argument("--routing", choices=["f-side", "direct"])
     p.add_argument(
@@ -73,19 +84,34 @@ def main():
         "automatic_rebase": False,
         "model_executed": False,
     }
-    if a.aic_root:
-        ar = a.aic_root.resolve(strict=True)
+    if a.aic_root or a.aic_config:
+        from sglang_simulator.aic_providers import load_aic_config
+
+        data_config = (
+            load_aic_config(a.aic_config, repository_root=a.aic_root)
+            if a.aic_config
+            else None
+        )
+        ar = (a.aic_root or a.aic_config.parent).resolve(strict=True)
         core_systems = ar / "aic-core/src/aiconfigurator_core/systems"
         default_systems = (
             core_systems if core_systems.is_dir() else ar / "src/aiconfigurator/systems"
         )
-        systems = (a.systems_path or default_systems).resolve(strict=True)
+        selected = (
+            Path(data_config[a.systems_dataset]) if data_config else default_systems
+        )
+        systems = (a.systems_path or selected).resolve(strict=True)
         if not systems.is_dir():
             raise ValueError("--systems-path must be a systems directory")
         state["aic"] = dict(
             git_info(ar, a.aic_ref),
             systems_path=str(systems),
             installation="separately installed editable checkout or pinned wheel",
+            api=a.aic_api or ("core" if data_config else "auto"),
+            data_config=str(a.aic_config.resolve()) if a.aic_config else None,
+            pythonpath=data_config.get("runtime", {}).get("pythonpath")
+            if data_config
+            else None,
         )
     state["status"] = "SOURCE_API_CHECKED"
     a.output.mkdir(parents=True)
@@ -103,7 +129,18 @@ def main():
         lines += [
             "export AIC_ROOT=" + shlex.quote(state["aic"]["root"]),
             "export AIC_SYSTEMS_PATH=" + shlex.quote(state["aic"]["systems_path"]),
+            "export SGLANG_SIMULATOR_AIC_API=" + shlex.quote(state["aic"]["api"]),
         ]
+        if state["aic"]["data_config"]:
+            lines.append(
+                "export AIC_CONFIG_PATH=" + shlex.quote(state["aic"]["data_config"])
+            )
+        if state["aic"]["pythonpath"]:
+            lines.append(
+                "export PYTHONPATH="
+                + shlex.quote(state["aic"]["pythonpath"])
+                + ":$PYTHONPATH"
+            )
     (a.output / "env.sh").write_text("\n".join(lines) + "\n")
     print("source " + shlex.quote(str(a.output.resolve() / "env.sh")))
     return 0

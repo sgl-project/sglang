@@ -41,6 +41,42 @@ class AICSDK:
             )
         return _CoreSession(model, database, backend)
 
+    def database(self, system, backend, version, *, systems_paths, database_mode):
+        """Select an explicit store/version and an isolated mode when supported."""
+        module = self.module("perf_database")
+        if self.api == "core":
+            view = getattr(module, "get_database_view", None)
+            if view is not None:
+                return view(
+                    system,
+                    backend,
+                    version,
+                    systems_paths=systems_paths,
+                    database_mode=database_mode,
+                    shared_layer=False,
+                    strict_provenance=True,
+                    allow_unlisted_version=True,
+                )
+            return module.get_database(
+                system,
+                backend,
+                version,
+                systems_paths=systems_paths,
+                database_mode=database_mode,
+                shared_layer=False,
+            )
+        database = module.get_database(
+            system, backend, version, systems_paths=systems_paths
+        )
+        if database is not None:
+            mode = (
+                getattr(self.common.DatabaseMode, database_mode)
+                if isinstance(database_mode, str)
+                else database_mode
+            )
+            database.set_default_database_mode(mode)
+        return database
+
     def query(self, database, kind, *, systems_path=None, **shape):
         """Return milliseconds and unmodified SDK provenance for one operation.
 
