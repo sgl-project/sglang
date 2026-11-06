@@ -46,7 +46,10 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
-from sglang.srt.utils import get_bool_env_var, next_power_of_2
+from sglang.srt.utils import (
+    get_bool_env_var,
+    next_power_of_2,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention

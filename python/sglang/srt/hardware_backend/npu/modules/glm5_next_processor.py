@@ -79,8 +79,6 @@ def npu_apply_glm5_next_preprocess_patch(processor) -> bool:
 
     for processor_type, wrapper in patches:
         original = getattr(processor_type, "patchify", None)
-        if not callable(original):
-            return False
         if getattr(original, _NPU_PATCH_MARKER, False):
             continue
         patched = wrapper(original)

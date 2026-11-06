@@ -483,14 +483,11 @@ def forward_dsa_prepare_npu(
                 m.rotary_emb, positions, q_pe, k_pe
             )
         else:
-            if (
-                m.rotary_emb is not None
-                and m.layer_id == get_token_to_kv_pool().start_layer
-            ):
-                m.rotary_emb.sin_cos_cache = m.rotary_emb.cos_sin_cache.index_select(
-                    0, positions
-                )
             if m.rotary_emb is not None:
+                if m.layer_id == get_token_to_kv_pool().start_layer:
+                    m.rotary_emb.sin_cos_cache = (
+                        m.rotary_emb.cos_sin_cache.index_select(0, positions)
+                    )
                 q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
 
         if dsa_use_prefill_cp(forward_batch):

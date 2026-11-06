@@ -23,7 +23,9 @@ from sglang.srt.utils.common import is_gfx1250_supported, is_npu
 
 _is_hip = is_hip()
 if _is_hip:
-    from sglang.kernels.ops.layernorm.mhc_boundary_hip import hc_mix_reduce_sinkhorn_vec
+    from sglang.kernels.ops.layernorm.mhc_boundary_hip import (
+        hc_mix_reduce_sinkhorn_vec,
+    )
 
 logger = logging.getLogger(__name__)
 

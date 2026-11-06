@@ -4173,16 +4173,11 @@ class HybridLinearKVPool(KVCache):
             assert index_head_dim is not None and kv_cache_dim is not None, (
                 "HybridLinearKVPool with use_dsa requires index_head_dim and kv_cache_dim"
             )
-            if full_kv_pool_class is not None:
-                DSAPoolClass = full_kv_pool_class
-            elif _is_npu:
-                from sglang.srt.hardware_backend.npu.memory_pool_npu import (
-                    NPUMLATokenToKVPool,
-                )
-
-                DSAPoolClass = NPUMLATokenToKVPool
-            else:
-                DSAPoolClass = DSATokenToKVPool
+            DSAPoolClass = (
+                full_kv_pool_class
+                if full_kv_pool_class is not None
+                else DSATokenToKVPool
+            )
             self.full_kv_pool = DSAPoolClass(
                 size=size,
                 page_size=self.page_size,

@@ -469,7 +469,6 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                 from sglang.srt.hardware_backend.xpu.attention.xpu_gdn_backend import (
                     XpuGDNAttnBackend as GDNAttnBackend,
                 )
-
         else:
             from sglang.srt.hardware_backend.npu.attention.ascend_gdn_backend import (
                 AscendGDNAttnBackend as GDNAttnBackend,

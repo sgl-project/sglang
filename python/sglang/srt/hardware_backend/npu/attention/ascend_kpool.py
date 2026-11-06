@@ -178,7 +178,6 @@ class AscendKPoolWorkspace:
         active = self.valid_requests
         owner = torch.where(active, self.req_pool_indices.long(), 0)
         slots = self.pooled_slot_mapping
-        slots.fill_(-1)
         self.tail_write_indices.fill_(-1)
         self.tail_state_indices.fill_(-1)
         self.tail_token_indices.fill_(-1)
