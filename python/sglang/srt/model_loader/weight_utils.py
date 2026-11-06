@@ -73,7 +73,7 @@ from sglang.srt.utils import (
     log_info_on_rank0,
     print_warning_once,
 )
-from sglang.srt.utils.common import is_cuda_alike
+from sglang.srt.utils.device import is_cuda_alike
 from sglang.utils import is_in_ci
 
 try:

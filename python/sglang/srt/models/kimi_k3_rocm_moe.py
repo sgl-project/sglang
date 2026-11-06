@@ -24,7 +24,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import unquant
-from sglang.srt.utils.common import print_warning_once
+from sglang.srt.utils.log_utils import print_warning_once
 
 # Merged MoE front [shared gate-up | router | latent down] at TP8; other TPs differ.
 # Only this shape has tuned bf16 rows (ROCm/aiter#6411, gfx950 with 256 CUs only).

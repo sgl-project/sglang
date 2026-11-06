@@ -88,6 +88,8 @@ from sglang.srt.layers.quantization.fp8_utils import (
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -111,6 +113,7 @@ from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
 )
 from sglang.srt.models.deepseek_common.utils import tiny_router_gemm_max_tokens
 from sglang.srt.models.dots3_common.fp8 import per_token_group_quant_einsum_fp8
+from sglang.srt.models.utils import bind_or_assign
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import (
     get_device,
@@ -120,13 +123,10 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils import (
     BumpAllocator,
     LazyValue,
-    add_prefix,
-    bind_or_assign,
     ceil_align,
     ceil_div,
     is_cuda,
     log_info_on_rank0,
-    make_pp_layers,
 )
 
 _is_cuda = is_cuda()

@@ -718,7 +718,11 @@ for f in README.md LICENSE; do
 done
 
 python3 -m pip uninstall -y sglang || true
-python3 -m pip install --no-deps --no-build-isolation -e "$RUNTIME_CHECKOUT/python"
+# Install with runtime_base (the torch-free deps) instead of --no-deps: the
+# image can predate a dependency the checkout imports (blake3 from #47120
+# failed every 11-05 job on image 20261104). pip's default only-if-needed
+# strategy leaves already-satisfied packages, including torch/aiter, alone.
+python3 -m pip install --no-build-isolation -e "$RUNTIME_CHECKOUT/python[runtime_base]"
 
 export RUNTIME_CHECKOUT
 export PYTHONPATH="$RUNTIME_CHECKOUT/python:${PYTHONPATH:-}"

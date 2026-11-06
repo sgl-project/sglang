@@ -16,7 +16,7 @@ from sglang.srt.models.kimi_k3_rocm_moe import (
     _first_untuned_tokens,
     build_tuned_front_gemm,
 )
-from sglang.srt.utils.common import is_hip
+from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
