@@ -81,6 +81,7 @@ def route_topk_with_mlb(
         routed_scaling_factor=routed_scaling_factor,
     )
     resources = context.resources
+    # With a balancer, physical ids are recorded here rather than in TopK.
     resources.expert_distribution_recorder.on_select_experts(
         topk_ids=output.recorded_physical_topk_ids
     )

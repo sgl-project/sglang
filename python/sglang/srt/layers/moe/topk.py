@@ -2644,7 +2644,6 @@ def _post_process_topk_ids(
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     padded_rows_masked: bool = False,
-    defer_expert_recording: bool = False,
     moe_load_balancer=None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     num_shared_topk_slots = topk_config.num_shared_topk_slots
@@ -2663,7 +2662,7 @@ def _post_process_topk_ids(
     routed_topk_ids = (
         topk_ids[:, :-num_shared_topk_slots] if _gate_appended else topk_ids
     )
-    if not defer_expert_recording and moe_load_balancer is None:
+    if moe_load_balancer is None:
         capture_routed_experts_if_allowed(topk_config, layer_id, routed_topk_ids)
     recorder_topk_ids = None
     _aiter_append = (
@@ -2741,11 +2740,8 @@ def _post_process_topk_ids(
             recorder_topk_ids = routed_cols
         else:
             fused_topk_ids = None
-            load_buffer = None
-            if not defer_expert_recording:
-                # The MoE load balancer remaps and records after TopK itself.
-                recorder = get_global_expert_distribution_recorder()
-                load_buffer = recorder.get_current_pass_count_buffer()
+            recorder = get_global_expert_distribution_recorder()
+            load_buffer = recorder.get_current_pass_count_buffer()
             if load_buffer is not None:
                 fused_topk_ids = topk_ids_logical_to_physical_and_record(
                     topk_ids,
@@ -2795,7 +2791,7 @@ def _post_process_topk_ids(
             and envs.SGLANG_AITER_MEGA_EPLB_FUSED_MAP_RECORD.get()
             and envs.SGLANG_AITER_MEGA_RANK_SYNC.get()
         ):
-            if get_moe_a2a_backend().is_megamoe() and not defer_expert_recording:
+            if get_moe_a2a_backend().is_megamoe():
                 recorder = get_global_expert_distribution_recorder()
                 load_buffer = recorder.get_current_pass_count_buffer()
                 if load_buffer is not None:
@@ -2960,7 +2956,6 @@ def select_experts(
     dynamic_expert_bias: Optional[torch.Tensor] = None,
     router_logits_partials: Optional[torch.Tensor] = None,
     moe_load_balancer=None,
-    defer_expert_recording: bool = False,
 ) -> StandardTopKOutput:
     top_k = topk_config.top_k
     use_grouped_topk = topk_config.use_grouped_topk
@@ -3020,7 +3015,6 @@ def select_experts(
             router_logits, correction_bias
         )
         expert_location_dispatch_info = None
-        defer_expert_recording = True
     else:
         (
             router_logits,
@@ -3276,11 +3270,10 @@ def select_experts(
         layer_id=layer_id,
         expert_location_dispatch_info=expert_location_dispatch_info,
         padded_rows_masked=padded_rows_masked,
-        defer_expert_recording=defer_expert_recording,
         moe_load_balancer=moe_load_balancer,
     )
 
-    if recorder_topk_ids is not None and not defer_expert_recording:
+    if recorder_topk_ids is not None and moe_load_balancer is None:
         get_global_expert_distribution_recorder().on_select_experts(
             topk_ids=recorder_topk_ids
         )
