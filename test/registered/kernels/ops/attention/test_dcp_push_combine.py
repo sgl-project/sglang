@@ -37,10 +37,12 @@ register_cuda_ci(est_time=60, stage="extra-b", runner_config="8-gpu-h200")
 
 H = 96  # Kimi-K3.1 MLA heads, all held by every DCP rank
 MAX_ROWS = 1024
+_COMM = None  # owns the push buffers that register_comm only points at
 
 
 @cache_once
 def _setup() -> ps.GroupCoordinator:
+    global _COMM
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(local_rank)
@@ -65,6 +67,8 @@ def _setup() -> ps.GroupCoordinator:
     )
     assert not comm.disabled
     pc.register_comm(comm.obj)
+    _COMM = comm
+    atexit.register(comm.close)  # LIFO: runs before destroy_process_group
     return coord
 
 

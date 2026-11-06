@@ -180,8 +180,6 @@ def test_request_ordered_byte_gather():
 
 
 def test_candidate_merge_scratch_and_graph_replay():
-    from functools import partial
-
     from sglang.kernels.ops.attention.dsv4.topk import plan_topk_v2
     from sglang.srt.layers.attention.dsa import dsa_dcp_sharded as dsa_dcp
 
@@ -201,7 +199,7 @@ def test_candidate_merge_scratch_and_graph_replay():
             local = (lengths + world - 1 - rank) // world
             table = torch.arange(64, device="cuda", dtype=torch.int32).expand(rows, -1)
 
-            def call(scores, local, lengths, table, **kwargs):
+            def call(scores, local, lengths, table):
                 return dsa_dcp.dcp_global_topk(
                     scores,
                     local,
@@ -210,7 +208,6 @@ def test_candidate_merge_scratch_and_graph_replay():
                     2048,
                     64,
                     plan_topk_v2(lengths),
-                    **kwargs,
                 )
 
             for _ in range(2):
@@ -226,13 +223,9 @@ def test_candidate_merge_scratch_and_graph_replay():
                 scores.uniform_()
                 lengths.fill_(length)
                 local.copy_((lengths + world - 1 - rank) // world)
-                expected = call(
-                    scores,
-                    local,
-                    lengths,
-                    table,
-                    all_gather=partial(group.all_gather, dim=0),
-                )
+                # Eager reference through the plain group all-gather.
+                with patch.object(dsa_dcp, "_CANDIDATE_ALL_GATHER", None):
+                    expected = call(scores, local, lengths, table)
                 graph.replay()
                 torch.cuda.synchronize()
                 # The top-k contract specifies the selected set, not output order.
