@@ -21,7 +21,8 @@ from sglang.srt.runtime_context import (
     process_model_config,
     uses_mla_backend,
 )
-from sglang.srt.utils.common import ceil_align, is_npu
+from sglang.srt.utils.common import ceil_align
+from sglang.srt.utils.device import is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig

@@ -45,7 +45,7 @@ from sglang.srt.speculative.draft_worker_common import (
 )
 from sglang.srt.speculative.dspark_components.dspark_config import (
     DSV4_DRAFT_ATTENTION_BACKEND,
-    draft_is_deepseek_v4,
+    draft_uses_compressed_kv_attention,
     resolve_runtime_config,
 )
 from sglang.srt.speculative.dspark_components.dspark_deferred_commit import (
@@ -91,14 +91,13 @@ from sglang.srt.speculative.spec_utils import (
     build_grammar_vocab_mask,
     draft_pp_context,
     draft_tp_context,
-    prepare_mamba_track_for_verify,
 )
 from sglang.srt.utils import (
     is_cuda,
     is_cuda_alike,
     is_npu,
 )
-from sglang.srt.utils.common import async_h2d
+from sglang.srt.utils.device import async_h2d
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -192,7 +191,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         if not self._hosts_draft:
             return
 
-        self._draft_is_moe = draft_is_deepseek_v4()
+        self._draft_is_moe = draft_uses_compressed_kv_attention()
         self.draft_parallel_layout = resolve_draft_parallel_layout(
             model_draft_parallel_spec(
                 target_worker.model_runner.spec_aux_config.draft_model_config,
@@ -1155,7 +1154,6 @@ class DSparkWorkerV2(BaseSpecWorker):
                         else simulate_bonus_sampling_info.temperatures[:bs]
                     ),
                 )
-        prepare_mamba_track_for_verify(batch)
         with self._observers.segment(InfoSegment.TARGET_VERIFY):
             if run_compact:
                 target_verify, hidden_strided = self._verify_executor.run_compact(

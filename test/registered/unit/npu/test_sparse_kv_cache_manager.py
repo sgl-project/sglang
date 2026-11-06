@@ -18,9 +18,9 @@ from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
 from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload import config
+from sglang.srt.layers import dp_attention
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool, ReqToTokenPool
 from sglang.srt.runtime_context import get_context
-from sglang.srt.utils import common
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -96,7 +96,7 @@ class TestSparseKVCacheManager(CustomTestCase):
             ("get_cuda_graph_batch_size_alignment", 1),
             ("require_mlp_sync", False),
         ):
-            patcher = patch.object(common, name, return_value=value)
+            patcher = patch.object(dp_attention, name, return_value=value)
             patcher.start()
             self.addCleanup(patcher.stop)
 
@@ -247,15 +247,15 @@ class TestSparseKVCacheManager(CustomTestCase):
                 with (
                     self.subTest(enable_lru=enable_lru, runner=runner),
                     patch.object(
-                        common,
+                        dp_attention,
                         "get_cuda_graph_batch_size_alignment",
                         return_value=16 if runner == "graph" else 1,
                     ),
                     patch.object(
-                        common, "require_mlp_sync", return_value=runner == "eager"
+                        dp_attention, "require_mlp_sync", return_value=runner == "eager"
                     ),
                     patch.object(
-                        common,
+                        dp_attention,
                         "get_parallel",
                         return_value=SimpleNamespace(attn_tp_size=16),
                     ),

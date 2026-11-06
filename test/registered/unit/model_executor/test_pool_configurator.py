@@ -544,6 +544,7 @@ class TestHybridSWAConfigurator(CustomTestCase):
         configurator = object.__new__(KVCacheConfigurator)
         configurator.model_config = mr.model_config
         configurator.is_hybrid_swa = True
+        configurator.use_mla_backend = False
         configurator.is_draft_worker = False
         target = configurator._derive_pool_sizes(config=config)
         configurator.is_draft_worker = True
