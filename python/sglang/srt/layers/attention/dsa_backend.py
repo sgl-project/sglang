@@ -427,29 +427,6 @@ def _validate_triton_sparse_mla_backend(
             )
 
 
-def _validate_dcp_backend(
-    *,
-    kimi_k31: bool,
-    use_fused_topk: bool,
-    use_topk_v2: bool,
-    prefill_impl: str,
-    decode_impl: str,
-) -> None:
-    if not kimi_k31:
-        raise ValueError("DSA with --dcp-size > 1 is implemented for Kimi-K3.1 only.")
-    if not use_fused_topk:
-        raise ValueError("DSA with --dcp-size > 1 needs fused DSA top-k.")
-    if not use_topk_v2:
-        raise ValueError(
-            "DSA with --dcp-size > 1 needs the v2 top-k (SGLANG_OPT_USE_TOPK_V2)."
-        )
-    if prefill_impl != "flashmla_kv" or decode_impl != "flashmla_kv":
-        raise ValueError(
-            "DSA with --dcp-size > 1 needs --dsa-prefill-backend and "
-            f"--dsa-decode-backend flashmla_kv; got {prefill_impl} and {decode_impl}."
-        )
-
-
 def _resolve_dsa_triton_union(*, union: int, deterministic: bool) -> int:
     # Union makes a token's output depend on which tokens share its group and
     # on the T % G tail, which breaks the batch invariance deterministic
@@ -597,8 +574,7 @@ class DeepseekSparseAttnBackend(
         )
         self.kv_scale_ue8m0 = model_runner.token_to_kv_pool.kv_scale_ue8m0
         self.dsa_index_topk = get_dsa_index_topk(hf_config)
-        kimi_k31 = is_kimi_k31(hf_config)
-        self.dsa_packed_extend_topk = _is_hip or kimi_k31
+        self.dsa_packed_extend_topk = _is_hip or is_kimi_k31(hf_config)
         self.dsa_index_kpool = get_dsa_index_kpool(hf_config)
         self.physical_page_size = model_runner.page_size // self.dsa_index_kpool
         sharded_dcp = dsa_shards_index_k()
@@ -756,13 +732,6 @@ class DeepseekSparseAttnBackend(
                 "Disabling fused DSA top-k for IndexShare under PD disaggregation."
             )
         if self.attn_dcp_size > 1:
-            _validate_dcp_backend(
-                kimi_k31=kimi_k31,
-                use_fused_topk=self.use_fused_topk,
-                use_topk_v2=self.dsa_topk_backend.should_use_topk_v2(),
-                prefill_impl=self.dsa_prefill_impl,
-                decode_impl=self.dsa_decode_impl,
-            )
             max_rows = max(model_runner.max_running_requests, 1)
             # The fused merge returns only this rank's slots; top-k capture needs all.
             if (
