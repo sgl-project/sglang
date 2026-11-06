@@ -767,6 +767,19 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         self.assertEqual(req[0].image_data, ["i1", "i2"])
         self.assertEqual(req[0].mm_hashes, ["h1", "h2"])
 
+    def test_routing_key_survives_batch_split(self):
+        """A routing-key request must retain its scheduling affinity after fan-out."""
+        for text, n in ((["first", "second"], 1), ("first", 2)):
+            with self.subTest(text=text, n=n):
+                req = GenerateReqInput(
+                    text=text, sampling_params={"n": n}, routing_key="conversation-a"
+                )
+                req.normalize_batch_and_arguments()
+                self.assertEqual(
+                    [req[i].routing_key for i in range(2)],
+                    ["conversation-a", "conversation-a"],
+                )
+
     def test_parallel_sampling_preserves_reasoning_controls(self):
         single = GenerateReqInput(
             text="Hello",
