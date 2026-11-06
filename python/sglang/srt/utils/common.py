@@ -455,22 +455,11 @@ def get_available_gpu_memory(
             free_gpu_memory, _ = torch.cuda.mem_get_info(gpu_id)
 
     elif device == "xpu":
-        num_gpus = torch.xpu.device_count()
-        assert gpu_id < num_gpus
-
-        if torch.xpu.current_device() != gpu_id:
-            logger.warning(
-                "current device is not %s, but %s, which may cause useless "
-                "memory allocation for torch XPU context.",
-                gpu_id,
-                torch.xpu.current_device(),
-            )
-
         if empty_cache:
             empty_device_cache(torch.xpu)
-        used_memory = torch.xpu.memory_allocated(gpu_id)
-        total_gpu_memory = torch.xpu.get_device_properties(gpu_id).total_memory
-        free_gpu_memory = total_gpu_memory - used_memory
+        free_gpu_memory, total_gpu_memory = current_platform.get_available_memory(
+            gpu_id
+        )
 
     elif device == "hpu":
         num_gpus = torch.hpu.device_count()

@@ -8,7 +8,7 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
-from sglang.srt.utils.cuda_vmm_utils import align_down, align_up
+from sglang.srt.utils.vmm_common import align_down, align_up
 
 # one (start, end_capped) expert range per peer DWDP rank
 PeerRanges = List[Tuple[int, int]]
@@ -277,6 +277,13 @@ def build_layer_weight_specs(
 ) -> LayerWeightSpecs:
     specs: LayerWeightSpecs = {}
     for (layer_idx, name), param in local_params.items():
+        if not param.is_contiguous():
+            raise RuntimeError(
+                f"DWDP expert weight {name} of layer {layer_idx} is not contiguous "
+                f"(shape={tuple(param.shape)}, stride={param.stride()}); the "
+                f"composite VA layout addresses experts by their logical byte size, "
+                f"so a padded row stride would place them at the wrong offsets"
+            )
         chunk_shape = tuple(param.shape)
         specs.setdefault(layer_idx, {})[name] = WeightSpec(
             num_experts=num_routed_experts,

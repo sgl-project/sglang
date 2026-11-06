@@ -468,6 +468,11 @@ def handle_dwdp(server_args: Any):
     assert not cfg.enable_two_batch_overlap, (
         "DWDP's prefetch event protocol does not support two-batch overlap"
     )
+    # fused shared experts append a row to every expert shard, which overruns the
+    # composite VA window each rank owns
+    assert not cfg.enforce_shared_experts_fusion, (
+        "DWDP is incompatible with --enforce-shared-experts-fusion"
+    )
 
     if cfg.disaggregation_mode == "null":
         logger.warning(
