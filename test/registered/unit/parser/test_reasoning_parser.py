@@ -57,6 +57,18 @@ class TestBaseReasoningFormatDetector(CustomTestCase):
         self.assertEqual(result.reasoning_text, "This is reasoning")
         self.assertEqual(result.normal_text, "This is normal")
 
+    def test_detect_and_parse_quoted_think_end_uses_last_occurrence(self):
+        """Bug regression (#48791): quoted think_end_token inside reasoning
+        must remain in reasoning_text when the real closing tag comes later."""
+        text = (
+            "<think>mentions `</think>` mid-thought then continues</think>answer"
+        )
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(
+            result.reasoning_text, "mentions `</think>` mid-thought then continues"
+        )
+        self.assertEqual(result.normal_text, "answer")
+
     def test_detect_and_parse_force_reasoning(self):
         """Test forced reasoning mode."""
         detector = BaseReasoningFormatDetector(
@@ -201,6 +213,29 @@ class TestDeepSeekR1Detector(CustomTestCase):
         # Should be treated as reasoning because force_reasoning=True
         self.assertEqual(result.reasoning_text, "I need to think about this.")
         self.assertEqual(result.normal_text, "The answer is 42.")
+
+    def test_detect_and_parse_quoted_think_end_stays_in_reasoning(self):
+        """Bug regression (#48791): a literal `</think>` quoted inside the
+        chain-of-thought must not truncate reasoning_content. Non-streaming
+        parse splits on the last think_end_token so the quoted tag stays in
+        reasoning and only the real closing delimiter starts content."""
+        text = (
+            "The client must split at the `</think>` marker. "
+            "Wait, with reasoning enabled the parser handles it. "
+            "Let me verify the field structure.</think>"
+            "Here is the answer."
+        )
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(
+            result.reasoning_text,
+            (
+                "The client must split at the `</think>` marker. "
+                "Wait, with reasoning enabled the parser handles it. "
+                "Let me verify the field structure."
+            ),
+        )
+        self.assertEqual(result.normal_text, "Here is the answer.")
+        self.assertNotIn("</think>", result.normal_text)
 
     def test_finish_flushes_truncated_forced_reasoning(self):
         """Bug regression: DeepSeek-R1 forces reasoning without a <think> start

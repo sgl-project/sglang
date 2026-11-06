@@ -190,9 +190,11 @@ class BaseReasoningFormatDetector:
                 reasoning_text=self._strip_partial_tool_start(processed_text)
             )
 
-        # Extract reasoning content
+        # Extract reasoning content. Prefer the last think_end_token so a
+        # quoted closing tag inside the chain-of-thought stays in reasoning
+        # (see #48791). Streaming still uses first-match; see parse path.
         if self.think_end_token in processed_text:
-            splits = processed_text.split(self.think_end_token, maxsplit=1)
+            splits = processed_text.rsplit(self.think_end_token, maxsplit=1)
             reasoning_text = splits[0]
             normal_text = splits[1]
 
