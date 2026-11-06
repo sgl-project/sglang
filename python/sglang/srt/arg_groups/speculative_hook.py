@@ -944,8 +944,8 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
         if backend in DFLASH_MLA_ONLY_DRAFT_BACKENDS:
             # These serve only MLA layers: a draft verify window through the
             # target's MLA decode kernels (DCP owner rows under DCP).
+            from sglang.srt.hf_transformers import get_config
             from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
-            from sglang.srt.utils.hf_transformers import get_config
 
             draft_hf_config = get_config(
                 cfg.speculative_draft_model_path,
