@@ -2144,6 +2144,21 @@ def mxfp8_group_quantize(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     return q_input.contiguous(), scale_u8.contiguous()
 
 
+# (N, K) of the dense MXFP8 GEMMs where cuDNN's SM107 kernel beats the CuTe-DSL one at
+# prefill sizes (wo_b, Engram KV); the two backends are bitwise equal.
+_SM107_CUDNN_MXFP8_NK = ((5120, 8192), (25600, 6144))
+_SM107_CUDNN_MXFP8_MIN_M = 8192
+
+
+@lru_cache(maxsize=1)
+def _sm107_cudnn_mxfp8_available() -> bool:
+    if not (_is_cuda and get_device_sm() == 107 and is_flashinfer_available()):
+        return False
+    from flashinfer.gemm.gemm_base import CUDNN_AVAILABLE
+
+    return CUDNN_AVAILABLE
+
+
 def flashinfer_mxfp8_blockscaled_linear(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -2186,7 +2201,18 @@ def flashinfer_mxfp8_blockscaled_linear(
         else:
             output_dtype = torch.bfloat16
 
-    if backend == "trtllm":
+    if (
+        backend == "cute-dsl"
+        and input_2d.shape[0] >= _SM107_CUDNN_MXFP8_MIN_M
+        and (weight.shape[0], k) in _SM107_CUDNN_MXFP8_NK
+        and x_scale_u8.is_contiguous()
+        and weight_scale.is_contiguous()
+        and _sm107_cudnn_mxfp8_available()
+    ):
+        backend = "cudnn"
+        x_scale_u8 = x_scale_u8.view(-1)
+
+    if backend in ("trtllm", "cudnn"):
         weight_scale_t = weight_scale.view(-1)
     else:
         weight_scale_t = weight_scale.t() if weight_scale.ndim == 2 else weight_scale
