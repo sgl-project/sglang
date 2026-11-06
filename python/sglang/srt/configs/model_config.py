@@ -47,7 +47,6 @@ from sglang.srt.runtime_context import get_platform
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_hip, is_npu, retry
 from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
-from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
 
@@ -1410,7 +1409,7 @@ class ModelConfig:
                 )
                 if (
                     envs.SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN.get()
-                    or is_in_ci()  # FIXME: fix this special case
+                    or envs.SGLANG_IS_IN_CI.get()  # FIXME: fix this special case
                 ):
                     logger.warning(msg)
                     self.context_len = context_length

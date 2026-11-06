@@ -79,6 +79,8 @@ try:
     )
 except ImportError:
     initialize_mamba_selective_state_update_backend = None
+import traceback
+
 from sglang.srt.beam_search.coordinator import BeamCoordinator
 from sglang.srt.configs.model_config import (
     ModelConfig,
@@ -404,11 +406,11 @@ from sglang.srt.utils import (
     suppress_other_loggers,
     triton_load_watch,
 )
+from sglang.srt.utils.common import TypeBasedDispatcher
 from sglang.srt.utils.device import is_confidential_compute, is_npu
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.weight_versions import record_weight_version_events
-from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 if is_mps():
     CudaStreamContext = nullcontext
@@ -6628,8 +6630,7 @@ def run_scheduler_process(
         scheduler.run_event_loop()
 
     except Exception:
-        traceback = get_exception_traceback()
-        logger.error(f"Scheduler hit an exception: {traceback}")
+        logger.error(f"Scheduler hit an exception: {traceback.format_exc()}")
         parent_process.send_signal(signal.SIGQUIT)
         # Opt-in: SIGKILL the pgroup so sibling ranks don't spew thousands
         # of NCCL/TCPStore tracebacks before they finally die.

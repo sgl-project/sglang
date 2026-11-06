@@ -22,7 +22,6 @@ from sglang.srt.utils.device import (
     is_gfx95_supported,
     is_mnnvl_fabric_device,
 )
-from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
 
@@ -243,7 +242,7 @@ def handle_grammar_backend(server_args: Any):
 
 def handle_debug_utils(server_args: Any):
     cfg = resolving_view(server_args)
-    if is_in_ci() and cfg.soft_watchdog_timeout is None:
+    if envs.SGLANG_IS_IN_CI.get() and cfg.soft_watchdog_timeout is None:
         logger.info("Set soft_watchdog_timeout since in CI")
         declare_resolution(
             server_args, "_handle_debug_utils", soft_watchdog_timeout=300
