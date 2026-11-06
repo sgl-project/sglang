@@ -43,19 +43,23 @@ class DeepGEMMDecodeData(msgspec.Struct, frozen=True):
     k_cache: torch.Tensor  # [pages, page_size, 1, 68] uint8, the layer's index-K pool
 
     def paged_logits_args(self, metadata, rows=slice(None)):
-        """``(q, lengths, page_table)`` for ``deep_gemm_fp4_paged_mqa_logits`` over
-        ``rows``, ``metadata.rows_per_request`` consecutive rows per request."""
+        """``(q, lengths, page_table, indices)`` for ``deep_gemm_fp4_paged_mqa_logits``
+        over ``rows``, ``metadata.rows_per_request`` consecutive rows per request:
+        one row per token with ``indices``, else grouped by request."""
         n = metadata.rows_per_request
         q_fp4, q_sf = self.q_fp4[rows], self.q_sf[rows]
         lens = metadata.compressed_seq_lens[rows]
         table = metadata.page_table[rows]
+        indices = metadata.deep_gemm_indices
+        if indices is not None:
+            return (q_fp4, q_sf), lens, table, indices[: lens.shape[0]]
         if n > 1:
             heads = q_fp4.shape[2]
             q_fp4 = q_fp4.view(-1, n, heads, 64)
             q_sf = q_sf.view(-1, n, heads)
             lens = lens.view(-1, n)
             table = table[::n]
-        return (q_fp4, q_sf), lens, table
+        return (q_fp4, q_sf), lens, table, None
 
 
 class DeepGEMMPrefillData(msgspec.Struct, frozen=True):
