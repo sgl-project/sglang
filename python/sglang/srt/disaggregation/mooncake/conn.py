@@ -43,7 +43,6 @@ from sglang.srt.disaggregation.common.utils import (
     build_dcp_token_transfer_plan,
     group_concurrent_contiguous,
     pack_int_lists,
-    run_on_device,
     unpack_int_lists,
 )
 from sglang.srt.disaggregation.mode import DisaggregationMode
@@ -261,6 +260,8 @@ def _uses_flat_entry_layout(
 class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     sender_trace_module = "mooncake"
 
+    _transfer_device_error: Optional[Exception] = None
+
     AUX_DATA_HEADER = b"AUX_DATA"
     # Implements teardown() below, so runtime PD role switching is supported.
     supports_role_switch = True
@@ -289,6 +290,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         )
         self.enable_trace = get_observability().enable_trace
         # Set by teardown() to make worker threads exit (P<->D role switch).
+        self._transfer_device_error = None
+        self._transfer_device_error_lock = threading.Lock()
         self._stopped = False
         self._worker_threads: List[threading.Thread] = []
         # Checked in every role, so a bad value fails startup rather than a
@@ -348,8 +351,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self.executors = [
                 concurrent.futures.ThreadPoolExecutor(
                     transfer_thread_pool_size // transfer_queue_size,
-                    initializer=bind_thread_to_device,
-                    initargs=(self.kv_args.gpu_id,),
+                    initializer=self._bind_transfer_thread_device,
                 )
                 for _ in range(transfer_queue_size)
             ]
@@ -369,10 +371,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 # a thread without a current device would run them on device 0
                 # and open a second context on another rank's GPU.
                 t = threading.Thread(
-                    target=run_on_device,
+                    target=self._run_transfer_worker,
                     args=(
-                        self.kv_args.gpu_id,
-                        self.transfer_worker,
                         queue,
                         executor,
                         (
@@ -400,6 +400,36 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             if self.enable_staging:
                 self._init_staging_allocator()
             self.start_decode_thread()
+
+    def _bind_transfer_thread_device(self) -> None:
+        try:
+            bind_thread_to_device(self.kv_args.gpu_id)
+        except Exception as exc:
+            # A daemon thread can die before it dequeues a room. Its failure
+            # belongs to this manager, including rooms submitted afterwards.
+            with self._transfer_device_error_lock:
+                if self._transfer_device_error is None:
+                    self._transfer_device_error = exc
+            raise
+
+    def _run_transfer_worker(self, queue, executor, staging_buffer, worker_index):
+        self._bind_transfer_thread_device()
+        self.transfer_worker(queue, executor, staging_buffer, worker_index)
+
+    def _raise_if_transfer_device_failed(self) -> None:
+        error = self._transfer_device_error
+        if error is not None:
+            raise RuntimeError(
+                f"KV transfer thread could not bind device {self.kv_args.gpu_id}"
+            ) from error
+
+    def check_status(self, bootstrap_room: int) -> KVPoll:
+        self._raise_if_transfer_device_failed()
+        return super().check_status(bootstrap_room)
+
+    def check_status_pp_consensus(self, bootstrap_room: int) -> KVPoll:
+        self._raise_if_transfer_device_failed()
+        return super().check_status_pp_consensus(bootstrap_room)
 
     def init_engine(self):
         self.engine = get_mooncake_transfer_engine()
