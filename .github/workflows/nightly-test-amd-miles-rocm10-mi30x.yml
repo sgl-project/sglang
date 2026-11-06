@@ -46,34 +46,53 @@ jobs:
               tests/fast-gpu/kernels/attention/dsa/test_dsa_sparse_attention.py
           # The 4- and 8-GPU suites run past 180 min on MI300X; the 4-GPU suite takes ~155 min on MI355X.
           # As one job, the 4-GPU suite loses its runner every night after 13-16 tests; split it in two.
+          # SGLang's DeepSeek-V4 TileLang kernels don't run on gfx942: the attention kernel is built
+          # for float8_e4m3fnuz but gets float8_e4m3fn (test_deepseek_v4_flash_4layer_ci, _cp2_ci),
+          # and another fails to compile at CUDA-graph capture (_megatron_impl_ci). FP8 checkpoints
+          # also fail their first weight update on MI300X (test_deepseek_v32_5layer_fp8). Both parts
+          # skip the same files so they partition the same list.
           - suite: nightly-stage-c-4-gpu-mi350
             runner: linux-mi300-4gpu-sglang
             timeout: 300
-            skip_tests: ""
+            skip_tests: >-
+              tests/e2e/megatron/model_scripts/test_deepseek_v4_flash_4layer_ci.py
+              tests/e2e/megatron/model_scripts/test_deepseek_v4_flash_4layer_cp2_ci.py
+              tests/e2e/megatron/model_scripts/test_deepseek_v4_flash_4layer_megatron_impl_ci.py
+              tests/e2e/megatron/model_scripts/test_deepseek_v32_5layer_fp8.py
             partition_id: 0
             partition_size: 2
             part: 1/2
           - suite: nightly-stage-c-4-gpu-mi350
             runner: linux-mi300-4gpu-sglang
             timeout: 300
-            skip_tests: ""
+            skip_tests: >-
+              tests/e2e/megatron/model_scripts/test_deepseek_v4_flash_4layer_ci.py
+              tests/e2e/megatron/model_scripts/test_deepseek_v4_flash_4layer_cp2_ci.py
+              tests/e2e/megatron/model_scripts/test_deepseek_v4_flash_4layer_megatron_impl_ci.py
+              tests/e2e/megatron/model_scripts/test_deepseek_v32_5layer_fp8.py
             partition_id: 1
             partition_size: 2
             part: 2/2
           # The 8-GPU suite no longer finishes in 300 min on MI300X; split it in two.
           # test_qwen3_8_next_4layer_ci: one of its Triton training kernels needs 72 KiB of LDS
-          # per block; gfx942 has 64 KiB. Both parts skip it so they partition the same file list.
+          # per block; gfx942 has 64 KiB. test_spec_mtptrain_nor3_fp8_sgl_tp2_meg_tp1cp1_fullyasync: the
+          # FP8 GLM-4.7-Flash engine rejects the first weight update on MI300X. Both parts skip the same
+          # files so they partition the same file list.
           - suite: nightly-stage-c-8-gpu-mi350
             runner: linux-mi300-8gpu-sglang
             timeout: 300
-            skip_tests: tests/e2e/megatron/model_scripts/test_qwen3_8_next_4layer_ci.py
+            skip_tests: >-
+              tests/e2e/megatron/model_scripts/test_qwen3_8_next_4layer_ci.py
+              tests/e2e/megatron/test_glm47_flash/test_spec_mtptrain_nor3_fp8_sgl_tp2_meg_tp1cp1_fullyasync.py
             partition_id: 0
             partition_size: 2
             part: 1/2
           - suite: nightly-stage-c-8-gpu-mi350
             runner: linux-mi300-8gpu-sglang
             timeout: 300
-            skip_tests: tests/e2e/megatron/model_scripts/test_qwen3_8_next_4layer_ci.py
+            skip_tests: >-
+              tests/e2e/megatron/model_scripts/test_qwen3_8_next_4layer_ci.py
+              tests/e2e/megatron/test_glm47_flash/test_spec_mtptrain_nor3_fp8_sgl_tp2_meg_tp1cp1_fullyasync.py
             partition_id: 1
             partition_size: 2
             part: 2/2

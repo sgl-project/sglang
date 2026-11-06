@@ -1687,10 +1687,14 @@ def _situ_mul_quant_contig_kernel(
     up_t = 2.0 * tl.sigmoid(2.0 * up / situ_linear_beta) - 1.0
     y = gate * situ_linear_beta * up_t
     amax = tl.clamp(tl.max(tl.abs(y), axis=1), min=1e-10, max=float("inf"))
-    q = (y * (448.0 / amax)[:, None]).to(tl.float8e4nv)
+    # Quantize with the power-of-two (UE8M0) scale the GEMM reads, not amax / 448.
+    bits = (amax / 448.0).to(tl.int32, bitcast=True)
+    exp = (bits >> 23) + ((bits & 0x7FFFFF) != 0).to(tl.int32)
+    scale = (exp << 23).to(tl.float32, bitcast=True)
+    q = (y / scale[:, None]).to(tl.float8e4nv)
     tl.store(q_ptr + row * N + offs, q, mask=mask)
     srow = tl.arange(0, KG_POW2)
-    tl.store(s_ptr + row * KG + srow, amax / 448.0, mask=srow < KG)
+    tl.store(s_ptr + row * KG + srow, scale, mask=srow < KG)
 
 
 def _apply_swiglu_limit(
