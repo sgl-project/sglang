@@ -697,6 +697,31 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         self.assertEqual(req.image_data, "single_image.jpg")
         self.assertIsNone(req.modalities)  # Modalities isn't set for single examples
 
+    def test_parallel_sampling_rejects_invalid_counts(self):
+        """Invalid sample counts must fail before batch expansion or tokenization."""
+        for n in (0, -1, 1.5, "2", True):
+            for text in ("hello", ["hello", "world"]):
+                for params in ({"n": n}, [{"n": n}, {"n": n}]):
+                    with self.subTest(n=n, text=text, params=params):
+                        req = GenerateReqInput(text=text, sampling_params=params)
+                        with self.assertRaisesRegex(
+                            ValueError, "n must be a positive integer"
+                        ):
+                            req.normalize_batch_and_arguments()
+
+    def test_null_sample_count_uses_default(self):
+        """Explicit null must behave like an omitted n, including mixed batches."""
+        for text, params in (
+            ("hello", {"n": None}),
+            (["hello", "world"], {"n": None}),
+            (["hello", "world"], [{"n": None}, {}]),
+        ):
+            with self.subTest(text=text, params=params):
+                req = GenerateReqInput(text=text, sampling_params=params)
+                req.normalize_batch_and_arguments()
+                self.assertEqual(req.parallel_sample_num, 1)
+                self.assertEqual(req.batch_size, 1 if isinstance(text, str) else 2)
+
     def test_single_to_batch_with_parallel_sampling(self):
         """Test single example converted to batch with parallel sampling."""
         req = GenerateReqInput(
