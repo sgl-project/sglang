@@ -538,6 +538,18 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
             self._fused_chain_verify_fn = fused_kda_conv_gating_verify
             rank0_log("KDA fused chain-verify kernel enabled (topk==1 path).")
+        # ReplaySSM ring verify needs only the outputs and the ring entries, so
+        # the draft window can be applied to one streamed pass over each row's
+        # state tile instead of the per-step recurrence. gfx95 is where this is
+        # measured; the fused chain-verify above covers SM90/SM100 at B == 1.
+        self._rowstream_verify_ring_fn = None
+        if verify_backend.is_triton() and is_gfx95_supported():
+            from sglang.kernels.ops.attention.linear.kda_rowstream_verify import (
+                kda_rowstream_verify_ring,
+            )
+
+            self._rowstream_verify_ring_fn = kda_rowstream_verify_ring
+            rank0_log("KDA row-streamed ReplaySSM ring verify enabled.")
         # Per-request row index into the speculative `intermediate_ssm` scratch,
         # used by the MTP / target_verify path (mirrors GDNAttnBackend). Sized
         # past the pool for attn_tp-padded warmup/MLP-sync batches (see helper).
@@ -1484,6 +1496,45 @@ class KDAAttnBackend(MambaAttnBackendBase):
         k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)
         v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)
 
+        if self._can_run_rowstream_verify_ring(
+            ring_kwargs=ring_kwargs,
+            dense_token_indices=dense_token_indices,
+            retrieve_next_token=retrieve_next_token,
+            retrieve_next_sibling=retrieve_next_sibling,
+            retrieve_parent_token=retrieve_parent_token,
+            draft_token_num=draft_token_num,
+            q=q,
+            k=k,
+            v=v,
+            a=a,
+            b=b,
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+        ):
+            # Ring mode consumes only the outputs and the ring entries, so a
+            # single streamed pass over each row's state tile is enough; the
+            # chunked form drops the per-step recurrence over that tile.
+            return self._rowstream_verify_ring_fn(
+                layer.A_log,
+                a,
+                layer.dt_bias,
+                q,
+                k,
+                v,
+                b,
+                initial_state_source=ssm_states,
+                initial_state_indices=cache_indices,
+                cu_seqlens=query_start_loc,
+                draft_token_num=draft_token_num,
+                lower_bound=layer.lower_bound,
+                replayssm_rawv=replayssm_rawv,
+                replayssm_rawk=replayssm_rawk,
+                replayssm_g=replayssm_g,
+                replayssm_beta=replayssm_beta,
+                ring_indices=ring_kwargs.get("ring_indices"),
+            )
+
         core_attn_out = self.kernel_dispatcher.target_verify(
             A_log=layer.A_log,
             dt_bias=layer.dt_bias,
@@ -1524,6 +1575,89 @@ class KDAAttnBackend(MambaAttnBackendBase):
             covered = dense_token_indices < (batch_size * draft_token_num)
             core_attn_out = torch.where(covered.view(1, -1, 1, 1), core_attn_out, 0.0)
         return core_attn_out
+
+    def _can_run_rowstream_verify_ring(
+        self,
+        *,
+        ring_kwargs: dict,
+        dense_token_indices: Optional[torch.Tensor],
+        retrieve_next_token: Optional[torch.Tensor],
+        retrieve_next_sibling: Optional[torch.Tensor],
+        retrieve_parent_token: Optional[torch.Tensor],
+        draft_token_num: int,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+    ) -> bool:
+        """Gate for the row-streamed ReplaySSM ring verify.
+
+        Only the ring mode qualifies: the kernel produces the outputs and the
+        ring, and deliberately has no per-step state snapshot to give the
+        non-ring commit path. Dense chain layouts only -- the tree verify needs
+        the parent-state reload and the ragged layout is already scattered to a
+        dense window by the caller but keeps a ghost row.
+        """
+        if self._rowstream_verify_ring_fn is None or not ring_kwargs:
+            return False
+        if dense_token_indices is not None or any(
+            value is not None
+            for value in (
+                retrieve_next_token,
+                retrieve_next_sibling,
+                retrieve_parent_token,
+            )
+        ):
+            return False
+        # The fused-accept kwargs fold the accepted state inside the verify
+        # kernel; this kernel does not write state at all.
+        if self.accept_lens_pool is not None:
+            return False
+        if not q.is_cuda or draft_token_num < 1:
+            return False
+        H, K = q.shape[-2], q.shape[-1]
+        HV, V = v.shape[-2], v.shape[-1]
+        if q.shape[-3] % draft_token_num != 0 or HV % H != 0:
+            return False
+        if K & (K - 1) or V & (V - 1) or not (16 <= K <= 128 and 16 <= V <= 128):
+            return False
+        if q.dtype != k.dtype or q.dtype != v.dtype or a.dtype != b.dtype:
+            return False
+        if (
+            q.stride(-1) != 1
+            or k.stride(-1) != 1
+            or v.stride(-1) != 1
+            or q.stride(-2) != K
+            or k.stride(-2) != K
+            or v.stride(-2) != V
+        ):
+            return False
+        # a / b arrive either flat ([n, ...]) or with a leading batch of 1.
+        n_tokens = q.shape[-3]
+        if (
+            a.stride(-1) != 1
+            or b.stride(-1) != 1
+            or tuple(a.shape[-2:]) != (n_tokens, HV * K)
+            or tuple(b.shape[-2:]) != (n_tokens, HV)
+            or a.numel() != n_tokens * HV * K
+            or b.numel() != n_tokens * HV
+        ):
+            return False
+        if (
+            ssm_states.dtype != torch.float32
+            or ssm_states.ndim != 4
+            or tuple(ssm_states.shape[1:]) != (HV, V, K)
+            or ssm_states.stride()[1:] != (V * K, K, 1)
+        ):
+            return False
+        # One grid row per query_start_loc interval, each reading its state slot.
+        if cache_indices.numel() < query_start_loc.numel() - 1:
+            return False
+        return True
 
     def _can_run_fused_chain_verify(
         self,

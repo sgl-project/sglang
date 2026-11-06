@@ -4,6 +4,7 @@ Compares the four target-verify variants the KDA backend can dispatch:
 
     unfused        causal_conv1d_update + recurrence, per-step ssm snapshots
     unfused+ring   causal_conv1d_update + recurrence, ReplaySSM CACHE_RING
+    rowstream+ring causal_conv1d_update + row-streamed chunked verify, CACHE_RING
     fused          fused_kda_conv_gating_verify, per-step ssm snapshots
     fused+ring     fused_kda_conv_gating_verify, ReplaySSM CACHE_RING
 
@@ -29,6 +30,9 @@ from sglang.kernels.ops.attention.linear.fused_kda_conv_recurrent_verify import 
 from sglang.kernels.ops.attention.linear.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
 )
+from sglang.kernels.ops.attention.linear.kda_rowstream_verify import (
+    kda_rowstream_verify_ring,
+)
 from sglang.kernels.ops.mamba.causal_conv1d_triton import causal_conv1d_update
 
 _DEVICE = "cuda"
@@ -36,7 +40,7 @@ _DTYPE = torch.bfloat16
 _W = 4
 # Ring length: power of two >= 2 * draft tokens (memory_pool.py invariant).
 _RING_LEN = 16
-_MODES = ("unfused", "unfused+ring", "fused", "fused+ring")
+_MODES = ("unfused", "unfused+ring", "rowstream+ring", "fused", "fused+ring")
 GRAPH_BATCH = 10
 
 
@@ -116,6 +120,8 @@ def make_runner(mode, inp, B, T, H, HV, K, V, lower_bound=None):
 
         return fn
 
+    rowstream = mode.startswith("rowstream")
+
     def fn():
         x3 = inp["mixed"].reshape(B, T, dim).transpose(1, 2)
         out3 = causal_conv1d_update(
@@ -130,6 +136,26 @@ def make_runner(mode, inp, B, T, H, HV, K, V, lower_bound=None):
         )
         mixed_out = out3.transpose(1, 2).reshape(seq_len, dim)
         q, k, v = mixed_out.split([H * K, H * K, HV * V], dim=-1)
+        if rowstream:
+            kda_rowstream_verify_ring(
+                inp["A_log"],
+                inp["a"],
+                inp["dt_bias"],
+                q.unflatten(-1, (H, K)).unsqueeze(0),
+                k.unflatten(-1, (H, K)).unsqueeze(0),
+                v.unflatten(-1, (HV, V)).unsqueeze(0),
+                inp["b"],
+                initial_state_source=inp["ssm"],
+                initial_state_indices=inp["cache_indices"],
+                cu_seqlens=inp["cu"],
+                draft_token_num=T,
+                lower_bound=lower_bound,
+                replayssm_rawv=inp["rawv"],
+                replayssm_rawk=inp["rawk"],
+                replayssm_g=inp["g"],
+                replayssm_beta=inp["beta"],
+            )
+            return
         fused_sigmoid_gating_delta_rule_update(
             A_log=inp["A_log"],
             a=inp["a"],
@@ -181,13 +207,15 @@ def bench_graph(fn, iters=200):
 
 
 def check_ring_bitwise(B, T, H, HV, K, V, lower_bound=None):
-    """One-shot guard: fused+ring must fill the same ring bytes as unfused+ring."""
-    ref, fus = (make_inputs(B, T, H, HV, K, V, seed=7) for _ in range(2))
+    """One-shot guard: every ring mode must fill the same ring bytes."""
+    ref = make_inputs(B, T, H, HV, K, V, seed=7)
     make_runner("unfused+ring", ref, B, T, H, HV, K, V, lower_bound)()
-    make_runner("fused+ring", fus, B, T, H, HV, K, V, lower_bound)()
-    torch.cuda.synchronize()
-    for name in ("rawv", "rawk", "g", "beta"):
-        assert torch.equal(ref[name], fus[name]), f"ring mismatch: {name}"
+    for mode in ("rowstream+ring", "fused+ring"):
+        got = make_inputs(B, T, H, HV, K, V, seed=7)
+        make_runner(mode, got, B, T, H, HV, K, V, lower_bound)()
+        torch.cuda.synchronize()
+        for name in ("rawv", "rawk", "g", "beta"):
+            assert torch.equal(ref[name], got[name]), f"{mode} ring mismatch: {name}"
 
 
 def run_modes(args, label_extra=""):
