@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
+pub mod abort;
 pub mod cache;
 pub mod chat;
 pub mod health;
