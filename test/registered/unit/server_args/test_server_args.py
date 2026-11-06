@@ -1493,6 +1493,19 @@ class TestKV4Compatibility(unittest.TestCase):
         )
         self._use_mla_backend_patcher.start()
         self.addCleanup(self._use_mla_backend_patcher.stop)
+        self._model_config_patcher = patch(
+            "sglang.srt.arg_groups.kv_cache_hook.model_config_of",
+            return_value=SimpleNamespace(is_hybrid_swa=False),
+        )
+        self._model_config_patcher.start()
+        self.addCleanup(self._model_config_patcher.stop)
+
+    @staticmethod
+    def _hybrid_swa():
+        return patch(
+            "sglang.srt.arg_groups.kv_cache_hook.model_config_of",
+            return_value=SimpleNamespace(is_hybrid_swa=True),
+        )
 
     @staticmethod
     def _make_nvfp4_args(**overrides):
@@ -1704,6 +1717,28 @@ class TestKV4Compatibility(unittest.TestCase):
         args = self._make_nvfp4_args(disaggregation_mode="decode")
         with self.assertRaisesRegex(ValueError, "PD disaggregation"):
             handle_kv4_compatibility(args)
+
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    def test_nvfp4_on_the_hybrid_swa_pool_needs_native_trtllm_mha(self):
+        """NVFP4 on the hybrid SWA pool works only with native SM100 trtllm_mha;
+        FlashInfer's FP8-dequant prefill made startup fail after the model loaded."""
+        with self._hybrid_swa():
+            handle_kv4_compatibility(self._make_nvfp4_args())
+            args = self._make_nvfp4_args(
+                prefill_attention_backend="flashinfer",
+                decode_attention_backend="trtllm_mha",
+            )
+            with self.assertRaisesRegex(ValueError, "hybrid sliding-window"):
+                handle_kv4_compatibility(args)
+
+    @override_platform(is_cuda=True, is_sm100=False, is_sm120=True)
+    def test_nvfp4_on_the_hybrid_swa_pool_is_rejected_with_xqa_decode(self):
+        """XQA decode (SM120) reads raw FP4 buffers the hybrid SWA pool lacks."""
+        with (
+            self._hybrid_swa(),
+            self.assertRaisesRegex(ValueError, "hybrid sliding-window"),
+        ):
+            handle_kv4_compatibility(self._make_nvfp4_args())
 
     @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
     def test_nvfp4_rejects_unified_memory(self):
@@ -2967,6 +3002,47 @@ class TestHiCacheArgs(CustomTestCase):
                         self.assertRaisesRegex(NotImplementedError, "buffer_only"),
                     ):
                         handle_hicache(args)
+
+    def test_hicache_swa_host_ratio_is_refused_where_nothing_applies_it(self):
+        """Only the non-unified full + sliding-window stack applies this ratio;
+        any other launch must fail rather than ignore it."""
+        for overrides, message in (
+            ({"hicache_swa_host_ratio": 1.5}, r"\(0, 1\]"),
+            ({"hicache_swa_host_ratio": -0.2}, r"\(0, 1\]"),
+            ({"hicache_swa_host_ratio": 0.2}, "needs --hicache-size"),
+            (
+                {
+                    "hicache_swa_host_ratio": 0.2,
+                    "hicache_size": 100,
+                    "enable_unified_memory": True,
+                },
+                "--enable-unified-memory",
+            ),
+        ):
+            with self.subTest(**overrides):
+                args = self._make_args(enable_hierarchical_cache=True, **overrides)
+                with self.assertRaisesRegex(ValueError, message):
+                    handle_hicache(args)
+        # The upper bound is inclusive; only a linear-attention model is refused.
+        for linear_attention in (object(), None):
+            with self.subTest(linear_attention=linear_attention is not None):
+                args = self._make_args(
+                    enable_hierarchical_cache=True,
+                    hicache_size=100,
+                    hicache_swa_host_ratio=1.0,
+                )
+                with (
+                    patch("sglang.srt.arg_groups.hicache_hook.model_config_of"),
+                    patch(
+                        "sglang.srt.configs.hybrid_arch.mambaish_config",
+                        return_value=linear_attention,
+                    ),
+                ):
+                    if linear_attention is None:
+                        handle_hicache(args)
+                    else:
+                        with self.assertRaisesRegex(ValueError, "linear-attention"):
+                            handle_hicache(args)
 
     def test_buffer_only_resolves_write_back_to_write_through(self):
         """buffer_only has no retained host tier for write_back to defer

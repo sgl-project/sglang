@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 
+import torch.distributed as dist
+
 from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.runtime_context import get_exec
 
@@ -48,7 +50,16 @@ from sglang.srt.mem_cache.kv.memory.views import MHAKVView, MLAKVView
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
+    HICACHE_HOST_MEMORY_RESERVE_BYTES,
+    _host_memory_budget,
+    host_memory_budget_plain_hugetlb,
+    host_memory_budget_scope,
     prepare_page_unified_write_back_staging,
+    ranks_per_host,
+)
+from sglang.srt.mem_cache.pool_host.common import (
+    get_allocator_class_from_storage,
+    get_allocator_type,
 )
 from sglang.srt.mem_cache.pool_host.mha import prepare_mha_write_back_staging
 from sglang.srt.mem_cache.pool_host.page_unified import resolve_kv_host_geometry
@@ -363,7 +374,67 @@ def validate_decode_radix_cache(
         )
 
 
+def _snapshot_host_budget(device) -> tuple[int, int]:
+    """This rank's (plain RAM, hugetlb pool) bytes, sampled once: the budget a
+    host pool built outside a scope samples in host_memory_preflight."""
+    allocator = get_allocator_class_from_storage(get_allocator_type())
+    plain, hugetlb = host_memory_budget_plain_hugetlb(allocator, device)
+    return max(plain, 0), max(hugetlb, 0)
+
+
+def _host_rank_barrier() -> None:
+    if not (dist.is_available() and dist.is_initialized()):
+        return
+    # An elastic EP joiner gets here after rejoining the world group, whose serving
+    # ranks never call this; they already hold their host pools.
+    if get_exec().moe.ep_join_mode is not None:
+        return
+    dist.barrier(group=get_parallel().world_group.cpu_group)
+
+
 def build_kv_cache(
+    *, enable_hierarchical_cache: bool, tp_worker: BaseTpWorker, **kwargs
+) -> KVCacheBuildResult:
+    """Build the KV cache; HiCache host pools book against one free-memory snapshot,
+    which every launch rank takes between two world-group barriers, before any pins."""
+    # Auto-sizing (--hicache-host-memory-fraction) books against its own sample.
+    if (
+        not enable_hierarchical_cache
+        or get_memory().hicache_host_memory_fraction is not None
+    ):
+        return _build_kv_cache(
+            enable_hierarchical_cache=enable_hierarchical_cache,
+            tp_worker=tp_worker,
+            **kwargs,
+        )
+    # The KV pool's device decides whether the hugetlb pool is credited, as in
+    # auto-sizing (the pool the token-to-KV allocator serves).
+    device = tp_worker.model_runner.token_to_kv_pool.device
+    _host_rank_barrier()  # no rank has pinned yet
+    budget = _snapshot_host_budget(device)
+    _host_rank_barrier()  # every rank now holds the same snapshot
+    with host_memory_budget_scope(budget):
+        result = _build_kv_cache(
+            enable_hierarchical_cache=enable_hierarchical_cache,
+            tp_worker=tp_worker,
+            **kwargs,
+        )
+        left = _host_memory_budget.get() or budget
+    logger.info(
+        "HiCache host budget per rank: %.2f GB plain RAM (after the %.0f GiB "
+        "reserve, %d local ranks) and %.2f GB hugetlb pool; claimed %.2f GB "
+        "plain and %.2f GB hugetlb",
+        budget[0] / 1e9,
+        HICACHE_HOST_MEMORY_RESERVE_BYTES / 2**30,
+        ranks_per_host(),
+        budget[1] / 1e9,
+        (budget[0] - left[0]) / 1e9,
+        (budget[1] - left[1]) / 1e9,
+    )
+    return result
+
+
+def _build_kv_cache(
     *,
     server_args: ServerArgs,
     model_config: ModelConfig,

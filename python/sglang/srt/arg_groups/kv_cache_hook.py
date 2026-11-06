@@ -134,6 +134,24 @@ def handle_kv4_compatibility(server_args: Any) -> None:
                 "the unified MHA pool does not allocate FP4 block scales or "
                 "the prefill dequant workspace."
             )
+        # Only native SM100 trtllm_mha reads FP4 through SWAKVPool's layer router;
+        # XQA decode and FlashInfer's NVFP4 prefill fail on the hybrid SWA pool.
+        if (
+            cfg.kv_cache_dtype == "nvfp4"
+            and not uses_mla
+            and not (
+                get_platform().is_sm100
+                and prefill_backend == "trtllm_mha"
+                and decode_backend == "trtllm_mha"
+            )
+            and model_config_of(server_args).is_hybrid_swa
+        ):
+            raise ValueError(
+                "--kv-cache-dtype=nvfp4 on a hybrid sliding-window model needs "
+                "native NVFP4: SM100 with trtllm_mha for prefill and decode "
+                "(--prefill-kv-cache-dequant-dtype=nvfp4); got prefill "
+                f"{prefill_backend!r} and decode {decode_backend!r}."
+            )
 
         # SM100 trtllm_mha owns physical, kernel-native NVFP4 scales. The
         # transfer and host-tier pools do not preserve that layout yet. Keep

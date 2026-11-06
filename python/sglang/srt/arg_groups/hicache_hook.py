@@ -6,7 +6,11 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from sglang.srt.arg_groups.model_override_base import resolving_view, use_mla_backend
+from sglang.srt.arg_groups.model_override_base import (
+    model_config_of,
+    resolving_view,
+    use_mla_backend,
+)
 from sglang.srt.arg_groups.overrides import declare_resolution
 
 logger = logging.getLogger(__name__)
@@ -73,6 +77,7 @@ def handle_hicache(server_args: Any):
         return
 
     validate_hicache_host_memory_mode(server_args)
+    _validate_hicache_swa_host_ratio(server_args)
 
     if cfg.disaggregation_decode_host_receive_threshold < 1:
         # The shared host pool must match KV transfer's per-layer buffers.
@@ -386,4 +391,29 @@ def validate_hicache_host_memory_mode(server_args: Any):
             "bypass the buffer-mode pipeline, fetching without its prefix "
             "context and never consuming its staged holds. Prefill "
             "instances share the standard scheduler path and are supported."
+        )
+
+
+def _validate_hicache_swa_host_ratio(server_args: Any):
+    cfg = resolving_view(server_args)
+    ratio = cfg.hicache_swa_host_ratio
+    if ratio == 0:
+        return
+    if not 0 < ratio <= 1:
+        raise ValueError(f"--hicache-swa-host-ratio must be in (0, 1], got {ratio}.")
+    if cfg.hicache_size <= 0:
+        raise ValueError(
+            "--hicache-swa-host-ratio splits --hicache-size, so it needs "
+            "--hicache-size > 0."
+        )
+    from sglang.srt.configs.hybrid_arch import mambaish_config
+
+    # Only build_hybrid_swa_stack reads the ratio; the unified and Mamba stacks do not.
+    if (
+        cfg.enable_unified_memory
+        or mambaish_config(model_config_of(server_args)) is not None
+    ):
+        raise ValueError(
+            "--hicache-swa-host-ratio is not supported with --enable-unified-memory "
+            "or on a hybrid linear-attention model."
         )

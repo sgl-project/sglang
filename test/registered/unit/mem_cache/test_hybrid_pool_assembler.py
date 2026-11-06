@@ -15,6 +15,7 @@ from sglang.srt.configs.inkling import (
     InklingConvStateShape,
     InklingStateDType,
 )
+from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo, MambaStateBufferInfo
 from sglang.srt.mem_cache.hicache_storage import (
@@ -38,6 +39,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     _MambaStrategy,
     _MambaSwaStrategy,
     _require_single_row_dsv4_swa_pages,
+    _swa_host_shares,
     _SwaStrategy,
     build_full_draft_pools,
     build_host_pool_group,
@@ -61,7 +63,13 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
 )
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
+from sglang.srt.mem_cache.pool_host import base as pool_host_base
 from sglang.srt.mem_cache.pool_host import dsa as pool_host_dsa
+from sglang.srt.mem_cache.pool_host.base import (
+    HICACHE_HOST_MEMORY_RESERVE_BYTES,
+    _host_memory_budget,
+    host_memory_preflight,
+)
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mha import (
     MHATokenToKOnlyPoolHost,
@@ -2075,6 +2083,195 @@ class TestHostLoadEvictsTheTargetWindowOnly(CustomTestCase):
         # The cache measures the shortfall on the target's own room.
         self.assertEqual(len(evicted), 1)
         self.assertEqual(evicted[0].window_tokens, {"window_4096": 16})
+
+
+GB = 10**9
+
+
+def _host_split_pool(size, bytes_per_token, *, rows=None, host_capacity_bytes=None):
+    """A device KV pool serving `size` tokens out of `rows` allocated ones."""
+    rows = size if rows is None else rows
+    half = bytes_per_token * rows // 2
+    return SimpleNamespace(
+        size=size,
+        k_buffer=[torch.empty(rows, 1)],
+        get_kv_size_bytes=lambda: (half, half),
+        host_capacity_bytes=host_capacity_bytes,
+    )
+
+
+def _host_split_mla_pool(size, bytes_per_token, *, page_size=1):
+    """An MLA sub-pool: one byte total over size + page_size rows, no k_buffer."""
+    return SimpleNamespace(
+        size=size,
+        page_size=page_size,
+        get_kv_size_bytes=lambda: bytes_per_token * (size + page_size),
+        host_capacity_bytes=None,
+    )
+
+
+def _tp_worker(device):
+    return SimpleNamespace(
+        model_runner=SimpleNamespace(token_to_kv_pool=SimpleNamespace(device=device))
+    )
+
+
+class TestHostBudgetSnapshot(CustomTestCase):
+    def _build(
+        self,
+        *,
+        enable_hierarchical_cache,
+        requests=(),
+        free=None,
+        fraction=None,
+        **build_kwargs,
+    ):
+        """build_kv_cache with the inner build booking `requests` bytes in turn."""
+        build_kwargs.setdefault("tp_worker", _tp_worker("cuda:0"))
+        seen, barriers = [], []
+
+        def build(**kwargs):
+            seen.append(_host_memory_budget.get())
+            for requested in requests:
+                seen.append(host_memory_preflight([requested]).available_bytes)
+            return "built"
+
+        free = (
+            4 * 100 * GB + HICACHE_HOST_MEMORY_RESERVE_BYTES if free is None else free
+        )
+        with (
+            patch.object(kv_cache_builder, "_build_kv_cache", side_effect=build),
+            patch.object(
+                kv_cache_builder,
+                "get_memory",
+                return_value=SimpleNamespace(hicache_host_memory_fraction=fraction),
+            ),
+            patch.object(
+                kv_cache_builder, "get_allocator_type", return_value="default"
+            ),
+            patch.object(
+                pool_host_base, "available_host_memory_bytes", return_value=free
+            ),
+            patch.object(pool_host_base, "ranks_per_host", return_value=4),
+            patch.object(kv_cache_builder, "ranks_per_host", return_value=4),
+            patch.object(
+                kv_cache_builder,
+                "_host_rank_barrier",
+                side_effect=lambda: barriers.append(len(seen)),
+            ),
+        ):
+            out = kv_cache_builder.build_kv_cache(
+                enable_hierarchical_cache=enable_hierarchical_cache, **build_kwargs
+            )
+        self.assertEqual(out, "built")
+        self.assertIsNone(_host_memory_budget.get())  # the scope ends with the build
+        return seen, barriers
+
+    def test_every_pool_is_booked_against_one_snapshot_taken_between_barriers(self):
+        with self.assertLogs(kv_cache_builder.logger, "INFO") as logs:
+            seen, barriers = self._build(
+                enable_hierarchical_cache=True, requests=(30 * GB, 50 * GB)
+            )
+        # each pool sees what the earlier ones left of the per-rank share
+        self.assertEqual(seen, [(100 * GB, 0), 100 * GB, 70 * GB])
+        # both barriers come before the first pool books anything
+        self.assertEqual(barriers, [0, 0])
+        self.assertIn("100.00 GB plain RAM", "".join(logs.output))
+        self.assertIn("claimed 80.00 GB plain", "".join(logs.output))
+
+    def test_the_snapshot_credits_the_hugetlb_pool_for_the_kv_pools_device(self):
+        # Whether the pool is credited depends on the device the host pools copy
+        # to, so the snapshot is taken for the KV pool's device.
+        tp_worker = _tp_worker("cuda:3")
+        with patch.object(
+            kv_cache_builder,
+            "host_memory_budget_plain_hugetlb",
+            return_value=(100 * GB, 64 * GB),
+        ) as sample:
+            seen, _ = self._build(enable_hierarchical_cache=True, tp_worker=tp_worker)
+        self.assertEqual(seen, [(100 * GB, 64 * GB)])
+        sample.assert_called_once()
+        self.assertEqual(sample.call_args.args[1], "cuda:3")
+
+    def test_no_snapshot_and_no_barrier_without_hierarchical_cache_or_auto_sizing(
+        self,
+    ):
+        # Auto-sizing samples once before its world all-reduce and requires readable
+        # cgroup limits; an outer snapshot would replace that sample and the check.
+        for enabled, fraction in ((False, None), (True, 0.8)):
+            with self.subTest(enabled=enabled, fraction=fraction):
+                seen, barriers = self._build(
+                    enable_hierarchical_cache=enabled, fraction=fraction
+                )
+                self.assertEqual((seen, barriers), ([None], []))
+
+    def test_a_node_without_memory_above_the_reserve_gets_a_zero_budget(self):
+        seen, _ = self._build(
+            enable_hierarchical_cache=True, free=HICACHE_HOST_MEMORY_RESERVE_BYTES - 1
+        )
+        self.assertEqual(seen, [(0, 0)])
+
+    def test_the_barrier_is_a_no_op_without_a_process_group(self):
+        self.assertIsNone(kv_cache_builder._host_rank_barrier())
+
+    def test_an_elastic_ep_joiner_skips_the_world_barrier(self):
+        """A joiner builds its pools after rejoining the world group, whose serving
+        ranks never reach this barrier: waiting there hangs the joiner."""
+        parallel = SimpleNamespace(world_group=SimpleNamespace(cpu_group="world"))
+        for mode in (None, "recover", "scale"):
+            exec_ = SimpleNamespace(moe=SimpleNamespace(ep_join_mode=mode))
+            with (
+                self.subTest(ep_join_mode=mode),
+                patch.object(kv_cache_builder.dist, "is_available", return_value=True),
+                patch.object(
+                    kv_cache_builder.dist, "is_initialized", return_value=True
+                ),
+                patch.object(kv_cache_builder, "get_exec", return_value=exec_),
+                patch.object(kv_cache_builder, "get_parallel", return_value=parallel),
+                patch.object(kv_cache_builder.dist, "barrier") as barrier,
+            ):
+                kv_cache_builder._host_rank_barrier()
+                if mode is None:
+                    barrier.assert_called_once_with(group="world")
+                else:
+                    barrier.assert_not_called()
+
+
+class TestSWAHostShares(CustomTestCase):
+    def test_the_stock_split_applies_unless_the_host_ratio_is_above_the_device_ratio(
+        self,
+    ):
+        full, swa = (
+            _host_split_pool(1000, 100),
+            _host_split_pool(100, 50),
+        )  # device ratio 0.1
+        for ratio in (0.0, 0.05, 0.1):
+            with self.subTest(ratio=ratio):
+                self.assertIsNone(_swa_host_shares(110, full, swa, ratio))
+        explicit = _host_split_pool(100, 50, host_capacity_bytes=GB)
+        self.assertIsNone(_swa_host_shares(110, full, explicit, 0.2))
+
+    def test_the_host_tiers_are_sized_as_if_the_device_used_the_host_ratio(self):
+        # full 100 B/token x 1000; sliding window 50 B/token x 1000 x 0.2
+        shares = _swa_host_shares(
+            110, _host_split_pool(1000, 100), _host_split_pool(100, 50), 0.2
+        )
+        self.assertEqual([round(s, 6) for s in shares], [100.0, 10.0])
+
+    def test_bytes_per_token_come_from_the_allocated_rows(self):
+        # the full pool serves 500 of its 1000 rows after a resize; the split keeps
+        # 100 B/token for it, not 1000 rows' bytes over 500 tokens
+        full = _host_split_pool(500, 100, rows=1000)
+        shares = _swa_host_shares(110, full, _host_split_pool(50, 50), 0.2)
+        self.assertEqual([round(s, 6) for s in shares], [100.0, 10.0])
+
+    def test_an_mla_backed_pool_splits_like_an_mha_one(self):
+        """MLA sub-pools report one byte total and have no k_buffer;
+        they must split like MHA ones instead of failing the startup."""
+        shares = _swa_host_shares(
+            110, _host_split_mla_pool(999, 100), _host_split_mla_pool(99, 50), 0.2
+        )
+        self.assertEqual([round(s, 6) for s in shares], [100.0, 10.0])
 
 
 if __name__ == "__main__":

@@ -18,7 +18,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.common import (
     free_kv_row_segments,
 )
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc, ReqToTokenPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -845,6 +845,74 @@ class TestSWAPageRepsFree(CustomTestCase):
                 touched = -(num_tokens // -ps) * ps
                 self.assertTrue(torch.all(mapping[indices[:touched]] == 0))
                 self.assertTrue(torch.all(mapping[indices[touched:]] > 0))
+
+
+class _RecordingSubPool:
+    """Stands in for an MHA sub-pool; records the layer ids each write carries."""
+
+    def __init__(self):
+        self.calls = []
+
+    def set_kv_buffer(
+        self,
+        layer,
+        loc,
+        cache_k,
+        cache_v,
+        k_scale=None,
+        v_scale=None,
+        layer_id_override=None,
+    ):
+        self.calls.append(
+            (None if layer is None else layer.layer_id, layer_id_override)
+        )
+
+
+def _layer_routing_pool(full_layer_ids, swa_layer_ids):
+    full, swa = _RecordingSubPool(), _RecordingSubPool()
+    pool = SWAKVPool.__new__(SWAKVPool)
+    pool.full_kv_pool, pool.swa_kv_pool, pool.layers_mapping = full, swa, {}
+    for local, gid in enumerate(full_layer_ids):
+        pool.layers_mapping[gid] = (local, False)
+    for local, gid in enumerate(swa_layer_ids):
+        pool.layers_mapping[gid] = (local, True)
+    return pool, full, swa
+
+
+def _write_loc(num_tokens):
+    ids = torch.arange(num_tokens)
+    return KVWriteLoc(ids, physical=True, window_locs={SWAKVPool.WINDOW_SUB_POOL: ids})
+
+
+class TestSWAKVPoolLayerIds(CustomTestCase):
+    """A quantized sub-pool indexes its buffers by the sub-pool-local index but reads
+    its per-layer KV scales by the global layer id, so SWAKVPool must pass both."""
+
+    def test_interleaved_layers_get_the_global_id_and_the_local_index(self):
+        # full = 0, 2, 4; swa = 1, 3, 5: a local index collides with another
+        # layer's global id in the other sub-pool.
+        pool, full, swa = _layer_routing_pool([0, 2, 4], [1, 3, 5])
+        for gid in range(6):
+            pool.set_kv_buffer(
+                SimpleNamespace(layer_id=gid),
+                _write_loc(4),
+                torch.zeros(4),
+                torch.zeros(4),
+            )
+        self.assertEqual(full.calls, [(0, 0), (2, 1), (4, 2)])
+        self.assertEqual(swa.calls, [(1, 0), (3, 1), (5, 2)])
+
+    def test_every_global_layer_reaches_exactly_one_sub_pool(self):
+        pool, full, swa = _layer_routing_pool([0, 1, 2], [3, 4, 5])
+        for gid in range(6):
+            pool.set_kv_buffer(
+                SimpleNamespace(layer_id=gid),
+                _write_loc(2),
+                torch.zeros(2),
+                torch.zeros(2),
+            )
+        seen = [c[0] for c in full.calls] + [c[0] for c in swa.calls]
+        self.assertEqual(sorted(seen), list(range(6)))
 
 
 if __name__ == "__main__":
