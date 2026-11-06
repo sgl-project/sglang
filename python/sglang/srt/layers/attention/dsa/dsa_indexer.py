@@ -260,6 +260,7 @@ def _index_k_write_targets(pool, layer_id: int, loc: torch.Tensor):
     return shard_pool.index_key_cache.write_targets(layer_id, loc)
 
 
+# TODO(kpham-sgl): shard index-K under DCP by default (dsa_shards_index_k() always on) and remove this switch.
 def _index_k_dcp() -> Tuple[int, int]:
     if not dsa_shards_index_k():
         return 1, 0
