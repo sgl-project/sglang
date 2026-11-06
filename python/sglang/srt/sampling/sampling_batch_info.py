@@ -89,6 +89,11 @@ class SamplingBatchInfo:
     acc_scaling_penalties: Optional[torch.Tensor] = (
         None  # Used in the overlap mode for repetition penalty
     )
+    # The scalar is needed for tokens first seen in the current verify block.
+    repetition_penalties: Optional[torch.Tensor] = None
+    # Forward-only GPU relay of the last committed block (CPU history may lag).
+    repetition_penalty_tokens: Optional[torch.Tensor] = None
+    repetition_penalty_lens: Optional[torch.Tensor] = None
 
     # Whether any request has custom logit processor
     has_custom_logit_processor: bool = False
@@ -295,6 +300,9 @@ class SamplingBatchInfo:
                 penaltylib.BatchedRepetitionPenalizer,
             },
         )
+        # The new orchestrator starts these requests with empty counters.
+        for r in reqs:
+            r.penalizer_cumulated_len = 0
 
         ret = cls(
             temperatures=temperatures,
@@ -419,7 +427,13 @@ class SamplingBatchInfo:
         self.grammar_mask = GrammarMask(first_grammar, vocab_mask)
 
     def update_penalties(self):
+        self.repetition_penalties = None
         if self.penalizer_orchestrator.is_required:
+            repetition = self.penalizer_orchestrator.penalizers.get(
+                penaltylib.BatchedRepetitionPenalizer
+            )
+            if repetition is not None and repetition.is_prepared():
+                self.repetition_penalties = repetition.repetition_penalties
             self.acc_additive_penalties = torch.zeros(
                 (len(self.temperatures), self.vocab_size),
                 dtype=torch.float32,
