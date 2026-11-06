@@ -182,7 +182,13 @@ def flash_mla_mega_prefill(
     rms_norm_eps: float = 0.0,
     use_legacy: bool = True,
 ) -> Tuple[torch.Tensor, ...]:
-    """MegaAttention prefill over a bf16 ``kv``: (out_fp8, out_sf, max_logits, lse)."""
+    """MegaAttention prefill: (out_fp8, out_sf, max_logits, lse).
+
+    ``kv`` is bf16, or e4m3 with unit scale for FlashMLA's all-fp8 prefill
+    (64 heads), which needs a FlashMLA carrying that path:
+    https://github.com/sgl-project/FlashMLA/compare/sgl...liaojianjin:FlashMLA:fp8-prefill
+    The ``sgl-flash-mla`` wheel takes bf16 only.
+    """
     return _mega.prefill(
         token_positions=positions,
         cos_sin_cache=cos_sin_cache,

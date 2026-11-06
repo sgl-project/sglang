@@ -167,6 +167,26 @@ _is_xpu = is_xpu()
 
 logger = logging.getLogger(__name__)
 
+
+def _dsv41_fp8_prefill_workspace(num_heads: int) -> bool:
+    """Whether a MegaAttention sparse prefill gathers an fp8 workspace.
+
+    ``SGLANG_DSV41_FP8_PREFILL_WORKSPACE`` gathers the workspace of every layer
+    (compressed + SWA, and SWA-only) as plain e4m3 with unit scale, which switches
+    FlashMLA's fused prefill to its all-fp8 path (f8f6f4 QK/PV UMMAs, half the
+    gather bytes, half the resident workspace). The all-fp8 instances exist for
+    64 query heads only; other head counts keep the bf16 workspace.
+    """
+    fp8 = num_heads == 64 and envs.SGLANG_DSV41_FP8_PREFILL_WORKSPACE.get()
+    global _dsv41_fp8_prefill_logged
+    if fp8 and not _dsv41_fp8_prefill_logged:
+        _dsv41_fp8_prefill_logged = True
+        logger.info("[dsv41] fp8 MegaAttention sparse-prefill workspace (unit scale).")
+    return fp8
+
+
+_dsv41_fp8_prefill_logged = False
+
 SWA_WINDOW = 128
 DEFAULT_INDEX_TOPK = 512
 PAGE_INDEX_ALIGNED_SIZE = 64
@@ -4555,8 +4575,9 @@ class DeepseekV4AttnBackend(
         cos_sin_cache: Optional[torch.Tensor] = None,
         use_cutedsl_h16: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        """Gathers each request's SWA window and c4/c128 cache into a flat bf16
-        workspace that flash_mla_sparse_fwd reads through per-query rebased indices."""
+        """Gathers each request's SWA window and c4/c128 cache into a flat bf16 (or,
+        for MegaAttention, optionally e4m3) workspace that flash_mla_sparse_fwd reads
+        through per-query rebased indices."""
         # q is (b, 1, h_q, d_qk); flash_mla_sparse_fwd takes (s_q, h_q, d_qk).
         q_flat = q.squeeze(1)
 
@@ -4573,8 +4594,17 @@ class DeepseekV4AttnBackend(
         extra_k_cache = None
         extra_page_size = None
         flat_token_ids = None
+        # Only the MegaAttention prefill consumes an fp8 workspace; it covers the
+        # SWA-only layers as well as the compressed ones.
+        if cos_sin_cache is not None and not use_cutedsl_h16:
+            use_fp8_ws = _dsv41_fp8_prefill_workspace(q_flat.shape[1])
+        else:
+            use_fp8_ws = False
+        ws_dtype = fp8_dtype if use_fp8_ws else torch.bfloat16
         if compress_ratio == 0:
-            workspace = self.sparse_prefill_kv_buffer.get(cache.swa_token_ids.shape[0])
+            workspace = self.sparse_prefill_kv_buffer.get(
+                cache.swa_token_ids.shape[0], dtype=ws_dtype
+            )
             combined_indices = cache.c0_combined_indices
             combined_lens = cache.c0_combined_lens
             swa_slice = workspace
@@ -4593,9 +4623,11 @@ class DeepseekV4AttnBackend(
             if reuse_compressed:
                 workspace = self.shared_compressed_prefill_workspaces[
                     compress_ratio
-                ].get(n_compressed + cache.swa_token_ids.shape[0])
+                ].get(n_compressed + cache.swa_token_ids.shape[0], dtype=ws_dtype)
                 compressed_slice = workspace[:n_compressed]
             else:
+                # Layers sharing a kv_source reuse its dequant: no later layer writes
+                # that cache, and graph replay keeps the layer order.
                 workspace, compressed_filled = (
                     self.sparse_prefill_kv_buffer.get_with_head(
                         n_compressed + cache.swa_token_ids.shape[0],
@@ -4603,7 +4635,9 @@ class DeepseekV4AttnBackend(
                             extra_k_cache.data_ptr(),
                             flat_token_ids.data_ptr(),
                             n_compressed,
+                            ws_dtype,
                         ),
+                        dtype=ws_dtype,
                     )
                 )
                 if not compressed_filled:
