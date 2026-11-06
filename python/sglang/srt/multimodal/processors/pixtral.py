@@ -8,6 +8,7 @@ from transformers.models.pixtral.image_processing_pixtral import (
     _num_image_tokens as _get_pixtral_hf_num_image_tokens,
 )
 
+from sglang.srt.hf_transformers.mistral_utils import mistral_common_image_encoder
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.models.pixtral import (
     PixtralForConditionalGeneration,
@@ -18,7 +19,6 @@ from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
 )
-from sglang.srt.utils.hf_transformers.mistral_utils import mistral_common_image_encoder
 
 
 class PixtralProcessor(BaseMultimodalProcessor):
@@ -234,7 +234,7 @@ class PixtralProcessor(BaseMultimodalProcessor):
                 new_item.model_specific_data["image_sizes"] = old_image_sizes[
                     image_idx : image_idx + 1
                 ]
-            new_item.hash = None
+            new_item.clear_identity()
             new_item.pad_value = None
             split_items.append(new_item)
         if offset_idx != len(all_offsets):

@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.configs.model_config import compute_mla_mscale_scaling
+from sglang.srt.hf_transformers import get_rope_config
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -34,7 +35,6 @@ from sglang.srt.models.dflash import (
 )
 from sglang.srt.models.dspark import DSparkDraftMixin, DSparkDraftModel
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils.hf_transformers import get_rope_config
 
 
 class DFlashMLAAttention(nn.Module):

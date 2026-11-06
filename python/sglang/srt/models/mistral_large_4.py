@@ -18,6 +18,7 @@ from sglang.srt.layers.quantization.modelopt_quant import (
 from sglang.srt.layers.rotary_embedding.rope_variant import (
     DeepseekScalingRotaryEmbedding,
 )
+from sglang.srt.layers.utils.common import add_prefix, set_weight_attrs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import sharded_weight_loader
 from sglang.srt.models.deepseek_v2 import (
@@ -29,7 +30,6 @@ from sglang.srt.models.deepseek_v2 import (
 from sglang.srt.models.mistral_large_3 import MistralLarge3ForCausalLM
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.state_capturer.indexer_topk import maybe_capture_indexer_topk
-from sglang.srt.utils import add_prefix, set_weight_attrs
 
 _LEROPE_ALPHA = "model.lerope_alpha"
 

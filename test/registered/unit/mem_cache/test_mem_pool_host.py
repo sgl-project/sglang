@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.hf_transformers.mistral_utils import _remap_mistral_dsa_args
 from sglang.srt.mem_cache.device_pool_info import MambaStateBufferInfo
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.kv_cache_configurator import _should_elide_dsa_index_k
@@ -37,7 +38,6 @@ from sglang.srt.mem_cache.pool_host.mha import (
 )
 from sglang.srt.mem_cache.pool_host.mla import MLAHostAllocation, MLATokenToKVPoolHost
 from sglang.srt.runtime_context import get_context
-from sglang.srt.utils.hf_transformers.mistral_utils import _remap_mistral_dsa_args
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -1098,7 +1098,6 @@ class TestDSAIndexerPoolInfo(CustomTestCase):
     def test_host_bytes_match_observed_allocation(self):
         info = self._stub().get_device_pool_infos()[1].buffer_info
         self.assertEqual(info.page_bytes, 8448)
-        self.assertEqual(284256 * 5 * info.page_bytes, 12006973440)
 
     def test_sharded_rank_without_index_buffers_keeps_remote_callbacks(self):
         from sglang.srt.mem_cache.hybrid_cache.host_pool_config import (
@@ -1224,6 +1223,25 @@ class TestDSAIndexerPoolInfo(CustomTestCase):
             torch.testing.assert_close(pool.kv_buffer[layer], expected)
         self.assertEqual(pool.kv_buffer[1].shape[0], 0)
         pool.index_key_cache.move.assert_called_once_with(tgt, src)
+
+
+class TestStridedStateDetection(CustomTestCase):
+    def test_contiguous_slots_are_not_strided(self):
+        for shape in ((8, 4), (8, 4, 3), (1, 5)):
+            with self.subTest(shape=shape):
+                self.assertFalse(
+                    MambaPoolHost._slots_are_strided(torch.zeros(shape)),
+                    "a contiguous slot array must take the direct path",
+                )
+
+    def test_envelope_strided_slots_are_detected(self):
+        num_slots, per_slot, envelope = 6, 4, 10
+        raw = torch.zeros(num_slots * envelope)
+        view = torch.as_strided(raw, size=(num_slots, per_slot), stride=(envelope, 1))
+        self.assertTrue(MambaPoolHost._slots_are_strided(view))
+
+    def test_empty_tensor_is_not_strided(self):
+        self.assertFalse(MambaPoolHost._slots_are_strided(torch.zeros((0, 4))))
 
 
 class TestMambaHostPoolOnXpu(CustomTestCase):
