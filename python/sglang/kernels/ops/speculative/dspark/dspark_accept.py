@@ -635,7 +635,7 @@ def accept_greedy(
     cutoff_verify_lens: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     bs = candidates.shape[0]
-    target_predict = _row_argmax(target_logits).view(bs, verify_num_draft_tokens)
+    target_predict = sampling_argmax(target_logits).view(bs, verify_num_draft_tokens)
     correct_len, bonus = compute_dflash_correct_drafts_and_bonus(
         candidates=candidates,
         target_predict=target_predict,
@@ -677,27 +677,6 @@ def gather_row_bonus_triton(*, table: torch.Tensor, idx: torch.Tensor) -> torch.
     return out
 
 
-def _row_argmax(logits: torch.Tensor) -> torch.Tensor:
-    if not _is_npu:
-        return sampling_argmax(logits)
-
-    if (
-        logits.is_cuda
-        and logits.dim() == 2
-        and logits.dtype == torch.float32
-        and logits.stride(1) == 1
-        and (
-            logits.shape[0] <= 64
-            or (logits.shape[0] <= 384 and logits.shape[1] >= 65536)
-        )
-        and logits.shape[1] >= 4096
-    ):
-        from sgl_kernel_npu.operators.sample import row_argmax
-
-        return row_argmax(logits)
-    return torch.argmax(logits, dim=-1)
-
-
 def accept_greedy_triton(
     *,
     candidates: torch.Tensor,
@@ -706,7 +685,7 @@ def accept_greedy_triton(
     cutoff_verify_lens: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     bs = candidates.shape[0]
-    target_predict = _row_argmax(target_logits).view(bs, verify_num_draft_tokens)
+    target_predict = sampling_argmax(target_logits).view(bs, verify_num_draft_tokens)
     correct_len, bonus = compute_dflash_correct_drafts_and_bonus(
         candidates=candidates,
         target_predict=target_predict,

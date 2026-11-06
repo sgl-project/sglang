@@ -7,11 +7,11 @@ import torch
 import torch_npu  # noqa: F401
 from torch_npu.contrib import transfer_to_npu  # noqa: F401
 
+from sglang.kernels.ops.sampling import argmax as sampling_argmax
 from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
 from sglang.kernels.ops.speculative.dspark.dspark_accept import (
     AcceptGreedy,
     SoftmaxTemp,
-    _row_argmax,
 )
 from sglang.kernels.ops.speculative.dspark.dspark_draft_model import MarkovGreedyStep
 from sglang.kernels.ops.speculative.dspark.dspark_schedule import ScheduleVerifyLensTopk
@@ -102,7 +102,7 @@ class TestDSparkNpuDispatch(CustomTestCase):
         logits[2, 10] = float("inf")
         expected_top1 = logits.cpu().argmax(-1)
         with mock.patch.object(sample, "row_argmax", wraps=sample.row_argmax) as kernel:
-            actual = _row_argmax(logits)
+            actual = sampling_argmax(logits)
         kernel.assert_called_once_with(logits)
         self.assertTrue(torch.equal(actual.cpu(), expected_top1))
         predict = expected_top1.reshape(rows, block)
@@ -131,13 +131,33 @@ class TestDSparkNpuDispatch(CustomTestCase):
         from sgl_kernel_npu.operators import sample
 
         for logits in (
-            torch.randn(3, 32, device="npu", dtype=torch.float16),
-            torch.randn(3, 64, device="npu")[:, ::2],
+            torch.randn(3, 4096, device="npu", dtype=torch.float16),
+            torch.randn(3, 8192, device="npu")[:, ::2],
+            torch.randn(3, 4095, device="npu"),
+            torch.randn(65, 4096, device="npu"),
+            torch.randn(65, 65535, device="npu"),
+            torch.randn(385, 65536, device="npu"),
         ):
             with mock.patch.object(sample, "row_argmax") as kernel:
-                actual = _row_argmax(logits)
+                actual = sampling_argmax(logits)
             kernel.assert_not_called()
             self.assertTrue(torch.equal(actual.cpu(), logits.cpu().argmax(-1)))
+
+    def test_argmax_shape_boundaries(self):
+        from sgl_kernel_npu.operators import sample
+
+        for rows, vocab in ((64, 4096), (65, 65536), (384, 65536)):
+            with self.subTest(rows=rows, vocab=vocab):
+                logits = torch.randn(rows, vocab, device="npu")
+                expected = logits.cpu().argmax(-1)
+                with mock.patch.object(
+                    sample, "row_argmax", wraps=sample.row_argmax
+                ) as kernel:
+                    actual = sampling_argmax(logits)
+                kernel.assert_called_once_with(logits)
+                self.assertEqual(actual.dtype, torch.int64)
+                self.assertEqual(actual.device, logits.device)
+                self.assertTrue(torch.equal(actual.cpu(), expected))
 
     def test_schedule_verify_lens_matches_torch(self):
         from sgl_kernel_npu.operators import sample
