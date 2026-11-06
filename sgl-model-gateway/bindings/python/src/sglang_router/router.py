@@ -171,6 +171,13 @@ class Router:
             routing. Default: 60
         max_payload_size: Maximum payload size in bytes. Default: 256MB
         max_tree_size: Maximum size of the approximation tree for cache-aware routing. Default: 2^24
+        cache_aware_prefill_backlog_rate: Estimated prefill throughput per worker in uncached input
+            chars/s for backlog-aware PD prefill selection in cache-aware routing. 0 disables.
+            Default: 0
+        cache_aware_prefill_backlog_hop_factor: Base weight of a request's uncached chars in
+            backlog-aware prefill selection. Default: 4.0
+        cache_aware_prefill_backlog_hop_scale: Backlog in chars that adds 1.0 to that weight; 0 keeps
+            it constant. Default: 200000
         dp_aware: Enable data parallelism aware schedule. Default: False
         enable_igw: Enable IGW (Inference-Gateway) mode for multi-model support. When enabled,
             the router can manage multiple models simultaneously with per-model load balancing
