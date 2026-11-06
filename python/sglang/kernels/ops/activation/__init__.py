@@ -121,7 +121,27 @@ __all__ = [
     "situ_and_mul",
     "SiluAndMulOp",
     "silu_and_mul",
+    "bf16_gelu_tanh_mul_lut",
 ]
+
+
+register_kernel(
+    KernelSpec(
+        op="activation.bf16_gelu_tanh_mul_lut",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.activation.xpu_gelu_tanh_mul_lut:bf16_gelu_tanh_mul_lut",
+        capabilities=frozenset({CapabilityRequirement.XPU}),
+    )
+)
+
+
+def bf16_gelu_tanh_mul_lut(input: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+    """Exact native BF16 gated activation with a prebuilt caller-owned table."""
+    from sglang.kernels.ops.activation.xpu_gelu_tanh_mul_lut import (
+        bf16_gelu_tanh_mul_lut as implementation,
+    )
+
+    return implementation(input, table)
 
 
 # Triton kernel migrated into this group (from layers/triton_ops/softcap);
