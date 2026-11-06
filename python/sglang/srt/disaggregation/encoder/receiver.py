@@ -27,6 +27,10 @@ from transformers import PretrainedConfig
 
 from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
 from sglang.srt.environ import envs
+from sglang.srt.hf_transformers import (
+    get_processor,
+    resolve_image_processor_backend,
+)
 from sglang.srt.managers.io_struct import (
     EncoderDispatchErrorReq,
     GenerateReqInput,
@@ -49,10 +53,6 @@ from sglang.srt.runtime_context import (
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import ImageData, VideoData
 from sglang.srt.utils.common import safe_pickle_loads
-from sglang.srt.utils.hf_transformers import (
-    get_processor,
-    resolve_image_processor_backend,
-)
 from sglang.srt.utils.network import (
     NetworkAddress,
     get_local_ip_auto,
