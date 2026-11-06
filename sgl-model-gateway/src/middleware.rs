@@ -18,6 +18,7 @@ use axum::{
 };
 use bytes::Bytes;
 use http_body::Frame;
+use opentelemetry::trace::TraceContextExt;
 use rand::Rng;
 use serde_json::json;
 use subtle::ConstantTimeEq;
@@ -25,12 +26,14 @@ use tokio::sync::{mpsc, oneshot};
 use tower::{Layer, Service};
 use tower_http::trace::{MakeSpan, OnRequest, OnResponse, TraceLayer};
 use tracing::{debug, error, field::Empty, info, info_span, warn, Span};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 pub use crate::core::token_bucket::TokenBucket;
 use crate::{
     observability::{
         inflight_tracker::InFlightRequestTracker,
         metrics::{method_to_static_str, metrics_labels, Metrics},
+        otel_trace,
     },
     routers::error::extract_error_code_from_response,
     server::AppState,
@@ -265,15 +268,29 @@ where
     }
 }
 
+/// Longest value recorded per traced request header; longer ones are cut, so a
+/// caller can't attach unbounded data to spans. The engine uses the same limit.
+const TRACED_HEADER_MAX_LEN: usize = 1024;
+
 /// Custom span maker that includes request ID
 #[derive(Clone, Debug)]
-pub struct RequestSpan;
+pub struct RequestSpan {
+    traced_headers: &'static [otel_trace::TracedRequestHeader],
+}
+
+impl Default for RequestSpan {
+    fn default() -> Self {
+        Self {
+            traced_headers: otel_trace::traced_request_headers(),
+        }
+    }
+}
 
 impl<B> MakeSpan<B> for RequestSpan {
     fn make_span(&mut self, request: &Request<B>) -> Span {
-        // Don't try to extract request ID here - it won't be available yet
-        // The RequestIdLayer runs after TraceLayer creates the span
-        info_span!(
+        // `request_id` is recorded later: RequestIdLayer runs after TraceLayer
+        // creates this span.
+        let span = info_span!(
             target: "smg::otel-trace",
             "http_request",
             method = %request.method(),
@@ -283,8 +300,24 @@ impl<B> MakeSpan<B> for RequestSpan {
             status_code = Empty,
             latency = Empty,
             error = Empty,
+            otel.status_code = Empty,
             module = "smg"
-        )
+        );
+        let parent = otel_trace::extract_trace_context_http(request.headers());
+        if parent.span().span_context().is_valid() {
+            span.set_parent(parent);
+        }
+        for header in self.traced_headers {
+            if let Some(value) = request
+                .headers()
+                .get(header.name.as_str())
+                .and_then(|v| v.to_str().ok())
+            {
+                let value = &value[..value.len().min(TRACED_HEADER_MAX_LEN)];
+                span.set_attribute(header.attribute.as_str(), value.to_owned());
+            }
+        }
+        span
     }
 }
 
@@ -343,6 +376,22 @@ impl<B> OnResponse<B> for ResponseLogger {
         // Use microseconds as integer to avoid format! string allocation
         span.record("latency", latency.as_micros() as u64);
 
+        if status.is_client_error() || status.is_server_error() {
+            let reason = status.canonical_reason().unwrap_or("error");
+            span.record(
+                "error",
+                if error_code.is_empty() {
+                    reason
+                } else {
+                    error_code
+                },
+            );
+        }
+
+        if status.is_server_error() {
+            span.record("otel.status_code", "ERROR");
+        }
+
         // Log the response completion
         let _enter = span.enter();
         if status.is_server_error() {
@@ -373,7 +422,7 @@ pub fn create_logging_layer() -> TraceLayer<
     ResponseLogger,
 > {
     TraceLayer::new_for_http()
-        .make_span_with(RequestSpan)
+        .make_span_with(RequestSpan::default())
         .on_request(RequestLogger)
         .on_response(ResponseLogger::default())
 }
@@ -981,6 +1030,8 @@ pub async fn wasm_middleware(
 
 #[cfg(test)]
 mod tests {
+    use opentelemetry_sdk::export::trace::{ExportResult, SpanData, SpanExporter};
+
     use super::*;
 
     #[test]
@@ -1045,5 +1096,105 @@ mod tests {
         // Regular words
         assert!(!is_dynamic_id("completions"));
         assert!(!is_dynamic_id("chat"));
+    }
+
+    /// Records exported spans so tests can check their trace and parent IDs.
+    #[derive(Clone, Debug, Default)]
+    struct CapturingExporter(Arc<std::sync::Mutex<Vec<SpanData>>>);
+
+    impl SpanExporter for CapturingExporter {
+        fn export(
+            &mut self,
+            batch: Vec<SpanData>,
+        ) -> futures_util::future::BoxFuture<'static, ExportResult> {
+            self.0.lock().unwrap().extend(batch);
+            Box::pin(std::future::ready(Ok(())))
+        }
+    }
+
+    /// Build one `http_request` span through `RequestSpan` and return what was exported.
+    fn export_request_span(headers: &[(&str, &str)]) -> SpanData {
+        use opentelemetry::trace::TracerProvider as _;
+        use tracing_subscriber::{layer::SubscriberExt, Layer as _};
+
+        opentelemetry::global::set_text_map_propagator(
+            opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+        );
+        let exporter = CapturingExporter::default();
+        let provider = opentelemetry_sdk::trace::TracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_opentelemetry::layer()
+                .with_tracer(provider.tracer("test"))
+                .with_filter(otel_trace::CustomOtelFilter::new()),
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            let mut request = Request::builder().uri("/v1/chat/completions");
+            for (name, value) in headers {
+                request = request.header(*name, *value);
+            }
+            let mut make_span = RequestSpan {
+                traced_headers: Box::leak(
+                    otel_trace::parse_traced_request_headers(
+                        " x-request-id, ,X-Upstream-Request-Id,",
+                    )
+                    .into_boxed_slice(),
+                ),
+            };
+            drop(make_span.make_span(&request.body(()).unwrap()));
+        });
+        let mut spans = exporter.0.lock().unwrap();
+        assert_eq!(spans.len(), 1);
+        spans.remove(0)
+    }
+
+    #[test]
+    fn test_request_span_continues_incoming_w3c_trace() {
+        let span = export_request_span(&[(
+            "traceparent",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        )]);
+        assert_eq!(
+            span.span_context.trace_id().to_string(),
+            "4bf92f3577b34da6a3ce929d0e0e4736"
+        );
+        assert_eq!(span.parent_span_id.to_string(), "00f067aa0ba902b7");
+    }
+
+    #[test]
+    fn test_request_span_records_request_ids() {
+        let span = export_request_span(&[
+            ("x-request-id", "req-1"),
+            ("x-upstream-request-id", "0f1e2d3c"),
+            ("x-untraced-id", "not-recorded"),
+        ]);
+        let attribute = |key: &str| {
+            span.attributes
+                .iter()
+                .find(|kv| kv.key.as_str() == key)
+                .map(|kv| kv.value.as_str().into_owned())
+        };
+        assert_eq!(
+            attribute("http.request.header.x-request-id").as_deref(),
+            Some("req-1")
+        );
+        assert_eq!(
+            attribute("http.request.header.x-upstream-request-id").as_deref(),
+            Some("0f1e2d3c")
+        );
+        assert_eq!(attribute("http.request.header.x-untraced-id"), None);
+    }
+
+    #[test]
+    fn test_request_span_cuts_recorded_headers_to_1024_bytes() {
+        let long_id = "a".repeat(5000);
+        let span = export_request_span(&[("x-request-id", long_id.as_str())]);
+        let recorded = span
+            .attributes
+            .iter()
+            .find(|kv| kv.key.as_str() == "http.request.header.x-request-id")
+            .map(|kv| kv.value.as_str().into_owned());
+        assert_eq!(recorded, Some("a".repeat(1024)));
     }
 }

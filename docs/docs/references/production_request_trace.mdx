@@ -38,6 +38,8 @@ This section explains how to configure the request tracing and export the trace 
 
     Replace `0.0.0.0:4317` with the actual endpoint of the OpenTelemetry collector. If you launched the openTelemetry collector with tracing_compose.yaml, the default receiving port is 4317.
 
+    The model gateway continues an incoming W3C `traceparent`, so its `http_request` span joins the caller's trace. It records the request headers named in `SGLANG_TRACE_REQUEST_HEADERS` on that span as `http.request.header.<name>`, and forwards the headers named in `SGLANG_TRACE_REQUEST_HEADERS` or `SGLANG_LOG_REQUEST_HEADERS` to workers so they can record them too; set these variables in the gateway's environment as well. Hop-by-hop headers (such as `host`, `connection` or `transfer-encoding`) and `content-length` are not forwarded even when a list names them, since the client's values would misframe the request to the worker.
+
     To use the HTTP/protobuf span exporter, set the following environment variable and point to an HTTP endpoint, for example, `http://0.0.0.0:4318/v1/traces`.
     ```bash Command
     export OTEL_EXPORTER_OTLP_TRACES_PROTOCOL=http/protobuf
