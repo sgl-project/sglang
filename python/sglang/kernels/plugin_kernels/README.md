@@ -27,6 +27,7 @@ srt/kernel_plugins/          # SGLang's integration
 | --- | --- | --- |
 | `nvidia/` | `--enable-nvidia-megakernel` | [sgl-nvidia-mega](https://github.com/sgl-project/sgl-nvidia-mega) |
 | `amd/` | `--enable-amd-monokernel` | [sgl-amd-mono](https://github.com/sgl-project/sgl-amd-mono) |
+| `xpu/` | `--enable-xpu-monokernel` | [sgl-kernel-xpu](https://github.com/sgl-project/sgl-kernel-xpu) |
 
 ## How a plugin runs
 
