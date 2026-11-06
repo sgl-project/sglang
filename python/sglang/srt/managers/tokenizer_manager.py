@@ -22,6 +22,7 @@ import gc
 import json
 import logging
 import os
+import pickle
 import signal
 import socket
 import sys
