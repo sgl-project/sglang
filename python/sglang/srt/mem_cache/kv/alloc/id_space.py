@@ -59,6 +59,12 @@ class IdSpace(msgspec.Struct, frozen=True):
     write: Optional[Callable[[torch.Tensor], torch.Tensor]] = None
     read_v2p: Optional[torch.Tensor] = None
     table: Optional[torch.Tensor] = None
+    prepare_read: Optional[Callable[[], None]] = None
+
+    def read_mapping(self):
+        if self.prepare_read is not None:
+            self.prepare_read()
+        return self.read_v2p
 
     def ids(self, virtual_ids: torch.Tensor) -> torch.Tensor:
         """``virtual_ids`` as this sub-pool indexes them."""
@@ -318,3 +324,39 @@ def window_read(
     return WindowRead(
         start=seq_lens - lens, lens=lens, window=window, window_left=window
     )
+
+
+class ReplicatedTokenIds:
+    """Draft coordinates over every logical token of an owner DCP page."""
+
+    def __init__(self, owner: UnitIds, factor: int):
+        self.owner = owner
+        self.factor = factor
+        self.expanded = torch.empty(
+            ((owner.virtual_to_physical.numel() - 1) * factor + 1,),
+            dtype=torch.int64,
+            device=owner.virtual_to_physical.device,
+        )
+
+    def refresh(self):
+        from sglang.kernels.ops.memory.virtual_slot import expand_page_mapping
+
+        expand_page_mapping(self.owner.virtual_to_physical, self.expanded, self.factor)
+
+    def write(self, ids):
+        return translate_token_ids(
+            loc=ids,
+            v2p=self.owner.virtual_to_physical,
+            page_size=self.owner.unit_tokens * self.factor,
+            dcp_size=1,
+            dcp_rank=0,
+        )
+
+    def space(self, key):
+        return IdSpace(
+            key=(key, "replicated", self.factor),
+            write=self.write,
+            read_v2p=self.expanded,
+            table=self.expanded,
+            prepare_read=self.refresh,
+        )

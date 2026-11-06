@@ -12,6 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
+from sglang._lazy_import import LazyImport
 from sglang.kernels.ops.layernorm.norm import (
     can_use_fused_inplace_qknorm as can_use_jit_qk_norm,
 )
@@ -40,7 +41,6 @@ from sglang.srt.utils.multi_stream_utils import (
     maybe_execute_in_parallel,
     with_multi_stream,
 )
-from sglang.utils import LazyImport
 
 _is_cpu = is_cpu()
 _is_cuda = is_cuda()
@@ -98,7 +98,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import apply_rotary_pos_emb
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_pos_emb_native_eager
-from sglang.srt.utils import add_prefix
+from sglang.srt.layers.utils.common import add_prefix
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
@@ -1032,6 +1032,7 @@ class VisionAMXAttention(nn.Module):
         cu_seqlens: torch.Tensor | SingletonCache | None,
         bsz: int,
         seq_len: int,
+        softmax_scale: Optional[float] = None,
         **kwargs,
     ) -> torch.Tensor:
         r"""
@@ -1062,6 +1063,7 @@ class VisionAMXAttention(nn.Module):
             max_seqlen_q=max_seqlen,
             max_seqlen_k=max_seqlen,
             causal=False,
+            sm_scale=softmax_scale,
         )
 
         return output
