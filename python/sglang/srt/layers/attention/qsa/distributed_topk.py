@@ -1,5 +1,3 @@
-"""Distributed QSA top-k candidate transport and deterministic merge."""
-
 from __future__ import annotations
 
 import torch
@@ -22,8 +20,6 @@ def all_gather_qsa_topk_candidates(
     group,
     static_buffers=None,
 ) -> torch.Tensor:
-    """All-gather fixed-width candidates through a ``GroupCoordinator``."""
-
     if candidate_global_indices.shape != candidate_scores.shape:
         raise ValueError("candidate scores and indices must have matching shapes")
     if candidate_global_indices.dtype not in (torch.int32, torch.int64):
@@ -100,7 +96,6 @@ def _fused_publish_qsa_topk_candidates_kernel(
     WORLD_SIZE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    """Materialize score/id pairs directly into the symmetric receive buffer."""
     # A rank may reach this layer in the next replay while a peer is still
     # merging the previous payload. Synchronize before overwriting the shared
     # fixed-address transport, then use the exit barrier for publication.
@@ -178,7 +173,6 @@ def fused_publish_and_merge_qsa_topk_candidates(
     topk: int,
     static_buffers,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Publish local candidates with one no-pack multimem kernel, then merge."""
     if logical_block_positions is None:
         raise ValueError("fused candidate publish requires logical block positions")
     rows = local_indices.shape[0]
@@ -308,13 +302,6 @@ def merge_qsa_topk_candidates(
     *,
     topk: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Select the best published candidates entirely on their current device.
-
-    Local selectors may return candidates in any order. Equal-score candidates
-    already omitted by a local top-k cannot be reconstructed here; global ids
-    only make the merge deterministic among candidates that were published.
-    """
-
     if gathered_candidates.ndim == 4:
         if gathered_candidates.shape[-1] != 2:
             raise ValueError("candidate transport must end in score/index pairs")
@@ -350,8 +337,6 @@ def gather_and_merge_qsa_topk_candidates(
     topk: int,
     static_buffers=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run one fixed-shape all-gather and merge the global candidates."""
-
     gathered = all_gather_qsa_topk_candidates(
         candidate_scores,
         candidate_global_indices,
