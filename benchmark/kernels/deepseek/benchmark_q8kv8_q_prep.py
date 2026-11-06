@@ -12,17 +12,8 @@ New path (SGLANG_ENABLE_DSA_Q8KV8_BORN_FP8_Q):
     (one Triton kernel: bmm + concat + fp8 cast; the bf16 q_nope_out and the
     standalone concat-cast launch disappear)
 
-Non-power-of-2 K (GLM 192) K-dimension codegen variants (A/B'd here; all keep
-the identical fp32 -> bf16 -> fp8 epilogue, see cache_ops.py):
-    loop      : split-K loop, BLOCK_K=64 x 3 (the original K=192 path)
-    two_dot   : preload a once as 128+64 tiles, two chained tl.dot, no K-loop
-    three_dot : preload a once as 3 x 64 tiles, three chained tl.dot
-                (same fp32 add order as `loop`, loads hoisted)
-    pad       : single tl.dot at BLOCK_K=256 with zero-masked k tail
-    single_k  : single tl.dot at BLOCK_K=192 -- documents the Triton
-                non-power-of-2 tl.arange limitation (compile fails <= 3.5.x)
-Power-of-2 K (DeepSeek 128) collapses every variant to the same single-dot
-fast path, so only one NEW row is shown there.
+Non-power-of-2 K (GLM 192) preloads a once as 128+64 tiles and chains two
+tl.dot per N-block; power-of-2 K (DeepSeek 128) takes a single tl.dot.
 
 Shapes (both models: N = kv_lora_rank = 512, R = qk_rope_head_dim = 64;
 K = qk_nope_head_dim differs per model):
@@ -45,7 +36,6 @@ Correctness:
 Usage (single GPU):
     python benchmark/kernels/deepseek/benchmark_q8kv8_q_prep.py                # both model shapes
     python benchmark/kernels/deepseek/benchmark_q8kv8_q_prep.py --tokens 8192 --iters 300
-    python benchmark/kernels/deepseek/benchmark_q8kv8_q_prep.py --variants two_dot,pad
     python benchmark/kernels/deepseek/benchmark_q8kv8_q_prep.py --sweep        # + tile/warp sweep
     python benchmark/kernels/deepseek/benchmark_q8kv8_q_prep.py --rounding-study
 """
@@ -113,23 +103,18 @@ def new_path(q_fp8, q_nope, w_kc, q_rope, num_heads, **kw):
     absorbed_bmm_concat_cast_q_fp8(q_fp8, q_nope, w_kc, q_rope, num_heads, **kw)
 
 
-# Non-power-of-2-K variants, in bench order (power-of-2 K collapses to "auto").
-ALL_VARIANTS = ["loop", "two_dot", "three_dot", "pad", "single_k"]
-
-# (block_m, block_n, num_warps, num_stages) sweep grid; num_stages 0 = Triton
-# default.  N=512 is a multiple of every block_n here; block_m stays power of 2.
+# (block_m, block_n, num_warps) sweep grid.  N=512 is a multiple of every
+# block_n here; block_m stays power of 2.
 SWEEP_TILES = [
-    (64, 128, 4, 0),  # kernel default
-    (64, 128, 8, 0),
-    (64, 128, 4, 2),
-    (64, 128, 4, 4),
-    (128, 128, 4, 0),
-    (128, 128, 8, 0),
-    (64, 256, 8, 0),
-    (128, 256, 8, 0),
-    (32, 128, 4, 0),
-    (64, 64, 4, 0),
-    (128, 64, 8, 0),
+    (64, 128, 4),
+    (64, 128, 8),
+    (128, 128, 4),
+    (128, 128, 8),
+    (64, 256, 8),
+    (128, 256, 8),
+    (32, 128, 4),
+    (64, 64, 4),
+    (128, 64, 8),
 ]
 
 
@@ -279,7 +264,6 @@ def run_config(
     device,
     seed,
     magnitude,
-    variants,
     sweep,
 ):
     print(f"\n=== {name}: tokens={num_tokens} heads={num_heads} K={k_nope} ===")
@@ -319,12 +303,9 @@ def run_config(
         f"  ({b_old / 1e6:8.1f} MB analytic, {b_old / t_old / 1e3:7.0f} GB/s)"
     )
 
-    # Power-of-2 K collapses every variant to the same single-dot codegen.
-    pow2 = k_nope & (k_nope - 1) == 0
-    run_variants = ["auto"] if pow2 else variants
     ctx = make_check_ctx(num_tokens, num_heads, k_nope, device, seed + 1, magnitude)
     results = {}
-    for v in run_variants:
+    for v in ("auto",):
         kw = {"variant": v}
         try:
             t_new = time_fn(
@@ -364,16 +345,11 @@ def run_config(
         )
 
     if sweep and results:
-        print(
-            f"\n--- tile sweep: {name} (us/call LOWER = FASTER;"
-            " stages=0 -> Triton default) ---"
-        )
+        print(f"\n--- tile sweep: {name} (us/call LOWER = FASTER) ---")
         rows = []
         for v in results:
-            for bm, bn, nw, ns in SWEEP_TILES:
-                kw = dict(
-                    variant=v, block_m=bm, block_n=bn, num_warps=nw, num_stages=ns
-                )
+            for bm, bn, nw in SWEEP_TILES:
+                kw = dict(variant=v, block_m=bm, block_n=bn, num_warps=nw)
                 try:
                     t = time_fn(
                         lambda: new_path(q_fp8, q_nope, w_kc, q_rope, num_heads, **kw),
@@ -383,21 +359,21 @@ def run_config(
                 except Exception as e:
                     msg = (str(e).splitlines() or [type(e).__name__])[0]
                     print(
-                        f"  {v:<10} bm={bm:<3} bn={bn:<3} warps={nw} stages={ns}:"
+                        f"  {v:<10} bm={bm:<3} bn={bn:<3} warps={nw}:"
                         f"     FAIL — {msg[:70]}"
                     )
                     continue
-                rows.append((t, v, bm, bn, nw, ns))
+                rows.append((t, v, bm, bn, nw))
                 print(
-                    f"  {v:<10} bm={bm:<3} bn={bn:<3} warps={nw} stages={ns}:"
+                    f"  {v:<10} bm={bm:<3} bn={bn:<3} warps={nw}:"
                     f" {t:8.1f} us/call ({b_new / t / 1e3:5.0f} GB/s,"
                     f" {t_old / t:5.2f}x vs OLD)"
                 )
         rows.sort()
         print("  -- top 5 (fastest first) --")
-        for t, v, bm, bn, nw, ns in rows[:5]:
+        for t, v, bm, bn, nw in rows[:5]:
             print(
-                f"  {v:<10} bm={bm:<3} bn={bn:<3} warps={nw} stages={ns}:"
+                f"  {v:<10} bm={bm:<3} bn={bn:<3} warps={nw}:"
                 f" {t:8.1f} us/call ({t_old / t:5.2f}x vs OLD)"
             )
 
@@ -427,29 +403,12 @@ def main():
         help="qk_nope_head_dim for --heads runs (ignored for the default pair)",
     )
     parser.add_argument(
-        "--variants",
-        type=str,
-        default="all",
-        help=(
-            "comma list of non-power-of-2-K variants to bench "
-            f"(default: all = {','.join(ALL_VARIANTS)}); power-of-2-K configs "
-            "always run the single collapsed 'auto' variant"
-        ),
-    )
-    parser.add_argument(
         "--sweep",
         action="store_true",
-        help="also sweep (block_m, block_n, num_warps, num_stages) per variant",
+        help="also sweep (block_m, block_n, num_warps)",
     )
     parser.add_argument("--rounding-study", action="store_true")
     args = parser.parse_args()
-
-    if args.variants == "all":
-        variants = ALL_VARIANTS
-    else:
-        variants = [v.strip() for v in args.variants.split(",") if v.strip()]
-        unknown = set(variants) - set(ALL_VARIANTS) - {"auto"}
-        assert not unknown, f"unknown variants: {sorted(unknown)}"
 
     assert torch.cuda.is_available(), "CUDA GPU required"
     device = torch.device("cuda")
@@ -474,7 +433,6 @@ def main():
             device,
             args.seed,
             args.magnitude,
-            variants,
             args.sweep,
         )
 

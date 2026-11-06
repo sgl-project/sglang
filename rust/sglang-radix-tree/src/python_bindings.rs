@@ -213,6 +213,8 @@ fn pool_name_str(name: PoolName) -> &'static str {
         PoolName::DeepseekV4C4State => "deepseek_v4_c4_state",
         PoolName::DeepseekV4C4IndexerState => "deepseek_v4_c4_indexer_state",
         PoolName::DeepseekV4C128State => "deepseek_v4_c128_state",
+        PoolName::Ernie55Mla => "ernie55_mla",
+        PoolName::Ernie55MlaIndexer => "ernie55_mla_indexer",
         PoolName::Draft => "draft",
         PoolName::DraftIndexer => "draft_indexer",
         PoolName::DraftSwa => "draft_swa",
@@ -242,6 +244,8 @@ fn parse_pool_name(name: &str) -> PyResult<PoolName> {
         "deepseek_v4_c4_state" => Ok(PoolName::DeepseekV4C4State),
         "deepseek_v4_c4_indexer_state" => Ok(PoolName::DeepseekV4C4IndexerState),
         "deepseek_v4_c128_state" => Ok(PoolName::DeepseekV4C128State),
+        "ernie55_mla" => Ok(PoolName::Ernie55Mla),
+        "ernie55_mla_indexer" => Ok(PoolName::Ernie55MlaIndexer),
         "draft" => Ok(PoolName::Draft),
         "draft_indexer" => Ok(PoolName::DraftIndexer),
         "draft_swa" => Ok(PoolName::DraftSwa),
@@ -2023,6 +2027,17 @@ macro_rules! tree_core_methods {
                 cache_actions_to_py(py, actions)
             }
 
+            /// Queue a write-back victim for its demote; returns its FULL device tokens.
+            fn mark_write_back_queued(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                copied: Vec<NodeId>,
+            ) -> PyResult<usize> {
+                py.detach(|| self.core().mark_write_back_queued(node_id, copied))
+                    .map_err(node_access_error)
+            }
+
             /// Release a node's device KV once its host copy exists.
             fn demote(&self, py: Python<'_>, node_id: NodeId) -> PyResult<DemoteResultBinding> {
                 let result = py
@@ -3391,6 +3406,16 @@ macro_rules! tree_core_binding {
                     self.inner
                         .commit_load_back(py, node_id, device_indices, kv_xfer, comp_xfers)
                 })
+            }
+
+            /// Queue a write-back victim for its demote; returns its FULL device tokens.
+            fn mark_write_back_queued(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                copied: Vec<NodeId>,
+            ) -> PyResult<usize> {
+                catch_native_panic(|| self.inner.mark_write_back_queued(py, node_id, copied))
             }
 
             /// Release a node's device KV once its host copy exists.
