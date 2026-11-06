@@ -709,13 +709,7 @@ def resolve_shared_experts_config(
         get_configured_moe_load_balancer_pipeline,
     )
 
-    # Draft models keep their own native shared-slot layout and never consume
-    # the target model's placement or replica-routing state.
-    pipeline = (
-        None
-        if get_flags().moe.in_speculative_scope
-        else get_configured_moe_load_balancer_pipeline()
-    )
+    pipeline = get_configured_moe_load_balancer_pipeline()
     routes_shared = pipeline is not None and pipeline.capabilities.routes_shared_expert
     if pipeline is not None:
         from evenmoe import ExpertDeploymentConfig

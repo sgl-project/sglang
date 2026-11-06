@@ -61,12 +61,15 @@ class TestRoutingBoundary(CustomTestCase):
         for router_type in (TopK, HashTopK):
             with (
                 self.subTest(router=router_type.__name__),
-                get_context().override_server_args(),
+                get_context().override_server_args(
+                    moe_load_balancer_algorithm="waterfill"
+                ),
                 get_parallel().override(tp_group=SimpleNamespace(world_size=1)),
                 get_context().resources.override(moe_load_balancer=mlb),
+                # Parse the configured algorithm, so the draft scope's override applies.
                 patch(
-                    "sglang.srt.eplb.moe_load_balancer_glue.get_configured_moe_load_balancer_pipeline",
-                    return_value=pipeline,
+                    "sglang.srt.eplb.moe_load_balancer_glue.get_moe_load_balancer_pipeline",
+                    side_effect=lambda algorithm: pipeline if algorithm else None,
                 ),
             ):
 
