@@ -626,6 +626,10 @@ def get_bf16_gemm_backend() -> Bf16GemmBackend:
     return _BF16_GEMM_BACKEND
 
 
+def is_aiter_unquant_skipped() -> bool:
+    return _skip_aiter_unquant
+
+
 # On gfx115x a weight row stride that is a multiple of 2 KiB puts the rows a skinny GEMM
 # reads together on the same L2/MALL channel; one 128 B cache line of pad spreads them.
 # Same rule as vLLM's cache_aliasing_pad_elems; measured on gfx1151.
