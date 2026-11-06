@@ -1465,18 +1465,20 @@ class Req(ReqDllmMixin):
             self._cap_finished_len_at_max_new_tokens()
             return
 
-        # Stop string beats EOS/stop-token matched in the same step (speculative
-        # decoding can accept >1 token): token-based would trim only the last
-        # token and leak the stop string.
+        token_finish = None
+        if self._check_token_based_finish(new_accepted_tokens):
+            token_finish = (self.finished_reason, self.finished_len)
+
+        # A speculative run can contain both kinds of stop. Keep the earlier
+        # boundary; a text stop at the same token still wins so it is trimmed.
         if self._check_str_based_finish(new_accepted_len):
+            if token_finish is not None and token_finish[1] < self.finished_len:
+                self.finished_reason, self.finished_len = token_finish
             self._cap_finished_len_at_max_new_tokens()
             return
 
-        # Stop token/EOS beats the length cap for the same reason: a spec accept
-        # run can cross max_new_tokens in the very step the EOS lands, and a
-        # length-first finish would keep the over-accepted tokens after the EOS
-        # (up to the cap) in the emitted output.
-        if self._check_token_based_finish(new_accepted_tokens):
+        if token_finish is not None:
+            self.finished_reason, self.finished_len = token_finish
             self._cap_finished_len_at_max_new_tokens()
             return
 
