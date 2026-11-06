@@ -216,11 +216,12 @@ def _build_response(
     rollout: bool,
     result: OutputBatch,
     video_dtype: str | None = None,
+    num_outputs: int | None = None,
 ) -> list[RolloutResponse]:
     """
     rollout: bool - set to False when evaluating the model
     """
-    batch_size = result.output.shape[0]
+    batch_size = result.output.shape[0] if result.output is not None else num_outputs
     inference_time_s = (
         result.metrics.total_duration_s
         if result.metrics and result.metrics.total_duration_s > 0
@@ -245,7 +246,7 @@ def _build_response(
 
     responses: list[RolloutResponse] = []
     for sample_idx in range(batch_size):
-        out_i = result.output[sample_idx]
+        out_i = result.output[sample_idx] if result.output is not None else None
         if isinstance(out_i, torch.Tensor):
             if video_dtype == "uint8":
                 out_i = _quantize_video_uint8(out_i)
@@ -315,6 +316,7 @@ def _build_sampling_kwargs(request: RolloutRequest) -> dict:
         rollout_debug_mode=request.rollout_debug_mode,
         rollout_return_denoising_env=request.rollout_return_denoising_env,
         rollout_return_dit_trajectory=request.rollout_return_dit_trajectory,
+        rollout_return_generated_output=request.rollout_return_generated_output,
         rollout_sde_step_indices=request.rollout_sde_step_indices,
         rollout_return_step_indices=request.rollout_return_step_indices,
         suppress_logs=request.suppress_logs,
@@ -366,6 +368,12 @@ async def rollout_generate(request: RolloutRequest):
         ) from exc
     if output_batch.error:
         raise HTTPException(status_code=500, detail=output_batch.error)
+    if not request.rollout_return_generated_output and output_batch.output is not None:
+        raise HTTPException(
+            status_code=400,
+            detail="rollout_return_generated_output=False is not supported by this "
+            "pipeline's decoding stage, which decoded the output anyway",
+        )
 
     def _serialize_response() -> list[bytes]:
         with stamps.span("build"):
@@ -376,6 +384,7 @@ async def rollout_generate(request: RolloutRequest):
                 request.rollout,
                 output_batch,
                 video_dtype=request.rollout_video_dtype,
+                num_outputs=sampling_params.num_outputs_per_prompt,
             )
         with stamps.span("dump"):
             payload = [r.model_dump() for r in rollout_responses]
