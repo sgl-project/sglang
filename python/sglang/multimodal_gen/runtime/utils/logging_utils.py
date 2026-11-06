@@ -19,6 +19,10 @@ from logging import Logger
 from types import MethodType
 from typing import Any, cast
 
+from sglang.multimodal_gen.runtime.managers.request_cancel_error import (
+    RequestCancelledError,
+)
+
 # color
 CYAN = "\033[1;36m"
 RED = "\033[91m"
@@ -217,8 +221,6 @@ def init_logger(name: str) -> _SGLDiffusionLogger:
 
     logger = logging.getLogger(name)
 
-    server_log_level = logger.getEffectiveLevel()
-
     # Patch instance methods
     setattr(logger, "info_once", MethodType(_print_info_once, logger))
     setattr(logger, "warning_once", MethodType(_print_warning_once, logger))
@@ -237,7 +239,7 @@ def init_logger(name: str) -> _SGLDiffusionLogger:
             **kwargs: Any,
         ) -> None:
             _log_process_aware(
-                server_log_level,
+                self.getEffectiveLevel(),
                 level,
                 self,
                 msg,
@@ -568,7 +570,9 @@ def log_generation_timer(
             timer.duration,
         )
     except Exception as e:
-        if request_idx is not None:
+        if isinstance(e, RequestCancelledError):
+            logger.info("Stopped generation: %s", e)
+        elif request_idx is not None:
             logger.error(
                 "Failed to generate output for prompt %d: %s",
                 request_idx,

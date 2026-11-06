@@ -52,6 +52,7 @@ class MockTokenizerManager:
             model_type="llama", architectures=["LlamaForCausalLM"]
         )
         self.served_model_name = self.SERVED_MODEL_NAME
+        self.model_path = "model"
         self.lora_registry = None
         self.server_args = Mock(
             enable_cache_report=False,
@@ -60,6 +61,7 @@ class MockTokenizerManager:
             tokenizer_metrics_allowed_custom_labels=None,
             tool_call_parser=None,
             incremental_streaming_output=False,
+            grammar_backend="xgrammar",
         )
         # Stands in for the context's resolved leaves: an override replaces the
         # field's one live value, the seed stays on server_args.
@@ -90,15 +92,17 @@ class MockTemplateManager:
         self.python_chat_template = None
 
 
-def make_serving(*, is_multimodal: bool = False) -> OpenAIServingResponses:
+def make_serving(
+    *, is_multimodal: bool = False, model_type: str = "llama"
+) -> OpenAIServingResponses:
     """The serving layer reads its config from the bags, so the fixture
     publishes one. Idempotent: a caller that already published keeps its own,
     which is how a test states a value the default record does not carry."""
     if not get_context().is_config_namespace_published("serving"):
         publish(ServerArgs(model_path="dummy"), role="tokenizer")
-    return OpenAIServingResponses(
-        MockTokenizerManager(is_multimodal=is_multimodal), MockTemplateManager()
-    )
+    manager = MockTokenizerManager(is_multimodal=is_multimodal)
+    manager.model_config.hf_config.model_type = model_type
+    return OpenAIServingResponses(manager, MockTemplateManager())
 
 
 async def collect_stream_events(stream: AsyncIterator[str]) -> list[str]:

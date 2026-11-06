@@ -9,7 +9,10 @@ import torch
 
 from sglang.kernels.fused_op import BaseFusedOp
 from sglang.srt.environ import envs
-from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
+from sglang.srt.layers.rotary_embedding.utils import (
+    apply_rotary_emb,
+    rotary_embedding_cpu,
+)
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_exec, publish_role
 from sglang.srt.utils import (
@@ -437,7 +440,7 @@ class RotaryEmbedding(BaseFusedOp):
             # rotary_embedding_cpu requires query and the cache to share a dtype;
             # forward_cuda/forward_xpu already align them, forward_cpu did not.
             self._match_cos_sin_cache_dtype(query)
-            return torch.ops.sgl_kernel.rotary_embedding_cpu(
+            return rotary_embedding_cpu(
                 positions,
                 query,
                 key,
@@ -510,17 +513,22 @@ class RotaryEmbedding(BaseFusedOp):
                     "save kv cache is not supported for fallback_rotary_embedding."
                 )
                 if _is_hip:
-                    self.cos_sin_cache = self.cos_sin_cache.to(query.device)
+                    # HIP keeps the buffer fp32 for the fused QSA indexer, but
+                    # this kernel reads it in the query dtype.
+                    if self.cos_sin_cache.device != query.device:
+                        self.cos_sin_cache = self.cos_sin_cache.to(query.device)
+                    cos_sin_cache = self.cos_sin_cache_as(query.dtype)
                 else:
                     self.cos_sin_cache = self.cos_sin_cache.to(
                         query.device, dtype=query.dtype
                     )
+                    cos_sin_cache = self.cos_sin_cache
                 self.fallback_rotary_embedding(
                     positions,
                     query,
                     key,
                     self.head_size,
-                    self.cos_sin_cache,
+                    cos_sin_cache,
                     self.is_neox_style,
                 )
         return query, key

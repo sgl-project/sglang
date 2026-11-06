@@ -19,7 +19,7 @@ MLP layers.
 """
 
 import logging
-from typing import Any, Dict, Optional, Tuple, cast
+from typing import Any, Dict, Optional, cast
 
 import torch
 from torch import nn
@@ -39,13 +39,14 @@ from sglang.srt.layers.rotary_embedding.yarn import (
     yarn_find_correction_range,
     yarn_get_mscale,
 )
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.models.qwen2_moe import Qwen2MoeMLP as Qwen3MoeMLP
 from sglang.srt.models.qwen3_moe import (
     Qwen3MoeAttention,
     Qwen3MoeDecoderLayer,
     Qwen3MoeForCausalLM,
-    Qwen3MoeMLP,
     Qwen3MoeModel,
     Qwen3MoeSparseMoeBlock,
 )
@@ -55,7 +56,7 @@ from sglang.srt.models.utils import (
     enable_fused_set_kv_buffer,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel
-from sglang.srt.utils import add_prefix, is_cuda
+from sglang.srt.utils import is_cuda
 
 _is_cuda = is_cuda()
 
@@ -562,27 +563,6 @@ class MellumForCausalLM(Qwen3MoeForCausalLM):
             forward_batch,
             input_embeds,
             pp_proxy_tensors=pp_proxy_tensors,
-        )
-
-    @torch.no_grad()
-    def forward_split_prefill(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        split_interval: Tuple[int, int],
-        input_embeds: Optional[torch.Tensor] = None,
-    ):
-        positions_device = (
-            input_embeds.device if input_embeds is not None else input_ids.device
-        )
-        positions = self._prepare_positions(positions, positions_device)
-        return super().forward_split_prefill(
-            input_ids,
-            positions,
-            forward_batch,
-            split_interval,
-            input_embeds,
         )
 
     def get_attention_sliding_window_size(self) -> Optional[int]:

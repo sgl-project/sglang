@@ -15,7 +15,7 @@ maybe_stub_sgl_kernel()
 
 import sglang.srt.speculative.ngram_worker as ngram_worker
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
 from sglang.srt.speculative.ngram_worker import NGRAMWorker

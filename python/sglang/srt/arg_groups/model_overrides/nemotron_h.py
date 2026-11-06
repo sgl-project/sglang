@@ -9,6 +9,7 @@ from sglang.srt.arg_groups.model_override_base import (
     model_config_of,
     resolving_view,
 )
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
 
 logger = logging.getLogger(__name__)
@@ -74,9 +75,17 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
     if has_w4a16_moe_layers:
         if cfg.moe_a2a_backend != "none":
             raise ValueError("W4A16_NVFP4 MoE layers require --moe-a2a-backend=none.")
-        if cfg.moe_runner_backend not in ("auto", "marlin"):
+        # CuTe DSL supports BF16 activations with NVFP4 weights when opted in.
+        use_cutedsl_w4a16 = (
+            cfg.moe_runner_backend == "flashinfer_cutedsl"
+            and get_platform().is_sm100
+            and envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
+        )
+        if cfg.moe_runner_backend not in ("auto", "marlin") and not use_cutedsl_w4a16:
             raise ValueError(
-                "W4A16_NVFP4 MoE layers require --moe-runner-backend=marlin."
+                "W4A16_NVFP4 MoE layers require --moe-runner-backend=marlin, "
+                "or flashinfer_cutedsl on SM100-family GPUs with "
+                "SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16=1."
             )
         if cfg.moe_runner_backend == "auto":
             overrides["moe_runner_backend"] = "marlin"
