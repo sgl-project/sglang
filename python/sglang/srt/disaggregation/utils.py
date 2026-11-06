@@ -1605,6 +1605,8 @@ def setup_state_kv_args(
         )
         if state_type == StateType.SWA:
             kv_args.swa_kv_cache_layout = region.kv_layout
+        if state_type == StateType.DSA:
+            set_dsa_index_k_token_bytes(kv_args, storage.view(entry.sub_pool))
     # MLA token KV beside recurrent state.
     kv_args.is_hybrid_mla_backend = (
         is_mla_backend(owner_view) and StateType.MAMBA in kv_args.state_types

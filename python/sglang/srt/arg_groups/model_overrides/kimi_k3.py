@@ -184,15 +184,15 @@ def _kimi_k31_overrides(server_args: Any, hf_config: Any) -> dict:
         raise ValueError("Kimi-K3.1 does not support --enable-unified-memory yet.")
     overrides = {}
     if cfg.dcp_size > 1:
-        if (
-            cfg.speculative_algorithm is not None
-            or cfg.disaggregation_mode != "null"
-            or cfg.enable_hierarchical_cache
-        ):
+        if cfg.speculative_algorithm is not None or cfg.enable_hierarchical_cache:
             raise ValueError(
-                "Kimi-K3.1 DCP does not support speculative decoding, PD "
-                "disaggregation or HiCache yet."
+                "Kimi-K3.1 DCP does not support speculative decoding or HiCache yet."
             )
+        if (
+            cfg.disaggregation_mode != "null"
+            and cfg.disaggregation_transfer_backend != "mooncake"
+        ):
+            raise ValueError("Kimi-K3.1 DCP supports PD only over Mooncake.")
         if (
             cfg.dsa_topk_backend != "sgl-kernel"
             or not envs.SGLANG_OPT_USE_TOPK_V2.get()
@@ -210,42 +210,6 @@ def _kimi_k31_overrides(server_args: Any, hf_config: Any) -> dict:
             logger.info("Kimi-K3.1 DCP enables replicated Q projection by default.")
             overrides["dcp_replicate_q_proj"] = True
     return overrides
-
-
-def _kimi_k31_dcp_overrides(cfg: Any) -> dict:
-    """DCP shards the MLA KV and the index-K cache by token; the indexer merges
-    a global top-k and the DSA attention (flashmla_kv) merges partials by LSE."""
-    dcp = cfg.dcp_size
-    if dcp & (dcp - 1) or cfg.tp_size % dcp:
-        raise ValueError(
-            f"Kimi-K3.1 DCP needs a power-of-two --dcp-size dividing --tp-size, "
-            f"got dcp_size={dcp}, tp_size={cfg.tp_size}."
-        )
-    unsupported = {
-        "speculative decoding": cfg.speculative_algorithm is not None,
-        # Mooncake moves a DCP-1 prefill's KV row by row and a same-DCP
-        # prefill's page by page, and raises on any other DCP pair.
-        "PD over a transfer backend other than Mooncake": (
-            cfg.disaggregation_mode in ("prefill", "decode")
-            and cfg.disaggregation_transfer_backend != "mooncake"
-        ),
-        "HiSparse": cfg.enable_hisparse,
-        "prefill context parallel": cfg.enable_prefill_cp
-        or (cfg.attn_cp_size or 1) > 1,
-    }
-    rejected = [name for name, on in unsupported.items() if on]
-    if rejected:
-        raise ValueError(f"Kimi-K3.1 DCP does not support {', '.join(rejected)} yet.")
-    return _dcp_replicate_q_proj_default(cfg, "Kimi-K3.1")
-
-
-def _dcp_replicate_q_proj_default(cfg: Any, model: str) -> dict:
-    # With an all-to-all merge, project full-head q locally (bf16 attention
-    # weights) instead of all-gathering it every layer.
-    if cfg.dcp_replicate_q_proj is None and cfg.dcp_comm_backend in ("a2a", "fi_a2a"):
-        logger.info(f"{model} DCP enables replicated Q projection by default.")
-        return {"dcp_replicate_q_proj": True}
-    return {}
 
 
 @_register_for("KimiK3ForConditionalGeneration", "KimiK31ForConditionalGeneration")
