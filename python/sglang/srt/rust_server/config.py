@@ -12,6 +12,10 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.disaggregation.kv_events import select_kv_publisher_dp_rank
+from sglang.srt.entrypoints.server_utils import (
+    build_model_info_fields,
+    build_server_info,
+)
 from sglang.srt.entrypoints.v1_loads import (
     _accelerator_name,
     _num_accelerators_per_dp_rank,
@@ -36,7 +40,6 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
-from sglang.srt.utils.common import build_model_info_fields, build_server_info
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.request_logger import (
     WHITELISTED_HEADERS,

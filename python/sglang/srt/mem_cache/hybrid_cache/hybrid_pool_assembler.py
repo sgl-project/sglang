@@ -689,6 +689,70 @@ def _dsv4_low_ratio_entries(
     return entries
 
 
+def _extra_host_region_entries(
+    kvcache: Any,
+    page_size: int,
+    num_host_pages: int,
+    transfer_layer_id_max: int,
+    draft_device_pools: tuple[Any, ...],
+) -> list[PoolEntry]:
+    """FULL-page HiCache entries for the regions a pool keeps beside the
+    compressed-KV layout (``extra_host_regions``); packed draft buffers follow
+    the target's."""
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+
+    if not isinstance(kvcache, DeepSeekV4TokenToKVPool):
+        return []
+    draft_buffers: dict[PoolName, list[Any]] = {}
+    for pool in draft_device_pools:
+        if isinstance(pool, DeepSeekV4TokenToKVPool):
+            for region in pool.extra_host_regions():
+                draft_buffers.setdefault(region.pool_name, []).extend(
+                    region.device_buffers
+                )
+    target_regions = kvcache.extra_host_regions()
+    orphans = set(draft_buffers) - {region.pool_name for region in target_regions}
+    if orphans:
+        # Packed drafts ride a target host pool; with none, they would be dropped.
+        raise ValueError(
+            f"draft {sorted(orphans)} pages have no target layer on this pipeline "
+            "stage to share a HiCache host pool with"
+        )
+    entries = []
+    for region in target_regions:
+        drafts = draft_buffers.get(region.pool_name, [])
+        if any(buf.shape[1] != region.item_bytes for buf in drafts):
+            raise ValueError(
+                f"draft {region.pool_name} pages must match the target's "
+                f"{region.item_bytes} B pages to share its host pool"
+            )
+        entries.append(
+            build_pool_entry(
+                name=region.pool_name,
+                host_pool=DeepSeekV4PagedHostPool(
+                    pool_name=str(region.pool_name),
+                    device_buffers=[*region.device_buffers, *drafts],
+                    item_bytes=region.item_bytes,
+                    num_host_pages=num_host_pages,
+                    slot_page_size=page_size,
+                    layout=get_memory().hicache_mem_layout,
+                    allocator_type=_get_allocator_type(),
+                    page_aligned_only=True,
+                ),
+                device_pool=region.device_pool,
+                layer_mapping=with_packed_draft_layer_mapping(
+                    region.layer_mapping,
+                    transfer_layer_start=transfer_layer_id_max,
+                    target_device_layer_num=len(region.device_buffers),
+                    draft_layer_num=len(drafts),
+                ),
+                transfer_layer_id_max=transfer_layer_id_max + len(drafts),
+                packed_draft_device_pools=tuple(drafts),
+            )
+        )
+    return entries
+
+
 def _build_dsv4_rope_entry(
     info: DevicePoolInfo | None,
     *,
@@ -751,16 +815,24 @@ def build_deepseek_v4_hicache_stack(
             physical_page_size=swa_info.page_slots,
             consumer="DeepSeek-V4 HiCache",
         )
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+            DeepSeekV4TokenToKVPool,
+        )
+
         # NextN has one layer per pool, while DSpark keeps all stages in one pool.
         for pool in params.mtp_draft_device_pools:
+            if isinstance(pool, DeepSeekV4TokenToKVPool) and not pool.swa_layer_ids():
+                # A draft with no SWA layer has no SWA buffer to pack.
+                continue
             draft_swa = _dsv4_pool_infos(pool).get(PoolName.SWA)
             if draft_swa is None:
                 raise ValueError("Packed DSV4 draft requires paged SWA storage")
             mtp_swa_device_buffers.extend(draft_swa.buffer_info.buffers)
+        # Map the SWA layers alone; the MLA layers own no SWA buffer.
         swa_layer_mapping = with_packed_draft_layer_mapping(
-            full_layer_mapping,
+            _dsv4_transfer_layer_mapping(swa.layer_ids, kvcache.start_layer),
             transfer_layer_start=transfer_layer_id_max,
-            target_device_layer_num=transfer_layer_id_max,
+            target_device_layer_num=len(swa.layer_ids),
             draft_layer_num=len(mtp_swa_device_buffers),
         )
 
@@ -992,6 +1064,15 @@ def build_deepseek_v4_hicache_stack(
     entries.extend(
         _dsv4_low_ratio_entries(
             kvcache, infos, page_size, num_host_pages, transfer_layer_id_max
+        )
+    )
+    entries.extend(
+        _extra_host_region_entries(
+            kvcache,
+            page_size,
+            num_host_pages,
+            transfer_layer_id_max,
+            draft_device_pools=params.mtp_draft_device_pools,
         )
     )
 
@@ -1975,6 +2056,10 @@ class _DeepSeekV4Strategy(StackStrategy):
             (PoolName.DEEPSEEK_V4_C4_STATE, PoolName.SWA),
             (PoolName.DEEPSEEK_V4_C4_INDEXER_STATE, PoolName.SWA),
             (PoolName.DEEPSEEK_V4_C128_STATE, PoolName.SWA),
+            *(
+                (region.pool_name, PoolName.KV)
+                for region in kvcache.extra_host_regions()
+            ),
         ]
         if ComponentType.C128 not in cache.components:
             _sidecar_srcs.append((PoolName.DEEPSEEK_V4_C128, PoolName.KV))
