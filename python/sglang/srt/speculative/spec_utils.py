@@ -269,6 +269,17 @@ SIMULATE_ACC_LEN = envs.SGLANG_SIMULATE_ACC_LEN.get()  # turn off if < 0
 SIMULATE_ACC_METHOD = envs.SGLANG_SIMULATE_ACC_METHOD.get()
 SIMULATE_ACC_TOKEN_MODE = envs.SGLANG_SIMULATE_ACC_TOKEN_MODE.get()
 
+# XORed into the server seed so these draws differ from other samplers'.
+_SIM_ACC_LEN_DOMAIN = 0x0F3D6B8C2A915E47
+
+
+def simulated_acc_len_generator(seed: int) -> torch.Generator:
+    """The generator of the SGLANG_SIMULATE_ACC_LEN draws (forced lengths, and
+    DSpark's bonus seed), seeded alike on every rank from the server seed."""
+    return torch.Generator().manual_seed(
+        (int(seed) ^ _SIM_ACC_LEN_DOMAIN) & 0x7FFFFFFFFFFFFFFF
+    )
+
 
 def check_simulate_acc_token_mode() -> None:
     if SIMULATE_ACC_LEN > 0 and SIMULATE_ACC_TOKEN_MODE not in (
@@ -1190,6 +1201,21 @@ def commit_mamba_states_after_verify(
         batch.req_pool_indices[:bs] if pp_spec_stable_rows_enabled() else None
     )
 
+    replay_state_indices = replay_track_indices = None
+    if mamba_pool is not None and (
+        mamba_pool.replayssm_spec_fold or mamba_pool.replayssm_cache_base is not None
+    ):
+        if batch.forward_mode.is_idle() or accept_index.numel() == 0:
+            return
+        # Persistent destinations follow state relocation; replay/scratch rows
+        # still index requests, and the scheduler keeps owning virtual state IDs.
+        state_ids = model_runner.runner_ids.state_ids(req_pool.state_sub_pool)
+        replay_state_indices = state_ids.ids(
+            req_pool.get_mamba_indices(batch.req_pool_indices)
+        )
+        if batch.mamba_track_indices is not None:
+            replay_track_indices = state_ids.ids(batch.mamba_track_indices)
+
     # Fold-every-commit: replay the accepted prefix from the ring into
     # `temporal`; the same fold stores the interval-crossing state to the
     # track slot, so no SSM scatter or force-flush is needed here.
@@ -1205,7 +1231,7 @@ def commit_mamba_states_after_verify(
         )
 
         spec_state = mamba_pool.get_speculative_mamba2_params_all_layers()
-        state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
+        state_batch_indices = replay_state_indices
         if prepared_step_indices is None:
             last_correct_step_indices, mamba_steps_to_track = (
                 _verify_commit_step_indices(
@@ -1222,7 +1248,7 @@ def commit_mamba_states_after_verify(
             state_batch_indices=state_batch_indices,
             accept_lens=accept_lens,
             last_correct_step_indices=last_correct_step_indices,
-            mamba_track_indices=batch.mamba_track_indices,
+            mamba_track_indices=replay_track_indices,
             mamba_steps_to_track=mamba_steps_to_track,
             src_indices_raw=src_indices_raw,
             null_block_id=-1,
@@ -1245,7 +1271,7 @@ def commit_mamba_states_after_verify(
         )
 
         spec_state = mamba_pool.get_speculative_mamba2_params_all_layers()
-        state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
+        state_batch_indices = replay_state_indices
         replay_indices = batch.req_pool_indices
         if prepared_step_indices is None:
             last_correct_step_indices, mamba_steps_to_track = (
@@ -1286,7 +1312,7 @@ def commit_mamba_states_after_verify(
             cache_base=mamba_pool.replayssm_cache_base,
             is_flush=mamba_pool.replayssm_is_flush,
             accept_lens=accept_lens,
-            mamba_track_indices=batch.mamba_track_indices,
+            mamba_track_indices=replay_track_indices,
             mamba_steps_to_track=mamba_steps_to_track,
             null_block_id=-1,
         )
@@ -1302,7 +1328,7 @@ def commit_mamba_states_after_verify(
             fused_conv_window_scatter_with_mask(
                 spec_state.conv[0],
                 spec_state.intermediate_conv_window[0],
-                batch.mamba_track_indices,
+                replay_track_indices,
                 mamba_steps_to_track,
                 src_indices_raw,
             )
@@ -1326,7 +1352,7 @@ def commit_mamba_states_after_verify(
         )
 
         spec_state = mamba_pool.get_speculative_mamba2_params_all_layers()
-        state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
+        state_batch_indices = replay_state_indices
         accept_indices_offset = torch.arange(
             0,
             bs * draft_token_num,
@@ -1343,7 +1369,7 @@ def commit_mamba_states_after_verify(
         # the track ping-pong slot (mirrors the regular commit's
         # mamba_steps_to_track); commit_kda_replayssm_spec folds it in one pass, so
         # `temporal` stays current and no device-side force-flush is needed.
-        mamba_track_indices = batch.mamba_track_indices
+        mamba_track_indices = replay_track_indices
         mamba_steps_to_track = None
         if mamba_track_indices is not None:
             ti = mamba_track_grid(batch.tree_cache.page_size)

@@ -52,6 +52,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
     get_server_args,
+    is_scheduler_io_rank,
     max_prefill_buffer_tokens,
     max_speculative_num_draft_tokens,
     publish,
@@ -672,6 +673,16 @@ class TestParallelOverride(_IsolatedOverrides):
             with p.override(tp_sizee=1):  # typo
                 pass
         self.assertEqual(p._overrides, {})
+
+
+class TestSchedulerIoRank(_IsolatedOverrides):
+    def test_only_rank_zero_of_every_inner_group_is_the_io_rank(self):
+        ranks = {"pp_rank": 0, "attn_tp_rank": 0, "attn_cp_rank": 0}
+        with get_parallel().override(**ranks):
+            self.assertTrue(is_scheduler_io_rank())
+        for name in ranks:
+            with get_parallel().override(**{**ranks, name: 1}):
+                self.assertFalse(is_scheduler_io_rank(), name)
 
 
 class TestParallelDCP(_IsolatedOverrides):

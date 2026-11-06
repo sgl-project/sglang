@@ -31,7 +31,9 @@ class TestEarlyEncode(CustomTestCase):
             tp_size=1,
             abort_windows=None,
         )
-        item = SimpleNamespace(hash=7, feature=torch.ones(3, 4), offsets=[(2, 4)])
+        item = SimpleNamespace(
+            hash=7, cache_key=b"a" * 32, feature=torch.ones(3, 4), offsets=[(2, 4)]
+        )
         req = FakeReq(
             rid="w1",
             sampling_params=SimpleNamespace(
@@ -60,7 +62,7 @@ class TestEarlyEncode(CustomTestCase):
         self.assertEqual(dev, device)
         self.assertIs(func, _encode)
         self.assertEqual(item.feature.device.type, "cuda")
-        emb = early.prefetched(7, 3)
+        emb = early.prefetched(item.cache_key, 3)
         self.assertEqual(tuple(emb.shape), (3, 4))
         prefetch.release_early("w1")
         self.assertFalse(early.has_prefetched())

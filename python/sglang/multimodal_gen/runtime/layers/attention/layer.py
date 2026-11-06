@@ -420,6 +420,8 @@ class UlyssesAttention(nn.Module):
             dtype,
             supported_attention_backends=supported_attention_backends,
             selected_attention_backend=required_attention_backend,
+            is_cross_attention=is_cross_attention,
+            quant_config=extra_impl_args.get("quant_config"),
         )
         impl_cls = attn_backend.get_impl_cls()
 
@@ -721,6 +723,7 @@ class LocalAttention(nn.Module):
             selected_attention_backend=required_attention_backend,
             default_attention_backend=default_attention_backend,
             is_cross_attention=is_cross_attention,
+            quant_config=extra_impl_args.get("quant_config"),
         )
         impl_cls = attn_backend.get_impl_cls()
         self.allow_cudnn_sdp = bool(extra_impl_args.get("allow_cudnn_sdp", False))
@@ -885,6 +888,7 @@ class USPAttention(nn.Module):
             selected_attention_backend=required_attention_backend,
             default_attention_backend=default_attention_backend,
             is_cross_attention=is_cross_attention,
+            quant_config=extra_impl_args.get("quant_config"),
         )
         if not skip_sequence_parallel and get_ring_parallel_world_size() > 1:
             if not attn_backend.supports_ring_rotation():
