@@ -69,6 +69,7 @@ class TestDefaultModelLoader(CustomTestCase):
                 loader = object.__new__(loader_class)
                 loader.load_config = object()
                 model = Mock(quant_config=None)
+                model.precompile_kernels_during_loading = nullcontext
                 model.eval.return_value = model
                 model.load_weights.side_effect = lambda weights: events.append(
                     ("load", list(weights))

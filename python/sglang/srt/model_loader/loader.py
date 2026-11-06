@@ -23,7 +23,7 @@ import tempfile
 import threading
 import time
 from abc import ABC, abstractmethod
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager, nullcontext, suppress
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -1027,9 +1027,13 @@ class DefaultModelLoader(BaseModelLoader):
                     quant_config,
                 )
 
-            self.load_weights_and_postprocess(
-                model, self._get_all_weights(model_config, model), target_device
+            precompile = getattr(
+                model, "precompile_kernels_during_loading", nullcontext
             )
+            with precompile():
+                self.load_weights_and_postprocess(
+                    model, self._get_all_weights(model_config, model), target_device
+                )
 
         self.counter_after_loading_weights = time.perf_counter()
         return model.eval()

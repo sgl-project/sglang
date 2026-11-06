@@ -1218,3 +1218,33 @@ def chunk_kda(
         chunk_indices=chunk_indices,
         chunk_offsets=chunk_offsets,
     )
+
+
+def precompile_kda_output(*, num_heads, head_dim, dtype, device):
+    """Compile output autotune candidates without launching or choosing a tactic."""
+    from triton.runtime.jit import MockTensor
+
+    if head_dim != 128 or dtype != torch.bfloat16:
+        return []
+    bf16 = MockTensor(dtype)
+    fp32 = MockTensor(torch.float32)
+    index = MockTensor(torch.int32)
+    with torch.cuda.device(device):
+        return chunk_gla_fwd_kernel_o.warmup(
+            q=bf16,
+            v=bf16,
+            g=fp32,
+            h=bf16,
+            o=bf16,
+            A=bf16,
+            cu_seqlens=index,
+            chunk_indices=index,
+            scale=head_dim**-0.5,
+            T=1,
+            H=num_heads,
+            K=head_dim,
+            V=head_dim,
+            BT=64,
+            IS_VARLEN=True,
+            grid=(1, 1, num_heads),
+        )
