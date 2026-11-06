@@ -335,7 +335,6 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
     ):
         cos, sin = freqs_cis[:2]
         cos_sin_cache = freqs_cis[2] if len(freqs_cis) > 2 else None
-        
 
         if kv_cache is None:
             # Pass un-rotated q/k: the base attention applies RoPE itself, and the
@@ -360,7 +359,7 @@ class LingBotWorldCausalSelfAttention(CausalWanSelfAttention):
         )
         roped_query = roped_query.type_as(v)
         roped_key = roped_key.type_as(v)
-        
+
         forward_batch = get_forward_context().forward_batch
         seq_splits = None
         uniform_seq_splits = False
