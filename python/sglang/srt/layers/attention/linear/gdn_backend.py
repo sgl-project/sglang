@@ -673,9 +673,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 u_ring=gdn_ucache.u_ring[0],
                 g_ring=gdn_ucache.g_ring[0],
                 flush_min=gdn_ucache.flush_min,
+                max_eager_batch_size=self.req_to_token_pool.size,
             )
         if self.gdn_ucache_track is not None:
-            self.gdn_ucache_track.warm_up(max_batch_size=max_bs)
+            # Eager verifies (bs > max_bs) run up to one row per request slot.
+            self.gdn_ucache_track.warm_up(
+                max_batch_size=max_bs, max_eager_batch_size=self.req_to_token_pool.size
+            )
 
     def supports_prefill_graph_extend(self) -> bool:
         # Read here, not in __init__: the support check reads model_config.

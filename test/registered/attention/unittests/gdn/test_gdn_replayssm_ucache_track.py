@@ -354,6 +354,18 @@ class TestGdnUcacheTrackMaterialize(CustomTestCase):
             )
             graphed.track.materialize(**static)
         torch.cuda.current_stream().wait_stream(stream)
+        # An eager batch past the warm-up size grows the plan after the capture;
+        # the captured plan must stay alive (no padding row writes state).
+        captured_plan = graphed.track._plan
+        padded = torch.full((12,), -1, dtype=torch.int32, device="cuda")
+        graphed.track.materialize(
+            slots=padded,
+            num_accept_tokens=padded,
+            track_slots=padded,
+            steps_to_track=padded,
+        )
+        self.assertEqual(graphed.track._plan.rows, 12)
+        self.assertIn(captured_plan, graphed.track._retired_plans)
 
         rounds = [
             (
@@ -384,13 +396,21 @@ class TestGdnUcacheTrackMaterialize(CustomTestCase):
                 torch.equal(eager.buffers.cache_base, graphed.buffers.cache_base)
             )
             self.assertEqual(
-                int(graphed.track._plan.num_active),
+                int(captured_plan.num_active),
                 sum(
                     s >= 0 and t > 0 and sl > 0
                     for s, t, sl in zip(steps, tracks, slots)
                 )
                 * 2,
             )
+
+    def test_warm_up_sizes_the_plan_for_eager_batches(self):
+        """Serving warms the plan for the largest eager verify, so no batch grows
+        it after graph capture."""
+        model = _Model(num_layers=2, num_slots=8, h=4, hv=8, seed=5)
+        model.track.warm_up(max_batch_size=4, max_eager_batch_size=12)
+        self.assertEqual(model.track._plan.rows, 12)
+        self.assertEqual(model.track._retired_plans, [])
 
     def test_request_resumed_from_snapshot_continues_like_the_original(self):
         """A request that decodes past folds snapshots at a track point; a second

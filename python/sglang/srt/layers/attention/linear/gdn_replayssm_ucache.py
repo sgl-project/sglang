@@ -432,6 +432,8 @@ class GdnUcacheTrackMaterializer:
         )
         self._plan_layers = self._num_layers if self._flat_pools is not None else 1
         self._plan: Optional[_TrackPlan] = None
+        # Outgrown plans stay alive: captured commit graphs hold their pointers.
+        self._retired_plans: list[_TrackPlan] = []
 
     @property
     def single_launch(self) -> bool:
@@ -485,11 +487,12 @@ class GdnUcacheTrackMaterializer:
             for layer in range(self._num_layers):
                 self._launch(tuple(t[layer] for t in self._layer_pools), args)
 
-    def warm_up(self, *, max_batch_size: int) -> None:
-        """Allocates the plan for ``max_batch_size`` rows and compiles both kernels
-        on an all-padding batch, so CUDA graph capture compiles and allocates
-        nothing."""
-        self._plan_for(max_batch_size)
+    def warm_up(self, *, max_batch_size: int, max_eager_batch_size: int = 0) -> None:
+        """Allocates the plan for the larger of ``max_batch_size`` (graph batches)
+        and ``max_eager_batch_size`` (eager verifies), and compiles both kernels on
+        an all-padding batch, so neither CUDA graph capture nor a later eager batch
+        allocates."""
+        self._plan_for(max(max_batch_size, max_eager_batch_size))
         device = self._buffers.hist_len.device
         padded = torch.full((max_batch_size,), -1, dtype=torch.int32, device=device)
         self.materialize(
@@ -508,6 +511,8 @@ class GdnUcacheTrackMaterializer:
         if plan is not None and plan.rows >= num_rows:
             return plan
         _assert_not_capturing("the track materialize plan (warm it up first)")
+        if plan is not None:
+            self._retired_plans.append(plan)
         device = self._buffers.hist_len.device
         entries = num_rows * self._plan_layers
 
@@ -579,6 +584,8 @@ class GdnUcacheVerifier:
         # out_proj) before the next GDN layer's verify overwrites it.
         self._output: Optional[torch.Tensor] = None
         self._qkv: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
+        # Outgrown shared buffers stay alive: captured graphs hold their pointers.
+        self._retired_buffers: list = []
 
     def target_verify(
         self,
@@ -649,19 +656,22 @@ class GdnUcacheVerifier:
         u_ring: torch.Tensor,
         g_ring: torch.Tensor,
         flush_min: int,
+        max_eager_batch_size: int = 0,
     ) -> None:
         """Compiles the kernels, allocates the shared buffers and builds
         FlashInfer's per-batch-size helper tensors eagerly, so CUDA graph capture
-        creates none of them."""
+        creates none of them. The shared buffers also cover
+        ``max_eager_batch_size`` so a later eager batch does not outgrow them."""
         num_k_heads, head_k_dim = k_ring.shape[1], k_ring.shape[3]
         num_v_heads, head_v_dim = u_ring.shape[1], u_ring.shape[3]
         device = state.device
         tokens = (max_batch_size, num_draft_tokens)
+        buffer_batch = max(max_batch_size, max_eager_batch_size)
         self._output_buffer(
-            batch=max_batch_size, row_shape=(num_draft_tokens, num_v_heads, head_v_dim)
+            batch=buffer_batch, row_shape=(num_draft_tokens, num_v_heads, head_v_dim)
         )
         self._qkv_buffers(
-            num_tokens=max_batch_size * num_draft_tokens,
+            num_tokens=buffer_batch * num_draft_tokens,
             cols=(
                 num_k_heads * head_k_dim,
                 num_k_heads * head_k_dim,
@@ -702,6 +712,8 @@ class GdnUcacheVerifier:
         out = self._output
         if out is None or out.shape[0] < batch or tuple(out.shape[1:]) != row_shape:
             _assert_not_capturing("the verify output buffer")
+            if out is not None:
+                self._retired_buffers.append(out)
             out = torch.zeros(
                 (batch, *row_shape), dtype=torch.bfloat16, device=self._device
             )
@@ -731,6 +743,8 @@ class GdnUcacheVerifier:
             or tuple(buf.shape[1] for buf in bufs) != cols
         ):
             _assert_not_capturing("the q/k/v split buffers")
+            if bufs is not None:
+                self._retired_buffers.append(bufs)
             bufs = tuple(
                 torch.empty((num_tokens, c), dtype=torch.bfloat16, device=self._device)
                 for c in cols
