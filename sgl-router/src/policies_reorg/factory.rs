@@ -255,6 +255,24 @@ pub fn build_resolver(
     Ok((resolver, groups.cleanup))
 }
 
+/// The in-process prefix provider reorg's cache-aware groups share, configured
+/// like the one `main.rs` builds for the other routing path: confirmed-first
+/// pending prefixes when `--cache-pending-prefix-consult-below` is set.
+pub(crate) fn local_prefix_provider(
+    model: &ModelConfig,
+    state: &KvEventIndex,
+) -> RadixTreePrefixProvider {
+    let provider = RadixTreePrefixProvider::new(state.tree(), state.block_size_oracle());
+    match model
+        .cache_aware
+        .as_ref()
+        .and_then(|cache| cache.pending_prefix_consult_below)
+    {
+        Some(below) => provider.with_pending_consult_below(below),
+        None => provider,
+    }
+}
+
 /// Builds group policies; session stores and cache sources are shared by all groups.
 struct Groups<'a> {
     model: &'a ModelConfig,
@@ -353,17 +371,14 @@ impl Groups<'_> {
     }
 
     fn source(&mut self) -> Arc<CacheSource> {
-        let (state, index) = (self.state, self.external_index.clone());
+        let (model, state, index) = (self.model, self.state, self.external_index.clone());
         Arc::clone(self.source.get_or_insert_with(|| {
             Arc::new(match index {
                 Some(index) => CacheSource::Remote {
                     index,
                     block_size: state.block_size_oracle(),
                 },
-                None => CacheSource::Local(RadixTreePrefixProvider::new(
-                    state.tree(),
-                    state.block_size_oracle(),
-                )),
+                None => CacheSource::Local(local_prefix_provider(model, state)),
             })
         }))
     }
