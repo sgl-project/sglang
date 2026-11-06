@@ -33,8 +33,12 @@ def _handoff_path(case_id: str) -> str:
     )
 
 
+_PASS1_IN_PROCESS: dict = {}
+
+
 def record_pass1(case_id: str, metrics: dict) -> None:
     """Persist the pass-1 metrics snapshot for the pass-2 comparison."""
+    _PASS1_IN_PROCESS[case_id] = metrics
     path = _handoff_path(case_id)
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -46,6 +50,11 @@ def record_pass1(case_id: str, metrics: dict) -> None:
 
 
 def load_pass1(case_id: str) -> dict:
+    # Same-process passes (single-node cases run both classes in one worker)
+    # share the in-memory snapshot; multi-node passes run in separate pods and
+    # hand off via the JSON file under the shared per-run output dir.
+    if case_id in _PASS1_IN_PROCESS:
+        return _PASS1_IN_PROCESS[case_id]
     path = _handoff_path(case_id)
     with open(path, encoding="utf-8") as f:
         return json.load(f)
