@@ -50,6 +50,7 @@ from sglang.srt.layers.attention.graph_variants import (
     Dsv41CandidateGraphVariants,
     create_attention_graph_variants,
     create_dsv41_candidate_graph_variants,
+    create_k3_mla_verify_graph_variants,
 )
 from sglang.srt.layers.cp.utils import is_mla_cp_enabled
 from sglang.srt.layers.dp_attention import (
@@ -403,6 +404,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             else create_attention_graph_variants(model_runner.model_config.hf_config)
             or create_dsv41_candidate_graph_variants(
                 model_runner, self.capture_forward_mode, self.captured_req_width
+            )
+            or create_k3_mla_verify_graph_variants(
+                self.attn_backend, self.capture_forward_mode
             )
             or self.attn_backend.get_decode_graph_variants(
                 self.capture_forward_mode, self.captured_req_width
