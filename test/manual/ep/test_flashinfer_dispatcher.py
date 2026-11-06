@@ -251,8 +251,8 @@ class TestFlashinferDispatcher(CustomTestCase):
         )
         expected_topk_ids[source_rank, : global_num_tokens[source_rank]] = self.rank
         assert_exact(
-            round_.dispatch_output.topk_output.topk_ids,
-            expected_topk_ids.flatten(0, 1),
+            actual=round_.dispatch_output.topk_output.topk_ids,
+            expected=expected_topk_ids.flatten(0, 1),
         )
         target_rank = self.target(round_.round_index)
         expected = torch.full(
@@ -262,14 +262,18 @@ class TestFlashinferDispatcher(CustomTestCase):
             device="cuda",
         )
         expected[:, 0], expected[:, 1] = mark_columns(round_.marks)
-        assert_exact(round_.combined, expected)
+        assert_exact(actual=round_.combined, expected=expected)
         return round_.dispatch_output
 
     def one_round(self, dispatcher, hidden_states, global_num_tokens):
         return self.check_round(
-            dispatcher,
-            self.run_round(dispatcher, hidden_states, global_num_tokens),
-            global_num_tokens,
+            dispatcher=dispatcher,
+            round_=self.run_round(
+                dispatcher=dispatcher,
+                hidden_states=hidden_states,
+                global_num_tokens=global_num_tokens,
+            ),
+            global_num_tokens=global_num_tokens,
         )
 
     def check_bf16_dispatch(self, dispatcher, global_num_tokens):
@@ -289,15 +293,15 @@ class TestFlashinferDispatcher(CustomTestCase):
 
         rounds = [
             self.run_round(
-                dispatcher,
-                torch.full(
+                dispatcher=dispatcher,
+                hidden_states=torch.full(
                     (global_num_tokens[self.rank], HIDDEN_SIZE),
-                    value(round_index, self.rank),
+                    value(round_index=round_index, source=self.rank),
                     dtype=torch.bfloat16,
                     device="cuda",
                 ),
-                global_num_tokens,
-                round_index,
+                global_num_tokens=global_num_tokens,
+                round_index=round_index,
             )
             for round_index in range(len(ROUND_OFFSETS))
         ]
@@ -306,7 +310,9 @@ class TestFlashinferDispatcher(CustomTestCase):
             with self.subTest(round=round_.round_index):
                 source_rank = self.source(round_.round_index)
                 dispatch_output = self.check_round(
-                    dispatcher, round_, global_num_tokens
+                    dispatcher=dispatcher,
+                    round_=round_,
+                    global_num_tokens=global_num_tokens,
                 )
                 self.assertIsNone(dispatch_output.hidden_states_scale)
                 self.assertEqual(dispatch_output.hidden_states.dtype, torch.bfloat16)
@@ -323,24 +329,28 @@ class TestFlashinferDispatcher(CustomTestCase):
                 )[source_rank][rows]
                 # A row's payload and its weight must carry one token's mark.
                 expected = torch.full_like(
-                    received, value(round_.round_index, source_rank)
+                    received, value(round_index=round_.round_index, source=source_rank)
                 )
                 expected[:, 0], expected[:, 1] = mark_columns(weights)
-                assert_exact(received, expected)
+                assert_exact(actual=received, expected=expected)
 
     def test_dispatch_basic(self):
         """Small BF16 rounds, which FlashInfer sends over Lamport."""
-        dispatcher = self.create_dispatcher("bf16", {"input_global_scale": None})
+        dispatcher = self.create_dispatcher(
+            dispatch_type="bf16", quant_config={"input_global_scale": None}
+        )
         num_tokens = 16
         self.assertGreaterEqual(dispatcher.moe_a2a.lamport_max_tokens, num_tokens)
-        self.check_bf16_dispatch(dispatcher, [num_tokens] * self.world_size)
+        self.check_bf16_dispatch(
+            dispatcher=dispatcher, global_num_tokens=[num_tokens] * self.world_size
+        )
 
     def test_dispatch_above_lamport_limit(self):
         """BF16 above FlashInfer's Lamport limit takes the fence path, whose combine
         stages the expert output unless it is already in the workspace."""
         dispatcher = self.create_dispatcher(
-            "bf16",
-            {"input_global_scale": None},
+            dispatch_type="bf16",
+            quant_config={"input_global_scale": None},
             runner_backend=MoeRunnerBackend.FLASHINFER_CUTLASS,
         )
         # The cutlass runner is what moves the combine payload into the workspace.
@@ -348,30 +358,46 @@ class TestFlashinferDispatcher(CustomTestCase):
         # Without Lamport the limit is 0, so this would be a one-token round.
         self.assertTrue(dispatcher.moe_a2a.lamport_enabled)
         num_tokens = dispatcher.moe_a2a.lamport_max_tokens + 1
-        self.check_bf16_dispatch(dispatcher, [num_tokens] * self.world_size)
+        self.check_bf16_dispatch(
+            dispatcher=dispatcher, global_num_tokens=[num_tokens] * self.world_size
+        )
 
     def test_dispatch_with_empty_tokens(self):
         """A rank with no tokens still takes part in the round, and a rank with
         fewer tokens than the round's maximum leaves padding after them."""
-        dispatcher = self.create_dispatcher("bf16", {"input_global_scale": None})
-        self.check_bf16_dispatch(dispatcher, uneven_token_counts(self.world_size, 16))
+        dispatcher = self.create_dispatcher(
+            dispatch_type="bf16", quant_config={"input_global_scale": None}
+        )
+        self.check_bf16_dispatch(
+            dispatcher=dispatcher,
+            global_num_tokens=uneven_token_counts(
+                world_size=self.world_size, num_tokens=16
+            ),
+        )
 
     def test_dispatch_with_fp4_quantization(self):
         """NVFP4 dispatch packs two values per byte and carries a block scale,
         also from a rank without tokens."""
         num_tokens = 128
-        global_num_tokens = uneven_token_counts(self.world_size, num_tokens)
+        global_num_tokens = uneven_token_counts(
+            world_size=self.world_size, num_tokens=num_tokens
+        )
         # Set input global scale to enable FP4 quantization
         input_global_scale = torch.tensor(1.0, dtype=torch.float32, device="cuda")
         dispatcher = self.create_dispatcher(
-            "nvfp4", {"input_global_scale": input_global_scale}
+            dispatch_type="nvfp4",
+            quant_config={"input_global_scale": input_global_scale},
         )
         hidden_states = torch.randn(
             (global_num_tokens[self.rank], HIDDEN_SIZE),
             dtype=torch.bfloat16,
             device="cuda",
         )
-        dispatch_output = self.one_round(dispatcher, hidden_states, global_num_tokens)
+        dispatch_output = self.one_round(
+            dispatcher=dispatcher,
+            hidden_states=hidden_states,
+            global_num_tokens=global_num_tokens,
+        )
 
         self.assertEqual(
             dispatch_output.hidden_states.shape,
@@ -390,13 +416,16 @@ class TestFlashinferDispatcher(CustomTestCase):
         """MXFP8 dispatch sends FP8 rows, a block scale and the routing ids."""
         num_tokens = 128
         dispatcher = self.create_dispatcher(
-            "mxfp8", {"input_global_scale": None, "use_mxfp8": True}
+            dispatch_type="mxfp8",
+            quant_config={"input_global_scale": None, "use_mxfp8": True},
         )
         hidden_states = torch.randn(
             (num_tokens, HIDDEN_SIZE), dtype=torch.bfloat16, device="cuda"
         )
         dispatch_output = self.one_round(
-            dispatcher, hidden_states, [num_tokens] * self.world_size
+            dispatcher=dispatcher,
+            hidden_states=hidden_states,
+            global_num_tokens=[num_tokens] * self.world_size,
         )
 
         self.assertEqual(
@@ -416,16 +445,23 @@ class TestFlashinferDispatcher(CustomTestCase):
     def test_dispatch_with_mxfp8_quantization_and_empty_rank(self):
         """All ranks must contribute the same payload dtypes, including empty ranks."""
         num_tokens = 16
-        global_num_tokens = uneven_token_counts(self.world_size, num_tokens)
+        global_num_tokens = uneven_token_counts(
+            world_size=self.world_size, num_tokens=num_tokens
+        )
         dispatcher = self.create_dispatcher(
-            "mxfp8", {"input_global_scale": None, "use_mxfp8": True}
+            dispatch_type="mxfp8",
+            quant_config={"input_global_scale": None, "use_mxfp8": True},
         )
         hidden_states = torch.randn(
             (global_num_tokens[self.rank], HIDDEN_SIZE),
             dtype=torch.bfloat16,
             device="cuda",
         )
-        dispatch_output = self.one_round(dispatcher, hidden_states, global_num_tokens)
+        dispatch_output = self.one_round(
+            dispatcher=dispatcher,
+            hidden_states=hidden_states,
+            global_num_tokens=global_num_tokens,
+        )
 
         self.assertEqual(dispatch_output.hidden_states.dtype, torch.float8_e4m3fn)
         self.assertEqual(dispatch_output.hidden_states_scale.dtype, torch.uint8)
