@@ -4185,6 +4185,13 @@ class TestKimiK31DcpOverrides(CustomTestCase):
             overrides["speculative_draft_attention_backend"], "cutedsl_mla"
         )
 
+    def test_pd_over_mori_is_allowed(self):
+        for mode in ("prefill", "decode"):
+            with self.subTest(mode=mode):
+                self._overrides(
+                    disaggregation_mode=mode, disaggregation_transfer_backend="mori"
+                )
+
     def test_pd_over_other_transfer_backends_is_rejected(self):
         for mode in ("prefill", "decode"):
             with self.subTest(mode=mode):

@@ -213,10 +213,10 @@ def _kimi_k31_dcp_overrides(cfg: Any) -> dict:
             not in (None, dflash_draft_backend)
         ),
         # Mooncake moves a DCP-1 prefill's KV row by row and a same-DCP
-        # prefill's page by page, and raises on any other DCP pair.
-        "PD over a transfer backend other than Mooncake": (
+        # prefill's page by page; MoRI moves only same-DCP pages.
+        "PD over a transfer backend other than Mooncake or MoRI": (
             cfg.disaggregation_mode in ("prefill", "decode")
-            and cfg.disaggregation_transfer_backend != "mooncake"
+            and cfg.disaggregation_transfer_backend not in ("mooncake", "mori")
         ),
         "HiSparse": cfg.enable_hisparse,
         "prefill context parallel": cfg.enable_prefill_cp

@@ -1113,6 +1113,16 @@ class MoriKVManager(CommonKVManager):
             "MoriKVManager torn down (was role=%s)", self.disaggregation_mode.value
         )
 
+    def requires_dcp_relayout(self, dst_dcp_size: int, dst_dcp_rank: int) -> bool:
+        relayout = super().requires_dcp_relayout(dst_dcp_size, dst_dcp_rank)
+        # The row relayout does not move a hybrid DSA index-K (Kimi-K3.1).
+        if relayout and getattr(self.kv_args, "dsa_index_k_token_bytes", None):
+            raise RuntimeError(
+                f"MoRI PD cannot relayout a DSA index-K from DCP-{self.dcp_size} "
+                f"to DCP-{dst_dcp_size}; use the same --dcp-size or Mooncake."
+            )
+        return relayout
+
     def _add_remote_peer(self, register_info: KVArgsRegisterInfo) -> None:
         engine_key = register_info.engine_key
         if engine_key in self.decode_kv_args_table:
@@ -1718,7 +1728,9 @@ class MoriKVManager(CommonKVManager):
                 "qsa_pending",
                 "qsa_compressed",
                 "swa_ring",
+                "draft_ring",
                 "c128_state",
+                "request_row",
                 "minimax_index_k",
                 "minimax_dense_kv",
             ):
@@ -1920,7 +1932,9 @@ class MoriKVManager(CommonKVManager):
                 "qsa_pending",
                 "qsa_compressed",
                 "swa_ring",
+                "draft_ring",
                 "c128_state",
+                "request_row",
                 "minimax_dense_kv",
             ):
                 raise RuntimeError(
@@ -1936,6 +1950,16 @@ class MoriKVManager(CommonKVManager):
             )
             src_state_indices = src_state_indices[:common_len]
             dst_state_indices = dst_state_indices[:common_len]
+        if state_type in ("draft_ring", "request_row") and not (
+            src_state_mem_descs and dst_state_mem_descs
+        ):
+            # A side without the draft registered empty slots.
+            return []
+        if state_type == "draft_ring":
+            # Row 0 marks a position one side's DCP rank does not own.
+            owned = (src_state_indices != 0) & (dst_state_indices != 0)
+            src_state_indices = src_state_indices[owned]
+            dst_state_indices = dst_state_indices[owned]
 
         # Group contiguous indices and issue per-tensor transfers
         grouped_plan = GroupedIndexPlan.from_groups(
