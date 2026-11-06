@@ -373,11 +373,15 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         )
 
         # Step 3: Execute GPU expert computation (any quantization method)
-        # This runs in parallel with CPU computation
-        gpu_combine_input = self.gpu_method.apply(layer, masked_dispatch_output)
+        # This runs in parallel with CPU computation. With no resident GPU
+        # experts (--kt-num-gpu-experts 0) there is nothing to run, and the
+        # FlashInfer MXFP4 runner refuses a zero-expert workspace.
+        if self.num_gpu_experts > 0:
+            output = self.gpu_method.apply(layer, masked_dispatch_output).hidden_states
+        else:
+            output = torch.zeros_like(x)
 
         # Step 4: Synchronize CPU results and merge with GPU results
-        output = gpu_combine_input.hidden_states
         if self.tp_rank == 0:
             cpu_output = self.sync(x)
             output = output + cpu_output
