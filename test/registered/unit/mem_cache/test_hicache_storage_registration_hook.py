@@ -101,6 +101,7 @@ def _group() -> HostPoolGroup:
 def _controller(cls: type, storage_host_pool: Any, mem_pool_host: Any) -> Any:
     """Only the attributes ``attach_storage_backend`` reads."""
     controller = object.__new__(cls)
+    controller.topk_rows = None
     controller.enable_storage = False
     controller.storage_stop_event = threading.Event()
     controller.storage_host_pool = storage_host_pool

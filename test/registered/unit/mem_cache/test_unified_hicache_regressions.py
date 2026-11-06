@@ -104,6 +104,7 @@ class TestTransferStreamOrdering(unittest.TestCase):
             ),
         )
         controller = HiCacheController.__new__(HiCacheController)
+        controller.topk_rows = None
         controller.write_fence_stream = forward
         controller.l2_transfer_engine = engine
         controller.mem_pool_device_allocator = Mock()

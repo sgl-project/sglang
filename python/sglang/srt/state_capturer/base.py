@@ -129,14 +129,6 @@ class TopkCaptureOutput:
 
 
 class BaseTopkCapturer:
-    # Class defaults also cover capturers built without __init__ (test doubles).
-    _pre_read_hooks: Tuple[Callable[[], None], ...] = ()
-    _finalize_hooks: Tuple[Callable[[int], None], ...] = ()
-    # Outputs handed out for overlap scheduling, whose rows land at finalize().
-    num_outputs: int = 0
-    # Rows of host-tier KV slots (hierarchical cache); see alloc_host_tier_cache.
-    host_tier_cache: Optional[BaseHostCache] = None
-
     def __init__(
         self,
         num_tokens: int,
@@ -155,6 +147,12 @@ class BaseTopkCapturer:
         has_host_cache before get_topk, and the subclass must not call
         capture().
         """
+        self._pre_read_hooks: Tuple[Callable[[], None], ...] = ()
+        self._finalize_hooks: Tuple[Callable[[int], None], ...] = ()
+        # Outputs handed out for overlap scheduling, whose rows land at finalize().
+        self.num_outputs = 0
+        # Rows of host-tier KV slots (hierarchical cache); see alloc_host_tier_cache.
+        self.host_tier_cache: Optional[BaseHostCache] = None
         self.num_layers = num_layers
         self.topk_size = topk_size
         self.device_topk_size = (

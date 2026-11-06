@@ -101,12 +101,14 @@ class InstantWriteBackController:
         self.ack_write_queue = []
         self.load_queue = []
         self.ack_load_queue = []
+        self.topk_rows = None
 
     def _done_ack(self, queue):
         op = CacheOperation.merge_ops(queue)
         queue.clear()
         return SimpleNamespace(
             finish_event=DoneEvent(),
+            topk_rows_copy=None,
             node_ids=op.node_ids,
             num_tokens_by_pool=self._num_tokens_by_pool(op),
             num_bytes=0,

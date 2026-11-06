@@ -47,7 +47,10 @@ class TestShardedDSAHiCache(CustomTestCase):
         indices = torch.arange(64)
         transfers = [object()]
         completion = SimpleNamespace(
-            start_event=start, finish_event=object(), timing_enabled=False
+            start_event=start,
+            topk_rows_copy=None,
+            finish_event=object(),
+            timing_enabled=False,
         )
 
         def prepare(op):
@@ -79,6 +82,7 @@ class TestShardedDSAHiCache(CustomTestCase):
             mem_pool_device_allocator=Mock(),
             _num_tokens_by_pool=lambda op: {"kv": 64},
             _transfer_num_bytes=lambda op: 0,
+            topk_rows=None,
         )
         self.assertEqual(HiCacheController.start_loading(cc), 0)
         self.assertEqual(events, ["prepare", "fence", "describe", "submit"])

@@ -726,7 +726,7 @@ class HiCacheController:
             raise
 
         # getattr: test doubles build controllers without __init__.
-        if getattr(self, "topk_rows", None) is not None:
+        if self.topk_rows is not None:
             logger.warning(
                 "Routed experts are not stored in the HiCache storage backend: "
                 "prefix pages loaded from storage return stale routed-experts rows."
@@ -948,7 +948,7 @@ class HiCacheController:
         # storage thread remains alive before clearing shared state.
         self._stop_storage_threads()
         # getattr: test doubles build controllers without __init__.
-        if (topk_rows := getattr(self, "topk_rows", None)) is not None:
+        if (topk_rows := self.topk_rows) is not None:
             topk_rows.reset()
 
         self.write_queue.clear()
@@ -1034,7 +1034,7 @@ class HiCacheController:
             )
 
         topk_rows_copy = None
-        if (topk_rows := getattr(self, "topk_rows", None)) is not None:
+        if (topk_rows := self.topk_rows) is not None:
             topk_rows_copy = topk_rows.copy_indices(
                 device_indices=op.device_indices,
                 host_indices=op.host_indices,
@@ -1187,7 +1187,7 @@ class HiCacheController:
             )
 
         topk_rows_copy = None
-        if (topk_rows := getattr(self, "topk_rows", None)) is not None:
+        if (topk_rows := self.topk_rows) is not None:
             topk_rows_copy = topk_rows.copy_indices(
                 device_indices=op.device_indices,
                 host_indices=op.host_indices,

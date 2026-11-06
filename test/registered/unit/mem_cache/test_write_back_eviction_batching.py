@@ -86,7 +86,10 @@ class _FencedController(InstantWriteBackController):
             synchronize=lambda: self.log.append(("sync", n)), query=lambda: True
         )
         return SimpleNamespace(
-            start_event=None, finish_event=finish, timing_enabled=False
+            start_event=None,
+            topk_rows_copy=None,
+            finish_event=finish,
+            timing_enabled=False,
         )
 
     def queued_pages(self, pool):
