@@ -1,4 +1,4 @@
-"""FLUX.2 XPU LayerNorm+modulate and gated residual norm fast paths.
+"""FLUX.2 and Qwen-Image 2.1 XPU LayerNorm modulation fast paths.
 
 The fusion cases need an Intel XPU; the Intel-Triton import regression runs
 in the diffusion unit suite, which installs the model's optional dependencies.
@@ -14,7 +14,9 @@ import torch
 import torch.nn as nn
 
 import sglang.multimodal_gen.runtime.models.dits.flux_2 as flux2
+import sglang.multimodal_gen.runtime.models.dits.qwen_image21 as qwen21
 from sglang.kernels.ops.diffusion import (
+    BitExactFusionGate,
     can_defer_xpu_gated_residual,
     can_use_xpu_layernorm_modulate,
     residual_gate_add,
@@ -98,6 +100,73 @@ class TestFlux2XpuNormFusions(CustomTestCase):
             expected = self.norm(x) * (1 + scale) + shift
             actual = xpu_layernorm_modulate(x, scale, shift, self.norm.eps)
             self.assertTrue(torch.equal(actual, expected), (rows, magnitude, batch))
+
+    def test_qwen21_scale_only_preserves_bits_across_reduction_dispatches(self):
+        torch.manual_seed(42)
+        norm = nn.LayerNorm(4096, elementwise_affine=False, eps=1e-6, device="xpu")
+        for batch, rows in (
+            (1, 17),
+            (1, 256),
+            (1, 257),
+            (1, 1024),
+            (1, 4096),
+            (2, 129),
+        ):
+            for amplitude, eps in ((1e-4, 1e-6), (1.0, 1e-6), (100.0, 1e-5)):
+                norm.eps = eps
+                x = torch.randn(batch, rows, 4096, device="xpu").bfloat16() * amplitude
+                params = torch.randn(batch, 1, 6 * 4096, device=x.device).bfloat16()
+                scale = params.chunk(6, dim=-1)[0]
+                scale[..., :3] = torch.tensor([-1, 0, 1], device=x.device)
+                expected = norm(x) * (1 + scale)
+                actual = xpu_layernorm_modulate(x, scale, None, norm.eps)
+                self.assertTrue(
+                    torch.equal(actual.view(torch.int16), expected.view(torch.int16)),
+                    (batch, rows, amplitude),
+                )
+                shift = params.chunk(6, dim=-1)[1]
+                actual = xpu_layernorm_modulate(x, scale, shift, norm.eps)
+                self.assertTrue(torch.equal(actual, expected + shift))
+        x = torch.ones(1, 17, 4096, device="xpu", dtype=torch.bfloat16)
+        scale = torch.full((1, 4096), -2, device=x.device, dtype=x.dtype)
+        actual = xpu_layernorm_modulate(x, scale, None, norm.eps)
+        self.assertTrue(torch.signbit(actual).all())
+
+    def test_qwen21_modulation_verifies_each_shape_and_keeps_native_fallback(self):
+        norm = nn.LayerNorm(4096, elementwise_affine=False, eps=1e-6, device="xpu")
+        gate = BitExactFusionGate("test Qwen XPU modulation", per_signature=True)
+        with patch.object(qwen21, "_XPU_MODULATION_FUSION", gate):
+            for rows in (17, 257, 1024):
+                x = torch.randn(1, rows, 4096, device="xpu", dtype=torch.bfloat16)
+                scale = torch.randn(1, 1, 4096, device=x.device, dtype=x.dtype)
+                for _ in range(2):
+                    expected = norm(x) * (1 + scale)
+                    actual = qwen21.apply_modulation(x, norm, scale)
+                    self.assertTrue(torch.equal(actual, expected))
+                    x.normal_()
+            self.assertEqual(len(gate.verified_sigs), 3)
+            self.assertFalse(gate.disabled)
+        gate = BitExactFusionGate("test Qwen mismatch", per_signature=True)
+        with (
+            patch.object(qwen21, "_XPU_MODULATION_FUSION", gate),
+            patch.object(
+                qwen21, "xpu_layernorm_modulate", lambda *args: torch.zeros_like(x)
+            ),
+        ):
+            expected = norm(x) * (1 + scale)
+            self.assertTrue(
+                torch.equal(qwen21.apply_modulation(x, norm, scale), expected)
+            )
+            self.assertTrue(gate.disabled)
+        gate = BitExactFusionGate("test Qwen capture", per_signature=True)
+        with (
+            patch.object(qwen21, "_XPU_MODULATION_FUSION", gate),
+            patch.object(torch.xpu, "is_current_stream_capturing", return_value=True),
+        ):
+            self.assertTrue(
+                torch.equal(qwen21.apply_modulation(x, norm, scale), expected)
+            )
+            self.assertFalse(gate.verified_sigs)
 
     def test_gated_resnorm_is_bit_exact(self):
         for rows, magnitude, seed, batch in _CASES:

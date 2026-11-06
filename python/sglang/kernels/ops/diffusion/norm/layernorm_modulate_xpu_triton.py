@@ -4,7 +4,7 @@
 Two eager chains, each replaced by one launch that reproduces the eager result
 bit for bit on XPU (``torch.equal``):
 
-- ``xpu_layernorm_modulate``: ``LN(x) * (1 + scale) + shift``
+- ``xpu_layernorm_modulate``: ``LN(x) * (1 + scale)`` with optional shift
 - ``xpu_gated_resnorm``: ``r = residual + update * gate`` followed by the same
   LN + modulate on ``r``; returns ``(out, r)``
 
@@ -13,9 +13,9 @@ CUDA aten's reduction with inline PTX, so they cannot run here. These kernels
 instead replicate torch-xpu-ops ``VectorizedLayerNormKernelFunctor`` for bf16
 rows (``src/ATen/native/xpu/sycl/LayerNormKernels.cpp``, ``compute_stats``):
 
-- Work-group of 1024 work-items (32 sub-groups of SIMD 32), which torch-xpu
-  selects whenever ``N / 4`` exceeds the 1024 max work-group size.
-- Work-item ``t`` Welford-pushes the 4-element vectors ``t, t + 1024, ...``,
+- Work-group of 1024 work-items (32 sub-groups of SIMD 32) for N > 4096.
+  At N = 4096, large row counts use 128 work-items and an SLM fold instead.
+- Work-item ``t`` Welford-pushes the 4-element vectors ``t, t + WG, ...``,
   each scalar as ``mean' = fma(delta, rcp(count), mean)``,
   ``m2' = fma(delta, val - mean', m2)`` with ``rcp`` being
   ``sycl::native::recip``, read from a per-device table of integer-count
@@ -26,7 +26,8 @@ rows (``src/ATen/native/xpu/sycl/LayerNormKernels.cpp``, ``compute_stats``):
 - ``rstd = rsqrt(div_rn(m2, N) + eps)``; ``y = bf16(rstd * (x - mean))``; the
   modulate chain rounds to bf16 after each op like the eager kernels.
 
-Measured bit-exact on Arc Pro B70 (torch 2.13.0+xpu). Other devices or torch
+Measured bit-exact on Arc Pro B70 (torch 2.13.0+xpu; D=4096 on 2.14.0+xpu).
+Other devices or torch
 versions may pick a different work-group size, so callers must verify
 ``torch.equal`` against the eager chain once and fall back on mismatch.
 """
@@ -139,11 +140,13 @@ def _gated_value(r_ptr, u_ptr, g_ptr, offs, live):
 
 
 @triton.jit
-def _modulate(x, s, b, mean, rstd):
+def _modulate(x, s, b, mean, rstd, HAS_SHIFT: tl.constexpr):
     y = (rstd * (x.to(tl.float32) - mean)).to(tl.bfloat16).to(tl.float32)
     one_s = (1.0 + s.to(tl.float32)).to(tl.bfloat16).to(tl.float32)
     p = (y * one_s).to(tl.bfloat16).to(tl.float32)
-    return (p + b.to(tl.float32)).to(tl.bfloat16)
+    if HAS_SHIFT:
+        p = p + b.to(tl.float32)
+    return p.to(tl.bfloat16)
 
 
 @triton.jit
@@ -172,6 +175,7 @@ def _xpu_ln_modulate_kernel(
     WG: tl.constexpr,
     SIMD: tl.constexpr,
     GATED: tl.constexpr,
+    HAS_SHIFT: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     row_off = row * N
@@ -210,13 +214,14 @@ def _xpu_ln_modulate_kernel(
         rcp_ptr,
         SG,
     )
-    mean, m2, cnt = _fold_32(
-        tl.reshape(mean, (1, SG)),
-        tl.reshape(m2, (1, SG)),
-        tl.reshape(cnt, (1, SG)),
-        rcp_ptr,
-        1,
-    )
+    mean = tl.reshape(mean, (1, SG))
+    m2 = tl.reshape(m2, (1, SG))
+    cnt = tl.reshape(cnt, (1, SG))
+    if SG == 4:
+        mean, m2, cnt = _fold_step(mean, m2, cnt, rcp_ptr, 1, 4)
+        mean, m2, cnt = _fold_step(mean, m2, cnt, rcp_ptr, 1, 2)
+    else:
+        mean, m2, cnt = _fold_32(mean, m2, cnt, rcp_ptr, 1)
     mean = tl.sum(mean, axis=1)
     var = libdevice.div_rn(tl.sum(m2, axis=1), tl.full((1,), N, tl.float32))
     rstd = libdevice.rsqrt(var + eps)
@@ -232,15 +237,21 @@ def _xpu_ln_modulate_kernel(
         else:
             x0, x1, x2, x3 = _load_vec4(x_ptr, offs, live)
         s0, s1, s2, s3 = _load_vec4(s_row, offs, live)
-        b0, b1, b2, b3 = _load_vec4(b_row, offs, live)
+        if HAS_SHIFT:
+            b0, b1, b2, b3 = _load_vec4(b_row, offs, live)
+        else:
+            b0 = tl.full((WG,), 0, tl.float32)
+            b1 = b0
+            b2 = b0
+            b3 = b0
         _store_vec4(
             o_ptr,
             offs,
             live,
-            _modulate(x0, s0, b0, mean, rstd),
-            _modulate(x1, s1, b1, mean, rstd),
-            _modulate(x2, s2, b2, mean, rstd),
-            _modulate(x3, s3, b3, mean, rstd),
+            _modulate(x0, s0, b0, mean, rstd, HAS_SHIFT),
+            _modulate(x1, s1, b1, mean, rstd, HAS_SHIFT),
+            _modulate(x2, s2, b2, mean, rstd, HAS_SHIFT),
+            _modulate(x3, s3, b3, mean, rstd, HAS_SHIFT),
         )
 
 
@@ -276,7 +287,7 @@ def can_use_xpu_layernorm_modulate(dtype: torch.dtype, hidden: int) -> bool:
         libdevice is not None
         and dtype is torch.bfloat16
         and hidden % _VEC == 0
-        and _WG < hidden // _VEC
+        and _WG <= hidden // _VEC
         and hidden < _RECIP_TABLE_SIZE
     )
 
@@ -322,7 +333,7 @@ def _checked_rows(x: torch.Tensor, name: str) -> None:
     if not _rows_ok(x):
         raise RuntimeError(
             f"{name} must be a contiguous, 8-byte aligned BF16 XPU [B, S, D] "
-            "tensor with 4096 < D < 8192 and D divisible by 4"
+            "tensor with 4096 <= D < 8192 and D divisible by 4"
         )
 
 
@@ -337,13 +348,20 @@ def _checked_mod(
 
 def _launch(x, update, gate, scale, shift, out, residual_out, eps, *, gated):
     (gate, g_stride), (scale, s_stride), (shift, b_stride) = gate, scale, shift
+    has_shift = shift is not None
     batch, seq_len, hidden = x.shape
+    work_group = _WG
+    if hidden == 4096:
+        # B70 has eight HW threads per EU: M * 4 > HW_threads / 2
+        # selects Torch's four-subgroup work-group at this boundary width.
+        if batch * seq_len > torch.xpu.get_device_properties(x.device).gpu_eu_count:
+            work_group = 128
     _xpu_ln_modulate_kernel[(batch * seq_len,)](
         x,
         update,
         gate,
         scale,
-        shift,
+        shift if has_shift else x,
         out,
         residual_out,
         _native_recip_table(x.device),
@@ -353,20 +371,21 @@ def _launch(x, update, gate, scale, shift, out, residual_out, eps, *, gated):
         b_stride,
         float(eps),
         N=hidden,
-        WG=_WG,
+        WG=work_group,
         SIMD=_SIMD,
         GATED=gated,
+        HAS_SHIFT=has_shift,
         num_warps=envs.SGLANG_XPU_LN_MOD_NUM_WARPS.get(),
     )
 
 
 def xpu_layernorm_modulate(
-    x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, eps: float
+    x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor | None, eps: float
 ) -> torch.Tensor:
-    """``LN(x) * (1 + scale) + shift`` for BF16 XPU ``[B, S, D]``, bit-exact vs eager."""
+    """BF16 XPU ``LN(x) * (1 + scale)`` with optional shift, bit-exact vs eager."""
     _checked_rows(x, "x")
     scale_rows = _checked_mod(scale, x, "scale")
-    shift_rows = _checked_mod(shift, x, "shift")
+    shift_rows = (None, 0) if shift is None else _checked_mod(shift, x, "shift")
     out = torch.empty_like(x)
     _launch(x, x, scale_rows, scale_rows, shift_rows, out, out, eps, gated=False)
     return out

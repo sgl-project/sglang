@@ -1,3 +1,4 @@
+import sys
 from typing import Tuple
 
 import torch
@@ -213,7 +214,42 @@ def bench_residual_layernorm_scale_shift_gate_select01(
     return run_benchmark_no_cudagraph(fn)
 
 
-if __name__ == "__main__":
+def bench_qwen21_xpu():
+    from triton.runtime import driver
+
+    from sglang.multimodal_gen.runtime.models.dits.qwen_image21 import (
+        _XPU_MODULATION_FUSION,
+        apply_modulation,
+    )
+
+    cache = driver.active.get_empty_cache_for_benchmark()
+    assert cache.numel() * cache.element_size() > (
+        4 * torch.xpu.get_device_properties().last_level_cache_size
+    )
+    torch.manual_seed(42)
+    print("B,S,D,torch_us,model_us")
+    for seq_len in (17, 256, 257, 1024, 4096):
+        x = torch.randn(1, seq_len, 4096, device="xpu", dtype=torch.bfloat16)
+        params = torch.randn(1, 1, 6 * 4096, device=x.device, dtype=x.dtype)
+        scale = params.chunk(6, dim=-1)[0]
+        norm = torch.nn.LayerNorm(4096, eps=EPS, elementwise_affine=False).to(x.device)
+        expected = norm(x) * (1 + scale)
+        actual = apply_modulation(x, norm, scale)
+        assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+        sig = (x.device, x.dtype, x.shape, x.stride(), scale.stride(), norm.eps)
+        assert _XPU_MODULATION_FUSION.is_verified(sig)
+        assert not _XPU_MODULATION_FUSION.disabled
+        reference_us = run_benchmark_no_cudagraph(lambda: norm(x) * (1 + scale))[0]
+        model_us = run_benchmark_no_cudagraph(lambda: apply_modulation(x, norm, scale))[
+            0
+        ]
+        print(f"1,{seq_len},4096,{reference_us:.3f},{model_us:.3f}")
+
+
+if __name__ == "__main__" and "--qwen21-xpu" in sys.argv:
+    with torch.inference_mode():
+        bench_qwen21_xpu()
+elif __name__ == "__main__":
     # The bit-exact LayerNorm kernel uses CUDA inline PTX; keep the shared
     # Qwen modulation benchmark runnable on its registered ROCm lane.
     if torch.version.hip is None:
