@@ -33,6 +33,7 @@ from sglang.srt.layers.quantization.modelslim.modelslim import (
     remap_dspark_weight_name_npu,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -76,7 +77,7 @@ from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyMode,
     read_ragged_verify_mode,
 )
-from sglang.srt.utils import add_prefix, is_npu
+from sglang.srt.utils import is_npu
 
 logger = logging.getLogger(__name__)
 
@@ -920,9 +921,10 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                 "DeepseekV4ForCausalLMDSpark requires the target embed_tokens "
                 "(call attach_shared_modules first)."
             )
-        x = self.embed_tokens(input_ids)
-        x = x.unsqueeze(1).repeat(1, self.hc_mult, 1)
-        return x
+        return self._expand_hc(self.embed_tokens(input_ids))
+
+    def _expand_hc(self, embeds: torch.Tensor) -> torch.Tensor:
+        return embeds.unsqueeze(1).repeat(1, self.hc_mult, 1)
 
     def forward(
         self,
@@ -948,6 +950,8 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
     def _forward_impl(self, input_ids, positions, forward_batch, input_embeds):
         if input_embeds is None:
             input_embeds = self.forward_embed(input_ids)
+        elif input_embeds.dim() == 2:
+            input_embeds = self._expand_hc(input_embeds)
         x = input_embeds
         pre = None
         if _is_cuda:

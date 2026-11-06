@@ -43,9 +43,7 @@ _SAIL_GPU_ARCHS = (
 def cuda_home() -> str:
     """CUDA install root, resolved the way tvm-ffi resolves it.
 
-    `arch._jit_cuda_version` resolves nvcc the same way for its own purposes;
-    the two must stay in agreement, since one picks the target and the other
-    compiles for it.
+    `arch._jit_cuda_version` probes this nvcc to pick the compile target.
     """
     configured = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
     if configured is not None:

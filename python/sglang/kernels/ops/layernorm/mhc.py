@@ -20,7 +20,7 @@ from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.utils.common import strict_contiguous
 from sglang.srt.runtime_context import get_parallel, get_platform
 from sglang.srt.utils import is_gfx95_supported, is_hip
-from sglang.srt.utils.common import is_gfx1250_supported
+from sglang.srt.utils.device import is_gfx1250_supported
 
 _is_hip = is_hip()
 if _is_hip:
@@ -667,9 +667,7 @@ def _mhc_pre_gemm_sqrsum_dispatch():
     """SM120's TileLang pipeline cannot warp-specialize this kernel (the role
     marker fails on tirx.Bind), so re-wrap it there with warp specialization
     disabled. Other archs keep the original compiled form."""
-    from sglang.srt.utils import is_sm120_supported
-
-    if not is_sm120_supported():
+    if not current_arch().is_sm(12):
         return mhc_pre_gemm_sqrsum_tilelang
     _tl = _load_tilelang()
     cfg = {_tl.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True}
@@ -696,14 +694,12 @@ def mhc_pre_gemm_sqrsum_splitk_kernel(
 
     ENABLE_PDL = is_arch_support_pdl()
 
-    from sglang.srt.utils import is_sm120_supported
-
     _tl = _load_tilelang()
     # See _mhc_pre_gemm_sqrsum_dispatch: SM120 cannot compile the
     # warp-specialized form of these kernels.
     _cfg = (
         {_tl.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True}
-        if is_sm120_supported()
+        if current_arch().is_sm(12)
         else None
     )
 
@@ -1144,9 +1140,14 @@ def mhc_pre(
                 hidden_block = 256
             elif hc_hidden_size == 28672:
                 hidden_block = 128
+            elif hc_hidden_size == 14336:
+                # 14336 = 4 * 3584 (xing4_0). hidden_block=256 -> 14336/256=56.
+                # Caller must pass n_splits_pre dividing 56 so that
+                # (14336//n_splits_pre) % 256 == 0 (e.g. n_splits_pre=8 -> 1792).
+                hidden_block = 256
             else:
                 raise NotImplementedError(
-                    f"mhc_pre splitk kernel only supports hc_hidden_size in {{16384, 28672}}, "
+                    f"mhc_pre splitk kernel only supports hc_hidden_size in {{16384, 28672, 14336}}, "
                     f"got {hc_hidden_size}"
                 )
             kernel_0, _ = mhc_pre_gemm_sqrsum_splitk_kernel(
@@ -1964,6 +1965,7 @@ def _mhc_pre_dispatch(
     sinkhorn_repeat: int,
     norm_weight: torch.Tensor | None = None,
     norm_eps: float | None = None,
+    n_splits_pre: int = 32,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
     assert residual.dim() == 3, f"residual must be (s, n, h); got {residual.shape}"
     if _use_aiter_mhc():
@@ -2008,6 +2010,7 @@ def _mhc_pre_dispatch(
         hc_sinkhorn_eps=hc_sinkhorn_eps,
         hc_post_mult_value=hc_post_mult_value,
         sinkhorn_repeat=sinkhorn_repeat,
+        n_splits_pre=n_splits_pre,
         norm_weight=norm_weight,
         norm_eps=norm_eps,
     )
@@ -2051,7 +2054,12 @@ def hc_pre(
     hc_norm_weight: torch.Tensor | None = None,
     out_norm_weight: torch.Tensor | None = None,
     out_norm_eps: float | None = None,
+    n_splits_pre: int = 32,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
+    """Split-K parallelism of the TileLang mhc_pre GEMM: the split size must
+    keep (hc_mult * hidden_size) // n_splits_pre divisible by the kernel's
+    hidden_block, e.g. n_splits_pre=8 for hc_hidden_size=14336 (14336/8=1792,
+    a multiple of 256; the default 32 would give 448, which is not)."""
     s, total = x.shape
     hidden_size = total // hc_mult
     if x.numel() == 0:
@@ -2076,6 +2084,7 @@ def hc_pre(
         sinkhorn_repeat=sinkhorn_iters,
         norm_weight=out_norm_weight,
         norm_eps=out_norm_eps,
+        n_splits_pre=n_splits_pre,
     )
     return (
         layer_input,
@@ -2558,6 +2567,16 @@ def hc_mix_stats_sinkhorn(
 # residual), accumulated over a fixed slice count to bound the fp32 error.
 _HC_MIX_COMPENSATED_SLICES = 16
 _HC_MIX_BF16X3_BLOCK_M = 128
+_HC_PRENORM_BLOCK_M = 64
+
+
+def _hc_mix_deepgemm_slices(m: int) -> int:
+    # Halve the slices when the prenorm grid overflows one wave. The fp32 error
+    # grows about linearly with K per slice, so do not go below half.
+    grid_m = triton.cdiv(m, _HC_PRENORM_BLOCK_M)
+    if grid_m * _HC_MIX_COMPENSATED_SLICES <= current_arch().num_sms:
+        return _HC_MIX_COMPENSATED_SLICES
+    return _HC_MIX_COMPENSATED_SLICES // 2
 
 
 def split_bf16_hc_weight(weight: torch.Tensor):
@@ -2702,7 +2721,7 @@ def hc_mix_stats_sinkhorn_deepgemm(
     assert x_flat.dtype == torch.bfloat16 and x_flat.is_contiguous()
     m, k = x_flat.shape
     mix = (2 + hc_mult) * hc_mult
-    slices = _HC_MIX_COMPENSATED_SLICES
+    slices = _hc_mix_deepgemm_slices(m)
     high, low = weight_parts
     assert high.shape == low.shape == (mix, k)
     dev = x_flat.device
