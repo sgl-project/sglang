@@ -21,7 +21,7 @@ from sglang.srt.configs.nemotron_h import NemotronHConfig
 from sglang.srt.configs.qwen3_5 import Qwen3_5Config, Qwen3_5MoeConfig
 from sglang.srt.configs.qwen3_next import Qwen3NextConfig
 from sglang.srt.configs.zaya import ZayaConfig
-from sglang.srt.utils.hf_transformers.common import get_hf_text_config
+from sglang.srt.hf_transformers.common import get_hf_text_config
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
