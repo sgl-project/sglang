@@ -44,13 +44,7 @@ class _FakeOpenAIServingChat:
     def supports_native_reasoning_history(self):
         return self.native_reasoning_history
 
-    def _generate_chat_stream(
-        self,
-        adapted_request,
-        processed_request,
-        raw_request,
-        keep_continuous_usage=False,
-    ):
+    def _generate_chat_stream(self, adapted_request, processed_request, raw_request):
         async def _gen():
             for line in self.stream_lines:
                 yield line
@@ -1405,11 +1399,7 @@ class TestAnthropicServing(unittest.TestCase):
 
         class _RaisingOpenAI(_FakeOpenAIServingChat):
             def _generate_chat_stream(
-                self,
-                adapted_request,
-                processed_request,
-                raw_request,
-                keep_continuous_usage=False,
+                self, adapted_request, processed_request, raw_request
             ):
                 async def _gen():
                     raise ValueError("tokenization failed")
