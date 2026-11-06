@@ -293,7 +293,7 @@ def _linear_accepts_fp8_tuple(linear: nn.Module) -> bool:
 
 
 def _fp8_tuple_input(linear: nn.Module, num_tokens: int) -> bool:
-    """Whether the producer hands ``linear`` a per-token FP8 (q, scale) pair (SGLANG_ROCM_SMALLM_FP8_PROJ)."""
+    """Whether the producer hands ``linear`` a per-token FP8 (q, scale) pair for the gfx950 small-M FP8 GEMM."""
     scheme = getattr(linear, "scheme", None)
     return (
         _use_aiter

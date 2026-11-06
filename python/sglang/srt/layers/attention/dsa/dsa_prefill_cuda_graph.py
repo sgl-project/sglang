@@ -116,7 +116,7 @@ def pcg_dsa_indexer_prefill_split(
         )
         return
 
-    # Fused path stores K (no-Hadamard) and computes q_fp8 + head gate in the
+    # Fused path stores K and computes q_fp8 + head gate in the
     # fused kernels, sliced to the unpadded count. Single stream: the split op is
     # captured, so the dual-stream overlap is disabled.
     in_cp = forward_batch.attn_cp_metadata is not None
@@ -149,7 +149,7 @@ def pcg_dsa_indexer_prefill_split(
         enable_dual_stream=False,
         forward_batch=forward_batch,
     )
-    q_fp8, q_scale = act_quant(query, indexer.block_size, indexer.scale_fmt)
+    q_fp8, q_scale = indexer._quantize_query(query, act_quant)
     # Reuse the compiled head-gate util shared with the eager path.
     weights = (  # same head-gate choice as the eager CP branch
         indexer._scale_head_gates(weights_raw, q_scale)

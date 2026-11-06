@@ -1,6 +1,7 @@
 """Stateful audio preprocessing pipeline shared by MiMo multimodal and ASR processors."""
 
 import io
+import logging
 import math
 import os
 import time
@@ -13,7 +14,8 @@ import pybase64
 import torch
 
 from sglang.srt.multimodal import media_io
-from sglang.utils import logger
+
+logger = logging.getLogger(__name__)
 
 try:
     from torchcodec.decoders import AudioDecoder
