@@ -24,7 +24,6 @@ import openai
 import requests
 import torch
 
-from sglang.srt.utils.common import is_xpu
 from sglang.srt.utils.hf_transformers import (
     get_processor,
     get_tokenizer_from_processor,
@@ -80,7 +79,6 @@ def _empty_xpu_cache() -> None:
         torch.xpu.empty_cache()
 
 
-@unittest.skipUnless(is_xpu(), "Intel XPU not available")
 class TestGemma4E2BXPU(CustomTestCase):
     server_args = XPU_SERVER_ARGS
 
