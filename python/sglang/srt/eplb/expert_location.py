@@ -644,7 +644,7 @@ def _pad_nested_array(arr, pad_value):
     return padded
 
 
-# TODO optimize performance (rewrite and/or run in separate process with overlap)
+# TODO run off the forward thread, overlapped with decode
 def compute_logical_to_rank_dispatch_physical_map(
     logical_to_all_physical_map: torch.Tensor,
     ep_size: int,
@@ -693,7 +693,9 @@ def compute_logical_to_rank_dispatch_physical_map(
             choices = _fair_choices(cand_row[:count], k=len(remaining_ranks), r=r)
             for rank, choice in zip(remaining_ranks, choices, strict=True):
                 row[rank] = choice
-        result[layer_ids, expert_ids] = torch.tensor(rows, dtype=result.dtype)
+        result[layer_ids, expert_ids] = torch.tensor(
+            rows, dtype=result.dtype, device=result.device
+        )
 
     assert torch.all(result != -1)
     return result[:, :, ep_rank].contiguous().to(dtype=dtype, device=device)
@@ -730,28 +732,25 @@ def _nearest_expert_dispatch(
     ranks = torch.arange(ep_size, device=device)
 
     def first_match(owner_of_candidate, owner_of_rank):
-        # width is the max replica count (a few), so a slot loop beats a strided reduction.
         count = torch.zeros(
             (*candidates.shape[:-1], ep_size), dtype=torch.int64, device=device
         )
         picked = torch.full_like(count, -1)
+        # Walk the slots backwards so the earliest matching replica wins.
         for k in reversed(range(width)):
             match = valid[..., k, None] & (
                 owner_of_candidate[..., k, None] == owner_of_rank
             )
             count += match
             picked = torch.where(match, candidates[..., k, None], picked)
-        return count, picked != -1, picked
+        return count, picked
 
-    _, has_gpu, gpu_pick = first_match(
-        candidates // num_local_gpu_physical_experts, ranks
-    )
-    result = torch.where(has_gpu, gpu_pick, torch.full_like(gpu_pick, -1))
+    _, result = first_match(candidates // num_local_gpu_physical_experts, ranks)
     if num_gpus_per_node is not None and num_local_node_physical_experts is not None:
-        node_count, has_node, node_pick = first_match(
+        node_count, node_pick = first_match(
             candidates // num_local_node_physical_experts, ranks // num_gpus_per_node
         )
-        narrows = has_node & (node_count < num_valid[..., None])
+        narrows = (node_count > 0) & (node_count < num_valid[..., None])
         result = torch.where((result == -1) & narrows, node_pick, result)
     single = (num_valid == 1)[..., None]
     return torch.where(single, candidates[..., :1].expand_as(result), result)
