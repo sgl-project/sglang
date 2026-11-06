@@ -3,7 +3,7 @@ moe_fused_gate (sigmoid, correction bias, top-4, renormalize, routed scaling) ->
 
 The sorted buffers reach the aiter runner through moe_sorting_small.presorted_moe_sort().
 m31_shared_router() runs it in one launch with the shared expert's gate_up GEMM.
-SGLANG_ROCM_SMALLM_ROUTER=0 disables it; a build/load failure disables it too."""
+A build/load failure disables it."""
 
 import ctypes
 import hashlib
@@ -15,11 +15,10 @@ import tempfile
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils.compile.cache import cache_root
 from sglang.kernels.jit.utils.hipcc import HipKernel, check_hip, hip_lib, hipcc_path
 from sglang.kernels.ops.gemm import router_gemv, smallm_fp8_gfx950
-from sglang.srt.environ import envs
-from sglang.srt.utils import is_gfx95_supported
 
 logger = logging.getLogger(__name__)
 
@@ -102,10 +101,11 @@ def m31_router_supported(
     x: torch.Tensor, gate_weight: torch.Tensor, bias: torch.Tensor | None
 ) -> bool:
     m = x.shape[0]
+    hip = current_arch().hip
     return (
         not _disabled
-        and envs.SGLANG_ROCM_SMALLM_ROUTER.get()
-        and is_gfx95_supported()
+        and hip is not None
+        and hip.gcn_arch == "gfx950"
         and x.dim() == 2
         and 1 <= m <= MAX_TOK
         and x.shape[1] == HIDDEN

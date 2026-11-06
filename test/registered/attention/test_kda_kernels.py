@@ -17,7 +17,7 @@ from sglang.kernels.ops.attention.fla.kda import (
 from sglang.kernels.ops.attention.linear.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
 )
-from sglang.srt.utils.common import get_device
+from sglang.srt.utils.device import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 

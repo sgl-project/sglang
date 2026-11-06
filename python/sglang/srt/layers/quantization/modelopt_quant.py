@@ -66,14 +66,11 @@ from sglang.srt.layers.quantization.utils import (
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils import alias_or_bind_derived_param, copy_or_rebind_param
+from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils.common import (
-    get_device_capability,
-    is_cuda,
-    round_up,
-    set_weight_attrs,
-)
+from sglang.srt.utils.common import round_up
 from sglang.srt.utils.custom_op import register_custom_op
+from sglang.srt.utils.device import get_device_capability, is_cuda
 from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 if TYPE_CHECKING:
