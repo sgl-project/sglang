@@ -71,6 +71,7 @@ from sglang.srt.utils import (
     is_cuda_alike,
     is_gfx95_supported,
     is_hip,
+    is_mlu,
     is_musa,
     is_npu,
     is_shm_available,
@@ -84,7 +85,7 @@ _is_npu = is_npu()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _is_musa = is_musa()
-
+_is_mlu = is_mlu()
 # Under CUDA-graph capture, stage aiter custom all-gather / reduce-scatter inputs
 # through the pre-registered IPC pool instead of registering graph-pool tensors:
 # the registered path makes peers read stale data over IPC on replay (garbage
@@ -99,6 +100,12 @@ REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)
 # Reuse the user-provided distributed timeout for model-parallel subgroup
 # creation so runtime collectives do not silently fall back to backend defaults.
 _MODEL_PARALLEL_GROUP_TIMEOUT: Optional[timedelta] = None
+
+# AITER fused AR+RMSNorm 1-stage kernel: one block per token up to kMaxBlocks,
+# and every rank reads every peer, so its read volume is payload * world_size
+# (128 KiB of payload at world_size 8).
+_FUSED_AR_RMS_1STAGE_MAX_TOKENS = 80
+_FUSED_AR_RMS_1STAGE_MAX_READ_BYTES = 8 * 128 * 1024
 
 
 def get_torch_distributed_pg_options(group_name=None):
@@ -854,17 +861,16 @@ class GroupCoordinator:
         if not hasattr(ca_comm, "custom_fused_ar_rms"):
             return None
 
-        # 1-stage vs 2-stage selection for fused AR+RMSNorm:
-        # The 1-stage kernel launches one block per token and is capped at
-        # 80 tokens (kMaxBlocks).  Guard with a byte threshold so large
-        # prefill batches fall through to the 2-stage kernel instead of
-        # hitting a runtime error.  AITER's C++ dispatch already gates
-        # which hidden_dims have valid 1-stage support.
+        # AITER's C++ dispatch further limits 1-stage to the hidden_dims it supports.
         if envs.SGLANG_USE_1STAGE_ALLREDUCE.is_set():
             use_1stage_ar = envs.SGLANG_USE_1STAGE_ALLREDUCE.get()
         else:
             total_bytes = input_.numel() * input_.element_size()
-            use_1stage_ar = total_bytes <= 128 * 1024
+            token_num = input_.numel() // input_.shape[-1]
+            use_1stage_ar = (
+                token_num <= _FUSED_AR_RMS_1STAGE_MAX_TOKENS
+                and total_bytes * self.world_size <= _FUSED_AR_RMS_1STAGE_MAX_READ_BYTES
+            )
 
         if (
             getattr(ca_comm, "_IS_CAPTURING", False)
@@ -2139,6 +2145,8 @@ def _group_coordinator_device(local_rank: int) -> torch.device:
         return torch.device(f"xpu:{local_rank}")
     if _is_musa:
         return torch.device(f"musa:{local_rank}")
+    if _is_mlu:
+        return torch.device(f"mlu:{local_rank}")
     platform = platforms.current_platform
     if platform.is_out_of_tree():
         return platform.get_group_coordinator_device(local_rank)
@@ -2201,7 +2209,7 @@ def init_model_parallel_group(
         if platform.is_out_of_tree() and not platform.capabilities.supports_pynccl:
             use_pynccl = False
         else:
-            use_pynccl = not (_is_npu or _is_xpu or backend == "mooncake")
+            use_pynccl = not (_is_npu or _is_xpu or _is_mlu or backend == "mooncake")
     return GroupCoordinator(
         group_ranks=group_ranks,
         local_rank=local_rank,
