@@ -2758,7 +2758,6 @@ def initialize_model_parallel(
                 f"DCP enabled, dcp_size={decode_context_parallel_size}, tp_size={tensor_model_parallel_size}"
             )
 
-    # QSA cache sharding is independent of decode context parallelism.
     global _QSA_CACHE_SHARDING
     assert _QSA_CACHE_SHARDING is None, (
         "QSA cache-sharding group is already initialized"
