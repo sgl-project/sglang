@@ -41,6 +41,7 @@ from sglang.srt.layers.attention.base_attn_backend import (
 from sglang.srt.layers.cp.base import (
     CPAttentionBackendKind,
     get_cp_strategy,
+    is_cp_enabled,
 )
 from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.dp_attention import get_cuda_graph_max_batch_size
@@ -371,13 +372,9 @@ class FlashInferAttnBackend(AttentionBackend):
         self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
         self.is_dllm_model = self.dllm_config is not None
 
-        # Same gate as the Triton backend: bidirectional extend attention needs
-        # the whole prompt in one forward, which chunked prefill and the CUDA
-        # graph modes that split or pad a prefill do not guarantee.
         self.allow_bidirectional_attention_in_extend = (
-            cuda_graph_fully_disabled()
-            or check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)
-        ) and get_schedule().chunked_prefill_size == -1
+            self._bidirectional_extend_allowed()
+        )
 
         self.kv_cache_quant_method = self.token_to_kv_pool.get_kv_cache_quant_method()
         self.prefill_kv_access = self.kv_cache_quant_method.resolve_attention_access(
@@ -1494,6 +1491,21 @@ class FlashInferAttnBackend(AttentionBackend):
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
+
+    @staticmethod
+    def _bidirectional_extend_allowed() -> bool:
+        # Bidirectional extend attention needs the whole prompt in one forward.
+        # Chunked prefill and the CUDA graph modes that split or pad a prefill
+        # break that, as in the Triton backend's gate. So does prefill context
+        # parallelism: a shard reads keys only up to its own end.
+        return (
+            (
+                cuda_graph_fully_disabled()
+                or check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)
+            )
+            and get_schedule().chunked_prefill_size == -1
+            and not is_cp_enabled()
+        )
 
     def _extend_is_causal(
         self, layer: RadixAttention, forward_batch: ForwardBatch
