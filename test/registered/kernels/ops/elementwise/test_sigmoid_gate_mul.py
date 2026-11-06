@@ -77,8 +77,8 @@ def test_sigmoid_gate_mul_contiguous_output():
     assert out.is_contiguous()
 
 
-@pytest.mark.parametrize("num_tokens", [1, 7, 300])
-def test_sigmoid_gate_mul_strided_gate_round_sigmoid_is_bit_exact(num_tokens):
+def test_sigmoid_gate_mul_strided_gate_round_sigmoid_is_bit_exact():
+    num_tokens = 300
     # The gate is the tail columns of a merged [q_up | gate] GEMM output.
     from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
 

@@ -116,8 +116,7 @@ def _validate_features(cfg: Any) -> None:
 
 
 def _validate_speculative(cfg: Any) -> None:
-    # Runs before handle_speculative_decoding resolves NEXTN to EAGLE,
-    # so it sees the raw CLI spelling.
+    # Runs before NEXTN is resolved to EAGLE, so it sees the raw CLI spelling.
     algo = (cfg.speculative_algorithm or "").upper()
     is_mtp = algo in ("EAGLE", "NEXTN")
     if algo not in ("", "DSPARK") and not is_mtp:
@@ -142,7 +141,6 @@ def _validate_speculative(cfg: Any) -> None:
 
 @_register_for(ERNIE5_5_MOE_ARCH)
 def _ernie55_overrides(server_args: Any, hf_config: Any) -> dict:
-    """The HCA layers ride the compressed-KV pool, so take its page and KV layout."""
     cfg = resolving_view(server_args)
     _validate_features(cfg)
     _validate_speculative(cfg)
@@ -151,7 +149,6 @@ def _ernie55_overrides(server_args: Any, hf_config: Any) -> dict:
         "page_size": DSV4_PAGE_SIZE,
     }
     if cfg.kv_cache_dtype == "auto":
-        # An accuracy-relevant default: say so rather than switching silently.
         logger.warning(
             "ERNIE 5.5 Flash defaults --kv-cache-dtype to fp8_e4m3; "
             "pass --kv-cache-dtype bfloat16 to keep the latent cache in bf16."

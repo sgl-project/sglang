@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""ERNIE 5.5 Flash's VHA cross-head postmix fused into the wo_a fp8 activation quant.
+"""VHA cross-head postmix fused into the wo_a fp8 activation quant.
 
 ``out[t, h] = sum_h' M[h, h'] * o[t, h']`` followed by
 :func:`sglang_per_token_group_quant_fp8_dsv4_wo_a`, whose output layout this
@@ -88,7 +88,6 @@ def _postmix_quant_kernel(
 
 
 def postmix_quant_supported(x: torch.Tensor, mix: torch.Tensor) -> bool:
-    """Shapes the kernel covers; anything else takes the two-pass spelling."""
     tokens, groups, hidden = x.shape
     num_heads = mix.shape[0]
     if tokens == 0 or num_heads % groups or (hidden * groups) % num_heads:

@@ -44,7 +44,6 @@ def test_multimax_matches_eager_bit_for_bit(shape):
 
 
 def test_multimax_keeps_non_finite_logits():
-    """A NaN or infinite logit comes out as eager computes it, never as 0."""
     from sglang.kernels.ops.activation.multimax import multimax
 
     x = torch.tensor(

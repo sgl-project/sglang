@@ -723,7 +723,7 @@ struct FusedQIndexerRopeHadamardQuantParams {
   uint32_t num_heads;
 };
 
-// kNeoxStyle pairs dim d with d + 32 (ERNIE 5.5) instead of adjacent dims; leading-dim rope only.
+// kNeoxStyle pairs dim d with d + 32 instead of adjacent dims (leading-dim rope only).
 template <
     typename DType,
     typename PosT,
@@ -792,7 +792,7 @@ Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const __grid_constant__ FusedQ
     }
   }
 
-  // part 2: rope. Adjacent pairs stay in-lane (2 per lane); NeoX pairs cross lanes.
+  // part 2: rope
   if constexpr (kNeoxStyle) {
     dsa_indexer::apply_neox_rope<kRopeSize>(data, freq, freq_sin, lane_id, is_rope_lane);
   } else if (is_rope_lane) {

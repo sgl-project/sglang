@@ -165,7 +165,7 @@ def append_window_to_topk(
         HAS_PAGE_ROWS=page_rows is not None,
         RAGGED=ragged_offsets is not None,
         OUT_WIDTH=out_width,
-        # 1024 over 8 warps keeps 4 elements per lane; 256 measured slower.
+        # 1024 over 8 warps keeps 4 elements per lane.
         BLOCK=min(1024, triton.next_power_of_2(out_width)),
         WINDOW_BLOCK=triton.next_power_of_2(window),
         num_warps=8,

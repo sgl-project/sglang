@@ -39,7 +39,6 @@ def test_postmix_quant_matches_unfused(num_tokens):
     torch.manual_seed(0)
     o = torch.randn(num_tokens, NUM_HEADS, HEAD_DIM, device="cuda").bfloat16()
     x = o.view(num_tokens, GROUPS, -1)
-    # Identity mix: one term per output, so no reduction order to differ in.
     eye = torch.eye(NUM_HEADS, device="cuda").bfloat16()
     assert postmix_quant_supported(x, eye)
     codes, scales = postmix_fp8_wo_a_quant(x, eye)

@@ -697,8 +697,8 @@ def _extra_host_region_entries(
     draft_device_pools: tuple[Any, ...],
 ) -> list[PoolEntry]:
     """FULL-page HiCache entries for the regions a pool keeps beside the
-    compressed-KV layout (``extra_host_regions``, e.g. ERNIE 5.5's MLA latent and
-    index keys); packed draft buffers follow the target's."""
+    compressed-KV layout (``extra_host_regions``); packed draft buffers follow
+    the target's."""
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 
     if not isinstance(kvcache, DeepSeekV4TokenToKVPool):
@@ -822,14 +822,13 @@ def build_deepseek_v4_hicache_stack(
         # NextN has one layer per pool, while DSpark keeps all stages in one pool.
         for pool in params.mtp_draft_device_pools:
             if isinstance(pool, DeepSeekV4TokenToKVPool) and not pool._swa_layer_ids():
-                # A draft with no SWA layer (ERNIE 5.5's NextN MLA layer) has no
-                # SWA buffer to pack.
+                # A draft with no SWA layer has no SWA buffer to pack.
                 continue
             draft_swa = _dsv4_pool_infos(pool).get(PoolName.SWA)
             if draft_swa is None:
                 raise ValueError("Packed DSV4 draft requires paged SWA storage")
             mtp_swa_device_buffers.extend(draft_swa.buffer_info.buffers)
-        # Map the SWA layers alone: ERNIE 5.5's MLA layers own no SWA buffer.
+        # Map the SWA layers alone; the MLA layers own no SWA buffer.
         swa_layer_mapping = with_packed_draft_layer_mapping(
             _dsv4_transfer_layer_mapping(swa.layer_ids, kvcache.start_layer),
             transfer_layer_start=transfer_layer_id_max,

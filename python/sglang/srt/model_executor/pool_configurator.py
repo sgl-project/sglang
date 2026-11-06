@@ -1458,7 +1458,6 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
     @property
     def num_swa_layers(self) -> int:
-        """Stage layers that keep an SWA buffer."""
         return self.num_layers_total
 
     def _get_bytes_per_swa_token(self) -> float:

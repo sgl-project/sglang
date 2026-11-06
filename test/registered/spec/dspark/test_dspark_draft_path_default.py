@@ -190,7 +190,6 @@ class TestDsparkDpAttentionMoeA2aGate(CustomTestCase):
                     _handle_dspark(self._dp_server_args(moe_a2a_backend=backend))
 
     def test_ernie55_admits_deepep_and_rejects_megamoe(self):
-        """ERNIE 5.5 Flash swaps the allowlist rather than extending it."""
         with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
             _handle_dspark(
                 self._dp_server_args(moe_a2a_backend="deepep", arch=ERNIE5_5_MOE_ARCH)

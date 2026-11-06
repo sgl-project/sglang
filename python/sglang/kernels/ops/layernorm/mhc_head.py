@@ -109,8 +109,7 @@ def fused_hc_head(
         hc_base   : (hc_mult,) fp32
         norm_eps  : RMS epsilon
         hc_eps    : additive epsilon after sigmoid
-        eps_outside_sqrt : normalize by ``1 / (sqrt(mean_sq) + eps)`` instead of
-            ``rsqrt(mean_sq + eps)``, as ``mhc_pre`` does under the same flag
+        eps_outside_sqrt : normalize by 1 / (sqrt(mean_sq) + eps), as mhc_pre does
 
     Returns:
         y : (T, hidden_size) same dtype as x

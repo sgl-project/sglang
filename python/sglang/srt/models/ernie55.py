@@ -15,19 +15,11 @@
 """ERNIE 5.5 Flash (``Ernie5_5_MoeForCausalLM``).
 
 The checkpoint's ``compress_ratios`` (``config.checkpoint_compress_ratios``)
-picks each layer's attention: ``128`` is an HCA layer (sliding window
-+ C128 compressed KV, :class:`MQALayer`), ``-2`` a full-context MLA layer
-(:class:`DeepseekV2AttentionMLA`, dims under ``hybrid_mla_*``) with a DSA
-lightning indexer. Both kinds add a learnable sink, a sigmoid output gate fed by
-the q-LoRA latent and a cross-head VHA postmix. Layers are joined by
-manifold-constrained hyper-connections (mHC); the FFN is a SiTU dense MLP for
-the first ``first_k_dense_replace`` layers and a latent MoE with a two-router
-(multi-router) gate afterwards.
-
-Both attention kinds subclass those upstream layers, and the KV pool and backend
-extend SGLang's compressed-KV attention stack (shared with DeepSeek-V4), so the
-HCA layers reuse its kernels, PD transfer and HiCache paths unchanged; the pool
-appends the MLA sub-pool's regions to both.
+picks each layer's attention: ``128`` is an HCA layer (:class:`MQALayer`), ``-2``
+a full-context MLA layer (:class:`DeepseekV2AttentionMLA`, dims under
+``hybrid_mla_*``) with a DSA indexer. Both add a sink, a sigmoid output gate and a
+VHA postmix. Layers are joined by mHC; the FFN is a SiTU dense MLP for the first
+``first_k_dense_replace`` layers and a latent multi-router MoE afterwards.
 
 :mod:`sglang.srt.configs.ernie55` glosses the checkpoint's field names (HCA,
 MLA, DSA, VHA, mHC, SiTU, ``wo_a``/``wo_b``).
@@ -126,8 +118,6 @@ from sglang.srt.utils import (
 
 
 def check_supported_deployment(config: Ernie5_5_MoeConfig) -> None:
-    """Reject the platforms and layouts this model cannot serve. Runs at model
-    construction, where the attention-TP width is final."""
     if not is_cuda():
         # The HIP / NPU prepare paths call wq_b directly and skip the gate split.
         raise ValueError("ERNIE 5.5 Flash is supported on CUDA only")
@@ -156,14 +146,11 @@ def check_supported_deployment(config: Ernie5_5_MoeConfig) -> None:
 
 
 def _heads_are_split() -> bool:
-    """Whether attention TP splits the head axis across ranks."""
     return get_parallel().attn_tp_size > 1
 
 
 def logits_rows(forward_batch: ForwardBatch) -> Optional[torch.Tensor]:
-    """Each extend segment's last token, the rows the LM head reads in a plain
-    prefill. None where other rows may be read or the rows are sharded, or while a
-    graph is captured."""
+    """Each extend segment's last token (the LM head's rows), or None."""
     if (
         forward_batch.forward_mode != ForwardMode.EXTEND
         or forward_batch._original_forward_mode == ForwardMode.IDLE
@@ -190,11 +177,7 @@ def _situ_betas(config: Ernie5_5_MoeConfig) -> Tuple[float, float]:
 
 
 class VhaPostMix(nn.Module):
-    """Cross-head low-rank mix ``o <- (I + V @ U.T) @ o`` over the head axis.
-
-    ``U``/``V`` hold one row per local head; with heads split, the ``[rank, d]``
-    latent is all-reduced over attention TP.
-    """
+    """Cross-head low-rank mix ``o <- (I + V @ U.T) @ o`` over the head axis."""
 
     def __init__(self, num_heads: int, total_heads: int):
         super().__init__()
@@ -227,13 +210,11 @@ class VhaPostMix(nn.Module):
         self.mix.copy_(torch.addmm(eye, v, u.t()))
 
     def forward(self, o: torch.Tensor) -> torch.Tensor:
-        """``o`` is any ``[T, ...]`` whose trailing dims flatten to
-        ``num_heads * d``; shape is kept."""
+        # o: [T, ...] with trailing dims flattening to num_heads * d.
         heads = o.reshape(o.shape[0], self.num_heads, -1)
         if not self.sharded:
             return torch.matmul(self.mix, heads).reshape(o.shape)
-        # fp32 end to end: a bf16 latent and residual add lose accuracy against
-        # the folded path.
+        # fp32 throughout: a bf16 latent or residual add loses accuracy vs the fold.
         heads32 = heads.float()
         latent = torch.matmul(self.vha_postmix_U.t().float(), heads32)
         latent = attn_tp_all_reduce(latent)
@@ -246,8 +227,7 @@ def _load_transposed(param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
 
 
 class Ernie5_5HcHead(nn.Module):
-    """Collapses the mHC streams into one hidden state (the checkpoint's
-    ``mhc_contract``)."""
+    """Collapses the mHC streams (the checkpoint's ``mhc_contract``)."""
 
     def __init__(self, config: Ernie5_5_MoeConfig):
         super().__init__()
@@ -276,14 +256,13 @@ class Ernie5_5HcHead(nn.Module):
 
 
 class Ernie5_5GatedQMixin:
-    """The [q_up | gate] GEMM over the q-LoRA latent, shared by the HCA and DSpark
-    attentions; the gate waits in ``self._gate`` until wo_b reads it."""
+    """[q_up | gate] GEMM over the q-LoRA latent; the gate waits in ``self._gate``
+    until wo_b reads it."""
 
     def _init_gated_wq_b(
         self, quant_config: Optional[QuantizationConfig], prefix: str
     ) -> None:
-        # One GEMM, merged so q_up shards by head and gate by output group
-        # (as wo_a / wo_b split).
+        # Merged so q_up shards by head and gate by output group, as wo_a / wo_b.
         self.q_up_local_size = self.n_local_heads * self.head_dim
         self.wq_b = MergedColumnParallelLinear(
             self.q_lora_rank,
@@ -298,7 +277,6 @@ class Ernie5_5GatedQMixin:
     def _gated_q_norm_rope(self, q_lora, positions, q_out=None):
         qg, _ = self.wq_b(q_lora)
         if self._gate is not None:
-            # Not an assert: `python -O` would turn a stale gate into wrong output.
             raise RuntimeError("previous output gate never reached wo_b")
         # Strided views; the norm+rope kernel and the gate-mul read the row stride.
         self._gate = qg[:, self.q_up_local_size :]
@@ -318,8 +296,6 @@ class Ernie5_5GatedQMixin:
 
 
 class Ernie5_5HcaAttention(Ernie5_5GatedQMixin, MQALayer):
-    """HCA attention plus ERNIE's postmix and sigmoid output gate."""
-
     def __init__(
         self,
         config: Ernie5_5_MoeConfig,
@@ -378,8 +354,7 @@ class Ernie5_5HcaAttention(Ernie5_5GatedQMixin, MQALayer):
 
 
 class Ernie5_5MlaAttention(DeepseekV2AttentionMLA):
-    """MLA with DSA sparse attention (indexer top-k + trailing window) over a
-    full-context latent cache; sink and gate go through the MLA hook points."""
+    """MLA with DSA sparse attention; sink and gate go through the MLA hooks."""
 
     def __init__(
         self,
@@ -529,8 +504,8 @@ class Ernie5_5Moe(nn.Module):
         self.num_experts = config.n_routed_experts
         latent_size = config.moe_latent_size
         self.latent_size = latent_size
-        # gate / gate_1 of the multi-router, fused into one bf16 GEMM with fp32
-        # logits, as DeepSeek-V4's router; an fp32 checkpoint rounds on load.
+        # gate and gate_1 fused into one bf16 GEMM with fp32 logits; an fp32
+        # checkpoint rounds on load.
         self.gate_weight = nn.Parameter(
             torch.empty(
                 2 * self.num_experts,
@@ -622,7 +597,6 @@ class Ernie5_5Moe(nn.Module):
             and get_is_capture_mode()
             and not is_in_breakable_cuda_graph()
         ):
-            # The shared expert is independent of routing; run it alongside.
             self.alt_stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(self.alt_stream):
                 shared = self.shared_experts(hidden_states)
@@ -633,7 +607,6 @@ class Ernie5_5Moe(nn.Module):
             and get_is_extend_in_batch()
         ):
             in_dispatch = self._shared_experts_in_dispatch(hidden_states)
-        # Each half of the router scores its own sigmoid; the halves add (in _route).
         topk_output = self.topk(
             hidden_states, linear_bf16_fp32(hidden_states, self.gate_weight)
         )
@@ -655,9 +628,8 @@ class Ernie5_5Moe(nn.Module):
         return routed + shared
 
     def _shared_experts_in_dispatch(self, hidden_states: torch.Tensor) -> list:
-        """Compute the shared expert in the eager DeepEP dispatch hook, after the
-        input is quantized and before the all-to-all, while the SMs idle. The
-        returned list holds the output once the hook ran."""
+        """Run the shared expert in the eager DeepEP dispatch hook (after quantize,
+        before the all-to-all); the returned list holds the output once it ran."""
         result = []
 
         def hook(dispatcher):
@@ -731,7 +703,6 @@ class Ernie5_5DecoderLayer(nn.Module):
         return Ernie5_5HcaAttention(config, layer_id, quant_config, prefix, alt_streams)
 
     def _hc_pre(self, residual, fn, scale, base, norm):
-        """Mix the ``hc_mult`` streams into one normalized layer input."""
         if residual.shape[0] == 0:
             hc = self.hc_mult
             return (
@@ -765,8 +736,7 @@ class Ernie5_5DecoderLayer(nn.Module):
         return mhc_post(x, residual, post, comb)
 
     def ffn_reads_own_rows(self) -> bool:
-        """True if each row's FFN output depends on that row alone (no DP gather),
-        so rows can be skipped."""
+        """True if each row's FFN output depends on that row alone."""
         return (
             self._dense_replicated
             or get_parallel().attn_dp_size == 1
@@ -777,11 +747,8 @@ class Ernie5_5DecoderLayer(nn.Module):
         )
 
     def _forward_ffn(self, x: torch.Tensor, forward_batch: ForwardBatch):
-        """With attention DP the FFN runs on every DP rank's tokens, except an
-        all-to-all MoE, which routes each rank's own."""
         if isinstance(self.mlp, Ernie5_5Moe) and not get_moe_a2a_backend().is_none():
             if not _heads_are_split():
-                # The all-to-all routes each rank's own tokens; the rest is per token.
                 return self.mlp(x)
             if forward_batch.attn_tp_sequence_sharded:
                 return self._forward_moe_attn_tp_shard(x)
@@ -812,10 +779,9 @@ class Ernie5_5DecoderLayer(nn.Module):
         return out
 
     def _forward_moe_attn_tp_shard(self, x: torch.Tensor) -> torch.Tensor:
-        """An all-to-all MoE under split heads: every attention-TP rank holds the
-        same rows, but the dispatcher bounds each rank to its own contiguous
-        ``rows / attn_tp_size`` slice (``num_token_non_padded``); route that slice
-        and all-gather the outputs back."""
+        """An all-to-all MoE under split heads: the dispatcher bounds each
+        attention-TP rank to its own ``rows / attn_tp_size`` slice
+        (``num_token_non_padded``); route that slice and all-gather."""
         attn_tp = get_parallel().attn_tp_size
         if x.shape[0] % attn_tp:
             raise RuntimeError(
@@ -829,8 +795,8 @@ class Ernie5_5DecoderLayer(nn.Module):
         return out
 
     def _forward_ffn_no_dp(self, x: torch.Tensor, forward_batch: ForwardBatch):
-        """Without attention DP, prefill-CP shards are gathered over the MoE-CP group
-        (an alias of attention CP here) so the TP-group reduce sums one token set."""
+        """Gather prefill-CP shards over the MoE-CP group (an alias of attention CP
+        here) so the TP-group reduce sums one token set."""
         if is_enable_moe_cp_allgather():
             rows = moe_cp_gathered_rows(forward_batch)
             if rows is not None:
@@ -912,7 +878,6 @@ class Ernie5_5Model(nn.Module):
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
             self.hc_head = Ernie5_5HcHead(config)
-        # Layers whose output feeds a DSpark draft; see set_dspark_layers_to_capture.
         self.dspark_layers_to_capture: Optional[list[int]] = None
 
     def forward(
@@ -970,8 +935,6 @@ class Ernie5_5Model(nn.Module):
 
 
 class Ernie5_5LogitsProcessor(LogitsProcessor):
-    """Applies the learned piecewise "multimax" activation to the logits."""
-
     def __init__(self, config: Ernie5_5_MoeConfig):
         super().__init__(config)
         self.multimax_ranges = nn.Parameter(torch.zeros(4, dtype=torch.bfloat16))
@@ -1083,8 +1046,7 @@ class Ernie5_5_MoeForCausalLM(nn.Module):
         self.post_load_weights()
 
     def post_load_weights(self) -> None:
-        # The MLA layers' kv_b_proj split into w_kc / w_vc (HCA layers have none),
-        # reused as a function rather than inherited.
+        # Splits the MLA layers' kv_b_proj into w_kc / w_vc (HCA layers have none).
         DeepseekV2WeightLoaderMixin.post_load_weights(self)
         for layer in self.model.layers[self.start_layer : self.end_layer]:
             layer.self_attn.postmix.fold()
@@ -1095,7 +1057,6 @@ _WO_A_BLOCK = 128
 
 
 def _quantize_wo_a(attn: Ernie5_5HcaAttention, weight: torch.Tensor) -> None:
-    """Block-quantize a bf16 checkpoint's ``wo_a`` per attention group."""
     from sglang.srt.layers.quantization.fp8_utils import per_block_cast_to_fp8
 
     groups, rank = attn.n_local_groups, attn.o_lora_rank
@@ -1117,7 +1078,6 @@ def _quantize_wo_a(attn: Ernie5_5HcaAttention, weight: torch.Tensor) -> None:
 def _load_fp8_wo_a(
     attn: Ernie5_5HcaAttention, weight: torch.Tensor, scale: torch.Tensor
 ) -> None:
-    """Load an offline-quantized ``wo_a``: e4m3 weight, fp32 128x128 block scale."""
     groups, rank = attn.n_local_groups, attn.o_lora_rank
     total_rows, in_dim = weight.shape
     expected = [total_rows // _WO_A_BLOCK, -(-in_dim // _WO_A_BLOCK)]
@@ -1142,8 +1102,7 @@ def _load_fp8_wo_a(
 def _store_fp8_wo_a(
     attn: Ernie5_5HcaAttention, weight: torch.Tensor, scale: torch.Tensor
 ) -> None:
-    """Write a rank's fp8 ``wo_a`` and its ``[groups, rank / 128, in / 128]``
-    scale into the layout ``fp8_einsum`` reads."""
+    """Write a rank's fp8 ``wo_a`` and its scale in the layout ``fp8_einsum`` reads."""
     wo_a = attn.wo_a
     # In place: a captured CUDA graph holds the weight's address.
     wo_a.weight.data.copy_(weight)
@@ -1169,8 +1128,7 @@ def _store_fp8_wo_a(
 
 
 class Ernie5_5WeightLoader:
-    """Maps the checkpoint names onto the module tree; fails on unmapped tensors
-    and on parameters left unloaded."""
+    """Maps checkpoint names onto the module tree; fails on unloaded parameters."""
 
     # Checkpoint tensors stacked into one parameter: suffix -> (param, stack index).
     _HCA_STACKED = {
@@ -1320,7 +1278,6 @@ class Ernie5_5WeightLoader:
     def _load_layer_tensor(
         self, prefix: str, layer_id: int, suffix: str, tensor: torch.Tensor
     ) -> None:
-        """One decoder layer's checkpoint tensor; ``prefix`` names its module."""
         if self._load_hc(prefix, suffix, tensor):
             return
         if suffix.startswith("block_sparse_moe.experts."):

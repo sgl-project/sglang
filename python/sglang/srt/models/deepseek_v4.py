@@ -2949,8 +2949,6 @@ class MQALayer(MqaAttentionBase):
         return self._project_wo_b(o, defer_all_reduce)
 
     def _project_wo_a(self, o, *, positions, forward_batch, inv_rope, wo_a_quant_freqs):
-        """Grouped ``wo_a`` over the ``[T, n_local_heads, head_dim]`` attention
-        output, which is still before its inverse RoPE."""
         if wo_a_quant_freqs is not None:
             # the decode already returned the wo_a mxfp8 (codes, scales)
             G = self.n_local_groups

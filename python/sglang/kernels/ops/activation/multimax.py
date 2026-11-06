@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""The "multimax" logit activation (used by ERNIE 5.5 Flash) in one pointwise launch.
+"""The "multimax" logit activation in one pointwise launch.
 
 ``x + t0*relu(r0-x) + t1*relu(x-r1) + t2*relu(r2-x)^2 + t3*relu(x-r3)^2`` with
 every primitive rounded to bf16, so it is bit-identical to the eager spelling,

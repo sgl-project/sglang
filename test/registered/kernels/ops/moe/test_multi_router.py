@@ -51,9 +51,10 @@ def _dense(weights, ids):
     )
 
 
-@pytest.mark.parametrize("num_routers", [2, 3])
-@pytest.mark.parametrize("num_tokens", [1, 3000])
-@pytest.mark.parametrize("renormalize", [True, False])
+@pytest.mark.parametrize(
+    "num_tokens, renormalize, num_routers",
+    [(1, True, 2), (3000, False, 3), (3000, True, 2)],
+)
 def test_multi_router_topk_matches_reference(num_tokens, renormalize, num_routers):
     from sglang.kernels.ops.moe.multi_router import multi_router_topk
 

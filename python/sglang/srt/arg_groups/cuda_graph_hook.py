@@ -193,7 +193,6 @@ def disable_breakable_cudagraph_if_incompatible(server_args: Any):
         # DSV4 is BCG-compatible but introduces heavy memory pressure: the
         # c4 indexer scratch is pinned in the capture pool and OOMs. The
         # supported CP path captures a smaller rank-local body.
-        # ERNIE 5.5 Flash inherits this via the shared pool; not validated separately.
         (
             "compressed-KV attention (DeepSeek-V4, ERNIE 5.5 Flash)",
             lambda: (

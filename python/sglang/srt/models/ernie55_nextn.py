@@ -104,8 +104,6 @@ class Ernie5_5ModelNextN(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Returns the normed hidden states and the pre-head mHC streams
-        (``hidden_states_before_norm``)."""
         hc_mult, hidden_size = self.config.hc_mult, self.config.hidden_size
         x = self.embed_tokens(input_ids) if input_embeds is None else input_embeds
         num_tokens = x.shape[0]
@@ -209,16 +207,13 @@ class Ernie5_5_MoeForCausalLMNextN(nn.Module):
         self.post_load_weights()
 
     def post_load_weights(self) -> None:
-        # The kv_b_proj split of the one MLA layer, at model.decoder, reused as a
-        # function rather than inherited.
+        # Splits kv_b_proj of the one MLA layer, model.decoder.
         DeepseekV2WeightLoaderMixin.post_load_weights(self, is_nextn=True)
         self.model.decoder.self_attn.postmix.fold()
 
 
 class _Ernie5_5NextNWeightLoader(Ernie5_5WeightLoader):
-    """Loads checkpoint layer ``mtp_checkpoint_layer_id`` as ``model.decoder``."""
-
-    # The layer's own tensors that sit outside the decoder.
+    # Checkpoint tensors that sit outside the decoder.
     _OUTER = {
         "e_proj.weight": "model.e_proj.weight",
         "e_proj.weight_scale_inv": "model.e_proj.weight_scale_inv",

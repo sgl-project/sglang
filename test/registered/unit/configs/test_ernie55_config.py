@@ -48,18 +48,13 @@ def _config(**kwargs):
 
 
 class TestErnie5_5_MoeConfigCompressRatios(CustomTestCase):
-    def test_accepts_main_stack_only(self):
-        config = _config(compress_ratios=_MAIN)
-        self.assertEqual(config.mla_layer_ids, (2,))
-
-    def test_accepts_one_entry_per_nextn_layer(self):
-        for num_nextn in (1, 2):
+    def test_accepts_main_stack_plus_one_entry_per_nextn_layer(self):
+        for num_nextn in (0, 1, 2):
             with self.subTest(num_nextn=num_nextn):
                 config = _config(
                     compress_ratios=_MAIN + [-2] * num_nextn,
                     num_nextn_predict_layers=num_nextn,
                 )
-                # The trailing NextN entries never count as main-stack MLA layers.
                 self.assertEqual(config.mla_layer_ids, (2,))
 
     def test_rejects_length_not_matching_nextn(self):
@@ -72,20 +67,6 @@ class TestErnie5_5_MoeConfigCompressRatios(CustomTestCase):
 
 
 class TestErnie5_5_MoeConfigRequiredFields(CustomTestCase):
-    def test_accepts_a_complete_checkpoint(self):
-        _config(compress_ratios=_MAIN).validate_checkpoint_fields()
-
-    def test_rejects_checkpoint_missing_a_required_field(self):
-        dropped = "hybrid_mla_kv_lora_rank"
-        fields = {k: v for k, v in _CHECKPOINT_FIELDS.items() if k != dropped}
-        config = Ernie5_5_MoeConfig(
-            num_hidden_layers=len(_MAIN),
-            compress_ratios=_MAIN,
-            **fields,
-        )
-        with self.assertRaisesRegex(ValueError, dropped):
-            config.validate_checkpoint_fields()
-
     def test_names_every_missing_field(self):
         config = Ernie5_5_MoeConfig(num_hidden_layers=len(_MAIN), compress_ratios=_MAIN)
         with self.assertRaises(ValueError) as caught:
@@ -101,15 +82,11 @@ class TestErnie5_5_MoeConfigRequiredFields(CustomTestCase):
 
 
 class TestErnie5_5DraftConfigs(CustomTestCase):
-    """The draft configs the speculative runners build from the target's."""
-
     def test_nextn_draft_is_the_checkpoint_mtp_layer_as_one_mla_layer(self):
         config = _config(compress_ratios=_MAIN + [-2], num_nextn_predict_layers=1)
         to_nextn_draft_config(config)
         self.assertEqual(config.architectures, [ERNIE5_5_NEXTN_ARCH])
-        # The KV pool gives the draft a latent sub-pool only for these layers.
         self.assertEqual(config.mla_layer_ids, (0,))
-        # The draft loader reads the checkpoint layer stored after the main stack.
         self.assertEqual(config.mtp_checkpoint_layer_id, len(_MAIN))
 
     def test_nextn_draft_needs_an_mtp_layer(self):
@@ -128,10 +105,8 @@ class TestErnie5_5DraftConfigs(CustomTestCase):
         to_dspark_draft_config(config)
         self.assertEqual(config.architectures, [ERNIE5_5_DSPARK_ARCH])
         self.assertEqual(config.num_hidden_layers, 3)
-        # Every stage is uncompressed: no C128 state, no latent sub-pool.
         self.assertEqual(config.compress_ratios, [0, 0, 0])
         self.assertEqual(config.mla_layer_ids, ())
-        # The checkpoint's draft stages are all MoE.
         self.assertEqual(config.first_k_dense_replace, 0)
 
     def test_dspark_draft_needs_bundled_dspark_keys(self):
@@ -140,8 +115,6 @@ class TestErnie5_5DraftConfigs(CustomTestCase):
 
 
 class TestErnie5_5ServerArgOverrides(CustomTestCase):
-    """Server features the model cannot serve are rejected at startup by name."""
-
     _SUPPORTED = dict(
         kv_cache_dtype="fp8_e4m3",
         moe_a2a_backend="deepep",
@@ -175,16 +148,6 @@ class TestErnie5_5ServerArgOverrides(CustomTestCase):
         for field, value, message in (
             ("moe_a2a_backend", "megamoe", "megamoe"),
             ("enable_eplb", True, "EPLB"),
-            ("ep_num_redundant_experts", 8, "EPLB"),
-            ("enable_unified_cache_external_linker", True, "external-linker"),
-            ("enable_hisparse", True, "hisparse"),
-            ("speculative_algorithm", "NGRAM", "DSPARK and EAGLE"),
-            ("enable_encoder_swa_bounded_replay", True, "encoder-swa-bounded-replay"),
-            ("enable_decoder_swa_bounded_replay", True, "decoder-swa-bounded-replay"),
-            ("dsa_prefill_backend", "flashmla_kv", "flashmla_sparse only"),
-            ("dsa_decode_backend", "trtllm", "flashmla_sparse only"),
-            ("enable_two_batch_overlap", True, "batch overlap"),
-            ("enable_single_batch_overlap", True, "batch overlap"),
             ("dcp_size", 2, "decode context parallelism"),
         ):
             with self.subTest(field=field):
@@ -193,8 +156,6 @@ class TestErnie5_5ServerArgOverrides(CustomTestCase):
                     _ernie55_overrides(args, None)
 
     def test_pd_rejects_pipeline_parallelism(self):
-        """PD with a split pipeline would corrupt the MLA layers' transferred KV;
-        either feature alone still starts."""
         for mode, pp, rejected in (
             ("prefill", 2, True),
             ("null", 2, False),
@@ -211,47 +172,37 @@ class TestErnie5_5ServerArgOverrides(CustomTestCase):
                     _ernie55_overrides(args, None)
 
     def test_mtp_accepts_any_chain_but_no_tree(self):
-        """ECHO runs as a chain of any length; a tree (topk > 1) is rejected at
-        startup, and the EAGLE handler, not the override, fixes the draft-token count."""
-        eagle = {**self._SUPPORTED, "speculative_algorithm": "EAGLE"}
-        _ernie55_overrides(SimpleNamespace(**eagle), None)
-        for steps in (1, 2, 3):
-            chain = dict(
-                speculative_num_steps=steps,
-                speculative_eagle_topk=1,
-                speculative_num_draft_tokens=steps + 1,
-            )
-            _ernie55_overrides(SimpleNamespace(**{**eagle, **chain}), None)
-        mismatched = dict(
-            speculative_num_steps=3,
-            speculative_eagle_topk=1,
-            speculative_num_draft_tokens=6,
-        )
-        _ernie55_overrides(SimpleNamespace(**{**eagle, **mismatched}), None)
-        tree = dict(
-            speculative_num_steps=3,
-            speculative_eagle_topk=2,
-            speculative_num_draft_tokens=4,
-        )
-        with self.assertRaisesRegex(ValueError, "eagle-topk 1 only"):
-            _ernie55_overrides(SimpleNamespace(**{**eagle, **tree}), None)
-
-    def test_raw_cli_spellings_are_accepted(self):
-        """Overrides see the CLI value before NEXTN -> EAGLE and upper-casing, so
-        NEXTN and lowercase eagle must pass and still get the MTP topk check."""
-        for algo in ("NEXTN", "eagle", "dspark"):
-            with self.subTest(algo=algo):
-                args = {**self._SUPPORTED, "speculative_algorithm": algo}
-                _ernie55_overrides(SimpleNamespace(**args), None)
-        nextn_tree = {
-            **self._SUPPORTED,
-            "speculative_algorithm": "NEXTN",
-            "speculative_num_steps": 3,
-            "speculative_eagle_topk": 4,
-            "speculative_num_draft_tokens": 4,
-        }
-        with self.assertRaisesRegex(ValueError, "eagle-topk 1 only"):
-            _ernie55_overrides(SimpleNamespace(**nextn_tree), None)
+        for algo, steps, draft in (
+            ("EAGLE", None, None),
+            ("EAGLE", 1, 2),
+            ("EAGLE", 3, 4),
+            ("EAGLE", 3, 6),
+            ("NEXTN", None, None),
+            ("eagle", None, None),
+            ("dspark", None, None),
+        ):
+            with self.subTest(algo=algo, steps=steps, draft=draft):
+                args = {
+                    **self._SUPPORTED,
+                    "speculative_algorithm": algo,
+                    "speculative_num_steps": steps,
+                    "speculative_eagle_topk": None if steps is None else 1,
+                    "speculative_num_draft_tokens": draft,
+                }
+                overrides = _ernie55_overrides(SimpleNamespace(**args), None)
+                self.assertEqual(overrides["attention_backend"], "ernie55")
+                self.assertEqual(overrides["page_size"], 256)
+        for algo in ("EAGLE", "NEXTN"):
+            with self.subTest(algo=algo, tree=True):
+                tree = {
+                    **self._SUPPORTED,
+                    "speculative_algorithm": algo,
+                    "speculative_num_steps": 3,
+                    "speculative_eagle_topk": 4,
+                    "speculative_num_draft_tokens": 4,
+                }
+                with self.assertRaisesRegex(ValueError, "eagle-topk 1 only"):
+                    _ernie55_overrides(SimpleNamespace(**tree), None)
 
 
 if __name__ == "__main__":

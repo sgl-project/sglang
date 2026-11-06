@@ -123,8 +123,6 @@ class TestSituMulQuantContig(CustomTestCase):
             raise unittest.SkipTest("UE8M0 activation scales are Blackwell-only")
 
     def test_ue8m0_scale_is_the_one_used_to_quantize(self):
-        """The stored scale is the power of two the codes were divided by, so
-        dequantizing with its e8m0 cast recovers the activation."""
         import triton
 
         from sglang.srt.layers.moe.moe_runner.deep_gemm import (

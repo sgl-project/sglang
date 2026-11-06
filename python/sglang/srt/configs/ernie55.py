@@ -65,7 +65,6 @@ _REQUIRED_CHECKPOINT_FIELDS = (
     "routed_scaling_factor_learnable",
 )
 
-# Fields whose only supported value the model hard-codes.
 _REQUIRED_CHECKPOINT_VALUES = {
     "hidden_act": "situ",
     "latent_moe_use_norm": True,
@@ -78,11 +77,7 @@ _REQUIRED_CHECKPOINT_VALUES = {
 
 
 def to_dspark_draft_config(hf_config) -> None:
-    """Reshape a target config, in place, into the DSpark draft's it bundles.
-
-    The draft (``model.mtp.*`` in the checkpoint) has one MoE stage per target layer
-    it reads, each attending uncompressed over the draft's own KV.
-    """
+    """Reshape a target config, in place, into the DSpark draft's it bundles."""
     from sglang.srt.speculative.dspark_components.dspark_config import (
         checkpoint_bundles_dspark_draft,
     )
@@ -96,7 +91,6 @@ def to_dspark_draft_config(hf_config) -> None:
     hf_config.architectures = [ERNIE5_5_DSPARK_ARCH]
     hf_config.num_hidden_layers = num_stages
     hf_config.first_k_dense_replace = 0
-    # Ratio 0 is a layer with no compressed KV, and no MLA layer.
     hf_config.compress_ratios = [0] * num_stages
     hf_config.checkpoint_compress_ratios = [0] * num_stages
     # The HCA backend accepts 512 or 1024; the draft has no DSA layer.
@@ -119,7 +113,6 @@ def to_nextn_draft_config(hf_config) -> None:
             f"compress ratio {ratios[mtp_layer]}"
         )
     hf_config.architectures = [ERNIE5_5_NEXTN_ARCH]
-    # The draft's weight loader reads the layer the checkpoint stores it under.
     hf_config.mtp_checkpoint_layer_id = mtp_layer
     hf_config.num_hidden_layers = 1
     hf_config.first_k_dense_replace = 0
@@ -142,14 +135,12 @@ class Ernie5_5_MoeConfig(PretrainedConfig):
         rope_scaling: Optional[dict] = None,
         **kwargs,
     ):
-        # The main-stack RoPE in the standardized form the model reads.
         rs = rope_scaling or {}
         kwargs.setdefault(
             "rope_parameters",
             {
                 **rs,
                 "rope_theta": rope_theta,
-                # Accept both "type" and "rope_type".
                 "rope_type": rs.get("rope_type", rs.get("type", "default")),
             },
         )

@@ -99,9 +99,7 @@ class _StageLocalLayerCounter:
 class Ernie5_5TokenToKVPool(DeepSeekV4TokenToKVPool):
     @staticmethod
     def stage_kwargs(hf_config, start_layer: int, end_layer: int) -> dict:
-        """The arguments beyond the compressed-KV pool's, for one pipeline stage."""
         return dict(
-            # Only this pipeline stage's MLA layers get latent storage.
             mla_layer_ids=[
                 i for i in hf_config.mla_layer_ids if start_layer <= i < end_layer
             ],
@@ -124,7 +122,6 @@ class Ernie5_5TokenToKVPool(DeepSeekV4TokenToKVPool):
         # Read by _swa_layer_ids, which the base __init__ calls.
         self._mla_layer_ids = frozenset(mla_layer_ids)
         super().__init__(**dsv4_kwargs)
-        # Global layer id -> SWA buffer index.
         self._swa_buffer_index = {
             layer: index for index, layer in enumerate(self._swa_layer_ids())
         }
@@ -220,7 +217,6 @@ class Ernie5_5TokenToKVPool(DeepSeekV4TokenToKVPool):
         return data_ptrs, data_lens, item_lens
 
     def extra_host_regions(self) -> tuple[ExtraHostRegion, ...]:
-        """The latent and index-K regions, as ``[pages, bytes per page]`` views."""
         views: dict[PoolName, list[tuple[int, torch.Tensor]]] = {}
         for pool_name, layer_id, buf, item_len in self._mla_page_regions():
             # The allocator never hands out a trailing page that does not fit whole.

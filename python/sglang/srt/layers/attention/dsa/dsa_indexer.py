@@ -324,8 +324,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         self.block_size = block_size
         self.scale_fmt = scale_fmt
         self.use_fp4_indexer = get_exec().kernel.enable_fp4_indexer
-        # V3.2 fuses adjacent-pair rope without the Hadamard rotation; a NeoX
-        # model keeps the rotation, which the fused kernels then apply too.
         self.fused_indexer_hadamard = is_neox_style
         self.use_dsa_indexer_fusion = (
             _is_cuda
@@ -774,8 +772,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         return q_fp8, weights.unsqueeze(-1)
 
     def _maybe_rotate(self, x: torch.Tensor) -> torch.Tensor:
-        # Match the fused writers, which decode reads back: the V3.2 fused paths
-        # omit Hadamard, the NeoX one keeps it.
+        # Match the fused writers decode reads back: V3.2's omit Hadamard,
+        # NeoX keeps it.
         if (
             self.use_aiter_fused_fp8_writer
             or not self.apply_hadamard
@@ -1156,7 +1154,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         )
 
     def _quantize_query(self, query: torch.Tensor, act_quant):
-        """Keep FP4 scales with Q; FP8 scales are folded into the head gates."""
         if self.use_fp4_indexer:
             q, sf = quantize_fp4_indexer_tensor(query, rne=True)
             return (

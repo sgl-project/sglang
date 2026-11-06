@@ -1,7 +1,6 @@
 // DSA indexer K kernels: single-head LayerNorm (not RMS), ropes the leading
 // kRopeDim dims, and fp8-quantizes the rotated activations. V3.2 drops the
 // Hadamard incoherence rotation; it is logit-preserving (see main_norm_rope.cuh).
-// ERNIE 5.5 keeps it and ropes NeoX pairs (kHadamard, kNeoxStyle).
 //
 // Independent of the wk + weights_proj GEMM fusion (dsa_indexer.py): `k_input`
 // here is the non-contiguous wk slice kw[:, :head_dim] read via
@@ -126,7 +125,7 @@ K_INDEXER_KERNEL void fused_k_indexer_norm_rope(const __grid_constant__ FusedKIn
     }
   }
 
-  // part 2: rope. Adjacent pairs stay in-lane; NeoX pairs cross lanes.
+  // part 2: rope
   if constexpr (kNeoxStyle) {
     dsa_indexer::apply_neox_rope<kRopeSize>(data, freq, freq_sin, lane_id, is_rope_lane);
   } else if (is_rope_lane) {
@@ -313,7 +312,7 @@ K_INDEXER_KERNEL void fused_k_indexer_norm_rope_store(const __grid_constant__ Fu
     }
   }
 
-  // part 2: rope. Adjacent pairs stay in-lane; NeoX pairs cross lanes.
+  // part 2: rope
   if constexpr (kNeoxStyle) {
     dsa_indexer::apply_neox_rope<kRopeSize>(data, freq, freq_sin, lane_id, is_rope_lane);
   } else if (is_rope_lane) {

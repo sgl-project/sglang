@@ -59,7 +59,6 @@ def fused_k_indexer_norm_rope(
     neox_style: bool = False,
 ) -> torch.Tensor:
     """Indexer K: LayerNorm + RoPE on leading dims (+ 128-pt Hadamard) -> bf16.
-    V3.2 uses the defaults; ERNIE 5.5 passes ``hadamard=True, neox_style=True``.
     CUDA only."""
     # k_input may be a non-contiguous wk slice; output is always contiguous.
     k_out = torch.empty(k_input.shape, dtype=k_input.dtype, device=k_input.device)

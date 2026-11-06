@@ -1176,7 +1176,6 @@ class ModelConfig:
                 self.hf_config.num_nextn_predict_layers = 1
 
         if is_draft_model and self.hf_config.architectures[0] == ERNIE5_5_MOE_ARCH:
-            # The model override admits DSPARK and EAGLE (MTP) only.
             if self.speculative_algorithm == "DSPARK":
                 to_dspark_draft_config(self.hf_config)
             else:

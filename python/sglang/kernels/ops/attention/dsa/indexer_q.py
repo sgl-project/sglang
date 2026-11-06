@@ -13,8 +13,7 @@ from sglang.kernels.jit.utils import (
 from sglang.kernels.ops.attention.dsv4.utils import make_name
 
 
-# V3.2 and ERNIE 5.5 lay q out as [rope | nope] (V4 is [nope | rope]) ->
-# kRopeFirst=true. V3.2 drops the Hadamard rotation; ERNIE keeps it and ropes NeoX pairs.
+# Indexer q is laid out [rope | nope] (V4 is [nope | rope]) -> kRopeFirst=true.
 @cache_once
 def _jit_main_q_indexer_rope_first_quant_module(
     dtype: torch.dtype, hadamard: bool, neox_style: bool
@@ -45,7 +44,6 @@ def fused_q_indexer_rope_first_quant(
     neox_style: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Indexer Q: RoPE on the leading dims (+ 128-pt Hadamard) + fp8 act-quant.
-    V3.2 uses the defaults; ERNIE 5.5 passes ``hadamard=True, neox_style=True``.
     CUDA only."""
     q_fp8 = torch.empty(q_input.shape, dtype=torch.float8_e4m3fn, device=q_input.device)
     weights_out = torch.empty(

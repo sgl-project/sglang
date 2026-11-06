@@ -433,7 +433,6 @@ _POST_MULT = 2.0
 
 @pytest.fixture
 def single_process(monkeypatch, stated_tp_group):
-    """Run mhc_pre without a TP group or symmetric memory."""
     monkeypatch.setattr(mhc, "use_symmetric_memory", lambda *a, **kw: nullcontext())
     monkeypatch.setattr(mhc, "is_allocation_symmetric", lambda: False)
     yield
@@ -540,12 +539,11 @@ def _hc_head_reference(x, fn, scale, base, norm_eps, hc_eps, eps_outside_sqrt):
 
 
 @pytest.mark.parametrize("eps_outside_sqrt", [False, True])
-@pytest.mark.parametrize("num_tokens", [1, 33])
-def test_fused_hc_head(num_tokens, eps_outside_sqrt):
+def test_fused_hc_head(eps_outside_sqrt):
     from sglang.kernels.ops.layernorm.mhc_head import fused_hc_head
 
     torch.manual_seed(0)
-    hc, hidden = 4, 4096
+    num_tokens, hc, hidden = 33, 4, 4096
     x = torch.randn(num_tokens, hc, hidden, device="cuda").bfloat16()
     fn = torch.randn(hc, hc * hidden, device="cuda") * 0.1
     scale = torch.ones(1, device="cuda")

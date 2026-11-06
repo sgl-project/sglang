@@ -14,9 +14,9 @@
 # ==============================================================================
 """The DSpark draft an ERNIE 5.5 Flash checkpoint bundles under ``model.mtp.*``.
 
-Each stage is an ERNIE MoE decoder layer whose attention is the uncompressed
-DSpark draft attention plus ERNIE's output gate and VHA postmix; stage 0
-also projects the target's captured hidden states into every stage's KV.
+Each stage is an ERNIE MoE decoder layer with the uncompressed DSpark draft
+attention; stage 0 also projects the target's captured hidden states into every
+stage's KV.
 :func:`sglang.srt.configs.ernie55.to_dspark_draft_config` reshapes the target
 config into this one.
 """
@@ -70,9 +70,6 @@ from sglang.srt.utils import add_prefix
 
 
 class Ernie5_5DSparkAttention(Ernie5_5GatedQMixin, DSparkAttention):
-    """The DSpark draft attention with ERNIE's merged [q_up | gate]
-    GEMM, sigmoid output gate and VHA postmix."""
-
     def __init__(
         self,
         config: Ernie5_5_MoeConfig,
@@ -280,8 +277,8 @@ class Ernie5_5_MoeForCausalLMDSpark(nn.Module):
     def project_commit_kv(
         self, *, main_hidden: torch.Tensor, pool: DeepSeekV4TokenToKVPool
     ) -> List[torch.Tensor]:
-        """The context rows' per-stage KV before norm / rope / store; the deferred
-        commit runs it before the accept decides which rows are committed."""
+        """The context rows' per-stage KV before norm / rope / store, computed
+        before the accept decides which rows are committed."""
         main_x = self.project_target_hidden(main_hidden)
         return CommitKvProj.execute(
             main_x=main_x,
@@ -387,8 +384,6 @@ class Ernie5_5_MoeForCausalLMDSpark(nn.Module):
 
 
 class _Ernie5_5DSparkWeightLoader(Ernie5_5WeightLoader):
-    """Loads the draft from ``model.mtp.*``; every target tensor is skipped."""
-
     # The draft attention keeps wq_a and wkv apart, which _HCA_UNFUSED_QKV_A loads.
     _HCA_STACKED = {}
     _DRAFT_RENAMES = {

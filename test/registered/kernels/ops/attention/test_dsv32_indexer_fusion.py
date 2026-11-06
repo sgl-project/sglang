@@ -5,9 +5,6 @@ Covers:
   - fused_k_indexer_norm_rope             (K: LayerNorm + rope-first -> bf16)
   - fused_k_indexer_norm_rope_store       (K: the above + fp8 quant + paged index-k cache write)
 
-each in the V3.2 form (adjacent-pair rope, no Hadamard) and the ERNIE 5.5 form
-(NeoX rope + 128-pt Hadamard).
-
 The store kernel is checked for byte-exact equivalence against the un-fused path
 (bf16 K kernel + standalone fused_store_index_k_cache), so it needs no fp8
 reference. The Q/K math kernels are checked against torch references. Strided
@@ -273,12 +270,7 @@ def test_indexer_uses_replaced_rope_cache_for_fused_kernels():
     assert ((q_fp8.float() * scale - q_ref).abs() <= 0.0625 * q_ref.abs() + scale).all()
 
 
-# ----------------------------------------------------------------------------
-# NeoX rope + Hadamard (ERNIE 5.5), against a torch reference of NeoX rope
-# followed by the Sylvester-order Hadamard.
-# ----------------------------------------------------------------------------
 def _rope_neox(x, cos_p, sin_p):
-    """NeoX rope on the leading ROPE_DIM dims: dim d pairs with d + HALF."""
     x = x.clone()
     x1 = x[..., :HALF].clone()
     x2 = x[..., HALF:ROPE_DIM].clone()

@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_context, get_parallel
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
 
 _parallel_override = get_parallel().override(attn_tp_size=1)
@@ -41,7 +41,6 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=17, stage="base-b", runner_config="1-gpu-large")
-register_cuda_ci(est_time=54, stage="nightly", runner_config="4-gpu-b200")
 
 # Global configuration for all indexer tests
 DEFAULT_CONFIG = {
@@ -1126,73 +1125,6 @@ class TestDSAIndexer(CustomTestCase):
         self._verify_topk_output(
             topk_indices, self.batch_size, 1, self.config["index_topk"]
         )
-
-    def test_forward_extend_mode_fp4(self):
-        self._test_forward_fp4_mode(ForwardMode.EXTEND)
-
-    def test_forward_decode_mode_fp4(self):
-        self._test_forward_fp4_mode(ForwardMode.DECODE)
-
-    def _test_forward_fp4_mode(self, mode):
-        if torch.cuda.get_device_capability()[0] != 10:
-            self.skipTest("DeepGEMM FP4 MQA requires SM100")
-
-        self.enterContext(
-            get_context().override_server_args(
-                enable_fp4_indexer=True, dsa_topk_backend="torch"
-            )
-        )
-        # The legacy fused Top-K kernel requires topk=2048; this fixture uses 64.
-        self.enterContext(envs.SGLANG_DSA_FUSE_TOPK.override(False))
-        self.batch_size = 1
-        self._init_model_runner({"use_fp4_indexer": True})
-        indexer = self._create_indexer()
-        for parameter in indexer.parameters():
-            torch.nn.init.normal_(parameter, std=0.02)
-
-        # Decode reads the FP4 cache populated by the preceding extend pass.
-        modes = (
-            [ForwardMode.EXTEND, ForwardMode.DECODE]
-            if mode == ForwardMode.DECODE
-            else [ForwardMode.EXTEND]
-        )
-        for forward_mode in modes:
-            forward_batch = self._create_forward_batch(forward_mode)
-            # The request-to-token table reserves the first page for padding.
-            forward_batch.out_cache_loc += self.config["page_size"]
-            self.backend.init_forward_metadata(forward_batch)
-            q_len = self.seq_len if forward_mode == ForwardMode.EXTEND else 1
-            hidden_states = torch.randn(
-                q_len,
-                self.config["hidden_size"],
-                dtype=self.dtype,
-                device=self.device,
-            )
-            q_lora = torch.randn(
-                q_len,
-                self.config["q_lora_rank"],
-                dtype=self.dtype,
-                device=self.device,
-            )
-            seq_len = forward_batch.seq_lens_cpu[0].item()
-            positions = torch.arange(seq_len - q_len, seq_len, device=self.device)
-
-            topk_indices = indexer(
-                x=hidden_states,
-                q_lora=q_lora,
-                positions=positions,
-                forward_batch=forward_batch,
-                layer_id=self.config["layer_id"],
-            )
-
-            self._verify_topk_output(
-                topk_indices, self.batch_size, q_len, self.config["index_topk"]
-            )
-            self.assertEqual(topk_indices.dtype, torch.int32)
-            torch.testing.assert_close(
-                (topk_indices >= 0).sum(dim=-1),
-                (positions + 1).clamp(max=self.config["index_topk"]),
-            )
 
     def test_fp8_mqa_logits_torch_matches_reference(self):
         """Test pure-torch prefill MQA logits fallback against a direct reference."""

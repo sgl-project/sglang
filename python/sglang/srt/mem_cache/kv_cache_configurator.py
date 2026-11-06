@@ -928,8 +928,8 @@ class KVCacheConfigurator:
         return placement
 
     def _unified_window_and_state(self) -> tuple:
-        """Whether this model's unified plan holds a window sub-pool and a state
-        sub-pool. Compressed-KV models (DeepSeek-V4, ERNIE 5.5) are not served by it."""
+        """Whether the unified plan holds a window sub-pool and a state sub-pool;
+        compressed-KV models are not served by it."""
         has_state = self.mambaish_config is not None
         has_window = self.is_hybrid_swa and not uses_compressed_kv_attention(
             self.model_config.hf_config

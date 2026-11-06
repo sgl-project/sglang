@@ -41,7 +41,6 @@ def _fused_sigmoid_mul_kernel(
     g = tl.load(gate_ptr + gate_off, mask=mask, other=0.0)
     sig = tl.sigmoid(g.to(tl.float32))
     if ROUND_SIGMOID:
-        # Bit-identical to the unfused ``attn_output * torch.sigmoid(gate)``.
         sig = sig.to(gate_ptr.dtype.element_ty).to(tl.float32)
     result = attn * sig
     if QUANT:  # the block is one row: per-token FP8 as _per_token_group_quant_8bit

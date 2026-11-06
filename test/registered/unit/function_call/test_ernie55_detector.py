@@ -53,15 +53,12 @@ class TestErnie5_5ToolCallParser(CustomTestCase):
             "I will look it up. " + _CALL
         )
         self.assertEqual(calls[0].name, "get_weather")
-        # days is declared integer, so it must not arrive as the string "3".
         self.assertEqual(
             json.loads(calls[0].parameters), {"city": "Beijing", "days": 3}
         )
         self.assertEqual(text.strip(), "I will look it up.")
 
     def test_call_without_block_end_still_parses(self):
-        """A generation cut before </ernie:tool_call> (max_tokens, or the end tag
-        as a stop string) still returns its complete call, not raw XML as content."""
         text, calls = FunctionCallParser(_TOOLS, "ernie55").parse_non_stream(
             "hi " + _CALL.removesuffix("</ernie:tool_call>")
         )
@@ -70,51 +67,33 @@ class TestErnie5_5ToolCallParser(CustomTestCase):
             json.loads(calls[0].parameters), {"city": "Beijing", "days": 3}
         )
 
-    def test_optional_parameter_keeps_its_value(self):
-        """A parameter typed ["string", "null"] must parse to its value, not None."""
-        tools = [
-            Tool(
-                type="function",
-                function=Function(
-                    name="search",
-                    parameters={
-                        "type": "object",
-                        "properties": {"query": {"type": ["string", "null"]}},
-                    },
-                ),
-            )
-        ]
-        call = (
-            '<ernie:tool_call>\n<invoke name="search">\n'
-            '<parameter name="query">sglang</parameter>\n'
-            "</invoke>\n</ernie:tool_call>"
-        )
-        _, calls = FunctionCallParser(tools, "ernie55").parse_non_stream(call)
-        self.assertEqual(json.loads(calls[0].parameters), {"query": "sglang"})
-
-    def test_plain_string_null_word_keeps_value(self):
-        """A non-nullable string whose value is the literal "null"/"none"/"nil"
-        parses to that string, not None; only a nullable parameter coerces."""
-        tools = [
-            Tool(
-                type="function",
-                function=Function(
-                    name="run",
-                    parameters={
-                        "type": "object",
-                        "properties": {"mode": {"type": "string"}},
-                    },
-                ),
-            )
-        ]
-        for word in ("null", "none", "nil"):
-            call = (
-                '<ernie:tool_call>\n<invoke name="run">\n'
-                f'<parameter name="mode">{word}</parameter>\n'
-                "</invoke>\n</ernie:tool_call>"
-            )
-            _, calls = FunctionCallParser(tools, "ernie55").parse_non_stream(call)
-            self.assertEqual(json.loads(calls[0].parameters), {"mode": word})
+    def test_value_is_parsed_per_schema_type(self):
+        for ptype, raw, expected in (
+            (["string", "null"], "sglang", "sglang"),
+            ("string", "null", "null"),
+            ("string", "none", "none"),
+            ("string", "nil", "nil"),
+        ):
+            with self.subTest(ptype=ptype, raw=raw):
+                tools = [
+                    Tool(
+                        type="function",
+                        function=Function(
+                            name="run",
+                            parameters={
+                                "type": "object",
+                                "properties": {"arg": {"type": ptype}},
+                            },
+                        ),
+                    )
+                ]
+                call = (
+                    '<ernie:tool_call>\n<invoke name="run">\n'
+                    f'<parameter name="arg">{raw}</parameter>\n'
+                    "</invoke>\n</ernie:tool_call>"
+                )
+                _, calls = FunctionCallParser(tools, "ernie55").parse_non_stream(call)
+                self.assertEqual(json.loads(calls[0].parameters), {"arg": expected})
 
 
 _S, _E = "<ernie:tool_call>", "</ernie:tool_call>"
@@ -149,7 +128,6 @@ def _param(name, value, close=True):
     return f'<parameter name="{name}">{value}' + ("</parameter>\n" if close else "")
 
 
-# Model outputs whose streamed and non-streamed parses must agree.
 _STREAM_CASES = {
     "brace_in_value": _block(_invoke("f", _param("path", "\na}\n")), after="Done."),
     "no_parameters": _block(_invoke("f")),
@@ -197,8 +175,6 @@ def _stream(text, size):
 
 class TestErnie5_5ToolCallStreaming(CustomTestCase):
     def test_streaming_matches_non_streaming(self):
-        """Streamed arguments are valid JSON equal to the non-streaming parse, and
-        content around the block survives, at any chunk size."""
         for name, text in _STREAM_CASES.items():
             result = Ernie5_5Detector().detect_and_parse(text, _STREAM_TOOLS)
             expected = (
@@ -208,6 +184,18 @@ class TestErnie5_5ToolCallStreaming(CustomTestCase):
             for size in (1, 3, len(text)):
                 with self.subTest(case=name, chunk=size):
                     self.assertEqual(_stream(text, size), expected)
+
+    def test_streaming_yields_the_expected_calls(self):
+        for name, normal, params in (
+            ("brace_in_value", "Done.", [{"path": "a}"}]),
+            ("parallel_calls", "", [{"path": "x}"}, {"n": 3}]),
+        ):
+            with self.subTest(case=name):
+                self.assertEqual(_stream(_STREAM_CASES[name], 1), (normal, params))
+                result = Ernie5_5Detector().detect_and_parse(
+                    _STREAM_CASES[name], _STREAM_TOOLS
+                )
+                self.assertEqual([c.name for c in result.calls], ["f"] * len(params))
 
     def test_string_value_streams_before_its_end_tag(self):
         detector = Ernie5_5Detector()
@@ -223,8 +211,6 @@ class TestErnie5_5ToolCallStreaming(CustomTestCase):
         self.assertEqual(sent, '{"path": "/tmp/abc')
 
     def test_start_tag_split_over_chunks(self):
-        """A start tag that arrives in pieces opens the call instead of leaking
-        into content."""
         text = "hi " + _block(_invoke("f", _param("n", "5")))
         for cut in range(len("hi ") + 1, len("hi ") + len(_S)):
             with self.subTest(cut=cut):

@@ -50,7 +50,7 @@ def test_append_window_to_topk(seq_lens, use_page_rows):
     torch.manual_seed(0)
     topk, window, alignment = 2048, 128, 128
     live = len(seq_lens)
-    num_rows = live + 2  # trailing padding rows
+    num_rows = live + 2
     num_pages = 4096 // PAGE_SIZE + 1
     if use_page_rows:
         page_table = torch.randperm(4 * num_pages, dtype=torch.int32).view(4, num_pages)
@@ -81,7 +81,6 @@ def test_append_window_to_topk(seq_lens, use_page_rows):
 
 
 def test_append_window_to_topk_ragged():
-    # FP8 prefill gathers each request's KV flat; window slots are offset + position.
     torch.manual_seed(0)
     topk, window, alignment = 2048, 128, 128
     seq_lens = torch.tensor([3, 130, 2500], dtype=torch.int32)

@@ -90,7 +90,6 @@ class Ernie5_5Detector(BaseFormatDetector):
         self._value_ends = (_PARAM_END, _FUNCTION_END, self.tool_call_end_token)
         self._max_end_prefix = max(map(len, self._value_ends)) - 1
 
-        # State of parse_streaming_increment.
         self._buf: str = ""
         self._tool_indices: Optional[Dict[str, int]] = None
         self._in_tool_call = False
@@ -115,9 +114,7 @@ class Ernie5_5Detector(BaseFormatDetector):
     def parse_streaming_increment(
         self, new_text: str, tools: List[Tool]
     ) -> StreamingParseResult:
-        """Stream tool calls as the model writes them.
-
-        The arguments JSON is closed when the call ends, never by counting braces,
+        """The arguments JSON is closed when the call ends, never by counting braces,
         which string values may contain. A string-only parameter streams as
         generated, other types once complete. Undefined tools are dropped and a
         missing </parameter> or </invoke> is tolerated, as in the non-streaming parse.
@@ -253,7 +250,6 @@ class Ernie5_5Detector(BaseFormatDetector):
         return True
 
     def _stream_string_value(self, calls: List[ToolCallItem]) -> None:
-        """Send the part of an open string value that can no longer change."""
         raw = self._param_raw
         end = len(raw)
         # Hold a trailing "<", "</par", ... that may start an end tag;

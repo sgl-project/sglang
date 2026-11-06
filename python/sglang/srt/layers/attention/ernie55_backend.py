@@ -189,7 +189,6 @@ class Ernie5_5MlaAttnBackend(DeepseekSparseAttnBackend):
         )
         keep = self._read_rows
         if keep is not None and kv_cache.dtype == torch.bfloat16:
-            # Unread rows attend to nothing: no work, zero output.
             topk_length = topk_length.masked_fill(~keep, 0)
         if kv_cache.dtype == torch.bfloat16 and q_all.shape[1] == 64:
             # The parent pads q to 128 heads on Blackwell; the 64-head build skips
@@ -318,8 +317,6 @@ class Ernie5_5AttnBackend(DeepseekV4AttnBackend):
             yield
 
     def read_rows(self, rows: Optional[torch.Tensor], num_rows: int):
-        """Compute the MLA layers' output for ``rows`` only; see
-        :meth:`Ernie5_5MlaAttnBackend.read_rows`."""
         return self.mla_attn_backend.read_rows(rows, num_rows)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch) -> None:

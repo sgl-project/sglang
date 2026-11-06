@@ -10,8 +10,7 @@
 // each lane owning one 4-element pack, the leading kRopeDim = 64 dims roped.
 namespace sglang::device::dsa_indexer {
 
-// NeoX ("halves") cos/sin for this lane's pack. The cache row is [cos(32) | sin(32)]
-// for both pairings; only the indexing differs from the adjacent-pair loader.
+// NeoX ("halves") cos/sin for this lane's pack; the cache row is [cos(32) | sin(32)].
 template <int64_t kRopeDim>
 SGL_DEVICE void load_neox_cos_sin(
     const float* __restrict__ cos_sin_cache,
@@ -24,8 +23,7 @@ SGL_DEVICE void load_neox_cos_sin(
   fsin.load(cos_sin_cache + kHalfRopeDim, idx);
 }
 
-// NeoX rope in place: dim d pairs with d + kRopeDim / 2, which lives kRopeSize / 2
-// lanes away. The shuffle needs every lane, so call this on all of them.
+// NeoX rope in place; the shuffle needs every lane, so call this on all of them.
 template <uint32_t kRopeSize>
 SGL_DEVICE void apply_neox_rope(
     AlignedVector<float, 4>& data,
@@ -47,8 +45,7 @@ SGL_DEVICE void apply_neox_rope(
   }
 }
 
-// 128-point Hadamard (Sylvester order) scaled by 1/sqrt(128), in place:
-// two in-lane butterfly stages, then five cross-lane ones.
+// 128-point Hadamard (Sylvester order) scaled by 1/sqrt(128), in place.
 SGL_DEVICE void hadamard_128(AlignedVector<float, 4>& data, int32_t lane_id) {
   {
     const float a0 = data[0], a1 = data[1], a2 = data[2], a3 = data[3];

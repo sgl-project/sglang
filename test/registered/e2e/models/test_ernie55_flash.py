@@ -12,12 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""GSM8K accuracy for ERNIE-5.5-Flash-Base (FP8) on four B200s with the cookbook's
-B200 High-Throughput recipe: attention DP 4 and SGLang's defaults otherwise.
-
-Covers both attention paths (HCA over the C128 sub-pool, MLA over the fp8 DSA
-latent sub-pool), the VHA postmix, and the latent MoE under attention DP.
-"""
+"""GSM8K accuracy for ERNIE-5.5-Flash-Base (FP8) on four B200s, attention DP 4."""
 
 import unittest
 
@@ -38,9 +33,7 @@ class TestErnie5_5Flash(GSM8KMixin, DefaultServerBase):
         "--context-length",
         "131072",
     ]
-    # A base model: sgl-eval sends chat requests, so score it with the few-shot
-    # completion harness. The B300 recipes score 0.965-0.977 (5-shot, 1319
-    # questions, greedy); the threshold leaves room for the B200 run.
+    # Base model: sgl-eval sends chat requests only, so use the few-shot harness.
     gsm8k_backend = "run_eval"
     gsm8k_num_shots = 5
     gsm8k_score_threshold = 0.93

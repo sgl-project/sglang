@@ -115,8 +115,7 @@ def multi_router_topk(
         TOPK=topk,
         TOPK_POW2=triton.next_power_of_2(topk),
         RENORMALIZE=renormalize,
-        # Measured on B300 (E=512, 2 routers, top-10): 4 warps are fastest up to
-        # ~512 tokens, 1 warp from 1024 tokens on.
+        # Measured (E=512, 2 routers, top-10): 4 warps up to ~512 tokens, 1 beyond.
         num_warps=4 if num_tokens <= 512 else 1,
     )
     return weights, ids

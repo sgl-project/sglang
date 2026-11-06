@@ -37,14 +37,12 @@ _INDEX_ROW = 4352
 
 
 def _pool(num_layers=3, owned=(1,)):
-    """CPU stub of what get_contiguous_buf_infos and extra_host_regions read;
-    the latent buffer is [tokens, 1, kv_cache_dim], as MLATokenToKVPool allocates it."""
+    """CPU stub of what get_contiguous_buf_infos and extra_host_regions read."""
     pool = object.__new__(Ernie5_5TokenToKVPool)
     pool.page_size = _PAGE_SIZE
     pool._stage_start = 0
     pool.mla_kv_pool = types.SimpleNamespace(
-        # 0-row placeholders stand in for the HCA layers, as the real sub-pool
-        # allocates them, so the enumeration must skip exactly those.
+        # 0-row placeholders stand in for the HCA layers, like the real sub-pool.
         kv_buffer=[
             torch.zeros(
                 (_PAGE_SIZE * 2 if i in owned else 0, 1, _LATENT_ROW),
@@ -78,7 +76,6 @@ class TestErnie5_5PdBufInfos(_StubbedBase):
         ptrs, lens, items = _pool(num_layers=4, owned=(1, 3)).get_contiguous_buf_infos()
         self.assertEqual(ptrs[0], _BASE[0][0], "base regions must come first")
         self.assertEqual(items[0], _BASE[2][0])
-        # Then both MLA layers' latent regions, then their index-K regions.
         latent_bytes = _PAGE_SIZE * 2 * _LATENT_ROW
         index_bytes = 8 * _INDEX_ROW
         self.assertEqual(
@@ -93,8 +90,6 @@ class TestErnie5_5PdBufInfos(_StubbedBase):
 
 
 class TestErnie5_5MlaHostRegions(_StubbedBase):
-    """HiCache mirrors the same pages the PD enumeration registers."""
-
     def test_one_region_per_kind_keyed_by_owning_layer(self):
         regions = _pool(num_layers=4, owned=(1, 3)).extra_host_regions()
         self.assertEqual(
@@ -110,7 +105,6 @@ class TestErnie5_5MlaHostRegions(_StubbedBase):
         latent, indexer = pool.extra_host_regions()
         self.assertEqual(latent.item_bytes, _LATENT_ROW * _PAGE_SIZE)
         self.assertEqual(indexer.item_bytes, _INDEX_ROW * (_PAGE_SIZE // DSA_PAGE_SIZE))
-        # Page 1 of the view must alias tokens [256, 512) of the device buffer.
         device = pool.mla_kv_pool.kv_buffer[1]
         device[_PAGE_SIZE, 0, 0] = 7
         self.assertEqual(latent.device_buffers[0][1, 0].item(), 7)
@@ -127,9 +121,6 @@ class TestErnie5_5MlaHostRegions(_StubbedBase):
 
 
 class TestErnie5_5SwaBuffers(CustomTestCase):
-    """Only the HCA layers attend over the SWA window, so the MLA layers own no
-    SWA buffer, and HiCache's SWA mapping must cover exactly the buffers that exist."""
-
     @staticmethod
     def _swa_pool(stage, mla_layer_ids):
         pool = object.__new__(Ernie5_5TokenToKVPool)
@@ -151,8 +142,6 @@ class TestErnie5_5SwaBuffers(CustomTestCase):
             pool._swa_local_layer_id(3)
 
     def test_hicache_mapping_is_stage_local_and_matches_the_buffers(self):
-        # Second pipeline stage of a 14-layer model with MLA layers 6 and 13; the
-        # pool is given only its own stage's MLA ids.
         from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
             _dsv4_transfer_layer_mapping,
         )
@@ -162,6 +151,8 @@ class TestErnie5_5SwaBuffers(CustomTestCase):
         self.assertEqual(len(mapping), len(pool._swa_layer_ids()))
         self.assertEqual(mapping, {0: 0, 1: 1, 2: 2, 3: 3, 4: 4, 5: 5})
 
+
+class TestErnie5_5Fp4IndexBudget(CustomTestCase):
     def test_fp4_index_budget_matches_packed_cache_bytes(self):
         config = types.SimpleNamespace(
             hybrid_mla_kv_lora_rank=512,
