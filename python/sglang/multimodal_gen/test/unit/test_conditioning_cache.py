@@ -153,6 +153,7 @@ def test_h3_reference_rows_are_cached_per_image_not_per_tile():
     torch.testing.assert_close(again, first, rtol=0, atol=0)
 
 
+@torch.no_grad()
 def test_lru_budget_and_oversized_outputs():
     cache = ConditioningCache(32)
     model = Encoder().eval()
