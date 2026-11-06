@@ -13,6 +13,7 @@ slot, and a host page move carries the draft bytes with it.
 
 import unittest
 from contextlib import nullcontext
+from itertools import product
 from types import MethodType, SimpleNamespace
 from unittest.mock import patch
 
@@ -37,6 +38,7 @@ from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.unified_draft_pool import (
     routed_draft_pool,
 )
+from sglang.srt.models.dspark_mla import MLADSparkModel
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -879,12 +881,12 @@ class TestRoutedDraftPool(CustomTestCase):
         model = SimpleNamespace(
             layers=self._draft_layers(values),
             project_target_hidden=lambda hidden: hidden,
+            prepare_context_hidden_for_kv=lambda layer, hidden: hidden,
             _fused_kv_write_bundle=lambda pool: None,
             _stacked_ctx_kv_params=lambda: None,
         )
-        model.write_target_hidden_kv = MethodType(
-            DSparkDraftMixin.write_target_hidden_kv, model
-        )
+        for layer, (k, v) in zip(model.layers, values):
+            layer.self_attn.context_kv = lambda positions, hidden, k=k, v=v: (k, v)
         injector = TargetHiddenKvInjector(
             draft_model=model,
             draft_model_runner=SimpleNamespace(
@@ -895,8 +897,13 @@ class TestRoutedDraftPool(CustomTestCase):
             verify_num_draft_tokens=3,
             block_pos_offsets=torch.arange(3),
         )
-        for lengths in (None, (2, 0), (0, 0)):
-            with self.subTest(commit_lens=lengths):
+        for model_cls, lengths in product(
+            (DSparkDraftMixin, MLADSparkModel), (None, (2, 0), (0, 0))
+        ):
+            with self.subTest(model=model_cls.__name__, commit_lens=lengths):
+                model.write_target_hidden_kv = MethodType(
+                    model_cls.write_target_hidden_kv, model
+                )
                 commit_lens = (
                     torch.tensor(lengths, dtype=torch.int32)
                     if lengths is not None
