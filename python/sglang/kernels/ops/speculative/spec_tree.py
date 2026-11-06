@@ -17,6 +17,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
 from sglang.srt.platforms import current_platform
 from sglang.srt.platforms.interface import reject_out_of_tree_path
 from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_musa, is_npu, is_xpu
@@ -394,11 +395,19 @@ def build_tree_kernel_efficient_func(
             tree_mask_mode,
         )
     elif _is_xpu:
-        sgl_build_tree_kernel_triton(
+        xpu_build_tree, xpu_tree_mask = sgl_build_tree_kernel_triton, tree_mask
+        if envs.SGLANG_XPU_USE_SYCL.get():
+            from sgl_kernel import build_tree_kernel_efficient as xpu_build_tree
+
+            # The SYCL op only takes bool; the triton attention backend's
+            # preallocated verify mask is uint8 (same 0/1 bytes).
+            if tree_mask.dtype == torch.uint8:
+                xpu_tree_mask = tree_mask.view(torch.bool)
+        xpu_build_tree(
             parent_list,
             top_scores_index,
             seq_lens,
-            tree_mask,
+            xpu_tree_mask,
             positions,
             retrieve_index,
             retrieve_next_token,
@@ -535,15 +544,20 @@ def verify_tree_greedy_func(
             target_predict=target_predict,
         )
     elif _is_xpu:
-        verify_tree_greedy_triton(
-            predicts=predicts,
-            accept_index=accept_index,
-            accept_token_num=accept_token_num,
-            candidates=candidates,
-            retrieve_index=retrieve_index,
-            retrieve_next_token=retrieve_next_token,
-            retrieve_next_sibling=retrieve_next_sibling,
-            target_predict=target_predict,
+        xpu_verify_tree_greedy = verify_tree_greedy_triton
+        if envs.SGLANG_XPU_USE_SYCL.get():
+            from sgl_kernel import verify_tree_greedy as xpu_verify_tree_greedy
+
+        # Positional: the sgl_kernel op spells these args `retrive_*`.
+        xpu_verify_tree_greedy(
+            predicts,  # mutable
+            accept_index,  # mutable
+            accept_token_num,  # mutable
+            candidates,
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
+            target_predict,
         )
     else:
         reject_out_of_tree_path(
