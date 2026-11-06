@@ -21,7 +21,6 @@ limitations under the License.
 The radix tree data structure for managing the KV cache.
 """
 
-import heapq
 import logging
 import sys
 import time
@@ -47,6 +46,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.events import KVCacheEventRecorder, LoRANameTable
+from sglang.srt.mem_cache.eviction_heap import LazyEvictionHeap
 from sglang.srt.mem_cache.utils import (
     get_eviction_strategy,
     split_node_hash_value,
@@ -319,6 +319,11 @@ class RadixCache(BasePrefixCache):
         )
 
         self.evictable_leaves = set()
+        self._eviction_heap = LazyEvictionHeap(
+            priority=self.eviction_strategy.get_priority,
+            candidate=lambda node: node in self.evictable_leaves,
+            active_count=lambda: len(self.evictable_leaves),
+        )
         self.reset()
 
     @classmethod
@@ -355,6 +360,7 @@ class RadixCache(BasePrefixCache):
         self.evictable_size_ = 0
         self.protected_size_ = 0
         self.evictable_leaves.clear()
+        self._eviction_heap.clear()
         self._empty_device_indices = torch.empty(
             (0,), dtype=torch.int64, device=self.device
         )
@@ -560,15 +566,11 @@ class RadixCache(BasePrefixCache):
 
         start_time = time.perf_counter()
         num_tokens = params.num_tokens
-        leaves = list(self.evictable_leaves)
-        eviction_heap = [
-            (self.eviction_strategy.get_priority(node), node) for node in leaves
-        ]
-        heapq.heapify(eviction_heap)
-
         num_evicted = 0
-        while num_evicted < num_tokens and len(eviction_heap):
-            _priority, x = heapq.heappop(eviction_heap)
+        while num_evicted < num_tokens:
+            x = self._eviction_heap.pop()
+            if x is None:
+                break
 
             # Tree values are page-aligned copies of a kv row: page-exact segment.
             self.token_to_kv_pool_allocator.free_segment(x.value, start_pos=0)
@@ -576,8 +578,7 @@ class RadixCache(BasePrefixCache):
             self._delete_leaf(x)
 
             if len(x.parent.children) == 0 and x.parent.lock_ref == 0:
-                new_priority = self.eviction_strategy.get_priority(x.parent)
-                heapq.heappush(eviction_heap, (new_priority, x.parent))
+                self._eviction_heap.add(x.parent)
 
             self.kv_events.record_remove(x)
 
@@ -656,6 +657,7 @@ class RadixCache(BasePrefixCache):
     def _match_prefix_helper(self, node: TreeNode, key: RadixKey):
         access_time = time.monotonic()
         node.last_access_time = access_time
+        self._eviction_heap.refresh(node)
 
         child_key = key.child_key(self.page_size)
 
@@ -663,6 +665,7 @@ class RadixCache(BasePrefixCache):
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
             child.last_access_time = access_time
+            self._eviction_heap.refresh(child)
             prefix_len = child.key.match(key, page_size=self.page_size)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
@@ -720,6 +723,7 @@ class RadixCache(BasePrefixCache):
             priority = 0
         access_time = time.monotonic()
         node.last_access_time = access_time
+        self._eviction_heap.refresh(node)
         # Update priority along the path (take max to propagate higher priority)
         node.priority = max(node.priority, priority)
         if len(key) == 0:
@@ -731,6 +735,7 @@ class RadixCache(BasePrefixCache):
         while len(key) > 0 and child_key in node.children.keys():
             node = node.children[child_key]
             node.last_access_time = access_time
+            self._eviction_heap.refresh(node)
             prefix_len = node.key.match(key, page_size=self.page_size)
             total_prefix_length += prefix_len
             key = key[prefix_len:]
@@ -806,6 +811,7 @@ class RadixCache(BasePrefixCache):
 
         if node not in self.evictable_leaves:
             self.evictable_leaves.add(node)
+            self._eviction_heap.add(node)
 
     def _total_size_helper(self):
         total_size = 0
