@@ -124,8 +124,8 @@ class TestRoutingKeyScheduling(CustomTestCase):
         await asyncio.gather(*short_tasks)
         await asyncio.gather(*long_running_tasks)
 
-        cls.stdout.flush()
-        cls.stderr.flush()
+        self.stdout.flush()
+        self.stderr.flush()
         log_text = "\n".join(
             Path(filename).read_text()
             for filename in (STDOUT_FILENAME, STDERR_FILENAME)
