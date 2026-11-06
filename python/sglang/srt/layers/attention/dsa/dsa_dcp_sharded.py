@@ -41,6 +41,7 @@ from sglang.kernels.ops.attention.dcp_kernels import _gather_candidate_prefix_ke
 from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.attention.dsa.dcp_fused_topk import (
     DCP_FUSED_TOPK_K,
+    DCP_FUSED_TOPK_MAX_CONTEXT,
     DCP_FUSED_TOPK_PAGE_SIZE,
     DCP_FUSED_TOPK_RANKS,
     dcp_fused_topk,
@@ -650,10 +651,15 @@ _FUSED_TOPK: Optional[DcpFusedTopK] = None
 _FUSED_TOPK_CREATED = False
 
 
-def init_dcp_fused_topk(max_rows: int, topk: int, page_size: int) -> bool:
+def init_dcp_fused_topk(
+    max_rows: int, topk: int, page_size: int, max_context_len: int
+) -> bool:
     """Collective over the DCP group; call on every rank before CUDA graph
     capture. Returns whether decode rows select and merge in one kernel."""
     global _FUSED_TOPK, _FUSED_TOPK_CREATED
+    if max_context_len > DCP_FUSED_TOPK_MAX_CONTEXT:
+        print_info_once("DSA DCP fused top-k off: it needs context length <= 1M")
+        return False
     if not _FUSED_TOPK_CREATED:  # one buffer per process, also when create declined
         _FUSED_TOPK_CREATED = True
         parallel = get_parallel()

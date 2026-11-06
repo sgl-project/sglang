@@ -15,6 +15,8 @@ if TYPE_CHECKING:
 DCP_FUSED_TOPK_RANKS = 8
 DCP_FUSED_TOPK_K = 2048
 DCP_FUSED_TOPK_PAGE_SIZE = 64
+# the kernel keeps a row's page ids (131072 local keys) in shared memory
+DCP_FUSED_TOPK_MAX_CONTEXT = 1 << 20
 # Local ranks [lo, hi] each rank sends around its expected share k / 8 = 256;
 # measured on real rows: no certificate failure in 1.09M shard-calls.
 DCP_FUSED_TOPK_WINDOW = (176, 336)

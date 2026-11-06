@@ -796,7 +796,10 @@ class DeepseekSparseAttnBackend(
                 init_dcp_candidate_all_gather(max_rows, self.dsa_index_topk)
             if envs.SGLANG_ENABLE_DSA_DCP_FUSED_TOPK.get():
                 init_dcp_fused_topk(
-                    max_rows, self.dsa_index_topk, self.physical_page_size
+                    max_rows,
+                    self.dsa_index_topk,
+                    self.physical_page_size,
+                    self.max_context_len,
                 )
 
         if _is_xpu:
