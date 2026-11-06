@@ -167,12 +167,14 @@ def _can_describe_string(schema: dict[str, Any]) -> bool:
 def validate_xgrammar_json_schema(schema: Any) -> None:
     """Reject constraints XGrammar 0.2.x accepts without fully enforcing."""
     for subschema, pointer in _iter_subschemas(schema):
-        unsupported = sorted(_XGRAMMAR_UNSUPPORTED_KEYWORDS.intersection(subschema))
+        unsupported = _XGRAMMAR_UNSUPPORTED_KEYWORDS.intersection(subschema)
+        if subschema.get("uniqueItems") is False:
+            unsupported = unsupported - {"uniqueItems"}
         if unsupported:
             _raise_unsupported(
                 "xgrammar",
                 pointer,
-                f"keyword(s) {', '.join(unsupported)} would be ignored",
+                f"keyword(s) {', '.join(sorted(unsupported))} would be ignored",
             )
 
         if _can_describe_string(subschema) and "format" in subschema:
@@ -203,12 +205,14 @@ def validate_xgrammar_json_schema(schema: Any) -> None:
 def validate_outlines_json_schema(schema: Any) -> None:
     """Reject constraints Outlines Core 0.1.x accepts without preserving."""
     for subschema, pointer in _iter_subschemas(schema):
-        unsupported = sorted(_OUTLINES_UNSUPPORTED_KEYWORDS.intersection(subschema))
+        unsupported = _OUTLINES_UNSUPPORTED_KEYWORDS.intersection(subschema)
+        if subschema.get("uniqueItems") is False:
+            unsupported = unsupported - {"uniqueItems"}
         if unsupported:
             _raise_unsupported(
                 "outlines",
                 pointer,
-                f"keyword(s) {', '.join(unsupported)} would be ignored or weakened",
+                f"keyword(s) {', '.join(sorted(unsupported))} would be ignored or weakened",
             )
 
         groups = (
