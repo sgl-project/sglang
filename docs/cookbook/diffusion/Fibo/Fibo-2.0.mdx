@@ -1,0 +1,147 @@
+---
+title: Fibo 2.0
+description: "Deploy BRIA Fibo 2.0 with SGLang - an 8B flow-matching model for image editing and generation in the FLUX.2 VAE latent space."
+metatags:
+    description: "Deploy BRIA Fibo 2.0 with SGLang - an 8B flow-matching model for image editing and generation in the FLUX.2 VAE latent space."
+---
+
+import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
+
+<DiffusionModelTags tags={["image", "image editing", "masked edit", "multi-reference", "8B", "4-step"]} />
+
+import { Deployment } from '/src/snippets/_deployment.jsx';
+import { config } from '/src/snippets/configs/Bria/fibo-2-edit-turbo.jsx';
+
+## 1. Quick start
+
+Follow the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation) for your GPU platform.
+
+<a id="2-sglang-diffusion-installation" />
+
+<Deployment config={config} />
+
+<a id="1-model-introduction" />
+
+## 2. Model capabilities
+
+[Fibo 2.0](https://huggingface.co/briaai/Fibo-2.0-edit-turbo) is BRIA's 8B flow-matching image model. It generates and edits images in the latent space of the FLUX.2 VAE; prompts are structured JSON captions encoded by Qwen3-VL-4B, whose features a two-layer Perceiver resamples into 256-512 "gist" tokens, and five transformer blocks additionally cross-attend to Qwen3-VL's internal layers.
+
+Two checkpoints share the architecture:
+
+| Checkpoint | Steps | Guidance | Use |
+| --- | --- | --- | --- |
+| `briaai/Fibo-2.0-edit-turbo` | 4 | 1.0 (off) | Fast, distilled editing |
+| `briaai/Fibo-2.0-dev` | 30 | 5.0 | Full-quality generation and editing |
+
+Editing supports an instruction on a single source image, an optional mask that confines the edit to the marked region, and up to five reference images that the instruction can address as `<image_1>` … `<image_5>`.
+
+:::note
+The weights are released under the BRIA Fibo license (CC BY-NC 4.0): non-commercial use only, and downloading them requires accepting BRIA's terms on Hugging Face.
+:::
+
+## 3. Model Deployment
+
+### 3.1 Basic Configuration
+
+Fibo 2.0 runs on a single GPU: the transformer, the Qwen3-VL text encoder and the FLUX.2 VAE fit together in about 26 GB of weights. The turbo checkpoint is the recommended default, since it denoises in 4 steps with guidance off.
+
+Use the [command builder](#1-quick-start) above.
+
+### 3.2 Configuration Tips
+
+- `--num-inference-steps`: 4 for the turbo checkpoint, 30 for the dev checkpoint.
+- `--guidance-scale`: 1.0 for the turbo checkpoint (classifier-free guidance off); 5.0 for the dev checkpoint, which runs the negative caption as a second pass per step.
+- **Output size must be a multiple of 16.** When editing without an explicit size, the pipeline picks the size Fibo 2.0 was trained at for the source image's aspect ratio, about one megapixel.
+- The prompt is a structured JSON caption. Plain natural-language instructions also work for editing; the model rewrites them internally. See §5.
+- Text-encoder offload (`--text-encoder-cpu-offload`) is not required on an 80 GB GPU and costs latency; enable it on smaller cards.
+
+## 4. API Usage
+
+For complete API documentation, see the [official API usage guide](/docs/sglang-diffusion/api/openai_api).
+
+### 4.1 Edit an image
+
+```bash curl
+curl -sS http://localhost:30000/v1/images/edits \
+  -F image=@photo.jpg \
+  -F 'prompt=replace the jacket with a red leather one' \
+  -F n=1 -F num_inference_steps=4 -F guidance_scale=1.0 \
+  -F response_format=b64_json
+```
+
+```python Example
+import base64
+import io
+
+from PIL import Image
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="not-needed")
+
+result = client.images.edit(
+    model="briaai/Fibo-2.0-edit-turbo",
+    image=open("photo.jpg", "rb"),
+    prompt="replace the jacket with a red leather one",
+    n=1,
+    extra_body={"num_inference_steps": 4, "guidance_scale": 1.0},
+)
+edited = Image.open(io.BytesIO(base64.b64decode(result.data[0].b64_json)))
+edited.save("edited.png")
+```
+
+### 4.2 Masked edit
+
+The mask is white where the image should be regenerated and black elsewhere; everything outside the mask is preserved. The masked region is greyed out before the VAE encodes the source image, as in training. A mask applies to a single source image and must match that image's size.
+
+```bash curl
+curl -sS http://localhost:30000/v1/images/edits \
+  -F image=@suitcase.png \
+  -F mask=@suitcase_mask.png \
+  -F 'prompt=replace the suitcase with a vintage brown leather one' \
+  -F n=1 -F num_inference_steps=4 -F guidance_scale=1.0 \
+  -F response_format=b64_json
+```
+
+### 4.3 Multi-reference editing
+
+Pass up to five images; the instruction refers to them in order as `<image_1>`, `<image_2>`, and so on.
+
+```bash curl
+curl -sS http://localhost:30000/v1/images/edits \
+  -F image=@person.png \
+  -F image=@dress.png \
+  -F 'prompt=dress the person in <image_1> in the dress from <image_2>' \
+  -F n=1 -F num_inference_steps=4 -F guidance_scale=1.0 \
+  -F response_format=b64_json
+```
+
+### 4.4 Generate an image
+
+Generation uses `briaai/Fibo-2.0-dev` with 30 steps and guidance 5.0:
+
+```bash curl
+curl -sS http://localhost:30000/v1/images/generations \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "briaai/Fibo-2.0-dev",
+    "prompt": "{\"short_description\":\"A red bicycle leaning against a white brick wall on a sunny morning.\",\"background_setting\":\"a white brick wall with a green door\",\"lighting\":{\"conditions\":\"bright morning sun\"},\"style_medium\":\"photograph\"}",
+    "n": 1,
+    "size": "1024x1024",
+    "num_inference_steps": 30,
+    "guidance_scale": 5.0,
+    "response_format": "b64_json"
+  }'
+```
+
+## 5. Prompt format
+
+Fibo 2.0 is trained on structured captions ("Visual GenAI Language"): JSON with explicit fields such as `short_description`, `objects`, `background_setting`, `lighting`, `aesthetics`, `photographic_characteristics`, `style_medium` and `text_render`. An edit prompt is an instruction (or a caption of the result plus an `edit_instruction` key) that the pipeline serialises compactly and hands to Qwen3-VL together with the images to edit.
+
+Short natural-language instructions are a valid shortcut for editing. For generation, a structured caption gives noticeably better control than a loose description; BRIA's [VGL documentation](https://docs.bria.ai/vgl) describes the schema.
+
+## 6. Limitations
+
+- Single GPU in this version: the Fibo blocks do not implement sequence or tensor parallelism yet.
+- Text-render hint images (`text_images` / `fonts` in the reference pipeline, which draw each caption text into a small image for the text encoder) are not supported yet; captions that carry `text_render` entries are still accepted, they are just not turned into images.
+- Requests whose prompts would need different gist-token counts in the same batch are rejected; send such prompts as separate requests.
+- Cache-DiT and other diffusion acceleration features are not wired up for this model.
