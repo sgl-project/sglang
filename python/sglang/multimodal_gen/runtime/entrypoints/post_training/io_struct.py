@@ -88,6 +88,8 @@ class RolloutRequest(BaseModel):
 
     rollout_return_denoising_env: bool = False
     rollout_return_dit_trajectory: bool = False
+    # The latents, debug and cond tensors go to the server's output store; the response carries the ref.
+    rollout_return_outputs_via_store: bool = False
 
     # 0-indexed denoising-loop step filters. None = all steps.
     rollout_sde_step_indices: Optional[list[int]] = None
@@ -115,6 +117,7 @@ class RolloutResponse(BaseModel):
 
     inference_time_s: Optional[float] = None
     peak_memory_mb: Optional[float] = None
+    output_store_ref: Optional[dict[str, Any]] = None
 
 
 @dataclass

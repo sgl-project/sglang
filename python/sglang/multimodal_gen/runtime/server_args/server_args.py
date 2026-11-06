@@ -385,6 +385,9 @@ class ServerArgs(DisaggServerArgsMixin):
     hsdp_shard_dim: Optional[int] = None
     dist_timeout: int | None = 3600  # 1 hour
     scheduler_rpc_timeout: int | None = None
+    # The LLM ServerArgs name these two the same way; "none" keeps rollout tensors in the response.
+    output_store_backend: str = "none"
+    output_store_backend_extra_config: str | None = None
 
     pipeline_config: PipelineConfig = field(default_factory=PipelineConfig, repr=False)
 
@@ -730,7 +733,23 @@ class ServerArgs(DisaggServerArgsMixin):
         self._validate_batching()
         self._validate_breakable_cuda_graph()
         self._validate_minimax_h3_adaln()
+        self._validate_output_store()
         self.pipeline_config.validate_server_args(self)
+
+    def _validate_output_store(self) -> None:
+        if self.output_store_backend == "none":
+            if self.output_store_backend_extra_config is not None:
+                raise ValueError(
+                    "--output-store-backend-extra-config needs --output-store-backend"
+                )
+            return
+        from radix_transfer_plugins import available_backends
+
+        if self.output_store_backend not in available_backends():
+            raise ValueError(
+                f"unknown --output-store-backend {self.output_store_backend!r}; "
+                f"available: {available_backends()}"
+            )
 
     def _validate_minimax_h3_adaln(self) -> None:
         # Warn, not raise: config-file and from_kwargs construction mark every
@@ -2612,6 +2631,23 @@ class ServerArgs(DisaggServerArgsMixin):
                 "time spent in the scheduler queue. By default no transport-level "
                 "deadline is imposed; callers may still cancel their request."
             ),
+        )
+
+        parser.add_argument(
+            "--output-store-backend",
+            type=str,
+            default=ServerArgs.output_store_backend,
+            help=(
+                "Where a /rollout/generate request that sets rollout_return_outputs_via_store "
+                "puts its latents, debug and cond tensors: a radix_transfer_plugins backend "
+                "name, or none."
+            ),
+        )
+        parser.add_argument(
+            "--output-store-backend-extra-config",
+            type=str,
+            default=ServerArgs.output_store_backend_extra_config,
+            help="JSON config of --output-store-backend.",
         )
 
         ServerArgs.add_disagg_cli_args(parser)
