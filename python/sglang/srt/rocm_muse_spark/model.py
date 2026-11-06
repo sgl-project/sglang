@@ -22,6 +22,10 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from sglang.kernels.ops.gemm.router_gemm_fp32 import (
+    router_gemv_fp32,
+    router_gemv_fp32_supported,
+)
 from sglang.srt.configs.muse_spark import (
     MuseSparkTextConfig,
     should_skip_weight_loading,
@@ -54,10 +58,6 @@ from sglang.srt.rocm_muse_spark.layers import (
     QKVOGateParallelLinear,
 )
 from sglang.srt.rocm_muse_spark.muse_qk_norm import fused_qk_norm, qk_norm_supported
-from sglang.srt.rocm_muse_spark.muse_router_gemv import (
-    router_gemv,
-    router_gemv_supported,
-)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
 
@@ -799,10 +799,10 @@ class MuseSpark1xMoE(nn.Module):
         if (
             _USE_ROUTER_GEMV
             and self.router_in_fp32
-            and router_gemv_supported(hidden_states, self.router.weight)
+            and router_gemv_fp32_supported(hidden_states, self.router.weight)
         ):
             # bf16 -> fp32 conversion happens inside the kernel (exact), IEEE fp32 accumulate
-            router_logits = router_gemv(hidden_states, self.router.weight)
+            router_logits = router_gemv_fp32(hidden_states, self.router.weight)
         else:
             router_input = (
                 hidden_states.float() if self.router_in_fp32 else hidden_states

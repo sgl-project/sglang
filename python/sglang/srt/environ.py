@@ -2192,6 +2192,8 @@ class Envs:
     SGLANG_MUSE_FUSED_QKV_CACHE = EnvBool(True)
     SGLANG_MUSE_QK_ROPE_CACHE = EnvBool(True)
     SGLANG_MUSE_DENSE_TUNED = EnvBool(True)
+    SGLANG_MUSE_SHARED_ROUTER_POOLER = EnvBool(True)
+    SGLANG_MUSE_JOINT_ROUTER_POOLER = EnvBool(True)
     SGLANG_USE_CUSTOM_ROUTER_SUM = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_USE_TRITON_ROUTER_SUM"
     )
