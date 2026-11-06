@@ -156,21 +156,37 @@ class TestCPUFp8QuantOps(CustomTestCase):
         dequant = q.float() * _ue8m0_to_float(scale_u8).repeat_interleave(32, dim=-1)
         torch.testing.assert_close(dequant, x, atol=0.04, rtol=0.04)
 
+    @unittest.skipUnless(
+        cpu_has_amx_support(), "CPU W8A16 FP8 requires the Intel AMX backend."
+    )
     def test_compressed_tensors_w8a16_fp8_cpu(self):
+        """Load-time AMX packing, with a model-dtype (bf16) bias as produced by loading."""
         x = torch.randn(5, 64, dtype=torch.bfloat16)
-        weight = (torch.randn(32, 64) / 4).to(torch.float8_e4m3fn)
-        weight_scale = torch.tensor([0.02], dtype=torch.float32)
-        bias = torch.randn(32, dtype=torch.float32) / 10
-        layer = SimpleNamespace(weight=weight, weight_scale=weight_scale)
-        scheme = CompressedTensorsW8A16Fp8(QuantizationStrategy.TENSOR, False)
-
-        out = scheme.apply_weights(layer, x, bias)
-        ref = torch.ops.sgl_kernel.fp8_per_tensor_scaled_mm_cpu(
-            x, weight, weight_scale, bias, x.dtype, False
+        weight = torch.randn(32, 64).to(torch.float8_e4m3fn)
+        weight_scale = torch.tensor([0.1], dtype=torch.float32)
+        bias = (torch.randn(32) / 10).to(torch.bfloat16)
+        layer = SimpleNamespace(
+            weight=torch.nn.Parameter(weight.clone(), requires_grad=False),
+            weight_scale=torch.nn.Parameter(weight_scale.clone(), requires_grad=False),
+            bias=torch.nn.Parameter(bias.clone(), requires_grad=False),
         )
+        scheme = CompressedTensorsW8A16Fp8(QuantizationStrategy.TENSOR, False)
+        scheme.process_weights_after_loading(layer)
 
-        torch.testing.assert_close(out, ref)
+        self.assertTrue(layer.use_intel_amx_backend)
+        self.assertEqual(layer.bias.dtype, torch.float32)
+        out = scheme.apply_weights(layer, x, layer.bias)
 
+        unpacked = torch.ops.sgl_kernel.fp8_per_tensor_scaled_mm_cpu(
+            x, weight, weight_scale, bias.float(), x.dtype, False
+        )
+        torch.testing.assert_close(out, unpacked)
+        ref = x.float() @ (weight.float() * weight_scale).t() + bias.float()
+        torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
+
+    @unittest.skipUnless(
+        cpu_has_amx_support(), "CPU W8A16 FP8 requires the Intel AMX backend."
+    )
     def test_compressed_tensors_w8a16_fp8_cpu_rejects_multi_scale(self):
         weight = (torch.randn(32, 64) / 4).to(torch.float8_e4m3fn)
         layer = SimpleNamespace(

@@ -7,6 +7,7 @@ from typing import Callable, List, Optional
 import torch
 from compressed_tensors.quantization import QuantizationStrategy
 
+from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
 from sglang.srt.layers.parameter import (
     ChannelQuantScaleParameter,
     ModelWeightParameter,
@@ -20,12 +21,13 @@ from sglang.srt.layers.quantization.marlin_utils_fp8 import (
     prepare_fp8_layer_for_marlin,
 )
 from sglang.srt.layers.quantization.utils import convert_to_channelwise
-from sglang.srt.utils import is_cpu
+from sglang.srt.utils import cpu_has_amx_support, is_cpu
 
 __all__ = ["CompressedTensorsW8A16Fp8"]
 
 SUPPORTED_STRATEGIES = [QuantizationStrategy.CHANNEL, QuantizationStrategy.TENSOR]
 _is_cpu = is_cpu()
+_is_cpu_amx_available = cpu_has_amx_support()
 
 
 class CompressedTensorsW8A16Fp8(CompressedTensorsLinearScheme):
@@ -43,6 +45,9 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsLinearScheme):
     # we expand each scale to its shard's channels.
     def process_weights_after_loading(self, layer) -> None:
         if _is_cpu:
+            assert _is_cpu_amx_available, (
+                "CPU compressed-tensors W8A16 FP8 requires AMX support."
+            )
             if self.strategy != QuantizationStrategy.TENSOR:
                 raise NotImplementedError(
                     "CPU compressed-tensors W8A16 FP8 currently supports only per-tensor weight scales."
@@ -55,6 +60,13 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsLinearScheme):
             layer.weight_scale = torch.nn.Parameter(
                 layer.weight_scale.reshape(()), requires_grad=False
             )
+            # Packs the weight into the AMX layout and converts the bias to fp32.
+            _amx_process_weight_after_loading(layer, ["weight"])
+            if not layer.use_intel_amx_backend:
+                raise NotImplementedError(
+                    "CPU compressed-tensors W8A16 FP8 requires an AMX-packable weight "
+                    "(output dim divisible by 16, input dim divisible by 32)."
+                )
             return
 
         if self.strategy == QuantizationStrategy.TENSOR:
@@ -149,7 +161,7 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsLinearScheme):
                 layer.weight_scale,
                 bias,
                 x.dtype,
-                False,
+                True,  # is_vnni: weight was packed at load time
             )
 
         return apply_fp8_marlin_linear(
