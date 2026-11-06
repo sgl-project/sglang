@@ -116,6 +116,49 @@ _use_fp8_prefill_attn = (
 
 # Max qlen limitation of the asm ps kernels to handle q with bf16 dtype
 _MLA_ASM_PS_MAX_QLEN = 4
+# 16 padded heads times the window must fit aiter's 128-row fold.
+_MLA_FP8_Q_ASM_FOLD_MAX_QLEN = 8
+# The fp8-Q kernels return wrong output for these verify windows (ROCm/aiter#7007).
+_MLA_FP8_Q_ASM_BROKEN_QLENS = frozenset(range(2, 4 + 1))
+
+
+def _fp8_q_asm_mla_selected(
+    *,
+    enabled: bool,
+    num_head: int,
+    head_pad_mode: str,
+    kv_cache_dtype: torch.dtype,
+    decode_backend: str,
+    verify_backend: str,
+    dcp_world_size: int,
+    is_draft_worker: bool,
+    verify_qlen: int,
+    gfx95: bool,
+    max_verify_qlen: int = _MLA_ASM_PS_MAX_QLEN,
+) -> bool:
+    # The native 16-head fp8-Q kernel covers up to _MLA_ASM_PS_MAX_QLEN tokens;
+    # a wider window folds onto the 32-head kernel, which wins only at long context.
+    if not enabled:
+        return False
+    if not 1 <= max_verify_qlen <= _MLA_FP8_Q_ASM_FOLD_MAX_QLEN:
+        raise ValueError(
+            f"fp8-Q asm MLA max verify qlen must be in "
+            f"[1, {_MLA_FP8_Q_ASM_FOLD_MAX_QLEN}], got {max_verify_qlen}"
+        )
+    return (
+        num_head == 12
+        and head_pad_mode == "zero"
+        and kv_cache_dtype == fp8_dtype
+        and decode_backend == "asm"
+        and verify_backend == "asm"
+        and dcp_world_size <= 1
+        # A draft backend also runs draft extend, which plans with the module modes.
+        and not is_draft_worker
+        and gfx95
+        and 1 <= verify_qlen <= max_verify_qlen
+        and verify_qlen not in _MLA_FP8_Q_ASM_BROKEN_QLENS
+    )
+
 
 # (query head count -> query lengths) at which aiter's scheduler treats the
 # count as native, on gfx950 with an fp8 query and KV. None means any length.
@@ -412,6 +455,8 @@ class AiterAttnBackend(AttentionBackend):
 
     # declare here to avoid CI failure in test_aiter_fp8_q_unified_attention.py
     use_mla_auto_kv_splits: bool = False
+    use_mla_fp8_q_asm: bool = False
+    use_mla_dcp_asm: bool = False
 
     # Set in __init__; declared here for tests that build the backend without it
     # (test_aiter_fp8_kv_scales_paths.py).
@@ -763,7 +808,26 @@ class AiterAttnBackend(AttentionBackend):
                     intra_batch_mode = False
                 log_mla_gluon_capability(logger)
 
-            use_any_mla_persist = _use_mla_ps_kernel or self.use_mla_dcp_asm
+            self.use_mla_fp8_q_asm = _fp8_q_asm_mla_selected(
+                enabled=envs.SGLANG_OPT_HIP_MLA_FP8_Q_ASM.get(),
+                num_head=self.num_head,
+                head_pad_mode=self.head_pad_mode,
+                kv_cache_dtype=self.kv_cache_dtype,
+                decode_backend=self.mla_decode_backend,
+                verify_backend=self.mla_verify_backend,
+                dcp_world_size=self.dcp_world_size,
+                is_draft_worker=model_runner.is_draft_worker,
+                verify_qlen=self.num_draft_tokens or 1,
+                gfx95=is_gfx95_supported(),
+                max_verify_qlen=envs.SGLANG_OPT_HIP_MLA_FP8_Q_ASM_MAX_QLEN.get(),
+            )
+            if self.use_mla_fp8_q_asm:
+                logger.info(
+                    "aiter MLA: decode/verify use the FP8-Q ASM kernel (qlen<=%s)",
+                    envs.SGLANG_OPT_HIP_MLA_FP8_Q_ASM_MAX_QLEN.get(),
+                )
+
+            use_any_mla_persist = self._mla_ps_kernel_enabled() or self.use_mla_dcp_asm
             self.max_split_per_batch = 32 if use_any_mla_persist else None
 
             if self.num_draft_tokens is None and use_any_mla_persist:
@@ -786,8 +850,11 @@ class AiterAttnBackend(AttentionBackend):
                     "aiter MLA: aiter plans the KV splits "
                     "(SGLANG_AITER_MLA_AUTO_KV_SPLITS=1)"
                 )
-                fast_mode = True
-                intra_batch_mode = False
+                # Draft extend reads the module modes; the fp8-Q opt-in alone must not
+                # flip them, it takes its own from _mla_decode_metadata_modes.
+                if _use_mla_ps_kernel or self.use_mla_dcp_asm:
+                    fast_mode = True
+                    intra_batch_mode = False
                 self.max_split_per_batch = -1
 
             self.fix_max_split_per_batch = self.max_split_per_batch
@@ -842,6 +909,11 @@ class AiterAttnBackend(AttentionBackend):
             return "auto"
         return "fp8_e4m3"
 
+    def _mla_ps_kernel_enabled(self) -> bool:
+        """SGLANG_AITER_MLA_PERSIST, or this instance's fp8-Q opt-in for decode/verify;
+        draft extend reads _use_mla_ps_kernel and keeps the process default."""
+        return _use_mla_ps_kernel or self.use_mla_fp8_q_asm
+
     def _quantize_q_fp8(self, q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Quantize ``q`` to fp8 with the static q scale.
 
@@ -860,19 +932,32 @@ class AiterAttnBackend(AttentionBackend):
     def _use_mla_decode_persist_metadata(self) -> bool:
         """Persist MLA metadata for non-DCP PS decode, or DCP ASM decode.
 
-        Matches main's ``_use_mla_ps_kernel and dcp_world_size <= 1`` when ASM
+        Matches ``_mla_ps_kernel_enabled() and dcp_world_size <= 1`` when ASM
         is off. DCP ASM needs the same buffers with fast_mode scheduling.
         """
-        return (_use_mla_ps_kernel and self.dcp_world_size <= 1) or (
+        return (self._mla_ps_kernel_enabled() and self.dcp_world_size <= 1) or (
             self.use_mla_dcp_asm and self.dcp_world_size > 1
         )
 
     def _mla_decode_metadata_modes(self) -> tuple[bool, bool]:
+        """(fast_mode, intra_batch_mode) for decode and non-cp verify metadata."""
         if self.use_mla_dcp_asm and self.dcp_world_size > 1:
             # Match the AITER/vLLM DCP path: persistent scheduling with the
             # gathered-head tensor folded internally to qh16.
             return True, False
+        if self.use_mla_fp8_q_asm:
+            # SGLANG_AITER_MLA_PERSIST=0 leaves the module modes non-persistent;
+            # take what PERSIST=1 would set, with or without auto KV splits.
+            return (True, False) if self.use_mla_auto_kv_splits else (False, True)
         return fast_mode, intra_batch_mode
+
+    def _mla_verify_metadata_modes(
+        self, use_asm_cprr_verify: bool
+    ) -> tuple[bool, bool]:
+        """(fast_mode, intra_batch_mode) for target verify metadata."""
+        if use_asm_cprr_verify:
+            return self.cprr_fast_mode, self.cprr_intra_batch_mode
+        return self._mla_decode_metadata_modes()
 
     def make_mla_decode_meta_data_buffer(
         self,
@@ -1557,10 +1642,11 @@ class AiterAttnBackend(AttentionBackend):
         q / o must already be shaped (..., num_head, head_dim).
         """
         num_head = layer.tp_q_head_num
+        max_q_len = kwargs.get("max_seqlen_q") or 1
         if (
-            _use_mla_ps_kernel
+            self._mla_ps_kernel_enabled()
             and self.dcp_world_size <= 1
-            and self._asm_ps_supports_qlen(kwargs.get("max_seqlen_q") or 1)
+            and self._asm_ps_supports_qlen(max_q_len)
         ):
             # The asm kernel reads KV row 0 for masked positions and weights it
             # by p = 0. A NaN there spreads to every request, because
@@ -1568,16 +1654,18 @@ class AiterAttnBackend(AttentionBackend):
             # their KV, and that KV can be NaN. Gluon, the kernel this path
             # replaces, does not read row 0.
             k_buffer_flat[0].zero_()
+        # Draft extend has no persist metadata under PERSIST=0 and keeps its bf16 query.
+        fp8_q_asm_call = (
+            self.use_mla_fp8_q_asm and kwargs.get("work_meta_data") is not None
+        )
         if (
             self.kv_cache_dtype == fp8_dtype
             and self.mla_kernel_num_head_padded == 16
             and is_gfx95_supported()
-            and (kwargs.get("max_seqlen_q") or 1) > _MLA_ASM_PS_MAX_QLEN
+            and (fp8_q_asm_call or max_q_len > _MLA_ASM_PS_MAX_QLEN)
             and q.dtype != fp8_dtype
         ):
-            q_flat = q.reshape(q.shape[0], -1).to(fp8_dtype)
-            kwargs["q_scale"] = torch.ones((), dtype=torch.float32, device=q.device)
-            q = q_flat.view(q.shape)
+            q, kwargs["q_scale"] = self._quantize_q_fp8(q)
         if self.head_pad_mode == "repeat" or (
             self.head_pad_mode == "none" and self.num_head_padded != self.num_head
         ):
@@ -1671,7 +1759,7 @@ class AiterAttnBackend(AttentionBackend):
             num_head=getattr(self, "num_head", layer.tp_q_head_num),
             kv_cache_dtype=self.kv_cache_dtype,
         ) and not (
-            _use_mla_ps_kernel
+            self._mla_ps_kernel_enabled()
             and self.mla_decode_backend == "asm"
             and self._asm_ps_supports_qlen(max_q_len)
         ):
@@ -1694,6 +1782,8 @@ class AiterAttnBackend(AttentionBackend):
         reduce_final_map = self.forward_metadata.reduce_final_map
         reduce_partial_map = self.forward_metadata.reduce_partial_map
         num_kv_splits = self._kernel_num_kv_splits()
+        # The kernel takes the intra_batch_mode its metadata was planned with.
+        _, planned_intra_batch_mode = self._mla_decode_metadata_modes()
 
         return self._mla_decode_fwd_with_head_pad(
             q,
@@ -1714,7 +1804,7 @@ class AiterAttnBackend(AttentionBackend):
             reduce_partial_map=reduce_partial_map,
             q_scale=k_descale,
             kv_scale=k_descale,
-            intra_batch_mode=intra_batch_mode,
+            intra_batch_mode=planned_intra_batch_mode,
             num_kv_splits=num_kv_splits,
         )
 
@@ -2520,13 +2610,16 @@ class AiterAttnBackend(AttentionBackend):
                     ) = self._build_dcp_verify_ragged_indices(
                         verify_token_table, local_kv_lens, bs, draft_num
                     )
-                if _use_mla_ps_kernel and (
+                if self._mla_ps_kernel_enabled() and (
                     self.dcp_world_size <= 1 or use_asm_cprr_verify
                 ):
                     max_seqlen_qo = draft_num
                     is_cp_round_robin = self.dcp_world_size > 1
                     metadata_heads = (
                         self.cprr_kernel_heads if use_asm_cprr_verify else None
+                    )
+                    verify_fast_mode, verify_intra_batch_mode = (
+                        self._mla_verify_metadata_modes(use_asm_cprr_verify)
                     )
                     (
                         work_metadata,
@@ -2538,12 +2631,8 @@ class AiterAttnBackend(AttentionBackend):
                     ) = self.make_mla_decode_meta_data_buffer(
                         max_seqlen_qo,
                         bs,
-                        metadata_fast_mode=(
-                            self.cprr_fast_mode if use_asm_cprr_verify else None
-                        ),
-                        metadata_intra_batch_mode=(
-                            self.cprr_intra_batch_mode if use_asm_cprr_verify else None
-                        ),
+                        metadata_fast_mode=verify_fast_mode,
+                        metadata_intra_batch_mode=verify_intra_batch_mode,
                         nhead_override=metadata_heads,
                         max_split_per_batch=(
                             self.max_split_per_batch if use_asm_cprr_verify else None
@@ -2563,15 +2652,9 @@ class AiterAttnBackend(AttentionBackend):
                         reduce_final_map,
                         reduce_partial_map,
                         max_seqlen_qo,
-                        fast_mode=(
-                            self.cprr_fast_mode if use_asm_cprr_verify else fast_mode
-                        ),
+                        fast_mode=verify_fast_mode,
                         max_split_per_batch=num_kv_splits,
-                        intra_batch_mode=(
-                            self.cprr_intra_batch_mode
-                            if use_asm_cprr_verify
-                            else intra_batch_mode
-                        ),
+                        intra_batch_mode=verify_intra_batch_mode,
                         is_cp_round_robin=is_cp_round_robin,
                         nhead_override=metadata_heads,
                     )
@@ -3010,13 +3093,13 @@ class AiterAttnBackend(AttentionBackend):
             )
 
         # if self.use_mla and (_use_mla_ps_kernel or self.kv_cache_dtype == fp8_dtype):
-        if self.use_mla and (_use_mla_ps_kernel or self.use_mla_dcp_asm):
+        if self.use_mla and (self._mla_ps_kernel_enabled() or self.use_mla_dcp_asm):
             # for persistent mla_decode_fwd
             max_seqlen_qo = (
                 1 if self.num_draft_tokens is None else self.num_draft_tokens
             )
             metadata_fast_mode, metadata_intra_batch_mode = (
-                (True, False) if self.use_mla_dcp_asm else (fast_mode, intra_batch_mode)
+                self._mla_decode_metadata_modes()
             )
 
             graph_use_asm_cprr_verify = self._asm_cprr_supports_verify_shape(
@@ -3372,11 +3455,14 @@ class AiterAttnBackend(AttentionBackend):
 
             if self.use_mla:
                 max_q_len = self.num_draft_tokens
-                if _use_mla_ps_kernel and (
+                if self._mla_ps_kernel_enabled() and (
                     self.dcp_world_size <= 1 or use_asm_cprr_verify
                 ):
                     num_kv_splits = self.max_split_per_batch
                     is_cp_round_robin = self.dcp_world_size > 1
+                    verify_fast_mode, verify_intra_batch_mode = (
+                        self._mla_verify_metadata_modes(use_asm_cprr_verify)
+                    )
 
                     self.make_mla_meta_data(
                         qo_indptr,
@@ -3389,15 +3475,9 @@ class AiterAttnBackend(AttentionBackend):
                         self.reduce_final_map,
                         self.reduce_partial_map,
                         max_q_len,
-                        fast_mode=(
-                            self.cprr_fast_mode if use_asm_cprr_verify else fast_mode
-                        ),
+                        fast_mode=verify_fast_mode,
                         max_split_per_batch=num_kv_splits,
-                        intra_batch_mode=(
-                            self.cprr_intra_batch_mode
-                            if use_asm_cprr_verify
-                            else intra_batch_mode
-                        ),
+                        intra_batch_mode=verify_intra_batch_mode,
                         is_cp_round_robin=is_cp_round_robin,
                         nhead_override=(
                             self.cprr_kernel_heads if use_asm_cprr_verify else None
@@ -4150,7 +4230,7 @@ class AiterAttnBackend(AttentionBackend):
                     num_head=getattr(self, "num_head", layer.tp_q_head_num),
                     kv_cache_dtype=self.kv_cache_dtype,
                 ) and not (
-                    _use_mla_ps_kernel
+                    self._mla_ps_kernel_enabled()
                     and self.mla_verify_backend == "asm"
                     and self._asm_ps_supports_qlen(self.forward_metadata.max_q_len or 1)
                 ):
@@ -4176,7 +4256,9 @@ class AiterAttnBackend(AttentionBackend):
                 reduce_final_map = self.forward_metadata.reduce_final_map
                 reduce_partial_map = self.forward_metadata.reduce_partial_map
 
-                num_kv_splits = self.forward_metadata.num_kv_splits
+                num_kv_splits = self._kernel_num_kv_splits()
+                # DCP verify returned above, so the decode modes planned this metadata.
+                _, planned_intra_batch_mode = self._mla_decode_metadata_modes()
 
                 o = self._mla_decode_fwd_with_head_pad(
                     q,
@@ -4197,7 +4279,7 @@ class AiterAttnBackend(AttentionBackend):
                     reduce_partial_map=reduce_partial_map,
                     q_scale=k_descale,
                     kv_scale=k_descale,
-                    intra_batch_mode=intra_batch_mode,
+                    intra_batch_mode=planned_intra_batch_mode,
                     num_kv_splits=num_kv_splits,
                 )
                 return o
