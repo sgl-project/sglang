@@ -319,10 +319,10 @@ def load_decision_config(model_path: str, revision: Optional[str]) -> Optional[d
         return None
     with open(path) as f:
         config = json.load(f)
-    if config["format_version"] != 1:
+    if config["format_version"] not in (1, 2):
         raise ValueError(
             f"decision_config.json format_version {config['format_version']} "
-            "is not supported, only version 1 is"
+            "is not supported, only versions 1 and 2 are"
         )
     # Serving a mode this loader does not honor would silently change the answers.
     attention_mode = config.get("attention_mode", "causal")
@@ -715,6 +715,9 @@ class ModelConfig:
             if self.decision_config is not None:
                 # A bare backbone whose readout the loader places in the LM head.
                 self.hf_config.architectures = ["Qwen3_5ForConditionalGeneration"]
+                # A tied LM head is the embedding table, which the readout would overwrite.
+                self.hf_config.tie_word_embeddings = False
+                self.hf_text_config.tie_word_embeddings = False
                 if (
                     self.decision_config.get("attention_mode")
                     == NONCAUSAL_FULL_ATTENTION

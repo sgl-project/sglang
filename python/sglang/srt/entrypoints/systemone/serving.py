@@ -34,6 +34,10 @@ from sglang.srt.entrypoints.systemone.joint_schema import (
     joint_schema_options,
 )
 from sglang.srt.entrypoints.systemone.kev import encode_kev
+from sglang.srt.entrypoints.systemone.pplx_inline_readout import (
+    encode_pplx_inline_readout,
+    pplx_prompt_order,
+)
 from sglang.srt.entrypoints.systemone.protocol import (
     SystemOneChoiceAnswer,
     SystemOneChoiceQuestion,
@@ -46,7 +50,7 @@ from sglang.srt.entrypoints.systemone.protocol import (
     SystemOneUsage,
 )
 from sglang.srt.layers.joint_schema_head import max_joint_prompt_tokens
-from sglang.srt.managers.io_struct import EmbeddingReqInput
+from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.runtime_context import get_schedule
 from sglang.srt.utils import CLIENT_MEDIA_EXCEPTIONS, ImageData, get_image_bytes
 
@@ -77,7 +81,11 @@ class SystemOneServing(OpenAIServingDecisions):
         return "systemone-"
 
     def _validate_request(self, request: SystemOneRequest) -> Optional[str]:
-        if self.joint_head_config is not None or self.pointer_head is not None:
+        if (
+            self.joint_head_config is not None
+            or self.pointer_head is not None
+            or self._pplx_inline_readout
+        ):
             return self._validate_joint_schema_request(request)
         return (
             self._validate_server(request.model)
@@ -88,7 +96,7 @@ class SystemOneServing(OpenAIServingDecisions):
     def _validate_joint_schema_request(
         self, request: SystemOneRequest
     ) -> Optional[str]:
-        """A Clef or Kev checkpoint renders its own prompt, without the chat template."""
+        """A Clef, Kev, or pplx-decider v1.2 checkpoint renders its own prompt."""
         route = self.route
         if self.tokenizer_manager.tokenizer is None:
             return f"{route} requires the server tokenizer"
@@ -101,12 +109,25 @@ class SystemOneServing(OpenAIServingDecisions):
         if request.images and self.tokenizer_manager.mm_processor is None:
             return f"{route} images require a model served with multimodal input"
         if request.chat_template_kwargs:
+            if self.pointer_head is not None:
+                scorer = "pointer head"
+            elif self.joint_head_config is not None:
+                scorer = "joint schema head"
+            else:
+                scorer = "decision readout"
             return (
-                f"{route} renders the prompt this checkpoint's "
-                f"{'pointer' if self.pointer_head is not None else 'joint schema'} "
-                "head was trained with, which takes no chat_template_kwargs"
+                f"{route} renders the prompt this checkpoint's {scorer} was "
+                "trained with, which takes no chat_template_kwargs"
             )
         return None
+
+    @property
+    def _pplx_inline_readout(self) -> bool:
+        """A decision checkpoint that answers every question at a marker of one prompt."""
+        return (
+            self.decision_config is not None
+            and self.decision_config.get("format_version", 1) == 2
+        )
 
     def _convert_to_internal_request(
         self,
@@ -121,6 +142,8 @@ class SystemOneServing(OpenAIServingDecisions):
             return self._joint_schema_request(request, views), (request, views)
         if self.pointer_head is not None:
             return self._pointer_request(request, views), (request, views)
+        if self._pplx_inline_readout:
+            return self._pplx_inline_readout_request(request, views), (request, views)
         encode = (
             self._encoded_systemone_questions
             if self.decision_config is None
@@ -128,6 +151,99 @@ class SystemOneServing(OpenAIServingDecisions):
         )
         # Lazy, so the async handler can yield to other requests between questions.
         return encode(request, views), (request, views)
+
+    def _pplx_inline_readout_request(
+        self, request: SystemOneRequest, views: List[QuestionView]
+    ) -> GenerateReqInput:
+        """All questions in one prompt, read at the marker after each question.
+
+        The handler encodes the prompt once it has read the image sizes."""
+        for question_id, view in zip(request.questions, views):
+            if view.kind == "score":
+                _check_legend(question_id, view)
+        return GenerateReqInput(
+            image_data=[
+                ImageData(url=image.url, detail=image.detail or "auto")
+                for image in request.images
+            ]
+            or None,
+        )
+
+    async def _answer_pplx_inline_readout(
+        self,
+        adapted_request: GenerateReqInput,
+        request: SystemOneRequest,
+        views: List[QuestionView],
+        raw_request: Request,
+    ) -> ORJSONResponse:
+        tokenizer_manager = self.tokenizer_manager
+        image_token_counts = []
+        if adapted_request.image_data:
+            adapted_request.image_data, image_token_counts = await self._read_images(
+                adapted_request.image_data
+            )
+        input_ids, positions = encode_pplx_inline_readout(
+            tokenizer_manager.tokenizer,
+            request,
+            views,
+            self.decision_config["codes"],
+            image_token_counts,
+        )
+        length = len(input_ids) + sum(count - 1 for count in image_token_counts)
+        if (
+            length + tokenizer_manager.num_reserved_tokens
+            >= tokenizer_manager.context_len
+        ):
+            raise ValueError(
+                f"the prompt has {length} tokens, which exceeds the context length "
+                f"of {tokenizer_manager.context_len} tokens"
+            )
+        token_ids = self.decision_config["token_ids"][
+            : max(len(view.names) for view in views)
+        ]
+        adapted_request.input_ids = input_ids
+        adapted_request.token_ids_logprob = token_ids
+        adapted_request.return_logprob = True
+        adapted_request.logprob_start_len = 0
+        adapted_request.sampling_params = {"max_new_tokens": 0}
+        adapted_request.token_indices_to_pool = positions
+        ret = await tokenizer_manager.generate_request(
+            adapted_request, raw_request
+        ).__anext__()
+        readouts = ret["meta_info"].get("input_token_ids_logprobs") or []
+        if len(readouts) != len(views):
+            raise RuntimeError("the decision readout did not score every question")
+        temperature = self.decision_config["temperature"]
+        answers = {}
+        for question_id, view, readout in zip(request.questions, views, readouts):
+            logprobs = {token: logprob for logprob, token, _ in readout}
+            order = pplx_prompt_order(view)
+            logits = [
+                logprobs[token] / temperature for token in token_ids[: len(order)]
+            ]
+            top = max(logits)
+            weights = [math.exp(logit - top) for logit in logits]
+            total = math.fsum(weights)
+            probabilities = [0.0] * len(order)
+            for weight, name_index in zip(weights, order):
+                probabilities[name_index] = weight / total
+            answers[question_id] = _answer(
+                view=view,
+                probabilities=probabilities,
+                mass=1.0,
+                question_id=question_id,
+            )
+        response = SystemOneResponse(
+            model=tokenizer_manager.served_model_name,
+            answers=answers,
+            usage=SystemOneUsage(input_tokens=ret["meta_info"]["prompt_tokens"]),
+        )
+        # The readout scores only the answer codes, so there is no label mass.
+        return ORJSONResponse(
+            content=response.model_dump(
+                exclude={"answers": {"__all__": {"x_label_mass"}}}
+            )
+        )
 
     def _joint_schema_request(
         self, request: SystemOneRequest, views: List[QuestionView]
@@ -414,6 +530,10 @@ class SystemOneServing(OpenAIServingDecisions):
             )
         if self.pointer_head is not None:
             return await self._answer_pointer(
+                adapted_request, request, views, raw_request
+            )
+        if self._pplx_inline_readout:
+            return await self._answer_pplx_inline_readout(
                 adapted_request, request, views, raw_request
             )
         _, _, result = await self._score(
