@@ -117,6 +117,9 @@ The maintained tests define the supported first-version scope:
   reusable-prefix accounting and cache-tier hit metrics across repeated runs;
 - [`test/test_aisimulate_predictor.py`](test/test_aisimulate_predictor.py):
   real-SDK prefill/decode prediction and prefix reuse in SOL and SILICON modes.
+- [`test/test_simulation_pd_e2e.py`](test/test_simulation_pd_e2e.py):
+  1P1D and 2P2D runs through the repository-level
+  [`PDDisaggBenchmarkRunner`](../../benchmark/simulator/pd_bench_runner.py).
 
 From `tools/sglang-simulator`:
 
@@ -283,6 +286,180 @@ and synchronized batch steps from a real SGLang server. Then use
 [train_ml_time_predictor](src/sglang_simulator/tools/train_ml_time_predictor/README.md) to train an
 18-feature latency model. Installing the package provides `sglang-simulator-collect`
 and `sglang-simulator-train`, including a small collected training example.
+
+## Prefill-decode disaggregation
+
+[`PDDisaggBenchmarkRunner`](../../benchmark/simulator/pd_bench_runner.py) runs
+one workload on one or more prefill instances and one or more decode instances
+in the same process. All instances go through SGLang's disaggregation queues,
+but no KV cache moves between them: the prefill sender and the decode receiver
+are SGLang's fake implementations, and the transfer time is modelled in between.
+
+```python
+import os
+
+os.environ["SGLANG_SIMULATOR_CONFIG_PATH"] = "/absolute/path/to/simulator.json"
+
+from sglang_simulator.simulation.benchmark import BenchmarkConfig
+from benchmark.simulator.pd_bench_runner import PDDisaggBenchmarkRunner
+from sglang.srt.server_args import ServerArgs
+
+common = dict(model_path="/path/to/model", load_format="dummy",
+              chunked_prefill_size=8192, page_size=256)
+runner = PDDisaggBenchmarkRunner(
+    ServerArgs(**common, disaggregation_mode="prefill",
+               disaggregation_transfer_backend="mooncake"),
+    ServerArgs(**common, disaggregation_mode="decode"),
+    output_dir="/tmp/sglang-simulator-pd",
+)
+try:
+    # `dataset` is any simulator dataset, such as a timestamped trace.
+    metrics = runner.benchmark(
+        BenchmarkConfig(ignore_request_timestamp=False), dataset
+    )
+finally:
+    runner.shutdown()
+```
+
+For several instances, pass a list of `ServerArgs` per role, each prefill
+instance with its own `disaggregation_bootstrap_port`, and optionally a
+`PDRouter`. Like the SGLang PD router, it picks the prefill and the decode
+instance of each request independently, in arrival order. It runs the gateway's
+own policies (`round_robin`, the default, `random`, `cache_aware`,
+`power_of_two`, `manual`, `bucket` for prefill, `consistent_hashing` and
+`prefix_hash`) through `sglang_router`, which must be built from
+`sgl-model-gateway/bindings/python` in this tree. Keyword arguments are the
+router's policy flags, with `launch_router`'s defaults:
+
+```python
+from benchmark.simulator.pd_bench_runner import PDRouter
+
+runner = PDDisaggBenchmarkRunner(
+    [ServerArgs(**common, disaggregation_mode="prefill",
+                disaggregation_transfer_backend="mooncake",
+                disaggregation_bootstrap_port=8998 + i) for i in range(2)],
+    [ServerArgs(**common, disaggregation_mode="decode") for _ in range(2)],
+    router=PDRouter(prefill_policy="cache_aware", decode_policy="power_of_two",
+                    cache_threshold=0.3),
+)
+```
+
+As in the gateway, a request counts against both its instances from routing
+until it completes, and `cache_aware`, `power_of_two` and `prefix_hash` read
+that count. Routing precedes the simulation, so completion times come from
+`PDRouter(end_times={rid: seconds})`, e.g. a measured run, or else the runner
+simulates the workload `routing_rounds` times (default 2), routing each round
+with the completion times of the round before. The router passes the prompt
+text when a policy needs it and, like the HTTP router, no tokens; `manual` and
+`consistent_hashing` read the routing key from `custom_params["headers"]`.
+Wall-clock parts of the policies, such as bucket boundary adjustment and cache
+tree eviction, do not follow the simulated clock.
+
+The run has two passes with a transfer step between them:
+
+1. The prefill pass replays the workload's timestamps, or arrivals generated
+   once from `request_rate` when `ignore_request_timestamp` is set. Each prefill
+   instance runs its own requests, concurrently with the others, and records
+   when each EXTEND chunk of a request finishes.
+2. The runner turns those chunks into the KV sends SGLang makes: one send per
+   chunk after the decode bootstrap completes, page-aligned except for the last.
+   A prefill prefix hit already on the device is sent on its own when its batch
+   starts, ahead of the forward, as SGLang does by default. A send moves whole
+   pages, so a partial last page is charged as a full one. Sends of one request
+   are serial. As in SGLang, each prefill instance shards its sends over
+   `transfer_queues` queues by decode instance, and each queue sends one wave at
+   a time. Queues moving data out of one prefill instance, or into one decode
+   instance, share its bandwidth.
+3. The decode pass always starts each request at the end of its own prefill and holds
+   it in the transfer queue until the part of the transfer that prefill did not
+   hide has elapsed.
+
+`metrics` reports client-visible TTFT and TPOT across both passes, plus lists of
+per-instance metrics under `prefill` and `decode`; the prefill metrics include
+the `kv_layout` (page size, KV bytes per token per rank, chunked prefill size)
+the waves were built from. Each request statistic also carries
+`prefill_instance`, `decode_instance`, `kv_xfer_send_s` (summed send time),
+`kv_xfer_visible_s` (the wait decode observed), `kv_xfer_n_waves`, and
+`kv_xfer_wave_tokens`. All times are on the workload's timeline.
+
+Requirements:
+
+- The prefill instance needs a real transfer backend because SGLang rejects
+  `fake` on a prefill server. With `mooncake`, the Mooncake transfer engine is
+  initialised at startup, so `mooncake-transfer-engine` must be installed, but
+  nothing is sent.
+- The decode instance always uses the `fake` backend, so decode radix cache is
+  unavailable and the whole prompt is transferred.
+
+Configure the transfer model with `kv_transfer_config` in the simulator
+configuration:
+
+```json
+"kv_transfer_config": {
+  "network": "EXAMPLE_RDMA",
+  "network_profiles": "../network_profiles/example_profiles.json",
+  "seed": 0
+}
+```
+
+A send costs `alpha + bytes / bandwidth` plus a sampled excursion.
+
+| Key | Meaning |
+|---|---|
+| `network` | Profile name looked up in `network_profiles`; see below. Explicit keys below override it. |
+| `network_profiles` | Path to a JSON file of profiles by name, or the mapping itself. A relative path is tried from the working directory, then from the configuration file's directory and its parents. Required with `network`. |
+| `alpha_us` | Per-send fixed cost. Default `0`. |
+| `bandwidth_gbps` | Effective bandwidth of one rank's share of a send. Default: the accelerator's nominal inter-node bandwidth. |
+| `bootstrap_alpha_s` | Time after arrival at which the decode bootstrap completes. Nothing is sent before it: earlier chunks are merged into the next send, and a prefill that finishes first waits for it. Default `0`, for a bootstrap that completes before a request's first batch. |
+| `excursion` | Delays above the alpha-beta line, in the profile format below. |
+| `max_inflight_waves` | Sends of different requests that may overlap in one transfer queue. Default `1`, as a Mooncake queue sends one chunk at a time. |
+| `transfer_queues` | Transfer queues per prefill instance (SGLang's `SGLANG_DISAGGREGATION_QUEUE_SIZE`). Decode instance `j` uses queue `j % transfer_queues`. Default `4`. |
+| `visible_scale` | Scales only the wait decode observes; send times are unchanged. Default `1.0`. |
+| `chunked_prefill` | `false` sends each request in one wave. |
+| `seed` | Seed for excursion sampling, derived per request so runs are reproducible. |
+
+Without `kv_transfer_config`, decode starts as soon as prefill finishes. An
+unknown network or an invalid value raises an error.
+
+No profiles are bundled, because fitted values describe the hardware, model
+and parallelism they were measured on.
+[`examples/network_profiles/example_profiles.json`](examples/network_profiles/example_profiles.json)
+shows the format with made-up values, and
+[`examples/sim_configs/pd_ml.json`](examples/sim_configs/pd_ml.json) uses it;
+replace its predictor paths with bundles trained for your deployment. A profile
+file maps each network name to:
+
+| Key | Meaning |
+|---|---|
+| `alpha_us` | Fixed cost of one send, in microseconds. |
+| `bandwidth_gbps` | Effective bandwidth of one rank's share of a send, in GB/s. |
+| `excursion.bands` | Delay distributions by send size. A send uses the first band, by ascending `max_bytes` (bytes per rank), that it is smaller than; a band without `max_bytes` has no limit. With `probability`, the send is delayed by a draw from `magnitude_s`, a `{seconds: weight}` distribution. |
+| `excursion.later_wave_exc_scale` | Scales the delay of every wave after a request's first. Default `1`. |
+
+To fit a profile, record the bytes per rank and the elapsed time of every KV
+send on the deployment you simulate; a send takes as long as its slowest rank.
+
+1. Send prompts of several fixed lengths one at a time, and fit
+   `elapsed = alpha + bytes / bandwidth` to the median send time of each size.
+2. Replay a representative trace and take each send's excursion, its elapsed
+   time above that line. Per size band, `probability` is the share of sends
+   whose excursion exceeds a small threshold, and `magnitude_s` is the
+   histogram of those excursions.
+3. Set `later_wave_exc_scale` to the mean excursion of later waves divided by
+   that of first waves.
+
+For a DeepSeek-V4 model, the KV bytes per token are measured from the KV pool,
+whose padded c4, c128 and indexer sub-pools the model config cannot describe.
+Other models keep the size derived from the model config.
+
+The `ml` predictor makes two independent choices. By instance role, a prefill
+instance loads `prefill_database_path` when it is set, and every other instance
+loads `database_path`. By batch phase, a bundle with separate `prefill` and
+`decode` regressors runs `decode` for batches whose requests all extend by one
+token and `prefill` for every other batch; `prefill_scale_factor` and
+`decode_scale_factor` scale the two phases, as they do for `aisimulate`.
+Set `scheduler.ignore_cpu_overhead` to `true` to keep the simulator's own host
+time off the simulated clock.
 
 ## Workload formats
 
