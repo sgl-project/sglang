@@ -396,20 +396,19 @@ def handle_a2a_moe(server_args: Any):
 
     cfg = resolving_view(server_args)
 
-    from sglang.srt.eplb.moe_load_balancer_glue import (
-        get_moe_load_balancer_pipeline,
-        pipeline_supports_a2a_backend,
-    )
+    from sglang.srt.eplb.moe_load_balancer_glue import get_moe_load_balancer_pipeline
 
     pipeline = get_moe_load_balancer_pipeline(cfg.moe_load_balancer_algorithm)
-    if (
-        pipeline is not None
-        and cfg.moe_a2a_backend == "ascend_ops"
-        and not pipeline_supports_a2a_backend(pipeline, cfg.moe_a2a_backend)
+    # EvenMoE routing runs on NVIDIA CUDA only; ascend_ops is an NPU backend.
+    platform = get_platform()
+    if pipeline is not None and (
+        not platform.is_cuda
+        or platform.is_hip
+        or platform.is_musa
+        or cfg.moe_a2a_backend == "ascend_ops"
     ):
         raise ValueError(
-            "The selected EvenMoE pipeline is incompatible with ascend_ops; "
-            f"supported A2A backends: {pipeline.capabilities.supported_a2a_backends}."
+            "--moe-load-balancer-algorithm is only supported on NVIDIA CUDA."
         )
 
     run_post_process_pass(server_args, _a2a_backend_overrides)

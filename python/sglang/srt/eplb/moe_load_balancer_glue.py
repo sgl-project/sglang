@@ -142,15 +142,6 @@ def get_moe_load_balancer_pipeline(algorithm):
     return RoutingPipeline.from_value(algorithm)
 
 
-def pipeline_supports_a2a_backend(pipeline, moe_a2a_backend: str) -> bool:
-    """Whether ``pipeline`` can dispatch over this ``--moe-a2a-backend``."""
-    from evenmoe.adapters.sglang import a2a_backend_from_sglang
-
-    return pipeline.capabilities.supports_a2a_backend(
-        a2a_backend_from_sglang(moe_a2a_backend)
-    )
-
-
 def resolve_pipeline_a2a_backend(pipeline, moe_a2a_backend: str) -> str:
     """The ``--moe-a2a-backend`` to run ``pipeline`` with: the requested one if
     supported, else the pipeline's first supported backend SGLang has."""

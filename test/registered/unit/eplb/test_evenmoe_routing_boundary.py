@@ -461,47 +461,6 @@ class TestLoadBalancerBeforeSharedLayout(CustomTestCase):
                     result.topk_ids, result.topk_ids.new_tensor([[6, 1, 9]])
                 )
 
-    def test_npu_finalizer_routes_before_native_layout(self):
-        from sglang.srt.hardware_backend.npu.moe.topk import _finalize_topk_npu
-
-        with (
-            self._boundary_context(per_rank=False),
-            patch.object(topk_module, "_is_npu", True),
-        ):
-            config = TopKConfig(
-                top_k=3,
-                shared_experts=SharedExpertsConfig(num_fused_shared_experts=1),
-            )
-
-            def route(**kwargs):
-                raw = kwargs["topk_output"]
-                torch.testing.assert_close(raw.topk_ids, torch.tensor([[0, 3], [1, 2]]))
-                return StandardTopKOutput(
-                    raw.topk_weights, torch.tensor([[5, 1], [2, 4]]), raw.router_logits
-                )
-
-            with patch(
-                "sglang.srt.eplb.moe_load_balancer_glue.route_topk_with_mlb",
-                side_effect=route,
-            ) as routed:
-                result = _finalize_topk_npu(
-                    topk_ids=torch.tensor([[0, 3, 4], [1, 2, 4]]),
-                    topk_weights=torch.tensor([[0.25, 0.75, 0.4], [0.5, 0.5, 0.4]]),
-                    router_logits=torch.zeros(2, 4),
-                    topk_config=config,
-                    num_token_non_padded=torch.tensor(1),
-                    expert_location_dispatch_info=None,
-                    layer_id=7,
-                    moe_load_balancer=object(),
-                )
-            routed.assert_called_once()
-            torch.testing.assert_close(
-                result.topk_ids, torch.tensor([[5, 1, 8], [2, 4, 8]])
-            )
-            torch.testing.assert_close(
-                result.topk_weights, torch.tensor([[0.25, 0.75, 0.4], [0.0, 0.0, 0.0]])
-            )
-
     def test_empty_ranks_route_without_shared_columns(self):
         pipeline = SimpleNamespace(
             capabilities=SimpleNamespace(requires_post_topk_routing=True)

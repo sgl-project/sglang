@@ -3305,26 +3305,28 @@ class TestAscendOpsArgs(CustomTestCase):
     @unittest.skipUnless(
         importlib.util.find_spec("evenmoe"), "evenmoe is not installed"
     )
-    def test_ascend_ops_rejected_by_waterfill_without_config(self):
+    @override_platform(is_cuda=True, is_hip=False, is_musa=False)
+    def test_ascend_ops_rejects_moe_load_balancer_without_config(self):
         server_args = ServerArgs(
             model_path="dummy",
             moe_a2a_backend="ascend_ops",
             moe_load_balancer_algorithm="waterfill",
         )
-        with self.assertRaisesRegex(ValueError, "incompatible.*ascend_ops"):
+        with self.assertRaisesRegex(ValueError, "only supported on NVIDIA CUDA"):
             handle_a2a_moe(server_args)
 
     @unittest.skipUnless(
         importlib.util.find_spec("evenmoe"), "evenmoe is not installed"
     )
-    def test_ascend_ops_rejected_by_waterfill_with_config(self):
+    @override_platform(is_cuda=True, is_hip=False, is_musa=False)
+    def test_ascend_ops_rejects_moe_load_balancer_with_config(self):
         server_args = ServerArgs(
             model_path="dummy",
             moe_a2a_backend="ascend_ops",
             moe_ascend_ops_config="{}",
             moe_load_balancer_algorithm="waterfill",
         )
-        with self.assertRaisesRegex(ValueError, "incompatible.*ascend_ops"):
+        with self.assertRaisesRegex(ValueError, "only supported on NVIDIA CUDA"):
             handle_a2a_moe(server_args)
 
     def test_ascend_ops_speculative_draft_requires_npu(self):
@@ -3383,6 +3385,10 @@ class TestLoadBalancerSharedRoutingArgs(CustomTestCase):
         )
         patcher.start()
         self.addCleanup(patcher.stop)
+        # EvenMoE routing is accepted on NVIDIA CUDA only.
+        platform = override_platform(is_cuda=True, is_hip=False, is_musa=False)
+        platform.install()
+        self.addCleanup(platform.restore)
 
     def test_waterfill_enforces_shared_experts_fusion(self):
         server_args = ServerArgs(
@@ -3458,7 +3464,6 @@ class TestLoadBalancerBackendSelection(CustomTestCase):
             ("waterfill", "flashinfer", "deepep"),
             ("lplb+waterfill", "megamoe", "megamoe"),
             ("lplb", "megamoe", "megamoe"),
-            ("lplb", "ascend_ops", "ascend_ops"),
             ("static", "mori", "mori"),
             ("ultraep", "megamoe", "deepep"),
             ("disabled", "megamoe", "megamoe"),
@@ -3487,31 +3492,27 @@ class TestLoadBalancerBackendSelection(CustomTestCase):
         self.assertEqual(overrides, {"moe_a2a_backend": "deepep"})
         self.assertIn("from 'megamoe' to 'deepep'", "\n".join(logs.output))
 
-    @override_platform(is_npu=False)
-    def test_ascend_rejection_depends_on_pipeline_backend_contract(self):
-        from evenmoe import A2A_DEEPEP, RoutingCapabilities
+    def test_load_balancer_requires_nvidia_cuda(self):
+        no_device = dict(
+            is_cuda=False, is_hip=False, is_musa=False, is_npu=False, is_xpu=False
+        )
 
-        for supported, error in (
-            (None, "only supported on NPU"),
-            ((A2A_DEEPEP,), "incompatible.*ascend_ops"),
-        ):
-            with self.subTest(supported=supported):
-                pipeline = SimpleNamespace(
-                    capabilities=RoutingCapabilities(supported_a2a_backends=supported)
-                )
-                args = ServerArgs(
-                    model_path="dummy",
-                    moe_load_balancer_algorithm="custom",
-                    moe_a2a_backend="ascend_ops",
-                )
-                with (
-                    patch(
-                        "sglang.srt.eplb.moe_load_balancer_glue.get_moe_load_balancer_pipeline",
-                        return_value=pipeline,
-                    ),
-                    self.assertRaisesRegex(ValueError, error),
+        def args():
+            return ServerArgs(
+                model_path="dummy",
+                moe_load_balancer_algorithm="lplb",
+                moe_a2a_backend="deepep",
+            )
+
+        for name in ("npu", "xpu", "hip", "musa", "cpu"):
+            facts = no_device if name == "cpu" else {**no_device, f"is_{name}": True}
+            with self.subTest(platform=name), override_platform(**facts):
+                with self.assertRaisesRegex(
+                    ValueError, "only supported on NVIDIA CUDA"
                 ):
-                    handle_a2a_moe(args)
+                    handle_a2a_moe(args())
+        with override_platform(**{**no_device, "is_cuda": True}):
+            handle_a2a_moe(args())
 
     def test_custom_policy_owns_backend_preference(self):
         from evenmoe import RoutingCapabilities
