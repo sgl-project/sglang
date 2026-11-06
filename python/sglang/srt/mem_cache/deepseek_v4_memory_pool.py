@@ -1146,7 +1146,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                     device=device,
                     enable_memory_saver=enable_memory_saver,
                     global_page_size=swa_page_size,
-                    kv_layout=self.kv_layout,
+                    kv_layout=self._window_kv_layout(),
                 )
 
             self.swa_kv_pool = None
@@ -1193,7 +1193,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 device=device,
                 enable_memory_saver=enable_memory_saver,
                 global_page_size=swa_page_size,
-                kv_layout=self.kv_layout,
+                kv_layout=self._window_kv_layout(),
                 cls=kv_pool_cls,
             )
         elif self._unified_kv:
@@ -1238,7 +1238,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 device=device,
                 enable_memory_saver=enable_memory_saver,
                 global_page_size=swa_page_size,
-                kv_layout=self.kv_layout,
+                kv_layout=self._window_kv_layout(),
                 cls=kv_pool_cls,
             )
 
@@ -1587,7 +1587,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                     global_page_size=page_size,
                     cls=pool_cls,
                     kv_layout=self.compressed_kv_layout(ratio),
-                    compressed=True,
                 )
             for ratio, sources in low_ratio_sources.items():
                 self.kv_pools[ratio] = self._make_kv_pool(
@@ -1600,7 +1599,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                     global_page_size=page_size,
                     cls=kv_pool_cls,
                     kv_layout=self.compressed_kv_layout(ratio),
-                    compressed=True,
                 )
 
         index_k_page8 = _is_hip and envs.SGLANG_HIP_DSV41_INDEX_K_PAGE8.get()
@@ -1663,14 +1661,10 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         global_page_size: int,
         cls: type = DeepSeekV4SingleKVPool,
         kv_layout: KVLayout = KVLayout.V4,
-        compressed: bool = False,
     ) -> DeepSeekV4SingleKVPool:
         """Build a full / SWA / c4 / c128 single-KV pool. ``global_page_size``
         is the model-wide logical page size. CUDA pools use it to reserve enough
         physical rows for the allocator's dummy logical page.
-        ``compressed`` marks a per-ratio compressed pool; only the NPU override
-        reads it (it selects the V4.1 fp4 row format over the window pool's fp8
-        one), CUDA pools are unaffected.
         Overridden by :class:`DSV4NPUTokenToKVPool` to swap in the NPU bf16
         PA_ND variant, which needs ``global_page_size`` for its kernel view."""
         return cls(
@@ -1685,6 +1679,12 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             global_page_size=global_page_size,
             kv_layout=kv_layout,
         )
+
+    def _window_kv_layout(self) -> KVLayout:
+        """kv_layout of the non-compressed (full/swa/window) pools. Mirrors
+        :func:`compressed_kv_layout` so backends resolve their row format per
+        pool role; the default keeps the model-level value."""
+        return self.kv_layout
 
     def compressed_kv_layout(self, compress_ratio: int) -> KVLayout:
         """See :func:`resolve_compressed_kv_layout`."""

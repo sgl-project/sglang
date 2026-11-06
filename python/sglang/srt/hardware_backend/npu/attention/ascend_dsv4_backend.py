@@ -934,8 +934,6 @@ class C4IndexerAscendBackendMixin:
         weights: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        import torch_npu
-
         if k.dtype == torch.float8_e4m3fn:
             # A5: block-quantize Q to FP8 so it matches the FP8 K buffer; scales
             # stay fp32 and the kernel wants one scale per (token, head).
@@ -1183,7 +1181,6 @@ class LowRatioCompressAscendBackendMixin:
                 "DeepSeek-V4.1 index K needs the compressor latent, but the "
                 f"compressor did not run for layer {layer.layer_id}."
             )
-        import torch_npu
 
         indexer = layer.indexer
         ratio = layer.compress_ratio
@@ -1252,7 +1249,6 @@ class LowRatioCompressAscendBackendMixin:
         """Packed MXFP4 Q, its E8M0 scales and the head weights, for both
         indexers (QLI and QSLI share the same Q side).
         """
-        import torch_npu
 
         indexer = layer.indexer
         t = int(q_lora.shape[0])
@@ -1395,12 +1391,12 @@ class LowRatioCompressAscendBackendMixin:
                 )
             head_dim = int(index_k.shape[-1]) * 2
             # 32 = the prologue's e4m3 scale group.
-            record = block * (head_dim // 2 + head_dim // 32)
+            row_bytes = block * (head_dim // 2 + head_dim // 32)
             cache = torch.zeros(
                 pages,
                 page_rows // block,
                 1,
-                record,
+                row_bytes,
                 dtype=torch.uint8,
                 device=index_k.device,
             )
@@ -2060,7 +2056,7 @@ class LowRatioCompressAscendBackendMixin:
             setattr(
                 metadata,
                 f"c{ratio}_index_page_table",
-                self._dsv41_graph_index_page_table(metadata, ratio),
+                self.graph_metadata[f"dsv41_index_page_table_c{ratio}"][:bs, :],
             )
             setattr(
                 metadata,
@@ -2208,35 +2204,6 @@ class LowRatioCompressAscendBackendMixin:
                 buf = torch.zeros_like(probe)
                 self.graph_metadata[key] = buf
             metadata.kernel_metadata[f"c{candidate_ratio}a_qsli_metadata"] = buf
-
-    def _dsv41_graph_index_page_table(self, metadata, ratio: int):
-        """Captured buffer for one ratio's indexer-K block table.
-
-        The FULL page table expanded to the index pool's page granularity
-        (full page p -> index pages [k*p, k*p + k)). The expansion widens the
-        row when k > 1, so it gets a dedicated buffer that the replay refresh
-        rewrites in place.
-        """
-        block_tables = getattr(metadata, "block_tables", None)
-        if block_tables is None:
-            return None
-        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
-            DSV41_INDEX_PAGE_SIZE,
-        )
-
-        slots_per_page = int(self.page_size) // ratio
-        assert slots_per_page % DSV41_INDEX_PAGE_SIZE == 0, (
-            f"ratio-{ratio} index pages of {DSV41_INDEX_PAGE_SIZE} slots do "
-            f"not tile a FULL page of {slots_per_page} slots"
-        )
-        blocks_per_page = slots_per_page // DSV41_INDEX_PAGE_SIZE
-        shape = (block_tables.shape[0], block_tables.shape[1] * blocks_per_page)
-        key = f"dsv41_index_page_table_c{ratio}"
-        buf = self.graph_metadata.get(key)
-        if buf is None or tuple(buf.shape) != shape:
-            buf = torch.zeros(shape, dtype=torch.int32, device=block_tables.device)
-            self.graph_metadata[key] = buf
-        return buf
 
     def _refresh_graph_dsv41_1d(self, ctx) -> None:
         """Decode replay refresh: derive the rows from ``out_cache_loc``."""
@@ -2766,6 +2733,30 @@ class DeepseekV4AscendAttnBackend(
         self.graph_metadata["c128_page_table"] = torch.full(
             (max_bs, max_pages), -1, dtype=torch.int32, device=device
         )
+
+        # V4.1 low-ratio indexer page tables: the FULL table expanded to the
+        # index pool's page granularity (full page p -> index pages
+        # [k*p, k*p + k), k = blocks_per_page). One shared buffer per ratio,
+        # row-sliced into each bucket's metadata and rewritten in place by the
+        # replay refresh -- the same lifecycle as the page tables above.
+        if self._dsv4_has_low_ratio:
+            from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+                DSV41_INDEX_PAGE_SIZE,
+            )
+
+            for ratio in self._dsv41_low_ratios():
+                slots_per_page = self.page_size // ratio
+                assert slots_per_page % DSV41_INDEX_PAGE_SIZE == 0, (
+                    f"ratio-{ratio} index pages of {DSV41_INDEX_PAGE_SIZE} slots do "
+                    f"not tile a FULL page of {slots_per_page} slots"
+                )
+                blocks_per_page = slots_per_page // DSV41_INDEX_PAGE_SIZE
+                self.graph_metadata[f"dsv41_index_page_table_c{ratio}"] = torch.full(
+                    (max_bs, max_pages * blocks_per_page),
+                    -1,
+                    dtype=torch.int32,
+                    device=device,
+                )
 
         # 1024 int32 per kernel-metadata buffer (fixed op metadata size)
         for key in (

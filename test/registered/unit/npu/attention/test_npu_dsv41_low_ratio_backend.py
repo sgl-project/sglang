@@ -49,13 +49,13 @@ from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
     DeepseekV4AscendAttnBackend,
     LowRatioCompressAscendBackendMixin,
 )
+from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.srt.hardware_backend.npu.dsv4 import dsv4_memory_pool
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
     DSV4NPUTokenToKVPool,
     DSV41NPUSingleKVPool,
-    dsv41_quant,
-    dsv41_row_layout,
 )
+from sglang.srt.hardware_backend.npu.dsv4.npu_kv_layout import NPUDSV4KVLayout
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DSV41_INDEX_PAGE_SIZE,
     get_dsv4_indexer_bytes_per_token,
@@ -128,6 +128,17 @@ def _low_ratio_backend(*, ratios=(1, 2), window=128):
     return backend
 
 
+def _seed_graph_index_page_tables(backend, *, bs, cols):
+    """Mirror ``_init_dsv4_graph_buffers``: one shared index-page-table buffer
+    per low ratio, sized (bs, cols * blocks_per_page); ``_init_dsv41_graph_metadata``
+    binds each bucket's metadata to its ``[:bs]`` row slice."""
+    for ratio in backend._dsv41_low_ratios():
+        blocks_per_page = (backend.page_size // ratio) // DSV41_INDEX_PAGE_SIZE
+        backend.graph_metadata[f"dsv41_index_page_table_c{ratio}"] = torch.full(
+            (bs, cols * blocks_per_page), -1, dtype=torch.int32
+        )
+
+
 def _batch(*, positions, out_cache_loc, seq_lens, batch_size):
     return SimpleNamespace(
         positions=torch.tensor(positions, dtype=torch.int64),
@@ -155,6 +166,7 @@ def _replay_decode_rows(batch, live):
         block_tables=torch.zeros((len(live), 1), dtype=torch.int32),
         kernel_metadata={},
     )
+    _seed_graph_index_page_tables(backend, bs=len(live), cols=1)
     backend._init_dsv41_graph_metadata(
         metadata, bs=len(live), tokens_per_req=1, device="cpu"
     )
@@ -178,19 +190,19 @@ class TestRowLayout(unittest.TestCase):
 
     def test_window_row_is_the_origin_544b_layout(self):
         # ori_kv: nope[448] + rope[64] = 512B FP8 E4M3 + 16 BF16 scales.
-        row_bytes, dtype = dsv41_row_layout(512, compressed=False)
-        self.assertEqual(row_bytes, 544)
+        kv_dim, dtype = NPUDSV4KVLayout.V41_SWA_FP8.kv_info(448, 64)
+        self.assertEqual(kv_dim, 544)
         self.assertEqual(dtype, torch.float8_e4m3fn)
 
     def test_compressed_row_is_the_320b_layout_for_both_ratios(self):
         # cmp_kv: 256B packed FP4 E2M1 + 32 BF16 scales, whatever the ratio.
-        row_bytes, dtype = dsv41_row_layout(512, compressed=True)
-        self.assertEqual(row_bytes, 320)
+        kv_dim, dtype = NPUDSV4KVLayout.V41_CMP_FP4.kv_info(448, 64)
+        self.assertEqual(kv_dim, 320)
         self.assertEqual(dtype, torch.uint8)
 
     def test_quant_modes_match_the_two_sides(self):
-        self.assertEqual(dsv41_quant(False), ("mxfp8_bf16", 32))
-        self.assertEqual(dsv41_quant(True), ("mxfp4_bf16", 16))
+        self.assertEqual(NPUDSV4KVLayout.V41_SWA_FP8.quant, ("mxfp8_bf16", 32))
+        self.assertEqual(NPUDSV4KVLayout.V41_CMP_FP4.quant, ("mxfp4_bf16", 16))
 
     def test_index_row_is_fp4_packed_pairs(self):
         # 64 payload bytes + 4 scale bytes per 128-dim row == 68.
@@ -198,19 +210,19 @@ class TestRowLayout(unittest.TestCase):
 
     def test_empty_head_dim_is_rejected(self):
         with self.assertRaises(AssertionError):
-            dsv41_row_layout(0, compressed=True)
+            NPUDSV4KVLayout.V41_CMP_FP4.kv_info(0, 0)
 
 
 class TestPoolFactory(unittest.TestCase):
-    """The V4.1 factory picks the row format from the pool's role.
+    """Pools arrive at the NPU factory pre-tagged with their row format.
 
-    The window pool and the ratio-1 compressed pool arrive with the same page
-    geometry, so keying the format off the ratio would silently give the
-    ratio-1 compressed pool the window's 544-byte fp8 rows while the ds41
-    attention op reads ``cmp_kv`` as 320-byte fp4.
+    ``_window_kv_layout()`` tags the non-compressed pools and
+    ``compressed_kv_layout()`` the compressed ones, so ``_make_kv_pool``
+    only ever sees ``NPUDSV4KVLayout`` members and never sniffs the
+    generation from the compression ratios.
     """
 
-    def _make(self, *, compression_ratios, page_size, global_page_size, compressed):
+    def _make(self, *, page_size, global_page_size, kv_layout):
         calls = {}
 
         def record(name):
@@ -221,7 +233,6 @@ class TestPoolFactory(unittest.TestCase):
             return factory
 
         fake_self = SimpleNamespace(
-            compression_ratios=compression_ratios,
             c128_page_size=128,
             qk_nope_head_dim=448,
             qk_rope_head_dim=64,
@@ -247,51 +258,118 @@ class TestPoolFactory(unittest.TestCase):
                 device="cpu",
                 enable_memory_saver=False,
                 global_page_size=global_page_size,
-                compressed=compressed,
+                kv_layout=kv_layout,
             )
         return out, calls
 
     def test_window_pool_is_the_fp8_side(self):
         out, calls = self._make(
-            compression_ratios=(0, 1, 2),
             page_size=128,
             global_page_size=128,
-            compressed=False,
+            kv_layout=NPUDSV4KVLayout.V41_SWA_FP8,
         )
         self.assertEqual(out, "DSV41NPUSingleKVPool")
-        self.assertIs(calls["DSV41NPUSingleKVPool"]["is_compressed"], False)
+        self.assertIs(
+            calls["DSV41NPUSingleKVPool"]["layout"], NPUDSV4KVLayout.V41_SWA_FP8
+        )
         # One row per slot: the window page is the global page.
         self.assertEqual(calls["DSV41NPUSingleKVPool"]["kernel_page_size"], 128)
 
     def test_ratio1_compressed_pool_is_fp4_despite_the_global_page(self):
         out, calls = self._make(
-            compression_ratios=(0, 1, 2),
             page_size=128,
             global_page_size=128,
-            compressed=True,
+            kv_layout=NPUDSV4KVLayout.V41_CMP_FP4,
         )
         self.assertEqual(out, "DSV41NPUSingleKVPool")
-        self.assertIs(calls["DSV41NPUSingleKVPool"]["is_compressed"], True)
+        self.assertIs(
+            calls["DSV41NPUSingleKVPool"]["layout"], NPUDSV4KVLayout.V41_CMP_FP4
+        )
 
     def test_ratio2_compressed_pool_is_fp4(self):
         out, calls = self._make(
-            compression_ratios=(0, 1, 2),
             page_size=64,
             global_page_size=128,
-            compressed=True,
+            kv_layout=NPUDSV4KVLayout.V41_CMP_FP4,
         )
         self.assertEqual(out, "DSV41NPUSingleKVPool")
-        self.assertIs(calls["DSV41NPUSingleKVPool"]["is_compressed"], True)
+        self.assertIs(
+            calls["DSV41NPUSingleKVPool"]["layout"], NPUDSV4KVLayout.V41_CMP_FP4
+        )
+        # A ratio-2 compressed page holds global // 2 rows.
+        self.assertEqual(calls["DSV41NPUSingleKVPool"]["kernel_page_size"], 64)
 
-    def test_v4_model_keeps_the_packed_fp8_pool(self):
+    def test_v4_window_pool_arrives_pre_tagged(self):
         out, calls = self._make(
-            compression_ratios=(0, 4, 128),
+            page_size=128,
+            global_page_size=128,
+            kv_layout=NPUDSV4KVLayout.A5_FP8,
+        )
+        self.assertEqual(out, "NPUDeepSeekV4SingleKVPool")
+        self.assertIs(
+            calls["NPUDeepSeekV4SingleKVPool"]["layout"], NPUDSV4KVLayout.A5_FP8
+        )
+        self.assertEqual(calls["NPUDeepSeekV4SingleKVPool"]["kernel_page_size"], 128)
+
+    def test_v4_c4_pool_keeps_its_native_page(self):
+        out, calls = self._make(
             page_size=32,
             global_page_size=128,
-            compressed=True,
+            kv_layout=NPUDSV4KVLayout.A5_FP8,
         )
         self.assertEqual(out, "NPUDeepSeekV4SingleKVPool")
         self.assertNotIn("DSV41NPUSingleKVPool", calls)
+        # A c4 page keeps its native page as the kernel view.
+        self.assertEqual(calls["NPUDeepSeekV4SingleKVPool"]["kernel_page_size"], 32)
+
+    def test_untyped_layout_is_rejected(self):
+        # Every pool arrives pre-tagged; a raw shared value is a caller bug.
+        with self.assertRaises(AssertionError):
+            self._make(page_size=128, global_page_size=128, kv_layout=KVLayout.V4)
+
+    def test_window_layout_resolves_the_row_format(self):
+        fake = SimpleNamespace(compression_ratios=(0, 1, 2))
+        self.assertIs(
+            DSV4NPUTokenToKVPool._window_kv_layout(fake),
+            NPUDSV4KVLayout.V41_SWA_FP8,
+        )
+        fake_v4 = SimpleNamespace(compression_ratios=(0, 4, 128))
+        with patch.object(dsv4_memory_pool, "is_npu_arch35", return_value=True):
+            self.assertIs(
+                DSV4NPUTokenToKVPool._window_kv_layout(fake_v4),
+                NPUDSV4KVLayout.A5_FP8,
+            )
+        with patch.object(dsv4_memory_pool, "is_npu_arch35", return_value=False):
+            self.assertIs(
+                DSV4NPUTokenToKVPool._window_kv_layout(fake_v4),
+                NPUDSV4KVLayout.A3_BF16,
+            )
+
+    def test_compressed_kv_layout_tags_every_ratio(self):
+        fake = SimpleNamespace(
+            compression_ratios=(0, 1, 2),
+            kv_layout=KVLayout.V4,
+            compressed_kv_layout_option=None,
+        )
+        self.assertIs(
+            DSV4NPUTokenToKVPool.compressed_kv_layout(fake, 1),
+            NPUDSV4KVLayout.V41_CMP_FP4,
+        )
+        fake_v4 = SimpleNamespace(
+            compression_ratios=(0, 4, 128),
+            kv_layout=KVLayout.V4,
+            compressed_kv_layout_option=None,
+        )
+        with patch.object(dsv4_memory_pool, "is_npu_arch35", return_value=True):
+            self.assertIs(
+                DSV4NPUTokenToKVPool.compressed_kv_layout(fake_v4, 4),
+                NPUDSV4KVLayout.A5_FP8,
+            )
+        with patch.object(dsv4_memory_pool, "is_npu_arch35", return_value=False):
+            self.assertIs(
+                DSV4NPUTokenToKVPool.compressed_kv_layout(fake_v4, 128),
+                NPUDSV4KVLayout.A3_BF16,
+            )
 
 
 class TestPairStatePool(unittest.TestCase):
@@ -643,6 +721,7 @@ class TestGraphBuffers(unittest.TestCase):
         backend = _low_ratio_backend()
         metadata = SimpleNamespace(block_tables=torch.zeros((4, 2), dtype=torch.int32))
         metadata.kernel_metadata = {}
+        _seed_graph_index_page_tables(backend, bs=4, cols=2)
         backend._init_dsv41_graph_metadata(
             metadata, bs=4, tokens_per_req=1, device="cpu"
         )
@@ -662,17 +741,20 @@ class TestGraphBuffers(unittest.TestCase):
         self.assertEqual(metadata.kernel_metadata["c1a_qli_metadata"].shape, (1024,))
         self.assertEqual(metadata.kernel_metadata["c2a_qli_metadata"].shape, (1024,))
 
-    def test_graph_index_page_table_is_a_dedicated_expanded_buffer(self):
+    def test_graph_index_page_table_is_a_shared_graph_buffer_row_slice(self):
         backend = _low_ratio_backend()
         block_tables = torch.tensor([[7, 8]], dtype=torch.int32)
         metadata = SimpleNamespace(block_tables=block_tables, kernel_metadata={})
+        _seed_graph_index_page_tables(backend, bs=1, cols=2)
         backend._init_dsv41_graph_metadata(
             metadata, bs=1, tokens_per_req=1, device="cpu"
         )
-        # ratio 2 pages at the full granule: its own 1:1 copy buffer, never the
-        # shared block-table alias.
+        # ratio 2 pages at the full granule (k=1): its slice aliases the shared
+        # graph buffer's storage, never the block-table alias.
         self.assertIsNot(metadata.c2_index_page_table, block_tables)
         self.assertEqual(metadata.c2_index_page_table.shape, (1, 2))
+        shared = backend.graph_metadata["dsv41_index_page_table_c2"]
+        self.assertEqual(metadata.c2_index_page_table.data_ptr(), shared.data_ptr())
         # ratio 1 needs two index pages per full page -> widened row [2p, 2p+1].
         self.assertEqual(metadata.c1_index_page_table.shape, (1, 4))
 
@@ -683,6 +765,7 @@ class TestGraphBuffers(unittest.TestCase):
             block_tables=torch.tensor([[7, 8]], dtype=torch.int32),
             kernel_metadata={},
         )
+        _seed_graph_index_page_tables(backend, bs=1, cols=2)
         backend._init_dsv41_graph_metadata(
             metadata, bs=1, tokens_per_req=1, device="cpu"
         )
@@ -713,6 +796,7 @@ class TestGraphBuffers(unittest.TestCase):
         backend = _low_ratio_backend()
         block_tables = torch.tensor([[7, 8]], dtype=torch.int32)
         metadata = SimpleNamespace(block_tables=block_tables, kernel_metadata={})
+        _seed_graph_index_page_tables(backend, bs=1, cols=2)
         backend._init_dsv41_graph_metadata(
             metadata, bs=1, tokens_per_req=1, device="cpu"
         )
@@ -724,6 +808,7 @@ class TestGraphBuffers(unittest.TestCase):
         backend.page_size = 128
         block_tables = torch.tensor([[7, 8]], dtype=torch.int32)
         metadata = SimpleNamespace(block_tables=block_tables, kernel_metadata={})
+        _seed_graph_index_page_tables(backend, bs=1, cols=2)
         backend._init_dsv41_graph_metadata(
             metadata, bs=1, tokens_per_req=1, device="cpu"
         )
@@ -746,6 +831,7 @@ class TestGraphBuffers(unittest.TestCase):
         backend = _low_ratio_backend()
         metadata = SimpleNamespace(block_tables=torch.zeros((2, 2), dtype=torch.int32))
         metadata.kernel_metadata = {}
+        _seed_graph_index_page_tables(backend, bs=2, cols=2)
         backend._init_dsv41_graph_metadata(
             metadata, bs=2, tokens_per_req=1, device="cpu"
         )
@@ -1501,9 +1587,10 @@ class _FakeTorchOps:
         return getattr(torch, name)
 
 
-def _dsv41_llm_pool(row_dim, dtype):
+def _dsv41_llm_pool(row_dim, dtype, layout):
     """A ``DSV41NPUSingleKVPool`` with just the ``kv_buffer`` the writers read."""
     pool = object.__new__(DSV41NPUSingleKVPool)
+    pool.layout = layout
     pool.kv_buffer = [torch.zeros(2, 4, 1, row_dim, dtype=dtype)]
     return pool
 
@@ -1518,12 +1605,12 @@ class TestV41PoolWritePath(unittest.TestCase):
 
     _SELF = SimpleNamespace(qk_nope_head_dim=448, qk_rope_head_dim=64)
 
-    def _write(self, *, buf, loc, cache, compressed):
+    def _write(self, *, buf, loc, cache, layout):
         recorder = MagicMock(name="kv_compress_epilog_v2")
         custom = SimpleNamespace(kv_compress_epilog_v2=recorder)
         with patch.object(dsv4_memory_pool, "torch", _FakeTorchOps(custom)):
             DSV4NPUTokenToKVPool._write_dsv41_packed_kv(
-                self._SELF, buf=buf, loc=loc, cache=cache, compressed=compressed
+                self._SELF, buf=buf, loc=loc, cache=cache, layout=layout
             )
         return recorder
 
@@ -1534,7 +1621,7 @@ class TestV41PoolWritePath(unittest.TestCase):
             loc=torch.tensor([[0, 1], [2, 3]], dtype=torch.int64),
             # float32 in: the writer must cast to the bf16 the op requires.
             cache=torch.zeros(4, 1, 512, dtype=torch.float32),
-            compressed=False,
+            layout=NPUDSV4KVLayout.V41_SWA_FP8,
         )
         self.assertEqual(recorder.call_count, 1)
         args, kwargs = recorder.call_args
@@ -1560,7 +1647,7 @@ class TestV41PoolWritePath(unittest.TestCase):
             buf=buf,
             loc=torch.tensor([5, -1], dtype=torch.int64),
             cache=torch.zeros(2, 1, 512, dtype=torch.bfloat16),
-            compressed=True,
+            layout=NPUDSV4KVLayout.V41_CMP_FP4,
         )
         args, kwargs = recorder.call_args
         self.assertEqual(tuple(args[0].shape), (8, 320))
@@ -1578,7 +1665,7 @@ class TestV41PoolWritePath(unittest.TestCase):
                 buf=torch.zeros(2, 4, 1, 544, dtype=torch.float8_e4m3fn),
                 loc=torch.zeros(1, dtype=torch.int64),
                 cache=torch.zeros(1, 1, 448),
-                compressed=False,
+                layout=NPUDSV4KVLayout.V41_SWA_FP8,
             )
 
     def test_write_rejects_a_slot_count_mismatch(self):
@@ -1587,7 +1674,7 @@ class TestV41PoolWritePath(unittest.TestCase):
                 buf=torch.zeros(2, 4, 1, 320, dtype=torch.uint8),
                 loc=torch.zeros(2, dtype=torch.int64),
                 cache=torch.zeros(3, 1, 512),
-                compressed=True,
+                layout=NPUDSV4KVLayout.V41_CMP_FP4,
             )
 
     def test_an_empty_write_calls_no_operator(self):
@@ -1595,7 +1682,7 @@ class TestV41PoolWritePath(unittest.TestCase):
             buf=torch.zeros(2, 4, 1, 320, dtype=torch.uint8),
             loc=torch.zeros(0, dtype=torch.int64),
             cache=torch.zeros(0, 1, 512),
-            compressed=True,
+            layout=NPUDSV4KVLayout.V41_CMP_FP4,
         )
         self.assertEqual(recorder.call_count, 0)
 
@@ -1616,7 +1703,7 @@ class TestV41PoolWriteDispatch(unittest.TestCase):
         )
 
     def test_compress_buffer_routes_a_v41_pool_to_the_fp4_writer(self):
-        pool = _dsv41_llm_pool(320, torch.uint8)
+        pool = _dsv41_llm_pool(320, torch.uint8, NPUDSV4KVLayout.V41_CMP_FP4)
         ns = self._ns(ratio=2, pool=pool)
         writer = MagicMock()
         ns._write_dsv41_packed_kv = writer
@@ -1625,11 +1712,14 @@ class TestV41PoolWriteDispatch(unittest.TestCase):
         DSV4NPUTokenToKVPool.set_compress_buffer(ns, 7, loc, kv, None, False)
         # A ratio-1 aggregate must take the same fp4 route as ratio 2.
         writer.assert_called_once_with(
-            buf=pool.kv_buffer[0], loc=loc, cache=kv, compressed=True
+            buf=pool.kv_buffer[0],
+            loc=loc,
+            cache=kv,
+            layout=NPUDSV4KVLayout.V41_CMP_FP4,
         )
 
     def test_compress_buffer_rejects_a_scale_for_the_v41_row(self):
-        pool = _dsv41_llm_pool(320, torch.uint8)
+        pool = _dsv41_llm_pool(320, torch.uint8, NPUDSV4KVLayout.V41_CMP_FP4)
         ns = self._ns(ratio=1, pool=pool)
         ns._write_dsv41_packed_kv = MagicMock()
         kv = SimpleNamespace(device=SimpleNamespace(type="npu"))
@@ -1644,7 +1734,7 @@ class TestV41PoolWriteDispatch(unittest.TestCase):
             )
 
     def test_swa_buffer_routes_a_v41_pool_to_the_fp8_writer(self):
-        pool = _dsv41_llm_pool(544, torch.float8_e4m3fn)
+        pool = _dsv41_llm_pool(544, torch.float8_e4m3fn, NPUDSV4KVLayout.V41_SWA_FP8)
         ns = SimpleNamespace(
             swa_kv_pool=pool, _swa_local_layer_id=lambda layer_id: layer_id
         )
@@ -1654,7 +1744,10 @@ class TestV41PoolWriteDispatch(unittest.TestCase):
         cache = torch.zeros(1, 1, 512, dtype=torch.bfloat16)
         DSV4NPUTokenToKVPool.set_swa_buffer(ns, 0, loc, cache)
         writer.assert_called_once_with(
-            buf=pool.kv_buffer[0], loc=loc, cache=cache, compressed=False
+            buf=pool.kv_buffer[0],
+            loc=loc,
+            cache=cache,
+            layout=NPUDSV4KVLayout.V41_SWA_FP8,
         )
 
 
@@ -1681,6 +1774,7 @@ class TestKernelMetadataBuilders(unittest.TestCase):
         backend = _low_ratio_backend()
         metadata = SimpleNamespace(block_tables=torch.zeros((bs, 2), dtype=torch.int32))
         metadata.kernel_metadata = {}
+        _seed_graph_index_page_tables(backend, bs=bs, cols=2)
         backend._init_dsv41_graph_metadata(
             metadata, bs=bs, tokens_per_req=tokens_per_req, device="cpu"
         )
@@ -2066,6 +2160,7 @@ class TestVerifyGraphRefresh(unittest.TestCase):
             block_tables=torch.tensor([[7, 8], [9, 10]], dtype=torch.int32)[:bs],
             kernel_metadata={},
         )
+        _seed_graph_index_page_tables(backend, bs=bs, cols=2)
         backend._init_dsv41_graph_metadata(
             metadata, bs=bs, tokens_per_req=tokens_per_req, device="cpu"
         )
