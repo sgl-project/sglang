@@ -2358,6 +2358,16 @@ def _compute_gemm1_alphas(
     return g1_alphas, g1_alphas_up
 
 
+def warn_if_up_scale_ratio_unused(quant_info) -> None:
+    """The LoRA MoE runners call the Marlin kernels with the gate's global scale
+    only, so they do not apply w13_up_scale_ratio."""
+    if getattr(quant_info, "w13_up_scale_ratio", None) is not None:
+        logger.warning_once(
+            "w1_weight_scale_2 must match w3_weight_scale_2 for NVFP4 MoE LoRA. "
+            "Accuracy may be affected."
+        )
+
+
 class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
     """
        MoE Method for FP4 Quantization with Blockscales and PerTensorScales
@@ -2735,24 +2745,26 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             moe_runner_backend = MoeRunnerBackend.MARLIN
         use_nvfp4_dispatch = _use_nvfp4_dispatch()
         if moe_runner_backend.is_marlin():
-            # Marlin supports only a single shared w1/w3 weight scale, so collapse
-            # the gate/up columns to the gate scale here. Other backends keep the
-            # raw scale and split the halves later (see _compute_gemm1_alphas).
+            # The Marlin kernel takes a single w1/w3 weight scale per expert, so
+            # it gets the gate's. Where the up scale differs, the Marlin runner
+            # rescales the up half of the GEMM1 output by up / gate (see
+            # w13_up_scale_ratio). Other backends keep the raw scale and split
+            # the halves later (see _compute_gemm1_alphas).
+            layer.w13_up_scale_ratio = None
             if layer.moe_runner_config.is_gated:
                 if layer.w13_weight_scale_2.dim() == 1:
                     # Some checkpoints store a shared scale for w1/w3.
                     w13_weight_scale_2 = layer.w13_weight_scale_2
                 else:
-                    if layer.w13_weight_scale_2.shape[1] >= 2 and not torch.allclose(
-                        layer.w13_weight_scale_2[:, 0],
-                        layer.w13_weight_scale_2[:, 1],
+                    gate_scale = layer.w13_weight_scale_2[:, 0]
+                    if layer.w13_weight_scale_2.shape[1] >= 2 and not torch.equal(
+                        gate_scale, layer.w13_weight_scale_2[:, 1]
                     ):
-                        logger.warning_once(
-                            "w1_weight_scale_2 must match w3_weight_scale_2. "
-                            "Accuracy may be affected."
-                        )
+                        layer.w13_up_scale_ratio = (
+                            layer.w13_weight_scale_2[:, 1].float() / gate_scale.float()
+                        ).contiguous()
 
-                    w13_weight_scale_2 = layer.w13_weight_scale_2[:, 0]
+                    w13_weight_scale_2 = gate_scale
             else:
                 w13_weight_scale_2 = layer.w13_weight_scale_2[:]
             copy_or_rebind_param(
@@ -3176,6 +3188,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             weight_bits=4,
             w13_global_scale=layer.w13_weight_scale_2,
             w2_global_scale=layer.w2_weight_scale_2,
+            w13_up_scale_ratio=getattr(layer, "w13_up_scale_ratio", None),
             expert_map=expert_map,
             global_num_experts=global_num_experts,
         )

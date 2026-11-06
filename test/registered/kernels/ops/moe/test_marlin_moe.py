@@ -516,6 +516,99 @@ class TestFusedMarlinMoe(CustomTestCase):
                         marlin_output, torch_output, atol=5e-2, rtol=0
                     )
 
+    def test_fused_marlin_moe_up_scale_ratio(self):
+        """The kernel applies one w13 scale per expert; w1_up_scale_ratio rescales
+        the up half of the GEMM1 output, as for FP4 checkpoints whose gate and up
+        global scales differ."""
+        from sglang.srt.layers.moe.topk import fused_topk_torch_native
+
+        n, k, topk, group_size = 256, 256, 2, 128
+        dtype = torch.bfloat16
+        quant_type = scalar_types.uint4b8
+        for m, e, ep_size in ((1, 8, 1), (33, 8, 1), (16, 8, 2)):
+            with self.subTest(m=m, e=e, ep_size=ep_size):
+                torch.manual_seed(7)
+                local_e = e // ep_size
+                e_ids = torch.arange(local_e, device="cuda", dtype=torch.int32)
+                e_map = None
+                if ep_size > 1:
+                    e_map = torch.full((e,), -1, device="cuda", dtype=torch.int32)
+                    e_map[e_ids] = torch.arange(
+                        local_e, device="cuda", dtype=torch.int32
+                    )
+
+                a = torch.randn((m, k), device="cuda", dtype=dtype) / 10
+                w1_full = torch.randn((e, 2 * n, k), device="cuda", dtype=dtype) / 20
+                w2_full = torch.randn((e, k, n), device="cuda", dtype=dtype) / 20
+                score = torch.randn((m, e), device="cuda", dtype=dtype)
+                if ep_size > 1:
+                    score[:, e_ids] += 10.0
+                # up / gate global-scale ratio per local expert, as in checkpoints
+                # whose gate and up scales differ by up to 10x
+                ratio = torch.linspace(
+                    0.1, 10.0, local_e, device="cuda", dtype=torch.float32
+                )
+
+                quantized = []
+                for w, size_k in ((w1_full[e_ids], k), (w2_full[e_ids], n)):
+                    refs, qweights, scales = [], [], []
+                    for i in range(local_e):
+                        w_ref, qweight, scale, _, _, _ = marlin_quantize(
+                            w[i].transpose(1, 0),
+                            quant_type,
+                            group_size,
+                            False,
+                            torch.randperm(size_k),
+                        )
+                        refs.append(w_ref.T)
+                        qweights.append(qweight)
+                        scales.append(scale)
+                    quantized.append(
+                        (
+                            stack_and_dev(refs),
+                            stack_and_dev(qweights).contiguous(),
+                            stack_and_dev(scales),
+                        )
+                    )
+                (w_ref1, qweight1, scales1), (w_ref2, qweight2, scales2) = quantized
+
+                # reference: the up rows (n..2n) of w1 carry the ratio
+                w_ref1 = w_ref1.clone()
+                w_ref1[:, n:, :] = (w_ref1[:, n:, :].float() * ratio.view(-1, 1, 1)).to(
+                    dtype
+                )
+                w_ref1_full, w_ref2_full = w1_full.clone(), w2_full.clone()
+                w_ref1_full[e_ids], w_ref2_full[e_ids] = w_ref1, w_ref2
+
+                topk_weights, topk_ids = fused_topk_torch_native(a, score, topk, False)
+                torch_output = torch_moe(
+                    a,
+                    w_ref1_full,
+                    w_ref2_full,
+                    score,
+                    topk,
+                    global_num_experts=e,
+                    expert_map=e_map,
+                )
+                marlin_output = fused_marlin_moe(
+                    a,
+                    qweight1,
+                    qweight2,
+                    scales1,
+                    scales2,
+                    score,
+                    topk_weights,
+                    topk_ids,
+                    global_num_experts=e,
+                    expert_map=e_map,
+                    w1_up_scale_ratio=ratio,
+                    num_bits=4,
+                    is_k_full=True,
+                )
+                torch.testing.assert_close(
+                    marlin_output, torch_output, atol=5e-2, rtol=2e-2
+                )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

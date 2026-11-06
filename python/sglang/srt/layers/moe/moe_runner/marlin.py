@@ -108,6 +108,8 @@ class MarlinMoeQuantInfo(MoeQuantInfo):
     global_num_experts: int = -1
     w13_global_scale: Optional[torch.Tensor] = None
     w2_global_scale: Optional[torch.Tensor] = None
+    # FP4: up/gate global-scale ratio per local expert when w1 and w3 differ
+    w13_up_scale_ratio: Optional[torch.Tensor] = None
     w13_bias: Optional[torch.Tensor] = None
     w2_bias: Optional[torch.Tensor] = None
 
@@ -195,6 +197,7 @@ def fused_experts_none_to_marlin(
         w2_zeros=quant_info.w2_qzeros,
         w1_global_scale=quant_info.w13_global_scale,
         w2_global_scale=quant_info.w2_global_scale,
+        w1_up_scale_ratio=quant_info.w13_up_scale_ratio,
         w1_bias=quant_info.w13_bias,
         w2_bias=quant_info.w2_bias,
         workspace=workspace,

@@ -137,6 +137,29 @@ def swiglu_limit_func(
 
 
 @register_custom_op(out_shape="hidden_states")
+def _scale_up_half(
+    gemm1_out: torch.Tensor,
+    up_scale_ratio: torch.Tensor,
+    topk_ids: torch.Tensor,
+    expert_map: Optional[torch.Tensor],
+) -> None:
+    """Rescale the up half of each GEMM1 output row by its expert's up/gate ratio.
+
+    The FP4 Marlin MoE kernel applies one w13 global scale per expert. When a
+    checkpoint stores different global scales for the gate (w1) and up (w3)
+    projections, the kernel gets the gate's, and the up half of its output is
+    off by up_scale / gate_scale. Rows are in (token, top-k) order.
+    """
+    expert = topk_ids.reshape(-1).to(torch.long)
+    if expert_map is not None:
+        expert = expert_map[expert].to(torch.long)
+    ratio = up_scale_ratio.to(torch.float32)[expert.clamp(min=0)]
+    if expert_map is not None:
+        ratio = torch.where(expert >= 0, ratio, torch.ones_like(ratio))
+    up = gemm1_out[:, gemm1_out.shape[1] // 2 :]
+    up.copy_((up.float() * ratio.unsqueeze(1)).to(up.dtype))
+
+
 def fused_marlin_moe(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -156,6 +179,7 @@ def fused_marlin_moe(
     w2_zeros: Optional[torch.Tensor] = None,
     w1_global_scale: Optional[torch.Tensor] = None,
     w2_global_scale: Optional[torch.Tensor] = None,
+    w1_up_scale_ratio: Optional[torch.Tensor] = None,
     w1_bias: Optional[torch.Tensor] = None,
     w2_bias: Optional[torch.Tensor] = None,
     workspace: Optional[torch.Tensor] = None,
@@ -191,6 +215,10 @@ def fused_marlin_moe(
     - topk_ids (torch.Tensor): Indices of topk-k elements.
     - w1_zeros (Optional[torch.Tensor]): Optional zero points to be used for w1.
     - w2_zeros (Optional[torch.Tensor]): Optional zero points to be used for w2.
+    - w1_up_scale_ratio (Optional[torch.Tensor]): Per local expert, the up
+        projection's global scale divided by the gate's, for FP4 checkpoints
+        whose w1 and w3 global scales differ; the up half of the GEMM1 output
+        is rescaled by it before the activation.
     - num_bits (int): The number of bits in expert weights quantization.
     - no_combine (bool): Return the router-weighted per-(token, expert) outputs,
         ``[num_tokens, topk, hidden]``, instead of their top-k sum.
@@ -342,6 +370,14 @@ def fused_marlin_moe(
         use_fp32_reduce=True,
         is_zp_float=False,
     )
+
+    if w1_up_scale_ratio is not None and is_gated:
+        _scale_up_half(
+            intermediate_cache1.view(-1, gemm1_n),
+            w1_up_scale_ratio,
+            topk_ids,
+            expert_map,
+        )
 
     if activation == "silu" and is_gated and gemm1_alpha is not None:
         if clamp_limit is None:

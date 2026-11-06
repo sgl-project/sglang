@@ -1144,6 +1144,11 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
                 f"get_marlin_quant_info, got {type(base_layer.quant_method).__name__}"
             )
             self._quant_info = base_layer.quant_method.get_marlin_quant_info(base_layer)
+            from sglang.srt.layers.quantization.modelopt_quant import (
+                warn_if_up_scale_ratio_unused,
+            )
+
+            warn_if_up_scale_ratio_unused(self._quant_info)
         elif runner_backend.is_triton():
             assert base_layer.quant_method is not None, "Quant method must be set"
             self._quant_info = base_layer.quant_method.get_triton_quant_info(base_layer)
