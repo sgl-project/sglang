@@ -71,6 +71,7 @@ from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
     _sparse_attn_kv_quant_kwargs,
     _sparse_attn_ops,
     _walsh_hadamard_matrix,
+    _fill_verify_positions_cmp_padding_one_fused,
 )
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     dsv4_state_payloads,
@@ -276,6 +277,38 @@ class TestVerifyCompressPositions(unittest.TestCase):
                 expected[: selected.numel()].copy_(selected)
                 self.assertEqual(dst.tolist(), expected.tolist())
 
+    def test_fused_dispatch_falls_back_on_cpu_without_touching_dst(self):
+        positions = torch.tensor([7, 8, 9, 10, 11, 12], dtype=torch.int64)
+        live_seq_lens = torch.tensor([7, 10], dtype=torch.int32)
+        dst = torch.full((4,), -1, dtype=torch.int64)
+
+        ran = _fill_verify_positions_cmp_padding_one_fused(
+            positions, live_seq_lens, dst, ratio=4, n_draft=3
+        )
+
+        self.assertFalse(ran)
+        # The dispatcher must leave the buffer to the aten fallback path.
+        self.assertEqual(dst.tolist(), [-1, -1, -1, -1])
+
+    def test_device_variant_skips_aten_chain_when_fused_path_runs(self):
+        backend = self._backend()
+        positions = torch.tensor([7, 8, 9, 10, 11, 12], dtype=torch.int64)
+        live_seq_lens = torch.tensor([7, 10], dtype=torch.int32)
+        dst = torch.full((4,), -1, dtype=torch.int64)
+
+        with patch(
+            "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend"
+            "._fill_verify_positions_cmp_padding_one_fused",
+            return_value=True,
+        ) as mock_fused:
+            backend._fill_verify_positions_cmp_padding_one_device(
+                positions, dst, ratio=4, live_seq_lens=live_seq_lens, n_draft=3
+            )
+
+        mock_fused.assert_called_once()
+        # The aten chain (which would zero-fill dst) must not have run.
+        self.assertEqual(dst.tolist(), [-1, -1, -1, -1])
+
 
 class TestH2DPinnedAsync(unittest.TestCase):
     @staticmethod
@@ -299,12 +332,13 @@ class TestH2DPinnedAsync(unittest.TestCase):
         self.assertEqual(out.dtype, torch.int64)
         self.assertEqual(out.tolist(), values)
 
-    def test_flattens_multidimensional_input(self):
+    def test_preserves_input_shape_across_dtypes(self):
         out = self._backend()._h2d_pinned_async(
-            torch.tensor([[1, 2], [3, 4]], dtype=torch.int32), torch.int32
+            torch.tensor([[1, 2], [3, 4]], dtype=torch.int64), torch.int32
         )
-        self.assertEqual(out.dim(), 1)
-        self.assertEqual(out.tolist(), [1, 2, 3, 4])
+        self.assertEqual(out.shape, (2, 2))
+        self.assertEqual(out.dtype, torch.int32)
+        self.assertEqual(out.tolist(), [[1, 2], [3, 4]])
 
     def test_upload_is_non_blocking(self):
         backend = self._backend()
