@@ -31,7 +31,7 @@ import msgspec.structs
 
 from sglang.srt.arg_groups.validation_hook import check_load_publish_args
 from sglang.srt.configs.embedding_model_spec import resolve_embedding_model_spec
-from sglang.srt.entrypoints import http_server
+from sglang.srt.entrypoints import http_server, server_utils
 from sglang.srt.entrypoints.grpc_bridge import RuntimeHandle
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef
@@ -39,7 +39,6 @@ from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.runtime_context import get_parallel, publish, reset_context
 from sglang.srt.rust_server import config as rust_config
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import common
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -225,7 +224,7 @@ class TestServerInfoTransportParity(CustomTestCase):
 
                 with (
                     patch.object(
-                        common,
+                        server_utils,
                         "get_serving",
                         return_value=SimpleNamespace(
                             host="127.0.0.1",
@@ -236,7 +235,7 @@ class TestServerInfoTransportParity(CustomTestCase):
                     ),
                     patch("sglang.srt.rust_extensions.load_rust_extension") as load,
                 ):
-                    common.start_follower_grpc_server(args, bridge.scheduler_info)
+                    server_utils.start_follower_grpc_server(args, bridge.scheduler_info)
                 start = load.return_value.start_metadata_server
                 start.assert_called_once_with(
                     host="127.0.0.1", port=50051, server_info_json=ANY
@@ -251,7 +250,7 @@ class TestServerInfoTransportParity(CustomTestCase):
         with (
             envs.SGLANG_RUST_SERVER.override(True),
             patch.object(
-                common,
+                server_utils,
                 "get_serving",
                 return_value=SimpleNamespace(
                     host="127.0.0.1",
@@ -263,7 +262,9 @@ class TestServerInfoTransportParity(CustomTestCase):
             patch("sglang.srt.rust_extensions.load_rust_extension") as load,
         ):
             self.assertIsNone(
-                common.start_follower_grpc_server(ServerArgs(model_path="dummy"), {})
+                server_utils.start_follower_grpc_server(
+                    ServerArgs(model_path="dummy"), {}
+                )
             )
         load.return_value.start_metadata_server.assert_not_called()
 
