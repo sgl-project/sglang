@@ -1454,8 +1454,19 @@ class Req(ReqDllmMixin):
             return
 
         if self.to_finish:
-            self.finished_reason = self.to_finish
-            self.to_finish = None
+            to_finish, self.to_finish = self.to_finish, None
+            # A client abort (no status code) that lands in the step reaching a
+            # stop token, stop string or max_new_tokens yields to that finish,
+            # so the output never runs past it.
+            if (
+                new_accepted_len > 0
+                and isinstance(to_finish, FINISH_ABORT)
+                and to_finish.status_code is None
+            ):
+                self.update_finish_state(new_accepted_len)
+                if self.finished():
+                    return
+            self.finished_reason = to_finish
             return
 
         new_accepted_tokens = self.output_ids[-new_accepted_len:]
