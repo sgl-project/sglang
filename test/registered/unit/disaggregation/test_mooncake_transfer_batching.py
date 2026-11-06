@@ -12,8 +12,8 @@ import torch
 
 from sglang.srt.disaggregation.base.conn import KVPoll, StateType
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager, MooncakeKVSender
-from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -492,6 +492,8 @@ class TestMooncakeEarlySend(CustomTestCase):
             dst_kv_layer_ids=[0],
             dst_kv_item_len=16,
             dst_attn_tp_size=1,
+            dst_aux_ptrs=[2000],
+            dst_aux_item_lens=[16],
         )
         manager = SimpleNamespace(
             enable_trace=False,
@@ -513,6 +515,7 @@ class TestMooncakeEarlySend(CustomTestCase):
             is_mla_backend=True,
             send_kvcache=MagicMock(return_value=0),
             _maybe_ack_drained_abort=MagicMock(),
+            validate_aux_buffers=MagicMock(),
             bootstrap_port=8998,
         )
         manager.check_status = lambda room: manager.request_status[room]

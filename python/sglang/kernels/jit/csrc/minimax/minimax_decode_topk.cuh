@@ -62,7 +62,6 @@ struct TopKTraitImpl {
   struct Smem {
     uint32_t warp_sum[kNumWarps];
     alignas(128) uint32_t counter;
-    alignas(128) uint32_t counter_final;
     alignas(128) uint32_t threshold_bin;
     uint32_t equal_count;
     uint32_t above_count;
@@ -372,6 +371,20 @@ struct TopKTraitImpl {
       }
       __syncthreads();
     };
+    // Number of threads with a lower tx whose `flag` is set; called by the whole
+    // CTA. Final-round ties are exactly equal scores; ranking them by block id
+    // makes the selection deterministic (lower id wins, as in the small path).
+    const auto block_rank = [&](bool flag) -> uint32_t {
+      using namespace device;
+      const uint32_t ballot = __ballot_sync(kWarpSyncMask, flag);
+      if (lane_id == 0) smem->warp_sum[warp_id] = __popc(ballot);
+      __syncthreads();
+      uint32_t base = 0;
+      for (uint32_t w = 0; w < warp_id; ++w)
+        base += smem->warp_sum[w];
+      __syncthreads();  // warp_sum is reused by the next call
+      return base + __popc(ballot & ((1u << lane_id) - 1u));
+    };
 
     if (num_blocks <= kSmallThreshold) {
       // O(n^2) compare: each block's rank = #blocks that outrank it; the ones
@@ -417,7 +430,7 @@ struct TopKTraitImpl {
       uint32_t topk_remain = topk;
       uint32_t write_pos = topk;  // sentinel: not selected
       if (tx < kRadixSize) smem->histogram[0][tx] = 0;
-      if (tx == kRadixSize) smem->counter = smem->counter_final = 0;
+      if (tx == kRadixSize) smem->counter = 0;
       __syncthreads();
       uint32_t total_active = num_blocks;
 
@@ -441,17 +454,24 @@ struct TopKTraitImpl {
         if (round < 3) total_active = equal_count;
         topk_remain -= above_count;
 
-        // scatter: above -> selected now; equal at the last pass -> keep the rest
+        // scatter: above -> selected now; equal at the last pass -> lowest ids first
         if (active) {
           if (bin > threshold_bin) {
             write_pos = atomicAdd(&smem->counter, 1);
             active = false;
           } else if (bin < threshold_bin) {
             active = false;
-          } else if (round == 3) {
-            write_pos = topk - topk_remain + atomicAdd(&smem->counter_final, 1);
           }
-          // bin == threshold && round < 3: stay active for the next pass
+          // bin == threshold: stays active (for the next pass, or as a tie below)
+        }
+        if (round == 3) {
+          if (equal_count <= topk_remain) {
+            // Every tie is selected, so slot order is free (the output is sorted).
+            if (active) write_pos = atomicAdd(&smem->counter, 1);
+          } else {
+            const auto rank = block_rank(active);
+            if (active && rank < topk_remain) write_pos = topk - topk_remain + rank;
+          }
         }
 
         if (round == 3 || topk_remain == 0) break;
@@ -480,7 +500,7 @@ struct TopKTraitImpl {
         }
       }
       if (tx < kRadixSize) smem->histogram[0][tx] = 0;
-      if (tx == kRadixSize) smem->counter = smem->counter_final = 0;
+      if (tx == kRadixSize) smem->counter = 0;
       __syncthreads();
 
       uint32_t topk_remain = topk;
@@ -514,11 +534,26 @@ struct TopKTraitImpl {
               active &= ~(1u << i);
             } else if (bin < threshold_bin) {
               active &= ~(1u << i);
-            } else if (round == 3) {
-              const auto pos = topk - topk_remain + atomicAdd(&smem->counter_final, 1);
-              if (pos < topk) topk_out[pos] = i * kCTASize + tx;
             }
-            // bin == threshold && round < 3: slot stays live for the next pass
+            // bin == threshold: slot stays live (for the next pass, or as a tie below)
+          }
+        }
+        if (round == 3 && equal_count <= topk_remain) {
+          // Every tie is selected, so slot order is free (the output is sorted).
+#pragma unroll
+          for (uint32_t i = 0; i < kIters; ++i)
+            if (active & (1u << i)) topk_out[atomicAdd(&smem->counter, 1)] = i * kCTASize + tx;
+        } else if (round == 3) {
+          // Ties in block-id order: slot i holds ids i * kCTASize + tx, so slots
+          // are ranked in turn and each slot's ties by tx.
+          uint32_t taken = 0;
+          for (uint32_t i = 0; i < kIters && taken < topk_remain; ++i) {
+            const bool tie = (active >> i) & 1u;
+            const uint32_t num_ties = __syncthreads_count(tie);
+            if (num_ties == 0) continue;
+            const auto rank = taken + block_rank(tie);
+            if (tie && rank < topk_remain) topk_out[topk - topk_remain + rank] = i * kCTASize + tx;
+            taken += num_ties;
           }
         }
 

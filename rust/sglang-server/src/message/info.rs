@@ -62,6 +62,18 @@ pub(crate) struct ServerInfo {
     pub(crate) incremental_streaming_output: bool,
     pub(crate) disaggregation_mode: DisaggregationMode,
     pub(crate) deployment_info: DeploymentInfo,
+    /// Under DP, every rank's listener by rank, published by the listener of
+    /// DP rank 0 so a client can address each rank's listener directly;
+    /// empty, and left out of the JSON, on the other listeners.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) dp_listeners: Vec<DpListener>,
+}
+
+/// One DP rank's listener, as `/server_info`'s `dp_listeners` lists it.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub(crate) struct DpListener {
+    pub(crate) dp_rank: u32,
+    pub(crate) url: String,
 }
 
 impl ServerInfo {
