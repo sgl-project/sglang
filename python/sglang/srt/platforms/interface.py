@@ -111,6 +111,20 @@ class SRTPlatform(DeviceMixin):
         """
         pass
 
+    def register_platform_backends(self) -> None:
+        """Install this platform's own backend registrations.
+
+        Called once from server-argument resolution, after the platform is
+        selected and before any model is built. A platform whose kernels or
+        fused ops live under ``hardware_backend`` imports them here, so the
+        shared dispatch code carries no platform import of its own.
+
+        Everything the platform needs to construct a model must already be
+        importable at this point; the call is not a substitute for the lazy
+        imports that keep optional dependencies off the startup path.
+        """
+        pass
+
     # ------------------------------------------------------------------
     # Subsystem factory methods
     # ------------------------------------------------------------------

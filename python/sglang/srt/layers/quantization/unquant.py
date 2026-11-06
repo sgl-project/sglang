@@ -1471,8 +1471,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             backend = MoeRunnerBackend.DEEP_GEMM
         else:
             backend = MoeRunnerBackend.TRITON
-        if is_sail() and backend.is_deep_gemm():
-            import sglang.srt.hardware_backend.sail.moe.deepgemm_moe  # noqa: F401
         self.runner = MoeRunner(backend, moe_runner_config)
 
         # aiter CK fused-MoE only supports some shapes / activations; else use triton.
