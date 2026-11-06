@@ -294,23 +294,25 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
 def _customized_draft_moe_spec(server_args: ServerArgs):
     """The MoE spec of a customized draft, or None for native drafts and dense ones."""
     from sglang.srt.hf_transformers import get_config
-    from sglang.srt.speculative.dflash_utils import (
-        is_customized_draft_config,
-        parse_dflash_draft_config,
-    )
+    from sglang.srt.layers.draft.ffn_spec import DraftMixFFNSpec
+    from sglang.srt.speculative.dflash_utils import is_customized_draft_config
 
     cfg = resolving_view(server_args)
     if cfg.speculative_draft_model_path is None:
         return None
-    draft_hf_config = get_config(
-        cfg.speculative_draft_model_path,
-        trust_remote_code=cfg.trust_remote_code,
-        revision=cfg.speculative_draft_model_revision,
-        model_override_args=json.loads(cfg.json_model_override_args),
-    )
+    try:
+        draft_hf_config = get_config(
+            cfg.speculative_draft_model_path,
+            trust_remote_code=cfg.trust_remote_code,
+            revision=cfg.speculative_draft_model_revision,
+            model_override_args=json.loads(cfg.json_model_override_args),
+        )
+    except Exception as e:  # unreadable here; the model loader reports it itself
+        logger.debug("Customized-draft check skipped, draft config unreadable: %s", e)
+        return None
     if not is_customized_draft_config(draft_hf_config):
         return None
-    return parse_dflash_draft_config(draft_hf_config=draft_hf_config).ffn.moe
+    return DraftMixFFNSpec.from_config(draft_hf_config).moe
 
 
 def _refuse_customized_moe_draft_parallelism(

@@ -933,6 +933,8 @@ class DFlashDraftModel(nn.Module):
                 draft_config.conv_group_size,
             )
 
+        # Only customized drafts read the FFN fields; native ones stay dense.
+        ffn_spec = DraftMixFFNSpec.from_config(config) if self.customized else None
         self.layers = nn.ModuleList(
             [
                 self.decoder_layer_cls(
@@ -942,7 +944,7 @@ class DFlashDraftModel(nn.Module):
                     attention_conv=grouped_conv(),
                     mlp_conv=grouped_conv(),
                     quant_config=quant_config,
-                    ffn_spec=draft_config.ffn if self.customized else None,
+                    ffn_spec=ffn_spec,
                     prefix=(
                         (f"{prefix}.layers.{i}" if prefix else f"layers.{i}")
                         if self.quantizable

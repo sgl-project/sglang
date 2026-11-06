@@ -13,7 +13,6 @@ from sglang.kernels.ops.sampling import argmax as sampling_argmax
 from sglang.kernels.ops.speculative.verify_sampling import (
     tree_speculative_sampling_target_only,
 )
-from sglang.srt.layers.draft.ffn_spec import DraftMixFFNSpec
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import (
     apply_custom_logit_processor,
@@ -629,7 +628,6 @@ class DFlashDraftConfig:
     attention_sink_bias: bool = False
     attention_value_scale: Optional[float] = None
     is_mla: bool = False
-    ffn: Optional[DraftMixFFNSpec] = None  # dense or MoE per layer; None if hand-built
 
     @property
     def is_domino(self) -> bool:
@@ -890,7 +888,6 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
                 f"DFLASH Domino requires block_size > 1, got {block_size}."
             )
 
-    ffn = DraftMixFFNSpec.from_config(draft_hf_config)
 
     return DFlashDraftConfig(
         num_hidden_layers=num_hidden_layers,
@@ -913,7 +910,6 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
         attention_sink_bias=attention_sink_bias,
         attention_value_scale=attention_value_scale,
         is_mla=is_mla,
-        ffn=ffn,
     )
 
 

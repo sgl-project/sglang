@@ -24,7 +24,10 @@ from sglang.srt.models.dflash import (
 from sglang.srt.models.dspark import CustomizedDSparkDraftModel, DSparkDraftModel
 from sglang.srt.runtime_context import reset_context
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
+from sglang.srt.speculative.dflash_utils import (
+    is_customized_draft_config,
+    parse_dflash_draft_config,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.parallel_groups import publish
 from sglang.test.test_utils import CustomTestCase
@@ -294,16 +297,15 @@ class TestFFNSpec(CustomTestCase):
                 with self.assertRaisesRegex(ValueError, message):
                     DraftMixFFNSpec.from_config(cfg)
 
-    def test_dflash_draft_config_carries_the_ffn_spec(self):
-        dense = parse_dflash_draft_config(draft_hf_config=SimpleNamespace(**_dense()))
-        self.assertIsInstance(dense.ffn, DraftMixFFNSpec)
-        self.assertFalse(dense.ffn.has_moe)
-        moe = parse_dflash_draft_config(draft_hf_config=SimpleNamespace(**_qwen_moe()))
-        self.assertEqual(moe.ffn.kind(2), FFN_KIND_MOE)
-        with self.assertRaisesRegex(ValueError, "scoring_func='relu'"):
-            parse_dflash_draft_config(
-                draft_hf_config=SimpleNamespace(**_qwen_moe(scoring_func="relu"))
-            )
+    def test_native_drafts_never_parse_the_ffn_spec(self):
+        # A native draft keeps its minimal config; only Customized* names read the FFN.
+        minimal = SimpleNamespace(**_without(_dense(), "intermediate_size"))
+        parse_dflash_draft_config(draft_hf_config=minimal)
+        self.assertFalse(is_customized_draft_config(minimal))
+        minimal.architectures = ["CustomizedDSparkDraftModel"]
+        self.assertTrue(is_customized_draft_config(minimal))
+        with self.assertRaisesRegex(ValueError, "intermediate_size is required"):
+            DraftMixFFNSpec.from_config(minimal)
 
 
 E, K, H, I, S, LAYERS = 4, 2, 16, 8, 12, 2
