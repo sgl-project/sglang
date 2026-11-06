@@ -32,6 +32,10 @@ class RankMetadata:
         self.num_pages = num_pages
         self.free_pages: List[int] = list(range(num_pages))
         self.key_to_index: OrderedDict[str, int] = OrderedDict()
+        # Reservations are process-local and intentionally not persisted. A second
+        # writer for the same key is skipped until the first write is confirmed or
+        # released; the HF3FS client treats index -1 as a skipped write.
+        self.pending_key_to_index: Dict[str, int] = {}
         # Todo: Support multi files for HF3FS
 
     def exists_keys(self, keys: List[str]) -> List[bool]:
@@ -46,21 +50,33 @@ class RankMetadata:
         with self.lock:
             results = [None] * len(keys)
             new_keys_to_process = []
+            new_keys_seen = set()
 
             for i, (key, prefix_key) in enumerate(keys):
                 if key in self.key_to_index:
                     results[i] = (True, self.key_to_index[key])
                     self.key_to_index.move_to_end(key)
+                elif key in self.pending_key_to_index or key in new_keys_seen:
+                    # The current writer owns this slot. Do not expose it to a
+                    # concurrent writer; -1 is the existing client skip sentinel.
+                    results[i] = (False, -1)
                 else:
+                    new_keys_seen.add(key)
                     new_keys_to_process.append((i, key, prefix_key))
 
             # Todo: Implementing data eviction logic after HiCache supports prefix information pass-through
             for i, key, prefix_key in new_keys_to_process:
-                if len(self.free_pages) > 0:
+                if self.free_pages:
                     page_index = self.free_pages.pop()
+                elif self.key_to_index:
+                    _, page_index = self.key_to_index.popitem(last=False)
                 else:
-                    page_index = self.key_to_index.popitem(last=False)[1]
+                    # All pages are held by in-flight writes. Preserve the
+                    # reservation invariant instead of raising or sharing a page.
+                    results[i] = (False, -1)
+                    continue
 
+                self.pending_key_to_index[key] = page_index
                 results[i] = (False, page_index)
 
             return results
@@ -73,12 +89,22 @@ class RankMetadata:
         """Confirm write operations and release pages."""
         with self.lock:
             for key, page_index in written_keys_to_confirm:
+                # Only the current pending owner may publish a write. Without
+                # reservation tokens, same-key/same-index ABA confirms cannot be
+                # distinguished from the current owner's confirmation.
+                if self.pending_key_to_index.get(key) != page_index:
+                    continue
+                del self.pending_key_to_index[key]
                 self.key_to_index[key] = page_index
                 self.key_to_index.move_to_end(key)
 
-            for page_index in pages_to_release:
-                if page_index not in self.free_pages:
-                    self.free_pages.append(page_index)
+            if pages_to_release:
+                pages_to_release_set = set(pages_to_release)
+                for key, page_index in list(self.pending_key_to_index.items()):
+                    if page_index in pages_to_release_set:
+                        del self.pending_key_to_index[key]
+                        if page_index not in self.free_pages:
+                            self.free_pages.append(page_index)
 
     def delete_keys(self, keys: List[str]) -> int:
         """Delete keys and return count of deleted keys."""
@@ -97,6 +123,7 @@ class RankMetadata:
         with self.lock:
             self.free_pages = list(range(self.num_pages))
             self.key_to_index.clear()
+            self.pending_key_to_index.clear()
 
     def get_page_indices(self, keys: List[str]) -> List[Optional[int]]:
         """Get page indices for keys."""
