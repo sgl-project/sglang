@@ -324,18 +324,14 @@ class DSANPUIndexerMixin:
                     pool.index_k_scale_dtype,
                 )
 
-                # int8 keys requires fp16 weights
-                op_weights = (
-                    weights.to(torch.float16)
-                    if pool.index_k_store_dtype == torch.int8
-                    else weights
-                )
-
                 if pool.index_k_store_dtype == torch.int8:
+                    # INT8 keys require FP16 weights
+                    op_weights = weights.to(torch.float16)
                     # torch_npu.npu_quant_lightning_indexer is not working
                     # for int8 cache in case of custom_ops imported
                     quant_lightning_indexer = torch.ops.npu.npu_quant_lightning_indexer
                 else:
+                    op_weights = weights
                     quant_lightning_indexer = torch_npu.npu_quant_lightning_indexer
 
                 topk_indices = quant_lightning_indexer(
