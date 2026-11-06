@@ -18,7 +18,7 @@ import torch
 from torch import nn
 
 from sglang.kernels.fused_op import BaseFusedOp, register_fused_op
-from sglang.kernels.spec import FormatSignature, KernelBackend
+from sglang.kernels.spec import KernelBackend
 from sglang.multimodal_gen.runtime.layers.layernorm import apply_qk_norm_rope
 from sglang.multimodal_gen.runtime.layers.lora.linear import BaseLayerWithLoRA
 from sglang.multimodal_gen.runtime.layers.quantization.flux3_prims_ts import (
@@ -79,10 +79,6 @@ def _unpack_qkv(qkv: torch.Tensor, local_heads: int):
 class _Flux3PrimsTsOp(BaseFusedOp):
     priority = (KernelBackend.FLASHINFER, KernelBackend.TORCH)
     capabilities = {KernelBackend.FLASHINFER: FLUX3_PRIMS_TS_CAPABILITIES}
-    format_signature = FormatSignature(
-        supported_dtypes=("bfloat16",),
-        description="FLUX.3 projection; layer-prepared PrimsTS weights",
-    )
 
     def _flashinfer_eligible(
         self, layer: nn.Module, x: torch.Tensor, role: Flux3PrimsTsRole
@@ -98,10 +94,6 @@ class Flux3LinearOp(_Flux3PrimsTsOp):
     """``layer(x)`` for an attention, MLP-down, or unfused QKV projection."""
 
     op = "gemm.flux3_linear"
-    descriptions = {
-        KernelBackend.FLASHINFER: "PrimsTS FP8/NVFP4 dense GEMM.",
-        KernelBackend.TORCH: "Generic SGLang linear (layer quant method).",
-    }
 
     def backend_eligible(self, backend, layer, x, quantized=None) -> bool:
         if backend is KernelBackend.FLASHINFER:
@@ -125,10 +117,6 @@ class Flux3QKVQKNormRopeOp(_Flux3PrimsTsOp):
     """Packed QKV projection, Q/K RMSNorm, and RoPE -> ``(B, L, H, D)`` q, k, v."""
 
     op = "gemm.flux3_qkv_qknorm_rope"
-    descriptions = {
-        KernelBackend.FLASHINFER: "PrimsTS QKV GEMM with QK-norm/RoPE epilogue.",
-        KernelBackend.TORCH: "FLUX.3 linear, then fused QK-norm/RoPE kernel.",
-    }
 
     def backend_eligible(
         self,
@@ -197,10 +185,6 @@ class Flux3GatedMLPOp(_Flux3PrimsTsOp):
     """``mlp_out(silu(gate) * value)`` with ``[gate | value] = mlp_in(x)``."""
 
     op = "gemm.flux3_gated_mlp"
-    descriptions = {
-        KernelBackend.FLASHINFER: "PrimsTS MLP-up with SwiGLU epilogue.",
-        KernelBackend.TORCH: "Generic MLP-up, silu_and_mul, FLUX.3 linear.",
-    }
 
     def backend_eligible(self, backend, mlp_in, mlp_out, x, quantized=None) -> bool:
         if backend is KernelBackend.FLASHINFER:

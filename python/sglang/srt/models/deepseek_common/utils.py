@@ -19,7 +19,7 @@ import torch
 
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.environ import envs
-from sglang.srt.layers.moe.fused_moe_triton.layer import get_moe_runner_backend
+from sglang.srt.layers.moe import get_moe_runner_backend
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -34,6 +34,7 @@ from sglang.srt.utils import (
     is_musa,
     is_npu,
     is_nvidia_cublas_version_ge_12_9,
+    is_sail,
     is_xpu,
 )
 
@@ -41,6 +42,7 @@ _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_musa = is_musa()
+_is_sail = is_sail()
 _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -70,10 +72,12 @@ FORWARD_ABSORB_CORE_ATTENTION_BACKENDS = [
     "flashinfer",
     "trtllm_mla",
     "cutedsl_mla",
-    "tokenspeed_mla",
     "ascend",
     "intel_xpu",
 ]
+if _is_sail:
+    # SailFlashMLABackend takes the absorbed q/k split into nope and rope parts.
+    FORWARD_ABSORB_CORE_ATTENTION_BACKENDS.append("flashmla")
 
 
 def _is_block_scale_fp8(proj: torch.nn.Module) -> bool:
@@ -186,14 +190,12 @@ def tiny_router_gemm_max_tokens(
     *, num_experts: int, hidden_size: int, weight_dtype: torch.dtype
 ) -> int:
     """Rows up to which the tiny GEMM beats cuBLAS for the router, -1 when the
-    shape or the device rules it out. Doubles as the kernel's compile-time
-    max_m, so keep it as tight as the measurements allow.
-    """
+    shape or the device rules it out."""
     if not _is_cuda or _device_sm < 90 or weight_dtype != torch.bfloat16:
         return -1
 
     from sglang.kernels.ops.gemm.tiny_gemm import can_use_tiny_gemm
 
-    if not can_use_tiny_gemm(num_experts, hidden_size, max_m=16):
+    if not can_use_tiny_gemm(num_experts, hidden_size):
         return -1
     return 16

@@ -11,7 +11,7 @@ import numpy.typing as npt
 from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
-    from sglang.srt.disaggregation.utils import DisaggregationMode
+    from sglang.srt.disaggregation.mode import DisaggregationMode
 
 
 class StateType(str, enum.Enum):
@@ -19,6 +19,7 @@ class StateType(str, enum.Enum):
     QSA_PENDING = "qsa_pending"
     QSA_COMPRESSED = "qsa_compressed"
     SWA = "swa"
+    AUXILIARY_SWA = "auxiliary_swa"
     DSA = "dsa"
     # DSA kpool-compress tail: one per-request ring row. The indices encode
     # only the live subrange of that row for the current open pool.
@@ -61,6 +62,8 @@ class KVArgs:
     kv_item_lens: List[int]
     kv_layer_ids: List[int]
     kv_cache_dtype_str: str
+    # KV byte layout both PD roles must share; None for pools with only one.
+    kv_layout: Optional[str] = None
     host_kv_data_ptrs: Optional[List[int]] = None
     host_kv_data_lens: Optional[List[int]] = None
     host_kv_item_lens: Optional[List[int]] = None

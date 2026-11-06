@@ -45,7 +45,8 @@ from sglang.srt.layers.attention.mqa_logits_utils import (
     mqa_logits_rows_per_chunk,
 )
 from sglang.srt.layers.linear import ReplicatedLinear
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
 )
@@ -58,11 +59,11 @@ from sglang.srt.runtime_context import (
     get_platform,
 )
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
-from sglang.srt.utils import add_prefix, is_cuda, is_hip, is_xpu
+from sglang.srt.utils import is_cuda, is_hip, is_xpu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-    from sglang.srt.layers.attention.dsv4.compressor import (
+    from sglang.srt.layers.attention.dsv4.compressor_v2 import (
         CompressorBackendMixin,
     )
     from sglang.srt.layers.quantization import QuantizationConfig

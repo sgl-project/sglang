@@ -11,12 +11,12 @@ import torch
 from torch import nn
 
 from sglang.kernels.ops.layernorm.mhc_boundary_hip import rmsnorm_with_sinkhorn
+from sglang.kernels.ops.layernorm.rmsnorm_fake_quant_amd_gfx95 import (
+    rmsnorm_fake_quant_fp8,
+)
 from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
     Fp8GridActivation,
     Mxfp8Activation,
-)
-from sglang.kernels.ops.quantization.rmsnorm_fake_quant_amd_gfx95 import (
-    rmsnorm_fake_quant_fp8,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -24,7 +24,7 @@ from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
 from sglang.srt.layers.quantization.fp8_utils import resolve_block_fp8_mxfp8_backend
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import is_gfx95_supported, is_hip
-from sglang.srt.utils.common import is_gfx1250_supported
+from sglang.srt.utils.device import is_gfx1250_supported
 
 logger = logging.getLogger(__name__)
 
