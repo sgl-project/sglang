@@ -57,7 +57,6 @@ from sglang.srt.mem_cache.kv.memory.arena import KVArena
 from sglang.srt.mem_cache.utils import get_num_new_pages
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.invariants import expect, resolve_level
-from sglang.srt.utils.triton_utils import next_power_of_2
 
 logger = logging.getLogger(__name__)
 
@@ -1021,7 +1020,6 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                     last_loc,
                     free_pages,
                     out_indices,
-                    next_power_of_2(bs),
                     self.full_attn_allocator.page_size,
                 )
             return out_indices
@@ -1185,7 +1183,6 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                         last_loc,
                         free_pages,
                         out_indices,
-                        next_power_of_2(bs),
                         self.full_attn_allocator.page_size,
                     )
                 return out_indices
