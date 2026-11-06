@@ -8,6 +8,7 @@ import threading
 import time
 from collections import defaultdict
 from contextlib import nullcontext
+from numbers import Integral
 from typing import (
     Dict,
     List,
@@ -73,6 +74,8 @@ from sglang.srt.utils.network import (
 )
 
 logger = logging.getLogger(__name__)
+
+_REBOOTSTRAP_CONNECT_TIMEOUT_S = 5.0
 
 ABORT_TAG = b"ABORT"
 ABORT_ACK_TAG = b"ABORT_ACK"
@@ -1233,6 +1236,10 @@ class CommonKVManager(BaseKVManager):
 
         The target prefill ``/generate`` URL is derived from bootstrap info (the
         prefill self-registered its HTTP port), not from a router-injected field.
+        The URL only pins the prefill *pod*; the DP rank inside it is pinned by
+        the payload's ``routed_dp_rank`` (see ``Req.build_rebootstrap_payload``),
+        which is validated here against the known prefill ``dp_size`` so a stale
+        pin fails immediately instead of hanging on the KV waiting timeout.
 
         Non-blocking from the scheduler's perspective: the HTTP POST runs on the
         shared executor. Any failure (unresolved URL, HTTP error, exception) is
@@ -1256,6 +1263,31 @@ class CommonKVManager(BaseKVManager):
         """
         if self.attn_tp_rank != 0 or self.attn_cp_rank != 0 or self.pp_rank != 0:
             return
+        routed_dp_rank = payload.get("routed_dp_rank")
+        prefill_info = self.prefill_info_table.get(kv_receiver.bootstrap_addr)
+        if (
+            routed_dp_rank is not None
+            and prefill_info is not None
+            and prefill_info.dp_size
+            and (
+                isinstance(routed_dp_rank, bool)
+                or not isinstance(routed_dp_rank, Integral)
+                or not 0 <= routed_dp_rank < prefill_info.dp_size
+            )
+        ):
+            # An out-of-range pin would be rejected by the prefill tokenizer
+            # manager (400) or, worse, reach DataParallelController and raise
+            # "DP rank N is not active" there. Fail the rebootstrap here so the
+            # request is aborted with a clear reason instead of waiting out the
+            # KV waiting timeout.
+            reason = (
+                f"PD retract rebootstrap target prefill dp_rank={routed_dp_rank} "
+                f"must be an integer in range [0, {prefill_info.dp_size}) for rid="
+                f"{payload.get('rid')}."
+            )
+            logger.error(reason)
+            self._fail_prefill_recompute(kv_receiver, reason)
+            return
         prefill_url = self._resolve_rebootstrap_prefill_url(kv_receiver)
         if not prefill_url:
             logger.error(
@@ -1271,8 +1303,25 @@ class CommonKVManager(BaseKVManager):
                 "URL from bootstrap info.",
             )
             return
-        self._ensure_prefill_recompute_executor().submit(
-            self._run_prefill_recompute, kv_receiver, prefill_url, payload
+        try:
+            self._ensure_prefill_recompute_executor().submit(
+                self._run_prefill_recompute, kv_receiver, prefill_url, payload
+            )
+        except Exception:
+            logger.exception(
+                "PD rebootstrap submission failed for rid=%s", payload.get("rid")
+            )
+            self._fail_prefill_recompute(
+                kv_receiver, "PD rebootstrap executor submission failed."
+            )
+            return
+        logger.info(
+            "PD retract rebootstrap submitted: rid=%s bootstrap_room=%s "
+            "prefill_dp_rank=%s tokens=%d",
+            payload.get("rid"),
+            kv_receiver.bootstrap_room,
+            routed_dp_rank,
+            len(payload.get("input_ids") or ()),
         )
 
     def _fail_prefill_recompute(
@@ -1308,7 +1357,13 @@ class CommonKVManager(BaseKVManager):
             response = self._get_prefill_recompute_session().post(
                 prefill_url.rstrip("/") + "/generate",
                 json=payload,
-                timeout=self.waiting_timeout,
+                # Separate connect/read budgets: an unreachable prefill must not
+                # burn the whole read budget before the request is failed, while
+                # the read budget still has to cover a full prefix recompute.
+                timeout=(
+                    min(_REBOOTSTRAP_CONNECT_TIMEOUT_S, self.waiting_timeout),
+                    self.waiting_timeout,
+                ),
             )
             if response.status_code >= 400:
                 logger.error(

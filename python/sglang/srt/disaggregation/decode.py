@@ -1023,6 +1023,19 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.queue.join([decode_req])
         return decode_req
 
+    @property
+    def num_rebootstrap_in_flight(self) -> int:
+        """Count the disjoint held, bootstrap, preallocation and transfer stages."""
+        return len(self.held_rebootstrap_reqs) + sum(
+            decode_req.is_rebootstrap
+            for queue in (
+                self.pending_reqs,
+                self.queue.items(),
+                self.transfer_queue.queue.items(),
+            )
+            for decode_req in queue
+        )
+
     def hold_rebootstrap(self, req: Req) -> None:
         """Stage a retracted request for rebootstrap without enqueuing it yet.
 
@@ -3214,6 +3227,15 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         decode_req.kv_receiver.clear()
         decode_req.kv_receiver = None
         decode_req.req.time_stats.set_wait_queue_entry_time()
+        if decode_req.is_rebootstrap:
+            logger.info(
+                "PD retract rebootstrap transfer completed: rid=%s bootstrap_room=%s "
+                "prefill_dp_rank=%s tokens=%d",
+                decode_req.req.rid,
+                decode_req.req.bootstrap_room,
+                decode_req.req.disagg_prefill_dp_rank,
+                pre_alloc_fill_len(decode_req.req),
+            )
         return
 
     def _pollers(self) -> list:
@@ -3257,6 +3279,14 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             self.scheduler.metrics_collector.increment_transfer_failed_reqs()
 
     def _abort_failed_transfer(self, decode_req: DecodeRequest) -> None:
+        if decode_req.is_rebootstrap:
+            logger.info(
+                "PD retract rebootstrap transfer failed: rid=%s bootstrap_room=%s "
+                "prefill_dp_rank=%s",
+                decode_req.req.rid,
+                decode_req.req.bootstrap_room,
+                decode_req.req.disagg_prefill_dp_rank,
+            )
         if self._is_host_destination(decode_req):
             decode_req.kv_receiver.abort()
 

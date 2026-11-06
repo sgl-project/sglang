@@ -216,6 +216,7 @@ def _gated_decode_req(poll, restore_status):
         kv_receiver=_GateReceiver(poll),
         metadata_buffer_index=3,
         hicache_restore_status=restore_status,
+        is_rebootstrap=False,
         pending_metadata=None,
     )
 

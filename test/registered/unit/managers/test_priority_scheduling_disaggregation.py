@@ -952,6 +952,68 @@ class TestCommonKVManagerPrefillRecompute(unittest.TestCase):
         mgr._prefill_recompute_executor.submit.assert_not_called()
         self.assertIn(7, mgr.failure_records)
 
+    def test_submit_out_of_range_dp_rank_fails_via_abort(self):
+        # A pinned prefill DP rank outside the prefill's dp_size would only be
+        # rejected later (HTTP 400 or a DP controller error); fail it before the
+        # POST so the request is aborted with a clear reason.
+        mgr = self._new_manager()
+        mgr._prefill_recompute_executor = MagicMock()
+        receiver = MagicMock(bootstrap_room=7, bootstrap_addr="127.0.0.1:8998")
+        self._register_prefill_info(mgr, "127.0.0.1:8998", 30000)
+
+        mgr.submit_prefill_recompute(receiver, {**self._payload(), "routed_dp_rank": 1})
+
+        receiver.abort.assert_called_once()
+        mgr._prefill_recompute_executor.submit.assert_not_called()
+        self.assertIn("integer in range", mgr.failure_records[7])
+
+    def test_invalid_rank_types_fail_before_executor_dispatch(self):
+        for rank in (-1, 1, True, 0.5, "0"):
+            with self.subTest(rank=rank):
+                mgr = self._new_manager()
+                mgr._prefill_recompute_executor = MagicMock()
+                receiver = MagicMock(bootstrap_room=7, bootstrap_addr="127.0.0.1:8998")
+                self._register_prefill_info(mgr, receiver.bootstrap_addr, 30000)
+                mgr.submit_prefill_recompute(
+                    receiver, {**self._payload(), "routed_dp_rank": rank}
+                )
+                receiver.abort.assert_called_once()
+                mgr._prefill_recompute_executor.submit.assert_not_called()
+
+    def test_executor_rejection_uses_the_transfer_failure_path(self):
+        mgr = self._new_manager()
+        mgr._prefill_recompute_executor = MagicMock()
+        mgr._prefill_recompute_executor.submit.side_effect = RuntimeError(
+            "shutting down"
+        )
+        receiver = MagicMock(bootstrap_room=7, bootstrap_addr="127.0.0.1:8998")
+        self._register_prefill_info(mgr, receiver.bootstrap_addr, 30000)
+        mgr.submit_prefill_recompute(receiver, self._payload())
+        receiver.abort.assert_called_once()
+        self.assertIn("executor submission failed", mgr.failure_records[7])
+
+    def test_connect_budget_respects_a_shorter_waiting_timeout(self):
+        mgr = self._new_manager()
+        mgr.waiting_timeout = 0.5
+        session = MagicMock()
+        session.post.return_value = SimpleNamespace(status_code=200)
+        mgr._prefill_recompute_sessions.session = session
+        mgr._run_prefill_recompute(
+            MagicMock(bootstrap_room=7), "http://prefill", self._payload()
+        )
+        self.assertEqual(session.post.call_args.kwargs["timeout"], (0.5, 0.5))
+
+    def test_submit_in_range_dp_rank_dispatches(self):
+        mgr = self._new_manager()
+        mgr._prefill_recompute_executor = MagicMock()
+        receiver = MagicMock(bootstrap_room=7, bootstrap_addr="127.0.0.1:8998")
+        self._register_prefill_info(mgr, "127.0.0.1:8998", 30000)
+
+        mgr.submit_prefill_recompute(receiver, {**self._payload(), "routed_dp_rank": 0})
+
+        mgr._prefill_recompute_executor.submit.assert_called_once()
+        receiver.abort.assert_not_called()
+
     def test_run_aborts_on_http_error(self):
         mgr = self._new_manager()
         session = MagicMock()
@@ -976,6 +1038,27 @@ class TestCommonKVManagerPrefillRecompute(unittest.TestCase):
 
         receiver.abort.assert_called_once()
         self.assertIn(7, mgr.failure_records)
+
+    def test_run_splits_connect_and_read_timeout(self):
+        # An unreachable prefill must fail within the short connect budget; the
+        # read budget still covers a full prefix recompute.
+        from sglang.srt.disaggregation.common.conn import (
+            _REBOOTSTRAP_CONNECT_TIMEOUT_S,
+        )
+
+        mgr = self._new_manager()
+        session = MagicMock()
+        session.post.return_value = SimpleNamespace(status_code=200, text="")
+        mgr._prefill_recompute_sessions.session = session
+        receiver = MagicMock(bootstrap_room=7)
+
+        mgr._run_prefill_recompute(receiver, "http://prefill", self._payload())
+
+        self.assertEqual(
+            session.post.call_args.kwargs["timeout"],
+            (_REBOOTSTRAP_CONNECT_TIMEOUT_S, mgr.waiting_timeout),
+        )
+        self.assertEqual(_REBOOTSTRAP_CONNECT_TIMEOUT_S, 5.0)
 
     def test_run_success_does_not_abort(self):
         mgr = self._new_manager()

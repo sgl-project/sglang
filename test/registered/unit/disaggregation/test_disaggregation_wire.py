@@ -2494,6 +2494,8 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                 rid="r0",
                 bootstrap_host="127.0.0.1",
                 bootstrap_room=9,
+                disagg_prefill_dp_rank=0,
+                origin_input_ids=[1, 2, 3],
                 output_ids=[5, 6],
                 customized_info={"token_ids": [5, 6]},
                 return_logprob=False,
