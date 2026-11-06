@@ -76,8 +76,8 @@ from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
 )
 from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
 from sglang.srt.layers.attention.graph_utils import (
+    pad_with_zero_rows,
     real_rows_scope,
-    zero_padded_rows,
 )
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStatePacker
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
@@ -2665,8 +2665,8 @@ class MQALayer(MqaAttentionBase):
                 defer_all_reduce=defer_all_reduce,
             )
         if isinstance(out, mhc.AttnOutput):
-            return mhc.AttnOutput(zero_padded_rows(out.partial, x.shape[0]))
-        return zero_padded_rows(out, x.shape[0])
+            return mhc.AttnOutput(pad_with_zero_rows(out.partial, x.shape[0]))
+        return pad_with_zero_rows(out, x.shape[0])
 
     def forward(
         self,
