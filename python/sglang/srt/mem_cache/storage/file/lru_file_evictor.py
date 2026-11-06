@@ -30,7 +30,7 @@ import threading
 from collections import OrderedDict
 from typing import Any, Callable, Optional, Set, Tuple
 
-from sglang.srt.environ import envs
+from sglang.srt.environ import EnvField, envs
 from sglang.srt.utils.common import human_readable_int
 
 logger = logging.getLogger(__name__)
@@ -53,6 +53,38 @@ def _parse_size_to_bytes(value: Any) -> int:
         return 0
 
 
+KV_SHARD_FILE_EVICTION_ERROR = (
+    "--enable-kv-cache-sharding does not support HiCacheFile eviction: unset "
+    "max_size / min_free_space in the storage backend extra config and "
+    "SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE / SGLANG_HICACHE_FILE_BACKEND_MIN_FREE_SPACE."
+)
+
+
+def _eviction_setting(extra: dict, *, key: str, env: EnvField) -> Any:
+    # extra_config (per-backend) takes precedence over env vars.
+    val = extra.get(key)
+    return env.get() if val is None else val
+
+
+def eviction_limits(extra_config: Optional[dict]) -> Tuple[int, int]:
+    """(max_size, min_free_space) in bytes; 0 leaves that limit off."""
+    extra = extra_config or {}
+    return (
+        _parse_size_to_bytes(
+            _eviction_setting(
+                extra, key="max_size", env=envs.SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE
+            )
+        ),
+        _parse_size_to_bytes(
+            _eviction_setting(
+                extra,
+                key="min_free_space",
+                env=envs.SGLANG_HICACHE_FILE_BACKEND_MIN_FREE_SPACE,
+            )
+        ),
+    )
+
+
 class LRUFileEvictor:
     """Bounds the on-disk size of a HiCacheFile directory via LRU eviction.
 
@@ -69,6 +101,7 @@ class LRUFileEvictor:
         *,
         owned_suffixes: Tuple[str, ...],
         tp_rank: int,
+        kv_sharded: bool = False,
         extra_config: Optional[dict] = None,
         on_evict: Optional[Callable[[str], None]] = None,
     ) -> None:
@@ -88,6 +121,10 @@ class LRUFileEvictor:
         self._load_config(extra_config or {})
 
         self._eviction_enabled = self.max_size_bytes > 0 or self.min_free_bytes > 0
+        if kv_sharded and self._eviction_enabled:
+            # Shard ranks share rank-free files; refuse before the startup scan
+            # evicts pages peers own.
+            raise ValueError(KV_SHARD_FILE_EVICTION_ERROR)
         if not self._eviction_enabled:
             return
 
@@ -115,20 +152,12 @@ class LRUFileEvictor:
         )
 
     def _load_config(self, extra: dict) -> None:
-        # extra_config (per-backend) takes precedence over env vars.
-        def _cfg(key, env):
-            val = extra.get(key)
-            return env.get() if val is None else val
+        self.max_size_bytes, self.min_free_bytes = eviction_limits(extra)
 
-        self.max_size_bytes = _parse_size_to_bytes(
-            _cfg("max_size", envs.SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE)
-        )
-        self.min_free_bytes = _parse_size_to_bytes(
-            _cfg("min_free_space", envs.SGLANG_HICACHE_FILE_BACKEND_MIN_FREE_SPACE)
-        )
-
-        ratio_raw = _cfg(
-            "eviction_ratio", envs.SGLANG_HICACHE_FILE_BACKEND_EVICTION_RATIO
+        ratio_raw = _eviction_setting(
+            extra,
+            key="eviction_ratio",
+            env=envs.SGLANG_HICACHE_FILE_BACKEND_EVICTION_RATIO,
         )
         try:
             self.eviction_ratio = float(ratio_raw)

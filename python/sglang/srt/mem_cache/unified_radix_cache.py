@@ -2405,6 +2405,23 @@ class UnifiedRadixCache(BasePrefixCache):
             return None
         return self.tree_core.rotation_base_of(node_id)
 
+    def _prefetch_rotation_base(
+        self, anchor_node_id: NodeId, prefetch_key: RadixKey
+    ) -> Optional[int]:
+        """Logical-page KV sharding: the rotation an L3 prefetch's host bounce is
+        drawn in. A chain keeps its anchor's base; a root anchor adopts a chain
+        that took the prefix since issue, else starts one seeded like a new
+        extend. None when sharding is off."""
+        allocator = self.token_to_kv_pool_allocator
+        if page_interleave_shard_size(allocator) == 1:
+            return None
+        if self.tree_core.is_root(anchor_node_id):
+            base = self.tree_core.rotation_base_below(anchor_node_id, prefetch_key)
+            return allocator.least_full_class() if base is None else base
+        base = self.tree_core.rotation_base_of(anchor_node_id)
+        assert base is not None, "a sharded chain node carries a rotation base"
+        return base
+
     def query_storage_hit_length(
         self,
         last_host_node_id: NodeId,
@@ -2768,7 +2785,8 @@ class UnifiedRadixCache(BasePrefixCache):
             return self._check_pp_prefetch_progress(request)
 
         if request not in self.ongoing_prefetch:
-            return True
+            # The ACK drain may have landed a declined read; wait for its re-issue.
+            return not self.storage_prefetch_retries.holds_admission(request.rid)
 
         operation = self.ongoing_prefetch[request].operation
 
@@ -2786,9 +2804,9 @@ class UnifiedRadixCache(BasePrefixCache):
             else:
                 self.storage_prefetch_retries.poll_miss(request.rid)
             self.revoke_pending_prefetch(request)
-        else:
-            self._handle_prefetch_result(operation)
-        return True
+            return True
+        self._handle_prefetch_result(operation)
+        return not self.storage_prefetch_retries.holds_admission(request.rid)
 
     def _handle_prefetch_result(self, operation: PrefetchOperation) -> None:
         # This function **owns**:
@@ -2846,6 +2864,7 @@ class UnifiedRadixCache(BasePrefixCache):
             fetched_key,
             host_indices[:completed_tokens],
             hash_value[: completed_tokens // self.page_size],
+            rotation_base=operation.kv_rotation_base,
         )
 
         # Apply the host-insert walk's actions before the transfer commit.
@@ -2858,6 +2877,14 @@ class UnifiedRadixCache(BasePrefixCache):
                 host_indices=host_indices[:completed_tokens],
                 extra_pools=[x for xfers in comp_xfers.values() for x in xfers],
             )
+            if insert_result.rotation_tail_declined and not operation.deadline_expired:
+                # A chain with another rotation took this prefix during the read;
+                # a re-issue inherits that rotation. best_effort does not wait for it.
+                self.storage_prefetch_retries.refetch(
+                    request.rid,
+                    operation.storage_start + completed_tokens,
+                    hold_admission=self.prefetch_stop_policy != "best_effort",
+                )
             loaded_from_storage = 0
         else:
             commit_actions: list[CacheAction | ComponentAction] = []
@@ -3485,6 +3512,9 @@ class UnifiedRadixCache(BasePrefixCache):
             # shortened recovery boundary may be invalid in storage; only
             # full-only models may truncate the prefix to fit host capacity.
             allow_partial = not info.comp_xfers
+            operation.kv_rotation_base = self._prefetch_rotation_base(
+                info.anchor_node_id, info.prefetch_key
+            )
             host_indices, alloc_len = cc.allocate_storage_hit(
                 operation,
                 hit_tokens,
