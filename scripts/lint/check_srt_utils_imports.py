@@ -20,8 +20,8 @@ from pathlib import Path
 PKG_ROOT = Path("python")
 UTILS_DIR = PKG_ROOT / "sglang" / "srt" / "utils"
 
-# srt infrastructure that sglang.srt.utils may build on. Each imports no srt
-# domain package at module level itself.
+# This check does not follow imports transitively: add a module here only if it
+# imports no srt domain package at module level itself.
 ALLOWED = (
     "sglang.srt.utils",
     "sglang.srt.environ",
@@ -30,9 +30,8 @@ ALLOWED = (
     "sglang.srt.observability.func_timer",
 )
 
-# Modules that predate the rule, with the srt packages each imports. Moving a
-# module to its owner removes its entry; a stale entry fails the check, so the
-# list only shrinks.
+# Modules that predate the rule. A stale entry fails the check, so the list only
+# shrinks.
 KNOWN_VIOLATIONS = {
     "crash_dump.py": {"sglang.srt.sampling"},
     "cuda_vmm_transport_utils.py": {"sglang.srt.multimodal"},
@@ -90,7 +89,6 @@ def _is_allowed(module: str) -> bool:
 
 
 def domain_imports() -> dict[str, set[str]]:
-    """The srt domain packages each utils module imports at module level."""
     found = {}
     for path in sorted(UTILS_DIR.rglob("*.py")):
         packages = {
