@@ -65,22 +65,24 @@ def _gfx115_grouped_num_warps(
     block_dpe: int,
     kv_dtype: torch.dtype,
     batch: int,
-    kv_head_num: int,
+    head_tiles: int,
 ) -> Optional[int]:
     """num_warps for stage 1 on RDNA3.5 without the CDNA hints, or None to keep them.
 
     The hints cap waves in flight, so the memory-bound GQA decode reads KV 1.4-2.7x slower
-    at batch. They still win where the kernel is compute-bound or the grid is tiny:
-    MLA, fp8 KV (dequant is emulated), and batch * kv_heads < 8 (measured on gfx1151).
+    at batch. Measured on gfx1151, they still win for MLA, fp8 KV (dequant is emulated) and
+    grids under 8 programs per split, and dropping them is neutral at head_dim 256.
     """
-    if block_dpe > 0 or kv_dtype not in (torch.bfloat16, torch.float16):
+    if block_dpe > 0 or block_dmodel > 128:
         return None
-    # Batch-dependent, yet deterministic inference stays batch-invariant: neither the hints
-    # nor num_warps change this kernel's accumulation order (bitwise-identical sweep).
-    if batch * kv_head_num < 8:
+    if kv_dtype not in (torch.bfloat16, torch.float16):
         return None
-    # head_dim 256: 2 warps measured up to 29% slower at batch 1-2
-    return 2 if block_dmodel <= 128 else 4
+    # Under CUDA graphs batch is the captured (padded) size, so this is decided per graph.
+    if batch * head_tiles < 8:
+        return None
+    # Batch-dependent, yet deterministic inference stays batch-invariant on this path: a request
+    # alone vs in batches of 2-16 was bitwise identical on gfx1151 with Triton 3.6.
+    return 2
 
 
 # gfx950 wants 32 where the HIP path otherwise takes 16. That is the model it was picked
@@ -874,7 +876,7 @@ def _decode_grouped_att_m_fwd(
                 block_dpe=BLOCK_DPE,
                 kv_dtype=k_buffer.dtype,
                 batch=batch,
-                kv_head_num=kv_head_num,
+                head_tiles=head_tiles,
             )
             if gfx115_warps is not None:
                 extra_kargs = {}
