@@ -2073,6 +2073,66 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "speculative-adaptive"):
                 validate_hisparse(server_args)
 
+    def test_hisparse_rejects_unvalidated_speculative_algorithms(self):
+        """Unvalidated speculative algorithms are rejected by name. Workers
+        that never call the HiSparse coordinator hooks would write
+        target-verify KV through unmapped device locations (silent
+        corruption); STANDALONE/FROZEN_KV_MTP share the EAGLE verify path
+        but stay rejected until the combination is validated."""
+        for algorithm in ("DFLASH", "DSPARK", "NGRAM", "STANDALONE", "FROZEN_KV_MTP"):
+            with self.subTest(algorithm=algorithm):
+                server_args = ServerArgs(
+                    model_path="dummy",
+                    enable_hisparse=True,
+                    disable_radix_cache=True,
+                    speculative_algorithm=algorithm,
+                )
+                model_config = SimpleNamespace(
+                    hf_config=SimpleNamespace(architectures=["GlmMoeDsaForCausalLM"])
+                )
+
+                with (
+                    patch(
+                        "sglang.srt.arg_groups.hisparse_hook.model_config_of",
+                        return_value=model_config,
+                    ),
+                    patch(
+                        "sglang.srt.configs.model_config.is_deepseek_dsa",
+                        return_value=True,
+                    ),
+                ):
+                    with self.assertRaisesRegex(ValueError, algorithm):
+                        validate_hisparse(server_args)
+
+    def test_hisparse_accepts_validated_speculative_algorithms(self):
+        """EAGLE-family and UNO verify through run_eagle_verify, which binds
+        the HiSparse verify slots; they must keep passing validation."""
+        for algorithm in ("EAGLE", "EAGLE3", "UNO"):
+            with self.subTest(algorithm=algorithm):
+                server_args = ServerArgs(
+                    model_path="dummy",
+                    enable_hisparse=True,
+                    disable_radix_cache=True,
+                    speculative_algorithm=algorithm,
+                    speculative_eagle_topk=1,
+                    kv_cache_dtype="auto",
+                )
+                model_config = SimpleNamespace(
+                    hf_config=SimpleNamespace(architectures=["GlmMoeDsaForCausalLM"])
+                )
+
+                with (
+                    patch(
+                        "sglang.srt.arg_groups.hisparse_hook.model_config_of",
+                        return_value=model_config,
+                    ),
+                    patch(
+                        "sglang.srt.configs.model_config.is_deepseek_dsa",
+                        return_value=True,
+                    ),
+                ):
+                    validate_hisparse(server_args)
+
 
 class TestFa4PageSizeAutoForce(CustomTestCase):
     """FA4 requires page_size 128 for non-MLA models on SM100. The auto-force
