@@ -1427,8 +1427,8 @@ _MUSE_SPARK_TGV_M_RANGES_SM107 = {
     **_MUSE_SPARK_TGV_M_RANGES,
     (1024, 8192): (320, 512),  # TP4 pooler slice: cuBLAS below
     (2560, 8192): (0, 0),  # DFlash draft qkv: cuBLAS
-    (14336, 8192): (40, 64),  # DFlash draft gate_up
-    (8192, 7168): (1, 64),  # DFlash draft down
+    (14336, 8192): (16, 64),  # DFlash draft gate_up
+    (8192, 7168): (1, 32),  # DFlash draft down
 }
 
 
