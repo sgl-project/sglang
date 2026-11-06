@@ -215,7 +215,8 @@ def _kimi_k31_overrides(server_args: Any, hf_config: Any) -> dict:
         if cfg.speculative_algorithm == "DFLASH":
             overrides["speculative_draft_attention_backend"] = "cutedsl_mla"
         if cfg.speculative_algorithm in ("DSPARK", "DFLASH"):
-            # Target verify runs on the DSA decode impl, which merges per-rank partials by LSE.
+            # NOTE(yhyang201): DCP target verify runs the DSA decode path; each
+            # rank attends over its KV shard and the (o, lse) partials are merged.
             overrides["speculative_attention_mode"] = "decode"
         if (
             cfg.dsa_topk_backend != "sgl-kernel"

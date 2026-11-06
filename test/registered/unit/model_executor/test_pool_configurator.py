@@ -1452,8 +1452,7 @@ class TestDflashDraftKvBudget(CustomTestCase):
                 self.assertIs(config.draft_parallel_layout, layout)
 
     def test_dcp_draft_budget_follows_draft_loc_space_scale(self):
-        """A replicated draft pool is charged per widened location, a draft that
-        executes DCP once per target row."""
+        """The DFLASH draft KV is charged once per draft_loc_space_scale row."""
         draft_kv_per_token = 10_240
         target_kv_per_token = 4 * (64 + 64) * 32 * KV_SIZE
         for dcp_size, loc_space_scale in ((1, 1), (8, 8), (8, 1)):
@@ -1484,8 +1483,7 @@ class TestDflashDraftKvBudget(CustomTestCase):
                 )
 
     def test_draft_loc_space_scale(self):
-        """An MLA draft that executes DCP keeps per-rank rows; an MHA draft spans
-        the widened locs."""
+        """An MLA draft that executes DCP keeps per-rank rows."""
         from sglang.srt.mem_cache.kv_cache_configurator import draft_loc_space_scale
 
         hf_config = SimpleNamespace(architectures=["DFlashDraftModel"])

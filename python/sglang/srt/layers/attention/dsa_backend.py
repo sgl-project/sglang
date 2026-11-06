@@ -1023,8 +1023,6 @@ class DeepseekSparseAttnBackend(
             and not envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
         )
         if forward_mode.is_target_verify() and self.dsa_shards_index_k:
-            # DCP: each verify row scores this rank's share of its causal length,
-            # laid out [B, next_n] for DG-native (one index-K read per request).
             lens = _to_2d_context_lens(seqlens_expanded, batch_size)
             if dg_native_verify and lens.numel() == batch_size * next_n:
                 lens = lens.view(batch_size, next_n)

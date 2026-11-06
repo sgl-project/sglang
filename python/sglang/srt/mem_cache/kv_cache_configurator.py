@@ -376,8 +376,6 @@ def host_only_mamba_checkpoint() -> bool:
 
 
 def draft_loc_space_scale(*, hf_config, use_mla_backend: bool, dcp_size: int) -> int:
-    """Pool rows a draft keeps per target row: dcp_size for a draft that spans the
-    widened locs untranslated, 1 for an MLA draft that executes DCP like the target."""
     execution_width = (
         mla_attention_dcp_size(hf_config, dcp_size=dcp_size, is_nextn=True)
         if use_mla_backend
@@ -415,7 +413,6 @@ class KVCacheConfigurator:
     memory_pool_config: Optional[MemoryPoolConfig]
     draft_parallel_layout: DraftParallelLayout | None = None
     dflash_draft_cell_size_per_token: int | None = field(init=False, default=None)
-    # DFLASH draft pool rows per target row (the draft's loc_space_scale)
     dflash_draft_loc_space_scale: int = field(init=False, default=1)
     draft_model_idx: Optional[int] = None
     kv_cache_dtype_str: Optional[str] = None
