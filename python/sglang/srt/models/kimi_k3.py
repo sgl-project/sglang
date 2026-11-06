@@ -3291,6 +3291,16 @@ class KimiK3LinearForCausalLM(nn.Module):
             _EXPERT_WEIGHT_NAME.fullmatch(key) for key in expert_params_lookup
         ), "ckpt expert names diverged from _EXPERT_WEIGHT_NAME; no expert would load"
 
+        # Only MXFP4 remaps the checkpoint's packed names onto weight; WNA16 and
+        # NPU keep the original names. compressed-tensors reports its own name,
+        # so ask it to detect MXFP4 from the format or the resolved target
+        # scheme -- a mixed-precision checkpoint puts neither in quant_format.
+        detect_mxfp4 = getattr(self.quant_config, "_is_mxfp4_moe", None)
+        is_mxfp4 = self.quant_config is not None and (
+            self.quant_config.get_name() == "mxfp4"
+            or (detect_mxfp4 is not None and detect_mxfp4(layer_name=""))
+        )
+
         num_hidden_layers = self.config.num_hidden_layers
         for args in weights:
             name, loaded_weight = args[:2]
@@ -3312,9 +3322,7 @@ class KimiK3LinearForCausalLM(nn.Module):
                 if _lid.isdigit() and int(_lid) >= num_hidden_layers:
                     continue
 
-            # compressed-tensors MXFP4 stores as weight_packed; Mxfp4MoEMethod uses weight
-            # (NPU keeps weight_packed for NPUCompressedTensorsW4A8mxfp4MoE).
-            if "weight_packed" in name and not _is_npu:
+            if "weight_packed" in name and is_mxfp4 and not _is_npu:
                 name = name.replace("weight_packed", "weight")
 
             # MLA: fuse q_a_proj + kv_a_proj_with_mqa → fused_qkv_a_proj_with_mqa

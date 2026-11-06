@@ -4,10 +4,10 @@ import math
 import os
 import time
 from contextlib import contextmanager, nullcontext
-from enum import IntEnum, auto
+from enum import Enum, IntEnum, auto
 from functools import partial
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Callable, Dict, List, Tuple
 
 import torch
 from tqdm import tqdm
@@ -29,7 +29,12 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
 )
-from sglang.srt.utils import ceil_align, ceil_div, get_available_gpu_memory, is_musa
+from sglang.srt.utils import (
+    ceil_align,
+    ceil_div,
+    get_available_gpu_memory,
+    is_musa,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +115,10 @@ def update_deep_gemm_config(gpu_id: int):
     _DO_COMPILE_ALL = _IS_FIRST_RANK_ON_NODE
 
 
+# The warmup kernel types every DeepGEMM build serves. A build that serves more
+# declares them in an enum of its own (see
+# hardware_backend/sail/deep_gemm/kernel_types.py); the signatures below take the
+# bare ``Enum`` because every table keys on ``.name``, which any member has.
 class DeepGemmKernelType(IntEnum):
     GROUPED_GEMM_NT_F8F8BF16_MASKED = auto()
     GROUPED_GEMM_NT_F8F8BF16_CONTIG = auto()
@@ -118,15 +127,24 @@ class DeepGemmKernelType(IntEnum):
     GEMM_NT_F8F8BF16 = auto()
     GEMM_NT_F8F8BF16_BLOCK32 = auto()
     GEMM_NT_BF16BF16F32 = auto()
+    # Every other layout is served by a build-specific enum: the per-channel,
+    # nopad, int8, fp4 and int4 GEMMs have no scale layout the CUDA build takes.
 
 
-_INITIALIZATION_DICT: Dict[Tuple[DeepGemmKernelType, int, int, int], bool] = dict()
+# Grouped layouts every build stores contiguously along M, so their warmup M
+# list is trimmed to the build's M alignment. A build that serves contiguous
+# layouts of its own answers through _trims_to_contiguous_alignment.
+_CONTIG_KERNEL_TYPES = {
+    "GROUPED_GEMM_NT_F8F8BF16_CONTIG",
+    "GROUPED_GEMM_NT_BF16_CONTIG",
+}
+
+
+_INITIALIZATION_DICT: Dict[Tuple[Enum, int, int, int], bool] = dict()
 
 
 @contextmanager
-def _local_rank_compile_lock(
-    kernel_type: DeepGemmKernelType, n: int, k: int, num_groups: int
-):
+def _local_rank_compile_lock(kernel_type: Enum, n: int, k: int, num_groups: int):
     """Serialize one pre-compile group across the ranks sharing DG_JIT_CACHE_DIR.
 
     Every rank lazily walks the same (kernel_type, n, k, num_groups) groups in
@@ -148,7 +166,7 @@ def _local_rank_compile_lock(
 
 # TODO improve code
 def _maybe_compile_deep_gemm_one_type_all(
-    kernel_type: DeepGemmKernelType,
+    kernel_type: Enum,
     n: int,
     k: int,
     num_groups: int,
@@ -160,6 +178,7 @@ def _maybe_compile_deep_gemm_one_type_all(
     if (
         _ENABLE_JIT_DEEPGEMM_PRECOMPILE
         and _DO_COMPILE_ALL
+        and not torch.cuda.is_current_stream_capturing()
         and _INITIALIZATION_DICT.get(query_key) is None
     ):
         _INITIALIZATION_DICT[query_key] = True
@@ -192,9 +211,43 @@ def _maybe_compile_deep_gemm_one_type_all(
             )
 
 
+def _trims_to_contiguous_alignment(kernel_type: Enum) -> bool:
+    """Whether the warmup M list is trimmed to the build's M alignment.
+
+    ``_CONTIG_KERNEL_TYPES`` covers the contiguous layouts every build serves.
+    A member of another enum is served by a build that declares its own, so ask
+    that build, imported on demand the way ``create`` reaches its executors.
+    """
+    if kernel_type.name in _CONTIG_KERNEL_TYPES:
+        return True
+    if isinstance(kernel_type, DeepGemmKernelType):
+        # Shared types are fully answered above; the CUDA build never imports
+        # the platform tree.
+        return False
+    from sglang.srt.hardware_backend.sail.deep_gemm.warmup import is_contig_layout
+
+    return is_contig_layout(kernel_type.name)
+
+
+def _contiguous_m_alignment() -> int:
+    """M alignment of the contiguous grouped layouts.
+
+    Builds that only expose the M-side query (the SAIL vendor build has no
+    ``get_mk_alignment_for_contiguous_layout``) answer with it; every other
+    build answers with the joint M/K query.
+    """
+    if hasattr(deep_gemm, "get_mk_alignment_for_contiguous_layout"):
+        m_alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
+    else:
+        m_alignment = deep_gemm.get_m_alignment_for_contiguous_layout()
+    if isinstance(m_alignment, tuple):
+        m_alignment = m_alignment[0]
+    return m_alignment
+
+
 # NOTE(alcanderian): get_num_sms should be change when 2-batch-overlap is introduced
 def _compile_deep_gemm_one_type_all(
-    kernel_type: DeepGemmKernelType,
+    kernel_type: Enum,
     n: int,
     k: int,
     num_groups: int,
@@ -204,12 +257,12 @@ def _compile_deep_gemm_one_type_all(
     # Temporary disable symmetric memory during compilation since it only runs on the first rank.
     saved_context = disable_symmetric_memory_context()
     try:
-        if kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG:
-            m_alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
+        if _trims_to_contiguous_alignment(kernel_type):
+            m_alignment = _contiguous_m_alignment()
             m_list = sorted(list(set(m for m in m_list if m % m_alignment == 0)))
-        elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_BF16_CONTIG:
-            m_alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
-            m_list = sorted(list(set(m for m in m_list if m % m_alignment == 0)))
+
+        if not m_list:
+            return
 
         # Here the precompilation is only run on the first rank, so gpu_id should be 0
         memory_budget = get_available_gpu_memory(
@@ -251,11 +304,12 @@ def _compile_deep_gemm_one_type_all(
             old_compile_mode = deep_gemm.get_compile_mode()
             deep_gemm.set_compile_mode(1)
 
-        # TODO can use multi thread
-        for m in tqdm(m_list, desc="DeepGEMM warmup"):
-            executor.execute(m=m)
-        if has_compile_mode_api:
-            deep_gemm.set_compile_mode(old_compile_mode)
+        try:
+            for m in tqdm(m_list, desc="DeepGEMM warmup"):
+                executor.execute(m=m)
+        finally:
+            if has_compile_mode_api:
+                deep_gemm.set_compile_mode(old_compile_mode)
 
         # clean up input buffers
         torch.cuda.current_stream().synchronize()
@@ -266,94 +320,139 @@ def _compile_deep_gemm_one_type_all(
         restore_symmetric_memory_context(saved_context)
 
 
-class _BaseWarmupExecutor:
+def check_and_skip_execute(func):
+    """Decorator that checks if the m exceeds self.max_m"""
+
+    def wrapper(self, m):
+        if hasattr(self, "max_m") and m > self.max_m:
+            logger.warning(f"Skip DeepGEMM warmup: {m=} > max_m={self.max_m}.")
+            return
+        return func(self, m)
+
+    return wrapper
+
+
+class _BaseWarmupExecutorMeta(type):
+    """Metaclass that automatically decorates 'execute' methods"""
+
+    def __new__(cls, name, bases, attrs):
+        if "execute" in attrs:
+            attrs["execute"] = check_and_skip_execute(attrs["execute"])
+        return super().__new__(cls, name, bases, attrs)
+
+
+class _BaseWarmupExecutor(metaclass=_BaseWarmupExecutorMeta):
     @staticmethod
-    def create(kernel_type: DeepGemmKernelType, **kwargs):
-        return {
-            DeepGemmKernelType.GEMM_NT_F8F8BF16: _NormalWarmupExecutor,
-            DeepGemmKernelType.GEMM_NT_F8F8BF16_BLOCK32: partial(
-                _NormalWarmupExecutor, block_size=32
-            ),
-            DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG: _GroupedContWarmupExecutor,
-            DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED: _GroupedMaskedWarmupExecutor,
-            DeepGemmKernelType.GEMM_NT_BF16BF16F32: _BF16F32WarmupExecutor,
-            DeepGemmKernelType.GROUPED_GEMM_NT_BF16_CONTIG: _BF16GroupedContWarmupExecutor,
-            DeepGemmKernelType.GROUPED_GEMM_NT_BF16_MASKED: _BF16GroupedMaskedWarmupExecutor,
-        }[kernel_type](**kwargs)
+    def create(kernel_type: Enum, **kwargs):
+        factory = _WARMUP_EXECUTORS.get(kernel_type)
+        if factory is None:
+            # Kernel types only the SAIL vendor build serves; their executors
+            # live under srt/hardware_backend/sail and are imported on demand.
+            from sglang.srt.hardware_backend.sail.deep_gemm.warmup import (
+                create_sail_warmup_executor,
+            )
+
+            return create_sail_warmup_executor(kernel_type, **kwargs)
+        return factory(**kwargs)
 
     @staticmethod
     def get_memory_requirement(
-        kernel_type: DeepGemmKernelType, max_m: int, n: int, k: int, num_groups: int
+        kernel_type: Enum, max_m: int, n: int, k: int, num_groups: int
     ) -> float:
         # FP32 input scales remain live while DeepGEMM converts their layout.
         _GB = 1 << 30
-        is_dense_fp8 = kernel_type in (
-            DeepGemmKernelType.GEMM_NT_F8F8BF16,
-            DeepGemmKernelType.GEMM_NT_F8F8BF16_BLOCK32,
-        )
-        block_size = (
-            32
-            if kernel_type == DeepGemmKernelType.GEMM_NT_F8F8BF16_BLOCK32
-            else _BLOCK_SIZE
-        )
-        lhs_scales = max_m * ceil_div(k, block_size) * 4
-        rhs_scales = ceil_div(n, block_size) * ceil_div(k, block_size) * 4
-        scale_workspace = _get_fp8_scale_workspace(
-            max_m,
-            n,
-            k,
-            lhs_groups=(
-                num_groups
-                if kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED
-                else 1
-            ),
-            rhs_groups=1 if is_dense_fp8 else num_groups,
-            block_size=block_size,
-        )
-        if is_dense_fp8:
-            return (
-                max_m * k
-                + n * k
-                + max_m * n * 2
-                + lhs_scales
-                + rhs_scales
-                + scale_workspace
-            ) / _GB
-        elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG:
-            return (
-                max_m * k
-                + num_groups * n * k
-                + max_m * 4
-                + max_m * n * 2
-                + lhs_scales
-                + scale_workspace
-                + num_groups * rhs_scales
-            ) / _GB
-        elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_BF16_CONTIG:
-            return (
-                max_m * k * 2 + num_groups * n * k * 2 + max_m * 4 + max_m * n * 2
-            ) / _GB
-        elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED:
-            return (
-                num_groups * max_m * k
-                + num_groups * n * k
-                + num_groups * 4
-                + num_groups * max_m * n * 2
-                + num_groups * (lhs_scales + rhs_scales)
-                + scale_workspace
-            ) / _GB
-        elif kernel_type == DeepGemmKernelType.GEMM_NT_BF16BF16F32:
+        name = kernel_type.name
+        if name == "GEMM_NT_BF16BF16F32":
             # bf16 lhs + bf16 rhs + fp32 out
             return (max_m * k * 2 + n * k * 2 + max_m * n * 4) / _GB
-        elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_BF16_MASKED:
+        if name == "GROUPED_GEMM_NT_BF16_MASKED":
             return (
                 num_groups * max_m * k * 2
                 + num_groups * n * k * 2
                 + num_groups * 4
                 + num_groups * max_m * n * 2
             ) / _GB
-        else:
-            raise ValueError(f"Invalid kernel type: {kernel_type}")
+        if name == "GROUPED_GEMM_NT_BF16_CONTIG":
+            return (
+                max_m * k * 2 + num_groups * n * k * 2 + max_m * 4 + max_m * n * 2
+            ) / _GB
+        block_size = 32 if name == "GEMM_NT_F8F8BF16_BLOCK32" else _BLOCK_SIZE
+        lhs_scales = max_m * ceil_div(k, block_size) * 4
+        rhs_scales = ceil_div(n, block_size) * ceil_div(k, block_size) * 4
+        if name in ("GEMM_NT_F8F8BF16", "GEMM_NT_F8F8BF16_BLOCK32"):
+            return (
+                max_m * k
+                + n * k
+                + max_m * n * 2
+                + lhs_scales
+                + rhs_scales
+                + _get_fp8_scale_workspace(
+                    max_m, n, k, lhs_groups=1, rhs_groups=1, block_size=block_size
+                )
+            ) / _GB
+        if name == "GROUPED_GEMM_NT_F8F8BF16_MASKED":
+            return (
+                num_groups * max_m * k
+                + num_groups * n * k
+                + num_groups * 4
+                + num_groups * max_m * n * 2
+                + num_groups * (lhs_scales + rhs_scales)
+                + _get_fp8_scale_workspace(
+                    max_m,
+                    n,
+                    k,
+                    lhs_groups=num_groups,
+                    rhs_groups=num_groups,
+                    block_size=block_size,
+                )
+            ) / _GB
+        if name == "GROUPED_GEMM_NT_F8F8BF16_CONTIG":
+            return (
+                max_m * k
+                + num_groups * n * k
+                + max_m * 4
+                + max_m * n * 2
+                + lhs_scales
+                + _get_fp8_scale_workspace(
+                    max_m,
+                    n,
+                    k,
+                    lhs_groups=1,
+                    rhs_groups=num_groups,
+                    block_size=block_size,
+                )
+                + num_groups * rhs_scales
+            ) / _GB
+        # Every remaining layout is declared by the build that serves it; that
+        # build's module prices it against the buffers its own executors allocate.
+        from sglang.srt.hardware_backend.sail.deep_gemm.memory import (
+            sail_memory_requirement,
+        )
+
+        return sail_memory_requirement(
+            kernel_type, max_m=max_m, n=n, k=k, num_groups=num_groups
+        )
+
+    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+        self.max_m = max_m
+        while True:
+            try:
+                self.setup_tensors(self.max_m, n, k, num_groups)
+                break
+            except torch.OutOfMemoryError:
+                if self.max_m <= 1:
+                    raise
+                # Drop the partially allocated tensors but keep executor config
+                # such as the recipe, then shrink M.
+                for name, value in list(vars(self).items()):
+                    if isinstance(value, torch.Tensor):
+                        delattr(self, name)
+                del value
+                torch.cuda.empty_cache()
+                self.max_m = max(1, self.max_m // 2)
+
+    def setup_tensors(self, max_m: int, n: int, k: int, num_groups: int):
+        raise NotImplementedError
 
     def execute(self, m):
         raise NotImplementedError
@@ -416,6 +515,10 @@ class _NormalWarmupExecutor(_BaseWarmupExecutor):
         self, max_m: int, n: int, k: int, num_groups: int, block_size: int = 128
     ):
         self.recipe = (1, block_size, block_size)
+        super().__init__(max_m, n, k, num_groups)
+
+    def setup_tensors(self, max_m: int, n: int, k: int, num_groups: int):
+        block_size = self.recipe[1]
         self.lhs_q, self.lhs_s = _empty_token_fp8((max_m, k), block_size)
         self.rhs_q, self.rhs_s = _empty_block_fp8((n, k), block_size)
         self.out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)
@@ -431,6 +534,9 @@ class _NormalWarmupExecutor(_BaseWarmupExecutor):
 
 class _GroupedContWarmupExecutor(_BaseWarmupExecutor):
     def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+        super().__init__(max_m, n, k, num_groups)
+
+    def setup_tensors(self, max_m: int, n: int, k: int, num_groups: int):
         self.lhs_q, self.lhs_s = _empty_token_fp8((max_m, k))
         self.rhs_q, self.rhs_s = _empty_block_fp8((num_groups, n, k))
         self.m_indices = torch.zeros((max_m,), device="cuda", dtype=torch.int32)
@@ -447,6 +553,9 @@ class _GroupedContWarmupExecutor(_BaseWarmupExecutor):
 
 class _BF16GroupedContWarmupExecutor(_BaseWarmupExecutor):
     def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+        super().__init__(max_m, n, k, num_groups)
+
+    def setup_tensors(self, max_m: int, n: int, k: int, num_groups: int):
         self.a = torch.empty((max_m, k), device="cuda", dtype=torch.bfloat16)
         self.b = torch.empty((num_groups, n, k), device="cuda", dtype=torch.bfloat16)
         self.m_indices = torch.zeros((max_m,), device="cuda", dtype=torch.int32)
@@ -463,6 +572,9 @@ class _BF16GroupedContWarmupExecutor(_BaseWarmupExecutor):
 
 class _GroupedMaskedWarmupExecutor(_BaseWarmupExecutor):
     def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+        super().__init__(max_m, n, k, num_groups)
+
+    def setup_tensors(self, max_m: int, n: int, k: int, num_groups: int):
         self.lhs_q, self.lhs_s = _empty_token_fp8((num_groups, max_m, k))
         self.rhs_q, self.rhs_s = _empty_block_fp8((num_groups, n, k))
         self.masked_m = torch.zeros((num_groups,), device="cuda", dtype=torch.int32)
@@ -476,13 +588,13 @@ class _GroupedMaskedWarmupExecutor(_BaseWarmupExecutor):
             (self.rhs_q, self.rhs_s),
             self.out,
             masked_m=self.masked_m,
-            # DeepGEMM uses `expect_m` instead of input shape for `get_best_config`
+            # DeepGEMM uses `expected_m` instead of input shape for `get_best_config`
             expected_m=m,
         )
 
 
 class _BF16F32WarmupExecutor(_BaseWarmupExecutor):
-    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+    def setup_tensors(self, max_m: int, n: int, k: int, num_groups: int):
         self.lhs = torch.empty((max_m, k), device="cuda", dtype=torch.bfloat16)
         self.rhs = torch.empty((n, k), device="cuda", dtype=torch.bfloat16)
         self.out = torch.empty((max_m, n), device="cuda", dtype=torch.float32)
@@ -493,6 +605,9 @@ class _BF16F32WarmupExecutor(_BaseWarmupExecutor):
 
 class _BF16GroupedMaskedWarmupExecutor(_BaseWarmupExecutor):
     def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+        super().__init__(max_m, n, k, num_groups)
+
+    def setup_tensors(self, max_m: int, n: int, k: int, num_groups: int):
         self.a = torch.empty(
             (num_groups, max_m, k), device="cuda", dtype=torch.bfloat16
         )
@@ -508,13 +623,29 @@ class _BF16GroupedMaskedWarmupExecutor(_BaseWarmupExecutor):
             self.b,
             self.out,
             masked_m=self.masked_m,
-            # DeepGEMM uses `expect_m` instead of input shape for `get_best_config`
+            # DeepGEMM uses `expected_m` instead of input shape for `get_best_config`
             expected_m=m,
         )
 
 
+# The executors for the kernel types every DeepGEMM build serves. A build's own
+# types are served by srt/hardware_backend/sail/deep_gemm/warmup.py, which
+# `create` imports on demand when this table has no entry for the name.
+_WARMUP_EXECUTORS: Dict[Enum, Callable] = {
+    DeepGemmKernelType.GEMM_NT_F8F8BF16: _NormalWarmupExecutor,
+    DeepGemmKernelType.GEMM_NT_F8F8BF16_BLOCK32: partial(
+        _NormalWarmupExecutor, block_size=32
+    ),
+    DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG: _GroupedContWarmupExecutor,
+    DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED: _GroupedMaskedWarmupExecutor,
+    DeepGemmKernelType.GEMM_NT_BF16BF16F32: _BF16F32WarmupExecutor,
+    DeepGemmKernelType.GROUPED_GEMM_NT_BF16_CONTIG: _BF16GroupedContWarmupExecutor,
+    DeepGemmKernelType.GROUPED_GEMM_NT_BF16_MASKED: _BF16GroupedMaskedWarmupExecutor,
+}
+
+
 def deep_gemm_execution_hook(
-    m: int, n: int, k: int, num_groups: int, kernel_type: DeepGemmKernelType
+    m: int, n: int, k: int, num_groups: int, kernel_type: Enum
 ):
     if _is_musa:
         return nullcontext()
@@ -524,7 +655,7 @@ def deep_gemm_execution_hook(
 
 @contextmanager
 def _deep_gemm_execution_hook(
-    m: int, n: int, k: int, num_groups: int, kernel_type: DeepGemmKernelType
+    m: int, n: int, k: int, num_groups: int, kernel_type: Enum
 ):
     if m > 0:
         _maybe_compile_deep_gemm_one_type_all(kernel_type, n, k, num_groups)

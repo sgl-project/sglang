@@ -8,6 +8,7 @@ from functools import cached_property
 from typing import Dict, List, Optional, Tuple
 
 import torch
+from compressed_tensors.quantization import QuantizationStrategy
 from torch.nn.parameter import UninitializedParameter
 
 from sglang.srt.batch_overlap.single_batch_overlap import DownGemmOverlapArgs
@@ -60,16 +61,22 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
 )
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+    CompressedTensorsConfig,
     CompressedTensorsFusedMoEMethod,
 )
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMxInt4MoE,
+    CompressedTensorsW8A8Fp8MoE,
+    CompressedTensorsW8A8Int8MoE,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 from sglang.srt.layers.quantization.fp8_utils import quantize_block_fp8_weight_to_mxfp4
 from sglang.srt.layers.quantization.minimax_m3_nvfp4 import MiniMaxM3Nvfp4MoE
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4FusedMoEMethod
+from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
+from sglang.srt.layers.quantization.w8a8_fp8 import W8A8FP8MoEMethod
+from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8MoEMethod
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     get_tc_piecewise_forward_context,
     is_in_tc_piecewise_cuda_graph,
@@ -89,11 +96,13 @@ from sglang.srt.utils import (
     is_cpu,
     is_hip,
     is_npu,
+    is_sail,
     round_up,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 
 _is_hip = is_hip()
+_is_sail = is_sail()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_npu = is_npu()
@@ -238,6 +247,7 @@ def create_moe_dispatcher(
         or a2a_backend.is_nixl()
         or a2a_backend.is_pplx()
     ):
+        use_recv_hook = envs.SGLANG_SAIL_DEEPEP_RECV_HOOK.get()
         return MaybeTboDeepEPDispatcher(
             runner_backend=moe_runner_config.runner_backend,
             group=_get_deepep_comm_group(a2a_backend),
@@ -249,7 +259,7 @@ def create_moe_dispatcher(
             params_dtype=moe_runner_config.params_dtype,
             deepep_mode=get_deepep_mode(),
             async_finish=True,
-            return_recv_hook=True,
+            return_recv_hook=use_recv_hook,
         )
     elif a2a_backend.is_deepep_v2():
         output_dtype = get_deepep_v2_dispatcher_output_dtype(
@@ -678,6 +688,14 @@ class FusedMoE(torch.nn.Module):
         if self.use_flashinfer_trtllm_moe:
             self.moe_runner_config.inplace = False
 
+        # On SAIL the dispatcher needs its wire format before the weights are
+        # loaded, so build it here. Off SAIL the quant method configures the
+        # dispatcher itself once the checkpoint dtype is final; writing the
+        # still-empty dict back would build MORI EPv2's op with the wrong format.
+        dispatcher_quant_config = self._build_dispatcher_quant_config()
+        if dispatcher_quant_config is not None:
+            self.dispatcher.set_quant_config(dispatcher_quant_config)
+
         self.should_fuse_routed_scaling_factor_in_topk = (
             _fuses_routed_scaling_factor_in_topk(self.quant_method, self.runner_backend)
         )
@@ -768,6 +786,77 @@ class FusedMoE(torch.nn.Module):
             param.data = tensor
         else:
             setattr(self, name, tensor)
+
+    def _build_dispatcher_quant_config(self) -> Optional[dict]:
+        """Build the dictionary passed to ``dispatcher.set_quant_config``.
+
+        Only SAIL needs the wire format at construction time. Everywhere else the
+        quantization method resolves it in ``process_weights_after_loading``,
+        once the checkpoint dtype is known, so this returns ``None`` and leaves
+        that call as the single writer. Writing the dispatcher's own (still
+        empty) dict back here would make MORI EPv2 build its op from ``{}``.
+
+        The dispatcher only accepts dictionaries. This method converts the
+        layer's ``quant_config`` object (e.g. ``CompressedTensorsConfig``)
+        into a dict with the fields required by the dispatcher, while
+        preserving the existing object for weight-loading paths.
+        """
+        if not _is_sail:
+            return None
+
+        quant_config_dict: dict = {}
+
+        # compressed-tensors reports its scheme on the layer rather than the
+        # quant method, so a compressed-tensors W8A8 INT8 MoE needs its own
+        # probe. It drives the same wire format as W8A8Int8MoEMethod.
+        ct_int8 = isinstance(
+            self.quant_method, CompressedTensorsFusedMoEMethod
+        ) and isinstance(self.scheme, CompressedTensorsW8A8Int8MoE)
+
+        # SAIL DeepEP reads the dispatch dtype from this same
+        # dispatcher_output_dtype field, which keeps every rank on one config.
+        if (
+            isinstance(self.quant_method, Fp8MoEMethod)
+            or isinstance(self.quant_method, W8A8FP8MoEMethod)
+            or (
+                isinstance(self.quant_method, CompressedTensorsFusedMoEMethod)
+                and isinstance(self.scheme, CompressedTensorsW8A8Fp8MoE)
+            )
+        ):
+            quant_config_dict["dispatcher_output_dtype"] = "fp8"
+        elif isinstance(self.quant_method, W8A8Int8MoEMethod) or ct_int8:
+            quant_config_dict["dispatcher_output_dtype"] = "int8"
+        elif isinstance(self.quant_method, Mxfp4MoEMethod):
+            quant_config_dict["dispatcher_output_dtype"] = (
+                "bf16"
+                if (
+                    self.quant_method.use_deepgemm_mxfp4_w4a16_valu
+                    or self.quant_method.use_deepgemm_mxfp4_w4a16_mma
+                )
+                else "uint8"
+            )
+        # Unquantized and WNA16 use BF16 dispatch on SAIL.
+        else:
+            quant_config_dict["dispatcher_output_dtype"] = "bf16"
+
+        is_channel_quant = False
+        if isinstance(self.quant_config, CompressedTensorsConfig):
+            # Resolve from the scheme picked for this expert layer rather than the
+            # global "Linear" target: a regex-targeted expert group can carry a
+            # different strategy, and a mismatch breaks both ways -- DeepEP would
+            # quantize activations in 128-groups while the channelwise runner
+            # expects one scale per token, or the reverse.
+            scheme_weight_quant = getattr(self.scheme, "weight_quant", None)
+            is_channel_quant = (
+                scheme_weight_quant is not None
+                and scheme_weight_quant.strategy == QuantizationStrategy.CHANNEL
+            )
+
+        if isinstance(self.quant_method, W8A8Int8MoEMethod) or ct_int8:
+            is_channel_quant = True
+
+        quant_config_dict["is_channel_quant"] = is_channel_quant
+        return quant_config_dict
 
     @cached_property
     def use_padded_loading(self) -> bool:
@@ -1439,6 +1528,7 @@ class FusedMoE(torch.nn.Module):
                     "CompressedTensorsWNA16MarlinMoE",
                     "CompressedTensorsWNA16MoE",
                     "CompressedTensorsWNA16TritonMoE",
+                    "CompressedTensorsWNA16DeepGemmMoE",
                 ]
             )
             and "zero" not in weight_name
@@ -1693,6 +1783,7 @@ class FusedMoE(torch.nn.Module):
                 in [
                     "CompressedTensorsWNA16MoE",
                     "CompressedTensorsWNA16TritonMoE",
+                    "CompressedTensorsWNA16DeepGemmMoE",
                 ]
             )
             and "zero" not in weight_name

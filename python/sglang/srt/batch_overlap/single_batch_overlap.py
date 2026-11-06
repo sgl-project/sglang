@@ -20,9 +20,11 @@ from typing import Optional
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.moe import get_moe_runner_backend
+from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPNormalDispatchOutput
 from sglang.srt.layers.moe.utils import is_sbo_enabled
-from sglang.srt.utils import is_blackwell
+from sglang.srt.utils import is_blackwell, is_sail
 
 
 class SboFlags:
@@ -85,13 +87,28 @@ def compute_overlap_args(dispatch_output, alt_stream):
     ):
         return None, None, {}
 
+    # The rest of this function reads the layout DeepEP's low-latency mode
+    # produces, (num_local_experts, num_tokens, hidden). Normal mode dispatches
+    # a plain (num_tokens, hidden) tensor, which would not even unpack, and it
+    # has its own receive layout anyway, so there is nothing to overlap.
+    if isinstance(dispatch_output, DeepEPNormalDispatchOutput):
+        return None, None, {}
+
     hidden_states = dispatch_output.hidden_states
 
     num_local_experts, num_tokens_static, hidden_dim = hidden_states.shape
 
-    total_num_sms = torch.cuda.get_device_properties(
-        device="cuda"
-    ).multi_processor_count
+    # DeepGEMM reports the SM count its grouped GEMMs may schedule on, which is
+    # exactly the budget this overlap hands out. Some devices under-report the
+    # count through their torch properties, so prefer DeepGEMM when it is built.
+    if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+        import deep_gemm
+
+        total_num_sms = deep_gemm.get_num_sms()
+    else:
+        total_num_sms = torch.cuda.get_device_properties(
+            device="cuda"
+        ).multi_processor_count
 
     if envs.SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS.is_set():
         communicate_num_sms = envs.SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS.get()
@@ -120,7 +137,11 @@ def compute_overlap_args(dispatch_output, alt_stream):
                 num_local_experts, dtype=torch.uint32, device=hidden_states.device
             )
         else:
-            MIN_BLOCK_M = 64
+            # <NOTE>
+            # MIN_BLOCK_M must equal to kMinBlockM in DeepEP
+            # TODO: get MIN_BLOCK_M from deepep interface
+            # </NOTE>
+            MIN_BLOCK_M = 64 if not is_sail() else 16
             combine_signal_size = num_local_experts * (
                 (num_tokens_static + MIN_BLOCK_M - 1) // MIN_BLOCK_M
             )
