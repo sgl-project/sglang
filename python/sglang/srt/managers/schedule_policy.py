@@ -72,6 +72,9 @@ from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.model_executor import encoder_swa_replay
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.scheduler_components.request_retirer import (
+        RequestRetirer,
+    )
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 
 # Clip the estimation of max_new_tokens for the request whose max_new_tokens is very large.
@@ -92,7 +95,7 @@ def _use_exact_chunk_fill() -> bool:
     on that kernel, against 1% for the hipBLASLt GEMMs that just run one extra
     partial tile.
     """
-    return envs.SGLANG_EXACT_CHUNK_FILL.get() and is_gfx95_supported()
+    return is_gfx95_supported()
 
 
 # Threshold for in-batch prefix cache.
@@ -628,6 +631,8 @@ class PrefillAdder:
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
         prefill_tile_block_m: int = 64,
+        request_retirer: Optional[RequestRetirer] = None,
+        kv_awaiting_transfer: bool = False,
     ):
         self.page_size = page_size
         # DCP donates a checkpoint only on the kernel chunk grid. A cut off
@@ -642,6 +647,9 @@ class PrefillAdder:
         if is_cp_sharded_padded():
             self.logical_page_size *= get_cp_strategy().cp_size
         self.running_batch = running_batch
+        self.request_retirer = request_retirer
+        # Finished prefills hold KV until decode pulls it (PD prefill).
+        self.kv_awaiting_transfer = kv_awaiting_transfer
         self.new_token_ratio = new_token_ratio
         self.rem_input_tokens = rem_input_tokens - num_mixed_decode_tokens
         self.rem_chunk_tokens = rem_chunk_tokens
@@ -1382,10 +1390,13 @@ class PrefillAdder:
         return self.budget_state()
 
     def _defer_staged_for_capacity_if_idle(self, req: Req, *, pool: str) -> None:
-        # Running work and admitted prefills (including continuing chunks) can
-        # release capacity. Only idle budget failures should force recomputation.
-        if self.can_run_list or (
-            self.running_batch is not None and self.running_batch.reqs
+        # Running work, admitted prefills (including continuing chunks) and KV
+        # awaiting a decode transfer can release capacity. Only idle budget
+        # failures should force recomputation.
+        if (
+            self.can_run_list
+            or (self.running_batch is not None and self.running_batch.reqs)
+            or self.kv_awaiting_transfer
         ):
             return
         if self.tree_cache.buffer_pipeline is not None:
@@ -1807,7 +1818,9 @@ class PrefillAdder:
                 )
                 release_counter += 1
                 self.running_batch.release_req(
-                    i, len(self.running_batch.reqs) - release_counter
+                    i,
+                    len(self.running_batch.reqs) - release_counter,
+                    self.request_retirer,
                 )
             else:
                 keep_indices.append(i)
