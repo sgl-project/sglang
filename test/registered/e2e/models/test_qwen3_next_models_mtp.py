@@ -7,7 +7,7 @@ from sglang.test.kits.kl_divergence_kit import KLDivergenceMixin
 from sglang.test.kits.prefix_cache_branching_kit import PrefixCacheBranchingMixin
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 
-register_cuda_ci(est_time=346, stage="base-c", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=346, stage="weekly", runner_config="4-gpu-h100")
 
 QWEN3_NEXT_MODEL = "Qwen/Qwen3-Next-80B-A3B-Instruct"
 
@@ -121,11 +121,11 @@ class TestQwen3NextMTPLazyV2(
     )
 
 
-@unittest.skip("Manual-only: forces all lazy spec preallocs to fail")
-class TestQwen3NextMTPLazyAllocFail(GSM8KMixin, KLDivergenceMixin, DefaultServerBase):
+@unittest.skip("Manual-only: reports the mamba state pool full at every lazy boundary")
+class TestQwen3NextMTPLazyPoolFull(GSM8KMixin, KLDivergenceMixin, DefaultServerBase):
     # Small track interval (= draft tokens) maximizes boundary crossings;
-    # forced alloc failure exercises the in-place fallback and the
-    # finished-req skip-insert path on every crossing.
+    # the pool is reported full, so each crossing evicts cached states
+    # before allocating its tracking slot.
     model = QWEN3_NEXT_MODEL
     cache_chunk_size = 64
     gsm8k_accuracy_thres = 0.93
@@ -140,14 +140,14 @@ class TestQwen3NextMTPLazyAllocFail(GSM8KMixin, KLDivergenceMixin, DefaultServer
 
     @classmethod
     def setUpClass(cls):
-        os.environ["SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL"] = "1"
+        os.environ["SGLANG_TEST_MAMBA_LAZY_POOL_FULL"] = "1"
         os.environ["SGLANG_TEST_SKIP_CACHE_HIT_ASSERT"] = "1"
         super().setUpClass()
 
     @classmethod
     def tearDownClass(cls):
         super().tearDownClass()
-        os.environ.pop("SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL", None)
+        os.environ.pop("SGLANG_TEST_MAMBA_LAZY_POOL_FULL", None)
         os.environ.pop("SGLANG_TEST_SKIP_CACHE_HIT_ASSERT", None)
 
 

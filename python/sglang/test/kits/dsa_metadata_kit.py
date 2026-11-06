@@ -9,7 +9,7 @@ from sglang.kernels.ops.attention.dsv4.topk import topk_v2_plan_is_written
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
 from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_parallel
 
 BS, NEXT_N, WIDTH, TOPK, POOL = 4, 6, 131072, 2048, 4

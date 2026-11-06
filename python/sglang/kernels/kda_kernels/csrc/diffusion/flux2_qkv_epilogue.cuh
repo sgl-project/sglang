@@ -169,7 +169,7 @@ struct Flux2QKVEpilogueKernel {
     auto D = SymbolicSize{"head_dim"};
     auto device = SymbolicDevice{};
     D.set_value(kHeadDim);
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     TensorMatcher({NI, H, D})
         .with_strides({-1, D, 1})

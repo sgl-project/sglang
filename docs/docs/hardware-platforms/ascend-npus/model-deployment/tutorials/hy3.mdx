@@ -60,7 +60,7 @@ Hy3 has 295B total parameters. If you need to download model weights, check the 
 
 <Tip>
 The BF16 variant (597.60GB) can be deployed on 16 × 64GB of device memory (`--tp-size 16`), which corresponds to one full
-Ascend A3 Series node (8 cards × 2 dies).
+A3 Series node (8 cards × 2 dies).
 </Tip>
 
 It is recommended to download the model weights to a shared directory accessible from within the container.
@@ -129,7 +129,7 @@ swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.
 ### Single-node online deployment
 
 Single-node deployment completes both prefill and decode within the same node (PD mixed mode). Hy3 with 295B
-parameters requires all 16 logical NPUs on an Ascend A3 Series server (8 physical NPUs × 2 logical cores each, 64 GB HBM
+parameters requires all 16 logical NPUs on an A3 Series server (8 physical NPUs × 2 logical cores each, 64 GB HBM
 per logical NPU).
 
 Set the following environment variables before launching the server:

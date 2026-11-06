@@ -258,6 +258,11 @@ class K31VerifyHostBinding:
             VerifyPoolView,
         )
 
+        if req_pool.mamba_pool.replayssm_request_ring:
+            raise ValueError(
+                "K31 verify indexes the KDA ReplaySSM ring by mamba slot; "
+                "SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT is not supported"
+            )
         full = pool.full_kv_pool
         layers = []
         full_map = pool.full_attention_layer_id_mapping
@@ -270,7 +275,9 @@ class K31VerifyHostBinding:
                 index_cache = full.get_index_k_with_scale_buffer(index)
                 layers.append(VerifyLayerPools(layer_id, (), (cache, index_cache)))
             else:
-                state = req_pool.mamba2_layer_cache(layer_id)
+                state = req_pool.mamba_pool.mamba2_layer_cache(
+                    req_pool.mamba_map[layer_id]
+                )
                 if state.intermediate_ssm is not None or state.replayssm_rawv is None:
                     raise ValueError(
                         "K31 verify requires KDA ReplaySSM speculative pools"
@@ -299,8 +306,10 @@ class K31VerifyHostBinding:
         q = r // b
         if not built.supports(b, q, r):
             return None
-        spec = forward_batch.spec_info
-        if spec is None or getattr(spec, "ragged_verify_layout", None) is not None:
+        if (
+            forward_batch.spec_info is None
+            or forward_batch.ragged_verify_layout is not None
+        ):
             return None
         if not torch.cuda.is_current_stream_capturing() and not covers_short_verify(
             forward_batch, q

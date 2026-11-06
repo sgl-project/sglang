@@ -381,6 +381,7 @@ class TestNativeMoeRoutingPolicy(CustomTestCase):
         )
         block._enable_a2a_moe = False
         block._fuse_shared_experts_inside_sbo = False
+        block.is_hash = False
         block.topk = SimpleNamespace(
             topk_config=SimpleNamespace(output_format=TopKOutputFormat.BYPASSED)
         )

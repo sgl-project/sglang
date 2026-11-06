@@ -144,3 +144,6 @@ class KimiK31Config(KimiK3Config):
     # Without it transformers generates an __init__ that skips KimiK3Config's.
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        if self.text_config.dsa_config is not None:
+            for key in _KIMI_K3_DSA_TOP_LEVEL_CONFIG_KEYS:
+                setattr(self, key, getattr(self.text_config, key))

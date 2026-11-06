@@ -251,7 +251,7 @@ def test_parallel_walk_matches_serial(b, num_sm_parts, topk, extra_topk, mode):
             fixed_overhead_num_blocks=FIXED_OVERHEAD,
             topk=topk,
             extra_topk=extra_topk,
-            parallel=parallel,
+            schedule="parallel" if parallel else "serial",
         )
         out.append((meta, splits))
     assert torch.equal(out[0][0], out[1][0])
@@ -282,7 +282,7 @@ def test_parallel_walk_replay_switches_with_lengths():
             block_size_n=BLOCK_SIZE_N,
             fixed_overhead_num_blocks=FIXED_OVERHEAD,
             topk=topk,
-            parallel=parallel,
+            schedule="parallel" if parallel else "serial",
         )
 
     for parallel in (False, True):
@@ -359,7 +359,7 @@ def test_native_heads_schedule_and_output(heads, batch, mode):
         topk_length=lengths,
         extra_indices=None,
         extra_topk_length=None,
-        parallel=True,
+        schedule="parallel",
     )
     expected_parts = torch.ops.sgl_kernel.sparse_decode_num_sm_parts(batch, 1, heads)
     assert custom_meta.tile_scheduler_metadata.shape[0] == expected_parts
@@ -398,7 +398,7 @@ def test_native_heads_schedule_and_output(heads, batch, mode):
             fixed_overhead_num_blocks=5,
             topk=topk,
             extra_topk=0,
-            parallel=True,
+            schedule="parallel",
         )
         return call(q, custom_meta)
 
@@ -418,7 +418,7 @@ def test_native_heads_schedule_and_output(heads, batch, mode):
 @pytest.mark.skipif(not get_platform().is_sm100, reason="native heads require SM100")
 class TestFlashMLAGraphMetadata(CustomTestCase):
     def test_partition_changes_between_graph_batch_sizes(self):
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.model_executor.forward_mode import ForwardMode
         from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
         from sglang.test.kits.dsa_metadata_kit import inputs, make_backend
 
@@ -549,7 +549,7 @@ def test_windowed_schedule_is_valid(b, num_sm_parts, mode):
         block_size_n=BLOCK_SIZE_N,
         fixed_overhead_num_blocks=FIXED_OVERHEAD,
         topk=topk,
-        windowed=True,
+        schedule="windowed",
     )
     num_blocks = (topk_length.clamp(min=1) + BLOCK_SIZE_N - 1) // BLOCK_SIZE_N
     max_cost = _replay_schedule(meta.cpu(), splits.cpu(), num_blocks.cpu())
@@ -591,7 +591,7 @@ def test_windowed_schedule_output(b):
         block_size_n=BLOCK_SIZE_N,
         fixed_overhead_num_blocks=FIXED_OVERHEAD,
         topk=topk,
-        windowed=True,
+        schedule="windowed",
     )
     out, lse, _ = _call(kv, b, 1, topk, topk_length, meta=(meta, splits))
     assert torch.isfinite(ref_out).all()

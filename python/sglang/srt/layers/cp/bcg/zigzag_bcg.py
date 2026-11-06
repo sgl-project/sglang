@@ -1,6 +1,6 @@
 """Zigzag-specific capture geometry for prefill context parallel CUDA graphs."""
 
-from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.cp.bcg.bcg import PrefillCPBCGInput
 

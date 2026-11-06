@@ -8,10 +8,8 @@ import torch
 from sglang.multimodal_gen.configs.models.dits.qwenimage21 import QwenImage21DitConfig
 from sglang.multimodal_gen.configs.models.encoders.qwen3vl import Qwen3VLConfig
 from sglang.multimodal_gen.configs.models.vaes.qwenimage21 import QwenImage21VAEConfig
-from sglang.multimodal_gen.configs.pipeline_configs.base import (
-    ImagePipelineConfig,
-    ModelTaskType,
-)
+from sglang.multimodal_gen.configs.pipeline_configs.base import ImagePipelineConfig
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 

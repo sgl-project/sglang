@@ -1,12 +1,4 @@
-"""Multi-GPU test of the DSA DCP top-k merge (``DcpTopKMerge``).
-
-Every rank holds the token-interleaved shard of the same global score rows,
-runs the v2 candidate epilogue on it and merges through NVLink multicast. Each
-rank's result must be exactly its share of the global top-k (score descending,
-then position ascending) as widened slots, -1 after them, also when a graph
-replays the merge on three alternating inputs until the 8-bit epoch tag wraps,
-so a read of a stale call's entries would return another input's keys. Unlike
-the one-GPU DSA DCP tests it needs 8 real ranks with NVLink multicast.
+"""Needs 8 GPUs with NVLink multicast.
 
 Usage::
 
@@ -19,6 +11,7 @@ from __future__ import annotations
 import atexit
 import logging
 import os
+from typing import Optional
 
 import pytest
 import torch
@@ -42,7 +35,7 @@ GRAPH_CHECKS, REPLAYS_PER_CHECK = 5, 20  # 3 * 100 calls per row slot > 255 tags
 
 
 @cache_once
-def _init_once() -> DcpTopKMerge:
+def _init_once() -> Optional[DcpTopKMerge]:
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(local_rank)
@@ -54,7 +47,7 @@ def _init_once() -> DcpTopKMerge:
     get_parallel().override_permanently(world_group=ps._WORLD)
     atexit.register(dist.destroy_process_group)
     logging.disable(logging.INFO)
-    return DcpTopKMerge(ps._WORLD, MAX_ROWS, TOPK)
+    return DcpTopKMerge.create(ps._WORLD, MAX_ROWS, TOPK, ps._WORLD.rank_in_group)
 
 
 def _rows(kind: str, seed: int) -> list[torch.Tensor]:
@@ -62,13 +55,6 @@ def _rows(kind: str, seed: int) -> list[torch.Tensor]:
     g = torch.Generator().manual_seed(seed)
     if kind == "random":
         return [torch.randn(131072, generator=g)]
-    if kind == "dense_top":
-        # many distinct scores near the global threshold: overflows the v2
-        # merge's 10-bit threshold bin, not the local 12-bit ones
-        return [
-            10 + 0.3 * torch.randn(131072, generator=g),
-            10 + 0.3 * torch.randn(65536, generator=g),
-        ]
     if kind == "ties":
         return [
             torch.randint(0, 200, (32768 - 100 * i,), generator=g).float() / 8
@@ -80,12 +66,17 @@ def _rows(kind: str, seed: int) -> list[torch.Tensor]:
         for n in (65536, 20000):
             base = torch.randn(8, generator=g)
             base[3] += 10
-            # distinct scores spread over many of v2's coarse bins, so the local
-            # top-k stays exact and the merge alone is under test
+            # distinct scores keep the local top-k exact, so only the merge is tested
             rows.append(
                 base.repeat(n // 8 + 1)[:n] + 4.0 * torch.randperm(n, generator=g) / n
             )
         return rows
+    if kind == "signed_zeros":
+        # ties at the threshold between -0 (even positions) and +0 (odd ones)
+        x = torch.zeros(131072)
+        x[0::2] = -0.0
+        x[torch.randperm(x.numel(), generator=g)[:1000]] = 1.0
+        return [x]
     if kind == "short":
         lengths = [1, 3, 7, 9, 300, 2047, 2048, 2049, 2055, 3000, 5000]
         return [torch.randn(n, generator=g) for n in lengths]
@@ -101,14 +92,13 @@ def _all_ranks_ok(ok: bool) -> bool:
 
 
 def _keys(scores: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
-    b = scores.float().contiguous().view(torch.int32).to(torch.int64) & 0xFFFFFFFF
+    scores = torch.where(scores == 0, 0.0, scores.float())  # -0 ties with +0
+    b = scores.contiguous().view(torch.int32).to(torch.int64) & 0xFFFFFFFF
     ordered = torch.where(b >= 0x80000000, 0xFFFFFFFF - b, b + 0x80000000)
     return ((ordered - 0x80000000) << 32) | (0xFFFFFFFF - pos.to(torch.int64))
 
 
 class _Case:
-    """One input set: this rank's shard of the rows and its expected results."""
-
     def __init__(self, kind: str, seed: int, rank: int, world: int, span: int):
         device = torch.device("cuda", torch.cuda.current_device())
         glob = _rows(kind, seed)
@@ -163,8 +153,9 @@ class _Case:
             self.logits.clone(),
             self.local_lens,
             out_candidates=self.candidates,
-            world=world,
-            rank=rank,
+            dcp_size=world,
+            dcp_rank=rank,
+            deterministic=True,
         )
         merge(self.candidates, self.global_lens, self.page_table, self.out, span)
 
@@ -182,14 +173,16 @@ class _Case:
         return bad
 
 
-@pytest.mark.parametrize("kind", ["random", "dense_top", "ties", "periodic", "short"])
+@pytest.mark.parametrize(
+    "kind", ["random", "ties", "periodic", "signed_zeros", "short"]
+)
 @torch.inference_mode()
 def test_dcp_topk_merge(kind: str) -> None:
     merge = _init_once()
     world, rank = ps._WORLD.world_size, ps._WORLD.rank_in_group
     if world != 8:
         pytest.skip("the merge needs 8 ranks")
-    if merge.buffer is None:
+    if merge is None:
         pytest.skip("multimem multicast unavailable")
     span = PAGE_SIZE * world
     cases = [_Case(kind, seed, rank, world, span) for seed in SEEDS]

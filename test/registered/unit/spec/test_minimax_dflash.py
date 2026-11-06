@@ -88,7 +88,7 @@ def test_dflash_draft_backend_uses_generic_attention_policy(explicit_backend, ex
             return_value=False,
         ),
         patch(
-            "sglang.srt.utils.hf_transformers_utils.get_config",
+            "sglang.srt.utils.hf_transformers.get_config",
             return_value=draft_config,
         ),
     ):
@@ -136,6 +136,8 @@ def test_dflash_hicache_restores_draft_kv_through_a_sidecar():
     draft_pool = object()
     draft_runner = SimpleNamespace(
         token_to_kv_pool=draft_pool,
+        # A draft with its own KV pool, not fused into the target's.
+        runner_ids=SimpleNamespace(is_fused_draft=False),
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(architectures=["MiniMaxDFlash2DraftModel"]),
             num_nextn_predict_layers=0,

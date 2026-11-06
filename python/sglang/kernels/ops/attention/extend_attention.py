@@ -581,6 +581,9 @@ def _fwd_kernel(
                     mask=mask_n,
                     other=0,
                 )
+            # Callers may pass int32 kv_indices; slot * stride overflows int32
+            # once slot >= 2^31 / stride (2M tokens at 8 heads x 128 dim).
+            offs_kv_loc = offs_kv_loc.to(tl.int64)
 
             # Page-aware KV address math. At PAGE_SIZE==1
             # (legacy / non-shared / shared-at-ps=1), Triton specializes
@@ -1364,7 +1367,7 @@ def _fwd_kernel_unified(
                 kv_indices + cur_seq_kv_start_idx + start_n + offs_n,
                 mask=mask_n,
                 other=0,
-            )
+            ).to(tl.int64)
 
             # Page-aware KV address math (see _fwd_kernel_stage1).
             if PAGE_SIZE == 1:

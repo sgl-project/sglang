@@ -186,7 +186,7 @@ Only the DSA layers use HiSparse; the KDA recurrent state stays on GPU and is tr
 ### Benchmark
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
     --backend sglang \
     --dataset-path /path/to/ShareGPT_V3_unfiltered_cleaned_split.json \
     --dataset-name random \

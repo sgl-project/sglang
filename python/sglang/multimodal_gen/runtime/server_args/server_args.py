@@ -667,6 +667,13 @@ class ServerArgs(DisaggServerArgsMixin):
         return self.port + 1
 
     @property
+    def cancel_endpoint(self) -> str | None:
+        # the HTTP server publishes cancelled request ids here to every replica driver
+        if self.port is None or self.disagg_role != RoleType.MONOLITHIC:
+            return None
+        return f"ipc://{tempfile.gettempdir()}/sglang-diffusion-cancel-{self.port}"
+
+    @property
     def progress_endpoint(self) -> str | None:
         # replica drivers send video progress here; ipc only reaches this node
         if self.port is None or self.disagg_role != RoleType.MONOLITHIC:
@@ -3027,7 +3034,7 @@ class ServerArgs(DisaggServerArgsMixin):
                 "('modelopt', 'modelopt_fp8', 'modelopt_fp4', 'mxfp8', "
                 "'mxfp4_npu', 'modelslim') require a pre-quantized checkpoint. "
                 "Note: 'mxfp4' targets ROCm + MI350+ (gfx95x); "
-                "'mxfp4_npu' / 'mxfp8' target Ascend NPU (A5 series for mxfp4_npu)."
+                "'mxfp4_npu' / 'mxfp8' target Ascend NPU (Ascend 950 series for mxfp4_npu)."
             ),
         )
         parser.add_argument(

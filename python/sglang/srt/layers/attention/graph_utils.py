@@ -21,6 +21,9 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.model_executor.runner_utils.prefill_graph import (
+    should_zero_prefill_padding,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -28,7 +31,7 @@ if TYPE_CHECKING:
 
 
 def _zero_padded_tokens(output, actual_tokens):
-    if actual_tokens is not None:
+    if actual_tokens is not None and should_zero_prefill_padding():
         output[actual_tokens:].zero_()
 
 

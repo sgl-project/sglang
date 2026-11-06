@@ -102,6 +102,7 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
     paged_mqa_schedule_metadata: Optional[torch.Tensor] = None
     paged_mqa_ctx_lens_2d: Optional[torch.Tensor] = None
     force_unfused_topk: bool = False
+    dcp_size: int = 1
     # the PAGED extend runs the exact v2 packed top-k (see DSATopKBackend)
     packed_extend_topk: bool = False
 

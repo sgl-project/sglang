@@ -24,7 +24,7 @@ import torch
 import sglang.srt.layers.attention.deepseek_v4_backend_hip_radix as backend_mod
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import runtime
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DSV4_FP8_NOPE_ROW_BYTES
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase

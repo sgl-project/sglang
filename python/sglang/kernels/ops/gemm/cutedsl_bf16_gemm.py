@@ -39,12 +39,9 @@ from cutlass.cute import experimental as cute_ext
 from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.runtime import from_dlpack, make_fake_stream
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.kernel_api_logging import debug_kernel_api
-from sglang.srt.utils import (
-    get_device_core_count,
-    get_device_sm,
-    is_sm100_supported,
-)
+from sglang.srt.utils import is_sm100_supported
 from sglang.srt.utils.common import direct_register_custom_op
 
 # Tuple format: (cta_m, cta_n, num_ab_stage, use_2cta); cta_k is fixed at
@@ -1323,7 +1320,7 @@ def _pick_tactic(m: int, n: int, k: int) -> int:
     tactic = _model_tgv_tactic(m, n, k)
     if tactic is not None:
         return tactic
-    num_sms = get_device_core_count(torch.cuda.current_device())
+    num_sms = current_arch().num_sms
     best, best_ctas = None, None
     for tactic, cta_m, cta_n, num_mma_ctas in _TGV_TACTIC_LADDER:
         ctas = _grid_ctas(m, n, cta_m, cta_n, num_mma_ctas)
@@ -1449,6 +1446,9 @@ _MUSE_SPARK_TGV_M_RANGES = {
     (8192, 1024): (1, 64),  # TP8 o_proj
     (512, 8192): (256, 512),  # TP8 pooler slice
     (1024, 4096): (1, 512),  # TP8 unpooler slice
+    (14336, 8192): (24, 32),  # hidden 8192 / inter 28672 TP4 gate_up (DFLASH draft)
+    (50512, 8192): (17, 32),  # DFLASH draft TP4 candidate head
+    (7168, 8192): (24, 32),  # hidden 8192 / inter 28672 TP8 gate_up (DFLASH draft)
 }
 
 
@@ -1467,7 +1467,7 @@ def use_cutedsl_bf16_gemm(m: int, n: int, k: int) -> bool:
     if m_range is not None:
         return m_range[0] <= m <= m_range[1]
     if (
-        get_device_sm() == 107
+        current_arch().is_sm(10, 7)
         and m in _K3_FRONT_WARP_SPLITK
         and (n, k)
         == (
@@ -1540,7 +1540,7 @@ def _tgv_bf16_gemm_out_run(
     if x.shape[0] == 0:
         return None
     if (
-        get_device_sm() == 107
+        current_arch().is_sm(10, 7)
         and x.shape[0] in _K3_FRONT_WARP_SPLITK
         and x.shape[1] == 7168
         and weight.shape == (6016, 7168)

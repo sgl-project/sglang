@@ -18,11 +18,7 @@ import torch
 from PIL import Image
 
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalProcessorOutput,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.models.kimi_k3 import (
     KimiK3ForConditionalGeneration,
     KimiK31ForConditionalGeneration,
@@ -47,6 +43,7 @@ from sglang.srt.multimodal.media_artifacts.kimi_k3 import (
     KimiK3PreprocessConfig,
     KimiK3ResizeConfig,
 )
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )

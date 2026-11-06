@@ -11,8 +11,9 @@ from unittest.mock import patch
 import requests
 import torch
 
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.managers.req_types import MultimodalDataItem
 from sglang.srt.models.deepseek_ocr import DeepseekOCRForCausalLM
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.hf_transformers import get_tokenizer
 from sglang.test.ci.ci_register import register_xpu_ci
