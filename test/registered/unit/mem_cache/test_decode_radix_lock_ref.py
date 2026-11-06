@@ -698,7 +698,11 @@ class TestPDHybridStateBudget(CustomTestCase):
             disaggregation_decode_enable_radix_cache=True,
             disaggregation_decode_extra_slots=2,
         )
-        memory = SimpleNamespace(disable_radix_cache=False, radix_cache_backend=None)
+        memory = SimpleNamespace(
+            disable_radix_cache=False,
+            radix_cache_backend=None,
+            enable_unified_memory=False,
+        )
         mamba = SimpleNamespace(enable_mamba_extra_buffer=True)
         getters = dict(
             get_schedule=lambda: schedule,
