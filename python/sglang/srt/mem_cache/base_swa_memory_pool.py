@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import abc
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import KVCache
 
 if TYPE_CHECKING:
@@ -30,6 +31,16 @@ class BaseSWAKVPool(KVCache):
     # of the target SWA allocator's physical IDs. HiCache must preserve that
     # index ownership even though both buffers implement sliding attention.
     swa_uses_full_indices: bool = False
+
+    def id_spaces(self) -> Dict[str, IdSpace]:
+        spaces = super().id_spaces()
+        # A request window keeps the window per request, with no full -> swa map.
+        if self.request_window is None:
+            spaces[IdSpaceKind.SLIDING_WINDOW] = IdSpace(
+                key=(IdSpaceKind.SLIDING_WINDOW, id(self)),
+                write=self.translate_loc_from_full_to_swa,
+            )
+        return spaces
 
     @abc.abstractmethod
     def register_mapping(self, full_to_swa_index_mapping: torch.Tensor) -> None:

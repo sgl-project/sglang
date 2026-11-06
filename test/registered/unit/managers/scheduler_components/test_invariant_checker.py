@@ -12,27 +12,32 @@ maybe_stub_sgl_kernel()
 
 import torch
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.managers.scheduler_components import invariant_checker
 from sglang.srt.managers.scheduler_components.invariant_checker import (
+    CheckPhase,
     SchedulerInvariantChecker,
 )
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
+    PoolStats,
     SchedulerPoolStatsObserver,
     kv_private_swa_tokens,
 )
+from sglang.srt.managers.scheduler_components.request_list import ListKind
 from sglang.srt.mem_cache.allocator.page_interleave import PageInterleavePoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage, StaticPoolShape
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.session.streaming_session import SessionSlot
+from sglang.test.tree_slots import tree_slots_of
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestCheckTreeCacheGate(CustomTestCase):
@@ -47,20 +52,24 @@ class TestCheckTreeCacheGate(CustomTestCase):
         tree_cache.supports_prefix_sharing.return_value = prefix_sharing
         tree_cache.supports_swa.return_value = hybrid_swa
         tree_cache.supports_mamba.return_value = hybrid_ssm
-        return SchedulerInvariantChecker(
+        pool_stats_observer = MagicMock()
+        pool_stats_observer.get_pool_stats.return_value = PoolStats(
+            full_num_used=0,
+            full_token_usage=0.0,
+            full_available_size=1024,
+            full_evictable_size=0,
             is_hybrid_swa=hybrid_swa,
             is_hybrid_ssm=hybrid_ssm,
+        )
+        return SchedulerInvariantChecker(
             disaggregation_mode=DisaggregationMode.NULL,
             page_size=1,
-            full_tokens_per_layer=None,
-            swa_tokens_per_layer=None,
-            max_total_num_tokens=1024,
             tree_cache=tree_cache,
             token_to_kv_pool_allocator=MagicMock(),
             req_to_token_pool=MagicMock(),
-            pool_stats_observer=MagicMock(),
+            pool_stats_observer=pool_stats_observer,
             get_last_batch=lambda: None,
-            get_running_batch=lambda: None,
+            get_skip_idle_pool_checks=lambda: True,
             scheduler_stage_metrics=None,
         )
 
@@ -71,7 +80,7 @@ class TestCheckTreeCacheGate(CustomTestCase):
         ):
             checker = self._make_checker()
 
-            checker._check_tree_cache()
+            checker.run(CheckPhase.IDLE)
 
             checker.tree_cache.sanity_check.assert_not_called()
 
@@ -82,7 +91,7 @@ class TestCheckTreeCacheGate(CustomTestCase):
         ):
             checker = self._make_checker()
 
-            checker._check_tree_cache()
+            checker.run(CheckPhase.IDLE)
 
             checker.tree_cache.sanity_check.assert_called_once()
 
@@ -91,7 +100,7 @@ class TestCheckTreeCacheGate(CustomTestCase):
             checker = self._make_checker()
 
             with envs.SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK.override(False):
-                checker._check_tree_cache()
+                checker.run(CheckPhase.IDLE)
 
             checker.tree_cache.sanity_check.assert_not_called()
 
@@ -100,7 +109,7 @@ class TestCheckTreeCacheGate(CustomTestCase):
             checker = self._make_checker()
 
             with envs.SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK.override(True):
-                checker._check_tree_cache()
+                checker.run(CheckPhase.IDLE)
 
             checker.tree_cache.sanity_check.assert_called_once()
 
@@ -110,9 +119,37 @@ class TestCheckTreeCacheGate(CustomTestCase):
                 prefix_sharing=False, hybrid_swa=False, hybrid_ssm=True
             )
 
-            checker._check_tree_cache()
+            checker.run(CheckPhase.IDLE)
 
             checker.tree_cache.sanity_check.assert_not_called()
+
+
+class TestStateCheckFlags(CustomTestCase):
+    def test_each_check_runs_when_its_own_flag_is_on(self):
+        flags = {
+            "request_lists": envs.SGLANG_ENABLE_RUNNING_REQS_CHECK,
+            "batch_consistency": envs.SGLANG_ENABLE_RUNNING_REQS_CHECK,
+            "busy_pools": envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY,  # an int level
+            "kv_pages": envs.SGLANG_CHECK_KV_PAGE_INVARIANTS,
+            "tree_cache": envs.SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK,
+        }
+        checker = SchedulerInvariantChecker(
+            disaggregation_mode=DisaggregationMode.NULL,
+            page_size=1,
+            tree_cache=None,
+            token_to_kv_pool_allocator=None,
+            req_to_token_pool=None,
+            pool_stats_observer=None,
+            get_last_batch=lambda: None,
+            scheduler_stage_metrics=None,
+        )
+        checks = {c.name: c for cs in checker.checks.values() for c in cs}
+        for name, flag in flags.items():
+            with self.subTest(check=name):
+                with flag.override(0):
+                    self.assertFalse(checks[name].when())
+                with flag.override(1):
+                    self.assertTrue(checks[name].when())
 
 
 class TestPrivateSwaTokens(CustomTestCase):
@@ -168,7 +205,7 @@ class TestShardedFullPoolInvariant(CustomTestCase):
                     req_to_token_pool=req_pool,
                     token_to_kv_pool_allocator=self.allocator,
                     page_size=self.PAGE_SIZE,
-                    tree_components=(ComponentType.FULL,),
+                    tree_slots=tree_slots_of((ComponentType.FULL,)),
                 )
             )
         self.last_batch = SimpleNamespace(reqs=[], is_empty=lambda: True)
@@ -176,32 +213,34 @@ class TestShardedFullPoolInvariant(CustomTestCase):
         self.chunked_req = None
         observer = SchedulerPoolStatsObserver(
             tree_cache=self.cache,
+            storage=StaticKVStorage(
+                req_pool,
+                self.allocator,
+                shape=StaticPoolShape(
+                    has_window=False,
+                    has_state=False,
+                    token_capacity=self.allocator.size,
+                ),
+            ),
             token_to_kv_pool_allocator=self.allocator,
-            req_to_token_pool=req_pool,
             session_controller=None,
             hisparse_coordinator=None,
-            is_hybrid_swa=False,
-            is_hybrid_ssm=False,
             enable_hisparse=False,
-            full_tokens_per_layer=None,
-            swa_tokens_per_layer=None,
-            max_total_num_tokens=self.allocator.size,
         )
         return SchedulerInvariantChecker(
-            is_hybrid_swa=False,
-            is_hybrid_ssm=False,
             disaggregation_mode=DisaggregationMode.PREFILL,
             page_size=self.PAGE_SIZE,
-            full_tokens_per_layer=None,
-            swa_tokens_per_layer=None,
-            max_total_num_tokens=self.allocator.size,
             tree_cache=self.cache,
             token_to_kv_pool_allocator=self.allocator,
             req_to_token_pool=req_pool,
             pool_stats_observer=observer,
             get_last_batch=lambda: self.last_batch,
-            get_running_batch=lambda: self.running_batch,
-            get_chunked_req=lambda: self.chunked_req,
+            get_request_lists=lambda: {
+                ListKind.CHUNKED: (
+                    [] if self.chunked_req is None else [self.chunked_req]
+                ),
+                ListKind.DECODING: self.running_batch.reqs,
+            },
             scheduler_stage_metrics=None,
         )
 
@@ -292,9 +331,14 @@ class TestShardedFullPoolInvariant(CustomTestCase):
         checker = self._make_checker()
         self._active_partial_page(checker)
         self._allocate(self.PAGE_SIZE)  # Leak in addition to the active tail.
-        self.assertEqual(checker._get_total_uncached_sizes(), (self.PAGE_SIZE, 0))
-        with self.assertRaisesRegex(AssertionError, "Full Pool Mem Leak Detected"):
-            checker.self_check_during_busy()
+        self.assertEqual(
+            checker._get_total_uncached_sizes(has_window=False), (self.PAGE_SIZE, 0)
+        )
+        with (
+            envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(1),
+            self.assertRaisesRegex(AssertionError, "Full Pool Mem Leak Detected"),
+        ):
+            checker.run(CheckPhase.BUSY)
 
     def test_partial_active_page_is_accounted_without_slack_exemption(self):
         checker = self._make_checker()
@@ -307,14 +351,19 @@ class TestShardedFullPoolInvariant(CustomTestCase):
                 if parked:
                     self.last_batch = SimpleNamespace(reqs=[], is_empty=lambda: True)
                     self.running_batch = self.last_batch
-                uncached, swa_uncached = checker._get_total_uncached_sizes()
+                uncached, swa_uncached = checker._get_total_uncached_sizes(
+                    has_window=False
+                )
                 self.assertEqual((uncached, swa_uncached), (self.PAGE_SIZE, 0))
                 stats = checker.pool_stats_observer.get_pool_stats()
                 leak, msg = checker._check_full_pool(stats, uncached=uncached)
                 self.assertFalse(leak, msg)
                 self.assertNotIn("slack_allowed", msg)
-                with envs.SGLANG_CHECK_KV_PAGE_INVARIANTS.override(False):
-                    checker.self_check_during_busy()
+                with (
+                    envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(1),
+                    envs.SGLANG_CHECK_KV_PAGE_INVARIANTS.override(False),
+                ):
+                    checker.run(CheckPhase.BUSY)
 
     def test_session_record_is_counted_once_by_its_owner(self):
         checker = self._make_checker()
@@ -328,12 +377,17 @@ class TestShardedFullPoolInvariant(CustomTestCase):
                 if parked:
                     self.last_batch = SimpleNamespace(reqs=[], is_empty=lambda: True)
                     self.running_batch = self.last_batch
-                self.assertEqual(checker._get_total_uncached_sizes(), (0, 0))
+                self.assertEqual(
+                    checker._get_total_uncached_sizes(has_window=False), (0, 0)
+                )
                 self.assertEqual(
                     checker.pool_stats_observer.session_held_tokens(), self.PAGE_SIZE
                 )
-                with envs.SGLANG_CHECK_KV_PAGE_INVARIANTS.override(False):
-                    checker.self_check_during_busy()
+                with (
+                    envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(1),
+                    envs.SGLANG_CHECK_KV_PAGE_INVARIANTS.override(False),
+                ):
+                    checker.run(CheckPhase.BUSY)
 
     def test_misaligned_evictable_counter_is_not_rounded_up(self):
         checker = self._make_checker()

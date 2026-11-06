@@ -6,11 +6,8 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
-from sglang.srt.arg_groups.overrides import (
-    declare_resolution,
-    model_config_of,
-    resolving_view,
-)
+from sglang.srt.arg_groups.model_override_base import model_config_of, resolving_view
+from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
@@ -43,8 +40,7 @@ def check_mega_moe_compat(server_args: ServerArgs) -> None:
         raise ValueError(
             "--moe-a2a-backend megamoe needs a CUDA SM90 GPU (block-FP8 experts) "
             "or an SM100-class GPU (MXFP4 / NVFP4 experts); it runs DeepGEMM "
-            "kernels over CUDA symmetric memory. On ROCm, set "
-            "SGLANG_AMD_USE_FLYDSL_MEGA_MOE=1 to select aiter MegaMoEv2 instead."
+            "kernels over CUDA symmetric memory. On ROCm it runs aiter MegaMoEv2."
         )
 
 
@@ -68,9 +64,10 @@ def mega_moe_needs_token_budget(
     model_arch: str, hf_quant_config: dict, quantization: str | None
 ) -> bool:
     # NVFP4 experts are repacked into the mega layout at load: no fallback.
-    nvfp4_experts = quantization == "modelopt_fp4" or "FP4" in str(
-        hf_quant_config.get("quant_algo", "")
-    )
+    nvfp4_experts = quantization in (
+        "modelopt_fp4",
+        "minimax_m3_nvfp4",
+    ) or "FP4" in str(hf_quant_config.get("quant_algo", ""))
     return model_arch in MEGA_MOE_NO_FALLBACK_ARCHS or nvfp4_experts
 
 
@@ -127,7 +124,7 @@ def flydsl_decode_tokens_per_rank(cfg) -> int | None:
 
 
 def validate_flydsl_decode_capacity(server_args: ServerArgs) -> None:
-    if not (get_platform().is_hip and envs.SGLANG_AMD_USE_FLYDSL_MEGA_MOE.get()):
+    if not get_platform().is_hip:
         return
     decode_mtpr = envs.SGLANG_AMD_FLYDSL_MEGA_MOE_DECODE_MTPR.get()
     if decode_mtpr <= 0 or decode_mtpr >= envs.SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR.get():
@@ -204,12 +201,12 @@ def validate_mega_moe_token_budget(server_args: ServerArgs, model_label: str) ->
         ) // token_partition_size
     elif attn_dp_enabled_of(cfg):
         token_partition_size = cfg.attn_dp_size
-        token_partition_name = "attn_dp_size"
+        token_partition_name = "attn_dp_size (already applied)"
         token_alignment = max(
             cfg.tp_size // cfg.attn_dp_size // cfg.attn_cp_size,
             1,
         )
-        local_chunked_prefill_size = cfg.chunked_prefill_size // token_partition_size
+        local_chunked_prefill_size = cfg.chunked_prefill_size
     else:
         # Pure TP and PP with static chunking are handled here.
         token_partition_size = 1

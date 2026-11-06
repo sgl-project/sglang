@@ -531,6 +531,63 @@ def dcp_pack_a2a_send(
 
 
 @triton.jit
+def _dcp_pack_q_kernel(
+    q_nope_ptr,
+    q_pe_ptr,
+    out_ptr,
+    nope_stride_B,
+    nope_stride_H,
+    pe_stride_B,
+    pe_stride_H,
+    out_stride_H,
+    out_stride_B,
+    D_NOPE: tl.constexpr,
+    D_PE: tl.constexpr,
+):
+    """One (batch, head) row of ``[q_pe | q_nope]``, cast to the output dtype."""
+    b = tl.program_id(0).to(tl.int64)
+    h = tl.program_id(1).to(tl.int64)
+    out_ty = out_ptr.dtype.element_ty
+    dst = out_ptr + h * out_stride_H + b * out_stride_B
+    pe = tl.arange(0, D_PE)
+    q_pe = tl.load(q_pe_ptr + b * pe_stride_B + h * pe_stride_H + pe)
+    tl.store(dst + pe, q_pe.to(out_ty))
+    nope = tl.arange(0, D_NOPE)
+    q_nope = tl.load(q_nope_ptr + b * nope_stride_B + h * nope_stride_H + nope)
+    tl.store(dst + D_PE + nope, q_nope.to(out_ty))
+
+
+def dcp_pack_q(q_nope: torch.Tensor, q_pe: torch.Tensor, out: torch.Tensor) -> None:
+    """Pack ``[B, H, D_nope]`` and ``[B, H, D_pe]`` into ``out`` ``[H, B, D_pe + D_nope]``.
+
+    The cast is Triton's, the same one the sparse-MLA kernels apply when they
+    load a bf16 q against an FP8 KV cache, so an FP8 ``out`` matches their
+    in-kernel conversion bit for bit.
+    """
+    B, H, d_nope = q_nope.shape
+    d_pe = q_pe.shape[-1]
+    if q_nope.stride(-1) != 1 or q_pe.stride(-1) != 1:
+        raise ValueError("q_nope and q_pe need a unit-stride last dim")
+    if out.shape != (H, B, d_pe + d_nope) or out.stride(-1) != 1:
+        raise ValueError(f"out {tuple(out.shape)} does not match q {(B, H)}")
+    if B == 0:
+        return
+    _dcp_pack_q_kernel[(B, H)](
+        q_nope,
+        q_pe,
+        out,
+        q_nope.stride(0),
+        q_nope.stride(1),
+        q_pe.stride(0),
+        q_pe.stride(1),
+        out.stride(0),
+        out.stride(1),
+        D_NOPE=d_nope,
+        D_PE=d_pe,
+    )
+
+
+@triton.jit
 def _dcp_lse_combine_kernel(
     recv_output_ptr,
     recv_lse_ptr,

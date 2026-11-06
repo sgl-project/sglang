@@ -23,8 +23,9 @@ from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
 )
+from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import get_device_capability, set_weight_attrs
+from sglang.srt.utils import get_device_capability
 
 logger = logging.getLogger(__name__)
 
@@ -235,11 +236,12 @@ def _local_expert_ids(layer, expert_id: int) -> List[int]:
     expert-parallel slice this rank stores.
     """
     metadata = get_global_expert_location_metadata()
-    physical = (
-        [expert_id]
-        if metadata is None or not layer.uses_expert_location
-        else metadata.logical_to_all_physical(layer.layer_id, expert_id)
-    )
+    if metadata is None or not layer.uses_expert_location:
+        physical = [expert_id]
+    else:
+        physical = metadata.logical_to_all_physical(layer.layer_id, expert_id)
+        if expert_id < metadata.num_logical_experts:
+            physical = layer._local_routed_expert_ids(physical)
     local = (layer._map_global_expert_id_to_local_expert_id(p) for p in physical)
     return [i for i in local if 0 <= i < layer.num_local_experts]
 

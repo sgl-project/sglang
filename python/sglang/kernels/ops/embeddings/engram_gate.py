@@ -1,5 +1,7 @@
 """Fused FP32 Engram gate with a single final cast to the activation dtype."""
 
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
@@ -12,12 +14,15 @@ def _engram_gate_kernel(
     KV,
     QW,
     KW,
+    IDS,
     O,
+    IMAGE_ID,
     D: tl.constexpr,
     HC: tl.constexpr,
     EPS: tl.constexpr,
     CLAMP: tl.constexpr,
     B: tl.constexpr,
+    HAS_IDS: tl.constexpr,
 ):
     row = tl.program_id(0)
     token = row // HC
@@ -35,7 +40,10 @@ def _engram_gate_kernel(
     dot = tl.sum((x * weight) * key, 0) * rstd * (D**-0.5)
     gate = tl.sigmoid(libdevice.copysign(tl.sqrt(tl.maximum(tl.abs(dot), CLAMP)), dot))
     value = tl.load(KV + token * (HC + 1) * D + HC * D + col, mask, 0).to(tl.float32)
-    tl.store(O + row * D + col, x + gate * value, mask)
+    out = x + gate * value
+    if HAS_IDS:
+        out = tl.where(tl.load(IDS + token) == IMAGE_ID, x, out)
+    tl.store(O + row * D + col, out, mask)
 
 
 def fused_engram_gate(
@@ -45,11 +53,17 @@ def fused_engram_gate(
     k_weight: torch.Tensor,
     eps: float,
     clamp_value: float,
+    input_ids: Optional[torch.Tensor] = None,
+    image_token_id: Optional[int] = None,
 ) -> torch.Tensor:
+    """Rows whose ``input_ids`` entry is ``image_token_id`` keep ``x`` unchanged."""
     assert x.ndim == 3 and kv.ndim == 2
     t, hc, d = x.shape
     assert kv.shape == (t, (hc + 1) * d)
     assert q_weight.shape == k_weight.shape == (hc, d)
+    assert input_ids is None or (
+        input_ids.shape == (t,) and input_ids.is_cuda and image_token_id is not None
+    )
     assert all(
         a.is_cuda and a.is_contiguous() and a.device == x.device
         for a in (x, kv, q_weight, k_weight)
@@ -64,12 +78,15 @@ def fused_engram_gate(
             kv,
             q_weight,
             k_weight,
+            input_ids,
             out,
+            image_token_id,
             d,
             hc,
             eps,
             clamp_value,
             triton.next_power_of_2(d),
+            input_ids is not None,
             num_warps=4,
             enable_fp_fusion=False,
         )

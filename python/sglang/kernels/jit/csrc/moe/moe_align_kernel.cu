@@ -23,6 +23,7 @@ limitations under the License.
 #include <tvm/ffi/container/tensor.h>
 
 #include <algorithm>
+#include <type_traits>
 
 #ifndef WARP_SIZE
 #define WARP_SIZE 32
@@ -36,6 +37,14 @@ namespace sglang {
 using Vec = int4;
 
 namespace moe {
+
+template <typename scalar_t>
+__device__ __forceinline__ int32_t sentinel_expert_bucket(scalar_t expert_id, int32_t num_buckets) {
+  static_assert(std::is_same_v<scalar_t, int32_t> || std::is_same_v<scalar_t, int64_t>);
+  using unsigned_t = std::make_unsigned_t<scalar_t>;
+  const unsigned_t shifted = static_cast<unsigned_t>(expert_id) + unsigned_t{1};
+  return shifted < static_cast<unsigned_t>(num_buckets) ? static_cast<int32_t>(shifted) : 0;
+}
 
 template <typename scalar_t>
 __global__ void count_and_sort_expert_tokens_kernel(
@@ -54,6 +63,23 @@ __global__ void count_and_sort_expert_tokens_kernel(
 }
 
 template <typename scalar_t>
+__global__ void count_and_sort_checked_expert_tokens_kernel(
+    const scalar_t* __restrict__ topk_ids,
+    int32_t* __restrict__ sorted_token_ids,
+    int32_t* __restrict__ cumsum_buffer,
+    size_t numel,
+    int32_t num_buckets) {
+  const size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+  const size_t stride = blockDim.x * gridDim.x;
+
+  for (size_t i = tid; i < numel; i += stride) {
+    const int32_t expert_id = sentinel_expert_bucket(topk_ids[i], num_buckets);
+    const int32_t rank_post_pad = atomicAdd(&cumsum_buffer[expert_id], 1);
+    sorted_token_ids[rank_post_pad] = i;
+  }
+}
+
+template <typename scalar_t, bool kWriteInactivePrefixCount, bool kMapInvalidExpertsToSentinel, bool kPadExpertIds>
 __global__ void moe_align_block_size_kernel(
     const scalar_t* __restrict__ topk_ids,
     int32_t* __restrict__ sorted_token_ids,
@@ -65,7 +91,8 @@ __global__ void moe_align_block_size_kernel(
     int32_t* __restrict__ cumsum,
     bool pad_sorted_token_ids,
     const int32_t scan_size,
-    int32_t max_num_tokens_padded) {
+    int32_t max_num_tokens_padded,
+    int32_t max_num_m_blocks) {
   // Use a separate thread block to populate sorted_token_ids
   if (blockIdx.x == 1) {
     if (pad_sorted_token_ids) {
@@ -100,7 +127,12 @@ __global__ void moe_align_block_size_kernel(
   __syncthreads();
 
   for (size_t i = tid; i < numel; i += stride) {
-    int expert_id = topk_ids[i] + 1;
+    int expert_id;
+    if constexpr (kMapInvalidExpertsToSentinel) {
+      expert_id = sentinel_expert_bucket(topk_ids[i], num_experts);
+    } else {
+      expert_id = topk_ids[i] + 1;
+    }
     atomicAdd(&shared_counts[expert_id], 1);
   }
 
@@ -162,7 +194,12 @@ __global__ void moe_align_block_size_kernel(
 
   if (tid == 0) {
     s_total_tokens_post_pad = prefix[num_experts];
-    *total_tokens_post_pad = s_total_tokens_post_pad;
+    if constexpr (kWriteInactivePrefixCount) {
+      *reinterpret_cast<int2*>(total_tokens_post_pad) =
+          make_int2(s_total_tokens_post_pad, CEILDIV(shared_counts[0], block_size));
+    } else {
+      *total_tokens_post_pad = s_total_tokens_post_pad;
+    }
   }
   __syncthreads();
 
@@ -189,7 +226,12 @@ __global__ void moe_align_block_size_kernel(
   if (tid == 0) {
     prefix[num_experts] = warp_sums[num_warps_for_scan - 1];
     s_total_tokens_post_pad = prefix[num_experts];
-    *total_tokens_post_pad = s_total_tokens_post_pad;
+    if constexpr (kWriteInactivePrefixCount) {
+      *reinterpret_cast<int2*>(total_tokens_post_pad) =
+          make_int2(s_total_tokens_post_pad, CEILDIV(shared_counts[0], block_size));
+    } else {
+      *total_tokens_post_pad = s_total_tokens_post_pad;
+    }
   }
   __syncthreads();
 
@@ -210,11 +252,9 @@ __global__ void moe_align_block_size_kernel(
   __syncthreads();
 
   int offset = warp_sums[warp_id];
-  if (tid < scan_size) scan_buf[tid] = pre + offset;
+  if (tid < num_experts) prefix[tid] = pre + offset;
+  // Publish the prefix before other threads binary-search it below.
   __syncthreads();
-
-  // Write prefix[0..num_experts - 1] and cumsum
-  if (tid < num_experts) prefix[tid] = scan_buf[tid];
 #endif
 
   if (tid <= num_experts) {
@@ -235,9 +275,19 @@ __global__ void moe_align_block_size_kernel(
     }
     expert_ids[i] = left - 2;
   }
+  if constexpr (kPadExpertIds) {
+    for (int32_t i = num_blocks + tid; i < max_num_m_blocks; i += stride) {
+      expert_ids[i] = -1;
+    }
+  }
 }
 
-template <typename scalar_t, int32_t fill_threads>
+template <
+    typename scalar_t,
+    int32_t fill_threads,
+    bool kWriteInactivePrefixCount,
+    bool kMapInvalidExpertsToSentinel,
+    bool kPadExpertIds>
 __global__ void moe_align_block_size_small_batch_expert_kernel(
     const scalar_t* __restrict__ topk_ids,
     int32_t* __restrict__ sorted_token_ids,
@@ -247,7 +297,8 @@ __global__ void moe_align_block_size_small_batch_expert_kernel(
     int32_t block_size,
     size_t numel,
     bool pad_sorted_token_ids,
-    int32_t max_num_tokens_padded) {
+    int32_t max_num_tokens_padded,
+    int32_t max_num_m_blocks) {
   // Adapted from
   // https://github.com/vllm-project/vllm/pull/29642/files#diff-5647b1413f4ae9aacba904eca8f8a8aee9079321eadff4c10101a2c6962dcc53R226
   // Use an additional group of threads to fill sorted_token_ids.
@@ -280,7 +331,12 @@ __global__ void moe_align_block_size_small_batch_expert_kernel(
   }
 
   for (size_t i = tid; i < numel; i += stride) {
-    int32_t expert_id = topk_ids[i] + 1;
+    int32_t expert_id;
+    if constexpr (kMapInvalidExpertsToSentinel) {
+      expert_id = sentinel_expert_bucket(topk_ids[i], num_experts);
+    } else {
+      expert_id = topk_ids[i] + 1;
+    }
     ++tokens_cnts[(tid + 1) * num_experts + expert_id];
   }
 
@@ -300,7 +356,11 @@ __global__ void moe_align_block_size_small_batch_expert_kernel(
     for (int i = 1; i <= num_experts; ++i) {
       cumsum[i] = cumsum[i - 1] + CEILDIV(tokens_cnts[stride * num_experts + i - 1], block_size) * block_size;
     }
-    *total_tokens_post_pad = static_cast<int32_t>(cumsum[num_experts]);
+    if constexpr (kWriteInactivePrefixCount) {
+      *reinterpret_cast<int2*>(total_tokens_post_pad) = make_int2(cumsum[num_experts], cumsum[1] / block_size);
+    } else {
+      *total_tokens_post_pad = static_cast<int32_t>(cumsum[num_experts]);
+    }
   }
 
   __syncthreads();
@@ -310,9 +370,19 @@ __global__ void moe_align_block_size_small_batch_expert_kernel(
       expert_ids[i / block_size] = tid - 1;
     }
   }
+  if constexpr (kPadExpertIds) {
+    for (int32_t i = cumsum[num_experts] / block_size + tid; i < max_num_m_blocks; i += stride) {
+      expert_ids[i] = -1;
+    }
+  }
 
   for (size_t i = tid; i < numel; i += stride) {
-    int32_t expert_id = topk_ids[i] + 1;
+    int32_t expert_id;
+    if constexpr (kMapInvalidExpertsToSentinel) {
+      expert_id = sentinel_expert_bucket(topk_ids[i], num_experts);
+    } else {
+      expert_id = topk_ids[i] + 1;
+    }
     int32_t rank_post_pad = tokens_cnts[tid * num_experts + expert_id] + cumsum[expert_id];
     sorted_token_ids[rank_post_pad] = i;
     ++tokens_cnts[tid * num_experts + expert_id];
@@ -328,7 +398,12 @@ __global__ void moe_align_block_size_small_batch_expert_kernel(
 // With 1024 threads and EXPERTS_PER_THREAD=4, covers at most 4096 expert
 // indices. Since num_experts includes the +1 offset bucket, this supports
 // up to 4095 real experts.
-template <typename scalar_t, int EXPERTS_PER_THREAD>
+template <
+    typename scalar_t,
+    int EXPERTS_PER_THREAD,
+    bool kWriteInactivePrefixCount,
+    bool kMapInvalidExpertsToSentinel,
+    bool kPadExpertIds>
 __global__ void moe_align_block_size_kernel_v2(
     const scalar_t* __restrict__ topk_ids,
     int32_t* __restrict__ sorted_token_ids,
@@ -340,7 +415,8 @@ __global__ void moe_align_block_size_kernel_v2(
     size_t numel,
     int32_t* __restrict__ cumsum,
     bool pad_sorted_token_ids,
-    int32_t max_num_tokens_padded) {
+    int32_t max_num_tokens_padded,
+    int32_t max_num_m_blocks) {
   // Use a separate thread block to populate sorted_token_ids
   if (blockIdx.x == 1) {
     if (pad_sorted_token_ids) {
@@ -377,9 +453,14 @@ __global__ void moe_align_block_size_kernel_v2(
   __syncthreads();
 
   for (size_t i = tid; i < numel; i += blockDim.x) {
-    int expert_id = topk_ids[i] + 1;  // +1 offset convention
-    if (expert_id < num_experts) {
+    if constexpr (kMapInvalidExpertsToSentinel) {
+      const int32_t expert_id = sentinel_expert_bucket(topk_ids[i], num_experts);
       atomicAdd(&shared_counts[expert_id], 1);
+    } else {
+      int expert_id = topk_ids[i] + 1;  // +1 offset convention
+      if (expert_id < num_experts) {
+        atomicAdd(&shared_counts[expert_id], 1);
+      }
     }
   }
 
@@ -428,7 +509,12 @@ __global__ void moe_align_block_size_kernel_v2(
   // Last thread writes total
   if (tid == blockDim.x - 1) {
     cumsum[num_experts] = thread_prefix + thread_sum;
-    *total_tokens_post_pad = thread_prefix + thread_sum;
+    if constexpr (kWriteInactivePrefixCount) {
+      *reinterpret_cast<int2*>(total_tokens_post_pad) =
+          make_int2(thread_prefix + thread_sum, CEILDIV(shared_counts[0], block_size));
+    } else {
+      *total_tokens_post_pad = thread_prefix + thread_sum;
+    }
   }
 
   __syncthreads();
@@ -442,11 +528,20 @@ __global__ void moe_align_block_size_kernel_v2(
       }
     }
   }
+  if constexpr (kPadExpertIds) {
+    for (int32_t i = cumsum[num_experts] / block_size + tid; i < max_num_m_blocks; i += blockDim.x) {
+      expert_ids[i] = -1;
+    }
+  }
 }
 
 }  // namespace moe
 
-template <typename scalar_t>
+template <
+    typename scalar_t,
+    bool kWriteInactivePrefixCount = false,
+    bool kMapInvalidExpertsToSentinel = false,
+    bool kPadExpertIds = false>
 struct MoeAlignBlockSizeKernel {
   static void
   run(tvm::ffi::TensorView topk_ids,
@@ -460,6 +555,9 @@ struct MoeAlignBlockSizeKernel {
     using namespace host;
 
     auto device = topk_ids.device();
+    if constexpr (kWriteInactivePrefixCount) {
+      TensorMatcher({2}).with_dtype<int32_t>().with_device(device).ensure_alignment(8).verify(num_tokens_post_pad);
+    }
     const cudaStream_t stream = LaunchKernel::resolve_device(device);
 
     int threads = 1024;
@@ -472,6 +570,10 @@ struct MoeAlignBlockSizeKernel {
     // to 8, covering at most 8192 expert indices. This supports up to 8191 real
     // experts, sufficient for LoRA virtual experts (num_moe_experts * max_loras).
     RuntimeCheck(num_experts <= 8192, "moe_align_block_size: num_experts must be <= 8192, got ", num_experts);
+    if constexpr (kMapInvalidExpertsToSentinel) {
+      RuntimeCheck(
+          num_experts > 0 && block_size > 0, "moe_align_block_size: bucket count and block size must be positive");
+    }
 
     const scalar_t* topk_ids_ptr = static_cast<const scalar_t*>(topk_ids.data_ptr());
     int32_t* sorted_token_ids_ptr = static_cast<int32_t*>(sorted_token_ids.data_ptr());
@@ -487,7 +589,12 @@ struct MoeAlignBlockSizeKernel {
       constexpr int32_t fill_threads = 256;
       const int32_t shared_mem_size = ((num_thread + 1) * num_experts + (num_experts + 1)) * sizeof(int32_t);
 
-      auto kernel = moe::moe_align_block_size_small_batch_expert_kernel<scalar_t, fill_threads>;
+      auto kernel = moe::moe_align_block_size_small_batch_expert_kernel<
+          scalar_t,
+          fill_threads,
+          kWriteInactivePrefixCount,
+          kMapInvalidExpertsToSentinel,
+          kPadExpertIds>;
       LaunchKernel(dim3(1), dim3(fill_threads + num_thread), stream, shared_mem_size)(
           kernel,
           topk_ids_ptr,
@@ -498,12 +605,14 @@ struct MoeAlignBlockSizeKernel {
           (int32_t)block_size,
           numel,
           pad_sorted_token_ids,
-          (int32_t)max_num_tokens_padded);
+          (int32_t)max_num_tokens_padded,
+          static_cast<int32_t>(expert_ids.numel()));
     } else if (num_experts <= 1024) {
       const size_t scan_size = host::round_up_pow2(static_cast<uint32_t>(num_experts));
       const size_t shared_mem_size = (num_experts + (num_experts + 1) + scan_size + WARP_SIZE) * sizeof(int32_t);
 
-      auto align_kernel = moe::moe_align_block_size_kernel<scalar_t>;
+      auto align_kernel = moe::
+          moe_align_block_size_kernel<scalar_t, kWriteInactivePrefixCount, kMapInvalidExpertsToSentinel, kPadExpertIds>;
       LaunchKernel(dim3(2), dim3(threads), stream, shared_mem_size)(
           align_kernel,
           topk_ids_ptr,
@@ -516,16 +625,30 @@ struct MoeAlignBlockSizeKernel {
           cumsum_buffer_ptr,
           pad_sorted_token_ids,
           (int32_t)scan_size,
-          (int32_t)max_num_tokens_padded);
+          (int32_t)max_num_tokens_padded,
+          static_cast<int32_t>(expert_ids.numel()));
 
       const int block_threads = std::min(256, threads);
       const int num_blocks = (numel + block_threads - 1) / block_threads;
       const int max_blocks = 65535;
       const int actual_blocks = std::min(num_blocks, max_blocks);
 
-      auto sort_kernel = moe::count_and_sort_expert_tokens_kernel<scalar_t>;
-      LaunchKernel(dim3(actual_blocks), dim3(block_threads), stream)(
-          sort_kernel, topk_ids_ptr, sorted_token_ids_ptr, cumsum_buffer_ptr, numel);
+      if (actual_blocks > 0) {
+        if constexpr (kMapInvalidExpertsToSentinel) {
+          auto sort_kernel = moe::count_and_sort_checked_expert_tokens_kernel<scalar_t>;
+          LaunchKernel(dim3(actual_blocks), dim3(block_threads), stream)(
+              sort_kernel,
+              topk_ids_ptr,
+              sorted_token_ids_ptr,
+              cumsum_buffer_ptr,
+              numel,
+              static_cast<int32_t>(num_experts));
+        } else {
+          auto sort_kernel = moe::count_and_sort_expert_tokens_kernel<scalar_t>;
+          LaunchKernel(dim3(actual_blocks), dim3(block_threads), stream)(
+              sort_kernel, topk_ids_ptr, sorted_token_ids_ptr, cumsum_buffer_ptr, numel);
+        }
+      }
     } else {
       // v2 path for >1024 experts: two-level warp scan with EXPERTS_PER_THREAD
       int64_t padded_num_experts = ((num_experts + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;
@@ -533,7 +656,12 @@ struct MoeAlignBlockSizeKernel {
 
       auto launch_v2 = [&](auto ept_tag) {
         constexpr int EPT = decltype(ept_tag)::value;
-        auto v2_kernel = moe::moe_align_block_size_kernel_v2<scalar_t, EPT>;
+        auto v2_kernel = moe::moe_align_block_size_kernel_v2<
+            scalar_t,
+            EPT,
+            kWriteInactivePrefixCount,
+            kMapInvalidExpertsToSentinel,
+            kPadExpertIds>;
         LaunchKernel(dim3(2), dim3(threads), stream, shared_mem_size)(
             v2_kernel,
             topk_ids_ptr,
@@ -546,7 +674,8 @@ struct MoeAlignBlockSizeKernel {
             numel,
             cumsum_buffer_ptr,
             pad_sorted_token_ids,
-            (int32_t)max_num_tokens_padded);
+            (int32_t)max_num_tokens_padded,
+            static_cast<int32_t>(expert_ids.numel()));
       };
 
       if (padded_num_experts <= 2048) {
@@ -562,9 +691,22 @@ struct MoeAlignBlockSizeKernel {
       const int max_blocks = 65535;
       const int actual_blocks = std::min(num_blocks, max_blocks);
 
-      auto sort_kernel = moe::count_and_sort_expert_tokens_kernel<scalar_t>;
-      LaunchKernel(dim3(actual_blocks), dim3(block_threads), stream)(
-          sort_kernel, topk_ids_ptr, sorted_token_ids_ptr, cumsum_buffer_ptr, numel);
+      if (actual_blocks > 0) {
+        if constexpr (kMapInvalidExpertsToSentinel) {
+          auto sort_kernel = moe::count_and_sort_checked_expert_tokens_kernel<scalar_t>;
+          LaunchKernel(dim3(actual_blocks), dim3(block_threads), stream)(
+              sort_kernel,
+              topk_ids_ptr,
+              sorted_token_ids_ptr,
+              cumsum_buffer_ptr,
+              numel,
+              static_cast<int32_t>(num_experts));
+        } else {
+          auto sort_kernel = moe::count_and_sort_expert_tokens_kernel<scalar_t>;
+          LaunchKernel(dim3(actual_blocks), dim3(block_threads), stream)(
+              sort_kernel, topk_ids_ptr, sorted_token_ids_ptr, cumsum_buffer_ptr, numel);
+        }
+      }
     }
   }
 };
