@@ -809,7 +809,7 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
             iteration_cols=self._iteration_cols,
         )
         for backend in backends:
-            backend.init_forward_metadata_out_graph(batch)
+            backend.stage_draft_extend_metadata(batch)
 
     def prepare(self, forward_batch: ForwardBatch, *, staged: bool = False):
         """Populate the shared buffers once from ``forward_batch`` and bucketize

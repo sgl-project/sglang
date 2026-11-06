@@ -768,6 +768,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                 and not b.draft_extend_metadata_captured_in_graph()
                 for b in self.draft_extend_attn_backend_list
             )
+            or self.draft_runner_list[0].runner_ids.is_translating
             or runner.require_mlp_tp_gather
             or len(batch.seq_lens) > runner.max_bs
             or (runner.disable_padding and len(batch.seq_lens) not in runner.capture_bs)
