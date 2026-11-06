@@ -65,6 +65,8 @@ from sglang.srt.layers.quantization.int8_utils import (
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -82,6 +84,7 @@ from sglang.srt.models.deepseek_common.utils import (
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 from sglang.srt.models.kimi_linear import KimiDeltaAttention
+from sglang.srt.models.utils import bind_or_assign
 from sglang.srt.runtime_context import (
     get_parallel,
     get_platform,
@@ -89,12 +92,9 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.utils import (
     BumpAllocator,
-    add_prefix,
-    bind_or_assign,
     is_cuda,
     is_flashinfer_available,
     log_info_on_rank0,
-    make_pp_layers,
 )
 
 _is_fp8_fnuz = is_fp8_fnuz()

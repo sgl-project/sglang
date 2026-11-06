@@ -72,6 +72,9 @@ from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.model_executor import encoder_swa_replay
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.scheduler_components.request_retirer import (
+        RequestRetirer,
+    )
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 
 # Clip the estimation of max_new_tokens for the request whose max_new_tokens is very large.
@@ -628,6 +631,7 @@ class PrefillAdder:
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
         prefill_tile_block_m: int = 64,
+        request_retirer: Optional[RequestRetirer] = None,
     ):
         self.page_size = page_size
         # DCP donates a checkpoint only on the kernel chunk grid. A cut off
@@ -642,18 +646,22 @@ class PrefillAdder:
         if is_cp_sharded_padded():
             self.logical_page_size *= get_cp_strategy().cp_size
         self.running_batch = running_batch
+        self.request_retirer = request_retirer
         self.new_token_ratio = new_token_ratio
         self.rem_input_tokens = rem_input_tokens - num_mixed_decode_tokens
         self.rem_chunk_tokens = rem_chunk_tokens
         self.chunked_req_limit: Optional[int] = None
         self.dllm_config = dllm_config
         # Mamba checkpoints only land on page-aligned chunk ends.
+        # Exact fill ends a chunk off the page grid; deterministic mode keeps chunk
+        # ends on pages, which some batch-invariant kernels depend on.
         self.exact_chunk_fill = (
             _use_exact_chunk_fill()
             and dllm_config is None
             and not (
                 tree_cache.supports_mamba() and tree_cache.supports_prefix_sharing()
             )
+            and not get_exec().deterministic.enable_deterministic_inference
         )
 
         if self.dllm_config is not None:
@@ -1804,7 +1812,9 @@ class PrefillAdder:
                 )
                 release_counter += 1
                 self.running_batch.release_req(
-                    i, len(self.running_batch.reqs) - release_counter
+                    i,
+                    len(self.running_batch.reqs) - release_counter,
+                    self.request_retirer,
                 )
             else:
                 keep_indices.append(i)
