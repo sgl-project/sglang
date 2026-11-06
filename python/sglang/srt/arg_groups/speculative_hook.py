@@ -928,10 +928,6 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
     Consumed by ModelRunner's `is_draft_worker` override (one backend for all
     draft modes).
     """
-    from sglang.srt.speculative.draft_worker_common import (
-        DFLASH_MLA_ONLY_DRAFT_BACKENDS,
-    )
-
     cfg = resolving_view(server_args)
 
     supported_draft_backends = DRAFT_ATTENTION_BACKEND_CHOICES
@@ -941,7 +937,7 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
             return current_platform.supports_speculative_draft_attention_backend(
                 "DFLASH", backend
             )
-        if backend in DFLASH_MLA_ONLY_DRAFT_BACKENDS:
+        if backend == "cutedsl_mla":
             from sglang.srt.hf_transformers import get_config
             from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
 

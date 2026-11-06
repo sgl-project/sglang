@@ -30,9 +30,6 @@ class DraftWorkerBundle(msgspec.Struct, frozen=True):
     resolved_attention_backend: str
 
 
-DFLASH_MLA_ONLY_DRAFT_BACKENDS = ("cutedsl_mla",)
-
-
 def resolve_draft_worker_attention_backend(*, algo_label: Optional[str] = None) -> str:
     """The attention backend `build_draft_tp_worker` gives a draft worker when
     the caller names none, from the published leaves.
@@ -52,7 +49,7 @@ def resolve_draft_worker_attention_backend(*, algo_label: Optional[str] = None) 
         draft_backend, _ = attention_backends()
     if draft_backend is None:
         return platform_fallback
-    if algo_label == "DFLASH" and draft_backend in DFLASH_MLA_ONLY_DRAFT_BACKENDS:
+    if algo_label == "DFLASH" and draft_backend == "cutedsl_mla":
         return draft_backend
     if draft_backend not in DRAFT_ATTENTION_BACKEND_CHOICES:
         fallback = platform_fallback
