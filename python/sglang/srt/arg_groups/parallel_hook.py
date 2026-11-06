@@ -10,6 +10,7 @@ from typing import Any
 from sglang.srt.arg_groups.cp_tp_group_sharing_hook import (
     resolve_cp_tp_group_sharing,
 )
+from sglang.srt.arg_groups.linear_attn_cp_hook import resolve_linear_attn_cp
 from sglang.srt.arg_groups.model_override_base import (
     model_config_of,
     resolved_view,
@@ -155,6 +156,8 @@ def handle_context_parallelism(server_args: Any):
         raise ValueError(
             "--cp-strategy must be set when --enable-prefill-cp is enabled."
         )
+
+    resolve_linear_attn_cp(server_args)
 
     view = resolved_view(server_args)
     if view.attn_cp_size > 1:

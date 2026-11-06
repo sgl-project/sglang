@@ -172,6 +172,16 @@ class Parallel(msgspec.Struct):
             choices=CP_KV_LAYOUT_CHOICES,
         ),
     ] = None
+    enable_linear_attn_cp: A[
+        bool,
+        Arg(
+            help="(Derived) fold CP into the tensor-parallel width of "
+            "linear-attention (GDN/KDA) layers and gather the sequence at "
+            "each layer boundary; resolved from the model architecture.",
+            no_cli=True,
+            resolvable=True,
+        ),
+    ] = False
     enable_cp_tp_group_sharing: A[
         bool,
         Arg(
