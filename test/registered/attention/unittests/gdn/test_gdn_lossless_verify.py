@@ -32,6 +32,7 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=40, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-large-amd")
+register_amd_ci(est_time=40, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 DEVICE = "cuda"
 NUM_LAYERS = 2
@@ -42,8 +43,10 @@ MAMBA_SLOTS = 12
 SLOTS = [3, 0, 7, 5, 9]
 TRACK_SLOTS = [10, 11, 1, 2, 4]
 N = len(SLOTS)
+ALL_ROWS = list(range(N))
 # (k-heads, v-heads) per TP rank: Qwen3.6-35B-A3B at TP=1, and the shape that
-# selects the gfx950-specific verify launch config on ROCm.
+# selects the gfx950-specific verify launch config on ROCm (one tile for a
+# single request, another for a batch).
 HEADS = [(16, 32), (4, 16)]
 
 
@@ -95,9 +98,9 @@ def _fill(pools, seed):
             phys.copy_(rand_like(phys))
 
 
-def _inputs(d, h, hv, seed):
+def _inputs(d, h, hv, seed, n=N):
     gen = torch.Generator(device=DEVICE).manual_seed(seed)
-    t = N * d
+    t = n * d
 
     def rand(*shape):
         return torch.randn(*shape, generator=gen, device=DEVICE)
@@ -116,10 +119,11 @@ def _inputs(d, h, hv, seed):
     ]
 
 
-def _verify(pool, inputs, d, rows):
-    """GDNAttnBackend.forward_extend's target-verify call, for every layer."""
-    slots = torch.tensor(SLOTS, dtype=torch.int32, device=DEVICE)
-    cu = torch.arange(0, N * d + 1, d, dtype=torch.int32, device=DEVICE)
+def _verify(pool, inputs, d, rows, sel=ALL_ROWS):
+    """GDNAttnBackend.forward_extend's target-verify call, for every layer, on
+    the verify rows ``sel``."""
+    slots = torch.tensor([SLOTS[i] for i in sel], dtype=torch.int32, device=DEVICE)
+    cu = torch.arange(0, len(sel) * d + 1, d, dtype=torch.int32, device=DEVICE)
     outs = []
     for layer, x in enumerate(inputs):
         lc = pool.mamba_cache.at_layer_idx(layer)
@@ -145,9 +149,9 @@ def _verify(pool, inputs, d, rows):
     return outs
 
 
-def _commit(pool, last, track_idx, track_steps, req_pool_indices=None):
+def _commit(pool, last, track_idx, track_steps, req_pool_indices=None, sel=ALL_ROWS):
     """Drive the real commit hook with a minimal stand-in for the backend."""
-    slots = torch.tensor(SLOTS, dtype=torch.int64, device=DEVICE)
+    slots = torch.tensor([SLOTS[i] for i in sel], dtype=torch.int64, device=DEVICE)
     slot_of_req = torch.full((64,), -1, dtype=torch.int64, device=DEVICE)
     if req_pool_indices is not None:
         slot_of_req[req_pool_indices] = slots
@@ -183,8 +187,9 @@ def _commit(pool, last, track_idx, track_steps, req_pool_indices=None):
     )
 
 
-def _accept_pattern(d):
-    """Every accepted length (none, one, half, all) plus track crossings."""
+def _accept_pattern(d, sel=ALL_ROWS):
+    """Every accepted length (none, one, half, all) plus track crossings, for
+    the verify rows ``sel``."""
     last = torch.tensor(
         [0, d - 1, min(1, d - 1), d // 2, -1], dtype=torch.int64, device=DEVICE
     )
@@ -193,28 +198,28 @@ def _accept_pattern(d):
     )
     track = torch.minimum(track, last)
     track_idx = torch.tensor(TRACK_SLOTS, dtype=torch.int64, device=DEVICE)
-    return last, track, track_idx
+    return last[sel], track[sel], track_idx[sel]
 
 
 class TestGdnLosslessVerify(CustomTestCase):
-    def _run_pair(self, d, h, hv, ssm_dtype, seed, pp_rows=False):
+    def _run_pair(self, d, h, hv, ssm_dtype, seed, pp_rows=False, sel=ALL_ROWS):
         spec_slots = 8 if pp_rows else N
         stock = _pool(False, d, h, hv, ssm_dtype, spec_slots)
         lossless = _pool(True, d, h, hv, ssm_dtype, spec_slots)
         _fill([stock, lossless], seed)
         before = lossless.mamba_cache.temporal.clone()
-        inputs = _inputs(d, h, hv, seed + 1)
+        inputs = _inputs(d, h, hv, seed + 1, n=len(sel))
         if pp_rows:
-            req_rows = torch.tensor([4, 1, 6, 0, 2], device=DEVICE)
+            req_rows = torch.tensor([4, 1, 6, 0, 2], device=DEVICE)[sel]
             rows = req_rows.to(torch.int32)
         else:
             req_rows = None
             rows = torch.arange(N + 1, dtype=torch.int32, device=DEVICE)
-        outs_stock = _verify(stock, inputs, d, rows)
-        outs_lossless = _verify(lossless, inputs, d, rows)
-        last, track, track_idx = _accept_pattern(d)
-        _commit(stock, last, track_idx, track, req_rows)
-        _commit(lossless, last, track_idx, track, req_rows)
+        outs_stock = _verify(stock, inputs, d, rows, sel)
+        outs_lossless = _verify(lossless, inputs, d, rows, sel)
+        last, track, track_idx = _accept_pattern(d, sel)
+        _commit(stock, last, track_idx, track, req_rows, sel)
+        _commit(lossless, last, track_idx, track, req_rows, sel)
         torch.cuda.synchronize()
         return stock, lossless, outs_stock, outs_lossless, before, last, track_idx
 
@@ -271,6 +276,18 @@ class TestGdnLosslessVerify(CustomTestCase):
                     touched[track_idx[:3]] = True
                     t = lossless.mamba_cache.temporal
                     self.assertTrue(torch.equal(t[:, ~touched], before[:, ~touched]))
+
+    def test_bit_exact_single_request(self):
+        # A batch of one picks its own verify launch config on gfx950, so run
+        # every accept pattern as its own batch.
+        for h, hv in HEADS:
+            for d in (2, 4, 8):
+                for row in ALL_ROWS:
+                    with self.subTest(h=h, hv=hv, d=d, row=row):
+                        stock, lossless, outs_s, outs_l, *_ = self._run_pair(
+                            d, h, hv, torch.float32, seed=10 * d + h + row, sel=[row]
+                        )
+                        self._assert_identical(stock, lossless, outs_s, outs_l)
 
     def test_bf16_state_pool(self):
         # The tuples stay fp32, so a bf16 pool commits bf16(h_t) like the
