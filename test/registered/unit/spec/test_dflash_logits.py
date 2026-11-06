@@ -9,6 +9,8 @@ from sglang.srt.models.dflash import (
     DFlash2DraftModel,
     _grouped_conv,
 )
+from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -411,6 +413,137 @@ def test_grouped_conv_supports_runtime_block_sizes():
                     value += coefficient * hidden_3d[batch, position - tap]
                 expected[batch * block_size + position] = value.flatten()
         torch.testing.assert_close(actual, expected)
+
+
+_SPARSE_WORLD = 4
+_SPARSE_SHARD = 256
+
+
+def _sparse_verify_support(
+    monkeypatch,
+    *,
+    rank=0,
+    top_ks=(64, 20, 1, 64),
+    shard_width=_SPARSE_SHARD,
+    worker_fields=(),
+    batch_fields=(),
+    sampling_fields=(),
+):
+    """``_sparse_verify_support`` on rank ``rank`` of 4 for 8-token verify blocks."""
+    from sglang.srt.speculative import dflash_worker_v2 as worker_mod
+
+    bs = len(top_ks)
+    sampling_info = SamplingBatchInfo(
+        temperatures=torch.ones(bs, 1),
+        top_ps=torch.ones(bs),
+        top_ks=torch.tensor(top_ks, dtype=torch.int32),
+        min_ps=torch.zeros(bs),
+        is_all_greedy=False,
+        is_any_greedy=1 in top_ks,
+        need_top_p_sampling=False,
+        need_top_k_sampling=any(k != TOP_K_ALL for k in top_ks),
+        need_min_p_sampling=False,
+        vocab_size=_SPARSE_WORLD * _SPARSE_SHARD,
+    )
+    worker = worker_mod.DFlashWorkerV2.__new__(worker_mod.DFlashWorkerV2)
+    worker._sparse_verify = True
+    worker._selector_sample = (None, None)
+    worker._block_verification = False
+    worker._target_logits_processor = SimpleNamespace(
+        vocab_size=_SPARSE_WORLD * _SPARSE_SHARD, final_logit_softcapping=20.0
+    )
+    batch = SimpleNamespace(has_grammar=False, return_logprob=False)
+    for target, fields in (
+        (worker, worker_fields),
+        (batch, batch_fields),
+        (sampling_info, sampling_fields),
+    ):
+        for name, value in dict(fields).items():
+            setattr(target, name, value)
+    gathered = []
+    group = SimpleNamespace(
+        world_size=_SPARSE_WORLD,
+        rank_in_group=rank,
+        all_gather_into_tensor=lambda output, input: gathered.append(output.shape),
+    )
+    parallel = SimpleNamespace(tp_group=group, tp_rank=rank)
+    monkeypatch.setattr(worker_mod, "get_parallel", lambda: parallel)
+    support = worker._sparse_verify_support(
+        batch=batch,
+        sampling_info=sampling_info,
+        draft_input=SimpleNamespace(max_top_k=max(top_ks)),
+        logits_shard=torch.zeros(bs * 8, shard_width),
+    )
+    return support, gathered
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        dict(top_ks=(65,)),
+        dict(top_ks=(64, 128)),
+        dict(top_ks=(64, TOP_K_ALL)),
+        dict(top_ks=(TOP_K_ALL, TOP_K_ALL)),
+        dict(shard_width=_SPARSE_SHARD + 1),
+        dict(sampling_fields={"need_top_p_sampling": True}),
+        dict(sampling_fields={"need_min_p_sampling": True}),
+        dict(sampling_fields={"has_custom_logit_processor": True}),
+        dict(
+            sampling_fields={
+                "penalizer_orchestrator": SimpleNamespace(is_required=True)
+            }
+        ),
+        dict(sampling_fields={"logit_bias": torch.zeros(1)}),
+        dict(sampling_fields={"grammar_mask": object()}),
+        dict(sampling_fields={"sampling_mask_batch_indices": torch.zeros(1)}),
+        dict(batch_fields={"has_grammar": True}),
+        dict(batch_fields={"return_logprob": True}),
+        dict(worker_fields={"_block_verification": True}),
+        dict(worker_fields={"_selector_sample": None}),
+        dict(worker_fields={"_sparse_verify": False}),
+    ],
+)
+def test_sparse_verify_keeps_the_dense_gather_when_the_support_cannot_match(
+    case, monkeypatch
+):
+    """Only a sampled batch with top_k <= 64, no logit adjustment and unpadded vocab
+    shards may skip the dense gather; top_k -1 or above 64 keeps it."""
+    from sglang.srt.speculative import dflash_worker_v2 as worker_mod
+
+    monkeypatch.setattr(
+        worker_mod,
+        "pack_shard_topk",
+        lambda *args, **kwargs: pytest.fail("the dense gather must run"),
+    )
+    support, gathered = _sparse_verify_support(monkeypatch, **case)
+    assert support is None and gathered == []
+
+
+def test_sparse_verify_gathers_rank_major_shards_with_global_ids(monkeypatch):
+    """The merge reads rank r's candidates at gathered rows r * rows.., with ids
+    offset by r * shard_width."""
+    from sglang.srt.speculative import dflash_worker_v2 as worker_mod
+
+    calls = []
+
+    def fake_pack(logits_shard, *, max_top_k, col_offset):
+        calls.append(("pack", max_top_k, col_offset))
+        return torch.zeros(logits_shard.shape[0], 256, dtype=torch.int32)
+
+    def fake_merge(gathered, *, world, softcap, max_top_k):
+        calls.append(("merge", world, softcap, max_top_k))
+        return "support"
+
+    monkeypatch.setattr(worker_mod, "pack_shard_topk", fake_pack)
+    monkeypatch.setattr(worker_mod, "merge_shard_topk", fake_merge)
+
+    support, gathered = _sparse_verify_support(monkeypatch, rank=2)
+    assert support == "support"
+    assert calls == [
+        ("pack", 64, 2 * _SPARSE_SHARD),
+        ("merge", _SPARSE_WORLD, 20.0, 64),
+    ]
+    assert gathered == [torch.Size([_SPARSE_WORLD * 4 * 8, 256])]
 
 
 if __name__ == "__main__":
