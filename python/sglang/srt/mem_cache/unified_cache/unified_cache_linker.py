@@ -749,15 +749,22 @@ class UnifiedCacheLinkerWrapper:
                 node_id
             )
             if transfers is None:
+                # The node's KV is stored or queued; a state attached since
+                # (a branch-point Mamba checkpoint) still needs its own copy.
+                self._offload_node_states(node_id)
                 continue
-            if self._skipped_windows:
-                skipped = {window.pool_name for window in self._skipped_windows}
-                transfers = [t for t in transfers if t.name not in skipped]
+            transfers = self._drop_skipped_windows(transfers)
             if self.offload_skip_prefix_len:
                 transfers = self._drop_offload_skip_prefix(node_id, transfers)
                 if transfers is None:
                     continue
             self._offload_node(node_id, transfers)
+
+    def _drop_skipped_windows(
+        self, transfers: list[PoolTransfer]
+    ) -> list[PoolTransfer]:
+        skipped = {window.pool_name for window in self._skipped_windows}
+        return [t for t in transfers if t.name not in skipped]
 
     @contextmanager
     def skip_offload_prefix(self, length: int):
@@ -798,7 +805,9 @@ class UnifiedCacheLinkerWrapper:
             kept.append(transfer)
         return kept
 
-    def _offload_node(self, node_id: NodeId, transfers: list[PoolTransfer]) -> None:
+    def _offload_node(
+        self, node_id: NodeId, transfers: list[PoolTransfer], *, publish: bool = True
+    ) -> None:
         cache = self.cache
         lock_params = cache.inc_lock_ref(node_id).to_dec_params()
         try:
@@ -812,8 +821,23 @@ class UnifiedCacheLinkerWrapper:
             cache.dec_lock_ref(node_id, lock_params)
             return
 
-        cache.tree_core.mark_external_linker_offload_pending(node_id)
-        self.pending_offloads.append(_PendingOffload(node_id, lock_params, [node_id]))
+        # Unpublished, the lock alone keeps a state slot alive: the node's
+        # stored and pending marks track its KV.
+        if publish:
+            cache.tree_core.mark_external_linker_offload_pending(node_id)
+        self.pending_offloads.append(
+            _PendingOffload(node_id, lock_params, [node_id] if publish else [])
+        )
+
+    def _offload_node_states(self, node_id: NodeId) -> None:
+        transfers = self.cache.tree_core.build_external_linker_state_offload_transfers(
+            node_id
+        )
+        transfers = self._drop_skipped_windows(transfers)
+        if self.offload_skip_prefix_len:
+            transfers = self._drop_offload_skip_prefix(node_id, transfers)
+        if transfers:
+            self._offload_node(node_id, transfers, publish=False)
 
     def replace_pending_offload_node(
         self, ack_id: NodeId, old_node_id: NodeId, new_node_ids: list[NodeId]
