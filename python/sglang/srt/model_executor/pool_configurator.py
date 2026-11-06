@@ -36,6 +36,7 @@ from sglang.srt.configs.model_config import (
     uses_minimax_m3_nvfp4_native_stack,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.dcp.layout import dsa_shards_index_k
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     collect_sources_by_ratio,
@@ -314,7 +315,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         kvc=kvc,
                         num_layers=num_layers,
                     )
-                    target_indexer_size *= dcp_size
+                    if not dsa_shards_index_k():
+                        target_indexer_size *= dcp_size
                     target_kv_size = self._cell_size - target_indexer_size
                     from sglang.srt.layers.cp.utils import (
                         get_glm_dsa_layer_split_effective_num_layers,
@@ -457,7 +459,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     kvc=kvc,
                     num_layers=num_layers,
                 )
-                if not kvc.is_draft_worker:
+                if not kvc.is_draft_worker and not dsa_shards_index_k():
                     indexer_cell_size *= dcp_size
                 cell_size += indexer_cell_size
         elif is_minimax_sparse(model_config.hf_config):
