@@ -33,7 +33,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
-from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers import deep_gemm_wrapper, offloader
 from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
 from sglang.srt.runtime_context import (
     get_exec,
@@ -55,7 +55,6 @@ from sglang.srt.utils import (
     is_hip,
     is_musa,
     is_xpu,
-    offloader,
 )
 from sglang.srt.utils.common import print_warning_once, torch_release
 from sglang.srt.utils.custom_op import register_custom_op
