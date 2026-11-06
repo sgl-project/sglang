@@ -7,9 +7,13 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.cp.bcg.bcg import PrefillCPBCGInput
-from sglang.srt.layers.cp.interleave import InterleaveCPStrategy
+from sglang.srt.layers.cp.interleave import (
+    InterleaveContextParallelMetadata,
+    InterleaveCPStrategy,
+)
 from sglang.srt.layers.cp.padding import get_cp_padding_align_size
 from sglang.srt.layers.cp.utils import (
     cp_interleave_input_ids,
@@ -33,6 +37,11 @@ class DSV4CPBCGInput(PrefillCPBCGInput):
     global_input_ids: Optional[torch.Tensor] = None
     num_token_non_padded: Optional[torch.Tensor] = None
     supports_max_context_size = True
+
+    @staticmethod
+    def supports(server_args) -> bool:
+        # The V4.1 adapter prepares embeddings on every rank and requires PP=1.
+        return resolving_view(server_args).pp_size == 1
 
     def _max_local_tokens(self, extend_seq_lens):
         size = get_parallel().attn_cp_size
@@ -100,6 +109,12 @@ class DSV4CPBCGInput(PrefillCPBCGInput):
         forward_batch.cp_input_ids = None
         out_cache_loc = forward_batch.out_cache_loc
         prepare_cp_forward(forward_batch)
+        metadata = forward_batch.attn_cp_metadata
+        if not isinstance(metadata, InterleaveContextParallelMetadata):
+            raise TypeError(
+                "DSV4 CP BCG requires InterleaveContextParallelMetadata, "
+                f"got {type(metadata).__name__}"
+            )
 
         captured_local_tokens = None
         if not capture:
@@ -113,18 +128,16 @@ class DSV4CPBCGInput(PrefillCPBCGInput):
 
             # Breakable graph segments retain their captured row geometry when
             # a smaller live batch reuses the same global token bucket.
-            metadata = forward_batch.attn_cp_metadata
-            if hasattr(metadata, "per_rank_actual_token"):
-                live_physical_tokens = max(metadata.per_rank_actual_token)
-                if live_physical_tokens > captured_local_tokens:
-                    raise RuntimeError(
-                        f"Live batch needs {live_physical_tokens} local CP rows, "
-                        f"but global prefill bucket {static_num_tokens} has "
-                        f"captured capacity {captured_local_tokens}"
-                    )
-                cp_size = len(metadata.per_rank_actual_token)
-                metadata.per_rank_actual_token = [captured_local_tokens] * cp_size
-                metadata.max_rank_len = [captured_local_tokens] * cp_size
+            live_physical_tokens = max(metadata.per_rank_actual_token)
+            if live_physical_tokens > captured_local_tokens:
+                raise RuntimeError(
+                    f"Live batch needs {live_physical_tokens} local CP rows, "
+                    f"but global prefill bucket {static_num_tokens} has "
+                    f"captured capacity {captured_local_tokens}"
+                )
+            cp_size = len(metadata.per_rank_actual_token)
+            metadata.per_rank_actual_token = [captured_local_tokens] * cp_size
+            metadata.max_rank_len = [captured_local_tokens] * cp_size
 
         raw_tokens = int(forward_batch.extend_num_tokens)
         global_input_ids = forward_batch.input_ids[:raw_tokens]
