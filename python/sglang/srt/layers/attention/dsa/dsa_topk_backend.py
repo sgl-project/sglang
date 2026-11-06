@@ -157,6 +157,7 @@ class DSATopKBackend(Enum):
                     topk_indices_offset=topk_indices_offset,
                     row_starts=row_starts,
                     batch_idx_list=batch_idx_list,
+                    packed_extend_topk=packed_extend_topk,
                 )
             from sglang.kernels.ops.attention.dsa.gvr2_topk import (
                 gvr2_check,
