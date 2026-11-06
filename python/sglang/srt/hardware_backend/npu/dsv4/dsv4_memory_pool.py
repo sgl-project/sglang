@@ -295,6 +295,26 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
     """
 
     def __init__(self, *args, **kwargs):
+        from sglang.srt.hardware_backend.npu.dsv4.swa_ring import (
+            resolve_npu_swa_ring_size,
+        )
+
+        ring = resolve_npu_swa_ring_size(
+            kwargs.get("sliding_window", 128), kwargs.get("swa_page_size", 128)
+        )
+        if ring is not None:
+            if (
+                args
+                or KVLayout.parse(kwargs.get("kv_layout", KVLayout.V4)) != KVLayout.V4
+            ):
+                raise ValueError(
+                    "NPU SWA rings require keyword construction and V4 layout"
+                )
+            slots = kwargs.get("num_req_slots") or kwargs["max_num_reqs"] + 1
+            kwargs["swa_size"] = slots * ring
+            kwargs["c4_state_pool_size"] = (
+                slots * ring // kwargs["swa_page_size"] * self.get_ring_size(4)
+            )
         c128_page_size = get_schedule().c128_page_size
         if c128_page_size <= 0 or c128_page_size % 16 != 0:
             raise ValueError(
@@ -303,6 +323,8 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             )
         self.c128_page_size = c128_page_size
         super().__init__(*args, **kwargs)
+        if ring is not None:
+            self.swa_req_ring_size = ring
 
     def _make_kv_pool(
         self,
