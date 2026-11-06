@@ -30,7 +30,9 @@ validate actually addresses the bytes the collective delivers:
    exact KV bytes, separate target/draft storage and scratch plans, fragmented
    pages, partial tail pages, both MLA write APIs, and local/nonzero draft
    layer IDs across batches.
-4. Symmetric-window buffer lifetime: deregistration before the free.
+4. Symmetric-window buffer lifetime: deregistration before the free, including
+   libraries without the multicast-pointer API.
+5. A foreground all-reduce pauses and resumes an in-flight NVLink transfer.
 
 The copy-engine (zero-SM) gathers need NCCL >= 2.31.2 and live in
 ``test/manual/mem_cache/test_page_interleave_zero_sm_gather.py``.
@@ -44,6 +46,7 @@ when too few CUDA devices are visible. Run directly with:
 import ctypes
 import gc
 import os
+import time
 import unittest
 from types import SimpleNamespace
 
@@ -54,9 +57,11 @@ from sglang.srt.distributed import (
     init_distributed_environment,
     initialize_model_parallel,
 )
+from sglang.srt.distributed.device_communicators.gated_transfer import Link
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     allocate_symmetric_buffer,
 )
+from sglang.srt.distributed.device_communicators.pynccl_wrapper import NCCLLibrary
 from sglang.srt.mem_cache.allocator.page_interleave import PageInterleavePoolAllocator
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 from sglang.srt.mem_cache.page_interleave import PageShardSpec, get_kv_shard_group
@@ -709,6 +714,7 @@ class TestSymmetricBufferLifetime(CustomTestCase):
             nccl=SimpleNamespace(
                 ncclMemAlloc=torch.cuda.caching_allocator_alloc,
                 ncclMemFree=free,
+                has_function=lambda name: False,
             ),
             register_comm_window_raw=lambda ptr, size: ctypes.c_void_p(ptr),
             deregister_comm_window=lambda window: released.append(
@@ -722,6 +728,123 @@ class TestSymmetricBufferLifetime(CustomTestCase):
         del buf
         gc.collect()
         self.assertEqual(released, [("deregister", ptr), ("free", ptr)])
+
+
+@unittest.skipIf(not torch.cuda.is_available(), "needs a CUDA device")
+class TestSymmetricBufferWithoutMultimemApi(CustomTestCase):
+    def test_older_nccl_skips_the_multicast_team_build(self):
+        """NCCL before 2.29.2 registers windows but does not export
+        ncclGetLsaMultimemDevicePointer; it builds the multicast team during
+        registration instead. The allocation helper must not call it."""
+        lib = NCCLLibrary()
+        self.assertEqual(
+            lib.has_function("ncclGetLsaMultimemDevicePointer"),
+            lib.ncclGetRawVersion() >= 22902,
+        )
+        self.assertFalse(lib.has_function("ncclNoSuchSymbol"))
+
+        def unbound(window, offset):
+            raise AssertionError("ncclGetLsaMultimemDevicePointer is not exported")
+
+        released = []
+
+        def free(ptr):
+            released.append(("free", ptr))
+            torch.cuda.caching_allocator_delete(ptr)
+
+        comm = SimpleNamespace(
+            device=torch.device("cuda", torch.cuda.current_device()),
+            nccl=SimpleNamespace(
+                ncclMemAlloc=torch.cuda.caching_allocator_alloc,
+                ncclMemFree=free,
+                has_function=lambda name: name != "ncclGetLsaMultimemDevicePointer",
+                ncclGetLsaMultimemDevicePointer=unbound,
+            ),
+            register_comm_window_raw=lambda ptr, size: ctypes.c_void_p(ptr),
+            deregister_comm_window=lambda window: released.append(
+                ("deregister", window.value)
+            ),
+        )
+        buf, registered = allocate_symmetric_buffer(comm, 8192)
+        self.assertTrue(registered)
+        self.assertEqual(int(buf.count_nonzero()), 0)
+        ptr = buf.data_ptr()
+        del buf
+        gc.collect()
+        self.assertEqual(released, [("deregister", ptr), ("free", ptr)])
+
+
+def _run_all_reduce_under_in_flight_transfer(rank, world, port):
+    """A real TP all-reduce (through GroupCoordinator, with whatever path it
+    picks) pauses and resumes an NVLink gate whose chain is in flight."""
+    from cuda.bindings import driver as cu
+
+    from sglang.srt.distributed.device_communicators.gated_transfer import (
+        TransferChain,
+        copy_chunks,
+    )
+    from sglang.srt.distributed.parallel_state import get_tp_group
+    from sglang.srt.utils.cuda_vmm_utils import check_drv
+
+    _dist_init(rank, world, port, attn_cp_size=1)
+    group = get_tp_group()
+    x = torch.full((4 << 20,), float(rank + 1), device="cuda")
+    expected = torch.full_like(x, float(sum(range(1, world + 1))))
+    torch.testing.assert_close(group.all_reduce(x.clone()), expected)  # warm up
+    chain = TransferChain(Link.NVLINK)
+    gate = chain._gate
+    # In flight: the first chunk waits for a host-released word, not the gate.
+    blocker = torch.zeros(1, dtype=torch.int32).pin_memory()
+    src = torch.ones(2 << 20, dtype=torch.uint8, device="cuda")
+    dst = torch.zeros_like(src)
+    ops = copy_chunks(dst, src, 1 << 20)
+    first = ops[0]
+
+    def held(stream):
+        check_drv(
+            cu.cuStreamWaitValue32(
+                stream.cuda_stream,
+                blocker.data_ptr(),
+                1,
+                cu.CUstreamWaitValue_flags.CU_STREAM_WAIT_VALUE_EQ,
+            ),
+            "blocker",
+        )
+        first(stream)
+
+    ops[0] = held
+    torch.cuda.synchronize()
+    landed = chain.run(ops)
+    pauses = gate._seq
+    y = group.all_reduce(x.clone())
+    assert gate._seq == pauses + 1, f"[rank {rank}] the all-reduce did not pause"
+    assert gate._pause_thread is None
+    blocker[0] = 1  # host only: nothing waits on the GPU before the release
+    deadline = time.monotonic() + 30
+    while not chain.query(landed):
+        assert time.monotonic() < deadline, f"[rank {rank}] transfer hung"
+        time.sleep(0.005)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(y, expected)
+    assert torch.equal(dst, src) and gate.word() == 0
+    # Opened by the bracket's stream-ordered resume, not a watchdog rescue.
+    assert gate.forced_opens == 0, f"[rank {rank}] the watchdog opened the gate"
+    # Drained: the next all-reduce pauses nothing.
+    group.all_reduce(x.clone())
+    assert gate._seq == pauses + 1
+    torch.cuda.synchronize()
+    torch.distributed.barrier()
+
+
+@unittest.skipIf(torch.cuda.device_count() < 2, "needs 2 CUDA devices")
+class TestAllReduceUnderInFlightTransferMultiGpu(CustomTestCase):
+    def test_all_reduce_pauses_an_in_flight_transfer(self):
+        mp.spawn(
+            _run_all_reduce_under_in_flight_transfer,
+            args=(_GATHER_WORLD, 29815),
+            nprocs=_GATHER_WORLD,
+            join=True,
+        )
 
 
 if __name__ == "__main__":

@@ -419,6 +419,22 @@ class NCCLLibrary:
         Function("ncclMemFree", ncclResult_t, [buffer_type]),
     ]
 
+    # Device-API host calls, NCCL >= 2.29.2.
+    exported_functions_lsa = [
+        # ncclResult_t ncclGetLsaMultimemDevicePointer(ncclWindow_t window, size_t offset, void** outPtr);
+        Function(
+            "ncclGetLsaMultimemDevicePointer",
+            ncclResult_t,
+            [ncclWindow_t, ctypes.c_size_t, ctypes.POINTER(buffer_type)],
+        ),
+        # ncclResult_t ncclGetPeerDevicePointer(ncclWindow_t window, size_t offset, int peer, void** outPtr);
+        Function(
+            "ncclGetPeerDevicePointer",
+            ncclResult_t,
+            [ncclWindow_t, ctypes.c_size_t, ctypes.c_int, ctypes.POINTER(buffer_type)],
+        ),
+    ]
+
     # class attribute to store the mapping from the path to the library
     # to avoid loading the same library multiple times
     path_to_library_cache: Dict[str, Any] = {}
@@ -457,6 +473,12 @@ class NCCLLibrary:
             exported_functions = list(NCCLLibrary.exported_functions)
             if hasattr(self.lib, "ncclCommWindowRegister"):
                 exported_functions.extend(NCCLLibrary.exported_functions_symm_mem)
+            # Each device-API host call is bound only if this library has it.
+            exported_functions.extend(
+                func
+                for func in NCCLLibrary.exported_functions_lsa
+                if hasattr(self.lib, func.name)
+            )
             for func in exported_functions:
                 f = getattr(self.lib, func.name)
                 f.restype = func.restype
@@ -464,6 +486,11 @@ class NCCLLibrary:
                 _funcs[func.name] = f
             NCCLLibrary.path_to_dict_mapping[so_file] = _funcs
         self._funcs = NCCLLibrary.path_to_dict_mapping[so_file]
+
+    def has_function(self, name: str) -> bool:
+        """Whether ``name`` is bound for this library. Optional symbols are
+        bound only when the library exports them."""
+        return name in self._funcs
 
     def ncclGetErrorString(self, result: ncclResult_t) -> str:
         return self._funcs["ncclGetErrorString"](result).decode("utf-8")
@@ -670,6 +697,35 @@ class NCCLLibrary:
 
     def ncclMemFree(self, ptr: int) -> None:
         self.NCCL_CHECK(self._funcs["ncclMemFree"](buffer_type(ptr)))
+
+    def ncclGetLsaMultimemDevicePointer(
+        self, window: ncclWindow_t, offset: int
+    ) -> Optional[int]:
+        """Multicast address of ``window + offset``; None without NVLS.
+
+        Creates the comm's multicast team on first use, which is collective.
+        """
+        ptr = buffer_type()
+        self.NCCL_CHECK(
+            self._funcs["ncclGetLsaMultimemDevicePointer"](
+                window, offset, ctypes.byref(ptr)
+            )
+        )
+        return ptr.value
+
+    def ncclGetPeerDevicePointer(
+        self, window: ncclWindow_t, offset: int, peer: int
+    ) -> Optional[int]:
+        """Address of ``window + offset`` on communicator rank ``peer``,
+        mapped into this process; None if ``peer`` is outside this rank's
+        LSA team (not load/store reachable)."""
+        ptr = buffer_type()
+        self.NCCL_CHECK(
+            self._funcs["ncclGetPeerDevicePointer"](
+                window, offset, peer, ctypes.byref(ptr)
+            )
+        )
+        return ptr.value
 
     def ncclGroupStart(self) -> None:
         self.NCCL_CHECK(self._funcs["ncclGroupStart"]())

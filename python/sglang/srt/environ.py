@@ -644,6 +644,19 @@ class Envs:
     # communicator. Leave NCCL_CTA_POLICY unset to preserve per-comm policies.
     # The engine defaults NCCL cuMem on for eligible single-node deployments.
     SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER = EnvBool(True)
+    # Transport of that gather: "nccl" (NCCL copy-engine allgather), or a
+    # one-sided copy-engine push into the scratch window in
+    # SGLANG_KV_SHARD_GATHER_CHUNK_MB chunks: "multicast" (through the NVLS
+    # multicast VA; needs NVLS) or "unicast" (into every peer's window).
+    SGLANG_KV_SHARD_GATHER_TRANSPORT = EnvStr("nccl")
+    SGLANG_KV_SHARD_GATHER_CHUNK_MB = EnvInt(8)
+    # With a push transport, run the gather's chunks behind the NVLink transfer
+    # gate (gated_transfer.py): each rank's copies stop at the next chunk
+    # boundary while the forward runs its latency-critical collectives.
+    # Opt-in: a parked gate stalls every stream sharing its hardware queue
+    # (the engine keeps a user CUDA_DEVICE_MAX_CONNECTIONS above 8), and a
+    # pause stuck behind one is only broken by the gated-transfer watchdog.
+    SGLANG_ENABLE_KV_SHARD_GATHER_PAUSE = EnvBool(False)
 
     # Attention (aiter, ROCm): route NEXTN spec draft_extend (EAGLE-v2 KV
     # catch-up) through aiter unified_attention (GQA-packed + split-KV) instead

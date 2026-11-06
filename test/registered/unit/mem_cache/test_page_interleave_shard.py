@@ -40,6 +40,8 @@ Pins the pure arithmetic that rotated owner-classed allocation hangs on:
 9. HiCache host offload: the host pool striped like the device pool,
    owner-classed host slots, the per-rank narrowing of a transfer, an N-rank
    backup -> evict -> load-back round trip, and the layer-load waits.
+10. Foreground all-reduces pause in-flight background transfers after any
+    output allocation and resume them after the communication call.
 
 The real NCCL MLA/MHA/MTP gathers and symmetric buffer lifetime tests live in
 ``test_page_interleave_gather_multi_gpu.py``; the zero-SM gathers, which need
@@ -52,6 +54,7 @@ import ctypes
 import gc
 import math
 import shutil
+import threading
 import unittest
 import unittest.mock
 from array import array
@@ -64,10 +67,13 @@ from parameterized import parameterized_class
 
 from sglang.srt.disaggregation.common.conn import CommonKVSender
 from sglang.srt.disaggregation.utils import filter_kv_indices_for_shard_rank
+from sglang.srt.distributed.device_communicators import gated_transfer
+from sglang.srt.distributed.device_communicators.gated_transfer import Link
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     _release_nccl_window_buffer,
     allocate_symmetric_buffer,
 )
+from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache import page_interleave
@@ -370,6 +376,7 @@ class TestSymmetricBufferFailureCleanup(CustomTestCase):
             nccl=SimpleNamespace(
                 ncclMemAlloc=unittest.mock.Mock(return_value=1234),
                 ncclMemFree=unittest.mock.Mock(),
+                has_function=lambda name: False,
             ),
             register_comm_window_raw=unittest.mock.Mock(
                 return_value=ctypes.c_void_p(5678)
@@ -2230,13 +2237,24 @@ class TestGatherWaitsForLayerLoad(CustomTestCase):
     def _pool(self, events, counter):
         slot = SimpleNamespace(
             tensors={"k": torch.zeros(N * PS, 1)},
-            ready=SimpleNamespace(record=lambda stream: None),
+            ready=None,
             resident_key=None,
+        )
+        current = object()
+        gather_stream = SimpleNamespace(
+            wait_stream=lambda stream: events.append(("wait_stream", stream is current))
         )
 
         def gather_pairs(local_layer):
             events.append(("gather", local_layer))
             return [(torch.zeros(4 * PS, 1), "k")]
+
+        def run(ops, *, setup, after):
+            self.assertEqual(len(ops), 1)
+            self.assertEqual(len(setup), 1)
+            self.assertIs(after, gather_stream if counter is not None else current)
+            events.append("all_gather")
+            return object()
 
         return SimpleNamespace(
             start_layer=2,
@@ -2250,14 +2268,13 @@ class TestGatherWaitsForLayerLoad(CustomTestCase):
             _send_rows=torch.arange(PS),
             _gather_send_rows=lambda name: torch.arange(PS),
             _gather_pairs=gather_pairs,
-            kv_gather_stream=SimpleNamespace(wait_stream=lambda stream: None),
+            _gather_chain=SimpleNamespace(run=run),
+            _sym_gather=None,
+            kv_gather_stream=gather_stream,
             device_module=SimpleNamespace(
-                stream=lambda stream: nullcontext(), current_stream=lambda: None
+                stream=lambda stream: nullcontext(), current_stream=lambda: current
             ),
-            kv_gather_comm=SimpleNamespace(
-                change_state=lambda enable: nullcontext(),
-                all_gather=lambda out, inp: events.append("all_gather"),
-            ),
+            kv_gather_comm=object(),
             layer_transfer_counter=counter,
         )
 
@@ -2265,12 +2282,149 @@ class TestGatherWaitsForLayerLoad(CustomTestCase):
         events = []
         counter = SimpleNamespace(wait_until=lambda i: events.append(("wait", i)))
         PageInterleaveKVPoolMixin._prefetch_layer(self._pool(events, counter), 3)
-        self.assertEqual(events, [("wait", 1), ("gather", 1), "all_gather"])
+        self.assertEqual(
+            events, [("wait_stream", True), ("wait", 1), ("gather", 1), "all_gather"]
+        )
 
     def test_no_counter_no_wait(self):
         events = []
         PageInterleaveKVPoolMixin._prefetch_layer(self._pool(events, None), 3)
         self.assertEqual(events, [("gather", 1), "all_gather"])
+
+
+class _InFlightGate(gated_transfer._Gate):
+    """An NVLink gate with chunks in flight that records its pauses."""
+
+    def __init__(self):
+        self.link, self.device = Link.NVLINK, 0
+        self._lock = threading.Lock()
+        self._pause_stream, self._pause_thread = None, None
+        self.calls = []
+        self.pending = True
+
+    def busy(self):
+        return self.pending
+
+    def pause(self, stream):
+        self.calls.append("pause")
+
+    def resume(self, stream):
+        self.calls.append("resume")
+
+
+class TestAllReduceLeafBrackets(CustomTestCase):
+    """The large all-reduces of a sharded prefill pause an in-flight
+    background transfer around the communication call only."""
+
+    def setUp(self):
+        self.gate = _InFlightGate()
+        for owner, attr, value in (
+            (gated_transfer, "_gates", (self.gate,)),
+            (torch.cuda, "current_device", lambda: 0),
+            (torch.cuda, "current_stream", lambda device=None: "stream"),
+            (torch.cuda, "is_current_stream_capturing", lambda: False),
+        ):
+            patcher = unittest.mock.patch.object(owner, attr, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _comm(self):
+        gate = self.gate
+
+        class Comm:
+            disabled = False
+            seen = []
+
+            def all_reduce(self, tensor):
+                self.seen.append(list(gate.calls))
+
+            def outplace_all_reduce(self, tensor, out):
+                self.seen.append(list(gate.calls))
+                return out
+
+            @contextmanager
+            def change_state(self, enable=None):
+                yield
+
+        return Comm()
+
+    def test_in_place_all_reduce_pauses_around_the_call(self):
+        comm = self._comm()
+        group = SimpleNamespace(
+            pynccl_comm=comm,
+            get_available_pynccl_comm=lambda: comm,
+            torch_symm_mem_comm=None,
+        )
+        GroupCoordinator._all_reduce_in_place(group, torch.ones(4))
+        self.assertEqual(comm.seen, [["pause"]])
+        self.assertEqual(self.gate.calls, ["pause", "resume"])
+
+    def test_pynccl_out_of_place_allocates_before_the_pause(self):
+        comm = self._comm()
+        group = SimpleNamespace(
+            pynccl_comm=comm,
+            get_available_pynccl_comm=lambda: comm,
+            ca_comm=None,
+            qr_comm=None,
+            pymscclpp_comm=None,
+            torch_symm_mem_comm=None,
+        )
+        allocated_paused = []
+        real_empty_like = torch.empty_like
+
+        def empty_like(*args, **kwargs):
+            allocated_paused.append(self.gate._pause_thread is not None)
+            return real_empty_like(*args, **kwargs)
+
+        with unittest.mock.patch.object(torch, "empty_like", empty_like):
+            out = GroupCoordinator._all_reduce_out_place(group, torch.ones(4), "pynccl")
+        self.assertEqual(out.shape, (4,))
+        self.assertEqual(allocated_paused, [False])
+        self.assertEqual(comm.seen, [["pause"]])
+        self.assertEqual(self.gate.calls, ["pause", "resume"])
+
+    def test_custom_all_reduce_reserves_its_output_before_the_pause(self):
+        """Custom all-reduce allocates its output inside the call; a block of
+        that size is cached before the pause so that allocation cannot reach
+        cudaMalloc / cudaFree inside the bracket."""
+        gate = self.gate
+        seen = []
+
+        class CustomAllReduce:
+            disabled = False
+
+            def custom_all_reduce(self, tensor):
+                seen.append(list(gate.calls))
+                return tensor.clone()
+
+        group = SimpleNamespace(
+            pynccl_comm=None,
+            get_available_pynccl_comm=lambda: None,
+            ca_comm=CustomAllReduce(),
+            qr_comm=None,
+            pymscclpp_comm=None,
+            torch_symm_mem_comm=None,
+        )
+        reserved_paused = []
+        real_empty_like = torch.empty_like
+
+        def empty_like(*args, **kwargs):
+            reserved_paused.append(gate._pause_thread is not None)
+            return real_empty_like(*args, **kwargs)
+
+        with unittest.mock.patch.object(torch, "empty_like", empty_like):
+            GroupCoordinator._all_reduce_out_place(group, torch.ones(4), "ca")
+        self.assertEqual(reserved_paused, [False])
+        self.assertEqual(seen, [["pause"]])
+        self.assertEqual(gate.calls, ["pause", "resume"])
+
+        # Nothing in flight: no reservation, no pause.
+        gate.pending = False
+        gate.calls.clear()
+        with unittest.mock.patch.object(torch, "empty_like", empty_like):
+            GroupCoordinator._all_reduce_out_place(group, torch.ones(4), "ca")
+        self.assertEqual(reserved_paused, [False])
+        self.assertEqual(gate.calls, [])
 
 
 if __name__ == "__main__":

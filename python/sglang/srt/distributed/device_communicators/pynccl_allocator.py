@@ -7,6 +7,7 @@ import tempfile
 import traceback
 import weakref
 from contextlib import nullcontext
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
@@ -52,6 +53,17 @@ def _release_nccl_window_buffer(
         comm.nccl.ncclMemFree(ptr)
 
 
+@dataclass
+class SymmetricWindowBuffer:
+    """A zeroed uint8 tensor over ``ncclMemAlloc`` memory, its symmetric
+    window on the communicator (None when NCCL returned none) and the
+    window's multicast VA (None without a window or without NVLS)."""
+
+    tensor: torch.Tensor
+    window: Optional[ncclWindow_t]
+    multicast_ptr: Optional[int]
+
+
 def allocate_symmetric_buffer(
     comm: PyNcclCommunicator, nbytes: int
 ) -> Tuple[torch.Tensor, bool]:
@@ -63,6 +75,16 @@ def allocate_symmetric_buffer(
     --enable-symm-mem. It is deregistered and freed when the last view dies.
     The returned flag means a symmetric window only on NCCL >= 2.29.2.
     """
+    buffer = allocate_symmetric_window(comm, nbytes)
+    return buffer.tensor, buffer.window is not None
+
+
+def allocate_symmetric_window(
+    comm: PyNcclCommunicator, nbytes: int
+) -> SymmetricWindowBuffer:
+    """``allocate_symmetric_buffer``, also returning the window handle and
+    its multicast VA (for one-sided transfers into the window)."""
+    multicast_ptr = None
     with torch.cuda.device(comm.device):
         ptr = comm.nccl.ncclMemAlloc(nbytes)
         window = None
@@ -73,6 +95,19 @@ def allocate_symmetric_buffer(
             # support, usually because NCCL runs without cuMem (ncclMemAlloc is
             # then a cudaMalloc); 2.28.x returns a local-registration handle.
             window = window if window.value else None
+            if window is not None and comm.nccl.has_function(
+                "ncclGetLsaMultimemDevicePointer"
+            ):
+                # Workaround for NCCL 2.29.7+ with NVLS on a 2-rank comm (fixed
+                # upstream by NCCL commit 430afbc, after 2.30.7): the multicast
+                # team is built lazily inside the first CE collective's sync
+                # (ncclDevrGetLsaTeamPtrMC) with no barrier after binding, so a
+                # fast rank's ready flag can miss a peer and both hang. Build the
+                # team now (keeping the multicast address) and barrier.
+                # Larger comms, and older NCCL without this API, build the team
+                # during window registration behind a barrier already.
+                multicast_ptr = comm.nccl.ncclGetLsaMultimemDevicePointer(window, 0)
+                torch.distributed.barrier(group=comm.group)
             owner = _NcclMemOwner(ptr, nbytes)
             release = weakref.finalize(
                 owner, _release_nccl_window_buffer, comm, ptr, window
@@ -91,7 +126,7 @@ def allocate_symmetric_buffer(
             except Exception:
                 logger.exception("Failed to release NCCL buffer after setup failure")
             raise
-    return buf, window is not None
+    return SymmetricWindowBuffer(buf, window, multicast_ptr or None)
 
 
 # C++ source for the NCCL allocator plugin

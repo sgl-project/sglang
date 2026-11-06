@@ -25,6 +25,10 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_reduce,
     tensor_model_parallel_quant_all_reduce,
 )
+from sglang.srt.distributed.device_communicators.gated_transfer import (
+    Link,
+    paused_background_transfers,
+)
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -180,7 +184,11 @@ def moe_cp_gather(
         dtype=hidden_states.dtype,
         device=hidden_states.device,
     )
-    moe_cp_all_gather_into_tensor(output, hidden_states)
+    # The per-layer pre-MoE gather is the collective a KV-shard prefix gather
+    # slows most; the chunk-KV gather is left unpaused (it precedes the read
+    # of the very slot being gathered).
+    with paused_background_transfers(Link.NVLINK):
+        moe_cp_all_gather_into_tensor(output, hidden_states)
     return output
 
 
