@@ -139,38 +139,32 @@ def build_layout(image_slots, image_shapes, axes_dims, device):
     )
 
 
-def apply_rope(x, rope):
-    fused = None
-    if _is_cuda and x.is_cuda and _ROPE_FUSION.can_attempt_once():
-        fused = fused_complex_rope(x, rope)
-        if _ROPE_FUSION.verified:
-            return fused
+def _eager_rope(x, rope):
     z = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
-    out = torch.view_as_real(z * rope[None, :, None]).flatten(-2).to(x.dtype)
-    if fused is not None:
-        return _ROPE_FUSION.accept_or_fallback(fused, out, logger=logger)
-    return out
+    return torch.view_as_real(z * rope[None, :, None]).flatten(-2).to(x.dtype)
+
+
+def apply_rope(x, rope):
+    if _is_cuda and x.is_cuda:
+        return _ROPE_FUSION.run(
+            lambda: fused_complex_rope(x, rope),
+            lambda: _eager_rope(x, rope),
+            logger=logger,
+        )
+    return _eager_rope(x, rope)
 
 
 def apply_qk_norm(x, norm):
-    fused = None
-    if (
-        _is_cuda
-        and x.is_cuda
-        and x.dtype in (torch.float16, torch.bfloat16)
-        and _QK_NORM_FUSION.can_attempt_once()
-    ):
-        fused = rmsnorm_preserve_reduction(x, norm.weight, norm.variance_epsilon)
-        if _QK_NORM_FUSION.verified:
-            return fused
-    out = norm(x)
-    if fused is not None:
-        return _QK_NORM_FUSION.accept_or_fallback(fused, out, logger=logger)
-    return out
+    if _is_cuda and x.is_cuda and x.dtype in (torch.float16, torch.bfloat16):
+        return _QK_NORM_FUSION.run(
+            lambda: rmsnorm_preserve_reduction(x, norm.weight, norm.variance_epsilon),
+            lambda: norm(x),
+            logger=logger,
+        )
+    return norm(x)
 
 
 def apply_qk_norm_rope(x, norm, rope):
-    fused = None
     if (
         _is_cuda
         and x.is_cuda
@@ -178,25 +172,25 @@ def apply_qk_norm_rope(x, norm, rope):
         and can_use_qknorm_complex_rope_cuda(x.dtype, x.shape[-1])
         and _QK_ROPE_CUDA_FUSION.can_attempt_once()
     ):
-        fused = qknorm_complex_rope_cuda(x, norm.weight, rope, norm.variance_epsilon)
-        if _QK_ROPE_CUDA_FUSION.verified:
-            return fused
-        out = apply_rope(norm(x), rope)
-        return _QK_ROPE_CUDA_FUSION.accept_or_fallback(fused, out, logger=logger)
+        return _QK_ROPE_CUDA_FUSION.run(
+            lambda: qknorm_complex_rope_cuda(
+                x, norm.weight, rope, norm.variance_epsilon
+            ),
+            lambda: apply_rope(norm(x), rope),
+            logger=logger,
+        )
     if (
         _is_cuda
         and x.is_cuda
         and x.dtype in (torch.float16, torch.bfloat16)
         and x.shape[-1] == 128
-        and _QK_ROPE_FUSION.can_attempt_once()
     ):
-        fused = qknorm_complex_rope(x, norm.weight, rope, norm.variance_epsilon)
-        if _QK_ROPE_FUSION.verified:
-            return fused
-    out = apply_rope(norm(x), rope)
-    if fused is not None:
-        return _QK_ROPE_FUSION.accept_or_fallback(fused, out, logger=logger)
-    return out
+        return _QK_ROPE_FUSION.run(
+            lambda: qknorm_complex_rope(x, norm.weight, rope, norm.variance_epsilon),
+            lambda: apply_rope(norm(x), rope),
+            logger=logger,
+        )
+    return apply_rope(norm(x), rope)
 
 
 def can_project_into(layer, x):
@@ -243,7 +237,11 @@ class PrefixPad:
         return self.value
 
 
-@eager_on_graph
+@eager_on_graph(
+    output_factory=lambda attn, q, k, v, prefix_pad: q.new_empty(
+        (*q.shape[:-1], v.shape[-1])
+    )
+)
 def attend_past_prefix_pad(attn, q, k, v, prefix_pad):
     # a graph break: the pad varies per request, and skipping it hands the
     # kernel exactly the eager K/V, so padded replays stay bit-exact. Calls the
@@ -260,19 +258,13 @@ def cat_outputs(outputs, dim=0):
 
 
 def apply_modulation(x, norm, scale):
-    fused = None
-    if (
-        x.is_cuda
-        and can_use_fused_layernorm_modulate(x.dtype, x.shape[-1])
-        and _MODULATION_FUSION.can_attempt_once()
-    ):
-        fused = fused_layernorm_modulate(x, scale.squeeze(1), None, norm.eps)
-        if _MODULATION_FUSION.verified:
-            return fused
-    out = norm(x) * (1 + scale)
-    if fused is not None:
-        return _MODULATION_FUSION.accept_or_fallback(fused, out, logger=logger)
-    return out
+    if x.is_cuda and can_use_fused_layernorm_modulate(x.dtype, x.shape[-1]):
+        return _MODULATION_FUSION.run(
+            lambda: fused_layernorm_modulate(x, scale.squeeze(1), None, norm.eps),
+            lambda: norm(x) * (1 + scale),
+            logger=logger,
+        )
+    return norm(x) * (1 + scale)
 
 
 class QwenImage21ZeroCenterRMSNorm(nn.Module):
@@ -430,18 +422,14 @@ class QwenImage21FeedForward(nn.Module):
                 x, *packed, self.gate_layer.quant_method.group_size, self.out
             )
         gate, value = self.gate_layer(x)[0], self.proj(x)[0]
-        fused = None
-        if (
-            _is_cuda
-            and gate.dtype is torch.bfloat16
-            and _SILU_MUL_FUSION.can_attempt_once()
-        ):
-            fused = fused_silu_mul_bitexact(gate, value)
-            if _SILU_MUL_FUSION.verified:
-                return self.out(fused)[0]
-        hidden = nn.functional.silu(gate) * value
-        if fused is not None:
-            hidden = _SILU_MUL_FUSION.accept_or_fallback(fused, hidden, logger=logger)
+        if _is_cuda and gate.dtype is torch.bfloat16:
+            hidden = _SILU_MUL_FUSION.run(
+                lambda: fused_silu_mul_bitexact(gate, value),
+                lambda: nn.functional.silu(gate) * value,
+                logger=logger,
+            )
+        else:
+            hidden = nn.functional.silu(gate) * value
         return self.out(hidden)[0]
 
 
@@ -660,7 +648,10 @@ class QwenImage21Attention(nn.Module):
         prefix = cache["key"].shape[1] if cache else layouts[0]["prefix_rope"].shape[0]
         seq = x.shape[1]
         rows = packed.shape[0] // 3
-        buffer = x.new_empty(1, prefix + seq, 3 * rows)
+        # a buffer kept by an image-conditioned prefill still holds the prefix K/V rows
+        buffer = cache.get("qkv") if cache else None
+        if buffer is None:
+            buffer = x.new_empty(1, prefix + seq, 3 * rows)
         torch.mm(x.view(seq, x.shape[-1]), packed.t(), out=buffer[0, prefix:])
         q = buffer[:, prefix:, :rows].view(1, seq, self.heads, self.head_dim)
         k_out = buffer[:, :, rows : 2 * rows].view(
@@ -680,7 +671,7 @@ class QwenImage21Attention(nn.Module):
             )
             if accepted is reference:
                 return None
-        return q, k, v, k_out, v_out
+        return q, k, v, k_out, v_out, buffer
 
     def _project_kv_into_buffers(self, x, layouts, caches):
         """Project K/V straight into ``[1, P+S, H, D]`` buffers; ``None`` keeps the plain path."""
@@ -728,7 +719,16 @@ class QwenImage21Attention(nn.Module):
         k_out=None,
         v_out=None,
         prefix_pad=None,
+        qkv=None,
     ):
+        if cache and qkv is not None and qkv is cache.get("qkv"):
+            # rows [0:P] of the kept buffer are this prefix's K/V: only Q and the target K change
+            rows = cache["key"].shape[1]
+            empty = k_out.new_empty(1, 0, *k_out.shape[2:])
+            q = self._pack_kv_cuda(
+                q, k, v, rope, empty, empty, k_out[:, rows:], v_out[:, rows:]
+            )[0]
+            return self.attend_target(q, k_out, v_out, prefix_pad), None
         if cache:
             kp, vp = cache["key"], cache["value"]
             prefix_output = None
@@ -755,6 +755,18 @@ class QwenImage21Attention(nn.Module):
         if get_sp_world_size() == 1 and _KV_PACK_CUDA_FUSION.can_attempt_once():
             cuda_packed = self._pack_kv_cuda(q, k, v, rope, kp, vp, k_out, v_out)
             if cuda_packed is not None:
+                if (
+                    prefix_output is not None
+                    and cache is not None
+                    and qkv is not None
+                    and prefix_pad is None
+                    and _KV_PACK_CUDA_FUSION.verified
+                    and any(is_image for _, _, is_image in layout["segments"])
+                ):
+                    # an image prefix is as long as the target: copying it every step
+                    # costs more than keeping the packed buffer for the request
+                    rows = kp.shape[1]
+                    cache.update(qkv=qkv, key=k_out[:, :rows], value=v_out[:, :rows])
                 return self.attend_target(*cuda_packed, prefix_pad), prefix_output
         q = apply_qk_norm_rope(q, self.norm_q, rope)
         packed = None
@@ -797,8 +809,9 @@ class QwenImage21Attention(nn.Module):
     def forward(self, x, ropes, prefixes, layouts, caches, prefix_pad):
         # batch target projections while retaining each sample's unpadded prefix
         packed = self._project_qkv_packed(x, layouts, caches)
+        qkv = None
         if packed is not None:
-            q, k, v, k_out, v_out = packed
+            q, k, v, k_out, v_out, qkv = packed
         else:
             buffers = self._project_kv_into_buffers(x, layouts, caches)
             if buffers is None:
@@ -820,6 +833,7 @@ class QwenImage21Attention(nn.Module):
                 k_out=k_out,
                 v_out=v_out,
                 prefix_pad=prefix_pad,
+                qkv=qkv,
             )
             outputs.append(out)
             prefix_outputs.append(prefix_out)

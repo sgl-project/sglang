@@ -60,6 +60,7 @@ class PiflowScheduler(FlowMatchEulerDiscreteScheduler):
         self.final_step_size_scale = float(final_step_size_scale)
         self.num_policy_substeps = int(num_policy_substeps)
         self._piflow_raw_timesteps = torch.empty(0)
+        self._piflow_substeps: list[int] = []
 
     def set_timesteps(
         self,
@@ -87,6 +88,18 @@ class PiflowScheduler(FlowMatchEulerDiscreteScheduler):
         sigmas = shift_timesteps(raw, float(self.config.shift))
         self.num_inference_steps = int(num_inference_steps)
         self._piflow_raw_timesteps = raw
+        # each step's substep count, from a host copy of the same fp32 math
+        raw_host = (
+            1.0 - torch.arange(num_inference_steps, dtype=torch.float32) * segment
+        )
+        raw_dst_host = torch.cat([raw_host[1:], raw_host.new_full((1,), self.eps)])
+        self._piflow_substeps = (
+            ((raw_host - raw_dst_host) * self.num_policy_substeps)
+            .round()
+            .long()
+            .clamp(min=1)
+            .tolist()
+        )
         self.timesteps = sigmas * self.config.num_train_timesteps
         self.sigmas = torch.cat([sigmas, sigmas.new_zeros(1)])
         self._step_index = None
@@ -141,7 +154,7 @@ class PiflowScheduler(FlowMatchEulerDiscreteScheduler):
         delta = raw_t - raw_dst.expand(sample.shape[0]).reshape(token_shape)
         substeps = (delta * self.num_policy_substeps).round().long().clamp(min=1)
         substep_size = delta / substeps
-        for index in range(substeps.max().item()):
+        for index in range(self._piflow_substeps[step_index]):
             # the checkpoint predicts x0 on a grid in unwarped time
             policy_t = sigma / (shift + (1 - shift) * sigma)
             t = ((policy_t - policy_dst) / policy_segment).clamp(0, 1) * (

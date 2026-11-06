@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import json
 from typing import (
+    Any,
+    Dict,
     List,
     Literal,
     Optional,
@@ -32,6 +35,17 @@ from sglang.srt.model_executor.cuda_graph_config import (
     parse_cuda_graph_config_arg,
 )
 from sglang.srt.utils.common import human_readable_int
+
+
+def _paged_experts_num_resident(value: str) -> Optional[int]:
+    """``auto`` (None: as many as fit, sized after loading) or a positive count."""
+    if value == "auto":
+        return None
+    if value.isdigit() and int(value) > 0:
+        return int(value)
+    raise argparse.ArgumentTypeError(
+        f"must be 'auto' or a positive count, got {value!r}"
+    )
 
 
 class ExecFeatures(msgspec.Struct):
@@ -123,6 +137,38 @@ class ExecFeatures(msgspec.Struct):
             choices=["last", "full"],
         ),
     ] = None
+    # Changes what --speculative-algorithm means: with this flag it only names
+    # the capture convention (EAGLE3, DFLASH or DSPARK) and
+    # handle_aux_hidden_state_capture resets it to None, so no draft is loaded,
+    # nothing is reserved for one, and the speculative stack stays off.
+    enable_return_aux_hidden_states: A[
+        bool,
+        "Capture auxiliary hidden states on the target model without running a "
+        "speculative draft. --speculative-algorithm then only names the capture "
+        "convention (EAGLE3, DFLASH or DSPARK) and is reset to None. Requests "
+        "with return_hidden_states receive the concatenated aux hidden states in "
+        "place of the last-layer hidden states. Sets --return-hidden-states-mode "
+        "to full when unset. Requires pp_size == 1.",
+    ] = False
+    # The capture convention behind --enable-return-aux-hidden-states, taken from
+    # --speculative-algorithm. It stays an enum because the models' capture hooks
+    # still differ by draft family (layer-id conventions, mHC contraction).
+    # TODO: unify the per-family capture hooks, then collapse this to the bool.
+    aux_hidden_state_capture: A[
+        Optional[str],
+        Arg(
+            help="Resolved from --enable-return-aux-hidden-states and "
+            "--speculative-algorithm.",
+            no_cli=True,
+            resolvable=True,
+        ),
+    ] = None
+    return_aux_hidden_state_layer_ids: A[
+        Optional[List[int]],
+        "Target-model layer ids for the selected capture convention. These may "
+        "differ from draft-checkpoint layer ids. Required for DFLASH and DSPARK; "
+        "EAGLE3 defaults to the model's EAGLE3 layers.",
+    ] = None
     enable_return_routed_experts: A[
         bool, "Enable returning routed experts of each layer with responses."
     ] = False
@@ -147,6 +193,10 @@ class ExecFeatures(msgspec.Struct):
             resolvable=True,
         ),
     ] = None
+    enable_prefill_weight_versions: A[
+        bool,
+        "Enable returning the weight version that computed each prompt token's KV cache with responses, as meta_info['prefill_weight_versions'].",
+    ] = False
     sampling_mask_max_tokens: A[
         int,
         "The maximum number of token IDs in a returned sampling mask. Requests "
@@ -192,10 +242,14 @@ class ExecKernel(msgspec.Struct):
         Optional[bool],
         "Enable Lean (Work-Centric) Attention decode kernel for long-context serving. When None (default), uses auto-gate that activates Lean for long contexts and falls back to standard kernel for short contexts. Set to True to force enable, False to force disable.",
     ] = None
-    monokernel_backend: A[
-        Optional[str],
-        "Select a registered monokernel backend, e.g. amd from sgl-amd-mono. Supported decode and verify steps use persistent kernels; other steps use the standard forward. An unsupported startup configuration raises an error listing the reasons. Experimental feature.",
-    ] = None
+    enable_nvidia_megakernel: A[
+        bool,
+        "Enable the NVIDIA megakernel from the sgl-nvidia-mega package, or for MiniMax-M3.1 from the SGLang plugin of the MSA package. Supported decode and verify steps use its fused kernels; other steps use the standard forward. An unsupported startup configuration raises an error listing the reasons. Experimental feature.",
+    ] = False
+    enable_amd_monokernel: A[
+        bool,
+        "Enable the AMD monokernels from the sgl-amd-mono package. Supported decode and verify steps use persistent kernels; other steps use the standard forward. An unsupported startup configuration raises an error listing the reasons. Experimental feature.",
+    ] = False
     prefill_attention_backend: A[
         Optional[str],
         Arg(
@@ -237,7 +291,7 @@ class ExecKernel(msgspec.Struct):
     fp8_gemm_runner_backend: A[
         str,
         Arg(
-            help="Choose the runner backend for Blockwise FP8 GEMM operations. Options: 'auto' (default, auto-selects based on hardware; MXFP8 dense picks flashinfer_cutedsl on SM100/SM103 and FlashInfer CUTLASS on other supported Blackwell GPUs), 'deep_gemm' (JIT-compiled; enabled by default on NVIDIA Hopper (SM90) and Blackwell (SM100) when DeepGEMM is installed), 'flashinfer_trtllm' (optimal for Blackwell and low-latency), 'flashinfer_cutlass' (FlashInfer CUTLASS groupwise FP8 GEMM), 'flashinfer_cutedsl' (FlashInfer CuTe DSL MXFP8 GEMM on SM100/SM103), 'flashinfer_deepgemm' (Hopper SM90 only; uses swapAB optimization for small M dimensions in decoding), 'cutlass' (optimal for SM120 GPUs), 'triton' (fallback, widely compatible), 'aiter' (ROCm only). ",
+            help="Choose the runner backend for Blockwise FP8 GEMM operations. Options: 'auto' (default, auto-selects based on hardware; MXFP8 dense picks flashinfer_cutedsl on SM100/SM103 and FlashInfer CUTLASS on other supported Blackwell GPUs), 'deep_gemm' (JIT-compiled; enabled by default on NVIDIA Hopper (SM90) and Blackwell (SM100) when DeepGEMM is installed), 'flashinfer_trtllm' (optimal for Blackwell and low-latency), 'flashinfer_cutlass' (FlashInfer CUTLASS groupwise FP8 GEMM), 'flashinfer_cutedsl' (FlashInfer CuTe DSL MXFP8 GEMM on SM100/SM103), 'flashinfer_deepgemm' (Hopper SM90 only; uses swapAB optimization for small M dimensions in decoding), 'cutlass' (optimal for SM120 GPUs), 'triton' (fallback, widely compatible), 'aiter' (ROCm only), 'halops' (MXFP8 w8a8 dense GEMM from the optional HALOps wheel; SM100 only), 'xpu_scaled_mm' (Intel XPU only; torch scaled_mm, which auto already selects on XPU). ",
             cli_name="--fp8-gemm-backend",
             choices=FP8_GEMM_RUNNER_BACKEND_CHOICES,
             resolvable=True,
@@ -255,7 +309,7 @@ class ExecKernel(msgspec.Struct):
     bf16_gemm_backend: A[
         str,
         Arg(
-            help="Choose the backend for unquantized BF16 GEMM operations. Options: 'auto' (default; selects 'cutedsl' on SM10x GPUs, except deterministic inference selects 'torch'; otherwise uses cuBLAS via torch.nn.functional.linear), 'cutedsl' (SGLang JIT CuTe DSL TGV BF16 GEMM on SM10x; dispatches between the allowlisted low-M Split-K kernel, the CuTe DSL kernel, and cuBLAS; set SGLANG_ENABLE_BF16_SPLITK_GEMM=0 to disable Split-K), 'gemv', 'torch' (always uses cuBLAS via torch.nn.functional.linear).",
+            help="Choose the backend for unquantized BF16 GEMM operations. Options: 'auto' (default; selects 'cutedsl' on SM10x GPUs, except deterministic inference selects 'torch'; otherwise uses cuBLAS via torch.nn.functional.linear), 'cutedsl' (SGLang JIT CuTe DSL TGV BF16 GEMM on SM10x; dispatches between the allowlisted low-M Split-K kernel, the CuTe DSL kernel, and cuBLAS), 'gemv', 'torch' (always uses cuBLAS via torch.nn.functional.linear).",
             cli_name="--bf16-gemm-backend",
             choices=["auto", "cutedsl", "gemv", "torch"],
         ),
@@ -288,9 +342,17 @@ class ExecKernel(msgspec.Struct):
             help=(
                 "DeepSeek-V4 sparse prefill backend. 'auto' and "
                 "'flashmla_sparse' use the existing BF16 sparse prefill path; "
-                "'flashmla_sparse_q8' enables the Q8KV8 sparse prefill path."
+                "'flashmla_sparse_q8' enables the Q8KV8 sparse prefill path; "
+                "'cutedsl_h16' enables experimental DeepSeek-V4 BF16 sparse "
+                "prefill for 16 TP-local query heads on SM90. Only ordinary "
+                "eager prefill uses H16; graph, speculative, TBO, CP and "
+                "bounded-replay paths retain the existing backend. "
+                "DeepSeek-V4.1 is not supported. Padded combined TOPK is limited "
+                "to 16384 (including the SWA window); the default 1M context "
+                "fits this limit. Sparse-prefill threshold and environment "
+                "selection remain unchanged."
             ),
-            choices=["auto", "flashmla_sparse", "flashmla_sparse_q8"],
+            choices=["auto", "flashmla_sparse", "flashmla_sparse_q8", "cutedsl_h16"],
         ),
     ] = "auto"
     dsa_triton_union: A[
@@ -328,7 +390,9 @@ class ExecKernel(msgspec.Struct):
         str,
         Arg(
             help="DeepSeek V4 attention backend. 'auto' (default) resolves to "
-            "'flashmla_mega' where it is supported and 'flashmla' otherwise. "
+            "'flashmla' where 'flashmla_mega' is unsupported or, outside PD "
+            "disaggregation, where attention is tensor-parallel across ranks "
+            "(attention TP > 1), and to 'flashmla_mega' otherwise. "
             "'trtllm' (opt-in, SM100/SM103 with FP8 KV cache) "
             "switches the SWA/compressed KV pools to a "
             "uniform 512-dim FP8 layout and runs decode and sparse prefill "
@@ -403,6 +467,10 @@ class ExecKernel(msgspec.Struct):
     enable_deepseek_v4_fp4_indexer: A[
         bool,
         "Enable the experimental FP4 C4 indexer path for DeepSeek V4. Default keeps the existing indexer implementation.",
+    ] = False
+    enable_fp4_indexer: A[
+        bool,
+        "Use FP4 queries and index-K cache in the DSA lightning indexer of DeepSeek-V3.2-style sparse attention, ERNIE 5.5 Flash's MLA layers included; requires SM100. DeepSeek V4's C4 indexer has its own switch, --enable-deepseek-v4-fp4-indexer. Default keeps the FP8 indexer.",
     ] = False
     enable_dsa_fused_indexer: A[
         Optional[bool],
@@ -760,7 +828,7 @@ class ExecComm(msgspec.Struct):
         Arg(
             help=(
                 "Disable Aiter AllReduce Fusion for prefill batches "
-                "(EXTEND / MIXED / SPLIT_PREFILL) while keeping it for decode. "
+                "(EXTEND / MIXED) while keeping it for decode. "
                 "Only meaningful with --enable-aiter-allreduce-fusion."
             ),
             resolvable=True,
@@ -808,7 +876,7 @@ class ExecMoe(msgspec.Struct):
             "flashinfer",
             "megamoe",
             "deepep_v2",
-            "ascend_tp",
+            "ascend_ops",
             "pplx",
             "flashinfer_megamoe",
         ],
@@ -825,7 +893,7 @@ class ExecMoe(msgspec.Struct):
                 "megamoe",
                 "deepep_v2",
                 "pplx",
-                "ascend_tp",
+                "ascend_ops",
                 "flashinfer_megamoe",
             ],
             resolvable=True,
@@ -912,6 +980,14 @@ class ExecMoe(msgspec.Struct):
         Optional[str],
         "Tuned DeepEP config suitable for your own cluster. It can be either a string with JSON content or a file path.",
     ] = None
+    moe_ascend_ops_config: A[
+        Optional[str],
+        (
+            "Configuration for the ascend_ops MoE backend used by the main "
+            "model and/or speculative draft as a JSON object, "
+            'for example {"prefill":"alltoallv","decode":"low_latency"}.'
+        ),
+    ] = None
     elastic_ep_backend: A[
         Literal[None, "mooncake", "nixl"],
         Arg(
@@ -954,7 +1030,7 @@ class ExecMoe(msgspec.Struct):
     ] = False
     enforce_shared_experts_fusion: A[
         bool,
-        "Enforce shared experts fusion even when it would normally be disabled (e.g. under DeepEP). Mutually exclusive with --disable-shared-experts-fusion.",
+        "Enforce shared experts fusion even when it would normally be disabled (e.g. under DeepEP). On a Quark MXFP4 Qwen3.5/Qwen3.8 checkpoint that excludes its shared expert from quantization, this also quantizes that shared expert to MXFP4 while loading so it can be fused, which runs its weights and its input activations at MXFP4 where the standalone path ran in BF16 - validate accuracy before using it. Mutually exclusive with --disable-shared-experts-fusion.",
     ] = False
 
     # -------------------------------------------------------------------------
@@ -962,15 +1038,22 @@ class ExecMoe(msgspec.Struct):
     # -------------------------------------------------------------------------
     enable_paged_experts: A[
         bool,
-        "Keep only --paged-experts-num-resident routed experts per MoE layer on the GPU and page "
-        "the rest from pinned host memory on demand. Unquantized, block-FP8 or GPTQ experts, "
-        "single GPU. Decode CUDA graphs (full backend) are captured up to K // top_k requests; "
-        "prefill graphs must be breakable or disabled.",
+        "Keep only --paged-experts-num-resident (K) routed experts per MoE layer on the GPU and "
+        "page the rest from pinned host memory on demand. Single GPU; the experts must run on the "
+        "triton or Marlin MoE runner (supported quantizations: see the Paged Experts docs). "
+        "Decode CUDA graphs (full backend) are captured up to K // top_k requests; prefill "
+        "graphs must be breakable or disabled.",
     ] = False
     paged_experts_num_resident: A[
         Optional[int],
-        "Number of routed experts per MoE layer kept resident on the GPU. Required with "
-        "--enable-paged-experts; at least the router's top-k.",
+        Arg(
+            help="Number of routed experts per MoE layer kept resident on the GPU, at least the "
+            "router's top-k; or 'auto' (the default): as many as fit in --mem-fraction-static "
+            "next to a KV cache of --max-total-tokens, else of up to --max-running-requests, if "
+            "you set it (else 1), requests of --context-length (default: the model's), at "
+            "least one.",
+            type_parser=_paged_experts_num_resident,
+        ),
     ] = None
 
     # -------------------------------------------------------------------------
@@ -1077,6 +1160,17 @@ class ExecOffload(msgspec.Struct):
             "$SGLANG_CACHE_DIR/ple/<model path>, one directory per checkpoint. "
             "The file is sparse and reused across restarts; put it on fast "
             "local storage (NVMe).",
+        ),
+    ] = None
+    engram_config: A[
+        Optional[Dict[str, Any]],
+        Arg(
+            help="Where the DeepSeek-V4.1 Engram tables live, as JSON: "
+            "'placement' gpu|cpu, 'replication' none|per_node, 'lookup' "
+            "auto|all_reduce|reduce_scatter|all_to_all|peer_read; an omitted key "
+            "takes the first value. "
+            "See docs/advanced_features/engram.",
+            type_parser=json.loads,
         ),
     ] = None
 

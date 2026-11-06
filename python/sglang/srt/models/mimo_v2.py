@@ -23,13 +23,13 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from sglang.kernels.ops.gemm.bf16_fp32 import linear_bf16_fp32
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_stages
 from sglang.srt.configs.model_config import get_mimo_v2_fused_qkv_expected_tp_size
 from sglang.srt.distributed.utils import get_group_rank_size
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
@@ -47,9 +47,9 @@ from sglang.srt.layers.layer_boundary import (
 )
 from sglang.srt.layers.layer_boundary.fusions.cutedsl import (
     CuteDSLFusion,
-    MoeDeferredFinalize,
     install_cutedsl_fusion,
 )
+from sglang.srt.layers.layer_boundary.fusions.moe_finalize import MoeDeferredFinalize
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -60,10 +60,7 @@ from sglang.srt.layers.linear import (
     resolve_linear_parallel_group,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe import (
-    get_moe_a2a_backend,
-    get_moe_runner_backend,
-)
+from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.topk import (
     TopK,
@@ -71,7 +68,11 @@ from sglang.srt.layers.moe.topk import (
     TopKOutputFormat,
     is_expert_remapping_enabled,
 )
-from sglang.srt.layers.moe.utils import is_deepep_class_backend, sum_post_experts_output
+from sglang.srt.layers.moe.utils import (
+    RoutingMethodType,
+    is_deepep_class_backend,
+    sum_post_experts_output,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
     Mxfp4FlashinferTrtllmMoEMethod,
@@ -80,6 +81,8 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -89,11 +92,7 @@ from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
     pad_mm_tokens,
 )
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputs,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
@@ -101,23 +100,31 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.mimo_audio import AudioEncoderMixin, MiMoAudioEncoderConfig
 from sglang.srt.models.mimo_vl import MiMoVisionTransformer, MiMoVLVisionConfig
+from sglang.srt.models.utils import is_non_idle_and_non_empty
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import (
     get_exec,
     get_flags,
     get_forward,
     get_parallel,
 )
-from sglang.srt.utils import (
-    LazyValue,
-    add_prefix,
-    ceil_align,
-    is_non_idle_and_non_empty,
-    make_pp_layers,
-)
+from sglang.srt.utils import LazyValue, ceil_align
 
 MiMoV2Config = None
 
 logger = logging.getLogger(__name__)
+
+# Minimum m (num_tokens) from which the HPC-Ops bf16xfp32 router GEMM is at
+# least as fast as cublas, benchmarked per router shape
+# (hidden_size, n_routed_experts) on H100; below it the dispatcher falls back.
+# Opt-in via SGLANG_OPT_BF16_FP32_GEMM_ALGO=hpc, for two reasons: the split
+# fp32 weight moves router logits by up to ~1e-4, enough to reorder near-tied
+# experts so generations are not bit-identical to the cublas path, and the
+# cached weight split rejects online weight updates.
+_MIMO_V2_ROUTER_HPC_GEMM_MIN_M = {
+    # MiMo-V2.5-Flash: 4096 hidden size, 256 routed experts.
+    (4096, 256): 8,
+}
 
 
 def load_mimo_v2_qkv_proj_weight(
@@ -381,20 +388,27 @@ class MoEGate(nn.Module):
             torch.empty((config.n_routed_experts, config.hidden_size), dtype=self.dtype)
         )
         if config.topk_method == "noaux_tc":
-            correction_bias_dtype = (
-                torch.bfloat16
-                if quant_config is not None
-                and quant_config.get_name() == "modelopt_fp4"
-                and get_moe_runner_backend().is_flashinfer_trtllm()
-                else torch.float32
-            )
             self.e_score_correction_bias = nn.Parameter(
-                torch.empty((config.n_routed_experts), dtype=correction_bias_dtype)
+                torch.empty((config.n_routed_experts), dtype=torch.float32)
             )
         else:
             self.e_score_correction_bias = None
+        self.hpc_kernel_min_m = (
+            _MIMO_V2_ROUTER_HPC_GEMM_MIN_M.get(
+                (config.hidden_size, config.n_routed_experts)
+            )
+            if self.dtype == torch.float32
+            and envs.SGLANG_OPT_BF16_FP32_GEMM_ALGO.get() == "hpc"
+            else None
+        )
 
     def forward(self, hidden_states):
+        if self.hpc_kernel_min_m is not None:
+            return linear_bf16_fp32(
+                hidden_states,
+                self.weight,
+                hpc_kernel_min_m=self.hpc_kernel_min_m,
+            )
         if self.dtype != torch.float32 and hidden_states.is_cuda:
             return torch.mm(
                 hidden_states.to(self.dtype),
@@ -440,6 +454,11 @@ class MiMoV2MoE(nn.Module):
             is_nextn=is_nextn,
         )
 
+        routing_method_type = (
+            RoutingMethodType.DeepSeekV3
+            if self.gate.e_score_correction_bias is not None and config.norm_topk_prob
+            else None
+        )
         experts_type = get_moe_impl_class(quant_config)
         self.experts = experts_type(
             num_experts=config.n_routed_experts
@@ -450,6 +469,7 @@ class MiMoV2MoE(nn.Module):
             layer_id=self.layer_id,
             quant_config=quant_config,
             routed_scaling_factor=1.0,
+            routing_method_type=routing_method_type,
             prefix=add_prefix("experts", prefix),
         )
 
@@ -469,6 +489,10 @@ class MiMoV2MoE(nn.Module):
             # Some Fp4 MoE backends require the output format to be bypassed but the MTP layers are unquantized
             # and requires the output format to be standard. We use quant_config to determine the output format.
             output_format=TopKOutputFormat.STANDARD if quant_config is None else None,
+        )
+        self.topk.bind_runner_backend(
+            self.experts.runner_backend,
+            routing_method_type=self.experts.routing_method_type,
         )
 
         uses_mxfp4_runner = isinstance(
@@ -545,11 +569,6 @@ class MiMoV2MoE(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                expert_location_dispatch_info=(
-                    ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
-                    if self._uses_expert_remap
-                    else None
-                ),
             )
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
@@ -581,10 +600,6 @@ class MiMoV2MoE(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=forward_batch.moe_num_token_non_padded(),
-                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                    layer_id=self.layer_id,
-                ),
             )
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
@@ -614,10 +629,6 @@ class MiMoV2MoE(nn.Module):
                 state.topk_output = self.topk(
                     hidden_states=hidden_states,
                     router_logits=router_logits,
-                    num_token_non_padded=state.forward_batch.moe_num_token_non_padded(),
-                    expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                        layer_id=self.layer_id,
-                    ),
                 )
         else:
             state.topk_output = self.topk.empty_topk_output(hidden_states.device)
@@ -708,6 +719,9 @@ class MiMoV2Attention(nn.Module):
         self.v_size = self.num_kv_heads * self.v_head_dim
 
         self.v_scale = v_scale
+        # Set once attention_value_scale has been folded into o_proj weights,
+        # disabling the runtime V multiply (see _fold_attention_value_scale_into_o_proj).
+        self.v_scale_folded = False
 
         self.scaling = self.head_dim**-0.5
 
@@ -785,7 +799,7 @@ class MiMoV2Attention(nn.Module):
         q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
 
         q, k = self.rotary_emb(positions, q, k)
-        if self.v_scale is not None:
+        if self.v_scale is not None and not self.v_scale_folded:
             v = v * self.v_scale
 
         inner_state = q, k, v, forward_batch
@@ -809,7 +823,9 @@ class MiMoV2Attention(nn.Module):
             qkv,
             positions,
             get_attn_backend().get_fused_kv_write_buffers(self.attn, forward_batch),
-            value_scale=1.0 if self.v_scale is None else self.v_scale,
+            value_scale=(
+                1.0 if self.v_scale is None or self.v_scale_folded else self.v_scale
+            ),
         )
         if query is None:
             return None
@@ -844,7 +860,7 @@ class MiMoV2Attention(nn.Module):
         q, k = self.rotary_emb(positions, q, k)
         # [t, h, d]
 
-        if self.v_scale is not None:
+        if self.v_scale is not None and not self.v_scale_folded:
             v = v * self.v_scale
         attn_output = self.attn(q, k, v, forward_batch, sinks=self.attention_sink_bias)
         output, _ = self.o_proj(attn_output)
@@ -1760,6 +1776,44 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                 expected_fused_tp_size,
                 config=self.config,
                 model=self,
+            )
+
+        self._fold_attention_value_scale_into_o_proj()
+
+    def _fold_attention_value_scale_into_o_proj(self) -> None:
+        """Fold ``attention_value_scale`` into the o_proj weights.
+
+        Attention is linear in V: ``softmax(qk) @ (s*V) == s * (softmax(qk) @ V)``,
+        so scaling every o_proj weight by s reproduces the runtime
+        ``v = v * v_scale`` exactly while removing one Muls kernel per layer on
+        the NPU decode path. Only applies to floating-point (unquantized)
+        o_proj weights; quantized ones keep the runtime multiply. KV caches
+        then hold unscaled V, which stays self-consistent because every
+        consumer of V goes through this layer's (folded) o_proj.
+        """
+        v_scale = getattr(self.config, "attention_value_scale", None)
+        if v_scale is None:
+            return
+        folded = skipped = 0
+        for layer in self.model.layers:
+            attn = layer.self_attn
+            weight = attn.o_proj.weight
+            if weight.dtype in (torch.float16, torch.bfloat16, torch.float32):
+                weight.data.mul_(v_scale)
+                attn.v_scale_folded = True
+                folded += 1
+            else:
+                skipped += 1
+        if folded:
+            logger.info(
+                f"Folded attention_value_scale={v_scale} into {folded} o_proj "
+                "weight(s); runtime V scaling disabled for them."
+            )
+        if skipped:
+            logger.warning(
+                f"attention_value_scale={v_scale} kept as runtime multiply for "
+                f"{skipped} layer(s) with non-fp16/bf16/fp32 o_proj (cannot "
+                "fold into quantized weights)."
             )
 
     def get_embed_and_head(self):
