@@ -31,7 +31,7 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers import zero_copy_context
 from sglang.srt.layers.activation import SiluAndMul, SituAndMul
-from sglang.srt.layers.attn_residual import aggregate_stream, get_cw
+from sglang.srt.layers.attn_residual import aggregate_stream, refresh_cw
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
     AuxHiddenStateList,
@@ -143,6 +143,7 @@ from sglang.srt.utils import is_hip, is_npu, make_pp_layers
 from sglang.srt.utils.common import (
     BumpAllocator,
     add_prefix,
+    bind_or_assign,
     get_bool_env_var,
     rank0_log,
     set_weight_attrs,
@@ -724,6 +725,10 @@ class KimiK3MoE(nn.Module):
         quantized or mixed-dtype checkpoints keep the unfused path.
         """
         if not self.use_latent_moe:
+            return
+        if self._front_w is not None:
+            # Merged by an earlier load: the module weights are views of it, so
+            # a weight update writes through to the buffer CUDA graphs hold.
             return
         # These merged layouts feed CUDA and ROCm fused front kernels. Keeping the
         # regular parameters on other devices avoids a large transient copy
@@ -1852,16 +1857,21 @@ class KimiK3DeltaAttention(nn.Module):
         and the width is padded to a multiple of 8 so every fused-output row
         stays 16-byte aligned for vectorized consumers (tiny-GEMM on f_b).
 
-        Called once after weight loading. Block-FP8 inputs are dequantized into
-        the BF16 tiny-GEMM buffers here."""
+        Called after every weight load. Block-FP8 inputs are dequantized into
+        the BF16 tiny-GEMM buffers here, in place once built: captured CUDA
+        graphs hold them."""
         if not self.use_full_rank_gate:
             return
         if _is_npu:
             return
+        if self._bfa_w is not None and not self._bfa_uses_block_fp8:
+            # Merged by an earlier load: the module weights are views of _bfa_w
+            # (or of the ROCm in-proj buffer), so updates write through.
+            return
         if _is_hip and self._merge_kda_inproj_weights_hip():
             # Split-path f_b GEMM still uses this when the fused in-proj
             # is above the token threshold.
-            self._bfa_f_b_w = self.f_b_proj.weight
+            self._bfa_f_b_w = self.f_b_proj.weight.data
             return
         mods = [self.f_a_proj, self.b_proj]
         if self._bfa_uses_block_fp8:
@@ -1870,8 +1880,12 @@ class KimiK3DeltaAttention(nn.Module):
             pad = (-sum(sizes)) % 8
             if pad:
                 weights.append(weights[0].new_zeros((pad, weights[0].shape[1])))
-            self._bfa_w = torch.cat(weights, dim=0).contiguous()
-            self._bfa_f_b_w = _get_k3_dense_weight(self.f_b_proj).contiguous()
+            self._bfa_w = bind_or_assign(
+                self._bfa_w, torch.cat(weights, dim=0).contiguous()
+            )
+            self._bfa_f_b_w = bind_or_assign(
+                self._bfa_f_b_w, _get_k3_dense_weight(self.f_b_proj).contiguous()
+            )
         else:
             if any(getattr(mod, "weight", None) is None for mod in mods):
                 return
@@ -1881,7 +1895,7 @@ class KimiK3DeltaAttention(nn.Module):
             if _is_hip and not _is_unquantized_mergeable([mod.weight for mod in mods]):
                 return
             self._bfa_w, sizes = _merge_weights_as_views(mods, pad_rows_to=8)
-            self._bfa_f_b_w = self.f_b_proj.weight
+            self._bfa_f_b_w = self.f_b_proj.weight.data
         self._bfa_fa_size, self._bfa_b_size = sizes
 
     def _merge_kda_inproj_weights_hip(self) -> bool:
@@ -2045,15 +2059,20 @@ class KimiK3DeltaAttention(nn.Module):
             if bias is not None
             else torch.zeros(3 * seg, dtype=torch.float32, device=w.device)
         )
-        layer._k3_fused_decode_args = (
+        tensors = (
             wt[:, :seg].contiguous(),
             wt[:, seg : 2 * seg].contiguous(),
             wt[:, 2 * seg :].contiguous(),
             conv_bias,
             layer.A_log.detach().reshape(-1),  # view; kernel wants [heads]
             self.o_norm.weight.data.float().contiguous(),
-            float(self.o_norm.eps),
         )
+        if self._kda_fused_decode_ready:
+            # Captured CUDA graphs hold the tensors built first.
+            tensors = tuple(
+                map(bind_or_assign, layer._k3_fused_decode_args[:-1], tensors)
+            )
+        layer._k3_fused_decode_args = (*tensors, float(self.o_norm.eps))
         self._kda_fused_decode_ready = True
 
     def forward_qkvbfg_fused(
@@ -3141,6 +3160,7 @@ class KimiK3LinearForCausalLM(nn.Module):
         logit_scale = getattr(config, "logit_scale", 1.0)
         self.logits_processor = LogitsProcessor(config=config, logit_scale=logit_scale)
         self.capture_aux_hidden_states = False
+        self._kda_prefill_precompiled = False
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
@@ -3427,7 +3447,7 @@ class KimiK3LinearForCausalLM(nn.Module):
             loaded_params.add(name)
 
         self._check_dsa_indexer_loaded(loaded_params)
-        self.post_load_weights()
+        self.post_load_weights(weight_names=loaded_params)
         return loaded_params
 
     def _check_dsa_indexer_loaded(self, loaded_params: set[str]) -> None:
@@ -3442,18 +3462,31 @@ class KimiK3LinearForCausalLM(nn.Module):
             f"e.g. {missing[:4]}"
         )
 
-    def post_load_weights(self):
+    def post_load_weights(self, weight_names: Optional[Iterable[str]] = None):
+        """Rebuild the tensors derived from the weights of the layers that
+        ``weight_names`` belong to (all layers when None), as deepseek_v2 does.
+        Any name of a layer selects it: K3 derives tensors from most of its
+        modules, not only kv_b_proj. A rebuild writes into the tensors built
+        first, which captured CUDA graphs hold."""
         # Also invoked by loader post-load hooks (DummyModelLoader,
         # ShardedStateLoader, remote-instance flows -- none of which call
         # load_weights), so e.g. dummy-weight benchmarks get the fused buffers.
+        layer_ids = (
+            None
+            if weight_names is None
+            else {get_layer_id(name) for name in weight_names} - {None}
+        )
+        layers = {
+            layer_id: layer
+            for layer_id, layer in enumerate(self.model.layers)
+            if not isinstance(layer, PPMissingLayer)
+            and (layer_ids is None or layer_id in layer_ids)
+        }
         # Post-load: absorb kv_b_proj into w_kc and w_vc for MLA layers
         for layer_id in self.config.full_attention_layer_ids:
-            if layer_id >= len(self.model.layers):
-                continue  # truncated config (e.g. num_hidden_layers override)
-            layer = self.model.layers[layer_id]
-            if isinstance(layer, PPMissingLayer):
-                continue
-            self_attn = layer.self_attn
+            if layer_id not in layers:
+                continue  # also a truncated config (num_hidden_layers override)
+            self_attn = layers[layer_id].self_attn
             if getattr(self_attn, "_kimi_split_gguf_kv_b", False):
                 if int(self_attn.k_b_qweight_type.weight_type) != 2:
                     raise ValueError("Kimi-K3 MLA K projection must remain GGUF Q4_0")
@@ -3482,8 +3515,12 @@ class KimiK3LinearForCausalLM(nn.Module):
             w_kc, w_vc = kv_b_weight.unflatten(
                 0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
             ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
-            self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
-            self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
+            self_attn.w_kc = bind_or_assign(
+                self_attn.w_kc, w_kc.transpose(1, 2).contiguous().transpose(1, 2)
+            )
+            self_attn.w_vc = bind_or_assign(
+                self_attn.w_vc, w_vc.contiguous().transpose(1, 2)
+            )
             kv_b_scale = getattr(self_attn.kv_b_proj, "weight_scale", None)
             if _is_hip and (
                 scale_folded_into_weight
@@ -3500,30 +3537,27 @@ class KimiK3LinearForCausalLM(nn.Module):
                 # a float in its place.
                 pass
             elif hasattr(self_attn.kv_b_proj, "weight_scale"):
-                self_attn.w_scale = self_attn.kv_b_proj.weight_scale
+                # .data: a Parameter would register under w_scale and hide
+                # kv_b_proj.weight_scale from named_parameters(), so from updates.
+                self_attn.w_scale = self_attn.kv_b_proj.weight_scale.data
 
         # Post-load: precompute the attn-res combined score weights BEFORE
         # cuda graph capture (a lazy first call inside get_cw would bake the
-        # multiply into every replay). Warm both dtypes (bf16 fast kernel,
-        # fp32 triton fallback).
-        def _warm_cw(proj, norm):
-            get_cw(proj, norm, dtype=torch.bfloat16)
-            get_cw(proj, norm)
-
-        for layer in self.model.layers:
-            if isinstance(layer, PPMissingLayer):
-                continue
+        # multiply into every replay).
+        for layer in layers.values():
             if layer.use_attn_residuals:
-                _warm_cw(layer.self_attention_res_proj, layer.self_attention_res_norm)
-                _warm_cw(layer.mlp_res_proj, layer.mlp_res_norm)
-        if hasattr(self.model, "output_attn_res_proj"):
-            _warm_cw(self.model.output_attn_res_proj, self.model.output_attn_res_norm)
+                refresh_cw(layer.self_attention_res_proj, layer.self_attention_res_norm)
+                refresh_cw(layer.mlp_res_proj, layer.mlp_res_norm)
+        # The output aggregation belongs to no layer: selected by its own names.
+        if hasattr(self.model, "output_attn_res_proj") and (
+            weight_names is None
+            or any("output_attn_res" in name for name in weight_names)
+        ):
+            refresh_cw(self.model.output_attn_res_proj, self.model.output_attn_res_norm)
 
         # Post-load: merge the horizontally-fused decode weights (views of the
         # merged buffers, ~0 extra memory); must run before cuda graph capture.
-        for layer in self.model.layers:
-            if isinstance(layer, PPMissingLayer):
-                continue
+        for layer in layers.values():
             if isinstance(layer.mlp, KimiK3MoE):
                 layer.mlp._merge_front_weights()
                 # Convert the correction bias to fp32 once so the per-call
@@ -3536,6 +3570,8 @@ class KimiK3LinearForCausalLM(nn.Module):
                 layer.self_attn._merge_bfa_weights()
                 layer.self_attn._prepare_fused_decode()
 
+        if self._kda_prefill_precompiled:
+            return
         for layer in self.model.layers:
             if isinstance(layer, PPMissingLayer) or not isinstance(
                 layer.self_attn, KimiK3DeltaAttention
@@ -3558,6 +3594,7 @@ class KimiK3LinearForCausalLM(nn.Module):
             ):
                 rank0_log("Precompiled the Kimi-K3 KDA prefill kernel.")
             break
+        self._kda_prefill_precompiled = True
 
 
 class KimiK3ForConditionalGeneration(nn.Module):

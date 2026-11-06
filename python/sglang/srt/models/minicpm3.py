@@ -40,7 +40,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, is_cuda
+from sglang.srt.utils import add_prefix, bind_or_assign, is_cuda
 
 if is_cuda():
     from sglang.kernels.ops.gemm import bmm_fp8
@@ -507,10 +507,14 @@ class MiniCPM3ForCausalLM(nn.Module):
             w_kc, w_vc = self_attn.kv_b_proj.weight.unflatten(
                 0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
             ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
-            self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
-            self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
+            self_attn.w_kc = bind_or_assign(
+                self_attn.w_kc, w_kc.transpose(1, 2).contiguous().transpose(1, 2)
+            )
+            self_attn.w_vc = bind_or_assign(
+                self_attn.w_vc, w_vc.contiguous().transpose(1, 2)
+            )
             if hasattr(self_attn.kv_b_proj, "weight_scale"):
-                self_attn.w_scale = self_attn.kv_b_proj.weight_scale
+                self_attn.w_scale = self_attn.kv_b_proj.weight_scale.data
             del self_attn.kv_b_proj
 
 
