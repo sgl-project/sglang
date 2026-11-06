@@ -577,11 +577,17 @@ class DeepseekSparseAttnBackend(
         self.dsa_packed_extend_topk = _is_hip or is_kimi_k31(hf_config)
         self.dsa_index_kpool = get_dsa_index_kpool(hf_config)
         self.physical_page_size = model_runner.page_size // self.dsa_index_kpool
-        sharded_dcp = dsa_shards_index_k()
-        self.attn_dcp_size = get_parallel().attn_dcp_size if sharded_dcp else 1
-        self.attn_dcp_rank = get_parallel().attn_dcp_rank if sharded_dcp else 0
-        self.real_page_span = self.physical_page_size * self.attn_dcp_size
-        if self.attn_dcp_size > 1 and self.dsa_index_kpool > 1:
+        self.dsa_shards_index_k = dsa_shards_index_k()
+        if model_runner.is_draft_worker and not dsa_draft_shards_under_dcp(
+            model_runner.model_config.hf_config, get_parallel().attn_dcp_size
+        ):
+            self.attn_dcp_size, self.attn_dcp_rank = 1, 0
+        else:
+            self.attn_dcp_size = get_parallel().attn_dcp_size
+            self.attn_dcp_rank = get_parallel().attn_dcp_rank
+        sharded_dcp_size = self.attn_dcp_size if self.dsa_shards_index_k else 1
+        self.real_page_span = self.physical_page_size * sharded_dcp_size
+        if self.dsa_shards_index_k and self.dsa_index_kpool > 1:
             raise ValueError("DSA index kpool does not support --dcp-size > 1.")
         self._init_kpool_metadata_fusion()
         self.max_context_len = model_runner.model_config.context_len
@@ -592,18 +598,8 @@ class DeepseekSparseAttnBackend(
         self.local_num_q_heads = (
             model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
         )
-        self.num_q_heads = self.local_num_q_heads * self.attn_dcp_size
-        if (
-            model_runner.is_draft_worker
-            and not dsa_draft_shards_under_dcp(
-                model_runner.model_config.hf_config, get_parallel().attn_dcp_size
-            )
-        ) or sharded_dcp:
-            self.dcp_size, self.dcp_rank = 1, 0
-        else:
-            self.dcp_size = get_parallel().attn_dcp_size
-            self.dcp_rank = get_parallel().attn_dcp_rank
-        self.num_dcp_q_heads = self.num_q_heads * self.dcp_size
+        self.num_q_heads = self.local_num_q_heads * sharded_dcp_size
+        self.num_dcp_q_heads = self.local_num_q_heads * self.attn_dcp_size
         self._dcp_page_table_cache = DcpPageTableCache()
         self.kv_cache_dim = model_runner.token_to_kv_pool.kv_cache_dim
         self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
@@ -623,8 +619,8 @@ class DeepseekSparseAttnBackend(
         # Dense MHA expands prefix KV outside the DSA metadata path. Keep
         # sharded prefill on the sparse kernels with explicit scratch addresses.
         self.supports_mha_one_shot: bool = (
-            self.dcp_size == 1 and self._kv_shard_pool is None
-        )
+            self.attn_dcp_size == 1 or self.dsa_shards_index_k
+        ) and self._kv_shard_pool is None
         self.dsa_prefill_impl: _DSA_IMPL_T = get_exec().kernel.dsa_prefill_backend
         self.dsa_decode_impl: _DSA_IMPL_T = get_exec().kernel.dsa_decode_backend
         if (
@@ -731,7 +727,7 @@ class DeepseekSparseAttnBackend(
             print_warning_once(
                 "Disabling fused DSA top-k for IndexShare under PD disaggregation."
             )
-        if self.attn_dcp_size > 1:
+        if self.dsa_shards_index_k:
             max_rows = max(model_runner.max_running_requests, 1)
             # The fused merge returns only this rank's slots; top-k capture needs all.
             if (
@@ -840,7 +836,8 @@ class DeepseekSparseAttnBackend(
             self.workspace_buffer = get_buffer(
                 "dsa_trtllm_workspace",
                 lambda: torch.empty(
-                    envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get() * self.dcp_size,
+                    envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get()
+                    * (1 if self.dsa_shards_index_k else self.attn_dcp_size),
                     dtype=torch.uint8,
                     device=model_runner.device,
                 ),
@@ -1034,7 +1031,7 @@ class DeepseekSparseAttnBackend(
         )
 
     def _dcp_local_ctx_lens(self, ctx_lens: torch.Tensor) -> torch.Tensor:
-        if self.attn_dcp_size == 1:
+        if not self.dsa_shards_index_k:
             return ctx_lens
         return get_dcp_lens(ctx_lens, self.attn_dcp_size, self.attn_dcp_rank).to(
             ctx_lens.dtype
@@ -1420,7 +1417,7 @@ class DeepseekSparseAttnBackend(
                     topk_transform_method == TopkTransformMethod.RAGGED
                     or mha_dequantize_needed
                 )
-            ) or self.attn_dcp_size > 1:
+            ) or self.dsa_shards_index_k:
                 page_table_1_flattened = torch.cat(
                     [
                         page_table[i, :kv_len]
@@ -1442,7 +1439,7 @@ class DeepseekSparseAttnBackend(
                     # Sharded extends index scratch rows, bounded by construction.
                     not kv_shard_extend
                     and forward_batch.seq_lens_sum > kv_cache_capacity
-                    and self.attn_dcp_size == 1
+                    and not self.dsa_shards_index_k
                 ):
                     max_idx = page_table_1_flattened.max().item()
                     assert max_idx < kv_cache_capacity, (
@@ -1533,7 +1530,7 @@ class DeepseekSparseAttnBackend(
                     indexer_seq_lens_cpu,
                 )
                 // self.attn_dcp_size
-                if self.attn_dcp_size > 1 and page_table_1_flattened is not None
+                if self.dsa_shards_index_k and page_table_1_flattened is not None
                 else None
             ),
             indexer_k_start_end=indexer_k_start_end,
@@ -2387,7 +2384,7 @@ class DeepseekSparseAttnBackend(
 
         # Do absorbed multi-latent attention (MLA path)
         kv_cache = self.kv_layers.read(layer.layer_id).key()
-        if self.attn_dcp_size > 1:
+        if self.dsa_shards_index_k:
             kv_cache = self.dcp_gather_kv_cache(kv_cache, forward_batch, metadata)
 
         if q_rope is not None:
@@ -2491,7 +2488,7 @@ class DeepseekSparseAttnBackend(
                 v_head_dim=layer.v_head_dim,
             )
         elif dsa_impl == "triton":
-            if _is_hip and self.dcp_size > 1:
+            if _is_hip and self.attn_dcp_size > 1 and not self.dsa_shards_index_k:
                 assert topk_transform_method == TopkTransformMethod.PAGED
                 return self._forward_triton_dcp(
                     q_nope=q_nope,
@@ -2827,7 +2824,7 @@ class DeepseekSparseAttnBackend(
                 layer=layer,
                 metadata=metadata,
                 page_table_1=page_table_1,
-                dcp_partial=self.attn_dcp_size > 1,
+                dcp_partial=self.dsa_shards_index_k,
             )
         elif dsa_impl == "tilelang":
             # Cat-skip (HIP-only): when caller passes q_rope=None on HIP, q_all
@@ -2846,7 +2843,7 @@ class DeepseekSparseAttnBackend(
         elif dsa_impl == "triton":
             # CUDA keeps upstream's dispatch: #43735 wires DCP to the trtllm
             # backends, and this localized path has only been run on ROCm.
-            if _is_hip and self.dcp_size > 1:
+            if _is_hip and self.attn_dcp_size > 1 and not self.dsa_shards_index_k:
                 return self._forward_triton_dcp(
                     q_nope=q_nope,
                     q_rope=q_rope,
@@ -3493,7 +3490,7 @@ class DeepseekSparseAttnBackend(
         num_q_heads = q_all.shape[2]
         target_q_heads = (
             self.flashmla_kv_num_q_heads_prefill
-            if self.attn_dcp_size > 1 and not dcp_partial
+            if self.dsa_shards_index_k and not dcp_partial
             else self.flashmla_kv_num_q_heads
         )
         if target_q_heads != num_q_heads:
@@ -3711,8 +3708,8 @@ class DeepseekSparseAttnBackend(
             layer_id=layer.layer_id,
             topk_indices=topk_indices,
             page_table=page_table_1[:rows].contiguous(),
-            dcp_size=self.dcp_size,
-            dcp_rank=self.dcp_rank,
+            dcp_size=self.attn_dcp_size,
+            dcp_rank=self.attn_dcp_rank,
         )
         stream_id = int(torch.cuda.current_stream(q_nope.device).cuda_stream)
         workspace = self._triton_sparse_mla_workspaces.setdefault(stream_id, [])
@@ -4234,15 +4231,15 @@ class DeepseekSparseAttnBackend(
         page_table_1, sparse_mla_top_k = self._pad_trtllm_sparse_page_table(
             page_table_1
         )
-        if self.dcp_size > 1:
+        if self.attn_dcp_size > 1 and not self.dsa_shards_index_k:
             page_table_1, seq_lens = localize_dcp_page_table(
                 self._dcp_page_table_cache,
                 metadata=metadata,
                 layer_id=layer.layer_id,
                 topk_indices=shared_topk_indices,
                 page_table=page_table_1,
-                dcp_size=self.dcp_size,
-                dcp_rank=self.dcp_rank,
+                dcp_size=self.attn_dcp_size,
+                dcp_rank=self.attn_dcp_rank,
             )
         sparse_mla_top_k_lens = None
         if self.qk_rope_head_dim == 0:
@@ -4284,7 +4281,7 @@ class DeepseekSparseAttnBackend(
             multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
         )
 
-        if self.dcp_size > 1:
+        if self.attn_dcp_size > 1 and not self.dsa_shards_index_k:
             out, lse = dcp_trtllm_sparse_attention(
                 query=q,
                 block_tables=block_tables,
@@ -4419,7 +4416,7 @@ class DeepseekSparseAttnBackend(
             and forward_mode == ForwardMode.EXTEND
         ):
             topk_transform_method = TopkTransformMethod.RAGGED
-        elif self.attn_dcp_size > 1 and forward_mode == ForwardMode.EXTEND:
+        elif self.dsa_shards_index_k and forward_mode == ForwardMode.EXTEND:
             topk_transform_method = TopkTransformMethod.RAGGED
         else:
             topk_transform_method = TopkTransformMethod.PAGED
@@ -4445,7 +4442,7 @@ class DeepseekSparseAttnBackend(
             paged_mqa_ctx_lens_2d=self.forward_metadata.paged_mqa_ctx_lens_2d,
             force_unfused_topk=force_unfused,
             packed_extend_topk=self.dsa_packed_extend_topk,
-            dcp_size=self.dcp_size,
+            dcp_size=1 if self.dsa_shards_index_k else self.attn_dcp_size,
         )
 
     def _compute_flashmla_metadata(
