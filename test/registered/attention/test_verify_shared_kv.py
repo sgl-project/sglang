@@ -18,7 +18,7 @@ from sglang.srt.layers.attention.triton_backend import (
 )
 from sglang.srt.layers.attention.triton_draft_hip import init_draft_backend
 from sglang.srt.layers.radix_attention import AttentionType
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import get_hip_version, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
@@ -421,6 +421,11 @@ def _extend(case, inputs, bf16_dot, kernel=extend_attention_fwd):
         **(
             {"max_bs": len(kv_indptr) - 1} if kernel is not extend_attention_fwd else {}
         ),
+        **(
+            {"allow_sliding_window": case.get("window", -1) > 0}
+            if kernel is verify_shared_kv_fwd
+            else {}
+        ),
     )
     if kernel is not extend_attention_fwd:
         assert ran is True
@@ -446,8 +451,17 @@ def _backend_extend(case, inputs, bf16_dot):
     backend.enable_deterministic = False
     backend.dllm_attention = None
     backend.page_size = 1
+    read = SimpleNamespace(
+        kv=lambda: (k_buffer, v_buffer), key=lambda: k_buffer, value=lambda: v_buffer
+    )
     backend.token_to_kv_pool = SimpleNamespace(
-        get_key_buffer=lambda _: k_buffer, get_value_buffer=lambda _: v_buffer
+        get_key_buffer=lambda _: k_buffer,
+        get_value_buffer=lambda _: v_buffer,
+        layer_router=SimpleNamespace(
+            read=lambda _: read,
+            route=lambda _: SimpleNamespace(sub_pool=None),
+            sub_pool=lambda _: None,
+        ),
     )
     backend.forward_metadata = SimpleNamespace(
         kv_indptr=kv_indptr,
