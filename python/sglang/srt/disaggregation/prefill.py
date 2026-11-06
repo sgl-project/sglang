@@ -104,7 +104,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
 )
 from sglang.srt.utils import is_npu, rank_consensus_checker
-from sglang.srt.utils.common import async_d2h
+from sglang.srt.utils.device import async_d2h
 
 if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import AbortReq
@@ -483,10 +483,8 @@ class PrefillBootstrapQueue:
         for req in self.queue:
             if recv_req.matches(req.rid):
                 logger.debug(f"Abort bootstrap queue request. {req.rid=}")
-                self.scheduler.release_aborted_request(req)
-
-                if hasattr(req.disagg_kv_sender, "abort"):
-                    req.disagg_kv_sender.abort()
+                # Only marks the abort; the exit that releases the request detaches it.
+                req.disagg_kv_sender.abort()
                 if get_parallel().pp_size > 1:
                     prepare_abort(req, "Aborted by AbortReq.")
 
@@ -621,14 +619,21 @@ class SchedulerDisaggregationPrefillMixin:
 
         checkpoint_kv_cache(req, cache)
 
-    def release_aborted_prefill_waiting_req(self: Scheduler, req: Req) -> None:
+    def release_prefill_sender(
+        self: Scheduler, req: Req, *, abort_sender: bool
+    ) -> None:
+        """Release a retiring request's KV send: its pending chunk entry and
+        metadata buffer. ``abort_sender`` stops a live sender; a failed one
+        already concluded through ``failure_exception``."""
         self.clear_pending_chunk_send(req)
-        sender = getattr(req, "disagg_kv_sender", None)
-        if sender is not None and hasattr(sender, "abort"):
-            sender.abort()
+        if abort_sender and req.disagg_kv_sender is not None:
+            try:
+                req.disagg_kv_sender.abort()
+            except Exception:
+                # Transport notification is best effort; local ownership must
+                # still be released or the next idle invariant check will fail.
+                logger.exception("Failed to notify KV sender of abort for %s", req.rid)
         maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
-        if req.kv.holds_kv or req.kv.holds_mamba:
-            release_kv_cache(req, self.tree_cache, checkpoint=False)
         req.pending_bootstrap = False
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
@@ -1315,11 +1320,7 @@ class SchedulerDisaggregationPrefillMixin:
                     self.batch_result_processor._maybe_collect_routed_experts(req)
                 if not isinstance(req.finished_reason, FINISH_ABORT):
                     req.finish_outside_step(FINISH_LENGTH(length=0))
-                # unlock the tree
-                release_kv_cache(req, self.tree_cache, checkpoint=True)
-                self.tree_cache.finish(
-                    req.cache_request_handle, CacheRequestOutcome.SUCCESS
-                )
+                self.request_retirer.release(req, checkpoint=True)
                 # FIXME: clean up req's data in transfer engine
                 req.disagg_kv_sender.clear()
                 done_reqs.append(req)
@@ -1390,15 +1391,11 @@ class SchedulerDisaggregationPrefillMixin:
         else:
             logger.warning(error_message)
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
-        if req.finished_reason is None:
-            req.finish_outside_step(FINISH_LENGTH(length=0))
-        # unlock the tree
-        release_kv_cache(req, self.tree_cache, checkpoint=True)
-        self.release_aborted_request(req)
         if not isinstance(req.finished_reason, FINISH_ABORT):
             prepare_abort(
                 req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
             )
+        self.request_retirer.release(req, checkpoint=False)
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_transfer_failed_reqs()
         return exc
@@ -1415,34 +1412,21 @@ class SchedulerDisaggregationPrefillMixin:
     def _retire_aborted_prefill_result(self: Scheduler, req: Req) -> bool:
         """Release an aborted request when its last prefill result is safe."""
         self.prefill_launched_reqs.leave([req])
-        self.clear_pending_chunk_send(req)
         owns_resources = (
             req.kv.holds_kv or req.kv.holds_mamba or req.metadata_buffer_index >= 0
         )
         if not owns_resources:
             # A bootstrap failure or earlier abort already retired it.
+            self.clear_pending_chunk_send(req)
             return False
-
-        sender = req.disagg_kv_sender
-        if sender is not None:
-            try:
-                sender.abort()
-            except Exception:
-                # Transport notification is best effort; local ownership must
-                # still be released or the next idle invariant check will fail.
-                logger.exception("Failed to notify KV sender of abort for %s", req.rid)
 
         if req.to_finish is not None and not req.finished():
             req.update_finish_state()
-        maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
-        req.pending_bootstrap = False
-        self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
-        if req.kv.holds_kv or req.kv.holds_mamba:
-            release_kv_cache(req, self.tree_cache, checkpoint=False)
+        self.release_prefill_sender(req, abort_sender=True)
+        self.request_retirer.release(req, checkpoint=False)
         return True
 
     def handle_bootstrap_failure(self: Scheduler, req: Req) -> None:
-        self.clear_pending_chunk_send(req)
         error_message = (
             f"Prefill bootstrap failed for request rank={get_parallel().tp_rank} "
             f"{req.rid=} {req.bootstrap_room=}"
@@ -1459,15 +1443,12 @@ class SchedulerDisaggregationPrefillMixin:
         else:
             logger.warning(error_message)
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
-        if req.kv.holds_kv or req.kv.holds_mamba:
-            release_kv_cache(req, self.tree_cache, checkpoint=False)
-        maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
-        req.pending_bootstrap = False
         prepare_abort(req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+        self.release_prefill_sender(req, abort_sender=False)
+        self.request_retirer.release(req, checkpoint=False)
         self.output_streamer.stream_output([req], req.return_logprob)
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_bootstrap_failed_reqs()
-        self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
 
     def handle_pending_bootstrap(self: Scheduler, req: Req, poll: KVPoll) -> bool:
         """Return True when bootstrap is finalized and KV transfer can proceed."""
@@ -1901,9 +1882,12 @@ class SchedulerDisaggregationPrefillMixin:
     def optimistic_release_and_requeue(self: Scheduler, req: Req, src: ReqList) -> None:
         """Release KV cache and requeue an optimistic prefill request out of `src`."""
         max_attempts = get_disagg().optimistic_prefill_attempts
-        uses_write_through_cache = _uses_write_through_cache(self.tree_cache)
-        if not uses_write_through_cache:
-            checkpoint_kv_cache(req, self.tree_cache)
+        # Publish the computed prefix before releasing it. A write-through cache
+        # keeps optimistic KV request-owned only to keep the backup off the
+        # decode bootstrap path; a yielded request has no bootstrap to delay, and
+        # publishing backs its KV up to L3 so the retry fetches it back instead
+        # of recomputing it once the device copy is evicted.
+        checkpoint_kv_cache(req, self.tree_cache)
         # The cached prefix is evictable once the KV is released. Its length
         # (capped at what a retry can match) seeds the retry's storage baseline,
         # so an evicted prefix is looked up in L3 once before it is recomputed.
