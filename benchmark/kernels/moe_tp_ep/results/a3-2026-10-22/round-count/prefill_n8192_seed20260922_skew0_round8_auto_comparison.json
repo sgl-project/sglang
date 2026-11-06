@@ -1,0 +1,21 @@
+{
+  "passed": true,
+  "tolerance": 0.02,
+  "checks": [
+    {
+      "max_abs": 0.015625,
+      "relative": 0.005555555553580247,
+      "passed": true
+    },
+    {
+      "max_abs": 0.0,
+      "relative": 0.0,
+      "passed": true
+    },
+    {
+      "max_abs": 0.0,
+      "relative": 0.0,
+      "passed": true
+    }
+  ]
+}

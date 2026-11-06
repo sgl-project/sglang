@@ -1,0 +1,627 @@
+{
+  "source_base": "a1e52138a63de95492f216e2536d10fc8b335f5f",
+  "source_archive_sha256": "abe96a9eeb1a39c9336cd00a531d909e30cc214e9958858ee587cae321cd31d9",
+  "environment": {
+    "python": "3.12.13",
+    "packages": {
+      "torch": "2.10.0+cpu",
+      "torch-npu": "2.10.0.post6",
+      "deep-ep": "1.0.0+0234a271.cann.9.1.0.b243",
+      "sglang": "0.5.23.dev315+ge9b22a081",
+      "sgl-kernel-npu": "2026.9.0",
+      "transformers": "5.19.0"
+    },
+    "sglang_commit": "a1e52138a63de95492f216e2536d10fc8b335f5f",
+    "sglang_diff_sha256": null,
+    "source_archive_sha256": "abe96a9eeb1a39c9336cd00a531d909e30cc214e9958858ee587cae321cd31d9",
+    "scripts_sha256": {
+      "bench_moe_tp_ep.py": "160b32e3ab17f111491f0737ebed72836bc79c70d814803fed6ac17eee7b88f8",
+      "bench_serving.py": "0505db70370d526cb4bf0258bcdead793139bb99b4ca0b11eb6e745167a5f982",
+      "check_equivalence.py": "195b094834138ed05c2cb8c7cf307d0cf809ab4c6d8d88febce77954fbc08b76",
+      "environment.py": "618818ed2cc635419d8604f8f2ae525a9f0b5e93bb9564f5d1fc6bff7e9f98f8",
+      "inspect_routing.py": "7f7c68bd0a5b7436c3876f99020aa6c0de72e6a1243a03836fbc4450bbabaf20",
+      "launch_serving.py": "3ada15da977e2c91023c5974d7042595df98bbd2540b07d92372c3d2ab01d5c8",
+      "observe_tokens.py": "06b933993f38b9118b4d9cda91577b951bb111cc07067a64f189b528c377412e",
+      "summarize.py": "a7627853aa28d27e1ac73aa42e544c76fb3e0dca6463d94d6fc0a81b0558c4da",
+      "summarize_profile.py": "dd9d5b97c2be69979e6f6b2054d0c0fc4061199bc2a1af212f99a99569fe0a7c",
+      "summarize_serving.py": "3b2c2e6e822296571c75a1959185ddacddab84df35f77ccfe37c0cc83e00dbbe",
+      "test_contracts.py": "ba7980cf109b4939ac81502638519eba31a25b5d9f4a4c2eb245222b44a47bb9",
+      "test_workload.py": "3da3885ff4eea7e061adcbb3444ec5bdbd54d1ed495d578e2d499bfdd71b8d76",
+      "workload.py": "263df8b437b844ecc869d1dbd66672b580178a61656751bc6b5eecb51d333281"
+    },
+    "environment": {
+      "HCCL_SOCKET_IFNAME": "lo",
+      "HCCL_NPU_SOCKET_PORT_RANGE": "28100-28131",
+      "HCCL_BUFFSIZE": "2048",
+      "DEEPEP_HCCL_BUFFSIZE": "2048",
+      "DEEPEP_HYBRID_DEPLOYMENT": "1",
+      "DEEPEP_NORMAL_LONG_SEQ_ROUND": "8",
+      "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "8192",
+      "DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ": "1",
+      "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "512",
+      "ASCEND_CUSTOM_OPP_PATH": "/usr/local/python3.12.13/lib/python3.12/site-packages/deep_ep/vendors/hwcomputing:/usr/local/python3.12.13/lib/python3.12/site-packages/deep_ep/vendors/hwcomputing:"
+    },
+    "execution_mode": "torch.inference_mode; eager",
+    "image_digest": "sha256:1fd5227d2aa3fcdcb0b03076ebb3c879b1e4641355a0fd255d6f629d076b1830",
+    "hardware": {
+      "machine": "aarch64",
+      "device_nodes": [
+        "davinci14",
+        "davinci15"
+      ],
+      "visible_devices": {},
+      "cann": {
+        "version": "9.1.0",
+        "sha256": "a9b17ef608ebeb70ade09cde1c12a545eb5e8f3e5312f6806ca0d368b0464848"
+      },
+      "driver": {
+        "version": "25.5.0",
+        "sha256": "573bf6989191f69a7619b0c3588727f05d368b26ee764070e7312cc0ee8a9102"
+      },
+      "devices": [
+        {
+          "logical_id": 0,
+          "model": "Ascend910_9382",
+          "uuid": "00cc0800-d001-0000-0000-803c20616efc"
+        },
+        {
+          "logical_id": 1,
+          "model": "Ascend910_9382",
+          "uuid": "00cc0800-d001-0000-0000-803c20616efd"
+        }
+      ]
+    }
+  },
+  "model": {
+    "repo": "Qwen/Qwen3-30B-A3B",
+    "revision": "ad44e777bcd18fa416d9da3bd8f70d33ebb85d39",
+    "tensor_count": 385,
+    "tensor_bytes": 1208483840,
+    "range_start": 622464672,
+    "range_end": 1830948511,
+    "original_header_sha256": "5ab7bae170681be4c3cb0d08936be1f5d75ee06354c8f6e55fdde9f8ddc47cd0",
+    "downloaded_tensor_bytes_sha256": "3a983e941ffb02e62dcaa03e4497d2a650c332f0c17b5f9d5efdb7ad47c2ec67",
+    "subset_sha256": "8f734376f5830f584506e4bf95b394a897066aa28d32fa57112a31526e939097",
+    "scope": "Unmodified original layer-zero MLP tensor bytes; not a full-model checkpoint"
+  },
+  "cpu": {
+    "inner_tests": 14,
+    "registered_wrapper_passed": true,
+    "log": "registered-cpu.log"
+  },
+  "lint": {
+    "rules": "F401,F821,F823,UP037,I; sglang first party; Ruff 0.15.1 format",
+    "passed": true,
+    "log": "lint.log"
+  },
+  "historical_evidence": [
+    {
+      "archive": "a3-2026-09-16",
+      "files": 68,
+      "passed": true
+    },
+    {
+      "archive": "a3-2026-10-17",
+      "files": 9,
+      "passed": true
+    }
+  ],
+  "modes": [
+    {
+      "file": "module-validation/timing/deepep_prefill_r1.json",
+      "phase": "prefill",
+      "mode": {
+        "requested": "auto",
+        "resolved": "normal"
+      }
+    },
+    {
+      "file": "module-validation/timing/deepep_decode_r1.json",
+      "phase": "decode",
+      "mode": {
+        "requested": "auto",
+        "resolved": "low_latency"
+      }
+    },
+    {
+      "file": "round-count/deepep_decode_normal.json",
+      "phase": "decode",
+      "mode": {
+        "requested": "normal",
+        "resolved": "normal"
+      }
+    }
+  ],
+  "correctness": {
+    "passed": 7,
+    "comparisons": [
+      {
+        "case": "prefill_n777_seed20260922_skew0_round8_auto",
+        "passed": true,
+        "tolerance": 0.02,
+        "checks": [
+          {
+            "max_abs": 0.015625,
+            "relative": 0.0064102564076265614,
+            "passed": true
+          },
+          {
+            "max_abs": 0.0,
+            "relative": 0.0,
+            "passed": true
+          },
+          {
+            "max_abs": 0.0,
+            "relative": 0.0,
+            "passed": true
+          }
+        ]
+      },
+      {
+        "case": "decode_n777_seed20260922_skew0_round8_auto",
+        "passed": true,
+        "tolerance": 0.02,
+        "checks": [
+          {
+            "max_abs": 0.015625,
+            "relative": 0.0064102564076265614,
+            "passed": true
+          },
+          {
+            "max_abs": 0.0,
+            "relative": 0.0,
+            "passed": true
+          },
+          {
+            "max_abs": 0.0,
+            "relative": 0.0,
+            "passed": true
+          }
+        ]
+      },
+      {
+        "case": "decode_n777_seed20260922_skew0_round8_normal",
+        "passed": true,
+        "tolerance": 0.02,
+        "checks": [
+          {
+            "max_abs": 0.015625,
+            "relative": 0.0064102564076265614,
+            "passed": true
+          },
+          {
+            "max_abs": 0.0,
+            "relative": 0.0,
+            "passed": true
+          },
+          {
+            "max_abs": 0.0,
+            "relative": 0.0,
+            "passed": true
+          }
+        ]
+      },
+      {
+        "case": "prefill_n8192_seed20260922_skew0_round8_auto",
+        "passed": true,
+        "tolerance": 0.02,
+        "checks": [
+          {
+            "max_abs": 0.015625,
+            "relative": 0.005555555553580247,
+            "passed": true
+          },
+          {
+            "max_abs": 0.0,
+            "relative": 0.0,
+            "passed": true
+          },
+          {
+            "max_abs": 0.0,
+            "relative": 0.0,
+            "passed": true
+          }
+        ]
+      },
+      {
+        "case": "prefill_n8192_seed20260922_skew0_round1_auto",
+        "passed": true,
+        "tolerance": 0.02,
+        "checks": [
+          {
+            "max_abs": 0.015625,
+            "relative": 0.005555555553580247,
+            "passed": true
+          },
+          {
+            "max_abs": 0.0,
+            "relative": 0.0,
+            "passed": true
+          },
+          {
+            "max_abs": 0.0,
+            "relative": 0.0,
+            "passed": true
+          }
+        ]
+      },
+      {
+        "case": "prefill_n32768_seed20260922_skew0_round8_auto",
+        "passed": true,
+        "tolerance": 0.02,
+        "checks": [
+          {
+            "max_abs": 0.015625,
+            "relative": 0.004739336491453471,
+            "passed": true
+          },
+          {
+            "max_abs": 0.0,
+            "relative": 0.0,
+            "passed": true
+          },
+          {
+            "max_abs": 0.0,
+            "relative": 0.0,
+            "passed": true
+          }
+        ]
+      },
+      {
+        "case": "prefill_n32768_seed20260922_skew0_round2_auto",
+        "passed": true,
+        "tolerance": 0.02,
+        "checks": [
+          {
+            "max_abs": 0.015625,
+            "relative": 0.004739336491453471,
+            "passed": true
+          },
+          {
+            "max_abs": 0.0,
+            "relative": 0.0,
+            "passed": true
+          },
+          {
+            "max_abs": 0.0,
+            "relative": 0.0,
+            "passed": true
+          }
+        ]
+      }
+    ],
+    "max_relative": 0.0064102564076265614
+  },
+  "timing_smoke": [
+    {
+      "phase": "decode",
+      "global_tokens": 1,
+      "independent_runs": 1,
+      "configurations": {
+        "deepep": {
+          "median_ms": 1.0538400411605835,
+          "run_medians_ms": [
+            1.0538400411605835
+          ],
+          "relative_range": 0.0,
+          "deepep_mode": {
+            "requested": "auto",
+            "resolved": "low_latency"
+          }
+        },
+        "none": {
+          "median_ms": 0.9833199977874756,
+          "run_medians_ms": [
+            0.9833199977874756
+          ],
+          "relative_range": 0.0,
+          "deepep_mode": {
+            "requested": null,
+            "resolved": null
+          }
+        }
+      },
+      "ep_over_tp": 1.0717162709309094
+    },
+    {
+      "phase": "decode",
+      "global_tokens": 777,
+      "independent_runs": 1,
+      "configurations": {
+        "deepep": {
+          "median_ms": 1.284000039100647,
+          "run_medians_ms": [
+            1.284000039100647
+          ],
+          "relative_range": 0.0,
+          "deepep_mode": {
+            "requested": "auto",
+            "resolved": "low_latency"
+          }
+        },
+        "none": {
+          "median_ms": 0.9882199764251709,
+          "run_medians_ms": [
+            0.9882199764251709
+          ],
+          "relative_range": 0.0,
+          "deepep_mode": {
+            "requested": null,
+            "resolved": null
+          }
+        }
+      },
+      "ep_over_tp": 1.2993058931529025
+    },
+    {
+      "phase": "prefill",
+      "global_tokens": 1,
+      "independent_runs": 1,
+      "configurations": {
+        "deepep": {
+          "median_ms": 1.7398200035095215,
+          "run_medians_ms": [
+            1.7398200035095215
+          ],
+          "relative_range": 0.0,
+          "deepep_mode": {
+            "requested": "auto",
+            "resolved": "normal"
+          }
+        },
+        "none": {
+          "median_ms": 1.0720200538635254,
+          "run_medians_ms": [
+            1.0720200538635254
+          ],
+          "relative_range": 0.0,
+          "deepep_mode": {
+            "requested": null,
+            "resolved": null
+          }
+        }
+      },
+      "ep_over_tp": 1.6229360609806383
+    },
+    {
+      "phase": "prefill",
+      "global_tokens": 777,
+      "independent_runs": 1,
+      "configurations": {
+        "deepep": {
+          "median_ms": 1.9491000175476074,
+          "run_medians_ms": [
+            1.9491000175476074
+          ],
+          "relative_range": 0.0,
+          "deepep_mode": {
+            "requested": "auto",
+            "resolved": "normal"
+          }
+        },
+        "none": {
+          "median_ms": 0.9709200263023376,
+          "run_medians_ms": [
+            0.9709200263023376
+          ],
+          "relative_range": 0.0,
+          "deepep_mode": {
+            "requested": null,
+            "resolved": null
+          }
+        }
+      },
+      "ep_over_tp": 2.007477407764037
+    }
+  ],
+  "round_comparison": [
+    {
+      "global_tokens": 8192,
+      "baseline_rounds": 8,
+      "candidate_rounds": 1,
+      "full_output_relative_difference": 0.0,
+      "run_medians_ms": {
+        "8": [
+          4.696280002593994,
+          4.644389867782593,
+          4.627870082855225
+        ],
+        "1": [
+          4.261650085449219,
+          4.16126012802124,
+          4.1252100467681885
+        ]
+      },
+      "baseline_median_ms": 4.644389867782593,
+      "candidate_median_ms": 4.16126012802124,
+      "latency_change_percent": -10.402437209519121,
+      "speedup": 1.1161017876551471,
+      "relative_range": {
+        "8": 0.014729581642858723,
+        "1": 0.032788154184898353
+      },
+      "wall_run_medians_ms": {
+        "1": [
+          4.383178949356079,
+          4.2593772411346436,
+          4.248802423477173
+        ],
+        "8": [
+          4.819937705993652,
+          4.740254640579224,
+          4.7462146282196045
+        ]
+      },
+      "wall_medians_ms": {
+        "1": 4.2593772411346436,
+        "8": 4.7462146282196045
+      },
+      "performance_valid": true
+    },
+    {
+      "global_tokens": 32768,
+      "baseline_rounds": 8,
+      "candidate_rounds": 2,
+      "full_output_relative_difference": 0.0,
+      "run_medians_ms": {
+        "8": [
+          13.630280017852783,
+          13.77111005783081,
+          13.710820198059082
+        ],
+        "2": [
+          13.530889987945557,
+          13.66618013381958,
+          26.303250312805176
+        ]
+      },
+      "baseline_median_ms": 13.710820198059082,
+      "candidate_median_ms": 13.66618013381958,
+      "latency_change_percent": -0.3255827411829171,
+      "speedup": 1.003266462449813,
+      "relative_range": {
+        "8": 0.010271452615064078,
+        "2": 0.9345962221917423
+      },
+      "wall_run_medians_ms": {
+        "2": [
+          13.635306358337402,
+          13.791079044342041,
+          26.446661949157715
+        ],
+        "8": [
+          13.75776720046997,
+          13.971732139587402,
+          13.830150604248047
+        ]
+      },
+      "wall_medians_ms": {
+        "2": 13.791079044342041,
+        "8": 13.830150604248047
+      },
+      "performance_valid": false,
+      "status": "quarantined; other processes started on the same chips during the study",
+      "exclude_from_performance_claims": true
+    }
+  ],
+  "evidence_manifest_sha256": "78424526e9298463408c4b1e0ed430dfad672b25ece13ce3b25802243ecb24a3",
+  "scope": "BF16 eager Qwen3-30B-A3B layer-zero MoE module; original 14-case evidence retained; no full-model quality or serving remeasurement",
+  "occupancy_audit": {
+    "other_process_started_utc": "2026-10-22T12:25:33+00:00",
+    "other_pids": [
+      1160296,
+      1160297
+    ],
+    "affected": [
+      {
+        "point": 32768,
+        "label": "deepep_round8_r2",
+        "approx_start_utc": "2026-10-22T12:24:56.846354+00:00",
+        "approx_end_utc": "2026-10-22T12:25:38.439465+00:00",
+        "overlaps_process_start": true
+      },
+      {
+        "point": 32768,
+        "label": "deepep_round8_r3",
+        "approx_start_utc": "2026-10-22T12:25:38.439465+00:00",
+        "approx_end_utc": "2026-10-22T12:26:20.681336+00:00",
+        "overlaps_process_start": true
+      },
+      {
+        "point": 32768,
+        "label": "deepep_round2_r3",
+        "approx_start_utc": "2026-10-22T12:26:20.681336+00:00",
+        "approx_end_utc": "2026-10-22T12:27:11.674306+00:00",
+        "overlaps_process_start": true
+      }
+    ],
+    "timeline": [
+      {
+        "point": 8192,
+        "label": "deepep_round8_r1",
+        "approx_start_utc": "2026-10-22T12:16:13.405853+00:00",
+        "approx_end_utc": "2026-10-22T12:16:52.172582+00:00",
+        "overlaps_process_start": false
+      },
+      {
+        "point": 8192,
+        "label": "deepep_round1_r1",
+        "approx_start_utc": "2026-10-22T12:16:52.172582+00:00",
+        "approx_end_utc": "2026-10-22T12:17:31.541926+00:00",
+        "overlaps_process_start": false
+      },
+      {
+        "point": 8192,
+        "label": "deepep_round1_r2",
+        "approx_start_utc": "2026-10-22T12:17:31.541926+00:00",
+        "approx_end_utc": "2026-10-22T12:18:12.161090+00:00",
+        "overlaps_process_start": false
+      },
+      {
+        "point": 8192,
+        "label": "deepep_round8_r2",
+        "approx_start_utc": "2026-10-22T12:18:12.161090+00:00",
+        "approx_end_utc": "2026-10-22T12:18:51.979854+00:00",
+        "overlaps_process_start": false
+      },
+      {
+        "point": 8192,
+        "label": "deepep_round8_r3",
+        "approx_start_utc": "2026-10-22T12:18:51.979854+00:00",
+        "approx_end_utc": "2026-10-22T12:19:32.296551+00:00",
+        "overlaps_process_start": false
+      },
+      {
+        "point": 8192,
+        "label": "deepep_round1_r3",
+        "approx_start_utc": "2026-10-22T12:19:32.296551+00:00",
+        "approx_end_utc": "2026-10-22T12:20:10.211441+00:00",
+        "overlaps_process_start": false
+      },
+      {
+        "point": 32768,
+        "label": "deepep_round8_r1",
+        "approx_start_utc": "2026-10-22T12:22:48.372345+00:00",
+        "approx_end_utc": "2026-10-22T12:23:28.315083+00:00",
+        "overlaps_process_start": false
+      },
+      {
+        "point": 32768,
+        "label": "deepep_round2_r1",
+        "approx_start_utc": "2026-10-22T12:23:28.315083+00:00",
+        "approx_end_utc": "2026-10-22T12:24:09.886656+00:00",
+        "overlaps_process_start": false
+      },
+      {
+        "point": 32768,
+        "label": "deepep_round2_r2",
+        "approx_start_utc": "2026-10-22T12:24:09.886656+00:00",
+        "approx_end_utc": "2026-10-22T12:24:56.846354+00:00",
+        "overlaps_process_start": false
+      },
+      {
+        "point": 32768,
+        "label": "deepep_round8_r2",
+        "approx_start_utc": "2026-10-22T12:24:56.846354+00:00",
+        "approx_end_utc": "2026-10-22T12:25:38.439465+00:00",
+        "overlaps_process_start": true
+      },
+      {
+        "point": 32768,
+        "label": "deepep_round8_r3",
+        "approx_start_utc": "2026-10-22T12:25:38.439465+00:00",
+        "approx_end_utc": "2026-10-22T12:26:20.681336+00:00",
+        "overlaps_process_start": true
+      },
+      {
+        "point": 32768,
+        "label": "deepep_round2_r3",
+        "approx_start_utc": "2026-10-22T12:26:20.681336+00:00",
+        "approx_end_utc": "2026-10-22T12:27:11.674306+00:00",
+        "overlaps_process_start": true
+      }
+    ],
+    "policy": "Retain every sample; quarantine 32768 timing study as incomplete. The 8192 study and all complete-output checks finished before these processes started.",
+    "followup": "Stopped own container after discovering occupied chips. Followup is excluded."
+  }
+}

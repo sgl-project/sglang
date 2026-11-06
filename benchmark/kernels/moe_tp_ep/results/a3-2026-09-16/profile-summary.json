@@ -1,0 +1,684 @@
+[
+  {
+    "file": "deepep_decode/4311e380b494_279755_20260915163035280_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
+    "device_ids": [
+      "0"
+    ],
+    "profiled_iterations": 10,
+    "summed_kernel_ms_per_iter": 0.726321,
+    "union_kernel_ms_per_iter": 0.7263209999999996,
+    "hccl_operation_span_union_ms_per_iter": 0.0,
+    "categories_ms_per_iter": {
+      "matmul": 0.36979940000000006,
+      "routing_and_other": 0.05235529999999998,
+      "dispatch_combine_fused": 0.30416629999999995
+    },
+    "operators": {
+      "aclnnMatmul_MatMulCommon_MatMulV2": {
+        "count": 10,
+        "ms_per_iter": 0.005627999999999999,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "MoeGatingTopKSoftmax": {
+        "count": 10,
+        "ms_per_iter": 0.022158399999999995,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "l1_norm_kernel": {
+        "count": 10,
+        "ms_per_iter": 0.008530300000000001,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "aclnnInplaceCopy_CastAiCore_Cast": {
+        "count": 30,
+        "ms_per_iter": 0.004286300000000001,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "MoeLowLatencyDispatchV2": {
+        "count": 10,
+        "ms_per_iter": 0.21175439999999995,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "aclnnGroupedMatmulWeightNz_GroupedMatmul_GroupedMatmul": {
+        "count": 20,
+        "ms_per_iter": 0.3641714,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "_swiglu_quant_kernel": {
+        "count": 10,
+        "ms_per_iter": 0.0173803,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "MoeLowLatencyCombineV2": {
+        "count": 10,
+        "ms_per_iter": 0.09241190000000002,
+        "input_shapes": [
+          ""
+        ]
+      }
+    }
+  },
+  {
+    "file": "deepep_decode/4311e380b494_279756_20260915163035280_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
+    "device_ids": [
+      "1"
+    ],
+    "profiled_iterations": 10,
+    "summed_kernel_ms_per_iter": 0.6782733000000001,
+    "union_kernel_ms_per_iter": 0.6782732999999997,
+    "hccl_operation_span_union_ms_per_iter": 0.0,
+    "categories_ms_per_iter": {
+      "matmul": 0.38581780000000004,
+      "routing_and_other": 0.050066599999999996,
+      "dispatch_combine_fused": 0.2423889
+    },
+    "operators": {
+      "aclnnMatmul_MatMulCommon_MatMulV2": {
+        "count": 10,
+        "ms_per_iter": 0.0056521,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "MoeGatingTopKSoftmax": {
+        "count": 10,
+        "ms_per_iter": 0.0204522,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "l1_norm_kernel": {
+        "count": 10,
+        "ms_per_iter": 0.008322199999999998,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "aclnnInplaceCopy_CastAiCore_Cast": {
+        "count": 30,
+        "ms_per_iter": 0.00393,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "MoeLowLatencyDispatchV2": {
+        "count": 10,
+        "ms_per_iter": 0.19223969999999999,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "aclnnGroupedMatmulWeightNz_GroupedMatmul_GroupedMatmul": {
+        "count": 20,
+        "ms_per_iter": 0.38016569999999994,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "_swiglu_quant_kernel": {
+        "count": 10,
+        "ms_per_iter": 0.0173622,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "MoeLowLatencyCombineV2": {
+        "count": 10,
+        "ms_per_iter": 0.050149200000000005,
+        "input_shapes": [
+          ""
+        ]
+      }
+    }
+  },
+  {
+    "file": "deepep_prefill/4311e380b494_277431_20260915162953808_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
+    "device_ids": [
+      "0"
+    ],
+    "profiled_iterations": 10,
+    "summed_kernel_ms_per_iter": 4.8266762,
+    "union_kernel_ms_per_iter": 4.826676199999997,
+    "hccl_operation_span_union_ms_per_iter": 0.0,
+    "categories_ms_per_iter": {
+      "matmul": 1.2823097000000003,
+      "routing_and_other": 0.26566530000000005,
+      "dispatch_combine_fused": 3.2787012000000004
+    },
+    "operators": {
+      "aclnnMatmul_MatMulCommon_MatMulV2": {
+        "count": 10,
+        "ms_per_iter": 0.0309347,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "MoeGatingTopKSoftmax": {
+        "count": 10,
+        "ms_per_iter": 0.0349866,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "l1_norm_kernel": {
+        "count": 10,
+        "ms_per_iter": 0.0228404,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "aclnnInplaceCopy_CastAiCore_Cast": {
+        "count": 40,
+        "ms_per_iter": 0.0207385,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "aclnnInplaceZero_ZerosLikeAiCore_ZerosLike": {
+        "count": 50,
+        "ms_per_iter": 0.012086300000000001,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "DispatchLayout": {
+        "count": 10,
+        "ms_per_iter": 0.0698992,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "NotifyDispatch": {
+        "count": 10,
+        "ms_per_iter": 1.1003580000000002,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "CamMoeDispatchNormal": {
+        "count": 10,
+        "ms_per_iter": 0.8678294000000001,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "aclnnReduceSum_CastAiCore_Cast": {
+        "count": 10,
+        "ms_per_iter": 0.0013581000000000003,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "aclnnReduceSum_ReduceSumOpAiCore_ReduceSum": {
+        "count": 10,
+        "ms_per_iter": 0.0088442,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "aclnnGroupedMatmulWeightNz_GroupedMatmul_GroupedMatmul": {
+        "count": 20,
+        "ms_per_iter": 1.2513750000000001,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "_swiglu_quant_kernel": {
+        "count": 10,
+        "ms_per_iter": 0.1648112,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "CamMoeCombineNormal": {
+        "count": 10,
+        "ms_per_iter": 1.2406145999999996,
+        "input_shapes": [
+          ""
+        ]
+      }
+    }
+  },
+  {
+    "file": "deepep_prefill/4311e380b494_277432_20260915162953809_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
+    "device_ids": [
+      "1"
+    ],
+    "profiled_iterations": 10,
+    "summed_kernel_ms_per_iter": 3.8152144,
+    "union_kernel_ms_per_iter": 3.8152143999999977,
+    "hccl_operation_span_union_ms_per_iter": 0.0,
+    "categories_ms_per_iter": {
+      "matmul": 1.4256367,
+      "routing_and_other": 0.2937896000000001,
+      "dispatch_combine_fused": 2.0957881
+    },
+    "operators": {
+      "aclnnMatmul_MatMulCommon_MatMulV2": {
+        "count": 10,
+        "ms_per_iter": 0.030626900000000002,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "MoeGatingTopKSoftmax": {
+        "count": 10,
+        "ms_per_iter": 0.0350826,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "l1_norm_kernel": {
+        "count": 10,
+        "ms_per_iter": 0.0225044,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "aclnnInplaceCopy_CastAiCore_Cast": {
+        "count": 40,
+        "ms_per_iter": 0.021196299999999998,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "aclnnInplaceZero_ZerosLikeAiCore_ZerosLike": {
+        "count": 50,
+        "ms_per_iter": 0.0121522,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "DispatchLayout": {
+        "count": 10,
+        "ms_per_iter": 0.0690676,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "NotifyDispatch": {
+        "count": 10,
+        "ms_per_iter": 0.1314226,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "CamMoeDispatchNormal": {
+        "count": 10,
+        "ms_per_iter": 0.8513050999999999,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "aclnnReduceSum_CastAiCore_Cast": {
+        "count": 10,
+        "ms_per_iter": 0.00133,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "aclnnReduceSum_ReduceSumOpAiCore_ReduceSum": {
+        "count": 10,
+        "ms_per_iter": 0.009078199999999998,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "aclnnGroupedMatmulWeightNz_GroupedMatmul_GroupedMatmul": {
+        "count": 20,
+        "ms_per_iter": 1.3950098,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "_swiglu_quant_kernel": {
+        "count": 10,
+        "ms_per_iter": 0.19244590000000003,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "CamMoeCombineNormal": {
+        "count": 10,
+        "ms_per_iter": 1.0439928,
+        "input_shapes": [
+          ""
+        ]
+      }
+    }
+  },
+  {
+    "file": "none_decode/4311e380b494_274721_20260915162911861_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
+    "device_ids": [
+      "0"
+    ],
+    "profiled_iterations": 10,
+    "summed_kernel_ms_per_iter": 0.6655094000000001,
+    "union_kernel_ms_per_iter": 0.6476190000000005,
+    "hccl_operation_span_union_ms_per_iter": 0.7078640999999999,
+    "categories_ms_per_iter": {
+      "matmul": 0.37121770000000004,
+      "routing_and_other": 0.1471808,
+      "collective": 0.1471109
+    },
+    "operators": {
+      "aclnnMatmul_MatMulCommon_MatMulV2": {
+        "count": 10,
+        "ms_per_iter": 0.0072801,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "MoeGatingTopKSoftmax": {
+        "count": 10,
+        "ms_per_iter": 0.0217722,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "l1_norm_kernel": {
+        "count": 10,
+        "ms_per_iter": 0.0084703,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "aclnnInplaceCopy_CastAiCore_Cast": {
+        "count": 10,
+        "ms_per_iter": 0.0014379999999999998,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "aclnnMoeInitRoutingV3_MoeInitRoutingV3_MoeInitRoutingV3": {
+        "count": 10,
+        "ms_per_iter": 0.0686734,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "aclnnGroupedMatmulWeightNz_GroupedMatmul_GroupedMatmul": {
+        "count": 20,
+        "ms_per_iter": 0.3639376000000001,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "SwiGlu": {
+        "count": 10,
+        "ms_per_iter": 0.0200162,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "MoeFinalizeRoutingV2": {
+        "count": 10,
+        "ms_per_iter": 0.0268107,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "allreduceAicpuKernel": {
+        "count": 10,
+        "ms_per_iter": 0.1471109,
+        "input_shapes": [
+          ""
+        ]
+      }
+    }
+  },
+  {
+    "file": "none_decode/4311e380b494_274722_20260915162911861_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
+    "device_ids": [
+      "1"
+    ],
+    "profiled_iterations": 10,
+    "summed_kernel_ms_per_iter": 0.677256,
+    "union_kernel_ms_per_iter": 0.6727858999999997,
+    "hccl_operation_span_union_ms_per_iter": 0.18148549999999994,
+    "categories_ms_per_iter": {
+      "matmul": 0.3745037,
+      "routing_and_other": 0.14557109999999998,
+      "collective": 0.15718120000000002
+    },
+    "operators": {
+      "aclnnMatmul_MatMulCommon_MatMulV2": {
+        "count": 10,
+        "ms_per_iter": 0.007116299999999999,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "MoeGatingTopKSoftmax": {
+        "count": 10,
+        "ms_per_iter": 0.023522300000000003,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "l1_norm_kernel": {
+        "count": 10,
+        "ms_per_iter": 0.0096443,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "aclnnInplaceCopy_CastAiCore_Cast": {
+        "count": 10,
+        "ms_per_iter": 0.00129,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "aclnnMoeInitRoutingV3_MoeInitRoutingV3_MoeInitRoutingV3": {
+        "count": 10,
+        "ms_per_iter": 0.0631814,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "aclnnGroupedMatmulWeightNz_GroupedMatmul_GroupedMatmul": {
+        "count": 20,
+        "ms_per_iter": 0.3673874,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "SwiGlu": {
+        "count": 10,
+        "ms_per_iter": 0.0193623,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "MoeFinalizeRoutingV2": {
+        "count": 10,
+        "ms_per_iter": 0.0285708,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "allreduceAicpuKernel": {
+        "count": 10,
+        "ms_per_iter": 0.15718120000000002,
+        "input_shapes": [
+          ""
+        ]
+      }
+    }
+  },
+  {
+    "file": "none_prefill/4311e380b494_272411_20260915162830829_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
+    "device_ids": [
+      "0"
+    ],
+    "profiled_iterations": 10,
+    "summed_kernel_ms_per_iter": 2.6195804000000003,
+    "union_kernel_ms_per_iter": 2.4346547000000003,
+    "hccl_operation_span_union_ms_per_iter": 0.36590540000000027,
+    "categories_ms_per_iter": {
+      "matmul": 1.5542569000000002,
+      "routing_and_other": 0.8803978000000001,
+      "collective": 0.18492569999999997
+    },
+    "operators": {
+      "aclnnMatmul_MatMulCommon_MatMulV2": {
+        "count": 10,
+        "ms_per_iter": 0.0349444,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "MoeGatingTopKSoftmax": {
+        "count": 10,
+        "ms_per_iter": 0.0454829,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "l1_norm_kernel": {
+        "count": 10,
+        "ms_per_iter": 0.0385408,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "aclnnInplaceCopy_CastAiCore_Cast": {
+        "count": 10,
+        "ms_per_iter": 0.0090725,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "aclnnMoeInitRoutingV3_MoeInitRoutingV3_MoeInitRoutingV3": {
+        "count": 10,
+        "ms_per_iter": 0.2723655,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "aclnnGroupedMatmulWeightNz_GroupedMatmul_GroupedMatmul": {
+        "count": 20,
+        "ms_per_iter": 1.5193125,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "allreduceAicpuKernel": {
+        "count": 10,
+        "ms_per_iter": 0.18492569999999997,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "SwiGlu": {
+        "count": 10,
+        "ms_per_iter": 0.11138810000000002,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "MoeFinalizeRoutingV2": {
+        "count": 10,
+        "ms_per_iter": 0.4035479999999999,
+        "input_shapes": [
+          ""
+        ]
+      }
+    }
+  },
+  {
+    "file": "none_prefill/4311e380b494_272412_20260915162830829_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
+    "device_ids": [
+      "1"
+    ],
+    "profiled_iterations": 10,
+    "summed_kernel_ms_per_iter": 2.6214263999999994,
+    "union_kernel_ms_per_iter": 2.433694600000001,
+    "hccl_operation_span_union_ms_per_iter": 0.5179703000000005,
+    "categories_ms_per_iter": {
+      "matmul": 1.5712253999999997,
+      "routing_and_other": 0.8623871999999997,
+      "collective": 0.18781379999999998
+    },
+    "operators": {
+      "aclnnMatmul_MatMulCommon_MatMulV2": {
+        "count": 10,
+        "ms_per_iter": 0.03645269999999999,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "MoeGatingTopKSoftmax": {
+        "count": 10,
+        "ms_per_iter": 0.0434589,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "l1_norm_kernel": {
+        "count": 10,
+        "ms_per_iter": 0.0372668,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "aclnnInplaceCopy_CastAiCore_Cast": {
+        "count": 10,
+        "ms_per_iter": 0.0076681,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "aclnnMoeInitRoutingV3_MoeInitRoutingV3_MoeInitRoutingV3": {
+        "count": 10,
+        "ms_per_iter": 0.2725094,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "aclnnGroupedMatmulWeightNz_GroupedMatmul_GroupedMatmul": {
+        "count": 20,
+        "ms_per_iter": 1.5347726999999998,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "allreduceAicpuKernel": {
+        "count": 10,
+        "ms_per_iter": 0.18781379999999998,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "SwiGlu": {
+        "count": 10,
+        "ms_per_iter": 0.10542599999999999,
+        "input_shapes": [
+          ""
+        ]
+      },
+      "MoeFinalizeRoutingV2": {
+        "count": 10,
+        "ms_per_iter": 0.39605799999999997,
+        "input_shapes": [
+          ""
+        ]
+      }
+    }
+  }
+]

@@ -1,0 +1,118 @@
+{
+  "other_process_started_utc": "2026-10-22T12:25:33+00:00",
+  "other_pids": [
+    1160296,
+    1160297
+  ],
+  "affected": [
+    {
+      "point": 32768,
+      "label": "deepep_round8_r2",
+      "approx_start_utc": "2026-10-22T12:24:56.846354+00:00",
+      "approx_end_utc": "2026-10-22T12:25:38.439465+00:00",
+      "overlaps_process_start": true
+    },
+    {
+      "point": 32768,
+      "label": "deepep_round8_r3",
+      "approx_start_utc": "2026-10-22T12:25:38.439465+00:00",
+      "approx_end_utc": "2026-10-22T12:26:20.681336+00:00",
+      "overlaps_process_start": true
+    },
+    {
+      "point": 32768,
+      "label": "deepep_round2_r3",
+      "approx_start_utc": "2026-10-22T12:26:20.681336+00:00",
+      "approx_end_utc": "2026-10-22T12:27:11.674306+00:00",
+      "overlaps_process_start": true
+    }
+  ],
+  "timeline": [
+    {
+      "point": 8192,
+      "label": "deepep_round8_r1",
+      "approx_start_utc": "2026-10-22T12:16:13.405853+00:00",
+      "approx_end_utc": "2026-10-22T12:16:52.172582+00:00",
+      "overlaps_process_start": false
+    },
+    {
+      "point": 8192,
+      "label": "deepep_round1_r1",
+      "approx_start_utc": "2026-10-22T12:16:52.172582+00:00",
+      "approx_end_utc": "2026-10-22T12:17:31.541926+00:00",
+      "overlaps_process_start": false
+    },
+    {
+      "point": 8192,
+      "label": "deepep_round1_r2",
+      "approx_start_utc": "2026-10-22T12:17:31.541926+00:00",
+      "approx_end_utc": "2026-10-22T12:18:12.161090+00:00",
+      "overlaps_process_start": false
+    },
+    {
+      "point": 8192,
+      "label": "deepep_round8_r2",
+      "approx_start_utc": "2026-10-22T12:18:12.161090+00:00",
+      "approx_end_utc": "2026-10-22T12:18:51.979854+00:00",
+      "overlaps_process_start": false
+    },
+    {
+      "point": 8192,
+      "label": "deepep_round8_r3",
+      "approx_start_utc": "2026-10-22T12:18:51.979854+00:00",
+      "approx_end_utc": "2026-10-22T12:19:32.296551+00:00",
+      "overlaps_process_start": false
+    },
+    {
+      "point": 8192,
+      "label": "deepep_round1_r3",
+      "approx_start_utc": "2026-10-22T12:19:32.296551+00:00",
+      "approx_end_utc": "2026-10-22T12:20:10.211441+00:00",
+      "overlaps_process_start": false
+    },
+    {
+      "point": 32768,
+      "label": "deepep_round8_r1",
+      "approx_start_utc": "2026-10-22T12:22:48.372345+00:00",
+      "approx_end_utc": "2026-10-22T12:23:28.315083+00:00",
+      "overlaps_process_start": false
+    },
+    {
+      "point": 32768,
+      "label": "deepep_round2_r1",
+      "approx_start_utc": "2026-10-22T12:23:28.315083+00:00",
+      "approx_end_utc": "2026-10-22T12:24:09.886656+00:00",
+      "overlaps_process_start": false
+    },
+    {
+      "point": 32768,
+      "label": "deepep_round2_r2",
+      "approx_start_utc": "2026-10-22T12:24:09.886656+00:00",
+      "approx_end_utc": "2026-10-22T12:24:56.846354+00:00",
+      "overlaps_process_start": false
+    },
+    {
+      "point": 32768,
+      "label": "deepep_round8_r2",
+      "approx_start_utc": "2026-10-22T12:24:56.846354+00:00",
+      "approx_end_utc": "2026-10-22T12:25:38.439465+00:00",
+      "overlaps_process_start": true
+    },
+    {
+      "point": 32768,
+      "label": "deepep_round8_r3",
+      "approx_start_utc": "2026-10-22T12:25:38.439465+00:00",
+      "approx_end_utc": "2026-10-22T12:26:20.681336+00:00",
+      "overlaps_process_start": true
+    },
+    {
+      "point": 32768,
+      "label": "deepep_round2_r3",
+      "approx_start_utc": "2026-10-22T12:26:20.681336+00:00",
+      "approx_end_utc": "2026-10-22T12:27:11.674306+00:00",
+      "overlaps_process_start": true
+    }
+  ],
+  "policy": "Retain every sample; quarantine 32768 timing study as incomplete. The 8192 study and all complete-output checks finished before these processes started.",
+  "followup": "Stopped own container after discovering occupied chips. Followup is excluded."
+}

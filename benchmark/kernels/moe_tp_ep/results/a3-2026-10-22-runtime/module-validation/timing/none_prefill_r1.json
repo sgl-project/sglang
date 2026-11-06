@@ -1,0 +1,273 @@
+{
+  "schema_version": 3,
+  "backend": "none",
+  "tp_size": 2,
+  "ep_size": 1,
+  "phase": "prefill",
+  "real_weights": true,
+  "repeat_id": 1,
+  "input_seed": 20260922,
+  "warmup": 2,
+  "iters": 5,
+  "num_experts": 128,
+  "topk": 8,
+  "hidden": 2048,
+  "weights_sha256": "89e5b1669c35a3936ab144beba3d7e81eb44dc770baba6166d896d73815c459f",
+  "metadata": {
+    "python": "3.12.13",
+    "packages": {
+      "torch": "2.10.0+cpu",
+      "torch-npu": "2.10.0.post6",
+      "deep-ep": "1.0.0+0234a271.cann.9.1.0.b243",
+      "sglang": "0.5.23.dev315+ge9b22a081",
+      "sgl-kernel-npu": "2026.9.0",
+      "transformers": "5.19.0"
+    },
+    "sglang_commit": "59b4e6ebc1d2b9a9a8ed33bd2fb9e1daf48e9367",
+    "sglang_diff_sha256": null,
+    "source_archive_sha256": "efaf42678dad5d462a99270861f07153771d991e3b2b91c008a3dcf298168da3",
+    "scripts_sha256": {
+      "bench_moe_tp_ep.py": "160b32e3ab17f111491f0737ebed72836bc79c70d814803fed6ac17eee7b88f8",
+      "bench_serving.py": "0505db70370d526cb4bf0258bcdead793139bb99b4ca0b11eb6e745167a5f982",
+      "check_equivalence.py": "195b094834138ed05c2cb8c7cf307d0cf809ab4c6d8d88febce77954fbc08b76",
+      "environment.py": "618818ed2cc635419d8604f8f2ae525a9f0b5e93bb9564f5d1fc6bff7e9f98f8",
+      "inspect_routing.py": "7f7c68bd0a5b7436c3876f99020aa6c0de72e6a1243a03836fbc4450bbabaf20",
+      "launch_serving.py": "3ada15da977e2c91023c5974d7042595df98bbd2540b07d92372c3d2ab01d5c8",
+      "observe_tokens.py": "06b933993f38b9118b4d9cda91577b951bb111cc07067a64f189b528c377412e",
+      "summarize.py": "a7627853aa28d27e1ac73aa42e544c76fb3e0dca6463d94d6fc0a81b0558c4da",
+      "summarize_profile.py": "dd9d5b97c2be69979e6f6b2054d0c0fc4061199bc2a1af212f99a99569fe0a7c",
+      "summarize_serving.py": "3b2c2e6e822296571c75a1959185ddacddab84df35f77ccfe37c0cc83e00dbbe",
+      "test_contracts.py": "1e3c3e2cc213e485757629097d8813544f5d5e7a52e96d720494daa5a4cdb6ad",
+      "test_workload.py": "3da3885ff4eea7e061adcbb3444ec5bdbd54d1ed495d578e2d499bfdd71b8d76",
+      "workload.py": "263df8b437b844ecc869d1dbd66672b580178a61656751bc6b5eecb51d333281"
+    },
+    "environment": {
+      "HCCL_SOCKET_IFNAME": "lo",
+      "HCCL_NPU_SOCKET_PORT_RANGE": "28100-28131",
+      "HCCL_BUFFSIZE": "2048",
+      "DEEPEP_HCCL_BUFFSIZE": "2048",
+      "DEEPEP_HYBRID_DEPLOYMENT": "1",
+      "DEEPEP_NORMAL_LONG_SEQ_ROUND": "8",
+      "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "8192",
+      "DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ": "1",
+      "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "512",
+      "ASCEND_CUSTOM_OPP_PATH": "/usr/local/python3.12.13/lib/python3.12/site-packages/deep_ep/vendors/hwcomputing:/usr/local/python3.12.13/lib/python3.12/site-packages/deep_ep/vendors/hwcomputing:/usr/local/python3.12.13/lib/python3.12/site-packages/deep_ep/vendors/hwcomputing:"
+    },
+    "execution_mode": "torch.inference_mode; eager",
+    "image_digest": "sha256:1fd5227d2aa3fcdcb0b03076ebb3c879b1e4641355a0fd255d6f629d076b1830",
+    "hardware": {
+      "machine": "aarch64",
+      "device_nodes": [
+        "davinci14",
+        "davinci15"
+      ],
+      "visible_devices": {},
+      "cann": {
+        "version": "9.1.0",
+        "sha256": "a9b17ef608ebeb70ade09cde1c12a545eb5e8f3e5312f6806ca0d368b0464848"
+      },
+      "driver": {
+        "version": "25.5.0",
+        "sha256": "573bf6989191f69a7619b0c3588727f05d368b26ee764070e7312cc0ee8a9102"
+      },
+      "devices": [
+        {
+          "logical_id": 0,
+          "model": "Ascend910_9382",
+          "uuid": "00cc0800-d001-0000-0000-ec819ca60827"
+        },
+        {
+          "logical_id": 1,
+          "model": "Ascend910_9382",
+          "uuid": "00cc0800-d001-0000-0000-ec819ca60828"
+        }
+      ],
+      "rank_mapping": [
+        {
+          "rank": 0,
+          "local_rank": 0,
+          "device": {
+            "logical_id": 0,
+            "model": "Ascend910_9382",
+            "uuid": "00cc0800-d001-0000-0000-ec819ca60827"
+          }
+        },
+        {
+          "rank": 1,
+          "local_rank": 1,
+          "device": {
+            "logical_id": 1,
+            "model": "Ascend910_9382",
+            "uuid": "00cc0800-d001-0000-0000-ec819ca60828"
+          }
+        }
+      ]
+    }
+  },
+  "results": [
+    {
+      "global_tokens": 1,
+      "tokens_per_rank": [
+        1,
+        1
+      ],
+      "input_sha256": "d8ab4623a22f93d0bc9aaca3a48f5c762fa570afc87ae790748a7d6004f488e0",
+      "median_ms": 1.0865199565887451,
+      "p95_ms": 1.476040005683899,
+      "wall_median_ms": 1.2425100803375244,
+      "global_tokens_per_s": 920.3696572123861,
+      "samples_max_rank_ms": [
+        [
+          1.476040005683899,
+          1.7670402526855469
+        ],
+        [
+          1.1751600503921509,
+          1.3308134078979492
+        ],
+        [
+          1.0865199565887451,
+          1.2425100803375244
+        ],
+        [
+          1.0316599607467651,
+          1.1825673580169678
+        ],
+        [
+          1.0588799715042114,
+          1.2090578079223633
+        ]
+      ],
+      "samples_per_rank_ms": [
+        [
+          [
+            1.3597400188446045,
+            1.7109075784683228
+          ],
+          [
+            1.1751600503921509,
+            1.3308134078979492
+          ],
+          [
+            1.0770800113677979,
+            1.2274589538574219
+          ],
+          [
+            1.0316599607467651,
+            1.1663371324539185
+          ],
+          [
+            1.0535999536514282,
+            1.2090578079223633
+          ]
+        ],
+        [
+          [
+            1.476040005683899,
+            1.7670402526855469
+          ],
+          [
+            1.1443400382995605,
+            1.3155629634857178
+          ],
+          [
+            1.0865199565887451,
+            1.2425100803375244
+          ],
+          [
+            1.0186599493026733,
+            1.1825673580169678
+          ],
+          [
+            1.0588799715042114,
+            1.189626693725586
+          ]
+        ]
+      ]
+    },
+    {
+      "global_tokens": 777,
+      "tokens_per_rank": [
+        777,
+        777
+      ],
+      "input_sha256": "343096e0cbc2d0af484088a9696f87262eb21dd6e0afa73f0b28745f19053bac",
+      "median_ms": 1.0734200477600098,
+      "p95_ms": 1.1051599979400635,
+      "wall_median_ms": 1.1778864860534668,
+      "global_tokens_per_s": 723854.5633849741,
+      "samples_max_rank_ms": [
+        [
+          1.1011799573898315,
+          1.2427297830581665
+        ],
+        [
+          1.1051599979400635,
+          1.265360951423645
+        ],
+        [
+          1.0734200477600098,
+          1.176156997680664
+        ],
+        [
+          1.0364400148391724,
+          1.1778864860534668
+        ],
+        [
+          1.0302799940109253,
+          1.161346197128296
+        ]
+      ],
+      "samples_per_rank_ms": [
+        [
+          [
+            1.0874199867248535,
+            1.2224390506744385
+          ],
+          [
+            1.1051599979400635,
+            1.265360951423645
+          ],
+          [
+            1.0491199493408203,
+            1.176156997680664
+          ],
+          [
+            1.0338599681854248,
+            1.1505167484283447
+          ],
+          [
+            1.011780023574829,
+            1.161346197128296
+          ]
+        ],
+        [
+          [
+            1.1011799573898315,
+            1.2427297830581665
+          ],
+          [
+            1.1032600402832031,
+            1.240950107574463
+          ],
+          [
+            1.0734200477600098,
+            1.1699172258377075
+          ],
+          [
+            1.0364400148391724,
+            1.1778864860534668
+          ],
+          [
+            1.0302799940109253,
+            1.1272850036621094
+          ]
+        ]
+      ]
+    }
+  ],
+  "deepep_mode": {
+    "requested": null,
+    "resolved": null
+  }
+}
