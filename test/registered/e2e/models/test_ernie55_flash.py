@@ -32,6 +32,8 @@ class TestErnie5_5Flash(GSM8KMixin, DefaultServerBase):
         "4",
         "--context-length",
         "131072",
+        "--max-running-requests",
+        "256",
     ]
     # Base model: sgl-eval sends chat requests only, so use the few-shot harness.
     gsm8k_backend = "run_eval"
