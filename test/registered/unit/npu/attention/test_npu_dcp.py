@@ -17,7 +17,7 @@ import torch
 
 # Loaded before the torch_npu mock below: importing transformers runs
 # accelerate's find_spec("torch_npu"), which fails on a mock without __spec__.
-import sglang.srt.utils.hf_transformers  # noqa: F401
+import sglang.srt.hf_transformers  # noqa: F401
 from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(est_time=9, suite="base-a-test-npu")
@@ -28,12 +28,12 @@ register_npu_ci(est_time=9, suite="base-a-test-npu")
 sys.modules.setdefault("sgl_kernel_npu", types.ModuleType("sgl_kernel_npu"))
 sys.modules.setdefault("torch_npu", MagicMock(name="torch_npu"))
 import sglang.srt.utils as _utils
-from sglang.srt.utils import common as _common_utils
+from sglang.srt.utils import device as _device_utils
 
-_real_is_npu = _common_utils.is_npu
+_real_is_npu = _device_utils.is_npu
 _real_utils_is_npu = _utils.is_npu
-_common_utils.is_npu = lambda: False
-_utils.is_npu = _common_utils.is_npu
+_device_utils.is_npu = lambda: False
+_utils.is_npu = _device_utils.is_npu
 try:
     from sglang.srt import runtime_context as rc
     from sglang.srt.hardware_backend.npu.attention.dsa_dcp import (
@@ -49,7 +49,7 @@ try:
         remap_dcp_sparse_indices,
     )
 finally:
-    _common_utils.is_npu = _real_is_npu
+    _device_utils.is_npu = _real_is_npu
     _utils.is_npu = _real_utils_is_npu
 
 
