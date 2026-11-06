@@ -129,6 +129,7 @@ POSITIONAL_FIELD_ORDER = (
     "enable_http2",
     "http2_max_concurrent_streams",
     "http2_initial_connection_window_size",
+    "max_payload_size",
     "ssl_keyfile",
     "ssl_certfile",
     "ssl_ca_certs",
