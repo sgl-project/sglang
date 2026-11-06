@@ -329,6 +329,28 @@ register_kernel(
     )
 )
 
+
+# Kimi-K3 ROCm route/sort/quant and MoE epilogue kernels (Triton).
+for _mod, _fn in [
+    ("k3_route_sort", "sort_quant"),
+    ("k3_route_sort_mid", "route_quant"),
+    ("k3_route_sort_mid", "sort_scatter"),
+    ("k3_moe_epi", "shared_down_topk"),
+    ("k3_moe_epi", "situ_topk"),
+    ("k3_moe_epi", "norm_add3"),
+    ("k3_moe_epi", "shared_gemm_preact"),
+    ("k3_moe_epi", "shared_gemm_sort_quant"),
+]:
+    register_kernel(
+        KernelSpec(
+            op=f"moe.{_mod}_{_fn}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.moe.{_mod}:{_fn}",
+            capabilities=_HIP,
+        )
+    )
+del _mod, _fn
+
 register_kernel(
     KernelSpec(
         op="moe.bailing_moe_biased_grouped_topk",
