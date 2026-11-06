@@ -117,6 +117,7 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
     sharded_weight_loader,
 )
+from sglang.srt.models import kimi_k3_mla_rocm
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods import (
     AttnForwardMethod,
 )
@@ -2427,6 +2428,22 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             alt.wait_stream(torch.cuda.current_stream())
             self._gate_pending_stream = alt
 
+    def _rocm_absorb_q_cache_target(self, forward_batch, num_rows):
+        return kimi_k3_mla_rocm.absorb_q_cache_target(self, forward_batch, num_rows)
+
+    def _rocm_absorb_q_cat_cache(self, q_nope, q_pe, k_nope, k_pe, forward_batch):
+        return kimi_k3_mla_rocm.absorb_q_cat_cache(
+            self, q_nope, q_pe, k_nope, k_pe, forward_batch
+        )
+
+    def _rocm_mla_cat_cache(self, q_nope_out, q_pe, k_nope, k_pe, forward_batch):
+        return kimi_k3_mla_rocm.mla_cat_cache(
+            self, q_nope_out, q_pe, k_nope, k_pe, forward_batch
+        )
+
+    def _rocm_absorb_v_gate(self, attn_output, forward_batch):
+        return kimi_k3_mla_rocm.absorb_v_gate(self, attn_output, forward_batch)
+
     def _compute_output_gate(self, hidden_states: torch.Tensor) -> torch.Tensor:
         alt = self._gate_pending_stream
         self._gate_pending_stream = None
@@ -3081,6 +3098,9 @@ class KimiK3LinearModel(nn.Module):
 class KimiK3LinearForCausalLM(nn.Module):
     """Text-only K3 causal LM."""
 
+    # AiterAttnBackend: FP8 PS-ASM MLA prefill + prefix no-cat K/V build.
+    aiter_k3_mla_prefill = True
+
     @staticmethod
     def get_model_config_for_expert_location(config):
         from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -3563,6 +3583,9 @@ class KimiK3LinearForCausalLM(nn.Module):
 
 class KimiK3ForConditionalGeneration(nn.Module):
     """K3 multimodal wrapper: MoonViT3d tower + KimiK3LinearForCausalLM."""
+
+    # AiterAttnBackend: FP8 PS-ASM MLA prefill + prefix no-cat K/V build.
+    aiter_k3_mla_prefill = True
 
     @staticmethod
     def get_model_config_for_expert_location(config):
