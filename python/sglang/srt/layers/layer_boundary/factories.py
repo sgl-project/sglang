@@ -18,11 +18,9 @@ from sglang.srt.layers.layer_boundary.adapters.overlap import (
     tbo_exit_rows,
 )
 from sglang.srt.layers.layer_boundary.boundary import _cp_moves
-from sglang.srt.layers.layer_boundary.construction import (
-    BatchVariant,
-    _bind_stage,
-)
+from sglang.srt.layers.layer_boundary.construction import _bind_stage
 from sglang.srt.layers.layer_boundary.contracts import (
+    BatchVariant,
     EdgeContract,
     ExitRows,
     InputContract,

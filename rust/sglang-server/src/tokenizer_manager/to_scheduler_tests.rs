@@ -152,6 +152,50 @@ fn every_abort_source_deregisters_and_stops_the_scheduler() {
     }
 }
 
+/// An `/abort_request` for a request the scheduler has keeps its detok entry,
+/// so the scheduler's terminal output still reaches the client, and queues
+/// behind the request on the request ring. On a full ring it falls back to
+/// the reserved lane and drops the entry, like any other abort.
+#[test]
+fn request_abort_keeps_the_sink_and_queues_behind_the_request() {
+    for (cap, keeps_sink) in [(2, true), (1, false)] {
+        let (detok_tx, detok_rx) = flume::unbounded::<DetokMsg>();
+        let (to_scheduler_tx, consumer) = to_scheduler(cap);
+        let request_ring = to_scheduler_tx.clone();
+        let (sd_tx, sd_rx) = flume::unbounded::<()>();
+        std::mem::forget(sd_tx);
+        let mut intake = Intake::new(
+            flume::unbounded().1,
+            flume::unbounded().1,
+            Senders {
+                tok_manager_tx: flume::unbounded().0,
+                abort_tx: flume::unbounded().0,
+                tokenizer_tx: flume::unbounded().0,
+                detokenizer_tx: vec![detok_tx],
+            },
+            to_scheduler_tx,
+            test_limits(),
+            test_mm(flume::unbounded().0, true),
+            sd_rx,
+        );
+        assert!(request_ring.try_push(SchedulerRequest {
+            header: b"request".to_vec().into(),
+            buffers: Vec::new(),
+        }));
+
+        intake.on_abort(AbortSource::Request("x".into()));
+
+        let headers: Vec<_> = consumer.drain(8).into_iter().map(|m| m.header).collect();
+        assert_eq!(headers.len(), 2, "cap {cap}");
+        assert_eq!(
+            headers[usize::from(!keeps_sink)],
+            b"request"[..],
+            "cap {cap}: the abort queues behind the request only on the request ring"
+        );
+        assert_eq!(detok_rx.try_recv().is_err(), keeps_sink, "cap {cap}");
+    }
+}
+
 /// A context ceiling high enough that only a test which sets one on purpose
 /// can reach it. `context_len` is mandatory now, so "no ceiling" has to be a
 /// large number rather than `None`; kept well below `u64::MAX` so the

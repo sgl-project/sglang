@@ -38,6 +38,7 @@ from sglang.srt.configs.model_config import (
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
+from sglang.srt.hf_transformers import get_rope_config
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
@@ -127,7 +128,6 @@ from sglang.srt.utils import (
     log_info_on_rank0,
     make_pp_layers,
 )
-from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -715,7 +715,6 @@ class MiniMaxM3MoE(nn.Module):
                     hidden_states,
                     self.gate.weight,
                     out_dtype=torch.float32,
-                    max_m=self.tiny_router_gemm_max_tokens,
                 )
             return torch.mm(
                 hidden_states, self.gate.weight.t(), out_dtype=torch.float32

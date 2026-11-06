@@ -19,6 +19,7 @@ from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecutio
 from sglang.srt.configs.laguna import normalize_gating
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
 from sglang.srt.environ import envs
+from sglang.srt.hf_transformers import get_rope_config
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communication.muse_spark_gemm_ag import gemm_ag
 from sglang.srt.layers.layer_boundary import AttentionInputs, get_attn_tp_context
@@ -33,6 +34,10 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import (
     LogitsProcessorOutput,
     should_apply_lm_head_quant_method,
+)
+from sglang.srt.layers.quantization.unquant import (
+    bf16_gemm_dispatch,
+    get_bf16_gemm_backend,
 )
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -56,7 +61,6 @@ from sglang.srt.speculative.dflash_utils import (
 )
 from sglang.srt.utils import BumpAllocator, bind_or_assign, is_npu, set_weight_attrs
 from sglang.srt.utils.common import get_compiler_backend
-from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _is_npu = is_npu()
 if _is_npu:
@@ -100,7 +104,16 @@ def _project_candidate_logits(
     """Project draft hiddens through the target head, restricted to the org vocab."""
     if not use_quant_head:
         weight = lm_head.weight
-        return torch.matmul(hidden.to(weight.dtype), weight[:num_org].T)
+        hidden = hidden.to(weight.dtype)
+        # Tuned bf16 dispatch (kernel chosen by GEMM shape); bf16 CUDA only.
+        backend = get_bf16_gemm_backend()
+        if (
+            (backend.is_cutedsl() or backend.is_gemv())
+            and hidden.is_cuda
+            and weight.dtype == torch.bfloat16
+        ):
+            return bf16_gemm_dispatch(hidden, weight[:num_org], None)
+        return torch.matmul(hidden, weight[:num_org].T)
     # A packed weight can't be row-sliced to the org vocab like the dense path,
     # and flashinfer's radix top-k rejects the crop view (non-contiguous), so
     # mask the padded tail out of the top-k instead.
@@ -600,6 +613,7 @@ class DFlashMLAAttention(DeepseekV2AttentionMLA):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         cache_loc: torch.Tensor,
+        swa_cache_loc: Optional[torch.Tensor] = None,
         cache_loc_2d: Optional[torch.Tensor] = None,
         commit_lens: Optional[torch.Tensor] = None,
     ) -> None:
@@ -607,11 +621,24 @@ class DFlashMLAAttention(DeepseekV2AttentionMLA):
         k_nope, k_pe = self.project_context_kv(positions, hidden_states)
         if cache_loc_2d is None:
             pool.set_mla_kv_buffer(
-                self.attn_mqa, KVWriteLoc(cache_loc, physical=True), k_nope, k_pe
+                self.attn_mqa,
+                KVWriteLoc(cache_loc, swa_loc=swa_cache_loc, physical=True),
+                k_nope,
+                k_pe,
             )
         else:
-            pool.set_mla_kv_buffer_prefix_valid(
-                self.attn_mqa, cache_loc_2d, commit_lens, k_nope, k_pe
+            pool.layer_router.layer(self.attn_mqa.layer_id).store_mla_prefix(
+                self.attn_mqa,
+                KVWriteLoc(
+                    cache_loc_2d,
+                    swa_loc=None
+                    if swa_cache_loc is None
+                    else swa_cache_loc.view_as(cache_loc_2d),
+                    physical=True,
+                ),
+                commit_lens,
+                k_nope,
+                k_pe,
             )
 
 
@@ -707,7 +734,7 @@ class DFlashGroupedConv(nn.Module):
         base_kernel = torch.zeros(2, self.taps, hidden_size)
         base_kernel[:, 0] = 1.0
         self.base_kernel = nn.Parameter(base_kernel)
-        self.kernel_projection = nn.Linear(
+        self.kernel_projection = ReplicatedLinear(
             hidden_size, 2 * self.taps * self.num_groups, bias=False
         )
 
@@ -728,7 +755,7 @@ class DFlashGroupedConv(nn.Module):
         )
 
     def prepare(self, hidden_states: torch.Tensor):
-        coefficients = self.kernel_projection(hidden_states).reshape(
+        coefficients = self.kernel_projection(hidden_states)[0].reshape(
             *hidden_states.shape[:-1], 2, self.taps, self.num_groups
         )
         return (
