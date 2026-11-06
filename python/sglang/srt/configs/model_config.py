@@ -35,17 +35,17 @@ from sglang.srt.configs.unlimited_ocr_v2 import (
     UocrDocumentConfig,
 )
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_platform
-from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import is_hip, is_npu, retry
-from sglang.srt.utils.hf_transformers import (
+from sglang.srt.hf_transformers import (
     get_config,
     get_context_length,
     get_generation_config,
     get_hf_text_config,
     get_sparse_attention_config,
 )
-from sglang.srt.utils.hf_transformers.config import POINTER_ADAPTER_BASES
+from sglang.srt.hf_transformers.config import POINTER_ADAPTER_BASES
+from sglang.srt.runtime_context import get_platform
+from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils import is_hip, is_npu, retry
 from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 from sglang.utils import is_in_ci
 
@@ -2071,7 +2071,7 @@ class ModelConfig:
         # Check for HuggingFace quantization config
         quant_cfg = getattr(self.hf_config, "quantization_config", None)
         if quant_cfg is None:
-            from sglang.srt.utils import has_hf_quant_config
+            from sglang.srt.configs.quant_utils import has_hf_quant_config
 
             return has_hf_quant_config(self.model_path)
         return True

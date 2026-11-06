@@ -26,6 +26,14 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_decode_parallel_world_size,
     model_parallel_is_initialized,
 )
+from sglang.multimodal_gen.runtime.models.dits.nomas_kv_cache import (
+    _block_mask_builder,
+    _flex_kernel,
+)
+from sglang.multimodal_gen.runtime.models.dits.nomas_layers import (
+    _compile_exact,
+    _fused_ok,
+)
 
 TUBELET = (4, 16, 16)
 TUBE_DIM = TUBELET[0] * TUBELET[1] * TUBELET[2] * 3
@@ -129,21 +137,7 @@ def apply_mrope(
     return x * cos + rotated * sin
 
 
-def _fused_ok(x: torch.Tensor) -> bool:
-    return (
-        x.is_cuda and not torch.is_grad_enabled() and not torch.compiler.is_compiling()
-    )
-
-
-def _compile_exact(fn):
-    # emulate_precision_casts keeps every intermediate rounding, so the fused
-    # elementwise kernels are bit-identical to the eager sequences they replace.
-    # Mean-square reductions stay in ATen to keep their summation order.
-    return torch.compile(
-        fn, dynamic=True, fullgraph=True, options={"emulate_precision_casts": True}
-    )
-
-
+# Mean-square reductions stay in ATen to keep their summation order.
 def _square(x):
     return x.float().pow(2)
 
@@ -190,13 +184,6 @@ def _compiled_silu_mul():
 
 def _mean_square(x):
     return _compiled_square()(x).mean(-1, keepdim=True)
-
-
-@lru_cache(maxsize=1)
-def _block_mask_builder():
-    from torch.nn.attention.flex_attention import create_block_mask
-
-    return torch.compile(create_block_mask, dynamic=True, fullgraph=True)
 
 
 def local_attention_layout(grid: tuple[int, int, int], tile: int, device):
@@ -253,15 +240,7 @@ def _flex_attention(
 
     if q.device.type != "cuda" or torch.compiler.is_compiling():
         return flex_attention(q, k, v, block_mask=block_mask, enable_gqa=True)
-    return _compiled_flex()(q, k, v, block_mask=block_mask, enable_gqa=True)
-
-
-@lru_cache(maxsize=1)
-def _compiled_flex():
-    from torch.nn.attention.flex_attention import flex_attention
-
-    # Never allow an eager quadratic-memory fallback after graph specialization.
-    return torch.compile(flex_attention, dynamic=True, fullgraph=True)
+    return _flex_kernel()(q, k, v, block_mask=block_mask, enable_gqa=True)
 
 
 class RMSNorm(nn.Module):

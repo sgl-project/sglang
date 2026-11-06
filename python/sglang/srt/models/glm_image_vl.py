@@ -52,6 +52,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_pos_emb
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -68,7 +69,7 @@ from sglang.srt.models.qwen3_vl import Qwen3_VisionMLP as GlmImageVisionMLP
 from sglang.srt.models.utils import compute_cu_seqlens_from_grid_numpy
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.runtime_context import get_mm, get_parallel
-from sglang.srt.utils import add_prefix, is_npu
+from sglang.srt.utils import is_npu
 
 logger = logging.getLogger(__name__)
 
