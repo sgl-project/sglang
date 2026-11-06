@@ -1675,6 +1675,14 @@ class OpenAIServingResponses(OpenAIServingChat):
                 and (
                     merged[-1].get("phase") == msg.get("phase")
                     or set(merged[-1]) == {"role", "reasoning_content"}
+                    # The tool calls a commentary preamble announces belong to
+                    # the same turn. Kept apart, the replayed history shows the
+                    # preamble as a finished turn, and the model learns to stop
+                    # after the preamble without calling a tool.
+                    or (
+                        merged[-1].get("phase") == "commentary"
+                        and set(msg) == {"role", "tool_calls"}
+                    )
                 )
             ):
                 prev = merged[-1] = dict(merged[-1])
