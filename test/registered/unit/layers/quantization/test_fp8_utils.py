@@ -22,6 +22,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     transform_scale_ue8m0,
 )
 from sglang.srt.runtime_context import get_platform
+from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -132,7 +133,7 @@ class TestInverseTransformScaleUe8m0(CustomTestCase):
                 # DeepSeek V3 kv_b_proj
                 (32768, 512),
                 dtype=torch.bfloat16,
-                device="cuda",
+                device=get_device(),
             )
 
             weight_block_size = [128, 128]
@@ -141,11 +142,17 @@ class TestInverseTransformScaleUe8m0(CustomTestCase):
                 weight_bf16, weight_block_size=weight_block_size
             )
             mn = qweight.shape[-2]
+            # DeepGEMM is CUDA-only; elsewhere check the torch impl.
+            use_torch_impl = not _is_cuda
 
-            sf_packed_original = transform_scale_ue8m0(sf_fp32_original, mn=mn)
+            sf_packed_original = transform_scale_ue8m0(
+                sf_fp32_original, mn=mn, use_torch_impl=use_torch_impl
+            )
             sf_fp32_recreated = inverse_transform_scale_ue8m0(sf_packed_original, mn=mn)
 
-            sf_packed_recreated = transform_scale_ue8m0(sf_fp32_recreated, mn=mn)
+            sf_packed_recreated = transform_scale_ue8m0(
+                sf_fp32_recreated, mn=mn, use_torch_impl=use_torch_impl
+            )
 
             assert torch.all(sf_packed_original == sf_packed_recreated), (
                 f"{sf_packed_original=} {sf_packed_recreated}"
