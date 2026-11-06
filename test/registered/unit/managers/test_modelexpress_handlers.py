@@ -543,6 +543,9 @@ def test_tokenizer_reports_all_ranks_without_extra_fanout(
     tokenizer._weight_update_session_call = MethodType(
         TokenizerControlMixin._weight_update_session_call, tokenizer
     )
+    tokenizer._weight_update_session_replies = MethodType(
+        TokenizerControlMixin._weight_update_session_replies, tokenizer
+    )
     request = UpdateWeightsFromModelExpressReqInput(weight_version="2")
 
     async def update():
