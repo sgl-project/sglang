@@ -13,6 +13,7 @@ from sglang.kernels.ops.memory.common import (
     get_last_loc_triton_safe,
     write_req_to_token_pool_triton,
 )
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_write_dsv4_decode,
     maybe_write_dsv4_extend,
@@ -42,7 +43,7 @@ from sglang.srt.utils import (
     next_power_of_2,
     support_triton,
 )
-from sglang.srt.utils.common import is_pin_memory_available
+from sglang.srt.utils.device import is_pin_memory_available
 
 _is_hip = is_hip()
 _is_npu = is_npu()
@@ -274,6 +275,26 @@ def ensure_mamba_capacity(
             EvictParams(num_tokens=0, mamba_num=needed - available)
         )
     return allocator.schedulable_available_size() >= needed
+
+
+def alloc_tracking_slots(
+    storage: KVStorage | StaticKVStorage,
+    state: StateStorage,
+    candidates: list[tuple[Req, int]],
+    tree_cache: BasePrefixCache | None,
+) -> list[bool]:
+    """Give each (req, position) candidate a lazy tracking slot; one bool each.
+
+    A shortfall evicts cached states from the tree once; a candidate that still
+    gets no slot is False, and its boundary writes no snapshot.
+    """
+    available = state.slots.schedulable_available_size()
+    if envs.SGLANG_TEST_MAMBA_LAZY_POOL_FULL.get():
+        available = 0
+    shortfall = len(candidates) - available
+    if shortfall > 0 and tree_cache is not None and tree_cache.supports_mamba():
+        tree_cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=shortfall))
+    return [storage.take_tracking_slot(req, pos) for req, pos in candidates]
 
 
 def alloc_req_slots(

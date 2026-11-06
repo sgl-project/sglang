@@ -27,6 +27,7 @@ import orjson
 import psutil
 
 from sglang.srt.disaggregation.kv_events import select_kv_publisher_dp_rank
+from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import ShutdownReq
 from sglang.srt.managers.utils import (
     MsgpackDecodeError,
@@ -34,7 +35,13 @@ from sglang.srt.managers.utils import (
 )
 from sglang.srt.multimodal.cache.identity import build_processor_fingerprint
 from sglang.srt.observability.startup_time import build_engine_startup_time
-from sglang.srt.runtime_context import get_exec, get_mm, get_parallel, get_serving
+from sglang.srt.runtime_context import (
+    get_device,
+    get_exec,
+    get_mm,
+    get_parallel,
+    get_serving,
+)
 from sglang.srt.rust_server.config import (
     _build_server_args,
     _frontend_cpu_key,
@@ -49,7 +56,6 @@ from sglang.srt.rust_server.multimodal import (
     settle_shm_buffers,
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.utils.common import get_bool_env_var
 from sglang.srt.utils.flatten import (
     FlatPairColumns,
     NestedRowColumns,
@@ -263,7 +269,17 @@ class RustServer:
         host = get_serving().host
         if host in ("", "0.0.0.0", "::"):
             # An unspecified bind address is not reachable from another node.
-            host = get_local_ip_auto(fallback="127.0.0.1")
+            detected = get_local_ip_auto(fallback="127.0.0.1")
+            if (
+                host == "0.0.0.0"
+                and NetworkAddress(detected, 0).is_ipv6
+                and _is_loopback(detected)
+            ):
+                # SGLANG_HOST_IP=::1 names this machine, which this IPv4
+                # listener serves at 127.0.0.1. It does not serve any other
+                # IPv6 address; gather_server_endpoints refuses those.
+                detected = "127.0.0.1"
+            host = detected
         return host
 
     @classmethod
@@ -445,7 +461,7 @@ class RustServer:
         (``sglang.srt.rust_server.shutdown``), as Python mode's tokenizer
         manager drains: health answers 503 at once, requests are still
         admitted, the listener closes once none is left in flight, and then
-        :meth:`drain` stops the schedulers. ``SGL_FORCE_SHUTDOWN`` skips the
+        :meth:`drain` stops the schedulers. ``SGLANG_FORCE_SHUTDOWN`` skips the
         wait for requests, as in Python.
 
         The drain begins from a Rust thread woken through the signal wakeup
@@ -460,7 +476,7 @@ class RustServer:
                 "rust server: not on the main thread; SIGTERM will not drain"
             )
             return
-        force = get_bool_env_var("SGL_FORCE_SHUTDOWN")
+        force = envs.SGLANG_FORCE_SHUTDOWN.get()
         if not self._broadcasts_shutdown:
             notify = None
 
@@ -507,9 +523,13 @@ class RustServer:
 
     def wait_request(self, timeout_ms: int) -> None:
         """Block until a request is pushed into the in-process ring or the timeout
-        elapses.
+        elapses. Without --sleep-on-idle, return at once, so the idle loop
+        polls the ring without blocking as Python's polls its sockets: a parked
+        thread starts each request's step on a cold core. A subclass that
+        holds drained requests back still parks on those.
         """
-        self.server.wait_request(timeout_ms)
+        if get_device().sleep_on_idle:
+            self.server.wait_request(timeout_ms)
 
     def drain(self, max_recv: int) -> List[Any]:
         """Ingress: non-blocking drain of the in-process ring → list of decoded

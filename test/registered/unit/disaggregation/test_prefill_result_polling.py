@@ -240,7 +240,8 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.send_kv_chunk = Mock()
         self.process_pending_chunked_abort = Mock()
         self.dp_attn_adapter = SimpleNamespace(
-            maybe_prepare_mlp_sync_batch=lambda batch: batch
+            maybe_prepare_mlp_sync_batch=lambda batch: batch,
+            shutdown_vote_pending=lambda: False,
         )
 
     def _process_hicache_events(self, should_retry_storage_prefetch=True):
@@ -959,23 +960,20 @@ class TestPrefillResultPolling(CustomTestCase):
                         poll=lambda: KVPoll.Transferring
                     )
                 released = []
+                scheduler.request_retirer = Mock()
+                release = scheduler.request_retirer.release
+                release.side_effect = lambda *args, **kwargs: released.append(
+                    scheduler.iteration
+                )
                 with (
                     _single_rank_gloo_group(),
-                    patch(
-                        "sglang.srt.disaggregation.prefill.release_kv_cache",
-                        side_effect=lambda *args, **kwargs: released.append(
-                            scheduler.iteration
-                        ),
-                    ) as release_kv,
                     envs.SGLANG_DISAGG_PREFILL_POLL_TRANSFERS_WHILE_WAITING.override(
                         poll_transfers
                     ),
                 ):
                     _run_loop(scheduler)
 
-                release_kv.assert_called_once_with(
-                    prior, scheduler.tree_cache, checkpoint=True
-                )
+                release.assert_called_once_with(prior, checkpoint=True)
                 self.assertEqual(released, [retired_at])
                 self.assertEqual(prior.metadata_buffer_index, -1)
                 self.assertEqual(second.reqs[0].metadata_buffer_index, 0)
@@ -1159,8 +1157,6 @@ class TestPrefillResultPolling(CustomTestCase):
                 )
 
                 class OptimisticScheduler(_Scheduler):
-                    release_aborted_request = Scheduler.release_aborted_request
-
                     def run_batch(self, batch):
                         if req in batch.reqs:
                             req.extend_end = batch.forward_iter

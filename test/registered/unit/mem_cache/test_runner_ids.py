@@ -23,7 +23,12 @@ Triton kernel.
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.unified_allocator_fixtures import arena_of, stand_in_views
+from sglang.test.unified_allocator_fixtures import (
+    FakeKVCache,
+    FakeUnifiedSWAKVPool,
+    arena_of,
+    stand_in_views,
+)
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -31,7 +36,6 @@ import unittest
 from types import SimpleNamespace
 
 import torch
-from test_multi_ended_allocator import _FakeKVCache, _FakeUnifiedSWAKVPool
 
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
@@ -72,7 +76,7 @@ def _build_composite(ps, n_full_pages=16, n_swa_pages=8):
         enable_memory_saver=False,
         page_size=ps,
     )
-    kvcache = _FakeUnifiedSWAKVPool(pool)
+    kvcache = FakeUnifiedSWAKVPool(pool)
     allocator = ChainAllocator(
         roles=ChainRoles(owner="full", window="swa"),
         arena=pool,
@@ -535,19 +539,19 @@ class TestWriteIds(CustomTestCase):
                     roles=ChainRoles(owner="full", state="mamba"),
                     arena=pool,
                     kvcache=SimpleNamespace(
-                        full_kv_pool=_FakeKVCache(pool, "full"),
-                        mamba_pool=_FakeKVCache(pool, "mamba"),
+                        full_kv_pool=FakeKVCache(pool, "full"),
+                        mamba_pool=FakeKVCache(pool, "mamba"),
                     ),
                     views=stand_in_views(
                         ChainRoles(owner="full", state="mamba"),
                         SimpleNamespace(
-                            full_kv_pool=_FakeKVCache(pool, "full"),
-                            mamba_pool=_FakeKVCache(pool, "mamba"),
+                            full_kv_pool=FakeKVCache(pool, "full"),
+                            mamba_pool=FakeKVCache(pool, "mamba"),
                         ),
                         (
                             SimpleNamespace(
-                                full_kv_pool=_FakeKVCache(pool, "full"),
-                                mamba_pool=_FakeKVCache(pool, "mamba"),
+                                full_kv_pool=FakeKVCache(pool, "full"),
+                                mamba_pool=FakeKVCache(pool, "mamba"),
                             )
                         ).mamba_pool,
                     ),

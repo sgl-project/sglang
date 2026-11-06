@@ -16,16 +16,14 @@ from sglang.srt.arg_groups.arg_utils import (
     A,
     Arg,
     Derived,
+    json_list_type,
+    nullable_str,
 )
 from sglang.srt.arg_groups.choices import (
     LOAD_FORMAT_CHOICES,
     QUANTIZATION_CHOICES,
 )
-from sglang.srt.utils.common import (
-    human_readable_int,
-    json_list_type,
-    nullable_str,
-)
+from sglang.srt.utils.common import human_readable_int
 
 
 class Model(msgspec.Struct):

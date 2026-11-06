@@ -45,7 +45,8 @@ under `ops/` (a model-named file or subpackage inside a group is fine).
 
 `lora` is its own group because it has a distinct responsibility: the adapter
 kernels that only the LoRA runtime in `srt/lora` calls (`dense/` SGMV GEMMs and
-their tuning data, `moe/` fused MoE-LoRA). It also keeps the experimental
+their tuning data, `moe/` fused MoE-LoRA, `common/` the routing and A/B kernels
+both share). It also keeps the experimental
 TRT-LLM LoRA path whole as `dense/trtllm_lora_temp/` and
 `moe/trtllm_lora_temp/`; the latter includes the FlashInfer overlay and the
 flag-gated routing kernels that `srt/layers/moe/topk.py` reaches.
