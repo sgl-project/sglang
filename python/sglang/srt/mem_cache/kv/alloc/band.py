@@ -1148,8 +1148,8 @@ class Band:
         the data-dependent dedup is skipped. `free_index` is token-granular and
         need not be page-aligned. EAGER drops one `wait_stream(forward_stream)`
         barrier so the v2p/p2v writes and the compaction move serialize with the
-        in-flight forward; LAZY needs none (a freed `v` has no live reader) and
-        defers compaction to `_flush`.
+        in-flight forward; LAZY waits for the latest forward before recycling
+        physical storage and defers compaction to `_flush`.
         """
         with record_function("Band.free"):
             if free_index is None or free_index.numel() == 0:
@@ -1233,9 +1233,16 @@ class Band:
                 free_v_pages = free_v_pages_raw
             else:
                 free_v_pages = torch.unique(free_v_pages_raw // self.page_size)
-            # One kernel for the v2p read and both tombstones; disjoint-element
-            # scatters need no barrier (a freed v has no live reader). Never the
-            # scalar `t[idx] = -1` form: it materialises -1 on the CPU and blocks
+            # A prepared attention page table can still read the freed storage
+            # after shared metadata reads finish. Order reuse after the whole
+            # forward, before a later allocation can overwrite or zero it.
+            if (
+                self._latest_forward_done_event is not None
+                and torch.device(self.device).type == "cuda"
+            ):
+                torch.cuda.current_stream().wait_event(self._latest_forward_done_event)
+            # One kernel for the v2p read and both tombstones. Never the scalar
+            # `t[idx] = -1` form: it materialises -1 on the CPU and blocks
             # the scheduler on a pageable H2D copy (~16 ms per 8192-token free).
             freed_p_pages = free_unbind_inplace(
                 free_v_pages, self.ids.virtual_to_physical, self.ids.physical_to_virtual

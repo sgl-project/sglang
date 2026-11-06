@@ -504,7 +504,6 @@ def moe_fused_gate(
             num_fused_shared_experts,
             num_expert_group,
             topk_group,
-            scores.device.index,
         )
         and moe_route_warp.bias_layout_ok(bias, bias_alt)
     ):
