@@ -1308,7 +1308,26 @@ def check_not_image_generation_head(name: str) -> None:
 
 class Qwen3VLForConditionalGeneration(nn.Module):
     supports_cuda_vmm_feature_transport = True
+    # BitsAndBytes specific attributes
 
+    default_bitsandbytes_target_modules = [
+            ".gate_proj.",
+        ".down_proj.",
+        ".up_proj.",
+        ".q_proj.",
+        ".k_proj.",
+        ".v_proj.",
+        ".o_proj.",
+    ]
+
+    bitsandbytes_stacked_params_mapping = {
+            "q_proj": ("qkv_proj", 0),
+        "k_proj": ("qkv_proj", 1),
+        "v_proj": ("qkv_proj", 2),
+        "gate_proj": ("gate_up_proj", 0),
+        "up_proj": ("gate_up_proj", 1),
+    }
+    
     # To ensure correct weight loading and mapping.
     hf_to_sglang_mapper = WeightsMapper(
         orig_to_new_substr={
