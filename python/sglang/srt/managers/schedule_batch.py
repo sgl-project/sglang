@@ -129,10 +129,8 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.common import (
     RetractionBackup,
-    backup_kv_cache,
     evict_from_tree_cache,
     match_kv_cache,
-    release_kv_cache,
 )
 from sglang.srt.mem_cache.kv.advance import TrackingAdvance
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -165,6 +163,9 @@ if TYPE_CHECKING:
     from sglang.srt.layers.engram_staging import StagedRows
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.managers.scheduler_components.metrics_reporter import PrefillStats
+    from sglang.srt.managers.scheduler_components.request_retirer import (
+        RequestRetirer,
+    )
     from sglang.srt.mem_cache.storage_prefetch import StagedPrefetchPlan
     from sglang.srt.models.unlimited_ocr_v2_support.document_reuse import UocrReqState
     from sglang.srt.sampling.custom_logit_processor import PageGuardState
@@ -1798,35 +1799,12 @@ def release_req(
     *,
     req: Req,
     remaing_req_count: int,
-    req_to_token_pool: ReqToTokenPool,
-    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
     tree_cache: BasePrefixCache,
-    hisparse_coordinator: Optional[HiSparseCoordinator],
+    request_retirer: RequestRetirer,
     offload_kv: bool = True,
 ) -> bool:
     """Returns whether the request can be resumed."""
-    if hisparse_coordinator is not None and not req.finished():
-        hisparse_coordinator.retract_req(req)
-
-    # In decode disaggregation the retracted KV is offloaded to host so it can be
-    # restored later without recompute (see resume_retracted_reqs/load_kv_cache).
-    # Callers that will recompute the KV instead (PD true-retraction rebootstrap)
-    # pass offload_kv=False to skip the wasteful device->host copy.
-    # The config bag reflects role flips; server_args keeps the launch role.
-    if get_disagg().disaggregation_mode != "decode":
-        resumable = req.resumable_by_reprefill
-    elif offload_kv:
-        resumable = backup_kv_cache(
-            req,
-            tree_cache,
-            req_to_token_pool,
-            token_to_kv_pool_allocator,
-            get_disagg().disaggregation_decode_retraction_backup,
-        )
-    else:
-        resumable = req.resumable_by_rebootstrap
-    # TODO (csy): for preempted requests, we may want to insert into the tree
-    release_kv_cache(req, tree_cache, checkpoint=False)
+    resumable = request_retirer.retract(req, offload_kv=offload_kv)
     # NOTE(lsyin): we should use the newly evictable memory instantly.
     num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
     evict_from_tree_cache(tree_cache, num_tokens)
@@ -1838,10 +1816,8 @@ def release_req(
 def retract_all(
     *,
     reqs: List[Req],
-    req_to_token_pool: ReqToTokenPool,
-    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
     tree_cache: BasePrefixCache,
-    hisparse_coordinator: Optional[HiSparseCoordinator],
+    request_retirer: RequestRetirer,
     offload_kv: bool = True,
 ) -> List[Req]:
     """Returns the requests that cannot be resumed."""
@@ -1850,10 +1826,8 @@ def retract_all(
         if not release_req(
             req=reqs[idx],
             remaing_req_count=len(reqs) - idx,
-            req_to_token_pool=req_to_token_pool,
-            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             tree_cache=tree_cache,
-            hisparse_coordinator=hisparse_coordinator,
+            request_retirer=request_retirer,
             offload_kv=offload_kv,
         ):
             unresumable.append(reqs[idx])
@@ -2904,7 +2878,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             spec_algorithm=self.spec_algorithm,
         )
 
-    def retract_decode(self) -> Tuple[List[Req], float, List[Req]]:
+    def retract_decode(
+        self, request_retirer: RequestRetirer
+    ) -> Tuple[List[Req], float, List[Req]]:
         """Retract the decoding requests when there is not enough memory."""
         sorted_indices = self._get_decode_retraction_order(self.reqs)
         sorted_indices = beam_retraction_order(sorted_indices, self.reqs)
@@ -2941,10 +2917,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     ),
                 )
                 # Aborting, so a host backup to resume from would be wasted.
-                self.release_req(idx, len(sorted_indices), offload_kv=False)
+                self.release_req(
+                    idx, len(sorted_indices), request_retirer, offload_kv=False
+                )
                 continue
             # release memory and don't insert into the tree because we need the space instantly
-            if self.release_req(idx, len(sorted_indices)):
+            if self.release_req(idx, len(sorted_indices), request_retirer):
                 retracted_reqs.append(req)
             else:
                 # No backup or rebuild exists and the device KV is already freed.
@@ -2990,7 +2968,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         self.req_to_token_pool, self.token_to_kv_pool_allocator
                     ),
                 )
-            self.release_req(last_idx, 0, offload_kv=False)
+            self.release_req(last_idx, 0, request_retirer, offload_kv=False)
             logger.warning(
                 "retract_decode: aborted last request %s due to OOM", last_req.rid
             )
@@ -3049,15 +3027,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self,
         idx: int,
         remaing_req_count: int,
+        request_retirer: RequestRetirer,
         offload_kv: bool = True,
     ) -> bool:
         return release_req(
             req=self.reqs[idx],
             remaing_req_count=remaing_req_count,
-            req_to_token_pool=self.req_to_token_pool,
-            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             tree_cache=self.tree_cache,
-            hisparse_coordinator=self.hisparse_coordinator,
+            request_retirer=request_retirer,
             offload_kv=offload_kv,
         )
 

@@ -42,32 +42,28 @@ import triton.language as tl
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.types import e4m3_dtype
 
-try:  # gfx950 assembly MTP-verify attention (in-tree .s, assembled at first use)
-    from sglang.kernels.ops.attention.vattn_asm_gfx950 import (
-        AsmKernelUnavailable as _AsmKernelUnavailable,
-    )
-    from sglang.kernels.ops.attention.vattn_asm_gfx950 import (
-        asm_kernel_available as _asm_kernel_available,
-    )
-    from sglang.kernels.ops.attention.vattn_asm_gfx950 import (
-        mtp_verify_attn_fwd_asm as _mtp_verify_attn_fwd_asm,
-    )
-    from sglang.kernels.ops.attention.vattn_asm_gfx950 import (
-        reset_seg_plan_cache as _reset_seg_plan_cache,
-    )
-except ImportError:
-    _mtp_verify_attn_fwd_asm = None
-    _AsmKernelUnavailable = RuntimeError
-    _reset_seg_plan_cache = None
+from sglang.kernels.arch import current_arch
 
+# gfx950 assembly MTP-verify attention (in-tree .s, assembled at first use)
+from sglang.kernels.ops.attention.vattn_asm_gfx950 import (
+    AsmKernelUnavailable as _AsmKernelUnavailable,
+)
+from sglang.kernels.ops.attention.vattn_asm_gfx950 import (
+    asm_kernel_available as _asm_kernel_available,
+)
+from sglang.kernels.ops.attention.vattn_asm_gfx950 import (
+    mtp_verify_attn_fwd_asm as _mtp_verify_attn_fwd_asm,
+)
+from sglang.kernels.ops.attention.vattn_asm_gfx950 import (
+    reset_seg_plan_cache as _reset_seg_plan_cache,
+)
 from sglang.srt.utils import get_hip_version, is_gfx95_supported
 
 
 def reset_verify_attn_plan_cache() -> None:
     """Drop the per-forward split-KV segment plan of the asm kernel;
     the attention backend calls this at the start of every forward."""
-    if _reset_seg_plan_cache is not None:
-        _reset_seg_plan_cache()
+    _reset_seg_plan_cache()
 
 
 def asm_verify_attn_enabled() -> bool:
@@ -76,8 +72,7 @@ def asm_verify_attn_enabled() -> bool:
     shape is supported. A failed assembly or module load disables it for the
     rest of the process."""
     return (
-        _mtp_verify_attn_fwd_asm is not None
-        and is_gfx95_supported()
+        is_gfx95_supported()
         and get_hip_version() >= (7, 2, 0)
         and _asm_kernel_available()
     )
@@ -746,7 +741,7 @@ def unified_attention_3d_mtp_func(
     total_num_q_blocks = num_tokens // block_q + num_seqs
     num_2d_programs = total_num_q_blocks * num_kv_heads
 
-    num_cus = torch.cuda.get_device_properties(q.device).multi_processor_count
+    num_cus = current_arch().num_sms
     max_segments = min(64, math.ceil(max_seqlen_k / tile_size))
     parallel_segments = math.ceil(num_cus * 2 / max(1, num_2d_programs))
     work_segments = math.ceil(max_seqlen_k / (tile_size * 32))

@@ -436,11 +436,8 @@ def test_dcp_disables_quick_allreduce_without_changing_tp_default():
             mock_world.local_rank = 0
             mock_world_group.return_value = mock_world
 
-            parallel_state.initialize_model_parallel(
-                tensor_model_parallel_size=8,
-                pipeline_model_parallel_size=1,
-                decode_context_parallel_size=8,
-            )
+            publish_build_topology(tp_size=8, pp_size=1, dcp_size=8)
+            parallel_state.initialize_model_parallel()
 
             assert created_group_kwargs["dcp"]["use_quick_allreduce"] is False
             assert "use_quick_allreduce" not in created_group_kwargs["tp"]
@@ -516,24 +513,4 @@ def test_group_desc_none_normalized_to_anonymous():
 
 
 if __name__ == "__main__":
-    # Run tests without requiring GPUs
-    import sys
-
-    try:
-        test_parallel_group_construction_tp8_attn_cp2(False)
-        test_parallel_group_construction_tp8_attn_cp2(True)
-        test_parallel_group_construction_tp8_moe_ep4_cp2()
-        test_group_desc_propagated_via_real_new_group("tp")
-        test_group_desc_propagated_via_real_new_group("pp")
-        test_group_desc_none_normalized_to_anonymous()
-
-        sys.exit(0)
-    except AssertionError as e:
-        print(f"\n Test failed: {e}")
-        sys.exit(1)
-    except Exception as e:
-        print(f"\n Unexpected error: {e}")
-        import traceback
-
-        traceback.print_exc()
-        sys.exit(1)
+    sys.exit(pytest.main([__file__]))

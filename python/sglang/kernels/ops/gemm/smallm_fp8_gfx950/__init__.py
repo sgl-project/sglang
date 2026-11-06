@@ -9,17 +9,14 @@ import ctypes
 import logging
 import os
 import subprocess
-import tempfile
 
 import torch
 
 from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils.hipcc import (
     HipKernel,
-    check_hip,
-    hip_lib,
+    build_gfx950_module,
     hip_version,
-    hipcc_path,
 )
 
 _SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "smallm_fp8_gemm.hip")
@@ -55,23 +52,8 @@ def smallm_fp8_gemm_enabled() -> bool:
         _mod = False
         hip = current_arch().hip
         if hip is not None and hip.gcn_arch == "gfx950" and hip_version() >= (7, 2, 0):
-            co = os.path.join(tempfile.mkdtemp(prefix="sglang_smallm_fp8_"), "k.co")
-            cmd = [
-                hipcc_path(),
-                "--genco",
-                "--offload-arch=gfx950",
-                "-O3",
-                "-o",
-                co,
-                _SRC,
-            ]
             try:
-                subprocess.run(cmd, check=True, capture_output=True)
-                mod = ctypes.c_void_p()
-                check_hip(
-                    hip_lib().hipModuleLoad(ctypes.byref(mod), co.encode()), "load"
-                )
-                _mod = mod
+                _mod = build_gfx950_module(_SRC, "sglang_smallm_fp8_")
             except (OSError, subprocess.CalledProcessError, RuntimeError) as e:
                 logger.warning("smallm_fp8_gemm disabled: %s", e)
     return _mod is not False
