@@ -369,13 +369,16 @@ def register_grammar_backend(name, init_func):
 
 
 def grammar_stop_token_ids(tokenizer, eos_token_ids=None) -> Optional[set]:
-    """Every token id the scheduler finishes a request on. A stop token missing
-    here is ordinary text to the grammar, so a constrained request could end on
-    it before the grammar is complete."""
+    """Stop tokens known at startup: config EOS, tokenizer EOS and additional
+    stop tokens. A stop token missing here is ordinary text to the grammar, so a
+    constrained request could end on it before the grammar is complete."""
     ids = set(eos_token_ids or ())
-    if getattr(tokenizer, "eos_token_id", None) is not None:
-        ids.add(tokenizer.eos_token_id)
-    ids.update(getattr(tokenizer, "additional_stop_token_ids", None) or ())
+    eos_token_id = getattr(tokenizer, "eos_token_id", None)
+    if eos_token_id is not None:
+        ids.add(eos_token_id)
+    additional_stop_token_ids = getattr(tokenizer, "additional_stop_token_ids", None)
+    if additional_stop_token_ids is not None:
+        ids.update(additional_stop_token_ids)
     return ids or None
 
 

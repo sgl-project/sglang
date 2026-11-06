@@ -433,12 +433,37 @@ class TestNulByteGrammarRejection(unittest.TestCase):
 
 
 class TestGrammarStopTokenIds(unittest.TestCase):
-    def test_includes_every_scheduler_stop_token(self):
-        tokenizer = SimpleNamespace(eos_token_id=163585, additional_stop_token_ids={7})
-        self.assertEqual(
-            grammar_stop_token_ids(tokenizer, {163586}), {7, 163585, 163586}
-        )
+    def test_no_startup_stop_tokens_gives_none(self):
         self.assertIsNone(grammar_stop_token_ids(SimpleNamespace(), None))
+
+    @patch("sglang.srt.constrained.xgrammar_backend.XGrammarGrammarBackend")
+    def test_xgrammar_receives_startup_stop_tokens(self, mock_xgrammar_cls):
+        mock_xgrammar_cls.return_value = MagicMock(spec=BaseGrammarBackend)
+        override = get_context().override_server_args(
+            grammar_backend="xgrammar",
+            reasoning_parser=None,
+            constrained_json_disable_any_whitespace=False,
+            constrained_json_max_whitespace_cnt=None,
+        )
+        override.install()
+        self.addCleanup(override.restore)
+        tokenizer = SimpleNamespace(eos_token_id=163585, additional_stop_token_ids={7})
+
+        create_grammar_backend(MagicMock(), tokenizer, 50000, {163586})
+
+        eos = mock_xgrammar_cls.call_args.kwargs["model_eos_token_ids"]
+        self.assertEqual(sorted(eos), [7, 163585, 163586])
+
+    @patch(
+        "sglang.srt.constrained.xgrammar_backend.XGrammarGrammarBackend._new_framing_compiler"
+    )
+    @patch("sglang.srt.constrained.xgrammar_backend.GrammarCompiler")
+    def test_init_xgrammar_tokenizer_keeps_startup_stop_tokens(self, *_):
+        from sglang.srt.constrained.xgrammar_backend import XGrammarGrammarBackend
+
+        tokenizer = SimpleNamespace(init_xgrammar=lambda: (MagicMock(), [2]))
+        backend = XGrammarGrammarBackend(tokenizer, 100, model_eos_token_ids=[2, 7])
+        self.assertEqual(backend.override_stop_tokens, [2, 7])
 
 
 if __name__ == "__main__":
