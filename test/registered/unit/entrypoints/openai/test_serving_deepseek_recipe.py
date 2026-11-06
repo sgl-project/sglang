@@ -46,6 +46,7 @@ def _serving(
     is_multimodal=False,
     tool_call_parser="deepseekv41",
     responses=False,
+    chat_template_name=None,
     **server_args,
 ):
     from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
@@ -80,7 +81,7 @@ def _serving(
         config_value=lambda name: getattr(args, name),
     )
     template_manager = SimpleNamespace(
-        chat_template_name=None,
+        chat_template_name=chat_template_name,
         jinja_template_content_format=None,
         reasoning_config=None,
         force_reasoning=False,
@@ -407,6 +408,25 @@ class TestHandlerRequestSemantics(CustomTestCase):
                     self._parse(chat, answer, messages=messages, **thinking)[:2],
                     ("Let me think.", "Hello"),
                 )
+        # Without recipe's prompt, as with input_ids or a conversation template,
+        # only a text turn under continue_final_message is continued.
+        client_prompt = self._prompt(chat, **thinking).prompt_ids
+        chatml = _serving(self, self.tokenizer, chat_template_name="chatml")
+        for name, server, fields in (
+            ("input_ids", chat, {"input_ids": client_prompt}),
+            ("conversation template", chatml, {}),
+        ):
+            with self.subTest(name):
+                self.assertEqual(
+                    self._parse(
+                        server,
+                        answer,
+                        messages=[HI, ASSISTANT_LIST | PREFIX],
+                        **thinking,
+                        **fields,
+                    )[:2],
+                    ("Let me think.", "Hello"),
+                )
 
     def test_natural_stop_inside_reasoning_fails(self):
         """A thinking output that stops on its own inside its reasoning fails,
@@ -492,6 +512,8 @@ class TestHandlerRequestSemantics(CustomTestCase):
 
     def test_outputs_that_may_skip_think_end_are_returned(self):
         """A parsed call ends the reasoning; the other outputs are not checked."""
+        from sglang.srt.entrypoints.openai.protocol import ResponsesRequest
+
         chat = _serving(self, self.tokenizer)
         thinking = {"chat_template_kwargs": {"thinking": True}}
         _, _, calls = self._parse(
@@ -510,6 +532,22 @@ class TestHandlerRequestSemantics(CustomTestCase):
             with self.subTest(fields=fields):
                 reasoning, content, _ = self._parse(chat, text, **(thinking | fields))
                 self.assertEqual((reasoning or "") + content, text)
+        # Nor is output after a conversation template's prompt, on chat or Responses.
+        chatml = _serving(self, self.tokenizer, chat_template_name="chatml")
+        reasoning, content, _ = self._parse(chatml, "Still thinking.", **thinking)
+        self.assertEqual((reasoning or "") + content, "Still thinking.")
+        eos = self._token("<｜end▁of▁sentence｜>")
+        output_ids = self.tokenizer.encode("Still thinking.", add_special_tokens=False)
+        output_ids.append(eos)
+        reasoning, content, _ = chatml._encoding_output().parse_responses_output(
+            request=ResponsesRequest(input="hi"),
+            require_reasoning=True,
+            output_ids=output_ids,
+            finish_reason={"type": "stop", "matched": eos},
+            separate_reasoning=True,
+            parse_tool_calls=False,
+        )
+        self.assertEqual(reasoning + content, "Still thinking.")
 
     def test_constrained_output_under_default_thinking_is_returned(self):
         """Under SGLANG_DEFAULT_THINKING alone, require_reasoning is false (#45614);
@@ -542,6 +580,22 @@ class TestHandlerRequestSemantics(CustomTestCase):
             ):
                 reasoning, content, _ = self._parse(chat, text, **fields)
                 self.assertEqual((reasoning or "") + content, text)
+        # --preferred-sampling-params can set the grammar, for requests that set none.
+        structural_tag = {
+            "type": "structural_tag",
+            "format": {"type": "const_string", "value": '{"a": 1}'},
+        }
+        for preferred in (
+            {"json_schema": '{"type": "object"}'},
+            {"structural_tag": json.dumps(structural_tag)},
+        ):
+            server = _serving(self, self.tokenizer, preferred_sampling_params=preferred)
+            with (
+                self.subTest(preferred=preferred),
+                envs.SGLANG_DEFAULT_THINKING.override(True),
+            ):
+                reasoning, content, _ = self._parse(server, '{"a": 1}')
+                self.assertEqual((reasoning or "") + content, '{"a": 1}')
 
     def test_unconstrained_output_under_default_thinking_fails(self):
         """Under SGLANG_DEFAULT_THINKING alone, an output is checked without a grammar,

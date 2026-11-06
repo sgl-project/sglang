@@ -231,6 +231,10 @@ class ChatEncodingAdapterContext(msgspec.Struct, frozen=True, kw_only=True):
       model_path, revision: checkpoint files.
       default_chat_template_kwargs: the workers' --default-chat-template-kwargs
         (deepseek-recipe validates the default effort at startup).
+      preferred_sampling_params: the workers' --preferred-sampling-params
+        (a grammar there constrains DeepSeek-V4 / V4.1 output).
+      chat_template_name: a --chat-template conversation template, which renders
+        prompts instead of the adapter (DeepSeek-V4 / V4.1 output parsing).
       backend: selects the builder; every spec has a "builtin" one.
     """
 
@@ -243,6 +247,8 @@ class ChatEncodingAdapterContext(msgspec.Struct, frozen=True, kw_only=True):
     model_path: str
     revision: Optional[str]
     default_chat_template_kwargs: Optional[dict[str, Any]] = None
+    preferred_sampling_params: Optional[dict[str, Any]] = None
+    chat_template_name: Optional[str] = None
     backend: EncodingBackend = "builtin"
 
     def require(self, field: str) -> Any:
@@ -282,6 +288,8 @@ def _build_deepseek_recipe(
         tool_call_parser=ctx.tool_call_parser,
         chat_hooks=ctx.chat_hooks,
         default_chat_template_kwargs=ctx.default_chat_template_kwargs,
+        preferred_sampling_params=ctx.preferred_sampling_params,
+        chat_template_name=ctx.chat_template_name,
     )
 
 

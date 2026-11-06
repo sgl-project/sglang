@@ -674,6 +674,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 model_path=self.tokenizer_manager.model_path,
                 revision=get_model().revision,
                 default_chat_template_kwargs=get_serving().default_chat_template_kwargs,
+                preferred_sampling_params=get_serving().preferred_sampling_params,
+                chat_template_name=self.template_manager.chat_template_name,
             )
         )
 
