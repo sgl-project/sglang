@@ -4,12 +4,15 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
+import random
 import unittest
 
 import torch
 
 from sglang.srt.eplb.expert_location import (
     _compute_logical_to_all_physical_map,
+    _fair_choices,
+    _find_nearest_expert,
     append_trivial_expert_slots,
     compute_logical_to_rank_dispatch_physical_map,
 )
@@ -95,6 +98,72 @@ class TestComputeLogicalToRankDispatchPhysicalMap(CustomTestCase):
                 ep_rank=ep_rank,
                 seed=seed,
             )
+
+    @staticmethod
+    def _all_rank_reference(mapping, ep_size, physical, nodes, seed, prefer_same_node):
+        """Resolve nearest replicas, then distribute remote picks in rank order."""
+        rng = random.Random(seed)
+        layers, experts, _ = mapping.shape
+        result = torch.full((ep_size, layers, experts), -1, dtype=mapping.dtype)
+        gpu_slots = physical // ep_size
+        node_ranks = ep_size // nodes if prefer_same_node else None
+        node_slots = gpu_slots * node_ranks if node_ranks is not None else None
+        for layer in range(layers):
+            for expert in range(experts):
+                candidates = [p for p in mapping[layer, expert].tolist() if p != -1]
+                remote = []
+                for rank in range(ep_size):
+                    selected = _find_nearest_expert(
+                        candidates, gpu_slots, rank, node_ranks, node_slots
+                    )
+                    result[rank, layer, expert] = selected
+                    if selected == -1:
+                        remote.append(rank)
+                if remote:
+                    for rank, selected in zip(
+                        remote, _fair_choices(candidates, len(remote), rng), strict=True
+                    ):
+                        result[rank, layer, expert] = selected
+        return result
+
+    def test_matches_all_rank_reference_across_topologies_and_seeds(self):
+        generator = torch.Generator().manual_seed(67)
+        for ep_size, nodes in ((2, 1), (4, 2), (8, 4), (32, 8)):
+            physical, experts = ep_size * 4, min(6, ep_size * 4)
+            mapping = torch.full((2, experts, physical), -1, dtype=torch.int64)
+            for layer in range(2):
+                layout = torch.cat(
+                    (
+                        torch.arange(experts),
+                        torch.randint(
+                            experts, (physical - experts,), generator=generator
+                        ),
+                    )
+                )[torch.randperm(physical, generator=generator)]
+                for expert in range(experts):
+                    slots = (layout == expert).nonzero().flatten()
+                    slots = slots[torch.randperm(len(slots), generator=generator)]
+                    mapping[layer, expert, : len(slots)] = slots
+            for join_mode in (None, "scale"):
+                for seed in (0, 42, 1024):
+                    expected = self._all_rank_reference(
+                        mapping, ep_size, physical, nodes, seed, join_mode != "scale"
+                    )
+                    with _published(ep_size, nodes, ep_join_mode=join_mode):
+                        for rank in range(ep_size):
+                            with self.subTest(
+                                ep=ep_size,
+                                nodes=nodes,
+                                join=join_mode,
+                                seed=seed,
+                                rank=rank,
+                            ):
+                                actual = compute_logical_to_rank_dispatch_physical_map(
+                                    mapping, ep_size, physical, rank, seed
+                                )
+                                torch.testing.assert_close(
+                                    actual, expected[rank], rtol=0, atol=0
+                                )
 
     # ------------------------------------------------------------------ shape & range
 
