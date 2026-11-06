@@ -2,9 +2,9 @@
 
 One entry point over ``csrc/kimi_k3/comm/gemm_ag.cuh``: for the latent MoE
 up_proj ([M, 3584] x [3584, 7168]) at small decode M, every rank computes
-only its 896-column slice of the replicated GEMM (the C++ side slices the
-full weight itself), multicast-stores it into the CustomAllReduceV2 push
-workspace (one more user of its double-buffer phase protocol), and a
+only its 896-column slice (from a replicated or TP-sharded weight), then
+multicast-stores it into the CustomAllReduceV2 push workspace (one more
+user of its double-buffer phase protocol), and a
 Lamport-spin consumer assembles ``out = up_proj(x) + b (+ c)`` — reading
 1/8 of the weight bytes per rank instead of all of them. Needs
 :func:`sglang.kernels.ops.communication.all_reduce_residual.register_comm` once beforehand
@@ -75,9 +75,8 @@ def gemm_ag_up_proj(
 ) -> torch.Tensor:
     """``out = x @ weight.T (allgathered) + b (+ c)``, all bf16.
 
-    ``x`` is [M, 3584] with M in [1, MAX_TOKENS]; ``weight`` is the FULL
-    replicated [7168, 3584] up_proj weight (each rank reads only its own
-    row block); ``b`` / ``c`` / ``out`` are [M, 7168] (``out`` is
-    output-only)."""
+    ``x`` is [M, 3584] with M in [1, MAX_TOKENS]; ``weight`` is replicated
+    [7168, 3584] or a contiguous local [896, 3584] output-column shard.
+    ``b`` / ``c`` / ``out`` are [M, 7168] (``out`` is output-only)."""
     _gemm_ag_op(world_size, x, weight, b, c, out)
     return out

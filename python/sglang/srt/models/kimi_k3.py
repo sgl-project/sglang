@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 from torch import nn
 
+from sglang.kernels.jit.utils import cache_once
 from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
 from sglang.srt.configs.kimi_k3 import KimiK3Config
 from sglang.srt.configs.kimi_linear import KimiLinearConfig
@@ -137,6 +138,7 @@ from sglang.srt.multimodal.kimi_k3_image_processing import (
 from sglang.srt.multimodal.mm_utils import materialize_multimodal_features
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import (
+    get_disagg,
     get_exec,
     get_parallel,
     get_platform,
@@ -441,6 +443,29 @@ def _uses_ep_a2a() -> bool:
     )
 
 
+@cache_once
+def _latent_up_gatherer(tp_group):
+    from sglang.srt.distributed.device_communicators.triton_symm_mem_ag import (
+        MultimemAllGatherer,
+    )
+
+    # Share one workspace across the MoE layers, keyed by their TP group.
+    # The first eager forward initializes it before graph capture. Larger
+    # prefill batches use the gatherer's existing NCCL path.
+    return MultimemAllGatherer(max_tokens=512)
+
+
+class KimiK3LatentUpProjection(ColumnParallelLinear):
+    """TP-sharded latent-up weight with a full-width output on every rank."""
+
+    def forward(self, latent):
+        local, bias = super().forward(latent)
+        # MoE layers consume this shared scratch in their shared-expert/residual
+        # add before the next layer reuses it. Small decode batches use gemm_ag
+        # directly on the same weight, preserving its original GEMV arithmetic.
+        return _latent_up_gatherer(self.tp_group)(local), bias
+
+
 class KimiK3MoE(nn.Module):
     """K3 MoE with Latent MoE (experts run in moe_hidden_size space)."""
 
@@ -674,13 +699,40 @@ class KimiK3MoE(nn.Module):
                 if config.latent_moe_use_norm
                 else None
             )
-            self.routed_expert_up_proj = ReplicatedLinear(
-                self.moe_hidden_size,
-                hidden_size,
-                bias=False,
-                quant_config=latent_quant_config,
-                prefix=f"{prefix}.routed_expert_up_proj",
+            # Decode workers can reuse the saved weight memory for KV slots.
+            # Gather adds latency, so keep prefill/mixed services replicated.
+            # All TP ranks must own the same latent rows; EP/DP/SP and devices
+            # without multicast retain their existing placement.
+            shard_latent_up = (
+                get_platform().is_cuda
+                and get_disagg().disaggregation_mode == "decode"
+                and self.tp_size == 8
+                and hidden_size == 7168
+                and self.moe_hidden_size == 3584
+                and latent_quant_config is None
+                and torch.get_default_dtype() == torch.bfloat16
+                and self.shared_experts is not None
+                and get_moe_a2a_backend().is_none()
+                and not is_dp_attention_enabled()
+                and not get_parallel().enable_layernorm_sp
+                and k3_ar_fusion.enabled()
             )
+            if shard_latent_up:
+                self.routed_expert_up_proj = KimiK3LatentUpProjection(
+                    self.moe_hidden_size,
+                    hidden_size,
+                    bias=False,
+                    parallel_group="tp",
+                    prefix=f"{prefix}.routed_expert_up_proj",
+                )
+            else:
+                self.routed_expert_up_proj = ReplicatedLinear(
+                    self.moe_hidden_size,
+                    hidden_size,
+                    bias=False,
+                    quant_config=latent_quant_config,
+                    prefix=f"{prefix}.routed_expert_up_proj",
+                )
         else:
             self.routed_expert_down_proj = None
             self.routed_expert_norm = None
@@ -1260,7 +1312,7 @@ class KimiK3MoE(nn.Module):
             out = hidden_states.new_empty((0, hidden_states.shape[1]))
         else:
             latent = self._reduce_latent(expert_output)
-            # up_proj is replicated, so the routed output is now fully reduced.
+            # The latent reduction completes the sum before up-projection.
             out, _ = self.routed_expert_up_proj(latent)
         wait_and_finalize_shared_experts()
         if shared_output is not None:

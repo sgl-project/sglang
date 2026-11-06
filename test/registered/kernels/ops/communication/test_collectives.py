@@ -200,39 +200,138 @@ def test_sequence_parallel_collectives():
     torch.testing.assert_close(gather_output, expected_gather, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("num_tokens", [1, 2, 4, 8, 12])
+@pytest.mark.parametrize("with_prefix", [False, True])
 @torch.inference_mode()
-def test_gemm_all_gather():
+def test_gemm_all_gather(num_tokens, with_prefix):
     _require_sm100()
     if int(os.environ["WORLD_SIZE"]) != _GEMM_AG_WORLD_SIZE:
         pytest.skip("Kimi K3 gemm_ag is compiled for TP8")
     comm = _init_comm()
-    generator = torch.Generator().manual_seed(30)
+    generator = torch.Generator(device=_device()).manual_seed(30)
     x = (
-        (torch.randn(1, gemm_ag.K, generator=generator) * 0.05)
-        .to(torch.bfloat16)
-        .to(_device())
+        torch.randn(
+            num_tokens,
+            gemm_ag.K,
+            generator=generator,
+            device=_device(),
+            dtype=torch.bfloat16,
+        )
+        * 0.05
     )
     weight = (
-        (torch.randn(gemm_ag.N, gemm_ag.K, generator=generator) * 0.05)
-        .to(torch.bfloat16)
-        .to(_device())
+        torch.randn(
+            gemm_ag.N,
+            gemm_ag.K,
+            generator=generator,
+            device=_device(),
+            dtype=torch.bfloat16,
+        )
+        * 0.05
     )
-    bias = torch.randn(1, gemm_ag.N, generator=generator).to(
-        device=_device(), dtype=torch.bfloat16
+    bias = torch.randn(
+        num_tokens,
+        gemm_ag.N,
+        generator=generator,
+        device=_device(),
+        dtype=torch.bfloat16,
     )
-    output = torch.empty(1, gemm_ag.N, device=_device(), dtype=torch.bfloat16)
-    expected = (x.float() @ weight.float().t() + bias.float()).to(torch.bfloat16)
+    prefix = torch.randn_like(bias) if with_prefix else None
+    local_weight = weight.chunk(comm.world_size)[dist.get_rank()].clone()
+    output = torch.empty_like(bias)
+    local_output = torch.empty_like(bias)
 
-    gemm_ag.gemm_ag_up_proj(
-        comm.world_size,
-        x,
-        weight,
-        bias,
-        None,
-        output,
-    )
+    def run():
+        gemm_ag.gemm_ag_up_proj(comm.world_size, x, weight, bias, prefix, output)
+        gemm_ag.gemm_ag_up_proj(
+            comm.world_size, x, local_weight, bias, prefix, local_output
+        )
+
+    def check():
+        expected = (x.float() @ weight.float().t()).to(torch.bfloat16) + bias
+        if prefix is not None:
+            expected = expected + prefix
+        torch.testing.assert_close(output, expected, rtol=3e-2, atol=3e-2)
+        torch.testing.assert_close(local_output, output, rtol=0, atol=0)
+
+    for _ in range(3):
+        run()
     torch.cuda.synchronize()
-    torch.testing.assert_close(output, expected, rtol=3e-2, atol=3e-2)
+    check()
+    graph = torch.cuda.CUDAGraph()
+    dist.barrier()
+    with torch.cuda.graph(graph):
+        run()
+    for _ in range(5):
+        x.normal_(std=0.05, generator=generator)
+        bias.normal_(generator=generator)
+        graph.replay()
+        torch.cuda.synchronize()
+        check()
+
+
+@torch.inference_mode()
+def test_kimi_latent_up_projection():
+    _require_sm100()
+    if int(os.environ["WORLD_SIZE"]) != _GEMM_AG_WORLD_SIZE:
+        pytest.skip("Kimi K3 latent-up sharding is enabled for TP8")
+    _init_world()
+    from sglang.srt.models.kimi_k3 import KimiK3LatentUpProjection
+
+    group = get_parallel().world_group
+    generator = torch.Generator(device=_device()).manual_seed(31)
+    weight = (
+        torch.randn(
+            gemm_ag.N,
+            gemm_ag.K,
+            generator=generator,
+            device=_device(),
+            dtype=torch.bfloat16,
+        )
+        * 0.02
+    )
+    with get_parallel().override(tp_group=group, tp_size=8, nnodes=1), _device():
+        layer = KimiK3LatentUpProjection(
+            gemm_ag.K,
+            gemm_ag.N,
+            bias=False,
+            params_dtype=torch.bfloat16,
+            parallel_group="tp",
+        )
+        layer.weight.weight_loader(layer.weight, weight)
+        torch.testing.assert_close(
+            layer.weight, weight.chunk(8)[group.rank_in_group], rtol=0, atol=0
+        )
+        assert layer.weight.untyped_storage().nbytes() == weight.numel() * 2 // 8
+        # Include zero rows, the GEMV boundary, odd/strided input, the multicast
+        # limit and the larger-prefill fallback. Consume scratch before reuse.
+        for rows in (0, 1, 12, 13, 219, 267, 512, 513):
+            storage = torch.randn(
+                rows,
+                gemm_ag.K + 8,
+                generator=generator,
+                device=_device(),
+                dtype=torch.bfloat16,
+            )
+            x = storage[:, : gemm_ag.K]
+
+            def run():
+                return layer(x)[0].clone()
+
+            for _ in range(3):
+                output = run()
+            expected = torch.nn.functional.linear(x, weight)
+            torch.testing.assert_close(output, expected, rtol=1e-2, atol=2e-2)
+            graph = torch.cuda.CUDAGraph()
+            dist.barrier()
+            with torch.cuda.graph(graph):
+                output = run()
+            for _ in range(5):
+                storage.normal_(generator=generator)
+                graph.replay()
+                torch.cuda.synchronize()
+                expected = torch.nn.functional.linear(x, weight)
+                torch.testing.assert_close(output, expected, rtol=1e-2, atol=2e-2)
 
 
 @torch.inference_mode()

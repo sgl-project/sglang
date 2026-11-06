@@ -12,7 +12,7 @@ from sglang.srt.layers import linear
 from sglang.srt.layers.dp_attention import initialize_dp_attention_flags
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.models import kimi_k3
-from sglang.srt.runtime_context import SpawnRanks, reset_context
+from sglang.srt.runtime_context import SpawnRanks, override_platform, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.parallel_groups import parallel_scope, publish, rank_size
@@ -47,7 +47,9 @@ class _Gate(torch.nn.Module):
         self.e_score_correction_bias = None
 
 
-def build_shared_experts(*, ep_a2a=True, width=16, shared=1, quant_config=None):
+def build_shared_experts(
+    *, ep_a2a=True, width=16, shared=1, quant_config=None, latent=None
+):
     # Routed experts and their router do not participate in this placement
     # test. The real MoE constructor still builds its real shared MLP.
     backend = SimpleNamespace(
@@ -57,6 +59,7 @@ def build_shared_experts(*, ep_a2a=True, width=16, shared=1, quant_config=None):
         is_mooncake=lambda: False,
         is_ascend_fuseep=lambda: False,
         is_mori=lambda: False,
+        is_none=lambda: not ep_a2a,
     )
     config = SimpleNamespace(
         hidden_size=width,
@@ -64,7 +67,9 @@ def build_shared_experts(*, ep_a2a=True, width=16, shared=1, quant_config=None):
         moe_renormalize=True,
         routed_scaling_factor=1.0,
         num_shared_experts=shared,
-        routed_expert_hidden_size=None,
+        routed_expert_hidden_size=latent,
+        latent_moe_use_norm=True,
+        rms_norm_eps=1e-6,
         num_experts=4,
         num_experts_per_token=1,
         hidden_act="silu",
@@ -107,6 +112,67 @@ class TestKimiMLPParallelGroups(CustomTestCase):
     def setUp(self):
         reset_context()
         self.addCleanup(reset_context)
+
+    def test_latent_up_shards_only_replicated_bf16_tp8_rows(self):
+        # Construct the real MoE and linears on meta; unrelated experts/router
+        # are the same fixtures as the shared-MLP tests. No forward is mocked.
+        cases = (
+            ("eligible", {}, True),
+            ("tp4", {"tp": 4}, False),
+            ("prefill", {"mode": "prefill"}, False),
+            ("mixed", {"mode": "null"}, False),
+            ("cpu", {"cuda": False}, False),
+            ("fp16", {"dtype": torch.float16}, False),
+            ("ep_rows", {"ep": True}, False),
+            ("dp_rows", {"dp": 2}, False),
+            ("layernorm_sp", {"sp": True}, False),
+            ("no_multicast", {"multicast": False}, False),
+            ("no_shared", {"shared": 0}, False),
+            ("other_width", {"width": 4096}, False),
+            ("non_latent", {"latent": None}, False),
+        )
+        old_dtype = torch.get_default_dtype()
+        self.addCleanup(torch.set_default_dtype, old_dtype)
+        for name, options, sharded in cases:
+            with self.subTest(name=name):
+                reset_context()
+                server = ServerArgs(
+                    model_path="dummy",
+                    device="cpu",
+                    tp_size=options.get("tp", 8),
+                    attn_dp_size=options.get("dp", 1),
+                    enable_layernorm_sp=options.get("sp", False),
+                    disaggregation_mode=options.get("mode", "decode"),
+                )
+                publish(server, role="test")
+                initialize_dp_attention_flags(server)
+                torch.set_default_dtype(options.get("dtype", torch.bfloat16))
+                with (
+                    torch.device("meta"),
+                    override_platform(is_cuda=options.get("cuda", True)),
+                    patch.object(
+                        kimi_k3.k3_ar_fusion,
+                        "enabled",
+                        return_value=options.get("multicast", True),
+                    ),
+                ):
+                    module, _ = build_shared_experts(
+                        ep_a2a=options.get("ep", False),
+                        width=options.get("width", 7168),
+                        shared=options.get("shared", 1),
+                        latent=options.get("latent", 3584),
+                    )
+                projection = module.routed_expert_up_proj
+                self.assertEqual(
+                    isinstance(projection, kimi_k3.KimiK3LatentUpProjection), sharded
+                )
+                if projection is not None:
+                    self.assertEqual(
+                        projection.weight.shape[0],
+                        options.get("width", 7168) // (8 if sharded else 1),
+                    )
+                if sharded:
+                    self.assertTrue(module._gemm_ag_up_eligible)
 
     def test_dense_and_explicit_group_layout_and_row_policy(self):
         for dp in (1, 2):
