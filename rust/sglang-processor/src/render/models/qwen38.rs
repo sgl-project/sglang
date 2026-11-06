@@ -8,7 +8,8 @@ use serde_json::{Value, json};
 
 use super::glm53::valid_documents;
 use super::pydantic_dump::{
-    continues_final_message, engine_message, normalize_tools, pydantic_bool, split_continuation,
+    continues_final_message, engine_message, fold_thinking_parts, normalize_tools, pydantic_bool,
+    split_continuation,
 };
 use crate::render::RenderError;
 use crate::render::reasoning::{requested_effort, requested_thinking};
@@ -196,6 +197,7 @@ fn template_message(message: Value, content_parts: bool) -> Result<Value, Render
     if message["role"] == "assistant" {
         dump_tool_calls(&mut message)?;
     }
+    fold_thinking_parts(&mut message)?;
     let Some(parts) = message["content"].as_array() else {
         return Ok(message);
     };

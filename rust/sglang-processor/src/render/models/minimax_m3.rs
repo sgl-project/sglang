@@ -7,7 +7,9 @@ use dynamo_renderer::{OAIChatLikeRequest, PromptFormatter};
 use serde_json::{Map, Value, json};
 
 use super::glm53::valid_documents;
-use super::pydantic_dump::{continues_final_message, engine_message, split_continuation};
+use super::pydantic_dump::{
+    continues_final_message, engine_message, fold_thinking_parts, split_continuation,
+};
 use super::qwen38::{prints_unlike_python, template_tools};
 use crate::py::{py_truthy, python_float, python_json_compact};
 use crate::render::RenderError;
@@ -439,6 +441,7 @@ fn template_message(mut message: Value, content_parts: Option<bool>) -> Result<V
         // Only request tools reach the template; Dynamo rejects message-level ones.
         fields.remove("tools");
     }
+    fold_thinking_parts(&mut message)?;
     let Some(parts) = message["content"].as_array() else {
         return Ok(message);
     };

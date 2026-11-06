@@ -66,6 +66,7 @@ from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.sampling.sampling_params import (
     REQUEST_REASONING_END_TOKEN_IDS_KEY,
     get_request_reasoning_in_grammar,
+    get_request_reasoning_open,
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_or_create_event_loop
@@ -5800,6 +5801,41 @@ class ServingChatTestCase(CustomTestCase):
         self.assertFalse(self.chat._get_reasoning_from_request(req))
         req.reasoning_effort = "medium"
         self.assertTrue(self.chat._get_reasoning_from_request(req))
+
+    def test_continued_open_reasoning_reaches_the_grammar(self):
+        """Bug regression: the grammar of a continued assistant message that ends
+        inside a [THINK] block was set up for a fresh turn; the request must tell
+        it the reasoning is already open, exactly when the output parser agrees."""
+        self.tm.server_args.reasoning_parser = "mistral"
+        self.chat.reasoning_parser = "mistral"
+        self.template_manager.reasoning_config = ReasoningToggleConfig(
+            special_case="mistral"
+        )
+        user = {"role": "user", "content": "Is [THINK] a token?"}
+        json_answer = {"response_format": {"type": "json_object"}}
+        cases = (
+            ("[THINK]I need to check", "high", True),
+            ("[THINK]a[/THINK]b[THINK]c", "high", True),
+            ("[THINK]a[/THINK]{", "high", False),
+            ("[THINK]I need to check", "none", False),
+            (None, "high", False),
+        )
+        for prefix, effort, expected in cases:
+            with self.subTest(prefix=prefix, effort=effort):
+                fields = {"messages": [user], "reasoning_effort": effort}
+                if prefix is not None:
+                    fields["messages"] = [
+                        user,
+                        {"role": "assistant", "content": prefix},
+                    ]
+                    fields["continue_final_message"] = True
+                adapted, _ = self._convert_rendered_as("", **fields, **json_answer)
+                self.assertIs(
+                    get_request_reasoning_open(
+                        adapted.sampling_params.get("custom_params")
+                    ),
+                    expected,
+                )
 
     # --- fallback path tests (config=None, uses reasoning_default) ---
 

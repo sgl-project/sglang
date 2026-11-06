@@ -132,6 +132,7 @@ from sglang.srt.parser.jinja_template_utils import (
 )
 from sglang.srt.parser.python_chat_template import render_chat_segments
 from sglang.srt.parser.reasoning_parser import (
+    BaseReasoningFormatDetector,
     IQuestQ1ReasoningDetector,
     ReasoningParser,
 )
@@ -149,6 +150,7 @@ from sglang.srt.parser.template_detection import detect_inline_system_support
 from sglang.srt.sampling.sampling_params import (
     set_request_reasoning_end_token_ids,
     set_request_reasoning_in_grammar,
+    set_request_reasoning_open,
 )
 from sglang.srt.utils.weight_versions import build_endpoint_weight_version_metadata
 
@@ -604,6 +606,27 @@ class OpenAIServingChat(OpenAIServingBase):
                     # Convert the last assistant message to user message
                     messages[-1] = {"role": "user", "content": last_content}
         return messages, assistant_prefix
+
+    def _continues_open_reasoning(self, request: ChatCompletionRequest) -> bool:
+        """Whether the continued assistant prefix ends inside a reasoning block,
+        as the output's reasoning parser reads it."""
+        last = request.messages[-1] if request.messages else None
+        if not (
+            self.reasoning_parser
+            and request.continue_final_message
+            and last is not None
+            and last.role == "assistant"
+            and isinstance(last.content, str)
+        ):
+            return False
+        detector = ReasoningParser(
+            model_type=self.reasoning_parser,
+            request=request,
+            tokenizer=self.tokenizer_manager.tokenizer,
+        ).detector
+        return (
+            isinstance(detector, BaseReasoningFormatDetector) and detector.in_reasoning
+        )
 
     def _append_assistant_prefix_to_prompt_ids(
         self, prompt_ids: list[int], assistant_prefix: str
@@ -1434,6 +1457,11 @@ class OpenAIServingChat(OpenAIServingBase):
         )
         set_request_reasoning_end_token_ids(
             sampling_params, processed_messages.reasoning_end_token_ids
+        )
+        set_request_reasoning_open(
+            sampling_params,
+            processed_messages.require_reasoning
+            and self._continues_open_reasoning(request),
         )
 
         # Handle single vs multiple requests

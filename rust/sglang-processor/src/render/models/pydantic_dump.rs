@@ -40,6 +40,37 @@ pub(super) fn accept_reasoning_alias(message: &mut Map<String, Value>) {
     }
 }
 
+/// `process_content_for_template_format` on the Jinja path: an assistant turn's
+/// `thinking` and `reasoning` parts, joined without a separator, fill a missing
+/// or null `reasoning_content`. The request model admits these parts only in
+/// assistant turns, each with exactly one of `thinking` and `text`.
+pub(super) fn fold_thinking_parts(message: &mut Value) -> Result<(), String> {
+    let Some(parts) = message["content"].as_array() else {
+        return Ok(());
+    };
+    let mut thinking: Option<String> = None;
+    for part in parts {
+        if !matches!(part["type"].as_str(), Some("thinking" | "reasoning")) {
+            continue;
+        }
+        if message["role"] != "assistant" {
+            return Err("thinking content parts are only valid in assistant messages".into());
+        }
+        let ((Value::String(text), Value::Null) | (Value::Null, Value::String(text))) =
+            (&part["thinking"], &part["text"])
+        else {
+            return Err("thinking parts require exactly one of 'thinking' or 'text'".into());
+        };
+        thinking.get_or_insert_default().push_str(text);
+    }
+    if let Some(thinking) = thinking
+        && message["reasoning_content"].is_null()
+    {
+        message["reasoning_content"] = thinking.into();
+    }
+    Ok(())
+}
+
 /// The pydantic dump SGLang renders: roles lowercased, unknown and null fields
 /// dropped, `user` reduced to role and content, null content blanked.
 pub(super) fn engine_message(message: Value) -> Value {

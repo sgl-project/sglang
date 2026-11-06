@@ -1022,19 +1022,20 @@ class TestMistralDetector(CustomTestCase):
     def _assert_parse(self, text, expected, **kwargs):
         one_shot = MistralDetector(**kwargs).detect_and_parse(text)
         self.assertEqual((one_shot.reasoning_text, one_shot.normal_text), expected)
+        chunkings = {
+            f"size={size}": [text[i : i + size] for i in range(0, len(text), size)]
+            for size in (1, 3, 7, 1000)
+        }
+        chunkings.update({f"cut={i}": [text[:i], text[i:]] for i in range(len(text))})
         for stream_reasoning in (True, False):
-            for chunk_size in (1, 3, 7, 1000):
-                with self.subTest(
-                    stream_reasoning=stream_reasoning, chunk_size=chunk_size
-                ):
+            for name, chunks in chunkings.items():
+                with self.subTest(stream_reasoning=stream_reasoning, chunks=name):
                     detector = MistralDetector(
                         stream_reasoning=stream_reasoning, **kwargs
                     )
                     reasoning = normal = ""
-                    for i in range(0, len(text), chunk_size):
-                        ret = detector.parse_streaming_increment(
-                            text[i : i + chunk_size]
-                        )
+                    for chunk in chunks:
+                        ret = detector.parse_streaming_increment(chunk)
                         reasoning += ret.reasoning_text
                         normal += ret.normal_text
                     ret = detector.finish()
@@ -1053,6 +1054,42 @@ class TestMistralDetector(CustomTestCase):
 
     def test_unterminated_block_is_reasoning(self):
         self._assert_parse("[THINK]still thinking [", ("still thinking [", ""))
+
+    def test_markers_in_tool_arguments_stay_arguments(self):
+        """Bug regression: [THINK]/[/THINK] inside a tool call's JSON strings were
+        parsed as reasoning, emptying the arguments; a block after the payload is
+        still reasoning."""
+        calls = (
+            '[TOOL_CALLS]echo[ARGS]{"text":"[THINK]literal[/THINK]"}',
+            '[TOOL_CALLS]a[ARGS]{"k[THINK]":"v\\"[/THINK]\\\\","n":[1,{"x":"}"}]}'
+            '[TOOL_CALLS]b[ARGS]{"t":"[THINK]"}',
+            '[TOOL_CALLS] [{"name":"echo","arguments":{"text":"a [THINK]b"}}]',
+            '[TOOL_CALLSecho[ARGS{"text":"[/THINK]"}',
+        )
+        for call in calls:
+            with self.subTest(call=call):
+                self._assert_parse(f"[THINK]checking[/THINK]{call}", ("checking", call))
+                self._assert_parse(
+                    f"{call}[THINK]more[/THINK]done", ("more", f"{call}done")
+                )
+
+    def test_tool_marker_text_outside_a_call_keeps_reasoning(self):
+        self._assert_parse(
+            "use [TOOL_CALLS] then [THINK]r[/THINK]a", ("r", "use [TOOL_CALLS] then a")
+        )
+
+    def test_continued_message_resumes_after_its_last_marker(self):
+        for prefix, expected in (
+            ("[THINK]a[/THINK]b[THINK]c", (" more", "answer")),
+            ("[THINK]a[/THINK]b", ("", " moreanswer")),
+        ):
+            with self.subTest(prefix=prefix):
+                self._assert_parse(
+                    " more[/THINK]answer",
+                    expected,
+                    continue_final_message=True,
+                    previous_content=prefix,
+                )
 
     def test_think_markers_resolve_to_control_tokens(self):
         """Bug regression: markers must resolve to control-token IDs; encoding the

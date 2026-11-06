@@ -137,6 +137,18 @@ class ReasonerGrammarObject(BaseGrammarObject):
             )
         self.reasoning_in_grammar = True
 
+    def continue_open_reasoning(self) -> None:
+        """Start inside the reasoning block the prompt left open, rather than
+        offering the optional opener; rolling back to the start stays inside it."""
+        if self._decoding_started():
+            raise RuntimeError(
+                "the prompt's reasoning state must be applied before decoding starts"
+            )
+        if self._opener_optional:
+            self._opener_optional = False
+            self._awaits_opener = False
+            self.tokens_in_think = 0
+
     def _decoding_started(self) -> bool:
         return (
             self.current_token is not None
