@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 
+from sglang.srt.environ import envs
 from sglang.srt.kv_canary.config import CanaryMode
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kv_canary.consts import SWA_POOL_SERVER_ARGS
@@ -25,6 +26,14 @@ class _PerturbReqToTokenBase(CanaryE2EBase):
         # A perturbed slot reaches free_swa with its peer already released: that
         # is the corruption under test, not a swa.peer_mapped regression.
         "SGLANG_INVARIANT_CHECK": "0",
+        # Keep the scheduler state checks that SGLANG_INVARIANT_CHECK=0 would
+        # otherwise turn off on their current defaults (on in CI).
+        "SGLANG_ENABLE_RUNNING_REQS_CHECK": str(
+            envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.get()
+        ),
+        "SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK": str(
+            envs.SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK.get()
+        ),
     }
 
     @classmethod

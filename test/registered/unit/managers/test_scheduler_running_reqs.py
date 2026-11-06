@@ -1,5 +1,6 @@
 import unittest
 from array import array
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
 
@@ -22,6 +23,7 @@ from sglang.srt.managers.schedule_batch import NextBatchPlan, Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.invariant_checker import (
+    CheckPoint,
     SchedulerInvariantChecker,
 )
 from sglang.srt.model_executor.forward_mode import ForwardMode
@@ -139,7 +141,7 @@ class TestRequestListsCheck(CustomTestCase):
     def setUp(self):
         super().setUp()
         self.s = _scheduler()
-        self.check = self.s.invariant_checker.maybe_check_request_lists
+        self.check = partial(self.s.invariant_checker.run, CheckPoint.LAUNCH)
         enter_scope(self, published_topology())
         enter_scope(self, envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.override(True))
 
