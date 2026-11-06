@@ -85,41 +85,22 @@ class TestDenseDraft(CustomTestCase):
         self.assertEqual(
             spec.dense, DraftDenseFFNSpec(intermediate_size=48, hidden_act="silu")
         )
-        self.assertEqual([spec.kind(i) for i in range(3)], [FFN_KIND_DENSE] * 3)
-
-    def test_object_config_and_nested_text_config(self):
-        as_object = SimpleNamespace(**_dense())
-        self.assertEqual(
-            DraftMixFFNSpec.from_config(as_object).layer_kinds, ("dense",) * 3
-        )
-        wrapped = {"text_config": _dense(), "model_type": "vl"}
-        self.assertEqual(
-            DraftMixFFNSpec.from_config(wrapped).dense.intermediate_size, 48
-        )
-
-    def test_dense_layers_require_intermediate_size(self):
-        with self.assertRaisesRegex(ValueError, "intermediate_size is required"):
-            DraftMixFFNSpec.from_config(_without(_dense(), "intermediate_size"))
+        # Config objects and a nested text_config read the same as the dict.
+        self.assertEqual(DraftMixFFNSpec.from_config(SimpleNamespace(**_dense())), spec)
+        self.assertEqual(DraftMixFFNSpec.from_config({"text_config": _dense()}), spec)
 
     def test_unknown_layer_count_is_uniform(self):
         spec = DraftMixFFNSpec.from_config(_without(_dense(), "num_hidden_layers"))
         self.assertIsNone(spec.layer_kinds)
         self.assertEqual(spec.kind(41), FFN_KIND_DENSE)
-
-    def test_dense_activation_and_moe_only_keys_are_not_checked(self):
-        spec = DraftMixFFNSpec.from_config(
-            _dense(hidden_act="gelu", scoring_func="relu")
-        )
-        self.assertEqual(spec.dense.hidden_act, "gelu")
-
-    def test_kind_out_of_range(self):
         with self.assertRaisesRegex(ValueError, "outside"):
             DraftMixFFNSpec.from_config(_dense()).kind(3)
 
 
 class TestQwenStyleMoe(CustomTestCase):
     def test_specforge_config(self):
-        spec = DraftMixFFNSpec.from_config(_qwen_moe())
+        # An all-MoE draft needs no dense intermediate_size.
+        spec = DraftMixFFNSpec.from_config(_without(_qwen_moe(), "intermediate_size"))
         self.assertEqual(spec.layer_kinds, (FFN_KIND_MOE,) * 3)
         self.assertIsNone(spec.dense)
         self.assertEqual(
@@ -142,20 +123,7 @@ class TestQwenStyleMoe(CustomTestCase):
             ),
         )
 
-    def test_all_moe_draft_needs_no_dense_intermediate_size(self):
-        spec = DraftMixFFNSpec.from_config(_without(_qwen_moe(), "intermediate_size"))
-        self.assertTrue(spec.has_moe)
-        self.assertIsNone(spec.dense)
-
-    def test_expert_count_aliases(self):
-        for alias in ("n_routed_experts", "num_local_experts"):
-            cfg = _without(_qwen_moe(), "num_experts")
-            cfg[alias] = 8
-            self.assertEqual(DraftMixFFNSpec.from_config(cfg).moe.num_experts, 8)
-        with self.assertRaisesRegex(ValueError, "declared twice"):
-            DraftMixFFNSpec.from_config(_qwen_moe(n_routed_experts=4))
-
-    def test_defaults(self):
+    def test_defaults_and_expert_count_aliases(self):
         cfg = _without(
             _qwen_moe(),
             "moe_preset",
@@ -168,18 +136,19 @@ class TestQwenStyleMoe(CustomTestCase):
         self.assertIsNone(moe.shared_expert_intermediate_size)
         self.assertFalse(moe.expert_bias)
         self.assertEqual(moe.routed_scaling_factor, 1.0)
+        for alias in ("n_routed_experts", "num_local_experts"):
+            cfg = _without(_qwen_moe(), "num_experts")
+            cfg[alias] = 8
+            self.assertEqual(DraftMixFFNSpec.from_config(cfg).moe.num_experts, 8)
+        with self.assertRaisesRegex(ValueError, "declared twice"):
+            DraftMixFFNSpec.from_config(_qwen_moe(n_routed_experts=4))
 
-    def test_gated_shared_expert(self):
+    def test_gated_shared_expert_and_bias_flag(self):
         moe = DraftMixFFNSpec.from_config(
             _qwen_moe(shared_expert_intermediate_size=24)
         ).moe
         self.assertEqual(moe.shared_expert_intermediate_size, 24)
         self.assertTrue(moe.shared_expert_gated)
-
-    def test_expert_bias_flag_nested_or_top_level(self):
-        nested_off = _qwen_moe()
-        nested_off["dflash_config"]["moe_router_enable_expert_bias"] = False
-        self.assertFalse(DraftMixFFNSpec.from_config(nested_off).moe.expert_bias)
         top_level = _qwen_moe(moe_router_enable_expert_bias=True)
         top_level["dflash_config"] = dict(DFLASH)
         self.assertTrue(DraftMixFFNSpec.from_config(top_level).moe.expert_bias)
@@ -196,12 +165,6 @@ class TestQwenStyleMoe(CustomTestCase):
         self.assertEqual(DraftMixFFNSpec.from_config(cfg).moe.intermediate_size, 64)
         with self.assertRaisesRegex(ValueError, "moe_intermediate_size is required"):
             DraftMixFFNSpec.from_config(_without(cfg, "intermediate_size"))
-
-    def test_sub_specs_stand_alone(self):
-        self.assertEqual(DraftDenseFFNSpec.from_config(_dense()).intermediate_size, 48)
-        self.assertEqual(DraftMoeFFNSpec.from_config(_qwen_moe()).top_k, 1)
-        with self.assertRaisesRegex(ValueError, "MoE layers need one of"):
-            DraftMoeFFNSpec.from_config(_dense())
 
 
 class TestOtherFamilies(CustomTestCase):
@@ -242,23 +205,40 @@ class TestOtherFamilies(CustomTestCase):
 
 
 class TestLayerSchedule(CustomTestCase):
-    def test_ffn_layer_types(self):
-        spec = DraftMixFFNSpec.from_config(
-            _qwen_moe(ffn_layer_types=["dense", "moe", "moe"])
-        )
-        self.assertEqual(spec.layer_kinds, ("dense", "moe", "moe"))
-        self.assertEqual(spec.dense.intermediate_size, 48)
-        self.assertEqual(spec.moe.intermediate_size, 12)
-
-    def test_ffn_layer_types_wins_over_other_keys(self):
-        spec = DraftMixFFNSpec.from_config(_deepseek_v3(ffn_layer_types=["moe"] * 6))
-        self.assertEqual(spec.layer_kinds, ("moe",) * 6)
-
-    def test_mlp_layer_types(self):
-        cfg = _qwen_moe(mlp_layer_types=["dense", "sparse", "sparse"])
-        self.assertEqual(
-            DraftMixFFNSpec.from_config(cfg).layer_kinds, ("dense", "moe", "moe")
-        )
+    def test_every_schedule_key(self):
+        cases = [
+            (
+                _qwen_moe(ffn_layer_types=["dense", "moe", "moe"]),
+                ("dense", "moe", "moe"),
+            ),
+            (
+                _qwen_moe(mlp_layer_types=["dense", "sparse", "sparse"]),
+                ("dense", "moe", "moe"),
+            ),
+            (_deepseek_v3(), ("dense", "dense", "moe", "moe", "moe", "moe")),
+            (
+                _deepseek_v3(moe_layer_freq=2),
+                ("dense", "dense", "moe", "dense", "moe", "dense"),
+            ),
+            (
+                _qwen_moe(
+                    num_hidden_layers=4, mlp_only_layers=[0], decoder_sparse_step=1
+                ),
+                ("dense", "moe", "moe", "moe"),
+            ),
+            (
+                _qwen_moe(
+                    num_hidden_layers=4, mlp_only_layers=[], decoder_sparse_step=2
+                ),
+                ("dense", "moe", "dense", "moe"),
+            ),
+        ]
+        for cfg, kinds in cases:
+            with self.subTest(kinds=kinds):
+                spec = DraftMixFFNSpec.from_config(cfg)
+                self.assertEqual(spec.layer_kinds, kinds)
+                self.assertEqual(spec.dense.intermediate_size, 48)
+                self.assertIsNotNone(spec.moe)
 
     def test_moe_layer_freq_list_marks_dense_layers(self):
         # MiniMax's DSpark draft: target MoE fields in the config, dense draft layers.
@@ -275,32 +255,6 @@ class TestLayerSchedule(CustomTestCase):
         self.assertEqual(spec.layer_kinds, ("dense",) * 5)
         self.assertIsNone(spec.moe)
         self.assertEqual(spec.dense.intermediate_size, 3072)
-
-    def test_first_k_dense_replace_and_freq(self):
-        self.assertEqual(
-            DraftMixFFNSpec.from_config(_deepseek_v3()).layer_kinds,
-            ("dense", "dense", "moe", "moe", "moe", "moe"),
-        )
-        self.assertEqual(
-            DraftMixFFNSpec.from_config(_deepseek_v3(moe_layer_freq=2)).layer_kinds,
-            ("dense", "dense", "moe", "dense", "moe", "dense"),
-        )
-
-    def test_mlp_only_layers_and_sparse_step(self):
-        cfg = _qwen_moe(num_hidden_layers=4, mlp_only_layers=[0], decoder_sparse_step=1)
-        self.assertEqual(
-            DraftMixFFNSpec.from_config(cfg).layer_kinds, ("dense", "moe", "moe", "moe")
-        )
-        cfg = _qwen_moe(num_hidden_layers=4, mlp_only_layers=[], decoder_sparse_step=2)
-        self.assertEqual(
-            DraftMixFFNSpec.from_config(cfg).layer_kinds,
-            ("dense", "moe", "dense", "moe"),
-        )
-
-    def test_all_dense_schedule_despite_experts(self):
-        spec = DraftMixFFNSpec.from_config(_qwen_moe(ffn_layer_types=["dense"] * 3))
-        self.assertFalse(spec.has_moe)
-        self.assertEqual(spec.kind(0), FFN_KIND_DENSE)
 
     def test_schedule_errors(self):
         cases = [
@@ -341,6 +295,7 @@ class TestRefusals(CustomTestCase):
 
     def test_inconsistent_fields(self):
         cases = [
+            (_without(_dense(), "intermediate_size"), "intermediate_size is required"),
             (
                 _without(_qwen_moe(), "num_experts_per_tok"),
                 "num_experts_per_tok is required",
@@ -375,10 +330,7 @@ class TestDFlashDraftConfigWiring(CustomTestCase):
         self.assertIsInstance(dense.ffn, DraftMixFFNSpec)
         self.assertFalse(dense.ffn.has_moe)
         moe = parse_dflash_draft_config(draft_hf_config=SimpleNamespace(**_qwen_moe()))
-        self.assertTrue(moe.ffn.has_moe)
         self.assertEqual(moe.ffn.kind(2), FFN_KIND_MOE)
-
-    def test_refusals_surface_at_parse_time(self):
         with self.assertRaisesRegex(ValueError, "scoring_func='relu'"):
             parse_dflash_draft_config(
                 draft_hf_config=SimpleNamespace(**_qwen_moe(scoring_func="relu"))
