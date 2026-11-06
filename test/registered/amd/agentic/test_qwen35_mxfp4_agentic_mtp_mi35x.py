@@ -106,9 +106,8 @@ MODE = os.environ.get("AGENTIC_MODE", "replay")
 # Parallelism and concurrency come from the recipe's own search space in
 # InferenceX configs/amd-master.yaml (qwen3.5-fp4-mi355x-sglang-agentic-mtp):
 # tp2 and tp4 at ep1, with the HiCache CPU tier only on the high-concurrency
-# rows. The CI matrix runs the ten tp2 points on the 2-GPU MI35x runner; tp4
-# needs the 8-GPU runner, so it stays a manual override rather than a scheduled
-# point. The recipe never runs this checkpoint at tp8.
+# rows. The CI matrix runs the ten tp2 points; tp4 stays a manual override for
+# now. The recipe never runs this checkpoint at tp8.
 TP_SIZE = int(os.environ.get("AGENTIC_TP", "4"))
 EP_SIZE = int(os.environ.get("AGENTIC_EP_SIZE", "1"))
 CONCURRENCY = int(os.environ.get("AGENTIC_CONCURRENCY", "48"))

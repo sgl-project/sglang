@@ -19,6 +19,9 @@ echo "[amd-ci-job] start on $(hostname) job=$JOB_ID suite=$CI_SUITE rocm=$CI_ROC
 
 finish() {
     local rc=$?
+    # The suite's step summary lands in the checkout; the launcher appends it
+    # to the workflow's.
+    [[ -n "${CI_SUMMARY_FILE:-}" ]] && cp "$WS/github_summary.md" "$CI_SUMMARY_FILE" 2>/dev/null || true
     # Root-owned files from the container can only be removed from inside it.
     docker exec ci_sglang bash -c 'rm -rf /sglang-checkout/* /sglang-checkout/.[!.]*' >/dev/null 2>&1 || true
     docker rm -f ci_sglang >/dev/null 2>&1 || true
@@ -31,6 +34,7 @@ trap finish EXIT
 mkdir -p "$WS" "$CI_NODE_SCRATCH/sglang-data"
 cp -a "$CI_SRC/." "$WS/"
 cd "$WS"
+touch github_summary.md
 
 # The scripts read these instead of an ARC pod hostname and /home/runner.
 export GITHUB_WORKSPACE="$WS"
@@ -40,8 +44,9 @@ export AMD_CI_CACHE_HOST="$CI_NODE_SCRATCH/sglang-data"
 bash scripts/ci/amd/ensure_vram_clear.sh rocm
 bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$CI_ROCM_VERSION"
 bash scripts/ci/amd/amd_ci_install_dependency.sh
-# --env pairs from the launcher, one KEY=VAL per line.
-EXEC_ENV_ARGS=()
+# --env pairs from the launcher, one KEY=VAL per line. amd_ci_exec.sh keeps the
+# last value given for a key, so they can override the summary path too.
+EXEC_ENV_ARGS=(-e GITHUB_STEP_SUMMARY=/sglang-checkout/github_summary.md)
 while IFS= read -r kv; do
     [[ -n "$kv" ]] && EXEC_ENV_ARGS+=(-e "$kv")
 done <<< "${CI_EXEC_ENV:-}"

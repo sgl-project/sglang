@@ -23,6 +23,8 @@
 #
 #   --env sets a variable inside the test container, as the `-e` flags the ARC
 #   workflows pass to amd_ci_exec.sh do (e.g. a benchmark's workload knobs).
+#   Whatever the suite writes to $GITHUB_STEP_SUMMARY in the container is
+#   appended to the step's summary.
 #
 # Required environment (set in the runner's .env, like the DI nightly runner):
 #   SLURM_PARTITION, SLURM_ACCOUNT, SLURM_QOS
@@ -80,6 +82,7 @@ mkdir -p "$RUN_DIR"
 # Read by amd_ci_job_mi35x.sh; sbatch exports the submitting environment.
 export CI_SRC="$GITHUB_WORKSPACE" CI_SUITE="$SUITE" CI_SUITE_ARGS="$SUITE_ARGS"
 export CI_ROCM_VERSION="$ROCM_VERSION" CI_NODE_SCRATCH CI_EXIT_FILE="$RUN_DIR/exit_code"
+export CI_SUMMARY_FILE="$RUN_DIR/summary.md"
 # One KEY=VAL per line; an environment variable cannot carry an array.
 CI_EXEC_ENV="$(printf '%s\n' ${EXEC_ENV[@]+"${EXEC_ENV[@]}"})"
 export CI_EXEC_ENV
@@ -122,7 +125,7 @@ job_state() {  # "<STATE> <REASON>", or empty if the controller does not know th
 for attempt in $(seq 1 "$SUBMIT_ATTEMPTS"); do
     LOG="$RUN_DIR/attempt${attempt}.log"
     : > "$LOG"
-    rm -f "$CI_EXIT_FILE"
+    rm -f "$CI_EXIT_FILE" "$CI_SUMMARY_FILE"
     SBATCH_ARGS=(-p "$SLURM_PARTITION" -A "$SLURM_ACCOUNT" -q "$SLURM_QOS"
                  -N1 --exclusive -t "$TIME_LIMIT" -J "$JOB_NAME" --output "$LOG")
     [[ -n "${SLURM_EXCLUDE:-}" ]] && SBATCH_ARGS+=(--exclude="$SLURM_EXCLUDE")
@@ -160,6 +163,10 @@ for attempt in $(seq 1 "$SUBMIT_ATTEMPTS"); do
     stream_log           # also picks up the last lines of the log
 
     if [[ -s "$CI_EXIT_FILE" ]]; then
+        # The job copies it out just before writing the exit code.
+        if [[ -s "$CI_SUMMARY_FILE" && -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+            cat "$CI_SUMMARY_FILE" >> "$GITHUB_STEP_SUMMARY" || true
+        fi
         rc="$(tr -dc 0-9 < "$CI_EXIT_FILE")"
         echo "Job $JOB_ID finished with exit code ${rc:-unknown}"
         exit "${rc:-1}"
