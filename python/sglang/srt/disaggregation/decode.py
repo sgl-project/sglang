@@ -124,7 +124,6 @@ from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
     match_kv_cache,
     page_align_floor,
-    release_kv_cache,
     restore_kv_cache,
     start_restore_kv_cache,
     suffix_page_indices,
@@ -180,6 +179,19 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.kv.storage import KVStorage
 
 CLIP_MAX_NEW_TOKEN = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
+
+
+@dataclass
+class _HostStagedAdmissionStats:
+    # One transfer pass: running/retracted/waiting queues do not change, and
+    # transfer entries are removed only at the end. Only admission changes
+    # the active count. Allocator and radix-cache counters stay live.
+    retractable_tokens: Optional[int] = None
+    retractable_swa_tokens: Optional[int] = None
+    max_req_tokens: Optional[int] = None
+    max_swa_req_tokens: Optional[int] = None
+    num_device_transfer_reqs: Optional[int] = None
+    retracted_tokens: Optional[Tuple[int, int]] = None
 
 
 def _bootstrap_addr(req: Req) -> str:
@@ -1084,14 +1096,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def _abort_retracted(self, recv_req: AbortReq) -> None:
         # Retracted requests hold a KV backup.
         for req in self.retracted_queue.take(lambda req: recv_req.matches(req.rid)):
-            self.scheduler.request_retirer.abort_queued(req)
+            self.scheduler.request_retirer.abort(req)
 
     def _abort_held(self, recv_req: AbortReq) -> None:
         # Held requests hold no KV.
         for req in self.held_rebootstrap_reqs.take(
             lambda req: recv_req.matches(req.rid)
         ):
-            self.scheduler.request_retirer.abort_queued(
+            self.scheduler.request_retirer.abort(
                 req, finished_reason=recv_req.finished_reason
             )
 
@@ -1788,8 +1800,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 r for r in self.pending_reqs if id(r) not in failed_ids
             ]
             for decode_req in failed_reqs:
-                if decode_req.req.kv.holds_mamba and not decode_req.req.kv.holds_kv:
-                    release_kv_cache(decode_req.req, self.tree_cache, checkpoint=False)
+                self.scheduler.request_retirer.release(decode_req.req, checkpoint=False)
 
         self.queue.leave([queue[i].req for i in indices_to_remove])
 
@@ -2232,14 +2243,32 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
         return domain.can_fit_many_then(receive, reserve)
 
+    _host_staged_admission_stats: Optional[_HostStagedAdmissionStats] = None
+
+    @contextlib.contextmanager
+    def _use_host_staged_admission_stats(self, stats: _HostStagedAdmissionStats):
+        # Scope the cache to admission calls; all other callers use live queues,
+        # including after an exception or on the next transfer pass.
+        self._host_staged_admission_stats = stats
+        try:
+            yield
+        finally:
+            self._host_staged_admission_stats = None
+
     def allocate_host_staged(self, decode_req: DecodeRequest) -> bool:
         if self.req_to_token_pool.available_size() <= 0:
             return False
         req = decode_req.req
-        retractable_tokens = sum(
-            len(r.origin_input_ids) + len(r.output_ids)
-            for r in self.scheduler.running_batch.reqs
-        )
+        stats = self._host_staged_admission_stats
+        if stats is None or stats.retractable_tokens is None:
+            retractable_tokens = sum(
+                len(r.origin_input_ids) + len(r.output_ids)
+                for r in self.scheduler.running_batch.reqs
+            )
+            if stats is not None:
+                stats.retractable_tokens = retractable_tokens
+        else:
+            retractable_tokens = stats.retractable_tokens
         required_tokens = self._required_admission_tokens(
             req,
             self._required_alloc_tokens(
@@ -2252,13 +2281,19 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         swa_allocatable_tokens = None
         if self._uses_swa_reservation():
             _, swa_required_tokens = self._prealloc_required_tokens(req)
+            if stats is None or stats.retractable_swa_tokens is None:
+                retractable_swa_tokens = sum(
+                    self._swa_retractable_len(r)
+                    for r in self.scheduler.running_batch.reqs
+                )
+                if stats is not None:
+                    stats.retractable_swa_tokens = retractable_swa_tokens
+            else:
+                retractable_swa_tokens = stats.retractable_swa_tokens
             full_allocatable_tokens, swa_allocatable_tokens = (
                 self._swa_aware_allocatable_token_budgets(
                     retractable_tokens=retractable_tokens,
-                    retractable_swa_tokens=sum(
-                        self._swa_retractable_len(r)
-                        for r in self.scheduler.running_batch.reqs
-                    ),
+                    retractable_swa_tokens=retractable_swa_tokens,
                     count_retracted=True,
                 )
             )
@@ -2275,6 +2310,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             return False
         self._pre_alloc(req)
         decode_req.host_staged = False
+        if stats is not None and stats.num_device_transfer_reqs is not None:
+            stats.num_device_transfer_reqs += 1
         return True
 
     def _host_destinations_quiescent(self) -> bool:
@@ -2293,6 +2330,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     @property
     def has_published_destinations(self) -> bool:
         return self._num_published_destinations > 0
+
+    @property
+    def has_device_destinations(self) -> bool:
+        """Whether a transfer-queue entry holds a device destination."""
+        stats = self._host_staged_admission_stats
+        if stats is not None and stats.num_device_transfer_reqs is not None:
+            return stats.num_device_transfer_reqs > 0
+        return any(not r.host_staged for r in self.transfer_queue.queue.items())
 
     def note_destinations_queued(self, count: int) -> None:
         """Hand `count` published destinations over to the transfer queue."""
@@ -2324,28 +2369,50 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def _need_space_for_single_req(
         self, retractable_tokens: Optional[int] = None
     ) -> int:
-        need_space_for_single_req = (
-            max(
-                [
-                    min(x.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKEN)
-                    + len(x.origin_input_ids)
-                    - retractable_tokens
-                    for x in self.scheduler.running_batch.reqs
-                ]
+        if retractable_tokens is None or not self.scheduler.running_batch.reqs:
+            return 0
+        stats = self._host_staged_admission_stats
+        if stats is None or stats.max_req_tokens is None:
+            max_req_tokens = max(
+                min(x.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKEN)
+                + len(x.origin_input_ids)
+                for x in self.scheduler.running_batch.reqs
             )
-            if retractable_tokens is not None
-            and len(self.scheduler.running_batch.reqs) > 0
-            else 0
-        )
-        return need_space_for_single_req
+            if stats is not None:
+                stats.max_req_tokens = max_req_tokens
+        else:
+            max_req_tokens = stats.max_req_tokens
+        return max_req_tokens - retractable_tokens
 
     def _active_req_count(self, extra_reserved_reqs: int = 0) -> int:
+        stats = self._host_staged_admission_stats
+        if stats is None or stats.num_device_transfer_reqs is None:
+            num_device_transfer_reqs = sum(
+                not r.host_staged for r in self.transfer_queue.queue.items()
+            )
+            if stats is not None:
+                stats.num_device_transfer_reqs = num_device_transfer_reqs
+        else:
+            num_device_transfer_reqs = stats.num_device_transfer_reqs
         return (
             len(self.scheduler.running_batch.reqs)
-            + sum(not r.host_staged for r in self.transfer_queue.queue.items())
+            + num_device_transfer_reqs
             + len(self.scheduler.waiting_queue)
             + extra_reserved_reqs
         )
+
+    def _retracted_token_counts(self) -> Tuple[int, int]:
+        stats = self._host_staged_admission_stats
+        if stats is not None and stats.retracted_tokens is not None:
+            return stats.retracted_tokens
+        full_tokens = swa_tokens = 0
+        for req in self.retracted_queue:
+            full_required, swa_required = self._prealloc_required_tokens(req)
+            full_tokens += full_required
+            swa_tokens += swa_required
+        if stats is not None:
+            stats.retracted_tokens = (full_tokens, swa_tokens)
+        return full_tokens, swa_tokens
 
     def _active_reserved_tokens(
         self, n_active: Optional[int] = None, extra_reserved_reqs: int = 0
@@ -2426,9 +2493,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
 
         if count_retracted:
-            for req in self.retracted_queue:
-                full_required, _ = self._prealloc_required_tokens(req)
-                allocatable_tokens -= full_required
+            full_required, _ = self._retracted_token_counts()
+            allocatable_tokens -= full_required
 
         allocatable_tokens -= hicache_reserved_tokens
         return allocatable_tokens
@@ -2449,12 +2515,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             retractable_swa_tokens is not None
             and len(self.scheduler.running_batch.reqs) > 0
         ):
-            need_swa_space_for_single_req = max(
-                self._swa_tail_len(len(x.origin_input_ids))
-                + min(x.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKEN)
-                - retractable_swa_tokens
-                for x in self.scheduler.running_batch.reqs
-            )
+            stats = self._host_staged_admission_stats
+            if stats is None or stats.max_swa_req_tokens is None:
+                max_swa_req_tokens = max(
+                    self._swa_tail_len(len(x.origin_input_ids))
+                    + min(x.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKEN)
+                    for x in self.scheduler.running_batch.reqs
+                )
+                if stats is not None:
+                    stats.max_swa_req_tokens = max_swa_req_tokens
+            else:
+                max_swa_req_tokens = stats.max_swa_req_tokens
+            need_swa_space_for_single_req = max_swa_req_tokens - retractable_swa_tokens
 
         if n_active is None:
             n_active = self._active_req_count(extra_reserved_reqs)
@@ -2502,9 +2574,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             swa_allocatable_tokens -= min(prebuilt_reserved_tokens, prebuilt_swa_growth)
 
         if count_retracted:
-            for req in self.retracted_queue:
-                _, swa_required = self._prealloc_required_tokens(req)
-                swa_allocatable_tokens -= swa_required
+            _, swa_required = self._retracted_token_counts()
+            swa_allocatable_tokens -= swa_required
 
         return swa_allocatable_tokens
 
@@ -3183,16 +3254,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         )
         kv_manager._staging_handler = self.staging_handler
 
-    def _release_request(self, decode_req: DecodeRequest) -> None:
-        # HiSparse host pages are the transfer destination; free them with the KV.
-        if self.scheduler.enable_hisparse:
-            self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
-        if self.enable_host_receive:
-            discard_kv_cache_backup(decode_req.req, self.tree_cache)
-            if decode_req.host_staged:
-                return
-        release_kv_cache(decode_req.req, self.tree_cache, checkpoint=False)
-
     def _is_host_destination(self, decode_req: DecodeRequest) -> bool:
         return self.enable_host_receive and decode_req.host_staged
 
@@ -3269,7 +3330,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         deferred_indices = set()
         failed: List[Tuple[int, DecodeRequest, bool]] = []
         outcomes: Dict[str, bool] = {}
-        device_admission_refused = False
+        admission_stats = None
         queue = list(self.queue.items())
         for i, (decode_req, poll) in enumerate(zip(queue, polls)):
             if rids_to_check is not None:
@@ -3351,21 +3412,22 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                         self.scheduler.output_streamer.stream_output(
                             [decode_req.req], decode_req.req.return_logprob
                         )
-                        self._release_request(decode_req)
+                        self.scheduler.request_retirer.release(
+                            decode_req.req, checkpoint=False
+                        )
                         decode_req.kv_receiver.clear()
                         decode_req.kv_receiver = None
                         indices_to_remove.add(i)
                         outcomes[decode_req.req.rid] = True
                         continue
-                    # Like the prealloc and retraction loops, admit in queue order: once
-                    # a request does not fit, later ones wait for the next pass.
-                    if device_admission_refused:
-                        continue
-                    if not self.scheduler.disagg_decode_prealloc_queue.allocate_host_staged(
-                        decode_req
+                    prealloc_queue = self.scheduler.disagg_decode_prealloc_queue
+                    if admission_stats is None:
+                        admission_stats = _HostStagedAdmissionStats()
+                    with prealloc_queue._use_host_staged_admission_stats(
+                        admission_stats
                     ):
-                        device_admission_refused = True
-                        continue
+                        if not prealloc_queue.allocate_host_staged(decode_req):
+                            continue
                 self._commit_transfer_to_req(decode_req)
                 indices_to_remove.add(i)
                 # Check if request was aborted due to corruption
@@ -3378,7 +3440,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                         decode_req.req.return_logprob,
                     )
                     self._clean_hicache_prefetch_resources(decode_req)
-                    self._release_request(decode_req)
+                    self.scheduler.request_retirer.release(
+                        decode_req.req, checkpoint=False
+                    )
                     self._record_transfer_failure(
                         decode_req.req.finished_reason.message
                     )
@@ -3405,7 +3469,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 self._defer_release(decode_req)
                 deferred_indices.add(i)
             else:
-                self._release_request(decode_req)
+                self.scheduler.request_retirer.release(decode_req.req, checkpoint=False)
                 receiver = decode_req.kv_receiver
                 receiver.clear()
                 decode_req.kv_receiver = None
@@ -3478,7 +3542,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         if self.enable_staging and self.staging_handler.is_staging_room(room):
             self.staging_handler.unregister_decode_req(room)
         # release pre-allocated kv cache, but don't insert into the tree since it's failed
-        self._release_request(decode_req)
+        self.scheduler.request_retirer.release(decode_req.req, checkpoint=False)
         self.metadata_buffers.clear_slot(idx)
         self.req_to_metadata_buffer_idx_allocator.free(idx)
         if not self._is_host_destination(decode_req):
@@ -3885,9 +3949,7 @@ class SchedulerDisaggregationDecodeMixin:
             status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
         )
         self.output_streamer.stream_output([req], req.return_logprob)
-        if self.enable_hisparse:
-            self.hisparse_coordinator.request_finished(req)
-        release_kv_cache(req, self.tree_cache, checkpoint=False)
+        self.request_retirer.release(req, checkpoint=False)
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_transfer_failed_reqs()
 

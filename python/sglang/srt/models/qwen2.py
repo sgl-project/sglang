@@ -25,6 +25,7 @@ from torch import nn
 from sglang.srt.distributed import (
     get_pp_indices,
 )
+from sglang.srt.hf_transformers import get_rope_config
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
@@ -67,7 +68,6 @@ from sglang.srt.models.utils import (
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import add_prefix, make_pp_layers
-from sglang.srt.utils.hf_transformers import get_rope_config
 
 Qwen2Config = None
 
