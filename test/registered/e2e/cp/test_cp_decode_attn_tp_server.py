@@ -86,7 +86,7 @@ class TestCpDecodeAttnTpServer(CustomTestCase):
             "python/sglang/srt/model_executor/runner/base_cuda_graph_runner.py",
             "python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py",
             "python/sglang/srt/models/deepseek_v2.py",
-            "python/sglang/srt/utils/common.py",
+            "python/sglang/srt/layers/dp_attention.py",
             str(Path(__file__).resolve().relative_to(root)),
         ]
         print(

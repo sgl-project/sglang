@@ -84,7 +84,7 @@ def wo_a_fp8_block32_enabled() -> bool:
 
 
 def use_fused_qk_norm_rope(attn) -> bool:
-    return bool(envs.SGLANG_OPT_USE_FUSED_QK_NORM_ROPE.get() and attn.q_head_norm)
+    return bool(attn.q_head_norm)
 
 
 def q_norm_for_wq_b(attn, q_lora: torch.Tensor) -> Tuple[torch.Tensor, object]:
