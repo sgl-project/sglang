@@ -559,7 +559,7 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
     # ---- HiCache CPU offload: skip empty (non-owned) layers ---------------
 
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
-        from sglang.srt.utils import current_platform
+        from sglang.srt.platforms import current_platform
 
         current_platform.synchronize()
         kv_cache_cpu = []
@@ -588,7 +588,7 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         mamba_indices=None,
         req_pool_index=None,
     ):
-        from sglang.srt.utils import current_platform
+        from sglang.srt.platforms import current_platform
 
         kv_cache_cpu = kv_cache_cpu_dict["kv"]
         current_platform.synchronize()

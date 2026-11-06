@@ -16,7 +16,7 @@ from sglang.srt.mem_cache.memory_pool import (
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.async_probe import maybe_detect_oob
-from sglang.srt.utils.common import is_npu
+from sglang.srt.utils.device import is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention

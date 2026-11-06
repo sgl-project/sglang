@@ -18,6 +18,7 @@ from sglang.srt.arg_groups.arg_utils import (
     A,
     Arg,
     Derived,
+    human_readable_int,
 )
 from sglang.srt.arg_groups.choices import (
     ATTENTION_BACKEND_CHOICES,
@@ -34,7 +35,6 @@ from sglang.srt.model_executor.cuda_graph_config import (
     parse_cuda_graph_backend_arg,
     parse_cuda_graph_config_arg,
 )
-from sglang.srt.utils.common import human_readable_int
 
 
 def _paged_experts_num_resident(value: str) -> Optional[int]:

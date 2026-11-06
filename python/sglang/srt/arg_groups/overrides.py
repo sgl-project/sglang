@@ -60,8 +60,8 @@ from sglang.srt.runtime_context import (
     get_platform,
     num_dp_ranks_of,
 )
-from sglang.srt.utils.common import (
-    get_quantization_config,
+from sglang.srt.utils.common import get_quantization_config
+from sglang.srt.utils.device import (
     is_fi_a2a_supported,
     is_gfx95_supported,
     xpu_has_xmx_support,

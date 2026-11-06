@@ -19,7 +19,7 @@ import time
 from collections import OrderedDict
 from typing import Any, Callable, Optional
 
-from sglang.srt.utils.common import human_readable_int
+from sglang.srt.arg_groups.arg_utils import human_readable_int
 
 logger = logging.getLogger(__name__)
 

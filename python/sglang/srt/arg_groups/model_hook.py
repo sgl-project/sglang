@@ -44,11 +44,8 @@ from sglang.srt.runtime_context import (
     derive_attn_tp_size,
     get_platform,
 )
-from sglang.srt.utils.common import (
-    get_quantization_config,
-    is_mps,
-    parse_connector_type,
-)
+from sglang.srt.utils.common import get_quantization_config, parse_connector_type
+from sglang.srt.utils.device import is_mps
 
 logger = logging.getLogger(__name__)
 

@@ -96,7 +96,7 @@ from sglang.multimodal_gen.runtime.utils.vision import (
     preprocess_image,
 )
 from sglang.srt.environ import envs
-from sglang.srt.utils.common import get_compiler_backend
+from sglang.srt.utils.device import get_compiler_backend
 
 logger = init_logger(__name__)
 

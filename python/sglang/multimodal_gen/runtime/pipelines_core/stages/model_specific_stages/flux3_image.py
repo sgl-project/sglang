@@ -380,7 +380,7 @@ def prepare_multi_reference(image: Image.Image) -> Image.Image:
 
 
 def _open_reference(path: str | bytes | Image.Image) -> Image.Image:
-    from sglang.srt.utils.common import get_image_bytes
+    from sglang.srt.multimodal.media_io import get_image_bytes
 
     if isinstance(path, Image.Image):
         return path

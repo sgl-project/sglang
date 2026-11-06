@@ -40,7 +40,7 @@ from sglang.srt.runtime_context import (
     get_observability,
     get_parallel,
 )
-from sglang.srt.utils.common import is_npu
+from sglang.srt.utils.device import is_npu
 from sglang.srt.utils.network import NetworkAddress
 
 if TYPE_CHECKING:
