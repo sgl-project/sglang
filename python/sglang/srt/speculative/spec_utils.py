@@ -417,18 +417,18 @@ def fill_draft_window_rail(
 
 
 def record_stream_each(tensors, stream):
-    """Call record_stream(stream) on each cuda tensor in `tensors`, skipping
-    non-tensor / non-cuda entries. Tells the caching allocator that the
+    """Call record_stream(stream) on each device tensor in `tensors`, skipping
+    non-tensor / host tensors. Tells the caching allocator that the
     tensors are also used on `stream`, so memory is not recycled while
     queued work is still in flight after Python refs drop.
     """
     for t in tensors:
-        if isinstance(t, torch.Tensor) and t.is_cuda:
+        if isinstance(t, torch.Tensor) and not t.is_cpu:
             t.record_stream(stream)
 
 
 def record_stream_for_v2_verify(batch, verify_input, fwd_stream):
-    """Mark pre-prepare SB / verify_input GPU tensors as used on `fwd_stream`.
+    """Mark pre-prepare SB / verify_input device tensors as used on `fwd_stream`.
 
     Spec V2 mutates SB mid-forward (`prepare_for_verify` rebinds
     `batch.input_ids` / `out_cache_loc`; `_draft_extend_for_decode` later
