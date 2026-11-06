@@ -22,9 +22,13 @@ install_simulator_hooks()
 from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
+from sglang.srt.runtime_context import publish
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.server_args import ServerArgs
 from sglang_simulator.simulation.sglang.scheduler import C_SchedulerHook
 
+publish(ServerArgs(model_path='dummy', device='cpu', page_size=1,
+                   disable_cuda_graph=True), role='test')
 events = []
 def noop(*args, **kwargs): pass
 def note(*, rid, natural_stop):
