@@ -591,12 +591,20 @@ def _check_gdn_replayssm_ucache_spec(cfg: Any, *, flag: str) -> None:
 
 
 def _check_gdn_replayssm_ucache_cache(cfg: Any, *, flag: str) -> None:
-    # TODO(ameynaik-hub): prefix-cache snapshots via FlashInfer's
-    # gdn_prefix_materialize, then drop the --disable-radix-cache requirement.
-    if not cfg.disable_radix_cache:
+    # Prefill-written states have an empty window, so the tree holds exact
+    # checkpoints; every target extend restarts its slot's window.
+    # TODO(ameynaik-hub): decode-time snapshots via FlashInfer's
+    # gdn_prefix_materialize, then drop the skip-decode-insert requirement.
+    if not cfg.disable_radix_cache and not cfg.radix_cache_skip_decode_insert:
         raise ValueError(
-            f"{flag} requires --disable-radix-cache: prefix-cache snapshots of a "
-            "deferred-fold state are not supported yet."
+            f"{flag} needs --disable-radix-cache or --radix-cache-skip-decode-insert: "
+            "decode-time snapshots of a deferred-fold state need "
+            "gdn_prefix_materialize, which is not wired yet."
+        )
+    if cfg.enable_int8_mamba_checkpoint:
+        raise ValueError(
+            f"{flag} does not support --enable-int8-mamba-checkpoint: the "
+            "u-cache keeps an fp16 checkpoint pool."
         )
     if cfg.enable_mixed_chunk:
         raise ValueError(

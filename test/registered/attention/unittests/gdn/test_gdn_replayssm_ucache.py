@@ -31,6 +31,7 @@ from sglang.srt.layers.attention.linear.gdn_replayssm_ucache import (  # noqa: E
     GdnUcacheVerifier,
     allocate_gdn_ucache,
     commit_gdn_ucache_cursors,
+    reset_gdn_ucache_cursors,
 )
 
 H, HV, K, V = 4, 12, 128, 128
@@ -183,6 +184,96 @@ class TestGdnReplaySsmUcache(CustomTestCase):
         self.assertTrue(all(count > 0 for count in folds.values()), folds)
         # Padding slot 0 is never verified or committed.
         self.assertEqual(int(buffers.hist_len[0]), 0)
+
+    def test_extend_reset_empties_recycled_slot_windows(self):
+        """A target extend into a slot whose previous owner left a non-empty window
+        (a recycled, copy-on-write or loaded-back slot) must verify from the new
+        checkpoint alone; a stale window would replay the old owner's records."""
+        device = torch.device("cuda")
+        gen = torch.Generator(device=device).manual_seed(1)
+
+        def randn(*shape, scale=1.0):
+            return torch.randn(*shape, generator=gen, device=device) * scale
+
+        T = NUM_DRAFT_TOKENS
+        buffers = allocate_gdn_ucache(
+            num_layers=1,
+            num_slots=NUM_SLOTS,
+            num_k_heads=H,
+            num_v_heads=HV,
+            head_k_dim=K,
+            head_v_dim=V,
+            max_num_draft_tokens=T,
+            device="cuda",
+        )
+        # Finite garbage records: a stale window shifts the output instead of NaN.
+        for ring in (buffers.k_ring, buffers.u_ring):
+            ring.copy_(randn(*ring.shape).to(ring.dtype))
+        buffers.g_ring.copy_(-randn(*buffers.g_ring.shape).abs() * 0.1)
+        # Previous owners' cursors, including on the padding slot 0.
+        buffers.hist_len.copy_(torch.arange(NUM_SLOTS, device=device) % 13 + 1)
+        buffers.cache_base.copy_(torch.arange(NUM_SLOTS, device=device) * 5 % 32)
+        hist_before = buffers.hist_len.clone()
+        base_before = buffers.cache_base.clone()
+
+        # The extend batch: slots 3 and 5 plus padding rows (0 and -1).
+        extend_slots = torch.tensor([3, 0, 5, -1], dtype=torch.int32, device=device)
+        reset_gdn_ucache_cursors(buffers=buffers, slots=extend_slots)
+        reset = [3, 5]
+        for slot in range(NUM_SLOTS):
+            if slot in reset:
+                self.assertEqual(int(buffers.hist_len[slot]), 0, slot)
+                self.assertEqual(int(buffers.cache_base[slot]), 0, slot)
+            else:
+                self.assertEqual(int(buffers.hist_len[slot]), int(hist_before[slot]))
+                self.assertEqual(int(buffers.cache_base[slot]), int(base_before[slot]))
+
+        # The extend wrote a fresh checkpoint; the first verify must read only it.
+        state = randn(NUM_SLOTS, HV, V, K, scale=0.5).to(torch.float16)
+        rows = torch.tensor(reset, dtype=torch.int32, device=device)
+        batch = len(reset)
+        q = randn(batch * T, H, K).to(torch.bfloat16)
+        k = randn(batch * T, H, K).to(torch.bfloat16)
+        v = randn(batch * T, HV, V, scale=0.5).to(torch.bfloat16)
+        a = randn(batch * T, HV, scale=0.5).to(torch.bfloat16)
+        b = randn(batch * T, HV).to(torch.bfloat16)
+        A_log = torch.full((HV,), -3.0, device=device)
+        dt_bias = randn(HV, scale=0.5).to(torch.bfloat16)
+        output = (
+            GdnUcacheVerifier(device=device, first_layer_id=0)
+            .target_verify(
+                layer_id=0,
+                query=q,
+                key=k,
+                value=v,
+                a=a,
+                b=b,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                state=state,
+                k_ring=buffers.k_ring[0],
+                u_ring=buffers.u_ring[0],
+                g_ring=buffers.g_ring[0],
+                buffers=buffers,
+                cache_indices=rows,
+                num_draft_tokens=T,
+            )
+            .view(batch, T, HV, V)
+        )
+        for r, slot in enumerate(reset):
+            tokens = slice(r * T, (r + 1) * T)
+            y_ref, _ = _fp32_window(
+                state[slot].float(),
+                q[tokens],
+                k[tokens],
+                v[tokens],
+                a[tokens],
+                b[tokens],
+                A_log,
+                dt_bias,
+            )
+            err = (output[r].float() - y_ref).abs().max().item()
+            self.assertLess(err, FIRST_STEP_TOL, f"slot {slot}: {err:.2e}")
 
 
 if __name__ == "__main__":

@@ -1622,7 +1622,7 @@ class HybridLinearAttnBackend(AttentionBackend):
 
         if mamba_pool.gdn_ucache is not None:
             # The u-cache ring owns the SSM rollback: no intermediate_ssm to scatter.
-            assert mamba_track_indices is None, "u-cache verify runs with radix off"
+            assert mamba_track_indices is None, "u-cache verify tracks no decode state"
             commit_gdn_ucache_cursors(
                 buffers=mamba_pool.gdn_ucache,
                 slots=state_indices_tensor,

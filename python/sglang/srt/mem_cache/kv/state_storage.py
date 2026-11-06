@@ -135,9 +135,6 @@ class StateStorage:
                 req.kv.mamba_pool_idx = mid[0]
                 given_state.append(req)
                 req.kv.mamba_needs_clear = True
-                # An empty u-cache window: verify then reads only what prefill wrote.
-                if self.pool.gdn_ucache is not None:
-                    self.pool.gdn_ucache.hist_len.index_fill_(0, mid, 0)
                 # A zero write_pos empties the ReplaySSM ring;
                 # decode then reads only the checkpoint written by prefill.
                 if self.pool.replayssm_write_pos is not None:

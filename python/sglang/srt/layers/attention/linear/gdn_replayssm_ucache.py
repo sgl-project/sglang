@@ -158,6 +158,23 @@ def _commit_cursors_kernel(
 
 
 @triton.jit
+def _reset_cursors_kernel(
+    slots_ptr,
+    hist_pool_ptr,
+    base_pool_ptr,
+    num_rows,
+    BLOCK: tl.constexpr,
+):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    in_range = offs < num_rows
+    slot = tl.load(slots_ptr + offs, mask=in_range, other=-1).to(tl.int64)
+    live = in_range & (slot > 0)
+    zero = tl.zeros([BLOCK], dtype=tl.int32)
+    tl.store(hist_pool_ptr + slot, zero, live)
+    tl.store(base_pool_ptr + slot, zero, live)
+
+
+@triton.jit
 def _zero_padded_rows_kernel(
     slots_ptr,
     out_ptr,
@@ -258,6 +275,27 @@ def commit_gdn_ucache_cursors(
         num_rows,
         buffers.flush_min,
         RING_MASK=_RING_MASK,
+        BLOCK=_CURSOR_BLOCK,
+    )
+
+
+def reset_gdn_ucache_cursors(*, buffers: GdnUcacheBuffers, slots: torch.Tensor) -> None:
+    """Empty the windows of the slots a target extend writes, so the extend and
+    the verifies after it read only the checkpoint ``S0``.
+
+    The slot may carry its previous owner's cursors (a recycled slot, a prefix-cache
+    copy-on-write or load-back), while the state it receives is always canonical:
+    prefix-cached states are prefill-written, decode-time states never enter the
+    tree. ``slots`` are state-pool (physical) ids; ``slot <= 0`` rows are padding
+    and left untouched. One launch, no host sync."""
+    num_rows = slots.shape[0]
+    if num_rows == 0:
+        return
+    _reset_cursors_kernel[(triton.cdiv(num_rows, _CURSOR_BLOCK),)](
+        slots,
+        buffers.hist_len,
+        buffers.cache_base,
+        num_rows,
         BLOCK=_CURSOR_BLOCK,
     )
 
