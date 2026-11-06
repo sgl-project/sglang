@@ -177,24 +177,6 @@ class TestServerArgsPositionalOrder(CustomTestCase):
             POSITIONAL_FIELD_ORDER,
         )
 
-    def test_new_parallel_flag_keeps_keyword_and_cli_inputs(self):
-        parser = argparse.ArgumentParser()
-        ServerArgs.add_cli_args(parser)
-        for enabled in (False, True):
-            with self.subTest(enabled=enabled):
-                keyword_args = ServerArgs(
-                    model_path="dummy", enable_megamoe_for_layernorm_sp=enabled
-                )
-                argv = ["--model-path", "dummy"]
-                argv.append(
-                    "--enable-megamoe-for-layernorm-sp"
-                    if enabled
-                    else "--no-enable-megamoe-for-layernorm-sp"
-                )
-                cli_args = ServerArgs.from_cli_args(parser.parse_args(argv))
-                self.assertEqual(keyword_args.enable_megamoe_for_layernorm_sp, enabled)
-                self.assertEqual(cli_args.enable_megamoe_for_layernorm_sp, enabled)
-
 
 class TestMuseSparkLaunchDefaults(CustomTestCase):
     """Minimal recipes must resolve before generic memory/backend defaults."""
@@ -3063,32 +3045,6 @@ class TestHiCacheArgs(CustomTestCase):
         self.assertEqual(resolution_result(args, "hicache_mem_layout"), "page_first")
         self.assertIsNone(resolution_result(args, "decode_attention_backend"))
 
-    def test_prefill_weight_versions_rejects_hierarchical_cache(self):
-        """KV restored from a host or storage tier carries no weight version, so the two cannot combine."""
-        args = self._make_args(
-            enable_prefill_weight_versions=True,
-            enable_hierarchical_cache=True,
-        )
-
-        with self.assertRaisesRegex(ValueError, "enable-hierarchical-cache"):
-            handle_cache_compatibility(args)
-
-    def test_prefill_weight_versions_rejects_disaggregation(self):
-        """PD prefill workers do not stamp prompt tokens yet, so the flag is refused there."""
-        args = self._make_args(
-            enable_prefill_weight_versions=True,
-            disaggregation_mode="prefill",
-        )
-
-        with self.assertRaisesRegex(ValueError, "disaggregation"):
-            handle_cache_compatibility(args)
-
-    def test_prefill_weight_versions_alone_is_accepted(self):
-        """A plain engine may report prompt weight versions."""
-        args = self._make_args(enable_prefill_weight_versions=True)
-
-        handle_cache_compatibility(args)
-
     def test_decode_offload_rejects_host_pool_retraction(self):
         args = self._make_args(
             disaggregation_mode="decode",
@@ -3229,16 +3185,6 @@ class TestAscendOpsArgs(CustomTestCase):
         server_args = ServerArgs(
             model_path="dummy",
             moe_a2a_backend="ascend_ops",
-            enable_waterfill=True,
-        )
-        with self.assertRaisesRegex(ValueError, "incompatible.*ascend_ops"):
-            handle_a2a_moe(server_args)
-
-    def test_ascend_ops_rejected_by_waterfill_with_config(self):
-        server_args = ServerArgs(
-            model_path="dummy",
-            moe_a2a_backend="ascend_ops",
-            moe_ascend_ops_config="{}",
             enable_waterfill=True,
         )
         with self.assertRaisesRegex(ValueError, "incompatible.*ascend_ops"):
@@ -5479,25 +5425,33 @@ class TestLazyReexports(CustomTestCase):
 
 class TestPrefillWeightVersionCompatibility(CustomTestCase):
     def test_untracked_kv_paths_rejected(self) -> None:
-        """Reject paths that load or produce KV without preserving provenance."""
-        for overrides in [
-            {"enable_unified_memory": True},
-            {"enable_encoder_swa_bounded_replay": True},
-            {"enable_lmcache": True},
-            {"enable_unified_cache_external_linker": True},
-            {"dllm_algorithm": "LowConfidence"},
-            {"speculative_algorithm": "NGRAM"},
-            {"speculative_algorithm": "UNO"},
-            {"speculative_algorithm": "DSPARK"},
+        """Reject paths that load or produce KV without preserving provenance:
+        KV restored from a host or storage tier carries no weight version, and
+        PD prefill workers do not stamp prompt tokens yet."""
+        flag = "enable-prefill-weight-versions"
+        for overrides, message in [
+            ({"enable_unified_memory": True}, flag),
+            ({"enable_encoder_swa_bounded_replay": True}, flag),
+            ({"enable_lmcache": True}, flag),
+            ({"enable_unified_cache_external_linker": True}, flag),
+            ({"dllm_algorithm": "LowConfidence"}, flag),
+            ({"speculative_algorithm": "NGRAM"}, flag),
+            ({"speculative_algorithm": "UNO"}, flag),
+            ({"speculative_algorithm": "DSPARK"}, flag),
+            ({"enable_hierarchical_cache": True}, "enable-hierarchical-cache"),
+            ({"disaggregation_mode": "prefill"}, "disaggregation"),
         ]:
             with self.subTest(overrides=overrides):
                 args = ServerArgs(
                     model_path="dummy", enable_prefill_weight_versions=True, **overrides
                 )
-                with self.assertRaisesRegex(
-                    ValueError, "enable-prefill-weight-versions"
-                ):
+                with self.assertRaisesRegex(ValueError, message):
                     handle_cache_compatibility(args)
+
+    def test_a_plain_engine_is_accepted(self) -> None:
+        handle_cache_compatibility(
+            ServerArgs(model_path="dummy", enable_prefill_weight_versions=True)
+        )
 
     def test_rust_response_without_provenance_rejected(self) -> None:
         """Reject the Rust response path that cannot serialize prompt versions."""

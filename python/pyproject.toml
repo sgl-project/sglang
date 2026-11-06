@@ -38,7 +38,6 @@ dependencies = [
   "easydict",  # Required by remote model code (e.g. DeepSeek-OCR) loaded via trust_remote_code; validated by transformers 5.4+ check_imports
   "einops",
   "fastapi",
-  "flash-attn-4>=4.0.0b18",
   "flashinfer_python[cu13]==0.7.3", # keep it aligned with jit-cache version in Dockerfile
   "gguf",
   "humming-kernels[cu13]==0.1.18",
@@ -79,7 +78,7 @@ dependencies = [
   "setproctitle",
   "sgl-deep-ep==0.1.2.post1",
   "sgl-deep-gemm==0.2.6",
-  "sgl-flash-mla==1.0.0",
+  "sgl-flash-mla==1.0.2",
   "sglang-kernel==0.4.10",
   "smg-grpc-servicer>=0.9.0",
   "soundfile==0.13.1",

@@ -120,8 +120,8 @@ from sglang.srt.utils.async_probe import (
     maybe_detect_nan,
     maybe_detect_oob,
 )
-from sglang.srt.utils.common import (
-    fast_topk,
+from sglang.srt.utils.common import fast_topk
+from sglang.srt.utils.device import (
     get_available_gpu_memory,
     is_cpu,
     is_cuda,
@@ -129,8 +129,8 @@ from sglang.srt.utils.common import (
     is_musa,
     is_npu,
     is_xpu,
-    log_info_on_rank0,
 )
+from sglang.srt.utils.log_utils import log_info_on_rank0
 
 _is_cpu = is_cpu()
 _is_npu = is_npu()
@@ -837,13 +837,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     break
 
                 forward_batch.input_ids = input_ids
-                # Qwen3-MoE MTP uses a fused RoPE + KV-store path whose cache_loc
-                # argument must be contiguous.
-                if (
-                    self.draft_runner.model_config.hf_config.architectures[0]
-                    == "Qwen3MoeForCausalLMMTP"
-                ):
-                    out_cache_loc = out_cache_loc.contiguous()
                 forward_batch.out_cache_loc = out_cache_loc[i]
                 spec_info.hidden_states = hidden_states
 
