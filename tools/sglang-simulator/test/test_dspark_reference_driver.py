@@ -664,6 +664,7 @@ def test_finished_successor_skips_response_metrics_but_accounts_launched_cost_on
 def test_native_abort_release_retires_admitted_chunks_without_a_later_result(
     run, hooked_scheduler
 ):
+    hooked_scheduler.predictor.supports_dspark = True
     hooked_scheduler.predictor.dspark_runtime = run.runtime
     current = selected(run, chunks=1)
     result = launch(run, current)
