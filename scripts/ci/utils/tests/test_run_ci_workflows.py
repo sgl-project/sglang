@@ -685,7 +685,8 @@ class PpuPathSelectionTest(unittest.TestCase):
             self.assertEqual(jobs[job]["runs-on"], "k8s-runner-group-cpu-flytiger")
             action = next(s for s in jobs[job]["steps"] if s.get("id") == "worker")
             self.assertRegex(
-                action["uses"], r"^flytiger-eco/shared-workflows/cluster-task@[a-f0-9]{40}$"
+                action["uses"],
+                r"^flytiger-eco/shared-workflows/cluster-task@[a-f0-9]{40}$",
             )
             self.assertEqual(
                 action["with"]["timeout_minutes"], {smoke: 40, body: 55, multi: 55}[job]

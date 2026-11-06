@@ -2,17 +2,16 @@
 
 import json
 import os
-from pathlib import Path
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
-
+from pathlib import Path
 
 SETUP_SCRIPT = Path(__file__).resolve().with_name("setup_evalscope.sh")
 SPEC = "evalscope[ifeval]==1.11.1"
-FAKE_COMMAND = r'''
+FAKE_COMMAND = r"""
 import json
 import os
 from pathlib import Path
@@ -104,7 +103,7 @@ elif command == "evalscope" and args == ["--help"]:
 
 else:
     raise SystemExit("unexpected fake invocation: " + command + " " + repr(args))
-'''
+"""
 
 
 @unittest.skipUnless(sys.platform in ("linux", "darwin"), "requires Linux or Darwin")
@@ -128,14 +127,16 @@ class TestEvalScopeCache(unittest.TestCase):
         self.venv = self.root / "venv one"
         self.log = self.root / "commands.jsonl"
         self.env = os.environ.copy()
-        self.env.update({
-            "PATH": str(self.bin) + os.pathsep + self.env.get("PATH", os.defpath),
-            "TMPDIR": str(self.scratch),
-            "EVALSCOPE_CACHE_DIR": str(self.cache),
-            "EVALSCOPE_WHEELHOUSE": str(self.root / "missing wheelhouse"),
-            "FAKE_LOG": str(self.log),
-            "REAL_MV": shutil.which("mv"),
-        })
+        self.env.update(
+            {
+                "PATH": str(self.bin) + os.pathsep + self.env.get("PATH", os.defpath),
+                "TMPDIR": str(self.scratch),
+                "EVALSCOPE_CACHE_DIR": str(self.cache),
+                "EVALSCOPE_WHEELHOUSE": str(self.root / "missing wheelhouse"),
+                "FAKE_LOG": str(self.log),
+                "REAL_MV": shutil.which("mv"),
+            }
+        )
         launcher = "#!" + str(Path(sys.executable).resolve()) + "\n" + FAKE_COMMAND
         for name in ("python3", "mv"):
             path = self.bin / name
@@ -145,20 +146,29 @@ class TestEvalScopeCache(unittest.TestCase):
     def run_setup(self, *, venv=None, spec=SPEC, failure="", cache=None):
         self.log.write_text("")
         env = self.env.copy()
-        env.update({
-            "EVALSCOPE_VENV": str(venv or self.venv),
-            "EVALSCOPE_SPEC": spec,
-            "FAKE_FAIL_AT": failure,
-            "EVALSCOPE_CACHE_DIR": str(cache or self.cache),
-        })
+        env.update(
+            {
+                "EVALSCOPE_VENV": str(venv or self.venv),
+                "EVALSCOPE_SPEC": spec,
+                "FAKE_FAIL_AT": failure,
+                "EVALSCOPE_CACHE_DIR": str(cache or self.cache),
+            }
+        )
         return subprocess.run(
-            ["bash", str(SETUP_SCRIPT)], env=env, text=True,
-            capture_output=True, timeout=30, check=False,
+            ["bash", str(SETUP_SCRIPT)],
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=False,
         )
 
     def events(self, name):
-        return [args for event, args in map(json.loads, self.log.read_text().splitlines())
-                if event == name]
+        return [
+            args
+            for event, args in map(json.loads, self.log.read_text().splitlines())
+            if event == name
+        ]
 
     def assert_success(self, result):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -175,12 +185,15 @@ class TestEvalScopeCache(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=self.root) as stage:
             subprocess.run([self.tar, "-xzf", str(archive), "-C", stage], check=True)
             restored = Path(stage)
-            self.assertEqual((restored / ".cache-key").read_text(),
-                             (venv / ".cache-key").read_text())
+            self.assertEqual(
+                (restored / ".cache-key").read_text(), (venv / ".cache-key").read_text()
+            )
             self.assertEqual((restored / ".fake-spec").read_text(), spec)
             self.assertTrue(os.access(restored / "bin/evalscope", os.X_OK))
-            self.assertEqual((restored / ".cache-requirements.txt").read_text(),
-                             "evalscope==" + spec.split("==", 1)[1] + "\n")
+            self.assertEqual(
+                (restored / ".cache-requirements.txt").read_text(),
+                "evalscope==" + spec.split("==", 1)[1] + "\n",
+            )
 
     def assert_zero_install(self):
         self.assertEqual(self.events("pip_install"), [])
@@ -244,7 +257,9 @@ class TestEvalScopeCache(unittest.TestCase):
         self.assert_success(result)
         self.assertIn("cache MISS:", result.stdout)
         third = self.archive_for(other_venv)
-        self.assertEqual(len({first.parent.name, second.parent.name, third.parent.name}), 3)
+        self.assertEqual(
+            len({first.parent.name, second.parent.name, third.parent.name}), 3
+        )
         self.assertTrue(all(path.is_file() for path in (first, second, third)))
         self.assert_archive(second, self.venv, other_spec)
         self.assert_archive(third, other_venv, other_spec)
@@ -271,8 +286,10 @@ class TestEvalScopeCache(unittest.TestCase):
                         (venv / ".cache-key").write_text("wrong-key\n")
                     else:
                         (venv / ".fake-spec").write_text("invalid installed version")
-                    subprocess.run([self.tar, "-czf", str(archive), "-C", str(venv), "."],
-                                   check=True)
+                    subprocess.run(
+                        [self.tar, "-czf", str(archive), "-C", str(venv), "."],
+                        check=True,
+                    )
                 corrupted = archive.read_bytes()
                 shutil.rmtree(venv)
                 venv.mkdir()
@@ -280,8 +297,11 @@ class TestEvalScopeCache(unittest.TestCase):
 
                 result = self.run_setup(venv=venv)
                 self.assert_success(result)
-                message = ("validation failed" if corruption == "invalid_environment"
-                           else "restore failed")
+                message = (
+                    "validation failed"
+                    if corruption == "invalid_environment"
+                    else "restore failed"
+                )
                 self.assertIn(message, result.stdout)
                 self.assertIn("cache MISS:", result.stdout)
                 self.assertIn("cache published:", result.stdout)
@@ -317,24 +337,34 @@ class TestEvalScopeCache(unittest.TestCase):
         archive = self.cache / key / "venv.tar.gz"
         for venv in venvs:
             (venv / ".cache-key").write_text(key + "\n")
-        publication = 'if [ "${built}" = 1 ]; then' + SETUP_SCRIPT.read_text().split(
-            'if [ "${built}" = 1 ]; then', 1
-        )[1].rsplit('\necho "evalscope binary:', 1)[0]
+        publication = (
+            'if [ "${built}" = 1 ]; then'
+            + SETUP_SCRIPT.read_text()
+            .split('if [ "${built}" = 1 ]; then', 1)[1]
+            .rsplit('\necho "evalscope binary:', 1)[0]
+        )
         publishers = []
         for venv in venvs:
             env = self.env.copy()
-            env.update({
-                "EVALSCOPE_VENV": str(venv),
-                "venv_python": str(venv / "bin/python"),
-                "cache_key": key,
-                "key_dir": str(archive.parent),
-                "cache_archive": str(archive),
-                "built": "1",
-            })
-            publishers.append(subprocess.Popen(
-                ["bash", "-euo", "pipefail", "-c", publication],
-                env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            ))
+            env.update(
+                {
+                    "EVALSCOPE_VENV": str(venv),
+                    "venv_python": str(venv / "bin/python"),
+                    "cache_key": key,
+                    "key_dir": str(archive.parent),
+                    "cache_archive": str(archive),
+                    "built": "1",
+                }
+            )
+            publishers.append(
+                subprocess.Popen(
+                    ["bash", "-euo", "pipefail", "-c", publication],
+                    env=env,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+            )
         for process in publishers:
             stdout, stderr = process.communicate(timeout=30)
             self.assertEqual(process.returncode, 0, stdout + stderr)
@@ -353,7 +383,9 @@ class TestEvalScopeCache(unittest.TestCase):
                 cache = blocked_cache if failure == "mkdir" else self.cache
                 result = self.run_setup(venv=venv, cache=cache, failure=failure)
                 self.assert_success(result)
-                self.assertIn("::warning::EvalScope cache publication failed", result.stdout)
+                self.assertIn(
+                    "::warning::EvalScope cache publication failed", result.stdout
+                )
                 self.assertNotIn("cache published:", result.stdout)
                 self.assertTrue((venv / ".cache-key").is_file())
                 self.assertTrue(os.access(venv / "bin/evalscope", os.X_OK))
@@ -367,6 +399,9 @@ class TestEvalScopeCache(unittest.TestCase):
 
 if __name__ == "__main__":
     if sys.platform == "darwin":
-        print("Darwin adapters: real gtar, mocked os-release, mv -T removed; "
-              "native Linux behavior still requires a Linux run.", file=sys.stderr)
+        print(
+            "Darwin adapters: real gtar, mocked os-release, mv -T removed; "
+            "native Linux behavior still requires a Linux run.",
+            file=sys.stderr,
+        )
     unittest.main()
