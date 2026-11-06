@@ -288,11 +288,6 @@ def _check_cuda_device_version(
     )
 
 
-is_ampere_with_cuda_12_3 = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version, device_capability_majors=[8], cuda_version=(12, 3)
-    )
-)
 is_hopper_with_cuda_12_3 = lru_cache(maxsize=1)(
     partial(
         _check_cuda_device_version, device_capability_majors=[9], cuda_version=(12, 3)
@@ -1346,29 +1341,6 @@ def get_cuda_driver_bindings():
         from cuda import cuda as cuda_driver
 
     return cuda_driver
-
-
-def get_device_sm_nvidia_smi():
-    try:
-        # Run nvidia-smi command and capture output
-        result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-
-        # Get the first line of output (assuming at least one GPU exists)
-        compute_cap_str = result.stdout.strip().split("\n")[0]
-
-        # Convert string (e.g., "9.0") to tuple of integers (9, 0)
-        major, minor = map(int, compute_cap_str.split("."))
-        return (major, minor)
-
-    except (subprocess.CalledProcessError, FileNotFoundError, ValueError) as e:
-        # Handle cases where nvidia-smi isn't available or output is unexpected
-        logger.error("Error getting compute capability: %s", e)
-        return (0, 0)  # Default/fallback value
 
 
 @contextmanager
@@ -3870,10 +3842,10 @@ def retry(
             traceback.print_exc()
 
             if try_index >= max_retry:
-                raise Exception(f"retry() exceed maximum number of retries.")
+                raise Exception("retry() exceed maximum number of retries.")
 
             if not should_retry(e):
-                raise Exception(f"retry() observe errors that should not be retried.")
+                raise Exception("retry() observe errors that should not be retried.")
 
             delay = min(initial_delay * (2**try_index), max_delay) * (
                 0.75 + 0.25 * random.random()
@@ -4340,7 +4312,7 @@ def dim_is_supported(weight):
 def _process_weight_after_loading(module, weight_names, transpose_dims=None) -> None:
     # Pack weight for get better performance on CPU
     devices = {getattr(module, weight_name).device for weight_name in weight_names}
-    assert len(devices) == 1, f"Expects all weights to be on the same device"
+    assert len(devices) == 1, "Expects all weights to be on the same device"
     device = devices.pop()
 
     if transpose_dims:
@@ -4568,9 +4540,9 @@ def get_physical_cpus_by_numa_or_block():
     use_block = n_blocks > n_nodes
     physical_by_group = defaultdict(dict)
 
-    for cpu, core, socket, node, block in cpu_info:
+    for cpu, core, socket_id, node, block in cpu_info:
         group = block if use_block else node
-        key = (core, socket)
+        key = (core, socket_id)
         if key not in physical_by_group[group]:
             # Pick the first CPU seen for that physical core.
             physical_by_group[group][key] = cpu
@@ -4895,19 +4867,6 @@ def json_list_type(value):
         )
 
 
-def get_extend_input_len_swa_limit(
-    sliding_window_size: int, chunked_prefill_size: int, page_size: int
-) -> int:
-    # 1. a factor of 2x is because each prefill contains chunked_prefill_size tokens,
-    #    and between prefills, we run the tree cache's checkpoint(),
-    #    so we unlock the previously locked nodes.
-    # 2. max is to handle the case that chunked_prefill_size is larger than sliding_window_size.
-    #    in that case, each prefill contains chunked_prefill_size tokens,
-    #    and we can only free out-of-sliding-window kv indices after each prefill.
-    # 3. page_size is because we want to have 1 token extra for generated tokens.
-    return page_size + 2 * max(sliding_window_size, chunked_prefill_size)
-
-
 def get_num_new_pages(
     seq_lens: torch.Tensor,
     page_size: int,
@@ -5116,20 +5075,6 @@ def calc_diff(x, y):
     denominator = (x * x + y * y).sum()
     sim = 2 * (x * y).sum() / denominator
     return 1 - sim
-
-
-@contextmanager
-def temp_attr_context(obj, attr, value):
-    if obj is None:
-        yield
-        return
-
-    original_value = getattr(obj, attr)
-    setattr(obj, attr, value)
-    try:
-        yield
-    finally:
-        setattr(obj, attr, original_value)
 
 
 def raise_error_or_warn(obj, strict, counter_name, message, log_interval=1000):
