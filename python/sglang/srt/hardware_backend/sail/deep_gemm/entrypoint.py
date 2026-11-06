@@ -23,6 +23,9 @@ from typing import Any, Optional, Tuple
 
 import torch
 
+from sglang.srt.hardware_backend.sail.deep_gemm.kernel_types import (
+    SailDeepGemmKernelType,
+)
 from sglang.srt.layers.deep_gemm_wrapper import compile_utils
 from sglang.srt.layers.deep_gemm_wrapper.configurer import (  # noqa: F401
     ENABLE_JIT_DEEPGEMM,
@@ -51,11 +54,9 @@ def grouped_gemm_nt_f8f8bf16_nopad(
 
     m, k = lhs[0].shape
     num_groups, n, _ = rhs[0].shape
-    kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_NOPAD
+    kernel_type = SailDeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_NOPAD
     if _is_sail and lhs[1].shape[-1] == 1 and rhs[1].shape[-1] == 1:
-        kernel_type = (
-            compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_NOPAD_CHANNEL
-        )
+        kernel_type = SailDeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_NOPAD_CHANNEL
 
     _sanity_check_input(lhs)
     _sanity_check_input(rhs)
@@ -89,9 +90,7 @@ def grouped_gemm_nt_f8f8bf16_masked(
     _, n, _ = rhs[0].shape
     kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED
     if lhs[1].shape[-1] == 1 and rhs[1].shape[-1] == 1:
-        kernel_type = (
-            compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED_CHANNEL
-        )
+        kernel_type = SailDeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED_CHANNEL
 
     _sanity_check_input(lhs)
     _sanity_check_input(rhs)
@@ -178,7 +177,7 @@ def gemm_nt_i8i8bf16(
     m, k = lhs[0].shape
     n, _ = rhs[0].shape
     num_groups = 1
-    kernel_type = compile_utils.DeepGemmKernelType.GEMM_NT_I8I8BF16
+    kernel_type = SailDeepGemmKernelType.GEMM_NT_I8I8BF16
 
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
         deep_gemm.gemm_int8_int8_bf16_nt(lhs, rhs, out)
@@ -196,7 +195,7 @@ def grouped_gemm_nt_i8i8bf16_contig(
 
     m, k = lhs[0].shape
     num_groups, n, _ = rhs[0].shape
-    kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_I8I8BF16_CONTIG
+    kernel_type = SailDeepGemmKernelType.GROUPED_GEMM_NT_I8I8BF16_CONTIG
 
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
         deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_contiguous(lhs, rhs, out, m_indices)
@@ -217,7 +216,7 @@ def grouped_gemm_nt_i8i8bf16_masked(
 
     num_groups, _, k = lhs[0].shape
     _, n, _ = rhs[0].shape
-    kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_I8I8BF16_MASKED
+    kernel_type = SailDeepGemmKernelType.GROUPED_GEMM_NT_I8I8BF16_MASKED
 
     with compile_utils.deep_gemm_execution_hook(
         expected_m, n, k, num_groups, kernel_type
@@ -251,7 +250,7 @@ def grouped_gemm_nt_i8i8bf16_nopad(
 
     m, k = lhs[0].shape
     num_groups, n, _ = rhs[0].shape
-    kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_I8I8BF16_NOPAD
+    kernel_type = SailDeepGemmKernelType.GROUPED_GEMM_NT_I8I8BF16_NOPAD
 
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
         deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_nopad(
@@ -270,7 +269,7 @@ def grouped_gemm_nt_bf16_nopad(
 
     m, k = lhs.shape
     num_groups, n, _ = rhs.shape
-    kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_BF16_NOPAD
+    kernel_type = SailDeepGemmKernelType.GROUPED_GEMM_NT_BF16_NOPAD
 
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
         deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_nopad(
@@ -292,9 +291,9 @@ def gemm_nt_f4f4bf16(
     num_groups = 1
 
     kernel_type = (
-        compile_utils.DeepGemmKernelType.GEMM_NT_F4F4BF16
+        SailDeepGemmKernelType.GEMM_NT_F4F4BF16
         if bias is None
-        else compile_utils.DeepGemmKernelType.GEMM_NT_F4F4BF16_BIAS
+        else SailDeepGemmKernelType.GEMM_NT_F4F4BF16_BIAS
     )
 
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
@@ -318,9 +317,9 @@ def grouped_gemm_nt_f4f4bf16_masked(
     num_groups, _, k = lhs[0].shape
     _, n, _ = rhs[0].shape
     kernel_type = (
-        compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F4F4BF16_MASKED
+        SailDeepGemmKernelType.GROUPED_GEMM_NT_F4F4BF16_MASKED
         if bias is None
-        else compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F4F4BF16_MASKED_BIAS
+        else SailDeepGemmKernelType.GROUPED_GEMM_NT_F4F4BF16_MASKED_BIAS
     )
 
     with compile_utils.deep_gemm_execution_hook(
@@ -362,9 +361,9 @@ def grouped_gemm_nt_f4f4bf16_nopad(
     num_groups, n, _ = rhs[0].shape
 
     kernel_type = (
-        compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F4F4BF16_NOPAD
+        SailDeepGemmKernelType.GROUPED_GEMM_NT_F4F4BF16_NOPAD
         if bias is None
-        else compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F4F4BF16_NOPAD_BIAS
+        else SailDeepGemmKernelType.GROUPED_GEMM_NT_F4F4BF16_NOPAD_BIAS
     )
 
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
@@ -402,9 +401,9 @@ def grouped_gemm_nt_bf16i4bf16_masked(
     _, n, _ = _get_w4a16_weight_shape(rhs[0])
 
     kernel_type = (
-        compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_MMA_MASKED
+        SailDeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_MMA_MASKED
         if rhs[0].dtype == torch.uint8
-        else compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_MASKED
+        else SailDeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_MASKED
     )
 
     with compile_utils.deep_gemm_execution_hook(
@@ -440,9 +439,9 @@ def grouped_gemm_nt_bf16i4bf16_nopad(
     num_groups, n, _ = _get_w4a16_weight_shape(rhs[0])
 
     kernel_type = (
-        compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_MMA_NOPAD
+        SailDeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_MMA_NOPAD
         if rhs[0].dtype == torch.uint8
-        else compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_NOPAD
+        else SailDeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_NOPAD
     )
 
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
@@ -506,15 +505,11 @@ def grouped_gemm_nt_bf16i4bf16_fused(
     m, k = lhs.shape
     num_groups, n, _ = _get_w4a16_weight_shape(rhs[0])
     if rhs[0].dtype == torch.uint8:
-        kernel_type = (
-            compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_MMA_FUSED
-        )
+        kernel_type = SailDeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_MMA_FUSED
     elif rhs[1].dtype == torch.uint8:
-        kernel_type = (
-            compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_VALU_FUSED
-        )
+        kernel_type = SailDeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_VALU_FUSED
     else:
-        kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_FUSED
+        kernel_type = SailDeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_FUSED
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
         deep_gemm.m_grouped_gemm_w4a16_fused(
             lhs,
@@ -542,7 +537,7 @@ def grouped_gemm_nt_bf16bf16bf16_fused(
     _require_sail_fused_api(gemm_name)
     m, k = lhs.shape
     num_groups, n, _ = rhs.shape
-    kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_BF16_FUSED
+    kernel_type = SailDeepGemmKernelType.GROUPED_GEMM_NT_BF16_FUSED
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
         deep_gemm.m_grouped_gemm_bf16_bf16_bf16_nt_fused(
             lhs,
@@ -570,7 +565,7 @@ def grouped_gemm_nt_i8i8bf16_fused(
     _require_sail_fused_api(gemm_name)
     m, k = lhs[0].shape
     num_groups, n, _ = rhs[0].shape
-    kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_I8I8BF16_FUSED
+    kernel_type = SailDeepGemmKernelType.GROUPED_GEMM_NT_I8I8BF16_FUSED
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
         deep_gemm.m_grouped_gemm_int8_int8_bf16_nt_fused(
             lhs,
@@ -602,9 +597,9 @@ def grouped_gemm_nt_f8f8bf16_fused(
     # At K=128 the last dim of block scales is also 1, so it cannot be used to
     # infer channel mode.
     kernel_type = (
-        compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_FUSED_CHANNEL
+        SailDeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_FUSED_CHANNEL
         if perchannel_quant
-        else compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_FUSED
+        else SailDeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_FUSED
     )
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
         deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_fused(
@@ -639,7 +634,7 @@ def grouped_gemm_nt_f4f4bf16_fused(
     # byte width for K.
     m, k = lhs[0].shape
     num_groups, n, _ = rhs[0].shape
-    kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F4F4BF16_FUSED
+    kernel_type = SailDeepGemmKernelType.GROUPED_GEMM_NT_F4F4BF16_FUSED
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
         deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_fused(
             lhs,

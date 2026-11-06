@@ -9,12 +9,16 @@ imports this module on demand, for a kernel type the shared table does not
 cover, so the shared compile path never imports the platform tree at module
 scope.
 
-``DeepGemmKernelType`` stays in the shared module: it is the key both sides
-dispatch on, and the shared memory estimate switches on its members.
+The types themselves are declared in ``kernel_types``: the shared enum names
+only what every DeepGEMM build serves, and the shared tables key on ``.name``,
+so a member declared here needs no counterpart there.
 """
 
 import torch
 
+from sglang.srt.hardware_backend.sail.deep_gemm.kernel_types import (
+    SailDeepGemmKernelType,
+)
 from sglang.srt.layers.deep_gemm_wrapper.compile_utils import (
     DeepGemmKernelType,
     _BaseWarmupExecutor,
@@ -602,37 +606,38 @@ class _GroupedNopadWarmupExecutor_int4_mma(_GroupedNopadWarmupExecutor_int4):
 
 
 _SAIL_WARMUP_EXECUTORS = {
-    DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_NOPAD: _GroupedNopadWarmupExecutor,
+    SailDeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_NOPAD: _GroupedNopadWarmupExecutor,
+    # Still a shared type: the shared entrypoint falls back to it as well.
     DeepGemmKernelType.GEMM_NT_F8F8BF16_CHANNEL: _NormalWarmupExecutor_channel,
-    DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG_CHANNEL: _GroupedContWarmupExecutor_channel,
-    DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED_CHANNEL: _GroupedMaskedWarmupExecutor_channel,
-    DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_NOPAD_CHANNEL: _GroupedNopadWarmupExecutor_channel,
-    DeepGemmKernelType.GROUPED_GEMM_NT_I8I8BF16_MASKED: _GroupedMaskedWarmupExecutor_int8,
-    DeepGemmKernelType.GROUPED_GEMM_NT_I8I8BF16_CONTIG: _GroupedContWarmupExecutor_int8,
-    DeepGemmKernelType.GROUPED_GEMM_NT_I8I8BF16_NOPAD: _GroupedNopadWarmupExecutor_int8,
-    DeepGemmKernelType.GEMM_NT_I8I8BF16: _NormalWarmupExecutor_int8,
-    DeepGemmKernelType.GROUPED_GEMM_NT_BF16_NOPAD: _GroupedNopadWarmupExecutor_bf16,
-    DeepGemmKernelType.GROUPED_GEMM_NT_F4F4BF16_MASKED: _GroupedMaskedWarmupExecutor_fp4,
-    DeepGemmKernelType.GROUPED_GEMM_NT_F4F4BF16_NOPAD: _GroupedNopadWarmupExecutor_fp4,
-    DeepGemmKernelType.GEMM_NT_F4F4BF16: _NormalWarmupExecutor_fp4,
-    DeepGemmKernelType.GROUPED_GEMM_NT_F4F4BF16_MASKED_BIAS: _GroupedMaskedWarmupExecutor_fp4_bias,
-    DeepGemmKernelType.GROUPED_GEMM_NT_F4F4BF16_NOPAD_BIAS: _GroupedNopadWarmupExecutor_fp4_bias,
-    DeepGemmKernelType.GEMM_NT_F4F4BF16_BIAS: _NormalWarmupExecutor_fp4_bias,
-    DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_MASKED: _GroupedMaskedWarmupExecutor_int4,
-    DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_NOPAD: _GroupedNopadWarmupExecutor_int4,
-    DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_FUSED: _GroupedFusedWarmupExecutor,
-    DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_FUSED_CHANNEL: _GroupedFusedWarmupExecutor_fp8_channel,
-    DeepGemmKernelType.GROUPED_GEMM_NT_I8I8BF16_FUSED: _GroupedFusedWarmupExecutor_int8,
-    DeepGemmKernelType.GROUPED_GEMM_NT_BF16_FUSED: _GroupedFusedWarmupExecutor_bf16,
-    DeepGemmKernelType.GROUPED_GEMM_NT_F4F4BF16_FUSED: _GroupedFusedWarmupExecutor_fp4,
-    DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_MMA_MASKED: _GroupedMaskedWarmupExecutor_int4_mma,
-    DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_MMA_NOPAD: _GroupedNopadWarmupExecutor_int4_mma,
-    DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_MMA_FUSED: _GroupedFusedWarmupExecutor_int4_mma,
-    DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_FUSED: _GroupedFusedWarmupExecutor_int4,
-    DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_VALU_FUSED: _GroupedFusedWarmupExecutor_mxfp4_valu,
+    SailDeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG_CHANNEL: _GroupedContWarmupExecutor_channel,
+    SailDeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED_CHANNEL: _GroupedMaskedWarmupExecutor_channel,
+    SailDeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_NOPAD_CHANNEL: _GroupedNopadWarmupExecutor_channel,
+    SailDeepGemmKernelType.GROUPED_GEMM_NT_I8I8BF16_MASKED: _GroupedMaskedWarmupExecutor_int8,
+    SailDeepGemmKernelType.GROUPED_GEMM_NT_I8I8BF16_CONTIG: _GroupedContWarmupExecutor_int8,
+    SailDeepGemmKernelType.GROUPED_GEMM_NT_I8I8BF16_NOPAD: _GroupedNopadWarmupExecutor_int8,
+    SailDeepGemmKernelType.GEMM_NT_I8I8BF16: _NormalWarmupExecutor_int8,
+    SailDeepGemmKernelType.GROUPED_GEMM_NT_BF16_NOPAD: _GroupedNopadWarmupExecutor_bf16,
+    SailDeepGemmKernelType.GROUPED_GEMM_NT_F4F4BF16_MASKED: _GroupedMaskedWarmupExecutor_fp4,
+    SailDeepGemmKernelType.GROUPED_GEMM_NT_F4F4BF16_NOPAD: _GroupedNopadWarmupExecutor_fp4,
+    SailDeepGemmKernelType.GEMM_NT_F4F4BF16: _NormalWarmupExecutor_fp4,
+    SailDeepGemmKernelType.GROUPED_GEMM_NT_F4F4BF16_MASKED_BIAS: _GroupedMaskedWarmupExecutor_fp4_bias,
+    SailDeepGemmKernelType.GROUPED_GEMM_NT_F4F4BF16_NOPAD_BIAS: _GroupedNopadWarmupExecutor_fp4_bias,
+    SailDeepGemmKernelType.GEMM_NT_F4F4BF16_BIAS: _NormalWarmupExecutor_fp4_bias,
+    SailDeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_MASKED: _GroupedMaskedWarmupExecutor_int4,
+    SailDeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_NOPAD: _GroupedNopadWarmupExecutor_int4,
+    SailDeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_FUSED: _GroupedFusedWarmupExecutor,
+    SailDeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_FUSED_CHANNEL: _GroupedFusedWarmupExecutor_fp8_channel,
+    SailDeepGemmKernelType.GROUPED_GEMM_NT_I8I8BF16_FUSED: _GroupedFusedWarmupExecutor_int8,
+    SailDeepGemmKernelType.GROUPED_GEMM_NT_BF16_FUSED: _GroupedFusedWarmupExecutor_bf16,
+    SailDeepGemmKernelType.GROUPED_GEMM_NT_F4F4BF16_FUSED: _GroupedFusedWarmupExecutor_fp4,
+    SailDeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_MMA_MASKED: _GroupedMaskedWarmupExecutor_int4_mma,
+    SailDeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_MMA_NOPAD: _GroupedNopadWarmupExecutor_int4_mma,
+    SailDeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_MMA_FUSED: _GroupedFusedWarmupExecutor_int4_mma,
+    SailDeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_FUSED: _GroupedFusedWarmupExecutor_int4,
+    SailDeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_VALU_FUSED: _GroupedFusedWarmupExecutor_mxfp4_valu,
 }
 
 
-def create_sail_warmup_executor(kernel_type: DeepGemmKernelType, **kwargs):
+def create_sail_warmup_executor(kernel_type: SailDeepGemmKernelType, **kwargs):
     """Build the warmup executor for a kernel type the shared table omits."""
     return _SAIL_WARMUP_EXECUTORS[kernel_type](**kwargs)

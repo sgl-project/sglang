@@ -4,7 +4,7 @@ import math
 import os
 import time
 from contextlib import contextmanager, nullcontext
-from enum import IntEnum, auto
+from enum import Enum, IntEnum, auto
 from functools import partial
 from pathlib import Path
 from typing import Callable, Dict, List, Tuple
@@ -115,6 +115,10 @@ def update_deep_gemm_config(gpu_id: int):
     _DO_COMPILE_ALL = _IS_FIRST_RANK_ON_NODE
 
 
+# The warmup kernel types every DeepGEMM build serves. A build that serves more
+# declares them in an enum of its own (see
+# hardware_backend/sail/deep_gemm/kernel_types.py); the signatures below take the
+# bare ``Enum`` because every table keys on ``.name``, which any member has.
 class DeepGemmKernelType(IntEnum):
     GROUPED_GEMM_NT_F8F8BF16_MASKED = auto()
     GROUPED_GEMM_NT_F8F8BF16_CONTIG = auto()
@@ -123,55 +127,26 @@ class DeepGemmKernelType(IntEnum):
     GEMM_NT_F8F8BF16 = auto()
     GEMM_NT_F8F8BF16_BLOCK32 = auto()
     GEMM_NT_BF16BF16F32 = auto()
-
-    # <NOTE>
-    # new added int8/bf16/fp4/int4 kernel type and nopad impl.
-    # </NOTE>
-    GROUPED_GEMM_NT_F8F8BF16_NOPAD = auto()
-    GROUPED_GEMM_NT_F8F8BF16_MASKED_CHANNEL = auto()
-    GROUPED_GEMM_NT_F8F8BF16_CONTIG_CHANNEL = auto()
+    # The fp8 GEMM with one scale per output channel. Still shared because the
+    # shared entrypoint falls back to it; the types only some builds serve live
+    # in that build's own enum.
     GEMM_NT_F8F8BF16_CHANNEL = auto()
-    GROUPED_GEMM_NT_F8F8BF16_NOPAD_CHANNEL = auto()
-
-    GROUPED_GEMM_NT_I8I8BF16_MASKED = auto()
-    GROUPED_GEMM_NT_I8I8BF16_CONTIG = auto()
-    GROUPED_GEMM_NT_I8I8BF16_NOPAD = auto()
-    GEMM_NT_I8I8BF16 = auto()
-
-    GROUPED_GEMM_NT_BF16_NOPAD = auto()
-
-    GROUPED_GEMM_NT_F4F4BF16_MASKED = auto()
-    GROUPED_GEMM_NT_F4F4BF16_NOPAD = auto()
-    GEMM_NT_F4F4BF16 = auto()
-    GROUPED_GEMM_NT_F4F4BF16_MASKED_BIAS = auto()
-    GROUPED_GEMM_NT_F4F4BF16_NOPAD_BIAS = auto()
-    GEMM_NT_F4F4BF16_BIAS = auto()
-
-    GROUPED_GEMM_NT_BF16I4BF16_MASKED = auto()
-    GROUPED_GEMM_NT_BF16I4BF16_NOPAD = auto()
-
-    # GEMM1 reads the routing indices directly, skipping the physical scatter.
-    GROUPED_GEMM_NT_F8F8BF16_FUSED = auto()
-    GROUPED_GEMM_NT_F8F8BF16_FUSED_CHANNEL = auto()
-    GROUPED_GEMM_NT_I8I8BF16_FUSED = auto()
-    GROUPED_GEMM_NT_BF16_FUSED = auto()
-    GROUPED_GEMM_NT_F4F4BF16_FUSED = auto()
-
-    # Appended at the end so the type values of existing warmup caches stay valid.
-    GROUPED_GEMM_NT_BF16I4BF16_MMA_MASKED = auto()
-    GROUPED_GEMM_NT_BF16I4BF16_MMA_NOPAD = auto()
-    GROUPED_GEMM_NT_BF16I4BF16_MMA_FUSED = auto()
-    GROUPED_GEMM_NT_BF16I4BF16_FUSED = auto()
-    GROUPED_GEMM_NT_BF16I4BF16_VALU_FUSED = auto()
 
 
-_INITIALIZATION_DICT: Dict[Tuple[DeepGemmKernelType, int, int, int], bool] = dict()
+# Grouped layouts whose M list is trimmed to the build's M alignment.
+_CONTIG_KERNEL_TYPES = {
+    "GROUPED_GEMM_NT_F8F8BF16_CONTIG",
+    "GROUPED_GEMM_NT_F8F8BF16_CONTIG_CHANNEL",
+    "GROUPED_GEMM_NT_I8I8BF16_CONTIG",
+    "GROUPED_GEMM_NT_BF16_CONTIG",
+}
+
+
+_INITIALIZATION_DICT: Dict[Tuple[Enum, int, int, int], bool] = dict()
 
 
 @contextmanager
-def _local_rank_compile_lock(
-    kernel_type: DeepGemmKernelType, n: int, k: int, num_groups: int
-):
+def _local_rank_compile_lock(kernel_type: Enum, n: int, k: int, num_groups: int):
     """Serialize one pre-compile group across the ranks sharing DG_JIT_CACHE_DIR.
 
     Every rank lazily walks the same (kernel_type, n, k, num_groups) groups in
@@ -193,7 +168,7 @@ def _local_rank_compile_lock(
 
 # TODO improve code
 def _maybe_compile_deep_gemm_one_type_all(
-    kernel_type: DeepGemmKernelType,
+    kernel_type: Enum,
     n: int,
     k: int,
     num_groups: int,
@@ -256,7 +231,7 @@ def _contiguous_m_alignment() -> int:
 
 # NOTE(alcanderian): get_num_sms should be change when 2-batch-overlap is introduced
 def _compile_deep_gemm_one_type_all(
-    kernel_type: DeepGemmKernelType,
+    kernel_type: Enum,
     n: int,
     k: int,
     num_groups: int,
@@ -266,12 +241,7 @@ def _compile_deep_gemm_one_type_all(
     # Temporary disable symmetric memory during compilation since it only runs on the first rank.
     saved_context = disable_symmetric_memory_context()
     try:
-        if kernel_type in [
-            DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG,
-            DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG_CHANNEL,
-            DeepGemmKernelType.GROUPED_GEMM_NT_I8I8BF16_CONTIG,
-            DeepGemmKernelType.GROUPED_GEMM_NT_BF16_CONTIG,
-        ]:
+        if kernel_type.name in _CONTIG_KERNEL_TYPES:
             m_alignment = _contiguous_m_alignment()
             m_list = sorted(list(set(m for m in m_list if m % m_alignment == 0)))
 
@@ -357,7 +327,7 @@ class _BaseWarmupExecutorMeta(type):
 
 class _BaseWarmupExecutor(metaclass=_BaseWarmupExecutorMeta):
     @staticmethod
-    def create(kernel_type: DeepGemmKernelType, **kwargs):
+    def create(kernel_type: Enum, **kwargs):
         factory = _WARMUP_EXECUTORS.get(kernel_type)
         if factory is None:
             # Kernel types only the SAIL vendor build serves; their executors
@@ -371,7 +341,7 @@ class _BaseWarmupExecutor(metaclass=_BaseWarmupExecutorMeta):
 
     @staticmethod
     def get_memory_requirement(
-        kernel_type: DeepGemmKernelType, max_m: int, n: int, k: int, num_groups: int
+        kernel_type: Enum, max_m: int, n: int, k: int, num_groups: int
     ) -> float:
         # FP32 input scales remain live while DeepGEMM converts their layout.
         _GB = 1 << 30
@@ -401,7 +371,7 @@ class _BaseWarmupExecutor(metaclass=_BaseWarmupExecutorMeta):
                     + max_m * n * 2
                 )
                 return (tensor_bytes + alignment_bytes) / _GB
-            bf16 = kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_BF16_FUSED
+            bf16 = name == "GROUPED_GEMM_NT_BF16_FUSED"
             tensor_bytes = (max_m * k + num_groups * n * k) * (
                 2 if bf16 else 1
             ) + max_m * n * 2
@@ -438,26 +408,15 @@ class _BaseWarmupExecutor(metaclass=_BaseWarmupExecutorMeta):
                 + lhs_groups * max_m * n * 2
                 + (rhs_groups * n * 4 if name.endswith("_BIAS") else 0)
             ) / _GB
-        is_dense_fp8 = kernel_type in (
-            DeepGemmKernelType.GEMM_NT_F8F8BF16,
-            DeepGemmKernelType.GEMM_NT_F8F8BF16_BLOCK32,
-        )
-        block_size = (
-            32
-            if kernel_type == DeepGemmKernelType.GEMM_NT_F8F8BF16_BLOCK32
-            else _BLOCK_SIZE
-        )
+        is_dense_fp8 = name in ("GEMM_NT_F8F8BF16", "GEMM_NT_F8F8BF16_BLOCK32")
+        block_size = 32 if name == "GEMM_NT_F8F8BF16_BLOCK32" else _BLOCK_SIZE
         lhs_scales = max_m * ceil_div(k, block_size) * 4
         rhs_scales = ceil_div(n, block_size) * ceil_div(k, block_size) * 4
         scale_workspace = _get_fp8_scale_workspace(
             max_m,
             n,
             k,
-            lhs_groups=(
-                num_groups
-                if kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED
-                else 1
-            ),
+            lhs_groups=(num_groups if name == "GROUPED_GEMM_NT_F8F8BF16_MASKED" else 1),
             rhs_groups=1 if is_dense_fp8 else num_groups,
             block_size=block_size,
         )
@@ -470,9 +429,9 @@ class _BaseWarmupExecutor(metaclass=_BaseWarmupExecutorMeta):
                 + rhs_scales
                 + scale_workspace
             ) / _GB
-        elif kernel_type in (
-            DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG,
-            DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_NOPAD,
+        elif name in (
+            "GROUPED_GEMM_NT_F8F8BF16_CONTIG",
+            "GROUPED_GEMM_NT_F8F8BF16_NOPAD",
         ):
             return (
                 max_m * k
@@ -483,14 +442,14 @@ class _BaseWarmupExecutor(metaclass=_BaseWarmupExecutorMeta):
                 + scale_workspace
                 + num_groups * rhs_scales
             ) / _GB
-        elif kernel_type in (
-            DeepGemmKernelType.GROUPED_GEMM_NT_BF16_CONTIG,
-            DeepGemmKernelType.GROUPED_GEMM_NT_BF16_NOPAD,
+        elif name in (
+            "GROUPED_GEMM_NT_BF16_CONTIG",
+            "GROUPED_GEMM_NT_BF16_NOPAD",
         ):
             return (
                 max_m * k * 2 + num_groups * n * k * 2 + max_m * 4 + max_m * n * 2
             ) / _GB
-        elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED:
+        elif name == "GROUPED_GEMM_NT_F8F8BF16_MASKED":
             return (
                 num_groups * max_m * k
                 + num_groups * n * k
@@ -499,17 +458,17 @@ class _BaseWarmupExecutor(metaclass=_BaseWarmupExecutorMeta):
                 + num_groups * (lhs_scales + rhs_scales)
                 + scale_workspace
             ) / _GB
-        elif kernel_type == DeepGemmKernelType.GEMM_NT_BF16BF16F32:
+        elif name == "GEMM_NT_BF16BF16F32":
             # bf16 lhs + bf16 rhs + fp32 out
             return (max_m * k * 2 + n * k * 2 + max_m * n * 4) / _GB
-        elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_BF16_MASKED:
+        elif name == "GROUPED_GEMM_NT_BF16_MASKED":
             return (
                 num_groups * max_m * k * 2
                 + num_groups * n * k * 2
                 + num_groups * 4
                 + num_groups * max_m * n * 2
             ) / _GB
-        elif kernel_type in [DeepGemmKernelType.GROUPED_GEMM_NT_F4F4BF16_NOPAD_BIAS]:
+        elif name == "GROUPED_GEMM_NT_F4F4BF16_NOPAD_BIAS":
             return (
                 max_m * k
                 + num_groups * n * k
@@ -517,7 +476,7 @@ class _BaseWarmupExecutor(metaclass=_BaseWarmupExecutorMeta):
                 + max_m * 4
                 + max_m * n * 2
             ) / _GB
-        elif kernel_type in [DeepGemmKernelType.GROUPED_GEMM_NT_F4F4BF16_MASKED_BIAS]:
+        elif name == "GROUPED_GEMM_NT_F4F4BF16_MASKED_BIAS":
             return (
                 num_groups * max_m * k
                 + num_groups * n * k
@@ -525,11 +484,11 @@ class _BaseWarmupExecutor(metaclass=_BaseWarmupExecutorMeta):
                 + num_groups * 4
                 + num_groups * max_m * n * 2
             ) / _GB
-        elif kernel_type in [DeepGemmKernelType.GEMM_NT_F4F4BF16_BIAS]:
+        elif name == "GEMM_NT_F4F4BF16_BIAS":
             return (max_m * k + n * k + n * 4 + max_m * n * 2) / _GB
-        elif kernel_type in (
-            DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_MMA_NOPAD,
-            DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_MMA_MASKED,
+        elif name in (
+            "GROUPED_GEMM_NT_BF16I4BF16_MMA_NOPAD",
+            "GROUPED_GEMM_NT_BF16I4BF16_MMA_MASKED",
         ):
             lhs_groups = num_groups if "MASKED" in name else 1
             return (
@@ -539,7 +498,7 @@ class _BaseWarmupExecutor(metaclass=_BaseWarmupExecutorMeta):
                 + (num_groups if "MASKED" in name else max_m) * 4
                 + lhs_groups * max_m * n * 2
             ) / _GB
-        elif kernel_type in [DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_NOPAD]:
+        elif name == "GROUPED_GEMM_NT_BF16I4BF16_NOPAD":
             return (
                 max_m * k * 2
                 + num_groups * (k // 16) * (n * 2) * 4
@@ -547,7 +506,7 @@ class _BaseWarmupExecutor(metaclass=_BaseWarmupExecutorMeta):
                 + max_m * 4
                 + max_m * n * 2
             ) / _GB
-        elif kernel_type in [DeepGemmKernelType.GROUPED_GEMM_NT_BF16I4BF16_MASKED]:
+        elif name == "GROUPED_GEMM_NT_BF16I4BF16_MASKED":
             return (
                 num_groups * max_m * k * 2
                 + num_groups * (k // 16) * (n * 2) * 4
@@ -556,7 +515,7 @@ class _BaseWarmupExecutor(metaclass=_BaseWarmupExecutorMeta):
                 + num_groups * max_m * n * 2
             ) / _GB
         else:
-            raise ValueError(f"Invalid kernel type: {kernel_type}")
+            raise ValueError(f"Invalid kernel type: {name}")
 
     def __init__(self, max_m: int, n: int, k: int, num_groups: int):
         self.max_m = max_m
@@ -753,10 +712,10 @@ class _BF16GroupedMaskedWarmupExecutor(_BaseWarmupExecutor):
         )
 
 
-# The kernel types every DeepGEMM build serves. The SAIL-only ones are registered
-# by srt/hardware_backend/sail/deep_gemm/warmup.py, which `create` imports on
-# demand, so this table is declared here only after its executors exist.
-_WARMUP_EXECUTORS: Dict[DeepGemmKernelType, Callable] = {
+# The executors for the kernel types every DeepGEMM build serves. A build's own
+# types are served by srt/hardware_backend/sail/deep_gemm/warmup.py, which
+# `create` imports on demand when this table has no entry for the name.
+_WARMUP_EXECUTORS: Dict[Enum, Callable] = {
     DeepGemmKernelType.GEMM_NT_F8F8BF16: _NormalWarmupExecutor,
     DeepGemmKernelType.GEMM_NT_F8F8BF16_BLOCK32: partial(
         _NormalWarmupExecutor, block_size=32
@@ -770,7 +729,7 @@ _WARMUP_EXECUTORS: Dict[DeepGemmKernelType, Callable] = {
 
 
 def deep_gemm_execution_hook(
-    m: int, n: int, k: int, num_groups: int, kernel_type: DeepGemmKernelType
+    m: int, n: int, k: int, num_groups: int, kernel_type: Enum
 ):
     if _is_musa:
         return nullcontext()
@@ -780,7 +739,7 @@ def deep_gemm_execution_hook(
 
 @contextmanager
 def _deep_gemm_execution_hook(
-    m: int, n: int, k: int, num_groups: int, kernel_type: DeepGemmKernelType
+    m: int, n: int, k: int, num_groups: int, kernel_type: Enum
 ):
     if m > 0:
         _maybe_compile_deep_gemm_one_type_all(kernel_type, n, k, num_groups)
