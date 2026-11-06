@@ -445,18 +445,28 @@ class OpenAIServingRerank(OpenAIServingBase):
                 )
 
                 # Execute generation request
-                ret = await self.tokenizer_manager.generate_request(
-                    gen_request, raw_request
-                ).__anext__()
+                gen = self.tokenizer_manager.generate_request(gen_request, raw_request)
+                try:
+                    ret = await gen.__anext__()
+                finally:
+                    await gen.aclose()
 
                 # Extract yes/no probabilities from logprobs
                 return self._extract_score_from_logprobs(ret)
 
             # Submit all documents at once so the scheduler can batch them.
             # asyncio.gather preserves input order.
-            scores = await asyncio.gather(
-                *(_score_one(doc) for doc in request.documents)
-            )
+            tasks = [asyncio.create_task(_score_one(doc)) for doc in request.documents]
+            try:
+                scores = await asyncio.gather(*tasks)
+            finally:
+                # If one document fails, cancel the rest so they stop consuming
+                # preprocessing and scheduler capacity; cancellation makes
+                # generate_request abort any already-dispatched request.
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
 
             responses = self._build_rerank_response(scores, request)
             return responses

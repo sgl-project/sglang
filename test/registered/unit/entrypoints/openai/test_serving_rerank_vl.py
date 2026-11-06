@@ -123,6 +123,35 @@ class TestServingRerankVLConcurrency(CustomTestCase):
             self.assertEqual(r.document, f"doc{r.index}")
             self.assertAlmostEqual(r.score, p_yes[r.document])
 
+    def test_failed_document_cancels_siblings(self):
+        manager = _TokenizerManager({"bad": 0.5, "slow": 0.5})
+        sibling_cancelled = asyncio.Event()
+
+        async def generate_request(request, raw_request):
+            if request.text.endswith("bad"):
+                await asyncio.sleep(0)
+                raise ValueError("bad exceeds the context length")
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                sibling_cancelled.set()
+                raise
+            yield  # pragma: no cover
+
+        manager.generate_request = generate_request
+        handler = OpenAIServingRerank(manager)
+        request = V1RerankReqInput(query="query", documents=["bad", "slow"])
+
+        async def run():
+            result = await handler._handle_non_streaming_request(request, request, None)
+            # Checked before asyncio.run() tears down leftover tasks.
+            return result, sibling_cancelled.is_set()
+
+        result, cancelled_before_return = asyncio.run(run())
+
+        self.assertIn(b"bad exceeds the context length", result.body)
+        self.assertTrue(cancelled_before_return)
+
     def test_requests_skip_prompt_logprobs(self):
         docs = ["doc0", "doc1"]
         manager = _TokenizerManager({doc: 0.5 for doc in docs})
