@@ -186,7 +186,7 @@ def _kda_fp8_modules() -> frozenset:
             "SGLANG_OPT_GLM53_KDA_PTPC_MODULES must select qkv_proj, f_a_proj "
             "and g_a_proj together"
         )
-    # Measured on H200 and H20; the GPU test runs on H100, H200 and H20.
+    # Measured on H200 and H20; the GPU test covers H100, H200 and H20.
     if not cutlass_fp8_supported() or get_device_capability()[0] != 9:
         raise ValueError(
             "SGLANG_OPT_GLM53_KDA_PTPC_MODULES requires a Hopper GPU (SM90)"

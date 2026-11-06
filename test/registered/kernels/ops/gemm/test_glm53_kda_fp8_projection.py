@@ -35,12 +35,13 @@ from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-# base-b and base-c, not the kernel stage, whose path filter misses srt/ changes;
-# H100 runs the path of a Hopper GPU without tuned tables. The test uses one GPU,
-# but H200 and H20 runners come only as 8-GPU pools.
+# base-b, not the kernel stage, whose path filter misses srt/ changes; H100 runs
+# the path of a Hopper GPU without tuned tables. H200 and H20, which have tuned
+# tables, run in extra-b. The test uses one GPU, but H200 and H20 runners come
+# only as 8-GPU pools.
 register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-large")
-register_cuda_ci(est_time=30, stage="base-c", runner_config="8-gpu-h200")
-register_cuda_ci(est_time=30, stage="base-c", runner_config="8-gpu-h20")
+register_cuda_ci(est_time=30, stage="extra-b", runner_config="8-gpu-h200")
+register_cuda_ci(est_time=30, stage="extra-b", runner_config="8-gpu-h20")
 
 HIDDEN, HEADS, HEAD_DIM = 4096, 64, 128
 PREFIX = "model.layers.0.self_attn"
