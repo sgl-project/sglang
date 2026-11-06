@@ -308,7 +308,6 @@ def check_dcp_l3_extra_pool(entry: Any, anchor: Any) -> None:
     from sglang.srt.layers.dcp.layout import dsa_shards_index_k
     from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
     from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
-    from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 
     pool = entry.host_pool
     if pool is anchor:
@@ -323,13 +322,6 @@ def check_dcp_l3_extra_pool(entry: Any, anchor: Any) -> None:
         and pool.size == anchor.size
     ):
         return  # index-K row-sharded like the MLA KV (Kimi-K3.1)
-    if (
-        entry.name == PoolName.DRAFT
-        and isinstance(pool, MLATokenToKVPoolHost)
-        and pool.kv_buffer is not None
-        and pool.dcp_size == anchor.dcp_size
-    ):
-        return  # DFLASH MLA draft holds this rank's rows, like the target
     raise NotImplementedError(
         f"HiCache L3 with DCP does not support the {entry.name} host pool "
         f"({type(pool).__name__})."
