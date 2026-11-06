@@ -169,7 +169,10 @@ class HierarchyBlock(DllmAlgorithm):
         logits = torch.cat([logits[:, :1], logits[:, :-1]], dim=1)
 
         candidates = self._current_sub_block(self._denoise_mask(forward_batch))
-        preds = logits.argmax(dim=-1)
+        # A predicted mask token would leave its position masked and stall the
+        # step, so it falls back to the runner-up token.
+        top2 = logits.topk(2, dim=-1).indices
+        preds = torch.where(top2[..., 0] == self.mask_id, top2[..., 1], top2[..., 0])
         probs = torch.softmax(logits.float(), dim=-1)
         confidence = probs.gather(dim=-1, index=preds.unsqueeze(-1)).squeeze(-1)
         confidence = torch.where(candidates, confidence, -float("inf"))

@@ -164,6 +164,18 @@ class TestHierarchyBlockRun(unittest.TestCase):
         self.assertEqual(batch.input_ids[1].item(), MASK)
         self.assertEqual(next_ids[0].tolist(), targets[0][3:8])
 
+    def test_predicted_mask_token_is_never_emitted(self):
+        """A model whose top prediction is the mask token must not stall a step
+        or leave a mask token in the output."""
+        targets = [[10] + [MASK] * 8]
+        runner = _OracleRunner(targets, HIGH)
+        batch = _batch([[MASK] * 8])
+
+        _, next_ids, _, _, _ = _algorithm().run(runner, batch, [10])
+
+        self.assertNotIn(MASK, next_ids[0].tolist())
+        self.assertLessEqual(len(runner.forwards), 8)
+
     def test_attention_is_causal_again_after_a_failed_denoise_forward(self):
         runner = _OracleRunner([[10] * 9], HIGH, fail_on_forward=0)
         with self.assertRaises(RuntimeError):
