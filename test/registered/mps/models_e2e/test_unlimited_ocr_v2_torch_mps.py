@@ -14,17 +14,17 @@ import unittest
 import requests
 import torch
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_mps_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    terminate_and_kill_process_tree,
     try_cached_model,
 )
 
-register_mps_ci(est_time=600, suite="stage-b-e2e-mps", nightly=True)
+register_mps_ci(est_time=180, suite="stage-b-e2e-mps")
 
 MODEL_PATH = os.environ.get("SGLANG_MPS_UOCR_MODEL", "baidu/Unlimited-OCR-2")
 # Same no-repeat processor the model card's client attaches, pickled by reference.
@@ -58,9 +58,7 @@ def _page(title: str) -> str:
     return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
 
 
-@unittest.skipUnless(
-    hasattr(torch, "mps") and torch.mps.is_available(), "requires Apple MPS"
-)
+@unittest.skipUnless(torch.backends.mps.is_available(), "requires Apple MPS")
 class TestUnlimitedOcrV2TorchMps(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -86,7 +84,8 @@ class TestUnlimitedOcrV2TorchMps(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid, wait_timeout=30)
+        if hasattr(cls, "process") and cls.process:
+            terminate_and_kill_process_tree(cls.process)
 
     def test_mps_defaults_cap_the_kv_pool_and_warm_up(self):
         info = requests.get(f"{self.base_url}/server_info", timeout=30).json()
