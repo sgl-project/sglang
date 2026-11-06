@@ -6,12 +6,14 @@ import zlib
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import numpy as np
 import torch
 
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.checksum import (
     KvChecksumComputer,
     is_health_check_req,
+    page_indices_for_request,
 )
 from sglang.srt.disaggregation.decode import (
     DecodeTransferQueue,
@@ -21,8 +23,6 @@ from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixi
 from sglang.srt.disaggregation.utils import MetadataBuffers, kv_layout_signature
 from sglang.srt.environ import envs
 from sglang.srt.managers.req_types import FINISH_ABORT
-from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
-from sglang.srt.mem_cache.kv.router import PlainPoolRouter
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.scheduler_test_utils import release_only_retirer
 
@@ -123,17 +123,34 @@ class TestKvLayoutSignature(unittest.TestCase):
 
 
 class TestKvChecksumComputerConfig(unittest.TestCase):
-    def test_flattens_nested_state_descriptor_components(self):
+    def test_each_state_component_digests_its_own_payload(self):
+        """The transfer addresses every buffer of a state component with that
+        component's own index list; one list for all components reads rows the
+        transfer never wrote."""
         computer = KvChecksumComputer(
             torch.device("cpu"),
-            kv_data_ptrs=[11, 22],
-            kv_item_lens=[33, 44],
-            state_data_ptrs=[[55, 66], [77]],
-            state_item_lens=[[88, 99], [111]],
+            kv_data_ptrs=[11],
+            kv_item_lens=[33],
+            state_data_ptrs=[[55, 66], [77], [88]],
+            state_item_lens=[[5, 6], [7], [8]],
         )
+        kernel = Mock(return_value=0x99)
+        with patch(
+            "sglang.srt.disaggregation.checksum.adler32_strided_checksum", kernel
+        ):
+            digest = computer.compute(
+                torch.tensor([0, 1]),
+                # A component that ships nothing, then a mamba-style list payload.
+                [np.array([4, 5], dtype=np.int32), None, [np.array([9]), [10]]],
+            )
 
-        self.assertEqual(computer._state_data_ptrs, [55, 66, 77])
-        self.assertEqual(computer._state_item_lens, [88, 99, 111])
+        self.assertEqual(digest, 0x99)
+        ptrs, item_lens, indices = kernel.call_args.args
+        self.assertEqual(ptrs, [11, 55, 66, 88])
+        self.assertEqual(item_lens, [33, 5, 6, 8])
+        self.assertEqual(
+            [idx.tolist() for idx in indices], [[0, 1], [4, 5], [4, 5], [9, 10]]
+        )
 
 
 class TestKvChecksumHealthCheck(unittest.TestCase):
@@ -151,12 +168,13 @@ def _make_kv(num_layers, num_pages, page_elems, dtype=torch.float16):
 
 
 def _make_computer(kv, item_len, state=None, state_item_lens=None):
+    # All state tensors form one component.
     return KvChecksumComputer(
         torch.device("cuda:0"),
         kv_data_ptrs=[t.data_ptr() for t in kv],
         kv_item_lens=[item_len] * len(kv),
-        state_data_ptrs=[t.data_ptr() for t in (state or [])],
-        state_item_lens=state_item_lens or [],
+        state_data_ptrs=[[t.data_ptr() for t in state]] if state else [],
+        state_item_lens=[state_item_lens] if state else [],
     )
 
 
@@ -185,7 +203,7 @@ class TestKvChecksumComputer(unittest.TestCase):
     def test_state_only_matches_reference(self):
         state = _make_kv(num_layers=1, num_pages=4, page_elems=16)
         idx = torch.tensor([1, 3], dtype=torch.int64, device=self.device)
-        value = _make_computer([], 0, state, [32, 32]).compute(idx, idx)
+        value = _make_computer([], 0, state, [32, 32]).compute(idx, [idx])
         self.assertEqual(value, _ref_strided_adler32(state, [idx, idx], [32, 32]))
 
     def test_kv_plus_state_matches_reference(self):
@@ -198,7 +216,7 @@ class TestKvChecksumComputer(unittest.TestCase):
         state_idx = torch.tensor([1], dtype=torch.int64, device=self.device)
         kv_len, state_lens = 32 * 2, [16 * 2, 16 * 2]
         computer = _make_computer(kv, kv_len, state, state_lens)
-        value = computer.compute(kv_idx, state_idx)
+        value = computer.compute(kv_idx, [state_idx])
         expected = _ref_strided_adler32(
             kv + state,
             [kv_idx] * len(kv) + [state_idx] * len(state),
@@ -206,9 +224,9 @@ class TestKvChecksumComputer(unittest.TestCase):
         )
         self.assertEqual(value, expected)
         state[0][1, 0] += 1
-        self.assertNotEqual(value, computer.compute(kv_idx, state_idx))
+        self.assertNotEqual(value, computer.compute(kv_idx, [state_idx]))
 
-    def test_nested_state_components_match_reference(self):
+    def test_state_components_match_reference(self):
         kv = _make_kv(num_layers=1, num_pages=8, page_elems=32)
         state_components = [
             [torch.randn(4, 16, dtype=torch.float16, device=self.device)],
@@ -218,7 +236,10 @@ class TestKvChecksumComputer(unittest.TestCase):
             ],
         ]
         kv_idx = torch.tensor([0, 3, 7], dtype=torch.int64, device=self.device)
-        state_idx = torch.tensor([1, 2], dtype=torch.int64, device=self.device)
+        state_idx = [
+            torch.tensor([1, 2], dtype=torch.int64, device=self.device),
+            torch.tensor([3, 0], dtype=torch.int64, device=self.device),
+        ]
         state_tensors = [tensor for comp in state_components for tensor in comp]
         kv_len = 32 * 2
         state_lens = [[16 * 2], [8 * 2, 12 * 2]]
@@ -235,17 +256,10 @@ class TestKvChecksumComputer(unittest.TestCase):
         value = computer.compute(kv_idx, state_idx)
         expected = _ref_strided_adler32(
             kv + state_tensors,
-            [kv_idx] * len(kv) + [state_idx] * len(state_tensors),
+            [kv_idx] * len(kv) + [state_idx[0]] + [state_idx[1]] * 2,
             [kv_len] * len(kv) + [item for comp in state_lens for item in comp],
         )
         self.assertEqual(value, expected)
-
-
-def _plain_kv_pool():
-    """A one-sub-pool KV pool: no window sub-pool, no wrapped view."""
-    pool = SimpleNamespace(start_layer=0, layer_num=1)
-    pool.layer_router = PlainPoolRouter(pool, IdSpaceKind.FULL)
-    return pool
 
 
 class _FakeScheduler(SchedulerDisaggregationDecodeMixin):
@@ -254,7 +268,7 @@ class _FakeScheduler(SchedulerDisaggregationDecodeMixin):
         self.enable_overlap = False
         self.waiting_queue = []
         self.token_to_kv_pool_allocator = SimpleNamespace(
-            page_size=1, get_kvcache=_plain_kv_pool
+            page_size=1, translate_kv_indices_for_transfer=lambda indices: indices
         )
         self.req_to_token_pool = SimpleNamespace(req_to_token=req_to_token)
         self.tree_cache = None
@@ -273,6 +287,7 @@ class _FakeScheduler(SchedulerDisaggregationDecodeMixin):
                 should_verify_kv_checksum=lambda bootstrap_addr: True
             ),
             kv_checksum_mismatch_injector=random.Random(0),
+            state_transfer_indices=lambda req, *, total_prefix_len, seq_len: [],
         )
 
     def stream_output(self, reqs, return_logprob):
@@ -280,11 +295,26 @@ class _FakeScheduler(SchedulerDisaggregationDecodeMixin):
 
 
 class _FakePrefillScheduler(SchedulerDisaggregationPrefillMixin):
-    def __init__(self, computer=None):
+    def __init__(self, computer=None, state_types=()):
         self.kv_checksum_computer = computer or object()
-        self.disagg_metadata_buffers = SimpleNamespace(set_kv_checksum=Mock())
+        self.disagg_metadata_buffers = Mock()
         self.disagg_prefill_bootstrap_queue = SimpleNamespace(
-            kv_checksum_signature=0x1234
+            kv_checksum_signature=0x1234,
+            kv_manager=SimpleNamespace(
+                kv_args=SimpleNamespace(state_types=list(state_types))
+            ),
+        )
+        self.enable_staging = False
+        self.disagg_prefill_pending_chunk_rids = set()
+        self.token_to_kv_pool_allocator = SimpleNamespace(
+            page_size=1,
+            translate_kv_indices_for_transfer=lambda indices: indices,
+            get_kvcache=lambda: SimpleNamespace(
+                unified_swa_ring_size=4, unified_swa_window=3
+            ),
+        )
+        self.req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.arange(16).view(2, 8)
         )
 
 
@@ -303,6 +333,7 @@ def _make_req(
         # start_idx: the decode-cached prefix, as each role records it.
         kv=SimpleNamespace(req_pool_idx=0, cache_protected_len=start_idx),
         origin_input_ids=list(range(num_input_tokens)),
+        output_ids=[],
         fill_ids=list(range(num_input_tokens)),
         extend_end=num_input_tokens,
         expected_kv_checksum=expected_chksum,
@@ -325,8 +356,8 @@ class TestPrefillChecksum(unittest.TestCase):
                 page_indices,
             ),
             patch(
-                "sglang.srt.disaggregation.prefill.state_indices_for_request",
-                lambda *args, **kwargs: None,
+                "sglang.srt.disaggregation.prefill._state_transfer_indices",
+                lambda *args: [],
             ),
         ):
             sched.send_kv_chunk(req, last_chunk=True)
@@ -353,6 +384,31 @@ class TestPrefillChecksum(unittest.TestCase):
         req = _make_req(0, 7, start_idx=4)
         page_indices = self._send_last_chunk(sched, req)
         page_indices.assert_called_once_with(sched, req, 7, start_idx=4)
+
+    def test_digest_covers_the_state_rows_it_ships(self):
+        """Prefill digests, per state component, the rows its last chunk ships;
+        any other rows make decode reject a correct transfer."""
+        computer = SimpleNamespace(compute=Mock(return_value=0x55))
+        sched = _FakePrefillScheduler(
+            computer, state_types=[StateType.SWA_RING, StateType.REQUEST_ROW]
+        )
+        sender = SimpleNamespace(
+            get_max_transfer_tokens=lambda: None,
+            should_send_kv_chunk=lambda num_pages, is_last: True,
+            send=Mock(),
+        )
+        req = _make_req(0, 7)
+        req.kv.req_pool_idx = 1
+        req.start_send_idx = 0
+        req.disagg_kv_sender = sender
+
+        sched.send_kv_chunk(req, last_chunk=True)
+
+        digested = computer.compute.call_args.args[1]
+        shipped = sender.send.call_args.args[1]
+        self.assertEqual(len(digested), 2)
+        for digested_rows, shipped_rows in zip(digested, shipped):
+            np.testing.assert_array_equal(digested_rows, shipped_rows)
 
 
 class TestKvChecksumComparable(unittest.TestCase):
@@ -388,6 +444,75 @@ class TestKvChecksumComparable(unittest.TestCase):
         warning.assert_not_called()
 
 
+def _run_prebuilt_batch(sched, *, batch_ret=None, reduce=None):
+    batch = Mock(reqs=sched.waiting_queue) if batch_ret is None else batch_ret
+    batch.is_empty.side_effect = lambda: not batch.reqs
+
+    def filter_batch(*, keep_indices):
+        batch.reqs = [batch.reqs[i] for i in keep_indices]
+
+    batch.filter_batch.side_effect = filter_batch
+    sched.waiting_queue = []
+    running_batch = SimpleNamespace()
+    with (
+        patch.object(
+            SchedulerDisaggregationDecodeMixin,
+            "_get_new_prebuilt_batch",
+            lambda s, rb: batch,
+        ),
+        # Single rank unless a test stands in for the peers.
+        patch(
+            "sglang.srt.disaggregation.decode.all_reduce_flags",
+            reduce or (lambda flags, group, op: flags),
+        ),
+    ):
+        return sched.get_new_prebuilt_batch(running_batch)
+
+
+class TestDecodeChecksumRange(unittest.TestCase):
+    def test_rebootstrap_digest_covers_the_kept_outputs(self):
+        """A rebootstrapped request's prefill input includes the outputs decode
+        kept, so decode digests that whole range and its state, not the prompt."""
+
+        def digest(pages, state_indices):
+            return zlib.adler32(repr((pages.tolist(), state_indices)).encode())
+
+        sched = _FakeScheduler(
+            SimpleNamespace(compute=digest), torch.arange(8).view(1, 8)
+        )
+        state_indices = Mock(return_value=["rows"])
+        sched.disagg_decode_prealloc_queue.state_transfer_indices = state_indices
+        # Prefill recomputed origin + output_ids[:-1]: 5 + 2 tokens.
+        req = _make_req(digest(torch.arange(7), ["rows"]), 5)
+        req.output_ids = [11, 12, 13]
+        sched.waiting_queue = [req]
+        with (
+            envs.SGLANG_IS_IN_CI.override(False),
+            patch("sglang.srt.disaggregation.decode.prepare_abort"),
+        ):
+            batch = _run_prebuilt_batch(sched)
+
+        self.assertEqual(batch.reqs, [req])
+        self.assertEqual(sched.streamed_aborts, [])
+        state_indices.assert_called_once_with(req, total_prefix_len=0, seq_len=7)
+
+    def test_digests_the_physical_pages_the_transfer_moved(self):
+        """A virtual-id pool's request row holds ids that address other bytes;
+        the digest must read the physical pages the transfer moved."""
+        sched = SimpleNamespace(
+            token_to_kv_pool_allocator=SimpleNamespace(
+                page_size=2,
+                translate_kv_indices_for_transfer=lambda indices: indices + 100,
+            ),
+            req_to_token_pool=SimpleNamespace(req_to_token=torch.arange(8).view(1, 8)),
+        )
+        req = SimpleNamespace(kv=SimpleNamespace(req_pool_idx=0))
+
+        pages = page_indices_for_request(sched, req, 6, start_idx=2)
+
+        self.assertEqual(pages.tolist(), [51, 52])
+
+
 class TestGetNewPrebuiltBatchChecksum(unittest.TestCase):
     def setUp(self) -> None:
         if not torch.cuda.is_available():
@@ -412,28 +537,7 @@ class TestGetNewPrebuiltBatchChecksum(unittest.TestCase):
         return _FakeScheduler(computer, self.req_to_token)
 
     def _run_once(self, sched, batch_ret=None, reduce=None):
-        batch = Mock(reqs=sched.waiting_queue) if batch_ret is None else batch_ret
-        batch.is_empty.side_effect = lambda: not batch.reqs
-
-        def filter_batch(*, keep_indices):
-            batch.reqs = [batch.reqs[i] for i in keep_indices]
-
-        batch.filter_batch.side_effect = filter_batch
-        sched.waiting_queue = []
-        running_batch = SimpleNamespace()
-        with (
-            patch.object(
-                SchedulerDisaggregationDecodeMixin,
-                "_get_new_prebuilt_batch",
-                lambda s, rb: batch,
-            ),
-            # Single rank unless a test stands in for the peers.
-            patch(
-                "sglang.srt.disaggregation.decode.all_reduce_flags",
-                reduce or (lambda flags, group, op: flags),
-            ),
-        ):
-            return sched.get_new_prebuilt_batch(running_batch)
+        return _run_prebuilt_batch(sched, batch_ret=batch_ret, reduce=reduce)
 
     def test_match_keeps_req(self):
         sched = self._make_sched(_SENTINEL)

@@ -52,7 +52,6 @@ from sglang.srt.disaggregation.checksum import (
     KvChecksumComputer,
     is_health_check_req,
     page_indices_for_request,
-    state_indices_for_request,
 )
 from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
 from sglang.srt.disaggregation.decode_hicache_mixin import (
@@ -1848,6 +1847,135 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # later schedule-stream work, which the forwards wait on.
         torch.cuda.current_stream().wait_stream(self._publish_stream)
 
+    def state_transfer_indices(
+        self,
+        req: Req,
+        *,
+        total_prefix_len: int,
+        seq_len: int,
+        mamba_on_device: bool = False,
+    ) -> List:
+        """Each state component's destination payload for req's row, in
+        kv_args.state_types order; the KV checksum digests this same list."""
+
+        def _mamba_payload():
+            state_ids = self.token_to_kv_pool_allocator.state_ids(
+                self.req_to_token_pool.state_sub_pool
+            )
+            indices = state_ids.ids(
+                self.req_to_token_pool.req_index_to_mamba_index_mapping[
+                    req.kv.req_pool_idx
+                ]
+            )
+            return [indices if mamba_on_device else indices.cpu().numpy()]
+
+        def _swa_payload(sub_pool="swa", window=_SCHEDULER_WINDOW):
+            if window is _SCHEDULER_WINDOW:
+                # Read only when a window entry is sent.
+                window = self.scheduler.sliding_window_size
+            storage = kv_storage_of(
+                self.req_to_token_pool, self.token_to_kv_pool_allocator
+            )
+            resume = storage.resume_units(
+                sub_pool,
+                req,
+                token_start=total_prefix_len,
+                token_boundary=seq_len,
+                window=window,
+            )
+            return resume.unit_ids.cpu().numpy()
+
+        def _full_kv_pages_payload():
+            kv_indices_full = self.req_to_token_pool.req_to_token[
+                req.kv.req_pool_idx, :seq_len
+            ]
+            # Indexer lives on device pool; always use device page_size
+            device_page_size = self.token_to_kv_pool.page_size
+            return kv_to_page_indices(kv_indices_full, device_page_size)
+
+        def _minimax_payload():
+            return minimax_index_transfer_pages(
+                self.req_to_token_pool.req_to_token[req.kv.req_pool_idx, :seq_len],
+                page_size=self.token_to_kv_pool.page_size,
+                prefix_len=total_prefix_len,
+            )
+
+        def _dsa_pages_payload():
+            # Mirror of prefill _dsa_pages_payload: the cached prefix keeps
+            # its own indexer rows, and rows still being restored by
+            # HiCache are not written until the restore commits.
+            return suffix_page_indices(
+                self.req_to_token_pool.req_to_token,
+                req.kv.req_pool_idx,
+                total_prefix_len,
+                seq_len,
+                self.token_to_kv_pool.page_size,
+            )
+
+        def _dsa_tail_payload():
+            return get_dsa_tail_state_indices(
+                self.token_to_kv_pool,
+                req.kv.req_pool_idx,
+                seq_len,
+            )
+
+        def _qsa_pending_payload():
+            # Match the prefill request-pool row positionally; the two
+            # req_pool_idx values need not be equal.
+            return get_qsa_pending_state_indices(req)
+
+        def _swa_ring_payload():
+            # Mirror of prefill _swa_ring_payload using this side's req_pool_idx.
+            # Same window positions and order -> positional match with prefill.
+            ring_stride = self.token_to_kv_pool.unified_swa_ring_size
+            window_size = self.token_to_kv_pool.unified_swa_window
+            window_start = max(0, seq_len - window_size)
+            positions = np.arange(window_start, seq_len, dtype=np.int64)
+            state_slot = int(req.kv.req_pool_idx)
+            ring_rows = state_slot * ring_stride + (positions % ring_stride)
+            return ring_rows.astype(np.int32)
+
+        def _request_state_payload():
+            return self.token_to_kv_pool.request_state_transfer_indices(
+                int(req.kv.req_pool_idx), seq_len
+            )
+
+        def _request_row_payload():
+            return np.array([req.kv.req_pool_idx], dtype=np.int32)
+
+        state_types = self.kv_manager.kv_args.state_types
+        payloads = {
+            StateType.MAMBA: _mamba_payload,
+            StateType.QSA_PENDING: _qsa_pending_payload,
+            StateType.QSA_COMPRESSED: _full_kv_pages_payload,
+            StateType.SWA: _swa_payload,
+            StateType.AUXILIARY_SWA: lambda: _swa_payload("draft_swa", None),
+            StateType.DSA: _dsa_pages_payload,
+            StateType.DSA_TAIL: _dsa_tail_payload,
+            StateType.MINIMAX_INDEX_K: _minimax_payload,
+            StateType.MINIMAX_DENSE_KV: _full_kv_pages_payload,
+            StateType.SWA_RING: _swa_ring_payload,
+            StateType.DSV4_REQUEST_STATE: _request_state_payload,
+            StateType.REQUEST_ROW: _request_row_payload,
+            StateType.BLOCK_SCALE: _full_kv_pages_payload,
+            StateType.BLOCK_SCALE_SWA: _swa_payload,
+        }
+        if _is_npu and isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool):
+            from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
+                dsv4_state_payloads,
+            )
+
+            payloads.update(
+                dsv4_state_payloads(
+                    self.req_to_token_pool,
+                    req.kv.req_pool_idx,
+                    seq_len,
+                    self.token_to_kv_pool_allocator.page_size,
+                    prefix_len=total_prefix_len,
+                )
+            )
+        return [payloads[st]() if st in payloads else None for st in state_types]
+
     def _publish_destination(
         self,
         decode_req: DecodeRequest,
@@ -1882,8 +2010,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 )
             )
 
-        seq_len = fill_len
-
         state_types = self.kv_manager.kv_args.state_types
         non_blocking_metadata = (
             self.transfer_queue.enable_staging
@@ -1893,133 +2019,20 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             and set(state_types) <= {StateType.MAMBA}
             and not _is_fake_transfer(decode_req.req)
         )
-
-        def _mamba_payload():
-            state_ids = self.token_to_kv_pool_allocator.state_ids(
-                self.req_to_token_pool.state_sub_pool
-            )
-            indices = state_ids.ids(
-                self.req_to_token_pool.req_index_to_mamba_index_mapping[
-                    decode_req.req.kv.req_pool_idx
-                ]
-            )
-            return [indices if non_blocking_metadata else indices.cpu().numpy()]
-
-        def _swa_payload(sub_pool="swa", window=_SCHEDULER_WINDOW):
-            if window is _SCHEDULER_WINDOW:
-                # Read only when a window entry is sent.
-                window = self.scheduler.sliding_window_size
-            storage = kv_storage_of(
-                self.req_to_token_pool, self.token_to_kv_pool_allocator
-            )
-            resume = storage.resume_units(
-                sub_pool,
-                decode_req.req,
-                token_start=total_prefix_len,
-                token_boundary=seq_len,
-                window=window,
-            )
-            return resume.unit_ids.cpu().numpy()
-
-        def _full_kv_pages_payload():
-            kv_indices_full = self.req_to_token_pool.req_to_token[
-                decode_req.req.kv.req_pool_idx, :seq_len
-            ]
-            # Indexer lives on device pool; always use device page_size
-            device_page_size = self.token_to_kv_pool.page_size
-            return kv_to_page_indices(kv_indices_full, device_page_size)
-
-        def _minimax_payload():
-            return minimax_index_transfer_pages(
-                self.req_to_token_pool.req_to_token[
-                    decode_req.req.kv.req_pool_idx, :seq_len
-                ],
-                page_size=self.token_to_kv_pool.page_size,
-                prefix_len=total_prefix_len,
-            )
-
-        def _dsa_pages_payload():
-            # Mirror of prefill _dsa_pages_payload: the cached prefix keeps
-            # its own indexer rows, and rows still being restored by
-            # HiCache are not written until the restore commits.
-            return suffix_page_indices(
-                self.req_to_token_pool.req_to_token,
-                decode_req.req.kv.req_pool_idx,
-                total_prefix_len,
-                seq_len,
-                self.token_to_kv_pool.page_size,
-            )
-
-        def _dsa_tail_payload():
-            return get_dsa_tail_state_indices(
-                self.token_to_kv_pool,
-                decode_req.req.kv.req_pool_idx,
-                seq_len,
-            )
-
-        def _qsa_pending_payload():
-            # Match the prefill request-pool row positionally; the two
-            # req_pool_idx values need not be equal.
-            return get_qsa_pending_state_indices(decode_req.req)
-
-        def _swa_ring_payload():
-            # Mirror of prefill _swa_ring_payload using this side's req_pool_idx.
-            # Same window positions and order -> positional match with prefill.
-            ring_stride = self.token_to_kv_pool.unified_swa_ring_size
-            window_size = self.token_to_kv_pool.unified_swa_window
-            window_start = max(0, seq_len - window_size)
-            positions = np.arange(window_start, seq_len, dtype=np.int64)
-            state_slot = int(decode_req.req.kv.req_pool_idx)
-            ring_rows = state_slot * ring_stride + (positions % ring_stride)
-            return ring_rows.astype(np.int32)
-
-        def _request_state_payload():
-            return self.token_to_kv_pool.request_state_transfer_indices(
-                int(decode_req.req.kv.req_pool_idx), seq_len
-            )
-
-        def _request_row_payload():
-            return np.array([decode_req.req.kv.req_pool_idx], dtype=np.int32)
-
+        # Here, not in state_transfer_indices: the checksum rebuilds that payload
+        # after the transfer has filled this state.
         if StateType.DSV4_REQUEST_STATE in state_types and isinstance(
             self.token_to_kv_pool, DeepSeekV4TokenToKVPool
         ):
             self.token_to_kv_pool.clear_request_scoped_state(
                 int(decode_req.req.kv.req_pool_idx)
             )
-        payloads = {
-            StateType.MAMBA: _mamba_payload,
-            StateType.QSA_PENDING: _qsa_pending_payload,
-            StateType.QSA_COMPRESSED: _full_kv_pages_payload,
-            StateType.SWA: _swa_payload,
-            StateType.AUXILIARY_SWA: lambda: _swa_payload("draft_swa", None),
-            StateType.DSA: _dsa_pages_payload,
-            StateType.DSA_TAIL: _dsa_tail_payload,
-            StateType.MINIMAX_INDEX_K: _minimax_payload,
-            StateType.MINIMAX_DENSE_KV: _full_kv_pages_payload,
-            StateType.SWA_RING: _swa_ring_payload,
-            StateType.DSV4_REQUEST_STATE: _request_state_payload,
-            StateType.REQUEST_ROW: _request_row_payload,
-            StateType.BLOCK_SCALE: _full_kv_pages_payload,
-            StateType.BLOCK_SCALE_SWA: _swa_payload,
-        }
-        if _is_npu and isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool):
-            from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
-                dsv4_state_payloads,
-            )
-
-            payloads.update(
-                dsv4_state_payloads(
-                    self.req_to_token_pool,
-                    decode_req.req.kv.req_pool_idx,
-                    seq_len,
-                    self.token_to_kv_pool_allocator.page_size,
-                    prefix_len=total_prefix_len,
-                )
-            )
-        state_indices: Optional[List] = [
-            payloads[st]() if st in payloads else None for st in state_types
-        ]
+        state_indices: Optional[List] = self.state_transfer_indices(
+            decode_req.req,
+            total_prefix_len=total_prefix_len,
+            seq_len=fill_len,
+            mamba_on_device=non_blocking_metadata,
+        )
 
         device_page_indices = None
         if (
@@ -3889,16 +3902,18 @@ class SchedulerDisaggregationDecodeMixin:
             # written its own tokens into the last page, so the handoff digest
             # no longer describes it.
             req.expected_kv_checksum = 0
-            seq_len = len(req.origin_input_ids)
+            # The range publish registered; a rebootstrap's kept outputs were
+            # part of prefill's input, so origin_input_ids alone falls short.
+            end_idx = pre_alloc_fill_len(req)
             # The tree cache owns [0, cache_protected_len): the prefix this
             # decode promised at bootstrap, so prefill sent and digested only
             # what follows it.
             start_idx = req.kv.cache_protected_len
             page_indices_gpu = page_indices_for_request(
-                self, req, seq_len, start_idx=start_idx
+                self, req, end_idx, start_idx=start_idx
             )
-            state_indices = state_indices_for_request(
-                self, req, seq_len, start_idx=start_idx
+            state_indices = prealloc_queue.state_transfer_indices(
+                req, total_prefix_len=start_idx, seq_len=end_idx
             )
             actual = computer.compute(page_indices_gpu, state_indices)
             if (
