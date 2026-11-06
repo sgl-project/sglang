@@ -17,7 +17,7 @@ from sglang.srt.runtime_context import (
     cutedsl_moe_max_num_tokens,
     get_parallel,
 )
-from sglang.srt.utils.common import log_info_on_rank0, print_warning_once
+from sglang.srt.utils.log_utils import log_info_on_rank0, print_warning_once
 
 if TYPE_CHECKING:
     from sglang.srt.batch_overlap.single_batch_overlap import DownGemmOverlapArgs

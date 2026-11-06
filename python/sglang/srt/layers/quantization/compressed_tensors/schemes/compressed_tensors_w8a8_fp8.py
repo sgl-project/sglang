@@ -58,6 +58,9 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
 
     @classmethod
     def get_min_capability(cls) -> int:
+        # TODO: torch.xpu.get_device_capability
+        if _is_xpu:
+            return 20
         # lovelace and up
         return 89
 
