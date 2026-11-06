@@ -139,6 +139,15 @@ class TestMoriDCP(unittest.TestCase):
         self.assertTrue(info.requires_dcp_relayout)
         self.assertEqual(info.dcp_token_item_lens, [64])
 
+    def test_dcp_relayout_refuses_a_dsa_index_k(self):
+        manager = object.__new__(mori_conn.MoriKVManager)
+        manager.dcp_size, manager.dcp_rank = 1, 0
+        manager.is_mla_backend, manager.is_hybrid_mla_backend = False, True
+        manager.kv_args = SimpleNamespace(dsa_index_k_token_bytes=(128, 4))
+
+        with self.assertRaisesRegex(RuntimeError, "DSA index-K"):
+            manager.requires_dcp_relayout(8, 3)
+
 
 class TestMoriDsaStateElision(unittest.TestCase):
     """_send_swa_dsa_state must read the dst length of the paired dst entry.
@@ -183,6 +192,37 @@ class TestMoriDsaStateElision(unittest.TestCase):
         # Decode elided layer 4. Writing to it would use a None descriptor.
         calls = self._send([4, 5], [3, 4, 5], [132, 132], [132, 0, 132])
         self.assertEqual(calls, [call("s5", "d5", "plan")])
+
+
+class TestMoriDraftRingState(unittest.TestCase):
+    def test_ring_rows_pair_only_where_both_dcp_ranks_own_the_position(self):
+        manager = object.__new__(mori_conn.MoriKVManager)
+        manager.pp_size = 1
+        manager.state_mem_descs = [["s-ring"], ["s-floor"]]
+        manager.kv_args = SimpleNamespace(
+            state_types=["draft_ring", "request_row"],
+            state_item_lens=[[64], [4]],
+            state_dim_per_tensor=[[], []],
+            state_layer_ids=[[], []],
+        )
+        manager._submit_batch_transfer_plan = Mock(return_value=[])
+        peer = SimpleNamespace(
+            dst_state_mem_descs=[["d-ring"], ["d-floor"]],
+            dst_state_item_lens=[[64], [4]],
+            dst_state_dim_per_tensor=[[], []],
+            dst_state_layer_ids=[[], []],
+        )
+        src = [np.array([5, 0, 7, 9], dtype=np.int32), np.array([11], dtype=np.int32)]
+        dst = [np.array([3, 4, 0, 8], dtype=np.int32), np.array([2], dtype=np.int32)]
+
+        manager.send_state(peer, src, dst)
+
+        ring = mori_conn.BatchTransferPlan([5 * 64, 9 * 64], [3 * 64, 8 * 64], [64, 64])
+        floor = mori_conn.BatchTransferPlan([11 * 4], [2 * 4], [4])
+        self.assertEqual(
+            manager._submit_batch_transfer_plan.call_args_list,
+            [call("s-ring", "d-ring", ring), call("s-floor", "d-floor", floor)],
+        )
 
 
 if __name__ == "__main__":
