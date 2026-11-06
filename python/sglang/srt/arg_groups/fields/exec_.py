@@ -606,10 +606,14 @@ class ExecMamba(msgspec.Struct):
         "about once every 4 verifies instead of every step. Numerics differ from "
         "the per-step fold (16-bit ring records, one rounding per fold). Requires "
         "a GDN hybrid model, a linear draft chain with at most 8 draft tokens, "
-        "--mamba-ssm-dtype float16 and either --disable-radix-cache or "
-        "--radix-cache-skip-decode-insert (prompt prefixes only); refuses mixed "
-        "chunk, streaming sessions, unified memory, int8 mamba checkpoints and PD "
-        "disaggregation; needs FlashInfer >= 0.7.3.",
+        "--mamba-ssm-dtype float16. With the radix cache, decode-time states "
+        "are cached through --mamba-radix-cache-strategy extra_buffer or "
+        "extra_buffer_lazy (each crossing writes FlashInfer's "
+        "gdn_prefix_materialize fold of the window into the track slot), or "
+        "--radix-cache-skip-decode-insert caches prompt prefixes only; no_buffer "
+        "decode inserts are refused. Sets GDN_UCACHE_STATE_DTYPE=fp16 for "
+        "FlashInfer. Refuses mixed chunk, streaming sessions, unified memory, int8 "
+        "mamba checkpoints and PD disaggregation; needs FlashInfer >= 0.7.3.",
     ] = False
 
 

@@ -12,6 +12,11 @@ The cursors are shared by all GDN layers of a slot and committed once per verify
 from the accept count (bonus token included), with the ``hist_len`` the verify saw:
 a folded row restarts its window at the old window's end with the accepted
 records, any other row extends it. A fresh slot only needs ``hist_len = 0``.
+
+With radix decode inserts, a row whose accepted tokens cross a track point gets
+``fold(S0, window up to that point)`` written into its track slot after the
+commit (FlashInfer's ``gdn_prefix_materialize``), so every state the radix tree
+holds has an empty window.
 """
 
 from __future__ import annotations
@@ -174,6 +179,67 @@ def _reset_cursors_kernel(
     tl.store(base_pool_ptr + slot, zero, live)
 
 
+# One program per plan layer (each recomputes the cheap row scan). Entry
+# e = layer * num_rows + row; the active list holds every layer's live entries
+# first, then -1. Reads the post-commit cursors.
+@triton.jit
+def _plan_track_kernel(
+    slots_ptr,
+    num_accept_tokens_ptr,
+    track_slots_ptr,
+    steps_to_track_ptr,
+    hist_pool_ptr,
+    base_pool_ptr,
+    src_out_ptr,
+    dst_out_ptr,
+    base_out_ptr,
+    count_out_ptr,
+    active_out_ptr,
+    num_active_out_ptr,
+    num_rows,
+    layer_slot_stride,
+    BLOCK: tl.constexpr,
+):
+    layer = tl.program_id(0)
+    num_layers = tl.num_programs(0)
+    offs = tl.arange(0, BLOCK)
+    in_range = offs < num_rows
+    slot = tl.load(slots_ptr + offs, mask=in_range, other=-1).to(tl.int64)
+    dst = tl.load(track_slots_ptr + offs, mask=in_range, other=-1).to(tl.int64)
+    step = tl.load(steps_to_track_ptr + offs, mask=in_range, other=-1).to(tl.int32)
+    live = in_range & (slot > 0) & (dst > 0) & (step >= 0)
+    hist = tl.load(hist_pool_ptr + slot, mask=live, other=0)
+    base = tl.load(base_pool_ptr + slot, mask=live, other=0)
+    num_accept = tl.load(num_accept_tokens_ptr + offs, mask=live, other=0).to(tl.int32)
+    # This verify's accepted records start at window index hist - num_accept on
+    # folded and unfolded rows alike; the snapshot covers them through `step`.
+    count = hist - num_accept + step + 1
+    live_i32 = live.to(tl.int32)
+    num_live = tl.sum(live_i32, axis=0)
+    rank = tl.cumsum(live_i32, axis=0) - 1
+    entry = layer * num_rows + offs
+    layer_offset = layer.to(tl.int64) * layer_slot_stride
+    src_flat = tl.where(live, layer_offset + slot, -1).to(tl.int32)
+    dst_flat = tl.where(live, layer_offset + dst, -1).to(tl.int32)
+    tl.store(src_out_ptr + entry, src_flat, in_range)
+    tl.store(dst_out_ptr + entry, dst_flat, in_range)
+    tl.store(base_out_ptr + entry, tl.where(live, base, 0), in_range)
+    tl.store(count_out_ptr + entry, tl.where(live, count, -1), in_range)
+    tl.store(active_out_ptr + layer * num_live + rank, entry, live)
+    tail = num_layers * num_live + layer * (num_rows - num_live) + offs - num_live
+    tl.store(
+        active_out_ptr + tail,
+        tl.full([BLOCK], -1, tl.int32),
+        in_range & (offs >= num_live),
+    )
+    if layer == 0:
+        tl.store(num_active_out_ptr, num_live * num_layers)
+        # A track slot holds a folded state, so its own window is empty.
+        zero = tl.zeros([BLOCK], dtype=tl.int32)
+        tl.store(hist_pool_ptr + dst, zero, live)
+        tl.store(base_pool_ptr + dst, zero, live)
+
+
 @triton.jit
 def _zero_padded_rows_kernel(
     slots_ptr,
@@ -298,6 +364,166 @@ def reset_gdn_ucache_cursors(*, buffers: GdnUcacheBuffers, slots: torch.Tensor) 
         num_rows,
         BLOCK=_CURSOR_BLOCK,
     )
+
+
+def _load_prefix_materialize() -> Callable:
+    # FlashInfer fixes PM's dtypes when flashinfer.gdn_kernels is first imported
+    # (GDN_UCACHE_STATE_DTYPE, set by the server-args hook); the pool is fp16 state
+    # with bf16 rings.
+    try:
+        from flashinfer.gdn_kernels.gdn_prefix_materialize import (
+            gdn_prefix_materialize,
+            ring_ty_torch,
+            state_ty_torch,
+        )
+    except ImportError as e:
+        raise RuntimeError(
+            "--enable-gdn-replayssm-ucache with radix decode inserts needs "
+            "FlashInfer >= 0.7.3 (flashinfer.gdn_kernels.gdn_prefix_materialize)."
+        ) from e
+    if (state_ty_torch(), ring_ty_torch()) != (torch.float16, torch.bfloat16):
+        raise RuntimeError(
+            "gdn_prefix_materialize resolved state/ring dtypes "
+            f"{state_ty_torch()}/{ring_ty_torch()}, need float16/bfloat16: set "
+            "GDN_UCACHE_STATE_DTYPE=fp16 (and leave GDN_UCACHE_RING_DTYPE unset) "
+            "before flashinfer.gdn_kernels is first imported."
+        )
+    return gdn_prefix_materialize
+
+
+class _TrackPlan(msgspec.Struct, frozen=True, kw_only=True):
+    """Static gdn_prefix_materialize arguments for up to ``rows`` batch rows
+    (times the plan layers); every tensor is [rows * layers] int32."""
+
+    rows: int
+    src: torch.Tensor
+    dst: torch.Tensor
+    base: torch.Tensor
+    count: torch.Tensor
+    active: torch.Tensor
+    # [1] int32: live entries in ``active``.
+    num_active: torch.Tensor
+
+
+class GdnUcacheTrackMaterializer:
+    """Writes the decode-time radix track snapshots of a u-cache pool.
+
+    After a verify's cursor commit, every row whose accepted tokens cross a track
+    point gets ``fold(S0, window up to that point)`` in its track slot, for all GDN
+    layers, and the track slot's cursors are zeroed. One plan launch builds the
+    FlashInfer arguments on the device (no host sync, graph-capturable); then one
+    FlashInfer launch over ``[layers * slots]`` views of the layer-major pools, or
+    one per layer if a pool is not contiguous."""
+
+    def __init__(self, *, state: torch.Tensor, buffers: GdnUcacheBuffers):
+        self._materialize = _load_prefix_materialize()
+        self._buffers = buffers
+        self._num_layers, self._num_slots = state.shape[:2]
+        pools = (state, buffers.k_ring, buffers.u_ring, buffers.g_ring)
+        assert all(t.shape[:2] == (self._num_layers, self._num_slots) for t in pools), [
+            t.shape for t in pools
+        ]
+        self._layer_pools = pools
+        # Flattening [layers, slots] into one pool dim needs no gap between layers.
+        self._flat_pools = (
+            tuple(t.view(-1, *t.shape[2:]) for t in pools)
+            if all(t.is_contiguous() for t in pools)
+            else None
+        )
+        self._plan_layers = self._num_layers if self._flat_pools is not None else 1
+        self._plan: Optional[_TrackPlan] = None
+
+    @property
+    def single_launch(self) -> bool:
+        return self._flat_pools is not None
+
+    def materialize(
+        self,
+        *,
+        slots: torch.Tensor,
+        num_accept_tokens: torch.Tensor,
+        track_slots: torch.Tensor,
+        steps_to_track: torch.Tensor,
+    ) -> None:
+        """``slots`` and ``track_slots`` are physical ids (``<= 0`` skips the row),
+        ``steps_to_track`` the verify step whose state is tracked (``-1`` skips).
+        Must follow ``commit_gdn_ucache_cursors`` of the same verify and precede
+        the next verify."""
+        num_rows = slots.shape[0]
+        if num_rows == 0:
+            return
+        plan = self._plan_for(num_rows)
+        num_entries = num_rows * self._plan_layers
+        _plan_track_kernel[(self._plan_layers,)](
+            slots,
+            num_accept_tokens,
+            track_slots,
+            steps_to_track,
+            self._buffers.hist_len,
+            self._buffers.cache_base,
+            plan.src,
+            plan.dst,
+            plan.base,
+            plan.count,
+            plan.active,
+            plan.num_active,
+            num_rows,
+            self._num_slots,
+            BLOCK=triton.next_power_of_2(plan.rows),
+        )
+        args = dict(
+            src_slots=plan.src[:num_entries],
+            dst_slots=plan.dst[:num_entries],
+            cache_base=plan.base[:num_entries],
+            count=plan.count[:num_entries],
+            active_request_indices=plan.active[:num_entries],
+            num_active=plan.num_active,
+        )
+        if self._flat_pools is not None:
+            self._launch(self._flat_pools, args)
+        else:
+            for layer in range(self._num_layers):
+                self._launch(tuple(t[layer] for t in self._layer_pools), args)
+
+    def warm_up(self, *, max_batch_size: int) -> None:
+        """Allocates the plan for ``max_batch_size`` rows and compiles both kernels
+        on an all-padding batch, so CUDA graph capture compiles and allocates
+        nothing."""
+        self._plan_for(max_batch_size)
+        device = self._buffers.hist_len.device
+        padded = torch.full((max_batch_size,), -1, dtype=torch.int32, device=device)
+        self.materialize(
+            slots=padded,
+            num_accept_tokens=padded,
+            track_slots=padded,
+            steps_to_track=padded,
+        )
+
+    def _launch(self, pools: tuple, args: dict) -> None:
+        state, k_ring, u_ring, g_ring = pools
+        self._materialize(state, k_cache=k_ring, u_cache=u_ring, g_cache=g_ring, **args)
+
+    def _plan_for(self, num_rows: int) -> _TrackPlan:
+        plan = self._plan
+        if plan is not None and plan.rows >= num_rows:
+            return plan
+        _assert_not_capturing("the track materialize plan (warm it up first)")
+        device = self._buffers.hist_len.device
+        entries = num_rows * self._plan_layers
+
+        def buf(n):
+            return torch.empty(n, dtype=torch.int32, device=device)
+
+        self._plan = _TrackPlan(
+            rows=num_rows,
+            src=buf(entries),
+            dst=buf(entries),
+            base=buf(entries),
+            count=buf(entries),
+            active=buf(entries),
+            num_active=buf(1),
+        )
+        return self._plan
 
 
 def _load_flush_kernel(device: torch.device) -> Callable:

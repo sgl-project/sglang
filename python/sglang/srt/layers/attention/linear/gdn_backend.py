@@ -34,6 +34,7 @@ from sglang.srt.layers.attention.linear.gdn_prefill_graph import (
     buckets_keep_chunk_o_block_size,
 )
 from sglang.srt.layers.attention.linear.gdn_replayssm_ucache import (
+    GdnUcacheTrackMaterializer,
     GdnUcacheVerifier,
 )
 from sglang.srt.layers.attention.linear.kda_prefill_graph import (
@@ -648,6 +649,17 @@ class GDNAttnBackend(MambaAttnBackendBase):
             if self._gdn_ucache is not None
             else None
         )
+        # Radix decode inserts: verify commits snapshot crossing rows into track slots.
+        self.gdn_ucache_track = (
+            GdnUcacheTrackMaterializer(
+                state=self.state_pool.mamba_cache.temporal, buffers=self._gdn_ucache
+            )
+            if self._gdn_ucache is not None
+            and not self.is_draft_worker
+            and get_exec().mamba.enable_mamba_extra_buffer
+            and not get_memory().radix_cache_skip_decode_insert
+            else None
+        )
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         super().init_cuda_graph_state(max_bs, max_num_tokens)
@@ -662,6 +674,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 g_ring=gdn_ucache.g_ring[0],
                 flush_min=gdn_ucache.flush_min,
             )
+        if self.gdn_ucache_track is not None:
+            self.gdn_ucache_track.warm_up(max_batch_size=max_bs)
 
     def supports_prefill_graph_extend(self) -> bool:
         # Read here, not in __init__: the support check reads model_config.

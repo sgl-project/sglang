@@ -604,15 +604,21 @@ def _check_gdn_replayssm_ucache_spec(cfg: Any, *, flag: str) -> None:
 
 
 def _check_gdn_replayssm_ucache_cache(cfg: Any, *, flag: str) -> None:
-    # Prefill-written states have an empty window, so the tree holds exact
-    # checkpoints; every target extend restarts its slot's window.
-    # TODO(ameynaik-hub): decode-time snapshots via FlashInfer's
-    # gdn_prefix_materialize, then drop the skip-decode-insert requirement.
-    if not cfg.disable_radix_cache and not cfg.radix_cache_skip_decode_insert:
+    # The tree must hold states with an empty window: prefill writes them, and
+    # each verify commit materializes decode-time track states into the extra
+    # buffer; every target extend restarts its slot's window.
+    # TODO(ameynaik-hub): no_buffer decode inserts need the live slot's window
+    # folded before its finish donation.
+    if (
+        not cfg.disable_radix_cache
+        and not cfg.radix_cache_skip_decode_insert
+        and cfg.mamba_radix_cache_strategy not in ("extra_buffer", "extra_buffer_lazy")
+    ):
         raise ValueError(
-            f"{flag} needs --disable-radix-cache or --radix-cache-skip-decode-insert: "
-            "decode-time snapshots of a deferred-fold state need "
-            "gdn_prefix_materialize, which is not wired yet."
+            f"{flag} with the radix cache needs --mamba-radix-cache-strategy "
+            "extra_buffer or extra_buffer_lazy, or --radix-cache-skip-decode-insert; "
+            f"got {cfg.mamba_radix_cache_strategy!r}: a no_buffer finish would "
+            "donate a checkpoint that lags its unfolded window."
         )
     if cfg.enable_int8_mamba_checkpoint:
         raise ValueError(

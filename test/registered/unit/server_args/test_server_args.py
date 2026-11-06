@@ -1139,8 +1139,9 @@ class TestInt8MambaCheckpointCompatibility(unittest.TestCase):
 
 
 class TestGdnReplaySsmUcacheRadixGuard(unittest.TestCase):
-    """--enable-gdn-replayssm-ucache caches only prefill-written states: the
-    radix cache is allowed only when decode-time states never reach the tree."""
+    """--enable-gdn-replayssm-ucache lets the radix tree hold only states with an
+    empty u-cache window: prefill states, or decode-time states materialized into
+    an extra_buffer track slot. A no_buffer finish would donate a lagging live slot."""
 
     FLAG = "--enable-gdn-replayssm-ucache"
 
@@ -1148,12 +1149,24 @@ class TestGdnReplaySsmUcacheRadixGuard(unittest.TestCase):
         server_args = ServerArgs(model_path="dummy", **kwargs)
         _check_gdn_replayssm_ucache_cache(resolving_view(server_args), flag=self.FLAG)
 
-    def test_radix_with_skip_decode_insert_is_accepted(self):
-        self._check(radix_cache_skip_decode_insert=True)
+    def test_radix_with_skip_decode_insert_is_accepted_on_any_strategy(self):
+        for strategy in ("auto", "no_buffer", "extra_buffer", "extra_buffer_lazy"):
+            self._check(
+                radix_cache_skip_decode_insert=True,
+                mamba_radix_cache_strategy=strategy,
+            )
 
-    def test_radix_without_skip_decode_insert_is_rejected(self):
-        with self.assertRaisesRegex(ValueError, "gdn_prefix_materialize"):
-            self._check()
+    def test_decode_inserts_with_extra_buffer_are_accepted(self):
+        for strategy in ("extra_buffer", "extra_buffer_lazy"):
+            self._check(mamba_radix_cache_strategy=strategy)
+
+    def test_decode_inserts_without_extra_buffer_are_rejected(self):
+        for strategy in ("auto", "no_buffer"):
+            with self.assertRaisesRegex(ValueError, "extra_buffer_lazy"):
+                self._check(mamba_radix_cache_strategy=strategy)
+
+    def test_radix_off_is_accepted_on_any_strategy(self):
+        self._check(disable_radix_cache=True, mamba_radix_cache_strategy="no_buffer")
 
     def test_state_dtype_env_is_set_to_fp16_and_conflicts_rejected(self):
         with patch.dict(os.environ, {}, clear=False):
