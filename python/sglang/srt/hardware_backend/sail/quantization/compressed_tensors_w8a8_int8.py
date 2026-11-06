@@ -166,7 +166,6 @@ class CompressedTensorsW8A8Int8MoE(CompressedTensorsMoEScheme):
                 or (requested_backend.is_auto() and envs.SGLANG_SAIL_DEEPGEMM_MOE.get())
             ):
                 moe_runner_backend = MoeRunnerBackend.DEEP_GEMM
-                import sglang.srt.hardware_backend.sail.moe.deepgemm_moe  # noqa: F401
             elif get_moe_a2a_backend().is_deepep() or requested_backend.is_deep_gemm():
                 raise ValueError(
                     "SAIL INT8 DeepEP requires an available DeepGEMM backend"

@@ -1790,7 +1790,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # The shared expert's side stream still reads the input, so combine must
             # not overwrite that buffer.
             moe_runner_config.inplace = False
-            import sglang.srt.hardware_backend.sail.moe.deepgemm_moe  # noqa: F401
 
         if moe_runner_backend.is_aiter():
             # MXFP4 hard-codes Swiglu in the AITER kernel path, so the

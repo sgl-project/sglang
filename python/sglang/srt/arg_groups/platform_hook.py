@@ -198,10 +198,34 @@ def handle_xpu_backends(server_args: Any):
             )
 
 
+def _disable_sail_unsupported_mhc_paths() -> None:
+    """Pin the MHC pre-norm engines SAIL does not implement off.
+
+    The DeepGEMM TF32 pre-norm GEMM and the FlashInfer MHC pre-norm are
+    NVIDIA kernels; SAIL serves the pre-norm from its own MHC ops. The model
+    reads both switches directly, so they are forced here instead of being
+    re-checked at every dispatch site. Only an explicit opt-in is worth a
+    warning -- the DeepGEMM one defaults to on, and that default is not a
+    choice anybody made.
+    """
+    for name, var in (
+        ("SGLANG_OPT_DEEPGEMM_HC_PRENORM", envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM),
+        ("SGLANG_OPT_USE_FLASHINFER_MHC", envs.SGLANG_OPT_USE_FLASHINFER_MHC),
+    ):
+        if var.get():
+            if var.is_set():
+                logger.warning("%s is not supported on SAIL; disabling it.", name)
+            var.set(False)
+
+
 def handle_sail_backends(server_args: Any):
     if not get_platform().is_sail:
         return
     from sglang.srt.configs.model_config import is_deepseek_dsa
+
+    _disable_sail_unsupported_mhc_paths()
+    # Install the SAIL-only MoE registrations before any model is built.
+    get_platform().register_platform_backends()
 
     if not envs.SGLANG_SAIL_DEEPGEMM_DENSE.is_set():
         envs.SGLANG_SAIL_DEEPGEMM_DENSE.set(True)
