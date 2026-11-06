@@ -559,5 +559,10 @@ POSITIONAL_FIELD_ORDER = (
     "uocr_doc_split",
     "uocr_doc_page_window",
     "uocr_max_page_tokens",
+    "uniboost_gamma",
+    "uniboost_bin_size",
+    "uniboost_clock",
+    "uniboost_adaptive_gamma",
+    "uniboost_adaptive_max_jump_s",
 )
 # fmt: on
