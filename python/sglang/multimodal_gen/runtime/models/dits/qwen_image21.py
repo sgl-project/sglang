@@ -19,6 +19,16 @@ from sglang.kernels.ops.diffusion import (
     rmsnorm_preserve_reduction,
     tensors_equal,
 )
+from sglang.kernels.ops.diffusion.activation.silu_mul_npu_triton import (
+    silu_mul_npu,
+)
+from sglang.kernels.ops.diffusion.modulate.residual_gate_add_npu_triton import (
+    residual_gate_add_npu,
+)
+from sglang.kernels.ops.diffusion.norm.rmsnorm_npu_triton import (
+    can_use_rmsnorm_npu,
+    rmsnorm_npu_onepass,
+)
 from sglang.kernels.ops.diffusion.rope.qknorm_complex_rope_kv_triton import (
     qknorm_complex_rope_kv,
 )
@@ -86,6 +96,8 @@ _QKV_PACK_FUSION = BitExactFusionGate(
 )
 _QK_NORM_FUSION = BitExactFusionGate("Qwen-Image 2.1 Q/K RMSNorm")
 _MODULATION_FUSION = BitExactFusionGate("Qwen-Image 2.1 LayerNorm modulation")
+_QK_NORM_NPU_FUSION = BitExactFusionGate("Qwen-Image 2.1 Q/K RMSNorm on NPU")
+_RESIDUAL_GATE_NPU_FUSION = BitExactFusionGate("Qwen-Image 2.1 residual + gate on NPU")
 
 
 def build_layout(image_slots, image_shapes, axes_dims, device):
@@ -140,46 +152,7 @@ def build_layout(image_slots, image_shapes, axes_dims, device):
     )
 
 
-# cos/sin expanded from the current forward's rope slices; reset at forward start/end.
-_NPU_ROPE_COS_SIN_CACHE = {}
-
-
-def _reset_npu_rope_cos_sin_cache():
-    _NPU_ROPE_COS_SIN_CACHE.clear()
-
-
-def _npu_rope_cos_sin(rope, dtype):
-    key = (id(rope), dtype)
-    hit = _NPU_ROPE_COS_SIN_CACHE.get(key)
-    if hit is not None:
-        return hit[1], hit[2]
-    real = torch.view_as_real(rope)
-    c = (
-        real[..., 0]
-        .reshape(1, rope.shape[0], 1, -1)
-        .repeat_interleave(2, dim=-1)
-        .to(dtype)
-    )
-    s = (
-        real[..., 1]
-        .reshape(1, rope.shape[0], 1, -1)
-        .repeat_interleave(2, dim=-1)
-        .to(dtype)
-    )
-    _NPU_ROPE_COS_SIN_CACHE[key] = (rope, c, s)
-    return c, s
-
-
-def _npu_rotary_mul(x, rope):
-    import torch_npu
-
-    c, s = _npu_rope_cos_sin(rope, x.dtype)
-    return torch_npu.npu_rotary_mul(x, c, s, rotary_mode="interleave")
-
-
 def apply_rope(x, rope):
-    if _is_npu and x.is_npu and x.dim() == 4:
-        return _npu_rotary_mul(x, rope)
     fused = None
     if _is_cuda and x.is_cuda and _ROPE_FUSION.can_attempt_once():
         fused = fused_complex_rope(x, rope)
@@ -209,6 +182,64 @@ def apply_qk_norm(x, norm):
     return out
 
 
+_NPU_I32_LIMIT = 2**31
+
+
+def _is_pow2(value):
+    return value >= 2 and not (value & (value - 1))
+
+
+def _can_use_rmsnorm_npu(x, weight):
+    return _is_npu and x.is_npu and can_use_rmsnorm_npu(x, weight)
+
+
+def _can_use_residual_gate_npu(residual, update, gate):
+    return (
+        _is_npu
+        and residual.is_npu
+        and residual.dtype is torch.bfloat16
+        and update.dtype is residual.dtype
+        and update.shape == residual.shape
+        and residual.ndim >= 2
+        and residual.is_contiguous()
+        and update.is_contiguous()
+        and 0 < residual.numel() < _NPU_I32_LIMIT
+        and _is_pow2(residual.shape[-1])
+        and gate.dtype is residual.dtype
+        and gate.device == residual.device
+        and gate.stride(-1) == 1
+        and gate.numel() in (residual.numel(), residual.shape[-1])
+    )
+
+
+def _can_use_silu_mul_npu(gate, value):
+    return (
+        _is_npu
+        and gate.is_npu
+        and gate.dtype is torch.bfloat16
+        and value.dtype is gate.dtype
+        and value.shape == gate.shape
+        and gate.is_contiguous()
+        and value.is_contiguous()
+        and 0 < gate.numel() < _NPU_I32_LIMIT
+    )
+
+
+def apply_residual_gate(residual, update, gate):
+    fused = None
+    if (
+        _can_use_residual_gate_npu(residual, update, gate)
+        and _RESIDUAL_GATE_NPU_FUSION.can_attempt_once()
+    ):
+        fused = residual_gate_add_npu(residual, update, gate)
+        if _RESIDUAL_GATE_NPU_FUSION.verified:
+            return fused
+    out = residual_gate_add(residual, update, gate)
+    if fused is not None:
+        return _RESIDUAL_GATE_NPU_FUSION.accept_or_fallback(fused, out, logger=logger)
+    return out
+
+
 def apply_qk_norm_rope(x, norm, rope):
     fused = None
     if (
@@ -233,7 +264,16 @@ def apply_qk_norm_rope(x, norm, rope):
         fused = qknorm_complex_rope(x, norm.weight, rope, norm.variance_epsilon)
         if _QK_ROPE_FUSION.verified:
             return fused
+    npu_fused = None
+    if _can_use_rmsnorm_npu(x, norm.weight) and _QK_NORM_NPU_FUSION.can_attempt_once():
+        npu_fused = apply_rope(
+            rmsnorm_npu_onepass(x, norm.weight, norm.variance_epsilon), rope
+        )
+        if _QK_NORM_NPU_FUSION.verified:
+            return npu_fused
     out = apply_rope(norm(x), rope)
+    if npu_fused is not None:
+        return _QK_NORM_NPU_FUSION.accept_or_fallback(npu_fused, out, logger=logger)
     if fused is not None:
         return _QK_ROPE_FUSION.accept_or_fallback(fused, out, logger=logger)
     return out
@@ -485,6 +525,10 @@ class QwenImage21FeedForward(nn.Module):
             fused = fused_silu_mul_bitexact(gate, value)
             if _SILU_MUL_FUSION.verified:
                 return self.out(fused)[0]
+        elif _can_use_silu_mul_npu(gate, value) and _SILU_MUL_FUSION.can_attempt_once():
+            fused = silu_mul_npu(gate, value)
+            if _SILU_MUL_FUSION.verified:
+                return self.out(fused)[0]
         hidden = nn.functional.silu(gate) * value
         if fused is not None:
             hidden = _SILU_MUL_FUSION.accept_or_fallback(fused, hidden, logger=logger)
@@ -518,16 +562,10 @@ class QwenImage21Attention(nn.Module):
             ]
         )
         self.norm_q = RMSNorm(
-            self.head_dim,
-            ac.eps,
-            cast_x_before_out_mul=True,
-            force_native=not current_platform.is_npu(),
+            self.head_dim, ac.eps, cast_x_before_out_mul=True, force_native=True
         )
         self.norm_k = RMSNorm(
-            self.head_dim,
-            ac.eps,
-            cast_x_before_out_mul=True,
-            force_native=not current_platform.is_npu(),
+            self.head_dim, ac.eps, cast_x_before_out_mul=True, force_native=True
         )
         backends = QwenImage21Transformer2DModel._supported_attention_backends
         self.local_attn = LocalAttention(
@@ -952,8 +990,8 @@ class QwenImage21TransformerBlock(nn.Module):
             caches,
             prefix_pad,
         )
-        hidden_states = residual_gate_add(hidden_states, attention, gate1)
-        hidden_states = residual_gate_add(
+        hidden_states = apply_residual_gate(hidden_states, attention, gate1)
+        hidden_states = apply_residual_gate(
             hidden_states,
             self.img_mlp(apply_modulation(hidden_states, self.img_norm2, scale2)),
             gate2,
@@ -961,8 +999,8 @@ class QwenImage21TransformerBlock(nn.Module):
         for state, attention in zip(prefix_states, prefix_attentions, strict=True):
             if attention is not None:
                 _, pg1, ps2, pg2 = prefix_modulation
-                prefix = residual_gate_add(state["hidden_states"], attention, pg1)
-                state["hidden_states"] = residual_gate_add(
+                prefix = apply_residual_gate(state["hidden_states"], attention, pg1)
+                state["hidden_states"] = apply_residual_gate(
                     prefix,
                     self.img_mlp(apply_modulation(prefix, self.img_norm2, ps2)),
                     pg2,
@@ -1138,7 +1176,6 @@ class QwenImage21Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin
         if prefix_caches is None:
             prefix_caches = [[None] * self.num_layers for _ in layouts]
         prefix_states, ropes = [], []
-        _reset_npu_rope_cos_sin_cache()
         for sample, layout in enumerate(layouts):
             prefix = None
             if not prefix_caches[sample][0]:
@@ -1170,7 +1207,6 @@ class QwenImage21Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin
                 prefix_pad,
             )
         output = self.proj_out(self.norm_out(images, temb))
-        _reset_npu_rope_cos_sin_cache()
         if sp > 1:
             output = sequence_model_parallel_all_gather(output, dim=1)
         return output

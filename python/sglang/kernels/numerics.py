@@ -63,7 +63,19 @@ def cuda_rsqrtf(x):
     return tl.where(is_subnormal, result * 4096.0, result)
 
 
+@triton.jit
+def cast_rne_bf16_to_fp32(value):
+    """RNE-round fp32 to bf16 precision through the ISA cast.
+
+    On Ascend this lowers to a single ``vcast``; the integer version above
+    costs three vector ops per element, which shows up on bandwidth-bound
+    fusions. Both are round-to-nearest-even, so the results are identical.
+    """
+    return value.to(tl.bfloat16).to(tl.float32)
+
+
 __all__ = [
+    "cast_rne_bf16_to_fp32",
     "cuda_rsqrtf",
     "div_rn_f32",
     "mul_rn_f32",
