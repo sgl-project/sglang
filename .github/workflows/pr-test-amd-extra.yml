@@ -153,8 +153,8 @@ jobs:
 
   # =============================================== extra-a (1-gpu-small) ===============================================
   # ~1.5h of tests in total; four shards keep each well under the step timeout.
-  extra-a-test-1-gpu-small-amd:
-    name: ${{ format('extra-a-test-1-gpu-small-amd ({0}, {1}, {2})', inputs.rocm_version || 'rocm10', fromJson(needs.amd-runner-map.outputs.runs_on_map)['1-gpu-small-mi30x'], matrix.part) }}
+  extra-a-test-1-gpu-small-mi30x:
+    name: ${{ format('extra-a-test-1-gpu-small-mi30x ({0}, {1}, {2})', inputs.rocm_version || 'rocm10', fromJson(needs.amd-runner-map.outputs.runs_on_map)['1-gpu-small-mi30x'], matrix.part) }}
     needs: [call-gate, amd-runner-map]
     if: ${{ !cancelled() && needs.call-gate.result == 'success' && needs.amd-runner-map.result == 'success' }}
     strategy:
@@ -190,8 +190,8 @@ jobs:
   # Single-GPU lora / spec / quant / perf model e2e tests. Runs on the same
   # 1-gpu pool as small (AMD GPUs carry enough VRAM that "large" here is a
   # CUDA memory-tier label, not a separate AMD runner pool). ~50 min in total.
-  extra-a-test-1-gpu-large-amd:
-    name: ${{ format('extra-a-test-1-gpu-large-amd ({0}, {1}, {2})', inputs.rocm_version || 'rocm10', fromJson(needs.amd-runner-map.outputs.runs_on_map)['1-gpu-large-mi30x'], matrix.part) }}
+  extra-a-test-1-gpu-large-mi30x:
+    name: ${{ format('extra-a-test-1-gpu-large-mi30x ({0}, {1}, {2})', inputs.rocm_version || 'rocm10', fromJson(needs.amd-runner-map.outputs.runs_on_map)['1-gpu-large-mi30x'], matrix.part) }}
     needs: [call-gate, amd-runner-map]
     if: ${{ !cancelled() && needs.call-gate.result == 'success' && needs.amd-runner-map.result == 'success' }}
     strategy:
@@ -225,8 +225,8 @@ jobs:
   # Multi-GPU TP / PP / PD mock-model + kv_canary e2e tests and PP/MoE
   # throughput. Mirrors CUDA's extra-a 2-gpu-large stage; runs on the 2-GPU
   # AMD pool.
-  extra-a-test-2-gpu-large-amd:
-    name: ${{ format('extra-a-test-2-gpu-large-amd ({0}, {1}, {2})', inputs.rocm_version || 'rocm10', fromJson(needs.amd-runner-map.outputs.runs_on_map)['2-gpu-large-mi30x'], matrix.part) }}
+  extra-a-test-2-gpu-large-mi30x:
+    name: ${{ format('extra-a-test-2-gpu-large-mi30x ({0}, {1}, {2})', inputs.rocm_version || 'rocm10', fromJson(needs.amd-runner-map.outputs.runs_on_map)['2-gpu-large-mi30x'], matrix.part) }}
     needs: [call-gate, amd-runner-map]
     if: ${{ !cancelled() && needs.call-gate.result == 'success' && needs.amd-runner-map.result == 'success' }}
     strategy:
@@ -258,8 +258,8 @@ jobs:
 
   # =============================================== extra-b (4-gpu) ===============================================
   # 4-GPU tests that CUDA runs in extra-b.
-  extra-b-test-4-gpu-amd:
-    name: ${{ format('extra-b-test-4-gpu-amd ({0}, {1})', inputs.rocm_version || 'rocm10', fromJson(needs.amd-runner-map.outputs.runs_on_map)['4-gpu-mi30x']) }}
+  extra-b-test-4-gpu-mi30x:
+    name: ${{ format('extra-b-test-4-gpu-mi30x ({0}, {1})', inputs.rocm_version || 'rocm10', fromJson(needs.amd-runner-map.outputs.runs_on_map)['4-gpu-mi30x']) }}
     needs: [call-gate, amd-runner-map]
     if: ${{ !cancelled() && needs.call-gate.result == 'success' && needs.amd-runner-map.result == 'success' }}
     runs-on: ${{ fromJson(needs.amd-runner-map.outputs.runs_on_map)['4-gpu-mi30x'] }}
@@ -301,10 +301,10 @@ jobs:
       [
         call-gate,
         amd-runner-map,
-        extra-a-test-1-gpu-small-amd,
-        extra-a-test-1-gpu-large-amd,
-        extra-a-test-2-gpu-large-amd,
-        extra-b-test-4-gpu-amd,
+        extra-a-test-1-gpu-small-mi30x,
+        extra-a-test-1-gpu-large-mi30x,
+        extra-a-test-2-gpu-large-mi30x,
+        extra-b-test-4-gpu-mi30x,
       ]
     if: always()
     runs-on: ubuntu-latest

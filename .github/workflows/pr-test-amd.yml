@@ -42,21 +42,21 @@ on:
         default: ''
         options:
           - ''
-          - sgl-kernel-unit-test-amd
-          - sgl-kernel-unit-test-2-gpu-amd
-          - stage-a-test-1-gpu-small-amd
-          - jit-kernel-unit-test-amd
-          - jit-kernel-benchmark-test-amd
-          - stage-b-test-1-gpu-small-amd
-          - stage-b-test-1-gpu-small-amd-mi35x
-          - stage-b-test-1-gpu-large-amd
-          - stage-b-test-2-gpu-large-amd
-          - multimodal-gen-test-1-gpu-amd
-          - multimodal-gen-test-2-gpu-amd
-          - stage-c-test-4-gpu-amd
-          - stage-c-test-large-8-gpu-amd
-          - stage-c-test-large-8-gpu-amd-mi35x
-          - stage-b-test-large-8-gpu-mi35x-disaggregation-amd
+          - sgl-kernel-unit-test-1-gpu-small-mi30x
+          - jit-kernel-unit-test-2-gpu-large-mi30x
+          - base-a-test-1-gpu-small-mi30x
+          - jit-kernel-unit-test-1-gpu-large-mi30x
+          - jit-kernel-benchmark-test-1-gpu-large-mi30x
+          - base-b-test-1-gpu-small-mi30x
+          - base-b-test-1-gpu-small-mi35x
+          - base-b-test-1-gpu-large-mi30x
+          - base-b-test-2-gpu-large-mi30x
+          - multimodal-gen-test-1-gpu-mi30x
+          - multimodal-gen-test-2-gpu-mi30x
+          - base-c-test-4-gpu-mi30x
+          - base-c-test-8-gpu-mi30x
+          - base-c-test-8-gpu-mi35x
+          - base-b-test-8-gpu-mi35x-fabric
       target_stage:
         description: "Or type comma-separated stage names (overrides dropdown if non-empty)"
         required: false
@@ -301,8 +301,8 @@ jobs:
     secrets: inherit
 
   # =============================================== sgl-kernel ====================================================
-  sgl-kernel-unit-test-amd:
-    name: ${{ format('sgl-kernel-unit-test-amd ({0}, {1})', matrix.rocm_version, fromJson(needs.check-changes.outputs.runs_on_map)['1-gpu-small-mi30x']) }}
+  sgl-kernel-unit-test-1-gpu-small-mi30x:
+    name: ${{ format('sgl-kernel-unit-test-1-gpu-small-mi30x ({0}, {1})', matrix.rocm_version, fromJson(needs.check-changes.outputs.runs_on_map)['1-gpu-small-mi30x']) }}
     strategy:
       fail-fast: false
       matrix:
@@ -311,7 +311,7 @@ jobs:
     if: |
       always() && !cancelled() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',sgl-kernel-unit-test-amd,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',sgl-kernel-unit-test-1-gpu-small-mi30x,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') &&
@@ -363,8 +363,8 @@ jobs:
           run_pytest docker exec -w /sglang-checkout/python/sglang/kernels/aot/tests ci_sglang python3 -m pytest test_torch_defaults_reset.py
           exit $failures
 
-  sgl-kernel-unit-test-2-gpu-amd:
-    name: ${{ format('sgl-kernel-unit-test-2-gpu-amd ({0}, {1})', matrix.rocm_version, fromJson(needs.check-changes.outputs.runs_on_map)['2-gpu-large-mi30x']) }}
+  jit-kernel-unit-test-2-gpu-large-mi30x:
+    name: ${{ format('jit-kernel-unit-test-2-gpu-large-mi30x ({0}, {1})', matrix.rocm_version, fromJson(needs.check-changes.outputs.runs_on_map)['2-gpu-large-mi30x']) }}
     strategy:
       fail-fast: false
       matrix:
@@ -373,7 +373,7 @@ jobs:
     if: |
       always() && !cancelled() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',sgl-kernel-unit-test-2-gpu-amd,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',jit-kernel-unit-test-2-gpu-large-mi30x,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') &&
@@ -408,8 +408,8 @@ jobs:
 
   # =============================================== primary ====================================================
 
-  stage-a-test-1-gpu-small-amd:
-    name: ${{ format('stage-a-test-1-gpu-small-amd ({0}, {1})', matrix.rocm_version, fromJson(needs.check-changes.outputs.runs_on_map)['1-gpu-small-mi30x']) }}
+  base-a-test-1-gpu-small-mi30x:
+    name: ${{ format('base-a-test-1-gpu-small-mi30x ({0}, {1})', matrix.rocm_version, fromJson(needs.check-changes.outputs.runs_on_map)['1-gpu-small-mi30x']) }}
     strategy:
       fail-fast: false
       matrix:
@@ -418,7 +418,7 @@ jobs:
     if: |
       always() && !cancelled() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-a-test-1-gpu-small-amd,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',base-a-test-1-gpu-small-mi30x,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') &&
@@ -449,8 +449,8 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite base-a-test-1-gpu-small-mi30x ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
-  jit-kernel-unit-test-amd:
-    name: ${{ format('jit-kernel-unit-test-amd ({0}, {1})', matrix.rocm_version, fromJson(needs.check-changes.outputs.runs_on_map)['1-gpu-large-mi30x']) }}
+  jit-kernel-unit-test-1-gpu-large-mi30x:
+    name: ${{ format('jit-kernel-unit-test-1-gpu-large-mi30x ({0}, {1})', matrix.rocm_version, fromJson(needs.check-changes.outputs.runs_on_map)['1-gpu-large-mi30x']) }}
     strategy:
       fail-fast: false
       matrix:
@@ -459,7 +459,7 @@ jobs:
     if: |
       always() && !cancelled() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',jit-kernel-unit-test-amd,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',jit-kernel-unit-test-1-gpu-large-mi30x,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') &&
@@ -490,8 +490,8 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite base-b-kernel-unit-test-1-gpu-large-mi30x ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
-  jit-kernel-benchmark-test-amd:
-    name: ${{ format('jit-kernel-benchmark-test-amd ({0}, {1})', matrix.rocm_version, fromJson(needs.check-changes.outputs.runs_on_map)['1-gpu-large-mi30x']) }}
+  jit-kernel-benchmark-test-1-gpu-large-mi30x:
+    name: ${{ format('jit-kernel-benchmark-test-1-gpu-large-mi30x ({0}, {1})', matrix.rocm_version, fromJson(needs.check-changes.outputs.runs_on_map)['1-gpu-large-mi30x']) }}
     strategy:
       fail-fast: false
       matrix:
@@ -500,7 +500,7 @@ jobs:
     if: |
       always() && !cancelled() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',jit-kernel-benchmark-test-amd,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',jit-kernel-benchmark-test-1-gpu-large-mi30x,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') &&
@@ -536,8 +536,8 @@ jobs:
   # For PR runs: wait jobs run and enforce sequential execution via polling.
   # For scheduled runs: wait jobs are skipped, enabling parallel execution of all stages.
 
-  wait-for-stage-a-amd:
-    name: wait-for-stage-a-amd
+  wait-for-base-a-amd:
+    name: wait-for-base-a-amd
     needs: [check-changes, call-gate]
     if: |
       always() &&
@@ -554,17 +554,17 @@ jobs:
       - uses: ./.github/actions/wait-for-jobs
         id: wait
         with:
-          stage-name: stage-a-amd
-          jobs: '[{"prefix": "stage-a-test-1-gpu-small-amd", "expected_count": 1}]'
+          stage-name: base-a-amd
+          jobs: '[{"prefix": "base-a-test-1-gpu-small-mi30x", "expected_count": 1}]'
           max-wait-minutes: '240'
 
-  stage-b-test-1-gpu-small-amd:
-    name: ${{ format('stage-b-test-1-gpu-small-amd ({0}, {1}, {2})', matrix.rocm_version, fromJson(needs.check-changes.outputs.runs_on_map)['1-gpu-small-mi30x'], matrix.part) }}
-    needs: [check-changes, wait-for-stage-a-amd]
+  base-b-test-1-gpu-small-mi30x:
+    name: ${{ format('base-b-test-1-gpu-small-mi30x ({0}, {1}, {2})', matrix.rocm_version, fromJson(needs.check-changes.outputs.runs_on_map)['1-gpu-small-mi30x'], matrix.part) }}
+    needs: [check-changes, wait-for-base-a-amd]
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-1-gpu-small-amd,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',base-b-test-1-gpu-small-mi30x,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           ((github.event_name == 'schedule') || (!failure() && !cancelled())) &&
@@ -604,13 +604,13 @@ jobs:
   # scarcest AMD runner pool, so a PR run only asks it for a runner once its
   # MI300 tests have passed. Scheduled runs skip the wait jobs and still run
   # this in parallel.
-  stage-b-test-1-gpu-small-amd-mi35x:
-    name: ${{ format('stage-b-test-1-gpu-small-amd-mi35x ({0}, {1})', matrix.rocm_version, fromJson(needs.check-changes.outputs.runs_on_map)['1-gpu-small-mi35x']) }}
-    needs: [check-changes, call-gate, wait-for-stage-b-amd]
+  base-b-test-1-gpu-small-mi35x:
+    name: ${{ format('base-b-test-1-gpu-small-mi35x ({0}, {1})', matrix.rocm_version, fromJson(needs.check-changes.outputs.runs_on_map)['1-gpu-small-mi35x']) }}
+    needs: [check-changes, call-gate, wait-for-base-b-amd]
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-1-gpu-small-amd-mi35x,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',base-b-test-1-gpu-small-mi35x,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           ((github.event_name == 'schedule') || (!failure() && !cancelled())) &&
@@ -644,13 +644,13 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite base-b-test-1-gpu-small-mi35x ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
-  stage-b-test-1-gpu-large-amd:
-    name: ${{ format('stage-b-test-1-gpu-large-amd ({0}, {1}, {2})', matrix.rocm_version, fromJson(needs.check-changes.outputs.runs_on_map)['1-gpu-large-mi30x'], matrix.part) }}
-    needs: [check-changes, wait-for-stage-a-amd]
+  base-b-test-1-gpu-large-mi30x:
+    name: ${{ format('base-b-test-1-gpu-large-mi30x ({0}, {1}, {2})', matrix.rocm_version, fromJson(needs.check-changes.outputs.runs_on_map)['1-gpu-large-mi30x'], matrix.part) }}
+    needs: [check-changes, wait-for-base-a-amd]
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-1-gpu-large-amd,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',base-b-test-1-gpu-large-mi30x,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           ((github.event_name == 'schedule') || (!failure() && !cancelled())) &&
@@ -686,13 +686,13 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite base-b-test-1-gpu-large-mi30x --auto-partition-id ${{ matrix.part }} --auto-partition-size 1 --timeout-per-file 2700 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
-  stage-b-test-2-gpu-large-amd:
-    name: ${{ format('stage-b-test-2-gpu-large-amd ({0}, {1}, {2})', matrix.rocm_version, fromJson(needs.check-changes.outputs.runs_on_map)['2-gpu-large-mi30x'], matrix.part) }}
-    needs: [check-changes, wait-for-stage-a-amd]
+  base-b-test-2-gpu-large-mi30x:
+    name: ${{ format('base-b-test-2-gpu-large-mi30x ({0}, {1}, {2})', matrix.rocm_version, fromJson(needs.check-changes.outputs.runs_on_map)['2-gpu-large-mi30x'], matrix.part) }}
+    needs: [check-changes, wait-for-base-a-amd]
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-2-gpu-large-amd,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',base-b-test-2-gpu-large-mi30x,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           ((github.event_name == 'schedule') || (!failure() && !cancelled())) &&
@@ -728,13 +728,13 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite base-b-test-2-gpu-large-mi30x --auto-partition-id ${{ matrix.part }} --auto-partition-size 1 --timeout-per-file ${{ (inputs.runner_arch || 'mi300') == 'mi300' && 5400 || 2700 }} ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
-  multimodal-gen-test-1-gpu-amd:
-    name: ${{ format('multimodal-gen-test-1-gpu-amd ({0}, {1}, {2})', matrix.rocm_version, fromJson(needs.check-changes.outputs.runs_on_map)['1-gpu-small-mi30x'], matrix.part) }}
+  multimodal-gen-test-1-gpu-mi30x:
+    name: ${{ format('multimodal-gen-test-1-gpu-mi30x ({0}, {1}, {2})', matrix.rocm_version, fromJson(needs.check-changes.outputs.runs_on_map)['1-gpu-small-mi30x'], matrix.part) }}
     needs: [check-changes, call-gate]
     if: |
       always() && !cancelled() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',multimodal-gen-test-1-gpu-amd,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',multimodal-gen-test-1-gpu-mi30x,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') &&
@@ -878,13 +878,13 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-  multimodal-gen-test-2-gpu-amd:
-    name: ${{ format('multimodal-gen-test-2-gpu-amd ({0}, {1}, {2})', matrix.rocm_version, fromJson(needs.check-changes.outputs.runs_on_map)['2-gpu-large-mi30x'], matrix.part) }}
+  multimodal-gen-test-2-gpu-mi30x:
+    name: ${{ format('multimodal-gen-test-2-gpu-mi30x ({0}, {1}, {2})', matrix.rocm_version, fromJson(needs.check-changes.outputs.runs_on_map)['2-gpu-large-mi30x'], matrix.part) }}
     needs: [check-changes, call-gate]
     if: |
       always() && !cancelled() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',multimodal-gen-test-2-gpu-amd,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',multimodal-gen-test-2-gpu-mi30x,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') &&
@@ -1025,16 +1025,16 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-  wait-for-stage-b-amd:
-    name: wait-for-stage-b-amd
-    needs: [check-changes, call-gate, wait-for-stage-a-amd]
+  wait-for-base-b-amd:
+    name: wait-for-base-b-amd
+    needs: [check-changes, call-gate, wait-for-base-a-amd]
     if: |
       always() &&
       !cancelled() &&
       github.event_name == 'pull_request' &&
       !(inputs.target_stage || inputs.target_stage_select) &&
       (needs.check-changes.outputs.main_package == 'true' || needs.check-changes.outputs.sgl_kernel == 'true') &&
-      (needs.wait-for-stage-a-amd.result == 'success' || needs.wait-for-stage-a-amd.result == 'skipped') &&
+      (needs.wait-for-base-a-amd.result == 'success' || needs.wait-for-base-a-amd.result == 'skipped') &&
       (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
     runs-on: ubuntu-latest
     outputs:
@@ -1044,22 +1044,22 @@ jobs:
       - uses: ./.github/actions/wait-for-jobs
         id: wait
         with:
-          stage-name: stage-b-amd
+          stage-name: base-b-amd
           jobs: |
             [
-              {"prefix": "stage-b-test-1-gpu-small-amd", "expected_count": 8},
-              {"prefix": "stage-b-test-1-gpu-large-amd", "expected_count": 1},
-              {"prefix": "stage-b-test-2-gpu-large-amd", "expected_count": 1}
+              {"prefix": "base-b-test-1-gpu-small-mi30x", "expected_count": 8},
+              {"prefix": "base-b-test-1-gpu-large-mi30x", "expected_count": 1},
+              {"prefix": "base-b-test-2-gpu-large-mi30x", "expected_count": 1}
             ]
           max-wait-minutes: '480'
 
-  stage-c-test-4-gpu-amd:
-    name: ${{ format('stage-c-test-4-gpu-amd ({0}, {1}, {2})', matrix.rocm_version, fromJson(needs.check-changes.outputs.runs_on_map)['4-gpu-mi30x'], matrix.part) }}
-    needs: [check-changes, call-gate, wait-for-stage-b-amd]
+  base-c-test-4-gpu-mi30x:
+    name: ${{ format('base-c-test-4-gpu-mi30x ({0}, {1}, {2})', matrix.rocm_version, fromJson(needs.check-changes.outputs.runs_on_map)['4-gpu-mi30x'], matrix.part) }}
+    needs: [check-changes, call-gate, wait-for-base-b-amd]
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-c-test-4-gpu-amd,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',base-c-test-4-gpu-mi30x,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           ((github.event_name == 'schedule') || (!failure() && !cancelled())) &&
@@ -1111,13 +1111,13 @@ jobs:
               --retry-timeout-increase 0 \
               ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
-  stage-c-test-large-8-gpu-amd:
-    name: ${{ format('stage-c-test-large-8-gpu-amd ({0}, {1}, {2})', matrix.rocm_version, fromJson(needs.check-changes.outputs.runs_on_map)['8-gpu-mi30x'], matrix.part) }}
-    needs: [check-changes, call-gate, wait-for-stage-b-amd]
+  base-c-test-8-gpu-mi30x:
+    name: ${{ format('base-c-test-8-gpu-mi30x ({0}, {1}, {2})', matrix.rocm_version, fromJson(needs.check-changes.outputs.runs_on_map)['8-gpu-mi30x'], matrix.part) }}
+    needs: [check-changes, call-gate, wait-for-base-b-amd]
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-c-test-large-8-gpu-amd,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',base-c-test-8-gpu-mi30x,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           ((github.event_name == 'schedule') || (!failure() && !cancelled())) &&
@@ -1162,13 +1162,13 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite base-c-test-8-gpu-mi30x --auto-partition-id ${{ matrix.part }} --auto-partition-size 1 --timeout-per-file 5400 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
-  stage-c-test-large-8-gpu-amd-mi35x:
-    name: ${{ format('stage-c-test-large-8-gpu-amd-mi35x ({0}, {1}, {2})', matrix.rocm_version, fromJson(needs.check-changes.outputs.runs_on_map)['8-gpu-mi35x'], matrix.part) }}
-    needs: [check-changes, call-gate, wait-for-stage-b-amd]
+  base-c-test-8-gpu-mi35x:
+    name: ${{ format('base-c-test-8-gpu-mi35x ({0}, {1}, {2})', matrix.rocm_version, fromJson(needs.check-changes.outputs.runs_on_map)['8-gpu-mi35x'], matrix.part) }}
+    needs: [check-changes, call-gate, wait-for-base-b-amd]
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-c-test-large-8-gpu-amd-mi35x,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',base-c-test-8-gpu-mi35x,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           ((github.event_name == 'schedule') || (!failure() && !cancelled())) &&
@@ -1204,13 +1204,13 @@ jobs:
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite base-c-test-8-gpu-mi35x --auto-partition-id ${{ matrix.part }} --auto-partition-size 1 --timeout-per-file 3600 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   # =============================================== Disaggregation ====================================================
-  stage-b-test-large-8-gpu-mi35x-disaggregation-amd:
-    name: ${{ format('stage-b-test-large-8-gpu-mi35x-disaggregation-amd ({0}, {1})', matrix.rocm_version, fromJson(needs.check-changes.outputs.runs_on_map)['8-gpu-mi35x-fabric']) }}
-    needs: [check-changes, wait-for-stage-a-amd]
+  base-b-test-8-gpu-mi35x-fabric:
+    name: ${{ format('base-b-test-8-gpu-mi35x-fabric ({0}, {1})', matrix.rocm_version, fromJson(needs.check-changes.outputs.runs_on_map)['8-gpu-mi35x-fabric']) }}
+    needs: [check-changes, wait-for-base-a-amd]
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-large-8-gpu-mi35x-disaggregation-amd,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',base-b-test-8-gpu-mi35x-fabric,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           ((github.event_name == 'schedule') || (!failure() && !cancelled())) &&
@@ -1349,24 +1349,24 @@ jobs:
         call-gate,
         check-changes,
 
-        sgl-kernel-unit-test-amd,
-        sgl-kernel-unit-test-2-gpu-amd,
-        multimodal-gen-test-1-gpu-amd,
-        multimodal-gen-test-2-gpu-amd,
+        sgl-kernel-unit-test-1-gpu-small-mi30x,
+        jit-kernel-unit-test-2-gpu-large-mi30x,
+        multimodal-gen-test-1-gpu-mi30x,
+        multimodal-gen-test-2-gpu-mi30x,
 
-        wait-for-stage-a-amd,
-        stage-a-test-1-gpu-small-amd,
-        jit-kernel-unit-test-amd,
-        jit-kernel-benchmark-test-amd,
-        wait-for-stage-b-amd,
-        stage-b-test-1-gpu-small-amd,
-        stage-b-test-1-gpu-small-amd-mi35x,
-        stage-b-test-1-gpu-large-amd,
-        stage-b-test-2-gpu-large-amd,
-        stage-b-test-large-8-gpu-mi35x-disaggregation-amd,
-        stage-c-test-4-gpu-amd,
-        stage-c-test-large-8-gpu-amd,
-        stage-c-test-large-8-gpu-amd-mi35x,
+        wait-for-base-a-amd,
+        base-a-test-1-gpu-small-mi30x,
+        jit-kernel-unit-test-1-gpu-large-mi30x,
+        jit-kernel-benchmark-test-1-gpu-large-mi30x,
+        wait-for-base-b-amd,
+        base-b-test-1-gpu-small-mi30x,
+        base-b-test-1-gpu-small-mi35x,
+        base-b-test-1-gpu-large-mi30x,
+        base-b-test-2-gpu-large-mi30x,
+        base-b-test-8-gpu-mi35x-fabric,
+        base-c-test-4-gpu-mi30x,
+        base-c-test-8-gpu-mi30x,
+        base-c-test-8-gpu-mi35x,
 
       ]
     if: always()
