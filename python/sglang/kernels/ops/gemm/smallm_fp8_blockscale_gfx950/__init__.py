@@ -1,13 +1,20 @@
 """gfx950 small-M FP8 block-scale GEMM with fused activation quant."""
 
 import ctypes
+import logging
 import os
 import subprocess
-import tempfile
 
 import torch
 
-from sglang.kernels.jit.utils.hipcc import HipKernel, check_hip, hip_lib, hipcc_path
+from sglang.kernels.arch import current_arch
+from sglang.kernels.jit.utils.hipcc import (
+    HipKernel,
+    build_gfx950_module,
+    check_hip,
+    hip_lib,
+)
+from sglang.srt.environ import envs
 
 _SRC = os.path.join(os.path.dirname(__file__), "smallm_fp8_blockscale_gemm.hip")
 # (N, K) -> (max M, N tiles/block, K steps/wave, waves), first match wins.
@@ -20,6 +27,7 @@ SHAPES = {
 }
 _mod = None
 _fns = {}
+logger = logging.getLogger(__name__)
 
 
 class Args(ctypes.Structure):
@@ -35,7 +43,7 @@ def try_smallm_fp8_bs_linear(x, WQ, w_scale):
     cfg = next((cfg for max_m, *cfg in SHAPES.get((N, K), ()) if M <= max_m), None)
     if not (
         _mod is not False
-        and os.environ.get("SGLANG_ROCM_SMALLM_FP8_BS", "1") != "0"
+        and envs.SGLANG_ROCM_SMALLM_FP8_BS.get()
         and x.dtype == torch.bfloat16
         and x.stride(1) == 1
         and x.stride(0) % 8 == 0
@@ -48,15 +56,15 @@ def try_smallm_fp8_bs_linear(x, WQ, w_scale):
     ):
         return None
     if _mod is None:
-        co = os.path.join(tempfile.mkdtemp(), "k.co")
-        cmd = [hipcc_path(), "--genco", "--offload-arch=gfx950", "-O3", "-o", co, _SRC]
+        hip = current_arch().hip
+        if hip is None or hip.gcn_arch != "gfx950":
+            _mod = False
+            return None
         try:
-            subprocess.run(cmd, check=True, capture_output=True)
-            _mod = ctypes.c_void_p()
-            check_hip(hip_lib().hipModuleLoad(ctypes.byref(_mod), co.encode()), "load")
+            _mod = build_gfx950_module(_SRC, "sglang_smallm_fp8_bs_")
         except (OSError, subprocess.CalledProcessError, RuntimeError) as e:
             _mod = False
-            print(f"[smallm_fp8_bs] disabled: {e}", flush=True)
+            logger.warning("smallm_fp8_bs disabled: %s", e)
             return None
     key = ((M + 15) // 16, *cfg)
     hip, fn = hip_lib(), _fns.get(key)

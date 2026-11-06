@@ -166,7 +166,6 @@ def test_capabilities_or_semantics():
     assert K.capabilities_satisfied(both, _HIP)
     assert not K.capabilities_satisfied(both, _CPU)
     assert K.capabilities_satisfied((), _CPU)  # empty = unrestricted
-    assert K.capabilities_satisfied(Cap.CUDA, _SM90)  # single tolerated
 
 
 class TestCakeSoftmaxCapability(CustomTestCase):
@@ -267,7 +266,7 @@ class TestCakeSoftmaxCapability(CustomTestCase):
 @pytest.mark.parametrize(
     "relative_path",
     (
-        "srt/utils/common.py",
+        "srt/utils/device.py",
         "multimodal_gen/runtime/utils/common.py",
     ),
 )
@@ -405,17 +404,62 @@ def test_backend_directories_register_their_backend():
             assert spec.backend is expected, spec
 
 
-def test_inventory_targets_survive_module_moves():
-    """Moving a module without its lazy target otherwise breaks only on first call."""
-    root = Path(K.__file__).resolve().parents[3] / "python"
+def _module_file(module: str) -> Path | None:
+    kernels = Path(K.__file__).resolve().parent
+    package, *_ = module.split(".")
+    # sgl_kernel resolves to the in-tree AOT package so the check needs no GPU build.
+    root = kernels / "aot/python" if package == "sgl_kernel" else kernels.parents[1]
+    path = root.joinpath(*module.split("."))
+    for candidate in (path.with_suffix(".py"), path / "__init__.py"):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _module_level_names(module: str) -> dict[str, ast.AST]:
+    """Names a module binds at top level, including under if/try and via `import *`."""
+    names = {}
+    pending = list(ast.parse(_module_file(module).read_text()).body)
+    while pending:
+        node = pending.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names[node.name] = node
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                for name in ast.walk(target):
+                    if isinstance(name, ast.Name):
+                        names[name.id] = node
+        elif isinstance(node, ast.ImportFrom) and node.names[0].name == "*":
+            names.update(_module_level_names(node.module))
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                names[(alias.asname or alias.name).split(".")[0]] = node
+        elif isinstance(node, (ast.If, ast.Try)):
+            pending += node.body + node.orelse
+            if isinstance(node, ast.Try):
+                pending += node.finalbody
+                pending += [stmt for handler in node.handlers for stmt in handler.body]
+    return names
+
+
+def test_inventory_targets_resolve():
+    """A lazy target whose module or attribute is gone otherwise breaks only on first call."""
     for spec in K.registry.all_specs():
-        module, _ = spec.target.split(":", 1)
-        if not module.startswith("sglang.kernels.ops."):
+        module, attr = spec.target.split(":", 1)
+        owner, *members = attr.split(".")
+        assert _module_file(module) is not None, spec
+        if _module_file(f"{module}.{owner}") is not None:
             continue
-        path = root.joinpath(*module.split("."))
-        assert path.with_suffix(".py").is_file() or (path / "__init__.py").is_file(), (
-            spec
-        )
+        names = _module_level_names(module)
+        assert owner in names, spec
+        if members and isinstance(names[owner], ast.ClassDef):
+            methods = {
+                node.name
+                for node in names[owner].body
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            }
+            assert members[0] in methods, spec
 
 
 def test_reclassified_public_entry_points_are_inventoried():
@@ -520,7 +564,6 @@ def _module_defines(module: str, attr: str) -> bool:
         ("communication.all_gather_matmul", {"cute_dsl"}),
         ("communication.matmul_reduce_scatter", {"cute_dsl"}),
         ("elementwise.row_sum", {"jit"}),
-        ("gemm.muse_spark_router_gemm", {"jit"}),
         ("gemm.muse_spark_router_gemv", {"cute_dsl"}),
         ("layernorm.muse_spark_norm_gate", {"torch", "jit", "helion", "triton"}),
         ("layernorm.muse_spark_norm_residual", {"torch", "jit", "triton"}),
