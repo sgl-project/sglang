@@ -423,6 +423,10 @@ class DSV4AttnMetadata:
     # length-folded aiter_sparse lists keyed by (ratio, address, shape); valid for one forward only
     _aiter_sparse_masked_indices: Optional[dict] = field(default=None, repr=False)
 
+    # {ratio: (fill key, published-mask length)} describing the layer-independent
+    # extend identity fill now in that ratio's sparse buffers; one forward only
+    _identity_fill_memo: Optional[dict] = field(default=None, repr=False)
+
     c0_flashmla_metadata: FlashMLASchedMeta = field(init=False, repr=False)
     c1_flashmla_metadata: Optional[FlashMLASchedMeta] = field(
         init=False, default=None, repr=False
@@ -535,6 +539,7 @@ class DSV4AttnMetadata:
                 # each forward; not copied across replays.
                 "swa_out_cache_loc",
                 "_aiter_sparse_masked_indices",
+                "_identity_fill_memo",
                 "c0_flashmla_metadata",
                 "c1_flashmla_metadata",
                 "c2_flashmla_metadata",
@@ -1694,6 +1699,7 @@ class DeepseekV4HipRadixBackend(
         if isinstance(metadata, DSV4Metadata):
             # the bucket object outlives the step; a warmup's length-fold cache must not be replayed
             metadata.core_attn_metadata._aiter_sparse_masked_indices = None
+            metadata.core_attn_metadata._identity_fill_memo = None
 
         window = self.token_to_kv_pool.request_window
         if window is not None and isinstance(metadata, DSV4Metadata):

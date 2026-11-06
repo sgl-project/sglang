@@ -287,6 +287,65 @@ def _fill_identity_request(
         raw_rows[:, :lc] = torch.where(reach, j[None, :], -1).to(torch.int32)
 
 
+def _identity_fill_memo_key(
+    *,
+    backend,
+    indexer,
+    ratio: int,
+    pos: torch.Tensor,
+    page_indices: torch.Tensor,
+    raw_indices: Optional[torch.Tensor],
+    lc_per_req: List[int],
+    extend_lens_cpu: List[int],
+    forward_batch: ForwardBatch,
+) -> tuple:
+    """Everything the score-free extend fill reads, none of it layer dependent.
+
+    The memo hangs off the forward's core metadata, so the key only has to
+    separate calls within one forward: req_to_token, its req_pool_indices and
+    the positions are written before the layers run and no layer touches them,
+    so identical buffer identities here mean the fill reads identical bytes.
+    The buffer addresses and shapes are in the key as well, so the late-layer
+    tail metadata -- whose rows are a subset of the full batch's -- can never
+    match an entry left by the full metadata."""
+    return (
+        ratio,
+        int(indexer.index_topk),
+        bool(backend.low_ratio_identity_skip),
+        int(pos.data_ptr()),
+        tuple(pos.shape),
+        int(page_indices.data_ptr()),
+        tuple(page_indices.shape),
+        None if raw_indices is None else int(raw_indices.data_ptr()),
+        None if raw_indices is None else tuple(raw_indices.shape),
+        int(backend.req_to_token.data_ptr()),
+        int(forward_batch.req_pool_indices.data_ptr()),
+        tuple(forward_batch.req_pool_indices.shape),
+        tuple(lc_per_req),
+        tuple(extend_lens_cpu),
+    )
+
+
+def _identity_fill_memo_hit(core, ratio: int, key: tuple) -> Optional[int]:
+    """Published-mask length of an identical fill already in the ratio's buffers."""
+    memo = core._identity_fill_memo
+    entry = None if memo is None else memo.get(ratio)
+    return entry[1] if entry is not None and entry[0] == key else None
+
+
+def _identity_fill_memo_store(core, ratio: int, key: tuple, n_publish: int) -> None:
+    if core._identity_fill_memo is None:
+        core._identity_fill_memo = {}
+    core._identity_fill_memo[ratio] = (key, n_publish)
+
+
+def _identity_fill_memo_drop(core, ratio: int) -> None:
+    """Called before any write to the ratio's buffers: whatever lands there next is
+    either layer dependent or re-memoized by the writer."""
+    if core._identity_fill_memo is not None:
+        core._identity_fill_memo.pop(ratio, None)
+
+
 def _decode_batch_max_seq_len(forward_batch) -> Optional[int]:
     """The host-side longest context of a decode batch, None when unknown."""
     seq_lens_cpu = forward_batch.seq_lens_cpu
@@ -506,9 +565,6 @@ def low_ratio_index_topk_hip_extend(
     indexer = layer.indexer
     page_indices = core.sparse_page_indices(ratio)
     raw_indices = core.sparse_raw_indices(ratio)
-    page_indices.fill_(-1)
-    if raw_indices is not None:
-        raw_indices.fill_(-1)
 
     seq_lens_cpu = _as_int_list(forward_batch.seq_lens_cpu)
     # bounded replay counts cover only each request's tail
@@ -518,7 +574,36 @@ def low_ratio_index_topk_hip_extend(
         extend_lens_cpu = _as_int_list(forward_batch.extend_seq_lens_cpu)
     assert seq_lens_cpu is not None and extend_lens_cpu is not None
     lc_per_req = [s // ratio for s in seq_lens_cpu]
+
+    # A score-free fill reads no layer state and every layer of this ratio writes
+    # the same buffers, so an earlier layer of this forward may already have put
+    # these exact bytes there.
+    memo_key = _identity_fill_memo_key(
+        backend=backend,
+        indexer=indexer,
+        ratio=ratio,
+        pos=pos,
+        page_indices=page_indices,
+        raw_indices=raw_indices,
+        lc_per_req=lc_per_req,
+        extend_lens_cpu=extend_lens_cpu,
+        forward_batch=forward_batch,
+    )
+    memo_n_publish = _identity_fill_memo_hit(core, ratio, memo_key)
+    if memo_n_publish is not None:
+        if indexer.is_candidate_source:
+            backend.candidate_masks = [None] * memo_n_publish
+        return
+    # Past here the ratio's buffers are rewritten, possibly with layer-dependent
+    # scores, so no earlier fill describes them any more.
+    _identity_fill_memo_drop(core, ratio)
+
+    page_indices.fill_(-1)
+    if raw_indices is not None:
+        raw_indices.fill_(-1)
+
     if pos.numel() == 0 or not any(lc_per_req):
+        _identity_fill_memo_store(core, ratio, memo_key, len(lc_per_req))
         if indexer.is_candidate_source:
             backend.candidate_masks = [None] * len(lc_per_req)
         return
@@ -564,6 +649,7 @@ def low_ratio_index_topk_hip_extend(
 
     if all(is_identity):
         fill_identity_requests(0, len(extend_lens_cpu), 0)
+        _identity_fill_memo_store(core, ratio, memo_key, len(extend_lens_cpu))
         if publish is not None:
             backend.candidate_masks = publish
         return
