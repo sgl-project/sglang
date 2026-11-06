@@ -2170,8 +2170,9 @@ class Scheduler(
                 self._record_scheduler_state_for_paused_engine()
                 continue
 
-            process_last_batch_early = self.should_process_last_batch_early(
-                self.last_batch
+            process_last_batch_early = (
+                self._has_pending_mamba_cache_update()
+                or self.should_process_last_batch_early(self.last_batch)
             )
             if process_last_batch_early:
                 pop_and_process()
@@ -2220,6 +2221,31 @@ class Scheduler(
 
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()
+
+    def _has_pending_mamba_cache_update(self) -> bool:
+        if not self.result_queue:
+            return False
+        pending_batch = self.result_queue[0][0]
+        if not pending_batch.forward_mode.is_extend():
+            return False
+        # DP/MLP-sync ranks need a collective decision; retain their overlap path.
+        if (
+            self.require_mlp_sync
+            or getattr(self.tree_cache, "disable", True)
+            or not getattr(self.tree_cache, "enable_mamba_extra_buffer", False)
+        ):
+            return False
+        return any(
+            req.kv.mamba_last_track_seqlen is not None
+            and not req.finished()
+            and not req.is_retracted
+            and not req.skip_radix_cache_insert
+            and (
+                not pending_batch.decoding_reqs
+                or req not in pending_batch.decoding_reqs
+            )
+            for req in pending_batch.reqs
+        )
 
     def should_process_last_batch_early(
         self, last_batch: Optional[ScheduleBatch]
