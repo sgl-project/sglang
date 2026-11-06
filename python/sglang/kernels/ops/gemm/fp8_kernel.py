@@ -9,7 +9,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers import deep_gemm_wrapper
-from sglang.srt.runtime_context import get_platform
+from sglang.srt.runtime_context import get_context, get_exec, get_platform
 from sglang.srt.utils import (
     get_device_name,
     is_cuda,
@@ -605,6 +605,22 @@ def w8a8_block_fp8_matmul_triton(
         # If an optimal configuration map has been found, look up the
         # optimal config
         config = configs[min(configs.keys(), key=lambda x: abs(x - M))]
+        # Split-K accumulates K in separate partials whose reduction order
+        # depends on M, so the same row can produce different results at
+        # different batch sizes. Deterministic inference promises batch
+        # invariant ops, so drop these meta-parameters instead of passing
+        # disabled values that the single-accumulator kernels do not accept.
+        # Standalone callers (tools, unit tests) have no published exec
+        # namespace and are not running deterministic inference: default off.
+        context = get_context()
+        if context.is_config_namespace_published("exec") and (
+            get_exec().deterministic.enable_deterministic_inference
+        ):
+            config = {
+                key: value
+                for key, value in config.items()
+                if key not in ("SPLIT_K", "SWAP_AB")
+            }
     else:
         # Default config
         # Block-wise quant: BLOCK_SIZE_K must be divisible by block_size[1]

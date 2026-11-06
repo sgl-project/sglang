@@ -38,6 +38,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
@@ -60,13 +61,7 @@ from sglang.srt.models.gemma4_causal import (
 from sglang.srt.models.gemma4_vision import Gemma4VisionEncoder
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import (
-    add_prefix,
-    cpu_has_amx_support,
-    flatten_nested_list,
-    is_cpu,
-    is_xpu,
-)
+from sglang.srt.utils import cpu_has_amx_support, flatten_nested_list, is_cpu, is_xpu
 
 logger = logging.getLogger(__name__)
 

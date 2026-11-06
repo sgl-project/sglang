@@ -2071,7 +2071,7 @@ class ModelConfig:
         # Check for HuggingFace quantization config
         quant_cfg = getattr(self.hf_config, "quantization_config", None)
         if quant_cfg is None:
-            from sglang.srt.utils import has_hf_quant_config
+            from sglang.srt.configs.quant_utils import has_hf_quant_config
 
             return has_hf_quant_config(self.model_path)
         return True
