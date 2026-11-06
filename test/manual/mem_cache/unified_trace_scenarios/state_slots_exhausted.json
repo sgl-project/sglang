@@ -1,0 +1,17 @@
+{"name": "state_slots_exhausted", "chain": "mamba", "page_size": 16, "lazy": true, "ops": [
+  {"op": "extend", "req": 0, "n": 96, "expect": "allocated"},
+  {"op": "extend", "req": 1, "n": 96, "expect": "allocated"},
+  {"op": "extend", "req": 2, "n": 96, "expect": "allocated"},
+  {"op": "extend", "req": 3, "n": 96, "expect": "allocated"},
+  {"op": "extend", "req": 4, "n": 96, "expect": "allocated"},
+  {"op": "extend", "req": 5, "n": 96, "expect": "allocated"},
+  {"op": "state_fill"},
+  {"op": "prepare_state", "n": 2},
+  {"op": "state_alloc", "n": 1, "expect": "refused"},
+  {"op": "free", "req": 0},
+  {"op": "free", "req": 1},
+  {"op": "prepare_state", "n": 2},
+  {"op": "state_alloc", "n": 2, "expect": "allocated"},
+  {"op": "state_free", "index": 0},
+  {"op": "state_alloc", "n": 1, "expect": "allocated"}
+]}

@@ -31,17 +31,14 @@ def _patch_group(monkeypatch, *, world_size, same_node):
 
 
 @pytest.mark.parametrize(
-    ("same_node", "has_fabric_clique", "uses_vmm", "expected"),
+    ("same_node", "has_fabric_clique", "expected"),
     [
-        (False, True, True, True),
-        (False, False, True, False),
-        (False, True, False, False),
-        (True, None, None, True),
+        (False, True, True),
+        (False, False, False),
+        (True, None, True),
     ],
 )
-def test_topology_capability(
-    monkeypatch, same_node, has_fabric_clique, uses_vmm, expected
-):
+def test_topology_capability(monkeypatch, same_node, has_fabric_clique, expected):
     world_size = 8 if same_node else 16
     group, device = _patch_group(
         monkeypatch,
@@ -54,22 +51,12 @@ def test_topology_capability(
             pytest.fail("intra-node groups do not need a fabric clique")
         return has_fabric_clique
 
-    def is_vmm_backed(device):
-        if same_node:
-            pytest.fail("intra-node groups do not need VMM")
-        return uses_vmm
-
     intra_node_capability = Mock(return_value=True)
 
     monkeypatch.setattr(
         custom_all_reduce_v2,
         "is_one_nvlink_clique",
         is_one_clique,
-    )
-    monkeypatch.setattr(
-        custom_all_reduce_v2,
-        "_is_vmm_backed_allocator",
-        is_vmm_backed,
     )
     monkeypatch.setattr(
         custom_all_reduce_v2,

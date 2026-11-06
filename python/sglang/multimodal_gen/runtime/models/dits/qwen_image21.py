@@ -139,38 +139,32 @@ def build_layout(image_slots, image_shapes, axes_dims, device):
     )
 
 
-def apply_rope(x, rope):
-    fused = None
-    if _is_cuda and x.is_cuda and _ROPE_FUSION.can_attempt_once():
-        fused = fused_complex_rope(x, rope)
-        if _ROPE_FUSION.verified:
-            return fused
+def _eager_rope(x, rope):
     z = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
-    out = torch.view_as_real(z * rope[None, :, None]).flatten(-2).to(x.dtype)
-    if fused is not None:
-        return _ROPE_FUSION.accept_or_fallback(fused, out, logger=logger)
-    return out
+    return torch.view_as_real(z * rope[None, :, None]).flatten(-2).to(x.dtype)
+
+
+def apply_rope(x, rope):
+    if _is_cuda and x.is_cuda:
+        return _ROPE_FUSION.run(
+            lambda: fused_complex_rope(x, rope),
+            lambda: _eager_rope(x, rope),
+            logger=logger,
+        )
+    return _eager_rope(x, rope)
 
 
 def apply_qk_norm(x, norm):
-    fused = None
-    if (
-        _is_cuda
-        and x.is_cuda
-        and x.dtype in (torch.float16, torch.bfloat16)
-        and _QK_NORM_FUSION.can_attempt_once()
-    ):
-        fused = rmsnorm_preserve_reduction(x, norm.weight, norm.variance_epsilon)
-        if _QK_NORM_FUSION.verified:
-            return fused
-    out = norm(x)
-    if fused is not None:
-        return _QK_NORM_FUSION.accept_or_fallback(fused, out, logger=logger)
-    return out
+    if _is_cuda and x.is_cuda and x.dtype in (torch.float16, torch.bfloat16):
+        return _QK_NORM_FUSION.run(
+            lambda: rmsnorm_preserve_reduction(x, norm.weight, norm.variance_epsilon),
+            lambda: norm(x),
+            logger=logger,
+        )
+    return norm(x)
 
 
 def apply_qk_norm_rope(x, norm, rope):
-    fused = None
     if (
         _is_cuda
         and x.is_cuda
@@ -178,25 +172,25 @@ def apply_qk_norm_rope(x, norm, rope):
         and can_use_qknorm_complex_rope_cuda(x.dtype, x.shape[-1])
         and _QK_ROPE_CUDA_FUSION.can_attempt_once()
     ):
-        fused = qknorm_complex_rope_cuda(x, norm.weight, rope, norm.variance_epsilon)
-        if _QK_ROPE_CUDA_FUSION.verified:
-            return fused
-        out = apply_rope(norm(x), rope)
-        return _QK_ROPE_CUDA_FUSION.accept_or_fallback(fused, out, logger=logger)
+        return _QK_ROPE_CUDA_FUSION.run(
+            lambda: qknorm_complex_rope_cuda(
+                x, norm.weight, rope, norm.variance_epsilon
+            ),
+            lambda: apply_rope(norm(x), rope),
+            logger=logger,
+        )
     if (
         _is_cuda
         and x.is_cuda
         and x.dtype in (torch.float16, torch.bfloat16)
         and x.shape[-1] == 128
-        and _QK_ROPE_FUSION.can_attempt_once()
     ):
-        fused = qknorm_complex_rope(x, norm.weight, rope, norm.variance_epsilon)
-        if _QK_ROPE_FUSION.verified:
-            return fused
-    out = apply_rope(norm(x), rope)
-    if fused is not None:
-        return _QK_ROPE_FUSION.accept_or_fallback(fused, out, logger=logger)
-    return out
+        return _QK_ROPE_FUSION.run(
+            lambda: qknorm_complex_rope(x, norm.weight, rope, norm.variance_epsilon),
+            lambda: apply_rope(norm(x), rope),
+            logger=logger,
+        )
+    return apply_rope(norm(x), rope)
 
 
 def can_project_into(layer, x):
@@ -243,20 +237,19 @@ class PrefixPad:
         return self.value
 
 
-@eager_on_graph
-def attend_past_prefix_pad(attn, q, k, v, prefix_pad, out):
+@eager_on_graph(
+    output_factory=lambda attn, q, k, v, prefix_pad: q.new_empty(
+        (*q.shape[:-1], v.shape[-1])
+    )
+)
+def attend_past_prefix_pad(attn, q, k, v, prefix_pad):
     # a graph break: the pad varies per request, and skipping it hands the
     # kernel exactly the eager K/V, so padded replays stay bit-exact. Calls the
     # impl like USPAttention does without SP, since its forward is a break too
     rows = prefix_pad.get()
-    result = attn.attn_impl.forward(
+    return attn.attn_impl.forward(
         q, k[:, rows:], v[:, rows:], get_forward_context().attn_metadata
     )
-    # copy_ would broadcast a mispredicted shape or cast a dtype silently.
-    assert out.shape == result.shape and out.dtype == result.dtype, (
-        "Qwen-Image 2.1 prefix-pad attention output mispredicted"
-    )
-    out.copy_(result)
 
 
 def cat_outputs(outputs, dim=0):
@@ -265,19 +258,13 @@ def cat_outputs(outputs, dim=0):
 
 
 def apply_modulation(x, norm, scale):
-    fused = None
-    if (
-        x.is_cuda
-        and can_use_fused_layernorm_modulate(x.dtype, x.shape[-1])
-        and _MODULATION_FUSION.can_attempt_once()
-    ):
-        fused = fused_layernorm_modulate(x, scale.squeeze(1), None, norm.eps)
-        if _MODULATION_FUSION.verified:
-            return fused
-    out = norm(x) * (1 + scale)
-    if fused is not None:
-        return _MODULATION_FUSION.accept_or_fallback(fused, out, logger=logger)
-    return out
+    if x.is_cuda and can_use_fused_layernorm_modulate(x.dtype, x.shape[-1]):
+        return _MODULATION_FUSION.run(
+            lambda: fused_layernorm_modulate(x, scale.squeeze(1), None, norm.eps),
+            lambda: norm(x) * (1 + scale),
+            logger=logger,
+        )
+    return norm(x) * (1 + scale)
 
 
 class QwenImage21ZeroCenterRMSNorm(nn.Module):
@@ -435,18 +422,14 @@ class QwenImage21FeedForward(nn.Module):
                 x, *packed, self.gate_layer.quant_method.group_size, self.out
             )
         gate, value = self.gate_layer(x)[0], self.proj(x)[0]
-        fused = None
-        if (
-            _is_cuda
-            and gate.dtype is torch.bfloat16
-            and _SILU_MUL_FUSION.can_attempt_once()
-        ):
-            fused = fused_silu_mul_bitexact(gate, value)
-            if _SILU_MUL_FUSION.verified:
-                return self.out(fused)[0]
-        hidden = nn.functional.silu(gate) * value
-        if fused is not None:
-            hidden = _SILU_MUL_FUSION.accept_or_fallback(fused, hidden, logger=logger)
+        if _is_cuda and gate.dtype is torch.bfloat16:
+            hidden = _SILU_MUL_FUSION.run(
+                lambda: fused_silu_mul_bitexact(gate, value),
+                lambda: nn.functional.silu(gate) * value,
+                logger=logger,
+            )
+        else:
+            hidden = nn.functional.silu(gate) * value
         return self.out(hidden)[0]
 
 
@@ -722,9 +705,7 @@ class QwenImage21Attention(nn.Module):
     def attend_target(self, q, k, v, prefix_pad):
         if prefix_pad is None:
             return self.target_attn(q, k, v)
-        out = q.new_empty((*q.shape[:-1], v.shape[-1]))
-        attend_past_prefix_pad(self.target_attn, q, k, v, prefix_pad, out)
-        return out
+        return attend_past_prefix_pad(self.target_attn, q, k, v, prefix_pad)
 
     def attend_sample(
         self,

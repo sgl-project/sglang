@@ -28,8 +28,8 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Sequence
 
-from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.sample.sampling_params import normalize_quality
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 from sglang.multimodal_gen.registry import (
     get_model_info,
     get_pipeline_config_classes,
