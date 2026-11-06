@@ -34,7 +34,7 @@ from sglang.srt.sampling.sampling_observer_pp import (
     pop_auxiliary_output_from_pp_tensors,
 )
 from sglang.srt.utils import DynamicGradMode, point_to_point_pyobj
-from sglang.srt.utils.common import is_npu
+from sglang.srt.utils.device import is_npu
 
 _is_npu = is_npu()
 logger = logging.getLogger(__name__)
@@ -430,6 +430,7 @@ class SchedulerPPMixin:
 
                 cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
                 self.cur_batch_for_debug = cur_batch
+                self._flush_staging_scatters()
                 if cur_batch:
                     server_is_idle = False
                     pp_proxy_tensors = None

@@ -48,6 +48,22 @@ def _make_backend(context_len=131072, **flags):
     return backend
 
 
+def _layer():
+    return SimpleNamespace(
+        layer_id=0,
+        tp_q_head_num=_NUM_Q_HEADS,
+        tp_k_head_num=_NUM_KV_HEADS,
+        tp_v_head_num=_NUM_KV_HEADS,
+        qk_head_dim=_HEAD_DIM,
+        v_head_dim=_HEAD_DIM,
+        k_scale=None,
+        v_scale=None,
+        sliding_window_size=-1,
+        logit_cap=0.0,
+        scaling=_HEAD_DIM**-0.5,
+    )
+
+
 def _variants(backend, mode=None, width=1):
     return backend.get_decode_graph_variants(mode or ForwardMode.DECODE, width)
 
@@ -165,31 +181,19 @@ class TestDecodePartitionBucketMetadata(CustomTestCase):
             req_pool_indices=torch.arange(len(seq_lens), device=_DEVICE),
         )
 
-    def _decode(self, backend, forward_batch, num_partitions):
+    def _decode(self, backend, forward_batch, num_partitions, q=None):
         backend.forward_metadata.decode_num_partitions = num_partitions
-        layer = SimpleNamespace(
-            layer_id=0,
-            tp_q_head_num=_NUM_Q_HEADS,
-            tp_k_head_num=_NUM_KV_HEADS,
-            tp_v_head_num=_NUM_KV_HEADS,
-            qk_head_dim=_HEAD_DIM,
-            v_head_dim=_HEAD_DIM,
-            k_scale=None,
-            v_scale=None,
-            sliding_window_size=-1,
-            logit_cap=0.0,
-            scaling=_HEAD_DIM**-0.5,
-        )
-        gen = torch.Generator(_DEVICE).manual_seed(1)
-        q = torch.randn(
-            forward_batch.batch_size,
-            _NUM_Q_HEADS * _HEAD_DIM,
-            device=_DEVICE,
-            dtype=torch.bfloat16,
-            generator=gen,
-        )
+        if q is None:
+            gen = torch.Generator(_DEVICE).manual_seed(1)
+            q = torch.randn(
+                forward_batch.batch_size,
+                _NUM_Q_HEADS * _HEAD_DIM,
+                device=_DEVICE,
+                dtype=torch.bfloat16,
+                generator=gen,
+            )
         return backend.forward_decode(
-            q, None, None, layer, forward_batch, save_kv_cache=False
+            q, None, None, _layer(), forward_batch, save_kv_cache=False
         )
 
     def test_eager_decode_matches_max_partitions(self):
@@ -212,8 +216,7 @@ class TestDecodePartitionBucketMetadata(CustomTestCase):
                     self.assertTrue(torch.equal(out, ref))
 
     def test_too_few_partitions_drop_kv(self):
-        # Too few partitions must change the output; also the only check that
-        # forward_decode hands decode_num_partitions to the kernel.
+        # Too few partitions must change the output.
         seq_lens = [4097, 100]
         backend = self._make_runnable_backend(seq_lens, torch.bfloat16)
         forward_batch = self._forward_batch(seq_lens)
@@ -258,6 +261,80 @@ class TestDecodePartitionBucketMetadata(CustomTestCase):
         _set_capture_attention_variant("dense")
         with self.assertRaises(ValueError):
             backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
+
+    def test_bucket_graphs_replay_like_eager(self):
+        # The partition count is a launch argument baked in at capture; replay
+        # rebuilds only the KV tables, so a graph serves only its own bucket.
+        bs = 2
+        backend = self._make_runnable_backend([32769, 4097], torch.bfloat16)
+        backend.page_size = 1
+        backend.cuda_graph_kv_indices = torch.zeros(
+            bs * 32769, dtype=torch.int32, device=_DEVICE
+        )
+        variants = _variants(backend)
+        seq_lens = torch.ones(bs, dtype=torch.int32, device=_DEVICE)
+        q = torch.zeros(
+            bs, _NUM_Q_HEADS * _HEAD_DIM, dtype=torch.bfloat16, device=_DEVICE
+        )
+        layer = _layer()
+
+        def batch(lens):
+            return SimpleNamespace(
+                batch_size=bs,
+                forward_mode=ForwardMode.DECODE,
+                spec_info=None,
+                seq_lens=seq_lens,
+                seq_lens_cpu=lens,
+                seq_lens_sum=int(lens.sum()),
+                req_pool_indices=torch.arange(bs, device=_DEVICE),
+            )
+
+        def decode(forward_batch):
+            return backend.forward_decode(
+                q, None, None, layer, forward_batch, save_kv_cache=False
+            )
+
+        graphs, outputs, captured_partitions, pool = {}, {}, {}, None
+        for label in variants.capture_labels:
+            _set_capture_attention_variant(label)
+            forward_batch = batch(torch.ones(bs, dtype=torch.int32))
+            backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
+            captured_partitions[label] = backend.forward_metadata.decode_num_partitions
+            decode(forward_batch)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, pool=pool):
+                outputs[label] = decode(forward_batch)
+            graphs[label], pool = graph, graph.pool()
+        _set_capture_attention_variant(None)
+        self.assertEqual(captured_partitions, {"p16": 16, "p128": 128, "pmax": 512})
+
+        def eager_then_replay(max_len, label):
+            lens = torch.tensor([max_len, 5], dtype=torch.int32)
+            q.normal_()
+            # Eager decode at the full count; it shares kv_indptr, so it runs first.
+            eager_batch = self._forward_batch(lens.tolist())
+            backend.init_forward_metadata(eager_batch)
+            ref = self._decode(backend, eager_batch, None, q)
+            seq_lens.copy_(lens)
+            backend.init_forward_metadata_out_graph(batch(lens))
+            graphs[label].replay()
+            return outputs[label], ref
+
+        for max_len, label in (
+            (4096, "p16"),
+            (4097, "p128"),
+            (32768, "p128"),
+            (32769, "pmax"),
+        ):
+            with self.subTest(max_len=max_len):
+                lens = torch.tensor([max_len, 5])
+                self.assertEqual(
+                    variants.select(SimpleNamespace(seq_lens_cpu=lens)), label
+                )
+                out, ref = eager_then_replay(max_len, label)
+                self.assertTrue(torch.equal(out, ref))
+        out, ref = eager_then_replay(4097, "p16")
+        self.assertFalse(torch.equal(out[0], ref[0]))
 
 
 if __name__ == "__main__":
