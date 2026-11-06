@@ -822,7 +822,7 @@ mod tests {
         rt.request_shutdown();
     }
 
-    /// A forced drain (`SGL_FORCE_SHUTDOWN`, or a failed last health probe)
+    /// A forced drain (`SGLANG_FORCE_SHUTDOWN`, or a failed last health probe)
     /// does not wait: the listener closes with a request still in flight, and
     /// that request is cut.
     #[test]

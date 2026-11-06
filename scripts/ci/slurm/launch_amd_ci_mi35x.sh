@@ -28,6 +28,7 @@
 #   SLURM_PARTITION, SLURM_ACCOUNT, SLURM_QOS
 #   CI_NODE_SCRATCH  node-local directory for the checkout copy and the
 #                    persistent /sgl-data cache (models, pip, MIOpen)
+#   HF_TOKEN         for gated models; passed through to the test container
 # Optional:
 #   SLURM_EXCLUDE    comma-separated nodes to keep the scheduler off
 #   TIME_LIMIT       default 01:30:00
