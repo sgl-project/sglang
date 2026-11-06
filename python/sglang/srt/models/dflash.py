@@ -1452,7 +1452,27 @@ class DFlashLagunaForCausalLM(DFlashDraftModel):
         return self.hidden_norm(projected)
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
+# The ROCm images set TORCHINDUCTOR_MAX_AUTOTUNE=1, which benchmarks this einsum's
+# bmm in every process and keeps whichever Triton template was fastest there. TP
+# ranks then run different templates whose K reductions round differently, the
+# replicated selector walks a different path on some rank, the ranks verify
+# different draft blocks, commit different lengths and finish the request at
+# different steps: one rank runs a forward the others never join and the server
+# hangs. The scores must be bit-identical on every rank, so keep this one off the
+# autotuner (the default lowering is chosen by shape alone).
+_RANK_IDENTICAL_COMPILE_OPTIONS = (
+    {"max_autotune": False, "max_autotune_gemm": False}
+    if get_compiler_backend() == "inductor"
+    else None
+)
+
+
+@torch.compile(
+    dynamic=True,
+    backend=get_compiler_backend(),
+    options=_RANK_IDENTICAL_COMPILE_OPTIONS,
+    disable=_is_npu,
+)
 def _score_edges(
     *,
     predecessor_table: torch.Tensor,

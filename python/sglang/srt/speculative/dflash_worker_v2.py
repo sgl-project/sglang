@@ -2929,6 +2929,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_tokens = self._draft_block_tokens_buf[:bs]
         draft_tokens[:, 0].copy_(block_ids[:, 0])
         draft_tokens[:, 1:].copy_(draft_next)
+        # Each rank drafts on its own; any bit difference in the draft makes the
+        # ranks verify different blocks and commit different lengths, after which
+        # they disagree on the step count and deadlock. Verify rank 0's block.
+        self._tp_sync.sync(SpecTpSyncSite.DFLASH_DRAFT, draft_tokens)
 
         # Must stay ahead of the target verify launch below.
         grammar_tree = (
