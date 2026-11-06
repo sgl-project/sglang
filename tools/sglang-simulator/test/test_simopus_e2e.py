@@ -129,7 +129,9 @@ def simulator(
             for _ in range(120):
                 assert proc.poll() is None, (root / "server.log").read_text()[-8000:]
                 try:
-                    if requests.get(url + "/health", timeout=1).status_code == 200:
+                    # /health can generate a token, mutating the cache and
+                    # querying costs before the authored profile begins.
+                    if requests.get(url + "/model_info", timeout=1).status_code == 200:
                         break
                 except requests.RequestException:
                     pass
