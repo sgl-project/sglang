@@ -432,12 +432,22 @@ impl ChatFormatter {
     }
 
     pub fn encode(&self, tokenizer: &Tokenizer, request: &JsonValue) -> Result<Vec<u32>> {
-        if let Some(ids) = self
-            .processor
-            .as_ref()
-            .and_then(|formatter| formatter.encode_request(request.clone(), &self.worker_defaults))
-        {
-            return ids.context("render chat");
+        if let Some(formatter) = self.processor.as_ref() {
+            if let Some(ids) = formatter.encode_request(request.clone(), &self.worker_defaults) {
+                return match ids {
+                    Ok(ids) => Ok(ids),
+                    // The processor's text-only path refuses images. Routing still needs the
+                    // chat's tokens, so render it with its image placeholders: the prompt up to
+                    // the first image is then the engine's exactly. These ids are routing-only;
+                    // a chat with media is never eligible for input_ids forwarding.
+                    Err(err) => match formatter
+                        .encode_multimodal_request(request.clone(), &self.worker_defaults)
+                    {
+                        Some(Ok(encoded)) if !encoded.images.is_empty() => Ok(encoded.ids),
+                        _ => Err(err).context("render chat"),
+                    },
+                };
+            }
         }
         let (prompt, prefix) = self.render_parts(request)?;
         let mut ids = match prompt.encode_segments() {

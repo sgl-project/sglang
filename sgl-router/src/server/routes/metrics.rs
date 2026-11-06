@@ -331,6 +331,22 @@ fn render_kv_tiers(kv: &KvIndexMetrics, block_size: u32) -> String {
         "sgl_router_cache_pending_prefix_capped_total {}\n",
         kv.tree.pending().capped(),
     ));
+    out.push_str(
+        "# HELP sgl_router_cache_media_affinity_hits_total Lookups of a chat with images where a placement remembered by --cache-media-affinity-ttl-ms matched deeper than any KV-event-confirmed prefix.\n",
+    );
+    out.push_str("# TYPE sgl_router_cache_media_affinity_hits_total counter\n");
+    out.push_str(&format!(
+        "sgl_router_cache_media_affinity_hits_total {}\n",
+        kv.tree.media().hits(),
+    ));
+    out.push_str(
+        "# HELP sgl_router_cache_media_affinity_tiebreaks_total Lookups of a chat with images, with no remembered placement, where workers or DP ranks tied on the confirmed prefix and the conversation's rendezvous hash chose one.\n",
+    );
+    out.push_str("# TYPE sgl_router_cache_media_affinity_tiebreaks_total counter\n");
+    out.push_str(&format!(
+        "sgl_router_cache_media_affinity_tiebreaks_total {}\n",
+        kv.tree.media_tiebreaks(),
+    ));
 
     out.push_str(
         "# HELP sgl_router_kv_tree_accounting_errors_total Times the tree's per-tier occupancy bookkeeping contradicted itself. Always 0 on a correct tree. Nonzero means sgl_router_kv_tree_blocks understates what the tree holds, and can drop a worker's series entirely — which the gauge's own HELP would have you read as a worker that publishes nothing.\n",

@@ -70,6 +70,27 @@ pub struct TokenizerRegistry {
     openai: Option<Arc<dyn OpenAiTokenizer>>,
     /// The model config SGLang's OpenAI chat layer reads.
     chat_model: ChatModel,
+    /// Ids of the placeholder tokens a rendered chat carries for its images.
+    media_token_ids: Vec<u32>,
+}
+
+/// Image placeholder tokens the chat renderers emit, by their spelling in
+/// `tokenizer.json`'s added tokens (DeepSeek-V4 family).
+const MEDIA_TOKENS: &[&str] = &["<｜deepseek_image｜>"];
+
+/// Ids of [`MEDIA_TOKENS`] declared by a `tokenizer.json`.
+fn media_token_ids(tokenizer_json: &serde_json::Value) -> Vec<u32> {
+    tokenizer_json["added_tokens"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|token| {
+            token["content"]
+                .as_str()
+                .is_some_and(|content| MEDIA_TOKENS.contains(&content))
+        })
+        .filter_map(|token| token["id"].as_u64().and_then(|id| u32::try_from(id).ok()))
+        .collect()
 }
 
 /// `get_context_length` over the model's text config.
@@ -135,6 +156,7 @@ impl TokenizerRegistry {
             "tokenizer loaded");
         let files = adapter::ModelFiles::open(tokenizer_path);
         if let Ok(Some(json)) = files.json("tokenizer.json") {
+            me.media_token_ids = media_token_ids(&json);
             me.openai = Some(Arc::new(OpenAiTokens {
                 tokenizer: Arc::clone(&t),
                 pieces: TokenPieces::from_tokenizer_json(&json),
@@ -222,6 +244,12 @@ impl TokenizerRegistry {
 
     pub fn chat_model(&self) -> &ChatModel {
         &self.chat_model
+    }
+
+    /// Ids of the image placeholder tokens a rendered chat can carry (empty when
+    /// the tokenizer declares none).
+    pub fn media_token_ids(&self) -> &[u32] {
+        &self.media_token_ids
     }
 
     pub fn stats(&self) -> &stats::TokenizerStats {
@@ -546,6 +574,54 @@ mod tests {
             resolve("deepseek_v4").unwrap().render(&request).unwrap(),
             "<｜begin▁of▁sentence｜><｜User｜>hi<｜Assistant｜></think>"
         );
+    }
+
+    /// SGLang's text-only path refuses images, but routing still needs a DeepSeek
+    /// chat's tokens: an image chat renders with its placeholder instead of
+    /// falling back to raw prompt text.
+    #[test]
+    fn deepseek_image_chat_encodes_for_routing() {
+        let dir = tempfile::tempdir().unwrap();
+        let tok = dir.path().join("tokenizer.json");
+        std::fs::copy("tests/fixtures/tiny_tokenizer.json", &tok).unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"model_type":"deepseek_v41"}"#,
+        )
+        .unwrap();
+        let formatter = ChatFormatter::load("m", tok.to_str().unwrap())
+            .unwrap()
+            .expect("DeepSeek-V4.1 formatter");
+        let (tokenizer, _) = adapter::load_with(
+            tok.to_str().unwrap(),
+            crate::config::TokenizerConfig::default(),
+        )
+        .unwrap();
+        let image_chat = serde_json::json!({"messages": [{"role": "user", "content": [
+            {"type": "text", "text": "look"},
+            {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}
+        ]}]});
+        let ids = formatter
+            .encode(&tokenizer, &image_chat)
+            .expect("image chat renders for routing");
+        assert!(!ids.is_empty());
+        // Deterministic, so every turn and every router hashes it the same way.
+        assert_eq!(formatter.encode(&tokenizer, &image_chat).unwrap(), ids);
+        // Video is still refused (and falls back as before).
+        let video_chat = serde_json::json!({"messages": [{"role": "user", "content": [
+            {"type": "video_url", "video_url": {"url": "https://example.com/a.mp4"}}
+        ]}]});
+        assert!(formatter.encode(&tokenizer, &video_chat).is_err());
+    }
+
+    #[test]
+    fn media_token_ids_come_from_added_tokens() {
+        let json = serde_json::json!({"added_tokens": [
+            {"id": 7, "content": "<｜begin▁of▁sentence｜>"},
+            {"id": 128_815, "content": "<｜deepseek_image｜>"}
+        ]});
+        assert_eq!(media_token_ids(&json), [128_815]);
+        assert!(media_token_ids(&serde_json::json!({})).is_empty());
     }
 
     #[test]

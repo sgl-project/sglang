@@ -425,6 +425,20 @@ fn build_app_context(
             .tree()
             .pending()
             .set_max_followers(cache.pending_prefix_max_followers);
+        if cache.media_affinity_ttl_ms > 0 {
+            let ttl = Duration::from_millis(cache.media_affinity_ttl_ms);
+            let tree = engine_state.tree();
+            tree.media().enable(ttl);
+            tree.media_ranks().enable(ttl);
+            let ids = app_context.tokenizers.media_token_ids().to_vec();
+            if ids.is_empty() {
+                tracing::warn!(
+                    "--cache-media-affinity-ttl-ms is set but the tokenizer declares no image \
+                     placeholder token; media affinity stays inactive"
+                );
+            }
+            tree.set_media_tokens(ids);
+        }
     }
     app_context.block_size_oracle = block_size_oracle;
     app_context.engine_reported_load = engine_state.engine_reported_load();

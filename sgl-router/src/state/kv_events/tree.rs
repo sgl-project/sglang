@@ -1196,6 +1196,18 @@ pub struct HashTree {
     pub(super) lora: Mutex<HashMap<KvWorkerId, sgl_kv_indexer::lora::LoraIndex>>,
     /// Route-time predictions, kept apart from the event-driven shards.
     pending: PendingPrefixes,
+    /// Where each chat with images was routed, per worker URL. KV events can
+    /// confirm such a chat only up to its first image (the engine derives image
+    /// token ids from pixels the router never sees), so this remembers the
+    /// rest for `--cache-media-affinity-ttl-ms`.
+    media: PendingPrefixes,
+    /// The same placements per DP rank, owned as `"{url}#{rank}"`.
+    media_ranks: PendingPrefixes,
+    /// Token ids marking an image in a rendered prompt; a prompt carrying one
+    /// is a media chat.
+    media_tokens: OnceLock<Vec<u32>>,
+    /// Lookups where media affinity broke a tie on the shared prefix.
+    media_tiebreaks: AtomicU64,
 }
 
 impl Default for HashTree {
@@ -1215,11 +1227,52 @@ impl HashTree {
             writer: Mutex::new(()),
             lora: Mutex::new(HashMap::new()),
             pending: PendingPrefixes::default(),
+            media: PendingPrefixes::default(),
+            media_ranks: PendingPrefixes::default(),
+            media_tokens: OnceLock::new(),
+            media_tiebreaks: AtomicU64::new(0),
         }
     }
 
     pub fn pending(&self) -> &PendingPrefixes {
         &self.pending
+    }
+
+    pub fn media(&self) -> &PendingPrefixes {
+        &self.media
+    }
+
+    pub fn media_ranks(&self) -> &PendingPrefixes {
+        &self.media_ranks
+    }
+
+    pub(crate) fn record_media_tiebreak(&self) {
+        self.media_tiebreaks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn media_tiebreaks(&self) -> u64 {
+        self.media_tiebreaks.load(Ordering::Relaxed)
+    }
+
+    /// Set the image placeholder token ids once, at startup.
+    pub fn set_media_tokens(&self, ids: Vec<u32>) {
+        let _ = self.media_tokens.set(ids);
+    }
+
+    /// Position of the prompt's first image placeholder when media affinity is
+    /// enabled; `None` for a text prompt or with media affinity off.
+    pub fn first_media_position(&self, tokens: &[u32]) -> Option<usize> {
+        if !self.media.is_enabled() {
+            return None;
+        }
+        let ids = self.media_tokens.get().filter(|ids| !ids.is_empty())?;
+        tokens.iter().position(|t| ids.contains(t))
+    }
+
+    /// Whether media affinity applies to this prompt: it is enabled and the
+    /// prompt carries an image placeholder.
+    pub fn is_media_prompt(&self, tokens: &[u32]) -> bool {
+        self.first_media_position(tokens).is_some()
     }
 
     /// Resolve an `insert`'s `parent_hash` over the COMPLETE carrier set and
@@ -1534,6 +1587,9 @@ impl HashTree {
             shard.write().clear_worker(worker);
         }
         self.pending.forget_worker(&worker.url);
+        self.media.forget_worker(&worker.url);
+        self.media_ranks
+            .forget_worker(&format!("{}#{}", worker.url, worker.dp_rank));
     }
 
     /// Find the longest path from the root that matches a prefix of
