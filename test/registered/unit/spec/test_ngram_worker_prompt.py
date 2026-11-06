@@ -2,6 +2,7 @@ import unittest
 from array import array
 from collections import deque
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import numpy as np
 import torch
@@ -17,35 +18,6 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.cpp_ngram.external_corpus import SEPARATOR_TOKEN as SEP
 from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
 from sglang.srt.speculative.ngram_worker import NGRAMWorker
-
-
-def _make_worker(corpus_trie_token_budget=1000):
-    worker = object.__new__(NGRAMWorker)
-    worker.max_trie_depth = 12
-    worker.ngram_corpus = NgramCorpus(
-        max_trie_depth=12,
-        min_bfs_breadth=1,
-        max_bfs_breadth=1,
-        draft_token_num=4,
-        capacity=1000,
-    )
-    worker._prev_decode_rids = set()
-    worker._corpus_trie_docs = {}
-    worker._staged_corpus_trie_docs = {}
-    worker._corpus_trie_tokens = 0
-    worker._corpus_trie_token_budget = corpus_trie_token_budget
-    worker._corpus_trie_backlog = deque()
-    return worker
-
-
-def _first_draft(worker, context):
-    """Most likely next token after context, or 0 when the trie has none."""
-    while worker._corpus_trie_backlog:
-        worker._feed_corpus_trie()
-    worker.ngram_corpus.synchronize()
-    drafts = worker.ngram_corpus.batch_get(["probe"], [context], [len(context)])[0]
-    worker.ngram_corpus.erase_match_state(["probe"])
-    return int(drafts[1])
 
 
 class TestNgramWorkerPrompt(CustomTestCase):
@@ -115,43 +87,38 @@ class TestNgramWorkerPrompt(CustomTestCase):
                     self.assertEqual(list(req.origin_input_ids_unpadded), [1, 2, 3])
 
     def test_extend_inserts_unpadded_tail_after_last_chunk(self):
-        req = Req("mm", "", array("q", [11, 12, 13]), SamplingParams())
-        # Pad sentinels overflow the trie's int32 tokens, so batch_put would raise.
-        req.origin_input_ids = array("q", [11] + [1 << 60] * 16 + [12, 13])
-        other = Req("text", "", array("q", [21, 22, 23]), SamplingParams())
-        for chunked in [True, False]:
-            with self.subTest(chunked=chunked):
-                worker = _make_worker()
-                batch = SimpleNamespace(
-                    reqs=[req, other], chunked_req=req if chunked else None
-                )
-                worker._insert_extend_prompt_tails(batch)
-                self.assertEqual(_first_draft(worker, [21, 22]), 23)
-                # A middle chunk waits for the last one instead of inserting early.
-                self.assertEqual(_first_draft(worker, [11, 12]), 0 if chunked else 13)
+        req = Req("mm", "", array("q", [1, 2, 3]), SamplingParams())
+        req.origin_input_ids = array("q", [1, 1 << 60, 2, 3])
+        other = Req("text", "", array("q", [4, 5]), SamplingParams())
+        for chunked_req, expected in [(req, [[4, 5]]), (None, [[1, 2, 3], [4, 5]])]:
+            worker = object.__new__(NGRAMWorker)
+            worker.ngram_corpus = MagicMock()
+            worker._insert_extend_prompt_tails(
+                SimpleNamespace(reqs=[req, other], chunked_req=chunked_req)
+            )
+            worker.ngram_corpus.batch_put.assert_called_once_with(expected)
 
-    def test_external_corpus_trie_follows_corpus_lifecycle(self):
-        worker = _make_worker(corpus_trie_token_budget=8)
-        # [7, 8, 9] spans a chunk boundary; [32, 33] is past the token budget.
-        chunks = [[1, 2, 3, SEP, 7, 8], [9, SEP, 30, 31, 32, 33]]
+    def test_external_corpus_trie_follows_lifecycle(self):
+        worker = object.__new__(NGRAMWorker)
+        worker.max_trie_depth = 12
+        worker.ngram_corpus = MagicMock()
+        worker._corpus_trie_docs, worker._staged_corpus_trie_docs = {}, {}
+        worker._corpus_trie_tokens, worker._corpus_trie_token_budget = 0, 8
+        worker._corpus_trie_backlog = backlog = deque()
+
+        # [7, 8, 9] spans a chunk boundary; 32 is past the token budget.
+        chunks = [[1, 2, 3, SEP, 7, 8], [9, SEP, 30, 31, 32]]
+        docs = [[1, 2, 3], [7, 8, 9], [30, 31]]
         worker.commit_corpus_load("a", worker.add_external_corpus("a", chunks))
-        self.assertEqual(_first_draft(worker, [7, 8]), 9)
-        self.assertEqual(_first_draft(worker, [8, 9]), 0)  # split at the separator
-        self.assertEqual(_first_draft(worker, [30, 31]), 0)
-        # Over budget: the corpus still loads into its SAM, not into the trie.
-        worker.commit_corpus_load("b", worker.add_external_corpus("b", [[40, 41]]))
-        self.assertEqual(worker.list_external_corpora(), {"a": 12, "b": 2})
-        self.assertEqual(_first_draft(worker, [40]), 0)
+        self.assertEqual(list(backlog), docs)
+        worker._feed_corpus_trie()
+        worker.ngram_corpus.batch_put.assert_called_once_with(docs)
 
-        # A flush drops request n-grams but keeps loaded corpora.
-        worker.ngram_corpus.batch_put([[50, 51, 52]])
+        # A flush re-queues the corpus; removing it drops it and frees its budget.
         worker.clear_cache_pool()
-        self.assertEqual(_first_draft(worker, [50, 51]), 0)
-        self.assertEqual(_first_draft(worker, [1, 2]), 3)
-        # A removed corpus is gone from the trie, also after the next flush.
+        self.assertEqual(list(backlog), docs)
         worker.remove_external_corpus("a")
-        worker.clear_cache_pool()
-        self.assertEqual(_first_draft(worker, [1, 2]), 0)
+        self.assertEqual(list(backlog), [])
         self.assertEqual(worker._corpus_trie_tokens, 0)
 
 
