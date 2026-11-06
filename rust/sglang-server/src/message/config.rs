@@ -80,6 +80,11 @@ pub struct RuntimeConfig {
     pub generate_hook: Option<Arc<dyn crate::GenerateHook>>,
     /// A model package's admission check on every client generation.
     pub generate_validator: Option<Arc<dyn crate::GenerateValidator>>,
+    /// A model package's own scheduler `internal_state` fields, which
+    /// `/server_info` reports by name after its typed ones. No other
+    /// scheduler field is reported: the state also carries the launch
+    /// arguments, credentials included.
+    pub server_info_state_keys: Vec<String>,
 }
 
 impl Default for RuntimeConfig {
@@ -89,6 +94,7 @@ impl Default for RuntimeConfig {
             server_args: Arc::new(ServerArgs::default()),
             generate_hook: None,
             generate_validator: None,
+            server_info_state_keys: Vec::new(),
         }
     }
 }

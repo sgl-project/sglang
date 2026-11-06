@@ -488,6 +488,7 @@ mod tests {
             server_args: Arc::new(server_args),
             generate_hook: None,
             generate_validator: None,
+            server_info_state_keys: Vec::new(),
         };
         (
             crate::runtime::start(cfg, None).expect("start runtime"),

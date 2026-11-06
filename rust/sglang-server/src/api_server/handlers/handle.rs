@@ -83,6 +83,21 @@ pub(crate) struct CoreMetadata {
     /// Priority for a generation that sets none (see
     /// `ServerArgs::default_priority_value`).
     pub(super) default_priority: Option<i64>,
+    /// The scheduler `internal_state` fields `/server_info` reports beyond its
+    /// typed ones, which an embedding package registers (see
+    /// `RuntimeConfig::server_info_state_keys`).
+    pub(super) server_info_state_keys: Vec<String>,
+}
+
+impl CoreMetadata {
+    /// This metadata, with `/server_info` reporting `keys` beyond its typed
+    /// scheduler fields.
+    pub(crate) fn with_server_info_state_keys(self, keys: Vec<String>) -> Self {
+        Self {
+            server_info_state_keys: keys,
+            ..self
+        }
+    }
 }
 
 impl From<&ServerArgs> for CoreMetadata {
@@ -107,6 +122,7 @@ impl From<&ServerArgs> for CoreMetadata {
             launch_server_info: args.launch_server_info.0.clone(),
             launch_model_info: args.launch_model_info.0.clone(),
             default_priority: args.default_priority_value,
+            server_info_state_keys: Vec::new(),
         }
     }
 }
