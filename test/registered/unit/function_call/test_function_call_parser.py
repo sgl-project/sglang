@@ -517,6 +517,49 @@ class TestPythonicDetector(unittest.TestCase):
             [str(w.message) for w in caught],
         )
 
+    def test_reserved_kwarg_names_preserved(self):
+        """Tool parameters named after Python keywords (from, in, class, etc.)
+        must not trigger SyntaxError and drop the tool call."""
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="send_email",
+                    description="Send an email",
+                    parameters={
+                        "properties": {
+                            "from": {"type": "string"},
+                            "to": {"type": "string"},
+                            "in": {"type": "string"},
+                            "class": {"type": "string"},
+                        },
+                        "required": ["from", "to"],
+                    },
+                ),
+            )
+        ]
+        text = '[send_email(from="alice@example.com", to="bob@example.com", in="inbox", class="urgent")]'
+        result = self.detector.detect_and_parse(text, tools)
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "send_email")
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(
+            params,
+            {
+                "from": "alice@example.com",
+                "to": "bob@example.com",
+                "in": "inbox",
+                "class": "urgent",
+            },
+        )
+
+        # Also verify streaming incremental parsing
+        stream_detector = PythonicDetector()
+        stream_result = stream_detector.parse_streaming_increment(text, tools)
+        self.assertEqual(len(stream_result.calls), 1)
+        stream_params = json.loads(stream_result.calls[0].parameters)
+        self.assertEqual(stream_params, params)
+
     def test_parse_streaming_no_brackets(self):
         """Test parsing text with no brackets (no tool calls)."""
         text = "This is just normal text without any tool calls."

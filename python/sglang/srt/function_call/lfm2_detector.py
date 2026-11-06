@@ -33,7 +33,11 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
-from sglang.srt.function_call.utils import safe_ast_parse
+from sglang.srt.function_call.utils import (
+    rename_reserved_kwargs,
+    restore_reserved_kwarg_names,
+    safe_ast_parse,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -48,83 +52,8 @@ _PYTHONIC_NAME_LITERALS = {
 }
 
 _QUOTE_FOLLOWERS = {",", ")", "]", "}", ":"}
-_RESERVED_KW_SUFFIX = "_pyreservedkw_"
-
-
-def _rename_reserved_kwargs(text: str) -> Tuple[str, bool]:
-    """Rename Python-keyword parameter names so the text parses.
-
-    Tools legitimately name parameters ``from``/``in``/``class``, but
-    ``memory_get(from=1)`` is a Python ``SyntaxError``. Rename ``from=`` to
-    ``from_pyreservedkw_=`` (outside string literals, keyword-argument
-    position only), parse, then restore via
-    :func:`_restore_reserved_kwarg_names`. Returns (rewritten_text, changed).
-    """
-    out: List[str] = []
-    quote: Optional[str] = None
-    changed = False
-    last_sig = ""
-    index, length = 0, len(text)
-    while index < length:
-        char = text[index]
-        if quote is not None:
-            out.append(char)
-            if char == "\\" and index + 1 < length:
-                out.append(text[index + 1])
-                index += 2
-                continue
-            if char == quote:
-                quote = None
-            index += 1
-            continue
-        if char in {"'", '"'}:
-            quote = char
-            out.append(char)
-            last_sig = char
-            index += 1
-            continue
-        if char.isalpha() or char == "_":
-            end = index
-            while end < length and (text[end].isalnum() or text[end] == "_"):
-                end += 1
-            name = text[index:end]
-            look = end
-            while look < length and text[look].isspace():
-                look += 1
-            if (
-                _python_keyword.iskeyword(name)
-                and look < length
-                and text[look] == "="
-                and (look + 1 >= length or text[look + 1] != "=")
-                and last_sig in {"(", ","}
-            ):
-                out.append(name + _RESERVED_KW_SUFFIX)
-                changed = True
-            else:
-                out.append(name)
-            last_sig = name[-1]
-            index = end
-            continue
-        out.append(char)
-        if not char.isspace():
-            last_sig = char
-        index += 1
-    return "".join(out), changed
-
-
-def _restore_reserved_kwarg_names(arguments: dict) -> dict:
-    """Exact inverse of :func:`_rename_reserved_kwargs` on a decoded dict."""
-    restored = {}
-    for key, value in arguments.items():
-        if (
-            isinstance(key, str)
-            and key.endswith(_RESERVED_KW_SUFFIX)
-            and _python_keyword.iskeyword(key[: -len(_RESERVED_KW_SUFFIX)])
-        ):
-            restored[key[: -len(_RESERVED_KW_SUFFIX)]] = value
-        else:
-            restored[key] = value
-    return restored
+_rename_reserved_kwargs = rename_reserved_kwargs
+_restore_reserved_kwarg_names = restore_reserved_kwarg_names
 
 
 def _is_escaped(text: str, index: int) -> bool:
