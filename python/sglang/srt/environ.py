@@ -2277,7 +2277,7 @@ class Envs:
     # Ulysses all-to-alls in row chunks on a side stream, overlapped with the chunks' QKV / O projections
     # (needs SGLANG_MUSE_ULYSSES_LOCAL_GATE).
     SGLANG_MUSE_ULYSSES_PIPELINE = EnvBool(True)
-    # TP4 compact A4 verify: one kernel runs the MoE finalize and pushes the all-reduce over xGMI (bitwise the
+    # TP4 / TP8 compact A4 verify: one kernel runs the MoE finalize and pushes the all-reduce over xGMI (bitwise the
     # FlyDSL finalize + aiter two-stage all-reduce).
     SGLANG_MUSE_FINALIZE_AR_PUSH = EnvBool(True)
     SGLANG_MUSE_DENSE_TUNED = EnvBool(True)
