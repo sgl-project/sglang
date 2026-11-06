@@ -3,11 +3,8 @@ import sys
 import pytest
 import torch
 
-from sglang.kernels.ops.embeddings.engram_gather import (
-    engram_gather,
-    engram_gather_peer,
-    unpack_mxfp4_rows,
-)
+from sglang.kernels.ops.communication.engram_gather_peer import engram_gather_peer
+from sglang.kernels.ops.embeddings.engram_gather import engram_gather, unpack_mxfp4_rows
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large")

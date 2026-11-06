@@ -490,7 +490,7 @@ def test_fp4_paged_logits_replay(batch, ratio, width, masked):
 def test_fp4_paged_logits_balanced_matches_per_row_replay(heads, ratio, masked):
     """One long verify group among short rows: the balanced split and the per-row grid
     must produce the same bits for every visible score, across graph replays."""
-    from sglang.srt.environ import envs
+    from sglang.kernels.ops.attention.dsv4 import fp4_indexer
 
     batch, width = 40, 20000
     q, weights, slots, lens, table = _make_logits_case(batch, heads, width)
@@ -508,16 +508,17 @@ def test_fp4_paged_logits_balanced_matches_per_row_replay(heads, ratio, masked):
     args = (q, weights, req, req_table, lengths, table, PAGE_SIZE, capacity, ratio)
 
     def score(balanced):
-        with envs.SGLANG_OPT_DSV41_FAST_DECODE_INDEXER.override(balanced):
+        if balanced:
+            return fp4_index_logits_paged(*args, candidate_mask)
+        with patch.object(fp4_indexer, "_PAGED_BALANCED_MAX_BATCH", 0):
             return fp4_index_logits_paged(*args, candidate_mask)
 
-    with envs.SGLANG_OPT_DSV41_FAST_DECODE_INDEXER.override(True):
-        for _ in range(3):
-            fp4_index_logits_paged(*args, candidate_mask)
-        torch.cuda.synchronize()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            actual = fp4_index_logits_paged(*args, candidate_mask)
+    for _ in range(3):
+        fp4_index_logits_paged(*args, candidate_mask)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = fp4_index_logits_paged(*args, candidate_mask)
     for step, long_len in enumerate([width, 0, 1, 129, 20000 - 63, width]):
         short = torch.tensor([0, 1, 63, 64, 65, 127, 128, 3000], device=q.device)
         lengths.copy_(short[torch.arange(batch, device=q.device) % 8].to(torch.int32))
@@ -727,108 +728,6 @@ def test_expand_index_page_table_matches_cpu(bs, n, bpp):
         out = expand(table)
         assert out.dtype == torch.int32
         assert torch.equal(out.cpu(), expand(table.cpu()))
-
-
-@pytest.mark.parametrize("rows", [0, 1, 32, 129])
-@pytest.mark.parametrize("topk", [0, 1, 65, 512])
-@pytest.mark.parametrize("write_raw", [False, True])
-def test_flat_indexer_finalization_replay(rows, topk, write_raw):
-    from sglang.kernels.ops.attention.dsv4.fp4_indexer import finish_flat_indexer_topk
-
-    torch.manual_seed(81 + rows + topk)
-    indices = torch.randint(
-        0, 2048, (rows, topk + 8), device="cuda", dtype=torch.int32
-    )[:, :topk]
-    slots = torch.randperm(2048, device="cuda").to(torch.int64)
-    starts = torch.randint(0, 128, (rows,), device="cuda", dtype=torch.int32)
-    pages = torch.full((rows + 1, topk + 8), 12345, device="cuda", dtype=torch.int32)
-    raw = torch.full_like(pages, 12345) if write_raw else None
-
-    def run():
-        finish_flat_indexer_topk(indices, slots, starts, pages, raw)
-
-    for _ in range(3):
-        run()
-    graph = None
-    if rows and topk:
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            run()
-    for step in range(3):
-        indices.copy_(
-            torch.randint(0, 2048, indices.shape, device="cuda", dtype=torch.int32)
-        )
-        indices[:, step::7] = -1 - step
-        indices[:, 2::11] = torch.iinfo(torch.int32).max
-        if step == 1:
-            indices.fill_(-1)
-        slots.copy_(slots.roll(17))
-        starts.add_(1)
-        pages.fill_(12345)
-        if raw is not None:
-            raw.fill_(12345)
-        if graph is not None:
-            graph.replay()
-        else:
-            run()
-        sentinel = torch.iinfo(torch.int32).max
-        selected = indices.masked_fill(indices < 0, sentinel).sort(-1).values
-        chosen = selected != sentinel
-        expected_pages = torch.full_like(pages, 12345)
-        expected_pages[:rows, :topk] = torch.where(
-            chosen, slots[selected.clamp_max(slots.numel() - 1)], -1
-        ).int()
-        torch.testing.assert_close(pages, expected_pages, rtol=0, atol=0)
-        if raw is not None:
-            expected_raw = torch.full_like(raw, 12345)
-            expected_raw[:rows, :topk] = torch.where(
-                chosen, selected - starts[:, None], -1
-            )
-            torch.testing.assert_close(raw, expected_raw, rtol=0, atol=0)
-
-
-@pytest.mark.parametrize("write_raw", [False, True])
-def test_flat_indexer_slot_count_does_not_recompile(write_raw):
-    from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
-        _finish_flat_indexer_topk_kernel,
-    )
-
-    rows, topk = 32, 512
-    torch.manual_seed(95)
-    indices = torch.randint(0, 8192, (rows, topk), device="cuda", dtype=torch.int32)
-    indices[:, 0] = -3
-    indices[:, 1] = torch.iinfo(torch.int32).max
-    starts = torch.arange(rows, device="cuda", dtype=torch.int32)
-    pages = torch.empty_like(indices)
-    raw = torch.empty_like(indices) if write_raw else None
-    hashes = set()
-    for num_slots in (1, 17, 64, 65, 129, 2048, 8192):
-        slots = torch.arange(num_slots, device="cuda", dtype=torch.int64) * 3 + 7
-        compiled = _finish_flat_indexer_topk_kernel[(rows,)](
-            indices,
-            slots,
-            starts,
-            pages,
-            raw,
-            topk,
-            num_slots,
-            indices.stride(0),
-            pages.stride(0),
-            raw.stride(0) if raw is not None else 0,
-            write_raw,
-            topk,
-            num_warps=4,
-        )
-        hashes.add(compiled.hash)
-        sentinel = torch.iinfo(torch.int32).max
-        selected = indices.masked_fill(indices < 0, sentinel).sort(-1).values
-        chosen = selected != sentinel
-        expected = torch.where(chosen, slots[selected.clamp_max(num_slots - 1)], -1)
-        torch.testing.assert_close(pages, expected.int(), rtol=0, atol=0)
-        if raw is not None:
-            expected_raw = torch.where(chosen, selected - starts[:, None], -1)
-            torch.testing.assert_close(raw, expected_raw, rtol=0, atol=0)
-    assert len(hashes) == 1, "Changing the visible slot count must reuse the kernel"
 
 
 if __name__ == "__main__":

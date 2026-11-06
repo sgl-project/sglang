@@ -7,7 +7,7 @@ import time
 import numpy as np
 import requests
 
-from sglang.srt.utils.hf_transformers import get_tokenizer
+from sglang.srt.hf_transformers import get_tokenizer
 
 # LongBench V2 dataset configuration
 # Reference: https://github.com/THUDM/LongBench
