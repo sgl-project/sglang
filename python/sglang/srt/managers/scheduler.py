@@ -122,6 +122,12 @@ from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
+from sglang.srt.hf_transformers import (
+    get_processor,
+    get_tokenizer,
+    get_tokenizer_from_processor,
+    resolve_image_processor_backend,
+)
 from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
 from sglang.srt.layers.cp.utils import from_cp_sharded
 from sglang.srt.layers.dp_attention import get_dp_tp_group
@@ -401,12 +407,6 @@ from sglang.srt.utils import (
     triton_load_watch,
 )
 from sglang.srt.utils.common import is_confidential_compute, is_npu
-from sglang.srt.utils.hf_transformers import (
-    get_processor,
-    get_tokenizer,
-    get_tokenizer_from_processor,
-    resolve_image_processor_backend,
-)
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.weight_versions import record_weight_version_events
@@ -2549,7 +2549,8 @@ class Scheduler(
         # The rust server *is* the ingress source: SchedulerRequestReceiver
         # drains its request ring (rust_server_mode) instead of a zmq socket.
         self.recv_from_tokenizer = rust_server
-        # Park the idle loop on the request ring within the rank-0 rust-server
+        # The idle loop parks in the server's wait_request, on the request ring
+        # only with --sleep-on-idle (see RustServer.wait_request).
         self.idle_sleeper = RustServerIdleSleeper(
             rust_server, can_empty_cache=lambda: not self._engine_paused
         )
@@ -3540,6 +3541,8 @@ class Scheduler(
             self.handle_generate_request(tokenized_req)
 
     def _prefetch_kvcache(self, req: Req, storage_hit_end: Optional[int] = None):
+        if self.enable_unified_cache_external_linker:
+            return self.tree_cache.linker.prefetch(req)
         if self.enable_hicache_storage or self.enable_lmcache:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
             tree_cache = self.tree_cache
@@ -4469,7 +4472,11 @@ class Scheduler(
                 ):
                     break
 
-            if self.enable_hicache_storage or self.enable_lmcache:
+            if (
+                self.enable_hicache_storage
+                or self.enable_lmcache
+                or self.enable_unified_cache_external_linker
+            ):
                 prefetch_done = self.tree_cache.check_prefetch_progress(
                     req.cache_request_handle
                 )
@@ -5585,6 +5592,10 @@ class Scheduler(
                 or self.disaggregation_mode != DisaggregationMode.NULL
                 or self.enable_lmcache
                 or self.deferred_responses.has_pending()
+                or (
+                    self.enable_unified_cache_external_linker
+                    and self.tree_cache.linker.prefetches
+                )
             ):
                 # Storage, transfer, and deferred-output workers need the GIL
                 # between I/O calls. Singleton PD polls no longer yield through
@@ -5737,6 +5748,9 @@ class Scheduler(
                         idle &= tc.buffer_pipeline.is_idle()
             elif self.enable_lmcache:
                 idle &= not self.tree_cache.has_pending_cache_operations()
+
+            if self.enable_unified_cache_external_linker:
+                idle &= not self.tree_cache.linker.prefetches
 
         return idle
 

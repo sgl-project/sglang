@@ -34,6 +34,7 @@ from triton.language.extra import libdevice
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.hf_transformers import get_rope_config
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
@@ -91,7 +92,6 @@ from sglang.srt.utils import (
     is_npu,
     make_pp_layers,
 )
-from sglang.srt.utils.hf_transformers import get_rope_config
 
 LoraConfig = None
 logger = logging.getLogger(__name__)

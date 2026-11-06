@@ -2330,7 +2330,7 @@ class CheckWeightsReqInput(BaseReq, kw_only=True):
 
 
 # Wire versions of the pydantic ParallelismInfo/ChecksumInfo in
-# sglang.srt.utils.weight_checker. Not array_like: the payload is read by field
+# sglang.srt.model_executor.weight_checker. Not array_like: the payload is read by field
 # name and re-serialized to JSON, so it must stay a {field: value} map.
 class ParallelismInfo(msgspec.Struct, kw_only=True):
     # "target", or a draft role such as "draft" / "draft_step_0"

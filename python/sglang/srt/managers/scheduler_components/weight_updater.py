@@ -56,9 +56,9 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
+from sglang.srt.model_executor.weight_checker import overall_checksum
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_model, get_parallel
-from sglang.srt.utils.weight_checker import overall_checksum
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
