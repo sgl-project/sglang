@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import ctypes
 import os
+import subprocess
+import tempfile
 
 import torch
 
+from sglang.kernels.jit.utils.compile.toolchain import rocm_home
 from sglang.srt.distributed.device_communicators.cuda_wrapper import (
     find_loaded_library,
 )
@@ -42,7 +45,7 @@ def hip_lib():
 def check_hip(rc, what):
     if rc != 0:
         raise RuntimeError(
-            f"smallm_moe: {what} failed: {rc} ({hip_lib().hipGetErrorString(rc).decode()})"
+            f"HIP {what} failed: {rc} ({hip_lib().hipGetErrorString(rc).decode()})"
         )
 
 
@@ -83,7 +86,21 @@ class HipKernel:
 
 
 def hipcc_path():
-    return os.path.join(os.environ.get("ROCM_PATH", "/opt/rocm"), "bin", "hipcc")
+    return os.path.join(rocm_home(), "bin", "hipcc")
+
+
+def build_gfx950_module(src: str, prefix: str) -> ctypes.c_void_p:
+    """Compile ``src`` for gfx950 with hipcc into a fresh temp dir and load it.
+
+    Raises OSError / subprocess.CalledProcessError (with text stderr) when hipcc
+    fails, and RuntimeError when the code object does not load.
+    """
+    co = os.path.join(tempfile.mkdtemp(prefix=prefix), "k.co")
+    cmd = [hipcc_path(), "--genco", "--offload-arch=gfx950", "-O3", "-o", co, src]
+    subprocess.run(cmd, check=True, capture_output=True, text=True)
+    mod = ctypes.c_void_p()
+    check_hip(hip_lib().hipModuleLoad(ctypes.byref(mod), co.encode()), "hipModuleLoad")
+    return mod
 
 
 def hip_version():
