@@ -134,11 +134,7 @@ class DraftMoE(nn.Module):
     ) -> None:
         super().__init__()
         from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
-        from sglang.srt.layers.moe.topk import (
-            TopK,
-            TopKOutputFormat,
-            fused_topk_torch_native,
-        )
+        from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
 
         _check_parallel_fit(spec)
         self.spec = spec
@@ -198,7 +194,7 @@ class DraftMoE(nn.Module):
             scoring_func=spec.scoring_func,
             correction_bias=self.gate.expert_bias,
             custom_routing_function=(
-                partial(fused_topk_torch_native, correction_bias=self.gate.expert_bias)
+                partial(_biased_softmax_topk, bias=self.gate.expert_bias)
                 if biased_softmax
                 else None
             ),
@@ -374,6 +370,14 @@ def _expect_shape(name: str, loaded: torch.Tensor, shape: tuple) -> None:
         raise ValueError(
             f"Draft FFN: {name} has shape {tuple(loaded.shape)}, expected {tuple(shape)}."
         )
+
+
+def _biased_softmax_topk(bias, **kwargs):
+    """SpecForge's biased softmax top-k in torch; int32 ids like the fused routers."""
+    from sglang.srt.layers.moe.topk import fused_topk_torch_native
+
+    weights, ids = fused_topk_torch_native(correction_bias=bias, **kwargs)
+    return weights, ids.to(torch.int32)
 
 
 def _routing_method(spec: DraftMoeFFNSpec):
