@@ -236,9 +236,9 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(
             hicache_restore_lock=None,
         )
 
-        queued = DecodeHiCacheTransferMixin._try_hicache_queue_load_back(
-            SimpleNamespace(tree_cache=cache), decode_req
-        )
+        queue = DecodeHiCacheTransferMixin()
+        queue.tree_cache = cache
+        queued = queue._try_hicache_queue_load_back(decode_req)
 
         self.assertTrue(queued)
         self.assertEqual(
