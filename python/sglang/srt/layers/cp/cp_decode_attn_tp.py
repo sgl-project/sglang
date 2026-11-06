@@ -124,7 +124,7 @@ class CpDecodeAttnTpContext:
     def _slice(
         self, tensor: torch.Tensor, dim: int, *, is_scale: bool = False
     ) -> torch.Tensor:
-        if dim not in (0, 1) or tensor.ndim <= dim:
+        if not 0 <= dim < tensor.ndim or (dim > 1 and not is_scale):
             raise ValueError(
                 f"CP decode attn TP: cannot slice {tensor.shape=} at {dim=}"
             )
@@ -225,19 +225,28 @@ class CpDecodeAttnTpContext:
             return []
 
         attrs = [(linear_instance, "weight", dim)]
+        if getattr(linear_instance, "_block_fp8_bf16_weight", None) is not None:
+            attrs.append((linear_instance, "_block_fp8_bf16_weight", dim))
         for scale_name in ("weight_scale_inv", "weight_scale"):
             scale = getattr(linear_instance, scale_name, None)
-            if scale is not None:
-                if dim == 1 and scale.dtype == torch.int32 and scale.ndim == 2:
-                    # DeepGEMM UE8M0 packs four 128-element K-block scales per
-                    # int32. Checking the padded scale shape alone misses a
-                    # logical K boundary inside one of these packed groups.
-                    if linear_instance.weight.shape[1] % (self.decode_tp_size * 512):
-                        raise ValueError(
-                            "CP decode attn TP: each packed UE8M0 K shard must "
-                            "contain a multiple of 512 weight columns"
-                        )
-                attrs.append((linear_instance, scale_name, dim))
+            if scale is None:
+                continue
+            if dim == 1 and scale.dtype == torch.int32 and scale.ndim == 2:
+                # DeepGEMM UE8M0 packs four 128-element K-block scales per
+                # int32. Checking the padded scale shape alone misses a
+                # logical K boundary inside one of these packed groups.
+                if linear_instance.weight.shape[1] % (self.decode_tp_size * 512):
+                    raise ValueError(
+                        "CP decode attn TP: each packed UE8M0 K shard must "
+                        "contain a multiple of 512 weight columns"
+                    )
+            # Per-output-channel scales are independent of an input-K slice.
+            if dim == 1 and scale.ndim == 1:
+                continue
+            # wo_a block scales can be [groups, N/128, K/128].
+            scale_dim = scale.ndim - 1 if dim == 1 else 0
+            if scale.numel() > 1 and scale.shape[scale_dim] != 1:
+                attrs.append((linear_instance, scale_name, scale_dim))
         return attrs
 
     # ==================== Context manager ====================
