@@ -521,7 +521,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         ):
             raise RuntimeError("the arena must be backed before allocator.resize")
         for band in self.members:
-            if band.allocated_count() or band._pending_reuse:
+            if band.allocated_count() or band._pending_reuse or band._pending_frees:
                 raise RuntimeError(
                     f"cannot resize non-empty band {band.sub_pool_name!r}"
                 )
@@ -805,8 +805,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         """Non-urgent flush of every member, ends before floats; sync-free."""
         with record_function("ChainAllocator.flush_opportunistic"):
             if all(
-                m._free_phys_pages.numel() == 0 and not m._pending_reuse
-                for m in self.members
+                m.free_page_count() == 0 and not m._pending_reuse for m in self.members
             ):
                 return 0
             ends_first = sorted(self.members, key=lambda m: m.grow_direction == "float")
@@ -925,6 +924,11 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         )
         if plan is None:
             return None
+        # Draining preserves the plan's capacity but changes the free lists.
+        # Do it before taking rollback snapshots of those lists.
+        for band in bands:
+            if plan.takes[band.sub_pool_name].pages:
+                band._drain_pending_frees(urgent=True)
         saved = []
         reserved = {}
         for band in bands:

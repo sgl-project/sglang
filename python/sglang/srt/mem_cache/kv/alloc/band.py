@@ -159,7 +159,7 @@ def _float_open_short_side(flt, demand) -> None:
     for band_alloc, pages in demand.items():
         if band_alloc is flt or pages <= 0:
             continue
-        holes = len(band_alloc._free_phys_pages) if band_alloc.lazy_compaction else 0
+        holes = band_alloc.free_page_count() if band_alloc.lazy_compaction else 0
         ext = max(0, pages - holes)
         above = flt.high_peer
         while above is not None and above is not band_alloc:
@@ -279,6 +279,7 @@ class Band:
     watermark_physical: _CapacityField[int] = _CapacityField()
     live_page_count: _CapacityField[int] = _CapacityField()
     _free_phys_pages: _CapacityField[torch.Tensor] = _CapacityField()
+    _pending_free_count: _CapacityField[int] = _CapacityField()
     # The owner's unminted virtual pages (None on a band that binds the owner's).
     free_virtual_ids: _CapacityField[Optional[torch.Tensor]] = _CapacityField()
 
@@ -390,6 +391,10 @@ class Band:
         ] = {}
         # CPU mirror of `_pending_reuse` for O(1) membership in the survivor walk.
         self._pending_reuse_pages_cpu: Set[int] = set()
+        # Ordinary frees keep physical storage until its last forward finishes.
+        # The tensors own the page IDs even after the request row is reused.
+        self._pending_frees: Dict[torch.cuda.Event, List[torch.Tensor]] = {}
+        self._pending_free_count = 0
         # Cumulative observability counters (NOT reset at clear()).
         self._stats_n_free_lazy: int = 0
         self._stats_n_release_batch: int = 0
@@ -528,6 +533,8 @@ class Band:
         self._free_phys_pages = torch.empty(0, dtype=torch.int64, device=self.device)
         self._pending_reuse.clear()
         self._pending_reuse_pages_cpu.clear()
+        self._pending_frees.clear()
+        self._pending_free_count = 0
         self.live_page_count = 0
         self._inflight_forward = None
         self._latest_forward_done_event = None
@@ -598,7 +605,7 @@ class Band:
             # Lazy end: the watermark span contains live + holes + pending
             # (eager has no holes/pending -- span == live by construction).
             holes = int(self._free_phys_pages.numel())
-            pending = len(self._pending_reuse_pages_cpu)
+            pending = len(self._pending_reuse_pages_cpu) + self._pending_free_count
             wm_span = self._allocated_pages()
             if wm_span != self.live_page_count + holes + pending:
                 out.append(
@@ -712,14 +719,15 @@ class Band:
         )
         pages_extend = min(pages_by_bytes, pages_by_index_space)
         # Lazy: drainable holes don't consume new bytes.
-        pages_drain = len(self._free_phys_pages) if self.lazy_compaction else 0
+        pages_drain = self.free_page_count() if self.lazy_compaction else 0
         return (pages_extend + pages_drain) * self.page_size
 
     def available_size(self) -> int:
-        """Tokens allocatable RIGHT NOW (no peer compaction).
+        """Tokens allocatable without peer compaction.
 
         Alloc shortfall gates consult this, so it MUST NOT fold in peer holes; use
-        `schedulable_available_size()` for that. Memoized on the chain epoch.
+        `schedulable_available_size()` for that. Pending frees count here; taking
+        their storage orders reuse after its forward. Memoized on the chain epoch.
         """
         epoch = self._chain_capacity_epoch()
         if self._avail_memo_epoch != epoch:
@@ -729,13 +737,17 @@ class Band:
 
     def _peer_drainable_hole_bytes(self) -> int:
         """Gap bytes an urgent flush of the growth-side chain neighbor would
-        release. Only `_free_phys_pages` counts -- NOT `_pending_reuse`, which
-        awaits an event -- so the credit is realizable.
+        release, including ordinary frees whose forward the urgent flush can
+        wait for. Compaction sources in `_pending_reuse` earn no credit.
         """
         neighbor = self._growth_side_neighbor()
         if not _drains_on_urgent_flush(neighbor):
             return 0
-        return len(neighbor._free_phys_pages) * neighbor.entry_bytes_per_page
+        return neighbor.free_page_count() * neighbor.entry_bytes_per_page
+
+    def free_page_count(self) -> int:
+        """Free pages, including storage still held for an in-flight forward."""
+        return int(self._free_phys_pages.numel()) + self._pending_free_count
 
     def add_pin_source(self, busy: Callable[[], bool]) -> None:
         """Keep this band's pages in place whenever ``busy()`` holds."""
@@ -823,6 +835,7 @@ class Band:
             if not self.lazy_compaction:
                 return self._take_physical_eager(num_pages)
 
+            self._prepare_physical_take(num_pages)
             # Lazy: slice the GPU free list (no D2H).
             n_drain = min(num_pages, int(self._free_phys_pages.shape[0]))
             need_more = num_pages - n_drain
@@ -1025,6 +1038,8 @@ class Band:
             if N == 0:
                 return torch.empty(0, dtype=torch.int64, device=self.device)
 
+            self._prepare_physical_take(N)
+
             # FAST PATH: eager, or lazy with no current holes.
             if not self.lazy_compaction or self._free_phys_pages.numel() == 0:
                 start_wm = self.watermark_physical  # kernel's `start_phys`
@@ -1148,8 +1163,8 @@ class Band:
         the data-dependent dedup is skipped. `free_index` is token-granular and
         need not be page-aligned. EAGER drops one `wait_stream(forward_stream)`
         barrier so the v2p/p2v writes and the compaction move serialize with the
-        in-flight forward; LAZY waits for the latest forward before recycling
-        physical storage and defers compaction to `_flush`.
+        in-flight forward; LAZY holds physical storage until the last forward
+        completes and defers compaction to `_flush`.
         """
         with record_function("Band.free"):
             if free_index is None or free_index.numel() == 0:
@@ -1218,12 +1233,14 @@ class Band:
     def _free_lazy(
         self, free_index: torch.Tensor, pages: Optional[torch.Tensor] = None
     ) -> None:
-        """Lazy free path: disjoint-element scatters plus ONE `torch.cat` onto
-        `_free_phys_pages`; boundary absorption is deferred to `_flush`. Callers
-        must not double-free -- a tombstone (-1) here would join the free list.
+        """Unbind virtual pages, holding their storage for the last forward.
+
+        Callers must not double-free -- a tombstone (-1) would join the free list.
+        Boundary absorption is deferred to `_flush`.
         """
         self._stats_n_free_lazy += 1
         with record_function("Band._free_lazy"):
+            self._drain_pending_frees(urgent=False)
             free_v_pages_raw = free_index.detach().to(torch.int64)
             if pages is not None:
                 # `free_segment` already derived these by stride slicing.
@@ -1233,14 +1250,6 @@ class Band:
                 free_v_pages = free_v_pages_raw
             else:
                 free_v_pages = torch.unique(free_v_pages_raw // self.page_size)
-            # A prepared attention page table can still read the freed storage
-            # after shared metadata reads finish. Order reuse after the whole
-            # forward, before a later allocation can overwrite or zero it.
-            if (
-                self._latest_forward_done_event is not None
-                and torch.device(self.device).type == "cuda"
-            ):
-                torch.cuda.current_stream().wait_event(self._latest_forward_done_event)
             # One kernel for the v2p read and both tombstones. Never the scalar
             # `t[idx] = -1` form: it materialises -1 on the CPU and blocks
             # the scheduler on a pageable H2D copy (~16 ms per 8192-token free).
@@ -1249,8 +1258,38 @@ class Band:
             )
             if self.is_id_owner:
                 self.free_virtual_ids = torch.cat([self.free_virtual_ids, free_v_pages])
-            self._free_phys_pages = torch.cat([self._free_phys_pages, freed_p_pages])
+            event = self._latest_forward_done_event
+            if event is not None and torch.device(self.device).type == "cuda":
+                # Prepared attention tables still name these physical pages
+                # after the shared-metadata barrier lets us unbind virtual IDs.
+                self._pending_frees.setdefault(event, []).append(freed_p_pages)
+                self._pending_free_count += int(freed_p_pages.numel())
+            else:
+                self._free_phys_pages = torch.cat(
+                    [self._free_phys_pages, freed_p_pages]
+                )
             self.live_page_count -= int(freed_p_pages.shape[0])
+
+    def _drain_pending_frees(self, *, urgent: bool) -> None:
+        """Retire completed readers; wait only when allocation needs the pages."""
+        if not self._pending_frees:
+            return
+        ready = []
+        for event, batches in list(self._pending_frees.items()):
+            if not event.query():
+                if not urgent:
+                    continue
+                torch.cuda.current_stream().wait_event(event)
+            ready.extend(batches)
+            del self._pending_frees[event]
+        if ready:
+            self._free_phys_pages = torch.cat([self._free_phys_pages, *ready])
+            self._pending_free_count -= sum(p.numel() for p in ready)
+
+    def _prepare_physical_take(self, num_pages: int) -> None:
+        self._drain_pending_frees(urgent=False)
+        if num_pages > self._free_phys_pages.numel():
+            self._drain_pending_frees(urgent=True)
 
     def _release_phys_pages_batch(self, pages: torch.Tensor) -> None:
         """Cat `pages` onto `_free_phys_pages`. `_flush` calls it only AFTER its
@@ -1469,7 +1508,7 @@ class Band:
         self._stats_last_emit_ts = now
         self._stats_n_emits += 1
         cur_holes = int(self._free_phys_pages.shape[0])
-        cur_pending = len(self._pending_reuse_pages_cpu)
+        cur_pending = len(self._pending_reuse_pages_cpu) + self._pending_free_count
         self._stats_peak_free_list_len = max(self._stats_peak_free_list_len, cur_holes)
         self._stats_peak_pending_pages = max(
             self._stats_peak_pending_pages, cur_pending
@@ -1498,7 +1537,7 @@ class Band:
             return
         try:
             cur_holes = int(self._free_phys_pages.shape[0])
-            cur_pending = len(self._pending_reuse_pages_cpu)
+            cur_pending = len(self._pending_reuse_pages_cpu) + self._pending_free_count
             self._stats_peak_free_list_len = max(
                 self._stats_peak_free_list_len, cur_holes
             )
@@ -1654,6 +1693,11 @@ class Band:
         the batched mapping lookup is a corrupt-state bug and raises.
         """
         if not self.lazy_compaction:
+            return 0
+        self._drain_pending_frees(urgent=urgent)
+        if self._pending_frees:
+            # These tombstoned pages still have readers. Keep the watermark
+            # and compaction walk away from them until their forward finishes.
             return 0
         if self.moves_blocked():
             # Holes stay in the free list; the next flush picks them up. Fired
@@ -1867,7 +1911,7 @@ class Band:
         with record_function("Band.flush_opportunistic"):
             if not self.lazy_compaction:
                 return 0
-            if self._free_phys_pages.numel() == 0 and not self._pending_reuse:
+            if self.free_page_count() == 0 and not self._pending_reuse:
                 return 0
             return self._flush(urgent=False)
 
@@ -2157,7 +2201,7 @@ class FloatBand(Band):
         p = self._side_neighbor(side)
         if not _drains_on_urgent_flush(p):
             return 0
-        return len(p._free_phys_pages) * p.entry_bytes_per_page
+        return p.free_page_count() * p.entry_bytes_per_page
 
     def _peer_drainable_hole_bytes(self) -> int:
         """The better of the two sides. `_growth_side_neighbor()` is undefined

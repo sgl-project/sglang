@@ -122,7 +122,7 @@ def snapshot_band(band: Band) -> BandSnapshot:
         band.min_page_index,
         band.lazy_compaction,
         band.moves_blocked(),
-        band._free_phys_pages.numel(),
+        band.free_page_count(),
         # `allocated_count() // page_size`: lazy ends count live pages apart
         # from the holes and pending pages inside their span.
         band.live_page_count if band.lazy_compaction else span,

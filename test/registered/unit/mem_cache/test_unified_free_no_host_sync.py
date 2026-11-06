@@ -38,6 +38,7 @@ from sglang.srt.environ import InvariantCheckLevel, envs
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.kv.alloc import band as mea
 from sglang.srt.mem_cache.kv.alloc import chain
+from sglang.srt.mem_cache.kv.memory.arena import ArenaBand, KVArena
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
@@ -766,6 +767,197 @@ class TestFreeSwaWindowRatchetNoHostSync(CustomTestCase):
         registry refuses a name it already holds."""
         spec = importlib.util.find_spec(chain.__name__)
         spec.loader.exec_module(importlib.util.module_from_spec(spec))
+
+
+class TestDeferredPhysicalFree(CustomTestCase):
+    class Event:
+        def __init__(self):
+            self.fired = False
+
+        def query(self):
+            return self.fired
+
+    def free_pending(self, alloc, slots, event):
+        alloc.set_latest_forward_done_event(event)
+        # Exercise CUDA's lifecycle with CPU tensors and controlled completion.
+        with (
+            mock.patch.object(alloc, "device", "cuda"),
+            mock.patch.object(
+                torch.cuda, "current_stream", side_effect=AssertionError("free waited")
+            ),
+        ):
+            alloc.free_segment(slots, start_pos=0)
+
+    def test_release_uses_its_own_forward_and_preserves_capacity(self):
+        alloc = _paged_allocator(lazy=True)
+        slots = alloc.alloc(4 * PAGE_SIZE)
+        physical = alloc.ids.virtual_to_physical[
+            slots[::PAGE_SIZE] // PAGE_SIZE
+        ].clone()
+        before = alloc.available_size()
+        first, second = self.Event(), self.Event()
+        self.free_pending(alloc, slots[: 2 * PAGE_SIZE], first)
+        self.free_pending(alloc, slots[2 * PAGE_SIZE :], second)
+        # The caller can overwrite its request row after release.
+        slots.fill_(0)
+        self.assertEqual(alloc.available_size(), before + 4 * PAGE_SIZE)
+        self.assertEqual(alloc._free_phys_pages.numel(), 0)
+        self.assertEqual(alloc._byte_accounting_violations(), [])
+        watermark = alloc.watermark_physical
+        self.assertEqual(alloc._flush(urgent=False), 0)
+        self.assertEqual(alloc.watermark_physical, watermark)
+        first.fired = True
+        # The scheduler publishes this from forward_stream; keep it metadata-only.
+        with mock.patch.object(torch, "cat", side_effect=AssertionError("GPU work")):
+            alloc.set_latest_forward_done_event(second)
+        with mock.patch.object(
+            torch.cuda,
+            "current_stream",
+            side_effect=AssertionError("ready free waited"),
+        ):
+            alloc._drain_pending_frees(urgent=False)
+        self.assertTrue(torch.equal(alloc._free_phys_pages, physical[:2]))
+        self.assertEqual(alloc._pending_free_count, 2)
+        self.assertEqual(set(alloc._pending_frees), {second})
+        self.assertEqual(alloc._byte_accounting_violations(), [])
+        with mock.patch.object(
+            torch.cuda,
+            "current_stream",
+            side_effect=AssertionError("unused pages waited"),
+        ):
+            fresh = alloc.alloc(2 * PAGE_SIZE)
+        self.assertTrue(
+            torch.equal(
+                alloc.ids.virtual_to_physical[fresh[::PAGE_SIZE] // PAGE_SIZE],
+                physical[:2],
+            )
+        )
+        second.fired = True
+        alloc._drain_pending_frees(urgent=False)
+        self.assertTrue(torch.equal(alloc._free_phys_pages, physical[2:]))
+        self.assertEqual(alloc._pending_free_count, 0)
+        self.assertEqual(alloc._byte_accounting_violations(), [])
+
+    def test_allocation_waits_once_for_multiple_frees(self):
+        alloc = _paged_allocator(lazy=True)
+        slots = alloc.alloc(4 * PAGE_SIZE)
+        event = self.Event()
+        self.free_pending(alloc, slots[:PAGE_SIZE], event)
+        self.free_pending(alloc, slots[PAGE_SIZE : 2 * PAGE_SIZE], event)
+        stream = mock.Mock()
+        with mock.patch.object(torch.cuda, "current_stream", return_value=stream):
+            self.assertIsNotNone(alloc.alloc(2 * PAGE_SIZE))
+        stream.wait_event.assert_called_once_with(event)
+        self.assertFalse(alloc._pending_frees)
+        self.assertEqual(alloc._byte_accounting_violations(), [])
+
+    def test_urgent_peer_flush_recovers_pending_capacity(self):
+        _, full, swa, _, _ = build_paged_band_pair(page_size=PAGE_SIZE)
+        full.lazy_compaction = swa.lazy_compaction = True
+        slots = full.alloc(4 * PAGE_SIZE)
+        before = swa.schedulable_available_size()
+        event = self.Event()
+        self.free_pending(full, slots[-2 * PAGE_SIZE :], event)
+        self.assertEqual(swa.schedulable_available_size(), before + 2 * PAGE_SIZE)
+        stream = mock.Mock()
+        with mock.patch.object(torch.cuda, "current_stream", return_value=stream):
+            full.flush_for_allocation()
+        stream.wait_event.assert_called_once_with(event)
+        self.assertFalse(full._pending_frees)
+        self.assertEqual(full._byte_accounting_violations(), [])
+
+    def test_reservation_rollback_keeps_drained_pages(self):
+        _, allocator, _ = build_window_chain(page_size=4)
+        full, swa = allocator.full_attn_allocator, allocator.swa_attn_allocator
+        full.lazy_compaction = swa.lazy_compaction = True
+        slots = allocator.alloc(8)
+        event = self.Event()
+        self.free_pending(swa, slots, event)
+        self.free_pending(full, slots, event)
+        before = allocator.pricing_snapshot()
+        with (
+            mock.patch.object(torch.cuda, "current_stream", return_value=mock.Mock()),
+            mock.patch.object(swa, "take_planned_physical_pages", return_value=None),
+        ):
+            self.assertIsNone(allocator._reserve_token_pages(2, {"swa": 2}))
+        self.assertEqual(allocator.pricing_snapshot(), before)
+        self.assertEqual(allocator.verify_byte_accounting(), [])
+        for band in (full, swa):
+            self.assertFalse(band._pending_frees)
+            self.assertEqual(band._pending_free_count, 0)
+            self.assertEqual(band._free_phys_pages.numel(), 2)
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "requires CUDA streams")
+class TestDeferredPhysicalFreeCUDA(CustomTestCase):
+    def test_last_reader_finishes_before_reuse(self):
+        for allocate_early in (False, True):
+            with self.subTest(allocate_early=allocate_early):
+                arena = KVArena(
+                    bands=[
+                        ArenaBand(
+                            name="kv",
+                            entry_bytes=64,
+                            unit_entries=4,
+                            grow_direction="down",
+                            zero_on_handout=True,
+                        )
+                    ],
+                    total_bytes=4096,
+                    sink_bytes=256,
+                    device="cuda",
+                )
+                alloc = mea.Band(
+                    arena=arena,
+                    sub_pool_name="kv",
+                    device="cuda",
+                    is_id_owner=True,
+                    page_size=4,
+                    lazy_compaction=True,
+                )
+                # Warm both kernels before using a bounded slow reader.
+                slots = alloc.alloc(8)
+                alloc.free_segment(slots, start_pos=0)
+                slots = alloc.alloc(8)
+                physical = alloc.ids.virtual_to_physical[slots[::4] // 4].clone()
+                storage = arena.raw.view(-1, 256)
+                storage[physical] = 37
+                schedule, forward = torch.cuda.Stream(), torch.cuda.Stream()
+                # Warm the reader and schedule-stream allocations as well: CUDA
+                # module loading and first allocations can synchronize streams.
+                with torch.cuda.stream(forward):
+                    torch.cuda._sleep(1)
+                    observed = storage[physical].clone()
+                with torch.cuda.stream(schedule):
+                    alloc.free_segment(slots, start_pos=0)
+                    slots = alloc.alloc(8)
+                    physical = alloc.ids.virtual_to_physical[slots[::4] // 4].clone()
+                    storage[physical] = 37
+                torch.cuda.synchronize()
+                done = torch.cuda.Event()
+                with torch.cuda.stream(forward):
+                    torch.cuda._sleep(500_000_000)
+                    observed = storage[physical].clone()
+                    done.record()
+                alloc.set_latest_forward_done_event(done)
+                with torch.cuda.stream(schedule):
+                    alloc.free_segment(slots, start_pos=0)
+                    schedule.synchronize()
+                    self.assertFalse(done.query(), "free serialized the scheduler")
+                    self.assertEqual(alloc._free_phys_pages.numel(), 0)
+                    if not allocate_early:
+                        # The normal result-consumption boundary already waits.
+                        done.synchronize()
+                        alloc._drain_pending_frees(urgent=False)
+                    fresh = alloc.alloc(8)
+                torch.cuda.synchronize()
+                self.assertTrue(torch.equal(observed, torch.full_like(observed, 37)))
+                reused = alloc.ids.virtual_to_physical[fresh[::4] // 4]
+                self.assertTrue(
+                    torch.equal(reused.sort().values, physical.sort().values)
+                )
+                self.assertEqual(torch.count_nonzero(storage[reused]).item(), 0)
+                self.assertEqual(alloc._byte_accounting_violations(), [])
 
 
 @unittest.skipUnless(
