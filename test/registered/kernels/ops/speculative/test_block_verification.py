@@ -16,7 +16,7 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
 
-register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 register_xpu_ci(est_time=30, suite="stage-b-test-1-gpu-xpu")
 
 if os.environ.get("TRITON_INTERPRET") == "1":
