@@ -9,7 +9,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from sglang.srt.utils.common import kill_process_tree
+from sglang.srt.utils.process import kill_process_tree
 from sglang.test.ci import ci_utils
 from sglang.test.ci.ci_register import register_cpu_ci
 
