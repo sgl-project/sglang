@@ -21,6 +21,7 @@ except Exception:  # noqa: BLE001
     # Triton prunes, so a None placeholder keeps the kernel importable on gfx950.
     libdevice = None
 
+from sglang.kernels.arch import current_arch
 
 def _pdl_supported() -> bool:
     """Check if Programmatic Dependent Launch is supported (NVIDIA SM >= 90)."""
@@ -239,7 +240,7 @@ def fused_qk_gemma_rmsnorm_rope_gate(
         HAS_PASS=rotary_dim < head_dim,
         HAS_GATE=has_gate,
         MROPE=mrope,
-        ENABLE_PDL=_ENABLE_PDL,
+        ENABLE_PDL=current_arch().supports_pdl,
     )
 
     return q_out, k_out, gate_out if has_gate else None

@@ -468,9 +468,39 @@ def get_zmq_socket(
                 restrict_zmq_peers(context, socket)
             socket.bind(endpoint)
         else:
-            socket.connect(endpoint)
+            zmq_connect(socket, endpoint)
 
         return socket
+
+
+def zmq_connect(socket: zmq.Socket, endpoint: str) -> None:
+    """Connect `socket`, pinning TCP connects to `SGLANG_ZMQ_SOURCE_IP`.
+
+    `restrict_zmq_peers` admits peers by source address. On a host with
+    several addresses (e.g. a container on host networking) the kernel may
+    pick a source outside the allowlist, and a rejected PUSH blocks forever.
+    The pin uses libzmq's `tcp://<source_endpoint>;<endpoint>` form, zmq_tcp(7).
+    """
+    socket.connect(_with_source_ip(endpoint))
+
+
+def _with_source_ip(endpoint: str) -> str:
+    from sglang.srt.environ import envs
+
+    source = envs.SGLANG_ZMQ_SOURCE_IP.get()
+    if not source or not endpoint.startswith("tcp://") or ";" in endpoint:
+        return endpoint
+    address = endpoint[len("tcp://") :]
+    host = address.rsplit(":", 1)[0].strip("[]")
+    try:
+        source_ip, host_ip = ipaddress.ip_address(source), ipaddress.ip_address(host)
+    except ValueError:
+        return endpoint
+    # A source of the other family cannot reach the host.
+    if source_ip.version != host_ip.version:
+        return endpoint
+    source_host = f"[{source_ip}]" if source_ip.version == 6 else str(source_ip)
+    return f"tcp://{source_host}:0;{address}"
 
 
 def is_zmq_endpoint_ipv6(endpoint: str) -> bool:

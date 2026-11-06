@@ -66,14 +66,11 @@ from sglang.srt.layers.quantization.utils import (
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils import alias_or_bind_derived_param, copy_or_rebind_param
+from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils.common import (
-    get_device_capability,
-    is_cuda,
-    round_up,
-    set_weight_attrs,
-)
+from sglang.srt.utils.common import round_up
 from sglang.srt.utils.custom_op import register_custom_op
+from sglang.srt.utils.device import get_device_capability, is_cuda
 from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 if TYPE_CHECKING:
@@ -677,6 +674,7 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
                 weight_scale=layer.weight_scale,
                 input_scale=layer.input_scale,
                 bias=bias,
+                pre_quant_output_dtype=layer.orig_dtype,
             )
         return apply_fp8_linear(
             input=x,
@@ -685,6 +683,7 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
             input_scale=layer.input_scale,
             bias=bias,
             cutlass_fp8_supported=self.cutlass_fp8_supported,
+            pre_quant_output_dtype=layer.orig_dtype,
         )
 
 
@@ -2369,7 +2368,12 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
     def __init__(self, quant_config: ModelOptFp4Config):
         self.quant_config = quant_config
         moe_runner_backend = get_moe_runner_backend()
-        if moe_runner_backend.is_auto() and is_cuda():
+        self._lora_marlin = moe_runner_backend.is_lora_marlin()
+        if moe_runner_backend.is_lora() and not self._lora_marlin:
+            raise ValueError(
+                "NVFP4 MoE LoRA requires --moe-runner-backend lora_marlin."
+            )
+        if (moe_runner_backend.is_auto() or moe_runner_backend.is_lora()) and is_cuda():
             capability = get_device_capability()
             use_marlin_fallback = (8, 0) <= capability < (10, 0)
         else:
@@ -2727,6 +2731,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         moe_runner_backend = getattr(
             self, "_moe_runner_backend", get_moe_runner_backend()
         )
+        if moe_runner_backend.is_lora_marlin():
+            moe_runner_backend = MoeRunnerBackend.MARLIN
         use_nvfp4_dispatch = _use_nvfp4_dispatch()
         if moe_runner_backend.is_marlin():
             # Marlin supports only a single shared w1/w3 weight scale, so collapse
@@ -2847,14 +2853,22 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 else (runner_config.gemm1_clamp_limit or runner_config.swiglu_limit)
             )
             if gemm1_clamp_limit is not None:
-                # The kernel clamps both raw halves with one limit, which is
-                # exact for both only when their dequantization scales match.
-                if not torch.equal(layer.g1_alphas, layer.g1_alphas_up):
-                    logger.warning_once(
-                        "NVFP4 MoE gate/up global scales differ; the TRT-LLM SwiGLU "
-                        "clamp limit is exact for the gate half only. "
-                        "Accuracy may be affected."
+                # The kernel clamps both raw halves with one limit, so move both onto
+                # the larger alpha by rescaling the smaller half's E4M3 block scales.
+                untied = layer.g1_alphas != layer.g1_alphas_up
+                if untied.any():
+                    shared_alphas = torch.maximum(layer.g1_alphas, layer.g1_alphas_up)
+                    # Block-scale rows are [up, gate] in the TRT-LLM weight layout.
+                    ratios = torch.stack([layer.g1_alphas_up, layer.g1_alphas], dim=1)
+                    ratios = torch.where(
+                        untied[:, None], ratios / shared_alphas[:, None], 1.0
                     )
+                    block_scales = layer.w13_weight_scale.data.unflatten(1, (2, -1))
+                    block_scales.copy_(
+                        block_scales.float().mul_(ratios[:, :, None, None])
+                    )
+                    copy_or_rebind_param(layer, "g1_alphas", shared_alphas)
+                    copy_or_rebind_param(layer, "g1_alphas_up", shared_alphas)
                 copy_or_rebind_param(
                     layer,
                     "gemm1_clamp_limit",
@@ -3114,6 +3128,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             self.runner = None
             return
 
+        if moe_runner_backend.is_lora():
+            self.runner = None
+            return
+
         if moe_runner_backend.is_flashinfer_cutedsl():
             import sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl  # noqa: F401 – triggers @register_fused_func
 
@@ -3188,6 +3206,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             and (
                 moe_runner_backend.is_flashinfer_trtllm()
                 or moe_runner_backend.is_flashinfer_megamoe()
+                or self._is_cutedsl_v2_standard
             )
         ), f"{activation=} is unsupported by {moe_runner_backend}"
 

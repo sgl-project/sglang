@@ -1,5 +1,7 @@
 """MXFP8 epilogues stay bitwise identical to FlashInfer's standalone quantizer."""
 
+import os
+import subprocess
 import sys
 
 import flashinfer
@@ -27,7 +29,8 @@ STREAMS = 4
 
 # 9-128 pins the single-tile scale-swizzle bound hc_combine_norm_mxfp8 was
 # widened to; 128 is the last row the swizzle addresses without a block offset.
-@pytest.mark.parametrize("m", [1, 2, 5, 6, 8, 9, 17, 33, 96, 127, 128])
+# 8/9 and 48/49 straddle the changes of the row's grid split.
+@pytest.mark.parametrize("m", [1, 2, 5, 6, 8, 9, 17, 33, 48, 49, 96, 127, 128])
 @pytest.mark.parametrize("scale", [1e-3, 1.0, 1e3])
 @pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
 def test_bitwise_identical_to_norm_then_quantize(m: int, scale: float, backend: str):
@@ -60,6 +63,44 @@ def test_bitwise_identical_to_norm_then_quantize(m: int, scale: float, backend: 
     )
     assert sf.shape == sf_ref.reshape(-1).shape
     assert torch.equal(sf, sf_ref.reshape(-1))
+
+
+_PADDING_REPLAY = """
+import torch
+from sglang.kernels.ops.layernorm import hc_combine_norm as mod
+
+alloc = mod._alloc
+
+
+def poisoned_alloc(m, k, device):
+    q, s = alloc(m, k, device)
+    return q, s.fill_(0xFF)
+
+
+mod._alloc = poisoned_alloc
+for m in (1, 49, 127):
+    g = torch.Generator().manual_seed(m)
+    x = torch.randn((m, 4 * 5120), dtype=torch.bfloat16, generator=g)
+    pre = torch.randn((m, 4), dtype=torch.bfloat16, generator=g)
+    w = torch.randn((5120,), dtype=torch.bfloat16, generator=g)
+    for parts in (1, 2, 4):
+        mod._parts_for = lambda m, k, p=parts: p
+        sf = mod.hc_combine_norm_mxfp8(x, pre, w, 1e-6)[2]
+        # A live scale byte is never 0xFF and, for these inputs, never 0.
+        assert not (sf == 0xFF).any(), f"m={m} parts={parts}: scale bytes unwritten"
+        live = int(sf.count_nonzero())
+        assert live == m * 160, f"m={m} parts={parts}: {m * 160 - live} live bytes zeroed"
+"""
+
+
+def test_combine_norm_mxfp8_padding_disjoint_from_live_rows():
+    replay = subprocess.run(
+        [sys.executable, "-c", _PADDING_REPLAY],
+        env={**os.environ, "TRITON_INTERPRET": "1"},
+        capture_output=True,
+        text=True,
+    )
+    assert replay.returncode == 0, replay.stderr[-3000:]
 
 
 def check(x, w, got):

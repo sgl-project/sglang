@@ -15,7 +15,6 @@
 """Inference-only Qwen3.5 model and Qwen3.5 MoE model compatible with HuggingFace weights."""
 
 import logging
-import os
 from functools import lru_cache
 from typing import Iterable, Optional, Set, Tuple, Union
 
@@ -49,6 +48,7 @@ from sglang.srt.distributed import get_pp_indices
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.hf_transformers import get_processor, get_rope_config
 from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
@@ -103,6 +103,8 @@ from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils.common import add_prefix, set_weight_attrs
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -127,6 +129,7 @@ from sglang.srt.models.utils import (
     WeightsMapper,
     fused_qk_gemma_rmsnorm,
     fused_qk_gemma_rmsnorm_with_gate,
+    maybe_enable_silu_fp4_quant_fusion,
 )
 from sglang.srt.runtime_context import (
     get_exec,
@@ -141,7 +144,6 @@ from sglang.srt.runtime_context import (
 # Utils
 from sglang.srt.utils import (
     LazyValue,
-    add_prefix,
     cpu_has_amx_support,
     get_bool_env_var,
     is_cpu,
@@ -150,11 +152,8 @@ from sglang.srt.utils import (
     is_hip,
     is_npu,
     is_xpu,
-    make_pp_layers,
-    set_weight_attrs,
     use_intel_amx_backend,
 )
-from sglang.srt.utils.hf_transformers_utils import get_processor, get_rope_config
 
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
@@ -184,18 +183,23 @@ _qknorm_use_alt_stream = _is_cuda or (
 _gdn_decode_fused_proj_conv = (
     _is_cuda and envs.SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV.get()
 )
+_gdn_online_mxfp4 = (
+    ("in_proj_qkvz", "out_proj")
+    if envs.SGLANG_ROCM_GDN_ONLINE_MXFP4.get() and _use_aiter and _is_gfx95
+    else ()
+)
 _is_amx_available = cpu_has_amx_support()
 _is_xpu = is_xpu()
 
 # Head-group ratios (num_v_heads // num_k_heads) served by the fused
 # split/reshape/cat Triton kernel. On AMD/aiter the ratio-8 layout is also
 # covered by the fused kernel, which removes the two `.contiguous()` copies
-# plus the `torch.cat` of the unfused fallback. On CUDA the ratio-3 dense 27B
-# layout is handled by the Triton kernel's per-head walk (the CPU fused op
+# plus the `torch.cat` of the unfused fallback. On CUDA and AMD/aiter, ratio-3
+# layouts are handled by the Triton kernel's per-head walk (the CPU fused op
 # still requires a power-of-two group). Other backends keep the original
 # tuple so their control flow is unchanged.
 _GDN_FUSED_QKVZBA_RATIOS = (
-    (1, 2, 4, 8) if _use_aiter else (1, 2, 3, 4) if _is_cuda else (1, 2, 4)
+    (1, 2, 3, 4, 8) if _use_aiter else (1, 2, 3, 4) if _is_cuda else (1, 2, 4)
 )
 
 cached_get_processor = lru_cache(get_processor)
@@ -208,33 +212,6 @@ def _disable_shared_experts_fusion() -> bool:
     # The deferred-finalize ABI needs the shared expert as a separate, gated
     # local contribution; it cannot consume a shared slot fused into routed MoE.
     return bool(uses_cutedsl_ar_fusion() or is_shared_experts_fusion_disabled())
-
-
-def _maybe_enable_silu_fp4_quant_fusion(mlp: nn.Module) -> None:
-    """Fuse SiLU+mul with the down_proj NVFP4 input quantization.
-
-    Replaces the separate act_and_mul and per-token FP4 quantize kernels with
-    one FlashInfer kernel and feeds down_proj a prequantized (fp4, scale)
-    tuple. Enabled when both dense-MLP projections use the NVFP4 (W4A4)
-    linear method; kill switch: SGLANG_DISABLE_SILU_FP4_QUANT_FUSION=1.
-    """
-    if os.environ.get("SGLANG_DISABLE_SILU_FP4_QUANT_FUSION", "0") == "1":
-        return
-    from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4LinearMethod
-
-    if not (
-        isinstance(mlp.gate_up_proj.quant_method, ModelOptFp4LinearMethod)
-        and mlp.gate_up_proj.quant_method.quant_mode == "w4a4"
-        and isinstance(mlp.down_proj.quant_method, ModelOptFp4LinearMethod)
-    ):
-        return
-    try:
-        from flashinfer import silu_and_mul_scaled_nvfp4_experts_quantize  # noqa: F401
-    except ImportError:
-        return
-    mlp._enable_silu_fp4_quant_fusion = True
-    mlp.down_proj._accepts_prequantized_fp4 = True
-    logger.info("Enabled fused SiLU+mul+FP4-quant for dense MLP down_proj input.")
 
 
 def _use_mnnvl_cutedsl_fusion(config: Qwen3_5TextConfig, is_nextn: bool) -> bool:
@@ -332,7 +309,7 @@ def _linear_accepts_fp8_tuple(linear: nn.Module) -> bool:
 
 
 def _fp8_tuple_input(linear: nn.Module, num_tokens: int) -> bool:
-    """Whether the producer hands ``linear`` a per-token FP8 (q, scale) pair (SGLANG_ROCM_SMALLM_FP8_PROJ)."""
+    """Whether the producer hands ``linear`` a per-token FP8 (q, scale) pair for the gfx950 small-M FP8 GEMM."""
     scheme = getattr(linear, "scheme", None)
     return (
         _use_aiter
@@ -363,6 +340,9 @@ def _select_fused_ar_input_for_linear(hidden_states, linear: nn.Module):
 
 
 if _is_npu:
+    from sgl_kernel_npu.norm.split_qkv_rmsnorm_mrope import (
+        triton_split_qkv_rmsnorm_mrope,
+    )
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import (
         split_qkvgate_gemma_rmsnorm_rope,
     )
@@ -540,6 +520,22 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             parallel_group=parallel_group,
             prefix=add_prefix("out_proj", prefix),
         )
+
+        if _gdn_online_mxfp4 and config.model_type in _QWEN3_5_ROCM_PACKED_MODEL_TYPES:
+            from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4 import (
+                AiterMxfp4OnlineLinearMethod,
+            )
+
+            # The loader quantizes these in process_weights_after_loading.
+            # gemm_a4w4 needs N, K % 256 == 0; other shapes stay BF16.
+            for name in _gdn_online_mxfp4:
+                proj = getattr(self, name)
+                if (
+                    isinstance(proj.quant_method, UnquantizedLinearMethod)
+                    and proj.weight.dtype == torch.bfloat16
+                    and all(d % 256 == 0 for d in proj.weight.shape)
+                ):
+                    proj.quant_method = AiterMxfp4OnlineLinearMethod()
 
     @staticmethod
     def _override_weight_loader(param, loader):
@@ -1183,7 +1179,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 # The stage boundary completes this stage's sum.
                 reduce_results=False,
             )
-            _maybe_enable_silu_fp4_quant_fusion(self.mlp)
+            maybe_enable_silu_fp4_quant_fusion(self.mlp)
         else:
             raise ValueError(f"Invalid model type: {config.model_type}")
 
@@ -1566,6 +1562,31 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         q, k = self.rotary_emb(positions, q, k)
         return q, k, v, gate
 
+    def forward_prepare_npu_prefill(self, positions, hidden_states):
+        rotary_emb = self.rotary_emb
+        if not getattr(rotary_emb, "mrope_section", None):
+            return self.forward_prepare_native(positions, hidden_states)
+
+        qkv, _ = self.qkv_proj(hidden_states)
+        if positions.ndim == 1:
+            positions = positions.expand(3, -1)
+        cos_sin = rotary_emb.cos_sin_cache[positions].to(qkv)
+        q, k, v, gate = triton_split_qkv_rmsnorm_mrope(
+            qkv=qkv,
+            q_weight=self.q_norm.gemma_weight,
+            k_weight=self.k_norm.gemma_weight,
+            cos_sin=cos_sin,
+            num_q_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            head_size=self.head_dim,
+            eps=self.q_norm.variance_epsilon,
+            mrope_section=rotary_emb.mrope_section,
+            is_interleaved=rotary_emb.mrope_interleaved,
+            rope_dim=rotary_emb.rotary_dim,
+            has_gate=self.attn_output_gate,
+        )
+        return q, k, v, gate if self.attn_output_gate else None
+
     def forward_prepare_npu(self, positions, hidden_states, forward_batch):
         qkv, _ = self.qkv_proj(hidden_states)
         if self.refreshes_rope_cos_sin:
@@ -1613,11 +1634,9 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 positions=positions,
                 hidden_states=hidden_states,
             )
-        if (
-            not _is_npu
-            or forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
-            or not self.attn_output_gate
-        ):
+        if _is_npu and forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
+            return self.forward_prepare_npu_prefill(positions, hidden_states)
+        if not _is_npu or not self.attn_output_gate:
             return self.forward_prepare_native(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -1889,13 +1908,24 @@ class Qwen3_5ForCausalLM(nn.Module):
     def prepare_before_cuda_graph_capture(self, model_runner) -> None:
         if _use_aiter and self.config.model_type in _QWEN3_5_ROCM_PACKED_MODEL_TYPES:
             packed = 0
+            mxfp4 = 0
             for module in self.modules():
                 if isinstance(module, Qwen3_5GatedDeltaNet):
+                    mxfp4 += sum(
+                        hasattr(getattr(module, name, None), "mxfp4_preshuffle_tuned")
+                        for name in _gdn_online_mxfp4
+                    )
                     module.finalize_fused_in_proj()
                     packed += int(module._fused_in_proj_weight is not None)
             logger.info(
                 "Packed BF16/FP8 GDN input projection enabled for %d layers", packed
             )
+            if _gdn_online_mxfp4:
+                logger.info(
+                    "Online MXFP4 GDN %s: %d projections",
+                    ",".join(_gdn_online_mxfp4),
+                    mxfp4,
+                )
 
     def set_dflash_layers_to_capture(self, layers_to_capture: list[int]):
         self.layers_to_capture = layers_to_capture
