@@ -15,6 +15,9 @@ from sglang_simulator.hook import (
 )
 from sglang_simulator.hook.utils import get_obj_from_args
 from sglang_simulator.simulation.manager import ConfigManager, Envs, StateManager
+from sglang_simulator.simulation.sglang.prepared_batch import (
+    predictor_batch_from_result,
+)
 from sglang_simulator.simulation.sglang.req_stats_manager import request_stats_manager
 from sglang_simulator.simulation.sglang.utils import (
     resolve_model_info,
@@ -538,7 +541,9 @@ class C_SchedulerHook(BaseHook):
                     False,
                 )
                 if prepared_batch:
-                    simulation_batch = build_predictor_batch(batch)
+                    simulation_batch = predictor_batch_from_result(
+                        ret, expected_batch_size=len(batch.reqs)
+                    )
                 else:
                     simulation_batch = SimulationScheduleBatch(reqs=[])
                     if batch.forward_mode.is_extend():

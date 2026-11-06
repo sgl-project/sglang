@@ -6,6 +6,10 @@ from types import SimpleNamespace
 import pytest
 from sglang_simulator.simulation.manager.state import StateManager
 from sglang_simulator.simulation.sglang import scheduler
+from sglang_simulator.simulation.sglang.prepared_batch import (
+    SNAPSHOT_ATTRIBUTE,
+    capture_prepared_batch,
+)
 from sglang_simulator.simulation.types import SimulationMode
 from sglang_simulator.time_predictor.base import ScheduleBatch, ScheduleRequest
 
@@ -52,7 +56,17 @@ def hooked_scheduler(monkeypatch):
 
         def run_batch(self, batch):
             advance(0.2)
-            return type("GenerationBatchResult", (), {})()
+            result = type("GenerationBatchResult", (), {})()
+            result.logits_output = SimpleNamespace()
+            if predictor.requires_prepared_batch:
+                setattr(
+                    result.logits_output,
+                    SNAPSHOT_ATTRIBUTE,
+                    capture_prepared_batch(batch.prepared_forward),
+                )
+            if getattr(self, "after_forward", None) is not None:
+                self.after_forward(batch, result)
+            return result
 
         def process_batch_result(self, batch):
             advance(0.01)
@@ -114,6 +128,13 @@ def make_batch(rid="request"):
         ],
         extend_lens=[8],
         prefix_lens=[0],
+        prepared_forward=SimpleNamespace(
+            forward_mode=SimpleNamespace(name="EXTEND"),
+            batch_size=1,
+            seq_lens_cpu=[8],
+            extend_seq_lens_cpu=[8],
+            extend_prefix_lens_cpu=[0],
+        ),
     )
 
 
@@ -127,6 +148,41 @@ def test_prepared_metadata_is_opt_in(hooked_scheduler):
     test.target.run_batch(batch)
     assert test.predictor.last_batch.request_info() == [[8, 0]]
     assert test.predictor.last_batch.forward_mode == "EXTEND"
+
+
+def test_prepared_prediction_uses_before_work_snapshot_after_native_mutation(
+    hooked_scheduler,
+):
+    test = hooked_scheduler
+    test.predictor.requires_prepared_batch = True
+    batch = make_batch()
+
+    def mutate_after_forward(native, result):
+        native.prefix_lens[:] = [900]
+        native.extend_lens[:] = [2]
+        native.prepared_forward.seq_lens_cpu[:] = [902]
+        native.prepared_forward.extend_prefix_lens_cpu[:] = [900]
+        native.prepared_forward.extend_seq_lens_cpu[:] = [2]
+
+    test.target.after_forward = mutate_after_forward
+    test.target.run_batch(batch)
+    assert test.predictor.last_batch.request_info() == [[8, 0]]
+
+
+def test_missing_prepared_snapshot_refuses_cost_before_clock_commit(hooked_scheduler):
+    test = hooked_scheduler
+    test.predictor.requires_prepared_batch = True
+    batch = make_batch()
+
+    def remove_snapshot(native, result):
+        delattr(result.logits_output, SNAPSHOT_ATTRIBUTE)
+
+    test.target.after_forward = remove_snapshot
+    before = StateManager.get_global_clock()
+    with pytest.raises(scheduler.PredictorError, match="prepared snapshot"):
+        test.target.run_batch(batch)
+    assert StateManager.get_global_clock() == before
+    assert not hasattr(test.predictor, "last_batch")
 
 
 def test_legacy_negative_prediction_remains_supported(hooked_scheduler):
