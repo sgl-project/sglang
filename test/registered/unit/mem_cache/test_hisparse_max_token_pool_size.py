@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.disaggregation.decode import DecodePreallocQueue
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
@@ -119,23 +120,63 @@ def _make_tp_worker(*, enable_hisparse: bool, device_capacity: int, host_capacit
 
 
 class TestTpModelWorkerWorkerInfo(CustomTestCase):
-    def test_hisparse_worker_info_uses_host_backed_pool(self):
-        worker = _make_tp_worker(
-            enable_hisparse=True, device_capacity=1024, host_capacity=4096
-        )
+    @staticmethod
+    def _get_worker_info(worker, disaggregation_mode):
         schedule = SimpleNamespace(max_prefill_tokens=16384, max_queued_requests=128)
-
         with (
             patch("sglang.srt.managers.tp_worker.get_schedule", return_value=schedule),
             patch(
                 "sglang.srt.managers.tp_worker.is_cp_sharded_padded",
                 return_value=False,
             ),
+            patch(
+                "sglang.srt.managers.tp_worker.get_disagg",
+                return_value=SimpleNamespace(disaggregation_mode=disaggregation_mode),
+                create=True,
+            ),
         ):
-            worker_info = worker.get_worker_info()
+            return worker.get_worker_info()
 
-        self.assertEqual(worker_info[4], 4095)
-        self.assertEqual(worker_info[5], 4090)
+    def test_pd_hisparse_worker_info_uses_host_backed_pool(self):
+        worker = _make_tp_worker(
+            enable_hisparse=True, device_capacity=1024, host_capacity=4096
+        )
+
+        for mode in ("decode", DisaggregationMode.DECODE):
+            with self.subTest(mode=mode):
+                worker_info = self._get_worker_info(worker, mode)
+                self.assertEqual(worker_info[4], 4095)
+                self.assertEqual(worker_info[5], 4090)
+
+    def test_non_hisparse_decode_worker_info_stays_device_limited(self):
+        worker = _make_tp_worker(
+            enable_hisparse=False, device_capacity=1024, host_capacity=4096
+        )
+
+        worker_info = self._get_worker_info(worker, DisaggregationMode.DECODE)
+
+        self.assertEqual(worker_info[4], 1023)
+        self.assertEqual(worker_info[5], 1018)
+
+    def test_hisparse_prefill_worker_info_stays_device_limited(self):
+        worker = _make_tp_worker(
+            enable_hisparse=True, device_capacity=1024, host_capacity=4096
+        )
+
+        worker_info = self._get_worker_info(worker, DisaggregationMode.PREFILL)
+
+        self.assertEqual(worker_info[4], 1023)
+        self.assertEqual(worker_info[5], 1018)
+
+    def test_aggregated_hisparse_worker_info_stays_device_limited(self):
+        worker = _make_tp_worker(
+            enable_hisparse=True, device_capacity=1024, host_capacity=4096
+        )
+
+        worker_info = self._get_worker_info(worker, DisaggregationMode.NULL)
+
+        self.assertEqual(worker_info[4], 1023)
+        self.assertEqual(worker_info[5], 1018)
 
 
 def _make_prealloc_queue(

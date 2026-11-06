@@ -2882,10 +2882,18 @@ class Scheduler(
                 self.max_req_len - input_len - 1,
             ),
         )
+        # HiSparse decode budgets generation against the host-backed logical
+        # pool. Other modes keep the device limit used by prefill allocation.
+        base_token_capacity = (
+            self.tp_worker.model_runner.max_token_pool_size
+            if getattr(self, "enable_hisparse", False)
+            and self.disaggregation_mode == DisaggregationMode.DECODE
+            else self.max_total_num_tokens
+        )
         # PrefillAdder reserves one page per shard; the allocator reserves one.
         # Subtract the other N - 1 pages to keep queue admission schedulable.
         token_capacity = (
-            self.max_total_num_tokens * self.kv_shard_widening
+            base_token_capacity * self.kv_shard_widening
             - self.page_size * (self.kv_shard_widening - 1)
         )
         if is_cp_sharded_padded():

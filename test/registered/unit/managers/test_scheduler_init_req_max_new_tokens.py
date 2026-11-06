@@ -1,11 +1,15 @@
 import logging
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.managers.utils import validate_input_length
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -197,6 +201,66 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
             req = self._new_req(max_new_tokens=64, min_new_tokens=32)
             self.assertEqual(self._init_and_check(scheduler, req), 16)
             self.assertEqual(req.sampling_params.min_new_tokens, 16)
+
+    def test_pd_hisparse_worker_info_preserves_long_request_generation(self):
+        worker = object.__new__(TpModelWorker)
+        worker.model_config = SimpleNamespace(context_len=1_000_000)
+        worker.dllm_algorithm = None
+        worker.random_seed = 0
+        worker.device = "cpu"
+        worker._model_runner = SimpleNamespace(
+            enable_hisparse=True,
+            effective_logical_max_total_num_tokens=1024,
+            max_token_pool_size=4096,
+            logical_max_total_num_tokens=1024,
+            max_running_requests=8,
+            forward_stream=None,
+            req_to_token_pool=SimpleNamespace(size=8, max_context_len=1_000_000),
+            token_to_kv_pool=SimpleNamespace(size=1024),
+            token_to_kv_pool_allocator=SimpleNamespace(),
+        )
+        schedule = SimpleNamespace(max_prefill_tokens=16384, max_queued_requests=128)
+        with (
+            patch("sglang.srt.managers.tp_worker.get_schedule", return_value=schedule),
+            patch(
+                "sglang.srt.managers.tp_worker.is_cp_sharded_padded",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.managers.tp_worker.get_disagg",
+                return_value=SimpleNamespace(
+                    disaggregation_mode=DisaggregationMode.DECODE
+                ),
+                create=True,
+            ),
+        ):
+            worker_info = worker.get_worker_info()
+
+        scheduler = self._new_scheduler(
+            max_req_len=worker_info[4], max_total_num_tokens=worker_info[0]
+        )
+        scheduler.enable_hisparse = True
+        scheduler.disaggregation_mode = DisaggregationMode.DECODE
+        scheduler.tp_worker = worker
+        req = self._new_req(max_new_tokens=10, input_len=2048)
+
+        scheduler.init_req_max_new_tokens(req)
+
+        self.assertIsNone(validate_input_length(req, worker_info[5], False))
+        self.assertEqual(req.sampling_params.max_new_tokens, 10)
+
+    def test_aggregated_hisparse_budget_stays_device_limited(self):
+        scheduler = self._new_scheduler(max_req_len=1023, max_total_num_tokens=1024)
+        scheduler.enable_hisparse = True
+        scheduler.disaggregation_mode = DisaggregationMode.NULL
+        scheduler.tp_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(max_token_pool_size=4096)
+        )
+        req = self._new_req(max_new_tokens=10, input_len=2048)
+
+        scheduler.init_req_max_new_tokens(req)
+
+        self.assertEqual(req.sampling_params.max_new_tokens, 0)
 
     def test_unified_budget_rounds_prompt_and_decode_together(self):
         bundle = build_test_unified_pools(

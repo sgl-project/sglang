@@ -24,6 +24,7 @@ import torch
 from sglang.srt.beam_search.logits_capture import capture_pre_sample_logits
 from sglang.srt.configs.draft_parallel import DraftParallelLayout
 from sglang.srt.configs.load_config import _DEFAULT_LOAD_GROUP, LoadGroup
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import is_cp_sharded_padded
 from sglang.srt.layers.cp.utils import from_cp_sharded
@@ -51,6 +52,7 @@ from sglang.srt.model_executor.graph_memory_usage import (
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.runtime_context import (
     get_device,
+    get_disagg,
     get_exec,
     get_model,
     get_parallel,
@@ -547,11 +549,17 @@ class TpModelWorker(BaseTpWorker):
         self.model_runner.hisparse_coordinator = coordinator
 
     def get_worker_info(self):
-        # The runner already reports logical DCP capacity; HiSparse admits up to
-        # its host-backed logical pool instead of the device-only pool.
+        # HiSparse is a decode-side optimization: its host-backed logical pool
+        # bounds requests only on the decode instance. Other modes keep the
+        # device limit because their prefill allocation is device-resident.
+        use_host_backed_pool = (
+            getattr(self.model_runner, "enable_hisparse", False)
+            and DisaggregationMode(get_disagg().disaggregation_mode)
+            == DisaggregationMode.DECODE
+        )
         kv_capacity = (
             self.model_runner.max_token_pool_size
-            if getattr(self.model_runner, "enable_hisparse", False)
+            if use_host_backed_pool
             else self.model_runner.effective_logical_max_total_num_tokens
         ) * page_interleave_shard_size(self.model_runner.token_to_kv_pool_allocator)
         if is_cp_sharded_padded():
