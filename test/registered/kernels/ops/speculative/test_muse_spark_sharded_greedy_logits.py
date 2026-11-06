@@ -13,7 +13,7 @@ from sglang.kernels.ops.sampling.softcap_row_argmax import (
     softcap_row_argmax,
 )
 from sglang.kernels.ops.speculative.dspark.simulated_bonus import (
-    simulated_bonus_sample,
+    simulated_bonus_sample_graph,
 )
 from sglang.test.ci.ci_register import register_amd_ci
 
@@ -115,10 +115,11 @@ def test_simulated_bonus_on_gathered_rows():
     rows = torch.randn(bs, vocab, device="cuda")
     winner = torch.randint(0, vocab, (bs,), device="cuda")
     rows[torch.arange(bs, device="cuda"), winner] += 100.0
-    bonus = simulated_bonus_sample(
+    bonus = simulated_bonus_sample_graph(
         target_logits=rows,
         correct_len=torch.zeros(bs, dtype=torch.int64, device="cuda"),
         temperatures=torch.full((bs,), 1e-5, device="cuda"),
+        seed=torch.full((1,), 3, dtype=torch.int32, device="cuda"),
         bs=bs,
         rows_per_request=1,
     )

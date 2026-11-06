@@ -502,7 +502,7 @@ def _is_pow2(v: int) -> bool:
 
 
 @register_custom_op(
-    op_name="fused_muse_spark_routing",
+    op_name="rocm_muse_spark_routing",
     mutates_args=["topk_weights", "topk_ids"],
 )
 def fused_muse_spark_routing_op(
@@ -523,7 +523,7 @@ def fused_muse_spark_routing_op(
 ) -> None:
     """Custom op wrapper for the fused MuseSpark routing Triton kernel.
 
-    Registered as torch.ops.sglang.fused_muse_spark_routing so that torch.compile
+    Registered as torch.ops.sglang.rocm_muse_spark_routing so that torch.compile
     treats it as an opaque node (no tracing into Triton kernel launches).
 
     ``num_valid_tokens`` is an optional device int32 scalar (e.g.
@@ -602,7 +602,7 @@ def fused_muse_spark_routing_op(
 
 
 @register_custom_op(
-    op_name="fused_muse_spark_routing_hip",
+    op_name="rocm_muse_spark_routing_hip",
     mutates_args=["topk_weights", "topk_ids"],
 )
 def fused_muse_spark_routing_hip_op(
@@ -666,7 +666,7 @@ def fused_muse_spark_routing(
     Fused MuseSpark routing function using a single Triton kernel.
 
     Pre-allocates output buffers and dispatches to the registered custom op
-    (torch.ops.sglang.fused_muse_spark_routing) for piecewise CUDA graph
+    (torch.ops.sglang.rocm_muse_spark_routing) for piecewise CUDA graph
     compatibility.
 
     Args:
@@ -743,7 +743,6 @@ def fused_muse_spark_routing(
         bias,
         topk_weights_view,
         topk_ids_view,
-        None,
         topk,
         route_scale,
         multiplier_val,
