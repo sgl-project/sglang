@@ -29,15 +29,23 @@ import orjson
 import psutil
 
 from sglang.srt.disaggregation.kv_events import select_kv_publisher_dp_rank
+from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import GenerateReqInput, ShutdownReq
 from sglang.srt.managers.utils import (
     MsgpackDecodeError,
     msgpack_decode_explained,
 )
 from sglang.srt.multimodal.cache.identity import build_processor_fingerprint
+from sglang.srt.observability.request_dump import (
+    CRASH_DUMP_GRACE_SECS,
+    crash_dump_hostname,
+    dumping,
+    write_crash_dump,
+)
 from sglang.srt.observability.startup_time import build_engine_startup_time
 from sglang.srt.runtime_context import (
     get_context,
+    get_device,
     get_exec,
     get_mm,
     get_observability,
@@ -58,14 +66,6 @@ from sglang.srt.rust_server.multimodal import (
     settle_shm_buffers,
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
-from sglang.srt.utils.common import get_bool_env_var
-from sglang.srt.utils.crash_dump import (
-    CRASH_DUMP_GRACE_SECS,
-    crash_dump_hostname,
-    dumping,
-    write_crash_dump,
-)
 from sglang.srt.utils.flatten import (
     FlatPairColumns,
     NestedRowColumns,
@@ -134,6 +134,55 @@ def claim_sigterm_before_compiles() -> None:
         os.kill(os.getpid(), signum)
 
     signal.signal(signal.SIGTERM, terminate)
+
+
+def _is_plain_dp() -> bool:
+    """DP over replicas, each its own TP group, rather than attention DP."""
+    parallel = get_parallel()
+    return not parallel.attn_dp_enabled and parallel.dp_size > 1
+
+
+def listener_port_offset(tp_rank: int, dp_rank: Optional[int]) -> int:
+    """The offset from ``--port`` of the listener that global TP rank
+    ``tp_rank`` (of replica ``dp_rank`` under plain DP) hosts: a node's
+    listeners bind consecutive ports, one per DP group led there."""
+    if _is_plain_dp():
+        # One TP group per replica, every leader on the same node.
+        return dp_rank
+    parallel = get_parallel()
+    if get_exec().moe.is_ep_scale_joiner:
+        # The joining TP group is entirely local to this node.
+        tp_size_per_node = parallel.tp_size
+    else:
+        nnodes_per_pp_rank = max(parallel.nnodes // parallel.pp_size, 1)
+        tp_size_per_node = parallel.tp_size // nnodes_per_pp_rank
+    dp_group_width = parallel.attn_tp_size * parallel.attn_cp_size
+    return (tp_rank % tp_size_per_node) // dp_group_width
+
+
+def node_listener_ports() -> List[int]:
+    """The ports this node's Rust listeners bind, ascending, assuming Rust
+    mode: one per DP group led on this node, none on a node that leads none.
+    Callable from the launching process, before any scheduler starts."""
+    from sglang.srt.entrypoints.engine import (
+        _calculate_rank_ranges,
+        _rank_hosts_rust_listener,
+    )
+
+    parallel = get_parallel()
+    pp_rank_range, tp_rank_range, _, _ = _calculate_rank_ranges(parallel.node_rank)
+    if 0 not in pp_rank_range:
+        return []
+    if get_exec().moe.is_ep_scale_joiner:
+        # Scale joiners launch their full TP group on this node.
+        tp_rank_range = range(parallel.tp_size)
+    dp_ranks = range(parallel.dp_size) if _is_plain_dp() else [None]
+    return sorted(
+        get_serving().port + listener_port_offset(tp_rank, dp_rank)
+        for tp_rank in tp_rank_range
+        if _rank_hosts_rust_listener(0, tp_rank)
+        for dp_rank in dp_ranks
+    )
 
 
 class RustServer:
@@ -277,17 +326,8 @@ class RustServer:
     @classmethod
     def _port_offset(cls) -> int:
         """This listener's offset from the base port based on per-node DP rank."""
-        if get_exec().moe.is_ep_scale_joiner:
-            # The joining TP group is entirely local to this node.
-            tp_size_per_node = get_parallel().tp_size
-        else:
-            nnodes_per_pp_rank = max(get_parallel().nnodes // get_parallel().pp_size, 1)
-            tp_size_per_node = get_parallel().tp_size // nnodes_per_pp_rank
-        dp_group_width = get_parallel().attn_tp_size * get_parallel().attn_cp_size
-        if not get_parallel().attn_dp_enabled and get_parallel().dp_size > 1:
-            # Plain DP: one TP group per replica, every leader on this node.
-            return get_parallel().dp_rank
-        return (get_parallel().tp_rank % tp_size_per_node) // dp_group_width
+        dp_rank = get_parallel().dp_rank if _is_plain_dp() else None
+        return listener_port_offset(get_parallel().tp_rank, dp_rank)
 
     @classmethod
     def _advertised_host(cls) -> str:
@@ -297,7 +337,17 @@ class RustServer:
         host = get_serving().host
         if host in ("", "0.0.0.0", "::"):
             # An unspecified bind address is not reachable from another node.
-            host = get_local_ip_auto(fallback="127.0.0.1")
+            detected = get_local_ip_auto(fallback="127.0.0.1")
+            if (
+                host == "0.0.0.0"
+                and NetworkAddress(detected, 0).is_ipv6
+                and _is_loopback(detected)
+            ):
+                # SGLANG_HOST_IP=::1 names this machine, which this IPv4
+                # listener serves at 127.0.0.1. It does not serve any other
+                # IPv6 address; gather_server_endpoints refuses those.
+                detected = "127.0.0.1"
+            host = detected
         return host
 
     @classmethod
@@ -514,7 +564,7 @@ class RustServer:
         (``sglang.srt.rust_server.shutdown``), as Python mode's tokenizer
         manager drains: health answers 503 at once, requests are still
         admitted, the listener closes once none is left in flight, and then
-        :meth:`drain` stops the schedulers. ``SGL_FORCE_SHUTDOWN`` skips the
+        :meth:`drain` stops the schedulers. ``SGLANG_FORCE_SHUTDOWN`` skips the
         wait for requests, as in Python.
 
         The drain begins from a Rust thread woken through the signal wakeup
@@ -529,7 +579,7 @@ class RustServer:
                 "rust server: not on the main thread; SIGTERM will not drain"
             )
             return
-        force = get_bool_env_var("SGL_FORCE_SHUTDOWN")
+        force = envs.SGLANG_FORCE_SHUTDOWN.get()
         if not self._broadcasts_shutdown:
             notify = None
 
@@ -607,18 +657,8 @@ class RustServer:
         if not finished and not unfinished:
             return
         try:
-            # Redact even with watermarking off, as the Python writer does:
-            # Rust mode refuses `--enable-watermark`, but the Python API
-            # accepts a server key without it.
-            server_args = redact_watermark_secrets(self.server_args.resolved_dict())
-        except Exception as e:
-            logger.error(f"Failed to snapshot server_args for the dump: {e!r}")
-            server_args = None
-        try:
-            resolved_config = redact_watermark_secrets(
-                get_context().resolved_server_args_dict(
-                    self.server_args.resolved_dict()
-                )
+            resolved_config = get_context().resolved_server_args_dict(
+                self.server_args.resolved_dict()
             )
         except Exception as e:
             logger.error(f"Failed to snapshot the resolved config for the dump: {e!r}")
@@ -627,7 +667,7 @@ class RustServer:
             folder,
             crash_dump_hostname(),
             finished + unfinished,
-            server_args=server_args,
+            server_args=self.server_args,
             resolved_config=resolved_config,
             watermark_config=self.server_args.watermark_config,
             # Every process that hosts a listener dumps its own requests.
@@ -646,9 +686,13 @@ class RustServer:
 
     def wait_request(self, timeout_ms: int) -> None:
         """Block until a request is pushed into the in-process ring or the timeout
-        elapses.
+        elapses. Without --sleep-on-idle, return at once, so the idle loop
+        polls the ring without blocking as Python's polls its sockets: a parked
+        thread starts each request's step on a cold core. A subclass that
+        holds drained requests back still parks on those.
         """
-        self.server.wait_request(timeout_ms)
+        if get_device().sleep_on_idle:
+            self.server.wait_request(timeout_ms)
 
     def drain(self, max_recv: int) -> List[Any]:
         """Ingress: non-blocking drain of the in-process ring → list of decoded

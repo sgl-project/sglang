@@ -17,6 +17,7 @@ mod multi_modality;
 mod tokenizer_manager;
 mod utils;
 
+pub use api_server::core::GenerateValidator;
 pub use api_server::handlers::{AbortEnding, Aborted};
 pub use api_server::http::generate_hook::{
     GenerateFrameHook, GenerateFrameInfo, GenerateFrameKeys, GenerateHook, GenerateMetaInfo,
@@ -162,7 +163,8 @@ fn buffer_to_py(py: Python<'_>, buffer: message::buffers::Buffer) -> PyResult<(S
 
 /// Wraps the HTTP app before it serves: an embedding package's own middleware
 /// or routes ([`Server::start_with_extensions`]). It wraps every route but the
-/// PD bootstrap registry's, inside the access log.
+/// PD bootstrap registry's, inside the access log and the request-body
+/// decompression, so it reads decompressed bodies.
 pub type HttpLayer = Arc<dyn Fn(axum::Router) -> axum::Router + Send + Sync>;
 
 /// When a `/generate` request's timing starts, as a request extension: an
@@ -215,6 +217,8 @@ impl Server {
             cores,
             None,
             None,
+            None,
+            Vec::new(),
         )
     }
 
@@ -325,7 +329,7 @@ impl Server {
     /// Begin the graceful drain, the Rust side of Python's SIGTERM handling:
     /// health answers 503 at once, requests are still admitted, and the
     /// listeners close once none is left in flight (see [`Server::drain_complete`]).
-    /// `force` (Python's `SGL_FORCE_SHUTDOWN`) closes them without waiting, as
+    /// `force` (Python's `SGLANG_FORCE_SHUTDOWN`) closes them without waiting, as
     /// does a failed last health probe. Idempotent.
     #[pyo3(signature = (force = false))]
     pub fn begin_drain(&self, force: bool) {
@@ -367,8 +371,12 @@ impl Server {
 impl Server {
     /// [`Server::start`] with a model package's extensions, the boot of the
     /// package's own server class: `http_layer` wraps the HTTP app (see
-    /// [`HttpLayer`]), and `generate_hook` adds the package's keys to native
-    /// `/generate` frames (see [`GenerateHook`]).
+    /// [`HttpLayer`]), `generate_hook` adds the package's keys to native
+    /// `/generate` frames (see [`GenerateHook`]), `generate_validator`
+    /// refuses generations from every ingress (see [`GenerateValidator`]), and
+    /// `server_info_state_keys` names the package scheduler's own
+    /// `internal_state` fields, which `/server_info` reports as the scheduler
+    /// set them; a name it already reports, or one given twice, fails the start.
     #[allow(clippy::too_many_arguments)]
     pub fn start_with_extensions(
         server_args: ServerArgs,
@@ -379,6 +387,8 @@ impl Server {
         cores: Option<Vec<usize>>,
         http_layer: Option<HttpLayer>,
         generate_hook: Option<Arc<dyn GenerateHook>>,
+        generate_validator: Option<Arc<dyn GenerateValidator>>,
+        server_info_state_keys: Vec<String>,
     ) -> PyResult<Self> {
         // `server_args` already arrived typed (pyo3 rejected any missing/extra/
         // mistyped field when Python constructed it); only value checks remain.
@@ -407,6 +417,8 @@ impl Server {
             },
             server_args: std::sync::Arc::new(server_args),
             generate_hook,
+            generate_validator,
+            server_info_state_keys,
         };
         let rt =
             runtime::start(cfg, http_layer).map_err(|e| value_error("runtime start failed", e))?;

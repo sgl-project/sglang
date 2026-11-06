@@ -112,6 +112,7 @@ impl CoreHandle {
         let record = self
             .receive(std::slice::from_ref(&request), received, false, true)
             .pop();
+        self.validate(std::slice::from_ref(&request))?;
         tokio::select! {
             biased;
             cancellation = generation.cancelled() => {
@@ -198,6 +199,8 @@ impl CoreHandle {
             .map(Some)
             .collect::<Vec<_>>();
         records.resize_with(requests.len(), || None);
+        // One refused item refuses the batch before any item is prepared.
+        self.validate(&requests)?;
         // Counted from admission, media prefetch included (see `generate`).
         let in_flight: Vec<InFlight> = requests.iter().map(|_| self.inner.drain.track()).collect();
         let mut generations: Vec<_> = requests
@@ -274,6 +277,7 @@ impl CoreHandle {
         CoreCall::new(
             runtime,
             self.inner.metadata.weight_version.clone(),
+            Some(self.inner.dp_rank),
             metrics,
             record,
             in_flight,
@@ -296,6 +300,18 @@ impl CoreHandle {
     ) -> Option<RequestMetrics> {
         let metrics = self.inner.metrics.as_ref()?;
         Some(metrics.start_request(request, created_at))
+    }
+
+    /// The launch's [`crate::GenerateValidator`] on each of a client's requests,
+    /// before any media prefetch; the first refusal is the error.
+    fn validate(&self, requests: &[GenerateRequest]) -> Result<(), CoreError> {
+        let Some(validator) = &self.inner.generate_validator else {
+            return Ok(());
+        };
+        requests
+            .iter()
+            .try_for_each(|request| validator.validate(request))
+            .map_err(CoreError::InvalidArgument)
     }
 
     async fn prepare_generations(&self, requests: &mut [GenerateRequest]) -> Result<(), CoreError> {
@@ -322,9 +338,10 @@ impl CoreHandle {
 pub(crate) struct CoreCall {
     runtime: RuntimeCall,
     events_finished: bool,
-    /// The launch weight version, stamped on every output (see
-    /// [`CoreOutput::weight_version`](crate::api_server::core::CoreOutput)).
+    /// The launch weight version and this listener's DP rank, stamped on
+    /// every output (see [`CoreOutput`](crate::api_server::core::CoreOutput)).
     weight_version: Option<Arc<str>>,
+    dp_rank: Option<u32>,
     /// Observes every runtime item as the call receives it.
     metrics: Option<RequestMetrics>,
     /// Logs the request's `Finish` and keeps its crash-dump entry.
@@ -337,6 +354,7 @@ impl CoreCall {
     fn new(
         runtime: RuntimeCall,
         weight_version: Option<Arc<str>>,
+        dp_rank: Option<u32>,
         metrics: Option<RequestMetrics>,
         mut record: Option<RequestRecord>,
         in_flight: Option<InFlight>,
@@ -348,6 +366,7 @@ impl CoreCall {
             runtime,
             events_finished: false,
             weight_version,
+            dp_rank,
             metrics,
             record,
             _in_flight: in_flight,
@@ -381,6 +400,7 @@ impl CoreCall {
                 last_output: LastOutput::default(),
                 abort_deadline: None,
             },
+            None,
             None,
             None,
             None,
@@ -459,13 +479,21 @@ impl CoreCall {
             None,
             None,
             None,
+            None,
         )
     }
 
     fn generation_event(&self, item: ResponseItem) -> CoreEvent {
         let mut event = generation_event(item);
-        if let CoreEvent::Delta(output) | CoreEvent::Finished(output) = &mut event {
+        let output = match &mut event {
+            CoreEvent::Delta(output) | CoreEvent::Finished(output) => Some(output),
+            // A status abort's output ends a native stream as a normal frame.
+            CoreEvent::Failed(CoreError::RuntimeRejected { output, .. }) => Some(&mut **output),
+            CoreEvent::Failed(_) => None,
+        };
+        if let Some(output) = output {
             output.weight_version = self.weight_version.clone();
+            output.dp_rank = self.dp_rank;
         }
         event
     }
@@ -919,6 +947,7 @@ mod tests {
                 },
                 metrics: Some(metrics.clone()),
                 request_log: None,
+                generate_validator: None,
             },
         );
         let mut call = handle
@@ -1159,6 +1188,7 @@ mod tests {
                 metadata: CoreMetadata::default(),
                 metrics: None,
                 request_log: Some(crate::api_server::core::RequestLog::for_test(None, true)),
+                generate_validator: None,
             },
         );
         let call = handle
@@ -1617,6 +1647,7 @@ mod tests {
                 metadata: CoreMetadata::default(),
                 metrics: Some(metrics.clone()),
                 request_log: None,
+                generate_validator: None,
             },
         );
         let mut submit =

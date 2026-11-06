@@ -78,6 +78,13 @@ pub struct RuntimeConfig {
     pub server_args: Arc<ServerArgs>,
     /// A model package's keys for native `/generate` frames.
     pub generate_hook: Option<Arc<dyn crate::GenerateHook>>,
+    /// A model package's admission check on every client generation.
+    pub generate_validator: Option<Arc<dyn crate::GenerateValidator>>,
+    /// A model package's own scheduler `internal_state` fields, which
+    /// `/server_info` reports by name after its typed ones. No other
+    /// scheduler field is reported: the state also carries the launch
+    /// arguments, credentials included.
+    pub server_info_state_keys: Vec<String>,
 }
 
 impl Default for RuntimeConfig {
@@ -86,6 +93,8 @@ impl Default for RuntimeConfig {
             rust_server_args: RustServerServerArgs::default(),
             server_args: Arc::new(ServerArgs::default()),
             generate_hook: None,
+            generate_validator: None,
+            server_info_state_keys: Vec::new(),
         }
     }
 }
@@ -170,6 +179,9 @@ pub struct ServerArgs {
     /// Start accepting health checks immediately instead of waiting for the
     /// main process's startup warmup request to finish.
     pub skip_server_warmup: bool,
+    /// `--gc-threshold`: the thresholds the scheduler ranks set when they
+    /// freeze their garbage collectors after startup; `None` keeps Python's.
+    pub gc_threshold: Option<Vec<i64>>,
     /// Extra headers on a successful `/health_generate` response, for a router
     /// that reads deployment metadata off the deep health probe.
     pub health_generate_headers: BTreeMap<String, String>,
@@ -179,6 +191,9 @@ pub struct ServerArgs {
     /// Apply the router's `x-override-*` headers to `/generate` bodies
     /// (`SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES`).
     pub enable_request_header_overrides: bool,
+    /// Decompress request bodies tagged with `x-body-compressed`
+    /// (`SGLANG_ENABLE_REQUEST_DECOMPRESSION`).
+    pub enable_request_decompression: bool,
     /// Streamed `/generate` frames carry per-step deltas instead of cumulative
     /// text. Matches the Python `TokenizerManager`.
     pub incremental_streaming_output: bool,
@@ -284,9 +299,11 @@ impl ServerArgs {
         detokenizer_worker_num,
         skip_tokenizer_init,
         skip_server_warmup,
+        gc_threshold,
         health_generate_headers,
         default_priority_value,
         enable_request_header_overrides,
+        enable_request_decompression,
         incremental_streaming_output,
         disaggregation_mode,
         model_config,
@@ -345,9 +362,11 @@ impl ServerArgs {
         detokenizer_worker_num: usize,
         skip_tokenizer_init: bool,
         skip_server_warmup: bool,
+        gc_threshold: Option<Vec<i64>>,
         health_generate_headers: BTreeMap<String, String>,
         default_priority_value: Option<i64>,
         enable_request_header_overrides: bool,
+        enable_request_decompression: bool,
         incremental_streaming_output: bool,
         disaggregation_mode: DisaggregationMode,
         model_config: ModelConfig,
@@ -404,9 +423,11 @@ impl ServerArgs {
             detokenizer_worker_num,
             skip_tokenizer_init,
             skip_server_warmup,
+            gc_threshold,
             health_generate_headers,
             default_priority_value,
             enable_request_header_overrides,
+            enable_request_decompression,
             incremental_streaming_output,
             disaggregation_mode,
             model_config,
@@ -470,9 +491,11 @@ impl Default for ServerArgs {
             detokenizer_worker_num: 1,
             skip_tokenizer_init: false,
             skip_server_warmup: false,
+            gc_threshold: None,
             health_generate_headers: BTreeMap::new(),
             default_priority_value: None,
             enable_request_header_overrides: false,
+            enable_request_decompression: false,
             incremental_streaming_output: false,
             disaggregation_mode: DisaggregationMode::Null,
             model_config: ModelConfig::default(),

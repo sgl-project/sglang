@@ -301,6 +301,7 @@ mod tests {
                     metadata: CoreMetadata::from(server_args.as_ref()),
                     metrics: None,
                     request_log: None,
+                    generate_validator: None,
                 },
             ),
             generation_policy: crate::message::request::GenerationPolicy::from(

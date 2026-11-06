@@ -293,6 +293,7 @@ const SCHEMA_META_INFO_KEYS: &[&str] = &[
     "audio_tokens",
     "video_tokens",
     "cached_tokens_details",
+    "dp_rank",
 ];
 
 /// A repeated key has been logged once.
@@ -1136,6 +1137,7 @@ mod tests {
                     metadata: crate::api_server::handlers::CoreMetadata::default(),
                     metrics: None,
                     request_log: None,
+                    generate_validator: None,
                 },
             ),
             server_args: Arc::new(crate::message::config::ServerArgs::default()),
@@ -1184,6 +1186,7 @@ mod tests {
                     metadata: crate::api_server::handlers::CoreMetadata::default(),
                     metrics: None,
                     request_log: None,
+                    generate_validator: None,
                 },
             ),
             server_args: Arc::new(crate::message::config::ServerArgs::default()),
@@ -1231,6 +1234,7 @@ mod tests {
                     metadata: crate::api_server::handlers::CoreMetadata::default(),
                     metrics: None,
                     request_log: None,
+                    generate_validator: None,
                 },
             ),
             generation_policy: crate::message::request::GenerationPolicy::from(&server_args),
@@ -1276,6 +1280,7 @@ mod tests {
                 metadata: crate::api_server::handlers::CoreMetadata::default(),
                 metrics: None,
                 request_log: None,
+                generate_validator: None,
             },
         );
         let state = Arc::new(AppState {
@@ -1366,6 +1371,7 @@ mod tests {
                 metadata: crate::api_server::handlers::CoreMetadata::default(),
                 metrics: None,
                 request_log: None,
+                generate_validator: None,
             },
         );
         let state = Arc::new(AppState {
@@ -1619,28 +1625,77 @@ mod tests {
         }
     }
 
-    /// A hook's keys reach every native frame of every request — unary,
-    /// cumulative and incremental streams, single and batch — each request's
-    /// hook started from its own sampling params, with the scheduler's decode
-    /// latency for a unary request and this frontend's for a streamed one;
-    /// without a hook the frames are the schema's. A finished request's stats
-    /// reach its terminal frame only, after the schema's keys and before the
-    /// hook's, with the decode throughput when metrics are on; a request whose
-    /// terminal output carries no stats (an older scheduler) reports neither.
-    /// The hook starts from each item's request, the HTTP headers and the
-    /// sampling params the client sent for it (without the launch-time
-    /// preferred ones), and sees each terminal frame once. An HTTP layer's
-    /// earlier [`crate::RequestStart`] lengthens every terminal `e2e_latency`
-    /// but neither decode latency.
+    /// The launch's generate validator refuses at every ingress before
+    /// anything is submitted, a batch's valid items included: native
+    /// `/generate` with its 400 (a stream's error frame), and the OpenAI
+    /// routes with their 400, unary even for a stream, as Python answers the
+    /// tokenizer manager's `ValueError` before the stream starts.
     #[tokio::test]
-    async fn generate_hook_keys_reach_every_frame() {
-        for (stream, incremental, hook, batch, metrics) in [
-            (false, false, true, true, true),
-            (false, false, false, false, false),
-            (true, false, true, true, false),
-            (true, false, false, false, true),
-            (true, true, true, true, true),
-            (true, true, false, false, true),
+    async fn generate_validator_refuses_every_ingress_before_submission() {
+        let native = serde_json::json!({"code": 400, "message": "top_logprobs_num 2"});
+        let openai = serde_json::json!({
+            "object": "error",
+            "message": "top_logprobs_num 2",
+            "type": "BadRequestError",
+            "param": null,
+            "code": 400,
+        });
+        let generate = |text: serde_json::Value, top_logprobs_num, stream| {
+            serde_json::json!({
+                "text": text,
+                "stream": stream,
+                "return_logprob": true,
+                "top_logprobs_num": top_logprobs_num,
+            })
+        };
+        let completion = |stream| {
+            serde_json::json!({
+                "model": "m",
+                "prompt": [1, 2],
+                "logprobs": 2,
+                "max_tokens": 1,
+                "stream": stream,
+            })
+        };
+        for (uri, body, status, error) in [
+            (
+                "/generate",
+                generate(
+                    serde_json::json!(["x", "y"]),
+                    serde_json::json!([1, 2]),
+                    false,
+                ),
+                StatusCode::BAD_REQUEST,
+                &native,
+            ),
+            (
+                "/generate",
+                generate(
+                    serde_json::json!(["x", "y"]),
+                    serde_json::json!([1, 2]),
+                    true,
+                ),
+                StatusCode::OK,
+                &native,
+            ),
+            (
+                "/generate",
+                generate(serde_json::json!("x"), serde_json::json!(2), false),
+                StatusCode::BAD_REQUEST,
+                &native,
+            ),
+            (
+                "/v1/completions",
+                completion(false),
+                StatusCode::BAD_REQUEST,
+                &openai,
+            ),
+            (
+                "/v1/completions",
+                completion(true),
+                StatusCode::BAD_REQUEST,
+                &openai,
+            ),
         ] {
             let (intake_tx, intake_rx) = flume::unbounded();
             let core = crate::api_server::handlers::CoreHandle::new(
@@ -1653,34 +1708,126 @@ mod tests {
                     is_disaggregation: false,
                     mm_limits: Default::default(),
                     multimodal: false,
-                    peer_endpoints: Vec::new(),
                     metadata: crate::api_server::handlers::CoreMetadata::default(),
                     metrics: None,
                     request_log: None,
+                    peer_endpoints: Vec::new(),
+                    generate_validator: Some(Arc::new(crate::api_server::core::TopLogprobsCap)),
+                },
+            );
+            let state = Arc::new(AppState {
+                core,
+                server_args: Arc::new(crate::message::config::ServerArgs {
+                    served_model_name: "m".into(),
+                    ..Default::default()
+                }),
+                generation_policy: GenerationPolicy::default(),
+                chat_formatter: None,
+                generate_hook: None,
+                openai_chat: None,
+            });
+            let case = format!("{uri} {body}");
+            let request = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let response = routes()
+                .merge(super::super::openai::routes())
+                .with_state(state)
+                .oneshot(request)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status, "{case}");
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            let body = std::str::from_utf8(&body).unwrap();
+            let first = body
+                .strip_prefix("data: ")
+                .unwrap_or(body)
+                .lines()
+                .next()
+                .unwrap();
+            assert_eq!(&parse(first)["error"], error, "{case}");
+            assert!(
+                intake_rx.is_empty(),
+                "{case}: an item reached the scheduler"
+            );
+        }
+    }
+
+    /// A hook's keys reach every native frame of every request — unary,
+    /// cumulative and incremental streams, single and batch — each request's
+    /// hook started from its own sampling params, with the scheduler's decode
+    /// latency for a unary request and this frontend's for a streamed one;
+    /// without a hook the frames are the schema's. A finished request's stats
+    /// reach its terminal frame only, after the schema's keys and before the
+    /// hook's, with the decode throughput when metrics are on; a request whose
+    /// terminal output carries no stats (an older scheduler) reports neither.
+    /// The hook starts from each item's request, the HTTP headers and the
+    /// sampling params the client sent for it (without the launch-time
+    /// preferred ones), and sees each terminal frame once. An HTTP layer's
+    /// earlier [`crate::RequestStart`] lengthens every terminal `e2e_latency`
+    /// but neither decode latency. Every frame carries the listener's DP rank
+    /// (null without data parallelism), a status abort's terminal stream frame
+    /// included.
+    #[tokio::test]
+    async fn generate_hook_keys_reach_every_frame() {
+        for (stream, incremental, hook, batch, metrics) in [
+            (false, false, true, true, true),
+            (false, false, false, false, false),
+            (true, false, true, true, false),
+            (true, false, false, false, true),
+            (true, true, true, true, true),
+            (true, true, false, false, true),
+        ] {
+            // A hooked case also runs as DP rank 1; the rest as the only rank.
+            let dp_rank: u32 = if hook { 1 } else { 0 };
+            let server_args = crate::message::config::ServerArgs {
+                incremental_streaming_output: incremental,
+                metrics: metrics.then(|| crate::message::config::MetricsConfig {
+                    multiproc_dir: String::new(),
+                    labels: Default::default(),
+                    priority_label: false,
+                    bucket_time_to_first_token: None,
+                    bucket_inter_token_latency: None,
+                    bucket_e2e_request_latency: None,
+                    bucket_prompt_tokens: None,
+                    bucket_generation_tokens: None,
+                }),
+                preferred_sampling_params: Some(crate::message::config::PreferredSamplingParams(
+                    serde_json::json!({"top_k": 7}),
+                )),
+                deployment_info: crate::message::config::DeploymentInfo {
+                    dp_rank: Some(dp_rank),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let (intake_tx, intake_rx) = flume::unbounded();
+            let core = crate::api_server::handlers::CoreHandle::new(
+                intake_tx,
+                flume::unbounded().0,
+                crate::api_server::handlers::CoreConfig {
+                    response_capacity: 8,
+                    response_activity: Default::default(),
+                    startup_ready: true,
+                    is_disaggregation: false,
+                    mm_limits: Default::default(),
+                    multimodal: false,
+                    peer_endpoints: Vec::new(),
+                    metadata: crate::api_server::handlers::CoreMetadata::from(&server_args),
+                    metrics: None,
+                    request_log: None,
+                    generate_validator: None,
                 },
             );
             let top_p_hook = TopPHook::default();
             let state = Arc::new(AppState {
                 core,
-                server_args: Arc::new(crate::message::config::ServerArgs {
-                    incremental_streaming_output: incremental,
-                    metrics: metrics.then(|| crate::message::config::MetricsConfig {
-                        multiproc_dir: String::new(),
-                        labels: Default::default(),
-                        priority_label: false,
-                        bucket_time_to_first_token: None,
-                        bucket_inter_token_latency: None,
-                        bucket_e2e_request_latency: None,
-                        bucket_prompt_tokens: None,
-                        bucket_generation_tokens: None,
-                    }),
-                    preferred_sampling_params: Some(
-                        crate::message::config::PreferredSamplingParams(
-                            serde_json::json!({"top_k": 7}),
-                        ),
-                    ),
-                    ..Default::default()
-                }),
+                server_args: Arc::new(server_args),
                 generation_policy: GenerationPolicy::default(),
                 chat_formatter: None,
                 generate_hook: hook
@@ -1724,6 +1871,17 @@ mod tests {
                         unreachable!()
                     };
                     chunk.rid = rid.clone();
+                    // A streamed batch's second item ends on a status abort,
+                    // still a frame.
+                    if stream && item == 1 {
+                        chunk.finish_reason = serde_json::from_value(serde_json::json!({
+                            "type": "abort",
+                            "message": "Aborted",
+                            "status_code": 500,
+                            "err_type": null
+                        }))
+                        .unwrap();
+                    }
                     let mut stats = serde_json::Map::new();
                     stats.insert("num_retractions".into(), serde_json::json!(1));
                     stats.insert("queue_time".into(), serde_json::json!(0.5));
@@ -1787,7 +1945,7 @@ mod tests {
             };
 
             let case = format!(
-                "stream={stream} incremental={incremental} hook={hook} batch={batch} metrics={metrics}"
+                "stream={stream} incremental={incremental} hook={hook} batch={batch} metrics={metrics} dp_rank={dp_rank}"
             );
             // A stream takes each delta before its terminal output arrives.
             assert_eq!(frames.len(), items * if stream { 2 } else { 1 }, "{case}");
@@ -1800,6 +1958,11 @@ mod tests {
                     .map_or(if batch { position } else { 0 }, |i| i as usize);
                 let meta = frame["meta_info"].as_object().unwrap();
                 let terminal = !meta["finish_reason"].is_null();
+                assert_eq!(
+                    meta.get("dp_rank"),
+                    Some(&serde_json::json!(dp_rank)),
+                    "{case}"
+                );
                 let keys: Vec<&str> = meta.keys().map(String::as_str).collect();
                 let e2e_latency = meta.get("e2e_latency").and_then(serde_json::Value::as_f64);
                 assert_eq!(e2e_latency.is_some(), terminal, "{case}");
@@ -2158,6 +2321,7 @@ mod tests {
             audio_tokens: Some(1),
             video_tokens: Some(1),
             cached_tokens_details: Some(Default::default()),
+            dp_rank: Some(0),
         };
         let keys: Vec<String> = serde_json::to_value(&every)
             .unwrap()

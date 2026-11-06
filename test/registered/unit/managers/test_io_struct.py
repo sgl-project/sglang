@@ -27,12 +27,12 @@ from sglang.srt.managers.kv_hints import (
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.multimodal.kimi_k3_image_processing import KimiK3DeferredPreprocessing
 from sglang.srt.multimodal.modality import Modality, MultimodalInputFormat
-from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.utils.cuda_vmm_transport_utils import (
+from sglang.srt.multimodal.transport.cuda_vmm import (
     CudaVmmPackedTensorTransportProxy,
     _CudaVmmPackedTensorLayout,
     _CudaVmmPackedTransportOwner,
 )
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils.msgpack_utils import _restore_torch_tensor, enc_hook, ext_hook
 from sglang.test.ci.ci_register import (
     register_amd_ci,
@@ -120,6 +120,7 @@ class TestTokenizedReqInputMsgpack(unittest.TestCase):
                 "DetachHiCacheStorageReqInput",
                 "AttachHiCacheStorageReqInput",
                 "ProfileReq",
+                "FreezeGCReq",
             },
         )
         for name, body in messages:

@@ -13,6 +13,10 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.disaggregation.kv_events import select_kv_publisher_dp_rank
+from sglang.srt.entrypoints.server_utils import (
+    build_model_info_fields,
+    build_server_info,
+)
 from sglang.srt.entrypoints.v1_loads import (
     _accelerator_name,
     _num_accelerators_per_dp_rank,
@@ -21,6 +25,11 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.load_snapshot import ShmLoadSnapshotWriter
 from sglang.srt.managers.utils import compute_num_reserved_tokens
 from sglang.srt.observability.metrics_collector import tokenizer_metric_labels
+from sglang.srt.observability.request_logger import (
+    WHITELISTED_HEADERS,
+    RequestLogger,
+    _dataclass_to_string_truncated,
+)
 from sglang.srt.observability.utils import generate_buckets
 from sglang.srt.runtime_context import (
     get_device,
@@ -37,18 +46,13 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
-from sglang.srt.utils.common import build_model_info_fields, build_server_info
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
-from sglang.srt.utils.request_logger import (
-    WHITELISTED_HEADERS,
-    RequestLogger,
-    _dataclass_to_string_truncated,
-)
 from sglang.version import __version__
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
     from sglang.srt.rust_extensions._server import ServerArgs
+    from sglang.srt.server_args import ServerArgs as PyServerArgs
 
 logger = logging.getLogger(__name__)
 
@@ -159,6 +163,7 @@ def _build_server_args(
         detokenizer_worker_num=get_serving().detokenizer_worker_num,
         skip_tokenizer_init=get_serving().skip_tokenizer_init,
         skip_server_warmup=get_serving().skip_server_warmup,
+        gc_threshold=get_device().gc_threshold,
         health_generate_headers=dict(health_generate_headers or {}),
         default_priority_value=(
             get_schedule().default_priority_value
@@ -166,6 +171,7 @@ def _build_server_args(
             else None
         ),
         enable_request_header_overrides=envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get(),
+        enable_request_decompression=envs.SGLANG_ENABLE_REQUEST_DECOMPRESSION.get(),
         incremental_streaming_output=get_serving().incremental_streaming_output,
         disaggregation_mode=disaggregation_mode,
         model_config=ext.ModelConfig(
@@ -374,8 +380,8 @@ def _launch_server_info(scheduler: Scheduler) -> str:
     at launch, as a JSON object: the resolved `server_args`,
     `launch_command`, `kv_events`, and the scheduler's init info less what is
     only known once initialization finishes (`startup_time`, which the Rust
-    server reports per request, and the gRPC `kv_event_sources`). Watermark
-    secrets are redacted as Python's HTTP and gRPC frontends redact them."""
+    server reports per request, and the gRPC `kv_event_sources`). Secrets are
+    redacted as Python's HTTP and gRPC frontends redact them."""
     scheduler_info = {
         "status": "ready",
         "max_total_num_tokens": scheduler.max_total_num_tokens,
@@ -389,21 +395,20 @@ def _launch_server_info(scheduler: Scheduler) -> str:
     # The Rust listener speaks HTTP/1 only, whatever `--enable-http2` says; a
     # router reads this key to pick its protocol.
     info["enable_http2"] = False
-    _redact_api_keys(info)
+    _redact_api_keys(info, scheduler.server_args)
     return json.dumps(info, default=str)
 
 
 _API_KEY_FIELDS = ("api_key", "admin_api_key")
 
 
-def _redact_api_keys(info: Dict[str, Any]) -> None:
-    """Keep the listener's keys out of `/server_info`, which only the API key
-    (or nothing) guards: reporting them would hand the admin key to every
-    API-key holder."""
-    keys = [info[name] for name in _API_KEY_FIELDS if info.get(name)]
-    for name in _API_KEY_FIELDS:
-        if info.get(name) is not None:
-            info[name] = "<redacted>"
+def _redact_api_keys(info: Dict[str, Any], server_args: PyServerArgs) -> None:
+    """Keep the listener's keys out of `/server_info`'s `launch_command`,
+    which only the API key (or nothing) guards: reporting them would hand the
+    admin key to every API-key holder. `build_server_info` has replaced the
+    key fields in `info` already, so the values come from `server_args`."""
+    keys = [getattr(server_args, name) for name in _API_KEY_FIELDS]
+    keys = [key for key in keys if key]
     command = info.get("launch_command")
     if not command:
         return

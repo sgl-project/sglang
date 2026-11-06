@@ -21,6 +21,8 @@ from sglang.srt.arg_groups.validation_hook import (  # noqa: E402
 )
 from sglang.srt.environ import envs  # noqa: E402
 from sglang.srt.managers.io_struct import GenerateReqInput  # noqa: E402
+from sglang.srt.observability import request_logger  # noqa: E402
+from sglang.srt.observability.request_logger import RequestLogger  # noqa: E402
 from sglang.srt.runtime_context import (  # noqa: E402
     ParallelContext,
     RuntimeContext,
@@ -28,8 +30,6 @@ from sglang.srt.runtime_context import (  # noqa: E402
 )
 from sglang.srt.rust_server import config as rust_config  # noqa: E402
 from sglang.srt.rust_server.config import request_log_settings  # noqa: E402
-from sglang.srt.utils import request_logger  # noqa: E402
-from sglang.srt.utils.request_logger import RequestLogger  # noqa: E402
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -234,6 +234,7 @@ _CASES = [
                 "reasoning_tokens": 0,
                 "weight_version": "default",
                 "cached_tokens_details": {"device": 1, "host": 0},
+                "dp_rank": None,
             },
         },
     },
