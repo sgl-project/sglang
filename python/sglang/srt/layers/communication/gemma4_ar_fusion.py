@@ -171,8 +171,9 @@ class Gemma4ArFusion:
     def rows(self, num_tokens: int) -> Tuple[int, int]:
         """(first row, row count) this rank owns out of ``num_tokens``."""
         per_rank = (num_tokens + self.world_size - 1) // self.world_size
-        row0 = self.rank * per_rank
-        return row0, max(0, min(num_tokens, row0 + per_rank) - row0)
+        # trailing ranks of a small batch own no rows; keep row0 inside the batch
+        row0 = min(self.rank * per_rank, num_tokens)
+        return row0, min(num_tokens, row0 + per_rank) - row0
 
     def _stage(self, partial: torch.Tensor) -> torch.Tensor:
         T = partial.shape[0]

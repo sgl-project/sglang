@@ -33,8 +33,9 @@ HIDDENS = [5376, 4096]  # Gemma-4 31B, and one more block width
 EPS = 1e-6
 GROUP = gemma4_ar_fusion.GROUP
 MAX_ROWS = 1024
-# ragged shards, a shard of one row, and a full barrier-plane grid
-ROWS = [7, 512, 1024]
+# fewer rows than ranks, trailing ranks owning none (5 at TP4, 9 at TP8), ragged
+# shards, and a full barrier-plane grid
+ROWS = [1, 5, 9, 512, 1024]
 
 
 class _Symm:
@@ -95,7 +96,7 @@ def _gather(t: torch.Tensor) -> list[torch.Tensor]:
 
 def _rows(num_tokens: int, rank: int, world_size: int):
     per_rank = (num_tokens + world_size - 1) // world_size
-    row0 = rank * per_rank
+    row0 = min(rank * per_rank, num_tokens)
     return row0, max(0, min(num_tokens, row0 + per_rank) - row0)
 
 

@@ -118,7 +118,7 @@ def benchmark(num_tokens: int, provider: str):
     else:
         (p_t, p_mc), (o_t, o_mc), (s_t, s_mc) = _buffers()
         per_rank = (num_tokens + world_size - 1) // world_size
-        row0 = rank * per_rank
+        row0 = min(rank * per_rank, num_tokens)
         rows = max(0, min(num_tokens, row0 + per_rank) - row0)
         mine = residual[row0 : row0 + rows].clone()
         copy = provider == "fused"
