@@ -36,7 +36,17 @@ def _resolved_server_args(server_args: "ServerArgs") -> dict:
 def resolve_scheduler_config(
     server_args: "ServerArgs",
     model_config: typing.Optional["ModelConfig"] = None,
+    *,
+    strict: bool = False,
+    scheduler_overrides: dict | None = None,
 ) -> SchedulerConfig:
+    """Resolve the target deployment from real ServerArgs.
+
+    `strict` applies the ForwardPass bridge's scope checks: a single scheduler
+    layout (PP=DP=CP=1, a bridge limit — the AIS SDK estimator itself accepts
+    other topologies), text-only models, no speculative decoding, and declared
+    quantization for quantized deployments.
+    """
     from sglang.version import __version__
 
     resolved = _resolved_server_args(server_args)
@@ -47,11 +57,79 @@ def resolve_scheduler_config(
             value = getattr(server_args, name, None)
         return default if value is None else value
 
+    overrides = scheduler_overrides or {}
+    if strict:
+        # One scheduler view does not represent these multi-rank dimensions.
+        for name in (
+            "dp_size",
+            "attn_dp_size",
+            "pp_size",
+            "attn_cp_size",
+            "moe_dp_size",
+            "dcp_size",
+            "dwdp_size",
+        ):
+            if get_arg(name, 1) != 1:
+                raise ValueError(
+                    f"The ForwardPass bridge takes one scheduler snapshot and "
+                    f"cannot represent {name}={get_arg(name)}; this is a "
+                    "bridge limit, not an AIS SDK capability limit"
+                )
+        model_config = _resolve_model_config(server_args, model_config)
+        if get_arg("speculative_algorithm"):
+            raise ValueError(
+                "AISimulate does not model speculative decoding; disable it"
+            )
+        if getattr(model_config, "is_multimodal", False):
+            raise ValueError(
+                "AISimulate estimates text-only serving; multimodal "
+                "models carry visual/audio encoder compute the FPM bridge does "
+                "not model."
+            )
+        quantized = (
+            get_arg("quantization")
+            or getattr(model_config, "quantization", None)
+            or getattr(model_config, "hf_quant_config", None)
+            or getattr(
+                getattr(model_config, "hf_config", None), "quantization_config", None
+            )
+            or getattr(
+                getattr(model_config, "hf_config", None), "compression_config", None
+            )
+            or get_arg("modelopt_quant")
+            or get_arg("quantize_and_serve", False)
+        )
+        if quantized:
+            fields = (
+                "data_type",
+                "kv_cache_data_type",
+                "moe_quant_mode_override",
+                "fmha_quant_mode_override",
+                "comm_quant_mode_override",
+            )
+            missing = [k for k in fields if not overrides.get(k)]
+            if missing:
+                raise ValueError(
+                    f"Declare the quantized deployment's scheduler fields: {missing}"
+                )
+        kv_dtype = get_arg("kv_cache_dtype", "auto")
+        if kv_dtype not in {"auto", "bf16", "bfloat16", "half", "float16"}:
+            if not overrides.get("kv_cache_data_type") or not overrides.get(
+                "fmha_quant_mode_override"
+            ):
+                raise ValueError(
+                    "Quantized KV requires kv_cache_data_type and fmha_quant_mode_override"
+                )
+
     dtype = get_arg("dtype", "auto")
     if dtype == "auto":
         model_config = _resolve_model_config(server_args, model_config)
         dtype = str(model_config.dtype).strip("torch.")
     data_type = DataType.from_torch_dtype(dtype)
+    if strict and data_type is None:
+        data_type = DataType.from_torch_dtype(
+            str(model_config.dtype).removeprefix("torch.")
+        )
     return SchedulerConfig(
         data_type=data_type,
         kv_cache_data_type=DataType.from_torch_dtype(get_arg("kv_cache_dtype"))

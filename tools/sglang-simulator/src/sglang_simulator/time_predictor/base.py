@@ -13,23 +13,44 @@ logger = get_logger("sgl_simulator")
 class ScheduleRequest:
     extend_length: int = 0
     past_kv_length: int = 0
+    # Real scheduler phase of this request ("extend"/"decode"), attached by
+    # the scheduler-entry snapshot for phase-aware predictors. Optional so
+    # every existing caller keeps working unchanged.
+    forward_mode: str | None = None
 
 
 @dataclass
 class ScheduleBatch:
     reqs: list[ScheduleRequest] = field(default_factory=list)
+    # Real scheduler forward mode of this step ("extend"/"decode"/"mixed"),
+    # attached by the scheduler-entry snapshot for phase-aware predictors.
+    forward_mode: str | None = None
 
     def __repr__(self) -> str:
         return f"batch_size={len(self.reqs)},reqs={[(req.extend_length, req.past_kv_length) for req in self.reqs]}"
 
     def __eq__(self, batch: "ScheduleBatch"):
+        if self.forward_mode != batch.forward_mode:
+            return False
         if self.batch_size != batch.batch_size:
             return False
 
         req1, req2 = [], []
         for idx in range(self.batch_size):
-            req1.append((self.reqs[idx].extend_length, self.reqs[idx].past_kv_length))
-            req2.append((batch.reqs[idx].extend_length, batch.reqs[idx].past_kv_length))
+            req1.append(
+                (
+                    self.reqs[idx].extend_length,
+                    self.reqs[idx].past_kv_length,
+                    self.reqs[idx].forward_mode or "",
+                )
+            )
+            req2.append(
+                (
+                    batch.reqs[idx].extend_length,
+                    batch.reqs[idx].past_kv_length,
+                    batch.reqs[idx].forward_mode or "",
+                )
+            )
 
         return sorted(req1) == sorted(req2)
 
@@ -56,6 +77,8 @@ class ScheduleBatch:
         return not self.is_decode()
 
     def is_decode(self) -> bool:
+        if self.forward_mode is not None:
+            return self.forward_mode == "decode"
         for req in self.reqs:
             if req.extend_length > 1:
                 return False

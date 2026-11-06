@@ -1,4 +1,4 @@
-"""Real-SDK prefill, decode, and prefix-cache prediction in both database modes."""
+"""Real-SDK prefill, decode, and prefix-cache prediction on the unified ForwardPass estimator."""
 
 import json
 from unittest.mock import patch
@@ -27,13 +27,16 @@ def test_real_sdk_prefill_decode_and_prefix_cache(database_mode):
         ),
         database_mode=config["predictor"]["database_mode"],
     )
-    cold = ScheduleBatch([ScheduleRequest(extend_length=1024)])
-    cached = ScheduleBatch([ScheduleRequest(extend_length=128, past_kv_length=896)])
-    decode = ScheduleBatch([ScheduleRequest(extend_length=1, past_kv_length=1024)])
+    cold = ScheduleBatch([ScheduleRequest(1024, 0, "extend")], "extend")
+    cached = ScheduleBatch([ScheduleRequest(128, 896, "extend")], "extend")
+    decode = ScheduleBatch([ScheduleRequest(1, 1024, "decode")], "decode")
 
-    cold_latency = predictor.predict_infer_time(cold)
-    cached_latency = predictor.predict_infer_time(cached)
-    decode_latency = predictor.predict_infer_time(decode)
+    try:
+        cold_latency = predictor.predict_infer_time(cold)
+        cached_latency = predictor.predict_infer_time(cached)
+        decode_latency = predictor.predict_infer_time(decode)
 
-    assert 0 < cached_latency < cold_latency
-    assert 0 < decode_latency < cold_latency
+        assert 0 < cached_latency < cold_latency
+        assert 0 < decode_latency < cold_latency
+    finally:
+        predictor._fpm.close()

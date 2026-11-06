@@ -14,6 +14,30 @@ from sglang_simulator.utils import get_logger
 
 logger = get_logger()
 
+# Predictor options the aisimulate factory forwards from the config file's
+# "predictor" section. Keys outside this set keep their historical treatment:
+# ignored, not an error. The three scale/floor knobs are post-processing on
+# the SDK estimate (ms units), not SDK estimator controls; enable_oom_check is
+# only accepted as the neutral False.
+_AISIMULATE_OPTIONS = (
+    "database_mode",
+    "estimation_mode",
+    "estimator_config",
+    "systems_paths",
+    "tune_observations",
+    "worker_type",
+    "prefill_scale_factor",
+    "decode_scale_factor",
+    "prefill_min_latency",
+    "enable_oom_check",
+)
+
+# Options without a path through the unified ForwardPass estimator. The
+# ForwardPassPerfModelConfig has no workload-distribution field, so the old
+# simulator knob cannot be forwarded; the specific error below replaces the
+# generic "removed with the static path" message.
+_AISIMULATE_REMOVED_OPTIONS = ("workload_distribution",)
+
 
 class ConfigManager:
     """Centralized configuration manager with caching."""
@@ -185,6 +209,11 @@ class ConfigManager:
             raise RuntimeError(f"Unsupported backend[{backend}] server args parser.")
 
     @classmethod
+    def uses_aisimulate_predictor(cls) -> bool:
+        predictor = cls._get_raw_config().get("predictor", {})
+        return predictor.get("name") == "aisimulate"
+
+    @classmethod
     def get_inference_time_predictor(
         cls, model: ModelInfo, hw: AcceleratorInfo, sched_config: SchedulerConfig
     ) -> InferTimePredictor:
@@ -195,29 +224,45 @@ class ConfigManager:
                 AISimulateTimePredictor,
             )
 
-            database_mode = predictor_config.get("database_mode", "SILICON")
-            prefill_scale_factor = predictor_config.get("prefill_scale_factor", 1)
-            decode_scale_factor = predictor_config.get("decode_scale_factor", 1)
-            prefill_min_latency = predictor_config.get("prefill_min_latency", 0)
-            workload_distribution = predictor_config.get(
-                "workload_distribution", "balanced"
-            )
-            enable_oom_check = predictor_config.get("enable_oom_check", False)
-
-            return AISimulateTimePredictor(
-                model,
-                hw=hw,
-                config=sched_config,
-                database_path=cls.resolve_config_relative_path(
-                    predictor_config.get("database_path")
-                ),
-                database_mode=database_mode,
-                prefill_scale_factor=prefill_scale_factor,
-                decode_scale_factor=decode_scale_factor,
-                prefill_min_latency=prefill_min_latency,
-                workload_distribution=workload_distribution,
-                enable_oom_check=enable_oom_check,
-            )
+            removed = [
+                key for key in _AISIMULATE_REMOVED_OPTIONS if key in predictor_config
+            ]
+            if removed:
+                raise ValueError(
+                    f"Predictor option {removed} has no path through the "
+                    "unified ForwardPass estimator: the SDK's ForwardPass "
+                    "configuration has no workload-distribution field, so "
+                    "latency-side distribution cannot be set here (the SDK's "
+                    "ModelConfig default is power_law, not the old simulator "
+                    "default 'balanced'). The memory-sizing path via "
+                    "get_perf_model is unchanged and still defaults to "
+                    "'balanced'; see docs/aisimulate_fpm.md."
+                )
+            options = {
+                k: v for k, v in predictor_config.items() if k in _AISIMULATE_OPTIONS
+            }
+            database_path = predictor_config.get("database_path")
+            if database_path is not None:
+                if options.get("systems_paths") is not None:
+                    raise ValueError(
+                        "Set either 'database_path' (legacy single systems "
+                        "root, mapped to systems_paths=[path]) or "
+                        "'systems_paths' in the aisimulate predictor config, "
+                        "not both"
+                    )
+                options["systems_paths"] = [
+                    str(cls.resolve_config_relative_path(database_path))
+                ]
+            config_dir = Path(Envs.config_path()).resolve().parent
+            if options.get("tune_observations") is not None:
+                options["tune_observations"] = str(
+                    config_dir / options["tune_observations"]
+                )
+            if options.get("systems_paths") is not None:
+                options["systems_paths"] = [
+                    str(config_dir / p) for p in options["systems_paths"]
+                ]
+            return AISimulateTimePredictor(model, hw=hw, config=sched_config, **options)
         elif predictor_config.get("name") == "ml":
             from sglang_simulator.time_predictor.ml import MLTimePredictor
 
