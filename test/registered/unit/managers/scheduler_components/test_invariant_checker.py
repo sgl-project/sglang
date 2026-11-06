@@ -13,7 +13,7 @@ maybe_stub_sgl_kernel()
 import torch
 
 from sglang.srt.disaggregation.mode import DisaggregationMode
-from sglang.srt.environ import InvariantCheckLevel, envs
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.managers.scheduler_components import invariant_checker
 from sglang.srt.managers.scheduler_components.invariant_checker import (
@@ -124,95 +124,32 @@ class TestCheckTreeCacheGate(CustomTestCase):
             checker.tree_cache.sanity_check.assert_not_called()
 
 
-class TestStateCheckLevels(CustomTestCase):
-    OFF, WARN, STRICT = (
-        InvariantCheckLevel.OFF,
-        InvariantCheckLevel.WARN,
-        InvariantCheckLevel.STRICT,
-    )
-    IDLE = ("idle_pools", "req_pool", "pool_bytes")
-
-    def _table(self, base=None, **levels):
-        """Expected level of every check: `base` (default all OFF) with the
-        keyword checks overridden."""
-        names = (
-            "request_lists",
-            "batch_consistency",
-            "busy_pools",
-            "kv_pages",
-            "idle_pools",
-            "req_pool",
-            "pool_bytes",
-            "tree_cache",
-        )
-        return {**dict.fromkeys(names, self.OFF), **(base or {}), **levels}
-
-    def _idle(self, level):
-        return dict.fromkeys(self.IDLE, level)
-
-    def _levels(self, in_ci, **flags):
-        with patch.dict(os.environ, {}, clear=False):
-            for env in (
-                envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY,
-                envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE,
-                envs.SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK,
-                envs.SGLANG_ENABLE_RUNNING_REQS_CHECK,
-                envs.SGLANG_CHECK_KV_PAGE_INVARIANTS,
-            ):
-                env.clear()
-            envs.SGLANG_IS_IN_CI.set(in_ci)
-            for name, value in flags.items():
-                getattr(envs, name).set(value)
-            checker = SchedulerInvariantChecker(
-                disaggregation_mode=DisaggregationMode.NULL,
-                page_size=1,
-                tree_cache=None,
-                token_to_kv_pool_allocator=None,
-                req_to_token_pool=None,
-                pool_stats_observer=None,
-                get_last_batch=lambda: None,
-                scheduler_stage_metrics=None,
-            )
-            return {c.name: c.level() for cs in checker.checks.values() for c in cs}
-
-    def test_each_flag_decides_its_check_level(self):
-        """Every registered check takes its level from its one flag, in prod and
-        in CI; SGLANG_INVARIANT_CHECK does not apply."""
-        prod = self._table(**self._idle(self.STRICT))
-        ci = self._table(
-            prod,
-            request_lists=self.STRICT,
-            batch_consistency=self.STRICT,
-            tree_cache=self.STRICT,
-        )
-        busy = "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY"
-        kv = "SGLANG_CHECK_KV_PAGE_INVARIANTS"
-        idle = "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE"
-        no_ci_checks = {
-            "SGLANG_ENABLE_RUNNING_REQS_CHECK": False,
-            "SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK": False,
+class TestStateCheckFlags(CustomTestCase):
+    def test_each_check_runs_when_its_own_flag_is_on(self):
+        flags = {
+            "request_lists": envs.SGLANG_ENABLE_RUNNING_REQS_CHECK,
+            "batch_consistency": envs.SGLANG_ENABLE_RUNNING_REQS_CHECK,
+            "busy_pools": envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY,  # an int level
+            "kv_pages": envs.SGLANG_CHECK_KV_PAGE_INVARIANTS,
+            "tree_cache": envs.SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK,
         }
-        cases = [
-            (False, {}, prod),
-            (True, {}, ci),
-            (True, no_ci_checks, prod),
-            (False, {kv: True}, self._table(prod, kv_pages=self.STRICT)),
-            (False, {kv: True, busy: 0}, self._table(prod, kv_pages=self.STRICT)),
-            (False, {busy: 2}, self._table(prod, busy_pools=self.STRICT)),
-            (
-                False,
-                {busy: 1, kv: True, idle: False},
-                self._table(
-                    prod,
-                    **self._idle(self.WARN),
-                    busy_pools=self.STRICT,
-                    kv_pages=self.STRICT,
-                ),
-            ),
-        ]
-        for in_ci, flags, expected in cases:
-            with self.subTest(in_ci=in_ci, **flags):
-                self.assertEqual(self._levels(in_ci, **flags), expected)
+        checker = SchedulerInvariantChecker(
+            disaggregation_mode=DisaggregationMode.NULL,
+            page_size=1,
+            tree_cache=None,
+            token_to_kv_pool_allocator=None,
+            req_to_token_pool=None,
+            pool_stats_observer=None,
+            get_last_batch=lambda: None,
+            scheduler_stage_metrics=None,
+        )
+        checks = {c.name: c for cs in checker.checks.values() for c in cs}
+        for name, flag in flags.items():
+            with self.subTest(check=name):
+                with flag.override(0):
+                    self.assertFalse(checks[name].when())
+                with flag.override(1):
+                    self.assertTrue(checks[name].when())
 
 
 class TestPrivateSwaTokens(CustomTestCase):

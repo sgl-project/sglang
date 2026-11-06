@@ -6,7 +6,6 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.environ import InvariantCheckLevel
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.managers.scheduler_components.request_list import ListKind
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -36,7 +35,7 @@ def _make_checker(page_size=_PAGE_SIZE, row_width=4096, num_reqs=8, free_pages=N
         req_to_token_pool = _rtp
         token_to_kv_pool_allocator = _alloc
         tree_cache = _tc
-        get_last_batch = lambda self: None
+        get_last_batch = lambda self: object()
         get_request_lists = lambda self: {}
         count_memory_leak_warnings = 0
 
@@ -45,7 +44,6 @@ def _make_checker(page_size=_PAGE_SIZE, row_width=4096, num_reqs=8, free_pages=N
         )
 
         _check_kv_page_invariants = _RIC._check_kv_page_invariants
-        _fail = _RIC._fail
         _requests_owning_rows = _RIC._requests_owning_rows
 
     return _FakeChecker(), rtt, tc, alloc
@@ -69,14 +67,13 @@ class TestKVPageInvariants(CustomTestCase):
             ListKind.DECODING: [_FakeOwner(0, 145, 144, rid="a")]
         }
         with self.assertRaises(AssertionError):
-            chk._check_kv_page_invariants(InvariantCheckLevel.STRICT)
+            chk._check_kv_page_invariants()
 
     def test_slot_committed_gt_allocated_raises(self):
         chk, rtt, tc, alloc = _make_checker()
-        chk.get_last_batch = lambda: None
         tc.session_records()["s1"] = _FakeOwner(0, 145, 144).kv
         with self.assertRaises(AssertionError):
-            chk._check_kv_page_invariants(InvariantCheckLevel.STRICT)
+            chk._check_kv_page_invariants()
 
     def test_owner_references_free_page_raises(self):
         # req 0 owns page 5, but page 5 is in the free pool -> use-after-free.
@@ -88,7 +85,7 @@ class TestKVPageInvariants(CustomTestCase):
             ListKind.DECODING: [_FakeOwner(0, 3, 3, rid="a")]
         }
         with self.assertRaises(ValueError):
-            chk._check_kv_page_invariants(InvariantCheckLevel.STRICT)
+            chk._check_kv_page_invariants()
 
     def test_requests_in_any_list_are_checked(self):
         # A request still owns its row while running or parked between chunks.
@@ -101,7 +98,7 @@ class TestKVPageInvariants(CustomTestCase):
                 owner = _FakeOwner(0, 3, 3, rid="a")
                 chk.get_request_lists = lambda: {where: [owner]}
                 with self.assertRaises(ValueError):
-                    chk._check_kv_page_invariants(InvariantCheckLevel.STRICT)
+                    chk._check_kv_page_invariants()
 
     def test_classed_allocator_without_flat_free_list_is_checked(self):
         chk, rtt, _tc, alloc = _make_checker(page_size=4, row_width=8)
@@ -119,7 +116,7 @@ class TestKVPageInvariants(CustomTestCase):
             return_value=2,
         ):
             with self.assertRaisesRegex(ValueError, "use-after-free"):
-                chk._check_kv_page_invariants(InvariantCheckLevel.STRICT)
+                chk._check_kv_page_invariants()
 
         alloc.get_all_free_pages.assert_called()
 
@@ -130,7 +127,7 @@ class TestKVPageInvariants(CustomTestCase):
             ListKind.DECODING: [_FakeOwner(0, 1, 1, rid="a")]
         }
         with self.assertRaises(ValueError):
-            chk._check_kv_page_invariants(InvariantCheckLevel.STRICT)
+            chk._check_kv_page_invariants()
 
 
 if __name__ == "__main__":
