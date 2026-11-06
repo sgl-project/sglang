@@ -371,8 +371,11 @@ def test_gvr2_backend_check_config():
         gvr2.check_config("cuda", 256)
     with pytest.raises(ValueError, match="CUDA"):
         gvr2.check_config("cpu", 2048)
+    with pytest.raises(ValueError, match="deterministic"):
+        gvr2.check_config("cuda", 2048, deterministic=True)
     for backend in (DSATopKBackend.SGL_KERNEL, DSATopKBackend.FLASHINFER):
         backend.check_config("cuda", 256)
+        backend.check_config("cuda", 2048, deterministic=True)
 
 
 if __name__ == "__main__":

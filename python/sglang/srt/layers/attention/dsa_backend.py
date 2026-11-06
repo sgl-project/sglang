@@ -639,7 +639,11 @@ class DeepseekSparseAttnBackend(
         )
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.resolve(model_runner)
         if self.dsa_index_topk is not None:
-            self.dsa_topk_backend.check_config(self.device, self.dsa_index_topk)
+            self.dsa_topk_backend.check_config(
+                self.device,
+                self.dsa_index_topk,
+                deterministic=get_exec().deterministic.enable_deterministic_inference,
+            )
         if self.num_q_heads <= 64:
             self.flashmla_kv_num_q_heads = 64
         elif self.num_q_heads <= 128:

@@ -61,9 +61,21 @@ class DSATopKBackend(Enum):
     def should_use_topk_v2(self) -> bool:
         return self.fallback().is_sgl_kernel() and envs.SGLANG_OPT_USE_TOPK_V2.get()
 
-    def check_config(self, device: Union[str, torch.device], topk: int) -> None:
+    def check_config(
+        self,
+        device: Union[str, torch.device],
+        topk: int,
+        deterministic: bool = False,
+    ) -> None:
         """Raise at startup if this backend cannot serve ``topk`` on ``device``."""
         if self.is_gvr2():
+            # GVR V2 has no deterministic mode: ties at the K-th score and the
+            # slot order within a row are not fixed.
+            if deterministic:
+                raise ValueError(
+                    "flashinfer_gvr2 does not support "
+                    "--enable-deterministic-inference; use sgl-kernel."
+                )
             from sglang.kernels.ops.attention.dsa.gvr2_topk import gvr2_check_config
 
             gvr2_check_config(device, topk)
