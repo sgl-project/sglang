@@ -466,6 +466,11 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def supports_fast_match_prefix(self) -> bool:
         return False
 
+    def peek_prefix_len(self, key: RadixKey) -> Optional[int]:
+        """Cached tokens for ``key`` without changing cache state (no split,
+        LRU or access-time update); None when unsupported."""
+        return None
+
     def touch_prefix(self, key: RadixKey) -> None:
         """Bump LRU recency along ``key``'s cached path. Unlike ``match_prefix``,
         never allocates, loads, or queries external tiers."""

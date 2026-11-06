@@ -348,6 +348,52 @@ class TestUnifiedRadixAllocationEvictionRealComponents(
 
 
 class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
+    def test_peek_prefix_len_is_read_only(self):
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        page = self.cfg.page_size
+        seq_a = self._make_seq(1, 3)
+        self._insert(cache, allocator, req_to_token_pool, seq_a)
+        # Diverges inside the inserted node: match_prefix would split it here.
+        probe = seq_a[: 2 * page] + self._make_seq(5000, 1)
+        if cache.peek_prefix_len(RadixKey(array("q", probe))) is None:
+            self.skipTest("tree core has no read-only probe")
+
+        def snapshot():
+            core = cache.tree_core
+            nodes = sorted(
+                (
+                    node_id,
+                    core.get_parent_node_id(node_id),
+                    core.get_node_key_length(node_id),
+                    core.get_node_hit_count(node_id),
+                )
+                for node_id in core.get_all_node_ids()
+            )
+            lrus = [
+                core.get_component_device_lru_node_ids(ct)
+                for ct in self.cfg.components
+                if ct != ComponentType.FULL
+            ]
+            return nodes, lrus
+
+        before = snapshot()
+        peeked = [
+            cache.peek_prefix_len(RadixKey(array("q", t)))
+            for t in (probe, seq_a, seq_a[:page], self._make_seq(9000, 2))
+        ]
+        self.assertEqual(snapshot(), before)
+
+        for tokens, got in zip(
+            (probe, seq_a, seq_a[:page], self._make_seq(9000, 2)), peeked
+        ):
+            m = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", tokens))))
+            expected = m.device_prefix_len + m.host_hit_length
+            if self.cfg.has_swa:
+                # A split point may satisfy the SWA window; peek never counts it.
+                self.assertLessEqual(got, expected)
+            else:
+                self.assertEqual(got, expected)
+
     def test_insert_and_match_basic(self):
         cache, allocator, req_to_token_pool = build_fixture(self.cfg)
 

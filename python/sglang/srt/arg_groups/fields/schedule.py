@@ -68,6 +68,14 @@ class Schedule(msgspec.Struct):
         bool,
         "Enable dynamic chunk size adjustment for pipeline parallelism. When enabled, chunk sizes are dynamically calculated based on fitted function to maintain consistent execution time across chunks.",
     ] = False
+    pp_min_chunked_prefill_size: A[
+        Optional[int],
+        "Small prefill chunk for pipeline parallelism. When set, a prefill batch uses this chunk unless a pending request has at least --chunked-prefill-size uncached tokens, so batches with few new tokens still fill every stage while long prefills keep the full chunk.",
+    ] = None
+    pp_chunk_overhead_tokens: A[
+        Optional[int],
+        "With --pp-min-chunked-prefill-size, size each prefill chunk from the total uncached tokens U of the pending requests instead: a chunk C costs a fixed overhead worth this many tokens plus C, so the pending prefill takes about (U / C + pp - 1) * (overhead + C), and the chunk doubles from the small one up to --chunked-prefill-size while the doubled chunk is faster (U * overhead >= 2 * (pp - 1) * C^2).",
+    ] = None
     max_prefill_tokens: A[
         int,
         Arg(

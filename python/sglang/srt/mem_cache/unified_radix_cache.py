@@ -706,6 +706,11 @@ class UnifiedRadixCache(BasePrefixCache):
     def supports_fast_match_prefix(self) -> bool:
         return self.tree_core.supports_fast_match_prefix()
 
+    def peek_prefix_len(self, key: RadixKey) -> Optional[int]:
+        if self.disable:
+            return 0
+        return self.tree_core.peek_prefix_len(key)
+
     def touch_prefix(self, key: RadixKey) -> None:
         # Tree walk only; skips match_prefix's session shortcut, finalizers and linker.
         if self.disable:
