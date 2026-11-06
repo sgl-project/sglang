@@ -1090,6 +1090,7 @@ impl MmSpec {
                 image_mean,
                 image_std,
                 resample: resample.into(),
+                video: None,
             }),
         };
         Self {

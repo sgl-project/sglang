@@ -183,8 +183,10 @@ def cases(formats):
 class PythonPath:
     """SGLang's Qwen-VL processor over one checkpoint, one backend and one config."""
 
-    def __init__(self, model_dir, backend, image_overrides):
+    def __init__(self, model_dir, backend, image_overrides, video_config=None):
         mm_process_config = {"image": image_overrides} if image_overrides else {}
+        if video_config:
+            mm_process_config["video"] = video_config
         server_args = SimpleNamespace(
             model_impl="sglang",
             mm_feature_transport="cpu",
@@ -220,8 +222,10 @@ class PythonPath:
         self.processor = QwenVLImageProcessor(
             self.hf_config, server_args, processor, None, skip_mm_pool=True
         )
-        # The CPU path: PIL decode (read by a classmethod), and CPU image kernels.
+        # The CPU path: PIL decode (read by a classmethod), CPU video decode,
+        # and CPU image kernels.
         QwenVLImageProcessor.gpu_image_decode = False
+        QwenVLImageProcessor.video_preprocessing_device = "cpu"
         self.processor._fast_image_processor_device = lambda _processor: "cpu"
         self.spec = self.rust_spec(server_args, processor)
 
