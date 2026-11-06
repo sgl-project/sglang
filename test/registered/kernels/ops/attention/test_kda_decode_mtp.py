@@ -333,7 +333,7 @@ class TestKdaDecodeMtpBf16State(CustomTestCase):
             (4, 4, 2),
             (32, 4, 12),  # Kimi-K3.1 at TP8: 12 KDA heads per rank, 5 tokens
             (16, 6, 12),  # 7 tokens
-            (3, 15, 2),  # 16 tokens, the gate's upper bound
+            (3, 7, 2),  # 8 tokens, the gate's upper bound
         ]
         for n, num_spec, h in cases:
             for ring in (False, True):
