@@ -44,7 +44,7 @@ from sglang.test.kits.inkling_sink_lora_kit import (
     _v2_backend,
 )
 
-register_cuda_ci(est_time=20, stage="nightly", runner_config="1-gpu-large")
+register_cuda_ci(est_time=20, stage="nightly", runner_config="1-gpu-small")
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="the sink kernels need CUDA"
