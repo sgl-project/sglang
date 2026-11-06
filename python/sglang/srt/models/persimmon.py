@@ -23,7 +23,10 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    maybe_remap_kv_scale_name,
+)
 from sglang.srt.runtime_context import get_parallel
 
 
@@ -299,6 +302,12 @@ class PersimmonForCausalLM(nn.Module):
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
+            # Map KV-cache scale names to the attention's k_scale/v_scale.
+            if "scale" in name:
+                name = maybe_remap_kv_scale_name(name, params_dict)
+                if name is None:
+                    continue
+
             if name not in params_dict:
                 if name == "lm_head.weight":
                     continue
