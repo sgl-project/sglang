@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from functools import partial
 from typing import Callable, Optional
 
@@ -21,10 +22,25 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.moe import reduce_moe_output
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
 
 SWIGLUOAI_ALPHA = 1.702  # gpt-oss's fixed sigmoid slope
+# Checkpoint names an MoE layer accepts, relative to the layer's mlp.
+_EXPERT_TENSOR = re.compile(
+    r"experts\.(\d+)\.(gate_proj|up_proj|down_proj|w1|w2|w3)\.weight"
+)
+_SHARD = {
+    "gate_proj": "w1",
+    "w1": "w1",
+    "up_proj": "w3",
+    "w3": "w3",
+    "down_proj": "w2",
+    "w2": "w2",
+}
+_BIAS_NAMES = ("gate.expert_bias", "gate.e_score_correction_bias")
+_SHARED_PREFIXES = ("shared_expert.", "shared_experts.")
 
 
 def _silu_and_mul_clamp(gate_up: torch.Tensor, limit: float) -> torch.Tensor:
@@ -194,6 +210,8 @@ class DraftMoE(nn.Module):
         self.shared_expert_gate = (
             nn.Linear(hidden_size, 1, bias=False) if spec.shared_expert_gated else None
         )
+        self._loaded: set = set()  # canonical names seen by load_weight
+        self._loaded_experts = {"w1": set(), "w2": set(), "w3": set()}
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         x = hidden_states.view(-1, self.hidden_size)
@@ -209,6 +227,121 @@ class DraftMoE(nn.Module):
                 shared = torch.sigmoid(self.shared_expert_gate(x)) * shared
             out = out + shared
         return reduce_moe_output(out).view_as(hidden_states)
+
+    def owns(self, name: str) -> bool:
+        """Whether a checkpoint tensor named relative to the layer's mlp belongs here."""
+        return name.startswith(("gate.", "experts.", "shared_expert"))
+
+    def load_weight(self, name: str, loaded: torch.Tensor) -> None:
+        """Load one tensor named relative to the layer's mlp; unknown names and shapes raise."""
+        spec, H = self.spec, self.hidden_size
+        E, I = spec.num_experts, spec.intermediate_size
+        if name == "gate.weight":
+            self._load_param(self.gate.weight, loaded, (E, H), name)
+        elif name in _BIAS_NAMES:
+            if self.gate.expert_bias is None:
+                raise ValueError(
+                    f"Draft FFN: the checkpoint has {name} but the config does not "
+                    "enable moe_router_enable_expert_bias."
+                )
+            self._load_param(self.gate.expert_bias, loaded, (E,), "gate.expert_bias")
+        elif name == "experts.gate_up_proj":  # SpecForge's stacked [E, 2I, H]
+            _expect_shape(name, loaded, (E, 2 * I, H))
+            w1, w3 = loaded.chunk(2, dim=1)
+            for e in range(E):
+                self._load_expert(e, "w1", w1[e])
+                self._load_expert(e, "w3", w3[e])
+        elif name == "experts.down_proj":  # stacked [E, H, I]
+            _expect_shape(name, loaded, (E, H, I))
+            for e in range(E):
+                self._load_expert(e, "w2", loaded[e])
+        elif match := _EXPERT_TENSOR.fullmatch(
+            name
+        ):  # per-expert, Qwen or DeepSeek names
+            e, shard = int(match.group(1)), _SHARD[match.group(2)]
+            if e >= E:
+                raise ValueError(f"Draft FFN: {name} names expert {e} of {E}.")
+            _expect_shape(name, loaded, (H, I) if shard == "w2" else (I, H))
+            self._load_expert(e, shard, loaded)
+        elif name.startswith(_SHARED_PREFIXES):
+            self._load_shared(name, loaded)
+        elif name == "shared_expert_gate.weight":
+            if self.shared_expert_gate is None:
+                raise ValueError(
+                    "Draft FFN: the checkpoint has shared_expert_gate.weight but the "
+                    "config declares no gated shared expert."
+                )
+            self._load_param(self.shared_expert_gate.weight, loaded, (1, H), name)
+        else:
+            raise ValueError(f"Draft FFN: unexpected tensor {name!r} for an MoE layer.")
+
+    def _load_param(self, param, loaded, shape, name) -> None:
+        _expect_shape(name, loaded, shape)
+        getattr(param, "weight_loader", default_weight_loader)(param, loaded)
+        self._loaded.add(name)
+
+    def _load_expert(self, expert_id: int, shard: str, loaded: torch.Tensor) -> None:
+        """FusedMoE's own loader: slices for TP and skips experts other EP ranks own."""
+        param_name = "experts.w2_weight" if shard == "w2" else "experts.w13_weight"
+        param = getattr(self.experts, param_name.split(".")[1])
+        self.experts.weight_loader(param, loaded, param_name, shard, expert_id)
+        self._loaded_experts[shard].add(expert_id)
+
+    def _load_shared(self, name: str, loaded: torch.Tensor) -> None:
+        if self.shared_expert is None:
+            raise ValueError(
+                f"Draft FFN: the checkpoint has {name} but the config declares no "
+                "shared expert."
+            )
+        rest = name.split(".", 1)[1]
+        match = re.fullmatch(r"(gate_proj|up_proj|down_proj|w1|w2|w3)\.weight", rest)
+        if match is None:
+            raise ValueError(f"Draft FFN: unexpected shared-expert tensor {name!r}.")
+        shard = _SHARD[match.group(1)]
+        S, H = self.spec.shared_expert_intermediate_size, self.hidden_size
+        canonical = {"w1": "gate_proj", "w3": "up_proj", "w2": "down_proj"}[shard]
+        if shard == "w2":
+            param = self.shared_expert.down_proj.weight
+            _expect_shape(name, loaded, (H, S))
+            param.weight_loader(param, loaded)
+        else:
+            param = self.shared_expert.gate_up_proj.weight
+            _expect_shape(name, loaded, (S, H))
+            param.weight_loader(param, loaded, 0 if shard == "w1" else 1)
+        self._loaded.add(f"shared_expert.{canonical}.weight")
+
+    def check_loaded(self) -> None:
+        """Every tensor the spec promises arrived; a partly loaded MoE layer must not serve."""
+        E = self.spec.num_experts
+        missing = []
+        if "gate.weight" not in self._loaded:
+            missing.append("gate.weight")
+        if self.gate.expert_bias is not None and "gate.expert_bias" not in self._loaded:
+            missing.append("gate.expert_bias")
+        for shard in ("w1", "w3", "w2"):
+            absent = sorted(set(range(E)) - self._loaded_experts[shard])
+            if absent:
+                missing.append(
+                    f"experts {shard} for {len(absent)} experts, e.g. {absent[:4]}"
+                )
+        if self.shared_expert is not None:
+            for part in ("gate_proj", "up_proj", "down_proj"):
+                if f"shared_expert.{part}.weight" not in self._loaded:
+                    missing.append(f"shared_expert.{part}.weight")
+        if self.shared_expert_gate is not None:
+            if "shared_expert_gate.weight" not in self._loaded:
+                missing.append("shared_expert_gate.weight")
+        if missing:
+            raise ValueError(
+                f"Draft FFN: MoE layer is missing {missing} in the checkpoint."
+            )
+
+
+def _expect_shape(name: str, loaded: torch.Tensor, shape: tuple) -> None:
+    if tuple(loaded.shape) != tuple(shape):
+        raise ValueError(
+            f"Draft FFN: {name} has shape {tuple(loaded.shape)}, expected {tuple(shape)}."
+        )
 
 
 def _routing_method(spec: DraftMoeFFNSpec):
