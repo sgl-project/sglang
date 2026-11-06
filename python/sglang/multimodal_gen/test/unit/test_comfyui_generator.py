@@ -162,7 +162,11 @@ def test_executor_reports_real_runtime_import_error(capsys) -> None:
     import torch
 
     blocked = "sglang.multimodal_gen.runtime.entrypoints.utils"
-    base = _load_with_blocked_import("executors/base.py", "_sgld_base_blocked", blocked)
+    base = _load_with_blocked_import(
+        "executors/base.py",
+        "sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors._base_blocked",
+        blocked,
+    )
     printed = capsys.readouterr().out
     assert blocked in printed
     assert "is not installed" not in printed

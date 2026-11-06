@@ -7,6 +7,8 @@ import uuid
 
 import torch
 
+from ..convert import CONVERT_COMMAND
+
 try:
     from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
     from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
@@ -132,8 +134,9 @@ def _reject_model_patches(transformer_options) -> None:
             "SGLD integrated mode runs the diffusion model in its worker and cannot "
             f"apply ComfyUI model patches ({', '.join(sorted(found))}). Remove "
             "speed-only patch nodes (attention backends, caches, compile) and set "
-            "the equivalent in SGLDOptions; for ControlNet or block patches, use "
-            "the native ComfyUI loader"
+            "the equivalent in SGLDOptions (the workflow converter lists them: "
+            f"{CONVERT_COMMAND}); for ControlNet or block patches, use the native "
+            "ComfyUI loader"
         )
 
 
@@ -200,7 +203,7 @@ class SGLDiffusionExecutor(torch.nn.Module):
         raise RuntimeError(
             "The SGLD worker owns this diffusion model's weights, so ComfyUI weight "
             "nodes (LoraLoader, ModelSave, model merging) cannot use it; load LoRAs "
-            "with SGLDLoraLoader"
+            f"with SGLDLoraLoader, or convert the workflow: {CONVERT_COMMAND}"
         )
 
     @staticmethod

@@ -6,6 +6,8 @@ import copy
 
 from comfy.model_patcher import ModelPatcher
 
+from ..convert import CONVERT_COMMAND
+
 
 class SGLDModelPatcher(ModelPatcher):
     """Model patcher for SGLang Diffusion models in ComfyUI."""
@@ -69,7 +71,8 @@ class SGLDModelPatcher(ModelPatcher):
             raise ValueError(
                 "A ComfyUI LoRA or weight-patch node is applied to an SGLD model, "
                 "whose weights live in the SGLD worker; load LoRAs with "
-                "SGLDLoraLoader (SGLDiffusion LoRA Loader) instead"
+                "SGLDLoraLoader (SGLDiffusion LoRA Loader) instead, or convert the "
+                f"workflow: {CONVERT_COMMAND}"
             )
         return []
 
