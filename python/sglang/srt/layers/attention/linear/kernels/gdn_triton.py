@@ -42,6 +42,10 @@ class TritonGDNKernel(LinearAttnKernelBase):
 
     supports_packed_decode: bool = not is_cpu() and not is_npu()
     supports_strided_target_verify_qkv: bool = True
+    # ``chunk_gated_delta_rule`` forwards ``track_state`` to the fused chunk
+    # kernel, so the radix track path can snapshot the fp32 chunk-boundary
+    # state instead of rounding it through the bf16 ``h`` output.
+    supports_track_state_snapshot: bool = not is_cpu() and not is_npu() and not is_xpu()
 
     def packed_decode(
         self,
@@ -207,6 +211,17 @@ class TritonGDNKernel(LinearAttnKernelBase):
             # control. Its existing behavior is equivalent to True.
             inplace_update_args = {}
 
+        # The radix track path asks for an fp32 snapshot of the state at a
+        # chunk boundary that is not the request's last position. Forward it so
+        # the chunk kernel writes the buffer in fp32 instead of snapping the
+        # bf16 ``h`` output (which silently rounds the cached state).
+        track_kwargs = {}
+        if kwargs.get("track_state") is not None:
+            track_kwargs = {
+                "track_state": kwargs["track_state"],
+                "track_chunk_idx": kwargs.get("track_chunk_idx"),
+            }
+
         return chunk_gated_delta_rule(
             q=q,
             k=k,
@@ -220,6 +235,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
             **recurrent_state_indices_args,
             **inplace_update_args,
             **graph_table_args,
+            **track_kwargs,
         )
 
     def target_verify(
