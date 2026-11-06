@@ -513,6 +513,7 @@ class TestPrePlannedReplayRestage(CustomTestCase):
         runner.ragged_verify_mode = False
         runner.deepep_adapter = SimpleNamespace(replay=lambda: None)
         runner.bs, runner.captured_req_width, runner.raw_num_token = 2, 2, 4
+        runner.raw_bs, runner.require_mlp_tp_gather = 2, False
         runner.buffers = SimpleNamespace(
             input_ids=torch.zeros(4, dtype=torch.int64),
             positions=torch.zeros(4, dtype=torch.int64),
