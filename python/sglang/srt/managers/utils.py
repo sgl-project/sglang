@@ -278,6 +278,23 @@ class GenerationBatchResult:
         )
 
 
+def max_schedulable_input_len(
+    *, max_req_len: int, kv_capacity: int, page_size: int, kv_shard_widening: int
+) -> int:
+    """Longest prompt an empty KV pool still admits with one new token.
+
+    kv_capacity is the widened capacity (max_total_num_tokens * kv_shard_widening).
+    Scheduler.init_req_max_new_tokens clips max_new_tokens to what fits after
+    the page-rounded prompt and one reserved page per shard, and admission
+    needs prompt + max_new_tokens + one page per shard below kv_capacity. A
+    longer prompt gets max_new_tokens = 0 and is never admitted, so it blocks
+    the head of the waiting queue.
+    """
+    reserved = page_size * kv_shard_widening
+    page_aligned_cap = (kv_capacity - reserved - 2) // page_size * page_size
+    return min(max_req_len - 5, page_aligned_cap)
+
+
 def validate_input_length(
     req: Req, max_req_input_len: int, allow_auto_truncate: bool
 ) -> Optional[str]:

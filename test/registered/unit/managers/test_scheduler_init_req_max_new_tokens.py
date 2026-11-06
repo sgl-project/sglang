@@ -1,11 +1,13 @@
 import logging
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.utils import max_schedulable_input_len
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -228,6 +230,52 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
                 req = self._new_req(max_new_tokens=1, input_len=prompt_len)
                 scheduler.init_req_max_new_tokens(req)
                 self.assertEqual(req.sampling_params.max_new_tokens, 1)
+
+    def test_prompt_at_max_req_input_len_gets_new_tokens(self):
+        # --allow-auto-truncate cuts prompts to max_req_input_len; with fewer
+        # than one new token such a request is never admitted.
+        for page_size in (1, 16, 64):
+            for shard_widening in (1, 2, 4):
+                for max_total_num_tokens in (4096, 4100):
+                    with self.subTest(
+                        page_size=page_size,
+                        shard_widening=shard_widening,
+                        max_total_num_tokens=max_total_num_tokens,
+                    ):
+                        kv_capacity = max_total_num_tokens * shard_widening
+                        input_len = max_schedulable_input_len(
+                            max_req_len=kv_capacity - 1,
+                            kv_capacity=kv_capacity,
+                            page_size=page_size,
+                            kv_shard_widening=shard_widening,
+                        )
+                        scheduler = self._new_scheduler(
+                            max_req_len=kv_capacity - 1,
+                            max_total_num_tokens=max_total_num_tokens,
+                            page_size=page_size,
+                            kv_shard_widening=shard_widening,
+                        )
+                        req = self._new_req(max_new_tokens=64, input_len=input_len)
+                        self.assertGreaterEqual(self._init_and_check(scheduler, req), 1)
+
+    def test_max_new_tokens_follow_the_truncated_prompt(self):
+        scheduler = self._new_scheduler(
+            max_req_len=1023, max_total_num_tokens=1024, page_size=16
+        )
+        scheduler.max_req_input_len = max_schedulable_input_len(
+            max_req_len=1023, kv_capacity=1024, page_size=16, kv_shard_widening=1
+        )
+        req = self._new_req(max_new_tokens=16, input_len=2048)
+
+        with mock.patch(
+            "sglang.srt.managers.scheduler.get_serving",
+            return_value=SimpleNamespace(allow_auto_truncate=True),
+        ):
+            error_msg = scheduler._validate_input_and_init_max_new_tokens(req)
+
+        self.assertIsNone(error_msg)
+        self.assertEqual(len(req.origin_input_ids), scheduler.max_req_input_len)
+        self.assertGreaterEqual(req.sampling_params.max_new_tokens, 1)
 
 
 if __name__ == "__main__":

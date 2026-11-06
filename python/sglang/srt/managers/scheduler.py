@@ -2867,6 +2867,16 @@ class Scheduler(
             record_step_time=RECORD_STEP_TIME,
         )
 
+    def _validate_input_and_init_max_new_tokens(self, req) -> Optional[str]:
+        # Clip max_new_tokens to the prompt that remains after truncation.
+        error_msg = validate_input_length(
+            req=req,
+            max_req_input_len=self.max_req_input_len,
+            allow_auto_truncate=get_serving().allow_auto_truncate,
+        )
+        self.init_req_max_new_tokens(req)
+        return error_msg
+
     def init_req_max_new_tokens(self, req):
         input_len = len(req.origin_input_ids)
         max_new_tokens = (
@@ -3441,15 +3451,7 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
-        # initialize before returning
-        self.init_req_max_new_tokens(req)
-
-        # Validate prompt length
-        error_msg = validate_input_length(
-            req,
-            self.max_req_input_len,
-            get_serving().allow_auto_truncate,
-        )
+        error_msg = self._validate_input_and_init_max_new_tokens(req)
         if error_msg:
             req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)

@@ -108,7 +108,9 @@ class TestDcpLogicalCapacity(CustomTestCase):
         for config in (
             patch(
                 "sglang.srt.managers.tp_worker.get_schedule",
-                return_value=NS(max_prefill_tokens=16384, max_queued_requests=None),
+                return_value=NS(
+                    max_prefill_tokens=16384, max_queued_requests=None, page_size=1
+                ),
             ),
         ):
             config.start()
