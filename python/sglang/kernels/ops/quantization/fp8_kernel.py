@@ -26,6 +26,7 @@ from sglang.kernels.ops.quantization.fp8_utils import fp8_dtype_to_triton
 from sglang.srt.environ import envs
 from sglang.srt.utils import (
     ceil_align,
+    is_cpu,
     is_cuda,
     is_hip,
     is_musa,
@@ -37,6 +38,7 @@ _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_musa = is_musa()
 _is_xpu = is_xpu()
+_is_cpu = is_cpu()
 _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 
 if _is_cuda:
@@ -808,6 +810,28 @@ def sglang_per_token_quant_fp8(
 
 if _is_cuda:
     per_token_group_quant_fp8 = sglang_per_token_group_quant_fp8
+elif _is_cpu:
+
+    def per_token_group_quant_fp8(
+        x: torch.Tensor,
+        group_size: int,
+        eps: float = 1e-10,
+        dtype: torch.dtype = fp8_dtype,
+        column_major_scales: bool = False,
+        scale_tma_aligned: bool = False,
+        scale_ue8m0: bool = False,
+        fuse_silu_and_mul: bool = False,
+        masked_m: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        assert dtype == torch.float8_e4m3fn
+        assert not column_major_scales
+        assert not scale_tma_aligned
+        assert not scale_ue8m0
+        assert not fuse_silu_and_mul
+        assert masked_m is None
+        return torch.ops.sgl_kernel.sgl_per_token_group_quant_8bit_cpu(
+            x, group_size, eps
+        )
 else:
     per_token_group_quant_fp8 = _per_token_group_quant_8bit_raw
 
@@ -886,6 +910,15 @@ def static_quant_fp8(
     """
     assert x.is_contiguous(), "`x` is not contiguous"
     assert x_s.numel() == 1, "only supports per-tensor scale"
+
+    if _is_cpu:
+        x_q_2d, _ = torch.ops.sgl_kernel.sgl_per_tensor_quant_fp8_cpu(
+            x.reshape(-1, x.shape[-1]), x_s
+        )
+        x_q = x_q_2d.reshape(x.shape)
+        if repeat_scale:
+            return x_q, x_s.repeat(x.numel() // x.shape[-1]).view(-1, 1)
+        return x_q, x_s
 
     x_q = torch.empty_like(x, device=x.device, dtype=fp8_dtype)
     M = x.numel() // x.shape[-1]
@@ -1222,6 +1255,36 @@ if _is_hip:
             else:
                 _native_static_quant_fp8(output, input, scale)
 
+        return output, scale
+
+elif _is_cpu:
+
+    def scaled_fp8_quant(
+        input: torch.Tensor,
+        scale: Optional[torch.Tensor] = None,
+        num_token_padding: Optional[int] = None,
+        use_per_token_if_dynamic: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert input.ndim == 2, f"Expected 2D input tensor, got {input.ndim}D"
+        per_token = scale is None and use_per_token_if_dynamic
+        if per_token:
+            output, scale = torch.ops.sgl_kernel.sgl_per_token_quant_fp8_cpu(input)
+        else:
+            output, computed_scale = torch.ops.sgl_kernel.sgl_per_tensor_quant_fp8_cpu(
+                input, scale
+            )
+            if scale is None:
+                scale = computed_scale
+
+        num_rows = input.shape[0]
+        if num_token_padding and num_token_padding > num_rows:
+            padded = output.new_zeros((num_token_padding, input.shape[1]))
+            padded[:num_rows] = output
+            output = padded
+            if per_token:
+                padded_scale = scale.new_zeros((num_token_padding, 1))
+                padded_scale[:num_rows] = scale
+                scale = padded_scale
         return output, scale
 
 else:
