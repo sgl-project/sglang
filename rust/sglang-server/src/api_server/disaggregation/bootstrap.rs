@@ -315,11 +315,7 @@ async fn route_get(
             kv_cache_dtype: topo.kv_cache_dtype.clone(),
             kv_layout: topo.kv_layout.clone(),
             dsv41_spec_layout: topo.dsv41_spec_layout.clone(),
-            spec_kv_layout: if query.get("spec_kv_layout").is_some_and(|v| v == "1") {
-                topo.spec_kv_layout.clone()
-            } else {
-                None
-            },
+            spec_kv_layout: topo.spec_kv_layout.clone(),
             follow_bootstrap_room: topo.follow_bootstrap_room.unwrap_or(true),
             enable_dsa_cache_layer_split: topo.enable_dsa_cache_layer_split.unwrap_or(false),
             stores_to_linker: topo.stores_to_linker.unwrap_or(false),
@@ -609,7 +605,7 @@ mod tests {
     }
 
     #[test]
-    fn spec_kv_layout_opt_in_and_rank_compatibility() {
+    fn spec_kv_layout_rank_compatibility() {
         let (_rt, addr) = start_on_free_port();
         let layout = serde_json::json!({
             "algorithm": "DSPARK", "num_draft_entries": 6, "dspark_block_size": 4
@@ -628,11 +624,6 @@ mod tests {
         assert_eq!(request(addr, "PUT", "/route", Some(&draftless)).0, 200);
         let (status, body) = request(addr, "GET", SENTINEL, None);
         assert_eq!(status, 200);
-        let info: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert!(info.get("spec_kv_layout").is_none());
-
-        let query = format!("{SENTINEL}&spec_kv_layout=1");
-        let (_, body) = request(addr, "GET", &query, None);
         let info: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(info["spec_kv_layout"], layout);
     }

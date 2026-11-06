@@ -1344,12 +1344,17 @@ class CommonKVManager(BaseKVManager):
             url = (
                 f"http://{bootstrap_addr}/route?"
                 f"prefill_dp_rank={-1}&prefill_cp_rank={-1}&"
-                f"target_tp_rank={-1}&target_pp_rank={-1}&spec_kv_layout=1"
+                f"target_tp_rank={-1}&target_pp_rank={-1}"
             )
             response = requests.get(url, timeout=5)
             if response.status_code == 200:
                 data = response.json()
-                info = PrefillServerInfo(**data)
+                # Ignore fields a newer prefill publishes that this decode
+                # does not know, so bootstrap can grow without lockstep upgrades.
+                known = {f.name for f in dataclasses.fields(PrefillServerInfo)}
+                info = PrefillServerInfo(
+                    **{key: value for key, value in data.items() if key in known}
+                )
             else:
                 logger.error(
                     f"Failed to get prefill server info: {response.status_code}, {response.text}"
@@ -1431,6 +1436,10 @@ class CommonKVManager(BaseKVManager):
                     "servers (including prefill CP ranks for MLA)"
                 )
 
+        # Only a prefill that injects draft KV publishes a layout. Decode ranks
+        # without draft KV entries (draftless PP stages, state-only drafts)
+        # carry None and skip the comparison; a target-only decode carries {}
+        # and is rejected, since it cannot consume the injected bytes.
         if (
             info.spec_kv_layout is not None
             and self.spec_kv_layout is not None
@@ -1654,7 +1663,9 @@ class CommonKVManager(BaseKVManager):
             "kv_cache_dtype": self.kv_cache_dtype_str,
             "kv_layout": self.kv_layout,
             "dsv41_spec_layout": self.dsv41_spec_layout,
-            "spec_kv_layout": self.spec_kv_layout,
+            # Only an injected draft KV layout goes on the wire; {} (no draft
+            # KV by design) is sent as absent so peers never see a new field.
+            "spec_kv_layout": self.spec_kv_layout or None,
             "load_balance_method": get_parallel().load_balance_method,
             "enable_dsa_cache_layer_split": get_parallel().enable_dsa_cache_layer_split,
             "enable_kv_cache_sharding": get_parallel().enable_kv_cache_sharding,
@@ -3314,11 +3325,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             payload = dataclasses.asdict(info)
             if info.dsv41_spec_layout is None:
                 payload.pop("dsv41_spec_layout")
-            # Old decodes reject unknown PrefillServerInfo fields.
-            if (
-                info.spec_kv_layout is None
-                or request.query.get("spec_kv_layout") != "1"
-            ):
+            if info.spec_kv_layout is None:
                 payload.pop("spec_kv_layout")
             if info.kv_layout is None:
                 payload.pop("kv_layout")

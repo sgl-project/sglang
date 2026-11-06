@@ -58,7 +58,7 @@ def decode_manager(spec_kv_layout):
     return manager
 
 
-def prefill_info(spec_kv_layout):
+def prefill_info(spec_kv_layout, **extra):
     info = PrefillServerInfo(
         attn_tp_size=1,
         attn_cp_size=1,
@@ -72,6 +72,7 @@ def prefill_info(spec_kv_layout):
     payload = dataclasses.asdict(info)
     if spec_kv_layout is None:
         payload.pop("spec_kv_layout")
+    payload.update(extra)
     response = MagicMock(status_code=200)
     response.json.return_value = payload
     return response
@@ -87,10 +88,8 @@ def register(server, row, **fields):
     return asyncio.run(server._handle_route_put(request))
 
 
-def route(server, *, opt_in=False):
+def route(server):
     query = dict(SENTINEL_QUERY)
-    if opt_in:
-        query["spec_kv_layout"] = "1"
     response = asyncio.run(server._handle_route_get(SimpleNamespace(query=query)))
     return response.status, json.loads(
         response.text
@@ -107,12 +106,12 @@ class TestSpecKVLayout(CustomTestCase):
         self.assertEqual(layout("DSPARK", num_draft_entries=0), None)
         self.assertEqual(layout("DFLASH"), {**DSPARK, "algorithm": "DFLASH"})
 
-    def test_decode_compares_only_known_layouts(self):
+    def test_decode_compares_only_published_layouts(self):
         cases = {
-            "ordinary PD or decode-only EAGLE": ({}, {}, None),
+            "ordinary PD or decode-only EAGLE": ({}, None, None),
             "matched DSpark": (DSPARK, DSPARK, None),
-            "legacy prefill": (DSPARK, None, None),
-            "DSpark decode, target-only prefill": (DSPARK, {}, "mismatch"),
+            "legacy, target-only, or draftless prefill": (DSPARK, None, None),
+            "DSpark prefill, draftless decode PP stage": (None, DSPARK, None),
             "DSpark prefill, target-only decode": ({}, DSPARK, "mismatch"),
             "different draft entries": (
                 DSPARK,
@@ -142,7 +141,16 @@ class TestSpecKVLayout(CustomTestCase):
                         self.assertTrue(
                             manager.try_ensure_parallel_info("prefill:8998")
                         )
-                    self.assertIn("spec_kv_layout=1", get.call_args.args[0])
+                    self.assertNotIn("spec_kv_layout", get.call_args.args[0])
+
+    def test_decode_ignores_fields_it_does_not_know(self):
+        manager = decode_manager({})
+        with patch(
+            "sglang.srt.disaggregation.common.conn.requests.get",
+            return_value=prefill_info(None, future_field={"v": 2}),
+        ):
+            self.assertTrue(manager.try_ensure_parallel_info("prefill:8998"))
+        self.assertEqual(len(manager.prefill_info_table), 1)
 
 
 class TestSpecKVLayoutBootstrap(CustomTestCase):
@@ -164,11 +172,11 @@ class TestSpecKVLayoutBootstrap(CustomTestCase):
             kv_cache_dtype="bf16",
         )
 
-    def test_draftless_ranks_and_old_decodes_are_compatible(self):
+    def test_draftless_ranks_are_compatible(self):
         cases = [
             ((None, DSPARK), DSPARK),
             ((DSPARK, None), DSPARK),
-            (({}, {}), {}),
+            ((None, None), None),
         ]
         for order, expected in cases:
             with self.subTest(order=order):
@@ -180,9 +188,8 @@ class TestSpecKVLayoutBootstrap(CustomTestCase):
                     self.assertEqual(status, 200)
                 status, payload = route(server)
                 self.assertEqual(status, 200)
-                self.assertNotIn("spec_kv_layout", payload)
-                _, payload = route(server, opt_in=True)
-                self.assertEqual(payload["spec_kv_layout"], expected)
+                self.assertEqual(payload.get("spec_kv_layout"), expected)
+                self.assertEqual("spec_kv_layout" in payload, expected is not None)
 
     def test_known_layouts_must_agree_across_ranks(self):
         server = bootstrap_server()

@@ -1639,8 +1639,11 @@ def get_dsv41_spec_layout(kv_args: KVArgs) -> Optional[dict]:
 
 
 def get_spec_kv_layout(kv_args: KVArgs) -> Optional[dict]:
-    """Prefill-injected draft KV layout: {} when the algorithm injects none,
-    None when this rank has no draft KV entries, so peers skip the comparison."""
+    """Prefill-injected draft KV layout for this rank.
+
+    {} when the algorithm injects none (target-only, EAGLE, NEXTN), None when
+    this rank has no draft KV entries (draftless PP stage, state-only drafts)
+    so it skips the comparison. Only a non-empty layout is published."""
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
     spec = get_spec()

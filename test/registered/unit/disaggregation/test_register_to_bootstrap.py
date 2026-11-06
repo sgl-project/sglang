@@ -65,6 +65,8 @@ class TestRegisterToBootstrap(CustomTestCase):
         for field in required_fields:
             self.assertIn(field, payload)
         self.assertEqual(payload["prefill_http_port"], 30000)
+        # An empty layout never goes on the wire as a new field.
+        self.assertIsNone(payload["spec_kv_layout"])
 
     @patch("sglang.srt.disaggregation.common.conn.requests.put")
     def test_rust_attention_dp_replicates_complete_topology_across_hosts(
@@ -209,6 +211,8 @@ class TestRegisterToBootstrap(CustomTestCase):
         mgr.system_dp_rank = 0
         mgr.local_ip = "127.0.0.1"
         mgr.rank_port = 12345
+        # Target-only prefill: knows it injects no draft KV.
+        mgr.spec_kv_layout = {}
 
         mgr.kv_args = MagicMock()
         mgr.kv_args.page_size = 16
