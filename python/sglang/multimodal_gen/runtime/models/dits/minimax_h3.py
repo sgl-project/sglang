@@ -22,6 +22,10 @@ from sglang.kernels.ops.activation.activation import (
     silu_and_mul_with_activation_rounding,
     silu_and_mul_with_activation_rounding_,
 )
+from sglang.kernels.ops.activation.swiglu_mxfp8_swizzled import (
+    can_use_silu_mul_mxfp8,
+    silu_mul_mxfp8,
+)
 from sglang.kernels.ops.diffusion import (
     MINIMAX_H3_NORM_MODULATE,
     BitExactFusionGate,
@@ -29,9 +33,7 @@ from sglang.kernels.ops.diffusion import (
     can_use_aten_head_rmsnorm,
     can_use_aten_head_rmsnorm_rope,
     can_use_fused_inplace_qknorm_rope,
-    can_use_mxfp8_swizzled,
     can_use_rmsnorm_indexed_scale_shift,
-    can_use_silu_mul_mxfp8,
     fused_inplace_qknorm_rope,
     fused_qknorm_rope_out_of_place,
     indexed_gate_bf16,
@@ -42,10 +44,12 @@ from sglang.kernels.ops.diffusion import (
     indexed_scale_shift_fp32_,
     indexed_scale_shift_mxfp8_,
     rmsnorm_indexed_scale_shift,
-    silu_mul_mxfp8,
     tensors_equal,
 )
 from sglang.kernels.ops.layernorm.norm import fused_inplace_qknorm
+from sglang.kernels.ops.quantization.mxfp8_swizzled_triton import (
+    can_use_mxfp8_swizzled,
+)
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
     MINIMAX_H3_ADALN_MODALITY_NUM,
@@ -77,6 +81,9 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import (
 from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn_h3 import (
     vsa_h3_fold_gate,
 )
+from sglang.multimodal_gen.runtime.layers.attention.layer import (
+    PIPELINED_ATTENTION_BACKENDS,
+)
 from sglang.multimodal_gen.runtime.layers.attention.selector import (
     claim_deferred_component_attn_backend,
     get_attn_backend,
@@ -94,7 +101,11 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
 )
 from sglang.multimodal_gen.runtime.layers.usp import (
     _ring_attention_varlen,
+    _usp_all_gather,
+    _usp_input_all_to_all_packed_qkv,
+    _usp_output_all_to_all,
     ulysses_head_group_pipelined_attention,
+    uncached_a2a_staging,
 )
 from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.managers.forward_context import (
@@ -769,12 +780,49 @@ def _minimax_h3_bind_attention_backend(
         )
 
 
-# FlashAttention on Hopper and cuDNN SDPA on Blackwell give a head group the
-# same bytes as those heads inside the full call (checked at H3's shapes)
-_PIPELINED_ATTENTION_BACKENDS = (
-    AttentionBackendEnum.FA,
-    AttentionBackendEnum.DYNAMIC_CUDNN_SDPA,
-)
+def _minimax_h3_pad_only_tail(
+    impl, cu_seqlens_host: tuple[int, ...] | None, max_seqlen: int
+) -> bool:
+    """Whether the packing ends in alignment rows (cu_seqlens ``[0, used,
+    total]``) that the pipelined group attention leaves zero."""
+    return (
+        isinstance(impl, DynamicCudnnSDPAImpl)
+        and cu_seqlens_host is not None
+        and len(cu_seqlens_host) == 3
+        and cu_seqlens_host[:2] == (0, max_seqlen)
+        and cu_seqlens_host[2] > max_seqlen
+    )
+
+
+def _minimax_h3_sequential_dense_attention(
+    attention: MiniMaxH3Attention,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    cu_seqlens: torch.Tensor,
+    cu_seqlens_host: tuple[int, ...] | None,
+    max_seqlen: int,
+) -> torch.Tensor:
+    """The exchange-attend-exchange the pipelined dense attention replaces."""
+    impl = attention._attention_impl
+    # once per shape: leave no staging behind that later calls never use
+    with uncached_a2a_staging():
+        q, k, v = _usp_input_all_to_all_packed_qkv(q, k, v)
+        out = impl.forward_varlen(
+            q,
+            k,
+            v,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            cu_seqlens_host=cu_seqlens_host,
+        )
+        out = _usp_output_all_to_all(out[None], head_dim=2)[0]
+    if _minimax_h3_pad_only_tail(impl, cu_seqlens_host, max_seqlen):
+        # nothing reads the alignment rows, and the pipeline leaves them zero
+        _, rank = get_ulysses_ctx()
+        out[max(max_seqlen - rank * out.shape[0], 0) :].zero_()
+    return out
 
 
 def _minimax_h3_pipelined_dense_attention(
@@ -786,18 +834,21 @@ def _minimax_h3_pipelined_dense_attention(
     cu_seqlens: torch.Tensor,
     cu_seqlens_host: tuple[int, ...] | None,
     max_seqlen: int,
+    sequential,
     fill=None,
 ) -> torch.Tensor | None:
     """Dense attention with the Ulysses exchange pipelined over head groups.
 
     Returns None (caller keeps the sequential exchange) unless head-group
     pipelining is enabled and a dense backend that runs a head group exactly
-    as it runs those heads in the full call would serve it.
+    as it runs those heads in the full call would serve it. ``sequential()``
+    returns what the sequential exchange gives for this call; the first call
+    of each shape checks the pipeline against it.
     """
     groups = envs.SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS
     if groups in (0, 1) or torch.compiler.is_compiling():
         return None
-    if attention._attention_backend_enum not in _PIPELINED_ATTENTION_BACKENDS:
+    if attention._attention_backend_enum not in PIPELINED_ATTENTION_BACKENDS:
         return None
     impl = attention._attention_impl
     skip_softmax = getattr(impl, "_request_skip_softmax_threshold", None)
@@ -813,7 +864,20 @@ def _minimax_h3_pipelined_dense_attention(
         cu_seqlens_host=cu_seqlens_host,
         max_seqlen=max_seqlen,
     )
-    return ulysses_pipelined_attention(q, k, v, attend, groups, fill=fill)
+    return ulysses_pipelined_attention(
+        q,
+        k,
+        v,
+        attend,
+        groups,
+        fill=fill,
+        sequential=sequential,
+        signature=(
+            type(impl).__name__,
+            fill is not None,
+            _minimax_h3_pad_only_tail(impl, cu_seqlens_host, max_seqlen),
+        ),
+    )
 
 
 def _minimax_h3_group_attend(
@@ -830,13 +894,7 @@ def _minimax_h3_group_attend(
     per-segment call, written straight into the output when the backend can.
     """
     used = max_seqlen
-    pad_only_tail = (
-        isinstance(impl, DynamicCudnnSDPAImpl)
-        and cu_seqlens_host is not None
-        and len(cu_seqlens_host) == 3
-        and cu_seqlens_host[:2] == (0, used)
-        and cu_seqlens_host[2] > used
-    )
+    pad_only_tail = _minimax_h3_pad_only_tail(impl, cu_seqlens_host, max_seqlen)
 
     def attend(q_group, k_group, v_group):
         if not pad_only_tail:
@@ -940,6 +998,31 @@ def _minimax_h3_qknorm_rope_pipelined_attention(
     cos_sin_cache, positions = rope_cache
     head_dim = attention.head_dim
     q_weight, k_weight = attention.q_norm.weight, attention.k_norm.weight
+    pipeline_kwargs = dict(
+        cu_seqlens=cu_seqlens,
+        cu_seqlens_host=cu_seqlens_host,
+        max_seqlen=max_seqlen,
+    )
+
+    def sequential():
+        # the caller's fallback: the in-place norm, then the sequential exchange
+        q_normed, k_normed = q.clone(), k.clone()
+        fused_inplace_qknorm_rope(
+            q_normed,
+            k_normed,
+            q_weight,
+            k_weight,
+            cos_sin_cache,
+            positions,
+            is_neox=True,
+            eps=attention.q_norm.eps,
+            head_dim=head_dim,
+            rope_dim=cos_sin_cache.shape[-1],
+            round_norm_before_rope=True,
+        )
+        return _minimax_h3_sequential_dense_attention(
+            attention, q_normed, k_normed, v, **pipeline_kwargs
+        )
 
     def fill(
         head_start: int, head_count: int, q_dst: torch.Tensor, k_dst: torch.Tensor
@@ -962,14 +1045,7 @@ def _minimax_h3_qknorm_rope_pipelined_attention(
         )
 
     return _minimax_h3_pipelined_dense_attention(
-        attention,
-        q,
-        k,
-        v,
-        cu_seqlens=cu_seqlens,
-        cu_seqlens_host=cu_seqlens_host,
-        max_seqlen=max_seqlen,
-        fill=fill,
+        attention, q, k, v, **pipeline_kwargs, sequential=sequential, fill=fill
     )
 
 
@@ -1003,7 +1079,14 @@ def _minimax_h3_attention_core_impl(
             max_seqlen=max_seqlen,
         )
         out = _minimax_h3_pipelined_dense_attention(
-            attention, q, k, v, **pipeline_kwargs
+            attention,
+            q,
+            k,
+            v,
+            **pipeline_kwargs,
+            sequential=lambda: _minimax_h3_sequential_dense_attention(
+                attention, q, k, v, **pipeline_kwargs
+            ),
         )
         if out is None:
             out = _minimax_h3_collective_pipelined_attention(
@@ -1013,12 +1096,6 @@ def _minimax_h3_attention_core_impl(
             return out
 
     if ulysses_active:
-        from sglang.multimodal_gen.runtime.layers.usp import (
-            _usp_all_gather,
-            _usp_input_all_to_all_packed_qkv,
-            _usp_output_all_to_all,
-        )
-
         q, k, v = _usp_input_all_to_all_packed_qkv(q, k, v)
 
     if attention._attention_backend_enum is AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3:

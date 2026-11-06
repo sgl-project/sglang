@@ -1792,12 +1792,25 @@ class KVWriteLoc:
             self.swa_loc = self.swa_loc[: self.loc.shape[0]]
         if self.full_loc is not None and self.full_loc.shape[0] != self.loc.shape[0]:
             self.full_loc = self.full_loc[: self.loc.shape[0]]
+        _check_dense_loc(self.loc, "loc")
+        _check_dense_loc(self.swa_loc, "swa_loc")
+        _check_dense_loc(self.full_loc, "full_loc")
+
+
+def _check_dense_loc(loc: Optional[torch.Tensor], name: str) -> None:
+    # The KV write kernels index a loc by flat offset; a strided view would
+    # silently write other rows' slots.
+    if loc is not None and not loc.is_contiguous():
+        raise ValueError(
+            f"KV write {name} must be contiguous: {tuple(loc.shape)=} {loc.stride()=}"
+        )
 
 
 def unwrap_write_loc(loc_info):
     """Return ``(loc, swa_loc, full_loc)`` from a ``KVWriteLoc`` or a bare loc."""
     if isinstance(loc_info, KVWriteLoc):
         return loc_info.loc, loc_info.swa_loc, loc_info.full_loc
+    _check_dense_loc(loc_info, "loc")
     return loc_info, None, None
 
 
@@ -5229,6 +5242,16 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
                 cache_k_nope_fp4_sf,
                 cache_k_rope_fp4_sf,
             )
+
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        super().move_kv_cache(tgt_loc, src_loc)
+        if tgt_loc.numel() == 0:
+            return
+
+        tgt_loc_flat = tgt_loc.view(-1).long()
+        src_loc_flat = src_loc.view(-1).long()
+        for kv_scale in self.kv_scale_buffer:
+            kv_scale[tgt_loc_flat] = kv_scale[src_loc_flat]
 
 
 class DSATokenToKVPool(MLATokenToKVPool):
