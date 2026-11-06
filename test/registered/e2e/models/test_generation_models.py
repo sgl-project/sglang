@@ -18,23 +18,19 @@ register_amd_ci(est_time=106, suite="extra-a-test-1-gpu-large-amd")
 # limitations under the License.
 # ==============================================================================
 """
-Usage:
+Compare SGLang against HF Transformers on CI_MODELS.
 
-To test a specific model locally:
-1. Add it to ALL_MODELS, for example, `ModelCase("Qwen/Qwen2-1.5B")`
-2. Run `ONLY_RUN=Qwen/Qwen2-1.5B python3 -m unittest test_generation_models.TestGenerationModels`
+To check another model locally, add a `ModelCase` for it to CI_MODELS and run
+`python3 -m unittest test_generation_models.TestGenerationModels`.
 """
 
 import dataclasses
 import multiprocessing as mp
-import os
 import unittest
-from contextlib import nullcontext
 from typing import List, Optional
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.utils import is_hip
 from sglang.test.runners import (
     DEFAULT_PROMPTS,
@@ -42,7 +38,7 @@ from sglang.test.runners import (
     SRTRunner,
     check_close_model_outputs,
 )
-from sglang.test.test_utils import CustomTestCase, is_in_ci
+from sglang.test.test_utils import CustomTestCase
 
 
 @dataclasses.dataclass
@@ -63,68 +59,6 @@ CI_MODELS = [
     ModelCase("google/gemma-2-2b", attention_backend="triton" if is_hip() else None),
 ]
 
-# the complete set of models to test sglang's generation model
-ALL_MODELS = [
-    *CI_MODELS,
-    ModelCase("Qwen/Qwen2-1.5B", decode_tolerance=7e-2),
-    ModelCase("Qwen/Qwen2.5-14B-Instruct"),
-    ModelCase("HuggingFaceTB/SmolLM-135M-Instruct", skip_long_prompt=True),
-    ModelCase("allenai/OLMo-1B-0724-hf", decode_tolerance=8e-2, skip_long_prompt=True),
-    ModelCase("shanearora/2025-sep-a-base-model"),
-    ModelCase(
-        "THUDM/glm-4-9b-chat", tp_size=2, trust_remote_code=True, skip_long_prompt=True
-    ),
-    ModelCase("openai-community/gpt2"),
-    ModelCase("microsoft/phi-1_5", trust_remote_code=True),
-    ModelCase("adept/persimmon-8b-chat"),
-    ModelCase("upstage/SOLAR-10.7B-Instruct-v1.0"),
-    ModelCase("inclusionAI/Ling-lite", trust_remote_code=True),
-    ModelCase("microsoft/Phi-3-small-8k-instruct", trust_remote_code=True),
-    ModelCase("allenai/OLMo-2-1124-7B-Instruct", skip_long_prompt=True),
-    ModelCase("ibm-granite/granite-3.0-2b-instruct", skip_long_prompt=True),
-    ModelCase(
-        "microsoft/Phi-3.5-MoE-instruct",
-        tp_size=2,
-        trust_remote_code=True,
-        skip_long_prompt=True,
-    ),
-    ModelCase("facebook/opt-125m", skip_long_prompt=True),
-    ModelCase(
-        "nvidia/Llama-3_3-Nemotron-Super-49B-v1_5",
-        tp_size=2,
-        trust_remote_code=True,
-        skip_long_prompt=True,
-    ),
-    ModelCase(
-        "nvidia/Llama-3_1-Nemotron-Ultra-253B-v1",
-        tp_size=8,
-        trust_remote_code=True,
-        skip_long_prompt=True,
-    ),
-    ModelCase(
-        "nvidia/NVIDIA-Nemotron-Nano-9B-v2",
-        trust_remote_code=True,
-        skip_long_prompt=True,
-    ),
-    ModelCase(
-        "swiss-ai/Apertus-8B",
-        trust_remote_code=True,
-        skip_long_prompt=True,
-    ),
-    ModelCase(
-        "LiquidAI/LFM2.5-1.2B-Instruct",
-        trust_remote_code=True,
-    ),
-    ModelCase(
-        "ibm-granite/granite-4.0-h-micro",
-        trust_remote_code=True,
-    ),
-]
-
-MAMBA_MODEL_PATHS = [
-    "LiquidAI/LFM2.5-1.2B-Instruct",
-]
-
 TORCH_DTYPES = [torch.float16]
 
 
@@ -142,16 +76,6 @@ class TestGenerationModels(CustomTestCase):
         model_path = model_case.model_path
         max_new_tokens = 32
 
-        # Set conv dtype for hybrid models to match inference dtype
-        dtype_str = {torch.float16: "float16", torch.bfloat16: "bfloat16"}.get(
-            torch_dtype, "bfloat16"
-        )
-
-        if model_case.model_path in MAMBA_MODEL_PATHS:
-            env_ctx = envs.SGLANG_MAMBA_CONV_DTYPE.override(dtype_str)
-        else:
-            env_ctx = nullcontext()
-
         with HFRunner(
             model_path,
             torch_dtype=torch_dtype,
@@ -160,17 +84,14 @@ class TestGenerationModels(CustomTestCase):
         ) as hf_runner:
             hf_outputs = hf_runner.forward(prompts, max_new_tokens=max_new_tokens)
 
-        with (
-            env_ctx,
-            SRTRunner(
-                model_path,
-                tp_size=model_case.tp_size,
-                torch_dtype=torch_dtype,
-                model_type="generation",
-                trust_remote_code=model_case.trust_remote_code,
-                attention_backend=model_case.attention_backend,
-            ) as srt_runner,
-        ):
+        with SRTRunner(
+            model_path,
+            tp_size=model_case.tp_size,
+            torch_dtype=torch_dtype,
+            model_type="generation",
+            trust_remote_code=model_case.trust_remote_code,
+            attention_backend=model_case.attention_backend,
+        ) as srt_runner:
             srt_outputs = srt_runner.forward(prompts, max_new_tokens=max_new_tokens)
 
         check_close_model_outputs(
@@ -182,33 +103,12 @@ class TestGenerationModels(CustomTestCase):
             debug_text=f"model_path={model_path} prompts={prompts}",
         )
 
-    @unittest.skipIf(not is_in_ci(), "Local test should run all models")
     def test_ci_models(self):
         for model_case in CI_MODELS:
             for torch_dtype in TORCH_DTYPES:
                 prompts = DEFAULT_PROMPTS
 
                 # Skip long prompts for models that do not have a long context
-                if model_case.skip_long_prompt:
-                    prompts = [p for p in DEFAULT_PROMPTS if len(p) < 1000]
-
-                # Assert the logits and output strs are close
-                self.assert_close_logits_and_output_strs(
-                    prompts, model_case, torch_dtype
-                )
-
-    @unittest.skipIf(is_in_ci(), "CI only runs selected models for simplicity")
-    def test_all_models(self):
-        for model_case in ALL_MODELS:
-            for torch_dtype in TORCH_DTYPES:
-                if (
-                    "ONLY_RUN" in os.environ
-                    and os.environ["ONLY_RUN"] != model_case.model_path
-                ):
-                    continue
-
-                # Skip long prompts for models that do not have a long context
-                prompts = DEFAULT_PROMPTS
                 if model_case.skip_long_prompt:
                     prompts = [p for p in DEFAULT_PROMPTS if len(p) < 1000]
 

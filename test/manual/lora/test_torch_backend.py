@@ -3,7 +3,8 @@ import unittest
 import torch
 
 from sglang.srt.lora.backend.torch_backend import TorchNativeLoRABackend
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.lora_utils import reference_sgmv_expand, reference_sgmv_shrink
 from sglang.test.test_utils import CustomTestCase
 

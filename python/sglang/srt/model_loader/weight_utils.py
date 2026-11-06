@@ -50,6 +50,7 @@ from sglang.srt.configs.model_config import (
     ModelConfig,
     is_qwen3_5_mtp_draft,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import QuantizationConfig, get_quantization_config
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.modelopt_quant import (
@@ -73,8 +74,7 @@ from sglang.srt.utils import (
     log_info_on_rank0,
     print_warning_once,
 )
-from sglang.srt.utils.common import is_cuda_alike
-from sglang.utils import is_in_ci
+from sglang.srt.utils.device import is_cuda_alike
 
 try:
     from fastsafetensors import SafeTensorsFileLoader, SingleGroup
@@ -595,7 +595,7 @@ def _find_local_hf_snapshot_dir_unlocked(
 
     # Only perform cache validation and cleanup in CI to avoid
     # unnecessary overhead for regular users
-    if is_in_ci() and local_weight_files:
+    if envs.SGLANG_IS_IN_CI.get() and local_weight_files:
         is_valid = ci_validate_and_cleanup_local_snapshot(
             model_name_or_path, found_local_snapshot_dir, local_weight_files
         )
@@ -691,7 +691,7 @@ def download_weights_from_hf(
 
         log_info_on_rank0(logger, f"Using model weights format {allow_patterns}")
 
-        if not is_in_ci():
+        if not envs.SGLANG_IS_IN_CI.get():
             # Simple download without validation for non-CI environments
             hf_folder = snapshot_download(
                 model_name_or_path,
@@ -1290,7 +1290,9 @@ def fastsafetensors_weights_iterator(
     except Exception:
         rank = 0
 
-    device = torch.device(f"cuda:{rank}")
+    # The group rank is global; on multi-node TP it exceeds the local GPU count.
+    # ModelRunner has already set this process's device (its gpu_id).
+    device = torch.device("cuda", torch.cuda.current_device())
 
     weight_files_sub_lists = [
         hf_weights_files[i : i + pg.size()]
@@ -1756,6 +1758,11 @@ def initialize_dummy_weights(
     the parameter's number of elements and its data type.
     """
     for name, param in model.state_dict().items():
+        # UE8M0 MXFP8 block scales (uint8): 127 is 2**0. Left at zero, every
+        # MXFP8 weight scales to 2**-127.
+        if name.endswith("weight_scale_inv") and param.dtype == torch.uint8:
+            param.fill_(127)
+            continue
         if torch.is_floating_point(param):
             # Neutral FP4 global scales keep fused gate/up projections compatible.
             if name.endswith(("weight_scale_inv", "weight_scale_2")):
@@ -1793,6 +1800,13 @@ def maybe_remap_kv_scale_name(name: str, params_dict: dict) -> Optional[str]:
              if no remapping is needed.
         None: If the remapped name is not found in params_dict.
     """
+    # ModelSlim: map fa_k.scale to attn_mqa.fa_k_scale; skip unused FA parameters.
+    stem, _, parameter = name.rpartition(".")
+    prefix, _, component = stem.rpartition(".")
+    if parameter in ("scale", "offset") and component in ("fa_q", "fa_k", "fa_v"):
+        remapped_name = f"{prefix}.attn_mqa.{component}_{parameter}"
+        return remapped_name if remapped_name in params_dict else None
+
     if name.endswith(".kv_scale"):
         print_warning_once(
             "DEPRECATED. Found kv_scale in the checkpoint. "
