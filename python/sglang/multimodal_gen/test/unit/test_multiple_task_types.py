@@ -220,7 +220,7 @@ def http_client(monkeypatch, tmp_path, request):
         return complete_dispatch()
 
     monkeypatch.setattr(image_api, "process_generation_batch", generate)
-    monkeypatch.setattr(image_api, "_upload_and_cleanup_images", upload)
+    monkeypatch.setattr(image_api.cloud_storage, "upload_all_and_cleanup", upload)
     monkeypatch.setattr(video_api, "_dispatch_job_async", dispatch)
     app = FastAPI()
     app.include_router(image_api.router)
