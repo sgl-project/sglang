@@ -708,7 +708,9 @@ def _compact_candidates(
     width = max(int(num_valid.max()), 1)
     slot = torch.where(valid, valid.cumsum(dim=-1) - 1, width)
     candidates = torch.zeros(
-        (*valid.shape[:-1], width + 1), dtype=torch.int64
+        (*valid.shape[:-1], width + 1),
+        dtype=torch.int64,
+        device=logical_to_all_physical_map.device,
     ).scatter_(-1, slot, logical_to_all_physical_map.to(torch.int64))
     return candidates[..., :width], num_valid
 
@@ -723,12 +725,15 @@ def _nearest_expert_dispatch(
 ) -> torch.Tensor:
     """Vectorized _find_nearest_expert for every (layer, logical expert, rank)."""
     width = candidates.shape[-1]
-    valid = torch.arange(width) < num_valid[..., None]
-    ranks = torch.arange(ep_size)
+    device = candidates.device
+    valid = torch.arange(width, device=device) < num_valid[..., None]
+    ranks = torch.arange(ep_size, device=device)
 
     def first_match(owner_of_candidate, owner_of_rank):
         # width is the max replica count (a few), so a slot loop beats a strided reduction.
-        count = torch.zeros((*candidates.shape[:-1], ep_size), dtype=torch.int64)
+        count = torch.zeros(
+            (*candidates.shape[:-1], ep_size), dtype=torch.int64, device=device
+        )
         picked = torch.full_like(count, -1)
         for k in reversed(range(width)):
             match = valid[..., k, None] & (
@@ -750,18 +755,6 @@ def _nearest_expert_dispatch(
         result = torch.where((result == -1) & narrows, node_pick, result)
     single = (num_valid == 1)[..., None]
     return torch.where(single, candidates[..., :1].expand_as(result), result)
-
-
-def _logical_to_all_physical_raw(
-    logical_to_all_physical_map, layer_id: int, logical_expert_id: int
-) -> List[int]:
-    return [
-        physical_expert_id
-        for physical_expert_id in logical_to_all_physical_map[
-            layer_id, logical_expert_id
-        ].tolist()
-        if physical_expert_id != -1
-    ]
 
 
 def _compute_gpu_id_of_physical_expert(
