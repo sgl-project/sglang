@@ -62,7 +62,11 @@ def resolve_chat_encoding_spec(
 def spec_supports_inline_system(spec: Optional[str]) -> bool:
     """Native encoders verified to render mid-conversation system messages in place."""
     # K3's tokenizer renders in Python, so there is no Jinja source to probe.
-    return spec == "kimi_k3"
+    # dsv41 is the same shape: its encoder converts the message list itself
+    # (deepseek-recipe for the dsv4 family), so a system turn past index 0 is
+    # rendered where it sits, and the checkpoint ships no chat_template for the
+    # probe to read.
+    return spec in ("kimi_k3", "dsv41")
 
 
 def spec_owns_reasoning_history(spec: Optional[str]) -> bool:
