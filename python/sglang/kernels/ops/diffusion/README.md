@@ -126,10 +126,9 @@ Keep that convention explicit at their call sites; do not add it to direct
 kernel entry points.
 
 A kernel that is only built or validated for one architecture generation gates
-on `common.platform.is_cuda_sm_at_least(min_sm, x.device)` inside its
-`can_use_*` predicate. That predicate checks for a CUDA build before comparing
-the compute capability, because ROCm reports a gfx-derived capability that
-would otherwise clear a plain `>= (10, 0)` test. Kernel-level predicates stop
+on `sglang.kernels.arch.current_arch().is_sm_at_least(major, minor)` inside its
+`can_use_*` predicate. That query is false off NVIDIA CUDA, because ROCm reports
+a gfx-derived capability that would otherwise clear a plain `>= (10, 0)` test. Kernel-level predicates stop
 at the tensor contract, the architecture floor and
 `torch.compiler.is_compiling()`; grad mode and stream capture are the model
 gate's business.
@@ -261,9 +260,10 @@ existing two kernels and the fusion, both alone and with the same FP8 GEMM.
 
 ### MXFP8 producers (online `mxfp8`, cuBLASLt block-scaled GEMM on SM100)
 
-Defined in `sglang.kernels.ops.quantization.mxfp8_swizzled_triton` (`silu_mul_mxfp8` in
-`sglang.kernels.ops.activation.swiglu_mxfp8_swizzled`, `indexed_scale_shift_mxfp8_` in
-`modulate/indexed_scale_shift_mxfp8_triton.py`) and re-exported here.
+`mxfp8_quantize_swizzled` lives in `sglang.kernels.ops.quantization.mxfp8_swizzled_triton`
+and `silu_mul_mxfp8` in `sglang.kernels.ops.activation.swiglu_mxfp8_swizzled`; import them
+from there. `indexed_scale_shift_mxfp8_` (`modulate/indexed_scale_shift_mxfp8_triton.py`) is
+exported here.
 
 | Entry point | Backend | Contract |
 |---|---|---|
