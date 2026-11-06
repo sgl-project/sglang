@@ -112,6 +112,12 @@ repos:
         language: system
         files: ^(\.github/workflows/.*\.yml|scripts/ci/opt_in_ci_tiers\.json|scripts/lint/check_opt_in_ci_tiers\.py)$
         pass_filenames: false
+      - id: check-amd-rerun-runners
+        name: check /rerun-test --amd runners match the AMD PR-test workflows
+        entry: python3 scripts/lint/check_amd_rerun_runners.py
+        language: system
+        files: ^(\.github/workflows/pr-test-amd(-extra)?\.yml|scripts/ci/partition_rerun_tests\.py|scripts/lint/check_amd_rerun_runners\.py)$
+        pass_filenames: false
       - id: check-rust-ext-cache-prefix
         name: check rust-ext cache key prefix defaults match
         entry: python3 scripts/lint/check_rust_ext_cache_prefix.py

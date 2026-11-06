@@ -16,6 +16,27 @@ STEP_TIMEOUT_SECONDS = 60 * 60
 UBUNTU_CPU_SUITES = {"base-a-test-cpu"}
 # rerun-test never builds sgl-kernel, so `$b200_runner` resolves to this pool.
 B200_RERUN_RUNNER = "4-gpu-b200"
+# AMD suite -> runner of the job that runs it in pr-test-amd.yml / pr-test-amd-extra.yml;
+# scripts/lint/check_amd_rerun_runners.py keeps the two in sync.
+# Unlisted AMD suites (nightly, disaggregation) are not dispatchable by /rerun-test.
+AMD_SUITE_RUNNERS = {
+    "stage-a-test-1-gpu-small-amd": "linux-mi300-1gpu-sglang",
+    "stage-b-test-1-gpu-small-amd": "linux-mi300-1gpu-sglang",
+    "stage-b-test-1-gpu-small-amd-nondeterministic": "linux-mi300-1gpu-sglang",
+    "stage-b-test-1-gpu-small-amd-mi35x": "linux-mi35x-gpu-1",
+    "stage-b-test-1-gpu-large-amd": "linux-mi300-1gpu-sglang",
+    "stage-b-test-2-gpu-large-amd": "linux-mi300-2gpu-sglang",
+    "jit-kernel-unit-test-amd": "linux-mi300-1gpu-sglang",
+    "jit-kernel-benchmark-test-amd": "linux-mi300-1gpu-sglang",
+    "sgl-kernel-unit-test-2-gpu-amd": "linux-mi300-2gpu-sglang",
+    "stage-c-test-4-gpu-amd": "linux-mi300-4gpu-sglang",
+    "stage-c-test-large-8-gpu-amd": "linux-mi300-8gpu-sglang",
+    "stage-c-test-large-8-gpu-amd-mi35x": "linux-mi35x-gpu-8",
+    "extra-a-test-1-gpu-small-amd": "linux-mi300-1gpu-sglang",
+    "extra-a-test-1-gpu-large-amd": "linux-mi300-1gpu-sglang",
+    "extra-a-test-2-gpu-large-amd": "linux-mi300-2gpu-sglang",
+    "extra-b-test-4-gpu-amd": "linux-mi300-4gpu-sglang",
+}
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -46,8 +67,8 @@ def _runner_config_labels():
     return {name: resolve_runs_on(cfg) for name, cfg in runner_configs.load().items()}
 
 
-def _registrations(path, register_name):
-    """Return [(est_time, runner_config, suite)] or None if any estimate is unusable."""
+def _registrations(path, register_name, keys=("runner_config", "suite")):
+    """Return [(est_time, *values of keys)] or None if any estimate is unusable."""
     try:
         tree = ast.parse(path.read_text())
     except (OSError, SyntaxError):
@@ -73,13 +94,29 @@ def _registrations(path, register_name):
         ):
             return None
         tags = []
-        for key in ("runner_config", "suite"):
+        for key in keys:
             try:
                 tags.append(ast.literal_eval(kwargs[key]))
             except (KeyError, ValueError, TypeError):
                 tags.append(None)
         found.append((estimate, *tags))
     return found
+
+
+def _amd_registrations(path):
+    """[(est_time, suite)] of every `register_amd_ci(...)`, or None like _registrations."""
+    found = _registrations(path, "register_amd_ci", ("runner_config", "suite", "stage"))
+    if found is None:
+        return None
+    # The suite name CIRegistry.effective_suite gives these registrations.
+    return [
+        (est, f"{stage}-test-{rc}" if stage and rc else suite)
+        for est, rc, suite, stage in found
+    ]
+
+
+def amd_suites(path):
+    return [suite for _, suite in _amd_registrations(path) or []]
 
 
 @functools.cache
@@ -112,6 +149,16 @@ def estimate_seconds(command, root, mode, runs_on=""):
         if case:
             return cases.get(case.group(1))
         return standalone.get(filename, standalone.get(Path(filename).name))
+
+    if mode == "amd":
+        filename = command.split()[0].split("::", 1)[0]
+        found = _amd_registrations(root / "test" / filename)
+        if not found:
+            return None
+        matching = [
+            est for est, suite in found if AMD_SUITE_RUNNERS.get(suite) == runs_on
+        ]
+        return max(matching or [est for est, _ in found])
 
     register_name = {"cuda": "register_cuda_ci", "cpu": "register_cpu_ci"}.get(mode)
     if register_name is None:
