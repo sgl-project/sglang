@@ -420,8 +420,8 @@ class MambaAttnBackendBase(AttentionBackend):
             in_capture=in_capture,
             mamba_track_indices=getattr(forward_batch, "mamba_track_indices", None),
             ragged_verify_layout=forward_batch.ragged_verify_layout,
-            extend_start_loc=getattr(forward_batch, "extend_start_loc", None),
-            extend_seq_lens=getattr(forward_batch, "extend_seq_lens", None),
+            extend_start_loc=forward_batch.extend_start_loc,
+            extend_seq_lens=forward_batch.extend_seq_lens,
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
