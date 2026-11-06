@@ -21,6 +21,7 @@ from sglang.kernels.ops.quantization.fp4_fake_quant import (
 )
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.speculative.ragged_verify import ragged_verify_token_rows
 from sglang.srt.utils import add_prefix, is_gfx95_supported
 
 
@@ -76,6 +77,15 @@ def token_req_indices(forward_batch, *, num_tokens=None) -> torch.Tensor:
     if forward_batch.forward_mode.is_decode():
         return req
     if forward_batch.forward_mode.is_target_verify():
+        layout = forward_batch.ragged_verify_layout
+        if layout is not None:
+            # Tokens past qo_indptr[-1] take pool slot 0, like the padded rows of
+            # a dense verify graph.
+            rows = ragged_verify_token_rows(
+                layout,
+                forward_batch.positions.shape[0] if num_tokens is None else num_tokens,
+            )
+            return torch.cat([req, req.new_zeros(1)])[rows]
         return torch.repeat_interleave(
             req, int(forward_batch.spec_info.draft_token_num), output_size=num_tokens
         )
