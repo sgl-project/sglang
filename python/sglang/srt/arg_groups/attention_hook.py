@@ -542,6 +542,7 @@ def _check_gdn_replayssm_ucache(server_args: Any) -> None:
     _check_gdn_replayssm_ucache_spec(cfg, flag=flag)
     _check_gdn_replayssm_ucache_cache(cfg, flag=flag)
     _check_gdn_replayssm_ucache_megakernel(cfg, flag=flag)
+    _set_gdn_ucache_state_dtype_env(flag=flag)
     if cfg.mamba_ssm_dtype is None:
         logger.info(f"{flag}: setting --mamba-ssm-dtype float16 (UMMA fp16 state).")
         declare_resolution(
@@ -551,6 +552,18 @@ def _check_gdn_replayssm_ucache(server_args: Any) -> None:
         raise ValueError(
             f"{flag} requires --mamba-ssm-dtype float16 (the UMMA kernels keep an "
             f"fp16 state pool); got {cfg.mamba_ssm_dtype!r}."
+        )
+
+
+def _set_gdn_ucache_state_dtype_env(*, flag: str) -> None:
+    # FlashInfer's gdn_prefix_materialize fixes its state dtype when
+    # flashinfer.gdn_kernels is first imported; scheduler processes inherit this.
+    # The UMMA verify kernels take their dtypes from the tensors.
+    value = os.environ.setdefault("GDN_UCACHE_STATE_DTYPE", "fp16")
+    if value.strip().lower() != "fp16":
+        raise ValueError(
+            f"{flag} needs GDN_UCACHE_STATE_DTYPE=fp16 (an fp16 state pool for "
+            f"gdn_prefix_materialize); got {value!r}."
         )
 
 

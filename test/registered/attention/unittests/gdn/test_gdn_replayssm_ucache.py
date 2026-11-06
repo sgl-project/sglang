@@ -7,14 +7,20 @@ commit, a gather of the wrong slot or a fold that drops records shows up as drif
 from the fp32 truth, which advances each slot's state by exactly its accepted tokens.
 """
 
-import unittest
+import os
 
-import pytest
-import torch
-import torch.nn.functional as F
+# As in serving (the server-args hook): FlashInfer fixes the materialize kernel's
+# state dtype at the first flashinfer.gdn_kernels import; the verify must not care.
+os.environ.setdefault("GDN_UCACHE_STATE_DTYPE", "fp16")
 
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+import unittest  # noqa: E402
+
+import pytest  # noqa: E402
+import torch  # noqa: E402
+import torch.nn.functional as F  # noqa: E402
+
+from sglang.test.ci.ci_register import register_cuda_ci  # noqa: E402
+from sglang.test.test_utils import CustomTestCase  # noqa: E402
 
 register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 

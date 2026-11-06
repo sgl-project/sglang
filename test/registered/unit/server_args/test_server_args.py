@@ -22,6 +22,7 @@ from sglang.srt.arg_groups import (
 )
 from sglang.srt.arg_groups.attention_hook import (
     _check_gdn_replayssm_ucache_cache,
+    _set_gdn_ucache_state_dtype_env,
     handle_attention_backend_compatibility,
     handle_deterministic_inference,
 )
@@ -1153,6 +1154,15 @@ class TestGdnReplaySsmUcacheRadixGuard(unittest.TestCase):
     def test_radix_without_skip_decode_insert_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "gdn_prefix_materialize"):
             self._check()
+
+    def test_state_dtype_env_is_set_to_fp16_and_conflicts_rejected(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("GDN_UCACHE_STATE_DTYPE", None)
+            _set_gdn_ucache_state_dtype_env(flag=self.FLAG)
+            self.assertEqual(os.environ["GDN_UCACHE_STATE_DTYPE"], "fp16")
+        with patch.dict(os.environ, {"GDN_UCACHE_STATE_DTYPE": "bf16"}):
+            with self.assertRaisesRegex(ValueError, "GDN_UCACHE_STATE_DTYPE=fp16"):
+                _set_gdn_ucache_state_dtype_env(flag=self.FLAG)
 
     def test_int8_checkpoint_is_rejected_with_radix(self):
         with self.assertRaisesRegex(ValueError, "--enable-int8-mamba-checkpoint"):
