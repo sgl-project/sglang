@@ -1676,6 +1676,29 @@ class TestPrefillAdder(CustomTestCase):
                             req, "mamba"
                         )
 
+    def test_idle_budget_failure_defers_staged_prefix_unless_kv_awaits_transfer(self):
+        for kv_awaiting_transfer in (False, True):
+            with self.subTest(kv_awaiting_transfer=kv_awaiting_transfer):
+                self.mock_token_allocator = self.create_token_allocator(
+                    available_size=100
+                )
+                self.mock_tree_cache = self.create_tree_cache()
+                self.mock_tree_cache.buffer_pipeline = MagicMock()
+                adder = self.create_adder(
+                    self.create_running_batch(),
+                    kv_awaiting_transfer=kv_awaiting_transfer,
+                )
+                req = self._create_delayer_req(1000)
+
+                result = adder.add_one_req(req, False, None)
+
+                self.assertIs(result, AddReqResult.NO_TOKEN)
+                defer = self.mock_tree_cache.buffer_pipeline.defer_staged_admission
+                if kv_awaiting_transfer:
+                    defer.assert_not_called()
+                else:
+                    defer.assert_called_once_with(req, "prefill_budget")
+
     def test_mamba_chunk_continuation_does_not_charge_restored_state_again(self):
         adder, req = self._build_mamba_restore_admission(
             holds_state=False, available_slots=2

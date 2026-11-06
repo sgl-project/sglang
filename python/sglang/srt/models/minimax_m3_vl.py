@@ -7,6 +7,7 @@ from typing import Iterable, List, Optional, Tuple
 import torch
 import torch.nn as nn
 
+from sglang.srt.hf_transformers import get_rope_config
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.utils import (
     get_moe_a2a_backend,
@@ -14,7 +15,7 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import PPMissingLayer
-from sglang.srt.layers.utils.common import get_layer_id
+from sglang.srt.layers.utils.common import add_prefix, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
@@ -45,14 +46,12 @@ from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.multimodal.encoder_preprocessing import EncoderMediaProcessorConfig
 from sglang.srt.runtime_context import get_mm, get_parallel
 from sglang.srt.utils import (
-    add_prefix,
     get_device_sm,
     is_cuda,
     is_gfx95_supported,
     is_hip,
     log_info_on_rank0,
 )
-from sglang.srt.utils.hf_transformers import get_rope_config
 
 logger = logging.getLogger(__name__)
 
