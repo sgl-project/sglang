@@ -570,7 +570,13 @@ class TestShardedDSAIndexerWrite(unittest.TestCase):
         self.addCleanup(cm.__exit__, None, None, None)
 
     def test_cuda_writers_match_unsharded_bytes(self):
+        for fp4 in (False, True):
+            with self.subTest(fp4=fp4):
+                self._check_cuda_writers_match_unsharded_bytes(fp4)
+
+    def _check_cuda_writers_match_unsharded_bytes(self, use_fp4_indexer):
         from sglang.srt.layers.attention.dsa import dsa_indexer
+        from sglang.srt.layers.attention.dsa.dsa_fp4_indexer import Fp4Indexer
 
         if not dsa_indexer._is_cuda:
             self.skipTest("requires CUDA indexer writers")
@@ -605,6 +611,8 @@ class TestShardedDSAIndexerWrite(unittest.TestCase):
         indexer = SimpleNamespace(
             block_size=128,
             scale_fmt="ue8m0",
+            is_neox_style=False,
+            fused_indexer_hadamard=False,
             k_norm=SimpleNamespace(
                 weight=torch.randn((128,), device=device, generator=generator),
                 bias=torch.randn((128,), device=device, generator=generator),
@@ -612,9 +620,9 @@ class TestShardedDSAIndexerWrite(unittest.TestCase):
             ),
             _indexer_cos_sin_cache=torch.cat((angles.cos(), angles.sin()), dim=-1),
         )
-        indexer._store_index_k_cache = MethodType(
-            dsa_indexer.Indexer._store_index_k_cache, indexer
-        )
+        indexer_cls = Fp4Indexer if use_fp4_indexer else dsa_indexer.Indexer
+        for name in ("_store_index_k_cache", "_write_index_k_cache"):
+            setattr(indexer, name, MethodType(getattr(indexer_cls, name), indexer))
         batch = SimpleNamespace(out_cache_loc=locations)
         pool_args = dict(
             page_size=page_size,
@@ -626,6 +634,7 @@ class TestShardedDSAIndexerWrite(unittest.TestCase):
             index_head_dim=128,
             enable_memory_saver=False,
             kv_cache_dim=576,
+            use_fp4_indexer=use_fp4_indexer,
         )
         reference = DSATokenToKVPool(num_pages * page_size, **pool_args)
         sharded = PageInterleaveDSATokenToKVPool.__new__(PageInterleaveDSATokenToKVPool)
@@ -649,7 +658,8 @@ class TestShardedDSAIndexerWrite(unittest.TestCase):
         ).roll(7)
         local_buffer = sharded.index_key_cache.get_local_buffer(0)
 
-        for fused_prepare in (False, True):
+        # Fp4Indexer has no fused preparation.
+        for fused_prepare in (False,) if use_fp4_indexer else (False, True):
             with self.subTest(fused_prepare=fused_prepare):
                 for buffer in (reference_buffer, local_buffer, scratch):
                     buffer.zero_()
@@ -691,10 +701,12 @@ def _attention_backend(pool, req_to_token, device, prefill_impl="flashmla_sparse
     backend.dsa_topk_backend = DSATopKBackend.SGL_KERNEL
     backend.dsa_packed_extend_topk = False
     backend.physical_page_size = 64
+    backend.real_page_span = 64
     backend.use_mha = False
     backend.use_fused_topk = False
     backend.num_q_heads = 8
-    backend.dcp_size = 1
+    backend.attn_dcp_size, backend.attn_dcp_rank = 1, 0
+    backend.dsa_shards_index_k = False
     backend.num_dcp_q_heads = backend.num_q_heads
     backend.kv_lora_rank = 512
     backend.qk_nope_head_dim = 128
@@ -705,6 +717,7 @@ def _attention_backend(pool, req_to_token, device, prefill_impl="flashmla_sparse
     backend.dsa_prefill_impl = prefill_impl
     backend.dsa_decode_impl = "flashmla_kv"
     backend.flashmla_kv_num_q_heads = 64
+    backend.flashmla_kv_num_q_heads_prefill = 64
     backend.flashmla_kv_format = "V32"
     backend.hisparse_coordinator = None
     backend.device_sm_major = (
@@ -827,7 +840,7 @@ def _real_indexer_topk(check, backends, batch, layer_id, query, weights):
         sm_count=torch.cuda.get_device_properties(check.device).multi_processor_count,
         _pad_heads_for_deep_gemm=dsa_indexer.Indexer._pad_heads_for_deep_gemm,
     )
-    for name in ("_with_real_sm_count", "_mask_init_and_local_tokens"):
+    for name in ("_with_real_sm_count", "_mask_init_and_local_tokens", "_mqa_logits"):
         setattr(indexer, name, MethodType(getattr(dsa_indexer.Indexer, name), indexer))
 
     class RecordingMetadata:

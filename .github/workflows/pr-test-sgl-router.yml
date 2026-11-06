@@ -58,6 +58,7 @@ jobs:
               - 'rust/Cargo.toml'
               - 'rust/sglang-processor/**'
               - 'rust/sglang-api-types/**'
+              - 'rust/sglang-runtime-v1-types/**'
               - 'proto/**'
               - '.github/workflows/pr-test-sgl-router.yml'
               - 'docker/sgl-router.Dockerfile'
