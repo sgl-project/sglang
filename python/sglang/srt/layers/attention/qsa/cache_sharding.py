@@ -1,5 +1,3 @@
-"""QSA cache sharding topology and CUDA-graph transport buffers."""
-
 from __future__ import annotations
 
 import os
@@ -11,8 +9,6 @@ import torch.distributed as dist
 
 @dataclass(frozen=True)
 class QSACacheShardingRuntime:
-    """Resolved QSA cache-sharding contract shared by runtime components."""
-
     size: int
     rank: int
     group: object | None
@@ -23,21 +19,15 @@ class QSACacheShardingRuntime:
 
 
 def resolve_qsa_cache_sharding_runtime(parallel) -> QSACacheShardingRuntime:
-    """Resolve QSA cache sharding from the published parallel topology."""
-
     size = int(getattr(parallel, "qsa_cache_sharding_size", 1))
     return QSACacheShardingRuntime(
         size=size,
         rank=int(getattr(parallel, "qsa_cache_sharding_rank", 0)),
-        group=(
-            getattr(parallel, "qsa_cache_sharding_group", None) if size > 1 else None
-        ),
+        group=getattr(parallel, "qsa_cache_sharding_group", None) if size > 1 else None,
     )
 
 
 def get_qsa_cache_sharding_runtime(parallel=None) -> QSACacheShardingRuntime:
-    """Resolve QSA cache sharding from the process-published topology."""
-
     from sglang.srt import runtime_context
 
     if parallel is None:
@@ -56,8 +46,6 @@ def assert_qsa_cache_sharding_runtime_match(
     *,
     component: str,
 ) -> None:
-    """Reject partially enabled or differently sharded QSA components."""
-
     expected_topology = (expected.size, expected.rank)
     actual_topology = (actual.size, actual.rank)
     if expected_topology != actual_topology:
@@ -66,9 +54,7 @@ def assert_qsa_cache_sharding_runtime_match(
             f"size/rank={actual_topology!r} (expected {expected_topology!r})"
         )
     if expected.enabled and expected.group is not actual.group:
-        raise ValueError(
-            f"{component} QSA cache-sharding collective group does not match"
-        )
+        raise ValueError(f"{component} QSA cache-sharding group does not match")
 
 
 def validate_qsa_cache_sharding(
@@ -87,8 +73,6 @@ def validate_qsa_cache_sharding(
     disaggregation_mode: str,
     dcp_size: int = 1,
 ) -> None:
-    """Reject combinations without complete QSA cache-sharding semantics."""
-
     if sharding_size == 1:
         return
     if device != "cuda":
@@ -109,27 +93,21 @@ def validate_qsa_cache_sharding(
             f"attention_tp_size={tp_size}, num_attention_heads={num_attention_heads}, "
             f"num_key_value_heads={num_key_value_heads}, sharding_size={sharding_size}"
         )
-    if dcp_size != 1:
-        raise ValueError(
-            "QSA cache sharding does not support decode context parallelism"
-        )
-    if pp_size != 1:
-        raise ValueError("QSA cache sharding does not support pipeline parallelism")
-    if attn_cp_size != 1:
-        raise ValueError(
-            "QSA cache sharding does not support attention context parallelism"
-        )
-    if enable_prefill_cp:
-        raise ValueError("QSA cache sharding does not support prefill CP")
+    unsupported = (
+        (dcp_size != 1, "decode context parallelism"),
+        (pp_size != 1, "pipeline parallelism"),
+        (attn_cp_size != 1, "attention context parallelism"),
+        (enable_prefill_cp, "prefill CP"),
+        (disaggregation_mode != "null", "PD disaggregation"),
+    )
+    for enabled, feature in unsupported:
+        if enabled:
+            raise ValueError(f"QSA cache sharding does not support {feature}")
     if ep_size < 1 or moe_dp_size < 1 or tp_size % (ep_size * moe_dp_size):
         raise ValueError("QSA cache sharding requires a valid MoE EP topology")
-    if disaggregation_mode != "null":
-        raise ValueError("QSA cache sharding does not support PD disaggregation")
 
 
 class QSACacheShardingStaticBuffers:
-    """Fixed-address collective staging buffers suitable for CUDA Graph."""
-
     def __init__(
         self,
         *,
@@ -148,51 +126,33 @@ class QSACacheShardingStaticBuffers:
             raise ValueError("static buffer dimensions must be positive")
         if num_heads % world_size:
             raise ValueError("num_heads must be divisible by world_size")
-        self.max_rows = max_rows
-        self.world_size = world_size
-        self.topk = topk
-        self.owner_topk = owner_topk
-        self.num_heads = num_heads
-        self.head_dim = head_dim
-        self._device = torch.device(device)
-        self._dtype = dtype
+        self.max_rows, self.world_size = max_rows, world_size
+        self.topk, self.owner_topk = topk, owner_topk
+        self.num_heads, self.head_dim = num_heads, head_dim
+        self._device, self._dtype = torch.device(device), dtype
         local_heads = num_heads // world_size
-        self.candidate_transport = torch.empty(
-            (max_rows, topk, 2), dtype=torch.float32, device=device
+
+        def empty(shape, storage_dtype=dtype):
+            return torch.empty(shape, dtype=storage_dtype, device=device)
+
+        self.candidate_transport = empty(
+            (max_rows, topk, 2), storage_dtype=torch.float32
         )
-        self.candidate_recv = torch.empty(
-            (world_size, max_rows, topk, 2), dtype=torch.float32, device=device
-        )
+        self.candidate_recv = empty((world_size, max_rows, topk, 2), torch.float32)
         self.candidate_symm_state = self._create_candidate_symm_state(candidate_group)
-        self.candidate_scores = torch.empty(
-            (max_rows, topk), dtype=torch.float32, device=device
-        )
-        self.candidate_indices = torch.empty(
-            (max_rows, topk), dtype=torch.int32, device=device
-        )
-        self.q_send = torch.empty(
-            (local_heads, max_rows, head_dim), dtype=dtype, device=device
-        )
-        self.q_recv = torch.empty(
-            (num_heads, max_rows, head_dim), dtype=dtype, device=device
-        )
-        self.q_gathered = torch.empty(
-            (max_rows, num_heads, head_dim), dtype=dtype, device=device
-        )
-        self.local_slots = torch.empty(
-            (max_rows, owner_topk), dtype=torch.int64, device=device
-        )
-        self.owner_lengths = torch.empty((max_rows,), dtype=torch.int32, device=device)
-        self.owner_a2a_send = torch.empty(
-            (world_size, max_rows, local_heads, head_dim + 1),
-            dtype=torch.float32,
-            device=device,
+        self.candidate_scores = empty((max_rows, topk), torch.float32)
+        self.candidate_indices = empty((max_rows, topk), torch.int32)
+        self.q_send = empty((local_heads, max_rows, head_dim))
+        self.q_recv = empty((num_heads, max_rows, head_dim))
+        self.q_gathered = empty((max_rows, num_heads, head_dim))
+        self.local_slots = empty((max_rows, owner_topk), torch.int64)
+        self.owner_lengths = empty((max_rows,), torch.int32)
+        self.owner_a2a_send = empty(
+            (world_size, max_rows, local_heads, head_dim + 1), torch.float32
         )
         self.owner_a2a_recv = torch.empty_like(self.owner_a2a_send)
 
     def _create_candidate_symm_state(self, candidate_group):
-        """Rendezvous one graph-only candidate buffer before graph capture."""
-
         if candidate_group is None:
             return None
         from sglang.srt.distributed.device_communicators.triton_symm_mem_ag import (
@@ -239,7 +199,5 @@ class QSACacheShardingStaticBuffers:
 
     def for_batch(self, rows: int) -> QSACacheShardingStaticBuffers:
         if rows < 0 or rows > self.max_rows:
-            raise ValueError(
-                f"batch rows {rows} exceed static buffer capacity {self.max_rows}"
-            )
+            raise ValueError(f"batch rows {rows} exceed capacity {self.max_rows}")
         return self

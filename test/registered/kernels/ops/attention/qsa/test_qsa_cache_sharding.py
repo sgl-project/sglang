@@ -1,5 +1,4 @@
 import os
-import socket
 
 import pytest
 import torch
@@ -11,14 +10,14 @@ from sglang.srt.layers.attention.qsa.cache_sharding import QSACacheShardingStati
 from sglang.srt.layers.attention.qsa.owner_sparse_attn import owner_sparse_attention
 from sglang.srt.mem_cache.qsa_kv_pool import QSARawKVSharding
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import find_available_port
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 
 class _Group:
     def __init__(self, rank, world_size):
-        self.rank_in_group = rank
-        self.world_size = world_size
+        self.rank_in_group, self.world_size = rank, world_size
         self.device_group = dist.group.WORLD
 
     def all_to_all_single(self, output, value):
@@ -60,20 +59,17 @@ def _worker(rank, world_size, port):
         def randn(*shape):
             return torch.randn(*shape, dtype=torch.bfloat16, device=device)
 
+        def expand(values):
+            return values.expand(rows, -1).contiguous()
+
         global_tokens = topk * world_size
-        logical = (
+        logical = expand(
             torch.arange(
                 rank, global_tokens, world_size, dtype=torch.int32, device=device
             )
-            .expand(rows, -1)
-            .contiguous()
         )
         logits = randn(rows, topk).float()
-        local_ids = (
-            torch.arange(topk, dtype=torch.int32, device=device)
-            .expand(rows, -1)
-            .contiguous()
-        )
+        local_ids = expand(torch.arange(topk, dtype=torch.int32, device=device))
         row_starts = torch.zeros(rows, dtype=torch.int32, device=device)
         full_q = randn(rows, world_size, head_dim)
         local_q = full_q[:, rank : rank + 1].contiguous()
@@ -142,8 +138,8 @@ def _worker(rank, world_size, port):
         expected = distributed_topk.gather_and_merge_qsa_topk_candidates(
             logits, logical, group=group, topk=topk
         )
-        torch.testing.assert_close(outputs[0], expected[0], rtol=0, atol=0)
-        torch.testing.assert_close(outputs[1], expected[1], rtol=0, atol=0)
+        for actual, reference in zip(outputs, expected):
+            torch.testing.assert_close(actual, reference, rtol=0, atol=0)
     finally:
         dist.destroy_process_group()
 
@@ -151,7 +147,4 @@ def _worker(rank, world_size, port):
 def test_qsa_multimem_owner_pipeline_eager_and_cuda_graph():
     if torch.cuda.device_count() < 4 or torch.cuda.get_device_capability()[0] != 9:
         pytest.skip("four SM90 CUDA devices are required")
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        port = sock.getsockname()[1]
-    mp.spawn(_worker, args=(4, port), nprocs=4, join=True)
+    mp.spawn(_worker, args=(4, find_available_port(29500)), nprocs=4, join=True)

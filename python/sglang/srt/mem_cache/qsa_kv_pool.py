@@ -79,8 +79,6 @@ def assert_qsa_indices_in_bounds(
     valid_mask: torch.Tensor | None = None,
     label: str,
 ) -> None:
-    """Validate QSA kernel indices without synchronizing CUDA tensors to host."""
-
     if not isinstance(indices, torch.Tensor):
         raise TypeError(f"{label} must be a tensor")
     if indices.dtype not in _INTEGER_DTYPES:
@@ -135,8 +133,6 @@ def qsa_global_compressed_capacity(
 
 @dataclass(frozen=True)
 class QSARawKVSharding:
-    """Interleaved owner mapping for the rank-local raw QSA K/V cache."""
-
     local_capacity: int
     world_size: int
     rank: int
@@ -197,13 +193,7 @@ class QSARawKVSharding:
 
 @dataclass(frozen=True)
 class QSACompressedBlockSharding:
-    """Interleaved full-page ownership for QSA compressed blocks.
-
-    Every compressed block in a physical page has the same owner. The small
-    per-request pending ring remains replicated because an incomplete
-    compression group can be completed by the next token before a
-    compressed-page owner is selected.
-    """
+    """Interleaved page ownership; incomplete pending groups stay replicated."""
 
     global_blocks: int
     compressed_page_size: int
@@ -266,12 +256,6 @@ class QSACompressedBlockSharding:
         *,
         valid_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return dense owner mask and safe rank-local destinations.
-
-        Eager fused compression keeps its static, shape-derived group count.
-        Non-owner and padded rows therefore stay in the launch but are masked
-        before the kernel reads group members or writes compressed state.
-        """
         if global_blocks.ndim != 1:
             raise ValueError("global_blocks must be one-dimensional")
         checked_mask = (
