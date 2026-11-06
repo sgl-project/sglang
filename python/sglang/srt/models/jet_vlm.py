@@ -17,8 +17,7 @@ from sglang.srt.configs.jet_vlm import JetVLMConfig
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import pad_mm_tokens
-from sglang.srt.managers.req_types import MultimodalDataItem
-from sglang.srt.managers.schedule_batch import MultimodalInputs
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.jet_nemotron import JetNemotronForCausalLM
 from sglang.srt.multimodal.modality import Modality

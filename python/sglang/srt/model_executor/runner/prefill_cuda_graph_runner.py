@@ -80,9 +80,6 @@ from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     build_prefill_registry,
 )
 from sglang.srt.model_executor.cuda_graph_config import Backend
-from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
-    create_chunked_prefix_cache_kv_indices,
-)
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     NgramEmbeddingInfo,
