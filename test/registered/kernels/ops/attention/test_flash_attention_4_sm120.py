@@ -1487,6 +1487,82 @@ def test_sm120_paged_prefill_reuses_cached_host_plan(
     assert cache_hits == [False, False, True]
 
 
+def test_sm120_paged_prefill_full_and_swa_layers_keep_separate_plans(monkeypatch):
+    """Layers that differ only in causal/window settings must not share a launch
+    plan, and each must still reuse its own."""
+    sm120_forward_host.clear_launch_plans()
+    cache_hits = []
+    original_try_paged = sm120_forward_host.try_paged
+
+    def record_cache_hit(**kwargs):
+        result = original_try_paged(**kwargs)
+        cache_hits.append(result is not None)
+        return result
+
+    monkeypatch.setattr(sm120_forward_host, "try_paged", record_cache_hit)
+    torch.manual_seed(20261105)
+    lengths, page_size = (192, 128, 77), 64
+    num_q_heads, num_kv_heads, head_dim = 16, 2, 128
+    total = sum(lengths)
+    pages = [-(-length // page_size) for length in lengths]
+    page_ids = torch.randperm(sum(pages), device="cuda").to(torch.int32)
+    page_table = torch.zeros(len(lengths), max(pages), device="cuda", dtype=torch.int32)
+    offsets = [0]
+    for i, num_pages in enumerate(pages):
+        page_table[i, :num_pages] = page_ids[offsets[-1] : offsets[-1] + num_pages]
+        offsets.append(offsets[-1] + num_pages)
+    cache_seqlens = torch.tensor(lengths, device="cuda", dtype=torch.int32)
+    q_offsets = [0]
+    for length in lengths:
+        q_offsets.append(q_offsets[-1] + length)
+    cu_seqlens_q = torch.tensor(q_offsets, device="cuda", dtype=torch.int32)
+
+    # Called the way FlashAttentionBackend's paged extend calls it.
+    def run(q, k_cache, v_cache, window_size):
+        return flash_attn_with_kvcache(
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=max(lengths),
+            causal=True,
+            window_size=window_size,
+            num_splits=1,
+        )
+
+    # The window is well below the sequence lengths, so the two settings differ.
+    full, swa = (-1, -1), (63, 0)
+    layers = []
+    for window_size in (full, swa, full, swa):
+        q = torch.randn(
+            total, num_q_heads, head_dim, device="cuda", dtype=torch.bfloat16
+        )
+        k_cache = torch.randn(
+            sum(pages),
+            page_size,
+            num_kv_heads,
+            head_dim,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        layers.append((q, k_cache, torch.randn_like(k_cache), window_size))
+    outputs = [run(*layer) for layer in layers]
+    torch.cuda.synchronize()
+    # First calls miss in the wrapper and in the generic path; the first SWA call
+    # misses although a full-attention plan of identical shapes exists.
+    assert cache_hits == [False, False, False, False, True, True]
+
+    for layer, cached in zip(layers, outputs):
+        sm120_forward_host.clear_launch_plans()
+        torch.testing.assert_close(run(*layer), cached, atol=0.0, rtol=0.0)
+
+    # The bitwise checks catch a shared plan only if the settings' outputs differ.
+    q, k_cache, v_cache, _ = layers[0]
+    assert not torch.equal(run(q, k_cache, v_cache, swa), outputs[0])
+
+
 @pytest.mark.parametrize(
     ("head_dim", "pack_gqa", "causal", "window_size", "softcap"),
     [
