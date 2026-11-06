@@ -491,6 +491,11 @@ SGLang supports various environment variables that can be used to configure its 
   </thead>
   <tbody>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_OPT_FUSED_WO_B_AR</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>ROCm gfx950, TP only: fuse DeepSeek-V4.1-Flash <code>wo_b</code>'s GEMM with its all-reduce through mori cco (needs <code>MORI_ENABLE_SDMA=1</code>). It reserves memory outside torch's allocator, about 560-700 MiB of symmetric window per rank plus a re-laid-out copy of every <code>wo_b</code> weight (about 840 MiB at TP2), so lower <code>--mem-fraction-static</code> when enabling it. Online weight updates (<code>update_weights_from_tensor</code> / <code>_from_distributed</code>) are refused while it is on, because the copies would go stale. Off under Megatron SP, data-parallel attention and LoRA, where <code>wo_b</code> does not perform this all-reduce.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_MORI_DISPATCH_DTYPE</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Override MoRI-EP dispatch quantization type. <code>auto</code> uses auto-detection from weight dtype; <code>bf16</code>/<code>fp8</code>/<code>fp4</code> forces the specified type for all layers</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>"auto"</code></td>
