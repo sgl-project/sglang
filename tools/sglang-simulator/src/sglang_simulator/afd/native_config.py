@@ -77,7 +77,7 @@ class NativeAFDConfig:
             raw.get("experimental_direct_stage_rows", 32),
             "experimental_direct_stage_rows",
         )
-        if attention != 8 or stages != 2:
+        if policy == "fixed" and (attention != 8 or stages != 2):
             raise ValueError(
                 "AFD_SIMULATOR_LAYOUT_UNSUPPORTED: current profiles require 8A/S2"
             )
@@ -109,9 +109,23 @@ class NativeAFDConfig:
             raise ValueError("AFD_NATIVE_DEPLOYMENT_MISMATCH")
         if deployment.get("routing", "f-side") != self.routing:
             raise ValueError("AFD_NATIVE_ROUTING_MISMATCH")
+        if self.routing == "direct":
+            declared = deployment.get("native_config")
+            if declared is None:
+                if self.attention_ranks != 8 or self.stages != 2:
+                    raise ValueError("AFD_NATIVE_LAYOUT_REQUIRES_EXPLICIT_COST_CONFIG")
+            else:
+                other = NativeAFDConfig.parse(declared)
+                if (other.attention_ranks, other.ffn_ranks, other.stages) != (
+                    self.attention_ranks,
+                    self.ffn_ranks,
+                    self.stages,
+                ):
+                    raise ValueError("AFD_NATIVE_DEPLOYMENT_MISMATCH")
         if (
             self.routing == "direct"
-            and deployment["batch_size"] // 16 > self.stage_capacity
+            and deployment["batch_size"] // (self.attention_ranks * self.stages)
+            > self.stage_capacity
         ):
             raise ValueError("AFD_DIRECT_BUFFER_CAPACITY")
 

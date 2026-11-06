@@ -78,6 +78,13 @@ def shapes(config):
         or config["layers"] != geometry.layers
     ):
         raise ValueError("AFD_MODEL_PROFILE_UNSUPPORTED")
+    return decoder_shapes(config, geometry, topology)
+
+
+def decoder_shapes(config, geometry, topology):
+    """Cost signatures from model metadata and a native deployment layout."""
+    batch, kv = config['batch_size'], config['effective_kv']
+    world, ffn = topology.attention_ranks, topology.ffn_ranks
     rows = topology.stage_rows
     local = batch // world
     global_rows = topology.global_stage_rows

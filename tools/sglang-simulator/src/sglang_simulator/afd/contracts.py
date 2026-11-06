@@ -40,6 +40,7 @@ class ExecutionTrace:
     events: list[dict]
     source_files: list[str]
     total_devices: int
+    request_placement: list[dict] | None = None
 
 
 class ExecutionAdapter(Protocol):

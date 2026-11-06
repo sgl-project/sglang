@@ -143,18 +143,29 @@ class CostCatalog:
             )
         document = self.decode[key]
         result = simulate(document, adapter=self.adapter)
-        rows = key[0] // 16
         ready = {
             e["actor"]: e["finish_ns"]
             for e in result["events"]
             if e["kind"] == "sampling"
         }
-        placement = {
-            r["id"]: dict(
-                attention_rank=i // (2 * rows), stage=(i // rows) % 2, slot=i % rows
-            )
-            for i, r in enumerate(requests)
-        }
+        if self.native.routing == "direct":
+            positions = result["request_placement"]
+            if positions is None or len(positions) != len(requests):
+                raise ValueError("AFD_NATIVE_REQUEST_PLACEMENT_MISSING")
+            placement = {
+                r["id"]: dict(position) for r, position in zip(requests, positions)
+            }
+        else:
+            # The existing fixed-F adapter remains a qualified legacy profile.
+            rows = key[0] // (self.native.attention_ranks * self.native.stages)
+            placement = {
+                r["id"]: dict(
+                    attention_rank=i // (self.native.stages * rows),
+                    stage=(i // rows) % self.native.stages,
+                    slot=i % rows,
+                )
+                for i, r in enumerate(requests)
+            }
         finishes = {
             rid: ready["A" + str(pos["attention_rank"])]
             for rid, pos in placement.items()

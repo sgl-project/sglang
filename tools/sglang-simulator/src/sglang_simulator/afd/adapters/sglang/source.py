@@ -20,13 +20,42 @@ def verify_source(source_root, *, mode=None, routing="f-side"):
         "afd/pipeline.py": ["AFDAttentionPipeline._run_layers"],
     }
     if routing == "direct":
+        required["afd/pipeline.py"].append("AFDAttentionPipeline.__init__")
         required["afd/expert_exchange.py"] = [
             "combine_partials",
+            "AFDDirectExchange.__init__",
+            "AFDDirectExchange.prepare_step",
             "AFDDirectExchange.dispatch",
             "AFDDirectExchange._exchange",
             "AFDDirectExchange.run_ffn_step",
             "AFDDirectExchange.run_layer",
         ]
+        required.update(
+            {
+                "afd/config.py": ["AFDConfig"],
+                "afd/contracts.py": ["AFDError", "AFDRole"],
+                "afd/connector.py": ["AFDConnector"],
+                "afd/ffn_backend.py": [
+                    "direct_step_reason",
+                    "select_direct_step",
+                    "select_m2n_step",
+                ],
+                "afd/model_adapters/base.py": [
+                    "AFDStage",
+                    "AFDDecoderAdapter.__init__",
+                    "AFDDecoderAdapter.split_step",
+                    "AFDDecoderAdapter.local_compute",
+                    "AFDDecoderAdapter.finish_layer",
+                    "AFDDecoderAdapter.join_step",
+                ],
+                "afd/model_adapters/qwen3_moe.py": ["Qwen3AFDAdapter"],
+                "model_executor/forward_batch_view.py": ["slice_batch_field"],
+                "batch_overlap/two_batch_overlap.py": [
+                    "TboForwardBatchPreparer._get_num_token_non_padded_cpu",
+                    "TboForwardBatchPreparer._split_num_token_non_padded",
+                ],
+            }
+        )
     else:
         required["afd/pipeline.py"].append("AFDFFNPipeline._run_layers")
         required["afd/model_adapters/base.py"] = [
@@ -50,7 +79,8 @@ def verify_source(source_root, *, mode=None, routing="f-side"):
             for part in symbol.split("."):
                 node = next(
                     (
-                        n for n in getattr(node, "body", [])
+                        n
+                        for n in getattr(node, "body", [])
                         if isinstance(n, (ast.ClassDef, ast.FunctionDef))
                         and n.name == part
                     ),

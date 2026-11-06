@@ -68,6 +68,8 @@ def main():
                 ffn_ranks=ranks,
             )
         if native:
+            if native.routing == "direct":
+                config["native_config"] = native.raw
             native.check(config)
         mapping = adapter.cost_mapping(config)
         adapter.verify()

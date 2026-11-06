@@ -16,7 +16,7 @@ AFD implementation: [PR #41646](https://github.com/sgl-project/sglang/pull/41646
 | Model | Qwen3-235B-A22B: 94 layers, H4096, Q64/KV4/D128, 128 experts, top-k8 |
 | Compute | TRTLLM attention with FP8 Q/KV, page64; none A2A and DeepGEMM, compact unmasked layout, block128 UE8M0 |
 | F-side routing | 8A + 2/4/8F, two equal stages; route on F after gathering inputs |
-| Direct routing | 8A8F, two equal stages; A Router/TopK, broadcast to every F, local expert/combine on F, sum partials on A |
+| Direct routing | Native configuration and model metadata drive rank/buffer construction and stage splitting; measured comparisons remain 8A8F/S2 |
 | Request workload | OFFLINE, uniform KV, fixed cohorts, batch divisible by 16, synchronous iterations |
 | Costs | Complete decode JSON catalog keyed by batch/effective KV; explicit whole-batch prefill costs |
 | Sources | Latest trusted AFD implementation checkout; required files and interfaces are checked |
@@ -57,6 +57,28 @@ one event graph. Each request receives its sampling completion offset; the next
 iteration waits for the full step. Device costs count, CPU/RPC wall time does not.
 Prefill uses an explicit whole-batch cost. Generic scheduling/cost contracts stay
 separate from source-checked SGLang adapters; temporary hooks are restored on exit.
+
+Direct imports the native configuration, model adapter, pipeline and exchange
+classes. It executes their constructors, `split_step`, `prepare_step`, A/F layer
+control and `join_step`; it does not reconstruct exchange fields with `__new__`.
+Only communicator creation, numerical model/metadata operations and tensor/device
+semantics are replaced by CPU event hooks. Source modules and hooks are restored
+after success or failure. Output-head pricing and resource policies remain explicit
+model boundaries, not a complete model-forward or CUDA trace capture.
+
+New Direct cost documents may include `deployment.native_config` (the original
+AFD configuration) and `deployment.model_config` (Qwen3-MoE model metadata).
+`native_config` selects A/F counts and capacity; `model_config` supplies hidden
+size, heads, expert count/top-k, layer count and vocabulary. Every changed shape
+requires a matching cost record; old 8A/S2 Qwen documents retain their declared
+profile for replay. No rank count or model dimensions are hard-coded in the event
+backend. The fixed-F routing adapter retains its existing qualified profile.
+
+Native source restrictions still apply: the current stage splitter accepts S2
+only. Alternative A/F layouts and small model geometries are synthetic control
+tests, not new hardware accuracy or deployment-capacity validation. Nonuniform
+KV, prefill graphs, cross-iteration overlap and PP execution remain outside this
+Direct update.
 
 ## Prepare and reproduce
 

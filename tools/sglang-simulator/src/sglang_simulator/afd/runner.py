@@ -99,6 +99,7 @@ def simulate(document, *, source_root=None, adapter: ExecutionAdapter | None = N
         "cost_ledger": document["costs"],
         "events": trace.events,
         "queries": provider.queries,
+        "request_placement": trace.request_placement,
         "limits": [
             "Fixed steady decode only, not an HTTP/Scheduler request simulation or prefill/TTFT estimate",
             "Single module costs and explicit dependency/resource assumptions do not prove service overlap or contention",

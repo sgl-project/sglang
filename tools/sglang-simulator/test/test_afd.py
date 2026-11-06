@@ -99,7 +99,7 @@ class AFDTests(unittest.TestCase):
                 NativeAFDConfig.parse(dict(ffn_backend=backend, lanes=8)).routing,
                 routing,
             )
-        for raw in ({}, dict(ffn_backend="direct", lanes=4)):
+        for raw in ({}, dict(ffn_backend="direct", lanes=0)):
             with self.assertRaises(ValueError):
                 NativeAFDConfig.parse(raw)
         self.assertEqual(request_prefix_length(NS(prefix_indices=[1, 2])), 2)
