@@ -1,5 +1,9 @@
+import os
+import tempfile
 import threading
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -7,11 +11,12 @@ from sglang.kernels.ops.moe.paged_experts import (
     paged_experts_decide,
     paged_experts_gather,
     paged_experts_host_device_pointer,
+    paged_experts_rows_to_slots,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-small")
+register_cuda_ci(est_time=45, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 E, K = 64, 16
 
@@ -199,6 +204,7 @@ class TestPagedExpertsKernels(CustomTestCase):
 
         gpu = torch.zeros(K, 3, 1000, dtype=torch.bfloat16, device="cuda")
         host = HostExpertStore({"w": ((3, 1000), torch.bfloat16)}, E).host["w"]
+        self.assertFalse(host.any())
         host.copy_(torch.randn(E, 3, 1000, dtype=torch.bfloat16))
         self.assertTrue(host.is_pinned())
         self.assertEqual(host.untyped_storage().nbytes(), E * 3 * 1000 * 2)
@@ -313,6 +319,107 @@ class TestPagedExpertsKernels(CustomTestCase):
                 f"{tempfile.gettempdir()} refuses O_DIRECT: read through the page cache"
             )
 
+    def test_rows_to_slots_copies_one_way(self):
+        """Rows of 16-, 4- and 2-byte multiples: the slot gets the row's expert, the row keeps
+        it; negative rows are skipped."""
+        hosts = [
+            torch.randn(E, 8, 32, dtype=torch.bfloat16).pin_memory(),
+            torch.randn(E, 3, dtype=torch.float32).pin_memory(),  # 12-byte rows
+            torch.randn(E, 3, dtype=torch.bfloat16).pin_memory(),  # 6-byte rows
+        ]
+        gpus = [
+            torch.randn(K, *h.shape[1:], dtype=h.dtype, device="cuda") for h in hosts
+        ]
+        rows = torch.tensor([5, -1, 17] + [0] * (K - 3), dtype=torch.int32).cuda()
+        slots = torch.tensor([2, 3, 15] + [0] * (K - 3), dtype=torch.int32).cuda()
+        count = torch.tensor([3], dtype=torch.int32, device="cuda")
+
+        before = [(h.clone(), g.cpu()) for h, g in zip(hosts, gpus)]
+        paged_experts_rows_to_slots(*_gather_args(hosts, gpus), rows, slots, count)
+        torch.cuda.synchronize()
+        for host, gpu, (host0, gpu0) in zip(hosts, gpus, before):
+            for r, s in ((5, 2), (17, 15)):
+                self.assertTrue(torch.equal(gpu[s].cpu(), host0[r]))
+                self.assertTrue(torch.equal(host[r], host0[r]))
+            self.assertTrue(torch.equal(gpu[3].cpu(), gpu0[3]))  # skipped
+
+    def test_captured_step_waits_for_a_disk_read_or_replays_after_it(self):
+        """A replayed step copies an expert in a host row into its slot and flags an expert
+        only on disk, publishes its row and waits: the replay hook reads the expert into a host
+        row and answers, and the step copies it in (no replay). A step that gives up waiting
+        (timeout 0) runs on with the slot's old expert; the hook then copies it in after the
+        step and asks for another replay. Both experts keep their rows (inclusive rows), the
+        ones the slots held are dropped."""
+        for wait in (True, False):
+            with self.subTest(wait=wait):
+                self._step_with_a_disk_read(wait)
+
+    def _step_with_a_disk_read(self, wait: bool):
+        from sglang.srt.layers.moe.paged_experts import disk_tier
+        from sglang.srt.layers.moe.paged_experts.expert_cache import ExpertCache
+        from sglang.srt.model_executor.runner_backend_utils import replay_hooks
+
+        experts = torch.randn(E, 8, 32, dtype=torch.bfloat16)
+        layer = SimpleNamespace(
+            w=torch.nn.Parameter(experts[:K].clone().cuda(), requires_grad=False)
+        )
+        with (
+            tempfile.TemporaryDirectory() as folder,
+            patch.object(disk_tier, "_MODEL", disk_tier.ModelContext()),
+            patch.object(replay_hooks, "_HOOKS", []),
+            patch(
+                "sglang.srt.runtime_context.process_model_config",
+                return_value=SimpleNamespace(num_hidden_layers=1),
+            ),
+            patch.object(disk_tier, "WAIT_TIMEOUT_MS", 2000 if wait else 0),
+        ):
+            cache = ExpertCache(os.path.join(folder, "layer-0.experts"), {"key": "k"})
+            cache.write({"w": experts})
+            store = disk_tier.TieredExpertStore(
+                {"w": ((8, 32), torch.bfloat16)},
+                E,
+                K,  # host rows hold experts K..2K-1, slots 0..K-1; R < E
+                cache,
+            )
+            store.bind(layer, device_planned=True)
+
+            i32 = dict(dtype=torch.int32, device="cuda")
+            src, dst = torch.zeros(K, **i32), torch.zeros(K, **i32)
+            count = torch.zeros(1, **i32)
+            store.gather(src, dst, count)  # warm up before capture
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                store.gather(src, dst, count)
+
+            src[:2] = torch.tensor([K + 3, 40], **i32)  # in a host row, only on disk
+            dst[:2] = torch.tensor([0, 1], **i32)
+            count.fill_(2)
+            graph.replay()
+            if wait:  # the hook answers while the step waits at the layer
+                self.assertFalse(replay_hooks.needs_replay())
+                torch.cuda.synchronize()
+                self.assertTrue(torch.equal(layer.w[0].cpu(), experts[K + 3]))
+                self.assertTrue(torch.equal(layer.w[1].cpu(), experts[40]))
+            else:
+                torch.cuda.synchronize()
+                self.assertTrue(torch.equal(layer.w[0].cpu(), experts[K + 3]))
+                self.assertTrue(torch.equal(layer.w[1].cpu(), experts[1]))  # on disk
+                self.assertTrue(replay_hooks.needs_replay())  # read 40, copied it in
+                torch.cuda.synchronize()
+                self.assertTrue(torch.equal(layer.w[1].cpu(), experts[40]))
+                count.zero_()  # the replayed step finds both resident
+                graph.replay()
+                self.assertFalse(replay_hooks.needs_replay())
+
+            store.read_maps(store.state.cpu())
+            rows = {e: r for r, e in enumerate(store.row_expert) if e >= 0}
+            for e, r in rows.items():  # every row holds what the maps say
+                self.assertTrue(torch.equal(store.host["w"][r], experts[e]))
+            # the moved experts keep their rows, the slots' old ones (0, 1) are dropped
+            self.assertTrue({K + 3, 40} <= set(rows))
+            self.assertFalse({0, 1} & set(rows))
+
     def test_graph_replays_decide_on_new_routing(self):
         """A captured decide + gather plans and pages each replay's routing, not the routing
         seen at capture."""
@@ -345,6 +452,76 @@ class TestPagedExpertsKernels(CustomTestCase):
             self.assert_state(state, ref, plan)
             for s, e in enumerate(ref.slot_expert):
                 self.assertTrue(torch.equal(gpu[s].cpu(), host[e]))
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "paged experts kernels need CUDA")
+class TestPublish(CustomTestCase):
+    """The map update kernel writes the layer's state row to pinned host memory and then the
+    new clock as its flag, captured and replayed."""
+
+    def test_the_row_then_the_flag(self):
+        from sglang.kernels.ops.moe.paged_experts import paged_experts_tiered_plan
+
+        k, e, r = 4, 16, 6
+        i32 = dict(dtype=torch.int32, device="cuda")
+        state = torch.zeros(3 * k + e + 2 * r + 1, **i32)
+        doorbell, expert_row, row_expert, row_stamp, clock = state.split(
+            [3 * k, e, r, r, 1]
+        )
+        expert_row.fill_(-1)
+        for row in range(r):
+            row_expert[row] = 4 + row
+            expert_row[4 + row] = row
+        src = torch.tensor([5, 13, 7, 0], **i32)  # 13 is on disk
+        dst = torch.tensor([0, 1, 2, 0], **i32)
+        count = torch.tensor([3], **i32)
+        rows_out = torch.full((k,), -1, **i32)
+        host = torch.zeros(2, state.numel(), dtype=torch.int32, pin_memory=True)
+        flags = torch.zeros(2, dtype=torch.int32, pin_memory=True)
+        row_at = paged_experts_host_device_pointer(host) + state.numel() * 4
+        flag_at = paged_experts_host_device_pointer(flags) + 4
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            paged_experts_tiered_plan(
+                src,
+                dst,
+                count,
+                expert_row,
+                row_expert,
+                row_stamp,
+                clock,
+                doorbell.view(3, k),
+                rows_out,
+                row_at,
+                flag_at,
+                state.numel(),
+            )
+        for step in (1, 2, 3):
+            host.zero_()
+            flags.zero_()
+            graph.replay()
+            torch.cuda.synchronize()
+            self.assertEqual(int(flags[1]), step)  # the new clock
+            self.assertEqual(int(flags[0]), 0)
+            self.assertEqual(host[1].tolist(), state.cpu().tolist())
+            self.assertEqual(host[0].abs().sum().item(), 0)
+            self.assertEqual(int(host[1, -1]), step)
+            self.assertEqual(host[1, :k].tolist(), [0, 1, 0, 0])  # 13 flagged
+        with self.assertRaises(Exception):  # a row shorter than the doorbell
+            paged_experts_tiered_plan(
+                src,
+                dst,
+                count,
+                expert_row,
+                row_expert,
+                row_stamp,
+                clock,
+                doorbell.view(3, k),
+                rows_out,
+                row_at,
+                flag_at,
+                3 * k - 1,
+            )
 
 
 class TestPooledSlotTables(CustomTestCase):

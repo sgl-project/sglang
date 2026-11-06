@@ -69,8 +69,23 @@ class EagerExecutor:
         r = self.device_residency
         routed = counts.tolist() if r is None else r.load_into(self.policy, counts)
         distinct = [e for e in range(self.num_experts) if routed[e]]
+        with self.store.host_planned():
+            waves = plan_waves(
+                policy=self.policy,
+                distinct=distinct,
+                in_host_rows=self.store.in_host_rows(),
+            )
+            merged = self._run_waves(layer, dispatch_output, waves, routed, topk_ids)
+        return StandardCombineInput(
+            hidden_states=self.contract.finish(
+                merged=merged,
+                hidden_states=dispatch_output.hidden_states,
+                routed_scaling_factor=self.routed_scaling_factor,
+            )
+        )
+
+    def _run_waves(self, layer, dispatch_output, waves, routed, topk_ids):
         merged = None
-        waves = plan_waves(policy=self.policy, distinct=distinct)
         # Every wave's slot map in one upload that does not wait for the GPU. Index E (and -1,
         # which wraps to it) stays -1: padded routing entries are masked.
         to_slot = torch.full((len(waves), self.num_experts + 1), -1, dtype=torch.int32)
@@ -93,13 +108,7 @@ class EagerExecutor:
                 merged=merged,
                 num_entries=sum(routed[e] for e in wave.experts),
             )
-        return StandardCombineInput(
-            hidden_states=self.contract.finish(
-                merged=merged,
-                hidden_states=dispatch_output.hidden_states,
-                routed_scaling_factor=self.routed_scaling_factor,
-            )
-        )
+        return merged
 
 
 class DeviceExecutor:
@@ -144,6 +153,9 @@ class DeviceExecutor:
             run_w.view(-1),
         )
         self.store.gather(src=r.src, dst=r.dst, count=r.count)
+        if not torch.cuda.is_current_stream_capturing():
+            # Not a graph replay: page in what the gather left on disk before the GEMM.
+            self.store.resolve_pending()
         # Every routed expert is now resident; padding got slot 0 and weight 0.
         wave_output = dispatch_output._replace(
             topk_output=topk_output._replace(
