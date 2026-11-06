@@ -532,36 +532,66 @@ class MiniMaxM3MoE(nn.Module):
     def forward_mega_moe(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ):
-        from sglang.srt.layers.moe.mega_moe import (
-            is_mega_moe_experts_ready,
-            run_mega_routed_experts,
-        )
+        from sglang.srt.layers.moe.mega_moe import is_mega_moe_experts_ready
 
         if not is_mega_moe_experts_ready(self.experts):
             raise RuntimeError(
                 "M3.1 NVFP4 MegaMoE weights are not ready on this device"
             )
         num_tokens = hidden_states.shape[0]
+        trtllm_decode = (
+            self.trtllm_decode_with_mega_moe and forward_batch.forward_mode.is_decode()
+        )
+        if (
+            envs.SGLANG_OPT_MINIMAX_M3_MEGA_MOE_SHARED_OVERLAP.get()
+            and self.alt_stream is not None
+            and self.shared_experts is not None
+            and num_tokens > 0
+            and not trtllm_decode
+            and get_is_capture_mode()
+        ):
+            # Routed MegaMoE goes first on the alt stream so its whole-grid
+            # launch is resident; the shared MLP then runs concurrently with it.
+            current_stream = torch.cuda.current_stream()
+            self.alt_stream.wait_stream(current_stream)
+            with torch.cuda.stream(self.alt_stream):
+                output = self._mega_moe_routed(hidden_states, forward_batch)
+            shared = self._forward_shared_experts(hidden_states)
+            current_stream.wait_stream(self.alt_stream)
+            return output + shared
         shared = self._forward_shared_experts(hidden_states) if num_tokens else None
-        topk_ids = topk_weights = None
-        if num_tokens:
-            output = self.topk(
-                hidden_states,
-                self._compute_router_logits(hidden_states),
-                num_token_non_padded=forward_batch.num_token_non_padded,
-                expert_location_dispatch_info=(
-                    ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
-                    if get_exec().moe.enable_eplb
-                    else None
-                ),
-            )
-            topk_ids, topk_weights = output.topk_ids, output.topk_weights
-        if self.trtllm_decode_with_mega_moe and forward_batch.forward_mode.is_decode():
+        if trtllm_decode:
             if not num_tokens:
                 return hidden_states
+            topk_ids, topk_weights = self._mega_moe_topk(hidden_states, forward_batch)
             output = self._forward_trtllm_decode(hidden_states, topk_ids, topk_weights)
             return output + shared if shared is not None else output
-        output = run_mega_routed_experts(
+        output = self._mega_moe_routed(hidden_states, forward_batch)
+        return output + shared if shared is not None else output
+
+    def _mega_moe_topk(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
+        if not hidden_states.shape[0]:
+            return None, None
+        output = self.topk(
+            hidden_states,
+            self._compute_router_logits(hidden_states),
+            num_token_non_padded=forward_batch.num_token_non_padded,
+            expert_location_dispatch_info=(
+                ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
+                if get_exec().moe.enable_eplb
+                else None
+            ),
+        )
+        return output.topk_ids, output.topk_weights
+
+    def _mega_moe_routed(
+        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+    ):
+        from sglang.srt.layers.moe.mega_moe import run_mega_routed_experts
+
+        num_tokens = hidden_states.shape[0]
+        topk_ids, topk_weights = self._mega_moe_topk(hidden_states, forward_batch)
+        return run_mega_routed_experts(
             self.experts,
             hidden_states,
             topk_ids,
@@ -573,7 +603,6 @@ class MiniMaxM3MoE(nn.Module):
             activation=self.experts._minimax_activation,
             activation_clamp=self.config.swiglu_limit,
         )
-        return output + shared if shared is not None else output
 
     def _forward_trtllm_decode(
         self,
