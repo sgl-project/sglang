@@ -54,6 +54,7 @@ from sglang.srt.distributed.device_communicators.cuda_wrapper import (
 )
 from sglang.srt.distributed.parallel_state import inplace_all_reduce
 from sglang.srt.environ import envs
+from sglang.srt.hf_transformers.tokenizer import get_tokenizer
 from sglang.srt.layers.dp_attention import (
     attn_cp_all_gather_into_tensor,
     dp_gather_replicate,
@@ -85,7 +86,6 @@ from sglang.srt.runtime_context import (
     get_serving,
 )
 from sglang.srt.utils import add_prefix, is_cuda, is_gfx95_supported, is_hip
-from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
 
 logger = logging.getLogger(__name__)
 

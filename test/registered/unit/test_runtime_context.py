@@ -2950,7 +2950,7 @@ class TestWhoAnswersDuringADraftScope(CustomTestCase):
 
     def test_a_report_built_for_a_runner_follows_that_runner(self):
         from sglang.srt.distributed import parallel_state
-        from sglang.srt.utils.weight_checker import WeightChecker
+        from sglang.srt.model_executor.weight_checker import WeightChecker
 
         self._two_stage_pipeline()
         self.assertEqual(get_parallel().pp_size, 2)

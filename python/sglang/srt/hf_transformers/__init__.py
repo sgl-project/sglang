@@ -21,7 +21,7 @@ loads a config, tokenizer, or processor.
 All public symbols are re-exported here for convenience.
 """
 
-from ..hf_transformers_patches import (
+from sglang.srt.utils.hf_transformers_patches import (
     apply_all_hf_patches,
     normalize_rope_scaling_compat,
 )

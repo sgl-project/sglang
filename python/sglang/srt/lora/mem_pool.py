@@ -19,6 +19,7 @@ from sglang.srt.distributed import (
     divide,
 )
 from sglang.srt.environ import envs
+from sglang.srt.hf_transformers import AutoConfig
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.lora.eviction_policy import get_eviction_policy
 from sglang.srt.lora.layers import BaseLayerWithLoRA, unwrap_lora_layer
@@ -40,7 +41,6 @@ from sglang.srt.lora.utils import (
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_pin_memory_available
-from sglang.srt.utils.hf_transformers import AutoConfig
 
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 

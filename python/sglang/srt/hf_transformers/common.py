@@ -102,9 +102,8 @@ from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
 from sglang.srt.configs.deepseek_v41 import DEEPSEEK_V41_CONFIG_CLASSES
 from sglang.srt.configs.internvl import InternVLChatConfig
 from sglang.srt.utils import get_bool_env_var, logger, lru_cache_frozenset
+from sglang.srt.utils.hf_transformers_patches import normalize_rope_scaling_compat
 from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
-
-from ..hf_transformers_patches import normalize_rope_scaling_compat
 
 if get_bool_env_var("SGLANG_USE_MODELSCOPE"):
     from modelscope import AutoConfig, GenerationConfig

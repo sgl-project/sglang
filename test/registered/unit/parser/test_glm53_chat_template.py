@@ -479,7 +479,7 @@ class TestTemplateManagerPythonChatTemplate(CustomTestCase):
 
 
 def _patch_hf_transformers(get_tokenizer, get_config):
-    module = ModuleType("sglang.srt.utils.hf_transformers")
+    module = ModuleType("sglang.srt.hf_transformers")
     module.get_tokenizer = get_tokenizer
     module.get_config = get_config
     return patch.dict(sys.modules, {module.__name__: module})

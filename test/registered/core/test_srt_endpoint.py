@@ -17,9 +17,9 @@ from typing import Optional
 import numpy as np
 import requests
 
+from sglang.srt.hf_transformers import get_tokenizer
 from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
 from sglang.srt.utils import kill_process_tree
-from sglang.srt.utils.hf_transformers import get_tokenizer
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,

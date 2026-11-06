@@ -11,6 +11,11 @@ from sglang.srt.distributed.naive_distributed import (
     get_naive_distributed,
     set_naive_distributed,
 )
+from sglang.srt.layers.host_shared_memory import (
+    HostSharedMemoryManager,
+    get_host_shared_memory_manager,
+    set_host_shared_memory_manager,
+)
 from sglang.srt.layers.parameter import ModelWeightParameter
 from sglang.srt.runtime_context import (
     get_exec,
@@ -18,11 +23,6 @@ from sglang.srt.runtime_context import (
     get_stream,
 )
 from sglang.srt.utils import MultiprocessingSerializer, is_pin_memory_available
-from sglang.srt.utils.host_shared_memory import (
-    HostSharedMemoryManager,
-    get_host_shared_memory_manager,
-    set_host_shared_memory_manager,
-)
 
 logger = logging.getLogger(__name__)
 
