@@ -37,10 +37,8 @@ from sglang.srt.layers.moe.moe_runner.base import (
 )
 from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.runtime_context import get_forward, get_parallel
-from sglang.srt.utils.common import (
-    is_flashinfer_available,
-    next_power_of_2,
-)
+from sglang.srt.utils.device import is_flashinfer_available
+from sglang.srt.utils.triton_utils import next_power_of_2
 
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 
