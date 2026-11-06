@@ -1513,7 +1513,7 @@ _A2A_EP_SPANNING_BACKENDS = frozenset(
 
 @register_post_process
 def _nccl_ep_capability_fallback(view: Any) -> dict:
-    """Fall back off nccl_ep when nccl4py / NCCL>=2.29 / SM90+ is unavailable.
+    """Fall back off nccl_ep when nccl-extensions / NCCL>=2.29 / SM90+ is unavailable.
 
     Runs before _a2a_backend_overrides so a 'deepep' fallback flows through the
     deepep-specific handling. Prefers deepep when the deep_ep package is
@@ -1533,7 +1533,7 @@ def _nccl_ep_capability_fallback(view: Any) -> dict:
     fallback = "deepep" if importlib.util.find_spec("deep_ep") is not None else "none"
     logger.warning(
         "NCCL EP MoE requested but unavailable (%s); falling back to "
-        "moe_a2a_backend='%s'. Install nccl4py[cu13] on a CUDA13 + NCCL>=2.29 "
+        "moe_a2a_backend='%s'. Install nccl-extensions[cu13] on a CUDA13 + NCCL>=2.29 "
         "Hopper/Blackwell box.",
         reason,
         fallback,

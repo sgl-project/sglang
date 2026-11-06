@@ -345,7 +345,25 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         hidden_states, hidden_scales, topk_ids, _, masked_m, expected_m = (
             dispatch_output
         )
+        return self._run_masked_gemm(
+            layer,
+            hidden_states=hidden_states,
+            hidden_scales=hidden_scales,
+            topk_ids=topk_ids,
+            masked_m=masked_m,
+            expected_m=expected_m,
+        )
 
+    def _run_masked_gemm(
+        self,
+        layer: DeepEPMoE,
+        *,
+        hidden_states: torch.Tensor,
+        hidden_scales: Optional[torch.Tensor],
+        topk_ids: torch.Tensor,
+        masked_m: torch.Tensor,
+        expected_m: int,
+    ) -> torch.Tensor:
         if hidden_scales is None:
             raise RuntimeError(
                 "W4AFP8 DeepEP low-latency requires FP8 dispatcher output "
@@ -385,7 +403,14 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
 
     def apply_nccl_ep_rank_major(self, layer, dispatch_output) -> torch.Tensor:
         """Run the shared masked W4AFP8 GEMM on NCCL EP RM's packed view."""
-        return self.apply_deepep_ll(layer, dispatch_output)
+        return self._run_masked_gemm(
+            layer,
+            hidden_states=dispatch_output.hidden_states,
+            hidden_scales=dispatch_output.hidden_states_scale,
+            topk_ids=dispatch_output.topk_ids,
+            masked_m=dispatch_output.masked_m,
+            expected_m=dispatch_output.expected_m,
+        )
 
     def apply_deepep_normal(
         self,

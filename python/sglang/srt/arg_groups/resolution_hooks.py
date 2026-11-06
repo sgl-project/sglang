@@ -93,6 +93,7 @@ _OVERRIDABLE_HOOKS: FrozenSet[str] = frozenset(
         "handle_model_capability_adjustments",
         "validate_deepep_v2_speculative_draft",
         "validate_deepep_v2_dispatch_token_budget",
+        "validate_nccl_ep_dispatch_token_budget",
     }
 )
 

@@ -243,10 +243,19 @@ def _nccl_runtime_version():
     return None
 
 
+def _nccl_ep_importable() -> bool:
+    # find_spec("nccl.ep") raises ModuleNotFoundError when the parent package is
+    # absent, which would escape the capability fallback.
+    try:
+        return importlib.util.find_spec("nccl.ep") is not None
+    except (ImportError, ModuleNotFoundError, ValueError):
+        return False
+
+
 def nccl_ep_unavailable_reason() -> str | None:
     """Return why NCCL EP is unavailable (None = available), for fallback logs."""
-    if importlib.util.find_spec("nccl.ep") is None:
-        return "nccl4py (nccl.ep) not importable"
+    if not _nccl_ep_importable():
+        return "nccl-extensions (nccl.ep) not importable"
     if not torch.cuda.is_available():
         return "no CUDA device"
     cc = torch.cuda.get_device_capability(0)[0]  # Hopper (sm_90) or Blackwell.
@@ -261,7 +270,7 @@ def nccl_ep_unavailable_reason() -> str | None:
 
 
 def is_nccl_ep_available() -> bool:
-    """Whether nccl4py + NCCL >= 2.29 + Hopper/Blackwell are usable here."""
+    """Whether nccl-extensions + NCCL >= 2.29 + Hopper/Blackwell are usable here."""
     return nccl_ep_unavailable_reason() is None
 
 
@@ -307,6 +316,9 @@ class NcclEpBuffer:
                 max_recv_tokens_per_rank=None,
                 router_topk=None,
                 layout=None,
+                # Every handle created on this group; destroy() must release
+                # them before the group because ncclEpHandleDestroy reads it.
+                handles=[],
                 # Pre-allocated scratch (fixed shapes); reused per dispatch/combine step.
                 recv_tokens=None,
                 # Wire-FP8 (DS_FP8E3M4) expert-major receive scratch: NCCL writes
@@ -493,31 +505,6 @@ class NcclEpBuffer:
         )
 
     @staticmethod
-    def _low_latency_rdma_size_hint(nccl_ep, state, world_size: int) -> int:
-        """Worst-case RDMA buffer size for LL (explicit so handle init is local).
-
-        Prefers a nccl4py native hint; falls back to a conservative upper bound
-        from the max recv footprint (E_local * max_recv * H * 2 bytes bf16), x4
-        for send+recv+slack.
-        """
-        hint_fn = getattr(nccl_ep, "get_low_latency_rdma_size_hint", None)
-        if callable(hint_fn):
-            try:
-                return int(
-                    hint_fn(
-                        state.max_dispatch_tokens_per_rank,
-                        state.hidden_size,
-                        world_size,
-                        state.num_experts,
-                    )
-                )
-            except Exception:
-                pass  # signature mismatch; fall through to the bound below
-        per_slot = state.num_local_experts * state.max_recv_tokens_per_rank
-        per_slot *= state.hidden_size * 2  # bf16 bytes
-        return int(per_slot * 4)
-
-    @staticmethod
     def _resolve_max_num_sms(num_experts: int) -> int:
         """Cap LL EP-group SMs so overlap compute can run alongside dispatch.
 
@@ -550,14 +537,21 @@ class NcclEpBuffer:
 
     @classmethod
     def destroy(cls):
-        state = cls._state()
-        g = state.group
-        if g is not None:
-            try:
-                g.destroy()
-            except Exception:
-                pass
-            state.group = None
+        """Release every handle, then the group, and drop the scratch.
+
+        Test teardown only; serving processes release NCCL EP at exit.
+        """
+        from sglang.srt.runtime_context import get_resources
+
+        state = get_resources().buffers.pop("nccl_ep_state", None)
+        if state is None:
+            return
+        try:
+            for handle in state.handles:
+                handle.destroy()
+        finally:
+            if state.group is not None:
+                state.group.destroy()
 
 
 # ----------------------------- Dispatcher (LL path) -----------------------------
@@ -630,9 +624,11 @@ class NcclEpDispatcher(BaseDispatcher):
         budget = get_nccl_ep_num_max_dispatch_tokens_per_rank()
         if budget <= 0:
             budget = _NCCL_EP_DEFAULT_MAX_DISPATCH_TOKENS_PER_RANK
-        assert budget <= _NCCL_EP_MAX_DISPATCH_TOKENS_PER_RANK_CAP, (
-            f"NCCL EP max_dispatch_tokens_per_rank {budget} exceeds cap {_NCCL_EP_MAX_DISPATCH_TOKENS_PER_RANK_CAP}"
-        )
+        if budget > _NCCL_EP_MAX_DISPATCH_TOKENS_PER_RANK_CAP:
+            raise ValueError(
+                f"NCCL EP max_dispatch_tokens_per_rank {budget} exceeds the "
+                f"cap {_NCCL_EP_MAX_DISPATCH_TOKENS_PER_RANK_CAP}"
+            )
         self.num_max_dispatch_tokens_per_rank = budget
 
         # Validate LL hard constraints early (fail fast at init, not at first dispatch).
@@ -650,13 +646,20 @@ class NcclEpDispatcher(BaseDispatcher):
         self.buffer = None
         self._comm_initialized = False
 
+        # Created on first use and retained for the process lifetime; see
+        # _ensure_handle.
         self.handle = None
-        self._handle_persistent = False
 
         # Staged execution state machine (mirrors deepep.py _Stage).
         self._stage = _Stage.INITIAL
         self._dispatch_intermediate_state = None
         self._combine_intermediate_state = None
+        # A send_only call keeps the descriptor structs it was given until
+        # complete() runs, so these wrappers must outlive dispatch_a/combine_a.
+        self._dispatch_link_state = None
+        self._combine_link_state = None
+        # The handle copies the routing descriptor, not the tensor behind it.
+        self._dispatched_topk_ids = None
 
         # SBO dispatch hook: deepseek_v2.py registers a hook via
         # register_deepep_dispatch_hook to run shared experts between
@@ -673,9 +676,12 @@ class NcclEpDispatcher(BaseDispatcher):
     # single slot — calling combine(send_only=1) before dispatch_b (complete)
     # would overwrite the dispatch continue_fn.
     def _update_stage(self, old_stage, new_stage):
-        assert self._stage == old_stage, (
-            f"NCCL EP stage mismatch: expected {old_stage}, got {self._stage}"
-        )
+        if self._stage != old_stage:
+            raise RuntimeError(
+                f"NCCL EP stage mismatch: expected {old_stage}, got {self._stage}. "
+                "A previous dispatch/combine did not complete, so the persistent "
+                "handle may hold an unfinished send_only; restart the engine."
+            )
         self._stage = new_stage
 
     def register_deepep_dispatch_hook(self, hook):
@@ -699,29 +705,34 @@ class NcclEpDispatcher(BaseDispatcher):
             return
         self._ensure_buffer()
 
-    def init_handle_for_graph(self):
-        if self._handle_persistent:
+    def _ensure_handle(self, topk_ids: torch.Tensor, stream) -> None:
+        """Create the persistent handle on first use (eager or warmup forward).
+
+        CUDA graph capture runs the forward twice for warmup before recording,
+        so the handle and its buffers exist before capture; later forwards,
+        eager and replayed, reuse the same handle via handle.update().
+        """
+        if self.handle is not None:
             return
-        if self.layout.is_rank_major():
-            raise NotImplementedError(
-                "NCCL EP rank-major CUDA graph capture is not enabled yet; "
-                "use --disable-cuda-graph for this first implementation."
+        # With auto RDMA sizing, handle creation is collective and may
+        # reallocate; nccl_ep.h forbids it inside a CUDA graph capture.
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "NCCL EP handle must be created by a warmup forward before CUDA "
+                "graph capture; this MoE layer was first reached during capture."
             )
-        self.init_comm_resources()
         nccl_ep = self._nccl_ep
-        ptr = nccl_ep._ep_bindings.init_handle(
-            self.buffer.group.ptr,
-            int(
+        self.handle = self.buffer.group.create_handle(
+            layout=(
                 nccl_ep.Layout.RANK_MAJOR
                 if self.layout.is_rank_major()
                 else nccl_ep.Layout.EXPERT_MAJOR
             ),
-            0,
-            self.router_topk,
-            0,
+            topk_idx=nccl_ep.Tensor(topk_ids),
+            config=nccl_ep.HandleConfig(),
+            stream=stream.cuda_stream,
         )
-        self.handle = nccl_ep.Handle(ptr)
-        self._handle_persistent = True
+        self.buffer.handles.append(self.handle)
 
     # ---- three-phase dispatch/combine (staged execution) ----
     def dispatch(
@@ -733,26 +744,22 @@ class NcclEpDispatcher(BaseDispatcher):
         return self.dispatch_b()
 
     def dispatch_a(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
-        self._update_stage(_Stage.INITIAL, _Stage.AFTER_DISPATCH_A)
-
-        nccl_ep = self._nccl_ep
-        topk_weights = topk_output.topk_weights.to(torch.float32)
-        topk_ids = topk_output.topk_ids.to(torch.int64)
-
+        # Validate before advancing the stage so a rejected batch leaves the
+        # dispatcher usable.
         t = hidden_states.shape[0]
         if t > self.num_max_dispatch_tokens_per_rank:
             raise ValueError(
-                f"NCCL EP: decode batch ({t}) exceeds per-rank dispatch budget "
-                f"{self.num_max_dispatch_tokens_per_rank}; increase "
-                f"--nccl-ep-num-max-dispatch-tokens-per-rank or reduce batch."
+                f"NCCL EP: {t} tokens on one rank exceeds the per-rank dispatch "
+                f"capacity {self.num_max_dispatch_tokens_per_rank}. Lower "
+                f"--chunked-prefill-size / --max-prefill-tokens (prefill) or "
+                f"--cuda-graph-max-bs-decode (decode); the capacity cannot exceed "
+                f"{_NCCL_EP_MAX_DISPATCH_TOKENS_PER_RANK_CAP} on this backend."
             )
-
-        if self.handle is not None and not self._handle_persistent:
-            try:
-                self.handle.destroy()
-            except Exception:
-                pass
-            self.handle = None
+        if self.handle is None and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "NCCL EP handle must be created by a warmup forward before CUDA "
+                "graph capture; this MoE layer was first reached during capture."
+            )
 
         # Rank-major CUDA graph capture follows the server-level CUDA graph
         # flag, mirroring the expert-major contract: the warmup forward creates
@@ -760,25 +767,22 @@ class NcclEpDispatcher(BaseDispatcher):
         # dispatch/combine kernels; replay refreshes routing through the same
         # device-side metadata (topk_idx / src_rank_counters).
         self._ensure_buffer()
+        self._update_stage(_Stage.INITIAL, _Stage.AFTER_DISPATCH_A)
+
+        nccl_ep = self._nccl_ep
+        topk_weights = topk_output.topk_weights.to(torch.float32)
+        topk_ids = topk_output.topk_ids.to(torch.int64)
+        self._dispatched_topk_ids = topk_ids
         state = self.buffer
 
         stream = torch.cuda.current_stream()
 
-        if self._handle_persistent:
+        if self.handle is None:
+            self._ensure_handle(topk_ids, stream)
+        else:
             self.handle.update(
                 topk_idx=nccl_ep.Tensor(topk_ids),
                 layout_info=None,
-                stream=stream.cuda_stream,
-            )
-        else:
-            self.handle = state.group.create_handle(
-                layout=(
-                    nccl_ep.Layout.RANK_MAJOR
-                    if self.layout.is_rank_major()
-                    else nccl_ep.Layout.EXPERT_MAJOR
-                ),
-                topk_idx=nccl_ep.Tensor(topk_ids),
-                config=nccl_ep.HandleConfig(),
                 stream=stream.cuda_stream,
             )
 
@@ -830,6 +834,7 @@ class NcclEpDispatcher(BaseDispatcher):
             stream=stream.cuda_stream,
         )
 
+        self._dispatch_link_state = (inputs, outputs, layout_info)
         self._dispatch_intermediate_state = (
             recv_tokens,
             recv_scales,
@@ -874,6 +879,7 @@ class NcclEpDispatcher(BaseDispatcher):
             config=nccl_ep.DispatchConfig(send_only=1),
             stream=stream.cuda_stream,
         )
+        self._dispatch_link_state = (inputs, outputs, layout_info)
         self._dispatch_intermediate_state = (
             recv_tokens,
             recv_ids,
@@ -901,6 +907,7 @@ class NcclEpDispatcher(BaseDispatcher):
 
         stream = torch.cuda.current_stream()
         self.handle.complete(config=0, stream=stream.cuda_stream)
+        self._dispatch_link_state = None
 
         if recv_scales is not None:
             # DS_FP8E3M4 arrive pre-quantized from the wire: E4M3 tokens with
@@ -935,15 +942,12 @@ class NcclEpDispatcher(BaseDispatcher):
 
         stream = torch.cuda.current_stream()
         self.handle.complete(config=0, stream=stream.cuda_stream)
+        self._dispatch_link_state = None
 
-        # A source rank cannot contribute more slots than its local input
-        # token count ``t``. NCCL lays each source rank's valid receive slots
-        # contiguously, so trim the fixed D capacity to [world, t] before the
-        # MoE preprocess. This avoids scanning world*D*topk metadata during
-        # low-concurrency decode without a dynamic-size GPU->CPU sync.
-        compact_width = t
-        if compact_width > recv_tokens.shape[1]:
-            raise ValueError("rank-major receive count exceeds the slot capacity")
+        # Per-source-rank valid slots are `src_rank_counters` (masked below);
+        # a remote rank's contribution is bounded by ITS batch, not this rank's
+        # `t`, so the receive view keeps the full fixed capacity.
+        compact_width = recv_tokens.shape[1]
         compact_tokens = recv_tokens[:, :compact_width].contiguous()
         compact_ids = recv_ids[:, :compact_width].contiguous()
         compact_weights = recv_weights[:, :compact_width].contiguous()
@@ -1052,6 +1056,7 @@ class NcclEpDispatcher(BaseDispatcher):
             stream=stream.cuda_stream,
         )
 
+        self._combine_link_state = (inputs, outputs)
         self._combine_intermediate_state = combined
 
     def _combine_a_rank_major(self, combine_input: NcclEpRankMajorCombineInput):
@@ -1068,12 +1073,15 @@ class NcclEpDispatcher(BaseDispatcher):
         # passing topk_weights here would double-apply routing weights.
         combined = self.buffer.rm_combined[: self._dispatched_t]
         stream = torch.cuda.current_stream()
+        inputs = self._nccl_ep.CombineInputs(tokens=self._nccl_ep.Tensor(pre_reduced))
+        outputs = self._nccl_ep.CombineOutputs(tokens=self._nccl_ep.Tensor(combined))
         self.handle.combine(
-            self._nccl_ep.CombineInputs(tokens=self._nccl_ep.Tensor(pre_reduced)),
-            self._nccl_ep.CombineOutputs(tokens=self._nccl_ep.Tensor(combined)),
+            inputs,
+            outputs,
             config=self._nccl_ep.CombineConfig(send_only=1),
             stream=stream.cuda_stream,
         )
+        self._combine_link_state = (inputs, outputs)
         self._combine_intermediate_state = combined
 
     def combine_b(self) -> torch.Tensor:
@@ -1086,10 +1094,6 @@ class NcclEpDispatcher(BaseDispatcher):
         try:
             self.handle.complete(config=0, stream=stream.cuda_stream)
         finally:
-            if not self._handle_persistent and self.handle is not None:
-                try:
-                    self.handle.destroy()
-                except Exception:
-                    pass
-                self.handle = None
+            self._combine_link_state = None
+            self._dispatched_topk_ids = None
         return combined

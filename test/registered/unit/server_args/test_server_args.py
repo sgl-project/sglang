@@ -50,6 +50,7 @@ from sglang.srt.arg_groups.moe_hook import (
     handle_a2a_moe,
     validate_deepep_v2_dispatch_token_budget,
     validate_deepep_v2_speculative_draft,
+    validate_nccl_ep_dispatch_token_budget,
 )
 from sglang.srt.arg_groups.overrides import (
     cutedsl_moe_max_num_tokens,
@@ -2449,6 +2450,23 @@ class TestNcclEpArgs(CustomTestCase):
                 f"expected fallback to none/deepep, got {effective}",
             )
 
+    def test_nccl_ep_rejects_two_batch_overlap(self):
+        """TBO's two in-flight sub-batches would share one group's RDMA buffer,
+        and the TBO dispatcher wrapper has no nccl_ep branch."""
+        server_args = ServerArgs(
+            model_path="dummy",
+            moe_a2a_backend="nccl_ep",
+            enable_two_batch_overlap=True,
+        )
+        with (
+            patch(
+                "sglang.srt.layers.moe.token_dispatcher.nccl_ep.nccl_ep_unavailable_reason",
+                return_value=None,
+            ),
+            self.assertRaisesRegex(ValueError, "two-batch-overlap"),
+        ):
+            handle_a2a_moe(server_args)
+
 
 class TestPrefillOnlyDisableKvCache(unittest.TestCase):
     """Validation for --prefill-only-disable-kv-cache.
@@ -3086,6 +3104,92 @@ class TestSamplingBackendTokenOracleEnvGate(CustomTestCase):
         )
         self.assertIn("token_oracle", enabled_action.choices)
         self.assertNotIn("token_oracle", disabled_action.choices)
+
+
+class TestNcclEpDispatchBudget(CustomTestCase):
+    def _args(self, **overrides):
+        fields = dict(
+            moe_a2a_backend="nccl_ep",
+            nccl_ep_num_max_dispatch_tokens_per_rank=0,
+            chunked_prefill_size=512,
+            max_prefill_tokens=512,
+            max_running_requests=None,
+            speculative_algorithm=None,
+            enable_dynamic_chunking=False,
+            enable_dp_attention=False,
+            dp_size=1,
+        )
+        fields.update(overrides)
+        args = ServerArgs(model_path="dummy", **fields)
+        args.cuda_graph_config = CudaGraphConfig(
+            decode=PhaseConfig(backend=Backend.FULL, max_bs=512),
+            prefill=PhaseConfig(backend=Backend.DISABLED),
+        )
+        return args
+
+    def test_prefill_capacity_boundaries(self):
+        validate_nccl_ep_dispatch_token_budget(self._args(chunked_prefill_size=1024))
+        with self.assertRaisesRegex(ValueError, "required=1025, capacity=1024"):
+            validate_nccl_ep_dispatch_token_budget(
+                self._args(chunked_prefill_size=1025, tp_size=8)
+            )
+
+    def test_disabled_chunking_checks_max_prefill_tokens(self):
+        for chunked in (None, 0, -1):
+            with self.subTest(chunked=chunked):
+                with self.assertRaisesRegex(ValueError, "required=2048"):
+                    validate_nccl_ep_dispatch_token_budget(
+                        self._args(chunked_prefill_size=chunked, max_prefill_tokens=2048)
+                    )
+
+    def test_invalid_capacity_rejected(self):
+        for capacity in (-1, 1025):
+            with self.subTest(capacity=capacity), self.assertRaises(ValueError):
+                validate_nccl_ep_dispatch_token_budget(
+                    self._args(nccl_ep_num_max_dispatch_tokens_per_rank=capacity)
+                )
+
+    def test_decode_role_skips_prefill_bound(self):
+        validate_nccl_ep_dispatch_token_budget(
+            self._args(disaggregation_mode="decode", chunked_prefill_size=4096)
+        )
+
+    def test_decode_graph_boundary_and_prefill_role(self):
+        args = self._args(disaggregation_mode="decode")
+        args.cuda_graph_config.decode.max_bs = 1025
+        with self.assertRaisesRegex(ValueError, "required=1025"):
+            validate_nccl_ep_dispatch_token_budget(args)
+        args.disaggregation_mode = "prefill"
+        validate_nccl_ep_dispatch_token_budget(args)
+
+    def test_eager_concurrency_checked_with_graphs_disabled(self):
+        args = self._args(max_running_requests=1025)
+        args.cuda_graph_config.decode.backend = Backend.DISABLED
+        with self.assertRaisesRegex(ValueError, "required=1025"):
+            validate_nccl_ep_dispatch_token_budget(args)
+
+    def test_dp_attention_concurrency_is_per_rank(self):
+        validate_nccl_ep_dispatch_token_budget(
+            self._args(max_running_requests=2048, enable_dp_attention=True, dp_size=8)
+        )
+        with self.assertRaisesRegex(ValueError, "required=2048"):
+            validate_nccl_ep_dispatch_token_budget(
+                self._args(max_running_requests=2048, tp_size=8)
+            )
+
+    def test_speculative_tokens_multiply_decode_requests(self):
+        args = self._args(speculative_algorithm="EAGLE", max_running_requests=129)
+        with patch(
+            "sglang.srt.arg_groups.moe_hook.max_speculative_num_draft_tokens",
+            return_value=8,
+        ):
+            with self.assertRaisesRegex(ValueError, "required=1032"):
+                validate_nccl_ep_dispatch_token_budget(args)
+
+    def test_other_backend_skips_validation(self):
+        validate_nccl_ep_dispatch_token_budget(
+            self._args(moe_a2a_backend="none", chunked_prefill_size=4096)
+        )
 
 
 class TestDeepEPv2Args(CustomTestCase):

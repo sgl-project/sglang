@@ -821,7 +821,7 @@ class ExecMoe(msgspec.Struct):
     ] = "expert_major"
     nccl_ep_num_max_dispatch_tokens_per_rank: A[
         int,
-        "Per-rank dispatch token budget for the NCCL EP group. 0 = use the backend default (capped at 1024).",
+        "Per-rank dispatch token budget for the NCCL EP group. 0 = use the backend default (capped at 1024). Prefill and decode both use the low-latency path. Startup validation conservatively requires the full prefill ceiling and per-rank decode batch (including speculative tokens) to fit this budget.",
     ] = 0
     elastic_ep_backend: A[
         Literal[None, "mooncake", "nixl"],

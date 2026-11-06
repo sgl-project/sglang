@@ -14,6 +14,7 @@ from sglang.srt.batch_overlap.single_batch_overlap import DownGemmOverlapArgs
 from sglang.srt.batch_overlap.two_batch_overlap import MaybeTboDeepEPDispatcher
 from sglang.srt.configs.moe_model_registry import model_requires_fp32_silu_mul
 from sglang.srt.distributed import (
+    get_tp_group,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -225,14 +226,9 @@ def create_moe_dispatcher(
             moe_runner_config=moe_runner_config,
         )
     elif a2a_backend.is_nccl_ep():
-        # Both expert_major and rank_major layouts are handled by the single
-        # NcclEpDispatcher in nccl_ep.py; the layout is resolved inside the
-        # dispatcher via get_nccl_ep_layout().  The legacy
-        # nccl_ep_expert_major_legacy.py set hidden_states_scale=None for the
-        # BF16 dispatch-output dtype, which crashes W4AFP8's
-        # apply_deepep_ll (expects a per-token-group FP8 scale).  The unified
-        # dispatcher always runs _quantize_fp8 in the EM path, producing a
-        # valid scale for both FP8 and W4AFP8 expert compute.
+        # One dispatcher serves both layouts; get_nccl_ep_layout() resolves
+        # which one at runtime. Expert-major supplies FP8 activations and
+        # per-token-group scales via wire quantization or _quantize_fp8.
         from sglang.srt.layers.moe.token_dispatcher.nccl_ep import NcclEpDispatcher
 
         return NcclEpDispatcher(

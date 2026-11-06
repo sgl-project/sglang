@@ -388,6 +388,13 @@ def handle_a2a_moe(server_args: Any):
         )
 
     if a2a_backend == "nccl_ep":
+        if cfg.enable_two_batch_overlap:
+            # The LL double-buffer index is per handle but the RDMA buffer is
+            # per group, so two in-flight sub-batches on one group would collide.
+            raise ValueError(
+                "NCCL EP MoE does not support --enable-two-batch-overlap yet. "
+                "Disable it, or use --moe-a2a-backend deepep."
+            )
         logger.warning(
             "NCCL EP MoE is enabled. The expert parallel size is adjusted to be "
             "the same as the tensor parallel size[%s]. Only the low-latency (LL) "
@@ -609,6 +616,68 @@ def validate_deepep_v2_dispatch_token_budget(server_args: Any) -> None:
             f"required={graph_tokens}, capacity={capacity} "
             f"(requests={graph_bs}, tokens/request={tokens_per_req}). Raise "
             "the environment value or lower --cuda-graph-max-bs-decode."
+        )
+
+
+def validate_nccl_ep_dispatch_token_budget(server_args: Any) -> None:
+    """Check the per-rank dispatch capacity against prefill and decode batches.
+
+    NCCL EP implements only the low-latency path, so prefill chunks and decode
+    CUDA graphs both have to fit the per-rank buffer.
+    """
+    view = resolved_view(server_args)
+    if view.moe_a2a_backend != "nccl_ep":
+        return
+    # Keep this configuration check independent of optional backend imports.
+    capacity = view.nccl_ep_num_max_dispatch_tokens_per_rank or 1024
+    if not 0 < capacity <= 1024:
+        raise ValueError(
+            "--nccl-ep-num-max-dispatch-tokens-per-rank must be between "
+            "0 (default 1024) and 1024."
+        )
+    if view.disaggregation_mode != "decode":
+        ceiling = max_prefill_buffer_tokens(server_args) or (
+            view.max_prefill_tokens or 0
+        )
+        # TP size alone does not prove that a model shards its MoE input.
+        # Use the full ceiling as a conservative bound for replicated and
+        # sharded inputs, including unequal DP batches under SUM_LEN padding.
+        prefill_tokens = ceiling
+        if prefill_tokens > capacity:
+            raise ValueError(
+                "NCCL EP per-rank prefill budget exceeds "
+                "--nccl-ep-num-max-dispatch-tokens-per-rank: "
+                f"required={prefill_tokens}, capacity={capacity}. Lower "
+                "--chunked-prefill-size / --max-prefill-tokens."
+            )
+
+    if view.disaggregation_mode == "prefill":
+        return
+    decode_config = getattr(view.cuda_graph_config, "decode", None)
+    graph_bs = (
+        decode_config.max_bs or 0
+        if decode_config is not None and decode_config.backend != Backend.DISABLED
+        else 0
+    )
+    concurrency = view.max_running_requests
+    if concurrency is not None:
+        attn_dp_size = view.dp_size if view.enable_dp_attention else 1
+        concurrency = max(1, concurrency // attn_dp_size)
+        graph_bs = min(graph_bs, concurrency)
+    tokens_per_req = (
+        max_speculative_num_draft_tokens(server_args) or 1
+        if view.speculative_algorithm
+        else 1
+    )
+    requests = max(graph_bs, concurrency or 0)
+    decode_tokens = requests * tokens_per_req
+    if decode_tokens > capacity:
+        raise ValueError(
+            "NCCL EP per-rank decode budget exceeds "
+            "--nccl-ep-num-max-dispatch-tokens-per-rank: "
+            f"required={decode_tokens}, capacity={capacity} "
+            f"(requests={requests}, tokens/request={tokens_per_req}). Lower "
+            "--cuda-graph-max-bs-decode / --max-running-requests."
         )
 
 
