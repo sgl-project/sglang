@@ -13,15 +13,13 @@ register_npu_ci(
     est_time=3600,
     suite="",
     nightly=True,
-    # disabled="Prefill CP on HIP/NPU/MUSA is deprecated; CP support will be refactored soon.",
+    disabled="Prefill CP on HIP/NPU/MUSA is deprecated; CP support will be refactored soon.",
 )
 
 GLM_5_1_PD_SEP_PREFILL_ENVS = {
     "SGLANG_SET_CPU_AFFINITY": "1",
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
     "STREAMS_PER_DEVICE": "32",
-    "SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS": "0",
-    "ASCEND_USE_FIA": "0",
     "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "1200",
     "SGLANG_DISAGGREGATION_WAITING_TIMEOUT": "1200",
     "DEEPEP_HCCL_BUFFSIZE": "1200",
@@ -39,8 +37,6 @@ GLM_5_1_PD_SEP_DECODE_ENVS = {
     "SGLANG_SET_CPU_AFFINITY": "1",
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
     "STREAMS_PER_DEVICE": "32",
-    "SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS": "0",
-    "ASCEND_USE_FIA": "0",
     "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "1200",
     "SGLANG_DISAGGREGATION_WAITING_TIMEOUT": "1200",
     "SGLANG_SPEC_ENABLE_OVERLAP_REFLOW": "1",
@@ -174,9 +170,9 @@ GLM_5_1_PD_SEP_MODEL_CONFIG = {
 }
 
 
-# @unittest.skip(
-#     "Prefill CP on HIP/NPU/MUSA is deprecated; CP support will be refactored soon."
-# )
+@unittest.skip(
+    "Prefill CP on HIP/NPU/MUSA is deprecated; CP support will be refactored soon."
+)
 class TestNPUGLM5_1_W4A8_PD_SEP_In3k5_Out1k5(TestNpuPerfMultiNodePdSepTestCaseBase):
     """Test NPU performance for GLM-5.1-w4a8 PD separation 4 nodes in3k5 out1k5"""
 
