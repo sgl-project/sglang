@@ -1600,7 +1600,20 @@ class OpenAIServingResponses(OpenAIServingChat):
                 message.get("name"),
                 encode_custom_tool_input(message.get("input") or ""),
             )
-        if msg_type in ("function_call_output", "custom_tool_call_output"):
+        if msg_type == "function_call_output":
+            # Preserve multimodal tool results by translating Responses parts to
+            # their Chat Completions equivalents, as for message input items.
+            out = message.get("output", "")
+            if isinstance(out, list):
+                out = [
+                    cls._normalize_response_content_part_for_chat(part) for part in out
+                ]
+            return {
+                "role": "tool",
+                "tool_call_id": message.get("call_id"),
+                "content": out,
+            }
+        if msg_type == "custom_tool_call_output":
             return {
                 "role": "tool",
                 "tool_call_id": message.get("call_id"),
