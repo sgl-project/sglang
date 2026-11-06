@@ -5,7 +5,7 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 
-"""Feature-owned allocations admitted for Blackwell hardware decompression.
+"""Feature-owned host arenas and hardware-decompression device allocations.
 
 Each rank owns its persistent host input arena; allocations are never exported
 or imported.
@@ -167,6 +167,21 @@ def record_device_stream(tensor, stream):
         if stream.device != owner.device:
             raise ValueError("GPU-delta allocation consumer stream/device mismatch")
         owner.streams[stream.cuda_stream] = stream
+
+
+class PinnedHostAllocation:
+    """Persistent pinned input for the CUDA decoder's double-buffered H2D copies."""
+
+    def __init__(self, capacity):
+        import torch
+
+        self.tensor = torch.empty(capacity, dtype=torch.uint8, pin_memory=True)
+        self.capacity = capacity
+        self.view = memoryview(self.tensor.numpy())
+
+    def close(self):
+        self.view.release()
+        self.view = self.tensor = None
 
 
 class HostAllocation:

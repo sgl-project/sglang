@@ -1,6 +1,6 @@
 """GPU conformance for the prebuilt nvCOMP ABI; no extension compilation.
 
-Manual-only: requires Blackwell, the paired Miles image, nvCOMP 6,
+Manual-only: DE cases require Blackwell; all cases use the paired Miles image, nvCOMP 6,
 zstandard, python-snappy, and lz4. Missing hardware or dependencies fail this suite.
 The hardware decoder preserves known bytes. Tests intentionally never feed malformed
 compressed streams to the GPU decoder.
@@ -133,7 +133,8 @@ def test_batched_plans_share_metadata_and_reuse_tensor_scratch(
         assert batch._arguments[5:7] == (temporary.data_ptr(), temporary.numel())
     prepared = PreparedDelta.__new__(PreparedDelta)
     prepared.device = device
-    prepared.stream, prepared.de_stream = stream, de_stream
+    prepared.stream, prepared.io_stream = stream, de_stream
+    prepared.hardware = True
     prepared.decoded_ready = [torch.cuda.Event() for _ in range(2)]
     prepared.decoded_free = [torch.cuda.Event() for _ in range(2)]
     # B leaves a prefix, an interior hole and a short tail; the unused part of
@@ -303,6 +304,86 @@ def test_batched_plans_share_metadata_and_reuse_tensor_scratch(
     # Original host input is released only after all streams' readers finish.
     del host
     allocation.close()
+
+
+@pytest.mark.parametrize("algorithm", ["bitcomp", "snappy", "lz4"])
+def test_cuda_decode_overlaps_h2d_and_reuses_double_buffer(algorithm, monkeypatch):
+    from miles.utils.gpu_delta.nvcomp import NvcompCompressor
+
+    # Force the CUDA path for Snappy/LZ4 even on the Blackwell validation node.
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (9, 0))
+    device = torch.device("cuda", 0)
+    compute, h2d = [torch.cuda.Stream(device=device) for _ in range(2)]
+    values = [bytes(1 << 20), bytes(range(251)) * 3, bytes([17]) * (64 << 10)]
+    with torch.cuda.stream(compute):
+        tensors = [
+            torch.frombuffer(bytearray(value), dtype=torch.uint8).to(device)
+            for value in values
+        ]
+        encoded = NvcompCompressor(algorithm, device).compress(tensors, compute)
+    compute.synchronize()
+    assert encoded.statuses.tolist() == [0] * len(values)
+    payload, frames = bytearray(), []
+    for value, output, size in zip(values, encoded.outputs, encoded.sizes.tolist()):
+        payload.extend(bytes((-len(payload)) % 16))
+        frames.append((len(payload), size, len(value), 0))
+        payload.extend(output[:size].cpu().numpy().tobytes())
+    host = torch.empty(len(payload), dtype=torch.uint8, pin_memory=True)
+    host.numpy()[:] = np.frombuffer(payload, dtype=np.uint8)
+    groups = [[0, 1], [2], [1, 2], [0], [2, 0, 1], []]
+    batches, references = [], []
+    for group in groups:
+        rows, reference = [], bytearray()
+        for index in group:
+            reference.extend(bytes([0xA5]) * ((-len(reference)) % 16))
+            source, encoded_size, decoded_size, _ = frames[index]
+            rows.append((source, encoded_size, decoded_size, len(reference)))
+            reference.extend(values[index])
+        batches.append(rows)
+        references.append(bytes(reference))
+    decoder = NvcompDecoder(device, algorithm)
+    assert decoder.backend == "cuda" and decoder._options.backend == 2
+    table, counts = _frame_table(batches)
+    plan = decoder.prepare_batches(table, counts, host, compute)
+    assert not plan.input_slots  # No compressed device arena before the pause.
+    with torch.cuda.stream(compute):
+        outputs = [
+            torch.empty(max(map(len, references)), dtype=torch.uint8, device=device)
+            for _ in range(2)
+        ]
+        plans = plan.bind_outputs(outputs)
+        error = torch.zeros(1, dtype=torch.int32, device=device)
+        checks = [prepare_status_check(batch, error) for batch in plans]
+        initialized = torch.cuda.Event()
+        initialized.record(compute)
+    h2d.wait_event(initialized)
+    ready, free = [[torch.cuda.Event() for _ in range(2)] for _ in range(2)]
+    snapshots = []
+    plans[0].copy_input(h2d)
+    ready[0].record(h2d)
+    for index, batch in enumerate(plans):
+        slot = index % 2
+        compute.wait_event(ready[slot])
+        if index + 1 < len(plans):
+            next_slot = (index + 1) % 2
+            if index >= 1:
+                h2d.wait_event(free[next_slot])
+            plans[index + 1].copy_input(h2d)
+            ready[next_slot].record(h2d)
+        with torch.cuda.stream(compute):
+            outputs[slot].fill_(0xA5)
+            batch.enqueue()
+            free[slot].record(compute)
+            checks[index]()
+            if batches[index]:
+                snapshots.append(outputs[slot][: len(references[index])].clone())
+    compute.synchronize()
+    h2d.synchronize()
+    assert error.item() == 0
+    assert len(plan.input_slots) == 2
+    assert plan.input_capacity_bytes <= 2 * len(payload)
+    for index, actual in enumerate(snapshots):
+        assert actual.cpu().numpy().tobytes() == references[index]
 
 
 if __name__ == "__main__":

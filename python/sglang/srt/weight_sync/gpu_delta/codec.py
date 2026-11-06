@@ -4,8 +4,9 @@ Preparation allocates small metadata and workspace; decoded output slots are bou
 only after generation pauses.
 The hot path calls the public C API directly: no nvCOMP Python array finalizers,
 implicit size discovery, host scalar reads or wrapper-added synchronization.
-The nvCOMP DE backend may wait for earlier work on the calling stream before
-submitting decompression, even though the public API is named Async.
+The nvCOMP DE backend and Bitcomp batched decoder may wait for earlier work on
+the calling stream before submitting decompression, despite the Async API name.
+CUDA decoding uses two compressed device slots so H2D can overlap decode/apply.
 """
 
 from __future__ import annotations
@@ -40,9 +41,14 @@ class _Lz4Options(ctypes.Structure):
     ]
 
 
+class _BitcompOptions(ctypes.Structure):
+    _fields_ = [("backend", ctypes.c_int), ("reserved", ctypes.c_char * 60)]
+
+
 _DECOMPRESS_OPTIONS = {
     "snappy": ("Snappy", _SnappyOptions),
     "lz4": ("LZ4", _Lz4Options),
+    "bitcomp": ("Bitcomp", _BitcompOptions),
 }
 _MAX_FRAME_BYTES = 4 << 20
 _INT64_MAX = np.iinfo(np.int64).max
@@ -92,18 +98,14 @@ class DecodeWorkspace:
 
 
 class NvcompDecoder:
-    """One device's fixed inner-codec hardware decoder.
-
-    Missing libraries and unsupported hardware fail admission. There is no CPU
-    decoder, algorithm substitution or software fallback.
-    """
+    """DE for Snappy/LZ4 on SM100/103; CUDA decoding for other combinations."""
 
     def __init__(self, device: torch.device, inner_codec: str):
         self.device = torch.device(device)
         if self.device.type != "cuda" or self.device.index is None:
             raise ValueError("Delta decoder requires an explicit CUDA device")
         if inner_codec not in _DECOMPRESS_OPTIONS:
-            raise ValueError("GPU delta inner codec must be snappy or lz4")
+            raise ValueError("GPU delta inner codec must be snappy, lz4 or bitcomp")
         self.inner_codec = inner_codec
         self._algorithm, options_type = _DECOMPRESS_OPTIONS[inner_codec]
         sorting = os.environ.get("GPU_DELTA_SORT_BEFORE_HW_DECOMPRESS", "0")
@@ -115,16 +117,22 @@ class NvcompDecoder:
         major_version = int(distribution.version.split(".")[0])
         if major_version != 6 or ctypes.sizeof(ctypes.c_size_t) != 8:
             raise RuntimeError("Direct GPU deltas require the 64-bit nvCOMP 6 ABI")
-        self.backend = "hardware"
+        hardware = inner_codec in {
+            "snappy",
+            "lz4",
+        } and torch.cuda.get_device_capability(self.device) in {(10, 0), (10, 3)}
+        self.backend = "hardware" if hardware else "cuda"
         self._options = options_type()
-        # Explicit backend selection: DEFAULT can silently select software.
-        self._options.backend = 1
-        self._options.sort_before_hw_decompress = int(sorting)
+        self._options.backend = 1 if hardware else 2
+        if inner_codec in {"snappy", "lz4"}:
+            self._options.sort_before_hw_decompress = int(sorting) if hardware else 0
         if self._algorithm == "LZ4":
             self._options.data_type = 0  # NVCOMP_TYPE_CHAR
             self._options.bitshuffle_mode = 0  # NVCOMP_BITSHUFFLE_NONE
-        self.maximum_chunk_bytes = _require_hardware_device(
-            self.device, self._algorithm
+        self.maximum_chunk_bytes = (
+            _require_hardware_device(self.device, self._algorithm)
+            if hardware
+            else _INT64_MAX
         )
         self._library = ctypes.CDLL(
             str(distribution.locate_file("nvidia/libnvcomp/lib64/libnvcomp.so.6"))
@@ -193,18 +201,32 @@ class NvcompDecoder:
         self._temporary_sizes[key] = size.value
         return size.value
 
+    def _empty(self, shape, dtype):
+        if self.backend == "hardware":
+            from sglang.srt.weight_sync.gpu_delta.memory import device_empty
+
+            return device_empty(shape, dtype=dtype, device=self.device)
+        return torch.empty(shape, dtype=dtype, device=self.device)
+
+    def _record_stream(self, tensor, stream):
+        if self.backend == "hardware":
+            from sglang.srt.weight_sync.gpu_delta.memory import record_device_stream
+
+            record_device_stream(tensor, stream)
+        else:
+            tensor.record_stream(stream)
+
     def _allocate_workspace(self, geometry, cuda_stream) -> DecodeWorkspace:
-        """One DE stream shares scratch; statuses/sizes belong to two slots."""
-        from sglang.srt.weight_sync.gpu_delta.memory import device_empty
+        """One decode stream shares scratch; statuses/sizes belong to two slots."""
 
         maximum_count = max((batch[0] for batch in geometry), default=0)
         temporary = max(
             (self.temporary_bytes(batch, cuda_stream) for batch in geometry), default=0
         )
         workspace = DecodeWorkspace(
-            device_empty((temporary,), dtype=torch.uint8, device=self.device),
-            device_empty((2, maximum_count), dtype=torch.int64, device=self.device),
-            device_empty((2, maximum_count), dtype=torch.int32, device=self.device),
+            self._empty((temporary,), torch.uint8),
+            self._empty((2, maximum_count), torch.int64),
+            self._empty((2, maximum_count), torch.int32),
         )
         if temporary and workspace.temporary.data_ptr() % self.alignments.temp:
             raise ValueError("Misaligned decoder workspace")
@@ -257,7 +279,7 @@ class NvcompDecoder:
                 raise ValueError("Misaligned decoded frame")
             remainders[slot] = first
             bounds[slot] = max(bounds[slot], int(outputs[-1] + decoded[-1]))
-            if count > _INT64_MAX // maximum:
+            if count > _INT64_MAX // int(decoded.max()):
                 raise ValueError("Decoded geometry sum exceeds signed metadata")
             geometry.append((count, int(decoded.max()), int(decoded.sum())))
         return geometry, bounds, remainders
@@ -274,11 +296,9 @@ class NvcompDecoder:
 
         Rows contain relative input offsets, encoded sizes, decoded sizes and
         relative output offsets. The admitted host arena must stay immutable
-        until the DE stream drains. Only input/size rows are uploaded now;
-        ``bind_outputs`` fills output pointers under the serving pause.
+        until decoding completes. Size rows and DE input pointers are uploaded now;
+        ``bind_outputs`` fills output pointers and CUDA input pointers while paused.
         """
-        from sglang.srt.weight_sync.gpu_delta.memory import device_empty
-
         if (
             host_input.device.type != "cpu"
             or host_input.dtype != torch.uint8
@@ -299,9 +319,10 @@ class NvcompDecoder:
             host_rows = host.numpy()
             np.add(table[0], input_base, out=host_rows[0])
             host_rows[1:3] = table[1:3]
-            metadata = device_empty(host.shape, dtype=torch.int64, device=self.device)
+            metadata = self._empty(host.shape, torch.int64)
             if metadata.numel():
-                metadata[:3].copy_(host[:3], non_blocking=True)
+                first = 0 if self.backend == "hardware" else 1
+                metadata[first:3].copy_(host[first:3], non_blocking=True)
         return PreparedDecodePlan(
             self,
             counts,
@@ -313,7 +334,32 @@ class NvcompDecoder:
             table[3].copy(),
             bounds,
             remainders,
+            table[:2],
         )
+
+
+def _pack_inputs(inputs, sizes, alignment):
+    """Merge adjacent frames into bounded H2D spans, retaining frame alignment."""
+    if not len(inputs):
+        return np.empty(0, dtype=np.int64), (), 0
+    alignment = max(16, alignment)  # Publication frames carry 16-byte padding.
+    order = np.argsort(inputs)
+    starts = inputs[order]
+    ends = np.maximum.accumulate(starts + sizes[order])
+    boundaries = np.r_[True, starts[1:] > ends[:-1] + alignment - 1]
+    first = np.flatnonzero(boundaries)
+    last = np.r_[first[1:] - 1, len(starts) - 1]
+    lengths = ends[last] - starts[first]
+    padded = (lengths + alignment - 1) // alignment * alignment
+    destinations = np.r_[0, np.cumsum(padded[:-1])]
+    groups = np.cumsum(boundaries) - 1
+    offsets = np.empty_like(inputs)
+    offsets[order] = starts - starts[first][groups] + destinations[groups]
+    ranges = tuple(
+        (int(source), int(destination), int(length))
+        for source, destination, length in zip(starts[first], destinations, lengths)
+    )
+    return offsets, ranges, int(destinations[-1] + lengths[-1])
 
 
 class PreparedDecodePlan:
@@ -331,6 +377,7 @@ class PreparedDecodePlan:
         output_offsets,
         output_bounds,
         output_remainders,
+        input_frames=None,
     ):
         self.decoder, self.stream = decoder, stream
         self.workspace = workspace
@@ -339,6 +386,9 @@ class PreparedDecodePlan:
         # Every batch retains this same list. Binding fills it only after all
         # output checks pass; dropping the plan alone cannot free in-flight slots.
         self.decoded_slots = []
+        self.input_slots = []
+        self.input_bytes = self.input_capacity_bytes = 0
+        self.input_bounds = [0, 0]
         self.batches = []
         temporary = workspace.temporary
         offset = 0
@@ -362,6 +412,15 @@ class PreparedDecodePlan:
                 statuses.data_ptr(),
                 stream.cuda_stream,
             )
+            if decoder.backend == "cuda":
+                inputs, sizes = input_frames[:, offset : offset + count]
+                input_offsets, copy_ranges, capacity = _pack_inputs(
+                    inputs, sizes, decoder.alignments.input
+                )
+                self.input_bounds[slot] = max(self.input_bounds[slot], capacity)
+                self.input_bytes += sum(length for _, _, length in copy_ranges)
+            else:
+                input_offsets, copy_ranges = None, ()
             self.batches.append(
                 PreparedDecode(
                     decoder,
@@ -377,6 +436,10 @@ class PreparedDecodePlan:
                     arguments,
                     output_offsets[offset : offset + count],
                     host_rows[3].numpy(),
+                    self.input_slots,
+                    input_offsets,
+                    copy_ranges,
+                    [],
                 )
             )
             offset += count
@@ -384,8 +447,6 @@ class PreparedDecodePlan:
 
     def record_stream(self, stream):
         """Register every consumer before it can enqueue storage readers."""
-        from sglang.srt.weight_sync.gpu_delta.memory import record_device_stream
-
         if stream.device != self.decoder.device:
             raise ValueError("Decoder consumer stream/device mismatch")
         for tensor in (
@@ -394,23 +455,21 @@ class PreparedDecodePlan:
             self.workspace.actual_sizes,
             self.workspace.statuses,
             *self.decoded_slots,
+            *self.input_slots,
         ):
-            record_device_stream(tensor, stream)
+            self.decoder._record_stream(tensor, stream)
 
     @profiling.annotate("gpu_delta.pause.bind_decoder_outputs")
     def bind_outputs(
         self, decoded_slots: Sequence[torch.Tensor]
     ) -> list[PreparedDecode]:
-        """Check paused allocations, fill output pointers, upload just row 3.
+        """Bind paused allocations: output row 3 and CUDA input row 0.
 
         Slot bounds and relative pointer alignment were computed during prepare.
         The caller waits for prior apply readers before reusing each output and
-        its status/actual-size row. Temporary storage is reused on the DE stream.
+        its status/actual-size row. Scratch is reused on the selected decode stream.
         """
-        from sglang.srt.weight_sync.gpu_delta.memory import (
-            record_device_stream,
-            require_de_capable,
-        )
+        from sglang.srt.weight_sync.gpu_delta.memory import require_de_capable
 
         if len(decoded_slots) != 2:
             raise ValueError("Decoded output count differs from prepared slots")
@@ -443,11 +502,33 @@ class PreparedDecodePlan:
             ):
                 raise ValueError("Misaligned decoded frame")
         for tensor in decoded_slots:
-            record_device_stream(tensor, self.stream)
+            self.decoder._record_stream(tensor, self.stream)
         with torch.cuda.device(self.decoder.device), torch.cuda.stream(self.stream):
-            for base, capacity in zip(bases, capacities):
-                if capacity:
-                    require_de_capable(base)
+            if self.decoder.backend == "hardware":
+                for base, capacity in zip(bases, capacities):
+                    if capacity:
+                        require_de_capable(base)
+            else:
+                self.input_slots[:] = [
+                    self.decoder._empty(size, torch.uint8) for size in self.input_bounds
+                ]
+                self.input_capacity_bytes = sum(self.input_bounds)
+                for index, batch in enumerate(self.batches):
+                    slot = self.input_slots[index % 2]
+                    np.add(
+                        batch.input_offsets,
+                        slot.data_ptr(),
+                        out=batch.host_metadata[0].numpy(),
+                    )
+                    batch.input_copies[:] = [
+                        (
+                            slot[destination : destination + length],
+                            batch.host_input[source : source + length],
+                        )
+                        for source, destination, length in batch.copy_ranges
+                    ]
+                if self.metadata.numel():
+                    self.metadata[0].copy_(self.host_metadata[0], non_blocking=True)
             for index, batch in enumerate(self.batches):
                 np.add(
                     batch.output_offsets,
@@ -475,14 +556,27 @@ class PreparedDecode:
     _arguments: tuple
     output_offsets: np.ndarray
     output_pointers: np.ndarray
+    input_slots: list[torch.Tensor]
+    input_offsets: np.ndarray | None
+    copy_ranges: tuple
+    input_copies: list
+
+    @profiling.annotate("gpu_delta.pause.h2d_input")
+    def copy_input(self, stream) -> None:
+        if self.input_copies:
+            self.decoder._record_stream(self.input_copies[0][0], stream)
+        with torch.cuda.stream(stream):
+            for destination, source in self.input_copies:
+                destination.copy_(source, non_blocking=True)
 
     @profiling.annotate("gpu_delta.pause.nvcomp_enqueue")
     def enqueue(self) -> None:
         """Launch only; caller checks statuses/sizes on device before applying weights.
 
         This object and all storage must outlive the submitted work. There is no
-        normal-path synchronization here; the session owns the final fence and
-        enters the captured DE stream/device context around submission. Foreign
+        explicit synchronization here; nvCOMP Bitcomp may synchronize internally
+        to inspect headers. The receiver queues the next H2D transfer first.
+        The session owns the final fence and calling-stream context. Foreign
         allocation finalizers also fence their recorded consumers before freeing.
         """
         if not self.statuses.numel():
