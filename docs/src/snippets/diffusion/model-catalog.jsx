@@ -4,6 +4,17 @@ export const DiffusionModelCatalog = ({ category }) => {
   const MODEL_CATALOG = {
   image: [
     {
+      name: "MOSS-Image",
+      modelIds: ["OpenMOSS-Team/MOSS-Image-Base", "OpenMOSS-Team/MOSS-Image-SFT"],
+      cookbook: "/cookbook/diffusion/OpenMOSS/MOSS-Image",
+      note: "Base is the reference checkpoint; SFT checkpoint validation is pending.",
+    },
+    {
+      name: "HunyuanImage-3.0",
+      modelIds: ["tencent/HunyuanImage-3.0", "tencent/HunyuanImage-3.0-Instruct"],
+      cookbook: "/cookbook/diffusion/Tencent/HunyuanImage3",
+    },
+    {
       name: "Anima",
       modelIds: ["circlestone-labs/Anima-Base-v1.0-Diffusers"],
       cookbook: "/cookbook/diffusion/CircleStone/Anima",
@@ -27,6 +38,11 @@ export const DiffusionModelCatalog = ({ category }) => {
       cookbook: "/cookbook/diffusion/FLUX/FLUX",
     },
     {
+      name: "FLUX.3 Image",
+      modelIds: ["black-forest-labs/flux-3-image-klein", "black-forest-labs/flux-3-image-klein-base"],
+      cookbook: "/cookbook/diffusion/FLUX/FLUX.3",
+    },
+    {
       name: "Qwen-Image",
       modelIds: [
         "Qwen/Qwen-Image",
@@ -36,8 +52,8 @@ export const DiffusionModelCatalog = ({ category }) => {
       cookbook: "/cookbook/diffusion/Qwen-Image/Qwen-Image",
     },
     {
-      name: "Qwen-Image 2.1",
-      modelIds: ["Qwen/Qwen-Image-2.1"],
+      name: "Qwen-Image 2.1 / Turbo",
+      modelIds: ["Qwen/Qwen-Image-2.1", "Qwen/Qwen-Image-2.1-Turbo"],
       cookbook: "/cookbook/diffusion/Qwen-Image/Qwen-Image-2.1",
     },
     {
@@ -129,6 +145,12 @@ export const DiffusionModelCatalog = ({ category }) => {
       note: "Resolved by the GLM-Image family detector.",
     },
     {
+      name: "HiDream-O1-Image",
+      modelIds: ["HiDream-ai/HiDream-O1-Image"],
+      cookbook: "/cookbook/diffusion/HiDream/HiDream-O1-Image",
+      note: "Pixel-space unified transformer: no VAE, single monolithic role, sequence parallelism unsupported.",
+    },
+    {
       name: "Hunyuan3D 2",
       modelIds: ["tencent/Hunyuan3D-2"],
     },
@@ -172,6 +194,14 @@ export const DiffusionModelCatalog = ({ category }) => {
         "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
       ],
       cookbook: "/cookbook/diffusion/Wan/Wan2.2",
+    },
+    {
+      name: "Wan-Animate-2",
+      modelIds: [
+        "Wan-AI/Wan2.2-Animate-2-14B-Diffusers",
+        "Wan-AI/Wan2.2-Animate-2-14B-Distilled-Diffusers",
+      ],
+      cookbook: "/cookbook/diffusion/Wan/Wan-Animate-2",
     },
     {
       name: "FastWan / TurboWan",
@@ -224,6 +254,16 @@ export const DiffusionModelCatalog = ({ category }) => {
       cookbook: "/cookbook/diffusion/MiniMax/MiniMax-H3#6-fasth3-8-step-distilled",
     },
     {
+      name: "FastH3 Omni",
+      modelIds: ["FastVideo/FastVideo-FastH3-Omni-8-Step-V1"],
+      cookbook: "/cookbook/diffusion/MiniMax/MiniMax-H3#fasth3-omni-ref2va-8-step-pdd",
+    },
+    {
+      name: "Pika H3 Flex",
+      modelIds: ["Pika-Labs/Pika-H3-Flex"],
+      cookbook: "/cookbook/diffusion/MiniMax/MiniMax-H3#pika-h3-flex-six-step-adapters",
+    },
+    {
       name: "VDN-H3",
       modelIds: ["OpenVDN/vdn-minimax-h3"],
       cookbook: "/cookbook/diffusion/MiniMax/MiniMax-H3#7-vdn-h3-hybrid-attention-8-step-distill",
@@ -245,6 +285,11 @@ export const DiffusionModelCatalog = ({ category }) => {
       cookbook: "/cookbook/diffusion/SANA-Video/SANA-Video",
     },
     {
+      name: "SANA-Video 2.0",
+      modelIds: ["Efficient-Large-Model/SANA-Video_2.0_5B_720p"],
+      cookbook: "/cookbook/diffusion/SANA-Video/SANA-Video#6-sana-video-20",
+    },
+    {
       name: "LingBot Video MoE",
       modelIds: ["robbyant/lingbot-video-moe-30b-a3b"],
       note: "Resolved by the LingBot Video MoE family detector.",
@@ -261,6 +306,11 @@ export const DiffusionModelCatalog = ({ category }) => {
   ],
   world: [
     {
+      name: "HY-Nomas",
+      modelIds: ["tencent/Hy-Nomas"],
+      cookbook: "/cookbook/diffusion/HY-Nomas/HY-Nomas",
+    },
+    {
       name: "Cosmos 3",
       modelIds: [
         "nvidia/Cosmos3-Nano",
@@ -271,6 +321,30 @@ export const DiffusionModelCatalog = ({ category }) => {
         "nvidia/Cosmos3-Edge",
       ],
       cookbook: "/cookbook/diffusion/Cosmos/Cosmos3",
+    },
+    {
+      name: "Cosmos-Dreams (Cosmos3-Interactive)",
+      modelIds: ["nvidia/Cosmos3-Nano-Sim-Bimanual"],
+      cookbook:
+        "/cookbook/diffusion/Cosmos/Cosmos3#simulation-and-multiview-checkpoints",
+    },
+    {
+      name: "Cosmos-Dreams-Transfer",
+      modelIds: ["nvidia/Cosmos3-Nano-Sim-Transfer"],
+      cookbook:
+        "/cookbook/diffusion/Cosmos/Cosmos3#simulation-and-multiview-checkpoints",
+    },
+    {
+      name: "Cosmos3 Multiview-AV",
+      modelIds: ["nvidia/Cosmos3-Nano-Transfer-Auto"],
+      cookbook:
+        "/cookbook/diffusion/Cosmos/Cosmos3#simulation-and-multiview-checkpoints",
+    },
+    {
+      name: "Cosmos3 Sim-Auto",
+      modelIds: ["nvidia/Cosmos3-Nano-Sim-Auto"],
+      cookbook:
+        "/cookbook/diffusion/Cosmos/Cosmos3#simulation-and-multiview-checkpoints",
     },
     {
       name: "FLUX 3 Action",

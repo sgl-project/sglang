@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-from sglang.srt.utils import add_prefix
+from sglang.srt.layers.utils.common import add_prefix
 
 # Adapted from
 # https://github.com/SafeAILab/EAGLE/blob/main/eagle/model/cnets.py
@@ -55,7 +55,8 @@ class Qwen2DecoderLayer(Qwen2DecoderLayer):
         if layer_id == 0:
             del self.input_layernorm
 
-    def _attn_readout(self, layer_id: int):
+    @classmethod
+    def _attn_readout(cls, layer_id: int):
         if layer_id == 0:
             return PLAIN_READOUT
         return super()._attn_readout(layer_id)

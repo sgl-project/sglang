@@ -24,7 +24,7 @@ from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=16, stage="base-b", runner_config="1-gpu-small")
 
 
 class TestGraphPoolBorrow(CustomTestCase):
@@ -208,7 +208,10 @@ class TestGraphPoolBorrow(CustomTestCase):
             sampling_info=sampling_info,
             forward_mode=SimpleNamespace(is_idle=lambda: False),
         )
-        logits_output = SimpleNamespace(next_token_logits=torch.randn((2, 8)))
+        logits_output = SimpleNamespace(
+            next_token_logits=torch.randn((2, 8)),
+            next_token_logits_vocab_shard=None,
+        )
         spec_config = SimpleNamespace(
             speculative_use_rejection_sampling=False,
             speculative_accept_threshold_single=1.0,
@@ -224,8 +227,9 @@ class TestGraphPoolBorrow(CustomTestCase):
                 return_value=False,
             ),
             get_parallel().override(tp_group=tp_group),
-            patch(
-                "sglang.kernels.ops.speculative.sampling.tree_speculative_sampling_target_only",
+            patch.object(
+                eagle_utils,
+                "tree_speculative_sampling_target_only",
                 side_effect=fake_sampling,
             ),
         ):

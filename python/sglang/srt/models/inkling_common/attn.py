@@ -9,11 +9,11 @@ from torch import nn
 from sglang.kernels.ops.attention.flash_attn.cute.batch_invariance import (
     is_batch_invariant,
 )
-from sglang.kernels.ops.attention.log_scaling_tau import (
-    apply_log_scaling_tau as _apply_log_scaling_tau,
-)
 from sglang.kernels.ops.attention.score_mod import (
     relative_bias_score_mod as triton_relative_bias_score_mod,
+)
+from sglang.kernels.ops.elementwise.row_scale import (
+    apply_log_scaling_tau as _apply_log_scaling_tau,
 )
 from sglang.kernels.ops.gemm.inkling_rel_proj import rel_proj_small_t
 from sglang.kernels.ops.memory.row_compact import row_compact_bf16
@@ -23,6 +23,7 @@ from sglang.srt.layers.linear import MergedColumnParallelLinear, RowParallelLine
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 from sglang.srt.models.inkling_common.kernels.comm import (
@@ -40,7 +41,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_spec,
 )
-from sglang.srt.utils import add_prefix, get_current_device_stream_fast
+from sglang.srt.utils import get_current_device_stream_fast
 
 try:
     import cutlass.cute as cute
@@ -446,6 +447,7 @@ class InklingAttention(nn.Module):
         )
         from sglang.srt.model_executor.forward_context import (
             get_attn_backend,
+            get_kv_layers,
             get_token_to_kv_pool,
         )
 
@@ -459,8 +461,8 @@ class InklingAttention(nn.Module):
         )
         v_cache, _, _, vw, v_inter = self.v_sconv.verify_fused_ar_inputs(forward_batch)
         pool = get_token_to_kv_pool()
-        k_buf = pool.get_key_buffer(self.layer_id)
-        v_buf = pool.get_value_buffer(self.layer_id)
+        kv = get_kv_layers().read(self.layer_id)
+        k_buf, v_buf = kv.key(), kv.value()
         do_bf16_store = _fused_kv_store_eligible(
             k_buf, v_buf, self.head_dim, torch.bfloat16
         )
@@ -469,7 +471,7 @@ class InklingAttention(nn.Module):
         if get_model().kv_cache_dtype == "mxfp8" and hasattr(
             pool, "get_kv_scale_buffer"
         ):
-            sfk, sfv = pool.get_kv_scale_buffer(self.layer_id)
+            sfk, sfv = kv.kv_scales()
             do_mxfp8_store = (
                 _fused_kv_store_eligible(
                     k_buf, v_buf, self.head_dim, torch.float8_e4m3fn
@@ -532,6 +534,7 @@ class InklingAttention(nn.Module):
         )
         from sglang.srt.model_executor.forward_context import (
             get_attn_backend,
+            get_kv_layers,
             get_token_to_kv_pool,
         )
 
@@ -557,8 +560,8 @@ class InklingAttention(nn.Module):
         v_inputs = self.v_sconv.extend_fused_ar_inputs(forward_batch)
         v_cache, vw = v_inputs[0], v_inputs[5]
         pool = get_token_to_kv_pool()
-        k_buf = pool.get_key_buffer(self.layer_id)
-        v_buf = pool.get_value_buffer(self.layer_id)
+        kv = get_kv_layers().read(self.layer_id)
+        k_buf, v_buf = kv.key(), kv.value()
         do_bf16_store = _fused_kv_store_eligible(
             k_buf, v_buf, self.head_dim, torch.bfloat16
         )
@@ -567,7 +570,7 @@ class InklingAttention(nn.Module):
         if get_model().kv_cache_dtype == "mxfp8" and hasattr(
             pool, "get_kv_scale_buffer"
         ):
-            sfk, sfv = pool.get_kv_scale_buffer(self.layer_id)
+            sfk, sfv = kv.kv_scales()
             do_mxfp8_store = (
                 _fused_kv_store_eligible(
                     k_buf, v_buf, self.head_dim, torch.float8_e4m3fn
@@ -649,6 +652,7 @@ class InklingAttention(nn.Module):
         )
         from sglang.srt.model_executor.forward_context import (
             get_attn_backend,
+            get_kv_layers,
             get_token_to_kv_pool,
         )
 
@@ -660,8 +664,8 @@ class InklingAttention(nn.Module):
         k_cache, ci, cm, kw = self.k_sconv.decode_fused_ar_inputs(forward_batch)
         v_cache, _, _, vw = self.v_sconv.decode_fused_ar_inputs(forward_batch)
         pool = get_token_to_kv_pool()
-        k_buf = pool.get_key_buffer(self.layer_id)
-        v_buf = pool.get_value_buffer(self.layer_id)
+        kv = get_kv_layers().read(self.layer_id)
+        k_buf, v_buf = kv.key(), kv.value()
         do_bf16_store = _fused_kv_store_eligible(
             k_buf, v_buf, self.head_dim, torch.bfloat16
         )
@@ -670,7 +674,7 @@ class InklingAttention(nn.Module):
         if get_model().kv_cache_dtype == "mxfp8" and hasattr(
             pool, "get_kv_scale_buffer"
         ):
-            sfk, sfv = pool.get_kv_scale_buffer(self.layer_id)
+            sfk, sfv = kv.kv_scales()
             do_mxfp8_store = (
                 _fused_kv_store_eligible(
                     k_buf, v_buf, self.head_dim, torch.float8_e4m3fn

@@ -8,6 +8,14 @@ import logging
 import os
 from typing import Any
 
+from sglang.srt.arg_groups.model_override_base import (
+    attention_backends_of,
+    mamba_extra_buffer_of,
+    model_config_of,
+    resolved_view,
+    resolving_view,
+    use_mla_backend,
+)
 from sglang.srt.arg_groups.overrides import (
     _deepseek_moe_quant_resolution,
     _deepseek_spec_moe_resolution,
@@ -18,21 +26,16 @@ from sglang.srt.arg_groups.overrides import (
     _hrm_text_attention_force,
     _mamba_radix_cache_resolution,
     _sparse_head_overlap_disable,
-    attention_backends_of,
     collect_model_override_declarations,
     declare_resolution,
     mamba_cache_chunk_size,
-    mamba_extra_buffer_of,
-    model_config_of,
-    resolved_view,
-    resolving_view,
     run_post_process_pass,
-    use_mla_backend,
     validate_declarations,
 )
 from sglang.srt.arg_groups.resolution_hooks import run_hook
 from sglang.srt.configs.embedding_model_spec import BCGPrefillPolicy
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec
+from sglang.srt.configs.quant_utils import get_quantization_config
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
@@ -42,11 +45,8 @@ from sglang.srt.runtime_context import (
     derive_attn_tp_size,
     get_platform,
 )
-from sglang.srt.utils.common import (
-    get_quantization_config,
-    is_mps,
-    parse_connector_type,
-)
+from sglang.srt.utils.common import parse_connector_type
+from sglang.srt.utils.device import is_mps
 
 logger = logging.getLogger(__name__)
 
@@ -97,10 +97,7 @@ def _probe_wo_a_weight_dtype(model_config: Any, download_dir: str | None) -> str
         from transformers.utils.hub import cached_file
 
         model_path = model_config.model_path
-        revision = (
-            getattr(model_config.hf_config, "_commit_hash", None)
-            or model_config.revision
-        )
+        revision = model_config.revision
         index_path = cached_file(
             model_path,
             "model.safetensors.index.json",
@@ -146,6 +143,7 @@ def handle_model_specific_adjustments(server_args: Any):
         NONCAUSAL_FULL_ATTENTION,
         get_mimo_v2_fused_qkv_expected_tp_size,
         is_deepseek_dsa,
+        is_kimi_k3,
     )
 
     if cfg.enable_deterministic_inference:
@@ -169,11 +167,15 @@ def handle_model_specific_adjustments(server_args: Any):
     hf_config = model_config.hf_config
     model_arch = hf_config.architectures[0]
 
-    if get_platform().is_npu and cfg.dcp_size > 1 and not is_deepseek_dsa(hf_config):
+    if (
+        get_platform().is_npu
+        and cfg.dcp_size > 1
+        and not (is_deepseek_dsa(hf_config) or is_kimi_k3(hf_config))
+    ):
         raise ValueError(
             "NPU decode context parallelism is currently implemented only for "
-            "DeepSeek DSA models; got "
-            f"{model_arch}. Set --decode-context-parallel-size=1 or use a DSA model."
+            "DeepSeek DSA and Kimi-K3 models; got "
+            f"{model_arch}. Set --decode-context-parallel-size=1 or use a supported model."
         )
 
     if model_arch == "InternS2MobiusForConditionalGeneration":
@@ -242,6 +244,7 @@ def handle_model_specific_adjustments(server_args: Any):
     if model_arch in (
         "KimiLinearForCausalLM",
         "KimiK3ForConditionalGeneration",
+        "KimiK31ForConditionalGeneration",
     ):
         from sglang.srt.arg_groups.kimi_k3_hook import (
             apply_kimi_k3_linear_attn_defaults,
@@ -279,6 +282,8 @@ def handle_model_specific_adjustments(server_args: Any):
         "HYV4ForCausalLMNextN",
         "LongcatFlashForCausalLM",
         "Dots3NoteForCausalLM",
+        "Xing4_0ForCausalLM",
+        "KimiK31ForConditionalGeneration",
     ]:
         # Set attention backend for DeepSeek
         if is_deepseek_dsa(hf_config):  # DeepSeek 3.2/GLM 5
@@ -308,15 +313,21 @@ def handle_model_specific_adjustments(server_args: Any):
                     # The DSA CP field declarations moved to the override
                     # registry (arg_groups/overrides.py:
                     # _deepseek_family_overrides).
-                    declare_resolution(
-                        server_args,
-                        "_handle_model_specific_adjustments",
-                        cuda_graph_config=with_phase(
-                            cfg.cuda_graph_config,
-                            Phase.PREFILL,
-                            backend=Backend.DISABLED,
-                        ),
-                    )
+                    from sglang.srt.layers.cp.bcg import supports_prefill_cp_bcg
+
+                    if not (
+                        cfg.cuda_graph_config.prefill.backend == Backend.BREAKABLE
+                        and supports_prefill_cp_bcg(server_args)
+                    ):
+                        declare_resolution(
+                            server_args,
+                            "_handle_model_specific_adjustments",
+                            cuda_graph_config=with_phase(
+                                cfg.cuda_graph_config,
+                                Phase.PREFILL,
+                                backend=Backend.DISABLED,
+                            ),
+                        )
                 else:
                     # Pure TP and partial DP Attention mode is active for DSA, logging a warning
                     attn_tp_size = derive_attn_tp_size(
@@ -509,6 +520,18 @@ def handle_model_specific_adjustments(server_args: Any):
             envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.set(False)
             envs.SGLANG_EAGER_INPUT_NO_COPY.set(True)
 
+    elif model_arch in ["Xing4_0ForCausalLM"]:
+        # Xing4_0 uses the TileLang mhc_pre/mhc_post kernels
+        # (sglang.kernels.ops.layernorm.mhc) for its mHC module. The
+        # DeepGEMM tf32_hc_prenorm_gemm path is a raw C extension that
+        # torch.compile (fullgraph=True, used by tc_piecewise prefill
+        # backend) cannot trace, raising:
+        #   torch._dynamo.exc.Unsupported: Dynamo does not know how to trace
+        #   method `__call__` of class `Function`
+        # Disable it so mhc_pre falls through to the TileLang splitk path
+        # which already supports xing4_0's hc_hidden_size=14336 (4 * 3584).
+        envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
+
     elif model_arch in ["GptOssForCausalLM"]:
         # Attention backend selection + XPU dtype validation moved to the
         # override registry (arg_groups/overrides.py: _gpt_oss_overrides).
@@ -643,6 +666,7 @@ def handle_model_specific_adjustments(server_args: Any):
         accepted_backends = (
             "trtllm_mha",
             "triton",
+            "fa4",
             "ascend",
             "intel_xpu",
             "intel_amx",
@@ -651,7 +675,7 @@ def handle_model_specific_adjustments(server_args: Any):
         assert (
             prefill_backend in accepted_backends and decode_backend in accepted_backends
         ), (
-            "Gemma4 only supports trtllm_mha, triton, ascend, intel_xpu, intel_amx, or "
+            "Gemma4 only supports trtllm_mha, triton, fa4, ascend, intel_xpu, intel_amx, or "
             f"aiter attention backend, got prefill={prefill_backend}, decode={decode_backend}"
         )
 
@@ -668,7 +692,7 @@ def handle_model_specific_adjustments(server_args: Any):
     ]:
         if hf_config.sliding_window_pattern is not None:
             # disable_hybrid_swa_memory moved to the override registry
-            # (arg_groups/overrides.py: _exaone_overrides).
+            # (arg_groups/model_overrides/exaone.py).
             # https://docs.sglang.ai/advanced_features/attention_backend.html
             accepted_backends = ["fa3", "triton", "trtllm_mha"]
             attention_backend = resolved_view(server_args).attention_backend
@@ -676,8 +700,8 @@ def handle_model_specific_adjustments(server_args: Any):
                 f"One of the attention backends in {accepted_backends} is required for {model_arch}, but got {attention_backend}"
             )
     elif model_arch in ["Olmo2ForCausalLM"]:
-        # disable_hybrid_swa_memory + attention backend selection moved to
-        # the override registry (arg_groups/overrides.py: _olmo2_overrides).
+        # The attention backend selection moved to the override registry
+        # (arg_groups/model_overrides/olmo2.py).
 
         # Flashinfer appears to degrade performance when sliding window attention
         # is used for the Olmo2 architecture. Olmo2 does not use sliding window attention
@@ -854,6 +878,20 @@ def handle_model_capability_adjustments(server_args: Any):
             "_handle_model_capability_adjustments",
             chunked_prefill_size=-1,
         )
+    # Encoder-only embedding models run one bidirectional prefill per request,
+    # so the KV pool is never read back; the FA backend then uses raw K/V.
+    if (
+        embedding_model_spec is not None
+        and embedding_model_spec.safe_disable_kv_cache
+        and embedding_model_spec.encoder_only_attention
+        and attention_backends_of(cfg)[0] in ("fa3", "fa4")
+    ):
+        declare_resolution(
+            server_args,
+            "_handle_model_capability_adjustments",
+            prefill_only_disable_kv_cache=True,
+        )
+        run_hook(validate_prefill_only_disable_kv_cache_args, server_args)
 
     is_embedding_gemma = (
         embedding_model_spec is not None
@@ -977,6 +1015,46 @@ def handle_model_capability_adjustments(server_args: Any):
             "prefill; using breakable CUDA graph for CUDA prefill."
         )
 
+    # A Clef checkpoint's joint schema head reads the final hidden state of
+    # every prompt token in one pass, so each request is one complete prefill
+    # with no decode: embedding mode, without prefix reuse or chunking. This
+    # also puts the FA backend on its raw K/V path, which skips the KV pool. A
+    # Kev checkpoint's pointer head reads two positions of each question's
+    # prompt and is served the same way.
+    if model_config.joint_head_config is not None:
+        name, head = "Clef", "joint schema head"
+        tp_reason = ", since the joint schema head reads full LM head rows"
+    elif model_config.pointer_head is not None:
+        name, head, tp_reason = "Kev", "pointer head", ""
+    else:
+        name = None
+    if name is not None:
+        if cfg.tp_size != 1 or cfg.pp_size != 1:
+            raise ValueError(
+                f"{name} checkpoints are served with --tp-size 1 and --pp-size 1"
+                f"{tp_reason}"
+            )
+        for key, value in (
+            ("is_embedding", True),
+            ("disable_radix_cache", True),
+            ("chunked_prefill_size", -1),
+        ):
+            declare_resolution(
+                server_args, "_handle_model_capability_adjustments", **{key: value}
+            )
+        for phase in (Phase.DECODE, Phase.PREFILL):
+            declare_resolution(
+                server_args,
+                "_handle_model_capability_adjustments",
+                cuda_graph_config=with_phase(
+                    cfg.cuda_graph_config, phase, backend=Backend.DISABLED
+                ),
+            )
+        logger.info(
+            f"{name} {head} detected: serving /v1/systemone decisions in "
+            "embedding mode without radix cache, chunked prefill, or CUDA graphs."
+        )
+
     if (
         model_config.is_multimodal
         and not model_config.is_multimodal_chunked_prefill_supported
@@ -990,6 +1068,15 @@ def handle_model_capability_adjustments(server_args: Any):
             f"Automatically turn off --chunked-prefill-size as it is not supported for "
             f"{hf_config.model_type}"
         )
+
+    if getattr(hf_config, "model_type", None) == "deepseek_v41":
+        from sglang.srt.arg_groups.deepseek_v4_hook import (
+            validate_deepseek_v41_encoder_replay_budget,
+        )
+
+        validate_deepseek_v41_encoder_replay_budget(server_args)
+    elif cfg.enable_encoder_swa_bounded_replay:
+        raise ValueError("--enable-encoder-swa-bounded-replay requires DeepSeek-V4.1")
 
 
 def handle_mamba_radix_cache(server_args: Any, hf_config: Any):
@@ -1039,12 +1126,14 @@ def handle_language_model_only(server_args: Any):
     ):
         if flag:
             raise ValueError(f"--language-model-only cannot be combined with {name}")
-    if cfg.disaggregation_mode != "null":
+    hf_config = model_config_of(server_args).hf_config
+    # V4.1 text-only workers use the standard PD KV transfer path.
+    if cfg.disaggregation_mode != "null" and hf_config.model_type != "deepseek_v41":
         raise ValueError(
             "--language-model-only is incompatible with --disaggregation-mode "
             "prefill/decode"
         )
-    architectures = model_config_of(server_args).hf_config.architectures
+    architectures = hf_config.architectures
     if not any(
         a in server_args.LANGUAGE_MODEL_ONLY_ARCHITECTURES for a in architectures
     ):

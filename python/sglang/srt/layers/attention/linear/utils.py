@@ -7,7 +7,7 @@ import msgspec
 
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_exec
-from sglang.srt.utils.common import rank0_log
+from sglang.srt.utils.log_utils import rank0_log
 
 if TYPE_CHECKING:
     pass
@@ -68,7 +68,7 @@ class LinearAttnBackends(msgspec.Struct, frozen=True):
     """One runner's linear-attn kernel choice, per phase.
 
     Per runner, not per process: a target and its draft coexist and can want
-    different kernels (only the runner whose model is GDN gets the SM100
+    different kernels (only eligible GDN/KDA runners get the
     FlashInfer prefill default, and an explicit flag applies to whichever runner
     was launched with it).
     """
@@ -83,8 +83,8 @@ def resolve_linear_attn_backends(
 ) -> LinearAttnBackends:
     """This runner's kernel choice from the published leaves.
 
-    ``prefill_default`` is the caller's own auto-default (the SM100 GDN
-    domain); an explicitly configured ``--linear-attn-prefill-backend`` wins.
+    ``prefill_default`` is the caller's own auto-default;
+    an explicitly configured ``--linear-attn-prefill-backend`` wins.
     """
     mamba = get_exec().mamba
     base = mamba.linear_attn_backend
@@ -138,7 +138,7 @@ def build_verify_intermediate_state_indices(pool_size: int, device):
     """
     import torch
 
-    from sglang.srt.utils.common import get_eager_max_batch_size
+    from sglang.srt.layers.dp_attention import get_eager_max_batch_size
 
     padded_bs = max(get_eager_max_batch_size(pool_size), pool_size)
     indices = torch.arange(pool_size, dtype=torch.int32, device=device)

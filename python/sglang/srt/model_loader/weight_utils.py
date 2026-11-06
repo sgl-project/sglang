@@ -40,7 +40,11 @@ from huggingface_hub.errors import HfHubHTTPError
 from pydantic import BaseModel, ConfigDict, ValidationInfo, model_validator
 from tqdm.auto import tqdm
 
-from sglang.srt.configs.load_config import LoadConfig
+from sglang.srt.configs.load_config import (
+    _DEFAULT_LOAD_GROUP,
+    LoadConfig,
+    LoadGroup,
+)
 from sglang.srt.configs.model_config import (
     REQUANTIZATION_METHODS,
     ModelConfig,
@@ -59,6 +63,7 @@ from sglang.srt.model_loader.ci_weight_validation import (
     ci_download_with_validation_and_retry,
     ci_validate_and_cleanup_local_snapshot,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     BAR_FORMAT,
@@ -68,7 +73,7 @@ from sglang.srt.utils import (
     log_info_on_rank0,
     print_warning_once,
 )
-from sglang.srt.utils.common import is_cuda_alike
+from sglang.srt.utils.device import is_cuda_alike
 from sglang.utils import is_in_ci
 
 try:
@@ -1178,6 +1183,89 @@ def safetensors_weights_iterator(
         prefetch_handle.stop()
 
 
+def get_pp_stage_load_group() -> LoadGroup:
+    """Select a group for stage-local loads, not all-rank cold startup.
+
+    Call before draft contexts override the target's parallel topology.
+    """
+    parallel = get_parallel()
+    return parallel.tp_group if parallel.pp_size > 1 else _DEFAULT_LOAD_GROUP
+
+
+def instanttensor_weights_iterator(
+    hf_weights_files: List[str],
+    extra_config: Optional[dict] = None,
+    load_group: LoadGroup = _DEFAULT_LOAD_GROUP,
+) -> Generator[Tuple[str, torch.Tensor], None, None]:
+    """Iterate over Safetensors weights with InstantTensor."""
+    if current_platform.device_type != "cuda":
+        raise ValueError(
+            "InstantTensor requires a CUDA-compatible device (including CUDA and ROCm); "
+            f"got {current_platform.device_type!r}."
+        )
+
+    unsupported_files = [f for f in hf_weights_files if not f.endswith(".safetensors")]
+    if unsupported_files:
+        raise ValueError(
+            "InstantTensor only supports .safetensors checkpoints; "
+            f"unsupported files: {unsupported_files}"
+        )
+
+    try:
+        import instanttensor
+    except ImportError as e:
+        raise ImportError(
+            'Please install InstantTensor via `pip install "instanttensor>=0.1.9"`.'
+        ) from e
+
+    kwargs = dict(extra_config or {})
+    backend = kwargs.get("backend")
+    if backend is not None:
+        names = [backend] if isinstance(backend, str) else backend
+        if not isinstance(names, list) or not names:
+            raise ValueError(
+                "InstantTensor backend must be a name or a non-empty list of names"
+            )
+        available = {
+            **instanttensor.Backend.__members__,
+            **instanttensor.BackendPolicy.__members__,
+        }
+        if any(not isinstance(name, str) or name not in available for name in names):
+            raise ValueError(
+                f"Invalid InstantTensor backend {backend!r}; expected names from {sorted(available)}"
+            )
+        kwargs["backend"] = [available[name] for name in names]
+
+    distributed = torch.distributed.is_initialized()
+    if load_group is _DEFAULT_LOAD_GROUP:
+        load_group = get_parallel().world_group if distributed else None
+    process_group = (
+        load_group.device_group
+        if load_group is not None and load_group.world_size > 1
+        else None
+    )
+
+    device = current_platform.get_device(torch.cuda.current_device())
+    enable_tqdm = not distributed or torch.distributed.get_rank() == 0
+    with instanttensor.safe_open(
+        hf_weights_files,
+        framework="pt",
+        device=device,
+        process_group=process_group,
+        copy=True,
+        **kwargs,
+    ) as f:
+        yield from tqdm(
+            f.tensors(),
+            total=len(f.keys()),
+            desc="Loading safetensors using InstantTensor",
+            disable=not enable_tqdm,
+            mininterval=1,
+            bar_format=BAR_FORMAT,
+            position=tqdm._get_free_pos(),
+        )
+
+
 def fastsafetensors_weights_iterator(
     hf_weights_files: List[str],
     enable_gds: bool = True,
@@ -1202,7 +1290,9 @@ def fastsafetensors_weights_iterator(
     except Exception:
         rank = 0
 
-    device = torch.device(f"cuda:{rank}")
+    # The group rank is global; on multi-node TP it exceeds the local GPU count.
+    # ModelRunner has already set this process's device (its gpu_id).
+    device = torch.device("cuda", torch.cuda.current_device())
 
     weight_files_sub_lists = [
         hf_weights_files[i : i + pg.size()]
@@ -1308,23 +1398,8 @@ def buffered_multi_thread_safetensors_weights_iterator(
 
 
 def _load_pt_file(bin_file: str) -> dict:
-    """Load a PyTorch checkpoint file, handling legacy tar format.
-
-    PyTorch 2.6 changed the default of weights_only from False to True.
-    Legacy tar format files cannot be loaded with weights_only=True.
-    This function tries weights_only=True first, then falls back to False
-    for legacy tar format files from trusted sources (HuggingFace Hub).
-    """
-    try:
-        return torch.load(bin_file, map_location="cpu", weights_only=True)
-    except RuntimeError as e:
-        if "legacy .tar format" in str(e):
-            logger.warning(
-                "Loading %s with weights_only=False (legacy tar format)",
-                os.path.basename(bin_file),
-            )
-            return torch.load(bin_file, map_location="cpu", weights_only=False)
-        raise
+    """Load a PyTorch checkpoint file with weights_only=True (no pickle execution)."""
+    return torch.load(bin_file, map_location="cpu", weights_only=True)
 
 
 def pt_weights_iterator(
@@ -1620,6 +1695,8 @@ def runai_safetensors_weights_iterator(
 
         for name, tensor in tensor_iter:
             setattr(tensor, RUNAI_STREAMER_TENSOR_ATTR, True)
+            # Views and detach() share storage but do not inherit tensor attributes.
+            setattr(tensor.untyped_storage(), RUNAI_STREAMER_TENSOR_ATTR, True)
             yield name, tensor
 
 
@@ -1681,8 +1758,14 @@ def initialize_dummy_weights(
     the parameter's number of elements and its data type.
     """
     for name, param in model.state_dict().items():
+        # UE8M0 MXFP8 block scales (uint8): 127 is 2**0. Left at zero, every
+        # MXFP8 weight scales to 2**-127.
+        if name.endswith("weight_scale_inv") and param.dtype == torch.uint8:
+            param.fill_(127)
+            continue
         if torch.is_floating_point(param):
-            if name.endswith("weight_scale_inv"):
+            # Neutral FP4 global scales keep fused gate/up projections compatible.
+            if name.endswith(("weight_scale_inv", "weight_scale_2")):
                 param.fill_(1.0)
                 continue
             generator = torch.Generator(device=param.data.device)
@@ -1717,6 +1800,13 @@ def maybe_remap_kv_scale_name(name: str, params_dict: dict) -> Optional[str]:
              if no remapping is needed.
         None: If the remapped name is not found in params_dict.
     """
+    # ModelSlim: map fa_k.scale to attn_mqa.fa_k_scale; skip unused FA parameters.
+    stem, _, parameter = name.rpartition(".")
+    prefix, _, component = stem.rpartition(".")
+    if parameter in ("scale", "offset") and component in ("fa_q", "fa_k", "fa_v"):
+        remapped_name = f"{prefix}.attn_mqa.{component}_{parameter}"
+        return remapped_name if remapped_name in params_dict else None
+
     if name.endswith(".kv_scale"):
         print_warning_once(
             "DEPRECATED. Found kv_scale in the checkpoint. "

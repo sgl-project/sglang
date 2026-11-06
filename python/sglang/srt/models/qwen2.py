@@ -25,9 +25,11 @@ from torch import nn
 from sglang.srt.distributed import (
     get_pp_indices,
 )
+from sglang.srt.hf_transformers import get_rope_config
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.dual_gemm import DualGemm
 from sglang.srt.layers.layer_boundary import (
     append_stages,
     declare_attn,
@@ -45,9 +47,12 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.fp8_activation import DenseSiluAndMulQuant
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -58,10 +63,12 @@ from sglang.srt.model_loader.weight_utils import (
     kv_cache_scales_loader,
     supports_quantized_rl_reload,
 )
+from sglang.srt.models.utils import (
+    can_run_silu_fp4_quant_fusion,
+    silu_and_mul_fp4_quant,
+)
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_exec, get_parallel
-from sglang.srt.utils import add_prefix, make_pp_layers
-from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 Qwen2Config = None
 
@@ -100,6 +107,12 @@ class Qwen2MLP(nn.Module):
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
+        self.dual_gemm = DualGemm(self.gate_up_proj, self.down_proj, hidden_size)
+        self.activation_quant = DenseSiluAndMulQuant(self.down_proj)
+        # Off unless the decoder layer enables the fused SiLU+mul+NVFP4 quant path.
+        self._enable_silu_fp4_quant_fusion = False
+        self._masked_m_cache: dict = {}
+        self._down_input_scale_inv_1d = None
 
     def forward(
         self,
@@ -109,8 +122,18 @@ class Qwen2MLP(nn.Module):
         if get_exec().deterministic.rl_on_policy_target is not None:
             x = x.bfloat16()
 
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
+        if self.dual_gemm.can_run(x, self.gate_up_proj):
+            x = self.dual_gemm(x, self.gate_up_proj)
+        else:
+            gate_up, _ = self.gate_up_proj(x)
+            if can_run_silu_fp4_quant_fusion(self, gate_up):
+                x = silu_and_mul_fp4_quant(self, gate_up)
+            elif forward_batch is not None and forward_batch.forward_mode.is_decode():
+                x = self.activation_quant.forward_decode(
+                    gate_up, self.act_fn, self.down_proj
+                )
+            else:
+                x = self.act_fn(gate_up)
         x, _ = self.down_proj(x, forward_batch=forward_batch)
         return x
 
@@ -294,15 +317,24 @@ class Qwen2DecoderLayer(nn.Module):
         )
         self.input_layernorm.fuse_input_quant(self.self_attn.qkv_proj)
         self.post_attention_layernorm.fuse_input_quant(self.mlp.gate_up_proj)
+        attn, ffn = self.stage_facts(config, layer_id)
         self.attn_boundary, self.ffn_boundary = append_stages(
-            (declare_attn(read=self._attn_readout(layer_id)), self.input_layernorm),
-            (
-                declare_ffn(sparse=False, next_layer_sparse=False),
-                self.post_attention_layernorm,
-            ),
+            (attn, self.input_layernorm),
+            (ffn, self.post_attention_layernorm),
         )
 
-    def _attn_readout(self, layer_id: int):
+    @classmethod
+    def stage_facts(cls, config: Qwen2Config, layer_id: int):
+        """The stages a layer of this class declares, from the config alone:
+        the model's shared declaration function, which the layer declares
+        with too (see make_layers). A subclass's attention read takes part."""
+        return (
+            declare_attn(read=cls._attn_readout(layer_id)),
+            declare_ffn(sparse=False, next_layer_sparse=False),
+        )
+
+    @classmethod
+    def _attn_readout(cls, layer_id: int):
         return NORM_QUANT_READOUT
 
     def forward(
@@ -325,7 +357,7 @@ class Qwen2DecoderLayer(nn.Module):
         # Fully Connected
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
         return self.ffn_boundary.finish(hidden_states, forward_batch)
 
 
@@ -379,6 +411,7 @@ class Qwen2Model(nn.Module):
                 alt_stream=alt_stream,
             ),
             prefix=add_prefix("layers", prefix),
+            stage_facts=lambda idx: decoder_layer_type.stage_facts(config, idx),
         )
         if self.pp_group.is_last_rank:
             norm_kwargs = (
@@ -569,46 +602,6 @@ class Qwen2ForCausalLM(nn.Module):
                 return self.pooler(hidden_states, forward_batch)
         else:
             return hidden_states
-
-    @torch.no_grad()
-    def forward_split_prefill(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        split_interval: Tuple[int, int],  # [start, end) 0-based
-        input_embeds: torch.Tensor = None,
-    ):
-        start, end = split_interval
-        # embed
-        if start == 0:
-            residual_batch.start(forward_batch)
-            if input_embeds is None:
-                forward_batch.hidden_states = self.model.embed_tokens(input_ids)
-            else:
-                forward_batch.hidden_states = input_embeds
-        # decoder layer
-        for i in range(start, end):
-            layer = self.model.layers[i]
-            forward_batch.hidden_states = layer(
-                positions,
-                forward_batch.hidden_states,
-                forward_batch,
-            )
-
-        if end == self.model.config.num_hidden_layers:
-            # norm
-            forward_batch.hidden_states = residual_batch.final_norm(
-                forward_batch.hidden_states, forward_batch, self.model.norm
-            )
-            # logits process
-            result = self.logits_processor(
-                input_ids, forward_batch.hidden_states, self.lm_head, forward_batch
-            )
-        else:
-            result = None
-
-        return result
 
     @property
     def start_layer(self):

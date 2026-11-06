@@ -3,8 +3,8 @@ import json
 import openai
 import requests
 
+from sglang.srt.hf_transformers import get_tokenizer
 from sglang.srt.parser.reasoning_parser import ReasoningParser
-from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
 
 class ReasoningTokenUsageMixin:

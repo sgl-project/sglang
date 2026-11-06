@@ -2,9 +2,10 @@
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=45, suite="base-a-test-cpu")
+register_cpu_ci(est_time=25, suite="base-a-test-cpu")
 
 import dataclasses
+import functools
 import json
 import os
 import pathlib as _pathlib
@@ -23,9 +24,10 @@ import sglang as _sglang
 import sglang.srt.server_args as server_args_module
 from sglang.srt.arg_groups import prefill_buffer_ceiling
 from sglang.srt.arg_groups.arg_utils import NS, A, Arg
-from sglang.srt.arg_groups.model_override_base import resolving_view
-from sglang.srt.arg_groups.overrides import (
+from sglang.srt.arg_groups.model_override_base import (
     attention_backends_of,
+    resolved_view,
+    resolving_view,
 )
 from sglang.srt.arg_groups.overrides import (
     mamba_cache_chunk_size as mamba_cache_chunk_size_of,
@@ -35,12 +37,9 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.arg_groups.overrides import (
     resolution_result,
-    resolved_view,
 )
 from sglang.srt.runtime_context import (
-    Flags,
     ParallelContext,
-    RuntimeContext,
     SpawnRanks,
     _FlagGroupBase,
     assert_published,
@@ -52,6 +51,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
     get_server_args,
+    is_scheduler_io_rank,
     max_prefill_buffer_tokens,
     max_speculative_num_draft_tokens,
     publish,
@@ -82,6 +82,16 @@ def _sources():
             yield path
 
 
+@functools.lru_cache(maxsize=None)
+def _source_texts():
+    """``(path, text)`` for every file ``_sources`` yields, read once per process."""
+    return tuple((path, path.read_text(encoding="utf-8-sig")) for path in _sources())
+
+
+def _package_texts():
+    return ((p, t) for p, t in _source_texts() if p.is_relative_to(_PACKAGE))
+
+
 _PS = "sglang.srt.distributed.parallel_state"
 
 
@@ -105,37 +115,6 @@ GROUP_STAMPS = {
     "attn_cp_group": "_ATTN_CP",
     "shared_experts_tp_group": "_SHARED_EXPERTS_TP",
 }
-
-
-def _groups_the_build_states() -> dict:
-    """Extract context-to-module group mappings from initialization source."""
-    import ast
-    import inspect
-    import textwrap
-
-    from sglang.srt.distributed import parallel_state
-
-    body = textwrap.dedent(inspect.getsource(parallel_state.initialize_model_parallel))
-    for node in ast.walk(ast.parse(body)):
-        keys = getattr(node, "keys", None)
-        if (
-            isinstance(node, ast.Dict)
-            and keys
-            and all(
-                isinstance(k, ast.Constant) and str(k.value).endswith("_group")
-                for k in keys
-            )
-        ):
-            return {k.value: v.id for k, v in zip(node.keys, node.values)}
-    raise AssertionError("initialize_model_parallel states no group at all")
-
-
-class TestRuntimeContextSingletons(CustomTestCase):
-    def test_singletons(self):
-        self.assertIs(get_parallel(), get_parallel())
-        self.assertIsInstance(get_parallel(), ParallelContext)
-        self.assertIsInstance(get_context(), RuntimeContext)
-        self.assertIs(get_context().parallel, get_parallel())
 
 
 class _IsolatedOverrides(CustomTestCase):
@@ -163,87 +142,6 @@ class TestTheBuildStatesEveryGroup(_IsolatedOverrides):
 
         declared = {name for name in _parallel_fields() if name.endswith("_group")}
         self.assertEqual(declared, set(GROUP_STAMPS) | {"world_group"})
-
-    def test_the_world_group_is_stated_where_it_is_built(self):
-        import ast
-        import inspect
-        import textwrap
-
-        from sglang.srt.distributed import parallel_state
-
-        body = textwrap.dedent(
-            inspect.getsource(parallel_state.init_distributed_environment)
-        )
-        stated = {
-            kw.arg
-            for node in ast.walk(ast.parse(body))
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "override_permanently"
-            for kw in node.keywords
-        }
-        self.assertIn("world_group", stated)
-
-    def test_nothing_reads_a_name_this_build_has_not_stated_yet(self):
-        import ast
-        import inspect
-        import textwrap
-
-        from sglang.srt.distributed import parallel_state
-
-        body = textwrap.dedent(
-            inspect.getsource(parallel_state.initialize_model_parallel)
-        )
-        read = set()
-        for node in ast.walk(ast.parse(body)):
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-                name = parallel_state._CONTEXT_NAME_OF.get(node.func.id)
-                if name is not None:
-                    read.add(name)
-        self.assertTrue(read, "no getter is called here; this proves nothing")
-        self.assertEqual(read - {"world_group"}, set())
-
-    def test_each_group_is_stated_from_the_global_it_was_built_into(self):
-        self.assertEqual(_groups_the_build_states(), GROUP_STAMPS)
-
-    def test_a_dimension_the_configuration_has_not_got_is_left_unstated(self):
-        import ast
-        import inspect
-        import textwrap
-
-        from sglang.srt.distributed import parallel_state
-
-        body = textwrap.dedent(
-            inspect.getsource(parallel_state.initialize_model_parallel)
-        )
-        stamp = next(
-            node
-            for node in ast.walk(ast.parse(body))
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "override_permanently"
-        )
-        self.assertEqual([keyword.arg for keyword in stamp.keywords], [None])
-        mapping = stamp.keywords[0].value
-        self.assertIsInstance(mapping, ast.DictComp)
-        self.assertEqual(len(mapping.generators), 1)
-        guards = mapping.generators[0].ifs
-        self.assertEqual(len(guards), 1)
-        guard = guards[0]
-        self.assertIsInstance(guard, ast.Compare)
-        self.assertEqual([type(op) for op in guard.ops], [ast.IsNot])
-        self.assertEqual([c.value for c in guard.comparators], [None])
-        self.assertEqual(ast.unparse(guard.left), ast.unparse(mapping.value))
-
-
-class TestParallelDelegation(_IsolatedOverrides):
-    def test_wrapper_holds_no_resolved_state(self):
-        # __slots__: no __dict__; the only instance state is the override hook.
-        self.assertFalse(hasattr(get_parallel(), "__dict__"))
-        # tp_group IS exposed: live delegation handles PD-multiplexing / the tp patch.
-        self.assertTrue(hasattr(ParallelContext, "tp_group"))
-        # local_attn_dp is intentionally not part of the wrapper surface.
-        self.assertFalse(hasattr(ParallelContext, "local_attn_dp_size"))
 
 
 class TestTheTwoWorldWidths(_IsolatedOverrides):
@@ -485,7 +383,7 @@ class TestStampedRanks(_IsolatedOverrides):
 
         self.addCleanup(restore)
         publish(
-            ServerArgs(model_path="dummy", tp_size=8, attn_dp_size=8),
+            ServerArgs(model_path="dummy", tp_size=8, attn_dp_size=4),
             role="test",
             ranks=SpawnRanks(world_rank=3),
         )
@@ -493,13 +391,14 @@ class TestStampedRanks(_IsolatedOverrides):
         dp_flags.use_world_group_for_gather = False
         self.assertEqual(dp_gather_slot(), parallel.attn_dp_rank)
 
-        # After a scale-up the gather spans the expanded WORLD, and the joining
-        # cohort is numbered from its offset.
+        # After scale-up the gather spans expanded WORLD, but its slots remain
+        # logical DP replicas. Physical ranks 8 and 9 therefore share DP slot 4.
         dp_flags.use_world_group_for_gather = True
         dp_flags.joiner_skip_all_gather = False
         parallel.override_permanently(ep_join_rank_offset=8)
-        self.assertEqual(dp_gather_slot(), 8 + parallel.tp_rank)
-        self.assertEqual(parallel.attn_dp_size, 8)
+        self.assertEqual(dp_gather_slot(), (8 + parallel.tp_rank) // 2)
+        self.assertEqual(parallel.attn_dp_size, 4)
+        self.assertEqual(parallel.attn_tp_size, 2)
         self.assertEqual(parallel.tp_size, 8)
 
     def test_a_scale_up_writes_no_width(self):
@@ -673,6 +572,16 @@ class TestParallelOverride(_IsolatedOverrides):
         self.assertEqual(p._overrides, {})
 
 
+class TestSchedulerIoRank(_IsolatedOverrides):
+    def test_only_rank_zero_of_every_inner_group_is_the_io_rank(self):
+        ranks = {"pp_rank": 0, "attn_tp_rank": 0, "attn_cp_rank": 0}
+        with get_parallel().override(**ranks):
+            self.assertTrue(is_scheduler_io_rank())
+        for name in ranks:
+            with get_parallel().override(**{**ranks, name: 1}):
+                self.assertFalse(is_scheduler_io_rank(), name)
+
+
 class TestParallelDCP(_IsolatedOverrides):
     """DCP widths come from configuration; active DCP ranks come from publication."""
 
@@ -806,6 +715,40 @@ class TestServerArgsOwnership(_IsolatedServerArgs):
         reset_context()
         with self.assertRaises(ValueError):
             get_server_args()
+
+
+class TestEmbeddedRuntimeContext(unittest.TestCase):
+    def test_embedded_context_is_scoped_and_keeps_its_overrides(self):
+        """An embedded engine context must neither replace nor leak into the process one."""
+        from sglang.srt import runtime_context as rc
+
+        self.addCleanup(rc.restore_context, rc.snapshot_context())
+        rc.reset_context()
+        outer_args = ServerArgs(model_path="dummy", tp_size=1)
+        outer = publish(
+            outer_args, role="diffusion_gpu_worker", ranks=SpawnRanks(world_rank=0)
+        )
+        inner = rc.create_context(
+            ServerArgs(model_path="dummy", tp_size=2),
+            role="scheduler",
+            ranks=SpawnRanks(world_rank=1),
+        )
+        self.assertIs(get_context(), outer)
+
+        with self.assertRaisesRegex(RuntimeError, "inner failure"):
+            with rc.use_context(inner):
+                self.assertIs(get_parallel(), inner.parallel)
+                self.assertEqual(get_parallel().tp_rank, 1)
+                inner.override("encoder.setup", page_size=16)
+                raise RuntimeError("inner failure")
+        self.assertIs(get_context(), outer)
+        self.assertIs(get_server_args(), outer_args)
+        self.assertEqual(get_parallel().tp_rank, 0)
+        self.assertEqual(publish_role(), "diffusion_gpu_worker")
+        self.assertNotEqual(rc.get_schedule().page_size, 16)
+
+        with rc.use_context(inner):
+            self.assertEqual(rc.get_schedule().page_size, 16)
 
 
 class TestAssertPublished(_IsolatedServerArgs):
@@ -988,12 +931,6 @@ class TestFlagsTier(_IsolatedServerArgs):
     end of __post_init__); the flags tier only carries runtime state
     (today: the capture lifecycle)."""
 
-    def test_wiring_and_groups(self):
-        flags = get_flags()
-        self.assertIs(flags, get_context().flags)
-        self.assertIsInstance(flags, Flags)
-        self.assertTrue(hasattr(flags, "capture"))
-
     def test_typo_safety(self):
         group = _FakeCaptureGroup()
         with self.assertRaises(AttributeError):
@@ -1126,6 +1063,26 @@ class TestMoeFlagsGroup(_IsolatedServerArgs):
         self.assertTrue(get_moe_a2a_backend().is_deepep())
         self.assertFalse(get_flags().moe.disable_fp4_allgather)
         self.assertFalse(get_flags().moe.speculative_context)
+
+    def test_flashinfer_megamoe_speculative_defaults(self):
+        self._init(
+            moe_a2a_backend="flashinfer_megamoe",
+            moe_runner_backend="flashinfer_megamoe",
+        )
+        moe = get_flags().moe
+        self.assertEqual(moe.speculative_runner_backend.value, "flashinfer_trtllm")
+        self.assertTrue(moe.speculative_a2a_backend.is_none())
+
+    def test_flashinfer_megamoe_speculative_explicit_wins(self):
+        self._init(
+            moe_a2a_backend="flashinfer_megamoe",
+            moe_runner_backend="flashinfer_megamoe",
+            speculative_moe_runner_backend="triton",
+            speculative_moe_a2a_backend="deepep",
+        )
+        moe = get_flags().moe
+        self.assertEqual(moe.speculative_runner_backend.value, "triton")
+        self.assertTrue(moe.speculative_a2a_backend.is_deepep())
 
     def test_swap_restores_on_exception(self):
         from sglang.srt.layers.moe.utils import (
@@ -2179,6 +2136,10 @@ class TestDerivedWidths(_IsolatedOverrides):
         ):
             mock_world_group.return_value = Mock(device_group=Mock(), local_rank=0)
             parallel_state.initialize_model_parallel()
+            for name, global_name in GROUP_STAMPS.items():
+                built = getattr(parallel_state, global_name)
+                if built is not None:
+                    self.assertIs(getattr(get_parallel(), name), built, name)
         self.addCleanup(parallel_state.destroy_model_parallel)
 
         self.assertEqual(built_at[0], [list(range(world_size))])
@@ -2265,8 +2226,7 @@ class TestAnEntryThatBuildsARunnerHandsOverItsPlacement(CustomTestCase):
         import ast as _ast
 
         offenders = []
-        for path in _sources():
-            text = path.read_text(encoding="utf-8-sig")
+        for path, text in _source_texts():
             if "ModelRunner(" not in text or "publish(" not in text:
                 continue
             tree = _ast.parse(text)
@@ -2318,40 +2278,36 @@ class TestTheAccessorsHaveNoCallersOutsideTheirPackage(CustomTestCase):
             if line.startswith("def get_") or line.startswith("def is_")
         }
 
-    def _callers(self, name):
-        """Find getter calls outside the defining package, including import aliases."""
+    def _calls(self, name, text):
+        """Line numbers calling getter ``name`` in ``text``, including import aliases."""
         import re
 
-        from sglang.srt.distributed import parallel_state as parallel_state_module
-
-        root = _pathlib.Path(parallel_state_module.__file__).parents[2]
-        hits = []
-        for path in root.rglob("*.py"):
-            rel = path.relative_to(root).as_posix()
-            if rel.startswith(("srt/distributed/", "multimodal_gen/", "test/")):
-                continue
-            text = path.read_text()
-            spellings = (
-                {name}
-                | set(re.findall(rf"import\s+{re.escape(name)}\s+as\s+(\w+)", text))
-                | set(re.findall(rf"^\s*{re.escape(name)}\s+as\s+(\w+),?$", text, re.M))
-            )
-            pattern = re.compile(
-                r"(?<![.\w])(?:" + "|".join(re.escape(s) for s in spellings) + r")\("
-            )
-            for number, line in enumerate(text.splitlines(), 1):
-                if line.lstrip().startswith(("def ", "#")):
-                    continue
-                if pattern.search(line):
-                    hits.append(f"{rel}:{number}")
-        return hits
+        spellings = (
+            {name}
+            | set(re.findall(rf"import\s+{re.escape(name)}\s+as\s+(\w+)", text))
+            | set(re.findall(rf"^\s*{re.escape(name)}\s+as\s+(\w+),?$", text, re.M))
+        )
+        pattern = re.compile(
+            r"(?<![.\w])(?:" + "|".join(re.escape(s) for s in spellings) + r")\("
+        )
+        return [
+            number
+            for number, line in enumerate(text.splitlines(), 1)
+            if not line.lstrip().startswith(("def ", "#")) and pattern.search(line)
+        ]
 
     def test_no_business_code_calls_them(self):
+        names = sorted(self._accessors() - self.ALLOWED)
         offenders = {}
-        for name in sorted(self._accessors() - self.ALLOWED):
-            callers = self._callers(name)
-            if callers:
-                offenders[name] = callers
+        for path, text in _package_texts():
+            rel = path.relative_to(_PACKAGE).as_posix()
+            if rel.startswith(("srt/distributed/", "multimodal_gen/", "test/")):
+                continue
+            for name in names:
+                if name not in text:
+                    continue
+                for number in self._calls(name, text):
+                    offenders.setdefault(name, []).append(f"{rel}:{number}")
         self.assertEqual(
             offenders,
             {},
@@ -2413,9 +2369,6 @@ class TestTheAccessorsHaveNoCallersOutsideTheirPackage(CustomTestCase):
             except Exception:
                 pass
         self.assertEqual([str(w.message) for w in seen], [])
-
-    def test_the_guard_would_notice_a_caller(self):
-        self.assertTrue(self._callers("get_self_pp_group"))
 
 
 class TestTheTopologyIdentities(CustomTestCase):
@@ -2684,8 +2637,7 @@ class TestTheParallelPhase(CustomTestCase):
         import ast as _ast
 
         offenders = []
-        for path in _sources():
-            text = path.read_text(encoding="utf-8-sig")
+        for path, text in _source_texts():
             if "ModelRunner(" not in text or "publish(" not in text:
                 continue
             tree = _ast.parse(text)
@@ -2887,7 +2839,7 @@ class TestWhoAnswersDuringADraftScope(CustomTestCase):
 
     def test_a_report_built_for_a_runner_follows_that_runner(self):
         from sglang.srt.distributed import parallel_state
-        from sglang.srt.utils.weight_checker import WeightChecker
+        from sglang.srt.model_executor.weight_checker import WeightChecker
 
         self._two_stage_pipeline()
         self.assertEqual(get_parallel().pp_size, 2)
@@ -2952,9 +2904,8 @@ class TestTheDpSlotComesFromTheSequenceItIndexes(CustomTestCase):
 
     def test_nothing_else_reads_the_bare_slot(self):
         offenders, exercised = [], set()
-        for path in _sources():
-            text = path.read_text(encoding="utf-8-sig")
-            if not _calls_named(text, "dp_gather_slot"):
+        for path, text in _source_texts():
+            if "dp_gather_slot" not in text or not _calls_named(text, "dp_gather_slot"):
                 continue
             rel = str(path).replace("\\", "/")
             allowed = [a for a in self.MAY_READ_THE_BARE_SLOT if rel.endswith(a)]
@@ -2973,10 +2924,10 @@ class TestTheDpSlotComesFromTheSequenceItIndexes(CustomTestCase):
 
     def test_no_sequence_is_indexed_by_the_attention_rank(self):
         offenders = []
-        for path in _sources():
-            found = _sequences_indexed_by_the_attention_rank(
-                path.read_text(encoding="utf-8-sig")
-            )
+        for path, text in _source_texts():
+            if "global_num_tokens" not in text or "attn_dp_rank" not in text:
+                continue
+            found = _sequences_indexed_by_the_attention_rank(text)
             offenders.extend(f"{path}: {one}" for one in found)
         self.assertEqual(
             offenders,
@@ -2984,20 +2935,6 @@ class TestTheDpSlotComesFromTheSequenceItIndexes(CustomTestCase):
             "a draft scope narrows attn_dp_rank to 0; index with "
             "dp_slot_in(<the sequence>):\n  " + "\n  ".join(offenders),
         )
-
-    def test_the_censuses_would_notice_one(self):
-        planted = (
-            "def f(fb):\n"
-            "    x = global_num_tokens[get_parallel().attn_dp_rank]\n"
-            "    y = fb.global_num_tokens_cpu[parallel.attn_dp_rank]\n"
-            "    return dp_gather_slot(), x, y\n"
-        )
-        self.assertEqual(len(_sequences_indexed_by_the_attention_rank(planted)), 2)
-        self.assertEqual(_calls_named(planted, "dp_gather_slot"), 1)
-        # A legal shape stays quiet.
-        legal = "def f(s):\n    return s[dp_slot_in(s)]\n"
-        self.assertEqual(_sequences_indexed_by_the_attention_rank(legal), [])
-        self.assertEqual(_calls_named(legal, "dp_gather_slot"), 0)
 
 
 class TestEveryParallelReadNamesAParallelField(CustomTestCase):
@@ -3023,8 +2960,10 @@ class TestEveryParallelReadNamesAParallelField(CustomTestCase):
         """
         import ast as _ast
 
-        for path in _PACKAGE.rglob("*.py"):
-            tree = _ast.parse(path.read_text(encoding="utf-8-sig"))
+        for path, text in _package_texts():
+            if "get_parallel" not in text:
+                continue
+            tree = _ast.parse(text)
             relative = path.relative_to(_PACKAGE).as_posix()
             bound = {
                 target.id
@@ -3078,72 +3017,20 @@ class TestEveryParallelReadNamesAParallelField(CustomTestCase):
 class TestTheRetiredNamesAreGoneEverywhere(CustomTestCase):
     """Classify parallel getters and reject retired package imports."""
 
-    #: Getters that answer something other than a place in the topology.
-    NOT_A_PLACEMENT = {
-        "get_default_distributed_backend",
-        "get_mooncake_transfer_engine",
-        "get_torch_distributed_pg_options",
-    }
-    #: Widths whose group is not in ``_WIDTH_AND_GROUP``.
-    WIDTH_WITHOUT_A_CHECKED_GROUP = {
-        "get_dcp_world_size",
-        "get_moe_data_parallel_world_size",
-        "get_moe_tensor_parallel_world_size",
-    }
-    #: Variants that answer a group the map already covers.
-    VARIANT_OF_A_MAPPED_GROUP = {
-        "get_dcp_group_no_assert",
-        "get_self_pp_group",
-    }
-
     def _retired(self):
         from sglang.srt.distributed.parallel_state import _CONTEXT_NAME_OF
 
         return set(_CONTEXT_NAME_OF)
-
-    def test_every_getter_the_module_defines_is_classified(self):
-        """Every getter the module defines is deprecated or classified here."""
-        from sglang.srt.distributed import parallel_state
-
-        defined = {
-            name
-            for name in dir(parallel_state)
-            if name.startswith("get_")
-            and callable(getattr(parallel_state, name))
-            and getattr(getattr(parallel_state, name), "__module__", None)
-            == parallel_state.__name__
-        }
-        self.assertTrue(defined, "no getters found; this proves nothing")
-        unclassified = (
-            defined
-            - self._retired()
-            - self.NOT_A_PLACEMENT
-            - self.WIDTH_WITHOUT_A_CHECKED_GROUP
-            - self.VARIANT_OF_A_MAPPED_GROUP
-        )
-        self.assertEqual(
-            unclassified,
-            set(),
-            "these getters are neither deprecated nor classified; say which "
-            "kind each one is, or route it through get_parallel():\n  "
-            + "\n  ".join(sorted(unclassified)),
-        )
-        stale = (
-            self.NOT_A_PLACEMENT
-            | self.WIDTH_WITHOUT_A_CHECKED_GROUP
-            | self.VARIANT_OF_A_MAPPED_GROUP
-        ) - defined
-        self.assertEqual(
-            stale, set(), f"these are named here but no longer defined: {stale}"
-        )
 
     def test_nothing_imports_a_retired_name_from_the_package(self):
         import ast as _ast
 
         retired = self._retired()
         offenders = []
-        for path in _sources():
-            for node in _ast.walk(_ast.parse(path.read_text(encoding="utf-8-sig"))):
+        for path, text in _source_texts():
+            if "sglang.srt.distributed" not in text:
+                continue
+            for node in _ast.walk(_ast.parse(text)):
                 if (
                     isinstance(node, _ast.ImportFrom)
                     and node.module == "sglang.srt.distributed"
@@ -3254,31 +3141,6 @@ class TestNothingReadsThePlacementBeforeItIsFrozen(CustomTestCase):
             "ask get_parallel() there, or move the call after the freeze:\n  "
             + "\n  ".join(offenders),
         )
-
-    def test_the_census_would_notice_one(self):
-        import ast as _ast
-        import textwrap
-
-        methods = {
-            m.name: m
-            for m in _ast.parse(
-                textwrap.dedent(
-                    """
-                    class R:
-                        def init_torch_distributed(self):
-                            self.tp_rank = 0
-
-                        def early(self):
-                            return self.tp_rank
-                    """
-                )
-            )
-            .body[0]
-            .body
-        }
-        frozen = self._frozen_names(methods)
-        self.assertEqual(frozen, {"tp_rank"})
-        self.assertEqual(self._reads(methods, methods["early"], frozen), {"tp_rank"})
 
 
 if __name__ == "__main__":

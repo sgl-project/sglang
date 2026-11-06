@@ -26,22 +26,25 @@ import torch
 from sglang.srt.batch_overlap.two_batch_overlap import TboCudaGraphRunnerPlugin
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
 from sglang.srt.environ import envs
+from sglang.srt.kernel_plugins.nvidia.binding import prepare_megakernel
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
+    require_attn_tp_gather,
+    require_gathered_buffer,
+    require_mlp_tp_gather,
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
 from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
     ForwardBatch,
-    ForwardMode,
     NgramEmbeddingInfo,
     PPProxyTensors,
     enable_num_token_non_padded,
     get_server_return_hidden_states_mode,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.runner.flashinfer_autotune import (
     maybe_flashinfer_autotune_extend,
     run_flashinfer_autotune_forward,
@@ -51,16 +54,11 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
     get_flags,
+    get_model,
     get_parallel,
 )
 from sglang.srt.speculative.spec_info import create_dummy_verify_input
-from sglang.srt.utils import (
-    empty_context,
-    log_info_on_rank0,
-    require_attn_tp_gather,
-    require_gathered_buffer,
-    require_mlp_tp_gather,
-)
+from sglang.srt.utils import empty_context, log_info_on_rank0
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -138,15 +136,17 @@ def _allocate_decode_buffers(
             pp_proxy_tensors = {
                 "hidden_states": torch.zeros((max_num_token, hs), dtype=dtype),
             }
-            if not is_mhc:
-                # Only Kimi K3 supplies num_blocks: its PP bank is token-major
-                # [T, blocks, H]. Other models use [T, H].
-                residual_shape = (
-                    (max_num_token, pp_proxy_residual_num_blocks, hidden_size)
-                    if pp_proxy_residual_num_blocks is not None
-                    else (max_num_token, hidden_size)
+            if pp_proxy_residual_num_blocks is not None:
+                # Only Kimi K3 supplies num_blocks: its attention-residual bank
+                # is token-major [T, blocks, H] and takes the residual's place.
+                pp_proxy_tensors["attn_res_bank"] = torch.zeros(
+                    (max_num_token, pp_proxy_residual_num_blocks, hidden_size),
+                    dtype=dtype,
                 )
-                pp_proxy_tensors["residual"] = torch.zeros(residual_shape, dtype=dtype)
+            elif not is_mhc:
+                pp_proxy_tensors["residual"] = torch.zeros(
+                    (max_num_token, hidden_size), dtype=dtype
+                )
             if pp_proxy_topk_size is not None:
                 pp_proxy_tensors["topk_indices"] = torch.zeros(
                     (max_num_token, pp_proxy_topk_size), dtype=torch.int32
@@ -202,6 +202,7 @@ def _allocate_decode_buffers(
     return SimpleNamespace(
         input_ids=input_ids,
         input_embeds=input_embeds,
+        ragged_verify_layout=None,
         req_pool_indices=req_pool_indices,
         seq_lens=seq_lens,
         seq_lens_cpu=seq_lens_cpu,
@@ -231,7 +232,6 @@ class BaseRunner(ABC):
         # elastic-EP scale-up widens num_dp_ranks on the published config
         self.num_dp_ranks = get_parallel().num_dp_ranks
         self.pp_size = get_parallel().pp_size
-        self.enable_pdmux = get_disagg().enable_pdmux
         self.return_hidden_states_mode = (
             CaptureHiddenMode.NULL
             if model_runner.is_draft_worker
@@ -241,7 +241,17 @@ class BaseRunner(ABC):
         self.attn_tp_size = get_parallel().attn_tp_size
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
+    def model_context(self):
+        """Select the layout owned by this runner's current model."""
+        return get_model().override(
+            shared_experts=self.model_runner.model.shared_experts_config
+        )
+
     def warmup(self) -> None:
+        with self.model_context():
+            self._warmup()
+
+    def _warmup(self) -> None:
         """Run kernel warmup + autotune once, gated by mr._kernel_warmed_up."""
         mr = self.model_runner
         if getattr(mr, "_kernel_warmed_up", False):
@@ -262,6 +272,7 @@ class BaseRunner(ABC):
         )
         if prepare_model_resources is not None:
             prepare_model_resources(mr)
+        prepare_megakernel(mr)
 
         if should_run_flashinfer_autotune(self.model_runner):
             buffers, batch_size = self._autotune_buffers()
@@ -367,7 +378,11 @@ class BaseRunner(ABC):
 
         mr = self.model_runner
         tokens_per_req = mr.decode_num_tokens_per_req()
-        capture_bs, _ = get_batch_sizes_to_capture(mr, tokens_per_req)
+        capture_bs, _ = get_batch_sizes_to_capture(
+            mr,
+            tokens_per_req,
+            gathered_buffer_required=any(mr.decode_graph_gather_requirements()),
+        )
         if not capture_bs:
             return None
         return max(capture_bs) * tokens_per_req
@@ -697,7 +712,7 @@ class BaseRunner(ABC):
             global_forward_mode=capture_forward_mode,
             lora_ids=lora_ids,
         )
-        mr.kv_index_translator.bind_runner_slots(forward_batch)
+        mr.runner_ids.bind_runner_slots(forward_batch)
 
         if buffers.ngram_embedding_info is not None:
             forward_batch.ngram_embedding_info = buffers.ngram_embedding_info.slice(
@@ -745,7 +760,9 @@ class BaseRunner(ABC):
 
         torch.get_device_module(mr.device).synchronize()
         get_parallel().tp_group.barrier()
-        with forward_context(ForwardContext(attn_backend=mr.attn_backend)):
+        with forward_context(
+            ForwardContext(attn_backend=mr.attn_backend), forward_batch=forward_batch
+        ):
             with run_ctx or empty_context():
                 run_once()
 

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-import os
-from functools import lru_cache
+from functools import cache, lru_cache
 from typing import Callable, Optional, Tuple, Union
 
 import torch
@@ -10,14 +9,9 @@ import torch.nn.functional as F
 from sglang.kernels.kernel_api_logging import debug_kernel_api
 
 try:
-    if os.environ.get("SGLANG_INKLING_FA4_USE_PIP") == "1":
-        # A/B debug escape hatch: route through the pip flash-attn-4 package
-        # (dev's stack). rel_bias is vendored-only, so SHEARED must be 0.
-        from flash_attn.cute import flash_attn_varlen_func as _flash_attn_varlen_func
-    else:
-        from sglang.kernels.ops.attention.flash_attn.cute import (
-            flash_attn_varlen_func as _flash_attn_varlen_func,
-        )
+    from sglang.kernels.ops.attention.flash_attn.cute import (
+        flash_attn_varlen_func as _flash_attn_varlen_func,
+    )
 except Exception as _e:  # pragma: no cover
     _flash_attn_varlen_func = None
     _flash_attn_import_error = _e
@@ -223,6 +217,8 @@ def flash_attn_varlen_func(
     rel_bias: Optional[torch.Tensor] = None,
     rel_bias_prep_cache: Optional[dict] = None,
     return_softmax_lse: bool = False,
+    mask_mod: Optional[Callable] = None,
+    out: Optional[torch.Tensor] = None,
     **_: object,
 ):
     if _flash_attn_varlen_func is None:  # pragma: no cover
@@ -280,6 +276,9 @@ def flash_attn_varlen_func(
         rel_bias_kwargs["rel_bias"] = rel_bias
     if rel_bias_prep_cache is not None:
         rel_bias_kwargs["rel_bias_prep_cache"] = rel_bias_prep_cache
+    # The kernel writes into out, except where it pads MLA heads: its output
+    # then has more heads than out, and the result is a new tensor.
+    out_kwargs = {"out": out} if out is not None and mla_head_padding is None else {}
     result = _flash_attn_varlen_func(
         q=q,
         k=k,
@@ -299,12 +298,14 @@ def flash_attn_varlen_func(
         learnable_sink=learnable_sink,
         num_splits=num_splits,
         pack_gqa=pack_gqa,
+        mask_mod=mask_mod,
         score_mod=score_mod,
         aux_tensors=aux_tensors,
         return_lse=return_softmax_lse,
         **sf_kwargs,
         **descale_kwargs,
         **rel_bias_kwargs,
+        **out_kwargs,
     )
     result = _unpad_mla_result(result, mla_head_padding)
 
@@ -355,6 +356,8 @@ def flash_attn_with_kvcache(
     rel_bias: Optional[torch.Tensor] = None,
     rel_bias_prep_cache: Optional[dict] = None,
     return_softmax_lse: bool = False,
+    mask_mod: Optional[Callable] = None,
+    out: Optional[torch.Tensor] = None,
     **_: object,
 ):
     if k is not None or v is not None:
@@ -386,6 +389,7 @@ def flash_attn_with_kvcache(
         num_splits=num_splits,
         pack_gqa=pack_gqa,
         learnable_sink=sinks,
+        mask_mod=mask_mod,
         score_mod=score_mod,
         aux_tensors=aux_tensors,
         q_descale=q_descale,
@@ -397,6 +401,7 @@ def flash_attn_with_kvcache(
         rel_bias=rel_bias,
         rel_bias_prep_cache=rel_bias_prep_cache,
         return_softmax_lse=True,
+        out=out,
     )
 
     if return_softmax_lse:
@@ -404,3 +409,41 @@ def flash_attn_with_kvcache(
     if isinstance(result, tuple):
         return result[0]
     return result
+
+
+@cache
+def make_image_mask_mod(window_left: int = -1):
+    """Causal text plus same-image bidirectionality, with a left-window bound.
+
+    aux_tensors are packed query image ranges (inclusive, -1 for text) and
+    cu_seqlens_q. Ranges use absolute positions in each request's KV sequence.
+    Cache the callback so its identity remains stable across forward passes.
+    """
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass import Int32
+
+    from sglang.kernels.ops.attention.flash_attn.cute.utils import (
+        scalar_to_ssa,
+        ssa_to_scalar,
+    )
+
+    @cute.jit
+    def image_mask(batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+        ranges, cu_q = aux_tensors
+        # Partial tiles can call the mask on padded query rows. Clamp the load;
+        # the kernel separately masks those rows out of the output.
+        local_q = cutlass.min(ssa_to_scalar(q_idx), seqlen_info.seqlen_q - 1)
+        row = cutlass.max(cu_q[batch_idx[0]] + local_q, Int32(0))
+        begin = scalar_to_ssa(ranges[row, 0], Int32)
+        end = scalar_to_ssa(ranges[row, 1], Int32)
+        absolute_q = q_idx + scalar_to_ssa(
+            seqlen_info.seqlen_k - seqlen_info.seqlen_q, Int32
+        )
+        keep = (kv_idx <= absolute_q) | ((kv_idx >= begin) & (kv_idx <= end))
+        if cutlass.const_expr(window_left >= 0):
+            keep = keep & (kv_idx >= absolute_q - window_left)
+        return keep
+
+    image_mask.__vec_size__ = 1
+    return image_mask

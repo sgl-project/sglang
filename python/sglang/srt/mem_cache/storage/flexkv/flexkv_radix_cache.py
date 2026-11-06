@@ -394,6 +394,8 @@ class FlexKVRadixCache(RadixCache):
             kv_committed_len = len(req.origin_input_ids) + max(
                 len(req.output_ids) - 1, 0
             )
+        # Keep the stored prefix within the checkpoint boundary.
+        kv_committed_len = min(kv_committed_len, up_to)
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
         if not token_ids:
@@ -476,7 +478,7 @@ class FlexKVRadixCache(RadixCache):
     # Optional pass-throughs used by the scheduler
     # ------------------------------------------------------------------
 
-    def release_aborted_request(self, handle: CacheRequestHandle) -> None:
+    def _abandon_attempt(self, handle: CacheRequestHandle) -> None:
         """Clean up tracking for an aborted request without invoking FlexKV."""
         self._load_markers.pop(handle, None)
         with self._node_lock:

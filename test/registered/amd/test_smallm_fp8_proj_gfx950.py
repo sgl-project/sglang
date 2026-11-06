@@ -51,6 +51,7 @@ class TestSmallMFp8ProjGfx950(CustomTestCase):
             (10304, 4096, 32),
             (8704, 4096, 16),
             (4096, 4096, 40),
+            (1536, 6144, 16),  # MiniMax-M3.1 TP4 shared-expert gate_up
         ):
             w = (torch.randn(n, k, device="cuda") * 0.05).to(torch.float8_e4m3fn)
             s = torch.rand(n, 1, device="cuda") * 0.01 + 1e-3
@@ -184,8 +185,6 @@ class TestSmallMFp8ProjGfx950(CustomTestCase):
                 reduce_results=False,
                 params_dtype=torch.bfloat16,
                 quant_config=_QuarkPerToken(),
-                tp_rank=0,
-                tp_size=1,
             ).cuda()
             proj.weight.data.copy_(
                 (torch.randn(4096, 2048, device="cuda") * 0.05).to(torch.float8_e4m3fn)
