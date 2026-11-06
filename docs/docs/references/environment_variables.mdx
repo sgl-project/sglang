@@ -1519,6 +1519,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>300</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_PD_DECODE_CACHE_INPUT_ONLY</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Experimental PD decode retention policy. Cache only page-aligned input prefixes, excluding generated output. Requires decode radix caching, EAGLE/NEXTN, Mooncake, PP/CP/DCP=1 and a Python FULL-only device cache. HiCache, decode offload, external KV stores and session radix caching are unsupported. Default off; four-node GLM-5.2 validation of the current port is pending.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DISAGGREGATION_WAITING_TIMEOUT</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Timeout (seconds) for a request waiting on KV transfer.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>300</code></td>
