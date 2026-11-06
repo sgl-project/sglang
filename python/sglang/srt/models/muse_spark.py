@@ -838,6 +838,12 @@ class MuseSpark1xMoE(nn.Module):
             topk_scores, topk_ids, packed_topk_ids = self._routing_op()(
                 None, router_logits, self.top_k, True, want_packed=True
             )
+        # The non-SP, non-NVFP4 norm only reads the main-stream pooler output.
+        # Enqueue it before joining the router; NVFP4 owns its fused norm/quant
+        # and SP normalizes inside _forward_sp_experts.
+        if not self.nvfp4_checkpoint and not sp_active:
+            if self.pre_expert_norm is not None:
+                expert_input = self.pre_expert_norm(expert_input)
         if use_side_stream:
             main_stream.wait_stream(side_stream)
         if use_side_stream and not torch.cuda.is_current_stream_capturing():
@@ -875,8 +881,6 @@ class MuseSpark1xMoE(nn.Module):
                 ar_workspace=ar_workspace,
             )
         else:
-            if self.pre_expert_norm is not None:
-                expert_input = self.pre_expert_norm(expert_input)
             output = self.experts(
                 expert_input,
                 topk_scores,
