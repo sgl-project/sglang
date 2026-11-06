@@ -53,10 +53,14 @@ def test_unsupported_contract_rejected(option):
 
 
 def test_default_launch_and_restore_on_failure(monkeypatch):
+    from sglang.multimodal_gen import runtime
+
     original = lambda spec: None
     module = types.ModuleType("sglang.multimodal_gen.runtime.launch_server")
     module.bootstrap_scheduler_process = original
     monkeypatch.setitem(sys.modules, module.__name__, module)
+    # a launch_server imported by an earlier test is found on the package first
+    monkeypatch.setattr(runtime, "launch_server", module, raising=False)
     with patches.scheduler_profiles([]):
         assert module.bootstrap_scheduler_process is original
     with (
