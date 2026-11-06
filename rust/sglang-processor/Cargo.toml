@@ -4,6 +4,7 @@ description = "Shared SGLang wrappers over the Dynamo frontend crates"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 
 [features]
 default = ["parser", "render", "tokenizer"]

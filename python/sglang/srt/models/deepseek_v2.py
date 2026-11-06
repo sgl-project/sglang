@@ -157,9 +157,12 @@ from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
     maybe_fuse_routed_scale_and_shared_add,
     routed_hidden_size,
 )
+from sglang.srt.layers.quantization.unquant import prefer_bf16_splitk_over_fused_a
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -214,6 +217,7 @@ from sglang.srt.models.deepseek_common.utils import (
     quant_blocks_shared_experts_fusion,
     tiny_router_gemm_max_tokens,
 )
+from sglang.srt.models.utils import is_non_idle_and_non_empty
 from sglang.srt.multimodal.dsv41.vl_routing import vision_topk
 from sglang.srt.runtime_context import (
     LoRABatchLayout,
@@ -231,10 +235,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     BumpAllocator,
     LazyValue,
-    add_prefix,
-    is_non_idle_and_non_empty,
     is_sm90_supported,
-    make_pp_layers,
     use_intel_amx_backend,
 )
 from sglang.srt.utils.custom_op import register_custom_op
@@ -588,7 +589,6 @@ class MoEGate(nn.Module):
                 hidden_states,
                 self.weight,
                 out_dtype=torch.float32,
-                max_m=self.tiny_router_gemm_max_tokens,
             )
         elif _use_aiter:
             logits = aiter_dsv3_router_gemm(hidden_states, self.weight)
@@ -2622,7 +2622,9 @@ class DeepseekV2AttentionMLA(
                     self.fused_qkv_a_proj_with_mqa, backend=self.fused_a_gemm_backend
                 )
             )
-        if self._use_min_latency_fused_a_gemm:
+        if self._use_min_latency_fused_a_gemm and not prefer_bf16_splitk_over_fused_a(
+            x=hidden_states, weight=self.fused_qkv_a_proj_with_mqa.weight
+        ):
             return linear_with_fused_a_gemm(
                 self.fused_qkv_a_proj_with_mqa,
                 hidden_states,
