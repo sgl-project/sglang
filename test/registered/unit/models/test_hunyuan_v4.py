@@ -8,7 +8,7 @@ from torch import nn
 from sglang.srt.models import hunyuan_v4
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=9, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def test_attention_gate_uses_attention_tp(monkeypatch):

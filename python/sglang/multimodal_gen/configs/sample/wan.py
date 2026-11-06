@@ -395,6 +395,27 @@ class Wan_Animate_2_14B_SamplingParam(Wan2_2_Base_SamplingParams):
             )
 
 
+@dataclass
+class Wan_Animate_2_14B_Distilled_SamplingParam(Wan_Animate_2_14B_SamplingParam):
+    """Sampling defaults for the distilled Wan-Animate-2 14B checkpoint (10 steps, no CFG)."""
+
+    # Guidance is distilled into the weights; the stage runs a single forward at 1.0.
+    guidance_scale: float = 1.0
+    num_inference_steps: int = 10
+
+    def _validate_with_pipeline_config(self, pipeline_config) -> None:
+        super()._validate_with_pipeline_config(pipeline_config)
+        # Runs once per request on the merged params. ValueError like the base hook's
+        # input checks: the /v1/videos handler maps it to HTTP 400.
+        if self.guidance_scale != 1.0:
+            raise ValueError(
+                f"guidance_scale={self.guidance_scale} is not supported by the "
+                "distilled Wan-Animate-2 checkpoint: it samples at guidance_scale 1.0 "
+                "only (the distilled recipe has no unconditional branch); omit the "
+                "field or set it to 1.0."
+            )
+
+
 # Smallest clip: one conditioning frame plus one VAE temporal stride (4k+1, k >= 1).
 MIN_CLIP_LEN = 5
 

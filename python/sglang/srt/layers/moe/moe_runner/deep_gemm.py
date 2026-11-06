@@ -8,10 +8,8 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.moe.dsv4 import (
-    silu_and_mul_clamp,
-    silu_and_mul_masked_post_quant,
-)
+from sglang.kernels.ops.activation.silu_and_mul_clamp import silu_and_mul_clamp
+from sglang.kernels.ops.moe.dsv4 import silu_and_mul_masked_post_quant
 from sglang.kernels.ops.moe.triton_pad_expert_counts import pad_expert_counts
 from sglang.kernels.ops.quantization.per_token_group_quant import per_token_group_quant
 
@@ -402,7 +400,9 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         quant_info: DeepGemmMoeQuantInfo,
         running_state: dict,
     ) -> torch.Tensor:
-        from sglang.kernels.ops.moe.dsv4 import silu_and_mul_contig_post_quant
+        from sglang.kernels.ops.activation.silu_and_mul_clamp import (
+            silu_and_mul_contig_post_quant,
+        )
         from sglang.kernels.ops.moe.ep_moe_kernels import tma_align_input_scale
         from sglang.kernels.ops.quantization.fp8_kernel import (
             create_per_token_group_quant_fp8_output_scale,
