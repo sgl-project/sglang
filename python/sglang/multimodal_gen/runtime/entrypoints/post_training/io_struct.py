@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 @dataclass
@@ -61,6 +61,9 @@ class ResumeMemoryOccupationReqInput:
 
 
 class RolloutRequest(BaseModel):
+    # set by the client to abort the request later with POST /rollout/abort;
+    # restricted so it is safe in file names such as profiler traces
+    request_id: Optional[str] = Field(default=None, pattern=r"^[A-Za-z0-9_-]{1,128}$")
     prompt: str
     negative_prompt: Optional[str] = None
     seed: Optional[int] = None
@@ -97,6 +100,11 @@ class RolloutRequest(BaseModel):
     suppress_logs: bool = False
 
     extra_sampling_params: Optional[dict[str, Any]] = None
+
+
+class RolloutAbortRequest(BaseModel):
+    request_ids: Optional[list[str]] = None
+    abort_all: bool = False
 
 
 class RolloutResponse(BaseModel):
