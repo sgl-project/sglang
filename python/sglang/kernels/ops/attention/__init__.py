@@ -480,6 +480,19 @@ register_kernel(
         ),
     )
 )
+# tcgen05 + TMA gather4, validated on SM100 only.
+for _fn in ("sparse_mla_q8kv8_sm100_fwd", "sparse_mla_q8kv8_sm100_trtllm"):
+    register_kernel(
+        KernelSpec(
+            op=f"attention.{_fn}",
+            backend=KernelBackend.JIT,
+            target=f"sglang.kernels.ops.attention.sparse_mla_q8kv8_sm100:{_fn}",
+            capabilities=frozenset(
+                {CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 0))}
+            ),
+        )
+    )
+del _fn
 register_kernel(
     KernelSpec(
         op="attention.topk_index_reduce",

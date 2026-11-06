@@ -3475,18 +3475,24 @@ def calculate_mla_kv_cache_dim(
     if not is_dsa_model:
         return kv_cache_dim
 
-    # TRTLLM uses the raw MLA KV layout. In disaggregated serving only the
-    # backend for the local role determines the local pool layout; the
-    # inactive role may legitimately have a different default backend.
+    # TRTLLM uses the raw MLA KV layout, and q8kv8_sm100 reads the same pool.
+    # In disaggregated serving only the backend for the local role determines
+    # the local pool layout; the inactive role may legitimately have a
+    # different default backend.
+    raw_layout_backends = ("trtllm", "q8kv8_sm100")
     disaggregation_mode = get_disagg().disaggregation_mode
     if disaggregation_mode == "decode":
-        uses_trtllm_kv_layout = get_exec().kernel.dsa_decode_backend == "trtllm"
+        uses_trtllm_kv_layout = (
+            get_exec().kernel.dsa_decode_backend in raw_layout_backends
+        )
     elif disaggregation_mode == "prefill":
-        uses_trtllm_kv_layout = get_exec().kernel.dsa_prefill_backend == "trtllm"
+        uses_trtllm_kv_layout = (
+            get_exec().kernel.dsa_prefill_backend in raw_layout_backends
+        )
     else:
         uses_trtllm_kv_layout = (
-            get_exec().kernel.dsa_prefill_backend == "trtllm"
-            or get_exec().kernel.dsa_decode_backend == "trtllm"
+            get_exec().kernel.dsa_prefill_backend in raw_layout_backends
+            or get_exec().kernel.dsa_decode_backend in raw_layout_backends
         )
 
     if uses_trtllm_kv_layout:

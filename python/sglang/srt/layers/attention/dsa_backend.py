@@ -359,6 +359,7 @@ _DSA_IMPL_T: TypeAlias = Literal[
     "tilelang",
     "triton",
     "trtllm",
+    "q8kv8_sm100",
     "intel_xpu",
 ]
 
@@ -496,6 +497,37 @@ def _validate_flashmla_sparse_q8_backend(
             "flashmla_sparse_q8 is a prefill-only backend. Pair it with a decode "
             "backend that reads the KV cache dtype (flashmla_kv for fp8_e4m3; "
             "tilelang or fa3 for bfloat16)."
+        )
+
+
+def _validate_q8kv8_sm100_backend(
+    *,
+    device_capability: Tuple[int, int],
+    kv_cache_dtype: torch.dtype,
+    kv_cache_dim: int,
+    num_q_heads: int,
+    index_kpool: int,
+    dcp_size: int,
+) -> None:
+    # q8kv8_sm100 is the trtllm FP8 path (merged e4m3 q, raw 576-dim e4m3 KV
+    # rows) with the final attention call replaced; the DCP path keeps its own call.
+    if not (
+        _is_cuda
+        and device_capability == (10, 0)
+        and kv_cache_dtype == torch.float8_e4m3fn
+        and kv_cache_dim == 576
+        and num_q_heads % 64 == 0
+        and index_kpool == 1
+        and dcp_size == 1
+    ):
+        raise ValueError(
+            "The q8kv8_sm100 DSA backend needs SM100, --kv-cache-dtype fp8_e4m3 "
+            "with 576-dim KV rows, a multiple of 64 query heads per rank, no "
+            "KPool and no DCP; got "
+            f"capability={device_capability}, "
+            f"kv_cache_dtype={kv_cache_dtype}, kv_cache_dim={kv_cache_dim}, "
+            f"num_q_heads={num_q_heads}, index_kpool={index_kpool}, "
+            f"dcp_size={dcp_size}."
         )
 
 
@@ -720,6 +752,15 @@ class DeepseekSparseAttnBackend(
             hisparse_enabled=self.hisparse_coordinator is not None,
             mixed_chunk_enabled=get_schedule().enable_mixed_chunk,
         )
+        if "q8kv8_sm100" in (self.dsa_prefill_impl, self.dsa_decode_impl):
+            _validate_q8kv8_sm100_backend(
+                device_capability=self.device_capability,
+                kv_cache_dtype=self.kv_cache_dtype,
+                kv_cache_dim=self.kv_cache_dim,
+                num_q_heads=self.num_q_heads,
+                index_kpool=self.dsa_index_kpool,
+                dcp_size=self.dcp_size,
+            )
 
         if self.dsa_prefill_impl == "triton_sparse_mla":
             _validate_triton_sparse_mla_backend(
@@ -2255,7 +2296,7 @@ class DeepseekSparseAttnBackend(
         dsa_impl = self._resolve_kpool_tail_backend(topk_indices, dsa_impl)
         self._check_kpool_tail_backend(topk_indices, dsa_impl, phase)
 
-        if dsa_impl == "trtllm" and not self.use_mha:
+        if dsa_impl in ("trtllm", "q8kv8_sm100") and not self.use_mha:
             return self._forward_trtllm(
                 q,
                 k,
@@ -2271,6 +2312,7 @@ class DeepseekSparseAttnBackend(
                 is_neox,
                 llama_4_scaling,
                 is_prefill=True,
+                use_q8kv8_sm100=dsa_impl == "q8kv8_sm100",
             )
 
         if k is not None:
@@ -2636,7 +2678,7 @@ class DeepseekSparseAttnBackend(
                 f"Learnable attention sinks require flashmla_sparse, got {dsa_impl}"
             )
 
-        if dsa_impl == "trtllm":
+        if dsa_impl in ("trtllm", "q8kv8_sm100"):
             return self._forward_trtllm(
                 q,
                 k,
@@ -2651,6 +2693,7 @@ class DeepseekSparseAttnBackend(
                 cos_sin_cache,
                 is_neox,
                 llama_4_scaling,
+                use_q8kv8_sm100=dsa_impl == "q8kv8_sm100",
             )
 
         if k is not None:
@@ -3973,6 +4016,7 @@ class DeepseekSparseAttnBackend(
         is_neox: Optional[bool] = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
         is_prefill: bool = False,
+        use_q8kv8_sm100: bool = False,
     ) -> torch.Tensor:
         """Forward using TRT-LLM sparse MLA kernel."""
         cp_store_cache_loc = None
@@ -4191,12 +4235,22 @@ class DeepseekSparseAttnBackend(
                 )
             return _restore_trtllm_decode_dp_padding(out, num_decode_padding_rows), lse
 
-        out = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
-            query=q,
-            block_tables=block_tables,
-            seq_lens=seq_lens,
-            **attention_kwargs,
-        )
+        if use_q8kv8_sm100:
+            from sglang.kernels.ops.attention.sparse_mla_q8kv8_sm100 import (
+                sparse_mla_q8kv8_sm100_trtllm,
+            )
+
+            # Same inputs and BF16 output as trtllm-gen; __init__ checked the setup.
+            out = sparse_mla_q8kv8_sm100_trtllm(
+                q, kv, block_tables, bmm1_scale, seq_lens=seq_lens
+            )
+        else:
+            out = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+                query=q,
+                block_tables=block_tables,
+                seq_lens=seq_lens,
+                **attention_kwargs,
+            )
 
         return _restore_trtllm_decode_dp_padding(out, num_decode_padding_rows)
 

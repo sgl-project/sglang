@@ -257,8 +257,10 @@ class DeepseekMHAForwardMixin:
                 self.use_dsa
                 and self.kv_cache_dtype == "fp8_e4m3"
                 and (
-                    not get_exec().kernel.dsa_decode_backend == "trtllm"
-                    or not get_exec().kernel.dsa_prefill_backend == "trtllm"
+                    get_exec().kernel.dsa_decode_backend
+                    not in ("trtllm", "q8kv8_sm100")
+                    or get_exec().kernel.dsa_prefill_backend
+                    not in ("trtllm", "q8kv8_sm100")
                 )
             ):
                 # FP8 path: dequantize DSA-specific FP8 format to BF16

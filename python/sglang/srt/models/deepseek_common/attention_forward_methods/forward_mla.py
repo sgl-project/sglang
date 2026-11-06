@@ -1077,9 +1077,10 @@ class DeepseekMLAForwardMixin:
         if self.rotary_emb is None:
             return False
         if self.current_attention_backend in ("dsa", "nsa"):
+            # q8kv8_sm100 runs the trtllm FP8 path with another final kernel.
             return (
-                get_exec().kernel.dsa_decode_backend == "trtllm"
-                or get_exec().kernel.dsa_prefill_backend == "trtllm"
+                get_exec().kernel.dsa_decode_backend in ("trtllm", "q8kv8_sm100")
+                or get_exec().kernel.dsa_prefill_backend in ("trtllm", "q8kv8_sm100")
             ) and get_attn_backend().kv_cache_dtype == torch.float8_e4m3fn
 
         return (

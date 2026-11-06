@@ -10,6 +10,7 @@ from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
 from sglang.srt.layers.attention.dsa_backend import (
     DeepseekSparseAttnBackend,
     _validate_flashmla_sparse_q8_backend,
+    _validate_q8kv8_sm100_backend,
 )
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -119,6 +120,39 @@ def test_q8_validator_rejects_an_unpacked_fp8_pool():
             qk_rope_head_dim=64,
             device_sm_major=9,
         )
+
+
+_Q8KV8_SM100_SETUP = dict(
+    device_capability=(10, 0),
+    kv_cache_dtype=torch.float8_e4m3fn,
+    kv_cache_dim=576,
+    num_q_heads=64,
+    index_kpool=1,
+    dcp_size=1,
+)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        pytest.param({"device_capability": (10, 3)}, id="sm103"),
+        pytest.param({"kv_cache_dtype": torch.bfloat16}, id="bf16_kv"),
+        pytest.param({"kv_cache_dim": 656}, id="flashmla_kv_layout"),
+        pytest.param({"num_q_heads": 32}, id="tp_split_heads"),
+        pytest.param({"index_kpool": 4}, id="kpool"),
+        pytest.param({"dcp_size": 2}, id="dcp"),
+    ],
+)
+def test_q8kv8_sm100_validator_rejects_setups_outside_the_trtllm_fp8_path(
+    change, monkeypatch
+):
+    """--dsa-*-backend q8kv8_sm100 must fail at launch on setups the kernel does
+    not cover, instead of failing on the first batch or quietly running
+    trtllm-gen (DCP)."""
+    monkeypatch.setattr("sglang.srt.layers.attention.dsa_backend._is_cuda", True)
+    _validate_q8kv8_sm100_backend(**_Q8KV8_SM100_SETUP)
+    with pytest.raises(ValueError, match="q8kv8_sm100"):
+        _validate_q8kv8_sm100_backend(**{**_Q8KV8_SM100_SETUP, **change})
 
 
 def _make_padder():
