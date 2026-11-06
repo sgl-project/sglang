@@ -428,40 +428,34 @@ def _null_content_as_empty(messages: list[dict[str, Any]]) -> list[dict[str, Any
     ]
 
 
-def _final_assistant_turn(
-    messages: list[dict[str, Any]],
-) -> Optional[dict[str, Any]]:
-    """The final assistant turn, without the tool calls SGLang discards."""
-    last = messages[-1] if messages else None
-    if last and last["role"] == "assistant":
-        return {key: value for key, value in last.items() if key != "tool_calls"}
-    return None
-
-
 def _trailing_assistant_turn(
     messages: list[dict[str, Any]],
 ) -> Optional[dict[str, Any]]:
     """The trailing text turn SGLang continues or, without continue_final_message,
-    re-sends as a user turn (as `_handle_last_assistant_message`)."""
-    last = _final_assistant_turn(messages)
-    if last is not None and isinstance(last.get("content"), str):
-        return last
+    re-sends as a user turn (as `_handle_last_assistant_message`), without the
+    tool calls SGLang discards."""
+    last = messages[-1] if messages else None
+    if last and last["role"] == "assistant" and isinstance(last.get("content"), str):
+        return {key: value for key, value in last.items() if key != "tool_calls"}
     return None
 
 
 def _continued_turn(
     message: Optional[ChatCompletionMessageParam], *, continue_final_message: bool
 ) -> Optional[dict[str, Any]]:
-    """The turn the prompt continues when it ends with `message`, if any."""
+    """The assistant turn the prompt continues, without its tool calls:
+    any under continue_final_message, else a non-text turn with `prefix`,
+    which `encode_messages` passes through to recipe."""
     if message is None:
         return None
-    final = _final_assistant_turn(
-        _null_content_as_empty(
-            [message.model_dump(exclude_unset=True, by_alias=True, mode="json")]
-        )
+    (turn,) = _null_content_as_empty(
+        [message.model_dump(exclude_unset=True, by_alias=True, mode="json")]
     )
-    if final is not None and (continue_final_message or _recipe_continues(final)):
-        return final
+    continued = continue_final_message or (
+        turn.get("prefix") and not isinstance(turn["content"], str)
+    )
+    if turn["role"] == "assistant" and continued:
+        return {key: value for key, value in turn.items() if key != "tool_calls"}
     return None
 
 
@@ -483,12 +477,6 @@ def _grammar_constrained(request: ChatCompletionRequest) -> bool:
         or request.tool_choice == "required"
         or isinstance(request.tool_choice, ToolChoice)
     )
-
-
-def _recipe_continues(turn: dict[str, Any]) -> bool:
-    """Whether recipe continues this turn without continue_final_message:
-    `encode_messages` passes a non-text turn through, `prefix` included."""
-    return bool(turn.get("prefix")) and not isinstance(turn.get("content"), str)
 
 
 def _numeric_effort(
