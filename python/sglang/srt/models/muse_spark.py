@@ -27,8 +27,9 @@ from sglang.kernels.ops.communication.muse_spark_all_gather_norm_residual import
     all_gather_norm_residual,
     all_gather_norm_residual_supported,
 )
-from sglang.kernels.ops.gemm.muse_spark_router_gemm import (
-    MAX_TOKENS as ROUTER_GEMM_MAX_TOKENS,
+from sglang.kernels.ops.gemm.muse_spark_router_gemv_cutedsl import (
+    router_gemv_cute,
+    router_gemv_cute_eligible,
 )
 from sglang.kernels.ops.layernorm.muse_spark_norm_gate import FusedRMSNormGate
 from sglang.kernels.ops.layernorm.muse_spark_norm_residual import (
@@ -178,13 +179,17 @@ def _uses_gptq_int4_experts(
     )
 
 
+# Decode batches up to this many tokens keep the fp32 router GEMM.
+_FP32_ROUTER_MAX_TOKENS = 8
+
+
 @functools.lru_cache(maxsize=1)
 def _split_bf16_router_supported() -> bool:
     return is_cuda() and get_device_capability()[0] == 9
 
 
 def _use_split_bf16_router(num_tokens: int) -> bool:
-    if num_tokens <= ROUTER_GEMM_MAX_TOKENS or not _split_bf16_router_supported():
+    if num_tokens <= _FP32_ROUTER_MAX_TOKENS or not _split_bf16_router_supported():
         return False
     return True
 
@@ -241,6 +246,9 @@ class MuseSpark1xRouter(nn.Module):
         return acc
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # Decode-sized FP32 logits: one CuTe GEMV instead of cuBLAS split-K + reduce.
+        if router_gemv_cute_eligible(hidden_states, self.weight):
+            return router_gemv_cute(hidden_states, self.weight)
         return F.linear(hidden_states, self.weight)
 
 
@@ -386,8 +394,8 @@ class MuseSpark1xAttention(nn.Module):
         ):
             return None
         cache_loc = backend._get_layer_cache_loc(self.attn, forward_batch)
-        k_cache = pool.get_key_buffer(self.layer_idx)
-        v_cache = pool.get_value_buffer(self.layer_idx)
+        k_cache = pool.layer_router.read(self.layer_idx).key()
+        v_cache = pool.layer_router.read(self.layer_idx).value()
         return (
             k_cache.view(k_cache.shape[0], -1),
             v_cache.view(v_cache.shape[0], -1),

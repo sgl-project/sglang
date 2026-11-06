@@ -19,14 +19,15 @@ from array import array
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Dict, Optional
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     OpenSessionReqInput,
     OpenSessionReqOutput,
     TokenizedGenerateReqInput,
 )
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
+from sglang.srt.managers.req_types import FINISH_ABORT
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.utils.common import log_info_on_rank0
 
 if TYPE_CHECKING:
@@ -58,12 +59,12 @@ class SessionReqNode:
             req_node.clear(req_dict)
 
         if self.req.finished_reason is None:
-            self.req.to_finish = FINISH_ABORT()
+            self.req.request_finish(FINISH_ABORT())
         del req_dict[self.req.rid]
 
     def abort(self):
         if self.req.finished_reason is None:
-            self.req.to_finish = FINISH_ABORT()
+            self.req.request_finish(FINISH_ABORT())
 
     def __str__(self):
         return self._str_helper(self.req.rid)
@@ -334,6 +335,7 @@ class Session:
         )
         if last_req is not None:
             new_req.multimodal_inputs = last_req.multimodal_inputs
+            new_req.bind_multimodal_cache_namespace()
             # An offset can truncate inherited media.
             if not abort and not session_params.offset:
                 new_req.inherit_mm_token_counts(last_req)

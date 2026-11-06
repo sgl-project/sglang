@@ -18,6 +18,7 @@ from typing import Iterable, Optional
 import torch
 from torch import nn
 
+from sglang.srt.configs.gigachat35 import GigaChat35Config
 from sglang.srt.layers.layer_boundary import layer_stack
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -33,7 +34,6 @@ from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     NextNEnabledConfig,
 )
 from sglang.srt.models.gigachat35 import (
-    GigaChat35Config,
     GigaChat35DecoderLayer,
     _remap_gigachat_weight_names,
     build_norm,

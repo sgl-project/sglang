@@ -17,7 +17,10 @@ defers to the original SIGKILL implementation for whatever is left.
 All server teardowns in the coverage suites converge on the single
 sglang.srt.utils.common.kill_process_tree (re-exported by
 sglang.srt.utils, bound into sglang.test.test_utils and the ascend e2e
-utils), so patching that one attribute covers base-b and base-c.
+utils), so patching that one attribute covers base-b and base-c. The
+diffusion suites use their own
+sglang.multimodal_gen.runtime.utils.process.kill_process_tree, patched
+lazily after collection (see _patch_multimodal_kill_process_tree).
 """
 
 import os
@@ -27,11 +30,11 @@ import sys
 import psutil
 
 
-def _patch_kill_process_tree():
-    import sglang.srt.utils.common as common
+def _enabled() -> bool:
+    return os.environ.get("SGLANG_KILL_PROCESS_TREE_GRACEFUL") == "1"
 
-    original = common.kill_process_tree
 
+def _make_graceful_kill_process_tree(original):
     graceful_timeout = float(
         os.environ.get("SGLANG_KILL_PROCESS_TREE_GRACEFUL_TIMEOUT", "5")
     )
@@ -64,18 +67,51 @@ def _patch_kill_process_tree():
             wait_timeout=wait_timeout,
         )
 
-    common.kill_process_tree = graceful = kill_process_tree_graceful
+    kill_process_tree_graceful._sglang_ci_graceful = True
+    return kill_process_tree_graceful
+
+
+def _patch_module_kill_process_tree(module):
+    original = module.kill_process_tree
+    graceful = _make_graceful_kill_process_tree(original)
+    module.kill_process_tree = graceful
 
     # Refresh modules that already bound the original (the sglang.srt.utils
-    # re-export, anything an early conftest imported). Modules imported
-    # later pick up the patched attribute on their own.
+    # re-export, anything an early conftest imported, the diffusion test
+    # helpers). Modules imported later pick up the patched attribute on
+    # their own.
     for mod in list(sys.modules.values()):
         if getattr(mod, "kill_process_tree", None) is original:
             mod.kill_process_tree = graceful
 
 
+def _patch_kill_process_tree():
+    import sglang.srt.utils.common as common
+
+    _patch_module_kill_process_tree(common)
+
+
+def _patch_multimodal_kill_process_tree():
+    """Patch the diffusion runtime's SIGKILL-only teardown, if it is loaded.
+
+    The diffusion suites tear their servers down via
+    sglang.multimodal_gen.runtime.utils.process.kill_process_tree instead of
+    the srt helper patched above, so subprocess coverage would be lost on the
+    SIGKILL. Unlike srt this module is imported by the diffusion test modules
+    during collection, so patch lazily AFTER collection: importing it here
+    would pull the whole diffusion runtime into every other suite's pytest
+    process for no benefit.
+    """
+    module = sys.modules.get("sglang.multimodal_gen.runtime.utils.process")
+    if module is None:
+        return
+    if getattr(module.kill_process_tree, "_sglang_ci_graceful", False):
+        return
+    _patch_module_kill_process_tree(module)
+
+
 def pytest_configure(config):
-    if os.environ.get("SGLANG_KILL_PROCESS_TREE_GRACEFUL") != "1":
+    if not _enabled():
         return
     try:
         _patch_kill_process_tree()
@@ -84,3 +120,14 @@ def pytest_configure(config):
         # outside the tests' own stubs. No servers are launched there, so
         # skipping the patch is fine — just make it visible in the log.
         print(f"precise_test_coverage_plugin: patch skipped: {exc!r}")
+
+
+def pytest_collection_modifyitems(config, items):
+    if not _enabled():
+        return
+    try:
+        _patch_multimodal_kill_process_tree()
+    except Exception as exc:
+        print(
+            f"precise_test_coverage_plugin: multimodal teardown patch skipped: {exc!r}"
+        )

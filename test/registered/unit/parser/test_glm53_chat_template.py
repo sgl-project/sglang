@@ -1,12 +1,11 @@
 """GLM-5.3 / GLM-5.3-Flash Python chat templates.
 
 The expected prompts below were rendered with the checkpoints' chat_template.jinja.
-Set SGLANG_TEST_GLM53_CHECKPOINT / SGLANG_TEST_GLM53_FLASH_CHECKPOINT to model
-directories to also compare against their Jinja templates directly.
+``test/manual/parser/test_glm53_checkpoint_template.py`` compares against the
+checkpoints' Jinja templates directly.
 """
 
 import inspect
-import os
 import sys
 import unittest
 from types import ModuleType, SimpleNamespace
@@ -23,6 +22,7 @@ from sglang.srt.parser.python_chat_template import (
     GLM53_FLASH,
     get_python_chat_template,
     install_python_chat_template,
+    render_chat_segments,
     resolve_python_chat_template,
 )
 from sglang.srt.parser.template_detection import (
@@ -476,8 +476,8 @@ class TestTemplateManagerPythonChatTemplate(CustomTestCase):
         )
 
 
-def _patch_hf_transformers_utils(get_tokenizer, get_config):
-    module = ModuleType("sglang.srt.utils.hf_transformers_utils")
+def _patch_hf_transformers(get_tokenizer, get_config):
+    module = ModuleType("sglang.srt.utils.hf_transformers")
     module.get_tokenizer = get_tokenizer
     module.get_config = get_config
     return patch.dict(sys.modules, {module.__name__: module})
@@ -496,7 +496,7 @@ class TestAutoParsersFromPythonChatTemplate(CustomTestCase):
         self.get_tokenizer = Mock(return_value=tokenizer)
         self.get_config = Mock(return_value=_hf_config(architecture))
         with (
-            _patch_hf_transformers_utils(self.get_tokenizer, self.get_config),
+            _patch_hf_transformers(self.get_tokenizer, self.get_config),
             self.assertLogs("sglang.srt.parser.template_detection", "INFO") as logs,
         ):
             resolve_auto_parsers(server_args)
@@ -608,37 +608,52 @@ class TestInstallPythonChatTemplate(CustomTestCase):
             expected,
         )
 
+    def test_segments_are_what_apply_chat_template_renders(self):
+        messages = [
+            {"role": "system", "content": "Be brief."},
+            {"role": "user", "content": "Weather?"},
+            {"role": "assistant", "content": "", "tool_calls": CALLS[:1]},
+            {"role": "tool", "tool_call_id": "a", "content": "Sunny"},
+            {"role": "user", "content": "Thanks"},
+        ]
+        segments = render_chat_segments(
+            self.tokenizer,
+            GLM53,
+            messages,
+            tools=[WEATHER],
+            add_generation_prompt=True,
+            template_kwargs={"reasoning_effort": "low"},
+        )
+        self.assertEqual(
+            "".join(segments),
+            self.tokenizer.apply_chat_template(
+                messages,
+                tools=[WEATHER],
+                add_generation_prompt=True,
+                tokenize=False,
+                reasoning_effort="low",
+            ),
+        )
+        turn_tokens = ("<|system|>", "<|user|>", "<|assistant|>", "<|observation|>")
+        for token in ("[gMASK]", "<sop>", "<think>") + turn_tokens:
+            self.assertIn(token, segments)
+        self.assertFalse(
+            [
+                s
+                for s in segments
+                if s not in turn_tokens and any(t in s for t in turn_tokens)
+            ]
+        )
 
-@unittest.skipUnless(
-    os.environ.get("SGLANG_TEST_GLM53_CHECKPOINT")
-    or os.environ.get("SGLANG_TEST_GLM53_FLASH_CHECKPOINT"),
-    "set SGLANG_TEST_GLM53_CHECKPOINT / SGLANG_TEST_GLM53_FLASH_CHECKPOINT",
-)
-class TestAgainstCheckpointTemplates(CustomTestCase):
-    def test_matches_checkpoint_jinja(self):
-        for env, render in (
-            ("SGLANG_TEST_GLM53_CHECKPOINT", render_glm53),
-            ("SGLANG_TEST_GLM53_FLASH_CHECKPOINT", render_glm53_flash),
-        ):
-            model_dir = os.environ.get(env)
-            if not model_dir:
-                continue
-            with open(
-                os.path.join(model_dir, "chat_template.jinja"), encoding="utf-8"
-            ) as f:
-                compiled = _compile_jinja_template(f.read())
-            for name, (kwargs, _, _) in CASES.items():
-                for add_generation_prompt in (False, True):
-                    with self.subTest(
-                        model=model_dir, case=name, gen=add_generation_prompt
-                    ):
-                        kwargs = {
-                            **kwargs,
-                            "add_generation_prompt": add_generation_prompt,
-                        }
-                        self.assertEqual(
-                            _render(render, kwargs), compiled.render(**kwargs)
-                        )
+        for key in ("chat_template", "continue_final_message", "tokenize", "documents"):
+            self.assertIsNone(
+                render_chat_segments(
+                    self.tokenizer, GLM53, self.messages, template_kwargs={key: None}
+                ),
+                key,
+            )
+        with self.assertRaises(ValueError):
+            render_chat_segments(self.tokenizer, GLM53, [])
 
 
 if __name__ == "__main__":

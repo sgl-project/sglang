@@ -8,6 +8,14 @@ import logging
 import os
 from typing import Any
 
+from sglang.srt.arg_groups.model_override_base import (
+    attention_backends_of,
+    mamba_extra_buffer_of,
+    model_config_of,
+    resolved_view,
+    resolving_view,
+    use_mla_backend,
+)
 from sglang.srt.arg_groups.overrides import (
     _deepseek_moe_quant_resolution,
     _deepseek_spec_moe_resolution,
@@ -18,16 +26,10 @@ from sglang.srt.arg_groups.overrides import (
     _hrm_text_attention_force,
     _mamba_radix_cache_resolution,
     _sparse_head_overlap_disable,
-    attention_backends_of,
     collect_model_override_declarations,
     declare_resolution,
     mamba_cache_chunk_size,
-    mamba_extra_buffer_of,
-    model_config_of,
-    resolved_view,
-    resolving_view,
     run_post_process_pass,
-    use_mla_backend,
     validate_declarations,
 )
 from sglang.srt.arg_groups.resolution_hooks import run_hook
@@ -143,6 +145,7 @@ def handle_model_specific_adjustments(server_args: Any):
         NONCAUSAL_FULL_ATTENTION,
         get_mimo_v2_fused_qkv_expected_tp_size,
         is_deepseek_dsa,
+        is_kimi_k3,
     )
 
     if cfg.enable_deterministic_inference:
@@ -166,11 +169,15 @@ def handle_model_specific_adjustments(server_args: Any):
     hf_config = model_config.hf_config
     model_arch = hf_config.architectures[0]
 
-    if get_platform().is_npu and cfg.dcp_size > 1 and not is_deepseek_dsa(hf_config):
+    if (
+        get_platform().is_npu
+        and cfg.dcp_size > 1
+        and not (is_deepseek_dsa(hf_config) or is_kimi_k3(hf_config))
+    ):
         raise ValueError(
             "NPU decode context parallelism is currently implemented only for "
-            "DeepSeek DSA models; got "
-            f"{model_arch}. Set --decode-context-parallel-size=1 or use a DSA model."
+            "DeepSeek DSA and Kimi-K3 models; got "
+            f"{model_arch}. Set --decode-context-parallel-size=1 or use a supported model."
         )
 
     if model_arch == "InternS2MobiusForConditionalGeneration":
@@ -239,6 +246,7 @@ def handle_model_specific_adjustments(server_args: Any):
     if model_arch in (
         "KimiLinearForCausalLM",
         "KimiK3ForConditionalGeneration",
+        "KimiK31ForConditionalGeneration",
     ):
         from sglang.srt.arg_groups.kimi_k3_hook import (
             apply_kimi_k3_linear_attn_defaults,
@@ -276,6 +284,8 @@ def handle_model_specific_adjustments(server_args: Any):
         "HYV4ForCausalLMNextN",
         "LongcatFlashForCausalLM",
         "Dots3NoteForCausalLM",
+        "Xing4_0ForCausalLM",
+        "KimiK31ForConditionalGeneration",
     ]:
         # Set attention backend for DeepSeek
         if is_deepseek_dsa(hf_config):  # DeepSeek 3.2/GLM 5
@@ -512,6 +522,18 @@ def handle_model_specific_adjustments(server_args: Any):
             envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.set(False)
             envs.SGLANG_EAGER_INPUT_NO_COPY.set(True)
 
+    elif model_arch in ["Xing4_0ForCausalLM"]:
+        # Xing4_0 uses the TileLang mhc_pre/mhc_post kernels
+        # (sglang.kernels.ops.layernorm.mhc) for its mHC module. The
+        # DeepGEMM tf32_hc_prenorm_gemm path is a raw C extension that
+        # torch.compile (fullgraph=True, used by tc_piecewise prefill
+        # backend) cannot trace, raising:
+        #   torch._dynamo.exc.Unsupported: Dynamo does not know how to trace
+        #   method `__call__` of class `Function`
+        # Disable it so mhc_pre falls through to the TileLang splitk path
+        # which already supports xing4_0's hc_hidden_size=14336 (4 * 3584).
+        envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
+
     elif model_arch in ["GptOssForCausalLM"]:
         # Attention backend selection + XPU dtype validation moved to the
         # override registry (arg_groups/overrides.py: _gpt_oss_overrides).
@@ -672,7 +694,7 @@ def handle_model_specific_adjustments(server_args: Any):
     ]:
         if hf_config.sliding_window_pattern is not None:
             # disable_hybrid_swa_memory moved to the override registry
-            # (arg_groups/overrides.py: _exaone_overrides).
+            # (arg_groups/model_overrides/exaone.py).
             # https://docs.sglang.ai/advanced_features/attention_backend.html
             accepted_backends = ["fa3", "triton", "trtllm_mha"]
             attention_backend = resolved_view(server_args).attention_backend
@@ -680,8 +702,8 @@ def handle_model_specific_adjustments(server_args: Any):
                 f"One of the attention backends in {accepted_backends} is required for {model_arch}, but got {attention_backend}"
             )
     elif model_arch in ["Olmo2ForCausalLM"]:
-        # disable_hybrid_swa_memory + attention backend selection moved to
-        # the override registry (arg_groups/overrides.py: _olmo2_overrides).
+        # The attention backend selection moved to the override registry
+        # (arg_groups/model_overrides/olmo2.py).
 
         # Flashinfer appears to degrade performance when sliding window attention
         # is used for the Olmo2 architecture. Olmo2 does not use sliding window attention
@@ -858,6 +880,20 @@ def handle_model_capability_adjustments(server_args: Any):
             "_handle_model_capability_adjustments",
             chunked_prefill_size=-1,
         )
+    # Encoder-only embedding models run one bidirectional prefill per request,
+    # so the KV pool is never read back; the FA backend then uses raw K/V.
+    if (
+        embedding_model_spec is not None
+        and embedding_model_spec.safe_disable_kv_cache
+        and embedding_model_spec.encoder_only_attention
+        and attention_backends_of(cfg)[0] in ("fa3", "fa4")
+    ):
+        declare_resolution(
+            server_args,
+            "_handle_model_capability_adjustments",
+            prefill_only_disable_kv_cache=True,
+        )
+        run_hook(validate_prefill_only_disable_kv_cache_args, server_args)
 
     is_embedding_gemma = (
         embedding_model_spec is not None
@@ -984,12 +1020,21 @@ def handle_model_capability_adjustments(server_args: Any):
     # A Clef checkpoint's joint schema head reads the final hidden state of
     # every prompt token in one pass, so each request is one complete prefill
     # with no decode: embedding mode, without prefix reuse or chunking. This
-    # also puts the FA backend on its raw K/V path, which skips the KV pool.
+    # also puts the FA backend on its raw K/V path, which skips the KV pool. A
+    # Kev checkpoint's pointer head reads two positions of each question's
+    # prompt and is served the same way.
     if model_config.joint_head_config is not None:
+        name, head = "Clef", "joint schema head"
+        tp_reason = ", since the joint schema head reads full LM head rows"
+    elif model_config.pointer_head is not None:
+        name, head, tp_reason = "Kev", "pointer head", ""
+    else:
+        name = None
+    if name is not None:
         if cfg.tp_size != 1 or cfg.pp_size != 1:
             raise ValueError(
-                "Clef checkpoints are served with --tp-size 1 and --pp-size 1, "
-                "since the joint schema head reads full LM head rows"
+                f"{name} checkpoints are served with --tp-size 1 and --pp-size 1"
+                f"{tp_reason}"
             )
         for key, value in (
             ("is_embedding", True),
@@ -1008,7 +1053,7 @@ def handle_model_capability_adjustments(server_args: Any):
                 ),
             )
         logger.info(
-            "Clef joint schema head detected: serving /v1/systemone decisions in "
+            f"{name} {head} detected: serving /v1/systemone decisions in "
             "embedding mode without radix cache, chunked prefill, or CUDA graphs."
         )
 

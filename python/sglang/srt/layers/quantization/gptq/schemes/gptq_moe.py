@@ -8,9 +8,9 @@ import torch
 from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
     NPUWNA16Int4MoEMethod,
 )
-from sglang.srt.layers.linear import set_weight_attrs
 from sglang.srt.layers.moe.moe_runner import MoeRunner, MoeRunnerConfig
 from sglang.srt.layers.moe.utils import MoeRunnerBackend, get_moe_runner_backend
+from sglang.srt.utils import set_weight_attrs
 
 from .gptq_scheme import GPTQMoESchemeBase
 
@@ -194,10 +194,12 @@ class GPTQMarlinMoEScheme(GPTQMoESchemeBase):
 
         if self.quant_config.group_size != -1:
             scales_size13 = hidden_size // self.quant_config.group_size
+            # Act-order needs the full down-projection scale table. Without
+            # act-order, each TP rank stores only its local K groups.
             if self.quant_config.desc_act:
-                w2_scales_size = intermediate_size_per_partition
-            else:
                 w2_scales_size = intermediate_size_per_partition * layer.moe_tp_size
+            else:
+                w2_scales_size = intermediate_size_per_partition
             scales_size2 = w2_scales_size // self.quant_config.group_size
             strategy = FusedMoeWeightScaleSupported.GROUP.value
         else:
@@ -236,7 +238,8 @@ class GPTQMarlinMoEScheme(GPTQMoESchemeBase):
                 num_experts,
                 scales_size13,
                 2 * intermediate_size_per_partition,
-                dtype=torch.half,
+                # Marlin requires scale dtype == activation dtype.
+                dtype=params_dtype,
             ),
             requires_grad=False,
         )
@@ -244,7 +247,7 @@ class GPTQMarlinMoEScheme(GPTQMoESchemeBase):
         set_weight_attrs(w13_scales, extra_weight_attrs)
 
         w2_scales = torch.nn.Parameter(
-            torch.empty(num_experts, scales_size2, hidden_size, dtype=torch.half),
+            torch.empty(num_experts, scales_size2, hidden_size, dtype=params_dtype),
             requires_grad=False,
         )
         layer.register_parameter("w2_scales", w2_scales)

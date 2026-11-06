@@ -41,18 +41,21 @@ import numpy as np
 import torch
 
 from sglang.srt.constants import GIB_BYTES
+from sglang.srt.kernel_plugins.amd.binding import (
+    monokernel_weights_iterator,
+)
 from sglang.srt.model_loader.post_load import stage_module_for_post_load
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
     get_remote_instance_transfer_engine_info_per_rank,
     register_memory_region,
 )
-from sglang.srt.monokernels.runtime import monokernel_weights_iterator
 from sglang.srt.runtime_context import (
     get_exec,
     get_model,
     get_parallel,
     get_server_args,
+    get_spec,
 )
 from sglang.srt.utils import get_available_gpu_memory
 
@@ -84,6 +87,7 @@ from sglang.srt.distributed import (
     model_parallel_is_initialized,
 )
 from sglang.srt.layers.layer_boundary.stage import check_stage_producers
+from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
 from sglang.srt.layers.moe.utils import (
     resolve_shared_experts_config,
@@ -92,6 +96,8 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.quantization.unquant import finalize_gfx115_weight_padding
+from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     trigger_transferring_weights_request,
 )
@@ -214,6 +220,14 @@ def _get_quantization_config(
         # (yizhang2077) workaround for nvidia/Llama-4-Maverick-17B-128E-Eagle3
         if quant_config is None:
             return None
+        if _is_npu and model_config.quantization == "modelslim":
+            draft_kv_cache_dtype = get_spec().speculative_draft_kv_cache_dtype
+            requested_dtype = (
+                draft_kv_cache_dtype
+                if model_config.is_draft_model and draft_kv_cache_dtype is not None
+                else get_model().kv_cache_dtype
+            )
+            quant_config.configure_kv_cache_quantization(requested_dtype)
         from sglang.srt.layers.quantization.fp8 import Fp8Config
 
         if isinstance(quant_config, Fp8Config):
@@ -929,7 +943,7 @@ class DefaultModelLoader(BaseModelLoader):
                 local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
             )
         except (KeyError, ValueError):
-            from sglang.srt.utils.hf_transformers_utils import get_config
+            from sglang.srt.utils.hf_transformers import get_config
 
             hf_config = get_config(
                 model_config.model_path,
@@ -1083,6 +1097,7 @@ class DefaultModelLoader(BaseModelLoader):
             # parameters onto device for processing and back off after.
             with device_loading_context(module, target_device):
                 quant_method.process_weights_after_loading(module)
+        finalize_gfx115_weight_padding(model)
 
     @staticmethod
     def restore_weights_before_loading(model, target_device):
@@ -2047,14 +2062,8 @@ class PreshardedModelLoader(DefaultModelLoader):
     @staticmethod
     def _rebind_parameter_aliases(model: nn.Module) -> None:
         for _, module in model.named_modules():
-            gemma_w = getattr(module, "gemma_weight", None)
-            weight = getattr(module, "weight", None)
-            if (
-                isinstance(gemma_w, torch.Tensor)
-                and isinstance(weight, torch.nn.Parameter)
-                and gemma_w.shape == weight.shape
-            ):
-                torch.add(weight.data, 1.0, out=gemma_w)
+            if isinstance(module, GemmaRMSNorm):
+                module.refresh_gemma_weight()
 
             attn = getattr(module, "attn", None)
             conv1d = getattr(module, "conv1d", None)
@@ -2067,13 +2076,8 @@ class PreshardedModelLoader(DefaultModelLoader):
             if conv1d is None:
                 continue
             cweight = getattr(conv1d, "weight", None)
-            if cweight is not None and hasattr(attn, "conv_weights"):
-                if cweight.dim() == 3 and cweight.size(1) == 1:
-                    attn.conv_weights = cweight.view(cweight.size(0), cweight.size(2))
-                else:
-                    attn.conv_weights = (
-                        cweight.squeeze() if cweight.dim() > 2 else cweight
-                    )
+            if cweight is not None and isinstance(attn, RadixLinearAttention):
+                attn.refresh_conv_weights(cweight)
             if hasattr(conv1d, "bias") and hasattr(attn, "bias"):
                 attn.bias = conv1d.bias
 

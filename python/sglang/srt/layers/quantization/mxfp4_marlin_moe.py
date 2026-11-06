@@ -13,6 +13,7 @@ from sglang.srt.utils import log_info_on_rank0, round_up, set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
+    from sglang.srt.layers.moe.utils import RoutingMethodType
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +59,11 @@ class Mxfp4MarlinMoEMethod:
 
     def get_moe_runner_backend(self, layer):
         return self.runner.runner_backend
+
+    def get_moe_routing_method_type(
+        self, layer: Module, requested_method: RoutingMethodType | None
+    ) -> RoutingMethodType | None:
+        return requested_method
 
     def create_weights(
         self,
