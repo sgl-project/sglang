@@ -305,7 +305,8 @@ def test_prefill_gathers_only_the_rows_it_reads(dtype, request):
     for r in range(2):
         for j in range(ext[r]):
             visible = seq[r] - ext[r] + j + 1
-            chosen = torch.randperm(visible, device="cuda")[:topk]
+            # A few columns per row, so most context rows stay unmarked.
+            chosen = torch.randperm(visible, device="cuda")[:32]
             indices[row, : chosen.numel()] = chosen.int()
             expected[int(cu_k[r]) + chosen] = 1
             row += 1
@@ -314,7 +315,7 @@ def test_prefill_gathers_only_the_rows_it_reads(dtype, request):
         indices=indices, cu_seqlens_k=cu_k, extend_seq_lens=ext_lens, total=total_k
     )
     assert torch.equal(selected, expected)
-    assert 0 < int(selected.sum()) < total_k
+    assert 0 < int(selected.sum()) < total_k // 2
     # Indices with a group dimension mark the same rows.
     grouped = mark_context_rows(
         indices=indices.view(rows, 2, topk // 2),
