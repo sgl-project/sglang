@@ -751,6 +751,8 @@ class Envs:
     SGLANG_ENABLE_DISAGG_PREFILL_CONTINUOUS_INPUT_POLLING = EnvBool(False)
     # Opt-in: retire finished prefill KV transfers while a forward result is pending.
     SGLANG_DISAGG_PREFILL_POLL_TRANSFERS_WHILE_WAITING = EnvBool(False)
+    # Opt-in: drain HiCache L3 events while a prefill forward result is pending.
+    SGLANG_DISAGG_PREFILL_POLL_HICACHE_WHILE_WAITING = EnvBool(False)
     # Override NVML Confidential Computing autodetection. None = autodetect.
     SGLANG_FORCE_CONFIDENTIAL_COMPUTE = EnvBool(None)
 
