@@ -1,5 +1,6 @@
 """KDA backend dispatch and ReplaySSM verify -> commit -> verify parity."""
 
+import dataclasses
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -277,25 +278,28 @@ class TestKDAFusedVerifyBackend(CustomTestCase):
                     torch.testing.assert_close(actual, expected, **_OUTPUT_TOL)
                 self.assertEqual(fused._fused_chain_verify_fn.call_count, 4)
 
-    @unittest.skipUnless(is_hip(), "HIP BF16-state ReplaySSM path")
-    def test_hip_k3_bf16_verify_commit_verify(self):
+    @unittest.skipUnless(is_hip(), "HIP low-precision-state ReplaySSM path")
+    def test_hip_k3_verify_commit_verify(self):
         # Kimi-K3 TP8 shape through the backend with default launch settings:
-        # H=HV=12, K=V=128, bf16 temporal state, fp32 conv weights, T=6/8,
-        # B=7/8 around the B>=8 tile switch, mixed accepted lengths and
+        # H=HV=12, K=V=128, bf16/fp16 temporal state, fp32 conv weights,
+        # T=6/8, B=7/8 around the B>=8 tile switch, mixed accepted lengths and
         # permuted physical slots.
-        for steps in (6, 8):
-            for batch_size in (7, 8):
-                with self.subTest(steps=steps, batch_size=batch_size):
-                    self._check_hip_k3(steps, batch_size)
+        for ssm_dtype in (torch.bfloat16, torch.float16):
+            for steps in (6, 8):
+                for batch_size in (7, 8):
+                    with self.subTest(
+                        ssm_dtype=ssm_dtype, steps=steps, batch_size=batch_size
+                    ):
+                        self._check_hip_k3(steps, batch_size, ssm_dtype)
 
-    def _check_hip_k3(self, steps, batch_size):
+    def _check_hip_k3(self, steps, batch_size, ssm_dtype):
         layers, initial, slots, batch, rounds = self._make_case(
             batch_size=batch_size,
             heads=12,
             v_heads=12,
             lower_bound=None,
             steps=steps,
-            ssm_dtype=torch.bfloat16,
+            ssm_dtype=ssm_dtype,
             conv_dtype=torch.float32,
             permute_slots=True,
         )
@@ -304,6 +308,14 @@ class TestKDAFusedVerifyBackend(CustomTestCase):
         )
         reference, ref_hybrid, ref_state = self._make_backend(
             initial, slots, steps, fused=False
+        )
+        # fp32 per-step snapshots from the same (upcast) initial state
+        snapshots, _, snapshot_state = self._make_backend(
+            dataclasses.replace(initial, temporal=initial.temporal.float()),
+            slots,
+            steps,
+            fused=False,
+            ring=False,
         )
         seen = []
         real_block_v = fkv._verify_block_v
@@ -316,6 +328,7 @@ class TestKDAFusedVerifyBackend(CustomTestCase):
         with mock.patch.object(fkv, "_verify_block_v", spy_block_v):
             out_fused = self._verify(fused, layers, batch, rounds[0])
         out_ref = self._verify(reference, layers, batch, rounds[0])
+        self._verify(snapshots, layers, batch, rounds[0])
         self.assertEqual(fused._fused_chain_verify_fn.call_count, len(layers))
         want_bv = (
             fkv.KDA_VERIFY_BLOCK_V_HIP if batch_size >= 8 else fkv.KDA_VERIFY_BLOCK_V
@@ -332,6 +345,8 @@ class TestKDAFusedVerifyBackend(CustomTestCase):
             torch.testing.assert_close(
                 getattr(fused_state, name), getattr(ref_state, name), rtol=0, atol=0
             )
+        for state in (fused_state, ref_state):
+            torch.testing.assert_close(state.temporal, initial.temporal, rtol=0, atol=0)
 
         accept = torch.arange(batch_size, device="cuda") % steps + 1
         for hybrid in (fused_hybrid, ref_hybrid):
@@ -347,16 +362,15 @@ class TestKDAFusedVerifyBackend(CustomTestCase):
         torch.testing.assert_close(
             fused_state.conv[0], ref_state.conv[0], rtol=0, atol=0
         )
-        # committed rows moved, untouched rows did not
-        idle = torch.ones(initial.temporal.shape[1], dtype=torch.bool, device="cuda")
-        idle[slots.long()] = False
+        # Independent snapshot oracle: each slot holds its accepted-prefix state,
+        # untouched slots keep the checkpoint.
+        expected_ssm = initial.temporal.clone()
+        for r in range(batch_size):
+            expected_ssm[:, int(slots[r])] = snapshot_state.intermediate_ssm[
+                :, r, int(accept[r]) - 1
+            ].to(ssm_dtype)
         torch.testing.assert_close(
-            fused_state.temporal[:, idle], initial.temporal[:, idle], rtol=0, atol=0
-        )
-        self.assertFalse(
-            torch.equal(
-                fused_state.temporal[:, slots.long()], initial.temporal[:, slots.long()]
-            )
+            fused_state.temporal, expected_ssm, rtol=2**-7, atol=1e-5
         )
         # independent conv oracle: last 3 inputs of each request's accepted prefix
         expected_conv = initial.conv[0].clone()

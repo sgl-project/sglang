@@ -5,6 +5,7 @@ import unittest
 
 import torch
 
+from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
 from sglang.kernels.ops.gemm.k3_norm_gemm import (
     hip_onorm_supported,
     kda_onorm_oproj_hip,
@@ -22,6 +23,14 @@ def _reference(x, gate, norm_weight, w):
     rstd = torch.rsqrt(x32.pow(2).mean(-1, keepdim=True) + EPS)
     o = x32 * rstd * norm_weight.float() * torch.sigmoid(gate.float().view_as(x32))
     return o.to(torch.bfloat16).view(x.shape[0], -1) @ w.t()
+
+
+def _production(x, gate, norm_weight, w):
+    """The replaced path: KimiK3DeltaAttention.o_norm, then the bf16 o_proj GEMM."""
+    norm = FusedRMSNormGated(D, eps=EPS, activation="sigmoid", device="cuda")
+    norm.weight.data = norm_weight
+    o = norm(x.view(x.shape[0], HEADS, D), gate.unflatten(-1, (HEADS, D)))
+    return torch.nn.functional.linear(o.reshape(x.shape[0], -1), w)
 
 
 class TestK3NormGemm(CustomTestCase):
@@ -42,9 +51,10 @@ class TestK3NormGemm(CustomTestCase):
 
                     out = kda_onorm_oproj_hip(x, gate, norm_weight, EPS, w)
 
-                    torch.testing.assert_close(
-                        out, _reference(x, gate, norm_weight, w), rtol=2e-2, atol=2e-2
-                    )
+                    for ref in (_reference, _production):
+                        torch.testing.assert_close(
+                            out, ref(x, gate, norm_weight, w), rtol=2e-2, atol=2e-2
+                        )
 
     def test_rejects_unsupported_shapes(self):
         self.assertFalse(hip_onorm_supported(17, HEADS * D, 1024, D))
