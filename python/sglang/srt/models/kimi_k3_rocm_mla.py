@@ -26,11 +26,8 @@ from torch import nn
 
 from sglang.kernels.ops.attention import mla_q_cache_aiter_hip
 from sglang.srt.runtime_context import get_buffer
-from sglang.srt.utils.common import (
-    is_device_stream_capturing,
-    is_gfx1250_supported,
-    print_warning_once,
-)
+from sglang.srt.utils.device import is_device_stream_capturing, is_gfx1250_supported
+from sglang.srt.utils.log_utils import print_warning_once
 
 # With save_kv_cache=False, these backends read only the BF16 Q and the KV cache;
 # Triton target-verify runs its extend kernel, which also reads k.

@@ -14,6 +14,10 @@ import numpy as np
 import pytest
 import torch
 
+from sglang.multimodal_gen.configs.sample.minimax_h3 import (
+    FastH3OmniSamplingParams,
+    MiniMaxH3SamplingParams,
+)
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3 import (
     keyframe_encoding,
@@ -79,17 +83,61 @@ def test_reference_image_resize_modes(
     assert resolved["allow_upscale"] is (mode == "diffusers")
 
 
-def test_reference_image_resize_defaults_to_legacy_diffusers_policy():
+@pytest.mark.parametrize(
+    ("source_size", "expected_size"),
+    [
+        ((512, 512), (512, 512)),
+        ((585, 1024), (576, 1024)),
+        ((5000, 2500), (4096, 2048)),
+    ],
+    ids=["small-square", "portrait-reference", "large-reference"],
+)
+def test_reference_image_resize_default_does_not_upscale(source_size, expected_size):
     resolved = reference_encoding.minimax_h3_resolve_reference_image_shape(
-        width=512,
-        height=512,
+        width=source_size[0],
+        height=source_size[1],
         canvas_width=960,
         canvas_height=544,
     )
 
-    assert (resolved["width"], resolved["height"]) == (2048, 2048)
-    assert resolved["reference_resize_mode"] == "diffusers"
-    assert resolved["shape_policy_version"] == "reference_image_short_edge_v1"
+    assert (resolved["width"], resolved["height"]) == expected_size
+    assert resolved["reference_resize_mode"] == "max"
+    assert resolved["shape_policy_version"] == "reference_image_max_v1"
+    assert resolved["allow_upscale"] is False
+
+
+@pytest.mark.parametrize(
+    ("sampling_params_class", "expected_size"),
+    [
+        (MiniMaxH3SamplingParams, (576, 1024)),
+        (FastH3OmniSamplingParams, (2048, 3584)),
+    ],
+    ids=["native-h3", "fasth3-omni"],
+)
+def test_checkpoint_resize_defaults_produce_expected_reference_geometry(
+    sampling_params_class, expected_size
+):
+    sampling_params = sampling_params_class()
+    reference_shape = reference_encoding.minimax_h3_resolve_reference_image_shape(
+        width=585,
+        height=1024,
+        canvas_width=1344,
+        canvas_height=768,
+        mode=sampling_params.reference_resize_mode,
+    )
+    assert (reference_shape["width"], reference_shape["height"]) == expected_size
+
+
+def test_explicit_diffusers_resize_preserves_legacy_geometry():
+    resolved = reference_encoding.minimax_h3_resolve_reference_image_shape(
+        width=585,
+        height=1024,
+        canvas_width=1344,
+        canvas_height=768,
+        mode="diffusers",
+    )
+    assert (resolved["width"], resolved["height"]) == (2048, 3584)
+    assert resolved["allow_upscale"] is True
 
 
 def test_reference_image_resize_normalizes_mode():
