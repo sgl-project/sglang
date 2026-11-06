@@ -28,6 +28,7 @@ class _GenerateReqInput:
     text: Optional[str] = None
     image_data: Optional[Any] = None
     sampling_params: Optional[Dict] = None
+    watermark: Optional[Any] = None
 
 
 @dataclass
@@ -171,6 +172,28 @@ class TestFormatOutputData(unittest.TestCase):
 
         self.assertIn("latency", result)
         self.assertNotIn("secret", result)
+
+    def test_redacts_client_watermark_keys(self):
+        server_args = _make_server_args("/tmp/unused")
+        exporter = _ConcreteExporter(
+            server_args, obj_skip_names=None, out_skip_names=None
+        )
+
+        key = {"enabled": True, "key": "abcdef0123456789"}
+        obj = _GenerateReqInput(
+            rid="req-1",
+            sampling_params={"temperature": 0.5, "watermark": key},
+            watermark=key,
+        )
+        result = exporter._format_output_data(obj, {})
+
+        self.assertNotIn("abcdef0123456789", result["request_parameters"])
+        params = json.loads(result["request_parameters"])
+        redacted = {"enabled": True, "key": "<redacted>"}
+        self.assertEqual(params["watermark"], redacted)
+        self.assertEqual(
+            params["sampling_params"], {"temperature": 0.5, "watermark": redacted}
+        )
 
 
 class TestFileRequestMetricsExporter(unittest.TestCase):

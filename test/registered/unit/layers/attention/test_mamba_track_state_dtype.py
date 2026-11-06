@@ -13,8 +13,9 @@ from sglang.srt.layers.attention.linear.gdn_backend import (
     GDNKernelDispatcher,
 )
 from sglang.srt.layers.attention.linear.kda_backend import KDAAttnBackend
+from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
 from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -99,30 +100,70 @@ class TestTrackMambaStateDtype(CustomTestCase):
         self.assertTrue(torch.all(ssm_states == 0))
 
     def test_default_prefill_convolution_hooks_preserve_arguments(self):
-        layer = SimpleNamespace(conv_weights=object(), bias=None, activation="silu")
+        """GDN returns packed tokens; KDA returns Q/K/V in either conv layout."""
         batch = SimpleNamespace(
             extend_prefix_lens=torch.tensor([0, 64]), extend_seq_lens_cpu=[2, 2]
         )
         qkv = torch.arange(24).view(4, 6)
+        convolved = qkv + 100
         states = torch.zeros(8, 6, 2)
         indices = torch.tensor([6, 2])
-        for backend_type, module in (
-            (GDNAttnBackend, gdn_backend),
-            (KDAAttnBackend, kda_backend),
+        for backend_type, module, prefill_backend, dims, split_size in (
+            (GDNAttnBackend, gdn_backend, None, (2, 2, 2), 0),
+            (KDAAttnBackend, kda_backend, LinearAttnKernelBackend.TRITON, (2, 2, 2), 0),
+            (
+                KDAAttnBackend,
+                kda_backend,
+                LinearAttnKernelBackend.FLASHINFER,
+                (2, 2, 2),
+                2,
+            ),
+            (
+                KDAAttnBackend,
+                kda_backend,
+                LinearAttnKernelBackend.FLASHINFER,
+                (1, 2, 3),
+                0,
+            ),
         ):
-            with self.subTest(backend=backend_type.__name__):
+            with self.subTest(
+                backend=backend_type.__name__, prefill=prefill_backend, dims=dims
+            ):
+                layer = SimpleNamespace(
+                    conv_weights=object(),
+                    bias=None,
+                    activation="silu",
+                    q_dim=dims[0],
+                    k_dim=dims[1],
+                    v_dim=dims[2],
+                )
                 backend = object.__new__(backend_type)
+                if backend_type is KDAAttnBackend:
+                    backend.kernel_dispatcher = SimpleNamespace(
+                        prefill_backend=prefill_backend
+                    )
                 starts = torch.tensor([0, 2, 4])
                 backend.forward_metadata = SimpleNamespace(
                     query_start_loc=starts, conv_block_table=None
                 )
+                expected = convolved.split(dims, dim=-1)
+                conv_output = torch.stack(expected) if split_size else convolved.T
                 with patch.object(
-                    module, "causal_conv1d_fn", return_value=qkv.T
+                    module, "causal_conv1d_fn", return_value=conv_output
                 ) as conv:
                     output = backend._convolve_prefill(
                         layer, batch, qkv, states, indices
                     )
-                torch.testing.assert_close(output, qkv)
+                if backend_type is KDAAttnBackend:
+                    self.assertIsInstance(output, tuple)
+                    torch.testing.assert_close(output, expected, rtol=0, atol=0)
+                    if split_size:
+                        self.assertTrue(all(plane.is_contiguous() for plane in output))
+                    self.assertEqual(
+                        conv.call_args.kwargs["output_split_size"], split_size
+                    )
+                else:
+                    torch.testing.assert_close(output, convolved, rtol=0, atol=0)
                 args, kwargs = conv.call_args
                 torch.testing.assert_close(args[0], qkv.T)
                 self.assertIs(args[1], layer.conv_weights)
@@ -179,7 +220,9 @@ class TestTrackMambaStateDtype(CustomTestCase):
                     ssm_states = torch.zeros(16, 1, 2, 2)[::2]
                     cache = SimpleNamespace(conv=[conv_states], temporal=ssm_states)
                     backend.state_layer_cache = lambda _: cache
-                    expected_indices = torch.arange(2) if contiguous else indices
+                    # Staged copies keep the padding sink at row 0, so the
+                    # requests sit at rows 1..n.
+                    expected_indices = torch.arange(1, 3) if contiguous else indices
 
                     def convolve(_layer, _batch, x, states, slots):
                         torch.testing.assert_close(slots, expected_indices)

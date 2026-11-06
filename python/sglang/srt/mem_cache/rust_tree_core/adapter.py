@@ -52,6 +52,7 @@ from sglang.srt.mem_cache.unified_cache.components import CacheTransferPhase
 from sglang.srt.mem_cache.unified_cache.tree_core_registry import NATIVE_SLOTS
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import StorageBackupSpec
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
+    JOINT_LRU_EVICTION_POLICY,
     BufferBackupSnapshot,
     BufferBackupState,
     DecSwaLockOnlyResult,
@@ -477,7 +478,13 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
 
         self._binding = self._binding_class()(
             self._bindings.TreeCoreInitParamsBinding(
-                eviction_policy=params.eviction_policy,
+                # This core keeps no joint order; joint_lru evicts each
+                # component as lru here.
+                eviction_policy=(
+                    "lru"
+                    if params.eviction_policy.lower() == JOINT_LRU_EVICTION_POLICY
+                    else params.eviction_policy
+                ),
                 slru_protected_threshold=getattr(
                     eviction_strategy, "protected_threshold", 2
                 ),
@@ -707,6 +714,11 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             else None,
         )
         return self._fill_evict_result(binding_result, result)
+
+    def mark_write_back_queued(
+        self, node_id: NodeId, copied: Sequence[NodeId] = ()
+    ) -> int:
+        return self._binding.mark_write_back_queued(node_id, list(copied))
 
     def demote(self, node_id: NodeId) -> DemoteResult:
         binding_result = self._binding.demote(node_id)
