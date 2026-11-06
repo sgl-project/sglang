@@ -3658,10 +3658,24 @@ class DeepseekV4AttnBackend(
             and x.shape[0]
             == forward_batch.batch_size * self.speculative_num_draft_tokens
         ):
-            # Static verify is request-major with consecutive positions; compact
-            # verify has variable block lengths and keeps the general path.
+            # Static verify is request-major with consecutive positions.
             self._low_ratio_compress_fused(
                 layer, x, req, pos, draft_len=self.speculative_num_draft_tokens
+            )
+        elif (
+            forward_batch.forward_mode.is_target_verify()
+            and not self.is_dspark_draft
+            and layer.compressor.use_fused_compress
+            and forward_batch.ragged_verify_layout is not None
+            and read_ragged_verify_mode() is RaggedVerifyMode.COMPACT
+        ):
+            layout = forward_batch.ragged_verify_layout
+            self._low_ratio_compress_fused(
+                layer,
+                x,
+                req,
+                pos,
+                extend_offsets=(layout.qo_indptr_device[:-1], layout.verify_lens),
             )
         elif (
             layer.compressor.use_fused_compress
