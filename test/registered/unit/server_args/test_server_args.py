@@ -3786,6 +3786,7 @@ class TestDeepEPv2Args(CustomTestCase):
             "DeepseekV3ForCausalLM",
             "DeepseekV4ForCausalLM",
             "Qwen3MoeForCausalLM",
+            "KimiK3ForConditionalGeneration",
             "Glm5NextForConditionalGeneration",
             "MiMoV2ForCausalLM",
             "MiMoV2FlashForCausalLM",
@@ -3878,6 +3879,23 @@ class TestDeepEPv2Args(CustomTestCase):
         args = self._args(moe_runner_backend="auto")
         handle_a2a_moe(args)
         self.assertEqual(resolved_view(args).moe_runner_backend, "deep_gemm")
+
+    @override_platform(is_sm100=True, device_sm=103)
+    def test_kimi_k3_auto_runner_keeps_deepep_v2_adapter(self):
+        from sglang.srt.arg_groups.overrides import collect_model_override_declarations
+
+        args = self._args(moe_runner_backend="auto", tp_size=8)
+        hf = args._model_config.hf_config
+        hf.architectures = ["KimiK3ForConditionalGeneration"]
+        hf.quantization_config = {
+            "config_groups": {"experts": {"format": "mxfp4-pack-quantized"}}
+        }
+        args._resolved_overrides = collect_model_override_declarations(
+            hf.architectures[0], args, hf
+        )
+        self.assertEqual(resolution_result(args, "moe_runner_backend"), "deep_gemm")
+        handle_a2a_moe(args)
+        self.assertEqual(resolution_result(args, "ep_size"), 8)
 
     def test_unsupported_runner_rejected(self):
         args = self._args(moe_runner_backend="flashinfer_trtllm")

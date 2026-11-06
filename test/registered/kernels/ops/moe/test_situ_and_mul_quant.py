@@ -1,6 +1,7 @@
 import unittest
 
 import torch
+import triton
 
 from sglang.kernels.ops.moe.kimi_k3_situ_and_mul_quant import (
     situ_and_mul_masked_post_quant,
@@ -46,6 +47,74 @@ class TestSituAndMulQuant(CustomTestCase):
             raise unittest.SkipTest("CUDA is not available")
         if get_device_sm() < 100:
             raise unittest.SkipTest("Kimi K3 compute kernels require SM100a+")
+
+    def test_contiguous_situ_uses_the_packed_scale_during_graph_replay(self):
+        from sglang.srt.layers.moe.moe_runner.deep_gemm import (
+            _cast_to_e8m0_with_rounding_up,
+            _situ_mul_quant_contig_kernel,
+        )
+
+        torch.cuda.manual_seed_all(41)
+        rows = 17
+        for width in (512, 1536, 2048):
+            groups = width // _GROUP_SIZE
+            x = torch.randn(rows, 2 * width, device="cuda", dtype=torch.bfloat16)
+            q = torch.empty(rows, width, device="cuda", dtype=torch.float8_e4m3fn)
+            scales = torch.empty(rows, groups, device="cuda", dtype=torch.float32)
+
+            def quantize():
+                _situ_mul_quant_contig_kernel[(rows,)](
+                    x,
+                    q,
+                    scales,
+                    width,
+                    groups,
+                    _BETA,
+                    _LINEAR_BETA,
+                    GROUP=_GROUP_SIZE,
+                    KG_POW2=triton.next_power_of_2(groups),
+                    num_warps=8,
+                )
+                return _cast_to_e8m0_with_rounding_up(scales.unsqueeze(0))
+
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                for _ in range(3):
+                    quantize()
+            torch.cuda.current_stream().wait_stream(stream)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                packed = quantize()
+            for gain in (1.0, 8.0, 0.0):
+                with self.subTest(width=width, gain=gain):
+                    x.copy_((torch.randn_like(x.float()) * gain).to(x.dtype))
+                    graph.replay()
+                    expected = _situ_reference(x)
+                    expected_scale = torch.exp2(
+                        torch.ceil(
+                            torch.log2(
+                                expected.reshape(rows, groups, _GROUP_SIZE)
+                                .abs()
+                                .amax(-1)
+                                .clamp_min(1e-10)
+                                / 448.0
+                            )
+                        )
+                    )
+                    packed_scale = _unpack_ue8m0_scales(
+                        packed.transpose(1, 2), groups
+                    ).squeeze(0)
+                    torch.testing.assert_close(scales, expected_scale, rtol=0, atol=0)
+                    torch.testing.assert_close(packed_scale, scales, rtol=0, atol=0)
+                    dequantized = q.float() * packed_scale.repeat_interleave(
+                        _GROUP_SIZE, dim=-1
+                    )
+                    relative_rmse = (
+                        (dequantized - expected).square().mean().sqrt()
+                        / expected.square().mean().sqrt().clamp_min(1e-12)
+                    )
+                    self.assertLess(relative_rmse.item(), 0.04)
 
     def test_situ_mul_quant(self):
         torch.cuda.manual_seed_all(3)

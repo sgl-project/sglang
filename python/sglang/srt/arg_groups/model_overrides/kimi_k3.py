@@ -198,6 +198,10 @@ def _kimi_k3_moe_runner_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
     if cfg.moe_runner_backend != "auto":
         return {}
+    if cfg.moe_a2a_backend == "deepep_v2":
+        # The v2 dispatcher has a DeepGEMM adapter, but no FlashInfer MXFP4
+        # adapter. Preserve packed MXFP4 weights via DeepGEMM's W4A8 path.
+        return {"moe_runner_backend": "deep_gemm"}
     if not (get_platform().is_sm100 and get_platform().device_sm in (100, 103, 107)):
         return {}
     if not _is_mxfp4_pack_quantized(hf_config):

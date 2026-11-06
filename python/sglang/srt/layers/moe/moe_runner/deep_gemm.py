@@ -11,6 +11,7 @@ import triton.language as tl
 from sglang.kernels.ops.activation.silu_and_mul_clamp import silu_and_mul_clamp
 from sglang.kernels.ops.moe.dsv4 import silu_and_mul_masked_post_quant
 from sglang.kernels.ops.moe.triton_pad_expert_counts import pad_expert_counts
+from sglang.kernels.ops.quantization.mxfp8_epilogue import ue8m0_scale
 from sglang.kernels.ops.quantization.per_token_group_quant import per_token_group_quant
 
 logger = logging.getLogger(__name__)
@@ -1687,10 +1688,15 @@ def _situ_mul_quant_contig_kernel(
     up_t = 2.0 * tl.sigmoid(2.0 * up / situ_linear_beta) - 1.0
     y = gate * situ_linear_beta * up_t
     amax = tl.clamp(tl.max(tl.abs(y), axis=1), min=1e-10, max=float("inf"))
-    q = (y * (448.0 / amax)[:, None]).to(tl.float8e4nv)
+    # The consumer packs these scales into UE8M0. Quantize with the same
+    # power-of-two scale; rounding only after quantizing rescales the values
+    # by up to 2x. Match the masked SiTU kernel's round-up contract.
+    scale_exp, inv_scale = ue8m0_scale(amax)
+    scale = (scale_exp << 23).to(tl.float32, bitcast=True)
+    q = (y * inv_scale[:, None]).to(tl.float8e4nv)
     tl.store(q_ptr + row * N + offs, q, mask=mask)
     srow = tl.arange(0, KG_POW2)
-    tl.store(s_ptr + row * KG + srow, amax / 448.0, mask=srow < KG)
+    tl.store(s_ptr + row * KG + srow, scale, mask=srow < KG)
 
 
 def _apply_swiglu_limit(
@@ -1744,7 +1750,7 @@ def pre_permute_deepep_v2_to_deep_gemm(
             "activation scales or BF16 dispatch output, but the dispatch "
             f"output carried {hidden_states.dtype} without scales."
         )
-    assert runner_config.activation == "silu"
+    assert runner_config.activation in ("silu", "situ")
 
     if is_expanded:
         if psum_num_recv_tokens_per_expert is None:
