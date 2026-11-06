@@ -1,8 +1,8 @@
-name: Nightly Test (PPU)
+name: Nightly Test (PPU K8s)
 
 on:
   schedule:
-    - cron: '0 16 * * *'  # 0:00 AM Beijing Time (UTC+8) every day
+    - cron: '0 16 * * *'  # 00:00 Beijing Time (UTC+8) every day
   workflow_dispatch:
     inputs:
       ref:
@@ -25,320 +25,318 @@ concurrency:
 permissions:
   contents: read
 
-# Every test container passes PIP_INDEX_URL=https://pypi.org/simple: the
-# sdk2.2.0 base image ships a pip index pointing at the Artifactory PyPI repo,
-# which returns 401 for the CI credentials. The env var outranks every pip
-# config file and restores the pip default these jobs used before the upgrade.
+defaults:
+  run:
+    shell: bash
+
 env:
   PPU_BASE_IMAGE: pkg.flytiger-eco.com/docker_release/llm:sdk2.2.0-pytorch2.11.0-ubuntu24.04-cuda13.0-sglang0.5.17-py312-20261001
   PPU_SDK_VERSION: 2.2.0
 
 jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      ref: ${{ steps.source.outputs.ref }}
+    steps:
+      - name: Validate the requested source ref
+        id: source
+        env:
+          REQUESTED_REF: ${{ inputs.ref || github.sha }}
+        run: |
+          if [[ "$REQUESTED_REF" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            :
+          elif [[ "$REQUESTED_REF" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] &&
+            git check-ref-format --allow-onecase "$REQUESTED_REF" >/dev/null; then
+            :
+          else
+            echo 'ref must be a full commit SHA or a valid branch/tag ref' >&2
+            exit 1
+          fi
+          printf 'ref=%s\n' "$REQUESTED_REF" >> "$GITHUB_OUTPUT"
+
+  # Keep separate jobs rather than a matrix: cluster-task derives its staging
+  # directory and K8s Job name from GITHUB_JOB, which concurrent matrix legs share.
   nightly-1a-ppu:
-    runs-on: ppu
+    name: Nightly 1-PPU A (890P K8s)
+    needs: [prepare]
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
     timeout-minutes: 120
     steps:
-      - name: Clean workspace (root-owned files from prior Docker runs)
-        run: |
-          docker run --rm \
-            -v ${{ github.workspace }}:/workspace \
-            ${{ env.PPU_BASE_IMAGE }} \
-            bash -c "rm -rf /workspace/.??* /workspace/* 2>/dev/null; true"
-
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.sha }}
+          ref: ${{ needs.prepare.outputs.ref }}
+          fetch-depth: 2
+      - name: Resolve the base image digest
+        run: bash scripts/ci/ppu/resolve_image_digest.sh
+      - name: Run PPU nightly tests (1-GPU, partition 1/2) via K8s
+        uses: flytiger-eco/shared-workflows/cluster-task@4692d51c552e8cdf4f267adfdef1e484ca685a6a
+        with:
+          image: ${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 1
+          node_selector: board-type=ZW-M890P
+          namespace: ppu-sched
+          job_suffix: ${{ github.job }}
+          host_volumes: "/wl_nas/cache/sglang-jit-ci:/root/.cache/tvm-ffi,/wl_nas/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm,/wl_nas/cache/sglang-jit:/root/.cache/sglang/jit"
+          extra_env: "PPU_EXPECTED_DEVICES=1,SGLANG_IS_IN_CI=true,SGL_KERNEL_WHEEL_CACHE_DIR=/nas_aisw/cache/sgl-kernel-wheels,PPU_BASE_IMAGE_REF=${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1,SGLANG_SAIL_PLA_CUDA=0,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_OFFLINE=1,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,PIP_INDEX_URL=https://pypi.org/simple"
+          command: |
+            set -euo pipefail
+            cd /workspace/source
+            export GITHUB_WORKSPACE=/workspace/source
+            git config --global --add safe.directory /workspace/source
+            ulimit -l unlimited
+            ulimit -s 65536
+            # extra_env is comma-separated, so build multi-device lists inside the pod.
+            export CUDA_VISIBLE_DEVICES
+            CUDA_VISIBLE_DEVICES=$(python3 -c 'import os; print(",".join(str(i) for i in range(int(os.environ["PPU_EXPECTED_DEVICES"]))))')
+            python3 - <<'PY'
+            import os
+            import torch
 
-      - name: Warm page cache for partition models
-        run: |
-          bash scripts/ci/warm_page_cache.sh \
-            /nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct \
-            /nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-30B-A3B \
-            /nas_aisw/datasets/checkpoints/LLM/deepseek/v2/DeepSeek-V2-Lite-Chat \
-            /nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-0.6B
-
-      - name: Run PPU nightly tests (1-GPU, partition 1/2)
-        timeout-minutes: 110
-        env:
-          PPU_ARTIFACTORY_USER: ${{ secrets.PPU_ARTIFACTORY_USER }}
-          PPU_ARTIFACTORY_PASSWORD: ${{ secrets.PPU_ARTIFACTORY_PASSWORD }}
-        run: |
-          docker run --rm \
-            --privileged \
-            --network host \
-            --add-host=$(hostname):$(hostname -I | awk '{print $1}') \
-            --device=/dev/alixpu_ctl \
-            --device=/dev/alixpu \
-            --ipc=host \
-            --shm-size=8g \
-            --ulimit memlock=-1 \
-            --ulimit stack=67108864 \
-            -v ${{ github.workspace }}:/workspace \
-            -v /nas_aisw:/nas_aisw \
-            -v /nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi \
-            -v /nas_aisw/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm \
-            -v /nas_aisw/cache/sglang-jit:/root/.cache/sglang/jit \
-            -e SGLANG_IS_IN_CI=true \
-            -e SGL_KERNEL_WHEEL_CACHE_DIR=/nas_aisw/cache/sgl-kernel-wheels \
-            -e PPU_BASE_IMAGE \
-            -e PPU_SDK_VERSION \
-            -e SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1 \
-            -e SGLANG_SAIL_PLA_CUDA=0 \
-            -e CUDA_VISIBLE_DEVICES=0 \
-            -e CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include \
-            -e HF_HUB_OFFLINE=1 \
-            -e HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub \
-            -e PPU_ARTIFACTORY_USER \
-            -e PPU_ARTIFACTORY_PASSWORD \
-            -e PPU_SUPPORTS_FP8=0 \
-            -e PIP_INDEX_URL=https://pypi.org/simple \
-            ${{ env.PPU_BASE_IMAGE }} \
-            bash -c "
-              cd /workspace && \
-              bash scripts/ci/ppu/ppu_install_dependency.sh && \
-              git config --global --add safe.directory /workspace && \
-              JIT_MTIME=\$(git -C /workspace log -1 --format=%ct 2>/dev/null || echo 0) && \
-              { [ \"\$JIT_MTIME\" != 0 ] && find /workspace/python/sglang/kernels/jit -type f -exec touch -d @\$JIT_MTIME {} + && echo \"Pinned JIT source mtimes to HEAD commit @\$JIT_MTIME so ninja reuses the NAS-persisted JIT cache across runs (a fresh checkout otherwise resets mtimes and forces a full recompile every night)\" || echo 'Skipped JIT mtime pinning (git unavailable); JIT will recompile'; } && \
-              cd test && \
-              python3 run_suite.py --hw ppu --suite nightly-1-ppu --nightly --require-nonempty --continue-on-error --auto-partition-id 0 --auto-partition-size 2
-            "
+            expected = int(os.environ['PPU_EXPECTED_DEVICES'])
+            names = [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())]
+            if len(names) != expected or not all('890' in name.upper() for name in names):
+                raise RuntimeError(f'Unexpected PPU allocation: expected={expected}, devices={names}')
+            print(f'PPU allocation verified: requested={expected}, visible={len(names)}, devices={names}')
+            PY
+            bash scripts/ci/warm_page_cache.sh \
+              /nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct \
+              /nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-30B-A3B \
+              /nas_aisw/datasets/checkpoints/LLM/deepseek/v2/DeepSeek-V2-Lite-Chat \
+              /nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-0.6B
+            bash scripts/ci/ppu/ppu_install_dependency.sh
+            JIT_MTIME=$(git log -1 --format=%ct 2>/dev/null || echo 0)
+            if [ "$JIT_MTIME" != 0 ]; then
+              find python/sglang/kernels/jit -type f -exec touch -d "@$JIT_MTIME" {} + ||
+                echo 'JIT mtime pinning failed; JIT will recompile'
+            else
+              echo 'Skipped JIT mtime pinning; JIT will recompile'
+            fi
+            cd test
+            python3 run_suite.py --hw ppu --suite nightly-1-ppu --nightly --require-nonempty --continue-on-error --auto-partition-id 0 --auto-partition-size 2
+          container_options: |
+            privileged: true
+            host_ipc: true
+            host_network: true
+            shm_size: 8Gi
+          timeout_minutes: 110
+          cleanup_policy: always
 
   nightly-1b-ppu:
-    needs: [nightly-1a-ppu]
-    if: always()
-    runs-on: ppu
-    # Higher than the other 1-GPU job: this partition owns test_marlin_moe, whose JIT
-    # preload can cost ~18min on a cache miss. Sized so that even the worst case
-    # (preload burns its 1500s cap AND marlin then hits its own 1200s watchdog) still
-    # fits, instead of overrunning the step and failing all 67 tests in the partition.
+    name: Nightly 1-PPU B (890P K8s)
+    needs: [prepare, nightly-1a-ppu]
+    if: ${{ always() && needs.prepare.result == 'success' }}
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    # This partition owns test_marlin_moe, whose JIT preload can cost about 18
+    # minutes on a cache miss and therefore needs a larger timeout than partition A.
     timeout-minutes: 135
     steps:
-      - name: Clean workspace (root-owned files from prior Docker runs)
-        run: |
-          docker run --rm \
-            -v ${{ github.workspace }}:/workspace \
-            ${{ env.PPU_BASE_IMAGE }} \
-            bash -c "rm -rf /workspace/.??* /workspace/* 2>/dev/null; true"
-
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.sha }}
+          ref: ${{ needs.prepare.outputs.ref }}
+          fetch-depth: 2
+      - name: Resolve the base image digest
+        run: bash scripts/ci/ppu/resolve_image_digest.sh
+      - name: Run PPU nightly tests (1-GPU, partition 2/2) via K8s
+        uses: flytiger-eco/shared-workflows/cluster-task@4692d51c552e8cdf4f267adfdef1e484ca685a6a
+        with:
+          image: ${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 1
+          node_selector: board-type=ZW-M890P
+          namespace: ppu-sched
+          job_suffix: ${{ github.job }}
+          host_volumes: "/wl_nas/cache/sglang-jit-ci:/root/.cache/tvm-ffi,/wl_nas/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm,/wl_nas/cache/sglang-jit:/root/.cache/sglang/jit"
+          extra_env: "PPU_EXPECTED_DEVICES=1,SGLANG_IS_IN_CI=true,SGL_KERNEL_WHEEL_CACHE_DIR=/nas_aisw/cache/sgl-kernel-wheels,PPU_BASE_IMAGE_REF=${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1,SGLANG_SAIL_PLA_CUDA=0,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_OFFLINE=1,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,PIP_INDEX_URL=https://pypi.org/simple"
+          command: |
+            set -euo pipefail
+            cd /workspace/source
+            export GITHUB_WORKSPACE=/workspace/source
+            git config --global --add safe.directory /workspace/source
+            ulimit -l unlimited
+            ulimit -s 65536
+            # extra_env is comma-separated, so build multi-device lists inside the pod.
+            export CUDA_VISIBLE_DEVICES
+            CUDA_VISIBLE_DEVICES=$(python3 -c 'import os; print(",".join(str(i) for i in range(int(os.environ["PPU_EXPECTED_DEVICES"]))))')
+            python3 - <<'PY'
+            import os
+            import torch
 
-      - name: Warm page cache for partition models
-        run: |
-          bash scripts/ci/warm_page_cache.sh \
-            /nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct \
-            /nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-30B-A3B \
-            /nas_aisw/datasets/checkpoints/LLM/deepseek/v2/DeepSeek-V2-Lite-Chat \
-            /nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-0.6B
-
-      - name: Run PPU nightly tests (1-GPU, partition 2/2)
-        # 125 rather than 110: observed 95min warm-cache, and the worst case (1500s
-        # preload cap + marlin's own 1200s watchdog) needs ~122min. See the job-level
-        # timeout comment above.
-        #
-        # The Marlin preload below asks for two module variants, not four: v0.5.18
-        # widened that module's cache key from dtype alone to
-        # (dtype, is_ep, has_bias), so the single variant per dtype this preload
-        # used to cover is now specifically the non-EP, no-bias one. That is the
-        # variant test_fused_marlin_moe compiles, and preloading only it keeps the
-        # step inside the 1500s cap that the ~16min two-dtype measurement above was
-        # taken against. The EP variant test_fused_marlin_moe_expert_parallelism
-        # needs is compilation work that did not exist when this preload was
-        # written, and is left to that test's own budget.
-        timeout-minutes: 125
-        env:
-          PPU_ARTIFACTORY_USER: ${{ secrets.PPU_ARTIFACTORY_USER }}
-          PPU_ARTIFACTORY_PASSWORD: ${{ secrets.PPU_ARTIFACTORY_PASSWORD }}
-        run: |
-          docker run --rm \
-            --privileged \
-            --network host \
-            --add-host=$(hostname):$(hostname -I | awk '{print $1}') \
-            --device=/dev/alixpu_ctl \
-            --device=/dev/alixpu \
-            --ipc=host \
-            --shm-size=8g \
-            --ulimit memlock=-1 \
-            --ulimit stack=67108864 \
-            -v ${{ github.workspace }}:/workspace \
-            -v /nas_aisw:/nas_aisw \
-            -v /nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi \
-            -v /nas_aisw/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm \
-            -v /nas_aisw/cache/sglang-jit:/root/.cache/sglang/jit \
-            -e SGLANG_IS_IN_CI=true \
-            -e SGL_KERNEL_WHEEL_CACHE_DIR=/nas_aisw/cache/sgl-kernel-wheels \
-            -e PPU_BASE_IMAGE \
-            -e PPU_SDK_VERSION \
-            -e SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1 \
-            -e SGLANG_SAIL_PLA_CUDA=0 \
-            -e CUDA_VISIBLE_DEVICES=0 \
-            -e CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include \
-            -e HF_HUB_OFFLINE=1 \
-            -e HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub \
-            -e PPU_ARTIFACTORY_USER \
-            -e PPU_ARTIFACTORY_PASSWORD \
-            -e PPU_SUPPORTS_FP8=0 \
-            -e PIP_INDEX_URL=https://pypi.org/simple \
-            ${{ env.PPU_BASE_IMAGE }} \
-            bash -c "
-              cd /workspace && \
-              bash scripts/ci/ppu/ppu_install_dependency.sh && \
-              git config --global --add safe.directory /workspace && \
-              JIT_MTIME=\$(git -C /workspace log -1 --format=%ct 2>/dev/null || echo 0) && \
-              { [ \"\$JIT_MTIME\" != 0 ] && find /workspace/python/sglang/kernels/jit -type f -exec touch -d @\$JIT_MTIME {} + && echo \"Pinned JIT source mtimes to HEAD commit @\$JIT_MTIME so ninja reuses the NAS-persisted JIT cache across runs (a fresh checkout otherwise resets mtimes and forces a full recompile every night)\" || echo 'Skipped JIT mtime pinning (git unavailable); JIT will recompile'; } && \
-              echo 'Preloading Marlin JIT outside the per-test watchdog (instant on a NAS cache hit; ~16min two-dtype ppu-llc compile on a miss, which would otherwise eat most of test_marlin_moe 1200s budget)...' && \
-              { timeout -k 30 1500 python3 -c 'import torch; from sglang.kernels.ops.moe.moe_wna16_marlin import _jit_moe_wna16_marlin_module; _jit_moe_wna16_marlin_module(torch.float16, False, False); _jit_moe_wna16_marlin_module(torch.bfloat16, False, False); print(\"Marlin JIT ready\")' || echo 'Marlin JIT preload did not finish; test_marlin_moe may hit its own 1200s timeout'; } && \
-              cd test && \
-              python3 run_suite.py --hw ppu --suite nightly-1-ppu --nightly --require-nonempty --continue-on-error --auto-partition-id 1 --auto-partition-size 2
-            "
+            expected = int(os.environ['PPU_EXPECTED_DEVICES'])
+            names = [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())]
+            if len(names) != expected or not all('890' in name.upper() for name in names):
+                raise RuntimeError(f'Unexpected PPU allocation: expected={expected}, devices={names}')
+            print(f'PPU allocation verified: requested={expected}, visible={len(names)}, devices={names}')
+            PY
+            bash scripts/ci/warm_page_cache.sh \
+              /nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct \
+              /nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-30B-A3B \
+              /nas_aisw/datasets/checkpoints/LLM/deepseek/v2/DeepSeek-V2-Lite-Chat \
+              /nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-0.6B
+            bash scripts/ci/ppu/ppu_install_dependency.sh
+            JIT_MTIME=$(git log -1 --format=%ct 2>/dev/null || echo 0)
+            if [ "$JIT_MTIME" != 0 ]; then
+              find python/sglang/kernels/jit -type f -exec touch -d "@$JIT_MTIME" {} + ||
+                echo 'JIT mtime pinning failed; JIT will recompile'
+            else
+              echo 'Skipped JIT mtime pinning; JIT will recompile'
+            fi
+            echo 'Preloading Marlin JIT outside the per-test watchdog'
+            timeout -k 30 1500 python3 -c 'import torch; from sglang.kernels.ops.moe.moe_wna16_marlin import _jit_moe_wna16_marlin_module; _jit_moe_wna16_marlin_module(torch.float16, False, False); _jit_moe_wna16_marlin_module(torch.bfloat16, False, False); print("Marlin JIT ready")' ||
+              echo 'Marlin JIT preload did not finish; the test watchdog still applies'
+            cd test
+            python3 run_suite.py --hw ppu --suite nightly-1-ppu --nightly --require-nonempty --continue-on-error --auto-partition-id 1 --auto-partition-size 2
+          container_options: |
+            privileged: true
+            host_ipc: true
+            host_network: true
+            shm_size: 8Gi
+          timeout_minutes: 125
+          cleanup_policy: always
 
   nightly-2-ppu:
-    needs: [nightly-1b-ppu]
-    if: always()
-    runs-on: ppu
+    name: Nightly 2-PPU (890P K8s)
+    needs: [prepare, nightly-1b-ppu]
+    if: ${{ always() && needs.prepare.result == 'success' }}
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
     timeout-minutes: 150
     steps:
-      - name: Clean workspace (root-owned files from prior Docker runs)
-        run: |
-          docker run --rm \
-            -v ${{ github.workspace }}:/workspace \
-            ${{ env.PPU_BASE_IMAGE }} \
-            bash -c "rm -rf /workspace/.??* /workspace/* 2>/dev/null; true"
-
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.sha }}
+          ref: ${{ needs.prepare.outputs.ref }}
+          fetch-depth: 2
+      - name: Resolve the base image digest
+        run: bash scripts/ci/ppu/resolve_image_digest.sh
+      - name: Run 2-GPU PPU nightly tests via K8s
+        uses: flytiger-eco/shared-workflows/cluster-task@4692d51c552e8cdf4f267adfdef1e484ca685a6a
+        with:
+          image: ${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 2
+          node_selector: board-type=ZW-M890P
+          namespace: ppu-sched
+          job_suffix: ${{ github.job }}
+          host_volumes: "/wl_nas/cache/sglang-jit-ci:/root/.cache/tvm-ffi,/wl_nas/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm,/wl_nas/cache/sglang-jit:/root/.cache/sglang/jit"
+          extra_env: "PPU_EXPECTED_DEVICES=2,SGLANG_IS_IN_CI=true,SGL_KERNEL_WHEEL_CACHE_DIR=/nas_aisw/cache/sgl-kernel-wheels,PPU_BASE_IMAGE_REF=${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1,SGLANG_SAIL_PLA_CUDA=0,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_OFFLINE=1,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,PIP_INDEX_URL=https://pypi.org/simple"
+          command: |
+            set -euo pipefail
+            cd /workspace/source
+            export GITHUB_WORKSPACE=/workspace/source
+            git config --global --add safe.directory /workspace/source
+            ulimit -l unlimited
+            ulimit -s 65536
+            # extra_env is comma-separated, so build multi-device lists inside the pod.
+            export CUDA_VISIBLE_DEVICES
+            CUDA_VISIBLE_DEVICES=$(python3 -c 'import os; print(",".join(str(i) for i in range(int(os.environ["PPU_EXPECTED_DEVICES"]))))')
+            python3 - <<'PY'
+            import os
+            import torch
 
-      - name: Warm page cache for partition models
-        run: |
-          bash scripts/ci/warm_page_cache.sh \
-            /nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct \
-            /nas_aisw/datasets/checkpoints/LLM/Llama/v3.2/Llama-3.2-1B-Instruct
-
-      - name: Run 2-GPU PPU nightly tests
-        timeout-minutes: 140
-        env:
-          PPU_ARTIFACTORY_USER: ${{ secrets.PPU_ARTIFACTORY_USER }}
-          PPU_ARTIFACTORY_PASSWORD: ${{ secrets.PPU_ARTIFACTORY_PASSWORD }}
-        run: |
-          docker run --rm \
-            --privileged \
-            --network host \
-            --add-host=$(hostname):$(hostname -I | awk '{print $1}') \
-            --device=/dev/alixpu_ctl \
-            --device=/dev/alixpu \
-            --ipc=host \
-            --shm-size=8g \
-            --ulimit memlock=-1 \
-            --ulimit stack=67108864 \
-            -v ${{ github.workspace }}:/workspace \
-            -v /nas_aisw:/nas_aisw \
-            -v /nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi \
-            -v /nas_aisw/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm \
-            -v /nas_aisw/cache/sglang-jit:/root/.cache/sglang/jit \
-            -e SGLANG_IS_IN_CI=true \
-            -e SGL_KERNEL_WHEEL_CACHE_DIR=/nas_aisw/cache/sgl-kernel-wheels \
-            -e PPU_BASE_IMAGE \
-            -e PPU_SDK_VERSION \
-            -e SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1 \
-            -e SGLANG_SAIL_PLA_CUDA=0 \
-            -e CUDA_VISIBLE_DEVICES=0,1 \
-            -e CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include \
-            -e HF_HUB_OFFLINE=1 \
-            -e HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub \
-            -e PPU_ARTIFACTORY_USER \
-            -e PPU_ARTIFACTORY_PASSWORD \
-            -e PPU_SUPPORTS_FP8=0 \
-            -e PIP_INDEX_URL=https://pypi.org/simple \
-            ${{ env.PPU_BASE_IMAGE }} \
-            bash -c "
-              cd /workspace && \
-              bash scripts/ci/ppu/ppu_install_dependency.sh && \
-              cd test && \
-              python3 run_suite.py --hw ppu --suite nightly-2-ppu --nightly --require-nonempty --continue-on-error
-            "
+            expected = int(os.environ['PPU_EXPECTED_DEVICES'])
+            names = [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())]
+            if len(names) != expected or not all('890' in name.upper() for name in names):
+                raise RuntimeError(f'Unexpected PPU allocation: expected={expected}, devices={names}')
+            print(f'PPU allocation verified: requested={expected}, visible={len(names)}, devices={names}')
+            PY
+            bash scripts/ci/warm_page_cache.sh \
+              /nas_aisw/datasets/checkpoints/LLM/Llama/v3.1/Llama-3.1-8B-Instruct \
+              /nas_aisw/datasets/checkpoints/LLM/Llama/v3.2/Llama-3.2-1B-Instruct
+            bash scripts/ci/ppu/ppu_install_dependency.sh
+            cd test
+            python3 run_suite.py --hw ppu --suite nightly-2-ppu --nightly --require-nonempty --continue-on-error
+          container_options: |
+            privileged: true
+            host_ipc: true
+            host_network: true
+            shm_size: 8Gi
+          timeout_minutes: 140
+          cleanup_policy: always
 
   nightly-4-ppu:
-    needs: [nightly-2-ppu]
-    if: always()
-    runs-on: ppu
+    name: Nightly 4-PPU (890P K8s)
+    needs: [prepare, nightly-2-ppu]
+    if: ${{ always() && needs.prepare.result == 'success' }}
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
     timeout-minutes: 180
     steps:
-      - name: Clean workspace (root-owned files from prior Docker runs)
-        run: |
-          docker run --rm \
-            -v ${{ github.workspace }}:/workspace \
-            ${{ env.PPU_BASE_IMAGE }} \
-            bash -c "rm -rf /workspace/.??* /workspace/* 2>/dev/null; true"
-
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.sha }}
+          ref: ${{ needs.prepare.outputs.ref }}
+          fetch-depth: 2
+      - name: Resolve the base image digest
+        run: bash scripts/ci/ppu/resolve_image_digest.sh
+      - name: Run 4-GPU PPU nightly tests via K8s
+        uses: flytiger-eco/shared-workflows/cluster-task@4692d51c552e8cdf4f267adfdef1e484ca685a6a
+        with:
+          image: ${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 4
+          node_selector: board-type=ZW-M890P
+          namespace: ppu-sched
+          job_suffix: ${{ github.job }}
+          host_volumes: "/wl_nas/cache/sglang-jit-ci:/root/.cache/tvm-ffi,/wl_nas/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm,/wl_nas/cache/sglang-jit:/root/.cache/sglang/jit"
+          extra_env: "PPU_EXPECTED_DEVICES=4,SGLANG_IS_IN_CI=true,SGL_KERNEL_WHEEL_CACHE_DIR=/nas_aisw/cache/sgl-kernel-wheels,PPU_BASE_IMAGE_REF=${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1,SGLANG_SAIL_PLA_CUDA=0,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_OFFLINE=1,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,PIP_INDEX_URL=https://pypi.org/simple"
+          command: |
+            set -euo pipefail
+            cd /workspace/source
+            export GITHUB_WORKSPACE=/workspace/source
+            git config --global --add safe.directory /workspace/source
+            ulimit -l unlimited
+            ulimit -s 65536
+            # extra_env is comma-separated, so build multi-device lists inside the pod.
+            export CUDA_VISIBLE_DEVICES
+            CUDA_VISIBLE_DEVICES=$(python3 -c 'import os; print(",".join(str(i) for i in range(int(os.environ["PPU_EXPECTED_DEVICES"]))))')
+            python3 - <<'PY'
+            import os
+            import torch
 
-      - name: Warm page cache for partition models
-        run: |
-          bash scripts/ci/warm_page_cache.sh \
-            /nas_aisw/datasets/checkpoints/LLM/Llama/v3.2/Llama-3.2-1B-Instruct
-
-      - name: Run 4-GPU PPU nightly tests
-        timeout-minutes: 170
-        env:
-          PPU_ARTIFACTORY_USER: ${{ secrets.PPU_ARTIFACTORY_USER }}
-          PPU_ARTIFACTORY_PASSWORD: ${{ secrets.PPU_ARTIFACTORY_PASSWORD }}
-        run: |
-          docker run --rm \
-            --privileged \
-            --network host \
-            --add-host=$(hostname):$(hostname -I | awk '{print $1}') \
-            --device=/dev/alixpu_ctl \
-            --device=/dev/alixpu \
-            --ipc=host \
-            --shm-size=8g \
-            --ulimit memlock=-1 \
-            --ulimit stack=67108864 \
-            -v ${{ github.workspace }}:/workspace \
-            -v /nas_aisw:/nas_aisw \
-            -v /nas_aisw/cache/sglang-jit-ci:/root/.cache/tvm-ffi \
-            -v /nas_aisw/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm \
-            -v /nas_aisw/cache/sglang-jit:/root/.cache/sglang/jit \
-            -e SGLANG_IS_IN_CI=true \
-            -e SGL_KERNEL_WHEEL_CACHE_DIR=/nas_aisw/cache/sgl-kernel-wheels \
-            -e PPU_BASE_IMAGE \
-            -e PPU_SDK_VERSION \
-            -e SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1 \
-            -e SGLANG_SAIL_PLA_CUDA=0 \
-            -e CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include \
-            -e HF_HUB_OFFLINE=1 \
-            -e HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub \
-            -e PPU_ARTIFACTORY_USER \
-            -e PPU_ARTIFACTORY_PASSWORD \
-            -e PPU_SUPPORTS_FP8=0 \
-            -e PIP_INDEX_URL=https://pypi.org/simple \
-            ${{ env.PPU_BASE_IMAGE }} \
-            bash -c "
-              cd /workspace && \
-              bash scripts/ci/ppu/ppu_install_dependency.sh && \
-              cd test && \
-              python3 run_suite.py --hw ppu --suite nightly-4-ppu --nightly --require-nonempty --continue-on-error
-            "
+            expected = int(os.environ['PPU_EXPECTED_DEVICES'])
+            names = [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())]
+            if len(names) != expected or not all('890' in name.upper() for name in names):
+                raise RuntimeError(f'Unexpected PPU allocation: expected={expected}, devices={names}')
+            print(f'PPU allocation verified: requested={expected}, visible={len(names)}, devices={names}')
+            PY
+            bash scripts/ci/warm_page_cache.sh \
+              /nas_aisw/datasets/checkpoints/LLM/Llama/v3.2/Llama-3.2-1B-Instruct
+            bash scripts/ci/ppu/ppu_install_dependency.sh
+            cd test
+            python3 run_suite.py --hw ppu --suite nightly-4-ppu --nightly --require-nonempty --continue-on-error
+          container_options: |
+            privileged: true
+            host_ipc: true
+            host_network: true
+            shm_size: 8Gi
+          timeout_minutes: 170
+          cleanup_policy: always
 
   # Restore the 8-PPU job only after real 8-PPU registrations pass hardware validation.
   nightly-test-ppu-finish:
-    needs: [nightly-1a-ppu, nightly-1b-ppu, nightly-2-ppu, nightly-4-ppu]
+    needs: [prepare, nightly-1a-ppu, nightly-1b-ppu, nightly-2-ppu, nightly-4-ppu]
     if: always()
-    runs-on: ppu
+    runs-on: ubuntu-latest
     steps:
       - name: Check all dependent job statuses
         env:
           NEEDS_JSON: ${{ toJson(needs) }}
         run: |
-          python3 -c "
-          import json, sys, os
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+
           needs = json.loads(os.environ['NEEDS_JSON'])
           failed = []
           for job, info in needs.items():
@@ -347,8 +345,7 @@ jobs:
               if result != 'success':
                   failed.append(f'{job} ({result})')
           if failed:
-              sep = ','
-              print(f'Failed jobs: {sep.join(failed)}')
+              print(f"Failed jobs: {','.join(failed)}")
               sys.exit(1)
           print('All jobs completed successfully')
-          "
+          PY
