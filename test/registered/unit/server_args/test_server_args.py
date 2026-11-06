@@ -3362,14 +3362,17 @@ class TestAscendOpsArgs(CustomTestCase):
             resolve_ascend_ops_speculative_draft(server_args)
 
 
+@unittest.skipUnless(importlib.util.find_spec("evenmoe"), "evenmoe is not installed")
 class TestLoadBalancerSharedRoutingArgs(CustomTestCase):
     def setUp(self):
         super().setUp()
         from types import SimpleNamespace
 
+        from evenmoe import A2A_DEEPEP, A2A_MEGAMOE, RoutingCapabilities
+
         pipeline = SimpleNamespace(
-            capabilities=SimpleNamespace(
-                supported_a2a_backends=("deepep", "megamoe"),
+            capabilities=RoutingCapabilities(
+                supported_a2a_backends=(A2A_DEEPEP, A2A_MEGAMOE),
                 routes_shared_expert=True,
                 requires_post_topk_routing=True,
             )
@@ -3473,9 +3476,12 @@ class TestLoadBalancerBackendSelection(CustomTestCase):
 
     @override_platform(is_npu=False)
     def test_ascend_rejection_depends_on_pipeline_backend_contract(self):
-        from evenmoe import RoutingCapabilities
+        from evenmoe import A2A_DEEPEP, RoutingCapabilities
 
-        for supported in (None, ("ascend_ops",)):
+        for supported, error in (
+            (None, "only supported on NPU"),
+            ((A2A_DEEPEP,), "incompatible.*ascend_ops"),
+        ):
             with self.subTest(supported=supported):
                 pipeline = SimpleNamespace(
                     capabilities=RoutingCapabilities(supported_a2a_backends=supported)
@@ -3490,7 +3496,7 @@ class TestLoadBalancerBackendSelection(CustomTestCase):
                         "sglang.srt.eplb.moe_load_balancer_glue.get_moe_load_balancer_pipeline",
                         return_value=pipeline,
                     ),
-                    self.assertRaisesRegex(ValueError, "only supported on NPU"),
+                    self.assertRaisesRegex(ValueError, error),
                 ):
                     handle_a2a_moe(args)
 
@@ -3499,19 +3505,22 @@ class TestLoadBalancerBackendSelection(CustomTestCase):
 
         from sglang.srt.arg_groups.overrides import _a2a_backend_overrides
 
-        pipeline = SimpleNamespace(
-            capabilities=RoutingCapabilities(
-                supported_a2a_backends=("megamoe", "deepep")
-            )
-        )
-        args = ServerArgs(model_path="dummy", moe_load_balancer_algorithm="custom")
-        with patch(
-            "sglang.srt.eplb.moe_load_balancer_glue.get_moe_load_balancer_pipeline",
-            return_value=pipeline,
-        ):
-            self.assertEqual(
-                _a2a_backend_overrides(args), {"moe_a2a_backend": "megamoe"}
-            )
+        # A backend SGLang does not have is skipped, not written to the flag.
+        for supported in (("megamoe", "deepep"), ("hybridep", "megamoe")):
+            with self.subTest(supported=supported):
+                pipeline = SimpleNamespace(
+                    capabilities=RoutingCapabilities(supported_a2a_backends=supported)
+                )
+                args = ServerArgs(
+                    model_path="dummy", moe_load_balancer_algorithm="custom"
+                )
+                with patch(
+                    "sglang.srt.eplb.moe_load_balancer_glue.get_moe_load_balancer_pipeline",
+                    return_value=pipeline,
+                ):
+                    self.assertEqual(
+                        _a2a_backend_overrides(args), {"moe_a2a_backend": "megamoe"}
+                    )
 
 
 class TestPrefillOnlyDisableKvCache(unittest.TestCase):

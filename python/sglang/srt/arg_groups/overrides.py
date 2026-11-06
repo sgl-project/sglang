@@ -1654,18 +1654,20 @@ _A2A_EP_SPANNING_BACKENDS = frozenset(
 def _a2a_backend_overrides(view: Any) -> dict:
 
     moe_a2a_backend = view.moe_a2a_backend
-    from sglang.srt.eplb.moe_load_balancer_glue import get_moe_load_balancer_pipeline
+    from sglang.srt.eplb.moe_load_balancer_glue import (
+        get_moe_load_balancer_pipeline,
+        resolve_pipeline_a2a_backend,
+    )
 
     pipeline = get_moe_load_balancer_pipeline(view.moe_load_balancer_algorithm)
     if pipeline is not None:
-        supported_backends = pipeline.capabilities.supported_a2a_backends
-        if supported_backends is not None and moe_a2a_backend not in supported_backends:
-            moe_a2a_backend = supported_backends[0]
+        moe_a2a_backend = resolve_pipeline_a2a_backend(pipeline, moe_a2a_backend)
+        if moe_a2a_backend != view.moe_a2a_backend:
             logger.warning(
                 "moe_a2a_backend is overridden to '%s' because the selected EvenMoE "
                 "pipeline supports %s.",
                 moe_a2a_backend,
-                supported_backends,
+                pipeline.capabilities.supported_a2a_backends,
             )
     if moe_a2a_backend != view.moe_a2a_backend:
         return {"moe_a2a_backend": moe_a2a_backend}
