@@ -48,10 +48,19 @@ class _Model:
 
 
 class _OracleRunner:
-    """Logits at block position p peak at targets[:, p + 1] (token shift)."""
+    """Logits at block position p peak at targets[:, p + 1] (token shift).
 
-    def __init__(self, targets, peaks, fail_on_forward=None):
+    Under bidirectional attention the peaks move to bidirectional_targets
+    when given, so tests can tell which attention produced a token.
+    """
+
+    def __init__(
+        self, targets, peaks, bidirectional_targets=None, fail_on_forward=None
+    ):
         self.targets = torch.tensor(targets)
+        self.bidirectional_targets = torch.tensor(
+            targets if bidirectional_targets is None else bidirectional_targets
+        )
         self.peaks = torch.as_tensor(peaks, dtype=torch.float32)
         self.model = _Model()
         self.forwards = []
@@ -61,11 +70,12 @@ class _OracleRunner:
         if self.fail_on_forward == len(self.forwards):
             raise RuntimeError("forward failed")
         self.forwards.append((self.model.causal, forward_batch.input_ids.clone()))
-        batch_size, width = self.targets.shape
+        targets = self.targets if self.model.causal else self.bidirectional_targets
+        batch_size, width = targets.shape
         block_size = width - 1
         logits = torch.zeros(batch_size, block_size, VOCAB)
         peak = self.peaks.expand(batch_size, block_size)
-        logits.scatter_(-1, self.targets[:, 1:].unsqueeze(-1), peak.unsqueeze(-1))
+        logits.scatter_(-1, targets[:, 1:].unsqueeze(-1), peak.unsqueeze(-1))
         return SimpleNamespace(
             logits_output=SimpleNamespace(full_logits=logits.view(-1, VOCAB)),
             can_run_graph=False,
@@ -128,8 +138,20 @@ class TestHierarchyBlockRun(unittest.TestCase):
         # Position 0 holds a prompt token, so the carried token is not used.
         self.assertEqual(next_ids[1].tolist(), targets[1][3:8])
         self.assertEqual(states, [18, 25])
-        self.assertEqual([c for c, _ in runner.forwards].count(True), 1)
+        # One causal forward seeds after the prompt tail, one writes the KV.
+        self.assertEqual([c for c, _ in runner.forwards].count(True), 2)
+        self.assertTrue(runner.forwards[0][0])
         self.assertTrue(runner.forwards[-1][0])
+
+    def test_first_token_after_prompt_tail_is_predicted_causally(self):
+        causal = [[1, 2, 3, 20, 21, 22, 23, 24, 25]]
+        bidirectional = [[1, 2, 3, 60, 21, 22, 23, 24, 25]]
+        runner = _OracleRunner(causal, HIGH, bidirectional_targets=bidirectional)
+        batch = _batch([[1, 2, 3] + [MASK] * 5])
+
+        _, next_ids, _, _, _ = _algorithm().run(runner, batch, [None])
+
+        self.assertEqual(next_ids[0].tolist(), causal[0][3:8])
 
     def test_literal_mask_in_prompt_is_not_denoised(self):
         targets = [[5, MASK, 6, 30, 31, 32, 33, 34, 35]]

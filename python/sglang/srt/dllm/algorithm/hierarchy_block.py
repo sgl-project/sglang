@@ -26,7 +26,9 @@ class HierarchyBlock(DllmAlgorithm):
     cache (and inserted into the radix tree) is what an autoregressive pass over
     the same tokens would write. The last position of that causal forward
     predicts the first token of the request's next block; that token is the
-    carried per-request state.
+    carried per-request state. The first generated token after a prompt tail
+    is also predicted causally, so every block starts from an autoregressive
+    token as in the reference implementation.
     """
 
     supported_architectures = ("Fast_dVLMForConditionalGeneration",)
@@ -55,14 +57,18 @@ class HierarchyBlock(DllmAlgorithm):
         algorithm_config = config.algorithm_config
         self.threshold = algorithm_config.get("threshold", 0.9)
         self.sub_block_size = algorithm_config.get("sub_block_size", 8)
-        self.token_shift = algorithm_config.get("token_shift", 1)
         if self.block_size % self.sub_block_size != 0:
             raise ValueError(
                 f"sub_block_size {self.sub_block_size} must divide "
                 f"block_size {self.block_size}"
             )
-        if self.token_shift not in (0, 1):
-            raise ValueError(f"token_shift must be 0 or 1, got {self.token_shift}")
+        # Seeding and inheritance read the logits at position i as the
+        # prediction for token i + 1, the only layout Fast-dVLM is trained with.
+        token_shift = algorithm_config.get("token_shift", 1)
+        if token_shift != 1:
+            raise ValueError(
+                f"HierarchyBlock requires token_shift 1, got {token_shift}"
+            )
 
     def run(
         self,
@@ -74,6 +80,7 @@ class HierarchyBlock(DllmAlgorithm):
         start_list = self._block_start_list(forward_batch)
         if algo_states is not None:
             self._seed_inherited_tokens(forward_batch, algo_states)
+        self._seed_after_prompt_tail(model_runner, forward_batch, start_list)
 
         model = model_runner.model
         if self._denoise_mask(forward_batch).any():
@@ -124,6 +131,26 @@ class HierarchyBlock(DllmAlgorithm):
             if first_is_mask[i] and inherited is not None:
                 input_ids[i, 0] = inherited
 
+    def _seed_after_prompt_tail(
+        self,
+        model_runner: ModelRunner,
+        forward_batch: ForwardBatch,
+        start_list: List[int],
+    ) -> None:
+        # Blocks are aligned to absolute positions, so the first generated
+        # block can start with committed prompt tokens.
+        rows = [i for i, start in enumerate(start_list) if 0 < start < self.block_size]
+        if not rows:
+            return
+        out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
+        full_logits = out.logits_output.full_logits
+        logits = full_logits.view(forward_batch.batch_size, self.block_size, -1)
+        row_ids = torch.tensor(rows, device=logits.device)
+        starts = torch.tensor([start_list[i] for i in rows], device=logits.device)
+        preds = logits[row_ids, starts - 1].argmax(dim=-1)
+        input_ids = forward_batch.input_ids.view(-1, self.block_size)
+        input_ids[row_ids, starts] = preds.to(input_ids.dtype)
+
     def _current_sub_block(self, is_mask: torch.Tensor) -> torch.Tensor:
         batch_size = is_mask.shape[0]
         num_sub_blocks = self.block_size // self.sub_block_size
@@ -138,9 +165,8 @@ class HierarchyBlock(DllmAlgorithm):
     ) -> None:
         batch_size = forward_batch.batch_size
         logits = full_logits.view(batch_size, self.block_size, -1)
-        if self.token_shift:
-            # Position i is predicted from the logits at position i - 1.
-            logits = torch.cat([logits[:, :1], logits[:, :-1]], dim=1)
+        # Position i is predicted from the logits at position i - 1.
+        logits = torch.cat([logits[:, :1], logits[:, :-1]], dim=1)
 
         candidates = self._current_sub_block(self._denoise_mask(forward_batch))
         preds = logits.argmax(dim=-1)
