@@ -430,7 +430,7 @@ class TestQwen35Mxfp4AgenticEvalMI35x(CustomTestCase):
             f"| workload | value |\n| --- | --- |\n"
             f"| parallelism | tp{TP_SIZE} / ep{EP_SIZE} |\n"
             f"| concurrency | {CONCURRENCY} |\n"
-            f"| kv offloading | {KV_OFFLOADING} |\n"
+            f"| kv offloading | {KV_OFFLOADING} |\n\n"
             f"| metric | value |\n| --- | --- |\n"
             f"| gsm8k questions | {EVAL_NUM_EXAMPLES} |\n"
             f"| gsm8k score | {metrics['score']:.3f} "
