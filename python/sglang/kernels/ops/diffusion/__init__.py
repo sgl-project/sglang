@@ -616,6 +616,12 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
         _CUDA,
     ),
     (
+        "diffusion.causal_unfold_nhwc",
+        KernelBackend.TRITON,
+        "layout.wan_causal_unfold_triton:causal_unfold_nhwc",
+        _HIP,
+    ),
+    (
         "diffusion.conv_bias_epilogue",
         KernelBackend.TRITON,
         "modulate.conv_bias_epilogue_triton:conv_bias_epilogue",
@@ -861,6 +867,7 @@ _EXPORTS: dict[str, str] = {
     "fused_scatter_to_padded": "layout.varlen_pack_pad_triton",
     "cat_pad_channels_last_3d": "layout.wan_causal_cache_triton",
     "dup_up3d_add": "layout.wan_causal_cache_triton",
+    "causal_unfold_nhwc": "layout.wan_causal_unfold_triton",
     "conv_bias_epilogue": "modulate.conv_bias_epilogue_triton",
     "can_use_conv_bias_epilogue": "modulate.conv_bias_epilogue_triton",
     "nearest_upsample_nhwc": "layout.nearest_upsample_nhwc_triton",
