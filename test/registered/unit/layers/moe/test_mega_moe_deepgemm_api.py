@@ -147,10 +147,18 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
     def test_decode_reserved_sms_applies_to_sm107_decode_only(self):
         max_num_sms = _UNCACHED_MEGA_MOE_MAX_NUM_SMS
         props = SimpleNamespace(multi_processor_count=212)
+        cases = ((107, False, 194), (107, True, 210), (100, False, 210))
         with patch.object(torch.cuda, "get_device_properties", return_value=props):
-            for device_sm, decode in ((107, 194), (100, 210)):
-                with self.subTest(device_sm=device_sm):
-                    with patch.object(mega_moe, "_device_sm", device_sm):
+            for device_sm, has_dual, decode in cases:
+                with self.subTest(device_sm=device_sm, has_dual=has_dual):
+                    with (
+                        patch.object(mega_moe, "_device_sm", device_sm),
+                        patch(
+                            "sglang.srt.layers.deep_gemm_wrapper.entrypoint."
+                            "has_tf32_hc_prenorm_gemm_dual",
+                            return_value=has_dual,
+                        ),
+                    ):
                         self.assertEqual(max_num_sms(False), 210)
                         self.assertEqual(max_num_sms(True), decode)
 

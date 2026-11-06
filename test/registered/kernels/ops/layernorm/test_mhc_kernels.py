@@ -278,6 +278,33 @@ def test_hopper_compensated_mhc(num_tokens):
         assert layer._hc_attn_bf16_parts is None
 
 
+@pytest.mark.parametrize("num_tokens", [32, 100, 256, 512, 1024])
+def test_deepgemm_prenorm_dual_matches_two_calls(num_tokens):
+    from unittest.mock import patch
+
+    from sglang.srt.layers.deep_gemm_wrapper import entrypoint
+
+    if not (
+        torch.cuda.is_available()
+        and torch.cuda.get_device_capability()[0] == 10
+        and entrypoint.has_tf32_hc_prenorm_gemm_dual()
+    ):
+        pytest.skip("SM10x DeepGEMM with tf32_hc_prenorm_gemm_dual")
+    torch.manual_seed(7 + num_tokens)
+    x = torch.randn(num_tokens, 20480, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(24, 20480, device="cuda") * 0.01
+    high = w.bfloat16().float()
+    low = (w - high).contiguous()
+    scale = torch.tensor([0.5, 0.25, 0.25], device="cuda")
+    base = torch.randn(24, device="cuda")
+    args = (x, (high, low), scale, base, 20, 1e-6, 1e-6)
+    dual = mhc.hc_mix_stats_sinkhorn_deepgemm(*args)
+    with patch.object(entrypoint, "has_tf32_hc_prenorm_gemm_dual", return_value=False):
+        two_calls = mhc.hc_mix_stats_sinkhorn_deepgemm(*args)
+    for a, b in zip(dual, two_calls):
+        assert torch.equal(a, b)
+
+
 @pytest.mark.parametrize("num_tokens", [1, 4, 64, 4096])
 def test_hopper_combine_norm(num_tokens):
     from sglang.srt.layers.layernorm import RMSNorm

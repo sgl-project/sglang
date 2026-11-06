@@ -67,8 +67,19 @@ def _mega_moe_mma_type(experts) -> str:
     return "fp8xfp8" if experts.w13_weight.dtype == torch.float8_e4m3fn else "fp8xfp4"
 
 
-# Decode/target-verify on sm107: SMs left for the mHC stats stream beside MegaMoE.
+# Decode/target-verify on sm107: SMs left for the mHC stats stream beside MegaMoE,
+# unless DeepGEMM has the one-pass prenorm GEMM that fits in the 2 spare SMs.
 _MEGA_MOE_SM107_DECODE_RESERVED_SMS = 18
+
+
+def _sm107_decode_reserved_sms() -> int:
+    from sglang.srt.layers.deep_gemm_wrapper.entrypoint import (
+        has_tf32_hc_prenorm_gemm_dual,
+    )
+
+    if has_tf32_hc_prenorm_gemm_dual():
+        return 0
+    return _MEGA_MOE_SM107_DECODE_RESERVED_SMS
 
 
 @functools.cache
@@ -83,7 +94,7 @@ def _mega_moe_max_num_sms(decode_like: bool) -> Optional[int]:
     num_sms = torch.cuda.get_device_properties(device="cuda").multi_processor_count
     reserved_num_sms = max(
         envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS.get(),
-        _MEGA_MOE_SM107_DECODE_RESERVED_SMS if decode_like and _device_sm == 107 else 0,
+        _sm107_decode_reserved_sms() if decode_like and _device_sm == 107 else 0,
     )
     return max(2, num_sms - reserved_num_sms)
 
