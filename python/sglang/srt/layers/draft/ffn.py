@@ -228,8 +228,9 @@ class DraftMoE(nn.Module):
             out = out + shared
         return reduce_moe_output(out).view_as(hidden_states)
 
-    def owns(self, name: str) -> bool:
-        """Whether a checkpoint tensor named relative to the layer's mlp belongs here."""
+    @staticmethod
+    def owns(name: str) -> bool:
+        """Whether a checkpoint tensor named relative to the layer's mlp is an MoE one."""
         return name.startswith(("gate.", "experts.", "shared_expert"))
 
     def load_weight(self, name: str, loaded: torch.Tensor) -> None:
