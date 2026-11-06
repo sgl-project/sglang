@@ -1,9 +1,10 @@
 """Fused MXFP4 MLA q absorb + RoPE + KV-cache write against the split path.
 
-On gfx950 decode of up to 256 tokens, ``forward_absorb_rocm_core`` replaces
-the MXFP4 branch of ``rocm_absorb_q_bmm`` followed by
-``_fused_rope_cat_and_cache`` with one ``_fused_bmm_rope_cat_and_cache`` launch. Both paths must hand attention
-the same q and leave the same KV-cache bytes, at the out_cache_loc slots only.
+On gfx950 graph decode of up to 256 tokens, ``forward_absorb_rocm_core``
+replaces the MXFP4 branch of ``rocm_absorb_q_bmm`` followed by
+``_fused_rope_cat_and_cache`` with one ``_fused_bmm_rope_cat_and_cache``
+launch. Both paths must hand attention the same q (within one FP8 step on an
+FP8 cache) and leave the same KV-cache bytes, at the out_cache_loc slots only.
 """
 
 import unittest

@@ -511,6 +511,7 @@ def _can_fuse_bmm_rope_cat_and_cache(
     attn: DeepseekV2AttentionMLA,
     *,
     forward_mode: ForwardMode,
+    is_capture_mode: bool,
     num_tokens: int,
 ) -> bool:
     """Whether one AITER kernel can do the q absorb, the RoPE and the KV write.
@@ -520,12 +521,17 @@ def _can_fuse_bmm_rope_cat_and_cache(
     well under half the CUs, so a fused grid runs them side by side instead of
     back to back. Every term below keeps the fused kernel to inputs it implements
     -- a branch one of those two would otherwise have taken, or a shape it tiles --
-    except the MXFP4 token bound, which is a measured speed term. FP8 and MXFP4
-    ``w_kc`` each have their own kernel and terms.
+    except two MXFP4 scope terms. FP8 and MXFP4 ``w_kc`` each have their own
+    kernel and terms.
+
+    MXFP4 fuses only while capturing CUDA graphs, and only for up to 256 tokens:
+    capture-only is the scope validated end to end, and the token bound is a
+    measured speed term. Eager decode and larger captured batches run split.
 
     With an FP8 Q the MXFP4 kernel is not bit-exact: it rounds the BMM straight
     to FP8 where the split path rounds through BF16 first, which moves about 1%
-    of those values by one FP8 step. The KV-cache bytes match.
+    of those values by one FP8 step. The KV-cache bytes match. So eager and
+    graph decode of one batch are not bit-identical.
 
     The caller adds one more term it alone can see: DCP q replication splits the
     absorb across a different weight, which this kernel does not carry.
@@ -551,7 +557,10 @@ def _can_fuse_bmm_rope_cat_and_cache(
         )
     if attn.w_kc.dtype == torch.uint8:
         return _can_fuse_mxfp4_bmm_rope_cat_and_cache(
-            attn, forward_mode=forward_mode, num_tokens=num_tokens
+            attn,
+            forward_mode=forward_mode,
+            is_capture_mode=is_capture_mode,
+            num_tokens=num_tokens,
         )
     return False
 
@@ -565,12 +574,16 @@ def _can_fuse_mxfp4_bmm_rope_cat_and_cache(
     attn: DeepseekV2AttentionMLA,
     *,
     forward_mode: ForwardMode,
+    is_capture_mode: bool,
     num_tokens: int,
 ) -> bool:
-    """MXFP4 terms: aiter-backend decode at shapes the kernel tiles."""
+    """MXFP4 terms: aiter-backend graph decode of up to 256 tokens at shapes the
+    kernel tiles."""
     return (
-        forward_mode.is_decode_or_idle()
-        # Shape only: eager and graph decode of one batch must take one path.
+        # Graph decode is the scope validated end to end; eager decode runs split.
+        is_capture_mode
+        and forward_mode.is_decode_or_idle()
+        # Speed only: larger captured batches run faster split.
         and num_tokens <= _FUSED_FP4_BMM_ROPE_CACHE_MAX_TOKENS
         and attn.current_attention_backend == "aiter"
         and not attn.use_dsa
@@ -837,6 +850,7 @@ class DeepseekMLARocmForwardMixin:
             and _can_fuse_bmm_rope_cat_and_cache(
                 self,
                 forward_mode=forward_batch.forward_mode,
+                is_capture_mode=get_is_capture_mode(),
                 num_tokens=q_nope.shape[0],
             )
         )

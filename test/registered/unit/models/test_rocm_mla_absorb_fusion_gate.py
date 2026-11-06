@@ -40,9 +40,13 @@ _MXFP4_MAX_TOKENS = forward_mla_rocm._FUSED_FP4_BMM_ROPE_CACHE_MAX_TOKENS
 
 
 def _CAN_FUSE(attn):
-    # FP8 terms ignore the forward mode and token count; the caller gates the mode.
+    # FP8 terms ignore the forward mode, capture state and token count; the caller
+    # gates the mode.
     return _CAN_FUSE_GATE(
-        attn, forward_mode=ForwardMode.EXTEND, num_tokens=_MXFP4_MAX_TOKENS + 1
+        attn,
+        forward_mode=ForwardMode.EXTEND,
+        is_capture_mode=False,
+        num_tokens=_MXFP4_MAX_TOKENS + 1,
     )
 
 
@@ -184,10 +188,11 @@ class TestMxfp4ProjectionFusionGate(CustomTestCase):
         ):
             yield
 
-    def _can_fuse(self, attn, forward_batch, num_tokens=1):
+    def _can_fuse(self, attn, forward_batch, is_capture_mode=True, num_tokens=1):
         return _CAN_FUSE_GATE(
             attn,
             forward_mode=forward_batch.forward_mode,
+            is_capture_mode=is_capture_mode,
             num_tokens=num_tokens,
         )
 
@@ -237,7 +242,7 @@ class TestMxfp4ProjectionFusionGate(CustomTestCase):
             ):
                 self.assertFalse(self._can_fuse(self._make_attn(), forward_batch))
 
-    def test_projection_fusion_gate_targets_aiter_decode(self):
+    def test_projection_fusion_gate_targets_aiter_graph_decode(self):
         attn = self._make_attn()
         forward_batch = self._make_decode_batch()
 
@@ -247,20 +252,31 @@ class TestMxfp4ProjectionFusionGate(CustomTestCase):
             attn.current_attention_backend = "flashinfer"
             self.assertFalse(self._can_fuse(attn, forward_batch))
 
-    def test_fuses_up_to_the_measured_token_bound(self):
-        """Above the bound the fused grid is slower than the split launches."""
+    def test_fuses_only_graph_decode_up_to_the_token_bound(self):
+        """Eager decode keeps the split path at every size: only graph decode is
+        validated end to end. Above the bound the fused grid is slower than the
+        split launches, so larger captured batches run split too."""
         forward_batch = self._make_decode_batch()
         with self._aiter_gfx95_env():
-            self.assertTrue(
-                self._can_fuse(
-                    self._make_attn(), forward_batch, num_tokens=_MXFP4_MAX_TOKENS
-                )
-            )
-            self.assertFalse(
-                self._can_fuse(
-                    self._make_attn(), forward_batch, num_tokens=_MXFP4_MAX_TOKENS + 1
-                )
-            )
+            for is_capture_mode, num_tokens, fused in (
+                (False, 1, False),
+                (False, _MXFP4_MAX_TOKENS, False),
+                (True, 1, True),
+                (True, _MXFP4_MAX_TOKENS, True),
+                (True, _MXFP4_MAX_TOKENS + 1, False),
+            ):
+                with self.subTest(
+                    is_capture_mode=is_capture_mode, num_tokens=num_tokens
+                ):
+                    self.assertEqual(
+                        self._can_fuse(
+                            self._make_attn(),
+                            forward_batch,
+                            is_capture_mode=is_capture_mode,
+                            num_tokens=num_tokens,
+                        ),
+                        fused,
+                    )
 
     def test_projection_fusion_gate_requires_power_of_two_shapes(self):
         """fused_fp4_bmm_rope_cat_and_cache_mla tiles kv_lora_rank and
