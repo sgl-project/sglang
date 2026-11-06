@@ -1,6 +1,7 @@
 //! Routing integration tests
 
 pub mod cache_aware_backward_compat_test;
+pub mod chat_extension_fields_test;
 pub mod header_forwarding_test;
 pub mod load_balancing_test;
 pub mod manual_routing_test;

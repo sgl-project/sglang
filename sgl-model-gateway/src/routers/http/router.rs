@@ -195,6 +195,7 @@ impl Router {
         &self,
         headers: Option<&HeaderMap>,
         typed_req: &T,
+        body_override: Option<&serde_json::Value>,
         route: &'static str,
         model_id: Option<&str>,
     ) -> Response {
@@ -219,7 +220,15 @@ impl Router {
             // operation per attempt
             |_: u32| async {
                 let res = self
-                    .route_typed_request_once(headers, typed_req, route, model_id, is_stream, &text)
+                    .route_typed_request_once(
+                        headers,
+                        typed_req,
+                        body_override,
+                        route,
+                        model_id,
+                        is_stream,
+                        &text,
+                    )
                     .await;
 
                 // Need to be outside `route_typed_request_once` because that function has multiple return paths
@@ -270,10 +279,12 @@ impl Router {
         response
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn route_typed_request_once<T: GenerationRequest + serde::Serialize + Clone>(
         &self,
         headers: Option<&HeaderMap>,
         typed_req: &T,
+        body_override: Option<&serde_json::Value>,
         route: &'static str,
         model_id: Option<&str>,
         is_stream: bool,
@@ -308,7 +319,15 @@ impl Router {
         let headers = Some(&headers_with_trace);
 
         let response = self
-            .send_typed_request(headers, typed_req, route, &worker, is_stream, load_guard)
+            .send_typed_request(
+                headers,
+                typed_req,
+                body_override,
+                route,
+                &worker,
+                is_stream,
+                load_guard,
+            )
             .await;
 
         events::RequestReceivedEvent {}.emit();
@@ -484,10 +503,12 @@ impl Router {
     }
 
     // Send typed request directly without conversion
+    #[allow(clippy::too_many_arguments)]
     async fn send_typed_request<T: serde::Serialize>(
         &self,
         headers: Option<&HeaderMap>,
         typed_req: &T,
+        body_override: Option<&serde_json::Value>,
         route: &'static str,
         worker: &Arc<dyn Worker>,
         is_stream: bool,
@@ -511,14 +532,17 @@ impl Router {
                 }
             };
 
-            let mut json_val = match serde_json::to_value(typed_req) {
-                Ok(j) => j,
-                Err(e) => {
-                    return error::bad_request(
-                        "serialization_failed",
-                        format!("Convert into serde_json::Value failed: {}", e),
-                    );
-                }
+            let mut json_val = match body_override {
+                Some(value) => value.clone(),
+                None => match serde_json::to_value(typed_req) {
+                    Ok(j) => j,
+                    Err(e) => {
+                        return error::bad_request(
+                            "serialization_failed",
+                            format!("Convert into serde_json::Value failed: {}", e),
+                        );
+                    }
+                },
             };
 
             if let Some(map) = json_val.as_object_mut() {
@@ -541,6 +565,12 @@ impl Router {
             self.client
                 .post(format!("{}{}", worker_url_prefix, route))
                 .json(&json_val)
+        } else if let Some(value) = body_override {
+            // Forward the pre-serialized body (typed request plus preserved
+            // extension fields) instead of re-serializing the typed request.
+            self.client
+                .post(format!("{}{}", worker_url, route))
+                .json(value)
         } else {
             self.client
                 .post(format!("{}{}", worker_url, route))
@@ -752,7 +782,7 @@ impl RouterTrait for Router {
         body: &GenerateRequest,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/generate", model_id)
+        self.route_typed_request(headers, body, None, "/generate", model_id)
             .await
     }
 
@@ -762,8 +792,41 @@ impl RouterTrait for Router {
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/chat/completions", model_id)
+        self.route_typed_request(headers, body, None, "/v1/chat/completions", model_id)
             .await
+    }
+
+    async fn route_chat_with_extensions(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ChatCompletionRequest,
+        model_id: Option<&str>,
+        extensions: &serde_json::Map<String, serde_json::Value>,
+    ) -> Response {
+        // Merge the preserved extension fields (e.g. `cache_salt`, dropped by
+        // openai-protocol 1.0.0's `ChatCompletionRequest` on deserialization)
+        // into the re-serialized request body forwarded to the worker.
+        // See https://github.com/sgl-project/sglang/issues/48793
+        let body_override = if extensions.is_empty() {
+            None
+        } else {
+            match serde_json::to_value(body) {
+                Ok(value) => Some(crate::routers::merge_unknown_request_fields(
+                    value, extensions,
+                )),
+                // Serialization of a deserialized struct cannot fail in
+                // practice; fall back to typed-only forwarding if it does.
+                Err(_) => None,
+            }
+        };
+        self.route_typed_request(
+            headers,
+            body,
+            body_override.as_ref(),
+            "/v1/chat/completions",
+            model_id,
+        )
+        .await
     }
 
     async fn route_completion(
@@ -772,7 +835,7 @@ impl RouterTrait for Router {
         body: &CompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/completions", model_id)
+        self.route_typed_request(headers, body, None, "/v1/completions", model_id)
             .await
     }
 
@@ -782,7 +845,7 @@ impl RouterTrait for Router {
         body: &ResponsesRequest,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/responses", model_id)
+        self.route_typed_request(headers, body, None, "/v1/responses", model_id)
             .await
     }
 
@@ -807,7 +870,7 @@ impl RouterTrait for Router {
         body: &EmbeddingRequest,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/embeddings", model_id)
+        self.route_typed_request(headers, body, None, "/v1/embeddings", model_id)
             .await
     }
 
@@ -817,7 +880,7 @@ impl RouterTrait for Router {
         body: &ClassifyRequest,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/classify", model_id)
+        self.route_typed_request(headers, body, None, "/v1/classify", model_id)
             .await
     }
 
@@ -828,7 +891,7 @@ impl RouterTrait for Router {
         model_id: Option<&str>,
     ) -> Response {
         let response = self
-            .route_typed_request(headers, body, "/v1/rerank", model_id)
+            .route_typed_request(headers, body, None, "/v1/rerank", model_id)
             .await;
         if response.status().is_success() {
             match Self::build_rerank_response(body, response).await {
