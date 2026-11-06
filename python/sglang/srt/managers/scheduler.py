@@ -5309,6 +5309,15 @@ class Scheduler(
             payload = RelayPayload(bonus_tokens=batch_result.next_token_ids)
         else:
             return
+        if self.spec_algorithm.is_dflash_family() and any(
+            req.sampling_params.repetition_penalty != 1.0 for req in batch.reqs
+        ):
+            # Do not wait for process_batch_result: under overlap Req.output_ids
+            # still lacks this block when the next forward snapshot is built.
+            payload.repetition_penalty_tokens = batch_result.next_token_ids.reshape(
+                len(batch.reqs), -1
+            )
+            payload.repetition_penalty_lens = batch_result.accept_lens
         if batch.beam_tail is not None:
             # The worker sliced the tail off before sampling, so sampled tokens
             # cover only the reqs-aligned rows; the coordinator relays the rest.
