@@ -130,6 +130,8 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
     supports_transformers_backend = True
     generates_input_ids_from_raw_prompt = True
     artifact_modality = Modality.IMAGE
+    # qwen_vl_utils composites alpha onto white; the HF processor alone would drop it.
+    rgb_conversion = "white"
     models = [
         Qwen2VLForConditionalGeneration,
         Qwen2_5_VLForConditionalGeneration,

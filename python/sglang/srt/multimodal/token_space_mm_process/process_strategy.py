@@ -58,8 +58,11 @@ class TokenSpaceProcessStrategy:
     discard_alpha_channel: bool = True
     # Where a video request decodes and preprocesses; mm_process_config overrides it.
     video_preprocessing_device: str | None = None
+    # The image loader's defaults for this model; mm_process_config overrides them per server.
     # False decodes JPEGs with PIL even on CUDA; nvJPEG pixels differ from PIL's.
     gpu_image_decode: bool = True
+    # "convert" drops alpha, "white" composites it onto white as qwen_vl_utils does, "smart" picks a background.
+    rgb_conversion: str = "convert"
 
     def __init__(self, hf_config, processor, *, mm_process_config=None):
         # `processor` is the shared original; read config from it here, never keep it.

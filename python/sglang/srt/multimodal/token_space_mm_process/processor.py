@@ -17,7 +17,12 @@ from sglang.srt.multimodal.processors.processor_config import MultimodalProcesso
 from sglang.srt.multimodal.token_space_mm_process.expansion import (
     expand_token_placeholders,
 )
-from sglang.srt.utils import ImageData, VideoData
+from sglang.srt.utils import (
+    ImageData,
+    VideoData,
+    resolve_gpu_image_decode,
+    resolve_rgb_conversion,
+)
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 from sglang.version import __version__ as sglang_version
 
@@ -70,10 +75,7 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
         return type(
             f"{cls.__name__}[{strategy_class.__name__}]",
             (cls,),
-            {
-                "strategy_class": strategy_class,
-                "gpu_image_decode": strategy_class.gpu_image_decode,
-            },
+            {"strategy_class": strategy_class},
         )
 
     def __init__(
@@ -105,6 +107,13 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
         )
         self._video_preprocessing_device = self.mm_process_config.get(
             "video_preprocessing_device", strategy_class.video_preprocessing_device
+        )
+        # The strategy's defaults replace the mixin's class attributes; the config still overrides them.
+        self.gpu_image_decode = resolve_gpu_image_decode(
+            self.mm_process_config, strategy_class.gpu_image_decode
+        )
+        self.rgb_conversion = resolve_rgb_conversion(
+            self.mm_process_config, strategy_class.rgb_conversion
         )
 
     def _worker_thread_initializer(self):
@@ -297,6 +306,8 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
             audio_sample_rate=self.strategy.audio_sample_rate,
             discard_alpha_channel=self.strategy.discard_alpha_channel,
             video_decode_device=request_options["video_device"],
+            gpu_image_decode=self.gpu_image_decode,
+            rgb_conversion=self.rgb_conversion,
         )
         # Missed items are in modality order, as the loaded lists are.
         loaded_items = [
