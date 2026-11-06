@@ -7,11 +7,20 @@ import logging
 import os
 from typing import Any
 
+from sglang.srt.arg_groups.model_override_base import (
+    attention_backends_of,
+    mamba_extra_buffer_of,
+    model_config_of,
+    resolved_view,
+    resolving_view,
+    use_mla_backend,
+)
 from sglang.srt.arg_groups.overrides import (
     _attention_backend_default,
     _attention_backend_fa3_fp8_fallback,
     _attention_backend_platform_fallbacks,
     _cutedsl_prefill_backend_fill,
+    _deterministic_aiter_prefill_page_size,
     _deterministic_allreduce_fusion_disable,
     _deterministic_attention_backend,
     _deterministic_rocm_rccl_check,
@@ -21,14 +30,8 @@ from sglang.srt.arg_groups.overrides import (
     _intel_xpu_page_constraint,
     _mla_backend_page_constraints,
     _mla_kv_cache_dtype_checks,
-    attention_backends_of,
     declare_resolution,
-    mamba_extra_buffer_of,
-    model_config_of,
-    resolved_view,
-    resolving_view,
     run_post_process_pass,
-    use_mla_backend,
 )
 from sglang.srt.arg_groups.platform_hook import (
     handle_sail_attention_backend_compatibility,
@@ -285,6 +288,8 @@ def handle_attention_backend_compatibility(server_args: Any):
         _check_xpu_dcp(server_args, model_config)
 
     run_post_process_pass(server_args, _intel_xpu_page_constraint)
+
+    run_post_process_pass(server_args, _deterministic_aiter_prefill_page_size)
 
 
 def handle_linear_attn_backend(server_args: Any):
@@ -587,7 +592,7 @@ def handle_multi_item_scoring(server_args: Any):
 
 
 def handle_deterministic_inference(server_args: Any):
-    from sglang.srt.server_args import (
+    from sglang.srt.arg_groups.choices import (
         RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND,
     )
 

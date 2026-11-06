@@ -13,7 +13,7 @@ from sglang.srt.disaggregation.base.conn import (
     KVPoll,
     KVTransferMetric,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
 
@@ -78,7 +78,7 @@ class FakeKVSender(BaseKVSender):
         return self.poll()
 
     def _check_waiting_timeout(self) -> Optional[KVPoll]:
-        # A send() that never comes must not pin the prefill inflight queue forever.
+        # A send() that never comes must not pin the prefill transfer queue forever.
         # No deadline before init(): the request is still in the bootstrap queue.
         if not self.inited:
             return None

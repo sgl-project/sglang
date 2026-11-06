@@ -14,7 +14,7 @@ import sys
 import tempfile
 from dataclasses import field
 from enum import Enum
-from typing import Any, List, Literal, Optional
+from typing import Any, List, Optional
 
 import addict
 import yaml
@@ -610,16 +610,9 @@ class ServerArgs(DisaggServerArgsMixin):
     # Disaggregation (pool mode only — launched via launch_pool_disagg_server())
     disagg_role: RoleType = RoleType.MONOLITHIC
     disagg_timeout: int = 3600
-    disagg_downstream_wait_timeout: int = 1800
     disagg_dispatch_policy: str = "round_robin"
     disagg_mode: bool = False
-    disagg_instance_id: int = 0
-    disagg_max_slots_per_instance: int = 8
-    disagg_transfer_redundancy: float = 1.25
-    disagg_role_device: Literal["auto", "cpu", "cuda"] = "auto"
-    disagg_transfer_backend: Literal["auto", "mock", "mooncake"] = "auto"
     disagg_transfer_pool_size: int = 256 * 1024 * 1024
-    disagg_transfer_pin_memory: Literal["auto", "off", "required"] = "auto"
     disagg_p2p_hostname: str = "127.0.0.1"
     disagg_ib_device: str | None = None
     disagg_server_addr: str | None = None
@@ -655,7 +648,7 @@ class ServerArgs(DisaggServerArgsMixin):
 
     # SGLang backend for encoder stage
     srt_encoder_url: str | None = None
-    srt_encoder_connect_timeout: int = 3.05
+    srt_encoder_connect_timeout: float = 3.05
     srt_encoder_timeout: int = 100
 
     # SGLang server for PE model inference
@@ -2384,6 +2377,16 @@ class ServerArgs(DisaggServerArgsMixin):
             help="Configuration for the attention backend. Can be a JSON string, a path to a JSON/YAML file, or key=value pairs.",
         )
         parser.add_argument(
+            "--enable-attention-backend-autotune",
+            action=StoreBoolean,
+            default=ServerArgs.enable_attention_backend_autotune,
+            help=(
+                "For native pipelines, time the compatible attention backends on "
+                "each layer's first large enough input and keep one only when it "
+                "is numerically compatible and faster. Validated on SM90 and SM12x."
+            ),
+        )
+        parser.add_argument(
             "--component-attention-backends",
             type=str,
             default=None,
@@ -2612,11 +2615,6 @@ class ServerArgs(DisaggServerArgsMixin):
             help="Path to a text file containing prompts (one per line) for batch processing",
         )
 
-        parser.add_argument(
-            "--mask-strategy-file-path",
-            type=str,
-            help="Path to mask strategy JSON file for STA",
-        )
         parser.add_argument(
             "--enable-torch-compile",
             action=StoreBoolean,
@@ -3034,7 +3032,7 @@ class ServerArgs(DisaggServerArgsMixin):
                 "('modelopt', 'modelopt_fp8', 'modelopt_fp4', 'mxfp8', "
                 "'mxfp4_npu', 'modelslim') require a pre-quantized checkpoint. "
                 "Note: 'mxfp4' targets ROCm + MI350+ (gfx95x); "
-                "'mxfp4_npu' / 'mxfp8' target Ascend NPU (A5 series for mxfp4_npu)."
+                "'mxfp4_npu' / 'mxfp8' target Ascend NPU (Ascend 950 series for mxfp4_npu)."
             ),
         )
         parser.add_argument(
@@ -3334,7 +3332,8 @@ class ServerArgs(DisaggServerArgsMixin):
         )
         parser.add_argument(
             "--srt-encoder-connection-timeout",
-            type=int,
+            dest="srt_encoder_connect_timeout",
+            type=float,
             default=ServerArgs.srt_encoder_connect_timeout,
             help="Timeout (in seconds) for establishing the initial TCP connection to the SGLang encoder server. "
             "Default value is 3.05.",
@@ -4227,45 +4226,12 @@ class ServerArgs(DisaggServerArgsMixin):
 
 @dataclasses.dataclass
 class PortArgs:
-    # The ipc filename for scheduler (rank 0) to receive inputs from tokenizer (zmq)
-    scheduler_input_ipc_name: str
-
-    # The port for nccl initialization (torch.dist)
-    nccl_port: int
-
-    # The ipc filename for rpc call between Engine and Scheduler
-    rpc_ipc_name: str
-
-    # The ipc filename for Scheduler to send metrics
-    metrics_ipc_name: str
-
     # Master port for distributed inference
     master_port: int | None = None
 
     @staticmethod
-    def from_server_args(
-        server_args: ServerArgs, dp_rank: Optional[int] = None
-    ) -> "PortArgs":
-        if server_args.nccl_port is None:
-            nccl_port = server_args.scheduler_port + random.randint(100, 1000)
-            while True:
-                if is_port_available(nccl_port):
-                    break
-                if nccl_port < 60000:
-                    nccl_port += 42
-                else:
-                    nccl_port -= 43
-        else:
-            nccl_port = server_args.nccl_port
-
-        # Normal case, use IPC within a single node
-        return PortArgs(
-            scheduler_input_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
-            nccl_port=nccl_port,
-            rpc_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
-            metrics_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
-            master_port=server_args.master_port,
-        )
+    def from_server_args(server_args: ServerArgs) -> "PortArgs":
+        return PortArgs(master_port=server_args.master_port)
 
 
 _global_server_args = None
