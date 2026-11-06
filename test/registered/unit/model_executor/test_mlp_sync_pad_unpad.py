@@ -21,7 +21,7 @@ from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sglang.srt.managers.scheduler_components.dp_attn import MLPSyncBatchInfo
 from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
 )
@@ -32,6 +32,7 @@ from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
 from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
     EAGLEDraftExtendCudaGraphRunner,
 )
+from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -290,6 +291,42 @@ class TestMlpSyncPadUnpad(CustomTestCase):
         # sample() derives prefill sampling positions from seq_lens - 1, so the
         # row count must match the real request count.
         self.assertEqual((fb.seq_lens - 1).shape[0], fb.batch_size)
+
+    def test_draft_extend_post_forward_keeps_full_capture_rows(self):
+        # A chain MTP draft's prefill extend captures one hidden row per token
+        # and feeds all of them to its next step; LAST keeps one per request.
+        hidden = torch.randn(7, 4)
+        for mode, rows in ((CaptureHiddenMode.FULL, 7), (CaptureHiddenMode.LAST, 2)):
+            with self.subTest(mode=mode):
+                fb = ForwardBatch(
+                    forward_mode=ForwardMode.EXTEND,
+                    batch_size=2,
+                    input_ids=torch.arange(7),
+                    req_pool_indices=torch.tensor([1, 2]),
+                    seq_lens=torch.tensor([3, 4]),
+                    out_cache_loc=torch.arange(7),
+                    seq_lens_sum=7,
+                    positions=torch.tensor([0, 1, 2, 0, 1, 2, 3]),
+                    seq_lens_cpu=torch.tensor([3, 4]),
+                    extend_seq_lens=torch.tensor([3, 4], dtype=torch.int32),
+                    lora_ids=[None, None],
+                    capture_hidden_mode=mode,
+                    spec_info=EagleDraftExtendInput(
+                        hidden_states=hidden, num_tokens_per_req=1
+                    ),
+                )
+                fb._original_batch_size = fb.batch_size
+                fb._pad_inputs_to_size(_mock_model_runner(), num_tokens=10, bs=2)
+
+                logits_output = SimpleNamespace(
+                    next_token_logits=torch.randn(2, 16),
+                    hidden_states=torch.cat([hidden, torch.zeros(3, 4)]),
+                    last_hidden_states=None,
+                )
+                fb.post_forward_mlp_sync_batch(logits_output)
+
+                self.assertEqual(logits_output.next_token_logits.shape[0], 2)
+                torch.testing.assert_close(logits_output.hidden_states, hidden[:rows])
 
     def test_draft_extend_dummy_request_pads_cpu_and_gpu_lens(self):
         spec_info = MagicMock()

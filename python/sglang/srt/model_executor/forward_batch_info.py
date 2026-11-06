@@ -2186,7 +2186,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                         :bs
                     ]
                 if logits_output.hidden_states is not None:
-                    logits_output.hidden_states = logits_output.hidden_states[:bs]
+                    # FULL capture has one row per token, and a chain MTP draft
+                    # feeds all of them to its next step.
+                    num_rows = (
+                        self._original_num_tokens
+                        if self.capture_hidden_mode is not None
+                        and self.capture_hidden_mode.is_full()
+                        else bs
+                    )
+                    logits_output.hidden_states = logits_output.hidden_states[:num_rows]
             elif self.forward_mode.is_draft_extend_v2():  # draft extend_v2
                 bs = bs * self.spec_info.num_tokens_per_req
                 if logits_output.next_token_logits is not None:
