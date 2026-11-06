@@ -292,6 +292,9 @@ class ForwardMetadata:
     cprr_empty_rows: Optional[torch.Tensor] = None
     # paged_attention_ragged grid size; None means max_num_partitions.
     decode_num_partitions: Optional[int] = None
+    # Unified target verify KV lengths (seq_lens + draft tokens), computed once
+    # per batch; graph replay refills preallocated storage.
+    verify_seqlen_k: Optional[torch.Tensor] = None
 
 
 def _build_paged_kv_view(
@@ -692,6 +695,28 @@ class AiterAttnBackend(AttentionBackend):
             and not self.use_mla
             and self.topk == 1
             and get_bool_env_var("SGLANG_AITER_UNIFIED_VERIFY", "1")
+        )
+
+        # Muse Spark TP8 shapes on gfx950: head_dim 64, GQA 8, SWA KV pool, unified
+        # Triton attention. Extend and target verify take the Muse fast paths below
+        # (each behind its own SGLANG_MUSE_* switch); decode is unchanged.
+        self.use_muse_attention_paths = (
+            is_gfx95_supported()
+            and not self.use_mla
+            and self.use_triton_unified_attention
+            and self.use_sliding_window_kv_pool
+            and not self.kv_cache_is_vectorized_5d
+            and self.head_dim == 64
+            and self.num_head == 8 * self.num_kv_head
+        )
+        self.muse_reuse_extend_metadata = (
+            self.use_muse_attention_paths
+            and envs.SGLANG_MUSE_REUSE_EXTEND_METADATA.get()
+        )
+        self.muse_reuse_verify_lengths = (
+            self.use_muse_attention_paths
+            and self._use_unified_verify
+            and envs.SGLANG_MUSE_REUSE_VERIFY_LENGTHS.get()
         )
 
         # aiter kernel related initialization
@@ -1371,10 +1396,19 @@ class AiterAttnBackend(AttentionBackend):
         dim to the next power of two and reads the same paged KV the decode path
         reads, so one kernel serves prefill and decode."""
         bs = forward_batch.batch_size
-        max_kv_len = int(forward_batch.seq_lens_cpu.max().item())
-        page_table, swa_page_table = self._build_extend_unified_page_table(
-            bs, forward_batch.seq_lens, forward_batch.req_pool_indices, max_kv_len
-        )
+        if self.muse_reuse_extend_metadata and self.page_size > 1:
+            # init_forward_metadata already built both block page tables, and the
+            # prefill updater wrote this batch's query offsets before any layer ran.
+            fm = self.forward_metadata
+            page_table = fm.kv_indices
+            swa_page_table = fm.swa_page_table
+            cu_seqlens_q = fm.qo_indptr
+            assert page_table.ndim == 2 and cu_seqlens_q is not None
+        else:
+            max_kv_len = int(forward_batch.seq_lens_cpu.max().item())
+            page_table, swa_page_table = self._build_extend_unified_page_table(
+                bs, forward_batch.seq_lens, forward_batch.req_pool_indices, max_kv_len
+            )
 
         # Build cu_seqlens_q from this batch's extend lengths. The standard
         # prefill metadata path leaves self.qo_indptr unset (qo_indptr=None in
@@ -2693,6 +2727,12 @@ class AiterAttnBackend(AttentionBackend):
                         max_extend_len=max_q_len,
                         swa_page_table=swa_page_table,
                         swa_out_cache_loc=swa_out_cache_loc,
+                        # Same lengths forward_extend would add per layer.
+                        verify_seqlen_k=(
+                            forward_batch.seq_lens[:bs] + draft_num
+                            if self.muse_reuse_verify_lengths
+                            else None
+                        ),
                     )
                 else:
                     qo_indptr = torch.arange(
@@ -3176,6 +3216,12 @@ class AiterAttnBackend(AttentionBackend):
                 dtype=torch.int64,
                 device=self.device,
             )
+        if self.muse_reuse_verify_lengths:
+            # Verify KV lengths, refilled by replay preparation; every layer of the
+            # captured graph reads this storage.
+            self.cuda_graph_verify_seqlen_k = torch.empty(
+                max_bs, dtype=torch.int64, device=self.device
+            )
 
     def _apply_cuda_graph_metadata(
         self,
@@ -3387,13 +3433,37 @@ class AiterAttnBackend(AttentionBackend):
                 )
             else:
                 kv_lens = seq_lens
-            kv_indptr = self.kv_indptr[: bs + 1]
-            kv_indptr[1 : bs + 1] = torch.cumsum(kv_lens, dim=0)
-            kv_indices = self.cuda_graph_kv_indices
-            # seq_lens_sum is None at capture (dummy seq_lens); only check on replay.
-            if seq_lens_sum is not None:
-                kv_indices_used = seq_lens_sum + (
-                    self.num_draft_tokens * bs if self.use_mla else 0
+            if self.use_muse_attention_paths and self._use_unified_verify:
+                # Unified verify reads the block page table only; the token-level
+                # KV index build (cumsum + index kernel over the whole context)
+                # would be wasted replay preparation.
+                kv_indptr = kv_indices = None
+            else:
+                kv_indptr = self.kv_indptr[: bs + 1]
+                kv_indptr[1 : bs + 1] = torch.cumsum(kv_lens, dim=0)
+                kv_indices = self.cuda_graph_kv_indices
+                # seq_lens_sum is None at capture (dummy seq_lens); only check on replay.
+                if seq_lens_sum is not None:
+                    kv_indices_used = seq_lens_sum + (
+                        self.num_draft_tokens * bs if self.use_mla else 0
+                    )
+                    assert_buffer_fits(
+                        kv_indices_used,
+                        kv_indices.numel(),
+                        "aiter target_verify kv_indices",
+                        bs=bs,
+                        seq_lens_sum=seq_lens_sum,
+                    )
+                num_token_blocks = self._kv_index_blocks(bs)
+                create_flashinfer_kv_indices_triton[(bs, num_token_blocks)](
+                    self.req_to_token,
+                    req_pool_indices,
+                    kv_lens,
+                    kv_indptr,
+                    None,
+                    kv_indices,
+                    self.req_to_token.stride(0),
+                    TOKEN_BLOCK_PARALLEL=num_token_blocks > 1,
                 )
                 assert_buffer_fits(
                     kv_indices_used,
@@ -3550,6 +3620,12 @@ class AiterAttnBackend(AttentionBackend):
                     )
 
                     max_kv_len_unified = max_num_blocks_per_seq * self.page_size
+                    verify_seqlen_k = None
+                    if self.muse_reuse_verify_lengths:
+                        verify_seqlen_k = self.cuda_graph_verify_seqlen_k[:bs]
+                        torch.add(
+                            seq_lens[:bs], verify_tokens_per_req, out=verify_seqlen_k
+                        )
                     self.forward_metadata = ForwardMetadata(
                         None,
                         _page_table,
@@ -3559,6 +3635,7 @@ class AiterAttnBackend(AttentionBackend):
                         max_kv_len_unified,
                         max_extend_len=_max_q_len,
                         swa_page_table=_swa_page_table,
+                        verify_seqlen_k=verify_seqlen_k,
                     )
                 else:
                     custom_mask = self.cuda_graph_custom_mask
@@ -4458,6 +4535,15 @@ class AiterAttnBackend(AttentionBackend):
                         )
                         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
+                    # seq_lens + draft tokens: precomputed once per batch when
+                    # the Muse verify-length reuse is on, else added here, inside
+                    # the graph region (a host-side add would allocate a new
+                    # tensor each replay and break the captured pointer).
+                    seqused_k = self.forward_metadata.verify_seqlen_k
+                    if seqused_k is None:
+                        seqused_k = (
+                            forward_batch.seq_lens + self.forward_metadata.max_q_len
+                        )
                     # GQA-packing fix: do NOT expand the single KV head to
                     # tp_q_head_num. Passing K/V with the true kv-head count (exactly
                     # like forward_decode) lets unified_attention derive
@@ -4468,18 +4554,13 @@ class AiterAttnBackend(AttentionBackend):
                     # signature num_query_heads_16/num_queries_per_kv_1). GQA head
                     # mapping here is identical to the proven decode path.
 
-                    # The seq_lens + draft_num add has to run INSIDE the graph
-                    # region; a host-side pre-add would allocate a new tensor
-                    # each replay and break the captured pointer.
                     unified_attention(
                         q=q_unified,
                         k=k_unified,
                         v=v_unified,
                         out=o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
                         cu_seqlens_q=self.forward_metadata.qo_indptr,
-                        seqused_k=(
-                            forward_batch.seq_lens + self.forward_metadata.max_q_len
-                        ),
+                        seqused_k=seqused_k,
                         max_seqlen_q=self.forward_metadata.max_q_len,
                         max_seqlen_k=max_kv_len,
                         softmax_scale=layer.scaling,

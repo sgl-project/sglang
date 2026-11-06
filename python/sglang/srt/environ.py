@@ -2186,6 +2186,14 @@ class Envs:
     # Use the experimental FlyDSL split-K paged GQA kernel for Muse Spark's
     # short-window decode layers on gfx950.
     SGLANG_MUSE_FLYDSL_DECODE = EnvBool(False)
+    # Muse Spark on MI355X (gfx950): AgentX fast paths, all on by default. Each
+    # variable is the off-switch of one optimization; the paths are shape-gated, so
+    # they only engage on the Muse Spark shapes they were measured on.
+    # aiter attention backend (head_dim 64, GQA 8, page 16, SWA KV pool):
+    # extend reuses the page tables / query offsets init_forward_metadata built.
+    SGLANG_MUSE_REUSE_EXTEND_METADATA = EnvBool(True)
+    # target-verify KV lengths once per batch / per graph replay, not per layer.
+    SGLANG_MUSE_REUSE_VERIFY_LENGTHS = EnvBool(True)
     # Triton extend: DFlash draft block (8 x 8 heads, 1 KV head, HD128) split-KV.
     SGLANG_MUSE_DFLASH_SPLITKV = EnvBool(True)
     # Tiled 17..64-row GEMMs for the weight shapes the ROCm Muse Spark model
