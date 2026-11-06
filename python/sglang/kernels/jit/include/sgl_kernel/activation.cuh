@@ -5,8 +5,8 @@
 ///
 /// - `kFastMath = true`: approximate PTX without slow-path branches, e.g. sigmoid
 ///   as `rcp.approx(1 + ex2.approx(-x * log2e))` (relative error around 1e-6).
-///   `gelu_tanh` and `silu_fast` use one `tanh.approx`: their relative error grows
-///   for negative x, so use them only for outputs stored in bf16 / fp8.
+///   `gelu_tanh` uses one `tanh.approx`: its relative error grows for negative x,
+///   so use it only for outputs stored in bf16 / fp8.
 /// - `kFastMath = false`: ATen's formula and operation order with libdevice
 ///   transcendentals and IEEE division, to reproduce eager PyTorch as closely as
 ///   the compiler's FMA contraction allows.
@@ -134,17 +134,6 @@ SGL_DEVICE float silu(float x) {
   } else {
     return __fdiv_rn(x, 1.0f + libdevice::exp(-x));
   }
-}
-
-/// \brief silu(x) with one MUFU: h + h * tanh(h), h = x / 2.
-///
-/// Faster than `silu` (two MUFUs) where the MUFU is on the critical path, e.g. small-batch
-/// fused quantization, but 0.5 + 0.5 * tanh cancels for negative x, so the relative error
-/// grows there (above bf16 rounding below about x = -8). Use it only for outputs stored in
-/// bf16 / fp8.
-SGL_DEVICE float silu_fast(float x) {
-  const auto h = 0.5f * x;
-  return h + h * ptx::tanh_approx(h);
 }
 
 /// \brief Exact GELU: 0.5 * x * (1 + erf(x / sqrt(2))).

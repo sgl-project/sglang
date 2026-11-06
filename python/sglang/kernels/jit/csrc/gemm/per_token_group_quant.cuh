@@ -23,6 +23,16 @@ namespace sglang {
 
 namespace detail {
 
+SGL_DEVICE float silu(const float val) {
+  // silu(x) = x * sigmoid(x)
+#if SGL_ARCH_BLACKWELL_OR_GREATER
+  const float half = 0.5f * val;
+  return half * (1.0f + __tanhf(half));
+#else
+  return val * __frcp_rn(1.0f + __expf(-val));
+#endif
+}
+
 template <typename T>
 struct WeightTrait {};
 
@@ -290,7 +300,7 @@ struct QuantTrait {
           const auto up_f32 = cast<float2>(up[i]);
           in[i] = cast<T2>(float2{activation::silu(gate.x) * up_f32.x, activation::silu(gate.y) * up_f32.y});
         } else {
-          const auto act = cast<T2>(float2{activation::silu_fast(gate.x), activation::silu_fast(gate.y)});
+          const auto act = cast<T2>(float2{detail::silu(gate.x), detail::silu(gate.y)});
           in[i] = __hmul2(act, up[i]);
         }
       }

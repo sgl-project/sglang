@@ -217,7 +217,7 @@ For a **2D tile**, either flatten `(row, col)` into a linear tile index first, o
 ```
 
 - `sigmoid/silu/gelu/gelu_tanh/softplus/sqrt_softplus/relu2<kFastMath = true>(x)` — one implementation per activation, independent of `--use_fast_math`. `kFastMath = true` is approximate PTX without slow-path branches (sigmoid / SiLU as `rcp.approx(1 + ex2.approx(...))`, relative error around 1e-6); `kFastMath = false` reproduces eager PyTorch (ATen formula and order, libdevice transcendentals, IEEE division). Use the precise mode where a test compares against torch bit for bit.
-- `silu_fast(x)` — SiLU with one `tanh.approx` (one MUFU instead of two) for latency-bound kernels such as small-batch fused quantization; its relative error grows for negative x, so use it only for outputs stored in bf16 / fp8. The fast `gelu_tanh` has the same property.
+- The fast `gelu_tanh` uses one `tanh.approx`; `1 + tanh` cancels for negative x, so its relative error grows there. Use it only for outputs stored in bf16 / fp8.
 
 ### `warp.cuh` — Warp-level primitives
 
