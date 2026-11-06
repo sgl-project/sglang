@@ -24,6 +24,11 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.load_snapshot import ShmLoadSnapshotWriter
 from sglang.srt.managers.utils import compute_num_reserved_tokens
 from sglang.srt.observability.metrics_collector import tokenizer_metric_labels
+from sglang.srt.observability.request_logger import (
+    WHITELISTED_HEADERS,
+    RequestLogger,
+    _dataclass_to_string_truncated,
+)
 from sglang.srt.observability.utils import generate_buckets
 from sglang.srt.runtime_context import (
     get_device,
@@ -41,11 +46,6 @@ from sglang.srt.runtime_context import (
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
-from sglang.srt.utils.request_logger import (
-    WHITELISTED_HEADERS,
-    RequestLogger,
-    _dataclass_to_string_truncated,
-)
 from sglang.version import __version__
 
 if TYPE_CHECKING:
