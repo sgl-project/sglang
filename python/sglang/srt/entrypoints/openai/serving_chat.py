@@ -601,6 +601,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 if request.continue_final_message:
                     # Extract content and remove the assistant message
                     assistant_prefix = last_content
+                    request._continuation_prefix = assistant_prefix
                     messages = messages[:-1]
                 else:
                     # Convert the last assistant message to user message
@@ -610,13 +611,11 @@ class OpenAIServingChat(OpenAIServingBase):
     def _continues_open_reasoning(self, request: ChatCompletionRequest) -> bool:
         """Whether the continued assistant prefix ends inside a reasoning block,
         as the output's reasoning parser reads it."""
-        last = request.messages[-1] if request.messages else None
         if not (
             self.reasoning_parser
             and request.continue_final_message
-            and last is not None
-            and last.role == "assistant"
-            and isinstance(last.content, str)
+            and request.messages
+            and request.messages[-1].role == "assistant"
         ):
             return False
         detector = ReasoningParser(
@@ -2537,6 +2536,8 @@ class OpenAIServingChat(OpenAIServingBase):
             # Remove the auto-added blank assistant turn, if present.
             if conv.messages and conv.messages[-1][1] is None:
                 conv.messages.pop()
+            if conv.messages and isinstance(conv.messages[-1][1], str):
+                request._continuation_prefix = conv.messages[-1][1]
             # Rebuild the prompt from the conversation.
             prompt = conv.get_prompt()
             # Strip trailing stop tokens or separators that indicate end-of-assistant.

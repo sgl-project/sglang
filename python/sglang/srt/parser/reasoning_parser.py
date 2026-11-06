@@ -2606,7 +2606,7 @@ class ReasoningParser:
             and request.messages[-1].role == "assistant"
         ):
             kwargs["continue_final_message"] = True
-            kwargs["previous_content"] = request.messages[-1].content
+            kwargs["previous_content"] = request.continuation_prefix()
 
         if chat_template_kwargs.get("force_nonempty_content") is True:
             kwargs["force_nonempty_content"] = True

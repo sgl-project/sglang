@@ -969,6 +969,7 @@ class ChatCompletionRequest(PDRoutingFields):
     _response_parser_tool_grammar: bool = PrivateAttr(default=False)
     _format_add_generation_prompt: Optional[bool] = PrivateAttr(default=None)
     _format_add_special_tokens: bool = PrivateAttr(default=False)
+    _continuation_prefix: Optional[str] = PrivateAttr(default=None)
 
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
@@ -1256,6 +1257,15 @@ class ChatCompletionRequest(PDRoutingFields):
             }
 
         return values
+
+    def continuation_prefix(self) -> str:
+        """The text continue_final_message resumes: the prefix rendering took from
+        the final assistant message, else its string content. Content left as
+        parts is not a prefix."""
+        if self._continuation_prefix is not None:
+            return self._continuation_prefix
+        content = self.messages[-1].content if self.messages else None
+        return content if isinstance(content, str) else ""
 
     def to_sampling_params(
         self,

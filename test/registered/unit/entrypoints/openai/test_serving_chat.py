@@ -5837,6 +5837,60 @@ class ServingChatTestCase(CustomTestCase):
                     expected,
                 )
 
+    def test_continued_content_parts_follow_the_rendered_prefix(self):
+        """Bug regression: continuing an assistant message given as content parts
+        crashed the Mistral output parser (HTTP 500, or a raised stream). Parts the
+        template flattens into the prompt prefix are read as that prefix; parts it
+        keeps structured are not a prefix."""
+        self.tm.server_args.reasoning_parser = "mistral"
+        self.chat.reasoning_parser = "mistral"
+        self.template_manager.reasoning_config = ReasoningToggleConfig(
+            special_case="mistral"
+        )
+        self.template_manager.chat_template_name = None
+        self.tm.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        cases = (
+            ("string", "Prefix", "[THINK]new[/THINK]answer", ("new", "answer"), False),
+            (
+                "string",
+                "[THINK]checking",
+                " more[/THINK]answer",
+                (" more", "answer"),
+                True,
+            ),
+            (
+                "openai",
+                "[THINK]checking",
+                "[THINK]new[/THINK]answer",
+                ("new", "answer"),
+                False,
+            ),
+        )
+        for content_format, text, output, expected, reasoning_open in cases:
+            self.template_manager.jinja_template_content_format = content_format
+            fields = {
+                "messages": [
+                    {"role": "user", "content": "Hi"},
+                    {"role": "assistant", "content": [{"type": "text", "text": text}]},
+                ],
+                "continue_final_message": True,
+                "reasoning_effort": "high",
+                "separate_reasoning": True,
+            }
+            with self.subTest(content_format=content_format, text=text):
+                adapted, _ = self._convert_rendered_as("", **fields)
+                self.assertIs(
+                    get_request_reasoning_open(
+                        adapted.sampling_params.get("custom_params")
+                    ),
+                    reasoning_open,
+                )
+                for stream in (False, True):
+                    served = self._served(
+                        self._stopped_on_token(output, 2), stream, **fields
+                    )
+                    self.assertEqual(served, (*expected, []))
+
     # --- fallback path tests (config=None, uses reasoning_default) ---
 
     def _setup_fallback(self, parser_name):
