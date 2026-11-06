@@ -401,7 +401,9 @@ class EmbeddingCacheController:
         self.io_thread = threading.Thread(target=self._io_loop, daemon=True)
         self.io_thread.start()
 
-        if self.tp_world_size > 1:
+        # The rank-0-only encoder path coordinates masks in MMEncoder. Creating
+        # a group here would require ranks that do not own a controller to join.
+        if self.all_rank_get and self.tp_world_size > 1:
             if self.tp_group is None:
                 raise ValueError("tp_group must be provided when tp_size > 1")
             from sglang.srt.distributed.parallel_state import (
