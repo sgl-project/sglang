@@ -54,6 +54,7 @@ _TRITON_KERNELS = [
     ("kv_indices", "create_flashinfer_kv_indices_triton"),
     ("kv_indices", "create_flashmla_kv_indices_triton"),
     ("kv_indices", "create_chunked_prefix_cache_kv_indices"),
+    ("kv_indices", "create_chunked_prefix_cache_kv_indices_2d"),
     ("kv_indices", "get_num_kv_index_blocks_flashmla"),
     ("kv_indices", "get_num_page_per_block_flashmla"),
     ("trtllm_mha_page_table", "build_trtllm_mha_page_table"),
