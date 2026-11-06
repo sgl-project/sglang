@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.activation.silu_and_mul_clamp import silu_and_mul_clamp
 from sglang.kernels.ops.moe.dsv4 import silu_and_mul_masked_post_quant
 from sglang.kernels.ops.moe.triton_pad_expert_counts import pad_expert_counts
@@ -84,8 +86,14 @@ else:
     _legacy_silu_and_mul = None
 
 
-_DEEPGEMM_ON_H20 = get_bool_env_var("SGLANG_DEEPGEMM_ON_H20")
 _masked_standard_layout_memory_budget_bytes: Optional[int] = None
+
+
+@lru_cache(maxsize=1)
+def _is_h20() -> bool:
+    # H20 and H20-3e are the only SM90 parts with 78 SMs.
+    arch = current_arch()
+    return arch.is_sm(9, 0) and arch.num_sms == 78
 
 
 # TODO(kaixih@nvidia): ideally we should merge this logic into
@@ -881,9 +889,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             gemm_overlap_args_dict = {}
         else:
             down_gemm_overlap_args.start_event.record()
-            max_block_n = (
-                160 if (_DEEPGEMM_ON_H20 and runner_input.expected_m <= 64) else 256
-            )
+            max_block_n = 160 if (_is_h20() and runner_input.expected_m <= 64) else 256
             gemm_overlap_args_dict = {
                 "overlap_args": down_gemm_overlap_args,
                 "max_block_n": max_block_n,
