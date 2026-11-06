@@ -34,6 +34,7 @@ MOE_ALIGN_CASES = get_ci_test_range(
 )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize(
     "block_size,num_tokens,topk,num_experts,pad_sorted_token_ids",
     MOE_ALIGN_CASES,
@@ -139,6 +140,7 @@ def test_moe_align_block_size_compare_implementations(
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize(
     "block_size,num_tokens,topk,num_experts",
     list(

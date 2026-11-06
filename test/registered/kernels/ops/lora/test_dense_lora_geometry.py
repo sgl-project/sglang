@@ -100,6 +100,7 @@ def test_cache_normalizes_device_and_keeps_distinct_destination_columns():
     ]
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_a_captured_graph_keeps_its_tables_when_other_geometries_appear():
     offsets = (0, 96, 224, 304)
     site, expected = _site(offsets, seed=11)

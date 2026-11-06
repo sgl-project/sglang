@@ -1,6 +1,7 @@
 import unittest
 
 import requests
+import torch
 
 from sglang.benchmark.serving import run_benchmark
 from sglang.srt.utils import kill_process_tree
@@ -23,6 +24,7 @@ register_cuda_ci(est_time=310, stage="base-b", runner_config="2-gpu-large")
 register_amd_ci(est_time=355, suite="stage-b-test-2-gpu-large-amd")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestMultiTokenizer(CustomTestCase, MMLUMixin):
     """One server covering both worker pools: multi-tokenizer and
     multi-detokenizer (the flags are orthogonal), with DP attention, so the

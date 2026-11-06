@@ -104,9 +104,11 @@ class TestDeepEPv2ContigScatter(CustomTestCase):
         ]
         self.assertEqual(len(set(accepted)), len(accepted))
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_scatter_bf16_without_scales(self):
         self._check(torch.bfloat16, with_scale=False)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_scatter_fp8_with_scales(self):
         self._check(torch.float8_e4m3fn, with_scale=True)
 

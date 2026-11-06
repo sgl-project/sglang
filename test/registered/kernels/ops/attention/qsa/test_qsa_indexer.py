@@ -165,6 +165,7 @@ def _eager_compress_reference(indexer, pool, group_locs, write_locs):
     pool.set_qsa_compressed_k_buffer(0, write_locs, normalized)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("num_groups", [1, 5, 2000])
 @pytest.mark.parametrize(
     "mrope_section, mrope_interleaved",
@@ -207,6 +208,7 @@ def test_fused_compress_matches_eager(
         assert_bit_comparable(pool_new.compressed, pool_ref.compressed)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_fused_q_prep_fp8_matches_eager_cast():
     """fp8 Q from the fused prep must match the eager Q cast at the end (one ulp)."""
     device = torch.device("cuda")
@@ -560,6 +562,7 @@ def test_tilelang_mqa_decode_skips_rows_that_fit_topk():
         torch.testing.assert_close(a, b, rtol=2e-3, atol=2e-3)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
 def test_expand_block_indices_int_inputs(dtype):
     device = torch.device("cuda")
@@ -593,6 +596,7 @@ def test_expand_block_indices_int_inputs(dtype):
     assert torch.equal(out.cpu(), ref)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_decode_selection_equivalent():
     """Last-ulp norm flips must not change the selected blocks:
     scores are fp32 sums of 128-dim dots, so a 1-ulp flip only matters on exact ties."""

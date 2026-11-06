@@ -99,6 +99,7 @@ def _ref_fill_and_locs(
 
 
 class TestBoundaryKvFixKernels(CustomTestCase):
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_kernels_vs_reference(self):
         for case_i, (
             bs,
@@ -244,6 +245,7 @@ def _ref_rotate(ids, starts, lens, new_tokens, select_index):
 
 
 class TestRotateInputIds(CustomTestCase):
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_in_place_shift_across_blocks(self):
         """A shift spanning several blocks must read only ids no earlier block
         overwrote, and must not write outside its own request's window."""

@@ -2,6 +2,7 @@ import unittest
 from types import SimpleNamespace
 
 import requests
+import torch
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -18,6 +19,7 @@ register_cuda_ci(est_time=91, stage="nightly", runner_config="1-gpu-large")
 register_amd_ci(est_time=200, suite="nightly-amd-1-gpu", nightly=True)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestSlidingWindowAttentionTriton(CustomTestCase):
     """Test sliding window attention functionality with triton backend."""
 

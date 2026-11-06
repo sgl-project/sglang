@@ -16,6 +16,7 @@ register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-s
 
 
 class TestVisionRoPE(CustomTestCase):
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_vision_rope(self):
         torch.manual_seed(4)
         qkv = torch.randn(480, 3, 12, 128, device="cuda", dtype=torch.bfloat16)

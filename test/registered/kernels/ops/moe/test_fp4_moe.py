@@ -176,6 +176,7 @@ def check_moe(
     torch.testing.assert_close(torch_output, test_output, atol=1e-1, rtol=1e-1)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("m,n,k", MNK_FACTORS)
 @pytest.mark.parametrize("e", [40, 64, 256])
 @pytest.mark.parametrize("topk", [1, 6, 8])

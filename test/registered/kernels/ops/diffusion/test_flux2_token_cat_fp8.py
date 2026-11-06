@@ -11,6 +11,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 register_cuda_ci(est_time=25, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("tokens", [1, 127, 4096])
 def test_flux2_token_cat_fp8_is_bit_exact(tokens: int) -> None:
     generator = torch.Generator(device="cuda")

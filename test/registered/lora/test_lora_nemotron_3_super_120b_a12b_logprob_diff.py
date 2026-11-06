@@ -49,6 +49,7 @@ DISABLE_SHARED_EXPERTS_FUSION = True
 KL_THRESHOLD = 2.5e-3
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestLoRANemotron3Super120B_A12B_LogprobDiff(CustomTestCase):
     def test_lora_nemotron_3_super_120b_a12b_logprob_accuracy(self):
         adapter_path = snapshot_download(

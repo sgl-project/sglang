@@ -10,6 +10,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_compress_k_writes_each_head_once():
     """Each compressed output must be produced once even with multiple KV heads."""
     key_cache = torch.arange(

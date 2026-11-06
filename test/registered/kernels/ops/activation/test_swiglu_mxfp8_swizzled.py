@@ -26,6 +26,7 @@ register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="4-gpu-b
 ROWS, HIDDEN = 333, 5376  # rows and scale columns both need padding
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_silu_mul_mxfp8_is_byte_exact(monkeypatch: pytest.MonkeyPatch) -> None:
     g = torch.Generator(device="cuda").manual_seed(2)
     x = (torch.randn((ROWS, 2 * HIDDEN), device="cuda", generator=g) * 2).to(
@@ -47,6 +48,7 @@ def _poison_scale_alloc(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(swiglu_mxfp8_swizzled, "_alloc", poisoned)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("rows", [1, 7, 128, 333])
 @pytest.mark.parametrize("n", [768, 1056])
 @pytest.mark.parametrize("scale", [1e-3, 1.0, 30.0])
@@ -62,6 +64,7 @@ def test_swiglu_oai_mxfp8_matches_eager_chain(
     assert_matches_flashinfer_mxfp8(swiglu_oai_mxfp8(x, 1.702, 7.0), ref)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_swiglu_oai_mxfp8_cuda_graph_replay() -> None:
     rows, n = 40, 768
     x = torch.randn((rows, 2 * n), device="cuda").to(torch.bfloat16)
@@ -78,6 +81,7 @@ def test_swiglu_oai_mxfp8_cuda_graph_replay() -> None:
         assert_matches_flashinfer_mxfp8(got, ref)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("rows", [1, 7, 128, 333, 2050])
 @pytest.mark.parametrize("n", [768, 1536])
 @pytest.mark.parametrize("scale", [0.0, 1e-3, 1.0, 30.0])

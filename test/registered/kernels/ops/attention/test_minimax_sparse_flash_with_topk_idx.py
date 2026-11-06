@@ -207,6 +207,7 @@ CASES = [
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("score_type", ["max", "lse"])
 @pytest.mark.parametrize(
     "bs,nqh,nkh,hd,blk,with_sink,seq_pat,ib,lb,tk",
@@ -288,6 +289,7 @@ def test_flash_decode_with_topk_idx(
             )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("score_type", ["max", "lse"])
 @pytest.mark.parametrize(
     "bs,nqh,nkh,hd,blk,with_sink,seq_pat,ib,lb,tk",
@@ -364,6 +366,7 @@ def test_flash_decode_score_only(
             )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_flash_decode_jit_topk_trivial_rows_skip_score_writes():
     torch.manual_seed(123)
     bs, nqh, nkh, hd, blk, tk = 4, 8, 1, 128, 64, 32
@@ -422,6 +425,7 @@ def test_flash_decode_jit_topk_trivial_rows_skip_score_writes():
             assert (topk_new[h, b, actual_k:] == -1).all()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.skipif(
     is_xpu(),
     reason="XPU does not support trtllm_mha/fa3 dense backend",

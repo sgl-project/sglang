@@ -33,6 +33,7 @@ def _make_inputs(rows: int):
     return x, residual, gate, scale, shift
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("rows", [1, 127, 1024])
 @pytest.mark.parametrize(
     "input_scale_value", [0.005, 0.03125, 0.4263392984867096, 0.4754464328289032, 1.0]
@@ -54,6 +55,7 @@ def test_norm_scale_shift_fp8_is_bit_exact(rows: int, input_scale_value: float) 
     assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("rows", [1, 127, 1024])
 @pytest.mark.parametrize(
     "input_scale_value", [0.005, 0.03125, 0.4263392984867096, 0.4754464328289032, 1.0]

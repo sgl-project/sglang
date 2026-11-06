@@ -1346,6 +1346,7 @@ def test_qsa_mtp_step_out_cache_loc_matches_draft_forward_layout():
     assert torch.equal(backend._step_out_cache_loc(fb, 0), flat)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("max_pages", [32, 129, 2048, 8193])
 def test_qsa_graph_metadata_kernels_match_legacy_host_path(max_pages):
     """For decode rows and target-verify fan-out (boundary and non-boundary),
@@ -1514,6 +1515,7 @@ def _qsa_expected_graph_layout(
     return row_lens, row_prefix, row_reqs
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("seq_offset", [0, 1, 3])
 def test_qsa_graph_layout_covers_speculative_rows_and_padded_tail(seq_offset):
     """The layout kernel must rebuild speculative row fan-out and the padded dummy tail;

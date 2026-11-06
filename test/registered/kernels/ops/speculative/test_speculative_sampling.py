@@ -252,6 +252,7 @@ def joint_top_k_top_p_case(request):
     return original_probs, sampling_info, expected_probs
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_eagle_preserves_original_top_p_nucleus(joint_top_k_top_p_case):
     """Production renormalizers must retain token 3: its original preceding
     mass is 0.80 < top_p, while its top-k-normalized mass exceeds top_p."""

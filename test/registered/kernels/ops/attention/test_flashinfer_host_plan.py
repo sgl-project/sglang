@@ -70,6 +70,7 @@ class TestFlashInferDraftHostIndptr(CustomTestCase):
         )
         return obj, indices, fb
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_production_metadata_and_live_graph_after_length_rollback(self):
         for topk, steps, page_size, initial in [
             (1, 3, 1, [8192]),
@@ -128,6 +129,7 @@ class TestFlashInferDraftHostIndptr(CustomTestCase):
                         consumer_indptr, original_indptr, rtol=0, atol=0
                     )
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_sliding_window_uses_bounded_device_metadata(self):
         obj, indices, fb = self._build(1, 3, 1, [8192, 1024])
         obj.draft_window_size = 256
@@ -151,6 +153,7 @@ class TestFlashInferDraftHostIndptr(CustomTestCase):
         for i, host in enumerate(observed):
             torch.testing.assert_close(host, expected_indptr[i].cpu(), rtol=0, atol=0)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_missing_host_mirror_and_failed_plan_restore_override(self):
         obj, indices, fb = self._build(1, 3, 1, [8192])
         with envs.SGLANG_OPT_FLASHINFER_DRAFT_HOST_INDPTR.override(False):
@@ -179,6 +182,7 @@ class TestFlashInferDraftHostIndptr(CustomTestCase):
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class TestFlashInferVerifyHostPlan(CustomTestCase):
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_packed_bits_and_padding(self):
         for width, lengths in [(4, [8196]), (3, [1, 7, 8191]), (5, [13, 17, 16379])]:
             with self.subTest(width=width, lengths=lengths):
@@ -211,6 +215,7 @@ class TestFlashInferVerifyHostPlan(CustomTestCase):
                 )
                 self.assertTrue(torch.all(result[expected.numel() :] == 173).item())
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_real_wrapper_live_lengths_and_masks(self):
         torch.manual_seed(20261008)
         for dtype, batch in [(torch.bfloat16, 1), (torch.float8_e4m3fn, 3)]:

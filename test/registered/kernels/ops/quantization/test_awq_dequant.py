@@ -64,6 +64,7 @@ def awq_dequantize_torch(
 
 
 class TestAWQTriton(CustomTestCase):
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_dequantize(self):
         rows_list = [3584, 18944, 128, 256, 512, 1024]
         cols_list = [448, 576, 4736, 16, 32, 64, 128]

@@ -119,6 +119,7 @@ def check(x, w, got):
     assert torch.count_nonzero(sf[pad]) == 0
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("m", [1, 5, 6, 8])
 @pytest.mark.parametrize("stride", [1280, 1792])
 def test_dynamic_graph(m, stride):

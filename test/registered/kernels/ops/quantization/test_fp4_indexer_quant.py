@@ -20,6 +20,7 @@ FP4_DIM = HEAD_DIM // 2
 GROUP_SIZE = 32
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("num_tokens", [1, 7, 96])
 def test_quantize_fp4_indexer_tensor(num_tokens: int) -> None:
     torch.manual_seed(num_tokens)

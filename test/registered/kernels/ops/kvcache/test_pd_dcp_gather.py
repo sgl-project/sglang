@@ -15,6 +15,7 @@ register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-s
 
 
 class TestPdDcpGather(CustomTestCase):
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_gathers_strided_rows_layer_major(self):
         dim = 8
         kv0 = torch.arange(32 * dim, dtype=torch.float32, device="cuda").view(

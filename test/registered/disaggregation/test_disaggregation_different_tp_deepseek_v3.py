@@ -1,6 +1,8 @@
 import unittest
 from types import SimpleNamespace
 
+import torch
+
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
@@ -17,6 +19,7 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=275, stage="extra-b", runner_config="8-gpu-h20")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDisaggregationMooncakePrefillLargerTP(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
@@ -96,6 +99,7 @@ class TestDisaggregationMooncakePrefillLargerTP(PDDisaggregationServerBase):
         self.assertGreater(metrics["score"], 0.60)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDisaggregationMooncakeDecodeLargerTP(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):

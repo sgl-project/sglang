@@ -15,6 +15,7 @@ from sglang.test.mem_cache_utils import routed
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("requests", [1, 3, 8, 128])
 @pytest.mark.parametrize("width", [1, 4])
 # FP8 packed scratch is used only with an FP8 KV pool.
@@ -163,6 +164,7 @@ def test_qsa_pool_routes_to_fused_prepare(monkeypatch, width):
     assert captured["new_kv"][3] == width
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("requests", [1, 9, 128])
 @pytest.mark.parametrize("width", [1, 2, 3, 4])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
@@ -245,6 +247,7 @@ def test_fused_block_expansion(requests, width, dtype, padding, chain_positions)
         torch.testing.assert_close(actual.float(), ref.float(), rtol=0, atol=0)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("width", [1, 4])
 def test_fused_block_expansion_writes_only_visible_pages(width):
     """With visible_page_size, a row's packed K/V matches the full write up to its
@@ -357,6 +360,7 @@ def test_block_indices_expand_on_attention_fallback(monkeypatch):
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_nonconsecutive_writes_keep_slot_matching():
     from sglang.srt.layers.attention.qsa.kernel import expand_qsa_block_indices
 

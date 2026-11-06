@@ -31,6 +31,7 @@ def _routing_op(num_experts, eps, multiplier, ep_map, num_valid):
     return op
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("backend", [KernelBackend.TRITON, KernelBackend.JIT])
 @pytest.mark.parametrize("num_tokens", [1, 33, 600])
 @pytest.mark.parametrize("num_experts, topk", [(256, 8), (128, 4)])
@@ -58,6 +59,7 @@ def test_routing_matches_native(
     torch.testing.assert_close(w[valid], ref_w[valid], rtol=1e-5, atol=1e-6)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("num_tokens", [1, 33, 4096])
 @pytest.mark.parametrize(
     "eps, multiplier, ep_map, padded",
@@ -96,6 +98,7 @@ def _post_expert_reference(x, scores, weight, eps, weight_first, ids):
     return (y * scores.float().unsqueeze(-1)).sum(dim=1)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("num_tokens", [1, 31, 32])
 @pytest.mark.parametrize("weight_first", [True, False])
 @pytest.mark.parametrize("with_ids", [False, True])
@@ -128,6 +131,7 @@ def test_post_expert_finalize_triton(num_tokens, weight_first, with_ids):
         assert torch.count_nonzero(out[0]) == 0
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("strided_input", ["ids", "weight"])
 def test_post_expert_finalize_preserves_input_layout(strided_input):
     """Small-batch finalization respects transposed IDs and sliced norm weights."""

@@ -143,6 +143,7 @@ def run_fused_mtp(
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.skipif(not KERNELS_AVAILABLE, reason="Kernel not available")
 @pytest.mark.parametrize("N", [1, 8, 16])
 @pytest.mark.parametrize("T", [1, 4, 8])
@@ -187,6 +188,7 @@ def test_fused_gdn_mtp_precision(N: int, T: int):
     torch.testing.assert_close(out_ref, out_fused, rtol=1e-2, atol=1e-2)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.skipif(not KERNELS_AVAILABLE, reason="Kernel not available")
 @pytest.mark.parametrize("N", [1, 3, 16])
 def test_qwen35_tp4_fused_gdn_mtp_precision(N: int):
@@ -306,6 +308,7 @@ def test_sm90_verify_launch_is_bit_exact(
     assert torch.equal(states_tuned, states_default)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.skipif(not KERNELS_AVAILABLE, reason="Kernels not available")
 @pytest.mark.parametrize("N", [1, 16, 128])
 def test_mtp_single_step_decode(N: int):
@@ -360,6 +363,7 @@ def test_mtp_single_step_decode(N: int):
     assert state_fail_rate < 0.01, f"State mismatch: fail_rate={state_fail_rate:.2f}%"
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.skipif(not KERNELS_AVAILABLE, reason="Kernels not available")
 def test_verify_scratch_pitch_uses_allocated_steps():
     # Gear below the allocated step dim must not spill into the neighbor block.

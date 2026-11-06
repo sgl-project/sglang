@@ -254,6 +254,7 @@ def compare_results(jit_out, sgl_out, dtype):
     torch.testing.assert_close(jit_out, sgl_out, atol=atol, rtol=rtol)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize(
     "head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype, device, batch_size, seq_len, num_q_heads, num_kv_heads",
     [

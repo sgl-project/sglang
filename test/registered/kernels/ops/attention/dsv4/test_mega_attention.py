@@ -93,6 +93,7 @@ class TestMegaAttention(CustomTestCase):
                         atol=0,
                     )
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_wo_a_projection_matches_reference(self):
         torch.manual_seed(456)
         positions = torch.tensor([0, 7, 127], device="cuda", dtype=torch.int32)

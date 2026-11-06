@@ -15,6 +15,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_repeated_context_and_greedy_bypass():
     device = "cuda"
     state = WatermarkState(
@@ -59,6 +60,7 @@ def test_repeated_context_and_greedy_bypass():
     assert state.num_watermarked_contexts.tolist() == [1, 0]
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_low_entropy_bypass_does_not_consume_context():
     state = WatermarkState(
         max_num_reqs=1,
@@ -99,6 +101,7 @@ def test_low_entropy_bypass_does_not_consume_context():
     assert state.num_watermarked_contexts[0].item() == 1
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_inactive_batch_skips_watermark_state(monkeypatch):
     state = WatermarkState(
         max_num_reqs=1,
@@ -129,6 +132,7 @@ def test_inactive_batch_skips_watermark_state(monkeypatch):
     assert state.lengths[0].item() == 0
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_retracted_request_restores_context_history():
     device = "cuda"
     state = WatermarkState(
@@ -193,6 +197,7 @@ def test_retracted_request_restores_context_history():
     assert state.num_watermarked_contexts[1].item() == 2
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_speculative_record_stops_at_context_capacity():
     state = WatermarkState(
         max_num_reqs=1,
@@ -217,6 +222,7 @@ def test_speculative_record_stops_at_context_capacity():
     assert state.watermarked_context_hashes[0].tolist() == [10, 20]
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_speculative_tree_fast_path_matches_tensor_reference():
     draft_token_num = 4
     req_pool_indices = torch.tensor([1, 3], dtype=torch.int32, device="cuda")
@@ -316,6 +322,7 @@ def test_speculative_tree_fast_path_matches_tensor_reference():
     assert fused_selected.view(2, draft_token_num)[:, 2].logical_not().all()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("block_verification", [False, True])
 def test_dspark_chain_commits_non_speculative_contexts(block_verification):
     from sglang.kernels.ops.speculative.dspark.dspark_accept import AcceptSampling

@@ -143,6 +143,7 @@ def test_scale_shift_4d_matches_torch(shape, num_frames, dtype, scale_constant):
 SCALE_SHIFT_3D_CASES = [(1, 37, 5120), (2, 9, 1536), (1, 5, 3072), (1, 3, 96)]
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("shape", SCALE_SHIFT_3D_CASES)
 @pytest.mark.parametrize("scale_constant", [0, 1])
 def test_scale_shift_3d_tiling_is_bit_exact(shape, scale_constant):

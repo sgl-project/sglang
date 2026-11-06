@@ -58,6 +58,7 @@ def _ref(down_output, src2dst, topk_ids, topk_weights, top_k, hidden, rsf):
     return out * rsf
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("num_tokens", [1, 8, 128, 1024, 4096])
 @pytest.mark.parametrize("pad_frac", [0.0, 0.3])
 @pytest.mark.parametrize("rsf", [1.0, 2.0])

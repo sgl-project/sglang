@@ -33,6 +33,7 @@ def _torch_pack(ids: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
     return (ids.to(torch.int32) << 16) | wbits
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize(
     "num_tokens,top_k",
     [
@@ -80,6 +81,7 @@ def test_unpack_matches_reference_and_roundtrips(num_tokens, top_k, num_experts,
     assert t_ids.shape == (num_tokens, top_k) and t_w.shape == (num_tokens, top_k)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_unpack_empty():
     packed = torch.empty((0, 2), dtype=torch.int32, device="cuda")
     ids, w = _fused_unpack_packed_topk(packed)

@@ -118,6 +118,7 @@ _REFERENCE_CASES = get_ci_test_range(
 )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize(
     "M,num_experts,topk,scoring_func,num_shared,renormalize,apply_scale",
     _REFERENCE_CASES,
@@ -155,6 +156,7 @@ def test_moe_fused_gate_matches_reference(
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize(
     "M,num_experts,topk,num_shared,scoring_func",
     [
@@ -193,6 +195,7 @@ def test_moe_fused_gate_matches_reference_at_model_shapes(
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("num_experts,topk", [(256, 6), (384, 8), (512, 8)])
 @pytest.mark.parametrize("apply_scale", [True, False])
 @pytest.mark.parametrize("renormalize", [True, False])
@@ -241,6 +244,7 @@ def test_moe_fused_gate_matches_production_impl(
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_moe_fused_gate_shapes_and_dtypes() -> None:
     """Output shapes/dtypes and renormalized weights for a DeepSeek-V4 config."""
     M, N, K = 64, 256, 8
@@ -300,6 +304,7 @@ _SOFTMAX_AOT_CASES = get_ci_test_range(
 )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize(
     "M,num_experts,topk,renormalize,dtype",
     _SOFTMAX_AOT_CASES,
@@ -332,6 +337,7 @@ def test_moe_fused_gate_softmax_matches_aot(
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("M", [1, 8, 32])
 def test_moe_fused_gate_softmax_none_bias_matches_zero_bias(M: int) -> None:
     torch.manual_seed(M)
@@ -367,6 +373,7 @@ _SIGMOID_AOT_CASES = get_ci_test_range(
 )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize(
     "M,num_experts,topk,renormalize,with_bias,dtype",
     _SIGMOID_AOT_CASES,
@@ -407,6 +414,7 @@ def test_moe_fused_gate_sigmoid_matches_aot(
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize(
     "num_experts,num_expert_group,topk_group,topk",
     [
@@ -527,6 +535,7 @@ def test_grouped_dispatch_flag_matches_default(
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("bias_dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("scoring_func", ["sigmoid", "sqrtsoftplus"])
 def test_moe_fused_gate_accepts_non_fp32_bias(
