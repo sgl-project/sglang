@@ -2038,13 +2038,14 @@ class Scheduler(
         # HostKVCache.destroy. Called from run_scheduler_process's finally.
         if self.hisparse_coordinator is not None:
             self.hisparse_coordinator.destroy()
+        from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
+
         pools = [self.token_to_kv_pool_allocator.get_kvcache()]
         if self.draft_worker is not None:
             pools.append(self.draft_worker.primary_draft_kv_pool)
         for pool in pools:
-            kv_offload = getattr(pool, "kv_offload", None)
-            if kv_offload is not None:
-                kv_offload.destroy()
+            if isinstance(pool, QSATokenToKVPool) and pool.kv_offload is not None:
+                pool.kv_offload.destroy()
         self.tree_cache.release_host_resources()
         if self.decode_offload_manager is not None:
             self.decode_offload_manager.release_host_resources()

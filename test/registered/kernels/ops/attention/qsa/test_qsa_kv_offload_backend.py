@@ -133,7 +133,7 @@ def test_backend_offload_matches_full_pool(server_context, torch_resolve):
         page_size=PAGE,
     )
     full = _backend(req_to_token, kv_offload_layout=None)
-    with envs.SGLANG_ENABLE_QSA_KV_OFFLOAD_TORCH_RESOLVE.override(torch_resolve):
+    with envs.SGLANG_USE_QSA_KV_OFFLOAD_TORCH_RESOLVE.override(torch_resolve):
         offloaded = _backend(req_to_token, kv_offload_layout=layout)
     assert full._kv_offload is None
     assert offloaded._kv_offload.use_fused is not torch_resolve

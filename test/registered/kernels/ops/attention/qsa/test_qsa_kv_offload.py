@@ -73,7 +73,7 @@ def test_offload_gather_matches_pool_gather(
     shape = (layout.device_rows + 64, HEADS, DIM)
     dev_k = torch.zeros(shape, device="cuda", dtype=dtype)
     dev_v = torch.zeros_like(dev_k)
-    with envs.SGLANG_ENABLE_QSA_KV_OFFLOAD_TORCH_RESOLVE.override(torch_resolve):
+    with envs.SGLANG_USE_QSA_KV_OFFLOAD_TORCH_RESOLVE.override(torch_resolve):
         offload = QSAKVHostOffload(
             layout=layout,
             k_buffers=[dev_k],
@@ -184,7 +184,7 @@ def test_draft_decode_rows_with_extra_columns(torch_resolve, request):
     shape = (layout.device_rows + 64, HEADS, DIM)
     dev_k = torch.zeros(shape, device="cuda", dtype=torch.bfloat16)
     dev_v = torch.zeros_like(dev_k)
-    with envs.SGLANG_ENABLE_QSA_KV_OFFLOAD_TORCH_RESOLVE.override(torch_resolve):
+    with envs.SGLANG_USE_QSA_KV_OFFLOAD_TORCH_RESOLVE.override(torch_resolve):
         offload = QSAKVHostOffload(
             layout=layout,
             k_buffers=[dev_k],

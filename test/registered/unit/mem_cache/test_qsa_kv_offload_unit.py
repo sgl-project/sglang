@@ -232,7 +232,7 @@ class TestOffloadArgs(CustomTestCase):
         check_qsa_kv_offload_args(
             _offload_args(cuda_graph_config=decode_graphs), _QSA_HF_CONFIG
         )
-        with envs.SGLANG_ENABLE_QSA_KV_OFFLOAD_TORCH_RESOLVE.override(True):
+        with envs.SGLANG_USE_QSA_KV_OFFLOAD_TORCH_RESOLVE.override(True):
             with self.assertRaisesRegex(ValueError, "disable-cuda-graph"):
                 check_qsa_kv_offload_args(
                     _offload_args(cuda_graph_config=decode_graphs), _QSA_HF_CONFIG
