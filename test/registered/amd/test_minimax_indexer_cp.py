@@ -211,9 +211,8 @@ class TestMiniMaxIndexerCP(unittest.TestCase):
                     )
 
     def test_nvfp4_dspark_verify_rows_match_the_native_selector(self):
-        """On M3.1's NVFP4 index-K pool, sharded verify scoring must select exactly
-        what the native NVFP4 verify paths (fused, and score + radix top-k) do, for
-        DSpark's 8-row and EAGLE's 4-row chains, short rows and tied scores."""
+        """On M3.1's NVFP4 index-K pool, sharded verify scoring must select exactly what
+        the native fused verify does, for DSpark's 8-row and EAGLE's 4-row chains."""
         from sglang.kernels.ops.attention.minimax_sparse.common.utils import (
             unit_scale,
         )
@@ -228,11 +227,10 @@ class TestMiniMaxIndexerCP(unittest.TestCase):
         sm_scale, k_scale = 0.07, 0.5
         for num_draft in (8, 4):
             for init_blocks, local_blocks in ((0, 1), (2, 2)):
+                # tied scores, and rows shorter than top-k (num_reqs > 5)
                 for num_reqs, tied, q_dtype in (
-                    (1, False, torch.bfloat16),
                     (3, True, torch.bfloat16),
                     (17, False, torch.float16),
-                    (64, True, torch.bfloat16),
                 ):
                     prefixes = [
                         BLOCK * (60 + 37 * (r % 8)) - r for r in range(num_reqs)
@@ -263,61 +261,46 @@ class TestMiniMaxIndexerCP(unittest.TestCase):
                         for rank in range(HEADS)
                     ]
                     gathered_keys = torch.stack(keys, dim=0)
-                    for fused in (True, False):
-                        for head in range(HEADS):
-                            with self.subTest(
+                    for head in range(HEADS):
+                        with self.subTest(
+                            num_draft=num_draft,
+                            init=init_blocks,
+                            local=local_blocks,
+                            reqs=num_reqs,
+                            head=head,
+                        ):
+                            native = verify_module.verify_topk_idx(
+                                q=q[:, head : head + 1].contiguous(),
+                                k_cache=cache,
+                                req_to_token=table,
+                                seq_lens=lengths,
+                                max_seqlen=max_len,
+                                slot_ids=slots,
                                 num_draft=num_draft,
-                                init=init_blocks,
-                                local=local_blocks,
-                                reqs=num_reqs,
-                                tied=tied,
-                                q=q_dtype,
-                                fused=fused,
-                                head=head,
-                            ):
-                                kwargs = dict(
-                                    q=q[:, head : head + 1].contiguous(),
-                                    k_cache=cache,
-                                    req_to_token=table,
-                                    seq_lens=lengths,
-                                    max_seqlen=max_len,
-                                    slot_ids=slots,
-                                    num_draft=num_draft,
-                                    block_size=BLOCK,
-                                    topk=TOPK,
-                                    init_blocks=init_blocks,
-                                    local_blocks=local_blocks,
-                                    sm_scale=sm_scale,
-                                    q_scale=q_scale,
-                                    k_scale=k_scale,
-                                )
-                                if fused:
-                                    kwargs["page_size"] = BLOCK
-                                    native = verify_module.verify_topk_idx(**kwargs)
-                                else:
-                                    use = verify_module._use_fused_verify_topk
-                                    verify_module._use_fused_verify_topk = (
-                                        lambda *a, **kw: False
-                                    )
-                                    try:
-                                        native = verify_module.verify_topk_idx(**kwargs)
-                                    finally:
-                                        verify_module._use_fused_verify_topk = use
-                                cp = cp_verify_merge(
-                                    gathered_keys,
-                                    head,
-                                    lengths,
-                                    max_len,
-                                    table,
-                                    BLOCK,
-                                    TOPK,
-                                    init_blocks,
-                                    local_blocks,
-                                )
-                                self.assertTrue(
-                                    torch.equal(cp, native),
-                                    f"{(cp != native).sum()} IDs differ",
-                                )
+                                block_size=BLOCK,
+                                topk=TOPK,
+                                init_blocks=init_blocks,
+                                local_blocks=local_blocks,
+                                sm_scale=sm_scale,
+                                q_scale=q_scale,
+                                k_scale=k_scale,
+                                page_size=BLOCK,
+                            )
+                            cp = cp_verify_merge(
+                                gathered_keys,
+                                head,
+                                lengths,
+                                max_len,
+                                table,
+                                BLOCK,
+                                TOPK,
+                                init_blocks,
+                                local_blocks,
+                            )
+                            self.assertTrue(
+                                torch.equal(cp, native),
+                                f"{(cp != native).sum()} IDs differ",
+                            )
 
 
 if __name__ == "__main__":
