@@ -582,10 +582,23 @@ def validate_experimental_sgl_marlin(server_args: Any):
     validate_experimental_sgl_marlin_server_args(server_args, view)
 
 
+# Multimodal architectures whose processor, encoder and decoder run on MPS.
+_MPS_MULTIMODAL_ARCHITECTURES = frozenset({"UnlimitedOCRV2ForCausalLM"})
+# Model-specific attention backends with an MPS implementation, by architecture.
+_MPS_MODEL_ATTENTION_BACKENDS = {"unlimited_ocr_v2": "UnlimitedOCRV2ForCausalLM"}
+
+
+def _model_architectures(model_config: Any) -> tuple:
+    return tuple(model_config.hf_config.architectures or ())
+
+
 def validate_mps_model_config(
     model_config: Any,
     *,
     lora_enabled: bool = False,
+    attention_backend: Optional[str] = None,
+    prefill_attention_backend: Optional[str] = None,
+    decode_attention_backend: Optional[str] = None,
 ) -> None:
     """Validate checkpoint-derived MPS constraints."""
     quantization = getattr(model_config, "quantization", None)
@@ -595,7 +608,21 @@ def validate_mps_model_config(
             "the resolved model configuration detected "
             f"quantization={quantization!r}"
         )
-    if bool(getattr(model_config, "is_multimodal", False)):
+    for backend in (
+        attention_backend,
+        prefill_attention_backend,
+        decode_attention_backend,
+    ):
+        if backend in _MPS_MODEL_ATTENTION_BACKENDS:
+            required = _MPS_MODEL_ATTENTION_BACKENDS[backend]
+            if required not in _model_architectures(model_config):
+                raise ValueError(
+                    f"The {backend} attention backend on Torch MPS serves "
+                    f"only {required}"
+                )
+    if bool(getattr(model_config, "is_multimodal", False)) and not (
+        _MPS_MULTIMODAL_ARCHITECTURES.intersection(_model_architectures(model_config))
+    ):
         raise ValueError(
             "Torch MPS multimodal serving does not yet have a model-specific "
             "end-to-end contract; use a text-only model until its encoder, "
@@ -625,7 +652,13 @@ def validate_standard_mps_server_args(server_args: Any):
     """Validate execution modes supported by the Torch MPS path."""
 
     cfg = resolving_view(server_args)
-    supported_attention_backends = {None, "torch_native"}
+    # Model-specific backends are checked against the architecture in
+    # validate_mps_model_config.
+    supported_attention_backends = {
+        None,
+        "torch_native",
+        *_MPS_MODEL_ATTENTION_BACKENDS,
+    }
     for field in (
         "attention_backend",
         "prefill_attention_backend",
