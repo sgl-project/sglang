@@ -17,16 +17,16 @@ from sglang_simulator.time_predictor import (
     ScheduleBatch,
     ScheduleRequest,
 )
-from sglang_simulator.time_predictor.infercast import (
+from sglang_simulator.time_predictor.simopus import (
     PROVIDER_CONTRACT,
-    InferCastTimePredictor,
+    SimOpusTimePredictor,
     _validate_batch,
     milliseconds_to_seconds,
     validate_topology,
 )
 
 try:
-    from infercast.sdk import (
+    from simopus.sdk import (
         DecodeExecutionProfile,
         ExtendExecutionProfile,
         ExtendRequestShape,
@@ -36,7 +36,7 @@ except ImportError:
 
 _MODEL_ID = "deepseek-ai/DeepSeek-R1"
 _FIXTURE = json.loads(
-    (Path(__file__).parent / "fixtures" / "infercast_provider.json").read_text(
+    (Path(__file__).parent / "fixtures" / "simopus_provider.json").read_text(
         encoding="utf-8"
     )
 )
@@ -161,7 +161,7 @@ def sdk_double(tmp_path, monkeypatch):
     """Patch public SDK entry points; production construction stays unchanged."""
     stack = tmp_path / "stack.json"
     stack.write_bytes(b'{"stack":"test"}')
-    module = ModuleType("infercast.sdk")
+    module = ModuleType("simopus.sdk")
     module.database = SimpleNamespace(slice_ref=SimpleNamespace(stack_path=stack))
     module.opened, module.built = [], []
 
@@ -178,11 +178,9 @@ def sdk_double(tmp_path, monkeypatch):
     module.ExtendRequestShape = lambda **values: values
     module.ExtendExecutionProfile = _ExecutionProfile
     module.DecodeExecutionProfile = _DecodeExecutionProfile
-    package = ModuleType("infercast")
+    package = ModuleType("simopus")
     package.__path__ = []
     package.__version__, package.__revision__ = "0.1.0", "a" * 40
-    monkeypatch.setitem(sys.modules, "infercast", package)
-    monkeypatch.setitem(sys.modules, "infercast.sdk", module)
     monkeypatch.setitem(sys.modules, "simopus", package)
     monkeypatch.setitem(sys.modules, "simopus.sdk", module)
     return module
@@ -197,7 +195,7 @@ def _predictor(
     revision="a" * 40,
     **extra,
 ):
-    sys.modules["infercast.sdk"].provider = provider
+    sys.modules["simopus.sdk"].provider = provider
     options = {
         "model_id": _MODEL_ID,
         "system": "mi350x",
@@ -211,7 +209,7 @@ def _predictor(
         "decode_execution_profile": _DECODE_PROFILE,
     }
     options.update(extra)
-    return InferCastTimePredictor(
+    return SimOpusTimePredictor(
         model
         or ModelInfo(
             attention_arch="MLA",
@@ -303,7 +301,7 @@ def test_decode_passes_ordered_histories_and_profile_once():
     assert arguments["history_lengths"] == (127, 1025, 4097, 8191)
     assert arguments["execution_profile"].to_dict() == _DECODE_PROFILE
     assert "attn_kernel_impl" not in arguments
-    metrics = predictor.get_metrics()["infercast"]
+    metrics = predictor.get_metrics()["simopus"]
     assert metrics["contract"] == PROVIDER_CONTRACT
     assert metrics["decode_execution_profile"] == _DECODE_PROFILE
     assert metrics["runtime"]["attn_kernel_impl"] == "cuda_graph"
@@ -312,7 +310,7 @@ def test_decode_passes_ordered_histories_and_profile_once():
 
 def test_portable_vectors_preserve_mode_order_and_lengths():
     fixture = json.loads(
-        (Path(__file__).parent / "fixtures" / "infercast_provider.json").read_text(
+        (Path(__file__).parent / "fixtures" / "simopus_provider.json").read_text(
             encoding="utf-8"
         )
     )
@@ -342,7 +340,7 @@ def test_portable_vectors_preserve_mode_order_and_lengths():
 
 
 @pytest.mark.parametrize(
-    "infercast_code,expected_code",
+    "simopus_code,expected_code",
     [
         ("perf_data_not_available", "data_unavailable"),
         ("prefix_prediction_not_supported", "unsupported_model"),
@@ -360,18 +358,18 @@ def test_portable_vectors_preserve_mode_order_and_lengths():
     ],
 )
 def test_provider_errors_preserve_details_without_counting_success(
-    infercast_code,
+    simopus_code,
     expected_code,
 ):
     error = RuntimeError("missing realization")
-    error.code, error.details = infercast_code, {"op": "mla"}
+    error.code, error.details = simopus_code, {"op": "mla"}
     predictor = _predictor(_Provider(error=error))
     with pytest.raises(PredictorError) as exc_info:
         predictor.predict_infer_time(_batch("DECODE", (1, 128)))
     assert exc_info.value.code == expected_code
-    assert exc_info.value.details["infercast_code"] == infercast_code
-    assert exc_info.value.details["infercast_details"] == {"op": "mla"}
-    assert predictor.get_metrics()["infercast"]["calls"]["total"] == 0
+    assert exc_info.value.details["simopus_code"] == simopus_code
+    assert exc_info.value.details["simopus_details"] == {"op": "mla"}
+    assert predictor.get_metrics()["simopus"]["calls"]["total"] == 0
 
 
 @pytest.mark.parametrize(
@@ -416,7 +414,7 @@ def test_production_binding_and_portable_provenance(sdk_double):
     assert sdk_double.opened[0][1]["database_mode"] == "SILICON"
     assert sdk_double.built[0][0] == (sdk_double.database, _MODEL_ID)
     assert sdk_double.built[0][1] == {"backend": "sglang", "revision": "c" * 40}
-    metrics = predictor.get_metrics()["infercast"]
+    metrics = predictor.get_metrics()["simopus"]
     stack = sdk_double.database.slice_ref.stack_path
     assert metrics["model_revision"] == "c" * 40
     assert metrics["provider_revision"] == "a" * 40
@@ -428,7 +426,7 @@ def test_production_binding_and_portable_provenance(sdk_double):
 def test_installed_revision_must_match_before_database_access(
     sdk_double, actual_revision
 ):
-    sys.modules["infercast"].__revision__ = actual_revision
+    sys.modules["simopus"].__revision__ = actual_revision
     with pytest.raises(PredictorError) as exc_info:
         _predictor(_Provider())
     assert exc_info.value.code == "incompatible_runtime"
@@ -486,9 +484,9 @@ def test_loaded_model_requires_complete_mla_geometry(field, value):
 def test_metrics_reset_only_call_counters():
     predictor = _predictor(_Provider())
     predictor.predict_infer_time(_batch("MIXED", (1, 0), (8, 0)))
-    before = predictor.get_metrics()["infercast"]
+    before = predictor.get_metrics()["simopus"]
     predictor.reset_metrics()
-    after = predictor.get_metrics()["infercast"]
+    after = predictor.get_metrics()["simopus"]
     assert before["model_id"] == after["model_id"]
     assert before["stack_digest"] == after["stack_digest"]
     assert after["calls"] == {
@@ -505,13 +503,13 @@ def test_invalid_provider_output_does_not_increment_success_counters(value):
     with pytest.raises(PredictorError) as exc_info:
         predictor.predict_infer_time(_batch("EXTEND", (1, 0)))
     assert exc_info.value.code == "invalid_provider_output"
-    assert predictor.get_metrics()["infercast"]["calls"]["total"] == 0
+    assert predictor.get_metrics()["simopus"]["calls"]["total"] == 0
 
 
 @pytest.fixture
 def canonical_predictor(sdk_double):
     if ExtendRequestShape is None:
-        pytest.skip("optional InferCast contract tests")
+        pytest.skip("optional SimOpus contract tests")
     sdk_double.ExtendRequestShape = ExtendRequestShape
     sdk_double.ExtendExecutionProfile = ExtendExecutionProfile
     sdk_double.DecodeExecutionProfile = DecodeExecutionProfile
@@ -542,7 +540,7 @@ def test_real_sdk_preserves_ordered_context_and_exact_profiles(
     assert arguments["tp_size"] == 8
     assert arguments["moe_tp_size"] == 4
     assert arguments["moe_ep_size"] == 2
-    metrics = predictor.get_metrics()["infercast"]
+    metrics = predictor.get_metrics()["simopus"]
     assert metrics["execution_profile"] == _REALIZATION_PROFILE
     assert metrics["decode_execution_profile"] == _DECODE_PROFILE
 
@@ -569,7 +567,7 @@ def test_real_sdk_decode_profile_is_independent_of_context(canonical_predictor):
     assert arguments["history_lengths"] == (513, 511)
     assert arguments["execution_profile"] == eager
     assert "attn_kernel_impl" not in arguments
-    metrics = predictor.get_metrics()["infercast"]
+    metrics = predictor.get_metrics()["simopus"]
     assert metrics["runtime"]["attn_kernel_impl"] == "cuda_graph"
     assert metrics["runtime"]["decode_attn_kernel_impl"] == "eager"
 

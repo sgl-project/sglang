@@ -105,7 +105,7 @@ def build_predictor_batch(batch) -> SimulationScheduleBatch:
             ScheduleRequest(
                 extend_length=1,
                 # prepare_for_decode increments seq_lens_cpu for the token
-                # entering this forward. InferCast history is the KV length
+                # entering this forward. SimOpus history is the KV length
                 # before that token.
                 past_kv_length=_host_int(seq_len) - 1,
             )

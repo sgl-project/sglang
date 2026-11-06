@@ -10,7 +10,7 @@
     "num_device_per_node": 8
   },
   "predictor": {
-    "name": "infercast",
+    "name": "simopus",
     "model_id": "deepseek-ai/DeepSeek-R1",
     "systems_root": "/path/to/complete/systems",
     "database_mode": "SILICON",
@@ -19,7 +19,7 @@
     "attn_dtype": "bfloat16",
     "kv_cache_dtype": "fp8",
     "model_revision": "56d4cbbb4d29f4355bab4b9a39ccb717a14ad5ad",
-    "provider_revision": "<full InferCast commit>",
+    "provider_revision": "<full SimOpus commit>",
     "execution_profile": {
       "schema_version": 2,
       "prefill_graph_backend": "disabled",
@@ -49,8 +49,8 @@
     }
   },
   "memory_budget": {
-    "provider": "infercast",
-    "provider_revision": "<full InferCast commit>",
+    "provider": "simopus",
+    "provider_revision": "<full SimOpus commit>",
     "model_id": "deepseek-ai/DeepSeek-R1",
     "model_revision": "56d4cbbb4d29f4355bab4b9a39ccb717a14ad5ad",
     "policy": {

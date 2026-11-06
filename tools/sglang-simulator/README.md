@@ -38,7 +38,22 @@ The simulator does not install or pin a second `sglang` package. Run it from a
 checkout whose `python/sglang` package is available on `PYTHONPATH`, or from a
 matching official SGLang image.
 
-### Estimator SDK
+### SimOpus provider
+
+Install the current SimOpus SDK from its checked-out source before selecting
+`predictor.name: "simopus"`. The resource-budget selector is
+`memory_budget.provider: "simopus"`. This integration requires the `simopus`
+distribution and namespace; it does not accept an older provider selector or
+load an alternate SDK package. Pin `provider_revision` to the installed SDK's
+full source commit and provide a matching, complete PerfDB slice.
+
+The minimal provider currently supports DeepSeek-R1. See
+[`simopus_deepseek_r1_mi355x_eager.json`](examples/sim_configs/simopus_deepseek_r1_mi355x_eager.json)
+for its required execution profiles. Model-forward latency and KV capacity use
+separate SDK contracts. Native V4.1 worker regions are a separate follow-up and
+are not enabled by changing this example's model name.
+
+### AISimulate estimator SDK
 
 The estimator SDK is optional. Replay with an explicit `max_total_tokens` does
 not import it, including when the KNN fallback is selected.

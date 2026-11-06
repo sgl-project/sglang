@@ -6,6 +6,11 @@ The example assets are organized by purpose:
 - `assets/`: the small illustrative ML model, replay table, and test tokenizer;
 - `workloads/`: ShareGPT and timestamped simulator/Autobench workload examples;
 
+The `simopus_deepseek_r1_mi355x_eager.json` example selects the optional SimOpus
+latency provider and independent memory budget. Install the current `simopus`
+SDK, replace its explicit paths and source revision, and use a complete matching
+PerfDB slice. The unmerged integration accepts only the `simopus` selector.
+
 The ML model is an illustrative constant-latency sklearn model, not a calibrated
 hardware predictor. Rebuild it and the tokenizer with:
 

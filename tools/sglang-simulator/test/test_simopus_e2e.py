@@ -1,4 +1,4 @@
-"""Opt-in HTTP E2E with a real InferCast provider and matching measured data."""
+"""Opt-in HTTP E2E with a real SimOpus provider and matching measured data."""
 
 import hashlib
 import json
@@ -24,13 +24,13 @@ ROOT = Path(__file__).resolve().parents[1]
 
 @pytest.fixture(scope="module")
 def provider_inputs():
-    systems = os.environ.get("INFERCAST_E2E_SYSTEMS_ROOT")
-    model = os.environ.get("INFERCAST_E2E_MODEL_PATH")
+    systems = os.environ.get("SIMOPUS_E2E_SYSTEMS_ROOT")
+    model = os.environ.get("SIMOPUS_E2E_MODEL_PATH")
     if not systems or not model:
-        pytest.skip("set INFERCAST_E2E_SYSTEMS_ROOT and INFERCAST_E2E_MODEL_PATH")
-    import infercast
+        pytest.skip("set SIMOPUS_E2E_SYSTEMS_ROOT and SIMOPUS_E2E_MODEL_PATH")
+    import simopus
 
-    revision = infercast.__revision__
+    revision = simopus.__revision__
     assert isinstance(revision, str) and re.fullmatch(r"[0-9a-f]{40}", revision)
     assert Path(systems).is_dir()
     assert (Path(model) / "config.json").is_file()
@@ -54,16 +54,16 @@ def simulator(
         if config_override is not None
         else json.loads(
             (
-                ROOT / "examples/sim_configs/infercast_deepseek_r1_mi355x_eager.json"
+                ROOT / "examples/sim_configs/simopus_deepseek_r1_mi355x_eager.json"
             ).read_text(encoding="utf-8")
         )
     )
-    if config["predictor"]["name"] == "infercast":
+    if config["predictor"]["name"] == "simopus":
         config["predictor"].update(systems_root=systems, provider_revision=revision)
     if automatic_budget:
         identity = config.get("memory_budget", config["predictor"])
         config["memory_budget"] = {
-            "provider": "infercast",
+            "provider": "simopus",
             "provider_revision": revision,
             "model_id": identity["model_id"],
             "model_revision": identity.get("model_revision"),
@@ -184,7 +184,7 @@ def test_simulator_uses_generated_config_with_ambient_config(
         if automatic_budget:
             assert "--max-total-tokens" not in captured["command"]
             assert config["memory_budget"] == {
-                "provider": "infercast",
+                "provider": "simopus",
                 "provider_revision": "a" * 40,
                 "model_id": config["predictor"]["model_id"],
                 "model_revision": config["predictor"]["model_revision"],
@@ -246,8 +246,8 @@ def read_profile(url, output, inputs, config, *, count, output_length=16):
     assert metrics["total_output"] == sum(lengths)
     for key in ("mean_ttft_ms", "mean_tpot_ms", "duration"):
         assert math.isfinite(metrics[key]) and metrics[key] > 0
-    provenance = metrics["infercast"]
-    assert provenance["contract"] == "infercast-forward-latency"
+    provenance = metrics["simopus"]
+    assert provenance["contract"] == "simopus-forward-latency"
     assert provenance["provider_revision"] == inputs[2]
     for key in ("execution_profile", "decode_execution_profile"):
         assert provenance[key] == config["predictor"][key]
@@ -273,7 +273,7 @@ def read_profile(url, output, inputs, config, *, count, output_length=16):
 
 
 @pytest.mark.parametrize("case", ["cold", "chunk", "prefix", "automatic_budget"])
-def test_infercast_scheduler_forwards(provider_inputs, tmp_path, case, monkeypatch):
+def test_simopus_scheduler_forwards(provider_inputs, tmp_path, case, monkeypatch):
     commands = []
     if case == "automatic_budget":
         original_spawn = subprocess.Popen
@@ -308,8 +308,8 @@ def test_infercast_scheduler_forwards(provider_inputs, tmp_path, case, monkeypat
                 response.json()["max_total_num_tokens"]
                 == metrics["memory_budget"]["max_total_tokens"]
             )
-    assert metrics["infercast"]["calls"]["context"] == (2 if case == "chunk" else 1)
-    assert metrics["infercast"]["calls"]["decode"] == 15
+    assert metrics["simopus"]["calls"]["context"] == (2 if case == "chunk" else 1)
+    assert metrics["simopus"]["calls"]["decode"] == 15
     assert metrics["prefix_cache_reused_ratio"] == pytest.approx(
         64 / length if case == "prefix" else 0
     )
@@ -317,7 +317,7 @@ def test_infercast_scheduler_forwards(provider_inputs, tmp_path, case, monkeypat
         assert len(commands) == 1
         assert "--max-total-tokens" not in commands[0]
         budget = metrics["memory_budget"]
-        assert budget["provider"] == "infercast"
+        assert budget["provider"] == "simopus"
         assert budget["provider_revision"] == provider_inputs[2]
         assert budget["model_id"] == config["predictor"]["model_id"]
         assert re.fullmatch(r"[0-9a-f]{64}", budget["resource_digest"])
@@ -332,7 +332,7 @@ def test_infercast_scheduler_forwards(provider_inputs, tmp_path, case, monkeypat
         assert budget["max_total_tokens"] > 0
         assert len(budget["ranks"]) == 8
         provenance = budget["provenance"]
-        assert provenance["infercast_revision"] == provider_inputs[2]
+        assert provenance["simopus_revision"] == provider_inputs[2]
         assert provenance["requested_revision"] == config["predictor"]["model_revision"]
         assert (
             provenance["config_sha256"]
@@ -348,7 +348,7 @@ def test_infercast_scheduler_forwards(provider_inputs, tmp_path, case, monkeypat
         )
 
 
-def test_infercast_ragged_mixed_batch(provider_inputs, tmp_path):
+def test_simopus_ragged_mixed_batch(provider_inputs, tmp_path):
     with simulator(provider_inputs, tmp_path, mixed=True) as (
         url,
         output,
@@ -370,7 +370,7 @@ def test_infercast_ragged_mixed_batch(provider_inputs, tmp_path):
         metrics, iterations, _ = read_profile(
             url, output, provider_inputs, config, count=4, output_length=lengths
         )
-    assert metrics["infercast"]["calls"]["mixed"] > 0
+    assert metrics["simopus"]["calls"]["mixed"] > 0
     assert any(
         item["forward_mode"] == "MIXED"
         and item["requests"] == [[8, 63], [4, 575], [3, 2175], [1, 8383]]
@@ -378,7 +378,7 @@ def test_infercast_ragged_mixed_batch(provider_inputs, tmp_path):
     )
 
 
-def test_infercast_blocking_successive_arrivals(provider_inputs, tmp_path):
+def test_simopus_blocking_successive_arrivals(provider_inputs, tmp_path):
     with simulator(provider_inputs, tmp_path, mode="BLOCKING") as (url, output, config):
         generate(url, [[7] * 128], total=2)
         # The next arrival is wall-clock based, after CPU/provider work for the first.
@@ -387,7 +387,7 @@ def test_infercast_blocking_successive_arrivals(provider_inputs, tmp_path):
     assert stats[1]["created_time"] > stats[0]["created_time"]
 
 
-def test_generic_qwen_replay_with_infercast_budget(provider_inputs, tmp_path):
+def test_generic_qwen_replay_with_simopus_budget(provider_inputs, tmp_path):
     # The empty table uses the existing explicit fallback, without measured data.
     table = tmp_path / "empty-replay.json"
     table.write_text("{}", encoding="utf-8")
@@ -428,9 +428,9 @@ def test_generic_qwen_replay_with_infercast_budget(provider_inputs, tmp_path):
     assert metrics["completed"] == 1 and metrics["total_output"] == 16
     assert metrics["replay_exact_match_steps"] == 0
     assert metrics["replay_zero_fallback_steps"] == 16
-    assert "infercast" not in metrics
+    assert "simopus" not in metrics
     budget = metrics["memory_budget"]
-    assert budget["provider"] == "infercast"
+    assert budget["provider"] == "simopus"
     assert budget["provider_revision"] == provider_inputs[2]
     assert budget["model_id"] == "Qwen/Qwen3-8B"
     assert budget["topology"] == {
@@ -440,5 +440,5 @@ def test_generic_qwen_replay_with_infercast_budget(provider_inputs, tmp_path):
         "pp_size": 1,
     }
     assert native_tokens == budget["max_total_tokens"] > 0
-    assert budget["provenance"]["infercast_revision"] == provider_inputs[2]
+    assert budget["provenance"]["simopus_revision"] == provider_inputs[2]
     assert budget["provenance"]["requested_revision"] is None

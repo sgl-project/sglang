@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "contract": "infercast-forward-latency",
+  "contract": "simopus-forward-latency",
   "supported_forward_modes": ["EXTEND", "MIXED"],
   "cases": [
     {

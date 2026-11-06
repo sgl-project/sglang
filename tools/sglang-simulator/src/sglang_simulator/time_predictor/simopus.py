@@ -1,4 +1,4 @@
-"""InferCast model-forward latency predictor."""
+"""SimOpus model-forward latency predictor."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from sglang_simulator.time_predictor.base import (
 )
 from sglang_simulator.time_predictor.simopus_sdk import load_sdk
 
-PROVIDER_CONTRACT = "infercast-forward-latency"
+PROVIDER_CONTRACT = "simopus-forward-latency"
 _CONTEXT_MODES = {"EXTEND", "MIXED"}
 _SUPPORTED_MODES = _CONTEXT_MODES | {"DECODE"}
 _SUPPORTED_MODELS = frozenset({"deepseek-ai/DeepSeek-R1"})
@@ -96,7 +96,7 @@ def validate_topology(config: SchedulerConfig) -> None:
     if config.dp_size != 1 or config.cp_size != 1:
         raise _error(
             "unsupported_topology",
-            "InferCast provider requires dp_size=cp_size=1",
+            "SimOpus provider requires dp_size=cp_size=1",
             **topology,
         )
     if config.tp_size % config.ep_size:
@@ -109,18 +109,18 @@ def validate_topology(config: SchedulerConfig) -> None:
 
 def milliseconds_to_seconds(value: Any) -> float:
     if isinstance(value, bool):
-        raise _error("invalid_provider_output", "InferCast latency must not be boolean")
+        raise _error("invalid_provider_output", "SimOpus latency must not be boolean")
     try:
         latency_ms = float(value)
     except (TypeError, ValueError) as error:
         raise _error(
             "invalid_provider_output",
-            f"InferCast returned non-numeric latency {value!r}",
+            f"SimOpus returned non-numeric latency {value!r}",
         ) from error
     if not math.isfinite(latency_ms) or latency_ms <= 0:
         raise _error(
             "invalid_provider_output",
-            f"InferCast latency must be finite and positive, got {latency_ms!r}",
+            f"SimOpus latency must be finite and positive, got {latency_ms!r}",
             latency_ms=latency_ms,
         )
     return latency_ms / 1000.0
@@ -146,8 +146,8 @@ def _sha256(path: str | Path) -> str:
     return digest.hexdigest()
 
 
-class InferCastTimePredictor(InferTimePredictor):
-    """Call one InferCast UMD estimate for one prepared SGLang forward."""
+class SimOpusTimePredictor(InferTimePredictor):
+    """Call one SimOpus UMD estimate for one prepared SGLang forward."""
 
     requires_prepared_batch = True
 
@@ -175,7 +175,7 @@ class InferCastTimePredictor(InferTimePredictor):
             unsupported = ", ".join(sorted(kwargs))
             raise _error(
                 "provider_initialization_failed",
-                f"unsupported InferCast predictor configuration: {unsupported}",
+                f"unsupported SimOpus predictor configuration: {unsupported}",
                 unsupported_fields=sorted(kwargs),
             )
         super().__init__(model, hw, config)
@@ -195,13 +195,13 @@ class InferCastTimePredictor(InferTimePredictor):
         if missing:
             raise _error(
                 "provider_initialization_failed",
-                f"missing InferCast configuration: {', '.join(missing)}",
+                f"missing SimOpus configuration: {', '.join(missing)}",
                 missing_fields=missing,
             )
         if model_id not in _SUPPORTED_MODELS:
             raise _error(
                 "unsupported_model",
-                f"InferCast simulator provider does not support model {model_id!r}",
+                f"SimOpus simulator provider does not support model {model_id!r}",
                 model_id=model_id,
                 supported_models=sorted(_SUPPORTED_MODELS),
             )
@@ -213,7 +213,7 @@ class InferCastTimePredictor(InferTimePredictor):
         if str(database_mode).upper() != "SILICON":
             raise _error(
                 "incompatible_runtime",
-                "InferCast provider requires database_mode='SILICON'",
+                "SimOpus provider requires database_mode='SILICON'",
             )
         if not _FULL_COMMIT.fullmatch(str(provider_revision)):
             raise _error(
@@ -251,7 +251,7 @@ class InferCastTimePredictor(InferTimePredictor):
         except (ImportError, AttributeError) as error:
             raise _error(
                 "provider_initialization_failed",
-                "InferCast is not installed or lacks the forward-latency contract",
+                "SimOpus is not installed or lacks the forward-latency contract",
             ) from error
         self._request_shape_factory = ExtendRequestShape
         try:
@@ -263,7 +263,7 @@ class InferCastTimePredictor(InferTimePredictor):
         except (TypeError, ValueError) as error:
             raise _error(
                 "invalid_execution_profile",
-                f"invalid InferCast execution profile: {error}",
+                f"invalid SimOpus execution profile: {error}",
             ) from error
         try:
             self._decode_execution_profile = self._load_profile(
@@ -283,7 +283,7 @@ class InferCastTimePredictor(InferTimePredictor):
         except (TypeError, ValueError) as error:
             raise _error(
                 "invalid_decode_execution_profile",
-                f"invalid InferCast decode execution profile: {error}",
+                f"invalid SimOpus decode execution profile: {error}",
             ) from error
         (
             self._provider,
@@ -331,7 +331,7 @@ class InferCastTimePredictor(InferTimePredictor):
         if not isinstance(geometry, dict):
             raise _error(
                 "incompatible_runtime",
-                "InferCast provider does not expose model geometry",
+                "SimOpus provider does not expose model geometry",
             )
         fields = {
             "hidden_size": "hidden_size",
@@ -344,17 +344,17 @@ class InferCastTimePredictor(InferTimePredictor):
         if model.attention_arch != "MLA":
             mismatches["attention_arch"] = {
                 "sglang": model.attention_arch,
-                "infercast": "MLA",
+                "simopus": "MLA",
             }
         for model_field, geometry_field in fields.items():
             expected = getattr(model, model_field)
             actual = geometry.get(geometry_field)
             if expected is None or expected != actual:
-                mismatches[model_field] = {"sglang": expected, "infercast": actual}
+                mismatches[model_field] = {"sglang": expected, "simopus": actual}
         if mismatches:
             raise _error(
                 "incompatible_runtime",
-                "InferCast model geometry does not match the loaded SGLang model",
+                "SimOpus model geometry does not match the loaded SGLang model",
                 mismatches=mismatches,
             )
 
@@ -370,13 +370,13 @@ class InferCastTimePredictor(InferTimePredictor):
             ):
                 raise _error(
                     "incompatible_runtime",
-                    "installed InferCast has no verifiable source revision",
+                    "installed SimOpus has no verifiable source revision",
                     actual_revision=actual_revision,
                 )
             if actual_revision != self._provider_revision:
                 raise _error(
                     "incompatible_runtime",
-                    "configured provider_revision does not match InferCast",
+                    "configured provider_revision does not match SimOpus",
                     configured_revision=self._provider_revision,
                     actual_revision=actual_revision,
                 )
@@ -401,19 +401,19 @@ class InferCastTimePredictor(InferTimePredictor):
         except (ImportError, AttributeError) as error:
             raise _error(
                 "provider_initialization_failed",
-                "InferCast is not installed",
+                "SimOpus is not installed",
             ) from error
         except FileNotFoundError as error:
             raise _error(
                 "data_unavailable",
-                f"InferCast FIDB data is unavailable: {error}",
+                f"SimOpus FIDB data is unavailable: {error}",
             ) from error
         except PredictorError:
             raise
         except Exception as error:
             raise _error(
                 "provider_initialization_failed",
-                f"failed to initialize InferCast: {error}",
+                f"failed to initialize SimOpus: {error}",
             ) from error
 
     def predict_infer_time(self, batch: ScheduleBatch) -> float:
@@ -442,13 +442,13 @@ class InferCastTimePredictor(InferTimePredictor):
                     **self._runtime,
                 )
         except Exception as error:
-            infercast_code = getattr(error, "code", None)
+            simopus_code = getattr(error, "code", None)
             raise _error(
-                _PROVIDER_ERROR_CODES.get(infercast_code, "prediction_failed"),
-                f"InferCast prediction failed: {error}",
+                _PROVIDER_ERROR_CODES.get(simopus_code, "prediction_failed"),
+                f"SimOpus prediction failed: {error}",
                 forward_mode=mode,
-                infercast_code=infercast_code,
-                infercast_details=getattr(error, "details", {}),
+                simopus_code=simopus_code,
+                simopus_details=getattr(error, "details", {}),
             ) from error
         latency_seconds = milliseconds_to_seconds(latency_ms)
         phase = {"DECODE": "decode", "MIXED": "mixed", "EXTEND": "context"}[mode]
@@ -458,7 +458,7 @@ class InferCastTimePredictor(InferTimePredictor):
 
     def get_metrics(self) -> dict:
         return {
-            "infercast": {
+            "simopus": {
                 "contract": PROVIDER_CONTRACT,
                 "provider_version": self._provider_version,
                 "provider_revision": self._provider_revision,

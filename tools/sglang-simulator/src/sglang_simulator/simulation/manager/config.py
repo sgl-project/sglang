@@ -52,8 +52,8 @@ class ConfigManager:
         return path
 
     @classmethod
-    def resolve_infercast_path(cls, path: str | None) -> str | None:
-        """Resolve the InferCast systems directory relative to its config file."""
+    def resolve_simopus_path(cls, path: str | None) -> str | None:
+        """Resolve the SimOpus systems directory relative to its config file."""
         if not path:
             return path
         path = Path(os.path.expandvars(path)).expanduser()
@@ -282,9 +282,9 @@ class ConfigManager:
                 miss_strategy=predictor_config.get("miss_strategy", "zero"),
                 miss_knn_k=predictor_config.get("miss_knn_k", 3),
             )
-        elif predictor_name in {"simopus", "infercast"}:
-            from sglang_simulator.time_predictor.infercast import (
-                InferCastTimePredictor,
+        elif predictor_name == "simopus":
+            from sglang_simulator.time_predictor.simopus import (
+                SimOpusTimePredictor,
             )
 
             obsolete_fields = sorted(
@@ -292,7 +292,7 @@ class ConfigManager:
             )
             if obsolete_fields:
                 raise ValueError(
-                    "obsolete InferCast predictor configuration fields: "
+                    "obsolete SimOpus predictor configuration fields: "
                     + ", ".join(obsolete_fields)
                 )
 
@@ -313,17 +313,17 @@ class ConfigManager:
             unknown_fields = sorted(predictor_config.keys() - supported_fields)
             if unknown_fields:
                 raise ValueError(
-                    "unknown InferCast predictor configuration fields: "
+                    "unknown SimOpus predictor configuration fields: "
                     + ", ".join(unknown_fields)
                 )
 
-            return InferCastTimePredictor(
+            return SimOpusTimePredictor(
                 model,
                 hw=hw,
                 config=sched_config,
                 model_id=predictor_config.get("model_id"),
                 system=config.get("platform", {}).get("accelerator", {}).get("name"),
-                systems_root=cls.resolve_infercast_path(
+                systems_root=cls.resolve_simopus_path(
                     predictor_config.get("systems_root")
                 ),
                 database_mode=predictor_config.get("database_mode", "SILICON"),
@@ -350,5 +350,5 @@ class ConfigManager:
                 )
             raise ValueError(
                 f"Unknown predictor name: {predictor_name}. "
-                f"Supported: aisimulate, ml, replay, infercast"
+                f"Supported: aisimulate, ml, replay, simopus"
             )

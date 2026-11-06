@@ -153,7 +153,7 @@ def test_native_pool_budget_rejects_zero_cell_constant_capacity(model_runner):
 
 def test_native_pool_budget_rejects_unreachable_rounded_target(model_runner):
     pool = LinearPool(fixed_bytes=0, alignment=8)
-    with pytest.raises(ValueError, match="exact InferCast capacity"):
+    with pytest.raises(ValueError, match="exact SimOpus capacity"):
         model_runner._native_pool_budget(pool, 12, 4, require_exact=True)
 
 
@@ -267,7 +267,7 @@ def test_explicit_capacity_bypasses_sdk_and_clears_budget_metrics(
     original_import = __import__
 
     def no_sdk(name, *args, **kwargs):
-        if name.split(".", 1)[0] in {"infercast", "aiconfigurator"}:
+        if name.split(".", 1)[0] in {"simopus", "aiconfigurator"}:
             raise AssertionError(
                 "explicit token capacity must not import a predictor SDK"
             )

@@ -11,7 +11,7 @@ _LAZY_CLASSES = {
     "AISimulateTimePredictor": "aisimulate",
     "MLTimePredictor": "ml",
     "ReplayTimePredictor": "replay",
-    "InferCastTimePredictor": "infercast",
+    "SimOpusTimePredictor": "simopus",
 }
 
 
@@ -27,7 +27,7 @@ def __getattr__(name: str):
 
 __all__ = (
     "AISimulateTimePredictor",
-    "InferCastTimePredictor",
+    "SimOpusTimePredictor",
     "InferTimePredictor",
     "MLTimePredictor",
     "PredictorError",

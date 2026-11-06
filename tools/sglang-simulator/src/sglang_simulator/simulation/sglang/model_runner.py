@@ -47,7 +47,7 @@ def _native_pool_budget(configurator, target_tokens, page_size, *, require_exact
         or target_tokens < 2
         or target_tokens % page_size
     ):
-        raise ValueError("InferCast KV capacity must be >=2 and page-aligned")
+        raise ValueError("SimOpus KV capacity must be >=2 and page-aligned")
 
     def resolved_tokens(budget_bytes):
         try:
@@ -76,7 +76,7 @@ def _native_pool_budget(configurator, target_tokens, page_size, *, require_exact
         else:
             upper = middle
     if require_exact and resolved_tokens(upper) != target_tokens:
-        raise ValueError("Native KV pool cannot represent the exact InferCast capacity")
+        raise ValueError("Native KV pool cannot represent the exact SimOpus capacity")
     return upper
 
 
@@ -126,7 +126,7 @@ def _validate_resource_pool(configurator):
         unsupported.append("runtime quantization override")
     if unsupported:
         raise ValueError(
-            "InferCast memory budget does not model: " + ", ".join(unsupported)
+            "SimOpus memory budget does not model: " + ", ".join(unsupported)
         )
 
 
@@ -317,7 +317,7 @@ class C_KVCacheConfiguratorHook(BaseHook):
             budget_config = ConfigManager.get_memory_budget_config()
             if budget_config is not None:
                 from sglang_simulator.simulation.resource_budget import (
-                    estimate_infercast_budget,
+                    estimate_simopus_budget,
                 )
 
                 from sglang.srt.model_executor.pool_configurator import (
@@ -331,9 +331,9 @@ class C_KVCacheConfiguratorHook(BaseHook):
                 target_config.page_size = _resolve_kv_page_size(self)
                 if target_config.kv_bytes_per_token_per_gpu is not None:
                     raise ValueError(
-                        "InferCast memory budget does not accept KV byte overrides"
+                        "SimOpus memory budget does not accept KV byte overrides"
                     )
-                max_tokens, metrics = estimate_infercast_budget(
+                max_tokens, metrics = estimate_simopus_budget(
                     model, hardware, target_config, budget_config
                 )
                 native_bytes = _native_pool_budget(

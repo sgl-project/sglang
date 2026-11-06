@@ -1,4 +1,4 @@
-"""Optional InferCast resource budgets for the declared target deployment."""
+"""Optional SimOpus resource budgets for the declared target deployment."""
 
 from __future__ import annotations
 
@@ -64,9 +64,7 @@ def _validate_loaded_model(
 ) -> None:
     payload = config_path.read_bytes()
     if hashlib.sha256(payload).hexdigest() != resources.provenance.config_sha256:
-        raise ValueError(
-            "local config.json changed during InferCast resource estimation"
-        )
+        raise ValueError("local config.json changed during SimOpus resource estimation")
     source = json.loads(payload)
     effective = model.hf_config
     if callable(getattr(effective, "to_dict", None)):
@@ -104,24 +102,22 @@ def _validate_loaded_model(
         )
     expected_arch = {"LLAMA": "MHA", "DEEPSEEK": "MLA"}.get(resources.family)
     if expected_arch is not None and model.attention_arch != expected_arch:
-        raise ValueError(
-            "loaded attention layout differs from InferCast resource layout"
-        )
+        raise ValueError("loaded attention layout differs from SimOpus resource layout")
     embedding = next(
         tensor for tensor in resources.tensors if tensor.role == "embedding"
     )
     if _dtype_name(model.torch_dtype) != embedding.storage.data_dtype:
         raise ValueError(
-            "loaded model torch_dtype differs from InferCast resource storage"
+            "loaded model torch_dtype differs from SimOpus resource storage"
         )
     if (
         target_config.data_type is not None
         and _dtype_name(target_config.data_type) != embedding.storage.data_dtype
     ):
-        raise ValueError("target data_type differs from InferCast resource storage")
+        raise ValueError("target data_type differs from SimOpus resource storage")
 
 
-def estimate_infercast_budget(
+def estimate_simopus_budget(
     model: ModelInfo,
     hw: AcceleratorInfo,
     target_config: SchedulerConfig,
@@ -133,8 +129,8 @@ def estimate_infercast_budget(
     unknown = set(budget_config) - _CONFIG_FIELDS
     if unknown:
         raise ValueError(f"unknown memory_budget fields: {sorted(unknown)}")
-    if budget_config.get("provider") not in {"simopus", "infercast"}:
-        raise ValueError("memory_budget.provider must be 'simopus' or 'infercast'")
+    if budget_config.get("provider") != "simopus":
+        raise ValueError("memory_budget.provider must be 'simopus'")
     model_id = budget_config.get("model_id")
     if not isinstance(model_id, str) or not model_id or model_id != model_id.strip():
         raise ValueError("memory_budget.model_id must be a nonempty trimmed string")
@@ -154,19 +150,19 @@ def estimate_infercast_budget(
     if not isinstance(budget_config.get("policy"), Mapping):
         raise ValueError("memory_budget.policy must be an explicit object")  # noqa: TRY004
     if type(target_config.dp_size) is not int or target_config.dp_size != 1:
-        raise ValueError("InferCast memory budgets require target dp_size=1")
+        raise ValueError("SimOpus memory budgets require target dp_size=1")
     if type(target_config.cp_size) is not int or target_config.cp_size != 1:
-        raise ValueError("InferCast memory budgets require target cp_size=1")
+        raise ValueError("SimOpus memory budgets require target cp_size=1")
     if (
         not isinstance(model.model_path, (str, Path))
         or not str(model.model_path).strip()
     ):
         raise ValueError(
-            "InferCast memory budgets require a local model config directory"
+            "SimOpus memory budgets require a local model config directory"
         )
     kv_dtype = getattr(target_config.kv_cache_data_type, "value", None)
     if not isinstance(kv_dtype, str):
-        raise ValueError("InferCast memory budgets require explicit kv_cache_data_type")  # noqa: TRY004
+        raise ValueError("SimOpus memory budgets require explicit kv_cache_data_type")  # noqa: TRY004
 
     capacity = hw.hbm_capacity_gb
     try:
@@ -193,7 +189,7 @@ def estimate_infercast_budget(
         actual_revision = getattr(package, "__revision__", None)
         if actual_revision != revision:
             raise ValueError(
-                "memory_budget.provider_revision does not match installed InferCast "
+                "memory_budget.provider_revision does not match installed SimOpus "
                 f"(configured={revision!r}, installed={actual_revision!r})"
             )
         MemoryBudgetPolicy = sdk.MemoryBudgetPolicy
@@ -201,9 +197,7 @@ def estimate_infercast_budget(
         build_model_resources = sdk.build_model_resources
         estimate_memory_budget = sdk.estimate_memory_budget
     except (ImportError, AttributeError) as error:
-        raise ValueError(
-            "InferCast with the resource-budget SDK is required"
-        ) from error
+        raise ValueError("SimOpus with the resource-budget SDK is required") from error
 
     topology = ResourceTopology(
         tp_size=target_config.tp_size,
@@ -233,7 +227,7 @@ def estimate_infercast_budget(
         or max_tokens <= 0
     ):
         raise ValueError(
-            "InferCast memory budget leaves no usable KV capacity "
+            "SimOpus memory budget leaves no usable KV capacity "
             f"(status={budget.status!r}, max_cache_tokens={max_tokens!r})"
         )
     metrics = {

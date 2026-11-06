@@ -23,7 +23,7 @@ def test_optional_predictors_are_not_imported_at_startup():
 import builtins
 import sys
 
-blocked = {"aiconfigurator", "infercast"}
+blocked = {"aiconfigurator", "simopus"}
 original_import = builtins.__import__
 def guarded_import(name, *args, **kwargs):
     if name.split(".", 1)[0] in blocked:
@@ -45,14 +45,14 @@ assert not blocked.intersection(sys.modules)
     )
 
 
-def test_infercast_systems_resolve_from_config_directory(tmp_path, monkeypatch):
+def test_simopus_systems_resolve_from_config_directory(tmp_path, monkeypatch):
     config = tmp_path / "config" / "simulator.json"
     config.parent.mkdir()
     config.write_text("{}", encoding="utf-8")
     monkeypatch.setattr(Envs, "config_path", classmethod(lambda cls: str(config)))
     monkeypatch.chdir(tmp_path)
 
-    assert ConfigManager.resolve_infercast_path("systems") == str(
+    assert ConfigManager.resolve_simopus_path("systems") == str(
         (config.parent / "systems").resolve()
     )
 
@@ -72,11 +72,11 @@ def test_existing_predictor_paths_keep_cwd_and_ancestor_resolution(
     assert ConfigManager.resolve_config_relative_path("missing.json") == "missing.json"
 
 
-@pytest.mark.parametrize("provider_name", ["simopus", "infercast"])
-def test_config_manager_passes_infercast_configuration(
+@pytest.mark.parametrize("provider_name", ["simopus"])
+def test_config_manager_passes_simopus_configuration(
     tmp_path, monkeypatch, provider_name
 ):
-    import sglang_simulator.time_predictor.infercast as infercast_module
+    import sglang_simulator.time_predictor.simopus as simopus_module
 
     captured = {}
 
@@ -86,7 +86,7 @@ def test_config_manager_passes_infercast_configuration(
 
     config_path = tmp_path / "simulator.json"
     monkeypatch.setattr(Envs, "config_path", classmethod(lambda cls: str(config_path)))
-    monkeypatch.setattr(infercast_module, "InferCastTimePredictor", Predictor)
+    monkeypatch.setattr(simopus_module, "SimOpusTimePredictor", Predictor)
     monkeypatch.setattr(
         ConfigManager,
         "_raw_config",
@@ -125,18 +125,28 @@ def test_config_manager_passes_infercast_configuration(
     assert captured["decode_attn_kernel_impl"] == "cuda_graph"
 
 
+def test_unmerged_provider_does_not_accept_old_selector(monkeypatch):
+    monkeypatch.setattr(
+        ConfigManager, "_raw_config", {"predictor": {"name": "infercast"}}
+    )
+    with pytest.raises(ValueError, match="Unknown predictor name"):
+        ConfigManager.get_inference_time_predictor(
+            object(), object(), SchedulerConfig()
+        )
+
+
 @pytest.mark.parametrize("field", ["contract_version", "reduction_policy"])
-def test_config_manager_rejects_obsolete_infercast_configuration(field, monkeypatch):
+def test_config_manager_rejects_obsolete_simopus_configuration(field, monkeypatch):
     monkeypatch.setattr(
         ConfigManager,
         "_raw_config",
         {
             "platform": {"accelerator": {"name": "mi355x"}},
-            "predictor": {"name": "infercast", field: "obsolete"},
+            "predictor": {"name": "simopus", field: "obsolete"},
         },
     )
 
-    with pytest.raises(ValueError, match="obsolete InferCast predictor"):
+    with pytest.raises(ValueError, match="obsolete SimOpus predictor"):
         ConfigManager.get_inference_time_predictor(
             ModelInfo(),
             AcceleratorInfo(
@@ -152,13 +162,13 @@ def test_config_manager_rejects_obsolete_infercast_configuration(field, monkeypa
 @pytest.mark.parametrize(
     "field", ["prefill_scale_factor", "decode_scale_factor", "typo"]
 )
-def test_config_manager_rejects_unknown_infercast_configuration(field, monkeypatch):
+def test_config_manager_rejects_unknown_simopus_configuration(field, monkeypatch):
     monkeypatch.setattr(
         ConfigManager,
         "_raw_config",
-        {"predictor": {"name": "infercast", field: 1.0}},
+        {"predictor": {"name": "simopus", field: 1.0}},
     )
-    with pytest.raises(ValueError, match="unknown InferCast predictor"):
+    with pytest.raises(ValueError, match="unknown SimOpus predictor"):
         ConfigManager.get_inference_time_predictor(ModelInfo(), None, SchedulerConfig())
 
 

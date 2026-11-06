@@ -9,7 +9,7 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
-from sglang_simulator.simulation.resource_budget import estimate_infercast_budget
+from sglang_simulator.simulation.resource_budget import estimate_simopus_budget
 from sglang_simulator.simulation.types import SchedulerConfig
 from sglang_simulator.spec.accelerator import AcceleratorInfo
 from sglang_simulator.spec.data_type import DataType
@@ -20,7 +20,7 @@ _REVISION = "a" * 40
 
 def _config(**overrides):
     return {
-        "provider": "infercast",
+        "provider": "simopus",
         "provider_revision": _REVISION,
         "model_id": "new-org/new-dense-model",
         "policy": {
@@ -79,10 +79,10 @@ def _model(tmp_path):
 
 @pytest.fixture
 def sdk_double(monkeypatch):
-    package = ModuleType("infercast")
+    package = ModuleType("simopus")
     package.__path__ = []
     package.__revision__ = _REVISION
-    sdk = ModuleType("infercast.sdk")
+    sdk = ModuleType("simopus.sdk")
     sdk.calls = []
 
     @dataclass
@@ -160,21 +160,19 @@ def sdk_double(monkeypatch):
     )
     sdk.ResourceTopology, sdk.MemoryBudgetPolicy = Topology, Policy
     sdk.build_model_resources, sdk.estimate_memory_budget = build, estimate
-    monkeypatch.setitem(sys.modules, "infercast", package)
-    monkeypatch.setitem(sys.modules, "infercast.sdk", sdk)
     monkeypatch.setitem(sys.modules, "simopus", package)
     monkeypatch.setitem(sys.modules, "simopus.sdk", sdk)
     return sdk
 
 
-@pytest.mark.parametrize("provider_name", ["simopus", "infercast"])
+@pytest.mark.parametrize("provider_name", ["simopus"])
 def test_target_topology_local_config_and_explicit_policy(
     sdk_double, tmp_path, provider_name
 ):
     model = _model(tmp_path)
     config = _config(model_revision="d" * 40, shared_expert_tp_size=4)
     config["provider"] = provider_name
-    tokens, metrics = estimate_infercast_budget(model, _hw(), _target(), config)
+    tokens, metrics = estimate_simopus_budget(model, _hw(), _target(), config)
 
     assert tokens == 1024
     method, model_id, arguments = sdk_double.calls[0]
@@ -201,12 +199,18 @@ def test_target_topology_local_config_and_explicit_policy(
 
 
 def test_default_page_size_and_revision_are_explicit(sdk_double, tmp_path):
-    estimate_infercast_budget(
-        _model(tmp_path), _hw(), _target(page_size=None), _config()
-    )
+    estimate_simopus_budget(_model(tmp_path), _hw(), _target(page_size=None), _config())
     assert sdk_double.calls[0][2]["kv_page_size"] == 1
     assert sdk_double.calls[0][2]["revision"] is None
     assert sdk_double.calls[0][2]["shared_expert_tp_size"] is None
+
+
+def test_unmerged_budget_does_not_accept_old_provider(sdk_double, tmp_path):
+    config = _config()
+    config["provider"] = "infercast"
+    with pytest.raises(ValueError, match="provider must be 'simopus'"):
+        estimate_simopus_budget(_model(tmp_path), _hw(), _target(), config)
+    assert sdk_double.calls == []
 
 
 @pytest.mark.parametrize(
@@ -224,15 +228,15 @@ def test_default_page_size_and_revision_are_explicit(sdk_double, tmp_path):
 )
 def test_bad_configuration_fails_before_sdk_queries(sdk_double, tmp_path, fields):
     with pytest.raises(ValueError):
-        estimate_infercast_budget(_model(tmp_path), _hw(), _target(), _config(**fields))
+        estimate_simopus_budget(_model(tmp_path), _hw(), _target(), _config(**fields))
     assert sdk_double.calls == []
 
 
 @pytest.mark.parametrize("actual_revision", [None, "main", "c" * 40])
 def test_provider_source_revision_must_match(sdk_double, tmp_path, actual_revision):
-    sys.modules["infercast"].__revision__ = actual_revision
+    sys.modules["simopus"].__revision__ = actual_revision
     with pytest.raises(ValueError, match="does not match installed"):
-        estimate_infercast_budget(_model(tmp_path), _hw(), _target(), _config())
+        estimate_simopus_budget(_model(tmp_path), _hw(), _target(), _config())
     assert sdk_double.calls == []
 
 
@@ -241,7 +245,7 @@ def test_target_memory_is_required_without_host_fallback(
     sdk_double, tmp_path, capacity
 ):
     with pytest.raises(ValueError, match="hbm_capacity_gb"):
-        estimate_infercast_budget(_model(tmp_path), _hw(capacity), _target(), _config())
+        estimate_simopus_budget(_model(tmp_path), _hw(capacity), _target(), _config())
     assert sdk_double.calls == []
 
 
@@ -249,7 +253,7 @@ def test_target_memory_is_required_without_host_fallback(
 @pytest.mark.parametrize("value", [2, True])
 def test_unsupported_target_topologies_fail_closed(sdk_double, tmp_path, field, value):
     with pytest.raises(ValueError, match=field):
-        estimate_infercast_budget(
+        estimate_simopus_budget(
             _model(tmp_path), _hw(), _target(**{field: value}), _config()
         )
     assert sdk_double.calls == []
@@ -269,7 +273,7 @@ def test_exhausted_or_invalid_capacity_is_never_published(
 ):
     sdk_double.budget.status, sdk_double.budget.max_cache_tokens = status, tokens
     with pytest.raises(ValueError, match="no usable KV capacity"):
-        estimate_infercast_budget(_model(tmp_path), _hw(), _target(), _config())
+        estimate_simopus_budget(_model(tmp_path), _hw(), _target(), _config())
 
 
 def test_sdk_failure_propagates_without_fallback(sdk_double, tmp_path):
@@ -278,7 +282,7 @@ def test_sdk_failure_propagates_without_fallback(sdk_double, tmp_path):
 
     sdk_double.build_model_resources = fail
     with pytest.raises(ValueError, match="unsupported resource family"):
-        estimate_infercast_budget(_model(tmp_path), _hw(), _target(), _config())
+        estimate_simopus_budget(_model(tmp_path), _hw(), _target(), _config())
     assert sdk_double.calls == []
 
 
@@ -298,7 +302,7 @@ def test_effective_model_config_cannot_change_resource_structure(
     model = _model(tmp_path)
     model.hf_config[field] = value
     with pytest.raises(ValueError, match="geometry differs"):
-        estimate_infercast_budget(model, _hw(), _target(), _config())
+        estimate_simopus_budget(model, _hw(), _target(), _config())
     assert [call[0] for call in sdk_double.calls] == ["build"]
 
 
@@ -306,26 +310,26 @@ def test_loaded_geometry_cannot_override_materialized_config(sdk_double, tmp_pat
     model = _model(tmp_path)
     model.hidden_size = 32
     with pytest.raises(ValueError, match="geometry differs"):
-        estimate_infercast_budget(model, _hw(), _target(), _config())
+        estimate_simopus_budget(model, _hw(), _target(), _config())
 
 
 def test_effective_dtype_cannot_override_resource_storage(sdk_double, tmp_path):
     model = _model(tmp_path)
     model.torch_dtype = "float32"
     with pytest.raises(ValueError, match="torch_dtype differs"):
-        estimate_infercast_budget(model, _hw(), _target(), _config())
+        estimate_simopus_budget(model, _hw(), _target(), _config())
 
 
 def test_target_dtype_cannot_override_resource_storage(sdk_double, tmp_path):
     with pytest.raises(ValueError, match="target data_type differs"):
-        estimate_infercast_budget(
+        estimate_simopus_budget(
             _model(tmp_path), _hw(), _target(data_type=DataType.FP32), _config()
         )
 
 
 @pytest.mark.parametrize("dtype", [None, DataType.BF16])
 def test_target_auto_or_matching_dtype_is_supported(sdk_double, tmp_path, dtype):
-    tokens, _ = estimate_infercast_budget(
+    tokens, _ = estimate_simopus_budget(
         _model(tmp_path), _hw(), _target(data_type=dtype), _config()
     )
     assert tokens == 1024
@@ -335,7 +339,7 @@ def test_materialized_hf_config_object_is_supported(sdk_double, tmp_path):
     model = _model(tmp_path)
     config = model.hf_config
     model.hf_config = SimpleNamespace(to_dict=lambda: dict(config))
-    tokens, _ = estimate_infercast_budget(model, _hw(), _target(), _config())
+    tokens, _ = estimate_simopus_budget(model, _hw(), _target(), _config())
     assert tokens == 1024
 
 
@@ -343,14 +347,14 @@ def test_loaded_attention_layout_must_match_resource_family(sdk_double, tmp_path
     model = _model(tmp_path)
     model.attention_arch = "MLA"
     with pytest.raises(ValueError, match="attention layout differs"):
-        estimate_infercast_budget(model, _hw(), _target(), _config())
+        estimate_simopus_budget(model, _hw(), _target(), _config())
 
 
 def test_policy_unknown_fields_are_rejected(sdk_double, tmp_path):
     config = _config()
     config["policy"]["hidden_reserve"] = 1
     with pytest.raises(ValueError, match="invalid budget policy"):
-        estimate_infercast_budget(_model(tmp_path), _hw(), _target(), config)
+        estimate_simopus_budget(_model(tmp_path), _hw(), _target(), config)
     assert sdk_double.calls == []
 
 
@@ -360,7 +364,7 @@ def test_module_import_keeps_optional_sdk_and_aic_lazy():
 import builtins
 original = builtins.__import__
 def guarded(name, *args, **kwargs):
-    if name.split('.', 1)[0] in {'infercast', 'aiconfigurator', 'torch'}:
+    if name.split('.', 1)[0] in {'simopus', 'aiconfigurator', 'torch'}:
         raise AssertionError('unexpected optional import: ' + name)
     return original(name, *args, **kwargs)
 builtins.__import__ = guarded
@@ -376,11 +380,11 @@ import sglang_simulator.simulation.resource_budget
 
 
 def test_real_sdk_small_dense_budget(tmp_path, monkeypatch):
-    pytest.importorskip("infercast.sdk.resources.models")
-    import infercast
+    pytest.importorskip("simopus.sdk.resources.models")
+    import simopus
 
     # Exercise actual resource contracts without depending on the wheel build used by CI.
-    monkeypatch.setattr(infercast, "__revision__", _REVISION)
+    monkeypatch.setattr(simopus, "__revision__", _REVISION)
     config = {
         "architectures": ["LlamaForCausalLM"],
         "torch_dtype": "bfloat16",
@@ -409,7 +413,7 @@ def test_real_sdk_small_dense_budget(tmp_path, monkeypatch):
             "runtime_reserve_bytes": 1 << 20,
         }
     )
-    count, metrics = estimate_infercast_budget(model, _hw(1), target, budget_config)
+    count, metrics = estimate_simopus_budget(model, _hw(1), target, budget_config)
     assert count > 0 and count % 4 == 0
     assert len(metrics["ranks"]) == 4
     assert metrics["topology"]["tp_size"] == 2
@@ -418,4 +422,4 @@ def test_real_sdk_small_dense_budget(tmp_path, monkeypatch):
     assert count == min(rank["max_cache_tokens"] for rank in metrics["ranks"])
     model.torch_dtype = "float32"
     with pytest.raises(ValueError, match="torch_dtype differs"):
-        estimate_infercast_budget(model, _hw(1), target, budget_config)
+        estimate_simopus_budget(model, _hw(1), target, budget_config)
