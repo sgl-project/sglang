@@ -66,7 +66,7 @@ def _quant_weight_blockwise(w_bf16, block=128):
     )
 
 
-def test_quant_equivalence(T, K, device):
+def _check_quant_equivalence(T, K, device):
     x = torch.randn(T, K, device=device, dtype=torch.bfloat16) * 3
     q_ref, s_ref = sglang_per_token_group_quant_fp8(x, GROUP)  # routed baseline
     q_pad, s_pad = sglang_per_token_group_quant_fp8_row_padded(x, GROUP)
@@ -81,7 +81,7 @@ def test_quant_equivalence(T, K, device):
     return bitwise_q and bitwise_s
 
 
-def test_shared_consumer(T, K, N, device):
+def _check_shared_consumer(T, K, N, device):
     torch.manual_seed(T + K)
     x = torch.randn(T, K, device=device, dtype=torch.bfloat16)
     w_bf16 = torch.randn(N, K, device=device, dtype=torch.bfloat16) / K**0.5
@@ -104,7 +104,7 @@ def test_shared_consumer(T, K, N, device):
     return bitwise
 
 
-def test_shared_consumer_deepgemm(T, K, N, device):
+def _check_shared_consumer_deepgemm(T, K, N, device):
     """DG branch (SGLANG_ENABLE_JIT_DEEPGEMM=1 recommended JIT-DeepGEMM config): the shared-expert
     linear resolves to deepgemm_w8a8_block_fp8_linear_with_fallback. Its own
     quant (column-major + TMA-aligned fp32 scales) has the same buffer layout
@@ -159,7 +159,7 @@ def _quant_weight_blockwise_n64(w_bf16, block=128):
     return q, scale
 
 
-def test_routed_consumer(T, K, E, I, topk, device):
+def _check_routed_consumer(T, K, E, I, topk, device):
     torch.manual_seed(T * 7 + K)
     x = torch.randn(T, K, device=device, dtype=torch.bfloat16)
     w1 = torch.empty(E, 2 * I, K, device=device, dtype=torch.float8_e4m3fn)
@@ -227,13 +227,13 @@ def main():
     all_bitwise_q = True
     for T in (1, 3, 4093, 4096):
         for K in (6144, 7168):
-            all_bitwise_q &= test_quant_equivalence(T, K, device)
+            all_bitwise_q &= _check_quant_equivalence(T, K, device)
 
     print("== (2) shared consumer (cutlass w8a8 linear) ==")
     # N=512 mirrors a tp8 shared expert gate_up (2*2048/8); must be %128==0.
     for T in (4093, 4096):
         for K in (6144, 7168):
-            test_shared_consumer(T, K, 512, device)
+            _check_shared_consumer(T, K, 512, device)
 
     print(
         "== (2b) shared consumer (deepgemm w8a8 linear, JIT DG recommended JIT-DeepGEMM config) =="
@@ -247,16 +247,16 @@ def main():
     else:
         for T in (4093, 4096):
             for K in (6144, 7168):
-                test_shared_consumer_deepgemm(T, K, 512, device)
+                _check_shared_consumer_deepgemm(T, K, 512, device)
         # DG accepts N % 64 (cutlass needs % 128) -- exercise the DG-only shape.
-        test_shared_consumer_deepgemm(4096, 7168, 320, device)
+        _check_shared_consumer_deepgemm(4096, 7168, 320, device)
 
     print("== (3) routed consumer (triton fused_experts) ==")
     # Identical in both cutlass and JIT-DG configs: the MoE runner stays
     # triton with a2a=none (is_deepgemm_moe_runner_backend_enabled() is False
     # for auto + a2a=none even when SGLANG_ENABLE_JIT_DEEPGEMM=1).
     for T in (61, 4093, 4096):
-        test_routed_consumer(T, 7168, E=32, I=256, topk=8, device=device)
+        _check_routed_consumer(T, 7168, E=32, I=256, topk=8, device=device)
 
     if not all_bitwise_q:
         print(

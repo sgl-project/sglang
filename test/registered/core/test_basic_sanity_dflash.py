@@ -72,7 +72,11 @@ class TestBasicSanityDFlash(
                 "--enable-metrics",
                 "--cuda-graph-backend-prefill=disabled",
             ],
-            env={"SGLANG_ENABLE_METRICS_DEVICE_TIMER": "1"},
+            env={
+                "SGLANG_ENABLE_METRICS_DEVICE_TIMER": "1",
+                # The DFlash draft derives a shorter context than the target.
+                "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN": "1",
+            },
         )
 
     @classmethod

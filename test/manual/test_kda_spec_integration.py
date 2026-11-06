@@ -1,10 +1,20 @@
 import concurrent.futures
 import time
 
+import pytest
 import requests
 
 BASE_URL = "http://localhost:30000"
 SHARED_PREFIX = "You are a helpful assistant. " * 20
+
+
+@pytest.fixture(scope="module", autouse=True)
+def require_running_server():
+    # Runs against a KDA spec-decoding server launched by hand at BASE_URL.
+    try:
+        requests.get(f"{BASE_URL}/health", timeout=5)
+    except requests.exceptions.ConnectionError:
+        pytest.skip(f"no sglang server running at {BASE_URL}")
 
 
 def test_normal_inference_no_regression():
