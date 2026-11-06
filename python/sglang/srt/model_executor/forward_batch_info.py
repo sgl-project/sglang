@@ -70,7 +70,8 @@ from sglang.srt.utils import (
     is_npu,
     support_triton,
 )
-from sglang.srt.utils.common import ceil_align, is_pin_memory_available
+from sglang.srt.utils.common import ceil_align
+from sglang.srt.utils.device import is_pin_memory_available
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -1353,7 +1354,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         A replicated (``sharded=False``) forward keeps the full DP-group count.
         """
-        from sglang.srt.utils.common import require_mlp_tp_gather
+        from sglang.srt.layers.dp_attention import require_mlp_tp_gather
 
         if self.global_num_tokens_cpu is not None:
             # DP / MLP-sync path: per-DP padded width.
