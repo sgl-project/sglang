@@ -296,8 +296,14 @@ def handle_deprecated_args(server_args: Any):
         "_handle_deprecated_args",
         enable_flashinfer_allreduce_fusion=False,
     )
-    # Deprecated attention-backend aliases.
-    aliases = {"compressed": "dsv4", "tokenspeed_mla": "cutedsl_mla"}
+    # Deprecated attention-backend aliases. Normalized once here so every
+    # downstream consumer (e.g. CPAttentionBackendKind.from_string) only
+    # ever sees the canonical names.
+    aliases = {
+        "compressed": "dsv4",
+        "nsa": "dsa",
+        "tokenspeed_mla": "cutedsl_mla",
+    }
     renamed = {}
     for attr in (
         "attention_backend",
