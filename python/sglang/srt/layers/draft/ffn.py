@@ -41,6 +41,7 @@ _SHARD = {
 }
 _BIAS_NAMES = ("gate.expert_bias", "gate.e_score_correction_bias")
 _SHARED_PREFIXES = ("shared_expert.", "shared_experts.")
+_MLP_TENSOR = re.compile(r"layers\.(\d+)\.mlp\.(.+)")
 
 
 def _silu_and_mul_clamp(gate_up: torch.Tensor, limit: float) -> torch.Tensor:
@@ -371,6 +372,29 @@ def _check_parallel_fit(spec: DraftMoeFFNSpec) -> None:
             f"Draft FFN: num_experts={spec.num_experts} is not divisible by the "
             f"MoE expert-parallel size {parallel.moe_ep_size}."
         )
+
+
+def load_draft_ffn_weight(layers, name: str, tensor: torch.Tensor) -> bool:
+    """layers.{i}.mlp.* of a DraftMoE layer goes to it; an MoE tensor on a dense layer raises."""
+    match = _MLP_TENSOR.fullmatch(name)
+    if match is None or int(match.group(1)) >= len(layers):
+        return False
+    mlp, rest = layers[int(match.group(1))].mlp, match.group(2)
+    if isinstance(mlp, DraftMoE):
+        mlp.load_weight(rest, tensor)
+        return True
+    if DraftMoE.owns(rest):
+        raise ValueError(
+            f"Draft FFN: {name} is an MoE tensor but the layer is dense; "
+            "use a Customized* architecture."
+        )
+    return False
+
+
+def check_draft_ffns_loaded(layers) -> None:
+    for layer in layers:
+        if isinstance(layer.mlp, DraftMoE):
+            layer.mlp.check_loaded()
 
 
 def build_draft_ffn(

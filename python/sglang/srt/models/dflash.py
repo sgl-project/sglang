@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import logging
-import re
 from functools import partial
 from typing import Iterable, Optional, Tuple
 
@@ -19,7 +18,11 @@ from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecutio
 from sglang.srt.configs.laguna import normalize_gating
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.draft.ffn import DraftMoE, build_draft_ffn
+from sglang.srt.layers.draft.ffn import (
+    build_draft_ffn,
+    check_draft_ffns_loaded,
+    load_draft_ffn_weight,
+)
 from sglang.srt.layers.draft.ffn_spec import DraftMixFFNSpec
 from sglang.srt.layers.layer_boundary import AttentionInputs, get_attn_tp_context
 from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
@@ -767,9 +770,6 @@ class DFlashGroupedConv(nn.Module):
         return self._convolve(hidden_states, coefficients, side=1)
 
 
-_MLP_TENSOR = re.compile(r"layers\.(\d+)\.mlp\.(.+)")
-
-
 class DFlashDecoderLayer(nn.Module):
     attention_cls = DFlashAttention
 
@@ -1139,7 +1139,7 @@ class DFlashDraftModel(nn.Module):
 
         for name, loaded_weight in weights:
             unprefixed_name = name.removeprefix("model.")
-            if self._load_moe_weight(unprefixed_name, loaded_weight):
+            if load_draft_ffn_weight(self.layers, unprefixed_name, loaded_weight):
                 continue
             if self.projector_type != "domino" and unprefixed_name.startswith(
                 ("prefix_gru.", "embed_proj.")
@@ -1220,31 +1220,12 @@ class DFlashDraftModel(nn.Module):
                 )
         self.post_load_weights()
 
-    def _load_moe_weight(self, name: str, loaded_weight: torch.Tensor) -> bool:
-        """Hand a layer's MoE tensor to its DraftMoE; refuse one aimed at a dense layer."""
-        match = _MLP_TENSOR.fullmatch(name)
-        if match is None or int(match.group(1)) >= len(self.layers):
-            return False
-        layer_id, rest = int(match.group(1)), match.group(2)
-        mlp = self.layers[layer_id].mlp
-        if isinstance(mlp, DraftMoE):
-            mlp.load_weight(rest, loaded_weight)
-            return True
-        if DraftMoE.owns(rest):
-            raise ValueError(
-                f"DFLASH checkpoint has MoE tensor {name!r} but layer {layer_id} is "
-                "dense; serve an MoE draft as a Customized* architecture with its "
-                "MoE config."
-            )
-        return False
-
     def post_load_weights(self) -> None:
         """Loaders that bypass load_weights call this directly."""
         for layer in self.layers:
             if isinstance(layer.self_attn, DFlashMLAAttention):
                 layer.self_attn.absorb_kv_b_proj()
-            if isinstance(layer.mlp, DraftMoE):
-                layer.mlp.check_loaded()
+        check_draft_ffns_loaded(self.layers)
 
 
 class DFlashLagunaAttention(DFlashAttention):
