@@ -155,7 +155,7 @@ jobs:
           rm -f python/pyproject.toml
           mv python/pyproject_npu.toml python/pyproject.toml
           # Versions mirror npu_ci_install_dependency.sh's defaults; keep them in sync.
-          # triton: sglang.srt.utils.common imports it unconditionally and the CPU
+          # triton: sglang.srt.utils.triton_utils imports it unconditionally and the CPU
           # wheel does not pull it in (the NPU image uses triton-ascend instead).
           # unsafe-best-match: --index-url is the lowest-priority index, so the
           # default strategy would resolve PyPI's CUDA torch, not the +cpu build.
