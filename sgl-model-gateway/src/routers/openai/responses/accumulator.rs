@@ -42,6 +42,12 @@ impl StreamingResponseAccumulator {
         self.process_block(block);
     }
 
+    /// Feed the accumulator with an SSE event whose JSON payload has already
+    /// been parsed by the streaming loop.
+    pub fn ingest_event(&mut self, event_name: Option<&str>, parsed: &Value) {
+        self.handle_parsed_event(event_name, parsed);
+    }
+
     /// Consume the accumulator and produce the best-effort final response value.
     pub fn into_final_response(mut self) -> Option<Value> {
         if self.completed_response.is_some() {
@@ -118,7 +124,11 @@ impl StreamingResponseAccumulator {
             }
         };
 
-        match get_event_type(event_name, &parsed) {
+        self.handle_parsed_event(event_name, &parsed);
+    }
+
+    fn handle_parsed_event(&mut self, event_name: Option<&str>, parsed: &Value) {
+        match get_event_type(event_name, parsed) {
             ResponseEvent::CREATED => {
                 if self.initial_response.is_none() {
                     if let Some(response) = parsed.get("response") {
@@ -139,7 +149,7 @@ impl StreamingResponseAccumulator {
                 }
             }
             "response.error" => {
-                self.encountered_error = Some(parsed);
+                self.encountered_error = Some(parsed.clone());
             }
             _ => {}
         }
