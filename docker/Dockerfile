@@ -1,9 +1,6 @@
 ARG CUDA_VERSION=13.0.3
 ARG UV_VERSION=latest
 ARG PYTHON_VERSION=3.12
-# AWS EFA userspace (libfabric, aws-ofi-nccl), see docker/install_efa.sh.
-ARG EFA_INSTALLER_VERSION=1.51.0
-ARG EFA_INSTALLER_SHA256=83993044fa4df3dc2f8b5c2f7051d61b9689441be023a2c92ea51d3f53f2465c
 
 FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv
 
@@ -212,7 +209,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 COPY python/pyproject.toml /tmp/sglang_deps/python/pyproject.toml
 COPY rust/sglang-grpc      /tmp/sglang_deps/rust/sglang-grpc
 COPY rust/sglang-mm        /tmp/sglang_deps/rust/sglang-mm
-COPY rust/sglang-api-types /tmp/sglang_deps/rust/sglang-api-types
+COPY rust/sglang-runtime-v1-types /tmp/sglang_deps/rust/sglang-runtime-v1-types
 
 # Install sglang dependencies (torch, transformers, etc.).
 # Generate constraints.txt to prevent reinstalling these deps in later stages.
@@ -558,17 +555,6 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --prerelease=allow --index-strategy unsafe-best-match \
         --extra-index-url https://pypi.nvidia.com/ ai-dynamo
 
-# Install the AWS EFA userspace for NIXL's LIBFABRIC backend, Mooncake's EFA
-# transport and NCCL over aws-ofi-nccl.
-ARG EFA_INSTALLER_VERSION
-ARG EFA_INSTALLER_SHA256
-RUN --mount=type=bind,source=docker/install_efa.sh,target=/tmp/install_efa.sh \
-    bash /tmp/install_efa.sh
-# LD_LIBRARY_PATH is required: under `--gpus` the NVIDIA toolkit reruns
-# ldconfig, which puts the distro libfabric first in the cache.
-ENV LD_LIBRARY_PATH="/opt/amazon/efa/lib:${LD_LIBRARY_PATH}" \
-    PATH="/opt/amazon/efa/bin:${PATH}"
-
 # Add yank script
 COPY --chown=root:root --chmod=755 docker/configs/yank /usr/local/bin/yank
 
@@ -677,7 +663,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # SM103, compiled at runtime); disable with --build-arg ENABLE_SGL_NVIDIA_MEGA=0.
 ARG ENABLE_SGL_NVIDIA_MEGA=1
 ARG SGL_NVIDIA_MEGA_REPO="https://github.com/sgl-project/sgl-nvidia-mega.git"
-ARG SGL_NVIDIA_MEGA_COMMIT="54b428921749fef89fcbd043000f839ac9cc4638"
+ARG SGL_NVIDIA_MEGA_COMMIT="77360f1fd74dc46010056ebdac0ed5e0b87d3978"
 RUN --mount=type=cache,target=/root/.cache/uv \
     if [ "${ENABLE_SGL_NVIDIA_MEGA}" != "1" ]; then \
         echo "[sgl-nvidia-mega] skip (ENABLE_SGL_NVIDIA_MEGA=${ENABLE_SGL_NVIDIA_MEGA})"; \
@@ -851,17 +837,6 @@ COPY --from=framework_final /root/.cache/sglang /root/.cache/sglang
 COPY --from=framework_final /usr/lib/*-linux-gnu/libgdrapi.so* /usr/lib/
 COPY --from=framework_final /usr/bin/gdrcopy_* /usr/bin/
 COPY --from=framework_final /usr/src/gdrdrv-2.5.1 /usr/src/gdrdrv-2.5.1
-
-# Install the AWS EFA userspace for NIXL's LIBFABRIC backend, Mooncake's EFA
-# transport and NCCL over aws-ofi-nccl.
-ARG EFA_INSTALLER_VERSION
-ARG EFA_INSTALLER_SHA256
-RUN --mount=type=bind,source=docker/install_efa.sh,target=/tmp/install_efa.sh \
-    bash /tmp/install_efa.sh
-# LD_LIBRARY_PATH is required: under `--gpus` the NVIDIA toolkit reruns
-# ldconfig, which puts the distro libfabric first in the cache.
-ENV LD_LIBRARY_PATH="/opt/amazon/efa/lib:${LD_LIBRARY_PATH}" \
-    PATH="/opt/amazon/efa/bin:${PATH}"
 
 # Fix DeepEP IBGDA symlink in runtime
 RUN ln -sf /usr/lib/$(uname -m)-linux-gnu/libmlx5.so.1 /usr/lib/$(uname -m)-linux-gnu/libmlx5.so \

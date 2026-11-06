@@ -6,7 +6,8 @@ from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     alloc_extend_naive,
 )
-from sglang.srt.utils import get_num_new_pages, next_power_of_2
+from sglang.srt.mem_cache.utils import get_num_new_pages
+from sglang.srt.utils import next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache

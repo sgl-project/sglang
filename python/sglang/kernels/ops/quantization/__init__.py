@@ -125,6 +125,15 @@ del _mod, _fn
 
 register_kernel(
     KernelSpec(
+        op="quantization.mxfp8_quantize_swizzled",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.quantization.mxfp8_swizzled_triton:mxfp8_quantize_swizzled",
+        capabilities=CUDA_ONLY,
+    )
+)
+
+register_kernel(
+    KernelSpec(
         op="quantization.quantize_fp4_indexer_tensor",
         backend=KernelBackend.TRITON,
         target=(
