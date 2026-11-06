@@ -1,12 +1,10 @@
 import unittest
 
 import sglang as sgl
-from sglang.srt.utils import is_ppu
-from sglang.test.ci.ci_register import register_cuda_ci, register_ppu_ci
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=300, stage="nightly", runner_config="4-gpu-h100")
-register_ppu_ci(est_time=600, suite="nightly-4-ppu", nightly=True)
 
 PROMPTS = [
     "Hello, my name is",
@@ -22,13 +20,7 @@ class TestPrefetchCheckpointsMultiGPU(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.engine = sgl.Engine(
-            # The original model is absent from the PPU offline HF cache; use a
-            # preloaded MoE checkpoint there while preserving the CUDA model.
-            model_path=(
-                "/nas_aisw/datasets/checkpoints/LLM/qwen/v3/Qwen3-30B-A3B"
-                if is_ppu()
-                else "Qwen/Qwen1.5-MoE-A2.7B-Chat"
-            ),
+            model_path="Qwen/Qwen1.5-MoE-A2.7B-Chat",
             tp_size=4,
             dp_size=4,
             enable_dp_attention=True,

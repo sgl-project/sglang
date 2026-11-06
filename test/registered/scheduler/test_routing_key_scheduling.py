@@ -1,8 +1,7 @@
-import ast
 import asyncio
 import os
+import time
 import unittest
-from pathlib import Path
 
 import aiohttp
 
@@ -11,7 +10,6 @@ from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cpu_ci,
     register_cuda_ci,
-    register_ppu_ci,
 )
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -23,41 +21,8 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=50, stage="nightly", runner_config="1-gpu-large")
-register_ppu_ci(est_time=54, suite="nightly-1-ppu", nightly=True)
 register_amd_ci(est_time=120, suite="nightly-amd-1-gpu", nightly=True)
 register_cpu_ci(est_time=184, suite="base-c-test-cpu")
-
-
-def _has_valid_routing_key_order(log_text):
-    running_counts = None
-    for line in log_text.splitlines():
-        if "routing_key_counts=" in line:
-            try:
-                raw_counts = line.split("routing_key_counts=", 1)[1].split(
-                    ", waiting_keys_before=", 1
-                )[0]
-                running_counts = ast.literal_eval(raw_counts)
-            except (SyntaxError, ValueError):
-                running_counts = None
-            continue
-        if "waiting_keys_after=" not in line or not running_counts:
-            continue
-        try:
-            keys = ast.literal_eval(line.split("waiting_keys_after=", 1)[1])
-        except (SyntaxError, ValueError):
-            continue
-        if not isinstance(keys, list):
-            continue
-        active_positions = [i for i, key in enumerate(keys) if key in running_counts]
-        other_positions = [i for i, key in enumerate(keys) if key not in running_counts]
-        if not active_positions or not other_positions:
-            continue
-        active_counts = [running_counts[key] for key in keys if key in running_counts]
-        if max(active_positions) < min(other_positions) and active_counts == sorted(
-            active_counts, reverse=True
-        ):
-            return True
-    return False
 
 
 class TestRoutingKeyScheduling(CustomTestCase):
@@ -98,9 +63,9 @@ class TestRoutingKeyScheduling(CustomTestCase):
         Test strategy:
         1. First send 2 long-running key_a requests to occupy running batch
         2. Then send 10 key_a and 10 key_b short requests concurrently
-        3. Inspect the scheduler's routing-key debug logs
-        4. Verify requests sharing a running batch's routing key are ordered
-           ahead of requests with other routing keys
+        3. With max_running_requests=3, key_a requests should be prioritized
+           because running batch has 2 key_a requests
+        4. Verify key_a requests finish before key_b requests on average
         """
         asyncio.run(self._test_routing_key_scheduling_order())
 
@@ -121,18 +86,22 @@ class TestRoutingKeyScheduling(CustomTestCase):
                 asyncio.create_task(self._send_chat_request("key_b", 10))
             )
 
-        await asyncio.gather(*short_tasks)
+        all_short_results = await asyncio.gather(*short_tasks)
         await asyncio.gather(*long_running_tasks)
 
-        self.stdout.flush()
-        self.stderr.flush()
-        log_text = "\n".join(
-            Path(filename).read_text()
-            for filename in (STDOUT_FILENAME, STDERR_FILENAME)
-        )
-        self.assertTrue(
-            _has_valid_routing_key_order(log_text),
-            "Expected requests sharing a running batch's routing key to be scheduled before other routing keys",
+        key_a_latencies = [lat for key, lat in all_short_results if key == "key_a"]
+        key_b_latencies = [lat for key, lat in all_short_results if key == "key_b"]
+
+        avg_key_a = sum(key_a_latencies) / len(key_a_latencies)
+        avg_key_b = sum(key_b_latencies) / len(key_b_latencies)
+
+        print(f"Average key_a latency: {avg_key_a:.3f}s")
+        print(f"Average key_b latency: {avg_key_b:.3f}s")
+
+        self.assertLess(
+            avg_key_a,
+            avg_key_b,
+            f"key_a requests (avg={avg_key_a:.3f}s) should finish before key_b (avg={avg_key_b:.3f}s)",
         )
 
     async def _send_chat_request(self, routing_key: str, max_tokens: int):
@@ -143,6 +112,7 @@ class TestRoutingKeyScheduling(CustomTestCase):
             "temperature": 0,
         }
         headers = {"x-smg-routing-key": routing_key}
+        start_time = time.perf_counter()
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 f"{self.base_url}/v1/chat/completions",
@@ -150,6 +120,8 @@ class TestRoutingKeyScheduling(CustomTestCase):
                 headers=headers,
             ) as resp:
                 await resp.json()
+        latency = time.perf_counter() - start_time
+        return routing_key, latency
 
 
 if __name__ == "__main__":
