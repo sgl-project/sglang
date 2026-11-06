@@ -216,7 +216,7 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
             full_available_size=MagicMock(return_value=512),
         )
         queue.token_to_kv_pool_allocator = SimpleNamespace(
-            logical_attn_allocator=logical_allocator
+            logical_attn_allocator=logical_allocator, storage=None
         )
         queue.scheduler = SimpleNamespace(enable_hisparse=True, last_batch=None)
         queue.retracted_queue = []
@@ -263,6 +263,8 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
 
         req_to_token_pool = ReqToTokenPool()
         allocator = SimpleNamespace(
+            state=None,
+            storage=None,
             device=torch.device("cpu"),
             page_size=256,
             available_size=MagicMock(return_value=fill_len),

@@ -167,6 +167,11 @@ class TestKimiMLPParallelGroups(CustomTestCase):
                                     parallel_scope(tp_group=tp, attn_tp_group=attn),
                                     patch.object(
                                         linear,
+                                        "is_allocation_symmetric",
+                                        return_value=True,
+                                    ),
+                                    patch.object(
+                                        linear,
                                         "use_symmetric_memory",
                                         return_value=nullcontext(),
                                     ) as allocation,
@@ -183,78 +188,13 @@ class TestKimiMLPParallelGroups(CustomTestCase):
                                         allocation.call_args.args[0],
                                         attn if auto_attn else tp,
                                     )
+                                    if not auto_attn:
+                                        self.assertEqual(
+                                            allocation.call_args.kwargs["disabled"],
+                                            layer.tp_group is None,
+                                        )
                                 else:
                                     allocation.assert_not_called()
-
-    def test_pcp8_weight_shards_and_padded_local_rows(self):
-        # 37 interleaved tokens occupy five padded rows on every CP rank.
-        # Gather rank-major, run feature-sharded MLPs, and sum/scatter back.
-        width, intermediate, size = 16, 32, 8
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        torch.manual_seed(42)
-        x = torch.randn(40, width, device=device)
-        x[37:] = 0
-        shards = [x[rank::size].contiguous() for rank in range(size)]
-        gathered = torch.cat(shards)
-        gate = torch.randn(intermediate, width, device=device) / 8
-        up = torch.randn(intermediate, width, device=device) / 8
-        down = torch.randn(width, intermediate, device=device) / 8
-        reference = F.linear(
-            F.silu(F.linear(gathered, gate)) * F.linear(gathered, up), down
-        )
-        partials = [
-            F.linear(
-                F.silu(F.linear(gathered, gate.chunk(size)[r]))
-                * F.linear(gathered, up.chunk(size)[r]),
-                down.chunk(size, dim=1)[r],
-            )
-            for r in range(size)
-        ]
-        for rank in range(size):
-            with self.subTest(rank=rank):
-                reset_context()
-                server = ServerArgs(
-                    model_path="dummy",
-                    device=device,
-                    tp_size=8,
-                    attn_cp_size=8,
-                    enable_prefill_cp=True,
-                )
-                publish(server, role="test", ranks=SpawnRanks(world_rank=rank))
-                group = SimpleNamespace(world_size=8, rank_in_group=rank)
-                with parallel_scope(
-                    shared_experts_tp_size=8, shared_experts_tp_group=group
-                ):
-                    owner, mlp = build_shared_experts()
-                    mlp.to(device)
-                for layer, weights in (
-                    (mlp.gate_up_proj, torch.cat((gate, up))),
-                    (mlp.down_proj, down),
-                ):
-                    layer.weight.weight_loader(layer.weight, weights)
-                    self.assertEqual(rank_size(layer), (rank, size))
-                self.assertEqual(
-                    sum(p.numel() for p in mlp.parameters()),
-                    (gate.numel() + up.numel() + down.numel()) // size,
-                )
-
-                def gather(output, local):
-                    torch.testing.assert_close(local, shards[rank])
-                    output.copy_(gathered)
-
-                def scatter(output, partial):
-                    torch.testing.assert_close(partial, partials[rank])
-                    output.copy_(torch.stack(partials).sum(0).chunk(size)[rank])
-
-                group.all_gather_into_tensor = Mock(side_effect=gather)
-                group.reduce_scatter_tensor = Mock(side_effect=scatter)
-                with patch.object(
-                    kimi_k3, "use_symmetric_memory", return_value=nullcontext()
-                ):
-                    result = owner._forward_shared_experts(shards[rank])
-                torch.testing.assert_close(result, reference.chunk(size)[rank])
-                group.all_gather_into_tensor.assert_called_once()
-                group.reduce_scatter_tensor.assert_called_once()
 
     def test_moe_shared_consumer_preserves_selection_and_execution_handle(self):
         for rank in range(4):

@@ -111,7 +111,7 @@ class KimiK3Detector(BaseFormatDetector):
     def get_structural_tag(
         self,
         tools: Union[List[Tool], None] = None,
-        tool_choice: Union[ToolChoice, Literal["auto", "required"]] = "auto",
+        tool_choice: Union[ToolChoice, Literal["auto", "required", "none"]] = "auto",
         thinking_mode: bool = False,
         parallel_tool_calls: bool = True,
         response_channel_open: bool = False,

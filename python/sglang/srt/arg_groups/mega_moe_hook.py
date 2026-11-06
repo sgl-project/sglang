@@ -6,11 +6,8 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
-from sglang.srt.arg_groups.overrides import (
-    declare_resolution,
-    model_config_of,
-    resolving_view,
-)
+from sglang.srt.arg_groups.model_override_base import model_config_of, resolving_view
+from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
@@ -171,12 +168,11 @@ def validate_mega_moe_token_budget(server_args: ServerArgs, model_label: str) ->
     )
     if cfg.disaggregation_mode != "prefill":
         decode_tokens = mega_moe_decode_tokens_per_rank(cfg)
-        if model_label == "KimiK31ForConditionalGeneration":
+        if (
+            model_label == "KimiK31ForConditionalGeneration"
+            and cfg.max_running_requests is not None
+        ):
             # Kimi repacks its experts at load and has no oversized eager fallback.
-            if cfg.max_running_requests is None:
-                raise ValueError(
-                    "Kimi MegaMoE needs --max-running-requests to bound eager decode / verify rows."
-                )
             eager_requests = ceil_align(
                 cfg.max_running_requests // cfg.attn_dp_size,
                 cfg.tp_size // cfg.attn_dp_size,
@@ -225,6 +221,19 @@ def validate_mega_moe_token_budget(server_args: ServerArgs, model_label: str) ->
         if graph is not None and graph.backend != "disabled":
             prefill_tokens = max(
                 prefill_tokens, graph.max_bs or 0, max(graph.bs or [0])
+            )
+        # Kimi repacks its experts at load and has no non-mega fallback, so the
+        # whole prefill forward must fit the MegaMoE workspace of the EP group.
+        ep_capacity = max_tokens_per_rank * (cfg.ep_size or 1)
+        if prefill_tokens > ep_capacity:
+            raise ValueError(
+                f"{model_label} with MegaMoE has no non-mega MoE fallback, so the "
+                f"largest prefill forward ({prefill_tokens} tokens, from "
+                "--chunked-prefill-size / --max-prefill-tokens / the prefill "
+                "CUDA graph buckets) must not exceed "
+                "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK x ep_size = "
+                f"{max_tokens_per_rank} x {cfg.ep_size or 1} = {ep_capacity}. "
+                "Lower --chunked-prefill-size or raise the env var."
             )
 
     if cfg.enable_prefill_cp:

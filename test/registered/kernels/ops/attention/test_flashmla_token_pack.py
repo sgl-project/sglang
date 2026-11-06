@@ -140,7 +140,7 @@ def test_attention(heads, tokens, topk, pattern):
     q = torch.randn(tokens, heads, 576, device="cuda", dtype=torch.bfloat16)
     cache = quantize_k_cache(
         torch.randn(slots // 64, 64, 1, 576, device="cuda", dtype=torch.bfloat16),
-        pow2_scale=True,
+        scale_ue8m0=True,
     )
     # Attention tests require distinct keys within each row; deduplication of
     # repeated valid keys would intentionally alter softmax multiplicity.

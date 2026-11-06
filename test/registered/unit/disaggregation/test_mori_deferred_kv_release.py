@@ -53,6 +53,7 @@ def _install_mori_stubs() -> None:
 
 _install_mori_stubs()
 
+from mori.io import StatusCode
 from test_deferred_decode_kv_release import (
     ABORT_GENERATION,
     DeferredAbortNotificationScenarios,
@@ -63,7 +64,6 @@ from sglang.srt.disaggregation.common.conn import AbortNotification, AckTarget
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
 from sglang.srt.disaggregation.mori.conn import (
     MoriKVManager,
-    StatusCode,
     _MoriTransferSubmissionError,
     _SubmissionLocal,
 )

@@ -11,8 +11,8 @@ import torch.nn.functional as F
 from transformers import Qwen3Config
 
 from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.models.dflash import DFlashMLAAttention
 from sglang.srt.runtime_context import get_context, reset_context
 from sglang.srt.server_args import ServerArgs
@@ -258,7 +258,7 @@ class TestDFlashMLABackends(unittest.TestCase):
                 custom_mask=None,
                 capture_hidden_mode=CaptureHiddenMode.FULL,
             )
-            runner.kv_index_translator.bind_own_plan(batch)
+            runner.runner_ids.bind_own_plan(batch)
             prefix = [
                 torch.randn(n, HIDDEN, device="cuda", dtype=torch.bfloat16)
                 for n in prefix_lens
@@ -299,7 +299,7 @@ class TestDFlashMLABackends(unittest.TestCase):
             # mask or plan baked in at capture would show up.
             batch, hidden, _ = make_inputs((0, 31))
             backend.init_cuda_graph_state(max_bs=2, max_num_tokens=2 * BLOCK)
-            runner.kv_index_translator.bind_runner_slots(batch)
+            runner.runner_ids.bind_runner_slots(batch)
             backend.init_forward_metadata_out_graph(batch, in_capture=True)
             stream = torch.cuda.Stream()
             stream.wait_stream(torch.cuda.current_stream())

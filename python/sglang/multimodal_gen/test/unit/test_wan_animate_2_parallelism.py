@@ -9,6 +9,7 @@ shape helpers are called directly. The parallelism rejections live in ``test_wan
 import math
 from collections import OrderedDict
 from contextlib import nullcontext
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -29,7 +30,10 @@ from sglang.multimodal_gen.runtime.models.dits.wan_animate_2_block import (
     _apply_rope_interleaved,
     _InContextLayout,
     _make_score_mod,
+    _pad_reference_video_kv,
+    _quantize_fp8_per_token_head,
     _sp_scatter_out,
+    _split_attention_is_exact,
 )
 from sglang.multimodal_gen.runtime.models.dits.wan_animate_2_clip_conditioning import (
     WanAnimate2ClipConditioning,
@@ -191,7 +195,10 @@ def test_attention_pads_tokens_into_the_slots_the_block_mask_admits():
         tokens([1, 2, 3, 4], 10.0),
         tokens([1, 2, 3, 4], 100.0),
     )
-    reference_k, reference_v = tokens([1, 2], 1000.0), tokens([1, 2], 10000.0)
+    reference_k, reference_v = (
+        _pad_reference_video_kv(tokens([1, 2], 1000.0), layout),
+        _pad_reference_video_kv(tokens([1, 2], 10000.0), layout),
+    )
     stub = SimpleNamespace(log_scale=0.0)
     with patch(f"{_BLOCK}._flex_attention_compiled", side_effect=fake_flex_attention):
         out = WanAnimate2TransformerBlock._in_context_attention(
@@ -261,8 +268,8 @@ def test_attention_slots_fit_a_reference_frame_wider_than_the_generation_frame()
     # Generation frames 0 (1..4) and 1 (5..8) of 4 tokens each; one 5-token reference frame.
     gen_ids = [1, 2, 3, 4, 5, 6, 7, 8]
     q, k, v = tokens(gen_ids, 1.0), tokens(gen_ids, 10.0), tokens(gen_ids, 100.0)
-    reference_k = tokens([1, 2, 3, 4, 5], 1000.0)
-    reference_v = tokens([1, 2, 3, 4, 5], 10000.0)
+    reference_k = _pad_reference_video_kv(tokens([1, 2, 3, 4, 5], 1000.0), layout)
+    reference_v = _pad_reference_video_kv(tokens([1, 2, 3, 4, 5], 10000.0), layout)
     with patch(f"{_BLOCK}._flex_attention_compiled", side_effect=fake_flex_attention):
         out = WanAnimate2TransformerBlock._in_context_attention(
             SimpleNamespace(log_scale=0.0),
@@ -336,7 +343,8 @@ def test_in_context_attention_hands_flex_a_score_mod_only_when_log_scale_is_nonz
         captured.append(score_mod)
         return torch.zeros_like(q)
 
-    gen, reference = torch.zeros(1, 4, 2, 8), torch.zeros(1, 2, 2, 8)
+    gen = torch.zeros(1, 4, 2, 8)
+    reference = _pad_reference_video_kv(torch.zeros(1, 2, 2, 8), layout)
     with patch(f"{_BLOCK}._flex_attention_compiled", side_effect=fake_flex_attention):
         for log_scale in (0.0, -1.3):
             WanAnimate2TransformerBlock._in_context_attention(
@@ -351,6 +359,204 @@ def test_in_context_attention_hands_flex_a_score_mod_only_when_log_scale_is_nonz
             )
     assert captured[0] is None
     assert captured[1] is _make_score_mod(layout.max_tokens_per_frame, -1.3)
+
+
+def test_fp8_reference_kv_dequantizes_into_the_attention_buffer():
+    # Per-(token, head) scales: an all-zero (padding) row stays exactly zero, a tiny head and
+    # a large outlier in the same token keep their own relative precision, nothing saturates
+    # to inf, and _in_context_attention hands flex the dequantized values.
+    layout = _SHORT_CLIP_LAYOUT
+    reference = torch.zeros(1, 2, 2, 8)
+    reference[0, 0, 0] = torch.linspace(-1e-4, 1e-4, 8)  # small head
+    reference[0, 0, 1] = torch.linspace(-3e4, 3e4, 8)  # outlier head, above e4m3 max
+    reference[0, 1] = torch.linspace(0.5, 2.0, 16).view(2, 8)
+    padded = _pad_reference_video_kv(reference, layout)
+    q8, scale = _quantize_fp8_per_token_head(padded)
+    assert q8.dtype == torch.float8_e4m3fn and tuple(scale.shape) == (
+        1,
+        layout.reference_video_f * layout.max_tokens_per_frame,
+        2,
+        1,
+    )
+    dequant = q8.float() * scale
+    assert torch.isfinite(dequant).all()
+    assert dequant[:, 2:].abs().sum() == 0
+    torch.testing.assert_close(dequant, padded, rtol=0.07, atol=0)
+
+    captured = {}
+
+    def fake_flex_attention(q, k, v, *, block_mask, score_mod):
+        captured.update(k=k, v=v)
+        return torch.zeros_like(q)
+
+    gen = torch.zeros(1, 4, 2, 8)
+    with patch(f"{_BLOCK}._flex_attention_compiled", side_effect=fake_flex_attention):
+        WanAnimate2TransformerBlock._in_context_attention(
+            SimpleNamespace(log_scale=0.0),
+            gen,
+            gen,
+            gen,
+            q8,
+            q8,
+            "SENTINEL_BLOCK_MASK",
+            layout,
+            scale,
+            scale,
+        )
+    start = layout.padded_generation_video_len
+    end = start + dequant.shape[1]
+    for t in (captured["k"], captured["v"]):
+        torch.testing.assert_close(t.transpose(1, 2)[:, start:end], dequant)
+        assert t.transpose(1, 2)[:, end:].abs().sum() == 0
+
+
+@pytest.mark.parametrize(
+    "layout,batch,expected",
+    [
+        (_InContextLayout((2, 1, 2), (1, 1, 2), (2, 1, 2)), 1, True),  # full clip
+        (_InContextLayout((2, 1, 2), (1, 1, 2), (4, 1, 2)), 1, True),  # short last clip
+        (_SHORT_CLIP_LAYOUT, 1, False),  # zero slots inside each frame
+        (
+            _InContextLayout((2, 2, 2), (1, 1, 5), (2, 2, 2)),
+            1,
+            False,
+        ),  # wider reference frame
+        (_InContextLayout((2, 1, 2), (1, 1, 2), (2, 1, 2)), 2, False),
+    ],
+)
+def test_split_attention_only_where_it_matches_flex(layout, batch, expected):
+    q = SimpleNamespace(is_cuda=True, shape=(batch, 4, 2, 8))
+    with patch(f"{_BLOCK}.current_platform.is_hopper", return_value=True):
+        assert _split_attention_is_exact(q, layout) is expected
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0),
+    reason="FA3 split runs on Hopper only",
+)
+@pytest.mark.parametrize("log_scale", [0.0, -1.3])
+@pytest.mark.parametrize("fp8", [False, True])
+@pytest.mark.parametrize("full_clip_f", [3, 5])  # full clip, short last clip
+def test_split_attention_matches_flex(log_scale, fp8, full_clip_f):
+    from torch.nn.attention.flex_attention import create_block_mask
+
+    layout = _InContextLayout((3, 8, 16), (2, 8, 16), (full_clip_f, 8, 16))
+    mask = create_block_mask(
+        layout.block_mask_fn(),
+        B=None,
+        H=None,
+        Q_LEN=layout.padded_generation_video_len,
+        KV_LEN=layout.padded_kv_len,
+        device="cuda",
+    )
+    g = torch.Generator(device="cuda").manual_seed(0)
+    q, k, v = (
+        torch.randn(1, 384, 4, 128, device="cuda", dtype=torch.bfloat16, generator=g)
+        for _ in range(3)
+    )
+    ref_k, ref_v = (
+        _pad_reference_video_kv(
+            torch.randn(
+                1, 256, 4, 128, device="cuda", dtype=torch.bfloat16, generator=g
+            ),
+            layout,
+        )
+        for _ in range(2)
+    )
+    scales = (None, None)
+    if fp8:
+        (ref_k, k_scale), (ref_v, v_scale) = (
+            _quantize_fp8_per_token_head(ref_k),
+            _quantize_fp8_per_token_head(ref_v),
+        )
+        scales = (k_scale, v_scale)
+    stub = SimpleNamespace(log_scale=log_scale)
+    args = (q, k, v, ref_k, ref_v, mask, layout, *scales)
+    with patch(f"{_BLOCK}._split_attention_is_exact", return_value=False):
+        flex_out = WanAnimate2TransformerBlock._in_context_attention(stub, *args)
+    stub._split_in_context_attention = partial(
+        WanAnimate2TransformerBlock._split_in_context_attention, stub
+    )
+    split_out = WanAnimate2TransformerBlock._in_context_attention(stub, *args)
+    assert split_out.shape == flex_out.shape == q.shape
+    torch.testing.assert_close(split_out, flex_out, rtol=2e-2, atol=2e-2)
+
+
+def _torch_varlen_attention(query, key, value, cu_q, cu_k, max_q, max_k, **_):
+    """CPU stand-in for FA3 varlen: per-segment softmax attention returning (out, lse [H, N])."""
+    outs, lses = [], []
+    for i in range(len(cu_q) - 1):
+        qs = query[cu_q[i] : cu_q[i + 1]].float().transpose(0, 1)
+        ks = key[cu_k[i] : cu_k[i + 1]].float().transpose(0, 1)
+        vs = value[cu_k[i] : cu_k[i + 1]].float().transpose(0, 1)
+        scores = qs @ ks.transpose(-1, -2) * qs.shape[-1] ** -0.5
+        outs.append((scores.softmax(-1) @ vs).transpose(0, 1))
+        lses.append(scores.logsumexp(-1))
+    return torch.cat(outs).to(query.dtype), torch.cat(lses, dim=-1)
+
+
+def _torch_merge_state(out_a, lse_a, out_b, lse_b):
+    lse = torch.logaddexp(lse_a, lse_b)
+    weight_a = (lse_a - lse).exp().unsqueeze(-1)
+    weight_b = (lse_b - lse).exp().unsqueeze(-1)
+    return out_a * weight_a + out_b * weight_b, lse
+
+
+@pytest.mark.parametrize("log_scale", [0.0, -1.3])
+@pytest.mark.parametrize("full_clip_f", [3, 5])  # full clip, short last clip
+def test_split_attention_matches_dense_masked_attention_on_cpu(log_scale, full_clip_f):
+    layout = _InContextLayout((3, 2, 4), (2, 2, 4), (full_clip_f, 2, 4))
+    g = torch.Generator().manual_seed(0)
+    heads, dim = 2, 8
+    q, k, v = (
+        torch.randn(1, layout.generation_video_num_tokens, heads, dim, generator=g)
+        for _ in range(3)
+    )
+    ref_k, ref_v = (
+        _pad_reference_video_kv(
+            torch.randn(1, layout.reference_video_num_tokens, heads, dim, generator=g),
+            layout,
+        )
+        for _ in range(2)
+    )
+
+    # Dense reference over the padded layout flex sees; the mask comes from the block mask itself.
+    padded_gen, padded_kv = layout.padded_generation_video_len, layout.padded_kv_len
+
+    def padded_keys(generation, reference):
+        out = torch.zeros(padded_kv, heads, dim)
+        out[: generation.shape[1]] = generation[0]
+        out[padded_gen : padded_gen + reference.shape[1]] = reference[0]
+        return out
+
+    key, value = padded_keys(k, ref_k), padded_keys(v, ref_v)
+    n = layout.generation_video_num_tokens
+    kv_idx = torch.arange(padded_kv)
+    frame_1_keys = (kv_idx >= layout.max_tokens_per_frame) & (
+        kv_idx < 2 * layout.max_tokens_per_frame
+    )
+    scores = torch.einsum("qhd,khd->hqk", q[0], key) * dim**-0.5
+    scores = scores + log_scale * frame_1_keys
+    allowed = layout.block_mask_fn()(
+        None, None, torch.arange(n)[:, None], kv_idx[None, :]
+    )
+    scores = scores.masked_fill(~allowed, float("-inf"))
+    expected = torch.einsum("hqk,khd->qhd", scores.softmax(-1), value).unsqueeze(0)
+
+    stub = SimpleNamespace(log_scale=log_scale)
+    with (
+        patch(
+            "sglang.kernels.ops.attention.flash_attention.flash_attn_varlen_func",
+            _torch_varlen_attention,
+        ),
+        patch(
+            "sglang.srt.layers.attention.merge_state.merge_state", _torch_merge_state
+        ),
+    ):
+        actual = WanAnimate2TransformerBlock._split_in_context_attention(
+            stub, q, k, v, ref_k, ref_v, layout, None, None
+        )
+    torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
 
 
 def test_make_score_mod_is_cached_by_key():

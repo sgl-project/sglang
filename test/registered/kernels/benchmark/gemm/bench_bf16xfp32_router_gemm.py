@@ -6,8 +6,9 @@ a Hopper GPU (sm90a); it decomposes the fp32 weight into two cached bf16
 halves and runs both bf16 GEMMs fused on tensor cores. The `cublas` provider
 upcasts the activation to fp32 and is what every model uses without HPC-Ops.
 
-Shapes are the LongCat-Flash router shapes: (hidden_size, n_routed_experts +
-zero_experts) = (6144, 768) for Chat and (3072, 384) for Lite.
+Shapes are the router shapes (hidden_size, n_routed_experts [+ zero_experts]):
+(6144, 768) for LongCat-Flash Chat, (3072, 384) for LongCat-Flash Lite and
+(4096, 256) for MiMo-V2.5-Flash.
 
 Run on a Hopper (SM90) GPU with HPC-Ops installed:
     python -m sglang.kernels.jit.benchmark.bench_bf16xfp32_router_gemm
@@ -15,9 +16,9 @@ Run on a Hopper (SM90) GPU with HPC-Ops installed:
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.benchmark import marker
 from sglang.kernels.jit.benchmark.utils import create_random
-from sglang.kernels.jit.utils import get_jit_cuda_arch, is_hip_runtime
 from sglang.kernels.ops.gemm.bf16_fp32 import (
     _linear_bf16_fp32_hpc,
     mark_hpc_bf16xfp32_gemm_enabled,
@@ -51,7 +52,9 @@ FN_MAP = {
 @marker.parametrize(
     "m", [1, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192], [1, 64, 8192]
 )
-@marker.parametrize("n,k", [(768, 6144), (384, 3072)], [(768, 6144)])
+@marker.parametrize(
+    "n,k", [(768, 6144), (384, 3072), (256, 4096)], [(768, 6144), (256, 4096)]
+)
 @marker.benchmark("provider", ["cublas", "hpc"])
 def benchmark(m, n, k, provider):
     x = create_random(m, k, dtype=torch.bfloat16)
@@ -60,7 +63,7 @@ def benchmark(m, n, k, provider):
 
 
 if __name__ == "__main__":
-    if is_hip_runtime() or get_jit_cuda_arch().major != 9:
+    if not current_arch().is_sm(9):
         print(
             "The HPC-Ops bf16xfp32 GEMM requires a Hopper (sm90a) CUDA GPU. Skipping."
         )

@@ -8,12 +8,8 @@ from sglang.kernels.ops.memory.adler32 import adler32_strided_checksum
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.layers.dcp.layout import dsa_index_k_page_tokens
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.mem_cache.memory_pool import (
-    DSATokenToKVPool,
-    HybridLinearKVPool,
-    MiniMaxSparseKVPool,
-)
-from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
+from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, MiniMaxSparseKVPool
 
 NestedInts = Sequence[int] | Sequence[Sequence[int]]
 
@@ -56,7 +52,9 @@ def state_indices_for_request(
     scheduler, req: Req, seq_len: int, start_idx: int = 0
 ) -> Optional[torch.Tensor | list[torch.Tensor]]:
     pool = scheduler.token_to_kv_pool_allocator.get_kvcache()
-    if isinstance(pool, HybridLinearKVPool):
+    router = pool.layer_router
+    # A pool wrapping one token KV view keeps its other layers' state per request.
+    if router.wrapped_view() is not None:
         mamba_indices = (
             scheduler.req_to_token_pool.req_index_to_mamba_index_mapping[
                 req.kv.req_pool_idx
@@ -65,12 +63,12 @@ def state_indices_for_request(
             .contiguous()
             .reshape(-1)
         )
-        mamba_indices = scheduler.req_to_token_pool.translate_mamba_indices(
-            mamba_indices
-        )
         # uncompressed hybrid DSA registers index-K pages as a second state
         # component, indexed by page rather than by Mamba slot
-        if pool.use_dsa and not pool.full_kv_pool.kpool_use_compress:
+        if (
+            getattr(pool, "use_dsa", False)
+            and not pool.full_kv_pool.kpool_use_compress
+        ):
             kv_indices = scheduler.req_to_token_pool.req_to_token[
                 req.kv.req_pool_idx, start_idx:seq_len
             ]
@@ -79,7 +77,7 @@ def state_indices_for_request(
             )
             return [mamba_indices, dsa_indices]
         return mamba_indices
-    if isinstance(pool, SWAKVPool):
+    if router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None:
         page_size = scheduler.token_to_kv_pool_allocator.page_size
         window_size = scheduler.sliding_window_size
         window_start = max(start_idx, seq_len - window_size)
@@ -87,11 +85,9 @@ def state_indices_for_request(
         window_full = scheduler.req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, window_start:seq_len
         ]
-        window_swa = (
-            scheduler.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
-                window_full
-            )
-        )
+        window_swa = scheduler.token_to_kv_pool_allocator.id_spaces()[
+            IdSpaceKind.SLIDING_WINDOW
+        ].ids(window_full)
         return _to_page_indices_gpu(window_swa, page_size)
     if isinstance(pool, (DSATokenToKVPool, MiniMaxSparseKVPool)):
         device_page_size = pool.page_size

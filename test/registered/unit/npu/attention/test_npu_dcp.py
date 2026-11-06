@@ -15,9 +15,12 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.test.ci.ci_register import register_cpu_ci
+# Loaded before the torch_npu mock below: importing transformers runs
+# accelerate's find_spec("torch_npu"), which fails on a mock without __spec__.
+import sglang.srt.utils.hf_transformers  # noqa: F401
+from sglang.test.ci.ci_register import register_npu_ci
 
-register_cpu_ci(est_time=9, suite="base-a-test-cpu")
+register_npu_ci(est_time=9, suite="base-a-test-npu")
 
 # Avoid importing the real extensions on CPU.  ``layers.dcp`` performs optional
 # kernel discovery during import, so temporarily force the platform probe to

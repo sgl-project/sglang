@@ -28,10 +28,26 @@ namespace flashmla {
 // the two per-end split flags, one pad word.
 constexpr int kMetaInts = 8;
 constexpr int kBlockSize = 256;
+// The dynamic shared memory every schedule kernel opts into.
+constexpr int kMaxDynamicSmem = 48 * 1024;
 // Smallest batch that takes the parallel walk; below it the serial walk is the shorter one.
 constexpr int kMinParallelBatch = 8;
-// Leave room for the static scan scratch and its allocation alignment.
-constexpr int kParallelSharedLimit = 47 * 1024;
+// The parallel walk's cap: leaves 1 KiB for its static scan scratch and allocation alignment.
+constexpr int kParallelSmemLimit = kMaxDynamicSmem - 1024;
+
+// Schedules, as the host op takes them.
+enum Schedule : int { kSerial = 0, kParallel = 1, kWindowed = 2 };
+
+// Dynamic shared memory of each schedule in ints, in the order its kernel carves it.
+__host__ __device__ constexpr int serial_smem_ints(int b, int parts) {
+  return b * 5 + 1 + parts * kMetaInts;  // num_blocks, num_splits, seqlens_k, first/last block, out
+}
+__host__ __device__ constexpr int parallel_walk_smem_ints(int b, int parts, int max_states) {
+  return (b + 1) + 2 * (max_states + 1) + (parts + 1) + b;  // row_start, jump x2, part_start, split_count
+}
+__host__ __device__ constexpr int windowed_smem_ints(int b, int parts) {
+  return 2 * (b + 1) + 4 * (parts + 1);  // cost_prefix, split_prefix, cut_req x2, cut_block x2
+}
 
 struct Params {
   int b;
@@ -59,17 +75,14 @@ __device__ __forceinline__ int ceil_to_i(int a, int b) {
   return (a + b - 1) / b * b;
 }
 
-// Parallel walk. A partition starts at block `blk` of request `r`, the walk
-// state numbered row_start_shared[r] + blk; state S = row_start_shared[b] means
-// every request is consumed. One partition maps a state to the next one
-// (next_partition_state, the same greedy as the serial walk), so the start of
-// every partition follows by pointer doubling, and each partition then writes
-// its entry independently.
-__device__ __forceinline__ int find_state_req(const int* row_start_shared, int b, int x) {
-  int lo = 0, hi = b - 1;  // the last request with row_start_shared[r] <= x
+// Parallel walk. State row_start_shared[r] + blk is block `blk` of request `r`
+// (row_start_shared[b]: all consumed). next_partition_state is the serial walk's
+// greedy step, so pointer doubling finds every partition start at once.
+__device__ __forceinline__ int last_le_index(const int* prefix, int b, int x) {
+  int lo = 0, hi = b - 1;  // the last r in [0, b) with prefix[r] <= x
   while (lo < hi) {
     const int mid = (lo + hi + 1) >> 1;
-    if (row_start_shared[mid] <= x) {
+    if (prefix[mid] <= x) {
       lo = mid;
     } else {
       hi = mid - 1;
@@ -117,7 +130,7 @@ __device__ __forceinline__ int next_partition_state(
     int overhead,
     int x) {
   if (x == num_states) return x;
-  int r = find_state_req(row_start_shared, b, x);
+  int r = last_le_index(row_start_shared, b, x);
   int blk = x - row_start_shared[r];
   int remain = payload;
   while (r < b) {
@@ -193,7 +206,7 @@ __device__ __forceinline__ void parallel_walk(
   const int active = *first_idle_part_shared;
   // A request is split once per partition that starts inside it.
   for (int i = 1 + threadIdx.x; i < active; i += kBlockSize) {
-    const int r = find_state_req(row_start_shared, b, part_start_shared[i]);
+    const int r = last_le_index(row_start_shared, b, part_start_shared[i]);
     if (part_start_shared[i] > row_start_shared[r]) atomicAdd(&split_count_shared[r], 1);
   }
   __syncthreads();
@@ -201,10 +214,10 @@ __device__ __forceinline__ void parallel_walk(
   block_exclusive_scan(b, [&](int r) { return split_count_shared[r] + 1; }, num_splits_shared, scan_scratch);
   for (int i = threadIdx.x; i < active; i += kBlockSize) {
     const int x0 = part_start_shared[i];
-    const int r0 = find_state_req(row_start_shared, b, x0);
+    const int r0 = last_le_index(row_start_shared, b, x0);
     const int blk0 = x0 - row_start_shared[r0];
     const int x1 = part_start_shared[i + 1];
-    const int r1 = x1 == num_states ? b : find_state_req(row_start_shared, b, x1);
+    const int r1 = x1 == num_states ? b : last_le_index(row_start_shared, b, x1);
     const int blk1 = x1 == num_states ? 0 : x1 - row_start_shared[r1];
     int begin_split_idx = 0;
     if (blk0 > 0) {  // partitions that started inside r0 so far, this one included
@@ -236,26 +249,23 @@ __device__ __forceinline__ void parallel_walk(
   }
 }
 
-// Windowed schedule (sparse only). Not FlashMLA's schedule, but one its kernel
-// consumes the same way, with the same bound on the costliest partition. The
-// requests' costs (blocks plus the per-split overhead) are laid end to end and
-// cut into num_sm_parts equal windows. A cut within a request's first `overhead`
-// positions moves to its start; any other cut splits the request there, except
-// that with snapping a cut leaving at most `overhead` blocks moves to its end.
-// Both cuttings are made and the one whose costliest partition is cheaper is
-// kept (snapping on a tie, as it splits less): snapping is what the greedy walk
-// does for requests about a window long, which the plain cutting would all
-// split, and costs up to an overhead more elsewhere. Every partition follows
-// from the prefix sums on its own, so the schedule takes a few microseconds
-// where the walk over all partitions takes tens.
-__device__ __forceinline__ int sparse_num_blocks(const Params& p, int i) {
+// Windowed schedule (sparse only): a valid FlashMLA schedule, not FlashMLA's
+// own, with the same bound on the costliest partition. Request costs are laid
+// end to end and cut into num_sm_parts equal windows; a cut within a request's
+// first `overhead` positions moves to its start. A second cutting also snaps a
+// cut leaving <= `overhead` blocks to the request's end; the cheaper one is kept.
+__device__ __forceinline__ int sparse_seqlen_k(const Params& p, int i) {
   int cur_s_k = p.topk_length ? __ldg(p.topk_length + i) : p.topk;
   if (cur_s_k == 0) cur_s_k = 1;  // the main loop must never be empty
   if (p.extra_topk) {
     cur_s_k = ceil_to_i(cur_s_k, p.block_size_n);
     cur_s_k += p.extra_topk_length ? __ldg(p.extra_topk_length + i) : p.extra_topk;
   }
-  return max(cur_s_k - 1, 0) / p.block_size_n + 1;
+  return cur_s_k;
+}
+
+__device__ __forceinline__ int sparse_num_blocks(const Params& p, int i) {
+  return max(sparse_seqlen_k(p, i) - 1, 0) / p.block_size_n + 1;
 }
 
 __global__ void __launch_bounds__(kBlockSize) flashmla_windowed_sched_meta_kernel(__grid_constant__ const Params p) {
@@ -281,7 +291,7 @@ __global__ void __launch_bounds__(kBlockSize) flashmla_windowed_sched_meta_kerne
     const int pos = (snap ? c - parts - 1 : c) * window;
     int req = b, block = 0;
     if (pos < total_cost) {
-      req = find_state_req(cost_prefix, b, pos);
+      req = last_le_index(cost_prefix, b, pos);
       const int offset = pos - cost_prefix[req];
       if (snap && cost_prefix[req + 1] - pos <= overhead) {
         ++req;
@@ -362,17 +372,7 @@ __global__ void __launch_bounds__(kBlockSize) flashmla_sched_meta_kernel(__grid_
 
   int partial = 0;
   for (int i = threadIdx.x; i < b; i += kBlockSize) {
-    int cur_s_k;
-    if (p.topk == -1) {
-      cur_s_k = __ldg(p.seqlens_k + i);
-    } else {
-      cur_s_k = p.topk_length ? __ldg(p.topk_length + i) : p.topk;
-      if (cur_s_k == 0) cur_s_k = 1;  // the main loop must never be empty
-      if (p.extra_topk) {
-        cur_s_k = ceil_to_i(cur_s_k, p.block_size_n);
-        cur_s_k += p.extra_topk_length ? __ldg(p.extra_topk_length + i) : p.extra_topk;
-      }
-    }
+    const int cur_s_k = p.topk == -1 ? __ldg(p.seqlens_k + i) : sparse_seqlen_k(p, i);
     seqlens_k_shared[i] = cur_s_k;
     const int last_token_idx = max(cur_s_k - 1, 0);
     const int cur_first_block_idx = 0;  // first_token_idx is always 0
@@ -525,8 +525,7 @@ void flashmla_sched_meta(
     int64_t fixed_overhead_num_blocks,
     int64_t topk,
     int64_t extra_topk,
-    bool parallel,
-    bool windowed) {
+    int64_t schedule) {
   using namespace host;
   using namespace flashmla;
 
@@ -562,6 +561,7 @@ void flashmla_sched_meta(
   };
 
   RuntimeCheck(topk != -1 || seqlens_k.has_value(), "a dense schedule (topk == -1) needs seqlens_k");
+  RuntimeCheck(schedule == kSerial || schedule == kParallel || schedule == kWindowed, "invalid schedule ", schedule);
 
   Params p{
       .b = b,
@@ -578,34 +578,35 @@ void flashmla_sched_meta(
       .max_states = 0,
   };
 
-  if (windowed && topk > 0) {
-    const std::size_t windowed_smem = sizeof(int) * static_cast<std::size_t>(2 * (b + 1) + 4 * (num_sm_parts + 1));
-    if (windowed_smem <= 48 * 1024) {
-      runtime::set_max_dynamic_smem_per_device<flashmla_windowed_sched_meta_kernel>(device_.unwrap(), 48 * 1024);
+  // A windowed or parallel schedule that does not fit falls back to the serial one.
+  if (schedule == kWindowed && topk > 0) {
+    const std::size_t windowed_smem = sizeof(int) * static_cast<std::size_t>(windowed_smem_ints(b, num_sm_parts));
+    if (windowed_smem <= kMaxDynamicSmem) {
+      runtime::set_max_dynamic_smem_per_device<flashmla_windowed_sched_meta_kernel>(device_.unwrap(), kMaxDynamicSmem);
       LaunchKernel(1, kBlockSize, device_.unwrap(), windowed_smem)(flashmla_windowed_sched_meta_kernel, p);
       return;
     }
   }
 
-  std::size_t smem = sizeof(int) * static_cast<std::size_t>(b * 5 + 1 + num_sm_parts * kMetaInts);
-  RuntimeCheck(smem <= 48 * 1024, "schedule does not fit in shared memory: ", smem, " bytes");
+  std::size_t smem = sizeof(int) * static_cast<std::size_t>(serial_smem_ints(b, num_sm_parts));
+  RuntimeCheck(smem <= kMaxDynamicSmem, "schedule does not fit in shared memory: ", smem, " bytes");
   // DCP's actual per-rank lengths can be much smaller than top-k. Reserve
   // what fits, and let the kernel fall back if this replay needs more states.
-  if (parallel && topk > 0 && b >= kMinParallelBatch) {
+  if (schedule == kParallel && topk > 0 && b >= kMinParallelBatch) {
     const int64_t row_blocks = (topk + extra_topk + block_size_n - 1) / block_size_n + 1;
-    const int64_t capacity =
-        (kParallelSharedLimit / static_cast<int>(sizeof(int)) - (b * 7 + 5 + num_sm_parts * (kMetaInts + 1))) / 2;
-    const int64_t max_states = std::min(static_cast<int64_t>(b) * row_blocks, std::max<int64_t>(capacity, 0));
+    const int64_t free_ints = kParallelSmemLimit / static_cast<int>(sizeof(int)) - serial_smem_ints(b, num_sm_parts) -
+                              parallel_walk_smem_ints(b, num_sm_parts, 0);
+    const int64_t max_states = std::min(static_cast<int64_t>(b) * row_blocks, std::max<int64_t>(free_ints / 2, 0));
     const std::size_t extra =
-        sizeof(int) * static_cast<std::size_t>((b + 1) + 2 * (max_states + 1) + (num_sm_parts + 1) + b);
-    if (max_states > 0 && smem + extra <= kParallelSharedLimit) {
+        sizeof(int) * static_cast<std::size_t>(parallel_walk_smem_ints(b, num_sm_parts, static_cast<int>(max_states)));
+    if (max_states > 0 && smem + extra <= kParallelSmemLimit) {
       p.max_states = static_cast<int>(max_states);
       smem += extra;
     }
   }
   // The kernel also has static shared memory. Opt in so schedules near
   // 48 KiB do not exceed the default combined static + dynamic limit.
-  runtime::set_max_dynamic_smem_per_device<flashmla_sched_meta_kernel>(device_.unwrap(), 48 * 1024);
+  runtime::set_max_dynamic_smem_per_device<flashmla_sched_meta_kernel>(device_.unwrap(), kMaxDynamicSmem);
   LaunchKernel(1, kBlockSize, device_.unwrap(), smem)(flashmla_sched_meta_kernel, p);
 }
 

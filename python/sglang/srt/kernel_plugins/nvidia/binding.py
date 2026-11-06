@@ -33,6 +33,8 @@ from sglang.kernels.plugin_kernels.nvidia.spec import (
     BuiltMegakernel,
     Feature,
     MegakernelSpec,
+    PostVerifyStrategy,
+    SpeculativeRuntimeHooks,
     Step,
     SupportsDraftAccept,
     SupportsDraftAux,
@@ -47,6 +49,7 @@ from sglang.kernels.plugin_kernels.nvidia.spec import (
 )
 from sglang.srt.arg_groups.model_override_base import model_config_of, resolving_view
 from sglang.srt.environ import envs
+from sglang.srt.kernel_plugins.amd.binding import msa_serves
 
 # a module import: kimi_k31_decode_binding imports this module back
 from sglang.srt.kernel_plugins.nvidia import kimi_k31_decode_binding
@@ -217,8 +220,15 @@ class KvPoolView:
     """The running forward's KV pool, under the pool's own names: its layout and
     per-layer key buffers (a pool offers the ones of its kind)."""
 
-    def __init__(self, pool: Any):
+    def __init__(self, pool: Any, seal_cache: Optional[Callable] = None):
         self.pool = pool
+        self._seal_cache = seal_cache
+
+    def get_key_buffer(self, layer_id: int) -> torch.Tensor:
+        value = self.pool.get_key_buffer(layer_id)
+        if self._seal_cache is not None:
+            self._seal_cache(layer_id, value)
+        return value
 
     @property
     def uniform_fp8(self) -> bool:
@@ -255,10 +265,14 @@ class ForwardView:
     """The running forward's attention data, read from its attention backend; built
     at capture for a graph step, so its tensors are the ones the graph replays."""
 
-    def __init__(self, backend: Any):
+    def __init__(self, backend: Any, seal_cache: Optional[Callable] = None):
         self._backend = backend
         self.metadata = backend.forward_metadata
-        self.kv_pool = KvPoolView(backend.token_to_kv_pool)
+        self.kv_pool = KvPoolView(backend.token_to_kv_pool, seal_cache)
+
+    @property
+    def use_fused_topk(self) -> bool:
+        return bool(getattr(self._backend, "use_fused_topk", False))
 
     @property
     def trtllm_attn(self) -> bool:
@@ -293,6 +307,7 @@ class MegakernelBinding:
     def __init__(self, *, model: torch.nn.Module):
         self._model = model
         self._sealed: dict[str, tuple] = {}
+        self._cache_sources: dict[int, tuple] = {}
 
     def create_tensor_entry(self, kind: int):
         if kind == 32:
@@ -332,7 +347,7 @@ class MegakernelBinding:
                     kda=KdaStepView(state_indices=linear.mamba_cache_indices),
                 )
             )
-        return ForwardView(backend)
+        return ForwardView(backend, self._seal_cache)
 
     def preparation_view(self, pool: Any, req_pool: Any) -> PreparationView:
         if not getattr(pool, "use_mla", False) or not hasattr(pool, "mamba_pool"):
@@ -346,7 +361,7 @@ class MegakernelBinding:
         }
         states = {}
         for layer in mamba_mapping:
-            state = req_pool.mamba2_layer_cache(layer)
+            state = req_pool.mamba_pool.mamba2_layer_cache(req_pool.mamba_map[layer])
             states[layer] = KdaStateView(
                 conv=tuple(state.conv), temporal=state.temporal
             )
@@ -394,7 +409,7 @@ class MegakernelBinding:
         if getattr(pool, "use_dsa", False):
             tensors.extend(full.index_k_with_scale_buffer)
         for layer in req_pool.mamba_map:
-            state = req_pool.mamba2_layer_cache(layer)
+            state = req_pool.mamba_pool.mamba2_layer_cache(req_pool.mamba_map[layer])
             tensors.extend((*state.conv, state.temporal))
         return tuple(_identity(tensor) for tensor in tensors)
 
@@ -407,7 +422,7 @@ class MegakernelBinding:
         linear = backend.linear_attn_backend
         req_pool = linear.req_to_token_pool
         last_layer = max(req_pool.mamba_map)
-        state = req_pool.mamba2_layer_cache(last_layer)
+        state = linear.state_layer_cache(last_layer)
         linear._track_mamba_state_decode(
             forward_batch,
             state.conv[0],
@@ -441,6 +456,22 @@ class MegakernelBinding:
                     f"megakernel binding: {name} was reallocated after its first read"
                 )
 
+        for layer_id, identity in self._cache_sources.items():
+            value = self._current_pool().get_key_buffer(layer_id)
+            if _identity(value) != identity:
+                raise RuntimeError(
+                    f"megakernel binding: kv_cache[{layer_id}] was reallocated "
+                    "after its first read"
+                )
+
+    def _seal_cache(self, layer_id: int, value: torch.Tensor) -> None:
+        identity = _identity(value)
+        if self._cache_sources.setdefault(layer_id, identity) != identity:
+            raise RuntimeError(
+                f"megakernel binding: kv_cache[{layer_id}] was reallocated "
+                "after its first read"
+            )
+
     def _seal(self, name: str, value: Any) -> None:
         self._sealed.setdefault(name, _identity(value))
 
@@ -457,7 +488,7 @@ class MegakernelBinding:
 
 def _identity(value: Any) -> tuple:
     if isinstance(value, torch.Tensor):
-        return (value.data_ptr(), tuple(value.shape), value.dtype)
+        return (value.data_ptr(), tuple(value.shape), value.dtype, value.stride())
     return (id(value),)
 
 
@@ -614,6 +645,9 @@ def handle_nvidia_megakernel(server_args: Any) -> None:
     cfg = resolving_view(server_args)
     if not cfg.enable_nvidia_megakernel:
         return
+    archs = model_config_of(server_args).hf_config.architectures
+    if msa_serves(archs) and not cfg.enable_amd_monokernel:
+        return  # handle_monokernel checks the MSA plugin's spec
     reasons = plugin_reasons()
     if not reasons:
         model_config = model_config_of(server_args)
@@ -648,7 +682,7 @@ def install_megakernel(
     is_draft: bool,
 ) -> None:
     """Build the model's spec and install its forward; runs before KV cache sizing."""
-    if not megakernel_enabled():
+    if not megakernel_enabled() or msa_serves(hf_config.architectures):
         return
     spec = _find_spec_on_every_rank(hf_config=hf_config, is_draft=is_draft)
     if spec is None:
@@ -741,6 +775,43 @@ def install_megakernel(
 def built_megakernel(model: torch.nn.Module) -> Optional[BuiltMegakernel]:
     """The object the spec built for this model, or None."""
     return model.__dict__.get("_megakernel")
+
+
+def bind_speculative_runtime_hooks(
+    model: torch.nn.Module,
+    defaults: SpeculativeRuntimeHooks,
+) -> SpeculativeRuntimeHooks:
+    """Resolve target-side speculative strategies once at the binding boundary.
+
+    The caller's stock strategies are returned by identity when the runtime master
+    switch is off or the built provider has no factory. Provider presence must agree
+    across ranks before any rank can call it. The provider may change the local key
+    builder, but the runtime-owned verification runner cannot be replaced.
+    """
+    if not envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get():
+        return defaults
+
+    built = built_megakernel(model)
+    factory = None if built is None else built.speculative_runtime_hooks
+    megakernel_agree(
+        factory is not None,
+        what="speculative runtime hooks factory presence",
+    )
+    if factory is None:
+        return defaults
+
+    hooks = factory(defaults)
+    if not isinstance(hooks, SpeculativeRuntimeHooks):
+        raise TypeError(
+            "speculative runtime hooks factory must return SpeculativeRuntimeHooks"
+        )
+    if not isinstance(hooks.post_verify, PostVerifyStrategy):
+        raise TypeError("post_verify must be a PostVerifyStrategy")
+    if hooks.post_verify.run is not defaults.post_verify.run:
+        raise ValueError("a provider cannot replace the runtime post-verify runner")
+    if not callable(hooks.post_verify.local_keys):
+        raise TypeError("post_verify.local_keys must be callable")
+    return hooks
 
 
 def megakernel_agree(value: Any, *, what: str, group: Any = None) -> None:
@@ -1052,11 +1123,12 @@ class _Dispatch:
                     **kwargs,
                 )
             hybrid = isinstance(self.binding, MegakernelBinding)
-            view = (
-                self.binding.forward_view(forward_batch)
-                if hybrid
-                else self.binding.forward_view()
-            )
+            if hybrid:
+                view = self.binding.forward_view(forward_batch)
+            elif step.mode == "prefill":
+                view = self.binding.prefill_view()
+            else:
+                view = self.binding.forward_view()
             out = self.built.forward(
                 msgspec.structs.replace(step, view=view),
                 self.original,

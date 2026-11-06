@@ -32,6 +32,7 @@ from sglang.kernels.ops.attention.dcp_kernels import (
     correct_attn_out,
     dcp_lse_combine_triton,
     dcp_pack_a2a_send,
+    dcp_pack_q,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
@@ -235,9 +236,9 @@ def all_gather_kv_cache_for_mha_extend(
     kv_a: torch.Tensor,
     k_pe: torch.Tensor,
 ):
-    prefix_kv_a, prefix_k_pe = token_to_kv_pool.get_mla_kv_buffer(
-        attn_mqa, dcp_local_prefix_kv_indices, dst_dtype=kv_a.dtype
-    )
+    prefix_kv_a, prefix_k_pe = token_to_kv_pool.layer_router.read(
+        attn_mqa.layer_id
+    ).read_mla(attn_mqa, dcp_local_prefix_kv_indices, dst_dtype=kv_a.dtype)
     extend_prefix_lens_cpu = torch.tensor(extend_prefix_lens_cpu)
     gathered_kv_cache = all_gather_kv_cache_for_dcp(
         prefix_kv_a,
@@ -282,12 +283,28 @@ def all_gather_kv_cache_for_mha_extend(
 def all_gather_q_for_mla_decode(
     q_nope_out: torch.Tensor,
     q_pe: torch.Tensor,
+    dtype: Optional[torch.dtype] = None,
 ):
+    """All-gather the DCP group's query heads; ``dtype`` casts q before the wire."""
     group = get_parallel().dcp_group
-    with use_symmetric_memory(group):
-        # transpose q_pe and q_nope_out from [B, H, L] to [H, B, L]
-        combined = torch.cat([q_pe.transpose(0, 1), q_nope_out.transpose(0, 1)], dim=-1)
-    gathered = group.all_gather(combined, dim=0)
+    if dtype is None or dtype == q_pe.dtype:
+        with use_symmetric_memory(group):
+            # transpose q_pe and q_nope_out from [B, H, L] to [H, B, L]
+            combined = torch.cat(
+                [q_pe.transpose(0, 1), q_nope_out.transpose(0, 1)], dim=-1
+            )
+        gathered = group.all_gather(combined, dim=0)
+    else:
+        B, H, d_nope = q_nope_out.shape
+        with use_symmetric_memory(group):
+            combined = torch.empty(
+                (H, B, q_pe.shape[-1] + d_nope), dtype=dtype, device=q_pe.device
+            )
+        dcp_pack_q(q_nope_out, q_pe, combined)
+        # The aiter custom all-gather only takes 16/32-bit floats and pynccl has
+        # no FP8 dtype: pair the bytes into fp16 when the row allows, an exact copy.
+        wire = torch.float16 if combined.shape[-1] % 2 == 0 else torch.uint8
+        gathered = group.all_gather(combined.view(wire), dim=0).view(dtype)
     d_pe = q_pe.size(-1)
     d_nope = q_nope_out.size(-1)
     q_pe, q_nope_out = gathered.split([d_pe, d_nope], dim=-1)
@@ -309,7 +326,9 @@ def all_gather_kv_cache_for_mla_extend(
 ):
     # On hip, skip the all-gather when there is no cached prefix to avoid crash
     if not _is_hip or dcp_extend_prefix_lens_sum > 0:
-        cache_k_nope, cache_k_rope = token_to_kv_pool.get_mla_kv_buffer(
+        cache_k_nope, cache_k_rope = token_to_kv_pool.layer_router.read(
+            attn_mqa.layer_id
+        ).read_mla(
             attn_mqa,
             dcp_local_prefix_kv_indices,
         )
@@ -344,6 +363,8 @@ def all_gather_kv_cache_for_dcp(
     prefix_k_pe: torch.Tensor,
     prefix_kv_lens_cpu: torch.Tensor,
     prefix_starts_cpu: torch.Tensor = None,
+    *,
+    interleave_size: int = 1,
 ):
     """
     prefix_kv_a and prefix_k_pe should have same shape, expect for last dim
@@ -358,16 +379,39 @@ def all_gather_kv_cache_for_dcp(
     if prefix_starts_cpu is None:
         prefix_starts_cpu = torch.zeros_like(prefix_kv_lens_cpu)
 
-    left_pads = prefix_starts_cpu % dcp_world_size > dcp_rank
-    left_pads = left_pads.to(torch.int32)
-    right_pads = (
-        prefix_starts_cpu + prefix_kv_lens_cpu - 1
-    ) % dcp_world_size < dcp_rank
-    right_pads = right_pads.to(torch.int32)
-    padded_lens = (
-        prefix_kv_lens_cpu + (prefix_starts_cpu % dcp_world_size) + dcp_world_size - 1
-    ) // dcp_world_size
-
+    cycle_size = dcp_world_size * interleave_size
+    if interleave_size == 1:
+        # Preserve the original token-interleaved padding path.
+        left_pads = prefix_starts_cpu % dcp_world_size > dcp_rank
+        left_pads = left_pads.to(torch.int32)
+        right_pads = (
+            prefix_starts_cpu + prefix_kv_lens_cpu - 1
+        ) % dcp_world_size < dcp_rank
+        right_pads = right_pads.to(torch.int32)
+        padded_lens = (
+            prefix_kv_lens_cpu
+            + (prefix_starts_cpu % dcp_world_size)
+            + dcp_world_size
+            - 1
+        ) // dcp_world_size
+    else:
+        start_offset = prefix_starts_cpu % cycle_size
+        end_offset = (prefix_starts_cpu + prefix_kv_lens_cpu - 1) % cycle_size
+        left_pads = (
+            (start_offset - dcp_rank * interleave_size)
+            .clamp(0, interleave_size)
+            .to(torch.int32)
+        )
+        right_pads = (
+            ((dcp_rank + 1) * interleave_size - 1 - end_offset)
+            .clamp(0, interleave_size)
+            .to(torch.int32)
+        )
+        padded_lens = (
+            (prefix_kv_lens_cpu + start_offset + cycle_size - 1)
+            // cycle_size
+            * interleave_size
+        )
     local_kv_lens = padded_lens - left_pads - right_pads
     local_kv_lens_cu = torch.zeros(
         len(prefix_kv_lens_cpu) + 1,
@@ -388,7 +432,13 @@ def all_gather_kv_cache_for_dcp(
 
     padded_kv_cache = torch.cat(padded_kv_cache_arr, dim=0)
 
-    gatherd_kv_cache = _all_gather_dcp_kv_cache(padded_kv_cache)
+    if interleave_size == 1:
+        gatherd_kv_cache = _all_gather_dcp_kv_cache(padded_kv_cache)
+    else:
+        gathered_pages = _all_gather_dcp_kv_cache(
+            padded_kv_cache.reshape(-1, interleave_size, *padded_kv_cache.shape[1:])
+        )
+        gatherd_kv_cache = gathered_pages.flatten(0, 1)
 
     # 2. re-org kv cache to query orders
     padded_lens_cu = torch.zeros(
@@ -401,7 +451,7 @@ def all_gather_kv_cache_for_dcp(
         kv_cache_tuple += (
             gatherd_kv_cache[
                 padded_lens_cu[req_idx] * dcp_world_size
-                + (prefix_starts_cpu[req_idx] % dcp_world_size) :
+                + (prefix_starts_cpu[req_idx] % cycle_size) :
             ][: prefix_kv_lens_cpu[req_idx]],
         )
     gatherd_kv_cache = torch.cat(kv_cache_tuple, dim=0)

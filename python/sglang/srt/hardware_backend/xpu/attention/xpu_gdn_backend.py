@@ -68,7 +68,7 @@ class XpuGDNAttnBackend(GDNAttnBackend):
         full pool directly for both conv and ssm.
         """
         fm = self.forward_metadata
-        layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        layer_cache = self.state_layer_cache(layer.layer_id)
         conv_states = layer_cache.conv[0]  # [cache, dim, width-1]
         ssm_states = layer_cache.temporal  # [cache, nv, hv, hk]
         cache_indices = fm.mamba_cache_indices

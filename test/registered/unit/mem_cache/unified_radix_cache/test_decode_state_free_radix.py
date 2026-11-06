@@ -10,10 +10,13 @@ from dataclasses import replace
 from types import MethodType, SimpleNamespace
 from unittest import mock
 
-from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req
+from sglang.srt.managers.req_types import FINISH_LENGTH
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocation import ensure_mamba_capacity
 from sglang.srt.mem_cache.common import release_kv_cache
-from sglang.srt.mem_cache.unified_cache.components.base import ComponentType
+from sglang.srt.mem_cache.kv.plan import TREE_STATE
+from sglang.srt.mem_cache.static_kv_storage import acquire_rows
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -38,7 +41,11 @@ def _state_free_cache():
     hybrid, allocator, req_to_token_pool = build_fixture(cfg)
     params = replace(
         hybrid.cache_init_params,
-        tree_components=(ComponentType.FULL,),
+        tree_slots=tuple(
+            slot
+            for slot in hybrid.cache_init_params.tree_slots
+            if slot.family != TREE_STATE
+        ),
         request_mamba_only=True,
         enable_mamba_extra_buffer=False,
     )
@@ -52,7 +59,7 @@ def _request(req_to_token_pool, allocator, tokens, rid):
         origin_input_ids=array("q", tokens),
         sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
     )
-    req_to_token_pool.alloc([req])
+    acquire_rows(req_to_token_pool, req_to_token_pool.state, [req])
     req.output_ids = array("q")
     kv = allocator.alloc(len(tokens))
     req_to_token_pool.write((req.kv.req_pool_idx, slice(0, len(tokens))), kv)
@@ -123,7 +130,7 @@ class TestDecodeStateFreeRadix(CustomTestCase):
             origin_input_ids=array("q", shared + [700, 701, 702]),
             sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
         )
-        req_to_token_pool.alloc([second])
+        acquire_rows(req_to_token_pool, req_to_token_pool.state, [second])
         queue = SimpleNamespace(
             tree_cache=cache,
             scheduler=SimpleNamespace(enable_decode_hicache=False),
@@ -150,7 +157,11 @@ class TestDecodeStateFreeRadix(CustomTestCase):
         with mock.patch.object(
             cache, "evict_for_alloc", side_effect=AssertionError("evicted")
         ):
-            self.assertFalse(ensure_mamba_capacity(req_to_token_pool, [req], cache))
+            self.assertFalse(
+                ensure_mamba_capacity(
+                    req_to_token_pool, req_to_token_pool.state, [req], cache
+                )
+            )
         allocator.free(held)
 
 

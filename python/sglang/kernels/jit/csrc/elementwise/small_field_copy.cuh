@@ -234,7 +234,7 @@ struct SmallFieldCopy {
     using namespace host;
 
     SymbolicDevice device_;
-    device_.set_options<kDLCUDA, kDLROCM>();
+    device_.set_options<kDLGPU, kDLROCM>();
     device_.verify(anchor.device());
 
     CHECK_HOST(num_entries % kSmallFieldCopyEntries == 0) << "bad descriptor length " << num_entries;
