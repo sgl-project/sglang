@@ -677,6 +677,7 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
                 weight_scale=layer.weight_scale,
                 input_scale=layer.input_scale,
                 bias=bias,
+                pre_quant_output_dtype=layer.orig_dtype,
             )
         return apply_fp8_linear(
             input=x,
@@ -685,6 +686,7 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
             input_scale=layer.input_scale,
             bias=bias,
             cutlass_fp8_supported=self.cutlass_fp8_supported,
+            pre_quant_output_dtype=layer.orig_dtype,
         )
 
 
