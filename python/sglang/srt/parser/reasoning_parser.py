@@ -45,6 +45,7 @@ from sglang.srt.parser.inkling_tokenizer import (
     INKLING_SPECIAL_TOKEN_IDS,
     MESSAGE_MODEL,
 )
+from sglang.srt.parser.marker_token_ids import marker_token_ids
 from sglang.srt.parser.response_template import (
     ResponseTemplateReasoningDetector,
     grammar_holds_calls,
@@ -116,7 +117,7 @@ class BaseReasoningFormatDetector:
             self._in_reasoning = False
 
     def get_think_end_token_ids(self, tokenizer: PreTrainedTokenizerBase) -> List[int]:
-        return tokenizer.encode(self.think_end_token, add_special_tokens=False)
+        return marker_token_ids(tokenizer=tokenizer, marker=self.think_end_token)
 
     def get_self_opened_think_start_token_ids(
         self, tokenizer: PreTrainedTokenizerBase
