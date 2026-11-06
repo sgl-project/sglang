@@ -12,6 +12,17 @@ from sglang.kernels.spec import (
     KernelSpec,
 )
 
+for _packet_name in ("pack_moe_fp8", "unpack_moe_fp8"):
+    register_kernel(
+        KernelSpec(
+            op=f"quantization.{_packet_name}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.quantization.moe_fp8_packet:{_packet_name}",
+            capabilities=CUDA_ONLY,
+        )
+    )
+del _packet_name
+
 if TYPE_CHECKING:
     import torch
 
