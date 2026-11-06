@@ -4,6 +4,7 @@ Multi-modality utils
 
 import copy
 import hashlib
+import logging
 import mmap
 import os
 import pickle
@@ -51,7 +52,8 @@ from sglang.srt.utils import (
     print_warning_once,
 )
 from sglang.srt.utils.stale_shm_cleanup import make_shm_name
-from sglang.utils import logger
+
+logger = logging.getLogger(__name__)
 
 # NOTE: Using the shared logger from sglang.utils instead of creating a module-specific logger
 # to ensure consistent logging behavior across the codebase. This prevents issues with log

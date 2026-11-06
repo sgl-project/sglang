@@ -52,6 +52,7 @@ from sglang.srt.arg_groups.model_override_base import (
 from sglang.srt.arg_groups.prefill_buffer_ceiling import prefill_buffer_ceiling_of
 
 logger = logging.getLogger(__name__)
+from sglang.srt.configs.quant_utils import get_quantization_config
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.runtime_context import (
@@ -60,8 +61,7 @@ from sglang.srt.runtime_context import (
     get_platform,
     num_dp_ranks_of,
 )
-from sglang.srt.utils.common import (
-    get_quantization_config,
+from sglang.srt.utils.device import (
     is_fi_a2a_supported,
     is_gfx95_supported,
     xpu_has_xmx_support,
@@ -852,7 +852,7 @@ def _deepseek_moe_quant_resolution(view: Any) -> dict:
             # Moonlight-16B-A3B) are purely BF16.  Check the actual
             # safetensors header instead of assuming FP8 by arch name.
             if quant_method is None and model_arch in ["DeepseekV3ForCausalLM"]:
-                from sglang.srt.utils.common import has_fp8_weights_in_checkpoint
+                from sglang.srt.configs.quant_utils import has_fp8_weights_in_checkpoint
 
                 if has_fp8_weights_in_checkpoint(view.model_path):
                     overrides["quantization"] = quantization = "fp8"
@@ -1845,7 +1845,7 @@ def _speculative_moe_runner_default(view: Any) -> dict:
 
 @register_post_process
 def _gguf_quantization(view: Any) -> dict:
-    from sglang.srt.utils.hf_transformers import check_gguf_file
+    from sglang.srt.hf_transformers import check_gguf_file
 
     if (view.load_format == "auto" or view.load_format == "gguf") and check_gguf_file(
         view.model_path
@@ -2029,10 +2029,13 @@ def post_capture_kv_sizing_planned(server_args: Any) -> bool:
         ):
             return False
 
-    from sglang.srt.configs.model_config import is_deepseek_v4, is_minimax_sparse
+    from sglang.srt.configs.model_config import (
+        is_minimax_sparse,
+        uses_compressed_kv_attention,
+    )
 
     hf_config = model_config.hf_config
-    if is_deepseek_v4(hf_config) or is_minimax_sparse(hf_config):
+    if uses_compressed_kv_attention(hf_config) or is_minimax_sparse(hf_config):
         return False
 
     return True
