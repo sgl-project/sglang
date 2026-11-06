@@ -130,9 +130,10 @@ def _reject_model_patches(transformer_options) -> None:
     if found:
         raise ValueError(
             "SGLD integrated mode runs the diffusion model in its worker and cannot "
-            f"apply ComfyUI model patches ({', '.join(sorted(found))}); remove the "
-            "patch nodes (ControlNet, attention backend, block patches) or use the "
-            "native ComfyUI loader"
+            f"apply ComfyUI model patches ({', '.join(sorted(found))}). Remove "
+            "speed-only patch nodes (attention backends, caches, compile) and set "
+            "the equivalent in SGLDOptions; for ControlNet or block patches, use "
+            "the native ComfyUI loader"
         )
 
 

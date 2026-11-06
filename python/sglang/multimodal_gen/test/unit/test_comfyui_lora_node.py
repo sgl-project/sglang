@@ -233,6 +233,33 @@ def test_rebuilt_worker_loads_only_this_runs_loras() -> None:
             assert ex._lora_input is None
 
 
+def test_comfy_weight_patches_on_an_sgld_model_are_rejected() -> None:
+    """A LoRA node other than SGLDLoraLoader that adds weight patches directly
+    would be dropped: the SGLD worker owns the diffusion model's weights."""
+    import importlib
+
+    class ModelPatcher:
+        def add_patches(self, patches, strength_patch=1.0, strength_model=1.0):
+            raise AssertionError("ComfyUI must not record SGLD weight patches")
+
+    comfy = types.ModuleType("comfy")
+    comfy.model_patcher = types.ModuleType("comfy.model_patcher")
+    comfy.model_patcher.ModelPatcher = ModelPatcher
+    name = "sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.core.model_patcher"
+    with mock.patch.dict(
+        sys.modules, {"comfy": comfy, "comfy.model_patcher": comfy.model_patcher}
+    ):
+        sys.modules.pop(name, None)
+        try:
+            patcher_cls = importlib.import_module(name).SGLDModelPatcher
+        finally:
+            sys.modules.pop(name, None)
+    patcher = object.__new__(patcher_cls)
+    assert patcher.add_patches({}) == []
+    with pytest.raises(ValueError, match="SGLDLoraLoader"):
+        patcher.add_patches({"diffusion_model.blocks.0.attn.to_q.weight": ()}, 1.0)
+
+
 def test_failed_lora_switch_is_not_recorded_as_active() -> None:
     ex = _executor(Mock())
     ex._lora_input = _lora_input([("A", 0.5)])
