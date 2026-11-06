@@ -17,6 +17,7 @@ import torch
 from sglang.kernels.ops.communication.muse_spark_all_gather import (
     MAX_TOKENS,
     all_gather,
+    all_gather_norm_fp4_quant,
 )
 
 if TYPE_CHECKING:
@@ -69,3 +70,27 @@ def gemm_ag(
     if out is None:
         out = torch.empty(x.shape[0], weight.shape[0], dtype=x.dtype, device=x.device)
     return all_gather(comm, local, out, b, c)
+
+
+def gemm_ag_norm_fp4_quant(
+    comm: CustomAllReduceV2,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    norm_weight: Optional[torch.Tensor],
+    eps: float,
+    global_scale: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Static NVFP4 ``(fp4 [M, N / 2] uint8, sf [M, N / 16] e4m3)`` of RMSNorm(``x @ weight.T``).
+
+    The local slice GEMM, then one gather + norm + quant kernel; bitwise the norm + quant of
+    :func:`gemm_ag`'s rows.
+    """
+    _, fp4, sf = all_gather_norm_fp4_quant(
+        comm,
+        gemm_local(comm, x, weight),
+        norm_weight,
+        eps,
+        global_scale,
+        write_rows=False,
+    )
+    return fp4, sf.view(torch.float8_e4m3fn)
