@@ -38,6 +38,7 @@ from sglang.srt.distributed import (
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.hf_transformers import get_rope_config
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
@@ -125,7 +126,6 @@ from sglang.srt.utils import (
     make_pp_layers,
     use_intel_amx_backend,
 )
-from sglang.srt.utils.hf_transformers import get_rope_config
 
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 

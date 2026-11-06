@@ -334,7 +334,7 @@ class TestBoundaryReductionDefaults(CustomTestCase):
                     hf_config=SimpleNamespace(architectures=["MiMoV2ForCausalLM"])
                 )
                 with patch(
-                    "sglang.srt.utils.hf_transformers.get_config",
+                    "sglang.srt.hf_transformers.get_config",
                     return_value=SimpleNamespace(model_type="qwen3"),
                 ) as load:
                     run_post_process_pass(args, resolve_boundary_reduction)
@@ -3593,7 +3593,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         from sglang.srt.arg_groups.overrides import _gguf_quantization
 
         with patch(
-            "sglang.srt.utils.hf_transformers.check_gguf_file",
+            "sglang.srt.hf_transformers.check_gguf_file",
             return_value=True,
         ):
             self.assertEqual(

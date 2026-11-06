@@ -7,7 +7,7 @@ from unittest.mock import patch
 import torch
 from torch import nn
 
-from sglang.srt.utils.weight_checker import ChecksumInfo, WeightChecker
+from sglang.srt.model_executor.weight_checker import ChecksumInfo, WeightChecker
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, enter_scope, published_topology
 

@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Unit tests for sglang/srt/utils/weight_checker.py."""
+"""Unit tests for sglang/srt/model_executor/weight_checker.py."""
 
 import unittest
 from typing import Iterable, List
@@ -24,8 +24,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     quant_weight_ue8m0,
     transform_scale_ue8m0,
 )
-from sglang.srt.utils import is_hip
-from sglang.srt.utils.weight_checker import (
+from sglang.srt.model_executor.weight_checker import (
     CheckEntry,
     ChecksumInfo,
     ParallelismInfo,
@@ -38,10 +37,11 @@ from sglang.srt.utils.weight_checker import (
     _is_non_persistent_buffer_name,
     _random_like,
 )
-from sglang.srt.utils.weight_checker_comparator import (
+from sglang.srt.model_executor.weight_checker_comparator import (
     Fp8BlockComparable,
     RawComparable,
 )
+from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase, enter_scope, published_topology
 
@@ -109,11 +109,11 @@ class TestShuffledFp8Comparable(CustomTestCase):
 
         with (
             patch(
-                "sglang.srt.utils.weight_checker_comparator.unshuffle_fp8_weight",
+                "sglang.srt.model_executor.weight_checker_comparator.unshuffle_fp8_weight",
                 side_effect=lambda weight: weight,
             ) as unshuffle,
             patch(
-                "sglang.srt.utils.weight_checker_comparator.block_quant_dequant",
+                "sglang.srt.model_executor.weight_checker_comparator.block_quant_dequant",
                 side_effect=lambda weight, *_args, **_kwargs: weight,
             ),
         ):
@@ -128,11 +128,11 @@ class TestShuffledFp8Comparable(CustomTestCase):
 
         with (
             patch(
-                "sglang.srt.utils.weight_checker_comparator.unshuffle_fp8_weight",
+                "sglang.srt.model_executor.weight_checker_comparator.unshuffle_fp8_weight",
                 side_effect=lambda weight: weight,
             ) as unshuffle,
             patch(
-                "sglang.srt.utils.weight_checker_comparator.block_quant_dequant",
+                "sglang.srt.model_executor.weight_checker_comparator.block_quant_dequant",
                 side_effect=lambda weight, *_args, **_kwargs: weight,
             ),
         ):
@@ -230,7 +230,7 @@ class TestRandomLike(CustomTestCase):
         torch.testing.assert_close(t, before)
 
     def test_floating_point_chunked_generation(self):
-        with patch("sglang.srt.utils.weight_checker.CHUNK_NUMEL", 8):
+        with patch("sglang.srt.model_executor.weight_checker.CHUNK_NUMEL", 8):
             out = _random_like(torch.zeros(64, dtype=torch.bfloat16))
         self.assertEqual(out.dtype, torch.bfloat16)
         self.assertEqual(out.shape, (64,))
@@ -408,7 +408,9 @@ class TestCheckTensors(CustomTestCase):
     def test_chunked_raw_stats_match_unchunked(self):
         expect = [("a", True, RawComparable(torch.zeros(10)))]
         actual = [("a", True, RawComparable(torch.arange(10.0)))]
-        with patch("sglang.srt.utils.weight_checker_comparator.CHUNK_NUMEL", 3):
+        with patch(
+            "sglang.srt.model_executor.weight_checker_comparator.CHUNK_NUMEL", 3
+        ):
             with self.assertRaises(Exception) as ctx:
                 _check_tensors(expect_tensors=expect, actual_tensors=actual)
         self.assertIn("max_abs_err=9.0", str(ctx.exception))

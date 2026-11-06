@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Unit tests for sglang/srt/utils/weight_checker_comparator.py."""
+"""Unit tests for sglang/srt/model_executor/weight_checker_comparator.py."""
 
 import unittest
 from unittest.mock import patch
@@ -22,7 +22,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     quant_weight_ue8m0,
     transform_scale_ue8m0,
 )
-from sglang.srt.utils.weight_checker_comparator import (
+from sglang.srt.model_executor.weight_checker_comparator import (
     ComparableWeight,
     Fp8BlockComparable,
     compare_weights,
@@ -130,7 +130,9 @@ class TestCompareQuantPair(CustomTestCase):
 
     def test_chunked_result_matches_unchunked(self):
         reference = _compare_quant_pair(self.e_q, self.e_s, self.a_q, self.a_s)
-        with patch("sglang.srt.utils.weight_checker_comparator.CHUNK_NUMEL", 128 * 128):
+        with patch(
+            "sglang.srt.model_executor.weight_checker_comparator.CHUNK_NUMEL", 128 * 128
+        ):
             chunked = _compare_quant_pair(self.e_q, self.e_s, self.a_q, self.a_s)
         eq_c, max_c, mean_c, ex_c = chunked
         eq_r, max_r, mean_r, ex_r = reference
