@@ -12,6 +12,7 @@ from typing import NamedTuple, Optional, TypeGuard, Union
 import torch
 
 from sglang.kernels.ops.kvcache.hicache import (
+    can_use_page_unified_load_back_jit_kernel,
     can_use_page_unified_write_back_jit_kernel,
 )
 from sglang.srt.mem_cache.host_memory import available_host_memory_bytes
@@ -57,11 +58,12 @@ def prepare_page_unified_write_back_staging(
         and can_use_page_unified_write_back_jit_kernel(
             group_bytes=geometry.group_bytes, is_mla=geometry.is_mla
         )
+        and can_use_page_unified_load_back_jit_kernel(group_bytes=geometry.group_bytes)
     ):
         row_kind = "latent" if geometry.is_mla else "head-group"
         raise ValueError(
-            "the 'page_unified' host layout requires the staged "
-            "write-back JIT kernel, which could not be built for a "
+            "the 'page_unified' host layout requires the staged write-back "
+            "and load-back JIT kernels, which could not be built for a "
             f"{geometry.group_bytes}-byte {row_kind} row."
         )
     shape = geometry.page_dims(min(page_capacity, _WRITE_BACK_STAGING_PAGE_CHUNK))
