@@ -1554,6 +1554,17 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             if self.max_context_size is not None or self.max_seq_len is not None
             else None
         )
+        if (
+            batch_max_context_len is not None
+            and forward_batch.original_global_num_tokens_cpu is not None
+            and 0 in forward_batch.original_global_num_tokens_cpu
+            and forward_batch.dp_padding_mode.is_max_len()
+        ):
+            # MAX_LEN turns an idle rank into one bucket-sized request. Every
+            # peer must honor its context bound or graph/eager collectives split.
+            batch_max_context_len = max(
+                batch_max_context_len, max(forward_batch.global_num_tokens_cpu)
+            )
         if not self.can_replay_locally(
             batch_size=forward_batch.batch_size,
             num_tokens=len(forward_batch.input_ids),

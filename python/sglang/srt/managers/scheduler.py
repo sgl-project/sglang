@@ -1535,6 +1535,18 @@ class Scheduler(
                     debug_log_enabled=get_parallel().attn_tp_rank == 0,
                 )
 
+        self.dp_phase_lockstep = (
+            get_schedule().enable_dp_phase_lockstep
+            and self.prefill_delayer is not None
+            and self.spec_algorithm.is_none()
+            and not envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get()
+        )
+        if get_schedule().enable_dp_phase_lockstep and not self.dp_phase_lockstep:
+            logger.info(
+                "--enable-dp-phase-lockstep is inert: it requires the prefill "
+                "delayer, no speculative decoding, and the scheduler all-gather."
+            )
+
         # NOTE: preemption is enabled by default for priority scheduling.
         self.enable_priority_preemption = (
             self.enable_priority_scheduling
@@ -4175,15 +4187,15 @@ class Scheduler(
             running_batch = prefill_plan.running_batch
 
         need_mlp_sync = self.require_mlp_sync
-        if (
-            need_mlp_sync
-            and not self.spec_algorithm.is_none()
-            and not envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get()
+        if need_mlp_sync and (
+            self.dp_phase_lockstep
+            or (
+                not self.spec_algorithm.is_none()
+                and not envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get()
+            )
         ):
-            # NOTE: This branch makes sure prefill and decode batches will not be mixed when spec and dp-attn is enabled.
-            # Before merging the new batch into running batch:
-            # 1. All new batches are none -> need_mlp_sync remains true (sync is needed for decode batch).
-            # 2. All new batches are some (prefill / idle) -> we do not need prepare mlp sync one more time.
+            # Synchronize admitted prefill batches before preparing decode;
+            # an optimistic delayer vote may still fail request admission.
             new_batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(new_batch)
             need_mlp_sync = new_batch is None
 

@@ -151,5 +151,58 @@ class TestStashGatePreservesPrefix(CustomTestCase):
         )
 
 
+class TestDPPhaseLockstep(CustomTestCase):
+    def test_phase_follows_admitted_batches_not_prefill_votes(self):
+        """Rejected admissions must leave decode runnable, even after a yes vote."""
+        for enabled in (False, True):
+            for local_prefill in (False, True):
+                for remote_prefill in (False, True):
+                    with self.subTest(
+                        enabled=enabled, local=local_prefill, remote=remote_prefill
+                    ):
+                        s = _scheduler_for_get_next_batch(
+                            tree_cache=_make_tree_cache(), chunked_req=None
+                        )
+                        s.dp_phase_lockstep = enabled
+                        s.require_mlp_sync = True
+                        s.spec_algorithm.is_none.return_value = True
+                        s.running_batch.is_empty.return_value = False
+                        prefill = MagicMock() if local_prefill else None
+                        idle = MagicMock()
+                        s.get_new_batch_prefill.return_value = SimpleNamespace(
+                            batch_to_run=prefill,
+                            running_batch=s.running_batch,
+                            delayer_phase_prefill=True,
+                        )
+
+                        def sync(batch, need_sync=True):
+                            return (
+                                idle
+                                if need_sync and batch is None and remote_prefill
+                                else batch
+                            )
+
+                        s.dp_attn_adapter.maybe_prepare_mlp_sync_batch.side_effect = (
+                            sync
+                        )
+                        s.dp_attn_adapter.maybe_convert_decode_to_extend.side_effect = (
+                            lambda b: b
+                        )
+                        plan = s.get_next_batch_to_run(s.running_batch, None)
+                        expected = (
+                            prefill
+                            if local_prefill
+                            else (
+                                idle if enabled and remote_prefill else s.running_batch
+                            )
+                        )
+                        self.assertIs(plan.batch_to_run, expected)
+                        self.assertIs(plan.running_batch, s.running_batch)
+                        self.assertEqual(
+                            s.update_running_batch.call_count,
+                            int(not local_prefill and not (enabled and remote_prefill)),
+                        )
+
+
 if __name__ == "__main__":
     unittest.main()
