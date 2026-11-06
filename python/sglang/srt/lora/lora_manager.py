@@ -44,6 +44,7 @@ from sglang.srt.lora.utils import (
     auto_detect_lora_target_modules,
     get_normalized_target_modules,
     get_target_module_name,
+    replace_submodule,
     warn_if_adapter_targets_embeddings,
 )
 from sglang.srt.managers.io_struct import LoRAUpdateOutput
@@ -58,7 +59,7 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import get_available_gpu_memory, replace_submodule
+from sglang.srt.utils import get_available_gpu_memory
 
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 
