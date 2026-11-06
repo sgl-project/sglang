@@ -1093,6 +1093,10 @@ class Envs:
     # the SHUFFLE KV layout that enables pa_decode_gluon for full-attn
     # decode without runtime permutes.
     SGLANG_AITER_KV_CACHE_LAYOUT = EnvStr("nhd")
+    # Decode implementation for the AITER-compatible vectorized-5D KV pool.
+    # "gluon" preserves the existing path, "tlx" requires TLX support, and
+    # "auto" stays on Gluon until an MI350 shape is validated for TLX.
+    SGLANG_AITER_5D_DECODE_BACKEND = EnvStr("gluon")
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
     # Send Qwen3.8's 512-expert softmax router back to aiter `fused_topk`
     # instead of `topk_gating`.
