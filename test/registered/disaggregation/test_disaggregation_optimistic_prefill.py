@@ -373,6 +373,104 @@ class TestOptimisticPrefillMambaAdmission(CustomTestCase):
         self.assertEqual(self._resolved_attempts(server_args), 3)
 
 
+def make_mamba_tree(*, size: int, mamba_size: int):
+    server_args = ServerArgs(model_path="dummy", page_size=1)
+    # The mamba component reads mamba_cache_chunk_size, whose property
+    # otherwise loads the HF config for the dummy model.
+    server_args._mamba_cache_chunk_size = FLA_CHUNK_SIZE
+    set_global_server_args_for_scheduler(server_args)
+    num_layers = 48
+    global_interval = 4
+    full_attention_layer_ids = [
+        i for i in range(global_interval - 1, num_layers, global_interval)
+    ]
+    mamba_layers = [i for i in range(num_layers) if i not in full_attention_layer_ids]
+    device = get_device()
+    with envs.SGLANG_MAMBA_SSM_DTYPE.override("bfloat16"):
+        shape = Mamba2StateShape.create(
+            tp_world_size=1,
+            intermediate_size=4096,
+            n_groups=16,
+            num_heads=32,
+            head_dim=128,
+            state_size=128,
+            conv_kernel=4,
+        )
+        cache_params = Mamba2CacheParams(shape=shape, layers=mamba_layers)
+    req_to_token_pool = HybridReqToTokenPool(
+        size=4,
+        mamba_size=mamba_size,
+        mamba_spec_state_size=4,
+        max_context_len=64,
+        device=device,
+        enable_memory_saver=False,
+        cache_params=cache_params,
+        mamba_layer_ids=mamba_layers,
+        enable_mamba_extra_buffer=True,
+        speculative_num_draft_tokens=3,
+    )
+    pool = HybridLinearKVPool(
+        size=size,
+        dtype=torch.bfloat16,
+        page_size=1,
+        head_num=2,
+        head_dim=256,
+        full_attention_layer_ids=full_attention_layer_ids,
+        device=device,
+        enable_memory_saver=False,
+        mamba_pool=req_to_token_pool.mamba_pool,
+    )
+    allocator = TokenToKVPoolAllocator(
+        size=size,
+        dtype=torch.bfloat16,
+        device=device,
+        kvcache=pool,
+        need_sort=False,
+    )
+    # As the KV cache configurator does: the allocator carries the state.
+    allocator.state = req_to_token_pool.state
+    tree = UnifiedRadixCache(
+        params=CacheInitParams(
+            disable=False,
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool_allocator=allocator,
+            page_size=1,
+            enable_mamba_extra_buffer=True,
+            tree_slots=tree_slots_of((ComponentType.FULL, ComponentType.MAMBA)),
+        )
+    )
+    return tree, allocator, req_to_token_pool
+
+
+def optimistic_mamba_req(
+    *,
+    rid: str,
+    prompt: list[int],
+    track_seqlen: int,
+    tree: UnifiedRadixCache,
+    allocator: TokenToKVPoolAllocator,
+    req_to_token_pool: HybridReqToTokenPool,
+) -> Req:
+    # A request that finished optimistic prefill of prompt and tracked one
+    # Mamba checkpoint at track_seqlen; its KV is request-owned.
+    req = Req(
+        rid=rid,
+        origin_input_text="",
+        origin_input_ids=array("q", prompt),
+        sampling_params=SamplingParams(max_new_tokens=1),
+    )
+    acquire_rows(req_to_token_pool, req_to_token_pool.state, [req])
+    kv_indices = allocator.alloc(len(prompt))
+    req_to_token_pool.write((req.kv.req_pool_idx, slice(0, len(prompt))), kv_indices)
+    req.full_untruncated_fill_ids = array("q", prompt)
+    req.extend_end = len(prompt)
+    req.kv.kv_committed_len = len(prompt)
+    req.kv.kv_allocated_len = len(prompt)
+    req.kv.mamba_last_track_seqlen = track_seqlen
+    req.last_node = tree.root_node_handle()
+    return req
+
+
 class TestOptimisticPrefillMambaRetryRelease(CustomTestCase):
     """An optimistic-prefill retry leaves the donated prefix and exactly one
     Mamba checkpoint in the tree -- not zero, and not a second pinned clone.
@@ -383,98 +481,18 @@ class TestOptimisticPrefillMambaRetryRelease(CustomTestCase):
     TRACK_SEQLEN = 4
     PROMPT = [1, 2, 3, 4, 5, 6, 7, 8]
 
-    def _setup_mamba_tree(self):
-        server_args = ServerArgs(model_path="dummy", page_size=1)
-        # The mamba component reads mamba_cache_chunk_size, whose property
-        # otherwise loads the HF config for the dummy model.
-        server_args._mamba_cache_chunk_size = FLA_CHUNK_SIZE
-        set_global_server_args_for_scheduler(server_args)
-        num_layers = 48
-        global_interval = 4
-        full_attention_layer_ids = [
-            i for i in range(global_interval - 1, num_layers, global_interval)
-        ]
-        mamba_layers = [
-            i for i in range(num_layers) if i not in full_attention_layer_ids
-        ]
-        device = get_device()
-        with envs.SGLANG_MAMBA_SSM_DTYPE.override("bfloat16"):
-            shape = Mamba2StateShape.create(
-                tp_world_size=1,
-                intermediate_size=4096,
-                n_groups=16,
-                num_heads=32,
-                head_dim=128,
-                state_size=128,
-                conv_kernel=4,
-            )
-            cache_params = Mamba2CacheParams(shape=shape, layers=mamba_layers)
-        req_to_token_pool = HybridReqToTokenPool(
-            size=4,
-            mamba_size=self.MAMBA_SIZE,
-            mamba_spec_state_size=4,
-            max_context_len=64,
-            device=device,
-            enable_memory_saver=False,
-            cache_params=cache_params,
-            mamba_layer_ids=mamba_layers,
-            enable_mamba_extra_buffer=True,
-            speculative_num_draft_tokens=3,
-        )
-        pool = HybridLinearKVPool(
-            size=self.SIZE,
-            dtype=torch.bfloat16,
-            page_size=1,
-            head_num=2,
-            head_dim=256,
-            full_attention_layer_ids=full_attention_layer_ids,
-            device=device,
-            enable_memory_saver=False,
-            mamba_pool=req_to_token_pool.mamba_pool,
-        )
-        allocator = TokenToKVPoolAllocator(
-            size=self.SIZE,
-            dtype=torch.bfloat16,
-            device=device,
-            kvcache=pool,
-            need_sort=False,
-        )
-        # As the KV cache configurator does: the allocator carries the state.
-        allocator.state = req_to_token_pool.state
-        tree = UnifiedRadixCache(
-            params=CacheInitParams(
-                disable=False,
-                req_to_token_pool=req_to_token_pool,
-                token_to_kv_pool_allocator=allocator,
-                page_size=1,
-                enable_mamba_extra_buffer=True,
-                tree_slots=tree_slots_of((ComponentType.FULL, ComponentType.MAMBA)),
-            )
-        )
-        return tree, allocator, req_to_token_pool
-
     def test_retry_release_retains_donated_checkpoint(self):
-        tree, allocator, req_to_token_pool = self._setup_mamba_tree()
-
-        # A request that finished optimistic prefill of PROMPT and tracked one
-        # Mamba checkpoint at TRACK_SEQLEN.
-        req = Req(
+        tree, allocator, req_to_token_pool = make_mamba_tree(
+            size=self.SIZE, mamba_size=self.MAMBA_SIZE
+        )
+        req = optimistic_mamba_req(
             rid="optimistic-mamba-retry",
-            origin_input_text="",
-            origin_input_ids=array("q", self.PROMPT),
-            sampling_params=SamplingParams(max_new_tokens=1),
+            prompt=self.PROMPT,
+            track_seqlen=self.TRACK_SEQLEN,
+            tree=tree,
+            allocator=allocator,
+            req_to_token_pool=req_to_token_pool,
         )
-        acquire_rows(req_to_token_pool, req_to_token_pool.state, [req])
-        kv_indices = allocator.alloc(len(self.PROMPT))
-        req_to_token_pool.write(
-            (req.kv.req_pool_idx, slice(0, len(self.PROMPT))), kv_indices
-        )
-        req.full_untruncated_fill_ids = array("q", self.PROMPT)
-        req.extend_end = len(self.PROMPT)
-        req.kv.kv_committed_len = len(self.PROMPT)
-        req.kv.kv_allocated_len = len(self.PROMPT)
-        req.kv.mamba_last_track_seqlen = self.TRACK_SEQLEN
-        req.last_node = tree.root_node_handle()
 
         scheduler = SimpleNamespace(
             tree_cache=tree,
@@ -508,6 +526,74 @@ class TestOptimisticPrefillMambaRetryRelease(CustomTestCase):
         self.assertEqual(allocator.available_size(), self.SIZE - self.TRACK_SEQLEN)
         self.assertEqual(
             req_to_token_pool.mamba_allocator.available_size(), self.MAMBA_SIZE - 1
+        )
+
+
+class TestOptimisticPrefillMambaWriteThroughAdvance(CustomTestCase):
+    """Under a write-through cache, a Mamba request whose decode peer has not
+    bootstrapped keeps its prefill KV and its tracked checkpoint request-owned
+    instead of aborting the scheduler, and the publication after bootstrap
+    donates exactly that checkpoint."""
+
+    SIZE = 128
+    MAMBA_SIZE = 8
+    TRACK_SEQLEN = 4
+    PROMPT = [1, 2, 3, 4, 5, 6, 7, 8]
+
+    def test_pending_bootstrap_keeps_tracked_checkpoint(self):
+        tree, allocator, req_to_token_pool = make_mamba_tree(
+            size=self.SIZE, mamba_size=self.MAMBA_SIZE
+        )
+        req = optimistic_mamba_req(
+            rid="optimistic-mamba-write-through",
+            prompt=self.PROMPT,
+            track_seqlen=self.TRACK_SEQLEN,
+            tree=tree,
+            allocator=allocator,
+            req_to_token_pool=req_to_token_pool,
+        )
+        req.pending_bootstrap = True
+        mamba_free = req_to_token_pool.mamba_allocator.available_size()
+        scheduler = SimpleNamespace(tree_cache=tree)
+
+        with patch(
+            "sglang.srt.disaggregation.prefill._uses_write_through_cache",
+            return_value=True,
+        ):
+            SchedulerDisaggregationPrefillMixin.checkpoint_disagg_prefill(
+                scheduler, req
+            )
+
+        # Nothing is published or freed, the checkpoint stays tracked for the
+        # publication, and the next extend resumes after this one.
+        self.assertEqual(tree.total_size(), (0, 0))
+        self.assertEqual(req.kv.mamba_last_track_seqlen, self.TRACK_SEQLEN)
+        self.assertEqual(allocator.available_size(), self.SIZE - len(self.PROMPT))
+        self.assertEqual(req_to_token_pool.mamba_allocator.available_size(), mamba_free)
+        self.assertEqual(req.prefix_len, len(self.PROMPT))
+
+        # Bootstrap completes: the publication donates the tracked checkpoint.
+        req.pending_bootstrap = False
+        with patch(
+            "sglang.srt.disaggregation.prefill._uses_write_through_cache",
+            return_value=True,
+        ):
+            SchedulerDisaggregationPrefillMixin.checkpoint_disagg_prefill(
+                scheduler, req
+            )
+
+        self.assertEqual(tree.total_size(), (self.TRACK_SEQLEN, 1))
+        match = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", self.PROMPT)))
+        )
+        self.assertIsNotNone(
+            tree.tree_core.get_component_device_value(
+                match.last_device_node, ComponentType.MAMBA
+            )
+        )
+        # The tree took the tracked slot and the request got a fresh one.
+        self.assertEqual(
+            req_to_token_pool.mamba_allocator.available_size(), mamba_free - 1
         )
 
 

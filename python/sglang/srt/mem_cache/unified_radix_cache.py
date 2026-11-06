@@ -1638,15 +1638,21 @@ class UnifiedRadixCache(BasePrefixCache):
 
     @rank_consensus(same_params=["req.rid"])
     def advance_unpublished_req(self, req: Req) -> None:
-        assert not self.supports_mamba()
         token_ids = req.get_fill_ids()
         insert_params = InsertParams(
             prev_prefix_len=req.kv.cache_protected_len,
             priority=req.priority or 0,
             rotation_base=req.kv_rotation_base,
         )
+        # A recurrent checkpoint is handed to the tree only at publication;
+        # until then the request keeps tracking its own state.
+        components = tuple(
+            comp
+            for comp in self._components_tuple
+            if not isinstance(comp, MambaComponent)
+        )
         effective_cache_len = len(token_ids)
-        for comp in self._components_tuple:
+        for comp in components:
             cache_len = comp.prepare_for_caching_req(
                 req=req,
                 insert_params=insert_params,
@@ -1663,10 +1669,10 @@ class UnifiedRadixCache(BasePrefixCache):
             cache_salt=req.cache_salt,
         )
         if envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get():
-            for comp in self._components_tuple:
+            for comp in components:
                 comp.free_out_of_window_slots(req, len(radix_key) - 1, insert_params)
 
-        for comp in self._components_tuple:
+        for comp in components:
             comp.cleanup_after_caching_req(
                 req, is_finished=False, insert_params=insert_params
             )
