@@ -70,6 +70,7 @@ class CancellationRetirementRegistry:
         return receipt
 
     def resolve(self, output: CancellationRetirementOutput):
+        self._expire()
         receipt = self._receipts.get(output.cancellation_id)
         if (
             receipt is not None

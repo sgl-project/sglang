@@ -9,6 +9,7 @@ do not establish GPU completion.
 import asyncio
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import httpx
 import zmq
@@ -292,6 +293,32 @@ class TestCancelRetirementFrontend(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(expired.status_code, 409)
         self.assertEqual(expired.json()["status"], "unknown")
         self.assertIn("expired", expired.json()["reason"].lower())
+
+    async def test_late_reply_expires_without_another_registry_operation(self):
+        registry = CancellationRetirementRegistry()
+        clock = SimpleNamespace(now=10.0)
+        with patch(
+            "sglang.srt.managers.cancellation_retirement.time",
+            SimpleNamespace(monotonic=lambda: clock.now),
+        ):
+            receipt = registry.create("late-cancel", "request", "instance-a")
+            waiter = asyncio.create_task(registry.wait(receipt, timeout_seconds=30))
+            self.tasks.append(waiter)
+            await asyncio.sleep(0)
+            clock.now += registry.ttl_seconds
+            # No lookup/create triggers expiry before this late scheduler reply.
+            registry.resolve(
+                CancellationRetirementOutput(
+                    rid="request",
+                    cancellation_id="late-cancel",
+                    request_instance_id="instance-a",
+                    status="retired",
+                )
+            )
+            result = await asyncio.wait_for(waiter, 1)
+            self.assertEqual(result.status, "unknown")
+            self.assertIn("expired", result.reason.lower())
+            self.assertIsNone(registry.lookup("late-cancel", "request"))
 
     async def test_http_retirement_follows_real_scheduler_cpu_resource_release(self):
         from test_scheduler_cancellation_retirement import (
