@@ -159,7 +159,7 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
                 bs=bs,
                 max_len=max_len,
                 dsa_index_topk=self.dsa_index_topk,
-                physical_page_size=self.physical_page_size,
+                physical_page_size=self.real_page_span,
             )
             seqlens_expanded = cache_seqlens
             seqlens_expanded_size = bs
@@ -294,7 +294,7 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
                 bs=bs,
                 max_seqlen_k=max_seqlen_k,
                 dsa_index_topk=self.dsa_index_topk,
-                physical_page_size=self.physical_page_size,
+                physical_page_size=self.real_page_span,
                 next_n=self.speculative_num_draft_tokens,
             )
 

@@ -11,6 +11,12 @@ a cycle. A helper that needs a domain package belongs to that package, as
 
 Imports inside a function or under `TYPE_CHECKING` do not run at import time
 and are not checked.
+
+It also checks that the runtime packages (sglang.srt, sglang.kernels) never
+import sglang.utils, which holds helpers for the client, tests, and docs. A
+helper the runtime needs belongs to the runtime: a generic one in
+sglang.srt.utils, one that a single package uses in that package. This rule
+checks every import, including imports inside a function.
 """
 
 import ast
@@ -19,6 +25,7 @@ from pathlib import Path
 
 PKG_ROOT = Path("python")
 UTILS_DIR = PKG_ROOT / "sglang" / "srt" / "utils"
+RUNTIME_DIRS = (PKG_ROOT / "sglang" / "srt", PKG_ROOT / "sglang" / "kernels")
 
 # This check does not follow imports transitively: add a module here only if it
 # imports no srt domain package at module level itself.
@@ -29,24 +36,6 @@ ALLOWED = (
     "sglang.srt.platforms",
     "sglang.srt.observability.func_timer",
 )
-
-# Modules that predate the rule. A stale entry fails the check, so the list only
-# shrinks.
-KNOWN_VIOLATIONS = {
-    "crash_dump.py": {"sglang.srt.sampling"},
-    "cuda_vmm_transport_utils.py": {"sglang.srt.multimodal"},
-    "hf_transformers/common.py": {"sglang.srt.configs"},
-    "hf_transformers/config.py": {"sglang.srt.configs", "sglang.srt.connector"},
-    "hf_transformers/gguf_native.py": {"sglang.srt.configs"},
-    "hf_transformers/processor.py": {"sglang.srt.multimodal"},
-    "hf_transformers/tokenizer.py": {"sglang.srt.connector"},
-    "host_shared_memory.py": {"sglang.srt.distributed"},
-    "offloader.py": {"sglang.srt.distributed", "sglang.srt.layers"},
-    "profile_utils.py": {"sglang.srt.managers", "sglang.srt.model_executor"},
-    "request_logger.py": {"sglang.srt.sampling"},
-    "weight_checker.py": {"sglang.srt.managers", "sglang.srt.mem_cache"},
-    "weight_checker_comparator.py": {"sglang.srt.layers"},
-}
 
 
 def _is_type_checking(test: ast.expr) -> bool:
@@ -88,45 +77,69 @@ def _is_allowed(module: str) -> bool:
     return any(module == a or module.startswith(a + ".") for a in ALLOWED)
 
 
-def domain_imports() -> dict[str, set[str]]:
-    found = {}
-    for path in sorted(UTILS_DIR.rglob("*.py")):
+def _sglang_utils_import_lines(path: Path) -> list[int]:
+    source = path.read_text(encoding="utf-8")
+    if "sglang.utils" not in source and "from sglang import" not in source:
+        return []
+    lines = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            if any(alias.name == "sglang.utils" for alias in node.names):
+                lines.append(node.lineno)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0:
+            if node.module == "sglang.utils" or (
+                node.module == "sglang"
+                and any(alias.name == "utils" for alias in node.names)
+            ):
+                lines.append(node.lineno)
+    return lines
+
+
+def _check_sglang_utils_imports() -> int:
+    found = [
+        f"  {path}:{line}"
+        for d in RUNTIME_DIRS
+        for path in sorted(d.rglob("*.py"))
+        for line in _sglang_utils_import_lines(path)
+    ]
+    if found:
+        print("ERROR: sglang.srt and sglang.kernels must not import sglang.utils:")
+        print("\n".join(found))
+        print(
+            "Move the helper into the runtime: sglang.srt.utils for a generic "
+            "one, or the package that uses it."
+        )
+        return 1
+    return 0
+
+
+def _check_utils_domain_imports() -> int:
+    paths = sorted(UTILS_DIR.rglob("*.py"))
+    if not paths:
+        print(f"ERROR: no Python files under {UTILS_DIR}; update UTILS_DIR.")
+        return 1
+    errors = []
+    for path in paths:
         packages = {
             ".".join(module.split(".")[:3])
             for module in _module_level_imports(path)
             if module.startswith("sglang.srt.") and not _is_allowed(module)
         }
         if packages:
-            found[path.relative_to(UTILS_DIR).as_posix()] = packages
-    return found
-
-
-def main() -> int:
-    found = domain_imports()
-    new = [
-        f"  {UTILS_DIR}/{rel}: {sorted(packages - KNOWN_VIOLATIONS.get(rel, set()))}"
-        for rel, packages in found.items()
-        if packages - KNOWN_VIOLATIONS.get(rel, set())
-    ]
-    stale = [
-        f"  {UTILS_DIR}/{rel}: {sorted(packages - found.get(rel, set()))}"
-        for rel, packages in KNOWN_VIOLATIONS.items()
-        if packages - found.get(rel, set())
-    ]
-    if new:
+            errors.append(f"  {path}: {sorted(packages)}")
+    if errors:
         print("ERROR: sglang.srt.utils imports an srt domain package at module level:")
-        print("\n".join(new))
+        print("\n".join(errors))
         print(
             "Move the helper to the package that owns it, import inside the "
             "function, or import under TYPE_CHECKING when only annotations use it."
         )
-    if stale:
-        print(
-            "ERROR: these imports are gone; drop them from KNOWN_VIOLATIONS in "
-            "scripts/lint/check_srt_utils_imports.py:"
-        )
-        print("\n".join(stale))
-    return 1 if new or stale else 0
+        return 1
+    return 0
+
+
+def main() -> int:
+    return _check_utils_domain_imports() | _check_sglang_utils_imports()
 
 
 if __name__ == "__main__":
