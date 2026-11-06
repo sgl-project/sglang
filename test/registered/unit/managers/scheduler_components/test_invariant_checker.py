@@ -17,7 +17,7 @@ from sglang.srt.environ import InvariantCheckLevel, envs
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.managers.scheduler_components import invariant_checker
 from sglang.srt.managers.scheduler_components.invariant_checker import (
-    CheckPoint,
+    CheckPhase,
     SchedulerInvariantChecker,
 )
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
@@ -80,7 +80,7 @@ class TestCheckTreeCacheGate(CustomTestCase):
         ):
             checker = self._make_checker()
 
-            checker.run(CheckPoint.IDLE)
+            checker.run(CheckPhase.IDLE)
 
             checker.tree_cache.sanity_check.assert_not_called()
 
@@ -91,7 +91,7 @@ class TestCheckTreeCacheGate(CustomTestCase):
         ):
             checker = self._make_checker()
 
-            checker.run(CheckPoint.IDLE)
+            checker.run(CheckPhase.IDLE)
 
             checker.tree_cache.sanity_check.assert_called_once()
 
@@ -100,7 +100,7 @@ class TestCheckTreeCacheGate(CustomTestCase):
             checker = self._make_checker()
 
             with envs.SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK.override(False):
-                checker.run(CheckPoint.IDLE)
+                checker.run(CheckPhase.IDLE)
 
             checker.tree_cache.sanity_check.assert_not_called()
 
@@ -109,7 +109,7 @@ class TestCheckTreeCacheGate(CustomTestCase):
             checker = self._make_checker()
 
             with envs.SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK.override(True):
-                checker.run(CheckPoint.IDLE)
+                checker.run(CheckPhase.IDLE)
 
             checker.tree_cache.sanity_check.assert_called_once()
 
@@ -119,7 +119,7 @@ class TestCheckTreeCacheGate(CustomTestCase):
                 prefix_sharing=False, hybrid_swa=False, hybrid_ssm=True
             )
 
-            checker.run(CheckPoint.IDLE)
+            checker.run(CheckPhase.IDLE)
 
             checker.tree_cache.sanity_check.assert_not_called()
 
@@ -130,6 +130,25 @@ class TestStateCheckLevels(CustomTestCase):
         InvariantCheckLevel.WARN,
         InvariantCheckLevel.STRICT,
     )
+    IDLE = ("idle_pools", "req_pool", "pool_bytes")
+
+    def _table(self, base=None, **levels):
+        """Expected level of every check: `base` (default all OFF) with the
+        keyword checks overridden."""
+        names = (
+            "request_lists",
+            "batch_consistency",
+            "busy_pools",
+            "kv_pages",
+            "idle_pools",
+            "req_pool",
+            "pool_bytes",
+            "tree_cache",
+        )
+        return {**dict.fromkeys(names, self.OFF), **(base or {}), **levels}
+
+    def _idle(self, level):
+        return dict.fromkeys(self.IDLE, level)
 
     def _levels(self, in_ci, **flags):
         with patch.dict(os.environ, {}, clear=False):
@@ -156,64 +175,40 @@ class TestStateCheckLevels(CustomTestCase):
                 get_last_batch=lambda: None,
                 scheduler_stage_metrics=None,
             )
-            return {
-                check.name: check.level()
-                for checks in checker.checks.values()
-                for check in checks
-            }
+            return {c.name: c.level() for cs in checker.checks.values() for c in cs}
 
     def test_legacy_flags_decide_the_level(self):
         """With SGLANG_INVARIANT_CHECK unset, every registered check keeps the
         level its own flags gave it, in prod and in CI."""
-        OFF, WARN, STRICT = self.OFF, self.WARN, self.STRICT
-        prod = dict(
-            request_lists=OFF,
-            batch_consistency=OFF,
-            busy_pools=OFF,
-            kv_pages=OFF,
-            idle_pools=STRICT,
-            req_pool=STRICT,
-            pool_bytes=STRICT,
-            tree_cache=OFF,
+        prod = self._table(**self._idle(self.STRICT))
+        ci = self._table(
+            prod,
+            request_lists=self.STRICT,
+            batch_consistency=self.STRICT,
+            tree_cache=self.STRICT,
         )
-        ci = {
-            **prod,
-            "request_lists": STRICT,
-            "batch_consistency": STRICT,
-            "tree_cache": STRICT,
+        busy = "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY"
+        kv = "SGLANG_CHECK_KV_PAGE_INVARIANTS"
+        idle = "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE"
+        no_ci_checks = {
+            "SGLANG_ENABLE_RUNNING_REQS_CHECK": False,
+            "SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK": False,
         }
         cases = [
             (False, {}, prod),
             (True, {}, ci),
-            (
-                True,
-                {
-                    "SGLANG_ENABLE_RUNNING_REQS_CHECK": False,
-                    "SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK": False,
-                },
-                prod,
-            ),
-            (False, {"SGLANG_CHECK_KV_PAGE_INVARIANTS": True}, prod),
+            (True, no_ci_checks, prod),
+            (False, {kv: True}, prod),
+            (False, {busy: 2}, self._table(prod, busy_pools=self.STRICT)),
             (
                 False,
-                {"SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY": 2},
-                {**prod, "busy_pools": STRICT},
-            ),
-            (
-                False,
-                {
-                    "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY": 1,
-                    "SGLANG_CHECK_KV_PAGE_INVARIANTS": True,
-                    "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE": False,
-                },
-                {
-                    **prod,
-                    "busy_pools": STRICT,
-                    "kv_pages": WARN,
-                    "idle_pools": WARN,
-                    "req_pool": WARN,
-                    "pool_bytes": WARN,
-                },
+                {busy: 1, kv: True, idle: False},
+                self._table(
+                    prod,
+                    **self._idle(self.WARN),
+                    busy_pools=self.STRICT,
+                    kv_pages=self.WARN,
+                ),
             ),
         ]
         for in_ci, flags, expected in cases:
@@ -221,31 +216,24 @@ class TestStateCheckLevels(CustomTestCase):
                 self.assertEqual(self._levels(in_ci, **flags), expected)
 
     def test_explicit_level_applies_unless_the_check_flag_is_set(self):
-        OFF, WARN, STRICT = self.OFF, self.WARN, self.STRICT
-        names = self._levels(False).keys()
-        for level in (OFF, WARN, STRICT):
+        for level in (self.OFF, self.WARN, self.STRICT):
             with self.subTest(level=level):
                 self.assertEqual(
                     self._levels(False, SGLANG_INVARIANT_CHECK=int(level)),
-                    dict.fromkeys(names, level),
+                    self._table(**dict.fromkeys(self._table(), level)),
                 )
         # An explicit check flag beats the explicit level, for its checks only.
         self.assertEqual(
             self._levels(
                 True,
-                SGLANG_INVARIANT_CHECK=int(OFF),
+                SGLANG_INVARIANT_CHECK=int(self.OFF),
                 SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE=False,
                 SGLANG_ENABLE_RUNNING_REQS_CHECK=True,
             ),
-            dict(
-                request_lists=STRICT,
-                batch_consistency=STRICT,
-                busy_pools=OFF,
-                kv_pages=OFF,
-                idle_pools=WARN,
-                req_pool=WARN,
-                pool_bytes=WARN,
-                tree_cache=OFF,
+            self._table(
+                **self._idle(self.WARN),
+                request_lists=self.STRICT,
+                batch_consistency=self.STRICT,
             ),
         )
         # The SGLANG_ENABLE_ASYNC_ASSERT bridge is not an explicit level.
@@ -441,7 +429,7 @@ class TestShardedFullPoolInvariant(CustomTestCase):
             envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(1),
             self.assertRaisesRegex(AssertionError, "Full Pool Mem Leak Detected"),
         ):
-            checker.run(CheckPoint.BUSY)
+            checker.run(CheckPhase.BUSY)
 
     def test_partial_active_page_is_accounted_without_slack_exemption(self):
         checker = self._make_checker()
@@ -466,7 +454,7 @@ class TestShardedFullPoolInvariant(CustomTestCase):
                     envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(1),
                     envs.SGLANG_CHECK_KV_PAGE_INVARIANTS.override(False),
                 ):
-                    checker.run(CheckPoint.BUSY)
+                    checker.run(CheckPhase.BUSY)
 
     def test_session_record_is_counted_once_by_its_owner(self):
         checker = self._make_checker()
@@ -490,7 +478,7 @@ class TestShardedFullPoolInvariant(CustomTestCase):
                     envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.override(1),
                     envs.SGLANG_CHECK_KV_PAGE_INVARIANTS.override(False),
                 ):
-                    checker.run(CheckPoint.BUSY)
+                    checker.run(CheckPhase.BUSY)
 
     def test_misaligned_evictable_counter_is_not_rounded_up(self):
         checker = self._make_checker()

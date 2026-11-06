@@ -263,7 +263,7 @@ from sglang.srt.managers.scheduler_components.internal_state import (
     SchedulerInternalStateController,
 )
 from sglang.srt.managers.scheduler_components.invariant_checker import (
-    CheckPoint,
+    CheckPhase,
     SchedulerInvariantChecker,
     create_scheduler_watchdog,
 )
@@ -2138,7 +2138,7 @@ class Scheduler(
 
             # Update last_batch
             self.last_batch = batch
-            self.invariant_checker.run(CheckPoint.BUSY)
+            self.invariant_checker.run(CheckPhase.BUSY)
 
     @DynamicGradMode()
     def event_loop_overlap(self):
@@ -2212,7 +2212,7 @@ class Scheduler(
             # Update last_batch
             self.last_batch = batch
 
-            self.invariant_checker.run(CheckPoint.BUSY)
+            self.invariant_checker.run(CheckPhase.BUSY)
 
     def should_process_last_batch_early(
         self, last_batch: Optional[ScheduleBatch]
@@ -4749,11 +4749,11 @@ class Scheduler(
         self.profiler_manager._profile_batch_predicate(batch)
         batch.add_inflight_step()
         self._join_prefill_launched(batch)
-        self.invariant_checker.run(CheckPoint.LAUNCH, batch)
+        self.invariant_checker.run(CheckPhase.LAUNCH, batch)
 
     def _on_step_processed(self, batch: ScheduleBatch) -> None:
         """The bookkeeping of every step once its result is processed."""
-        self.invariant_checker.run(CheckPoint.RESULT, batch)
+        self.invariant_checker.run(CheckPhase.RESULT, batch)
         batch.drop_inflight_step()
         # Requests finish only in a step's processing.
         self.running_reqs.leave_finished()
@@ -5603,7 +5603,7 @@ class Scheduler(
             except Exception:
                 pass
 
-        self.invariant_checker.run(CheckPoint.IDLE)
+        self.invariant_checker.run(CheckPhase.IDLE)
 
         # metrics every 30s
         self.metrics_reporter._maybe_log_idle_metrics()

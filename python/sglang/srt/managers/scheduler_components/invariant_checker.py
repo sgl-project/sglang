@@ -57,7 +57,7 @@ logger = logging.getLogger(__name__)
 BUSY_MEM_CHECK_LOG_RING_SIZE = 1000
 
 
-class CheckPoint(Enum):
+class CheckPhase(Enum):
     """Where in the scheduler loop a state check runs."""
 
     # A step is launched (`Scheduler._on_step_launch`).
@@ -70,17 +70,20 @@ class CheckPoint(Enum):
     IDLE = "idle"
 
 
+_STAGED_PHASES = (CheckPhase.BUSY, CheckPhase.IDLE)
+
+
 @dataclass(frozen=True, slots=True)
 class StateCheck:
-    # For reporting only.
+    # Identifies the check; the checker itself never reads it.
     name: str
-    point: CheckPoint
+    phase: CheckPhase
     # Resolved on every run. OFF skips the check, STRICT raises on a failure,
     # WARN logs a throttled warning and counts it.
     level: Callable[[], InvariantCheckLevel]
-    # Called with the resolved level (never OFF) and, at LAUNCH and RESULT,
-    # the step's batch.
-    fn: Callable[[InvariantCheckLevel, Optional[ScheduleBatch]], None]
+    # Called with the resolved level (never OFF); a LAUNCH or RESULT check
+    # also takes the step's batch: `fn(level, batch)`, else `fn(level)`.
+    fn: Callable[..., None]
     # Skips the check when it returns True; evaluated once per run however
     # many checks carry it.
     skip: Optional[Callable[[], bool]] = None
@@ -90,7 +93,7 @@ def _strict_if(enabled: bool) -> InvariantCheckLevel:
     return InvariantCheckLevel.STRICT if enabled else InvariantCheckLevel.OFF
 
 
-def _leak_report_level() -> InvariantCheckLevel:
+def _idle_leak_legacy_level() -> InvariantCheckLevel:
     if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE.get():
         return InvariantCheckLevel.STRICT
     return InvariantCheckLevel.WARN
@@ -102,10 +105,10 @@ def _kv_pages_legacy_level() -> InvariantCheckLevel:
         and envs.SGLANG_CHECK_KV_PAGE_INVARIANTS.get()
     ):
         return InvariantCheckLevel.OFF
-    return _leak_report_level()
+    return _idle_leak_legacy_level()
 
 
-def _level(
+def _level_resolver(
     legacy_level: Callable[[], InvariantCheckLevel], *legacy_flags: EnvField
 ) -> Callable[[], InvariantCheckLevel]:
     """A check's level: an explicitly set SGLANG_INVARIANT_CHECK, unless one of
@@ -123,24 +126,24 @@ def _level(
     return resolve
 
 
-_running_reqs_level = _level(
+_running_reqs_level = _level_resolver(
     lambda: _strict_if(envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.get()),
     envs.SGLANG_ENABLE_RUNNING_REQS_CHECK,
 )
-_busy_pools_level = _level(
+_busy_pools_level = _level_resolver(
     lambda: _strict_if(envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get()),
     envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY,
 )
-_kv_pages_level = _level(
+_kv_pages_level = _level_resolver(
     _kv_pages_legacy_level,
     envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY,
     envs.SGLANG_CHECK_KV_PAGE_INVARIANTS,
     envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE,
 )
-_idle_leak_level = _level(
-    _leak_report_level, envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE
+_idle_leak_level = _level_resolver(
+    _idle_leak_legacy_level, envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE
 )
-_tree_cache_level = _level(
+_tree_cache_level = _level_resolver(
     lambda: _strict_if(envs.SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK.get()),
     envs.SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK,
 )
@@ -174,117 +177,97 @@ class SchedulerInvariantChecker:
     recent_busy_msgs: Deque[str] = field(
         default_factory=lambda: deque(maxlen=BUSY_MEM_CHECK_LOG_RING_SIZE)
     )
-    checks: Dict[CheckPoint, List[StateCheck]] = field(init=False)
+    checks: Dict[CheckPhase, List[StateCheck]] = field(init=False)
 
     def __post_init__(self) -> None:
-        def skip_idle_pools() -> bool:
-            return self.get_skip_idle_pool_checks()
+        def no_last_batch() -> bool:
+            return self.get_last_batch() is None
 
-        self.checks = {point: [] for point in CheckPoint}
+        self.checks = {phase: [] for phase in CheckPhase}
         for check in (
             StateCheck(
-                "request_lists",
-                CheckPoint.LAUNCH,
-                _running_reqs_level,
-                lambda level, batch: self._check_request_lists(level, batch),
+                name="request_lists",
+                phase=CheckPhase.LAUNCH,
+                level=_running_reqs_level,
+                fn=self._check_request_lists,
             ),
             StateCheck(
-                "batch_consistency",
-                CheckPoint.RESULT,
-                _running_reqs_level,
-                lambda level, batch: self._check_batch_consistency(level, batch),
+                name="batch_consistency",
+                phase=CheckPhase.RESULT,
+                level=_running_reqs_level,
+                fn=self._check_batch_consistency,
             ),
             StateCheck(
-                "busy_pools",
-                CheckPoint.BUSY,
-                _busy_pools_level,
-                lambda level, _: self._check_busy_pools(level),
+                name="busy_pools",
+                phase=CheckPhase.BUSY,
+                level=_busy_pools_level,
+                fn=self._check_busy_pools,
+                skip=no_last_batch,
             ),
             StateCheck(
-                "kv_pages",
-                CheckPoint.BUSY,
-                _kv_pages_level,
-                lambda level, _: self._check_kv_page_invariants(level),
+                name="kv_pages",
+                phase=CheckPhase.BUSY,
+                level=_kv_pages_level,
+                fn=self._check_kv_page_invariants,
+                skip=no_last_batch,
             ),
             StateCheck(
-                "idle_pools",
-                CheckPoint.IDLE,
-                _idle_leak_level,
-                lambda level, _: self._check_idle_pools(level),
-                skip=skip_idle_pools,
+                name="idle_pools",
+                phase=CheckPhase.IDLE,
+                level=_idle_leak_level,
+                fn=self._check_idle_pools,
+                skip=self.get_skip_idle_pool_checks,
             ),
             StateCheck(
-                "req_pool",
-                CheckPoint.IDLE,
-                _idle_leak_level,
-                lambda level, _: self._check_req_pool(level),
-                skip=skip_idle_pools,
+                name="req_pool",
+                phase=CheckPhase.IDLE,
+                level=_idle_leak_level,
+                fn=self._check_req_pool,
+                skip=self.get_skip_idle_pool_checks,
             ),
             StateCheck(
-                "pool_bytes",
-                CheckPoint.IDLE,
-                _idle_leak_level,
-                lambda level, _: self._check_pool_bytes(level),
-                skip=skip_idle_pools,
+                name="pool_bytes",
+                phase=CheckPhase.IDLE,
+                level=_idle_leak_level,
+                fn=self._check_pool_bytes,
+                skip=self.get_skip_idle_pool_checks,
             ),
             StateCheck(
-                "tree_cache",
-                CheckPoint.IDLE,
-                _tree_cache_level,
-                lambda level, _: self._check_tree_cache(level),
+                name="tree_cache",
+                phase=CheckPhase.IDLE,
+                level=_tree_cache_level,
+                fn=self._check_tree_cache,
             ),
         ):
-            self.checks[check.point].append(check)
+            self.checks[check.phase].append(check)
 
-    def run(self, point: CheckPoint, batch: Optional[ScheduleBatch] = None) -> None:
-        """Run the checks registered at `point` whose level is not OFF, in
+    def run(self, phase: CheckPhase, batch: Optional[ScheduleBatch] = None) -> None:
+        """Run the checks registered at `phase` whose level is not OFF, in
         registration order."""
-        checks = self.checks[point]
-        for start, check in enumerate(checks):
-            level = check.level()
-            if level is not InvariantCheckLevel.OFF:
-                break
-        else:
+        checks = self.checks[phase]
+        if not any(check.level() is not InvariantCheckLevel.OFF for check in checks):
             return
-        if point is CheckPoint.LAUNCH or point is CheckPoint.RESULT:
-            self._run_from(checks, start, level, batch)
+        if phase in _STAGED_PHASES:
+            self._run_in_sanity_stage(checks)
         else:
-            self._run_in_sanity_stage(point, checks, start, level)
+            self._run_checks(checks, batch)
 
     @scheduler_stage_method(SCHEDULER_STAGE_SANITY_CHECK_CACHE)
-    def _run_in_sanity_stage(
-        self,
-        point: CheckPoint,
-        checks: List[StateCheck],
-        start: int,
-        level: InvariantCheckLevel,
-    ) -> None:
-        if point is CheckPoint.BUSY and self.get_last_batch() is None:
-            return
-        self._run_from(checks, start, level, None)
+    def _run_in_sanity_stage(self, checks: List[StateCheck]) -> None:
+        self._run_checks(checks)
 
-    def _run_from(
-        self,
-        checks: List[StateCheck],
-        start: int,
-        level: InvariantCheckLevel,
-        batch: Optional[ScheduleBatch],
-    ) -> None:
-        """Run `checks[start]` at `level`, then each later check whose level
-        is not OFF."""
+    def _run_checks(self, checks: List[StateCheck], *args: ScheduleBatch) -> None:
         skipped: Dict[Callable[[], bool], bool] = {}
-        for i in range(start, len(checks)):
-            check = checks[i]
-            if i > start:
-                level = check.level()
-                if level is InvariantCheckLevel.OFF:
-                    continue
+        for check in checks:
+            level = check.level()
+            if level is InvariantCheckLevel.OFF:
+                continue
             if check.skip is not None:
                 if check.skip not in skipped:
                     skipped[check.skip] = check.skip()
                 if skipped[check.skip]:
                     continue
-            check.fn(level, batch)
+            check.fn(level, *args)
 
     def _fail(
         self,
