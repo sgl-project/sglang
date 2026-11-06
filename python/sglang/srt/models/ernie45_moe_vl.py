@@ -22,6 +22,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.srt.hf_transformers.common import get_rope_config
 from sglang.srt.layers.layer_boundary import (
     append_stages,
     declare_attn,
@@ -46,7 +47,6 @@ from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.models.deepseek_v2 import DeepseekV2MLP as Ernie4_5_VLMoeMLP
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, make_pp_layers
-from sglang.srt.utils.hf_transformers.common import get_rope_config
 
 logger = logging.getLogger(__name__)
 
