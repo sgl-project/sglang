@@ -614,7 +614,8 @@ class ExecMamba(msgspec.Struct):
         "decode inserts are refused. With decode inserts on, sets "
         "GDN_UCACHE_STATE_DTYPE=fp16 for FlashInfer and refuses another value. "
         "Refuses mixed chunk, streaming sessions, unified memory, int8 "
-        "mamba checkpoints and PD disaggregation; needs FlashInfer >= 0.7.3.",
+        "mamba checkpoints, HiCache, LMCache and PD disaggregation; needs "
+        "FlashInfer >= 0.7.3.",
     ] = False
 
 

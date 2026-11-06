@@ -1190,6 +1190,14 @@ class TestGdnReplaySsmUcacheRadixGuard(unittest.TestCase):
                 self._pin(**kwargs)
                 self.assertEqual(os.environ["GDN_UCACHE_STATE_DTYPE"], "bf16")
 
+    def test_host_cache_offload_is_rejected(self):
+        for kwargs in (
+            dict(enable_hierarchical_cache=True),
+            dict(enable_lmcache=True),
+        ):
+            with self.assertRaisesRegex(ValueError, "--enable-hierarchical-cache"):
+                self._check(mamba_radix_cache_strategy="extra_buffer_lazy", **kwargs)
+
     def test_int8_checkpoint_is_rejected_with_radix(self):
         with self.assertRaisesRegex(ValueError, "--enable-int8-mamba-checkpoint"):
             self._check(

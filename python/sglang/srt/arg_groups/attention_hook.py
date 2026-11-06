@@ -631,6 +631,14 @@ def _check_gdn_replayssm_ucache_cache(cfg: Any, *, flag: str) -> None:
             f"{flag} does not support --enable-int8-mamba-checkpoint: the "
             "u-cache keeps an fp16 checkpoint pool."
         )
+    # TODO(ameynaik-hub): validate host offload and load-back of tree states, then
+    # lift this; the rings and cursors are not in the transfer set.
+    if cfg.enable_hierarchical_cache or cfg.enable_lmcache:
+        raise ValueError(
+            f"{flag} does not support --enable-hierarchical-cache or "
+            "--enable-lmcache yet: offload and load-back of u-cache states is "
+            "not validated."
+        )
     if cfg.enable_mixed_chunk:
         raise ValueError(
             f"{flag} does not support --enable-mixed-chunk: decode rows of a mixed "
