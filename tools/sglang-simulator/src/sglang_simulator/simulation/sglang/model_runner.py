@@ -1,4 +1,6 @@
+import functools
 import json
+import os
 from contextvars import ContextVar
 
 import torch
@@ -16,6 +18,64 @@ class _MockModel(torch.nn.Module):
 
     def forward(self, *args, **kwargs):
         return None
+
+
+def _cpu_payload_metadata(device):
+    return (
+        os.getenv("SGLANG_SIMULATOR_BOOTSTRAP") == "1"
+        and os.getenv("SGLANG_USE_CPU_ENGINE") == "1"
+        and device is not None
+        and torch.device(device).type == "cpu"
+    )
+
+
+class C_DSV4PayloadHook(BaseHook):
+    """Keep packed payload geometry without allocating unused model values.
+
+    Only payload allocation methods run on meta. Native integer allocators,
+    request/window state, pool device and logical capacities remain unchanged.
+    """
+
+    HOOK_CLASS_NAME = (
+        r"^DeepSeekV4(SingleKVPool|UniformFP8KVPool|IndexerPool|UnifiedKVPool)$"
+    )
+    HOOK_MODULE_NAME = r"^sglang\.srt\.mem_cache\.deepseek_v4_memory_pool$"
+    REGEX = True
+    REQUIRED = False
+
+    @classmethod
+    def hook(cls, target):
+        if target.__name__ == "DeepSeekV4UnifiedKVPool":
+            original = target.__init__
+
+            @functools.wraps(original)
+            def initialize(self, *args, **kwargs):
+                if "device" in kwargs and _cpu_payload_metadata(kwargs["device"]):
+                    kwargs = {**kwargs, "device": "meta"}
+                return original(self, *args, **kwargs)
+
+            target.__init__ = initialize
+            return
+
+        name = (
+            "_create_buffer"
+            if target.__name__ == "DeepSeekV4IndexerPool"
+            else "create_buffer"
+        )
+        original = getattr(target, name)
+
+        @functools.wraps(original)
+        def allocate(self, *args, **kwargs):
+            device = self.device
+            if not _cpu_payload_metadata(device):
+                return original(self, *args, **kwargs)
+            self.device = "meta"
+            try:
+                return original(self, *args, **kwargs)
+            finally:
+                self.device = device
+
+        setattr(target, name, allocate)
 
 
 class _MockModelLoader:

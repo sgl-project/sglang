@@ -409,6 +409,12 @@ Set the real deployment topology under `scheduler` in `--sim-config-path`. That
 topology drives predictor and cache-resource modeling without launching physical
 parallel workers.
 
+CPU-only DSpark simulation keeps packed KV value payloads on PyTorch `meta`
+tensors. Native shapes and dtypes remain available without allocating the unused
+KV values. Integer page allocators, request state and logical token capacities
+remain on CPU; this payload storage choice does not change predicted costs or
+admit accuracy.
+
 Other server options are normal SGLang command-line arguments. For direct Python
 integration, see
 [`test_simulation_sglang_runner.py`](test/test_simulation_sglang_runner.py); for the
