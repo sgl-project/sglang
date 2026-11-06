@@ -105,7 +105,29 @@ in one batch must use the same resolution, inference steps, guidance settings,
 and output options. Requests with multiple outputs or `think_mode=true` are
 executed sequentially.
 
-### 5.2 Ascend NPU optimizations
+### 5.2 CFG parallelism on two GPUs
+
+With classifier-free guidance enabled (the default `guidance_scale` is 4.0),
+every denoising step runs a conditional and an unconditional forward pass.
+`--enable-cfg-parallel` places one branch on each of two GPUs, so each GPU runs
+one forward pass per step and the two exchange the predicted velocity. The
+image is bit-identical to the single-GPU result.
+
+```bash Command
+sglang serve \
+  --model-path sensenova/SenseNova-U1.5-8B-MoT \
+  --port 30000 \
+  --num-gpus 2 \
+  --enable-cfg-parallel
+```
+
+Each GPU holds a full copy of the weights. Requests with `guidance_scale` 1 have
+a single branch, which both GPUs compute. SenseNova-U1 does not support tensor,
+sequence or data parallelism yet, so `--num-gpus 2` requires
+`--enable-cfg-parallel`. CFG parallelism works with `think_mode`, but not yet
+with dynamic request batching (`--batching-max-size` greater than 1).
+
+### 5.3 Ascend NPU optimizations
 
 On Ascend NPU, SenseNova-U1 automatically uses fused inference attention,
 RMSNorm, and SwiGLU MLP operators for supported inputs. FIA and SwiGLU fall back
@@ -171,6 +193,21 @@ first use.
     Peak Memory Median (MB):                      34326.00
     ------------------------------------------------------------
     ```
+  </Tab>
+  <Tab title="NVIDIA H200 CFG parallel">
+
+    Environment: two NVIDIA H200 GPUs connected by NVLink; workload: the
+    Section 3.1 `sglang generate` command (2048 x 2048, 50 denoising steps,
+    CFG 4, seed 42) with `--warmup-mode request`; repetitions: 2 per row, both
+    within 0.03 s; latency: the warmed-up request time.
+
+    | GPUs | Extra flags | Latency (s) | Speedup | Peak reserved memory on GPU 0 (MB) |
+    |---:|---|---:|---:|---:|
+    | 1 | | 16.26 | 1.00x | 36446 |
+    | 2 | `--num-gpus 2 --enable-cfg-parallel` | 8.32 | 1.95x | 35606 |
+
+    Both configurations produce byte-identical PNG files.
+
   </Tab>
   <Tab title="Ascend 910C">
 
