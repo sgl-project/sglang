@@ -91,6 +91,7 @@ import torch.distributed as dist
 import triton
 from packaging import version as pkg_version
 from PIL import Image, ImageOps, UnidentifiedImageError
+from starlette.responses import PlainTextResponse
 from starlette.routing import Mount
 from torch import nn
 from torch.library import Library
@@ -2901,13 +2902,86 @@ def set_prometheus_multiproc_dir():
     logger.debug(f"PROMETHEUS_MULTIPROC_DIR: {os.environ['PROMETHEUS_MULTIPROC_DIR']}")
 
 
+def _make_guarded_metrics_app(
+    metrics_app: Callable,
+    scrape_timeout_s: float = 5.0,
+):
+    scrape_task: Optional[asyncio.Task] = None
+
+    def clear_scrape_task(done_task: asyncio.Task):
+        nonlocal scrape_task
+        try:
+            exc = done_task.exception()
+            if exc is not None:
+                logger.error("Failed to generate Prometheus metrics", exc_info=exc)
+        except asyncio.CancelledError:
+            pass
+        if scrape_task is done_task:
+            scrape_task = None
+
+    async def guarded_metrics_app(scope, receive, send):
+        nonlocal scrape_task
+
+        if scope.get("type") != "http":
+            response = PlainTextResponse("not found\n", status_code=404)
+            await response(scope, receive, send)
+            return
+
+        request = await receive()
+        if request.get("type") != "http.request":
+            return
+
+        if scrape_task is not None and not scrape_task.done():
+            response = PlainTextResponse(
+                "metrics scrape already in progress\n", status_code=503
+            )
+            await response(scope, receive, send)
+            return
+
+        messages = []
+
+        async def buffered_receive():
+            return request
+
+        async def collect_message(message):
+            messages.append(message)
+
+        def run_metrics_app():
+            # Buffer the request and response so the native app's synchronous
+            # registry work never runs on the serving event loop.
+            asyncio.run(metrics_app(scope, buffered_receive, collect_message))
+
+        scrape_task = asyncio.create_task(asyncio.to_thread(run_metrics_app))
+        scrape_task.add_done_callback(clear_scrape_task)
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(scrape_task), timeout=scrape_timeout_s
+            )
+        except asyncio.TimeoutError:
+            response = PlainTextResponse("metrics scrape timed out\n", status_code=504)
+            await response(scope, receive, send)
+            return
+        except Exception:
+            response = PlainTextResponse(
+                "failed to generate metrics\n", status_code=500
+            )
+            await response(scope, receive, send)
+            return
+
+        for message in messages:
+            await send(message)
+
+    return guarded_metrics_app
+
+
 def add_prometheus_middleware(app):
     # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
     from prometheus_client import CollectorRegistry, make_asgi_app, multiprocess
 
     registry = CollectorRegistry()
     multiprocess.MultiProcessCollector(registry)
-    metrics_route = Mount("/metrics", make_asgi_app(registry=registry))
+    metrics_app = _make_guarded_metrics_app(make_asgi_app(registry=registry))
+    metrics_route = Mount("/metrics", metrics_app)
 
     # Workaround for 307 Redirect for /metrics
     metrics_route.path_regex = re.compile("^/metrics(?P<path>.*)$")
