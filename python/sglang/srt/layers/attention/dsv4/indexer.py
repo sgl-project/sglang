@@ -17,7 +17,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.kernels.ops.attention.dsv4 import (
-    fused_q_indexer_rope_hadamard_fp4_quant,
     fused_q_indexer_rope_hadamard_quant,
     plan_topk_v2,
     topk_transform_paged,
@@ -854,9 +853,14 @@ class C4IndexerBackendMixin:
             weights = weights.squeeze(2)
         if use_fp4_indexer and not use_aiter_fp4:
             weights = weights.float()
-            if envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
+            if is_xpu():
+                from sgl_kernel import fp4_paged_mqa_logits
+
+                fn = fp4_paged_mqa_logits
+            elif envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
                 raise RuntimeError("DeepSeek V4 FP4 indexer requires DeepGEMM indexer.")
-            from deep_gemm import fp8_fp4_paged_mqa_logits as fn
+            else:
+                from deep_gemm import fp8_fp4_paged_mqa_logits as fn
         elif use_aiter_fp4:
             fn = None
         elif envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
@@ -1235,7 +1239,18 @@ class C4Indexer(nn.Module):
                 positions,
             )
             return (q_fp4, q_scale), weight
+        if self.use_fp4_indexer and is_xpu():
+            # Same signature and return layout as the CUDA op below.
+            from sgl_kernel import fused_q_indexer_rope_hadamard_fp4_quant
+
+            return fused_q_indexer_rope_hadamard_fp4_quant(
+                q.contiguous(), weight, self.weight_scale, self.freqs_cis, positions
+            )
         if self.use_fp4_indexer:
+            from sglang.kernels.ops.attention.dsv4 import (
+                fused_q_indexer_rope_hadamard_fp4_quant,
+            )
+
             return fused_q_indexer_rope_hadamard_fp4_quant(
                 q.contiguous(), weight, self.weight_scale, self.freqs_cis, positions
             )
