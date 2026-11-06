@@ -59,9 +59,8 @@ class CacheInitParams:
     # paged SWA pool only a draft uses), so it must not gate prefix matching.
     swa_gates_prefix_match: bool = True
     decoder_swa_bounded_replay: bool = False
-    # Tokens back from the committed length that a fused draft reads in the
-    # swa sub-pool (BaseSpecWorker.draft_swa_window); 0 when it reads none.
-    draft_swa_window: int = 0
+    # Additional reader reaches keyed by actual storage band, not attention role.
+    draft_window_reaches: Optional[dict[str, int]] = None
 
     # The prefix tree's slots in drive order; the KV storage supplies them.
     tree_slots: Optional[tuple[TreeSlot, ...]] = None
@@ -91,4 +90,6 @@ class CacheInitParams:
         # The model's attention window remains sliding_window_size.
         if self.sliding_window_size is None:
             return None
-        return max(self.sliding_window_size, self.draft_swa_window)
+        return max(
+            self.sliding_window_size, (self.draft_window_reaches or {}).get("swa", 0)
+        )

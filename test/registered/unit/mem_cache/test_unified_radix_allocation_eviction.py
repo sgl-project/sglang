@@ -8,10 +8,10 @@ import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.common import evict_from_tree_cache
-from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator
+from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
 from sglang.srt.mem_cache.kv.alloc.interim import (
     _FloatChainPolicy,
-    _TokenAndSlotEndsPolicy,
+    _OwnerEndPolicy,
 )
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -30,6 +30,7 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
         cache.tree_components = (ComponentType.FULL, ComponentType.MAMBA)
         index_slots(cache, cache.tree_components)
         cache.is_swa_enabled = False
+        cache.evicts_by_joint_lru = False
         cache.cache_controller = None
         cache.metrics_collector = None
         cache.tree_core = MagicMock()
@@ -83,8 +84,10 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
 
         capacity = {"free_ids": free_ids, "byte_slots": byte_slots}
         allocator = object.__new__(ChainAllocator)
+        allocator.roles = ChainRoles(owner="full", state="mamba")
+        allocator.window_allocators = {}
         allocator._policy = object.__new__(
-            _FloatChainPolicy if tri_pool else _TokenAndSlotEndsPolicy
+            _FloatChainPolicy if tri_pool else _OwnerEndPolicy
         )
         allocator.free_group = None
         allocator.free_page_reps_group = None
