@@ -14,6 +14,7 @@ import triton
 import triton.language as tl
 from sglang.kernels.arch import current_arch
 
+
 try:
     from triton.language.extra.cuda import libdevice
 except Exception:  # noqa: BLE001
