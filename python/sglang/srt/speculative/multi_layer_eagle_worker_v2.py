@@ -246,9 +246,13 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             boundary_kv_fix_enabled()
             and self.topk == 1
             and self.speculative_num_steps > 1
-            # The fix stashes the mamba/sconv boundary state, so it only applies
-            # to hybrid models; non-hybrid MTP drafts (e.g. MiMoV2) must skip it.
-            and self.req_to_token_pool.holds_state_slots
+            # The K - 1 front rows rebuild draft KV that a step wrote from a
+            # token still a draft guess at the time; hybrid models add the conv
+            # warm-up rows below. Chain drafts need the rows on any cache.
+            # Non-chain drafts on a plain cache (e.g. MiMoV2) still skip it.
+            and (
+                self.chain_mtp_hidden_states or self.req_to_token_pool.holds_state_slots
+            )
         ):
             return
         draft_model_runner = self.draft_runner_list[0]
