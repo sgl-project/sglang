@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import enum
 import functools
 import logging
@@ -17,6 +18,7 @@ from typing import (
 )
 
 import msgspec
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -80,6 +82,7 @@ from sglang.srt.layers.attention.dsv4.metadata import (
     maybe_copy_inplace,
 )
 from sglang.srt.layers.attention.dsv4.online_c128_mtp import OnlineC128MTPController
+from sglang.srt.layers.attention.dsv4.shard_q import MIN_TOKENS, ShardQ, split_runs
 from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillChunkCache,
     SparsePrefillKVBuffer,
@@ -984,6 +987,21 @@ class DSV4AttnMetadata:
             self.c2_flashmla_metadata = _create_flashmla_metadata()
 
 
+class ShardQPlan(msgspec.Struct, frozen=True):
+    """One step's token-sharded (ShardQ) view: the all-to-all exchange plan,
+    and a from-scratch metadata built over this rank's zigzag token runs,
+    each run a plain prefill chunk whose context ends at its own last token.
+
+    Low-ratio sources / attention read this through
+    ``DeepseekV4AttnBackend.use_shard_q_metadata``, which swaps
+    ``self.forward_metadata`` onto ``metadata`` for the call's duration: the
+    existing builders then see an ordinary (smaller) prefill batch and need
+    no ShardQ-specific logic of their own."""
+
+    exchange: ShardQ
+    metadata: DSV4Metadata
+
+
 class LateLayerTail(msgspec.Struct, frozen=True):
     """Rows the layers from late_layer_start on run over under decoder SWA bounded
     replay: the last tail tokens of each request in the extend."""
@@ -1137,6 +1155,17 @@ class DSV4Metadata:
     # Captured with the late layers on a tail block (decoder SWA bounded replay
     # inside the prefill CUDA graph); replay rebuilds the tail metadata iff set.
     prefill_graph_tail: bool = False
+
+    # Set on the metadata built for the main extend when this step's low-ratio
+    # sources before the candidate cut take the token-sharded (ShardQ) path;
+    # None keeps every such layer head-sharded as before. Never set on a tail
+    # or ShardQ's own metadata (plan.metadata.shard_q stays None).
+    shard_q: Optional[ShardQPlan] = None
+    # True only on ``shard_q.metadata`` while its compact rows are active.
+    # Sparse-prefill's chunk cache assumes one contiguous full-batch query
+    # chunk per request, so the first implementation deliberately keeps the
+    # compact ShardQ view on the existing paged FlashMLA path.
+    shard_q_active: bool = False
 
     @property
     def core_metadata(self) -> DSV4AttnMetadata:
@@ -2944,6 +2973,7 @@ class DeepseekV4AttnBackend(
             return
 
         self.forward_metadata = self._build_forward_metadata(forward_batch)
+        self.forward_metadata.shard_q = self._plan_shard_q(forward_batch)
         self.init_forward_metadata_in_graph(forward_batch)
         self.tail_forward_metadata = (
             self._build_late_layer_tail_metadata(forward_batch)
@@ -2953,6 +2983,160 @@ class DeepseekV4AttnBackend(
         )
 
         self._activate_request_window()
+
+    def _plan_shard_q(self, forward_batch: ForwardBatch) -> Optional[ShardQPlan]:
+        """Build this step's ShardQ view, or fail closed on every TP rank.
+
+        The first SGLang implementation intentionally targets the SM90
+        FlashMLA configuration (validated first on H20): plain eager
+        ``EXTEND``, replicated and unpadded token rows, bounded replay, no
+        speculative/draft,
+        CP/DCP/HiSparse, request window, graph, TBO, input scattering or
+        sequence sharding. Those are correctness boundaries, not tuning
+        switches; eligible batches enable ShardQ automatically.
+
+        SM100's ``DeepGEMMPrefillData`` assumes one contiguous query range per
+        request, while a zigzag rank normally owns two. Hopper's torch indexer
+        groups compact rows directly by ``req_rows``, so only that path is
+        enabled here.
+        """
+        parallel = get_parallel()
+        num_tokens = (
+            sum(forward_batch.extend_seq_lens_cpu)
+            if forward_batch.extend_seq_lens_cpu is not None
+            else 0
+        )
+        real_tokens = forward_batch.global_num_token_non_padded_cpu
+        if (
+            parallel.attn_tp_size == 1
+            or parallel.attn_cp_size != 1
+            or getattr(parallel, "dcp_enabled", False)
+            or getattr(parallel, "enable_attn_tp_input_scattered", False)
+            or not self.is_dsv41
+            or not self.low_ratios
+            or self.has_c4
+            or self.has_c128
+            or self.mega_attn
+            or self.trtllm_attn
+            or not get_platform().is_sm90
+            or is_sm100_or_newer()
+            or not self.enable_decoder_swa_bounded_replay
+            or self.is_draft_runner
+            or self.hisparse_coordinator is not None
+            or self.token_to_kv_pool.request_window is not None
+            or forward_batch.forward_mode != ForwardMode.EXTEND
+            or forward_batch._original_forward_mode is not None
+            or forward_batch.spec_info is not None
+            or forward_batch.can_run_tbo
+            or forward_batch.attn_tp_sequence_sharded
+            or is_cp_active(forward_batch)
+            or forward_batch.input_ids_from_graph
+            or forward_batch.full_prefill_cuda_graph_capture
+            or forward_batch.can_run_dp_prefill_cuda_graph
+            or forward_batch.extend_seq_lens_cpu is None
+            or forward_batch.seq_lens_cpu is None
+            or forward_batch.positions is None
+            or forward_batch.input_ids is None
+            or num_tokens < MIN_TOKENS
+            or num_tokens != forward_batch.positions.shape[0]
+            or num_tokens != forward_batch.out_cache_loc.shape[0]
+            or num_tokens != forward_batch.input_ids.shape[0]
+            or (real_tokens is not None and real_tokens != num_tokens)
+        ):
+            return None
+        return self._build_shard_q_metadata(
+            forward_batch,
+            _as_int_list(forward_batch.extend_seq_lens_cpu),
+            _as_int_list(forward_batch.seq_lens_cpu),
+        )
+
+    def _build_shard_q_metadata(
+        self,
+        forward_batch: ForwardBatch,
+        extend_lens_cpu: List[int],
+        seq_lens_cpu: List[int],
+    ) -> Optional[ShardQPlan]:
+        """The exchange plan plus metadata over this rank's zigzag runs.
+
+        A run is represented as an ordinary prefill chunk ending at its own
+        last token, allowing the existing page-table and FlashMLA metadata
+        builders to remain unchanged. ``ShardQ.build`` has already validated
+        every rank's runs before any rank can enter a collective.
+        """
+        parallel = get_parallel()
+        device = forward_batch.out_cache_loc.device
+        exchange = ShardQ.build(
+            extend_lens=extend_lens_cpu,
+            seq_lens=seq_lens_cpu,
+            group=parallel.attn_tp_group,
+            device=device,
+        )
+        if exchange is None:
+            return None
+        token_ids = exchange.token_ids
+        local = np.asarray(exchange.token_ids_cpu, dtype=np.int64)
+        req, run_qlen, run_req, run_seq = split_runs(
+            local, extend_lens_cpu, seq_lens_cpu
+        )
+        # No local-only fallback is allowed after the global split check: all
+        # ranks must make the same collective decision.
+        assert local.size > 0 and run_qlen.size > 0 and int(run_seq.min()) > 0
+        run_start = np.r_[0, np.cumsum(run_qlen)][:-1].astype(np.int64)
+
+        req_pool_cpu = forward_batch.req_pool_indices.cpu().numpy()
+        run_pool = req_pool_cpu[run_req]
+
+        # Match the dtypes init_forward_metadata_prefill's regular caller
+        # (_build_forward_metadata) passes, not an assumed convention.
+        req_pool_dtype = forward_batch.req_pool_indices.dtype
+        seq_lens_dtype = forward_batch.seq_lens.dtype
+        extend_seq_lens_dtype = forward_batch.extend_seq_lens.dtype
+
+        metadata = self.init_forward_metadata_prefill(
+            max_seq_len=int(run_seq.max()),
+            req_pool_indices=async_h2d(
+                run_pool.tolist(), dtype=req_pool_dtype, device=device
+            ),
+            seq_lens=async_h2d(run_seq.tolist(), dtype=seq_lens_dtype, device=device),
+            seq_lens_cpu=run_seq.tolist(),
+            out_cache_loc=forward_batch.out_cache_loc.index_select(0, token_ids),
+            num_tokens=int(local.size),
+            extend_seq_lens=async_h2d(
+                run_qlen.tolist(), dtype=extend_seq_lens_dtype, device=device
+            ),
+            extend_seq_lens_cpu=run_qlen.tolist(),
+            extend_start_loc=async_h2d(
+                run_start.tolist(), dtype=extend_seq_lens_dtype, device=device
+            ),
+        )
+        # Per-token (not per-run) request and position, in this metadata's own
+        # row order, for forward_low_ratio_sources' hoisted-rows fast path.
+        metadata.low_ratio_req_indices = async_h2d(
+            req_pool_cpu[req].tolist(), dtype=torch.int64, device=device
+        )
+        metadata.low_ratio_pos_i64 = forward_batch.positions.index_select(
+            0, token_ids
+        ).to(torch.int64)
+        # Index-K slots describe the replicated global cache and are therefore
+        # shared with the full-batch snapshot. Query-row plans are compact and
+        # must be rebuilt independently on this metadata.
+        metadata.low_ratio_k_slots = self.forward_metadata.low_ratio_k_slots
+        metadata.low_ratio_index_plans = {}
+        metadata.shard_q_active = True
+        return ShardQPlan(exchange=exchange, metadata=metadata)
+
+    @contextlib.contextmanager
+    def use_shard_q_metadata(self, plan: ShardQPlan):
+        """Swap ``self.forward_metadata`` onto ``plan.metadata`` for the
+        duration of the call: a layer's low-ratio sources and attention then
+        see an ordinary (smaller) prefill batch, exactly as a tail block
+        swaps onto ``tail_forward_metadata`` (``enter_late_layer_tail``)."""
+        saved = self.forward_metadata
+        self.forward_metadata = plan.metadata
+        try:
+            yield
+        finally:
+            self.forward_metadata = saved
 
     def _snapshot_low_ratio_k_slots(
         self, forward_batch: ForwardBatch, metadata: DSV4Metadata, *, publish_rows: bool
@@ -3013,6 +3197,7 @@ class DeepseekV4AttnBackend(
 
         return (
             not self.trtllm_attn
+            and not self.forward_metadata.shard_q_active
             and forward_batch.forward_mode.is_extend_without_speculative()
             and (not cp_active or cp_sparse_prefill)
             and not get_platform().is_sm120
