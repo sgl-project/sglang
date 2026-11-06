@@ -23,8 +23,11 @@ use sglang_processor::dynamo_parsers::{ToolChoice as DynamoToolChoice, ToolDefin
 use sglang_processor::dynamo_protocols::types::{
     ChatChoice, ChatChoiceLogprobs, ChatChoiceStream, ChatCompletionMessageContent,
     ChatCompletionMessageToolCall, ChatCompletionMessageToolCallChunk,
-    ChatCompletionResponseMessage, ChatCompletionTokenLogprob, ChatCompletionToolChoiceOption,
-    CreateChatCompletionRequest, CreateChatCompletionResponse, CreateChatCompletionStreamResponse,
+    ChatCompletionRequestMessage, ChatCompletionRequestToolMessageContent,
+    ChatCompletionRequestToolMessageContentPart, ChatCompletionRequestUserMessageContent,
+    ChatCompletionRequestUserMessageContentPart, ChatCompletionResponseMessage,
+    ChatCompletionTokenLogprob, ChatCompletionToolChoiceOption, CreateChatCompletionRequest,
+    CreateChatCompletionResponse, CreateChatCompletionStreamResponse,
     FinishReason as OpenAIFinishReason, FunctionCall, FunctionCallStream, FunctionType,
     ResponseFormat, Role, ServiceTier as ChatServiceTier, Stop, TopLogprobs,
 };
@@ -41,7 +44,7 @@ use super::pd_routing::PDRoutingFields;
 use super::template::{RenderedChat, render_chat};
 use super::tools::{apply_tool_constraint, chat_delta, chat_finish_reason, parse_chat_tool_calls};
 use super::{
-    AppState, ChatFormatter, ChatTemplateKwargs, collect_output, contains_media, error_payload,
+    AppState, ChatFormatter, ChatTemplateKwargs, collect_output, error_payload,
     indexed_decode_stream, model_error, openai_error, submit_generation, unix_seconds_u32,
 };
 use crate::api_server::core::{CoreEvent, CoreOutput};
@@ -88,6 +91,38 @@ impl<'de> Deserialize<'de> for ChatBody {
     }
 }
 
+fn contains_media(messages: &[ChatCompletionRequestMessage]) -> bool {
+    messages.iter().any(|message| match message {
+        ChatCompletionRequestMessage::Developer(_)
+        | ChatCompletionRequestMessage::System(_)
+        | ChatCompletionRequestMessage::Assistant(_)
+        | ChatCompletionRequestMessage::Function(_) => false,
+        ChatCompletionRequestMessage::User(message) => match &message.content {
+            ChatCompletionRequestUserMessageContent::Text(_) => false,
+            ChatCompletionRequestUserMessageContent::Array(parts) => {
+                parts.iter().any(|part| match part {
+                    ChatCompletionRequestUserMessageContentPart::Text(_) => false,
+                    ChatCompletionRequestUserMessageContentPart::ImageUrl(_)
+                    | ChatCompletionRequestUserMessageContentPart::VideoUrl(_)
+                    | ChatCompletionRequestUserMessageContentPart::AudioUrl(_)
+                    | ChatCompletionRequestUserMessageContentPart::InputAudio(_) => true,
+                })
+            }
+        },
+        ChatCompletionRequestMessage::Tool(message) => match &message.content {
+            ChatCompletionRequestToolMessageContent::Text(_) => false,
+            ChatCompletionRequestToolMessageContent::Array(parts) => {
+                parts.iter().any(|part| match part {
+                    ChatCompletionRequestToolMessageContentPart::Text(_) => false,
+                    ChatCompletionRequestToolMessageContentPart::ImageUrl(_)
+                    | ChatCompletionRequestToolMessageContentPart::VideoUrl(_)
+                    | ChatCompletionRequestToolMessageContentPart::AudioUrl(_) => true,
+                })
+            }
+        },
+    })
+}
+
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -117,7 +152,7 @@ async fn chat_completions(
     if request.messages.is_empty() {
         return openai_error(StatusCode::BAD_REQUEST, "messages cannot be empty", false);
     }
-    if serde_json::to_value(&request.messages).is_ok_and(|messages| contains_media(&messages)) {
+    if contains_media(&request.messages) {
         return openai_error(
             StatusCode::BAD_REQUEST,
             "image, audio, video, and file message content is not supported",
@@ -1106,13 +1141,15 @@ mod tests {
     };
     use super::{
         OutputParsing, SamplingDefaults, chat_event_stream, chat_logprobs, chat_sampling_params,
-        merge_template_stops, unary_chat,
+        contains_media, merge_template_stops, unary_chat,
     };
     use crate::message::config::{DefaultSamplingParams, ServerArgs};
     use crate::message::response::{ChunkEvent, ChunkExtras, ResponseItem};
     use axum::http::StatusCode;
     use futures::StreamExt;
-    use sglang_processor::dynamo_protocols::types::{CreateChatCompletionRequest, Stop};
+    use sglang_processor::dynamo_protocols::types::{
+        ChatCompletionRequestMessage, CreateChatCompletionRequest, Stop,
+    };
     use sglang_processor::dynamo_tokenizers::Tokenizer;
     use sglang_processor::openai::ChatModel;
     use sglang_processor::{DeepSeekOutputOptions, ReasoningOptions};
@@ -1123,6 +1160,98 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}]
         }))
         .unwrap()
+    }
+
+    fn value_contains_media(value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::Array(values) => values.iter().any(value_contains_media),
+            serde_json::Value::Object(object) => {
+                object.keys().any(|key| {
+                    matches!(
+                        key.as_str(),
+                        "image_url" | "video_url" | "input_audio" | "audio_url" | "file"
+                    )
+                }) || object.values().any(value_contains_media)
+            }
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn typed_media_scan_matches_value_scan() {
+        let fixtures = [
+            (
+                serde_json::json!([
+                    {"role": "developer", "content": "image_url is text"},
+                    {"role": "system", "content": [{"type": "text", "text": "video_url"}]},
+                    {"role": "user", "content": "input_audio is text"},
+                    {"role": "assistant", "content": "audio_url is text", "audio": {"id": "prior-audio"}},
+                    {"role": "tool", "tool_call_id": "call-1", "content": [{"type": "text", "text": "file is text"}]},
+                    {"role": "function", "name": "legacy", "content": "image_url is text"}
+                ]),
+                false,
+            ),
+            (
+                serde_json::json!([{"role": "user", "content": [
+                    {"type": "text", "text": "before"},
+                    {"type": "image_url", "image_url": {"url": "https://example.com/image.png"}}
+                ]}]),
+                true,
+            ),
+            (
+                serde_json::json!([{"role": "user", "content": [
+                    {"type": "video_url", "video_url": {"url": "https://example.com/video.mp4"}}
+                ]}]),
+                true,
+            ),
+            (
+                serde_json::json!([{"role": "user", "content": [
+                    {"type": "audio_url", "audio_url": {"url": "https://example.com/audio.wav"}}
+                ]}]),
+                true,
+            ),
+            (
+                serde_json::json!([{"role": "user", "content": [
+                    {"type": "input_audio", "input_audio": {"data": "AAAA", "format": "wav"}}
+                ]}]),
+                true,
+            ),
+            (
+                serde_json::json!([{"role": "tool", "tool_call_id": "call-2", "content": [
+                    {"type": "text", "text": "before"},
+                    {"type": "image_url", "image_url": {"url": "https://example.com/tool.png"}}
+                ]}]),
+                true,
+            ),
+            (
+                serde_json::json!([{"role": "tool", "tool_call_id": "call-3", "content": [
+                    {"type": "video_url", "video_url": {"url": "https://example.com/tool.mp4"}}
+                ]}]),
+                true,
+            ),
+            (
+                serde_json::json!([{"role": "tool", "tool_call_id": "call-4", "content": [
+                    {"type": "audio_url", "audio_url": {"url": "https://example.com/tool.wav"}}
+                ]}]),
+                true,
+            ),
+        ];
+
+        for (wire, expected) in fixtures {
+            let messages: Vec<ChatCompletionRequestMessage> =
+                serde_json::from_value(wire.clone()).unwrap();
+            assert_eq!(value_contains_media(&wire), expected, "{wire}");
+            assert_eq!(contains_media(&messages), expected, "{wire}");
+        }
+    }
+
+    #[test]
+    fn file_content_remains_rejected_by_request_schema() {
+        let wire = serde_json::json!([{"role": "user", "content": [{
+            "type": "file",
+            "file": {"file_id": "file-1"}
+        }]}]);
+        assert!(serde_json::from_value::<Vec<ChatCompletionRequestMessage>>(wire).is_err());
     }
 
     /// Python `to_sampling_params` priority: user value > model generation
