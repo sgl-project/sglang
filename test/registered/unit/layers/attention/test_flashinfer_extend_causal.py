@@ -73,6 +73,18 @@ class TestFlashInferExtendCausal(CustomTestCase):
         # A DLLM extend is one complete canvas, so it is bidirectional regardless.
         self.assertFalse(backend._extend_is_causal(layer, _DLLM_EXTEND))
 
+    def test_bidirectional_layer_stays_causal_on_a_window_plan(self):
+        """A paged wrapper planned with a window reads only each query's causal
+        window, so running it without the window would skip keys."""
+        backend = _backend(allow_bidirectional=True)
+        layer = _layer(AttentionType.DECODER_BIDIRECTIONAL, sliding_window_size=512)
+
+        for forward_batch in (_EXTEND, _DLLM_EXTEND):
+            self.assertTrue(
+                backend._extend_is_causal(layer, forward_batch, window_planned=True)
+            )
+        self.assertEqual(backend._extend_window_left(layer, causal=True), 512)
+
     def test_gate_needs_the_whole_prompt_in_one_forward(self):
         self.assertTrue(_gate())
         self.assertTrue(_gate(graphs_disabled=False, breakable_prefill=True))

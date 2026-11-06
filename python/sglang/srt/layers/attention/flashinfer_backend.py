@@ -1508,11 +1508,18 @@ class FlashInferAttnBackend(AttentionBackend):
         )
 
     def _extend_is_causal(
-        self, layer: RadixAttention, forward_batch: ForwardBatch
+        self,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        window_planned: bool = False,
     ) -> bool:
         if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
             return False
         if layer.attn_type == AttentionType.DECODER_BIDIRECTIONAL:
+            if window_planned:
+                # A window plan reads only the keys of each query's causal
+                # window, so the layer stays causal on it.
+                return True
             # A DLLM extend is one complete, fixed-width canvas, so it stays
             # bidirectional even when the generic gate is off.
             return not (
@@ -1529,7 +1536,8 @@ class FlashInferAttnBackend(AttentionBackend):
             return -1
         if not causal and layer.attn_type == AttentionType.DECODER_BIDIRECTIONAL:
             # FlashInfer has no right window, so a bidirectional sliding-window
-            # layer attends over the whole sequence, as in the Triton backend.
+            # layer attends every token of this forward, as in the Triton
+            # backend. A cached prefix keeps its planned window mask.
             return -1
         return layer.sliding_window_size
 
@@ -1577,15 +1585,17 @@ class FlashInferAttnBackend(AttentionBackend):
         prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[
             self._get_wrapper_idx(layer)
         ]
-        causal = self._extend_is_causal(layer, forward_batch)
+        window_dispatch = self.dispatch_reason == WrapperDispatch.SLIDING_WINDOW
+        causal = self._extend_is_causal(
+            layer,
+            forward_batch,
+            window_planned=window_dispatch and prefill_wrapper_paged._window_left >= 0,
+        )
         window_left = self._extend_window_left(layer, causal)
         # Window-read planning may put the window in a custom mask. Other
         # wrappers leave per-layer windows to forward, even when planned with -1.
         paged_window_left = window_left
-        if (
-            self.dispatch_reason == WrapperDispatch.SLIDING_WINDOW
-            and prefill_wrapper_paged._window_left < 0
-        ):
+        if window_dispatch and prefill_wrapper_paged._window_left < 0:
             paged_window_left = -1
 
         logits_soft_cap = layer.logit_cap
