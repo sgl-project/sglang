@@ -491,8 +491,13 @@ def can_use_gluon_prefill(
 def _pair_prefill_module(
     q: torch.Tensor, k_cache: Union[torch.Tensor, Nvfp4Cache]
 ) -> Optional[ModuleType]:
-    """The two-queries-per-program kernel module when it serves this forward, else None."""
-    if gluon_prefill_pair_gfx950 is None:
+    """The two-queries-per-program kernel module when it serves this forward, else None.
+
+    Deterministic inference never uses it: it serves forwards from a token count
+    on, and walks the union of two neighbouring queries' blocks, so a query's
+    result would depend on its batch.
+    """
+    if gluon_prefill_pair_gfx950 is None or _is_deterministic_inference():
         return None
     fp8_pool = not isinstance(k_cache, Nvfp4Cache) and k_cache.dtype == _FP8_KV_DTYPE
     return (
