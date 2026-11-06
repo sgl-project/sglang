@@ -234,7 +234,7 @@ class QwenSparseAttnBackend(AttentionBackend):
     def __init__(self, runner=None) -> None:
         self.runner = runner
         self.token_to_kv_pool = getattr(runner, "token_to_kv_pool", None)
-        self._kv_offload = getattr(self.token_to_kv_pool, "kv_offload", None)
+        self._kv_offload = self._kv_offload_of(self.token_to_kv_pool)
         self._fused_kv_pool_eligible = self._supports_fused_kv_pool(
             self.token_to_kv_pool
         )
@@ -946,7 +946,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         self._require_chain_speculation(forward_mode, spec_info)
         if self.token_to_kv_pool is None:
             self.token_to_kv_pool = getattr(self.runner, "token_to_kv_pool", None)
-            self._kv_offload = getattr(self.token_to_kv_pool, "kv_offload", None)
+            self._kv_offload = self._kv_offload_of(self.token_to_kv_pool)
             self._fused_kv_pool_eligible = self._supports_fused_kv_pool(
                 self.token_to_kv_pool
             )
@@ -1408,8 +1408,12 @@ class QwenSparseAttnBackend(AttentionBackend):
         return torch.where(valid, slots, torch.full_like(slots, -1)).to(torch.int32)
 
     @staticmethod
+    def _kv_offload_of(pool):
+        return pool.kv_offload if isinstance(pool, QSATokenToKVPool) else None
+
+    @staticmethod
     def _supports_fused_kv_pool(pool):
-        if getattr(pool, "kv_offload", None) is not None:
+        if QwenSparseAttnBackend._kv_offload_of(pool) is not None:
             return False
         if type(pool) in (HybridLinearKVPool, QSATokenToKVPool):
             storage = pool.full_kv_pool
