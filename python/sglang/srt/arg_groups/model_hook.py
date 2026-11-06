@@ -35,6 +35,7 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.arg_groups.resolution_hooks import run_hook
 from sglang.srt.configs.embedding_model_spec import BCGPrefillPolicy
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec
+from sglang.srt.configs.quant_utils import get_quantization_config
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
@@ -44,11 +45,8 @@ from sglang.srt.runtime_context import (
     derive_attn_tp_size,
     get_platform,
 )
-from sglang.srt.utils.common import (
-    get_quantization_config,
-    is_mps,
-    parse_connector_type,
-)
+from sglang.srt.utils.common import parse_connector_type
+from sglang.srt.utils.device import is_mps
 
 logger = logging.getLogger(__name__)
 
@@ -284,6 +282,7 @@ def handle_model_specific_adjustments(server_args: Any):
         "HYV4ForCausalLMNextN",
         "LongcatFlashForCausalLM",
         "Dots3NoteForCausalLM",
+        "Xing4_0ForCausalLM",
         "KimiK31ForConditionalGeneration",
     ]:
         # Set attention backend for DeepSeek
@@ -520,6 +519,18 @@ def handle_model_specific_adjustments(server_args: Any):
             envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)
             envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.set(False)
             envs.SGLANG_EAGER_INPUT_NO_COPY.set(True)
+
+    elif model_arch in ["Xing4_0ForCausalLM"]:
+        # Xing4_0 uses the TileLang mhc_pre/mhc_post kernels
+        # (sglang.kernels.ops.layernorm.mhc) for its mHC module. The
+        # DeepGEMM tf32_hc_prenorm_gemm path is a raw C extension that
+        # torch.compile (fullgraph=True, used by tc_piecewise prefill
+        # backend) cannot trace, raising:
+        #   torch._dynamo.exc.Unsupported: Dynamo does not know how to trace
+        #   method `__call__` of class `Function`
+        # Disable it so mhc_pre falls through to the TileLang splitk path
+        # which already supports xing4_0's hc_hidden_size=14336 (4 * 3584).
+        envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
 
     elif model_arch in ["GptOssForCausalLM"]:
         # Attention backend selection + XPU dtype validation moved to the
