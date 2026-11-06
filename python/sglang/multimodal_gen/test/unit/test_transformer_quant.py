@@ -1568,6 +1568,43 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         self.assertEqual(len(spec.post_load_hooks), 1)
         self.assertIs(nunchaku_config.model_cls, _FakeFluxTransformer)
 
+    def test_resolve_transformer_quant_load_spec_accepts_svdquant_checkpoint(self):
+        # Real Nunchaku checkpoints carry int8 SVDQuant weights and a
+        # quantization_config without quant_method; Nunchaku loads them itself.
+        with tempfile.NamedTemporaryFile(suffix=".safetensors") as f:
+            save_file(
+                {
+                    "block.qkv_proj.qweight": torch.zeros((4, 2), dtype=torch.int8),
+                    "block.qkv_proj.wscales": torch.ones((1, 4)),
+                },
+                f.name,
+                metadata={
+                    "config": json.dumps(
+                        {"_class_name": _FakeFluxTransformer.__name__}
+                    ),
+                    "quantization_config": json.dumps(
+                        {"method": "svdquant", "weight": {"dtype": "int4"}}
+                    ),
+                },
+            )
+            nunchaku_config = NunchakuConfig(transformer_weights_path=f.name)
+            server_args = self._make_server_args(
+                transformer_weights_path=nunchaku_config.transformer_weights_path,
+                nunchaku_config=nunchaku_config,
+            )
+
+            spec = resolve_transformer_quant_load_spec(
+                hf_config={},
+                server_args=server_args,
+                safetensors_list=[nunchaku_config.transformer_weights_path],
+                component_model_path="/unused/component/path",
+                model_cls=_FakeFluxTransformer,
+                cls_name=_FakeFluxTransformer.__name__,
+            )
+
+        self.assertIsNone(spec.quant_config)
+        self.assertIs(spec.nunchaku_config, nunchaku_config)
+
     def test_flux2_mixed_nvfp4_fallback_disables_conflicting_offloads(self):
         server_args = self._make_server_args(
             transformer_weights_path="/tmp/flux2-dev-nvfp4-mixed.safetensors",
