@@ -102,8 +102,8 @@ from sglang.srt.utils import (
     get_bool_env_var,
     normalize_serialized_named_tensor_payloads,
 )
+from sglang.srt.utils.common import TypeBasedDispatcher
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
-from sglang.utils import TypeBasedDispatcher
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager

@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import copy
+import logging
 import math
 import os
 import re
@@ -36,7 +37,8 @@ from sglang.srt.multimodal.processors.mimo_audio import (
 )
 from sglang.srt.multimodal.processors.qwen_vl import smart_nframes
 from sglang.srt.runtime_context import get_device
-from sglang.utils import logger
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
