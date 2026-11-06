@@ -86,7 +86,7 @@ def tail_covered(shared: torch.Tensor, prefix: Optional[torch.Tensor]) -> bool:
 
 def gather_tail_attn_res_read(
     part: torch.Tensor,
-    sq: torch.Tensor,
+    sq: Optional[torch.Tensor],
     shared: torch.Tensor,
     prefix: Optional[torch.Tensor],
     tail_eps: float,
@@ -104,9 +104,14 @@ def gather_tail_attn_res_read(
     all-gather of every rank's [T, H / 8] column slice (rank r holds columns
     [r * H / 8, (r + 1) * H / 8)), finished from the column tail's partials
     (k3_latent_tail_partials of its up_proj rows):
-    bf16(bf16(sum_k part[k] / rms) + shared[:, cols] [+ prefix[:, cols]]).
+    bf16(bf16(sum_k part[k] / rms) + shared[:, cols] [+ prefix[:, cols]]),
+    or, with sq None, from part = the slice's bf16 [T, H / 8] GEMM of the
+    RMSNorm'd latent: bf16(part + shared[:, cols] [+ prefix[:, cols]]).
     cw and ow are fp32 [H]; write_bank also stores the stream into bank[:, nvb]."""
     rows = bank.shape[0]
+    projected = sq is None
+    if projected:
+        sq = part.new_empty((0,), dtype=torch.float32)
     stream = bank.new_empty((rows, HIDDEN_SIZE))
     out = bank.new_empty((rows, HIDDEN_SIZE))
     _module().run(
@@ -127,5 +132,6 @@ def gather_tail_attn_res_read(
         float(score_eps),
         float(out_eps),
         float(tail_eps),
+        projected,
     )
     return out, stream

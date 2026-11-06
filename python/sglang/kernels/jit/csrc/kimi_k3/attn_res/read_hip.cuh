@@ -10,6 +10,10 @@
 // optionally snapshotting the stream into bank[:, nvb]: attn_res_hip's _agg_kernel, with the
 // scores' transcendentals run once per row and DPP wave reductions.
 //
+// Above the split-K tail's rows, the caller instead projects the RMSNorm'd latent onto the slice
+// itself (the replicated tail's GEMM on 1/8 of its columns) and the kernel only adds
+//     slice = bf16(proj + shared [+ prefix]).
+//
 // The all-gather is LL: each rank pushes its slice into every peer's scratch as 16-byte lines of
 // 8 payload bytes + an epoch flag, and the receiver polls its own scratch, so there is no
 // barrier. The bank rows are loaded and scored while the peers' lines are in flight.
@@ -45,7 +49,8 @@ namespace k3_attn_res_read {
 using namespace k3_ll;
 
 inline constexpr int kWorld = 8;
-inline constexpr int kMaxRows = 64;
+// The largest graphed target verify at TP8 AgentX concurrencies: 64 requests x 6 rows.
+inline constexpr int kMaxRows = 384;
 inline constexpr int kSlice = kHidden / kWorld;  // all-gather columns per rank
 inline constexpr int kSliceThreads = kSlice / kVec;
 // 8 payload bytes per 16-byte line.
@@ -79,6 +84,7 @@ struct Params {
   // Tail source: this rank's slice = bf16(bf16(sum_k part[k] / rms) + shared [+ prefix]).
   const float* __restrict__ tail_part;     // [kTailSplits, T, H / 8] fp32
   const float* __restrict__ tail_sq;       // [kTailSplits, T] fp32, sums of squares of the latent
+  const uint4* __restrict__ tail_proj;     // projected mode: [T, H / 8] bf16, the slice's GEMM
   const bf16_t* __restrict__ tail_shared;  // [T, H] bf16 (row stride tail_stride), full columns
   const bf16_t* __restrict__ tail_prefix;  // [T, H] bf16 (row stride tail_stride), or null
   int64_t tail_stride;
@@ -200,30 +206,35 @@ struct AttnResRead {
   }
 };
 
-// This thread's vector of the rank's tail slice, as k3_latent_tail computes it.
-template <bool kHasPrefix>
+// This thread's vector of the rank's tail slice, as k3_latent_tail computes it, or from the
+// projected slice.
+template <bool kHasPrefix, bool kProjected>
 SGL_DEVICE uint4 finish_tail(const Params& p, int t, int rows, int slice_vec) {
-  float acc[kVec] = {};
-  float sq = 0.f;
+  float proj[kVec], shared[kVec], prefix[kVec];
+  if constexpr (kProjected) {
+    unpack8(p.tail_proj[static_cast<int64_t>(t) * kSliceThreads + slice_vec], proj);
+  } else {
+    float acc[kVec] = {};
+    float sq = 0.f;
 #pragma unroll
-  for (int k = 0; k < kTailSplits; ++k) {
-    const float4* part =
-        reinterpret_cast<const float4*>(p.tail_part + (static_cast<int64_t>(k) * rows + t) * kSlice + slice_vec * kVec);
-    const float4 a = part[0], b = part[1];
-    acc[0] += a.x, acc[1] += a.y, acc[2] += a.z, acc[3] += a.w;
-    acc[4] += b.x, acc[5] += b.y, acc[6] += b.z, acc[7] += b.w;
-    sq += p.tail_sq[k * rows + t];
+    for (int k = 0; k < kTailSplits; ++k) {
+      const float4* part = reinterpret_cast<const float4*>(
+          p.tail_part + (static_cast<int64_t>(k) * rows + t) * kSlice + slice_vec * kVec);
+      const float4 a = part[0], b = part[1];
+      acc[0] += a.x, acc[1] += a.y, acc[2] += a.z, acc[3] += a.w;
+      acc[4] += b.x, acc[5] += b.y, acc[6] += b.z, acc[7] += b.w;
+      sq += p.tail_sq[k * rows + t];
+    }
+    const float inv_rms = 1.0f / sqrtf(sq / kTailK + p.tail_eps);
+#pragma unroll
+    for (int e = 0; e < kVec; ++e)
+      proj[e] = acc[e] * inv_rms;
+    unpack8(pack8(proj), proj);  // the projection is bf16 before the adds see it
   }
   const int64_t col = static_cast<int64_t>(t) * p.tail_stride + p.rank * kSlice + slice_vec * kVec;
   const uint4 sv = *reinterpret_cast<const uint4*>(p.tail_shared + col);
   uint4 rv = make_uint4(0, 0, 0, 0);
   if constexpr (kHasPrefix) rv = *reinterpret_cast<const uint4*>(p.tail_prefix + col);
-  const float inv_rms = 1.0f / sqrtf(sq / kTailK + p.tail_eps);
-  float proj[kVec], shared[kVec], prefix[kVec];
-#pragma unroll
-  for (int e = 0; e < kVec; ++e)
-    proj[e] = acc[e] * inv_rms;
-  unpack8(pack8(proj), proj);  // the projection is bf16 before the adds see it
   unpack8(sv, shared);
   unpack8(rv, prefix);
 #pragma unroll
@@ -234,7 +245,7 @@ SGL_DEVICE uint4 finish_tail(const Params& p, int t, int rows, int slice_vec) {
   return pack8(proj);
 }
 
-template <int kNvb, bool kWriteBank, bool kHasPrefix>
+template <int kNvb, bool kWriteBank, bool kHasPrefix, bool kProjected>
 __global__ __launch_bounds__(kThreads, 1) void k3_ag_attn_res_kernel(const Params p) {
   using Read = AttnResRead<kNvb>;
   __shared__ typename Read::Shared smem;
@@ -251,7 +262,7 @@ __global__ __launch_bounds__(kThreads, 1) void k3_ag_attn_res_kernel(const Param
   const bool mine = src == p.rank;
 
   uint4 pv = make_uint4(0, 0, 0, 0);
-  if (mine) pv = finish_tail<kHasPrefix>(p, t, static_cast<int>(gridDim.x), slice_vec);
+  if (mine) pv = finish_tail<kHasPrefix, kProjected>(p, t, static_cast<int>(gridDim.x), slice_vec);
   Read read;
   read.load(p, t, tid);
 
@@ -288,21 +299,23 @@ __global__ __launch_bounds__(kThreads, 1) void k3_ag_attn_res_kernel(const Param
   if (tid == 0) p.epochs[t] = static_cast<int32_t>(flag);
 }
 
-template <int kNvb, bool kHasPrefix>
+template <int kNvb, bool kHasPrefix, bool kProjected>
 void launch_gather(const Params& params, bool write_bank, int rows, DLDevice device) {
   if (write_bank) {
-    host::LaunchKernel(rows, kThreads, device)(k3_ag_attn_res_kernel<kNvb, true, kHasPrefix>, params);
+    host::LaunchKernel(rows, kThreads, device)(k3_ag_attn_res_kernel<kNvb, true, kHasPrefix, kProjected>, params);
   } else {
-    host::LaunchKernel(rows, kThreads, device)(k3_ag_attn_res_kernel<kNvb, false, kHasPrefix>, params);
+    host::LaunchKernel(rows, kThreads, device)(k3_ag_attn_res_kernel<kNvb, false, kHasPrefix, kProjected>, params);
   }
 }
 
 template <int kNvb>
-void launch(const Params& params, bool has_residual, bool write_bank, int rows, DLDevice device) {
+void launch(const Params& params, bool has_residual, bool write_bank, bool projected, int rows, DLDevice device) {
   if (has_residual) {
-    launch_gather<kNvb, true>(params, write_bank, rows, device);
+    projected ? launch_gather<kNvb, true, true>(params, write_bank, rows, device)
+              : launch_gather<kNvb, true, false>(params, write_bank, rows, device);
   } else {
-    launch_gather<kNvb, false>(params, write_bank, rows, device);
+    projected ? launch_gather<kNvb, false, true>(params, write_bank, rows, device)
+              : launch_gather<kNvb, false, false>(params, write_bank, rows, device);
   }
 }
 
@@ -310,7 +323,8 @@ struct K3AttnResReadKernel {
   // The all-gather read over `comm`, the dedicated aiter CustomAllreduce* whose meta buffers
   // hold the LL scratch. Each rank's slice is finished from the column tail's partials:
   // tail_part [7, T, H / 8], tail_sq [7, T], tail_shared [T, H] and, when has_residual,
-  // residual = the tail's prefix [T, H] (same row stride). write_bank snapshots the stream
+  // residual = the tail's prefix [T, H] (same row stride); projected instead takes the slice's
+  // bf16 GEMM as tail_part [T, H / 8] and ignores tail_sq. write_bank snapshots the stream
   // into bank[:, nvb].
   static void
   run(int64_t comm,
@@ -329,7 +343,8 @@ struct K3AttnResReadKernel {
       bool write_bank,
       double score_eps,
       double out_eps,
-      double tail_eps) {
+      double tail_eps,
+      bool projected) {
     using namespace host;
     auto T = SymbolicSize{"num_tokens"};
     auto NB = SymbolicSize{"num_blocks"};
@@ -339,8 +354,12 @@ struct K3AttnResReadKernel {
     TensorMatcher({T, kHidden}).with_dtype<bf16_t>().with_device(device).verify(prefix_out).verify(out);
     TensorMatcher({T, NB, kHidden}).with_dtype<bf16_t>().with_device(device).with_strides({-1, -1, 1}).verify(bank);
     TensorMatcher({kHidden}).with_dtype<float>().with_device(device).verify(cw).verify(ow);
-    TensorMatcher({kTailSplits, T, kSlice}).with_dtype<float>().with_device(device).verify(tail_part);
-    TensorMatcher({kTailSplits, T}).with_dtype<float>().with_device(device).verify(tail_sq);
+    if (projected) {
+      TensorMatcher({T, kSlice}).with_dtype<bf16_t>().with_device(device).verify(tail_part);
+    } else {
+      TensorMatcher({kTailSplits, T, kSlice}).with_dtype<float>().with_device(device).verify(tail_part);
+      TensorMatcher({kTailSplits, T}).with_dtype<float>().with_device(device).verify(tail_sq);
+    }
     TensorMatcher({T, kHidden}).with_dtype<bf16_t>().with_device(device).with_strides({S, 1}).verify(tail_shared);
     if (has_residual) {
       TensorMatcher({T, kHidden}).with_dtype<bf16_t>().with_device(device).with_strides({S, 1}).verify(residual);
@@ -368,8 +387,9 @@ struct K3AttnResReadKernel {
         .rank = 0,
         .score_eps = static_cast<float>(score_eps),
         .out_eps = static_cast<float>(out_eps),
-        .tail_part = static_cast<const float*>(tail_part.data_ptr()),
-        .tail_sq = static_cast<const float*>(tail_sq.data_ptr()),
+        .tail_part = projected ? nullptr : static_cast<const float*>(tail_part.data_ptr()),
+        .tail_sq = projected ? nullptr : static_cast<const float*>(tail_sq.data_ptr()),
+        .tail_proj = projected ? static_cast<const uint4*>(tail_part.data_ptr()) : nullptr,
         .tail_shared = static_cast<const bf16_t*>(tail_shared.data_ptr()),
         .tail_prefix = has_residual ? static_cast<const bf16_t*>(residual.data_ptr()) : nullptr,
         .tail_stride = S.unwrap(),
@@ -388,21 +408,21 @@ struct K3AttnResReadKernel {
     const int n = static_cast<int>(rows);
     switch (nvb) {
       case 1:
-        return launch<1>(params, has_residual, write_bank, n, dev);
+        return launch<1>(params, has_residual, write_bank, projected, n, dev);
       case 2:
-        return launch<2>(params, has_residual, write_bank, n, dev);
+        return launch<2>(params, has_residual, write_bank, projected, n, dev);
       case 3:
-        return launch<3>(params, has_residual, write_bank, n, dev);
+        return launch<3>(params, has_residual, write_bank, projected, n, dev);
       case 4:
-        return launch<4>(params, has_residual, write_bank, n, dev);
+        return launch<4>(params, has_residual, write_bank, projected, n, dev);
       case 5:
-        return launch<5>(params, has_residual, write_bank, n, dev);
+        return launch<5>(params, has_residual, write_bank, projected, n, dev);
       case 6:
-        return launch<6>(params, has_residual, write_bank, n, dev);
+        return launch<6>(params, has_residual, write_bank, projected, n, dev);
       case 7:
-        return launch<7>(params, has_residual, write_bank, n, dev);
+        return launch<7>(params, has_residual, write_bank, projected, n, dev);
       default:
-        return launch<8>(params, has_residual, write_bank, n, dev);
+        return launch<8>(params, has_residual, write_bank, projected, n, dev);
     }
   }
 };

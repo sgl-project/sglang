@@ -1071,6 +1071,9 @@ class Envs:
     # With the row-sharded MoE tail, leave the stream on each rank's rows: the next layer's
     # attention read aggregates the bank there and gathers its normed input.
     SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM = EnvBool(False)
+    # Kimi-K3 gfx950 TP8 decode: up to this many rows (at most 384) the latent-MoE tail runs on
+    # each rank's 1/8 of the up_proj columns and all-gathers the stream.
+    SGLANG_ROCM_K3_COLUMN_TAIL_MAX_TOKENS = EnvInt(64)
     # Use the gfx950 MXFP8 opus port instead of Triton split-K for fp8_ds_mla decode.
     SGLANG_ENABLE_ROCM_DSA_OPUS_DECODE = EnvBool(True)
     # GiB of ROCm device memory kept out of torch's allocator (0 = no cap): HSA

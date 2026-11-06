@@ -16,7 +16,8 @@ if TYPE_CHECKING:
     from aiter.dist.device_communicators.custom_all_reduce import CustomAllreduce
 
 WORLD_SIZE: int = 8
-MAX_ROWS: int = 64
+# The largest graphed target verify (64 requests x 6 rows); must match kMaxRows.
+MAX_ROWS: int = 384
 # Per region: 2 epochs x world x rows x lines-per-row x 16 B (8 payload bytes a
 # line). The kernels hardcode the region order and line counts.
 _LINES_PER_ROW = (2 * 7168 // WORLD_SIZE // 8,)  # gather read: an H / 8 bf16 slice
