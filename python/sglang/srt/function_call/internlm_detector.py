@@ -155,80 +155,39 @@ class InternlmDetector(BaseFormatDetector):
     def parse_streaming_increment(
         self, new_text: str, tools: List[Tool]
     ) -> StreamingParseResult:
-        """
-        Streaming incremental parsing for InternLM format.
-
-        Supports a single tool call in streaming mode.
-        """
+        """Streaming incremental parsing for InternLM format."""
         self._buffer += new_text
-        current_text = self._buffer
+        calls, normal_text = [], ""
 
-        # Check if we don't have a tool call start marker
-        start = current_text.find(self.bot_token)
-        if start == -1:
-            # No tool call marker found
-            # If we've already processed tool calls, don't return text again
-            if self.current_tool_id > 0:
-                self._buffer = ""
-                return StreamingParseResult(normal_text="")
+        if (
+            not self.prev_tool_call_arr
+            and (start := self._buffer.find(self.bot_token)) > 0
+        ):
+            normal_text, self._buffer = self._buffer[:start], self._buffer[start:]
 
-            # Check if buffer could be partial start of bot_token
-            if not self._ends_with_partial_token(current_text, self.bot_token):
-                # Not a partial match, return as normal text
-                normal_text = current_text
-                self._buffer = ""
-                # Clean up any stray end tokens
-                if self.eot_token in normal_text:
-                    normal_text = normal_text.replace(self.eot_token, "")
-                return StreamingParseResult(normal_text=normal_text)
-            else:
-                # Might be partial start token, keep buffering
-                return StreamingParseResult()
+        while (start := self._buffer.find(self.bot_token)) != -1:
+            if (end := self._buffer.find(self.eot_token, start)) == -1:
+                break
+            res = self.detect_and_parse(
+                self._buffer[start : end + len(self.eot_token)], tools=tools
+            )
+            for call in res.calls:
+                call.tool_index = self.current_tool_id = len(self.prev_tool_call_arr)
+                self.prev_tool_call_arr.append(
+                    {"name": call.name, "arguments": json.loads(call.parameters)}
+                )
+                self.streamed_args_for_tool.append(call.parameters)
+            calls.extend(res.calls)
+            self._buffer = self._buffer[end + len(self.eot_token) :]
 
-        # Check if we have a complete tool call (with end marker)
-        end = current_text.find(self.eot_token)
-        if end != -1:
-            # We have a complete tool call
-            # Initialize state if this is the first tool call
-            if self.current_tool_id == -1:
-                self.current_tool_id = 0
-                self.prev_tool_call_arr = []
-                self.streamed_args_for_tool = [""]
+        if (start := self._buffer.find(self.bot_token)) != -1:
+            self._buffer = self._buffer[start:]
+        elif not self._ends_with_partial_token(self._buffer, self.bot_token):
+            if not self.prev_tool_call_arr:
+                normal_text = self._buffer.replace(self.eot_token, "")
+            self._buffer = ""
 
-            # Ensure we have enough entries in our tracking arrays
-            while len(self.prev_tool_call_arr) <= self.current_tool_id:
-                self.prev_tool_call_arr.append({})
-            while len(self.streamed_args_for_tool) <= self.current_tool_id:
-                self.streamed_args_for_tool.append("")
-
-            # Use detect_and_parse on the complete tool call
-            complete_section = current_text[: end + len(self.eot_token)]
-            result = self.detect_and_parse(complete_section, tools=tools)
-
-            if result.calls:
-                # Update the tool call index
-                result.calls[0].tool_index = self.current_tool_id
-                # Store the parsed tool call for reference
-                self.prev_tool_call_arr[self.current_tool_id] = {
-                    "name": result.calls[0].name,
-                    "arguments": json.loads(result.calls[0].parameters),
-                }
-                self.streamed_args_for_tool[self.current_tool_id] = result.calls[
-                    0
-                ].parameters
-                # Increment tool ID for next tool call
-                self.current_tool_id += 1
-
-            # Remove the completed tool call from buffer
-            self._buffer = current_text[end + len(self.eot_token) :]
-            return result
-
-        # We have bot_token but no eot_token yet - handle partial tool call streaming
-        # Extract normal text before the tool call
-        normal_text = current_text[:start]
-        # Keep the tool call part in buffer
-        self._buffer = current_text[start:]
-        return StreamingParseResult(normal_text=normal_text)
+        return StreamingParseResult(normal_text=normal_text, calls=calls)
 
     def structure_info(self) -> _GetInfoFunc:
         """
