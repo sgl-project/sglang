@@ -30,10 +30,7 @@ def _memfd_create(name: str) -> int:
     libc = _libc()
     if libc is None or not hasattr(libc, "memfd_create"):
         raise OSError(errno.ENOSYS, "Paged experts require Linux memfd_create support")
-    create = libc.memfd_create
-    create.argtypes = (ctypes.c_char_p, ctypes.c_uint)
-    create.restype = ctypes.c_int
-    fd = create(name.encode(), flags)
+    fd = libc.memfd_create(name.encode(), flags)
     if fd < 0:
         error = ctypes.get_errno()
         raise OSError(error, os.strerror(error))
@@ -281,7 +278,8 @@ _MADV_PAGEOUT = getattr(mmap, "MADV_PAGEOUT", 21 if _LINUX else None)
 
 @functools.lru_cache(maxsize=None)
 def _libc():
-    """The C library's ``madvise``, loaded on first use; None where there is none."""
+    """The C library, loaded on first use with prototypes for ``madvise`` and, where the
+    symbol exists, ``memfd_create``; None where there is none."""
     if not _LINUX:
         return None
     try:
@@ -289,6 +287,9 @@ def _libc():
         libc.madvise.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int)
     except (OSError, AttributeError):
         return None
+    if hasattr(libc, "memfd_create"):
+        libc.memfd_create.argtypes = (ctypes.c_char_p, ctypes.c_uint)
+        libc.memfd_create.restype = ctypes.c_int
     return libc
 
 

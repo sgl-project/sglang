@@ -59,6 +59,13 @@ class TestMemfd(CustomTestCase):
                 os.close(fd)
         self.assertEqual(len(os.listdir("/proc/self/fd")), before)
 
+    @unittest.skipUnless(HAS_LIBC_MEMFD, "requires libc.memfd_create")
+    def test_libc_declares_the_memfd_prototype_once(self):
+        create = store._libc().memfd_create
+        self.assertEqual(create.argtypes, (ctypes.c_char_p, ctypes.c_uint))
+        self.assertIs(create.restype, ctypes.c_int)
+        self.assertIs(store._libc().memfd_create, create)
+
     def test_libc_errno_is_propagated(self):
         def denied(name, flags):
             ctypes.set_errno(errno.EPERM)
