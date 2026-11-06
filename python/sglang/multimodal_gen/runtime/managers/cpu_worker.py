@@ -40,19 +40,19 @@ class CPUWorker(GPUWorker):
         cpu_ids_by_node = get_cpu_ids_by_node()
         n_groups = len(cpu_ids_by_node)
         if omp_cpuids == "all":
-            assert self.server_args.tp_size <= n_groups, (
+            assert self.server_args.num_gpus <= n_groups, (
                 f"SGLANG_CPU_OMP_THREADS_BIND is not set, in this case, "
-                f"tp_size ({self.server_args.tp_size}) should be smaller than or equal to the number of NUMA/CBB CPU binding groups on the machine ({n_groups}). "
-                f"If you need more TP ranks than CPU binding groups, please set the CPU cores for each TP rank via SGLANG_CPU_OMP_THREADS_BIND explicitly. "
+                f"num_gpus ({self.server_args.num_gpus}) should be smaller than or equal to the number of NUMA/CBB CPU binding groups on the machine ({n_groups}). "
+                f"If you need more CPU workers than CPU binding groups, please set the CPU cores for each CPU worker via SGLANG_CPU_OMP_THREADS_BIND explicitly. "
                 f"For example, on a machine with 2 numa nodes, where core 0-31 are on numa node 0 and core 32-63 are on numa node 1, "
-                f"it is suggested to use --tp 2 and bind tp rank 0 to core 0-31 and tp rank 1 to core 32-63. "
+                f"it is suggested to use --num-gpus 2 and bind CPU worker 0 to core 0-31 and CPU worker 1 to core 32-63. "
                 f"This is the default behavior if SGLANG_CPU_OMP_THREADS_BIND is not set and it is the same as setting SGLANG_CPU_OMP_THREADS_BIND=0-31|32-63. "
-                f"If you do need tp_size to be larger than the number of numa nodes, you could set SGLANG_CPU_OMP_THREADS_BIND explicitly for example SGLANG_CPU_OMP_THREADS_BIND=0-15|16-31|32-47|48-63 and run with --tp 4. "
-                f"If you don't want each tp rank to use all the cores on one numa node, you could set for example SGLANG_CPU_OMP_THREADS_BIND=0-15|32-47 and run with --tp 2."
+                f"If you need more CPU workers than CPU binding groups, set SGLANG_CPU_OMP_THREADS_BIND explicitly, for example SGLANG_CPU_OMP_THREADS_BIND=0-15|16-31|32-47|48-63 and run with --num-gpus 4. "
+                f"If you don't want each CPU worker to use all the cores on one NUMA node, you could set SGLANG_CPU_OMP_THREADS_BIND=0-15|32-47 and run with --num-gpus 2."
             )
-            if self.server_args.tp_size < n_groups:
+            if self.server_args.num_gpus < n_groups:
                 logger.warning(
-                    f"Detected {n_groups} NUMA/CBB CPU binding groups, but tp_size is set to {self.server_args.tp_size}, so only {self.server_args.tp_size} groups are used."
+                    f"Detected {n_groups} NUMA/CBB CPU binding groups, but num_gpus is set to {self.server_args.num_gpus}, so only {self.server_args.num_gpus} groups are used."
                 )
             self.local_omp_cpuid = cpu_ids_by_node[self.rank]
         else:
@@ -62,9 +62,9 @@ class CPUWorker(GPUWorker):
                 f"Please double check your settings."
             )
             self.local_omp_cpuid = threads_bind_list[self.rank]
-            if self.server_args.tp_size > n_groups:
+            if self.server_args.num_gpus > n_groups:
                 logger.warning(
-                    f"TP size ({self.server_args.tp_size}) is larger than the number of NUMA/CBB CPU binding groups ({n_groups}), "
+                    f"num_gpus ({self.server_args.num_gpus}) is larger than the number of NUMA/CBB CPU binding groups ({n_groups}), "
                     f"in this case the available memory amount of each rank cannot be determined in prior. "
                     f"Please set proper `--max-total-tokens` to avoid the out-of-memory error."
                 )
