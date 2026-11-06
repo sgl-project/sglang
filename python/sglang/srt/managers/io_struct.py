@@ -990,6 +990,13 @@ class GenerateReqInput:
             image_data=self.image_data[i],
             video_data=self.video_data[i],
             audio_data=self.audio_data[i],
+            use_audio_in_video=self.use_audio_in_video,
+            video_config=self.video_config,
+            max_dynamic_patch=self.max_dynamic_patch,
+            min_dynamic_patch=self.min_dynamic_patch,
+            image_max_dynamic_patch=self.image_max_dynamic_patch,
+            video_max_dynamic_patch=self.video_max_dynamic_patch,
+            images_config=self.images_config,
             mm_hashes=self.mm_hashes[i] if self.mm_hashes is not None else None,
             mm_content_hashes=(
                 self.mm_content_hashes[i]

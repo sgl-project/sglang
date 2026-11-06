@@ -745,6 +745,32 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         self.assertEqual(req[0].mm_hashes, ["h1", "h2"])
         self.assertEqual(req[0].modalities, "multi-images")
 
+    def test_multimodal_options_survive_batch_split(self):
+        """Batching and parallel sampling must preserve media preprocessing choices."""
+        options = {
+            "use_audio_in_video": True,
+            "video_config": {"fps": 2},
+            "max_dynamic_patch": 8,
+            "min_dynamic_patch": 2,
+            "image_max_dynamic_patch": 6,
+            "video_max_dynamic_patch": 4,
+            "images_config": {"image_mode": "gundam"},
+        }
+        for text, media, n in (
+            (["first", "second"], ["a.png", "b.png"], 1),
+            ("first", ["a.png", "b.png"], 2),
+        ):
+            with self.subTest(text=text, n=n):
+                req = GenerateReqInput(
+                    text=text, image_data=media, sampling_params={"n": n}, **options
+                )
+                req.normalize_batch_and_arguments()
+                for i in range(2):
+                    child = req[i]
+                    self.assertEqual(
+                        {name: getattr(child, name) for name in options}, options
+                    )
+
     def test_parallel_sampling_keeps_media_already_nested_per_request(self):
         """With n > 1, media already given as one list per request must not gain another level."""
         for field_name in ("image_data", "video_data", "audio_data"):
