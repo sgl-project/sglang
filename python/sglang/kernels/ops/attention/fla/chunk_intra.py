@@ -926,6 +926,52 @@ def chunk_kda_fwd_kernel_intra_sub_chunk(
     tl.store(p_Akk, b_Ai.to(Akk.dtype.element_ty), mask=m_Akk_s)
 
 
+def precompile_kda_small_grid(*, num_heads, head_dim, dtype, safe_gate, device):
+    """Compile small-grid candidates without executing or autotuning them.
+
+    The one-token health check takes this path even with FlashInfer prefill.
+    Compilation can overlap checkpoint loading without changing the eventual
+    autotune timings or tactic selection.
+    """
+    from triton.runtime.jit import MockTensor
+
+    if head_dim != 128 or dtype != torch.bfloat16:
+        return []
+    bf16 = MockTensor(dtype)
+    fp32 = MockTensor(torch.float32)
+    index = MockTensor(torch.int32)
+    with torch.cuda.device(device):
+        # Bypass only the outer heuristic wrapper, supplying IS_VARLEN
+        # explicitly to the autotuner's compile-only warmup API.
+        return chunk_kda_fwd_kernel_inter_solve_fused.fn.warmup(
+            q=bf16,
+            k=bf16,
+            g=fp32,
+            beta=fp32,
+            Aqk=bf16,
+            Akkd=fp32,
+            Akk=bf16,
+            scale=head_dim**-0.5,
+            v_in=bf16,
+            w_out=bf16,
+            u_out=bf16,
+            kg_out=bf16,
+            cu_seqlens=index,
+            chunk_indices=index,
+            T=1,
+            H=num_heads,
+            K=head_dim,
+            V=head_dim,
+            BT=64,
+            BC=16,
+            IS_VARLEN=True,
+            USE_SAFE_GATE=safe_gate,
+            FUSE_RECOMPUTE=True,
+            FUSE_DIAGONAL=True,
+            grid=(1, num_heads),
+        )
+
+
 def chunk_kda_fwd_intra(
     q: torch.Tensor,
     k: torch.Tensor,

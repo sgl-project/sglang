@@ -3655,6 +3655,39 @@ class KimiK3ForConditionalGeneration(nn.Module):
         if self.language_model is not None:
             self.language_model.post_load_weights()
 
+    def precompile_kernels_during_loading(self):
+        from sglang.srt.models.kimi_k3_startup import (
+            KdaPrecompileConfig,
+            precompile_kimi_kernels,
+        )
+
+        config = self.config.text_config
+        block_size = getattr(config, "attn_res_block_size", None)
+        num_bank_rows = (
+            _cdiv(config.num_hidden_layers, block_size)
+            if block_size and self.language_model is not None
+            else 0
+        )
+        kda_config = None
+        if self.language_model is not None:
+            for layer in self.language_model.model.layers:
+                attn = getattr(layer, "self_attn", None)
+                if isinstance(attn, KimiK3DeltaAttention):
+                    kda_config = KdaPrecompileConfig(
+                        num_heads=attn.local_num_heads,
+                        head_dim=attn.head_dim,
+                        dtype=attn.o_proj.params_dtype,
+                        safe_gate=attn.attn.lower_bound is not None,
+                    )
+                    break
+        return precompile_kimi_kernels(
+            config.hidden_size,
+            num_bank_rows,
+            next(self.parameters()).device,
+            kda_config,
+            config,
+        )
+
     def precompile_kernels_after_loading(self) -> None:
         if self.config.language_only:
             return
