@@ -2189,6 +2189,8 @@ class Envs:
     # Tiled 17..64-row GEMMs for the weight shapes the ROCm Muse Spark model
     # registers (O projection, MoE pooler, DFlash draft MLP).
     SGLANG_MUSE_DENSE_TILED = EnvBool(True)
+    SGLANG_MUSE_FUSED_QKV_CACHE = EnvBool(True)
+    SGLANG_MUSE_QK_ROPE_CACHE = EnvBool(True)
     SGLANG_MUSE_DENSE_TUNED = EnvBool(True)
     SGLANG_USE_CUSTOM_ROUTER_SUM = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_USE_TRITON_ROUTER_SUM"
