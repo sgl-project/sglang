@@ -22,14 +22,16 @@ use sglang_processor::dynamo_parsers::tool_calling::jail::Annotated;
 use sglang_processor::dynamo_parsers::{ToolChoice as DynamoToolChoice, ToolDefinition};
 use sglang_processor::dynamo_protocols::types::{
     ChatChoice, ChatChoiceLogprobs, ChatChoiceStream, ChatCompletionMessageContent,
+    ChatCompletionMessageToolCall, ChatCompletionMessageToolCallChunk,
     ChatCompletionResponseMessage, ChatCompletionTokenLogprob, ChatCompletionToolChoiceOption,
     CreateChatCompletionRequest, CreateChatCompletionResponse, CreateChatCompletionStreamResponse,
-    FinishReason as OpenAIFinishReason, ResponseFormat, Role, ServiceTier as ChatServiceTier, Stop,
-    TopLogprobs,
+    FinishReason as OpenAIFinishReason, FunctionCall, FunctionCallStream, FunctionType,
+    ResponseFormat, Role, ServiceTier as ChatServiceTier, Stop, TopLogprobs,
 };
 use sglang_processor::openai::ChatModel;
 use sglang_processor::{
-    ReasoningOptions, ReasoningStreamSplitter, dynamo_tool_choice, split_reasoning,
+    DeepSeekDelta, DeepSeekFinish, DeepSeekOutputOptions, DeepSeekOutputParser, DeepSeekStopMatch,
+    ReasoningOptions, ReasoningStreamSplitter, dynamo_tool_choice, split_reasoning, tool_call_id,
     tool_call_stream,
 };
 
@@ -39,13 +41,17 @@ use super::pd_routing::PDRoutingFields;
 use super::template::{RenderedChat, render_chat};
 use super::tools::{apply_tool_constraint, chat_delta, chat_finish_reason, parse_chat_tool_calls};
 use super::{
-    AppState, ChatFormatter, ChatTemplateKwargs, collect_output, contains_media, error_payload,
-    indexed_decode_stream, model_error, openai_error, submit_generation, unix_seconds_u32,
+    AppState, ChatFormatter, ChatTemplateKwargs, collect_output, contains_media,
+    contains_non_image_media, error_payload, indexed_decode_stream, model_error, openai_error,
+    submit_generation, unix_seconds_u32,
 };
-use crate::api_server::core::{CoreCall, CoreEvent};
+use crate::api_server::core::{CoreEvent, CoreOutput};
+use crate::api_server::handlers::CoreCall;
 use crate::message::config::{DefaultSamplingParams, ServerArgs};
+use crate::message::finish_reason::{FinishKind, FinishReason, Matched};
 use crate::message::ids::Rid;
-use crate::message::request::GenerateRequest;
+use crate::message::multimodal::MmItem;
+use crate::message::request::{GenerateRequest, MmData};
 use crate::message::response::ChunkExtras;
 use crate::message::sampling::SamplingParams;
 use crate::message::types::OneOrMany;
@@ -62,6 +68,9 @@ pub(super) struct ChatRequest {
     /// is a 400, as Python's request model makes it.
     #[allow(dead_code)]
     chat_template_kwargs: Option<ChatTemplateKwargs>,
+    /// Python's `skip_special_tokens` request extension; absent keeps the
+    /// sampling default (drop them).
+    skip_special_tokens: Option<bool>,
     #[serde(flatten)]
     routing: PDRoutingFields,
 }
@@ -90,9 +99,13 @@ async fn chat_completions(
         return response;
     }
     let ChatBody {
-        request: ChatRequest {
-            request, routing, ..
-        },
+        request:
+            ChatRequest {
+                request,
+                skip_special_tokens,
+                routing,
+                ..
+            },
         raw,
     } = match Json::from_bytes(&body) {
         Ok(Json(body)) => body,
@@ -106,13 +119,13 @@ async fn chat_completions(
     if request.messages.is_empty() {
         return openai_error(StatusCode::BAD_REQUEST, "messages cannot be empty", false);
     }
-    if serde_json::to_value(&request.messages).is_ok_and(|messages| contains_media(&messages)) {
-        return openai_error(
-            StatusCode::BAD_REQUEST,
-            "image, audio, video, and file message content is not supported",
-            false,
-        );
-    }
+    let images = match chat_images(
+        &request.messages,
+        state.server_args.model_config.is_multimodal,
+    ) {
+        Ok(images) => images,
+        Err(message) => return openai_error(StatusCode::BAD_REQUEST, message, false),
+    };
     if request.n == Some(0) {
         return openai_error(StatusCode::BAD_REQUEST, "n must be at least 1", false);
     }
@@ -167,8 +180,9 @@ async fn chat_completions(
         );
     }
     // Python gates the split on `request.separate_reasoning` (default true);
-    // the Dynamo request type has no such field, so it is always on when the
-    // server was launched with `--reasoning-parser`.
+    // the Dynamo request type has no such field, so the text parsers always
+    // split when the server was launched with `--reasoning-parser`. recipe
+    // reads the flag off the raw request.
     let reasoning_parser = state.server_args.reasoning_parser.clone();
     let tools = (!tools.is_empty()).then_some(tools);
     let tools_slice = tools.as_deref().unwrap_or_default();
@@ -198,6 +212,26 @@ async fn chat_completions(
         })
         .and_then(|message| message["content"].as_str())
         .map(str::to_owned);
+    // recipe parses DeepSeek output from its token ids, in place of both parsers.
+    let deepseek = match chat_model.deepseek_output(
+        reasoning_parser.as_deref(),
+        state.server_args.tool_call_parser.as_deref(),
+    ) {
+        Ok(None) => None,
+        Ok(Some(output)) => match output.for_request(
+            &raw,
+            &state.server_args.default_chat_template_kwargs,
+            reasoning_parser.is_some(),
+            parser.is_some(),
+        ) {
+            Ok(options) => Some(options),
+            Err(message) => return openai_error(StatusCode::BAD_REQUEST, message, false),
+        },
+        // `load_chat_support` serves no chat under such a configuration.
+        Err(error) => {
+            return openai_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string(), false);
+        }
+    };
     let (request, rendered) = match prepare_chat_request(&state, raw, request).await {
         Ok(prepared) => prepared,
         Err(response) => return response,
@@ -217,6 +251,9 @@ async fn chat_completions(
             return openai_error(StatusCode::BAD_REQUEST, message, false);
         }
     };
+    if let Some(skip_special_tokens) = skip_special_tokens {
+        sampling.skip_special_tokens = skip_special_tokens;
+    }
 
     if chat_model.keeps_special_tokens(reasoning_parser.as_deref()) {
         sampling.skip_special_tokens = false;
@@ -282,6 +319,12 @@ async fn chat_completions(
             // Python's thinking mode: the grammar starts after the reasoning,
             // which the scheduler also counts.
             require_reasoning: reasoning_options.force_reasoning == Some(true),
+            mm: (!images.is_empty()).then(|| {
+                Box::new(MmData {
+                    image_data: images.clone(),
+                    ..Default::default()
+                })
+            }),
             ..Default::default()
         };
         let call = match submit_generation(&state, native, stream).await {
@@ -291,6 +334,15 @@ async fn chat_completions(
         submitted.push((index, call));
     }
 
+    let parsing = match deepseek {
+        Some(options) => OutputParsing::DeepSeek(options),
+        None => OutputParsing::Text {
+            reasoning_parser,
+            reasoning_options,
+            tool_parser: parser,
+            tools,
+        },
+    };
     if stream {
         let event_stream = chat_event_stream(
             submitted,
@@ -299,11 +351,8 @@ async fn chat_completions(
             created,
             want_logprobs,
             include_usage,
-            parser,
-            reasoning_parser,
-            reasoning_options,
+            parsing,
             prompt_stub_tokens,
-            tools,
             stream_tool_choice,
             uses_tool_call_structural_tag,
             parallel_tool_calls,
@@ -318,16 +367,31 @@ async fn chat_completions(
             model,
             created,
             want_logprobs,
-            parser,
-            reasoning_parser,
-            reasoning_options,
+            parsing,
             prompt_stub_tokens,
-            tools,
             parallel_tool_calls,
             service_tier,
         )
         .await
     }
+}
+
+/// The chat's images for the multimodal pipeline, in the order Python's
+/// `process_content_for_template_format` collects them, or why the request is
+/// refused: only a multimodal model takes media, and only images so far.
+fn chat_images<T: serde::Serialize>(
+    messages: &T,
+    is_multimodal: bool,
+) -> Result<Vec<MmItem>, String> {
+    let messages = serde_json::to_value(messages).unwrap_or_default();
+    if !contains_media(&messages) {
+        return Ok(Vec::new());
+    }
+    if !is_multimodal || contains_non_image_media(&messages) {
+        return Err("image, audio, video, and file message content is not supported".into());
+    }
+    let images = sglang_processor::extract_images(&messages)?;
+    Ok(images.into_iter().map(MmItem::Source).collect())
 }
 
 /// Render the chat template for an OpenAI request, mapping a missing
@@ -509,6 +573,20 @@ pub(super) fn chat_sampling_params(
     })
 }
 
+/// How a choice's output is parsed.
+pub(super) enum OutputParsing {
+    /// `--reasoning-parser`, and `--tool-call-parser` over the request's tools,
+    /// over the output text.
+    Text {
+        reasoning_parser: Option<String>,
+        reasoning_options: ReasoningOptions,
+        tool_parser: Option<String>,
+        tools: Option<Vec<ToolDefinition>>,
+    },
+    /// recipe over the output token ids, in place of both parsers.
+    DeepSeek(DeepSeekOutputOptions),
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn unary_chat(
     submitted: Vec<(usize, CoreCall)>,
@@ -516,11 +594,8 @@ pub(super) async fn unary_chat(
     model: String,
     created: u32,
     want_logprobs: bool,
-    parser: Option<String>,
-    reasoning_parser: Option<String>,
-    reasoning_options: ReasoningOptions,
+    parsing: OutputParsing,
     prompt_stub_tokens: u32,
-    tools: Option<Vec<ToolDefinition>>,
     parallel_tool_calls: bool,
     service_tier: Option<ChatServiceTier>,
 ) -> Response {
@@ -542,26 +617,60 @@ pub(super) async fn unary_chat(
         completion_tokens = completion_tokens.saturating_add(output.completion_tokens);
         let logprobs = want_logprobs.then(|| chat_logprobs(output.extras.as_deref()));
         let finish_reason = chat_finish_reason(&output);
-        // Split reasoning markers out of the content first (Python splits
-        // before tool-call parsing too), then parse tool calls on the clean
-        // normal text.
-        let (reasoning_text, text) = split_reasoning(
-            reasoning_parser.as_deref(),
-            &reasoning_options,
-            &output.text,
-            output.stop_trimmed_token_ids(),
-        );
-        let (content, tool_calls) = parse_chat_tool_calls(
-            text,
-            parser.as_deref(),
-            tools.as_deref(),
-            parallel_tool_calls,
-        )
-        .await;
-        let finish_reason = if tool_calls.is_some() {
-            Some(OpenAIFinishReason::ToolCalls)
-        } else {
-            finish_reason
+        let (reasoning_text, content, tool_calls, finish_reason) = match &parsing {
+            OutputParsing::DeepSeek(options) => {
+                let delta = options.parser().finish(
+                    &output.token_ids,
+                    deepseek_finish(output.finish_reason.as_ref()),
+                );
+                let calls: Vec<_> = delta
+                    .whole_tool_calls()
+                    .into_iter()
+                    .map(|call| ChatCompletionMessageToolCall {
+                        id: tool_call_id(),
+                        r#type: FunctionType::Function,
+                        function: FunctionCall {
+                            name: call.name,
+                            arguments: call.arguments,
+                        },
+                    })
+                    .collect();
+                // `parse_chat_response`: calls turn only a stop into `tool_calls`.
+                let finish_reason = match !calls.is_empty() && stopped(&output) {
+                    true => Some(OpenAIFinishReason::ToolCalls),
+                    false => finish_reason,
+                };
+                let calls = (!calls.is_empty()).then_some(calls);
+                (delta.reasoning, delta.content, calls, finish_reason)
+            }
+            OutputParsing::Text {
+                reasoning_parser,
+                reasoning_options,
+                tool_parser,
+                tools,
+            } => {
+                // Split reasoning markers out of the content first (Python splits
+                // before tool-call parsing too), then parse tool calls on the clean
+                // normal text.
+                let (reasoning_text, text) = split_reasoning(
+                    reasoning_parser.as_deref(),
+                    reasoning_options,
+                    &output.text,
+                    output.stop_trimmed_token_ids(),
+                );
+                let (content, tool_calls) = parse_chat_tool_calls(
+                    text,
+                    tool_parser.as_deref(),
+                    tools.as_deref(),
+                    parallel_tool_calls,
+                )
+                .await;
+                let finish_reason = match tool_calls {
+                    Some(_) => Some(OpenAIFinishReason::ToolCalls),
+                    None => finish_reason,
+                };
+                (reasoning_text, content, tool_calls, finish_reason)
+            }
         };
         #[allow(deprecated)]
         let message = ChatCompletionResponseMessage {
@@ -606,17 +715,32 @@ pub(super) fn chat_event_stream(
     created: u32,
     want_logprobs: bool,
     include_usage: bool,
-    parser: Option<String>,
-    reasoning_parser: Option<String>,
-    reasoning_options: ReasoningOptions,
+    parsing: OutputParsing,
     prompt_stub_tokens: u32,
-    tools: Option<Vec<ToolDefinition>>,
     tool_choice: Option<ChatCompletionToolChoiceOption>,
     uses_tool_call_structural_tag: bool,
     parallel_tool_calls: bool,
     service_tier: Option<ChatServiceTier>,
 ) -> impl futures::Stream<Item = String> {
     let count = submitted.len();
+    let (reasoning_parser, reasoning_options, parser, tools, deepseek) = match parsing {
+        OutputParsing::Text {
+            reasoning_parser,
+            reasoning_options,
+            tool_parser,
+            tools,
+        } => (
+            reasoning_parser,
+            reasoning_options,
+            tool_parser,
+            tools,
+            None,
+        ),
+        OutputParsing::DeepSeek(options) => {
+            (None, ReasoningOptions::default(), None, None, Some(options))
+        }
+    };
+    let recipe_parses = deepseek.is_some();
     let raw = async_stream::stream! {
         let count = submitted.len();
         let mut streams = Vec::with_capacity(count);
@@ -633,6 +757,9 @@ pub(super) fn chat_event_stream(
                 vec![]
             };
         let reasoning_enabled = !reasoning_splitters.is_empty();
+        let mut deepseek_parsers: Vec<DeepSeekOutputParser> = deepseek
+            .map(|options| (0..count).map(|_| options.parser()).collect())
+            .unwrap_or_default();
 
         for (index, call) in submitted {
             streams.push(indexed_decode_stream(index, call));
@@ -678,12 +805,20 @@ pub(super) fn chat_event_stream(
                 prompt_tokens = output.prompt_tokens.saturating_sub(prompt_stub_tokens);
             }
             completion_tokens = completion_tokens.saturating_add(output.completion_tokens);
-            let finish_reason = chat_finish_reason(&output);
-            // Split the step's text into (reasoning, normal) deltas when
-            // `--reasoning-parser` is set. Mirrors Python's per-step emission:
-            // reasoning chunk first (logprobs ride it), then the content chunk.
+            let mut finish_reason = chat_finish_reason(&output);
             let mut emitted = Vec::with_capacity(2);
-            if reasoning_enabled {
+            if let Some(parser) = deepseek_parsers.get_mut(index) {
+                let finish = finish_reason.map(|_| deepseek_finish(output.finish_reason.as_ref()));
+                let delta = parser.step(&output.token_ids, finish);
+                let logprobs = want_logprobs.then(|| chat_logprobs(output.extras.as_deref()));
+                emitted = deepseek_choices(index, delta, logprobs);
+                if parser.has_tool_calls() && stopped(&output) {
+                    finish_reason = Some(OpenAIFinishReason::ToolCalls);
+                }
+            } else if reasoning_enabled {
+                // Split the step's text into (reasoning, normal) deltas when
+                // `--reasoning-parser` is set. Mirrors Python's per-step emission:
+                // reasoning chunk first (logprobs ride it), then the content chunk.
                 let (reasoning_text, normal_text) =
                     reasoning_splitters[index].split(&output.text, output.stop_trimmed_token_ids());
                 let mut remaining_logprobs =
@@ -743,9 +878,11 @@ pub(super) fn chat_event_stream(
             }
             // The finish reason rides the last emitted chunk (the wire format
             // the equivalence tests pin); a step whose text was entirely
-            // buffered inside the parser still gets a finish-only frame.
+            // buffered inside a text parser still gets a frame. recipe emits
+            // nothing for a step it holds, as Python does.
             match emitted.last_mut() {
                 Some(last) => last.finish_reason = finish_reason,
+                None if recipe_parses && finish_reason.is_none() => {}
                 None => emitted.push(ChatChoiceStream {
                     index: u32::try_from(index).unwrap_or(u32::MAX),
                     delta: chat_delta(None, None, None, None),
@@ -798,7 +935,7 @@ pub(super) fn chat_event_stream(
 
     let parsed: std::pin::Pin<
         Box<dyn futures::Stream<Item = Annotated<CreateChatCompletionStreamResponse>> + Send>,
-    > = if let Some(parser) = parser {
+    > = if let Some(parser) = parser.filter(|_| !recipe_parses) {
         tool_call_stream(
             &parser,
             tool_choice,
@@ -817,7 +954,8 @@ pub(super) fn chat_event_stream(
         futures::pin_mut!(parsed);
         while let Some(mut item) = parsed.next().await {
             if let Some(response) = item.data.as_mut() {
-                if !parallel_tool_calls {
+                // recipe's calls pass whole, as Python's recipe path passes them.
+                if !parallel_tool_calls && !recipe_parses {
                     for choice in &mut response.choices {
                         let index = choice.index as usize;
                         if let Some(calls) = choice.delta.tool_calls.as_mut() {
@@ -842,6 +980,80 @@ pub(super) fn chat_event_stream(
         }
         yield "[DONE]".to_string();
     }
+}
+
+/// `token_output_sse_chunks`: a reasoning chunk, a content chunk, then one
+/// chunk per tool-call piece. The step's logprobs ride on the reasoning or
+/// content chunk, else on a chunk of their own.
+fn deepseek_choices(
+    index: usize,
+    delta: DeepSeekDelta,
+    mut logprobs: Option<ChatChoiceLogprobs>,
+) -> Vec<ChatChoiceStream> {
+    let index = u32::try_from(index).unwrap_or(u32::MAX);
+    let mut choices = Vec::new();
+    let mut choice = |delta, logprobs| {
+        choices.push(ChatChoiceStream {
+            index,
+            delta,
+            finish_reason: None,
+            logprobs,
+        })
+    };
+    if !delta.reasoning.is_empty() {
+        choice(
+            chat_delta(None, None, None, Some(delta.reasoning)),
+            logprobs.take(),
+        );
+    }
+    if !delta.content.is_empty() {
+        choice(
+            chat_delta(Some(delta.content), None, None, None),
+            logprobs.take(),
+        );
+    }
+    for call in delta.tool_calls {
+        // The first piece of a call names it; later pieces extend its arguments.
+        let call = ChatCompletionMessageToolCallChunk {
+            index: u32::try_from(call.index).unwrap_or(u32::MAX),
+            id: call.name.is_some().then(tool_call_id),
+            r#type: Some(FunctionType::Function),
+            function: Some(FunctionCallStream {
+                name: call.name,
+                arguments: Some(call.arguments),
+            }),
+        };
+        choice(chat_delta(None, None, Some(vec![call]), None), None);
+    }
+    if logprobs.is_some() {
+        choice(chat_delta(None, None, None, None), logprobs);
+    }
+    choices
+}
+
+/// The scheduler's finish reason as recipe's parser takes it; a type other than
+/// `stop` and `length` ends the parse without a backend finish.
+fn deepseek_finish(reason: Option<&FinishReason>) -> DeepSeekFinish<'_> {
+    match reason {
+        Some(FinishReason::Known(FinishKind::Stop { matched })) => {
+            DeepSeekFinish::Stop(match matched {
+                Some(Matched::Token(id)) => Some(DeepSeekStopMatch::Token(*id)),
+                Some(Matched::Str(stop)) => Some(DeepSeekStopMatch::Text(stop)),
+                _ => None,
+            })
+        }
+        Some(FinishReason::Known(FinishKind::Length { .. })) => DeepSeekFinish::Length,
+        _ => DeepSeekFinish::Abort,
+    }
+}
+
+/// Whether the scheduler stopped the choice, as `finish_reason["type"] == "stop"`;
+/// an abort, which [`chat_finish_reason`] also reports as a stop, did not.
+fn stopped(output: &CoreOutput) -> bool {
+    matches!(
+        output.finish_reason,
+        Some(FinishReason::Known(FinishKind::Stop { .. }))
+    )
 }
 
 fn serialize_chat_stream_response(response: CreateChatCompletionStreamResponse) -> String {
@@ -915,18 +1127,21 @@ mod tests {
 
     use super::super::ChatFormatter;
     use super::super::test_utils::{
-        answering_app_state_with, body_json, chat_submitted, chunk, post_json,
+        answering_app_state_with, answering_app_state_with_item, body_json, chat_submitted, chunk,
+        post_json,
     };
     use super::{
-        SamplingDefaults, chat_event_stream, chat_logprobs, chat_sampling_params,
-        merge_template_stops, unary_chat,
+        OutputParsing, SamplingDefaults, chat_event_stream, chat_images, chat_logprobs,
+        chat_sampling_params, merge_template_stops, unary_chat,
     };
     use crate::message::config::{DefaultSamplingParams, ServerArgs};
-    use crate::message::response::ChunkExtras;
+    use crate::message::response::{ChunkEvent, ChunkExtras, ResponseItem};
     use axum::http::StatusCode;
     use futures::StreamExt;
-    use sglang_processor::ReasoningOptions;
     use sglang_processor::dynamo_protocols::types::{CreateChatCompletionRequest, Stop};
+    use sglang_processor::dynamo_tokenizers::Tokenizer;
+    use sglang_processor::openai::ChatModel;
+    use sglang_processor::{DeepSeekOutputOptions, ReasoningOptions};
 
     fn request() -> CreateChatCompletionRequest {
         serde_json::from_value(serde_json::json!({
@@ -934,6 +1149,35 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}]
         }))
         .unwrap()
+    }
+
+    /// Images ride along in Python's order; other media, or any media for a
+    /// text-only model, is refused.
+    #[test]
+    fn chat_images_follow_python_and_refuse_other_media() {
+        let image = |url: &str| serde_json::json!({"type": "image_url", "image_url": {"url": url}});
+        let messages = serde_json::json!([
+            {"role": "user", "content": [image("a"), {"type": "text", "text": "x"}]},
+            {"role": "user", "content": "plain"},
+            {"role": "user", "content": [image("b")]},
+        ]);
+        let urls: Vec<String> = chat_images(&messages, true)
+            .unwrap()
+            .into_iter()
+            .map(|item| item.source().unwrap().to_owned())
+            .collect();
+        assert_eq!(urls, ["a", "b"]);
+        assert!(chat_images(&messages, false).is_err());
+        let video = serde_json::json!([{"role": "user", "content": [
+            {"type": "video_url", "video_url": {"url": "v"}}
+        ]}]);
+        assert!(chat_images(&video, true).is_err());
+        let text = serde_json::json!([{"role": "user", "content": "plain"}]);
+        assert!(chat_images(&text, false).unwrap().is_empty());
+        let no_url = serde_json::json!([{"role": "user", "content": [
+            {"type": "image_url", "image_url": null, "uuid": "cached"}
+        ]}]);
+        assert!(chat_images(&no_url, true).is_err());
     }
 
     /// Python `to_sampling_params` priority: user value > model generation
@@ -1096,11 +1340,8 @@ mod tests {
             "model".into(),
             1,
             false,
-            None,
-            None,
-            ReasoningOptions::default(),
+            text_parsing(None),
             3, // Kimi K3's generation stub
-            None,
             true,
             None,
         )
@@ -1121,6 +1362,16 @@ mod tests {
     }
 
     /// The first choice's message for `body`, against a core answering `text`.
+    /// Parsing by `reasoning_parser` alone, without tools.
+    fn text_parsing(reasoning_parser: Option<&str>) -> OutputParsing {
+        OutputParsing::Text {
+            reasoning_parser: reasoning_parser.map(str::to_owned),
+            reasoning_options: ReasoningOptions::default(),
+            tool_parser: None,
+            tools: None,
+        }
+    }
+
     async fn chat_message(
         reasoning_parser: &str,
         formatter: ChatFormatter,
@@ -1138,9 +1389,72 @@ mod tests {
         body_json(response).await["choices"][0]["message"].clone()
     }
 
+    /// The DeepSeek-V4.1 checkpoint the processor's `openai_parity` fixture
+    /// pins, from the HF cache CI fills; `None` skips the test elsewhere.
+    fn deepseek_v41() -> Option<(ChatFormatter, Tokenizer)> {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../sglang-processor/tests/fixtures/openai_parity/deepseek-v4.1-flash.json"
+        )))
+        .unwrap();
+        let path = sglang_processor::resolve_model_file(
+            fixture["model"].as_str().unwrap(),
+            fixture["revision"].as_str(),
+            "tokenizer.json",
+        );
+        let Some(path) = path else {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "CI caches the tokenizer: tests/scripts/cache_deepseek_files.sh"
+            );
+            return None;
+        };
+        let json = std::fs::read_to_string(&path).unwrap();
+        let formatter = ChatFormatter::deepseek_v4(true, Some(&json)).unwrap();
+        Some((formatter, Tokenizer::from_file(&path).unwrap()))
+    }
+
+    /// The engine's last chunk for `rid`: `text`'s ids, ended by `finish`.
+    fn ids_chunk(
+        rid: &str,
+        tokenizer: &Tokenizer,
+        text: &str,
+        finish: serde_json::Value,
+    ) -> ResponseItem {
+        let ids = tokenizer.encode(text).unwrap().token_ids().to_vec();
+        ResponseItem::Done(ChunkEvent {
+            rid: rid.into(),
+            text: text.into(),
+            completion_tokens: ids.len() as u64,
+            token_ids: ids.into_iter().map(i64::from).collect(),
+            prompt_tokens: 5,
+            finish_reason: Some(serde_json::from_value(finish).unwrap()),
+            ..Default::default()
+        })
+    }
+
+    /// recipe's parse of `body`'s output, under the V4.1 parsers.
+    fn deepseek_options(
+        formatter: &ChatFormatter,
+        body: serde_json::Value,
+    ) -> DeepSeekOutputOptions {
+        let model = ChatModel::for_formatter(formatter);
+        let output = model.deepseek.expect("the tokenizer is attached");
+        output
+            .for_request(&body, &Default::default(), true, true)
+            .unwrap()
+    }
+
+    const DSML_CALL: &str = "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n\
+        <｜DSML｜ parameter name=\"city\" string=\"true\">Paris</｜DSML｜ parameter>\n\
+        </｜DSML｜ invoke>\n</｜DSML｜ calls>";
+
     /// A continuation that already closed its think block generates content.
     #[tokio::test]
     async fn continuation_after_think_end_is_content() {
+        let Some((formatter, tokenizer)) = deepseek_v41() else {
+            return;
+        };
         let body = serde_json::json!({
             "model": "model",
             "messages": [
@@ -1150,15 +1464,119 @@ mod tests {
             "continue_final_message": true,
             "chat_template_kwargs": {"thinking": true}
         });
-        let message = chat_message(
-            "deepseek-v4",
-            ChatFormatter::DeepSeekV41(None),
-            " 391.",
-            body,
-        )
-        .await;
+        let args = ServerArgs {
+            served_model_name: "model".into(),
+            reasoning_parser: Some("deepseek-v41".into()),
+            ..Default::default()
+        };
+        let stop = serde_json::json!({"type": "stop"});
+        let state = answering_app_state_with_item(Arc::new(args), formatter, None, move |rid| {
+            ids_chunk(rid, &tokenizer, " 391.", stop.clone())
+        });
+        let app = super::super::routes().with_state(state);
+        let response = body_json(post_json(app, "/v1/chat/completions", body).await).await;
+        let message = &response["choices"][0]["message"];
         assert_eq!(message["content"], " 391.");
         assert!(message["reasoning_content"].is_null());
+    }
+
+    /// A call `max_tokens` cuts stays a `length` finish, as Python reports it.
+    #[tokio::test]
+    async fn deepseek_call_cut_by_length_is_not_a_tool_calls_finish() {
+        let Some((formatter, tokenizer)) = deepseek_v41() else {
+            return;
+        };
+        let body = serde_json::json!({"messages": [{"role": "user", "content": "Weather?"}]});
+        let (choice, tx) = chat_submitted(0, "r0");
+        let cut = &DSML_CALL[..DSML_CALL.find("Paris").unwrap()];
+        let length = serde_json::json!({"type": "length", "length": 16});
+        tx.send(ids_chunk("r0", &tokenizer, cut, length))
+            .await
+            .unwrap();
+        let parsing = OutputParsing::DeepSeek(deepseek_options(&formatter, body));
+        let response = unary_chat(
+            vec![choice],
+            "id".into(),
+            "model".into(),
+            1,
+            false,
+            parsing,
+            0,
+            true,
+            None,
+        )
+        .await;
+        let value = body_json(response).await;
+        assert_eq!(value["choices"][0]["finish_reason"], "length");
+        let call = &value["choices"][0]["message"]["tool_calls"][0];
+        assert_eq!(call["function"]["name"], "get_weather");
+    }
+
+    /// A streamed call is named once, its id on that first piece, and every
+    /// frame carries a delta or the finish.
+    #[tokio::test]
+    async fn deepseek_stream_names_a_call_once() {
+        let Some((formatter, tokenizer)) = deepseek_v41() else {
+            return;
+        };
+        let body = serde_json::json!({"messages": [{"role": "user", "content": "Weather?"}]});
+        let (choice, tx) = chat_submitted(0, "r0");
+        let ids = tokenizer.encode(DSML_CALL).unwrap().token_ids().to_vec();
+        // One frame per token, then the finish.
+        tokio::spawn(async move {
+            for id in ids {
+                let frame = ChunkEvent {
+                    rid: "r0".into(),
+                    token_ids: vec![i64::from(id)],
+                    completion_tokens: 1,
+                    ..Default::default()
+                };
+                tx.send(ResponseItem::Frame(frame)).await.unwrap();
+            }
+            let stop = serde_json::json!({"type": "stop"});
+            tx.send(ids_chunk("r0", &tokenizer, "", stop))
+                .await
+                .unwrap();
+        });
+        let parsing = OutputParsing::DeepSeek(deepseek_options(&formatter, body));
+        let stream = chat_event_stream(
+            vec![choice],
+            "id".into(),
+            "model".into(),
+            1,
+            false,
+            false,
+            parsing,
+            0,
+            None,
+            false,
+            false,
+            None,
+        );
+        let frames: Vec<serde_json::Value> = stream
+            .filter_map(|frame| async move { serde_json::from_str(&frame).ok() })
+            .collect()
+            .await;
+        let choices: Vec<&serde_json::Value> = frames.iter().map(|f| &f["choices"][0]).collect();
+        let pieces: Vec<&serde_json::Value> = choices
+            .iter()
+            .filter_map(|c| c["delta"]["tool_calls"].get(0))
+            .collect();
+        assert_eq!(pieces[0]["function"]["name"], "get_weather");
+        assert!(pieces[0]["id"].is_string());
+        for piece in &pieces[1..] {
+            assert_eq!(piece["index"], 0);
+            assert!(piece.get("id").is_none_or(|id| id.is_null()));
+        }
+        assert_eq!(choices.last().unwrap()["finish_reason"], "tool_calls");
+        let carries_something = |choice: &&serde_json::Value| {
+            let delta = &choice["delta"];
+            ["role", "content", "reasoning_content", "tool_calls"]
+                .iter()
+                .any(|field| !delta[field].is_null())
+                || !choice["finish_reason"].is_null()
+        };
+        assert!(choices.iter().all(carries_something));
     }
 
     /// Kimi K3 with thinking off generates content, though its detector defaults to reasoning.
@@ -1192,11 +1610,8 @@ mod tests {
             "model".into(),
             1,
             false,
-            None,
-            Some("deepseek-r1".into()),
-            ReasoningOptions::default(),
+            text_parsing(Some("deepseek-r1")),
             0,
-            None,
             true,
             None,
         )
@@ -1232,11 +1647,8 @@ mod tests {
             1,
             false,
             true,
-            None,
-            Some("deepseek-r1".into()),
-            ReasoningOptions::default(),
+            text_parsing(Some("deepseek-r1")),
             0,
-            None,
             None,
             false,
             true,
@@ -1279,11 +1691,8 @@ mod tests {
             1,
             false,
             true,
-            None,
-            None,
-            ReasoningOptions::default(),
+            text_parsing(None),
             0,
-            None,
             None,
             false,
             true,
@@ -1311,7 +1720,7 @@ mod tests {
     #[tokio::test]
     async fn system_message_tools_reach_http_responses() {
         use super::super::test_utils::{body_json, post_json};
-        use crate::api_server::core::{CoreConfig, CoreHandle, CoreMetadata};
+        use crate::api_server::handlers::{CoreConfig, CoreHandle, CoreMetadata};
         use crate::message::config::ServerArgs;
         use crate::message::request::RequestKind;
         use crate::tokenizer_manager::wiring::TmEvent;
@@ -1333,6 +1742,8 @@ mod tests {
                     startup_ready: true,
                     is_disaggregation: false,
                     mm_limits: Default::default(),
+                    multimodal: false,
+                    peer_endpoints: Vec::new(),
                     metadata: CoreMetadata::from(args.as_ref()),
                     metrics: None,
                 },

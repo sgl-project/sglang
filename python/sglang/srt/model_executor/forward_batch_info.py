@@ -30,14 +30,14 @@ from __future__ import annotations
 import hashlib
 import warnings
 from dataclasses import dataclass
-from enum import IntEnum, auto
-from functools import lru_cache, total_ordering
+from functools import lru_cache
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
 
 import torch
 
 from sglang.kernels.ops.attention.clamp_position import clamp_position
 from sglang.kernels.ops.attention.position import compute_position_triton
+from sglang.kernels.ops.memory.small_copy import write_host_ints
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.environ import envs
@@ -54,6 +54,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     ForwardBatchDeepSeekMHAMixin,
 )
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.runtime_context import (
     get_exec,
     get_flags,
@@ -63,13 +64,13 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.speculative.spec_info import SpecInputType
 from sglang.srt.utils import (
-    get_bool_env_var,
     is_cpu,
     is_hip,
     is_npu,
     support_triton,
 )
-from sglang.srt.utils.common import ceil_align, is_pin_memory_available
+from sglang.srt.utils.common import ceil_align
+from sglang.srt.utils.device import is_pin_memory_available
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -78,10 +79,12 @@ if TYPE_CHECKING:
     from sglang.srt.layers.engram_staging import StagedRows
     from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-    from sglang.srt.managers.schedule_batch import MultimodalInputs, ScheduleBatch
-    from sglang.srt.mem_cache.kv_loc_plan import Cols, KVLocPlan
+    from sglang.srt.managers.req_types import MultimodalInputs
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.mem_cache.kv.alloc.iteration_ids import Cols, IterationIds
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+    from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
 # Warn-once flag for the deprecated skip_attn_backend_init kwarg; see
@@ -142,6 +145,44 @@ def _build_forward_token_modalities(
     ).to(device, non_blocking=True)
 
 
+# write_host_ints passes every value as a kernel argument; one launch carries at
+# most this many, so its arguments stay far below the kernel parameter limit.
+_HOST_INTS_PER_LAUNCH = 256
+
+
+def _host_ints_to_device(values: List[int], dtype: torch.dtype, device) -> torch.Tensor:
+    """A 1-D ``dtype`` CUDA tensor holding ``values``, written by kernels that take
+    the values as arguments. Unlike a pinned host-to-device copy, the write never
+    queues on a copy engine behind bulk host-to-device transfers.
+
+    The kernel writes a buffer padded to a power of two (or to whole launches past
+    one launch), so a varying length compiles a bounded set of kernels; the
+    result is the buffer's leading ``len(values)`` elements.
+    """
+    n = len(values)
+    if n == 0:
+        return torch.empty(0, dtype=dtype, device=device)
+    if n <= _HOST_INTS_PER_LAUNCH:
+        size = 1 << (n - 1).bit_length()
+    else:
+        size = -(-n // _HOST_INTS_PER_LAUNCH) * _HOST_INTS_PER_LAUNCH
+    padded = list(values) + [0] * (size - n)
+    out = torch.empty(size, dtype=dtype, device=device)
+    for start in range(0, size, _HOST_INTS_PER_LAUNCH):
+        stop = min(start + _HOST_INTS_PER_LAUNCH, size)
+        write_host_ints((out[start:stop],), (padded[start:stop],))
+    return out[:n]
+
+
+def _kernel_writes_metadata(device) -> bool:
+    """Whether kernels write the forward's small metadata instead of pinned
+    host-to-device copies: SGLANG_ENABLE_MLP_SYNC_METADATA_FILL, on CUDA."""
+    return (
+        envs.SGLANG_ENABLE_MLP_SYNC_METADATA_FILL.get()
+        and torch.device(device).type == "cuda"
+    )
+
+
 def _maybe_build_forward_token_modalities(
     model_config: ModelConfig,
     mm_inputs: Optional[List[MultimodalInputs]],
@@ -193,132 +234,6 @@ def _elastic_should_preserve_local_token_counts(
 
     uneven_token_count = len(set(global_num_tokens)) > 1
     return uneven_token_count
-
-
-class ForwardMode(IntEnum):
-    # Extend a sequence. The KV cache of the beginning part of the sequence is already computed (e.g., system prompt).
-    # It is also called "prefill" in common terminology.
-    EXTEND = auto()
-    # Decode one token.
-    DECODE = auto()
-    # Contains both EXTEND and DECODE when doing chunked prefill.
-    MIXED = auto()
-    # No sequence to forward. For data parallel attention, some workers will be IDLE if no sequence are allocated.
-    IDLE = auto()
-
-    # Used in speculative decoding: verify a batch in the target model.
-    TARGET_VERIFY = auto()
-    # Used in speculative decoding: extend a batch in the draft model.
-    DRAFT_EXTEND_V2 = auto()
-
-    # Used in disaggregated decode worker
-    # Represent a batch of requests having their KV cache ready to start decoding
-    PREBUILT = auto()
-
-    # Split Prefill for PD multiplexing
-    SPLIT_PREFILL = auto()
-
-    # Used in dLLM
-    DLLM_EXTEND = auto()
-
-    def is_prefill(self, include_draft_extend_v2: bool = False):
-        return self.is_extend(include_draft_extend_v2=include_draft_extend_v2)
-
-    def is_extend(self, include_draft_extend_v2: bool = False):
-        return (
-            self == ForwardMode.EXTEND
-            or self == ForwardMode.MIXED
-            or (include_draft_extend_v2 and self == ForwardMode.DRAFT_EXTEND_V2)
-            or self == ForwardMode.TARGET_VERIFY
-            or self == ForwardMode.SPLIT_PREFILL
-            or self == ForwardMode.DLLM_EXTEND
-        )
-
-    def is_context_parallel_extend(self, include_draft_extend_v2: bool = False):
-        return (
-            self == ForwardMode.EXTEND
-            or self == ForwardMode.MIXED
-            or (
-                self == ForwardMode.DRAFT_EXTEND_V2
-                if include_draft_extend_v2
-                else False
-            )
-        )
-
-    def is_decode(self):
-        return self == ForwardMode.DECODE
-
-    def is_mixed(self):
-        return self == ForwardMode.MIXED
-
-    def is_idle(self):
-        return self == ForwardMode.IDLE
-
-    def is_decode_or_idle(self):
-        return self == ForwardMode.DECODE or self == ForwardMode.IDLE
-
-    def is_target_verify(self):
-        return self == ForwardMode.TARGET_VERIFY
-
-    def is_draft_extend_v2(self):
-        # For fixed shape logits output in eagle v2 worker
-        return self == ForwardMode.DRAFT_EXTEND_V2
-
-    def is_extend_or_draft_extend_or_mixed(self, include_draft_extend_v2: bool = False):
-        return (
-            self == ForwardMode.EXTEND
-            or self == ForwardMode.MIXED
-            or self == ForwardMode.SPLIT_PREFILL
-            or (include_draft_extend_v2 and self == ForwardMode.DRAFT_EXTEND_V2)
-        )
-
-    def is_cuda_graph(self):
-        return (
-            self == ForwardMode.DECODE
-            or self == ForwardMode.TARGET_VERIFY
-            or self == ForwardMode.IDLE
-            or self == ForwardMode.DLLM_EXTEND
-        )
-
-    def is_cpu_graph(self):
-        return self == ForwardMode.DECODE
-
-    def is_dllm_extend(self):
-        return self == ForwardMode.DLLM_EXTEND
-
-    def is_split_prefill(self):
-        return self == ForwardMode.SPLIT_PREFILL
-
-    def is_extend_without_speculative(self):
-        return self.is_extend() and not self.is_target_verify()
-
-    def is_prebuilt(self):
-        return self == ForwardMode.PREBUILT
-
-    def is_dllm_extend(self):
-        return self == ForwardMode.DLLM_EXTEND
-
-
-@total_ordering
-class CaptureHiddenMode(IntEnum):
-    # Do not capture anything.
-    NULL = 0
-    # Capture a hidden state of the last token.
-    LAST = 1
-    # Capture hidden states of all tokens.
-    FULL = 2
-
-    def need_capture(self):
-        return self != CaptureHiddenMode.NULL
-
-    def is_full(self):
-        return self == CaptureHiddenMode.FULL
-
-    def is_last(self):
-        return self == CaptureHiddenMode.LAST
-
-    def __lt__(self, other):
-        return self.value < other.value
 
 
 def get_server_return_hidden_states_mode() -> CaptureHiddenMode:
@@ -520,14 +435,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # The original sequence length without being chunked. Qwen-1M related.
     orig_seq_lens: Optional[torch.Tensor] = None
 
-    # This iteration's KV ids, translated once per sub-pool (`KVLocPlan`).
+    # This iteration's KV ids, translated once per sub-pool (`IterationIds`).
     # Every forward of the iteration holds the same plan; `out_cache_loc` is
     # its write window in the full-attention ids this runner's pool indexes,
     # and a backend that writes another sub-pool asks the plan for its ids
-    # (`KVIndexTranslator.write_ids`).
-    kv_loc_plan: Optional[KVLocPlan] = None
+    # (`RunnerIds.write_ids`).
+    iteration_ids: Optional[IterationIds] = None
     # The part of the plan's window this forward writes (None: all of it).
-    kv_loc_cols: Optional[Cols] = None
+    iteration_cols: Optional[Cols] = None
     # The same write ids in the virtual space when `out_cache_loc` holds
     # translated ones (None on a pool that indexes virtual ids), for the
     # scheduler's bookkeeping: lazy compaction's in-flight write set, TBO's
@@ -536,7 +451,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # DSV4-NPU only: per-pool slot bundle from DSV4NPUTokenToKVPoolAllocator,
     # consumed by the Ascend backend for PA_ND block tables. None elsewhere.
     out_cache_loc_dsv4: Optional[DSV4OutCacheLoc] = None
-    # Whether `out_cache_loc` holds physical ids: set by `KVLocPlan.bind`.
+    # Whether `out_cache_loc` holds physical ids: set by `IterationIds.bind`.
     out_cache_loc_is_physical: bool = False
     # The indices to track mamba state with
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
@@ -592,6 +507,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For two-batch overlap
     tbo_split_seq_index: Optional[int] = None
 
+    # the decode graph owns input_ids and positions until replay or eager fallback
+    input_ids_from_graph: bool = False
+
     # === Borrowed from ScheduleBatch: host metadata (CPU lists / mirrors) ===
     # Optional seq_lens on cpu (CPU mirror of seq_lens)
     seq_lens_cpu: Optional[torch.Tensor] = None
@@ -625,11 +543,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     sampling_info: SamplingBatchInfo = None
     # Speculative decoding
     spec_info: Optional[SpecInput] = None
+    # Per-request target-verify geometry.
+    ragged_verify_layout: Optional[RaggedVerifyLayout] = None
 
     # === Derived from ScheduleBatch.reqs ===
     # True for synthetic capture batches; init_new snapshots real request ranges.
     # Running decode rows do not complete a prefill.
     contains_last_prefill_chunk: bool = True
+    # Per-request completion of an extend (including resumed/retracted prompts).
+    # None for decode and synthetic capture batches. Running decode requests in
+    # a mixed batch also end at a prediction boundary.
+    extend_is_final_cpu: Optional[List[bool]] = None
     # For LoRA
     lora_ids: Optional[List[str]] = None
     # For dumper: request IDs for cross-step sequence tracking
@@ -735,14 +659,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     next_token_logits_buffer: torch.Tensor = None
     temperature: torch.Tensor = None
     top_p: torch.Tensor = None
-
-    # For split prefill
-    # intermediate values for split prefill
-    hidden_states: torch.Tensor = None
-    residual: torch.Tensor = None
-    model_specific_states: Dict[str, any] = None
-    # current split index of layer
-    split_index: int = 0
 
     # For multimodal
     mm_input_embeds: Optional[torch.Tensor] = None
@@ -944,16 +860,31 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         self.original_global_num_tokens_cpu = global_num_tokens_source
         self.global_num_tokens_cpu = global_num_tokens
-        pin_memory = is_pin_memory_available(device)
-        self.global_num_tokens_gpu = torch.tensor(
-            global_num_tokens, dtype=torch.int64, pin_memory=pin_memory
-        ).to(device, non_blocking=True)
         self.global_num_tokens_for_logprob_cpu = global_num_tokens_for_logprob
-        self.global_num_tokens_for_logprob_gpu = torch.tensor(
-            global_num_tokens_for_logprob,
-            dtype=torch.int64,
-            pin_memory=pin_memory,
-        ).to(device, non_blocking=True)
+        if _kernel_writes_metadata(device):
+            # One kernel writes both: a pinned host-to-device copy would queue on
+            # the copy engine behind bulk transfers (such as host KV restores)
+            # and hold up this forward.
+            self.global_num_tokens_gpu = torch.empty(
+                len(global_num_tokens), dtype=torch.int64, device=device
+            )
+            self.global_num_tokens_for_logprob_gpu = torch.empty(
+                len(global_num_tokens_for_logprob), dtype=torch.int64, device=device
+            )
+            write_host_ints(
+                (self.global_num_tokens_gpu, self.global_num_tokens_for_logprob_gpu),
+                (global_num_tokens, global_num_tokens_for_logprob),
+            )
+        else:
+            pin_memory = is_pin_memory_available(device)
+            self.global_num_tokens_gpu = torch.tensor(
+                global_num_tokens, dtype=torch.int64, pin_memory=pin_memory
+            ).to(device, non_blocking=True)
+            self.global_num_tokens_for_logprob_gpu = torch.tensor(
+                global_num_tokens_for_logprob,
+                dtype=torch.int64,
+                pin_memory=pin_memory,
+            ).to(device, non_blocking=True)
         self.can_run_decode_cuda_graph = batch.can_run_decode_cuda_graph
         self.can_run_dp_draft_cuda_graph = batch.can_run_dp_draft_cuda_graph
 
@@ -965,18 +896,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         *,
         capture_hidden_mode: Optional[CaptureHiddenMode] = None,
         return_hidden_states_before_norm: bool,
+        ragged_verify_layout: Optional[RaggedVerifyLayout] = None,
         extend_position_info=None,
         spec_mrope_positions: Optional[torch.Tensor] = None,
-        kv_loc_plan: Optional[KVLocPlan] = None,
+        pp_loras: Optional[set[Optional[str]]] = None,
+        iteration_ids: Optional[IterationIds] = None,
         write_cols: Optional[Cols] = None,
+        input_ids_from_graph: bool = False,
     ):
-        # init_new must not mutate the input ScheduleBatch; per-forward
-        # overrides go through explicit keyword arguments.
-        #
-        # `kv_loc_plan`: the iteration's plan when this forward is one of
-        # several over the same slots (a speculative iteration), `write_cols`
-        # the columns of its window this forward writes. Without one, this
-        # forward is its own iteration and builds the plan itself.
+        # init_new must not mutate ScheduleBatch; use explicit forward overrides.
+        # Speculative forwards share iteration_ids and select their write_cols;
+        # a standalone forward builds its own iteration plan.
 
         # capture_hidden_mode=None means no override: capture the server's
         # configured maximum so lower-mode requests can share one graph.
@@ -1023,11 +953,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             batch.seq_lens_sum = int(seq_lens_cpu.sum())
 
         contains_last_prefill_chunk = False
+        extend_is_final_cpu = None
         if batch.forward_mode.is_extend_without_speculative():
             decoding_req_ids = {id(req) for req in (batch.decoding_reqs or ())}
-            contains_last_prefill_chunk = any(
-                req.extend_end == len(req.full_untruncated_fill_ids)
+            extend_is_final_cpu = [
+                id(req) in decoding_req_ids
+                or req.extend_end == len(req.full_untruncated_fill_ids)
                 for req in batch.reqs
+            ]
+            contains_last_prefill_chunk = any(
+                final
+                for req, final in zip(batch.reqs, extend_is_final_cpu)
                 if id(req) not in decoding_req_ids
             )
 
@@ -1091,10 +1027,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             global_forward_mode=batch.global_forward_mode,
             is_prefill_only=batch.is_prefill_only,
             contains_last_prefill_chunk=contains_last_prefill_chunk,
+            extend_is_final_cpu=extend_is_final_cpu,
             spec_algorithm=batch.spec_algorithm,
             capture_hidden_mode=capture_hidden_mode,
             return_hidden_states_before_norm=return_hidden_states_before_norm,
             tbo_split_seq_index=batch.tbo_split_seq_index,
+            input_ids_from_graph=input_ids_from_graph,
             # Host-side metadata
             top_logprobs_nums=batch.top_logprobs_nums,
             token_ids_logprobs=batch.token_ids_logprobs,
@@ -1121,11 +1059,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # Compound (carry their own device tensors)
             sampling_info=batch.sampling_info,
             spec_info=batch.spec_info,
+            ragged_verify_layout=ragged_verify_layout,
         )
 
         # ScheduleBatch and req_to_token keep allocator-global slot identities,
         # and so does the plan's window. An NPU DCP target writes rank-local
-        # slots, which its translator maps the window to at `bind` below; keep
+        # slots, which its `RunnerIds` maps the window to at `bind` below; keep
         # the global view for the consumers that read it.
         if _is_npu and get_parallel().dcp_enabled and not model_runner.is_draft_worker:
             ret.origin_out_cache_loc = ret.out_cache_loc
@@ -1142,10 +1081,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             device,
         )
 
-        translator = model_runner.kv_index_translator
-        if kv_loc_plan is None:
-            kv_loc_plan = translator.own_plan(ret)
-        kv_loc_plan.bind(ret, translator, cols=write_cols)
+        runner_ids = model_runner.runner_ids
+        if iteration_ids is None:
+            iteration_ids = runner_ids.own_plan(ret)
+        iteration_ids.bind(ret, runner_ids, cols=write_cols)
 
         if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():
             hashed = _hash_rids_to_tensor(
@@ -1230,19 +1169,30 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         # Init position information
         if ret.forward_mode.is_decode() or ret.forward_mode.is_target_verify():
-            if ret.positions is None:
+            if ret.positions is None and not ret.input_ids_from_graph:
                 ret.positions = clamp_position(batch.seq_lens)
         else:
             if isinstance(extend_seq_lens, list):
                 # Main path: H2D from host lists; populate *_cpu mirrors.
                 assert isinstance(extend_prefix_lens, list)
-                pin_memory = is_pin_memory_available(device)
-                ret.extend_seq_lens = torch.tensor(
-                    extend_seq_lens, dtype=torch.int32, pin_memory=pin_memory
-                ).to(device, non_blocking=True)
-                ret.extend_prefix_lens = torch.tensor(
-                    extend_prefix_lens, dtype=torch.int32, pin_memory=pin_memory
-                ).to(device, non_blocking=True)
+                if _kernel_writes_metadata(device):
+                    # Written by kernels: a pinned host-to-device copy would queue
+                    # on the copy engine behind bulk transfers (such as host KV
+                    # load-backs) and hold up this forward.
+                    ret.extend_seq_lens = _host_ints_to_device(
+                        extend_seq_lens, torch.int32, device
+                    )
+                    ret.extend_prefix_lens = _host_ints_to_device(
+                        extend_prefix_lens, torch.int32, device
+                    )
+                else:
+                    pin_memory = is_pin_memory_available(device)
+                    ret.extend_seq_lens = torch.tensor(
+                        extend_seq_lens, dtype=torch.int32, pin_memory=pin_memory
+                    ).to(device, non_blocking=True)
+                    ret.extend_prefix_lens = torch.tensor(
+                        extend_prefix_lens, dtype=torch.int32, pin_memory=pin_memory
+                    ).to(device, non_blocking=True)
                 ret.extend_prefix_lens_cpu = list(extend_prefix_lens)
                 ret.extend_seq_lens_cpu = list(extend_seq_lens)
             else:
@@ -1297,7 +1247,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # In the non-LoRA overlap loading case, we fetch LoRA adapters into the memory pool
             # as a batch, right before running the batch
             if not get_lora().enable_lora_overlap_loading:
-                model_runner.lora_manager.fetch_new_loras(set(ret.lora_ids))
+                model_runner.lora_manager.fetch_new_loras(
+                    set(ret.lora_ids), pp_loras=pp_loras
+                )
 
             model_runner.lora_manager.prepare_lora_batch(ret)
 
@@ -1380,11 +1332,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         else:
             num_tokens = 0
         if enable_num_token_non_padded():
-            self.global_num_token_non_padded = torch.tensor(
-                num_tokens,
-                dtype=torch.int32,
-                pin_memory=is_pin_memory_available(device),
-            ).to(device, non_blocking=True)
+            if _kernel_writes_metadata(device):
+                # A kernel writes the 0-dim count; see _host_ints_to_device.
+                self.global_num_token_non_padded = _host_ints_to_device(
+                    [num_tokens], torch.int32, device
+                ).squeeze(0)
+            else:
+                self.global_num_token_non_padded = torch.tensor(
+                    num_tokens,
+                    dtype=torch.int32,
+                    pin_memory=is_pin_memory_available(device),
+                ).to(device, non_blocking=True)
         self.global_num_token_non_padded_cpu = num_tokens
 
     def set_local_num_token_non_padded(self, *, sharded: bool) -> None:
@@ -1392,7 +1350,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         A replicated (``sharded=False``) forward keeps the full DP-group count.
         """
-        from sglang.srt.utils.common import require_mlp_tp_gather
+        from sglang.srt.layers.dp_attention import require_mlp_tp_gather
 
         if self.global_num_tokens_cpu is not None:
             # DP / MLP-sync path: per-DP padded width.
@@ -1952,12 +1910,18 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         self._pad_inputs_to_size(model_runner, num_tokens, bs)
         self.global_num_tokens_cpu = global_num_tokens
         self.use_pin_memory = not _is_cpu
-        global_num_tokens_pinned = torch.tensor(
-            global_num_tokens, pin_memory=self.use_pin_memory
-        )
-        self.global_num_tokens_gpu.copy_(
-            global_num_tokens_pinned, non_blocking=self.use_pin_memory
-        )
+        if _kernel_writes_metadata(self.global_num_tokens_gpu.device):
+            # One kernel writes the padded counts in place: a pinned host-to-device
+            # copy would queue on the copy engine behind bulk transfers and hold up
+            # this forward.
+            write_host_ints((self.global_num_tokens_gpu,), (global_num_tokens,))
+        else:
+            global_num_tokens_pinned = torch.tensor(
+                global_num_tokens, pin_memory=self.use_pin_memory
+            )
+            self.global_num_tokens_gpu.copy_(
+                global_num_tokens_pinned, non_blocking=self.use_pin_memory
+            )
         # Exchanged here, not in the model forward: every rank reaches this point
         # after reshaping its batch and before it picks a prefill graph or eager.
         if (
@@ -2296,10 +2260,7 @@ def _dp_tp_moe_masks_pad_rows() -> bool:
     from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
     return (
-        _is_hip
-        and get_bool_env_var("SGLANG_DP_MASK_PAD_ROWS", default="true")
-        and get_parallel().attn_dp_size > 1
-        and get_moe_a2a_backend().is_none()
+        _is_hip and get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none()
     )
 
 
@@ -2341,13 +2302,14 @@ def build_inner_fb_view(
         out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
         # A caller may hand in another view that does not carry this field.
         out_cache_loc_virtual=getattr(forward_batch, "out_cache_loc_virtual", None),
-        kv_loc_plan=getattr(forward_batch, "kv_loc_plan", None),
-        kv_loc_cols=getattr(forward_batch, "kv_loc_cols", None),
+        iteration_ids=getattr(forward_batch, "iteration_ids", None),
+        iteration_cols=getattr(forward_batch, "iteration_cols", None),
         origin_out_cache_loc=getattr(forward_batch, "origin_out_cache_loc", None),
         out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
         # A caller may hand in another view that does not carry this field.
         max_seq_len_host=getattr(forward_batch, "max_seq_len_host", None),
         spec_info=forward_batch.spec_info,
+        ragged_verify_layout=forward_batch.ragged_verify_layout,
     )
 
 

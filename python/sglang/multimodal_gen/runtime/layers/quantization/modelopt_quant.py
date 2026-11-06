@@ -44,7 +44,8 @@ from sglang.srt.layers.quantization.utils import (
     requantize_with_max_scale,
 )
 from sglang.srt.layers.utils.common import copy_or_rebind_param
-from sglang.srt.utils.common import is_flashinfer_available, round_up
+from sglang.srt.utils.common import round_up
+from sglang.srt.utils.device import is_flashinfer_available
 
 logger = logging.getLogger(__name__)
 

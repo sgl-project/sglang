@@ -9,6 +9,7 @@ from sglang.srt.mem_cache.events import KvEventLoraNames
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+    from sglang.srt.mem_cache.kv.plan import TreeSlot
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.mem_cache.unified_cache.components import ComponentType
     from sglang.srt.mem_cache.unified_cache.components.base import (
@@ -58,14 +59,14 @@ class CacheInitParams:
     # paged SWA pool only a draft uses), so it must not gate prefix matching.
     swa_gates_prefix_match: bool = True
     decoder_swa_bounded_replay: bool = False
-    # Tokens back from the committed length that a fused draft reads in the
-    # swa sub-pool (BaseSpecWorker.draft_swa_window); 0 when it reads none.
-    draft_swa_window: int = 0
+    # Additional reader reaches keyed by actual storage band, not attention role.
+    draft_window_reaches: Optional[dict[str, int]] = None
 
-    tree_components: Optional[tuple[ComponentType, ...]] = None
-    component_registry_override: Optional[dict[ComponentType, type[TreeComponent]]] = (
-        None
-    )
+    # The prefix tree's slots in drive order; the KV storage supplies them.
+    tree_slots: Optional[tuple[TreeSlot, ...]] = None
+    # A family's component class where it is not the default one (a hardware
+    # backend's state, a block sidecar).
+    component_registry_override: Optional[dict[str, type[TreeComponent]]] = None
     tree_core_backend: Optional[str] = dataclasses.field(default=None, kw_only=True)
 
     mtp_draft_device_pools: tuple[object, ...] = ()
@@ -74,10 +75,21 @@ class CacheInitParams:
     mtp_draft_mamba_pools: tuple[object, ...] = ()
 
     @property
+    def tree_components(self) -> Optional[tuple[ComponentType, ...]]:
+        """The tree slots' ids, in drive order."""
+        if self.tree_slots is None:
+            return None
+        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+
+        return tuple(ComponentType[slot.component] for slot in self.tree_slots)
+
+    @property
     def swa_retain_window(self) -> Optional[int]:
         # Cache history required by every reader of the SWA sub-pool. Retention,
         # tree locks, prefix matching and host transfers must use the same span.
         # The model's attention window remains sliding_window_size.
         if self.sliding_window_size is None:
             return None
-        return max(self.sliding_window_size, self.draft_swa_window)
+        return max(
+            self.sliding_window_size, (self.draft_window_reaches or {}).get("swa", 0)
+        )
