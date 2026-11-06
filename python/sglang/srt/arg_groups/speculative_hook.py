@@ -297,7 +297,7 @@ def _customized_draft_moe_spec(server_args: ServerArgs):
         is_customized_draft_config,
         parse_dflash_draft_config,
     )
-    from sglang.srt.utils.hf_transformers import get_config
+    from sglang.srt.hf_transformers import get_config
 
     cfg = resolving_view(server_args)
     if cfg.speculative_draft_model_path is None:
