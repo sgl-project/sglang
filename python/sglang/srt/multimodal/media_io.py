@@ -24,7 +24,7 @@ import time
 from dataclasses import dataclass
 from functools import lru_cache
 from io import BytesIO
-from typing import Dict, Optional, Sequence, Union
+from typing import Callable, Dict, Optional, Sequence, Union
 from urllib.parse import unquote, urljoin, urlparse
 
 import numpy as np
@@ -111,6 +111,34 @@ def configure_media_url_security(
     _allowed_media_domains = frozenset(normalized_domains)
     _media_url_max_file_size_bytes = max_file_size_mb * 1024 * 1024
     return normalized_domains
+
+
+def media_url_max_file_size_bytes() -> int:
+    """Configured byte limit for client-supplied media; 0 means unlimited."""
+    return _media_url_max_file_size_bytes
+
+
+MediaUrlResolver = Callable[[str], bytes]
+_media_url_resolvers: dict[str, MediaUrlResolver] = {}
+
+
+def register_media_url_resolver(scheme: str, resolver: MediaUrlResolver) -> None:
+    """Fetch ``<scheme>://`` media URLs with ``resolver``.
+
+    Lets a deployment plug in object stores the loaders don't know about
+    (``s3://``, ``gs://``, ...). Unregistered schemes keep the historical
+    behavior of being decoded as bare base64.
+    """
+    _media_url_resolvers[scheme.lower()] = resolver
+
+
+def resolve_media_url(url: str) -> Optional[bytes]:
+    """Bytes from the resolver registered for ``url``'s scheme, or None."""
+    scheme, separator, _ = url.partition("://")
+    if not separator:
+        return None
+    resolver = _media_url_resolvers.get(scheme.lower())
+    return None if resolver is None else resolver(url)
 
 
 def _assert_media_url_allowed(url: str) -> None:
@@ -247,6 +275,10 @@ def load_audio(
         source = download_remote_media(audio_file, timeout=timeout)
     elif isinstance(audio_file, str) and audio_file.startswith("file://"):
         source = unquote(urlparse(audio_file).path)
+    elif isinstance(audio_file, str) and (
+        (resolved := resolve_media_url(audio_file)) is not None
+    ):
+        source = resolved
     elif isinstance(audio_file, str):
         source = audio_file
     else:
@@ -523,6 +555,9 @@ def get_image_bytes(image_file: Union[str, bytes]) -> bytes:
         _, encoded = image_file.split(",", 1)
         return pybase64.b64decode(encoded, validate=True)
     if isinstance(image_file, str):
+        resolved = resolve_media_url(image_file)
+        if resolved is not None:
+            return resolved
         return pybase64.b64decode(image_file, validate=True)
     raise NotImplementedError(f"Invalid image: {image_file}")
 
@@ -547,7 +582,9 @@ def _normalize_video_input(
             return pybase64.b64decode(encoded, validate=True)
         elif video_file.startswith("file://"):
             return unquote(urlparse(video_file).path)
-        elif os.path.isfile(unquote(urlparse(video_file).path)):
+        elif (resolved := resolve_media_url(video_file)) is not None:
+            return resolved
+        elif "://" not in video_file and os.path.isfile(unquote(video_file)):
             return video_file
         else:
             return pybase64.b64decode(video_file, validate=True)

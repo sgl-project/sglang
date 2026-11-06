@@ -40,6 +40,7 @@ from sglang.srt.multimodal.inkling import (
 from sglang.srt.multimodal.media_io import (
     CLIENT_MEDIA_EXCEPTIONS,
     download_remote_media,
+    resolve_media_url,
 )
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import (
@@ -66,8 +67,9 @@ def _resolve_media_item(item):
 
     The OpenAI chat path hands ImageData/AudioData objects or data:/http(s) URLs; the
     /generate path hands raw bytes or local file paths. Resolve URLs to bytes here
-    (data: base64 -> exact original bytes; http(s) -> download) and pass bytes / file
-    paths / PIL through unchanged for the per-modality byte loader to handle.
+    (data: base64 -> exact original bytes; http(s) and registered schemes -> download)
+    and pass bytes / file paths / PIL through unchanged for the per-modality byte
+    loader to handle.
     """
     url = None
     if isinstance(item, str):
@@ -88,6 +90,9 @@ def _resolve_media_item(item):
             )
         if url.startswith(("http://", "https://")):
             return download_remote_media(url, timeout=30)
+        resolved = resolve_media_url(url)
+        if resolved is not None:
+            return resolved
     except CLIENT_MEDIA_EXCEPTIONS as e:
         url_str = url
         if len(url_str) > 100:
