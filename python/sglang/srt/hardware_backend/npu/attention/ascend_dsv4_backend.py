@@ -1312,16 +1312,27 @@ class DeepseekV4AscendAttnBackend(
             (max_bs, max_pages), -1, dtype=torch.int32, device=device
         )
 
-        # 1024 int32 per kernel-metadata buffer (fixed op metadata size)
-        for key in (
-            "kernel_metadata_c1a",
-            "kernel_metadata_c4a",
-            "kernel_metadata_c128a",
-            "kernel_metadata_li_quant",
-        ):
-            self.graph_metadata[key] = torch.zeros(
-                1024, dtype=torch.int32, device=device
-            )
+        # Opaque metadata sizes belong to the selected kernel implementation.
+        # Query each API before capture instead of assuming a shared SDK ABI.
+        kernel_metadata = self._kernel_metadata_from_parts(
+            bs=max_bs,
+            actual_seq_lengths_q_pa=torch.arange(
+                max_bs + 1, dtype=torch.int32, device=device
+            ),
+            # Keep compressed KV lengths positive for both c4 and c128 probes.
+            actual_seq_lengths_kv=torch.full(
+                (max_bs,), 128, dtype=torch.int32, device=device
+            ),
+            forward_metadata=SimpleNamespace(
+                ori_sparse_indices=None,
+                ori_mask_mode=4,
+                ori_win_left=self._dsv4_sliding_window_size - 1,
+                ori_win_right=0,
+            ),
+        )
+        for key, value in kernel_metadata.items():
+            graph_key = "kernel_metadata_" + key.removesuffix("_metadata")
+            self.graph_metadata[graph_key] = torch.zeros_like(value, device=device)
 
         self.graph_metadata["c4_topk_indices"] = torch.full(
             (max_num_tokens, self._dsv4_index_topk),
@@ -1468,10 +1479,14 @@ class DeepseekV4AscendAttnBackend(
         metadata.seqused = torch.zeros(bs, dtype=torch.int32, device=device)
 
         metadata.kernel_metadata = {
-            "c1a_metadata": self.graph_metadata["kernel_metadata_c1a"],
-            "c4a_metadata": self.graph_metadata["kernel_metadata_c4a"],
-            "c128a_metadata": self.graph_metadata["kernel_metadata_c128a"],
-            "li_quant_metadata": self.graph_metadata["kernel_metadata_li_quant"],
+            key: self.graph_metadata[graph_key]
+            for key, graph_key, enabled in (
+                ("c1a_metadata", "kernel_metadata_c1a", True),
+                ("c4a_metadata", "kernel_metadata_c4a", self._dsv4_has_c4),
+                ("c128a_metadata", "kernel_metadata_c128a", self._dsv4_has_c128),
+                ("li_quant_metadata", "kernel_metadata_li_quant", self._dsv4_has_c4),
+            )
+            if enabled
         }
 
         T = n_tok
@@ -1491,9 +1506,7 @@ class DeepseekV4AscendAttnBackend(
             metadata.ori_mask_mode = 0
             # Match eager metadata: preserve the logical window until the
             # kernel adapter selects the released or legacy operator ABI.
-            metadata.ori_win_left = (
-                self._dsv4_sliding_window_size + tokens_per_req - 1
-            )
+            metadata.ori_win_left = self._dsv4_sliding_window_size + tokens_per_req - 1
             metadata.ori_win_right = 0
 
         self.graph_metadata[metadata_key] = metadata
@@ -2195,8 +2208,9 @@ class DeepseekV4AscendAttnBackend(
         bs: int,
         actual_seq_lengths_q_pa: torch.Tensor,
         actual_seq_lengths_kv: torch.Tensor,
+        forward_metadata: Optional[ForwardMetadata] = None,
     ) -> dict:
-        fm = self.forward_metadata
+        fm = self.forward_metadata if forward_metadata is None else forward_metadata
         common = {
             **_sparse_attn_kv_quant_kwargs(),
             "cu_seqlens_q": actual_seq_lengths_q_pa,
