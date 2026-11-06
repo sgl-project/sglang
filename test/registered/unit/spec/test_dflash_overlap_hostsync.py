@@ -1,7 +1,7 @@
 """Unit tests for the DFlash spec-v2 host-sync removal: compact-rebuild
 kernel bit-exactness, vocab-parallel draft sampler select, host seq-lens
 upper bound, hybrid needs_cpu_seq_lens delegation, filter_batch host
-keep-list."""
+keep-list, host-bounded sliding-window buffer."""
 
 import unittest
 from types import SimpleNamespace
@@ -270,6 +270,73 @@ class TestHybridNeedsCpuSeqLens(CustomTestCase):
         self.assertFalse(
             self._make(False, False, spec_mode="prefill").needs_cpu_seq_lens
         )
+
+
+class _FakeWindowRunnerIds:
+    """CPU stand-in for RunnerIds: gathers each row's window from req_to_token
+    into its indptr slot, optionally leaving the ids for the caller to map."""
+
+    is_translating = False
+    window_kv_kind = None
+
+    def __init__(self, req_to_token, translated=True):
+        self.req_to_token = req_to_token
+        self.translated = translated
+
+    def pack_read_stream(
+        self, plan, *, req_pool_indices, seq_lens, indptr, out, kv_start_idx, **_
+    ):
+        for i in range(seq_lens.numel()):
+            s, n, k = int(indptr[i]), int(seq_lens[i]), int(kv_start_idx[i])
+            out[s : s + n] = self.req_to_token[int(req_pool_indices[i]), k : k + n]
+        return self.translated
+
+    def space(self, kind):
+        return None if self.translated else object()
+
+    def ids_in(self, kind, ids):
+        return ids + 100000
+
+
+class TestSlidingWindowBufferHostBound(CustomTestCase):
+    def _run(self, runner_ids, seq_lens, window, max_window_tokens):
+        from sglang.srt.layers.attention.triton_backend import (
+            update_sliding_window_buffer,
+        )
+
+        bs = seq_lens.numel()
+        return update_sliding_window_buffer(
+            torch.zeros(bs + 1, dtype=torch.int32),
+            runner_ids,
+            None,
+            torch.arange(bs),
+            window,
+            seq_lens,
+            bs,
+            torch.device("cpu"),
+            None,
+            max_window_tokens=max_window_tokens,
+        )
+
+    def test_bound_matches_exact_size(self):
+        window = 64
+        seq_lens = torch.tensor([1, 63, 64, 65, 300], dtype=torch.int32)
+        req_to_token = torch.arange(5 * 512, dtype=torch.int64).view(5, 512)
+        for translated in (True, False):
+            runner_ids = _FakeWindowRunnerIds(req_to_token, translated)
+            ref = self._run(runner_ids, seq_lens, window, None)
+            out = self._run(runner_ids, seq_lens, window, 5 * window)
+            n = int(ref[0][-1])
+            self.assertEqual(ref[1].numel(), n)
+            self.assertEqual(out[1].numel(), 5 * window)
+            for a, b in zip((ref[0], *ref[2:]), (out[0], *out[2:])):
+                torch.testing.assert_close(a, b)
+            torch.testing.assert_close(out[1][:n], ref[1])
+
+    def test_empty_batch_bound_is_nonzero(self):
+        runner_ids = _FakeWindowRunnerIds(torch.zeros(1, 8, dtype=torch.int64))
+        out = self._run(runner_ids, torch.zeros(0, dtype=torch.int32), 64, 0)
+        self.assertEqual(out[1].numel(), 1)
 
 
 class TestFilterBatchHostIndices(CustomTestCase):
