@@ -1100,7 +1100,8 @@ sgl-eval run aime25 \\
     // ====================================================================
     // AMD MI300X / MI325X / MI355X (ROCm) — TP8, DSA tilelang backend.
     // MTP: the MI355X FP8 low-latency cell serves EAGLE 3-1-4, as the MDX
-    // agentic recipe (section 3.6) does; the other AMD cells serve without MTP.
+    // recipe "MI355X FP8 deployment with the AMD monokernel" does; the other
+    // AMD cells serve without MTP.
     // The Speculative card offers its presets on the MI355X FP8 cells only, and
     // not 5-1-6 at high throughput (startup OOM).
     // Strategies differ only by batch-shaping levers
