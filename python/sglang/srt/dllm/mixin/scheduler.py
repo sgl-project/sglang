@@ -34,11 +34,11 @@ class SchedulerDllmMixin:
         )
         self.dllm_manager = DllmManager(
             dllm_config=self.dllm_config,
-            release_aborted=self._release_aborted_dllm_req,
+            abort=self._abort_dllm_req,
         )
 
-    def _release_aborted_dllm_req(self: Scheduler, req: Req) -> None:
-        self.request_retirer.abort_queued(req)
+    def _abort_dllm_req(self: Scheduler, req: Req) -> None:
+        self.request_retirer.abort(req)
         logger.debug(f"Abort dLLM queued request. {req.rid=}")
 
     def validate_dllm_request(self: Scheduler, req: Req) -> Optional[str]:
@@ -203,7 +203,7 @@ class SchedulerDllmMixin:
             req.finish_outside_step(FINISH_LENGTH(length=len(req.output_ids)))
 
         if req.finished():
-            self.request_retirer.release_finished(
+            self.request_retirer.release(
                 req,
                 checkpoint=not self.dllm_config.requires_separate_context_encoding,
             )
@@ -290,6 +290,7 @@ class SchedulerDllmMixin:
             self.priority_scheduling_preemption_threshold,
             prefill_max_requests=get_schedule().prefill_max_requests,
             dllm_config=self.dllm_config,
+            request_retirer=self.request_retirer,
         )
 
     def _process_dllm_batches(
@@ -455,7 +456,7 @@ class DllmManager:
     def __init__(
         self,
         dllm_config: Optional[DllmConfig],
-        release_aborted: Callable[[Req], None],
+        abort: Callable[[Req], None],
     ):
         self.dllm_config = dllm_config
         self.max_running_reqs = (
@@ -464,7 +465,7 @@ class DllmManager:
         self.waiting_queue = IndexedReqList(ListKind.DLLM, abort=self._abort)
         # A subset of the waiting queue.
         self.staging_queue: List[Req] = []
-        self._release_aborted = release_aborted
+        self._abort_one = abort
 
     def get_prefill_requests(self) -> List[Req]:
         """Get all prefill requests from waiting queue."""
@@ -516,7 +517,7 @@ class DllmManager:
         aborted = set(aborted_reqs)
         self.staging_queue = [req for req in self.staging_queue if req not in aborted]
         for req in aborted_reqs:
-            self._release_aborted(req)
+            self._abort_one(req)
 
     def init_next_round(self) -> None:
         """Initialize staging requests for next round and clear staging queue."""
