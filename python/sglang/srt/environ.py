@@ -2361,6 +2361,13 @@ class Envs:
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MAX_SEQLEN = EnvInt(6144)
 
     # ===================================================================
+    # ERNIE 5.5
+    # ===================================================================
+    # Fusions not bit-exact with the eager ops: the input RMSNorm into mhc_pre,
+    # and the VHA postmix into the wo_a fp8 quant.
+    SGLANG_OPT_ERNIE5_5_FUSE_INEXACT = EnvBool(True)
+
+    # ===================================================================
     # Symmetric memory
     # ===================================================================
     SGLANG_SYMM_MEM_PREALLOC_GB_SIZE = EnvInt(-1)

@@ -2939,6 +2939,16 @@ class MQALayer(MqaAttentionBase):
                     **({} if inv_rope is None else {"inv_rope": inv_rope}),
                 )
             o = o[:, tp_slice, :]
+        o = self._project_wo_a(
+            o,
+            positions=positions,
+            forward_batch=forward_batch,
+            inv_rope=inv_rope,
+            wo_a_quant_freqs=wo_a_quant_freqs,
+        )
+        return self._project_wo_b(o, defer_all_reduce)
+
+    def _project_wo_a(self, o, *, positions, forward_batch, inv_rope, wo_a_quant_freqs):
         if wo_a_quant_freqs is not None:
             # the decode already returned the wo_a mxfp8 (codes, scales)
             G = self.n_local_groups
@@ -3111,7 +3121,7 @@ class MQALayer(MqaAttentionBase):
                         self.o_lora_rank,
                     )
 
-        return self._project_wo_b(o, defer_all_reduce)
+        return o
 
     def _project_wo_b(self, o, defer_all_reduce: bool = False):
         from sglang.srt.layers.moe.utils import should_skip_mlp_all_reduce

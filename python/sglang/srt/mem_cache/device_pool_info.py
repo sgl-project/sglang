@@ -67,6 +67,8 @@ class MambaStateBufferInfo(msgspec.Struct, frozen=True, kw_only=True):
 class IndexKeyLayout(Enum):
     # Each buffer row is one page, [P x 128 fp8 keys][P x fp32 scales].
     PAGED_FP8_KEYS_WITH_SCALES = "paged_fp8_keys_with_scales"
+    # Each buffer row is one page, [P x 64 packed e2m1 keys][P x 4 ue8m0 scales].
+    PAGED_FP4_KEYS_WITH_SCALES = "paged_fp4_keys_with_scales"
     # Each buffer row is one key, [num_keys, head_num, head_dim] in the buffer dtype.
     KEY_ROWS = "key_rows"
 
@@ -76,6 +78,8 @@ class IndexKeyLayout(Enum):
             key_data_bytes = key_count * 128
             scale_bytes = key_count * 4
             return key_data_bytes + scale_bytes
+        if self is IndexKeyLayout.PAGED_FP4_KEYS_WITH_SCALES:
+            return key_count * (64 + 4)
         raise ValueError(f"unsupported index key layout {self}")
 
 
