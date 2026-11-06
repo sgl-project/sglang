@@ -35,7 +35,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=56, stage="extra-a", runner_config="1-gpu-small")
-register_amd_ci(est_time=43, stage="base-b", runner_config="1-gpu-small-mi30x")
+register_amd_ci(est_time=43, stage="extra-a", runner_config="1-gpu-small-mi30x")
 register_cpu_ci(est_time=54, suite="stage-b-test-cpu-intel")
 
 CHUNKED_PREFILL_SIZE = 256

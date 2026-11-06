@@ -152,7 +152,7 @@ jobs:
         run: python3 scripts/ci/runner_configs.py --amd-map "$AMD_ARCH" >> "$GITHUB_OUTPUT"
 
   # =============================================== extra-a (1-gpu-small) ===============================================
-  # ~1.5h of tests in total; four shards keep each well under the step timeout.
+  # ~1.9h of tests in total; four shards keep each well under the step timeout.
   extra-a-test-1-gpu-small-mi30x:
     name: ${{ format('extra-a-test-1-gpu-small-mi30x ({0}, {1}, {2})', inputs.rocm_version || 'rocm10', fromJson(needs.amd-runner-map.outputs.runs_on_map)['1-gpu-small-mi30x'], matrix.part) }}
     needs: [call-gate, amd-runner-map]
@@ -189,7 +189,8 @@ jobs:
   # =============================================== extra-a (1-gpu-large) ===============================================
   # Single-GPU lora / spec / quant / perf model e2e tests. Runs on the same
   # 1-gpu pool as small (AMD GPUs carry enough VRAM that "large" here is a
-  # CUDA memory-tier label, not a separate AMD runner pool). ~50 min in total.
+  # CUDA memory-tier label, not a separate AMD runner pool). ~90 min in total;
+  # three shards keep each well under the step timeout.
   extra-a-test-1-gpu-large-mi30x:
     name: ${{ format('extra-a-test-1-gpu-large-mi30x ({0}, {1}, {2})', inputs.rocm_version || 'rocm10', fromJson(needs.amd-runner-map.outputs.runs_on_map)['1-gpu-large-mi30x'], matrix.part) }}
     needs: [call-gate, amd-runner-map]
@@ -197,7 +198,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [0, 1]
+        part: [0, 1, 2]
     runs-on: ${{ fromJson(needs.amd-runner-map.outputs.runs_on_map)['1-gpu-large-mi30x'] }}
     steps:
       - name: Checkout code
@@ -219,7 +220,7 @@ jobs:
       - name: Run test
         timeout-minutes: 60
         run: |
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite extra-a-test-1-gpu-large-mi30x --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 1800 ${{ inputs.continue_on_error == true && '--continue-on-error' || '' }}
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite extra-a-test-1-gpu-large-mi30x --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 --timeout-per-file 1800 ${{ inputs.continue_on_error == true && '--continue-on-error' || '' }}
 
   # =============================================== extra-a (2-gpu-large) ===============================================
   # Multi-GPU TP / PP / PD mock-model + kv_canary e2e tests and PP/MoE

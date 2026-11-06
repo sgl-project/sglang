@@ -1,7 +1,7 @@
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=179, stage="extra-a", runner_config="1-gpu-large")
-register_amd_ci(est_time=270, stage="base-b", runner_config="1-gpu-small-mi30x")
+register_amd_ci(est_time=270, stage="extra-a", runner_config="1-gpu-large-mi30x")
 """
 Usage:
 python3 -m unittest test_vision_chunked_prefill.TestVisionChunkedPrefill.test_chunked_prefill
