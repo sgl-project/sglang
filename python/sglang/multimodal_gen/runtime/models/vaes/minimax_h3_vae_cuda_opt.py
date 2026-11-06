@@ -4,10 +4,12 @@
 Installed once at VAE load and dispatched on one decode-scoped
 :class:`VaeFastPathGate`: ``quality="lossless"`` and ``"high"`` take the fast
 path (rounding-level differences), ``"exact"`` runs the original module path
-bit-for-bit. Two things read the gate:
+bit-for-bit. Three things read the gate:
 
 * every decoder attention block fuses its per-head QK RMSNorm + NeoX RoPE
   into one in-place launch and runs its attention on cuDNN SDPA;
+* the decoder transformer blocks fuse each scaled residual add into the next
+  RMSNorm (vae_vit.py);
 * the tiled decode runs several equal-shaped tiles and temporal windows per
   decoder forward, with the caps the VAE config carries (klvae.py).
 
@@ -189,6 +191,8 @@ def maybe_optimize_minimax_h3_vae(vae: nn.Module) -> nn.Module:
         gate = VaeFastPathGate()
         vae._sgl_gate = gate
     register_vae_fast_path_gate(vae, gate)
+    if isinstance(vae.decoder, ViT3DDecoder):
+        vae.decoder._sgl_gate = gate
     attention_modules = _fast_attention_modules(vae.decoder)
     _install_fast_attention(attention_modules, gate)
     logger.info(

@@ -33,13 +33,21 @@ from sglang.srt.layers.attention.local_attention import (
     LocalAttentionMetadataBuilder,
 )
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
-from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
-from sglang.srt.layers.cp.utils import is_cp_active
+from sglang.srt.layers.cp.base import (
+    CPAttentionBackendKind,
+    get_cp_strategy,
+    is_cp_sharded_padded,
+)
+from sglang.srt.layers.cp.utils import (
+    get_cp_sharded_padded_cache_transfer_indices,
+    is_cp_active,
+)
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.layout.paged_view import paged_kv_view, paged_view
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import (
     get_exec,
     get_memory,
@@ -53,10 +61,9 @@ from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyLayout,
     build_ragged_target_verify_geometry,
 )
-from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
-from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
+from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import get_compiler_backend
-from sglang.srt.utils.common import get_device_capability
+from sglang.srt.utils.device import get_device_capability
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
@@ -226,14 +233,8 @@ class FlashAttentionBackend(AttentionBackend):
             self.speculative_num_draft_tokens is not None
             and model_runner.is_draft_worker
         ):
-            # Static verify width; NOTE: overwrites the config-named attr in place.
-            self.speculative_num_draft_tokens = resolve_num_tokens_per_req(
-                phase="target_verify",
-                spec_algorithm=SpeculativeAlgorithm.from_string(
-                    get_spec().speculative_algorithm
-                ),
-                is_draft_worker=True,
-                num_draft_tokens=int(self.speculative_num_draft_tokens),
+            self.speculative_num_draft_tokens = model_runner.decode_num_tokens_per_req(
+                num_draft_tokens=int(self.speculative_num_draft_tokens)
             )
         self.speculative_step_id = speculative_step_id
 
@@ -315,16 +316,17 @@ class FlashAttentionBackend(AttentionBackend):
         # block-schedule cache (see forward_extend rel_bias handling).
         self.full_cg_prefill_metadata = None
 
-        # In embedding mode with no chunked prefill and radix cache disabled,
-        # skip KV cache write and use flash_attn_varlen_func with raw K/V
-        # instead of flash_attn_with_kvcache, bypassing paged KV cache entirely.
+        # Keep raw-K/V prefill opt-in aligned with the flag that installs the
+        # no-op KV pool. Without it, embedding requests use paged attention.
+        # Internal auto-enables (e.g. EmbeddingGemma) also set this flag.
         # Restricted to non-MLA backends: the read-skip elif lives inside the
         # `if not self.use_mla:` branch in forward_extend, while the write-skip
         # guard wraps both set_kv_buffer and set_mla_kv_buffer. Without this
         # gate, MLA + is_embedding would skip the write but still read stale
         # cache via get_key_buffer in the absorbed-MLA path.
         self.fa_skip_kv_cache = (
-            get_model().is_embedding
+            get_schedule().prefill_only_disable_kv_cache
+            and get_model().is_embedding
             and get_schedule().chunked_prefill_size == -1
             and get_memory().disable_radix_cache
             and not self.use_mla
@@ -495,8 +497,8 @@ class FlashAttentionBackend(AttentionBackend):
                 self.speculative_num_draft_tokens,
                 self.page_size,
                 metadata.swa_page_table,
-                full_v2p=runner_ids.space(IdSpaceKind.FULL).read_v2p,
-                swa_v2p=None if swa is None else swa.read_v2p,
+                full_v2p=runner_ids.space(IdSpaceKind.FULL).read_mapping(),
+                swa_v2p=None if swa is None else swa.read_mapping(),
                 zero_tail=True,
             )
             return
@@ -832,6 +834,11 @@ class FlashAttentionBackend(AttentionBackend):
                 forward_batch.req_pool_indices[:bs, None],
                 self.full_cg_prefill_strided_indices[:max_seq_pages],
             ]
+            if is_cp_sharded_padded():
+                # Project cache rows to this rank's local rows; null rows stay.
+                page_indices = get_cp_sharded_padded_cache_transfer_indices(
+                    page_indices
+                )
             m.page_table[:, :max_seq_pages].copy_(page_indices // self.page_size)
             if self.use_sliding_window_kv_pool:
                 # SWA block table: translate the page-start full slots to their
@@ -1190,6 +1197,11 @@ class FlashAttentionBackend(AttentionBackend):
             metadata.page_table = self.req_to_token_pool.req_to_token[
                 forward_batch.req_pool_indices, : metadata.max_seq_len_k
             ]
+            if is_cp_sharded_padded():
+                # Project cache rows to this rank's local rows; null rows stay.
+                metadata.page_table = get_cp_sharded_padded_cache_transfer_indices(
+                    metadata.page_table
+                )
 
             if forward_batch.forward_mode.is_draft_extend_v2():
                 # Fixed-q window (num_draft_tokens, widened by num_front_tokens

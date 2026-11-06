@@ -594,7 +594,7 @@ sglang serve \
 ##### 5.1.1.1 Low Concurrency
 - Benchmark Command:
 ```shell Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --model MiniMaxAI/MiniMax-M2.5 \
   --dataset-name random \
@@ -646,7 +646,7 @@ Max ITL (ms):                            14.46
 ##### 5.1.1.2 Medium Concurrency
 - Benchmark Command:
 ```shell Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --model MiniMaxAI/MiniMax-M2.5 \
   --dataset-name random \
@@ -698,7 +698,7 @@ Max ITL (ms):                            483.53
 ##### 5.1.1.3 High Concurrency
 - Benchmark Command:
 ```shell Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --model MiniMaxAI/MiniMax-M2.5 \
   --dataset-name random \
@@ -762,7 +762,7 @@ sglang serve \
 ##### 5.1.2.1 Low Concurrency
 - Benchmark Command:
 ```shell Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --model MiniMaxAI/MiniMax-M2.5 \
   --dataset-name random \
@@ -814,7 +814,7 @@ Max ITL (ms):                            14.11
 ##### 5.1.2.2 Medium Concurrency
 - Benchmark Command:
 ```shell Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --model MiniMaxAI/MiniMax-M2.5 \
   --dataset-name random \
@@ -866,7 +866,7 @@ Max ITL (ms):                            1065.02
 ##### 5.1.2.3 High Concurrency
 - Benchmark Command:
 ```shell Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --model MiniMaxAI/MiniMax-M2.5 \
   --dataset-name random \
@@ -940,7 +940,7 @@ sglang serve \
 ##### 5.1.3.1 Low Concurrency
 - Benchmark Command:
 ```shell Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --model MiniMaxAI/MiniMax-M2.5 \
   --dataset-name random \
@@ -992,7 +992,7 @@ Max ITL (ms):                            10.10
 ##### 5.1.3.2 Medium Concurrency
 - Benchmark Command:
 ```shell Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --model MiniMaxAI/MiniMax-M2.5 \
   --dataset-name random \
@@ -1044,7 +1044,7 @@ Max ITL (ms):                            107.39
 ##### 5.1.3.3 High Concurrency
 - Benchmark Command:
 ```shell Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --model MiniMaxAI/MiniMax-M2.5 \
   --dataset-name random \
@@ -1197,7 +1197,7 @@ After warm-up, run the reference workload from the same container:
 
 ```bash Command
 set -o pipefail
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --dataset-name random \
   --backend sglang \
   --host 127.0.0.1 \
@@ -1310,7 +1310,7 @@ These checks establish simple chat functionality and the listed synthetic reques
 
 ### 5.5 Ascend A2 performance benchmark
 
-On September 23, 2026, the official `python -m sglang.bench_serving` tool completed **10 runs and 76 measured requests** on the same 8 × 910B4 allocation and runtime recorded in section 5.4. All requests succeeded, with the planned input lengths and exactly 128 output tokens each. Warm-up requests are excluded from the 76 measured requests.
+On September 23, 2026, the official `python -m sglang.benchmark.serving` tool completed **10 runs and 76 measured requests** on the same 8 × 910B4 allocation and runtime recorded in section 5.4. All requests succeeded, with the planned input lengths and exactly 128 output tokens each. Warm-up requests are excluded from the 76 measured requests.
 
 This benchmark used a separate server configuration: `--mem-fraction-static 0.97`, `--max-total-tokens 16384`, `--context-length 8192`, and `--max-running-requests 8`. The interactive selector retains the single-request configuration from section 5.4. The benchmark launch command was:
 
@@ -1410,7 +1410,7 @@ for length, concurrency, count, seed in cases:
     if result.exists():
         raise RuntimeError(f"Refusing to overwrite {result}")
     command = [
-        sys.executable, "-m", "sglang.bench_serving", "--backend", "sglang",
+        sys.executable, "-m", "sglang.benchmark.serving", "--backend", "sglang",
         "--base-url", "http://127.0.0.1:31216", "--model", model, "--tokenizer", tokenizer,
         "--dataset-name", "random", "--dataset-path", str(dataset),
         "--random-input-len", str(length), "--random-output-len", "128",
@@ -1438,7 +1438,7 @@ Retain failed runs and missing-run records when reporting a reproduction; do not
 
 ### 5.6 Ascend A2 reference-length performance
 
-On September 24, 2026, the same A2 hardware and runtime completed three official `sglang.bench_serving` runs with **3500 input tokens and 1500 output tokens**, using seeds **1, 17, and 29**. Each run measured two requests at client concurrency 2. All **6/6 measured requests** completed with the exact planned token lengths and no request errors: 21000 input tokens and 9000 output tokens in total. Each run's one-request, 32-output-token warm-up is excluded from these counts.
+On September 24, 2026, the same A2 hardware and runtime completed three official `sglang.benchmark.serving` runs with **3500 input tokens and 1500 output tokens**, using seeds **1, 17, and 29**. Each run measured two requests at client concurrency 2. All **6/6 measured requests** completed with the exact planned token lengths and no request errors: 21000 input tokens and 9000 output tokens in total. Each run's one-request, 32-output-token warm-up is excluded from these counts.
 
 The server used the section 5.5 launch command with `--context-length 9216` instead of 8192. Its other settings remained TP8, ModelSlim, BF16, memory fraction 0.97, KV limit 16384, maximum running requests 8, prefill chunk 128, maximum prefill tokens 4096, and graph capture and radix cache disabled. **Client concurrency 2 did not change the server's maximum of 8.** No draft model was used; the interactive selector's conservative default is unchanged.
 
@@ -1462,7 +1462,7 @@ mkdir -p minimax-a2-reference-perf
 for SEED in 1 17 29; do
   RESULT="minimax-a2-reference-perf/in3500-out1500-c2-n2-seed${SEED}.jsonl"
   test ! -e "$RESULT"
-  python -m sglang.bench_serving \
+  python -m sglang.benchmark.serving \
     --backend sglang --base-url http://127.0.0.1:31216 \
     --model /workspace/issue1215/model \
     --tokenizer /workspace/issue1215/metadata \

@@ -26,7 +26,7 @@ import functools
 import threading
 import warnings
 from contextvars import ContextVar
-from typing import Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import torch
 
@@ -38,7 +38,12 @@ except ImportError:
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.cuda_utils import (
     checkCudaErrors,
 )
-from sglang.srt.utils import get_device_module, is_hip, is_xpu
+from sglang.srt.utils import get_device_module, is_hip, is_musa, is_xpu
+
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.runner_backend_utils.hicache_graph_events import (
+        HiCacheGraphEvents,
+    )
 
 _is_xpu = is_xpu()
 
@@ -88,11 +93,11 @@ def _capture_status(stream_ptr: int) -> "rt.cudaStreamCaptureStatus":
 
 
 def _is_stream_capturing(stream: torch.Stream) -> bool:
-    # On ROCm/HIP and XPU, cuda-python is unavailable, so use the portable torch
-    # API (which maps to the HIP / XPU runtime). On NVIDIA, keep querying the
-    # CUDA runtime directly via cuda-python: torch.cuda.is_current_stream_capturing()
-    # has proven unreliable there, so we preserve the original behavior.
-    if is_hip() or _is_xpu:
+    # On ROCm/HIP, MUSA, and XPU, cuda-python is unavailable or unnecessary, so
+    # use the portable device API. On NVIDIA, keep querying the CUDA runtime
+    # directly via cuda-python because torch.cuda.is_current_stream_capturing()
+    # has proven unreliable there.
+    if is_hip() or is_musa() or _is_xpu:
         with get_device_module().stream(stream):
             return get_device_module().is_current_stream_capturing()
     return (
@@ -328,15 +333,26 @@ class BreakableCUDAGraph:
     """Container holding one torch.cuda.CUDAGraph per segment plus an
     eager break function between consecutive segments."""
 
-    def __init__(self, deduped_cuda_graph=None) -> None:
+    def __init__(
+        self,
+        deduped_cuda_graph=None,
+        *,
+        hicache_graph_events: "HiCacheGraphEvents | None" = None,
+    ) -> None:
         self._segments: list[Any] = []
         self._break_fns: list[Callable[[], Any]] = []
         self._deduped_cuda_graph = deduped_cuda_graph
+        self._hicache_graph_events = hicache_graph_events
+        self._hicache_wait_nodes = []
 
     def replay(self) -> None:
         stream = get_device_module().current_stream()
         token = _current_stream_var.set(stream)
         try:
+            if self._hicache_graph_events is not None:
+                self._hicache_graph_events.bind(
+                    self._segments, self._hicache_wait_nodes
+                )
             for i, seg in enumerate(self._segments):
                 seg.replay()
                 if i < len(self._break_fns):
@@ -351,6 +367,10 @@ class BreakableCUDAGraph:
         if needs_instantiate:
             graph.instantiate()
         self._segments.append(graph)
+        if self._hicache_graph_events is not None:
+            self._hicache_wait_nodes.append(
+                self._hicache_graph_events.find_wait_nodes(graph)
+            )
 
 
 class BreakableCUDAGraphCapture:
@@ -416,7 +436,10 @@ class BreakableCUDAGraphCapture:
         # keep_graph retains the raw graph for dedup; skip it on the plain path.
         # Dedup is CUDA-only (it introspects the raw graph via cuda-python), so
         # XPU always takes the plain path below.
-        if self.cuda_graph._deduped_cuda_graph is not None:
+        if self.cuda_graph._hicache_graph_events is not None:
+            graph = graph_cls(keep_graph=True)
+            self._current_graph_needs_instantiate = True
+        elif self.cuda_graph._deduped_cuda_graph is not None:
             try:
                 graph = graph_cls(keep_graph=True)
                 self._current_graph_needs_instantiate = True

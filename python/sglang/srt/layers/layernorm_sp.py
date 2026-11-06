@@ -80,7 +80,7 @@ def runs_sp(forward_mode) -> bool:
     ``get_forward().sp_active``: Python writes made inside that region do not
     re-execute on graph replay, so the flag is stale there.
     """
-    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.model_executor.forward_mode import ForwardMode
 
     return layernorm_sp_enabled() and forward_mode == ForwardMode.EXTEND
 

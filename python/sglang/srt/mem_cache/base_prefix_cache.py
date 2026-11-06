@@ -18,6 +18,8 @@ from typing import (
 
 import torch
 
+from sglang.srt.layers.cp.base import is_cp_sharded_padded
+from sglang.srt.layers.cp.utils import from_cp_sharded
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.events import KVCacheEventRecorder
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -58,6 +60,7 @@ class PrefixCacheTrait(Protocol):
     req_to_token_pool: ReqToTokenPool
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
     page_size: int
+    logical_page_size: int
     disable: bool
 
 
@@ -81,6 +84,15 @@ class InsertParams:
 
     # Mamba specific
     mamba_value: Optional[torch.Tensor] = None
+    # Host-only checkpoint: hicache host-pool index. The radix node keeps this
+    # and no GPU slot. Mutually exclusive with mamba_value.
+    mamba_host_value: Optional[torch.Tensor] = None
+    # GPU slot to copy into the host pool. Set by prepare; the copy itself
+    # waits until the insert key is known, so a leaf that already has mamba
+    # never pays the D2H.
+    mamba_host_src: Optional[torch.Tensor] = None
+    # Both mamba values stay empty and the leaf already holds the checkpoint.
+    allow_missing_mamba: bool = False
     # The ping-pong slot prepare picked; cleanup keeps that same slot.
     mamba_keep_idx: Optional[int] = None
 
@@ -158,6 +170,7 @@ class EvictParams:
     num_tokens: int = 0
     swa_num_tokens: int = 0
     mamba_num: int = 0
+    auxiliary_swa_num_tokens: int = 0
 
 
 @dataclasses.dataclass
@@ -167,6 +180,7 @@ class EvictResult:
     num_tokens_evicted: int = 0
     swa_num_tokens_evicted: int = 0
     mamba_num_evicted: int = 0
+    auxiliary_swa_num_tokens_evicted: int = 0
 
 
 @dataclasses.dataclass
@@ -219,6 +233,8 @@ class DecLockRefParams:
     A segment release requires its component's boundary entry; a missing
     entry must not be treated as a lock reaching the root. ``node_id`` is
     ``None`` only for legacy caches; the unified tree rejects such a receipt.
+    ``skipped_lock_components`` also records components released individually
+    before the remaining receipt is unlocked.
     """
 
     node_id: Optional[int] = None
@@ -320,6 +336,7 @@ class MatchResult(NamedTuple):
     # Reusable prefix length in FULL's device-value scan, before node-boundary
     # or auxiliary constraints. None means no shorter prefix was reported.
     full_device_match_len: Optional[int] = None
+    auxiliary_swa_host_hit_length: int = 0
 
 
 def zero_match_result(
@@ -336,6 +353,7 @@ def zero_match_result(
         best_match_node=root,
         host_hit_length=0,
         swa_host_hit_length=0,
+        auxiliary_swa_host_hit_length=0,
         swa_branching_seqlen=None,
         mamba_host_hit_length=0,
         full_kv_hit_length=0,
@@ -398,9 +416,8 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     storage_prefetch_retries: Optional[StoragePrefetchRetries] = None
     # Set by caches that publish KV placement events; None means they don't.
     kv_events: Optional[KVCacheEventRecorder] = None
-    # Tokens back from the committed length a fused draft reads in the swa
-    # sub-pool (CacheInitParams.draft_swa_window); 0 when it reads none.
-    draft_swa_window: int = 0
+    # Additional reader reaches keyed by actual storage band, not attention role.
+    draft_window_reaches: Optional[dict[str, int]] = None
 
     def init_metrics_collector(self):
         from sglang.srt.layers.dp_attention import is_dp_attention_enabled
@@ -430,13 +447,13 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         tens of seconds (see HostKVCache.destroy). Idempotent.
         """
 
-    def release_aborted_request(self, handle: CacheRequestHandle) -> None:
+    def _abandon_attempt(self, handle: CacheRequestHandle) -> None:
         """Release attempt state; caches without prefetch state have nothing to drop."""
 
     def finish(self, handle: CacheRequestHandle, outcome: CacheRequestOutcome) -> None:
         """Finish an attempt without cancelling successful asynchronous cache work."""
         if outcome != CacheRequestOutcome.SUCCESS:
-            self.release_aborted_request(handle)
+            self._abandon_attempt(handle)
 
     @abstractmethod
     def reset(self):
@@ -504,11 +521,12 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         row = self.req_to_token_pool.req_to_token[kv.req_pool_idx]
         # Adjacent pieces whose seam falls inside one (DCP-widened) page would
         # free that page twice; the allocator rejects that, so merge them first.
+        global_page_size = self.logical_page_size
         free_kv_row_segments(
             allocator,
             [(row[start:end], start) for start, end in coalesce_ranges(ranges)],
             swa_evicted_seqlen=kv.get_evicted_seqlen(ComponentType.SWA),
-            swa_dead_lo=kv.swa_dead_lo(allocator.page_size),
+            swa_dead_lo=kv.swa_dead_lo(global_page_size),
         )
 
     @abstractmethod
@@ -587,6 +605,9 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         return 0
 
     def swa_evictable_size(self):
+        return 0
+
+    def auxiliary_swa_evictable_size(self):
         return 0
 
     def protected_size(self):
@@ -685,7 +706,9 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         # every other SWA rule uses sliding_window_size.
         if self.sliding_window_size is None:
             return None
-        return max(self.sliding_window_size, self.draft_swa_window)
+        return max(
+            self.sliding_window_size, (self.draft_window_reaches or {}).get("swa", 0)
+        )
 
     def swa_retain_floor(self, req) -> int | None:
         # A match lands on a state checkpoint rather than on the tail, so a cache
@@ -693,6 +716,12 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         # the last checkpoint. Those caches override this. Everyone else has
         # nothing deeper than the tail to protect.
         return None
+
+    def window_retention(self, req):
+        """Running-request window components, retention lengths and prefix floors."""
+        return (
+            (ComponentType.SWA, self.swa_retain_window, self.swa_retain_floor(req)),
+        )
 
     def swa_reprefill_tail_tokens(self, req=None) -> int:
         # Caches whose matched SWA is not reusable as is override this.
@@ -707,6 +736,14 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def release_radix_session(self, session_id: str) -> None:
         pass
 
+    def retained_window_tokens(self) -> int:
+        """KV tokens held outside the prefix tree and streaming-session records"""
+        return 0
+
+    def retained_window_req_count(self) -> int:
+        """request rows retained outside streaming-session records"""
+        return 0
+
     def session_records(self) -> dict[str, ReqKvInfo]:
         """The KV records sessions own, by session id. Pool accounting counts them
         as session-held, including while a request runs on one."""
@@ -719,5 +756,7 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
     def available_and_evictable_str(self) -> str:
         available_size = self.token_to_kv_pool_allocator.available_size()
+        if is_cp_sharded_padded():
+            available_size = from_cp_sharded(available_size)
         evictable_size = self.evictable_size()
         return f"Available tokens: {available_size + evictable_size} ({available_size=} + {evictable_size=})\n"
