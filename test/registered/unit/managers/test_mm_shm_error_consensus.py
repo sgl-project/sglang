@@ -337,7 +337,7 @@ class TestShmPointerFailureCleanup(CustomTestCase):
                 patch.object(
                     handle, "unlink", side_effect=PermissionError("unlink denied")
                 ),
-                self.assertLogs("sglang.utils", level="WARNING"),
+                self.assertLogs("sglang.srt.managers.mm_utils", level="WARNING"),
             ):
                 result = pointer.materialize()
             self.assertTrue(torch.equal(result, torch.ones(1)))
