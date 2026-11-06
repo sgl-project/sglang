@@ -933,8 +933,8 @@ class ExecMoe(msgspec.Struct):
         Literal[1, 2, 3],
         "Select the Ascend FuseEP mode: 1 runs dispatch_gmm_combine_decode; "
         "2 runs dispatch_ffn_combine (supports hybrid deployment); "
-        "3 runs MegaMoE for A3 ModelSlim per-channel W4A8/W8A8 INT "
-        "with separate shared experts and no speculative decoding.",
+        "3 runs A3 MegaMoE for BF16 or ModelSlim per-channel W4A8/W8A8 INT "
+        "with SwiGLU/SiTU, separate shared experts, and no speculative decoding.",
     ] = 2
     deepep_dispatcher_output_dtype: A[
         Literal["auto", "bf16", "fp8", "int8", "nvfp4"],

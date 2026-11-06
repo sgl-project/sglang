@@ -1777,8 +1777,11 @@ def _a2a_fusion_adjustments(view: Any) -> dict:
             raise ValueError(
                 "--fuseep-mode 3 requires --device npu --moe-a2a-backend ascend_fuseep"
             )
-        if view.quantization != "modelslim":
-            raise ValueError("--fuseep-mode 3 requires --quantization modelslim")
+        if view.quantization not in (None, "modelslim"):
+            raise ValueError(
+                "--fuseep-mode 3 supports BF16 (no quantization) or "
+                "ModelSlim W4A8/W8A8 INT on A3"
+            )
         if not view.disable_shared_experts_fusion:
             raise ValueError("--fuseep-mode 3 requires --disable-shared-experts-fusion")
         if view.speculative_algorithm is not None:

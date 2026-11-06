@@ -72,14 +72,33 @@ see [Best practices](#best-practices), which may require additional cards or nod
 For the hardware specifications (memory per die and dies per card),
 see [Ascend NPU Reference — Hardware](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware).
 
-## MegaMoE on A3 with W4A8 or W8A8
+## MegaMoE on A3 with BF16 or INT experts
 
 Use `--moe-a2a-backend ascend_fuseep --fuseep-mode 3` for fused dispatch,
-expert GEMMs, ordinary SwiGLU, and combine on Atlas A3 (`Ascend910_93`).
-This path requires BF16 hidden states and homogeneous per-channel ModelSlim
-W4A8 INT or W8A8 INT routed experts. Keep shared experts separate with
-`--disable-shared-experts-fusion`. Speculative decoding and expert load balancing
-are unsupported.
+expert GEMMs, activation, and combine on Atlas A3 (`Ascend910_93`).
+The adapter uses the layer's configuration rather than a model-name allowlist.
+Compatible GLM, Kimi, and other MoE layers can use these combinations:
+
+| Expert format | Quantization setting | Activation | Expert bias |
+| --- | --- | --- | --- |
+| BF16 | No quantization flag; BF16 checkpoint | SwiGLU or SiTU | Unsupported |
+| W8A8 INT | `--quantization modelslim`, per-channel scales | SwiGLU or SiTU | Unsupported |
+| W4A8 INT | `--quantization modelslim`, per-channel scales | SwiGLU or SiTU | Loaded compensation required |
+
+Hidden states must be BF16 for every format. Ordinary SwiGLU is selected by
+`activation="silu"` or `"swiglu"`. Kimi's SiTU is selected by `"situ"` or
+`"situglu"`, with `gemm1_alpha` forwarded as `beta` (default 4.0) and
+`gemm1_clamp_limit` forwarded as `linear_beta`. A `None` clamp remains unclamped;
+the adapter does not replace it with a fixed Kimi default.
+
+Keep shared experts separate with `--disable-shared-experts-fusion`.
+Speculative decoding, expert load balancing, input-side router weighting,
+non-gated/no-combine execution, clipped SwiGLU, SwiGLU-OAI, and other activation
+contracts are rejected. FP8, MXFP and FP4 layouts are not reinterpreted as INT
+weights: the current DeepEP A3 MegaMoE path exposes BF16 and INT modes, while
+A5 MXFP formats require a separate platform/layout adapter. Groupwise INT scales,
+activation clipping, nonzero weight offsets, mixed projection formats and BF16
+expert biases are unsupported.
 
 Use matching CANN toolkit/operator packages and DeepEP exposing
 `FuseMode.MEGA_MOE` and `Buffer.fused_deep_moe(..., fuse_mode=3, activation=...,
@@ -106,7 +125,7 @@ print("DeepEP:", deep_ep.__file__)
 inspect.signature(mega_moe).bind_partial(
     activation="swiglu", activation_params=None
 )
-assert {"fuse_mode", "activation", "l1_bias", "l2_bias"} <= set(
+assert {"fuse_mode", "quant_mode", "activation", "beta", "linear_beta", "l1_bias", "l2_bias"} <= set(
     inspect.signature(deep_ep.Buffer.fused_deep_moe).parameters
 )
 print("Required Python APIs available; device validation is still required")
@@ -115,10 +134,11 @@ PY_CHECK
 
 SGLang neither patches dependency sources nor replaces DeepEP strategy methods.
 
-W4A8 requires loaded checkpoint compensation for both expert projections.
-Groupwise scales, activation clipping, nonzero weight offsets, and mixed W13/W2
-quantization are rejected. W8A8 uses INT8 weights without expert bias.
-The following eager recipe uses one A3 node with 16 dies and MoE EP16/TP1:
+The following eager recipe uses a compatible ModelSlim INT checkpoint on one
+A3 node with 16 dies and MoE EP16/TP1. For BF16 experts, use an unquantized BF16
+checkpoint and omit `--quantization modelslim`; do not reinterpret packed INT
+checkpoint weights as BF16. Model activation settings are read from its MoE
+configuration, including Kimi's SiTU parameters.
 
 ```bash
 export MODEL_PATH=/path/to/GLM-5.2-modelslim-int
@@ -139,7 +159,10 @@ python3 -m sglang.launch_server \
 ```
 
 This is a validation recipe, not a measured performance recommendation. Select
-a compatible full-weight W4A8 or W8A8 checkpoint. The dispatch capacity must be
+a compatible full-weight BF16, W4A8 INT or W8A8 INT checkpoint. A3 expert
+intermediate dimensions up to 3584 are accepted with the existing 512 alignment;
+remaining geometry and platform constraints are checked before conversion or by
+CANN. The dispatch capacity must be
 identical across ranks and within `[1, 4096]`; it bounds each rank's input rows,
 including prefill. The scheduler chunk is global, so verify logged rank-local
 rows before increasing either limit. Older native operators size workspace from
@@ -169,8 +192,9 @@ correctness. For a TP baseline, replace the FuseEP flags and `--ep-size 16` with
 shared-expert setting, and workload identical, and record the MoE topology change.
 Check prefill/decode accuracy before enabling graphs, then validate capture and
 repeated changing-shape replay separately. Record resolved arguments, runtime
-identity, TTFT, TPOT, and peak memory. Target-A3 acceptance of this adaptation
-remains pending.
+identity, TTFT, TPOT, and peak memory. Target-A3 acceptance of the BF16/INT and
+SwiGLU/SiTU combinations remains pending; host matrix tests do not establish
+full-model quality.
 
 ## Installation
 

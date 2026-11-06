@@ -978,6 +978,13 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
     def process_weights_after_loading(
         self, layer: torch.nn.Module, weight_prefix: str
     ) -> None:
+        from sglang.srt.runtime_context import get_exec
+
+        if get_exec().moe.fuseep_mode == 3 and self.maybe_process_fuseep_weights(layer):
+            if weight_prefix == "w13":
+                self._set_moe_dispatch_dtype(layer, "bf16")
+            return
+
         self._validate_weight_prefix(layer, weight_prefix)
 
         weight: torch.Tensor = getattr(layer, f"{weight_prefix}_weight")
