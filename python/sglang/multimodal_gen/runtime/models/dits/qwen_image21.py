@@ -10,6 +10,7 @@ from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
     can_use_fused_layernorm_modulate,
     can_use_qknorm_complex_rope_cuda,
+    can_use_xpu_layernorm_modulate,
     fused_complex_rope,
     fused_layernorm_modulate,
     fused_packed_silu_mul_bitexact,
@@ -19,6 +20,7 @@ from sglang.kernels.ops.diffusion import (
     residual_gate_add,
     residual_gate_add_sum2,
     tensors_equal,
+    xpu_layernorm_modulate,
 )
 from sglang.kernels.ops.diffusion.rope.qknorm_complex_rope_kv_triton import (
     qknorm_complex_rope_kv,
@@ -74,6 +76,9 @@ _is_cuda = current_platform.is_cuda()
 logger = init_logger(__name__)
 _ROPE_FUSION = BitExactFusionGate("Qwen-Image 2.1 complex RoPE")
 _SILU_MUL_FUSION = BitExactFusionGate("Qwen-Image 2.1 SiLU-mul")
+_XPU_MODULATION_FUSION = BitExactFusionGate(
+    "Qwen-Image 2.1 XPU LayerNorm modulation", per_signature=True
+)
 _QK_ROPE_FUSION = BitExactFusionGate("Qwen-Image 2.1 Q/K RMSNorm + complex RoPE")
 _KV_ROPE_FUSION = BitExactFusionGate("Qwen-Image 2.1 K RMSNorm + RoPE + KV packing")
 _QK_ROPE_CUDA_FUSION = BitExactFusionGate(
@@ -274,8 +279,20 @@ def apply_modulation(x, norm, scale):
             lambda: norm(x) * (1 + scale),
             logger=logger,
         )
+    elif x.is_xpu and can_use_xpu_layernorm_modulate(x.dtype, x.shape[-1]):
+        sig = (x.device, x.dtype, x.shape, x.stride(), scale.stride(), norm.eps)
+        if torch.compiler.is_compiling() or (
+            not _XPU_MODULATION_FUSION.is_verified(sig)
+            and torch.xpu.is_current_stream_capturing()
+        ):
+            return norm(x) * (1 + scale)
+        return _XPU_MODULATION_FUSION.run(
+            lambda: xpu_layernorm_modulate(x, scale.squeeze(1), None, norm.eps),
+            lambda: norm(x) * (1 + scale),
+            sig=sig,
+            logger=logger,
+        )
     return norm(x) * (1 + scale)
-
 
 class QwenImage21ZeroCenterRMSNorm(nn.Module):
     def __init__(self, dim, eps):
