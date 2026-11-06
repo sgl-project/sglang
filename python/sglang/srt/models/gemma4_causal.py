@@ -79,6 +79,7 @@ from sglang.srt.models.utils import (
 from sglang.srt.runtime_context import (
     get_exec,
     get_forward,
+    get_lora,
     get_parallel,
     get_server_args,
 )
@@ -956,6 +957,33 @@ class Gemma4TextModel(PreTrainedModel):
         self._ar_fusion = self._maybe_init_ar_fusion(config)
         self.post_init()
 
+    # Block-FP8 linears that take the fused site's pre-quantized (fp8, scales)
+    # input (see compressed_tensors_w8a8_fp8.apply_weights).
+    _AR_FUSION_LINEARS = (
+        "deepgemm_w8a8_block_fp8_linear_with_fallback",
+        "triton_w8a8_block_fp8_linear",
+    )
+
+    @classmethod
+    def _ar_fusion_linear_reason(cls, layers) -> Optional[str]:
+        """Why a layer's qkv_proj or gate_up_proj cannot take the fused site's
+        output, or None when every consumer in ``layers`` can."""
+        for i, layer in enumerate(layers):
+            for name, proj in (
+                ("qkv_proj", layer.self_attn.qkv_proj),
+                ("gate_up_proj", layer.mlp.gate_up_proj),
+            ):
+                linear = getattr(
+                    getattr(proj, "scheme", None), "w8a8_block_fp8_linear", None
+                )
+                linear_name = getattr(getattr(linear, "func", linear), "__name__", "")
+                if linear_name not in cls._AR_FUSION_LINEARS:
+                    return (
+                        f"layer {i} {name}: block-FP8 linear "
+                        f"{linear_name or 'missing'} takes no pre-quantized input"
+                    )
+        return None
+
     def _maybe_init_ar_fusion(
         self, config
     ) -> Optional["gemma4_ar_fusion.Gemma4ArFusion"]:
@@ -963,28 +991,20 @@ class Gemma4TextModel(PreTrainedModel):
         when requested and this model fits them."""
         if not gemma4_ar_fusion.requested():
             return None
-        layer = self.layers[self.start_layer]
-        linear = getattr(
-            getattr(layer.self_attn.qkv_proj, "scheme", None),
-            "w8a8_block_fp8_linear",
-            None,
-        )
-        linear_name = getattr(getattr(linear, "func", linear), "__name__", "")
+        layers = self.layers[self.start_layer : self.end_layer]
+        dtype = layers[0].input_layernorm.weight.dtype
+        linear_reason = self._ar_fusion_linear_reason(layers)
         reasons = [
             why
             for bad, why in (
                 (self.pp_group.world_size != 1, "pipeline parallel"),
                 (self.hidden_size_per_layer_input > 0, "per-layer embeddings"),
                 (Gemma4DecoderLayer._enable_moe_block(config), "MoE block"),
-                (
-                    linear_name
-                    not in (
-                        "deepgemm_w8a8_block_fp8_linear_with_fallback",
-                        "triton_w8a8_block_fp8_linear",
-                    ),
-                    f"block-FP8 linear {linear_name or 'missing'} takes no "
-                    "pre-quantized input",
-                ),
+                # the kernel reads bf16 residual rows and norm weights
+                (dtype != torch.bfloat16, f"dtype {dtype} (needs bfloat16)"),
+                # the adapter GEMMs take a bf16 tensor, not (fp8, scales)
+                (get_lora().enable_lora, "LoRA"),
+                (linear_reason is not None, linear_reason),
             )
             if bad
         ]
