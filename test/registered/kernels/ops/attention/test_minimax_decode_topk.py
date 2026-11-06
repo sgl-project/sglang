@@ -17,7 +17,7 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
-register_amd_ci(est_time=15, suite="nightly-amd-kernel-1-gpu", nightly=True)
+register_amd_ci(est_time=15, stage="jit-kernel-unit", runner_config="amd")
 
 
 def _ref(score, seq_lens, block_size, topk):
