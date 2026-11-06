@@ -1129,6 +1129,10 @@ class Envs:
     # On gfx95x with SGLANG_USE_AITER=1, quantize the BF16 Qwen3.5/3.8 GDN
     # in_proj_qkvz and out_proj to MXFP4 after loading. 0 keeps them BF16.
     SGLANG_ROCM_GDN_ONLINE_MXFP4 = EnvBool(True)
+    # Kimi-K3 on gfx950: run the latent MoE down/up projections on MXFP4 copies
+    # (AITER gemm_a4w4) for batches of at least _MIN_TOKENS tokens.
+    SGLANG_OPT_HIP_K3_MOE_LATENT_MXFP4 = EnvBool(False)
+    SGLANG_OPT_HIP_K3_MOE_LATENT_MXFP4_MIN_TOKENS = EnvInt(2048)
     # ROCm decode attention kernel: auto (aiter_sparse on gfx950, tilelang elsewhere) |
     # aiter_sparse | tilelang | triton | torch | comparison | unified_kv_triton
     SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("auto")
