@@ -10,39 +10,53 @@ from typing import Optional, Tuple
 import torch
 
 from sglang.kernels.jit.utils import cache_once, load_jit
+from sglang.srt.utils import get_device_core_count
 from sglang.srt.utils.custom_op import register_custom_op
 
 MAX_ROWS = 1024
+SPLIT4_MAX_ROWS = 128
+SPLIT2_MAX_ROWS = 640
 
 
 @cache_once
-def _module(threads: int):
+def _module(threads: int, split: int = 1):
     return load_jit(
         "mhc_post_combine_norm_decode",
         str(threads),
+        str(split),
         cuda_files=["deepseek_v4/mhc_post_combine_norm_decode.cuh"],
         cuda_wrappers=[
-            ("run", f"MhcPostCombineNormDecode<{threads}>::run"),
+            ("run", f"MhcPostCombineNormDecode<{threads}, {split}>::run"),
             (
                 "max_active_ctas",
-                f"MhcPostCombineNormDecode<{threads}>::max_active_ctas",
+                f"MhcPostCombineNormDecode<{threads}, {split}>::max_active_ctas",
             ),
         ],
     )
+
+
+_num_sms = cache_once(get_device_core_count)
 
 
 @cache_once
 def _rows_per_wave(device_index: int, threads: int, quant: bool) -> int:
     with torch.cuda.device(device_index):
         ctas = int(_module(threads).max_active_ctas(quant))
-    return torch.cuda.get_device_properties(device_index).multi_processor_count * ctas
+    return _num_sms(device_index) * ctas
 
 
-def _pick_threads(m: int, device: torch.device, quant: bool) -> int:
-    return min(
+def _pick_config(m: int, device: torch.device, quant: bool) -> Tuple[int, int]:
+    """(threads, CTAs per row): split rows over a cluster while the grid is small,
+    else the thread count that needs the fewest waves."""
+    if m <= SPLIT4_MAX_ROWS:
+        return (128, 5) if quant else (160, 4)
+    if _num_sms(device.index) < m <= SPLIT2_MAX_ROWS:
+        return 160, 2
+    threads = min(
         (640, 320, 160),
         key=lambda threads: -(-m // _rows_per_wave(device.index, threads, quant)),
     )
+    return threads, 1
 
 
 @register_custom_op(mutates_args=["updated", "normalized", "q", "sf"])
@@ -60,8 +74,9 @@ def _mhc_post_combine_norm_decode(
     eps: float,
     quant: bool,
     threads: int,
+    split: int,
 ) -> None:
-    _module(threads).run(
+    _module(threads, split).run(
         x, residual, post, comb, pre, weight, updated, normalized, q, sf, eps, quant
     )
 
@@ -101,7 +116,7 @@ def mhc_post_combine_norm_decode(
         sf,
         eps,
         quant,
-        _pick_threads(m, x.device, quant),
+        *_pick_config(m, x.device, quant),
     )
     if not quant:
         return updated, normalized, None, None

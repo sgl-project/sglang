@@ -27,13 +27,21 @@ import orjson
 import psutil
 
 from sglang.srt.disaggregation.kv_events import select_kv_publisher_dp_rank
+from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import ShutdownReq
 from sglang.srt.managers.utils import (
     MsgpackDecodeError,
     msgpack_decode_explained,
 )
+from sglang.srt.multimodal.cache.identity import build_processor_fingerprint
 from sglang.srt.observability.startup_time import build_engine_startup_time
-from sglang.srt.runtime_context import get_exec, get_mm, get_parallel, get_serving
+from sglang.srt.runtime_context import (
+    get_device,
+    get_exec,
+    get_mm,
+    get_parallel,
+    get_serving,
+)
 from sglang.srt.rust_server.config import (
     _build_server_args,
     _frontend_cpu_key,
@@ -48,7 +56,6 @@ from sglang.srt.rust_server.multimodal import (
     settle_shm_buffers,
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.utils.common import get_bool_env_var
 from sglang.srt.utils.flatten import (
     FlatPairColumns,
     NestedRowColumns,
@@ -59,7 +66,8 @@ from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 
 if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import AbortReq, BatchTokenIDOutput
-    from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput, Req
+    from sglang.srt.managers.req_types import MultimodalProcessorOutput
+    from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.scheduler import Scheduler
     from sglang.srt.rust_extensions._server import MmSpec, Server
 
@@ -135,6 +143,7 @@ class RustServer:
         self.http_port = http_port
         self.mm_spec = mm_spec
         self._multimodal_enabled = mm_spec is not None
+        self._mm_cache_namespace: Optional[str] = None
         self._max_per_poll = max_per_poll
         # The engine-level startup timings `/server_info` reports, set once
         # the scheduler finishes initializing (see `set_startup_time`).
@@ -253,6 +262,27 @@ class RustServer:
         return (get_parallel().tp_rank % tp_size_per_node) // dp_group_width
 
     @classmethod
+    def _advertised_host(cls) -> str:
+        """The host this rank's listener is published at: the bound host, else
+        the address the interfaces answer on. A deployment whose service
+        discovery publishes another of the node's addresses overrides this."""
+        host = get_serving().host
+        if host in ("", "0.0.0.0", "::"):
+            # An unspecified bind address is not reachable from another node.
+            detected = get_local_ip_auto(fallback="127.0.0.1")
+            if (
+                host == "0.0.0.0"
+                and NetworkAddress(detected, 0).is_ipv6
+                and _is_loopback(detected)
+            ):
+                # SGLANG_HOST_IP=::1 names this machine, which this IPv4
+                # listener serves at 127.0.0.1. It does not serve any other
+                # IPv6 address; gather_server_endpoints refuses those.
+                detected = "127.0.0.1"
+            host = detected
+        return host
+
+    @classmethod
     def gather_server_endpoints(cls, hosts_listener: bool) -> List[Dict[str, Any]]:
         """Collective: every rank calls once; returns listener endpoints by DP rank."""
         if get_exec().moe.is_ep_joiner:
@@ -264,11 +294,7 @@ class RustServer:
             # out, and the serving ranks' table is untouched.
             return []
         bind_host = get_serving().host
-        host = bind_host
-        if host in ("", "0.0.0.0", "::"):
-            # An unspecified bind address is not reachable from another
-            # node; advertise the address the interfaces answer on.
-            host = get_local_ip_auto(fallback="127.0.0.1")
+        host = cls._advertised_host()
         # Nodes that rendezvous on loopback share this machine, so a loopback
         # listener reaches them; otherwise it is a likely misconfiguration.
         if get_parallel().nnodes > 1 and _is_loopback(host):
@@ -359,6 +385,18 @@ class RustServer:
             if scheduler.model_config.is_multimodal
             else None
         )
+        mm_cache_namespace = (
+            build_processor_fingerprint(
+                scheduler.processor,
+                scheduler.model_config.hf_config,
+                extra={
+                    "model_path": scheduler.model_config.model_path,
+                    "rust_spec": mm_spec.rust_json() if mm_spec is not None else None,
+                },
+            )
+            if scheduler.model_config.is_multimodal
+            else None
+        )
 
         extension = cls._load_extension()
         server = extension.Server(
@@ -374,6 +412,7 @@ class RustServer:
             **cls._server_kwargs(scheduler),
         )
         instance = cls(server, http_port=listen_port)
+        instance._mm_cache_namespace = mm_cache_namespace
         instance._broadcasts_shutdown = get_parallel().tp_rank == 0
 
         if scheduler.model_config.is_multimodal:
@@ -422,7 +461,7 @@ class RustServer:
         (``sglang.srt.rust_server.shutdown``), as Python mode's tokenizer
         manager drains: health answers 503 at once, requests are still
         admitted, the listener closes once none is left in flight, and then
-        :meth:`drain` stops the schedulers. ``SGL_FORCE_SHUTDOWN`` skips the
+        :meth:`drain` stops the schedulers. ``SGLANG_FORCE_SHUTDOWN`` skips the
         wait for requests, as in Python.
 
         The drain begins from a Rust thread woken through the signal wakeup
@@ -437,7 +476,7 @@ class RustServer:
                 "rust server: not on the main thread; SIGTERM will not drain"
             )
             return
-        force = get_bool_env_var("SGL_FORCE_SHUTDOWN")
+        force = envs.SGLANG_FORCE_SHUTDOWN.get()
         if not self._broadcasts_shutdown:
             notify = None
 
@@ -484,9 +523,13 @@ class RustServer:
 
     def wait_request(self, timeout_ms: int) -> None:
         """Block until a request is pushed into the in-process ring or the timeout
-        elapses.
+        elapses. Without --sleep-on-idle, return at once, so the idle loop
+        polls the ring without blocking as Python's polls its sockets: a parked
+        thread starts each request's step on a cold core. A subclass that
+        holds drained requests back still parks on those.
         """
-        self.server.wait_request(timeout_ms)
+        if get_device().sleep_on_idle:
+            self.server.wait_request(timeout_ms)
 
     def drain(self, max_recv: int) -> List[Any]:
         """Ingress: non-blocking drain of the in-process ring → list of decoded
@@ -577,6 +620,20 @@ class RustServer:
             # step of the Rust path; a text-only request on a multimodal
             # model carries no `mm.*` buffers.
             obj.mm_inputs = self._wrap_mm_result(buffers)
+            if self._mm_cache_namespace is None:
+                raise RuntimeError("Rust multimodal cache namespace is not initialized")
+            for item in obj.mm_inputs.mm_items:
+                if item.identity is None or len(item.identity) != 32:
+                    raise ValueError(
+                        "Rust multimodal workers must return a full 32-byte identity"
+                    )
+                # Bind all wrappers, including external packages. Only the
+                # 32-byte worker digest is hashed on the scheduler thread.
+                item.bind_processor_fingerprint(self._mm_cache_namespace)
+            if obj.mm_inputs.padded_input_ids is not None:
+                obj.mm_inputs.padded_input_ids = obj.mm_inputs.build_padded_input_ids(
+                    obj.mm_inputs.input_ids, obj.mm_inputs.mm_items
+                )
 
     def push_control_output(self, recv_req, output) -> None:
         """Push a control-request response through the egress ring to the waiting

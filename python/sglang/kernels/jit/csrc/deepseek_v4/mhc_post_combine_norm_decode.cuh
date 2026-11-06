@@ -1,10 +1,12 @@
 // Decode/verify mHC post + next combine + RMSNorm (+ optional MXFP8 of the normed row).
-// One CTA per row; each thread owns kVPT 8-element vectors of the 5120 hidden columns.
+// A row is split over a cluster of Split CTAs (blockIdx.x is the rank, blockIdx.y the row; Split 1 uses blockIdx.x);
+// each thread owns kVPT 8-element vectors of the 5120 hidden columns.
 #pragma once
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
 #include <sgl_kernel/math.cuh>
+#include <sgl_kernel/mbarrier.cuh>
 #include <sgl_kernel/type.cuh>
 #include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/vec.cuh>
@@ -15,6 +17,33 @@
 #include <cuda_fp8.h>
 
 namespace sglang {
+
+namespace device::ptx {
+
+SGL_DEVICE uint32_t mapa_shared(uint32_t addr, uint32_t rank) {
+  uint32_t result;
+  asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(result) : "r"(addr), "r"(rank));
+  return result;
+}
+
+SGL_DEVICE void st_async_f32(uint32_t remote_addr, float x, uint32_t remote_bar) {
+  asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.f32 [%0], %1, [%2];" ::"r"(remote_addr),
+               "f"(x),
+               "r"(remote_bar)
+               : "memory");
+}
+
+SGL_DEVICE void mbar_wait_parity_acquire_cta(uint64_t* bar, uint32_t parity) {
+  asm volatile(
+      "{\n\t.reg .pred p;\n\t"
+      "WAIT_%=: mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 p, [%0], %1;\n\t"
+      "@!p bra WAIT_%=;\n\t}\n" ::"r"(to_shared(bar)),
+      "r"(parity)
+      : "memory");
+}
+
+}  // namespace device::ptx
+
 struct MhcPostCombineNormDecodeParams {
   const bf16_t *x, *residual, *weight;
   bf16_t *residual_out, *output;
@@ -24,44 +53,76 @@ struct MhcPostCombineNormDecodeParams {
   float eps;
 };
 
-template <int Threads, bool Quant>
+template <int Threads, int Split, bool Quant>
 __global__ __launch_bounds__(Threads) void mhc_post_combine_norm_decode_kernel(
     const __grid_constant__ MhcPostCombineNormDecodeParams p) {
   using namespace device;
   using V = AlignedVector<bf16x2_t, 4>;
-  constexpr int kVectors = 640;
+  constexpr int kVectors = 640 / Split;
   constexpr int kVPT = kVectors / Threads;
   constexpr int kWarps = Threads / 32;
-  static_assert(kVPT * Threads == kVectors && Threads % 32 == 0);
+  constexpr int kPool = Split * kWarps;
+  constexpr bool kPrefetchWeight = Split > 1 || kVPT == 1;
+  static_assert(kVPT * Threads * Split == 640 && Threads % 32 == 0 && kPool <= 32);
   constexpr int kGroups = 5120 / 32;
   constexpr int64_t kTileBytes = ((kGroups + 3) / 4) * 512;
-  __shared__ float warp_sums[kWarps];
-  __shared__ float inv_rms_shared;
+  __shared__ float pool[kPool];
+  __shared__ uint64_t bar;
 
   const int tid = threadIdx.x;
   const int lane = tid % 32;
-  const int64_t row = blockIdx.x;
+  const int warp = tid / 32;
+  const int rank = Split > 1 ? blockIdx.x : 0;
+  const int64_t row = Split > 1 ? blockIdx.y : blockIdx.x;
+
+  if constexpr (Split > 1) {
+    if (tid == 0) {
+      ptx::mbar_init(&bar, 1);
+      ptx::mbar_arrive_expect_tx(&bar, kPool * sizeof(float));
+      asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+    }
+    asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
+  }
+  const bf16_t* x_ptr = p.x;
+  const bf16_t* residual_ptr = p.residual;
+  const bf16_t* weight_ptr = p.weight;
+  const float* comb_ptr = p.comb;
+  const float* post_ptr = p.post;
+  const float* pre_ptr = p.pre;
+  __builtin_assume(__isGlobal(x_ptr));
+  __builtin_assume(__isGlobal(residual_ptr));
+  __builtin_assume(__isGlobal(weight_ptr));
+  __builtin_assume(__isGlobal(comb_ptr));
+  __builtin_assume(__isGlobal(post_ptr));
+  __builtin_assume(__isGlobal(pre_ptr));
 
   float comb[16], post[4], pre[4];
 #pragma unroll
   for (int i = 0; i < 16; ++i)
-    comb[i] = __ldg(p.comb + row * 16 + i);
+    comb[i] = __ldg(comb_ptr + row * 16 + i);
 #pragma unroll
   for (int i = 0; i < 4; ++i) {
-    post[i] = __ldg(p.post + row * 4 + i);
-    pre[i] = __ldg(p.pre + row * 4 + i);
+    post[i] = __ldg(post_ptr + row * 4 + i);
+    pre[i] = __ldg(pre_ptr + row * 4 + i);
+  }
+
+  V w[kVPT];
+  if constexpr (kPrefetchWeight) {
+#pragma unroll
+    for (int j = 0; j < kVPT; ++j)
+      w[j].load(weight_ptr, rank * kVectors + tid + j * Threads);
   }
 
   float value[kVPT][8];
   float sum = 0.f;
 #pragma unroll
   for (int j = 0; j < kVPT; ++j) {
-    const int vid = tid + j * Threads;
+    const int vid = rank * kVectors + tid + j * Threads;
     V x, residual[4];
-    x.load(p.x + row * 5120, vid);
+    x.load(x_ptr + row * 5120, vid);
 #pragma unroll
     for (int r = 0; r < 4; ++r)
-      residual[r].load(p.residual + row * 20480 + r * 5120, vid);
+      residual[r].load(residual_ptr + row * 20480 + r * 5120, vid);
     float combined[8] = {};
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
@@ -101,32 +162,34 @@ __global__ __launch_bounds__(Threads) void mhc_post_combine_norm_decode_kernel(
 #pragma unroll
   for (int offset = 16; offset; offset >>= 1)
     sum = __fadd_rn(sum, __shfl_xor_sync(0xffffffff, sum, offset));
-  if (lane == 0) warp_sums[tid / 32] = sum;
-  __syncthreads();
-  if (tid < 32) {
-    float total = lane < kWarps ? warp_sums[lane] : 0.f;
-#pragma unroll
-    for (int offset = 16; offset; offset >>= 1)
-      total = __fadd_rn(total, __shfl_xor_sync(0xffffffff, total, offset));
-    if (lane == 0) {
-      float mean, inverse;
-      asm("div.full.f32 %0, %1, %2;" : "=f"(mean) : "f"(total), "f"(5120.f));
-      asm("add.f32 %0, %1, %2;" : "=f"(mean) : "f"(mean), "f"(p.eps));
-      asm("rsqrt.approx.ftz.f32 %0, %1;" : "=f"(inverse) : "f"(mean));
-      inv_rms_shared = inverse;
+  if constexpr (Split > 1) {
+    asm volatile("barrier.cluster.wait.aligned;" ::: "memory");
+    if (lane < Split) {
+      const uint32_t slot = ptx::to_shared(&pool[rank * kWarps + warp]);
+      ptx::st_async_f32(ptx::mapa_shared(slot, lane), sum, ptx::mapa_shared(ptx::to_shared(&bar), lane));
     }
+    ptx::mbar_wait_parity_acquire_cta(&bar, 0);
+  } else {
+    if (lane == 0) pool[warp] = sum;
+    __syncthreads();
   }
-  __syncthreads();
-  const float inv_rms = inv_rms_shared;
+  float total = lane < kPool ? pool[lane] : 0.f;
+#pragma unroll
+  for (int offset = 16; offset; offset >>= 1)
+    total = __fadd_rn(total, __shfl_xor_sync(0xffffffff, total, offset));
+  float mean, inv_rms;
+  asm("div.full.f32 %0, %1, %2;" : "=f"(mean) : "f"(total), "f"(5120.f));
+  asm("add.f32 %0, %1, %2;" : "=f"(mean) : "f"(mean), "f"(p.eps));
+  asm("rsqrt.approx.ftz.f32 %0, %1;" : "=f"(inv_rms) : "f"(mean));
 
 #pragma unroll
   for (int j = 0; j < kVPT; ++j) {
-    const int vid = tid + j * Threads;
-    V w, out;
-    w.load(p.weight, vid);
+    const int vid = rank * kVectors + tid + j * Threads;
+    if constexpr (!kPrefetchWeight) w[j].load(weight_ptr, vid);
+    V out;
 #pragma unroll
     for (int k = 0; k < 4; ++k) {
-      const auto weight = cast<fp32x2_t>(w[k]);
+      const auto weight = cast<fp32x2_t>(w[j][k]);
       out[k] = cast<bf16x2_t>(fp32x2_t{
           __fmul_rn(__fmul_rn(value[j][2 * k], inv_rms), weight.x),
           __fmul_rn(__fmul_rn(value[j][2 * k + 1], inv_rms), weight.y)});
@@ -172,24 +235,24 @@ __global__ __launch_bounds__(Threads) void mhc_post_combine_norm_decode_kernel(
   if constexpr (Quant) {
     // Word i of the last 128-row tile holds tile row (i % 4) * 32 + (i % 128) / 4.
     const int first_pad = static_cast<int>(p.rows % 128);
+    const int stride = static_cast<int>(p.rows) * Split * Threads;
     auto* tile = reinterpret_cast<uint32_t*>(p.sf + (p.rows / 128) * kTileBytes);
-    for (int i = static_cast<int>(row) * Threads + tid; first_pad && i < kTileBytes / 4;
-         i += static_cast<int>(p.rows) * Threads) {
+    for (int i = (static_cast<int>(row) * Split + rank) * Threads + tid; first_pad && i < kTileBytes / 4; i += stride) {
       if ((i % 4) * 32 + (i % 128) / 4 >= first_pad) tile[i] = 0;
     }
   }
 }
 
-template <int Threads>
+template <int Threads, int Split>
 struct MhcPostCombineNormDecode {
   static int64_t max_active_ctas(bool quant) {
     int ctas = 0;
     if (quant)
       CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-          &ctas, mhc_post_combine_norm_decode_kernel<Threads, true>, Threads, 0));
+          &ctas, mhc_post_combine_norm_decode_kernel<Threads, Split, true>, Threads, 0));
     else
       CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-          &ctas, mhc_post_combine_norm_decode_kernel<Threads, false>, Threads, 0));
+          &ctas, mhc_post_combine_norm_decode_kernel<Threads, Split, false>, Threads, 0));
     return ctas;
   }
 
@@ -226,6 +289,7 @@ struct MhcPostCombineNormDecode {
       CHECK_HOST(reinterpret_cast<uintptr_t>(ptr) % 16 == 0) << "BF16 pointers must be 16-byte aligned";
     }
     if (rows == 0) return;
+    CHECK_HOST(Split == 1 || rows <= 65535) << "rows go in grid.y";
     const MhcPostCombineNormDecodeParams params{
         static_cast<const bf16_t*>(x.data_ptr()),
         static_cast<const bf16_t*>(residual.data_ptr()),
@@ -239,12 +303,12 @@ struct MhcPostCombineNormDecode {
         quant ? static_cast<uint8_t*>(sf.data_ptr()) : nullptr,
         rows,
         eps};
+    LaunchKernel launch(Split > 1 ? dim3(Split, rows) : dim3(rows), Threads, dev.unwrap());
+    if (Split > 1) launch.enable_cluster(dim3(Split, 1, 1));
     if (quant)
-      LaunchKernel(dim3(rows), Threads, dev.unwrap())
-          .launch(mhc_post_combine_norm_decode_kernel<Threads, true>, params);
+      launch.launch(mhc_post_combine_norm_decode_kernel<Threads, Split, true>, params);
     else
-      LaunchKernel(dim3(rows), Threads, dev.unwrap())
-          .launch(mhc_post_combine_norm_decode_kernel<Threads, false>, params);
+      launch.launch(mhc_post_combine_norm_decode_kernel<Threads, Split, false>, params);
   }
 };
 }  // namespace sglang

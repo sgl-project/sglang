@@ -133,7 +133,7 @@ def build_rust_frame_metadata_fixture() -> dict:
     collector records for each request of the cache-tier batches.
     Regenerate the fixture with ``json.dump(build_rust_frame_metadata_fixture(),
     f, indent=2)`` after changing either side."""
-    from sglang.srt.disaggregation.utils import DisaggregationMode
+    from sglang.srt.disaggregation.mode import DisaggregationMode
     from sglang.srt.managers.io_struct import AbortReq
     from sglang.srt.managers.scheduler_components.output_streamer import (
         SchedulerOutputStreamer,
@@ -669,6 +669,11 @@ def launch_context(server_cls, cores=(None, None)):
         patch.object(
             server_module, "_build_server_args", return_value=sentinel.args
         ) as build_args,
+        patch.object(
+            server_module,
+            "build_processor_fingerprint",
+            return_value="sha256:" + "12" * 32,
+        ),
     ):
         yield build_args
 
@@ -695,7 +700,10 @@ class TestRustServerExtension(CustomTestCase):
                 self.server.start_mm_workers(sentinel.spec, 8)
 
         scheduler = SimpleNamespace(
-            model_config=SimpleNamespace(is_multimodal=True),
+            processor=sentinel.processor,
+            model_config=SimpleNamespace(
+                is_multimodal=True, hf_config=sentinel.config, model_path="test/model"
+            ),
         )
         with launch_context(ModelServer) as build_args:
             instance = ModelServer.launch(scheduler)
@@ -814,7 +822,10 @@ class TestRustServerExtension(CustomTestCase):
                 ):
                     RustServer.gather_server_endpoints(hosts_listener=False)
 
-    def test_gather_server_endpoints_checks_bind_family_on_every_rank(self):
+    def test_gather_server_endpoints_publishes_an_address_the_bind_serves(self):
+        """An IPv4 wildcard listener publishes 127.0.0.1 for SGLANG_HOST_IP=::1
+        (the same machine) and refuses any other IPv6 SGLANG_HOST_IP, which it
+        does not serve, on every rank, listener or not."""
         parallel = SimpleNamespace(
             nnodes=1,
             attn_dp_size=1,
@@ -823,40 +834,44 @@ class TestRustServerExtension(CustomTestCase):
             world_group=SimpleNamespace(all_gather_object=Mock()),
         )
         serving = SimpleNamespace(host="0.0.0.0", port=30000)
-        with (
-            patch.object(server_module, "get_parallel", return_value=parallel),
-            patch.object(
-                server_module,
-                "get_exec",
-                return_value=SimpleNamespace(moe=SimpleNamespace(is_ep_joiner=False)),
-            ),
-            patch.object(server_module, "get_serving", return_value=serving),
-            patch.object(RustServer, "_port_offset", return_value=0),
-            patch.object(server_module, "get_local_ip_auto") as advertised,
+        for bind, host_ip, published in (
+            ("0.0.0.0", "10.0.0.1", "10.0.0.1"),
+            ("::", "2001:db8::1", "2001:db8::1"),
+            ("::", "::1", "::1"),
+            ("0.0.0.0", "::1", "127.0.0.1"),
+            ("0.0.0.0", "2001:db8::1", None),
         ):
-            for bind, host in (
-                ("0.0.0.0", "10.0.0.1"),
-                ("::", "2001:db8::1"),
-                ("0.0.0.0", "2001:db8::1"),
+            serving.host = bind
+            gathered = []
+
+            def gather(entry):
+                if entry is not None:
+                    gathered[:] = [entry]
+                return [*gathered, None]
+
+            parallel.world_group.all_gather_object.side_effect = gather
+            with (
+                patch.dict(os.environ, {"SGLANG_HOST_IP": host_ip}),
+                patch.object(server_module, "get_parallel", return_value=parallel),
+                patch.object(
+                    server_module,
+                    "get_exec",
+                    return_value=SimpleNamespace(
+                        moe=SimpleNamespace(is_ep_joiner=False)
+                    ),
+                ),
+                patch.object(server_module, "get_serving", return_value=serving),
+                patch.object(RustServer, "_port_offset", return_value=0),
             ):
-                serving.host = bind
-                advertised.return_value = host
-                gathered = []
-
-                def gather(entry):
-                    if entry is not None:
-                        gathered.append(entry)
-                    return gathered
-
-                parallel.world_group.all_gather_object.side_effect = gather
                 for hosts_listener in (True, False):
-                    with self.subTest(bind=bind, host=host, listener=hosts_listener):
-                        if bind == "0.0.0.0" and ":" in host:
+                    with self.subTest(
+                        bind=bind, host_ip=host_ip, listener=hosts_listener
+                    ):
+                        if published is None:
                             with self.assertRaisesRegex(
                                 ValueError, "DP rank 0.*IPv4.*2001:db8::1"
                             ):
                                 RustServer.gather_server_endpoints(hosts_listener)
-                            self.assertEqual(len(gathered), 1)
                         else:
                             self.assertEqual(
                                 RustServer.gather_server_endpoints(hosts_listener),
@@ -864,7 +879,7 @@ class TestRustServerExtension(CustomTestCase):
                                     {
                                         "dp_rank": 0,
                                         "endpoint": server_module.NetworkAddress(
-                                            host, 30000
+                                            published, 30000
                                         ).to_url(),
                                     }
                                 ],
@@ -1197,6 +1212,7 @@ class TestRustServerExtension(CustomTestCase):
             model_config=SimpleNamespace(
                 is_multimodal=True,
                 hf_config=SimpleNamespace(model_type="unsupported_vlm"),
+                model_path="test/model",
             ),
         )
         with (
@@ -1213,14 +1229,16 @@ class TestRustServerExtension(CustomTestCase):
                 BuiltinServer.launch(scheduler)
             extension.Server.assert_not_called()
 
-            mm_processor.return_value.resolve_spec.return_value = sentinel.spec
+            spec = Mock()
+            spec.rust_json.return_value = "{}"
+            mm_processor.return_value.resolve_spec.return_value = spec
             instance = BuiltinServer.launch(scheduler)
 
         extension.Server.assert_called_once()
         instance.server.start_mm_workers.assert_called_once_with(
             sentinel.worker_spec, 8
         )
-        self.assertIs(instance.mm_spec, sentinel.spec)
+        self.assertIs(instance.mm_spec, spec)
         self.assertTrue(instance._multimodal_enabled)
 
     @unittest.skipUnless(
@@ -1253,7 +1271,12 @@ class TestRustServerExtension(CustomTestCase):
             # Affinity is per thread: launch on a thread of its own, as the
             # scheduler's launch thread, so the test runner keeps its mask.
             scheduler = SimpleNamespace(
-                model_config=SimpleNamespace(is_multimodal=True)
+                processor=sentinel.processor,
+                model_config=SimpleNamespace(
+                    is_multimodal=True,
+                    hf_config=sentinel.config,
+                    model_path="test/model",
+                ),
             )
             with launch_context(ModelServer, cores=([launch_core], server_cores)):
                 ModelServer.launch(scheduler)
