@@ -14,8 +14,9 @@ from sglang.srt.model_executor.cuda_graph_config import (
     CudaGraphConfig,
     PhaseConfig,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mha import (
     forward_dsa_indexer_for_mha,
@@ -1519,7 +1520,6 @@ def run_dsa_mtp_seed_handoff_case(
                 q_lora=fixture.input_hidden,
                 positions=batch.positions,
                 forward_batch=batch,
-                layer_id=0,
             )
         else:
             state = IndexTopKShareState.from_mtp_carry(batch)

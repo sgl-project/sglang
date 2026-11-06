@@ -7,11 +7,11 @@ from typing import Any
 
 from sglang.srt.arg_groups.arg_utils import record_fields
 from sglang.srt.arg_groups.kv_shard_hook import handle_kv_cache_sharding
+from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.arg_groups.overrides import (
     _page_size_default,
     _pipeline_parallel_overlap_disable,
     _sampling_backend_default,
-    resolving_view,
     run_post_process_pass,
 )
 from sglang.srt.arg_groups.resolution_hooks import run_hook
