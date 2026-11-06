@@ -10,6 +10,8 @@ mod deepseek_output;
 mod error;
 #[cfg(any(feature = "parser", feature = "openai"))]
 mod kimi_k3_format;
+#[cfg(feature = "mm")]
+mod mm;
 mod model_files;
 #[cfg(feature = "openai")]
 pub mod openai;
@@ -33,6 +35,8 @@ pub use deepseek_output::{
     DeepSeekStopMatch, DeepSeekToolCall, DeepSeekToolCallDelta,
 };
 pub use error::ProcessorError;
+#[cfg(feature = "mm")]
+pub use mm::{MmOutput, MmOutputItem, MmProcessor};
 pub use model_files::{resolve_model_file, resolve_tokenizer_file};
 #[cfg(feature = "parser")]
 pub use parser::{
@@ -43,8 +47,8 @@ pub use parser::{
 #[cfg(feature = "render")]
 pub use render::{
     ChatFormatter, ChatFormatterOptions, DeepSeekTokenizer, OneOrMany, TemplateArgs, TemplateError,
-    ThinkingTemplates, continues_final_message, load_chat_formatter, requested_effort,
-    requested_thinking, select_chat_formatter,
+    ThinkingTemplates, continues_final_message, extract_images, load_chat_formatter,
+    requested_effort, requested_thinking, select_chat_formatter,
 };
 #[cfg(any(feature = "parser", feature = "openai"))]
 pub use think::ReasoningOptions;
@@ -55,6 +59,8 @@ pub use tool_call::tool_call_id;
 
 // Dynamo crates whose types appear in this crate's public API. Hosts use these
 // re-exports so their Dynamo versions always match the processor's.
+#[cfg(feature = "mm")]
+pub use dynamo_multimodal;
 #[cfg(feature = "parser")]
 pub use dynamo_parsers;
 #[cfg(any(feature = "parser", feature = "render"))]
