@@ -17,6 +17,7 @@ from sglang.srt.disaggregation.decode import (
     _PendingPublish,
 )
 from sglang.srt.disaggregation.decode_hicache_mixin import (
+    DecodePrefixMatch,
     HiCacheRestoreGatedKVReceiver,
     HiCacheRestoreResult,
 )
@@ -411,6 +412,123 @@ class TestDeferredDestinationPublish(CustomTestCase):
             total_prefix_len=0,
             fill_len=4,
         )
+
+    def _storage_admission_queue(self, restored_tokens):
+        dr = self._decode_req(_PollingReceiver())
+        dr.req.lock = None
+        dr.req.cache_request_handle = "storage-request"
+        queue = self._deferring_queue([dr])
+        queue._defer_publish = False
+        queue.scheduler.enable_decode_hicache = True
+        queue.tree_cache.check_prefetch_progress.return_value = False
+        queue.tree_cache.pop_prefetch_loaded_span.return_value = (restored_tokens, 0)
+        queue._required_alloc_tokens = lambda **kw: kw["fill_len"] - kw["prefix_len"]
+        queue._required_admission_tokens = lambda req, needed, *args: needed
+
+        def match(req, *, query_storage=True):
+            req.lock = "device-lock"
+            return DecodePrefixMatch(
+                prefix_indices=torch.empty(0, dtype=torch.int64),
+                l2_host_hit_length=0 if query_storage else restored_tokens,
+                l3_storage_hit_length=4 if query_storage else 0,
+                last_device_node="root",
+                last_host_node="host" if query_storage or restored_tokens else None,
+            )
+
+        queue._match_prefix_and_lock = match
+        # The storage operation starts successfully, but the allocator/reader
+        # can later supply either a checkpoint or no usable prefix.
+        queue._start_hicache_prefetch = lambda req, pm: setattr(
+            pm, "prefetch_registered", pm.l3_storage_hit_length > 0
+        )
+        queue._publish_destination = lambda **kw: kw[
+            "decode_req"
+        ].kv_receiver.send_metadata(
+            decode_prefix_len=kw["total_prefix_len"],
+            suffix_tokens=kw["fill_len"] - kw["total_prefix_len"],
+        )
+        config = SimpleNamespace(
+            disaggregation_decode_host_receive_threshold=1,
+            disaggregation_decode_enable_radix_cache=True,
+        )
+        config_patch = patch(
+            "sglang.srt.disaggregation.decode.get_disagg", return_value=config
+        )
+        config_patch.start()
+        self.addCleanup(config_patch.stop)
+        return queue, dr
+
+    def test_storage_outcome_is_settled_before_publishing_prefix(self):
+        """A registered read may be revoked or lose its checkpoint before completion."""
+        for restored in (0, 2, 4):
+            with self.subTest(restored_tokens=restored):
+                queue, dr = self._storage_admission_queue(restored)
+                self.assertEqual(queue.pop_preallocated(), ([], []))
+                self.assertEqual(dr.metadata_buffer_index, -1)
+                self.assertEqual(queue.pop_preallocated(), ([], []))
+                self.assertFalse(dr.kv_receiver.send_metadata.called)
+
+                queue.tree_cache.check_prefetch_progress.return_value = True
+                self.assertEqual(queue.pop_preallocated(), ([dr], []))
+                metadata = dr.kv_receiver.send_metadata.call_args.kwargs
+                self.assertEqual(metadata["decode_prefix_len"], restored)
+                self.assertEqual(metadata["suffix_tokens"], 5 - restored)
+                self.assertFalse(dr.hicache_prefetch_pending)
+
+    def test_ticketed_storage_read_also_waits_before_publishing(self):
+        queue, dr = self._storage_admission_queue(4)
+        queue._start_hicache_prefetch = lambda req, pm: setattr(
+            pm, "prefetch_ticketed", pm.l3_storage_hit_length > 0
+        )
+        self.assertEqual(queue.pop_preallocated(), ([], []))
+        self.assertFalse(dr.kv_receiver.send_metadata.called)
+        queue.tree_cache.check_prefetch_progress.return_value = True
+        self.assertEqual(queue.pop_preallocated(), ([dr], []))
+        self.assertEqual(
+            dr.kv_receiver.send_metadata.call_args.kwargs["decode_prefix_len"], 4
+        )
+
+    def test_pending_storage_read_does_not_block_a_cache_miss(self):
+        queue, pending = self._storage_admission_queue(0)
+        self.assertEqual(queue.pop_preallocated(), ([], []))
+        following = self._decode_req(_PollingReceiver())
+        following.req.rid = "following"
+        following.hicache_prefetch_done = True
+        queue.queue.join([following])
+        self.assertEqual(queue.pop_preallocated(), ([following], []))
+        self.assertTrue(pending.hicache_prefetch_pending)
+        self.assertFalse(pending.kv_receiver.send_metadata.called)
+        self.assertEqual(
+            following.kv_receiver.send_metadata.call_args.kwargs["decode_prefix_len"], 0
+        )
+        self.assertEqual(list(queue.queue.items()), [pending])
+
+    def test_finished_prefetch_does_not_bypass_readmission(self):
+        queue, dr = self._storage_admission_queue(0)
+        self.assertEqual(queue.pop_preallocated(), ([], []))
+        queue.tree_cache.check_prefetch_progress.return_value = True
+        queue._prealloc_reservation_fits.return_value = False
+        self.assertEqual(queue.pop_preallocated(), ([], []))
+        self.assertFalse(dr.kv_receiver.send_metadata.called)
+        self.assertEqual(dr.metadata_buffer_index, -1)
+        queue._prealloc_reservation_fits.return_value = True
+        self.assertEqual(queue.pop_preallocated(), ([dr], []))
+        self.assertEqual(
+            dr.kv_receiver.send_metadata.call_args.kwargs["decode_prefix_len"], 0
+        )
+
+    def test_abort_while_prefetching_never_publishes(self):
+        queue, dr = self._storage_admission_queue(0)
+        self.assertEqual(queue.pop_preallocated(), ([], []))
+        from sglang.srt.managers.req_types import FINISH_ABORT
+
+        dr.req.finished_reason = FINISH_ABORT("cancelled")
+        dr.req.finished_output = True
+        self.assertEqual(queue.pop_preallocated(), ([], [dr]))
+        self.assertIsNone(dr.req.lock)
+        self.assertFalse(dr.hicache_prefetch_pending)
+        self.assertIsNone(dr.kv_receiver)
+        self.assertEqual(len(queue.queue), 0)
 
     def test_deferred_destination_keeps_its_metadata_slot_until_published(self):
         # The transfer queue frees the metadata slot of any request it fails, so

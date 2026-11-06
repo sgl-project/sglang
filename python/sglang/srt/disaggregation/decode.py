@@ -422,6 +422,9 @@ class DecodeRequest:
     # kwargs) until the forward and any pinned metadata readback are done.
     pending_metadata: Optional[Tuple[Any, tuple, dict]] = None
 
+    # Storage must settle before publishing a reuse boundary to prefill.
+    hicache_prefetch_pending: bool = False
+    hicache_prefetch_done: bool = False
     # HiCache Status
     prefix_match: Optional[DecodePrefixMatch] = None
     hicache_restored_kv_indices: Optional[torch.Tensor] = None
@@ -969,7 +972,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
             self.pending_reqs.append(decode_req)
 
-    def _match_prefix_and_lock(self, req: Req) -> DecodePrefixMatch:
+    def _match_prefix_and_lock(
+        self, req: Req, *, query_storage: bool = True
+    ) -> DecodePrefixMatch:
         max_prefix_len = None
         if self._uses_swa_tail_prealloc():
             fill_len = pre_alloc_fill_len(req)
@@ -980,12 +985,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             req,
             self.tree_cache,
             req.origin_input_ids,
-            cow_mamba=self.tree_cache.supports_mamba(),
+            cow_mamba=self.tree_cache.supports_mamba() and query_storage,
             max_prefix_len=max_prefix_len,
         )
         req.lock = self.tree_cache.lock(result.last_device_node)
         return self._build_decode_prefix_match(
-            req, result, max_prefix_len=max_prefix_len
+            req, result, max_prefix_len=max_prefix_len, query_storage=query_storage
         )
 
     def _resolve_prefill_dp_rank(self, req: Req) -> Optional[int]:
@@ -1121,6 +1126,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     def release_memory_occupation(self):
         self._cancel_prefill_dp_rank_queries()
+        for dr in self.queue.items():
+            self._cancel_hicache_admission(dr)
         self.queue.clear()
         self._pending_publish.clear()
         for req in self.retracted_queue:
@@ -1508,6 +1515,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
             if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
+                self._cancel_hicache_admission(decode_req)
                 if not getattr(decode_req.req, "finished_output", False):
                     self.scheduler.output_streamer.stream_output(
                         [decode_req.req],
@@ -1569,6 +1577,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if not decode_req.waiting_for_input:
                 continue
 
+            if not self._poll_hicache_prefetch(decode_req):
+                continue
+
             if self.req_to_metadata_buffer_idx_allocator.available_size() <= 0:
                 break
 
@@ -1619,7 +1630,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
             if use_decode_radix_cache:
                 # Match prefix against decode's radix cache.
-                prefix_match = self._match_prefix_and_lock(decode_req.req)
+                prefix_match = self._match_prefix_and_lock(
+                    decode_req.req, query_storage=not decode_req.hicache_prefetch_done
+                )
                 prefix_indices = prefix_match.prefix_indices
                 # prefix_len: tokens already on device (L1 hit).
                 # total_prefix_len: full prefix promised to prefill
@@ -1720,10 +1733,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     indices_to_remove.add(i)
                     continue
             if self.scheduler.enable_decode_hicache:
-                # Prefill is promised only the L3 span the prefetch took.
                 self._start_hicache_prefetch(decode_req.req, prefix_match)
                 if prefix_match is not None:
+                    if (
+                        prefix_match.prefetch_registered
+                        or prefix_match.prefetch_ticketed
+                    ):
+                        decode_req.hicache_prefetch_pending = True
+                        decode_req.prefix_match = prefix_match
+                        continue
                     total_prefix_len = prefix_match.decode_prefix_len
+                    self._pin_hicache_host_prefix(prefix_match)
             # Prefill is responsible for storing this prefix; no persistence ACK is required.
             prefill_info = getattr(decode_req.kv_receiver, "prefill_info", None)
             decode_req.req.linker_offload_skip_prefix_len = (

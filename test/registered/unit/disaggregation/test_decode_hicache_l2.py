@@ -211,6 +211,44 @@ class TestDecodeHiCacheL2(CustomTestCase):
         self.assertEqual(dr.prefix_match.l3_storage_hit_length, 0)
         self.cache.unlock(dr.req.lock)
 
+    def test_admission_host_pin_survives_until_dma_owns_the_prefix(self):
+        self._host_prefix()
+        dr = self._request(0)
+        self.queue._pin_hicache_host_prefix(dr.prefix_match)
+        self.assertEqual(self.cache.evict_host(1024), 0)
+        self.queue._process_hicache_local_restores([dr])
+        self.assertIsNone(dr.prefix_match.host_lock_receipt)
+        # Releasing admission's pin must not release the copy's own host pin.
+        self.assertEqual(self.cache.evict_host(1024), 0)
+        self._complete()
+        self.queue._clean_hicache_prefetch_resources(dr)
+        self.cache.unlock(dr.req.lock)
+        self.assertEqual(
+            self.cache.evict(EvictParams(num_tokens=1024)).num_tokens_evicted, 128
+        )
+        # This fixture uses a standalone CPU allocator rather than a host group.
+        self.cache.host_pool_group = SimpleNamespace(
+            free=lambda indices, pool: self.controller.mem_pool_host.free(indices)
+        )
+        self.assertGreater(self.cache.evict_host(1024), 0)
+        self.cache.sanity_check()
+
+    def test_cancel_before_load_back_releases_admission_host_pin(self):
+        self._host_prefix()
+        dr = self._request(0)
+        self.queue._pin_hicache_host_prefix(dr.prefix_match)
+        self.assertEqual(self.cache.evict_host(1024), 0)
+        self.queue._clean_hicache_prefetch_resources(dr)
+        self.queue._clean_hicache_prefetch_resources(dr)
+        self.cache.unlock(dr.req.lock)
+        self.assertIsNone(dr.prefix_match.host_lock_receipt)
+        # This fixture uses a standalone CPU allocator rather than a host group.
+        self.cache.host_pool_group = SimpleNamespace(
+            free=lambda indices, pool: self.controller.mem_pool_host.free(indices)
+        )
+        self.assertGreater(self.cache.evict_host(1024), 0)
+        self.cache.sanity_check()
+
     def test_concurrent_shared_prefix_and_l1_follower_wait_for_dma(self):
         self._host_prefix()
         requests = [self._request(0), self._request(1)]
