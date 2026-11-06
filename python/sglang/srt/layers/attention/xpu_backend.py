@@ -11,7 +11,10 @@ from sglang.kernels.ops.attention.metadata import (
 )
 from sglang.kernels.ops.attention.utils import assert_buffer_fits
 from sglang.srt.configs.model_config import AttentionArch
-from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.base_attn_backend import (
+    AttentionBackend,
+    resolve_window_id_space,
+)
 from sglang.srt.layers.attention.flashattention_backend import (
     FlashAttentionMetadata,
     merge_state_v2_wrapper,
@@ -186,8 +189,25 @@ class XPUAttentionBackend(AttentionBackend):
         # Pool refs — captured at construction so they survive deletion of the
         # corresponding ForwardBatch fields.
         self.req_to_token_pool = model_runner.req_to_token_pool
-        self.token_to_kv_pool = model_runner.token_to_kv_pool
+        self.is_frozen_kv_mtp_draft = (
+            model_runner.is_draft_worker
+            and model_runner.spec_algorithm.is_frozen_kv_mtp()
+        )
+        # Frozen-KV drafts own only a dummy pool; reads and SWA translation
+        # must use the target allocator's pool, including during graph setup.
+        self.token_to_kv_pool = (
+            model_runner.token_to_kv_pool_allocator.get_kvcache()
+            if self.is_frozen_kv_mtp_draft
+            else model_runner.token_to_kv_pool
+        )
         self.runner_ids = model_runner.runner_ids
+        # The draft runner's ids name its dummy pool; a frozen draft's window reads
+        # take the target pool's window ids instead.
+        self._frozen_draft_window_space = (
+            resolve_window_id_space(model_runner, self.token_to_kv_pool)
+            if self.is_frozen_kv_mtp_draft
+            else None
+        )
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.kv_cache_dtype = model_runner.kv_cache_dtype
         self.kv_cache_dtype_str = model_runner.kv_cache_dtype_str
@@ -195,10 +215,8 @@ class XPUAttentionBackend(AttentionBackend):
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         self.skip_prefill = skip_prefill
         self.is_hybrid_swa = model_runner.is_hybrid_swa
-        self.use_sliding_window_kv_pool = (
-            model_runner.token_to_kv_pool.layer_router.routes_to(
-                IdSpaceKind.SLIDING_WINDOW
-            )
+        self.use_sliding_window_kv_pool = self.token_to_kv_pool.layer_router.routes_to(
+            IdSpaceKind.SLIDING_WINDOW
         )
         self.topk = get_spec().speculative_eagle_topk or 0
         self.speculative_num_steps = speculative_num_steps
@@ -274,6 +292,11 @@ class XPUAttentionBackend(AttentionBackend):
         self.bidirectional_block_ids = None
         # Set with the ids by models whose full-attention layers stay causal.
         self.bidirectional_sliding_layers_only = False
+
+    def _window_ids(self, full_ids: torch.Tensor) -> torch.Tensor:
+        if self._frozen_draft_window_space is not None:
+            return self._frozen_draft_window_space.ids(full_ids)
+        return self.runner_ids.ids_in(IdSpaceKind.SLIDING_WINDOW, full_ids)
 
     def _assert_dcp_supported(self):
         if self.has_swa:
@@ -684,12 +707,12 @@ class XPUAttentionBackend(AttentionBackend):
         if self.use_sliding_window_kv_pool:
             # flash_attn_with_kvcache requires int32 page tables; the SWA index
             # mapping is int64, so cast (matches flashattention_backend.py).
-            metadata.swa_page_table = self.runner_ids.ids_in(
-                IdSpaceKind.SLIDING_WINDOW, metadata.page_table
-            ).to(torch.int32)
+            metadata.swa_page_table = self._window_ids(metadata.page_table).to(
+                torch.int32
+            )
             if forward_batch.out_cache_loc is not None:
-                metadata.swa_out_cache_loc = self.runner_ids.ids_in(
-                    IdSpaceKind.SLIDING_WINDOW, forward_batch.out_cache_loc
+                metadata.swa_out_cache_loc = self._window_ids(
+                    forward_batch.out_cache_loc
                 )
 
         if self.use_mla:
@@ -868,9 +891,7 @@ class XPUAttentionBackend(AttentionBackend):
                 if metadata.swa_page_table is not None:
                     page_table = metadata.swa_page_table
                 else:
-                    page_table = self.runner_ids.ids_in(
-                        IdSpaceKind.SLIDING_WINDOW, metadata.page_table
-                    ).to(torch.int32)
+                    page_table = self._window_ids(metadata.page_table).to(torch.int32)
             cu_seqlens_q = metadata.cu_seqlens_q
             cache_seqlens = metadata.cache_seqlens_int32
             max_seqlen_q = metadata.max_seq_len_q
@@ -1589,9 +1610,9 @@ class XPUAttentionBackend(AttentionBackend):
                     if metadata.swa_page_table is not None:
                         page_table = metadata.swa_page_table
                     else:
-                        page_table = self.runner_ids.ids_in(
-                            IdSpaceKind.SLIDING_WINDOW, metadata.page_table
-                        ).to(torch.int32)
+                        page_table = self._window_ids(metadata.page_table).to(
+                            torch.int32
+                        )
 
                 cache_seqlens = metadata.cache_seqlens_int32
                 cu_seqlens_k = metadata.cu_seqlens_k
@@ -1896,7 +1917,7 @@ class XPUAttentionBackend(AttentionBackend):
                 seq_len_delta=kv_len_offset,
             )
 
-        if self.use_sliding_window_kv_pool:
+        if self.use_sliding_window_kv_pool and not self.is_frozen_kv_mtp_draft:
             if forward_batch.out_cache_loc is None:
                 raise ValueError(
                     f"out_cache_loc is None for hybrid SWA model in graph "
@@ -1906,11 +1927,7 @@ class XPUAttentionBackend(AttentionBackend):
             swa_out_cache_loc = self.decode_cuda_graph_metadata["swa_out_cache_loc"]
             n = forward_batch.out_cache_loc.shape[0]
             swa_out_cache_loc[n:].zero_()
-            swa_out_cache_loc[:n].copy_(
-                self.runner_ids.ids_in(
-                    IdSpaceKind.SLIDING_WINDOW, forward_batch.out_cache_loc
-                )
-            )
+            swa_out_cache_loc[:n].copy_(self._window_ids(forward_batch.out_cache_loc))
             metadata.swa_out_cache_loc = swa_out_cache_loc[:n]
 
         self.forward_metadata = metadata

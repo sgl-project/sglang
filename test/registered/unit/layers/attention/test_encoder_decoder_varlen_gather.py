@@ -9,6 +9,7 @@ import torch
 # imported inside it while their torch op registrations stay.
 import sglang.srt.model_executor.forward_batch_info  # noqa: F401
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 with patch.dict(
     sys.modules,
@@ -26,6 +27,78 @@ with patch.dict(
     from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+class TestFrozenKVPoolBinding(CustomTestCase):
+    """A frozen draft must translate through target SWA, not its dummy pool."""
+
+    def test_frozen_and_independent_draft_pool_ownership(self):
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        window_space = object()
+        dummy_pool = MagicMock()
+        dummy_pool.layer_router.routes_to.return_value = False
+        target_pool = MagicMock()
+        target_pool.layer_router.routes_to.return_value = True
+        target_pool.id_spaces.return_value = {
+            xpu_backend.IdSpaceKind.SLIDING_WINDOW: window_space
+        }
+        runner = SimpleNamespace(
+            model_config=SimpleNamespace(
+                context_len=128,
+                hf_text_config=SimpleNamespace(num_attention_heads=4),
+                is_encoder_decoder=False,
+                attention_arch=xpu_backend.AttentionArch.MHA,
+            ),
+            sliding_window_size=511,
+            device="cpu",
+            req_to_token_pool=SimpleNamespace(
+                req_to_token=torch.zeros((1, 128), dtype=torch.int32)
+            ),
+            token_to_kv_pool=dummy_pool,
+            token_to_kv_pool_allocator=SimpleNamespace(
+                get_kvcache=lambda: target_pool, hands_out_virtual_ids=False
+            ),
+            runner_ids=object(),
+            kv_cache_dtype=torch.bfloat16,
+            kv_cache_dtype_str="bfloat16",
+            page_size=64,
+            is_hybrid_swa=True,
+            is_draft_worker=True,
+        )
+        with (
+            patch.object(
+                xpu_backend,
+                "get_parallel",
+                return_value=SimpleNamespace(
+                    tp_size=1, attn_dcp_size=1, attn_dcp_rank=0
+                ),
+            ),
+            patch.object(
+                xpu_backend,
+                "get_spec",
+                return_value=SimpleNamespace(
+                    speculative_eagle_topk=1, speculative_num_draft_tokens=4
+                ),
+            ),
+            patch.object(
+                xpu_backend,
+                "get_exec",
+                return_value=SimpleNamespace(
+                    deterministic=SimpleNamespace(enable_deterministic_inference=False)
+                ),
+            ),
+        ):
+            for algorithm, expected_pool, translates_swa, expected_space in (
+                (SpeculativeAlgorithm.FROZEN_KV_MTP, target_pool, True, window_space),
+                (SpeculativeAlgorithm.EAGLE, dummy_pool, False, None),
+            ):
+                with self.subTest(algorithm=algorithm):
+                    runner.spec_algorithm = algorithm
+                    backend = XPUAttentionBackend(runner)
+                    self.assertIs(backend.token_to_kv_pool, expected_pool)
+                    self.assertEqual(backend.use_sliding_window_kv_pool, translates_swa)
+                    self.assertIs(backend._frozen_draft_window_space, expected_space)
 
 
 class TestEncoderDecoderForward(unittest.TestCase):

@@ -150,11 +150,15 @@ export const Gemma4Deployment = () => {
       if (hardware === 'xeon') {
         cmd += ` \\\n  --speculative-algorithm NGRAM`;
       } else {
+        const xpuE2B = hardware === 'arc_b' && modelSize === 'e2b';
         cmd += ` \\\n  --speculative-algorithm NEXTN`;
         cmd += ` \\\n  --speculative-draft-model-path ${modelPath}-assistant`;
-        cmd += ` \\\n  --speculative-num-steps 5`;
-        cmd += ` \\\n  --speculative-num-draft-tokens 6`;
+        cmd += ` \\\n  --speculative-num-steps ${xpuE2B ? 3 : 5}`;
+        cmd += ` \\\n  --speculative-num-draft-tokens ${xpuE2B ? 4 : 6}`;
         cmd += ` \\\n  --speculative-eagle-topk 1`;
+        if (xpuE2B) {
+          cmd += ` \\\n  --max-running-requests 8`;
+        }
       }
     }
 
@@ -240,7 +244,7 @@ export const Gemma4Deployment = () => {
       if (prev.hardware === 'arc_b' && optionName === 'checkpoint' && value !== 'standard') {
         return prev;
       }
-      if (prev.hardware === 'arc_b' && optionName === 'speculative' && value !== 'disabled') {
+      if (prev.hardware === 'arc_b' && prev.modelSize !== 'e2b' && optionName === 'speculative' && value !== 'disabled') {
         return prev;
       }
 
@@ -250,6 +254,9 @@ export const Gemma4Deployment = () => {
           next.modelSize = '31b';
         }
         next.checkpoint = 'standard';
+        next.speculative = 'disabled';
+      }
+      if (next.hardware === 'arc_b' && next.modelSize !== 'e2b') {
         next.speculative = 'disabled';
       }
       if (optionName === 'hardware' && value === 'xeon') {
@@ -440,6 +447,7 @@ export const Gemma4Deployment = () => {
                     item.id !== 'standard';
                   const isArcBSpeculativeLocked =
                     values.hardware === 'arc_b' &&
+                    values.modelSize !== 'e2b' &&
                     option.name === 'speculative' &&
                     item.id !== 'disabled';
                   const isXeonQatLocked =
