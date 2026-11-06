@@ -4,7 +4,8 @@ from unittest.mock import patch
 
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import CacheAwarePolicy, SchedulePolicy
-from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.mem_cache.base_prefix_cache import InsertParams
+from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -225,6 +226,44 @@ class TestShortestPrefillFirst(CustomTestCase):
                 256,
             )
         )
+
+
+class TestAdmissionMatchedPrefixTokens(CustomTestCase):
+    """The admission re-match must record num_matched_prefix_tokens.
+
+    Cache-agnostic policies (fcfs, lof, random, routing-key) skip the
+    sort-time match, so this is the only place their requests record it; a
+    request left at 0 makes load snapshots and cache-hit reporting read zero
+    reuse (#43094).
+    """
+
+    PREFIX = list(range(64))
+
+    def _cache_with_prefix(self):
+        tree_cache = RadixCache.create_simulated()
+        tree_cache.insert(InsertParams(key=RadixKey(token_ids=array("q", self.PREFIX))))
+        return tree_cache
+
+    def test_warm_req_records_match_length(self):
+        req = _make_req("warm", "", self.PREFIX + [7, 8, 9])
+        req.init_next_round_input(self._cache_with_prefix())
+        self.assertEqual(req.num_matched_prefix_tokens, len(self.PREFIX))
+
+    def test_cold_req_records_zero(self):
+        req = _make_req("cold", "", [100 + i for i in range(80)])
+        req.init_next_round_input(self._cache_with_prefix())
+        self.assertEqual(req.num_matched_prefix_tokens, 0)
+
+    def test_rematch_after_retraction_records_again(self):
+        # Retraction zeroes the field; the next admission must record the
+        # reuse again rather than keep the reset value.
+        tree_cache = self._cache_with_prefix()
+        req = _make_req("warm", "", self.PREFIX + [7, 8, 9])
+        req.init_next_round_input(tree_cache)
+        req.reset_for_retract()
+        self.assertEqual(req.num_matched_prefix_tokens, 0)
+        req.init_next_round_input(tree_cache)
+        self.assertEqual(req.num_matched_prefix_tokens, len(self.PREFIX))
 
 
 if __name__ == "__main__":
