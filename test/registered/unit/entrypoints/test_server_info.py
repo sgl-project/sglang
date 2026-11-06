@@ -157,6 +157,14 @@ def _call_server_info_with(
 
 
 class TestServerInfoTransportParity(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        # The HTTP and follower gRPC paths under test are the Python server's;
+        # a Rust-server node skips the follower metadata server (covered by
+        # `test_rust_server_followers_skip_runtime_metadata_server`), so pin the
+        # mode against an inherited SGLANG_RUST_SERVER=1.
+        self.enterContext(envs.SGLANG_RUST_SERVER.override(False))
+
     def test_rust_launch_info_redacts_the_api_keys(self):
         # Only the API key (or nothing) guards /server_info, so reporting the
         # keys would hand the admin key to every API-key holder.
@@ -287,6 +295,12 @@ class TestServerInfoInternalStatesRedaction(CustomTestCase):
         "admin_api_key": "admin-secret tail-admin",
         "ssl_keyfile_password": "ssl-secret tail-ssl",
     }
+
+    def setUp(self):
+        super().setUp()
+        # Rust-server mode refuses --ssl-keyfile-password at resolution, so pin
+        # the Python server against an inherited SGLANG_RUST_SERVER=1.
+        self.enterContext(envs.SGLANG_RUST_SERVER.override(False))
 
     def _scheduler_readback(self, server_args: ServerArgs) -> dict:
         from sglang.srt.managers.io_struct import GetInternalStateReq
