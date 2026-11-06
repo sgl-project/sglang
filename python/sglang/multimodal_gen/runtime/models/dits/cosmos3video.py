@@ -810,6 +810,9 @@ class Cosmos3CrossAttention(nn.Module):
             supported_attention_backends=supported_attention_backends,
             prefix=add_prefix("attn", prefix),
             is_cross_attention=True,
+            # On one GPU, dense SDPA can be captured with the surrounding
+            # GEN kernels. Other backends and SP still use eager BCG breaks.
+            capture_dense_attention=quant_config is None,
         )
 
     def forward(
@@ -1368,6 +1371,7 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         self.modelopt_fp8_checkpoint = isinstance(
             quant_config, MODELOPT_FP8_QUANT_CONFIGS
         )
+        self.bcg_bf16_eligible = quant_config is None
 
         self.__post_init__()
 
@@ -1543,6 +1547,96 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         if not isinstance(self.cached_gen_rope_inputs, dict):
             self.cached_gen_rope_inputs = {}
 
+    def _enable_t1_fused_qk_norm_rope(self, frames: int) -> bool:
+        return frames == 1 and _can_enable_t1_fused_qk_norm_rope(
+            is_blackwell=current_platform.is_blackwell(),
+            is_hopper=current_platform.is_hopper(),
+            hidden_act=self.hidden_act,
+            hidden_size=self.hidden_size,
+            tp_size=get_tp_world_size(),
+            sp_size=get_sp_world_size(),
+            is_compiled=self._gen_layers_torch_compiled,
+        )
+
+    def prepare_gen_condition(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        text_ids: torch.Tensor,
+        text_mask: torch.Tensor,
+        fps: float | None,
+        cache_key: str,
+        max_text_seq_len: int | None = None,
+        sound_frames: int = 0,
+        action_frames: int = 0,
+        action_fps: float | None = None,
+        action_start_frame_offset: int = 1,
+        control_frame_counts: Sequence[int] = (),
+        transfer_share_vision_temporal_positions: bool = True,
+        temporal_position_period: int | None = None,
+        activation_dtype: torch.dtype | None = None,
+    ) -> tuple[
+        list[tuple[torch.Tensor, torch.Tensor]],
+        tuple[torch.Tensor, torch.Tensor],
+    ]:
+        """Prepare request-local UND K/V and GEN RoPE outside the GEN graph.
+
+        The existing per-branch cache remains an eager-only owner. A graph call
+        receives the returned tensors explicitly, so replay refreshes its
+        static inputs even when the next request uses the same cache key.
+        """
+        if max_text_seq_len is None:
+            max_text_seq_len = int(text_mask.sum(dim=1).max().item())
+        if max_text_seq_len < text_ids.shape[1]:
+            text_ids = text_ids[:, :max_text_seq_len]
+            text_mask = text_mask[:, :max_text_seq_len]
+
+        self._ensure_cache_dicts()
+        if (
+            cache_key not in self.cached_kv
+            or cache_key not in self.cached_gen_rope_inputs
+        ):
+            _, _, frames, height, width = hidden_states.shape
+            hp, wp, _, _ = self._pad_to_patch_size(height, width)
+            text_pos_ids, vis_pos_ids = self._compute_rope_position_ids(
+                text_mask,
+                frames,
+                hp,
+                wp,
+                fps,
+                hidden_states.device,
+                sound_frames=sound_frames,
+                action_frames=action_frames,
+                action_fps=action_fps if action_fps is not None else fps,
+                action_start_frame_offset=action_start_frame_offset,
+                control_frames=control_frame_counts,
+                share_vision_temporal_positions=(
+                    transfer_share_vision_temporal_positions
+                ),
+                temporal_position_period=temporal_position_period,
+            )
+            # UND K/V stays full on each SP rank, as in the eager path.
+            self.cached_kv[cache_key] = self.language_model(
+                text_ids, text_mask, text_pos_ids
+            )
+            if self.sp_size > 1:
+                vis_pos_ids = shard_sequence(
+                    vis_pos_ids, self.sp_size, self.sp_rank, dim=2, pad_last=True
+                )
+            cos_sin_gen, gen_rope_cache_positions = (
+                self.language_model.rotary_emb.build_rope_cache_inputs(
+                    vis_pos_ids,
+                    cache_dtype=activation_dtype or hidden_states.dtype,
+                )
+            )
+            if self._enable_t1_fused_qk_norm_rope(frames):
+                cos_sin_gen = cos_sin_gen.to(activation_dtype or hidden_states.dtype)
+            self.cached_gen_rope_inputs[cache_key] = (
+                cos_sin_gen,
+                gen_rope_cache_positions,
+            )
+        return self.cached_kv[cache_key], self.cached_gen_rope_inputs[cache_key]
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1566,6 +1660,8 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         transfer_share_vision_temporal_positions: bool = True,
         temporal_position_period: int | None = None,
         multiview_layout: Any | None = None,
+        precomputed_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
+        precomputed_gen_rope_inputs: tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Forward pass for denoising.
@@ -1614,16 +1710,19 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
             [B, C, T, H, W] velocity prediction, or a tuple
             (video_pred, ...) with extra tensors when action/sound are active.
         """
-        if text_ids is None or text_mask is None:
+        if (precomputed_kv is None) != (precomputed_gen_rope_inputs is None):
+            raise ValueError("Both precomputed GEN condition inputs are required")
+        if precomputed_kv is None and (text_ids is None or text_mask is None):
             raise ValueError("Cosmos3 requires text_ids and text_mask to be passed")
 
         batch_size, C, T, H, W = hidden_states.shape
         Hp, Wp, _, _ = self._pad_to_patch_size(H, W)
-        if max_text_seq_len is None:
-            max_text_seq_len = int(text_mask.sum(dim=1).max().item())
-        if max_text_seq_len < text_ids.shape[1]:
-            text_ids = text_ids[:, :max_text_seq_len]
-            text_mask = text_mask[:, :max_text_seq_len]
+        if precomputed_kv is None:
+            if max_text_seq_len is None:
+                max_text_seq_len = int(text_mask.sum(dim=1).max().item())
+            if max_text_seq_len < text_ids.shape[1]:
+                text_ids = text_ids[:, :max_text_seq_len]
+                text_mask = text_mask[:, :max_text_seq_len]
 
         sound_frames = sound_latents.shape[-1] if sound_latents is not None else 0
 
@@ -1769,77 +1868,38 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
                     hidden_gen, self.sp_size, self.sp_rank, dim=1, pad_last=False
                 )
 
-        self._ensure_cache_dicts()
-
         # The T=1 fused path is faster on Blackwell. It also benefits the
         # single-GPU Hopper Nano (SwiGLU) and Edge (2048-wide dense) workloads,
         # as well as TP2 Super-Text2Image (SwiGLU). The older dense-MLP Super
         # workload remains on the split path because that shape regresses.
-        enable_t1_fused_qk_norm_rope = T == 1 and _can_enable_t1_fused_qk_norm_rope(
-            is_blackwell=current_platform.is_blackwell(),
-            is_hopper=current_platform.is_hopper(),
-            hidden_act=self.hidden_act,
-            hidden_size=self.hidden_size,
-            tp_size=get_tp_world_size(),
-            sp_size=get_sp_world_size(),
-            is_compiled=self._gen_layers_torch_compiled,
-        )
+        enable_t1_fused_qk_norm_rope = self._enable_t1_fused_qk_norm_rope(T)
 
-        # Compute UND K/V cache for this cache_key if not already cached
-        # This allows reusing the cache across denoising steps for the same text
-        if (
-            cache_key not in self.cached_kv
-            or cache_key not in self.cached_gen_rope_inputs
-        ):
-            text_pos_ids, vis_pos_ids = self._compute_rope_position_ids(
-                text_mask,
-                T,
-                Hp,
-                Wp,
-                fps,
-                hidden_states.device,
-                sound_frames=sound_frames,
-                action_frames=action_frames,
-                action_fps=action_fps if action_fps is not None else fps,
-                action_start_frame_offset=action_start_frame_offset,
-                control_frames=control_frame_counts,
-                share_vision_temporal_positions=(
-                    transfer_share_vision_temporal_positions
-                ),
-                temporal_position_period=temporal_position_period,
-            )
-            # UND K/V cache is kept FULL on all ranks (not sharded). Text
-            # sequence is short, so memory impact is minimal, and the GEN
-            # cross-attention needs the full K/V on every SP rank.
-            self.cached_kv[cache_key] = self.language_model(
-                text_ids, text_mask, text_pos_ids
-            )
-            if sequence_shard_enabled:
-                vis_pos_ids = shard_sequence(
-                    vis_pos_ids, self.sp_size, self.sp_rank, dim=2, pad_last=True
-                )
-            cos_sin_gen, gen_rope_cache_positions = (
-                self.language_model.rotary_emb.build_rope_cache_inputs(
-                    vis_pos_ids, cache_dtype=hidden_gen.dtype
+        if precomputed_kv is None:
+            cached_kv_for_key, (cos_sin_gen, gen_rope_cache_positions) = (
+                self.prepare_gen_condition(
+                    hidden_states=hidden_states,
+                    text_ids=text_ids,
+                    text_mask=text_mask,
+                    fps=fps,
+                    cache_key=cache_key,
+                    max_text_seq_len=max_text_seq_len,
+                    sound_frames=sound_frames,
+                    action_frames=action_frames,
+                    action_fps=action_fps,
+                    action_start_frame_offset=action_start_frame_offset,
+                    control_frame_counts=control_frame_counts,
+                    transfer_share_vision_temporal_positions=(
+                        transfer_share_vision_temporal_positions
+                    ),
+                    temporal_position_period=temporal_position_period,
+                    activation_dtype=hidden_gen.dtype,
                 )
             )
-            if enable_t1_fused_qk_norm_rope:
-                # build_rope_cache_inputs already rounds through cache_dtype
-                # before returning FP32 storage. Keep that rounded cache in the
-                # activation dtype so the exact fused QKNorm+RoPE kernel can
-                # consume it without repeating the cast in every GEN layer.
-                cos_sin_gen = cos_sin_gen.to(hidden_gen.dtype)
-            self.cached_gen_rope_inputs[cache_key] = (
-                cos_sin_gen,
-                gen_rope_cache_positions,
-            )
+        else:
+            cached_kv_for_key = precomputed_kv
+            cos_sin_gen, gen_rope_cache_positions = precomputed_gen_rope_inputs
 
-        cos_sin_gen, gen_rope_cache_positions = self.cached_gen_rope_inputs[cache_key]
-
-        # Run GEN layers. `residual` is threaded so each layer's
-        # input_layernorm and post_attention_layernorm can use the
-        # fused add+rmsnorm path instead of separate add + norm kernels.
-        cached_kv_for_key = self.cached_kv[cache_key]
+        # Run GEN layers. The residual carry enables fused add+rmsnorm.
         residual: torch.Tensor | None = None
         round_norm_before_rope = enable_t1_fused_qk_norm_rope
         use_fused_qk_norm_rope = T > 1 or (

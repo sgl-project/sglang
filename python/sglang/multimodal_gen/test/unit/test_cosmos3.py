@@ -25,7 +25,7 @@ from sglang.multimodal_gen.configs.sample.cosmos3 import (
     Cosmos3SamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
-from sglang.multimodal_gen.configs.task_type import DataType
+from sglang.multimodal_gen.configs.task_type import DataType, ModelTaskType
 from sglang.multimodal_gen.registry import (
     _PIPELINE_REGISTRY,
     _discover_and_register_pipelines,
@@ -82,6 +82,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_guardrails import (
     is_cosmos_guardrail_available,
 )
+from sglang.multimodal_gen.runtime.warmup_request_builder import build_warmup_reqs
 from sglang.srt.environ import envs
 from sglang.test.test_utils import CustomTestCase
 
@@ -2410,6 +2411,88 @@ class TestCosmos3VideoPreprocess(CustomTestCase):
             stage.vae.use_tiling = True
             self.assertTrue(torch.equal(stage._vae_encode(video), video * 2))
             self.assertEqual(stage.vae.calls, 3)
+
+
+class TestCosmos3BCGWarmup(CustomTestCase):
+    def test_v2v_warmup_keeps_conditioning_and_prompt(self):
+        """A startup capture must exercise the V2V mask and real UND length.
+
+        Dropping either field captures a T2V graph or a placeholder-length
+        graph, so the first measured V2V request silently runs eager.
+        """
+        defaults = Cosmos3SamplingParams(
+            width=832,
+            height=480,
+            num_frames=45,
+            num_inference_steps=35,
+            prompt="A robotic arm moves tools into a box on a clean table.",
+            negative_prompt="blurry, distorted, high quality",
+            video_path="/tmp/cosmos3_warmup.mp4",
+            condition_frame_indexes=[0, 1],
+        )
+        args = mock.MagicMock()
+        args.pipeline_config = Cosmos3Config()
+        args.enable_breakable_cuda_graph = True
+        args.enable_torch_compile = False
+        args.enable_cfg_parallel = False
+        args.warmup_sampling_params = {"video_path": defaults.video_path}
+        args.warmup_num_frames = 45
+        args.warmup_steps = 1
+        args.num_gpus = 1
+        with mock.patch(
+            "sglang.multimodal_gen.runtime.warmup_request_builder.get_model_sampling_defaults",
+            return_value=defaults,
+        ):
+            reqs = build_warmup_reqs(
+                args,
+                warmup_resolutions=["832x480"],
+                server_based_warmup=True,
+            )
+        self.assertEqual(len(reqs), 1)
+        req = reqs[0]
+        self.assertTrue(req.is_warmup)
+        self.assertEqual(req.prompt, defaults.prompt)
+        self.assertEqual(req.negative_prompt, defaults.negative_prompt)
+        self.assertEqual(req.video_path, defaults.video_path)
+        self.assertIsNone(req.image_path)
+        self.assertEqual(req.condition_frame_indexes, [0, 1])
+        self.assertEqual(req.num_frames, 45)
+        self.assertEqual(req.num_inference_steps, 35)
+        self.assertFalse(req.save_output)
+
+    def test_t2i_warmup_keeps_image_output_and_text_condition(self):
+        defaults = Cosmos3SamplingParams(
+            width=640,
+            height=640,
+            num_frames=1,
+            num_inference_steps=35,
+            prompt="A robotic arm moves tools into a box.",
+        )
+        args = mock.MagicMock()
+        args.pipeline_config = Cosmos3Config()
+        args.enable_breakable_cuda_graph = True
+        args.enable_torch_compile = False
+        args.enable_cfg_parallel = False
+        args.warmup_sampling_params = {"num_frames": 1}
+        args.warmup_num_frames = 1
+        args.warmup_steps = 35
+        args.num_gpus = 1
+        with mock.patch(
+            "sglang.multimodal_gen.runtime.warmup_request_builder.get_model_sampling_defaults",
+            return_value=defaults,
+        ):
+            req = build_warmup_reqs(
+                args,
+                warmup_resolutions=["640x640"],
+                server_based_warmup=True,
+            )[0]
+        self.assertEqual(req.prompt, defaults.prompt)
+        self.assertIsNone(req.image_path)
+        self.assertIsNone(req.video_path)
+        self.assertEqual(req.num_frames, 1)
+        self.assertEqual(req.task_type, ModelTaskType.T2I)
+        self.assertEqual(req.data_type, DataType.IMAGE)
+        self.assertFalse(req.save_output)
 
 
 if __name__ == "__main__":
