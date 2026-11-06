@@ -2147,12 +2147,9 @@ def full_linker_component():
     return SimpleNamespace(
         component_type=ComponentType.FULL,
         build_external_linker_transfer=MagicMock(side_effect=build_transfer),
-        update_external_linker_load=lambda phase,
-        req,
-        full_transfer,
-        transfer,
-        prefix_len,
-        **kwargs: (transfer),
+        update_external_linker_load=lambda phase, req, full_transfer, transfer, prefix_len, **kwargs: (
+            transfer
+        ),
     )
 
 
