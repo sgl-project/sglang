@@ -109,7 +109,7 @@ def pcg_dsa_indexer_prefill_split(
             False,
             forward_batch,
             layer_id,
-            (q_fp8, None),
+            q_fp8,
             weights,
             metadata,
             topk_result,
@@ -135,7 +135,7 @@ def pcg_dsa_indexer_prefill_split(
             False,
             forward_batch,
             layer_id,
-            (q_fp8, None),
+            q_fp8,
             weights,
             metadata,
             topk_result,
@@ -149,8 +149,7 @@ def pcg_dsa_indexer_prefill_split(
         enable_dual_stream=False,
         forward_batch=forward_batch,
     )
-    q_with_sf, q_scale = indexer._quantize_query(query, act_quant)
-    q, q_sf = q_with_sf
+    q_fp8, q_scale = indexer._quantize_query(query, act_quant)
     # Reuse the compiled head-gate util shared with the eager path.
     weights = (  # same head-gate choice as the eager CP branch
         indexer._scale_head_gates(weights_raw, q_scale)
@@ -178,14 +177,7 @@ def pcg_dsa_indexer_prefill_split(
         False,
         forward_batch,
         layer_id,
-        (
-            (q, q_sf)
-            if in_cp
-            else (
-                q[:extend_num_tokens],
-                q_sf[:extend_num_tokens] if q_sf is not None else None,
-            )
-        ),
+        q_fp8 if in_cp else q_fp8[:extend_num_tokens],
         weights,
         metadata,
         topk_result,

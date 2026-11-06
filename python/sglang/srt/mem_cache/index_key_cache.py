@@ -70,10 +70,7 @@ class IndexKeyCache:
         src_loc_flat = src_loc.view(-1).long()
         tgt_page, tgt_offset = tgt_loc_flat // page_size, tgt_loc_flat % page_size
         src_page, src_offset = src_loc_flat // page_size, src_loc_flat % page_size
-        key_dim_bytes = self.pool.index_head_dim // (
-            2 if self.pool.use_fp4_indexer else 1
-        )
-        key_bytes = page_size * key_dim_bytes
+        key_bytes = page_size * self.pool.index_key_bytes_per_token
         for index_k in self.buffer:
             if index_k.shape[0] == 0:
                 continue

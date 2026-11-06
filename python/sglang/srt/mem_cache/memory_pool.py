@@ -4215,7 +4215,7 @@ class HybridLinearKVPool(KVCache):
                 max_running_requests=max_running_requests,
                 skip_topk_layers=skip_topk_layers,
                 kv_scale_ue8m0=kv_scale_ue8m0,
-                **({"use_fp4_indexer": True} if use_fp4_indexer else {}),
+                use_fp4_indexer=use_fp4_indexer,
             )
         else:
             MLAPoolClass = (
@@ -5252,6 +5252,12 @@ class DSATokenToKVPool(MLATokenToKVPool):
             # Packed E2M1 values and four per-32 UE8M0 exponents.
             return index_head_dim // 2 + index_head_dim // 32
         return index_head_dim + index_head_dim // DSATokenToKVPool.quant_block_size * 4
+
+    @property
+    def index_key_bytes_per_token(self) -> int:
+        """Bytes of one token's index-K values, without its scale."""
+        # Packed E2M1 stores two values per byte.
+        return self.index_head_dim // 2 if self.use_fp4_indexer else self.index_head_dim
 
     def __init__(
         self,

@@ -1,9 +1,11 @@
 import unittest
+from unittest.mock import patch
 
 import test_dsa_indexer as base
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.dsa_fp4_indexer import Fp4Indexer
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -24,11 +26,8 @@ class TestDSAIndexerFp4(CustomTestCase):
         if torch.cuda.get_device_capability()[0] != 10:
             self.skipTest("DeepGEMM FP4 MQA requires SM100")
 
-        self.enterContext(
-            get_context().override_server_args(
-                enable_fp4_indexer=True, dsa_topk_backend="torch"
-            )
-        )
+        self.enterContext(get_context().override_server_args(dsa_topk_backend="torch"))
+        self.enterContext(patch.object(base, "Indexer", Fp4Indexer))
         self.enterContext(envs.SGLANG_DSA_FUSE_TOPK.override(False))
         self.batch_size = 1
         self._init_model_runner({"use_fp4_indexer": True})

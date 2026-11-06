@@ -2243,8 +2243,6 @@ class KVCacheConfigurator:
             pool_kwargs["layer_shard_size"] = dsa_cp_layer_shard_size
         else:
             PoolCls = dsa_pool_class
-        if get_exec().kernel.enable_fp4_indexer:
-            pool_kwargs["use_fp4_indexer"] = True
         if self.loc_space_scale > 1:
             pool_kwargs["dcp_replicated"] = True
         if _should_elide_dsa_index_k(is_draft_worker=self.is_draft_worker):
@@ -2277,6 +2275,7 @@ class KVCacheConfigurator:
             tail_extra_slots=(max_speculative_num_draft_tokens() or 0),
             max_running_requests=max_running_requests,
             kv_scale_ue8m0=is_kimi_k31(self.model_config.hf_config),
+            use_fp4_indexer=get_exec().kernel.enable_fp4_indexer,
             **pool_kwargs,
         )
         return token_to_kv_pool
@@ -2314,9 +2313,8 @@ class KVCacheConfigurator:
                     model_config=self.model_config,
                     kv_cache_dtype=self.kv_cache_dtype,
                 ),
+                use_fp4_indexer=get_exec().kernel.enable_fp4_indexer,
             )
-            if get_exec().kernel.enable_fp4_indexer:
-                full_pool_kwargs["use_fp4_indexer"] = True
 
         return SWAKVPool(
             size=full_max_total_num_tokens,
