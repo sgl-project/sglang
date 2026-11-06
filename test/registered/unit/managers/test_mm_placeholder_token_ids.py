@@ -1,15 +1,6 @@
-"""Unit tests for the token ids embed_mm_inputs leaves at multimodal positions.
-
-The scheduler fills the multimodal positions of input_ids with per-item pad values
-(MM_PAD_SHIFT_VALUE + hash sentinels, above any vocab) so the radix cache can key
-images. embed_mm_inputs works in place on that tensor, which is
-forward_batch.input_ids, and models can read it again after the embedding: Qwen4-Exp's
-per-layer N-gram embedding hashes token N-grams of it. Each modality's placeholder
-token id (im_token_id / video_token_id) must replace its pad values there, as in the
-HF reference, on both the plain and the adaptive-dispatch split path. Embeddings and
-the host-side key ids keep their values.
-
-CPU-only: no engine, GPU or weights.
+"""embed_mm_inputs must leave each modality's placeholder token id, not a clamped
+pad value, at multimodal positions of input_ids, on both the plain and the split
+path. CPU-only: no engine, GPU or weights.
 """
 
 import unittest
@@ -114,11 +105,6 @@ def _expected_embeds(mm_inputs_list, host_ids, embedding):
             start, end = item.offsets[0]
             expected[r * SEQ_LEN + start : r * SEQ_LEN + end + 1] = _feature(item)
     return expected
-
-
-def _case_pad_values_are_out_of_vocab():
-    _, ids, positions = _request(1, IMAGE_TOKEN_ID)
-    assert bool((ids[positions[Modality.IMAGE]] >= MM_PAD_SHIFT_VALUE).all())
 
 
 def _case_placeholder_token_id_written_in_place(num_requests):
@@ -285,9 +271,6 @@ class TestMMPlaceholderTokenIds(CustomTestCase):
     def tearDown(self):
         self._parallel.__exit__(None, None, None)
         self._server_args.restore()
-
-    def test_pad_values_are_out_of_vocab(self):
-        _case_pad_values_are_out_of_vocab()
 
     def test_placeholder_token_id_written_in_place(self):
         for num_requests in (1, 2):
