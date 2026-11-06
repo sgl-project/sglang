@@ -377,6 +377,7 @@ class TritonAttnBackend(AttentionBackend):
         ), "Sliding window and cross attention are not supported together"
 
         # TODO(Jianan Ji): verify behavior when kv_indptr_buf is provided and sliding window is enabled
+        self._owns_kv_indptr = kv_indptr_buf is None
         if kv_indptr_buf is None:
             self.kv_indptr = torch.zeros(
                 (max_bs + 1,), dtype=torch.int32, device=model_runner.device
@@ -1155,6 +1156,24 @@ class TritonAttnBackend(AttentionBackend):
             uneven_batch=uneven_batch,
         )
 
+    def _grow_req_indptr_buffers(self, max_bs: int) -> None:
+        # The per-request indptr buffers are sized from the req pool, but the
+        # graph buckets pad the request count up to the attention TP/CP
+        # alignment (get_batch_sizes_to_capture), so a small pool (e.g. three
+        # requests under PCP8) gets buckets past it. A kv_indptr_buf handed in
+        # by a multi-step backend is shared and stays as its owner sized it.
+        def grown(buf: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+            if buf is None or buf.numel() >= max_bs + 1:
+                return buf
+            return buf.new_zeros((max_bs + 1,))
+
+        if self._owns_kv_indptr:
+            self.kv_indptr = grown(self.kv_indptr)
+            self.window_kv_indptr = grown(self.window_kv_indptr)
+        if not self.skip_prefill:
+            self.qo_indptr = grown(self.qo_indptr)
+            self.mask_indptr = grown(self.mask_indptr)
+
     def init_cuda_graph_state(
         self,
         max_bs: int,
@@ -1162,6 +1181,7 @@ class TritonAttnBackend(AttentionBackend):
         kv_indices_buf: Optional[torch.Tensor] = None,
         cuda_graph_num_kv_splits_buf: Optional[torch.Tensor] = None,
     ):
+        self._grow_req_indptr_buffers(max_bs)
         if self.dllm_attention is not None:
             self.dllm_attention.init_graph_state(max_bs, max_num_tokens)
         self.cuda_graph_attn_logits = torch.zeros(
