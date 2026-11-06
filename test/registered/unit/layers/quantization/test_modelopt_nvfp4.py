@@ -6,6 +6,7 @@ import torch.nn as nn
 
 from sglang.srt.layers.linear import MergedColumnParallelLinear, QKVParallelLinear
 from sglang.srt.layers.parameter import PerTensorScaleParameter
+from sglang.srt.layers.quantization import modelopt_quant
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp4LinearMethod,
@@ -151,6 +152,56 @@ class TestModelOptNvfp4(CustomTestCase):
         self.assertFalse(bf16_shared.can_fuse_shared_expert())
         # Only the gate is BF16 (Qwen3-Next NVFP4): the FP4 body still fuses.
         self.assertTrue(gate_only_bf16.can_fuse_shared_expert())
+
+
+class TestModelOptNvfp4FusedWeightScale2(CustomTestCase):
+    """The NVFP4 GEMMs take one weight_scale_2 per layer, the largest of the
+    fused projections'. A projection with a smaller one is dequantized wrong,
+    so the post-load step warns, as the NVFP4A16 linear method does."""
+
+    def test_warns_when_fused_weight_scale_2_differ(self):
+        with self.assertLogs(modelopt_quant.logger, level="WARNING") as logs:
+            modelopt_quant._warn_if_fused_weight_scale_2_differ(
+                torch.tensor([0.25, 1.0]), "NVFP4"
+            )
+        self.assertIn("weight_scale_2 differs across fused", logs.output[0])
+
+    def test_shared_weight_scale_2_is_silent(self):
+        with self.assertNoLogs(modelopt_quant.logger, level="WARNING"):
+            modelopt_quant._warn_if_fused_weight_scale_2_differ(
+                torch.tensor([1.0, 1.0]), "NVFP4"
+            )
+
+    def test_fp4_linear_post_load_checks_weight_scale_2(self):
+        config = ModelOptFp4Config(
+            is_checkpoint_nvfp4_serialized=True,
+            group_size=16,
+            use_per_token_activation=False,
+        )
+        method = ModelOptFp4LinearMethod(config)
+        layer = nn.Module()
+        method.create_weights(
+            layer,
+            input_size_per_partition=16,
+            output_partition_sizes=[16, 16],
+            input_size=16,
+            output_size=32,
+            params_dtype=torch.bfloat16,
+            weight_loader=default_weight_loader,
+        )
+        layer.weight_scale_2.data.copy_(torch.tensor([0.25, 1.0]))
+
+        class Checked(Exception):
+            pass
+
+        with patch.object(
+            modelopt_quant,
+            "_warn_if_fused_weight_scale_2_differ",
+            side_effect=Checked,
+        ) as check:
+            with self.assertRaises(Checked):
+                method.process_weights_after_loading(layer)
+        torch.testing.assert_close(check.call_args.args[0], torch.tensor([0.25, 1.0]))
 
 
 if __name__ == "__main__":

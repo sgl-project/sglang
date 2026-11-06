@@ -31,6 +31,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW4A16Nvfp4MoE,
     CompressedTensorsW8A8Fp8MoE,
     CompressedTensorsWNA16,
+    compressed_tensors_w4a4_nvfp4,
 )
 from sglang.srt.layers.quantization.fp4_utils import Fp4GemmRunnerBackend
 from sglang.srt.runtime_context import override_platform
@@ -381,6 +382,36 @@ class TestWeightOnlyFp4WeightCreation(CustomTestCase):
         layer.w2_weight_global_scale.data.fill_(2.0)
         with self.assertRaisesRegex(ValueError, r"experts \[3\] differ"):
             scheme.process_weights_after_loading(layer)
+
+
+class TestW4A4Fp4FusedGlobalScales(CustomTestCase):
+    """The NVFP4 W4A4 GEMM takes one weight global scale per layer. Fused
+    projections whose scales differ cannot share one without changing the
+    other projections' weights, as in the weight-only path."""
+
+    def _process(self, global_scales):
+        scheme = CompressedTensorsW4A4Fp4()
+        layer = _linear_layer(scheme, output_partition_sizes=(256, 128, 128))
+        layer.weight_global_scale.data.copy_(torch.tensor(global_scales))
+        layer.input_global_scale.data.fill_(2.0)
+        layer.weight_scale.data.zero_()
+        backend = SimpleNamespace(is_flashinfer_trtllm=lambda: False)
+        with mock.patch.object(
+            compressed_tensors_w4a4_nvfp4,
+            "get_fp4_gemm_runner_backend",
+            return_value=backend,
+        ):
+            scheme.process_weights_after_loading(layer)
+        return layer
+
+    def test_mismatched_fused_global_scales_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "share one weight_global_scale"):
+            self._process([256.0, 1024.0, 1024.0])
+
+    def test_shared_fused_global_scale_is_kept(self):
+        layer = self._process([1024.0, 1024.0, 1024.0])
+        self.assertEqual(layer.weight_global_scale.item(), 1024.0)
+        self.assertEqual(layer.alpha.item(), 1 / (2.0 * 1024.0))
 
 
 class TestWeightOnlyFp4BackendSelection(CustomTestCase):

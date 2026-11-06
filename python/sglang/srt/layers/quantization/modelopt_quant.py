@@ -1766,6 +1766,21 @@ class HybridFp8NvFp4Config(Fp8Config):
         self.nvfp4_config.apply_weight_name_mapper(hf_to_sglang_mapper)
 
 
+def _warn_if_fused_weight_scale_2_differ(
+    weight_scale_2: torch.Tensor, scheme: str
+) -> None:
+    """The FP4 GEMMs take one weight_scale_2 per layer, the largest of the
+    fused projections' (q/k/v, gate/up). A projection with a smaller one is
+    dequantized with the wrong scale."""
+    if torch.unique(weight_scale_2).numel() != 1:
+        logger.warning(
+            "In %s linear, weight_scale_2 differs across fused parallel layers "
+            "(%s); the largest is used for all of them. Accuracy may be degraded.",
+            scheme,
+            weight_scale_2.tolist(),
+        )
+
+
 class ModelOptFp4LinearMethod(LinearMethodBase):
     """Linear method for NVFP4.
     Supports loading NVFP4 checkpoints with the following structure:
@@ -1884,6 +1899,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         input_scale_2 = layer.input_scale.max().to(torch.float32)
+        _warn_if_fused_weight_scale_2_differ(layer.weight_scale_2, "NVFP4")
         weight_scale_2 = layer.weight_scale_2.max().to(torch.float32)
 
         if self.quant_mode == "w4a16":
@@ -2269,11 +2285,7 @@ class ModelOptNvFp4A16LinearMethod(LinearMethodBase):
         if hasattr(layer, "input_scale"):
             del layer.input_scale
 
-        if torch.unique(layer.weight_scale_2).numel() != 1:
-            logger.warning(
-                "In NVFP4A16 linear, weight_scale_2 differs across fused "
-                "parallel layers. Accuracy may be degraded."
-            )
+        _warn_if_fused_weight_scale_2_differ(layer.weight_scale_2, "NVFP4A16")
 
         copy_or_rebind_param(
             layer,
