@@ -208,5 +208,6 @@ def attn_res_hip(
         HAS_ADD=has_add,
         WRITE_BANK=write_prefix,
         APPLY_OUT_NORM=ow is not None,
-        num_warps=4,
+        # an 8-row bank tile spills at 4 warps (measured on MI350X, H=7168)
+        num_warps=8 if triton.next_power_of_2(nvb) >= 8 else 4,
     )

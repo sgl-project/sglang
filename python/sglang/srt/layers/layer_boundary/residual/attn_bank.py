@@ -14,18 +14,22 @@
 """A residual read that aggregates a bank of snapshots of itself."""
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attn_residual import AttnResidual
 from sglang.srt.layers.layer_boundary import ops
 from sglang.srt.layers.layer_boundary.contracts import ReadoutFusion
 from sglang.srt.layers.layer_boundary.facts import residual_facts
 from sglang.srt.layers.layer_boundary.layout import SumGroup
-from sglang.srt.layers.layer_boundary.residual import LayerResidualOps
+from sglang.srt.layers.layer_boundary.residual import LayerResidualOps, attn_bank_hip
 from sglang.srt.layers.layer_boundary.residual.add_norm import PLAIN_ADD
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import is_hip
+
+_is_hip = is_hip()
 
 
 class AttnBank:
@@ -63,6 +67,13 @@ def _bank_rows(bank: AttnResidual, hidden_states) -> Optional[slice]:
     if rows == total:
         return None
     parallel = get_parallel()
+    if _is_hip and envs.SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM.get():
+        # gfx950 row-sharded stream: the last ranks' shards may be short or empty
+        start, valid = attn_bank_hip.row_shard(
+            total, parallel.attn_tp_size, parallel.attn_tp_rank
+        )
+        if rows == valid:
+            return slice(start, start + valid)
     if rows * parallel.attn_tp_size != total:
         raise RuntimeError(
             f"{rows} rows are neither the bank's {total} rows nor an "
@@ -100,6 +111,19 @@ class AttnBankState:
     # The bank stays on each rank's attention-TP slice across layers;
     # otherwise every rank writes every row and the attention reads them all.
     reads_slices: bool = False
+    # Whether a batch of this many tokens completes the attention output's sum
+    # onto this rank's 1/TP of the rows, reads the FFN input there and gathers
+    # it, leaving the written residual on the shard for an FFN that consumes
+    # it there (K3's row-sharded MoE tail on gfx950), or None.
+    ffn_row_shards: Optional[Callable[[int], bool]] = None
+    # With ffn_row_shards: the FFN's own work on this rank's normed rows and the
+    # gather of what it needs, in place of gathering the normed input. Takes the
+    # padded rows and the token count; False leaves the gather to the read.
+    ffn_shard_front: Optional[Callable[[torch.Tensor, int], bool]] = None
+    # With ffn_row_shards: the attention output's complete sum on this rank's
+    # padded rows when the attention produced it there, else None (the read
+    # reduce-scatters its TP-partial output).
+    ffn_attn_rows: Optional[Callable[[int], Optional[torch.Tensor]]] = None
 
     def _aggregate(
         self, contribution, residual, norm, *, score_proj, score_norm, write
@@ -132,6 +156,16 @@ class AttnBankState:
             score_norm=self.attn_score_norm,
             write=self.writes_block,
         )
+        total = self.bank.require().block_residual.shape[0]
+        if (
+            _is_hip
+            and envs.SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM.get()
+            and normed.shape[0] != total
+            and not self.reads_slices
+        ):
+            # a stream the MoE tail left on row shards: read here, gather the
+            # attention input; the residual stays on the shard
+            normed = attn_bank_hip.gather_row_shards(normed, total)
         return normed, None if self.writes_block else residual
 
     def update_and_read_ffn_input(self, contribution, residual, norm):
@@ -274,15 +308,18 @@ class _FfnReadout(_BankReadout):
     @property
     def completing_fusions(self) -> Tuple[ReadoutFusion, ...]:
         state = self.state
+        fusions = state.ffn_input_fusions
+        if state.ffn_row_shards is not None:
+            fusions = (attn_bank_hip.row_sharded_ffn_read(state), *fusions)
         if not state.fuses_slice_collectives:
-            return state.ffn_input_fusions
+            return fusions
         reads = ReadoutFusion(
             SumGroup.ATTN_TP,
             state.reduce_scatter_and_read_ffn_input,
             scatters=True,
             reads=True,
         )
-        return (reads, *state.ffn_input_fusions)
+        return (reads, *fusions)
 
     def read(self, residual, norm, quant_format="", post_residual_addition=None):
         # The attention read of a write layer leaves the residual empty, so the
@@ -337,7 +374,16 @@ class AttnBankOutputRead:
         )
         if read is None:
             read = bank.forward(*read_args, self.norm, rows=rows)
-            if rows is not None:
+            if (
+                rows is not None
+                and _is_hip
+                and envs.SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM.get()
+                and not self.reads_attn_tp_slices
+            ):
+                # a stream the MoE tail left on (possibly short) row shards
+                total = bank.block_residual.shape[0]
+                read = (attn_bank_hip.gather_row_shards(read[0], total), read[1])
+            elif rows is not None:
                 read = (self._gather(read[0]), read[1])
         normed, head = read
         return normed if residual is None else (normed, head)

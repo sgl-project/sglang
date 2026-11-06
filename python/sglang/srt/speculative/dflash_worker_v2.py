@@ -66,7 +66,7 @@ from sglang.srt.model_executor.runner_utils.pool import (
     graph_pool_borrow_enabled,
 )
 from sglang.srt.model_loader.weight_utils import get_pp_stage_load_group
-from sglang.srt.models.dflash import DFlashMLAAttention
+from sglang.srt.models.dflash import DFlashDraftModel, DFlashMLAAttention
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_exec,
@@ -151,6 +151,7 @@ _is_npu = is_npu()
 
 
 if TYPE_CHECKING:
+    from sglang.kernels.ops.speculative.dflash_mla_ctx import MlaContextKV
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
@@ -746,6 +747,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_greedy_selected_ids_buf: Optional[torch.Tensor] = None
         self._draft_greedy_index_cap: int = 0
         self._use_fused_kv_materialize = is_cuda() or is_hip() or is_xpu()
+        # built on first use: it stacks the draft's kv_a rows, loaded after init
+        self._mla_ctx: Optional[MlaContextKV] = None
+        self._mla_ctx_resolved = False
         self._fused_kv_helper: Optional[object] = None
         if self._use_fused_kv_materialize:
             self._init_fused_kv_helper()
@@ -1046,7 +1050,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                         "Disable DFLASH draft cuda graph because dp attention "
                         "is enabled (draft runs eager)."
                     )
-            if is_cuda() and capture_decode_cuda_graph:
+            if (is_cuda() or is_hip()) and capture_decode_cuda_graph:
                 available_mem = self._tp_sync.available_memory_gb(
                     SpecTpSyncSite.DFLASH_MEM,
                     self.device,
@@ -1130,9 +1134,10 @@ class DFlashWorkerV2(BaseSpecWorker):
     def prewarm_sampling(self) -> SamplingPrewarmResult:
         """Rehearse the non-greedy verify path so an undersized graph-pool
         borrow surfaces at startup rather than under traffic."""
+        # ROCm prewarms the sampler without graph-pool borrowing; KV is sized before capture.
         if (
             not self._hosts_draft
-            or not is_cuda()
+            or not (is_cuda() or is_hip())
             or not is_dflash_sampling_verify_available()
         ):
             return self.model_runner.prewarm_sampling()
@@ -2253,6 +2258,42 @@ class DFlashWorkerV2(BaseSpecWorker):
         physical ids for a fused draft, the virtual ids for a private one."""
         return plan.write_ids(self.draft_model_runner.runner_ids, kind=kind)
 
+    def _mla_context_kv(self) -> Optional["MlaContextKV"]:
+        """Return the ROCm monokernel's stacked context-KV writer, or None."""
+        if self._mla_ctx_resolved:
+            return self._mla_ctx
+        self._mla_ctx_resolved = True
+        if not (is_hip() and get_exec().kernel.enable_amd_monokernel):
+            return None
+        from sglang.kernels.ops.speculative.dflash_mla_ctx import MlaContextKV
+
+        attns = [layer.self_attn for layer in self.draft_model.layers]
+        # one GEMM serves every layer only when each reads the same projected row
+        if (
+            type(self.draft_model).prepare_context_hidden_for_kv
+            is not DFlashDraftModel.prepare_context_hidden_for_kv
+            or not all(
+                isinstance(a, DFlashMLAAttention) and a.q_lora_rank is not None
+                for a in attns
+            )
+        ):
+            blocker = "not low-rank-q MLA layers reading one projected context row"
+        else:
+            blocker = MlaContextKV.blocker(attns)
+        if blocker is None:
+            self._mla_ctx = MlaContextKV(attns)
+            # the stacked kv_a copy would keep serving the old weights
+            self.draft_model._derived_weight_cache_error = (
+                "Online weight updates are not supported with the stacked DFLASH MLA "
+                "context KV of --enable-amd-monokernel."
+            )
+        if get_parallel().tp_rank == 0:
+            status = (
+                f"{len(attns)} layers" if blocker is None else f"disabled: {blocker}"
+            )
+            logger.info("DFLASH MLA fused context KV: %s", status)
+        return self._mla_ctx
+
     def _append_target_hidden_to_draft_kv_by_loc(
         self,
         *,
@@ -2415,6 +2456,21 @@ class DFlashWorkerV2(BaseSpecWorker):
                         self._use_fused_kv_materialize = False
                         self._fused_kv_helper = None
 
+                mla_ctx = self._mla_context_kv()
+                if mla_ctx is not None:
+                    k_nope, k_pe = mla_ctx.project_all(positions, ctx_hidden)
+                    # set_mla_kv_buffer_prefix_valid's masking, built once for every layer
+                    offsets = torch.arange(cache_loc_2d.shape[1], device=device)
+                    loc = KVWriteLoc(
+                        torch.where(
+                            offsets < commit_lens[:, None], cache_loc_2d, 0
+                        ).reshape(-1),
+                        physical=True,
+                    )
+                    pool = self.draft_model_runner.token_to_kv_pool
+                    for i, attn in enumerate(mla_ctx.attns):
+                        pool.set_mla_kv_buffer(attn.attn_mqa, loc, k_nope[i], k_pe[i])
+                    return
                 for layer in self.draft_model.layers:
                     attn = layer.self_attn
                     layer_ctx_hidden = self.draft_model.prepare_context_hidden_for_kv(

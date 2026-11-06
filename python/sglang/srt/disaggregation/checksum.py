@@ -6,6 +6,7 @@ import torch
 
 from sglang.kernels.ops.memory.adler32 import adler32_strided_checksum
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
+from sglang.srt.layers.dcp.layout import dsa_index_k_page_tokens
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, MiniMaxSparseKVPool
@@ -49,12 +50,12 @@ def page_indices_for_request(
 
 def state_indices_for_request(
     scheduler, req: Req, seq_len: int, start_idx: int = 0
-) -> Optional[torch.Tensor]:
+) -> Optional[torch.Tensor | list[torch.Tensor]]:
     pool = scheduler.token_to_kv_pool_allocator.get_kvcache()
     router = pool.layer_router
     # A pool wrapping one token KV view keeps its other layers' state per request.
     if router.wrapped_view() is not None:
-        return (
+        mamba_indices = (
             scheduler.req_to_token_pool.req_index_to_mamba_index_mapping[
                 req.kv.req_pool_idx
             ]
@@ -62,6 +63,20 @@ def state_indices_for_request(
             .contiguous()
             .reshape(-1)
         )
+        # uncompressed hybrid DSA registers index-K pages as a second state
+        # component, indexed by page rather than by Mamba slot
+        if (
+            getattr(pool, "use_dsa", False)
+            and not pool.full_kv_pool.kpool_use_compress
+        ):
+            kv_indices = scheduler.req_to_token_pool.req_to_token[
+                req.kv.req_pool_idx, start_idx:seq_len
+            ]
+            dsa_indices = _to_page_indices_gpu(
+                kv_indices, dsa_index_k_page_tokens(pool.full_kv_pool.page_size)
+            )
+            return [mamba_indices, dsa_indices]
+        return mamba_indices
     if router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None:
         page_size = scheduler.token_to_kv_pool_allocator.page_size
         window_size = scheduler.sliding_window_size
@@ -98,13 +113,18 @@ class KvChecksumComputer:
         self._kv_item_lens = [int(item_len) for item_len in kv_item_lens]
         self._state_data_ptrs = _flatten_ints(state_data_ptrs)
         self._state_item_lens = _flatten_ints(state_item_lens)
+        self._state_component_sizes = (
+            [len(component) for component in state_data_ptrs]
+            if state_data_ptrs and isinstance(state_data_ptrs[0], (list, tuple))
+            else [len(state_data_ptrs)]
+        )
         assert len(self._state_data_ptrs) == len(self._state_item_lens)
         assert self._kv_data_ptrs or self._state_data_ptrs
 
     def compute(
         self,
         kv_page_indices_gpu: torch.Tensor,
-        state_indices_gpu: Optional[torch.Tensor] = None,
+        state_indices_gpu: Optional[torch.Tensor | Sequence[torch.Tensor]] = None,
     ) -> int:
         assert kv_page_indices_gpu.is_cuda and kv_page_indices_gpu.is_contiguous()
         all_ptrs = list(self._kv_data_ptrs)
@@ -114,8 +134,16 @@ class KvChecksumComputer:
         )
         if self._state_data_ptrs:
             assert state_indices_gpu is not None
-            assert state_indices_gpu.is_cuda and state_indices_gpu.is_contiguous()
             all_ptrs += self._state_data_ptrs
             all_lens += self._state_item_lens
-            all_indices += [state_indices_gpu] * len(self._state_data_ptrs)
+            if isinstance(state_indices_gpu, torch.Tensor):
+                component_indices = [state_indices_gpu] * len(
+                    self._state_component_sizes
+                )
+            else:
+                component_indices = state_indices_gpu
+            assert len(component_indices) == len(self._state_component_sizes)
+            for idx, count in zip(component_indices, self._state_component_sizes):
+                assert idx.is_cuda and idx.is_contiguous()
+                all_indices += [idx] * count
         return adler32_strided_checksum(all_ptrs, all_lens, all_indices)

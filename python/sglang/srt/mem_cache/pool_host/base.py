@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import abc
 import logging
+import resource
 import threading
 from collections.abc import Iterable
 from contextlib import contextmanager
@@ -30,6 +31,8 @@ _is_hip = is_hip()
 
 # Host RAM to leave free when sizing HiCache pools (OS, other processes).
 HICACHE_HOST_MEMORY_RESERVE_BYTES: int = 10 * (1024**3)
+# Per local rank, pinned host memory left to RCCL, AITER and torch.
+ROCM_PINNED_RESERVE_BYTES: int = 4 * (1024**3)
 
 _WRITE_BACK_STAGING_PAGE_CHUNK = 64
 
@@ -123,6 +126,21 @@ def ranks_per_host() -> int:
     return max(launch_world_size // get_parallel().nnodes, 1)
 
 
+def rocm_pinnable_share_bytes() -> Optional[int]:
+    """A local rank's share of the host memory the amdgpu driver can pin: the TTM
+    page limit (half of RAM by default), past which hipHostMalloc fails while RAM
+    is still free. None off ROCm or when the limit is not visible."""
+    if not torch.version.hip:
+        return None
+    try:
+        with open("/sys/module/ttm/parameters/pages_limit") as f:
+            limit = int(f.read()) * resource.getpagesize()
+    except (OSError, ValueError):
+        return None
+    ranks = ranks_per_host()
+    return (limit - ROCM_PINNED_RESERVE_BYTES * ranks) // ranks
+
+
 def host_memory_budget_bytes(
     requested_bytes: int = 0, *, auto_size: bool = False
 ) -> int:
@@ -146,8 +164,9 @@ def host_memory_budget_bytes(
     free = (
         available_host_memory_bytes(allow_cgroup_fallback=not auto_size)
         - HICACHE_HOST_MEMORY_RESERVE_BYTES
-    )
-    return free // ranks_per_host()
+    ) // ranks_per_host()
+    pinnable = rocm_pinnable_share_bytes()
+    return free if pinnable is None else min(free, pinnable)
 
 
 def sync_fixed_hicache_size(size: int, host_size: int) -> int:

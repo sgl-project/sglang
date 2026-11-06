@@ -24,7 +24,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=894, stage="extra-a", runner_config="1-gpu-small")
-register_amd_ci(est_time=420, stage="extra-a", runner_config="1-gpu-small-amd")
+register_amd_ci(est_time=490, stage="extra-a", runner_config="1-gpu-small-amd")
 
 
 class TestDFlashServerBase(
@@ -179,10 +179,7 @@ class TestDFlashServerOverlapPlanStream(TestDFlashServerOverlap):
     overlap_plan_stream = True
 
 
-@unittest.skipIf(
-    is_hip(),
-    "borrowing is CUDA-only and ROCm has no DFLASH sampling-verify kernel",
-)
+@unittest.skipIf(is_hip(), "graph-pool borrowing is CUDA-only")
 class TestDFlashServerGraphPoolBorrow(TestDFlashServerBase):
     """Verify probabilities served out of idle CUDA graph storage. Only the
     non-greedy accept path borrows, hence the sampled GSM8K below."""
@@ -197,6 +194,21 @@ class TestDFlashServerGraphPoolBorrow(TestDFlashServerBase):
     # Measured over 4x200 examples per arm: score 0.7525 (sd 0.021) and accept
     # length 2.80, borrowing on or off. Corruption collapses accept length
     # toward 1.0; the accuracy floor is loose to absorb other hardware.
+    gsm8k_accuracy_thres = 0.60
+    gsm8k_accept_length_thres = 2.0
+
+
+@unittest.skipUnless(
+    is_hip(), "CUDA covers sampled verify in TestDFlashServerGraphPoolBorrow"
+)
+class TestDFlashServerSampledVerify(TestDFlashServerBase):
+    """Non-greedy verify through the Triton target-only sampler. ROCm does not
+    borrow graph storage, so the probabilities live in ordinary memory."""
+
+    disable_overlap = False
+    gsm8k_temperature = 0.6
+    gsm8k_top_p = 0.95
+    # The floors of the CUDA borrow arm above.
     gsm8k_accuracy_thres = 0.60
     gsm8k_accept_length_thres = 2.0
 

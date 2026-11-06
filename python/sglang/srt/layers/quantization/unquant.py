@@ -82,6 +82,12 @@ if _use_aiter:
     from aiter.ops.triton.gemm_a16w16 import gemm_a16w16 as _aiter_triton_a16w16
     from aiter.tuned_gemm import tgemm
 
+    from sglang.srt.layers.quantization.unquant_hip import (
+        a16w16_into,
+        a16w16_is_tuned,
+        prefer_hipblaslt,
+    )
+
 # Route supported decode shapes that are absent from the tuned table.
 _A16W16_TRITON_MAX_K = 2048
 _A16W16_TRITON_MAX_M = 64
@@ -762,7 +768,15 @@ class UnquantizedLinearMethod(LinearMethodBase):
             and not _skip_aiter_unquant
             and type(layer.weight.data) is torch.Tensor
         ):
-            if _is_gfx95 and _prefer_triton_a16w16(x, layer.weight):
+            if x.dim() == 2 and prefer_hipblaslt(x.shape[0], *layer.weight.shape):
+                return F.linear(x, layer.weight, bias)
+            if (
+                _is_gfx95
+                and _prefer_triton_a16w16(x, layer.weight)
+                and not a16w16_is_tuned(
+                    x.shape[0], layer.weight.shape[0], x.shape[1], bias is not None
+                )
+            ):
                 return _aiter_triton_a16w16(x, layer.weight, bias, dtype=x.dtype)
             return tgemm.mm(x, layer.weight, bias, otype=x.dtype)
 
@@ -857,6 +871,8 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 f"linear output has shape {output.shape}, expected "
                 f"{(x.shape[0], layer.weight.shape[0])}"
             )
+        if _use_aiter and bias is None and a16w16_into(x, layer.weight, output):
+            return output
         torch.mm(x, layer.weight.t(), out=output)
         if bias is not None:
             output.add_(bias)

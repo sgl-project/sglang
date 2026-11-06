@@ -23,7 +23,8 @@ def apply_kimi_k3_spec_backend_defaults(server_args: ServerArgs) -> None:
     # Use the fused Kimi-K3/DSPARK CuTeDSL kernel for KDA target verification.
     # Decode is left free (its bf16-ssm SM100+ flashinfer default is fine -- the
     # target only verifies under spec); the verify backend is pinned directly.
-    if cfg.linear_attn_verify_backend is None:
+    # CuTeDSL is CUDA-only; ROCm keeps the Triton verify kernel.
+    if cfg.linear_attn_verify_backend is None and not get_platform().is_hip:
         declare_resolution(
             server_args,
             "apply_kimi_k3_spec_backend_defaults",

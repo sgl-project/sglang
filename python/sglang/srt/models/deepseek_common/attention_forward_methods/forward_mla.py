@@ -65,6 +65,9 @@ from sglang.srt.utils import BumpAllocator
 logger = logging.getLogger(__name__)
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 _ENABLE_DSA_Q8KV8_BORN_FP8_Q = envs.SGLANG_ENABLE_DSA_Q8KV8_BORN_FP8_Q.get()
+# ROCm defaults to 32: over xGMI the unprojected exchange bottlenecks bs48 (5x tok/s
+# at 32 vs 512 rows, measured on MI350X DCP8).
+_DCP_V_PREPROJECT_MIN_ROWS = 32 if _is_hip else 512
 _ENABLE_DSA_Q8KV8_QPREP_OVERLAP = envs.SGLANG_ENABLE_DSA_Q8KV8_QPREP_OVERLAP.get()
 
 from sglang.srt.model_executor.runner_utils.forward_batch import get_forward_batch
@@ -216,11 +219,8 @@ class DeepseekMLAForwardMixin:
         if not get_parallel().dcp_replicate_q_proj or self.dcp_size == 1:
             return False
         mode = forward_batch.forward_mode
-        if mode.is_decode() or mode.is_target_verify():
-            return True
-        # DSA extend on HIP merges owned partials like decode, so replicating
-        # q_b_proj replaces the per-layer [T, H, 576] Q all-gather there too.
-        return self.use_dsa and _is_hip and mode.is_extend(include_draft_extend_v2=True)
+        # the ROCm DSA extend attends the gathered KV with this rank's heads
+        return mode.is_decode() or mode.is_target_verify()
 
     def init_mla_forward(self: DeepseekV2AttentionMLA):
         self.flashinfer_mla_disable_ragged = (
@@ -1045,7 +1045,7 @@ class DeepseekMLAForwardMixin:
                         getattr(self, "dcp_v_preproject", False)
                         and self.use_dsa
                         and (
-                            attn_output.shape[0] >= 512
+                            attn_output.shape[0] >= _DCP_V_PREPROJECT_MIN_ROWS
                             # the push-combine reduce wins at any batch size
                             or dcp_push_combine_fits(
                                 attn_output.shape[0] * self.num_local_heads

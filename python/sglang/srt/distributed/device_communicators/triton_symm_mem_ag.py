@@ -21,6 +21,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_spec,
 )
+from sglang.srt.utils import is_hip
 
 logger = logging.getLogger(__name__)
 
@@ -465,8 +466,10 @@ class MultimemAllGatherer:
     ):
         self._max_tokens = int(max_tokens)
         self._skip_entry_sync = skip_entry_sync
-        # None => always NCCL; _UNINIT => build on first eager call.
-        self._state = self._UNINIT if enabled else None
+        # None => always NCCL; _UNINIT => build on first eager call. ROCm has no
+        # multicast, so the build would only fall back to NCCL after a symmetric
+        # memory rendezvous, which hung server start on MI355X.
+        self._state = self._UNINIT if enabled and not is_hip() else None
         if self._state is self._UNINIT:
             # Lazy import avoids a module-load dependency on the distributed facade.
             from sglang.srt.distributed.parallel_state import (

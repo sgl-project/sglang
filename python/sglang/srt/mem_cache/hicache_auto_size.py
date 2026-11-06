@@ -17,6 +17,7 @@ from sglang.srt.mem_cache.pool_host.base import (
     host_memory_budget_bytes,
     host_memory_budget_scope,
     ranks_per_host,
+    rocm_pinnable_share_bytes,
 )
 from sglang.srt.runtime_context import get_context, get_memory, get_parallel
 
@@ -104,7 +105,13 @@ def auto_size_hicache(
     """
     fraction = get_memory().hicache_host_memory_fraction
     if not enabled or fraction is None:
-        yield
+        if not enabled or rocm_pinnable_share_bytes() is None:
+            yield
+            return
+        # explicit sizes book every pool against the pinnable share, so the
+        # ratio-sized Mamba pool built last clamps to what the others left
+        with host_memory_budget_scope(host_memory_budget_bytes()):
+            yield
         return
     requested = get_memory().hicache_ratio
     device_bytes = _estimate_hicache_bytes(params, draft_plan)

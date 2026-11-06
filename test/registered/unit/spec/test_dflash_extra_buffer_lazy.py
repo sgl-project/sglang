@@ -10,15 +10,22 @@ from unittest import mock
 import torch
 
 from sglang.srt.arg_groups.mamba_hook import validate_mamba_extra_buffer
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
+# backend-specific: a ROCm host validates the pairing as ROCm, not as CUDA.
+register_amd_ci(est_time=12, stage="stage-b", runner_config="1-gpu-small-amd")
 
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import override_platform
 from sglang.srt.speculative import dflash_info
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+from sglang.srt.utils import is_hip
+
+# The platform each validation runs as: a ROCm host checks its own, other hosts
+# (CPU-only included) stand in as CUDA.
+_PLATFORM = {"is_hip": True} if is_hip() else {"is_cuda": True}
 
 
 def _lazy_view(**overrides):
@@ -45,7 +52,7 @@ class TestValidateMambaExtraBufferLazyDflash(CustomTestCase):
     def _validate(self, view):
         # Keep the test runnable on CPU-only hosts: the platform assert is
         # not what is under test here.
-        with override_platform(is_cuda=True):
+        with override_platform(**_PLATFORM):
             validate_mamba_extra_buffer(
                 view,
                 SimpleNamespace(architectures=["Qwen3NextForCausalLM"]),
@@ -79,7 +86,7 @@ class TestValidateMambaExtraBufferLazyDflash(CustomTestCase):
         def _must_not_be_read():
             raise AssertionError("the chunk size was read before page_size resolved")
 
-        with override_platform(is_cuda=True):
+        with override_platform(**_PLATFORM):
             validate_mamba_extra_buffer(
                 _lazy_view(page_size=None),
                 SimpleNamespace(architectures=["Qwen3NextForCausalLM"]),

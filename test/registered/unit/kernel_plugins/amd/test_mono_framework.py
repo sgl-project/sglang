@@ -117,7 +117,7 @@ def batch(mode, bs, rows):
     )
 
 
-def install(*, archs, lookups=None, is_load_observed=False):
+def install(*, archs, lookups=None, is_load_observed=False, model_type="fake"):
     """install_monokernel_forward on an Lm, as rank 0 of two whose gathered lookups
     are lookups, or as the only rank."""
     lm = Lm()
@@ -135,7 +135,7 @@ def install(*, archs, lookups=None, is_load_observed=False):
     ):
         binding.install_monokernel_forward(
             model=lm,
-            hf_config=SimpleNamespace(architectures=archs),
+            hf_config=SimpleNamespace(architectures=archs, model_type=model_type),
             capture_tail_hooks=[],
         )
     return lm
@@ -371,6 +371,17 @@ class TestMonokernelFramework(CustomTestCase):
         # a model the backend registers no spec for keeps its forward on every rank
         lm = install(archs=["Other"], lookups=[(False, False, "none", None)] * 2)
         self.assertNotIn("forward", vars(lm))
+
+    def test_another_targets_draft_keeps_its_forward(self):
+        # two targets' DFlash2 drafts share an architecture and model type: the spec's
+        # hf_config names its own draft, and the other one was refused at load
+        registry.register(
+            backend=BACKEND, architecture="SharedDraft", path=f"{__name__}:SPEC"
+        )
+        lm = install(archs=["SharedDraft"], model_type="other")
+        self.assertNotIn("forward", vars(lm))
+        with self.assertRaisesRegex(ValueError, "monokernel_weights_iterator"):
+            install(archs=["SharedDraft"])
 
     def test_the_decode_attention_backend_is_checked(self):
         # the steps a spec serves run on the decode backend, not the base one

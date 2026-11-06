@@ -5,10 +5,16 @@ import zlib
 
 import torch
 
-from sglang.kernels.ops.memory.adler32 import adler32_strided_checksum
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.kernels.ops.memory.adler32 import (
+    _alloc_states,
+    _jit_adler32_module,
+    adler32_strided_checksum,
+)
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-small")
+# backend-specific: the kernel looks up ROCm streams through kDLROCM
+register_amd_ci(est_time=15, stage="jit-kernel-unit", runner_config="amd")
 
 
 def _ref_adler32(tensor: torch.Tensor) -> int:
@@ -73,6 +79,31 @@ class TestAdler32(unittest.TestCase):
         t = torch.randn(1000, 128, dtype=torch.bfloat16, device="cuda")
         idx = torch.arange(1000, dtype=torch.int64, device="cuda")
         self._check_strided([t], [idx], [128 * 2])
+
+    def test_strided_nondefault_stream(self):
+        # Both launches must join the active stream's graph. A wrong-device
+        # stream lookup leaves the replay using the pre-mutation checksum.
+        module = _jit_adler32_module()
+        rows, stride, num_blocks = 1025, 32, 5
+        tensor = torch.zeros(rows, stride, dtype=torch.uint8, device="cuda")
+        ptrs = torch.arange(rows, dtype=torch.int64, device="cuda") * stride
+        ptrs += tensor.data_ptr()
+        lens = torch.full((rows,), stride, dtype=torch.int32, device="cuda")
+        states = _alloc_states(num_blocks, tensor.device)
+        result = torch.empty(1, dtype=torch.int64, device="cuda")
+        module.adler32_strided(ptrs, lens, states, rows)
+        module.adler32_reduce(states, result, num_blocks)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=torch.cuda.Stream()):
+            module.adler32_strided(ptrs, lens, states, rows)
+            module.adler32_reduce(states, result, num_blocks)
+        torch.cuda.synchronize()
+        tensor.fill_(1)
+        torch.cuda.synchronize()
+        graph.replay()
+        torch.cuda.synchronize()
+        self.assertEqual(result.item(), _ref_adler32(tensor))
 
     def test_strided_large_items(self):
         first = torch.randint(

@@ -184,6 +184,21 @@ class MambaPoolHost(HostKVCache):
 
         requested_bytes = self.size * self.size_per_token
         available_bytes = host_memory_budget_bytes(requested_bytes)
+        if requested_bytes > available_bytes and host_size <= 0:
+            # a ratio-sized pool takes what the host budget has left rather than failing
+            page_bytes = self.size_per_token * self.page_size
+            self.page_num = max(available_bytes // page_bytes, 1)
+            self.size = self.page_num * self.page_size
+            logger.warning(
+                "HiCache Mamba host pool clamped to %d state slots (%.2f GB): "
+                "%.2f GB requested by the host-to-device ratio, %.2f GB available.",
+                self.size,
+                self.size * self.size_per_token / 1e9,
+                requested_bytes / 1e9,
+                available_bytes / 1e9,
+            )
+            requested_bytes = self.size * self.size_per_token
+            host_memory_budget_bytes(requested_bytes)  # book the clamped size
         if requested_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory available. Requesting "

@@ -540,6 +540,12 @@ def _validate_dcp_backend(
     # per-forward plan.
     if not kimi_k31:
         raise ValueError("DSA with --dcp-size > 1 is implemented for Kimi-K3.1 only.")
+    if _is_hip:
+        from sglang.srt.layers.attention.dsa.dsa_backend_hip import (
+            validate_dcp_backend_hip,
+        )
+
+        return validate_dcp_backend_hip(prefill_impl, decode_impl)
     if not use_fused_topk:
         raise ValueError("DSA with --dcp-size > 1 needs fused DSA top-k.")
     if not use_topk_v2:
@@ -963,9 +969,10 @@ class DeepseekSparseAttnBackend(
             max_rows = max(model_runner.max_running_requests, 1) * max(
                 self.speculative_num_draft_tokens or 1, 1
             )
-            init_dcp_candidate_all_gather(max_rows, self.dsa_index_topk)
-            if not get_exec().features.enable_return_indexer_topk:
-                init_dcp_topk_merge(max_rows, self.dsa_index_topk)
+            if not _is_hip:  # both workspaces are NVLS multicast buffers
+                init_dcp_candidate_all_gather(max_rows, self.dsa_index_topk)
+                if not get_exec().features.enable_return_indexer_topk:
+                    init_dcp_topk_merge(max_rows, self.dsa_index_topk)
 
         if _is_xpu:
             self.device_capability = (0, 0)
@@ -2730,17 +2737,18 @@ class DeepseekSparseAttnBackend(
                 v_head_dim=layer.v_head_dim,
             )
         elif dsa_impl == "triton":
-            if _is_hip and self.dcp_size > 1:
-                assert topk_transform_method == TopkTransformMethod.PAGED
-                return self._forward_triton_dcp(
-                    q_nope=q_nope,
-                    q_rope=q_rope,
-                    kv_cache=kv_cache,
-                    v_head_dim=layer.v_head_dim,
-                    page_table_1=page_table_1,
-                    sm_scale=layer.scaling,
-                    layer=layer,
-                    topk_indices=shared_topk_indices,
+            # On ROCm, DCP target verify, like decode, returns this rank's partial.
+            if (
+                _is_hip
+                and self.attn_dcp_size > 1
+                and forward_batch.forward_mode.is_target_verify()
+            ):
+                from sglang.srt.layers.attention.dsa.dsa_backend_hip import (
+                    forward_triton_dcp_partial,
+                )
+
+                return forward_triton_dcp_partial(
+                    self, q_nope, q_rope, kv_cache, page_table_1, layer
                 )
             from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
                 triton_sparse_mla_fwd,
@@ -3106,18 +3114,13 @@ class DeepseekSparseAttnBackend(
                 v_head_dim=layer.v_head_dim,
             )
         elif dsa_impl == "triton":
-            # CUDA keeps upstream's dispatch: #43735 wires DCP to the trtllm
-            # backends, and this localized path has only been run on ROCm.
-            if _is_hip and self.dcp_size > 1:
-                return self._forward_triton_dcp(
-                    q_nope=q_nope,
-                    q_rope=q_rope,
-                    kv_cache=kv_cache,
-                    v_head_dim=layer.v_head_dim,
-                    page_table_1=page_table_1,
-                    sm_scale=layer.scaling,
-                    layer=layer,
-                    topk_indices=shared_topk_indices,
+            if _is_hip and self.attn_dcp_size > 1:
+                from sglang.srt.layers.attention.dsa.dsa_backend_hip import (
+                    forward_triton_dcp_partial,
+                )
+
+                return forward_triton_dcp_partial(
+                    self, q_nope, q_rope, kv_cache, page_table_1, layer
                 )
             return self._forward_triton_decode(
                 q_nope=q_nope,
@@ -4026,52 +4029,6 @@ class DeepseekSparseAttnBackend(
             d_v=v_head_dim,
             workspace=workspace,
         ).squeeze(0)
-
-    def _forward_triton_dcp(
-        self,
-        q_nope: torch.Tensor,
-        q_rope: torch.Tensor,
-        kv_cache: torch.Tensor,
-        v_head_dim: int,
-        page_table_1: torch.Tensor,
-        sm_scale: float,
-        layer: RadixAttention,
-        topk_indices: Optional[torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Attend the owned slots of the global top-k; one query row per token."""
-        from sglang.kernels.ops.attention.dsa.triton_sparse_mla_decode import (
-            triton_sparse_mla_decode_splitk,
-        )
-
-        rows, heads = q_nope.shape[0], q_nope.shape[1]
-        if rows == 0:
-            return (
-                q_nope.new_empty((rows, heads, v_head_dim), dtype=torch.bfloat16),
-                q_nope.new_empty((rows, heads), dtype=torch.float32),
-            )
-        local_page_table, owned_counts = localize_dcp_page_table(
-            self._dcp_page_table_cache,
-            metadata=self.forward_metadata,
-            layer_id=layer.layer_id,
-            topk_indices=topk_indices,
-            page_table=page_table_1[:rows].contiguous(),
-            dcp_size=self.dcp_size,
-            dcp_rank=self.dcp_rank,
-        )
-        stream_id = int(torch.cuda.current_stream(q_nope.device).cuda_stream)
-        workspace = self._triton_sparse_mla_workspaces.setdefault(stream_id, [])
-        out, lse = triton_sparse_mla_decode_splitk(
-            q_nope=q_nope,
-            q_rope=q_rope,
-            kv=kv_cache,
-            indices=local_page_table.unsqueeze(1),
-            sm_scale=sm_scale,
-            d_v=v_head_dim,
-            workspace=workspace,
-            return_lse=True,
-            lengths=owned_counts,
-        )
-        return out.view(rows, heads, v_head_dim), lse
 
     def _forward_intel_xpu_sparse_decode(
         self,

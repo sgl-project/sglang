@@ -52,7 +52,7 @@ import tqdm
 from sglang.kernels.ops.attention.kv_indices import (
     create_chunked_prefix_cache_kv_indices,
 )
-from sglang.srt.configs.model_config import is_qwen4_exp
+from sglang.srt.configs.model_config import is_kimi_k31, is_qwen4_exp
 from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
@@ -175,6 +175,7 @@ from sglang.srt.utils import (
     get_available_gpu_memory,
     get_cuda_graph_max_batch_size,
     is_cuda,
+    is_hip,
     is_npu,
     require_attn_tp_gather,
     require_gathered_buffer,
@@ -338,6 +339,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     _backend_vote_prefill_cuda_graph = None
     _captured_attn_metadata_max_bs: Optional[int] = None
     _dcp_extend_active = False
+    _kimi_k31_rocm_bcg = False
     dllm_attention = None
 
     @property
@@ -346,7 +348,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         # DSA sets use_mha=False inside piecewise/breakable graphs, so the MHA
         # companion never runs there and any prefix goes through sparse MLA.
-        return isinstance(self.model_runner.attn_backend, DeepseekSparseAttnBackend)
+        backend = self.model_runner.attn_backend
+        if self._kimi_k31_rocm_bcg:  # KDA + DSA: the hybrid backend wraps DSA
+            backend = backend.full_attn_backend
+        return isinstance(backend, DeepseekSparseAttnBackend)
 
     def __init__(self, model_runner: ModelRunner):
         if get_schedule().enable_mixed_chunk:
@@ -735,8 +740,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         # DCP extend attention reads KV through a gather buffer in attn_dcp_metadata;
         # capture keeps one bucket-sized buffer per shape and replay reuses it.
-        self._dcp_extend_active = get_parallel().attn_dcp_size > 1 and hasattr(
-            model_runner.model, "prepare_context_parallel_metadata_for_dcp"
+        # Kimi-K3.1's DSA layers never read it, so its prefix extends keep replaying.
+        self._kimi_k31_rocm_bcg = is_hip() and is_kimi_k31(
+            model_runner.model_config.hf_config
+        )
+        self._dcp_extend_active = (
+            get_parallel().attn_dcp_size > 1
+            and hasattr(model_runner.model, "prepare_context_parallel_metadata_for_dcp")
+            and not self._kimi_k31_rocm_bcg
         )
         self._dcp_kv_buffers: Dict[ShapeKey, torch.Tensor] = {}
 
@@ -1663,6 +1674,19 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         capture_start_locs = [0]
         for seq_len in capture_seq_lens[:-1]:
             capture_start_locs.append(capture_start_locs[-1] + seq_len)
+        dcp_size = get_parallel().attn_dcp_size
+        if dcp_size > 1 and self._kimi_k31_rocm_bcg:
+            # Sharded DSA picks a rank's KV rows by slot owner (slot % dcp_size) but
+            # sizes its gather by position; slots p % dcp_size keep the two consistent
+            # and only touch each rank's padding row 0.
+            req_to_token = self.model_runner.req_to_token_pool.req_to_token
+            for row, seq_len in enumerate(capture_seq_lens):
+                req_to_token[row, :seq_len] = (
+                    torch.arange(
+                        seq_len, device=req_to_token.device, dtype=req_to_token.dtype
+                    )
+                    % dcp_size
+                )
 
         with torch.device(self.device):
             shape_inputs = {

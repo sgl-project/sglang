@@ -891,6 +891,9 @@ class Envs:
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
     SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM = EnvBool(False)
+    # Override --hicache-ratio for Mamba states in ratio mode: a cached KV prefix
+    # cannot be reused after its host state is evicted.
+    SGLANG_HICACHE_MAMBA_HOST_RATIO = EnvFloat(None)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
     # File-backend LRU eviction (opt-in; sizes accept SI/IEC suffixes, "0" disables).
     SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE = EnvStr(None)
@@ -1049,6 +1052,33 @@ class Envs:
     # Enabled by default for supported configurations; set to 0 to disable.
     SGLANG_M3_USE_AITER_FUSED_QKNORM = EnvBool(True)
     SGLANG_USE_AITER_AG = EnvBool(True)
+    # triton_sparse_mla_fwd calls of 16..512 query rows (TP8 target verify, bs x 6 rows;
+    # H <= 16) on that HIP kernel's split-K form: each row's top-k over
+    # sparse_mla_decode_splits(rows) CTAs and an fp32 log-sum-exp combine.
+    SGLANG_ROCM_SPARSE_MLA_DECODE_HIP = EnvBool(True)
+    # Kimi-K3 prefill on gfx950, on top of the row-sharded MoE tail: run the MoE front
+    # (router top-k, latent down-proj) and the shared experts on this rank's rows, from full
+    # shared-expert weights each rank gathers at load (+264 MB a layer).
+    SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_FRONT = EnvBool(False)
+    # The same front on this rank's rows without the gathered weights (no extra memory):
+    # the shared experts stay TP-sharded on the all-gathered normed input.
+    # SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_FRONT takes precedence.
+    SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT = EnvBool(False)
+    # With the row-sharded attention read, exchange o_proj's input to row shards (all-to-all,
+    # 1/4.7 of the output's bytes) and run o_proj there with its full weight, gathered at load
+    # (+176 MB a layer), instead of reduce-scattering the TP-partial output. Eager batches only.
+    SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_O_PROJ = EnvBool(False)
+    # With the row-sharded MoE tail, leave the stream on each rank's rows: the next layer's
+    # attention read aggregates the bank there and gathers its normed input.
+    SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM = EnvBool(False)
+    # Kimi-K3 gfx950 TP8 decode: up to this many rows (at most 384) the latent-MoE tail runs on
+    # each rank's 1/8 of the up_proj columns and all-gathers the stream.
+    SGLANG_ROCM_K3_COLUMN_TAIL_MAX_TOKENS = EnvInt(64)
+    # Use the gfx950 MXFP8 opus port instead of Triton split-K for fp8_ds_mla decode.
+    SGLANG_ENABLE_ROCM_DSA_OPUS_DECODE = EnvBool(True)
+    # GiB of ROCm device memory kept out of torch's allocator (0 = no cap): HSA
+    # allocates per-queue scratch outside it, e.g. for RCCL's spilling generic kernel.
+    SGLANG_ROCM_RUNTIME_RESERVE_GB = EnvFloat(0.0)
     # The gfx950 TP4 JIT quick all-reduce (quick_all_reduce_hip) runs an INT4 request below this
     # many MiB in INT8, which is as fast at decode sizes with about 1/16 of INT4's error; 0 runs
     # INT4 at every size.

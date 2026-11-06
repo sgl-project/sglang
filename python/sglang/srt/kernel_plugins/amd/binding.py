@@ -370,13 +370,22 @@ def install_monokernel_forward(
     spec, why = find_spec(
         backend=backend, architectures=archs, isa=isa, model_type=model_type
     )
+    # Several targets' drafts can share an architecture and model type; the spec's
+    # hf_config requirement names its own (a target's was checked at startup).
+    is_other_model = spec is not None and any(
+        getattr(hf_config, key, None) != want
+        for key, want in spec.requires.hf_config.items()
+    )
+    if is_other_model:
+        spec, why = None, f"{spec.name} serves another {archs[0]}"
     is_load_observed = "_mono_copies" in model.__dict__
     copies = model.__dict__.pop("_mono_copies", {})
     # Ranks branch together; one skipping the collectives below would hang its peers.
     lookups = _gather_tp(
         (
             spec is not None,
-            spec_registered(
+            not is_other_model
+            and spec_registered(
                 backend=backend, architectures=archs, model_type=model_type
             ),
             why,
@@ -384,7 +393,7 @@ def install_monokernel_forward(
         )
     )
     if not any(is_registered for _, is_registered, _, _ in lookups):
-        # A draft model may have no registered spec.
+        # A draft model may have no registered spec, or another target's.
         logger.info("monokernel: %s: the normal forward", why)
         return
     reasons = [

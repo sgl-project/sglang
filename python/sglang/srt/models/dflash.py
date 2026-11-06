@@ -61,10 +61,17 @@ from sglang.srt.speculative.dflash_utils import (
     is_nemotron_35_draft_config,
     parse_dflash_draft_config,
 )
-from sglang.srt.utils import BumpAllocator, bind_or_assign, is_npu, set_weight_attrs
+from sglang.srt.utils import (
+    BumpAllocator,
+    bind_or_assign,
+    is_hip,
+    is_npu,
+    set_weight_attrs,
+)
 from sglang.srt.utils.common import get_compiler_backend
 from sglang.srt.utils.hf_transformers import get_rope_config
 
+_is_hip = is_hip()
 _is_npu = is_npu()
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
@@ -914,6 +921,14 @@ class DFlashDecoderLayer(nn.Module):
         return hidden_states, residual
 
 
+# On ROCm, from this many rows (prefill chunks) each rank projects only its 1/TP
+# of the target hidden rows: the replicated [6 x 7168 -> 7168] fc took 7.6 ms of
+# a 16K-token DCP8 prefill step on MI355X, against ~0.6 ms for the all-gather.
+# CUDA keeps the replicated fc: its DFLASH aux graph can capture this projection
+# and replay it on a side stream beside other collectives.
+_FC_ROW_SHARD_MIN_ROWS = 4096
+
+
 class DFlashDraftModel(nn.Module):
     """SGLang DFlash draft model with an optional Nemotron embedding.
 
@@ -1103,6 +1118,13 @@ class DFlashDraftModel(nn.Module):
                 "This usually means the target model is capturing a different number of layer features than "
                 "the draft checkpoint/config expects."
             )
+        if (
+            _is_hip
+            and self.fc_tp_columns is None
+            and target_hidden.shape[0] >= _FC_ROW_SHARD_MIN_ROWS
+            and get_parallel().tp_group.world_size > 1
+        ):
+            return self._project_row_sharded(target_hidden)
         projected = self.fc(target_hidden)
         if self.quantizable:
             projected = projected[0]
@@ -1110,6 +1132,24 @@ class DFlashDraftModel(nn.Module):
             projected = self._gather_fc_columns(projected)
         ctx_hidden = self.hidden_norm(projected)
         return ctx_hidden
+
+    def _project_row_sharded(self, target_hidden: torch.Tensor) -> torch.Tensor:
+        """The replicated fc and the norm on this rank's 1/TP of the rows, then
+        an all-gather, instead of every rank projecting every row."""
+        group = get_parallel().tp_group
+        num_rows = target_hidden.shape[0]
+        rows = -(-num_rows // group.world_size)
+        start = group.rank_in_group * rows
+        shard = target_hidden[start : start + rows]
+        if shard.shape[0] < rows:
+            shard = torch.nn.functional.pad(shard, (0, 0, 0, rows - shard.shape[0]))
+        projected = self.fc(shard)
+        if self.quantizable:
+            projected = projected[0]
+        normed = self.hidden_norm(projected)
+        gathered = normed.new_empty(rows * group.world_size, normed.shape[1])
+        group.all_gather_into_tensor(gathered, normed.contiguous())
+        return gathered[:num_rows]
 
     def _fc_tp_columns(self, hidden_size: int) -> Optional[Tuple[int, int]]:
         parallel = get_parallel()

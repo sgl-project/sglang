@@ -1034,6 +1034,12 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
             fallback_backend,
         )
         draft_backend = fallback_backend
+    if draft_backend == "triton" and cfg.dcp_size > 1 and get_platform().is_hip:
+        from sglang.srt.layers.attention.triton_draft_hip import check_dcp_mla_draft
+
+        check_dcp_mla_draft(
+            _load_draft_hf_config(cfg), cfg.speculative_draft_window_size
+        )
     # FIXME: avoid overriding server args directly; pass the resolved draft
     # backend to the draft worker explicitly instead.
     declare_resolution(
@@ -1104,6 +1110,7 @@ def _resolve_dflash_draft_kv_ring(server_args: ServerArgs) -> None:
         _load_draft_hf_config(cfg),
         draft_backend=cfg.speculative_draft_attention_backend,
         draft_window_size=cfg.speculative_draft_window_size,
+        dcp_size=cfg.dcp_size,
     )
     if reason is None:
         logger.info("DFLASH draft KV ring: on.")

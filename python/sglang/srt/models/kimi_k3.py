@@ -70,6 +70,7 @@ from sglang.srt.layers.layer_boundary.residual.attn_bank import (
     AttnBankState,
     _bank_rows,
 )
+from sglang.srt.layers.layer_boundary.residual.attn_bank_hip import gather_row_shards
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelBatchedLinear,
@@ -127,6 +128,19 @@ from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods
     AttnForwardMethod,
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA, MoEGate
+from sglang.srt.models.kimi_k3_amd.attention import KimiK3MLAPreOProjMixin
+from sglang.srt.models.kimi_k3_amd.moe import (
+    KimiK3MoEHipMixin,
+    ffn_row_shards_hip,
+    link_column_tails_hip,
+    link_row_sharded_stream_hip,
+)
+from sglang.srt.models.kimi_k3_amd.row_shard_o_proj import (
+    gather_full_o_proj,
+    pad_o_proj_rows,
+    row_shard_o_proj,
+    take_o_proj_row_shard,
+)
 from sglang.srt.models.kimi_k3_vl import (
     KimiK3MultiModalProjector,
     KimiK3VisionTower,
@@ -172,6 +186,8 @@ _EXPERT_WEIGHT_NAME = re.compile(r"experts\.\d+\.w[123]\.")
 _is_hip = is_hip()
 _is_npu = is_npu()
 _aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
+if _is_hip:
+    from sglang.srt.models.kimi_k3_amd.gemm import k3_bf16_gemm_hip, kda_f_b_gemm_hip
 
 # Kimi-K3.1 dense GEMMs routed to TGV for every caller of the shape: (n, k) ->
 # ((m_lo, m_hi, tactic), ...), tactic None = the ladder pick.
@@ -315,6 +331,8 @@ def _k3_bf16_gemm(
                 if out is None:
                     return cutedsl_bf16_gemm(x, weight)
                 return cutedsl_bf16_gemm_out(x, weight, out)
+    if _is_hip and (hip_out := k3_bf16_gemm_hip(x, weight, out)) is not None:
+        return hip_out
     if out is None:
         return torch.nn.functional.linear(x, weight)
     if out.dtype != x.dtype:
@@ -475,6 +493,21 @@ def _add3(
 _EP_FRONT_LOGGED = False
 
 
+def _row_sharded_switch_on() -> bool:
+    """Any of the opt-in gfx950 row-sharded front / o_proj / stream switches."""
+    return (
+        envs.SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_FRONT.get()
+        or envs.SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT.get()
+        or envs.SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_O_PROJ.get()
+        or envs.SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM.get()
+    )
+
+
+def _is_row_shard_o_proj(o_proj: RowParallelLinear) -> bool:
+    """Whether row_shard_o_proj wrapped o_proj (its forward then keeps the input)."""
+    return "row_shard_input" in o_proj.__dict__
+
+
 def _o_proj_takes_output(o_proj: RowParallelLinear) -> bool:
     """Whether o_proj can write into caller-owned storage. ``apply_into`` is an
     optional quant-method capability; only the unquantized method has it."""
@@ -554,7 +587,7 @@ def _uses_ep_a2a() -> bool:
     )
 
 
-class KimiK3MoE(nn.Module):
+class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
     """K3 MoE with Latent MoE (experts run in moe_hidden_size space)."""
 
     def __init__(
@@ -918,9 +951,11 @@ class KimiK3MoE(nn.Module):
 
         The situ activation and the flashinfer_mxfp4 quantizer read the fp32
         slices directly. Every other runner takes routed_input rounded back to
-        bf16 in _forward_fused, which is bit-identical to the bf16 front."""
+        bf16 in _forward_fused, which is bit-identical to the bf16 front. On
+        ROCm a bf16 front would also round the fp32 correction bias to bf16
+        (select_experts matches the logits' dtype), so AITER takes it in fp32."""
         return (
-            not _is_hip
+            (not _is_hip or get_bool_env_var("SGLANG_USE_AITER"))
             and self._eligible_for_fused_front
             and self._front_w.dtype == torch.bfloat16
         )
@@ -1545,6 +1580,10 @@ class KimiK3MoE(nn.Module):
         )
 
     def _forward_routed(self, hidden_states, router_logits, routed_input, latent):
+        if _is_hip and self._forward_routed_a8w4(
+            hidden_states, router_logits, routed_input, latent
+        ):
+            return
         if self._route_quant_fuse_eligible:
             route_quant_handoff.stage(routed_input, layer=self.experts)
         try:
@@ -1588,7 +1627,7 @@ class KimiK3MoE(nn.Module):
         return norm.weight, norm.variance_epsilon
 
     def _fused_front(
-        self, hidden_states: torch.Tensor
+        self, hidden_states: torch.Tensor, cast_routed: bool = True
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Read hidden_states once through the merged [H, gate_up + E + latent]
         weight: the shared experts' gate_up, the router logits and the routed
@@ -1603,7 +1642,7 @@ class KimiK3MoE(nn.Module):
         )
         if hidden_states.shape[0] > 1 and _is_hip and not _aiter_k3_opt:
             router_logits = router_logits.contiguous()
-        if self._moe_front_needs_dense_bf16:
+        if cast_routed and self._moe_front_needs_dense_bf16:
             # off an fp32 front the cast allocates the dense buffer, so the
             # contiguous() behind it is free; off a bf16 front it is the copy
             routed_input = routed_input.to(hidden_states.dtype).contiguous()
@@ -1659,6 +1698,8 @@ class KimiK3MoE(nn.Module):
                 and isinstance(self.shared_experts.down_proj.weight, torch.Tensor)
                 and self.routed_expert_up_proj is not None
             )
+        if _is_hip:
+            return self._forward_fused_hip(hidden_states, prefix_sum=prefix_sum)
 
         num_tokens, hidden_size = hidden_states.shape
         sharded = self._sharded_front_covers(num_tokens)
@@ -1825,6 +1866,9 @@ class KimiK3MoE(nn.Module):
         cp_shard_rows: the rows are gathered rank-major over the attention-CP
         group, and only this rank's CP rows of the output are returned."""
         num_tokens, hidden_size = hidden_states.shape
+        if _is_hip and self._row_front_out is not None:
+            # the FFN read already ran the front on this rank's rows (shard_front)
+            return self._forward_row_front(prefix_sum)
         hidden_states = hidden_states.view(-1, hidden_size)
         if cp_shard_rows:
             return self._forward_cp_shard_rows(hidden_states)
@@ -1836,7 +1880,8 @@ class KimiK3MoE(nn.Module):
                 prefix_sum=prefix_sum,
                 valid_token_count=valid_token_count,
             )
-        return out.view(num_tokens, hidden_size)
+        # a row-sharded tail may leave the stream on this rank's rows
+        return out.view(-1, hidden_size)
 
 
 class KimiK3DeltaAttention(nn.Module):
@@ -2122,6 +2167,8 @@ class KimiK3DeltaAttention(nn.Module):
             # buffer, which needs the GEMM to write into caller-owned storage
             self.all_reduce_fusion = False
             self.o_proj.use_dp_attention_reduce = True
+        if _is_hip and envs.SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_O_PROJ.get():
+            row_shard_o_proj(self.o_proj)
         conv_weights = self.qkv_conv1d.weight.squeeze(1)
         bias = self.qkv_conv1d.bias
 
@@ -2250,9 +2297,9 @@ class KimiK3DeltaAttention(nn.Module):
         that a raw row-cat would silently drop."""
         if not (_is_hip and envs.SGLANG_ROCM_K3_FUSE_KDA_INPROJ.get()):
             return False
+        # The wide [q, k, v, g] projection exists whenever the gate is full rank; a
+        # model-level quant config (MXFP4 experts) leaves it bf16, as checked below.
         if not self.use_full_rank_gate:
-            return False
-        if not (self.do_fuse_qkvbfg or get_exec().kernel.enable_amd_monokernel):
             return False
         # Block-FP8 in-proj needs dequantized BF16 buffers; a raw row-cat
         # would drop the scales. Leave fusion to the split [f_a|b] path.
@@ -2406,7 +2453,9 @@ class KimiK3DeltaAttention(nn.Module):
                         fused_states, self._qkvgbfa_sizes, dim=-1
                     )
                     # Fused KDA decode consumes f_a and applies f_b itself.
-                    forget_gate = f_a if defer_f_b else gemm(f_a, self._bfa_f_b_w)
+                    forget_gate = (
+                        f_a if defer_f_b else kda_f_b_gemm_hip(f_a, self._bfa_f_b_w)
+                    )
                     return qkv, beta, forget_gate, g_proj_states
 
                 if (
@@ -2469,6 +2518,7 @@ class KimiK3DeltaAttention(nn.Module):
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
+        """The TP-local core output o_proj takes; a monokernel launch runs o_proj."""
         # Under interleave prefill CP the boundary hands the CP shards
         # gathered rank-major; the recurrence needs sequence order.
         gathered_rows = hidden_states.shape[0]
@@ -2547,7 +2597,7 @@ class KimiK3DeltaAttention(nn.Module):
         return self.o_proj(core_attn_out)[0]
 
 
-class KimiK3MLAAttention(DeepseekV2AttentionMLA):
+class KimiK3MLAAttention(KimiK3MLAPreOProjMixin, DeepseekV2AttentionMLA):
     """MLA with output gate for K3. Gate is applied in TP-local space before o_proj."""
 
     # Kimi-K3.1 DSA layers (K3 has no indexer)
@@ -2668,6 +2718,9 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             # Allocate o_proj's output in the attention-TP group's symmetric
             # memory, where the stage boundary sums it.
             self.o_proj.use_dp_attention_reduce = True
+        if _is_hip and envs.SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_O_PROJ.get():
+            # inside the output gate, which multiplies x before o_proj takes it
+            row_shard_o_proj(self.o_proj)
         if self.use_output_gate:
             projection_size = config.num_attention_heads * config.v_head_dim
             # Shard by attn-TP to match the attention output (DSV2 MLA shards
@@ -2774,6 +2827,12 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
     def _compute_output_gate(self, hidden_states: torch.Tensor) -> torch.Tensor:
         alt = self._gate_pending_stream
         self._gate_pending_stream = None
+        pre = self.__dict__.get("_mono_pre")
+        if pre is not None and "gate" in pre:
+            # g_proj(x) from a monokernel plugin's projection front
+            if alt is not None:
+                torch.cuda.current_stream().wait_stream(alt)
+            return pre["gate"]
         if alt is None:
             return self.g_proj(hidden_states)[0]
         with torch.cuda.stream(alt):
@@ -3062,6 +3121,26 @@ class KimiK3DecoderLayer(nn.Module):
 
         self._ffn_writes_stream = _latent_moe_writes_stream(config, layer_idx)
         self._declare_stages(config, layer_idx, attn_bank)
+        # o_proj keeps its input for the row-sharded FFN read (row_shard_o_proj),
+        # else writes into rows padded for its reduce-scatter
+        self._o_proj_row_sharded = False
+        o_proj = self.self_attn.o_proj
+        if self._row_shards is not None and _is_row_shard_o_proj(o_proj):
+            o_proj.row_shards = self._row_shards
+            self._o_proj_row_sharded = True
+        elif (
+            self._row_shards is not None
+            and _row_sharded_switch_on()
+            and _o_proj_takes_output(o_proj)
+        ):
+            pad_o_proj_rows(
+                o_proj, tp_size=get_parallel().attn_tp_size, row_shards=self._row_shards
+            )
+
+    def _o_proj_row_shard(self, num_tokens: int) -> Optional[torch.Tensor]:
+        if not self._o_proj_row_sharded:
+            return None
+        return take_o_proj_row_shard(self.self_attn.o_proj, num_tokens)
 
     def _declare_stages(self, config, layer_idx, attn_bank):
         """Declare this layer's attention and FFN stages as _stage_facts gives
@@ -3069,7 +3148,9 @@ class KimiK3DecoderLayer(nn.Module):
         K3 supplies for the bank path."""
         sp_collective = k3_sp_collective.enabled()
         bank = None
+        self._row_shards = None
         if self.use_attn_residuals:
+            self._row_shards = ffn_row_shards_hip(self) if _is_hip else None
             bank = AttnBankState(
                 attn_bank,
                 self.self_attention_res_proj,
@@ -3082,6 +3163,15 @@ class KimiK3DecoderLayer(nn.Module):
                 and sp_collective
                 and envs.SGLANG_K3_SP_ATTN_RES.get(),
                 reads_slices=_carries_bank_slices(config),
+                ffn_row_shards=self._row_shards,
+                ffn_shard_front=(
+                    self.mlp.shard_front
+                    if self._row_shards is not None and isinstance(self.mlp, KimiK3MoE)
+                    else None
+                ),
+                ffn_attn_rows=self._o_proj_row_shard
+                if self._row_shards is not None
+                else None,
             ).residual_ops()
         attn, ffn = _stage_facts(
             config, layer_idx, sp_collective=sp_collective, bank=bank
@@ -3293,6 +3383,9 @@ class KimiK3LinearModel(nn.Module):
                 config, idx, sp_collective=sp_collective
             ),
         )
+        if _is_hip:
+            link_column_tails_hip(self)
+            link_row_sharded_stream_hip(self)
 
     def forward(
         self,
@@ -3461,6 +3554,9 @@ class KimiK3LinearModel(nn.Module):
         # Only the mixture is needed by the draft. Keep the bank sharded and
         # return owned storage so a later layer's gather cannot overwrite it.
         if rows is not None:
+            if _is_hip and envs.SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM.get():
+                # gfx950 row-sharded stream: short or empty last shards
+                return gather_row_shards(mixed, bank.block_residual.shape[0])
             return get_parallel().attn_tp_group.all_gather(mixed, dim=0)
         return mixed
 
@@ -3494,7 +3590,7 @@ class KimiK3LinearForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        if is_kimi_k31(config):
+        if is_kimi_k31(config) and not _is_hip:
             from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import (
                 register_tgv_m_ranges,
             )
@@ -3942,12 +4038,16 @@ class KimiK3LinearForCausalLM(nn.Module):
                     # graph capture. Other MegaMoE recipes are sized with the
                     # workspace taken from the non-static slack, as on main.
                     layer.mlp._mega_moe_buffer()
+                if _is_hip:
+                    layer.mlp._prepare_hip_paths()
                 # Convert the correction bias to fp32 once so the per-call
                 # .to(float32) in topk is a no-op, not one upcast kernel per
                 # MoE layer per step.
                 bias = layer.mlp.gate.e_score_correction_bias
                 if bias.dtype != torch.float32:
                     bias.data = bias.data.to(torch.float32)
+            if layer._o_proj_row_sharded:
+                gather_full_o_proj(layer.self_attn.o_proj)
             if isinstance(layer.self_attn, KimiK3DeltaAttention):
                 layer.self_attn._merge_bfa_weights()
                 layer.self_attn._prepare_fused_decode()

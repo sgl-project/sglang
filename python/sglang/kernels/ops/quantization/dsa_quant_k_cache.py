@@ -189,9 +189,12 @@ def _quantize_k_cache_fast_separate(
 
     assert num_tokens == num_tokens_, f"k_nope and k_rope must have same num_tokens"
 
-    # Ensure contiguous tensors for kernel
-    k_nope = k_nope.contiguous()
-    k_rope = k_rope.contiguous()
+    # The kernel addresses rows by stride: column slices of the kv_a output
+    # (k_rope) need no copy, only a packed inner dim.
+    if k_nope.stride(-1) != 1:
+        k_nope = k_nope.contiguous()
+    if k_rope.stride(-1) != 1:
+        k_rope = k_rope.contiguous()
 
     num_tiles = dim_nope // group_size
 

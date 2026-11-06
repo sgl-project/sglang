@@ -18,6 +18,18 @@ def _gfx950():
     )
 
 
+def _scale_rows(scale):
+    """[rows, groups] e8m0 bytes of a scale in aiter's swizzled MX GEMM tile layout."""
+    from aiter.ops.shuffle import shuffle_scale
+
+    rows, groups = scale.shape
+    ids = torch.arange(-(-rows // 256) * 256 * groups, device=scale.device)
+    swizzled = shuffle_scale(ids.to(torch.int32).view(-1, groups)).view(-1).long()
+    address = torch.empty_like(ids)
+    address[swizzled] = ids
+    return scale.view(torch.uint8).view(-1)[address[: rows * groups]].view(rows, groups)
+
+
 @unittest.skipUnless(_gfx950(), "gfx950 (MI35x) only")
 class TestMoeSortingSmall(CustomTestCase):
     # Qwen3.5: 512 routed experts + fused shared expert, top-10 + shared slot
@@ -55,13 +67,14 @@ class TestMoeSortingSmall(CustomTestCase):
     def _sort(self, fn, ids, w, bs, E=E):
         return fn(ids, w, E, self.DIM, torch.bfloat16, bs, None, None, 0, True)
 
-    def _emitted_quant(self, ids, w, x, bs, E):
+    def _sort_emitting_quant(self, ids, w, x, bs, E):
+        """The patched sort and the stage-1 quant it emitted (None if it did not)."""
         S = self.S
         tok = S._pending_quant_input.set(x)
         etok = S._emitted_quant.set(None)
         try:
-            self._sort(self.fm._moe_sorting_impl, ids, w, bs, E)
-            return S._emitted_quant.get()
+            sort = self._sort(self.fm._moe_sorting_impl, ids, w, bs, E)
+            return sort, S._emitted_quant.get()
         finally:
             S._emitted_quant.reset(etok)
             S._pending_quant_input.reset(tok)
@@ -114,17 +127,70 @@ class TestMoeSortingSmall(CustomTestCase):
                 sorted_weights=sw,
                 num_experts_upper_bound=E,
             )
-            emitted = self._emitted_quant(ids, w, x, bs, E)
+            _, emitted = self._sort_emitting_quant(ids, w, x, bs, E)
             self.assertIsNotNone(emitted, f"E={E} m={m}")
             self.assertTrue(
                 torch.equal(ref_q.view(torch.uint8), emitted[0].view(torch.uint8)),
                 f"E={E} m={m}",
             )
 
-    def test_falls_back_to_aiter_past_compact_at_513_experts(self):
+    def test_k3_sorted_emit_matches_aiter_quant_and_scales(self):
+        """Kimi-K3.1 decode (E=896, top-16, > 64 pairs) takes the histogram-sort emit:
+        its fp8 rows and the e8m0 scale of every real sorted row must be what aiter
+        quantizes for that sort, read off a row-strided slice of the fused front."""
+        E, topk, dim = 896, 16, 3584  # 3584 % 2048 != 0: 512-column quant chunks
+        # [shared gate_up (TP8) | router logits | routed input] of the fused front GEMM
+        front_width, routed_start = 1536 + E + dim, 1536 + E
+        for bs, m, hot in ((32, 5, E), (32, 16, 24), (16, 16, 16)):
+            msg = f"bs={bs} m={m} hot={hot}"
+            g = torch.Generator(device="cpu").manual_seed(m * 1000 + hot)
+            # hot < E crowds the pairs onto few experts: ranks within an expert matter
+            ids = torch.stack(
+                [torch.randperm(hot, generator=g)[:topk] for _ in range(m)]
+            )
+            ids = (ids + E - hot).to(torch.int32).to(self.dev)
+            w = torch.rand(m, topk, generator=g).to(self.dev)
+            front = torch.randn(m, front_width, generator=g).to(
+                self.dev, torch.bfloat16
+            )
+            x = front[:, routed_start:]
+            self.assertTrue(self.S._small_sort_supported(ids, bs, None, None, E), msg)
+            sort, emitted = self._sort_emitting_quant(ids, w, x, bs, E)
+            self.assertIsNotNone(emitted, msg)
+            self._assert_same_sort(
+                self._sort(self.orig_sort, ids, w, bs, E), sort, bs, msg
+            )
+            sid, sw, _, nv, _ = sort
+            ref_q, ref_scale = self.orig_quant(
+                x.contiguous(),
+                sorted_ids=sid,
+                num_valid_ids=nv,
+                token_num=m,
+                topk=topk,
+                block_size=bs,
+                sorted_weights=sw,
+                num_experts_upper_bound=E,
+            )
+            self.assertTrue(
+                torch.equal(ref_q.view(torch.uint8), emitted[0].view(torch.uint8)), msg
+            )
+            # padding rows of a block hold no pair and are never read
+            real = sid[: int(nv[0])]
+            real = torch.nonzero((real & 0xFFFFFF) < m).flatten()
+            self.assertEqual(real.numel(), m * topk, msg)
+            self.assertTrue(
+                torch.equal(
+                    _scale_rows(ref_scale)[real], _scale_rows(emitted[1])[real]
+                ),
+                msg,
+            )
+
+    def test_falls_back_to_aiter_from_1024_experts(self):
+        # past 64 pairs the histogram sort serves up to E=896 (E_POW2 <= 1024)
         m = 6
         ids, _ = self._routing(m, m)
-        self.assertFalse(self.S._small_sort_supported(ids, 32, None, None, self.E))
+        self.assertTrue(self.S._small_sort_supported(ids, 32, None, None, self.E))
+        self.assertFalse(self.S._small_sort_supported(ids, 32, None, None, 1024))
 
 
 def _reference(ids, w, num_experts, block_size):

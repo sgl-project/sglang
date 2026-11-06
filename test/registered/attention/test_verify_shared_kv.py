@@ -8,14 +8,23 @@ import torch
 
 from sglang.kernels.ops.attention.extend_attention import extend_attention_fwd
 from sglang.kernels.ops.attention.verify_mla import verify_shared_kv_fwd
+from sglang.kernels.ops.attention.verify_mla_draft import (
+    verify_shared_kv_fwd as verify_draft_fwd,
+)
+from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.layers.attention.triton_backend import (
+    TritonAttnBackend,
     _should_use_verify_shared_kv,
 )
-from sglang.srt.utils import get_hip_version
+from sglang.srt.layers.attention.triton_draft_hip import init_draft_backend
+from sglang.srt.layers.radix_attention import AttentionType
+from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.utils import get_hip_version, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=180, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 BF16_ATOL = 2e-2
 BF16_RTOL = 1e-2
@@ -31,10 +40,13 @@ def _build_inputs(
     v_head_dim,
     h_kv=1,
     cache_dtype=torch.bfloat16,
+    latent_values=False,
+    shuffle_cache=False,
+    seed=0,
 ):
     device = "cuda"
     dtype = torch.bfloat16
-    generator = torch.Generator(device=device).manual_seed(0)
+    generator = torch.Generator(device=device).manual_seed(seed)
     prefix_lens_t = torch.tensor(prefix_lens, dtype=torch.int32, device=device)
     total_prefix = sum(prefix_lens)
     batch_size = len(prefix_lens)
@@ -45,15 +57,28 @@ def _build_inputs(
 
     q = randn(num_extend_tokens, h_q, head_dim)
     k = randn(num_extend_tokens, h_kv, head_dim)
-    v = randn(num_extend_tokens, h_kv, v_head_dim)
-    k_buffer = randn(total_prefix, h_kv, head_dim).to(cache_dtype)
-    v_buffer = randn(total_prefix, h_kv, v_head_dim).to(cache_dtype)
+    v = (
+        k[..., :v_head_dim].contiguous()
+        if latent_values
+        else randn(num_extend_tokens, h_kv, v_head_dim)
+    )
+    cache_rows = total_prefix + 64 if shuffle_cache else total_prefix
+    k_buffer = randn(cache_rows, h_kv, head_dim).to(cache_dtype)
+    v_buffer = (
+        k_buffer[..., :v_head_dim]
+        if latent_values
+        else randn(cache_rows, h_kv, v_head_dim).to(cache_dtype)
+    )
     qo_indptr = torch.arange(
         0, num_extend_tokens + 1, l_ext, dtype=torch.int32, device=device
     )
     kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
     kv_indptr[1:] = torch.cumsum(prefix_lens_t, dim=0)
-    kv_indices = torch.arange(total_prefix, dtype=torch.int64, device=device)
+    kv_indices = (
+        torch.randperm(cache_rows, device=device, generator=generator)[:total_prefix]
+        if shuffle_cache
+        else torch.arange(total_prefix, dtype=torch.int64, device=device)
+    )
     return q, k, v, k_buffer, v_buffer, qo_indptr, kv_indptr, kv_indices
 
 
@@ -84,54 +109,20 @@ class TestVerifySharedKV(CustomTestCase):
             v_head_dim=v_head_dim,
             cache_dtype=cache_dtype,
         )
-        q, k, v, k_buffer, v_buffer, qo_indptr, kv_indptr, kv_indices = inputs
-        output_shape = (q.shape[0], q.shape[1], v_head_dim)
-        reference = torch.empty(output_shape, dtype=q.dtype, device=q.device)
-        actual = torch.empty_like(reference)
-        scale = head_dim**-0.5
-
-        extend_attention_fwd(
-            q,
-            k,
-            v,
-            reference,
-            k_buffer,
-            v_buffer,
-            qo_indptr,
-            kv_indptr,
-            kv_indices,
-            None,
-            is_causal,
-            None,
-            l_ext,
-            k_scale,
-            v_scale,
-            sm_scale=scale,
-            sliding_window_size=sliding_window_size,
+        case = dict(
+            h_q=h_q,
+            h_kv=h_kv,
+            d=head_dim,
+            dv=v_head_dim,
+            l_ext=l_ext,
+            causal=is_causal,
+            mla=False,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            window=sliding_window_size,
         )
-        ran = verify_shared_kv_fwd(
-            q,
-            k,
-            v,
-            actual,
-            k_buffer,
-            v_buffer,
-            qo_indptr,
-            kv_indptr,
-            kv_indices,
-            None,
-            is_causal,
-            None,
-            l_ext,
-            k_scale,
-            v_scale,
-            sm_scale=scale,
-            sliding_window_size=sliding_window_size,
-            max_bs=len(kv_indptr) - 1,
-            allow_sliding_window=sliding_window_size > 0,
-        )
-
-        self.assertTrue(ran)
+        reference = _extend(case, inputs, bf16_dot=False)
+        actual = _extend(case, inputs, bf16_dot=False, kernel=verify_shared_kv_fwd)
         torch.testing.assert_close(actual, reference, atol=atol, rtol=rtol)
 
     def test_qwen3_5_tp_shapes(self):
@@ -341,6 +332,258 @@ class TestVerifySharedKV(CustomTestCase):
             return_value=False,
         ):
             self.assertFalse(_should_use_verify_shared_kv(qwen, 1, False, True))
+
+
+# FP8 q/probability rounding is materially larger than BF16 dot rounding.
+BF16_ERR = 1e-2
+# Triton 3.4 on ROCm 7.0 aborts gfx950 FP8 dots (triton-lang/triton#8278).
+FP8_DOT_OK = get_hip_version()[:2] != (7, 0)
+
+MLA = dict(h_q=12, h_kv=1, d=576, dv=512, l_ext=8, causal=True, mla=True)
+
+EXTEND_CASES = {
+    "mla5_window": dict(MLA, prefix_lens=(3000, 1500, 5), window=1023),
+    "mla_full": dict(MLA, prefix_lens=(3000, 300, 5)),
+}
+
+
+def _inputs(case, cache_dtype, seed=0):
+    return _build_inputs(
+        prefix_lens=case["prefix_lens"],
+        l_ext=case["l_ext"],
+        h_q=case["h_q"],
+        head_dim=case["d"],
+        v_head_dim=case["dv"],
+        h_kv=case["h_kv"],
+        cache_dtype=cache_dtype,
+        latent_values=case["mla"],
+        shuffle_cache=True,
+        seed=seed,
+    )
+
+
+def _scale(case):
+    # MLA scales by the 128 + 64 qk head of the target, not the latent width.
+    return (128 + 64) ** -0.5 if case["mla"] else case["d"] ** -0.5
+
+
+def _reference(case, q, k, v, k_buffer, v_buffer, kv_indptr, kv_indices, scale):
+    """fp32 attention of each draft row over its request's prefix and block, the
+    cache read exactly (FP8 and BF16 values are exact in fp32) and descaled.
+    The block is causal or not; a window keeps the keys of [p - window, p]."""
+    h_q, h_kv, l_ext = case["h_q"], case["h_kv"], case["l_ext"]
+    window = case.get("window", -1)
+    k_scale, v_scale = case.get("k_scale", 1.0), case.get("v_scale", 1.0)
+    bounds = kv_indptr.tolist()
+    out = []
+    for b in range(len(bounds) - 1):
+        locs = kv_indices[bounds[b] : bounds[b + 1]]
+        prefix = locs.numel()
+        rows = slice(b * l_ext, (b + 1) * l_ext)
+        keys = torch.cat([k_buffer[locs].float() * k_scale, k[rows].float()])
+        vals = torch.cat([v_buffer[locs].float() * v_scale, v[rows].float()])
+        q_rows = q[rows].float().unflatten(1, (h_kv, h_q // h_kv))
+        s = torch.einsum("lkgd,tkd->kglt", q_rows, keys) * scale
+        q_pos = prefix + torch.arange(l_ext, device="cuda")
+        k_pos = torch.arange(prefix + l_ext, device="cuda")
+        seen = torch.ones(l_ext, prefix + l_ext, dtype=torch.bool, device="cuda")
+        if case["causal"]:
+            seen &= k_pos[None, :] <= q_pos[:, None]
+        if window > 0:
+            seen &= k_pos[None, :] >= q_pos[:, None] - window
+        p = torch.softmax(s.masked_fill(~seen, float("-inf")), dim=-1)
+        out.append(torch.einsum("kglt,tkd->lkgd", p, vals).flatten(1, 2))
+    return torch.cat(out)
+
+
+def _extend(case, inputs, bf16_dot, kernel=extend_attention_fwd):
+    q, k, v, k_buffer, v_buffer, qo_indptr, kv_indptr, kv_indices = inputs
+    out = torch.empty(*q.shape[:2], case["dv"], dtype=q.dtype, device="cuda")
+    ran = kernel(
+        q,
+        k,
+        v,
+        out,
+        k_buffer,
+        v_buffer,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        None,
+        case["causal"],
+        None,
+        case["l_ext"],
+        case.get("k_scale", 1.0),
+        case.get("v_scale", 1.0),
+        sm_scale=_scale(case),
+        sliding_window_size=case.get("window", -1),
+        **({"bf16_dot": bf16_dot} if kernel is not verify_shared_kv_fwd else {}),
+        **(
+            {"max_bs": len(kv_indptr) - 1} if kernel is not extend_attention_fwd else {}
+        ),
+        **(
+            {"allow_sliding_window": case.get("window", -1) > 0}
+            if kernel is verify_shared_kv_fwd
+            else {}
+        ),
+    )
+    if kernel is not extend_attention_fwd:
+        assert ran is True
+    return out
+
+
+def _err(out, ref):
+    return ((out.float() - ref).norm() / ref.norm()).item()
+
+
+def _backend_extend(case, inputs, bf16_dot):
+    # Exercise the real dispatcher as well as the kernel: losing bf16_dot must
+    # fail the FP32 accuracy check, not merely a recorded-kwargs assertion.
+    q, k, v, k_buffer, v_buffer, qo_indptr, kv_indptr, kv_indices = inputs
+    backend = TritonAttnBackend.__new__(TritonAttnBackend)
+    backend.draft_bf16_dot = bf16_dot
+    backend.use_dense_fp8_chunked_prefill = False
+    backend.use_verify_shared_kv = False
+    backend.use_verify_splitkv = False
+    backend.verify_mla_draft_fwd = None
+    backend.extend_attention_fwd = extend_attention_fwd
+    backend.dcp_size = 1
+    backend.enable_deterministic = False
+    backend.dllm_attention = None
+    backend.page_size = 1
+    read = SimpleNamespace(
+        kv=lambda: (k_buffer, v_buffer), key=lambda: k_buffer, value=lambda: v_buffer
+    )
+    backend.token_to_kv_pool = SimpleNamespace(
+        get_key_buffer=lambda _: k_buffer,
+        get_value_buffer=lambda _: v_buffer,
+        layer_router=SimpleNamespace(
+            read=lambda _: read,
+            route=lambda _: SimpleNamespace(sub_pool=None),
+            sub_pool=lambda _: None,
+        ),
+    )
+    backend.forward_metadata = SimpleNamespace(
+        kv_indptr=kv_indptr,
+        kv_indices=kv_indices,
+        window_kv_indptr=kv_indptr,
+        window_kv_indices=kv_indices,
+        window_kv_offsets=None,
+        qo_indptr=qo_indptr,
+        custom_mask=None,
+        mask_indptr=None,
+        max_extend_len=case["l_ext"],
+    )
+    layer = SimpleNamespace(
+        layer_id=0,
+        qk_head_dim=case["d"],
+        v_head_dim=case["dv"],
+        tp_q_head_num=case["h_q"],
+        k_scale=None,
+        v_scale=None,
+        logit_capping_method="tanh",
+        logit_cap=0.0,
+        is_cross_attention=False,
+        attn_type=AttentionType.DECODER,
+        sliding_window_size=case.get("window", -1),
+        scaling=_scale(case),
+        xai_temperature_len=-1,
+    )
+    forward_batch = SimpleNamespace(
+        forward_mode=ForwardMode.TARGET_VERIFY,
+        mha_one_shot=False,
+        extend_seq_lens_cpu=None,
+    )
+    return backend.forward_extend(
+        q, k, v, layer, forward_batch, save_kv_cache=False
+    ).view(*q.shape[:2], case["dv"])
+
+
+@unittest.skipUnless(is_hip(), "ROCm DFLASH draft kernels")
+class TestDraftAttention(CustomTestCase):
+    def test_fp8_cache_bf16_dot_matches_fp32(self):
+        for name in EXTEND_CASES:
+            with self.subTest(case=name):
+                case = EXTEND_CASES[name]
+                inputs = _inputs(case, fp8_dtype)
+                q, k, v, k_buffer, v_buffer, _, kv_indptr, kv_indices = inputs
+                ref = _reference(
+                    case,
+                    q,
+                    k,
+                    v,
+                    k_buffer,
+                    v_buffer,
+                    kv_indptr,
+                    kv_indices,
+                    _scale(case),
+                )
+
+                out = _backend_extend(case, inputs, bf16_dot=True)
+                err = _err(out, ref)
+                assert err < BF16_ERR, err
+                torch.testing.assert_close(
+                    out.float(), ref, atol=BF16_ATOL, rtol=BF16_RTOL
+                )
+
+                if FP8_DOT_OK:
+                    # The default still runs FP8 q and probabilities over an FP8 cache.
+                    default = _backend_extend(case, inputs, bf16_dot=False)
+                    default_err = _err(default, ref)
+                    assert not torch.equal(default, out)
+                    assert default_err > 2 * err, (default_err, err)
+
+    def test_bf16_cache_unchanged_by_bf16_dot(self):
+        for name in EXTEND_CASES:
+            with self.subTest(case=name):
+                case = EXTEND_CASES[name]
+                inputs = _inputs(case, torch.bfloat16, seed=1)
+                torch.testing.assert_close(
+                    _extend(case, inputs, bf16_dot=True),
+                    _extend(case, inputs, bf16_dot=False),
+                    rtol=0,
+                    atol=0,
+                )
+
+    def test_draft_backend_gate(self):
+        for algorithm, expected in (
+            (SpeculativeAlgorithm.DFLASH, True),
+            (SpeculativeAlgorithm.DSPARK, True),
+            (SpeculativeAlgorithm.EAGLE, False),
+        ):
+            with self.subTest(algorithm=algorithm):
+                backend = SimpleNamespace(use_mla=False, dcp_size=1)
+                init_draft_backend(backend, SimpleNamespace(spec_algorithm=algorithm))
+                assert backend.draft_bf16_dot is expected
+
+    def test_verify_matches_extend(self):
+        cases = [
+            ((65536, 3000), 8, -1, False),
+            ((600, 1024, 1100), 6, 1024, False),
+            ((600, 1024, 1100), 6, 1024, True),
+            ((600, 1024, 1100), 8, 1024, False),
+            ((600, 1024, 1100), 8, 1024, True),
+        ]
+        for prefix_lens, l_ext, window, bf16_dot in cases:
+            with self.subTest(l_ext=l_ext, window=window, bf16_dot=bf16_dot):
+                case = dict(
+                    MLA, mla=False, prefix_lens=prefix_lens, l_ext=l_ext, window=window
+                )
+                inputs = _inputs(case, torch.float8_e4m3fn)
+                actual = _extend(case, inputs, bf16_dot, kernel=verify_draft_fwd)
+                expected = _extend(case, inputs, bf16_dot)
+                torch.testing.assert_close(actual, expected, atol=8e-2, rtol=2e-2)
+
+    def test_verify_rejects_window_narrower_than_block(self):
+        case = dict(MLA, mla=False, prefix_lens=(256,))
+        q, k, v, k_buffer, v_buffer, qo_indptr, kv_indptr, kv_indices = _inputs(
+            case, torch.bfloat16
+        )
+        out = torch.empty(*q.shape[:2], case["dv"], dtype=q.dtype, device=q.device)
+        assert not verify_draft_fwd(
+            q, k, v, out, k_buffer, v_buffer, qo_indptr, kv_indptr, kv_indices,
+            None, True, None, 8, 1.0, 1.0, sliding_window_size=4,
+        )  # fmt: skip
 
 
 if __name__ == "__main__":

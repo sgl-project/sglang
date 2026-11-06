@@ -42,6 +42,15 @@ from sglang.srt.utils import is_gfx95_supported
 
 logger = logging.getLogger(__name__)
 
+# most (token, expert) pairs for which the patched sort (+ stage-1 quant) runs; aiter sorts
+# and quantizes larger batches itself
+_SMALL_SORT_MAX_PAIRS = 256
+# Kimi-K3's (num_experts, topk) runs it up to 1024 pairs. At E=896 / top-16 / block_m 32 on
+# MI355X the sorted variant beats aiter's opus sort + quant by 31-46% up to 960 pairs and
+# ties from 1152 (its bitonic width doubles past 1024); other shapes are unmeasured there.
+_KIMI_K3_MOE_SHAPE = (896, 16)
+_KIMI_K3_SMALL_SORT_MAX_PAIRS = 1024
+
 
 # P <= 64: one sort CTA does the whole P x P rank compare
 # per-M ints stay unspecialized so prefill sizes reuse the graph-capture compiles
@@ -56,6 +65,7 @@ def _moe_sorting_small_kernel(
     moe_buf_ptr,
     moe_buf_numel,
     qx_ptr,  # [M, N_COLS] activations to mx-quantize (EMIT_MX only)
+    qx_stride,  # row stride of qx (a column slice of a wider GEMM output)
     qout_ptr,  # [M, N_COLS] fp8 out
     qscale_ptr,  # swizzled e8m0 bytes, one per (sorted_row, group)
     M,
@@ -121,7 +131,7 @@ def _moe_sorting_small_kernel(
                 + (dest_p % 16) * 4
                 + (dest_p % 32) // 16
             )
-            x = tl.load(qx_ptr + token_p * N_COLS + c0 + offs_q).to(tl.float32)
+            x = tl.load(qx_ptr + token_p * qx_stride + c0 + offs_q).to(tl.float32)
             x2 = tl.reshape(x, (QCHUNK // 32, 32))
             amax = tl.maximum(tl.max(tl.abs(x2), axis=1), 1e-10)
             sf = amax * (1.0 / 448.0)
@@ -189,6 +199,7 @@ def _moe_sorting_small_kernel_distributed(
     moe_buf_ptr,
     moe_buf_numel,
     qx_ptr,  # [M, N_COLS] activations to mx-quantize (EMIT_MX only)
+    qx_stride,  # row stride of qx (a column slice of a wider GEMM output)
     qout_ptr,  # [M, N_COLS] fp8 out
     qscale_ptr,  # swizzled e8m0 bytes, one per (sorted_row, group)
     M,
@@ -291,7 +302,7 @@ def _moe_sorting_small_kernel_distributed(
         )
         for cc in tl.static_range(N_COLS // QCHUNK):
             c0 = cc * QCHUNK
-            x = tl.load(qx_ptr + token_p * N_COLS + c0 + offs_q).to(tl.float32)
+            x = tl.load(qx_ptr + token_p * qx_stride + c0 + offs_q).to(tl.float32)
             x2 = tl.reshape(x, (QCHUNK // 32, 32))
             amax = tl.maximum(tl.max(tl.abs(x2), axis=1), 1e-10)
             sf = amax * (1.0 / 448.0)
@@ -311,7 +322,81 @@ def _moe_sorting_small_kernel_distributed(
             tl.store(qscale_ptr + sw, exp.to(tl.uint8))
 
 
-# no-quant path: histogram + bitonic sort keep every pair in registers of one CTA
+@triton.jit
+def _sorted_mx_quant(
+    q_id,
+    topk_ids_ptr,
+    qx_ptr,
+    qx_stride,
+    qout_ptr,
+    qscale_ptr,
+    M,
+    TOPK: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    P_POW2: tl.constexpr,
+    E_POW2: tl.constexpr,
+    N_COLS: tl.constexpr,
+    QCHUNK: tl.constexpr,
+    SCALEN_PAD: tl.constexpr,
+    TOPK_POW2: tl.constexpr,
+):
+    # One (token, column chunk): quantize it once, mirroring
+    # fused_dynamic_mxfp8_quant_moe_sort, and place its e8m0 scales at the sorted
+    # row of each of the token's TOPK pairs (dest = blocks before the expert *
+    # BLOCK_SIZE + rank within the expert), as the sort CTA lays them out.
+    CHUNKS: tl.constexpr = N_COLS // QCHUNK
+    t = q_id // CHUNKS
+    c0 = (q_id % CHUNKS) * QCHUNK
+    if t < M:
+        P = M * TOPK
+        offs_p = tl.arange(0, P_POW2)
+        e_all = tl.load(topk_ids_ptr + offs_p, mask=offs_p < P, other=E_POW2 - 1)
+        offs_e = tl.arange(0, E_POW2)
+        cnt = tl.where(offs_e < E_POW2 - 1, tl.histogram(e_all, E_POW2), 0)
+        blocks = (cnt + BLOCK_SIZE - 1) // BLOCK_SIZE
+        blocks_before = tl.cumsum(blocks, 0) - blocks
+
+        offs_j = tl.arange(0, TOPK_POW2)
+        mask_j = offs_j < TOPK
+        p_j = t * TOPK + offs_j
+        e_j = tl.load(topk_ids_ptr + p_j, mask=mask_j, other=0)
+        earlier_same = (e_all[None, :] == e_j[:, None]) & (
+            offs_p[None, :] < p_j[:, None]
+        )
+        rank_j = tl.sum(tl.where(earlier_same, 1, 0), axis=1)
+        dest_j = tl.gather(blocks_before, e_j, 0) * BLOCK_SIZE + rank_j
+
+        offs_q = tl.arange(0, QCHUNK)
+        offs_g = tl.arange(0, QCHUNK // 32)
+        x = tl.load(qx_ptr + t * qx_stride + c0 + offs_q).to(tl.float32)
+        x2 = tl.reshape(x, (QCHUNK // 32, 32))
+        amax = tl.maximum(tl.max(tl.abs(x2), axis=1), 1e-10)
+        sf = amax * (1.0 / 448.0)
+        bits = sf.to(tl.int32, bitcast=True)
+        exp = (bits >> 23) & 0xFF
+        exp = tl.where((bits & 0x7FFFFF) != 0, exp + 1, exp)
+        scale = (exp << 23).to(tl.float32, bitcast=True)
+        q = tl.clamp(x2 / scale[:, None], -448.0, 448.0)
+        tl.store(
+            qout_ptr + t * N_COLS + c0 + offs_q,
+            tl.reshape(q, (QCHUNK,)).to(qout_ptr.dtype.element_ty),
+        )
+        base_sw = (
+            (dest_j // 32) * (SCALEN_PAD * 32) + (dest_j % 16) * 4 + (dest_j % 32) // 16
+        )
+        y = c0 // 32 + offs_g
+        sw = (
+            base_sw[:, None]
+            + ((y // 8) * 256 + (y % 4) * 64 + ((y % 8) // 4) * 2)[None, :]
+        )
+        tl.store(
+            qscale_ptr + sw,
+            tl.broadcast_to(exp[None, :], (TOPK_POW2, QCHUNK // 32)).to(tl.uint8),
+            mask=mask_j[:, None],
+        )
+
+
+# histogram + bitonic sort keep every pair in registers of one CTA
 @triton.jit(do_not_specialize=["M", "moe_buf_numel", "num_buf"])
 def _moe_sorting_small_kernel_sorted(
     topk_ids_ptr,  # [M, topk] i32
@@ -330,8 +415,36 @@ def _moe_sorting_small_kernel_sorted(
     PAD_POW2: tl.constexpr,  # >= (M * topk) * BLOCK_SIZE (worst-case padded len)
     BUF_BLOCK: tl.constexpr,
     num_buf,  # buf-zero CTAs occupy pids [1, num_buf]
+    qx_ptr=None,  # [M, N_COLS] activations to mx-quantize (EMIT_MX only)
+    qx_stride=0,  # row stride of qx (a column slice of a wider GEMM output)
+    qout_ptr=None,  # [M, N_COLS] fp8 out
+    qscale_ptr=None,  # swizzled e8m0 bytes, one per (sorted_row, group)
+    EMIT_MX: tl.constexpr = False,  # quant CTAs (token, chunk) follow the buf CTAs
+    N_COLS: tl.constexpr = 32,
+    QCHUNK: tl.constexpr = 32,
+    SCALEN_PAD: tl.constexpr = 8,
+    TOPK_POW2: tl.constexpr = 1,
 ):
     pid = tl.program_id(0)
+    if EMIT_MX and pid > num_buf:
+        _sorted_mx_quant(
+            pid - num_buf - 1,
+            topk_ids_ptr,
+            qx_ptr,
+            qx_stride,
+            qout_ptr,
+            qscale_ptr,
+            M,
+            TOPK,
+            BLOCK_SIZE,
+            P_POW2,
+            E_POW2,
+            N_COLS,
+            QCHUNK,
+            SCALEN_PAD,
+            TOPK_POW2,
+        )
+        return
     if pid > 0:
         offs = (pid - 1) * BUF_BLOCK + tl.arange(0, BUF_BLOCK)
         tl.store(
@@ -389,18 +502,24 @@ def _small_sort_supported(
 ):
     m, topk = topk_ids.shape
     p = m * topk
+    max_pairs = (
+        _KIMI_K3_SMALL_SORT_MAX_PAIRS
+        if (num_experts, topk) == _KIMI_K3_MOE_SHAPE
+        else _SMALL_SORT_MAX_PAIRS
+    )
     return (
         expert_mask is None
         and num_local_tokens is None
-        and p <= 256
+        and p <= max_pairs
         # ponytail: the distributed variant scans every 64-expert chunk per pair, so it beats
         # aiter at E=129 but loses at E=513; cutoff untuned in between. The no-quant
         # path past 32 pairs takes the histogram + bitonic sort kernel instead, which
-        # does not scan per expert chunk (measured up to E=385, i.e. E_POW2 <= 512).
+        # does not scan per expert chunk (measured up to E=896, i.e. E_POW2 <= 1024).
         and (
             (p <= 64 and p <= 2 * block_size)
             or num_experts <= 256
-            or (not emit_mx and p > 32 and num_experts < 512)
+            or (not emit_mx and p > 32 and num_experts < 1024)
+            or (emit_mx and p > 64 and 256 < num_experts < 1024)
         )
         and topk < 128
         and topk_ids.dtype == torch.int32
@@ -426,6 +545,9 @@ def _run_small_sort(
     emit_mx = mx_quant_input is not None
     if emit_mx:
         n_cols = mx_quant_input.shape[-1]
+        # columns per quant program: 2048 where it divides the row, else 512
+        # (Kimi-K3.1's 3584-wide latent rows)
+        qchunk = 2048 if n_cols % 2048 == 0 else 512
         scalen_pad = ((n_cols // 32 + 7) // 8) * 8
         max_padded = sorted_ids.shape[0]
         qout = torch.empty(m, n_cols, dtype=torch.float8_e4m3fn, device=topk_ids.device)
@@ -437,11 +559,30 @@ def _run_small_sort(
         )
     else:
         n_cols, scalen_pad = 32, 8
+        qchunk = n_cols
         qout = qscale = moe_buf  # unused placeholder pointers
     num_buf = triton.cdiv(max(moe_buf.numel(), 1), buf_block)
-    if not emit_mx and p > 32:
-        # beyond one 32-lane tile the sort variant beats both P x P compare kernels
-        _moe_sorting_small_kernel_sorted[(1 + num_buf,)](
+    sorted_emit = emit_mx and p > 64 and num_experts > 256
+    if (not emit_mx and p > 32) or sorted_emit:
+        # beyond one 32-lane tile the sort variant beats both P x P compare kernels;
+        # with the quant at E > 256 it also beats them past 64 pairs
+        num_quant = m * (n_cols // qchunk) if sorted_emit else 0
+        quant = (
+            dict(
+                qx_ptr=mx_quant_input,
+                qx_stride=mx_quant_input.stride(0),
+                qout_ptr=qout,
+                qscale_ptr=qscale,
+                EMIT_MX=True,
+                N_COLS=n_cols,
+                QCHUNK=qchunk,
+                SCALEN_PAD=scalen_pad,
+                TOPK_POW2=triton.next_power_of_2(topk),
+            )
+            if sorted_emit
+            else {}
+        )
+        _moe_sorting_small_kernel_sorted[(1 + num_buf + num_quant,)](
             topk_ids,
             topk_weights,
             sorted_ids,
@@ -459,11 +600,14 @@ def _run_small_sort(
             BUF_BLOCK=buf_block,
             num_buf=num_buf,
             num_warps=4,
+            **quant,
         )
+        if sorted_emit:
+            return qout, qscale.view(torch.float8_e8m0fnu)
         return None
     if p <= 64 and p <= 2 * block_size:
         # compact variant: one sort CTA does the P x P rank compare
-        num_quant = (p * (n_cols // min(2048, n_cols))) if emit_mx else 0
+        num_quant = (p * (n_cols // qchunk)) if emit_mx else 0
         grid = (1 + num_buf + num_quant,)
         _moe_sorting_small_kernel[grid](
             topk_ids,
@@ -475,6 +619,7 @@ def _run_small_sort(
             moe_buf,
             moe_buf.numel(),
             mx_quant_input if emit_mx else moe_buf,
+            mx_quant_input.stride(0) if emit_mx else 0,
             qout,
             qscale,
             m,
@@ -486,7 +631,7 @@ def _run_small_sort(
             num_buf=num_buf,
             EMIT_MX=emit_mx,
             N_COLS=n_cols,
-            QCHUNK=min(2048, n_cols),
+            QCHUNK=qchunk,
             SCALEN_PAD=scalen_pad,
             num_warps=4,
         )
@@ -508,6 +653,7 @@ def _run_small_sort(
         moe_buf,
         moe_buf.numel(),
         mx_quant_input if emit_mx else moe_buf,
+        mx_quant_input.stride(0) if emit_mx else 0,
         qout,
         qscale,
         m,
@@ -522,7 +668,7 @@ def _run_small_sort(
         num_buf=num_buf,
         EMIT_MX=emit_mx,
         N_COLS=n_cols,
-        QCHUNK=min(2048, n_cols),
+        QCHUNK=qchunk,
         SCALEN_PAD=scalen_pad,
         num_warps=8,
     )
@@ -662,9 +808,11 @@ def apply_aiter_small_moe_sort_patch() -> bool:
             and w1.dtype in (dtypes.fp4x2, dtypes.fp8)
             and not separated_swiglu_fp4
             and hidden_states.dtype in (torch.bfloat16, torch.float16)
-            and hidden_states.is_contiguous()
-            and hidden_states.shape[-1] % 2048 == 0
-            and topk_ids.numel() <= 256
+            and hidden_states.dim() == 2
+            and hidden_states.stride(-1) == 1
+            and hidden_states.shape[-1] % 512 == 0
+            # _small_sort_supported applies the per-shape limit
+            and topk_ids.numel() <= _KIMI_K3_SMALL_SORT_MAX_PAIRS
         )
         # aiter quantizes separated-SwiGLU stage1 activations to MXFP4 from fp4_act_min_tokens
         emit_fp4 = (
@@ -707,12 +855,11 @@ def apply_aiter_small_moe_sort_patch() -> bool:
         output_aux=False,
         **orig_kwargs,
     ):
-        # newer aiter passes a caller-owned moe_buf as output=; leave that to aiter
-        plain_sort = (
-            not output_aux
-            and not return_local_topk_ids
-            and orig_kwargs.get("output") is None
-        )
+        # newer aiter passes a caller-owned moe_buf as output=; only the small
+        # sort below takes it, the other sorts leave it to aiter
+        output = orig_kwargs.get("output")
+        small_sort = not output_aux and not return_local_topk_ids
+        plain_sort = small_sort and output is None
         # an accumulating stage2 sums into a pending addend instead of a zeroed moe_buf
         addend = (
             take_moe_output_addend(
@@ -735,7 +882,7 @@ def apply_aiter_small_moe_sort_patch() -> bool:
             if zero_moe_buf:
                 moe_buf.zero_()
             return (*presorted[:4], moe_buf)
-        if plain_sort and _small_sort_supported(
+        if small_sort and _small_sort_supported(
             topk_ids,
             int(block_size),
             expert_mask,
@@ -762,7 +909,13 @@ def apply_aiter_small_moe_sort_patch() -> bool:
             )
             num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
             if zero_moe_buf:
-                moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
+                # A caller-owned output= stands in for moe_buf, as in aiter: the
+                # sort kernel zeroes the buffer it is handed.
+                moe_buf = (
+                    output
+                    if output is not None
+                    else torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
+                )
             else:
                 moe_buf = torch.empty((0, 0), dtype=moebuf_dtype, device=device)
             quant_ret = _run_small_sort(

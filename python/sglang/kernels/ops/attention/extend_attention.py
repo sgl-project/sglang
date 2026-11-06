@@ -438,6 +438,7 @@ def _fwd_kernel(
     IS_GFX1250: tl.constexpr = False,
     PAGE_SIZE: tl.constexpr = 1,
     IDENTITY_KV_INDICES: tl.constexpr = False,
+    BF16_DOT: tl.constexpr = False,
     SCORE_MOD: tl.constexpr = None,
     Aux0=None,
     aux0_stride_t=0,
@@ -614,9 +615,10 @@ def _fwd_kernel(
             # reused (prefill reads the cached fp8 KV), and the MLA nope dot has K=512,
             # so we must upcast the fp8 K to q's dtype and dot in bf16 rather than
             # downcasting q to fp8. No-op for a bf16 cache. (Do NOT revert to q.to(fp8).)
-            # On all other platforms keep the original q.to(k.dtype) downcast.
-            # TODO: remove this branch once the gfx1250 fp8 tl.dot issue is resolved.
-            if IS_GFX1250:
+            # On all other platforms keep the original q.to(k.dtype) downcast, unless
+            # BF16_DOT asks for the same upcast so that q and the dots stay BF16.
+            # TODO: drop IS_GFX1250 here once the gfx1250 fp8 tl.dot issue is resolved.
+            if IS_GFX1250 or BF16_DOT:
                 qk = tl.dot(q, k.to(q.dtype))
             else:
                 qk = tl.dot(q.to(k.dtype), k)
@@ -639,7 +641,7 @@ def _fwd_kernel(
                     mask=mask_n[None, :],
                     other=0.0,
                 )
-                if IS_GFX1250:
+                if IS_GFX1250 or BF16_DOT:
                     qk += tl.dot(qpe, kpe.to(qpe.dtype))
                 else:
                     qk += tl.dot(qpe.to(kpe.dtype), kpe)
@@ -711,6 +713,8 @@ def _fwd_kernel(
                 # TODO: remove this branch once the gfx1250 bf16 P·V issue is resolved.
                 if IS_GFX1250:
                     dot = tl.dot(p, v.to(tl.float32), out_dtype=tl.float32)
+                elif BF16_DOT:
+                    dot = tl.dot(p.to(q.dtype), v.to(q.dtype))
                 else:
                     dot = tl.dot(p.to(v.dtype), v)
                 acc = acc * re_scale[:, None] + dot * v_scale
@@ -947,6 +951,7 @@ def extend_attention_fwd(
     aux_tensors=None,
     extend_seq_lens_cpu=None,
     identity_kv_indices: bool = False,
+    bf16_dot: bool = False,
 ):
     """
     q_extend, k_extend, v_extend, o_extend: contiguous tensors
@@ -961,6 +966,9 @@ def extend_attention_fwd(
     see triton_ops/score_mod.py for the contract.
     ``identity_kv_indices`` promises that the prefix buffer is densely packed,
     allowing direct addressing instead of loading an index for every token.
+    ``bf16_dot``: with an FP8 cache and BF16 q, upcast the cached K/V and run the
+    prefix dots in BF16 instead of casting q and the probabilities to FP8 (no FP8
+    prefix or zero-prefix kernel). No effect on a BF16 cache.
     """
     Lq, Lk, Lv = (
         q_extend.shape[-1],
@@ -991,6 +999,7 @@ def extend_attention_fwd(
     # native-FP8 zero-prefix kernel at every sequence length.
     use_fp8_zero_prefix = (
         _is_gfx95
+        and not bf16_dot
         and envs.SGLANG_TRITON_FP8_PREFILL_ATTN.get()
         and zero_prefix_shape
         and q_extend.dtype == torch.bfloat16
@@ -1024,6 +1033,7 @@ def extend_attention_fwd(
     HAS_SINK = sinks is not None
     USE_FP8_PREFIX = (
         _is_gfx95
+        and not bf16_dot
         and kimi_k3_shape
         and k_buffer.dtype == torch.float8_e4m3fn
         and v_buffer.dtype == torch.float8_e4m3fn
@@ -1160,6 +1170,7 @@ def extend_attention_fwd(
         FP8_MAX=FP8_MAX,
         PAGE_SIZE=page_size,
         IDENTITY_KV_INDICES=identity_kv_indices,
+        BF16_DOT=bf16_dot,
         SCORE_MOD=score_mod,
         Aux0=aux0,
         aux0_stride_t=aux0_stride_t,

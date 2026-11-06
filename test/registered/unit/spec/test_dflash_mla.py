@@ -13,19 +13,25 @@ from unittest.mock import Mock, patch
 import torch
 from transformers import Qwen3Config
 
+from sglang.srt.arg_groups.overrides import resolution_result
+from sglang.srt.arg_groups.speculative_hook import (
+    _resolve_dflash_draft_attention_backend,
+)
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
+from sglang.srt.environ import envs
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.models.dflash import DFlashDraftModel, DFlashMLAAttention
 from sglang.srt.models.dspark import DSparkDraftModel
-from sglang.srt.runtime_context import reset_context
+from sglang.srt.runtime_context import override_platform, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_utils import (
     dflash_draft_cell_size_per_token,
     is_dflash_mla_draft_config,
 )
+from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.parallel_groups import publish
 from sglang.test.test_utils import CustomTestCase
@@ -34,6 +40,9 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 HIDDEN, HEADS, KV_LORA, NOPE, ROPE, VDIM, THETA, EPS = 16, 2, 8, 8, 8, 6, 1e4, 1e-6
 Q_LORA = 16
+# A ROCm host serves MLA through forward_absorb_rocm_core, whose absorbed bmms are
+# bf16, so there the layer runs in bf16 against the FP32 reference.
+LAYER_DTYPE, LAYER_TOL = (torch.bfloat16, 2e-2) if is_hip() else (torch.float32, 1e-5)
 # SpecForge's attention parameter names (external checkpoint layout).
 SPECFORGE_KEYS = {
     None: {"q_proj.weight"},
@@ -112,7 +121,7 @@ def _mla_rope(x, positions, interleaved):
 
 
 def _reference_output(attn, ctx_hidden, ctx_positions, hidden, positions, interleaved):
-    w = _specforge_weights(attn)
+    w = {name: param.float() for name, param in _specforge_weights(attn).items()}
 
     def kv(x, pos):
         kv_a, k_pe = (x @ w["kv_a_proj_with_mqa.weight"].T).split([KV_LORA, ROPE], -1)
@@ -140,7 +149,8 @@ def _reference_output(attn, ctx_hidden, ctx_positions, hidden, positions, interl
 
 class _BlockOverCachedContext(torch.nn.Module):
     """Bidirectional attention of the block over the cached latent context, in the
-    triton call convention: concatenated [latent | rope] Q/K rows, latent V."""
+    triton call convention: concatenated [latent | rope] Q/K rows, latent V; FP32
+    math, as the kernels accumulate."""
 
     def __init__(self, radix, k_ctx, v_ctx):
         super().__init__()
@@ -152,8 +162,10 @@ class _BlockOverCachedContext(torch.nn.Module):
         keys = torch.cat((self.k_ctx, k)).expand(-1, heads, -1)
         values = torch.cat((self.v_ctx, v)).expand(-1, heads, -1)
         q = q.view(-1, heads, self.radix.qk_head_dim)
-        probs = (torch.einsum("qhd,khd->hqk", q, keys) * self.radix.scaling).softmax(-1)
-        return torch.einsum("hqk,khd->qhd", probs, values).flatten(1)
+        scores = torch.einsum("qhd,khd->hqk", q.float(), keys.float())
+        probs = (scores * self.radix.scaling).softmax(-1)
+        out = torch.einsum("hqk,khd->qhd", probs, values.float()).flatten(1)
+        return out.to(q.dtype)
 
 
 def _serve_block(attn, ctx_hidden, ctx_positions, hidden, positions):
@@ -271,24 +283,32 @@ class TestDFlashMLA(CustomTestCase):
                         param.copy_(
                             torch.randn_like(param) * 0.2 + (param == 1).float()
                         )
-                attn.absorb_kv_b_proj()
+                attn.to(LAYER_DTYPE).absorb_kv_b_proj()
                 norms = [attn.kv_a_layernorm] + (
                     [attn.q_a_layernorm] if q_lora_rank else []
                 )
                 for module in (attn.rotary_emb, *norms):
                     module.forward = module.forward_native
 
-                ctx_hidden, hidden = torch.randn(5, HIDDEN), torch.randn(4, HIDDEN)
+                ctx_hidden = torch.randn(5, HIDDEN).to(LAYER_DTYPE)
+                hidden = torch.randn(4, HIDDEN).to(LAYER_DTYPE)
                 ctx_positions = torch.tensor([0, 1, 2, 7, 100])
                 positions = torch.arange(1000, 1004)
                 with torch.no_grad():
                     expected = _reference_output(
-                        attn, ctx_hidden, ctx_positions, hidden, positions, interleaved
+                        attn,
+                        ctx_hidden.float(),
+                        ctx_positions,
+                        hidden.float(),
+                        positions,
+                        interleaved,
                     )
                 actual = _serve_block(
                     attn, ctx_hidden, ctx_positions, hidden, positions
                 )
-                torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+                torch.testing.assert_close(
+                    actual.float(), expected, atol=LAYER_TOL, rtol=LAYER_TOL
+                )
 
     def test_dspark_commits_verify_rows_through_mla_layer(self):
         """DSpark's fused context-KV paths slice a qkv_proj; an MLA draft must commit
@@ -306,6 +326,11 @@ class TestDFlashMLA(CustomTestCase):
             for parameter in attn.parameters():
                 parameter.fill_(0.1)
         attn.rotary_emb = copy.deepcopy(attn.rotary_emb)
+        # The layer allocates its weights with torch.empty, whose bytes can be NaN.
+        torch.manual_seed(0)
+        with torch.no_grad():
+            for param in attn.parameters():
+                param.copy_(torch.randn_like(param))
         for module in (attn.rotary_emb, attn.kv_a_layernorm):
             module.forward = module.forward_native
         # A real MLA pool also exposes the K/V buffer getters the GQA bundle probes.
@@ -336,6 +361,65 @@ class TestDFlashMLA(CustomTestCase):
         self.assertIs(got_lens, commit_lens)
         for got, want in zip(rows, expected):
             torch.testing.assert_close(got, want, rtol=0, atol=0)
+
+
+class TestTritonDcpMlaDraft(CustomTestCase):
+    """Under --dcp-size > 1 the triton draft backend takes a sliding-window MLA
+    draft only where the ROCm MLA forward merges its partials."""
+
+    # draft: (attention_modes, layer_types)
+    SLIDING = (["mla"] * 2, ["sliding_attention"] * 2)  # MLA5
+    FULL = (["mla"] * 2, ["full_attention"] * 2)  # MLA7
+
+    def _resolve(self, draft, *, is_hip=True, use_aiter=True, window_size=None):
+        modes, layer_types = draft
+        draft_config = {
+            "num_hidden_layers": 2,
+            "dflash_config": {"attention_modes": modes},
+            "layer_types": layer_types,
+            "sliding_window": 256,
+        }
+        args = ServerArgs(
+            model_path="dummy",
+            device="cuda",
+            speculative_algorithm="DFLASH",
+            speculative_draft_model_path="draft",
+            speculative_draft_attention_backend="triton",
+            speculative_draft_window_size=window_size,
+            dcp_size=8,
+        )
+        hook = "sglang.srt.arg_groups.speculative_hook"
+        with (
+            override_platform(is_hip=is_hip),
+            envs.SGLANG_USE_AITER.override(use_aiter),
+            patch(f"{hook}.current_platform.is_out_of_tree", return_value=False),
+            patch(f"{hook}._load_draft_hf_config", return_value=draft_config),
+        ):
+            _resolve_dflash_draft_attention_backend(args)
+        return resolution_result(args, "speculative_draft_attention_backend")
+
+    def test_rocm_with_aiter_takes_the_sliding_draft(self):
+        self.assertEqual(self._resolve(self.SLIDING), "triton")
+
+    def test_other_rocm_setups_refuse(self):
+        for setup in (
+            dict(use_aiter=False),
+            # The owner rows are read through the shared req_to_token, not
+            # a compact draft one.
+            dict(window_size=1024),
+        ):
+            with (
+                self.subTest(**setup),
+                self.assertRaisesRegex(ValueError, "only with SGLANG_USE_AITER=1"),
+            ):
+                self._resolve(self.SLIDING, **setup)
+
+    def test_cuda_keeps_dev_resolution(self):
+        self.assertEqual(self._resolve(self.SLIDING, is_hip=False), "triton")
+
+    def test_full_attention_draft_refuses(self):
+        with self.assertRaisesRegex(ValueError, "only sliding_attention"):
+            self._resolve(self.FULL)
 
 
 if __name__ == "__main__":

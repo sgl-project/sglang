@@ -450,8 +450,8 @@ def dcp_global_topk(
     every rank in one process). Every rank must call this with the same number
     of rows, also when it has no local keys.
 
-    With ``DcpTopKMerge`` the result holds only this rank's slots, which is all
-    ``dcp_localize_compact`` keeps.
+    With ``DcpTopKMerge``, and on ROCm without indexer top-k capture, the result
+    holds only this rank's slots, which is all ``dcp_localize_compact`` keeps.
     """
     parallel = get_parallel()
     rows = local_lens.shape[0]
@@ -460,6 +460,12 @@ def dcp_global_topk(
     out = torch.empty((rows, topk), dtype=torch.int32, device=logits.device)
     if rows == 0:
         return out
+    if get_platform().is_hip:
+        from sglang.srt.layers.attention.dsa import dsa_dcp_sharded_hip
+
+        return dsa_dcp_sharded_hip.dcp_global_topk(
+            logits, local_lens, global_lens, page_table, out, span, all_gather
+        )
     if all_gather is None and _TOPK_MERGE is not None and _TOPK_MERGE.usable(rows):
         candidates = _local_candidates(logits, local_lens, topk)
         _TOPK_MERGE(candidates, global_lens, page_table, out, span)
@@ -524,6 +530,10 @@ def dcp_all_visible(
     rows that see at most ``topk`` keys (the indexer's k-only path), -1 padded."""
     span = page_size * get_parallel().attn_dcp_size
     rows = global_lens.shape[0]
+    if get_platform().is_hip:
+        from sglang.srt.layers.attention.dsa import dsa_dcp_sharded_hip
+
+        return dsa_dcp_sharded_hip.dcp_all_visible(global_lens, page_table, topk, span)
     scores = torch.zeros((rows, topk), dtype=torch.float32, device=global_lens.device)
     out = torch.empty((rows, topk), dtype=torch.int32, device=global_lens.device)
     if rows == 0:
