@@ -80,6 +80,7 @@ def _make_backend(batch_size, capture_width=7):
     backend.sliding_window_size = None
     backend.use_sliding_window_kv_pool = False
     backend._verify_mask = None
+    backend._use_dflash_draft_verify = False
     return backend
 
 

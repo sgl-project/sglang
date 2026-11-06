@@ -33,6 +33,7 @@ from sglang.srt.layers.dcp import (
     get_dcp_lens,
 )
 from sglang.srt.layers.radix_attention import AttentionType
+from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -248,6 +249,13 @@ class TritonAttnBackend(AttentionBackend):
             self.topk,
             self.use_mla,
             self.use_verify_splitkv,
+        )
+        # ROCm DFlash draft block (TARGET_VERIFY on the draft runner): split-KV
+        # SWA verify kernel + one-launch verify metadata.
+        self._use_dflash_draft_verify = (
+            _is_hip
+            and model_runner.is_draft_worker
+            and model_runner.spec_algorithm.is_dflash()
         )
         self.dcp_size = attention_dcp_size(
             backend="triton",
@@ -598,48 +606,81 @@ class TritonAttnBackend(AttentionBackend):
     ):
         """Fill all cuda-graph buffers for target_verify mode."""
         num_tokens_per_req = self._target_verify_num_tokens_per_req(spec_info)
-        qo_indptr = self.qo_indptr[: bs + 1]
-        qo_indptr[: bs + 1] = torch.arange(
-            0,
-            (1 + bs) * num_tokens_per_req,
-            step=num_tokens_per_req,
-            dtype=torch.int32,
-            device=self.device,
-        )
-        kv_indptr = self._fill_kv_indptr_and_indices(
-            plan, bs, seq_lens, req_pool_indices, self.cuda_graph_kv_indices
-        )
+        swa = self.sliding_window_size is not None and self.sliding_window_size > 0
         window_kv_indptr = self.window_kv_indptr
-        window_kv_indices = None
-        window_num_kv_splits = None
-        window_kv_offsets = None
-        if self.sliding_window_size is not None and self.sliding_window_size > 0:
-            window_kv_indices = self.cuda_graph_window_kv_indices
-            window_num_kv_splits = self.cuda_graph_window_num_kv_splits
-            window_kv_offsets = self.cuda_graph_window_kv_offsets
-            window_kv_indptr, window_kv_indices, _, window_kv_offsets[:bs] = (
-                update_sliding_window_buffer(
-                    self.window_kv_indptr,
-                    self.runner_ids,
-                    plan,
-                    req_pool_indices,
-                    self.sliding_window_size,
-                    seq_lens[:bs],
-                    bs,
-                    token_to_kv_pool=self.token_to_kv_pool,
-                    window_kv_indices=window_kv_indices,
-                )
+        window_kv_indices = self.cuda_graph_window_kv_indices if swa else None
+        window_num_kv_splits = self.cuda_graph_window_num_kv_splits if swa else None
+        window_kv_offsets = self.cuda_graph_window_kv_offsets if swa else None
+        if (
+            self._use_dflash_draft_verify
+            and (spec_info is None or spec_info.custom_mask is None)
+            and not self.kv_index_translator.reads_are_translated
+            and not isinstance(self.token_to_kv_pool, BaseSWAKVPool)
+            and self.dcp_size == 1
+            and seq_lens.shape[0] == bs
+            and bs <= 1024
+        ):
+            from sglang.kernels.ops.attention.dflash_draft_verify_metadata import (
+                fill_draft_verify_metadata,
             )
-        custom_mask = (
-            self._verify_mask.buffer if self._verify_mask is not None else None
-        )
-        if spec_info is not None and spec_info.custom_mask is not None:
-            custom_mask[: spec_info.custom_mask.shape[0]] = spec_info.custom_mask
-        else:
+
+            fill_draft_verify_metadata(
+                bs=bs,
+                seq_lens=seq_lens,
+                req_pool_indices=req_pool_indices,
+                req_to_token=self.kv_index_translator.req_to_token,
+                num_tokens_per_req=num_tokens_per_req,
+                qo_indptr=self.qo_indptr,
+                kv_indptr=self.kv_indptr,
+                kv_indices=self.cuda_graph_kv_indices,
+                mask_indptr=self.mask_indptr,
+                window_size=self.sliding_window_size if swa else None,
+                window_kv_indptr=self.window_kv_indptr if swa else None,
+                window_kv_indices=window_kv_indices,
+                window_kv_offsets=window_kv_offsets,
+            )
+            qo_indptr = self.qo_indptr[: bs + 1]
+            kv_indptr = self.kv_indptr[: bs + 1]
             custom_mask = None
-        seq_mask_len = num_tokens_per_req * (seq_lens + num_tokens_per_req)
-        mask_indptr = self.mask_indptr[: bs + 1]
-        mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
+            mask_indptr = self.mask_indptr[: bs + 1]
+            if swa:
+                window_kv_indptr = self.window_kv_indptr[: bs + 1]
+        else:
+            qo_indptr = self.qo_indptr[: bs + 1]
+            qo_indptr[: bs + 1] = torch.arange(
+                0,
+                (1 + bs) * num_tokens_per_req,
+                step=num_tokens_per_req,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            kv_indptr = self._fill_kv_indptr_and_indices(
+                plan, bs, seq_lens, req_pool_indices, self.cuda_graph_kv_indices
+            )
+            if swa:
+                window_kv_indptr, window_kv_indices, _, window_kv_offsets[:bs] = (
+                    update_sliding_window_buffer(
+                        self.window_kv_indptr,
+                        self.runner_ids,
+                        plan,
+                        req_pool_indices,
+                        self.sliding_window_size,
+                        seq_lens[:bs],
+                        bs,
+                        token_to_kv_pool=self.token_to_kv_pool,
+                        window_kv_indices=window_kv_indices,
+                    )
+                )
+            custom_mask = (
+                self._verify_mask.buffer if self._verify_mask is not None else None
+            )
+            if spec_info is not None and spec_info.custom_mask is not None:
+                custom_mask[: spec_info.custom_mask.shape[0]] = spec_info.custom_mask
+            else:
+                custom_mask = None
+            seq_mask_len = num_tokens_per_req * (seq_lens + num_tokens_per_req)
+            mask_indptr = self.mask_indptr[: bs + 1]
+            mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
         return (
             qo_indptr,
             kv_indptr,
@@ -1842,6 +1883,57 @@ class TritonAttnBackend(AttentionBackend):
         else:
             k_descale = 1.0
             v_descale = 1.0
+
+        # ROCm DFlash draft block (TARGET_VERIFY on the draft runner): split-KV
+        # GQA-packed sliding-window kernel; reads the strided q/k/v directly.
+        if (
+            self._use_dflash_draft_verify
+            and k is not None
+            and v is not None
+            and score_mod is None
+            and aux_tensors is None
+            and k_descale == 1.0
+            and v_descale == 1.0
+            and self.forward_metadata.custom_mask is None
+            and forward_batch.forward_mode.is_target_verify()
+        ):
+            from sglang.kernels.ops.attention import dflash_draft_swa_verify as _dsv
+
+            q3 = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+            k3 = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
+            v3 = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
+            k_buf = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+            v_buf = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+            if _dsv.can_handle(
+                q3,
+                k3,
+                v3,
+                k_buf,
+                v_buf,
+                self.forward_metadata.qo_indptr,
+                self.forward_metadata.max_extend_len,
+                causal=causal,
+                sinks=sinks,
+                logit_cap=logits_soft_cap,
+                xai_temperature_len=layer.xai_temperature_len,
+                score_mod=score_mod,
+            ):
+                _dsv.draft_swa_verify_fwd(
+                    q3,
+                    k3,
+                    v3,
+                    o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                    k_buf,
+                    v_buf,
+                    self.forward_metadata.qo_indptr,
+                    kv_indptr,
+                    kv_indices,
+                    self.forward_metadata.max_extend_len,
+                    layer.scaling,
+                    sliding_window_size,
+                    self.req_to_token_pool.size,
+                )
+                return o
 
         # Split-KV EAGLE-verify fast path (ROCm/Triton). On target-verify
         # (topk=1 causal chain), run the bandwidth-efficient split-KV kernel
