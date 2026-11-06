@@ -9,7 +9,11 @@ import torch
 from torch import nn
 
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.draft.ffn_spec import DraftMoeFFNSpec
+from sglang.srt.layers.draft.ffn_spec import (
+    FFN_KIND_DENSE,
+    DraftMixFFNSpec,
+    DraftMoeFFNSpec,
+)
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     ReplicatedLinear,
@@ -233,3 +237,25 @@ def _check_parallel_fit(spec: DraftMoeFFNSpec) -> None:
             f"Draft FFN: num_experts={spec.num_experts} is not divisible by the "
             f"MoE expert-parallel size {parallel.moe_ep_size}."
         )
+
+
+def build_draft_ffn(
+    spec: DraftMixFFNSpec,
+    layer_id: int,
+    hidden_size: int,
+    *,
+    dense: Callable[[], nn.Module],
+    quant_config: Optional[QuantizationConfig] = None,
+    prefix: str = "",
+) -> nn.Module:
+    """The FFN of draft layer ``layer_id``: ``dense()`` as today, or a DraftMoE."""
+    if spec.kind(layer_id) == FFN_KIND_DENSE:
+        return dense()
+    assert spec.moe is not None
+    return DraftMoE(
+        spec.moe,
+        hidden_size,
+        layer_id=layer_id,
+        quant_config=quant_config,
+        prefix=prefix,
+    )
