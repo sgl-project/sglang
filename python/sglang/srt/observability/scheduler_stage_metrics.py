@@ -86,6 +86,10 @@ class SchedulerStageMetricsRecorder:
         default_factory=lambda: defaultdict(int)
     )
 
+    @property
+    def current_stage(self) -> str:
+        return self._current_stage
+
     def start(self, wall_ns: int) -> None:
         if not self.enabled:
             return
