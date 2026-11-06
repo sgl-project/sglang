@@ -7,6 +7,7 @@ import torch
 
 from sglang.srt.models.qwen2_5_vl import Qwen2_5_VisionTransformer
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
@@ -28,7 +29,7 @@ def reference_layout(grids, window=4, merge=2):
     return indices, boundaries
 
 
-class TestQwen25WindowIndex(unittest.TestCase):
+class TestQwen25WindowIndex(CustomTestCase):
     def test_mixed_video_and_image_shapes(self):
         model = SimpleNamespace(
             window_size=112, spatial_merge_size=2, patch_size=14, spatial_merge_unit=4
