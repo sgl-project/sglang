@@ -417,6 +417,7 @@ class CommonKVManager(BaseKVManager):
         self.failure_records: Dict[int, str] = {}
         self.failure_lock = threading.Lock()
         self._staging_outstanding: Dict[int, int] = defaultdict(int)
+        self._room_lifecycle_gen: Dict[int, int] = defaultdict(int)
         self._deferred_ack_targets: Dict[int, Dict[Tuple[str, int], AckTarget]] = {}
         # A poisoned room has a permanently outstanding transfer whose backend
         # can no longer prove quiescent. A new room lifecycle clears this state.
@@ -703,6 +704,10 @@ class CommonKVManager(BaseKVManager):
                 self._deferred_ack_targets.pop(bootstrap_room, None)
                 self._deferred_ack_poisoned_rooms.discard(bootstrap_room)
                 self._staging_outstanding.pop(bootstrap_room, None)
+                lifecycle_gens = self.__dict__.setdefault("_room_lifecycle_gen", {})
+                lifecycle_gens[bootstrap_room] = (
+                    lifecycle_gens.get(bootstrap_room, 0) + 1
+                )
                 self.request_status[bootstrap_room] = status
             return
         if status == KVPoll.Failed:
@@ -891,6 +896,15 @@ class CommonKVManager(BaseKVManager):
         handler.handle_chunk_arrived(room, chunk_idx, page_start, num_pages, writer_id)
         return True
 
+    def _is_current_room_lifecycle(
+        self, bootstrap_room: int, lifecycle_gen: Optional[int]
+    ) -> bool:
+        return (
+            lifecycle_gen is None
+            or getattr(self, "_room_lifecycle_gen", {}).get(bootstrap_room)
+            == lifecycle_gen
+        )
+
     def conclude_transfer(
         self,
         *,
@@ -898,13 +912,17 @@ class CommonKVManager(BaseKVManager):
         status: KVPoll,
         targets: Optional[List[Tuple[str, int]]] = None,
         failure_reason: Optional[str] = None,
+        lifecycle_gen: Optional[int] = None,
     ) -> Optional[KVPoll]:
         """Returns the status emitted, or None for a cleared room.
 
         Runs more than once for a room when a staging chunk is deferred past the
         last one. ``targets`` defaults to the room's non-dummy decode endpoints.
         """
-        if bootstrap_room not in self.request_status:
+        if (
+            bootstrap_room not in self.request_status
+            or not self._is_current_room_lifecycle(bootstrap_room, lifecycle_gen)
+        ):
             # The sender already cleared this room. Concluding now would
             # re-create it in request_status and leave a failure record that a
             # request reusing this bootstrap_room would adopt as its own.

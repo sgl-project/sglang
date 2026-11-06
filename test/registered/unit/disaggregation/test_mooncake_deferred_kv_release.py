@@ -19,7 +19,8 @@ from test_deferred_decode_kv_release import (
 
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.conn import AckTarget, CommonKVManager
-from sglang.srt.disaggregation.common.utils import TransferKVChunk
+from sglang.srt.disaggregation.common.utils import FastQueue, TransferKVChunk
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager, TransferInfo
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -41,6 +42,7 @@ def _manager(
     manager._deferred_ack_targets = {}
     manager._deferred_ack_poisoned_rooms = set()
     manager._staging_outstanding = {}
+    manager._room_lifecycle_gen = defaultdict(int)
     manager.check_status = lambda room: manager.request_status[room]
     manager.update_status = lambda room, value: manager.request_status.__setitem__(
         room, value
@@ -233,6 +235,108 @@ class TestMooncakeAbortNotification(
 
                 manager.send_aux.assert_called_once()
                 self.assertEqual(manager._sent, [])
+
+    def test_queued_chunk_from_previous_lifecycle_skips_reopened_room(self):
+        """A chunk enqueued before a room is cleared and reopened must not read
+        the new lifecycle's TransferInfo or write into its decode pages."""
+        manager = _manager(status=None)
+        self._prepare_worker(manager)
+        manager.disaggregation_mode = DisaggregationMode.PREFILL
+        manager.transfer_queues = [FastQueue()]
+        session = f"{DECODE_IP}:{DECODE_PORT}"
+        manager.decode_kv_args_table[session] = manager.decode_kv_args_table[
+            "decode-session-0"
+        ]
+        manager.transfer_infos = {
+            ROOM: {
+                session: TransferInfo(
+                    room=ROOM,
+                    endpoint=DECODE_IP,
+                    dst_port=DECODE_PORT,
+                    mooncake_session_id=session,
+                    dst_kv_indices=np.array([1], dtype=np.int32),
+                    dst_aux_index=0,
+                    dst_state_indices=[[1]],
+                    required_dst_info_num=1,
+                    is_dummy=False,
+                )
+            }
+        }
+        manager.update_status = lambda room, value: CommonKVManager.update_status(
+            manager, room, value
+        )
+        manager.conclude_transfer = lambda **kw: CommonKVManager.conclude_transfer(
+            manager, **kw
+        )
+
+        # Lifecycle 1 opens ROOM and enqueues a chunk via real add_transfer_request.
+        manager.update_status(ROOM, KVPoll.WaitingForInput)
+        manager.add_transfer_request(
+            bootstrap_room=ROOM,
+            kv_indices=np.array([10], dtype=np.int32),
+            index_slice=slice(0, 1),
+            is_last_chunk=False,
+        )
+        queued_chunk = manager.transfer_queues[0].get()
+        self.assertEqual(queued_chunk.lifecycle_gen, 1)
+
+        # Lifecycle 1 is cleared; Lifecycle 2 reopens ROOM with its own TransferInfo.
+        manager.request_status.pop(ROOM, None)
+        manager.update_status(ROOM, KVPoll.WaitingForInput)
+        self.assertEqual(manager._room_lifecycle_gen[ROOM], 2)
+
+        queue = MagicMock()
+        queue.get.side_effect = [queued_chunk, None]
+        manager.transfer_worker(queue, MagicMock())
+
+        # Stale chunk from lifecycle 1 must be skipped without sending KV or
+        # popping lifecycle 2's TransferInfo / status.
+        manager.send_kvcache.assert_not_called()
+        self.assertEqual(manager.request_status[ROOM], KVPoll.WaitingForInput)
+        self.assertIn(ROOM, manager.transfer_infos)
+        self.assertEqual(manager._staging_outstanding.get(ROOM, 0), 0)
+
+    def test_inflight_last_chunk_from_previous_lifecycle_does_not_conclude_reopened_room(
+        self,
+    ):
+        """An in-flight last chunk that already passed the dequeue check before
+        room reopen must not promote the new Bootstrapping room to Success."""
+        manager = _manager(status=None)
+        self._prepare_worker(manager)
+        manager.failure_records = {}
+        manager.failure_lock = threading.Lock()
+        manager.deferred_bootstrap = None
+        manager.send_kv_status_message = MagicMock()
+        manager.update_status = lambda room, value: CommonKVManager.update_status(
+            manager, room, value
+        )
+        manager.conclude_transfer = lambda **kw: CommonKVManager.conclude_transfer(
+            manager, **kw
+        )
+
+        # Lifecycle 1 opens ROOM; its last chunk is created and starts sending.
+        manager.update_status(ROOM, KVPoll.WaitingForInput)
+        chunk = _last_chunk()
+        chunk.lifecycle_gen = manager._room_lifecycle_gen[ROOM]
+
+        def reopen_room_mid_send(*args, **kwargs):
+            # While lifecycle 1's last chunk is in send_aux, lifecycle 1 is
+            # cleared and lifecycle 2 reopens ROOM in Bootstrapping.
+            manager.request_status.pop(ROOM, None)
+            manager.update_status(ROOM, KVPoll.Bootstrapping)
+            return 0
+
+        manager.send_aux.side_effect = reopen_room_mid_send
+        queue = MagicMock()
+        queue.get.side_effect = [chunk, None]
+        manager.transfer_worker(queue, MagicMock())
+
+        # Lifecycle 2 must remain in Bootstrapping (not clobbered to Success)
+        # and keep its transfer_infos entry.
+        self.assertEqual(manager.request_status[ROOM], KVPoll.Bootstrapping)
+        manager.send_kv_status_message.assert_not_called()
+        self.assertIn(ROOM, manager.transfer_infos)
+        self.assertEqual(manager._staging_outstanding.get(ROOM, 0), 0)
 
 
 if __name__ == "__main__":
