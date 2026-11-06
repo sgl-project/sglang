@@ -91,7 +91,9 @@ def verify_logits_adjustments_are_noop(sampling_info) -> bool:
         return True
     if sampling_info.has_custom_logit_processor:
         return False
-    if getattr(sampling_info, "acc_linear_penalties", None) is not None:
+    if getattr(sampling_info, "acc_additive_penalties", None) is not None:
+        return False
+    if getattr(sampling_info, "acc_scaling_penalties", None) is not None:
         return False
     penalizer = getattr(sampling_info, "penalizer_orchestrator", None)
     if penalizer is not None and penalizer.is_required:
@@ -346,6 +348,7 @@ class TargetVerifyExecutor:
                 next_token_logits=result.logits_output.next_token_logits,
                 sampling_info=sampling_info,
                 draft_token_num=verify_w,
+                verify_input_ids=verify_ids_2d,
             )
 
         return result
@@ -535,6 +538,9 @@ class TargetVerifyExecutor:
             next_token_logits=strided_logits,
             sampling_info=sampling_info,
             verify_num_draft_tokens=stride,
+            verify_input_ids=torch.cat(
+                [draft_block_ids[:, :1], draft_tokens[:, : stride - 1]], dim=1
+            ),
         )
         logits_output.next_token_logits = strided_logits
         logits_output.hidden_states = hidden_strided
