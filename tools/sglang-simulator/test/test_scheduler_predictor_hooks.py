@@ -56,9 +56,6 @@ def hooked_scheduler(monkeypatch):
         def _prefetch_kvcache(self, req):
             pass
 
-        def _release_aborted_request(self, req):
-            self.released_request_id = req.rid
-
         def get_new_batch_prefill(self):
             return None
 

@@ -464,7 +464,6 @@ class C_SchedulerHook(BaseHook):
         original_overlap_decision = getattr(
             target, "is_disable_overlap_for_batch", None
         )
-        original_release_aborted = getattr(target, "_release_aborted_request", None)
         original_event_loop_normal = target.event_loop_normal
         original_init_request_dispatcher = target.init_request_dispatcher
         original_on_idle = target.on_idle
@@ -538,21 +537,6 @@ class C_SchedulerHook(BaseHook):
                     - started,
                 )
             return decision
-
-        def wrapped_release_aborted(self, req, *args, **kwargs):
-            result = original_release_aborted(self, req, *args, **kwargs)
-            driver = reference_driver()
-            if driver is not None:
-                # Native queued/chunk abort release can happen without another
-                # result, and prefill does not use the decode finish callback.
-                try:
-                    C_SchedulerHook.INFERENCE_PREDICTOR.dspark_runtime.note_request_finished(
-                        rid=req.rid, natural_stop=False
-                    )
-                except Exception as error:
-                    driver.fail("native abort release", error)
-                    raise
-            return result
 
         def override_event_loop_overlap(self, *args, **kwargs):
             driver = reference_driver()
@@ -1244,8 +1228,6 @@ class C_SchedulerHook(BaseHook):
             target.get_next_batch_to_run = wrapped_get_next_batch
         if original_overlap_decision is not None:
             target.is_disable_overlap_for_batch = wrapped_overlap_decision
-        if original_release_aborted is not None:
-            target._release_aborted_request = wrapped_release_aborted
         target.on_idle = wrapped_on_idle
         target.event_loop_overlap = override_event_loop_overlap
         target.__init__ = wrapped_init

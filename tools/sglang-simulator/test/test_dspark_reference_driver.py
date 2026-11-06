@@ -668,11 +668,22 @@ def test_native_abort_release_retires_admitted_chunks_without_a_later_result(
     current = selected(run, chunks=1)
     result = launch(run, current)
     process(run, current, result)
-    hooked_scheduler.target._release_aborted_request(current.reqs[0])
+    from sglang_simulator.simulation.sglang.dspark_worker import (
+        C_DSparkRequestRetirerHook,
+    )
+
+    class Retirer:
+        def _detach(self, req):
+            self.released_request_id = req.rid
+
+    C_DSparkRequestRetirerHook.hook(Retirer)
+    retirer = Retirer()
+    retirer._detach(current.reqs[0])
+    assert retirer.released_request_id == current.reqs[0].rid
     assert run.driver.adapter.ledger.requests == ()
     with pytest.raises(PredictorError, match="prior injection"):
         run.runtime.session.history_for("a")
-    hooked_scheduler.target._release_aborted_request(NS(rid="never-admitted"))
+    retirer._detach(NS(rid="never-admitted"))
     assert run.driver.adapter.ledger.requests == ()
 
 

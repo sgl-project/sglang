@@ -55,7 +55,9 @@ class C_DSparkRequestRetirerHook(BaseHook):
 
     @classmethod
     def hook(cls, target):
-        original = target.release_aborted_request
+        # Native release() and abort_retracted() share this detach boundary.
+        # Observe both queued/chunked and non-resumable retracted aborts.
+        original = target._detach
 
         def release(self, req):
             result = original(self, req)
@@ -63,12 +65,15 @@ class C_DSparkRequestRetirerHook(BaseHook):
 
             predictor = C_SchedulerHook.INFERENCE_PREDICTOR
             if getattr(predictor, "supports_dspark", False):
-                predictor.dspark_runtime.note_request_finished(
-                    rid=req.rid, natural_stop=False
-                )
+                runtime = predictor.dspark_runtime
+                try:
+                    runtime.note_request_finished(rid=req.rid, natural_stop=False)
+                except Exception as error:
+                    runtime.reference_driver.fail("native abort detach", error)
+                    raise
             return result
 
-        target.release_aborted_request = release
+        target._detach = release
 
 
 class C_DSparkWorkerHook(BaseHook):
