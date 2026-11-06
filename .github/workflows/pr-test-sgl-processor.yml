@@ -126,6 +126,11 @@ jobs:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      # dynamo-multimodal loads libvpx at runtime to decode the VP8 and VP9 fixtures;
+      # -dev provides the unversioned libvpx.so on every Ubuntu release.
+      - name: Install libvpx
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libvpx-dev
+
       # cargo test builds the library and runs unit, integration, and doc tests.
       # These tests use local fixtures; no GPU or model downloads are needed.
       - name: Test default features
