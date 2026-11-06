@@ -15,7 +15,8 @@ import subprocess
 import sys
 import sysconfig
 import tempfile
-from contextlib import contextmanager
+import time
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
@@ -41,6 +42,10 @@ _BUILD_ENVIRONMENT_VARIABLES = (
     "CARGO_ENCODED_RUSTFLAGS",
     "RUSTFLAGS",
 )
+# A toolchain probe may download the pinned toolchain. One that outlives this,
+# counting its wait for other processes' probes, fails like a missing toolchain
+# instead of blocking startup.
+_TOOLCHAIN_PROBE_TIMEOUT_SECONDS = 300
 
 _RUST_WORKSPACE = Path(__file__).resolve().parents[4] / "rust"
 
@@ -122,13 +127,14 @@ def load_rust_extension(
 
     crate = _discover_crate(workspace, python_module)
     features = tuple(dict.fromkeys((*crate.features, *additional_features)))
+    cache_root = _cache_root(cache_dir)
     context = _build_context(
         crate,
         features=features,
         build_fingerprint=build_fingerprint,
         extension_module=load_module,
+        toolchain_lock=toolchain_lock_path(cache_dir),
     )
-    cache_root = _cache_root(cache_dir)
     extension_path = _cached_extension_path(
         cache_root, crate, context.fingerprint, load_module
     )
@@ -249,18 +255,14 @@ def _build_context(
     features: tuple[str, ...] | None = None,
     build_fingerprint: Mapping[str, object] | None = None,
     extension_module: str | None = None,
+    toolchain_lock: Path | None = None,
 ) -> _BuildContext:
     if features is None:
         features = crate.features
     if extension_module is None:
         extension_module = crate.python_module
     source_digest = _source_digest(crate.workspace, crate.source_inputs)
-    toolchain = {
-        "cargo": _command_version(
-            "cargo", "--version", "--verbose", cwd=crate.workspace
-        ),
-        "rustc": _command_version("rustc", "-vV", cwd=crate.workspace),
-    }
+    toolchain = probe_rust_toolchain(crate.workspace, lock_path=toolchain_lock)
     python_abi = {
         "cache_tag": sys.implementation.cache_tag,
         "ext_suffix": sysconfig.get_config_var("EXT_SUFFIX"),
@@ -329,7 +331,46 @@ def _source_files(workspace: Path) -> Iterator[Path]:
             yield root_path / filename
 
 
-def _command_version(command: str, *arguments: str, cwd: Path) -> str:
+def probe_rust_toolchain(
+    workspace: Path,
+    *,
+    lock_path: Path | None = None,
+    timeout: float = _TOOLCHAIN_PROBE_TIMEOUT_SECONDS,
+) -> dict[str, str]:
+    """Query the cargo and rustc versions that fingerprint a build in ``workspace``.
+
+    rustup's cargo and rustc proxies install the toolchain pinned by
+    rust-toolchain.toml on first use, and concurrent installs into one
+    RUSTUP_HOME race. Processes that pass the same ``lock_path`` (see
+    ``toolchain_lock_path``) therefore probe one at a time, so only the first
+    one installs. ``timeout`` covers the wait for the lock and both queries;
+    past it the probe raises ``RuntimeError``, as for a missing toolchain.
+    """
+    deadline = time.monotonic() + timeout
+    waiting_for = f"the lock {lock_path}"
+    try:
+        with _filesystem_lock(lock_path, deadline) if lock_path else nullcontext():
+            versions = {}
+            for command, *arguments in (
+                ("cargo", "--version", "--verbose"),
+                ("rustc", "-vV"),
+            ):
+                waiting_for = f"`{command} {' '.join(arguments)}`"
+                versions[command] = _command_version(
+                    command,
+                    *arguments,
+                    cwd=workspace,
+                    timeout=max(deadline - time.monotonic(), 0.0),
+                )
+            return versions
+    except (TimeoutError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(
+            f"the Rust toolchain probe timed out after {timeout:g} s "
+            f"waiting for {waiting_for}"
+        ) from exc
+
+
+def _command_version(command: str, *arguments: str, cwd: Path, timeout: float) -> str:
     try:
         result = subprocess.run(
             [command, *arguments],
@@ -337,6 +378,7 @@ def _command_version(command: str, *arguments: str, cwd: Path) -> str:
             capture_output=True,
             text=True,
             cwd=cwd,
+            timeout=timeout,
         )
     except (OSError, subprocess.CalledProcessError) as exc:
         raise RuntimeError(
@@ -359,6 +401,14 @@ def _cache_root(cache_dir: Path | None) -> Path:
     return Path(sglang_cache).expanduser().resolve() / "rust_extensions"
 
 
+def toolchain_lock_path(cache_dir: Path | None = None) -> Path:
+    """The ``probe_rust_toolchain`` lock of processes sharing an extension cache.
+
+    ``cache_dir`` defaults as in ``load_rust_extension``.
+    """
+    return _cache_root(cache_dir) / "locks" / "toolchain.lock"
+
+
 def _cached_extension_path(
     cache_root: Path,
     crate: _CrateSpec,
@@ -379,10 +429,25 @@ def _cached_extension_path(
 
 
 @contextmanager
-def _filesystem_lock(path: Path) -> Iterator[None]:
+def _filesystem_lock(path: Path, deadline: float | None = None) -> Iterator[None]:
+    """Hold an exclusive lock on ``path``.
+
+    With a ``deadline`` (a ``time.monotonic()`` value), raise ``TimeoutError``
+    if the lock is still held elsewhere then.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a+b") as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        if deadline is None:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        else:
+            while True:
+                try:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(f"timed out waiting for {path}") from None
+                    time.sleep(0.1)
         try:
             yield
         finally:
