@@ -69,7 +69,7 @@ def _kv_write_target(attention, forward_batch: ForwardBatch) -> _KVWriteTarget |
     if not (
         isinstance(backend, AiterAttnBackend)
         and not backend.use_mla
-        and backend.page_size == 16
+        and backend.page_size in (16, 32, 64, 128)
         and not backend.kv_cache_is_vectorized_5d
         and backend.use_triton_unified_attention
         and not layer.is_cross_attention
