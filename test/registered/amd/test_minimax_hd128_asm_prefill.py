@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.mem_cache.kv.router import PlainPoolRouter
 from sglang.test.ci.ci_register import register_amd_ci
 
 register_amd_ci(est_time=45, suite="stage-b-test-1-gpu-small-amd-mi35x")
@@ -56,9 +57,13 @@ class TestMiniMaxHD128AsmPrefill(unittest.TestCase):
         backend.k_scale = torch.ones(1, device=device)
         backend.v_scale = torch.ones(1, device=device)
         backend.qo_indptr = cu_q
-        backend.token_to_kv_pool = SimpleNamespace(
-            get_kv_buffer=lambda _: (k_cache, v_cache)
+        pool = SimpleNamespace(
+            get_kv_buffer=lambda _: (k_cache, v_cache),
+            start_layer=0,
+            layer_transfer_counter=None,
         )
+        pool.layer_router = PlainPoolRouter(pool, "full")
+        backend.token_to_kv_pool = pool
         backend.forward_metadata = self.ab.ForwardMetadata(
             kv_indptr=cu_k,
             kv_indices=token_ids,
