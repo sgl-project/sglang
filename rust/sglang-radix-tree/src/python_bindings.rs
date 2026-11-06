@@ -3,7 +3,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use pyo3::IntoPyObjectExt;
 use pyo3::buffer::PyBuffer;
@@ -206,7 +206,7 @@ fn parse_pool_name(name: &str) -> PoolName {
         "kv" => PoolName::Kv,
         "mamba" => PoolName::Mamba,
         "swa" => PoolName::Swa,
-        other => PoolName::Other(Arc::from(other)),
+        other => PoolName::Other(other.into()),
     }
 }
 

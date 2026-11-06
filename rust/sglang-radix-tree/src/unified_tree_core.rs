@@ -401,7 +401,7 @@ pub enum PoolName {
     Kv,
     Mamba,
     Swa,
-    Other(Arc<str>),
+    Other(Box<str>),
 }
 
 /// Result of a HiCache pool transfer.
