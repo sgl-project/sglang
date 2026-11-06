@@ -1,7 +1,7 @@
 import asyncio
 import os
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import (
     APIRouter,
@@ -62,15 +62,19 @@ def _build_sampling_params_from_request(
         "image_path": [image_path] if image_path else None,
         "save_output": True,
         "output_file_name": f"{request_id}.{ext}",
-        "seed": req.seed,
-        "generator_device": req.generator_device,
     }
-    if req.num_inference_steps is not None:
-        sampling_kwargs["num_inference_steps"] = req.num_inference_steps
-    if req.guidance_scale is not None:
-        sampling_kwargs["guidance_scale"] = req.guidance_scale
-    if req.negative_prompt is not None:
-        sampling_kwargs["negative_prompt"] = req.negative_prompt
+    sampling_kwargs.update(
+        req.model_dump(
+            include={
+                "seed",
+                "generator_device",
+                "num_inference_steps",
+                "guidance_scale",
+                "negative_prompt",
+            },
+            exclude_none=True,
+        )
+    )
 
     return SamplingParams.from_user_sampling_params_args(
         model_path=server_args.model_path,
@@ -103,9 +107,7 @@ async def _dispatch_job_async(job_id: str, batch: Req) -> None:
         )
         save_file_path = save_file_path_list[0]
 
-        file_size = None
-        if os.path.exists(save_file_path):
-            file_size = os.path.getsize(save_file_path)
+        file_size = os.path.getsize(save_file_path)
 
         cloud_url = await cloud_storage.upload_and_cleanup(save_file_path)
 
@@ -124,7 +126,14 @@ async def _dispatch_job_async(job_id: str, batch: Req) -> None:
     except Exception as e:
         logger.exception("Mesh job %s failed", job_id)
         await MESH_STORE.update_fields(
-            job_id, {"status": "failed", "error": {"message": str(e)}}
+            job_id,
+            {
+                "status": "failed",
+                "error": {"message": str(e)},
+                "file_path": None,
+                "url": None,
+                "file_size_bytes": None,
+            },
         )
 
 
@@ -218,14 +227,13 @@ async def create_mesh(
         )
 
     sampling_params = _build_sampling_params_from_request(request_id, req, input_path)
-    job = _mesh_job_from_sampling(request_id, req, sampling_params)
-    await MESH_STORE.upsert(request_id, job)
-
     batch = prepare_request(
         server_args=server_args,
         sampling_params=sampling_params,
     )
 
+    job = _mesh_job_from_sampling(request_id, req, sampling_params)
+    await MESH_STORE.upsert(request_id, job)
     asyncio.create_task(_dispatch_job_async(request_id, batch))
     return MeshResponse(**job)
 
@@ -233,12 +241,12 @@ async def create_mesh(
 @router.get("", response_model=MeshListResponse)
 async def list_meshes(
     after: Optional[str] = Query(None),
-    limit: Optional[int] = Query(None, ge=1, le=100),
-    order: Optional[str] = Query("desc"),
+    limit: int = Query(20, ge=1, le=100),
+    order: Literal["asc", "desc"] = Query("desc"),
 ):
-    jobs = await MESH_STORE.list_page(after=after, limit=limit, order=order)
-    items = [MeshResponse(**job) for job in jobs]
-    return MeshListResponse(data=items)
+    return MeshListResponse(
+        **await MESH_STORE.list_page(after=after, limit=limit, order=order)
+    )
 
 
 @router.get("/{mesh_id}", response_model=MeshResponse)
@@ -265,6 +273,10 @@ async def download_mesh_content(
     job = await MESH_STORE.get(mesh_id)
     if not job:
         raise HTTPException(status_code=404, detail="Mesh not found")
+
+    # an exporter may create its final path before generation finishes
+    if job["status"] != "completed":
+        raise HTTPException(status_code=404, detail="Mesh output is not available")
 
     if job.get("url"):
         raise HTTPException(

@@ -42,6 +42,7 @@ from sglang.srt.debug_utils.comparator.aligner.unsharder.types import (
     UnsharderPlan,
 )
 from sglang.srt.debug_utils.comparator.dims_spec import ParallelAxis, TokenLayout
+from sglang.srt.debug_utils.comparator.output_formatter import _format_aligner_plan
 from sglang.srt.debug_utils.comparator.output_types import (
     BundleFileInfo,
     BundleSideInfo,
@@ -54,7 +55,6 @@ from sglang.srt.debug_utils.comparator.output_types import (
     LogRecord,
     RecordLocation,
     SummaryRecord,
-    _format_aligner_plan,
     _split_logs,
 )
 from sglang.srt.debug_utils.comparator.utils import Pair

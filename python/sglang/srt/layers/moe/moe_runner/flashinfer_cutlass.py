@@ -18,15 +18,23 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import is_allocation_symmetric
+from sglang.srt.layers.dp_attention import (
+    deployment_attn_dp_size,
+    is_allocation_symmetric,
+)
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
     register_fused_func,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_parallel,
+    get_schedule,
+    max_prefill_buffer_tokens,
+)
 from sglang.srt.utils import is_flashinfer_available
-from sglang.srt.utils.common import next_power_of_2
+from sglang.srt.utils.common import is_sm120, next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
@@ -59,6 +67,7 @@ class FlashInferCutlassMoeQuantInfo(MoeQuantInfo):
     swiglu_beta: Optional[torch.Tensor] = None
     swiglu_limit: Optional[torch.Tensor] = None
     apply_routed_scaling_factor: bool = True
+    pair_w2_weight: Optional[torch.Tensor] = None
 
 
 def materialize_swiglu_params_for_cutlass(
@@ -156,6 +165,22 @@ def _flashinfer_cutlass_fused_moe():
     return cutlass_fused_moe, ActivationType
 
 
+# Matches the default tune_max_num_tokens of FlashInfer's cutlass_fused_moe.
+_FLASHINFER_DEFAULT_TUNE_MAX_NUM_TOKENS = 8192
+
+
+# Tune range: the DP-gathered prefill chunk, capped at FlashInfer's default;
+# PD decode servers run no prefill, so they size it per call.
+def _cutlass_moe_tune_max_num_tokens(num_tokens: int) -> int:
+    if get_disagg().disaggregation_mode == "decode":
+        return next_power_of_2(num_tokens)
+    prefill_tokens = max_prefill_buffer_tokens() or get_schedule().max_prefill_tokens
+    return min(
+        prefill_tokens * deployment_attn_dp_size(),
+        _FLASHINFER_DEFAULT_TUNE_MAX_NUM_TOKENS,
+    )
+
+
 def _activation_type(runner_config: MoeRunnerConfig):
     from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import get_activation_type
 
@@ -250,6 +275,25 @@ def _prepare_input(
     return x, x_sf, output_dtype, output_col
 
 
+def _sm120_mtp_mma_supported() -> bool:
+    import os
+
+    # Matches only FlashInfer's default FP4 quantizer with the fused FC2 epilogue.
+    return (
+        is_sm120()
+        and envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get()
+        and not envs.FLASHINFER_NVFP4_4OVER6.get()
+        and os.environ.get("FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH", "0") == "0"
+        and os.environ.get("TRTLLM_DISABLE_FP4_QUANT_FAST_MATH", "0") == "0"
+    )
+
+
+def _flashinfer_autotune_active() -> bool:
+    from flashinfer.autotuner import AutoTuner
+
+    return AutoTuner.get().is_tuning_mode
+
+
 def _run_flashinfer_cutlass(
     *,
     dispatch_output,
@@ -267,6 +311,35 @@ def _run_flashinfer_cutlass(
     x, x_sf, output_dtype, output_col = _prepare_input(
         dispatch_output, quant_info, runner_config
     )
+
+    if (
+        quant_info.quant_type == "fp4"
+        and not runner_config.is_gated
+        and runner_config.activation == "relu2"
+        and runner_config.moe_ep_size == runner_config.moe_tp_size == 1
+        and x_sf is None
+        and not enable_alltoall
+        and is_sm120()
+    ):
+        from sglang.kernels.ops.gemm.sm120_nvfp4_moe import try_nvfp4_moe
+
+        result = try_nvfp4_moe(
+            x,
+            quant_info.w13_weight,
+            quant_info.w2_weight,
+            quant_info.quant_scales,
+            topk_ids,
+            topk_weights,
+            output_dtype=output_dtype,
+            out=output,
+            pair_w2_weight=quant_info.pair_w2_weight,
+            # Preserve FlashInfer target/draft tactic discovery during autotuning.
+            use_mtp=_sm120_mtp_mma_supported() and not _flashinfer_autotune_active(),
+        )
+        if result is not None:
+            return _maybe_apply_routed_scaling_factor(result, quant_info, runner_config)
+    if quant_info.pair_w2_weight is not None:
+        raise RuntimeError("A paired NVFP4 weight reached an unsupported MoE path")
 
     if output is None:
         with use_symmetric_memory(
@@ -312,7 +385,7 @@ def _run_flashinfer_cutlass(
         ep_rank=runner_config.moe_ep_rank,
         tp_size=runner_config.moe_tp_size,
         tp_rank=runner_config.moe_tp_rank,
-        tune_max_num_tokens=next_power_of_2(x.shape[0]),
+        tune_max_num_tokens=_cutlass_moe_tune_max_num_tokens(x.shape[0]),
         activation_type=_activation_type(runner_config),
         enable_alltoall=enable_alltoall,
         use_fused_finalize=envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get(),
@@ -345,13 +418,21 @@ def fused_experts_none_to_flashinfer_cutlass(
 
 @register_fused_func("flashinfer", "flashinfer_cutlass")
 def fused_experts_flashinfer_to_flashinfer_cutlass(
-    dispatch_output: FlashinferDispatchOutput,
+    dispatch_output: FlashinferDispatchOutput | StandardDispatchOutput,
     quant_info: MoeQuantInfo,
     runner_config: MoeRunnerConfig,
-) -> FlashinferCombineInput:
+) -> FlashinferCombineInput | StandardCombineInput:
     from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
         FlashinferCombineInput,
     )
+    from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
+
+    # All-gather prefill must use ordinary expert execution and reduce-scatter
+    # combine, without the decode A2A workspace or kernel layout.
+    if isinstance(dispatch_output, StandardDispatchOutput):
+        return fused_experts_none_to_flashinfer_cutlass(
+            dispatch_output, quant_info, runner_config
+        )
 
     assert isinstance(quant_info, FlashInferCutlassMoeQuantInfo), (
         f"Unexpected quant_info type for flashinfer_cutlass: {type(quant_info)}"
@@ -526,7 +607,7 @@ def _fused_experts_flashinfer_mxfp4_cutlass(
             if quant_info.use_swiglu_step
             else ActivationType.Swiglu
         ),
-        tune_max_num_tokens=next_power_of_2(x.shape[0]),
+        tune_max_num_tokens=_cutlass_moe_tune_max_num_tokens(x.shape[0]),
         output=out,
         use_fused_finalize=envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get(),
         **humming_kwargs,

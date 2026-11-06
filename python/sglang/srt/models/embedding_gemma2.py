@@ -42,16 +42,11 @@ from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    pad_mm_tokens,
 )
-from sglang.srt.managers.schedule_batch import (
-    ForwardBatch,
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputs,
-    flatten_nested_list,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.gemma4_audio import Gemma4AudioEncoder
 from sglang.srt.models.gemma4_causal import Gemma4MLP
@@ -60,8 +55,9 @@ from sglang.srt.models.gemma4_mm import (
     Gemma4MultimodalEmbedder,
 )
 from sglang.srt.models.gemma4_vision import Gemma4VisionEncoder
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import get_mm, get_parallel
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, flatten_nested_list
 
 logger = logging.getLogger(__name__)
 
@@ -648,8 +644,7 @@ class EmbeddingGemma2Model(nn.Module):
     def pad_input_ids(
         self, input_ids: list[int], mm_inputs: MultimodalInputs
     ) -> list[int]:
-        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
-        return pattern.pad_input_tokens(input_ids, mm_inputs)
+        return pad_mm_tokens(input_ids, mm_inputs)
 
     def get_image_feature(self, items: list[MultimodalDataItem]) -> torch.Tensor:
         if self.vision_tower is None or self.embed_vision is None:

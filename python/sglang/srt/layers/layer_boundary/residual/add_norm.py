@@ -37,7 +37,8 @@ from sglang.srt.layers.quantization.fp8_utils import (
     materialize_bpreshuffle_fp8_scale_tuple,
     view_aiter_fused_rms_transposed_fp8_scale_tuple,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_exec, get_parallel, get_platform
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -136,15 +137,13 @@ def _fused_rmsnorm_fp8_per_token_quant(
         return (out_fp8, scale.unsqueeze(1))
 
 
-# TODO: According to the discussion in https://github.com/flashinfer-ai/flashinfer/issues/1223#issuecomment-3047256465
-# We set the max token num to 128 for allreduce fusion with min-latency case(use_oneshot=True).
+# Largest batch the non-CuTe-DSL FlashInfer all-reduce fusion runs on;
+# it also sizes that fusion's workspace, pre-allocated before graph capture.
 FUSE_ALLREDUCE_MAX_BATCH_SIZE = 2048
 
 
 def flashinfer_ar_fusion_applies(batch_size: int):
     return (
-        # NOTE: flashinfer 0.6.1 caused performance regression on sm100 for allreduce fusion
-        # Ref: https://github.com/sgl-project/sglang/issues/17237
         (_is_sm90_supported or _is_sm100_supported)
         and _is_flashinfer_available
         and not is_dp_attention_enabled()

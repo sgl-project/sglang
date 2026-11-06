@@ -1239,7 +1239,9 @@ def _get_jit_functions():
     return _jit_functions
 
 
-def _get_compiled_kernel(N, H, HV, K, V, h0_source, use_small_batch, is_varlen_decode):
+def _get_compiled_kernel(
+    N, H, HV, K, V, h0_source, dt_bias_dtype, use_small_batch, is_varlen_decode
+):
     """Get or compile the KDA kernel for given dimensions.
 
     ``h0_source`` is the caller's real state pool: ``from_dlpack`` bakes its
@@ -1258,6 +1260,7 @@ def _get_compiled_kernel(N, H, HV, K, V, h0_source, use_small_batch, is_varlen_d
         V,
         pool_size,
         tuple(h0_source.stride()),
+        dt_bias_dtype,
         use_small_batch,
         is_varlen_decode,
     )
@@ -1282,7 +1285,8 @@ def _get_compiled_kernel(N, H, HV, K, V, h0_source, use_small_batch, is_varlen_d
         o = torch.zeros(N, 1, HV, V, dtype=torch.bfloat16, device="cuda")
 
     A_log = torch.zeros(HV, dtype=torch.float32, device="cuda")
-    dt_bias = torch.zeros(HV, K, dtype=torch.bfloat16, device="cuda")
+    # CuTe launches skip dtype checks; a mismatched dt_bias is silently reinterpreted.
+    dt_bias = torch.zeros(HV, K, dtype=dt_bias_dtype, device="cuda")
     h0_indices = torch.zeros(N, dtype=torch.int32, device="cuda")
 
     cu_seqlens_tensor = from_dlpack(cu_seqlens, assumed_align=16)
@@ -1541,7 +1545,7 @@ def cutedsl_fused_sigmoid_gating_kda_update(
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     compiled_kernel = _get_compiled_kernel(
-        N, H, HV, K, V, h0_source, use_small_batch, is_varlen_decode
+        N, H, HV, K, V, h0_source, dt_bias.dtype, use_small_batch, is_varlen_decode
     )
 
     compiled_kernel(
