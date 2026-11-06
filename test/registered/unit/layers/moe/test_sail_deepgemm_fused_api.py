@@ -18,6 +18,9 @@ maybe_stub_sgl_kernel()
 from sglang.kernels.ops.gemm import sail_deepgemm as ops
 from sglang.srt.hardware_backend.sail.deep_gemm import entrypoint as sail_entrypoint
 from sglang.srt.hardware_backend.sail.deep_gemm import warmup as sail_warmup
+from sglang.srt.hardware_backend.sail.deep_gemm.kernel_types import (
+    SailDeepGemmKernelType,
+)
 from sglang.srt.layers.deep_gemm_wrapper import compile_utils
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -652,7 +655,7 @@ class TestSailDeepGemmFusedApi(CustomTestCase):
     def test_fp8_k128_uses_explicit_scale_semantics(self):
         """block scales with K=128 also have a trailing dim of 1, but the warmup must
         still use the block GEMM rather than the channel GEMM."""
-        types = compile_utils.DeepGemmKernelType
+        types = SailDeepGemmKernelType
         q = torch.ones((2, 128)).to(torch.float8_e4m3fn)
         w = torch.ones((2, 128, 128)).to(torch.float8_e4m3fn)
         rows = torch.ones(2, dtype=torch.int32)
@@ -783,7 +786,7 @@ class TestSailDeepGemmFusedApi(CustomTestCase):
         for m, experts in ((1, 256), (257, 8)):
             n, packed_k = 128, 64
             required = compile_utils._BaseWarmupExecutor.get_memory_requirement(
-                compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F4F4BF16_FUSED,
+                SailDeepGemmKernelType.GROUPED_GEMM_NT_F4F4BF16_FUSED,
                 m,
                 n,
                 packed_k,
@@ -838,7 +841,7 @@ class TestSailDeepGemmFusedApi(CustomTestCase):
     def test_w4a16_fused_routes_use_logical_dimensions(self):
         """VALU/INT4 Marlin dims must not be mixed with the MMA packed K; the routing
         is generated only once."""
-        types = compile_utils.DeepGemmKernelType
+        types = SailDeepGemmKernelType
         a = torch.tensor([[1, 2], [3, 4]], dtype=torch.bfloat16).repeat(1, 32)
         ids = torch.tensor([[1, 0], [0, 1]], dtype=torch.int32)
         tokens = torch.tensor([1, 2, 0, 3], dtype=torch.int32)
@@ -925,7 +928,7 @@ class TestSailDeepGemmFusedApi(CustomTestCase):
     def test_w4a16_factory_allocations_fit_warmup_budget(self):
         """The tensor byte count produced by the real factory must be covered by the
         budget; the MMA K is a logical element width."""
-        types = compile_utils.DeepGemmKernelType
+        types = SailDeepGemmKernelType
         names = (
             "GROUPED_GEMM_NT_BF16I4BF16_MMA_MASKED",
             "GROUPED_GEMM_NT_BF16I4BF16_MMA_NOPAD",
