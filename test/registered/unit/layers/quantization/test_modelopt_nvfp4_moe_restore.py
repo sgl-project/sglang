@@ -76,6 +76,7 @@ def _layer(raw):
     layer.num_local_experts = NUM_EXPERTS
     layer.intermediate_size_per_partition = INTERMEDIATE
     layer.dispatcher = SimpleNamespace(set_quant_config=lambda config: None)
+    layer._fp4_moe_repack = modelopt_quant.Fp4MoeRepack.CHECKPOINT  # create_weights
     params = {name: t.clone() for name, t in raw.items()}
     params.update(
         w13_weight_scale_2=torch.full((NUM_EXPERTS, 2), 0.01, device="cuda"),
@@ -216,7 +217,7 @@ class TestNvFp4MoeRestore(CustomTestCase):
                     layer.quant_method.restore_weights_before_loading(layer)
             for name in REPACKED:
                 self.assertTrue(torch.equal(_bytes(layer, name), before[name]), name)
-            self.assertEqual(layer._fp4_moe_repack, "trtllm")
+            self.assertIs(layer._fp4_moe_repack, modelopt_quant.Fp4MoeRepack.TRTLLM)
 
     def test_padded_scale_layouts(self):
         # hidden 192: w2 block-scale rows are not a multiple of 128, so the
@@ -232,8 +233,9 @@ class TestNvFp4MoeRestore(CustomTestCase):
                 # FlashInfer's TRT-LLM row shuffle needs 128-row multiples, so
                 # this layout fails at load today; restore must stay off if not.
                 pass
-            self.assertTrue(layer.trtllm_fp4_layout_padded)
-            self.assertIsNone(layer._fp4_moe_repack)
+            self.assertIs(
+                layer._fp4_moe_repack, modelopt_quant.Fp4MoeRepack.NOT_RESTORABLE
+            )
 
         # CUTLASS keeps the padded w2 swizzle in a separate buffer, so the
         # source scale stays in checkpoint layout and a partial update works.

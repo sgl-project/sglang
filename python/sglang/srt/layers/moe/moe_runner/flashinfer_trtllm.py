@@ -627,7 +627,7 @@ def trtllm_nvfp4_hidden_alignment(
 
 def align_fp4_moe_weights_for_flashinfer_trtllm(
     layer: Module, hidden_alignment: int = 1
-) -> None:
+) -> bool:
     """Prepare FP4 MoE weights/scales for FlashInfer TRT-LLM kernels.
 
     This function handles the weight transformation needed for FP4 TRTLLM MoE:
@@ -637,6 +637,9 @@ def align_fp4_moe_weights_for_flashinfer_trtllm(
     - Reorders weights for gated activation GEMM
     - Shuffles weights and scales for transposed MMA output
     - Computes the output scale factors
+
+    Returns whether any weight or scale was padded (such a layout cannot be
+    restored for a weight update).
     """
     from sglang.srt.layers.quantization.utils import (
         prepare_static_weights_for_trtllm_fp4_moe,
@@ -671,7 +674,7 @@ def align_fp4_moe_weights_for_flashinfer_trtllm(
         padded_hidden_size if padded_hidden_size != hidden_size else None
     )
     # nvfp4_block_scale_interleave pads scale rows to 128 and columns to 4.
-    layer.trtllm_fp4_layout_padded = (
+    padded = (
         w13_weight.shape != layer.w13_weight.shape
         or w2_weight.shape != layer.w2_weight.shape
         or any(
@@ -721,6 +724,7 @@ def align_fp4_moe_weights_for_flashinfer_trtllm(
 
     # Update intermediate_size_per_partition to reflect any padding applied
     layer.intermediate_size_per_partition = intermediate_size
+    return padded
 
 
 def _fp4_block_scale_interleave_sources(
@@ -796,13 +800,13 @@ def restore_fp4_moe_weights_from_flashinfer_trtllm(
     epilogue_tile_m = 128
     is_gated = layer.moe_runner_config.is_gated
     plans = []
-    for weight_name, scale_name in (
-        ("w13_weight", "w13_weight_scale"),
-        ("w2_weight", "w2_weight_scale"),
+    for weight_param, scale_param, is_w13 in (
+        (layer.w13_weight, layer.w13_weight_scale, True),
+        (layer.w2_weight, layer.w2_weight_scale, False),
     ):
-        weight = getattr(layer, weight_name).data.view(torch.uint8)
-        scale = getattr(layer, scale_name).data.view(torch.uint8)
-        if weight_name == "w13_weight":
+        weight = weight_param.data.view(torch.uint8)
+        scale = scale_param.data.view(torch.uint8)
+        if is_w13:
             weight_indices = _maybe_get_cached_w3_w1_permute_indices(
                 cache_permute_indices,
                 weight[0],
