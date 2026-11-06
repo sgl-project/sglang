@@ -9,13 +9,16 @@
 #   - Skips pr-gate, recommend
 #   - setup-covstub assembles and publishes the baseline to the shared disk
 #     at /root/.cache/tests/precise-test/coverage
-# pr-test-npu-finish is the final gate in the called workflow. Manually
-# triggered only (workflow_dispatch): PRs run the standard pr-test-npu.yml
-# instead; this pipeline builds the full coverage baseline on demand.
+# pr-test-npu-finish is the final gate in the called workflow. Triggered
+# manually via workflow_dispatch or every 2 days via schedule; this pipeline
+# builds the full coverage baseline on demand.
 name: Coverage Collection (NPU)
 
 on:
   workflow_dispatch:
+  # Every 2 days at 05:00 Asia/Shanghai (21:00 UTC the previous day).
+  schedule:
+    - cron: "0 21 */2 * *"
 
 concurrency:
   group: npu-coverage-collection-${{ github.ref }}

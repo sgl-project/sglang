@@ -110,7 +110,7 @@ struct DraftExtendSconvKernel {
     auto W1s = SymbolicSize{"W_minus_1"};
     auto B = SymbolicSize{"B"};
     auto dev = SymbolicDevice{};
-    dev.set_options<kDLCUDA>();
+    dev.set_options<kDLGPU>();
     W1s.set_value(W1);
 
     TensorMatcher({BT, D}).with_strides({-1, 1}).with_dtype<DType>().with_device(dev).verify(hidden);

@@ -91,6 +91,20 @@ class KVLayer(msgspec.Struct, frozen=True, kw_only=True):
             **kwargs,
         )
 
+    def store_prefix(
+        self, layer, loc_info, commit_lens, cache_k, cache_v, *args, **kwargs
+    ) -> None:
+        """Commit each request's live prefix using this layer's physical ids."""
+        from sglang.srt.mem_cache.memory_pool import unwrap_write_loc
+
+        write_loc = loc_info if self.plain else self._write_loc(layer, loc_info)
+        loc, _, _ = unwrap_write_loc(write_loc)
+        if not self.plain:
+            kwargs["layer_id_override"] = self.view_layer_id
+        self.view.set_kv_buffer_prefix_valid(
+            layer, loc, commit_lens, cache_k, cache_v, *args, **kwargs
+        )
+
     def store_mla(self, layer, loc_info, cache_k_nope, cache_k_rope) -> None:
         if self.plain:
             self.view.set_mla_kv_buffer(layer, loc_info, cache_k_nope, cache_k_rope)
@@ -101,6 +115,18 @@ class KVLayer(msgspec.Struct, frozen=True, kw_only=True):
             cache_k_nope,
             cache_k_rope,
             layer_id_override=self.view_layer_id,
+        )
+
+    def store_mla_prefix(
+        self, layer, loc_info, commit_lens, cache_k_nope, cache_k_rope
+    ) -> None:
+        from sglang.srt.mem_cache.memory_pool import unwrap_write_loc
+
+        write_loc = loc_info if self.plain else self._write_loc(layer, loc_info)
+        loc, _, _ = unwrap_write_loc(write_loc)
+        kwargs = {} if self.plain else {"layer_id_override": self.view_layer_id}
+        self.view.set_mla_kv_buffer_prefix_valid(
+            layer, loc, commit_lens, cache_k_nope, cache_k_rope, **kwargs
         )
 
     def _write_loc(self, layer, loc_info):
@@ -176,8 +202,10 @@ class KVLayerRouter:
         view, and each routed model layer's index in that view, which is also
         the id the composite passes the view today. ``owner`` names the
         sub-pool whose write ids are the request's token ids (default: the
-        first)."""
-        owner = layer_maps[0][0] if owner is None else owner
+        first). No layer maps build a router without token KV, for parts to be
+        bound to."""
+        if owner is None and layer_maps:
+            owner = layer_maps[0][0]
         layers: Dict[int, KVLayer] = {}
         for name, view, indices in layer_maps:
             for layer_id, index in indices.items():
@@ -280,6 +308,12 @@ class KVLayerRouter:
         """Whether some layer's KV lives in the named sub-pool."""
         found = self.sub_pool(sub_pool)
         return found is not None and len(found.layer_ids) > 0
+
+    def storage_name(self, sub_pool: str) -> str:
+        """Backing sub-pool for an attention role, including routed drafts."""
+        if self._pool.requires_physical_write_loc:
+            return self.view(sub_pool)._sub_pool_name
+        return sub_pool
 
     def view(self, sub_pool: str) -> Any:
         return self._views[sub_pool]

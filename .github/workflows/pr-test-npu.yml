@@ -681,7 +681,6 @@ jobs:
 
   # ==================== Recommend Tests from Coverage ==================== #
   # Recommends PR-affected test cases from the pre-built coverage baseline.
-  # continue-on-error so it never blocks the PR gate.
   recommend-tests-from-coverage:
     name: Recommend tests from coverage
     needs: [check-changes, pr-gate]
@@ -719,11 +718,6 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      # Every step carries step-level continue-on-error so the job conclusion
-      # is ALWAYS 'success' — the fast-fail health check in other jobs filters
-      # by job conclusion, and job-level continue-on-error still reports
-      # 'failure' via the API. Failed steps stay visible (red ✗ + annotation)
-      # but never cascade to test jobs.
       - name: Checkout sglang scripts
         continue-on-error: true
         uses: actions/checkout@v4
@@ -773,23 +767,30 @@ jobs:
 
       - name: Recommend tests for current PR
         continue-on-error: true
+        uses: lb-actions/precision-test@v1.0.7
+        with:
+          repo: sglang
+          github-pr: ${{ github.repository }}#${{ github.event.pull_request.number }}
+          source-dir: ${{ github.workspace }}/outputs/covstub
+          map-file: ${{ github.workspace }}/test_case_map.json
+
+      - name: Export changed-file list for bucketing
+        continue-on-error: true
+        if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
-          if ! python3 -c "import regex" >/dev/null 2>&1; then
-            echo "regex not found for $(python3 -V); bootstrapping pip and installing regex"
-            curl -fsSL https://bootstrap.pypa.io/get-pip.py -o get-pip.py
-            python3 get-pip.py --break-system-packages
-            python3 -m pip install --break-system-packages regex
+          if test -f recommended_pytest_paths.txt; then
+            # Paginated files API instead of `gh pr diff --name-only`: the
+            # diff endpoint may truncate large PRs, which would silently
+            # drop a changed pipeline-config path from the full-run gate.
+            gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
+              --paginate --jq '.[].filename' > "$PWD/pr_changed_files.txt"
+            test -s "$PWD/pr_changed_files.txt"
+            echo "Changed files: $(wc -l < "$PWD/pr_changed_files.txt")"
+          else
+            echo "::warning::Precision selector produced no recommendation; dropping the changed-file list so all suites run in full."
+            rm -f pr_changed_files.txt
           fi
-          python3 -c "import regex; print('regex ok:', regex.__file__)"
-          PR_SPEC="${{ github.repository }}#${{ github.event.pull_request.number }}"
-          echo "Selecting tests for PR: ${PR_SPEC}"
-          # test_selector.py resolves relative paths against the script's own dir,
-          # so pass absolute paths for files downloaded to the workspace root.
-          python3 scripts/ci/npu/precise-test/test_selector.py \
-            --github-pr "${PR_SPEC}" \
-            --source-dir "$PWD/outputs/covstub" \
-            --map-file "$PWD/test_case_map.json"
 
       # Bucket the recommended tests per suite. Downstream jobs consume two
       # outputs per suite: should_run_<suite> ('false' -> skip the job, e.g.
@@ -807,8 +808,8 @@ jobs:
         run: |
           set -euo pipefail
           python3 scripts/ci/npu/precise-test/bucket_recommended_tests.py \
-            --recommended scripts/ci/npu/precise-test/recommended_pytest_paths.txt \
-            --changed-files scripts/ci/npu/precise-test/pr_changed_files.txt \
+            --recommended recommended_pytest_paths.txt \
+            --changed-files pr_changed_files.txt \
             --suites "base-b-test-1-npu-a3,base-b-test-2-npu-a3,base-b-test-4-npu-a3,base-b-test-8-npu-a3,base-b-test-16-npu-a3,base-c-test-acc-2-npu-a3,base-c-test-acc-16-npu-a3,base-c-test-perf-2-npu-a3,base-c-test-perf-16-npu-a3" \
             --diffusion-suites "multimodal-gen-test-1-npu-a3:1-npu,multimodal-gen-test-4-npu-a3:2-npu" \
             --case-map "$PWD/test_case_map.json" \
@@ -919,7 +920,8 @@ jobs:
           # coverage html from failing on a missing recorded source file.
           echo '__version__ = "0.0.0"' > "${COVSTUB}/sglang/_version.py"
 
-      - name: Build test case map
+      - name: Prepare build-map inputs
+        id: prepare-build-map
         shell: bash
         run: |
           set -euo pipefail
@@ -943,33 +945,39 @@ jobs:
           echo "Source dir: ${COVSTUB}"
 
           # Coverage data may be absent when no test targets were enumerated
-          # (run_tests_with_coverage.sh never ran). Skip map building then.
+          # (run_tests_with_coverage.sh never ran). The action would still emit
+          # an empty {} JSON in that case, which would later overwrite the good
+          # baseline on OBS — so we gate early here instead of relying on the
+          # publish step to detect empty content.
+          RUN_BUILD_MAP=true
           if [ ! -d "${COV_ROOT}" ]; then
             echo "::warning::Coverage dir not found: ${COV_ROOT}, skip building test case map"
-            exit 0
+            RUN_BUILD_MAP=false
+          else
+            COVERAGE_FILE_COUNT=$(find "${COV_ROOT}" -name 'coverage.*' -type f | wc -l)
+            echo "Found ${COVERAGE_FILE_COUNT} coverage files"
+            if [ "${COVERAGE_FILE_COUNT}" -eq 0 ]; then
+              echo "::warning::No coverage files found under ${COV_ROOT}, skip building test case map"
+              RUN_BUILD_MAP=false
+            fi
           fi
 
-          COVERAGE_FILE_COUNT=$(find "${COV_ROOT}" -name 'coverage.*' -type f | wc -l)
-          echo "Found ${COVERAGE_FILE_COUNT} coverage files"
-          if [ "${COVERAGE_FILE_COUNT}" -eq 0 ]; then
-            echo "::warning::No coverage files found under ${COV_ROOT}, skip building test case map"
-            exit 0
-          fi
+          echo "run-build-map=${RUN_BUILD_MAP}" >> "$GITHUB_OUTPUT"
+          echo "cov-root=${COV_ROOT}"          >> "$GITHUB_OUTPUT"
+          echo "covstub=${COVSTUB}"            >> "$GITHUB_OUTPUT"
+          echo "map-file=${MAP_FILE}"           >> "$GITHUB_OUTPUT"
 
-          if ! python3 -c "import regex" 2>/dev/null; then
-            python3 -m pip install regex \
-              -i https://repo.huaweicloud.com/repository/pypi/simple \
-              --retries 3 --timeout 60 \
-              || python3 -m pip install regex -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
-          fi
-
-          python3 scripts/ci/npu/precise-test/test_selector.py \
-            --build-map \
-            --coverage-dir "${COV_ROOT}" \
-            --source-dir "${COVSTUB}" \
-            --map-file "${MAP_FILE}"
-          test -s "${MAP_FILE}"
-          du -h "${MAP_FILE}"
+      - name: Build test case map
+        uses: lb-actions/precision-test@v1.0.7
+        if: steps.prepare-build-map.outputs.run-build-map == 'true'
+        with:
+          repo: sglang
+          build-map: true
+          # Absolute paths: the action forwards them unchanged to the CLI,
+          # which otherwise resolves relative paths against its own package dir.
+          coverage-dir: ${{ steps.prepare-build-map.outputs.cov-root }}
+          source-dir:   ${{ steps.prepare-build-map.outputs.covstub }}
+          map-file:     ${{ steps.prepare-build-map.outputs.map-file }}
 
       - name: Generate HTML coverage report
         # Best-effort add-on: continue-on-error keeps the job green and later
@@ -1181,7 +1189,7 @@ jobs:
           # The percentage is computed once by the "Generate HTML coverage
           # report" step above (same container). Fail closed when the value is
           # missing, e.g. that step died before writing it.
-          MIN_NPU_COVERAGE=10
+          MIN_NPU_COVERAGE=40
           NPU_PCT_FILE="${RUN_DIR}/npu_coverage.txt"
           if [ ! -s "${NPU_PCT_FILE}" ]; then
             echo "::error::NPU-only coverage value missing (${NPU_PCT_FILE}); refusing to upload the baseline to OBS"
@@ -1313,6 +1321,7 @@ jobs:
   pr-test-npu-finish:
     needs:
       [
+        pr-gate,
         check-changes,
 
         base-a-test-npu,
