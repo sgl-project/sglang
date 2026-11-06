@@ -504,6 +504,7 @@ def _row_sharded_switch_on() -> bool:
     """Any of the opt-in gfx950 row-sharded front / o_proj / stream switches."""
     return (
         envs.SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_FRONT.get()
+        or envs.SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT.get()
         or envs.SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_O_PROJ.get()
         or envs.SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM.get()
     )
