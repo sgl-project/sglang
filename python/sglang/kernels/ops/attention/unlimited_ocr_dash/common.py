@@ -6,6 +6,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.attention.minimax_sparse.common.tile_ptr import tile_ptrs_2d
+
 # One sparse block == one KV page. Fallback only; the real value is threaded in
 # as ``sparse_block_size=`` from ``sparse_attention_config`` by every wrapper.
 SPARSE_BLOCK_SIZE = 128
@@ -16,25 +18,6 @@ _FP8_DTYPES = (
     torch.float8_e5m2,
     torch.float8_e5m2fnuz,
 )
-
-
-def _compute_pdl_support() -> bool:
-    # PDL (programmatic dependent launch) is an SM90+ Triton launch feature.
-    try:
-        major, _ = torch.cuda.get_device_capability()
-        return major >= 9
-    except Exception:
-        return False
-
-
-_PDL_SUPPORTED: bool | None = None
-
-
-def _arch_supports_pdl() -> bool:
-    global _PDL_SUPPORTED
-    if _PDL_SUPPORTED is None:
-        _PDL_SUPPORTED = _compute_pdl_support()
-    return _PDL_SUPPORTED
 
 
 @triton.heuristics(
@@ -68,16 +51,19 @@ def _merge_topk_attn_out_kernel(
 
     off_c = tl.arange(0, NUM_TOPK_CHUNKS)
     off_d = tl.arange(0, BLOCK_SIZE_D)
-    o_ptrs = tl.make_block_ptr(
-        base=o_ptr + pid_b * stride_o_b + pid_h * stride_o_h,
-        shape=(NUM_TOPK_CHUNKS, head_dim),
-        strides=(stride_o_c, stride_o_d),
-        offsets=(0, 0),
-        block_shape=(NUM_TOPK_CHUNKS, BLOCK_SIZE_D),
-        order=(1, 0),
+    o_ptrs, o_mask = tile_ptrs_2d(
+        o_ptr + pid_b * stride_o_b + pid_h * stride_o_h,
+        NUM_TOPK_CHUNKS,
+        head_dim,
+        stride_o_c,
+        stride_o_d,
+        0,
+        0,
+        NUM_TOPK_CHUNKS,
+        BLOCK_SIZE_D,
     )
     lse_ptrs = lse_ptr + pid_b * stride_l_b + pid_h * stride_l_h + off_c * stride_l_c
-    o = tl.load(o_ptrs, boundary_check=(0, 1), padding_option="zero")
+    o = tl.load(o_ptrs, mask=o_mask, other=0.0)
     lse = tl.load(lse_ptrs)  # empty chunks contribute -inf -> weight 0
     lse_max = tl.max(lse, axis=0)
     weights = tl.exp2(lse - lse_max)

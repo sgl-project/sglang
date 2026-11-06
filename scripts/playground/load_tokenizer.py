@@ -1,7 +1,7 @@
 import argparse
 import code
 
-from sglang.srt.utils.hf_transformers import get_tokenizer
+from sglang.srt.hf_transformers import get_tokenizer
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

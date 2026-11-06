@@ -63,7 +63,7 @@ from sglang.srt.speculative.ragged_verify import (
 )
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import get_compiler_backend
-from sglang.srt.utils.common import get_device_capability
+from sglang.srt.utils.device import get_device_capability
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
@@ -497,8 +497,8 @@ class FlashAttentionBackend(AttentionBackend):
                 self.speculative_num_draft_tokens,
                 self.page_size,
                 metadata.swa_page_table,
-                full_v2p=runner_ids.space(IdSpaceKind.FULL).read_v2p,
-                swa_v2p=None if swa is None else swa.read_v2p,
+                full_v2p=runner_ids.space(IdSpaceKind.FULL).read_mapping(),
+                swa_v2p=None if swa is None else swa.read_mapping(),
                 zero_tail=True,
             )
             return
