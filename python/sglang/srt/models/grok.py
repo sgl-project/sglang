@@ -112,7 +112,7 @@ class Grok1MLP(nn.Module):
         if _is_cpu:
             x = torch.ops.sgl_kernel.gelu_and_mul_cpu(gate_up)
         else:
-            x, _ = gelu_and_mul_triton(gate_up)
+            x = gelu_and_mul_triton(gate_up)
         x, _ = self.down_proj(x)
         return x
 
