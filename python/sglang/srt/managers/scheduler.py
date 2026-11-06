@@ -232,6 +232,7 @@ from sglang.srt.managers.prefill_delayer import (
     PrefillDelayerSinglePassExecutor,
     RecentPrefillBatchSizeTracker,
 )
+from sglang.srt.managers.queue_admission import select_queue_evictions
 from sglang.srt.managers.req_types import (
     FINISH_ABORT,
     MultimodalInputs,
@@ -3751,37 +3752,27 @@ class Scheduler(
 
     def _abort_on_queued_limit(self, recv_req: Req) -> bool:
         """Abort an incoming or existing request if the waiting queue is full. Returns True if the incoming request is aborted."""
-        if (
-            self.max_queued_requests is None
-            or len(self.waiting_queue) + 1 <= self.max_queued_requests
-        ):
+        evictions = select_queue_evictions(
+            waiting_queue=self.waiting_queue,
+            incoming=recv_req,
+            max_requests=self.max_queued_requests,
+            max_tokens=get_schedule().max_queued_tokens,
+            enable_priority=self.enable_priority_scheduling,
+            low_priority_values_first=self.schedule_low_priority_values_first,
+        )
+        if evictions == []:
             return False
 
-        if self.enable_priority_scheduling:
-            # With priority scheduling, consider aboritng an existing request based on the priority.
-            # direction = 1  => smaller number = higher priority; -1 => larger number = higher priority.
-            # max(...) + (direction * priority, queue_time_start) picks the least-preferred request.
-            # Tie: later queue_time_start (newer) is evicted first. Preempt only if strictly better.
-            direction = 1 if self.schedule_low_priority_values_first else -1
-            key_fn = lambda req: (
-                direction * req.priority,
-                req.time_stats.wait_queue_entry_time,
-            )
-            candidate_req = max(self.waiting_queue, key=key_fn)
-            abort_existing_req = (
-                direction * recv_req.priority < direction * candidate_req.priority
-            )
-            if abort_existing_req:
-                self.waiting_queue.leave([candidate_req])
+        if evictions is not None:
+            self.waiting_queue.leave(evictions)
+            for req in evictions:
                 self._abort_unavailable(
-                    candidate_req,
+                    req,
                     message="The request is aborted by a higher priority request.",
                 )
-                # An evicted request sharing the incoming rid refuses it too.
-                if candidate_req.rid != recv_req.rid:
-                    return False
+            if all(req.rid != recv_req.rid for req in evictions):
+                return False
 
-        # Reject the incoming request by default.
         self._abort_unavailable(recv_req, message="The request queue is full.")
         return True
 
