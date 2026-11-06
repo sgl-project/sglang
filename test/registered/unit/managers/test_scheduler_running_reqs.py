@@ -388,6 +388,7 @@ class TestRunningReqsHooks(CustomTestCase):
             model_runner=SimpleNamespace(attn_backend=SimpleNamespace())
         )
         s.get_prefill_adder_class = lambda: _Adder
+        s.request_retirer = None
         s.page_size = 1
         s.tree_cache = SimpleNamespace(buffer_pipeline=None)
         s.token_to_kv_pool_allocator = SimpleNamespace(state_slots=None)
@@ -399,6 +400,7 @@ class TestRunningReqsHooks(CustomTestCase):
         s.max_running_requests = 4
         s.enable_lora = False
         s.enable_hicache_storage = False
+        s.enable_unified_cache_external_linker = False
         s.enable_lmcache = False
         s.truncation_align_size = None
         s._add_request_to_queue = Mock()

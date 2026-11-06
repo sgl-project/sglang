@@ -149,9 +149,8 @@ class GenerationBatchResult:
     # Every stage holds the KV for its own layers, so every stage has to compact
     # that path into its committed prefix; only the last stage can compute it.
     accept_index: Optional[torch.Tensor] = None
-    prepared_draft_extend_inputs: Optional[
-        tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-    ] = None
+    # The optional fourth item is the prepared draft-extend layout.
+    prepared_draft_extend_inputs: Optional[tuple] = None
 
     # Refs the worker wants scheduler to keep alive for the same 2-iter window
     # as batch_record_buf. Used for cross-stream tensor lifetime (e.g. a spec
