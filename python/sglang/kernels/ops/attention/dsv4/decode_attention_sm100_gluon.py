@@ -57,9 +57,9 @@ def _load_v4(
     scale = gl.where(exponent == 0, 0x00400000, exponent << 23).to(
         gl.float32, bitcast=True
     )
-    rope_ptr = (CACHE + base + slot * DATA_BYTES + 448 + (d[None, :] - 448) * 2).to(
+    rope_ptr = (CACHE + base + slot * DATA_BYTES + 448).to(
         gl.pointer_type(gl.bfloat16)
-    )
+    ) + (d[None, :] - 448)
     rope = gl.load(rope_ptr, valid[:, None] & (d[None, :] >= 448), 0)
     return gl.where(d[None, :] < 448, fp8 * scale, rope.to(gl.float32)).to(gl.bfloat16)
 
