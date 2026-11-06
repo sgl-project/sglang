@@ -20,6 +20,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cpu,
     is_cuda,
+    is_gfx1201_supported,
     is_hip,
     is_mps,
     is_musa,
@@ -86,6 +87,17 @@ if _is_xpu:
         )
 
 
+def _should_force_native_rope() -> bool:
+    # gfx1201: released ROCm sgl-kernel wheels are not built for that arch, so
+    # the fused RoPE entry point is unavailable there. Queried lazily -- reading
+    # device properties at import time would initialise a HIP context in every
+    # process that merely imports this module.
+    return is_gfx1201_supported() or (
+        publish_role() is not None
+        and get_exec().deterministic.rl_on_policy_target is not None
+    )
+
+
 class RotaryEmbedding(BaseFusedOp):
     """Original rotary positional embedding."""
 
@@ -110,10 +122,7 @@ class RotaryEmbedding(BaseFusedOp):
         self.is_neox_style = is_neox_style
         self.dtype = dtype
         self.position_start = position_start
-        self._force_native = (
-            publish_role() is not None
-            and get_exec().deterministic.rl_on_policy_target is not None
-        )
+        self._force_native = _should_force_native_rope()
 
         cache = self._compute_cos_sin_cache()
         # NOTE(ByronHsu): cache needs to be in FP32 for numerical stability.
@@ -250,7 +259,9 @@ class RotaryEmbedding(BaseFusedOp):
             )
         )
         if self._force_native:
-            inv_freq = inv_freq.cuda()
+            # Match the position tensor's initialization device, including
+            # CPU-first construction before the module is moved to the GPU.
+            inv_freq = inv_freq.to(device=torch.empty(0).device)
         return inv_freq
 
     def _compute_cos_sin_cache(self) -> torch.Tensor:

@@ -32,6 +32,7 @@ from sglang.kernels.ops.layernorm.norm import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.rotary_embedding.base import _should_force_native_rope
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.layout.paged_view import paged_kv_view
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -305,6 +306,11 @@ def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
     # The fused RoPE writer cannot localize DCP slots or filter token owners.
     if get_parallel().dcp_enabled:
         return False
+    # Native RoPE does not write the KV cache. Callers must keep the separate
+    # attention cache write enabled whenever that implementation is selected.
+    if _should_force_native_rope():
+        return False
+
     pool = get_token_to_kv_pool()
     return (
         _is_cuda

@@ -329,7 +329,9 @@ class Llama4Attention(nn.Module):
         if self.rotary_emb is not None:
             q_view, k_view = qk.split([self.q_size, self.kv_size], dim=-1)
             q_out_unused, k_out_unused = self.rotary_emb(positions, q_view, k_view)
-            if _is_npu:
+            # NPU and forced-native RoPE (e.g. gfx1201) return new tensors
+            # instead of rotating the views in place.
+            if _is_npu or getattr(self.rotary_emb, "_force_native", False):
                 qk = torch.cat([q_out_unused, k_out_unused], dim=-1)
             del q_view, k_view, q_out_unused, k_out_unused
 
