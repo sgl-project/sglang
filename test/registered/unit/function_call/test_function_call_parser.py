@@ -5579,6 +5579,95 @@ class TestQwen25Detector(unittest.TestCase):
         cities = [json.loads(result[i]["parameters"])["city"] for i in sorted(result)]
         self.assertEqual(cities, ["NYC", "LA"])
 
+    def _collect_streaming_tool_calls_with_flush(self, chunks, tools=None):
+        """Helper: like _collect_streaming_tool_calls, plus the end-of-stream
+        finish() flush, so tool calls stranded in the buffer are not lost."""
+        tools = self.tools if tools is None else tools
+        tool_calls_by_index = {}
+        results = [
+            self.detector.parse_streaming_increment(chunk, tools) for chunk in chunks
+        ]
+        results.append(self.detector.finish(tools))
+        for result in results:
+            for call in result.calls:
+                entry = tool_calls_by_index.setdefault(
+                    call.tool_index, {"name": "", "parameters": ""}
+                )
+                if call.name:
+                    entry["name"] = call.name
+                if call.parameters:
+                    entry["parameters"] += call.parameters
+        return tool_calls_by_index
+
+    def test_flush_drains_calls_stranded_in_final_chunk(self):
+        """A final delta that carries several complete tool calls must not
+        lose the ones the one-action-per-increment parser could not reach:
+        finish() drains the remainder of the buffer."""
+        call1 = (
+            '<tool_call>\n{"name": "get_current_weather", '
+            '"arguments": {"city": "NYC", "state": "NY"}}\n</tool_call>'
+        )
+        call2 = (
+            '<tool_call>\n{"name": "get_current_weather", '
+            '"arguments": {"city": "LA", "state": "CA"}}\n</tool_call>'
+        )
+
+        result = self._collect_streaming_tool_calls_with_flush([call1 + call2])
+        self.assertEqual(len(result), 2, f"Expected 2 tool calls, got {len(result)}")
+        self.assertEqual(result[0]["name"], "get_current_weather")
+        self.assertEqual(result[1]["name"], "get_current_weather")
+        self.assertEqual(json.loads(result[0]["parameters"])["city"], "NYC")
+        self.assertEqual(json.loads(result[1]["parameters"])["city"], "LA")
+
+        # finish() must be idempotent.
+        self.assertEqual(self.detector.finish(self.tools).calls, [])
+
+    def test_streaming_with_flush_matches_non_streaming(self):
+        """Streaming plus the end-of-stream flush must reproduce the
+        non-streaming tool calls regardless of how the text is chunked."""
+        from sglang.srt.function_call.qwen25_detector import Qwen25Detector
+
+        tools = [
+            *self.tools,
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_time",
+                    description="Get the current time in a given timezone",
+                    parameters={
+                        "type": "object",
+                        "properties": {"tz": {"type": "string"}},
+                        "required": ["tz"],
+                    },
+                ),
+            ),
+        ]
+        text = (
+            "Sure! "
+            '<tool_call>\n{"name": "get_current_weather", '
+            '"arguments": {"city": "NYC", "state": "NY"}}\n</tool_call>'
+            '<tool_call>\n{"name": "get_time", '
+            '"arguments": {"tz": "UTC"}}\n</tool_call>'
+        )
+        self.detector = Qwen25Detector()
+        expected = [
+            (c.tool_index, c.name, json.loads(c.parameters))
+            for c in self.detector.detect_and_parse(text, tools).calls
+        ]
+
+        for size in (1, 7, len(text)):
+            with self.subTest(chunk_size=size):
+                self.detector = Qwen25Detector()
+                chunks = [text[i : i + size] for i in range(0, len(text), size)]
+                result = self._collect_streaming_tool_calls_with_flush(chunks, tools)
+                self.assertEqual(
+                    [
+                        (i, e["name"], json.loads(e["parameters"]))
+                        for i, e in sorted(result.items())
+                    ],
+                    expected,
+                )
+
 
 class TestGemma4Detector(unittest.TestCase):
     def setUp(self):

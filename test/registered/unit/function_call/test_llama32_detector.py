@@ -185,6 +185,36 @@ class TestLlama32Detector(CustomTestCase):
         self.assertEqual(params["city"], "Tokyo")
         self.assertEqual(params["unit"], "celsius")
 
+    def test_flush_drains_calls_stranded_in_final_chunk(self):
+        """A final delta that carries both complete tool calls must not lose
+        the second one: finish() drains what the increments left buffered."""
+        detector = Llama32Detector()
+        text = (
+            '<|python_tag|>{"name": "get_weather", "parameters": {"city": "Paris"}};'
+            '{"name": "search", "parameters": {"query": "hotels"}}'
+        )
+        all_calls = []
+        all_calls.extend(detector.parse_streaming_increment(text, self.tools).calls)
+        all_calls.extend(detector.finish(self.tools).calls)
+
+        streamed = {}
+        for call in all_calls:
+            entry = streamed.setdefault(call.tool_index, {"name": "", "arguments": ""})
+            entry["name"] += call.name or ""
+            entry["arguments"] += call.parameters
+        self.assertEqual(
+            [
+                (e["name"], json.loads(e["arguments"]))
+                for _, e in sorted(streamed.items())
+            ],
+            [
+                ("get_weather", {"city": "Paris"}),
+                ("search", {"query": "hotels"}),
+            ],
+        )
+        # finish() must be idempotent.
+        self.assertEqual(detector.finish(self.tools).calls, [])
+
 
 if __name__ == "__main__":
     import unittest
