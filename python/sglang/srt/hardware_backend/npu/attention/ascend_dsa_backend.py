@@ -244,21 +244,19 @@ class AscendDSAAttnBackend(AscendAttnBackend):
         workspace = metadata.kpool
         assert workspace is not None
         write_mode, max_query_len = self._kpool_layout(forward_batch)
-        if (
-            workspace.num_tokens != forward_batch.out_cache_loc.numel()
-            or workspace.mode != write_mode
-            or workspace.max_query_len != max_query_len
-        ):
+        if workspace.mode != write_mode or workspace.max_query_len != max_query_len:
             raise RuntimeError(
-                "KeyPool replay mode/token capacity differs from capture"
+                "KeyPool replay mode/query capacity differs from capture"
             )
-        ends = query_lens.cumsum(0)
-        first = (ends - query_lens).long().clamp(max=max(workspace.num_tokens - 1, 0))
+        # Replay keeps real requests before the bucket's padded suffix. Use that
+        # boundary directly; out_cache_loc may contain only the unpadded tokens.
+        num_padding = getattr(forward_batch, "num_padding", 0)
+        if not 0 <= num_padding <= batch:
+            raise ValueError("Invalid DSA request padding")
+        actual_mode = getattr(forward_batch, "actual_forward_mode", mode)
+        num_real_requests = 0 if actual_mode.is_idle() else batch - num_padding
         valid = query_lens > 0
-        if workspace.num_tokens:
-            valid = valid & (forward_batch.out_cache_loc[first] != 0)
-        else:
-            valid = torch.zeros_like(valid)
+        valid[num_real_requests:] = False
         start_pos = torch.where(valid, (cache_lens - query_lens).clamp_min(0), 0)
         workspace.update_inputs(
             start_pos=start_pos,
