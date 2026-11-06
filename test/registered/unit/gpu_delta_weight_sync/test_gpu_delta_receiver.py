@@ -227,7 +227,8 @@ class TestReceiverPreparation(unittest.TestCase):
         ):
             backend = SimpleNamespace(layout=plan)
             self.assertIs(receiver.GpuDeltaBackend.describe(backend), description)
-        prepared.device, prepared.stream = torch.device("cpu"), object()
+        prepared.device = torch.device("cpu")
+        prepared.stream = SimpleNamespace(wait_stream=lambda _: None)
         prepared.batches, prepared.status_checks = [], []
         prepared.apply_bindings, prepared.apply_source_patches = [], []
         prepared.apply_fallback_groups = set()
@@ -239,6 +240,7 @@ class TestReceiverPreparation(unittest.TestCase):
             patch.object(prepared, "_allocate_paused"),
             patch.object(torch.cuda, "device", return_value=nullcontext()),
             patch.object(torch.cuda, "stream", return_value=nullcontext()),
+            patch.object(torch.cuda, "default_stream", return_value=prepared.stream),
             patch.object(
                 torch.cuda,
                 "Event",
