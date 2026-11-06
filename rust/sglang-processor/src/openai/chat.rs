@@ -6,20 +6,72 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
+use sglang_api_types::api::v1::{
+    GenerateMetaInfo, GenerateRequest, GenerateResponse, GenerateStreamError, ImagesConfig,
+    Int64List, LogprobEntry, NullableTopLogprobs, SamplingParams, SamplingParamsOrList, TokenIds,
+    TokenIdsOrList, WatermarkRequestConfig, sampling_params_or_list, string_or_list,
+    token_ids_or_list,
+};
 
 use super::kimi_k3_tag::auto_tool_call_tag;
 use super::request::{
-    OneOrList, ResponseFormat, StreamOptions, custom_labels, default_model, float_logit_bias,
-    format_json_schema, lora_path, one, usage_flags, yes,
+    OneOrList, ResponseFormat, StreamOptions, custom_labels, default_model, format_json_schema,
+    lora_path, one, usage_flags, yes,
 };
 use super::wire::{
-    Payload, Reply, StreamState, http_status_name, malformed_output_reply, meta_u64, now,
-    stream_error_event, unary_reply,
+    Reply, StreamState, abort_event, finish_fields, logprob_slice, logprobs_length, now,
+    unary_reply,
 };
 use super::{OpenAiHeaders, OpenAiSettings, OpenAiTokenizer, Unsupported};
 use crate::py::python_json;
-use crate::think::{ReasoningOptions, ThinkConfig, ThinkDetector, think_config};
+use crate::think::{ReasoningDefault, ReasoningOptions, ThinkConfig, ThinkDetector, think_config};
 use crate::tool_call::{ToolCallItem, ToolDetector, tool_call_id, tool_detector};
+
+#[cfg(feature = "render")]
+mod deepseek;
+/// Without `render` there is no recipe: requests whose output it would parse
+/// fall back.
+#[cfg(not(feature = "render"))]
+mod deepseek {
+    use serde_json::Value;
+    use sglang_api_types::api::v1::{GenerateMetaInfo, GenerateResponse};
+
+    use super::{ChatModel, OpenAiSettings, ToolCallItem, Unsupported};
+
+    pub(super) enum DeepSeekParsing {}
+
+    pub(super) fn parsing(
+        model: &ChatModel,
+        settings: &OpenAiSettings,
+        _request: &Value,
+        _has_tools: bool,
+    ) -> Result<Option<DeepSeekParsing>, Unsupported> {
+        match model.recipe_parses_output(
+            settings.reasoning_parser.as_deref(),
+            settings.tool_call_parser.as_deref(),
+        )? {
+            true => Err(Unsupported("reasoning_parser")),
+            false => Ok(None),
+        }
+    }
+
+    impl DeepSeekParsing {
+        pub(super) fn unary(&self, _: &GenerateResponse) -> (String, String, Vec<ToolCallItem>) {
+            match *self {}
+        }
+
+        pub(super) fn stream(
+            &mut self,
+            _: u64,
+            _: &GenerateResponse,
+            _: &GenerateMetaInfo,
+            _: Option<&str>,
+            _: bool,
+        ) -> ((String, String, Vec<ToolCallItem>), bool) {
+            match *self {}
+        }
+    }
+}
 
 /// Facts about the served model that Python's chat layer reads.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -37,15 +89,187 @@ pub struct ChatModel {
     #[serde(default)]
     pub reasoning_toggle: Option<ReasoningToggle>,
     /// `chat_encoding_spec`, the encoder SGLang renders the model with; the
-    /// OpenAI layer special-cases `"kimi_k3"`.
+    /// OpenAI layer special-cases `"kimi_k3"`, and recipe parses `"dsv4"` and
+    /// `"dsv41"` output.
     #[serde(default)]
     pub chat_encoding_spec: Option<String>,
+    /// The served DeepSeek-V4 / V4.1 checkpoint, whose output recipe parses
+    /// with its tokenizer.
+    #[cfg(feature = "render")]
+    #[serde(skip)]
+    pub deepseek: Option<crate::DeepSeekOutput>,
+}
+
+/// Why recipe cannot parse a DeepSeek model's output under the server's parsers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum DeepSeekOutputError {
+    /// Python rejects this at startup.
+    #[error("a DeepSeek reasoning or tool-call parser is mixed with another model's parser")]
+    MixedParsers,
+    #[error("DeepSeek output parsing needs the checkpoint's tokenizer.json")]
+    NoTokenizer,
+}
+
+impl From<DeepSeekOutputError> for Unsupported {
+    fn from(error: DeepSeekOutputError) -> Self {
+        match error {
+            DeepSeekOutputError::MixedParsers => Unsupported("reasoning_parser"),
+            DeepSeekOutputError::NoTokenizer => Unsupported("no_tokenizer"),
+        }
+    }
 }
 
 impl ChatModel {
+    /// What `template_detection` and `chat_encoding_spec` resolve for
+    /// `formatter`; the host fills in the rest.
+    #[cfg(feature = "render")]
+    pub fn for_formatter(formatter: &crate::ChatFormatter) -> Self {
+        use crate::{ChatFormatter, DeepSeekOutput};
+        let deepseek = |v41, tokenizer: &Option<Arc<crate::DeepSeekTokenizer>>| {
+            tokenizer
+                .clone()
+                .map(|tokenizer| DeepSeekOutput::new(v41, tokenizer))
+        };
+        let (chat_encoding_spec, deepseek) = match formatter {
+            ChatFormatter::KimiK3 => (Some("kimi_k3"), None),
+            ChatFormatter::DeepSeekV4(tokenizer) => (Some("dsv4"), deepseek(false, tokenizer)),
+            ChatFormatter::DeepSeekV41(tokenizer) => (Some("dsv41"), deepseek(true, tokenizer)),
+            _ => (None, None),
+        };
+        Self {
+            always_thinks: formatter.always_thinks(),
+            reasoning_toggle: formatter.reasoning_toggle().map(|(param, enabled)| {
+                ReasoningToggle {
+                    toggle_param: param.to_owned(),
+                    default_enabled: enabled,
+                }
+            }),
+            chat_encoding_spec: chat_encoding_spec.map(str::to_owned),
+            deepseek,
+            ..Self::default()
+        }
+    }
+
+    /// `ADAPTER_OUTPUT_PARSERS`: whether recipe parses the output in place of
+    /// the server's parsers, once one of the model's DeepSeek parsers is set.
+    fn recipe_parses_output(
+        &self,
+        reasoning_parser: Option<&str>,
+        tool_call_parser: Option<&str>,
+    ) -> Result<bool, DeepSeekOutputError> {
+        let (reasoning, tool) = match self.chat_encoding_spec.as_deref() {
+            Some("dsv4") => ("deepseek-v4", "deepseekv4"),
+            Some("dsv41") => ("deepseek-v41", "deepseekv41"),
+            _ => return Ok(false),
+        };
+        if reasoning_parser != Some(reasoning) && tool_call_parser != Some(tool) {
+            return Ok(false);
+        }
+        match reasoning_parser.is_none_or(|name| name == reasoning)
+            && tool_call_parser.is_none_or(|name| name == tool)
+        {
+            true => Ok(true),
+            false => Err(DeepSeekOutputError::MixedParsers),
+        }
+    }
+
+    /// The checkpoint whose output recipe parses under the server's parsers
+    /// (`DeepSeekRecipeChatEncodingAdapter.output`).
+    #[cfg(feature = "render")]
+    pub fn deepseek_output(
+        &self,
+        reasoning_parser: Option<&str>,
+        tool_call_parser: Option<&str>,
+    ) -> Result<Option<&crate::DeepSeekOutput>, DeepSeekOutputError> {
+        match self.recipe_parses_output(reasoning_parser, tool_call_parser)? {
+            true => self
+                .deepseek
+                .as_ref()
+                .map(Some)
+                .ok_or(DeepSeekOutputError::NoTokenizer),
+            false => Ok(None),
+        }
+    }
+
     fn is_kimi_k3(&self) -> bool {
         self.chat_encoding_spec.as_deref() == Some("kimi_k3")
     }
+
+    /// `_patch_reasoning_skip_special_tokens`: K3's markers are special
+    /// tokens, so its output keeps them.
+    pub fn keeps_special_tokens(&self, reasoning_parser: Option<&str>) -> bool {
+        self.is_kimi_k3() || reasoning_parser == Some("kimi_k3")
+    }
+
+    /// `_reported_prompt_tokens`: the prompt tokens left out of `usage`.
+    pub fn unreported_prompt_tokens(&self) -> u64 {
+        if self.is_kimi_k3() {
+            KIMI_K3_GENERATION_STUB_TOKENS
+        } else {
+            0
+        }
+    }
+
+    /// `_get_reasoning_from_request` over the merged template kwargs: whether the
+    /// reply starts in reasoning. `None` for no parser or one the port does not cover.
+    fn thinking(
+        &self,
+        reasoning_parser: Option<&str>,
+        kwargs: &Map<String, Value>,
+    ) -> Option<bool> {
+        let name = reasoning_parser?;
+        let default = match think_config(name) {
+            Some(config) => config.reasoning_default(),
+            // `DeepSeekV4Detector.reasoning_default`, which Python reads when recipe parses.
+            None if self.recipe_parses_output(Some(name), None) == Ok(true) => {
+                ReasoningDefault::off_unless("thinking")
+            }
+            None => return None,
+        };
+        Some(match &self.reasoning_toggle {
+            Some(toggle) => toggle.enabled(kwargs),
+            // Without a detected template config, the parser's own default.
+            None => self.always_thinks || default.enabled(kwargs),
+        })
+    }
+
+    /// [`Self::thinking`] for a raw chat `body` under the server's `defaults`,
+    /// its kwargs filled as `_process_messages` fills them.
+    #[cfg(feature = "render")]
+    pub fn request_thinking(
+        &self,
+        reasoning_parser: Option<&str>,
+        body: &Value,
+        defaults: &HashMap<String, Value>,
+    ) -> Option<bool> {
+        let kwargs = template_kwargs(
+            body["chat_template_kwargs"]
+                .as_object()
+                .cloned()
+                .unwrap_or_default(),
+            crate::requested_thinking(body).map(Value::from),
+            defaults,
+        );
+        self.thinking(reasoning_parser, &kwargs)
+    }
+}
+
+/// `_process_messages`' template kwargs: the request's, then the thinking toggle
+/// its effort implies, then the server's `defaults`; the effort moves onto the request.
+fn template_kwargs<'a>(
+    mut kwargs: Map<String, Value>,
+    thinking: Option<Value>,
+    defaults: impl IntoIterator<Item = (&'a String, &'a Value)>,
+) -> Map<String, Value> {
+    if let Some(thinking) = thinking {
+        kwargs.entry("thinking").or_insert(thinking.clone());
+        kwargs.entry("enable_thinking").or_insert(thinking);
+    }
+    kwargs.remove("reasoning_effort");
+    for (key, value) in defaults {
+        kwargs.entry(key.clone()).or_insert_with(|| value.clone());
+    }
+    kwargs
 }
 
 /// A chat template's reasoning toggle (`ReasoningToggleConfig`).
@@ -82,7 +306,7 @@ struct ChatRequest {
     model: String,
     #[serde(default)]
     frequency_penalty: f64,
-    logit_bias: Option<Map<String, Value>>,
+    logit_bias: Option<HashMap<String, f64>>,
     #[serde(default)]
     logprobs: bool,
     top_logprobs: Option<i64>,
@@ -109,7 +333,7 @@ struct ChatRequest {
     regex: Option<String>,
     ebnf: Option<String>,
     repetition_penalty: Option<f64>,
-    stop_token_ids: Option<Vec<i64>>,
+    stop_token_ids: Option<Int64List>,
     stop_regex: Option<OneOrList<String>>,
     #[serde(default)]
     no_stop_trim: bool,
@@ -128,8 +352,8 @@ struct ChatRequest {
     chat_template_kwargs: Option<Map<String, Value>>,
     custom_logit_processor: Option<OneOrList<Option<String>>>,
     custom_params: Option<Map<String, Value>>,
-    watermark: Option<Map<String, Value>>,
-    images_config: Option<Map<String, Value>>,
+    watermark: Option<WatermarkRequestConfig>,
+    images_config: Option<ImagesConfig>,
     rid: Option<OneOrList<String>>,
     extra_key: Option<OneOrList<String>>,
     cache_salt: Option<OneOrList<String>>,
@@ -194,7 +418,7 @@ pub fn lower_chat(
     model: &ChatModel,
     render: impl FnOnce(&Value) -> Option<Vec<u32>>,
     tokenizer: Option<Arc<dyn OpenAiTokenizer>>,
-) -> Result<(Value, ChatResponder), Unsupported> {
+) -> Result<(GenerateRequest, ChatResponder), Unsupported> {
     let original: Value =
         serde_json::from_slice(body).map_err(|_| Unsupported("unparsed_request"))?;
     let Value::Object(mut raw) = original.clone() else {
@@ -210,13 +434,19 @@ pub fn lower_chat(
     {
         return Err(Unsupported("unsupported_chat_feature"));
     }
-    custom_labels(headers, settings)?;
+    let labels = custom_labels(headers, settings)?;
     if settings.return_input_ids || settings.return_output_ids || headers.sglext_ids {
         return Err(Unsupported("sglext_output"));
     }
-    let parser = match settings.reasoning_parser.as_deref() {
-        Some(name) => Some(think_config(name).ok_or(Unsupported("reasoning_parser"))?),
-        None => None,
+    let reasoning_parser = settings.reasoning_parser.as_deref();
+    let tool_call_parser = settings.tool_call_parser.as_deref();
+    // recipe parses DeepSeek output from its token ids in place of both parsers.
+    let deepseek = deepseek::parsing(model, settings, &original, request_tools(&raw)?.is_some())?;
+    let parser = match reasoning_parser {
+        Some(name) if deepseek.is_none() => {
+            Some(think_config(name).ok_or(Unsupported("reasoning_parser"))?)
+        }
+        _ => None,
     };
     // `_process_messages`: glm47 constrains a request with tools, `"none"`
     // included, by a grammar flagged `ebnf_full_assistant`, which `/generate`
@@ -232,12 +462,8 @@ pub fn lower_chat(
     let tools = request_tools(&raw)?;
     let tool_definitions = raw.get("tools").and_then(Value::as_array).cloned();
     let parallel_tool_calls = raw.get("parallel_tool_calls") != Some(&Value::Bool(false));
-    let tool_parsing = match (
-        settings.tool_call_parser.as_deref(),
-        &tools,
-        &tool_definitions,
-    ) {
-        (Some(parser), Some(_), Some(definitions)) => {
+    let tool_parsing = match (tool_call_parser, &tools, &tool_definitions) {
+        (Some(parser), Some(_), Some(definitions)) if deepseek.is_none() => {
             tool_detector(parser, definitions).ok_or(Unsupported("tool_parser"))?;
             Some((parser.to_owned(), definitions.clone()))
         }
@@ -267,31 +493,13 @@ pub fn lower_chat(
     }
     let prompt_ids = render(&original).ok_or(Unsupported("render"))?;
 
-    // `_process_messages`: the server's default kwargs fill in the request's.
-    let mut kwargs = request.chat_template_kwargs.take().unwrap_or_default();
-    if let Some(thinking) = thinking_kwarg {
-        kwargs.entry("thinking").or_insert(thinking.clone());
-        kwargs.entry("enable_thinking").or_insert(thinking);
-    }
-    kwargs.remove("reasoning_effort");
-    for (key, value) in settings.default_chat_template_kwargs.iter().flatten() {
-        kwargs.entry(key.clone()).or_insert_with(|| value.clone());
-    }
-    let thinking = match parser.and_then(|config| config.default_thinking(&kwargs)) {
-        Some(thinking) => thinking,
-        None => {
-            parser.is_some()
-                && match &model.reasoning_toggle {
-                    Some(toggle) => toggle.enabled(&kwargs),
-                    None => {
-                        model.always_thinks || kwargs.get("thinking") == Some(&Value::Bool(true))
-                    }
-                }
-        }
-    };
-    // `_patch_reasoning_skip_special_tokens`: K3's markers are special tokens.
-    let kimi_k3 = model.is_kimi_k3();
-    if kimi_k3 || settings.reasoning_parser.as_deref() == Some("kimi_k3") {
+    let kwargs = template_kwargs(
+        request.chat_template_kwargs.take().unwrap_or_default(),
+        thinking_kwarg,
+        settings.default_chat_template_kwargs.iter().flatten(),
+    );
+    let thinking = model.thinking(reasoning_parser, &kwargs).unwrap_or(false);
+    if model.keeps_special_tokens(reasoning_parser) {
         request.skip_special_tokens = false;
     }
     // `_process_messages`: tool output keeps the parser's special tokens.
@@ -300,7 +508,7 @@ pub fn lower_chat(
     }
     // K3 also stops on its tool parser's `eot_token`.
     let tool_call_stop = match &tool_parsing {
-        Some((parser, _)) if kimi_k3 => match parser.as_str() {
+        Some((parser, _)) if model.is_kimi_k3() => match parser.as_str() {
             "kimi_k3" => Some(KIMI_K3_TOOLS_CLOSE),
             _ => return Err(Unsupported("tool_parser")),
         },
@@ -325,16 +533,23 @@ pub fn lower_chat(
 
     let mut lowered = generate_body(
         &request, &kwargs, model, prompt_ids, thinking, headers, settings,
-    );
+    )?;
+    lowered.custom_labels = labels;
     // `get_structure_constraint`: K3's tool parser constrains `auto` calls by
     // its structural tag, unless the request is already constrained; Python
     // tests the constraints by truthiness, so empty strings are unset.
-    let sampling = &mut lowered["sampling_params"];
+    let Some(sampling_params_or_list::Value::One(sampling)) = lowered
+        .sampling_params
+        .as_mut()
+        .and_then(|p| p.value.as_mut())
+    else {
+        unreachable!("one sampling configuration")
+    };
     if let (Some((tool_parser, _)), Some(definitions)) = (&tool_parsing, &tool_definitions)
         && tool_parser == "kimi_k3"
-        && ["regex", "ebnf", "json_schema"]
+        && [&sampling.regex, &sampling.ebnf, &sampling.json_schema]
             .iter()
-            .all(|key| sampling[*key].as_str().is_none_or(str::is_empty))
+            .all(|value| value.as_deref().is_none_or(str::is_empty))
     {
         // `strip_structural_tag_excludes`: the reasoning parser owns the think tokens.
         let strip = parser
@@ -342,20 +557,19 @@ pub fn lower_chat(
             .unwrap_or_default();
         let strip: Vec<&str> = strip.into_iter().filter(|t| !t.is_empty()).collect();
         if let Some(tag) = auto_tool_call_tag(definitions, parallel_tool_calls, &strip)? {
-            sampling["structural_tag"] = python_json(&tag, true).into();
+            sampling.structural_tag = Some(python_json(&tag, true));
         }
     }
     if let Some(stop) = tool_call_stop {
-        let sampling = &mut lowered["sampling_params"];
-        let mut stops = match sampling["stop"].take() {
-            Value::Array(stops) => stops,
-            Value::Null => Vec::new(),
-            single => vec![single],
+        let mut stops = match sampling.stop.take().and_then(|s| s.value) {
+            Some(string_or_list::Value::Many(stops)) => stops.items,
+            Some(string_or_list::Value::One(stop)) => vec![stop],
+            None => Vec::new(),
         };
         if !stops.iter().any(|s| s == stop) {
-            stops.push(stop.into());
+            stops.push(stop.to_owned());
         }
-        sampling["stop"] = stops.into();
+        sampling.stop = Some(OneOrList::List(stops).into());
     }
     let (include_usage, continuous_usage_stats) =
         usage_flags(request.stream_options.as_ref(), settings);
@@ -384,16 +598,17 @@ pub fn lower_chat(
         .sum();
     let responder = ChatResponder {
         model: request.model,
-        unreported_prompt_tokens: if kimi_k3 {
-            KIMI_K3_GENERATION_STUB_TOKENS
-        } else {
-            0
-        },
+        unreported_prompt_tokens: model.unreported_prompt_tokens(),
         history_tool_calls,
         n: request.n as usize,
         logprobs: request.logprobs,
-        reasoning,
-        tools: tool_parsing,
+        parsing: match deepseek {
+            Some(deepseek) => OutputParsing::DeepSeek(deepseek),
+            None => OutputParsing::Text {
+                reasoning,
+                tools: tool_parsing,
+            },
+        },
         include_usage,
         continuous_usage_stats,
         settings: settings.clone(),
@@ -605,13 +820,6 @@ fn validate(
     {
         return invalid;
     }
-    if request
-        .logit_bias
-        .as_ref()
-        .is_some_and(|b| !b.values().all(Value::is_number))
-    {
-        return invalid;
-    }
     let max_output = request
         .max_completion_tokens
         .filter(|&n| n != 0)
@@ -715,96 +923,141 @@ fn generate_body(
     thinking: bool,
     headers: &OpenAiHeaders<'_>,
     settings: &OpenAiSettings,
-) -> Value {
-    // `ChatCompletionRequest.to_sampling_params`: request, then generation config, then OpenAI.
+) -> Result<GenerateRequest, Unsupported> {
     let model_defaults = settings.sampling_defaults.as_deref().unwrap_or("model") == "model";
-    let param = |value: Option<Value>, name: &str, default: Value| {
-        let configured = model
-            .generation_config
-            .get(name)
-            .filter(|v| model_defaults && !v.is_null());
-        value.unwrap_or_else(|| configured.cloned().unwrap_or(default))
+    let param = |value: Option<f64>, name: &str, default: f64| -> Result<f64, Unsupported> {
+        match value {
+            Some(value) => Ok(value),
+            None => match model
+                .generation_config
+                .get(name)
+                .filter(|v| model_defaults && !v.is_null())
+            {
+                Some(value) => value
+                    .as_f64()
+                    .ok_or(Unsupported("invalid_sampling_default")),
+                None => Ok(default),
+            },
+        }
     };
-    let logit_bias = float_logit_bias(&request.logit_bias);
-    let max_new_tokens = request
-        .max_completion_tokens
-        .filter(|&n| n != 0)
-        .or(request.max_tokens);
-    let mut sampling = json!({
-        "temperature": param(request.temperature.map(Value::from), "temperature", json!(1.0)),
-        "max_new_tokens": max_new_tokens,
-        "min_new_tokens": request.min_tokens,
-        "stop": request.stop,
-        "stop_token_ids": request.stop_token_ids,
-        "stop_regex": request.stop_regex,
-        "top_p": param(request.top_p.map(Value::from), "top_p", json!(1.0)),
-        "top_k": param(request.top_k.map(Value::from), "top_k", json!(-1)),
-        "min_p": param(request.min_p.map(Value::from), "min_p", json!(0.0)),
-        "presence_penalty": request.presence_penalty,
-        "frequency_penalty": request.frequency_penalty,
-        "repetition_penalty": param(request.repetition_penalty.map(Value::from), "repetition_penalty", json!(1.0)),
-        "regex": request.regex,
-        "ebnf": request.ebnf,
-        "n": request.n,
-        "no_stop_trim": request.no_stop_trim,
-        "ignore_eos": request.ignore_eos,
-        "skip_special_tokens": request.skip_special_tokens,
-        "logit_bias": logit_bias,
-        "custom_params": request.custom_params,
-        "sampling_seed": request.seed,
-        "spaces_between_special_tokens": kwargs.get("spaces_between_special_tokens").cloned().unwrap_or(json!(true)),
-        "watermark": request.watermark,
-    });
-    if let Ok(Some(schema)) =
-        format_json_schema(request.response_format.as_ref(), model.is_kimi_k3())
-    {
-        sampling["json_schema"] = schema.into();
-    }
-    json!({
-        "input_ids": prompt_ids,
-        "image_data": null,
-        "video_data": null,
-        "audio_data": null,
-        "sampling_params": sampling,
-        "return_logprob": request.logprobs,
-        "logprob_start_len": -1,
-        "top_logprobs_num": request.top_logprobs.unwrap_or(0),
-        "return_sampling_mask": false,
-        "sampling_logprobs_mode": null,
-        "stream": request.stream,
-        "return_text_in_logprobs": true,
-        "modalities": [],
-        "lora_path": lora_path(&request.model, &request.lora_path),
-        "bootstrap_host": request.bootstrap_host,
-        "bootstrap_port": request.bootstrap_port,
-        "bootstrap_room": request.bootstrap_room,
-        "routed_dp_rank": request.routed_dp_rank.or(request.data_parallel_rank),
-        "disagg_prefill_dp_rank": request.disagg_prefill_dp_rank,
-        "return_hidden_states": false,
-        "return_routed_experts": false,
-        "routed_experts_start_len": 0,
-        "rid": request.rid,
-        "session_id": request.session_id,
-        "extra_key": request.extra_key,
-        "cache_salt": request.cache_salt,
-        "require_reasoning": thinking,
-        "priority": request.priority,
-        "routing_key": headers.routing_key,
-        "custom_labels": custom_labels(headers, settings).unwrap_or_default(),
-        "custom_logit_processor": request.custom_logit_processor,
-        "images_config": request.images_config,
-        "video_config": null,
-        "image_max_dynamic_patch": null,
-        "video_max_dynamic_patch": null,
-        "max_dynamic_patch": null,
-        "use_audio_in_video": false,
-        "return_prompt_token_ids": false,
+    let top_k = match request.top_k {
+        Some(value) => value,
+        None => match model
+            .generation_config
+            .get("top_k")
+            .filter(|v| model_defaults && !v.is_null())
+        {
+            Some(value) => value
+                .as_i64()
+                .ok_or(Unsupported("invalid_sampling_default"))?,
+            None => -1,
+        },
+    };
+    let sampling = SamplingParams {
+        temperature: Some(param(request.temperature, "temperature", 1.0)?),
+        max_new_tokens: request
+            .max_completion_tokens
+            .filter(|&n| n != 0)
+            .or(request.max_tokens),
+        min_new_tokens: Some(request.min_tokens),
+        stop: request.stop.clone().map(Into::into),
+        stop_token_ids: request.stop_token_ids.clone(),
+        stop_regex: request.stop_regex.clone().map(Into::into),
+        top_p: Some(param(request.top_p, "top_p", 1.0)?),
+        top_k: Some(top_k),
+        min_p: Some(param(request.min_p, "min_p", 0.0)?),
+        presence_penalty: Some(request.presence_penalty),
+        frequency_penalty: Some(request.frequency_penalty),
+        repetition_penalty: Some(param(
+            request.repetition_penalty,
+            "repetition_penalty",
+            1.0,
+        )?),
+        regex: request.regex.clone(),
+        json_schema: format_json_schema(request.response_format.as_ref(), model.is_kimi_k3())?,
+        ebnf: request.ebnf.clone(),
+        n: Some(request.n),
+        no_stop_trim: Some(request.no_stop_trim),
+        ignore_eos: Some(request.ignore_eos),
+        skip_special_tokens: Some(request.skip_special_tokens),
+        logit_bias: request.logit_bias.clone().unwrap_or_default(),
+        custom_params: request
+            .custom_params
+            .as_ref()
+            .map(|v| serde_json::to_string(v).expect("JSON object")),
+        sampling_seed: request.seed,
+        watermark: request.watermark.clone(),
+        spaces_between_special_tokens: Some(
+            kwargs
+                .get("spaces_between_special_tokens")
+                .map(|v| v.as_bool().ok_or(Unsupported("invalid_request")))
+                .transpose()?
+                .unwrap_or(true),
+        ),
+        ..Default::default()
+    };
+    Ok(GenerateRequest {
+        sampling_params: Some(SamplingParamsOrList {
+            value: Some(sampling_params_or_list::Value::One(sampling)),
+        }),
+        return_logprob: Some(OneOrList::One(request.logprobs).into()),
+        top_logprobs_num: Some(OneOrList::One(request.top_logprobs.unwrap_or(0)).into()),
+        stream: Some(request.stream),
+        return_text_in_logprobs: Some(true),
+        lora_path: lora_path(
+            &request.model,
+            &request.lora_path,
+            settings.served_model_name.as_deref(),
+        ),
+        bootstrap_host: request.bootstrap_host.clone().map(Into::into),
+        bootstrap_port: request.bootstrap_port.clone().map(Into::into),
+        bootstrap_room: request.bootstrap_room.clone().map(Into::into),
+        routed_dp_rank: request.routed_dp_rank.or(request.data_parallel_rank),
+        disagg_prefill_dp_rank: request.disagg_prefill_dp_rank,
+        rid: request.rid.clone().map(Into::into),
+        session_id: request.session_id.clone(),
+        extra_key: request.extra_key.clone().map(Into::into),
+        cache_salt: request.cache_salt.clone().map(Into::into),
+        priority: request.priority,
+        routing_key: headers.routing_key.map(str::to_owned),
+        custom_logit_processor: request.custom_logit_processor.clone().map(Into::into),
+        images_config: request.images_config.clone(),
+        input_ids: Some(TokenIdsOrList {
+            value: Some(token_ids_or_list::Value::One(TokenIds {
+                ids: prompt_ids.into_iter().map(i64::from).collect(),
+            })),
+        }),
+        require_reasoning: Some(thinking),
+        ..Default::default()
     })
 }
 
 struct ReasoningConfig {
     think: ThinkConfig,
     options: ReasoningOptions,
+}
+
+/// How the responder parses the output.
+enum OutputParsing {
+    /// The reasoning parser, and the tool parser with the request's tools,
+    /// over the output text.
+    Text {
+        reasoning: Option<ReasoningConfig>,
+        tools: Option<(String, Vec<Value>)>,
+    },
+    /// recipe over the output token ids, in place of both parsers.
+    DeepSeek(deepseek::DeepSeekParsing),
+}
+
+impl OutputParsing {
+    /// The reasoning config and the tool parser with its tools; none when
+    /// recipe parses.
+    fn text_parsers(&self) -> (Option<&ReasoningConfig>, Option<&(String, Vec<Value>)>) {
+        match self {
+            OutputParsing::Text { reasoning, tools } => (reasoning.as_ref(), tools.as_ref()),
+            OutputParsing::DeepSeek(_) => (None, None),
+        }
+    }
 }
 
 /// Builds the OpenAI chat response from the engine's `/generate` output.
@@ -816,9 +1069,7 @@ pub struct ChatResponder {
     history_tool_calls: i64,
     n: usize,
     logprobs: bool,
-    reasoning: Option<ReasoningConfig>,
-    /// The tool parser and request tools when the output is parsed for tool calls.
-    tools: Option<(String, Vec<Value>)>,
+    parsing: OutputParsing,
     include_usage: bool,
     continuous_usage_stats: bool,
     settings: OpenAiSettings,
@@ -830,55 +1081,38 @@ pub struct ChatResponder {
     detectors: HashMap<u64, ThinkDetector>,
     tool_detectors: HashMap<u64, Box<dyn ToolDetector>>,
     has_tool_calls: HashSet<u64>,
-    finish_reasons: Vec<(u64, Value)>,
+    finish_reasons: Vec<(u64, String, Value)>,
 }
 
 impl ChatResponder {
     /// `_handle_non_streaming_request` over a `/generate` response.
-    pub fn unary(self, body: &[u8]) -> Option<Reply> {
-        let mut ret = match serde_json::from_slice(body).ok()? {
-            Value::Array(items) => items,
-            item => vec![item],
-        };
+    pub fn unary(self, mut ret: Vec<GenerateResponse>) -> Option<Reply> {
         for item in &mut ret {
-            self.report_prompt_tokens(&mut item["meta_info"]);
+            if let Some(meta) = &mut item.meta_info {
+                self.report_prompt_tokens(meta);
+            }
         }
         let mut choices = Vec::with_capacity(ret.len());
         for (index, item) in ret.iter().enumerate() {
-            let meta = &item["meta_info"];
+            let default_meta = GenerateMetaInfo::default();
+            let meta = item.meta_info.as_ref().unwrap_or(&default_meta);
             let logprobs = self.logprobs.then(|| {
-                json!({"content": self.token_logprobs(&meta["output_token_logprobs"], &meta["output_top_logprobs"])})
+                json!({"content": self.token_logprobs(meta.output_token_logprobs.as_ref().map_or(&[], |p| &p.entries), &meta.output_top_logprobs)})
             });
-            let Some(text) = item["text"].as_str() else {
-                return Some(malformed_output_reply("text"));
-            };
-            let mut text = text.to_owned();
-            let mut reasoning = String::new();
-            if let Some(config) = &self.reasoning {
-                (reasoning, text) = ThinkDetector::new(config.think, &config.options).parse(&text);
-            }
-            // `_process_tool_calls`.
-            let mut finish_reason = meta["finish_reason"].clone();
+            let (reasoning, text, calls) = self.parse_output(item);
+            let (mut finish_type, mut matched_stop) = finish_fields(meta.finish_reason.as_ref());
             let mut tool_calls = Value::Null;
-            if let Some((parser, tools)) = &self.tools
-                && let Some(detector) = tool_detector(parser, tools)
-                && detector.has_tool_call(&text)
-            {
-                let (normal, calls) = detector.parse_non_stream(&text);
-                text = normal;
-                if !calls.is_empty() {
-                    let calls = calls
-                        .iter()
-                        .enumerate()
-                        .map(|(i, call)| self.tool_call(i as i64, call));
-                    tool_calls = calls.collect();
-                    if finish_reason["type"] == "stop" {
-                        finish_reason["type"] = "tool_calls".into();
-                        finish_reason["matched"] = Value::Null;
-                    }
+            if !calls.is_empty() {
+                let calls = calls
+                    .iter()
+                    .enumerate()
+                    .map(|(i, call)| self.tool_call(i as i64, call));
+                tool_calls = calls.collect();
+                if finish_type.as_deref() == Some("stop") {
+                    finish_type = Some("tool_calls".into());
+                    matched_stop = Value::Null;
                 }
             }
-            let finish_reason = &finish_reason;
             let mut message = json!({
                 "role": "assistant",
                 "content": text,
@@ -892,8 +1126,8 @@ impl ChatResponder {
                 "index": index,
                 "message": message,
                 "logprobs": logprobs,
-                "finish_reason": finish_reason.get("type"),
-                "matched_stop": finish_reason.get("matched"),
+                "finish_reason": finish_type,
+                "matched_stop": matched_stop,
             }));
         }
         unary_reply(
@@ -906,13 +1140,43 @@ impl ChatResponder {
         )
     }
 
-    /// One `/generate` SSE `data:` payload, as `_generate_chat_stream` handles
+    /// One choice's whole output as `(reasoning, content, tool calls)`; the
+    /// text parsers' calls as `_process_tool_calls` parses them.
+    fn parse_output(&self, item: &GenerateResponse) -> (String, String, Vec<ToolCallItem>) {
+        if let OutputParsing::DeepSeek(deepseek) = &self.parsing {
+            return deepseek.unary(item);
+        }
+        let (reasoning_config, tools) = self.parsing.text_parsers();
+        let mut text = item.text.clone();
+        let mut reasoning = String::new();
+        if let Some(config) = reasoning_config {
+            (reasoning, text) = ThinkDetector::new(config.think, &config.options).parse(&text);
+        }
+        let mut calls = Vec::new();
+        if let Some((parser, tools)) = tools
+            && let Some(detector) = tool_detector(parser, tools)
+            && detector.has_tool_call(&text)
+        {
+            (text, calls) = detector.parse_non_stream(&text);
+        }
+        (reasoning, text, calls)
+    }
+
+    /// One decoded `/generate` stream item, as `_generate_chat_stream` handles
     /// it. `Err` replaces the whole stream, before anything was sent.
-    pub fn stream_data(&mut self, data: &[u8]) -> Result<Vec<String>, Reply> {
-        let mut events = match self.stream.payload(data)? {
-            Payload::Done => return Ok(self.stream_end()),
-            Payload::Frame(content) => self.stream_frame(&content),
-            Payload::Events(events) => events,
+    pub fn stream_data(
+        &mut self,
+        data: Result<GenerateResponse, GenerateStreamError>,
+    ) -> Result<Vec<String>, Reply> {
+        if self.stream.done {
+            return Ok(Vec::new());
+        }
+        let mut events = match data {
+            Ok(content) => {
+                self.stream.started = true;
+                self.stream_frame(&content)
+            }
+            Err(error) => self.stream.error(error)?,
         };
         if self.stream.ending() {
             events.extend(self.stream_end());
@@ -925,33 +1189,26 @@ impl ChatResponder {
         self.stream.done
     }
 
-    fn stream_frame(&mut self, content: &Value) -> Vec<String> {
-        let index = content.get("index").and_then(Value::as_u64).unwrap_or(0);
-        let meta = &content["meta_info"];
-        let mut reported = meta.clone();
-        self.report_prompt_tokens(&mut reported);
-        self.stream.record(index, &reported);
-        let finish_reason = meta["finish_reason"].clone();
-        let finish_type = finish_reason["type"].as_str().map(str::to_owned);
+    fn stream_frame(&mut self, content: &GenerateResponse) -> Vec<String> {
+        let index = u64::from(content.index.unwrap_or(0));
+        let mut meta = content.meta_info.clone().unwrap_or_default();
+        self.report_prompt_tokens(&mut meta);
+        self.stream.record(index, &meta);
+        let (finish_type, matched_stop) = finish_fields(meta.finish_reason.as_ref());
 
         let mut logprobs = None;
         if self.logprobs {
             let prev = self.stream.logprob_counts.get(&index).copied().unwrap_or(0);
-            let total = meta_u64(meta, "output_token_logprobs_length") as usize;
+            let total = logprobs_length(&meta, prev, self.settings.incremental_streaming_output);
             if prev < total {
                 let incremental = self.settings.incremental_streaming_output;
-                let slice = |key: &str| -> Value {
-                    let items = meta[key].as_array().cloned().unwrap_or_default();
-                    match incremental {
-                        true => Value::Array(items),
-                        false => {
-                            Value::Array(items.into_iter().skip(prev).take(total - prev).collect())
-                        }
-                    }
-                };
+                let output = meta
+                    .output_token_logprobs
+                    .as_ref()
+                    .map_or(&[][..], |p| p.entries.as_slice());
                 let content = self.token_logprobs(
-                    &slice("output_token_logprobs"),
-                    &slice("output_top_logprobs"),
+                    logprob_slice(output, prev, total, incremental),
+                    logprob_slice(&meta.output_top_logprobs, prev, total, incremental),
                 );
                 logprobs = Some(json!({"content": content}));
             }
@@ -960,19 +1217,12 @@ impl ChatResponder {
 
         let mut events = Vec::new();
         if let Some(finish_type) = &finish_type {
-            // An abort carrying a status is an error; Python checks for an
-            // `HTTPStatus`, which `/generate` serializes as its integer.
-            if finish_type == "abort"
-                && let Some(code) = finish_reason["status_code"].as_u64()
-                && let Some(name) = http_status_name(code)
-            {
-                let message = finish_reason["message"]
-                    .as_str()
-                    .unwrap_or("Generation aborted.");
+            if let Some(event) = abort_event(meta.finish_reason.as_ref()) {
                 self.stream.stopped = true;
-                return vec![stream_error_event(message, name, code as u16)];
+                return vec![event];
             }
-            self.finish_reasons.push((index, finish_reason.clone()));
+            self.finish_reasons
+                .push((index, finish_type.clone(), matched_stop));
         }
         if self.roles_sent.insert(index) {
             events.push(self.chunk(
@@ -983,8 +1233,19 @@ impl ChatResponder {
             ));
         }
 
+        if let OutputParsing::DeepSeek(deepseek) = &mut self.parsing {
+            let incremental = self.settings.incremental_streaming_output;
+            let (delta, called) =
+                deepseek.stream(index, content, &meta, finish_type.as_deref(), incremental);
+            if called {
+                self.has_tool_calls.insert(index);
+            }
+            events.extend(self.token_output_chunks(index, delta, logprobs));
+            return events;
+        }
+        let (reasoning_config, tools) = self.parsing.text_parsers();
         // `_generate_stream_content`.
-        let text = content["text"].as_str().unwrap_or_default();
+        let text = content.text.as_str();
         let mut delta = match self.settings.incremental_streaming_output {
             true => text.to_owned(),
             false => {
@@ -997,7 +1258,7 @@ impl ChatResponder {
             }
         };
         let mut remaining_logprobs = logprobs;
-        if let Some(config) = &self.reasoning {
+        if let Some(config) = reasoning_config {
             let detector = self
                 .detectors
                 .entry(index)
@@ -1019,10 +1280,9 @@ impl ChatResponder {
                 ));
             }
         }
-        if self.tools.is_some() {
+        if let Some(tools) = tools {
             // `_process_tool_call_stream`, whose chunks are Pydantic models.
             let flush = finish_type.as_deref().is_some_and(|t| t != "abort");
-            let tools = self.tools.as_ref().expect("tools are set");
             let detector = self.tool_detectors.entry(index).or_insert_with(|| {
                 tool_detector(&tools.0, &tools.1).expect("checked when lowering")
             });
@@ -1078,20 +1338,70 @@ impl ChatResponder {
         events
     }
 
-    fn stream_end(&mut self) -> Vec<String> {
+    /// `token_output_sse_chunks`: a reasoning chunk, a content chunk, then one
+    /// chunk per tool-call piece. The step's logprobs ride on the reasoning or
+    /// content chunk, else on a chunk of their own.
+    fn token_output_chunks(
+        &self,
+        index: u64,
+        (reasoning, content, pieces): (String, String, Vec<ToolCallItem>),
+        mut logprobs: Option<Value>,
+    ) -> Vec<String> {
+        let usage = self.chunk_usage(index);
+        let mut events = Vec::new();
+        if !reasoning.is_empty() {
+            let delta = json!({"reasoning_content": reasoning});
+            events.push(self.chunk(index, delta, logprobs.take(), usage.clone()));
+        }
+        if !content.is_empty() {
+            let delta = json!({"reasoning_content": null, "content": content});
+            events.push(self.chunk(index, delta, logprobs.take(), usage.clone()));
+        }
+        for piece in pieces {
+            // The first piece of a call names it; later pieces extend its arguments.
+            let named = !piece.name.is_empty();
+            let tool_call = json!({
+                "id": named.then(tool_call_id),
+                "index": piece.tool_index,
+                "type": "function",
+                "function": {
+                    "name": named.then_some(piece.name),
+                    "arguments": piece.parameters,
+                },
+            });
+            let delta = json!({
+                "role": null,
+                "content": null,
+                "reasoning_content": null,
+                "tool_calls": [tool_call],
+            });
+            let mut chunk = self.chunk_json(index, delta, None, None);
+            chunk["usage"] = usage.clone().unwrap_or(Value::Null);
+            events.push(format!("data: {chunk}\n\n"));
+        }
+        if logprobs.is_some() {
+            events.push(self.chunk(index, json!({"reasoning_content": null}), logprobs, usage));
+        }
+        events
+    }
+
+    pub fn stream_end(&mut self) -> Vec<String> {
+        if self.stream.done {
+            return Vec::new();
+        }
         self.stream.done = true;
         let mut events = Vec::new();
         if !self.stream.failed && self.stream.started {
-            for (index, reason) in std::mem::take(&mut self.finish_reasons) {
+            for (index, finish_type, matched_stop) in std::mem::take(&mut self.finish_reasons) {
                 let mut chunk =
                     self.chunk_json(index, json!({"reasoning_content": null}), None, None);
                 let tool_calls = self.has_tool_calls.contains(&index);
-                chunk["choices"][0]["finish_reason"] = match reason["type"].as_str() {
-                    Some("stop") if tool_calls => "tool_calls".into(),
-                    _ => reason["type"].clone(),
+                chunk["choices"][0]["finish_reason"] = if finish_type == "stop" && tool_calls {
+                    "tool_calls".into()
+                } else {
+                    finish_type.into()
                 };
-                chunk["choices"][0]["matched_stop"] =
-                    reason.get("matched").cloned().unwrap_or(Value::Null);
+                chunk["choices"][0]["matched_stop"] = matched_stop;
                 events.push(format!("data: {chunk}\n\n"));
             }
             if self.include_usage {
@@ -1111,16 +1421,19 @@ impl ChatResponder {
     }
 
     /// `_reported_prompt_tokens`.
-    fn report_prompt_tokens(&self, meta: &mut Value) {
-        if self.unreported_prompt_tokens > 0 && meta.is_object() {
-            let prompt = meta_u64(meta, "prompt_tokens");
-            meta["prompt_tokens"] = prompt.saturating_sub(self.unreported_prompt_tokens).into();
-        }
+    fn report_prompt_tokens(&self, meta: &mut GenerateMetaInfo) {
+        meta.prompt_tokens =
+            u64::from(meta.prompt_tokens).saturating_sub(self.unreported_prompt_tokens) as u32;
     }
 
     /// A `ToolCall` as Pydantic dumps it, with `_process_tool_call_id`'s id.
     fn tool_call(&self, index: i64, call: &ToolCallItem) -> Value {
-        let id = match self.tools.as_ref().map(|(parser, _)| parser.as_str()) {
+        let id = match self
+            .parsing
+            .text_parsers()
+            .1
+            .map(|(parser, _)| parser.as_str())
+        {
             Some("kimi_k3") => format!(
                 "{}:{}",
                 call.name,
@@ -1184,34 +1497,32 @@ impl ChatResponder {
     }
 
     /// `_build_token_logprobs_from_raw`.
-    fn token_logprobs(&self, output: &Value, top: &Value) -> Vec<Value> {
-        let top_rows = top.as_array();
+    fn token_logprobs(&self, output: &[LogprobEntry], top: &[NullableTopLogprobs]) -> Vec<Value> {
         let mut out = Vec::new();
-        for (i, triple) in output.as_array().into_iter().flatten().enumerate() {
-            let text = triple[2].as_str().unwrap_or_default();
-            let top_logprobs: Vec<Value> = top_rows
-                .and_then(|rows| rows.get(i))
-                .and_then(Value::as_array)
+        for (i, triple) in output.iter().enumerate() {
+            let text = triple.text.as_deref().unwrap_or_default();
+            let top_logprobs: Vec<Value> = top.get(i).and_then(|row| row.row.as_ref()).map(|row| &row.entries)
                 .into_iter()
                 .flatten()
                 .map(|t| {
-                    let text = t[2].as_str().unwrap_or_default();
-                    json!({"token": text, "bytes": self.token_bytes(&t[1], text), "logprob": t[0]})
+                    let text = t.text.as_deref().unwrap_or_default();
+                    json!({"token": text, "bytes": self.token_bytes(t.token_id, text), "logprob": t.logprob})
                 })
                 .collect();
             out.push(json!({
                 "token": text,
-                "bytes": self.token_bytes(&triple[1], text),
-                "logprob": triple[0],
+                "bytes": self.token_bytes(triple.token_id, text),
+                "logprob": triple.logprob,
                 "top_logprobs": top_logprobs,
             }));
         }
         out
     }
 
-    fn token_bytes(&self, id: &Value, text: &str) -> Vec<u8> {
-        id.as_u64()
-            .and_then(|id| self.tokenizer.as_ref()?.byte_level_bytes(id as u32))
+    fn token_bytes(&self, id: i64, text: &str) -> Vec<u8> {
+        u32::try_from(id)
+            .ok()
+            .and_then(|id| self.tokenizer.as_ref()?.byte_level_bytes(id))
             .unwrap_or_else(|| text.as_bytes().to_vec())
     }
 }
@@ -1219,6 +1530,39 @@ impl ChatResponder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Kimi K3 starts in reasoning unless the merged kwargs turn `thinking` off;
+    /// a parser the port does not cover keeps its own default.
+    #[test]
+    fn chat_model_decides_reasoning_as_python() {
+        let k3 = ChatModel {
+            chat_encoding_spec: Some("kimi_k3".into()),
+            ..ChatModel::default()
+        };
+        assert_eq!(k3.thinking(Some("kimi_k3"), &Map::new()), Some(true));
+        assert_eq!(k3.thinking(Some("deepseek-r1"), &Map::new()), None);
+        assert_eq!(k3.thinking(None, &Map::new()), None);
+        #[cfg(feature = "render")]
+        {
+            let body = json!({"messages": [], "reasoning_effort": "none"});
+            let defaults = HashMap::new();
+            assert_eq!(
+                k3.request_thinking(Some("kimi_k3"), &body, &defaults),
+                Some(false)
+            );
+        }
+
+        // An undetected template falls back to the parser's `reasoning_default`.
+        let custom = ChatModel::default();
+        assert_eq!(custom.thinking(Some("qwen3"), &Map::new()), Some(true));
+        let off = Map::from_iter([("enable_thinking".to_owned(), Value::Bool(false))]);
+        assert_eq!(custom.thinking(Some("qwen3"), &off), Some(false));
+        let dsv4 = ChatModel {
+            chat_encoding_spec: Some("dsv4".into()),
+            ..ChatModel::default()
+        };
+        assert_eq!(dsv4.thinking(Some("deepseek-v4"), &Map::new()), Some(false));
+    }
 
     /// The reason `messages` is not lowered, with a renderer that accepts anything.
     fn unsupported(messages: Value) -> Option<&'static str> {
@@ -1306,13 +1650,16 @@ mod tests {
         let meta = |finish: Value| json!({"id": "r", "finish_reason": finish, "prompt_tokens": 1, "completion_tokens": 1});
         let mut events = Vec::new();
         for frame in [
-            json!({"text": "a", "output_ids": [2], "meta_info": meta(Value::Null)}).to_string(),
-            json!({"text": "a", "output_ids": [2], "meta_info": meta(json!({"type": "stop"}))})
-                .to_string(),
-            "[DONE]".into(),
+            json!({"text": "a", "output_ids": [2], "meta_info": meta(Value::Null)}),
+            json!({"text": "a", "output_ids": [2], "meta_info": meta(json!({"type": "stop"}))}),
         ] {
-            events.extend(responder.stream_data(frame.as_bytes()).unwrap());
+            events.extend(
+                responder
+                    .stream_data(Ok(serde_json::from_value(frame).unwrap()))
+                    .unwrap(),
+            );
         }
+        events.extend(responder.stream_end());
         let created: Vec<Value> = events
             .iter()
             .filter_map(|event| serde_json::from_str::<Value>(event.strip_prefix("data: ")?).ok())

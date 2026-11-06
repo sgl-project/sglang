@@ -9,14 +9,15 @@ use bytes::Bytes;
 use crate::message::detok::DetokMsg;
 use crate::message::ids::Rid;
 use crate::message::response::{
-    ChunkEvent, DISPATCH_TAG_BATCH, DISPATCH_TAG_ERROR, DISPATCH_TAG_RESULT, for_each_chunk,
+    ChunkEvent, DISPATCH_TAG_BATCH, DISPATCH_TAG_ERROR, DISPATCH_TAG_HEALTH_ACK,
+    DISPATCH_TAG_RESULT, for_each_chunk,
 };
 use crate::runtime::Runnable;
 use crate::tokenizer_manager::channel::FromSchedulerRx;
 use crate::tokenizer_manager::wiring::{Senders, recv};
 
-/// A monotonic counter bumped once per from_scheduler frame the dispatcher drains.
-/// Equivalent to the Python `TokenizerManager`'s
+/// A monotonic counter bumped once per decode batch or health acknowledgement
+/// the dispatcher drains. Equivalent to the Python `TokenizerManager`'s
 /// `last_receive_tstamp`: `/health_generate` watches it advance to confirm the
 /// scheduler → detok path is alive (the value itself is meaningless).
 pub type ActivityCounter = Arc<AtomicU64>;
@@ -134,6 +135,11 @@ impl Runnable for Dispatcher {
                     if let Some((rid, msg)) = decode_error(body) {
                         self.route(&rid, msg);
                     }
+                }
+                // A busy scheduler skips health probes and acknowledges them after
+                // its next step, which proves it alive without any batch output.
+                DISPATCH_TAG_HEALTH_ACK => {
+                    self.activity.fetch_add(1, Ordering::Relaxed);
                 }
                 other => tracing::warn!(tag = other, "from_scheduler: unknown frame tag"),
             }

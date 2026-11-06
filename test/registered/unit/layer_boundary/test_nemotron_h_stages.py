@@ -24,11 +24,11 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def layer_stage(pattern, index):
-    from sglang.srt.layers.layer_boundary.construction import BatchVariant
+    from sglang.srt.layers.layer_boundary.contracts import BatchVariant
     from sglang.srt.layers.layer_boundary.factories import _connect_line
 
     previous = utils._declaration(pattern, index - 1) if index else None

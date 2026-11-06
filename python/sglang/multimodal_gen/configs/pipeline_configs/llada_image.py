@@ -11,13 +11,13 @@ from sglang.multimodal_gen.configs.models.dits.llada_image import (
 )
 from sglang.multimodal_gen.configs.models.vaes.flux import Flux2VAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
-    ModelTaskType,
     SpatialImagePipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.flux import (
     _unpatchify_latents,
     flux2_vae_bn_stats,
 )
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 
 
 @dataclass

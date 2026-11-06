@@ -21,6 +21,7 @@ logger = init_logger(__name__)
 if current_platform.is_cuda():
     from sglang.kernels.ops.diffusion import (
         can_use_fused_causal_conv3d_cat_pad_cuda,
+        cat_pad_channels_last_3d,
     )
     from sglang.kernels.ops.diffusion import (
         fused_causal_conv3d_cat_pad as fused_causal_conv3d_cat_pad_triton,
@@ -30,6 +31,7 @@ if current_platform.is_cuda():
     )
 else:
     can_use_fused_causal_conv3d_cat_pad_cuda = None
+    cat_pad_channels_last_3d = None
     fused_causal_conv3d_cat_pad_cuda = None
     fused_causal_conv3d_cat_pad_triton = None
 
@@ -260,12 +262,14 @@ def gather_height_sizes(
     if world_size <= 1:
         return [x.shape[-2]]
     parallel_group = parallel_group or get_decode_parallel_group_coordinator()
-    local_height = torch.tensor([x.shape[-2]], device=x.device, dtype=torch.int64)
+    # heights are host metadata: a device gather would make the host wait for
+    # every kernel queued before it, idling the GPU while it relaunches
+    local_height = torch.tensor([x.shape[-2]], dtype=torch.int64)
     gathered = [torch.empty_like(local_height) for _ in range(world_size)]
     dist.all_gather(
         gathered,
         local_height,
-        group=parallel_group.device_group,
+        group=parallel_group.cpu_group,
     )
     return [int(height.item()) for height in gathered]
 
@@ -399,6 +403,63 @@ def halo_exchange(
         recv_top_buf,
         recv_bottom_buf,
     )
+
+
+def fill_halo_rows_(
+    x: torch.Tensor,
+    height_halo_size: int,
+    recv_top_buf: torch.Tensor | None = None,
+    recv_bottom_buf: torch.Tensor | None = None,
+    parallel_group: GroupCoordinator | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """fill x's zero halo rows with the adjacent ranks' edge rows, in place
+
+    x carries ``height_halo_size`` rows above and below this rank's shard; the
+    global top and bottom halos stay zero, as ``halo_exchange`` pads them
+    """
+    halo = height_halo_size
+    parallel_group = parallel_group or get_decode_parallel_group_coordinator()
+    rank = parallel_group.rank_in_group
+    world_size = parallel_group.world_size
+    group = parallel_group.device_group
+    group_ranks = parallel_group.ranks
+
+    top_rows = x[..., halo : 2 * halo, :]
+    bottom_rows = x[..., -2 * halo : -halo, :]
+    recv_top_buf = _ensure_recv_buf(recv_top_buf, top_rows)
+    recv_bottom_buf = _ensure_recv_buf(recv_bottom_buf, bottom_rows)
+    memory_format = _halo_memory_format(top_rows)
+    p2p_ops = []
+    if rank > 0:
+        prev_rank = group_ranks[rank - 1]
+        p2p_ops.append(dist.P2POp(dist.irecv, recv_top_buf, prev_rank, group))
+        p2p_ops.append(
+            dist.P2POp(
+                dist.isend,
+                top_rows.contiguous(memory_format=memory_format),
+                prev_rank,
+                group,
+            )
+        )
+    if rank < world_size - 1:
+        next_rank = group_ranks[rank + 1]
+        p2p_ops.append(
+            dist.P2POp(
+                dist.isend,
+                bottom_rows.contiguous(memory_format=memory_format),
+                next_rank,
+                group,
+            )
+        )
+        p2p_ops.append(dist.P2POp(dist.irecv, recv_bottom_buf, next_rank, group))
+    if p2p_ops:
+        for req in dist.batch_isend_irecv(p2p_ops):
+            req.wait()
+    if rank > 0:
+        x[..., :halo, :].copy_(recv_top_buf)
+    if rank < world_size - 1:
+        x[..., -halo:, :].copy_(recv_bottom_buf)
+    return recv_top_buf, recv_bottom_buf
 
 
 def _make_boundary_halo(
@@ -677,11 +738,50 @@ class SpatialParallelCausalConv3d(nn.Conv3d):
         self.parallel_group = parallel_group
         self.rank, self.world_size = _parallel_rank_and_world_size(parallel_group)
 
+    def _pads_halo_in_place(self, x, cache_x) -> bool:
+        """whether one pass can build the conv input, halo rows included"""
+        return (
+            cat_pad_channels_last_3d is not None
+            and self.height_halo_size > 0
+            and self._halo_conv_forward is None
+            and _conv3d_weight_is_channels_last_3d(self.weight)
+            and current_platform.is_amp_supported()
+            and not torch.compiler.is_compiling()
+            and (
+                cache_x is None
+                or (cache_x.device == x.device and cache_x.dtype == x.dtype)
+            )
+            and _conv_preserves_local_height(
+                height_halo_size=self.height_halo_size,
+                height_pad_top=self.height_pad_top,
+                height_pad_bottom=self.height_pad_bottom,
+                kernel_height=self.kernel_size[-2],
+                dilation_height=self.dilation[-2],
+                stride_height=self.stride[-2],
+            )
+        )
+
     def forward(self, x, cache_x=None):
         padding = list(self._padding)
         if spatial_parallel_decode_disabled():
             padding[2] = self.height_pad_top
             padding[3] = self.height_pad_bottom
+        elif self._pads_halo_in_place(x, cache_x):
+            # one channels_last pass writes the cache frames, the shard and
+            # zero halo rows; the halos then arrive in place, so the input is
+            # never copied again to concatenate them
+            padding[2] = padding[3] = self.height_halo_size
+            x_padded = cat_pad_channels_last_3d(x, cache_x, padding)
+            if x_padded is not None:
+                self._halo_recv_top_buf, self._halo_recv_bottom_buf = fill_halo_rows_(
+                    x_padded,
+                    self.height_halo_size,
+                    self._halo_recv_top_buf,
+                    self._halo_recv_bottom_buf,
+                    self.parallel_group,
+                )
+                return super().forward(x_padded)
+            padding = list(self._padding)
         x = causal_conv3d_cat_pad(x, cache_x, padding)
         x = x if current_platform.is_amp_supported() else x.to(self.weight.dtype)
 

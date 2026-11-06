@@ -128,7 +128,7 @@ struct TopKKernel {
     auto P = SymbolicSize{"page_table_stride"};
     auto K = SymbolicSize{"topk"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     TensorMatcher({B, -1})  // strided scores
         .with_strides({S, 1})

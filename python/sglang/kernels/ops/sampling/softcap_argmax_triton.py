@@ -17,7 +17,7 @@ def _partial(
     SANITIZE: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    row = tl.program_id(0)
+    row = tl.program_id(0).to(tl.int64)
     chunk = tl.program_id(1)
     col = chunk * BLOCK + tl.arange(0, BLOCK)
     valid = col < N
@@ -71,7 +71,7 @@ def _rank_partial(
     CHUNKS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    row = tl.program_id(0)
+    row = tl.program_id(0).to(tl.int64)
     col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     valid = col < N
     value = tl.load(X + row * STRIDE + col, valid, other=0)
