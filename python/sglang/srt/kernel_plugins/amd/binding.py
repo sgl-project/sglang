@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """SGLang's binding to the monokernel plugins: the AMD ones behind
---enable-amd-monokernel and the MSA one, which --enable-nvidia-megakernel routes
-here. Startup validation and graph-size alignment, then weight observation and
-the full-forward dispatch installed on the model."""
+--enable-amd-monokernel, the Intel XPU ones behind --enable-xpu-monokernel and
+the MSA one, which --enable-nvidia-megakernel routes here. Startup validation and
+graph-size alignment, then weight observation and the full-forward dispatch
+installed on the model."""
 
 from __future__ import annotations
 
@@ -29,6 +30,8 @@ from sglang.kernels.plugin_kernels.amd.spec import (
     spec_registered,
 )
 from sglang.kernels.plugin_kernels.nvidia.spec import FLAG as NVIDIA_FLAG
+from sglang.kernels.plugin_kernels.xpu.spec import BACKEND as XPU_BACKEND
+from sglang.kernels.plugin_kernels.xpu.spec import FLAG as XPU_FLAG
 from sglang.srt.arg_groups.model_override_base import (
     attention_backends_of,
     model_config_of,
@@ -73,6 +76,8 @@ def selected_monokernel(cfg: Any) -> Optional[tuple[str, str]]:
     """The (backend, flag) a monokernel may serve under this configuration."""
     if cfg.enable_amd_monokernel:
         return BACKEND, FLAG
+    if getattr(cfg, "enable_xpu_monokernel", False):
+        return XPU_BACKEND, XPU_FLAG
     if cfg.enable_nvidia_megakernel:
         return MSA_BACKEND, NVIDIA_FLAG
     return None
@@ -89,8 +94,26 @@ def deadline_s(watchdog_timeout: Optional[float]) -> float:
     return min(MAX_DEADLINE_S, 0.5 * float(watchdog_timeout))
 
 
+def _device_module():
+    """The torch module of this server's accelerator: torch.xpu on Intel GPUs,
+    else torch.cuda (CUDA and ROCm)."""
+    if not torch.cuda.is_available() and hasattr(torch, "xpu") and torch.xpu.is_available():
+        return torch.xpu
+    return torch.cuda
+
+
+def _compute_units(props: Any) -> int:
+    """SMs / CUs of a CUDA or ROCm GPU, Xe cores of an Intel GPU."""
+    count = getattr(props, "multi_processor_count", None)
+    return count if count is not None else props.gpu_subslice_count
+
+
 def device_isa() -> Optional[str]:
     """Return the GPU ISA without feature suffixes, or None without a GPU."""
+    if _device_module() is torch.xpu:
+        # SYCL architecture: IP version major in bits 30.., e.g. 20 (Xe2)
+        arch = torch.xpu.get_device_properties(torch.xpu.current_device()).architecture
+        return f"xe{(arch >> 30) // 10}"
     if not torch.cuda.is_available():
         return None
     props = torch.cuda.get_device_properties(torch.cuda.current_device())
@@ -233,6 +256,9 @@ def handle_monokernel(server_args: ServerArgs) -> None:
     if selected is None:
         return
     backend, flag = selected
+    if cfg.enable_amd_monokernel and getattr(cfg, "enable_xpu_monokernel", False):
+        # both replace the model's forward
+        raise ValueError(f"{XPU_FLAG}: --enable-amd-monokernel is also set; use one of the two")
     model_config = model_config_of(server_args)
     if backend == MSA_BACKEND and not msa_serves(model_config.hf_config.architectures):
         return  # sgl-nvidia-mega serves this model
@@ -410,10 +436,11 @@ def install_monokernel_forward(
             f"{spec.name} keeps weight copies at load, and this load path does not "
             "pass checkpoint tensors through monokernel_weights_iterator"
         )
-    props = torch.cuda.get_device_properties(torch.cuda.current_device())
-    if props.multi_processor_count < spec.devices[isa].resident_blocks:
+    device = _device_module()
+    units = _compute_units(device.get_device_properties(device.current_device()))
+    if units < spec.devices[isa].resident_blocks:
         reasons.append(
-            f"{Feature.PARTITIONED_GPU.value}: {props.multi_processor_count} compute "
+            f"{Feature.PARTITIONED_GPU.value}: {units} compute "
             f"units, the launch grid needs {spec.devices[isa].resident_blocks}"
         )
     # Collect validation failures before the plugin starts collective setup.
@@ -451,7 +478,7 @@ def install_monokernel_forward(
         deadline_s=deadline_s(get_device().watchdog_timeout),
         copies=copies,
     )
-    build_start, memory_before = time.perf_counter(), torch.cuda.memory_allocated()
+    build_start, memory_before = time.perf_counter(), device.memory_allocated()
     built = spec.build(model, hf_config, build_context)
     _install_forward(model=model, built=built, served=served, spec=spec)
     # Captured kernels retain weight copies that online updates cannot refresh.
@@ -466,7 +493,7 @@ def install_monokernel_forward(
         isa,
         list(widths),
         time.perf_counter() - build_start,
-        (torch.cuda.memory_allocated() - memory_before) / 2**20,
+        (device.memory_allocated() - memory_before) / 2**20,
         build_context.deadline_s,
         _format_weight_copies(copies),
     )
@@ -501,7 +528,7 @@ class _CaptureCheck:
         forward_batch: ForwardBatch,
         num_tokens: int,
     ) -> None:
-        if self.is_done or not torch.cuda.is_current_stream_capturing():
+        if self.is_done or not _device_module().is_current_stream_capturing():
             return  # the runner's warmup runs, and any recapture
         self.captured[int(forward_batch.batch_size)] = shape_key(forward_batch)
         if not set(runner.capture_bs) <= set(self.captured):
