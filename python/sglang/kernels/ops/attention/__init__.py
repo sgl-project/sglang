@@ -58,6 +58,7 @@ _TRITON_KERNELS = [
     ("kv_indices", "get_num_page_per_block_flashmla"),
     ("trtllm_mha_page_table", "build_trtllm_mha_page_table"),
     ("trtllm_mha_graph_metadata", "update_trtllm_mha_graph_metadata"),
+    ("trtllm_mha_graph_metadata", "update_draft_step_seqlens"),
     ("aiter_unified_page_table", "scatter_ragged_to_page_table_kernel"),
     ("aiter_unified_page_table", "scatter_req_to_token_to_page_table_kernel"),
     ("fused_qk_rope_reshape_and_cache", "fused_qk_rope_reshape_and_cache"),
@@ -530,7 +531,6 @@ for _mod, _fn, _backend in [
         )
     )
 del _mod, _fn, _backend
-# Its PDL probe reads the device major only, which also enables PDL on ROCm gfx9.
 register_kernel(
     KernelSpec(
         op="attention.dash_sparse_attn_decode",
