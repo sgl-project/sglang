@@ -26,6 +26,7 @@ _SM90 = PlatformInfo(device_type="cuda", cuda_arch_major=9, cuda_arch_minor=0)
 _SM100 = PlatformInfo(device_type="cuda", cuda_arch_major=10, cuda_arch_minor=0)
 _HIP = PlatformInfo(device_type="hip")
 _MUSA = PlatformInfo(device_type="musa")
+_XPU = PlatformInfo(device_type="xpu")
 
 
 def test_single_backend_resolves_without_backend():
@@ -126,6 +127,13 @@ def test_activation_default_backend(monkeypatch, device, expect):
         (Cap.MUSA, _HIP, False),
         (Cap.CUDA, _MUSA, False),
         (Cap.HIP, _MUSA, False),
+        (Cap.XPU, _XPU, True),
+        (Cap.XPU, _CPU, False),
+        (Cap.XPU, _SM90, False),
+        (Cap.XPU, _HIP, False),
+        (Cap.CUDA, _XPU, False),
+        (Cap.HIP, _XPU, False),
+        (Cap(device=DeviceType.CPU), _XPU, False),
         (Cap.cuda(min_sm=(10, 0)), _SM90, False),
         (Cap.cuda(min_sm=(10, 0)), _SM100, True),
         (Cap.cuda(max_sm=(9, 0)), _SM100, False),
