@@ -3,6 +3,7 @@ import unittest
 import torch
 
 from sglang.multimodal_gen.runtime.models.dits.zimage import ZImageTransformer2DModel
+from sglang.multimodal_gen.runtime.platforms import current_platform
 
 
 class _RopeCacheHost(torch.nn.Module):
@@ -29,7 +30,10 @@ def _expected_cache(table):
     return torch.cat([table[0].float(), table[1].float()], dim=-1)
 
 
-@unittest.skipUnless(torch.cuda.is_available(), "the RoPE caches are CUDA-only")
+@unittest.skipUnless(
+    torch.cuda.is_available() and current_platform.is_cuda(),
+    "the RoPE caches are CUDA-only",
+)
 class TestZImageRopeCache(unittest.TestCase):
     def test_new_table_at_a_freed_address_is_not_served_stale(self):
         # the server warmup's table is freed and the next request of the same

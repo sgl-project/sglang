@@ -25,11 +25,12 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
     DSparkScheduleConfig,
 )
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels import dspark as dspark_kernels
-from sglang.test.test_utils import CustomTestCase, get_device
+from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=14, stage="base-b", runner_config="1-gpu-small")
 
 DEVICE = get_device()
 VOCAB = 129280
@@ -326,6 +327,18 @@ def _case_expand_prefill_causally(tc):
         extend_seq_lens=torch.full((bs2,), block, device=DEVICE),
         extend_start_loc=None,
         seq_lens_cpu=[int(x) for x in seq_lens[:bs2].tolist()],
+        extend_seq_lens_cpu=[block] * bs2,
+        num_tokens=bs2 * block,
+        padded_num_tokens=None,
+    )
+    # Device lengths only: the DSpark draft block without host lens.
+    tc._parity(
+        attn_metadata_kernels.ExpandPrefillCausally,
+        req_pool_indices=req_pool_indices[:bs2],
+        seq_lens=seq_lens[:bs2],
+        extend_seq_lens=torch.full((bs2,), block, device=DEVICE),
+        extend_start_loc=None,
+        seq_lens_cpu=None,
         extend_seq_lens_cpu=[block] * bs2,
         num_tokens=bs2 * block,
         padded_num_tokens=None,

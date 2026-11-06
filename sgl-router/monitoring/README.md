@@ -42,6 +42,8 @@ Families the router emits. The dashboard graphs all of them except the
 | `sgl_router_kv_event_batches_lost_total` | Counter | KV-event batches dropped in transit, from gaps in each publisher's sequence |
 | `sgl_router_kv_event_replays_total` | Counter | Sequence gaps sent to the engine's replay socket, by `outcome` (`repaired`, `incomplete`, `failed`) |
 | `sgl_router_cache_pending_prefix_hits_total` | Counter | Prefix lookups where a prompt routed within `--cache-pending-prefix-ttl-ms` matched deeper than any confirmed prefix |
+| `sgl_router_cache_pending_prefix_followed_total` | Counter | Requests routed to a worker because of its pending stake |
+| `sgl_router_cache_pending_prefix_capped_total` | Counter | Prefix lookups that `--cache-pending-prefix-max-followers` left without a pending candidate |
 | `sgl_router_kv_tree_accounting_errors_total` | Counter | Occupancy-bookkeeping contradictions, by `reason`. Always 0 on a correct tree |
 | `sgl_router_kv_tree_maintained` | Gauge | 1 when this router maintains its own KV tree, 0 under an external Indexer |
 | `sgl_router_kv_bootstrap_peers` | Gauge | Ready sibling router replicas peer bootstrap could pull a tree snapshot from. Emitted only with `--kv-peer-selector` |

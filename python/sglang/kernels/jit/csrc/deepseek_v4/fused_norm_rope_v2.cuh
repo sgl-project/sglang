@@ -787,7 +787,7 @@ struct FusedNormRopeKernel {
 
     auto N = SymbolicSize{"num_tokens"};
     auto device_ = SymbolicDevice{};
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLGPU>();
 
     TensorMatcher({N, kHeadDim}).with_dtype<DType>().with_device(device_).verify(input);
     TensorMatcher({kHeadDim}).with_dtype<DType>().with_device(device_).verify(weight);

@@ -1,5 +1,6 @@
 import asyncio
 import os
+import traceback
 from concurrent.futures.process import BrokenProcessPool
 from typing import Dict, List, Optional, Union
 
@@ -10,11 +11,7 @@ from transformers.models.auto.processing_auto import (
 )
 
 import sglang.srt.managers.multimodal_processor as sgl_mm_processor_utils
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalProcessorOutput,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.models.llava import (
     LlavaForConditionalGeneration,
     LlavaLlamaForCausalLM,
@@ -23,20 +20,20 @@ from sglang.srt.models.llava import (
 )
 from sglang.srt.models.llavavid import LlavaVidForCausalLM
 from sglang.srt.models.mistral import Mistral3ForConditionalGeneration
+from sglang.srt.multimodal.media_io import (
+    CLIENT_MEDIA_EXCEPTIONS,
+    ImageData,
+    get_image_bytes,
+    load_image,
+)
 from sglang.srt.multimodal.mm_utils import (
     ensure_numpy,
     expand2square,
     process_anyres_image,
 )
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
-from sglang.srt.utils import (
-    CLIENT_MEDIA_EXCEPTIONS,
-    ImageData,
-    get_image_bytes,
-    load_image,
-    logger,
-)
-from sglang.utils import get_exception_traceback
+from sglang.srt.utils import logger
 
 
 class LlavaImageProcessor(BaseMultimodalProcessor):
@@ -103,7 +100,7 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
         except CLIENT_MEDIA_EXCEPTIONS as error:
             raise ValueError(f"Error while processing image: {error}") from error
         except Exception:
-            logger.error("Exception in TokenizerManager:\n" + get_exception_traceback())
+            logger.error("Exception in TokenizerManager:\n" + traceback.format_exc())
             raise
 
     async def _fetch_remote_image_bytes(self, url):
@@ -329,3 +326,15 @@ class LlavaMultimodalProcessor(BaseMultimodalProcessor):
 
     async def process_mm_data_async(self, *args, **kwargs):
         return await self.inner.process_mm_data_async(*args, **kwargs)
+
+    def finalize_cache_identities(self, output: MultimodalProcessorOutput) -> None:
+        self.inner.finalize_cache_identities(output)
+
+    def preprocess_fingerprint_payload(self):
+        return self.inner.preprocess_fingerprint_payload()
+
+    def clear_preprocess_cache(self) -> None:
+        self.inner.clear_preprocess_cache()
+
+    def shutdown(self) -> None:
+        self.inner.shutdown()

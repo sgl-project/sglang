@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -6,10 +7,17 @@ import torch
 from sglang.srt.disaggregation.utils import get_kv_transfer_buf_infos
 from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
 from sglang.srt.mem_cache.pool_host.mha import HiSparseMHATokenToKVPoolHost
+from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+def _static_storage(pool) -> StaticKVStorage:
+    """The storage a static pool registers with PD peers through."""
+    allocator = SimpleNamespace(storage=None, state=None, get_kvcache=lambda: pool)
+    return StaticKVStorage(None, allocator)
 
 
 def _make_k_only_pool(
@@ -82,7 +90,8 @@ class TestMiniMaxSparsePoolPD(CustomTestCase):
             try:
                 self.assertEqual((host.start_layer, host.end_layer), (7, 11))
                 self.assertEqual(host.size, 36)
-                ptrs, lens, item_lens = get_kv_transfer_buf_infos(host)
+                # A HiSparse decode peer registers its host pool as the KV entries.
+                ptrs, lens, item_lens = host.get_contiguous_buf_infos()
                 buffers = list(host.k_buffer.unbind()) + list(host.v_buffer.unbind())
                 self.assertEqual(len(buffers), 8)
                 self.assertEqual(ptrs, [buffer.data_ptr() for buffer in buffers])
@@ -98,7 +107,7 @@ class TestMiniMaxSparsePoolPD(CustomTestCase):
         for hisparse in (False, True):
             pool = _make_k_only_pool(enable_hisparse=hisparse)
             for layers, infos in (
-                (range(3, 7), get_kv_transfer_buf_infos(pool)),
+                (range(3, 7), get_kv_transfer_buf_infos(_static_storage(pool))),
                 (range(3), pool.get_dense_kv_state_buf_infos()),
             ):
                 with self.subTest(hisparse=hisparse, layers=layers):

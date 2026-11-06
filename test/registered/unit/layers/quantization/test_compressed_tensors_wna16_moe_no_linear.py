@@ -16,7 +16,7 @@ from sglang.srt.runtime_context import override_platform
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 _WNA16_MOE_SCHEMES = (CompressedTensorsWNA16MoE, CompressedTensorsWNA16TritonMoE)
 EXPERTS_LAYER = "model.layers.0.mlp.experts"
@@ -181,6 +181,39 @@ class TestWNA16MoENoLinearGroup(CustomTestCase):
 
         self.assertIsInstance(scheme, CompressedTensorsWNA16MoE)
         self.assertNotIsInstance(scheme, CompressedTensorsWNA16TritonMoE)
+
+    def test_asymmetric_group_actorder_loads_full_w2_zero_points(self):
+        quant_config = CompressedTensorsConfig.from_config(
+            _make_wna16_moe_config(
+                ["re:.*mlp.experts.*"],
+                num_bits=4,
+                symmetric=False,
+                actorder="group",
+            )
+        )
+        with mock.patch.object(
+            compressed_tensors,
+            "get_moe_runner_backend",
+            return_value=MoeRunnerBackend.MARLIN,
+        ):
+            scheme = quant_config.get_moe_scheme(
+                torch.nn.Module(), layer_name=EXPERTS_LAYER
+            )
+
+        layer = torch.nn.Module()
+        layer.moe_tp_size = 2
+        scheme.create_weights(
+            layer=layer,
+            num_experts=2,
+            hidden_size=256,
+            intermediate_size_per_partition=128,
+            params_dtype=torch.float16,
+        )
+
+        self.assertEqual(layer.w2_weight_scale.shape, (2, 2, 256))
+        self.assertEqual(layer.w2_weight_zero_point.shape, (2, 2, 32))
+        self.assertTrue(layer.w2_weight_scale.load_full_w2)
+        self.assertTrue(layer.w2_weight_zero_point.load_full_w2)
 
 
 if __name__ == "__main__":

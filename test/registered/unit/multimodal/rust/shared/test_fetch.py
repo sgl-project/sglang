@@ -2,7 +2,7 @@
 
 Covers ``fetch_bytes`` in ``rust/sglang-mm/src/common/fetch.rs`` (via the
 ``_core.common.fetch_bytes`` binding), against the Python reference
-``sglang.srt.utils.common.get_image_bytes``.
+``sglang.srt.multimodal.media_io.get_image_bytes``.
 """
 
 import base64
@@ -13,14 +13,14 @@ import threading
 import unittest
 from pathlib import Path
 
-from sglang.srt.utils.common import get_image_bytes
+from sglang.srt.multimodal.media_io import get_image_bytes
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from _mm_rust_utils import load_core  # noqa: E402
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 CORE = load_core()
 FETCH = CORE and CORE.common.fetch_bytes

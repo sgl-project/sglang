@@ -8,6 +8,8 @@
 #pragma once
 #include <sgl_kernel/type.cuh>
 
+#include <cstdint>
+
 namespace sglang {
 
 namespace device::math {
@@ -110,6 +112,48 @@ SGL_DEVICE float fma_f32_bf16(bf16_t a, bf16_t b, float acc) {
 // overload above (the bf16 -> f32 convert is exact).
 SGL_DEVICE float fma_f32_bf16(bf16_t a, float b, float acc) {
   return fmaf(cast<fp32_t>(a), b, acc);
+}
+
+// Packed fp32x2 arithmetic (one FFMA2 / FMUL2 / FADD2 on SM100+, round to nearest). The fallback is bit-identical:
+// `__fmul_rn` / `__fadd_rn` keep the compiler from contracting the result into a neighbouring FMA.
+SGL_DEVICE float2 fma_f32x2(float2 a, float2 b, float2 c) {
+#if SGL_ARCH_BLACKWELL_OR_GREATER
+  float2 d;
+  const auto a_bits = reinterpret_cast<const uint64_t&>(a);
+  const auto b_bits = reinterpret_cast<const uint64_t&>(b);
+  const auto c_bits = reinterpret_cast<const uint64_t&>(c);
+  auto& d_bits = reinterpret_cast<uint64_t&>(d);
+  asm("fma.rn.f32x2 %0, %1, %2, %3;" : "=l"(d_bits) : "l"(a_bits), "l"(b_bits), "l"(c_bits));
+  return d;
+#else
+  return make_float2(fmaf(a.x, b.x, c.x), fmaf(a.y, b.y, c.y));
+#endif
+}
+
+SGL_DEVICE float2 mul_f32x2(float2 a, float2 b) {
+#if SGL_ARCH_BLACKWELL_OR_GREATER
+  float2 d;
+  const auto a_bits = reinterpret_cast<const uint64_t&>(a);
+  const auto b_bits = reinterpret_cast<const uint64_t&>(b);
+  auto& d_bits = reinterpret_cast<uint64_t&>(d);
+  asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(d_bits) : "l"(a_bits), "l"(b_bits));
+  return d;
+#else
+  return make_float2(__fmul_rn(a.x, b.x), __fmul_rn(a.y, b.y));
+#endif
+}
+
+SGL_DEVICE float2 add_f32x2(float2 a, float2 b) {
+#if SGL_ARCH_BLACKWELL_OR_GREATER
+  float2 d;
+  const auto a_bits = reinterpret_cast<const uint64_t&>(a);
+  const auto b_bits = reinterpret_cast<const uint64_t&>(b);
+  auto& d_bits = reinterpret_cast<uint64_t&>(d);
+  asm("add.rn.f32x2 %0, %1, %2;" : "=l"(d_bits) : "l"(a_bits), "l"(b_bits));
+  return d;
+#else
+  return make_float2(__fadd_rn(a.x, b.x), __fadd_rn(a.y, b.y));
+#endif
 }
 
 /**

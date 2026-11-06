@@ -1,0 +1,22 @@
+{"name": "tree_joint_reclaim", "chain": "swa", "page_size": 16, "lazy": true, "ops": [
+  {"op": "extend", "req": 0, "n": 96},
+  {"op": "extend", "req": 1, "n": 96},
+  {"op": "extend", "req": 2, "n": 96},
+  {"op": "extend", "req": 3, "n": 96},
+  {"op": "extend", "req": 4, "n": 96},
+  {"op": "extend", "req": 5, "n": 96},
+  {"op": "extend", "req": 6, "n": 96},
+  {"op": "extend", "req": 7, "n": 96},
+  {"op": "extend", "req": 8, "n": 96},
+  {"op": "extend", "req": 9, "n": 96},
+  {"op": "cache", "req": 0},
+  {"op": "cache", "req": 1},
+  {"op": "cache", "req": 2},
+  {"op": "cache", "req": 3},
+  {"op": "cache", "req": 4},
+  {"op": "cache", "req": 5},
+  {"op": "evict", "n": 128},
+  {"op": "extend", "req": 20, "n": 160},
+  {"op": "evict", "n": 320},
+  {"op": "extend", "req": 21, "n": 256}
+]}

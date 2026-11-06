@@ -9,14 +9,20 @@ from unittest import mock
 import torch
 
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.unified_cache.components.base import (
-    ComponentData,
-    ComponentType,
-)
-from sglang.srt.mem_cache.unified_radix_cache import COMPONENT_REGISTRY, UnifiedTreeNode
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.mem_cache.unified_cache.components.base import ComponentData
+from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeNode
+from sglang.srt.mem_cache.unified_radix_cache import COMPONENT_REGISTRY
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.tree_slots import FAMILY_OF
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+# The component ids whose family has a default component class.
+_REGISTERED_COMPONENTS = tuple(
+    ct for ct, family in FAMILY_OF.items() if family in COMPONENT_REGISTRY
+)
 
 
 class TestComponentSplitFieldCoverage(unittest.TestCase):
@@ -79,7 +85,7 @@ class TestComponentSplitFieldCoverage(unittest.TestCase):
     def test_policy_covers_every_component_and_field(self):
         self.assertEqual(
             set(self.SPLIT_POLICY),
-            set(COMPONENT_REGISTRY),
+            set(_REGISTERED_COMPONENTS),
             "a component in COMPONENT_REGISTRY has no split policy: decide what "
             "its split does with each ComponentData field and record it here",
         )
@@ -110,11 +116,11 @@ class TestComponentSplitFieldCoverage(unittest.TestCase):
 
     def _split(self, component_type):
         """Run the real hook over a fresh parent/child pair."""
-        component = object.__new__(COMPONENT_REGISTRY[component_type])
+        component = object.__new__(COMPONENT_REGISTRY[FAMILY_OF[component_type]])
         # The hooks only reach the tree core for the host LRU, and the marked
         # child keeps both halves out of it (device value present, host lock held).
         component.tree_core = mock.Mock(
-            host_lru_lists={ct: mock.Mock() for ct in COMPONENT_REGISTRY}
+            host_lru_lists={ct: mock.Mock() for ct in _REGISTERED_COMPONENTS}
         )
         component.cache = SimpleNamespace(tree_core=component.tree_core)
         child = self._marked_child(component_type)

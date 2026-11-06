@@ -291,6 +291,20 @@ These techniques can change the denoising path, numerical representation, or gen
 6. Profile if the bottleneck is unclear.
 7. Add `quality=high`, caching, progressive resolution, or quantization only after comparing output quality against your acceptance target.
 
+## Python garbage collection
+
+Workers collect startup garbage after loading and again after the final warmup,
+including compile prewarms. Automatic cyclic GC is deferred during model forward
+and output materialization/reply, then restored with its original thresholds.
+Reference counting and explicit, memory-critical collections still work;
+model objects are not frozen and CUDA allocator caches are not flushed by GC.
+
+With `--async-output-save`, continuous forward/save overlap is drained at a request
+boundary after 30 seconds without a GC opportunity. This bounds deferral, not an
+individual request's duration. Cyclic garbage can remain alive until execution
+finishes, so benchmark sustained traffic and host/device memory as well as P99
+latency. GC may still run between protected regions or through an explicit call.
+
 ## Per-model tuning starting points
 
 Warmup and breakable CUDA graph (BCG) solve different problems. `--warmup-mode request` runs a warmup copy derived from the first request to prime one-time compilation and caches; it does not remove recurring Python launches from each denoising step. BCG captures supported DiT segments and can reduce that recurring launch overhead for captured shapes. Use the table below as a first experiment, then keep a lever only when profiling confirms that it addresses the active bottleneck.

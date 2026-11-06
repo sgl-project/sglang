@@ -12,6 +12,7 @@ from diffusers.models.embeddings import PixArtAlphaTextProjection
 from sglang.kernels.ops.diffusion import (
     SANA_VIDEO_LINEAR_ATTENTION,
     BitExactFusionGate,
+    fused_depthwise_conv3x3_bias_glu,
     fused_interleaved_rope_fp64,
     tensors_equal,
     try_sana_video_linear_attention,
@@ -41,6 +42,9 @@ _is_cuda = current_platform.is_cuda()
 logger = init_logger(__name__)
 
 _SANA_VIDEO_ROPE = BitExactFusionGate("SANA-Video fused RoPE")
+_SANA_VIDEO_DEPTHWISE_GLU = BitExactFusionGate(
+    "SANA-Video fused depthwise GLU", per_signature=True
+)
 
 
 def apply_interleaved_rotary_emb(
@@ -189,6 +193,50 @@ class GLUMBTempConv(nn.Module):
             bias=False,
         )
 
+    def _depthwise_glu(self, x: torch.Tensor) -> torch.Tensor:
+        conv = self.conv_depth
+
+        def reference():
+            return sana_conv_bias_glu(conv, x, allow_eager=True)
+
+        if (
+            torch.compiler.is_compiling()
+            or not _is_cuda
+            or not x.is_cuda
+            or torch.is_grad_enabled()
+            or x.dtype is not torch.bfloat16
+            or x.ndim != 4
+            or x.numel() < 2**24
+            or not x.is_contiguous(memory_format=torch.channels_last)
+            or torch.cuda.get_device_capability(x.device) != (12, 0)
+            or not torch.backends.cudnn.enabled
+            or type(conv) is not nn.Conv2d
+            or conv.kernel_size != (3, 3)
+            or conv.stride != (1, 1)
+            or conv.padding != (1, 1)
+            or conv.dilation != (1, 1)
+            or conv.groups != x.shape[1]
+            or conv.padding_mode != "zeros"
+            or conv.bias is None
+        ):
+            return reference()
+        sig = (
+            x.shape,
+            x.stride(),
+            x.device,
+            conv.weight.stride(),
+            torch.backends.cudnn.benchmark,
+            torch.backends.cudnn.deterministic,
+            torch.backends.cudnn.allow_tf32,
+            torch.are_deterministic_algorithms_enabled(),
+        )
+        return _SANA_VIDEO_DEPTHWISE_GLU.run(
+            lambda: fused_depthwise_conv3x3_bias_glu(x, conv.weight, conv.bias),
+            reference,
+            sig=sig,
+            logger=logger,
+        )
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, num_frames, height, width, channels = hidden_states.shape
         hidden_states = hidden_states.reshape(
@@ -199,9 +247,7 @@ class GLUMBTempConv(nn.Module):
         hidden_states = sana_conv_bias_silu(
             self.conv_inverted, hidden_states, allow_eager=True
         )
-        hidden_states = sana_conv_bias_glu(
-            self.conv_depth, hidden_states, allow_eager=True
-        )
+        hidden_states = self._depthwise_glu(hidden_states)
         hidden_states = self.conv_point(hidden_states)
 
         temporal = hidden_states.reshape(

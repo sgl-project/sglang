@@ -47,6 +47,7 @@ from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
     can_use_fp8_rowwise,
     can_use_fused_inplace_qknorm_rope,
+    can_use_fused_packed_swiglu_fp8_rowwise,
     fp8_rowwise,
     fused_inplace_qknorm_rope,
     fused_packed_silu_mul_bitexact,
@@ -331,21 +332,10 @@ class Flux3Fp8RowwiseLinear(nn.Module):
     def forward_swiglu(self, packed: torch.Tensor):
         """Fuse packed BF16 SwiGLU with this layer's activation quantization."""
         if not (
-            packed.is_cuda
-            and torch.version.hip is None
-            and packed.dtype == torch.bfloat16
-            and packed.ndim == 3
+            self.weight.dtype == torch.float8_e4m3fn
             and packed.shape[-1] == 2 * self.in_features
-            and 0 < self.in_features <= 16384
-            and packed.stride(-1) == 1
-            and packed.stride(1) >= packed.shape[-1]
-            and (
-                packed.shape[0] <= 1
-                or packed.stride(0) == packed.shape[1] * packed.stride(1)
-            )
-            and self.weight.dtype == torch.float8_e4m3fn
-            and torch.cuda.get_device_capability(packed.device) >= (8, 9)
             and not torch.compiler.is_compiling()
+            and can_use_fused_packed_swiglu_fp8_rowwise(packed)
         ):
             return self(_swiglu(packed))
         activation, activation_scale = fused_packed_swiglu_fp8_rowwise(

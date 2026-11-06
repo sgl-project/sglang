@@ -178,7 +178,7 @@ def generate_draft_decode_kv_indices(
     sink_size: tl.constexpr = 0,
     NUM_STEPS: tl.constexpr = 0,
     ENTRY_PAGE_SIZE: tl.constexpr = 1,
-    # The source's page table (`KVIndexTable.v2p`), applied with TRANSLATE.
+    # The source's page table (`ReadTable.v2p`), applied with TRANSLATE.
     v2p=None,
     TRANSLATE: tl.constexpr = False,
 ):
@@ -328,7 +328,7 @@ def generate_draft_decode_window_kv_indices(
     page_size: tl.constexpr,
     window: tl.constexpr,
     ENTRY_PAGE_SIZE: tl.constexpr = 1,
-    # The source's sliding-window page table (`KVIndexTable.v2p`).
+    # The source's sliding-window page table (`ReadTable.v2p`).
     v2p=None,
     TRANSLATE: tl.constexpr = False,
 ):

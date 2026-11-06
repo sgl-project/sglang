@@ -33,8 +33,10 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_loading_or
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentResidencyManager,
-    ComponentResidencyStrategy,
     get_global_component_residency_manager,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_strategies import (
+    ComponentResidencyStrategy,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.comfyui_mode import (
     COMFYUI_REQUIRED_MODULES,
@@ -69,6 +71,7 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     verify_model_config_and_directory,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.model_overlay import is_model_overlay
 
 logger = init_logger(__name__)
 
@@ -219,11 +222,19 @@ class ComposedPipelineBase(ABC):
                 raise ValueError(
                     f"model_subfolder must stay inside the model repository: {model_subfolder!r}"
                 )
-            model_root = maybe_download_model(
-                self.model_path,
-                allow_patterns=[f"{model_subfolder}/**"],
-                revision=self.server_args.revision,
-            )
+            if is_model_overlay(self.model_path):
+                # an overlay materializes every partition under one root
+                model_root = maybe_download_model(
+                    self.model_path,
+                    force_diffusers_model=True,
+                    revision=self.server_args.revision,
+                )
+            else:
+                model_root = maybe_download_model(
+                    self.model_path,
+                    allow_patterns=[f"{model_subfolder}/**"],
+                    revision=self.server_args.revision,
+                )
             model_path = os.path.join(model_root, model_subfolder)
 
         self.model_path = model_path

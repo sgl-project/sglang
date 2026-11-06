@@ -55,7 +55,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import msgspec
 
-from sglang.kernels.jit.utils.arch import get_jit_cuda_arch
+from sglang.kernels.jit.utils.arch import get_compile_arch
 from sglang.kernels.jit.utils.common import (
     cache_once,
     is_hip_runtime,
@@ -225,7 +225,7 @@ def _target_tag() -> str:
         return f"sail_{safe}"
     if is_hip_runtime():
         return toolchain.gpu_arch_name().split(":")[0] or "unknown"
-    arch = get_jit_cuda_arch()
+    arch = get_compile_arch()
     prefix = "mp" if is_musa_runtime() else "sm"
     return f"{prefix}{arch.major}{arch.minor}{arch.suffix}"
 
@@ -251,7 +251,7 @@ def _environment_fingerprint() -> str:
     elif is_hip_runtime():
         target = f"hip:{toolchain.gpu_arch_name()}"
     else:
-        arch = get_jit_cuda_arch()
+        arch = get_compile_arch()
         target = f"{'musa' if is_musa_runtime() else 'cuda'}:{arch.target_name}"
 
     compilers = []

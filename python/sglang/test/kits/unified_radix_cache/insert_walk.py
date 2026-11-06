@@ -1,10 +1,8 @@
 from array import array
 from types import SimpleNamespace
 
-from sglang.srt.managers.schedule_batch import (
-    FINISH_LENGTH,
-    Req,
-)
+from sglang.srt.managers.req_types import FINISH_LENGTH
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     InsertParams,
@@ -12,9 +10,8 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     TreeLock,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.unified_cache.components.base import (
-    ComponentType,
-)
+from sglang.srt.mem_cache.static_kv_storage import acquire_rows
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.kits.unified_radix_cache.fixtures import (
     build_fixture,
@@ -258,7 +255,7 @@ class StreamingSessionLockLifecycleFixtures:
     def _admitted_turn(self, cache, allocator, pool, tokens, session):
         """A first turn with its own row and the root lock admission took."""
         req = self._turn(tokens, session)
-        pool.alloc([req])
+        acquire_rows(pool, pool.state, [req])
         pool.write(
             (req.kv.req_pool_idx, slice(0, len(tokens))),
             allocator.alloc(len(tokens)),

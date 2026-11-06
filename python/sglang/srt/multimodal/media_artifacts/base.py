@@ -32,7 +32,6 @@ import numpy as np
 import torch
 from PIL import Image
 
-from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.multimodal.cache import (
     CacheLookup,
     CacheMiss,
@@ -42,7 +41,8 @@ from sglang.srt.multimodal.cache import (
     parse_content_hash,
     snapshot_media,
 )
-from sglang.srt.utils import load_image
+from sglang.srt.multimodal.media_io import load_image
+from sglang.srt.multimodal.modality import Modality
 
 
 @runtime_checkable
@@ -51,8 +51,8 @@ class MediaArtifact(Protocol):
 
     ``content_digest`` identifies the media contents. ``artifact_key`` also
     includes every preprocessing choice that can change the artifact.
-    ``feature_hash`` becomes ``MultimodalDataItem.hash`` and identifies the
-    corresponding encoder embedding.
+    ``feature_hash`` carries a full-width server-computed fingerprint, not a
+    caller-provided hint or a truncated embedding-cache key.
     """
 
     content_digest: str

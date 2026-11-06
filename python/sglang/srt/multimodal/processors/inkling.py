@@ -30,17 +30,18 @@ from typing import Any, Dict, List, Optional, Tuple, Type, Union
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalProcessorOutput,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.models.inkling import InklingForConditionalGeneration
 from sglang.srt.multimodal.inkling import (
     InklingAudioFeatureExtractor,
     InklingImageProcessor,
     InklingProcessor,
 )
+from sglang.srt.multimodal.media_io import (
+    CLIENT_MEDIA_EXCEPTIONS,
+    download_remote_media,
+)
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
@@ -52,7 +53,6 @@ from sglang.srt.parser.inkling_tokenizer import IMAGE_TOKEN_ID as INKLING_IMAGE_
 from sglang.srt.parser.inkling_tokenizer import (
     INKLING_SPECIAL_TOKEN_IDS,
 )
-from sglang.srt.utils.common import CLIENT_MEDIA_EXCEPTIONS, download_remote_media
 
 logger = logging.getLogger(__name__)
 

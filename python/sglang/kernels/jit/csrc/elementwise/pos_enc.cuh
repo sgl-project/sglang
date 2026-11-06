@@ -381,7 +381,7 @@ struct BF16RopeScaleStoreKernel {
     auto value_stride = SymbolicSize{"value_stride"};
     auto device = SymbolicDevice{};
     auto index_type = SymbolicDType{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
     TensorMatcher({tokens, input_width})
         .with_strides({input_stride, 1})
         .with_dtype<bf16_t>()

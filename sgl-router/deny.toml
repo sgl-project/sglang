@@ -35,6 +35,8 @@ allow = [
     # deepseek-recipe's dependency tree (both OSI approved, permissive):
     "BSL-1.0",  # xxhash-rust — Boost Software License.
     "MIT-0",  # borrow-or-share (via jsonschema) — MIT No Attribution.
+    # aws-lc-fips-sys (`fips` feature only): ISC AND (Apache-2.0 OR ISC) AND OpenSSL.
+    "OpenSSL",
 ]
 confidence-threshold = 0.93
 

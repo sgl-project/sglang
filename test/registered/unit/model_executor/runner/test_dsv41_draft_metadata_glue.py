@@ -11,6 +11,7 @@ import torch
 
 from sglang.srt.layers.attention import deepseek_v4_backend as dsv4
 from sglang.srt.model_executor.runner import decode_cuda_graph_runner as mod
+from sglang.srt.model_executor.runner.metadata_glue_graph import MetadataGlueGraph
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -49,6 +50,7 @@ class TestHostFreeDraftPrep(CustomTestCase):
     def test_every_other_setup_says_why(self):
         cases = {
             "not the DSpark draft runner": dict(is_dspark_draft=False),
+            "host sequence lengths": dict(needs_cpu_seq_lens=True),
             "trtllm-gen attention": dict(trtllm_attn=True),
             "online c128 MTP": dict(
                 online_c128_mtp=SimpleNamespace(enabled=lambda: True)
@@ -100,6 +102,24 @@ class TestDraftExtendLengths(CustomTestCase):
                 backend._draft_block_extend_lens([6, 6])
 
 
+class TestGlueCaptureFailure(CustomTestCase):
+    def _run_through_capture(self, glue):
+        backend = mock.Mock(attn_backend_list=None, requires_eager_metadata=False)
+        with (
+            mock.patch("torch.cuda.Stream"),
+            mock.patch("torch.cuda.CUDAGraph"),
+            mock.patch("torch.cuda.graph", side_effect=RuntimeError("host read")),
+        ):
+            for _ in range(glue.NUM_WARMUP + 1):
+                glue.run(backend, fb_view=None, key=1)
+
+    def test_strict_raises(self):
+        glue = MetadataGlueGraph("cpu", strict=True)
+        with self.assertRaisesRegex(RuntimeError, "host read"):
+            self._run_through_capture(glue)
+        self.assertFalse(glue.disabled)
+
+
 def _runner(*, draft=True, backend=None):
     runner = mod.DecodeCudaGraphRunner.__new__(mod.DecodeCudaGraphRunner)
     runner.model_runner = SimpleNamespace(is_draft_worker=draft)
@@ -114,15 +134,17 @@ class TestRunnerGluesTheDraft(CustomTestCase):
         step_own = torch.arange(100, 106)
         view = SimpleNamespace(out_cache_loc=step_own)
         runner._draft_metadata_glue = False
-        runner._glue_draft_inputs(view)
+        runner._glue_draft_inputs(view, 6)
         self.assertIs(view.out_cache_loc, step_own)
         runner._draft_metadata_glue = True
-        runner._glue_draft_inputs(view)
+        runner._glue_draft_inputs(view, 6)
         slot = view.out_cache_loc
         self.assertEqual(slot.data_ptr(), runner.buffers.out_cache_loc.data_ptr())
         self.assertEqual(slot.shape, step_own.shape)
+        runner._glue_draft_inputs(view, 8)
+        self.assertEqual(view.out_cache_loc.shape, (8,))
         idle = SimpleNamespace(out_cache_loc=None)
-        runner._glue_draft_inputs(idle)
+        runner._glue_draft_inputs(idle, 0)
         self.assertIsNone(idle.out_cache_loc)
 
 

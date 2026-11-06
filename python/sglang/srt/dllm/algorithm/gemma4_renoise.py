@@ -8,8 +8,9 @@ import torch
 from sglang.srt.arg_groups.model_override_base import (
     attention_backends_of,
     model_config_of,
+    resolving_view,
 )
-from sglang.srt.arg_groups.overrides import declare_resolution, resolving_view
+from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.dllm.algorithm.base import DllmAlgorithm, DllmRunOutput
 from sglang.srt.dllm.config import DllmConfig

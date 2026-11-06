@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import threading
+from concurrent.futures import Future
 from copy import deepcopy
 from queue import Empty, Queue
 
@@ -11,6 +12,7 @@ import torch
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
+    HiCacheStorageExtraInfo,
     PoolName,
     PoolTransfer,
 )
@@ -76,6 +78,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         rank_replicated = self.pool_group.rank_replicated
         self.offload_owner = not rank_replicated or tp_rank == 0
         extra_config = deepcopy(extra_config or {})
+        self.load_mode = extra_config.pop("load_mode", "layer_wise")
         # TODO: unlike `HiCacheController._generate_storage_config`, this sets no
         # `dp_rank`. Aligning the storage-config producers changes persisted
         # storage keys, so it waits for a storage-key format change.
@@ -124,7 +127,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.mla_broadcaster = None
         self.tp_group = tp_group
         self.broadcast_loads = {}
-        if server_args.enable_linker_mla_dedup and rank_replicated and tp_size > 1:
+        if (
+            self.load_mode == "layer_wise"
+            and server_args.enable_linker_mla_dedup
+            and rank_replicated
+            and tp_size > 1
+        ):
             self.mla_broadcaster = LinkerMLADedupBroadcaster.build(
                 self.pool_group, params.tp_cache_group, params.attn_tp_cache_group
             )
@@ -135,18 +143,16 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             self.num_layers,
             self._broadcast_loaded_layers if self.mla_broadcaster else None,
         )
-        if PoolName.MAMBA in self.pools:
-            params.req_to_token_pool.register_layer_transfer_counter(
-                self.layer_done_counter
-            )
         self.pending_loads: dict[str, list[PoolTransfer]] = {}
         self.gc_frozen = False
         self.load_queue: Queue[
-            tuple[int, dict[str, list[PoolTransfer]], object] | None
+            tuple[int, dict[str, list[PoolTransfer]], object]
+            | tuple[Future[bool], list[PoolTransfer], object]
+            | None
         ] = Queue()
-        self.offload_queue: Queue[tuple[list[PoolTransfer], int, object] | None] = (
-            Queue()
-        )
+        self.offload_queue: Queue[
+            tuple[list[PoolTransfer], int, list[object], str | None] | None
+        ] = Queue()
         self.offload_results: Queue[bool] = Queue()
         self.stats = {"lookup": 0, "load": 0, "offload": 0}
         self.load_thread = threading.Thread(
@@ -212,6 +218,39 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.pending_loads[rid] = expanded
         return True
 
+    def prefetch(self, transfers: list[PoolTransfer]) -> Future[bool] | None:
+        if self.load_mode != "prefetch" or not self.load_thread.is_alive():
+            return None
+        expanded = self.pool_group.resolve_transfers(
+            transfers, allow_partial=True, allow_missing_kv=True
+        )
+        if not expanded:
+            return None
+        self.freeze_gc_once()
+        ready = self.record_transfer_ready()
+        future = Future()
+        self.load_queue.put((future, expanded, ready))
+        return future
+
+    def load_all_layers(self, transfers: list[PoolTransfer]) -> bool:
+        for transfer in transfers:
+            keys, multiplier = self.storage._get_hybrid_page_component_keys(
+                list(transfer.keys), transfer
+            )
+            keys = self.storage._tag_keys(keys)
+            ptrs, sizes = self.storage._build_pool_buffer_meta(
+                self.pools[transfer.name],
+                transfer.host_indices,
+                keys,
+                multiplier,
+                None,
+            )
+            received = self.storage._get_batch_zero_copy_impl(keys, ptrs, sizes)
+            # Require every byte of every layer, including short reads.
+            if list(received) != [sum(s) if isinstance(s, list) else s for s in sizes]:
+                return False
+        return True
+
     def cancel_queued_load(self, rid: str) -> bool:
         return self.pending_loads.pop(rid, None) is not None
 
@@ -263,12 +302,11 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             if not broadcaster.is_src:
                 for layer in range(self.num_layers):
                     self.layer_done_counter.complete(counter_index, layer)
-        ready_event = device_module.Event()
-        ready_event.record()
+        ready = self.record_transfer_ready()
         if broadcaster is not None:
-            self.broadcast_loads[counter_index] = (0, prepared, ready_event)
+            self.broadcast_loads[counter_index] = (0, prepared, ready)
         if broadcaster is None or broadcaster.is_src:
-            self.load_queue.put((counter_index, pending, ready_event))
+            self.load_queue.put((counter_index, pending, ready))
         self.stats["load"] += len(pending)
         return counter_index
 
@@ -276,9 +314,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         batch = self.broadcast_loads.get(index)
         if batch is None:
             return
-        first, prepared, ready_event = batch
+        first, prepared, ready = batch
         if first == 0:
-            device_module.current_stream().wait_event(ready_event)
+            ready.wait(device_module.current_stream())
         # KV access may wait several times per layer, or skip sparse layers.
         # Launch each broadcast exactly once, in order, on the forward stream.
         for layer in range(first, threshold + 1):
@@ -289,7 +327,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             self.broadcast_loads[index] = (
                 max(first, threshold + 1),
                 prepared,
-                ready_event,
+                ready,
             )
 
     def load_thread_func(self) -> None:
@@ -298,13 +336,25 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             try:
                 if task is None:
                     return
-                counter_index, pending, ready_event = task
+                completion, pending, ready = task
+                prefetch = isinstance(completion, Future)
+                if prefetch and not completion.set_running_or_notify_cancel():
+                    continue
                 try:
-                    ready_event.synchronize()
-                    self.load_layer_wise(counter_index, list(pending.values()))
+                    ready.synchronize()
+                    if prefetch:
+                        completion.set_result(self.load_all_layers(pending))
+                    else:
+                        self.load_layer_wise(completion, list(pending.values()))
                 except BaseException as error:
-                    self.layer_done_counter.fail(counter_index, error)
-                    logger.exception("Mooncake layer-wise load batch failed")
+                    if prefetch:
+                        completion.set_result(False)
+                    else:
+                        self.layer_done_counter.fail(completion, error)
+                    logger.exception(
+                        "Mooncake %s load batch failed",
+                        "prefetch" if prefetch else "layer-wise",
+                    )
             finally:
                 self.load_queue.task_done()
 
@@ -372,7 +422,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     self.layer_done_counter.fail(counter_index, error)
                     logger.exception("Mooncake layer-wise load session cleanup failed")
 
-    def offload(self, transfers: list[PoolTransfer]) -> bool:
+    def offload(
+        self, transfers: list[PoolTransfer], session_id: str | None = None
+    ) -> bool:
         expanded = self.pool_group.resolve_transfers(transfers, allow_partial=True)
         if not expanded:
             return False
@@ -382,8 +434,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             return True
         kv = next(transfer for transfer in transfers if transfer.name == PoolName.KV)
         tokens = len(kv.keys) * self.page_size
-        ready_events = self.record_offload_ready()
-        self.offload_queue.put((expanded, tokens, ready_events))
+        ready = self.record_transfer_ready()
+        self.offload_queue.put((expanded, tokens, ready, session_id))
         return True
 
     def offload_thread_func(self) -> None:
@@ -392,10 +444,14 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             try:
                 if task is None:
                     return
-                expanded, tokens, ready_events = task
-                for event in ready_events:
-                    event.synchronize()
-                results = self.storage.batch_set_v2(expanded)
+                expanded, tokens, ready, session_id = task
+                ready.synchronize()
+                extra_info = (
+                    HiCacheStorageExtraInfo(extra_info={"session_id": session_id})
+                    if session_id
+                    else None
+                )
+                results = self.storage.batch_set_v2(expanded, extra_info)
                 success = all(all(pool_results) for pool_results in results.values())
                 if success:
                     self.stats["offload"] += 1
@@ -416,6 +472,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
 
     def reset(self) -> None:
         self.pending_loads.clear()
+        # Both load modes must stop writing before any destination is recycled.
         self.load_queue.join()
         self.offload_queue.join()
         self.broadcast_loads.clear()

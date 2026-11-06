@@ -58,6 +58,7 @@ def load_jit(
     extra_include_paths: List[str] | None = None,
     extra_dependencies: List[str] | None = None,
     header_only: bool = True,
+    cuda_units: List[List[str]] | None = None,
 ) -> Module:
     """Load a JIT module, compiling it if no cached build still applies.
 
@@ -79,7 +80,14 @@ def load_jit(
     :param header_only: Compile through a generated wrapper that exports the
                         given entry points. Otherwise the sources must export
                         from the C++ side themselves.
+    :param cuda_units: Extra translation units of a header-only module, one
+                       list of ``NAME=VALUE`` macros each. A unit defines its
+                       macros, includes `cuda_files` and exports nothing; ninja
+                       builds the units in parallel, so a module can split its
+                       kernel instantiations across them.
     """
+    if cuda_units and not (header_only and cuda_files):
+        raise ValueError("cuda_units needs a header-only module with cuda_files.")
     if is_hip_runtime():
         extra_cuda_cflags = [
             flag
@@ -123,6 +131,7 @@ def load_jit(
         ldflags=tuple(DEFAULT_LDFLAGS + (extra_ldflags or [])),
         include_paths=tuple(includes),
         header_only=header_only,
+        cuda_units=tuple(tuple(unit) for unit in cuda_units or ()),
     )
 
     # Generated once and threaded through: the cache key is taken over this

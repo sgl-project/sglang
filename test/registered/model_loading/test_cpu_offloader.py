@@ -11,9 +11,9 @@ from torch.nn import functional as F
 
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, MergedColumnParallelLinear
+from sglang.srt.layers.offloader import OffloaderV1, OffloaderV2
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.model_loader.loader import PreshardedModelLoader
-from sglang.srt.utils.offloader import OffloaderV1, OffloaderV2
 from sglang.srt.weight_cache.ipc_loader import IpcModelLoader
 from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -140,10 +140,10 @@ class TestCpuOffloader(CustomTestCase):
             # The cached view is held outside the selected projection submodule.
             with (
                 patch(
-                    "sglang.srt.utils.offloader.get_parallel",
+                    "sglang.srt.layers.offloader.get_parallel",
                     return_value=SimpleNamespace(dp_rank=0, num_dp_ranks=1),
                 ),
-                patch("sglang.srt.utils.offloader.get_stream", return_value=None),
+                patch("sglang.srt.layers.offloader.get_stream", return_value=None),
                 patch("torch.cuda.memory_allocated", return_value=0),
                 patch.dict(os.environ, {"SGLANG_RUN_ID": "test-cpu-offloader"}),
             ):

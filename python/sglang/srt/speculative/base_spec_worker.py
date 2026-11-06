@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.configs.draft_parallel import DraftParallelLayout
+from sglang.srt.configs.model_config import uses_compressed_kv_attention
+from sglang.srt.mem_cache.kv.router import STATE_PART
 from sglang.srt.model_executor.graph_memory_usage import (
     merge_graph_memory_usage,
     merge_graph_time_usage,
@@ -47,12 +49,11 @@ def _can_pack_hicache_mtp(
             runner.model_config.num_nextn_predict_layers for runner in draft_runners
         )
     )
-    is_dspark_dsv4 = (
+    is_dspark_compressed_kv = (
         spec_algorithm.is_dspark()
-        and draft_runners[0].model_config.hf_config.architectures[0]
-        == "DeepseekV4ForCausalLMDSpark"
+        and uses_compressed_kv_attention(draft_runners[0].model_config.hf_config)
     )
-    return is_nextn_mtp or is_dspark_dsv4
+    return is_nextn_mtp or is_dspark_compressed_kv
 
 
 class EagleDraftWorkerBase(ABC):
@@ -162,10 +163,9 @@ class BaseSpecWorker(ABC):
         return self._hicache_draft_plan
 
     @property
-    def draft_swa_window(self) -> int:
-        """Tokens back from the committed length that the draft reads in the
-        target's swa sub-pool; 0 when the target's own window covers them."""
-        return 0
+    def draft_window_reaches(self) -> dict[str, int]:
+        """Reader reaches from committed length, keyed by actual storage band."""
+        return {}
 
     def weight_update_runners(self) -> list[tuple[str, ModelRunner]]:
         """(role, runner) pairs weight ops apply to; [] when the draft owns no weights."""
@@ -189,15 +189,13 @@ class BaseSpecWorker(ABC):
 
     @property
     def primary_draft_kv_pool(self) -> Optional[object]:
-        from sglang.srt.mem_cache.unified_draft_pool import fused_draft_host_allocator
-
         draft_runners = self._draft_model_runners()
         if not draft_runners:
             return None
-        pool = draft_runners[0].token_to_kv_pool
-        if fused_draft_host_allocator(pool) is not None:
+        # A fused draft's KV lives in the target's pool: it has none of its own.
+        if draft_runners[0].runner_ids.is_fused_draft:
             return None
-        return pool
+        return draft_runners[0].token_to_kv_pool
 
     @property
     def target_worker(self) -> TpModelWorker:
@@ -282,11 +280,7 @@ class BaseSpecWorker(ABC):
         if not draft_runners:
             return HiCacheDraftPlan()
         draft_pools = tuple(runner.token_to_kv_pool for runner in draft_runners)
-        from sglang.srt.mem_cache.unified_draft_pool import (
-            fused_draft_host_allocator,
-        )
-
-        if any(fused_draft_host_allocator(pool) is not None for pool in draft_pools):
+        if any(runner.runner_ids.is_fused_draft for runner in draft_runners):
             from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
                 validate_fused_hicache_draft,
             )
@@ -302,11 +296,11 @@ class BaseSpecWorker(ABC):
             )
         if _can_pack_hicache_mtp(spec_algorithm, draft_runners):
             target_model_runner.mtp_draft_device_pools = draft_pools
-            target_mamba_pool = getattr(
-                target_model_runner.req_to_token_pool, "mamba_pool", None
+            target_mamba_pool = (
+                target_model_runner.token_to_kv_pool.layer_router.part_view(STATE_PART)
             )
             draft_mamba_pools = tuple(
-                getattr(runner.req_to_token_pool, "mamba_pool", None)
+                runner.token_to_kv_pool.layer_router.part_view(STATE_PART)
                 for runner in draft_runners
             )
             # Shared state is already backed up with the target. Separate

@@ -25,9 +25,9 @@ from sglang.srt.layers.pooler import (
     score_and_pool,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM, Qwen2Model
-from sglang.srt.utils import add_prefix
 
 
 class Qwen2ForSequenceClassification(nn.Module):

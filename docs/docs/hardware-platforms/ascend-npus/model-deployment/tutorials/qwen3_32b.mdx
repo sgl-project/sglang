@@ -14,9 +14,9 @@ decoding for accelerated inference and supports both standard and thinking/reaso
 This document demonstrates the deployment of Qwen3-32B on Ascend NPUs using SGLang, including single-node PD mixed mode,
 feature configuration, and performance optimization.
 
-This document is validated and written based on **SGLang v0.5.16**. The current model (Qwen3-32B) is fully supported in
-this version. To use the latest features (e.g., speculative decoding), it is recommended to use v0.5.16 or a later
-version.
+This document is validated and written based on **SGLang v0.5.18**. The current model (Qwen3-32B) is fully supported in
+this version. It is recommended to use exactly v0.5.18 (the `v0.5.18-cann9.0.0-a3` image); later versions are not
+covered by this document and may introduce breaking changes.
 
 ## Supported features
 
@@ -82,17 +82,12 @@ Ensure sufficient disk space before pulling images. The Docker image requires at
 The dependencies required for the NPU runtime environment have been integrated into a Docker image and uploaded to the
 online platform. You can directly pull it.
 
-Both **stable releases** and **daily builds** are available. CANN 9.1.0 has no stable image yet, so the following
-command uses the daily build tag `main-cann9.1.0-a3`. Once the stable image is published, switch back to the stable
-release tag.
+The following command is based on the stable release tag `v0.5.18-cann9.0.0-a3`.
 For details, see [Docker image versions](/docs/hardware-platforms/ascend-npus/faq#8-docker-image-versions-stable-release-vs-daily-build).
 
-{/* TODO: CANN 9.1.0 has no stable image yet, so this page temporarily references the daily build tag `main-cann9.1.0-a3`. Once the stable image is published, switch back to the stable release tag. */}
+{/* NOTE(agent): The image version and scripts in this file are frozen (validated best practice). Skip this file in batch image-version updates and when deprecating or renaming parameters/flags. */}
 ```bash Command
-# TODO: CANN 9.1.0 has no stable image yet, so this temporarily pulls the
-# daily build tag. Once the stable image is published, switch back to the
-# stable release tag.
-docker pull quay.io/ascend/sglang:main-cann9.1.0-a3
+docker pull quay.io/ascend/sglang:v0.5.18-cann9.0.0-a3
 
 docker run -itd --shm-size=16g --name ${NAME} \
 --privileged=true --net=host \
@@ -120,7 +115,7 @@ docker run -itd --shm-size=16g --name ${NAME} \
 --device=/dev/davinci_manager:/dev/davinci_manager \
 --device=/dev/hisi_hdc:/dev/hisi_hdc \
 --entrypoint=bash \
-quay.io/ascend/sglang:main-cann9.1.0-a3
+quay.io/ascend/sglang:v0.5.18-cann9.0.0-a3
 ```
 
 <Tip>
