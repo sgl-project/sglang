@@ -153,6 +153,15 @@ def conv_window_dedup_enabled(
     )
 
 
+# KV dtypes that force a uint8 store_dtype (see KVCache.__init__) and therefore
+# carry a cast on every write.
+_FP8_KV_CACHE_DTYPES = (
+    torch.float8_e5m2,
+    torch.float8_e4m3fn,
+    torch.float8_e4m3fnuz,
+)
+
+
 def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
     if isinstance(t, list):
         return sum(get_tensor_size_bytes(x) for x in t)
@@ -1889,7 +1898,7 @@ class KVCache(abc.ABC):
         self.page_size = page_size
         self.dtype = dtype
         self.device = device
-        if dtype in (torch.float8_e5m2, torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+        if dtype in _FP8_KV_CACHE_DTYPES:
             # NOTE: Store as torch.uint8 because Tensor.index_put is not implemented for torch.float8_e5m2
             self.store_dtype = torch.uint8
         else:
@@ -6319,6 +6328,18 @@ class MiniMaxSparseKVPool(KVCache):
     ) -> None:
         """Store main K/V + index K (+ optional index V) for a sparse layer in
         one fused JIT launch, falling back to separate stores when not applicable."""
+        # Both fused routes below write through raw kernel launches, bypassing the
+        # stale-slot detectors that MHATokenToKVPool.set_kv_buffer runs on the
+        # fallback route. Hoisting it here keeps every exit from this function
+        # covered, so a bad `loc` cannot become silent KV corruption on whichever
+        # route a layout capability check happens to select. It is a no-op
+        # unless SGLANG_ENABLE_ASYNC_ASSERT is set, so the fallback repeating
+        # it costs nothing outside that debug mode.
+        _pool = self._pool_for(layer.layer_id)
+        maybe_detect_oob(
+            loc, 0, _pool.size + _pool.page_size, "set_fused_kv_index_buffer"
+        )
+
         disable_value = cache_idx_v is None
         index_pool = self.index_k_pool if disable_value else self.index_kv_pool
 
