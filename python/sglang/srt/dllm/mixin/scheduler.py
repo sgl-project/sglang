@@ -96,6 +96,10 @@ class SchedulerDllmMixin:
             self.dllm_config.requires_separate_context_encoding
             and not batch.forward_mode.is_dllm_extend()
         ):
+            # A causal context pass can seed the following denoising block.
+            if result.dllm_algo_state is not None:
+                for req, state in zip(batch.reqs, result.dllm_algo_state):
+                    req.dllm_algo_state = state
             self.metrics_reporter.report_prefill_stats(
                 batch=batch,
                 prefill_stats=batch.prefill_stats,
