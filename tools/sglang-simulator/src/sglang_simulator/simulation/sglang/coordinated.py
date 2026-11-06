@@ -1,4 +1,4 @@
-"""A causal boundary around the existing, non-overlapping SGLang scheduler."""
+"""A causal boundary around native scheduler results and external driver events."""
 
 import inspect
 import math
@@ -67,7 +67,6 @@ def install_prefill_cadence_hooks(target, coordinator_getter) -> None:
             or before > self.prefill_decode_interval
             or after != (before - 1 if result else 0)
             or (result and before == 0)
-            or (not result and before != 0)
         ):
             raise ProtocolError("unsupported native prefill cadence decision")
         bridge._cadence_deferred = result
@@ -87,7 +86,7 @@ def _validate_prefill_cadence_runtime(scheduler) -> None:
         return
     expected = {
         "get_next_batch_to_run": ("running_batch", "last_batch"),
-        "_should_defer_prefill": (),
+        "_should_defer_prefill": ("running_batch",),
         "_arm_prefill_decode_interval": ("batch",),
     }
     for name, parameters in expected.items():
@@ -106,6 +105,26 @@ def _validate_prefill_cadence_runtime(scheduler) -> None:
         raise ValueError("prefill_decode_interval requires a valid native counter")
 
 
+def _watchdog_activation_owner(watchdog):
+    """Resolve the native raw callback without activating a disabled watchdog."""
+    missing = object()
+    active = getattr(watchdog, "is_active", missing)
+    if active is not missing:
+        owner = watchdog
+    else:
+        owner = getattr(watchdog, "_raw", missing)
+        if owner is missing:
+            from sglang.srt.utils.watchdog import _WatchdogNoop
+
+            if type(watchdog) is _WatchdogNoop:
+                return None
+            raise ValueError("unsupported native watchdog activation interface")
+        active = getattr(owner, "is_active", missing)
+    if not callable(active):
+        raise TypeError("native watchdog activation must be callable")
+    return owner, active
+
+
 class CoordinatedScheduler:
     """Receive payloads while time is stopped; commit results at their due time.
 
@@ -113,11 +132,19 @@ class CoordinatedScheduler:
     run, including its warmup; restarting it gives the next run a clean cache.
     """
 
-    def __init__(self, *, scheduler, endpoint: str, timeout_s: float = 30.0):
+    def __init__(
+        self,
+        *,
+        scheduler,
+        endpoint: str,
+        timeout_s: float = 30.0,
+        pending_work: Callable[[], bool] | None = None,
+    ):
         endpoint = validate_coordinator_endpoint(endpoint)
         # Model defaults can resolve cadence absent from the raw launch arguments.
         _validate_prefill_cadence_runtime(scheduler)
         self.scheduler = scheduler
+        self._pending_work = pending_work
         self.clock = Coordinator()
         self.timeout_s = timeout_s
         self._closed = False
@@ -151,14 +178,20 @@ class CoordinatedScheduler:
         self._in_scheduler_pass = False
         self._cadence_deferred = False
         self._cadence_only_pass = False
-        for name in ("watchdog", "soft_watchdog"):
-            watchdog = getattr(scheduler, name, None)
-            if watchdog is not None:
-                active = watchdog.is_active
-                self._watchdogs.append((watchdog, active))
-                watchdog.is_active = lambda active=active: (
-                    not self._waiting and active()
-                )
+        try:
+            for name in ("watchdog", "soft_watchdog"):
+                watchdog = getattr(scheduler, name, None)
+                if watchdog is not None:
+                    activation = _watchdog_activation_owner(watchdog)
+                    if activation is not None:
+                        owner, active = activation
+                        self._watchdogs.append((owner, active))
+                        owner.is_active = lambda active=active: (
+                            not self._waiting and active()
+                        )
+        except Exception:
+            self.close()
+            raise
 
     def close(self) -> None:
         """Release control resources without resetting native scheduler state."""
@@ -206,6 +239,7 @@ class CoordinatedScheduler:
             return result
 
     def _pump(self) -> None:
+        profiles = []
         for req in self._raw_receive():
             kind = type(req).__name__
             if kind == "TokenizedGenerateReqInput":
@@ -224,14 +258,36 @@ class CoordinatedScheduler:
                     if not self.clock.awaiting_ready:
                         raise ProtocolError(f"HTTP abort without Cancel: {req.rid}")
                     self._aborts.add(req.rid)
-            elif (
-                kind in ("GetInternalStateReq", "ConfigureLoggingReq", "FreezeGCReq")
-                or kind == "ShutdownReq"
-                and (self._finished or self.clock.run_id is None)
+            elif kind in ("GetInternalStateReq", "ConfigureLoggingReq", "FreezeGCReq"):
+                self._admin.append(req)
+            elif kind == "ProfileReq":
+                profiles.append(req)
+            elif kind == "ShutdownReq" and (
+                self._finished or self.clock.run_id is None
             ):
                 self._admin.append(req)
             else:
                 raise ProtocolError(f"unsupported request during coordination: {kind}")
+        if profiles:
+            # Check the entire receive pass: an earlier profile request cannot
+            # reset accounting ahead of a payload from the same native poll.
+            if not (
+                (self.clock.run_id is None or self._finished)
+                and not self._reply_pending
+                and self._batch is None
+                and not self._payloads
+                and not self._pending
+                and not self._aborts
+                and not self._cancel_cleanup
+                and not self.clock.pending_rids
+                and not self.clock.open_rids
+                and not self.clock.has_terminals
+                and not self._has_native_work()
+            ):
+                raise ProtocolError(
+                    "ProfileReq requires bootstrap or a drained finished run"
+                )
+            self._admin.extend(profiles)
 
     @staticmethod
     def _validate_request(req) -> None:
@@ -254,6 +310,8 @@ class CoordinatedScheduler:
         try:
             while True:
                 self._pump()
+                if self._admin and self._batch is None and self.clock.run_id is None:
+                    return  # Apply bootstrap administration before accepting Ready.
                 if self._finished:
                     if self._payloads:
                         raise ProtocolError("run already finished")
@@ -292,8 +350,6 @@ class CoordinatedScheduler:
                             self._grant()
                             continue
                         return
-                if self._admin and self._batch is None and self.clock.run_id is None:
-                    return  # Bootstrap administration does not require a driver.
                 if (
                     self.clock.run_id is not None
                     and time.monotonic() - start > self.timeout_s
@@ -342,7 +398,9 @@ class CoordinatedScheduler:
     def _has_native_work(self) -> bool:
         # Cancellation is logically terminal before native decode/chunked cleanup.
         return bool(
-            self.scheduler.waiting_queue
+            (self._pending_work is not None and self._pending_work())
+            or getattr(self.scheduler, "result_queue", ())
+            or self.scheduler.waiting_queue
             or self.scheduler.chunked_req is not None
             or self.scheduler._pending_chunked_abort_req is not None
             or any(not req.finished() for req in self.scheduler.collect_inflight_reqs())
@@ -397,42 +455,61 @@ class CoordinatedScheduler:
         self._reply_pending = False
         self._finished = finished
 
-    def process_batch_result(self, batch, result, *, process: Callable):
+    def process_batch_result(
+        self, batch, result, *, process: Callable, duration: float | None = None
+    ):
         with self._guard():
-            duration = StateManager.get_current_inference_dur()
-            if (
-                not math.isfinite(duration)
-                or duration <= 0
-                or round(duration * 1e9) == 0
-            ):
-                raise ProtocolError(f"invalid predicted batch duration: {duration}")
-            finish_ns = self.clock.now_ns + round(duration * 1e9)
-            self._batch = batch
-            while (
-                self.clock.next_wakeup_ns is not None
-                and self.clock.next_wakeup_ns < finish_ns
-            ):
-                self._advance(self.clock.next_wakeup_ns)
-                self._grant()
-                self._settle()
-            self._advance(finish_ns)
-            self._cleanup_cancelled()
+            finish_ns = self._prepare_result_time(batch, duration)
             attach_timing_output(result, self.clock, self._token_events)
+            requests = tuple(batch.reqs)
+            before = {
+                id(req): (len(req.output_ids), req.finished()) for req in requests
+            }
             ret = process()
             self.scheduler.process_pending_chunked_abort()
-            for req in batch.reqs:
+            for req in requests:
                 stats = request_stats_manager.get_req_stats(req.rid)
-                if req.output_ids:
+                output_count, finished = before[id(req)]
+                if (
+                    not finished
+                    and not self.clock.is_cancelled(req.rid)
+                    and len(req.output_ids) > output_count
+                ):
                     stats.gen_token_latencies.append(
                         finish_ns / 1e9 - stats.last_event_time
                     )
                     stats.last_event_time = finish_ns / 1e9
                 if req.finished() and not self.clock.is_terminal(req.rid):
                     self.clock.terminal(req.rid, "COMPLETED")
-            self._batch = None
-            if self.clock.has_terminals or self.clock.next_wakeup_ns == finish_ns:
-                self._grant()
+            self._finish_result_time()
             return ret
+
+    def _prepare_result_time(self, owner, duration):
+        """Advance once before native output; a result owner supplies its event duration."""
+        if duration is None:
+            duration = StateManager.get_current_inference_dur()
+        if not math.isfinite(duration) or duration <= 0 or round(duration * 1e9) == 0:
+            raise ProtocolError(f"invalid predicted batch duration: {duration}")
+        if self._batch is not None:
+            raise ProtocolError("a native result still owns the clock boundary")
+        finish_ns = self.clock.now_ns + round(duration * 1e9)
+        self._batch = owner
+        while (
+            self.clock.next_wakeup_ns is not None
+            and self.clock.next_wakeup_ns < finish_ns
+        ):
+            self._advance(self.clock.next_wakeup_ns)
+            self._grant()
+            self._settle()
+        self._advance(finish_ns)
+        self._cleanup_cancelled()
+        return finish_ns
+
+    def _finish_result_time(self):
+        """Release only after native processing and accounting consumption."""
+        self._batch = None
+        if self.clock.has_terminals or self.clock.next_wakeup_ns == self.clock.now_ns:
+            self._grant()
 
     def on_idle(self) -> None:
         with self._guard():

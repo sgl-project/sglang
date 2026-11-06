@@ -351,7 +351,10 @@ def cadence_scheduler(harness, interval):
             self.next_batch = None
             self.next_error = None
 
-        def _should_defer_prefill(self):
+        def _should_defer_prefill(self, running_batch=None):
+            if getattr(self, "reset_for_small_batch", False):
+                self._prefill_decode_interval_remaining = 0
+                return False
             if self._prefill_decode_interval_remaining == 0:
                 return False
             self._prefill_decode_interval_remaining -= 1
@@ -376,6 +379,27 @@ def cadence_scheduler(harness, interval):
     return harness.scheduler
 
 
+def test_native_small_batch_can_reset_positive_cadence_without_deferral(harness):
+    scheduler = cadence_scheduler(harness, 192)
+    scheduler._prefill_decode_interval_remaining = 192
+    scheduler.reset_for_small_batch = True
+    expected = SimpleNamespace(reqs=[])
+    scheduler.next_batch = expected
+    assert scheduler.get_next_batch_to_run(None, None).batch_to_run is expected
+    assert scheduler._prefill_decode_interval_remaining == 0
+    assert harness.bridge._cadence_deferred is False
+    assert harness.bridge._cadence_only_pass is False
+
+
+def test_watchdog_wrapper_resolves_raw_activation_without_calling_it():
+    called = []
+    raw = SimpleNamespace(is_active=lambda: called.append(True))
+    wrapper = SimpleNamespace(_raw=raw)
+    owner, callback = coordinated._watchdog_activation_owner(wrapper)
+    assert owner is raw and callback is raw.is_active
+    assert called == []
+
+
 def test_cadence_hooks_without_a_coordinator_only_delegate():
     calls = []
 
@@ -384,7 +408,7 @@ def test_cadence_hooks_without_a_coordinator_only_delegate():
         def _prefill_decode_interval_remaining(self):
             pytest.fail("non-coordinated hooks must not inspect the native counter")
 
-        def _should_defer_prefill(self):
+        def _should_defer_prefill(self, running_batch=None):
             calls.append("defer")
             return True
 
