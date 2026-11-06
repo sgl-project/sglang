@@ -48,9 +48,9 @@ class TestRequestLoggerMultimodal(CustomTestCase):
         logger.log_finished_request(req, {"meta_info": {"e2e_latency": 0.1}})
         received, finished = _lines(target)
         expected = (
-            "multimodal={'image': {'count': 2, 'bytes': "
+            "multimodal={'image': {'count': 2, 'payload_len': "
             f"{len(IMAGE_B64) + len(IMAGE_URL)}}}, "
-            f"'audio': {{'count': 1, 'bytes': {len(AUDIO_B64)}}}}}"
+            f"'audio': {{'count': 1, 'payload_len': {len(AUDIO_B64)}}}}}"
         )
         for line in (received, finished):
             self.assertIn(expected, line)
@@ -72,9 +72,29 @@ class TestRequestLoggerMultimodal(CustomTestCase):
         batch_line, plain_line = (json.loads(line) for line in _lines(target))
         self.assertEqual(
             batch_line["multimodal"],
-            {"image": {"count": 2, "bytes": 2 * len(IMAGE_URL)}},
+            {"image": {"count": 2, "payload_len": 2 * len(IMAGE_URL)}},
         )
         self.assertNotIn("multimodal", plain_line)
+
+    def test_parallel_sampling_counts_media_once(self):
+        req = GenerateReqInput(
+            text="describe",
+            image_data=IMAGE_URL,
+            audio_data=AUDIO_B64,
+            sampling_params={"n": 4},
+            rid="rid-n",
+        )
+        req.normalize_batch_and_arguments()
+        logger, target = _logger(level=0, fmt="json")
+        logger.log_received_request(req)
+        (line,) = (json.loads(line) for line in _lines(target))
+        self.assertEqual(
+            line["multimodal"],
+            {
+                "image": {"count": 1, "payload_len": len(IMAGE_URL)},
+                "audio": {"count": 1, "payload_len": len(AUDIO_B64)},
+            },
+        )
 
     def test_openai_chat_log_counts_content_parts(self):
         chat = ChatCompletionRequest(
@@ -102,8 +122,8 @@ class TestRequestLoggerMultimodal(CustomTestCase):
         self.assertEqual(
             line["multimodal"],
             {
-                "image": {"count": 1, "bytes": len(IMAGE_B64)},
-                "audio": {"count": 1, "bytes": len(audio_url)},
+                "image": {"count": 1, "payload_len": len(IMAGE_B64)},
+                "audio": {"count": 1, "payload_len": len(audio_url)},
             },
         )
 

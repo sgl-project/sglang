@@ -48,8 +48,9 @@ _OPENAI_PART_MODALITIES = {
 }
 
 
-def _media_payload_size(item: Any) -> int:
-    """Length of a media item's inline payload or reference; 0 for decoded objects."""
+def _media_payload_len(item: Any) -> int:
+    """Length of a media item's inline payload or reference (characters of a data
+    URI, URL or path, or bytes of raw data); 0 for decoded objects."""
     if isinstance(item, (str, bytes)):
         return len(item)
     if isinstance(item, dict):
@@ -63,9 +64,12 @@ def _media_payload_size(item: Any) -> int:
 def _summarize_multimodal(
     obj: Union[GenerateReqInput, EmbeddingReqInput],
 ) -> Dict[str, Dict[str, int]]:
-    """Per-modality item count and payload size, so a log line records that a
+    """Per-modality item count and payload length, so a log line records that a
     request carried media without carrying the media itself."""
     summary: Dict[str, Dict[str, int]] = {}
+    # Normalization repeats the media lists once per parallel sample; count what
+    # the client sent.
+    num_samples = getattr(obj, "parallel_sample_num", 1)
     for value, modality in (
         (obj.image_data, "image"),
         (obj.video_data, "video"),
@@ -73,16 +77,18 @@ def _summarize_multimodal(
     ):
         if value is None:
             continue
-        count = size = 0
+        if isinstance(value, list) and num_samples > 1:
+            value = value[: len(value) // num_samples]
+        count = payload_len = 0
         for item in value if isinstance(value, list) else [value]:
             # A batch request holds one list of items per sub-request.
             for leaf in item if isinstance(item, list) else [item]:
                 if leaf is None:
                     continue
                 count += 1
-                size += _media_payload_size(leaf)
+                payload_len += _media_payload_len(leaf)
         if count:
-            summary[modality] = {"count": count, "bytes": size}
+            summary[modality] = {"count": count, "payload_len": payload_len}
     return summary
 
 
@@ -104,9 +110,11 @@ def _summarize_openai_multimodal(obj: Any) -> Dict[str, Dict[str, int]]:
             payload = part.get(part_type)
             if isinstance(payload, dict):
                 payload = payload.get("url", payload.get("data"))
-            entry = summary.setdefault(modality, {"count": 0, "bytes": 0})
+            entry = summary.setdefault(modality, {"count": 0, "payload_len": 0})
             entry["count"] += 1
-            entry["bytes"] += len(payload) if isinstance(payload, (str, bytes)) else 0
+            entry["payload_len"] += (
+                len(payload) if isinstance(payload, (str, bytes)) else 0
+            )
     return summary
 
 
