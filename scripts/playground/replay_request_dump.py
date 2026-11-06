@@ -18,7 +18,7 @@ from datetime import datetime
 import requests
 
 from sglang.benchmark.utils import set_ulimit
-from sglang.srt.utils.common import safe_pickle_load
+from sglang.srt.utils.serialization import safe_pickle_load
 from sglang.utils import get_exception_traceback
 
 
