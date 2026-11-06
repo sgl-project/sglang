@@ -207,7 +207,8 @@ class TestDSABackendDPPadding(CustomTestCase):
             device="cpu",
             num_q_heads=2,
             num_dcp_q_heads=2,
-            dcp_size=1,
+            attn_dcp_size=1,
+            dsa_shards_index_k=False,
         )
         backend._pad_topk_indices = MethodType(
             DeepseekSparseAttnBackend._pad_topk_indices, backend
