@@ -31,6 +31,18 @@ When a cache miss occurs in L1 and L2, HiCache automatically fetches the require
 
 This integration is particularly valuable for production deployments involving long-context models, multi-turn conversations, and high-throughput serving scenarios where traditional caching approaches become capacity-constrained.
 
+### Decode context parallelism (DCP)
+
+Mooncake L3 supports DCP for one materialized MLA KV pool and optional KDA
+state, using `layer_first`, `page_first`, or `page_first_direct`. GQA/MHA, other
+host pools, split KV buffers, and separate KV scale buffers are not supported
+with DCP.
+
+DCP keys separate TP/DCP/PP/CP sizes and logical page sizes. With TP=4/DCP=2,
+ranks 0 and 1 write two shards per page; ranks 2 and 3 read those same objects.
+Use matching model settings. KV format and host layout are not yet in the keys;
+use different `extra_backend_tag` values when these differ.
+
 ## Install Mooncake
 
 **Method 1: with pip**
@@ -82,10 +94,12 @@ When integrated with **SGLang**, the system conceptually consists of four key co
 **Launch Mooncake `metadata service` (Optional):**
 
 ```bash
-python -m mooncake.http_metadata_server
+python -m mooncake.http_metadata_server --host 127.0.0.1
 ```
 
 This service is responsible for centralized metadata management including internal connection status and related metadata.
+
+Since Mooncake 0.3.14, the metadata server refuses to bind a non-loopback address (such as the default `0.0.0.0`) without an authentication token. Bind `127.0.0.1` for a single-server setup. For a multi-server setup, set the same `MC_METADATA_HTTP_TOKEN` on the metadata server and on every SGLang server and store service.
 
 Deployment of the `metadata service` can be skipped in the following cases:
 * Mooncake supports non-centralized metadata management via a P2P handshake mechanism to exchange metadata. When using this mode, deployment of the `metadata service` can be skipped.

@@ -121,6 +121,5 @@ Look for `Pixel data generated successfully in xxxx seconds` in console output. 
 ## Env Vars
 
 Defined in `envs.py` (300+ vars). Key ones:
-- `SGLANG_DIFFUSION_ATTENTION_BACKEND` — attention backend override
 - `SGLANG_CACHE_DIT_ENABLED` — enable Cache-DiT acceleration
 - `SGLANG_CLOUD_STORAGE_TYPE` — cloud output storage (s3, etc.)

@@ -79,7 +79,9 @@ _GRAPH = {"execution_mode": "cuda_graph"}
         ),
         ("vdn_h3", {"attention_backend": "flash_attention"}, True, "does not apply"),
         ("qwen_image", {"attention_backend": "sol_attention"}, False, "does not apply"),
-        ("flux", {"quantization": "fp8"}, False, "native model directories"),
+        ("flux", {"quantization": "fp8"}, False, "native model directory"),
+        ("qwen_image21", {"quantization": "mxfp8"}, False, "pre-quantized"),
+        ("qwen_image21", {"quantization": "fp8"}, False, "pre-quantized"),
         ("lumina2", {"int8_gemm": "comfy_kitchen"}, False, "no effect"),
         ("qwen_image", {"cache_mode": "cache_dit"}, False, "cache_dit is not"),
         ("minimax_h3", {"cache_mode": "teacache"}, False, "teacache is not"),
@@ -101,6 +103,8 @@ def test_preflight_rejects_what_the_model_cannot_run(
         ("minimax_h3", {"int8_gemm": "comfy_kitchen", "cache_mode": "spectrum"}, False),
         ("fast_h3", {"attention_backend": "video_sparse_attn_h3"}, True),
         ("vdn_h3", {"quantization": "fp8", "cache_mode": "cache_dit"}, True),
+        ("qwen_image21", {"quantization": "convrot_int8"}, False),
+        ("qwen_image21", {"int8_gemm": "sglang_jit"}, False),
     ],
 )
 def test_preflight_accepts_supported_combinations(

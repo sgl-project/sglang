@@ -3,17 +3,15 @@ srt/arg_groups/overrides.py."""
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 import contextlib
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from sglang.srt.arg_groups.overrides import (
-    ResolvedView,
-    _moe_runner_backend_quant_constraints,
-)
+from sglang.srt.arg_groups.model_override_base import ResolvedView
+from sglang.srt.arg_groups.overrides import _moe_runner_backend_quant_constraints
 from sglang.srt.runtime_context import override_platform
 from sglang.test.test_utils import CustomTestCase
 

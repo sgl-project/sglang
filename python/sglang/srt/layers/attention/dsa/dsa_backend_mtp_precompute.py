@@ -11,12 +11,12 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.kernels.ops.attention.utils import seqlens_expand_triton
+from sglang.kernels.ops.attention.pad import seqlens_expand_triton
 from sglang.srt.layers.attention.dsa.utils import compute_dsa_seqlens
 from sglang.srt.utils import is_cuda, is_hip
 
 if TYPE_CHECKING:
-    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.model_executor.forward_mode import ForwardMode
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()

@@ -7,11 +7,10 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from sglang.multimodal_gen.configs.sample.sampling_params import (
-    DataType,
     SamplingParams,
     _sanitize_filename,
 )
-from sglang.multimodal_gen.configs.task_type import ModelTaskType
+from sglang.multimodal_gen.configs.task_type import DataType, ModelTaskType
 from sglang.multimodal_gen.configs.utils import expand_path_fields
 from sglang.multimodal_gen.runtime.utils.argparse import StoreBoolean
 

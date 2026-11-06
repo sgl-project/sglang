@@ -32,13 +32,10 @@ from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    pad_mm_tokens,
 )
-from sglang.srt.managers.schedule_batch import (
-    MultimodalDataItem,
-    MultimodalInputs,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.lfm2 import Lfm2ForCausalLM
@@ -172,8 +169,7 @@ class Lfm2VlForConditionalGeneration(nn.Module):
         self.logits_processor = LogitsProcessor(config.text_config)
 
     def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
-        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
-        result = pattern.pad_input_tokens(input_ids, mm_inputs)
+        result = pad_mm_tokens(input_ids, mm_inputs)
         return result
 
     def get_input_embeddings(self) -> nn.Embedding:
