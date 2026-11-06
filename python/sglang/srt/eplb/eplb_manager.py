@@ -98,35 +98,8 @@ class EPLBManager:
 
     def refresh_layer(self, layer_id, logical_topk_ids):
         """Re-plan one layer from its current TopK and commit weights + placement
-        before that layer dispatches. Every EP rank must take the same branch:
-        the gate, the gather and the weight move are collectives."""
-        # TopK does not see the batch; ModelRunner.forward published it.
-        forward_batch = self._forward_batch
-        if (
-            forward_batch is None
-            or self._rebalance_disabled_reason is not None
-            or torch.cuda.is_current_stream_capturing()
-        ):
-            return
-        mode = forward_batch.global_forward_mode or forward_batch.forward_mode
-        # Decode-only passes (idle DP ranks included) do not count as batches.
-        if (
-            mode.is_decode() or mode.is_idle()
-        ) and not forward_batch.is_extend_in_batch:
-            return
-        if not self._refresh_gate.is_due(layer_id):
-            return
-        counts = forward_batch.original_global_num_tokens_cpu
-        if counts is None:
-            counts = forward_batch.global_num_tokens_cpu
-        num_tokens = (
-            sum(counts)
-            if counts is not None
-            else forward_batch.global_num_token_non_padded_cpu
-        )
-        if not self._refresh_gate.should_refresh(
-            layer_id, representative=num_tokens >= 512
-        ):
+        before that layer dispatches."""
+        if not self._should_refresh_layer(layer_id):
             return
 
         from evenmoe.adapters.sglang import (
@@ -136,6 +109,7 @@ class EPLBManager:
         )
         from evenmoe.kernels.ops.counting import count_logical_experts
 
+        # Count this rank's tokens per logical expert, then gather every rank's counts.
         live = get_global_expert_location_metadata()
         local_count = count_logical_experts(
             logical_topk_ids, live.num_logical_experts, dtype=torch.int32
@@ -146,18 +120,23 @@ class EPLBManager:
             local_count.contiguous(),
             group=get_parallel().moe_ep_group.device_group,
         )
+        # EvenMoE plans the new placement for this single layer.
         plan = self._moe_load_balancer.plan_placement(
             to_placement_request(per_rank_count[:, None, :], context=get_context())
         )
         maps = to_sglang_maps(plan)
+        # The request holds one layer, so the plan's routing metadata (if the
+        # policy keeps any) sits under key 0; republish it under the real layer.
+        routing_metadata = maps.routing_metadata.get(0)
         layer_metadata = ExpertLocationMetadata._init_raw(
             ep_size=live.ep_size,
             physical_to_logical_map=maps.physical_to_logical_map,
             logical_to_all_physical_map=maps.logical_to_all_physical_map,
-            mlb_routing_metadata={
-                layer_id: value for value in maps.routing_metadata.values()
-            },
+            mlb_routing_metadata=(
+                {} if routing_metadata is None else {layer_id: routing_metadata}
+            ),
         )
+        # Move this layer's expert weights against the still-live placement.
         self._get_expert_location_updater().update_layer(
             self._get_model().routed_experts_weights_of_layer[layer_id],
             layer_metadata,
@@ -165,7 +144,42 @@ class EPLBManager:
             nnodes=get_parallel().nnodes,
             rank=get_parallel().tp_rank,
         )
+        # Publish the new placement so this layer's routing reads it.
         commit_placement(self._moe_load_balancer, get_context(), [layer_id])
+
+    def _should_refresh_layer(self, layer_id) -> bool:
+        """Whether this layer re-plans on this pass. Every EP rank must reach the
+        same answer, since the refresh runs collectives, so only global batch
+        facts decide it."""
+        # TopK does not see the batch; ModelRunner.forward published it.
+        forward_batch = self._forward_batch
+        if (
+            forward_batch is None
+            or self._rebalance_disabled_reason is not None
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return False
+        mode = forward_batch.global_forward_mode or forward_batch.forward_mode
+        # Decode-only passes (idle DP ranks included) do not count as batches.
+        if (
+            mode.is_decode() or mode.is_idle()
+        ) and not forward_batch.is_extend_in_batch:
+            return False
+        if not self._refresh_gate.is_due(layer_id):
+            return False
+        # DP batches list every rank's count (prefer the one before speculative
+        # scaling); without DP the batch's real-token count is already global.
+        counts = forward_batch.original_global_num_tokens_cpu
+        if counts is None:
+            counts = forward_batch.global_num_tokens_cpu
+        num_tokens = (
+            sum(counts)
+            if counts is not None
+            else forward_batch.global_num_token_non_padded_cpu
+        )
+        return self._refresh_gate.should_refresh(
+            layer_id, representative=num_tokens >= 512
+        )
 
     def reset_generator(self):
         self._main_generator = self._entrypoint()

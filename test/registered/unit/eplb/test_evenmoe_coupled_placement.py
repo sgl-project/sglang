@@ -243,6 +243,44 @@ def test_current_batch_refresh_includes_idle_rank_and_commits_before_routing(emp
     assert events == ["solve", "move", "publish"] * 2
 
 
+def refresh_batch(non_padded=None, dp_counts=None, decode=False):
+    mode = SimpleNamespace(is_decode=lambda: decode, is_idle=lambda: False)
+    return SimpleNamespace(
+        global_forward_mode=mode,
+        forward_mode=mode,
+        is_extend_in_batch=not decode,
+        original_global_num_tokens_cpu=dp_counts,
+        global_num_tokens_cpu=None,
+        global_num_token_non_padded_cpu=non_padded,
+    )
+
+
+def test_refresh_decision_bootstraps_then_waits_for_representative_batches():
+    from evenmoe.policies.l1 import RefreshGate
+
+    from sglang.srt.eplb.eplb_manager import EPLBManager
+
+    manager = object.__new__(EPLBManager)
+    manager._refresh_gate = RefreshGate(2)
+    manager._rebalance_disabled_reason = None
+
+    def decide(batch):
+        manager._forward_batch = batch
+        return manager._should_refresh_layer(0)
+
+    with patch("torch.cuda.is_current_stream_capturing", return_value=False):
+        assert not decide(None)  # ModelRunner published no batch
+        assert not decide(refresh_batch(1024, decode=True))  # decode never counts
+        assert manager._refresh_gate._batches_since_refresh == {}
+        assert decide(refresh_batch(100))  # the first call always bootstraps
+        assert decide(refresh_batch(1024))  # a thin bootstrap is due at once
+        assert not decide(refresh_batch(1024))  # 1 of 2 batches: not due
+        assert not decide(refresh_batch(100))  # due, but under 512 tokens
+        assert decide(refresh_batch(dp_counts=[256, 256]))  # DP counts sum ranks
+    with patch("torch.cuda.is_current_stream_capturing", return_value=True):
+        assert not decide(refresh_batch(1024))
+
+
 def test_rank_counts_retain_source_rank_and_sum_recorded_steps():
     from sglang.srt.eplb.expert_distribution import _StatAccumulator
 
