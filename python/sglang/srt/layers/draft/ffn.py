@@ -394,8 +394,20 @@ def _routing_method(spec: DraftMoeFFNSpec):
 
 
 def _check_parallel_fit(spec: DraftMoeFFNSpec) -> None:
-    """FusedMoE shards the expert width over MoE TP and the experts over MoE EP."""
+    """FusedMoE on the dense draft path: no DP attention, no a2a dispatch, shards must divide."""
+    from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
     parallel = get_parallel()
+    if parallel.attn_dp_size > 1:
+        raise ValueError(
+            "Draft FFN: MoE draft layers do not support --enable-dp-attention yet; "
+            "the draft's MoE all-reduce is not synchronized across DP ranks."
+        )
+    if not get_moe_a2a_backend().is_none():
+        raise ValueError(
+            "Draft FFN: MoE draft layers run their experts without an all-to-all "
+            f"dispatcher; got moe_a2a_backend={get_moe_a2a_backend().value!r}."
+        )
     if spec.intermediate_size % parallel.moe_tp_size:
         raise ValueError(
             f"Draft FFN: moe_intermediate_size={spec.intermediate_size} is not "

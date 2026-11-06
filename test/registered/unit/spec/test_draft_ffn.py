@@ -16,9 +16,10 @@ from sglang.srt.layers.draft.ffn_spec import (
     DraftMoeFFNSpec,
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.moe.utils import MoeA2ABackend
 from sglang.srt.models.dflash import DFlashDraftModel, DFlashMLP
 from sglang.srt.models.dspark import DSparkDraftModel
-from sglang.srt.runtime_context import reset_context
+from sglang.srt.runtime_context import get_flags, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -413,6 +414,22 @@ class TestDraftMoeLoading(CustomTestCase):
         self.assertIsInstance(DSparkDraftModel(moe).layers[0].mlp, DraftMoE)
         dense = Qwen3Config(**dict(BASE, dflash_config=dflash, **dspark))
         self.assertIsInstance(DSparkDraftModel(dense).layers[0].mlp, DFlashMLP)
+
+    def test_moe_layers_refuse_dp_attention_and_a2a_dispatch(self):
+        spec = DraftMixFFNSpec.from_config(_moe_fields()).moe
+        dp_attention = SimpleNamespace(attn_dp_size=2, moe_tp_size=1, moe_ep_size=1)
+        with patch(
+            "sglang.srt.layers.draft.ffn.get_parallel", return_value=dp_attention
+        ):
+            with self.assertRaisesRegex(ValueError, "dp-attention"):
+                DraftMoE(spec, H, layer_id=0)
+        moe = get_flags().moe
+        moe.a2a_backend = MoeA2ABackend.DEEPEP
+        try:
+            with self.assertRaisesRegex(ValueError, "all-to-all"):
+                DraftMoE(spec, H, layer_id=0)
+        finally:
+            moe.a2a_backend = MoeA2ABackend.NONE
 
     def test_stacked_per_expert_and_prefixed_exports_load_the_same(self):
         for per_expert, prefix in ((False, ""), (True, ""), (False, "model.")):
