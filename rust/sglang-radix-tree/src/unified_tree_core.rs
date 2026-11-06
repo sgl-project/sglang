@@ -417,6 +417,8 @@ pub enum PoolName {
     DeepseekV4C4State,
     DeepseekV4C4IndexerState,
     DeepseekV4C128State,
+    Ernie55Mla,
+    Ernie55MlaIndexer,
     Draft,
     DraftIndexer,
     DraftSwa,

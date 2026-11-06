@@ -43,6 +43,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.utils import is_layer_skipped
+from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.runtime_context import (
     get_exec,
     get_platform,
@@ -57,7 +58,6 @@ from sglang.srt.utils import (
     is_triton_kernels_available,
     is_xpu,
     round_up,
-    set_weight_attrs,
     use_intel_amx_backend,
 )
 from sglang.srt.utils.common import get_bool_env_var

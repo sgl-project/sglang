@@ -849,6 +849,11 @@ class Envs:
     # get_embedding_tp_kwargs); they must stay in lock-step. Currently only
     # applies to the Deepseek-V2 family (Deepseek V3.1, Kimi K2.5) + drafts.
     SGLANG_ENABLE_EMBED_REPLICATION = EnvBool(False)
+    # Gated background transfers (distributed/device_communicators/
+    # gated_transfer.py): force open a transfer gate whose pause has been held
+    # this long, logging an error. A pause that never resumes means work the
+    # resume depends on is stuck behind a parked chunk. 0 disables it.
+    SGLANG_GATED_TRANSFER_WATCHDOG_MS = EnvInt(1000)
 
     # ===================================================================
     # Tool calling and native web search
@@ -912,6 +917,12 @@ class Envs:
     # Staging buffer for heterogeneous TP KV transfer
     SGLANG_DISAGG_STAGING_BUFFER = EnvBool(False)
     SGLANG_DISAGG_STAGING_POOL_SIZE_MB = EnvInt(4096)
+    # Queue incoming KV scatters between forwards; disabled by default.
+    SGLANG_PLB_SCATTER_DEFER = EnvBool(False)
+    # Decode stream priority relative to background KV scatters.
+    SGLANG_PLB_STREAM_PRIORITY = EnvInt(0)
+    # 0: original kernel; >0: persistent CTAs; -1: one CTA per page.
+    SGLANG_PLB_SCATTER_CTAS = EnvInt(0)
     # TODO(yangminl): remove SGLANG_STAGING_USE_TORCH and the torch fallback in
     # staging_buffer.py once Triton kernels are fully validated in production.
     SGLANG_STAGING_USE_TORCH = EnvBool(False)
@@ -1110,6 +1121,7 @@ class Envs:
     SGLANG_ROCM_SMALLM_ROUTER = EnvBool(True)
     SGLANG_ROCM_SMALLM_MOE = EnvBool(True)
     SGLANG_ROCM_SMALLM_FP8_PROJ = EnvBool(True)
+    SGLANG_ROCM_SMALLM_FP8_BS = EnvBool(True)
     # Quark MXFP4 dense linear on gfx95: use AITER's preshuffled ASM/CK FP4 GEMM
     # (shared a4w4 tuned CSVs) instead of the Triton gemm_afp4wfp4 path.
     SGLANG_ROCM_USE_AITER_FP4_ASM_GEMM = EnvBool(False)
@@ -1118,6 +1130,15 @@ class Envs:
     # output columns ride along nearly free.
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ = EnvBool(True)
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvInt(256)
+    # Kimi-K3 fused KDA decode on ROCm: "gfx950" (in-tree kernel) or "aiter";
+    # any other value keeps the unfused decode.
+    SGLANG_ROCM_K3_KDA_FUSED_BACKEND = EnvStr("gfx950")
+    # Kimi-K3 FlyDSL operators: "auto" (in-tree, then aiter), "sglang" or "aiter".
+    SGLANG_K3_FLYDSL_SOURCE = EnvStr("auto")
+    # "0" or "false" turns off the gfx950 HIP KDA chunked prefill.
+    SGLANG_ROCM_KDA_HIP_PREFILL = EnvStr("1")
+    # Any value but "1" keeps gfx950 MTP-verify attention off the asm kernel.
+    SGLANG_ASM_VERIFY_ATTN = EnvStr("1")
     # On gfx95x with SGLANG_USE_AITER=1, quantize the BF16 Qwen3.5/3.8 GDN
     # in_proj_qkvz and out_proj to MXFP4 after loading. 0 keeps them BF16.
     SGLANG_ROCM_GDN_ONLINE_MXFP4 = EnvBool(True)
@@ -1239,14 +1260,6 @@ class Envs:
     # MUSA
     # ===================================================================
     SGLANG_MUSA_FA3_FORCE_UPDATE_METADATA = EnvBool(False)
-
-    # ===================================================================
-    # Intel XPU
-    # ===================================================================
-    # Triton warps per program for the XPU LayerNorm+modulate kernels. Layout
-    # only, the bit-exact result does not depend on it; 4 measured fastest on
-    # Arc Pro B70.
-    SGLANG_XPU_LN_MOD_NUM_WARPS = EnvInt(4)
 
     # ===================================================================
     # Quantization
@@ -1523,6 +1536,8 @@ class Envs:
     SGLANG_LORA_MOE_CONFIG_DIR = EnvStr(None)
     # Per-file overrides for dense LoRA plan tables.
     SGLANG_LORA_DENSE_CONFIG_DIR = EnvStr(None)
+    # Root of the csgmv_configs tuning tables; defaults to the packaged directory.
+    SGLANG_LORA_CONFIG_DIR = EnvStr(None)
 
     # ===================================================================
     # Expert-parallel dispatch and MoE execution
@@ -1549,6 +1564,11 @@ class Envs:
     # The [M*top_k, hidden] HBM round trip pays only at small M; 0 disables.
     # GLM-5.2 (H=6144): neutral at 192 on B300 TP8, crossover 192-223 on GB300 TP4.
     SGLANG_MOE_DEFERRED_FINALIZE_MAX_TOKENS = EnvInt(192)
+    # Let the CuTe DSL fused MoE finalize consume expert-parallel handoffs.
+    # Unset follows the NVIDIA runtime master; an explicit value wins.
+    SGLANG_OPT_CUTEDSL_EP_DEFERRED_FINALIZE = EnvBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
     # DeepSeek/GLM MoE (deepseek_v2.py): quantize the (dp-gathered) MoE input
     # to per-token-group-128 fp8 ONCE and feed both the fused shared-expert
     # GEMM (cutlass w8a8 linear) and the routed experts' triton fused runner,
@@ -1593,7 +1613,6 @@ class Envs:
     SGLANG_MINICPM_DENSE_AS_SPARSE = EnvBool(False)
     SGLANG_MINICPM_FORCE_DENSE = EnvBool(False)
 
-    SGLANG_USE_SGL_FA3_KERNEL = EnvBool(True)
     # Force every sglang.kernels BaseFusedOp onto one backend (a KernelBackend
     # value, e.g. "torch" / "torch_compile" / "triton" / "helion" / "aot"); unset =
     # auto-select by priority. "torch" flips all fused ops to their pure-torch
@@ -1665,6 +1684,11 @@ class Envs:
     SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # Let an unchanged top-k-1 EAGLE round read the previous round's top-1 and hidden
+    # rows where the draft-extend graph left them instead of relaying copies.
+    SGLANG_OPT_SPEC_RELAY_IN_PLACE = EnvBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
     # Runtime optimizations that follow SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION. Each
     # still accepts its former name (deprecated_name) until the alias is removed.
     # The fused small-field copy gives each field its own blocks and moves aligned fields in 16 B units.
@@ -1720,6 +1744,8 @@ class Envs:
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get,
         deprecated_name="SGLANG_Q35MF_EDGE_MULTIHOST_TCP",
     )
+    # PD decode optimizations follow the shared switch unless explicitly disabled.
+    SGLANG_ENABLE_NV_MEGA_PDDEC_RUNTIME_OPTIMIZATION = EnvBool(True)
     # Reuse the resolved CPU sequence lengths for FlashInfer draft planning,
     # avoiding a second blocking readback after generating the same indptr.
     SGLANG_OPT_FLASHINFER_DRAFT_HOST_INDPTR = EnvBool(False)
@@ -1809,6 +1835,8 @@ class Envs:
     # Kill-switch for the fused per-slot conv clear/copy kernel (MambaPool);
     # falls back to the per-conv-type Python loop.
     SGLANG_DISABLE_FUSED_MAMBA_SLOT_OPS = EnvBool(False)
+    # Kill-switch for the gate-fused LFM2 short convolution.
+    SGLANG_DISABLE_LFM_FUSED_CONV = EnvBool(False)
     # Opt-in: on the unified radix tree, leave the matched-prefix mamba evictable
     # during decode (it is already COW'd to the request's own slot) and shrink the
     # mamba pool ratio accordingly. Frees one resident slot per running request,
@@ -2064,8 +2092,6 @@ class Envs:
     # V4.1 ratio-1 index-K pool in aiter's row-group page-8 layout (8 consecutive 8-slot pages per
     # 64-slot page), so a candidate consumer layer scores only its published blocks.
     SGLANG_HIP_DSV41_INDEX_K_PAGE8 = EnvBool(False)
-    # DeepSeek-V4.1 mHC boundary (HIP): the 32-row Triton tile from _HC_BOUNDARY_WIDE_MIN_M rows (bitwise the same).
-    SGLANG_HIP_MHC_BOUNDARY_WIDE_TILE = EnvBool(True)
 
     # cache, GEMM, and distributed
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
@@ -2334,6 +2360,13 @@ class Envs:
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MIN_HITS = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MAX_SEQLEN = EnvInt(6144)
+
+    # ===================================================================
+    # ERNIE 5.5
+    # ===================================================================
+    # Fusions not bit-exact with the eager ops: the input RMSNorm into mhc_pre,
+    # and the VHA postmix into the wo_a fp8 quant.
+    SGLANG_OPT_ERNIE5_5_FUSE_INEXACT = EnvBool(True)
 
     # ===================================================================
     # Symmetric memory

@@ -45,7 +45,7 @@ from sglang.srt.speculative.draft_worker_common import (
 )
 from sglang.srt.speculative.dspark_components.dspark_config import (
     DSV4_DRAFT_ATTENTION_BACKEND,
-    draft_is_deepseek_v4,
+    draft_uses_compressed_kv_attention,
     resolve_runtime_config,
 )
 from sglang.srt.speculative.dspark_components.dspark_deferred_commit import (
@@ -97,7 +97,7 @@ from sglang.srt.utils import (
     is_cuda_alike,
     is_npu,
 )
-from sglang.srt.utils.common import async_h2d
+from sglang.srt.utils.device import async_h2d
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -191,7 +191,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         if not self._hosts_draft:
             return
 
-        self._draft_is_moe = draft_is_deepseek_v4()
+        self._draft_is_moe = draft_uses_compressed_kv_attention()
         self.draft_parallel_layout = resolve_draft_parallel_layout(
             model_draft_parallel_spec(
                 target_worker.model_runner.spec_aux_config.draft_model_config,
