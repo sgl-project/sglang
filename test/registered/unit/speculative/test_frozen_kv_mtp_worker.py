@@ -56,7 +56,9 @@ class TestFrozenKVMTPChain(CustomTestCase):
             _set_positions=lambda b: None,
             _target_kv_pool_view=lambda b: nullcontext(),
         )
-        with patch.object(module, "forward_context", lambda context: nullcontext()):
+        with patch.object(
+            module, "forward_context", lambda context, **kwargs: nullcontext()
+        ):
             actual = module.FrozenKVMTPDraftWorker.draft_forward(worker, batch)
         scores = None
         score_list = []
