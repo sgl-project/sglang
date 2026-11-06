@@ -168,7 +168,7 @@ struct CausalConv1dKernel {
     auto Km1 = SymbolicSize{"W_minus_1"};
     auto NS = SymbolicSize{"nseq"};
     auto dev = SymbolicDevice{};
-    dev.set_options<kDLCUDA>();
+    dev.set_options<kDLGPU>();
     Wd.set_value(W);
     Km1.set_value(W - 1);
 

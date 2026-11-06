@@ -41,10 +41,11 @@ Pins the pure arithmetic that rotated owner-classed allocation hangs on:
    owner-classed host slots, the per-rank narrowing of a transfer, an N-rank
    backup -> evict -> load-back round trip, and the layer-load waits.
 
-The real NCCL MLA/MHA/MTP gathers, zero-SM gather correctness and release,
-and symmetric buffer lifetime tests live in
-``test_page_interleave_gather_multi_gpu.py``. DSA indexer and attention
-coverage lives in ``test_page_sharded_dsa_attention.py``.
+The real NCCL MLA/MHA/MTP gathers and symmetric buffer lifetime tests live in
+``test_page_interleave_gather_multi_gpu.py``; the zero-SM gathers, which need
+a newer NCCL than CI has, live in
+``test/manual/mem_cache/test_page_interleave_zero_sm_gather.py``. DSA indexer
+and attention coverage lives in ``test_page_sharded_dsa_attention.py``.
 """
 
 import ctypes
@@ -109,6 +110,7 @@ from sglang.srt.mem_cache.page_interleave_pool import (
     _symmetric_scratch_layout,
     _symmetric_scratch_supported,
 )
+from sglang.srt.mem_cache.pool_host import PoolEntry
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.page_interleave import (
     PageInterleaveHostPool,
@@ -123,6 +125,7 @@ from sglang.srt.utils import ceil_div
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.mem_cache_utils import finish_req
 from sglang.test.test_utils import CustomTestCase, enter_scope
+from sglang.test.tree_slots import tree_slots_of
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
@@ -309,6 +312,34 @@ class TestZeroSmScratchLayout(CustomTestCase):
                 )
                 if version < _NCCL_SYMMETRIC_SCRATCH_MIN_VERSION:
                     same_node.assert_not_called()
+
+    def test_cross_node_group_keeps_sm_gather(self):
+        with (
+            envs.SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER.override(True),
+            unittest.mock.patch(
+                "sglang.srt.mem_cache.page_interleave_pool.is_cuda",
+                return_value=True,
+            ),
+            unittest.mock.patch(
+                "sglang.srt.mem_cache.page_interleave_pool.NCCLLibrary"
+            ) as library,
+            unittest.mock.patch(
+                "sglang.srt.mem_cache.page_interleave_pool.in_the_same_node_as",
+                return_value=[True, False],
+            ) as same_node,
+        ):
+            library.return_value.ncclGetRawVersion.return_value = (
+                _NCCL_SYMMETRIC_SCRATCH_MIN_VERSION
+            )
+            cpu_group = object()
+            self.assertFalse(
+                _symmetric_scratch_supported(
+                    memory_saver_enabled=False,
+                    custom_mem_pool=None,
+                    shard_group=SimpleNamespace(cpu_group=cpu_group),
+                )
+            )
+            same_node.assert_called_once_with(cpu_group, source_rank=0)
 
     def test_slot_tensors_are_window_aligned_and_disjoint(self):
         """Both slots share one symmetric window: every tensor must start on
@@ -1023,7 +1054,7 @@ def _unified_tree(page_size=4, pool_size=256, disable=False):
             token_to_kv_pool_allocator=allocator,
             page_size=page_size,
             eviction_policy="lru",
-            tree_components=(ComponentType.FULL,),
+            tree_slots=tree_slots_of((ComponentType.FULL,)),
         )
     )
 
@@ -1071,7 +1102,7 @@ class TestShardedAllocationEviction(CustomTestCase):
                 ),
                 token_to_kv_pool_allocator=allocator,
                 page_size=PS,
-                tree_components=(ComponentType.FULL,),
+                tree_slots=tree_slots_of((ComponentType.FULL,)),
                 tree_core_backend="python",
             )
         )
@@ -1204,7 +1235,7 @@ class TestShardedCoreGate(_TreeCoreBackendCase):
             token_to_kv_pool_allocator=_make_allocator(pages_per_rank=8),
             page_size=PS,
             eviction_policy="lru",
-            tree_components=(ComponentType.FULL,),
+            tree_slots=tree_slots_of((ComponentType.FULL,)),
         )
         with unittest.mock.patch.object(
             type(tree.tree_core), "supports_rotation_base", False
@@ -1222,7 +1253,7 @@ class TestShardedCoreGate(_TreeCoreBackendCase):
             token_to_kv_pool_allocator=tree.token_to_kv_pool_allocator,
             page_size=4,
             eviction_policy="lru",
-            tree_components=(ComponentType.FULL,),
+            tree_slots=tree_slots_of((ComponentType.FULL,)),
         )
         with unittest.mock.patch.object(
             type(tree.tree_core), "supports_rotation_base", False
@@ -2052,8 +2083,11 @@ class TestOwnedRows(CustomTestCase):
         host = pool.alloc(6 * PS, start_owner=0)
         controller = HybridCacheController.__new__(HybridCacheController)
         controller.is_kv_sharded = True
-        entry = SimpleNamespace(host_pool=pool, device_pool=object(), layer_mapper=None)
-        indexer = SimpleNamespace(
+        entry = PoolEntry(
+            name=PoolName.KV, host_pool=pool, device_pool=object(), layer_mapper=None
+        )
+        indexer = PoolEntry(
+            name=PoolName.INDEXER,
             host_pool=SimpleNamespace(can_use_write_back_jit=False),
             device_pool=object(),
             layer_mapper=None,

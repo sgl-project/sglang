@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.managers.scheduler_components.request_list import ListKind
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -35,8 +36,7 @@ def _make_checker(page_size=_PAGE_SIZE, row_width=4096, num_reqs=8, free_pages=N
         token_to_kv_pool_allocator = _alloc
         tree_cache = _tc
         get_last_batch = lambda self: None
-        get_running_batch = lambda self: None
-        get_chunked_req = lambda self: None
+        get_request_lists = lambda self: {}
         count_memory_leak_warnings = 0
 
         from sglang.srt.managers.scheduler_components.invariant_checker import (
@@ -63,9 +63,9 @@ class _FakeOwner:
 class TestKVPageInvariants(CustomTestCase):
     def test_committed_gt_allocated_raises(self):
         chk, rtt, tc, alloc = _make_checker()
-        chk.get_last_batch = lambda: SimpleNamespace(
-            reqs=[_FakeOwner(0, 145, 144, rid="a")]
-        )
+        chk.get_request_lists = lambda: {
+            ListKind.DECODING: [_FakeOwner(0, 145, 144, rid="a")]
+        }
         with self.assertRaises(AssertionError):
             chk._check_kv_page_invariants()
 
@@ -82,25 +82,22 @@ class TestKVPageInvariants(CustomTestCase):
         rtt[0, :3] = torch.tensor(
             [5 * _PAGE_SIZE, 5 * _PAGE_SIZE + 1, 5 * _PAGE_SIZE + 2]
         )
-        chk.get_last_batch = lambda: SimpleNamespace(
-            reqs=[_FakeOwner(0, 3, 3, rid="a")]
-        )
+        chk.get_request_lists = lambda: {
+            ListKind.DECODING: [_FakeOwner(0, 3, 3, rid="a")]
+        }
         with self.assertRaises(ValueError):
             chk._check_kv_page_invariants()
 
-    def test_requests_outside_last_batch_are_checked(self):
-        # A request still owns its row from running_batch or parked between chunks.
-        for where in ("running", "chunked"):
+    def test_requests_in_any_list_are_checked(self):
+        # A request still owns its row while running or parked between chunks.
+        for where in (ListKind.DECODING, ListKind.CHUNKED):
             with self.subTest(where=where):
                 chk, rtt, tc, alloc = _make_checker(free_pages=torch.tensor([5, 6, 7]))
                 rtt[0, :3] = torch.tensor(
                     [5 * _PAGE_SIZE, 5 * _PAGE_SIZE + 1, 5 * _PAGE_SIZE + 2]
                 )
                 owner = _FakeOwner(0, 3, 3, rid="a")
-                if where == "running":
-                    chk.get_running_batch = lambda: SimpleNamespace(reqs=[owner])
-                else:
-                    chk.get_chunked_req = lambda: owner
+                chk.get_request_lists = lambda: {where: [owner]}
                 with self.assertRaises(ValueError):
                     chk._check_kv_page_invariants()
 
@@ -111,9 +108,9 @@ class TestKVPageInvariants(CustomTestCase):
             return_value=torch.tensor([5, 6], dtype=torch.int64)
         )
         rtt[0, :1] = torch.tensor([5 * alloc.page_size])
-        chk.get_last_batch = lambda: SimpleNamespace(
-            reqs=[_FakeOwner(0, 1, 1, rid="classed")]
-        )
+        chk.get_request_lists = lambda: {
+            ListKind.DECODING: [_FakeOwner(0, 1, 1, rid="classed")]
+        }
 
         with patch(
             "sglang.srt.managers.scheduler_components.invariant_checker.page_interleave_shard_size",
@@ -127,9 +124,9 @@ class TestKVPageInvariants(CustomTestCase):
     def test_free_pool_duplicate_raises(self):
         chk, rtt, tc, alloc = _make_checker(free_pages=torch.tensor([3, 3, 4]))
         rtt[0, :1] = torch.tensor([10 * _PAGE_SIZE])  # owner page 10, not in free
-        chk.get_last_batch = lambda: SimpleNamespace(
-            reqs=[_FakeOwner(0, 1, 1, rid="a")]
-        )
+        chk.get_request_lists = lambda: {
+            ListKind.DECODING: [_FakeOwner(0, 1, 1, rid="a")]
+        }
         with self.assertRaises(ValueError):
             chk._check_kv_page_invariants()
 

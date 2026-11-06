@@ -26,7 +26,8 @@ use super::{
     AppState, MAX_OPENAI_CHOICES, collect_output, error_payload, indexed_decode_stream,
     model_error, openai_error, submit_generation, unix_seconds_u32,
 };
-use crate::api_server::core::{CoreCall, CoreError, CoreEvent, CoreOutput};
+use crate::api_server::core::{CoreError, CoreEvent, CoreOutput};
+use crate::api_server::handlers::CoreCall;
 use crate::message::finish_reason::Matched;
 use crate::message::ids::Rid;
 use crate::message::request::GenerateRequest;
@@ -42,6 +43,9 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
 struct CompletionRequest {
     #[serde(flatten)]
     request: CreateCompletionRequest,
+    /// Python's `skip_special_tokens` request extension; absent keeps the
+    /// sampling default (drop them).
+    skip_special_tokens: Option<bool>,
     #[serde(flatten)]
     routing: PDRoutingFields,
 }
@@ -70,7 +74,11 @@ async fn completions(
     State(state): State<Arc<AppState>>,
     body: Result<Json<CompletionRequest>, JsonRejection>,
 ) -> Response {
-    let CompletionRequest { request, routing } = match body {
+    let CompletionRequest {
+        request,
+        skip_special_tokens,
+        routing,
+    } = match body {
         Ok(Json(request)) => request,
         Err(rejection) => {
             return openai_error(StatusCode::BAD_REQUEST, rejection.body_text(), false);
@@ -126,6 +134,9 @@ async fn completions(
             return openai_error(StatusCode::BAD_REQUEST, &message, false);
         }
     };
+    if let Some(skip_special_tokens) = skip_special_tokens {
+        sampling.skip_special_tokens = skip_special_tokens;
+    }
     if let Err(error) = sampling.normalize(
         state.server_args.skip_tokenizer_init,
         state.server_args.model_config.vocab_size,

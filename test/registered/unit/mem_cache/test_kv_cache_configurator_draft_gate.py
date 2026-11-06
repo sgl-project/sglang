@@ -13,7 +13,7 @@
 # ==============================================================================
 """How a draft worker's KVCacheConfigurator binds its KV under the unified pool.
 
-With a fused region the draft binds `UnifiedDraftKVPool` over the target's
+With a fused region the draft binds `DraftMHAView` over the target's
 allocator (a compact-window DFLASH draft with a private `req_to_token` of its
 own), refusing a KV dtype unlike the region's. Without one it takes the private
 arm, sized by the full sub-allocator's VIRTUAL id space (`max_slots - 1`), not
@@ -42,12 +42,13 @@ from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache import kv_cache_configurator as kcc
 from sglang.srt.mem_cache import unified_draft_pool
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
-from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-    UnifiedSWATokenToKVPoolAllocator,
-)
 from sglang.srt.mem_cache.base_prefix_cache import DecLockRefParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import checkpoint_kv_cache
+from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
+from sglang.srt.mem_cache.kv.layout.base import _store_dtype_for
+from sglang.srt.mem_cache.kv.layout.mha import DraftMHAView, MHASubPoolSpec
+from sglang.srt.mem_cache.kv.requests import RequestTable
 from sglang.srt.mem_cache.layout.fused_draft import (
     DenseDraftRegion,
     FusedDraftPlacement,
@@ -56,23 +57,20 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.pure_swa_radix_cache import PureSWARadixCache
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
-from sglang.srt.mem_cache.unified_draft_pool import (
-    UnifiedDraftKVPool,
-    UnifiedDraftSWAKVPool,
-)
-from sglang.srt.mem_cache.unified_memory_pool import (
-    MHASubPoolSpec,
-    UnifiedKVPool,
-    _store_dtype_for,
-)
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+from sglang.test.unified_allocator_fixtures import (
+    FakeUnifiedSWAKVPool,
+    arena_of,
+    plan_stand_in,
+    stand_in_views,
+)
 
 register_cpu_ci(est_time=35, stage="weekly", runner_config="cpu")
 maybe_stub_sgl_kernel()
@@ -81,26 +79,7 @@ from sglang.srt.speculative.multi_layer_eagle_worker_v2 import (
     MultiLayerEagleDraftWorker,
     MultiLayerEagleWorkerV2,
 )
-
-
-class _FakeKVCache:
-    def __init__(self, max_slots):
-        self.buf = torch.full((max_slots,), -1, dtype=torch.int64)
-        self.allocator = None
-
-    def attach_allocator(self, allocator):
-        self.allocator = allocator
-
-
-class _FakeUnifiedSWAKVPool:
-    def __init__(self, shared_pool):
-        self.full_kv_pool = _FakeKVCache(shared_pool.max_slots("full"))
-        self.swa_kv_pool = _FakeKVCache(shared_pool.max_slots("swa"))
-        self.full_to_swa_index_mapping = None
-
-    def attach_allocators(self, *, full_allocator, swa_allocator):
-        self._full_allocator = full_allocator
-        self._swa_allocator = swa_allocator
+from sglang.test.tree_slots import tree_slots_of
 
 
 class _CapturedSizes(Exception):
@@ -124,8 +103,14 @@ def _bare(cls, **attrs):
 def _multi_layer_worker(pools_and_windows, *, front):
     """A multi-layer MTP worker whose draft runners hold these (pool, window)
     pairs and whose draft extend is widened by `front` rows."""
+    # A draft runner's `RunnerIds` calls its pool fused when the pool's writes
+    # take the shared allocator's physical ids.
     runners = [
-        SimpleNamespace(token_to_kv_pool=pool, sliding_window_size=window)
+        SimpleNamespace(
+            token_to_kv_pool=pool,
+            sliding_window_size=window,
+            runner_ids=SimpleNamespace(is_fused_draft=pool.requires_physical_write_loc),
+        )
         for pool, window in pools_and_windows
     ]
     draft = _bare(
@@ -143,13 +128,13 @@ def _swa_cache_params(*, sliding_window_size, draft_swa_window):
         token_to_kv_pool_allocator=None,
         page_size=1,
         sliding_window_size=sliding_window_size,
-        draft_swa_window=draft_swa_window,
+        draft_window_reaches={"swa": draft_swa_window},
     )
 
 
 class TestDraftBindingDispatch(CustomTestCase):
     def setUp(self):
-        # `KVIndexTranslator.__init__` reads `attn_dcp_size`, a derived
+        # `RunnerIds.__init__` reads `attn_dcp_size`, a derived
         # parallel width that only exists once a config is published.
         reset_context()
         self.addCleanup(reset_context)
@@ -197,23 +182,26 @@ class TestDraftBindingDispatch(CustomTestCase):
             draft_region=region if host == "swa" else None,
         )
         total = n_full * full_spec.entry_bytes() + n_swa * swa_spec.entry_bytes()
-        pool = UnifiedKVPool(
+        placement = (
+            FusedDraftPlacement.from_counts(counts={host: [1]}, regions={host: region})
+            if region is not None
+            else None
+        )
+        pool = arena_of(
             total_bytes=total,
             sub_pool_specs=[full_spec, swa_spec],
             device="cpu",
             enable_memory_saver=False,
             page_size=_PS,
-            fused_draft=(
-                FusedDraftPlacement.from_counts(
-                    counts={host: [1]}, regions={host: region}
-                )
-                if region is not None
-                else None
-            ),
+            fused_draft=placement,
         )
-        return UnifiedSWATokenToKVPoolAllocator(
-            unified_buffer=pool,
-            kvcache=_FakeUnifiedSWAKVPool(pool),
+        alloc = ChainAllocator(
+            roles=ChainRoles(owner="full", window="swa"),
+            arena=pool,
+            kvcache=FakeUnifiedSWAKVPool(pool),
+            views=stand_in_views(
+                ChainRoles(owner="full", window="swa"), FakeUnifiedSWAKVPool(pool)
+            ),
             device="cpu",
             full_max_total_num_tokens=n_full,
             swa_max_total_num_tokens=n_swa,
@@ -221,6 +209,9 @@ class TestDraftBindingDispatch(CustomTestCase):
             need_sort=False,
             forward_stream=None,
         )
+        # The target's KV storage, as far as draft binding reads it.
+        alloc.storage = SimpleNamespace(plan=plan_stand_in(pool, placement))
+        return alloc
 
     def _run(
         self,
@@ -232,7 +223,16 @@ class TestDraftBindingDispatch(CustomTestCase):
         req_to_token_pool="shared",
     ):
         if req_to_token_pool == "shared":
-            req_to_token_pool = object()
+            # The target's table: slot ids only, no recurrent state.
+            req_to_token_pool = RequestTable(
+                size=8,
+                pre_alloc_size=0,
+                max_context_len=64,
+                state_sub_pool=None,
+                tracking=None,
+                device="cpu",
+                enable_memory_saver=False,
+            )
         cfg = kcc.KVCacheConfigurator.__new__(kcc.KVCacheConfigurator)
         cfg.kv_cache_dtype = kv_dtype
         cfg.is_draft_worker = True
@@ -240,7 +240,7 @@ class TestDraftBindingDispatch(CustomTestCase):
         cfg.spec_algorithm = algorithm
         cfg.page_size = _PS
         cfg.is_hybrid_swa = False
-        cfg.is_hybrid_swa_mtp_draft = False
+        cfg.draft_owns_its_depth = False
         cfg.model = object()
         cfg.model_config = SimpleNamespace(hf_config=None, is_hybrid_swa=False)
         sizes = kcc._PoolSizes(
@@ -259,7 +259,7 @@ class TestDraftBindingDispatch(CustomTestCase):
         def _capture(self, *, sizes, **kw):
             raise _CapturedSizes(sizes)
 
-        built_req_pool = SimpleNamespace(kind="private-compact")
+        built_req_pool = SimpleNamespace(kind="private-compact", state=None)
 
         with (
             patch.object(
@@ -297,24 +297,25 @@ class TestDraftBindingDispatch(CustomTestCase):
                 token_to_kv_pool_allocator=alloc,
             )
 
-    def test_non_eagle_draft_takes_the_private_arm_sized_by_the_id_space(self):
-        alloc = self._swa_allocator(with_draft_region=False)
-        id_space = alloc.full_attn_allocator.max_slots - 1
-        # The distinction under test only exists while budget < id space.
-        self.assertLess(alloc.size_full, id_space)
-        with self.assertRaises(_CapturedSizes) as caught:
-            self._run(
-                algorithm=SpeculativeAlgorithm.DSPARK,
-                alloc=alloc,
-                max_total_num_tokens=alloc.size_full,
-            )
-        sized = caught.exception.sizes.max_total_num_tokens
-        self.assertEqual(sized, (id_space + _PS - 1) // _PS * _PS)
+    def test_supported_drafts_require_a_declared_placement(self):
+        for algorithm in (
+            SpeculativeAlgorithm.EAGLE3,
+            SpeculativeAlgorithm.DFLASH,
+            SpeculativeAlgorithm.DSPARK,
+        ):
+            with self.subTest(algorithm=algorithm.name):
+                alloc = self._swa_allocator(with_draft_region=False)
+                with self.assertRaisesRegex(
+                    ValueError, "must declare the draft payload"
+                ):
+                    self._run(
+                        algorithm=algorithm,
+                        alloc=alloc,
+                        max_total_num_tokens=alloc.size_full,
+                    )
 
     def test_a_draft_with_a_region_binds_the_fused_pool(self):
-        """An EAGLE or DSPARK draft binds the fused pool over the target's
-        allocator when the target resolved a region; the region-less private
-        arm above is the fallback."""
+        """Supported draft algorithms bind the placement priced by the target."""
         alloc = self._swa_allocator(with_draft_region=True)
         for algorithm in (SpeculativeAlgorithm.EAGLE3, SpeculativeAlgorithm.DSPARK):
             pools = self._run(
@@ -322,7 +323,7 @@ class TestDraftBindingDispatch(CustomTestCase):
                 alloc=alloc,
                 max_total_num_tokens=alloc.size_full,
             )
-            self.assertIsInstance(pools.token_to_kv_pool, UnifiedDraftKVPool)
+            self.assertIsInstance(pools.token_to_kv_pool, DraftMHAView)
             self.assertIs(pools.token_to_kv_pool_allocator, alloc)
 
     def test_a_draft_kv_dtype_unlike_the_region_refuses_to_bind(self):
@@ -369,13 +370,14 @@ class TestDraftBindingDispatch(CustomTestCase):
             max_total_num_tokens=alloc.size_full,
             req_to_token_pool=None,
         )
-        self.assertIsInstance(pools.token_to_kv_pool, UnifiedDraftKVPool)
+        self.assertIsInstance(pools.token_to_kv_pool, DraftMHAView)
         self.assertEqual(pools.req_to_token_pool.kind, "private-compact")
 
-    def test_window_draft_binds_the_swa_composite(self):
+    def test_window_draft_routes_its_layer_to_the_swa_sub_pool(self):
         """MiMoV2MTP shape: the runner's one layer is a window layer placed in
-        the swa sub-pool, so it binds the SWA-shaped composite (the backends
-        key their swa rail on it), with no full side at all."""
+        the swa sub-pool, so its pool routes that layer to the swa sub-pool's
+        view (the backends read the window through the router), with no full
+        side at all."""
         alloc = self._swa_allocator(with_draft_region=True, window_draft=True)
         with patch.object(unified_draft_pool, "draft_swa_layer_ids", return_value=(0,)):
             pools = self._run(
@@ -384,9 +386,7 @@ class TestDraftBindingDispatch(CustomTestCase):
                 max_total_num_tokens=alloc.size_full,
             )
         pool = pools.token_to_kv_pool
-        self.assertIsInstance(pool, UnifiedDraftSWAKVPool)
-        self.assertEqual(pool.layers_mapping, {0: (0, True)})
-        self.assertIsNone(pool.full_kv_pool)
+        self._assert_routes_only_the_window(pool)
         self.assertIs(pools.token_to_kv_pool_allocator, alloc)
 
     def test_a_per_depth_window_runner_trusts_the_placement(self):
@@ -405,10 +405,14 @@ class TestDraftBindingDispatch(CustomTestCase):
                 alloc=alloc,
                 max_total_num_tokens=alloc.size_full,
             )
-        pool = pools.token_to_kv_pool
-        self.assertIsInstance(pool, UnifiedDraftSWAKVPool)
-        self.assertEqual(pool.layers_mapping, {0: (0, True)})
-        self.assertIsNone(pool.full_kv_pool)
+        self._assert_routes_only_the_window(pools.token_to_kv_pool)
+
+    def _assert_routes_only_the_window(self, pool):
+        router = pool.layer_router
+        self.assertEqual(router.route(0).sub_pool, "swa")
+        self.assertEqual(router.route(0).index, 0)
+        self.assertIsNone(router.sub_pool("full"))
+        self.assertTrue(pool.requires_physical_write_loc)
 
     def _bound_draft_pool(self, *, window_draft: bool):
         alloc = self._swa_allocator(with_draft_region=True, window_draft=window_draft)
@@ -428,11 +432,12 @@ class TestDraftBindingDispatch(CustomTestCase):
         window 511 and a draft extend widened by 5 front rows. The draft reads
         516 tokens back, so eviction keeps 516 while the window stays 511."""
         pool = self._bound_draft_pool(window_draft=True)
-        self.assertIsInstance(pool, UnifiedDraftSWAKVPool)
+        self.assertEqual(pool.layer_router.route(0).sub_pool, "swa")
         worker = _multi_layer_worker([(pool, 511)] * 3, front=5)
-        self.assertEqual(worker.draft_swa_window, 516)
+        self.assertEqual(worker.draft_window_reaches, {"swa": 516})
         params = _swa_cache_params(
-            sliding_window_size=511, draft_swa_window=worker.draft_swa_window
+            sliding_window_size=511,
+            draft_swa_window=worker.draft_window_reaches.get("swa", 0),
         )
         self.assertEqual(params.swa_retain_window, 516)
         self.assertEqual(params.sliding_window_size, 511)
@@ -442,7 +447,7 @@ class TestDraftBindingDispatch(CustomTestCase):
         folded into the full sub-pool, a private pool (the baseline), or an
         extend without front rows leaves the retain window at the target's."""
         full_pool = self._bound_draft_pool(window_draft=False)
-        self.assertIsInstance(full_pool, UnifiedDraftKVPool)
+        self.assertIsInstance(full_pool, DraftMHAView)
         cases = [
             (full_pool, 5),
             (object.__new__(SWAKVPool), 5),
@@ -451,7 +456,8 @@ class TestDraftBindingDispatch(CustomTestCase):
         for pool, front in cases:
             worker = _multi_layer_worker([(pool, 511)], front=front)
             params = _swa_cache_params(
-                sliding_window_size=511, draft_swa_window=worker.draft_swa_window
+                sliding_window_size=511,
+                draft_swa_window=worker.draft_window_reaches.get("swa", 0),
             )
             self.assertEqual(params.swa_retain_window, 511, type(pool).__name__)
 
@@ -502,8 +508,11 @@ class TestSWARetainWindow(CustomTestCase):
                 token_to_kv_pool_allocator=allocator,
                 page_size=1,
                 sliding_window_size=_WINDOW,
-                draft_swa_window=draft_swa_window,
-                tree_components=(ComponentType.FULL, ComponentType.SWA),
+                draft_window_reaches={"swa": draft_swa_window},
+                tree_slots=tree_slots_of(
+                    (ComponentType.FULL, ComponentType.SWA),
+                    window=max(_WINDOW, draft_swa_window),
+                ),
             )
         )
         req = Req(
