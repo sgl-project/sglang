@@ -4753,6 +4753,7 @@ SUPPORTED_LORA_TARGET_MODULES = [
     "wk",
     "weights_proj",
     "gate_proj",
+    "self_attn.gate_proj",
     "up_proj",
     "down_proj",
     "qkv_proj",
