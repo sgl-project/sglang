@@ -400,7 +400,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.attention_graph_variants: Optional[AttentionGraphVariants] = (
             self.dllm_attention.graph_variants(self.captured_req_width)
             if self.dllm_attention is not None and self.is_dllm
-            else create_attention_graph_variants(model_runner.model_config.hf_config)
+            else create_attention_graph_variants(
+                model_runner.model_config.hf_config, self.capture_forward_mode
+            )
             or create_dsv41_candidate_graph_variants(
                 model_runner, self.capture_forward_mode, self.captured_req_width
             )

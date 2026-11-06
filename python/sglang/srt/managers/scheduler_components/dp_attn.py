@@ -49,6 +49,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
     get_spec,
+    max_speculative_num_draft_tokens,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
@@ -164,6 +165,8 @@ class MLPSyncBatchInfo:
     is_health_check: bool = False
     # Causal (query, key) pairs this rank attends this step.
     attention_pairs: int = 0
+    # Upper bound of the longest sequence in this rank's decode step (0 without one).
+    decode_graph_max_seq_len: int = 0
 
     # some gathered elements
     tp0_info_cpu: torch.Tensor = None
@@ -172,6 +175,7 @@ class MLPSyncBatchInfo:
     global_num_tokens: list[int] = None
     global_num_tokens_for_logprob: list[int] = None
     global_attention_pairs: list[int] = None
+    global_decode_graph_max_seq_len: Optional[int] = None
     tbo_split_seq_index: torch.Tensor = None
     global_forward_mode: int = None
     dp_cooperation_info: Optional[DPCooperationInfo] = None
@@ -190,6 +194,7 @@ class MLPSyncBatchInfo:
                 int(self.can_run_draft_cuda_graph),
                 int(self.is_health_check),
                 self.attention_pairs,
+                self.decode_graph_max_seq_len,
             ],
             device=device,
             dtype=dtype,
@@ -209,6 +214,7 @@ class MLPSyncBatchInfo:
                 1,  # can_run_draft_cuda_graph
                 0,  # is_health_check
                 0,  # attention_pairs
+                0,  # decode_graph_max_seq_len
             ],
             device=device,
             dtype=dtype,
@@ -220,6 +226,7 @@ class MLPSyncBatchInfo:
         self.global_num_tokens = [self.num_tokens]
         self.global_num_tokens_for_logprob = [self.num_tokens_for_logprob]
         self.global_attention_pairs = [self.attention_pairs]
+        self.global_decode_graph_max_seq_len = self.decode_graph_max_seq_len
         self.any_health_check = self.is_health_check
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
@@ -297,6 +304,7 @@ class MLPSyncBatchInfo:
         self.can_run_draft_cuda_graph = bool(tp0_info_cpu[:, 8].min())
         self.any_health_check = bool(tp0_info_cpu[:, 9].max())
         self.global_attention_pairs = tp0_info_cpu[:, 10].tolist()
+        self.global_decode_graph_max_seq_len = int(tp0_info_cpu[:, 11].max())
         self.sync_wait_seconds = time.perf_counter() - sync_start
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
@@ -345,6 +353,9 @@ def _update_gather_batch(
         batch.is_extend_in_batch = mlp_sync_info.is_extend_in_batch
         batch.tbo_split_seq_index = mlp_sync_info.tbo_split_seq_index
         batch.global_forward_mode = mlp_sync_info.global_forward_mode
+    batch.dp_decode_graph_max_seq_len = (
+        None if skip_global_metadata else mlp_sync_info.global_decode_graph_max_seq_len
+    )
 
     # Check forward mode for cuda graph
     batch.can_run_decode_cuda_graph = mlp_sync_info.can_run_decode_cuda_graph
@@ -500,6 +511,29 @@ def _local_attention_pairs(local_batch: Optional[ScheduleBatch]) -> int:
     return _prefill_attention_pairs(local_batch)
 
 
+def _local_decode_graph_max_seq_len(
+    local_batch: Optional[ScheduleBatch], spec_algorithm: SpeculativeAlgorithm
+) -> int:
+    """Upper bound of the longest sequence this rank's decode step attends, read on the
+    host. Without a host seq_lens mirror (speculative acceptance in flight, or a merge
+    that dropped it) the committed lengths lag the device by up to one unprocessed step
+    plus this step's tokens, so reserve two steps' width."""
+    if (
+        local_batch is None
+        or not local_batch.forward_mode.is_decode()
+        or local_batch.batch_size() == 0
+    ):
+        return 0
+    if local_batch.seq_lens_cpu is not None and local_batch.seq_lens_cpu.numel() > 0:
+        return int(local_batch.seq_lens_cpu.max())
+    step_width = (
+        1
+        if spec_algorithm.is_none()
+        else max(max_speculative_num_draft_tokens() or 0, 1)
+    )
+    return max(req.seqlen for req in local_batch.reqs) + 2 * step_width
+
+
 class DPSyncWaitCarry:
     """MLP-sync wait of batch-less gathers, folded into the next recorded step.
 
@@ -644,6 +678,9 @@ def prepare_mlp_sync_batch_raw(
         # Gathered unconditionally like the other columns, so a per-process
         # metrics flag cannot make ranks disagree on what the tensor holds.
         attention_pairs=_local_attention_pairs(local_batch),
+        decode_graph_max_seq_len=_local_decode_graph_max_seq_len(
+            local_batch, model_runner.spec_algorithm
+        ),
     )
 
     if num_dp_ranks == 1:

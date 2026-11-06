@@ -25,6 +25,22 @@ class AttentionGraphVariants(Protocol):
         ...
 
 
+def dp_decode_max_seq_len(forward_batch: ForwardBatch) -> Optional[int]:
+    """The step's longest sequence agreed by all attention-DP ranks, for decode/idle.
+
+    Under DP attention the ranks replay their graphs in lockstep and the collectives
+    captured inside them pair up across ranks (some register their graph's input
+    buffers), so every rank must replay the same variant. A per-rank length picks
+    different variants when the ranks hold different requests (an idle rank has
+    none). The scheduler's MLP sync gathers an upper bound per rank and stores the
+    maximum on the batch; None without the sync (no DP attention) or outside decode.
+    """
+    max_seq_len = getattr(forward_batch, "dp_decode_graph_max_seq_len", None)
+    if max_seq_len is None or not forward_batch.forward_mode.is_decode_or_idle():
+        return None
+    return max_seq_len
+
+
 @dataclass(frozen=True)
 class DsaGraphVariants:
     index_topk: int
@@ -32,6 +48,9 @@ class DsaGraphVariants:
     capture_labels: ClassVar[tuple[str, ...]] = (DSA_DENSE, DSA_SPARSE)
 
     def select(self, forward_batch: ForwardBatch) -> str:
+        dp_max_seq_len = dp_decode_max_seq_len(forward_batch)
+        if dp_max_seq_len is not None:
+            return DSA_DENSE if dp_max_seq_len <= self.index_topk else DSA_SPARSE
         seq_lens_cpu = forward_batch.seq_lens_cpu
         if seq_lens_cpu is not None and seq_lens_cpu.numel() > 0:
             # Plain decode maintains this host mirror without a D2H sync.
@@ -58,17 +77,26 @@ class SeqLenBucketGraphVariants(msgspec.Struct, frozen=True):
         return tuple(label for label, _ in self.graph_limits) + (self.fallback_label,)
 
     def select(self, forward_batch: ForwardBatch) -> str:
+        max_seq_len = dp_decode_max_seq_len(forward_batch)
         # Only the host mirror is read: a device max would sync every replay.
         lengths = forward_batch.seq_lens_cpu
-        if lengths is not None and lengths.device.type == "cpu" and lengths.numel() > 0:
+        if (
+            max_seq_len is None
+            and lengths is not None
+            and lengths.device.type == "cpu"
+            and lengths.numel() > 0
+        ):
             max_seq_len = int(lengths.max())
+        if max_seq_len is not None:
             for label, limit in self.graph_limits:
                 if max_seq_len <= limit:
                     return label
         return self.fallback_label
 
 
-def create_attention_graph_variants(hf_config) -> Optional[AttentionGraphVariants]:
+def create_attention_graph_variants(
+    hf_config, capture_forward_mode=None
+) -> Optional[AttentionGraphVariants]:
     from sglang.srt.configs.model_config import (
         get_dsa_index_kpool,
         get_dsa_index_topk,
@@ -80,6 +108,10 @@ def create_attention_graph_variants(hf_config) -> Optional[AttentionGraphVariant
         # KPool has no dense-skip path: both variants run the full indexer.
         # Capture it once, keeping the regular DSA dense/sparse split intact.
         if get_dsa_index_kpool(hf_config) > 1:
+            return None
+        # The dense variant only changes the decode/idle indexer (k-only skip); a
+        # target-verify capture runs the full indexer in both, so one graph serves.
+        if capture_forward_mode is not None and not capture_forward_mode.is_decode():
             return None
 
         index_topk = get_dsa_index_topk(hf_config)
@@ -111,6 +143,11 @@ class Dsv41CandidateGraphVariants:
     verify_extra_tokens: int = 0
 
     def select(self, forward_batch: ForwardBatch) -> str:
+        # Decode only: a DSpark target verify stages its metadata for the variant of
+        # its own committed lengths (select_for_max_seq_len) before the replay.
+        dp_max_seq_len = dp_decode_max_seq_len(forward_batch)
+        if dp_max_seq_len is not None:
+            return self.select_for_max_seq_len(dp_max_seq_len)
         lengths = getattr(forward_batch, "seq_lens_cpu", None)
         max_seq_len = None
         if lengths is not None and lengths.device.type == "cpu" and lengths.numel() > 0:

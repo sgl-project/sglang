@@ -2009,6 +2009,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     can_run_dp_draft_cuda_graph: bool = False
     can_run_dp_prefill_cuda_graph: bool = False
     dp_prefill_cuda_graph_max_prefix_len: int = 0
+    # Longest sequence of the step across attention-DP ranks (MLP sync), for a
+    # rank-consistent decode graph variant; None when the ranks did not sync.
+    dp_decode_graph_max_seq_len: Optional[int] = None
     tbo_split_seq_index: Optional[int] = None
     # Rank-consistent forward mode for the recv skipper, derived from the MLP
     # sync all-gather (the TBO-only `global_forward_mode` is None without TBO).
@@ -3455,6 +3458,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             can_run_dp_draft_cuda_graph=self.can_run_dp_draft_cuda_graph,
             can_run_dp_prefill_cuda_graph=self.can_run_dp_prefill_cuda_graph,
             dp_prefill_cuda_graph_max_prefix_len=self.dp_prefill_cuda_graph_max_prefix_len,
+            dp_decode_graph_max_seq_len=self.dp_decode_graph_max_seq_len,
             is_extend_in_batch=self.is_extend_in_batch,
             is_prefill_only=self.is_prefill_only,
             seq_lens_cpu=self.seq_lens_cpu,
