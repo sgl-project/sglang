@@ -3,7 +3,7 @@ from typing import Optional
 
 from sglang.srt.layers.attention.qsa.config import QSAProfile
 from sglang.srt.runtime_context import attention_backends, get_spec
-from sglang.srt.utils.common import (
+from sglang.srt.utils.device import (
     cpu_has_amx_support,
     is_blackwell,
     is_cpu,

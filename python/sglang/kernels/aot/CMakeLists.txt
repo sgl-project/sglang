@@ -532,9 +532,6 @@ find_library(TORCH_PYTHON_LIBRARY torch_python PATHS "${TORCH_INSTALL_PREFIX}/li
 target_link_libraries(infllm_ops PRIVATE ${TORCH_LIBRARIES} ${TORCH_PYTHON_LIBRARY} c10 cuda)
 install(TARGETS infllm_ops LIBRARY DESTINATION "sgl_kernel")
 
-# ============================ Extra Install: FLashMLA ============================= #
-include(${CMAKE_CURRENT_LIST_DIR}/cmake/flashmla.cmake)
-
 # ============================ Extra Install: triton kernels ============================= #
 install(DIRECTORY "${repo-triton_SOURCE_DIR}/python/triton_kernels/triton_kernels/"
         DESTINATION "triton_kernels"

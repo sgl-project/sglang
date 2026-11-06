@@ -4,7 +4,7 @@ import os
 import sys
 import unittest
 
-from sglang.srt.utils.common import is_xpu
+from sglang.srt.utils.device import is_xpu
 
 # Put the `test/` root on sys.path so `registered.<...>` resolves regardless of
 # cwd: CI runs each file as `python3 <full_path>` (only the file's own dir is on

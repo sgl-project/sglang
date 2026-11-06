@@ -143,6 +143,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_OPT_CUTEDSL_EP_DEFERRED_FINALIZE`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Allow the CuTe DSL fused MoE finalize path to consume expert-parallel handoffs when its runtime capability checks pass. When unset, this follows `SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION`; an explicit `0` or `1` takes precedence.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Follows the NVIDIA runtime master (both unset: <code>false</code>)</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_ENABLE_TORCH_INFERENCE_MODE`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Control whether to use torch.inference_mode</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`false`</td>
@@ -958,6 +963,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_SYNC_TOKEN_IDS_ACROSS_TP</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Synchronize sampled token ids across tensor-parallel ranks.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_GATED_TRANSFER_WATCHDOG_MS</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Gated background transfers: force open a transfer gate whose pause has been held this many milliseconds, and log an error. A pause that never resumes means work the resume depends on is stuck behind a parked chunk (a hardware queue shared with it, a lazy module load or a device sync inside a pause); the transfer then overlaps the foreground op instead of hanging it. <code>0</code> disables the watchdog.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>1000</code></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER</code></td>
@@ -1956,6 +1966,26 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_OPT_HIP_K3_MLA_ABSORB_FP8</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Kimi-K3 on gfx950 with AITER: requantize a Quark per-channel FP8 <code>kv_b_proj</code> to per-tensor FP8 so the MLA absorb BMMs run AITER's a8w8 kernel. Set to <code>false</code> to dequantize it to BF16 instead (about 0.12% vs 2.3% weight error, at BF16 BMM speed). Other ROCm targets always use the BF16 dequant.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ROCM_K3_KDA_FUSED_BACKEND</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Kimi-K3 fused KDA decode on ROCm: <code>gfx950</code> runs the in-tree gfx950 kernel, <code>aiter</code> runs AITER's FlyDSL kernel. Any other value keeps the unfused decode.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>gfx950</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_K3_FLYDSL_SOURCE</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Where the Kimi-K3 FlyDSL operators come from: <code>auto</code> tries the in-tree copy and then AITER, <code>sglang</code> or <code>aiter</code> force one.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>auto</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ROCM_KDA_HIP_PREFILL</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Set to <code>0</code> or <code>false</code> to turn off the gfx950 HIP KDA chunked prefill; the Triton <code>chunk_kda</code> path runs instead.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>1</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ASM_VERIFY_ATTN</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>gfx950 MTP-verify attention uses the in-tree assembly kernel when this is <code>1</code> (and ROCm is 7.2 or newer); any other value keeps it on the Triton kernel.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>1</code></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ROCM_GDN_ONLINE_MXFP4</code></td>

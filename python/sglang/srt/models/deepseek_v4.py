@@ -64,6 +64,7 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import (
 from sglang.srt.hardware_backend.npu.utils import (
     use_npu_arch35_mxfp8_wo_a,
 )
+from sglang.srt.hf_transformers import get_rope_config
 from sglang.srt.layers.attention.dsa.utils import (
     is_dsa_enable_prefill_cp,
 )
@@ -119,6 +120,8 @@ from sglang.srt.layers.quantization.mxfp8_input import (
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -207,17 +210,14 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.utils import (
     LazyValue,
-    add_prefix,
     ceil_align,
     get_bool_env_var,
     is_gfx95_supported,
     is_gfx942_supported,
     is_gfx1250_supported,
     log_info_on_rank0,
-    make_pp_layers,
 )
 from sglang.srt.utils.custom_op import register_custom_op
-from sglang.srt.utils.hf_transformers import get_rope_config
 
 # NPU-only: bind torch_npu here so _compute_q_b / _forward_prepare can call
 # torch_npu.npu_rms_norm directly (imports elsewhere aren't visible in this module).
