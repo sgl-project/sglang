@@ -7,7 +7,7 @@ import torch
 from sglang.srt.layers.attention.minimax_sparse_backend import (
     MiniMaxSparseAttnBackend,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.models.minimax_m3 import MiniMaxM3SparseForCausalLM
 from sglang.srt.models.minimax_m3_vl import (
     MiniMaxM3SparseForConditionalGeneration,
@@ -19,8 +19,17 @@ register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
 class _FakeKVPool:
+    def __init__(self):
+        self.layer_router = self
+
     def set_fused_kv_index_buffer(self, *args, **kwargs):
         pass
+
+    def read(self, layer_id):
+        return self
+
+    def kv(self):
+        return torch.empty(1), torch.empty(1)
 
     def get_kv_buffer(self, layer_id):
         return torch.empty(1), torch.empty(1)
@@ -42,13 +51,15 @@ def _make_backend():
     backend._prefill_seqblock_meta = None
     backend.index_cache_enabled = False
     backend._loc_mapping = None
+    backend._linear_verify = False
     return backend
 
 
 def _make_batch(**overrides):
     batch = SimpleNamespace(
         forward_mode=ForwardMode.TARGET_VERIFY,
-        spec_info=SimpleNamespace(draft_token_num=2, ragged_verify_layout=None),
+        spec_info=SimpleNamespace(draft_token_num=2),
+        ragged_verify_layout=None,
         extend_seq_lens=None,
         extend_seq_lens_cpu=None,
         extend_prefix_lens=None,
@@ -118,7 +129,7 @@ def test_ragged_verify_trims_dp_padding_and_repads_output():
         total_verify_tokens=3,
     )
     batch = _make_batch()
-    batch.spec_info.ragged_verify_layout = layout
+    batch.ragged_verify_layout = layout
     captured = {}
 
     def fake_sparse_prefill(*args, **kwargs):
@@ -173,16 +184,29 @@ def test_forward_batch_geometry_trims_uniform_dp_padding():
     assert output[2:].tolist() == [[0.0, 0.0], [0.0, 0.0]]
 
 
-@pytest.mark.parametrize(
-    "model_cls",
-    [MiniMaxM3SparseForCausalLM, MiniMaxM3SparseForConditionalGeneration],
-)
-def test_dspark_capture_reuses_eagle3_setup(model_cls):
+def test_dspark_text_capture_reuses_eagle3_setup():
     captured_layer_ids = []
     model = SimpleNamespace(
         set_eagle3_layers_to_capture=lambda ids: captured_layer_ids.append(ids)
     )
 
-    model_cls.set_dspark_layers_to_capture(model, [0, 2])
+    MiniMaxM3SparseForCausalLM.set_dspark_layers_to_capture(model, [0, 2])
 
     assert captured_layer_ids == [[0, 2]]
+
+
+def test_dspark_vl_capture_marks_requested_layers():
+    layers = [SimpleNamespace() for _ in range(4)]
+    model = SimpleNamespace(
+        pp_group=SimpleNamespace(is_last_rank=True),
+        model=SimpleNamespace(layers=layers),
+        capture_aux_hidden_states=False,
+    )
+
+    MiniMaxM3SparseForConditionalGeneration.set_dspark_layers_to_capture(model, [0, 2])
+
+    assert model.capture_aux_hidden_states
+    assert model.model.layers_to_capture == [1, 3]
+    assert [
+        getattr(layer, "_is_layer_to_capture", False) for layer in model.model.layers
+    ] == [False, True, False, True]

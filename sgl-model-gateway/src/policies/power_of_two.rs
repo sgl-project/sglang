@@ -7,10 +7,21 @@ use std::{
 
 use async_trait::async_trait;
 use rand::Rng;
-use tracing::debug;
+use tracing::{debug, info};
 
 use super::{get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
 use crate::core::Worker;
+
+/// Load compared between candidates, set by `SGLANG_ROUTER_P2C_LOAD_METRIC`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoadMetric {
+    /// Polled token load, then in-flight requests.
+    Tokens,
+    /// In-flight requests, then polled token load.
+    Requests,
+    /// As `Requests`, over every worker with a polled load.
+    LeastRequests,
+}
 
 /// Power-of-two choices policy
 ///
@@ -20,12 +31,24 @@ use crate::core::Worker;
 pub struct PowerOfTwoPolicy {
     /// Cached load information from external monitoring
     cached_loads: RwLock<HashMap<String, isize>>,
+    metric: LoadMetric,
 }
 
 impl PowerOfTwoPolicy {
     pub fn new() -> Self {
+        let metric = match std::env::var("SGLANG_ROUTER_P2C_LOAD_METRIC").as_deref() {
+            Ok("requests") => LoadMetric::Requests,
+            Ok("least_requests") => LoadMetric::LeastRequests,
+            _ => LoadMetric::Tokens,
+        };
+        Self::with_metric(metric)
+    }
+
+    fn with_metric(metric: LoadMetric) -> Self {
+        info!("Power-of-two load metric: {:?}", metric);
         Self {
             cached_loads: RwLock::new(HashMap::new()),
+            metric,
         }
     }
 }
@@ -47,8 +70,40 @@ impl LoadBalancingPolicy for PowerOfTwoPolicy {
             return Some(healthy_indices[0]);
         }
 
-        // Select two random workers - use offset to guarantee different selection in O(1)
         let mut rng = rand::rng();
+        let loads_guard = self.cached_loads.read().ok();
+        let tokens = |idx: usize| {
+            loads_guard
+                .as_ref()
+                .and_then(|m| m.get(workers[idx].url()).copied())
+        };
+
+        if self.metric == LoadMetric::LeastRequests {
+            // Workers without a polled load are skipped unless none has one.
+            let reported: Vec<usize> = healthy_indices
+                .iter()
+                .copied()
+                .filter(|&idx| tokens(idx).is_some())
+                .collect();
+            let candidates = if reported.is_empty() {
+                &healthy_indices
+            } else {
+                &reported
+            };
+            // A random start spreads ties instead of favouring low indices.
+            let start = rng.random_range(0..candidates.len());
+            let selected_idx = candidates
+                .iter()
+                .cycle()
+                .skip(start)
+                .take(candidates.len())
+                .copied()
+                .min_by_key(|&idx| (workers[idx].load(), tokens(idx).unwrap_or(0)))?;
+            workers[selected_idx].increment_processed();
+            return Some(selected_idx);
+        }
+
+        // Select two random workers - use offset to guarantee different selection in O(1)
         let idx1 = rng.random_range(0..healthy_indices.len());
         // Pick idx2 from remaining indices: offset by 1 + random from (len-1) to guarantee different
         let idx2 =
@@ -59,29 +114,13 @@ impl LoadBalancingPolicy for PowerOfTwoPolicy {
         let worker1 = &workers[worker_idx1];
         let worker2 = &workers[worker_idx2];
 
-        // Access cached loads safely
-        let loads_guard = self.cached_loads.read().ok();
-
-        // Try to get high-fidelity token loads for BOTH workers
-        let load1_tokens = loads_guard
-            .as_ref()
-            .and_then(|m| m.get(worker1.url()).copied());
-        let load2_tokens = loads_guard
-            .as_ref()
-            .and_then(|m| m.get(worker2.url()).copied());
-
-        // If either worker is missing token data (e.g. monitor failure),
-        // we must degrade BOTH to request counts to ensure fairness.
-        let (load1, load2) = match (load1_tokens, load2_tokens) {
-            (Some(t1), Some(t2)) => {
-                // Both have token data. Compare Tokens.
-                (t1, t2)
-            }
-            _ => {
-                // If One or both are missing token data.
-                // Fallback to local request counts for BOTH.
-                (worker1.load() as isize, worker2.load() as isize)
-            }
+        // Compare the primary load for BOTH workers and fall back to the other
+        // one when it is tied or, for tokens, missing on either side.
+        let (r1, r2) = (worker1.load() as isize, worker2.load() as isize);
+        let (load1, load2) = match (self.metric, tokens(worker_idx1), tokens(worker_idx2)) {
+            (LoadMetric::Tokens, Some(t1), Some(t2)) if t1 != t2 => (t1, t2),
+            (LoadMetric::Requests, Some(t1), Some(t2)) if r1 == r2 => (t1, t2),
+            _ => (r1, r2),
         };
 
         // Select worker with lower load
@@ -385,5 +424,56 @@ mod tests {
         );
 
         println!("All edge case tests passed successfully.");
+    }
+
+    /// Workers with the given in-flight requests and polled token loads.
+    fn workers_with_loads(
+        policy: &PowerOfTwoPolicy,
+        loads: &[(usize, Option<isize>)],
+    ) -> Vec<Arc<dyn Worker>> {
+        let mut tokens = HashMap::new();
+        let workers = loads
+            .iter()
+            .enumerate()
+            .map(|(rank, &(requests, token_load))| {
+                let worker = BasicWorkerBuilder::new(format!("http://d:8000@{rank}"))
+                    .worker_type(WorkerType::Decode)
+                    .build();
+                (0..requests).for_each(|_| worker.increment_load());
+                if let Some(t) = token_load {
+                    tokens.insert(worker.url().to_string(), t);
+                }
+                Arc::new(worker) as Arc<dyn Worker>
+            })
+            .collect();
+        policy.update_loads(&tokens);
+        workers
+    }
+
+    #[tokio::test]
+    async fn test_requests_metric_prefers_fewer_in_flight_requests() {
+        let policy = PowerOfTwoPolicy::with_metric(LoadMetric::Requests);
+        let workers = workers_with_loads(&policy, &[(5, Some(10)), (2, Some(1000))]);
+        for _ in 0..20 {
+            let idx = policy
+                .select_worker(&workers, &SelectWorkerInfo::default())
+                .await;
+            assert_eq!(idx, Some(1));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_least_requests_skips_workers_without_load() {
+        let policy = PowerOfTwoPolicy::with_metric(LoadMetric::LeastRequests);
+        let workers = workers_with_loads(
+            &policy,
+            &[(0, None), (5, Some(1)), (1, Some(1000)), (3, Some(1))],
+        );
+        for _ in 0..20 {
+            let idx = policy
+                .select_worker(&workers, &SelectWorkerInfo::default())
+                .await;
+            assert_eq!(idx, Some(2));
+        }
     }
 }

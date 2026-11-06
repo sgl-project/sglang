@@ -27,6 +27,7 @@ fn fixtures_match_sglang() {
             let options = |stream_reasoning| ReasoningOptions {
                 force_reasoning: Some(case["force"] == true),
                 stream_reasoning,
+                force_nonempty_content: case["nonempty"] == true,
                 ..Default::default()
             };
             let mut streaming =
