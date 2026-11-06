@@ -1077,11 +1077,16 @@ class BlackwellDualGemmKernel:
         tmem_ready = cute_ext.allocate(
             cutlass.Int64, cute.AddressSpace.smem, cute.make_layout(1), alignment=8
         )
-        tmem_dealloc = cute_ext.allocate(
-            cutlass.Int64, cute.AddressSpace.smem, cute.make_layout(1), alignment=8
-        )
         full, empty = full_storage.iterator, empty_storage.iterator
         ready = ready_storage.iterator
+        # 2-CTA only: peer MMA warps rendezvous here before the collective
+        # dealloc. 1-CTA passes None and never touches it.
+        tmem_dealloc = None
+        if cutlass.const_expr(self.use_2cta):
+            tmem_dealloc_storage = cute_ext.allocate(
+                cutlass.Int64, cute.AddressSpace.smem, cute.make_layout(1), alignment=8
+            )
+            tmem_dealloc = tmem_dealloc_storage.iterator
 
         if tid == 0:
             for stage in cutlass.range_constexpr(self.stages):
@@ -1092,8 +1097,7 @@ class BlackwellDualGemmKernel:
             cute.arch.mbarrier_init(ready, 1)
             cute.arch.mbarrier_init(tmem_ready.iterator, 32 + 128)
             if cutlass.const_expr(self.use_2cta):
-                # Peer MMA warps rendezvous here before the collective dealloc.
-                cute.arch.mbarrier_init(tmem_dealloc.iterator, 32)
+                cute.arch.mbarrier_init(tmem_dealloc, 32)
 
         cute.arch.mbarrier_init_fence()
 
@@ -1152,7 +1156,7 @@ class BlackwellDualGemmKernel:
                 empty,
                 ready,
                 tmem_ready.iterator,
-                tmem_dealloc.iterator,
+                tmem_dealloc,
                 tmem_slot.iterator,
                 cta_rank,
                 accumulator_layout,

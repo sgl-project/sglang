@@ -335,10 +335,14 @@ class TgvGemmCuteExtKernel:
         bar_tmem_alloc_arr = cute_ext.allocate(
             cutlass.Int64, cute.AddressSpace.smem, cute.make_layout(1), alignment=8
         )
-        # 2-CTA: rendezvous of the two MMA warps before the collective TMEM dealloc.
-        bar_tmem_dealloc_arr = cute_ext.allocate(
-            cutlass.Int64, cute.AddressSpace.smem, cute.make_layout(1), alignment=8
-        )
+        # 2-CTA only: rendezvous of the two MMA warps before the collective
+        # TMEM dealloc. 1-CTA passes None and never touches it.
+        bar_tmem_dealloc = None
+        if cutlass.const_expr(self.use_2cta):
+            bar_tmem_dealloc_arr = cute_ext.allocate(
+                cutlass.Int64, cute.AddressSpace.smem, cute.make_layout(1), alignment=8
+            )
+            bar_tmem_dealloc = bar_tmem_dealloc_arr.iterator  # Pointer[Int64]
         # alloc_tmem writes the TMEM base address to this slot; both MMA and
         # EPILOG read it back via retrieve_tmem_ptr.
         tmem_base_arr = cute_ext.allocate(
@@ -350,7 +354,6 @@ class TgvGemmCuteExtKernel:
         bar_tma_epilog = bar_tma_epilog_arr.iterator  # Pointer[Int64]
         bar_mma_epilog = bar_mma_epilog_arr.iterator  # Pointer[Int64]
         bar_tmem_alloc = bar_tmem_alloc_arr.iterator  # Pointer[Int64]
-        bar_tmem_dealloc = bar_tmem_dealloc_arr.iterator  # Pointer[Int64]
         tmem_base_ptr = tmem_base_arr.iterator  # Pointer[Int32]
 
         # ---- Barrier init (1 thread, PTX mbarrier.init is single-thread) ----
@@ -679,7 +682,7 @@ class TgvGemmCuteExtKernel:
         bar_empty,  # Pointer[Int64], DMA_Stage entries
         bar_mma_epilog,  # Pointer[Int64], 1 entry
         bar_tmem_alloc,  # Pointer[Int64], 1 entry, 160-arrival
-        bar_tmem_dealloc,  # Pointer[Int64], 1 entry, 32-arrival (2-CTA peer handshake)
+        bar_tmem_dealloc,  # Pointer[Int64], 1 entry, 32-arrival (2-CTA only, else None)
         cta_rank_in_cluster: cutlass.Int32,
         tiled_mma: cute.TiledMma,
         sA: cute.Tensor,  # ((Mma_M, Mma_K), NumMma_M, NumMma_K, DMA_Stage)
