@@ -1975,6 +1975,11 @@ class ResponsesRequest(PDRoutingFields):
     _response_parser_grammar_start: Optional[str] = PrivateAttr(default=None)
     _response_parser_json_response_format: bool = PrivateAttr(default=False)
     _response_parser_tool_grammar: bool = PrivateAttr(default=False)
+    # The last message the prompt was rendered from,
+    # so an output parser can follow a turn the prompt continues.
+    _final_chat_message: Optional[ChatCompletionMessageParam] = PrivateAttr(
+        default=None
+    )
 
     # Core OpenAI API fields (ordered by official documentation)
     background: Optional[bool] = False

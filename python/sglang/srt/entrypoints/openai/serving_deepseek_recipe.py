@@ -16,6 +16,7 @@ from sglang.srt.entrypoints.openai.chat_encoding_adapters import (
 from sglang.srt.entrypoints.openai.protocol import (
     FunctionResponse,
     ToolCall,
+    ToolChoice,
 )
 from sglang.srt.environ import envs
 from sglang.srt.function_call.core_types import ToolCallItem
@@ -36,6 +37,7 @@ from sglang.srt.utils import ImageData
 if TYPE_CHECKING:
     from sglang.srt.entrypoints.openai.chat_encoding_adapters import ChatOutputHooks
     from sglang.srt.entrypoints.openai.protocol import (
+        ChatCompletionMessageParam,
         ChatCompletionRequest,
         ResponsesRequest,
         Tool,
@@ -328,26 +330,15 @@ class DeepSeekRecipeChatEncodingAdapter:
         self, request: ChatCompletionRequest
     ) -> DeepSeekRecipeOutputParser:
         response_format = request.response_format
-        continued = (
-            _final_assistant_turn(
-                _null_content_as_empty(
-                    [
-                        message.model_dump(
-                            exclude_unset=True, by_alias=True, mode="json"
-                        )
-                        for message in request.messages[-1:]
-                    ]
-                )
-            )
-            if request.continue_final_message
-            else None
-        )
         return DeepSeekRecipeOutputParser(
             self.deepseek_recipe,
             thinking_stage=self.deepseek_recipe.parse_start(
                 thinking=self._hooks.thinking_requested(request),
                 task=request.task,
-                continued=continued,
+                continued=_continued_turn(
+                    request.messages[-1] if request.messages else None,
+                    continue_final_message=request.continue_final_message,
+                ),
             ),
             parse_tool_calls=request.task is None
             and self._hooks.tool_call_parsing_active(request),
@@ -355,15 +346,25 @@ class DeepSeekRecipeChatEncodingAdapter:
             and response_format.type in JSON_RESPONSE_FORMATS,
             separate_reasoning=self._separate_reasoning and request.separate_reasoning,
             stream_reasoning=request.stream_reasoning,
-            # A task output, such as an action label, has no reasoning to close,
-            # and a grammar may not let a constrained output close it.
-            reasoning_must_close=request.task is None
-            and request.regex is None
-            and request.ebnf is None
-            and (response_format is None or response_format.type == "text"),
+            reasoning_must_close=self._reasoning_must_close(request),
             stop=_stop_strings(request.stop),
             stop_regex=_stop_strings(request.stop_regex),
             stop_token_ids=request.stop_token_ids or (),
+        )
+
+    def _reasoning_must_close(self, request: ChatCompletionRequest) -> bool:
+        return (
+            # The parse start follows the request, not a client's own input_ids.
+            request.input_ids is None
+            # A task output, such as an action label, has no reasoning to close.
+            and request.task is None
+            and not _forces_nonempty_content(request.chat_template_kwargs)
+            # A grammar applies from the first token unless reasoning is required,
+            # and may never allow </think> (#45614).
+            and (
+                self._hooks.reasoning_required(request)
+                or not _grammar_constrained(request)
+            )
         )
 
     def _new_responses_parser(
@@ -375,10 +376,18 @@ class DeepSeekRecipeChatEncodingAdapter:
     ) -> DeepSeekRecipeOutputParser:
         return DeepSeekRecipeOutputParser(
             self.deepseek_recipe,
-            thinking_stage=self.deepseek_recipe.parse_start(thinking=require_reasoning),
+            thinking_stage=self.deepseek_recipe.parse_start(
+                thinking=require_reasoning,
+                continued=_continued_turn(
+                    request._final_chat_message, continue_final_message=False
+                ),
+            ),
             parse_tool_calls=parse_tool_calls,
             separate_reasoning=separate_reasoning,
             stop=_stop_strings(request.stop),
+            reasoning_must_close=not _forces_nonempty_content(
+                request.chat_template_kwargs
+            ),
         )
 
     def _tool_call_id(self, index: int, name: str, history_tool_calls_cnt: int) -> str:
@@ -438,6 +447,48 @@ def _trailing_assistant_turn(
     if last is not None and isinstance(last.get("content"), str):
         return last
     return None
+
+
+def _continued_turn(
+    message: Optional[ChatCompletionMessageParam], *, continue_final_message: bool
+) -> Optional[dict[str, Any]]:
+    """The turn the prompt continues when it ends with `message`, if any."""
+    if message is None:
+        return None
+    final = _final_assistant_turn(
+        _null_content_as_empty(
+            [message.model_dump(exclude_unset=True, by_alias=True, mode="json")]
+        )
+    )
+    if final is not None and (continue_final_message or _recipe_continues(final)):
+        return final
+    return None
+
+
+def _forces_nonempty_content(chat_template_kwargs: Optional[dict[str, Any]]) -> bool:
+    """The opt-in to get unclosed reasoning back as content, which SGLang's
+    reasoning parsers implement and recipe does not; such output is not checked."""
+    return (chat_template_kwargs or {}).get("force_nonempty_content") is True
+
+
+def _grammar_constrained(request: ChatCompletionRequest) -> bool:
+    """Whether a regex, an EBNF, a non-text response format or a forced tool call
+    holds the output; any of them may rule out </think>, which the automatic
+    tool-call tag leaves open."""
+    response_format = request.response_format
+    return bool(
+        request.regex
+        or request.ebnf
+        or (response_format is not None and response_format.type != "text")
+        or request.tool_choice == "required"
+        or isinstance(request.tool_choice, ToolChoice)
+    )
+
+
+def _recipe_continues(turn: dict[str, Any]) -> bool:
+    """Whether recipe continues this turn without continue_final_message:
+    `encode_messages` passes a non-text turn through, `prefix` included."""
+    return bool(turn.get("prefix")) and not isinstance(turn.get("content"), str)
 
 
 def _numeric_effort(

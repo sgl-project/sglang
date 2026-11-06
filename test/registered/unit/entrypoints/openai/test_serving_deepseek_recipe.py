@@ -14,7 +14,16 @@ DSML_CALL = (
     '<｜DSML｜ parameter name="x" string="true">1</｜DSML｜ parameter>\n'
     "</｜DSML｜ invoke>\n</｜DSML｜ calls>"
 )
-TOOL = {"type": "function", "function": {"name": "f", "parameters": {}}}
+TOOL = {"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}
+HI = {"role": "user", "content": "hi"}
+ASSISTANT_TEXT = {"role": "assistant", "content": "Hello"}
+ASSISTANT_LIST = {"role": "assistant", "content": [{"type": "text", "text": "Hello"}]}
+PREFIX = {"prefix": True}
+# recipe accepts json_object only when the prompt mentions json.
+JSON_OBJECT = {
+    "messages": [{"role": "user", "content": "Reply in json."}],
+    "response_format": {"type": "json_object"},
+}
 
 
 def _tokenizer_file():
@@ -29,8 +38,17 @@ def _tokenizer_file():
         raise unittest.SkipTest(f"the tokenizer is not available: {error}")
 
 
-def _serving(test, tokenizer, *, is_multimodal=False, **server_args):
+def _serving(
+    test,
+    tokenizer,
+    *,
+    is_multimodal=False,
+    tool_call_parser="deepseekv41",
+    responses=False,
+    **server_args,
+):
     from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
+    from sglang.srt.entrypoints.openai.serving_responses import OpenAIServingResponses
     from sglang.srt.runtime_context import publish, reset_context
     from sglang.srt.server_args import ServerArgs
 
@@ -39,7 +57,7 @@ def _serving(test, tokenizer, *, is_multimodal=False, **server_args):
     args = ServerArgs(
         model_path="dummy",
         reasoning_parser="deepseek-v41",
-        tool_call_parser="deepseekv41",
+        tool_call_parser=tool_call_parser,
         **server_args,
     )
     publish(args, role="tokenizer")
@@ -68,7 +86,8 @@ def _serving(test, tokenizer, *, is_multimodal=False, **server_args):
         python_chat_template=None,
         jinja_template_may_reorder_tool_results=False,
     )
-    return OpenAIServingChat(manager, template_manager)
+    handler = OpenAIServingResponses if responses else OpenAIServingChat
+    return handler(manager, template_manager)
 
 
 class TestAdapterRegistry(CustomTestCase):
@@ -82,6 +101,7 @@ class TestAdapterRegistry(CustomTestCase):
             tool_call_parser=None,
             chat_hooks=registry.ChatOutputHooks(
                 thinking_requested=lambda request: False,
+                reasoning_required=lambda request: False,
                 tool_call_parsing_active=lambda request: False,
                 history_tool_calls_count=lambda request: 0,
                 tool_call_id=lambda item, index: "",
@@ -355,26 +375,29 @@ class TestHandlerRequestSemantics(CustomTestCase):
             self._parse(chat, "A title", task="title", **thinking)[:2],
             (None, "A title"),
         )
-        for content in ("Hello", [{"type": "text", "text": "Hello"}]):
-            continued = [
-                {"role": "user", "content": "hi"},
-                {"role": "assistant", "content": content},
-            ]
-            with self.subTest(content=content):
+        for turn in (ASSISTANT_TEXT, ASSISTANT_LIST):
+            with self.subTest(turn=turn):
                 self.assertEqual(
                     self._parse(
                         chat,
                         " world",
-                        messages=continued,
+                        messages=[HI, turn],
                         continue_final_message=True,
                         **thinking,
                     )[:2],
                     (None, " world"),
                 )
+        # Without continue_final_message, recipe continues a non-text `prefix` turn.
+        self.assertEqual(
+            self._parse(
+                chat, " world", messages=[HI, ASSISTANT_LIST | PREFIX], **thinking
+            )[:2],
+            (None, " world"),
+        )
 
     def test_natural_stop_inside_reasoning_fails(self):
-        """A thinking output that stops on its own inside its reasoning fails, also
-        when the request sets other stops or no call is parsed."""
+        """A thinking output that stops on its own inside its reasoning fails,
+        also when the request sets other stops or no call is parsed."""
         from sglang.srt.parser.deepseek_recipe_output import UnclosedReasoningError
 
         chat = _serving(self, self.tokenizer)
@@ -394,6 +417,14 @@ class TestHandlerRequestSemantics(CustomTestCase):
                 "Still thinking.\n\n<｜DSML｜ calls>\n</｜DSML｜ calls>",
                 {"tools": [TOOL]},
             ),
+            # A grammar that waits for </think> leaves the output free to close.
+            ("Still thinking.", JSON_OBJECT),
+            ("Still thinking.", {"regex": r"Still thinking\."}),
+            ("Still thinking.", {"ebnf": 'root ::= "Still thinking."'}),
+            # SGLang re-sends a text turn, and recipe closes a turn without `prefix`,
+            # so neither is continued and the output starts in reasoning.
+            ("Still thinking.", {"messages": [HI, ASSISTANT_TEXT | PREFIX]}),
+            ("Still thinking.", {"messages": [HI, ASSISTANT_LIST]}),
         ):
             with (
                 self.subTest(text=text, fields=fields),
@@ -402,11 +433,12 @@ class TestHandlerRequestSemantics(CustomTestCase):
                 self._parse(chat, text, **thinking, **fields)
 
     def test_reasoning_cut_on_purpose_is_returned(self):
-        """A length or abort finish, or a stop the client asked for, returns the
-        reasoning so far."""
+        """A length or abort finish, or a stop the client asked for,
+        returns the reasoning so far."""
         chat = _serving(self, self.tokenizer)
         thinking = {"chat_template_kwargs": {"thinking": True}}
         dot = self._token(".")
+        eos = self._token("<｜end▁of▁sentence｜>")
         for finish_reason, fields in (
             ({"type": "length", "length": 3}, {}),
             ({"type": "abort", "message": "Aborted"}, {}),
@@ -414,6 +446,7 @@ class TestHandlerRequestSemantics(CustomTestCase):
             ({"type": "stop", "matched": r"\."}, {"stop_regex": r"\."}),
             ({"type": "stop", "matched": r"\."}, {"stop_regex": ["E+ND", r"\."]}),
             ({"type": "stop", "matched": dot}, {"stop_token_ids": [dot]}),
+            ({"type": "stop", "matched": eos}, {"stop_token_ids": [eos]}),
         ):
             with self.subTest(finish_reason=finish_reason, fields=fields):
                 reasoning, content, _ = self._parse(
@@ -427,27 +460,91 @@ class TestHandlerRequestSemantics(CustomTestCase):
                 self.assertEqual(content, "")
 
     def test_outputs_that_may_skip_think_end_are_returned(self):
-        """A parsed call ends the reasoning, and a task output, a constrained output
-        or reasoning sent as content is returned without </think>."""
+        """A parsed call ends the reasoning; a task output, reasoning sent as
+        content, output after the client's own input_ids and output under
+        force_nonempty_content are returned without </think>."""
         chat = _serving(self, self.tokenizer)
         thinking = {"chat_template_kwargs": {"thinking": True}}
         _, _, calls = self._parse(
             chat, "Still thinking." + DSML_CALL, tools=[TOOL], **thinking
         )
         self.assertEqual([call.function.name for call in calls], ["f"])
+        # Rendered without thinking, so the prompt has closed the reasoning.
+        client_prompt = self._prompt(chat).prompt_ids
+        nonempty = {"thinking": True, "force_nonempty_content": True}
         for text, fields in (
             ("search", {"task": "action"}),
-            ('{"a": 1}', {"response_format": {"type": "json_object"}}),
-            ("Still thinking.", {"regex": r"Still thinking\."}),
             ("Still thinking.", {"separate_reasoning": False}),
+            ("Hello.", {"input_ids": client_prompt}),
+            ("Still thinking.", {"chat_template_kwargs": nonempty}),
         ):
             with self.subTest(fields=fields):
-                reasoning, content, _ = self._parse(chat, text, **thinking, **fields)
+                reasoning, content, _ = self._parse(chat, text, **(thinking | fields))
                 self.assertEqual((reasoning or "") + content, text)
+
+    def test_constrained_output_under_default_thinking_is_returned(self):
+        """Under SGLANG_DEFAULT_THINKING alone, require_reasoning is false (#45614);
+        the grammar then applies from the first token, so the output is returned."""
+        from sglang.srt.environ import envs
+
+        # Without a tool-call parser, SGLang forces a call through a JSON schema.
+        chat = _serving(self, self.tokenizer, tool_call_parser=None)
+        forced_call = '[{"name": "f", "parameters": {}}]'
+        named = {"type": "function", "function": {"name": "f"}}
+        for text, fields in (
+            ('{"a": 1}', JSON_OBJECT),
+            ("Still thinking.", {"regex": r"Still thinking\."}),
+            ("Still thinking.", {"ebnf": 'root ::= "Still thinking."'}),
+            (
+                "Still thinking.",
+                {
+                    "response_format": {
+                        "type": "structural_tag",
+                        "format": {"type": "const_string", "value": "Still thinking."},
+                    }
+                },
+            ),
+            (forced_call, {"tools": [TOOL], "tool_choice": "required"}),
+            (forced_call, {"tools": [TOOL], "tool_choice": named}),
+        ):
+            with (
+                self.subTest(fields=fields),
+                envs.SGLANG_DEFAULT_THINKING.override(True),
+            ):
+                reasoning, content, _ = self._parse(chat, text, **fields)
+                self.assertEqual((reasoning or "") + content, text)
+
+    def test_unconstrained_output_under_default_thinking_fails(self):
+        """None of these rules out </think>: a text response format, the tool-call
+        tag a strict tool gets under automatic tool choice, and an empty regex or
+        EBNF, which SamplingParams drops."""
+        from sglang.srt.environ import envs
+        from sglang.srt.parser.deepseek_recipe_output import UnclosedReasoningError
+
+        chat = _serving(self, self.tokenizer)
+        text_format = {"response_format": {"type": "text"}}
+        strict_tool = {
+            "type": "function",
+            "function": {**TOOL["function"], "strict": True},
+        }
+        for fields in (
+            {},
+            text_format,
+            {"tools": [strict_tool]},
+            {"regex": ""},
+            {"ebnf": ""},
+        ):
+            with (
+                self.subTest(fields=fields),
+                envs.SGLANG_DEFAULT_THINKING.override(True),
+                self.assertRaises(UnclosedReasoningError),
+            ):
+                self._parse(chat, "Still thinking.", **fields)
 
     def test_other_paths_fail_at_a_natural_stop_inside_reasoning(self):
         """Streamed chat and both Responses paths fail at such a finish too, but
-        not after </think> has streamed in."""
+        not once </think> has arrived, before or in the final chunk, and not for
+        a Responses result without a finish reason."""
         from sglang.srt.entrypoints.openai.protocol import (
             ChatCompletionRequest,
             ResponsesRequest,
@@ -463,12 +560,13 @@ class TestHandlerRequestSemantics(CustomTestCase):
             messages=[{"role": "user", "content": "hi"}],
             chat_template_kwargs={"thinking": True},
         )
-        responses_stream = adapter.new_responses_stream(
-            request=ResponsesRequest(input="hi"),
-            require_reasoning=True,
-            separate_reasoning=True,
-            parse_tool_calls=False,
-        )
+        responses = {
+            "request": ResponsesRequest(input="hi"),
+            "require_reasoning": True,
+            "separate_reasoning": True,
+            "parse_tool_calls": False,
+        }
+        responses_stream = adapter.new_responses_stream(**responses)
         parsers = {}
 
         def stream_chat(chunk, finish_reason_type):
@@ -503,20 +601,84 @@ class TestHandlerRequestSemantics(CustomTestCase):
             responses_stream.step(chunk(output_ids, True), finish)
         with self.assertRaises(UnclosedReasoningError):
             adapter.parse_responses_output(
-                request=ResponsesRequest(input="hi"),
-                require_reasoning=True,
+                output_ids=output_ids, finish_reason=finish, **responses
+            )
+        adapter.parse_responses_output(
+            output_ids=output_ids, finish_reason=None, **responses
+        )
+
+        closed = self.tokenizer.encode("Done.</think>Hi", add_special_tokens=False)
+        closed.append(eos)
+        parsers.clear()
+        for end in range(1, len(closed)):
+            stream_chat(chunk(closed[:end], False), None)
+        stream_chat(chunk(closed, True), "stop")
+        parsers.clear()
+        stream_chat(chunk(closed, True), "stop")
+        stream = adapter.new_responses_stream(**responses)
+        self.assertEqual(stream.step(chunk(closed, True), finish)[:2], ("Done.", "Hi"))
+        self.assertEqual(
+            adapter.parse_responses_output(
+                output_ids=closed, finish_reason=finish, **responses
+            )[:2],
+            ("Done.", "Hi"),
+        )
+
+    def test_responses_parsing_starts_where_the_prompt_ends(self):
+        """As in chat, a turn recipe continues is answer. A text turn, which
+        SGLang re-sends, and a turn that merges into a reasoning item, losing its
+        `prefix`, are not continued, so a natural stop inside reasoning fails
+        unless force_nonempty_content is set."""
+        import asyncio
+
+        from sglang.srt.entrypoints.openai.protocol import ResponsesRequest
+        from sglang.srt.parser.deepseek_recipe_output import UnclosedReasoningError
+
+        responses = _serving(self, self.tokenizer, responses=True)
+        eos = self._token("<｜end▁of▁sentence｜>")
+        finish = {"type": "stop", "matched": eos}
+
+        def parse(items, text, **template_kwargs):
+            request = ResponsesRequest(
+                model="dummy",
+                input=items,
+                chat_template_kwargs={"thinking": True, **template_kwargs},
+            )
+            *_, processed = asyncio.run(
+                responses._make_request(request, None, self.tokenizer)
+            )
+            output_ids = self.tokenizer.encode(text, add_special_tokens=False)
+            output_ids.append(eos)
+            return responses._encoding_output().parse_responses_output(
+                request=request,
+                require_reasoning=processed.require_reasoning,
                 output_ids=output_ids,
                 finish_reason=finish,
                 separate_reasoning=True,
                 parse_tool_calls=False,
-            )
+            )[:2]
 
-        parsers.clear()
-        closed = self.tokenizer.encode("Done.</think>", add_special_tokens=False)
-        closed.append(eos)
-        for end in range(1, len(closed)):
-            stream_chat(chunk(closed[:end], False), None)
-        stream_chat(chunk(closed, True), "stop")
+        output_text = {
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "Hello"}],
+        }
+        reasoning, content = parse([HI, output_text | PREFIX], " world")
+        self.assertEqual((reasoning or "", content), ("", " world"))
+        reasoning_item = {
+            "type": "reasoning",
+            "summary": [{"type": "summary_text", "text": "Thought."}],
+        }
+        for items in (
+            [HI, ASSISTANT_TEXT | PREFIX],
+            [HI, reasoning_item, output_text | PREFIX],
+        ):
+            with self.subTest(items=items):
+                with self.assertRaises(UnclosedReasoningError):
+                    parse(items, "Still thinking.")
+                reasoning, content = parse(
+                    items, "Still thinking.", force_nonempty_content=True
+                )
+                self.assertEqual(reasoning + content, "Still thinking.")
 
     def test_streamed_tool_call(self):
         from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
@@ -591,13 +753,10 @@ class TestHandlerRequestSemantics(CustomTestCase):
         )
         # V4 output never opens with <think>; the text parsers left it unsplit.
         self.assertEqual(adapter.separate_reasoning_text("a</think>b"), ("a", "b"))
-        call = (
-            '\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name="f">\n'
-            '<｜DSML｜ parameter name="x" string="true">1</｜DSML｜ parameter>\n'
-            "</｜DSML｜ invoke>\n</｜DSML｜ calls>"
-        )
-        tool = Tool(type="function", function={"name": "f", "parameters": {}})
-        text, (item,) = adapter.parse_function_call_text("Sure." + call, [tool])
+        # A native parse has no finish to judge, so unclosed reasoning is returned.
+        self.assertEqual(adapter.separate_reasoning_text("<think>a"), ("a", ""))
+        tool = Tool(**TOOL)
+        text, (item,) = adapter.parse_function_call_text("Sure." + DSML_CALL, [tool])
         self.assertEqual(
             (text, item.name, item.parameters), ("Sure.", "f", '{"x": "1"}')
         )

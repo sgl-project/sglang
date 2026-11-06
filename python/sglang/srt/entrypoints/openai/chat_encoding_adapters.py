@@ -23,6 +23,9 @@ class ChatOutputHooks(msgspec.Struct, frozen=True, kw_only=True):
     """Chat-handler policies an output adapter needs, bound to one handler."""
 
     thinking_requested: Callable[[ChatCompletionRequest], bool]
+    # The handler's require_reasoning: whether a grammar waits for </think>.
+    # Unlike `thinking_requested`, it does not follow SGLANG_DEFAULT_THINKING (#45614).
+    reasoning_required: Callable[[ChatCompletionRequest], bool]
     tool_call_parsing_active: Callable[[ChatCompletionRequest], bool]
     history_tool_calls_count: Callable[[ChatCompletionRequest], int]
     tool_call_id: Callable[[ToolCallItem, int], str]

@@ -115,8 +115,8 @@ class DeepSeekRecipeOutputParser:
         # A finish reports a client stop by its string, regex or id, and EOS by its id.
         self._client_stops = (*stop, *stop_regex, *stop_token_ids)
         self._think_end_id = self._hf_tokenizer.token_to_id(THINK_END_TOKEN)
-        # Reasoning ends at </think> or at the first call recipe parses. Reasoning
-        # sent as content cannot leave the answer empty, so it is not tracked.
+        # Reasoning ends at </think> or at the first call recipe parses.
+        # Reasoning sent as content is not tracked: its text is the answer.
         self._reasoning_open = (
             reasoning_must_close
             and separate_reasoning
