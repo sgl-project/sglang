@@ -33,12 +33,8 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.moe.utils import AscendOpsConfig
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
-from sglang.srt.utils.common import (
-    get_bool_env_var,
-    is_gfx1250_supported,
-    is_sm100_supported,
-    parse_connector_type,
-)
+from sglang.srt.utils.common import get_bool_env_var, parse_connector_type
+from sglang.srt.utils.device import is_gfx1250_supported, is_sm100_supported
 
 logger = logging.getLogger(__name__)
 
