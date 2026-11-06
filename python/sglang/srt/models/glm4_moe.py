@@ -36,6 +36,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.hf_transformers import get_rope_config
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.dp_attention import (
@@ -59,6 +60,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
+    get_moe_runner_backend,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
@@ -74,6 +76,8 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -86,7 +90,6 @@ from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
 from sglang.srt.models.utils import WeightsMapper, apply_qk_norm
 from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
 from sglang.srt.utils import (
-    add_prefix,
     cpu_has_amx_support,
     get_bool_env_var,
     get_device_sm,
@@ -95,9 +98,7 @@ from sglang.srt.utils import (
     is_hip,
     is_npu,
     log_info_on_rank0,
-    make_pp_layers,
 )
-from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -1284,6 +1285,13 @@ class Glm4MoeForCausalLM(nn.Module):
 class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
     fused_shared_experts_architecture = "GlmMoeDsaForCausalLM"
 
+    @classmethod
+    def num_fusable_shared_experts(cls, hf_config) -> int:
+        # The GLM target Gluon kernels consume the rank-local appended shared
+        # expert directly. Keep the generic DeepSeek Gluon+EP guard scoped to
+        # models whose kernels have not implemented that ABI.
+        return hf_config.n_shared_experts or 0
+
 
 class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):
     # ModelConfig rewrites a GLM draft's architecture to this class's own name,
@@ -1296,6 +1304,15 @@ class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):
     hf_to_sglang_mapper = WeightsMapper()
 
     _NEXTN_SPEC_WEIGHT_NAMES = ("shared_head.norm", "eh_proj", "enorm", "hnorm")
+
+    @classmethod
+    def num_fusable_shared_experts(cls, hf_config) -> int:
+        # The Gluon draft kernel keeps the BF16 shared expert native. Pin the
+        # model-level loader decision as well as the layer-level decision so
+        # the checkpoint remap cannot append it to the routed expert bank.
+        if get_moe_runner_backend().is_gluon():
+            return 0
+        return super().num_fusable_shared_experts(hf_config)
 
     @classmethod
     def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
@@ -1393,16 +1410,22 @@ class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):
         if not mtp_excluded:
             return quant_config
 
+        apply_ptpc = should_apply_glm_nextn_moe_ptpc(
+            quant_config, config.num_hidden_layers
+        )
+        routed_experts_prefix = "model.decoder.mlp.experts."
         names = set(quant_config.exclude_layers)
         for name in mtp_excluded:
-            names.add(self._map_mtp_ckpt_name(name, layer_prefix))
+            mapped = self._map_mtp_ckpt_name(name, layer_prefix)
+            # Keep checkpoint excludes for the loader, but let the converted
+            # runtime experts use the PTPC scheme below.
+            if apply_ptpc and mapped.startswith(routed_experts_prefix):
+                continue
+            names.add(mapped)
 
-        # Fused routed experts are queried by the coarse module prefix
-        # "model.decoder.mlp.experts", which expanded per-expert leaf excludes
-        # do not match. So that module needs its own entry: bf16 as in the
-        # checkpoint, or the scheme matching the on-load PTPC-FP8 cast.
-        # Same gate as the weight-loader cast (Quark-excluded = bf16 in ckpt).
-        if should_apply_glm_nextn_moe_ptpc(quant_config, config.num_hidden_layers):
+        # Match the runtime scheme to the weight-loader cast; otherwise keep
+        # the checkpoint's BF16 routed experts excluded.
+        if apply_ptpc:
             mtp_layer_quant_config = quant_config.quant_config.setdefault(
                 "layer_quant_config", {}
             )

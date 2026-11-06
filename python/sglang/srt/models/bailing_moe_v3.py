@@ -17,8 +17,8 @@ from sglang.kernels.ops.gemm.router_gate_matvec import (
 from sglang.kernels.ops.quantization.fp8_kernel import (
     is_fp8_fnuz,
 )
-from sglang.srt.configs import KimiLinearConfig
 from sglang.srt.configs.bailing_hybrid import is_bailing_multi_gate_enabled
+from sglang.srt.configs.kimi_linear import KimiLinearConfig
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers import deep_gemm_wrapper
@@ -65,6 +65,8 @@ from sglang.srt.layers.quantization.int8_utils import (
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -82,6 +84,7 @@ from sglang.srt.models.deepseek_common.utils import (
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 from sglang.srt.models.kimi_linear import KimiDeltaAttention
+from sglang.srt.models.utils import bind_or_assign
 from sglang.srt.runtime_context import (
     get_parallel,
     get_platform,
@@ -89,12 +92,9 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.utils import (
     BumpAllocator,
-    add_prefix,
-    bind_or_assign,
     is_cuda,
     is_flashinfer_available,
     log_info_on_rank0,
-    make_pp_layers,
 )
 
 _is_fp8_fnuz = is_fp8_fnuz()
@@ -597,7 +597,10 @@ class BailingMoE(nn.Module):
                 and getattr(quant_config, "is_fp4_experts", False)
             ),
         )
-        self.topk.bind_runner_backend(self.experts.runner_backend)
+        self.topk.bind_runner_backend(
+            self.experts.runner_backend,
+            routing_method_type=self.experts.routing_method_type,
+        )
 
         # Whether to apply routed_scaling_factor at model layer.
         # For A2A MoE paths (e.g., DeepEP), the runner/post_permute does not apply it,

@@ -43,7 +43,7 @@ from sglang.srt.constrained.json_schema_validation import (
 )
 from sglang.srt.constrained.utils import is_legacy_structural_tag
 from sglang.srt.utils import is_hip
-from sglang.srt.utils.common import is_pin_memory_available
+from sglang.srt.utils.device import is_pin_memory_available
 
 _is_hip = is_hip()
 

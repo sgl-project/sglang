@@ -17,7 +17,7 @@ def _rmsnorm_mxfp8_kernel(
     Q,
     S,
     SX: tl.constexpr,
-    M: tl.constexpr,
+    M,
     K: tl.constexpr,
     EPS: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -34,9 +34,10 @@ def _rmsnorm_mxfp8_kernel(
         mxfp8_epilogue(y, row, Q, S, K, BLOCK, GROUPS, 0, GROUPS)
     else:
         # Padding scale entries are disjoint from the live rows above.
-        off = (row - M) * 512 + tl.arange(0, 512)
-        pad_row = ((off // 4) % 4) * 32 + ((off // 16) % 32)
-        tl.store(S + off, 0, (off < GROUPS * 128) & (pad_row >= M))
+        last = (tl.cdiv(M, 128) - 1) * 128
+        local = (row - M) * 512 + tl.arange(0, 512)
+        pad_row = last + ((local // 4) % 4) * 32 + ((local // 16) % 32)
+        tl.store(S + last * GROUPS + local, 0, (local < GROUPS * 128) & (pad_row >= M))
 
 
 def rmsnorm_mxfp8(
@@ -44,12 +45,14 @@ def rmsnorm_mxfp8(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """RMSNorm returning ``(y_bf16, y_q, y_sf)`` with the same MXFP8 epilogue."""
     m, k = x.shape
-    assert 0 < m <= 8 and k % 32 == 0
+    assert m > 0 and k % 128 == 0
     assert x.dtype == weight.dtype == torch.bfloat16 and x.stride(1) == 1
     y = torch.empty_like(x, memory_format=torch.contiguous_format)
     q = torch.empty((m, k), dtype=torch.float8_e4m3fn, device=x.device)
-    s = torch.empty((k // 32) * 128, dtype=torch.uint8, device=x.device)
-    _rmsnorm_mxfp8_kernel[(m + triton.cdiv(s.numel(), 512),)](
+    s = torch.empty(
+        (k // 32) * triton.cdiv(m, 128) * 128, dtype=torch.uint8, device=x.device
+    )
+    _rmsnorm_mxfp8_kernel[(m + triton.cdiv((k // 32) * 128, 512),)](
         x,
         weight,
         y,

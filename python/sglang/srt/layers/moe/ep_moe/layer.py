@@ -198,21 +198,7 @@ class DeepEPMoE(FusedMoE):
         finally:
             set_is_extend_in_batch(saved_is_extend_in_batch)
 
-    def _a2a_forward_capture_stub(
-        self,
-        hidden_states: torch.Tensor,
-        topk_weights: torch.Tensor,
-        topk_ids: torch.Tensor,
-        router_logits: torch.Tensor,
-        output: torch.Tensor,
-    ) -> None:
-        # Capture pass only: record the buffer address, skip the
-        # rank-coupled a2a. Warmup and replay run the real body.
-        output.zero_()
-
-    a2a_forward_with_output = eager_on_graph(
-        True, capture_stub=_a2a_forward_capture_stub
-    )(_a2a_forward_with_output_impl)
+    a2a_forward_with_output = eager_on_graph(True)(_a2a_forward_with_output_impl)
 
     def forward(
         self,
