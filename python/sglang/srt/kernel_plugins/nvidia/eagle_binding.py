@@ -59,6 +59,9 @@ TOLERATED_READS = (
     "get_capture_attention_variant)",
     "ForwardBatch.batch_size",
     "ForwardBatch.forward_mode",
+    "ForwardBatch.logical_forward_mode",
+    "ForwardBatch.extend_prefix_lens",
+    "ForwardBatch.extend_seq_lens_cpu",
     "ForwardBatch.out_cache_loc",
     "ForwardBatch.req_pool_indices",
     "ForwardBatch.seq_lens",
@@ -130,6 +133,45 @@ class EagleForwardView(msgspec.Struct, frozen=True):
     gdn: Optional[GdnStepMetadata]  # None for a model without GDN layers (the draft)
     kv: KvPoolBuffers
     mamba: Optional[MambaPoolBuffers]  # None for a model without GDN layers
+
+
+class LinearPrefillBuffers(msgspec.Struct, frozen=True):
+    """Committed linear-attention state, with no speculative scratch requirement."""
+
+    layer_ids: tuple[int, ...]
+    conv: tuple[torch.Tensor, ...]
+    temporal: torch.Tensor
+
+
+class LinearPrefillView(msgspec.Struct, frozen=True):
+    """A packed linear-attention prefill's data; no backend or runner escapes.
+
+    The consumer may update the current state slots and selected track slots.
+    All other slots and metadata are read-only. Scratch outputs belong to the
+    consumer unless an output buffer is supplied by the forward.
+    """
+
+    state: LinearPrefillBuffers
+    query_start_loc: torch.Tensor
+    state_indices: torch.Tensor
+    conv_block_table: Optional[torch.Tensor]
+    # Native backend family: 1 = Triton chunk kernel, 0 = another backend.
+    kernel_id: int
+    requires_contiguous_state: bool
+    is_graph: bool
+    has_mis: bool
+    has_track: bool
+    track_conv_indices: Optional[torch.Tensor]
+    track_conv_dst: Optional[torch.Tensor]
+    track_ssm_h_src: Optional[torch.Tensor]
+    track_ssm_h_dst: Optional[torch.Tensor]
+    track_ssm_final_src: Optional[torch.Tensor]
+    track_ssm_final_dst: Optional[torch.Tensor]
+    track_ssm_recompute_dst: Optional[torch.Tensor]
+    state_checkpoint_cu_starts: Optional[torch.Tensor]
+    num_state_checkpoints: int
+    state_checkpoint_every_n_tokens: int
+    output: Optional[torch.Tensor] = None
 
 
 class EagleDraftLoopIO(msgspec.Struct, frozen=True):
@@ -233,9 +275,41 @@ class EagleBinding:
             mamba=None if linear is None else self._read("mamba", self._mamba, backend),
         )
 
+    def prefill_view(self) -> LinearPrefillView:
+        """Publish the active prefill's tensors without speculative pool readers."""
+        backend = get_attn_backend()
+        _, linear = split_backend(backend)
+        if linear is None:
+            raise RuntimeError(
+                "linear prefill view requires a linear-attention backend"
+            )
+        meta = linear.forward_metadata
+        kernel = linear.kernel_dispatcher.extend_kernel
+        return LinearPrefillView(
+            state=self._read("prefill", self._prefill, backend),
+            query_start_loc=meta.query_start_loc,
+            state_indices=meta.mamba_cache_indices,
+            conv_block_table=getattr(meta, "conv_block_table", None),
+            kernel_id=int(type(kernel).__name__ == "TritonGDNKernel"),
+            requires_contiguous_state=linear.requires_contiguous_prefill_state,
+            is_graph=getattr(linear, "prefill_graph_metadata", None) is not None,
+            has_mis=getattr(linear, "mis_metadata", None) is not None,
+            has_track=meta.has_mamba_track_mask,
+            track_conv_indices=meta.track_conv_indices,
+            track_conv_dst=meta.conv_states_mask_indices,
+            track_ssm_h_src=meta.track_ssm_h_src,
+            track_ssm_h_dst=meta.track_ssm_h_dst,
+            track_ssm_final_src=meta.track_ssm_final_src,
+            track_ssm_final_dst=meta.track_ssm_final_dst,
+            track_ssm_recompute_dst=meta.track_ssm_recompute_dst,
+            state_checkpoint_cu_starts=meta.state_checkpoint_cu_starts,
+            num_state_checkpoints=meta.num_state_checkpoints,
+            state_checkpoint_every_n_tokens=meta.state_checkpoint_every_n_tokens,
+        )
+
     def assert_live(self) -> None:
         backend = get_attn_backend()
-        readers = {"kv": self._kv, "mamba": self._mamba}
+        readers = {"kv": self._kv, "mamba": self._mamba, "prefill": self._prefill}
         for name, sealed in self._sealed.items():
             if _identity(readers[name](backend)) != sealed:
                 raise RuntimeError(
@@ -253,6 +327,15 @@ class EagleBinding:
             pool=backend.token_to_kv_pool,
             backend=split_backend(backend)[0],
             model=self._model,
+        )
+
+    def _prefill(self, backend: Any) -> LinearPrefillBuffers:
+        pool = backend.req_to_token_pool
+        state = pool.mamba_pool.mamba_cache
+        return LinearPrefillBuffers(
+            layer_ids=tuple(sorted(pool.mamba_map, key=pool.mamba_map.get)),
+            conv=tuple(state.conv),
+            temporal=state.temporal,
         )
 
     def _mamba(self, backend: Any) -> MambaPoolBuffers:

@@ -62,6 +62,11 @@ from sglang.srt.entrypoints.engine_info_bootstrap_server import (
 )
 from sglang.srt.entrypoints.engine_score_mixin import EngineScoreMixin
 from sglang.srt.entrypoints.EngineBase import EngineBase
+from sglang.srt.entrypoints.server_utils import (
+    launch_dummy_health_check_server,
+    set_prometheus_multiproc_dir,
+    start_follower_grpc_server,
+)
 from sglang.srt.entrypoints.sidecar import rust_server_sidecar
 from sglang.srt.environ import envs
 from sglang.srt.managers.data_parallel_controller import (
@@ -147,13 +152,10 @@ from sglang.srt.utils import (
     is_cuda,
     is_mnnvl_fabric_device,
     kill_process_tree,
-    launch_dummy_health_check_server,
     maybe_reindex_device_id,
     normalize_serialized_named_tensor_payloads,
     numa_utils,
-    set_prometheus_multiproc_dir,
     set_ulimit,
-    start_follower_grpc_server,
 )
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.network import (
@@ -574,12 +576,9 @@ class Engine(EngineScoreMixin, EngineBase):
         image_data: Optional[MultimodalDataInputFormat] = None,
         audio_data: Optional[MultimodalDataInputFormat] = None,
         video_data: Optional[MultimodalDataInputFormat] = None,
-        # Optional per-image hashes the caller has already computed (hex strings,
-        # one per image in `image_data`). When supplied, each MultimodalDataItem's
-        # `hash` is initialised from this list and `set_pad_value` skips the
-        # internal `hash_feature()` recompute. Intended for external KV routers
-        # that compute their own per-image hash for routing decisions and need
-        # sglang's prefix-cache key to align. See GenerateReqInput.mm_hashes.
+        # Optional per-image routing hints (hex strings). These never replace
+        # the server-computed full content/configuration identity and cannot
+        # force cache sharing. See GenerateReqInput.mm_hashes.
         mm_hashes: Optional[Union[List[str], List[List[str]]]] = None,
         mm_content_hashes: Optional[
             Union[List[Optional[str]], List[List[Optional[str]]]]
