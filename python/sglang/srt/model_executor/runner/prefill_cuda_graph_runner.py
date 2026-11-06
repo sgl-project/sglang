@@ -2137,6 +2137,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             capture_hidden_mode=forward_batch.capture_hidden_mode,
             num_token_non_padded=num_token_non_padded,
             global_num_token_non_padded_cpu=forward_batch.global_num_token_non_padded_cpu,
+            # An idle DP rank replays as a dummy EXTEND batch, so the model needs
+            # this field to tell it apart from a real one.
+            _original_forward_mode=forward_batch._original_forward_mode,
             attn_tp_sequence_sharded=self.model_runner.attn_tp_sequence_sharded(
                 static_num_tokens
             ),
