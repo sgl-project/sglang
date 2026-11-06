@@ -15,13 +15,15 @@
 
 from __future__ import annotations
 
-import contextlib
 import logging
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Tuple, Union
 
 import torch
 
+from sglang.kernels.ops.attention.kv_indices import (
+    create_chunked_prefix_cache_kv_indices,
+)
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.utils import (
@@ -35,21 +37,14 @@ from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     build_eager_registry,
 )
-from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
-    create_chunked_prefix_cache_kv_indices,
-)
-from sglang.srt.model_executor.forward_batch_info import (
-    ForwardBatch,
-    ForwardMode,
-    PPProxyTensors,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import (
-    ForwardContext,
     forward_context,
     get_forward_context,
     get_req_to_token_pool,
     get_token_to_kv_pool,
 )
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner.base_runner import BaseRunner
 from sglang.srt.model_executor.runner_utils.shared_read_event import (
     maybe_publish_prefill_shared_read_done,
@@ -226,35 +221,19 @@ class EagerRunner(BaseRunner):
                 return self._execute_extend(forward_batch, pp_proxy_tensors)
             raise ValueError(f"Invalid forward mode for eager runner: {mode}")
 
-    def _resolve_decode_pdmux(
-        self,
-    ) -> Tuple[Any, contextlib.AbstractContextManager]:
-        """Resolve the (attn_backend, forward_context) the eager decode forward
-        runs under. PDmux selects a per-stream backend and publishes it via an
-        active ForwardContext; non-pdmux uses attn_backend + the ambient ctx."""
-        model_runner = self.model_runner
-        if self.enable_pdmux:
-            return model_runner.decode_attn_backend, forward_context(
-                ForwardContext(attn_backend=model_runner.decode_attn_backend)
-            )
-        return model_runner.attn_backend, contextlib.nullcontext()
-
     def _execute_decode(
         self,
         forward_batch: ForwardBatch,
         pp_proxy_tensors=None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
         model_runner = self.model_runner
-        enable_pdmux = self.enable_pdmux
-        attn_backend, pdmux_ctx = self._resolve_decode_pdmux()
-        if not enable_pdmux:
-            forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
+        forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
         if forward_batch.needs_forward_metadata_init():
             if hasattr(model_runner.model, "prepare_forward_batch"):
                 # Prepare model-specific attention metadata before planning,
                 # e.g. Moss-VL's prefill cross-attention custom mask.
                 model_runner.model.prepare_forward_batch(forward_batch)
-            attn_backend.init_forward_metadata(forward_batch)
+            model_runner.attn_backend.init_forward_metadata(forward_batch)
         # FIXME: add pp_proxy_tensors arg to all models
         kwargs = model_runner._pp_kwargs(pp_proxy_tensors)
 
@@ -262,7 +241,6 @@ class EagerRunner(BaseRunner):
 
         with (
             ctx,
-            pdmux_ctx,
             forward_context(get_forward_context(), forward_batch=forward_batch),
         ):
             return model_runner.model.forward(
@@ -280,8 +258,7 @@ class EagerRunner(BaseRunner):
         model_runner = self.model_runner
         kwargs = model_runner._extend_forward_kwargs(forward_batch, pp_proxy_tensors)
 
-        if not self.enable_pdmux:
-            forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
+        forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
 
         cp_active = is_cp_active(forward_batch)
         if cp_active:
@@ -449,8 +426,7 @@ class EagerRunner(BaseRunner):
         # Padded idle (DP-attn MLP sync) needs metadata reinit; unpadded must
         # drop stale forward_metadata to avoid an SWA use-after-free on req_pool.
         if forward_batch.batch_size > 0:
-            if not self.enable_pdmux:
-                forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
+            forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
             model_runner.attn_backend.init_forward_metadata(forward_batch)
         else:
             model_runner.attn_backend.forward_metadata = None

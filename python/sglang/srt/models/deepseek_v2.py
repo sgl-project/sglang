@@ -54,7 +54,6 @@ from sglang.srt.batch_overlap.two_batch_overlap import (
 )
 from sglang.srt.configs.model_config import (
     compute_mla_mscale_scaling,
-    dsa_draft_shards_under_dcp,
     dsa_layer_skips_topk,
     get_dsa_index_head_dim,
     get_dsa_index_kpool,
@@ -62,6 +61,7 @@ from sglang.srt.configs.model_config import (
     get_dsa_index_topk,
     is_deepseek_dsa,
     is_glm_moe_dsa,
+    mla_attention_dcp_size,
 )
 from sglang.srt.distributed import divide
 from sglang.srt.environ import envs
@@ -80,19 +80,25 @@ from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
     AuxHiddenStatePacker,
 )
-from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
+from sglang.srt.layers.cp.cp_decode_attn_tp import (
+    can_defer_cp_decode_attn_tp,
+    configure_cp_decode_attn_tp,
+    get_cp_decode_attn_tp_ctx,
+)
 from sglang.srt.layers.cp.utils import cp_gather_full_sequence_states
 from sglang.srt.layers.dcp.planner import (
     prepare_decode_context_parallel_metadata,
 )
 from sglang.srt.layers.flashinfer_comm_fusion import uses_cutedsl_ar_fusion
 from sglang.srt.layers.layer_boundary import (
+    SumGroup,
     append_stages,
     declare_attn,
     declare_ffn,
     get_attn_tp_context,
     is_dense_ffn_fully_dp,
 )
+from sglang.srt.layers.layer_boundary.contracts import BatchVariant
 from sglang.srt.layers.layer_boundary.residual import access as residual_access
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
@@ -261,6 +267,7 @@ elif _is_npu:
         forward_mha_prepare_npu,
         forward_mla_core_npu,
         forward_mla_prepare_npu,
+        init_modelslim_mla_kv,
     )
 else:
     pass
@@ -581,7 +588,6 @@ class MoEGate(nn.Module):
                 hidden_states,
                 self.weight,
                 out_dtype=torch.float32,
-                max_m=self.tiny_router_gemm_max_tokens,
             )
         elif _use_aiter:
             logits = aiter_dsv3_router_gemm(hidden_states, self.weight)
@@ -1012,6 +1018,19 @@ class DeepseekV2MoE(nn.Module):
         # forward (weights and runner are final by then). None = undecided.
         self._moe_quant_once: Optional[bool] = None
 
+        if get_moe_runner_backend().is_gluon():
+            if getattr(config, "model_type", None) != "glm_moe_dsa":
+                raise RuntimeError(
+                    "--moe-runner-backend gluon supports only GLM-5.2/5.3 "
+                    "Quark MXFP4 checkpoints"
+                )
+            from sglang.srt.layers.moe.glm_mxfp4_gluon import (
+                GlmMxfp4GluonMoeBackend,
+            )
+            from sglang.srt.layers.moe.gluon_backend import bind_gluon_moe_backend
+
+            bind_gluon_moe_backend(self, GlmMxfp4GluonMoeBackend())
+
     def get_moe_weights(self):
         # EPLB only rebalances physical routed experts. Fused shared expert
         # slots live after each rank's routed slots and must stay stable.
@@ -1038,10 +1057,10 @@ class DeepseekV2MoE(nn.Module):
             and hidden_states.shape[0] > 0
             and self.shared_experts is not None
             and getattr(self.experts, "use_flashinfer_trtllm_moe", False)
-            and self.topk.topk_config.output_format == TopKOutputFormat.BYPASSED
             and not self._enable_a2a_moe
             and not self._fuse_shared_experts_inside_sbo
-            and not getattr(self, "is_hash", False)
+            and not self.is_hash
+            and self.topk.topk_config.output_format == TopKOutputFormat.BYPASSED
             and not is_expert_remapping_enabled()
             and get_exec().moe.ep_dispatch_algorithm not in ("fake", "lp")
         )
@@ -1062,7 +1081,28 @@ class DeepseekV2MoE(nn.Module):
         the V2/V3 layer-boundary handoff. ``leave_output_sum`` returns those
         pieces with the selected finalize kernel, for
         a boundary that owns reduction and the replicated shared add."""
+        from sglang.srt.layers.moe.gluon_backend import (
+            forward_gluon_moe,
+            should_use_gluon_moe,
+        )
         from sglang.srt.layers.moe.mega_moe import forward_mega_moe, should_use_mega_moe
+
+        num_token_non_padded = (
+            forward_batch.moe_num_token_non_padded()
+            if forward_batch is not None
+            else None
+        )
+        if should_use_gluon_moe(self):
+            output = forward_gluon_moe(
+                self,
+                hidden_states,
+                gemm_output_zero_allocator=gemm_output_zero_allocator,
+                input_ids=input_ids,
+                input_ids_global=input_ids_global,
+                skip_shared_experts=skip_shared_experts,
+                num_token_non_padded=num_token_non_padded,
+            )
+            return self._finalize_normal_output(output, None)
 
         if should_use_mega_moe(self, hidden_states):
             return forward_mega_moe(
@@ -1072,7 +1112,9 @@ class DeepseekV2MoE(nn.Module):
                 input_ids_global=input_ids_global,
             )
 
-        use_vision_topk = self.gate.e_score_correction_bias_vl is not None
+        use_vision_topk = (
+            self.gate.e_score_correction_bias_vl is not None and not self.is_hash
+        )
         if use_vision_topk and _is_hip:
             use_vision_topk = _hip_moe.batch_has_images(forward_batch)
         if not self._enable_a2a_moe:
@@ -1210,8 +1252,11 @@ class DeepseekV2MoE(nn.Module):
         deferred_finalize = (
             has_shared_output
             and not self._shared_expert_tp1
-            and topk_output.format == TopKOutputFormat.BYPASSED
-            and self.experts.supports_deferred_finalize
+            and (
+                self.experts.supports_deferred_finalize
+                if topk_output.format == TopKOutputFormat.BYPASSED
+                else self.experts.supports_routed_deferred_finalize
+            )
             and (
                 self._deferred_finalize_max_tokens <= 0
                 or hidden_states.shape[0] <= self._deferred_finalize_max_tokens
@@ -1298,6 +1343,21 @@ class DeepseekV2MoE(nn.Module):
         # TP1 shared experts are replicated: add them after this block's
         # all-reduce, or on TP rank 0 only when the stage boundary sums.
         if self._shared_expert_tp1 and self._adds_replicated_output():
+            final_hidden_states += shared_output
+        return final_hidden_states
+
+    def _finalize_normal_output(
+        self,
+        final_hidden_states: torch.Tensor,
+        shared_output: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if self.reduce_results:
+            final_hidden_states = post_experts_all_reduce(final_hidden_states)
+        if (
+            shared_output is not None
+            and self._shared_expert_tp1
+            and self._adds_replicated_output()
+        ):
             final_hidden_states += shared_output
         return final_hidden_states
 
@@ -1452,17 +1512,7 @@ class DeepseekV2MoE(nn.Module):
             None if self._shared_expert_tp1 else shared_output,
             self.routed_scaling_factor,
         )
-        if self.reduce_results:
-            final_hidden_states = post_experts_all_reduce(final_hidden_states)
-        # TP1 shared experts are replicated: add them after this block's
-        # all-reduce, or on TP rank 0 only when the stage boundary sums.
-        if (
-            shared_output is not None
-            and self._shared_expert_tp1
-            and self._adds_replicated_output()
-        ):
-            final_hidden_states += shared_output
-        return final_hidden_states
+        return self._finalize_normal_output(final_hidden_states, shared_output)
 
     def _adds_replicated_output(self) -> bool:
         """Whether this rank adds the replicated TP1 shared-expert output."""
@@ -2056,13 +2106,15 @@ class DeepseekV2AttentionMLA(
         self.is_nextn = is_nextn
         attn_tp_size = get_parallel().attn_tp_size
         self.use_dsa = is_deepseek_dsa(config)
-        self.dcp_size = get_parallel().attn_dcp_size
-        if (
-            is_nextn
-            and self.use_dsa
-            and not dsa_draft_shards_under_dcp(config, self.dcp_size)
-        ):
-            self.dcp_size = 1
+        self.defer_cp_decode_attn_tp = (
+            self.use_dsa
+            and q_lora_rank is not None
+            and not reduce_results
+            and can_defer_cp_decode_attn_tp()
+        )
+        self.dcp_size = mla_attention_dcp_size(
+            config, dcp_size=get_parallel().attn_dcp_size, is_nextn=is_nextn
+        )
         self.num_heads = num_heads
         assert num_heads % attn_tp_size == 0
         self.num_local_heads = num_heads // attn_tp_size
@@ -2170,6 +2222,10 @@ class DeepseekV2AttentionMLA(
             prefix=add_prefix("o_proj", prefix),
             parallel_group="attn_tp",
         )
+        if self.q_lora_rank is not None:
+            configure_cp_decode_attn_tp(
+                self.o_proj, defer_all_reduce=self.defer_cp_decode_attn_tp
+            )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
 
         if not skip_rope and qk_rope_head_dim > 0:
@@ -2229,6 +2285,8 @@ class DeepseekV2AttentionMLA(
             attn_type=attn_type,
             prefix=add_prefix("attn_mha", prefix),
         )
+        if _is_npu:
+            init_modelslim_mla_kv(self, prefix)
 
         self.alt_stream = alt_stream
         self.attn_mha.kv_b_proj = None
@@ -2242,6 +2300,9 @@ class DeepseekV2AttentionMLA(
         self.w_kc_qrep = None
         self.q_b_proj_qrep_weight = None
         self.q_b_proj_qrep = None
+        # Full-head bf16 w_vc for project-before-merge: the V up-projection runs
+        # on every group head before the DCP a2a, so the wire carries v_head_dim.
+        self.w_vc_qrep = None
 
         self.w_scale_k = None
         self.w_scale_v = None
@@ -2293,6 +2354,7 @@ class DeepseekV2AttentionMLA(
             [self.q_b_proj, self.o_proj],
             tensor_attrs=tensor_attrs,
             radix_attn=self.attn_mqa,
+            defer_all_reduce=self.defer_cp_decode_attn_tp,
         ):
             if ctx.use_decode_attn_tp:
                 orig_num_local_heads = self.num_local_heads
@@ -2555,7 +2617,9 @@ class DeepseekV2AttentionMLA(
                 self.has_fused_proj
                 and not get_exec().deterministic.enable_deterministic_inference
                 and not self.is_packed_weight
-                and fused_a_gemm_weight_eligible(self.fused_qkv_a_proj_with_mqa)
+                and fused_a_gemm_weight_eligible(
+                    self.fused_qkv_a_proj_with_mqa, backend=self.fused_a_gemm_backend
+                )
             )
         if self._use_min_latency_fused_a_gemm:
             return linear_with_fused_a_gemm(
@@ -2576,7 +2640,9 @@ class DeepseekV2AttentionMLA(
         if self._use_min_latency_q_b_gemm is None:
             self._use_min_latency_q_b_gemm = (
                 self._q_b_proj_verified_shape
-                and fused_a_gemm_weight_eligible(self.q_b_proj)
+                and fused_a_gemm_weight_eligible(
+                    self.q_b_proj, backend=self.fused_a_gemm_backend
+                )
             )
         if self._use_min_latency_q_b_gemm:
             q = linear_with_fused_a_gemm(
@@ -2721,7 +2787,16 @@ class DeepseekV2DecoderLayer(nn.Module):
         with too (see make_layers). ``attn_output`` and ``output``: the
         attention's and the FFN's output transforms, if any."""
         return (
-            declare_attn(output_transform=attn_output),
+            declare_attn(
+                output_transform=attn_output,
+                ordinary_tp_group=(
+                    SumGroup.TP
+                    if is_deepseek_dsa(config)
+                    and getattr(config, "q_lora_rank", None) is not None
+                    and can_defer_cp_decode_attn_tp()
+                    else None
+                ),
+            ),
             declare_ffn(
                 sparse=cls._is_layer_sparse(config, layer_id, is_nextn=is_nextn),
                 next_layer_sparse=cls._is_layer_sparse(
@@ -2755,6 +2830,13 @@ class DeepseekV2DecoderLayer(nn.Module):
         attn, ffn = self.stage_facts(
             self.config, self.layer_id, is_nextn=self.is_nextn, **modules
         )
+        defer_decode_sum = getattr(self.self_attn, "defer_cp_decode_attn_tp", False)
+        if (attn.ordinary_tp_group is not None) != defer_decode_sum:
+            raise ValueError(
+                "CP decode attention TP deferral disagrees with the stage declaration"
+            )
+        if defer_decode_sum:
+            configure_cp_decode_attn_tp(self.self_attn.o_proj, defer_all_reduce=True)
         attn_boundary, ffn_boundary = append_stages(
             (
                 attn,
@@ -2828,6 +2910,11 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
 
         with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
+            if getattr(self.self_attn, "defer_cp_decode_attn_tp", False):
+                assert get_cp_decode_attn_tp_ctx().use_decode_attn_tp == (
+                    self.attn_boundary.plan.variant_for(forward_batch)
+                    is BatchVariant.ORDINARY
+                ), "CP decode weight dispatch disagrees with the boundary sum"
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -3026,19 +3113,19 @@ class DeepseekV2Model(nn.Module):
         if (
             _use_aiter_gfx95
             and config.n_routed_experts == 256
-            and self.embed_tokens.embedding_dim == 7168
+            and getattr(self.embed_tokens, "embedding_dim", None) == 7168
         ):
             num_moe_layers = sum(
                 [
                     1
                     for i in range(len(self.layers))
-                    if isinstance(self.layers[i].mlp, DeepseekV2MoE)
+                    if isinstance(getattr(self.layers[i], "mlp", None), DeepseekV2MoE)
                 ]
             )
 
             allocate_size = 0
             for i in range(len(self.layers)):
-                if isinstance(self.layers[i].mlp, DeepseekV2MoE):
+                if isinstance(getattr(self.layers[i], "mlp", None), DeepseekV2MoE):
                     # tp_size = get_parallel().tp_size
                     # Keep the original deepep-class scope here and only add DeepEP v2,
                     # so unrelated backends' allocator sizing is unchanged.
@@ -3061,7 +3148,7 @@ class DeepseekV2Model(nn.Module):
                     config.n_routed_experts,
                     num_moe_layers,
                     allocate_size,
-                    self.embed_tokens.embedding_dim,
+                    getattr(self.embed_tokens, "embedding_dim", 0),
                 )
             )
         self.layers_to_capture = []
@@ -3412,6 +3499,10 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
     @classmethod
     def num_fusable_shared_experts(cls, hf_config) -> int:
         """Return the model's fusable shared-expert count."""
+        # Generic Gluon EP kernels keep the shared expert native. GLM's
+        # target class overrides this hook for its fused rank-local slot.
+        if get_moe_runner_backend().is_gluon() and get_parallel().moe_ep_size > 1:
+            return 0
         return hf_config.n_shared_experts or 0
 
     def get_input_embeddings(self) -> nn.Embedding:

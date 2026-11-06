@@ -9,7 +9,7 @@ from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
     max_bootstrap_input_len,
 )
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
     PrefillAdder,
@@ -128,7 +128,7 @@ class TestPrefillAdder(CustomTestCase):
 
     def create_mock_req(self, rid, priority, max_new_tokens, output_len=0, wait_time=0):
         req = MagicMock(spec=Req)
-        req.kv = SimpleNamespace(req_pool_idx=None)
+        req.kv = ReqKvInfo()
         req.rid = str(rid)
         req.cache_request_handle = CacheRequestHandle(req.rid, 0)
         req.priority = priority
@@ -1610,6 +1610,11 @@ class TestPrefillAdder(CustomTestCase):
         self.mock_tree_cache.mock_add_spec(schedule_policy.UnifiedRadixCache)
         self.mock_tree_cache.buffer_pipeline = MagicMock()
         allocator = self.mock_token_allocator
+        allocator.prefill_state_fits.side_effect = (
+            lambda full, window, state, **kwargs: (
+                full + state * 64 <= allocator.available_size()
+            )
+        )
         allocator.create_prefill_budget.side_effect = lambda tree_cache, **kwargs: (
             ChainPrefillBudget(
                 allocator,
@@ -1619,13 +1624,23 @@ class TestPrefillAdder(CustomTestCase):
             )
         )
         adder = self.create_adder(self.create_running_batch())
-        adder.memory_budget.rem_state_slots = available_slots
+        allocator.mamba_allocator.schedulable_available_size.return_value = (
+            available_slots
+        )
+        self.mock_tree_cache.supports_mamba.return_value = True
+        self.mock_tree_cache.mamba_evictable_size.return_value = 0
         req = self._create_host_hit_req(host_hit=32, tail=8)
         req.mamba_host_hit_length = 1
-        req.kv.holds_mamba = holds_state
+        req.kv.mamba_pool_idx = torch.tensor([0]) if holds_state else None
+        allocator.storage.pending_state_slots.side_effect = lambda req: int(
+            not req.kv.holds_mamba
+        )
 
         def load_back(params):
-            req.kv.holds_mamba = True
+            allocator.mamba_allocator.schedulable_available_size.return_value -= (
+                int(not req.kv.holds_mamba) + req.mamba_host_hit_length
+            )
+            req.kv.mamba_pool_idx = torch.tensor([0])
             return req.host_hit_length, req.last_node
 
         self.mock_tree_cache.init_load_back.side_effect = load_back
@@ -1651,9 +1666,7 @@ class TestPrefillAdder(CustomTestCase):
                 )
                 if admitted:
                     self.mock_tree_cache.init_load_back.assert_called_once()
-                    self.assertEqual(
-                        adder.memory_budget.total_offset, 8 + 8 + 1 + slots * 64
-                    )
+                    self.assertEqual(adder.memory_budget.total_offset, 8 + 8 + 1)
                 else:
                     self.assertIs(result, AddReqResult.NO_TOKEN)
                     self.mock_tree_cache.init_load_back.assert_not_called()
@@ -1674,7 +1687,7 @@ class TestPrefillAdder(CustomTestCase):
         # Continuing chunks retain the original host-hit metadata.
         self.assertEqual(req.mamba_host_hit_length, 1)
         next_adder = self.create_adder(self.create_running_batch(), rem_chunk_tokens=4)
-        next_adder.memory_budget.rem_state_slots = 0
+        self.mock_token_allocator.mamba_allocator.schedulable_available_size.return_value = 0
         self.assertIsNone(next_adder.add_chunked_req(req))
         self.assertEqual(next_adder.memory_budget.rem_state_slots, 0)
         self.assertEqual(next_adder.memory_budget.total_offset, 4 + 8 + 1)

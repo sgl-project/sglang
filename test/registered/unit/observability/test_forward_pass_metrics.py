@@ -12,14 +12,14 @@ from contextlib import nullcontext
 from functools import partial
 from itertools import count
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import prometheus_client
 import torch
 
 from sglang.srt.disaggregation.decode import SchedulerDisaggregationDecodeMixin
-from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.managers.schedule_batch import ReqKvInfo, ScheduleBatch
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
@@ -28,18 +28,21 @@ from sglang.srt.managers.scheduler_components.metrics_reporter import (
     SchedulerMetricsReporter,
     _CacheHitRateWindow,
 )
+from sglang.srt.managers.scheduler_components.request_list import ListKind
 from sglang.srt.managers.scheduler_pp_mixin import PPBatchMetadata, SchedulerPPMixin
 from sglang.srt.managers.utils import GenerationBatchResult
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.observability.forward_pass_metrics import (
     ForwardPassMetrics,
     FpmTiming,
+    TimingSegment,
     _FpmPublisherThread,
     decode,
     wrap_forward_with_fpm,
 )
 from sglang.srt.observability.metrics_collector import (
     DPBalanceStats,
+    QueueCount,
     SchedulerMetricsCollector,
 )
 from sglang.srt.observability.scheduler_stage_metrics import (
@@ -47,6 +50,7 @@ from sglang.srt.observability.scheduler_stage_metrics import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.device_timer import DeviceTimer, _TimingInterval, device_timer_ctx
+from sglang.test.scheduler_test_utils import FakeReq, decode_queue
 from sglang.test.test_utils import CustomTestCase, enter_scope
 
 
@@ -164,6 +168,124 @@ class TestDeviceTimerCapture(unittest.TestCase):
                 timing.when_ready(callback)
                 callback.assert_called_once_with(expected)
 
+    def test_pending_group_supports_span_and_segment_consumers(self):
+        reporter = Mock()
+        timer = DeviceTimer(reporter)
+        intervals = [FakeInterval(2, ready=True), FakeInterval(5, start=4)]
+        timing = FpmTiming()
+        with patch.object(_TimingInterval, "create", side_effect=intervals):
+            with timer.capture(timing):
+                with device_timer_ctx(timer, "extend"):
+                    pass
+                with device_timer_ctx(timer, "decode"):
+                    pass
+        timing.seal()
+        publisher = _CollectingPublisher()
+        metrics = ForwardPassMetrics(worker_id="worker", counter_id=17)
+        timing.publish_when_ready(metrics, publisher)
+        segments = []
+
+        def collect_segments(_span):
+            segments.extend(
+                (segment.elapsed_seconds, segment.metadata["category"])
+                for segment in timing.segments
+            )
+
+        timing.when_ready(collect_segments)
+        self.assertEqual(publisher.metrics, [])
+        self.assertEqual(segments, [])
+
+        intervals[-1].ready = True
+        timer._report()
+        self.assertEqual(len(publisher.metrics), 1)
+        self.assertEqual(publisher.metrics[0].wall_time, 0.009)
+        self.assertEqual(publisher.metrics[0].counter_id, 17)
+        self.assertEqual(segments, [(0.002, "extend"), (0.005, "decode")])
+        self.assertEqual(sum(t for t, _ in segments), 0.007)
+        self.assertEqual(
+            reporter.call_args_list,
+            [
+                call(t=0.002, category="extend"),
+                call(t=0.005, category="decode"),
+            ],
+        )
+        timer._report()
+        self.assertEqual(len(publisher.metrics), 1)
+        self.assertEqual(len(segments), 2)
+
+    def test_segments_are_read_only_snapshots_built_once_ready(self):
+        timer = DeviceTimer()
+        interval = FakeInterval(7)
+        interval.elapsed_time = Mock(wraps=interval.elapsed_time)
+        timing = capture_timing(timer, interval)
+        with self.assertRaises(RuntimeError):
+            _ = timing.segments
+
+        interval.ready = True
+        timer._report()
+        segments = timing.segments
+        self.assertEqual(segments, timing.segments)
+        interval.elapsed_time.assert_called_once_with()
+        (segment,) = segments
+        self.assertEqual(segment.elapsed_seconds, 0.007)
+        self.assertEqual(dict(segment.metadata), {"category": "test"})
+        interval.metadata["category"] = "changed"
+        self.assertEqual(segment.metadata["category"], "test")
+        with self.assertRaises(TypeError):
+            segment.metadata["category"] = "changed"
+        with self.assertRaises(AttributeError):
+            segment.elapsed_seconds = 0.0
+        self.assertFalse(hasattr(segment, "__dict__"))
+        self.assertIsInstance(segment, TimingSegment)
+
+    def test_span_only_consumers_skip_segment_durations(self):
+        timer = DeviceTimer()
+        intervals = [FakeInterval(2, ready=True), FakeInterval(5, True, start=4)]
+        for interval in intervals:
+            interval.elapsed_time = Mock(wraps=interval.elapsed_time)
+        timing = capture_timing(timer, *intervals)
+        timer._report()
+        ready = Mock()
+        timing.when_ready(ready)
+        ready.assert_called_once_with(0.009)
+        for interval in intervals:
+            interval.elapsed_time.assert_not_called()
+
+    def test_completion_before_seal_keeps_all_listeners(self):
+        timer = DeviceTimer()
+        timing = FpmTiming()
+        callbacks = [Mock(), Mock(), Mock()]
+        with patch.object(
+            _TimingInterval, "create", return_value=FakeInterval(7, ready=True)
+        ):
+            with timer.capture(timing):
+                timing.when_ready(callbacks[0])
+                timing.when_ready(callbacks[1])
+                with device_timer_ctx(timer, "decode"):
+                    pass
+        callbacks[0].assert_not_called()
+        callbacks[1].assert_not_called()
+        timing.seal()
+        timing.when_ready(callbacks[2])
+        timing.seal()
+        timer._report()
+        for callback in callbacks:
+            callback.assert_called_once_with(0.007)
+
+    def test_captured_intervals_still_reach_late_aggregate_reporters(self):
+        original, late = Mock(), Mock()
+        timer = DeviceTimer(original)
+        interval = FakeInterval(7)
+        timing = capture_timing(timer, interval)
+        interval.ready = True
+        timer.add_reporter(late)
+        timer._report()
+        for reporter in (original, late):
+            reporter.assert_called_once_with(t=0.007, category="test")
+        ready = Mock()
+        timing.when_ready(ready)
+        ready.assert_called_once_with(0.007)
+
 
 class TestSpecDecodeLengthSnapshot(CustomTestCase):
     def test_snapshot_precedes_settlement_and_survives_retraction(self):
@@ -185,7 +307,7 @@ class TestSpecDecodeLengthSnapshot(CustomTestCase):
                         spec_verify_ct=0,
                         spec_num_correct_drafts=0,
                         update_spec_correct_drafts_histogram=Mock(),
-                        kv=types.SimpleNamespace(kv_committed_len=0),
+                        kv=ReqKvInfo(),
                     )
                     for length in (100, 200, 300)
                 ]
@@ -319,6 +441,7 @@ def _make_reporter(test, scheduler) -> SchedulerMetricsReporter:
     if not hasattr(scheduler, "kv_events_publisher"):
         scheduler.kv_events_publisher = types.SimpleNamespace(
             init_kv_events=lambda *a, **kw: None,
+            emit_kv_metrics=Mock(),
         )
     if not hasattr(scheduler, "tp_workers"):
         scheduler.tp_workers = []
@@ -898,8 +1021,7 @@ class TestIdleMetrics(CustomTestCase):
     def setUp(self):
         self.scheduler = types.SimpleNamespace(
             running_batch=types.SimpleNamespace(reqs=[]),
-            waiting_queue=[],
-            grammar_manager=[],
+            request_lists=lambda: {kind: [] for kind in ListKind},
             enable_priority_scheduling=False,
             disaggregation_mode=DisaggregationMode.NULL,
             pool_stats_observer=types.SimpleNamespace(
@@ -920,6 +1042,76 @@ class TestIdleMetrics(CustomTestCase):
                 stats.fwd_occupancy
             ),
         )
+
+    def test_idle_publishes_refreshed_kv_metrics(self):
+        self.reporter.current_scheduler_metrics_enabled = True
+        self.scheduler.disagg_decode_prealloc_queue = types.SimpleNamespace(
+            queue=[], pre_allocated_token_counts=lambda: (0, 0)
+        )
+        self.scheduler.disagg_decode_transfer_queue = types.SimpleNamespace(
+            queue=[], num_pending_deferred_releases=lambda: 0
+        )
+        published = []
+        self.scheduler.kv_events_publisher.emit_kv_metrics.side_effect = lambda: (
+            published.append(
+                (
+                    self.reporter.stats.token_usage,
+                    self.reporter.stats.num_running_reqs.total,
+                    self.reporter.stats.num_queue_reqs.total,
+                )
+            )
+        )
+        for mode in DisaggregationMode:
+            for token_usage in (0.0, 0.25):
+                with self.subTest(mode=mode, token_usage=token_usage):
+                    self.scheduler.disaggregation_mode = mode
+                    self.reporter.stats.token_usage = 0.82
+                    self.reporter.stats.num_running_reqs = QueueCount(total=1)
+                    self.reporter.stats.num_queue_reqs = QueueCount(total=1)
+                    self.scheduler.pool_stats_observer.get_pool_stats = lambda: (
+                        types.SimpleNamespace(
+                            update_scheduler_stats=lambda stats: setattr(
+                                stats, "token_usage", token_usage
+                            ),
+                            full_capacity=1,
+                            is_hybrid_swa=False,
+                        )
+                    )
+                    with patch(
+                        "sglang.srt.managers.scheduler_components.metrics_reporter.time.perf_counter",
+                        return_value=101.0,
+                    ):
+                        self.reporter._maybe_log_idle_metrics()
+                    self.assertEqual(published, [(token_usage, 0, 0)])
+                    published.clear()
+
+    def test_idle_kv_metrics_preserve_rate_limit_and_metrics_gate(self):
+        self.reporter.current_scheduler_metrics_enabled = True
+        with (
+            patch(
+                "sglang.srt.managers.scheduler_components.metrics_reporter.ENABLE_METRICS_DEVICE_TIMER",
+                False,
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_components.metrics_reporter.time.perf_counter",
+                return_value=101.0,
+            ),
+        ):
+            self.reporter._maybe_log_idle_metrics()
+        self.scheduler.kv_events_publisher.emit_kv_metrics.assert_not_called()
+
+        with patch(
+            "sglang.srt.managers.scheduler_components.metrics_reporter.time.perf_counter",
+            return_value=131.0,
+        ):
+            self.reporter._maybe_log_idle_metrics()
+        self.scheduler.kv_events_publisher.emit_kv_metrics.assert_called_once_with()
+
+        self.scheduler.kv_events_publisher.emit_kv_metrics.reset_mock()
+        self.reporter.current_scheduler_metrics_enabled = False
+        self.reporter.stats.num_running_reqs = QueueCount(total=1)
+        self.reporter._maybe_log_idle_metrics()
+        self.scheduler.kv_events_publisher.emit_kv_metrics.assert_not_called()
 
     def test_host_receive_metrics_survive_queue_drain(self):
         registry = prometheus_client.CollectorRegistry()
@@ -943,11 +1135,12 @@ class TestIdleMetrics(CustomTestCase):
             queue=[], pre_allocated_token_counts=lambda: (0, 0)
         )
         host_reqs = [
-            types.SimpleNamespace(host_staged=True, priority=priority)
+            types.SimpleNamespace(req=FakeReq(priority=priority), host_staged=True)
             for priority in (1, 2)
         ]
+        device_req = types.SimpleNamespace(req=FakeReq(priority=1), host_staged=False)
         self.scheduler.disagg_decode_transfer_queue = types.SimpleNamespace(
-            queue=[*host_reqs, types.SimpleNamespace(host_staged=False, priority=1)],
+            queue=decode_queue(ListKind.PD_RECEIVING, [*host_reqs, device_req]),
             num_pending_deferred_releases=lambda: 0,
         )
         for _ in host_reqs:

@@ -44,7 +44,7 @@ import torch.types
 from PIL import Image
 from torch import nn
 from torch.nn.init import trunc_normal_
-from transformers import PretrainedConfig
+from transformers import LlamaConfig, PretrainedConfig
 
 from sglang.srt.configs.qwen3_5 import Qwen3_5MoeTextConfig
 from sglang.srt.layers.linear import ReplicatedLinear
@@ -55,16 +55,12 @@ from sglang.srt.managers.mm_utils import (
     pad_mm_token_pairs,
     pad_mm_tokens,
 )
-from sglang.srt.managers.schedule_batch import (
-    MultimodalDataItem,
-    MultimodalInputFormat,
-    MultimodalInputs,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.idefics2 import Idefics2VisionTransformer
-from sglang.srt.models.llama import LlamaConfig, LlamaForCausalLM
+from sglang.srt.models.llama import LlamaForCausalLM
 from sglang.srt.models.minicpmv_vit import (
     MiniCPMV_Merger,
     MiniCPMV_VisionTransformer,
@@ -73,6 +69,7 @@ from sglang.srt.models.qwen2 import Qwen2Config, Qwen2ForCausalLM
 from sglang.srt.models.qwen3 import Qwen3Config, Qwen3ForCausalLM
 from sglang.srt.models.qwen3_5 import Qwen3_5ForCausalLM, Qwen3_5MoeForCausalLM
 from sglang.srt.models.utils import WeightsMapper
+from sglang.srt.multimodal.modality import MultimodalInputFormat
 from sglang.srt.utils import add_prefix, flatten_nested_list, get_device
 
 RawImageType = Union[Image.Image, torch.Tensor]

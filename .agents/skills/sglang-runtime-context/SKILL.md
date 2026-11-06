@@ -443,8 +443,9 @@ in-process twins report.
 
 ### Adding a model-specific config adjustment
 
-Never assign `server_args` fields from model code. Declare instead
-(`sglang/srt/arg_groups/overrides.py`):
+Never assign `server_args` fields from model code. Declare instead, in a module
+under `sglang/srt/arg_groups/model_overrides/`, with the helpers from
+`sglang/srt/arg_groups/model_override_base.py`:
 
 - Constant per-arch values → `MODEL_OVERRIDES["MyArchForCausalLM"] = {...}`.
 - Derived values → `@register_model_override("MyArchForCausalLM")` returning a dict; the

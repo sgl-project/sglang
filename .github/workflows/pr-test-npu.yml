@@ -681,7 +681,6 @@ jobs:
 
   # ==================== Recommend Tests from Coverage ==================== #
   # Recommends PR-affected test cases from the pre-built coverage baseline.
-  # continue-on-error so it never blocks the PR gate.
   recommend-tests-from-coverage:
     name: Recommend tests from coverage
     needs: [check-changes, pr-gate]
@@ -719,11 +718,6 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      # Every step carries step-level continue-on-error so the job conclusion
-      # is ALWAYS 'success' — the fast-fail health check in other jobs filters
-      # by job conclusion, and job-level continue-on-error still reports
-      # 'failure' via the API. Failed steps stay visible (red ✗ + annotation)
-      # but never cascade to test jobs.
       - name: Checkout sglang scripts
         continue-on-error: true
         uses: actions/checkout@v4
@@ -773,23 +767,30 @@ jobs:
 
       - name: Recommend tests for current PR
         continue-on-error: true
+        uses: lb-actions/precision-test@v1.0.7
+        with:
+          repo: sglang
+          github-pr: ${{ github.repository }}#${{ github.event.pull_request.number }}
+          source-dir: ${{ github.workspace }}/outputs/covstub
+          map-file: ${{ github.workspace }}/test_case_map.json
+
+      - name: Export changed-file list for bucketing
+        continue-on-error: true
+        if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
-          if ! python3 -c "import regex" >/dev/null 2>&1; then
-            echo "regex not found for $(python3 -V); bootstrapping pip and installing regex"
-            curl -fsSL https://bootstrap.pypa.io/get-pip.py -o get-pip.py
-            python3 get-pip.py --break-system-packages
-            python3 -m pip install --break-system-packages regex
+          if test -f recommended_pytest_paths.txt; then
+            # Paginated files API instead of `gh pr diff --name-only`: the
+            # diff endpoint may truncate large PRs, which would silently
+            # drop a changed pipeline-config path from the full-run gate.
+            gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
+              --paginate --jq '.[].filename' > "$PWD/pr_changed_files.txt"
+            test -s "$PWD/pr_changed_files.txt"
+            echo "Changed files: $(wc -l < "$PWD/pr_changed_files.txt")"
+          else
+            echo "::warning::Precision selector produced no recommendation; dropping the changed-file list so all suites run in full."
+            rm -f pr_changed_files.txt
           fi
-          python3 -c "import regex; print('regex ok:', regex.__file__)"
-          PR_SPEC="${{ github.repository }}#${{ github.event.pull_request.number }}"
-          echo "Selecting tests for PR: ${PR_SPEC}"
-          # test_selector.py resolves relative paths against the script's own dir,
-          # so pass absolute paths for files downloaded to the workspace root.
-          python3 scripts/ci/npu/precise-test/test_selector.py \
-            --github-pr "${PR_SPEC}" \
-            --source-dir "$PWD/outputs/covstub" \
-            --map-file "$PWD/test_case_map.json"
 
       # Bucket the recommended tests per suite. Downstream jobs consume two
       # outputs per suite: should_run_<suite> ('false' -> skip the job, e.g.
@@ -807,8 +808,8 @@ jobs:
         run: |
           set -euo pipefail
           python3 scripts/ci/npu/precise-test/bucket_recommended_tests.py \
-            --recommended scripts/ci/npu/precise-test/recommended_pytest_paths.txt \
-            --changed-files scripts/ci/npu/precise-test/pr_changed_files.txt \
+            --recommended recommended_pytest_paths.txt \
+            --changed-files pr_changed_files.txt \
             --suites "base-b-test-1-npu-a3,base-b-test-2-npu-a3,base-b-test-4-npu-a3,base-b-test-8-npu-a3,base-b-test-16-npu-a3,base-c-test-acc-2-npu-a3,base-c-test-acc-16-npu-a3,base-c-test-perf-2-npu-a3,base-c-test-perf-16-npu-a3" \
             --diffusion-suites "multimodal-gen-test-1-npu-a3:1-npu,multimodal-gen-test-4-npu-a3:2-npu" \
             --case-map "$PWD/test_case_map.json" \
@@ -866,14 +867,48 @@ jobs:
           name: coverage-outputs-base-a-test-npu
           path: /tmp/base-a-coverage
 
-      - name: Merge base-a coverage into shared run dir
+      - name: Merge base-a coverage and earlier attempts into shared run dir
+        shell: bash
         run: |
+          set -euo pipefail
+
           # Artifact stages {RUN_DIR}/outputs/... — merges 1:1 into the shared layout.
           CACHE_ROOT="/root/.cache/tests/precise-test"
           mkdir -p "${CACHE_ROOT}"
           cp -a /tmp/base-a-coverage/. "${CACHE_ROOT}/"
           echo "Merged base-a coverage into ${CACHE_ROOT}:"
-          find "${CACHE_ROOT}" -maxdepth 3 -type d | head -20
+          find "${CACHE_ROOT}" -maxdepth 3 -type d | head -20 || true
+
+          # Re-run only re-executes failed jobs; union all attempts of this run
+          # (newest first, current attempt wins) so the report stays complete.
+          RUN_ID="${{ github.run_id }}"
+          CURRENT="${RUN_ID}-attempt-${{ github.run_attempt }}"
+          # Date tag derivation must match run_tests_with_coverage.sh.
+          COV_DATE_TAG="${GITHUB_RUN_STARTED_AT:-$(date +%Y%m%d)}"
+          COV_DATE_TAG="${COV_DATE_TAG:0:10}"
+          COV_DATE_TAG="${COV_DATE_TAG//-/}"
+          DEST="${CACHE_ROOT}/${CURRENT}/outputs/sglang@${COV_DATE_TAG}"
+          mkdir -p "${DEST}"
+
+          # A single attempt can end up with two date dirs: when the runner
+          # falls back to `date` and the attempt crosses midnight UTC, jobs
+          # started on either side write under different tags. Fold them in,
+          # otherwise everything outside DEST's tag is dropped downstream.
+          for td in "${CACHE_ROOT}/${CURRENT}/outputs/sglang@"*/*; do
+            [ -d "${td}" ] || continue
+            [ -e "${DEST}/${td##*/}" ] || cp -a "${td}" "${DEST}/"
+          done
+
+          find "${CACHE_ROOT}" -mindepth 1 -maxdepth 1 -type d \
+            -name "${RUN_ID}-attempt-*" ! -name "${CURRENT}" -print0 \
+            | sort -zrV \
+            | while IFS= read -r -d '' prev; do
+                for td in "${prev}/outputs/sglang@"*/*; do
+                  [ -d "${td}" ] || continue
+                  [ -e "${DEST}/${td##*/}" ] || cp -a "${td}" "${DEST}/"
+                done
+              done
+          echo "Test dirs in ${DEST}: $(find "${DEST}" -maxdepth 1 -mindepth 1 -type d | wc -l)"
 
       - name: Copy sglang source to covstub
         run: |
@@ -885,7 +920,8 @@ jobs:
           # coverage html from failing on a missing recorded source file.
           echo '__version__ = "0.0.0"' > "${COVSTUB}/sglang/_version.py"
 
-      - name: Build test case map
+      - name: Prepare build-map inputs
+        id: prepare-build-map
         shell: bash
         run: |
           set -euo pipefail
@@ -909,33 +945,39 @@ jobs:
           echo "Source dir: ${COVSTUB}"
 
           # Coverage data may be absent when no test targets were enumerated
-          # (run_tests_with_coverage.sh never ran). Skip map building then.
+          # (run_tests_with_coverage.sh never ran). The action would still emit
+          # an empty {} JSON in that case, which would later overwrite the good
+          # baseline on OBS — so we gate early here instead of relying on the
+          # publish step to detect empty content.
+          RUN_BUILD_MAP=true
           if [ ! -d "${COV_ROOT}" ]; then
             echo "::warning::Coverage dir not found: ${COV_ROOT}, skip building test case map"
-            exit 0
+            RUN_BUILD_MAP=false
+          else
+            COVERAGE_FILE_COUNT=$(find "${COV_ROOT}" -name 'coverage.*' -type f | wc -l)
+            echo "Found ${COVERAGE_FILE_COUNT} coverage files"
+            if [ "${COVERAGE_FILE_COUNT}" -eq 0 ]; then
+              echo "::warning::No coverage files found under ${COV_ROOT}, skip building test case map"
+              RUN_BUILD_MAP=false
+            fi
           fi
 
-          COVERAGE_FILE_COUNT=$(find "${COV_ROOT}" -name 'coverage.*' -type f | wc -l)
-          echo "Found ${COVERAGE_FILE_COUNT} coverage files"
-          if [ "${COVERAGE_FILE_COUNT}" -eq 0 ]; then
-            echo "::warning::No coverage files found under ${COV_ROOT}, skip building test case map"
-            exit 0
-          fi
+          echo "run-build-map=${RUN_BUILD_MAP}" >> "$GITHUB_OUTPUT"
+          echo "cov-root=${COV_ROOT}"          >> "$GITHUB_OUTPUT"
+          echo "covstub=${COVSTUB}"            >> "$GITHUB_OUTPUT"
+          echo "map-file=${MAP_FILE}"           >> "$GITHUB_OUTPUT"
 
-          if ! python3 -c "import regex" 2>/dev/null; then
-            python3 -m pip install regex \
-              -i https://repo.huaweicloud.com/repository/pypi/simple \
-              --retries 3 --timeout 60 \
-              || python3 -m pip install regex -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
-          fi
-
-          python3 scripts/ci/npu/precise-test/test_selector.py \
-            --build-map \
-            --coverage-dir "${COV_ROOT}" \
-            --source-dir "${COVSTUB}" \
-            --map-file "${MAP_FILE}"
-          test -s "${MAP_FILE}"
-          du -h "${MAP_FILE}"
+      - name: Build test case map
+        uses: lb-actions/precision-test@v1.0.7
+        if: steps.prepare-build-map.outputs.run-build-map == 'true'
+        with:
+          repo: sglang
+          build-map: true
+          # Absolute paths: the action forwards them unchanged to the CLI,
+          # which otherwise resolves relative paths against its own package dir.
+          coverage-dir: ${{ steps.prepare-build-map.outputs.cov-root }}
+          source-dir:   ${{ steps.prepare-build-map.outputs.covstub }}
+          map-file:     ${{ steps.prepare-build-map.outputs.map-file }}
 
       - name: Generate HTML coverage report
         # Best-effort add-on: continue-on-error keeps the job green and later
@@ -1258,21 +1300,18 @@ jobs:
           ls -lh "${PUBLISH_DIR}" | tail -n +2
 
       - name: Clean up per-run directory
-        # Default success() on purpose: any earlier failure (incl. the OBS
-        # upload) keeps RUN_DIR for manual recovery.
-        # A successful run also sweeps leftovers from earlier failed runs, so
-        # residue does not pile up. Only dirs older than STALE_MINUTES: RUN_DIR
-        # is per-run for a reason, and a bare glob would delete the directory
-        # of a concurrently running job mid-flight.
+        # success() by default: earlier failures keep the run dirs for debugging.
+        # Attempts never overlap and earlier ones are already merged, so drop
+        # all of this run's attempt dirs at once; stale ones from old runs go too.
         shell: bash
         run: |
           set -euo pipefail
           CACHE_ROOT="/root/.cache/tests/precise-test"
-          RUN_DIR="${CACHE_ROOT}/${{ github.run_id }}-attempt-${{ github.run_attempt }}"
+          RUN_PREFIX="${CACHE_ROOT}/${{ github.run_id }}-attempt-"
           # 8h > the 6h per-job execution limit, so a live run can never match.
           STALE_MINUTES=480
-          rm -rf "${RUN_DIR}"
-          echo "Removed ${RUN_DIR}"
+          rm -rf "${RUN_PREFIX}"*
+          echo "Removed ${RUN_PREFIX}*"
           # -maxdepth 1 keeps the shared coverage/ dir out of reach.
           find "${CACHE_ROOT}" -mindepth 1 -maxdepth 1 -type d \
             -name '*-attempt-*' -mmin +"${STALE_MINUTES}" \
@@ -1282,6 +1321,7 @@ jobs:
   pr-test-npu-finish:
     needs:
       [
+        pr-gate,
         check-changes,
 
         base-a-test-npu,

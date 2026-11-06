@@ -16,8 +16,8 @@ from sglang.test.test_utils import (
     run_embeddings_benchmark_multi,
 )
 
-register_cuda_ci(est_time=199, stage="extra-a", runner_config="1-gpu-large")
-register_amd_ci(est_time=240, suite="extra-a-test-1-gpu-large-amd")
+register_cuda_ci(est_time=199, stage="weekly", runner_config="1-gpu-large")
+register_amd_ci(est_time=240, suite="nightly-amd-1-gpu", nightly=True)
 
 
 class TestEmbeddingsAPI(CustomTestCase):
