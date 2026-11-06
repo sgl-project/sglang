@@ -268,7 +268,8 @@ fn tool_dump(tool: &Value) -> Result<Value, String> {
     if let Some(parameters) = function.get_mut("parameters") {
         normalize_json_schema_types(parameters);
     }
-    if let Some(strict) = f.get("strict") {
+    // `Function._serialize` drops an unset `strict`, null included.
+    if let Some(strict) = f.get("strict").filter(|strict| !strict.is_null()) {
         function.insert("strict".into(), pydantic_bool(strict)?.into());
     }
     // `Tool._propagate_defer_loading`; `Function` drops an unset flag.

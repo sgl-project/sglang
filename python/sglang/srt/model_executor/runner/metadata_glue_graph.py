@@ -11,16 +11,19 @@ graph launch.
 
 Correctness contract:
 
-- The caller only routes here when the replay is padding-free
-  (raw_bs == padded bs) and TBO / pdmux / LoRA are off, so every
-  Python-visible branch inside the backends is constant per key.
+- The caller only routes here when TBO / LoRA are off and the replay is
+  padding-free (raw_bs == padded bs) or, outside ragged verify mode, a padded
+  replay of a backend-declared DSV4 glue whose prep reads only the padded
+  slots; so every Python-visible branch inside the backends is constant per
+  key.
 - Python side effects (each backend's ``forward_metadata`` object) are
   snapshotted at capture time and re-installed on every replay; the graph
   replays only the device ops that refresh the tensors those objects point to.
 - ``NUM_WARMUP`` eager runs precede capture so triton JIT compile / autotune
   happen outside capture.
 - Any capture failure (e.g. a backend syncing or reading host values inside
-  its prep) permanently disables the glue graph and falls back to eager.
+  its prep) permanently disables the glue graph and falls back to eager. A
+  strict glue (a backend-declared one, in CI) raises instead.
 - Backends whose prep computes values on the HOST each replay (e.g. the
   DFlash-family host-fed fast verify plans) must never be glued: capture
   records only device ops, so the host-written plan inputs would replay
@@ -44,8 +47,9 @@ logger = logging.getLogger(__name__)
 class MetadataGlueGraph:
     NUM_WARMUP = 2
 
-    def __init__(self, device):
+    def __init__(self, device, strict: bool = False):
         self.device = device
+        self.strict = strict
         self.disabled = False
         # Since the first warm-up: prep steps served by a graph replay, and steps
         # that ran eagerly after it (capture failure, disabled, or never routed here).
@@ -61,7 +65,7 @@ class MetadataGlueGraph:
 
     def note_not_routed(self) -> None:
         """A replay the caller prepared eagerly without calling ``run`` (padding,
-        TBO, pdmux, LoRA, disabled)."""
+        TBO, LoRA, disabled)."""
         if self._states or self.disabled:
             self.eager += 1
 
@@ -91,6 +95,14 @@ class MetadataGlueGraph:
     def run(self, attn_backend, fb_view, key) -> None:
         """Run ``init_forward_metadata_out_graph`` for this replay, through the
         captured glue graph once it is ready."""
+        if any(
+            backend.requires_eager_metadata for backend in self._leaves(attn_backend)
+        ):
+            self.disabled = True
+            self.eager += 1
+            attn_backend.init_forward_metadata_out_graph(fb_view)
+            return
+
         st = self._states.get(key)
         if st is None:
             st = {"warmups": 0, "graph": None, "meta": None}
@@ -118,6 +130,8 @@ class MetadataGlueGraph:
             ):
                 attn_backend.init_forward_metadata_out_graph(fb_view)
         except Exception:
+            if self.strict:
+                raise
             logger.warning(
                 "Metadata glue-graph capture failed for key %s; falling back "
                 "to eager metadata prep permanently.",
