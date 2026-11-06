@@ -404,8 +404,8 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         lambda cfg: cfg.has_swa and not cfg.has_mamba,
         "SWA-only fixture required to exercise extra pool",
     )
-    def test_release_aborted_request_l3_prefetch_io_in_progress(self):
-        """release_aborted_request while a prefetch IO is still in progress; the IO
+    def test_abandon_attempt_l3_prefetch_io_in_progress(self):
+        """_abandon_attempt while a prefetch IO is still in progress; the IO
         thread owns the buffers until it finishes."""
 
         # SWA prefetch is all-or-nothing over one full sliding window: size the
@@ -521,8 +521,8 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         lambda cfg: cfg.has_swa and not cfg.has_mamba,
         "SWA-only fixture required to exercise extra pool",
     )
-    def test_release_aborted_request_l3_prefetch_io_done(self):
-        """release_aborted_request after the prefetch IO completed releases the
+    def test_abandon_attempt_l3_prefetch_io_done(self):
+        """_abandon_attempt after the prefetch IO completed releases the
         buffers."""
 
         # SWA prefetch is all-or-nothing over one full sliding window: size the
