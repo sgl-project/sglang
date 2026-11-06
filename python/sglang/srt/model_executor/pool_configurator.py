@@ -16,6 +16,9 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.arg_groups.model_override_base import resolving_view
+from sglang.srt.arg_groups.model_overrides.deepseek_v4 import (
+    DSV4_DEFAULT_SWA_FULL_TOKENS_RATIO,
+)
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.configs.model_config import (
     AttentionArch,
@@ -27,9 +30,9 @@ from sglang.srt.configs.model_config import (
     get_minimax_sparse_layer_ids,
     get_unlimited_ocr_v2_sparse_config,
     is_deepseek_dsa,
-    is_deepseek_v4,
     is_minimax_sparse,
     is_unlimited_ocr_v2,
+    uses_compressed_kv_attention,
     uses_minimax_m3_nvfp4_native_stack,
 )
 from sglang.srt.environ import envs
@@ -630,7 +633,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     ) -> int:
         index_head_dim = get_dsa_index_head_dim(kvc.model_config.hf_config)
         indexer_size_per_token = ceil_div(
-            index_head_dim + index_head_dim // DSATokenToKVPool.quant_block_size * 4,
+            DSATokenToKVPool.index_bytes_per_token_for(
+                index_head_dim, get_exec().kernel.enable_fp4_indexer
+            ),
             get_dsa_index_kpool(kvc.model_config.hf_config),
         )
         element_size = torch._utils._element_size(
@@ -754,8 +759,9 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             if is_deepseek_dsa(model_config.hf_config):
                 index_head_dim = get_dsa_index_head_dim(model_config.hf_config)
                 index_elements = ceil_div(
-                    index_head_dim
-                    + index_head_dim // DSATokenToKVPool.quant_block_size * 4,
+                    DSATokenToKVPool.index_bytes_per_token_for(
+                        index_head_dim, get_exec().kernel.enable_fp4_indexer
+                    ),
                     get_dsa_index_kpool(model_config.hf_config),
                 )
                 self._full_per_token += index_elements * torch._utils._element_size(
@@ -1106,10 +1112,6 @@ class SWARequestCapPoolConfigurator(HybridSWAPoolConfigurator):
         )
 
 
-# Used when --swa-full-tokens-ratio is at its default and cap mode is unusable.
-DSV4_DEFAULT_SWA_FULL_TOKENS_RATIO = 0.1
-
-
 def _operator_swa_full_tokens_ratio() -> Optional[float]:
     """The operator's --swa-full-tokens-ratio, or None when it was not given."""
     schedule = get_schedule()
@@ -1134,6 +1136,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
     # object.__new__ stubs (SWA floor tests) skip __init__
     _dspark_draft_on_bf16 = False
+    # A subclass that adds the draft's KV to the per-token bytes itself sets this,
+    # replacing the (T+D)/T inflation.
+    _draft_kv_priced_exactly = False
 
     def __init__(self, kvc: KVCacheConfigurator):
         self.kv_cache_dtype_str = kvc.kv_cache_dtype_str
@@ -1346,7 +1351,11 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         )
         self.bytes_per_swa_token = self._get_bytes_per_swa_token()
         self.bytes_per_full_token = self._get_bytes_per_full_token()
-        if self.is_speculative and not self.encoder_replay:
+        if (
+            self.is_speculative
+            and not self.encoder_replay
+            and not self._draft_kv_priced_exactly
+        ):
             # Reserve the draft worker by inflating per-token bytes by
             # (target+draft)/target, as scale_kv_cell_size_per_token_for_dflash does.
             draft_layers = 1
@@ -1468,6 +1477,10 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             page_size = self.page_size // compress_ratio
         return layout.page_bytes(page_size) / page_size
 
+    @property
+    def num_swa_layers(self) -> int:
+        return self.num_layers_total
+
     def _get_bytes_per_swa_token(self) -> float:
         """Bytes one SWA slot costs across the stage. c4_state_pool_size = swa_tokens
         // page_size * ring, so c4 compress state is priced per SWA slot too."""
@@ -1480,7 +1493,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         c4_indexer_state_bytes = 2 * 2 * self.indexer_head_dim * c4_state_dtype_size
 
         c4_state_ratio = self.ring_sizes.get(4, 0) / self.page_size
-        return self._get_paged_kv_bytes_per_token() * self.num_layers_total + (
+        return self._get_paged_kv_bytes_per_token() * self.num_swa_layers + (
             c4_state_ratio
             * (c4_state_bytes + c4_indexer_state_bytes)
             * self.num_layers(4)
@@ -1814,7 +1827,13 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 def create_memory_pool_configurator(
     kvc: KVCacheConfigurator,
 ) -> MemoryPoolConfigurator:
-    if is_deepseek_v4(kvc.model_config.hf_config) and kvc.is_hybrid_swa:
+    if uses_compressed_kv_attention(kvc.model_config.hf_config) and kvc.is_hybrid_swa:
+        if kvc.model_config.mla_layer_ids:
+            from sglang.srt.mem_cache.ernie55_memory_pool import (
+                Ernie5_5PoolConfigurator,
+            )
+
+            return Ernie5_5PoolConfigurator(kvc)
         return DSV4PoolConfigurator(kvc)
     if kvc.is_hybrid_swa:
         if SWARequestCapPoolConfigurator.is_applicable(kvc):

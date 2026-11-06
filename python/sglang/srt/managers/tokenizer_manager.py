@@ -26,6 +26,7 @@ import socket
 import sys
 import threading
 import time
+import traceback
 from array import array
 from collections import deque
 from contextlib import nullcontext
@@ -213,6 +214,7 @@ from sglang.srt.utils import (
     kill_process_tree,
 )
 from sglang.srt.utils.aio_rwlock import RWLock
+from sglang.srt.utils.common import TypeBasedDispatcher
 from sglang.srt.utils.cudacore_pyspy_dump_utils import (
     collect_scheduler_processes,
     pyspy_dump_schedulers,
@@ -224,7 +226,6 @@ from sglang.srt.utils.weight_versions import (
     add_weight_versions_to_meta_info,
     weight_version_spans_to_json,
 )
-from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
@@ -4166,8 +4167,7 @@ async def print_exception_wrapper(func):
     try:
         await func()
     except Exception:
-        traceback = get_exception_traceback()
-        logger.error(f"TokenizerManager hit an exception: {traceback}")
+        logger.error(f"TokenizerManager hit an exception: {traceback.format_exc()}")
         if hasattr(func, "__self__") and isinstance(func.__self__, TokenizerManager):
             func.__self__.dump_requests_before_crash()
         kill_process_tree(os.getpid(), include_parent=True)

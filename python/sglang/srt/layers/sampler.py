@@ -6,6 +6,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
+from sglang._lazy_import import LazyImport
 from sglang.kernels.ops.sampling import argmax as sampler_argmax
 from sglang.kernels.ops.sampling import softmax as sampler_softmax
 from sglang.kernels.ops.sampling.murmur_hash import murmur_hash32
@@ -35,7 +36,6 @@ from sglang.srt.utils.device import (
     is_npu,
     is_xpu,
 )
-from sglang.utils import LazyImport
 
 if is_cuda():
     from sglang.srt.layers.sampling_renorm import (

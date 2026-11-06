@@ -27,6 +27,7 @@ import ssl
 import tempfile
 import threading
 import time
+import traceback
 import uuid
 from contextlib import asynccontextmanager
 from functools import partial
@@ -155,6 +156,7 @@ from sglang.srt.managers.io_struct import (
     ParseFunctionCallReq,
     PauseGenerationReqInput,
     PdRoleSwitchReqInput,
+    PluginWeightUpdateReqInput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
@@ -213,7 +215,6 @@ from sglang.srt.utils.json_response import (
 )
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.watchdog import SubprocessWatchdog
-from sglang.utils import get_exception_traceback
 from sglang.version import __version__
 
 logger = logging.getLogger(__name__)
@@ -419,7 +420,7 @@ async def lifespan(fast_api_app: FastAPI):
             f"OpenAIServingResponses init failed ({type(e).__name__}: {e})"
         )
         logger.debug(
-            f"OpenAIServingResponses init traceback:\n{get_exception_traceback()}"
+            f"OpenAIServingResponses init traceback:\n{traceback.format_exc()}"
         )
 
     # Execute custom warmups
@@ -1483,6 +1484,24 @@ async def end_weight_update(
     )
 
 
+@app.post("/plugin_weight_update")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def plugin_weight_update(
+    obj: Annotated[PluginWeightUpdateReqInput, Body()], request: Request
+):
+    """Receive weights through a platform transport and load them, as /update_weights_from_distributed does."""
+    reply = await _global_state.tokenizer_manager.plugin_weight_update(obj, request)
+    content = {
+        "success": reply.success,
+        "message": reply.message,
+        "received_tensor_counts": reply.received_tensor_counts,
+    }
+    if reply.success:
+        return ORJSONResponse(content, status_code=200)
+    else:
+        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+
+
 @app.post("/update_weights_from_distributed")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def update_weights_from_distributed(
@@ -2378,7 +2397,7 @@ def _execute_server_warmup(server_args: ServerArgs):
             success = True
             break
         except (AssertionError, requests.exceptions.RequestException):
-            last_traceback = get_exception_traceback()
+            last_traceback = traceback.format_exc()
             pass
 
     if not success:
@@ -2530,7 +2549,7 @@ def _execute_server_warmup(server_args: ServerArgs):
             )
 
     except Exception:
-        last_traceback = get_exception_traceback()
+        last_traceback = traceback.format_exc()
         logger.error(f"Initialization failed. warmup error: {last_traceback}")
         kill_process_tree(os.getpid())
         return False
