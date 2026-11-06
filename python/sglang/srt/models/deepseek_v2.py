@@ -54,7 +54,6 @@ from sglang.srt.batch_overlap.two_batch_overlap import (
 )
 from sglang.srt.configs.model_config import (
     compute_mla_mscale_scaling,
-    dsa_draft_shards_under_dcp,
     dsa_layer_skips_topk,
     get_dsa_index_head_dim,
     get_dsa_index_kpool,
@@ -62,6 +61,7 @@ from sglang.srt.configs.model_config import (
     get_dsa_index_topk,
     is_deepseek_dsa,
     is_glm_moe_dsa,
+    mla_attention_dcp_size,
 )
 from sglang.srt.distributed import divide
 from sglang.srt.environ import envs
@@ -160,6 +160,8 @@ from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -214,6 +216,7 @@ from sglang.srt.models.deepseek_common.utils import (
     quant_blocks_shared_experts_fusion,
     tiny_router_gemm_max_tokens,
 )
+from sglang.srt.models.utils import is_non_idle_and_non_empty
 from sglang.srt.multimodal.dsv41.vl_routing import vision_topk
 from sglang.srt.runtime_context import (
     LoRABatchLayout,
@@ -231,10 +234,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     BumpAllocator,
     LazyValue,
-    add_prefix,
-    is_non_idle_and_non_empty,
     is_sm90_supported,
-    make_pp_layers,
     use_intel_amx_backend,
 )
 from sglang.srt.utils.custom_op import register_custom_op
@@ -588,7 +588,6 @@ class MoEGate(nn.Module):
                 hidden_states,
                 self.weight,
                 out_dtype=torch.float32,
-                max_m=self.tiny_router_gemm_max_tokens,
             )
         elif _use_aiter:
             logits = aiter_dsv3_router_gemm(hidden_states, self.weight)
@@ -2113,13 +2112,9 @@ class DeepseekV2AttentionMLA(
             and not reduce_results
             and can_defer_cp_decode_attn_tp()
         )
-        self.dcp_size = get_parallel().attn_dcp_size
-        if (
-            is_nextn
-            and self.use_dsa
-            and not dsa_draft_shards_under_dcp(config, self.dcp_size)
-        ):
-            self.dcp_size = 1
+        self.dcp_size = mla_attention_dcp_size(
+            config, dcp_size=get_parallel().attn_dcp_size, is_nextn=is_nextn
+        )
         self.num_heads = num_heads
         assert num_heads % attn_tp_size == 0
         self.num_local_heads = num_heads // attn_tp_size
