@@ -18,6 +18,60 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class RustMmVideoSampling(msgspec.Struct, frozen=True, kw_only=True):
+    """``qwen_vl.py``'s frame sampling and pre-resize inputs, read at launch
+    because ``VIDEO_TOTAL_PIXELS`` comes from the environment. Mirrors
+    ``sglang_processor::VideoSampling``."""
+
+    config: Dict[str, float]
+    fps: float
+    min_frames: float
+    max_frames: float
+    frame_factor: float
+    factor: float
+    min_pixels: float
+    max_pixels: float
+    total_pixels: float
+
+
+class RustMmVideoSpec(msgspec.Struct, frozen=True, kw_only=True):
+    """Qwen3-VL video: the token ids ``Qwen3VLProcessor`` inserts, its
+    ``Qwen3VLVideoProcessor``, and SGLang's sampling ahead of it."""
+
+    video_token_id: int
+    vision_start_token_id: int
+    vision_end_token_id: int
+    patch_size: int
+    merge_size: int
+    temporal_patch_size: int
+    # The video processor's size["shortest_edge"] and size["longest_edge"].
+    min_pixels: int
+    max_pixels: int
+    image_mean: Tuple[float, ...]
+    image_std: Tuple[float, ...]
+    sampling: RustMmVideoSampling
+
+    def rust_json(self) -> Dict[str, Any]:
+        """``dynamo_multimodal``'s ``QwenVlVideoSpec``."""
+        return {
+            "video_token_id": self.video_token_id,
+            "vision_start_token_id": self.vision_start_token_id,
+            "vision_end_token_id": self.vision_end_token_id,
+            "processor": {
+                "video_processor_type": "Qwen3VLVideoProcessor",
+                "patch_size": self.patch_size,
+                "merge_size": self.merge_size,
+                "temporal_patch_size": self.temporal_patch_size,
+                "size": {
+                    "shortest_edge": self.min_pixels,
+                    "longest_edge": self.max_pixels,
+                },
+            },
+            "image_mean": self.image_mean,
+            "image_std": self.image_std,
+        }
+
+
 class RustMmSpec(msgspec.Struct, frozen=True, kw_only=True):
     """Resolved parameters of the Rust MM pipeline for one model,
     consumed by the Rust worker pool (as the typed extension ``MmSpec``, see
@@ -40,6 +94,8 @@ class RustMmSpec(msgspec.Struct, frozen=True, kw_only=True):
     vision_start_token_id: Optional[int]
     vision_end_token_id: Optional[int]
     video_token_id: Optional[int]
+    # None: the model or its config takes no video on the Rust path.
+    video: Optional[RustMmVideoSpec] = None
 
     # Used by the drain adapter only; every other field goes to Rust.
     DRAIN_ONLY = ("vision_start_token_id", "vision_end_token_id", "video_token_id")
@@ -52,8 +108,14 @@ class RustMmSpec(msgspec.Struct, frozen=True, kw_only=True):
         """The subset `sglang_mm::registry::pipeline_from_spec` parses — the
         JSON form the ``_multimodal`` parity API takes; the server itself is
         handed the typed ``MmSpec`` instead."""
-        fields = (f for f in self.__struct_fields__ if f not in self.DRAIN_ONLY)
-        return msgspec.json.encode({f: getattr(self, f) for f in fields}).decode()
+        fields = (
+            f for f in self.__struct_fields__ if f not in self.DRAIN_ONLY + ("video",)
+        )
+        spec = {f: getattr(self, f) for f in fields}
+        if self.video is not None:
+            spec["video"] = self.video.rust_json()
+            spec["video_sampling"] = self.video.sampling
+        return msgspec.json.encode(spec).decode()
 
 
 class RustMmFamily(msgspec.Struct, frozen=True, kw_only=True):
@@ -100,6 +162,76 @@ RUST_MM_FAMILIES: Tuple[RustMmFamily, ...] = (
         },
     ),
 )
+
+
+# Qwen3-VL video only: Qwen2-VL and Qwen2.5-VL size video and place it in
+# M-RoPE differently.
+RUST_MM_VIDEO_MODEL_TYPES = frozenset(("qwen3_vl", "qwen3_vl_moe"))
+
+# The `--mm-process-config` video keys `preprocess_video` consumes; any other key
+# would reach the HF video processor, which Rust does not mirror.
+RUST_MM_VIDEO_CONFIG_KEYS = frozenset(
+    (
+        "fps",
+        "nframes",
+        "min_frames",
+        "max_frames",
+        "min_pixels",
+        "max_pixels",
+        "total_pixels",
+    )
+)
+
+
+def _video_processor_mismatch(video_processor: Any) -> Optional[str]:
+    """Why the Rust video stages cannot reproduce this HF video processor, or
+    ``None`` when they can."""
+    from transformers.image_utils import PILImageResampling
+
+    name = type(video_processor).__name__
+    if name != "Qwen3VLVideoProcessor":
+        return f"video processor {name}"
+    vp = video_processor
+    if not (vp.do_resize and vp.do_rescale and vp.do_normalize):
+        return "a video processor stage is off"
+    if vp.resample != PILImageResampling.BICUBIC:
+        return f"video resample {vp.resample}"
+    if vp.rescale_factor != 1 / 255:
+        return "video rescale_factor is not 1/255"
+    if vp.cap_pixels_per_frame:
+        return "video cap_pixels_per_frame is on"
+    return None
+
+
+def _video_spec(
+    hf_config: Any, video_processor: Any, config: Dict[str, float]
+) -> RustMmVideoSpec:
+    from sglang.srt.multimodal.processors import qwen_vl
+
+    sampling = RustMmVideoSampling(
+        config={key: float(value) for key, value in config.items()},
+        fps=float(qwen_vl.FPS),
+        min_frames=float(qwen_vl.FPS_MIN_FRAMES),
+        max_frames=float(qwen_vl.FPS_MAX_FRAMES),
+        frame_factor=float(qwen_vl.FRAME_FACTOR),
+        factor=float(qwen_vl.IMAGE_FACTOR),
+        min_pixels=float(qwen_vl.VIDEO_MIN_PIXELS),
+        max_pixels=float(qwen_vl.VIDEO_MAX_PIXELS),
+        total_pixels=float(qwen_vl.VIDEO_TOTAL_PIXELS),
+    )
+    return RustMmVideoSpec(
+        video_token_id=hf_config.video_token_id,
+        vision_start_token_id=hf_config.vision_start_token_id,
+        vision_end_token_id=hf_config.vision_end_token_id,
+        patch_size=video_processor.patch_size,
+        merge_size=video_processor.merge_size,
+        temporal_patch_size=video_processor.temporal_patch_size,
+        min_pixels=int(video_processor.size["shortest_edge"]),
+        max_pixels=int(video_processor.size["longest_edge"]),
+        image_mean=tuple(float(x) for x in video_processor.image_mean),
+        image_std=tuple(float(x) for x in video_processor.image_std),
+        sampling=sampling,
+    )
 
 
 def rust_mm_family_for(
@@ -298,11 +430,36 @@ class RustMmProcessor:
                 vision_start_token_id=getattr(hf_config, "vision_start_token_id", None),
                 vision_end_token_id=getattr(hf_config, "vision_end_token_id", None),
                 video_token_id=getattr(hf_config, "video_token_id", None),
+                video=self._resolve_video_spec(hf_config),
             )
         except (AttributeError, TypeError):  # missing/odd processor attrs
             return None
         logger.info("rust server: Rust MM pipeline enabled (family=%s)", family.name)
         return spec
+
+    def _resolve_video_spec(self, hf_config) -> Optional[RustMmVideoSpec]:
+        """The video half of the spec, or ``None`` when Rust cannot mirror
+        this model's or this server's video processing; images still run."""
+        if hf_config.model_type not in RUST_MM_VIDEO_MODEL_TYPES:
+            return None
+        config = dict((get_mm().mm_process_config or {}).get("video", {}))
+        try:
+            video_processor = self._processor.video_processor
+            reason = _video_processor_mismatch(video_processor)
+            if reason is None and not set(config) <= RUST_MM_VIDEO_CONFIG_KEYS:
+                reason = f"--mm-process-config video keys {sorted(config)}"
+            if reason is None and {"fps", "nframes"} <= set(config):
+                reason = "--mm-process-config video sets both fps and nframes"
+            if reason is None and any(
+                type(v) not in (int, float) for v in config.values()
+            ):
+                reason = f"--mm-process-config video values {config}"
+            if reason is None:
+                return _video_spec(hf_config, video_processor, config)
+        except (AttributeError, KeyError, TypeError) as error:
+            reason = f"unreadable video processor: {error!r}"
+        logger.warning("rust server: video input disabled: %s", reason)
+        return None
 
     def _use_feature_shm(self) -> bool:
         """Whether to park feature buffers in POSIX shm rather than inline.
@@ -419,14 +576,13 @@ class RustMmProcessor:
             )
             stubs.append(stub)
             feature = stub
-        t, h, w = item["model_specific_data"]["image_grid_thw"]
+        grid = "video_grid_thw" if item["modality"] == "video" else "image_grid_thw"
+        t, h, w = item["model_specific_data"][grid]
         return MultimodalDataItem(
             modality=_MODALITIES[item["modality"]],
             feature=feature,
             hash=item["hash"],
             identity=bytes(item["identity"]),
             offsets=[tuple(span) for span in item["offsets"]],
-            model_specific_data={
-                "image_grid_thw": torch.tensor([[t, h, w]], dtype=torch.long)
-            },
+            model_specific_data={grid: torch.tensor([[t, h, w]], dtype=torch.long)},
         )

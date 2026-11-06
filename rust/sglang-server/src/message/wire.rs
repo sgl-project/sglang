@@ -82,13 +82,52 @@ pub fn string_list_or_list(v: api::StringListOrList) -> Option<OneOrMany<Vec<Str
 pub fn media_item(item: api::MediaItem) -> Result<MmItem, Error> {
     use api::media_item::Value;
     match item.value {
-        // Only `url` and the hints a Rust processor reads reach the MM
-        // pipeline; the rest serve model families it does not run (Python's
-        // `load_image` reduces an item to `.url` the same way).
-        Some(Value::Ref(r)) if !r.url.is_empty() => Ok(MmItem::Ref {
-            url: r.url,
-            hints: MediaHints { fps: r.fps },
-        }),
+        // The hints a Rust processor reads reach the MM pipeline; the rest
+        // only by name, so a processor can refuse what it would ignore.
+        Some(Value::Ref(r)) if !r.url.is_empty() => {
+            // Exhaustive, so a new `MediaRef` field must be read or listed here.
+            let api::MediaRef {
+                url,
+                detail,
+                max_dynamic_patch,
+                content_hash,
+                min_pixels,
+                max_pixels,
+                total_max_pixels,
+                fps,
+                num_frames,
+                min_frames,
+                max_frames,
+                max_tokens_per_frame,
+                max_image_tokens,
+                use_audio,
+                image_grid_thw,
+            } = r;
+            let unread = [
+                ("detail", detail.is_some()),
+                ("max_dynamic_patch", max_dynamic_patch.is_some()),
+                ("content_hash", content_hash.is_some()),
+                ("min_pixels", min_pixels.is_some()),
+                ("max_pixels", max_pixels.is_some()),
+                ("total_max_pixels", total_max_pixels.is_some()),
+                ("max_tokens_per_frame", max_tokens_per_frame.is_some()),
+                ("max_image_tokens", max_image_tokens.is_some()),
+                ("use_audio", use_audio.is_some()),
+                ("image_grid_thw", image_grid_thw.is_some()),
+            ];
+            Ok(MmItem::Ref {
+                url,
+                hints: MediaHints {
+                    fps,
+                    num_frames,
+                    min_frames,
+                    max_frames,
+                    unread: (unread.into_iter())
+                        .filter_map(|(name, set)| set.then_some(name))
+                        .collect(),
+                },
+            })
+        }
         Some(Value::Ref(_)) => Err(Error::Validation(
             "a multimodal item object needs a non-empty `url`".into(),
         )),
@@ -445,7 +484,26 @@ mod tests {
             conv(r#"{"url": "u", "detail": "high", "fps": 2.0}"#),
             MmDataInput::One(MmItem::Ref {
                 url: "u".into(),
-                hints: MediaHints { fps: Some(2.0) },
+                hints: MediaHints {
+                    fps: Some(2.0),
+                    unread: vec!["detail"],
+                    ..Default::default()
+                },
+            })
+        );
+        assert_eq!(
+            conv(
+                r#"{"url": "u", "num_frames": 8, "min_frames": 4, "max_frames": 16, "max_pixels": 9}"#
+            ),
+            MmDataInput::One(MmItem::Ref {
+                url: "u".into(),
+                hints: MediaHints {
+                    num_frames: Some(8),
+                    min_frames: Some(4),
+                    max_frames: Some(16),
+                    unread: vec!["max_pixels"],
+                    ..Default::default()
+                },
             })
         );
         assert_eq!(

@@ -16,13 +16,19 @@ pub enum MmItem {
     Ref { url: String, hints: MediaHints },
 }
 
-/// The `MediaRef` hints a processor may read, grown as processors need them;
-/// the rest serve Python-side model families the Rust pipeline does not run.
-/// A bare source carries none, and the built-in families ignore them.
+/// The `MediaRef` hints a processor may read, grown as processors need them,
+/// and the names of the others a request set. A bare source carries none.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct MediaHints {
     /// Video: the requested frame sampling rate.
     pub fps: Option<f64>,
+    /// Video: an exact frame count, or bounds on the fps-sampled count.
+    pub num_frames: Option<i64>,
+    pub min_frames: Option<i64>,
+    pub max_frames: Option<i64>,
+    /// `MediaRef` fields the request set that no field above carries. The
+    /// video pipeline refuses them rather than sample differently than asked.
+    pub unread: Vec<&'static str>,
 }
 
 impl MmItem {
@@ -154,16 +160,19 @@ mod tests {
     }
 
     /// Object items are typed `MediaRef`s: the `url` and the hints a processor
-    /// reads ride along (`detail` does not), a hint the schema does not name is
-    /// an error, and a preprocessed-input dict is not a wire shape at all (its
-    /// values are tensors; Engine-only).
+    /// reads ride along (`detail` only by name, as unread), a hint the schema
+    /// does not name is an error, and a preprocessed-input dict is not a wire
+    /// shape at all (its values are tensors; Engine-only).
     #[test]
     fn parses_item_objects() {
         assert_eq!(
             parse(r#"{"url": "u", "detail": "high"}"#).unwrap(),
             MmDataInput::One(MmItem::Ref {
                 url: "u".into(),
-                hints: MediaHints::default(),
+                hints: MediaHints {
+                    unread: vec!["detail"],
+                    ..Default::default()
+                },
             })
         );
         let err = parse(r#"{"url": "u", "detai": "high"}"#)

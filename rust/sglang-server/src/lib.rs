@@ -27,7 +27,7 @@ pub use api_server::http::pre_generate::abortable_before_generate;
 pub use api_server::http::pre_generate::test_support;
 pub use message::config::{
     DefaultSamplingParams, DisaggregationMode, MetricsConfig, MmFamily, MmResample, MmSpec,
-    ModelConfig, RustServerServerArgs, ServerArgs,
+    MmVideoSpec, ModelConfig, RustServerServerArgs, ServerArgs,
 };
 pub use message::multimodal::{MediaHints, MmItem};
 pub use message::request::{GenerateRequest, MmData};
@@ -431,6 +431,7 @@ pub fn register_boundary_types(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<MmFamily>()?;
     m.add_class::<MmResample>()?;
     m.add_class::<MmSpec>()?;
+    m.add_class::<MmVideoSpec>()?;
     m.add_class::<IngressRequest>()?;
     m.add_class::<ShmBuffer>()?;
     Ok(())

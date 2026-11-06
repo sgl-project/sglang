@@ -52,6 +52,7 @@ from sglang.srt.rust_server.multimodal import (
     RUST_MM_FAMILIES,
     RustMmProcessor,
     RustMmSpec,
+    RustMmVideoSpec,
     settle_shm_buffers,
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -952,4 +953,33 @@ class RustServer:
             image_mean=spec.image_mean,
             image_std=spec.image_std,
             resample=resample,
+            video=cls._build_mm_video_spec(ext, spec.video),
+        )
+
+    @staticmethod
+    def _build_mm_video_spec(ext, video: Optional[RustMmVideoSpec]):
+        """The extension's ``MmVideoSpec`` for ``RustMmVideoSpec``, or ``None``."""
+        if video is None:
+            return None
+        sampling = video.sampling
+        return ext.MmVideoSpec(
+            video_token_id=video.video_token_id,
+            vision_start_token_id=video.vision_start_token_id,
+            vision_end_token_id=video.vision_end_token_id,
+            patch_size=video.patch_size,
+            merge_size=video.merge_size,
+            temporal_patch_size=video.temporal_patch_size,
+            min_pixels=video.min_pixels,
+            max_pixels=video.max_pixels,
+            image_mean=video.image_mean,
+            image_std=video.image_std,
+            config=sampling.config,
+            fps=sampling.fps,
+            min_frames=sampling.min_frames,
+            max_frames=sampling.max_frames,
+            frame_factor=sampling.frame_factor,
+            factor=sampling.factor,
+            sampling_min_pixels=sampling.min_pixels,
+            sampling_max_pixels=sampling.max_pixels,
+            sampling_total_pixels=sampling.total_pixels,
         )

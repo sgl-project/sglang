@@ -11,6 +11,7 @@ use sglang_processor::dynamo_multimodal::processor::{self as dynamo, PositionOut
 use super::encoded::{MRope, MmEncodedEntry, MmEncodedItem, MmMeta, MmMetaValue, MmModality};
 use crate::message::buffers::{Buffer, BufferData, BufferStore};
 use crate::message::config::MmSpec;
+use crate::message::multimodal::MmItem;
 use crate::message::request::{MmData, Request, RequestKind};
 use crate::message::types::TokenIds;
 use crate::tokenizer_manager::to_scheduler::{Limits, fit_input};
@@ -128,19 +129,47 @@ pub trait MmProcessor: Send + Sync {
     fn processed(&self, _request: MmRequestInfo<'_>, _output: &MmProcessOutput) {}
 }
 
-/// The built-in path: SGLang's image pipeline (`sglang_processor::mm`) over the
+/// The built-in path: SGLang's pipeline (`sglang_processor::mm`) over the
 /// request's resolved media bytes.
-struct ImageMmProcessor {
+struct BuiltinMmProcessor {
     pipeline: sglang_processor::MmProcessor,
+    /// Encodes a video's timestamp text; `None` (no video spec, or no tokenizer as under
+    /// `skip_tokenizer_init`) refuses video.
+    text: Option<TimestampText>,
 }
 
-impl MmProcessor for ImageMmProcessor {
-    fn process(&self, input_ids: TokenIds, mm: MmData) -> Result<MmProcessOutput, MediaError> {
-        if !mm.video_data.is_empty() || !mm.audio_data.is_empty() {
-            return Err(MediaError::Client(
-                "unsupported modality: video/audio input".into(),
-            ));
+/// The server's tokenizer as `Qwen3VLProcessor` uses it for timestamps:
+/// `tokenizer.encode(text, add_special_tokens=False)`.
+struct TimestampText(Arc<sglang_processor::DynamoTokenizer>);
+
+impl dynamo::TextEncoder for TimestampText {
+    fn encode(&self, text: &str) -> sglang_processor::dynamo_multimodal::Result<Vec<i32>> {
+        use sglang_processor::TextTokenizer;
+        (self.0.encode(text, false))
+            .map_err(|e| sglang_processor::dynamo_multimodal::MmError::internal(e.to_string()))
+    }
+}
+
+impl MmProcessor for BuiltinMmProcessor {
+    fn check_media(&self, mm: &MmData) -> Result<(), String> {
+        if !mm.audio_data.is_empty() {
+            return Err("unsupported modality: audio input".into());
         }
+        for item in &mm.video_data {
+            if let MmItem::Ref { hints, .. } = item
+                && let Some(field) = hints.unread.first()
+            {
+                return Err(format!("video input does not take the `{field}` hint"));
+            }
+        }
+        if !mm.video_data.is_empty() && self.text.is_none() {
+            return Err("unsupported modality: this server takes no video input".into());
+        }
+        Ok(())
+    }
+
+    fn process(&self, input_ids: TokenIds, mm: MmData) -> Result<MmProcessOutput, MediaError> {
+        self.check_media(&mm).map_err(MediaError::Client)?;
         let media = super::payload::resolve_media_work(input_ids, mm)?;
         let input_ids = (media.input_ids.iter())
             .map(|&id| {
@@ -149,10 +178,24 @@ impl MmProcessor for ImageMmProcessor {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let images: Vec<&[u8]> = media.images.iter().map(|image| image.as_ref()).collect();
-        // The pipeline fails on the request's images and prompt layout.
-        let output = (self.pipeline)
-            .process(&input_ids, &images)
-            .map_err(|error| MediaError::Client(error.to_string()))?;
+        let videos: Vec<sglang_processor::MmVideo> = (media.videos.iter())
+            .zip(&media.video_hints)
+            .map(|(bytes, hints)| sglang_processor::MmVideo {
+                bytes,
+                hints: sglang_processor::VideoHints {
+                    fps: hints.fps,
+                    num_frames: hints.num_frames,
+                    min_frames: hints.min_frames,
+                    max_frames: hints.max_frames,
+                },
+            })
+            .collect();
+        // The pipeline fails on the request's media and prompt layout.
+        let output = match &self.text {
+            Some(text) => (self.pipeline).process_media(&input_ids, &images, &videos, text),
+            None => (self.pipeline).process(&input_ids, &images),
+        }
+        .map_err(|error| MediaError::Client(error.to_string()))?;
         encode_output(output).map_err(MediaError::Server)
     }
 }
@@ -243,11 +286,18 @@ pub struct MmContext {
 }
 
 impl MmContext {
-    pub fn new(spec: MmSpec) -> Result<Self, String> {
-        let pipeline = sglang_processor::MmProcessor::from_spec(spec.pipeline, None)
+    pub fn new(
+        spec: MmSpec,
+        tokenizer: Option<Arc<sglang_processor::DynamoTokenizer>>,
+    ) -> Result<Self, String> {
+        let takes_video = spec.video.is_some();
+        let pipeline = sglang_processor::MmProcessor::from_spec(spec.pipeline, spec.video)
             .map_err(|e| e.to_string())?;
         Ok(Self {
-            processor: Arc::new(ImageMmProcessor { pipeline }),
+            processor: Arc::new(BuiltinMmProcessor {
+                pipeline,
+                text: tokenizer.filter(|_| takes_video).map(TimestampText),
+            }),
             feature_shm: spec.feature_shm,
             limits: None,
         })
@@ -399,6 +449,8 @@ pub struct MmWiring {
     pub tm_tx: flume::Sender<TmEvent>,
     /// Intake's limits, for the pool's [`MmContext::with_limits`].
     pub limits: Limits,
+    /// The server's tokenizer, for the built-in pipeline's video timestamps.
+    pub tokenizer: Option<Arc<sglang_processor::DynamoTokenizer>>,
 }
 
 /// One MM worker, spawned via `Runtime::start_mm_workers` (which owns the
@@ -615,6 +667,54 @@ mod tests {
         let item = &encode_output(output).unwrap().result.items[0];
         assert_eq!(item.modality, MmModality::Video);
         assert_eq!(item.offsets, [(2, 2), (5, 5)]);
+    }
+
+    /// Video is refused before any fetch when the pipeline cannot honor it: a
+    /// `MediaRef` hint it does not read, or no video on this spec or server.
+    #[test]
+    fn builtin_check_media_refuses_unhonored_video() {
+        use sglang_processor::dynamo_multimodal::models::qwen_vl::{QwenVlSpec, Resampler};
+        use sglang_processor::dynamo_multimodal::registry::ProcessorSpec;
+        let spec = MmSpec {
+            feature_shm: false,
+            pipeline: ProcessorSpec::QwenVl(QwenVlSpec {
+                image_token_id: 1,
+                patch_size: 2,
+                merge_size: 2,
+                temporal_patch_size: 2,
+                min_pixels: 4,
+                max_pixels: 1 << 20,
+                image_mean: [0.5; 3],
+                image_std: [0.5; 3],
+                resample: Resampler::AtenU8,
+                video: None,
+            }),
+            video: None,
+        };
+        let ctx = MmContext::new(spec, None).unwrap();
+        let video = |hints| MmData {
+            video_data: vec![MmItem::Ref {
+                url: "v".into(),
+                hints,
+            }],
+            ..Default::default()
+        };
+        let unread = crate::message::multimodal::MediaHints {
+            unread: vec!["max_pixels"],
+            ..Default::default()
+        };
+        let error = ctx.processor.check_media(&video(unread)).unwrap_err();
+        assert!(error.contains("`max_pixels`"), "{error}");
+        let error = ctx
+            .processor
+            .check_media(&video(Default::default()))
+            .unwrap_err();
+        assert!(error.contains("takes no video"), "{error}");
+        let images = MmData {
+            image_data: vec![MmItem::Source("i".into())],
+            ..Default::default()
+        };
+        assert!(ctx.processor.check_media(&images).is_ok());
     }
 
     /// The built-in Qwen shape: two items with grids, spans and M-RoPE.
