@@ -394,7 +394,9 @@ def backup_kv_cache(
     the caller aborts it."""
     if backend == "none":
         return False
-    if dsv4_needs_rebootstrap(token_to_kv_pool_allocator):
+    from sglang.srt.mem_cache.draft_window import uses_draft_window_kv
+
+    if dsv4_needs_rebootstrap(token_to_kv_pool_allocator) or uses_draft_window_kv():
         if not req.resumable_by_rebootstrap:
             return False
         # Drain the in-flight forward before its slots can receive recomputed KV.

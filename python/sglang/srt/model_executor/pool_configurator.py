@@ -112,6 +112,7 @@ class MemoryPoolConfig:
     c4_state_pool_size: int = 0
     c128_state_pool_size: int = 0
 
+    draft_window_tokens: Optional[int] = None
     mem_fraction_static: Optional[float] = None
 
     # Unified pool only: the profiled byte budget the buffer is sized from,
@@ -286,6 +287,26 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             kvc,
             include_mtp=not kvc.is_draft_worker and kvc.spec_algorithm.is_eagle(),
         )
+        self._draft_window_tokens = None
+        if (
+            get_spec().speculative_draft_window_kv
+            and not kvc.is_draft_worker
+            and get_disagg().disaggregation_mode == "decode"
+        ):
+            from sglang.srt.mem_cache.draft_window import resolve_draft_window_layout
+
+            if kvc.is_hybrid_swa:
+                raise ValueError(
+                    "Draft window KV currently requires a target without SWA pools"
+                )
+            layout = resolve_draft_window_layout(kvc)
+            draft_cell = _dflash_draft_cell_size(kvc)
+            if not draft_cell:
+                raise ValueError(
+                    "Cannot price draft window KV without its exact geometry and dtype"
+                )
+            self._fixed_overhead_bytes += layout.storage_tokens * draft_cell
+            self._draft_window_tokens = layout.usable_tokens
 
         # EAGLE/STANDALONE: assumes the draft shares the target's per-layer KV size,
         # which holds for EAGLE/MTP drafts that reuse the target's attention config.
@@ -355,7 +376,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
         # DFLASH/DSPARK: the draft's per-token KV cost can differ from the target's
         # (e.g. MLA target, per-head K/V draft), so size from the draft config.
-        if kvc.spec_algorithm.is_dflash_family() and not kvc.is_draft_worker:
+        if (
+            kvc.spec_algorithm.is_dflash_family()
+            and not kvc.is_draft_worker
+            and self._draft_window_tokens is None
+        ):
             from sglang.srt.speculative.dflash_utils import (
                 scale_kv_cell_size_per_token_for_dflash,
             )
@@ -715,13 +740,19 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             else self._zero_kv_max_tokens
         )
         max_total_num_tokens = max_total_num_tokens // page_size * page_size
-        return MemoryPoolConfig(max_total_num_tokens=max_total_num_tokens)
+        return MemoryPoolConfig(
+            max_total_num_tokens=max_total_num_tokens,
+            draft_window_tokens=self._draft_window_tokens,
+        )
 
     def calculate_pool_sizes_from_max_tokens(
         self, max_total_num_tokens: int, page_size: int
     ) -> MemoryPoolConfig:
         max_total_num_tokens = max_total_num_tokens // page_size * page_size
-        return MemoryPoolConfig(max_total_num_tokens=max_total_num_tokens)
+        return MemoryPoolConfig(
+            max_total_num_tokens=max_total_num_tokens,
+            draft_window_tokens=self._draft_window_tokens,
+        )
 
 
 class HybridSWAPoolConfigurator(MemoryPoolConfigurator):

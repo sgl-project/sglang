@@ -596,7 +596,9 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
             pop_bootstrapped=Mock(return_value=[])
         )
         scheduler.disagg_decode_prealloc_queue = SimpleNamespace(
-            prefetch_prefill_dp_rank_queries=Mock(), queue=[]
+            prefetch_prefill_dp_rank_queries=Mock(),
+            record_draft_window_forward=Mock(),
+            queue=[],
         )
         scheduler.process_decode_queue = Mock(return_value=False)
         scheduler.ngram_embedding_manager = SimpleNamespace(

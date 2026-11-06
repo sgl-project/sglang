@@ -587,6 +587,11 @@ Relevant parameters:
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>None</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--speculative-draft-window-kv</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use request-private sliding-window draft KV storage on NIXL PD decode. Enable on both prefill and decode.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>False</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--speculative-draft-window-size</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Draft KV sliding-window size. Must be <code>&gt;= speculative-num-draft-tokens</code> when set.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>None</code></td>
@@ -619,6 +624,37 @@ response = client.chat.completions.create(
 
 print(response.choices[0].message.content)
 ```
+
+### Sliding-window draft KV pools for NIXL PD
+
+On Linux with NVIDIA CUDA and the FA3 draft backend, you can enable
+`--speculative-draft-window-kv` on **both prefill and decode**. Decode stores each
+request's draft KV in a private ring buffer sized by the draft's native attention
+window, request slots, and execution margin. The target keeps its full KV cache,
+so the draft pool no longer grows with the target's token capacity. The option is
+disabled by default and does not require decode RadixCache.
+
+All draft attention layers must use the same native sliding window without
+attention sinks. Prefill and decode must use matching draft TP layouts and KV
+dtypes (`bfloat16` or tensor-scaled `fp8_e4m3`). For example, with a TP4 prefill
+server and a TP4 decode server, use the local GLM-5.3-Flash weights as
+`--model-path /path/to/GLM-5.3-Flash` and add these options to both commands in your
+[NIXL PD deployment](/docs/advanced_features/pd_disaggregation):
+
+```bash Options for both prefill and decode
+--speculative-algorithm DFLASH \
+--speculative-draft-model-path /path/to/GLM-5.3-Flash-DFlash2 \
+--speculative-draft-attention-backend fa3 \
+--speculative-draft-kv-cache-dtype fp8_e4m3 \
+--speculative-draft-window-kv
+```
+
+Set an explicit `--max-running-requests` on decode; it determines the number of
+request-private windows together with PD's extra slots. Decode CP and PP/DP/DCP
+sizes must be one. Colocated serving, target SWA pools, session-held KV,
+multimodal requests, staging buffers, KV offload, and HiCache/HiSparse are not
+supported. Do not combine this option with `--speculative-draft-window-size`:
+the physical pool follows the checkpoint's native attention window.
 
 ### DFlash and DFlash2 with DP attention
 

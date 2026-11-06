@@ -648,6 +648,23 @@ class TestResolveDeferredReleases(CustomTestCase):
             outcome="drained",
         )
 
+    def test_draft_window_waits_for_drain_even_after_timeout(self):
+        mgr = _make_manager()
+        room, idx = 301, 3
+        q = _make_queue()
+        q.draft_window_kv = True
+        dreq = _make_decode_req(room, idx, mgr, n_prefill_ranks=1)
+        generation = mgr.register_deferred_abort_room(room)
+        q._deferred_releases.join([(dreq, 10.0, float("-inf"), idx, 1)])
+        with patch.object(q.scheduler.request_retirer, "release") as release:
+            q.resolve_deferred_releases()
+            release.assert_not_called()
+            self.assertEqual(len(q._deferred_releases), 1)
+            mgr.note_abort_ack(room, 0, generation)
+            q.resolve_deferred_releases()
+            release.assert_called_once_with(dreq.req, checkpoint=False)
+        self.assertEqual(q.req_to_metadata_buffer_idx_allocator.freed, [idx])
+
     def test_releases_on_timeout_without_ack(self):
         mgr = _make_manager()
         room, idx = 300, 3

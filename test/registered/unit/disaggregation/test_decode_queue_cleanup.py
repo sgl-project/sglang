@@ -11,6 +11,7 @@ from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.conn import KVTransferError
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
+    DecodeReqToTokenPool,
     DecodeRequest,
     DecodeTransferQueue,
     SchedulerDisaggregationDecodeMixin,
@@ -22,6 +23,7 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
 )
 from sglang.srt.disaggregation.utils import ReqToMetadataIdxAllocator
 from sglang.srt.environ import envs
+from sglang.srt.managers.async_d2h_copy_worker import HostCopyDone
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
@@ -51,6 +53,65 @@ class TestDecodeQueueCleanup(CustomTestCase):
         reset_context()
         self.addCleanup(reset_context)
         publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
+    def test_window_slot_reuse_waits_for_latest_forward_without_blocking(self):
+        """Finishing batch N must not expose a ring still written by batch N+1."""
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.draft_window_kv = True
+        queue._draft_window_slot_events = {}
+        queue.queue = [object()]
+        queue.gloo_group = None
+        pool = DecodeReqToTokenPool(3, 8, "cpu", False, 0)
+        queue.req_to_token_pool = pool
+        # Slot 2 belongs to an unrelated live request; 1 was just released.
+        pool.free_slots = [1, 3]
+        batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(is_prebuilt=lambda: False),
+            req_pool_indices_cpu=torch.tensor([1, 2]),
+        )
+        previous, latest = HostCopyDone(), HostCopyDone()
+        previous.set_done()
+        queue.record_draft_window_forward(batch, SimpleNamespace(copy_done=previous))
+        queue.record_draft_window_forward(batch, SimpleNamespace(copy_done=latest))
+
+        def allocate():
+            req = SimpleNamespace(kv=ReqKvInfo())
+            return pool.alloc([req])
+
+        with queue._hold_busy_draft_window_slots():
+            self.assertEqual(allocate(), [3])
+            self.assertIsNone(allocate())
+        self.assertEqual(pool.free_slots, [1])
+        # A later forward for slot 2 does not gate reuse of slot 1.
+        unrelated = HostCopyDone()
+        batch.req_pool_indices_cpu = torch.tensor([2])
+        queue.record_draft_window_forward(batch, SimpleNamespace(copy_done=unrelated))
+        latest.set_done()
+        with queue._hold_busy_draft_window_slots():
+            self.assertEqual(allocate(), [1])
+        self.assertFalse(unrelated.query())
+
+    def test_window_slot_reuse_respects_remote_rank_and_restores_on_error(self):
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.draft_window_kv = True
+        queue._draft_window_slot_events = {}
+        queue.queue = [object()]
+        queue.gloo_group = None
+        pool = DecodeReqToTokenPool(2, 8, "cpu", False, 0)
+        queue.req_to_token_pool = pool
+        # Local GPU is ready, but the peer still writes slot 1. The collective
+        # is the external boundary; allocation still uses the real pool.
+        with patch(
+            "sglang.srt.disaggregation.decode.all_reduce_flags", return_value=[1, 0]
+        ):
+            with self.assertRaisesRegex(RuntimeError, "admission failed"):
+                with queue._hold_busy_draft_window_slots():
+                    req = SimpleNamespace(kv=ReqKvInfo())
+                    self.assertEqual(pool.alloc([req]), [2])
+                    other = SimpleNamespace(kv=ReqKvInfo())
+                    self.assertIsNone(pool.alloc([other]))
+                    raise RuntimeError("admission failed")
+        self.assertEqual(pool.free_slots, [1])
 
     def test_ensure_prefill_info_tolerates_cleared_receiver(self):
         # A req whose kv_receiver was already cleared must not crash on .abort().
