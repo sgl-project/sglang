@@ -151,7 +151,9 @@ class TimestepEmbedder(nn.Module):
         )
 
     def forward(self, t):
-        return self.mlp(timestep_embedding(t).type(self.mlp[0].weight.dtype))
+        # Quantized linears store INT8 weights but still consume BF16 embeddings.
+        dtype = getattr(self.mlp[0], "params_dtype", self.mlp[0].weight.dtype)
+        return self.mlp(timestep_embedding(t).to(dtype))
 
 
 class FinalLayerPerBlock(nn.Module):
