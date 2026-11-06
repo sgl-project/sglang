@@ -1491,6 +1491,7 @@ class ModelConfig:
                 setattr(self.hf_text_config, "head_dim", self.head_dim)
 
         self.v_head_dim = getattr(self.hf_text_config, "v_head_dim", None)
+        configured_v_head_dim = self.v_head_dim
         if self.v_head_dim is None or self.v_head_dim == 0:
             self.v_head_dim = self.head_dim
             setattr(self.hf_text_config, "v_head_dim", self.v_head_dim)
@@ -1666,6 +1667,9 @@ class ModelConfig:
             self.qk_nope_head_dim = self.hf_config.qk_nope_head_dim
             self.v_head_dim = self.hf_config.v_head_dim
             self._init_mla_scaling(self.hf_config.rope_scaling)
+        elif getattr(self.hf_text_config, "use_mla", False) is True:
+            # External models can opt in without extending the architecture list.
+            self._init_configured_mla(v_head_dim=configured_v_head_dim)
         else:
             if (
                 "MistralModel" in self.hf_config.architectures
@@ -1768,6 +1772,38 @@ class ModelConfig:
         # Use vision_vocab_size for lm_head, LogitsProcessor, and graph-mode logits buffers.
         if _hf_arch(self.hf_config) == "GlmImageForConditionalGeneration":
             self.vocab_size = self.hf_text_config.vision_vocab_size
+
+    def _init_configured_mla(self, *, v_head_dim: Optional[int]) -> None:
+        dimensions = {
+            "kv_lora_rank": getattr(self.hf_text_config, "kv_lora_rank", None),
+            "qk_nope_head_dim": getattr(self.hf_text_config, "qk_nope_head_dim", None),
+            "qk_rope_head_dim": getattr(self.hf_text_config, "qk_rope_head_dim", None),
+            # Check the checkpoint value before the generic MHA default filled it.
+            "v_head_dim": v_head_dim,
+        }
+        for name, value in dimensions.items():
+            minimum = 0 if name in ("qk_nope_head_dim", "qk_rope_head_dim") else 1
+            if type(value) is not int or value < minimum:
+                raise ValueError(
+                    f"use_mla=True requires {name} to be an integer >= {minimum}; "
+                    f"got {value!r}"
+                )
+        if dimensions["qk_nope_head_dim"] + dimensions["qk_rope_head_dim"] == 0:
+            raise ValueError(
+                "use_mla=True requires qk_nope_head_dim + qk_rope_head_dim > 0"
+            )
+
+        for name, value in dimensions.items():
+            setattr(self, name, value)
+        self.attention_arch = AttentionArch.MLA
+        self.head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        self.swa_kv_lora_rank = self.kv_lora_rank
+        self.swa_qk_rope_head_dim = self.qk_rope_head_dim
+        self.index_head_dim = None
+        rope_scaling = getattr(self.hf_text_config, "rope_parameters", None) or getattr(
+            self.hf_text_config, "rope_scaling", None
+        )
+        self._init_mla_scaling(rope_scaling)
 
     def _init_mla_scaling(self, rope_scaling: Optional[dict]) -> None:
         """Base MLA attention scale from the head dims, then the rope mscale."""
