@@ -3646,7 +3646,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 self.force_exit_handler()
                 break
 
-            elif get_bool_env_var("SGL_FORCE_SHUTDOWN"):
+            elif envs.SGLANG_FORCE_SHUTDOWN.get():
                 # if force shutdown flag set, exit immediately
                 logger.error(
                     "Signal SIGTERM received while force shutdown flag set. Force exiting."

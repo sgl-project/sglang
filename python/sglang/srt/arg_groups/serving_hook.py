@@ -452,7 +452,6 @@ def handle_environment_variables(server_args: Any):
                 server_args, "_handle_environment_variables", debug_cuda_graph=False
             )
         else:
-            envs.SGLANG_USE_BREAKABLE_CUDA_GRAPH.set("1")
             logger.warning(
                 "Debug mode for CUDA graph is enabled via breakable CUDA graph. "
                 "All operations will run eagerly through the graph capture/replay path."
