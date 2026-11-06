@@ -1108,7 +1108,7 @@ class MuseSpark1xModel(nn.Module):
             layer.bind_next_pre_attn_norm(next_layer.input_layernorm)
         self._sp_moe_dispatcher = None
         self._finalize_ar_workspace = None
-        if is_cuda() and envs.SGLANG_ENABLE_MUSE_SPARK_FINALIZE_AR.get():
+        if is_cuda():
             from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
                 CustomAllReduceV2,
             )

@@ -19,6 +19,7 @@ import multiprocessing as mp
 import signal
 import threading
 import time
+import traceback
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -75,6 +76,7 @@ from sglang.srt.server_args import (
     ServerArgs,
 )
 from sglang.srt.utils import numa_utils
+from sglang.srt.utils.common import TypeBasedDispatcher
 from sglang.srt.utils.device import maybe_reindex_device_id
 from sglang.srt.utils.log_utils import configure_logger
 from sglang.srt.utils.network import (
@@ -86,7 +88,6 @@ from sglang.srt.utils.network import (
 from sglang.srt.utils.process import kill_itself_when_parent_died
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.watchdog import Watchdog
-from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 logger = logging.getLogger(__name__)
 
@@ -989,6 +990,7 @@ def run_data_parallel_controller_process(
                 f"Scheduler or DataParallelController {proc.pid} terminated with {proc.exitcode}"
             )
     except Exception:
-        traceback = get_exception_traceback()
-        logger.error(f"DataParallelController hit an exception: {traceback}")
+        logger.error(
+            f"DataParallelController hit an exception: {traceback.format_exc()}"
+        )
         parent_process.send_signal(signal.SIGQUIT)
