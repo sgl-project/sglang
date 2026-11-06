@@ -23,6 +23,7 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 def _block_scale_layer():
     return SimpleNamespace(
+        moe_tp_size=1,
         _map_global_expert_id_to_local_expert_id=lambda expert: (
             0 if expert == 2 else -1
         ),
@@ -71,6 +72,7 @@ def test_block_scale_negotiation_is_identical_on_local_and_foreign_ranks(
 @pytest.mark.parametrize("experts", [1, 2])
 def test_ue8m0_expansion_is_exact_shared_and_private(experts):
     layer = SimpleNamespace(
+        moe_tp_size=1,
         _map_global_expert_id_to_local_expert_id=lambda expert: expert,
         w2_weight_scale_inv=torch.full((experts, 17, 15), -3.0),
     )
@@ -192,6 +194,7 @@ def test_cutedsl_bindings_preserve_scale_images_padding_and_aliases():
                 mma = mma.clone(memory_format=torch.preserve_format)
             stem = "w2" if projection == "down" else "w13"
             layer = SimpleNamespace(
+                moe_tp_size=1,
                 **{
                     f"{stem}_blockscale_swizzled": primary.unsqueeze(0),
                     f"{stem}_blockscale_mma": mma,
@@ -419,6 +422,71 @@ def blocked_scales(value):
         .contiguous()
         .flatten()
     )
+
+
+@pytest.mark.parametrize("projection", ["gate", "down"])
+@pytest.mark.parametrize("suffix", ["weight", "weight_scale"])
+@pytest.mark.parametrize("tp_rank,tp_size,partition", [(1, 2, 128), (3, 4, 64)])
+def test_trtllm_tp_preserves_padded_loader_offsets(
+    projection, suffix, tp_rank, tp_size, partition
+):
+    # A 192-wide checkpoint has logical TP2 width 96, but this loader partitions
+    # by its padded width 128: rank one owns [128:192], not [96:192].
+    scale = suffix == "weight_scale"
+    divisor = 16 if scale else 2
+    shape = (
+        (192, 128 // divisor) if projection == "gate" else (128, 192 // divisor)
+    )
+    rows = 2 * partition if projection == "gate" else 128
+    cols = (128 if projection == "gate" else partition) // divisor
+    logical = torch.zeros(rows, cols, dtype=torch.uint8)
+    physical = (
+        blocked_scales(shuffled_rows(logical))
+        if scale
+        else shuffled_rows(logical)
+    )
+    stem = "w13" if projection == "gate" else "w2"
+    layer = SimpleNamespace(
+        moe_tp_size=tp_size,
+        moe_tp_rank=tp_rank,
+        use_padded_loading=True,
+        intermediate_size_per_partition=partition,
+        _map_global_expert_id_to_local_expert_id=lambda _: 0,
+    )
+    weight_cols = (128 if projection == "gate" else partition) // 2
+    setattr(
+        layer,
+        stem + "_weight",
+        torch.zeros(rows, weight_cols, dtype=torch.uint8).unsqueeze(0),
+    )
+    setattr(layer, stem + "_" + suffix, physical.unsqueeze(0))
+    binding = _moe_binding(
+        "expert",
+        {"dtype": "F8_E4M3" if scale else "U8", "shape": list(shape)},
+        layer,
+        0,
+        projection,
+        suffix,
+        FlashInferLayout("nvfp4", "trtllm", True, "w4a4"),
+    )
+    if tp_size == 4:
+        # Padded rank three owns no checkpoint bytes and must leave its entire
+        # zero-filled consumer image untouched.
+        assert binding is None
+    else:
+        mask = torch.randint(256, shape, dtype=torch.uint8)
+        for view in binding.apply_bindings():
+            source = view.selected_bytes(mask.flatten())
+            for target in view.destinations:
+                target.bitwise_xor_(source.reshape(target.shape))
+        if projection == "gate":
+            logical[:128:2] = mask[128:]
+        else:
+            logical[:, :64 // divisor] = mask[:, 128 // divisor:]
+    expected = shuffled_rows(logical)
+    if scale:
+        expected = blocked_scales(expected)
+    assert torch.equal(physical, expected)
 
 
 @pytest.mark.parametrize(

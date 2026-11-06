@@ -36,8 +36,9 @@ class FlashInferLayout:
 class DestinationSegment:
     # Coordinates are canonical ELEMENTS, not bytes. Only the returned views
     # use byte coordinates, so BF16 source selections retain their element size.
-    slices: tuple[tuple[int, int], tuple[int, int]]
+    slices: tuple[tuple[int, int], ...]
     destinations: tuple[torch.Tensor, ...]
+    source_shape: tuple[int, ...] | None = None
 
 
 def _backend(backend):
@@ -399,6 +400,36 @@ def expert_scale_target(layer, layout, local_expert, projection, canonical_shape
     if rows > target.shape[0] or cols > target.shape[1]:
         raise ValueError("block-128 scale projection exceeds live storage")
     return target[:rows, :cols]
+
+
+def expert_slices(layer, layout, projection, suffix, shape):
+    """Canonical projection owned by the ordinary expert loader's TP rank.
+
+    CuTe DSL and MegaMoE partition checkpoint extents before padding. TRTLLM's
+    padded loader instead uses its physical intermediate extent as the rank
+    stride. Keep that distinction at admission; apply sees only byte strides.
+    """
+    slices = [[0, extent] for extent in shape]
+    if layer.moe_tp_size != 1:
+        axis = 1 if projection == "down" else 0
+        extent = shape[axis]
+        if layer.use_padded_loading:
+            divisor = 1
+            if suffix in {"weight_scale", "weight_scale_inv"}:
+                if layout.format == "fp8-block128-ue8m0":
+                    divisor = 128
+                elif axis == 1:
+                    divisor = 16 if layout.format == "nvfp4" else 32
+            elif axis == 1 and layout.format in {"nvfp4", "mxfp4"}:
+                divisor = 2
+            width = (layer.intermediate_size_per_partition + divisor - 1) // divisor
+        else:
+            width, remainder = divmod(extent, layer.moe_tp_size)
+            if remainder:
+                raise ValueError("canonical expert extent must divide its TP group")
+        start = min(layer.moe_tp_rank * width, extent)
+        slices[axis] = [start, min(start + width, extent)]
+    return slices
 
 
 def expert_destinations(

@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import replace
 
 import torch
 
@@ -18,9 +19,59 @@ from sglang.srt.weight_sync.gpu_delta.bindings import (
     DerivedImage,
     ParameterBindings,
     TensorBinding,
+    _byte_view,
     _full_slices,
     dense_target,
 )
+from sglang.srt.weight_sync.gpu_delta.flashinfer import DestinationSegment
+
+
+def _with_replicated_projection(binding, target, rows_per_head, key_rows=None):
+    """Apply the same canonical mask to a DCP group's gathered MLA consumer.
+
+    The decode payload remains complete. A logical head axis lets one affine
+    descriptor select the K rows of every KV head, without per-head segments,
+    temporary weights, or an all-gather while paused.
+    """
+    heads = target.shape[0] if key_rows is not None else target.shape[0] // rows_per_head
+    span = heads * rows_per_head
+    start = binding.slices[0][0] // span * span
+    coverage = [[start, start + span], [0, binding.shape[1]]]
+    if key_rows is None:
+        source_shape = None
+        slices = tuple(tuple(axis) for axis in coverage)
+        expected = (span, binding.shape[1])
+    else:
+        source_shape = (
+            binding.shape[0] // rows_per_head,
+            rows_per_head,
+            binding.shape[1],
+        )
+        slices = (
+            (start // rows_per_head, start // rows_per_head + heads),
+            (0, key_rows),
+            (0, binding.shape[1]),
+        )
+        expected = (heads, key_rows, binding.shape[1])
+    if (
+        target.dtype != binding.torch_dtype
+        or tuple(target.shape) != expected
+        or start + span > binding.shape[0]
+        or binding.shape[0] % rows_per_head
+    ):
+        raise ValueError("unsupported DCP replicated projection geometry")
+    return replace(
+        binding,
+        slices=coverage,
+        storage=(*binding.storage, target),
+        destinations=(),
+        segments=(
+            DestinationSegment(
+                tuple(tuple(axis) for axis in binding.slices), binding.destinations
+            ),
+            DestinationSegment(slices, (_byte_view(target),), source_shape),
+        ),
+    )
 
 
 def _indexer_norm_binding(name, meta, target):
@@ -130,16 +181,41 @@ class DeepSeekMlaMapping:
             )
             return _indexer_norm_binding(name, meta, target)
         binding = self.parameters.bind(name, meta, target_name, target)
+        if name.endswith((".q_b_proj.weight", ".q_proj.weight")):
+            prefix = target_name.rsplit(".", 2)[0]
+            attn = self.parameters.modules[prefix]
+            if attn.q_b_proj_qrep is not None:
+                raise ValueError("GPU delta requires unquantized DCP Q replication")
+            if attn.q_b_proj_qrep_weight is not None:
+                binding = _with_replicated_projection(
+                    binding, attn.q_b_proj_qrep_weight, attn.qk_head_dim
+                )
         if ".kv_b_proj.weight" in name:
             prefix = target_name.rsplit(".kv_b_proj.weight", 1)[0]
-            self.mla_layers[prefix] = self.parameters.modules[prefix]
+            attn = self.parameters.modules[prefix]
+            self.mla_layers[prefix] = attn
+            if attn.w_kc_qrep is not None:
+                binding = _with_replicated_projection(
+                    binding,
+                    attn.w_kc_qrep,
+                    attn.qk_nope_head_dim + attn.v_head_dim,
+                    attn.qk_nope_head_dim,
+                )
         return binding
 
     def finish(self):
         for prefix, attn in self.mla_layers.items():
             self._add_derived(prefix, attn)
             self.consumers.append(
-                ConsumerSnapshot(lambda attn=attn: (attn.w_kc, attn.w_vc))
+                ConsumerSnapshot(
+                    lambda attn=attn: (
+                        attn.w_kc,
+                        attn.w_vc,
+                        attn.w_kc_qrep,
+                        attn.q_b_proj_qrep_weight,
+                        attn.q_b_proj_qrep,
+                    )
+                )
             )
 
     def _add_derived(self, prefix, attn):

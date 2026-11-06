@@ -22,6 +22,7 @@ from sglang.srt.weight_sync.gpu_delta.flashinfer import (
     DestinationSegment,
     expert_destinations,
     expert_scale_target,
+    expert_slices,
     identify_layout,
 )
 
@@ -120,6 +121,7 @@ class TensorBinding:
         return tuple(
             replace(
                 self,
+                shape=self.shape if segment.source_shape is None else segment.source_shape,
                 slices=[list(axis) for axis in segment.slices],
                 destinations=segment.destinations,
                 segments=(),
@@ -240,13 +242,17 @@ def _moe_binding(name, meta, layer, expert, projection, suffix, layout):
             else target[local]
         )
         return _direct_binding(name, meta, target)
+    slices = expert_slices(layer, layout, projection, suffix, meta["shape"])
+    local_shape = tuple(stop - start for start, stop in slices)
+    if not all(local_shape):
+        return None
     if layout.format == "fp8-block128-ue8m0" and suffix == "weight_scale_inv":
-        target = expert_scale_target(layer, layout, local, projection, meta["shape"])
+        target = expert_scale_target(layer, layout, local, projection, local_shape)
         return TensorBinding(
             name,
             meta["dtype"],
             tuple(meta["shape"]),
-            _full_slices(meta["shape"]),
+            slices,
             (target,),
             encoding="raw_bytes",
             format=meta["format"],
@@ -263,8 +269,18 @@ def _moe_binding(name, meta, layer, expert, projection, suffix, layout):
         local,
         projection,
         byte_suffix,
-        tuple(meta["shape"]),
+        local_shape,
         meta["dtype"],
+    )
+    segments = tuple(
+        DestinationSegment(
+            tuple(
+                (start + origin, stop + origin)
+                for (start, stop), (origin, _) in zip(segment.slices, slices)
+            ),
+            segment.destinations,
+        )
+        for segment in segments
     )
     storage = {}
     for segment in segments:
@@ -274,7 +290,7 @@ def _moe_binding(name, meta, layer, expert, projection, suffix, layout):
         name,
         meta["dtype"],
         tuple(meta["shape"]),
-        _full_slices(meta["shape"]),
+        slices,
         tuple(storage.values()),
         segments=segments,
         format=meta.get("format"),
@@ -436,9 +452,9 @@ class ParameterBindings:
             if layer is None:
                 raise ValueError(f"canonical expert has no runtime layer: {name}")
             if prefix not in self.moe_layers:
-                if layer.moe_tp_size != 1 or layer.use_presharded_weights:
+                if layer.use_presharded_weights:
                     raise ValueError(
-                        "GPU delta requires expert TP=1 and an unsharded canonical checkpoint"
+                        "GPU delta requires an unsharded canonical checkpoint"
                     )
                 self.moe_layouts[prefix] = _identify_moe_layout(layer)
                 self.moe_layers[prefix] = layer
@@ -455,7 +471,7 @@ class ParameterBindings:
                 self.excluded[name] = (
                     "static activation calibration"
                     if suffix == "input_scale"
-                    else "expert owned by another EP rank"
+                    else "expert projection owned by another EP/TP rank"
                 )
             return binding
         if target is None:

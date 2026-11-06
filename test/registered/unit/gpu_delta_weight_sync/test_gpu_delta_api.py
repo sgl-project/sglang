@@ -122,7 +122,7 @@ def test_delta_routes_preserve_typed_requests_auth_and_app_route_class(http_delt
                 "validate_payload_hash", True
             )
     response = GpuDeltaReqOutput(
-        success=True, message="", participant=receipts[0], rid="control-reply"
+        success=True, message="", participants=receipts, rid="control-reply"
     )
     received = msgpack_decode(msgpack_encode(response))
     assert type(received) is GpuDeltaReqOutput and received == response
@@ -184,18 +184,21 @@ def publication():
     )
 
 
-def reply(control, obj, state, rank=0):
+def reply(control, obj, state, ranks=(0,)):
     control.communicator.handle_recv(
         io.GpuDeltaReqOutput(
             rid=obj.rid,
             success=True,
             message="",
-            participant={
-                "identity": {"engine_id": "e0", "rank_id": f"r{rank}"},
-                "session_id": obj.session_id,
-                "state": state,
-                "target_version": 7,
-            },
+            participants=[
+                {
+                    "identity": {"engine_id": "e0", "rank_id": f"r{rank}"},
+                    "session_id": obj.session_id,
+                    "state": state,
+                    "target_version": 7,
+                }
+                for rank in ranks
+            ],
         )
     )
 
@@ -223,29 +226,29 @@ def test_update_waits_for_every_rank_before_apply_and_resume(
         assert type(prepare) is io.PrepareGpuDeltaReqInput
         assert prepare.validate_payload_hash is True
         assert not facade.manager.is_pause
-        reply(facade, prepare, "PREPARED")
+        reply(facade, prepare, "PREPARED", ranks=(0, 1))
         await asyncio.sleep(0)
         assert sent.empty() and not task.done()
-        reply(facade, prepare, "PREPARED", rank=1)
+        reply(facade, prepare, "PREPARED", ranks=(2, 3))
         apply = await sent.get()
         assert type(apply) is io.ApplyGpuDeltaReqInput
         assert facade.manager.is_pause
-        reply(facade, apply, "APPLIED")
+        reply(facade, apply, "APPLIED", ranks=(0, 1))
         await asyncio.sleep(0)
         assert sent.empty() and facade.manager.is_pause
-        reply(facade, apply, "APPLIED", rank=1)
+        reply(facade, apply, "APPLIED", ranks=(2, 3))
         resume = await sent.get()
         assert type(resume) is io.ResumeGpuDeltaReqInput
         assert facade.manager.is_pause and versions == []
-        reply(facade, resume, "RESUMED")
+        reply(facade, resume, "RESUMED", ranks=(0, 1))
         await asyncio.sleep(0)
         assert not task.done() and facade.manager.is_pause and versions == []
-        reply(facade, resume, "RESUMED", rank=1)
+        reply(facade, resume, "RESUMED", ranks=(2, 3))
         result = await task
         assert result["success"] and not facade.manager.is_pause
         assert versions == ["7"] and sent.empty()
-        assert [r["state"] for r in result["applied_participants"]] == ["APPLIED"] * 2
-        assert [r["state"] for r in result["participants"]] == ["RESUMED"] * 2
+        assert [r["state"] for r in result["applied_participants"]] == ["APPLIED"] * 4
+        assert [r["state"] for r in result["participants"]] == ["RESUMED"] * 4
         assert setup_calls == ["loop", "workers"]
 
     asyncio.run(asyncio.wait_for(run(), timeout=2))
