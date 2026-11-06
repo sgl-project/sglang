@@ -93,11 +93,21 @@ class IndexKeyCache:
             scales[tgt_page, tgt_offset] = scales[src_page, src_offset]
 
     def get_local_buffer(self, layer_id: int) -> torch.Tensor:
+        # Raw getters preserve shared-layer placeholders. Page-interleave
+        # callers also use these reads to advance layer transfer/prefetch.
         if self.pool.layer_transfer_counter is not None:
             self.pool.layer_transfer_counter.wait_until(
                 layer_id - self.pool.start_layer
             )
         return self._kernel_view(self.buffer[layer_id - self.pool.start_layer])
+
+    def _check_live_indexer(self, layer_id: int) -> None:
+        # Non-owned CP layers are distinct: they can have an empty local buffer
+        # without being shared-topk layers. Reject only the latter here.
+        if self.pool.skip_topk_layers[layer_id - self.pool.start_layer]:
+            raise RuntimeError(
+                f"Layer {layer_id} reuses top-k and has no index-K storage"
+            )
 
     def get_buffer(self, layer_id: int) -> torch.Tensor:
         return self.get_local_buffer(layer_id)
@@ -110,6 +120,7 @@ class IndexKeyCache:
         seq_len_sum: int,
         max_seq_len: int,
     ):
+        self._check_live_indexer(layer_id)
         buf = self.get_buffer(layer_id)
         return dsa_index_k_cache.GetKAndS.execute(
             self.pool,
@@ -127,6 +138,7 @@ class IndexKeyCache:
         index_k: torch.Tensor,
         index_k_scale: torch.Tensor,
     ) -> None:
+        self._check_live_indexer(layer_id)
         buf = self._kernel_view(self.buffer[layer_id - self.pool.start_layer])
         dsa_index_k_cache.SetKAndS.execute(
             pool=self.pool,

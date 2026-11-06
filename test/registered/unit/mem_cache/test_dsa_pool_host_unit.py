@@ -223,6 +223,146 @@ class TestDSAHiCacheTransfer(unittest.TestCase):
             with self.subTest(fp4=fp4):
                 self._run_device_to_host_indexer_copy("direct", fp4)
 
+    @unittest.skipUnless(is_cuda(), "CUDA compact HiSparse regression")
+    def test_shared_indexer_l2_roundtrip_with_packed_draft(self):
+        """A PP stage starting in a shared layer retains KV and the draft tail."""
+        for layout in ("layer_first", "page_first_direct"):
+            with self.subTest(layout=layout):
+                # Match the controller: direct transfers use a dedicated CUDA stream.
+                stream = torch.cuda.Stream()
+                with torch.cuda.stream(stream):
+                    self._run_shared_indexer_roundtrip(layout)
+
+    def _run_shared_indexer_roundtrip(self, layout):
+        def pool(layers, start, mask=None):
+            return DSATokenToKVPool(
+                size=256,
+                page_size=64,
+                kv_lora_rank=512,
+                dtype=torch.bfloat16,
+                qk_rope_head_dim=64,
+                layer_num=layers,
+                device="cuda",
+                index_head_dim=128,
+                enable_memory_saver=False,
+                kv_cache_dim=576,
+                start_layer=start,
+                end_layer=start + layers,
+                skip_topk_layers=mask,
+            )
+
+        target = pool(6, 21, [True, False, True, True, True, False])
+        draft = pool(1, 78)
+        anchor = MLATokenToKVPoolHost(
+            buffer_info=target.get_device_pool_infos()[0].buffer_info,
+            device_capacity_tokens=target.size,
+            target_layer_num=target.layer_num,
+            start_layer=target.start_layer,
+            end_layer=target.end_layer,
+            host_to_device_ratio=2,
+            host_size=0,
+            page_size=64,
+            layout=layout,
+            pin_memory=True,
+            device="cpu",
+            allocator_type="default",
+            override_kv_cache_dim=target.kv_cache_dim,
+        )
+        host = _make_indexer_host(
+            target,
+            anchor,
+            packed_draft_device_pools=(draft,),
+            pin_memory=True,
+            device="cpu",
+            allocator_type="default",
+        )
+        self.assertEqual(host._live_target_layers, [1, 5])
+        self.assertEqual(host.layer_num, 3)  # Two producers plus the draft.
+        self.assertTrue(all(buf.numel() for buf in target.kv_buffer))
+        expected = {}
+        for i in (1, 5):
+            target.index_k_with_scale_buffer[i].random_(0, 256)
+            expected[i] = target.index_k_with_scale_buffer[i][1:3].clone()
+        draft.index_k_with_scale_buffer[0].random_(0, 256)
+        expected_draft = draft.index_k_with_scale_buffer[0][1:3].clone()
+        for i, buf in enumerate(target.kv_buffer):
+            buf.fill_(i + 1)
+        device_indices = torch.arange(64, 192, dtype=torch.int64, device="cpu")
+        host_indices = torch.arange(0, 128, dtype=torch.int64, device="cpu")
+        anchor.backup_from_device_all_layer(
+            target, host_indices, device_indices, "direct"
+        )
+        host.backup_from_device_all_layer(
+            target, host_indices, device_indices, "direct"
+        )
+        torch.cuda.synchronize()
+        for buf in target.index_k_with_scale_buffer + draft.index_k_with_scale_buffer:
+            buf.zero_()
+        for buf in target.kv_buffer:
+            buf.zero_()
+        for i in range(6):
+            anchor.load_to_device_per_layer(
+                target, host_indices, device_indices, i, "direct"
+            )
+            host.load_to_device_per_layer(
+                target, host_indices, device_indices, i, "direct"
+            )
+        host.load_to_device_per_layer(
+            draft, host_indices, device_indices, 6, "direct", is_draft=True
+        )
+        torch.cuda.synchronize()
+        for i in (1, 5):
+            torch.testing.assert_close(
+                target.index_k_with_scale_buffer[i][1:3], expected[i]
+            )
+        torch.testing.assert_close(
+            draft.index_k_with_scale_buffer[0][1:3], expected_draft
+        )
+        for i, buf in enumerate(target.kv_buffer):
+            self.assertTrue(torch.all(buf[64:192] == i + 1).item())
+        self.assertEqual(
+            [buf.numel() == 0 for buf in target.index_k_with_scale_buffer],
+            [True, False, True, True, True, False],
+        )
+        host.destroy()
+        anchor.destroy()
+
+    @unittest.skipUnless(is_cuda(), "CUDA compact HiSparse regression")
+    def test_hisparse_pool_elides_only_shared_indexer_storage(self):
+        from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
+
+        mask = [not (i < 3 or (i - 2) % 4 == 0) for i in range(78)]
+        pool = HiSparseDSATokenToKVPool(
+            size=128,
+            page_size=64,
+            kv_lora_rank=512,
+            dtype=torch.float8_e4m3fn,
+            qk_rope_head_dim=64,
+            layer_num=78,
+            device="cuda",
+            index_head_dim=128,
+            enable_memory_saver=False,
+            kv_cache_dim=656,
+            skip_topk_layers=mask,
+            host_to_device_ratio=20,
+        )
+        self.assertEqual(pool.index_buf_size, 2560)
+        self.assertEqual(len(pool.kv_buffer), 78)
+        self.assertTrue(all(buf.numel() for buf in pool.kv_buffer))
+        self.assertEqual(
+            sum(buf.nbytes for buf in pool.index_k_with_scale_buffer),
+            21 * (2560 + 64) * 132,
+        )
+        _, lengths, items = pool.get_state_buf_infos()
+        self.assertEqual(len(lengths), 78)
+        self.assertEqual(sum(length > 0 for length in lengths), 21)
+        for i, shared in enumerate(mask):
+            if shared:
+                self.assertEqual((lengths[i], items[i]), (0, 0))
+            else:
+                data = pool.get_index_k_with_scale_buffer(i)
+                self.assertEqual(data.shape, (41, 64 * 132))
+
 
 if __name__ == "__main__":
     unittest.main()

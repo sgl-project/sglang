@@ -1147,6 +1147,143 @@ class TestEagleConfigurator(CustomTestCase):
 class TestDSAIndexerAllocationPolicy(CustomTestCase):
     @patch(
         "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
+        return_value=656,
+    )
+    def test_hisparse_budget_matches_cpu_pool_storage_growth(self, _dim):
+        import torch
+
+        from sglang.srt.environ import envs
+        from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
+        from sglang.srt.mem_cache.kv_cache_configurator import _should_elide_dsa_index_k
+        from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+        from sglang.srt.model_executor.pool_configurator import DefaultPoolConfigurator
+
+        types = ["full" if i < 3 or (i - 2) % 4 == 0 else "shared" for i in range(78)]
+        for ratio in (16, 20, 32):
+            for enabled in (False, True):
+                with self.subTest(ratio=ratio, enabled=enabled):
+                    mr = _make_model_runner(
+                        self,
+                        num_layers=78,
+                        use_mla_backend=True,
+                        enable_hisparse=True,
+                        hisparse_host_to_device_ratio=ratio,
+                        disaggregation_mode="decode",
+                        page_size=64,
+                    )
+                    _configure_dsa_model(mr)
+                    hf = mr.model_config.hf_config
+                    hf.model_type = "glm_moe_dsa"
+                    hf.num_hidden_layers = 78
+                    hf.indexer_types = types
+                    mr.spec_algorithm.is_eagle.return_value = True
+                    mr.spec_algorithm.is_none.return_value = False
+                    mr.spec_aux_config.eagle_draft_num_layers = 1
+                    with (
+                        envs.SGLANG_ENABLE_HISPARSE_INDEX_K_ELISION.override(enabled),
+                        patch(
+                            "sglang.srt.mem_cache.kv_cache_configurator._is_cuda", True
+                        ),
+                        patch(
+                            "sglang.srt.mem_cache.kv_cache_configurator._is_npu", False
+                        ),
+                        get_parallel().override(pp_size=1, attn_dcp_size=1),
+                        mock_cpu_env(kv_size=1),
+                    ):
+                        cfg = DefaultPoolConfigurator(mr)
+                        elide = _should_elide_dsa_index_k(
+                            is_draft_worker=False, hf_config=hf
+                        )
+                        mask = [elide and kind == "shared" for kind in types]
+                        kwargs = dict(
+                            page_size=64,
+                            kv_lora_rank=512,
+                            dtype=torch.float8_e4m3fn,
+                            qk_rope_head_dim=64,
+                            device="cpu",
+                            index_head_dim=128,
+                            enable_memory_saver=False,
+                            kv_cache_dim=656,
+                        )
+                        sizes = []
+                        for tokens in (128, 192):
+                            target = HiSparseDSATokenToKVPool(
+                                size=tokens,
+                                layer_num=78,
+                                skip_topk_layers=mask,
+                                host_to_device_ratio=ratio,
+                                **kwargs,
+                            )
+                            draft = DSATokenToKVPool(
+                                size=tokens * ratio, layer_num=1, **kwargs
+                            )
+                            self.assertEqual(
+                                sum(
+                                    b.numel() > 0
+                                    for b in target.index_k_with_scale_buffer
+                                ),
+                                21 if enabled else 78,
+                            )
+                            self.assertTrue(draft.index_k_with_scale_buffer[0].numel())
+                            sizes.append(
+                                sum(
+                                    b.nbytes
+                                    for pool in (target, draft)
+                                    for b in pool.kv_buffer
+                                    + pool.index_k_with_scale_buffer
+                                )
+                            )
+                            del target, draft
+                        # Differencing page-aligned capacities removes fixed
+                        # padding pages; _cell_size prices each added token.
+                        self.assertEqual(sizes[1] - sizes[0], 64 * cfg._cell_size)
+
+    @patch(
+        "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
+        return_value=576,
+    )
+    def test_hisparse_elision_prices_target_producers_but_keeps_draft(self, _dim):
+        from sglang.srt.environ import envs
+        from sglang.srt.model_executor.pool_configurator import DefaultPoolConfigurator
+
+        # GLM-5.3: the first three layers and then every fourth are producers.
+        types = ["full" if i < 3 or (i - 2) % 4 == 0 else "shared" for i in range(78)]
+        self.assertEqual(types.count("full"), 21)
+        for ratio in (20, 32):
+            for enabled in (False, True):
+                with self.subTest(ratio=ratio, enabled=enabled):
+                    mr = _make_model_runner(
+                        self,
+                        num_layers=78,
+                        use_mla_backend=True,
+                        enable_hisparse=True,
+                        hisparse_host_to_device_ratio=ratio,
+                        disaggregation_mode="decode",
+                    )
+                    _configure_dsa_model(mr)
+                    mr.model_config.hf_config.model_type = "glm_moe_dsa"
+                    mr.model_config.hf_config.num_hidden_layers = 78
+                    mr.model_config.hf_config.indexer_types = types
+                    mr.spec_algorithm.is_eagle.return_value = True
+                    mr.spec_algorithm.is_none.return_value = False
+                    mr.spec_aux_config.eagle_draft_num_layers = 1
+                    with (
+                        envs.SGLANG_ENABLE_HISPARSE_INDEX_K_ELISION.override(enabled),
+                        patch(
+                            "sglang.srt.mem_cache.kv_cache_configurator._is_cuda",
+                            True,
+                            create=True,
+                        ),
+                        get_parallel().override(pp_size=1, attn_dcp_size=1),
+                        mock_cpu_env(kv_size=1),
+                    ):
+                        cfg = DefaultPoolConfigurator(mr)
+                    target_layers = 21 if enabled else 78
+                    expected = 78 * 576 + ratio * (target_layers * 132 + 576 + 132)
+                    self.assertEqual(cfg._cell_size, expected)
+
+    @patch(
+        "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
         return_value=576,
     )
     def test_non_arch35_npu_budget_uses_compact_indexer_capacity(

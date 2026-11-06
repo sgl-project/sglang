@@ -2009,6 +2009,61 @@ class TestStagingScatterLifecycle(CustomTestCase):
 
 
 class TestMooncakeHiSparseSpecIndices(CustomTestCase):
+    def test_shared_index_elision_pp4_keeps_global_layers_and_draft(self):
+        producer = [i < 3 or (i - 2) % 4 == 0 for i in range(78)] + [True]
+        item_bytes = 64 * 132
+        for src_elides in (False, True):
+            for dst_elides in (False, True):
+                for start, end in ((0, 21), (21, 40), (40, 59), (59, 79)):
+                    with self.subTest(src=src_elides, dst=dst_elides, start=start):
+                        manager = object.__new__(MooncakeKVManager)
+                        manager.kv_args = SimpleNamespace(
+                            mla_compression_ratios=None, prefill_start_layer=start
+                        )
+                        manager.is_mla_backend = True
+                        manager.is_hybrid_mla_backend = False
+                        manager.pp_size = 4
+                        manager.enable_custom_mem_pool = False
+                        manager.max_transfer_batch_indices = 0
+                        manager.state_strides_validated = set()
+                        manager._transfer_data = Mock(return_value=0)
+                        src = [0x1000000 + i * 0x100000 for i in range(start, end)]
+                        dst = [0x10000000 + i * 0x100000 for i in range(79)]
+                        sl = [
+                            item_bytes if producer[i] or not src_elides else 0
+                            for i in range(start, end)
+                        ]
+                        dl = [
+                            item_bytes if live or not dst_elides else 0
+                            for live in producer
+                        ]
+                        ret = manager._send_kvcache_generic(
+                            "decode",
+                            src,
+                            dst,
+                            sl,
+                            np.array([2, 3], dtype=np.int32),
+                            np.array([11, 12], dtype=np.int32),
+                            executor=None,
+                            state_type=StateType.DSA,
+                            dst_item_lens=dl,
+                            dst_device_data_indices=np.array([7, 8], dtype=np.int32),
+                            dst_device_data_ptrs=set(dst),
+                        )
+                        self.assertEqual(ret, 0)
+                        expected = [
+                            (
+                                src[i - start] + 2 * item_bytes,
+                                dst[i] + 7 * item_bytes,
+                                2 * item_bytes,
+                            )
+                            for i in range(start, end)
+                            if producer[i] or not (src_elides or dst_elides)
+                        ]
+                        self.assertEqual(
+                            manager._transfer_data.call_args.args[1], expected
+                        )
+
     def test_draft_buffers_use_logical_device_indices(self):
         """A local target layer count must not turn remote target KV into draft KV."""
         for pp_size, stage_start in ((1, 0), (2, 0), (2, 2)):

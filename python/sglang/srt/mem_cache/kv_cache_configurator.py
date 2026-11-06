@@ -123,6 +123,7 @@ from sglang.srt.utils.device import (
     cpu_has_amx_support,
     get_available_gpu_memory,
     get_device_memory_capacity,
+    is_cuda,
     is_float4_e2m1fn_x2,
     is_hip,
     is_npu,
@@ -131,7 +132,7 @@ from sglang.srt.utils.device import (
 logger = logging.getLogger(__name__)
 
 
-def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
+def _should_elide_dsa_index_k(*, is_draft_worker: bool, hf_config=None) -> bool:
     """Shared-topk layers get a 0-row index-K buffer; HiCache and PD must skip those entries."""
     memory_config = get_memory()
     # Ascend PD slices the KV list positionally (index-K rides in it, not in
@@ -141,14 +142,33 @@ def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
     # The NPU HiCache host pool has no compact index-K layout.
     if _is_npu and memory_config.enable_hierarchical_cache:
         return False
+    if is_draft_worker or memory_config.enable_unified_cache_external_linker:
+        return False
+    if not memory_config.enable_hisparse:
+        return True
+
+    # Storage ownership is independent of the HiSparse prefetch plan. Drafts
+    # can run their own indexer, even when their top-k is sometimes shared.
+    indexer_types = getattr(hf_config, "indexer_types", None)
     return (
-        not memory_config.enable_hisparse
-        and not is_draft_worker
-        and not memory_config.enable_unified_cache_external_linker
+        envs.SGLANG_ENABLE_HISPARSE_INDEX_K_ELISION.get()
+        and _is_cuda
+        and not _is_npu
+        and getattr(hf_config, "model_type", None) == "glm_moe_dsa"
+        and isinstance(indexer_types, (list, tuple))
+        and len(indexer_types) == getattr(hf_config, "num_hidden_layers", 0)
+        and len(indexer_types) > 0
+        and indexer_types[0] == "full"
+        and all(kind in ("full", "shared") for kind in indexer_types)
+        and get_disagg().disaggregation_mode == "decode"
+        and get_parallel().pp_size == 1
+        and get_parallel().attn_cp_size == 1
+        and get_parallel().attn_dcp_size == 1
     )
 
 
 _is_hip = is_hip()
+_is_cuda = is_cuda()
 
 
 def _get_dsv4_compress_state_dtypes() -> tuple[torch.dtype, torch.dtype]:
@@ -2246,7 +2266,10 @@ class KVCacheConfigurator:
             PoolCls = dsa_pool_class
         if self.loc_space_scale > 1:
             pool_kwargs["dcp_replicated"] = True
-        if _should_elide_dsa_index_k(is_draft_worker=self.is_draft_worker):
+        if _should_elide_dsa_index_k(
+            is_draft_worker=self.is_draft_worker,
+            hf_config=self.model_config.hf_config,
+        ):
             pool_kwargs["skip_topk_layers"] = [
                 dsa_layer_skips_topk(self.model_config.hf_config, layer_id)
                 for layer_id in range(
@@ -2279,6 +2302,17 @@ class KVCacheConfigurator:
             use_fp4_indexer=get_exec().kernel.enable_fp4_indexer,
             **pool_kwargs,
         )
+        if isinstance(token_to_kv_pool, HiSparseDSATokenToKVPool):
+            active_layers = sum(not skip for skip in token_to_kv_pool.skip_topk_layers)
+            logger.info(
+                "HiSparse index-K layout: active_layers=%d/%d, logical_tokens=%d, "
+                "index_bytes=%d, elision_requested=%s",
+                active_layers,
+                token_to_kv_pool.layer_num,
+                token_to_kv_pool.index_buf_size,
+                sum(buf.nbytes for buf in token_to_kv_pool.index_k_with_scale_buffer),
+                envs.SGLANG_ENABLE_HISPARSE_INDEX_K_ELISION.get(),
+            )
         return token_to_kv_pool
 
     def _build_hybrid_mla_swa_kv_pool(

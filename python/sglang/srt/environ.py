@@ -763,6 +763,9 @@ class Envs:
     # Kill-switch for the shared-index (IndexShare) swap-in prefetch
     # (auto-enabled for GLM-5.2-style DSA); set True to A/B synchronous swap-in.
     SGLANG_DISABLE_HISPARSE_PREFETCH = EnvBool(False)
+    # Opt-in: omit unused shared-layer index-K on CUDA GLM IndexShare decode.
+    # Target KV and draft index-K remain allocated; see the pool policy gate.
+    SGLANG_ENABLE_HISPARSE_INDEX_K_ELISION = EnvBool(False)
     SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS = EnvBool(True)
     # Decode batches between SWA out-of-window evictions.
     SGLANG_SWA_EVICTION_INTERVAL = EnvInt(128)
