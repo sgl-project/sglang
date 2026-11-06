@@ -44,7 +44,7 @@ def _add_metrics_routes(app):
         CollectorRegistry,
         multiprocess,
     )
-    from prometheus_client.openmetrics.exposition import (
+    from prometheus_client.exposition import (
         CONTENT_TYPE_LATEST,
         generate_latest,
     )
