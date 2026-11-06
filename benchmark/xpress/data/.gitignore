@@ -1,0 +1,3 @@
+# Keep the small offline samples despite the repository-wide *.jsonl rule.
+!gsm8k_5shot_40.jsonl
+!math500_40.jsonl
