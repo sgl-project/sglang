@@ -100,7 +100,9 @@ class Serving(msgspec.Struct):
         "Start a locally managed sidecar against the native gRPC server. "
         "The selected module must expose main(argv) and read the resolved "
         "native gRPC endpoint from SGLANG_GRPC_ENDPOINT. Requires --grpc-port "
-        "or SGLANG_GRPC_PORT.",
+        "or SGLANG_GRPC_PORT. With SGLANG_RUST_SERVER, every node that hosts a "
+        "Rust listener runs one sidecar, with SGLANG_GRPC_ENDPOINT set to that "
+        "node's first listener (--grpc-port).",
     ] = None
     sidecar_args: A[
         Optional[List[str]],

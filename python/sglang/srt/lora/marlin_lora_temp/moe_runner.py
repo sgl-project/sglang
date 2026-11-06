@@ -209,6 +209,7 @@ def fused_experts_experimental_sgl_marlin_lora(
     lora_info,
 ) -> StandardCombineInput:
     from sglang.kernels.ops.lora.moe.trtllm_lora_temp.virtual_experts import (
+        _prewarm_per_expert_lora_routes,
         merged_experts_fused_moe_lora_add,
     )
     from sglang.srt.layers.moe.token_dispatcher.standard import (
@@ -233,7 +234,7 @@ def fused_experts_experimental_sgl_marlin_lora(
     hidden_states = dispatch_output.hidden_states
     topk_output = dispatch_output.topk_output
     topk_ids = topk_output.topk_ids
-    topk_weights = topk_output.topk_weights.masked_fill(topk_ids < 0, 0.0)
+    topk_weights = topk_output.topk_weights
     if (
         topk_ids.ndim != 2
         or topk_weights.shape != topk_ids.shape
@@ -345,8 +346,25 @@ def fused_experts_experimental_sgl_marlin_lora(
             != lora_info.gate_up_lora_b_weights.shape[-1]
         )
         # Allocate and prewarm on main; side streams launch kernels only.
-        gate_up_delta = hidden_states.new_zeros((M, topk, 2 * N))
-        if not direct_decode:
+        gate_up_delta = hidden_states.new_empty((M, topk, 2 * N))
+        paired_routing = (
+            factored_shared_outer
+            and not direct_decode
+            and _prewarm_per_expert_lora_routes(
+                hidden_states,
+                lora_info.down_lora_a_weights,
+                lora_info.gate_up_lora_b_weights,
+                topk_ids,
+                lora_info.token_lora_mapping,
+                routing_cache,
+                shrink_lora_b=lora_info.down_lora_b_weights,
+                adapter_enabled=lora_info.adapter_enabled,
+                include_inactive_routes=True,
+                local_expert_offset=0,
+                local_num_experts=E,
+            )
+        )
+        if not direct_decode and not paired_routing:
             merged_experts_fused_moe_lora_add(
                 output=gate_up_delta,
                 hidden_states=hidden_states,
@@ -359,7 +377,9 @@ def fused_experts_experimental_sgl_marlin_lora(
                 experts_shared_outer_loras_a=lora_info.experts_shared_outer_loras,
                 experts_shared_outer_loras_b=False,
                 routing_cache=routing_cache,
+                include_inactive_routes=True,
                 stage="routing",
+                adapter_enabled=lora_info.adapter_enabled,
                 prewarm_a_routing=not factored_shared_outer,
                 local_expert_offset=0,
                 local_num_experts=E,
@@ -380,7 +400,9 @@ def fused_experts_experimental_sgl_marlin_lora(
                 experts_shared_outer_loras_a=True,
                 experts_shared_outer_loras_b=False,
                 routing_cache=collapsed_routing_cache,
+                include_inactive_routes=True,
                 stage="routing",
+                adapter_enabled=lora_info.adapter_enabled,
                 prewarm_a_routing=True,
                 prewarm_b_routing=False,
                 local_expert_offset=0,
@@ -402,7 +424,7 @@ def fused_experts_experimental_sgl_marlin_lora(
             )
         )
         # Prewarm down routing and allocate its intermediate on main.
-        if not direct_decode:
+        if not direct_decode and not paired_routing:
             merged_experts_fused_moe_lora_add(
                 output=gate_up_delta,
                 hidden_states=hidden_states,
@@ -415,8 +437,10 @@ def fused_experts_experimental_sgl_marlin_lora(
                 experts_shared_outer_loras_a=False,
                 experts_shared_outer_loras_b=lora_info.experts_shared_outer_loras,
                 routing_cache=routing_cache,
+                include_inactive_routes=True,
                 stage="routing",
                 prewarm_b_routing=not factored_shared_outer,
+                adapter_enabled=lora_info.adapter_enabled,
                 local_expert_offset=0,
                 local_num_experts=E,
             )
@@ -436,8 +460,10 @@ def fused_experts_experimental_sgl_marlin_lora(
                 experts_shared_outer_loras_a=False,
                 experts_shared_outer_loras_b=True,
                 routing_cache=collapsed_routing_cache,
+                include_inactive_routes=True,
                 stage="routing",
                 prewarm_a_routing=False,
+                adapter_enabled=lora_info.adapter_enabled,
                 prewarm_b_routing=True,
                 local_expert_offset=0,
                 local_num_experts=E,
@@ -476,7 +502,9 @@ def fused_experts_experimental_sgl_marlin_lora(
                         experts_shared_outer_loras_a=True,
                         experts_shared_outer_loras_b=False,
                         routing_cache=collapsed_routing_cache,
+                        include_inactive_routes=True,
                         stage="shrink",
+                        adapter_enabled=lora_info.adapter_enabled,
                         prewarm_b_routing=False,
                         intermediate_buffer=gate_up_intermediate,
                         local_expert_offset=0,
@@ -495,6 +523,7 @@ def fused_experts_experimental_sgl_marlin_lora(
                         topk_ids,
                         lora_info.token_lora_mapping,
                         gate_up_delta,
+                        adapter_enabled=lora_info.adapter_enabled,
                     )
                     return
                 merged_experts_fused_moe_lora_add(
@@ -509,7 +538,9 @@ def fused_experts_experimental_sgl_marlin_lora(
                     experts_shared_outer_loras_a=True,
                     experts_shared_outer_loras_b=False,
                     routing_cache=routing_cache,
+                    include_inactive_routes=True,
                     fuse_add_to_output=False,
+                    adapter_enabled=lora_info.adapter_enabled,
                     use_direct_expand_add=True,
                     local_expert_offset=0,
                     local_num_experts=E,
@@ -530,7 +561,9 @@ def fused_experts_experimental_sgl_marlin_lora(
                 experts_shared_outer_loras_a=lora_info.experts_shared_outer_loras,
                 experts_shared_outer_loras_b=False,
                 routing_cache=routing_cache,
+                include_inactive_routes=True,
                 fuse_add_to_output=False,
+                adapter_enabled=lora_info.adapter_enabled,
                 use_direct_expand_add=use_direct_expand,
                 local_expert_offset=0,
                 local_num_experts=E,
@@ -552,7 +585,11 @@ def fused_experts_experimental_sgl_marlin_lora(
     # Start alignment after the side-stream fork. EP IDs are already localized;
     # the wrapper owns Marlin's extra sentinel bucket.
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-        topk_ids, block_size_m, E
+        topk_ids,
+        block_size_m,
+        E,
+        return_inactive_prefix_count=not ep_active,
+        map_invalid_experts_to_sentinel=False,
     )
 
     # A cached workspace can outlive its CUDA graph-private pool.
@@ -572,13 +609,9 @@ def fused_experts_experimental_sgl_marlin_lora(
     )
 
     # Stage 1: gate_up (marlin) — concurrent with the side-stream delta above.
-    projection_cache = torch.zeros(
-        (M * topk * (2 * N + K),),
-        device=hidden_states.device,
-        dtype=hidden_states.dtype,
+    intermediate_cache1 = torch.empty(
+        (M * topk, 2 * N), device=hidden_states.device, dtype=hidden_states.dtype
     )
-    intermediate_cache1 = projection_cache[: M * topk * 2 * N].view(-1, 2 * N)
-    intermediate_cache3 = projection_cache[M * topk * 2 * N :].view(-1, K)
     intermediate_cache1 = moe_wna16_marlin_gemm(
         hidden_states,
         intermediate_cache1,
@@ -597,7 +630,10 @@ def fused_experts_experimental_sgl_marlin_lora(
         moe_block_size=block_size_m,
         top_k=topk,
         mul_topk_weights=False,
+        zero_inactive_output=True,
         is_ep=ep_active,
+        expert_ids_are_sorted=not ep_active,
+        has_inactive_prefix_count=not ep_active,
         b_q_type=scalar_type1,
         size_m=M,
         size_n=2 * N,
@@ -616,6 +652,8 @@ def fused_experts_experimental_sgl_marlin_lora(
     if run_lora:
         if lora_event is not None:
             torch.cuda.current_stream().wait_event(lora_event)
+        # Both private producers define dropped routes as zero; the runtime
+        # activation therefore needs no routing or adapter metadata reads.
         silu_and_mul_add_delta(
             intermediate_cache1.view(-1, 2 * N),
             gate_up_delta.view(-1, 2 * N),
@@ -641,6 +679,7 @@ def fused_experts_experimental_sgl_marlin_lora(
                         topk_ids,
                         lora_info.token_lora_mapping,
                         down_intermediate,
+                        adapter_enabled=lora_info.adapter_enabled,
                     )
                 else:
                     merged_experts_fused_moe_lora_add(
@@ -655,7 +694,9 @@ def fused_experts_experimental_sgl_marlin_lora(
                         experts_shared_outer_loras_a=False,
                         experts_shared_outer_loras_b=lora_info.experts_shared_outer_loras,
                         routing_cache=routing_cache,
+                        include_inactive_routes=True,
                         stage="shrink",
+                        adapter_enabled=lora_info.adapter_enabled,
                         prewarm_b_routing=not factored_shared_outer,
                         intermediate_buffer=down_intermediate,
                         local_expert_offset=0,
@@ -673,6 +714,8 @@ def fused_experts_experimental_sgl_marlin_lora(
                         down_rank_sum,
                         routed_scaling_factor,
                         block_m=_weighted_rank_sum_block_m(M),
+                        topk_ids=topk_ids,
+                        inactive_ranks_are_zero=True,
                     )
                 down_shrink_done.record()
             if torch.cuda.is_current_stream_capturing():
@@ -682,6 +725,9 @@ def fused_experts_experimental_sgl_marlin_lora(
         silu_and_mul(intermediate_cache1.view(-1, 2 * N), intermediate_cache2)
 
     # Stage 3: down (marlin).
+    intermediate_cache3 = torch.empty(
+        (M * topk, K), device=hidden_states.device, dtype=hidden_states.dtype
+    )
 
     intermediate_cache3 = moe_wna16_marlin_gemm(
         intermediate_cache2,
@@ -701,7 +747,10 @@ def fused_experts_experimental_sgl_marlin_lora(
         moe_block_size=block_size_m,
         top_k=1,
         mul_topk_weights=True,
+        zero_inactive_output=True,
         is_ep=ep_active,
+        expert_ids_are_sorted=not ep_active,
+        has_inactive_prefix_count=not ep_active,
         b_q_type=scalar_type2,
         size_m=M * topk,
         size_n=K,
@@ -723,6 +772,7 @@ def fused_experts_experimental_sgl_marlin_lora(
                     topk_ids,
                     lora_info.token_lora_mapping,
                     down_intermediate,
+                    adapter_enabled=lora_info.adapter_enabled,
                 )
             else:
                 down_intermediate.zero_()
@@ -738,7 +788,9 @@ def fused_experts_experimental_sgl_marlin_lora(
                     experts_shared_outer_loras_a=False,
                     experts_shared_outer_loras_b=True,
                     routing_cache=routing_cache,
+                    include_inactive_routes=True,
                     stage="shrink",
+                    adapter_enabled=lora_info.adapter_enabled,
                     prewarm_b_routing=False,
                     intermediate_buffer=down_intermediate,
                     local_expert_offset=0,
@@ -760,7 +812,9 @@ def fused_experts_experimental_sgl_marlin_lora(
             experts_shared_outer_loras_a=False,
             experts_shared_outer_loras_b=lora_info.experts_shared_outer_loras,
             routing_cache=routing_cache,
+            include_inactive_routes=True,
             local_expert_offset=0,
+            adapter_enabled=lora_info.adapter_enabled,
             local_num_experts=E,
             zero_intermediate=lora_info.experts_shared_outer_loras,
         )
@@ -782,6 +836,7 @@ def fused_experts_experimental_sgl_marlin_lora(
                 output,
                 routed_scaling_factor,
                 block_k=64,
+                topk_ids=topk_ids,
             )
         else:
             tail_block_m, tail_block_k = fused_base_shared_lora_reduce_config(M)
@@ -794,6 +849,7 @@ def fused_experts_experimental_sgl_marlin_lora(
                 routed_scaling_factor,
                 block_m=tail_block_m,
                 block_k=tail_block_k,
+                topk_ids=topk_ids,
             )
     elif routed_scaling_factor == 1.0 and M <= 512:
         torch.sum(intermediate_cache3, dim=1, out=output)
@@ -810,6 +866,8 @@ def fused_experts_experimental_sgl_marlin_lora(
                 down_rank_sum,
                 routed_scaling_factor,
                 block_m=_weighted_rank_sum_block_m(M),
+                topk_ids=topk_ids,
+                inactive_ranks_are_zero=True,
             )
         else:
             # Wait only at the shared-B consumer.
@@ -830,7 +888,9 @@ def fused_experts_experimental_sgl_marlin_lora(
                 experts_shared_outer_loras_a=False,
                 experts_shared_outer_loras_b=True,
                 routing_cache=collapsed_routing_cache,
+                include_inactive_routes=True,
                 fuse_add_to_output=True,
+                adapter_enabled=lora_info.adapter_enabled,
                 use_direct_expand_add=False,
                 local_expert_offset=0,
                 local_num_experts=E,
@@ -854,8 +914,10 @@ def fused_experts_experimental_sgl_marlin_lora(
             experts_shared_outer_loras_a=False,
             experts_shared_outer_loras_b=lora_info.experts_shared_outer_loras,
             routing_cache=routing_cache,
+            include_inactive_routes=True,
             fuse_add_to_output=False,
             fuse_sum_all_reduce=True,
+            adapter_enabled=lora_info.adapter_enabled,
             use_direct_expand_add=lora_info.max_lora_rank <= 64,
             local_expert_offset=0,
             local_num_experts=E,

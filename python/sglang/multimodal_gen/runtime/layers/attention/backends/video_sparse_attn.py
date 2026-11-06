@@ -7,10 +7,12 @@ from dataclasses import dataclass
 
 import torch
 
-try:
-    from vsa import video_sparse_attn
-except ImportError:
-    video_sparse_attn = None
+video_sparse_attn = None
+if torch.cuda.is_available():
+    try:
+        from vsa import video_sparse_attn
+    except ImportError:
+        pass
 
 from typing import Any
 

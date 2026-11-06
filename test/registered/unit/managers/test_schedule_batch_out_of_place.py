@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
@@ -21,18 +21,35 @@ from sglang.srt.managers.schedule_batch import (  # noqa: E402
 from sglang.srt.managers.scheduler_components.batch_result_processor import (  # noqa: E402
     SchedulerBatchResultProcessor,
 )
-from sglang.srt.model_executor.forward_batch_info import (  # noqa: E402
-    CaptureHiddenMode,
-    ForwardBatch,
-    ForwardMode,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.runtime_context import get_context  # noqa: E402
 from sglang.srt.sampling.sampling_params import SamplingParams  # noqa: E402
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm  # noqa: E402
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 AUTO_FILL_EXCLUDED_FIELDS = ["reqs"]
+
+
+class TestScheduleBatchCopy(CustomTestCase):
+    def test_the_copy_carries_the_token_allocator(self):
+        """Lazy Mamba tracking releases slots through the result batch's allocator;
+        the copy must retain it along with the request table."""
+        allocator = types.SimpleNamespace(state_slots=types.SimpleNamespace())
+        table = types.SimpleNamespace()
+        batch = ScheduleBatch(
+            reqs=[],
+            req_to_token_pool=table,
+            token_to_kv_pool_allocator=allocator,
+            model_config=types.SimpleNamespace(is_encoder_decoder=False),
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+            req_pool_indices=torch.zeros(0, dtype=torch.int64),
+            req_pool_indices_cpu=torch.zeros(0, dtype=torch.int64),
+        )
+        copy = batch.copy()
+        self.assertIs(copy.token_to_kv_pool_allocator, allocator)
+        self.assertIs(copy.req_to_token_pool, table)
 
 
 class TestCachedPrefixTierAttribution(unittest.TestCase):
@@ -159,7 +176,7 @@ class TestForwardBatchPrefillCompletion(unittest.TestCase):
             model_config=types.SimpleNamespace(
                 requires_mm_token_modalities=False, model_is_mrope=False
             ),
-            kv_index_translator=MagicMock(),
+            runner_ids=MagicMock(),
             prefill_attention_backend_str="torch_native",
             ngram_embedding_manager=types.SimpleNamespace(enabled=False),
             lora_manager=None,
@@ -268,10 +285,16 @@ class TestForwardBatchPrefillCompletion(unittest.TestCase):
                         int(forward.orig_seq_lens[i]),
                     )
                 self.assertEqual(forward.contains_last_prefill_chunk, completing)
+                final_extends = [completing, True] if mixed else [completing]
+                self.assertEqual(forward.extend_is_final_cpu, final_extends)
                 incoming.extend_end = 4 if completing else 8 + output_len
                 self.assertEqual(forward.contains_last_prefill_chunk, completing)
+                self.assertEqual(forward.extend_is_final_cpu, final_extends)
                 self.assertEqual(
                     dataclasses.replace(forward).contains_last_prefill_chunk, completing
+                )
+                self.assertEqual(
+                    dataclasses.replace(forward).extend_is_final_cpu, final_extends
                 )
 
 

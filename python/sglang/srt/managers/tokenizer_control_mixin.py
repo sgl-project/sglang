@@ -10,7 +10,8 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import fastapi
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.communicator import FanOutCommunicator
 from sglang.srt.managers.io_struct import (
     AddExternalCorpusReqInput,
@@ -38,6 +39,8 @@ from sglang.srt.managers.io_struct import (
     ExpertDistributionReqType,
     FlushCacheReqInput,
     FlushCacheReqOutput,
+    GetHiCacheL3LayoutReq,
+    GetHiCacheL3LayoutReqOutput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
     GetWeightsByNameReqInput,
@@ -61,6 +64,7 @@ from sglang.srt.managers.io_struct import (
     ProfileReqType,
     ReleaseMemoryOccupationReqInput,
     ReleaseMemoryOccupationReqOutput,
+    ReleaseUocrDocReqInput,
     RemoveExternalCorpusReqInput,
     RemoveExternalCorpusReqOutput,
     ResumeMemoryOccupationReqInput,
@@ -84,6 +88,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightVersionReqOutput,
 )
 from sglang.srt.managers.load_snapshot import LoadSnapshot
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_disagg,
     get_lora,
@@ -91,7 +96,6 @@ from sglang.srt.runtime_context import (
     get_serving,
     get_spec,
 )
-from sglang.srt.server_args import LoRARef
 from sglang.srt.utils import (
     get_bool_env_var,
     normalize_serialized_named_tensor_payloads,
@@ -135,6 +139,7 @@ _COMMUNICATOR_SPECS = [
     ("profile", ProfileReqOutput),
     ("get_internal_state", GetInternalStateReqOutput),
     ("set_internal_state", SetInternalStateReqOutput),
+    ("get_hicache_l3_cache_layout", GetHiCacheL3LayoutReqOutput),
     ("expert_distribution", ExpertDistributionReqOutput),
     ("begin_weight_update", BeginWeightUpdateReqOutput),
     ("end_weight_update", EndWeightUpdateReqOutput),
@@ -402,6 +407,7 @@ class TokenizerControlMixin:
         self.auto_create_handle_loop()
         req = req or ProfileReq()
         req.req_type = ProfileReqType.START_PROFILE
+        current_platform.apply_profile_request_defaults(req)
         env_with_stack: bool = get_bool_env_var("SGLANG_PROFILE_WITH_STACK", "true")
         req.with_stack = (
             False if req.with_stack is False or env_with_stack is False else True
@@ -970,6 +976,16 @@ class TokenizerControlMixin:
         # Many DP ranks
         return [res.internal_state for res in responses]
 
+    async def get_hicache_l3_cache_layout(
+        self: TokenizerManager,
+    ) -> List[Dict[Any, Any]]:
+        self.auto_create_handle_loop()
+        req = GetHiCacheL3LayoutReq()
+        responses: List[
+            GetHiCacheL3LayoutReqOutput
+        ] = await self.get_hicache_l3_cache_layout_communicator(req)
+        return [res.layout for res in responses]
+
     async def set_internal_state(
         self: TokenizerManager, obj: SetInternalStateReq
     ) -> List[bool]:
@@ -1048,6 +1064,14 @@ class TokenizerControlMixin:
         request: Optional[fastapi.Request] = None,
     ):
         await self._async_dispatch_to_scheduler(obj)
+
+    def release_uocr_doc(self: TokenizerManager, doc_id: str) -> None:
+        """Tell the scheduler to free a split document's retained window.
+
+        Sync because it is also called from a `finally` while the handler is
+        being cancelled.
+        """
+        self._dispatch_to_scheduler(ReleaseUocrDocReqInput(doc_id=doc_id))
 
     async def update_weight_version(
         self: TokenizerManager, obj: UpdateWeightVersionReqInput

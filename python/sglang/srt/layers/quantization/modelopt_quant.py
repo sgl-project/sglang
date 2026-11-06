@@ -677,6 +677,7 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
                 weight_scale=layer.weight_scale,
                 input_scale=layer.input_scale,
                 bias=bias,
+                pre_quant_output_dtype=layer.orig_dtype,
             )
         return apply_fp8_linear(
             input=x,
@@ -685,6 +686,7 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
             input_scale=layer.input_scale,
             bias=bias,
             cutlass_fp8_supported=self.cutlass_fp8_supported,
+            pre_quant_output_dtype=layer.orig_dtype,
         )
 
 
@@ -2369,7 +2371,12 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
     def __init__(self, quant_config: ModelOptFp4Config):
         self.quant_config = quant_config
         moe_runner_backend = get_moe_runner_backend()
-        if moe_runner_backend.is_auto() and is_cuda():
+        self._lora_marlin = moe_runner_backend.is_lora_marlin()
+        if moe_runner_backend.is_lora() and not self._lora_marlin:
+            raise ValueError(
+                "NVFP4 MoE LoRA requires --moe-runner-backend lora_marlin."
+            )
+        if (moe_runner_backend.is_auto() or moe_runner_backend.is_lora()) and is_cuda():
             capability = get_device_capability()
             use_marlin_fallback = (8, 0) <= capability < (10, 0)
         else:
@@ -2727,6 +2734,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         moe_runner_backend = getattr(
             self, "_moe_runner_backend", get_moe_runner_backend()
         )
+        if moe_runner_backend.is_lora_marlin():
+            moe_runner_backend = MoeRunnerBackend.MARLIN
         use_nvfp4_dispatch = _use_nvfp4_dispatch()
         if moe_runner_backend.is_marlin():
             # Marlin supports only a single shared w1/w3 weight scale, so collapse
@@ -3122,6 +3131,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             self.runner = None
             return
 
+        if moe_runner_backend.is_lora():
+            self.runner = None
+            return
+
         if moe_runner_backend.is_flashinfer_cutedsl():
             import sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl  # noqa: F401 – triggers @register_fused_func
 
@@ -3196,6 +3209,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             and (
                 moe_runner_backend.is_flashinfer_trtllm()
                 or moe_runner_backend.is_flashinfer_megamoe()
+                or self._is_cutedsl_v2_standard
             )
         ), f"{activation=} is unsupported by {moe_runner_backend}"
 
