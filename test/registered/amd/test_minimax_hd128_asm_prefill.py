@@ -56,8 +56,9 @@ class TestMiniMaxHD128AsmPrefill(unittest.TestCase):
         backend.k_scale = torch.ones(1, device=device)
         backend.v_scale = torch.ones(1, device=device)
         backend.qo_indptr = cu_q
+        layer_kv = SimpleNamespace(kv=lambda: (k_cache, v_cache))
         backend.token_to_kv_pool = SimpleNamespace(
-            get_kv_buffer=lambda _: (k_cache, v_cache)
+            layer_router=SimpleNamespace(read=lambda _layer_id: layer_kv)
         )
         backend.forward_metadata = self.ab.ForwardMetadata(
             kv_indptr=cu_k,
