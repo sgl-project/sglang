@@ -728,7 +728,9 @@ class DeepseekSparseAttnBackend(
                 "Disabling fused DSA top-k for IndexShare under PD disaggregation."
             )
         if self.dsa_shards_index_k:
-            max_rows = max(model_runner.max_running_requests, 1)
+            max_rows = max(model_runner.max_running_requests, 1) * max(
+                self.speculative_num_draft_tokens or 1, 1
+            )
             # The fused merge returns only this rank's slots; top-k capture needs all.
             if (
                 get_exec().features.enable_return_indexer_topk
@@ -1020,7 +1022,7 @@ class DeepseekSparseAttnBackend(
             and get_platform().is_sm100
             and not envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
         )
-        if forward_mode.is_target_verify() and self.attn_dcp_size > 1:
+        if forward_mode.is_target_verify() and self.dsa_shards_index_k:
             # DCP: each verify row scores this rank's share of its causal length,
             # laid out [B, next_n] for DG-native (one index-K read per request).
             lens = _to_2d_context_lens(seqlens_expanded, batch_size)
@@ -2018,7 +2020,7 @@ class DeepseekSparseAttnBackend(
                 if (
                     self.speculative_num_draft_tokens >= 2
                     and get_platform().is_sm100
-                    and self.attn_dcp_size == 1
+                    and not self.dsa_shards_index_k
                     and metadata.paged_mqa_ctx_lens_2d is not None
                     and metadata.paged_mqa_ctx_lens_2d.dim() == 2
                     and metadata.paged_mqa_ctx_lens_2d.size(0) == bs
@@ -2390,7 +2392,10 @@ class DeepseekSparseAttnBackend(
 
         # Do absorbed multi-latent attention (MLA path)
         kv_cache = self.kv_layers.read(layer.layer_id).key()
-        if self.dsa_shards_index_k:
+        if (
+            self.dsa_shards_index_k
+            and not forward_batch.forward_mode.is_target_verify()
+        ):
             kv_cache = self.dcp_gather_kv_cache(kv_cache, forward_batch, metadata)
 
         if q_rope is not None:
@@ -2642,7 +2647,7 @@ class DeepseekSparseAttnBackend(
                 layer=layer,
                 metadata=metadata,
                 page_table_1=page_table_1,
-                dcp_partial=self.attn_dcp_size > 1
+                dcp_partial=self.dsa_shards_index_k
                 and forward_batch.forward_mode.is_target_verify(),
             )
         elif dsa_impl == "fa3":
