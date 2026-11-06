@@ -2082,7 +2082,7 @@ class Scheduler(
             # stream aliases forward_stream, which would eliminate scheduler
             # overlap. Only CUDA/HIP streams expose a ``cuda_stream`` handle;
             # other accelerators (e.g. NPU/XPU) skip the alias check.
-            if get_exec().kernel.monokernel_backend is not None:
+            if get_exec().kernel.enable_amd_monokernel:
                 # A monokernel launch needs every one of its workgroups resident at
                 # once (they wait on each other); a kernel on another stream that
                 # takes a CU while one is dispatched can leave it waiting forever.

@@ -372,7 +372,6 @@ for _mod, _fn, _desc in _MUSE_SPARK_GFX950_KERNELS:
             backend=KernelBackend.TRITON,
             target=f"sglang.kernels.ops.moe.{_mod}:{_fn}",
             capabilities=frozenset({CapabilityRequirement.HIP}),
-            description=_desc,
         )
     )
 del _mod, _fn, _desc

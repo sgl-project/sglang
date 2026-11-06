@@ -1734,7 +1734,7 @@ def _prepare_prefill_fp8_projections(moe: MuseSpark1xMoE) -> None:
 def _monokernel_backend() -> str | None:
     if not get_context().is_config_namespace_published("exec"):
         return None
-    return get_exec().kernel.monokernel_backend
+    return "amd" if get_exec().kernel.enable_amd_monokernel else None
 
 
 def _a4w4_keeps_native(experts: list) -> bool:

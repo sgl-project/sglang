@@ -8,6 +8,7 @@ from sglang.kernels.registry import register_kernel
 from sglang.kernels.selector import get_kernel
 from sglang.kernels.spec import (
     CUDA_ONLY,
+    CapabilityRequirement,
     KernelBackend,
     KernelSpec,
 )
@@ -178,7 +179,6 @@ for _mod, _fn, _desc in _MUSE_SPARK_GFX950_KERNELS:
             backend=KernelBackend.TRITON,
             target=f"sglang.kernels.ops.quantization.{_mod}:{_fn}",
             capabilities=frozenset({CapabilityRequirement.HIP}),
-            description=_desc,
         )
     )
 del _mod, _fn, _desc
