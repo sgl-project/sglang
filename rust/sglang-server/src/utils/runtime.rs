@@ -330,6 +330,7 @@ fn notify_drained(name: &str) {
 /// [`HttpLayer`]). Returns once threads are spawned (non-blocking).
 /// `Err` on a startup misconfiguration (e.g. no tokenizer for a non-skip server).
 pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtime, String> {
+    crate::message::info::InternalState::check_registered_keys(&cfg.server_info_state_keys)?;
     let (shutdown_tx, shutdown_rx) = flume::unbounded::<()>();
     let (startup_failure_tx, startup_failure_rx) = flume::bounded::<String>(1);
     let mut threads = Vec::new();
@@ -527,7 +528,8 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
                 cfg.server_args.deployment_info.dp_rank.unwrap_or(0),
                 &cfg.server_args.api_keys,
             )?,
-            metadata: crate::api_server::handlers::CoreMetadata::from(cfg.server_args.as_ref()),
+            metadata: crate::api_server::handlers::CoreMetadata::from(cfg.server_args.as_ref())
+                .with_server_info_state_keys(cfg.server_info_state_keys.clone()),
             metrics,
             request_log: crate::api_server::core::RequestLog::from_server_args(&cfg.server_args),
             generate_validator: cfg.generate_validator.clone(),
@@ -683,6 +685,31 @@ mod tests {
             server_args: Arc::new(test_server_args()),
             generate_hook: None,
             generate_validator: None,
+            server_info_state_keys: Vec::new(),
+        }
+    }
+
+    /// A registered `/server_info` state key that names a field it already
+    /// reports, or one registered twice, fails startup before anything runs.
+    #[test]
+    fn start_rejects_colliding_server_info_state_keys() {
+        for (keys, problem) in [
+            (
+                ["package_state", "memory_usage"],
+                r#""memory_usage" names a field /server_info already reports"#,
+            ),
+            (
+                ["package_state", "package_state"],
+                r#""package_state" is registered twice"#,
+            ),
+        ] {
+            let (http_addr, _) = free_loopback_addrs();
+            let cfg = RuntimeConfig {
+                server_info_state_keys: keys.map(String::from).to_vec(),
+                ..test_config(http_addr, None)
+            };
+            let error = start(cfg, None).err().expect("startup must fail");
+            assert!(error.contains(problem), "{error}");
         }
     }
 
@@ -1196,6 +1223,7 @@ mod tests {
             server_args: Arc::new(server_args),
             generate_hook: None,
             generate_validator: None,
+            server_info_state_keys: Vec::new(),
         };
         // Bind is synchronous in `start`, so the port is already accepting.
         let rt = start(cfg, None).expect("start runtime");
@@ -1345,6 +1373,7 @@ mod tests {
             server_args: Arc::new(server_args),
             generate_hook: None,
             generate_validator: None,
+            server_info_state_keys: Vec::new(),
         };
         let rt = start(cfg, None).expect("start runtime");
 
@@ -1421,6 +1450,7 @@ mod tests {
             server_args: Arc::new(server_args),
             generate_hook: None,
             generate_validator: None,
+            server_info_state_keys: Vec::new(),
         };
         let rt = start(cfg, None).expect("start runtime");
 
@@ -1828,6 +1858,7 @@ mod tests {
             server_args: Arc::new(server_args),
             generate_hook: None,
             generate_validator: None,
+            server_info_state_keys: Vec::new(),
         };
         let err = match start(cfg, None) {
             Ok(_) => panic!("bind conflict must fail startup, got Ok"),
