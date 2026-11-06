@@ -11,10 +11,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Verified engine-host encoded cache and rank-owned direct-DE host arenas.
+"""Verified engine-host encoded cache and rank-owned pinned input arenas.
 
 Encoded publication files are shared through tmpfs. Each scheduler unwraps Zstd
-or copies plain LZ4 into its own original CUDA HOST_NUMA allocation.
+or copies unwrapped inner frames into DE-capable or ordinary pinned storage.
 """
 
 import fcntl
@@ -35,18 +35,19 @@ import numpy as np
 import orjson
 
 from sglang.srt.weight_sync.gpu_delta import profiling
-from sglang.srt.weight_sync.gpu_delta.memory import HostAllocation
+from sglang.srt.weight_sync.gpu_delta.memory import HostAllocation, PinnedHostAllocation
 
 
 def validate_codec(manifest):
     """Admit the authenticated publication codec before examining any tensor payload."""
     if (
-        manifest.get("codec") not in {"snappy-zstd", "lz4-zstd", "lz4"}
+        manifest.get("codec")
+        not in {"snappy-zstd", "lz4-zstd", "lz4", "bitcomp", "bitcomp-zstd"}
         or type(manifest.get("frame_bytes")) is not int
         or not 0 < manifest["frame_bytes"] <= 4 << 20
     ):
         raise ValueError(
-            "GPU delta requires a snappy-zstd, lz4-zstd or lz4 codec "
+            "GPU delta requires snappy-zstd, lz4-zstd, lz4, bitcomp or bitcomp-zstd "
             "and an integer frame size in (0, 4 MiB]"
         )
 
@@ -345,7 +346,7 @@ def _copy_group(jobs, destination, files, pool):
 def _prepare_arena(destination, layout, files, entries, pool, metrics, codec):
     started = time.perf_counter()
     jobs, futures, error = [], [], None
-    if codec == "lz4":
+    if not codec.endswith("-zstd"):
         worker, phase = _copy_group, "host_rank_encoded_copy_s"
     else:
         worker, phase = _decode_zstd_group, "host_rank_outer_zstd_decode_s"
@@ -408,7 +409,7 @@ def _map_files(directory, encoded, definitions):
 
 
 class HostArena:
-    """Persistent rank-owned DE storage with an engine-host encoded cache.
+    """Persistent rank-owned input storage with an engine-host encoded cache.
 
     The original engine cohort shares encoded files under each publication's hash
     policy. Successful all-rank apply/resume permits the next publication to
@@ -419,6 +420,7 @@ class HostArena:
         self.engine_id, self.device = engine_id, device
         self.allocation = self.mapping = self.tensor = None
         self.capacity = None
+        self.hardware = None
         self.directory = None
         self.tensor_order = None
 
@@ -426,10 +428,14 @@ class HostArena:
     def root(self):
         return _cache_root(self.engine_id)
 
-    def _reserve_rank_arena(self, size, metrics):
+    def _reserve_rank_arena(self, size, metrics, hardware=True):
         import torch
 
-        if self.capacity is not None and size <= self.capacity["capacity"]:
+        if (
+            self.capacity is not None
+            and size <= self.capacity["capacity"]
+            and hardware == self.hardware
+        ):
             metrics["host_rank_mapping_reused"] = 1
             return
         previous = self.capacity
@@ -440,9 +446,16 @@ class HostArena:
             * _CAPACITY_ALIGNMENT
         )
         started = time.perf_counter()
-        allocation = HostAllocation(capacity, self.device) if capacity else None
+        allocation = None
+        if capacity:
+            allocation = (
+                HostAllocation(capacity, self.device)
+                if hardware
+                else PinnedHostAllocation(capacity)
+            )
         self.close()
         self.allocation = allocation
+        self.hardware = hardware
         self.mapping = allocation.view if allocation is not None else None
         self.tensor = (
             torch.frombuffer(self.mapping, dtype=torch.uint8)
@@ -626,7 +639,7 @@ class HostArena:
         return index, files
 
     @profiling.annotate("gpu_delta.host.prepare_local")
-    def prepare_local(self, index, files, local_entries, pool, timings):
+    def prepare_local(self, index, files, local_entries, pool, timings, hardware=True):
         """Prepare local payloads; the caller retains file views until this returns."""
         metrics = {
             name: 0
@@ -651,7 +664,7 @@ class HostArena:
         entries = [local_entries[i] for i in self.tensor_order]
         layout, size = _tensor_layout(entries)
         metrics["host_rank_layout_s"] = time.perf_counter() - layout_started
-        self._reserve_rank_arena(size, metrics)
+        self._reserve_rank_arena(size, metrics, hardware)
         prepare_started = time.perf_counter()
         _prepare_arena(
             self.mapping if self.mapping is not None else memoryview(b""),
@@ -681,7 +694,7 @@ class HostArena:
 
 
 class HostPreparedSnapshot:
-    """One publication's local views, retaining backend-owned DE host storage."""
+    """One publication's local views, retaining backend-owned pinned host storage."""
 
     def __init__(self, arena, index, records):
         self.arena, self.records = arena, records

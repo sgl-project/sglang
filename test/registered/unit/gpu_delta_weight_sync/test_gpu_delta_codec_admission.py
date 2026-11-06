@@ -35,29 +35,41 @@ def _frame_table(batches):
 
 
 @pytest.mark.parametrize(
-    "name,algorithm,options_type,reserved_offset",
+    "name,algorithm,options_type,reserved_offset,capability,hardware",
     [
-        ("snappy", "Snappy", codec._SnappyOptions, 8),
-        ("lz4", "LZ4", codec._Lz4Options, 16),
+        ("snappy", "Snappy", codec._SnappyOptions, 8, (10, 0), True),
+        ("lz4", "LZ4", codec._Lz4Options, 16, (10, 3), True),
+        ("snappy", "Snappy", codec._SnappyOptions, 8, (9, 0), False),
+        ("lz4", "LZ4", codec._Lz4Options, 16, (9, 0), False),
+        ("bitcomp", "Bitcomp", codec._BitcompOptions, 4, (10, 3), False),
+        ("bitcomp", "Bitcomp", codec._BitcompOptions, 4, (9, 0), False),
     ],
 )
 @pytest.mark.parametrize("sorting", ["0", "1"])
 def test_codec_abi_and_frozen_hardware_options(
-    monkeypatch, name, algorithm, options_type, reserved_offset, sorting
+    monkeypatch,
+    name,
+    algorithm,
+    options_type,
+    reserved_offset,
+    capability,
+    hardware,
+    sorting,
 ):
     # Match nvCOMP 6 shared_types.h, snappy.h and lz4.h. In particular, LZ4
     # inserts two enums before reserved bytes despite both structs being 64B.
     assert ctypes.sizeof(options_type) == 64
     assert ctypes.alignment(options_type) == ctypes.alignment(ctypes.c_int)
     assert options_type.backend.offset == 0
-    assert options_type.sort_before_hw_decompress.offset == 4
+    if name != "bitcomp":
+        assert options_type.sort_before_hw_decompress.offset == 4
     assert options_type.reserved.offset == reserved_offset
     if name == "lz4":
         assert options_type.data_type.offset == 8
         assert options_type.bitshuffle_mode.offset == 12
     monkeypatch.setenv("GPU_DELTA_SORT_BEFORE_HW_DECOMPRESS", sorting)
     calls, device_queries = [], []
-    attributes = {136: {"Snappy": 2, "LZ4": 4}[algorithm], 137: 4 << 20}
+    attributes = {136: {"Snappy": 2, "LZ4": 4, "Bitcomp": 0}[algorithm], 137: 4 << 20}
 
     def device_attribute(attribute, device):
         device_queries.append((attribute, device))
@@ -113,6 +125,7 @@ def test_codec_abi_and_frozen_hardware_options(
     monkeypatch.setattr(codec.ctypes, "CDLL", load_library)
     monkeypatch.setattr(torch.version, "cuda", "13.0")
     monkeypatch.setattr(torch.cuda, "device", lambda _: nullcontext())
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: capability)
     for allocator_api in (
         "get_allocator_backend",
         "_snapshot",
@@ -124,10 +137,14 @@ def test_codec_abi_and_frozen_hardware_options(
             lambda *a: pytest.fail("global allocator access"),
         )
     decoder = codec.NvcompDecoder(torch.device("cuda", 0), name)
-    assert decoder.inner_codec == name and decoder.backend == "hardware"
-    assert decoder.maximum_chunk_bytes == 4 << 20
-    assert decoder._options.backend == 1
-    assert decoder._options.sort_before_hw_decompress == int(sorting)
+    assert decoder.inner_codec == name
+    assert decoder.backend == ("hardware" if hardware else "cuda")
+    assert decoder.maximum_chunk_bytes == ((4 << 20) if hardware else codec._INT64_MAX)
+    assert decoder._options.backend == (1 if hardware else 2)
+    if name != "bitcomp":
+        assert decoder._options.sort_before_hw_decompress == (
+            int(sorting) if hardware else 0
+        )
     assert bytes(decoder._options)[8:] == bytes(56)
     align_function = functions[
         f"nvcompBatched{algorithm}DecompressGetRequiredAlignments"
@@ -164,18 +181,19 @@ def test_codec_abi_and_frozen_hardware_options(
     ]
     assert calls[0][1] == calls[1][1]
     assert decoder.temporary_bytes(geometry, 7) == 64
-    assert device_queries == [(136, 0), (137, 0)]
+    assert device_queries == ([(136, 0), (137, 0)] if hardware else [])
     # Allocation capability alone does not prove this codec exists. Frame
     # lengths are checked against the cached device limit during preparation.
-    attributes[136] = 0
-    with pytest.raises(RuntimeError, match="no hardware"):
-        codec.NvcompDecoder(decoder.device, name)
-    attributes[136] = {"Snappy": 2, "LZ4": 4}[algorithm]
-    attributes[137] = 1 << 20
-    assert codec.NvcompDecoder(decoder.device, name).maximum_chunk_bytes == 1 << 20
-    attributes[137] = 0
-    with pytest.raises(RuntimeError, match="positive hardware decompression limit"):
-        codec.NvcompDecoder(decoder.device, name)
+    if hardware:
+        attributes[136] = 0
+        with pytest.raises(RuntimeError, match="no hardware"):
+            codec.NvcompDecoder(decoder.device, name)
+        attributes[136] = {"Snappy": 2, "LZ4": 4}[algorithm]
+        attributes[137] = 1 << 20
+        assert codec.NvcompDecoder(decoder.device, name).maximum_chunk_bytes == 1 << 20
+        attributes[137] = 0
+        with pytest.raises(RuntimeError, match="positive hardware decompression limit"):
+            codec.NvcompDecoder(decoder.device, name)
     distribution.version = "5.3.0.16"
     with pytest.raises(RuntimeError, match="nvCOMP 6 ABI"):
         codec.NvcompDecoder(decoder.device, name)
@@ -226,6 +244,7 @@ def test_prepared_stream_scratch_and_slot_status_ownership(monkeypatch):
     # requirements without a device. Native tests cover actual DE and ring reuse.
     decoder = object.__new__(codec.NvcompDecoder)
     decoder.device = torch.device("cpu")
+    decoder.backend = "hardware"
     decoder.alignments = codec._Alignments(16, 16, 16)
     decoder._options = codec._SnappyOptions()
     decoder.temporary_bytes = lambda geometry, stream: geometry[0] * 13
@@ -310,6 +329,7 @@ def test_host_input_plans_reject_invalid_geometry_before_device_work(monkeypatch
     # vector arithmetic and output-lease failures here without a fake CUDA API.
     decoder = object.__new__(codec.NvcompDecoder)
     decoder.device = torch.device("cpu")
+    decoder.backend = "hardware"
     decoder.inner_codec = "snappy"
     decoder.maximum_chunk_bytes = 4 << 20
     decoder.alignments = codec._Alignments(16, 16, 16)
@@ -386,10 +406,32 @@ def test_host_input_plans_reject_invalid_geometry_before_device_work(monkeypatch
         assert not plan.decoded_slots
 
 
+def test_cuda_input_packing_preserves_frame_bytes_and_alignment():
+    # Reordered, duplicate and disjoint frames must share merged H2D spans
+    # without copying large holes in the persistent host arena.
+    inputs = np.array([160, 0, 16, 160, 1 << 20], dtype=np.int64)
+    sizes = np.array([8, 7, 20, 8, 9], dtype=np.int64)
+    offsets, ranges, capacity = codec._pack_inputs(inputs, sizes, 16)
+    assert ranges == ((0, 0, 36), (160, 48, 8), (1 << 20, 64, 9))
+    assert capacity == 73
+    assert offsets.tolist() == [48, 0, 16, 48, 64]
+    source = np.arange((1 << 20) + 9, dtype=np.uint8)
+    destination = np.zeros(capacity, dtype=np.uint8)
+    for start, offset, length in ranges:
+        destination[offset : offset + length] = source[start : start + length]
+    for start, offset, size in zip(inputs, offsets, sizes):
+        np.testing.assert_array_equal(
+            destination[offset : offset + size], source[start : start + size]
+        )
+    assert codec._pack_inputs(
+        np.array([], dtype=np.int64), np.array([], dtype=np.int64), 16
+    )[1:] == ((), 0)
+
+
 class TestOuterZstd(unittest.TestCase):
     def test_manifest_codec_and_frame_geometry_admission(self):
         admitted = dict(codec="snappy-zstd", frame_bytes=1 << 20)
-        for codec in ("snappy-zstd", "lz4-zstd", "lz4"):
+        for codec in ("snappy-zstd", "lz4-zstd", "lz4", "bitcomp", "bitcomp-zstd"):
             for size in (1 << 16, 192 << 10, 1 << 19, 1 << 20, 2 << 20, 4 << 20):
                 with self.subTest(codec=codec, size=size):
                     validate_codec(admitted | {"codec": codec, "frame_bytes": size})
@@ -404,7 +446,7 @@ class TestOuterZstd(unittest.TestCase):
         ):
             with (
                 self.subTest(patch=patch_value),
-                self.assertRaisesRegex(ValueError, "codec"),
+                self.assertRaisesRegex(ValueError, "GPU delta requires"),
             ):
                 validate_codec(admitted | patch_value)
 

@@ -55,10 +55,12 @@ class TestCanonicalPlanCache(unittest.TestCase):
                         raise RuntimeError("enqueue failed")
                 self.assertEqual(
                     events,
-                    [("push", "gpu_delta.worker"), ("pop",)] * 2
-                    + [("push", "gpu_delta.pause.decode"), ("pop",)]
-                    if enabled
-                    else [],
+                    (
+                        [("push", "gpu_delta.worker"), ("pop",)] * 2
+                        + [("push", "gpu_delta.pause.decode"), ("pop",)]
+                        if enabled
+                        else []
+                    ),
                 )
 
     def publication(self):
@@ -261,6 +263,57 @@ class TestReceiverPreparation(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "consumer storage changed"):
             plan.check_identity()
 
+    def test_cuda_pipeline_prefetches_and_fences_two_input_slots(self):
+        events = []
+
+        class Stream:
+            def __init__(self, name):
+                self.name = name
+
+            def wait_event(self, event):
+                events.append((self.name, "wait", event.name))
+
+        class Event:
+            def __init__(self, name):
+                self.name = name
+
+            def record(self, stream):
+                events.append((stream.name, "record", self.name))
+
+        prepared = receiver.PreparedDelta.__new__(receiver.PreparedDelta)
+        prepared.stream, prepared.io_stream = Stream("compute"), Stream("h2d")
+        prepared.decoded_ready = [Event(f"ready{i}") for i in range(2)]
+        prepared.decoded_free = [Event(f"free{i}") for i in range(2)]
+        prepared.batches = [
+            SimpleNamespace(
+                decoder=SimpleNamespace(
+                    copy_input=lambda stream, i=i: events.append(("copy", i)),
+                    enqueue=lambda i=i: events.append(("decode", i)),
+                ),
+                zero_ranges=[],
+                check_status=lambda i=i: events.append(("status", i)),
+                apply=lambda i=i: events.append(("apply", i)),
+            )
+            for i in range(4)
+        ]
+        with patch.object(torch.cuda, "stream", return_value=nullcontext()):
+            prepared._copy_batch(prepared.batches[0], 0)
+            prepared._apply_cuda_batches()
+        for i in range(4):
+            self.assertLess(events.index(("copy", i)), events.index(("decode", i)))
+            self.assertLess(events.index(("decode", i)), events.index(("status", i)))
+            self.assertLess(events.index(("status", i)), events.index(("apply", i)))
+            if i < 3:
+                self.assertLess(
+                    events.index(("copy", i + 1)), events.index(("decode", i))
+                )
+            if i >= 2:
+                wait = events.index(("h2d", "wait", f"free{i % 2}"))
+                self.assertLess(
+                    events.index(("compute", "record", f"free{i % 2}")), wait
+                )
+                self.assertLess(wait, events.index(("copy", i)))
+
     def test_decode_table_preserves_sparse_rows_and_natural_zero_ranges(self):
         sparse = SimpleNamespace(name="sparse")
         tail = SimpleNamespace(name="tail")
@@ -338,6 +391,7 @@ class TestReceiverPreparation(unittest.TestCase):
         backend, manifest = TestCanonicalPlanCache().publication()
         backend.device = torch.device("cpu")
         backend.payload_pool = object()
+        backend.decoders = {"lz4": SimpleNamespace(backend="hardware")}
         manifest.update(
             codec="lz4-zstd",
             frame_bytes=1 << 20,
@@ -362,7 +416,8 @@ class TestReceiverPreparation(unittest.TestCase):
             self.assertIsNotNone(refs[-1]())
             return {}, {}
 
-        def prepare_local(index, files, entries, pool, timings):
+        def prepare_local(index, files, entries, pool, timings, hardware):
+            self.assertTrue(hardware)
             self.assertIsNone(refs[-1]())
             self.assertEqual([entry["name"] for entry in entries], ["local"])
             raise RuntimeError("stop at local preparation boundary")
@@ -456,7 +511,7 @@ class TestReceiverPreparation(unittest.TestCase):
             )
             self.assertEqual(backend.decoders, {})
             self.assertIsNone(backend.apply_stream)
-            self.assertIsNone(backend.de_stream)
+            self.assertIsNone(backend.io_stream)
             self.assertEqual(backend.layers_per_batch, 3)
             with patch.dict(receiver.os.environ, GPU_DELTA_LAYERS_PER_BATCH="0"):
                 backend.describe()
@@ -476,7 +531,7 @@ class TestReceiverPreparation(unittest.TestCase):
             raise RuntimeError("decode stream failed")
 
         prepared = receiver.PreparedDelta.__new__(receiver.PreparedDelta)
-        prepared.de_stream = SimpleNamespace(synchronize=decode_failure)
+        prepared.io_stream = SimpleNamespace(synchronize=decode_failure)
         prepared.stream = SimpleNamespace(synchronize=lambda: drains.append("compute"))
         with self.assertRaisesRegex(RuntimeError, "decode stream failed"):
             prepared.close()

@@ -5,7 +5,7 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 
-"""Publication preparation and fixed double-buffer DE/application scheduling."""
+"""Publication preparation and fixed double-buffer transfer/decode/apply scheduling."""
 
 from __future__ import annotations
 
@@ -60,7 +60,7 @@ class GpuDeltaBackend:
         self.host_arena = HostArena(identity["engine_id"], self.device.index)
         self.decoders = {}
         self.apply_stream = None
-        self.de_stream = None
+        self.io_stream = None
 
     def describe(self):
         self.layout.check_identity()
@@ -237,7 +237,7 @@ class PreparedDelta:
         from sglang.srt.weight_sync.gpu_delta.host import copy_bytes, validate_codec
 
         self.stream = None
-        self.de_stream = None
+        self.io_stream = None
         self.host_snapshot = None
         self.batches, self.raw_copies = [], {}
         self.timings = {}
@@ -260,6 +260,13 @@ class PreparedDelta:
         plan_started = time.perf_counter()
         validate_codec(manifest)
         self.codec = manifest["codec"]
+        from sglang.srt.weight_sync.gpu_delta.codec import NvcompDecoder
+
+        inner_codec = self.codec.removesuffix("-zstd")
+        if inner_codec not in backend.decoders:
+            backend.decoders[inner_codec] = NvcompDecoder(self.device, inner_codec)
+        self.decoder = backend.decoders[inner_codec]
+        self.hardware = self.decoder.backend == "hardware"
         self.target_version = manifest["target_version"]
         entries, reused_plan = _qualify_canonical_plan(backend, manifest)
         self.timings["host_plan_validate_s"] = time.perf_counter() - plan_started
@@ -288,6 +295,7 @@ class PreparedDelta:
             list(entries.values()),
             backend.payload_pool,
             self.timings,
+            self.hardware,
         )
         self.timings["host_rank_prepare_body_s"] = time.perf_counter() - payload_started
         del files
@@ -360,7 +368,7 @@ class PreparedDelta:
             decode_stages=2,
             layers_per_batch=layers_per_batch,
             compressed_tensors=self.matrix_tensor_count,
-            de_host_input_bytes=int(frame_table[1].sum()),
+            de_host_input_bytes=int(frame_table[1].sum()) if self.hardware else 0,
             decoded_zero_ranges=sum(map(len, self.gaps)),
             decoded_zero_bytes=sum(size for gaps in self.gaps for _, size in gaps),
         )
@@ -370,15 +378,13 @@ class PreparedDelta:
     @profiling.annotate("gpu_delta.prepare.gpu_metadata")
     def _prepare_gpu_metadata(self, frame_table, frame_counts, raw_targets):
         """Prepare small GPU inputs; retain their leases, not wire-frame objects."""
-        from sglang.srt.weight_sync.gpu_delta.codec import NvcompDecoder
-
         started = time.perf_counter()
         backend = self.backend
         if backend.apply_stream is None:
             apply_stream = torch.cuda.Stream(device=self.device)
-            de_stream = torch.cuda.Stream(device=self.device)
-            backend.apply_stream, backend.de_stream = apply_stream, de_stream
-        self.stream, self.de_stream = backend.apply_stream, backend.de_stream
+            io_stream = torch.cuda.Stream(device=self.device)
+            backend.apply_stream, backend.io_stream = apply_stream, io_stream
+        self.stream, self.io_stream = backend.apply_stream, backend.io_stream
         self.decoded_ready = [torch.cuda.Event() for _ in range(2)]
         self.decoded_free = [torch.cuda.Event() for _ in range(2)]
         with torch.cuda.stream(self.stream):
@@ -443,15 +449,11 @@ class PreparedDelta:
             self._prepare_apply_bindings()
         self.workspace = self.decode_plan = None
         if self.static_plans:
-            inner_codec = self.codec.removesuffix("-zstd")
-            if inner_codec not in backend.decoders:
-                backend.decoders[inner_codec] = NvcompDecoder(self.device, inner_codec)
-            decoder = backend.decoders[inner_codec]
-            self.decode_plan = decoder.prepare_batches(
+            self.decode_plan = self.decoder.prepare_batches(
                 frame_table,
                 frame_counts,
                 backend.host_arena.tensor,
-                self.de_stream,
+                self.io_stream if self.hardware else self.stream,
             )
             self.decode_plan.record_stream(self.stream)
             self.workspace = self.decode_plan.workspace
@@ -463,10 +465,10 @@ class PreparedDelta:
                     for decode in self.decode_plan.batches
                 ]
         # PREPARED includes small input transfers, never output-slot allocation,
-        # DE execution or synchronization with rollout. The fixed apply kernel
+        # decoding or synchronization with rollout. The fixed apply kernel
         # is already compiled/loaded; membership never specializes its code.
         ready = []
-        for stream in (self.stream, self.de_stream):
+        for stream in (self.stream, self.io_stream):
             event = torch.cuda.Event()
             event.record(stream)
             ready.append(event)
@@ -553,12 +555,11 @@ class PreparedDelta:
 
         started = time.perf_counter()
         self.stream.wait_stream(torch.cuda.default_stream(self.device))
+        allocate = device_empty if self.hardware else torch.empty
         with torch.cuda.stream(self.stream):
             self.decoded = (
                 [
-                    device_empty(
-                        self.max_decoded, dtype=torch.uint8, device=self.device
-                    )
+                    allocate(self.max_decoded, dtype=torch.uint8, device=self.device)
                     for _ in range(2)
                 ]
                 if self.static_plans
@@ -585,7 +586,14 @@ class PreparedDelta:
                 )
         self.timings.update(
             paused_setup_host_s=time.perf_counter() - started,
-            decoder_metadata_uploads=2 * int(bool(decoders)),
+            decoder_metadata_uploads=(2 if self.hardware else 3) * int(bool(decoders)),
+            compressed_input_buffers=0 if self.hardware or not decoders else 2,
+            compressed_input_capacity_bytes=(
+                self.decode_plan.input_capacity_bytes if self.decode_plan else 0
+            ),
+            compressed_input_h2d_bytes=(
+                self.decode_plan.input_bytes if self.decode_plan else 0
+            ),
             apply_metadata_h2d_bytes=self.apply_metadata.numel() * 8,
             apply_descriptor_h2d_bytes=sum(
                 group.metadata_size * 8 for group in apply_groups
@@ -606,6 +614,7 @@ class PreparedDelta:
                 "raw_h2d_bytes",
                 "decoder_metadata_h2d_bytes",
                 "apply_metadata_h2d_bytes",
+                "compressed_input_h2d_bytes",
             )
         )
 
@@ -628,26 +637,21 @@ class PreparedDelta:
             self._allocate_paused()
             with torch.cuda.stream(self.stream):
                 with self._phase("paused_gpu_pipeline"):
-                    # DE and apply alternate between two decoded buffers.
-                    # DE first waits for paused allocation and metadata uploads.
                     if self.batches:
-                        self.de_stream.wait_stream(self.stream)
-                        self._decode_batch(self.batches[0], 0)
-                    # Raw-target copies can overlap the first DE operation.
+                        self.io_stream.wait_stream(self.stream)
+                        if self.hardware:
+                            self._decode_batch(self.batches[0], 0)
+                        else:
+                            self._copy_batch(self.batches[0], 0)
                     with self._phase("raw_apply"):
                         for targets, sources in self.raw_copies.values():
                             torch._foreach_copy_(targets, sources)
                     matrices_started = time.perf_counter()
-                    for index, batch in enumerate(self.batches):
-                        slot = index % 2
-                        self.stream.wait_event(self.decoded_ready[slot])
-                        self._apply_batch(batch)
-                        self.decoded_free[slot].record(self.stream)
-                        # nvCOMP may wait for prior work on its calling stream.
-                        # Queue apply BEFORE the next DE call to retain overlap.
-                        next_index = index + 1
-                        if next_index < len(self.batches):
-                            self._decode_batch(self.batches[next_index], next_index)
+                    if self.batches:
+                        if self.hardware:
+                            self._apply_hardware_batches()
+                        else:
+                            self._apply_cuda_batches()
                     self.timings["host_matrix_enqueue_s"] = (
                         time.perf_counter() - matrices_started
                     )
@@ -672,10 +676,8 @@ class PreparedDelta:
             raise RuntimeError(
                 "direct GPU delta decompression failed; session is poisoned"
             )
-        # The loop-local batch also holds output/workspace leases. Drop it before
-        # releasing the dedicated DE allocations, so free/fence overhead is
-        # included in paused host wall time and completes before generation resumes.
-        batch = None
+        # Release output/workspace leases before generation resumes. DE allocation
+        # free/fence overhead remains included in paused host wall time.
         self._release_gpu()
         self.timings["paused_apply_host_wall_s"] = time.perf_counter() - apply_started
         return {
@@ -686,6 +688,40 @@ class PreparedDelta:
             "timings": self.timings,
             "h2d_bytes": self.h2d_bytes,
         }
+
+    def _apply_hardware_batches(self):
+        # DE writes one decoded slot while the SMs consume the other.
+        for index, batch in enumerate(self.batches):
+            slot = index % 2
+            self.stream.wait_event(self.decoded_ready[slot])
+            self._apply_batch(batch)
+            self.decoded_free[slot].record(self.stream)
+            # Queue apply before nvCOMP, which may wait on its calling stream.
+            if index + 1 < len(self.batches):
+                self._decode_batch(self.batches[index + 1], index + 1)
+
+    def _copy_batch(self, batch, index):
+        with torch.cuda.stream(self.io_stream), self._phase("h2d"):
+            slot = index % 2
+            if index >= 2:
+                self.io_stream.wait_event(self.decoded_free[slot])
+            batch.decoder.copy_input(self.io_stream)
+            self.decoded_ready[slot].record(self.io_stream)
+
+    def _apply_cuda_batches(self):
+        # CUDA decode and apply share one compute stream. Only compressed H2D
+        # overlaps compute; a slot becomes reusable as soon as decoding ends.
+        for index, batch in enumerate(self.batches):
+            slot = index % 2
+            self.stream.wait_event(self.decoded_ready[slot])
+            if index + 1 < len(self.batches):
+                self._copy_batch(self.batches[index + 1], index + 1)
+            with self._phase("decode"):
+                if batch.zero_ranges:
+                    torch._foreach_zero_(batch.zero_ranges)
+                batch.decoder.enqueue()
+            self.decoded_free[slot].record(self.stream)
+            self._apply_batch(batch)
 
     def _decode_batch(self, batch, index):
         stream = batch.decoder.stream
@@ -733,7 +769,7 @@ class PreparedDelta:
         # Error/cancel paths must attempt every stream before releasing any
         # storage. Success already joined and released GPU leases in apply.
         failure = None
-        for stream in (self.de_stream, self.stream):
+        for stream in (self.io_stream, self.stream):
             if stream is not None:
                 try:
                     stream.synchronize()

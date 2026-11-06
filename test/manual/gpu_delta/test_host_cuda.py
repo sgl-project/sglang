@@ -1,8 +1,8 @@
-"""Two engines verify encoded files once and prepare private rank DE arenas.
+"""Native host-arena and complete receiver checks.
 
-Manual-only: Linux, two Blackwell CUDA GPUs, Torch, Snappy, LZ4 and Zstandard are required.
-The test barriers coordinate the oracle only; production preparation has no
-collectives. Both 4- and 8-worker rank pools exercise the same exact bytes.
+Manual-only: Linux, CUDA, nvCOMP 6, Torch, Snappy, LZ4 and Zstandard are required.
+Bitcomp uses one GPU and the Miles producer. The two-engine DE test requires two
+Blackwell GPUs; its barriers coordinate the oracle, not production preparation.
 """
 
 import hashlib
@@ -12,12 +12,166 @@ import os
 import random
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import lz4.block
 import numpy as np
 import pytest
 import snappy
 import zstandard as zstd
+
+
+@pytest.mark.parametrize("codec", ["bitcomp", "bitcomp-zstd"])
+def test_bitcomp_receiver_double_buffer_exact_updates_and_stale_target(
+    codec, monkeypatch
+):
+    """Real producer/receiver, five batches, omitted frames and raw replacement."""
+    import torch
+    from miles.utils.gpu_delta.encoder import GpuBatchEncoder
+    from miles.utils.gpu_delta.publication import PublicationWriter
+
+    from sglang.srt.weight_sync.gpu_delta import checkpoint
+    from sglang.srt.weight_sync.gpu_delta.bindings import _digest
+    from sglang.srt.weight_sync.gpu_delta.receiver import GpuDeltaBackend
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    frame_bytes = 1 << 16
+    model = torch.nn.Module()
+    model.config = SimpleNamespace(
+        architectures=["DeepseekV3ForCausalLM"], num_hidden_layers=5
+    )
+    model.num_fused_shared_experts = 0
+    model.model = torch.nn.Module()
+    model.model.layers = torch.nn.ModuleList([torch.nn.Module() for _ in range(5)])
+    for layer in model.model.layers:
+        layer.weight = torch.nn.Parameter(
+            torch.zeros((1, 2 * frame_bytes + 140), dtype=torch.uint8, device=device),
+            requires_grad=False,
+        )
+    model.model.raw = torch.nn.Parameter(
+        torch.zeros(17, dtype=torch.uint8, device=device), requires_grad=False
+    )
+    inventory = {
+        name: {"dtype": "U8", "shape": list(value.shape)}
+        for name, value in model.named_parameters()
+    }
+    monkeypatch.setattr(
+        checkpoint, "read_canonical_checkpoint_inventory", lambda _: inventory
+    )
+    monkeypatch.setenv("GPU_DELTA_CPU_WORKERS", "4")
+    monkeypatch.setenv("GPU_DELTA_LAYERS_PER_BATCH", "1")
+    monkeypatch.setenv("GPU_DELTA_SKIP_PAYLOAD_HASH", "0")
+    encoder = GpuBatchEncoder(device, codec=codec, frame_bytes=frame_bytes)
+    with tempfile.TemporaryDirectory(
+        prefix="gpu-delta-bitcomp-", dir="/dev/shm"
+    ) as directory:
+        root = Path(directory)
+        monkeypatch.setenv("GPU_DELTA_HOST_CACHE_DIR", str(root / "cache"))
+        backend = GpuDeltaBackend(
+            SimpleNamespace(model=model), {"engine_id": directory}
+        )
+        definitions = backend.describe()["tensors"]
+        plan_digest = _digest(sorted(definitions, key=lambda row: row["name"]))
+        prepared = None
+        try:
+            for version in range(1, 4):
+                before = {
+                    name: value.detach().cpu().flatten().pin_memory()
+                    for name, value in model.named_parameters()
+                }
+                after = {
+                    name: value.clone().pin_memory() for name, value in before.items()
+                }
+                for name, value in after.items():
+                    if name == "model.raw":
+                        value.bitwise_xor_(version)
+                    else:
+                        value[:frame_bytes:4096].bitwise_xor_(version)
+                        value[-140:].bitwise_xor_(version + 7)
+                matrices = [
+                    row for row in definitions if row["encoding"] == "xor_bytes"
+                ]
+                encoded = encoder.finish_device(
+                    encoder.encode_device(
+                        [(before[row["name"]], after[row["name"]]) for row in matrices]
+                    )
+                )
+                writer = PublicationWriter(
+                    root / str(version),
+                    "tiny-receiver",
+                    version - 1,
+                    version,
+                    plan_digest,
+                    codec,
+                    frame_bytes=frame_bytes,
+                )
+                try:
+                    for row, result in zip(matrices, encoded, strict=True):
+                        writer.add_encoded_tensor(
+                            row["name"],
+                            *result[:4],
+                            dtype=row["dtype"],
+                            shape=row["shape"],
+                            views=row["views"],
+                        )
+                    raw = next(row for row in definitions if row["name"] == "model.raw")
+                    writer.add_raw_tensor(
+                        raw["name"],
+                        before[raw["name"]].numpy(),
+                        after[raw["name"]].numpy(),
+                        raw["dtype"],
+                        raw["shape"],
+                        raw["views"],
+                    )
+                    descriptor = writer.finish()
+                finally:
+                    writer.close()
+                metadata = dict(
+                    descriptor,
+                    session_id="tiny-receiver",
+                    validate_payload_hash=True,
+                    participants=[{"engine_id": directory, "rank": 0}],
+                )
+                prepared = backend.prepare(
+                    descriptor["manifest_path"], descriptor["manifest_sha256"], metadata
+                )
+                assert not prepared.hardware
+                assert (
+                    not prepared.decode_plan.decoded_slots
+                    and not prepared.decode_plan.input_slots
+                )
+                assert backend.host_arena.allocation.tensor.is_pinned()
+                assert prepared.timings["compressed_batches"] == 5
+                assert prepared.timings["decoded_zero_bytes"] == 5 * frame_bytes
+                assert prepared.timings["host_batch_plan_reused"] == int(version > 1)
+                for name, value in model.named_parameters():
+                    assert torch.equal(value.cpu().flatten(), before[name])
+                if version == 3:
+                    model.model.layers[0].weight = torch.nn.Parameter(
+                        model.model.layers[0].weight.clone(), requires_grad=False
+                    )
+                    with pytest.raises(
+                        RuntimeError, match="parameter identity changed"
+                    ):
+                        prepared.apply()
+                    for name, value in model.named_parameters():
+                        assert torch.equal(value.cpu().flatten(), before[name])
+                    prepared.close()
+                else:
+                    result = prepared.apply()
+                    assert result["applied"] and result["target_version"] == version
+                    assert result["timings"]["compressed_input_buffers"] == 2
+                    assert result["timings"]["decoded_buffers"] == 2
+                    assert result["timings"]["compressed_input_h2d_bytes"] > 0
+                    assert result["timings"]["de_host_input_bytes"] == 0
+                    for name, value in model.named_parameters():
+                        assert torch.equal(value.cpu().flatten(), after[name])
+                    prepared.release_and_close()
+                prepared = None
+        finally:
+            if prepared is not None:
+                prepared.close()
+            backend.close()
 
 
 def _publication(directory, version, repeat, codec):
