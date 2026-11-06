@@ -134,7 +134,7 @@ impl Runtime {
         workers: usize,
     ) -> Result<(), String> {
         let ctx = Arc::new(
-            crate::multi_modality::worker::MmContext::new(spec)?
+            crate::multi_modality::worker::MmContext::new(spec, self.mm_wiring.tokenizer.clone())?
                 .with_limits(self.mm_wiring.limits.clone()),
         );
         self.spawn_mm_pool(workers, ctx);
@@ -450,6 +450,7 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
         ),
         None => detokenizer::DetokenizerBackend::Skip,
     };
+    let mm_tokenizer = tokenizer.clone();
 
     // The potentially slow/fallible tokenizer load above happens before the
     // ports become visible. Own both sockets before starting any worker or
@@ -693,6 +694,7 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
             mm_rx: mm_worker_rx,
             tm_tx: tok_manager_tx,
             limits: tokenizer_manager::to_scheduler::Limits::from(&*cfg.server_args),
+            tokenizer: mm_tokenizer,
         },
         core,
         threads: Mutex::new(threads),
