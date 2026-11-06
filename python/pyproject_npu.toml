@@ -19,6 +19,7 @@ dependencies = [
   "aiohttp",
   "anthropic>=0.20.0",
   "av",
+  "blake3>=1.0.0",
   "blobfile==3.0.0",
   "build",
   "compressed-tensors",

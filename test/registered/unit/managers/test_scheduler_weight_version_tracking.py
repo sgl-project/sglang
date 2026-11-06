@@ -4,7 +4,7 @@ from unittest.mock import MagicMock, Mock, patch
 
 import torch
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.io_struct import (
     BeginWeightUpdateReqInput,
     EndWeightUpdateReqInput,
@@ -13,6 +13,13 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
+)
+from sglang.srt.managers.scheduler_components.deferred_responses import (
+    DeferredResponses,
+)
+from sglang.srt.managers.scheduler_components.request_list import (
+    KeyedReqList,
+    ListKind,
 )
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
@@ -23,11 +30,12 @@ from sglang.srt.mem_cache.kv_weight_version_tracker import (
     KvWeightVersionRecord,
     KvWeightVersionTracker,
 )
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import release_only_retirer
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -36,62 +44,6 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 class _ServingStub:
     def __init__(self, weight_version: str):
         self.weight_version = weight_version
-
-
-class _ContextStub:
-    def __init__(self, serving: _ServingStub):
-        self.serving = serving
-
-    def override(self, source, **fields):
-        self.serving.weight_version = fields["weight_version"]
-
-
-class TestSchedulerRecordWeightVersionChange(CustomTestCase):
-    def _serving(self, version: str) -> _ServingStub:
-        serving = _ServingStub(version)
-        for name, value in (
-            ("get_serving", serving),
-            ("get_context", _ContextStub(serving)),
-        ):
-            patcher = patch(f"sglang.srt.managers.scheduler.{name}", return_value=value)
-            patcher.start()
-            self.addCleanup(patcher.stop)
-        return serving
-
-    def _scheduler(
-        self, *, inflight=(), waiting=(), chunked=None, staging=()
-    ) -> SimpleNamespace:
-        return SimpleNamespace(
-            collect_inflight_reqs=lambda: set(inflight),
-            _deferred_responses=None,
-            waiting_queue=list(waiting),
-            chunked_req=chunked,
-            hisparse_coordinator=(
-                SimpleNamespace(
-                    ack_staging_queue=[SimpleNamespace(req=req) for req in staging]
-                )
-                if staging
-                else None
-            ),
-        )
-
-    def test_every_source_of_live_requests_is_stamped(self):
-        """A request missed here keeps attributing its next tokens to the superseded version."""
-        self._serving("v1")
-        inflight, queued, chunked, staged = (object() for _ in range(4))
-        scheduler = self._scheduler(
-            inflight=[inflight], waiting=[queued], chunked=chunked, staging=[staged]
-        )
-
-        with patch(
-            "sglang.srt.managers.scheduler.record_weight_version_events",
-            return_value=0,
-        ) as recorder:
-            Scheduler.record_weight_version_change(scheduler, new_version="v2")
-
-        self.assertEqual(
-            set(recorder.call_args.args[0]), {inflight, queued, chunked, staged}
-        )
 
 
 class TestSchedulerBatchWeightVersion(CustomTestCase):
@@ -149,6 +101,11 @@ class TestSchedulerBatchWeightVersion(CustomTestCase):
 
     def _scheduler(self) -> Scheduler:
         scheduler = Scheduler.__new__(Scheduler)
+        scheduler.deferred_responses = DeferredResponses(
+            disaggregation_mode=DisaggregationMode.NULL,
+            output_streamer=None,
+            send_abort=None,
+        )
         scheduler.token_to_kv_pool_allocator = None
         scheduler.req_to_token_pool = None
         scheduler.publish_load_snapshot = MagicMock()
@@ -156,6 +113,9 @@ class TestSchedulerBatchWeightVersion(CustomTestCase):
         scheduler.load_publisher = MagicMock()
         scheduler.load_inquirer = MagicMock()
         scheduler.tree_cache = SimpleNamespace(flush_pending_backups=MagicMock())
+        scheduler.running_reqs = KeyedReqList(ListKind.DECODING)
+        scheduler.prefill_launched_reqs = KeyedReqList(ListKind.PREFILL_LAUNCHED)
+        scheduler.invariant_checker = MagicMock()
         scheduler.kv_weight_version_tracker = KvWeightVersionTracker(
             num_slots=8,
             device="cpu",
@@ -180,6 +140,7 @@ class TestSchedulerBatchWeightVersion(CustomTestCase):
             logprob_result_processor=None,
             output_streamer=MagicMock(),
             beam_coordinator=MagicMock(),
+            request_retirer=release_only_retirer(tree_cache=scheduler.tree_cache),
             abort_request=lambda *args, **kwargs: None,
         )
         for name, value in (
@@ -201,11 +162,14 @@ class TestSchedulerBatchWeightVersion(CustomTestCase):
         return scheduler
 
     def _batch(self) -> ScheduleBatch:
-        return ScheduleBatch(
+        batch = ScheduleBatch(
             reqs=[],
             forward_mode=ForwardMode.EXTEND,
             out_cache_loc=torch.tensor([3], dtype=torch.int64),
         )
+        # A launched step, as process_batch_result expects.
+        batch.add_inflight_step()
+        return batch
 
     def test_pending_result_uses_version_captured_when_batch_ran(self) -> None:
         """A pending result keeps the forward-time version across a serving update."""

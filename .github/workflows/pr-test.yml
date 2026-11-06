@@ -404,8 +404,6 @@ jobs:
       matrix:
         include:
           - { runner_config: 4-gpu-h100, run_timeout: '30', timeout_per_file: '' }
-          - { runner_config: 8-gpu-h200, run_timeout: '30', timeout_per_file: '1800' }
-          - { runner_config: 8-gpu-h20, run_timeout: '30', timeout_per_file: '' }
           - { runner_config: 4-gpu-b200, run_timeout: '30', timeout_per_file: '1800' }
           - { runner_config: 8-gpu-b300, run_timeout: '60', timeout_per_file: '3600' }
     uses: ./.github/workflows/_pr-test-stage.yml

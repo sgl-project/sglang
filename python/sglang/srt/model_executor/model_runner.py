@@ -91,8 +91,14 @@ from sglang.srt.layers.cp.utils import (
     is_cp_active,
     is_mla_cp_enabled,
 )
-from sglang.srt.layers.dp_attention import get_dp_tp_group
+from sglang.srt.layers.dp_attention import get_dp_tp_group, require_gathered_buffer
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.moe.mega_moe import allocate_mega_moe_buffers
+from sglang.srt.layers.offloader import (
+    create_offloader,
+    get_offloader,
+    set_offloader,
+)
 from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.lora.lora_manager import LoRAManager, init_lora_cuda_graph_moe_buffers
 from sglang.srt.lora.lora_registry import LoRARef
@@ -168,6 +174,7 @@ from sglang.srt.model_executor.model_runner_components.load_model_utils import (
     maybe_register_debug_tensor_dump_hook,
     maybe_trigger_remote_instance_nccl_send_group,
     report_online_quantization,
+    reserve_rope_cache_for_long_sequences,
     resolve_sliding_window_size,
 )
 from sglang.srt.model_executor.model_runner_components.moe_ep_setup import (
@@ -197,6 +204,9 @@ from sglang.srt.model_executor.runner import (
     EagerRunner,
     get_batch_sizes_to_capture,
 )
+from sglang.srt.model_executor.weight_checker import WeightChecker
+from sglang.srt.models.unlimited_ocr_v2_support.greedy_graph import UocrGreedyGraph
+from sglang.srt.observability.profile_utils import build_step_span_name
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     assert_published,
@@ -218,11 +228,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_observer import SamplingObserver
 from sglang.srt.sampling.watermarking.core import WatermarkState
-from sglang.srt.server_args import (  # noqa: F401  (re-export)
-    CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS,
-    ServerArgs,
-    add_chunked_prefix_cache_attention_backend,
-)
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.adaptive_spec_params import (
     resolve_candidate_steps_from_config,
 )
@@ -246,22 +252,13 @@ from sglang.srt.utils import (
     get_available_gpu_memory,
     is_host_cpu_arm64,
     is_npu,
-    require_gathered_buffer,
-    reserve_rope_cache_for_long_sequences,
     set_cuda_arch,
     slow_rank_detector,
 )
 from sglang.srt.utils.device_timer import device_timer_ctx
 from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
 from sglang.srt.utils.nvtx_utils import profile_range
-from sglang.srt.utils.offloader import (
-    create_offloader,
-    get_offloader,
-    set_offloader,
-)
-from sglang.srt.utils.profile_utils import build_step_span_name
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
-from sglang.srt.utils.weight_checker import WeightChecker
 
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -329,6 +326,8 @@ class ModelRunner:
     """ModelRunner runs the forward passes of the models."""
 
     watermark_state: Optional[WatermarkState] = None
+    # Unlimited-OCR v2 only; see maybe_init_uocr_greedy_graph.
+    uocr_greedy_graph: Optional[UocrGreedyGraph] = None
     canary_manager: Optional[CanaryManager] = None
 
     @property
@@ -498,7 +497,9 @@ class ModelRunner:
         self.init_torch_distributed()
 
         # Init forward stream for overlap schedule
-        self.forward_stream = torch.get_device_module(self.device).Stream()
+        self.forward_stream = torch.get_device_module(self.device).Stream(
+            priority=envs.SGLANG_PLB_STREAM_PRIORITY.get()
+        )
 
         # Read-done mailbox: the scheduler's WAR barrier reads it from the runner
         # its worker names, and treats None as the coarse whole-forward fence.
@@ -778,6 +779,7 @@ class ModelRunner:
             capture_tail_hooks=self.capture_tail_hooks,
             is_draft=self.is_draft_worker,
         )
+        allocate_mega_moe_buffers(self.model)
 
     def init_memory_saver_adapter(self):
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -1017,9 +1019,21 @@ class ModelRunner:
             self.memory_pool_config = memory_pool_config
 
         self.init_kv_cache_configurator(draft_parallel_layout)
+        expert_slots = None
+        if get_exec().moe.enable_paged_experts and (
+            get_exec().moe.paged_experts_num_resident in (None, "auto")
+        ):
+            # --paged-experts-num-resident auto: the KV cache first, then the expert slots.
+            from sglang.srt.layers.moe.paged_experts.sizing import ExpertSlotSizing
+
+            expert_slots = ExpertSlotSizing.for_model(
+                self.model, self.kv_cache_configurator, self.pre_model_load_memory
+            )
         result = self.kv_cache_configurator.configure(
             pre_model_load_memory=self.pre_model_load_memory
         )
+        if expert_slots is not None:
+            expert_slots.size(result.max_total_num_tokens)
         self.max_total_num_tokens = result.max_total_num_tokens
         self.max_running_requests = result.max_running_requests
         self.req_to_token_pool = result.req_to_token_pool
@@ -1171,22 +1185,48 @@ class ModelRunner:
         dcp_group = get_parallel().dcp_group
         if dcp_group.world_size <= 1:
             return
+        fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+
+        def absorb_weight_16bit(w: torch.Tensor, w_scale) -> Optional[torch.Tensor]:
+            # Per-tensor fp8 absorb weights (GLM kv_b_proj on gfx95) carry a
+            # rank-local scale, so they are dequantized before the gather.
+            if w.dtype in (torch.bfloat16, torch.float16):
+                return w.contiguous()
+            if w.dtype in fp8_dtypes and (
+                isinstance(w_scale, (int, float)) or w_scale.numel() == 1
+            ):
+                return (w.to(torch.bfloat16) * w_scale).contiguous()
+            return None
+
         n_prepared = 0
         for m in self.model.modules():
             if not isinstance(m, DeepseekV2AttentionMLA) or m.w_kc is None:
                 continue
             qp = m.q_b_proj if m.has_q_b_proj else m.q_proj
-            if m.w_kc.dtype not in (torch.bfloat16, torch.float16):
-                logger.warning("dcp_replicate_q_proj: skipping non-16-bit w_kc")
+            # q-replicate needs a 16-bit or per-tensor fp8 absorb weight;
+            # anything else keeps the per-layer Q all-gather.
+            w_kc = absorb_weight_16bit(m.w_kc, m.w_scale)
+            if w_kc is None:
+                logger.warning("dcp_replicate_q_proj: skipping unsupported w_kc")
                 continue
             if isinstance(qp.quant_method, UnquantizedLinearMethod):
-                m.q_b_proj_qrep_weight = dcp_group.all_gather(qp.weight.data, dim=0)
+                local = qp.weight.data
+                m.q_b_proj_qrep_weight = dcp_group.all_gather(local.contiguous(), dim=0)
+                # The local q_b_proj rows are this rank's slice of the replica;
+                # alias them so the replica does not double the q_b_proj
+                # footprint.
+                rows = local.shape[0]
+                r = dcp_group.rank_in_group
+                qp.weight.data = m.q_b_proj_qrep_weight[r * rows : (r + 1) * rows]
             elif _is_block_fp8(qp):
                 m.q_b_proj_qrep = _gather_block_fp8_linear(qp, dcp_group)
             else:
                 logger.warning("dcp_replicate_q_proj: skipping unsupported q-proj")
                 continue
-            m.w_kc_qrep = dcp_group.all_gather(m.w_kc.contiguous(), dim=0)
+            m.w_kc_qrep = dcp_group.all_gather(w_kc, dim=0)
+            w_vc = absorb_weight_16bit(m.w_vc, m.w_scale)
+            if w_vc is not None:
+                m.w_vc_qrep = dcp_group.all_gather(w_vc, dim=0)
             n_prepared += 1
         logger.info(
             "dcp_replicate_q_proj: prepared full-head Q weights for %d MLA layers",
@@ -1467,6 +1507,13 @@ class ModelRunner:
     def maybe_precompile_model_kernels_after_loading(self) -> None:
         maybe_precompile_model_kernels_after_loading(self.model, self.device)
 
+    def _uses_cpu_graph_attention_backend(self) -> bool:
+        return (
+            self.device == "cpu"
+            and self.prefill_attention_backend_str == "intel_amx"
+            and self.decode_attention_backend_str == "intel_amx"
+        )
+
     def maybe_init_dwdp(self):
         if self.is_draft_worker:
             return
@@ -1632,6 +1679,19 @@ class ModelRunner:
     def get_cuda_graph_layers(self, layer_model) -> AttentionAndMoeLayers:
         """Return the model layers used by prefill CUDA graph execution."""
         return compute_attention_and_moe_layers(layer_model)
+
+    def maybe_init_uocr_greedy_graph(self) -> None:
+        """Record greedy argmax inside Unlimited-OCR v2 decode graph capture."""
+        # A recapture keeps the recorder and its one registered hook.
+        if self.uocr_greedy_graph is not None:
+            return
+        self.uocr_greedy_graph = UocrGreedyGraph.maybe_create(
+            model_config=self.model_config,
+            max_running_requests=get_schedule().max_running_requests,
+            device=self.device,
+        )
+        if self.uocr_greedy_graph is not None:
+            self.capture_tail_hooks.append(self.uocr_greedy_graph.capture_tail_hook)
 
     def init_decode_cuda_graph(self):
         self.decode_cuda_graph_runner = None
@@ -1850,10 +1910,19 @@ class ModelRunner:
             else contextlib.nullcontext()
         )
 
+        recorder = get_global_expert_distribution_recorder()
+        # Draft batches can also use TARGET_VERIFY; ownership comes from the runner.
+        record_ctx = (
+            recorder.disable_this_region()
+            if self.is_draft_worker
+            else contextlib.nullcontext()
+        )
+
         with (
             canary_ctx,
             step_span_ctx,
-            get_global_expert_distribution_recorder().with_forward_pass(
+            record_ctx,
+            recorder.with_forward_pass(
                 self.forward_pass_id,
                 forward_batch,
             ) as recorder_outputs,
@@ -2004,6 +2073,13 @@ class ModelRunner:
                 self.hisparse_coordinator.wait_for_pending_backup()
                 self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
 
+            if self.uocr_greedy_graph is not None:
+                self.uocr_greedy_graph.before_forward(
+                    forward_batch,
+                    replays_graph=can_run_graph,
+                    decode_graph_runner=self.decode_cuda_graph_runner,
+                )
+
             # Replay cuda graph if applicable
             if can_run_graph:
                 ret = self.decode_cuda_graph_runner.execute(
@@ -2153,22 +2229,30 @@ class ModelRunner:
             logprob_logits = None
 
         # Sample the next tokens
-        next_token_ids = self.sampler(
-            logits_output,
-            forward_batch.sampling_info,
-            forward_batch.return_logprob,
-            forward_batch.top_logprobs_nums,
-            forward_batch.token_ids_logprobs,
-            # For prefill, we only use the position of the last token.
-            (
-                forward_batch.positions
-                if forward_batch.forward_mode.is_decode()
-                else forward_batch.seq_lens - 1
-            ),
-            **(
-                {"logprob_logits": logprob_logits} if logprob_logits is not None else {}
-            ),
-        )
+        next_token_ids = None
+        if self.uocr_greedy_graph is not None:
+            next_token_ids = self.uocr_greedy_graph.recorded_ids(
+                logits_output, forward_batch, watermark_state=watermark_state
+            )
+        if next_token_ids is None:
+            next_token_ids = self.sampler(
+                logits_output,
+                forward_batch.sampling_info,
+                forward_batch.return_logprob,
+                forward_batch.top_logprobs_nums,
+                forward_batch.token_ids_logprobs,
+                # For prefill, we only use the position of the last token.
+                (
+                    forward_batch.positions
+                    if forward_batch.forward_mode.is_decode()
+                    else forward_batch.seq_lens - 1
+                ),
+                **(
+                    {"logprob_logits": logprob_logits}
+                    if logprob_logits is not None
+                    else {}
+                ),
+            )
         if observer_state is not None:
             logits_output.auxiliary_device_output = observer.after_sample(
                 observer_state,
