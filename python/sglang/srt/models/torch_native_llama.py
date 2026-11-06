@@ -62,7 +62,10 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    maybe_remap_kv_scale_name,
+)
 from sglang.srt.runtime_context import get_parallel
 
 tp_size: Optional[int] = None
@@ -73,8 +76,13 @@ def gate_up_proj_weight_loader(
     self,
     param: Parameter,
     loaded_weight: torch.Tensor,
-    loaded_shard_id: int,
+    loaded_shard_id: Optional[int] = None,
 ):
+    if loaded_shard_id is None:
+        # A fused gate_up_proj tensor (Phi-3 checkpoints): load gate, then up.
+        for shard_id, shard in enumerate(loaded_weight.split(self.output_sizes)):
+            gate_up_proj_weight_loader(self, param, shard, shard_id)
+        return
     # shard_id: (shard_offset, shard_size)
     gate_up_offsets = {}
     current_shard_offset = 0
@@ -141,8 +149,16 @@ def qkv_proj_weight_loader(
     self,
     param: Parameter,
     loaded_weight: torch.Tensor,
-    loaded_shard_id: str,
+    loaded_shard_id: Optional[str] = None,
 ):
+    if loaded_shard_id is None:
+        # A fused qkv_proj tensor (Phi-3 checkpoints): load q, k, then v.
+        q_size = self.num_heads * self.head_size
+        kv_size = self.num_kv_heads * self.head_size
+        shards = loaded_weight.split([q_size, kv_size, kv_size])
+        for shard_id, shard in zip(("q", "k", "v"), shards):
+            qkv_proj_weight_loader(self, param, shard, shard_id)
+        return
     num_heads = self.num_heads // tp_size
     num_kv_heads = self.num_kv_heads // tp_size
     # shard_id: (shard_offset, shard_size)
@@ -246,6 +262,8 @@ class LlamaAttention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            quant_config=quant_config,
+            prefix=add_prefix("attn", prefix),
         )
 
     def forward(
@@ -446,8 +464,10 @@ class TorchNativeLlamaForCausalLM(nn.Module):
         self,
         fqn: str,
         weights: Iterable[Tuple[str, torch.Tensor]],
+        recurse: bool = False,
     ):
-        """Load weights onto submodule pointed by path `fqn`."""
+        """Load weights onto submodule pointed by path `fqn` (and, with
+        `recurse`, onto all its submodules)."""
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".qkv_proj", ".q_proj", "q"),
@@ -457,7 +477,14 @@ class TorchNativeLlamaForCausalLM(nn.Module):
             (".gate_up_proj", ".up_proj", 1),
         ]
         module = self.get_submodule(fqn)
-        params_dict = dict(module.named_parameters(prefix=fqn, recurse=False))
+        params_dict = dict(module.named_parameters(prefix=fqn, recurse=recurse))
+        # KV-cache scale names are mapped against the scales of the whole model:
+        # the layered loader fills one submodule at a time.
+        kv_scales = {
+            name: None
+            for name, _ in self.named_parameters()
+            if name.endswith((".k_scale", ".v_scale"))
+        }
 
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name or "projector" in name:
@@ -470,6 +497,13 @@ class TorchNativeLlamaForCausalLM(nn.Module):
                 continue
             if self.config.tie_word_embeddings and "lm_head.weight" in name:
                 continue
+            # Map checkpoint KV-cache scale names (`self_attn.k_scale`,
+            # `self_attn.k_proj.k_scale`, `self_attn.kv_scale`) to the attention
+            # before `.k_proj` is renamed to `.qkv_proj` below.
+            if "scale" in name:
+                name = maybe_remap_kv_scale_name(name, kv_scales)
+                if name is None:
+                    continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
@@ -495,7 +529,7 @@ class TorchNativeLlamaForCausalLM(nn.Module):
         weights: Iterable[Tuple[str, torch.Tensor]],
     ):
         """Load weights onto the full model."""
-        self.load_weights_to_module("", weights)
+        self.load_weights_to_module("", weights, recurse=True)
 
 
 class TorchNativePhi3ForCausalLM(TorchNativeLlamaForCausalLM):
