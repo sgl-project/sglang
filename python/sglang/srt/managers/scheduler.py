@@ -122,6 +122,12 @@ from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
+from sglang.srt.hf_transformers import (
+    get_processor,
+    get_tokenizer,
+    get_tokenizer_from_processor,
+    resolve_image_processor_backend,
+)
 from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
 from sglang.srt.layers.cp.utils import from_cp_sharded
 from sglang.srt.layers.dp_attention import get_dp_tp_group
@@ -400,12 +406,6 @@ from sglang.srt.utils import (
     triton_load_watch,
 )
 from sglang.srt.utils.common import is_confidential_compute, is_npu
-from sglang.srt.utils.hf_transformers import (
-    get_processor,
-    get_tokenizer,
-    get_tokenizer_from_processor,
-    resolve_image_processor_backend,
-)
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.weight_versions import record_weight_version_events
@@ -2544,7 +2544,8 @@ class Scheduler(
         # The rust server *is* the ingress source: SchedulerRequestReceiver
         # drains its request ring (rust_server_mode) instead of a zmq socket.
         self.recv_from_tokenizer = rust_server
-        # Park the idle loop on the request ring within the rank-0 rust-server
+        # The idle loop parks in the server's wait_request, on the request ring
+        # only with --sleep-on-idle (see RustServer.wait_request).
         self.idle_sleeper = RustServerIdleSleeper(
             rust_server, can_empty_cache=lambda: not self._engine_paused
         )
@@ -4012,15 +4013,13 @@ class Scheduler(
         req.clear_requested_finish()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.release_prefill_sender(req, abort_sender=True)
-        self.request_retirer.release(req, checkpoint=False)
+        # A client abort leaves the message to the tokenizer.
+        self.request_retirer.abort(
+            req, finished_reason=req.discard_output_reason and reason.to_json()
+        )
 
         self.chunked_req = None
         self._pending_chunked_abort_req = None
-        # A client abort leaves the message to the tokenizer.
-        finished_reason = req.discard_output_reason and reason.to_json()
-        self.send_abort_output(
-            make_abort_req(req, finished_reason=finished_reason), req
-        )
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
 
     def _build_hisparse_decode_batch(self, reqs):
@@ -4389,6 +4388,7 @@ class Scheduler(
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
             prefill_tile_block_m=prefill_tile_block_m,
+            request_retirer=self.request_retirer,
         )
 
         if self.chunked_req is not None:
@@ -4801,7 +4801,9 @@ class Scheduler(
                 if mamba_allocator is not None
                 else None
             )
-            retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode()
+            retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
+                self.request_retirer
+            )
             self.running_reqs.leave([*retracted_reqs, *reqs_to_abort])
             new_available_tokens = self.token_to_kv_pool_allocator.available_size()
             new_token_gained = new_available_tokens - old_available_tokens
@@ -4824,15 +4826,8 @@ class Scheduler(
                 )
             self.new_token_ratio_tracker.current = new_token_ratio
             for req in reqs_to_abort:
-                abort_reason: FINISH_ABORT = req.to_finish
-                self.send_abort_output(
-                    make_abort_req(req, finished_reason=abort_reason.to_json()),
-                    req,
-                )
-            for req in reqs_to_abort:
-                # Member rows were freed inside retract_decode; the group only
-                # has to leave the live set.
-                self.beam_coordinator.retire_group(req)
+                # retract_decode recorded the reason and freed any member rows.
+                self.request_retirer.abort_retracted(req, reason=req.to_finish)
 
             msg_prefix = (
                 "KV cache pool is full. Retract requests. "
@@ -6135,10 +6130,8 @@ class Scheduler(
             # be discarded; non-decode modes never offload.
             unresumable = retract_all(
                 reqs=retract_reqs,
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                 tree_cache=self.tree_cache,
-                hisparse_coordinator=self.hisparse_coordinator,
+                request_retirer=self.request_retirer,
                 offload_kv=False,
             )
         self.running_batch.reqs = []
@@ -6147,12 +6140,12 @@ class Scheduler(
         self.prefill_launched_reqs.leave(retract_reqs)
         for req in retract_reqs:
             if req in unresumable:
-                abort_reason = FINISH_ABORT(
-                    unresumable_abort_message(),
-                    status_code=HTTPStatus.SERVICE_UNAVAILABLE,
-                )
-                self.send_abort_output(
-                    make_abort_req(req, finished_reason=abort_reason.to_json()), req
+                self.request_retirer.abort_retracted(
+                    req,
+                    reason=FINISH_ABORT(
+                        unresumable_abort_message(),
+                        status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                    ),
                 )
             elif self.disaggregation_mode == DisaggregationMode.DECODE:
                 req.time_stats.set_retract_time()

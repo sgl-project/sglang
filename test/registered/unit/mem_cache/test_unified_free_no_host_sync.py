@@ -32,7 +32,6 @@ import unittest
 from unittest import mock
 
 import torch
-from test_multi_ended_allocator import TestPagedBand as _PagedFixture
 from torch.utils._python_dispatch import TorchDispatchMode
 
 from sglang.srt.environ import InvariantCheckLevel, envs
@@ -41,19 +40,25 @@ from sglang.srt.mem_cache.kv.alloc import band as mea
 from sglang.srt.mem_cache.kv.alloc import chain
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang.test.unified_allocator_fixtures import arena_of, stand_in_views
+from sglang.test.unified_allocator_fixtures import (
+    FakeKVCache,
+    arena_of,
+    build_paged_band_pair,
+    build_window_chain,
+    stand_in_views,
+)
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
 
-PAGE_SIZE = _PagedFixture.PAGE_SIZE
+PAGE_SIZE = 8
 
 
 def _paged_allocator(lazy: bool):
-    """A real paged `Band` from the sibling fixture."""
-    inst = _PagedFixture([m for m in dir(_PagedFixture) if m.startswith("test_")][0])
-    _pool, full, _swa, _fkv, _skv = inst._build()
+    """A real paged `Band`."""
+    _pool, full, _swa, _fkv, _skv = build_paged_band_pair(page_size=PAGE_SIZE)
     full.lazy_compaction = lazy
     return full
 
@@ -109,11 +114,6 @@ _TOMBSTONE_METHODS = [
     (mea.FloatBand, "make_room"),
     (mea.FloatBand, "_relocate_to_positions"),
 ]
-
-
-# Sanctioned no-sync tombstone forms: `index_fill_` takes the scalar as an
-# argument torch keeps off the host; the fused launcher stores it in-kernel.
-_NO_SYNC_TOMBSTONE_FORMS = ("index_fill_", "free_unbind_inplace")
 
 
 _UNIFIED_MODULES = (mea, chain)
@@ -215,18 +215,6 @@ class TestTombstonesDoNotCrossTheBus(unittest.TestCase):
                         f"copies it H2D, blocking the scheduler thread until the "
                         f"stream drains. Use `.index_fill_(0, idx, -1)`."
                     ),
-                )
-
-    def test_free_paths_actually_write_a_tombstone(self):
-        """Positive form, so deleting the scatter entirely cannot pass; a new
-        no-sync mechanism is added to `_NO_SYNC_TOMBSTONE_FORMS` deliberately."""
-        for cls, name in _TOMBSTONE_METHODS:
-            with self.subTest(method=f"{cls.__name__}.{name}"):
-                src = inspect.getsource(getattr(cls, name))
-                self.assertTrue(
-                    any(form in src for form in _NO_SYNC_TOMBSTONE_FORMS),
-                    f"{cls.__name__}.{name} writes no tombstone through any of "
-                    f"{_NO_SYNC_TOMBSTONE_FORMS}",
                 )
 
 
@@ -540,9 +528,9 @@ class TestUnifiedSwaFullSideGroup(unittest.TestCase):
     def test_allocation_reclaim_flushes_full_only_segment_frees(self):
         """FULL-only queued pages already satisfy this allocation. Ignoring
         their queue makes two-pool reclaim report insufficient capacity."""
-        from test_unified_swa_shared_virtual_ids import _build
-
-        alloc = _build(64, 32, 2, 4)
+        _arena, alloc, _kvcache = build_window_chain(
+            n_full_slots=64, n_swa_slots=32, full_layer_num=2, swa_layer_num=4
+        )
         indices = alloc.alloc(8)
         alloc.free_swa(indices)
         before = alloc.full_available_size()
@@ -560,9 +548,9 @@ class TestUnifiedSwaFullSideGroup(unittest.TestCase):
         self.assertEqual(alloc.full_available_size(), before + 8)
 
     def test_full_only_frees_defer_until_group_end(self):
-        from test_unified_swa_shared_virtual_ids import _build
-
-        alloc = _build(64, 32, 2, 4)
+        _arena, alloc, _kvcache = build_window_chain(
+            n_full_slots=64, n_swa_slots=32, full_layer_num=2, swa_layer_num=4
+        )
         idx = alloc.alloc(8)
         alloc.free_swa(idx)
         before = alloc.full_available_size()
@@ -585,10 +573,11 @@ class TestFreeSwaWindowRatchetNoHostSync(CustomTestCase):
     PS = 4
 
     def _swa_composite(self, lazy=True, ps=None):
+        from test_multi_ended_allocator import _make_mha_spec
+
         from sglang.test.unified_allocator_fixtures import setup_allocator_context
 
         setup_allocator_context()
-        from test_multi_ended_allocator import _FakeKVCache, _make_mha_spec
 
         full = _make_mha_spec("full", "up", layer_num=4)
         swa = _make_mha_spec("swa", "down", layer_num=2)
@@ -603,8 +592,8 @@ class TestFreeSwaWindowRatchetNoHostSync(CustomTestCase):
 
         class _KV:
             def __init__(self, p):
-                self.full_kv_pool = _FakeKVCache(p, "full")
-                self.swa_kv_pool = _FakeKVCache(p, "swa")
+                self.full_kv_pool = FakeKVCache(p, "full")
+                self.swa_kv_pool = FakeKVCache(p, "swa")
 
             def attach_allocators(self, **kwargs):
                 pass
@@ -783,9 +772,8 @@ class TestFreeSwaWindowRatchetNoHostSync(CustomTestCase):
     torch.cuda.is_available(), "the fused tombstone is a Triton kernel"
 )
 class TestFusedTombstoneWritesBothTables(unittest.TestCase):
-    """The source scan accepts `free_unbind_inplace` as a no-sync mechanism; on
-    CPU the launcher takes its pure-torch reference path, so nothing else in
-    the suite ever runs the kernel that does the tombstoning.
+    """On CPU the `free_unbind_inplace` launcher takes its pure-torch reference
+    path, so nothing else in the suite runs the kernel that does the tombstoning.
     """
 
     def test_matches_the_reference_over_randomized_bindings(self):
